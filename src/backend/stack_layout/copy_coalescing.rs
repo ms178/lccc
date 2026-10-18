@@ -1860,6 +1860,10 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecFnmaF64x2
             | O::VecFmaF32x4
             | O::VecFnmaF32x4
+            | O::VecFmsF64x2
+            | O::VecFnmsF64x2
+            | O::VecFmsF32x4
+            | O::VecFnmsF32x4
             | O::VecAddI32x4
             | O::VecAddF32x4
             | O::VecMulF32x4
@@ -2524,7 +2528,14 @@ pub(crate) fn memfold_consumer_fma_128(op: &crate::ir::intrinsics::IntrinsicOp) 
     use crate::ir::intrinsics::IntrinsicOp as O;
     matches!(
         op,
-        O::VecFmaF64x2 | O::VecFnmaF64x2 | O::VecFmaF32x4 | O::VecFnmaF32x4
+        O::VecFmaF64x2
+            | O::VecFnmaF64x2
+            | O::VecFmaF32x4
+            | O::VecFnmaF32x4
+            | O::VecFmsF64x2
+            | O::VecFmsF32x4
+            | O::VecFnmsF64x2
+            | O::VecFnmsF32x4
     )
 }
 

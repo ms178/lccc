@@ -367,6 +367,56 @@ fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
     (index < 2).then_some(width)
 }
 
+/// Byte width written by a whole-register `VecStore*` family store (the
+/// SIMD vector lowering's `emit_vec_store`: `args = [value, ptr, 0]`,
+/// `dest_ptr = ptr`).  Every member is emitted through an unaligned store
+/// (`vmovups`/`vmovdqu`, `sse_store_dest`), so the destination carries no
+/// alignment contract.  `VecStoreI32x4Pair` writes only the low 8 bytes of
+/// its 16-byte home and is answered as 8 so the exact-width gate below
+/// still rejects it as a whole-object writer.
+fn whole_vector_store_width(op: IntrinsicOp) -> Option<usize> {
+    use IntrinsicOp as O;
+    match op {
+        O::VecStoreI32x4
+        | O::VecStoreF32x4
+        | O::VecStoreF64x2
+        | O::VecStoreI64x2
+        | O::VecStoreI16x8
+        | O::VecStoreI8x16 => Some(16),
+        O::VecStoreI32x8
+        | O::VecStoreF32x8
+        | O::VecStoreF64x4
+        | O::VecStoreI64x4
+        | O::VecStoreI8x32
+        | O::VecStoreI16x16 => Some(32),
+        O::VecStoreI32x4Pair => Some(8),
+        _ => None,
+    }
+}
+
+/// Whole-register `VecLoad*` family loads (`emit_vec_load`: `args = [ptr,
+/// 0]`).  The x86 emitter reads them with `vmovups`/`vmovdqu`/`movups`
+/// (the direct form) and folds them as memory operands only under VEX, whose
+/// encodings carry no alignment contract; no other backend implements them.
+fn whole_vector_load(op: IntrinsicOp) -> bool {
+    use IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecLoadI32x4
+            | O::VecLoadF32x4
+            | O::VecLoadF64x2
+            | O::VecLoadI64x2
+            | O::VecLoadI16x8
+            | O::VecLoadI8x16
+            | O::VecLoadI32x8
+            | O::VecLoadF32x8
+            | O::VecLoadF64x4
+            | O::VecLoadI64x4
+            | O::VecLoadI8x32
+            | O::VecLoadI16x16
+    )
+}
+
 /// Minimum stack alignment required when an intrinsic argument refers to an
 /// alloca.  `Some(0)` means the backend uses an unaligned-safe access; `None`
 /// means that this pass cannot prove the use safe.  Address-valued scalar or
@@ -376,6 +426,18 @@ fn intrinsic_arg_required_alignment(op: IntrinsicOp, index: usize) -> Option<usi
     use IntrinsicOp as O;
     if op == O::Load256 && index == 0 {
         return Some(32);
+    }
+    // `VecLoad*`: args[0] is the base address, args[1] the constant offset.
+    if whole_vector_load(op) {
+        return (index == 0).then_some(0);
+    }
+    // `VecStore*`: args[1] is the destination address (the same pointer as
+    // `dest_ptr`, audited by `intrinsic_dest_required_alignment`), args[2]
+    // the constant byte offset; args[0] is the register value.  A vector
+    // alloca in the VALUE position would be an address escape -- it is not
+    // listed and fails closed below.
+    if whole_vector_store_width(op).is_some() {
+        return (index == 1).then_some(0);
     }
     if pointer_vector_arg_width(op, index).is_some() {
         return Some(0);
@@ -411,6 +473,11 @@ fn intrinsic_dest_required_alignment(
     // stores.  Exact width also rejects partial/RMW operations accidentally
     // listed by a broad intrinsic family query.
     if has_result && op.vector_result_width().map(|width| width as usize) == Some(alloca_size) {
+        return Some(0);
+    }
+    // Whole-object unaligned vector store (the SIMD vector lowering's
+    // result/merge temporaries): exact width only.
+    if !has_result && whole_vector_store_width(op) == Some(alloca_size) {
         return Some(0);
     }
 
@@ -3066,6 +3133,73 @@ mod tests {
             )],
         );
         assert_eq!(downgrade_in_function(&mut function), 0);
+    }
+
+    #[test]
+    fn whole_vector_store_family_allows_alignment_relaxation() {
+        // The SIMD vector lowering's merge/result temporary: written whole by
+        // `VecStore<fam>` (`args = [value, ptr, 0]`, `dest_ptr = ptr`), read
+        // whole by `VecLoad<fam>`.  Both are unaligned forms: align 32 -> 0.
+        let mut function = function(
+            "vecstore",
+            vec![block(
+                0,
+                vec![
+                    alloca(0, 32, 32),
+                    intrinsic(Some(9), IntrinsicOp::VecZeroF32x8, None, vec![]),
+                    intrinsic(
+                        None,
+                        IntrinsicOp::VecStoreF32x8,
+                        Some(0),
+                        vec![
+                            Operand::Value(Value(9)),
+                            Operand::Value(Value(0)),
+                            Operand::Const(IrConst::I64(0)),
+                        ],
+                    ),
+                    intrinsic(
+                        Some(10),
+                        IntrinsicOp::VecLoadI32x8,
+                        None,
+                        vec![Operand::Value(Value(0)), Operand::Const(IrConst::I64(0))],
+                    ),
+                ],
+            )],
+        );
+        assert_eq!(downgrade_in_function(&mut function), 1);
+        assert!(matches!(
+            function.blocks[0].instructions[0],
+            Instruction::Alloca { align: 0, .. }
+        ));
+        // A 16-byte store into a 32-byte object is a partial write: the
+        // exact-width gate keeps the object's alignment.
+        let mut partial = function.clone();
+        partial.blocks[0].instructions[0] = alloca(0, 32, 32);
+        partial.blocks[0].instructions[2] = intrinsic(
+            None,
+            IntrinsicOp::VecStoreF32x4,
+            Some(0),
+            vec![
+                Operand::Value(Value(9)),
+                Operand::Value(Value(0)),
+                Operand::Const(IrConst::I64(0)),
+            ],
+        );
+        assert_eq!(downgrade_in_function(&mut partial), 0);
+        // The alloca in the VALUE position of a store is an address escape.
+        let mut escaped = function.clone();
+        escaped.blocks[0].instructions[0] = alloca(0, 32, 32);
+        escaped.blocks[0].instructions[2] = intrinsic(
+            None,
+            IntrinsicOp::VecStoreF32x8,
+            Some(1),
+            vec![
+                Operand::Value(Value(0)),
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I64(0)),
+            ],
+        );
+        assert_eq!(downgrade_in_function(&mut escaped), 0);
     }
 
     #[test]

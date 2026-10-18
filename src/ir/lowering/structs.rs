@@ -857,6 +857,17 @@ impl Lowerer {
             // Ternary and assignment on struct values produce rvalues (temporaries).
             // We must copy the struct data to a fresh temporary so that subsequent
             // member writes don't modify the original objects.
+            Expr::Conditional(cond, then_expr, else_expr, _)
+                if self
+                    .packed_vector_conditional_shape(cond, then_expr, else_expr)
+                    .is_some() =>
+            {
+                // Packed vector `?:` (`vector_simd.rs`): the result is a
+                // fresh merge temporary no other expression can name, so it
+                // is the object itself -- no defensive copy.
+                let val = self.lower_expr(expr);
+                self.operand_to_value(val)
+            }
             Expr::Conditional(_, _, _, _)
             | Expr::GnuConditional(_, _, _)
             | Expr::Assign(_, _, _) => {

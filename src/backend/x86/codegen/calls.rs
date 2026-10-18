@@ -114,27 +114,7 @@ impl X86Codegen {
     }
 
     pub(super) fn call_abi_config_impl(&self) -> CallAbiConfig {
-        CallAbiConfig {
-            max_int_regs: 6,
-            max_float_regs: 8,
-            align_i128_pairs: false,
-            f128_in_fp_regs: false,
-            f128_in_gp_pairs: false,
-            variadic_floats_in_gp: false,
-            large_struct_by_ref: false,
-            use_sysv_struct_classification: true,
-            use_riscv_float_struct_classification: false,
-            allow_struct_split_reg_stack: false,
-            align_struct_pairs: false,
-            sret_uses_dedicated_reg: false,
-            gcc_regparm_mode: false,
-            // GCC >= 4.6 honors the full natural alignment of MEMORY-class
-            // stack arguments (SysV AMD64); the >16 case is completed by the
-            // caller's dynamic %rsp realignment (emit_call_stack_args_impl).
-            stack_arg_align_cap: usize::MAX,
-            vector_xmm_regs: 0,
-            i386_ext_vector_lanes: false,
-        }
+        CallAbiConfig::sysv_x86_64()
     }
 
     /// Extract a constant i64 from an Operand, following Copy chains.

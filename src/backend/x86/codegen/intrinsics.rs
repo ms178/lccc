@@ -1717,6 +1717,28 @@ impl X86Codegen {
         dest_ptr: &Option<Value>,
         args: &[Operand],
     ) {
+        // A vector parameter the prologue already moved into this load's
+        // register home (`vec_param_preloaded`): nothing to emit. Checked
+        // before VLFOLD so no consumer is ever told to fold the never
+        // written parameter slot.
+        if let Some(d) = dest {
+            if self.state.vec_param_preloaded.contains(&d.0) {
+                if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                    let wide = op.vector_home_width() == Some(32);
+                    let name = if wide {
+                        phys_reg_name_256(reg)
+                    } else {
+                        phys_reg_name(reg)
+                    };
+                    self.state.vector_values.insert(d.0);
+                    self.state.vec_claim_live_reg(d.0, name);
+                    if wide {
+                        self.state.dirty_upper_ymm = true;
+                    }
+                }
+                return;
+            }
+        }
         // VLFOLD: an eligible single-use 256-bit or 128-bit load emits
         // nothing; its adjacent consumer folds the source memory operand.
         if self.try_elide_vec_load(dest, op, args) {
@@ -6240,13 +6262,25 @@ impl X86Codegen {
             IntrinsicOp::VecFmaF64x2
             | IntrinsicOp::VecFnmaF64x2
             | IntrinsicOp::VecFmaF32x4
-            | IntrinsicOp::VecFnmaF32x4 => {
+            | IntrinsicOp::VecFnmaF32x4
+            | IntrinsicOp::VecFmsF64x2
+            | IntrinsicOp::VecFmsF32x4
+            | IntrinsicOp::VecFnmsF64x2
+            | IntrinsicOp::VecFnmsF32x4 => {
                 if let Some(d) = dest {
-                    // args = [a, b, acc] → acc ± a·b, 128-bit lanes.
+                    // args = [a, b, acc] → acc ± a·b (a·b − acc for the
+                    // vfmsub family, −a·b − acc for vfnmsub), 128-bit
+                    // lanes. The sign structure attaches to the algebraic
+                    // terms in every 132/213/231 form, so one emitter
+                    // serves all four families.
                     let (mn, ps) = match op {
                         IntrinsicOp::VecFmaF64x2 => ("vfmadd", "pd"),
                         IntrinsicOp::VecFnmaF64x2 => ("vfnmadd", "pd"),
+                        IntrinsicOp::VecFmsF64x2 => ("vfmsub", "pd"),
+                        IntrinsicOp::VecFnmsF64x2 => ("vfnmsub", "pd"),
                         IntrinsicOp::VecFmaF32x4 => ("vfmadd", "ps"),
+                        IntrinsicOp::VecFmsF32x4 => ("vfmsub", "ps"),
+                        IntrinsicOp::VecFnmsF32x4 => ("vfnmsub", "ps"),
                         _ => ("vfnmadd", "ps"),
                     };
                     self.emit_vec_fma_128(d, args, mn, ps);
@@ -7782,6 +7816,50 @@ impl X86Codegen {
 
     fn emit_avx_map_fma_inner(&mut self, dest: &Value, args: &[Operand], mnemonic: &str) {
         assert!(args.len() == 3, "{} expects input, scale, bias", mnemonic);
+        // All-homed register form (the GNU-vector contraction shape
+        // `vecfma` produces: three register-valued operands, a homed
+        // result). FMA3 is destructive — the destination is also a source
+        // — so the form is chosen by which operand the result's own home
+        // already holds; otherwise ONE register copy stages a multiplicand
+        // into it. The sign structure attaches to the algebraic terms, so
+        // every family re-encodes exactly (`fma_form_reencode`):
+        //   d == a:     <fam132> b, c, d      d = d·b ± c
+        //   d == b:     <fam132> a, c, d      d = d·a ± c
+        //   d == c:     <fam231> b, a, d      d = a·b ± d   (231: ±d)
+        //   otherwise:  vmovaps a, d ; <fam132> b, c, d
+        // Term check per SDM for the 231 arm, all four families: vfmadd231
+        // d = a·b + d, vfmsub231 d = a·b − d, vfnmadd231 d = −a·b + d,
+        // vfnmsub231 d = −a·b − d — each the family's algebra with c = d.
+        // Operands are read before the write, so a multiple alias
+        // (`d == a == c`, the product `a*b + a` coalesced onto a) is also
+        // exact through the first arm.
+        if let Some(homes) = self.all_vec_homes_256(&[&args[0], &args[1], &args[2]], dest) {
+            let (a, b, c, d) = (
+                homes[0].clone(),
+                homes[1].clone(),
+                homes[2].clone(),
+                homes[3].clone(),
+            );
+            let form132 = mnemonic;
+            if d == a {
+                self.state
+                    .emit_fmt(format_args!("    {} {}, {}, {}", form132, b, c, d));
+            } else if d == b {
+                self.state
+                    .emit_fmt(format_args!("    {} {}, {}, {}", form132, a, c, d));
+            } else if d == c {
+                let form231 = Self::fma_form_reencode(mnemonic, true);
+                self.state
+                    .emit_fmt(format_args!("    {} {}, {}, {}", form231, b, a, d));
+            } else {
+                self.state
+                    .emit_fmt(format_args!("    vmovaps {}, {}", a, d));
+                self.state
+                    .emit_fmt(format_args!("    {} {}, {}, {}", form132, b, c, d));
+            }
+            self.note_vec_dest_in_home(dest, &d);
+            return;
+        }
         // VLFOLD forms (ICX saxpy shape): one of the three operands is an
         // elided single-use load and the FMA takes its SOURCE memory
         // operand directly, exactly like the audited binary emitter
@@ -8390,7 +8468,11 @@ impl X86Codegen {
         // ── Register-alias discipline ────────────────────────────────
         // Three operands (a, b, acc) are live at the FMA and any of them
         // may be the register the allocator REUSED for the dest (each
-        // dies at the instruction). The Intel forms — canonical AT&T
+        // dies at the instruction). The operands need not be distinct
+        // values (`x*x + c`, `a*b + a` from the GNU-vector contraction):
+        // a shared multiplicand simply resolves both sources to one
+        // register, and an accumulator aliasing a multiplicand takes the
+        // move-aside below. The Intel forms — canonical AT&T
         // spelling (src3/r/m, src2/vvvv, dst), semantics CPU-verified:
         //   132: D = D × src3 + src2 — r/m is the SECOND MULTIPLICAND,
         //        VVVV the ADDEND. D must hold one MULTIPLICAND.
@@ -8400,8 +8482,8 @@ impl X86Codegen {
         //        the ADDEND (the accumulator).
         // The alias of dst with a/b/acc selects the form; the product
         // commutes, so the multiplier register is whichever multiplicand
-        // dst does NOT hold. Multiple aliases are impossible (a, b, acc
-        // are mutually distinct live values).
+        // dst does NOT hold (or dst itself when both multiplicands are
+        // the same value).
         //
         // Resolve the multiplicands first (homed: their register; unhomed:
         // staged into %xmm1/%xmm2). The resolution NAMES let the alias
@@ -8420,11 +8502,9 @@ impl X86Codegen {
             // Canonical AT&T: `v{f,n}madd213{ps,pd} MEM_acc, %S2, %dst`
             // computes S2 × dst + MEM_acc = a·b + acc, dst holding a
             // multiplicand (loaded into dst when it holds neither).
-            if a_src == dst && b_src == dst {
-                // Impossible (distinct live values share no register);
-                // fail loudly rather than guess.
-                unreachable!("FMA dest aliases both multiplicands");
-            }
+            // `a_src == b_src == dst` is the squared multiplicand
+            // (`x*x + acc` with dest coalesced onto x): the else-arm's
+            // `213 MEM, dst, dst` computes dst·dst + MEM exactly.
             if a_src != dst && b_src != dst {
                 // dst holds neither: load `a` into it (b is already
                 // resolved to its own register/scratch).

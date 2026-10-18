@@ -44,6 +44,10 @@ set -euo pipefail
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 ccc=${CCC:-$repo/target/fastbuild/lccc}
+# The oracle must be GCC 16: GCC 12's callee for `c_u32` (a union of
+# 32-byte vectors returned in %ymm0) returns only the low 128 bits
+# (`u32 9 0` for `u32 9 9`); GCC 16 and lccc agree.  ci_local.sh and the
+# hosted workflow both pin `GCC=gcc-16`.
 gcc_bin=${GCC:-gcc}
 dir=$repo/tests/regression/vector_abi_boundary
 tmp=$(mktemp -d)

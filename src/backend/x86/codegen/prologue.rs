@@ -2979,6 +2979,22 @@ impl X86Codegen {
                 })
             }),
         );
+        // A vector return carried in `%xmm0`/`%ymm0`/`%zmm0` -- either the
+        // hidden-buffer reload (`vector_ret_buffer_bytes`) or a
+        // register-valued SSA vector operand of a `Return` terminator
+        // (`try_lower_vector_return_simd`) -- reads bank 0 at `ret` just
+        // like a scalar FP return; without this bit the FP liveness oracle
+        // deletes the home-to-`%ymm0` move that produces the value.
+        let vector_ret_in_xmm0 = self.vector_ret_buffer_bytes > 0
+            || func.blocks.iter().any(|b| {
+                matches!(&b.terminator, Terminator::Return(Some(Operand::Value(v)))
+                    if self.state.vector_values.contains(&v.0))
+            });
+        let ret_xmm_mask = if vector_ret_in_xmm0 {
+            ret_xmm_mask | 1
+        } else {
+            ret_xmm_mask
+        };
         self.state
             .emit_fmt(format_args!("    # LCCC_RET_XMM {}", ret_xmm_mask));
 
@@ -3267,7 +3283,13 @@ impl X86Codegen {
         // pre-storing in param order then destroys a later param's incoming
         // value (observed miscompile: constp(a, b, scale) computed (a+b)*a
         // because a's home xmm2 clobbered scale's ABI xmm2).
-        let mut fp_prestores: Vec<(usize, usize, PhysReg, &'static str, bool)> = Vec::new();
+        let mut fp_prestores: Vec<(usize, usize, PhysReg, &'static str, FpPrestoreKind)> =
+            Vec::new();
+        // Vector parameters (`F128SseReg` 16/32 bytes) read through one
+        // entry-prefix VecLoad with an XMM home: the incoming register moves
+        // straight into the home (same ordered parallel copy as the scalar
+        // FP pre-stores), the alloca slot is dead and the load emits nothing.
+        let vector_direct = crate::backend::stack_layout::x86_vector_param_loads(func);
         // Deferred integer/pointer pre-stores form a parallel-copy problem:
         // caller-saved homes such as r8/r9/rdi/rsi can still contain a later
         // incoming argument.  Emit them after collection in a dependency-safe
@@ -3291,6 +3313,30 @@ impl X86Codegen {
                     self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
                 }
                 continue;
+            }
+
+            if let (ParamClass::F128SseReg { reg_idx, size }, Some(Some((load_dest, bytes)))) =
+                (class, vector_direct.get(i))
+            {
+                if size == *bytes && matches!(size, 16 | 32) {
+                    if let Some(&phys_reg) = self.reg_assignments.get(&load_dest.0) {
+                        if super::emit::is_xmm_reg(phys_reg) {
+                            fp_prestores.push((
+                                i,
+                                reg_idx,
+                                phys_reg,
+                                phys_reg_name(phys_reg),
+                                if size == 32 {
+                                    FpPrestoreKind::V256
+                                } else {
+                                    FpPrestoreKind::V128
+                                },
+                            ));
+                            self.state.vec_param_preloaded.insert(load_dest.0);
+                            continue;
+                        }
+                    }
+                }
             }
 
             // Pre-store optimization: when a param's alloca is dead (eliminated by
@@ -3365,7 +3411,11 @@ impl X86Codegen {
                                         reg_idx,
                                         phys_reg,
                                         dest_reg,
-                                        func.params[i].ty == IrType::F32,
+                                        if func.params[i].ty == IrType::F32 {
+                                            FpPrestoreKind::F32
+                                        } else {
+                                            FpPrestoreKind::F64
+                                        },
                                     ));
                                 }
                             }
@@ -3801,15 +3851,17 @@ impl X86Codegen {
         // params whose homes are each other's ABI registers) are broken with a
         // scratch XMM register that is no pending param's home.
         if !fp_prestores.is_empty() {
-            // (param_idx, abi_idx, home_phys, dest_name, is_f32)
-            let mut pending: Vec<(usize, usize, PhysReg, &'static str, bool)> = fp_prestores;
-            // (dest_name, is_f32, scratch_name)
-            let mut scratch_saves: Vec<(&'static str, bool, &'static str)> = Vec::new();
+            // (param_idx, abi_idx, home_phys, dest_name, kind)
+            let mut pending: Vec<(usize, usize, PhysReg, &'static str, FpPrestoreKind)> =
+                fp_prestores;
+            // (dest_name, kind, scratch_name)
+            let mut scratch_saves: Vec<(&'static str, FpPrestoreKind, &'static str)> = Vec::new();
             while !pending.is_empty() {
                 let mut progressed = false;
-                let mut remaining: Vec<(usize, usize, PhysReg, &'static str, bool)> = Vec::new();
+                let mut remaining: Vec<(usize, usize, PhysReg, &'static str, FpPrestoreKind)> =
+                    Vec::new();
                 for cand in &pending {
-                    let (i, abi_idx, _home, dest, is_f32) = *cand;
+                    let (i, abi_idx, _home, dest, kind) = *cand;
                     // Unsafe if the home register IS the ABI argument register
                     // of a DIFFERENT pending param (reading that ABI register
                     // later would yield the overwritten home value). Compare
@@ -3818,10 +3870,7 @@ impl X86Codegen {
                         .iter()
                         .any(|&(j, j_abi, _, _, _)| j != i && dest == xmm_regs[j_abi]);
                     if !clobbers {
-                        let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
-                        self.state
-                            .out
-                            .emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], dest);
+                        self.emit_fp_prestore_move(kind, xmm_regs[abi_idx], dest);
                         self.state.param_pre_stored.insert(i);
                         progressed = true;
                     } else {
@@ -3833,7 +3882,7 @@ impl X86Codegen {
                     // scratch XMM register (no pending param's home), so its
                     // ABI register is free for the others; the scratch value
                     // moves to its home at the very end.
-                    let (i, abi_idx, home, dest, is_f32) = pending[0];
+                    let (i, abi_idx, home, dest, kind) = pending[0];
                     let scratch = {
                         let mut s: Option<&'static str> = None;
                         for r in (26u8..=33).rev() {
@@ -3846,20 +3895,14 @@ impl X86Codegen {
                         s
                     };
                     if let Some(scratch) = scratch {
-                        let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
-                        self.state
-                            .out
-                            .emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], scratch);
+                        self.emit_fp_prestore_move(kind, xmm_regs[abi_idx], scratch);
                         self.state.param_pre_stored.insert(i);
-                        scratch_saves.push((dest, is_f32, scratch));
+                        scratch_saves.push((dest, kind, scratch));
                         let _ = home;
                         pending.remove(0);
                     } else {
                         // Degenerate (every XMM is a pending home): emit directly.
-                        let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
-                        self.state
-                            .out
-                            .emit_instr_reg_reg(mnemonic, xmm_regs[abi_idx], dest);
+                        self.emit_fp_prestore_move(kind, xmm_regs[abi_idx], dest);
                         self.state.param_pre_stored.insert(i);
                         pending.remove(0);
                     }
@@ -3867,9 +3910,8 @@ impl X86Codegen {
                     pending = remaining;
                 }
             }
-            for (dest, is_f32, scratch) in scratch_saves {
-                let mnemonic = if is_f32 { "    movss" } else { "    movsd" };
-                self.state.out.emit_instr_reg_reg(mnemonic, scratch, dest);
+            for (dest, kind, scratch) in scratch_saves {
+                self.emit_fp_prestore_move(kind, scratch, dest);
             }
         }
 
@@ -4405,5 +4447,39 @@ mod signed_home_demand_tests {
     fn x87_source_demand_is_unchanged() {
         let (needed, _, _) = signed_i32_home_requirements(&fixture(IrType::F128));
         assert_eq!(needed, [0, 1, 2].into_iter().collect());
+    }
+}
+
+/// Width of one prologue FP/vector pre-store move (`emit_fp_prestore_move`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FpPrestoreKind {
+    F32,
+    F64,
+    /// A 16-byte vector parameter: the whole `%xmm`.
+    V128,
+    /// A 32-byte vector parameter: the whole `%ymm`.
+    V256,
+}
+
+impl X86Codegen {
+    /// One register-to-register move of the pre-store width. `src`/`dst`
+    /// are `xmm` names; the 256-bit form renames both to their `ymm`
+    /// aliases (the ABI register `xmmN` carries the value in `ymmN`).
+    pub(super) fn emit_fp_prestore_move(
+        &mut self,
+        kind: FpPrestoreKind,
+        src: &'static str,
+        dst: &'static str,
+    ) {
+        match kind {
+            FpPrestoreKind::F32 => self.state.out.emit_instr_reg_reg("    movss", src, dst),
+            FpPrestoreKind::F64 => self.state.out.emit_instr_reg_reg("    movsd", src, dst),
+            FpPrestoreKind::V128 => self.state.out.emit_instr_reg_reg("    movaps", src, dst),
+            FpPrestoreKind::V256 => {
+                self.state.dirty_upper_ymm = true;
+                self.state
+                    .emit_fmt(format_args!("    vmovaps %y{}, %y{}", &src[1..], &dst[1..]));
+            }
+        }
     }
 }

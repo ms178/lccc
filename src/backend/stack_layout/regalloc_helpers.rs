@@ -6,7 +6,7 @@
 use super::super::regalloc::{PhysReg, RaConfig};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
-use crate::ir::reexports::{Instruction, IrFunction, Value};
+use crate::ir::reexports::{Instruction, IrFunction, Operand, Value};
 use std::sync::Arc;
 
 // ── Register allocation helpers ───────────────────────────────────────────
@@ -596,6 +596,99 @@ fn reserve_static_chain_reg(
         drop(call_arg),
         drop(indirect_target),
     )
+}
+
+/// Parameters whose vector value is read through ONE entry-prefix
+/// `VecLoad` of the parameter alloca (the shape `vec_ssa::hoist_param_loads`
+/// produces).
+///
+/// Index = parameter index; `Some((load_dest, bytes))` when the parameter
+/// alloca is 16 or 32 bytes, is mentioned by exactly one instruction in the
+/// whole function, that instruction is a pure full-width zero-offset
+/// `VecLoad*` in the entry block, and nothing but `Alloca`/`ParamRef`/other
+/// such loads precedes it.  At that program point the incoming argument
+/// register is provably untouched (the prologue reads it, nothing in the
+/// prefix writes an argument register), so the x86 prologue may move the
+/// register straight into the load's home and the load emits nothing
+/// (`CodegenState::vec_param_preloaded`).
+pub fn x86_vector_param_loads(func: &IrFunction) -> Vec<Option<(Value, usize)>> {
+    use crate::backend::stack_layout::copy_coalescing::is_pure_vec_load;
+    let n = func.params.len();
+    let mut out: Vec<Option<(Value, usize)>> = vec![None; n];
+    if func.param_alloca_values.is_empty() || func.blocks.is_empty() {
+        return out;
+    }
+    let mut size_of: crate::common::fx_hash::FxHashMap<u32, usize> =
+        crate::common::fx_hash::FxHashMap::default();
+    for inst in &func.blocks[0].instructions {
+        if let Instruction::Alloca {
+            dest,
+            size,
+            volatile: false,
+            semantic_volatile: false,
+            ..
+        } = inst
+        {
+            if matches!(*size, 16 | 32) {
+                size_of.insert(dest.0, *size);
+            }
+        }
+    }
+    // Mention census over the whole function.
+    let mut mentions: crate::common::fx_hash::FxHashMap<u32, usize> =
+        crate::common::fx_hash::FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| {
+                if size_of.contains_key(&v) {
+                    *mentions.entry(v).or_insert(0) += 1;
+                }
+            });
+        }
+        block.terminator.for_each_used_value(|v| {
+            if size_of.contains_key(&v) {
+                *mentions.entry(v).or_insert(0) += 1;
+            }
+        });
+    }
+    let alloca_to_param: crate::common::fx_hash::FxHashMap<u32, usize> = func
+        .param_alloca_values
+        .iter()
+        .enumerate()
+        .take(n)
+        .map(|(i, v)| (v.0, i))
+        .collect();
+    for inst in &func.blocks[0].instructions {
+        match inst {
+            Instruction::Alloca { .. } | Instruction::ParamRef { .. } => continue,
+            Instruction::Intrinsic {
+                dest: Some(d),
+                op,
+                dest_ptr: None,
+                args,
+            } if is_pure_vec_load(op) && args.len() == 2 => {
+                let Operand::Value(base) = args[0] else {
+                    return out;
+                };
+                let zero_off = matches!(&args[1], Operand::Const(c) if c.to_i64() == Some(0));
+                let Some(&bytes) = size_of.get(&base.0) else {
+                    return out;
+                };
+                let Some(&pi) = alloca_to_param.get(&base.0) else {
+                    return out;
+                };
+                if !zero_off
+                    || op.vector_home_width() != Some(bytes as u32)
+                    || mentions.get(&base.0).copied() != Some(1)
+                {
+                    return out;
+                }
+                out[pi] = Some((*d, bytes));
+            }
+            _ => return out,
+        }
+    }
+    out
 }
 
 #[cfg(test)]

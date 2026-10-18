@@ -563,9 +563,16 @@ fn classify_alloca(
     block_space: &mut FxHashMap<usize, i64>,
     max_block_local_space: &mut i64,
 ) {
-    // Recover over-aligned parameter allocas: the authoritative ABI alignment
-    // (IrParam.struct_align) may exceed a pass-dropped `Alloca.align`.
-    let effective_align = align.max(ctx.param_aligns.get(&dest.0).copied().unwrap_or(0));
+    // `Alloca.align` is authoritative, for parameter allocas too: the
+    // lowering homes a parameter alloca at `struct_align.or(param_align)`
+    // (func_lowering.rs, `allocate_function_params`), and the only pass that
+    // lowers it afterwards is `downgrade_nonescaping_vector_align`, which
+    // does so exactly when it has proven every use alignment-insensitive
+    // (the capture store and every x86 param copy are unaligned moves).
+    // Re-raising it here from `IrParam` undid that proof for every
+    // 32-byte `vector_size` parameter the SIMD lowering did not take whole:
+    // a per-access `leaq; addq $31; andq $-32` realign for each lane.
+    let effective_align = align;
     let extra = if effective_align > 16 {
         effective_align - 1
     } else {

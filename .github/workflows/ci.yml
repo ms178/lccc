@@ -599,7 +599,7 @@ jobs:
     - name: Wide-vector (%ymm/%zmm) ABI at the compiler boundary
       run: |
         set -o pipefail
-        env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_wide.sh 2>&1 |
+        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_vector_abi_wide.sh 2>&1 |
           tee "$RUNNER_TEMP/vector-abi-wide.log"
     - name: Surface wide-vector ABI failures in annotations
       if: failure()
@@ -671,6 +671,16 @@ jobs:
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_designator_init.sh
     - name: Vector initializers inside aggregates
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_vector_static_init.sh
+    - name: GNU vector-extension whole-vector lowering (runtime vs GCC + ceilings)
+      run: |
+        set -o pipefail
+        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_vector_ext_codegen.sh 2>&1 |
+          tee "$RUNNER_TEMP/vector-ext-codegen.log"
+    - name: Surface vector-extension codegen failures in annotations
+      if: failure()
+      run: |
+        [ -s "$RUNNER_TEMP/vector-ext-codegen.log" ] || exit 0
+        python3 scripts/ci_annotate_log.py --title "vector-ext codegen" "$RUNNER_TEMP/vector-ext-codegen.log"
     - name: Void declarators and initializers
       run: |
         set -o pipefail

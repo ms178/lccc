@@ -476,24 +476,24 @@ fn eval_sym_addr_d(
 
 /// The intrinsic opcode set for one (lane type, width) family.
 #[derive(Clone, Copy)]
-struct VecFamily {
-    load: IntrinsicOp,
-    store: IntrinsicOp,
-    broadcast: IntrinsicOp,
-    zero: IntrinsicOp,
+pub(crate) struct VecFamily {
+    pub(crate) load: IntrinsicOp,
+    pub(crate) store: IntrinsicOp,
+    pub(crate) broadcast: IntrinsicOp,
+    pub(crate) zero: IntrinsicOp,
     /// 2-lane gather (I64/F64 only in v1). None ⇒ gathers reject the seed.
-    pack2: Option<IntrinsicOp>,
+    pub(crate) pack2: Option<IntrinsicOp>,
     /// 4-lane gather (I32x4 only in v1).
-    pack4: Option<IntrinsicOp>,
+    pub(crate) pack4: Option<IntrinsicOp>,
     /// Lane extract producing the exact scalar lane type. None ⇒ seeds
     /// needing extracts are rejected (all 256-bit families, F32x4, I16x8,
     /// I8x16 — no exact extract intrinsic exists for them in v1).
-    extract: Option<IntrinsicOp>,
+    pub(crate) extract: Option<IntrinsicOp>,
     /// Lane byte size.
-    size: u64,
+    pub(crate) size: u64,
 }
 
-fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
+pub(crate) fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
     let avx2 = x86_avx2_available_pub();
     match (ty, width) {
         // HALF-WIDE dword pairs: 2 lanes of 4 bytes in the low 64 bits of
@@ -647,7 +647,7 @@ fn family_for(ty: IrType, width: usize) -> Option<VecFamily> {
 /// Map a supported lane binop to its packed intrinsic. None for ops with
 /// no exact packed form (div/rem/shifts/bit-test/rotates, i64 Muls —
 /// there is no SSE2/AVX2 pmulq).
-fn packed_binop(op: IrBinOp, ty: IrType, width: usize) -> Option<IntrinsicOp> {
+pub(crate) fn packed_binop(op: IrBinOp, ty: IrType, width: usize) -> Option<IntrinsicOp> {
     let width = reg_width_for(ty, width);
     match (ty, width) {
         (IrType::F64, 2) => match op {
@@ -750,7 +750,7 @@ fn packed_binop(op: IrBinOp, ty: IrType, width: usize) -> Option<IntrinsicOp> {
     }
 }
 
-fn is_commutative(op: IrBinOp) -> bool {
+pub(crate) fn is_commutative(op: IrBinOp) -> bool {
     matches!(
         op,
         IrBinOp::Add | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
@@ -760,7 +760,7 @@ fn is_commutative(op: IrBinOp) -> bool {
 /// Map an FP lane type/width to its packed bitwise-XOR intrinsic (the
 /// exact packed spelling of every FP bit-manipulation idiom whose scalar
 /// lowering is an integer-domain XOR on the bit pattern).
-fn packed_fpxor(ty: IrType, width: usize) -> Option<IntrinsicOp> {
+pub(crate) fn packed_fpxor(ty: IrType, width: usize) -> Option<IntrinsicOp> {
     match (ty, width) {
         (IrType::F32, 8) => Some(IntrinsicOp::VecXorF32x8),
         (IrType::F32, 4) => Some(IntrinsicOp::VecXorF32x4),
@@ -772,7 +772,7 @@ fn packed_fpxor(ty: IrType, width: usize) -> Option<IntrinsicOp> {
 
 /// The `-0.0` constant of an FP lane type — the sign-mask operand of the
 /// FP-Neg composite (bit pattern: sign bit set, everything else clear).
-fn minus_zero_const(ty: IrType) -> Option<IrConst> {
+pub(crate) fn minus_zero_const(ty: IrType) -> Option<IrConst> {
     match ty {
         IrType::F32 => Some(IrConst::F32(-0.0)),
         IrType::F64 => Some(IrConst::F64(-0.0)),
@@ -874,7 +874,7 @@ fn packed_int_minmax(
 /// The packed compare + lane-mask-select intrinsic pair for a (lane type,
 /// width) family. `None` where no family exists (I64 lanes) — the lanes
 /// then degrade to the gather/binop paths.
-fn packed_cmp_blendv(ty: IrType, width: usize) -> Option<(IntrinsicOp, IntrinsicOp)> {
+pub(crate) fn packed_cmp_blendv(ty: IrType, width: usize) -> Option<(IntrinsicOp, IntrinsicOp)> {
     let width = reg_width_for(ty, width);
     let avx2 = x86_avx2_available_pub();
     match (ty, width) {
@@ -909,7 +909,7 @@ fn packed_cmp_blendv(ty: IrType, width: usize) -> Option<(IntrinsicOp, Intrinsic
 /// 0 = EQ_OQ, 1 = LT_OS, 2 = LE_OS, 4 = NEQ_UQ (exactly the C spellings —
 /// all false on NaN). Integer vocabulary: 0 = eq, 1 = lt.s, 2 = le.s,
 /// 4 = ne, 5 = lt.u, 6 = le.u. Unsigned relations are integer-only.
-fn cmp_predicate_imm(op: IrCmpOp, is_fp: bool) -> Option<(i64, bool)> {
+pub(crate) fn cmp_predicate_imm(op: IrCmpOp, is_fp: bool) -> Option<(i64, bool)> {
     match op {
         IrCmpOp::Eq => Some((0, false)),
         IrCmpOp::Ne => Some((4, false)),
@@ -931,7 +931,7 @@ fn cmp_predicate_imm(op: IrCmpOp, is_fp: bool) -> Option<(i64, bool)> {
 /// byte lanes (no packed byte shift before AVX-512) and I64 arithmetic
 /// right shift (no packed qword `psraq` before AVX-512). Those lanes
 /// degrade to gathers where a family has one, else reject the seed.
-fn packed_shift(op: IrBinOp, ty: IrType, width: usize) -> Option<IntrinsicOp> {
+pub(crate) fn packed_shift(op: IrBinOp, ty: IrType, width: usize) -> Option<IntrinsicOp> {
     let width = reg_width_for(ty, width);
     match (ty, width) {
         (IrType::I16 | IrType::U16, 16) => match op {
@@ -974,7 +974,7 @@ fn packed_shift(op: IrBinOp, ty: IrType, width: usize) -> Option<IntrinsicOp> {
 
 /// The all-ones constant of a lane type (`-1` in every width — the bit
 /// pattern `try_all_ones_splat` lowers to one `pcmpeqd`/`vpcmpeqd`).
-fn all_ones_const(ty: IrType) -> Option<IrConst> {
+pub(crate) fn all_ones_const(ty: IrType) -> Option<IrConst> {
     match ty {
         IrType::I8 | IrType::U8 => Some(IrConst::I8(-1)),
         IrType::I16 | IrType::U16 => Some(IrConst::I16(-1)),
@@ -3664,19 +3664,14 @@ fn build_pack(
                             let window_hi = window_lo + width as i128 * fam.size as i128;
                             !(lo..=hi).any(|q| {
                                 let inst = &block.instructions[q];
-                                let is_write = matches!(
-                                    inst,
-                                    Instruction::Store { .. }
-                                        | Instruction::AtomicStore { .. }
-                                        | Instruction::AtomicRmw { .. }
-                                        | Instruction::AtomicCmpxchg { .. }
-                                        | Instruction::Call { .. }
-                                        | Instruction::CallIndirect { .. }
-                                        | Instruction::InlineAsm { .. }
-                                        | Instruction::DynAlloca { .. }
-                                        | Instruction::Memcpy { .. }
-                                );
-                                if !is_write {
+                                // The canonical write classifier: it also
+                                // covers memory-writing INTRINSICS — the
+                                // `VecStore*` a previous seed of this same
+                                // block already emitted (a 32-byte vector
+                                // split into two 128-bit seeds rewrites the
+                                // block twice), which the earlier hand-rolled
+                                // variant list could not see.
+                                if !is_memory_write(inst) {
                                     return false;
                                 }
                                 if let Instruction::Store { ptr, ty: sty, .. } = inst {
@@ -3702,6 +3697,33 @@ fn build_pack(
                         _ => false,
                     }
                 }) {
+                    // The shared pack must be scheduled where the EARLIER
+                    // scalar group read (`sched` = max lane def, computed
+                    // from `lane_vals`): built from the later group first
+                    // (plan construction walks the root's operands, and
+                    // `b*t + t` reaches the multiply's reload of `b` before
+                    // the add's original load), the pack would otherwise be
+                    // placed after a consumer that was scheduled at the
+                    // earlier group — a use-before-def the IR verifier
+                    // flagged (`ho_*_al2`, `-mno-avx`).  The no-write proof
+                    // above spans both groups, so either position reads
+                    // the same bytes; the anchor pointer moves with the
+                    // group (the later group's GEP may not be defined yet
+                    // at the earlier position).  The superseded scalar
+                    // loads stay in place (not in `lane_vals`, so never
+                    // removed) and die in the next DCE sweep.
+                    let group_pos = |vs: &[Value]| -> usize {
+                        vs.iter()
+                            .filter_map(|v| ctx.def_pos.get(&v.0).copied())
+                            .max()
+                            .unwrap_or(usize::MAX)
+                    };
+                    if group_pos(&vals) < group_pos(&packs[prior].lane_vals) {
+                        packs[prior].lane_vals = vals;
+                        if let PackKind::MemLoad { ptrs: pp, .. } = &mut packs[prior].kind {
+                            *pp = ptrs;
+                        }
+                    }
                     return Some(prior);
                 }
                 let idx = packs.len();
@@ -6099,7 +6121,15 @@ fn apply_plan(
             .packs
             .iter()
             .map(|p| match &p.kind {
-                PackKind::MemLoad { .. } => "MemLoad".into(),
+                PackKind::MemLoad { .. } => format!(
+                    "MemLoad@{}[{}]",
+                    p.sched,
+                    p.lane_vals
+                        .iter()
+                        .map(|v| format!("v{}", v.0))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
                 PackKind::Forward { val } => format!("Forward(v{})", val.0),
                 PackKind::Fma { negate, acc, a, b } => {
                     format!(
@@ -6111,7 +6141,7 @@ fn apply_plan(
                     )
                 }
                 PackKind::BinOp { op, lhs, rhs, .. } => {
-                    format!("BinOp({:?} l{} r{})", op, lhs, rhs)
+                    format!("BinOp({:?} l{} r{})@{}", op, lhs, rhs, p.sched)
                 }
                 PackKind::Splat { .. } => "Splat".into(),
                 PackKind::Gather2 { .. } => "Gather2".into(),

@@ -3798,3 +3798,121 @@ because the carrier did not exist. Decisions taken when implementing it:
   The `-mno-avx` leg exposed a peephole miscompile unrelated to the ABI
   (`mulss` prefix-matched as the integer `mul`); fixed with an exact
   mnemonic match and pinned by a unit and a corpus test.
+
+## 2026-10-18 — GNU vector extension: whole-vector lowering, `vec_ssa`, authoritative alloca alignment
+
+The `v8f add8` debt (37 instructions against GCC's 2) was not one bug but
+the sum of every layer treating a 32-byte vector as a memory object.
+Decisions taken when retiring it (numbers in
+`FOLLOWUP-2026-10-17-ext-vector-grid.md`, VEC-EXT-PERF-1):
+
+- *No new IR value class.* The vector-extension language is address-based
+  (lane subscripts, `&v`, members, the ABI all want memory), so the result
+  of a packed expression is still an alloca; a dedicated pass (`vec_ssa`)
+  removes the alloca when every access is a whole-width `VecLoad`/
+  `VecStore` of one family. Lowering decides WHAT is packed (the SLP
+  vectorizer's own family tables, so legality has one owner), the pass
+  decides WHERE memory is unnecessary. The fallback is total: nothing in
+  the packed path may reject what the scalar path accepts.
+- *The scalar lowering stays the semantic reference.* Every packed form
+  must compute bit-for-bit what the per-lane scalar lowering computes:
+  shifts only for in-range constants, compares with the same all-ones
+  masks, `-0.0`-correct negation (`vxorps` with the sign mask — which is
+  how the matrix found the pre-existing scalar `return -a;` miscompile).
+- *A pass's alignment proof is final.* `downgrade_nonescaping_vector_align`
+  lowers an alloca's alignment only after proving every use insensitive to
+  it; the backend re-raising parameter allocas from `IrParam.struct_align`
+  "in case a pass dropped it" silently undid that proof for every 32-byte
+  parameter and cost a `leaq; addq $31; andq $-32` per lane access
+  (1 127 of them across the matrix). `Alloca.align` is now authoritative
+  end to end; the lowering sets it from the same ABI figures. The rule:
+  a backend must not second-guess an IR fact with the fact's own input.
+- *One predicate for both sides of a prologue contract.* The dead-param
+  decision (stack layout) and the register pre-store (prologue) must agree
+  on which parameters arrive in `%ymmN`; both call
+  `CallAbiConfig::sysv_x86_64()` + `classify_params`. Two hand-written
+  copies of an ABI predicate are a miscompile waiting for the next class.
+- *Peephole legality is argued in bits, not in mnemonics.* The result
+  retarget now folds a legacy full-width copy-out (`movdqa %xmm4,%xmm0`)
+  of a VEX.128 producer: bits 127:0 of the destination are identical
+  either way and the only difference — the producer zeroes bits above
+  128, the legacy move leaves them — is exactly the wide-reader check the
+  scalar rule already had. A unit test that asserted the old refusal was
+  documenting conservatism, not a semantics; it was rewritten to state
+  the real boundary (a merge from a third register is refused, a wide
+  reader of the destination is refused).
+- *Ceilings ratchet, including the debt.* The codegen gate pins the
+  register-shaped functions at GCC parity and the scalar-residue functions
+  at their measured counts, each annotated with the missing instruction
+  (`vpsllvd`, `vpcmpgtq`, the `pmullw` byte expansion, VEX-128 integer
+  emitters). A residue function may only get smaller.
+- *Runtime levels follow the host CPU, assembly ceilings do not.* The
+  hosted runner is not guaranteed AVX-512 (or AVX2); the gate executes
+  only the levels `/proc/cpuinfo` supports and always checks the
+  `-O2 -mavx2` assembly, which does not depend on the host.
+
+### Addendum — packed FMA contraction, the handoff ranking, and two scheduling rules (2026-10-18)
+
+The second half of the vector-extension series (FMA contraction, the
+`-D'NAME(args)=body'` driver fix, constant/`{}` initialisers, the
+register-handoff ranking, the SLP shared-load schedule) settled these:
+
+- *Contraction is a pass with the scalar gate's exact rules, not a
+  lowering choice.* `vec_fma_contract` runs after `vec_ssa` on packed
+  intrinsics and copies the scalar detector's contract verbatim: FMA3
+  available, `-ffp-contract` (`off`/`on`/`fast`, statement tags for
+  `on`), single-use multiply or every use fusable in the same block, and
+  the loop-carried rule. That last rule is precise, not coarse: the
+  accumulator may not be the ADDEND (`s += a[i]*b[i]` stays `vmulps` +
+  `vaddps`, GCC's `AVOID_256FMA_CHAINS`), but `s = s*a[i] + c` IS fused —
+  the multiply already sits on the serial chain, GCC fuses it, and the
+  differential gate (`cf_goto_loop`) is bit-exact only when both sides
+  agree. A coarser "any loop-carried value" veto was the first version
+  and the runtime differential rejected it.
+- *Negation is seen through, not pattern-matched at the source.* lccc
+  spells `-m` as `VecXor(m, -0.0 splat)`; the contraction pass flips the
+  fused family for a single-use xor-with-sign-mask operand
+  (`VecFnms`/`VecFnmadd`), so `-(a*b) ± c` and `c - a*b` reach the same
+  single instruction GCC emits. The check is `v == 0.0 &&
+  is_sign_negative()` — `to_f64` keeps the sign, equality does not.
+- *The handoff ranking has one exception, and it is the return
+  register.* Among several dying FMA operands the one defined LAST wins
+  (the chain temporary), except when the result is returned and one
+  operand arrived in `%ymm0`/`%xmm0`: then that one wins, because the
+  copy peephole collapses prestore + result + return move onto the return
+  register. "Latest-def always wins" broke `a*b + c`; "return-register
+  always wins" broke `mix_sab`. Both shapes are gate ceilings now.
+- *A shared SLP load pack is scheduled at its EARLIEST scalar group.* The
+  BB-SLP load CSE ("same stream, same first offset, same width, no write
+  in the window ⇒ identical bytes") returned the pack built FIRST, whose
+  `lane_vals` — and so its schedule — came from the LATER group (plan
+  construction walks the root's operands: `b*t + t` reaches the
+  multiply's reload of `b` before the add's original load). The pack was
+  then placed after a consumer scheduled at the earlier group: a
+  use-before-def the IR verifier reported and the runtime matrix caught
+  (`ho_*_al2` at `-mno-avx`). The CSE now moves `lane_vals` and the
+  anchor pointer to whichever group reads earlier; the no-write proof
+  already spans both groups, so either position reads the same bytes.
+  The window's write classifier is `is_memory_write` (it sees the
+  `VecStore` intrinsics a previous seed of the same block emitted), no
+  longer a hand-rolled variant list.
+- *`CCC_VERIFY_IR=1` reports; gates must fail on the report.* The
+  verifier prints and exits 0 by design (it is a diagnostic), so a gate
+  that sets it and discards stderr learns nothing. The vector gate greps
+  its output and fails on any `ir-verify` line at every level.
+- *A VEX result retarget may rename a short straight-line interior.* The
+  copy peephole's result retarget required the copy-out to be adjacent;
+  `t = a+b; return b*t + t` is `vaddps → %ymm14; vfmadd132ps …%ymm14;
+  vmovdqa %ymm14,%ymm0`, where the FMA cannot be retargeted (it reads its
+  destination) but the ADD can, provided the interior is renamed with it.
+  Legality: no barrier, the interior never mentions the destination
+  register, mentions the temporary only at the producer's width and only
+  in VEX zero-above spellings, and the copy-out is the full-width VEX
+  move — so the destination's final bits are identical to what the copy
+  left. Bounded at six interior lines: it is a bracket fold, not an
+  allocator. `ho_f8_al2` is now GCC's exact three instructions.
+- *Function-length and panic-site budgets are held by extraction, not
+  re-baselining.* Two W27 helpers (`x86_return_register_param_loads`,
+  `returned_vector_values`) and the map-intermediate class table
+  (`x86_map_intrinsic_class`) were lifted out when the census ratchet
+  tripped; the baseline file was not touched.

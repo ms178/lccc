@@ -342,12 +342,25 @@ pub enum IntrinsicOp {
     /// Packed FMS contraction (BB-SLP): args = [a, b, acc] → acc − a·b,
     /// 2×F64 (vfnmadd231pd). Same single-rounding contract.
     VecFnmaF64x2,
+    /// Packed `a·b − acc` contraction (`vecfma`): args = [a, b, acc],
+    /// 2×F64 (vfmsub231pd). Same single-rounding contract.
+    VecFmsF64x2,
+    /// Packed `−a·b − acc` contraction (`vecfma`, the negated-product
+    /// shape `-(a*b) - c`): args = [a, b, acc], 2×F64 (vfnmsub231pd).
+    /// Same single-rounding contract.
+    VecFnmsF64x2,
     /// Packed FMA contraction (BB-SLP): args = [a, b, acc] → acc + a·b,
     /// 4×F32 (vfmadd231ps).
     VecFmaF32x4,
     /// Packed FMS contraction (BB-SLP): args = [a, b, acc] → acc − a·b,
     /// 4×F32 (vfnmadd231ps).
     VecFnmaF32x4,
+    /// Packed `a·b − acc` contraction (`vecfma`): args = [a, b, acc],
+    /// 4×F32 (vfmsub231ps).
+    VecFmsF32x4,
+    /// Packed `−a·b − acc` contraction (`vecfma`): args = [a, b, acc],
+    /// 4×F32 (vfnmsub231ps).
+    VecFnmsF32x4,
     /// Vector add: %dest_vec = %src1_vec + %src2_vec - AVX2 8×I32
     /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
     VecAddI32x8,
@@ -1853,6 +1866,7 @@ impl IntrinsicOp {
             | VecMinF32x4 | VecMaxF32x4 | VecCmpF32x4 | VecBlendvF32x4
             | VecMinF64x2 | VecMaxF64x2 | VecCmpF64x2 | VecBlendvF64x2
             | VecFmaF64x2 | VecFnmaF64x2 | VecFmaF32x4 | VecFnmaF32x4
+            | VecFmsF64x2 | VecFmsF32x4 | VecFnmsF64x2 | VecFnmsF32x4
             | VecCmpI32x4 | VecBlendvI32x4
             | VecAddI8x16 | VecSubI8x16 | VecCmpI8x16
             | VecMinU8x16 | VecMaxU8x16 | VecBlendvI8x16
@@ -2141,6 +2155,10 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecFnmaF64x2
                 | IntrinsicOp::VecFmaF32x4
                 | IntrinsicOp::VecFnmaF32x4
+                | IntrinsicOp::VecFmsF64x2
+                | IntrinsicOp::VecFnmsF64x2
+                | IntrinsicOp::VecFmsF32x4
+                | IntrinsicOp::VecFnmsF32x4
                 | IntrinsicOp::VecAddI32x8
                 | IntrinsicOp::VecMaxI32x8
                 | IntrinsicOp::VecMinI32x8
@@ -2573,6 +2591,10 @@ mod vector_width_tests {
             "VecFnmaF64x2" => IntrinsicOp::VecFnmaF64x2,
             "VecFmaF32x4" => IntrinsicOp::VecFmaF32x4,
             "VecFnmaF32x4" => IntrinsicOp::VecFnmaF32x4,
+            "VecFmsF64x2" => IntrinsicOp::VecFmsF64x2,
+            "VecFnmsF64x2" => IntrinsicOp::VecFnmsF64x2,
+            "VecFmsF32x4" => IntrinsicOp::VecFmsF32x4,
+            "VecFnmsF32x4" => IntrinsicOp::VecFnmsF32x4,
             "VecMaskedAddI32x8" => IntrinsicOp::VecMaskedAddI32x8,
             "VecMaxF32x4" => IntrinsicOp::VecMaxF32x4,
             "VecMaxF32x8" => IntrinsicOp::VecMaxF32x8,

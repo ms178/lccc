@@ -33,6 +33,29 @@ thread_local! {
     /// may use, in bytes: 16 (SSE), 32 under `-mavx` (`%ymm`), 64 under
     /// `-mavx512f` (`%zmm`). See `target_vector_abi_bytes`.
     static TARGET_VECTOR_ABI_BYTES: Cell<usize> = const { Cell::new(16) };
+    /// Widest packed-SIMD register the *lowering* may use for GCC
+    /// vector-extension arithmetic (`vector_size` / `ext_vector_type`):
+    /// 0 = scalarize every lane, 16 = SSE2 `%xmm`, 32 = AVX2 `%ymm`. See
+    /// `set_target_vector_lowering_bytes`.
+    static TARGET_VECTOR_LOWERING_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Publish the widest packed register the frontend may lower a whole
+/// vector-extension operation to (`0`, `16` or `32`). Distinct from
+/// [`set_target_vector_abi_bytes`]: that one is the psABI *classification*
+/// width, which follows the requested ISA only; this one is the code
+/// generation ceiling (the x86-64-v3 default baseline grants `%ymm` without
+/// changing the ABI). `0` keeps the per-lane scalar lowering — every target
+/// without the x86-64 `Vec*` intrinsic families, `-mno-sse`, and `-O0`.
+pub fn set_target_vector_lowering_bytes(bytes: usize) {
+    debug_assert!(matches!(bytes, 0 | 16 | 32));
+    TARGET_VECTOR_LOWERING_BYTES.with(|c| c.set(bytes));
+}
+
+/// The widest packed register the vector-extension lowering may use
+/// (`0` = scalarize). See [`set_target_vector_lowering_bytes`].
+pub fn target_vector_lowering_bytes() -> usize {
+    TARGET_VECTOR_LOWERING_BYTES.with(|c| c.get())
 }
 
 /// Set the widest vector register the psABI classification may use for a

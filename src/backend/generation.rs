@@ -4765,10 +4765,13 @@ fn generate_function(
                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x4HoistedSIB | crate::ir::intrinsics::IntrinsicOp::MulAddF64x4HoistedSIB
                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x2
                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x2Hoisted
-                | crate::ir::intrinsics::IntrinsicOp::VecZeroF64x4
-                | crate::ir::intrinsics::IntrinsicOp::VecZeroF64x2
-                | crate::ir::intrinsics::IntrinsicOp::VecZeroF32x8
-                | crate::ir::intrinsics::IntrinsicOp::VecZeroF32x4
+                // The `VecZero*` family was listed here too; its emitters
+                // write a register home or go through the mode-aware slot
+                // addressing (`emit_instr_rbp_reg` resolves %rsp-relative
+                // under FPO), so a zero seed alone never needs %rbp. Keeping
+                // it pinned a frame pointer (push/mov/pop and a 32-byte
+                // realigned frame) onto every `v32f s = {}` accumulator
+                // loop whose body otherwise needed no stack at all.
                 | crate::ir::intrinsics::IntrinsicOp::LoadF64x4
                 | crate::ir::intrinsics::IntrinsicOp::LoadF64x2
             ))
