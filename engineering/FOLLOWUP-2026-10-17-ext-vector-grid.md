@@ -425,6 +425,15 @@ fails the gate.
 - *Driver* `-D'NAME(args)=body'` defined an object-like macro named
   `NAME(args)` (`define_macro`); function-like command-line macros now
   parse through the same path as `#define`.
+- *`loop_memset` after `loop_carried_forward`* (main `b933388c`, found by
+  the rebase's regression run under `CCC_VERIFY_IR=1`): the forward-
+  overlap smear `G[i+1] = G[i]` becomes a store of a degenerate header
+  phi `v = φ(G[0], v)`; the fill-byte check only refused BODY-defined
+  values, so the loop was replaced by `memset(G+1, v, n)` with `v`
+  deleted alongside the loop (undefined use; `loop_idiom_copy_norewrite`).
+  The census now refuses any value defined in a loop block and sees
+  through the degenerate phi to its entry value (`memset(G+1, G[0], n)`
+  is exactly the smear). Corpus test `loop_memset_smear_phi.c`.
 - *Loop-carried FMA gate* was coarser than the scalar one: `s = s*a[i]
   + c` was left unfused (GCC fuses it; the differential disagreed by one
   rounding). Now the exact scalar rule: fuse unless the accumulator is the
