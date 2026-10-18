@@ -599,6 +599,8 @@ jobs:
         env CCC=target/fastbuild/lccc python3 scripts/check_repro_replay.py
     - name: Shuffle builtin diagnostics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_shuffle_diagnostics.sh
+    - name: ext-vector swizzle diagnostics
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_swizzle_diagnostics.sh
     - name: Subscript constraint diagnostics
       run: env CCC=target/fastbuild/lccc python3 tests/regression/check_subscript_diagnostics.py
     - name: Cross-target intrinsic trap

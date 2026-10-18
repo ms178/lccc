@@ -2873,21 +2873,51 @@ impl SemanticAnalyzer {
                 // `v.lo`): validate the spelling here so a typo or an
                 // out-of-range component is an error, not offset-0 garbage.
                 if base_ctype.ext_vector_swizzle(field_name).is_none() {
-                    let type_name = format!("{}", base_ctype);
                     let lanes = base_ctype.vector_info().map_or(0, |(_, n)| n);
-                    let msg = if field_name
-                        .bytes()
-                        .all(|b| b"xyzwrgba".contains(&b) || b == b's' || b.is_ascii_hexdigit())
-                    {
-                        format!(
-                            "vector component access '{}' exceeds type '{}' ({} lanes)",
-                            field_name, type_name, lanes
-                        )
-                    } else {
-                        format!("illegal vector component name '{}'", field_name)
-                    };
+                    let msg =
+                        if crate::common::types::ext_vector_component_indices(field_name, lanes)
+                            .is_some()
+                        {
+                            format!(
+                                "vector component access '{}' exceeds type '{}' ({} lanes)",
+                                field_name, base_ctype, lanes
+                            )
+                        } else {
+                            format!("illegal vector component name '{}'", field_name)
+                        };
                     self.diagnostics.borrow_mut().error(msg, span);
                 }
+                return;
+            }
+            // A definite scalar base (arithmetic, pointer, a GNU vector):
+            // `x.y` on a float, `p->z` on an `int *`, `w.hi.y` on a two-lane
+            // ext vector whose `.hi` is already the scalar lane. Used to be
+            // accepted and lowered as field offset 0 (a miscompile with no
+            // diagnostic). Anything the checker cannot name (`None`,
+            // typeof, incomplete) still skips.
+            CType::Int
+            | CType::UInt
+            | CType::Char
+            | CType::UChar
+            | CType::Short
+            | CType::UShort
+            | CType::Long
+            | CType::ULong
+            | CType::LongLong
+            | CType::ULongLong
+            | CType::Bool
+            | CType::Float
+            | CType::Double
+            | CType::LongDouble
+            | CType::Pointer(..)
+            | CType::Vector(..) => {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "request for member '{}' in something not a structure or union (base type '{}')",
+                        field_name, base_ctype
+                    ),
+                    span,
+                );
                 return;
             }
             _ => return, // Not a struct/union; skip check
@@ -3716,6 +3746,17 @@ impl SemanticAnalyzer {
             | (CType::Union(_), _)
             | (_, CType::Struct(_))
             | (_, CType::Union(_)) => true,
+            // Vectors of different sizes never convert implicitly (GCC:
+            // "incompatible types when assigning"; Clang: "assigning to
+            // 'float2' from incompatible type 'float4'"), including a
+            // multi-component swizzle target (`v.xy = v`). Same-size
+            // vectors with different lanes are GCC's lax conversion and
+            // a scalar converts to an ext vector by splat; both stay
+            // accepted.
+            (
+                CType::Vector(..) | CType::ExtVector(..),
+                CType::Vector(..) | CType::ExtVector(..),
+            ) => from_ty.size() != to_ty.size(),
             _ => false,
         };
         if incompatible {

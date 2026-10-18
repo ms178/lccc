@@ -1506,9 +1506,6 @@ impl Lowerer {
         None
     }
 
-    /// Resolve member access to get the CType of the field (not just the IrType).
-    /// This is needed to check if a field is an array type (for array decay behavior).
-    /// Handles both direct (s.field) and pointer (p->field) access.
     /// `base.field` / `base->field` where the (pointed-to) base is a Clang
     /// ext vector: the vector type and the lanes the component spelling
     /// names (`v.x` -> [0], `v.zy` -> [2, 1]). `None` for anything else, so
@@ -1534,6 +1531,9 @@ impl Lowerer {
         Some((vec_ct, lanes))
     }
 
+    /// Resolve member access to get the CType of the field (not just the IrType).
+    /// This is needed to check if a field is an array type (for array decay behavior).
+    /// Handles both direct (s.field) and pointer (p->field) access.
     pub(super) fn resolve_member_field_ctype_impl(
         &self,
         base_expr: &Expr,

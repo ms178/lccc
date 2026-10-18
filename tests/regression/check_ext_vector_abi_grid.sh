@@ -9,6 +9,9 @@
 #   clang -> clang   oracle sanity (a failure here is an oracle defect)
 #   clang -> lccc    lccc calls Clang-compiled functions
 #   lccc  -> clang   Clang calls lccc-compiled functions
+#   clangO0 -> clang (-O2 only) Clang -O0 provider under the Clang -O2
+#                    caller: oracle self-consistency across optimisation
+#                    levels, no lccc code involved
 #   lccc  -> lccc    lccc agrees with itself
 # The caller checks every lane of identity returns, a call whose fourth
 # vector lands past all register pieces (i386: %xmm0-2), an argument-only
@@ -65,10 +68,19 @@ declare -A seen_expected
 # failing with the expectation for this leg. Returns 0 when they agree.
 leg_verdict() {
     local key=$1 rc=$2 log=$3
-    local actual want extra missing chk flaky judged
+    local actual want extra missing chk flaky judged tolerated
     actual=$(awk '/^FAIL /{print $2}' "$log" | sort -u | tr '\n' ' ')
     want=$(tr ' ' '\n' <<<"${expected[$key]:-}" | sed '/^$/d' | sort -u | tr '\n' ' ')
     seen_expected[$key]=1
+    # The oracle self-consistency leg (Clang -O0 provider, Clang -O2 caller)
+    # inherits the same-opt clang:clang expectations as TOLERATED: a check
+    # Clang already fails against itself at -O2 has no reference here either,
+    # but it is not required to fail across optimisation levels. Checks the
+    # leg lists explicitly keep the exact-match rule.
+    tolerated=
+    if [[ $key == *" clangO0:clang" ]]; then
+        tolerated=${expected["${key% *} clang:clang"]:-}
+    fi
     if [[ $rc -ne 0 && -z $actual ]]; then
         fail "$key: probe exited $rc without a verdict: $(tr '\n' ' ' <"$log")"
         return 1
@@ -89,7 +101,11 @@ leg_verdict() {
     for chk in $flaky; do flaky_total=$((flaky_total + 1)); done
     extra=
     missing=
-    for chk in $actual; do [[ " $want " == *" $chk "* ]] || extra+="$chk "; done
+    for chk in $actual; do
+        [[ " $want " == *" $chk "* ]] && continue
+        if [[ " $tolerated " == *" $chk "* ]]; then xfail_oracle=$((xfail_oracle + 1)); continue; fi
+        extra+="$chk "
+    done
     for chk in $want; do [[ " $actual " == *" $chk "* ]] || missing+="$chk "; done
     if [[ -n $extra ]]; then
         fail "$key: unexpected failure(s): $extra"
@@ -99,7 +115,7 @@ leg_verdict() {
     fi
     [[ -z $extra && -z $missing ]] || return 1
     for chk in $actual; do
-        case ${expected_class["$key $chk"]} in
+        case ${expected_class["$key $chk"]:-} in
             oracle) xfail_oracle=$((xfail_oracle + 1)) ;;
             lccc) xfail_lccc=$((xfail_lccc + 1)) ;;
         esac
@@ -212,7 +228,18 @@ for bits in 64 32; do
                 done
             done
             [[ $ok == 1 ]] || continue
-            for leg in clang:clang clang:lccc lccc:clang lccc:lccc; do
+            # Keep the -O0 Clang provider: the -O2 pass links it against the
+            # -O2 Clang caller (`clangO0:clang`), the oracle self-consistency
+            # leg that tells an lccc defect from an LLVM -O0/-O2 disagreement
+            # without lccc in the picture (ORACLE-CLANG-2313-2).
+            legs="clang:clang clang:lccc lccc:clang lccc:lccc"
+            if [[ $opt == -O0 ]]; then
+                cp "$tmp/p-clang.o" "$tmp/p-clangO0-$bits-$shape.o"
+            elif [[ -f $tmp/p-clangO0-$bits-$shape.o ]]; then
+                cp "$tmp/p-clangO0-$bits-$shape.o" "$tmp/p-clangO0.o"
+                legs+=" clangO0:clang"
+            fi
+            for leg in $legs; do
                 prov=${leg%:*}
                 call=${leg#*:}
                 exe=$tmp/t

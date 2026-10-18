@@ -397,6 +397,53 @@ pub enum I386ExtVectorCarrier {
 /// `<N x x86_fp80>` at the element's 80-bit size (see `ExtVectorLayout`).
 pub const X87_LANE_STRIDE: usize = 10;
 
+/// The lane indices a Clang ext-vector component spelling names on a
+/// vector of `lanes` lanes, WITHOUT the range check (`ext_vector_swizzle`
+/// adds it): `None` only when `name` is not a component spelling at all.
+/// One naming set per access -- `xyzw`, `rgba`, or `s`/`S` followed by hex
+/// digits -- and the four halving names `lo`/`hi`/`even`/`odd`, which stand
+/// alone and are resolved against the lane count. Sema uses the split to
+/// tell "illegal vector component name" from "access exceeds type".
+pub fn ext_vector_component_indices(name: &str, lanes: usize) -> Option<Vec<usize>> {
+    let idx: Vec<usize> = match name {
+        "lo" => (0..lanes / 2).collect(),
+        "hi" => (lanes / 2..lanes).collect(),
+        "even" => (0..lanes).step_by(2).collect(),
+        "odd" => (1..lanes).step_by(2).collect(),
+        _ => {
+            let bytes = name.as_bytes();
+            if bytes.is_empty() {
+                return None;
+            }
+            if bytes[0] == b's' || bytes[0] == b'S' {
+                if bytes.len() < 2 {
+                    return None;
+                }
+                bytes[1..]
+                    .iter()
+                    .map(|&b| (b as char).to_digit(16).map(|d| d as usize))
+                    .collect::<Option<Vec<_>>>()?
+            } else {
+                let set: &[u8] = if bytes.iter().all(|b| b"xyzw".contains(b)) {
+                    b"xyzw"
+                } else if bytes.iter().all(|b| b"rgba".contains(b)) {
+                    b"rgba"
+                } else {
+                    return None;
+                };
+                bytes
+                    .iter()
+                    .map(|b| set.iter().position(|c| c == b))
+                    .collect::<Option<Vec<_>>>()?
+            }
+        }
+    };
+    if idx.is_empty() {
+        return None;
+    }
+    Some(idx)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExtVectorLayout {
     pub lanes: usize,
@@ -2471,8 +2518,6 @@ impl CType {
         (1..=3).contains(&words).then_some(words)
     }
 
-    /// Storage stride for one logical vector lane, or None for a packed bool
-    /// ext-vector whose lane addresses are bit positions rather than bytes.
     /// Resolve a Clang ext-vector component access (`v.x`, `v.zyx`, `v.rgb`,
     /// `v.s03`, `v.lo`/`.hi`/`.even`/`.odd`) on this vector type to the lane
     /// indices it names, in order. `None` when `self` is not an ext vector
@@ -2485,41 +2530,8 @@ impl CType {
         let CType::ExtVector(_, layout) = self else {
             return None;
         };
-        let lanes = layout.lanes;
-        let idx: Vec<usize> = match name {
-            "lo" => (0..lanes / 2).collect(),
-            "hi" => (lanes / 2..lanes).collect(),
-            "even" => (0..lanes).step_by(2).collect(),
-            "odd" => (1..lanes).step_by(2).collect(),
-            _ => {
-                let bytes = name.as_bytes();
-                if bytes.is_empty() {
-                    return None;
-                }
-                if bytes[0] == b's' || bytes[0] == b'S' {
-                    if bytes.len() < 2 {
-                        return None;
-                    }
-                    bytes[1..]
-                        .iter()
-                        .map(|&b| (b as char).to_digit(16).map(|d| d as usize))
-                        .collect::<Option<Vec<_>>>()?
-                } else {
-                    let set: &[u8] = if bytes.iter().all(|b| b"xyzw".contains(b)) {
-                        b"xyzw"
-                    } else if bytes.iter().all(|b| b"rgba".contains(b)) {
-                        b"rgba"
-                    } else {
-                        return None;
-                    };
-                    bytes
-                        .iter()
-                        .map(|b| set.iter().position(|c| c == b))
-                        .collect::<Option<Vec<_>>>()?
-                }
-            }
-        };
-        if idx.is_empty() || idx.iter().any(|&i| i >= lanes) {
+        let idx = ext_vector_component_indices(name, layout.lanes)?;
+        if idx.iter().any(|&i| i >= layout.lanes) {
             return None;
         }
         Some(idx)
@@ -2547,6 +2559,8 @@ impl CType {
         matches!(self, CType::ExtVector(elem, _) if matches!(**elem, CType::LongDouble))
     }
 
+    /// Storage stride for one logical vector lane, or None for a packed bool
+    /// ext-vector whose lane addresses are bit positions rather than bytes.
     pub fn vector_element_storage_size(&self) -> Option<usize> {
         match self {
             CType::Vector(elem, _) => Some(elem.size()),

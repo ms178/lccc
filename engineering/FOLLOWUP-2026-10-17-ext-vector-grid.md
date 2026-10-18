@@ -1,6 +1,6 @@
 # Follow-up: ext_vector_type ABI grid — first measured run against Clang 23.1.3
 
-**Status: open (ABI-EXTVEC-VA-1, ABI-EXTVEC-I386-O2-1 and ABI-EXTVEC-LD-1 fixed; the Clang oracle class, ABI-GNUVEC-I386-1 and ABI-EXTVEC-LD-I386-1 open).** Measured on 2026-10-17 by the hosted "Frontend and ABI
+**Status: every lccc-class entry fixed (ABI-EXTVEC-VA-1, ABI-EXTVEC-I386-O2-1, ABI-EXTVEC-LD-1, ABI-EXTVEC-LD-I386-1); open: the Clang oracle class (ORACLE-CLANG-2313-1/-2) and ABI-GNUVEC-I386-1 (GNU `vector_size` on i386, latched by its own gate).** Measured on 2026-10-17 by the hosted "Frontend and ABI
 contracts" job (ubuntu-24.04, lccc fastbuild, Clang 23.1.3 from
 `scripts/ci_install_clang_oracle.sh`, GCC 16 as the linker driver).
 `tests/regression/check_ext_vector_abi_grid.sh` ran 848 legs over 53 shapes
@@ -28,7 +28,28 @@ caller** leg fails, so there is no reference convention for lccc to meet:
   wider-than-16 shapes do not. Clang's i386 variadic caller and its
   `va_arg` lowering use different slot sizes/alignments for these.
 - **`long double` vectors on x86-64**: `ldx1 hashva` (-O0, -O2) and
-  `ldx3 ident kfour` at -O2 fail clang→clang.
+  `ldx3 ident kfour` at -O2 fail clang→clang. `ldx1 hashva` also fails
+  `clang:lccc` (Clang's `va_arg` reads the one-lane vector from the XMM
+  register save area although its own caller — and lccc's — passes it in
+  memory; `lccc:clang` passes).
+- **ORACLE-CLANG-2313-2 — `ldx3` at -O2, both targets** (second hosted
+  measurement, after the 10-byte lane stride landed): `hash2`/`hashva`
+  fail `clang:lccc` and `lccc:clang` at -O2 only, while every -O0 cross
+  leg and both lccc ↔ lccc legs pass. lccc's layout is
+  optimisation-level invariant (lccc -O0 ↔ lccc -O2 links pass locally in
+  all four pairings; the callee reads `x` at `entry+8` and `y` at
+  `entry+72` at both levels) and agrees with Clang -O0, so Clang -O0 and
+  Clang -O2 must disagree with each other about the lanes of
+  `<3 x x86_fp80>`. The gate now proves that without lccc in the picture:
+  the `clangO0:clang` leg (Clang -O0 provider, Clang -O2 caller) runs for
+  every -O2 shape and is listed as failing `hash2`/`hashva` for `ldx3` on
+  x86-64 and `hash2` on i386. (Likely LLVM mechanism: the -O2 pipeline
+  scalarizes a `load <3 x x86_fp80>` + `extractelement` through a GEP
+  whose index scales by the element's 16-byte *alloc* size, while the
+  vector load/store legalization packs lanes at the 10-byte *store*
+  size; `<2 x x86_fp80>` does not take that path, which is why `ldx2`
+  -O2 passes.) If the self-consistency leg ever passes, the rows are
+  "expected failure did not occur" and the lccc side must be re-triaged.
 
 These are Clang defects (or, for `va_arg` of a vector, an area the psABI
 leaves to the implementation). They are listed so the gate does not pretend
@@ -214,16 +235,55 @@ Clang), `sizeof(v.xy)`; sema diagnoses "illegal vector component name" and
 of miscompiled: compound assignment to a multi-component swizzle
 (`v.xy += w`). Test: `tests/regression/ext_vector_swizzle.c`.
 
-**Residual: ABI-EXTVEC-LD-I386-1** (6 rows, i386 `ldx3` only): `ident`/
-`kfour` cross legs at -O0 and `hash2` cross legs at -O2 disagree with Clang
-(lccc agrees with itself; the -O2 `ident`/`kfour` legs are Clang-broken,
-class `oracle`). On i386 Linux every vector argument and return is
-`getDirect()` for Clang, so `<3 x x86_fp80>` is what LLVM's i386
-legalization makes of it (scalarized `f80` slots and an sret-demoted
-return), not the 64-byte image with a 4-byte-aligned slot lccc uses after
-the hidden pointer. Not measurable here without Clang; it needs the
-hosted run's assembly to pin the slot layout before changing the i686
-carrier.
+**ABI-EXTVEC-LD-I386-1 — FIXED** by the lane stride: the second hosted
+measurement reports the i386 `ldx3` -O0 `ident`/`kfour` rows as "expected
+failure did not occur" (removed); the i386 `ldx3` -O2 `hash2` rows are the
+same -O2-only Clang self-inconsistency as on x86-64 and are re-attributed
+to ORACLE-CLANG-2313-2. The ten i386 -O2 `lccc:lccc hashva` rows of the
+32/64-byte shapes also stopped failing (removed). i386 `ldx2` by-value
+return stays rejected (grid `ret_unsupported`; Clang returns it in
+`FP0/FP1`, lccc's i686 ext-vector return carrier does not use the pair
+primitive) — a diagnosed limitation, not a miscompile.
+
+**Second pass over the swizzle implementation (this revision).**
+
+- `d->xyz = s->zyx` read the source through a zero-initialised temporary
+  (6 stores, 3 of them dead): a swizzle on the right now reads its lanes
+  straight out of the source vector. Every source lane is loaded before
+  the first store, so `v.xy = v.yx` and `rev3(&o, &o)` behave as through a
+  temporary (-O2: 3 loads + 3 stores for the three-lane copy, 2 + 2 for
+  the swap).
+- The assignment's result vector was built after every swizzle store,
+  re-reading the destination lanes (an extra **volatile** access per lane
+  for a `volatile` vector, and dead work otherwise); it is now built from
+  the stored values, and only when the assignment's value is used
+  (`discard_assign_result`, set by `lower_expr_discard` for expression
+  statements and `for` increments).
+- `v.x = 1.0L` on a `long double` lane went through the x87 scratch +
+  10-byte copy; a constant lane is now two immediate stores (8 + 2 bytes).
+- Sema: "illegal vector component name" vs "exceeds type" are told apart
+  by the spelling (`v.xr` mixes naming sets and is illegal, not out of
+  range); a vector assigned from a vector of another size (`v.xy = v`,
+  GNU `v2 = v4`) is "incompatible types" like GCC/Clang instead of a
+  silent wrong-size copy; member access on a scalar base (`x.y` on a
+  float, `p->z` on an `int *`, `w.hi.y` on a two-lane vector) is
+  "request for member in something not a structure or union" instead of
+  offset-0 garbage. Gate: `tests/regression/check_ext_vector_swizzle_diagnostics.sh`
+  (14 fixtures, positive control runs).
+- Still diagnosed rather than implemented: compound assignment to a
+  multi-component swizzle (`v.xy += w`; single components take every
+  operator).
+
+**Backend debt observed, not changed here (quantified).** Every IR `F128`
+load materialises a truncated `double` shadow in `%rax` (`fstpt slot; fldt
+slot; subq $8,%rsp; fstpl (%rsp); popq %rax`, `emit_f128_load_finish`) that
+nothing reads when the value stays x87; a non-constant x87 lane store is
+`fstpt scratch` + `movq/movw` copy (3 memory operations where `fstpt
+10(%rdi)` would do, because the generic `F128` store and the
+load→store copy peephole (`generation.rs`, "Exact F128 load->store is a
+16-byte copy") write 16 bytes). Both are properties of the x87 value model
+shared by scalar `long double`, outside this grid's scope; `long double`
+ext vectors are a correctness carrier, not a performance one on x86-64.
 
 ### ABI-EXTVEC-I386-O2-1 — i386 -O2 only: 32/64-byte by-value vectors (27) — **FIXED**
 

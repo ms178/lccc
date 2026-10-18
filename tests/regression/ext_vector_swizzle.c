@@ -26,6 +26,13 @@ __attribute__((noinline)) F4 mk(float a, float b, float c, float d) {
 }
 __attribute__((noinline)) float sum_hi(const F4 *p) { return p->hi.x + p->hi.y; }
 __attribute__((noinline)) void set_odd(F4 *p, F2 v) { p->yw = v; }
+/* swizzle-to-swizzle copies read every source lane before the first store:
+ * `d == s` and the in-place swap must behave as if through a temporary. */
+__attribute__((noinline)) void rev3(F4 *d, const F4 *s) { d->xyz = s->zyx; }
+__attribute__((noinline)) void swap_xy(F4 *p) { p->xy = p->yx; }
+__attribute__((noinline)) void swap_ld(T3 *p) { p->xz = p->zx; }
+/* a vector-returning call as the swizzle source */
+__attribute__((noinline)) void from_call(F4 *p) { p->wz = mk(1, 2, 3, 4).xy; }
 
 int main(void) {
     int bad = 0;
@@ -88,6 +95,26 @@ int main(void) {
     volatile F4 vv = v;
     vv.x = 100;
     if (vv.x != 100 || vv.w != 8) bad |= 1 << 19;
+
+    /* overlapping source and destination */
+    F4 o = {1, 2, 3, 4};
+    rev3(&o, &o);
+    if (o.x != 3 || o.y != 2 || o.z != 1 || o.w != 4) bad |= 1 << 20;
+    swap_xy(&o);
+    if (o.x != 2 || o.y != 3) bad |= 1 << 21;
+    T3 tl = {1.0L, 2.0L, 3.0L};
+    swap_ld(&tl);
+    if (tl.x != 3.0L || tl.y != 2.0L || tl.z != 1.0L) bad |= 1 << 22;
+    from_call(&o);
+    if (o.w != 1 || o.z != 2 || o.x != 2) bad |= 1 << 23;
+    vv.xy = vv.yx; /* volatile: each lane read once, written once */
+    if (vv.x != 3 || vv.y != 100) bad |= 1 << 24;
+    /* constant x87 lane stores take the immediate path */
+    T3 tc;
+    tc.x = 1.0L;
+    tc.y = -2.5L;
+    tc.z = 0.0L;
+    if (tc.x != 1.0L || tc.y != -2.5L || tc.z != 0.0L || tc.hi.y != 0.0L) bad |= 1 << 25;
 
     printf("swizzle: %s (0x%x)\n", bad ? "FAIL" : "ok", bad);
     return bad;

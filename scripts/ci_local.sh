@@ -504,6 +504,14 @@ gate "ivsr-reproducers" fast \
 gate "shuffle-diagnostics" fast \
     env CCC="$LCCC" bash tests/regression/check_shuffle_diagnostics.sh
 
+# Clang ext_vector_type component access: every form Clang rejects (illegal
+# or mixed component names, out-of-range lanes, duplicate or compound
+# swizzle assignment, width-mismatched vector assignment, member access on
+# a scalar) is a positioned diagnostic, never offset-0 garbage or an ICE; the
+# accepted forms compile and run.
+gate "ext-vector-swizzle-diagnostics" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_swizzle_diagnostics.sh
+
 # C11 6.5.2.1p1: a subscript whose operands are not pointer + integer must be
 # diagnosed (LCCC lowered it as a pointer access, crashing struct-based
 # `__m256` code at run time); oracle-checked against gcc.

@@ -19,6 +19,7 @@ impl Lowerer {
     /// `None` when `lhs` is not such a swizzle (or is a single component,
     /// which is an ordinary element lvalue).
     fn try_lower_swizzle_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Option<Operand> {
+        let discard_result = std::mem::replace(&mut self.discard_assign_result, false);
         let (base_expr, field_name, is_pointer) = match lhs {
             Expr::MemberAccess(b, f, _) => (&**b, f.as_str(), false),
             Expr::PointerMemberAccess(b, f, _) => (&**b, f.as_str(), true),
@@ -55,44 +56,84 @@ impl Lowerer {
         };
         // Evaluate the right side first (C: the store is not sequenced
         // before the operand evaluation), then the destination address.
-        let (rhs_ptr, rhs_scalar) = if rhs_ct.is_vector() {
-            (Some(self.vector_operand_ptr(rhs, &rhs_ct)), None)
+        // Every source lane is loaded before the first store: the source
+        // may overlap the destination (`v.xy = v.yx` swaps; `d->xyz =
+        // s->zyx` with `d == s`). A swizzle on the right reads its lanes
+        // straight out of the source vector instead of through a temporary.
+        let rhs_swizzle = match rhs {
+            Expr::MemberAccess(b, f, _) => self
+                .vector_member_lanes(b, f, false)
+                .map(|(ct, l)| (&**b, ct, l, false)),
+            Expr::PointerMemberAccess(b, f, _) => self
+                .vector_member_lanes(b, f, true)
+                .map(|(ct, l)| (&**b, ct, l, true)),
+            _ => None,
+        }
+        .filter(|(_, _, l, _)| l.len() == lanes.len());
+        let mut values: Vec<Operand> = Vec::with_capacity(lanes.len());
+        if let Some((src_expr, src_ct, src_lanes, src_is_pointer)) = rhs_swizzle {
+            let src_space = if src_is_pointer {
+                self.get_addr_space_of_ptr_expr(src_expr)
+            } else {
+                self.get_addr_space_of_struct_expr(src_expr)
+            };
+            let src_volatile = if src_is_pointer {
+                self.pointee_expr_is_volatile(src_expr)
+            } else {
+                self.expr_access_is_volatile(src_expr)
+            };
+            let src = self.vector_lane_addr_of_expr(src_expr, &src_ct, 0, src_is_pointer);
+            let src_elem = src_ct
+                .vector_info()
+                .map_or(elem_ir_ty, |(e, _)| Self::vector_elem_ir_type(&e));
+            for &sl in &src_lanes {
+                let v = self.load_vector_lane(src, &src_ct, sl, src_space, src_volatile);
+                values.push(self.emit_implicit_cast(v, src_elem, elem_ir_ty));
+            }
+        } else if rhs_ct.is_vector() {
+            let ptr = self.vector_operand_ptr(rhs, &rhs_ct);
+            let src_elem = rhs_ct
+                .vector_info()
+                .map_or(elem_ir_ty, |(e, _)| Self::vector_elem_ir_type(&e));
+            for i in 0..lanes.len() {
+                let v = self.load_vector_lane(ptr, &rhs_ct, i, AddressSpace::Default, false);
+                values.push(self.emit_implicit_cast(v, src_elem, elem_ir_ty));
+            }
         } else {
+            // Scalar right operand: Clang splats it over the named lanes.
             let raw = self.lower_expr(rhs);
             let raw_ty = self.value_ir_type(rhs);
-            (None, Some(self.emit_implicit_cast(raw, raw_ty, elem_ir_ty)))
-        };
-        let dest = self.vector_lane_addr_of_expr(base_expr, &vec_ct, 0, is_pointer);
-        for (i, &lane) in lanes.iter().enumerate() {
-            let v = match rhs_ptr {
-                Some(ptr) => {
-                    let src_ct = if rhs_ct.is_vector() {
-                        &rhs_ct
-                    } else {
-                        &result_ct
-                    };
-                    let v = self.load_vector_lane(ptr, src_ct, i, AddressSpace::Default, false);
-                    let src_elem = src_ct
-                        .vector_info()
-                        .map_or(elem_ir_ty, |(e, _)| Self::vector_elem_ir_type(&e));
-                    self.emit_implicit_cast(v, src_elem, elem_ir_ty)
-                }
-                None => rhs_scalar
-                    .clone()
-                    .unwrap_or(Operand::Const(IrConst::I64(0))),
-            };
-            self.store_vector_lane(dest, &vec_ct, lane, v, elem_ir_ty, addr_space, volatile);
+            let v = self.emit_implicit_cast(raw, raw_ty, elem_ir_ty);
+            values.resize(lanes.len(), v);
         }
+        let dest = self.vector_lane_addr_of_expr(base_expr, &vec_ct, 0, is_pointer);
+        for (&lane, v) in lanes.iter().zip(values.iter()) {
+            self.store_vector_lane(
+                dest,
+                &vec_ct,
+                lane,
+                v.clone(),
+                elem_ir_ty,
+                addr_space,
+                volatile,
+            );
+        }
+        let stored = values;
         // The value of the assignment is the right operand converted to
-        // the swizzle's type; callers that use it get a fresh vector.
+        // the swizzle's type. An expression statement never reads it; a
+        // consumer gets a fresh vector built from the values just stored
+        // (not re-read from the destination: a volatile object must not
+        // see an access the source does not contain).
+        if discard_result {
+            return Some(Operand::Const(IrConst::I64(0)));
+        }
         let size = result_ct.size();
         let align = self.ctype_align(&result_ct);
         let out = self.emit_entry_alloca(IrType::Ptr, size, align, false);
         if crate::ir::lowering::lower::vector_temp_needs_zero_init(&result_ct, lanes.len()) {
             self.zero_init_alloca(out, size);
         }
-        for (i, &lane) in lanes.iter().enumerate() {
-            let v = self.load_vector_lane(dest, &vec_ct, lane, addr_space, volatile);
+        for (i, v) in stored.into_iter().enumerate() {
             self.store_vector_lane(
                 out,
                 &result_ct,

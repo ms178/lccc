@@ -808,6 +808,31 @@ impl Lowerer {
         volatile: bool,
         seg_override: AddressSpace,
     ) {
+        // A constant lane value needs no x87 round trip: store its 80-bit
+        // image as an 8-byte and a 2-byte immediate store (`v.x = 1.0L`).
+        if let Operand::Const(IrConst::LongDouble(_, f128_bytes)) = &val {
+            let x87 = crate::common::long_double::f128_bytes_to_x87_bytes(f128_bytes);
+            let lo = u64::from_le_bytes([
+                x87[0], x87[1], x87[2], x87[3], x87[4], x87[5], x87[6], x87[7],
+            ]);
+            let hi = u16::from_le_bytes([x87[8], x87[9]]);
+            self.emit(Instruction::Store {
+                volatile,
+                val: Operand::Const(IrConst::I64(lo as i64)),
+                ptr: addr,
+                ty: IrType::U64,
+                seg_override,
+            });
+            let hi_dst = self.emit_gep_offset(addr, 8, IrType::U16);
+            self.emit(Instruction::Store {
+                volatile,
+                val: Operand::Const(IrConst::I64(i64::from(hi))),
+                ptr: hi_dst,
+                ty: IrType::U16,
+                seg_override,
+            });
+            return;
+        }
         let scratch = self.fresh_value();
         self.emit(Instruction::Alloca {
             dest: scratch,

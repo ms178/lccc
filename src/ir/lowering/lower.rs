@@ -89,6 +89,11 @@ pub struct Lowerer {
     /// (expression statement, for-increment), so a discarded post-inc/dec can
     /// skip its volatile old-value spill.
     pub(super) discard_expr_result: bool,
+    /// Set while lowering an `Expr::Assign` whose value is discarded
+    /// (expression statement, for-increment): a swizzle assignment then
+    /// skips materialising its result vector. Captured at the start of
+    /// `try_lower_swizzle_assign`; any nested `lower_expr` clears it.
+    pub(super) discard_assign_result: bool,
     /// Set of function names that have at least one file-scope declaration
     /// without the `inline` specifier OR with `extern`. Per C99 6.7.4p7,
     /// an inline definition is only an "inline definition" (no external def)
@@ -265,6 +270,7 @@ impl Lowerer {
             pure_functions: FxHashSet::default(),
             const_functions: FxHashSet::default(),
             discard_expr_result: false,
+            discard_assign_result: false,
             has_non_inline_decl: FxHashSet::default(),
             types: type_context,
             func_meta: FunctionMeta::default(),
