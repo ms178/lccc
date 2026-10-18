@@ -18,6 +18,7 @@ use crate::ir::reexports::{
     Operand, Terminator, Value,
 };
 use crate::passes::loop_analysis;
+use crate::passes::round_cap;
 
 /// Maximum number of IR instructions (across all blocks) in a callee for it
 /// to be eligible for inlining. This handles constant-returning helpers
@@ -1204,8 +1205,12 @@ fn inline_run_with(
         let mut size_after_cleanup: Option<usize> = None;
         loop {
             let mut second_pass_inlined = false;
+            // T5 (round_cap): a budget exit counts only if the last round still
+            // inlined something; this flag records exactly that.
+            let mut ordinary_round_inlined = false;
             while ordinary_rounds_left > 0 {
                 ordinary_rounds_left -= 1;
+                ordinary_round_inlined = false;
                 // Check if the caller has grown too large for further normal inlining.
                 // Each SSA value in CCC gets an 8-byte stack slot, so functions with
                 // too many instructions will have massive stack frames. Stop normal
@@ -1514,10 +1519,14 @@ fn inline_run_with(
                         budget_remaining = budget_remaining.saturating_sub(callee_inst_count);
                     }
                     total_inlined += 1;
+                    ordinary_round_inlined = true;
                     module.functions[func_idx].has_inlined_calls = true;
                 } else {
                     break;
                 }
+            }
+            if ordinary_rounds_left == 0 && ordinary_round_inlined {
+                round_cap::note_cap_hit(round_cap::Site::InlineOrdinaryRounds);
             }
 
             // Second pass: ensure all remaining __always_inline call sites are inlined.
@@ -1539,8 +1548,10 @@ fn inline_run_with(
             // critical inlines (avoiding linker errors and BRK crashes), so they
             // must proceed regardless of caller size. The budget limit (400 inst)
             // provides the growth bound instead.
+            let mut second_pass_round_inlined = false;
             while second_pass_rounds_left > 0 {
                 second_pass_rounds_left -= 1;
+                second_pass_round_inlined = false;
                 let mut call_sites = find_inline_call_sites(
                     &module.functions[func_idx],
                     &callee_map,
@@ -1714,6 +1725,7 @@ fn inline_run_with(
                         }
                         total_inlined += 1;
                         second_pass_inlined = true;
+                        second_pass_round_inlined = true;
                         module.functions[func_idx].has_inlined_calls = true;
                         if !is_tiny && !is_small && !caller_has_section {
                             second_pass_budget =
@@ -1726,6 +1738,9 @@ fn inline_run_with(
                 if !found {
                     break;
                 }
+            }
+            if second_pass_rounds_left == 0 && second_pass_round_inlined {
+                round_cap::note_cap_hit(round_cap::Site::InlineSecondPassRounds);
             }
             if !joint_fixpoint_enabled || !second_pass_inlined || ordinary_rounds_left == 0 {
                 break;

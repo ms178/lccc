@@ -14,6 +14,12 @@ measured negatives in [`DECISIONS.md`](DECISIONS.md), raw numbers in
 intermediate-cast bit-idiom miscompiles and salvage two SQLite regressions.
 [Continuity and prioritized follow-up](FOLLOWUP-a9987d0-2026-10-11.md).
 
+## vellvm / vir transplant audit (2026-10-18)
+
+[Audit and transplant register](../docs/VELLVM_VIR_TRANSPLANT_AUDIT.md): what
+to take from two formal-verification projects, what was rejected, and why.
+[Continuity and prioritized follow-up](FOLLOWUP-2026-10-18-vellvm-vir-transplant.md).
+
 ## Read order for an implementation agent
 
 1. [`STATE.md`](STATE.md) — the compiler as it is on `main` right now.

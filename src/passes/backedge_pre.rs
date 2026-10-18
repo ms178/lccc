@@ -82,6 +82,7 @@ use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{
     BasicBlock, BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Value,
 };
+use crate::passes::round_cap;
 
 /// Upper bound on fixpoint rounds. Each applied rewrite strictly removes one
 /// in-loop non-phi instruction, so termination does not depend on this; it
@@ -1468,12 +1469,17 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     }
     let tm = TargetModel::detect();
     let mut total = 0;
+    let mut converged = false;
     for _ in 0..MAX_ROUNDS {
         let n = run_round(func, &env, &tm);
         total += n;
         if n == 0 {
+            converged = true;
             break;
         }
+    }
+    if !converged {
+        round_cap::note_cap_hit(round_cap::Site::BackedgePre);
     }
     total
 }

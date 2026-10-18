@@ -1449,6 +1449,15 @@ jobs:
         bash tests/regression/check_got64_old_spelling.sh
         bash tests/regression/check_tls_pie_preemptible.sh
         bash tests/regression/check_tls_model_selection.sh
+        # T5 round-cap observability (engineering/FOLLOWUP-2026-10-18-vellvm-vir-transplant.md):
+        # the report must print under CCC_TIME_PASSES and nowhere else. Mirrors the
+        # ci_local.sh gate; check_ci_gate_parity.py fails if the two lists drift.
+        bash tests/regression/check_round_cap_observability.sh
+        # T6: IR verifier clean on the fixed gate subset (mirrors ci_local.sh).
+        bash tests/regression/check_verify_ir_clean.sh
+        # T4/T7: mutation self-tests for the C reducer and the punning model.
+        python3 -m unittest discover -s tests/fuzz -p test_c_reduce.py
+        python3 -m unittest discover -s tests/fuzz -p test_punning_fuzz.py
         # The peephole folds and the affine exit-compare fold: oracle parity
         # at every opt level times every kill switch, plus the asm pins that
         # say the fold actually fired (and stayed off when refused).

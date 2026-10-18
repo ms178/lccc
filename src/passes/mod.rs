@@ -72,6 +72,7 @@ pub(crate) mod reassoc_latency;
 pub(crate) mod recursion_to_iter;
 pub(crate) mod redundant_loads;
 mod resolve_asm;
+pub(crate) mod round_cap;
 pub(crate) mod sccp;
 pub(crate) mod set_membership;
 pub(crate) mod simplify;
@@ -1560,6 +1561,9 @@ pub(crate) fn run_passes(
             verify::verify_after_pass(module, "fmanegpeel");
         }
         resolve_asm::resolve_inline_asm_symbols(module);
+        if time_passes {
+            round_cap::report();
+        }
         if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
             eprintln!("==== IR after all passes (opt_level={}) ====", opt_level);
             eprintln!("{:#?}", module);
@@ -3413,6 +3417,9 @@ pub(crate) fn run_passes(
         verify::verify_after_pass(module, "fmanegpeel");
     }
 
+    if time_passes {
+        round_cap::report();
+    }
     if std::env::var("CCC_DUMP_IR_AFTER").is_ok() {
         eprintln!("==== IR after all passes (opt_level={}) ====", opt_level);
         eprintln!("{:#?}", module);

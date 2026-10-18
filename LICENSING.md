@@ -65,6 +65,8 @@ Current derived benchmark files are:
 | File | Upstream-derived material | Applicable upstream license |
 |---|---|---|
 | `tests/benchmark/programs/gzip_crc32.c` | GNU gzip 1.14 `lib/crc.c` scalar table path | LGPL-3.0-or-later |
+| `tests/fuzz/punning_fuzz.py`, `tests/fuzz/test_punning_fuzz.py` | Original LCCC work. The byte-serialisation discipline is a *concept* taken from `vellvm/vellvm` `src/rocq/Semantics/MemoryBytes.v` (MIT); no source text was copied. | MIT OR Apache-2.0 OR BSD-2-Clause (LCCC) |
+| `docs/VELLVM_VIR_TRANSPLANT_AUDIT.md` | Analysis only. Reads `jlebar/vir` (Apache-2.0) and `vellvm/vellvm` (MIT); no code copied. | MIT OR Apache-2.0 OR BSD-2-Clause (LCCC) |
 | `tests/benchmark/programs/zlib_ng_adler32.c` | zlib-ng 2.3.3 generic Adler-32 | Zlib |
 | `tests/benchmark/programs/expat_xml_scan.c` | Expat 2.8.2 tokenizer specialization | MIT |
 | `tests/benchmark/programs/sqlite_varint.c` | SQLite 3.53.4 varint encoder/decoder | Public domain |

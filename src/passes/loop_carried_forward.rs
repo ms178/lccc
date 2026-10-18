@@ -99,6 +99,7 @@ use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{
     BlockId, Instruction, IrBinOp, IrConst, IrFunction, IrModule, Operand, Value,
 };
+use crate::passes::round_cap;
 
 /// Loop-carried phi budget per header (GPR-class). Beyond this the scan
 /// allocator is already at its limit on x86-64 (14 allocatable GPRs minus
@@ -1325,12 +1326,17 @@ pub(crate) fn run_module(module: &mut IrModule) -> usize {
             return 0;
         }
         let mut total = 0;
+        let mut converged = false;
         for _ in 0..MAX_ROUNDS {
             let n = run_round(f, &globals, env);
             if n == 0 {
+                converged = true;
                 break;
             }
             total += n;
+        }
+        if !converged {
+            round_cap::note_cap_hit(round_cap::Site::LoopCarriedForward);
         }
         total
     })

@@ -138,6 +138,7 @@ use crate::common::types::IrType;
 use crate::ir::analysis;
 use crate::ir::reexports::{Instruction, IrBinOp, IrFunction, Operand, Value};
 use crate::passes::loop_analysis;
+use crate::passes::round_cap;
 
 /// Largest tree the pass rebuilds.  The greedy is quadratic in the leaf
 /// count; real associative chains have a handful of leaves.
@@ -473,12 +474,17 @@ struct LoopFacts {
 /// trees rewritten.
 pub(crate) fn run_function(func: &mut IrFunction) -> usize {
     let mut total = 0;
+    let mut converged = false;
     for _ in 0..MAX_ROUNDS {
         let r = run_round(func);
         total += r;
         if r == 0 {
+            converged = true;
             break;
         }
+    }
+    if !converged {
+        round_cap::note_cap_hit(round_cap::Site::ReassocLatency);
     }
     total
 }
