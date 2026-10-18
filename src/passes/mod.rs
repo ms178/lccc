@@ -1261,6 +1261,10 @@ pub(crate) fn run_passes(
     x86_avx512vl: bool,
     disable_tree_vectorize: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
+    // pic: `-fPIC`/`-shared` semantic interposition — external definitions
+    // in this unit are interposable, so the inliner keeps calls to them
+    // (GCC's default `-fsemantic-interposition` at -fPIC).
+    pic: bool,
 ) {
     let policy = crate::common::pass_policy::PassPolicy::new(
         wrap_signed_overflow,
@@ -1419,6 +1423,7 @@ pub(crate) fn run_passes(
     );
     // The inliner's extension kill switches (A/B and triage), same rule.
     let inline_enabled = |name: &str| std::env::var_os(name).is_none();
+    inline::set_semantic_interposition(pic);
     inline::set_features(inline::InlineFeatures {
         devirt: inline_enabled("CCC_NO_INLINE_DEVIRT"),
         snapshot_refresh: inline_enabled("CCC_NO_INLINE_SNAPSHOT_REFRESH"),
@@ -3900,6 +3905,7 @@ mod signed_wrap_policy_tests {
             false,
             false,
             &crate::backend::regalloc::RaConfig::default(),
+            false,
         );
     }
 

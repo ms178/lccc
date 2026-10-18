@@ -1,5 +1,8 @@
 //! Loop-idiom recognition: proven-disjoint byte copies call `memcpy`; other
-//! copy loops retain a scalar fallback behind a safe fast path.
+//! copy loops retain a scalar fallback behind a safe fast path. The same
+//! fixpoint also folds the guarded `ffs` shift-loop
+//! (`while (!(x & 1)) { x >>= 1; r++; }` behind `if (!x) …`) into one
+//! `CtzNonZero` — the `bsf` shape GCC 16 emits for glibc's `ffs`.
 //!
 //! Real-world C copies bytes in loops everywhere (compressors, codecs, string
 //! routines, network buffers, kernels). A byte-at-a-time loop costs ~7-9
@@ -40,7 +43,8 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis::{self, CfgAnalysis};
 use crate::ir::reexports::{
-    BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
+    BlockId, Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, IrUnaryOp, Operand, Terminator,
+    Value,
 };
 use crate::passes::loop_analysis::{DominanceChecker, find_natural_loops, merge_loops_by_header};
 
@@ -446,6 +450,28 @@ pub(crate) fn recognize_idioms(
                     if matched.needs_overlap_guard || matched.needs_zero_guard {
                         versioned_headers.insert(header_label);
                     }
+                    total += 1;
+                    progressed = true;
+                    break;
+                }
+            }
+            // Trailing-zero-count idiom (the portable `ffs` shape): the
+            // shift-and-count loop is exactly `r0 + ctz(x0)` guarded
+            // iterations. Matched only behind a dominating nonzero guard so
+            // the rewrite emits `CtzNonZero` (baseline x86: `bsf` without a
+            // zero fixup — GCC 16's shape for glibc's `ffs`).
+            if let Some(matched) = try_match_ctz_loop(func, lp, &cfg) {
+                dlog!(
+                    "{} loop@{}: MATCH ctz (header={} pre={} latch_exit={} x=phi{} r=phi{})",
+                    func.name,
+                    lp.header,
+                    matched.header,
+                    matched.preheader,
+                    matched.exit,
+                    matched.x_phi.0,
+                    matched.r_phi.0,
+                );
+                if rewrite_ctz_loop(func, &matched, &lp.body) {
                     total += 1;
                     progressed = true;
                     break;
@@ -2286,6 +2312,897 @@ fn rewrite_guarded_copy_loop(
     true
 }
 
+// ── Trailing-zero-count (ffs shift-loop) idiom ───────────────────────────────
+
+/// A matched trailing-zero-count loop — the portable `ffs` shape:
+///
+/// ```c
+/// if (!x) return 0;              // dominating nonzero guard (proven below)
+/// int r = 1;
+/// while (!(x & 1)) { x >>= 1; r++; }
+/// return r;                      // == r0 + ctz(x0)
+/// ```
+///
+/// The loop performs exactly `ctz(x0)` iterations, so the counter ends at
+/// `r0 + ctz(x0)`. Replacing it with one `CtzNonZero` removes both the
+/// data-dependent bit-test branch and the serial shift chain — the `bsf`
+/// shape GCC 16 emits for glibc's `ffs` and the kernel's `ffs`/`__ffs`.
+#[derive(Clone, Copy)]
+enum PreheaderEdge {
+    /// `Branch(header)` — retarget the whole terminator.
+    Uncond,
+    /// `CondBranch` with the loop on the TRUE arm — retarget that arm.
+    CondTrue,
+    /// `CondBranch` with the loop on the FALSE arm — retarget that arm.
+    CondFalse,
+}
+
+struct CtzLoop {
+    header: usize,
+    preheader: usize,
+    edge: PreheaderEdge,
+    exit: usize,
+    /// Shifted word's loop-carried phi.
+    x_phi: Value,
+    /// The word's value entering the loop (preheader edge operand).
+    x_init: Operand,
+    x_ty: IrType,
+    /// Counter's loop-carried phi.
+    r_phi: Value,
+    /// The counter's value entering the loop (preheader edge operand).
+    r_init: Operand,
+    r_ty: IrType,
+}
+
+/// Follow same-width `Cast` chains (cycle-guarded). The frontend's parameter
+/// plumbing re-materializes loop-carried words as width-preserving casts;
+/// the matcher sees through exactly those and nothing else.
+fn strip_noop_casts(defs: &FxHashMap<u32, &Instruction>, mut v: Value) -> Value {
+    for _ in 0..32 {
+        match defs.get(&v.0) {
+            Some(Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            }) if from_ty.size() == to_ty.size() => match src {
+                Operand::Value(inner) => v = *inner,
+                Operand::Const(_) => break,
+            },
+            _ => break,
+        }
+    }
+    v
+}
+
+/// Header phi pair of a matched ctz loop: the shifted word and the counter,
+/// each with its entry operand and type, plus the latch step destinations.
+struct CtzPhis {
+    x: (Value, Operand, IrType),
+    r: (Value, Operand, IrType),
+    x_step: Option<Value>,
+    r_step: Option<Value>,
+}
+
+/// Scan the header phis of a ctz candidate: exactly the shifted word
+/// (`x >>= 1`) and the counter (`r += 1`), both fed from {preheader, latch},
+/// both steps defined in the latch. Anything else refuses the loop.
+fn ctz_collect_header_phis(
+    func: &IrFunction,
+    header: usize,
+    latch: usize,
+    latch_label: BlockId,
+    defs: &FxHashMap<u32, &Instruction>,
+    def_blocks: &FxHashMap<u32, usize>,
+) -> Option<CtzPhis> {
+    let name = func.name.as_str();
+    let strip = |v: Value| strip_noop_casts(defs, resolve_copy(defs, v));
+    let mut x: Option<(Value, Operand, IrType)> = None;
+    let mut r: Option<(Value, Operand, IrType)> = None;
+    let mut x_step_dest: Option<Value> = None;
+    let mut r_step_dest: Option<Value> = None;
+    for inst in &func.blocks[header].instructions {
+        let Instruction::Phi { dest, ty, incoming } = inst else {
+            continue;
+        };
+        if incoming.len() != 2 {
+            dlog!(
+                "{name} loop@{header}: ctz bail (phi {} arity {})",
+                dest.0,
+                incoming.len()
+            );
+            return None;
+        }
+        let mut latch_in: Option<&Operand> = None;
+        let mut init: Option<&Operand> = None;
+        for (op, l) in incoming {
+            if *l == latch_label {
+                if latch_in.is_some() {
+                    dlog!(
+                        "{name} loop@{header}: ctz bail (phi {} dup latch edge)",
+                        dest.0
+                    );
+                    return None;
+                }
+                latch_in = Some(op);
+            } else {
+                init = Some(op);
+            }
+        }
+        let Some(latch_in) = latch_in else {
+            dlog!(
+                "{name} loop@{header}: ctz bail (phi {} no latch edge)",
+                dest.0
+            );
+            return None;
+        };
+        let Some(init) = init else {
+            dlog!(
+                "{name} loop@{header}: ctz bail (phi {} no entry edge)",
+                dest.0
+            );
+            return None;
+        };
+        let init = init.clone();
+        let step_v = match latch_in {
+            Operand::Value(v) => strip(*v),
+            Operand::Const(_) => {
+                dlog!("{name} loop@{header}: ctz bail (phi {} const step)", dest.0);
+                return None;
+            }
+        };
+        if def_blocks.get(&step_v.0) != Some(&latch) {
+            dlog!(
+                "{name} loop@{header}: ctz bail (phi {} step outside latch)",
+                dest.0
+            );
+            return None;
+        }
+        let Some(Instruction::BinOp { op, lhs, rhs, .. }) = defs.get(&step_v.0) else {
+            dlog!(
+                "{name} loop@{header}: ctz bail (phi {} step not a BinOp)",
+                dest.0
+            );
+            return None;
+        };
+        let feeds_self =
+            |o: &Operand| -> bool { matches!(o, Operand::Value(u) if strip(*u) == *dest) };
+        match (*op, lhs, rhs) {
+            (IrBinOp::LShr, l, Operand::Const(c)) if feeds_self(l) && c.to_i64() == Some(1) => {
+                if x.is_some() {
+                    dlog!("{name} loop@{header}: ctz bail (two shifted words)");
+                    return None;
+                }
+                x = Some((*dest, init, *ty));
+                x_step_dest = Some(step_v);
+            }
+            (IrBinOp::Add, Operand::Const(c), rr) if c.to_i64() == Some(1) && feeds_self(rr) => {
+                if r.is_some() {
+                    dlog!("{name} loop@{header}: ctz bail (two counters)");
+                    return None;
+                }
+                r = Some((*dest, init, *ty));
+                r_step_dest = Some(step_v);
+            }
+            (IrBinOp::Add, ll, Operand::Const(c)) if c.to_i64() == Some(1) && feeds_self(ll) => {
+                if r.is_some() {
+                    dlog!("{name} loop@{header}: ctz bail (two counters)");
+                    return None;
+                }
+                r = Some((*dest, init, *ty));
+                r_step_dest = Some(step_v);
+            }
+            (op, _, _) => {
+                dlog!(
+                    "{name} loop@{header}: ctz bail (phi {} step {op:?})",
+                    dest.0
+                );
+                return None;
+            }
+        }
+    }
+    let (x, r) = match (x, r) {
+        (Some(x), Some(r)) => (x, r),
+        (None, _) => {
+            dlog!("{name} loop@{header}: ctz bail (no shifted word phi)");
+            return None;
+        }
+        (_, None) => {
+            dlog!("{name} loop@{header}: ctz bail (no counter phi)");
+            return None;
+        }
+    };
+    Some(CtzPhis {
+        x,
+        r,
+        x_step: x_step_dest,
+        r_step: r_step_dest,
+    })
+}
+
+/// The header test of a ctz candidate: `(x & 1)` re-evaluated in the header,
+/// optionally wrapped in `== 0` / `!= 0`. Returns the polarity — `true` means
+/// the condition is "low bit set" on the TRUE arm — after checking that the
+/// body arm agrees with "continue while the low bit is clear" and the test's
+/// defs live in the header (while-shape; rotated forms stay rolled).
+fn ctz_header_test_polarity(
+    func: &IrFunction,
+    header: usize,
+    body_arm_idx: usize,
+    x_phi: Value,
+    defs: &FxHashMap<u32, &Instruction>,
+    def_blocks: &FxHashMap<u32, usize>,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+) -> Option<bool> {
+    let name = func.name.as_str();
+    let strip = |v: Value| strip_noop_casts(defs, resolve_copy(defs, v));
+    let as_val = |o: &Operand| -> Option<Value> {
+        match o {
+            Operand::Value(v) => Some(*v),
+            Operand::Const(_) => None,
+        }
+    };
+    let cond_v = match &func.blocks[header].terminator {
+        Terminator::CondBranch { cond, .. } => match cond {
+            Operand::Value(v) => strip(*v),
+            Operand::Const(_) => return None,
+        },
+        _ => return None,
+    };
+    let header_and = |cv: Value| -> Option<Value> {
+        match defs.get(&cv.0)? {
+            Instruction::BinOp {
+                op: IrBinOp::And,
+                lhs,
+                rhs,
+                ..
+            } => {
+                let one = |o: &Operand| matches!(o, Operand::Const(c) if c.to_i64() == Some(1));
+                if let Some(l) = as_val(lhs) {
+                    if one(rhs) {
+                        return Some(strip(l));
+                    }
+                }
+                if let Some(rr) = as_val(rhs) {
+                    if one(lhs) {
+                        return Some(strip(rr));
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    };
+    // The `and` may itself be the branch condition (truthiness form) or sit
+    // under a `== 0` / `!= 0` comparison.
+    let low_bit_set_exits = if let Some(a) = header_and(cond_v) {
+        if a != x_phi {
+            dlog!("{name} loop@{header}: ctz bail (cond and is not (x & 1))");
+            return None;
+        }
+        true
+    } else {
+        match defs.get(&cond_v.0) {
+            Some(Instruction::Cmp { op, lhs, rhs, .. }) => {
+                let and_on_lhs = as_val(lhs).is_some_and(|v| header_and(v) == Some(x_phi));
+                let and_on_rhs = as_val(rhs).is_some_and(|v| header_and(v) == Some(x_phi));
+                if !and_on_lhs && !and_on_rhs {
+                    dlog!("{name} loop@{header}: ctz bail (cond is not against (x & 1))");
+                    return None;
+                }
+                match op {
+                    IrCmpOp::Eq => false, // (x&1)==0: true → continue
+                    IrCmpOp::Ne => true,  // (x&1)!=0: true → exit
+                    op => {
+                        dlog!("{name} loop@{header}: ctz bail (cond cmp {op:?})");
+                        return None;
+                    }
+                }
+            }
+            _ => {
+                dlog!("{name} loop@{header}: ctz bail (cond neither and nor cmp)");
+                return None;
+            }
+        }
+    };
+    match def_blocks.get(&cond_v.0) {
+        Some(&db) if db == header => {}
+        _ => {
+            dlog!("{name} loop@{header}: ctz bail (test outside header)");
+            return None;
+        }
+    }
+    let header_true = match &func.blocks[header].terminator {
+        Terminator::CondBranch { true_label, .. } => *label_to_idx.get(true_label)?,
+        _ => return None,
+    };
+    // Truthy-and exits (raw form / `!= 0`) ⇔ the body arm is the FALSE arm;
+    // `(x & 1) == 0` continues on TRUE ⇔ the body arm is the TRUE arm.
+    if (header_true == body_arm_idx) == low_bit_set_exits {
+        dlog!("{name} loop@{header}: ctz bail (test polarity)");
+        return None;
+    }
+    Some(low_bit_set_exits)
+}
+
+/// Escape discipline for a ctz candidate: any loop-defined value used outside
+/// the loop must be the counter, and only in shapes the rewrite covers — a
+/// straight use in the exit block, or a phi operand whose incoming edge is
+/// the exit block (the inlined-`ffs` merge shape: the exit branches to a
+/// downstream merge phi that also collects the zero path). Returns the
+/// number of outside uses of the counter (zero also refuses: the rewrite
+/// would be dead code).
+fn ctz_escape_discipline(
+    func: &IrFunction,
+    lp: &crate::passes::loop_analysis::NaturalLoop,
+    exit_idx: usize,
+    r_phi: Value,
+    loop_defs: &FxHashSet<u32>,
+) -> Option<usize> {
+    let name = func.name.as_str();
+    let header = lp.header;
+    let exit_label = func.blocks[exit_idx].label;
+    let mut r_outside_uses = 0usize;
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if lp.body.contains(&bi) {
+            continue;
+        }
+        let in_exit = bi == exit_idx;
+        for inst in &block.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (op, lbl) in incoming {
+                    if let Operand::Value(u) = op {
+                        if loop_defs.contains(&u.0) {
+                            if *u == r_phi && *lbl == exit_label {
+                                r_outside_uses += 1;
+                            } else {
+                                dlog!(
+                                    "{name} loop@{header}: ctz bail (loop value escapes via phi)"
+                                );
+                                return None;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            inst.for_each_used_value(|u| {
+                if loop_defs.contains(&u) {
+                    if in_exit && u == r_phi.0 {
+                        r_outside_uses += 1;
+                    } else {
+                        r_outside_uses = usize::MAX; // poison: bail below
+                    }
+                }
+            });
+        }
+        match &block.terminator {
+            Terminator::Return(Some(Operand::Value(u))) => {
+                if loop_defs.contains(&u.0) {
+                    if in_exit && *u == r_phi {
+                        r_outside_uses += 1;
+                    } else {
+                        r_outside_uses = usize::MAX;
+                    }
+                }
+            }
+            Terminator::CondBranch { cond, .. } => {
+                if let Operand::Value(u) = cond {
+                    if loop_defs.contains(&u.0) {
+                        r_outside_uses = usize::MAX;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if r_outside_uses == usize::MAX {
+        dlog!("{name} loop@{header}: ctz bail (loop value escapes)");
+        return None;
+    }
+    if r_outside_uses == 0 {
+        dlog!("{name} loop@{header}: ctz bail (counter unused outside)");
+        return None;
+    }
+    Some(r_outside_uses)
+}
+
+/// Walk up from the preheader (at most four single-pred blocks through
+/// unconditional branches) looking for the dominating `if (!x) …` guard on
+/// the loop word. A conditional preheader IS the guard: the arm entering the
+/// loop must be the nonzero arm of a test on the word.
+fn ctz_entry_proves_nonzero(
+    func: &IrFunction,
+    cfg: &CfgAnalysis,
+    preheader: usize,
+    edge: PreheaderEdge,
+    x_init_v: Value,
+    defs: &FxHashMap<u32, &Instruction>,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+) -> bool {
+    let name = func.name.as_str();
+    let mut proven_nonzero = false;
+    if !matches!(edge, PreheaderEdge::Uncond) {
+        if let Terminator::CondBranch { cond, .. } = &func.blocks[preheader].terminator {
+            if let Operand::Value(cv) = cond {
+                match guard_on_value(defs, resolve_copy(defs, *cv), x_init_v) {
+                    Some(eq_zero) => {
+                        let nonzero_is_true = !eq_zero;
+                        proven_nonzero = match edge {
+                            PreheaderEdge::CondTrue => nonzero_is_true,
+                            PreheaderEdge::CondFalse => !nonzero_is_true,
+                            PreheaderEdge::Uncond => unreachable!(),
+                        };
+                    }
+                    None => {
+                        dlog!(
+                            "{name} loop@{preheader}: ctz bail (cond preheader does not guard the word)"
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+        return proven_nonzero;
+    }
+    let mut cur = preheader;
+    for _ in 0..4 {
+        let preds: Vec<usize> = cfg.preds.row(cur).iter().map(|&p| p as usize).collect();
+        if preds.len() != 1 {
+            break;
+        }
+        let p = preds[0];
+        let (gc, t_lbl, f_lbl) = match &func.blocks[p].terminator {
+            Terminator::Branch(t) if label_to_idx.get(t) == Some(&cur) => {
+                cur = p;
+                continue;
+            }
+            Terminator::CondBranch {
+                cond,
+                true_label,
+                false_label,
+            } => {
+                let cond = match cond {
+                    Operand::Value(v) => resolve_copy(defs, *v),
+                    Operand::Const(_) => break,
+                };
+                match (label_to_idx.get(true_label), label_to_idx.get(false_label)) {
+                    (Some(&t), Some(&f)) => (cond, t, f),
+                    _ => break,
+                }
+            }
+            _ => break,
+        };
+        let down_is_true = t_lbl == cur;
+        let down_is_false = f_lbl == cur;
+        if !down_is_true && !down_is_false {
+            break;
+        }
+        match guard_on_value(defs, gc, x_init_v) {
+            Some(eq_zero) => {
+                let nonzero_is_true = !eq_zero;
+                proven_nonzero =
+                    (down_is_true && nonzero_is_true) || (down_is_false && !nonzero_is_true);
+                break;
+            }
+            None => break,
+        }
+    }
+    proven_nonzero
+}
+
+fn try_match_ctz_loop(
+    func: &IrFunction,
+    lp: &crate::passes::loop_analysis::NaturalLoop,
+    cfg: &CfgAnalysis,
+) -> Option<CtzLoop> {
+    let name = func.name.as_str();
+    // Shape: 2–3 blocks (header + latch, optionally one middle block).
+    if !(2..=3).contains(&lp.body.len()) {
+        return None;
+    }
+    let header = lp.header;
+    let label_to_idx = analysis::build_label_map(func);
+
+    // Header: conditional branch, one arm in the loop, one out.
+    let (body_arm_idx, exit_idx) = match &func.blocks[header].terminator {
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
+            let ti = label_to_idx.get(true_label).copied()?;
+            let fi = label_to_idx.get(false_label).copied()?;
+            let t_in = lp.body.contains(&ti);
+            let f_in = lp.body.contains(&fi);
+            if t_in == f_in {
+                dlog!("{name} loop@{header}: ctz bail (header arms not split)");
+                return None;
+            }
+            if t_in { (ti, fi) } else { (fi, ti) }
+        }
+        _ => return None,
+    };
+
+    // Header preds: exactly {preheader, latch}; the preheader transfer shape
+    // decides how the rewrite retargets it.
+    let preds: Vec<usize> = cfg.preds.row(header).iter().map(|&p| p as usize).collect();
+    if preds.len() != 2 {
+        dlog!(
+            "{name} loop@{header}: ctz bail (header preds {})",
+            preds.len()
+        );
+        return None;
+    }
+    let latch = lp.single_latch(&cfg.preds)?;
+    if latch == header {
+        dlog!("{name} loop@{header}: ctz bail (self-loop)");
+        return None;
+    }
+    let preheader = if preds[0] == latch {
+        preds[1]
+    } else {
+        preds[0]
+    };
+    if preheader == latch || lp.body.contains(&preheader) {
+        dlog!("{name} loop@{header}: ctz bail (preheader inside loop)");
+        return None;
+    }
+    let latch_label = func.blocks[latch].label;
+    // Two preheader shapes: an unconditional branch into the loop (the
+    // guard lives upstream), or the guard's own conditional branch with the
+    // loop on one arm (`if (!x) return 0;` merged with the entry edge — the
+    // common `ffs` shape after CFG simplification). The latter retargets
+    // only the loop arm.
+    let edge = match &func.blocks[preheader].terminator {
+        Terminator::Branch(target) if label_to_idx.get(target) == Some(&header) => {
+            PreheaderEdge::Uncond
+        }
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
+            let t_is_header = label_to_idx.get(true_label) == Some(&header);
+            let f_is_header = label_to_idx.get(false_label) == Some(&header);
+            if t_is_header == f_is_header {
+                dlog!("{name} loop@{header}: ctz bail (preheader not Branch header)");
+                return None;
+            }
+            if t_is_header {
+                PreheaderEdge::CondTrue
+            } else {
+                PreheaderEdge::CondFalse
+            }
+        }
+        _ => {
+            dlog!("{name} loop@{header}: ctz bail (preheader not Branch header)");
+            return None;
+        }
+    };
+    // No side entries; non-header loop blocks branch only within the loop.
+    for &b in lp.body.iter() {
+        if b == header {
+            continue;
+        }
+        for &p in cfg.preds.row(b).iter() {
+            if !lp.body.contains(&(p as usize)) {
+                dlog!("{name} loop@{header}: ctz bail (outside entry to {b})");
+                return None;
+            }
+        }
+        match &func.blocks[b].terminator {
+            Terminator::Branch(target) => {
+                let ti = *label_to_idx.get(target)?;
+                if !lp.body.contains(&ti) {
+                    dlog!("{name} loop@{header}: ctz bail (block {b} exits loop)");
+                    return None;
+                }
+            }
+            _ => {
+                dlog!("{name} loop@{header}: ctz bail (block {b} not Branch)");
+                return None;
+            }
+        }
+    }
+
+    // Definition sites (instructions only; phi defs live in the header).
+    let mut defs: FxHashMap<u32, &Instruction> = FxHashMap::default();
+    let mut def_blocks: FxHashMap<u32, usize> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                defs.insert(d.0, inst);
+                def_blocks.insert(d.0, bi);
+            }
+        }
+    }
+    let strip = |v: Value| strip_noop_casts(&defs, resolve_copy(&defs, v));
+
+    let phis = ctz_collect_header_phis(func, header, latch, latch_label, &defs, &def_blocks)?;
+    let (x_phi, x_init, x_ty) = phis.x;
+    let (r_phi, r_init, r_ty) = phis.r;
+    let x_step_dest = phis.x_step;
+    let r_step_dest = phis.r_step;
+
+    ctz_header_test_polarity(
+        func,
+        header,
+        body_arm_idx,
+        x_phi,
+        &defs,
+        &def_blocks,
+        &label_to_idx,
+    )?;
+
+    // Latch/middle scan: only the two steps plus plumbing. A load, store,
+    // call or any other computation inside the loop kills the match (the
+    // rewrite deletes these blocks).
+    for &b in lp.body.iter() {
+        if b == header {
+            continue;
+        }
+        for inst in &func.blocks[b].instructions {
+            match inst {
+                Instruction::Copy { .. } | Instruction::Cast { .. } => {}
+                Instruction::BinOp { dest, .. }
+                    if Some(*dest) == x_step_dest || Some(*dest) == r_step_dest => {}
+                other => {
+                    dlog!("{name} loop@{header}: ctz bail (latch inst {other:?})");
+                    return None;
+                }
+            }
+        }
+    }
+
+    // Escape discipline: only the counter, only in the exit block.
+    let loop_defs: FxHashSet<u32> = lp
+        .body
+        .iter()
+        .flat_map(|&b| func.blocks[b].instructions.iter())
+        .filter_map(|inst| inst.dest().map(|d| d.0))
+        .collect();
+    ctz_escape_discipline(func, lp, exit_idx, r_phi, &loop_defs)?;
+
+    // Availability at the preheader: the word and counter entering values
+    // must be defined in the preheader itself, in a dominating block, or be
+    // function arguments.
+    let x_init_v = match &x_init {
+        Operand::Value(u) => strip(*u),
+        Operand::Const(_) => {
+            dlog!("{name} loop@{header}: ctz bail (const word — folds elsewhere)");
+            return None;
+        }
+    };
+    let (num_blocks, idom) = {
+        let c = CfgAnalysis::build(func);
+        (c.num_blocks, c.idom)
+    };
+    let dom = DominanceChecker::new(num_blocks, &idom);
+    let check_available = |v: Value| -> Option<()> {
+        match def_blocks.get(&v.0) {
+            None => Some(()), // function argument
+            Some(&db) if db == preheader || dom.dominates(db, preheader) => Some(()),
+            Some(_) => None,
+        }
+    };
+    check_available(x_init_v)?;
+    if let Operand::Value(u) = &r_init {
+        check_available(strip(*u))?;
+    }
+
+    // Dominating nonzero guard: the source `if (!x) …` that proves the loop
+    // word is nonzero on the entry path. Without it, x0 == 0 makes the
+    // source loop NOT terminate and `Ctz` would fabricate a value — refuse.
+    if !ctz_entry_proves_nonzero(func, cfg, preheader, edge, x_init_v, &defs, &label_to_idx) {
+        dlog!("{name} loop@{header}: ctz bail (no dominating nonzero guard)");
+        return None;
+    }
+
+    Some(CtzLoop {
+        header,
+        preheader,
+        edge,
+        exit: exit_idx,
+        x_phi,
+        x_init,
+        x_ty,
+        r_phi,
+        r_init,
+        r_ty,
+    })
+}
+
+/// Is `cmp_v` a guard condition on `v`? Returns `Some(true)` for `v == 0`,
+/// `Some(false)` for raw-truthiness / `v != 0`, `None` when the condition
+/// does not test `v`.
+fn guard_on_value(defs: &FxHashMap<u32, &Instruction>, cmp_v: Value, v: Value) -> Option<bool> {
+    let strip = |val: Value| strip_noop_casts(defs, resolve_copy(defs, val));
+    if strip(cmp_v) == v {
+        return Some(false); // raw truthiness: nonzero on the TRUE arm
+    }
+    match defs.get(&cmp_v.0)? {
+        Instruction::Cmp { op, lhs, rhs, .. } => {
+            let zero = |o: &Operand| matches!(o, Operand::Const(c) if c.to_i64() == Some(0));
+            let on_x = |o: &Operand| -> bool { matches!(o, Operand::Value(u) if strip(*u) == v) };
+            match op {
+                IrCmpOp::Ne if (on_x(lhs) && zero(rhs)) || (on_x(rhs) && zero(lhs)) => Some(false),
+                IrCmpOp::Eq if (on_x(lhs) && zero(rhs)) || (on_x(rhs) && zero(lhs)) => Some(true),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Rewrite a matched trailing-zero-count loop into one `CtzNonZero` in the
+/// preheader plus a straight branch to the loop exit. Abort-safe: every
+/// structural check runs before the first mutation.
+fn rewrite_ctz_loop(func: &mut IrFunction, m: &CtzLoop, body: &FxHashSet<usize>) -> bool {
+    let fname = func.name.clone();
+    let preheader_label = func.blocks[m.preheader].label;
+    let header_label = func.blocks[m.header].label;
+    let exit_label = func.blocks[m.exit].label;
+
+    // Pre-scan 1: exit phis must have no preheader-edge incoming yet and at
+    // most one header-edge incoming each.
+    for inst in &func.blocks[m.exit].instructions {
+        if let Instruction::Phi { incoming, .. } = inst {
+            let mut header_entries = 0u32;
+            let mut pre_entries = 0u32;
+            for (_, label) in incoming {
+                if *label == preheader_label {
+                    pre_entries += 1;
+                }
+                if *label == header_label {
+                    header_entries += 1;
+                }
+            }
+            if pre_entries > 0 || header_entries > 1 {
+                dlog!(
+                    "{fname} loop@{}: ctz rewrite abort (exit phi edges pre={} header={})",
+                    m.header,
+                    pre_entries,
+                    header_entries
+                );
+                return false;
+            }
+        }
+    }
+    // Pre-scan 2: the loop's labels are disjoint from preheader/exit by
+    // construction; refuse to mutate if that ever changes.
+    if body.contains(&m.preheader) || body.contains(&m.exit) {
+        dlog!(
+            "{fname} loop@{}: ctz rewrite abort (label collision)",
+            m.header
+        );
+        return false;
+    }
+
+    // Materialize `res = r0 + ctz_nonzero(x0)` at the end of the preheader.
+    let ctz_v = alloc_value(func);
+    let mut extra: Vec<Instruction> = vec![Instruction::UnaryOp {
+        dest: ctz_v,
+        op: IrUnaryOp::CtzNonZero,
+        src: m.x_init.clone(),
+        ty: m.x_ty,
+    }];
+    let mut res = ctz_v;
+    if m.r_ty != m.x_ty {
+        let cast_v = alloc_value(func);
+        extra.push(Instruction::Cast {
+            dest: cast_v,
+            src: Operand::Value(ctz_v),
+            from_ty: m.x_ty,
+            to_ty: m.r_ty,
+        });
+        res = cast_v;
+    }
+    let res_val = if matches!(&m.r_init, Operand::Const(c) if c.to_i64() == Some(0)) {
+        res
+    } else {
+        let add_v = alloc_value(func);
+        extra.push(Instruction::BinOp {
+            dest: add_v,
+            op: IrBinOp::Add,
+            lhs: Operand::Value(res),
+            rhs: m.r_init.clone(),
+            ty: m.r_ty,
+        });
+        add_v
+    };
+
+    // Retarget the preheader to the exit and install the computation. A
+    // conditional preheader keeps its guard arm and only the loop arm moves
+    // to the exit (the guard test still selects the zero path).
+    {
+        let pre = &mut func.blocks[m.preheader];
+        pre.instructions.extend(extra);
+        match m.edge {
+            PreheaderEdge::Uncond => {
+                debug_assert!(matches!(pre.terminator, Terminator::Branch(_)));
+                pre.terminator = Terminator::Branch(exit_label);
+            }
+            PreheaderEdge::CondTrue => {
+                if let Terminator::CondBranch { true_label, .. } = &mut pre.terminator {
+                    *true_label = exit_label;
+                }
+            }
+            PreheaderEdge::CondFalse => {
+                if let Terminator::CondBranch { false_label, .. } = &mut pre.terminator {
+                    *false_label = exit_label;
+                }
+            }
+        }
+    }
+
+    // Replace the counter's uses in the exit block: straight uses become the
+    // result; phi entries move from the (now dead) header edge to the new
+    // preheader edge.
+    let exit = m.exit;
+    for inst in &mut func.blocks[exit].instructions {
+        if let Instruction::Phi { incoming, .. } = inst {
+            for (op, lbl) in incoming.iter_mut() {
+                if *lbl == header_label {
+                    if matches!(op, Operand::Value(u) if *u == m.r_phi) {
+                        *op = Operand::Value(res_val);
+                    }
+                    *lbl = preheader_label;
+                }
+            }
+            continue;
+        }
+        inst.for_each_value_use_mut(|u| {
+            if *u == m.r_phi {
+                *u = res_val;
+            }
+        });
+    }
+    if let Terminator::Return(Some(op)) = &mut func.blocks[exit].terminator {
+        if matches!(op, Operand::Value(u) if *u == m.r_phi) {
+            *op = Operand::Value(res_val);
+        }
+    }
+    // Merge-block phis fed from the exit block's edge (the inlined-ffs shape
+    // merges the zero path and the loop result downstream): the counter
+    // operand becomes the result; the edge itself is untouched (the exit
+    // block survives with its original terminator).
+    let exit_label = func.blocks[exit].label;
+    for bi in 0..func.blocks.len() {
+        if bi == exit || body.contains(&bi) {
+            continue;
+        }
+        for inst in &mut func.blocks[bi].instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (op, lbl) in incoming.iter_mut() {
+                    if *lbl == exit_label && matches!(op, Operand::Value(u) if *u == m.r_phi) {
+                        *op = Operand::Value(res_val);
+                    }
+                }
+            }
+        }
+    }
+
+    // Delete the now-unreachable loop blocks and drop their phi edges
+    // elsewhere (only exit phis could legally hold them, and those were
+    // rewritten above).
+    let dead_labels: FxHashSet<BlockId> = body.iter().map(|&b| func.blocks[b].label).collect();
+    func.blocks.retain(|b| !dead_labels.contains(&b.label));
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                incoming.retain(|(_, lbl)| !dead_labels.contains(lbl));
+            }
+        }
+    }
+    dlog!(
+        "{fname} loop@{}: ctz rewrite done ({} blocks removed)",
+        m.header,
+        dead_labels.len()
+    );
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2964,5 +3881,134 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(trace_root(&defs, 6), ObjectRoot::Other);
+    }
+    // ── Trailing-zero-count (ffs shift-loop) idiom ─────────────────────────
+
+    fn u32_param() -> IrParam {
+        IrParam {
+            ty: IrType::U32,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            is_f128_sse: false,
+            riscv_float_class: None,
+        }
+    }
+
+    /// The pass-time `ffs` shape (labels match the pipeline's post-simplify
+    /// CFG): guard block 0 branches straight into the loop header, the
+    /// header carries both phis plus the `(x & 1)` truthiness test, the
+    /// latch shifts and counts, the exit returns the counter.
+    fn ctz_func(guard_on_word: bool) -> IrFunction {
+        let mut f = IrFunction::new("ffs_shape".into(), IrType::I32, vec![u32_param()], false);
+        f.next_value_id = 20;
+        f.next_label = 5;
+        let cond_src = if guard_on_word { val(1) } else { i32c(1) };
+        f.blocks.push(block(
+            0, // guard: `if (!x) return 0;` with the loop on the TRUE arm
+            vec![param_def(1, 0)],
+            Terminator::CondBranch {
+                cond: cond_src,
+                true_label: BlockId(2),
+                false_label: BlockId(1),
+            },
+        ));
+        f.blocks.push(block(
+            1, // zero path
+            vec![],
+            Terminator::Return(Some(i32c(0))),
+        ));
+        f.blocks.push(block(
+            2, // header: phis + (x & 1) test
+            vec![
+                Instruction::Phi {
+                    dest: Value(10),
+                    ty: IrType::U32,
+                    incoming: vec![(val(1), BlockId(0)), (val(12), BlockId(3))],
+                },
+                Instruction::Phi {
+                    dest: Value(11),
+                    ty: IrType::I32,
+                    incoming: vec![(i32c(1), BlockId(0)), (val(13), BlockId(3))],
+                },
+                Instruction::BinOp {
+                    dest: Value(14),
+                    op: IrBinOp::And,
+                    lhs: val(10),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::U32,
+                },
+            ],
+            Terminator::CondBranch {
+                cond: val(14),
+                true_label: BlockId(4),
+                false_label: BlockId(3),
+            },
+        ));
+        f.blocks.push(block(
+            3, // latch: x >>= 1; r++
+            vec![
+                Instruction::BinOp {
+                    dest: Value(12),
+                    op: IrBinOp::LShr,
+                    lhs: val(10),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::U32,
+                },
+                Instruction::BinOp {
+                    dest: Value(13),
+                    op: IrBinOp::Add,
+                    lhs: val(11),
+                    rhs: i32c(1),
+                    ty: IrType::I32,
+                },
+            ],
+            Terminator::Branch(BlockId(2)),
+        ));
+        f.blocks.push(block(
+            4, // exit: return r
+            vec![],
+            Terminator::Return(Some(val(11))),
+        ));
+        f
+    }
+
+    #[test]
+    fn ctz_guarded_loop_becomes_one_ctz_nonzero() {
+        let mut f = ctz_func(true);
+        assert_eq!(run_function(&mut f), 1, "the guarded shift loop rewrites");
+        // The loop is gone; the guard keeps two arms and the preheader arm
+        // now feeds a CtzNonZero feeding the exit value.
+        assert_eq!(f.blocks.len(), 3, "header and latch removed");
+        assert!(
+            f.blocks
+                .iter()
+                .any(|b| b.instructions.iter().any(|inst| matches!(
+                    inst,
+                    Instruction::UnaryOp {
+                        op: IrUnaryOp::CtzNonZero,
+                        ..
+                    }
+                ))),
+            "one CtzNonZero materialized"
+        );
+        assert!(
+            !f.blocks.iter().any(|b| b.label == BlockId(2)),
+            "loop header deleted"
+        );
+    }
+
+    #[test]
+    fn ctz_unguarded_loop_is_kept() {
+        // The guard tests a constant instead of the word: x0 == 0 would make
+        // the source loop not terminate, so the rewrite must refuse.
+        let mut f = ctz_func(false);
+        assert_eq!(run_function(&mut f), 0, "no nonzero proof, no rewrite");
+        assert!(
+            f.blocks.iter().any(|b| b.label == BlockId(2)),
+            "loop retained"
+        );
     }
 }
