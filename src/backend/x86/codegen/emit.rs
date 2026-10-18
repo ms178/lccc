@@ -8514,13 +8514,12 @@ impl ArchCodegen for X86Codegen {
             };
             for (reg_id, kind) in last_writes.iter() {
                 let home = PhysReg(*reg_id);
-                let resident = self
-                    .reg_assignments
-                    .iter()
-                    .filter(|(_, r)| **r == home)
-                    .map(|(&v, _)| v)
-                    .collect::<Vec<_>>();
-                if resident.is_empty() {
+                // `home_sharers` is the inverse of the function's final
+                // `reg_assignments` (built with it in the prologue): an O(1)
+                // answer where filtering the whole assignment map cost
+                // O(values) per written register per window -- quadratic in
+                // call-dense functions, which flush a window per call.
+                if self.home_sharers.get(reg_id).is_none_or(|s| s.is_empty()) {
                     // Not a home register in this function: nothing to track.
                     continue;
                 }

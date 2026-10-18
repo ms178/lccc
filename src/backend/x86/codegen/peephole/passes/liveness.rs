@@ -71,6 +71,12 @@ const RET_LIVE: u16 =
 /// return-value materialisation leaves behind.
 const RET_LIVE_RAX_ONLY: u16 = RET_LIVE & !RDX;
 
+/// How many lines after a `call` its marker protocol may occupy: every
+/// marker [`call_site_reads`] consults sits on lines `n+1..=n+CALL_MARKER_WINDOW`
+/// of the call on line `n`, so an edit further down cannot change that
+/// call's read set.
+const CALL_MARKER_WINDOW: usize = 4;
+
 /// Registers the `call` on line `n` reads: the leading SysV GP argument
 /// registers its `# LCCC_CALL_ARGS <n>` marker publishes (all six when the
 /// marker is absent), `%rax` at `# LCCC_VA_CALL` sites, `%r10` at static-chain
@@ -139,7 +145,7 @@ pub(super) fn call_site_reads(store: &LineStore, infos: &[LineInfo], n: usize) -
     // `call` emissions like the i128 helpers) keeps all six:
     // fail-closed.
     let mut gp_args: usize = 6;
-    for k in n + 1..(n + 5).min(infos.len()) {
+    for k in n + 1..(n + 1 + CALL_MARKER_WINDOW).min(infos.len()) {
         if infos[k].is_nop() {
             continue;
         }
@@ -612,8 +618,10 @@ impl FileLiveness {
     }
 
     /// The recorded `(start, end)` of the function containing `idx`, if its
-    /// delimiting CFI lines are still in place.
-    fn recorded_function(
+    /// delimiting CFI lines are still in place: the same half-open range
+    /// `relay_and_lea::function_range` rescans for (no pass creates or
+    /// deletes CFI lines; the intact check fails closed if one ever does).
+    pub(super) fn recorded_function(
         &self,
         store: &LineStore,
         infos: &[LineInfo],
@@ -752,10 +760,21 @@ impl FileLiveness {
         }
         let real = |n: usize| !infos[n].is_steppable();
         // A call's read set comes from the marker window after it
-        // (`call_site_reads` looks at most 4 lines ahead).
-        if (lo.saturating_sub(5).max(start)..lo)
-            .any(|p| !infos[p].is_nop() && infos[p].kind == LineKind::Call)
-        {
+        // (`call_site_reads`, `CALL_MARKER_WINDOW` lines), so an edit there
+        // may change it.  The exact test: recompute it on the edited text
+        // and compare with the recorded transfer function (its writes and
+        // CFG edges depend only on the call's own text, which a span never
+        // contains -- calls are structural).  Calls are never spliced, and
+        // every splice re-checks this, so the recorded read set is the one
+        // of the current text.  A blanket refusal here made every fold in
+        // the few lines after a call fall back to a whole-function
+        // re-analysis: quadratic compile time in call-dense functions
+        // (2000 `printf` calls in one `main`: 42 s at -O0).
+        if (lo.saturating_sub(CALL_MARKER_WINDOW).max(start)..lo).any(|p| {
+            !infos[p].is_nop()
+                && infos[p].kind == LineKind::Call
+                && (!self.known[p] || self.effect[p].0 != call_site_reads(store, infos, p))
+        }) {
             return false;
         }
         // The first real line after the span, whose live-in anchors the

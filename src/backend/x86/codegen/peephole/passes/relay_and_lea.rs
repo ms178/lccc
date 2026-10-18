@@ -430,10 +430,43 @@ pub(super) fn family_private_to(
     fam: RegId,
     owned: &[usize],
 ) -> bool {
+    match function_range(store, infos, idx) {
+        Some(range) => family_private_in(store, infos, range, fam, owned),
+        None => false,
+    }
+}
+
+/// [`family_private_to`] for a caller holding the [`FileLiveness`] of the
+/// file: the enclosing function's bounds come from its record (O(1), the
+/// same `[start, end)` as [`function_range`] -- see
+/// `FileLiveness::recorded_function`) instead of a rescan for the
+/// delimiters.  The rescan is O(function) per query, and this proof runs
+/// for every candidate the dataflow calls live -- nearly all of them in
+/// -O0 code, where the accumulator is live everywhere: compile time was
+/// quadratic in function length.
+fn family_private_lv(
+    lv: &FileLiveness,
+    store: &LineStore,
+    infos: &[LineInfo],
+    idx: usize,
+    fam: RegId,
+    owned: &[usize],
+) -> bool {
+    match lv.recorded_function(store, infos, idx) {
+        Some(range) => family_private_in(store, infos, range, fam, owned),
+        None => family_private_to(store, infos, idx, fam, owned),
+    }
+}
+
+/// The scan behind [`family_private_to`] over the function `[start, end)`.
+fn family_private_in(
+    store: &LineStore,
+    infos: &[LineInfo],
+    (start, end): (usize, usize),
+    fam: RegId,
+    owned: &[usize],
+) -> bool {
     let mask = 1u16 << fam;
-    let Some((start, end)) = function_range(store, infos, idx) else {
-        return false;
-    };
     let mut n = start;
     while n < end {
         if infos[n].is_nop() {
@@ -540,7 +573,8 @@ pub(super) fn provably_dead_lv(
     if matches!(lv.live_after(use_idx, fam), Some(false)) {
         return true;
     }
-    provably_dead(store, infos, use_idx, fam, owned)
+    dead_in_block_after(store, infos, use_idx + 1, fam)
+        || family_private_lv(lv, store, infos, use_idx, fam, owned)
 }
 
 /// Deadness oracle for passes that delete a definition and rewrite its
@@ -2138,7 +2172,7 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
         }
         replace_line(store, &mut infos[i], i, new_line);
         mark_nop(&mut infos[j]);
-        lv.refresh_at(store, infos, i);
+        lv.refresh_span(store, infos, i, j);
         changed = true;
         i = j + 1;
     }
@@ -3485,7 +3519,7 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
             || dead_in_block_after(store, infos, li + 1, s_fam)
             || (is_caller_saved_family(s_fam)
                 && !copy_in_loop(store, infos, li)
-                && family_private_to(store, infos, li, s_fam, &[li])))
+                && family_private_lv(&lv, store, infos, li, s_fam, &[li])))
         {
             continue;
         }
