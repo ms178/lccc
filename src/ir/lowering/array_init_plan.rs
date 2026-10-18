@@ -37,10 +37,10 @@ use crate::ir::reexports::{GlobalInit, IrConst, Operand, Value};
 pub(super) struct ArrayGeometry {
     /// IR type of the innermost element.
     pub base_ty: IrType,
-    /// The innermost element is `_Bool` (values are normalised to 0/1).
-    pub is_bool: bool,
-    /// The innermost element is `long double`.
-    pub is_long_double: bool,
+    /// C type of the innermost element: every element converts BY VALUE to
+    /// it (the IR type alone cannot tell `__int128` from a `_Float128` or
+    /// decimal carrier, nor `_Bool` from `unsigned char`).
+    pub elem_ct: CType,
     /// Byte size of one element at each level: `strides[0]` is the size of
     /// an element of the array itself, the last entry the scalar size.
     pub strides: Vec<usize>,
@@ -49,6 +49,16 @@ pub(super) struct ArrayGeometry {
 }
 
 impl ArrayGeometry {
+    /// The innermost element is `_Bool` (values are normalised to 0/1).
+    pub fn is_bool(&self) -> bool {
+        self.elem_ct == CType::Bool
+    }
+
+    /// The innermost element is `long double`.
+    pub fn is_long_double(&self) -> bool {
+        self.elem_ct == CType::LongDouble
+    }
+
     /// Byte size of one scalar.
     pub fn elem_size(&self) -> usize {
         *self
@@ -177,8 +187,7 @@ impl Lowerer {
         }
         Some(ArrayGeometry {
             base_ty: IrType::from_ctype(cur),
-            is_bool: *cur == CType::Bool,
-            is_long_double: *cur == CType::LongDouble,
+            elem_ct: cur.clone(),
             strides,
             total,
         })
@@ -557,10 +566,10 @@ impl Lowerer {
             ElemInit::Unit(u) => return Some(IrConst::from_i64(i64::from(u), geo.base_ty)),
             ElemInit::Expr(e) => {
                 let raw = self.eval_const_expr(e)?;
-                self.coerce_init_const(raw, e, geo.base_ty, geo.is_bool.then_some(&CType::Bool))
+                self.coerce_init_const(raw, e, geo.base_ty, Some(&geo.elem_ct))
             }
         };
-        Some(Self::maybe_promote_long_double(c, geo.is_long_double))
+        Some(Self::maybe_promote_long_double(c, geo.is_long_double()))
     }
 
     /// Whether the plan needs relocations (an element initialized by an
@@ -606,7 +615,7 @@ impl Lowerer {
         plan: &ArrayInitPlan<'_>,
         geo: &ArrayGeometry,
     ) -> Vec<IrConst> {
-        let zero = self.typed_zero_const(geo.base_ty, geo.is_long_double);
+        let zero = self.typed_zero_const(geo.base_ty, geo.is_long_double());
         let mut out = vec![zero; geo.total];
         for (flat, init) in plan.iter() {
             if let Some(c) = self.plan_elem_const(init, geo) {
@@ -711,7 +720,7 @@ impl Lowerer {
                 ElemInit::Expr(e) => {
                     let v = self.lower_expr(e);
                     let src = self.get_expr_type(e);
-                    if geo.is_bool {
+                    if geo.is_bool() {
                         self.emit_expr_bool_conversion(v, src, e)
                     } else {
                         self.emit_implicit_cast(v, src, geo.base_ty)
