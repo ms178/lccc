@@ -1261,6 +1261,10 @@ pub(crate) fn run_passes(
     x86_avx512vl: bool,
     disable_tree_vectorize: bool,
     ra_config: &crate::backend::regalloc::RaConfig,
+    // pic: `-fPIC`/`-shared` semantic interposition — external definitions
+    // in this unit are interposable, so the inliner keeps calls to them
+    // (GCC's default `-fsemantic-interposition` at -fPIC).
+    pic: bool,
 ) {
     let policy = crate::common::pass_policy::PassPolicy::new(
         wrap_signed_overflow,
@@ -1419,6 +1423,7 @@ pub(crate) fn run_passes(
     );
     // The inliner's extension kill switches (A/B and triage), same rule.
     let inline_enabled = |name: &str| std::env::var_os(name).is_none();
+    inline::set_semantic_interposition(pic);
     inline::set_features(inline::InlineFeatures {
         devirt: inline_enabled("CCC_NO_INLINE_DEVIRT"),
         snapshot_refresh: inline_enabled("CCC_NO_INLINE_SNAPSHOT_REFRESH"),
@@ -1747,7 +1752,11 @@ pub(crate) fn run_passes(
     // uses the size-aware policy at -Os/-Oz, so running the unrestricted
     // inliner unconditionally in this later phase defeats that decision and
     // can clone medium helpers at every call site after the first cleanup.
-    if !pass_disabled(&disabled, "postinline") {
+    // "inline" gates the LATE phase too: the pass name is the A/B kill
+    // switch for inlining as a whole, and a late phase that re-inlines
+    // everything the disabled primary phase skipped made
+    // CCC_DISABLE_PASSES=inline a silent no-op for the final binary.
+    if !pass_disabled(&disabled, "postinline") && !pass_disabled(&disabled, "inline") {
         if optimize_for_size {
             inline::run_size_optimized(module);
         } else {
@@ -3900,6 +3909,7 @@ mod signed_wrap_policy_tests {
             false,
             false,
             &crate::backend::regalloc::RaConfig::default(),
+            false,
         );
     }
 

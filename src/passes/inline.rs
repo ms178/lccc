@@ -950,6 +950,21 @@ pub(crate) fn set_features(features: InlineFeatures) {
     FEATURES.with(|f| f.set(features));
 }
 
+// `-fPIC`/`-shared` semantic interposition: a default-visibility external
+// definition may be replaced by another module's symbol at dynamic-link
+// time, so callers in the defining TU must keep the call. Mirrors GCC's
+// default `-fsemantic-interposition` at -fPIC (off at -fPIE/-fno-pic —
+// the kernel and static-link builds, where GCC inlines freely).
+thread_local! {
+    static SEMANTIC_INTERPOSITION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record this translation unit's interposition mode (resolved once per
+/// unit by the driver, the same shape as the affine-fold knobs).
+pub(crate) fn set_semantic_interposition(interposable: bool) {
+    SEMANTIC_INTERPOSITION.with(|f| f.set(interposable));
+}
+
 fn inline_run_impl(module: &mut IrModule, size_optimized: bool, always_inline_only: bool) -> usize {
     inline_run_with(
         module,
@@ -2875,6 +2890,9 @@ struct CalleeContext {
     /// For callees with exactly one entry call site: the function holding it.
     sole_caller: FxHashMap<String, String>,
     debug_callee: bool,
+    /// This unit was built `-fPIC`/`-shared`: default-visibility external
+    /// definitions are semantically interposable, so callers keep the call.
+    semantic_interposition: bool,
 }
 
 fn callee_context(module: &IrModule) -> CalleeContext {
@@ -2903,7 +2921,74 @@ fn callee_context(module: &IrModule) -> CalleeContext {
         call_site_counts,
         sole_caller,
         debug_callee: std::env::var("CCC_INLINE_DEBUG").is_ok(),
+        semantic_interposition: SEMANTIC_INTERPOSITION.with(|f| f.get()),
     }
+}
+
+/// GCC at -O2 inlines small external-linkage DEFINITIONS into callers of the
+/// same translation unit while keeping the out-of-line copy: the body is
+/// this TU's own code and — outside -fPIC — cannot be interposed out from
+/// under a direct call (glibc's `ffs`, zlib's helpers, every non-static
+/// wrapper). Three gates keep admission on the proven class:
+///
+/// * `-fPIC`/`-shared` semantic interposition refuses external admission
+///   entirely (a dynamic symbol may be replaced by another module's).
+/// * Scalar returns only: the inliner's return-value merge is vetted for
+///   scalars; two-eightbyte [Sse, Sse] struct returns mis-merged when
+///   cloned (tests/regression/sse_struct_two_reg_return.c failed its first
+///   value check in the paired corpus A/B, 2026-10-18).
+/// * At most one natural loop: the standalone body is the shape every
+///   downstream optimizer tuned; a multi-loop kernel (matmul: three nested
+///   loops, 34 IR instructions) cloned into a big caller lost the
+///   vectorized form and ran 2.6x slower in the paired corpus A/B
+///   (2026-10-18). Multi-loop extern kernels keep their call (and their
+///   optimized out-of-line body).
+fn extern_inline_admission(func: &IrFunction, ctx: &CalleeContext) -> bool {
+    if ctx.semantic_interposition || func.is_static {
+        return false;
+    }
+    // Leaf helpers only: a callee that itself calls out (libm `fma@PLT`, the
+    // guarded `__lccc_cpu_init` probe initialiser, Fortify wrappers) must
+    // keep its call sites unique — GCC declines these too, and duplicating
+    // them changed pinned contracts in the paired A/B (the fma ISA gate's
+    // byte-for-byte 8-call libm count became 10; the cpu_supports runtime
+    // gate's 2 initialiser calls became 4). Opaque inline asm is refused for
+    // the same reason.
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Call { .. }
+                | Instruction::CallIndirect { .. }
+                | Instruction::InlineAsm { .. } => return false,
+                _ => {}
+            }
+        }
+    }
+    if func.uses_sret
+        || func.ret_is_f128_sse
+        || !func.ret_eightbyte_classes.is_empty()
+        || !matches!(
+            func.return_type,
+            IrType::I8
+                | IrType::I16
+                | IrType::I32
+                | IrType::I64
+                | IrType::I128
+                | IrType::U8
+                | IrType::U16
+                | IrType::U32
+                | IrType::U64
+                | IrType::U128
+                | IrType::F32
+                | IrType::F64
+                | IrType::Ptr
+        )
+    {
+        return false;
+    }
+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+    let raw = loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
+    loop_analysis::merge_loops_by_header(raw).len() <= 1
 }
 
 fn callee_data_for(
@@ -2936,6 +3021,25 @@ fn callee_data_for(
         if func.is_weak {
             return None;
         }
+
+        // GCC at -O2 inlines small external-linkage DEFINITIONS into callers
+        // of the same translation unit while keeping the out-of-line copy:
+        // the body is this TU's own code and — outside -fPIC — cannot be
+        // interposed out from under a direct call (glibc's `ffs`, zlib's
+        // helpers, every non-static wrapper). Admission reuses the static
+        // size windows below; the single-call-site death exemption stays
+        // static-only (an external body always survives for other TUs).
+        //
+        // ONE-LOOP CAP for external candidates: the standalone body is the
+        // shape every downstream optimizer tuned; a multi-loop kernel
+        // (matmul: three nested loops, 34 IR instructions) cloned into a
+        // big caller lost the vectorized form and ran 2.6x slower in the
+        // paired corpus A/B (2026-10-18). External admission therefore
+        // covers the single-loop wrapper/small-helper class only; multi-
+        // loop extern kernels keep their call (and their optimized
+        // out-of-line body).
+        let extern_admissible = extern_inline_admission(func, ctx);
+        let is_static_like = func.is_static || extern_admissible;
 
         // va_arg_pack forwarding plan (S17) — computed before the variadic
         // gate below, consumed by the CalleeData construction at the loop tail.
@@ -3008,7 +3112,7 @@ fn callee_data_for(
             })
         });
         let direct_call_count = call_counts.get(&func.name).copied().unwrap_or(0);
-        let is_small_static = func.is_static
+        let is_small_static = is_static_like
             && !func.is_inline
             && inst_count_for_static <= MAX_STATIC_NONINLINE_INSTRUCTIONS
             && func.blocks.len() <= MAX_STATIC_NONINLINE_BLOCKS;
@@ -3021,7 +3125,7 @@ fn callee_data_for(
         // modpost flags a .text -> .init.text section mismatch.
         // These are treated as normal inline candidates (not exceeds_normal_limits)
         // since they fit within MAX_INLINE_INSTRUCTIONS/MAX_INLINE_BLOCKS.
-        let medium_block_limit = if func.is_static && !func.is_inline {
+        let medium_block_limit = if is_static_like && !func.is_inline {
             MAX_MEDIUM_STATIC_INLINE_BLOCKS
         } else if has_loops {
             MAX_INLINE_BLOCKS
@@ -3036,7 +3140,7 @@ fn callee_data_for(
         // `always_inline` and gnu_inline bodies keep their own admission path:
         // they must be inlined at every site, so they never become
         // constant-trip-only.
-        let loop_bound_params = if func.is_static
+        let loop_bound_params = if is_static_like
             && !func.is_inline
             && !func.is_always_inline
             && !func.is_gnu_inline_def
@@ -3053,7 +3157,7 @@ fn callee_data_for(
         // instructions are admitted, including small loop CFGs. This exposes
         // aggregate-return helpers such as make_group to scalar cleanup. The
         // per-caller budget and caller-size cap remain the code-growth bounds.
-        let is_medium_static = func.is_static
+        let is_medium_static = is_static_like
             && !func.is_inline
             && !is_small_static
             && ((!has_loops
@@ -3175,7 +3279,7 @@ fn callee_data_for(
         // Non-loop callees get a higher block limit since their control flow
         // (if/else chains, switch, early returns) doesn't create nested loops
         // when inlined into a loop caller.
-        let effective_block_limit = if func.is_static && !func.is_inline {
+        let effective_block_limit = if is_static_like && !func.is_inline {
             MAX_MEDIUM_STATIC_INLINE_BLOCKS
         } else if has_loops {
             MAX_INLINE_BLOCKS
@@ -3190,11 +3294,11 @@ fn callee_data_for(
         let fits_general_normal = fits_normal_inline_limits(
             inst_count,
             func.blocks.len(),
-            func.is_static,
+            is_static_like,
             func.is_inline,
             func_has_vector_intrinsics(func),
             effective_block_limit,
-        ) || (func.is_static
+        ) || (is_static_like
             && !func.is_inline
             && has_loops
             && fits_static_loop_inline_limits(inst_count, func.blocks.len(), direct_call_count))
