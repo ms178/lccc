@@ -838,10 +838,17 @@ impl Lowerer {
             return None;
         }
         let ret_ct = self.func().return_ctype.clone()?;
-        if !ret_ct.is_vector() {
+        // A record whose single member is the whole vector (`struct S8f {
+        // v32f v; }`) has the vector's own register image and classes
+        // (`Sse+SseUp`): it returns the packed member exactly like the
+        // bare vector.
+        let vec_ct = self
+            .whole_vector_record_member(&ret_ct)
+            .unwrap_or_else(|| ret_ct.clone());
+        if !vec_ct.is_vector() {
             return None;
         }
-        let shape = simd_shape(&ret_ct)?;
+        let shape = simd_shape(&vec_ct)?;
         let fname = self.func().name.clone();
         let sig = self.func_meta.sigs.get(fname.as_str())?;
         let register_return = match shape.bytes {
@@ -867,9 +874,10 @@ impl Lowerer {
         }
         // The expression's own type must be the same dense object (a
         // `return` of a differently typed vector goes through the generic
-        // conversion paths).
+        // conversion paths); a record's size needs the layout context.
         let expr_ct = self.expr_ctype(e);
-        if expr_ct.size() != shape.bytes || !expr_ct.is_vector() {
+        let expr_size = expr_ct.size_ctx(&*self.types.borrow_struct_layouts());
+        if expr_size != shape.bytes || (!expr_ct.is_vector() && expr_ct != ret_ct) {
             return None;
         }
         if self.aggregate_lvalue_space(e) != AddressSpace::Default {
@@ -878,6 +886,29 @@ impl Lowerer {
         let addr = self.get_struct_base_addr(e);
         let value = self.emit_vec_load(&shape, addr);
         Some(Operand::Value(value))
+    }
+
+    /// The vector type of a record (struct, not union) with exactly one
+    /// non-bitfield member that is a dense vector covering the record's
+    /// whole size (an over-aligned record pads past it), else `None`.
+    pub(super) fn whole_vector_record_member(&self, ct: &CType) -> Option<CType> {
+        if !matches!(ct, CType::Struct(_)) {
+            return None;
+        }
+        let layout = self.get_struct_layout_for_ctype(ct)?;
+        if layout.is_union || layout.fields.len() != 1 {
+            return None;
+        }
+        let f = &layout.fields[0];
+        if f.offset != 0
+            || f.bit_width.is_some()
+            || !f.ty.is_vector()
+            || f.ty.size() != layout.size
+            || simd_shape(&f.ty).is_none()
+        {
+            return None;
+        }
+        Some(f.ty.clone())
     }
 
     /// The single predicate behind `try_lower_vector_conditional_simd`:

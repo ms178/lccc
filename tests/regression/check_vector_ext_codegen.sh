@@ -230,7 +230,7 @@ ceiling loop_v32i 16
 # Shapes still on the per-lane scalar path, ratcheted at their measured
 # counts so the memory-object cost model cannot regress unnoticed
 # (GCC: 2 / 11 / 11 / 15; see FOLLOWUP "vector-ext scalar residue").
-ceiling sadd 18        # struct-wrapped compound assign: lane stores + memcpy
+ceiling sadd 2         # single-member vector record: returned like the bare vector (GCC: 2)
 ceiling s4i_add 26     # struct-wrapped 128-bit add
 ceiling tern_se 53     # ternary whose arms are calls (two sret temporaries)
 ceiling viacall 30     # by-value call into a GCC-built callee + return
