@@ -1697,7 +1697,7 @@ impl Lowerer {
         }
 
         let ty = self.get_expr_type(inner);
-        if let Some(lv) = self.lower_lvalue(inner) {
+        if let Some(lv) = self.lower_lvalue_for_mutation(inner) {
             let loaded = self.load_lvalue_typed(&lv, ty);
             let loaded_val = self.operand_to_value(loaded);
 
@@ -1766,7 +1766,7 @@ impl Lowerer {
                 (IrConst::I64(1), IrType::I64)
             }
         };
-        let lv = match self.lower_lvalue(inner) {
+        let lv = match self.lower_lvalue_for_mutation(inner) {
             Some(lv) => lv,
             None => return self.lower_expr(inner),
         };
