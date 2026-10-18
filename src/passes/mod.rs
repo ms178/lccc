@@ -1415,6 +1415,12 @@ pub(crate) fn run_passes(
         // __fabstf2); LCCC links no libgcc, so fold them to the backend's own
         // inline intrinsics even at -O0 (semantics-preserving rename).
         simplify::fold_math_intrinsic_calls(module);
+        // -O0 runs one budgeted fixpoint above: the always-inline rounds,
+        // whose second-pass budget is a correctness budget (an unexpanded
+        // must-inline call cannot link).  Its cap hits must surface too.
+        if time_passes {
+            round_cap::report();
+        }
         return;
     }
 

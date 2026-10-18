@@ -47,13 +47,13 @@ class ToolMissing(Exception):
     """A required tool cannot be executed: a usage or setup error, not a verdict."""
 
 
-def run(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[bytes] | None:
+def run(cmd: list[str], timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[bytes] | None:
     """Run `cmd`.  None means the run timed out.  A tool that cannot be
     executed raises ToolMissing: treating it as a timeout would turn a wrong
     `--ccc` path into "every candidate is a crash" and reduce to nothing."""
     try:
         return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True,
-                              timeout=timeout, check=False)
+                              timeout=timeout, check=False, env=env)
     except subprocess.TimeoutExpired:
         return None
     except OSError as exc:
@@ -65,8 +65,19 @@ def reference_output(ref: str, src: Path, work: Path, timeout: float) -> bytes |
     built = run([ref, *REF_FLAGS, str(src), "-o", str(exe), "-lm"], timeout)
     if built is None or built.returncode != 0:
         return None
-    first = run([str(exe)], timeout)
-    second = run([str(exe)], timeout)
+    # LeakSanitizer is part of -fsanitize=address and reports ANY allocation
+    # still live at exit as an error (exit status 1).  Leaking is not
+    # undefined behaviour -- C11 makes no requirement to free -- so a leaking
+    # but otherwise defined candidate must stay reducible: without
+    # detect_leaks=0 the oracle rejects every unfreed-allocation candidate
+    # and the reducer silently cannot minimise a leak-containing miscompile.
+    # (Demonstrated: a main() that mallocs 4 KiB and returns 0 exits 1 under
+    # the default environment, 0 with detect_leaks=0.)  ASan interceptors and
+    # UBSan traps are unaffected by the knob; only the at-exit leak report
+    # changes.
+    run_env = {**os.environ, "ASAN_OPTIONS": "detect_leaks=0"}
+    first = run([str(exe)], timeout, env=run_env)
+    second = run([str(exe)], timeout, env=run_env)
     if first is None or second is None:
         return None
     if first.returncode != 0 or second.returncode != 0:

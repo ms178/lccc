@@ -38,17 +38,21 @@ Engines Supported:
  13. aarch64      : forwards to tests/fuzz/aarch64_fuzz.py (lccc-arm vs
                     aarch64-linux-gnu-gcc under qemu-aarch64; SKIPs
                     gracefully when the cross toolchain is absent).
+ 14. punning      : forwards to tests/fuzz/punning_fuzz.py (byte-exact union/
+                    memcpy type-punning). Its own Vellvm-style byte model is
+                    the oracle, so it needs NO reference compiler; SKIPs on
+                    non-x86-64 hosts (the model encodes little-endian x86-64).
 
 The tests/fuzz engines use two absorption mechanisms, both preserving the
 standalone scripts byte-for-byte: generator-config engines (5-7) import the
 historical generator and evaluate its cases through this harness's oracle
 (every reference compiler at every level, GEN-BUG tripwire, repro retention);
-forwarding engines (8-13) launch the standalone differential tester - which
+forwarding engines (8-14) launch the standalone differential tester - which
 owns its nostdlib/int80 or cross-compilation pipeline - and adopt its exit
 code as the verdict, exactly like the stress_suite's unroll_stress arm.  Each
 of them keeps its historical defaults (seed span, levels, gcc oracle); m32
-engines SKIP cleanly on hosts that cannot build/execute ELF32, and aarch64
-SKIPs when a cross toolchain is missing.
+engines SKIP cleanly on hosts that cannot build/execute ELF32, aarch64
+SKIPs when a cross toolchain is missing, and punning SKIPs off x86-64.
 
 Features:
   - Exact stdout/exit-status checksum validation across ALL selected
@@ -88,6 +92,7 @@ import importlib
 import itertools
 import json
 import os
+import platform
 import random
 import shlex
 import shutil
@@ -840,6 +845,11 @@ _STANDALONE_FUZZ_ENGINES: dict[str, dict[str, Any]] = {
     "alu_torture": {"script": "alu_torture_m32.py", "seeds": False,
                     "gen": ("alu_torture_m32", "PROBE", ["-mno-sse", "-mno-mmx"])},
     "aarch64": {"script": "aarch64_fuzz.py", "seeds": True, "gen": None},
+    # Byte-precise type punning: the script's own little-endian x86-64 byte
+    # model is the oracle (validated against GCC upstream), so no reference
+    # compiler is forwarded and the m32/int80 host probe does not apply.
+    "punning": {"script": "punning_fuzz.py", "seeds": True, "gen": None,
+                "oracle": "self_model"},
 }
 
 
@@ -956,7 +966,8 @@ def run_standalone_engine(engine: str, lccc_path: str, ref_compilers: list[str],
     Host gates: aarch64 needs a cross toolchain (SKIP otherwise); the m32
     engines need a working ELF32 build+int80 oracle - when the oracle is
     blocked (common in containers) they fall back to compile-only
-    validation instead of reporting vacuous passes.
+    validation instead of reporting vacuous passes; self-model engines
+    (punning) need only a host that can execute x86-64 binaries.
     """
     spec = _STANDALONE_FUZZ_ENGINES[engine]
     script = FUZZ_DIR / spec["script"]
@@ -979,6 +990,13 @@ def run_standalone_engine(engine: str, lccc_path: str, ref_compilers: list[str],
                 "cross toolchain unavailable on this host: " + ", ".join(missing)
                 + "; run on a cross-equipped host or invoke the script directly")]
         ref_cc = cross_gcc
+    elif spec.get("oracle") == "self_model":
+        if platform.machine() not in ("x86_64", "AMD64"):
+            return [DiffResult(
+                engine, "SKIP",
+                f"self-model oracle is x86-64-only (host {platform.machine()}); "
+                f"run the script directly on an x86-64 host")]
+        ref_cc = None  # the engine's byte model IS the reference (--gcc unsupported)
     else:
         ref_cc = ref_compilers[0]
         can_build, oracle = _m32_host_capability(ref_cc)
@@ -995,8 +1013,10 @@ def run_standalone_engine(engine: str, lccc_path: str, ref_compilers: list[str],
                                      seed, count, repro_dir or DEFAULT_REPRO_DIR)
 
     out_dir = Path(tempfile.mkdtemp(prefix=f"fuzz_diff_{engine}_"))
-    cmd = [sys.executable, str(script), "--ccc", lccc_path, "--gcc", ref_cc,
+    cmd = [sys.executable, str(script), "--ccc", lccc_path,
            "--levels", ",".join(levels), "--out", str(out_dir)]
+    if ref_cc is not None:
+        cmd += ["--gcc", ref_cc]
     if takes_seeds:
         cmd += ["--seeds", f"{seed}:{seed + max(count, 1)}"]
     cases = max(1, count) * len(levels) if takes_seeds else len(levels)
@@ -1032,6 +1052,8 @@ _LEGACY_ENGINE_DEFAULTS: dict[str, dict[str, Any]] = {
     "alias_m32": {"count": 64, "seed": 0, "opts": "-O2,-Os", "refs": "gcc"},
     "alu_torture": {"count": 1, "seed": 0, "opts": "-O2,-Os", "refs": "gcc"},
     "aarch64": {"count": 40, "seed": 0, "opts": "-O2,-Os", "refs": "gcc"},
+    "punning": {"count": 200, "seed": 0, "opts": "-O0,-O1,-O2,-O3,-Os",
+                "refs": "gcc"},
 }
 
 
@@ -1051,6 +1073,7 @@ _ENGINE_RUNNERS = {
     "alias_m32": functools.partial(run_standalone_engine, "alias_m32"),
     "alu_torture": functools.partial(run_standalone_engine, "alu_torture"),
     "aarch64": functools.partial(run_standalone_engine, "aarch64"),
+    "punning": functools.partial(run_standalone_engine, "punning"),
 }
 
 # Every legacy engine's backing file in tests/fuzz (verified by
@@ -1367,7 +1390,10 @@ def main() -> int:
         print(f"note: reference compilers not found (skipped): "
               f"{', '.join(missing_refs)}", file=sys.stderr)
     if not available_refs:
-        sys.exit(f"error: none of the reference compilers ({refs_raw}) found in PATH")
+        if _STANDALONE_FUZZ_ENGINES.get(args.engine, {}).get("oracle") != "self_model":
+            sys.exit(f"error: none of the reference compilers ({refs_raw}) found in PATH")
+        print(f"note: --engine {args.engine} is its own oracle; running without "
+              f"a reference compiler", file=sys.stderr)
 
     opts_raw = args.opts or _LEGACY_ENGINE_DEFAULTS.get(args.engine, {}).get("opts", "-O0,-O1,-O2,-O3")
     opt_levels = [o.strip() for o in opts_raw.split(",") if o.strip()]

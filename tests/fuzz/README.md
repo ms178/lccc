@@ -48,6 +48,7 @@ unchanged and absorbs it through one of two mechanisms:
 | `alias_fuzz_m32.py` | `alias_m32` | forwarding engine (redundant-load/GVN shapes). |
 | `alu_torture_m32.py` | `alu_torture` | forwarding engine; the probe is fixed, so it runs once per level and `--count` has no effect. |
 | `aarch64_fuzz.py` | `aarch64` | forwarding engine to `lccc-arm` vs `aarch64-linux-gnu-gcc` under `qemu-aarch64`; SKIPs cleanly when the cross toolchain is absent (the harness defaults `--lccc` to `target/fastbuild/lccc-arm` for this engine). |
+| `punning_fuzz.py` | `punning` | forwarding engine (same `--ccc`/`--seeds`/`--levels` mapping, but no `--gcc`: the script's own byte model is the oracle, so no reference compiler is required); SKIPs off x86-64. |
 
 Each engine keeps its historical defaults (seed span, levels, gcc oracle);
 `--count`/`--seed`/`--opts`/`--refs` override them.
