@@ -219,6 +219,70 @@ pub(super) fn call_window_verdict(
 }
 
 /// Per-line liveness for a whole assembly file.
+/// Exact, lazy liveness upkeep for a forward-scanning pass that only
+/// DELETES straight-line definitions (the dead-write passes).
+///
+/// Re-solving the whole function after every deletion made such a pass
+/// O(deletions x function length).  By
+/// [`FileLiveness::deletion_changes_only_reads`], a deletion leaves every
+/// family's solution unchanged except the families the deleted line read,
+/// so the stale solution still answers every other family exactly; the
+/// function is re-solved only when a later query in it asks about one of
+/// those families.  A function the scan has left is never queried again.
+pub(super) struct DeadWriteRefresh {
+    /// A line of the function with pending deletions, and the families
+    /// whose solution there may have shrunk since it was last solved.
+    stale: Option<(usize, u16)>,
+}
+
+impl DeadWriteRefresh {
+    pub(super) fn new() -> Self {
+        DeadWriteRefresh { stale: None }
+    }
+
+    /// Make `lv` exact for a query about `fam` after line `idx`.
+    pub(super) fn before_query(
+        &mut self,
+        lv: &mut FileLiveness,
+        store: &LineStore,
+        infos: &[LineInfo],
+        idx: usize,
+        fam: RegId,
+    ) {
+        let Some((k, families)) = self.stale else {
+            return;
+        };
+        if !lv.same_function(k, idx) {
+            // Forward scan: the stale function is behind us for good.
+            self.stale = None;
+        } else if fam <= REG_GP_MAX && families & (1u16 << fam) != 0 {
+            lv.refresh_at(store, infos, k);
+            self.stale = None;
+        }
+    }
+
+    /// Delete line `idx` (`mark_nop`) and keep `lv` exact.
+    pub(super) fn delete(
+        &mut self,
+        lv: &mut FileLiveness,
+        store: &LineStore,
+        infos: &mut [LineInfo],
+        idx: usize,
+    ) {
+        let reads = lv.deletion_changes_only_reads(idx);
+        mark_nop(&mut infos[idx]);
+        self.stale = match (reads, self.stale) {
+            (Some(r), Some((k, families))) if lv.same_function(k, idx) => Some((k, families | r)),
+            (Some(r), _) => Some((idx, r)),
+            (None, _) => {
+                // Re-solves the whole function, pending deletions included.
+                lv.refresh_at(store, infos, idx);
+                None
+            }
+        };
+    }
+}
+
 pub(super) struct FileLiveness {
     /// Registers live immediately AFTER each line, when its function could be
     /// analysed.
@@ -550,6 +614,40 @@ impl FileLiveness {
             return None;
         }
         Some(self.live_out[idx] & (1u16 << fam) != 0)
+    }
+
+    /// Whether lines `a` and `b` lie in the same analysed function.
+    pub(super) fn same_function(&self, a: usize, b: usize) -> bool {
+        matches!((self.func_of.get(a), self.func_of.get(b)),
+            (Some(Some(x)), Some(Some(y))) if x == y)
+    }
+
+    /// The families whose solution can change if line `idx` is deleted, when
+    /// that set is exactly the line's reads; `None` when only a full
+    /// [`FileLiveness::refresh_at`] is exact.
+    ///
+    /// Liveness is a per-family gen/kill problem.  Deleting a straight-line
+    /// instruction (control flow, labels and the CFG are untouched, so the
+    /// solver's convergence and the jump-table resolution are too) turns its
+    /// transfer function into the identity.  A family it writes and that is
+    /// dead after it had live-in 0 (killed) and keeps live-in 0 (passes the
+    /// dead live-out through), so its solution is unchanged everywhere; a
+    /// family it reads may only shrink; every other family is untouched.
+    /// That needs: the function analysed, every written family dead after
+    /// the line in THIS solution (a deletion justified by a syntactic proof
+    /// while the dataflow still models the family live could grow it), and
+    /// the return liveness taken from the prologue markers (the textual
+    /// tail-block detector reads instruction text a deletion can change).
+    pub(super) fn deletion_changes_only_reads(&self, idx: usize) -> Option<u16> {
+        if !*self.known.get(idx)? {
+            return None;
+        }
+        let (start, _) = (*self.func_of.get(idx)?)?;
+        if self.textual_ret.contains(&(start as usize)) {
+            return None;
+        }
+        let (reads, writes) = self.effect[idx];
+        (self.live_out[idx] & writes == 0).then_some(reads)
     }
 
     /// Recompute the liveness of the function containing `idx` after a pass
@@ -1552,6 +1650,85 @@ impl FileLiveness {
 mod tests {
     use super::*;
     use crate::backend::peephole_common::LineStore;
+
+    /// `DeadWriteRefresh` keeps the solution exact without re-solving per
+    /// deletion: after each deletion every family outside the pending read
+    /// set answers exactly what a fresh solve of the edited text answers,
+    /// on every line; a query on a pending family re-solves first, after
+    /// which all families agree.  The fixture is a loop whose dead writes
+    /// cascade (deleting `movl %edi, %r8d` frees nothing; deleting
+    /// `movl %r9d, %r10d` makes `%r9d`'s producer dead in turn).
+    #[test]
+    fn dead_write_refresh_stays_exact() {
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    # LCCC_RET_RDX 0\n",
+            "    # LCCC_RET_RAX 1\n",
+            "    movl $1, %ecx\n",
+            "    movl %esi, %r9d\n",
+            ".L1:\n",
+            "    movl %edi, %r8d\n",
+            "    movl %r9d, %r10d\n",
+            "    addl %ecx, %eax\n",
+            "    subl $1, %edi\n",
+            "    jne .L1\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let store = LineStore::new(asm.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let line = |text: &str| {
+            (0..store.len())
+                .find(|&i| store.get(i).trim() == text)
+                .unwrap()
+        };
+        let mut lv = FileLiveness::new(&store, &infos);
+        let mut upkeep = DeadWriteRefresh::new();
+        let agree = |lv: &FileLiveness, infos: &[LineInfo], families: u16, what: &str| {
+            let fresh = FileLiveness::new(&store, infos);
+            for j in 0..store.len() {
+                if infos[j].is_nop() {
+                    continue;
+                }
+                for fam in 0..=REG_GP_MAX {
+                    if families & (1u16 << fam) != 0 {
+                        assert_eq!(
+                            lv.live_after(j, fam),
+                            fresh.live_after(j, fam),
+                            "{what}: line {j} {:?} family {fam}",
+                            store.get(j)
+                        );
+                    }
+                }
+            }
+        };
+        // Deletion order of a forward scan; each line is dead when deleted.
+        for text in ["movl %edi, %r8d", "movl %r9d, %r10d"] {
+            let i = line(text);
+            assert_eq!(
+                lv.live_after(i, register_family_fast(text.rsplit(' ').next().unwrap())),
+                Some(false)
+            );
+            let reads = lv
+                .deletion_changes_only_reads(i)
+                .expect("deferrable deletion");
+            upkeep.delete(&mut lv, &store, &mut infos, i);
+            let pending = upkeep.stale.map_or(0, |(_, f)| f);
+            assert_eq!(pending & reads, reads, "{text}: its reads are pending");
+            agree(&lv, &infos, !pending, &format!("after deleting {text}"));
+        }
+        // `%r9d`'s producer is dead only in the re-solved program: asking
+        // about family 9 must refresh, then everything agrees.
+        let producer = line("movl %esi, %r9d");
+        upkeep.before_query(&mut lv, &store, &infos, producer, 9);
+        assert!(
+            upkeep.stale.is_none(),
+            "a pending family forces the re-solve"
+        );
+        assert_eq!(lv.live_after(producer, 9), Some(false));
+        agree(&lv, &infos, u16::MAX, "after the forced re-solve");
+    }
 
     /// Drift alarm for the dest-only contract.  Since S03 the liveness
     /// classifier DELEGATES to `helpers::is_read_modify_write` (the
