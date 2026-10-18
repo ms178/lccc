@@ -1816,6 +1816,16 @@ impl Lowerer {
                     if let Some(func_info) = self.sema_functions.get(sig_key.as_str()) {
                         return Some(func_info.return_type.clone());
                     }
+                    // An undeclared builtin is typed by sema's builtin table
+                    // (`typeof(__builtin_nan(""))` is double, not the
+                    // implicit-int fallback).
+                    if let Some(ct) =
+                        crate::frontend::sema::type_checker::ExprTypeChecker::builtin_return_ctype(
+                            name,
+                        )
+                    {
+                        return Some(ct);
+                    }
                 }
                 // For indirect calls through function pointer variables,
                 // extract the return type from the pointer's CType.

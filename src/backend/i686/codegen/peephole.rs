@@ -2698,22 +2698,23 @@ fn frame_mem_width(mn: &str) -> i32 {
     match mn {
         "movb" | "movzbl" | "movsbl" | "addb" | "subb" | "andb" | "orb" | "xorb" | "adcb"
         | "sbbb" | "incb" | "decb" | "negb" | "notb" | "shlb" | "shrb" | "sarb" | "rolb"
-        | "rorb" | "rclb" | "rcrb" | "xchgb" | "cmpxchgb" | "fistpb" | "btsb" | "btrb" | "btcb"
-        | "movntib" | "xaddb" => 1,
+        | "rorb" | "rclb" | "rcrb" | "xchgb" | "cmpxchgb" | "btsb" | "btrb" | "btcb" | "movntib"
+        | "xaddb" | "cmpb" | "testb" => 1,
         "movw" | "movzwl" | "movsbw" | "addw" | "subw" | "andw" | "orw" | "xorw" | "adcw"
         | "sbbw" | "incw" | "decw" | "negw" | "notw" | "shlw" | "shrw" | "sarw" | "rolw"
-        | "rorw" | "rclw" | "rcrw" | "xchgw" | "cmpxchgw" | "fistpw" | "fisttpw" | "fnstsw"
-        | "fstsw" | "fstcw" | "fnstcw" | "fldcw" | "movntiw" | "fistb" | "xaddw" => 2,
+        | "rorw" | "rclw" | "rcrw" | "xchgw" | "cmpxchgw" | "fnstsw" | "fstsw" | "fstcw"
+        | "fnstcw" | "fldcw" | "movntiw" | "xaddw" | "cmpw" | "testw"
+        // AT&T x87 integer suffixes: `s` = 16-bit, `l` = 32-bit, `q` = 64-bit.
+        | "filds" | "fists" | "fistps" | "fisttps" => 2,
         "movl" | "addl" | "subl" | "andl" | "orl" | "xorl" | "adcl" | "sbbl" | "incl" | "decl"
         | "negl" | "notl" | "shll" | "shrl" | "sarl" | "roll" | "rorl" | "rcll" | "rcrl"
         | "xchgl" | "cmpxchgl" | "btsl" | "btrl" | "btcl" | "xaddl" | "movd" | "movss"
-        | "fildl" | "filds" | "fistl" | "fistpl" | "fstps" | "fists" | "flds" | "movntil"
-        | "cmpl" | "testl" | "cmpw" | "testw" | "cmpb" | "testb" | "fisttpl" | "stmxcsr"
-        | "ldmxcsr" => 4,
+        | "fildl" | "fistl" | "fistpl" | "fisttpl" | "fstps" | "flds" | "movntil" | "cmpl"
+        | "testl" | "stmxcsr" | "ldmxcsr" => 4,
         // `cmpl`/`testl` are reads and never invalidate, but they get the right
         // width anyway so the table stays a single source of truth for both
         // passes and for the tests that pin it.
-        "movq" | "movsd" | "fstpl" | "fstl" | "fldl" | "fildq" | "fistpq" | "fisttpq" | "fistq"
+        "movq" | "movsd" | "fstpl" | "fstl" | "fldl" | "fildq" | "fistpq" | "fisttpq"
         | "movlps" | "movhps" | "movlpd" | "movhpd" | "movntlq" => 8,
         "fldt" | "fstt" | "fstpt" | "fbstp" => 10,
         "fstp" | "fst" => 8,
@@ -2799,8 +2800,8 @@ fn frame_write_extents(s: &str, out: &mut [(i32, i32)]) -> usize {
     let store_family = matches!(
         mn,
         "fstps" | "fstpl" | "fstpt" | "fstp" | "fst"
-            | "fists" | "fistl" | "fistq" | "fistpl" | "fistpq" | "fisttp"
-            | "fisttpl" | "fisttpq" | "fbstp" | "fxsave" | "fxsave64"
+            | "fists" | "fistps" | "fistl" | "fistpl" | "fistpq" | "fisttp"
+            | "fisttps" | "fisttpl" | "fisttpq" | "fbstp" | "fxsave" | "fxsave64"
             | "fnsave" | "fsave" | "fnstsw" | "fstsw" | "fstcw" | "fnstcw"
             // fstenv/fnstenv STORE the 28-byte FPU environment; only fldenv and
             // frstor read it. Classifying these as reads was an
@@ -5084,9 +5085,26 @@ fn mnemonic_only_reads_memory(mn: &str) -> bool {
             | "fldl"
             | "fldt"
             | "fild"
+            | "filds"
             | "fildl"
             | "fildll"
             | "fildq"
+            | "fiadds"
+            | "fiaddl"
+            | "fisubs"
+            | "fisubl"
+            | "fisubrs"
+            | "fisubrl"
+            | "fimuls"
+            | "fimull"
+            | "fidivs"
+            | "fidivl"
+            | "fidivrs"
+            | "fidivrl"
+            | "ficoms"
+            | "ficoml"
+            | "ficomps"
+            | "ficompl"
             | "fadd"
             | "fadds"
             | "faddl"
@@ -5165,9 +5183,12 @@ fn esp_store_operand(mn: &str, op: &str) -> Option<(i32, i32)> {
         "movb" => 1,
         "movq" | "movsd" | "movlps" | "movups" | "movaps" | "movapd" | "movupd" => 8,
         "movdqa" | "movdqu" => 16,
-        "fstl" | "fstpl" | "fistpl" => 8,
-        "fsts" | "fstps" | "fistl" => 4,
-        "fstt" | "fstpt" | "fisttpl" => 10,
+        // x87 stores: the width is the MEMORY format, never the register's.
+        // Overstating it would "prove" bytes overwritten that are not.
+        "fstl" | "fstpl" | "fistpq" | "fisttpq" => 8,
+        "fsts" | "fstps" | "fistl" | "fistpl" | "fisttpl" => 4,
+        "fists" | "fistps" | "fisttps" => 2,
+        "fstt" | "fstpt" => 10,
         _ => return None,
     };
     let disp = esp_slot_displacement(op)?;
@@ -20550,6 +20571,69 @@ f:
         assert_eq!(w("movl %eax, %ecx"), vec![]);
         // a `lock` prefix is not the mnemonic
         assert_eq!(w("lock xaddl %ebx, 8(%esp)"), vec![(ESP_SLOT_BIAS + 8, 4)]);
+    }
+
+    #[test]
+    fn x87_integer_store_widths_are_memory_format_widths() {
+        // AT&T x87 integer suffixes: s = 16, l = 32, q = 64 bits. The
+        // slot-overwrite proof must never overstate a store: `fistpl` was 8
+        // and `fisttpl` 10, which "proved" the untouched high half of an
+        // 8-byte slot dead.
+        for (mn, w) in [
+            ("fists", 2),
+            ("fistps", 2),
+            ("fisttps", 2),
+            ("fistl", 4),
+            ("fistpl", 4),
+            ("fisttpl", 4),
+            ("fistpq", 8),
+            ("fisttpq", 8),
+            ("fsts", 4),
+            ("fstpl", 8),
+            ("fstpt", 10),
+        ] {
+            assert_eq!(esp_store_operand(mn, "4(%esp)"), Some((4, w)), "{mn}");
+            assert_eq!(frame_mem_width(mn), w, "{mn}");
+        }
+        for (mn, w) in [("filds", 2), ("fildl", 4), ("fildq", 8)] {
+            assert_eq!(frame_mem_width(mn), w, "{mn}");
+        }
+        for (mn, w) in [("cmpb", 1), ("testb", 1), ("cmpw", 2), ("testw", 2)] {
+            assert_eq!(frame_mem_width(mn), w, "{mn}");
+        }
+        // Slot [8, 16): a 32-bit store covers exactly one half (the old
+        // widths reported Both for `fistpl 8(%esp)` / `fisttpl 8(%esp)`).
+        assert!(matches!(
+            slot_write_extent("    fisttpl 8(%esp)", 8, 12),
+            SlotWrite::Lo
+        ));
+        assert!(matches!(
+            slot_write_extent("    fistpl 8(%esp)", 8, 12),
+            SlotWrite::Lo
+        ));
+        assert!(matches!(
+            slot_write_extent("    fistpl 12(%esp)", 8, 12),
+            SlotWrite::Hi
+        ));
+        assert!(matches!(
+            slot_write_extent("    fisttpq 8(%esp)", 8, 12),
+            SlotWrite::Both
+        ));
+        assert!(matches!(
+            slot_write_extent("    fisttps 8(%esp)", 8, 12),
+            SlotWrite::ReadOrUnknown
+        ));
+    }
+
+    #[test]
+    fn x87_short_integer_stores_invalidate_their_two_bytes() {
+        let mut ext = [(0i32, 0i32); 4];
+        for line in ["fisttps 8(%esp)", "fistps 8(%esp)", "fists 8(%esp)"] {
+            let n = frame_write_extents(line, &mut ext);
+            assert_eq!(&ext[..n], &[(ESP_SLOT_BIAS + 8, 2)], "{line}");
+        }
+        let n = frame_write_extents("filds 8(%esp)", &mut ext);
+        assert_eq!(n, 0, "filds only reads its operand");
     }
 
     #[test]

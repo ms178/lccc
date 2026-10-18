@@ -1053,7 +1053,7 @@ impl<'a> ExprTypeChecker<'a> {
     /// Return CType for known builtins.
     /// This is the CType-level equivalent of the lowerer's builtin_return_type (IrType).
     /// TODO: consolidate with sema/builtins.rs BuiltinInfo to avoid duplication.
-    fn builtin_return_ctype(name: &str) -> Option<CType> {
+    pub(crate) fn builtin_return_ctype(name: &str) -> Option<CType> {
         match name {
             // BMI2 BZHI returns its operand type.
             "__builtin_ia32_bzhi_si" => Some(CType::UInt),
