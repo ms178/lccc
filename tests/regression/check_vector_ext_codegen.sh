@@ -197,6 +197,10 @@ for fn in cq_le_s cq_ne_s cq4_ne_s cd4_ne_s cw4_ne_s cq_lt_u cq4_lt_u cd4_lt_u; 
 for fn in cq4_le_u cq_le_u; do ceiling "$fn" 6; done
 ceiling cq_ge_u 7
 ceiling cq_sel 7
+# Whole-register `__builtin_memcpy` load/store idioms (GCC: 2).  The byte/
+# word 128-bit shapes are register-homed like the dword ones.
+for fn in ld_v32f ld_v32i ld_v32c ld_v16f ld_v16i ld_v16c ld_v16s \
+          st_v32f st_v32i st_v32c st_v32s st_v16f st_v16i st_v16c st_v16s; do ceiling "$fn" 2; done
 ceiling mix_sab4 7
 # Scalar/vector interleave: broadcast + fma + ret (GCC: 3).
 ceiling mix_sab 3

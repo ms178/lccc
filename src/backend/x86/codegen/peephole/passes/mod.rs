@@ -1248,6 +1248,19 @@ fn peephole_optimize_inner(
                 changed |= c;
             }
         }
+        if !sk("vzeroupper_entry_state") {
+            {
+                let c = vector_copy::elide_vzeroupper_without_upper_writes(&store, &mut infos);
+                trace(
+                    "elide_vzeroupper_without_upper_writes",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
         if !sk("dead_pure_writes") {
             {
                 let c = dead_writes::eliminate_dead_pure_writes(&store, &mut infos);

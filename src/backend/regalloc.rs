@@ -8627,6 +8627,19 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecXorI64x2
         | O::VecSminI32x4
         | O::VecSmaxI32x4
+        // Byte/word 128-bit loads and bitwise ops: the GNU-vector
+        // `v16c`/`v8s` shapes.  Home-direct `movdqu` loads (the I32x4
+        // arm's discipline) and `emit_sse_binary_128`/VEX.128 bitwise
+        // forms; without these entries every `v8s` parameter round-
+        // tripped through a 16-byte slot.
+        | O::VecLoadI8x16
+        | O::VecLoadI16x8
+        | O::VecAndI8x16
+        | O::VecOrI8x16
+        | O::VecXorI8x16
+        | O::VecAndI16x8
+        | O::VecOrI16x8
+        | O::VecXorI16x8
         // HALF-WIDE dword-pair endpoints (the ops between them are
         // the ordinary I32x4 intrinsics above).
         | O::VecLoadI32x4Pair
@@ -8806,6 +8819,9 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecOrI64x4
                     | O::VecXorI64x4
                     | O::VecStoreI64x4
+                    // Word-lane store: the `vec_store_source_256` arm
+                    // shared with I32x8/I8x32.
+                    | O::VecStoreI16x16
             ),
             6 => matches!(
                 op,
@@ -8866,6 +8882,16 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecSminI32x4
                     | O::VecSmaxI32x4
                     | O::VecStoreI64x2
+                    // Byte/word 128-bit bitwise ops and stores (the
+                    // `vec_store_source_128` arm shared with I32x4).
+                    | O::VecAndI8x16
+                    | O::VecOrI8x16
+                    | O::VecXorI8x16
+                    | O::VecAndI16x8
+                    | O::VecOrI16x8
+                    | O::VecXorI16x8
+                    | O::VecStoreI8x16
+                    | O::VecStoreI16x8
             ),
             _ => false,
         }
