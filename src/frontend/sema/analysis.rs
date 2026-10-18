@@ -166,6 +166,9 @@ pub struct SemanticAnalyzer {
     /// block-scope declaration finds the nested entity it belongs to instead of
     /// writing through the shared basename.
     function_nesting_stack: Vec<String>,
+    /// Whether ordinary hosted-library builtin folds are disabled.
+    no_builtins: bool,
+    builtin_policy: crate::common::pass_policy::BuiltinFlags,
 }
 
 impl SemanticAnalyzer {
@@ -179,6 +182,8 @@ impl SemanticAnalyzer {
             defined_structs: RefCell::new(FxHashSet::default()),
             current_return_type: None,
             function_nesting_stack: Vec::new(),
+            no_builtins: false,
+            builtin_policy: crate::common::pass_policy::BuiltinFlags::default(),
         };
         // Pre-populate with common implicit declarations
         analyzer.declare_implicit_functions();
@@ -221,6 +226,18 @@ impl SemanticAnalyzer {
     /// Set a pre-configured diagnostic engine on the analyzer.
     pub fn set_diagnostics(&mut self, engine: DiagnosticEngine) {
         self.diagnostics = RefCell::new(engine);
+    }
+
+    /// Disable ordinary hosted-library builtin folds (`-fno-builtin`).
+    /// Compiler-prefixed `__builtin_*` forms remain available.
+    pub fn set_no_builtins(&mut self, no_builtins: bool) {
+        self.no_builtins = no_builtins;
+    }
+
+    /// Install the CLI's builtin-withdrawal policy (blanket and per-name
+    /// state).  Evaluators consult this instead of an ambient mode.
+    pub fn set_builtin_policy(&mut self, policy: crate::common::pass_policy::BuiltinFlags) {
+        self.builtin_policy = policy;
     }
 
     /// Take the diagnostic engine back from the analyzer.
@@ -656,6 +673,7 @@ impl SemanticAnalyzer {
                         types: &self.result.type_context,
                         functions: &self.result.functions,
                         expr_types: Some(&self.result.expr_types),
+                        builtin_policy: self.builtin_policy.clone(),
                     };
                     checker.infer_expr_ctype(init_expr).unwrap_or(CType::Int)
                 } else {
@@ -1162,6 +1180,7 @@ impl SemanticAnalyzer {
                             types: &self.result.type_context,
                             functions: &self.result.functions,
                             expr_types: Some(&self.result.expr_types),
+                            builtin_policy: self.builtin_policy.clone(),
                         };
                         if let Some(init_ty) = checker.infer_expr_ctype(init_expr) {
                             self.check_pointer_float_conversion(
@@ -1331,6 +1350,7 @@ impl SemanticAnalyzer {
                 types: &self.result.type_context,
                 functions: &self.result.functions,
                 expr_types: Some(&self.result.expr_types),
+                builtin_policy: self.builtin_policy.clone(),
             };
             // An object with static storage (file scope, or a block-scope
             // `static`) needs a constant initializer (C11 6.7.9p4), and its
@@ -1407,6 +1427,7 @@ impl SemanticAnalyzer {
             functions: &self.result.functions,
             const_values: Some(&self.result.const_values),
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
             folding_initializer: false,
         };
         let value = evaluator.eval_const_expr(expr)?;
@@ -1743,6 +1764,42 @@ impl SemanticAnalyzer {
                         .type_context
                         .insert_enum_type_scoped(tag.clone(), enum_type);
                 }
+                // Register EVERY completed named body -- packed or not -- in the
+                // enum tag registry.  A body-less `enum tag` reference resolves
+                // through `TypeContext::enum_types` so it ends up with the same
+                // variant values (and therefore the same compatible integer
+                // type, C11 6.7.2.2p4) as the definition itself.  Before this,
+                // only packed bodies were stored, a reference to a non-packed
+                // enum carried an empty variant list, and
+                // `EnumType::compatible_ctype` then reported `unsigned int`
+                // even for enums with a negative enumerator -- which rejected
+                // the kernel's `kstrtoint(buf, 10, &submodule->id)` in
+                // drivers/md/md.c (`enum md_submodule_id` starts with
+                // `ID_LINEAR = LEVEL_LINEAR` == -1, from
+                // include/uapi/linux/raid/md_u.h).  The same evaluation rules
+                // as the packed branch: explicit values re-anchor the counter,
+                // implicit ones continue it.
+                if let Some(tag) = name {
+                    let mut variant_values = Vec::with_capacity(variants.len());
+                    let mut next_val: i64 = 0;
+                    for v in variants {
+                        if let Some(ref val_expr) = v.value {
+                            if let Some(val) = self.eval_const_expr(val_expr) {
+                                next_val = val;
+                            }
+                        }
+                        variant_values.push((v.name.clone(), next_val));
+                        next_val += 1;
+                    }
+                    self.result.type_context.enum_types.insert(
+                        tag.clone(),
+                        crate::common::types::EnumType {
+                            name: Some(tag.clone()),
+                            variants: variant_values,
+                            is_packed: *is_packed,
+                        },
+                    );
+                }
             }
             TypeSpecifier::Struct(_, Some(fields), ..)
             | TypeSpecifier::Union(_, Some(fields), ..) => {
@@ -1819,6 +1876,7 @@ impl SemanticAnalyzer {
                             types: &self.result.type_context,
                             functions: &self.result.functions,
                             expr_types: Some(&self.result.expr_types),
+                            builtin_policy: self.builtin_policy.clone(),
                         };
                         let expr_is_void =
                             matches!(checker.infer_expr_ctype(expr), Some(CType::Void) | None);
@@ -1834,6 +1892,7 @@ impl SemanticAnalyzer {
                             types: &self.result.type_context,
                             functions: &self.result.functions,
                             expr_types: Some(&self.result.expr_types),
+                            builtin_policy: self.builtin_policy.clone(),
                         };
                         if let Some(actual) = checker.infer_expr_ctype(expr) {
                             let actual = self.conversion_source_ctype(expr, actual);
@@ -2543,6 +2602,7 @@ impl SemanticAnalyzer {
                     types: &self.result.type_context,
                     functions: &self.result.functions,
                     expr_types: Some(&self.result.expr_types),
+                    builtin_policy: self.builtin_policy.clone(),
                 };
                 let signature = match checker.infer_expr_ctype(callee) {
                     Some(CType::Function(ft)) => Some(*ft),
@@ -2588,6 +2648,7 @@ impl SemanticAnalyzer {
                     types: &self.result.type_context,
                     functions: &self.result.functions,
                     expr_types: Some(&self.result.expr_types),
+                    builtin_policy: self.builtin_policy.clone(),
                 };
                 if let (Some(lhs_ty), Some(rhs_ty)) =
                     (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
@@ -2736,6 +2797,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
         };
         if let Some(ctype) = checker.infer_expr_ctype(expr) {
             self.result.expr_types.insert(expr.id(), ctype);
@@ -2765,6 +2827,7 @@ impl SemanticAnalyzer {
             functions: &self.result.functions,
             const_values: Some(&self.result.const_values),
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
             folding_initializer: false,
         };
         if let Some(val) = evaluator.eval_const_expr(expr) {
@@ -2793,6 +2856,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
         };
         let trusted = |expr: &Expr| {
             let ty = checker.infer_expr_ctype(expr)?;
@@ -2848,6 +2912,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
         };
 
         // Get the base type, dereferencing for pointer member access (->)
@@ -2972,6 +3037,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
         };
         let lct = match checker.infer_expr_ctype(lhs) {
             Some(ct) => ct,
@@ -3039,6 +3105,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
         };
         for (index, (arg, (param_ty, _))) in args.iter().zip(params).enumerate() {
             if let Some(arg_ty) = checker.infer_expr_ctype(arg) {
@@ -3343,6 +3410,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
         };
         match checker.infer_expr_ctype(expr) {
             Some(CType::Struct(_) | CType::Union(_) | CType::Array(..)) | None => true,
@@ -3479,6 +3547,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
         };
         let Some(from) = checker.infer_expr_ctype(expr) else {
             return;
@@ -3514,6 +3583,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
         };
         let (Some(lt), Some(rt)) = (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
         else {
@@ -3560,6 +3630,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
         };
         let (Some(tt), Some(et)) = (
             checker.infer_expr_ctype(then_expr),
@@ -3628,6 +3699,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
         };
         checker.infer_expr_ctype(expr)
     }
@@ -3692,6 +3764,7 @@ impl SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
         };
         let (Some(CType::Pointer(_, from_space)), Some(CType::Pointer(_, to_space))) = (
             checker.infer_expr_ctype(inner),
@@ -4043,6 +4116,7 @@ impl SemanticAnalyzer {
             functions: &self.result.functions,
             const_values: Some(&self.result.const_values),
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
             folding_initializer: false,
         }
     }
@@ -4221,6 +4295,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
         };
         checker.lvalue_address_space(expr)
     }
@@ -4428,6 +4503,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
             types: &self.result.type_context,
             functions: &self.result.functions,
             expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
         };
         checker.infer_expr_ctype(expr).unwrap_or(CType::Int)
     }

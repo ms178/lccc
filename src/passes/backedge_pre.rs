@@ -1722,6 +1722,32 @@ mod tests {
                 assert_eq!(count_muls(&f), if observable { 2 } else { 1 });
                 // Do not turn an FP legality fence into a global integer ban.
                 assert_eq!(run(&mut int_recurrence()), 1);
+                // Keep that guarantee when an otherwise unrelated FP operation
+                // appears in the same loop: policy is candidate-local, not a
+                // function-wide ban on integer PRE.
+                let mut mixed = int_recurrence();
+                mixed.blocks[1].instructions.push(binop(
+                    90,
+                    IrBinOp::Mul,
+                    Operand::Const(IrConst::F64(1.25)),
+                    Operand::Const(IrConst::F64(0.125)),
+                    IrType::F64,
+                ));
+                mixed.next_value_id = 91;
+                mixed.pass_policy.fp_environment_observable = observable;
+                assert_eq!(
+                    run(&mut mixed),
+                    1,
+                    "FP policy must not ban integer PRE in a mixed function"
+                );
+                assert!(mixed.blocks[1].instructions.iter().any(|i| matches!(
+                    i,
+                    Instruction::BinOp {
+                        dest: Value(90),
+                        ty: IrType::F64,
+                        ..
+                    }
+                )));
             }
         }
     }
@@ -1962,9 +1988,17 @@ mod tests {
             1
         );
         let mut volatile = function.clone();
-        if let Instruction::Alloca { volatile, .. } = &mut volatile.blocks[1].instructions[at] {
-            *volatile = true;
-        }
+        volatile.blocks[1].instructions.insert(
+            at + 3,
+            Instruction::Load {
+                dest: Value(72),
+                ptr: Value(70),
+                ty: IrType::I32,
+                seg_override: crate::common::types::AddressSpace::Default,
+                volatile: true,
+            },
+        );
+        volatile.next_value_id = volatile.next_value_id.max(73);
         assert_eq!(run_round(&mut volatile, &env, &tm), 0);
         let mut user_call = function.clone();
         user_call.blocks[1].instructions.push(Instruction::Call {

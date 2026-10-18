@@ -135,3 +135,5 @@ work/
 # tool's anchor file are local state, never source.
 .claude/settings.local.json
 /.base_ref
+target-dbg/
+.arena-tmp/

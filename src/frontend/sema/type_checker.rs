@@ -45,6 +45,8 @@ pub struct ExprTypeChecker<'a> {
     /// Pre-computed expression types from bottom-up sema walk (memoization cache).
     /// When set, `infer_expr_ctype` checks this map before recursing.
     pub expr_types: Option<&'a FxHashMap<ExprId, CType>>,
+    /// Whether hosted-library builtin aliases are disabled for constant queries.
+    pub builtin_policy: crate::common::pass_policy::BuiltinFlags,
 }
 
 impl<'a> ExprTypeChecker<'a> {
@@ -870,9 +872,23 @@ impl<'a> ExprTypeChecker<'a> {
             }
             TypeSpecifier::FunctionPointer(ret, params, variadic) => {
                 let ret_ct = self.resolve_type_spec(ret);
+                // Full per-parameter conversion (param_decl_to_ctype_with): a
+                // nested function-pointer parameter inside the type name
+                // (`void(*)(void *, int (*fun)(unsigned int))`) rides on
+                // ParamDecl.fptr_params; resolving `p.type_spec` alone yields
+                // `int *` and rejects GCC-legal calls (tracepoint
+                // __traceiter_cpuhp_enter probe dispatch).
                 let param_cts: Vec<(CType, Option<String>)> = params
                     .iter()
-                    .map(|p| (self.resolve_type_spec(&p.type_spec), p.name.clone()))
+                    .map(|p| {
+                        (
+                            crate::common::type_builder::param_decl_to_ctype_with(
+                                &|ts| self.resolve_type_spec(ts),
+                                p,
+                            ),
+                            p.name.clone(),
+                        )
+                    })
                     .collect();
                 CType::Pointer(
                     Box::new(CType::Function(Box::new(FunctionType {
@@ -898,6 +914,7 @@ impl<'a> ExprTypeChecker<'a> {
             functions: self.functions,
             const_values: None,
             expr_types: self.expr_types,
+            builtin_policy: self.builtin_policy.clone(),
             folding_initializer: false,
         };
         evaluator.eval_const_expr(expr)?.to_i64()

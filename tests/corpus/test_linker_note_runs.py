@@ -37,3 +37,21 @@ class NoteRuns(unittest.TestCase):
                        section('debug', 1, 96, 8, flags=0)]:
             rows = [section('a', 7, 64, 32), middle, section('b', 7, 104, 32)]
             self.assertEqual(len(module._allocated_note_runs(rows)), 1)
+
+    def test_note_span_payload_boundaries(self):
+        occupied = [(0x120, 0x127)]
+        for start, end, expected in [
+            (0x100, 0x120, False), (0x127, 0x140, False),
+            (0x120, 0x121, True), (0x126, 0x140, True),
+            (0x100, 0x140, True), (0x123, 0x123, False),
+            (0x124, 0x122, False),
+        ]:
+            with self.subTest(start=start, end=end):
+                self.assertEqual(module._note_span_has_payload(occupied, start, end), expected)
+
+    def test_registered_oracle_entry_point_executes_its_controls(self):
+        self.assertEqual(module._note_run_oracle_test(None, None).status, 'PASS')
+
+
+if __name__ == '__main__':
+    unittest.main()

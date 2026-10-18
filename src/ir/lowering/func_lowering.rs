@@ -219,68 +219,10 @@ impl Lowerer {
             let param_ctype = self.type_spec_to_ctype(&param.type_spec);
 
             // Complex parameter decomposition
-            let decompose_cld = self.decomposes_complex_long_double();
-            if param_ctype.is_complex() {
-                // ComplexLongDouble: only decompose on ARM64 (HFA in Q regs);
-                // on x86-64/RISC-V it's passed as a struct (on stack / by reference).
-                if matches!(param_ctype, CType::ComplexLongDouble) && !decompose_cld {
-                    // Fall through to struct handling below
-                } else if matches!(param_ctype, CType::ComplexDouble)
-                    && !self.decomposes_complex_double()
-                {
-                    // i686: _Complex double (16 bytes) is passed as a struct on the stack.
-                    // Fall through to struct handling below.
-                } else if matches!(param_ctype, CType::ComplexFloat)
-                    && !self.decomposes_complex_float()
-                {
-                    // i686: _Complex float (8 bytes) is passed as a struct on the stack.
-                    // Fall through to struct handling below.
-                } else if matches!(param_ctype, CType::ComplexFloat)
-                    && self.uses_packed_complex_float()
-                {
-                    // x86-64: _Complex float packed into single F64
-                    let ir_idx = params.len();
-                    params.push(IrParam {
-                        ty: IrType::F64,
-                        noalias: false,
-                        struct_size: None,
-                        struct_align: None,
-                        param_align: None,
-                        struct_eightbyte_classes: Vec::new(),
-                        riscv_float_class: None,
-                        is_f128_sse: false,
-                    });
-                    param_kinds.push(ParamKind::ComplexFloatPacked(ir_idx));
-                    continue;
-                } else {
-                    // Decompose into two FP params (ComplexFloat/ComplexDouble on 64-bit,
-                    // ComplexLongDouble on ARM64 only)
-                    let comp_ty = Self::complex_component_ir_type(&param_ctype);
-                    let real_idx = params.len();
-                    params.push(IrParam {
-                        ty: comp_ty,
-                        noalias: false,
-                        struct_size: None,
-                        struct_align: None,
-                        param_align: None,
-                        struct_eightbyte_classes: Vec::new(),
-                        riscv_float_class: None,
-                        is_f128_sse: false,
-                    });
-                    let imag_idx = params.len();
-                    params.push(IrParam {
-                        ty: comp_ty,
-                        noalias: false,
-                        struct_size: None,
-                        struct_align: None,
-                        param_align: None,
-                        struct_eightbyte_classes: Vec::new(),
-                        riscv_float_class: None,
-                        is_f128_sse: false,
-                    });
-                    param_kinds.push(ParamKind::ComplexDecomposed(real_idx, imag_idx));
-                    continue;
-                }
+            if param_ctype.is_complex()
+                && self.try_push_complex_param_ir(&param_ctype, &mut params, &mut param_kinds)
+            {
+                continue;
             }
 
             // Clang 23.1.3's i386 ext-vector parameter carriers
@@ -515,6 +457,82 @@ impl Lowerer {
     }
 
     /// Allocate function parameters as local variables (3-phase process).
+
+    /// Push the IR params for a `_Complex` parameter when this target
+    /// decomposes complex parameters into float registers; return whether
+    /// the parameter was consumed (the caller must not run its struct or
+    /// scalar arms).
+    ///
+    /// Per-target policy, mirrored from the platform ABIs: _Complex long
+    /// double decomposes only on ARM64 (HFA in Q regs) — on x86-64/RISC-V it
+    /// is passed as an aggregate; _Complex double/float decompose unless the
+    /// i686 struct-on-stack policy applies; x86-64 additionally packs
+    /// `_Complex float` into a single F64.
+    fn try_push_complex_param_ir(
+        &self,
+        param_ctype: &CType,
+        params: &mut Vec<IrParam>,
+        param_kinds: &mut Vec<ParamKind>,
+    ) -> bool {
+        // ComplexLongDouble: only decompose on ARM64 (HFA in Q regs);
+        // on x86-64/RISC-V it's passed as a struct (on stack / by reference).
+        if matches!(param_ctype, CType::ComplexLongDouble) && !self.decomposes_complex_long_double()
+        {
+            // Fall through to struct handling in the caller.
+            return false;
+        }
+        if matches!(param_ctype, CType::ComplexDouble) && !self.decomposes_complex_double() {
+            // i686: _Complex double (16 bytes) is passed as a struct on the stack.
+            return false;
+        }
+        if matches!(param_ctype, CType::ComplexFloat) && !self.decomposes_complex_float() {
+            // i686: _Complex float (8 bytes) is passed as a struct on the stack.
+            return false;
+        }
+        if matches!(param_ctype, CType::ComplexFloat) && self.uses_packed_complex_float() {
+            // x86-64: _Complex float packed into single F64
+            let ir_idx = params.len();
+            params.push(IrParam {
+                ty: IrType::F64,
+                noalias: false,
+                struct_size: None,
+                struct_align: None,
+                param_align: None,
+                struct_eightbyte_classes: Vec::new(),
+                riscv_float_class: None,
+                is_f128_sse: false,
+            });
+            param_kinds.push(ParamKind::ComplexFloatPacked(ir_idx));
+            return true;
+        }
+        // Decompose into two FP params (ComplexFloat/ComplexDouble on 64-bit,
+        // ComplexLongDouble on ARM64 only)
+        let comp_ty = Self::complex_component_ir_type(param_ctype);
+        let real_idx = params.len();
+        params.push(IrParam {
+            ty: comp_ty,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            riscv_float_class: None,
+            is_f128_sse: false,
+        });
+        let imag_idx = params.len();
+        params.push(IrParam {
+            ty: comp_ty,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            riscv_float_class: None,
+            is_f128_sse: false,
+        });
+        param_kinds.push(ParamKind::ComplexDecomposed(real_idx, imag_idx));
+        true
+    }
     pub(super) fn allocate_function_params(
         &mut self,
         func: &FunctionDef,

@@ -20,6 +20,16 @@ use crate::ir::reexports::{CallInfo, Instruction, IrFunction, IrModule, Operand,
 ///
 /// Returns the number of call sites updated.
 pub fn run(module: &mut IrModule) -> usize {
+    run_with_builtins(
+        module,
+        &crate::common::pass_policy::BuiltinPolicy::default(),
+    )
+}
+
+pub fn run_with_builtins(
+    module: &mut IrModule,
+    builtins: &crate::common::pass_policy::BuiltinPolicy,
+) -> usize {
     let fenv = module
         .functions
         .iter()
@@ -74,7 +84,8 @@ pub fn run(module: &mut IrModule) -> usize {
         "ceill", "floor", "floorf", "floorl", "trunc", "truncf", "truncl", "round", "roundf",
         "roundl", "log", "logf", "logl", "exp", "expf", "expl", "pow", "powf", "powl",
     ] {
-        if fp_effectful.contains(*name)
+        if !builtins.may_assume(name)
+            || fp_effectful.contains(*name)
             || (fenv && !["abs", "labs", "llabs", "imaxabs"].contains(name))
         {
             continue;
@@ -345,6 +356,7 @@ fn analyze_function_purity(
                 | Instruction::VaCopy { .. }
                 | Instruction::VaArg { .. }
                 | Instruction::VaArgStruct { .. }
+                | Instruction::VaArgVector { .. }
                 | Instruction::PgoCounterInc { .. }
                 | Instruction::Fence { .. }
                 | Instruction::InitTrampoline { .. }

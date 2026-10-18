@@ -2940,6 +2940,30 @@ fn build_coalesce_groups(
             (start, end, m)
         });
         let mut accepted: Vec<u32> = Vec::new();
+        // Overlap tolerance for a same-value edge is sound only while both
+        // endpoints hold identical bits. A single-def pair copies once and
+        // keeps the equality for the whole later span. A MULTI-DEF endpoint
+        // rewrites the shared home at every later definition — foreign
+        // content for any other live member — so it may overlap nothing
+        // except its own latch partner (whose single use dies at the copy,
+        // the guarded latch_same_value shape).
+        let def_le_1 = |v: u32| def_count.get(&v).copied().unwrap_or(0) <= 1;
+        // Overlap tolerance is sound only while both endpoints hold
+        // IDENTICAL bits for the whole overlapped region. A single-def
+        // same-value pair copies once and keeps the equality afterwards, so
+        // the edge may tolerate the overlap. A MULTI-DEF endpoint (a
+        // loop-latch or phi-transport copy dest) rewrites the shared home at
+        // every later definition — foreign content for any member still
+        // live across it (arp_create: the v1376/v71 web let v71's def clobber
+        // still-live v1376's only home mid-span, leaving it with no
+        // slot/remat/acc recovery at its consumer and tripping the
+        // fail-closed operand_to_rax gate) — so multi-def members never get
+        // overlap tolerance and take their own homes.
+        let edge_pair = |m: u32, a: u32| -> bool {
+            (same_value_edges.contains(&(m, a)) || same_value_edges.contains(&(a, m)))
+                && def_le_1(m)
+                && def_le_1(a)
+        };
         for m in members {
             let ok = match iv_map.get(&m) {
                 None => true,
@@ -2951,8 +2975,7 @@ fn build_coalesce_groups(
                             // and src hold identical register contents, so
                             // sharing the register is sound and the cast
                             // emits nothing.
-                            || same_value_edges.contains(&(m, *a))
-                            || same_value_edges.contains(&(*a, m))
+                            || edge_pair(m, *a)
                             // Phi-web members on exclusive CFG paths may
                             // share a home. Linearized fat intervals overlap
                             // even then; hole-aware segments are the proof.

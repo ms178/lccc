@@ -278,6 +278,23 @@ impl<'s> StaticInitChecker<'s> {
                     None => Kind::Bad,
                 }
             }
+            // __builtin_choose_expr is _Generic by constant condition: only
+            // the SELECTED operand is part of the initializer, so the other
+            // one may be non-constant or name an automatic object (GCC folds
+            // the choice before checking any leaf — the kernel's
+            // PIN_GROUP(.mode = __builtin_choose_expr(
+            // __builtin_constant_p((m)), (m), 0)) static-local pattern).
+            // The condition must fold; otherwise the choice is unknowable.
+            Expr::FunctionCall(callee, args, _)
+                if matches!(callee.as_ref(), Expr::Identifier(name, _) if name == "__builtin_choose_expr")
+                    && args.len() >= 3 =>
+            {
+                match (self.eval)(&args[0]) {
+                    Some(v) if v.is_nonzero() => self.value(&args[1]),
+                    Some(_) => self.value(&args[2]),
+                    None => Kind::Bad,
+                }
+            }
             // A file-scope compound literal has static storage: an address constant.
             Expr::CompoundLiteral(..) => self.compound_literal_kind(),
             Expr::Sizeof(..)

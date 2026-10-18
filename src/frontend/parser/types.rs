@@ -764,6 +764,27 @@ impl Parser {
     }
 
     /// Parse a struct or union definition/reference.
+
+    /// True when the type specifier names (or defines) an enum type.  The
+    /// parser-level evaluator has no enum tag registry, so any enum-shaped
+    /// alignof must be answered by sema (which resolves the compatible type
+    /// from the completed definition).
+    pub(super) fn type_spec_has_enum_tag(ts: &TypeSpecifier) -> bool {
+        match ts {
+            TypeSpecifier::Enum(..) => true,
+            TypeSpecifier::Pointer(inner, _) => Self::type_spec_has_enum_tag(inner),
+            TypeSpecifier::Array(inner, _) => Self::type_spec_has_enum_tag(inner),
+            TypeSpecifier::TypeofType(inner) => Self::type_spec_has_enum_tag(inner),
+            // A record with an enum field inherits the range-dependence: the
+            // field's alignment is the completed enum's alignment.
+            TypeSpecifier::Struct(_, Some(fields), ..)
+            | TypeSpecifier::Union(_, Some(fields), ..) => fields
+                .iter()
+                .any(|f| Self::type_spec_has_enum_tag(&f.type_spec)),
+            _ => false,
+        }
+    }
+
     fn parse_struct_or_union(&mut self, is_struct: bool) -> TypeSpecifier {
         // Type-budget frame: nested struct/union DEFINITIONS recurse one
         // frame per level (`struct { struct { ... int x; } s; }`); on
@@ -855,9 +876,16 @@ impl Parser {
         };
         // Record alignment for named struct/union definitions so that later
         // tag-only references (e.g., __alignof__(struct foo)) can look it up.
+        // A definition containing an enum field is NOT cached: the field's
+        // alignment follows the completed enum definition's value range
+        // (sema's registry), which the parser cannot always see — caching a
+        // 4-byte guess here made every later `_Alignof(struct WithEnum)` and
+        // `_Static_assert(_Alignof(..) == 8)` answer 4 where GCC says 8.
         match &ts {
             TypeSpecifier::Struct(Some(tag), Some(_), ..)
-            | TypeSpecifier::Union(Some(tag), Some(_), ..) => {
+            | TypeSpecifier::Union(Some(tag), Some(_), ..)
+                if !Self::type_spec_has_enum_tag(&ts) =>
+            {
                 // Pass the tag-alignment map so nested NAMED records already
                 // defined (parsed inside-out) resolve in O(1) instead of
                 // re-walking the whole chain at every level. This is what
@@ -1046,7 +1074,11 @@ impl Parser {
                 self.advance();
                 continue;
             }
-            // C11 6.7.2.1: _Static_assert is allowed as a struct-declaration
+            // C11 6.7.2.1: _Static_assert is allowed as a struct-declaration.
+            // Struct members carry no AST slot for assertions; the parse-time
+            // fast-path decides literal conditions, and tag-dependent
+            // conditions stay accepted (the enclosing struct's own layout is
+            // still being built here, so there is no sema state to defer to).
             if matches!(self.peek(), TokenKind::StaticAssert) {
                 if let Some(deferred) = self.parse_static_assert() {
                     // Speculative parses (nested-function and cast lookahead)
@@ -1262,12 +1294,15 @@ impl Parser {
                 declarator_span,
             );
             // Attach the address-space qualifier (e.g. `__percpu`) to the
-            // outermost pointer: `unsigned int __percpu *read_count` declares a
-            // %gs-qualified POINTER, and the load through it must use %gs:.
+            // pointer the qualifier was written BEFORE. GCC binds such a
+            // qualifier to the first (innermost) star: `unsigned int __percpu
+            // *read_count` dereferences with %gs, `int __seg_gs **f` keeps
+            // the outer dereference generic and puts %gs on the second
+            // (`**f`), and `void __percpu *pptrs[]` (DECLARE_FLEX_ARRAY)
+            // makes every ELEMENT a %gs-qualified pointer, so the slot sits
+            // under the array dimensions.
             if field_addr_space != AddressSpace::Default {
-                if let TypeSpecifier::Pointer(_, addr_slot) = &mut field_type {
-                    *addr_slot = field_addr_space;
-                }
+                field_type = Self::attach_before_star_space(field_type, field_addr_space);
             }
 
             fields.push(StructFieldDecl {
@@ -1328,6 +1363,30 @@ impl Parser {
     /// into the TypeSpecifier directly to maintain backward compatibility with
     /// downstream code. For complex cases (function pointers), return the
     /// derived list for downstream to process with build_full_ctype().
+    /// Bind a BEFORE-the-star address-space qualifier to the pointer it
+    /// applies to. GCC attaches such a qualifier to the first (innermost)
+    /// star, reached through any array dimensions and outer pointer levels:
+    /// `unsigned int __percpu *read_count` dereferences with %gs, `int
+    /// __seg_gs **f` keeps the outer dereference generic and puts %gs on the
+    /// second (`**f`), and `void __percpu *pptrs[]` (DECLARE_FLEX_ARRAY)
+    /// makes every ELEMENT a %gs-qualified pointer, so the slot sits under
+    /// the array dimensions. A type without a bindable pointer is returned
+    /// unchanged (the qualifier was rejected by check_struct_field_space).
+    fn attach_before_star_space(t: TypeSpecifier, space: AddressSpace) -> TypeSpecifier {
+        match t {
+            TypeSpecifier::Array(elem, n) => {
+                TypeSpecifier::Array(Box::new(Self::attach_before_star_space(*elem, space)), n)
+            }
+            TypeSpecifier::Pointer(pointee, s)
+                if matches!(&*pointee, TypeSpecifier::Pointer(..)) =>
+            {
+                TypeSpecifier::Pointer(Box::new(Self::attach_before_star_space(*pointee, space)), s)
+            }
+            TypeSpecifier::Pointer(pointee, _) => TypeSpecifier::Pointer(pointee, space),
+            other => other,
+        }
+    }
+
     fn fold_simple_derived(
         base: &TypeSpecifier,
         derived: &[DerivedDeclarator],

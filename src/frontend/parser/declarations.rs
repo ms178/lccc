@@ -930,6 +930,11 @@ impl Parser {
         // Handle bare type with semicolon (struct/enum/union definition)
         if matches!(self.peek(), TokenKind::Semicolon) {
             self.advance();
+            // The declaration's address space is lexical to it: a nested
+            // declaration parsed inside this one's type specifier (a
+            // statement expression inside typeof) must not leave its space
+            // behind for the ENCLOSING declaration to inherit.
+            self.attrs.parsing_address_space = AddressSpace::Default;
             let mut d = Declaration::new(
                 type_spec,
                 declarators,
@@ -1043,6 +1048,14 @@ impl Parser {
         }
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
+        // The declaration's address space is lexical to it: consume it now
+        // that every declarator has read it. A declaration NESTED inside
+        // this one's type specifier (a statement expression inside typeof,
+        // kernel per-CPU read macros) parses its own `const void __seg_gs *q`
+        // and used to leave __seg_gs in the flag — the outer `typeof(({...}))
+        // x` then inherited the space and tripped "'__seg_gs' specified for
+        // auto variable" on code GCC 16.2 accepts.
+        self.attrs.parsing_address_space = AddressSpace::Default;
         // Merge alignment from _Alignas (captured in parsed_alignas during type specifier parsing)
         // with alignment from __attribute__((aligned(N))) on declarators
         if let Some(a) = self.attrs.parsed_alignas.take() {

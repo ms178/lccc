@@ -1233,7 +1233,7 @@ impl Preprocessor {
                 let mut swapped = false;
                 for slot in self.system_include_paths.iter_mut() {
                     if slot == std::path::Path::new("/usr/include/x86_64-linux-gnu") {
-                        *slot = std::path::PathBuf::from("/usr/include/i386-linux-gnu");
+                        *slot = sysroot_candidate("/usr/include/i386-linux-gnu");
                         swapped = true;
                         break;
                     }
@@ -1248,7 +1248,7 @@ impl Preprocessor {
                         .position(|p| p == std::path::Path::new("/usr/include"))
                         .unwrap_or(self.system_include_paths.len());
                     self.system_include_paths
-                        .insert(at, std::path::PathBuf::from("/usr/include/i386-linux-gnu"));
+                        .insert(at, sysroot_candidate("/usr/include/i386-linux-gnu"));
                 }
             }
             _ => {

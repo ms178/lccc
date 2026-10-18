@@ -134,11 +134,34 @@ fn builtin_cast_is_nop(target: &TypeSpecifier) -> bool {
 /// - __builtin_parity{,l,ll}, __builtin_clrsb{,l,ll}
 ///
 /// `eval_fn` is the caller's recursive eval_const_expr function.
+/// Evaluate a compile-time builtin call in hosted mode (non-prefixed
+/// hosted-library names fold).  Thin wrapper over
+/// [`eval_builtin_call_with_mode`] with the default policy; kept as the
+/// natural entry point for contexts without a builtin-policy thread.
 pub fn eval_builtin_call(
     name: &str,
     args: &[Expr],
     eval_fn: &dyn Fn(&Expr) -> Option<IrConst>,
 ) -> Option<IrConst> {
+    eval_builtin_call_with_mode(name, args, eval_fn, true)
+}
+
+/// Evaluate a compile-time builtin call under an explicit builtin policy.
+/// `allow_nonprefixed_builtins=false` (`-fno-builtin` / `-ffreestanding`)
+/// withdraws EVERY non-`__`-prefixed spelling — the whole bare-name fold
+/// table (strlen, fabs, floor, ceil, fma, fmax, fmin, copysign, ...) consists
+/// of hosted-library aliases; the reserved `__builtin_*`/`__lccc_*` spellings
+/// stay available in both hosted and freestanding modes (C11 7.1.3 reserved
+/// identifiers). Pinning: `check_fno_builtin_folds.sh`.
+pub fn eval_builtin_call_with_mode(
+    name: &str,
+    args: &[Expr],
+    eval_fn: &dyn Fn(&Expr) -> Option<IrConst>,
+    allow_nonprefixed_builtins: bool,
+) -> Option<IrConst> {
+    if !allow_nonprefixed_builtins && !name.starts_with("__") {
+        return None;
+    }
     match name {
         "__builtin_strlen" | "strlen" => {
             // String literal -> compile-time length (without the NUL).
@@ -978,6 +1001,9 @@ fn classified_f64(
 ///
 /// `is_unsigned` indicates whether the expression has an unsigned type.
 #[inline]
+/// Evaluate a compile-time builtin call under an explicit builtin policy.
+/// `allow_nonprefixed_builtins=false` (`-fno-builtin` / `-ffreestanding`)
+/// withdraws EVERY non-`__`-prefixed spelling — the whole bare-name fold
 pub fn promote_sub_int(val: IrConst, is_unsigned: bool) -> IrConst {
     match &val {
         IrConst::I8(v) => {
@@ -1088,7 +1114,7 @@ pub fn eval_binop_with_types(
 
 #[cfg(test)]
 mod string_length_tests {
-    use super::{eval_builtin_call, narrow_string_strlen};
+    use super::{eval_builtin_call, eval_builtin_call_with_mode, narrow_string_strlen};
     use crate::common::source::Span;
     use crate::frontend::parser::ast::Expr;
     use crate::ir::constants::IrConst;
@@ -1096,9 +1122,20 @@ mod string_length_tests {
     #[test]
     fn narrow_strlen_stops_at_first_embedded_nul() {
         assert_eq!(narrow_string_strlen("ab\0cd"), 2);
-        let literal = Expr::StringLiteral("ab\0cd".to_string(), Span::dummy());
+        let literal = || Expr::StringLiteral("ab\0cd".to_string(), Span::dummy());
         assert_eq!(
-            eval_builtin_call("strlen", &[literal], &|_| None),
+            eval_builtin_call("strlen", &[literal()], &|_| None),
+            Some(IrConst::I64(2))
+        );
+        // Policy interaction: `-fno-builtin` keeps the ordinary spelling a
+        // call (None here), while the explicit __builtin spelling still
+        // folds — GCC-compatible, at every tier.
+        assert_eq!(
+            eval_builtin_call_with_mode("strlen", &[literal()], &|_| None, false),
+            None
+        );
+        assert_eq!(
+            eval_builtin_call_with_mode("__builtin_strlen", &[literal()], &|_| None, false),
             Some(IrConst::I64(2))
         );
     }

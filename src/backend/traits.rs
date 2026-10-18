@@ -1876,6 +1876,26 @@ pub trait ArchCodegen {
         self.emit_va_arg_struct(dest_ptr, va_list_ptr, size, align);
     }
 
+    /// Emit `va_arg` of a vector-shaped type on x86-64.
+    ///
+    /// A vector vararg occupies ONE SSE register (its two eightbytes share
+    /// the single XMM slot at reg_save_area + fp_offset) or one 16-aligned
+    /// overflow slot; fp_offset always advances by exactly 16. This is
+    /// observably different from `emit_va_arg_struct_ex` with per-eightbyte
+    /// classes, which fetches one slot PER SSE eightbyte. Default
+    /// implementation falls back to the struct fetch (sound for targets
+    /// where the lowering never produces this instruction).
+    fn emit_va_arg_vector(
+        &mut self,
+        dest_ptr: &Value,
+        va_list_ptr: &Value,
+        size: usize,
+        align: usize,
+        _eightbyte_classes: &[crate::common::types::EightbyteClass],
+    ) {
+        self.emit_va_arg_struct(dest_ptr, va_list_ptr, size, align);
+    }
+
     /// Emit an atomic read-modify-write operation.
     fn emit_atomic_rmw(
         &mut self,

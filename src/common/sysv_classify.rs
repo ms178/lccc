@@ -149,6 +149,17 @@ pub fn classify(ty: &CType, ctx: &dyn StructLayoutProvider) -> Option<SysvPassin
     if !matches!(ty, CType::Struct(_) | CType::Union(_)) && !ty.is_vector() {
         return None;
     }
+    // GCC 16.2.0 (measured, harness-cache-1 oracle): a one-lane FP
+    // `vector_size` vector has no vector mode (BLKmode) and is MEMORY in the
+    // argument position — the 4/8 bytes travel on the stack
+    // (`f32x1 id(f32x1)` loads its argument from `8(%rsp)`). Everything the
+    // `None` leaf below used to fall back to (an INTEGER register pass)
+    // diverged from the oracle by a whole calling convention.
+    if let CType::Vector(elem, total) = ty {
+        if matches!(**elem, CType::Float | CType::Double) && elem.size() == *total {
+            return Some(SysvPassing::Memory);
+        }
+    }
     if let CType::Struct(key) | CType::Union(key) = ty {
         ctx.get_struct_layout(key)?;
     }
@@ -172,6 +183,16 @@ pub fn classify_return(ty: &CType, ctx: &dyn StructLayoutProvider) -> Option<Sys
         if layout.lanes == 2 && matches!(**elem, CType::LongDouble) {
             return Some(SysvPassing::X87Pair);
         }
+        // A one-lane FLOAT ext vector deliberately has NO special arm: the
+        // pinned Clang 23.1.3 oracle (the ext_vector_abi_grid, exact-
+        // expectations, green on the pinned release through many runs)
+        // returns it through the INTEGER eightbyte — `%eax`/`%rax` carries
+        // the bit pattern, exactly like a `u32x1`/`u64x1`. The "float twin
+        // of f64x1" analogy was validated only against GCC 16.2.0, which
+        // IGNORES `ext_vector_type` entirely and therefore compiles a plain
+        // `float` — no oracle for this spelling. The `vector_size` spelling
+        // of the one-lane FP shapes IS answered by `classify` below: GCC
+        // 16.2.0 measured V1SF/V1DF as MEMORY (BLKmode, hidden sret).
     }
     classify(ty, ctx)
 }
@@ -210,7 +231,13 @@ fn finish(classes: Option<Vec<Class>>) -> SysvPassing {
                 Integer => EightbyteClass::Integer,
                 Sse => EightbyteClass::Sse,
                 SseUp => EightbyteClass::SseUp,
-                X87 | X87Up | ComplexX87 | Memory => unreachable!("filtered above"),
+                // Defense in depth, not dead code: the X87/X87Up/ComplexX87/
+                // Memory arm above only inspects the classes slice directly.
+                // If a future edit routes a classified-but-unfiltered type
+                // through this mapping (e.g. a union post-merge pass), the
+                // psABI-mandated answer for those classes is memory class —
+                // a panic would take a working compile down with it.
+                X87 | X87Up | ComplexX87 | Memory => EightbyteClass::Memory,
             })
             .collect(),
     };

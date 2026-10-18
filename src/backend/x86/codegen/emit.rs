@@ -9643,6 +9643,7 @@ impl ArchCodegen for X86Codegen {
         fn emit_va_arg(&mut self, dest: &Value, va_list_ptr: &Value, result_ty: IrType) => emit_va_arg_impl;
         fn emit_va_arg_struct(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize) => emit_va_arg_struct_impl;
         fn emit_va_arg_struct_ex(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize, eightbyte_classes: &[crate::common::types::EightbyteClass]) => emit_va_arg_struct_ex_impl;
+        fn emit_va_arg_vector(&mut self, dest_ptr: &Value, va_list_ptr: &Value, size: usize, align: usize, eightbyte_classes: &[crate::common::types::EightbyteClass]) => emit_va_arg_vector_impl;
         fn emit_va_start(&mut self, va_list_ptr: &Value) => emit_va_start_impl;
         fn emit_va_copy(&mut self, dest_ptr: &Value, src_ptr: &Value) => emit_va_copy_impl;
         // returns

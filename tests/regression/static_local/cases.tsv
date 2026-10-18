@@ -1,6 +1,3 @@
-# Block-scope static initializers, measured against GCC 16.2.
-# id<TAB>expect(accept|reject)<TAB>diag-substring-or-'-'<TAB>function-body
-# The body is placed in: void f(int n, struct s *q) { BODY }, after prelude.c.
 call_addr	reject	not constant	int a[2]; static int *p = (int *)g();
 auto_addr	reject	not constant	int a; static int *p = &a;
 auto_arr_decay	reject	not constant	int a[2]; static int *p = a;
@@ -94,3 +91,4 @@ funcname_cast_ok	accept	-	static const void *s = (const void *)__PRETTY_FUNCTION
 strcond_field_ok	accept	-	static const struct { const char *f; int k; } t = { 1 ? "x" : "y", 2 }; (void)t;
 strcond_array_ok	accept	-	static const char *a[] = { 0 ? "x" : "y", 1 ? "z" : "w" }; (void)a;
 strcond_nonconst_bad	reject	not constant	static const char *a[] = { n ? "x" : "y" }; (void)a;
+choose_expr_array_mode_ok	accept	-	static const int pp[2] = {1,2}; static const struct gm { int mode; const int *modes; } t = { .mode = __builtin_choose_expr(__builtin_constant_p((pp)), (pp), 0), .modes = __builtin_choose_expr(__builtin_constant_p((pp)), (const void *)0, (pp)) }; (void)t.mode;

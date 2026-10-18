@@ -246,6 +246,23 @@ impl Lowerer {
             return init;
         }
 
+        // `__func__`/`__FUNCTION__`/`__PRETTY_FUNCTION__` denote a static
+        // const char[] per function (C99 6.4.2.2p4), so a static local
+        // initialized with one is an address constant (GCC 16.2 accepts
+        // `static const char *s = __func__;`; the kernel's tracepoint string
+        // helpers — lib/maple_tree.c trace_ma_op — do exactly that). Material
+        // the function name as the same interned string literal the
+        // expression path lowers it to.
+        if let Expr::Identifier(name, _) = expr {
+            if matches!(
+                name.as_str(),
+                "__func__" | "__FUNCTION__" | "__PRETTY_FUNCTION__"
+            ) {
+                let fname = self.func().name.clone();
+                return GlobalInit::GlobalAddr(self.intern_string_literal(&fname));
+            }
+        }
+
         // &(compound_literal) at file scope
         if let Expr::AddressOf(inner, _) = expr {
             if let Expr::CompoundLiteral(cl_type_spec, cl_init, _) = inner.as_ref() {
@@ -337,6 +354,24 @@ impl Lowerer {
     /// The operand of a folded global relational or logical expression: an
     /// integer constant, or the address of a named global with a byte offset.
     fn global_operand(&self, expr: &Expr) -> Option<GlobalOperand> {
+        // __builtin_choose_expr selects one operand at compile time; the
+        // choice can be an ADDRESS constant (the kernel's
+        // PIN_GROUP(.modes = __builtin_choose_expr(
+        // __builtin_constant_p((m)), (const void *)0, (m))) names the static
+        // pin array in the unselected-by-constant_p arm), so the selection
+        // must consult the address path, not just the value path.
+        if let Expr::FunctionCall(callee, args, _) = expr {
+            if matches!(callee.as_ref(), Expr::Identifier(name, _) if name == "__builtin_choose_expr")
+                && args.len() >= 3
+            {
+                let chosen = match self.eval_const_expr(&args[0]) {
+                    Some(v) if v.is_nonzero() => &args[1],
+                    Some(_) => &args[2],
+                    None => return None,
+                };
+                return self.global_operand(chosen);
+            }
+        }
         if let Some(v) = self.eval_const_expr(expr).and_then(|c| c.to_i64()) {
             return Some(GlobalOperand::Int(v));
         }
