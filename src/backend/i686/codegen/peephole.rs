@@ -6750,16 +6750,30 @@ fn collect_non_nop_indices<const N: usize>(
     count
 }
 
-/// Fuse `cmpl/testl + setCC %al + movzbl %al, %eax + [store/load] + testl %eax, %eax + jne/je`
-/// into a single `jCC`/`j!CC` directly.
+/// Fuse `cmp/test + setCC %al + [extensions, spills, reloads] + re-test of
+/// the boolean + jne/je` into `jCC`/`j!CC`.
 ///
-/// This enhanced version can skip over store/load pairs between the movzbl and
-/// testl, allowing fusion even when the boolean is temporarily spilled to the
-/// stack. It tracks stored offsets and verifies each has a matching load nearby,
-/// ensuring the stored boolean is only consumed locally.
+/// The scan models exactly where the boolean lives and fails closed on any
+/// line outside the model: `%al` holds it after the setCC; ALL of `%eax`
+/// only after `movzbl/movsbl %al, %eax` (setCC writes the low byte alone,
+/// so `testl %eax, %eax` straight after it reads unspecified bits 8..31);
+/// a slot holds it only after `movl %eax, S` and gives it back only through
+/// `movl S, %eax`.  Every admitted line preserves EFLAGS, so the jump may
+/// read the compare's flags itself: the re-test (`testl %eax,%eax`,
+/// `cmpl $0,%eax`, `testb %al,%al`, `cmpb $0,%al`) is always removed.
+///
+/// Removing the setCC and its extensions is a second, separate claim: no
+/// store may have published the boolean (the slot can be read anywhere
+/// later; a nearby reload proves nothing about other readers) and `%eax`
+/// must be dead after the jump (a fallthrough successor may read the cached
+/// boolean, e.g. `addl $10, %eax` after `je`).  Stores and loads into other
+/// registers are never removed.
 fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;
+    // Whole-function GPR liveness, computed on first need.  Later fusions
+    // only delete reads, so a cached answer stays conservative.
+    let mut liveness_cache: Option<GprLiveness> = None;
 
     let mut i = 0;
     while i < len {
@@ -6795,50 +6809,82 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
         }
         let setcc_cc = setcc_cc.unwrap();
 
-        // Scan for testl %eax, %eax pattern.
-        // Track StoreEbp offsets so we can bail out if any store's slot is
-        // potentially read by another basic block (no matching load nearby).
+        // Where the boolean lives (see the doc comment): `%al` always holds
+        // it once admitted; `eax_ext` = bits 8..31 of %eax are zero.
+        let mut eax_ext = false;
+        // Dword slots holding a copy of %eax: (offset, eax_ext at the store).
+        let mut slots: [(i32, bool); MAX_TRACKED_STORE_LOAD_OFFSETS] =
+            [(0, false); MAX_TRACKED_STORE_LOAD_OFFSETS];
+        let mut slot_count = 0usize;
+        let mut published = false;
         let mut test_idx = None;
-        let mut store_offsets: [i32; MAX_TRACKED_STORE_LOAD_OFFSETS] =
-            [0; MAX_TRACKED_STORE_LOAD_OFFSETS];
-        let mut store_count = 0usize;
         let mut scan = 2;
         while scan < seq_count {
             let si = seq_indices[scan];
             let line = trimmed(store, &infos[si], si);
-
-            // Skip zero-extend of setcc result
-            if line == "movzbl %al, %eax" {
-                scan += 1;
-                continue;
+            match infos[si].kind {
+                LineKind::StoreEbp { reg, offset, size } => {
+                    let bytes = match size {
+                        MoveSize::L => 4,
+                        MoveSize::W => 2,
+                        MoveSize::B => 1,
+                    };
+                    // Any store may overwrite a tracked copy.
+                    let mut k = 0;
+                    while k < slot_count {
+                        if ranges_overlap(slots[k].0, 4, offset, bytes) {
+                            slot_count -= 1;
+                            slots[k] = slots[slot_count];
+                        } else {
+                            k += 1;
+                        }
+                    }
+                    if reg == REG_EAX {
+                        published = true;
+                        if size == MoveSize::L {
+                            if slot_count == MAX_TRACKED_STORE_LOAD_OFFSETS {
+                                break;
+                            }
+                            slots[slot_count] = (offset, eax_ext);
+                            slot_count += 1;
+                        }
+                    }
+                    scan += 1;
+                    continue;
+                }
+                LineKind::LoadEbp { reg, offset, size } => {
+                    if reg != REG_EAX {
+                        // Writes another register, reads no flags: kept.
+                        scan += 1;
+                        continue;
+                    }
+                    match slots[..slot_count].iter().find(|t| t.0 == offset) {
+                        Some(&(_, ext)) if size == MoveSize::L => {
+                            eax_ext = ext;
+                            scan += 1;
+                            continue;
+                        }
+                        // An unrelated value (or a partial reload) replaces
+                        // the boolean: the test no longer reads it.
+                        _ => break,
+                    }
+                }
+                _ => {}
             }
-            // Skip store/load to ebp (pre-parsed fast check).
-            if let LineKind::StoreEbp { offset, .. } = infos[si].kind {
-                if store_count < MAX_TRACKED_STORE_LOAD_OFFSETS {
-                    store_offsets[store_count] = offset;
-                    store_count += 1;
-                } else {
-                    store_count = usize::MAX;
+            match line {
+                "movzbl %al, %eax" | "movsbl %al, %eax" => eax_ext = true,
+                "cwtl" | "movswl %ax, %eax" if eax_ext => {}
+                "testl %eax, %eax" | "cmpl $0, %eax" if eax_ext => {
+                    test_idx = Some(scan);
                     break;
                 }
-                scan += 1;
-                continue;
+                "testb %al, %al" | "cmpb $0, %al" => {
+                    test_idx = Some(scan);
+                    break;
+                }
+                _ => break,
             }
-            if matches!(infos[si].kind, LineKind::LoadEbp { .. }) {
-                scan += 1;
-                continue;
-            }
-            // Skip cwtl (sign-extend ax->eax, i686 equivalent of cltq)
-            if line == "cwtl" || line.starts_with("movswl ") || line.starts_with("movsbl ") {
-                scan += 1;
-                continue;
-            }
-            // Check for test
-            if line == "testl %eax, %eax" {
-                test_idx = Some(scan);
-                break;
-            }
-            break;
+            scan += 1;
         }
 
         let test_scan = match test_idx {
@@ -6849,57 +6895,14 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
             }
         };
 
-        // If there are stores in the sequence, verify each has a matching load nearby.
-        if store_count == usize::MAX {
-            i += 1;
-            continue;
-        }
-        if store_count > 0 {
-            let range_start = seq_indices[1];
-            let range_end = seq_indices[test_scan];
-            let mut load_offsets: [i32; MAX_TRACKED_STORE_LOAD_OFFSETS] =
-                [0; MAX_TRACKED_STORE_LOAD_OFFSETS];
-            let mut load_count = 0usize;
-            for ri in range_start..=range_end {
-                let off = match infos[ri].kind {
-                    LineKind::LoadEbp { offset, .. } => Some(offset),
-                    // Check NOP'd lines too - earlier passes (store/load forwarding)
-                    // may have NOP'd a load that originally matched a store.
-                    LineKind::Nop => {
-                        let orig = classify_line(store.get(ri));
-                        match orig.kind {
-                            LineKind::LoadEbp { offset, .. } => Some(offset),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some(o) = off {
-                    if load_count < MAX_TRACKED_STORE_LOAD_OFFSETS {
-                        load_offsets[load_count] = o;
-                        load_count += 1;
-                    }
-                }
-            }
-            let has_unmatched_store = (0..store_count)
-                .any(|si| !(0..load_count).any(|li| load_offsets[li] == store_offsets[si]));
-            if has_unmatched_store {
-                i += 1;
-                continue;
-            }
-        }
-
         if test_scan + 1 >= seq_count {
             i += 1;
             continue;
         }
 
         // Find jne/je after test
-        let jmp_line = trimmed(
-            store,
-            &infos[seq_indices[test_scan + 1]],
-            seq_indices[test_scan + 1],
-        );
+        let jmp_idx = seq_indices[test_scan + 1];
+        let jmp_line = trimmed(store, &infos[jmp_idx], jmp_idx);
         let (is_jne, branch_target) = if let Some(target) = jmp_line.strip_prefix("jne ") {
             (true, target.trim())
         } else if let Some(target) = jmp_line.strip_prefix("je ") {
@@ -6923,9 +6926,23 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
 
         let fused_jcc = format!("    j{} {}", fused_cc, branch_target);
 
-        // NOP out everything from setCC through testl
-        for s in 1..=test_scan {
-            infos[seq_indices[s]].kind = LineKind::Nop;
+        // The re-test is redundant unconditionally (flags preserved).  The
+        // setCC and its extensions die only with an unpublished boolean
+        // and %eax dead past the jump.
+        infos[seq_indices[test_scan]].kind = LineKind::Nop;
+        if !published
+            && liveness_cache
+                .get_or_insert_with(|| GprLiveness::compute(store, infos))
+                .dead_after(jmp_idx, REG_EAX)
+        {
+            for s in 1..test_scan {
+                if !matches!(
+                    infos[seq_indices[s]].kind,
+                    LineKind::LoadEbp { .. } | LineKind::StoreEbp { .. }
+                ) {
+                    infos[seq_indices[s]].kind = LineKind::Nop;
+                }
+            }
         }
         // Replace the jne/je with the fused conditional jump
         let idx = seq_indices[test_scan + 1];
@@ -8395,6 +8412,19 @@ fn try_fold_memory_operand(
 // compare must be narrow), which the 32-bit-only matcher used to miss.
 //
 // Kill switch: CCC_NO_NARROW_CMP_FOLD.
+/// The zero compare of the fold's narrow operand: `test{b,w} %r, %r` for a
+/// register source (same flags as `cmp $0` — CF=OF=0, ZF/SF/PF of the same
+/// bits — and the canonical shape later setCC/branch fusions match),
+/// `cmp{b,w} $0, M` for memory (`test` would need the operand twice).
+fn narrow_zero_test(width: MoveSize, operand: &str) -> String {
+    let suffix = if width == MoveSize::B { 'b' } else { 'w' };
+    if operand.starts_with('%') {
+        format!("    test{} {}, {}", suffix, operand, operand)
+    } else {
+        format!("    cmp{} $0, {}", suffix, operand)
+    }
+}
+
 fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     if std::env::var_os("CCC_NO_NARROW_CMP_FOLD").is_some() {
         return false;
@@ -8455,7 +8485,7 @@ fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -
             } else if let Some((a, b)) = s.strip_prefix(test_prefix).and_then(|r| r.split_once(','))
             {
                 if a.trim() == low && b.trim() == low {
-                    replacement = Some(format!("    {} $0, {}", mnem, operand));
+                    replacement = Some(narrow_zero_test(width, &operand));
                 }
             }
         }
@@ -8502,7 +8532,7 @@ fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -
                             )
                         {
                             test_shape = true;
-                            replacement = Some(format!("    cmpb $0, {}", operand));
+                            replacement = Some(narrow_zero_test(width, &operand));
                         }
                     }
                 }
@@ -17276,109 +17306,155 @@ mod tests {
         );
     }
 
+    /// Run the peephole over `f: <body>`; `.L2` redefines %eax before
+    /// `ret`, so %eax is dead at the branch target.  A body that wants
+    /// %eax dead on the fallthrough too must redefine it itself.
+    fn fuse_out(body: &str) -> String {
+        let asm =
+            format!("f:\n.cfi_startproc\n{body}.L2:\n    xorl %eax, %eax\n    ret\n.cfi_endproc\n");
+        peephole_optimize(asm)
+    }
+
+    const FUSE_DEAD_FALLTHROUGH: &str = "    movl $1, %eax\n    ret\n";
+
     #[test]
     fn test_compare_branch_fusion() {
-        let asm = [
-            "    cmpl %ecx, %eax",
-            "    setl %al",
-            "    movzbl %al, %eax",
-            "    testl %eax, %eax",
-            "    jne .LBB2",
-        ]
-        .join("\n")
-            + "\n";
-        let result = peephole_optimize(asm.to_string());
-        assert!(result.contains("jl .LBB2"), "should fuse to jl: {}", result);
-        assert!(
-            !result.contains("setl"),
-            "should eliminate setl: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_compare_branch_fusion_with_store_load() {
-        // Pattern: cmp + setCC + movzbl + store + load + test + jne
-        // The store/load pair should be skipped, allowing fusion.
-        let asm = [
-            "    cmpl %ecx, %eax",
-            "    setge %al",
-            "    movzbl %al, %eax",
-            "    movl %eax, -16(%ebp)",
-            "    movl -16(%ebp), %eax",
-            "    testl %eax, %eax",
-            "    jne .LBB5",
-        ]
-        .join("\n")
-            + "\n";
-        let result = peephole_optimize(asm.to_string());
-        assert!(
-            result.contains("jge .LBB5"),
-            "should fuse to jge: {}",
-            result
-        );
-        assert!(
-            !result.contains("setge"),
-            "should eliminate setge: {}",
-            result
-        );
-        assert!(
-            !result.contains("movzbl"),
-            "should eliminate movzbl: {}",
-            result
-        );
-        assert!(
-            !result.contains("testl"),
-            "should eliminate testl: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_compare_branch_fusion_unmatched_store_bails() {
-        // If the store has no matching load, we should NOT fuse (the boolean
-        // escapes to another basic block).
-        let asm = [
-            "    cmpl %ecx, %eax",
-            "    setge %al",
-            "    movzbl %al, %eax",
-            "    movl %eax, -16(%ebp)",
-            "    testl %eax, %eax",
-            "    jne .LBB5",
-        ]
-        .join("\n")
-            + "\n";
-        let result = peephole_optimize(asm.to_string());
-        // Should NOT fuse because the store has no matching load
-        assert!(
-            result.contains("setge"),
-            "should keep setge (unmatched store): {}",
-            result
-        );
+        let out = fuse_out(&format!(
+            "    cmpl %ecx, %eax\n    setl %al\n    movzbl %al, %eax\n    testl %eax, %eax\n    jne .L2\n{FUSE_DEAD_FALLTHROUGH}"
+        ));
+        assert!(out.contains("jl .L2"), "should fuse to jl:\n{out}");
+        for gone in ["setl", "movzbl", "testl"] {
+            assert!(!out.contains(gone), "{gone} survived:\n{out}");
+        }
     }
 
     #[test]
     fn test_compare_branch_fusion_inverted() {
-        // Test je (inverted condition)
-        let asm = [
-            "    cmpl %ecx, %eax",
-            "    setl %al",
-            "    movzbl %al, %eax",
-            "    testl %eax, %eax",
-            "    je .LBB3",
-        ]
-        .join("\n")
-            + "\n";
-        let result = peephole_optimize(asm.to_string());
+        let out = fuse_out(&format!(
+            "    cmpl %ecx, %eax\n    setl %al\n    movzbl %al, %eax\n    testl %eax, %eax\n    je .L2\n{FUSE_DEAD_FALLTHROUGH}"
+        ));
+        assert!(out.contains("jge .L2"), "should fuse to jge:\n{out}");
+        assert!(!out.contains("setl"), "setl survived:\n{out}");
+    }
+
+    #[test]
+    fn test_compare_branch_fusion_with_store_load() {
+        // The stored boolean is PUBLISHED: -16(%ebp) may be read on either
+        // path later, so the store and the setCC feeding it stay.  The
+        // re-test is still redundant (mov/movzbl preserve EFLAGS).
+        let out = fuse_out(&format!(
+            "    cmpl %ecx, %eax\n    setge %al\n    movzbl %al, %eax\n    movl %eax, -16(%ebp)\n    movl -16(%ebp), %eax\n    testl %eax, %eax\n    jne .L2\n{FUSE_DEAD_FALLTHROUGH}"
+        ));
+        assert!(out.contains("jge .L2"), "should fuse to jge:\n{out}");
+        assert!(!out.contains("testl"), "testl survived:\n{out}");
+        assert!(out.contains("setge %al"), "published setge removed:\n{out}");
         assert!(
-            result.contains("jge .LBB3"),
-            "should fuse to jge (inverted): {}",
-            result
+            out.contains("movl %eax, -16(%ebp)"),
+            "published store removed:\n{out}"
+        );
+    }
+
+    #[test]
+    fn test_compare_branch_fusion_published_store_keeps_boolean() {
+        let out = fuse_out(&format!(
+            "    cmpl %ecx, %eax\n    setge %al\n    movzbl %al, %eax\n    movl %eax, -16(%ebp)\n    testl %eax, %eax\n    jne .L2\n{FUSE_DEAD_FALLTHROUGH}"
+        ));
+        assert!(
+            out.contains("setge"),
+            "should keep setge (published):\n{out}"
         );
         assert!(
-            !result.contains("setl"),
-            "should eliminate setl: {}",
-            result
+            out.contains("jge .L2"),
+            "redundant re-test not fused:\n{out}"
+        );
+    }
+
+    #[test]
+    fn compare_branch_fusion_keeps_boolean_live_past_the_jump() {
+        // switch ((x < 0) + 0) shape: the fallthrough reads the boolean.
+        // Deleting setl/movzbl here returned garbage (`sw_cmp`, i686 -O1).
+        let out = fuse_out(
+            "    cmpl $0, 16(%esp)\n    setl %al\n    movzbl %al, %eax\n    testl %eax, %eax\n    je .L2\n    cmpl $1, %eax\n    sete %al\n    ret\n",
+        );
+        assert!(
+            out.contains("jge .L2"),
+            "redundant re-test not fused:\n{out}"
+        );
+        assert!(
+            out.contains("setl %al") && out.contains("movzbl %al, %eax"),
+            "live boolean deleted:\n{out}"
+        );
+    }
+
+    #[test]
+    fn compare_branch_fusion_accepts_byte_retests() {
+        for retest in ["testb %al, %al", "cmpb $0, %al"] {
+            let out = fuse_out(&format!(
+                "    cmpl %ecx, %edx\n    setb %al\n    {retest}\n    jne .L2\n{FUSE_DEAD_FALLTHROUGH}"
+            ));
+            assert!(out.contains("jb .L2"), "{retest}: not fused:\n{out}");
+            assert!(!out.contains("setb"), "{retest}: dead setb kept:\n{out}");
+        }
+    }
+
+    #[test]
+    fn compare_branch_fusion_refusals() {
+        for (mid, why) in [
+            // bits 8..31 of %eax are unspecified after setCC alone.
+            (
+                "    setl %al\n    testl %eax, %eax\n",
+                "no extension before testl",
+            ),
+            // An unrelated value replaces the boolean before the test.
+            (
+                "    setl %al\n    movzbl %al, %eax\n    movl -12(%ebp), %eax\n    testl %eax, %eax\n",
+                "unrelated reload",
+            ),
+            (
+                "    setl %al\n    movzbl %al, %eax\n    movsbl 8(%esp), %eax\n    testl %eax, %eax\n",
+                "extension of another value",
+            ),
+            // The spilled copy is overwritten by another register first.
+            (
+                "    setl %al\n    movzbl %al, %eax\n    movl %eax, -16(%ebp)\n    movl %ecx, -16(%ebp)\n    movl -16(%ebp), %eax\n    testl %eax, %eax\n",
+                "clobbered spill slot",
+            ),
+        ] {
+            let out = fuse_out(&format!(
+                "    cmpl %ecx, %edx\n{mid}    jne .L2\n{FUSE_DEAD_FALLTHROUGH}"
+            ));
+            assert!(!out.contains("jl .L2"), "{why}: fused:\n{out}");
+            assert!(out.contains("jne .L2"), "{why}: branch rewritten:\n{out}");
+        }
+    }
+
+    #[test]
+    fn narrow_fold_zero_test_matches_the_load_width() {
+        // A 32-bit test of a zero-extended WORD is a word zero test: the old
+        // `cmpb $0` read one byte (0x0100 compared equal to zero) and spelled
+        // `cmpb $0, %ax` for register sources.
+        for (load, want) in [
+            ("movzwl 2(%edi), %ecx", "cmpw $0, 2(%edi)"),
+            ("movzwl (%ebx), %edx", "cmpw $0, (%ebx)"),
+            ("movzwl %si, %ecx", "testw %si, %si"),
+            ("movzbl %dl, %ecx", "testb %dl, %dl"),
+            ("movzbl 3(%esp), %ecx", "cmpb $0, 3(%esp)"),
+        ] {
+            let r = load.rsplit(", ").next().unwrap();
+            let out = narrow_fold_out(&format!(
+                "    {load}\n    testl {r}, {r}\n    je .L1\n    xorl %ebx, %ebx\n"
+            ));
+            assert!(out.contains(want), "{load}: want {want}:\n{out}");
+            if load.starts_with("movzw") {
+                assert!(!out.contains("cmpb"), "{load}: byte test of a word:\n{out}");
+            }
+        }
+        // Width-matched register source: `test r,r`, never `cmp $0, %r`.
+        let out = narrow_fold_out("    movzbl %cl, %eax\n    testb %al, %al\n    jne .L1\n");
+        assert!(out.contains("testb %cl, %cl"), "register zero test:\n{out}");
+        assert!(
+            !out.contains("cmpb $0, %cl"),
+            "cmp $0 on a register:\n{out}"
         );
     }
 
