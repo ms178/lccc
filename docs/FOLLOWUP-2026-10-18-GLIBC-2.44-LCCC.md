@@ -2,7 +2,7 @@
 
 ## Reproducible configuration
 
-- LCCC base: `aec2a2751a70a59a7cca2b5714c5ad0371f1aa4d` (then session commits)
+- LCCC base: `644f4145ccc9c8252e5135489d05d63ec1d64adc` (then task commits)
 - glibc source: `afd131806b25715a7617ab757db43f0bb610acbf`
   (`2.44+r25+gafd131806b`)
 - source archive SHA-256:
@@ -57,38 +57,75 @@ floating negative zero remains sign-preserving.
 
 Evidence: focused regression and the exact glibc `math/cabsf128.c` command pass.
 
-## Current build frontier (not a success claim)
+## Completed frontier and runtime fixes
 
-The build reached **4410 object files**, linked `elf/ld.so`, linked `libc.so.6`,
-and proceeded into libm/support. It is not yet a complete build/install. The
-next deterministic stop is:
+The `e_acosh.c` failure was reduced to a local x86 peephole folding a stack
+reload into an address although the reloaded value was XMM-homed. The fold now
+requires a GPR-capable address value; the assembler remains fail-closed for an
+XMM base. The exact glibc command subsequently compiled.
+
+With explicit Initial-Exec TLS for this startup-loaded libc, the complete glibc
+build and staged install succeeded. Direct `write`, malloc/free and overlapping
+memmove probes passed through the custom loader. A broader smoke then exposed a
+second independent defect in `vfprintf-internal.c`: lowering emitted a pointer
+`Load`, but call conversion labelled its SSA result I32 and truncated a stack
+address. CType pointer results are now authoritative, and a call argument whose
+defining instruction is `Ptr` can only be strengthened to `Ptr` (never blindly
+retyped: small aggregate ABI carriers are intentionally integers). The latter
+restriction was added after red-team testing caught four SysV aggregate crashes
+in a 186-shape cross-compiler ABI grid. All 186 shapes now pass in every tested
+caller/callee direction.
+
+Strict-FP glibc exposed two self-recursive builtin implementations as well:
+`__fma` called its public `fma` alias, and `__ieee754_sqrt` called `sqrt`.
+Hardware FMA and sqrt obey MXCSR rounding and exception state; GCC 16.2 also
+emits them under `-frounding-math -ftrapping-math`. They are therefore included
+in the strict-environment-safe intrinsic set. The final staged-loader smoke
+prints:
 
 ```text
-sysdeps/ieee754/dbl-64/e_acosh.c
-ccc: error: `1(%xmm11)' is not a valid base/index expression
+glibc=2.44 fma=10.0 acosh=1.31695790
 ```
 
-This is an x86 address-selection defect: a scalar FP/XMM home escaped into an
-integer base-address position. Preserve the exact compile command from the
-`math/e_acosh.o` build log, reduce it before modifying allocation or memory
-folding, and mutation-test the reproducer. Do not weaken the assembler's valid
-rejection of an XMM base.
+## Oracle and performance evidence
 
-## Highest-priority follow-up
+The cross-vendor Compiler Explorer semantics sweep passed all 9 programs with
+GCC 16.2, Clang 23.1, ICC 2021.10 and current ICX (36 vendor executions, zero
+divergences). Aggregate LCCC instruction count was 1487 versus 1852 GCC, 2274
+Clang, 3714 ICC and 2441 ICX. This is code-size evidence, not a cycle claim.
 
-1. Reduce and fix the `e_acosh.c` XMM-as-address defect; rerun its exact command.
-2. Resume `make -j2`, recording each new first failure. A clean build must then
-   be rerun through `tests/workloads/glibc-2.44/build_lccc.sh` so its install and
-   structural ABI gates produce the schema-2 manifest.
-3. Run staged-loader smoke only after install; never execute a partially staged
-   libc through the host loader.
-4. Add a safe explicit interrupted-build resume mode. Current
-   `GLIBC_REUSE_BUILD=1` intentionally accepts only a completed, identity-matched
-   manifest; manual resume was used for diagnosis only.
-5. The runner still needs a self-contained pin acquisition path for the
-   archpkgbuilds patch, and its capability comment about IFUNC must be reconciled
-   against current linker evidence before any multi-arch gate is lifted.
-6. Only after correctness/build completion: run glibc tests, triage with
-   `scripts/glibc_check_triage.py`, then collect deterministic Callgrind/icount
-   evidence in this PMU-less VM. Hardware claims remain blocked pending the
-   i7-14700KF environment.
+The glibc-derived Callgrind A/B screen against GCC 14 found:
+
+- `libm_round_family`: Ir ratio 0.97505 (LCCC/GCC), but native paired median
+  1.0472 and a large D1-miss disadvantage;
+- `glibc_memcmp`: Ir ratio 1.05136 and native paired median 1.0101.
+
+The round-family assembly oracle explains the native loss: Clang emits a
+four-lane packed rounding loop, while LCCC emits a two-way scalar unroll. This
+is recorded as a real optimization backlog item, not patched speculatively:
+adding packed round nodes touches the vectorizer's parsing, legality, reduction,
+remainder and backend tables and requires exception/rounding-mode tests. The
+current patch deliberately keeps the correct scalar implementation rather than
+claiming a size-only or unvalidated speed win.
+
+## Red-team conclusions
+
+- **Accepted:** preserving linker rejection of TPOFF32 in shared objects. IE is
+  selected explicitly only for startup-loaded glibc; silently weakening the
+  linker would be unsound for late `dlopen`.
+- **Accepted after narrowing:** definition-driven call typing. The first broad
+  implementation broke small aggregate carriers. Restricting the override to
+  an actual `Ptr` producer fixes vfprintf without bypassing aggregate ABI logic.
+- **Accepted:** strict FMA/sqrt inline lowering. It preserves operation-level FP
+  semantics and prevents glibc alias recursion; focused runtime and assembly
+  gates pin both properties.
+- **Rejected:** backend register/rematerialization and final-peephole theories
+  for the printf crash. No rematerialization event occurred and the malformed
+  I32-to-Ptr cast was already present in optimized IR.
+- **Rejected for now:** packed-round vectorization based only on oracle assembly.
+  Native and Callgrind evidence identify the opportunity, but correctness under
+  strict FP and reduction ordering needs a dedicated implementation and corpus.
+- **CI hygiene fixed:** externally visible leaf definitions may now inline
+  (matching GCC 16.2), so the libcall gate tests semantics rather than requiring
+  a stale call shape. Newly added standalone regressions are mirrored in local
+  and hosted gate inventories.

@@ -1254,7 +1254,7 @@ impl Lowerer {
                 // I32 fallback here creates malformed IR and truncates the
                 // pointer before the call (glibc vfprintf's end_of_fmt).
                 if let Operand::Value(value) = val
-                    && let Some(actual_ty) = self
+                    && let Some(IrType::Ptr) = self
                         .func_state
                         .as_ref()
                         .and_then(|state| {
@@ -1266,7 +1266,11 @@ impl Lowerer {
                         })
                         .and_then(Instruction::result_type)
                 {
-                    arg_ty = actual_ty;
+                    // Only strengthen a misclassified scalar to Ptr. Aggregate
+                    // rvalues deliberately use integer ABI carriers for small
+                    // structs; replacing their semantic type with that carrier
+                    // breaks the dedicated struct-argument path.
+                    arg_ty = IrType::Ptr;
                 }
 
                 // A raw GCC 128-bit vector builtin (__builtin_ia32_shufps,

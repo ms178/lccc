@@ -24,5 +24,5 @@ objdump -d "$tmp/test" >"$tmp/dis"
 grep -Eq 'vfmadd[0-9]+sd' "$tmp/dis"
 grep -Eq 'vfmadd[0-9]+ss' "$tmp/dis"
 grep -Eq 'vsqrtsd|sqrtsd' "$tmp/dis"
-! sed -n '/<fma_wrap>:/,/^$/p' "$tmp/dis" | grep -Eq 'call.*fma'
-! sed -n '/<sqrt_wrap>:/,/^$/p' "$tmp/dis" | grep -Eq 'call.*sqrt'
+! sed -n '/<fma_wrap>:/,/^$/p' "$tmp/dis" | grep -E 'call.*fma' >/dev/null
+! sed -n '/<sqrt_wrap>:/,/^$/p' "$tmp/dis" | grep -E 'call.*sqrt' >/dev/null
