@@ -2039,8 +2039,9 @@ impl Driver {
                         m if m == "single" => m,
                         m => {
                             return Err(format!(
-                                "unknown profile update method '{m}' (valid arguments to \
-                                 '-fprofile-update=' are: atomic prefer-atomic single)"
+                                "unknown profile update method '{m}' \
+                                 (-fprofile-update={m}; valid arguments are: \
+                                 atomic prefer-atomic single)"
                             ));
                         }
                     });
