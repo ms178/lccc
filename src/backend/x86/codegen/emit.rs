@@ -761,6 +761,15 @@ pub struct X86Codegen {
     pub(super) num_named_stack_bytes: usize,
     /// For variadic functions: stack offset of the register save area (negative from rbp)
     pub(super) reg_save_area_offset: i64,
+    /// The current function returns its aggregate in ONE `%ymm0` / `%zmm0`
+    /// (`call_abi::hidden_vector_return_bytes`): the byte width, and the
+    /// frame offset (negative from the frame base) of the private buffer
+    /// that homes the hidden return pointer. `0` when not applicable.
+    pub(super) vector_ret_buffer_bytes: usize,
+    pub(super) vector_ret_buffer_offset: i64,
+    /// Set by `emit_post_call_restore_caller_regs`, cleared by the matching
+    /// pre-call save: the restore runs at most once per call site.
+    pub(super) caller_regs_restored: bool,
     /// Whether the current function is variadic
     pub(super) is_variadic: bool,
     /// Same-block div/rem pair fusion (compute_i686_divrem_pairs with the
@@ -1424,6 +1433,9 @@ impl X86Codegen {
             num_named_fp_params: 0,
             num_named_stack_bytes: 0,
             reg_save_area_offset: 0,
+            vector_ret_buffer_bytes: 0,
+            vector_ret_buffer_offset: 0,
+            caller_regs_restored: false,
             is_variadic: false,
             divrem_tail_dests: FxHashSet::default(),
             divrem_head_partners: FxHashMap::default(),
@@ -8599,6 +8611,7 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_pre_call_save_caller_regs(&mut self) {
+        self.caller_regs_restored = false;
         let point = self.state.current_program_point;
         // Home-freshness snapshot for the registers this call actually saves:
         // their content is preserved across the call by the save/restore
@@ -8630,6 +8643,13 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_post_call_restore_caller_regs(&mut self) {
+        // Idempotent per call site: the vector-register aggregate return
+        // (`emit_call_store_vector_return_impl`) restores early so it can
+        // read the buffer operand, and the generic Phase 2b call that
+        // follows must not reload a second time.
+        if std::mem::replace(&mut self.caller_regs_restored, true) {
+            return;
+        }
         let point = self.state.current_program_point;
         let snapshot = std::mem::take(&mut self.call_fresh_snapshot);
         for (&reg_id, &slot) in &self.caller_save_spill_slots {
@@ -9604,6 +9624,7 @@ impl ArchCodegen for X86Codegen {
         fn set_call_ret_eightbyte_classes(&mut self, classes: &[crate::common::types::EightbyteClass]) => set_call_ret_eightbyte_classes_impl;
         fn set_call_ret_is_f128_sse(&mut self, is_f128: bool) => set_call_ret_is_f128_sse_impl;
         fn emit_call_store_result(&mut self, dest: &Value, return_type: IrType) => emit_call_store_result_impl;
+        fn emit_call_store_vector_return(&mut self, buffer: &Operand, bytes: usize, dest: Option<&Value>) => emit_call_store_vector_return_impl;
         fn emit_call_store_i128_result(&mut self, dest: &Value) => emit_call_store_i128_result_impl;
         fn emit_call_move_f32_to_acc(&mut self) => emit_call_move_f32_to_acc_impl;
         fn emit_call_move_f64_to_acc(&mut self) => emit_call_move_f64_to_acc_impl;

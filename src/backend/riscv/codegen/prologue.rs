@@ -712,6 +712,7 @@ impl RiscvCodegen {
                 // F128 in FP reg doesn't happen on RISC-V.
                 ParamClass::F128FpReg { .. }
                 | ParamClass::F128SseReg { .. }
+                | ParamClass::VectorReturnBuffer { .. }
                 | ParamClass::ZeroSizeSkip => {}
 
                 // RISC-V LP64D: struct with float/double fields passed in FP registers.

@@ -3773,3 +3773,28 @@ its probes rather than reading assembly and is unaffected. The step also
 now tees its log and emits `::error` annotations on failure (the same
 wrapper the grid step has), so the next hosted-only divergence is visible
 without log downloads.
+
+### Addendum — the AVX ABI level is a classification input, not a codegen flag (2026-10-18)
+
+AUD-VABI-2 (32/64-byte vectors in one `%ymm`/`%zmm`) was latched as debt
+because the carrier did not exist. Decisions taken when implementing it:
+
+- *The ABI level follows the requested ISA state only.* `-mavx*`,
+  `-march=` and `-march=native` raise it, `-mno-avx` clears it, exactly
+  as GCC's `TARGET_AVX`/`TARGET_AVX512F` and Clang's `AVXLevel`; the
+  default x86-64-v3 code-generation baseline does NOT raise it (GCC's
+  default is no AVX, and a TU built with plain `-O2` must link against a
+  plain `-O2` GCC object). The same cell drives `BIGGEST_ALIGNMENT`.
+- *The hidden return pointer stays in the IR.* A `%ymm0` return keeps the
+  sret lowering (a 32-byte value is a memory object in the IR); the
+  backend gives the pointer no register, homes it as a private buffer and
+  moves the buffer into `%ymm0` at return / out of `%ymm0` after the
+  call. One mechanism for both directions, no new IR value class.
+- *A latch is retired by turning it into an agreement gate in the same
+  commit*, and the gate grows to the whole rule (overflow, variadic,
+  struct controls, 64-byte, `-mno-avx`) so the fix is measured where the
+  debt was measured.
+- *A gate leg that crashes is a finding, never an environment problem.*
+  The `-mno-avx` leg exposed a peephole miscompile unrelated to the ABI
+  (`mulss` prefix-matched as the integer `mul`); fixed with an exact
+  mnemonic match and pinned by a unit and a corpus test.

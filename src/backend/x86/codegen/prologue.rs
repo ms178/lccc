@@ -2750,6 +2750,22 @@ impl X86Codegen {
             self.reg_save_area_offset = -space;
         }
 
+        // A `%ymm0` / `%zmm0`-returned aggregate: the hidden return pointer
+        // arrives in no register, so the callee homes it as the address of
+        // this private buffer; the return sequence loads the buffer into the
+        // register. 16-aligned like every vector slot (the frame base is
+        // only 16-aligned, so the moves are the unaligned forms anyway).
+        self.vector_ret_buffer_bytes = crate::backend::call_abi::hidden_vector_return_bytes(
+            func.uses_sret,
+            &func.ret_eightbyte_classes,
+        )
+        .unwrap_or(0);
+        if self.vector_ret_buffer_bytes > 0 {
+            space = (space + 15) & !15;
+            space += self.vector_ret_buffer_bytes as i64;
+            self.vector_ret_buffer_offset = -space;
+        }
+
         // Callee-saved registers in a call-free leaf are already represented
         // by push/pop. If layout consumed no bytes beyond the conservative
         // collision reserve, there are no local slots and no call-alignment
@@ -3148,16 +3164,30 @@ impl X86Codegen {
         }
     }
 
-    /// Capture-store a full 16-byte XMM register (F128SseReg: movdqu).
-    fn emit_capture_store_movdqu(&mut self, dst: CaptureDst, src_reg: &str) {
+    /// Capture-store one whole vector argument register (F128SseReg):
+    /// `movdqu %xmmN` for 16 bytes, `vmovdqu %ymmN` / `vmovdqu64 %zmmN` for
+    /// the 32 / 64-byte AVX aggregate shapes.
+    fn emit_capture_store_vector(&mut self, dst: CaptureDst, size: usize, reg_idx: usize) {
+        let (mov, reg) = super::calls::vector_reg_move(size, reg_idx);
         match dst {
             CaptureDst::Raw(b) => {
-                self.state.out.emit_instr_reg_rbp("    movdqu", src_reg, b);
+                self.state
+                    .out
+                    .emit_instr_reg_rbp(&format!("    {mov}"), &reg, b);
             }
             CaptureDst::Aligned => self
                 .state
-                .emit_fmt(format_args!("    movdqu %{}, (%r11)", src_reg)),
+                .emit_fmt(format_args!("    {mov} %{reg}, (%r11)")),
         }
+    }
+
+    /// `leaq` the private buffer of a `%ymm0`/`%zmm0`-returned aggregate
+    /// (`vector_ret_buffer_offset`, frame-relative) into `reg`.
+    pub(super) fn emit_vector_ret_buffer_addr(&mut self, reg: &str) {
+        debug_assert!(self.vector_ret_buffer_bytes > 0);
+        self.state
+            .out
+            .emit_instr_rbp_reg("    leaq", self.vector_ret_buffer_offset, reg);
     }
 
     /// Capture-store the x87 ST0 80-bit image (F128AlwaysStack).
@@ -3248,6 +3278,20 @@ impl X86Codegen {
 
         for (i, _param) in func.params.iter().enumerate() {
             let class = param_classes[i];
+
+            if let ParamClass::VectorReturnBuffer { .. } = class {
+                // The hidden return pointer of a `%ymm0`/`%zmm0`-returned
+                // aggregate: no incoming register, its value is the address
+                // of the private frame buffer. Home it in the parameter's
+                // alloca slot when one exists; a slot-less parameter is read
+                // through `emit_param_ref_impl`, which materialises the same
+                // address on demand.
+                if let Some((slot, _, _)) = self.state.param_alloca_slots[i] {
+                    self.emit_vector_ret_buffer_addr("rax");
+                    self.state.out.emit_instr_reg_rbp("    movq", "rax", slot.0);
+                }
+                continue;
+            }
 
             // Pre-store optimization: when a param's alloca is dead (eliminated by
             // dead param alloca analysis) but the ParamRef dest is register-assigned,
@@ -3545,9 +3589,11 @@ impl X86Codegen {
                         self.emit_capture_store_xmm(dst, xmm_regs[hi], 8);
                     }
                 }
-                ParamClass::F128SseReg { reg_idx } => {
-                    // _Float128: the full 16 bytes arrive in ONE XMM register.
-                    self.emit_capture_store_movdqu(dst, xmm_regs[reg_idx]);
+                ParamClass::F128SseReg { reg_idx, size } => {
+                    // The whole object arrives in ONE vector register: 16
+                    // bytes (`_Float128`, `[SSE, SSEUP]`) in an `%xmm`, the
+                    // AVX shapes in a `%ymm` / `%zmm`.
+                    self.emit_capture_store_vector(dst, size, reg_idx);
                 }
                 ParamClass::StructMixedIntSseReg {
                     int_reg_idx,
@@ -3615,6 +3661,8 @@ impl X86Codegen {
                 | ParamClass::LargeStructByRefStack { .. }
                 | ParamClass::StructSplitRegStack { .. }
                 | ParamClass::ZeroSizeSkip => {}
+                // Homed at the top of the loop (no incoming register).
+                ParamClass::VectorReturnBuffer { .. } => {}
             }
         }
 
@@ -3925,6 +3973,12 @@ impl X86Codegen {
         let stack_base: i64 = if self.state.omit_frame_pointer { 8 } else { 16 };
 
         match class {
+            ParamClass::VectorReturnBuffer { .. } => {
+                // The hidden return pointer of a `%ymm0`/`%zmm0`-returned
+                // aggregate is the address of the private frame buffer.
+                self.emit_vector_ret_buffer_addr("rax");
+                self.store_rax_to(dest);
+            }
             ParamClass::IntReg { reg_idx } => {
                 let src_reg = Self::reg_for_type(X86_ARG_REGS[reg_idx], ty);
                 let load_instr = Self::mov_load_for_type(ty);

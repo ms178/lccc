@@ -386,7 +386,17 @@ impl X86Codegen {
     ) {
         // MEMORY: over 16 bytes (empty classes) or classified `[Memory]`
         // (misaligned fields, X87 members, BLKmode vectors).
-        if eightbyte_classes.is_empty() || eightbyte_classes == [EightbyteClass::Memory] {
+        // An unnamed `__m256`/`__m512` (SSE + 3 or 7 SSEUP under the AVX ABI
+        // level) is MEMORY as well: the register save area holds 16 bytes
+        // per `%xmm`, so psABI §3.2.3 sends the whole value to the overflow
+        // area at its natural 32/64-byte alignment (what the caller side
+        // in `emit_call` does with the demoted classification).
+        let wide_vector = crate::common::sysv_classify::vector_reg_bytes_of(eightbyte_classes)
+            .is_some_and(|b| b > 16);
+        if eightbyte_classes.is_empty()
+            || eightbyte_classes == [EightbyteClass::Memory]
+            || wide_vector
+        {
             self.emit_va_arg_struct_overflow(dest_ptr, va_list_ptr, size, align);
             return;
         }

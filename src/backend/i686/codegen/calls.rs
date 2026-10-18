@@ -319,7 +319,7 @@ impl I686Codegen {
         // GP argument registers; nothing after this point touches an XMM
         // register before the call.
         for (i, ac) in arg_classes.iter().enumerate() {
-            if let call_abi::CallArgClass::StructXmmReg { reg_idx } = ac {
+            if let call_abi::CallArgClass::StructXmmReg { reg_idx, .. } = ac {
                 self.operand_to_eax(&args[i]);
                 emit!(self.state, "    movups (%eax), %xmm{}", reg_idx);
             }

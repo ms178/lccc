@@ -29,6 +29,39 @@ thread_local! {
     /// alignment (`min_align_of_type`). x86: 16, 32 under `-mavx`, 64
     /// under `-mavx512f`. See `CType::c11_alignof_ctx`.
     static TARGET_BIGGEST_ALIGNMENT: Cell<usize> = const { Cell::new(16) };
+    /// The widest vector register the x86-64 psABI argument classification
+    /// may use, in bytes: 16 (SSE), 32 under `-mavx` (`%ymm`), 64 under
+    /// `-mavx512f` (`%zmm`). See `target_vector_abi_bytes`.
+    static TARGET_VECTOR_ABI_BYTES: Cell<usize> = const { Cell::new(16) };
+}
+
+/// Set the widest vector register the psABI classification may use for a
+/// by-value vector argument or return (bytes; 16, 32 or 64). Must be
+/// called before any function is lowered.
+pub fn set_target_vector_abi_bytes(bytes: usize) {
+    debug_assert!(matches!(bytes, 16 | 32 | 64));
+    TARGET_VECTOR_ABI_BYTES.with(|c| c.set(bytes));
+}
+
+/// The widest vector register the x86-64 psABI argument classification may
+/// use, in bytes.
+///
+/// The psABI classifies a 32-byte `__m256` as SSE + 3×SSEUP and a 64-byte
+/// `__m512` as SSE + 7×SSEUP — one `%ymm` / `%zmm` register — "if AVX /
+/// AVX-512 is enabled"; otherwise they are MEMORY. GCC (`TARGET_AVX`,
+/// `TARGET_AVX512F` in `classify_argument`) and Clang (`AVXLevel` in
+/// `X86_64ABIInfo`, `getNativeVectorSizeForAVXABI`) both decide this from
+/// the translation unit's *requested* ISA — the same state that defines
+/// `__AVX__` / `__AVX512F__` and GCC's `BIGGEST_ALIGNMENT` — not from what
+/// the code generator is otherwise allowed to emit. lccc follows that
+/// exactly (`Driver::run` publishes it next to `set_target_biggest_alignment`),
+/// so a TU built with `-mavx2` interoperates with `gcc -mavx2` and a TU
+/// built without `-mavx` keeps the memory convention `gcc` uses without it.
+/// Variadic calls are unaffected: the psABI passes `__m256`/`__m512` to a
+/// variadic callee in memory regardless (GCC and Clang agree), which
+/// `classify_args_core` applies through `real_variadic`.
+pub fn target_vector_abi_bytes() -> usize {
+    TARGET_VECTOR_ABI_BYTES.with(|c| c.get())
 }
 
 /// Set GCC's `BIGGEST_ALIGNMENT` (bytes) for the current target/ISA. Must
@@ -2588,12 +2621,25 @@ impl CType {
         if layout.bitpacked_bool && layout.lanes > 64 {
             return !is_return;
         }
-        is_return
-            && self.size() > 16
-            && (self
-                .ext_vector_xmm_pieces()
-                .is_some_and(|p| (2..=4).contains(&p))
-                || (layout.lanes == 3 && elem.size() == 8))
+        if !is_return || self.size() <= 16 {
+            return false;
+        }
+        // Under the AVX / AVX-512F ABI level Clang classifies a vector of up
+        // to the native register width (`getNativeVectorSizeForAVXABI`:
+        // 256 / 512 bits, a three-lane type rounded up to the next power of
+        // two by `ASTContext::getTypeInfo`) as SSE + SSEUP, i.e. ONE %ymm /
+        // %zmm, for returns as for named arguments -- the same carrier the
+        // `vector_size` ABI uses (AUD-VABI-2), which lccc implements. The
+        // piece-wise register returns below are the no-AVX convention only.
+        if !layout.bitpacked_bool
+            && self.size().next_power_of_two() <= target_vector_abi_bytes()
+            && !matches!(**elem, CType::LongDouble)
+        {
+            return false;
+        }
+        self.ext_vector_xmm_pieces()
+            .is_some_and(|p| (2..=4).contains(&p))
+            || (layout.lanes == 3 && elem.size() == 8)
     }
 
     /// Number of 32-bit i386 GP return words used for a Clang integer
