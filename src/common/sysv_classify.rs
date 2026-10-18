@@ -103,6 +103,17 @@ pub fn classify(ty: &CType, ctx: &dyn StructLayoutProvider) -> Option<SysvPassin
     if !matches!(ty, CType::Struct(_) | CType::Union(_)) && !ty.is_vector() {
         return None;
     }
+    // GCC 16.2.0 (measured, harness-cache-1 oracle): a one-lane FP
+    // `vector_size` vector has no vector mode (BLKmode) and is MEMORY in the
+    // argument position — the 4/8 bytes travel on the stack
+    // (`f32x1 id(f32x1)` loads its argument from `8(%rsp)`). Everything the
+    // `None` leaf below used to fall back to (an INTEGER register pass)
+    // diverged from the oracle by a whole calling convention.
+    if let CType::Vector(elem, total) = ty {
+        if matches!(**elem, CType::Float | CType::Double) && elem.size() == *total {
+            return Some(SysvPassing::Memory);
+        }
+    }
     if let CType::Struct(key) | CType::Union(key) = ty {
         ctx.get_struct_layout(key)?;
     }
@@ -136,20 +147,11 @@ pub fn classify_return(ty: &CType, ctx: &dyn StructLayoutProvider) -> Option<Sys
             return Some(SysvPassing::X87Pair);
         }
     }
-    // The `vector_size` spelling of the one-lane FP shapes: f32x1/f64x1
-    // return in the low half of %xmm0 like the scalar (GCC 16's psABI
-    // small-vector update; system gcc-12 still routes these through MEMORY —
-    // disclosed in `check_ext_vector_one_lane_fp.sh`). Without this the
-    // callee BLKmode-classified the return (sret/%rax) while the
-    // indirect-call vector carrier promised %xmm0.
-    if let CType::Vector(elem, total) = ty {
-        if (*total == 4 || *total == 8)
-            && *total == elem.size()
-            && matches!(**elem, CType::Float | CType::Double)
-        {
-            return Some(SysvPassing::Regs(vec![EightbyteClass::Sse]));
-        }
-    }
+    // The `vector_size` spelling of the one-lane FP shapes is answered by
+    // `classify` itself: GCC 16.2.0 measured V1SF/V1DF as MEMORY (sret), so
+    // no return-position departure exists there — see the arm in `classify`.
+    // The `ext_vector_type` spellings follow Clang (the only oracle that
+    // accepts the attribute) and keep their SSE return arms.
     classify(ty, ctx)
 }
 

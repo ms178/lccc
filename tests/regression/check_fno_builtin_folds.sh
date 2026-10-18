@@ -13,6 +13,7 @@ td=$(mktemp -d "${TMPDIR:-/tmp}/lccc-fno-builtin-folds.XXXXXX")
 trap 'rm -rf "$td"' EXIT
 
 cat > "$td/static_fabs.c" <<'EOF'
+double fabs(double);
 static double hosted_alias_folds = fabs(2.5);
 double read(void) { return hosted_alias_folds; }
 EOF
@@ -60,6 +61,7 @@ done
 # Runtime calls under -fno-builtin are RETAINED (no libm shortcut folding of
 # the bare spelling through a different path).
 cat > "$td/runtime.c" <<'EOF'
+double fabs(double);
 double opaque(double);
 double call_site(double x) { return fabs(x); }
 EOF

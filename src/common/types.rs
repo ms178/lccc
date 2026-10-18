@@ -2374,15 +2374,23 @@ impl CType {
                 _ => None,
             };
         }
-        // A ONE-element floating-point vector (f32x1/f64x1) is SysV-SSE: it
-        // travels in the low half of ONE xmm register exactly like the scalar
-        // element, matching GCC 16 and Clang 19 same-compiler codegen (the
-        // gate asserts the -O1 chained-call shape end to end). The legacy
-        // INTEGER carrier here was doubly wrong: it diverged from both
-        // oracles, and the backend's missing packed-result spill made
-        // `dadd(did(x), dadd(y, y))` segfault at -O1.  32-bit targets never
-        // reach this classifier (their ext vectors use the GP-word path).
+        // A ONE-element floating-point vector is SysV-SSE in the
+        // `ext_vector_type` spelling: it travels in the low half of ONE xmm
+        // register exactly like the scalar element, matching Clang's
+        // same-compiler codegen (the gate asserts the -O1 chained-call shape
+        // end to end). The legacy INTEGER carrier here was doubly wrong: it
+        // diverged from both oracles, and the backend's missing
+        // packed-result spill made `dadd(did(x), dadd(y, y))` segfault at
+        // -O1.  32-bit targets never reach this classifier (their ext
+        // vectors use the GP-word path).  The `vector_size` spelling returns
+        // None: GCC 16.2.0 measured V1SF/V1DF as MEMORY (stack argument,
+        // sret return), and the indirect convention must equal the direct
+        // one — `classify` answers SysvPassing::Memory for those types, so
+        // the sret path is taken.
         if self.elem_is_fp_scalar() {
+            if matches!(self, CType::Vector(_, _)) {
+                return None;
+            }
             return match self.size() {
                 4 | 8 => Some((vec![EightbyteClass::Sse], false)),
                 _ => None,

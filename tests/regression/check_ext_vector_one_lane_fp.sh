@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# AUD-VABI-4: one-lane FP vectors (f32x1/f64x1) return in the low half of
-# %xmm0 like scalar f32/f64 — the same-compiler shape GCC 16 and Clang 19
-# emit.  The two fixtures cover identity/arithmetic/chained forwarding and an
+# AUD-VABI-4: ONE-LANE FP vectors per spelling:
+#   - ext_vector_type(1) (Clang-only spelling): argument AND return ride the
+#     scalar carrier in the low half of %xmm0 (Clang receipt; GCC does not
+#     accept the attribute). The fixtures below use this spelling.
+#   - vector_size(4)/(8) (both spellings accepted): GCC 16.2.0 measured
+#     MEMORY both ways (stack argument, sret return) — lccc follows the
+#     oracle and matches it in cross-linked binaries in BOTH directions
+#     (harness-cache-1 gcc-16.2.0: `f32x1 id(f32x1)` loads its argument from
+#     8(%rsp) and returns through the hidden pointer).
+# The two fixtures cover identity/arithmetic/chained forwarding and an
 # exhaustive matrix (fptrs, volatile, memcpy, NaN/Inf/subnormal, integer
 # one-lanes riding INTEGER), each at -O0/-O1/-O2.
-# Oracle note: system GCC 12 predates the psABI small-vector update and
-# passes vector_size(4/8) FP shapes through MEMORY, so the cross legs here
-# are lccc-vs-lccc round trips with values pinned by the fixtures; the
-# GCC-16 CI lanes are the cross-ABI receipts.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/../.." && pwd)
 CCC=${CCC:-"$root/target/fastbuild/lccc"}
