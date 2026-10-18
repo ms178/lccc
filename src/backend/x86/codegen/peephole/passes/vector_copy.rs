@@ -4066,7 +4066,7 @@ mod tests {
     /// Run just the entry-state `vzeroupper` elision on a full function
     /// body and report the surviving lines.
     fn vzeroupper_only(text: &str) -> Vec<String> {
-        let mut store = LineStore::new(body(text));
+        let store = LineStore::new(body(text));
         let mut infos: Vec<LineInfo> = (0..store.len())
             .map(|i| classify_line(store.get(i)))
             .collect();
