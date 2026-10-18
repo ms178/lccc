@@ -545,10 +545,15 @@ jobs:
         set -o pipefail
         env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_abi_grid.sh 2>&1 |
           tee "$RUNNER_TEMP/ext-vector-abi-grid.log"
+    - name: ext_vector_type by-value ABI under the AVX ABI level vs the Clang 23.1.3 oracle
+      run: |
+        set -o pipefail
+        env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_abi_avx.sh 2>&1 |
+          tee "$RUNNER_TEMP/ext-vector-abi-avx.log"
     - name: Surface ext-vector ABI failures in annotations
       if: failure()
       run: |
-        for log in ext-vector-abi ext-vector-abi-grid; do
+        for log in ext-vector-abi ext-vector-abi-grid ext-vector-abi-avx; do
           [ -s "$RUNNER_TEMP/$log.log" ] || continue
           python3 scripts/ci_annotate_log.py --title "ext-vector ABI ($log)" "$RUNNER_TEMP/$log.log"
         done
@@ -582,8 +587,17 @@ jobs:
       run: python3 tests/regression/check_sysv_aggregate_abi.py --lccc target/fastbuild/lccc --cc gcc-16
     - name: Vector argument operand forms against GCC 16
       run: python3 tests/regression/check_vector_arg_forms.py --lccc target/fastbuild/lccc --cc gcc-16
-    - name: Wide-vector ABI debt (latched)
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_wide.sh
+    - name: Wide-vector (%ymm/%zmm) ABI at the compiler boundary
+      run: |
+        set -o pipefail
+        env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_wide.sh 2>&1 |
+          tee "$RUNNER_TEMP/vector-abi-wide.log"
+    - name: Surface wide-vector ABI failures in annotations
+      if: failure()
+      run: |
+        if [ -s "$RUNNER_TEMP/vector-abi-wide.log" ]; then
+          python3 scripts/ci_annotate_log.py --title "wide-vector ABI" "$RUNNER_TEMP/vector-abi-wide.log"
+        fi
     - name: GNU vector_size alignment model and MEMORY-class vector argument ABI against GCC 16
       run: |
         set -o pipefail

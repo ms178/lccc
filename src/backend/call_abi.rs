@@ -38,10 +38,12 @@ pub enum CallArgClass {
     /// _Float128 (binary128) in ONE 16-byte XMM register (SysV psABI).
     /// The operand is the 16-byte value itself.
     F128SseReg { reg_idx: usize },
-    /// A 16-byte `[SSE, SSEUP]` aggregate (`struct { v4f v; }`, a struct
-    /// wrapping `_Float128`, ...) in ONE XMM register. Unlike `F128SseReg`
-    /// the operand is the aggregate's ADDRESS.
-    StructXmmReg { reg_idx: usize },
+    /// A `[SSE, SSEUP...]` aggregate in ONE vector register: 16 bytes
+    /// (`struct { v4f v; }`, a struct wrapping `_Float128`, ...) in an
+    /// `%xmm`, 32 bytes (`__m256`, under the AVX ABI level) in a `%ymm`, 64
+    /// bytes (`__m512`, AVX-512) in a `%zmm` — `size` says which. Unlike
+    /// `F128SseReg` the operand is the aggregate's ADDRESS.
+    StructXmmReg { reg_idx: usize, size: usize },
     /// Small struct (<=16 bytes) passed by value in 1-2 GP registers.
     StructByValReg { base_reg_idx: usize, size: usize },
     /// i686 regparm: I64/U64 in a consecutive GP register pair
@@ -153,10 +155,19 @@ pub enum ParamClass {
         hi_fp_idx: Option<usize>,
         size: usize,
     },
-    /// 16 bytes arrive in ONE XMM register (SysV psABI): a `_Float128`, or a
-    /// `[SSE, SSEUP]` aggregate. Both are captured the same way -- the 16
-    /// bytes are stored to the parameter's home -- so one class serves both.
-    F128SseReg { reg_idx: usize },
+    /// `size` bytes arrive in ONE vector register (SysV psABI): 16 for a
+    /// `_Float128` or a `[SSE, SSEUP]` aggregate (`%xmm`), 32 / 64 for the
+    /// AVX one-register aggregate shapes (`%ymm` / `%zmm`). All are captured
+    /// the same way -- the bytes are stored to the parameter's home -- so
+    /// one class serves them all.
+    F128SseReg { reg_idx: usize, size: usize },
+    /// The hidden return pointer of a function whose aggregate result the
+    /// psABI returns in ONE `%ymm0` / `%zmm0` (see
+    /// [`hidden_vector_return_bytes`]). It arrives in no register: the
+    /// callee homes it as the address of a private `bytes`-byte frame
+    /// buffer, and the return sequence loads that buffer into the vector
+    /// register.
+    VectorReturnBuffer { bytes: usize },
     /// Small struct: first eightbyte INTEGER, second SSE.
     /// (`size` mirrors `CallArgClass`/`CoreArgClass` for structural consistency.)
     StructMixedIntSseReg {
@@ -300,12 +311,39 @@ impl ParamClass {
         match self {
             ParamClass::FloatReg { .. } => 1,
             ParamClass::F128SseReg { .. } => 1,
+            ParamClass::VectorReturnBuffer { .. } => 0,
             ParamClass::F128FpReg { .. } => 1,
             ParamClass::StructSseReg { hi_fp_idx, .. } => 1 + usize::from(hi_fp_idx.is_some()),
             ParamClass::StructMixedIntSseReg { .. } | ParamClass::StructMixedSseIntReg { .. } => 1,
             _ => 0,
         }
     }
+}
+
+/// `Some(bytes)` when a call or function with the hidden-pointer return
+/// shape (`is_sret`) actually returns its aggregate in ONE `%ymm0` (32) or
+/// `%zmm0` (64): the x86-64 psABI convention for `__m256` / `__m512` under
+/// the AVX / AVX-512 ABI level.
+///
+/// The IR has no 32/64-byte value type, so the lowering keeps such a return
+/// in the sret shape (caller-allocated buffer, its address as argument 0,
+/// callee copies into it) and tags it with the classifier's SSE + SSEUPs
+/// classes — a pair no other convention produces (a MEMORY-class sret has
+/// no classes; a register-returned aggregate of ≤16 bytes is not sret). The
+/// backend applies the register convention at the boundary: the hidden
+/// pointer consumes no argument register (`CallArgClass::ZeroSizeSkip` /
+/// `ParamClass::VectorReturnBuffer`), the callee's return loads the buffer
+/// into the register, and the caller stores the register through its
+/// buffer after the call. A 16-byte one-`%xmm` return is not this case: it
+/// travels as a 16-byte IR value (`ret_is_f128_sse`).
+pub fn hidden_vector_return_bytes(
+    is_sret: bool,
+    ret_classes: &[crate::common::types::EightbyteClass],
+) -> Option<usize> {
+    if !is_sret {
+        return None;
+    }
+    crate::common::sysv_classify::vector_reg_bytes_of(ret_classes).filter(|b| *b > 16)
 }
 
 // ---------------------------------------------------------------------------
@@ -537,9 +575,11 @@ enum CoreArgClass {
     F128SseReg {
         reg_idx: usize,
     },
-    /// A 16-byte `[SSE, SSEUP]` aggregate in ONE XMM register.
+    /// A `[SSE, SSEUP...]` aggregate in ONE vector register of `size`
+    /// bytes (16 `%xmm`, 32 `%ymm`, 64 `%zmm`).
     StructXmmReg {
         reg_idx: usize,
+        size: usize,
     },
     StructByValReg {
         base_reg_idx: usize,
@@ -652,6 +692,7 @@ fn classify_args_core(
             if !real_variadic && vec_xmm_idx < config.vector_xmm_regs {
                 result.push(CoreArgClass::StructXmmReg {
                     reg_idx: vec_xmm_idx,
+                    size: 16,
                 });
                 vec_xmm_idx += 1;
             } else {
@@ -797,18 +838,27 @@ fn classify_args_core(
             // x86-64 SysV: _Float128 (IEEE binary128) — ONE 16-byte XMM
             // register per the psABI (not a two-eightbyte SSE struct).
             // Overflow (all XMM regs consumed) goes to a 16-byte stack slot.
-            // `[Sse, SseUp]` is the same carrier for any aggregate.
-            let one_xmm = info.eightbyte_classes
-                == [
-                    crate::common::types::EightbyteClass::Sse,
-                    crate::common::types::EightbyteClass::SseUp,
-                ];
-            if (info.is_f128_sse || one_xmm) && size == 16 {
+            // `[Sse, SseUp]` is the same carrier for any aggregate, and the
+            // AVX shapes SSE + 3×SSEUP / SSE + 7×SSEUP (one `%ymm` /
+            // `%zmm`, 32 / 64 bytes) take the same walk: one SSE argument
+            // register each, the whole object to memory when none is left.
+            // The classifier (`sysv_classify`) only produces the wide
+            // shapes under the TU's AVX ABI level, and a variadic callee
+            // never sees them (`__m256`/`__m512` are MEMORY in a variadic
+            // call, psABI §3.2.3; the lowering classifies those positions
+            // as MEMORY before they reach here).
+            let one_vec_reg =
+                crate::common::sysv_classify::vector_reg_bytes_of(info.eightbyte_classes)
+                    .is_some_and(|bytes| bytes == size);
+            if (info.is_f128_sse && size == 16) || one_vec_reg {
                 if float_idx < config.max_float_regs {
                     result.push(if info.is_f128_sse {
                         CoreArgClass::F128SseReg { reg_idx: float_idx }
                     } else {
-                        CoreArgClass::StructXmmReg { reg_idx: float_idx }
+                        CoreArgClass::StructXmmReg {
+                            reg_idx: float_idx,
+                            size,
+                        }
                     });
                     float_idx += 1;
                 } else {
@@ -1120,7 +1170,9 @@ pub fn classify_call_args(
             } => CallArgClass::F128Reg { reg_idx },
             CoreArgClass::F128Stack => CallArgClass::F128Stack,
             CoreArgClass::F128SseReg { reg_idx } => CallArgClass::F128SseReg { reg_idx },
-            CoreArgClass::StructXmmReg { reg_idx } => CallArgClass::StructXmmReg { reg_idx },
+            CoreArgClass::StructXmmReg { reg_idx, size } => {
+                CallArgClass::StructXmmReg { reg_idx, size }
+            }
             CoreArgClass::StructByValReg { base_reg_idx, size } => {
                 CallArgClass::StructByValReg { base_reg_idx, size }
             }
@@ -1192,9 +1244,44 @@ pub struct ParamClassification {
 /// agree on parameter locations. Returns one `ParamClass` per parameter plus the final
 /// register allocation state.
 pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamClassification {
+    // A `%ymm0`/`%zmm0`-returned aggregate keeps the hidden-pointer shape in
+    // the IR (parameter 0) but the pointer arrives in no register: classify
+    // the real parameters from index 1 and give parameter 0 its frame
+    // buffer class. (x86-64 only; every other target answers `None`.)
+    if let Some(bytes) = hidden_vector_return_bytes(func.uses_sret, &func.ret_eightbyte_classes) {
+        if !func.params.is_empty() {
+            let mut classification = classify_param_slice(
+                &func.name,
+                &func.params[1..],
+                false,
+                func.is_variadic,
+                config,
+            );
+            classification
+                .classes
+                .insert(0, ParamClass::VectorReturnBuffer { bytes });
+            return classification;
+        }
+    }
+    classify_param_slice(
+        &func.name,
+        &func.params,
+        func.uses_sret,
+        func.is_variadic,
+        config,
+    )
+}
+
+/// `classify_params_full` over an explicit parameter list.
+fn classify_param_slice(
+    func_name: &str,
+    params: &[crate::ir::module::IrParam],
+    uses_sret: bool,
+    is_variadic: bool,
+    config: &CallAbiConfig,
+) -> ParamClassification {
     // Build ArgInfo slice from function parameters.
-    let arg_infos: Vec<ArgInfo<'_>> = func
-        .params
+    let arg_infos: Vec<ArgInfo<'_>> = params
         .iter()
         .map(|param| ArgInfo {
             is_float: param.ty.is_float(),
@@ -1210,11 +1297,11 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
         .collect();
 
     // Pass is_variadic=true here because the callee side encodes variadic behavior
-    // directly in config.variadic_floats_in_gp (set by the caller based on func.is_variadic).
+    // directly in config.variadic_floats_in_gp (set by the caller based on is_variadic).
     // The force_gp check is: is_variadic && config.variadic_floats_in_gp && is_float.
     // For non-variadic functions, config.variadic_floats_in_gp is false, so force_gp
     // is false regardless of the is_variadic flag — making this safe.
-    let mut core = classify_args_core(&arg_infos, true, func.is_variadic, config);
+    let mut core = classify_args_core(&arg_infos, true, is_variadic, config);
 
     // AArch64 ABI: when sret uses a dedicated register (x8), the classification initially
     // assigns the sret pointer to IntReg(0), consuming one GP register slot. On the caller
@@ -1226,7 +1313,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
     // on where each argument lives. The emit_store_gp_params method already handles
     // the register index shift (sret_shift=1), but it does NOT promote stack args.
     // Apply the promotion here to match the caller-side logic.
-    if func.uses_sret && config.sret_uses_dedicated_reg && core.classes.len() > 1 {
+    if uses_sret && config.sret_uses_dedicated_reg && core.classes.len() > 1 {
         // Use max_int_regs (not max_int_regs-1) because emit_store_gp_params applies
         // sret_shift=1, computing actual_idx = reg_idx - 1. So reg_idx=8 maps to x7.
         let freed_reg = config.max_int_regs;
@@ -1234,7 +1321,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
         for i in 1..core.classes.len() {
             match core.classes[i] {
                 CoreArgClass::Stack => {
-                    let is_float = func.params.get(i).map(|p| p.ty.is_float()).unwrap_or(false);
+                    let is_float = params.get(i).map(|p| p.ty.is_float()).unwrap_or(false);
                     if !is_float {
                         core.classes[i] = CoreArgClass::IntReg { reg_idx: freed_reg };
                         break;
@@ -1259,7 +1346,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
     let mut classes = Vec::with_capacity(core.classes.len());
 
     for (i, c) in core.classes.iter().enumerate() {
-        let param_ty = func.params.get(i).map(|p| p.ty);
+        let param_ty = params.get(i).map(|p| p.ty);
         let pc = match *c {
             CoreArgClass::IntReg { reg_idx } => ParamClass::IntReg { reg_idx },
             CoreArgClass::FloatReg { reg_idx } => ParamClass::FloatReg { reg_idx },
@@ -1300,8 +1387,9 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                 lo_reg_idx: base_reg_idx,
                 hi_reg_idx: base_reg_idx + 1,
             },
-            CoreArgClass::F128SseReg { reg_idx } | CoreArgClass::StructXmmReg { reg_idx } => {
-                ParamClass::F128SseReg { reg_idx }
+            CoreArgClass::F128SseReg { reg_idx } => ParamClass::F128SseReg { reg_idx, size: 16 },
+            CoreArgClass::StructXmmReg { reg_idx, size } => {
+                ParamClass::F128SseReg { reg_idx, size }
             }
             CoreArgClass::LargeStructByRefReg { reg_idx, size } => {
                 ParamClass::LargeStructByRefReg { reg_idx, size }
@@ -1365,14 +1453,14 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                 //    __addtf3 reads its by-value TF args at entry+20/+36).
                 //    The caller layout (i686 calls.rs stack_arg_align) uses
                 //    the identical rule so both sides agree.
-                let param = func.params.get(i);
+                let param = params.get(i);
                 let struct_align = param
                     .and_then(|p| p.struct_align)
                     .unwrap_or(slot_size as usize);
                 if std::env::var_os("CCC_DEBUG_STACK_ALIGN").is_some() {
                     eprintln!(
                         "[STACK-ALIGN-ARM] fn={} i={} size={} ir_align={:?} slot_size={} cap={} aligning={}",
-                        func.name,
+                        func_name,
                         i,
                         size,
                         param.and_then(|p| p.struct_align),
@@ -1401,7 +1489,7 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
                 if std::env::var_os("CCC_DEBUG_STACK_ALIGN").is_some() {
                     eprintln!(
                         "[STACK-ALIGN-ARM2] fn={} i={} post_align_offset={}",
-                        func.name, i, stack_offset
+                        func_name, i, stack_offset
                     );
                 }
                 let off = stack_offset;
@@ -1455,15 +1543,15 @@ pub fn classify_params_full(func: &IrFunction, config: &CallAbiConfig) -> ParamC
         for (i, pc) in classes.iter().enumerate() {
             eprintln!(
                 "[STACK-ALIGN] fn={} param {} = {:?} ir_align={:?}",
-                func.name,
+                func_name,
                 i,
                 pc,
-                func.params.get(i).and_then(|p| p.struct_align)
+                params.get(i).and_then(|p| p.struct_align)
             );
         }
         eprintln!(
             "[STACK-ALIGN] fn={} total_stack_bytes={}",
-            func.name, stack_offset
+            func_name, stack_offset
         );
     }
 

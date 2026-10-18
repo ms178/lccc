@@ -338,6 +338,13 @@ gate "ext-vector-cross-abi" fast \
 gate "ext-vector-abi-grid" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_abi_grid.sh
 
+# The same probe under the AVX / AVX-512F ABI level (x86-64 only): a named
+# ext vector of up to the native register width is ONE %ymm / %zmm for
+# Clang, the carrier lccc shares with the vector_size ABI (AUD-VABI-2), so
+# every leg must agree, returns included.
+gate "ext-vector-abi-avx" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_abi_avx.sh
+
 gate "a9987-salvage" fast \
     env CCC="$LCCC" bash tests/regression/check_a9987_salvage.sh
 
@@ -454,14 +461,12 @@ gate "sysv-aggregate-abi" fast \
 gate "vector-arg-forms" fast \
     python3 tests/regression/check_vector_arg_forms.py --lccc "$LCCC" --cc "${GCC:-gcc-16}"
 
-# AUD-VABI-2: the 32-byte case of the same rule (WHOLE %ymm with AVX on).  Not
-# fixable like the 16-byte one -- it needs a %ymm carrier through return and
-# argument classification, the prologue, location allocation and the call
-# sequence -- so the gate measures and LATCHES the debt: the two working
-# configurations are asserted to stay correct, and the two broken cross legs
-# must show exactly the recorded verdict, so the bug cannot silently change
-# shape or be declared fixed without the fix.
-gate "vector-abi-wide-latched" fast \
+# AUD-VABI-2: the 32- and 64-byte case of the same rule (ONE %ymm / %zmm
+# with the AVX / AVX-512F ABI level on; MEMORY without it).  Two reproducers,
+# four provider/caller combinations each, -O0/-O2 x {-mavx2, x86-64-v3,
+# -mavx512f (host permitting), none, -mno-avx}: every binary's output must
+# equal gcc/gcc's.
+gate "vector-abi-wide" fast \
     env CCC="$LCCC" bash tests/regression/check_vector_abi_wide.sh
 
 # ABI-EXTVEC-VA-1 and its `vector_size` twin: a vector type's alignment is its

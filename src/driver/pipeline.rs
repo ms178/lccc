@@ -761,19 +761,30 @@ impl Driver {
         // `_Alignof(v32)` is 16 by default and 32 with `-mavx` exactly like
         // GCC 16.2. Non-x86 targets keep 16 (their vector TYPE_ALIGN is
         // already capped at 16 in `vector_type_align`, so the value is moot).
-        crate::common::types::set_target_biggest_alignment(
-            if matches!(self.target, Target::X86_64 | Target::I686) && !self.no_sse {
-                if self.enable_avx512f {
-                    64
-                } else if self.enable_avx {
-                    32
-                } else {
-                    16
-                }
+        let x86_isa_width = if matches!(self.target, Target::X86_64 | Target::I686) && !self.no_sse
+        {
+            if self.enable_avx512f {
+                64
+            } else if self.enable_avx {
+                32
             } else {
                 16
-            },
-        );
+            }
+        } else {
+            16
+        };
+        crate::common::types::set_target_biggest_alignment(x86_isa_width);
+        // The psABI vector-register width of the argument classification
+        // (`__m256` in one `%ymm` under `-mavx`, `__m512` in one `%zmm`
+        // under `-mavx512f`, MEMORY otherwise) follows the same requested
+        // ISA state, exactly like GCC's `TARGET_AVX`/`TARGET_AVX512F` and
+        // Clang's `AVXLevel`. x86-64 only: the i386 psABI has no AVX
+        // register convention (`sysv_classify` is not consulted there).
+        crate::common::types::set_target_vector_abi_bytes(if self.target == Target::X86_64 {
+            x86_isa_width
+        } else {
+            16
+        });
         // 4-byte width-partitioned spill slots are only enabled where the
         // backend's store/load paths are proven width-consistent.  x86-64
         // narrows ≤32-bit spills; i686 naturally accesses every non-wide

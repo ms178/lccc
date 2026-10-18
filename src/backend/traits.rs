@@ -1120,7 +1120,7 @@ pub trait ArchCodegen {
         dest: Option<Value>,
         return_type: IrType,
         is_variadic: bool,
-        _num_fixed_args: usize,
+        num_fixed_args: usize,
         struct_arg_sizes: &[Option<usize>],
         struct_arg_aligns: &[Option<usize>],
         struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
@@ -1153,17 +1153,59 @@ pub trait ArchCodegen {
 
         use super::call_abi::*;
         let config = self.call_abi_config();
+        // x86-64 `%ymm0`/`%zmm0` aggregate return (AVX ABI level): the IR
+        // passes the result buffer's address as argument 0 in the sret
+        // shape, but the psABI gives it no register. Classify the real
+        // arguments from index 1 and store the register through the buffer
+        // after the call (`emit_call_store_vector_return`).
+        let vector_return_bytes =
+            hidden_vector_return_bytes(is_sret, ret_eightbyte_classes).filter(|_| !args.is_empty());
+        let skip = usize::from(vector_return_bytes.is_some());
+        // psABI §3.2.3 (x86-64): an unnamed `__m256`/`__m512` argument of a
+        // variadic call is MEMORY -- the register save area has no room for
+        // the upper lanes -- while a named one still rides in a vector
+        // register. `num_fixed_args` counts the sret slot; the demoted
+        // argument keeps its size and alignment, so it lands in a 32- or
+        // 64-byte aligned stack slot exactly as GCC/Clang place it.
+        let wide_vector = |classes: &[crate::common::types::EightbyteClass]| {
+            crate::common::sysv_classify::vector_reg_bytes_of(classes).is_some_and(|b| b > 16)
+        };
+        let demoted_classes: Vec<Vec<crate::common::types::EightbyteClass>>;
+        let struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>] = if is_variadic
+            && struct_arg_classes
+                .iter()
+                .skip(num_fixed_args)
+                .any(|c| wide_vector(c))
+        {
+            demoted_classes = struct_arg_classes
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    if i >= num_fixed_args && wide_vector(c) {
+                        Vec::new()
+                    } else {
+                        c.clone()
+                    }
+                })
+                .collect();
+            &demoted_classes
+        } else {
+            struct_arg_classes
+        };
         let mut arg_classes = classify_call_args(
-            args,
-            arg_types,
-            struct_arg_sizes,
-            struct_arg_aligns,
-            struct_arg_classes,
-            struct_arg_riscv_float_classes,
-            struct_arg_is_f128_sse,
+            &args[skip..],
+            arg_types.get(skip..).unwrap_or(&[]),
+            struct_arg_sizes.get(skip..).unwrap_or(&[]),
+            struct_arg_aligns.get(skip..).unwrap_or(&[]),
+            struct_arg_classes.get(skip..).unwrap_or(&[]),
+            struct_arg_riscv_float_classes.get(skip..).unwrap_or(&[]),
+            struct_arg_is_f128_sse.get(skip..).unwrap_or(&[]),
             is_variadic,
             &config,
         );
+        if skip == 1 {
+            arg_classes.insert(0, CallArgClass::ZeroSizeSkip);
+        }
 
         // AArch64 ABI: the sret pointer goes in x8 (indirect result register),
         // NOT in x0 as a regular argument.  Reclassify: mark arg[0] as ZeroSizeSkip
@@ -1294,7 +1336,9 @@ pub trait ArchCodegen {
         self.emit_call_cleanup(effective_stack_cleanup, f128_temp_space, indirect);
 
         // Phase 6: Store return value.
-        if let Some(dest) = dest {
+        if let Some(bytes) = vector_return_bytes {
+            self.emit_call_store_vector_return(&args[0], bytes, dest.as_ref());
+        } else if let Some(dest) = dest {
             self.set_call_ret_eightbyte_classes(ret_eightbyte_classes);
             self.set_call_ret_is_f128_sse(ret_is_f128_sse);
             self.emit_call_store_result(&dest, return_type);
@@ -1316,6 +1360,26 @@ pub trait ArchCodegen {
 
     /// Return the ABI configuration for this architecture's function calls.
     fn call_abi_config(&self) -> super::call_abi::CallAbiConfig;
+
+    /// Store a `bytes`-byte aggregate that came back in ONE vector register
+    /// (`%ymm0` / `%zmm0`, x86-64 AVX ABI level) through the caller's result
+    /// buffer at `buffer` (the hidden argument 0 of the sret-shaped call),
+    /// then give `dest` -- the sret shape's pointer result -- that address.
+    /// Only x86-64 lowering produces such calls (`sysv_classify` is the
+    /// sole source of the SSE + SSEUPs classes and answers nothing on other
+    /// targets), so the default is unreachable by construction: it asserts
+    /// that contract in debug builds and emits nothing otherwise.
+    fn emit_call_store_vector_return(
+        &mut self,
+        _buffer: &Operand,
+        bytes: usize,
+        _dest: Option<&Value>,
+    ) {
+        debug_assert!(
+            false,
+            "{bytes}-byte vector-register aggregate return is an x86-64 convention"
+        );
+    }
 
     /// Compute how much stack space to allocate for overflow arguments.
     /// x86 returns raw push bytes; ARM/RISC-V return pre-allocated SP space.

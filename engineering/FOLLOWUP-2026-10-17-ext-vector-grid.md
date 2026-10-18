@@ -319,6 +319,82 @@ GCC 16 reference; the previous compiler prints `0`/garbage for `p.hi`);
 pass unit test `forwards_reads_through_a_path_into_another_forwarded_temporary`.
 The 27 rows are retired.
 
+### AUD-VABI-2 — x86-64 AVX ABI level: 32/64-byte vectors in one `%ymm`/`%zmm` — **FIXED**
+
+Measured before the fix (`check_vector_abi_wide.sh`, then a latch): under
+`-mavx2` an lccc caller fed a gcc callee garbage (`add: 0 0 0 …`) and a gcc
+caller crashed an lccc callee (SIGSEGV); the no-AVX legs agreed. lccc had
+no SSEUP notion past 16 bytes: the struct rule stopped there and the
+AVX-level classification never existed, so every 32-byte vector took the
+memory convention regardless of flags.
+
+**The convention** (psABI 3.2.3; GCC `classify_argument`/`TARGET_AVX`,
+Clang `getNativeVectorSizeForAVXABI`): a vector is SSE + one SSEUP per
+further eightbyte; with the AVX (AVX-512F) ABI level a 32-byte (64-byte)
+vector, or a struct/union whose only member is one, is ONE `%ymm` (`%zmm`)
+as a named argument and returns whole in `%ymm0` (`%zmm0`). SSE overflow
+is transactional (the ninth vector goes to memory at its 32-byte alignment,
+the scalar after it still takes a GPR). An **unnamed** vector of a variadic
+call is MEMORY (the register save area has 16 bytes per `%xmm`) and `%al`
+counts only the SSE registers actually used. `struct { v4f a, b; }`
+(SSE+SSEUP+SSE+SSEUP), `struct { v8f; int }` (40 B) and `struct { v8f;
+v16f }` (96 B, 64-aligned stack slot, sret) stay MEMORY.
+
+**Implementation.** `TARGET_VECTOR_ABI_BYTES` (16/32/64, set from the
+requested ISA level exactly like `BIGGEST_ALIGNMENT`: `-mavx*`, `-march=`,
+`native`, cleared by `-mno-avx`); `sysv_classify` emits the wide shapes
+only at that level and `vector_reg_bytes_of` recognises them; the carriers
+gained a size (`StructXmmReg { size }`, `F128SseReg { size }`,
+`vector_reg_move`: `movdqu`/`vmovdqu`/`vmovdqu64`). A `%ymm0`-returned
+aggregate keeps the IR's sret shape — the hidden pointer is argument 0 — but
+the psABI gives it no register: the callee classifies it as
+`ParamClass::VectorReturnBuffer`, homes it as the address of a private
+frame buffer and the return sequence loads that buffer into `%ymm0`
+(without the epilogue `vzeroupper`, which would zero the upper lanes); the
+caller skips it in the argument walk and stores `%ymm0` through its own
+buffer after the call (`emit_call_store_vector_return`, restoring
+caller-saved homes first — the restore is now idempotent per call site).
+`num_fixed_args` now counts the sret slot and `emit_call` demotes unnamed
+wide vectors to MEMORY; `va_arg` of a wide vector reads the overflow area
+at its alignment. The ext-vector rejection (`x86_64_ext_vector_unsupported`)
+admits the shapes the level makes one register (Clang: returns classify as
+named), so `f32x8`/`f64x3`/… return by value under `-mavx2`.
+
+**Verification.** `check_vector_abi_wide.sh` (no latch left): `wide.c` +
+`wide_avx.c` (23 functions over the rule set above) × 4 legs × -O0/-O2 ×
+{`-mavx2`, `-march=x86-64-v3`, `-mavx512f`, none, `-mno-avx`} = 80 binaries,
+all equal to gcc/gcc; `-march={native,znver4,skylake-avx512,x86-64-v4}` and
+`-mavx512f -mno-avx512f` agree too (manual). New Clang-oracle gate
+`check_ext_vector_abi_avx.sh` (hosted CI): 10 32-byte shapes under `-mavx2`
+(+4 64-byte under `-mavx512f`), lccc ↔ lccc legs run locally (0 failures).
+
+**Debt observed, not changed here (quantified).** `v8f add8(v8f a, v8f b)
+{ return a + b; }` at `-O2 -mavx2` is 37 instructions against GCC's 2
+(`vaddps %ymm1,%ymm0,%ymm0; ret`): 32-byte vectors are memory objects in
+the IR, every over-aligned alloca access re-derives `(slot+31)&~31` at
+run time instead of aligning the frame once, parameters are captured to
+slots and the return value is copied into the hidden buffer before the
+`%ymm0` load. Correct, interoperable, slow — a first-class 256-bit SSA
+value class plus frame realignment is the fix, a separate series.
+Also not covered: a per-function `__attribute__((target("avx2")))` ABI
+level (GCC and Clang 23 classify per function; lccc per TU), and a
+variadic call through a non-identifier callee expression (`s->fn(1, v)`)
+is lowered with every argument named.
+
+### PEEP-MULSS-RAX-1 — legacy-SSE `mul*`/`div*` classified as an implicit `%rax` write — **FIXED**
+
+Found by the `-mno-avx` leg of the gate above (lccc main + any callee
+crashed). `parse_dest_reg_fast` prefix-matched `mul`/`div`, so the CFG
+liveness treated `mulss %xmm2,%xmm3` as a KILL of `%rax`;
+`eliminate_dead_flag_writes` then deleted the `addq $63,%rax; andq
+$-64,%rax` realignment of a 64-byte vector alloca whose address was
+dereferenced after the multiply (`movss %xmm3,(%r10,%rax)` wrote 48 bytes
+early; `fill_mul` in the new corpus test printed 1326 for 2040). Only the
+VEX-less path spells the multiply `mulss`, so the default v3 baseline hid
+it. Fix: exact mnemonic match (`mul{,b,w,l,q}`, `{i,}div{,b,w,l,q}`); unit
+test `sse_scalar_arith_is_not_an_implicit_rax_write`, corpus test
+`sse_scalar_mul_not_rax_kill.c` (`-O2 -mno-avx`, GCC reference).
+
 ## Retiring an entry
 
 Fix the defect, run the grid locally (`scripts/ci_local.sh` gate

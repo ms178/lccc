@@ -4,6 +4,7 @@ use super::emit::{X86_ARG_REGS, X86Codegen};
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_push_bytes};
 use crate::backend::generation::is_i128_type;
 use crate::backend::narrow_copy::{NarrowCopy, eax_ferry, narrow_copy_plan, narrow_move_mnemonic};
+use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
 
@@ -990,7 +991,8 @@ impl X86Codegen {
                         }
                     }
                 }
-                CallArgClass::F128SseReg { reg_idx } | CallArgClass::StructXmmReg { reg_idx } => {
+                CallArgClass::F128SseReg { reg_idx }
+                | CallArgClass::StructXmmReg { reg_idx, .. } => {
                     if *reg_idx < 8 {
                         written_xmm[*reg_idx] = true;
                     }
@@ -1201,13 +1203,14 @@ impl X86Codegen {
                         float_count += 1;
                     }
                 }
-                CallArgClass::StructXmmReg { reg_idx } => {
-                    // A `[SSE, SSEUP]` aggregate is exactly 16 bytes: load
-                    // them through its address into one XMM register.
+                CallArgClass::StructXmmReg { reg_idx, size } => {
+                    // A `[SSE, SSEUP...]` aggregate is exactly one vector
+                    // register wide (16 / 32 / 64 bytes): load it through
+                    // its address into that register.
                     self.operand_to_rax(arg);
+                    let (mov, reg) = vector_reg_move(size, reg_idx);
                     self.state
-                        .out
-                        .emit_instr_mem_reg("    movdqu", 0, "rax", xmm_regs[reg_idx]);
+                        .emit_fmt(format_args!("    {mov} (%rax), %{reg}"));
                     float_count += 1;
                 }
                 CallArgClass::F128SseReg { reg_idx } => {
@@ -1721,6 +1724,37 @@ impl X86Codegen {
         self.call_ret_is_f128_sse = is_f128;
     }
 
+    /// An aggregate that came back in ONE `%ymm0` / `%zmm0` (the x86-64 AVX
+    /// ABI level for `__m256` / `__m512`): store the register through the
+    /// caller's result buffer -- the sret-shaped call's hidden argument 0 --
+    /// and hand `dest` that address, which is what the sret shape's pointer
+    /// result means to the rest of the IR. `%rax` is scratch here: the
+    /// callee returned nothing in it.
+    pub(super) fn emit_call_store_vector_return_impl(
+        &mut self,
+        buffer: &Operand,
+        bytes: usize,
+        dest: Option<&Value>,
+    ) {
+        self.state.reg_cache.invalidate_all();
+        // The buffer operand may live in a caller-saved home that the call
+        // clobbered and the Phase 2b restore would only reload afterwards:
+        // restore first (idempotent; the later generic restore is a no-op).
+        self.emit_post_call_restore_caller_regs();
+        self.operand_to_rax(buffer);
+        let (mov, reg) = vector_reg_move(bytes, 0);
+        self.state
+            .emit_fmt(format_args!("    {mov} %{reg}, (%rax)"));
+        // The whole SSE file is caller-saved; nothing cached survives a
+        // call, and the pending-vector-store peephole must not see a stale
+        // image of the buffer.
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+        if let Some(dest) = dest {
+            self.store_rax_to(dest);
+        }
+    }
+
     pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {
         // Void functions have no meaningful return value — skip the store.
         // Without this, store_rax_to writes garbage %rax to a stack slot that
@@ -1849,5 +1883,19 @@ impl X86Codegen {
 
     pub(super) fn emit_call_move_f64_to_acc_impl(&mut self) {
         self.state.emit("    movq %xmm0, %rax");
+    }
+}
+
+/// The unaligned move and register name that carry a `size`-byte
+/// one-vector-register aggregate (psABI SSE + SSEUPs) in SSE argument /
+/// return register `idx`: `movdqu %xmmN` (16), `vmovdqu %ymmN` (32, AVX),
+/// `vmovdqu64 %zmmN` (64, AVX-512F). Unaligned on purpose: the object's
+/// home is a stack slot or a caller buffer whose alignment the frame does
+/// not promise beyond 16.
+pub(super) fn vector_reg_move(size: usize, idx: usize) -> (&'static str, String) {
+    match size {
+        32 => ("vmovdqu", format!("ymm{idx}")),
+        64 => ("vmovdqu64", format!("zmm{idx}")),
+        _ => ("movdqu", format!("xmm{idx}")),
     }
 }

@@ -49,7 +49,9 @@ impl Lowerer {
 
     /// Eightbyte classes and the one-`%xmm` flag of a by-value aggregate
     /// argument on x86-64 (`None` elsewhere, or for non-aggregates). Records
-    /// over 16 bytes keep an empty class list (MEMORY by size), and so do
+    /// over 16 bytes keep an empty class list (MEMORY by size) unless they
+    /// are the AVX one-register shape (SSE + SSEUPs, see
+    /// `SysvPassing::vector_reg_bytes`), and so do
     /// records of zero static size: they have no eightbyte to classify
     /// (`StructLayout::classify_sysv_eightbytes` answers the same), and a
     /// VLA-containing struct -- static size zero, passed by reference in a
@@ -59,7 +61,10 @@ impl Lowerer {
     pub(super) fn sysv_arg_abi(&self, ct: &CType) -> Option<(Vec<EightbyteClass>, bool)> {
         let passing = self.sysv_passing(ct)?;
         let size = ct.size_ctx(&*self.types.borrow_struct_layouts());
-        if size == 0 || size > 16 {
+        // Over 16 bytes only the AVX vector-register shape (SSE + SSEUPs,
+        // one `%ymm`/`%zmm`) is a register carrier; every other wide
+        // object is MEMORY by size.
+        if size == 0 || (size > 16 && passing.vector_reg_bytes().is_none()) {
             return Some((Vec::new(), false));
         }
         let one_xmm = passing.one_xmm();
@@ -94,6 +99,21 @@ impl Lowerer {
             Some(passing @ SysvPassing::Regs(_)) => {
                 r.one_xmm = passing.one_xmm();
                 r.classes = passing.arg_classes();
+                // One `%ymm0` / `%zmm0` (SSE + 3 or 7 SSEUPs, the AVX ABI
+                // level): the IR has no 32/64-byte value type, so the value
+                // keeps the hidden-pointer SHAPE in the IR (`sret_size`
+                // stays `Some(size)`: the caller allocates the buffer and
+                // passes its address first, the callee's returns copy into
+                // it) and the backend applies the register convention at
+                // the boundary — the hidden pointer consumes no argument
+                // register, the callee homes it in a private frame buffer,
+                // and the bytes cross the call in the vector register. See
+                // `backend::call_abi::hidden_vector_return_bytes`, which
+                // recognises exactly this `sret + wide SSE classes` pair.
+                debug_assert!(
+                    passing.vector_reg_bytes().is_some_and(|b| b > 16) == (r.sret_size.is_some()),
+                    "register-returned aggregate classes and the size rule disagree"
+                );
             }
         }
         r

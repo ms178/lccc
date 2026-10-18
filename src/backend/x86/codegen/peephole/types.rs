@@ -964,11 +964,39 @@ pub(super) fn parse_dest_reg_fast(s: &str) -> RegId {
     // Note: imul is not listed because the codegen only emits two/three-operand
     // forms (imulq %rcx, %rax / imulq $imm, %rax, %rax) which write to the
     // explicit destination, handled by the comma-based dest extraction below.
-    if b.len() >= 3
-        && (b[0] == b'd' || b[0] == b'i' || b[0] == b'm')
-        && (s.starts_with("div") || s.starts_with("idiv") || s.starts_with("mul"))
+    //
+    // EXACT mnemonic match, never a prefix test: the scalar/packed SSE
+    // forms `mulss`/`mulsd`/`mulps`/`mulpd`/`divss`/`divsd`/`divps`/`divpd`
+    // share the prefix and write only their explicit `%xmm` destination. The
+    // former `starts_with("mul")` made every legacy-SSE multiply a phantom
+    // `%rax` KILL in the liveness solution, so a `%rax`-based address
+    // computed before `mulss` and dereferenced after it
+    // (`leaq 16(%rsp),%rax; addq $63,%rax; andq $-64,%rax; ...; mulss
+    // %xmm2,%xmm3; movss %xmm3,(%r10,%rax)`) lost its `addq`/`andq` to
+    // dead-flag-write elimination -- a wrong-address store in every `-mno-avx`
+    // / x86-64-v2 build that realigns an over-aligned vector alloca.
     {
-        return 0; // rax family (also rdx, but we track rax as primary)
+        let m = s.split([' ', '\t']).next().unwrap_or("");
+        if matches!(
+            m,
+            "div"
+                | "divb"
+                | "divw"
+                | "divl"
+                | "divq"
+                | "idiv"
+                | "idivb"
+                | "idivw"
+                | "idivl"
+                | "idivq"
+                | "mul"
+                | "mulb"
+                | "mulw"
+                | "mull"
+                | "mulq"
+        ) {
+            return 0; // rax family (also rdx, but we track rax as primary)
+        }
     }
     // For AT&T syntax the final *top-level* operand is the destination.  A
     // raw last-comma search is unsound for SIB memory operands such as
