@@ -1370,6 +1370,25 @@ impl CodegenState {
         }
     }
 
+    /// Re-sync the debug %rax park epoch after a sequence that wrote %rax
+    /// transiently but restored the parked value exactly (the narrow-copy
+    /// ferry in `emit_call_reg_args`: spill `%rax` to the transient frame,
+    /// ferry through it, reload it verbatim). The reload is a %rax write to
+    /// the epoch analyzer, so without this call the park epoch and the
+    /// shadow epoch diverge and the next `acc_has_verified` would report a
+    /// dead-%rax read although the value is live and identical. The caller
+    /// GUARANTEES that %rax holds the parked value again when it calls
+    /// this; an emitter that does not restore the value must use
+    /// [`RegCache::invalidate_acc`] instead. Release builds compile the
+    /// body away (the field it syncs is debug-only).
+    #[inline]
+    pub fn refresh_acc_park_epoch(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            self.reg_cache.acc_park_epoch = self.out.debug_rax_epoch();
+        }
+    }
+
     /// Record that the secondary register now holds `value_id`, syncing
     /// the debug %rcx shadow epoch (see [`RegCache::sec_park_epoch`]).
     /// The %rcx mirror of [`park_acc`](Self::park_acc): every park on an

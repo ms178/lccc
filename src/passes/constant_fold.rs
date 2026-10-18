@@ -104,7 +104,9 @@ fn fold_const_global_loads(module: &mut IrModule) -> usize {
 }
 
 /// Fold `strlen`/`__builtin_strlen` calls whose argument is a string-literal
-/// global into the literal's byte length. glibc's startup.h pattern
+/// global into the literal's byte length. The builtin policy follows
+/// `-fno-builtin`: ordinary `strlen` folding is disabled there, while an
+/// explicit `__builtin_strlen` remains a compiler builtin. glibc's startup.h pattern
 /// `__builtin_constant_p (__builtin_strlen (message))` with a string-literal
 /// message becomes 1 after inlining; without this, the branch to
 /// `_startup_fatal_not_constant` survives into static links. Runs after

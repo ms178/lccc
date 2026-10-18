@@ -196,8 +196,10 @@ pub trait TypeConvertContext {
                 let param_ctypes: Vec<(CType, Option<String>)> = params
                     .iter()
                     .map(|p| {
-                        let ty = self.resolve_type_spec_to_ctype(&p.type_spec);
-                        (ty, p.name.clone())
+                        (
+                            param_decl_to_ctype_with(&|ts| self.resolve_type_spec_to_ctype(ts), p),
+                            p.name.clone(),
+                        )
                     })
                     .collect();
                 CType::Pointer(
@@ -216,8 +218,10 @@ pub trait TypeConvertContext {
                 let param_ctypes: Vec<(CType, Option<String>)> = params
                     .iter()
                     .map(|p| {
-                        let ty = self.resolve_type_spec_to_ctype(&p.type_spec);
-                        (ty, p.name.clone())
+                        (
+                            param_decl_to_ctype_with(&|ts| self.resolve_type_spec_to_ctype(ts), p),
+                            p.name.clone(),
+                        )
                     })
                     .collect();
                 CType::Function(Box::new(FunctionType {
@@ -356,18 +360,48 @@ fn find_function_pointer_core(derived: &[DerivedDeclarator]) -> Option<usize> {
 /// (`int (*xStress)(void*, PgHdr*)` typed as `int *`); it was fixed on one side
 /// of the duplication and not the other. Both sides now call this.
 pub fn param_decl_to_ctype(ctx: &dyn TypeConvertContext, param: &ParamDecl) -> CType {
+    param_decl_to_ctype_with(&|ts| ctx.resolve_type_spec_to_ctype(ts), param)
+}
+
+/// `param_decl_to_ctype` with the TypeSpecifier resolver injected. The
+/// FunctionPointer/BareFunction TypeSpecifier arms and sema's own type
+/// resolver share this so a nested function-pointer parameter
+/// (`int (*fun)(unsigned int)` inside a type name) resolves through
+/// `fptr_params` everywhere; resolving `param.type_spec` alone yields
+/// `int *` and rejects GCC-legal probe dispatch code
+/// (include/trace/events/cpuhp.h __traceiter_cpuhp_enter).
+pub fn param_decl_to_ctype_with(
+    resolve: &dyn Fn(&TypeSpecifier) -> CType,
+    param: &ParamDecl,
+) -> CType {
     if let Some(ref fptr_params) = param.fptr_params {
         // `float (*func)(float, float)`: the specifier is the pointee function's
         // return type, and the parenthesised declarator's own parameter list
-        // rides on `fptr_params`.
-        let return_ctype = ctx.resolve_type_spec_to_ctype(&param.type_spec);
-        let actual_return = match return_ctype {
-            CType::Pointer(inner, _) => *inner,
-            other => other,
-        };
+        // rides on `fptr_params`. The parser wraps type_spec with a Pointer
+        // per declarator star — the parenthesised group's own stars
+        // (`long (**op)(req)` has two) AND any leading stars (`long *(*op)(req)`
+        // has one, and it qualifies the RETURN pointer). fptr_inner_ptr_depth
+        // counts the parenthesised group's stars — 0 when the parameter list
+        // directly follows a leading star (`void *lookup_elem(struct bpf_map *,
+        // u32)`, a function parameter decaying to a pointer) — so strip
+        // max(that, 1) levels: one for the implicit is_func_ptr wrap, plus the
+        // extra group stars. The old single strip turned `long (**op)(req)`
+        // into a function RETURNING long* one level short
+        // (crypto/ahash.c ahash_do_req_chain); stripping zero made
+        // `void *f(map, u32)` return void** (kernel/bpf/devmap.c
+        // __bpf_xdp_redirect_map's lookup_elem).
+        let return_ctype = resolve(&param.type_spec);
+        let mut actual_return = return_ctype;
+        for _ in 0..param.fptr_inner_ptr_depth.max(1) {
+            if let CType::Pointer(inner, _) = actual_return {
+                actual_return = *inner;
+            } else {
+                break;
+            }
+        }
         let param_types: Vec<(CType, Option<String>)> = fptr_params
             .iter()
-            .map(|p| (param_decl_to_ctype(ctx, p), p.name.clone()))
+            .map(|p| (param_decl_to_ctype_with(resolve, p), p.name.clone()))
             .collect();
         let func_type = CType::Function(Box::new(FunctionType {
             return_type: actual_return,
@@ -385,7 +419,7 @@ pub fn param_decl_to_ctype(ctx: &dyn TypeConvertContext, param: &ParamDecl) -> C
     // C23 6.7.6.3p8: a parameter declared as an array is adjusted to a pointer
     // to its first element, and one declared as a function to a pointer to that
     // function. Both adjustments belong to the parameter, not to the caller.
-    match ctx.resolve_type_spec_to_ctype(&param.type_spec) {
+    match resolve(&param.type_spec) {
         CType::Array(elem, _) => CType::Pointer(elem, AddressSpace::Default),
         CType::Function(ft) => CType::Pointer(Box::new(CType::Function(ft)), AddressSpace::Default),
         other => other,

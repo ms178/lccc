@@ -4947,6 +4947,19 @@ fn remap_instruction(inst: &Instruction, vo: u32, bo: u32) -> Instruction {
             align: *align,
             eightbyte_classes: eightbyte_classes.clone(),
         },
+        Instruction::VaArgVector {
+            dest_ptr,
+            va_list_ptr,
+            size,
+            align,
+            eightbyte_classes,
+        } => Instruction::VaArgVector {
+            dest_ptr: remap_value(*dest_ptr, vo),
+            va_list_ptr: remap_value(*va_list_ptr, vo),
+            size: *size,
+            align: *align,
+            eightbyte_classes: eightbyte_classes.clone(),
+        },
         Instruction::AtomicRmw {
             dest,
             op,

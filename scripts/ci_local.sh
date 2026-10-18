@@ -181,6 +181,11 @@ if [ ! -x "$LCCC" ]; then
     exit 1
 fi
 
+gate "driver-option-contract" fast \
+    env CCC="$LCCC" bash tests/regression/check_driver_option_contract.sh
+gate "fno-builtin-fold-contract" fast \
+    env CCC="$LCCC" bash tests/regression/check_fno_builtin_folds.sh
+
 # --------------------------------------------------------------- job:test --
 # The ratchet that keeps the 2026-10-13 audit's debt numbers from growing:
 # panic-class sites (AUD-ICE-1), unsafe sites, giant functions (AUD-MONO-1),
@@ -337,6 +342,12 @@ gate "ext-vector-cross-abi" fast \
 # scripts/ci_install_clang_oracle.sh installs it (CLANG=... selects it).
 gate "ext-vector-abi-grid" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_abi_grid.sh
+
+# Vector-shaped varargs (vector_size cross-checked against GCC in all four
+# link directions; ext_vector_type as pinned LCCC round-trips). A wrong fetch
+# width or %al census poisons every later FP vararg, not just its own.
+gate "ext-vector-varargs-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_varargs_abi.sh
 
 gate "a9987-salvage" fast \
     env CCC="$LCCC" bash tests/regression/check_a9987_salvage.sh
@@ -912,6 +923,12 @@ gate "segfs-declarator-codegen" fast \
 gate "seg-named-decl-qualifier" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_seg_named_decl_qualifier.sh
 
+# A declaration nested inside another declaration's typeof() must not leak
+# its named address space onto the outer object (kernel amd/core.c per-CPU
+# read macro; oracle-compared against GCC 16).
+gate "seg-typeof-stmtexpr-leak" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_seg_typeof_stmtexpr_leak.sh
+
 # `%gs:`/`%fs:` loads whose base is a register plus a constant displacement must
 # fold into the memory operand (`movq %gs:8(%rax), %rax`) — the shape GCC and
 # Clang emit for every per-CPU `base->field` access — including when the base
@@ -1170,6 +1187,10 @@ gate "record-tag-identity" fast \
     env CCC="$LCCC" bash tests/regression/check_record_tag_identity.sh
 gate "enum-tag-scope-compat" fast \
     env CCC="$LCCC" bash tests/regression/check_enum_tag_scope_compat.sh
+gate "enum-layout-semantics" fast \
+    env CCC="$LCCC" bash tests/regression/check_enum_layout_semantics.sh
+gate "ext-vector-one-lane-fp" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_one_lane_fp.sh
 gate "strlen-embedded-nul" fast \
     env CCC="$LCCC" bash tests/regression/check_strlen_embedded_nul.sh
 # Enum/enumerator types and `_Alignas(type)` member layout on x86-64 and i686:

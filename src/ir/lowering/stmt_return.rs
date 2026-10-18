@@ -575,6 +575,34 @@ impl Lowerer {
         if struct_size == 0 || struct_size > 8 {
             return None;
         }
+        // AUD-VABI-4: a ONE-LANE FP vector (f32x1/f64x1) returns in the low
+        // half of %xmm0 as a scalar float/double, NOT as an I64 bit pattern.
+        // Loading it as I64 would bounce the value through GPRs on every leaf
+        // and — with the scalar F32/F64 IR carrier — misinterpret the FP bits
+        // as an integer. Load it directly with movss/movsd so the return value
+        // stays in the FP domain end-to-end.
+        if let Some((elem_ct, n_elems)) = expr_ct.vector_info() {
+            if n_elems == 1 && elem_ct.is_floating() {
+                let load_ty = match elem_ct.size() {
+                    4 => IrType::F32,
+                    8 => IrType::F64,
+                    _ => IrType::I64,
+                };
+                if matches!(load_ty, IrType::F32 | IrType::F64) {
+                    let addr = self.get_struct_base_addr(e);
+                    let seg = self.aggregate_lvalue_space(e);
+                    let dest = self.fresh_value();
+                    self.emit(Instruction::Load {
+                        volatile: false,
+                        dest,
+                        ptr: addr,
+                        ty: load_ty,
+                        seg_override: seg,
+                    });
+                    return Some(Operand::Value(dest));
+                }
+            }
+        }
         let addr = self.get_struct_base_addr(e);
         // The segment rides on the load itself; no temporary is needed. Read
         // exactly the object's bytes: a whole-word load would over-read 1..7

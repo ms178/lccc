@@ -517,6 +517,10 @@ jobs:
       run: bash tests/regression/check_rust_toolchain_selector.sh
     - name: Verify restored linker oracle versions
       run: bash tests/regression/check_linker_oracle_versions.sh
+    - name: Check driver option contracts
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_driver_option_contract.sh
+    - name: Check -fno-builtin constant-fold withdrawal (F1)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_fno_builtin_folds.sh
     - name: Check the recursion-to-iteration pass
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_rec2iter.sh
     - name: Check FP-contraction parity with GCC
@@ -552,6 +556,11 @@ jobs:
           [ -s "$RUNNER_TEMP/$log.log" ] || continue
           python3 scripts/ci_annotate_log.py --title "ext-vector ABI ($log)" "$RUNNER_TEMP/$log.log"
         done
+    - name: ext_vector_type and vector_size varargs ABI (GCC cross oracle)
+      run: |
+        set -o pipefail
+        env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_varargs_abi.sh 2>&1 |
+          tee "$RUNNER_TEMP/ext-vector-varargs-abi.log"
     - name: Memory value forwarding and predicate effect contracts
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_memory_value_contracts.sh
     - name: Audit loop branch and must-execute contracts
@@ -807,6 +816,10 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_record_tag_identity.sh
     - name: Enum tag scope compatibility
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_enum_tag_scope_compat.sh
+    - name: Enum layout semantics (widening, packed, struct inheritance, static asserts)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_enum_layout_semantics.sh
+    - name: One-lane FP vector ABI (AUD-VABI-4)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_one_lane_fp.sh
     - name: Embedded-NUL strlen contract
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_strlen_embedded_nul.sh
     # Enum/enumerator types and `_Alignas(type)` member layout, on x86-64 and
@@ -907,6 +920,10 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_seg_const_offset_fold.sh
+    - name: Verify statement-expression address-space declarations do not leak into typeof
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_seg_typeof_stmtexpr_leak.sh
     - name: Verify segment loads land in their home register
       env:
         CCC: target/fastbuild/lccc

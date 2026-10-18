@@ -68,6 +68,119 @@ impl X86Codegen {
         self.emit_va_arg_gp(dest, va_list_ptr, result_ty);
     }
 
+    // =========================================================================
+    // va_arg — vector (x86-64 SysV: ONE SSE register / one 16B overflow slot)
+    // =========================================================================
+
+    /// `va_arg` of a `vector_size` / `ext_vector_type` value.
+    ///
+    /// The psABI passes a vector vararg in exactly one XMM register: the
+    /// register-save area holds it at reg_save_area + fp_offset, and
+    /// fp_offset advances by 16 regardless of the vector's width (an 8-byte
+    /// vector wastes the high half of its slot, a 16-byte one fills it).
+    /// Overflow fetches one align-rounded slot. This is why VaArgStruct's
+    /// per-eightbyte fetch cannot express it: [Sse, Sse] there reads TWO
+    /// consecutive slots, which corrupts every later FP vararg (measured
+    /// against GCC 16 in check_vector_varargs_abi.sh).
+    pub(super) fn emit_va_arg_vector_impl(
+        &mut self,
+        dest_ptr: &Value,
+        va_list_ptr: &Value,
+        size: usize,
+        align: usize,
+        eightbyte_classes: &[EightbyteClass],
+    ) {
+        // Memory carrier (>16 bytes and the tracked shapes
+        // `sysv_vector_carrier` declines): unconditional overflow fetch, the
+        // register path can never hold the value.
+        if eightbyte_classes.is_empty() {
+            self.emit_va_arg_struct_overflow(dest_ptr, va_list_ptr, size, align);
+            return;
+        }
+        // INTEGER carrier (<= 4-byte vectors, bit-packed bool carriers): one
+        // GP slot, fetched in the integer domain regardless of -mno-sse.
+        let gp_count = eightbyte_classes
+            .iter()
+            .filter(|c| matches!(c, EightbyteClass::Integer | EightbyteClass::NoClass))
+            .count();
+        if gp_count > 0 {
+            self.emit_va_arg_struct_ex_impl(dest_ptr, va_list_ptr, size, align, eightbyte_classes);
+            return;
+        }
+        if self.no_sse {
+            // -mno-sse: va_start forced fp_offset to FP_MAX, so the value is
+            // always in the overflow area; fetch it in the GPR domain (no SSE
+            // instruction may be emitted). The overflow pointer is rounded up
+            // to the vector's alignment (8 or 16, both powers of two) and the
+            // advanced pointer is written back before the byte copy, matching
+            // the register path's va_list side effects.
+            self.load_va_list_ptr_to_rcx(va_list_ptr);
+            self.load_ptr_to_reg(dest_ptr, "rdi");
+            self.state.emit("    movq 8(%rcx), %rdx"); // overflow_arg_area
+            if align > 8 {
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    addq", (align - 1) as i64, "rdx");
+                self.state
+                    .out
+                    .emit_instr_imm_reg("    andq", -(align as i64), "rdx");
+            }
+            self.state
+                .out
+                .emit_instr_imm_reg("    leaq", size as i64, "rax");
+            self.state.out.emit_instr_reg_reg("    addq", "rdx", "rax");
+            self.state.emit("    movq %rax, 8(%rcx)"); // advance overflow
+            for off in (0..size).step_by(8) {
+                self.state
+                    .out
+                    .emit_fmt(format_args!("    movq {}(%rdx), %rax", off));
+                self.state
+                    .out
+                    .emit_fmt(format_args!("    movq %rax, {}(%rdi)", off));
+            }
+            self.state.reg_cache.invalidate_all();
+            return;
+        }
+
+        let label_mem = self.state.fresh_label("va_vec_mem");
+        let label_end = self.state.fresh_label("va_vec_end");
+
+        self.load_va_list_ptr_to_rcx(va_list_ptr);
+        self.load_ptr_to_reg(dest_ptr, "rdi");
+
+        // if (fp_offset >= 176) goto mem;   fall-through = registers.
+        self.state.emit("    movl 4(%rcx), %edx");
+        self.state
+            .out
+            .emit_instr_imm_reg("    cmpl", FP_MAX - FP_SLOT, "edx");
+        self.state.out.emit_jcc_label("    ja", &label_mem);
+
+        // ---- register path: one 16-byte slot at reg_save_area + fp_offset ----
+        self.state.emit("    movq 16(%rcx), %rsi"); // reg_save_area
+        if size >= 16 {
+            self.state.emit("    movdqu (%rsi,%rdx), %xmm0");
+            self.state
+                .out
+                .emit_fmt(format_args!("    movdqu %xmm0, (%rdi)"));
+        } else {
+            // 8-byte vector: the slot's low half is the value; movq keeps the
+            // 8-byte alloca bounds honest (movdqu would write past it).
+            self.state.emit("    movsd (%rsi,%rdx), %xmm0");
+            self.state
+                .out
+                .emit_fmt(format_args!("    movq %xmm0, (%rdi)"));
+        }
+        self.state.emit("    addl $16, 4(%rcx)");
+        self.state.out.emit_jmp_label(&label_end);
+
+        // ---- overflow path: one align-rounded, vector-aligned slot ----
+        self.state.out.emit_named_label(&label_mem);
+        self.emit_va_arg_struct_overflow_body(size, align);
+
+        self.state.out.emit_named_label(&label_end);
+        self.state.reg_cache.invalidate_all();
+    }
+
     /// INTEGER class, single eightbyte (int, long, pointer, …).
     ///
     /// The fetch width follows `mov_load_for_type` exactly (movslq for I32 —

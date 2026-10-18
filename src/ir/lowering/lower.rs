@@ -37,6 +37,11 @@ use std::mem::Discriminant;
 pub struct Lowerer {
     /// TU-owned arithmetic policy, including runtime expression lowering.
     pub(super) pass_policy: crate::common::pass_policy::PassPolicy,
+    /// TU-owned builtin policy: the CLI's `-fno-builtin` family state.
+    /// The FULL `BuiltinFlags`, not a projection onto libcalls — per-name
+    /// withdrawals of non-Libcall spellings (the hosted `strlen` alias, for
+    /// one) must hold at lowering-time const-eval, which matches names.
+    pub(super) builtin_policy: crate::common::pass_policy::BuiltinFlags,
     /// Target architecture, used for ABI-specific lowering decisions
     pub(super) target: Target,
     pub(super) next_label: u32,
@@ -216,6 +221,14 @@ impl Lowerer {
         self
     }
 
+    pub(crate) fn with_builtin_policy(
+        mut self,
+        policy: crate::common::pass_policy::BuiltinFlags,
+    ) -> Self {
+        self.builtin_policy = policy;
+        self
+    }
+
     /// Create a new Lowerer with pre-populated state from semantic analysis.
     ///
     /// The sema-provided TypeContext contains typedefs, enum constants, struct layouts,
@@ -249,6 +262,7 @@ impl Lowerer {
 
         Self {
             pass_policy: Default::default(),
+            builtin_policy: Default::default(),
             target,
             next_label: 0,
             next_string: 0,

@@ -10,11 +10,12 @@
 # loader; the default is structural/build validation because a staged glibc
 # must be paired with a complete sysroot before runtime claims are meaningful.
 #
-# The current LCCC linker has no IFUNC/SFrame emission and LCCC cannot assemble
-# glibc's AVX-512 libmvec sources.  The capability-gated defaults therefore
-# disable multi-arch, mathvec, and SFrame while keeping the ms178 patch and the
-# complete scalar libc/libm build.  Remove those gates only after the relevant
-# LCCC features pass their own differential tests.
+# The current LCCC linker has no IFUNC/SFrame emission, LCCC cannot assemble
+# glibc's AVX-512 libmvec sources, and semantic-interposition policy is not an
+# implemented driver option. The capability-gated defaults therefore disable
+# multi-arch, mathvec, and SFrame while keeping a scalar libc/libm build. Remove
+# those gates only after the relevant LCCC features pass their own differential
+# tests.
 #
 # Usage:
 #   tests/workloads/glibc-2.44/build_lccc.sh
@@ -33,7 +34,7 @@ PATCH=${MS178_GLIBC_PATCH:-/home/user/archpkgbuilds/toolchain-stable/glibc/ms178
 PATCH_SHA256= # filled/checked below; the recipe is the authority
 BINUTILS=${GLIBC_BINUTILS_PREFIX:-/home/user/tools/binutils-2.47/bin}
 JOBS=${JOBS:-2}
-CFLAGS=${GLIBC_CFLAGS:--O2 -march=x86-64-v3 -mtune=native -fomit-frame-pointer -fcf-protection=none -mharden-sls=none -fno-stack-protector -fno-semantic-interposition}
+CFLAGS=${GLIBC_CFLAGS:--O2 -march=x86-64-v3 -mtune=native -fomit-frame-pointer -fcf-protection=none -mharden-sls=none -fno-stack-protector}
 
 mkdir -p "$WORK" "$CACHE"
 "$ROOT/scripts/ensure_swap.sh"

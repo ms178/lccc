@@ -442,6 +442,9 @@ pub struct Driver {
     /// `None` = keep the built-in default; `Some(None)` = the dialect defines
     /// no `__STDC_VERSION__` (C89/C90); `Some(Some(v))` = define it as `v`.
     pub(super) stdc_version: Option<Option<&'static str>>,
+    /// `-fno-tree-vectorize` disables automatic vectorizer passes while
+    /// retaining explicit vector types and intrinsics.
+    pub(super) disable_tree_vectorize: bool,
     /// Whether -fexceptions is in effect (defines __EXCEPTIONS like GCC).
     pub(super) exceptions: bool,
     /// Whether to dump preprocessor defines instead of preprocessed output (-dM).
@@ -645,6 +648,7 @@ impl Driver {
             gnu89_inline: false,
             gnu89_inline_explicit: None,
             stdc_version: None,
+            disable_tree_vectorize: false,
             exceptions: false,
             dump_defines: false,
             color_mode: ColorMode::Auto,
@@ -1091,6 +1095,7 @@ impl Driver {
 
             // Semantic analysis.
             let mut sema = SemanticAnalyzer::new();
+            sema.set_builtin_policy(self.builtin_policy.clone());
             sema.set_diagnostics(diagnostics);
             if let Err(error_count) = sema.analyze(&ast) {
                 return Err(format!("{} error(s) during semantic analysis", error_count));
@@ -1920,6 +1925,7 @@ impl Driver {
         // the source manager so sema diagnostics can resolve spans)
         let t3 = std::time::Instant::now();
         let mut sema = SemanticAnalyzer::new();
+        sema.set_builtin_policy(self.builtin_policy.clone());
         sema.set_diagnostics(diagnostics);
         if let Err(error_count) = sema.analyze(&ast) {
             // Errors already emitted through diagnostic engine with source spans
@@ -1962,7 +1968,8 @@ impl Driver {
         .with_pass_policy(crate::common::pass_policy::PassPolicy::new(
             self.wrap_signed_overflow,
             fp_environment_observable,
-        ));
+        ))
+        .with_builtin_policy(self.builtin_policy.clone());
         let (mut module, mut diagnostics) = lowerer.lower(&ast);
         // IR lowering is a user-facing phase: it rejects ill-typed builtins,
         // target-specific intrinsics and unsupported constructs, and every one
@@ -2189,6 +2196,7 @@ impl Driver {
                 && self.enable_avx512f
                 && self.enable_avx512vl
                 && !self.no_sse,
+            self.disable_tree_vectorize,
             ra_config.as_ref(),
         );
         if time_phases {

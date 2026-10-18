@@ -1616,6 +1616,47 @@ impl Lowerer {
             return self.lower_va_arg_vector(ap_expr, type_spec, &ctype);
         }
 
+        // Vector-shaped va_arg on x86-64 rides the same classified machinery:
+        // a vector vararg occupies ONE XMM register (its SysV carrier classes
+        // from `sysv_vector_carrier`), or the 16-aligned overflow area, and
+        // GCC/Clang read it byte-identically through the struct fetch. The
+        // temporary alloca VaArgStruct fills IS the vector's address carrier
+        // (vector rvalues are addresses in LCCC IR), so the result needs no
+        // reassembly.  32-bit targets keep their legacy pointer convention.
+        if ctype.is_vector() && self.target == Target::X86_64 {
+            let size = ctype.size();
+            let align = ctype.align_ctx(&*self.types.borrow_struct_layouts());
+            let ap_val = self.lower_va_list_pointer(ap_expr);
+            let va_list_ptr = self.operand_to_value(ap_val);
+            let num_slots = size.div_ceil(8);
+            let alloc_size = if size > 0 { num_slots * 8 } else { 8 };
+            let alloca = self.fresh_value();
+            self.emit(Instruction::Alloca {
+                dest: alloca,
+                size: alloc_size,
+                ty: IrType::I64,
+                align,
+                volatile: false,
+                semantic_volatile: false,
+            });
+            // Per the SysV vector carrier: one XMM slot, one GP slot, or
+            // (carrier None, e.g. >16 bytes) the 16-aligned overflow area.
+            // The alloca is the vector's address carrier, so the result
+            // needs no reassembly.
+            let classes = ctype
+                .sysv_vector_carrier()
+                .map(|(classes, _pair)| classes)
+                .unwrap_or_default();
+            self.emit(Instruction::VaArgVector {
+                dest_ptr: alloca,
+                va_list_ptr,
+                size,
+                align,
+                eightbyte_classes: classes,
+            });
+            return Operand::Value(alloca);
+        }
+
         use crate::backend::Target;
         let ap_val = if self.target == Target::Riscv64 || self.target == Target::I686 {
             // RISC-V / i686: va_list is a pointer, need address of the variable holding it
@@ -1754,7 +1795,12 @@ impl Lowerer {
         // overflow/stack area if not.
         if self.target == Target::X86_64 || self.target == Target::Aarch64 {
             let eightbyte_classes = if self.target == Target::X86_64 && struct_size <= 16 {
-                if let Some(layout) = self.get_struct_layout_for_ctype(ctype) {
+                if let Some((classes, _pair)) = ctype.sysv_vector_carrier() {
+                    // Vector va_arg: the SysV vector carrier decides the
+                    // register classes (see `lower_va_arg` routing above);
+                    // struct layouts do not exist for vector types.
+                    classes
+                } else if let Some(layout) = self.get_struct_layout_for_ctype(ctype) {
                     layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
                 } else {
                     Vec::new()

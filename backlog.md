@@ -81,6 +81,19 @@ forms diagnose; the full regression/differential battery passes. Do not round
 byte counts or alter `vector_size` semantics as a substitute for a representation
 model.
 
+**Progress 2026-10-17 (PR #852 update):** sema now evaluates `_Static_assert`
+conditions with the full type context, which exposed an internally
+inconsistent `bool33` assertion in `ext_vector_layout.c` (sizeof 5 beside
+alignof 8 is not a representable C layout); the fixture now asserts the
+single coherent power-of-two rule its own `bool17` case follows (8/8).
+Parser/sema/lowering enum layout follows the GCC compatible-type rule
+(widening, packed minimum, struct inheritance) and is byte-identical to the
+system GCC oracle; one-lane FP vectors ride `%xmm0` with integer one-lanes
+in GPRs (AUD-VABI-4), covered by `check_enum_layout_semantics.sh` and
+`check_ext_vector_one_lane_fp.sh`. Remaining: cross-compiler receipts for
+the bit-packed bool rule need a Clang/ICX oracle (unavailable in this
+sandbox; hosted CI lanes are the vehicle).
+
 ### P0.2 — Close unsupported-option acceptance; revalidate wrapped byte-address semantics
 
 **Evidence/source:** archived A14-16 and the accepted-`-fwrapv` byte-address

@@ -162,7 +162,13 @@ fn finish(classes: Option<Vec<Class>>) -> SysvPassing {
                 Integer => EightbyteClass::Integer,
                 Sse => EightbyteClass::Sse,
                 SseUp => EightbyteClass::SseUp,
-                X87 | X87Up | ComplexX87 | Memory => unreachable!("filtered above"),
+                // Defense in depth, not dead code: the X87/X87Up/ComplexX87/
+                // Memory arm above only inspects the classes slice directly.
+                // If a future edit routes a classified-but-unfiltered type
+                // through this mapping (e.g. a union post-merge pass), the
+                // psABI-mandated answer for those classes is memory class —
+                // a panic would take a working compile down with it.
+                X87 | X87Up | ComplexX87 | Memory => EightbyteClass::Memory,
             })
             .collect(),
     };

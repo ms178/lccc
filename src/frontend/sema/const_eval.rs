@@ -58,6 +58,10 @@ pub struct SemaConstEval<'a> {
     pub const_values: Option<&'a FxHashMap<ExprId, IrConst>>,
     /// Pre-computed expression types from bottom-up sema walk.
     pub expr_types: Option<&'a FxHashMap<ExprId, CType>>,
+    /// The TU's builtin policy (the CLI's `-fno-builtin` family): bare
+    /// library spellings must not fold when the policy withdraws them, in
+    /// constant expressions exactly as in static initializers.
+    pub builtin_policy: crate::common::pass_policy::BuiltinFlags,
     /// Set while the initializer of an object with static storage is
     /// evaluated (GCC's `folding_initializer`; the lowerer's flag of the same
     /// name): `__builtin_constant_p` must then answer now, 0 unless proven,
@@ -479,11 +483,26 @@ impl<'a> SemaConstEval<'a> {
                         {
                             return Some(IrConst::I32(0));
                         }
+                        // The same for a block-scope object with static
+                        // storage (a static local): GCC 16.2 answers 0 for
+                        // any object address, and the kernel's
+                        // PIN_GROUP(.mode = __builtin_choose_expr(
+                        // __builtin_constant_p((m)), (m), 0)) needs the 0
+                        // when `m` is a static-local pin array.
+                        if matches!(arg, Expr::Identifier(id, _) if
+                            self.symbols.lookup(id).is_some()
+                                && !self.symbols.is_automatic_object(id))
+                        {
+                            return Some(IrConst::I32(0));
+                        }
                         return None;
                     }
-                    shared_const_eval::eval_builtin_call(name.as_str(), args, &|e| {
-                        self.eval_const_expr(e)
-                    })
+                    shared_const_eval::eval_builtin_call_with_mode(
+                        name.as_str(),
+                        args,
+                        &|e| self.eval_const_expr(e),
+                        self.builtin_policy.may_assume(name.as_str()),
+                    )
                 } else {
                     None
                 }
@@ -622,6 +641,14 @@ impl<'a> SemaConstEval<'a> {
             (CType::Array(a, sa), CType::Array(b, sb)) => {
                 self.ctypes_compatible(a, b) && (sa == sb || sa.is_none() || sb.is_none())
             }
+            // C11 6.7.2.2p4: an enum type is compatible with its compatible
+            // integer type (chosen from the completed definition's value
+            // range), so `typeof(again)` of a body-less `enum tag` reference
+            // answers 1 against `int`/`unsigned int` exactly like GCC —
+            // pointers to the two interchange in both directions.
+            (CType::Enum(e), other) | (other, CType::Enum(e)) if other.is_integer() => {
+                &e.compatible_ctype() == other
+            }
             _ => t1 == t2,
         }
     }
@@ -673,6 +700,7 @@ impl<'a> SemaConstEval<'a> {
             types: self.types,
             functions: self.functions,
             expr_types: self.expr_types,
+            builtin_policy: self.builtin_policy.clone(),
         }
     }
 

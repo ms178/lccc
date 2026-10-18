@@ -633,14 +633,19 @@ impl Lowerer {
             }
             UnaryOp::Neg => {
                 let inner_ct = self.expr_ctype(inner);
-                // Integer-element vector negation: element-wise.  The scalar
-                // path would negate the vector's address (PR 110817 family).
+                // Vector negation (any element kind) is element-wise.  The
+                // scalar path would negate the vector's address, because the
+                // IR represents a by-value vector parameter as Ptr until it
+                // is loaded: `negq %rax` on the alloca address produced a
+                // wild pointer and segfaulted on the reload.  This applied
+                // to integer vectors originally (PR 110817 family) but the
+                // same bug bites float-element ext vectors (`-v` on f64x1
+                // produced `negq %rax` then `mov (%rax), %rax`), so dispatch
+                // ALL vector negation through the elementwise lowering.
+                // BitNot is integer-only by construction and is handled
+                // separately in its own arm.
                 if inner_ct.is_vector() {
-                    if let Some((elem, _)) = inner_ct.vector_info() {
-                        if !elem.is_floating() {
-                            return self.lower_vector_unary(IrUnaryOp::Neg, inner, &inner_ct);
-                        }
-                    }
+                    return self.lower_vector_unary(IrUnaryOp::Neg, inner, &inner_ct);
                 }
                 if inner_ct.is_complex() {
                     let val = self.lower_expr(inner);

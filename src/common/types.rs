@@ -2344,8 +2344,104 @@ impl CType {
     }
 
     /// Whether this is a GCC vector extension type.
+    /// Whether this is a GCC vector extension type.
+    /// SysV AMD64 classification of a VECTOR type, as the pair
+    /// `(eightbyte classes, occupies ONE xmm register)`.
+    ///
+    /// The psABI classifies the FIRST eightbyte of a vector as SSE and every
+    /// further eightbyte as SSEUP -- "the upper half of the same vector
+    /// register" -- which is why `<4 x i32>` occupies exactly ONE `%xmm`
+    /// register while a `{double, double}` struct, whose two eightbytes are
+    /// both plain SSE, takes two.  LCCC already models "one 16-byte XMM" with
+    /// the carrier `_Float128` uses (`is_f128_sse` in the call ABI), so a
+    /// 16-byte vector is described by the same flag.
+    ///
+    /// Returns `None` for anything that is not a vector, and for 32-byte
+    /// vectors, whose SysV treatment (two SSEUP eightbytes in ONE `%ymm`) is a
+    /// per-invocation ABI decision the caller has to make with `-mavx` in
+    /// hand -- returning `None` keeps the existing by-value behaviour there
+    /// instead of promising a convention the backend may not emit.
+    pub fn sysv_vector_carrier(&self) -> Option<(Vec<EightbyteClass>, bool)> {
+        if !self.is_vector() {
+            return None;
+        }
+        // Clang lowers packed `_Bool` ext vectors through an integer carrier
+        // on x86-64 (e.g. ext_vector_type(4) is an i8 argument/return), not an
+        // SSE register. This classification is separate from vector_size.
+        if self.is_bitpacked_bool_vector() {
+            return match self.size() {
+                1..=8 => Some((vec![EightbyteClass::Integer], false)),
+                _ => None,
+            };
+        }
+        // A ONE-element floating-point vector (f32x1/f64x1) is SysV-SSE: it
+        // travels in the low half of ONE xmm register exactly like the scalar
+        // element, matching GCC 16 and Clang 19 same-compiler codegen (the
+        // gate asserts the -O1 chained-call shape end to end). The legacy
+        // INTEGER carrier here was doubly wrong: it diverged from both
+        // oracles, and the backend's missing packed-result spill made
+        // `dadd(did(x), dadd(y, y))` segfault at -O1.  32-bit targets never
+        // reach this classifier (their ext vectors use the GP-word path).
+        if self.elem_is_fp_scalar() {
+            return match self.size() {
+                4 | 8 => Some((vec![EightbyteClass::Sse], false)),
+                _ => None,
+            };
+        }
+        match self.size() {
+            // Smaller than an eightbyte: INTEGER class, carried in the low
+            // bytes of ONE general-purpose register. Measured with both
+            // oracles on x86-64: clang-19 `id_u8x1`/`id_u8x2`/`id_u16x2`/
+            // `id_u32x1` and gcc-16 `vector_size(1,2,4)` shapes all arrive
+            // in %edi and leave in %eax. The old rule classified these as
+            // SSE and LCCC passed them in %xmm0, which no oracle does.
+            1..=4 => Some((vec![EightbyteClass::Integer], false)),
+            // 5..=8: A ONE-lane integer vector (u64x1/i64x1) is SysV-INTEGER
+            // — it arrives in %rdi and returns in %rax, exactly like
+            // uint64_t. GCC 12/16 and Clang agree (the psABI classes an
+            // 8-byte aggregate whose single member is INTEGER as INTEGER;
+            // "one lane" is the trivial one-member aggregate). Without this,
+            // the backend routes a 64-bit integer one-lane through %xmm0 and
+            // emits `movq %xmm0,%rdi; movq %rdi,%xmm0; ret` at every leaf:
+            // three wasted instructions plus a false XMM/GPR dependency
+            // (domain-crossing merge uop). Multi-lane integer vectors
+            // (u32x2, u16x4, ...) stay SSE — they are NOT scalar-carried.
+            5..=8
+                if self
+                    .vector_info()
+                    .is_some_and(|(e, n)| n == 1 && e.is_integer()) =>
+            {
+                Some((vec![EightbyteClass::Integer], false))
+            }
+            // One SSE eightbyte: the low 64 bits of ONE xmm register.
+            5..=8 => Some((vec![EightbyteClass::Sse], false)),
+            // SSE + SSEUP: the full 128 bits of ONE xmm register. An
+            // ext_vector_type(3) object is padded to 16 bytes and still uses a
+            // single %xmm0 (clang-19 `id_u32x3`/`id_f32x3`), so 9..=16 is one
+            // register, not the two-register struct form.
+            9..=16 => Some((vec![EightbyteClass::Sse, EightbyteClass::Sse], true)),
+            _ => None,
+        }
+    }
+
     pub fn is_vector(&self) -> bool {
         matches!(self, CType::Vector(_, _) | CType::ExtVector(_, _))
+    }
+
+    /// Whether this vector's sole element lane is a floating-point scalar
+    /// (float/double), used by the single-lane SSE carrier rules above. Only
+    /// meaningful when `self.is_vector()` is true; returns false for
+    /// multi-lane vectors (their classification is handled by the
+    /// per-eightbyte rules) and for integer vectors.
+    pub fn elem_is_fp_scalar(&self) -> bool {
+        match self {
+            CType::ExtVector(elem, layout) => layout.lanes == 1 && elem.is_floating(),
+            CType::Vector(elem, total_size) => {
+                let es = elem.size();
+                es > 0 && *total_size == es && elem.is_floating()
+            }
+            _ => false,
+        }
     }
 
     /// Whether this is a bit-packed bool ext-vector. `vector_size` types are
