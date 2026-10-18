@@ -1723,6 +1723,26 @@ impl Lowerer {
         is_inc: bool,
         return_new: bool,
     ) -> Operand {
+        // `discard_expr_result` reaches here set only when this inc/dec is
+        // the discarded top-level expression (`lower_expr_unmaterialized`).
+        // It describes this expression alone: the operand's subexpressions
+        // still need their values, so it is cleared while the operand is
+        // lowered. Otherwise the `p++` in `(p++)->w++;` also took the
+        // discarded-result path, yielded the incremented pointer, and the
+        // increment landed in the next element.
+        let discard = std::mem::replace(&mut self.discard_expr_result, false);
+        let result = self.lower_inc_dec_operand(inner, is_inc, return_new, discard);
+        self.discard_expr_result = discard;
+        result
+    }
+
+    fn lower_inc_dec_operand(
+        &mut self,
+        inner: &Expr,
+        is_inc: bool,
+        return_new: bool,
+        discard: bool,
+    ) -> Operand {
         if let Some(result) = self.try_lower_bitfield_inc_dec(inner, is_inc, return_new) {
             return result;
         }
@@ -1735,7 +1755,7 @@ impl Lowerer {
         // of 0xffff).
         let inner_ct = self.expr_ctype(inner);
         if inner_ct.is_vector() {
-            return self.lower_vector_inc_dec(inner, is_inc, return_new, &inner_ct);
+            return self.lower_vector_inc_dec(inner, is_inc, return_new, discard, &inner_ct);
         }
 
         let ty = self.get_expr_type(inner);
@@ -1792,7 +1812,7 @@ impl Lowerer {
             }
             // A discarded result needs no old value.  Otherwise the pre-update
             // load is exactly the value required by C post-inc/dec semantics.
-            if self.discard_expr_result {
+            if discard {
                 return store_op;
             }
             return Operand::Value(loaded_val);
@@ -1812,6 +1832,7 @@ impl Lowerer {
         inner: &Expr,
         is_inc: bool,
         return_new: bool,
+        discard: bool,
         vec_ct: &CType,
     ) -> Operand {
         let (elem_ct, num_elems) = match vec_ct.vector_info() {
@@ -1843,7 +1864,7 @@ impl Lowerer {
         let seg = self.lvalue_addr_space(&lv);
         let base = self.lvalue_addr(&lv);
 
-        let old_copy = if !return_new && !self.discard_expr_result {
+        let old_copy = if !return_new && !discard {
             let old_alloca =
                 self.emit_entry_alloca(IrType::Ptr, total_size, self.ctype_align(vec_ct), false);
             self.zero_init_alloca(old_alloca, total_size);
