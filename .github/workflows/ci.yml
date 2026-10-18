@@ -832,10 +832,10 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_enum_tag_scope_compat.sh
     - name: Enum layout semantics (widening, packed, struct inheritance, static asserts)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_enum_layout_semantics.sh
-    - name: One-lane FP vector ABI (AUD-VABI-4)
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_one_lane_fp.sh
     - name: Ext-vector rvalue subscript cross-ABI
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_rvalue_subscript.sh
+    - name: One-lane FP vector ABI (AUD-VABI-4)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_one_lane_fp.sh
     - name: Embedded-NUL strlen contract
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_strlen_embedded_nul.sh
     # Enum/enumerator types and `_Alignas(type)` member layout, on x86-64 and

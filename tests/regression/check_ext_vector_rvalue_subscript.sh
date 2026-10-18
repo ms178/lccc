@@ -43,8 +43,14 @@ for bits in 64 32; do
         for p in "${!compilers[@]}"; do
             for c in "${!compilers[@]}"; do
                 "$ccc" "${link_flags[@]}" "$work/provider$p.o" "$work/caller$c.o" -o "$work/test"
-                if ! "$work/test"; then
-                    echo "FAIL: rvalue subscript m$bits $opt provider=$p caller=$c" >&2
+                rc=0
+                "$work/test" || rc=$?
+                if [[ $rc != 0 ]]; then
+                    detail="rvalue subscript m$bits $opt provider=$p caller=$c status=$rc (shape=$(((rc-1)/4+1)), consumer=$(((rc-1)%4+1)))"
+                    echo "FAIL: $detail" >&2
+                    if [[ ${GITHUB_ACTIONS:-} == true ]]; then
+                        echo "::error title=Vector rvalue cross-ABI::$detail"
+                    fi
                     exit 1
                 fi
             done

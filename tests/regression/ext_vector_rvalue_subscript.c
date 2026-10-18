@@ -35,19 +35,21 @@ static int calls;
 static int index_value;
 static int index_once(void) { ++calls; return index_value; }
 #define CHECK(name, elem, lanes, value) do { \
+    ++shape; \
     name (*volatile fp)(void) = make_##name; \
     for (int i = 0; i < lanes; ++i) { \
         index_value = i; \
         calls = 0; \
-        if (make_##name()[index_once()] != value || calls != 1) return 1; \
+        if (make_##name()[index_once()] != value || calls != 1) return 4 * (shape - 1) + 1; \
         calls = 0; \
-        if (fp()[index_once()] != value || calls != 1) return 2; \
+        if (fp()[index_once()] != value || calls != 1) return 4 * (shape - 1) + 2; \
         calls = 0; \
-        if ((++calls, make_##name())[i] != value || calls != 1) return 3; \
-        if (({ make_##name(); })[i] != value) return 4; \
+        if ((++calls, make_##name())[i] != value || calls != 1) return 4 * (shape - 1) + 3; \
+        if (({ make_##name(); })[i] != value) return 4 * (shape - 1) + 4; \
     } \
 } while (0);
 int main(void) {
+    int shape = 0;
     SHAPES(CHECK)
     return 0;
 }
