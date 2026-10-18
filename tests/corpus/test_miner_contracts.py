@@ -12,8 +12,6 @@ Run:  python3 -m unittest tests/corpus/test_miner_contracts.py
 from __future__ import annotations
 
 import importlib.util
-import json
-import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -56,7 +54,7 @@ class TranslatorTest(unittest.TestCase):
         # Every EDG_TO_GCC value must be non-empty or explicitly listed as
         # an acknowledged no-op; unknown switches land in `untranslated`.
         gcc, arch, untr = mmod.translate_options("--microsoft --gnu_version")
-        self.assertTrue(tr := untr or gcc)  # something is visible either way
+        self.assertTrue(untr or gcc)  # something is visible either way
         self.assertIn("--microsoft", untr)
 
     def test_last_standard_flag_wins_per_set(self):

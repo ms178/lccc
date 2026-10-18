@@ -27,12 +27,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 import statistics
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -95,7 +93,6 @@ def pair_ratio(pgo_values: list[float], plain_values: list[float], seed: int) ->
     n = min(len(pgo_values), len(plain_values))
     if n < 2:
         return None
-    rng = random.Random(seed)
     ratios = []
     for i in range(n):
         # Paired within a round; tiny eps to avoid div-by-zero.

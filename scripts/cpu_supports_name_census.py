@@ -38,7 +38,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor

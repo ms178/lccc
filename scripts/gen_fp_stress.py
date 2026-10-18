@@ -48,7 +48,7 @@ def gen(seed: int) -> str:
         kind = r.randint(0, 5)
         if kind == 0:  # hoist-friendly: many reads of the same const
             ci = r.randrange(len(consts))
-            t = r.choice(["double","float"])
+            r.choice(["double","float"])  # draw kept: the seeded stream fixes the corpus bytes
             loop = r.randint(20, 400)
             w(f"    double s_{_} = 0.0;")
             w(f"    for (int k{_} = 0; k{_} < {loop}; k{_}++) {{ s_{_} += v{r.randrange(6)} * c{ci}; if (k{_} & 1) s_{_} -= c{ci} * 0.5; }}")

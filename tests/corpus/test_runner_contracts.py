@@ -7,7 +7,6 @@ replaced by strict v2 behavioral contracts rather than preserving false PASS.
 """
 import copy
 import importlib.util
-import json
 from pathlib import Path
 import subprocess
 import sys

@@ -15,7 +15,6 @@ import struct, sys
 def probe(path):
     d = open(path,'rb').read()
     assert d[:4]==b'\x7fELF'
-    is64 = d[4]==2
     e_shoff, = struct.unpack_from('<Q', d, 0x28)
     e_shentsize, e_shnum, e_shstrndx = struct.unpack_from('<HHH', d, 0x3A)
     secs=[]
@@ -33,7 +32,6 @@ def probe(path):
             n=s['size']//24
             locals_=0
             strtab=secs[s['link']]
-            sd=d[strtab['off']:strtab['off']+strtab['size']]
             types={}
             for k in range(n):
                 o=s['off']+k*24

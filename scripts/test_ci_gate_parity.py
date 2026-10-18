@@ -45,6 +45,7 @@ from __future__ import annotations
 from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
+import importlib
 import tempfile
 import unittest
 
@@ -541,7 +542,7 @@ class StepSemanticsGuardTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        import yaml  # noqa: F401  (the checker requires it anyway)
+        importlib.import_module("yaml")  # the checker requires PyYAML
         cls.dir = tempfile.TemporaryDirectory()
         cls.wf = Path(cls.dir.name) / "ci.yml"
 
@@ -771,7 +772,7 @@ class QuoteAwareCommentStrippingTest(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        import yaml  # noqa: F401  (the checker requires it anyway)
+        importlib.import_module("yaml")  # the checker requires PyYAML
         self._dir = tempfile.TemporaryDirectory()
         self.wf = Path(self._dir.name) / "ci.yml"
         self.addCleanup(self._dir.cleanup)
@@ -862,7 +863,7 @@ class StructuredHostedDiagnosticsTest(unittest.TestCase):
                   "--lccc target/fastbuild/lccc-x86")
 
     def setUp(self) -> None:
-        import yaml  # noqa: F401  (the checker requires it anyway)
+        importlib.import_module("yaml")  # the checker requires PyYAML
         self._dir = tempfile.TemporaryDirectory()
         self.wf = Path(self._dir.name) / "ci.yml"
         self.addCleanup(self._dir.cleanup)
@@ -946,7 +947,7 @@ class WorkflowTriggerSemanticsTest(unittest.TestCase):
     )
 
     def setUp(self) -> None:
-        import yaml  # noqa: F401  (the checker requires it anyway)
+        importlib.import_module("yaml")  # the checker requires PyYAML
         self._dir = tempfile.TemporaryDirectory()
         self.wf = Path(self._dir.name) / "ci.yml"
         self.addCleanup(self._dir.cleanup)

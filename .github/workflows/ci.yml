@@ -568,6 +568,12 @@ jobs:
         set -o pipefail
         env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_varargs_abi.sh 2>&1 |
           tee "$RUNNER_TEMP/ext-vector-varargs-abi.log"
+    - name: One-lane ext_vector caller-side marshalling (-O0/-O1/-O2)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_callsite_abi.sh
+    - name: One-lane ext_vector FP/int carrier correctness
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_lane1_abi.sh
+    - name: Narrow one-lane ext_vector arithmetic and small-slot A/B
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_narrow_arith.sh
     - name: Memory value forwarding and predicate effect contracts
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_memory_value_contracts.sh
     - name: Audit loop branch and must-execute contracts

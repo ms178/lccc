@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Compiler-free real Python subprocess budgets and publication fault tests."""
-import os
 from pathlib import Path
 import sys
 import tempfile

@@ -137,6 +137,10 @@ def split_flags_for_gcc(flags: str, src: str) -> list[str]:
     words = flags.split()
     libs = [w for w in words if w.startswith(("-l", "-Wl,"))]
     rest = [w for w in words if not w.startswith(("-l", "-Wl,"))]
+    # GCC's -m32 reference executables are linked non-PIE to match lccc's
+    # non-PIE -m32 output (like-for-like; default-PIE -m32 also runs here).
+    if "-m32" in rest and "-no-pie" not in rest:
+        rest.append("-no-pie")
     return [*rest, src, *libs]
 
 
@@ -514,7 +518,6 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.monotonic()
 
     def report(res: Result) -> None:
-        nonlocal passed
         mark = {
             "pass": color(GRN, "PASS"),
             "fail": color(RED, "FAIL"),

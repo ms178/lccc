@@ -288,7 +288,7 @@ class EncDiffSemanticTests(unittest.TestCase):
         wrapped_near = objdump_listing(
             "   0:\t2e 3e 26 36 2e 3e e9 \tjmp    0x6",
             "   7:\t00 ")
-        short = objdump_listing("   0:\t74 02                \tje     0x2")
+        objdump_listing("   0:\t74 02                \tje     0x2")
         # (Same-transfer check is exercised through real rows elsewhere;
         # here the pin is that the wrapped listing itself is admissible
         # evidence — the old parser skipped its continuation line and

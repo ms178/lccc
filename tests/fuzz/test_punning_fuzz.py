@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import random
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -87,6 +88,17 @@ class GeneratorShape(unittest.TestCase):
         for seed in range(300):
             for ops in pf.gen_case(seed).bodies:
                 for op in ops:
+                    if op.kind in pf.BIT_KINDS:
+                        width, pos, _ = pf.BIT_FIELDS[op.ty]
+                        self.assertLessEqual(pos + width, 32, (seed, op))  # one 32-bit unit
+                        continue
+                    if op.kind == "pcopy":
+                        self.assertLessEqual(pf.PAD_SIZE, pf.OBJECT_SIZE, (seed, op))
+                        continue
+                    if op.kind in pf.PAD_KINDS:
+                        off, ty = pf.PAD_FIELDS[op.ty]
+                        self.assertLessEqual(off + pf.TYPES[ty][0], pf.PAD_SIZE, (seed, op))
+                        continue
                     size = pf.TYPES[op.ty][0]
                     self.assertLessEqual(op.off + size, pf.OBJECT_SIZE, (seed, op))
                     if op.kind in ("uset", "uget"):
@@ -95,6 +107,37 @@ class GeneratorShape(unittest.TestCase):
     def test_model_output_format(self):
         out = pf.run_model(pf.gen_case(5))
         self.assertRegex(out, r"^[0-9a-f]{16} [0-9a-f]{16}\n$")
+
+    def test_bitfield_store_load_matches_packed_layout(self):
+        mem = bytearray(pf.OBJECT_SIZE)
+        pf.bf_set(mem, 3, 7, 0x7F)          # field b (signed, bits 3..9) = all ones
+        self.assertEqual(pf.bf_get(mem, "b"), -1)
+        self.assertEqual(pf.bf_get(mem, "a"), 0)
+        self.assertEqual(pf.bf_get(mem, "c"), 0)
+        pf.bf_set(mem, 0, 3, 5)             # neighbour store keeps b intact
+        self.assertEqual((pf.bf_get(mem, "a"), pf.bf_get(mem, "b")), (5, -1))
+
+    def test_bitfield_store_truncates_to_width(self):
+        mem = bytearray(pf.OBJECT_SIZE)
+        pf.bf_set(mem, 10, 14, (1 << 14) + 7)   # field c: modular, keeps low 14 bits
+        self.assertEqual(pf.bf_get(mem, "c"), 7)
+        pf.bf_set(mem, 3, 7, 0x80)              # 0x80 truncated to 7 bits is 0 -> b == 0
+        self.assertEqual(pf.bf_get(mem, "b"), 0)
+        self.assertEqual(pf.bf_get(mem, "c"), 7)
+        pf.bf_set(mem, 3, 7, 0xFF)              # 0xFF truncated to 7 bits is 0x7F -> -1
+        self.assertEqual(pf.bf_get(mem, "b"), -1)
+
+    def test_padding_bytes_are_never_read(self):
+        padding = set(range(pf.PAD_SIZE)) - {
+            b for off, ty in pf.PAD_FIELDS.values() for b in range(off, off + pf.TYPES[ty][0])}
+        self.assertEqual(padding, {1, 2, 3, 11})
+        for seed in range(300):
+            for ops in pf.gen_case(seed).bodies:
+                for op in ops:
+                    if op.kind in pf.PAD_KINDS and op.kind != "pcopy":
+                        off, ty = pf.PAD_FIELDS[op.ty]
+                        self.assertEqual(op.off, off)
+                        self.assertFalse(set(range(off, off + pf.TYPES[ty][0])) & padding)
 
 
 @unittest.skipUnless(shutil.which("gcc"), "gcc not available")
@@ -109,6 +152,24 @@ class ModelAgreesWithGcc(unittest.TestCase):
                     result = pf.one_case(pf.Job(seed, "gcc", level, "base", out, 60))
                     self.assertEqual(result.status, "pass",
                                      f"seed {seed} -{level}: {result.detail}")
+
+    def test_padded_struct_layout_matches_gcc(self):
+        # C cannot take the offset of a bit-field, so bit positions are covered by
+        # the corpus itself; the byte layout of struct pad is checked directly.
+        probe = pf.UNION_DEF.split("union cell")[0] + (
+            "#include <stddef.h>\n#include <stdio.h>\n"
+            "int main(void) {\n"
+            "  printf(\"%zu %zu %zu %zu %zu %zu\\n\", sizeof(struct pad),"
+            " offsetof(struct pad, a), offsetof(struct pad, b),"
+            " offsetof(struct pad, c), offsetof(struct pad, d), sizeof(struct bits));\n"
+            "  return 0;\n}\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            src, exe = Path(tmp) / "probe.c", Path(tmp) / "probe"
+            src.write_text("#include <stdint.h>\n" + probe)
+            subprocess.run(["gcc", "-w", str(src), "-o", str(exe)], check=True, timeout=60)
+            got = subprocess.run([str(exe)], capture_output=True, text=True, check=True).stdout.split()
+        want = [pf.PAD_SIZE] + [pf.PAD_FIELDS[k][0] for k in "abcd"] + [4]
+        self.assertEqual([int(x) for x in got], want)
 
     def test_v3_lane_matches_gcc(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -12,7 +12,6 @@ import hashlib
 import json
 import lzma
 from pathlib import Path
-import subprocess
 import tarfile
 
 import lccc_recover as recovery

@@ -1,5 +1,4 @@
 """Client-controlled regions: STOP can reset summary, not file cost totals."""
-import importlib.util
 from pathlib import Path
 import sys
 import tempfile

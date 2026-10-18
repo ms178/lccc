@@ -76,7 +76,6 @@ mode and is skipped, not passed, when the cross-binutils are absent.
 from __future__ import annotations
 
 import argparse
-import os
 import re
 import shutil
 import subprocess

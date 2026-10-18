@@ -1,6 +1,5 @@
 """Adversarial scalar, lifecycle and matcher tests added after native audit."""
 from pathlib import Path
-import math
 import sys
 import tempfile
 import time
@@ -9,7 +8,7 @@ from unittest import mock
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
-from tools.corpus import diagnostics, process, publication, schema
+from tools.corpus import process, publication, schema
 
 
 class ScalarBoundaryTests(unittest.TestCase):

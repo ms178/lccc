@@ -2858,7 +2858,7 @@ int main(void){ g_bss = s_fn() + g_tls; printf("%d\n", g_bss); return 0; }
             parts = line.split()
             if len(parts) < 8 or not parts[0].endswith(":"):
                 continue
-            value, styp, ndx, nm = parts[1], parts[3], parts[6], parts[7]
+            value, _, ndx, nm = parts[1], parts[3], parts[6], parts[7]
             if nm not in ("g_data", "g_ro", "g_bss", "main", "s_fn"):
                 continue
             if not ndx.isdigit():
@@ -4570,7 +4570,7 @@ def _eh_frame_packing_test(args, oracles):
             if tag == "lccc":
                 os.rename(os.path.join(td, "libehp.so"), os.path.join(td, "libehp.lccc.so"))
         for kind in ("exe", "lib"):
-            (lc, lf, lz), (bc, _bf, _bz) = counts["lccc"][kind], counts["bfd"][kind]
+            (lc, lf, lz), (bc, _, _) = counts["lccc"][kind], counts["bfd"][kind]
             if lz != 1:
                 return Result(name, "FAIL", f"{kind}: {lz} ZERO terminators, want exactly 1")
             if lf == 0 or lc > bc:
@@ -5354,7 +5354,7 @@ def _gotpcrel_edges_test(args, oracles):
                 if run.returncode != 0 or run.stdout.decode() != want:
                     return Result(name, "FAIL",
                                   f"{mode}/{tag}: got {run.stdout.decode()!r} rc {run.returncode}")
-            img = f"libe.lccc.so" if mode == "-shared" else f"t{mode}.lccc"
+            img = "libe.lccc.so" if mode == "-shared" else f"t{mode}.lccc"
             pic = mode != "-no-pie"
             path = os.path.join(td, img)
             with open(path, "rb") as f:
@@ -6894,7 +6894,6 @@ def _gnu_hash_sizing_test(args, oracles):
         d = open(so, "rb").read()
         shdrs = _elf_bytes_shdrs(d)
         gh = None
-        dynsym = dynstr = None
         sec_data = {}
         for h in shdrs:
             o, s = h[4], h[5]
@@ -6930,7 +6929,6 @@ def _gnu_hash_sizing_test(args, oracles):
         bloom_off = 16
         buckets_off = bloom_off + bloom_size * 8
         chains_off = buckets_off + nbuckets * 4
-        nsym = len(syms) // 24
         def lookup(want):
             h = gnu_hash(want)
             w_idx = (h // 64) & (bloom_size - 1)
@@ -8019,6 +8017,8 @@ def _cxx_eh_test(args, oracles):
             return Result(name, "FAIL", f"lccc link failed: {r.stderr.decode()[:300]}")
         code, out = run_bin(os.path.join(td, "ex.lccc"), [], td)
         r2 = sh([CXX, "ex.o", "-o", "ex.ref"], cwd=td)
+        if r2.returncode != 0:
+            return Result(name, "FAIL", f"reference link failed: {r2.stderr.decode()[:300]}")
         code2, out2 = run_bin(os.path.join(td, "ex.ref"), [], td)
         if (code, out) != (code2, out2):
             return Result(name, "FAIL",
@@ -11328,8 +11328,16 @@ def main():
     # caller-supplied relative path anchored to the invocation directory.
     args.lccc = os.path.abspath(os.path.expanduser(args.lccc))
 
-    have_mold = shutil.which("mold") is not None
     have_wild = shutil.which("wild") is not None
+    # mold is probed FUNCTIONALLY for the same reason as lld below: a `mold`
+    # binary on PATH without the `ld.mold` driver link (`gcc -fuse-ld=mold`
+    # then dies with "cannot find 'ld'") is not an oracle. Counting it as one
+    # made the reloc_pc32_out_of_range checks report one opinion of two.
+    have_mold = (
+        shutil.which("mold") is not None
+        and shutil.which(CC) is not None
+        and sh([CC, "-fuse-ld=mold", "-Wl,--version"]).returncode == 0
+    )
     # `lld` must be probed FUNCTIONALLY, not just present: the suite's whole
     # point on the script-path fixture is a second opinion, and `ld.lld` being
     # on PATH does not mean this gcc accepts `-fuse-ld=lld` (a cross toolchain
@@ -11802,8 +11810,6 @@ def run_case(c, args, oracles):
 
         inputs = c.link_inputs if c.link_inputs else objs
         # drop archive-only fixture objects from default input list
-        outputs = {}
-
         # --- lccc link ---
         lccc_out = os.path.join(td, "out.lccc")
         r = link_with([args.lccc], inputs, "out.lccc",
@@ -11905,7 +11911,7 @@ def run_case(c, args, oracles):
                 addrs = {vals[n] for n in group}
                 if len(addrs) != 1:
                     return Result(c.name, "FAIL",
-                        f"symbols not folded onto one address: "
+                        "symbols not folded onto one address: "
                         + ", ".join(f"{n}={vals[n]:#x}" for n in group))
         if c.expect_distinct_addresses is not None:
             vals = sym_values(lccc_out)
@@ -11920,7 +11926,7 @@ def run_case(c, args, oracles):
                 addrs = [vals[n] for n in group]
                 if len(set(addrs)) != len(addrs):
                     return Result(c.name, "FAIL",
-                        f"symbols wrongly folded onto one address: "
+                        "symbols wrongly folded onto one address: "
                         + ", ".join(f"{n}={vals[n]:#x}" for n in group))
         if c.expect_dyn_has is not None or c.expect_dyn_missing is not None:
             tags, _ = dyn_tag_map(lccc_out)

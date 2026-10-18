@@ -1,6 +1,5 @@
 """Reject unspecified representation bytes as cross-vendor correctness data."""
 from pathlib import Path
-import re
 import subprocess
 import sys
 import tempfile

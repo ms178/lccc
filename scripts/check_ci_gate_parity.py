@@ -478,7 +478,7 @@ ENCDIFF_SUITE_ENV = (
 # multilib and the kernel relocs tool.
 LINKER_ENV = (
     "LCCC_TEST_ASSEMBLER=$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as",
-    f"PATH=$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH",
+    "PATH=$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH",
     "LCCC_REQUIRE_I386=1",
     "LCCC_RELOCS_TOOL=$HOME/.cache/lccc-kernel-tools/bin/relocs",
 )
@@ -871,7 +871,6 @@ def _unique_keys(loader, node, deep=False):
     A checker built on a silently-collapsing parse is a checker that can be
     fed a different file than the one it printed — refuse instead.
     """
-    import yaml
     mapping = {}
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)

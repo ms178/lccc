@@ -59,7 +59,6 @@ census is printed so it can be burned down deliberately.
 from __future__ import annotations
 
 import re
-import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -170,7 +169,7 @@ def main() -> int:
     total = sum(len(v) for v in bad.values())
 
     if "--census" in args:
-        print(f"  repo-wide census (CI set + helper scripts):")
+        print("  repo-wide census (CI set + helper scripts):")
         all_sh = sorted(set(ROOT.glob("tests/**/*.sh")) | set(ROOT.glob("scripts/*.sh")) | set(ROOT.glob("tools/**/*.sh")))
         c = census(all_sh)
         for f, v in sorted(c.items(), key=lambda kv: -len(kv[1])):

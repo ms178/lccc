@@ -230,7 +230,7 @@ def main() -> int:
     to = sum(v["oracle"] for v in per_class.values())
     print(f"\ntotal instructions: lccc={tl}  {a.oracle}={to}  delta={tl - to:+d} ({100.0 * (tl - to) / max(to, 1):+.1f}%)")
 
-    print(f"\n== worst translation units by instruction delta ==")
+    print("\n== worst translation units by instruction delta ==")
     print(f"{'TU':<24}{'lccc':>8}{a.oracle:>8}{'delta':>8}")
     for name, v in sorted(per_class.items(), key=lambda kv: kv[1]["oracle"] - kv[1]["lccc"])[:12]:
         print(f"{name:<24}{v['lccc']:>8}{v['oracle']:>8}{v['lccc'] - v['oracle']:>+8}")

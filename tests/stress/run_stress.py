@@ -45,11 +45,10 @@ Oracle disagreements do not affect the exit status but are listed.
 from __future__ import annotations
 
 import argparse
+import importlib
 import concurrent.futures as futures
 import json
-import os
 import random
-import re
 import shutil
 import signal
 import subprocess
@@ -69,9 +68,9 @@ if SCRIPTS.is_dir():
     sys.path.insert(0, str(SCRIPTS))
 
 import families  # noqa: E402
-from families import Case, Param  # noqa: E402
+from families import Case  # noqa: E402
 import abi_family  # noqa: E402
-import peephole_families  # noqa: E402,F401  (registers the peephole family set)
+importlib.import_module("peephole_families")  # registers the peephole family set
 
 DEFAULT_LCCC = REPO / "target" / "fastbuild" / "lccc"
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Static code-quality comparison: lccc-i686 vs gcc -m32 -O2 per benchmark TU."""
-import os, re, subprocess, sys, glob
+import os, re, subprocess, glob
 REPO="/home/user/lccc"; L=os.path.join(REPO,"target/fastbuild/lccc-i686")
 INSN=re.compile(r"^\s+[a-z][a-z0-9]*\b")
 def count(path):

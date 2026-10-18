@@ -7,7 +7,6 @@ the write syscall; both binaries run under qemu-aarch64-static.
 Usage: aarch64_fuzz.py --ccc path/to/lccc-arm [--seeds 0:40] [--levels O2,Os]
 """
 import argparse
-import os
 import random
 import subprocess
 import sys

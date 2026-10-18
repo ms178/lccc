@@ -28,7 +28,6 @@ import argparse
 import json
 import re
 import subprocess
-import sys
 from collections import defaultdict
 
 HDR = re.compile(r"^([a-z]{2,3})=\((\d+)\)\s*(.*)$")

@@ -61,7 +61,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools.corpus import process
-import time
 
 
 #: Options whose value may legitimately start with a dash (compiler flags).

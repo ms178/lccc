@@ -66,7 +66,7 @@ def gen_c(seed: int) -> str:
         ])
         lines.append(f"  u32 {v} = {expr};")
     lines.append("  g_x = (u32)seed;")
-    lines.append(f"  for (i32 i = 0; i < (iter & 15) + 2; i++) {{")
+    lines.append("  for (i32 i = 0; i < (iter & 15) + 2; i++) {{")
     lines.append(f"    g_arr[i & 15] = g_arr[(i + 3) & 15] + {vars_[0]} + (u32)i;")
     body_ops = rng.randint(4, 10)
     for _ in range(body_ops):

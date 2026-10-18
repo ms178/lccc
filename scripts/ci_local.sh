@@ -358,6 +358,17 @@ gate "ext-vector-varargs-abi" fast \
 gate "ext-vector-abi-avx" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_abi_avx.sh
 
+# One-lane ext_vector carriers: caller-side marshalling (register class and
+# width at -O0/-O1/-O2), FP/int lane-1 carrier correctness, and narrow
+# add/sub/mul/neg with signedness, A/B across the small-slot configuration.
+# These were orphaned (not wired into any gate) until this entry.
+gate "ext-vector-callsite-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_callsite_abi.sh
+gate "ext-vector-lane1-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_lane1_abi.sh
+gate "ext-vector-narrow-arith" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_narrow_arith.sh
+
 gate "a9987-salvage" fast \
     env CCC="$LCCC" bash tests/regression/check_a9987_salvage.sh
 

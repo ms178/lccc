@@ -40,7 +40,12 @@ and reloaded as bit patterns, with the exponent forced finite so no NaN payload
 semantics are exercised), and `__int128` / `unsigned __int128` (16 bytes, hashed
 as two 64-bit words).  Lanes: `base` (the default target) and `v3`
 (`-march=x86-64-v3`, the AVX2/BMI2 tuning the CPU model selects on modern hosts).
-Not covered yet: bit-fields and struct padding (see the T7 follow-up record).
+Bit-fields (`struct bits`: four fields packed LSB-first into one 32-bit unit,
+signed and unsigned, widths 3/7/14/8) and padded structs (`struct pad`: u8, u32,
+i16, u8 with 3 + 1 padding bytes) are covered as members of the union.  The
+layouts are fixed x86-64 SysV facts that GCC, Clang and ICX share; padding
+bytes are never read (their value is unspecified), and whole-struct copies only
+read members of the copy.  The GCC self-check verifies the layout model.
 
 Usage:
   punning_fuzz.py --ccc gcc --seeds 0:200 --levels O0,O2 --jobs 2 --out /tmp/p  # model self-check
@@ -80,13 +85,25 @@ TYPES = {
 }
 FLOAT_TYPES = {"f32": 4, "f64": 8}  # name -> size; values are bit patterns
 OBJECT_SIZE = 16  # bytes in `union cell` (large enough for the 128-bit members)
-SETTERS = ("uset", "mset", "rawset")
+SETTERS = ("uset", "mset", "rawset", "bset", "pset")
+# Bit-field layout of `struct bits` (C order, LSB-first in one 32-bit unit):
+# name -> (width, bit position, signed).  Positions are 0, 3, 10, 24.
+BIT_FIELDS = {"a": (3, 0, False), "b": (7, 3, True), "c": (14, 10, False), "d": (8, 24, False)}
+# Member layout of `struct pad` (byte offsets, x86-64 SysV): name -> (offset, type).
+# Bytes 1..3 and 11 are padding and are never read.
+PAD_FIELDS = {"a": (0, "u8"), "b": (4, "u32"), "c": (8, "i16"), "d": (10, "u8")}
+PAD_SIZE = 12
+BIT_KINDS = ("bset", "bget")
+PAD_KINDS = ("pset", "pget", "pcopy")
 MASK128 = (1 << 128) - 1
 LANES = {"base": [], "v3": ["-march=x86-64-v3"]}
 
 UNION_DEF = """\
+struct bits { unsigned a : 3; int b : 7; unsigned c : 14; unsigned d : 8; };
+struct pad { uint8_t a; uint32_t b; int16_t c; uint8_t d; };
 union cell {
   unsigned char raw[16];
+  struct bits bf;   struct pad pd;
   uint8_t u8[16];   int8_t i8[16];
   uint16_t u16[8];  int16_t i16[8];
   uint32_t u32[4];  int32_t i32[4];
@@ -162,6 +179,28 @@ def store_bits(x: int, ty: str) -> int:
     return finite_bits(v, ty) if ty in FLOAT_TYPES else v
 
 
+def bf_set(mem: bytearray, pos: int, width: int, x: int) -> None:
+    """Store `x` into a bit-field: read-modify-write of the 32-bit unit at offset 0.
+
+    The assigned value is truncated to the field width (modular, as GCC, Clang
+    and ICX do for in-range-representable and out-of-range signed bit-fields
+    alike), and the neighbouring bits of the unit are preserved.
+    """
+    unit = int.from_bytes(bytes(mem[0:4]), "little")
+    field = ((1 << width) - 1) << pos
+    unit = (unit & ~field & 0xFFFFFFFF) | ((x << pos) & field)
+    mem[0:4] = unit.to_bytes(4, "little")
+
+
+def bf_get(mem: bytearray, name: str) -> int:
+    """Load a bit-field: sign-extended from its width when it is signed."""
+    width, pos, signed = BIT_FIELDS[name]
+    v = (int.from_bytes(bytes(mem[0:4]), "little") >> pos) & ((1 << width) - 1)
+    if signed and v >> (width - 1):
+        v -= 1 << width
+    return v
+
+
 def load_words(data: bytes, ty: str) -> list[int]:
     """64-bit words a typed load hashes, matching the C side.
 
@@ -198,7 +237,20 @@ def gen_case(seed: int) -> Case:
     for _ in range(2):
         ops: list[Op] = []
         for _ in range(r.randint(8, 24)):
-            kind = r.choice(["uset", "uget", "mset", "mget", "rawset", "rawget"])
+            kind = r.choice(["uset", "uget", "mset", "mget", "rawset", "rawget",
+                             *BIT_KINDS, *PAD_KINDS])
+            if kind in BIT_KINDS:
+                # ty is the bit-field name; off is its bit position (not a byte offset)
+                ty = r.choice(list(BIT_FIELDS))
+                ops.append(Op(kind, ty, BIT_FIELDS[ty][1], r.randrange(0, 41)))
+                continue
+            if kind == "pcopy":
+                ops.append(Op(kind, "pd", 0, r.randrange(0, 41)))
+                continue
+            if kind in PAD_KINDS:
+                ty = r.choice(list(PAD_FIELDS))
+                ops.append(Op(kind, ty, PAD_FIELDS[ty][0], r.randrange(0, 41)))
+                continue
             if kind == "rawset" or kind == "rawget":
                 ty = "u8"
                 off = r.randrange(OBJECT_SIZE)
@@ -230,10 +282,30 @@ def run_model(case: Case) -> str:
             for ops in case.bodies:
                 mem = mems[mem_name]
                 for op in ops:
-                    size = TYPES[op.ty][0]
                     if op.kind in SETTERS:
                         # Only stores advance the value stream (see emit_op).
                         s = (s * LCG_A + LCG_C) & MASK64
+                    if op.kind == "bset":
+                        width, pos, _ = BIT_FIELDS[op.ty]
+                        bf_set(mem, pos, width, s >> op.shift)
+                        continue
+                    if op.kind == "bget":
+                        h = mix(h, bf_get(mem, op.ty))
+                        continue
+                    if op.kind in ("pset", "pget"):
+                        off, pty = PAD_FIELDS[op.ty]
+                        psize = TYPES[pty][0]
+                        if op.kind == "pset":
+                            mem[off:off + psize] = encode(store_bits(s >> op.shift, pty), psize)
+                        else:
+                            h = mix(h, decode(bytes(mem[off:off + psize]), pty) & MASK64)
+                        continue
+                    if op.kind == "pcopy":
+                        # `struct pad t = *c; t.b` reads the copy's member b only.
+                        off, pty = PAD_FIELDS["b"]
+                        h = mix(h, decode(bytes(mem[off:off + TYPES[pty][0]]), pty))
+                        continue
+                    size = TYPES[op.ty][0]
                     if op.kind in ("uset", "mset"):
                         val = store_bits(s >> op.shift, op.ty)
                         mem[op.off:op.off + size] = encode(val, size)
@@ -252,10 +324,21 @@ def run_model(case: Case) -> str:
 # --------------------------------------------------------------------------
 
 def emit_op(op: Op) -> str:
+    head = "  s = s * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);"
+    if op.kind == "bset":
+        return f"{head}\n  c->bf.{op.ty} = (unsigned)(s >> {op.shift});"
+    if op.kind == "bget":
+        return f"  h = mix(h, (uint64_t)c->bf.{op.ty});"
+    if op.kind == "pset":
+        return f"{head}\n  c->pd.{op.ty} = ({TYPES[PAD_FIELDS[op.ty][1]][2]})(s >> {op.shift});"
+    if op.kind == "pget":
+        return f"  h = mix(h, (uint64_t)c->pd.{op.ty});"
+    if op.kind == "pcopy":
+        return ("  { struct pad t; memcpy(&t, &c->pd, sizeof t);"
+                " h = mix(h, (uint64_t)t.b); }")
     ctype = TYPES[op.ty][2]
     size = TYPES[op.ty][0]
     is_float = op.ty in FLOAT_TYPES
-    head = "  s = s * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);"
     if is_float:
         fin = "fin32" if size == 4 else "fin64"
         bits_t = "uint32_t" if size == 4 else "uint64_t"

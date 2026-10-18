@@ -20,8 +20,6 @@ def gen_program(rng, idx):
     """Return C source text for one randomized program."""
     ops = ["<", "<=", ">", ">=", "==", "!="]
     uops = ["<", "<=", ">", ">="]
-    lines = []
-    body = []
 
     def cmp_expr(p, ty, rng):
         op = rng.choice(ops if ty == "int" else uops)
@@ -43,14 +41,14 @@ def gen_program(rng, idx):
     fn += f"    int p;\n    if (a > b) p = {v1}; else p = {v2};\n"
     if rng.random() < 0.3:
         ty = "unsigned"
-        fn += f"    unsigned q;\n    if (a < b) q = (unsigned)p + 1u; else q = 0xfffffff0u;\n"
+        fn += "    unsigned q;\n    if (a < b) q = (unsigned)p + 1u; else q = 0xfffffff0u;\n"
         fn += f"    if ({cmp_expr('q', ty, rng)}) acc += 1000; else acc += 7;\n"
         if live1:
-            fn += f"    acc += (unsigned long long)(p ^ q);\n"
+            fn += "    acc += (unsigned long long)(p ^ q);\n"
     else:
         fn += f"    if ({cmp_expr('p', 'int', rng)}) acc += 1000; else acc += 7;\n"
         if live1:
-            fn += f"    acc += (unsigned long long)(p < 0 ? -p : p * 2);\n"
+            fn += "    acc += (unsigned long long)(p < 0 ? -p : p * 2);\n"
     # diamond 2: bool phi with possible dead Cmp in the merge (hole hunt)
     if rng.random() < 0.5:
         fn += "    int r;\n    if (b > 3) r = p; else r = -p;\n"

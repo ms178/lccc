@@ -235,7 +235,7 @@ def gen_divmod(rng: random.Random, count: int) -> list[Case]:
                 q, qt = binop("/", a, t, b, tb)
                 r, _ = binop("%", a, t, b, tb)
                 v, vt = binop("^", q, qt, r, qt)
-                expr = f"((p0 / {{B}}) ^ (p0 % {{B}}))"
+                expr = "((p0 / {{B}}) ^ (p0 % {{B}}))"
             else:
                 v, vt = binop(op, a, t, b, tb)
                 expr = f"(p0 {op} {{B}})"
@@ -704,7 +704,7 @@ def gen_fpcmp(rng: random.Random, count: int) -> list[Case]:
             params = [pa, pb]
         elif kind == "unord":
             v = 1 if (math.isnan(a) or math.isnan(b)) else 0
-            body = f"return (uint64_t)__builtin_isunordered(p0, p1);"
+            body = "return (uint64_t)__builtin_isunordered(p0, p1);"
             params = [pa, pb]
         elif kind == "cvt_i":
             # only in-range, finite values (out-of-range conversion is UB)
