@@ -4807,17 +4807,26 @@ impl X86Codegen {
             }
             IntrinsicOp::VecAndI64x4 => {
                 if let Some(d) = dest {
-                    self.emit_avx_binary_256(d, args, "vpand", true);
+                    let lane_bytes = 8;
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, true, "vpand") {
+                        self.emit_avx_binary_256(d, args, "vpand", true);
+                    }
                 }
             }
             IntrinsicOp::VecOrI64x4 => {
                 if let Some(d) = dest {
-                    self.emit_avx_binary_256(d, args, "vpor", true);
+                    let lane_bytes = 8;
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, true, "vpor") {
+                        self.emit_avx_binary_256(d, args, "vpor", true);
+                    }
                 }
             }
             IntrinsicOp::VecXorI64x4 => {
                 if let Some(d) = dest {
-                    self.emit_avx_binary_256(d, args, "vpxor", true);
+                    let lane_bytes = 8;
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, true, "vpxor") {
+                        self.emit_avx_binary_256(d, args, "vpxor", true);
+                    }
                 }
             }
             // Per-lane variable shifts (AVX2): `src1 op src2` lane-wise.
@@ -4918,17 +4927,26 @@ impl X86Codegen {
             }
             IntrinsicOp::VecAndI64x2 => {
                 if let Some(d) = dest {
-                    self.emit_sse_binary_128(d, args, "pand");
+                    let lane_bytes = 8;
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, false, "vpand") {
+                        self.emit_sse_binary_128(d, args, "pand");
+                    }
                 }
             }
             IntrinsicOp::VecOrI64x2 => {
                 if let Some(d) = dest {
-                    self.emit_sse_binary_128(d, args, "por");
+                    let lane_bytes = 8;
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, false, "vpor") {
+                        self.emit_sse_binary_128(d, args, "por");
+                    }
                 }
             }
             IntrinsicOp::VecXorI64x2 => {
                 if let Some(d) = dest {
-                    self.emit_sse_binary_128(d, args, "pxor");
+                    let lane_bytes = 8;
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, false, "vpxor") {
+                        self.emit_sse_binary_128(d, args, "pxor");
+                    }
                 }
             }
             IntrinsicOp::VecLoadI16x8 | IntrinsicOp::VecLoadI8x16 => {
@@ -5001,17 +5019,38 @@ impl X86Codegen {
             }
             IntrinsicOp::VecAndI8x16 | IntrinsicOp::VecAndI16x8 => {
                 if let Some(d) = dest {
-                    self.emit_sse_binary_128(d, args, "pand");
+                    let lane_bytes = if matches!(op, IntrinsicOp::VecAndI8x16) {
+                        1
+                    } else {
+                        2
+                    };
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, false, "vpand") {
+                        self.emit_sse_binary_128(d, args, "pand");
+                    }
                 }
             }
             IntrinsicOp::VecOrI8x16 | IntrinsicOp::VecOrI16x8 => {
                 if let Some(d) = dest {
-                    self.emit_sse_binary_128(d, args, "por");
+                    let lane_bytes = if matches!(op, IntrinsicOp::VecOrI8x16) {
+                        1
+                    } else {
+                        2
+                    };
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, false, "vpor") {
+                        self.emit_sse_binary_128(d, args, "por");
+                    }
                 }
             }
             IntrinsicOp::VecXorI8x16 | IntrinsicOp::VecXorI16x8 => {
                 if let Some(d) = dest {
-                    self.emit_sse_binary_128(d, args, "pxor");
+                    let lane_bytes = if matches!(op, IntrinsicOp::VecXorI8x16) {
+                        1
+                    } else {
+                        2
+                    };
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, false, "vpxor") {
+                        self.emit_sse_binary_128(d, args, "pxor");
+                    }
                 }
             }
             IntrinsicOp::VecPackI64x2 | IntrinsicOp::VecPackF64x2 => {
@@ -5699,28 +5738,28 @@ impl X86Codegen {
                     // Bitwise lane XOR — commutative, pure, and the exact
                     // packed spelling of FP sign-bit manipulation idioms
                     // (see the IR enum doc on `VecXorF32x8`).
-                    if !self.try_emit_fpxor_sign_mask(d, args, 4, true, "vxorps") {
+                    if !self.try_emit_bitwise_lane_const(d, args, 4, true, "vxorps") {
                         self.emit_avx_binary_256(d, args, "vxorps", true);
                     }
                 }
             }
             IntrinsicOp::VecXorF64x4 => {
                 if let Some(d) = dest {
-                    if !self.try_emit_fpxor_sign_mask(d, args, 8, true, "vxorpd") {
+                    if !self.try_emit_bitwise_lane_const(d, args, 8, true, "vxorpd") {
                         self.emit_avx_binary_256(d, args, "vxorpd", true);
                     }
                 }
             }
             IntrinsicOp::VecXorF32x4 => {
                 if let Some(d) = dest {
-                    if !self.try_emit_fpxor_sign_mask(d, args, 4, false, "vxorps") {
+                    if !self.try_emit_bitwise_lane_const(d, args, 4, false, "vxorps") {
                         self.emit_sse_binary_128(d, args, "xorps");
                     }
                 }
             }
             IntrinsicOp::VecXorF64x2 => {
                 if let Some(d) = dest {
-                    if !self.try_emit_fpxor_sign_mask(d, args, 8, false, "vxorpd") {
+                    if !self.try_emit_bitwise_lane_const(d, args, 8, false, "vxorpd") {
                         self.emit_sse_binary_128(d, args, "xorpd");
                     }
                 }
@@ -6591,47 +6630,86 @@ impl X86Codegen {
             }
             IntrinsicOp::VecAndI32x8 => {
                 if let Some(d) = dest {
-                    self.emit_avx_binary_256(d, args, "vpand", true);
+                    let lane_bytes = 4;
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, true, "vpand") {
+                        self.emit_avx_binary_256(d, args, "vpand", true);
+                    }
                 }
             }
             IntrinsicOp::VecAndI32x4 => {
                 if let Some(d) = dest {
-                    self.emit_sse_binary_128(d, args, "pand");
+                    let lane_bytes = 4;
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, false, "vpand") {
+                        self.emit_sse_binary_128(d, args, "pand");
+                    }
                 }
             }
             IntrinsicOp::VecOrI32x8 => {
                 if let Some(d) = dest {
-                    self.emit_avx_binary_256(d, args, "vpor", true);
+                    let lane_bytes = 4;
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, true, "vpor") {
+                        self.emit_avx_binary_256(d, args, "vpor", true);
+                    }
                 }
             }
             IntrinsicOp::VecOrI32x4 => {
                 if let Some(d) = dest {
-                    self.emit_sse_binary_128(d, args, "por");
+                    let lane_bytes = 4;
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, false, "vpor") {
+                        self.emit_sse_binary_128(d, args, "por");
+                    }
                 }
             }
             IntrinsicOp::VecXorI32x8 => {
                 if let Some(d) = dest {
-                    self.emit_avx_binary_256(d, args, "vpxor", true);
+                    let lane_bytes = 4;
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, true, "vpxor") {
+                        self.emit_avx_binary_256(d, args, "vpxor", true);
+                    }
                 }
             }
             IntrinsicOp::VecAndI8x32 | IntrinsicOp::VecAndI16x16 => {
                 if let Some(d) = dest {
-                    self.emit_avx_binary_256(d, args, "vpand", true);
+                    let lane_bytes = if matches!(op, IntrinsicOp::VecAndI8x32) {
+                        1
+                    } else {
+                        2
+                    };
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, true, "vpand") {
+                        self.emit_avx_binary_256(d, args, "vpand", true);
+                    }
                 }
             }
             IntrinsicOp::VecOrI8x32 | IntrinsicOp::VecOrI16x16 => {
                 if let Some(d) = dest {
-                    self.emit_avx_binary_256(d, args, "vpor", true);
+                    let lane_bytes = if matches!(op, IntrinsicOp::VecOrI8x32) {
+                        1
+                    } else {
+                        2
+                    };
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, true, "vpor") {
+                        self.emit_avx_binary_256(d, args, "vpor", true);
+                    }
                 }
             }
             IntrinsicOp::VecXorI8x32 | IntrinsicOp::VecXorI16x16 => {
                 if let Some(d) = dest {
-                    self.emit_avx_binary_256(d, args, "vpxor", true);
+                    let lane_bytes = if matches!(op, IntrinsicOp::VecXorI8x32) {
+                        1
+                    } else {
+                        2
+                    };
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, true, "vpxor") {
+                        self.emit_avx_binary_256(d, args, "vpxor", true);
+                    }
                 }
             }
             IntrinsicOp::VecXorI32x4 => {
                 if let Some(d) = dest {
-                    self.emit_sse_binary_128(d, args, "pxor");
+                    let lane_bytes = 4;
+                    if !self.try_emit_bitwise_lane_const(d, args, lane_bytes, false, "vpxor") {
+                        self.emit_sse_binary_128(d, args, "pxor");
+                    }
                 }
             }
             IntrinsicOp::VecMulI32x8 => {
@@ -8772,7 +8850,7 @@ impl X86Codegen {
     /// streams through the scratch pair exactly like the memfold consumers
     /// (a pending VLFOLD on args[0] is materialised first: this emitter
     /// cannot fold a second memory operand into the same instruction).
-    fn try_emit_fpxor_sign_mask(
+    fn try_emit_bitwise_lane_const(
         &mut self,
         dest: &Value,
         args: &[Operand],
@@ -8780,17 +8858,26 @@ impl X86Codegen {
         wide: bool,
         vex_mnemonic: &str,
     ) -> bool {
-        // The exact `-0.0` constant of the family's lane type.
-        let is_minus_zero = match args.get(1) {
-            Some(Operand::Const(IrConst::F32(v))) => lane_bytes == 4 && v.to_bits() == 0x8000_0000,
-            Some(Operand::Const(IrConst::F64(v))) => {
-                lane_bytes == 8 && v.to_bits() == 0x8000_0000_0000_0000
+        // The lane constant: the exact `-0.0` of an FP family, or any
+        // integer constant of the integer family's lane width (the byte
+        // multiply's `0x00ff` word mask, select masks, ...).
+        let lane_value: u64 = match args.get(1) {
+            Some(Operand::Const(IrConst::F32(v)))
+                if lane_bytes == 4 && v.to_bits() == 0x8000_0000 =>
+            {
+                0x8000_0000
             }
-            _ => false,
+            Some(Operand::Const(IrConst::F64(v)))
+                if lane_bytes == 8 && v.to_bits() == 0x8000_0000_0000_0000 =>
+            {
+                0x8000_0000_0000_0000
+            }
+            Some(Operand::Const(IrConst::I8(v))) if lane_bytes == 1 => *v as u8 as u64,
+            Some(Operand::Const(IrConst::I16(v))) if lane_bytes == 2 => *v as u16 as u64,
+            Some(Operand::Const(IrConst::I32(v))) if lane_bytes == 4 => *v as u32 as u64,
+            Some(Operand::Const(IrConst::I64(v))) if lane_bytes == 8 => *v as u64,
+            _ => return false,
         };
-        if !is_minus_zero {
-            return false;
-        }
         // A pending VLFOLD names args[0] (the analysis admits Xor consumers
         // in either position of the COMMUTATIVE op): this emitter's single
         // memory slot is the sign mask, so the fold must be materialised —
@@ -8803,7 +8890,8 @@ impl X86Codegen {
         let total = if wide { 32 } else { 16 };
         let mut mask = vec![0u8; total];
         for l in 0..total / lane_bytes {
-            mask[l * lane_bytes + lane_bytes - 1] = 0x80;
+            mask[l * lane_bytes..(l + 1) * lane_bytes]
+                .copy_from_slice(&lane_value.to_le_bytes()[..lane_bytes]);
         }
         let label = self.state.get_vec_const_label(&mask);
         let mem = format!("{}(%rip)", label);

@@ -188,11 +188,14 @@ fi
 # 128-bit forms through the VEX.128 three-operand path.
 for fn in eq_v32i lt_v32i eq_v32f lt_v32f lt_v16f eq_v16i lt_v16i eq_v16l lt_v16l \
           eq_v32l lt_v32l eq_v16s lt_v16s eq_v16c lt_v16c \
-          cq_lt_s cq_gt_s cq4_lt_s cq4_lt_u cq_eq_u; do ceiling "$fn" 2; done
-# le / ne / unsigned orderings: min+eq (3), eq/gt+invert (4), bias+gt (5),
-# qword le.u = bias+gt+invert (6).  GCC: 3-5 (it has the same ISA gap).
-for fn in cd4_le_s cd4_le_u cq4_le_u cq_le_u cq_le_s; do ceiling "$fn" 6; done
-for fn in cq_ne_s cq4_ne_s cd4_ne_s cw4_ne_s cb4_le_s cq_lt_u cq_ge_u cd4_lt_u; do ceiling "$fn" 5; done
+          cq_lt_s cq_gt_s cq4_lt_s cq_eq_u; do ceiling "$fn" 2; done
+# le / ne / unsigned orderings (counts include `ret`): min+eq (3),
+# eq/gt+invert (4), bias+gt (4), qword le.u = bias+gt+invert (6); the
+# swapped `>=` form pays one RA handoff copy (7).  GCC: 3-6.
+for fn in cd4_le_s cd4_le_u cb4_le_s; do ceiling "$fn" 3; done
+for fn in cq_le_s cq_ne_s cq4_ne_s cd4_ne_s cw4_ne_s cq_lt_u cq4_lt_u cd4_lt_u; do ceiling "$fn" 4; done
+for fn in cq4_le_u cq_le_u; do ceiling "$fn" 6; done
+ceiling cq_ge_u 7
 ceiling cq_sel 7
 ceiling mix_sab4 7
 # Scalar/vector interleave: broadcast + fma + ret (GCC: 3).
@@ -222,7 +225,10 @@ ceiling tern_se 53     # ternary whose arms are calls (two sret temporaries)
 ceiling viacall 30     # by-value call into a GCC-built callee + return
 ceiling shr_v32l 23    # signed 64-bit lanes: no vpsravq below AVX-512VL
 ceiling shr_v16l 15    # (GCC: 6 — it emulates with vpsrlvq + sign fixup)
-ceiling mul_v32c 136   # byte multiply (no pmullw/pack expansion yet)
+# Byte multiply through the word family: pmullw + mask + two shifts +
+# pmullw + shift + or (GCC: 10 / 12).
+ceiling mul_v32c 8
+ceiling mul_v16c 8
 # FMA contraction (`vecfma`): `a*b + c` and its sign variants are one
 # vfmadd/vfmsub/vfnmadd + ret at 256 and 128 bits (GCC: 2).  The squared
 # and self-addend forms coalesce onto the dying multiplicand (GCC: 2; ours

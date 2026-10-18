@@ -344,16 +344,87 @@ impl Lowerer {
             self.emit_vec_store(&shape, dest, result);
             return Some(Operand::Value(result));
         }
-        let packed = Self::vec_binop_intrinsic(op, &shape, is_unsigned)?;
+        let byte_mul = matches!(op, BinOp::Mul) && shape.elem_ir.size() == 1;
+        let packed = if byte_mul {
+            None
+        } else {
+            Some(Self::vec_binop_intrinsic(op, &shape, is_unsigned)?)
+        };
         let rhs_plan = self.vec_operand_plan(rhs, &shape, vec_ct)?;
         // Evaluation order: C leaves it unspecified between the operands;
         // the scalar lowering evaluates lhs then rhs, keep that.
         let a = self.vec_operand_value(lhs, lhs_plan, &shape);
         let b = self.vec_operand_value(rhs, rhs_plan, &shape);
-        let r = self.emit_vec_binary(packed, a, b);
+        let r = match packed {
+            Some(packed) => self.emit_vec_binary(packed, a, b),
+            None => self.emit_vec_byte_mul(&shape, a, b)?,
+        };
         let result = self.vec_result_alloca(vec_ct);
         self.emit_vec_store(&shape, r, result);
         Some(Operand::Value(result))
+    }
+
+    /// Byte-lane multiply through the word family (x86 has no `pmullb`):
+    ///
+    ///   even = pmullw(a, b) & 0x00ff      (low byte of a word product is
+    ///                                      the low byte of the byte product)
+    ///   odd  = pmullw(a >> 8, b >> 8) << 8 (logical word shifts isolate the
+    ///                                      odd bytes; the result's low byte
+    ///                                      is zero so no mask is needed)
+    ///   r    = even | odd
+    ///
+    /// Signedness is irrelevant: multiplication modulo 2^8 is the same for
+    /// both.  The word family of the same register image carries the ops;
+    /// the result is stored with the byte shape (bit-identical image).
+    fn emit_vec_byte_mul(&mut self, shape: &SimdShape, a: Value, b: Value) -> Option<Value> {
+        let (mul, shl, shr, and, or) = match shape.bytes {
+            32 => (
+                IntrinsicOp::VecMulI16x16,
+                IntrinsicOp::VecShlI16x16,
+                IntrinsicOp::VecLShrI16x16,
+                IntrinsicOp::VecAndI16x16,
+                IntrinsicOp::VecOrI16x16,
+            ),
+            16 => (
+                IntrinsicOp::VecMulI16x8,
+                IntrinsicOp::VecShlI16x8,
+                IntrinsicOp::VecLShrI16x8,
+                IntrinsicOp::VecAndI16x8,
+                IntrinsicOp::VecOrI16x8,
+            ),
+            _ => return None,
+        };
+        let even_full = self.emit_vec_binary(mul, a, b);
+        // The mask rides as a lane constant on the AND itself: the backend
+        // folds it into a `.rodata` memory operand
+        // (`try_emit_bitwise_lane_const`), no broadcast sequence.
+        let even = self.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(even),
+            op: and,
+            dest_ptr: None,
+            args: vec![
+                Operand::Value(even_full),
+                Operand::Const(IrConst::I16(0x00ff)),
+            ],
+        });
+        let a_hi = self.emit_vec_shift_imm(shr, a, 8);
+        let b_hi = self.emit_vec_shift_imm(shr, b, 8);
+        let odd_lo = self.emit_vec_binary(mul, a_hi, b_hi);
+        let odd = self.emit_vec_shift_imm(shl, odd_lo, 8);
+        Some(self.emit_vec_binary(or, even, odd))
+    }
+
+    /// Packed shift by an immediate lane count.
+    fn emit_vec_shift_imm(&mut self, op: IntrinsicOp, a: Value, amount: i64) -> Value {
+        let dest = self.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(dest),
+            op,
+            dest_ptr: None,
+            args: vec![Operand::Value(a), Operand::Const(IrConst::I64(amount))],
+        });
+        dest
     }
 
     /// Per-lane variable shift (`lhs` a vector; `rhs` a vector of counts
