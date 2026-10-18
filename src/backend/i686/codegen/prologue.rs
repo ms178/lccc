@@ -189,6 +189,8 @@ impl I686Codegen {
             }
         }
 
+        self.narrow_images = super::comparison::compute_narrow_images(func);
+
         // Dynamic alloca (VLAs) requires the frame pointer to track the stack,
         // since ESP changes by runtime-computed amounts.
         if self.state.has_dyn_alloca {

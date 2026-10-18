@@ -8382,6 +8382,18 @@ fn try_fold_memory_operand(
 //     adjacency one;
 //   * `%esp` is never the loaded register (dataflow only).
 //
+// Width-matched consumers (`cmpb $I, %al` / `testb %al, %al` after a byte
+// load into %eax, `cmpw`/`testw` on %ax after a word load) are the exact
+// case: the compare already reads only the loaded bytes, so `cmp{b,w} $I, M`
+// and `cmp{b,w} $0, M` (for the test: CF=OF=0, SF/ZF/PF of the same byte in
+// both) set EVERY flag identically -- no immediate window, no flags-reader
+// gate, and a sign-extending load folds too (the extension bits are never
+// read).  The register must be the LOW sub-register of the loaded family
+// (`%ah` names the same family and a different byte) and dead after the
+// consumer.  The compare emitters produce exactly this shape for narrow IR
+// compares (a narrow value's upper register bits are unspecified, so the
+// compare must be narrow), which the 32-bit-only matcher used to miss.
+//
 // Kill switch: CCC_NO_NARROW_CMP_FOLD.
 fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     if std::env::var_os("CCC_NO_NARROW_CMP_FOLD").is_some() {
@@ -8396,7 +8408,8 @@ fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -
             i += 1;
             continue;
         }
-        let Some((width, src, dst_reg)) = parse_narrow_zext_src(store, &infos[i], i) else {
+        let Some((width, src, dst_reg, sign_extends)) = parse_narrow_zext_src(store, &infos[i], i)
+        else {
             i += 1;
             continue;
         };
@@ -8419,7 +8432,35 @@ fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -
         let mut replacement: Option<String> = None;
         // Consumer 2: `testl %R, %R` — ZF-only, gated on the flag reader.
         let mut test_shape = false;
-        if infos[j].kind == LineKind::Cmp {
+        let mnem = if width == MoveSize::B { "cmpb" } else { "cmpw" };
+        let operand = match &src {
+            NarrowSrc::Slot(disp, base) => format!("{}({})", disp, base),
+            NarrowSrc::Verbatim(v) => v.clone(),
+        };
+        // Consumers 3/4: the width-matched compare/test (exact, see above).
+        if infos[j].kind == LineKind::Cmp
+            && let Some(low) = narrow_reg_name(dst_reg, width)
+        {
+            let (cmp_prefix, test_prefix) = if width == MoveSize::B {
+                ("cmpb $", "testb ")
+            } else {
+                ("cmpw $", "testw ")
+            };
+            if let Some((imm_str, reg_str)) =
+                s.strip_prefix(cmp_prefix).and_then(|r| r.split_once(", "))
+            {
+                if reg_str.trim() == low && imm_str.trim().parse::<i64>().is_ok() {
+                    replacement = Some(format!("    {} ${}, {}", mnem, imm_str.trim(), operand));
+                }
+            } else if let Some((a, b)) = s.strip_prefix(test_prefix).and_then(|r| r.split_once(','))
+            {
+                if a.trim() == low && b.trim() == low {
+                    replacement = Some(format!("    {} $0, {}", mnem, operand));
+                }
+            }
+        }
+        // The 32-bit consumers' flag law assumes a zero-extended operand.
+        if replacement.is_none() && !sign_extends && infos[j].kind == LineKind::Cmp {
             if let Some(rest) = s.strip_prefix("cmpl $") {
                 if let Some((imm_str, reg_str)) = rest.split_once(", %") {
                     if let Ok(imm) = imm_str.trim().parse::<i64>() {
@@ -8440,11 +8481,6 @@ fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -
                                 NARROW_CF_ZF_SETCC,
                             )
                         {
-                            let mnem = if width == MoveSize::B { "cmpb" } else { "cmpw" };
-                            let operand = match src {
-                                NarrowSrc::Slot(disp, base) => format!("{}({})", disp, base),
-                                NarrowSrc::Verbatim(v) => v,
-                            };
                             replacement = Some(format!("    {} ${}, {}", mnem, imm, operand));
                         }
                     }
@@ -8466,10 +8502,6 @@ fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -
                             )
                         {
                             test_shape = true;
-                            let operand = match src {
-                                NarrowSrc::Slot(disp, base) => format!("{}({})", disp, base),
-                                NarrowSrc::Verbatim(v) => v,
-                            };
                             replacement = Some(format!("    cmpb $0, {}", operand));
                         }
                     }
@@ -8521,12 +8553,16 @@ fn parse_narrow_zext_src(
     store: &LineStore,
     info: &LineInfo,
     idx: usize,
-) -> Option<(MoveSize, NarrowSrc, RegId)> {
+) -> Option<(MoveSize, NarrowSrc, RegId, bool)> {
     let t = trimmed(store, info, idx);
-    let (mnem, width) = if let Some(r) = t.strip_prefix("movzbl ") {
-        (r, MoveSize::B)
+    let (mnem, width, sign_extends) = if let Some(r) = t.strip_prefix("movzbl ") {
+        (r, MoveSize::B, false)
     } else if let Some(r) = t.strip_prefix("movzwl ") {
-        (r, MoveSize::W)
+        (r, MoveSize::W, false)
+    } else if let Some(r) = t.strip_prefix("movsbl ") {
+        (r, MoveSize::B, true)
+    } else if let Some(r) = t.strip_prefix("movswl ") {
+        (r, MoveSize::W, true)
     } else {
         return None;
     };
@@ -8563,7 +8599,7 @@ fn parse_narrow_zext_src(
         } else {
             parse_offset(disp_str)
         };
-        return Some((width, NarrowSrc::Slot(disp, base), dst));
+        return Some((width, NarrowSrc::Slot(disp, base), dst, sign_extends));
     }
     // Source shape 2: a narrow register spelling, or a base-only indirect
     // operand `DISP(%reg)` (pointer loads: `movzwl (%edi), %edx`).  For the
@@ -8572,7 +8608,12 @@ fn parse_narrow_zext_src(
     // flag law carries over unchanged.  Adjacency (nops only between load
     // and consumer) is what makes "the memory is unchanged" local.
     if src_part.starts_with('%') && register_family(src_part) != REG_NONE {
-        return Some((width, NarrowSrc::Verbatim(src_part.to_string()), dst));
+        return Some((
+            width,
+            NarrowSrc::Verbatim(src_part.to_string()),
+            dst,
+            sign_extends,
+        ));
     }
     if let Some(paren) = src_part.find("(%") {
         let disp_str = &src_part[..paren];
@@ -8585,7 +8626,12 @@ fn parse_narrow_zext_src(
         {
             return None;
         }
-        return Some((width, NarrowSrc::Verbatim(src_part.to_string()), dst));
+        return Some((
+            width,
+            NarrowSrc::Verbatim(src_part.to_string()),
+            dst,
+            sign_extends,
+        ));
     }
     None
 }
@@ -21229,6 +21275,134 @@ f:
             !out.contains("cmpl $4, 176(%esp)"),
             "cmpl must not appear:\n{out}"
         );
+    }
+
+    /// Run the fold over `f: <body>` and return the output.
+    fn narrow_fold_out(body: &str) -> String {
+        let asm =
+            format!("f:\n.cfi_startproc\n{body}.L1:\n    xorl %eax, %eax\n    ret\n.cfi_endproc\n");
+        peephole_optimize(asm)
+    }
+
+    #[test]
+    fn narrow_fold_width_matched_compare_folds_for_every_flag_reader() {
+        // `cmpb $I, %al` after the byte load reads exactly the loaded byte:
+        // every flag matches `cmpb $I, M`, so signed readers and immediates
+        // outside the zero-extension window fold too.
+        for (load, cmp, jcc, want) in [
+            (
+                "movzbl 12(%esp), %eax",
+                "cmpb $4, %al",
+                "je",
+                "cmpb $4, 12(%esp)",
+            ),
+            (
+                "movzbl 12(%esp), %eax",
+                "cmpb $-6, %al",
+                "jl",
+                "cmpb $-6, 12(%esp)",
+            ),
+            (
+                "movzbl (%esi), %eax",
+                "cmpb $200, %al",
+                "jg",
+                "cmpb $200, (%esi)",
+            ),
+            (
+                "movsbl 3(%edi), %ecx",
+                "cmpb $-1, %cl",
+                "jle",
+                "cmpb $-1, 3(%edi)",
+            ),
+            (
+                "movzwl 8(%ebp), %edx",
+                "cmpw $513, %dx",
+                "jb",
+                "cmpw $513, 8(%ebp)",
+            ),
+            (
+                "movswl (%ecx), %eax",
+                "cmpw $-300, %ax",
+                "jge",
+                "cmpw $-300, (%ecx)",
+            ),
+        ] {
+            let out = narrow_fold_out(&format!(
+                "    {load}\n    {cmp}\n    {jcc} .L1\n    xorl %ebx, %ebx\n"
+            ));
+            assert!(out.contains(want), "{load}; {cmp} did not fold:\n{out}");
+            assert!(!out.contains(load), "the load survived:\n{out}");
+        }
+    }
+
+    #[test]
+    fn narrow_fold_width_matched_test_folds_to_compare_with_zero() {
+        // testb/testw and cmp{b,w} $0 agree on CF=OF=0 and SF/ZF/PF.
+        for (load, test, jcc, want) in [
+            (
+                "movzbl 5(%esp), %eax",
+                "testb %al, %al",
+                "js",
+                "cmpb $0, 5(%esp)",
+            ),
+            (
+                "movsbl (%ebx), %edx",
+                "testb %dl, %dl",
+                "jne",
+                "cmpb $0, (%ebx)",
+            ),
+            (
+                "movzwl 2(%edi), %ecx",
+                "testw %cx, %cx",
+                "jle",
+                "cmpw $0, 2(%edi)",
+            ),
+        ] {
+            let out = narrow_fold_out(&format!(
+                "    {load}\n    {test}\n    {jcc} .L1\n    xorl %ebx, %ebx\n"
+            ));
+            assert!(out.contains(want), "{load}; {test} did not fold:\n{out}");
+            assert!(!out.contains(load), "the load survived:\n{out}");
+        }
+    }
+
+    #[test]
+    fn narrow_fold_width_matched_refusals() {
+        for (body, why) in [
+            // %ah is the loaded family but a different byte.
+            (
+                "    movzbl 12(%esp), %eax\n    cmpb $4, %ah\n    je .L1\n",
+                "high byte",
+            ),
+            // A byte compare after a WORD load reads only half of it... and
+            // a word compare after a byte load reads a byte that was not
+            // loaded: neither is width-matched.
+            (
+                "    movzwl 12(%esp), %eax\n    cmpb $4, %al\n    je .L1\n",
+                "byte of a word",
+            ),
+            (
+                "    movzbl 12(%esp), %eax\n    cmpw $4, %ax\n    je .L1\n",
+                "word of a byte",
+            ),
+            // The loaded register is read (and observably stored) after the
+            // compare: the load stays.
+            (
+                "    movzbl 12(%esp), %eax\n    cmpb $4, %al\n    je .L1\n    movl %eax, (%edi)\n",
+                "live after",
+            ),
+            // A different register than the one loaded.
+            (
+                "    movzbl 12(%esp), %eax\n    cmpb $4, %cl\n    je .L1\n",
+                "other register",
+            ),
+        ] {
+            let out = narrow_fold_out(body);
+            assert!(
+                out.contains("movzbl 12(%esp)") || out.contains("movzwl 12(%esp)"),
+                "{why}: folded:\n{out}"
+            );
+        }
     }
 
     #[test]

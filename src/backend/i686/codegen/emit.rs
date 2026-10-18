@@ -174,6 +174,11 @@ pub struct I686Codegen {
     /// cross term and carries with an immediate 0 — the parser hot shape
     /// `res = res * base + val` (GCC: imull/mull/addl/adcl $0).
     pub(super) zext_wide_values: FxHashSet<u32>,
+    /// Narrow values whose 32-bit image is a proven extension
+    /// (`comparison::compute_narrow_images`): lets a byte/word compare in a
+    /// register without that sub-register (`%esi`/`%edi`/`%ebp`) run at 32
+    /// bits exactly instead of staging through `%eax`.
+    pub(super) narrow_images: FxHashMap<u32, super::comparison::NarrowImage>,
 }
 
 // Callee-saved physical register indices for i686
@@ -497,6 +502,7 @@ impl I686Codegen {
             current_return_i686_xmm: false,
             is_variadic: false,
             reg_assignments: FxHashMap::default(),
+            narrow_images: FxHashMap::default(),
             divrem_tail_dests: FxHashSet::default(),
             divrem_head_partners: FxHashMap::default(),
             divrem_broken_tails: FxHashSet::default(),
