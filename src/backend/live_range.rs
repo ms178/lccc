@@ -530,6 +530,188 @@ pub(crate) fn loop_depth_weight(loop_depth: u32) -> u64 {
     10u64.pow(loop_depth.min(4) as u32)
 }
 
+/// Set [`LiveRange::slot_operand_only`] on every range whose uses (and, for
+/// a web leader, every merged member's uses) are all servable from the
+/// spill slot with zero instructions. `members_of` maps a web leader to its
+/// merged members; `meta_uses` is the [`RangeMetadata::uses`] map the
+/// ranges were cut from. Shared by the GPR scan (via
+/// [`mark_loop_spanning`]) and the x86-64 XMM scan.
+pub(crate) fn mark_slot_operand_only(
+    ranges: &mut [LiveRange],
+    func: &IrFunction,
+    members_of: &FxHashMap<u32, Vec<u32>>,
+    meta_uses: &FxHashMap<u32, Vec<u32>>,
+) {
+    // SLOT-OPERAND CLASSIFICATION — `mark_loop_spanning` runs it
+    // unconditionally, before its loop bail-out: the cost-ratio escape in
+    // `select_evict_victim` runs in every function, loop-free ones
+    // included, and it must not fire on behalf of an incoming whose every
+    // remaining use is servable from its spill slot with ZERO
+    // instructions; the free-victim rank there relies on the same flag.
+    // Two such use contexts exist, both x86-64: the RHS of an integer
+    // compare, where both emitter paths fold the slot directly into the
+    // compare (`cmpq N(%rsp), %rax` — `emit_int_cmp_insn_typed` arms 1/4
+    // and `emit_int_cmp_replay_insn`), and the scalar FP binop operand
+    // positions described below.
+    //
+    // This is deliberately NOT conflated with `folded_at` (addressing
+    // bases, whose slot service still pays a pipelined reload that feeds
+    // pressure models): a slot-operand-only range's memory residency costs
+    // exactly one store at its def, so register residency buys it nothing
+    // and a steal on its behalf only displaces the victim and squeezes the
+    // pool for the incoming's whole remaining life. Alloca-derived
+    // operands are excluded — an alloca's home slot holds the OBJECT's
+    // bytes, not the address value, so the emitter's fold arms (is_alloca
+    // guard) reload them.
+    let slot_direct_enabled =
+        crate::common::types::target_elf_machine() == crate::backend::elf::EM_X86_64;
+    if slot_direct_enabled {
+        let mut alloca_dests: FxHashSet<u32> = FxHashSet::default();
+        let mut slot_direct_at: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Alloca { dest, .. } = inst {
+                    alloca_dests.insert(dest.0);
+                }
+            }
+        }
+        // Scalar FP binops (x86-64 SSE/AVX). `emit_float_binop` serves a
+        // slot-homed operand as the instruction's memory source with zero
+        // extra instructions in exactly two positions: the RHS of
+        // add/sub/mul/div (`vsubsd N(%rsp), %xmmL, %xmmD`, and the
+        // spilled-dest fallback's `subsd N(%rsp), %xmm0`) and the LHS of a
+        // commutative add/mul (swapped into the src2 position). A
+        // non-commutative LHS is staged with a load, and `x op x` stages x
+        // once, so neither qualifies. A multiply that may be contracted
+        // into its single add/sub user (`emit_fused_fma`) loads both
+        // operands into registers (`movsd N(%rsp), %xmm1; vfmadd231sd
+        // %xmm1, ...`), so its operands are excluded conservatively.
+        let fp_scalar = |ty: &IrType| matches!(ty, IrType::F32 | IrType::F64);
+        let mut use_count: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut fp_addsub_operand: FxHashSet<u32> = FxHashSet::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                // Every use: operand positions plus bare-`Value` positions
+                // (pointers, GEP bases) -- the two walkers are disjoint.
+                for_each_operand_in_instruction(inst, |o| {
+                    if let Operand::Value(v) = o {
+                        *use_count.entry(v.0).or_insert(0) += 1;
+                    }
+                });
+                for_each_value_use_in_instruction(inst, |v| {
+                    *use_count.entry(v.0).or_insert(0) += 1;
+                });
+                if let Instruction::BinOp {
+                    op: IrBinOp::Add | IrBinOp::Sub,
+                    lhs,
+                    rhs,
+                    ty,
+                    ..
+                } = inst
+                {
+                    if fp_scalar(ty) {
+                        for o in [lhs, rhs] {
+                            if let Operand::Value(v) = o {
+                                fp_addsub_operand.insert(v.0);
+                            }
+                        }
+                    }
+                }
+            }
+            for_each_operand_in_terminator(&block.terminator, |o| {
+                if let Operand::Value(v) = o {
+                    *use_count.entry(v.0).or_insert(0) += 1;
+                }
+            });
+        }
+        {
+            // Dense point numbering of `collect_range_metadata` (one point
+            // per instruction, one for the block terminator) so the map
+            // aligns with `meta_uses` by construction.
+            let mut point = 0u32;
+            for block in &func.blocks {
+                for inst in &block.instructions {
+                    if let Instruction::Cmp {
+                        rhs: Operand::Value(rv),
+                        ty,
+                        ..
+                    } = inst
+                    {
+                        // Integer widths the emitter serves from a slot
+                        // with the width-matched mnemonic (cmpb..cmpq);
+                        // I128 compares take the multi-instruction
+                        // emit_i128_cmp path and must not be classified.
+                        if ty.is_integer() && ty.size() <= 8 && !alloca_dests.contains(&rv.0) {
+                            slot_direct_at.entry(point).or_default().insert(rv.0);
+                        }
+                    }
+                    if let Instruction::BinOp {
+                        dest,
+                        op,
+                        lhs,
+                        rhs,
+                        ty,
+                    } = inst
+                    {
+                        let arith = matches!(
+                            op,
+                            IrBinOp::Add
+                                | IrBinOp::Sub
+                                | IrBinOp::Mul
+                                | IrBinOp::SDiv
+                                | IrBinOp::UDiv
+                        );
+                        let may_contract = *op == IrBinOp::Mul
+                            && use_count.get(&dest.0) == Some(&1)
+                            && fp_addsub_operand.contains(&dest.0);
+                        if fp_scalar(ty) && arith && !may_contract {
+                            let same = matches!((lhs, rhs),
+                                (Operand::Value(l), Operand::Value(r)) if l.0 == r.0);
+                            if !same {
+                                if let Operand::Value(rv) = rhs {
+                                    slot_direct_at.entry(point).or_default().insert(rv.0);
+                                }
+                                if matches!(op, IrBinOp::Add | IrBinOp::Mul) {
+                                    if let Operand::Value(lv) = lhs {
+                                        slot_direct_at.entry(point).or_default().insert(lv.0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    point = point.saturating_add(1);
+                }
+                point = point.saturating_add(1);
+            }
+        }
+        let all_slot_direct = |vid: u32, uses: &[u32]| {
+            !uses.is_empty()
+                && uses
+                    .iter()
+                    .all(|u| slot_direct_at.get(u).is_some_and(|s| s.contains(&vid)))
+        };
+        for range in ranges.iter_mut() {
+            let mut slot_direct = all_slot_direct(range.value_id, &range.uses);
+            // Web-wide: a coalesced member with any latency-exposed (or
+            // unknown) use disqualifies the leader exactly as it does for
+            // the in-loop-use flag below — merged members own no range of
+            // their own, so their uses are read from `meta_uses`.
+            if slot_direct {
+                if let Some(members) = members_of.get(&range.value_id) {
+                    for &m in members {
+                        let m_ok = meta_uses.get(&m).is_some_and(|us| all_slot_direct(m, us));
+                        if !m_ok {
+                            slot_direct = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            range.slot_operand_only = slot_direct;
+        }
+    }
+}
+
 /// Flag ranges whose fat envelope covers a whole natural loop extent
 /// (`[header_start, latch_end]`, see `LivenessResult::loop_extents`).
 ///
@@ -567,88 +749,7 @@ pub(crate) fn mark_loop_spanning(
             members_of.entry(owner).or_default().push(member);
         }
     }
-    // SLOT-OPERAND CLASSIFICATION — unconditional, before the loop bail-out
-    // below: the cost-ratio escape in `select_evict_victim` runs in every
-    // function, loop-free ones included, and it must not fire on behalf of
-    // an incoming whose every remaining use is servable from its spill slot
-    // with ZERO instructions. Today exactly one such use context exists:
-    // the RHS of an integer compare on x86-64, where both emitter paths
-    // fold the slot directly into the compare (`cmpq N(%rsp), %rax` —
-    // `emit_int_cmp_insn_typed` arms 1/4 and `emit_int_cmp_replay_insn`).
-    //
-    // This is deliberately NOT conflated with `folded_at` (addressing
-    // bases, whose slot service still pays a pipelined reload that feeds
-    // pressure models): a slot-operand-only range's memory residency costs
-    // exactly one store at its def, so register residency buys it nothing
-    // and a steal on its behalf only displaces the victim and squeezes the
-    // pool for the incoming's whole remaining life. Alloca-derived
-    // operands are excluded — an alloca's home slot holds the OBJECT's
-    // bytes, not the address value, so the emitter's fold arms (is_alloca
-    // guard) reload them.
-    let slot_direct_enabled =
-        crate::common::types::target_elf_machine() == crate::backend::elf::EM_X86_64;
-    if slot_direct_enabled {
-        let mut alloca_dests: FxHashSet<u32> = FxHashSet::default();
-        let mut slot_direct_at: FxHashMap<u32, FxHashSet<u32>> = FxHashMap::default();
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                if let Instruction::Alloca { dest, .. } = inst {
-                    alloca_dests.insert(dest.0);
-                }
-            }
-        }
-        {
-            // Dense point numbering of `collect_range_metadata` (one point
-            // per instruction, one for the block terminator) so the map
-            // aligns with `meta_uses` by construction.
-            let mut point = 0u32;
-            for block in &func.blocks {
-                for inst in &block.instructions {
-                    if let Instruction::Cmp {
-                        rhs: Operand::Value(rv),
-                        ty,
-                        ..
-                    } = inst
-                    {
-                        // Integer widths the emitter serves from a slot
-                        // with the width-matched mnemonic (cmpb..cmpq);
-                        // I128 compares take the multi-instruction
-                        // emit_i128_cmp path and must not be classified.
-                        if ty.is_integer() && ty.size() <= 8 && !alloca_dests.contains(&rv.0) {
-                            slot_direct_at.entry(point).or_default().insert(rv.0);
-                        }
-                    }
-                    point = point.saturating_add(1);
-                }
-                point = point.saturating_add(1);
-            }
-        }
-        let all_slot_direct = |vid: u32, uses: &[u32]| {
-            !uses.is_empty()
-                && uses
-                    .iter()
-                    .all(|u| slot_direct_at.get(u).is_some_and(|s| s.contains(&vid)))
-        };
-        for range in ranges.iter_mut() {
-            let mut slot_direct = all_slot_direct(range.value_id, &range.uses);
-            // Web-wide: a coalesced member with any latency-exposed (or
-            // unknown) use disqualifies the leader exactly as it does for
-            // the in-loop-use flag below — merged members own no range of
-            // their own, so their uses are read from `meta_uses`.
-            if slot_direct {
-                if let Some(members) = members_of.get(&range.value_id) {
-                    for &m in members {
-                        let m_ok = meta_uses.get(&m).is_some_and(|us| all_slot_direct(m, us));
-                        if !m_ok {
-                            slot_direct = false;
-                            break;
-                        }
-                    }
-                }
-            }
-            range.slot_operand_only = slot_direct;
-        }
-    }
+    mark_slot_operand_only(ranges, func, &members_of, meta_uses);
     // Nothing below is reachable without a loop, and the two IR walks that
     // follow are O(instructions): bail out before paying for them. (`folded_at`,
     // `def_uses` and the per-range pass all feed only the extent loop.)
@@ -1196,6 +1297,15 @@ pub struct LinearScanAllocator {
     /// Loop-spanning ranges in the original worklist (see the admission
     /// cap in [`LinearScanAllocator::allocate_range`]).
     pub total_spans: usize,
+    /// Rank a slot-operand-only active as the free eviction in
+    /// [`Self::select_evict_victim`]. Set by the x86-64 XMM scan only:
+    /// there the classified ranges are hoisted FP constants read as SSE
+    /// memory operands. In the GPR scan the classified ranges are integer
+    /// compare right-hand sides -- loop bounds -- whose eviction the
+    /// depth, next-use and cost-ratio gates are tuned around; ranking them
+    /// free bypassed those gates and cascaded (rot(): 51 -> 55 insns,
+    /// 2 -> 5 stack refs; zstd_count +3 stack refs; expat +6 moves).
+    pub free_slot_victims: bool,
 }
 
 impl LinearScanAllocator {
@@ -1232,6 +1342,7 @@ impl LinearScanAllocator {
             enable_splitting: false,
             next_reg_idx: 0,
             total_spans,
+            free_slot_victims: false,
         }
     }
 
@@ -1720,9 +1831,25 @@ impl LinearScanAllocator {
             if interval.range.reg_hint.is_some() {
                 continue;
             }
+            // SLOT-OPERAND VICTIM: demoting a slot-operand-only active costs
+            // exactly one store at its def -- every remaining use reads the
+            // slot as a memory operand with zero instructions -- so it is
+            // the cheapest victim there is, and the next-use churn gate
+            // below (which prices a victim's reload) does not apply: there
+            // is no reload. The canonical case is a hoisted FP constant
+            // holding an XMM register across a loop whose temporaries then
+            // round-trip the stack (struct_copy: three `fp_const_hoist`
+            // homes cost every dx/dy/dz a store + reload per pair, +16M
+            // Ir). An incoming that is itself slot-operand-only gains
+            // nothing from the register, so it never claims this rank.
+            let free_victim = self.free_slot_victims
+                && interval.range.slot_operand_only
+                && !incoming.slot_operand_only;
             // Rank key. Mode 6: position-relative weighted spill cost.
             // Modes 1-3: the historical global priority.
-            let priority = if cost_order {
+            let priority = if free_victim {
+                0
+            } else if cost_order {
                 interval.range.spill_cost_at(pos)
             } else {
                 interval.range.priority
@@ -1735,7 +1862,7 @@ impl LinearScanAllocator {
             if bar <= priority {
                 continue;
             }
-            if mode < 2 && interval.range.loop_depth >= incoming.loop_depth {
+            if mode < 2 && !free_victim && interval.range.loop_depth >= incoming.loop_depth {
                 continue;
             }
             let nxt = next_use_after(&interval.range, incoming.start);
@@ -1777,7 +1904,11 @@ impl LinearScanAllocator {
             // for every non-i686 target, bit for bit.
             let span_steal_arch =
                 crate::common::types::target_elf_machine() == crate::backend::elf::EM_386;
-            if mode >= 3 && nxt <= incoming.end && (!incoming.spans_loop || !span_steal_arch) {
+            if mode >= 3
+                && !free_victim
+                && nxt <= incoming.end
+                && (!incoming.spans_loop || !span_steal_arch)
+            {
                 // Cost-ratio escape: the next-use gate protects short
                 // chain-links (struct_copy/sha256: evicting hot shorts
                 // for spans measured ~2x), but it is absolute — a span
@@ -5057,6 +5188,144 @@ mod tests {
             Some(0),
             "clean eviction (nxt > incoming.end) is unaffected by the flag"
         );
+    }
+
+    /// A slot-operand-only VICTIM is the free eviction: demoting it costs
+    /// one store at its def and no reload, so even a lower-priority incoming
+    /// takes its register, and the next-use churn gate does not apply. The
+    /// struct_copy regression: three hoisted FP constants (priority 40)
+    /// held XMM registers while every dx/dy/dz temporary (priority 10-20)
+    /// round-tripped the stack. Only scans that opt in (the x86-64 XMM
+    /// scan) rank it so; the GPR default keeps the ordinary gates.
+    #[test]
+    fn slot_operand_only_victim_is_the_free_eviction() {
+        let regs = vec![PhysReg(0)];
+        let constant = |slot: bool, hinted: bool| {
+            let mut r = lr(1, 0, 200, vec![10, 150], 40);
+            r.slot_operand_only = slot;
+            if hinted {
+                r.reg_hint = Some(PhysReg(0));
+            }
+            r
+        };
+        let evict_in = |free: bool, victim: LiveRange, incoming: &LiveRange| {
+            let mut a = LinearScanAllocator::new(vec![], regs.clone());
+            a.free_slot_victims = free;
+            a.init_registers();
+            a.allocate_range(victim);
+            a.select_evict_victim(incoming, 3)
+        };
+        let evict = |victim: LiveRange, incoming: &LiveRange| evict_in(true, victim, incoming);
+        // Next use 150 > incoming end 60 would pass the gate anyway; use a
+        // victim used INSIDE the incoming's life to prove the gate is skipped.
+        let inside = |slot: bool| {
+            let mut r = lr(1, 0, 200, vec![10, 58, 150], 40);
+            r.slot_operand_only = slot;
+            r
+        };
+        let temp = lr(2, 50, 60, vec![55, 59], 10);
+        assert_eq!(evict(constant(true, false), &temp), Some(0));
+        assert_eq!(
+            evict(inside(true), &temp),
+            Some(0),
+            "no reload: churn gate skipped"
+        );
+        // Controls: the flag is the only difference.
+        assert_eq!(evict(constant(false, false), &temp), None);
+        assert_eq!(evict(inside(false), &temp), None);
+        // A slot-operand-only incoming gains nothing from the register.
+        let mut slot_temp = lr(3, 50, 60, vec![55, 59], 10);
+        slot_temp.slot_operand_only = true;
+        assert_eq!(evict(constant(true, false), &slot_temp), None);
+        // ABI-hinted values stay protected.
+        assert_eq!(evict(constant(true, true), &temp), None);
+        // A scan that does not opt in (GPR) keeps the ordinary gates: the
+        // slot-operand-only victim is protected exactly like the control.
+        assert_eq!(evict_in(false, constant(true, false), &temp), None);
+        assert_eq!(evict_in(false, inside(true), &temp), None);
+    }
+
+    /// The x86-64 scalar FP slot-operand positions: the RHS of
+    /// add/sub/mul/div and the LHS of commutative add/mul fold the slot as
+    /// the memory source; a non-commutative LHS, `x op x`, the operands of a
+    /// multiply that may contract into its single add/sub user, and integer
+    /// ALU operands do not.
+    #[test]
+    fn fp_binop_slot_operand_positions_are_exact() {
+        if crate::common::types::target_elf_machine() != crate::backend::elf::EM_X86_64 {
+            return; // classification disabled off x86-64
+        }
+        use crate::ir::reexports::Value;
+        let v = |id: u32| Operand::Value(Value(id));
+        let bin = |dest: u32, op: IrBinOp, lhs: u32, rhs: u32, ty: IrType| Instruction::BinOp {
+            dest: Value(dest),
+            op,
+            lhs: v(lhs),
+            rhs: v(rhs),
+            ty,
+        };
+        let mut f = IrFunction::new("t".to_string(), IrType::F64, vec![], false);
+        f.blocks.push(crate::ir::reexports::BasicBlock {
+            label: crate::ir::reexports::BlockId(0),
+            instructions: vec![
+                bin(20, IrBinOp::Mul, 1, 2, IrType::F64),    // 0: both fold
+                bin(21, IrBinOp::Sub, 3, 4, IrType::F64),    // 1: rhs only
+                bin(22, IrBinOp::Mul, 5, 5, IrType::F64),    // 2: x*x stages x
+                bin(23, IrBinOp::Mul, 6, 7, IrType::F64),    // 3: may contract...
+                bin(24, IrBinOp::Add, 23, 8, IrType::F64),   // 4: ...into this add
+                bin(25, IrBinOp::Add, 9, 10, IrType::I64),   // 5: integer ALU
+                bin(26, IrBinOp::SDiv, 12, 11, IrType::F32), // 6: f32 div rhs
+            ],
+            terminator: Terminator::Return(Some(v(20))),
+            source_spans: Vec::new(),
+        });
+        let points: [(u32, u32); 12] = [
+            (1, 0),
+            (2, 0),
+            (3, 1),
+            (4, 1),
+            (5, 2),
+            (6, 3),
+            (7, 3),
+            (8, 4),
+            (9, 5),
+            (10, 5),
+            (11, 6),
+            (12, 6),
+        ];
+        let mut ranges: Vec<LiveRange> = points
+            .iter()
+            .map(|&(id, p)| lr(id, 0, p, vec![p], 10))
+            .collect();
+        mark_slot_operand_only(
+            &mut ranges,
+            &f,
+            &FxHashMap::default(),
+            &FxHashMap::default(),
+        );
+        let flag = |id: u32| {
+            ranges
+                .iter()
+                .find(|r| r.value_id == id)
+                .unwrap()
+                .slot_operand_only
+        };
+        assert!(flag(1), "commutative mul LHS folds");
+        assert!(flag(2), "mul RHS folds");
+        assert!(!flag(3), "sub LHS is staged");
+        assert!(flag(4), "sub RHS folds");
+        assert!(!flag(5), "x*x stages x once");
+        assert!(
+            !flag(6) && !flag(7),
+            "a contractible mul loads both operands"
+        );
+        assert!(flag(8), "the add consuming it still folds its RHS");
+        assert!(
+            !flag(9) && !flag(10),
+            "integer ALU operands are not slot-direct"
+        );
+        assert!(flag(11), "f32 div RHS folds");
+        assert!(!flag(12), "div LHS is staged");
     }
 
     /// Modes 1-3 must be untouched by the cost model: same victim, same

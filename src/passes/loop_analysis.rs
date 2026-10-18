@@ -577,6 +577,21 @@ pub fn find_dedicated_preheader(
     }
 }
 
+/// Whether `pred`, the unique outside predecessor of the loop headed by
+/// `header`, lies inside some loop that does NOT contain `header`.
+///
+/// Code appended to such a block runs once per iteration of that foreign
+/// loop rather than once per entry of this one. The common shape is two
+/// consecutive top-tested loops after CFG cleanup: the first loop's header
+/// exits straight into the second, so it *is* the second loop's preheader.
+/// A parent loop containing both blocks is not foreign (its body runs once
+/// per outer iteration either way).
+pub fn pred_in_foreign_loop(pred: usize, header: usize, loops: &[NaturalLoop]) -> bool {
+    loops
+        .iter()
+        .any(|m| m.body.contains(&pred) && !m.body.contains(&header))
+}
+
 /// Full loop hierarchy and nesting analysis for a CFG.
 ///
 /// Constructs a tree/forest of loops where outer loops are parents of inner loops.

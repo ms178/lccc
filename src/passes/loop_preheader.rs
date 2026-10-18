@@ -512,6 +512,51 @@ fn apply_insertions(func: &mut IrFunction, plans: &[Plan]) -> usize {
     inserted
 }
 
+/// Give a dedicated preheader to every loop selected by `wants` whose unique
+/// outside predecessor sits in a *foreign* loop
+/// ([`loop_analysis::pred_in_foreign_loop`]). Returns the number of blocks
+/// inserted; callers must rebuild their CFG when it is non-zero.
+///
+/// This is the frequency counterpart of [`run_function`]'s soundness rule.
+/// Passes that append pure code to "the preheader" (`int_const_hoist`,
+/// `fp_const_hoist`) would otherwise run it once per iteration of a
+/// preceding sibling loop, and the now non-empty sibling header also loses
+/// its bottom-test rotation (`zlib_ng_adler32`: the `% 65521` magic home
+/// executed 2,097,153 times in the data-init loop's header, +6.3M Ir).
+/// A non-dedicated predecessor that is *not* in a foreign loop (an `if (n
+/// > 0)` guard) runs at most once per entry, so it is left alone and no
+/// block is spent on it. One planning round suffices: plans are applied by
+/// label, at most one per header.
+pub(crate) fn dedicate_foreign_preheaders(
+    func: &mut IrFunction,
+    wants: impl Fn(&IrFunction, &NaturalLoop) -> bool,
+) -> usize {
+    if func.is_declaration || func.blocks.len() < 2 {
+        return 0;
+    }
+    let cfg = analysis::CfgAnalysis::build(func);
+    let loops = loop_analysis::merge_loops_by_header(loop_analysis::find_natural_loops(
+        cfg.num_blocks,
+        &cfg.preds,
+        &cfg.succs,
+        &cfg.idom,
+    ));
+    let selected: Vec<&NaturalLoop> = loops
+        .iter()
+        .filter(|l| {
+            loop_analysis::find_preheader(l.header, &l.body, &cfg.preds)
+                .is_some_and(|p| loop_analysis::pred_in_foreign_loop(p, l.header, &loops))
+                && wants(func, l)
+        })
+        .collect();
+    if selected.is_empty() {
+        return 0;
+    }
+    let mut census = Census::default();
+    let plans = plan_insertions(func, &selected, &cfg, &mut census);
+    apply_insertions(func, &plans)
+}
+
 /// Give every eligible loop in `func` a dedicated preheader.
 ///
 /// Returns the number of blocks inserted.  Re-planning after each round is

@@ -5242,12 +5242,30 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
 
         if !f64_intervals.is_empty() {
-            let mut f64_ranges = live_range::build_live_ranges_with_config(
+            let (mut f64_ranges, f64_meta) = live_range::build_live_ranges_with_config_and_meta(
                 &f64_intervals,
                 &liveness.block_loop_depth,
                 func,
                 &config.ra_config,
             );
+            // Slot-operand classification for the XMM pool, so a hoisted FP
+            // constant whose every use folds its slot as a memory operand is
+            // the scan's free victim instead of a temporary that would
+            // round-trip the stack (`select_evict_victim`). Only the
+            // classification is shared with the GPR scan; the loop-span
+            // admission machinery of `mark_loop_spanning` is GPR-tuned.
+            if x86_fp_pool {
+                let mut fp_members_of: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+                for (&member, &leader) in &fp_web_member_of {
+                    fp_members_of.entry(leader).or_default().push(member);
+                }
+                live_range::mark_slot_operand_only(
+                    &mut f64_ranges,
+                    func,
+                    &fp_members_of,
+                    &f64_meta.uses,
+                );
+            }
             // RA-05: hole-aware coverage for the XMM scan as well — FP phi
             // webs spanning mutually exclusive arms get the same treatment
             // as the GPR scan. Use the FP web map so member segments attach
@@ -5265,6 +5283,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             };
             let mut xmm_allocator =
                 LinearScanAllocator::new_with_config(f64_ranges, scan_pool, &config.ra_config);
+            xmm_allocator.free_slot_victims = x86_fp_pool;
             xmm_allocator.run();
             for (&vid, &reg) in &xmm_allocator.assignments {
                 assignments.insert(vid, reg);

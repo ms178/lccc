@@ -24,6 +24,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     if func.blocks.len() < 2 {
         return 0;
     }
+    // Never hoist into a sibling loop's header (see
+    // `loop_preheader::dedicate_foreign_preheaders`).
+    super::loop_preheader::dedicate_foreign_preheaders(func, loop_has_candidate);
     let cfg = analysis::CfgAnalysis::build(func);
     let mut loops =
         loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
@@ -104,6 +107,22 @@ fn for_each_fp_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand)) {
         }
         _ => {}
     }
+}
+
+/// Whether `hoist_in_loop` would hoist anything for this loop.
+fn loop_has_candidate(func: &IrFunction, lp: &loop_analysis::NaturalLoop) -> bool {
+    let mut found = false;
+    for &bi in &lp.body {
+        for inst in &func.blocks[bi].instructions {
+            for_each_fp_operand(inst, &mut |op| {
+                found |= const_of(op).is_some_and(|c| !c.is_zero());
+            });
+            if found {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn hoist_in_loop(

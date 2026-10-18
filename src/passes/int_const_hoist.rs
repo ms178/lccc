@@ -112,6 +112,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     if func.blocks.len() < 2 {
         return 0;
     }
+    // Never hoist into a sibling loop's header (see
+    // `loop_preheader::dedicate_foreign_preheaders`).
+    super::loop_preheader::dedicate_foreign_preheaders(func, loop_has_candidate);
     let cfg = analysis::CfgAnalysis::build(func);
     let mut loops = loop_analysis::merge_loops_by_header(loop_analysis::find_natural_loops(
         cfg.num_blocks,
@@ -177,6 +180,22 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         }
     }
     count
+}
+
+/// Whether `run` would hoist anything for this loop.
+fn loop_has_candidate(func: &IrFunction, lp: &loop_analysis::NaturalLoop) -> bool {
+    let mut found = false;
+    for &bi in &lp.body {
+        for inst in &func.blocks[bi].instructions {
+            for_each_int_operand(inst, &mut |op, needs_reg, imm32_exact| {
+                found |= large_int_const(op, needs_reg, imm32_exact).is_some();
+            });
+            if found {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// An integer constant that is NOT encodable as a target immediate and so
@@ -762,5 +781,192 @@ mod tests {
             assert!(const_homes(&f, model).is_empty(), "{model:?}");
         }
         assert_eq!(model_for(crate::backend::Target::I686), None);
+    }
+
+    // ---- frequency: never hoist into a sibling loop's header -------------
+
+    fn blk(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        }
+    }
+
+    fn counter_loop(
+        header: u32,
+        body: u32,
+        exit: u32,
+        entry: (Operand, u32),
+        iv: u32,
+        body_insts: Vec<Instruction>,
+    ) -> [BasicBlock; 2] {
+        let (next, cmp) = (iv + 1, iv + 2);
+        let mut insts = body_insts;
+        insts.push(Instruction::BinOp {
+            dest: Value(next),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(iv)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        });
+        [
+            blk(
+                header,
+                vec![
+                    Instruction::Phi {
+                        dest: Value(iv),
+                        ty: IrType::I32,
+                        incoming: vec![
+                            (entry.0, BlockId(entry.1)),
+                            (Operand::Value(Value(next)), BlockId(body)),
+                        ],
+                    },
+                    Instruction::Cmp {
+                        dest: Value(cmp),
+                        op: IrCmpOp::Slt,
+                        lhs: Operand::Value(Value(iv)),
+                        rhs: Operand::Const(IrConst::I32(64)),
+                        ty: IrType::I32,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(cmp)),
+                    true_label: BlockId(body),
+                    false_label: BlockId(exit),
+                },
+            ),
+            blk(body, insts, Terminator::Branch(BlockId(header))),
+        ]
+    }
+
+    /// Loop B's body multiplies by a constant that needs a register.
+    fn wide_mul(dest: u32, src: u32) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(Value(src)),
+            rhs: Operand::Const(IrConst::I64(0x1_0000_0000)),
+            ty: IrType::U64,
+        }
+    }
+
+    fn block_defining_copy_of(func: &IrFunction, bits: i64) -> usize {
+        func.blocks
+            .iter()
+            .position(|b| {
+                b.instructions.iter().any(|i| {
+                    matches!(i, Instruction::Copy { src: Operand::Const(IrConst::I64(v)), .. }
+                        if *v == bits)
+                })
+            })
+            .expect("hoisted copy")
+    }
+
+    /// zlib_ng_adler32's shape: loop A's header exits straight into loop B's
+    /// header, so A's header is B's unique outside predecessor. Appending
+    /// the hoisted copy there ran it once per A iteration (2,097,153 times,
+    /// and it cost A its bottom-test rotation). The copy must land in a new
+    /// dedicated block on the A-exit edge instead.
+    #[test]
+    fn hoist_never_lands_in_a_sibling_loop_header() {
+        let mut func = IrFunction::new("sibling".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(blk(
+            0,
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(0)),
+            }],
+            Terminator::Branch(BlockId(1)),
+        ));
+        let a = counter_loop(1, 2, 3, (Operand::Value(Value(0)), 0), 10, vec![]);
+        let b = counter_loop(
+            3,
+            4,
+            5,
+            (Operand::Value(Value(10)), 1),
+            20,
+            vec![wide_mul(30, 20)],
+        );
+        func.blocks.extend(a);
+        func.blocks.extend(b);
+        func.blocks.push(blk(
+            5,
+            vec![],
+            Terminator::Return(Some(Operand::Value(Value(20)))),
+        ));
+        func.next_value_id = 31;
+        func.next_label = 6;
+        let a_header_len = func.blocks[1].instructions.len();
+
+        assert_eq!(run(&mut func), 1);
+
+        let home = block_defining_copy_of(&func, 0x1_0000_0000);
+        let home_label = func.blocks[home].label;
+        assert!(
+            home_label.0 >= 6,
+            "copy must live in a new block, got {home_label:?}"
+        );
+        assert!(matches!(
+            func.blocks[home].terminator,
+            Terminator::Branch(BlockId(3))
+        ));
+        let a_header = func.blocks.iter().find(|b| b.label == BlockId(1)).unwrap();
+        assert_eq!(
+            a_header.instructions.len(),
+            a_header_len,
+            "loop A's header gained code"
+        );
+        assert!(matches!(&a_header.terminator,
+            Terminator::CondBranch { false_label, .. } if *false_label == home_label));
+        let b_header = func.blocks.iter().find(|b| b.label == BlockId(3)).unwrap();
+        let Instruction::Phi { incoming, .. } = &b_header.instructions[0] else {
+            panic!("expected B's phi");
+        };
+        assert!(incoming.iter().any(|(_, l)| *l == home_label));
+        assert!(incoming.iter().all(|(_, l)| *l != BlockId(1)));
+    }
+
+    /// A guard block outside every loop runs at most once per entry: no
+    /// block is spent on it and the copy goes to the guard as before.
+    #[test]
+    fn guard_preheader_is_not_split() {
+        let mut func = IrFunction::new("guarded".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(blk(
+            0,
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(0)),
+            }],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(1),
+                false_label: BlockId(3),
+            },
+        ));
+        func.blocks.extend(counter_loop(
+            1,
+            2,
+            3,
+            (Operand::Value(Value(0)), 0),
+            10,
+            vec![wide_mul(30, 10)],
+        ));
+        func.blocks.push(blk(
+            3,
+            vec![],
+            Terminator::Return(Some(Operand::Value(Value(0)))),
+        ));
+        func.next_value_id = 31;
+        func.next_label = 4;
+
+        assert_eq!(run(&mut func), 1);
+
+        assert_eq!(func.blocks.len(), 4, "no block for a guard preheader");
+        assert_eq!(
+            func.blocks[block_defining_copy_of(&func, 0x1_0000_0000)].label,
+            BlockId(0)
+        );
     }
 }
