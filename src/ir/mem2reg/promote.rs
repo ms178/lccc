@@ -668,8 +668,10 @@ fn rename_blocks(
     while let Some(step) = work.pop() {
         let (block_idx, goto_snapshot) = match step {
             RenameWork::Exit { mark } => {
-                while undo.len() > mark {
-                    let ai = undo.pop().expect("undo log shorter than its mark");
+                // Unwind this subtree's pushes, newest first. `mark` was
+                // the log length at entry, so the clamp never truncates.
+                let keep = mark.min(undo.len());
+                for ai in undo.drain(keep..).rev() {
                     def_stacks[ai].pop();
                 }
                 continue;

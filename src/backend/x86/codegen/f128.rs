@@ -579,12 +579,6 @@ impl X86Codegen {
                 self.state.emit("    btcq $63, %rax");
                 self.state.out.emit_named_label(&done_label);
             }
-            IrType::I64 | IrType::U32 => {
-                self.state.emit_fmt(format_args!("    {cvt}q %xmm0, %rax"));
-                if to_ty == IrType::U32 {
-                    self.state.emit("    movl %eax, %eax");
-                }
-            }
             IrType::I32 | IrType::I16 | IrType::I8 | IrType::U16 | IrType::U8 => {
                 self.state.emit_fmt(format_args!("    {cvt}l %xmm0, %eax"));
                 if to_ty.is_signed() {
@@ -593,7 +587,14 @@ impl X86Codegen {
                     self.emit_zero_extend_to_rax(to_ty);
                 }
             }
-            other => panic!("float->int truncation to non-scalar-integer {other:?}"),
+            // I64, U32 (needs the wider range) and every other 8-byte
+            // carrier (Ptr): the 64-bit form, upstream's former default.
+            _ => {
+                self.state.emit_fmt(format_args!("    {cvt}q %xmm0, %rax"));
+                if to_ty == IrType::U32 {
+                    self.state.emit("    movl %eax, %eax");
+                }
+            }
         }
     }
 

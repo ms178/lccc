@@ -3630,15 +3630,18 @@ impl Lowerer {
         r: Operand,
         common_ct: &CType,
     ) -> Value {
+        // Decimal and _Float128 arithmetic are libcalls named by one stem;
+        // sema admits only + - * / on these types, stated once here.
+        let soft_stem = || match op {
+            ast::BinOp::Add => "add",
+            ast::BinOp::Sub => "sub",
+            ast::BinOp::Mul => "mul",
+            ast::BinOp::Div => "div",
+            _ => unreachable!("non-arithmetic soft-float op: {op:?}"),
+        };
         if let Some(w) = Self::decimal_width(common_ct) {
             let s = Self::dec_suffix(w);
-            let name = match op {
-                ast::BinOp::Add => "add",
-                ast::BinOp::Sub => "sub",
-                ast::BinOp::Mul => "mul",
-                ast::BinOp::Div => "div",
-                _ => unreachable!("non-arithmetic decimal compound op: {op:?}"),
-            };
+            let name = soft_stem();
             let dec_ty = Self::dec_ty(w);
             return self.emit_decimal_call(
                 &format!("__bid_{name}{s}3"),
@@ -3648,14 +3651,8 @@ impl Lowerer {
             );
         }
         if *common_ct == CType::Float128 {
-            let helper = match op {
-                ast::BinOp::Add => "__addtf3",
-                ast::BinOp::Sub => "__subtf3",
-                ast::BinOp::Mul => "__multf3",
-                ast::BinOp::Div => "__divtf3",
-                _ => unreachable!("non-arithmetic _Float128 compound op: {op:?}"),
-            };
-            return self.emit_f128_binop_call(helper, l, r);
+            let helper = format!("__{}tf3", soft_stem());
+            return self.emit_f128_binop_call(&helper, l, r);
         }
         let ir_op = Self::binop_to_ir(*op, false);
         self.emit_binop_val(ir_op, l, r, IrType::from_ctype(common_ct))
