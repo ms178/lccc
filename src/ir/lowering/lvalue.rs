@@ -1094,6 +1094,13 @@ impl Lowerer {
     /// For pointers, this is the loaded pointer value.
     /// For nested subscripts (a[i] where a is multi-dim), compute address without loading.
     pub(super) fn get_array_base_addr(&mut self, base: &Expr) -> Operand {
+        // A small vector call yields packed register bits, not an address.
+        // Subscripts need object storage just like component/member access.
+        // Use the shared ABI-aware materializer: sret, XMM bundles and x87
+        // results already have storage and must not be spilled a second time.
+        if self.expr_ctype(base).is_vector() && self.expr_produces_packed_struct_data(base) {
+            return Operand::Value(self.get_struct_base_addr(base));
+        }
         match base {
             Expr::Identifier(name, _) => {
                 // Check locals first so inner-scope locals shadow statics

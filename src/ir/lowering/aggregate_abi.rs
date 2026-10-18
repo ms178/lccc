@@ -74,6 +74,18 @@ impl Lowerer {
     /// Return convention for a function returning `ret_ct` (a struct,
     /// union or vector of `size` bytes) by value.
     pub(super) fn aggregate_return(&self, ret_ct: &CType, size: usize) -> AggregateReturn {
+        // ExtVector register returns on i386 are not SysV record returns.
+        // Definitions already use this carrier table; indirect calls must
+        // consult it too, rather than adding a hidden record-return pointer
+        // (and expecting the callee to pop a pointer it never received).
+        if crate::common::types::target_is_32bit() {
+            if let Some((_, classes)) = ret_ct.i686_ext_vector_ret_carrier() {
+                return AggregateReturn {
+                    classes,
+                    ..AggregateReturn::default()
+                };
+            }
+        }
         let (sret_size, two_reg_size) = Self::classify_struct_return(size);
         let mut r = AggregateReturn {
             sret_size,

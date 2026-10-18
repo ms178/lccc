@@ -539,6 +539,8 @@ jobs:
       run: env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_a9987_salvage.sh
     - name: ext_vector_type padded layout vs the compiler oracle
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_layout.sh
+    - name: Ext-vector rvalue subscript cross-ABI
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_rvalue_subscript.sh
     - name: ext_vector_type cross-compiler by-value ABI
       run: |
         set -o pipefail

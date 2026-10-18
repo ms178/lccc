@@ -15,7 +15,7 @@
 #     8(%rsp) and returns through the hidden pointer).
 # The two fixtures cover identity/arithmetic/chained forwarding and an
 # exhaustive matrix (fptrs, volatile, memcpy, NaN/Inf/subnormal, integer
-# one-lanes riding INTEGER), each at -O0/-O1/-O2.
+# one-lanes preserving their lane bits), each at -O0/-O1/-O2.
 set -euo pipefail
 root=$(cd -- "$(dirname -- "$0")/../.." && pwd)
 CCC=${CCC:-"$root/target/fastbuild/lccc"}
@@ -36,4 +36,9 @@ for opt in -O0 -O1 -O2; do
         }
     done
 done
-echo 'one-lane FP vector ABI: PASS (ext f64x1 in %xmm0, ext f32x1 INTEGER bits per Clang 23.1.3 grid, integer one-lanes in GPRs, vector_size one-lanes MEMORY per GCC 16.2.0, at -O0/-O1/-O2)'
+echo 'one-lane FP vector ABI: PASS (ext f64x1 in %xmm0, ext f32x1 INTEGER bits per Clang 23.1.3 grid, integer lane bits preserved, vector_size one-lanes MEMORY per GCC 16.2.0, at -O0/-O1/-O2)'
+
+# Direct indexing is a distinct consumer from memcpy/argument forwarding.
+for gate in lane1_abi callsite_abi narrow_arith; do
+    env CCC="$CCC" bash "$root/tests/regression/check_ext_vector_${gate}.sh"
+done
