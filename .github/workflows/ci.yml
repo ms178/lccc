@@ -585,7 +585,15 @@ jobs:
     - name: Wide-vector ABI debt (latched)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_wide.sh
     - name: GNU vector_size alignment model and MEMORY-class vector argument ABI against GCC 16
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_gnu_vector_align_abi.sh
+      run: |
+        set -o pipefail
+        env CCC=target/fastbuild/lccc bash tests/regression/check_gnu_vector_align_abi.sh 2>&1 |
+          tee "$RUNNER_TEMP/gnu-vector-align-abi.log"
+    - name: Surface GNU vector alignment ABI failures in annotations
+      if: failure()
+      run: |
+        [ -s "$RUNNER_TEMP/gnu-vector-align-abi.log" ] &&
+          python3 scripts/ci_annotate_log.py --title "GNU vector alignment ABI" "$RUNNER_TEMP/gnu-vector-align-abi.log" || true
     - name: LCCC vs GCC compatibility suite
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_compat_suite.sh
     - name: IVSR/univsr loop-strength-reduction probe contracts
