@@ -178,3 +178,25 @@ fn rewrite_fp_operands(inst: &mut Instruction, c: FpConst, new_val: u32) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exactly the constants the pass hoists: every non-zero F32/F64 bit
+    /// pattern. +0.0 has a free zeroing idiom and is not hoisted; -0.0 is a
+    /// distinct bit pattern (sign bit set) that must be materialized, as
+    /// must NaN. Integers and other widths are not this pass's.
+    #[test]
+    fn hoisted_fp_constants_are_the_nonzero_bit_patterns() {
+        assert!(!is_hoisted_fp_const(&IrConst::F64(0.0)));
+        assert!(!is_hoisted_fp_const(&IrConst::F32(0.0)));
+        assert!(is_hoisted_fp_const(&IrConst::F64(-0.0)));
+        assert!(is_hoisted_fp_const(&IrConst::F32(-0.0)));
+        assert!(is_hoisted_fp_const(&IrConst::F64(1.5)));
+        assert!(is_hoisted_fp_const(&IrConst::F32(f32::NAN)));
+        assert!(is_hoisted_fp_const(&IrConst::F64(f64::MIN_POSITIVE / 2.0)));
+        assert!(!is_hoisted_fp_const(&IrConst::I64(0x3ff0_0000_0000_0000)));
+        assert!(!is_hoisted_fp_const(&IrConst::I32(1)));
+    }
+}

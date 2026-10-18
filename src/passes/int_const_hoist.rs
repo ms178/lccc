@@ -59,15 +59,48 @@ pub(crate) fn model_for(target: crate::backend::Target) -> Option<ImmModel> {
     }
 }
 
-/// Whether this pass can materialize `c` in a loop preheader under
-/// `model`: the constant is unencodable even in a plain immediate position
-/// of its own width (32-bit forms take the imm32 pattern verbatim). Late
-/// passes that forward constant copies must spare such copies -- forwarding
-/// one re-sinks the `movabsq`/`movz`+`movk`/`lui`+`addi` into every
-/// iteration (sum_div7's magic multiplier).
-pub(crate) fn is_hoisted_int_const(model: ImmModel, c: &IrConst) -> bool {
-    let imm32_exact = matches!(c, IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_));
-    large_int_const_in(model, &Operand::Const(*c), false, imm32_exact).is_some()
+/// The integer constant homes of `func` under `model`: every single-def
+/// `Copy dest = Const(c)` that feeds at least one operand position where
+/// this pass's own criterion ([`large_int_const_in`] with that position's
+/// `needs_reg`/`imm32_exact`) says `c` costs a materialization. Late passes
+/// that forward constant copies must spare these -- forwarding one re-sinks
+/// the `movabsq`/`movz`+`movk`/`lui`+`addi` (or AArch64's `mov` for a `mul`
+/// or `sdiv` operand, which has no immediate form at all) into every use.
+/// Position-exact on purpose: the pass hoists a small constant only for a
+/// register-only position, so a test on the constant alone cannot tell
+/// such a home from an ordinary copy.
+pub(crate) fn const_homes(func: &IrFunction, model: ImmModel) -> FxHashSet<u32> {
+    let mut consts: FxHashMap<u32, Option<IrConst>> = FxHashMap::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::Copy {
+            dest,
+            src: Operand::Const(c),
+        } = inst
+        {
+            // A second Copy definition poisons the entry (not single-def).
+            consts
+                .entry(dest.0)
+                .and_modify(|e| *e = None)
+                .or_insert(Some(*c));
+        }
+    }
+    let mut homes = FxHashSet::default();
+    if consts.is_empty() {
+        return homes;
+    }
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        for_each_int_operand_in(model, inst, &mut |op, needs_reg, imm32_exact| {
+            if let Operand::Value(v) = op {
+                if let Some(Some(c)) = consts.get(&v.0) {
+                    let op = Operand::Const(*c);
+                    if large_int_const_in(model, &op, needs_reg, imm32_exact).is_some() {
+                        homes.insert(v.0);
+                    }
+                }
+            }
+        });
+    }
+    homes
 }
 use crate::common::types::IrType;
 use crate::ir::analysis;
@@ -267,6 +300,15 @@ fn large_int_const_in(
 /// pays a materialization there (Lev Kropp's 558e3ed9 insight, generalized
 /// per target).
 fn for_each_int_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand, bool, bool)) {
+    for_each_int_operand_in(MODEL.with(|c| c.get()), inst, f);
+}
+
+/// [`for_each_int_operand`] under an explicit immediate model.
+fn for_each_int_operand_in(
+    model: ImmModel,
+    inst: &Instruction,
+    f: &mut dyn FnMut(&Operand, bool, bool),
+) {
     match inst {
         Instruction::BinOp {
             op, lhs, rhs, ty, ..
@@ -277,7 +319,7 @@ fn for_each_int_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand, bool, bo
                 // take imm12, so a small constant is a materialization ONLY
                 // at that position. RISC-V has no immediate forms anywhere
                 // (uniform `li` staging), so `mul` is not special there.
-                IrBinOp::Mul => MODEL.with(|c| c.get()) == ImmModel::Aarch64,
+                IrBinOp::Mul => model == ImmModel::Aarch64,
                 _ => false,
             };
             // Shift counts are a separate encoding (imm8 / %cl) and never take
@@ -641,5 +683,84 @@ mod tests {
             assert_eq!(run(&mut func), 1);
             assert!(matches!(mul_rhs(&func), Operand::Value(_)));
         });
+    }
+
+    /// One block: `Copy %1 = Const(c)`, then `%3 = %2 <op> %1` in type `ty`
+    /// (and a second Copy of %1 when `twice`), returning %3.
+    fn home_func(c: IrConst, op: IrBinOp, ty: IrType, twice: bool) -> IrFunction {
+        let mut func = IrFunction::new("homes".to_string(), IrType::I64, vec![], false);
+        let mut instructions = vec![Instruction::Copy {
+            dest: Value(1),
+            src: Operand::Const(c),
+        }];
+        if twice {
+            instructions.push(Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Const(c),
+            });
+        }
+        instructions.push(Instruction::Copy {
+            dest: Value(2),
+            src: Operand::Const(IrConst::I64(3)),
+        });
+        instructions.push(Instruction::BinOp {
+            dest: Value(3),
+            op,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Value(Value(1)),
+            ty,
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 4;
+        func
+    }
+
+    fn is_home(model: ImmModel, c: IrConst, op: IrBinOp, ty: IrType) -> bool {
+        const_homes(&home_func(c, op, ty, false), model).contains(&1)
+    }
+
+    /// The homes are exactly the copies this pass would have created for
+    /// their use positions: AArch64 hoists a small constant only for `mul`
+    /// / `sdiv` (no immediate form), so `#7` is a home there and not under
+    /// `add`; x86-64 64-bit forms sign-extend imm32 while 32-bit forms take
+    /// the bit pattern verbatim; RISC-V's boundary is imm12. %2 (a small
+    /// constant in the left position) is never a home, and a multiply
+    /// defined copy never is either.
+    #[test]
+    fn const_homes_follow_the_hoisting_criterion_per_position() {
+        use IrBinOp::{Add, Mul, SDiv};
+        use IrType::{I32, I64};
+        let a64 = ImmModel::Aarch64;
+        assert!(is_home(a64, IrConst::I64(7), Mul, I64));
+        assert!(is_home(a64, IrConst::I64(7), SDiv, I64));
+        assert!(!is_home(a64, IrConst::I64(7), Add, I64));
+        assert!(!is_home(a64, IrConst::I64(4095), Add, I64));
+        assert!(is_home(a64, IrConst::I64(4096), Add, I64));
+
+        let x86 = ImmModel::X86_64;
+        assert!(!is_home(x86, IrConst::I64(7), Mul, I64));
+        assert!(!is_home(x86, IrConst::I64(i32::MAX as i64), Add, I64));
+        assert!(is_home(x86, IrConst::I64(1 << 32), Add, I64));
+        assert!(is_home(x86, IrConst::I64(0x9e37_79b1), Mul, I64));
+        assert!(!is_home(x86, IrConst::I64(0x9e37_79b1), Mul, I32));
+        assert!(is_home(x86, IrConst::I64(1 << 40), SDiv, I64));
+
+        let rv = ImmModel::Riscv;
+        assert!(!is_home(rv, IrConst::I64(2047), Add, I64));
+        assert!(!is_home(rv, IrConst::I64(-2048), Mul, I64));
+        assert!(is_home(rv, IrConst::I64(2048), Add, I64));
+
+        for model in [a64, x86, rv] {
+            let f = home_func(IrConst::I64(1 << 40), Add, I64, false);
+            assert!(!const_homes(&f, model).contains(&2), "{model:?}");
+            let f = home_func(IrConst::I64(1 << 40), Add, I64, true);
+            assert!(const_homes(&f, model).is_empty(), "{model:?}");
+        }
+        assert_eq!(model_for(crate::backend::Target::I686), None);
     }
 }

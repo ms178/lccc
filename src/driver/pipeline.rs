@@ -2392,15 +2392,20 @@ impl Driver {
             // x87 F64 constants (a stack-temporary rebuild per use) into loops.
             let int_model = crate::passes::int_const_hoist::model_for(self.target);
             let hoists_ran = self.opt_level >= 2;
-            let spare = |c: &crate::ir::reexports::IrConst| {
-                hoists_ran
-                    && (crate::passes::fp_const_hoist::is_hoisted_fp_const(c)
-                        || int_model.is_some_and(|m| {
-                            crate::passes::int_const_hoist::is_hoisted_int_const(m, c)
-                        }))
-            };
             for (func, &floor) in module.functions.iter_mut().zip(&fresh_floor) {
                 if !func.is_declaration && !func.blocks.is_empty() {
+                    let int_homes = match int_model {
+                        Some(m) if hoists_ran => {
+                            crate::passes::int_const_hoist::const_homes(func, m)
+                        }
+                        _ => Default::default(),
+                    };
+                    let spare =
+                        |v: crate::ir::reexports::Value, c: &crate::ir::reexports::IrConst| {
+                            hoists_ran
+                                && (crate::passes::fp_const_hoist::is_hoisted_fp_const(c)
+                                    || int_homes.contains(&v.0))
+                        };
                     crate::passes::copy_prop::propagate_copies_sparing(func, floor, &spare);
                     crate::passes::dce::eliminate_dead_code(func);
                 }
