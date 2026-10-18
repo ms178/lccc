@@ -67,7 +67,7 @@ impl Lowerer {
         let outer = self.folding_initializer.replace(true);
         let lowered = match init {
             Initializer::Expr(expr) => {
-                self.lower_global_init_expr(expr, type_spec, base_ty, is_array, obj_ty, elem_ct)
+                self.lower_global_init_expr(expr, base_ty, is_array, obj_ty, elem_ct)
             }
             Initializer::List(items) => {
                 // Resolve brace elision, designator chains and overrides of
@@ -80,7 +80,6 @@ impl Lowerer {
                 let items = canonical.as_deref().unwrap_or(items);
                 self.lower_global_init_list(
                     items,
-                    type_spec,
                     base_ty,
                     is_array,
                     elem_size,
@@ -125,7 +124,6 @@ impl Lowerer {
     fn lower_global_init_expr(
         &mut self,
         expr: &Expr,
-        type_spec: &TypeSpecifier,
         base_ty: IrType,
         is_array: bool,
         obj_ty: Option<&CType>,
@@ -136,24 +134,25 @@ impl Lowerer {
         // literals, address expressions, etc.) sees the resolved expression.
         if let Expr::GenericSelection(controlling, associations, _) = expr {
             if let Some(selected) = self.resolve_generic_selection_expr(controlling, associations) {
-                return self.lower_global_init_expr(
-                    selected, type_spec, base_ty, is_array, obj_ty, elem_ct,
-                );
+                return self.lower_global_init_expr(selected, base_ty, is_array, obj_ty, elem_ct);
             }
         }
 
         // Complex types: handle before scalar evaluation to prevent misinterpretation
         // of scalar values (e.g., `_Complex float g = 1.0f;`).
-        {
-            let ctype = self.type_spec_to_ctype(type_spec);
-            if ctype.is_complex() {
-                if let Some(init) = self.eval_complex_global_init(expr, &ctype) {
-                    return init;
-                }
+        //
+        // Every type decision below uses `elem_ct`, the object's own scalar
+        // type -- never `type_spec`, the declaration's base specifier: for
+        // `_Decimal64 *p = (_Decimal64 *)64;` the base is `_Decimal64` but
+        // the object is a pointer, and converting the address as a decimal
+        // stored its BID encoding (likewise `long double *`, `_Bool *`).
+        if elem_ct.is_complex() {
+            if let Some(init) = self.eval_complex_global_init(expr, elem_ct) {
+                return init;
             }
         }
         // A vector from a constant vector expression (`v = (T){ ... }`). The
-        // object's own type decides: `type_spec` is only the declaration's
+        // object's own type decides: the declaration's type specifier is only its
         // base specifier (`T (*fp)(int) = f;` has base type `T`).
         if let Some(vec_ct) = obj_ty.filter(|t| t.is_vector()) {
             let mut bytes = vec![0u8; self.resolve_ctype_size(vec_ct)];
@@ -201,7 +200,7 @@ impl Lowerer {
             // expansion, BID sources by decode/re-encode) — never a raw
             // integer/float bit-cast (`_Decimal32 g = 5` used to emit the
             // I64 {5}). Unhandled kinds fall through to coerce (status quo).
-            let target_ct = self.type_spec_to_ctype(type_spec);
+            let target_ct = elem_ct.clone();
             if target_ct.is_decimal() {
                 let width = match target_ct {
                     CType::Decimal32 => 32,
@@ -320,12 +319,11 @@ impl Lowerer {
         // so each is folded here instead of falling through to the
         // non-constant diagnostic below.
         if let Some(v) = self.eval_global_relational(expr) {
-            let target_ct = self.type_spec_to_ctype(type_spec);
             return GlobalInit::Scalar(self.coerce_scalar_const(
                 IrConst::I64(v),
                 expr,
                 base_ty,
-                Some(&target_ct),
+                Some(elem_ct),
             ));
         }
 
@@ -383,9 +381,13 @@ impl Lowerer {
 
     /// The truth value of a folded operand: an address is never null.
     fn global_truth(&self, expr: &Expr) -> Option<bool> {
-        match self.global_operand(expr)? {
-            GlobalOperand::Int(v) => Some(v != 0),
-            GlobalOperand::Addr(..) => Some(true),
+        match self.global_operand(expr) {
+            Some(GlobalOperand::Int(v)) => Some(v != 0),
+            Some(GlobalOperand::Addr(..)) => Some(true),
+            // A nested relation or logical form: `!(&g == 0)`,
+            // `(&g != 0) && (&h != 0)` (GCC folds both).  Each call descends
+            // into a strict subexpression, so the recursion terminates.
+            None => self.eval_global_relational(expr).map(|v| v != 0),
         }
     }
 
@@ -418,6 +420,25 @@ impl Lowerer {
                 self.global_truth(lhs)? || self.global_truth(rhs)?,
             )),
             Expr::BinaryOp(op, lhs, rhs, _) => self.eval_global_compare(*op, lhs, rhs),
+            // `(T)(&g != 0)`: GCC folds the cast of such a value too.  Every
+            // conversion to an integer, `_Bool`, pointer, binary or decimal
+            // floating type maps 0 to 0 and 1 to 1 exactly (GCC's integer to
+            // pointer conversion keeps the value), so the cast is peeled only
+            // for those targets and only for a 0/1 operand; a string
+            // character outside {0, 1} or a vector/complex/aggregate target
+            // still declines.
+            Expr::Cast(ts, inner, _, _) => {
+                let to = self.type_spec_to_ctype(ts);
+                let exact = to.is_integer()
+                    || to.is_floating()
+                    || to.is_decimal()
+                    || matches!(to, CType::Float128 | CType::Pointer(..));
+                if !exact {
+                    return None;
+                }
+                self.eval_global_relational(inner)
+                    .filter(|v| matches!(v, 0 | 1))
+            }
             _ => None,
         }
     }
@@ -665,7 +686,6 @@ impl Lowerer {
     fn lower_global_init_list(
         &mut self,
         items: &[InitializerItem],
-        type_spec: &TypeSpecifier,
         base_ty: IrType,
         is_array: bool,
         elem_size: usize,
@@ -683,10 +703,11 @@ impl Lowerer {
             }
         }
 
-        // Complex array: double _Complex arr[] = { ... }
-        let complex_ctype = self.type_spec_to_ctype(type_spec);
-        if is_array && complex_ctype.is_complex() {
-            return self.lower_complex_array_init(items, &complex_ctype, total_size, elem_size);
+        // Complex array: double _Complex arr[] = { ... }.  The leaf type
+        // decides, not the base specifier: `_Complex double *a[2]` is an
+        // array of pointers (it was lowered as complex values).
+        if is_array && elem_ct.is_complex() {
+            return self.lower_complex_array_init(items, elem_ct, total_size, elem_size);
         }
 
         // Arrays of ext-vectors have vector objects as their leaf
