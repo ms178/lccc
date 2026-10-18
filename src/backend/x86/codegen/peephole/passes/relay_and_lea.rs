@@ -331,6 +331,68 @@ pub(super) fn function_range(
     Some((start, end))
 }
 
+/// The `.cfi_startproc` / `.cfi_endproc` markers of a line store, answering
+/// [`function_range`] in O(log F) for passes that ask once per loop or per
+/// candidate (a scan per query is quadratic in the function's length).
+///
+/// Exact while the caller reports every `insert_line` through
+/// [`CfiIndex::shift_for_insert`] and never rewrites, nops or inserts a CFI
+/// marker line itself.
+pub(super) struct CfiIndex {
+    /// Every live marker, ascending: `(line, is_startproc)`.
+    marks: Vec<(usize, bool)>,
+}
+
+impl CfiIndex {
+    pub(super) fn build(store: &LineStore, infos: &[LineInfo]) -> Self {
+        let mut marks = Vec::new();
+        for (n, info) in infos.iter().enumerate().take(store.len()) {
+            if info.is_nop() {
+                continue;
+            }
+            let t = info.trimmed(store.get(n));
+            if t.starts_with(".cfi_startproc") {
+                marks.push((n, true));
+            } else if t.starts_with(".cfi_endproc") {
+                marks.push((n, false));
+            }
+        }
+        CfiIndex { marks }
+    }
+
+    /// [`function_range`]`(store, infos, idx)` for a store of `len` lines.
+    pub(super) fn function_range(&self, idx: usize, len: usize) -> Option<(usize, usize)> {
+        if len == 0 {
+            return None;
+        }
+        // Nearest marker at or above the clamped index going backward: a
+        // startproc opens the function, an endproc means `idx` lies
+        // between two functions.
+        let k = self.marks.partition_point(|&(n, _)| n <= idx.min(len - 1));
+        let (start, is_start) = *self.marks.get(k.checked_sub(1)?)?;
+        if !is_start {
+            return None;
+        }
+        // First endproc at or after `idx` (startprocs are stepped over, as
+        // the forward scan does); past-the-end when there is none.
+        let from = self.marks.partition_point(|&(n, _)| n < idx);
+        let end = self.marks[from..]
+            .iter()
+            .find(|&&(_, is_start)| !is_start)
+            .map_or(len, |&(n, _)| n);
+        Some((start, end))
+    }
+
+    /// Account for `store.insert_line(ins, ..)` of a non-CFI line.
+    pub(super) fn shift_for_insert(&mut self, ins: usize) {
+        for (n, _) in &mut self.marks {
+            if *n >= ins {
+                *n += 1;
+            }
+        }
+    }
+}
+
 /// Registers an ABI-visible control transfer can READ without naming them in
 /// the instruction text: the SysV argument registers (`%rdi %rsi %rdx %rcx
 /// %r8 %r9`) and `%rax` (vector-argument count for variadic callees).
@@ -3710,6 +3772,72 @@ fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String> 
 
 #[cfg(test)]
 mod tests {
+
+    /// `CfiIndex` answers exactly what the `function_range` scan answers, for
+    /// every line: before the first function, inside one, on a marker,
+    /// between two functions (an `endproc` nearer than any `startproc`),
+    /// across a marker nopped before the index was built, inside a function
+    /// left open at the end of the text, and after an `insert_line`.
+    #[test]
+    fn cfi_index_matches_function_range_scan() {
+        let asm = concat!(
+            "    .text\n",
+            "f:\n.cfi_startproc\n",
+            "    movl $1, %eax\n",
+            "    ret\n.cfi_endproc\n",
+            "    .p2align 4\n",
+            "g:\n.cfi_startproc\n",
+            "    .cfi_endproc\n", // nopped below: g continues past it
+            "    movl $2, %eax\n",
+            "    ret\n.cfi_endproc\n",
+            "h:\n.cfi_startproc\n",
+            "    movl $3, %eax\n",
+            "    ret\n",
+        );
+        let mut store = super::LineStore::new(asm.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| super::classify_line(store.get(i)))
+            .collect();
+        let stray = (0..store.len())
+            .filter(|&i| store.get(i).trim() == ".cfi_endproc")
+            .nth(1)
+            .expect("fixture has a second endproc");
+        super::mark_nop(&mut infos[stray]);
+
+        let check = |store: &super::LineStore, infos: &[super::LineInfo], idx: &super::CfiIndex| {
+            for i in 0..store.len() {
+                assert_eq!(
+                    idx.function_range(i, store.len()),
+                    super::function_range(store, infos, i),
+                    "line {i}: {:?}",
+                    store.get(i)
+                );
+            }
+        };
+        let mut idx = super::CfiIndex::build(&store, &infos);
+        check(&store, &infos, &idx);
+        // Unterminated `h` runs to the end; the gap between f and g is in
+        // no function.
+        let last = store.len() - 1;
+        assert_eq!(
+            idx.function_range(last, store.len()).map(|r| r.1),
+            Some(store.len())
+        );
+        let gap = (0..store.len())
+            .find(|&i| store.get(i).trim() == ".p2align 4")
+            .unwrap();
+        assert_eq!(idx.function_range(gap, store.len()), None);
+
+        // Insert inside g (and at the very front): the shifted index still
+        // agrees with a fresh scan.
+        for at in [stray + 2, 0] {
+            let text = "    nop".to_string();
+            store.insert_line(at, text.clone());
+            infos.insert(at, super::classify_line(&text));
+            idx.shift_for_insert(at);
+            check(&store, &infos, &idx);
+        }
+    }
 
     #[test]
     fn mem_index_relay_folds_movl_copy() {

@@ -303,25 +303,6 @@ pub(crate) fn is_explicit_call(inst: &Instruction) -> bool {
     )
 }
 
-fn value_is_phi_dest(func: &IrFunction, vid: u32) -> bool {
-    func.blocks.iter().any(|b| {
-        b.instructions
-            .iter()
-            .any(|i| matches!(i, Instruction::Phi { dest, .. } if dest.0 == vid))
-    })
-}
-
-fn value_is_phi_incoming(func: &IrFunction, vid: u32) -> bool {
-    func.blocks.iter().any(|b| {
-        b.instructions.iter().any(|i| match i {
-            Instruction::Phi { incoming, .. } => incoming
-                .iter()
-                .any(|(op, _)| matches!(op, Operand::Value(v) if v.0 == vid)),
-            _ => false,
-        })
-    })
-}
-
 fn collect_alloca_ids(func: &IrFunction) -> FxHashSet<u32> {
     let mut s = FxHashSet::default();
     for block in &func.blocks {
@@ -649,32 +630,47 @@ pub fn split_call_spanning_ranges(func: &mut IrFunction, max_splits: usize) -> u
     let mut rejected: FxHashSet<u32> = FxHashSet::default();
     let mut next_val = func.next_value_id;
 
-    while splits < max_splits {
-        let Some(vid) = pick_call_split_candidate(func, &rejected) else {
-            break;
-        };
-        rejected.insert(vid);
-        match apply_local_call_split(func, vid, &mut next_val) {
-            Some(n) if n > 0 => {
+    // A declined split leaves the IR untouched, so the ranking (and the
+    // liveness it came from) stays valid: walk on to the next candidate and
+    // recompute only after a split actually rewrote the function.  This is
+    // the same sequence of choices as re-picking the best non-rejected
+    // candidate after every attempt, without a liveness solve per decline.
+    'rank: while splits < max_splits {
+        let (ranked, types) = rank_call_split_candidates(func, &rejected);
+        for vid in ranked {
+            rejected.insert(vid);
+            if let Some(n) = apply_local_call_split(func, vid, &types, &mut next_val) {
+                debug_assert!(n > 0, "a split that wraps nothing must decline");
                 splits += 1;
                 func.next_value_id = next_val;
+                continue 'rank;
             }
-            _ => {}
         }
+        break;
     }
     splits
 }
 
-fn pick_call_split_candidate(func: &IrFunction, rejected: &FxHashSet<u32>) -> Option<u32> {
+/// Every call-split candidate, best first (most uses; ties keep live-interval
+/// order), plus the value types they were judged with.
+///
+/// One linear pass gathers the facts every candidate needs (phi
+/// destinations, phi incomings, per-value use counts); asking the function
+/// for each live interval separately was O(values x instructions).
+fn rank_call_split_candidates(
+    func: &IrFunction,
+    rejected: &FxHashSet<u32>,
+) -> (Vec<u32>, FxHashMap<u32, IrType>) {
+    let types = collect_value_types(func);
     let liveness = super::liveness::compute_live_intervals(func);
     if liveness.call_points.is_empty() {
-        return None;
+        return (Vec::new(), types);
     }
     let alloca_set = collect_alloca_ids(func);
-    let types = collect_value_types(func);
     let points = assign_point_locs(func);
+    let facts = UseFacts::collect(func);
 
-    let mut best: Option<(u32, u32)> = None; // (vid, uses)
+    let mut ranked: Vec<(u32, u32)> = Vec::new(); // (vid, uses)
     for iv in &liveness.intervals {
         if rejected.contains(&iv.value_id) || alloca_set.contains(&iv.value_id) {
             continue;
@@ -682,7 +678,7 @@ fn pick_call_split_candidate(func: &IrFunction, rejected: &FxHashSet<u32>) -> Op
         if iv.end <= iv.start {
             continue;
         }
-        if value_is_phi_dest(func, iv.value_id) || value_is_phi_incoming(func, iv.value_id) {
+        if facts.phi_dests.contains(&iv.value_id) || facts.phi_incomings.contains(&iv.value_id) {
             continue;
         }
         let Some(&ty) = types.get(&iv.value_id) else {
@@ -715,39 +711,86 @@ fn pick_call_split_candidate(func: &IrFunction, rejected: &FxHashSet<u32>) -> Op
             continue;
         }
 
-        let uses = count_uses(func, iv.value_id);
+        let uses = facts.uses.get(&iv.value_id).copied().unwrap_or(0);
         // Each wrap is a Store+Load (~two memops). Demand enough post-split
         // register uses to pay for them. Same constant the original used.
         if uses < calls_in.saturating_mul(4).saturating_add(5) {
             continue;
         }
-        if best.is_none_or(|(_, u)| uses > u) {
-            best = Some((iv.value_id, uses));
-        }
+        ranked.push((iv.value_id, uses));
     }
-    best.map(|(v, _)| v)
+    // Stable: equal use counts keep interval order, as the arg-max did.
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    (ranked.into_iter().map(|(v, _)| v).collect(), types)
 }
 
-fn count_uses(func: &IrFunction, vid: u32) -> u32 {
-    let mut n = 0u32;
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if instruction_uses_value(inst, vid) {
-                n = n.saturating_add(1);
+/// Per-function use facts for the call-split picker, from one pass.
+struct UseFacts {
+    phi_dests: FxHashSet<u32>,
+    phi_incomings: FxHashSet<u32>,
+    /// Instructions and terminators using each value (each counted once,
+    /// however many operands name the value): `instruction_uses_value` /
+    /// `terminator_uses_value` summed over the function.
+    uses: FxHashMap<u32, u32>,
+}
+
+impl UseFacts {
+    fn collect(func: &IrFunction) -> Self {
+        let mut phi_dests = FxHashSet::default();
+        let mut phi_incomings = FxHashSet::default();
+        let mut uses: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut seen: Vec<u32> = Vec::new();
+        let mut bump = |seen: &mut Vec<u32>| {
+            seen.sort_unstable();
+            seen.dedup();
+            for &v in seen.iter() {
+                let n = uses.entry(v).or_insert(0);
+                *n = n.saturating_add(1);
             }
+            seen.clear();
+        };
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Phi { dest, incoming, .. } = inst {
+                    phi_dests.insert(dest.0);
+                    for (op, _) in incoming {
+                        if let Operand::Value(v) = op {
+                            phi_incomings.insert(v.0);
+                        }
+                    }
+                }
+                super::liveness::for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        seen.push(v.0);
+                    }
+                });
+                super::liveness::for_each_value_use_in_instruction(inst, |v| seen.push(v.0));
+                bump(&mut seen);
+            }
+            super::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+                if let Operand::Value(v) = op {
+                    seen.push(v.0);
+                }
+            });
+            bump(&mut seen);
         }
-        if terminator_uses_value(&block.terminator, vid) {
-            n = n.saturating_add(1);
+        UseFacts {
+            phi_dests,
+            phi_incomings,
+            uses,
         }
     }
-    n
 }
 
 /// Wrap every same-block call that `vid` is live across. Returns the number
 /// of calls wrapped, or `None` if the IR didn't match the plan (raced with
 /// an earlier edit, def vanished, …).
-fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -> Option<usize> {
-    let types = collect_value_types(func);
+fn apply_local_call_split(
+    func: &mut IrFunction,
+    vid: u32,
+    types: &FxHashMap<u32, IrType>,
+    next_val: &mut u32,
+) -> Option<usize> {
     let ty = *types.get(&vid)?;
     if !is_simple_gpr_type(ty) {
         return None;
@@ -765,22 +808,30 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
     // The picker already required the live interval to end in the same
     // block as every contained call; we re-check locally so a stale
     // candidate cannot rewrite the wrong uses.
+    // A call is used-after iff the terminator uses `vid` or some later
+    // instruction does: one reverse scan per block finds the last use.
     let mut sites: Vec<(usize, usize)> = Vec::new(); // (block, call_inst_idx)
     for (bi, block) in func.blocks.iter().enumerate() {
-        for (ii, inst) in block.instructions.iter().enumerate() {
+        let used_until = if terminator_uses_value(&block.terminator, vid) {
+            block.instructions.len()
+        } else {
+            match block
+                .instructions
+                .iter()
+                .rposition(|i| instruction_uses_value(i, vid))
+            {
+                Some(last) => last,
+                None => continue,
+            }
+        };
+        for (ii, inst) in block.instructions[..used_until].iter().enumerate() {
             if !is_explicit_call(inst) && !is_liveness_call_like(inst) {
                 continue;
             }
             if bi == def.0 && ii <= def.1 {
                 continue;
             }
-            let after = block.instructions[ii + 1..]
-                .iter()
-                .any(|i| instruction_uses_value(i, vid))
-                || terminator_uses_value(&block.terminator, vid);
-            if after {
-                sites.push((bi, ii));
-            }
+            sites.push((bi, ii));
         }
     }
     if sites.is_empty() {
@@ -823,23 +874,30 @@ fn apply_local_call_split(func: &mut IrFunction, vid: u32, next_val: &mut u32) -
             continue;
         }
 
-        // First confirmed wrap: mint and insert the entry alloca, then
-        // re-derive this site's index across the shift.
-        if alloca_val.is_none() {
-            let slot = next_value(next_val)?;
-            insert_entry_alloca(func, slot, ty, true);
-            alloca_val = Some(slot);
+        // Mint every id this wrap needs before mutating anything, so id
+        // exhaustion can only stop the split between whole wraps (the
+        // alloca never leaks unsynced).  The first confirmed wrap then
+        // inserts the entry alloca and re-derives this site's index across
+        // the shift.
+        let need = if alloca_val.is_none() { 2 } else { 1 };
+        if next_val.checked_add(need).is_none() {
+            break;
         }
-        let alloca_val = alloca_val.unwrap();
+        let alloca_val = match alloca_val {
+            Some(slot) => slot,
+            None => {
+                let slot = next_value(next_val)?;
+                insert_entry_alloca(func, slot, ty, true);
+                alloca_val = Some(slot);
+                slot
+            }
+        };
         let ci = if site_block == 0 && raw_ci >= alloca_pos {
             raw_ci + 1
         } else {
             raw_ci
         };
-        let new_val = match next_value(next_val) {
-            Some(v) => v,
-            None => break,
-        };
+        let new_val = next_value(next_val)?;
 
         // [store, call, load, ...]
         insert_instruction(
@@ -1308,7 +1366,8 @@ mod tests {
         func.next_value_id = 4;
 
         let mut next_val = func.next_value_id;
-        let n = apply_local_call_split(&mut func, 0, &mut next_val).expect("split applies");
+        let types = collect_value_types(&func);
+        let n = apply_local_call_split(&mut func, 0, &types, &mut next_val).expect("split applies");
         assert_eq!(n, 1, "the one call must be wrapped");
         func.next_value_id = next_val;
 
@@ -1372,7 +1431,8 @@ mod tests {
         )];
         func.next_value_id = 1;
         let mut next_val = 1u32;
-        assert!(apply_local_call_split(&mut func, 0, &mut next_val).is_none());
+        let types = collect_value_types(&func);
+        assert!(apply_local_call_split(&mut func, 0, &types, &mut next_val).is_none());
         assert_eq!(next_val, 1, "no ids minted on the clean-reject path");
         assert!(
             !func.blocks[0]

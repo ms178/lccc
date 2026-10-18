@@ -1462,6 +1462,31 @@ fn fold_computed_phi_incomings(func: &mut IrFunction) {
     let label_to_idx = analysis::build_label_map(func);
     let (preds, succs) = analysis::build_cfg(func, &label_to_idx);
     let idom = analysis::compute_dominators(num_blocks, &preds, &succs);
+    // O(1) strict dominance (dominator-tree Euler intervals; unreachable
+    // blocks are their own roots, so nothing else dominates them).
+    let dom = analysis::DominanceChecker::new(num_blocks, &idom);
+    // value id -> blocks whose instructions read or write it, ascending and
+    // deduplicated.  The fold only moves an instruction within its own
+    // block, so this stays exact for the whole sweep.  The dominated-region
+    // test below then visits only the few blocks touching the phi home,
+    // instead of every block with an idom-chain walk each (cubic in a long
+    // sequence of loops).
+    let mut touch_blocks: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    for (bj, blk) in func.blocks.iter().enumerate() {
+        let bj = bj as u32;
+        let mut note = |id: u32| {
+            let v = touch_blocks.entry(id).or_default();
+            if v.last() != Some(&bj) {
+                v.push(bj);
+            }
+        };
+        for inst in &blk.instructions {
+            if let Some(Value(d)) = inst.dest() {
+                note(d);
+            }
+            inst.for_each_used_value(&mut note);
+        }
+    }
     for bi in 0..func.blocks.len() {
         // Candidates: every Copy in the block whose source is defined by a
         // pure ALU instruction in the same block. The whole block is scanned
@@ -1543,44 +1568,11 @@ fn fold_computed_phi_incomings(func: &mut IrFunction) {
                     // that the planner parked in a trampoline reads the home
                     // after this block ends. C1 itself lives in this block,
                     // so the sweep cannot match the relay we are folding.
-                    'dom: for (bj, blkj) in func.blocks.iter().enumerate() {
-                        if bj == bi {
-                            continue;
-                        }
-                        // Strict dominance via the idom chain of `bj`
-                        // (bounded walk; the usize::MAX sentinel marks
-                        // unreachable blocks and terminates the loop).
-                        let mut cur = bj;
-                        let mut steps = 0usize;
-                        while cur < idom.len() && steps <= num_blocks {
-                            if cur == bi {
-                                for inst in &blkj.instructions {
-                                    if inst.dest().is_some_and(|Value(d)| d == dest.0) {
-                                        pending_relay = true;
-                                        break 'dom;
-                                    }
-                                    let mut touches = false;
-                                    inst.for_each_used_value(|id| {
-                                        if id == dest.0 {
-                                            touches = true;
-                                        }
-                                    });
-                                    if touches {
-                                        pending_relay = true;
-                                        break 'dom;
-                                    }
-                                }
-                                break;
-                            }
-                            let next = idom[cur];
-                            if next == cur || next >= idom.len() {
-                                // entry self-parent or sentinel: stop
-                                break;
-                            }
-                            cur = next;
-                            steps += 1;
-                        }
-                    }
+                    pending_relay = touch_blocks.get(&dest.0).is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|&bj| dom.strictly_dominates(bi, bj as usize))
+                    });
                 }
                 if !pending_relay {
                     return None;
