@@ -82,9 +82,19 @@ int r[] = {
     _Alignof(gd), _Alignof(gv),
 };
 EOF
-constants() {  # constants <compiler> <flags...>: the `.long` data of probe.c
+constants() {  # constants <compiler> <flags...>: the `.long` data of `r` in probe.c
     local cc=$1; shift
-    "$cc" "$@" -w -O0 -S "$tmp/probe.c" -o - | sed -n 's/^[[:space:]]*\.long[[:space:]]*//p' | tr '\n' ' '
+    # Scope the extraction to the initialiser of `r` (from its label to the
+    # first non-`.long` line).  A bare `.long` grep also picks up data the
+    # toolchain appends on its own -- a GCC configured with
+    # `--enable-cet`/default `-fcf-protection` (Ubuntu runners) emits a
+    # `.note.gnu.property` of `.long 1f - 0f`/`.long 0xc0000002` entries
+    # after the object, which is not an ABI constant and must not be compared.
+    "$cc" "$@" -w -O0 -S "$tmp/probe.c" -o - \
+        | awk '/^r:/ { in_r = 1; next }
+               in_r && /^[[:space:]]*\.long[[:space:]]/ { sub(/^[[:space:]]*\.long[[:space:]]*/, ""); print; next }
+               in_r { exit }' \
+        | tr '\n' ' '
 }
 for flags in "-m64" "-m64 -mavx" "-m64 -mavx2" "-m64 -mavx512f" "-m32" "-m32 -mavx"; do
     # shellcheck disable=SC2086  # flags are a word list on purpose

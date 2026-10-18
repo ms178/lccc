@@ -3752,3 +3752,24 @@ failing in both directions while -O0 passed.
   i386 `ldx3` rows (`ABI-EXTVEC-LD-I386-1`) turned out to be the same two
   effects: the -O0 rows retired with the stride, the -O2 `hash2` rows are
   the oracle class.
+
+### Addendum — oracle assembly must be scoped, not grepped (2026-10-18)
+
+The first hosted run of `check_gnu_vector_align_abi.sh` (it had sat behind
+the then-red grid step) failed all four `-m64` constant legs while all 39
+values agreed. The GitHub runner's GCC enables `-fcf-protection` by default
+and appends a `.note.gnu.property` (`.long 1f - 0f`, `.long 0xc0000002`,
+…) after the probe's data; the gate harvested every `.long` in the file.
+Locally (Debian gcc-16, no CET default) the gate was green, including seven
+environment/stack-residue variations, so the host CPU was ruled out before
+the runner toolchain default was found — reproduced with a `gcc-16
+-fcf-protection` wrapper (old extraction: 6/6 FAIL; new: 50/50 PASS).
+
+Decision: oracle-derived constants are extracted from the probe object's own
+initialiser (`r:` label up to the first non-`.long` line, `awk`), never from
+a whole-file directive grep. Any gate that compares emitted data against an
+oracle must scope the same way; `check_ext_vector_layout.sh` already runs
+its probes rather than reading assembly and is unaffected. The step also
+now tees its log and emits `::error` annotations on failure (the same
+wrapper the grid step has), so the next hosted-only divergence is visible
+without log downloads.

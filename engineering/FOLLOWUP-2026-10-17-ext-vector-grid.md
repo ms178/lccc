@@ -113,7 +113,10 @@ measured `lccc:clang`-never-fails pattern):
   `-mavx512f`, `-m32`, `-m32 -mavx`; x86-64 runtime cross matrix (va_arg,
   named-after-six-GP, first-stack-argument; 32- and 64-byte vectors; -O0
   and -O2; four pairings; both stack residues) — 46/46; the pre-fix compiler
-  fails 18 of them.
+  fails 18 of them. Hosted note: the gate's first hosted run failed on the
+  runner GCC's default `-fcf-protection` `.note.gnu.property` (extra `.long`
+  lines, not ABI data); the extraction is now scoped to the probe's `r`
+  initialiser (DECISIONS 2026-10-18 addendum).
 - Corpus tests `tests/regression/gnu_vector_overalign_layout.c` and
   `tests/regression/typedef_aligned_lowers_alignment.c` (run_regression.py,
   GCC reference output).
