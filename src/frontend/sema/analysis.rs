@@ -1196,6 +1196,32 @@ impl SemanticAnalyzer {
                                 init_expr.span(),
                                 null_constant,
                             );
+                            // Scalar <-> GNU vector in scalar initializers
+                            // follows exactly the implicit-assignment rule:
+                            // oracles reject it at any size ("initializing
+                            // 'd1' with an expression of incompatible
+                            // type"), with the sole documented exception of
+                            // the ext-vector splat. Accepting it also
+                            // silently miscompiled: the scalar rvalue's
+                            // VALUE was used as the SOURCE ADDRESS of the
+                            // whole-vector copy, faulting at runtime.
+                            let scalar_side = init_ty.is_integer()
+                                || init_ty.is_floating()
+                                || init_ty.is_complex();
+                            let mismatched = (matches!(var_ty, CType::Vector(..)) && scalar_side)
+                                || (matches!(init_ty, CType::Vector(..) | CType::ExtVector(..))
+                                    && (var_ty.is_integer()
+                                        || var_ty.is_floating()
+                                        || var_ty.is_complex()));
+                            if mismatched {
+                                self.diagnostics.borrow_mut().error(
+                                    format!(
+                                        "incompatible types (have '{}' but expected '{}')",
+                                        init_ty, var_ty
+                                    ),
+                                    init_expr.span(),
+                                );
+                            }
                         }
                     }
                 }
@@ -2695,6 +2721,41 @@ impl SemanticAnalyzer {
                 self.check_void_type_name(ts, *span);
                 self.analyze_expr(inner);
                 self.check_explicit_cast_address_space(expr, inner, *span);
+                // Scalar <-> vector casts with mismatched sizes are ill-formed
+                // (GCC: "cannot convert a value of type 'int' to vector type
+                // '__vector(1) double' which has different size"). Equal-size
+                // casts are the documented raw reinterpretation. An unresolved
+                // operand type (`inner` depends on a not-yet-inferable decl)
+                // skips the check rather than risking a false positive.
+                let checker = super::type_checker::ExprTypeChecker {
+                    symbols: &self.symbol_table,
+                    types: &self.result.type_context,
+                    functions: &self.result.functions,
+                    expr_types: Some(&self.result.expr_types),
+                    builtin_policy: self.builtin_policy.clone(),
+                };
+                if let Some(inner_ty) = checker.infer_expr_ctype(inner) {
+                    let target_ty = self.type_spec_to_ctype(ts);
+                    if Self::is_vector_scalar_size_mismatch(&inner_ty, &target_ty) {
+                        // GCC's two messages: scalar -> vector is "cannot
+                        // convert a value of type 'int' to vector type
+                        // '__vector(1) double' which has different size";
+                        // vector -> scalar is "cannot convert a vector of
+                        // type 'd1' to type 'int' which has different size".
+                        let message = if inner_ty.is_vector() {
+                            format!(
+                                "cannot convert a vector of type '{}' to type '{}' which has different size",
+                                inner_ty, target_ty
+                            )
+                        } else {
+                            format!(
+                                "cannot convert a value of type '{}' to vector type '{}' which has different size",
+                                inner_ty, target_ty
+                            )
+                        };
+                        self.diagnostics.borrow_mut().error(message, *span);
+                    }
+                }
             }
             Expr::Sizeof(arg, span) => {
                 // sizeof is unevaluated context, but identifiers must still be declared
@@ -3802,6 +3863,35 @@ impl SemanticAnalyzer {
         self.diagnostics.borrow_mut().warning(message, span);
     }
 
+    /// Scalar <-> vector conversions require `sizeof` equality. GCC and
+    /// Clang diagnose every size mismatch in both directions: explict casts
+    /// get "cannot convert a value of type 'int' to vector type ... which
+    /// has different size" / "invalid conversion between vector type ...
+    /// and integer type ... of different size" (applied to explicit casts
+    /// too), and implicit assignments/inits get the plain "incompatible
+    /// types" error. Equal-size conversions are legal and are the
+    /// GNU-documented raw bit-reinterpretation in both directions.
+    /// Arbitrary probe (both oracles agree): `(int)` of an 8-byte
+    /// `vector_size(8)` double is rejected; `(int)` of a `vector_size(4)`
+    /// float reinterprets lane bits.
+    fn is_vector_scalar_size_mismatch(from_ty: &CType, to_ty: &CType) -> bool {
+        // Struct/union sizes are 0 from CType::size() (they need a layout
+        // context); scalar-vs-vector comparisons never involve aggregates on
+        // either side because one arm is always a vector below.
+        let one_vector = from_ty.is_vector() != to_ty.is_vector();
+        if !one_vector {
+            return false;
+        }
+        // The other (non-vector) side must be an arithmetic scalar: integers,
+        // reals, and _Complex. (GCC's front end also accepts equal-size
+        // pointer<->vector raw conversions, but rejecting only size
+        // mismatches for arithmetic types is the GCC/Clang semantics at
+        // issue here; pointer opposite sides are outside this rule.)
+        let other = if from_ty.is_vector() { to_ty } else { from_ty };
+        let other_scalar = other.is_integer() || other.is_floating() || other.is_complex();
+        other_scalar && from_ty.size() != to_ty.size()
+    }
+
     fn check_assignment_compatibility(
         &self,
         from_ty: &CType,
@@ -3830,6 +3920,39 @@ impl SemanticAnalyzer {
                 CType::Vector(..) | CType::ExtVector(..),
                 CType::Vector(..) | CType::ExtVector(..),
             ) => from_ty.size() != to_ty.size(),
+            // NOTE: `match (from_ty, to_ty)` — the FIRST element of each
+            // tuple pattern is the CONVERSION SOURCE, the SECOND is the
+            // DESTINATION type. Keep that orientation in every vector arm
+            // below; a previous iteration bound the destination in the
+            // first slot and the diagnostic silently never fired.
+            //
+            // Implicit scalar -> ext vector: the documented Clang splat
+            // ("Scalar right operand: Clang splats it over the named
+            // lanes"). Stay accepted.
+            (from, CType::ExtVector(..))
+                if from.is_integer() || from.is_floating() || from.is_complex() =>
+            {
+                false
+            }
+            // Implicit scalar -> plain GNU vector: oracles reject at ANY
+            // size ("incompatible types when assigning") — including the
+            // same-size case. Accepting it also miscompiled: the scalar
+            // rvalue reached vector store lowering as an ADDRESS (witness:
+            // `b = i;` for `vector_size(4)` float emitted `movl (%rax)`
+            // with %rax == 5 and faulted at runtime).
+            (from, CType::Vector(..))
+                if from.is_integer() || from.is_floating() || from.is_complex() =>
+            {
+                true
+            }
+            // Implicit vector -> scalar (plain or ext): rejected by both
+            // oracles at any size (only explicit equal-size casts are
+            // legal: the GNU raw bit reinterpretation).
+            (from, to)
+                if from.is_vector() && (to.is_integer() || to.is_floating() || to.is_complex()) =>
+            {
+                true
+            }
             _ => false,
         };
         if incompatible {

@@ -322,6 +322,35 @@ impl Lowerer {
     /// values using the same size-correct path used for ordinary vector copy
     /// initialization.
     fn copy_vector_expr_to_alloca(&mut self, expr: &Expr, destination: Value, vector_ct: &CType) {
+        // Scalar right operand: Clang splats it over every lane
+        // (`ext_vector_type` only; plain GNU vectors are rejected by sema
+        // for scalar initializers). Lower the scalar, convert it to the
+        // lane type and store it into each lane — the splat is a value
+        // operation, NOT a whole-object copy, so the generic Memcpy path
+        // below (which treats the scalar's register value as the source
+        // address) must never see it. Mirrors the scalar splat in
+        // `try_lower_swizzle_assign`.
+        let expr_ct = self.expr_ctype(expr);
+        if !expr_ct.is_vector() {
+            if let CType::ExtVector(elem_ct, layout) = vector_ct {
+                let elem_ir_ty = Self::vector_elem_ir_type(elem_ct);
+                let raw = self.lower_expr(expr);
+                let raw_ty = self.value_ir_type(expr);
+                let value = self.emit_implicit_cast(raw, raw_ty, elem_ir_ty);
+                for lane in 0..layout.lanes {
+                    self.store_vector_lane(
+                        destination,
+                        vector_ct,
+                        lane,
+                        value.clone(),
+                        elem_ir_ty,
+                        AddressSpace::Default,
+                        false,
+                    );
+                }
+                return;
+            }
+        }
         // Packed whole-object initialization (`vector_simd.rs`): one load,
         // one store, no Memcpy.  Total fallback below.
         if self.try_lower_vector_init_simd(expr, destination, vector_ct) {

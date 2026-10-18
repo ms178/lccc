@@ -1431,6 +1431,39 @@ impl Lowerer {
         let lhs_ptr = self.lower_expr(lhs);
         let lhs_ptr_val = self.operand_to_value(lhs_ptr);
 
+        // Scalar right operand: Clang splats it over every lane of an
+        // ext_vector_type lvalue (sema accepts this shape ONLY for ext
+        // vectors; plain GNU vectors are diagnosed). It is a VALUE
+        // operation: convert the scalar to the lane type and store it into
+        // each lane. The generic Memcpy path below would treat the scalar's
+        // register value as the SOURCE ADDRESS of the copy — `v = 2.5f`
+        // accepted but segfaulting at runtime before this branch existed —
+        // so a scalar RHS must never reach it. Mirrors the splat in
+        // `try_lower_swizzle_assign` and `copy_vector_expr_to_alloca`.
+        let rhs_ct = self.expr_ctype(rhs);
+        if !rhs_ct.is_vector() {
+            if let CType::ExtVector(elem_ct, layout) = lhs_ct {
+                let elem_ir_ty = Self::vector_elem_ir_type(elem_ct);
+                let raw = self.lower_expr(rhs);
+                let raw_ty = self.value_ir_type(rhs);
+                let value = self.emit_implicit_cast(raw, raw_ty, elem_ir_ty);
+                let addr_space = self.aggregate_lvalue_space(lhs);
+                let volatile = self.expr_access_is_volatile(lhs);
+                for lane in 0..layout.lanes {
+                    self.store_vector_lane(
+                        lhs_ptr_val,
+                        lhs_ct,
+                        lane,
+                        value.clone(),
+                        elem_ir_ty,
+                        addr_space,
+                        volatile,
+                    );
+                }
+                return Operand::Value(lhs_ptr_val);
+            }
+        }
+
         // Packed whole-object copy (`vector_simd.rs`); total fallback below.
         if self.try_lower_vector_assign_simd(lhs, lhs_ptr_val, rhs, lhs_ct) {
             return Operand::Value(lhs_ptr_val);
