@@ -100,7 +100,11 @@ impl Lowerer {
     /// type every scalar leaf of its initializer converts to. Taken from the
     /// object's C type when known (an array typedef or `typeof` names the
     /// whole array), otherwise from the declaration's type specifier.
-    fn init_leaf_ctype(&self, obj_ty: Option<&CType>, type_spec: &TypeSpecifier) -> CType {
+    pub(super) fn init_leaf_ctype(
+        &self,
+        obj_ty: Option<&CType>,
+        type_spec: &TypeSpecifier,
+    ) -> CType {
         let mut ct = obj_ty
             .cloned()
             .unwrap_or_else(|| self.type_spec_to_ctype(type_spec));

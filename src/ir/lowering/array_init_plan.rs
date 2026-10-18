@@ -723,7 +723,14 @@ impl Lowerer {
                     if geo.is_bool() {
                         self.emit_expr_bool_conversion(v, src, e)
                     } else {
-                        self.emit_implicit_cast(v, src, geo.base_ty)
+                        let src_ct = self.get_expr_ctype(e);
+                        self.convert_assign_value(
+                            v,
+                            src,
+                            src_ct.as_ref(),
+                            &geo.elem_ct,
+                            geo.base_ty,
+                        )
                     }
                 }
             };

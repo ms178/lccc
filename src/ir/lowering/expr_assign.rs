@@ -229,18 +229,7 @@ impl Lowerer {
         } else {
             let rhs_val = self.lower_expr(rhs);
             let rhs_ty = self.value_ir_type(rhs);
-            if lhs_ct == CType::Float128
-                || rhs_ct == CType::Float128
-                || lhs_ct.is_decimal()
-                || rhs_ct.is_decimal()
-            {
-                // _Float128 assignments route through the soft-float helpers;
-                // C23 decimals route through the libbid helpers (same silent-
-                // miscompile class: raw IR casts emit binary conversions).
-                self.convert_scalar_ctype(rhs_val, rhs_ty, &rhs_ct, &lhs_ct)
-            } else {
-                self.emit_implicit_cast(rhs_val, rhs_ty, lhs_ty)
-            }
+            self.convert_assign_value(rhs_val, rhs_ty, Some(&rhs_ct), &lhs_ct, lhs_ty)
         };
 
         if let Some(lv) = lv {

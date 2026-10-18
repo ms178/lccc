@@ -764,9 +764,8 @@ impl Lowerer {
         // Store real part
         if let Some(first) = sub_items.first() {
             if let Initializer::Expr(e) = &first.init {
-                let val = self.lower_expr(e);
-                let expr_ty = self.get_expr_type(e);
-                let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
+                let comp_ct = Self::complex_component_ctype(complex_ctype);
+                let val = self.lower_init_leaf(e, &comp_ct);
                 self.emit(Instruction::Store {
                     volatile: false,
                     val,
@@ -789,9 +788,8 @@ impl Lowerer {
         let imag_ptr = self.emit_gep_offset(dest_addr, comp_size, IrType::I8);
         if let Some(item) = sub_items.get(1) {
             if let Initializer::Expr(e) = &item.init {
-                let val = self.lower_expr(e);
-                let expr_ty = self.get_expr_type(e);
-                let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
+                let comp_ct = Self::complex_component_ctype(complex_ctype);
+                let val = self.lower_init_leaf(e, &comp_ct);
                 self.emit(Instruction::Store {
                     volatile: false,
                     val,
@@ -1033,7 +1031,7 @@ impl Lowerer {
                                     );
                                 }
                             } else {
-                                let val = self.lower_and_cast_init_expr(e, field_ty);
+                                let val = self.lower_init_leaf(e, &field.ty);
                                 let field_addr = self.emit_gep_offset(base, field_offset, field_ty);
                                 self.emit(Instruction::Store {
                                     volatile: false,
@@ -1079,8 +1077,7 @@ impl Lowerer {
                             // consume up to arr_size items from the init list to fill array elements
                             let elem_ir_ty = IrType::from_ctype(elem_ty);
                             let elem_size = elem_ir_ty.size().max(1);
-                            let elem_is_bool = **elem_ty == CType::Bool;
-                            let val = self.lower_init_expr_bool_aware(e, elem_ir_ty, elem_is_bool);
+                            let val = self.lower_init_leaf(e, elem_ty);
                             let field_addr = self.emit_gep_offset(base, field_offset, elem_ir_ty);
                             self.emit(Instruction::Store {
                                 volatile: false,
@@ -1106,11 +1103,7 @@ impl Lowerer {
                                     }
                                 };
                                 if let Some(next_e) = expr_opt {
-                                    let next_val = self.lower_init_expr_bool_aware(
-                                        next_e,
-                                        elem_ir_ty,
-                                        elem_is_bool,
-                                    );
+                                    let next_val = self.lower_init_leaf(next_e, elem_ty);
                                     let offset = field_offset + arr_idx * elem_size;
                                     let elem_addr = self.emit_gep_offset(base, offset, elem_ir_ty);
                                     self.emit(Instruction::Store {
@@ -1125,8 +1118,7 @@ impl Lowerer {
                             }
                         }
                     } else {
-                        let val =
-                            self.lower_init_expr_bool_aware(e, field_ty, field.ty == CType::Bool);
+                        let val = self.lower_init_leaf(e, &field.ty);
                         let field_addr = self.emit_gep_offset(base, field_offset, field_ty);
                         if let (Some(bit_offset), Some(bit_width)) =
                             (field.bit_offset, field.bit_width)
@@ -1206,7 +1198,6 @@ impl Lowerer {
                             ai = idx;
                         }
                     }
-                    let elem_is_bool = **elem_ty == CType::Bool;
                     // A literal for a row of a multi-dimensional array field
                     // (`struct { char a[2][4]; } s = { { "ab", "c" } };`).
                     let row_string = match (&**elem_ty, &item.init) {
@@ -1223,7 +1214,7 @@ impl Lowerer {
                             self.zero_fill_after_string(base, at + len, at + elem_size);
                         }
                         Initializer::Expr(e) => {
-                            let val = self.lower_init_expr_bool_aware(e, elem_ir_ty, elem_is_bool);
+                            let val = self.lower_init_leaf(e, elem_ty);
                             self.emit_store_at_offset(base, ai * elem_size, val, elem_ir_ty);
                         }
                         Initializer::List(sub_items) => {
@@ -1240,11 +1231,7 @@ impl Lowerer {
                 if let Some(first) = items.first() {
                     if let Initializer::Expr(e) = &first.init {
                         let field_ir_ty = IrType::from_ctype(field_ctype);
-                        let val = self.lower_init_expr_bool_aware(
-                            e,
-                            field_ir_ty,
-                            *field_ctype == CType::Bool,
-                        );
+                        let val = self.lower_init_leaf(e, field_ctype);
                         self.emit(Instruction::Store {
                             volatile: false,
                             val,
@@ -1277,85 +1264,11 @@ impl Lowerer {
         &mut self,
         items: &[InitializerItem],
         alloca: Value,
-        base_ty: IrType,
+        base_ct: &CType,
         array_dim_strides: &[usize],
     ) {
         let mut flat_index = 0usize;
-        self.lower_array_init_recursive(items, alloca, base_ty, array_dim_strides, &mut flat_index);
-    }
-
-    /// Base element type and per-dimension byte strides (the
-    /// `DeclAnalysis::array_dim_strides` shape: stride of each index, the
-    /// last being the element size) of a sized multi-dimensional array whose
-    /// innermost element is a plain scalar, plus its total element count.
-    /// Those are exactly the objects [`Self::lower_array_init_recursive`]
-    /// initializes; `None` for anything else (1-D arrays, which have their
-    /// own paths, and arrays of aggregates).
-    pub(super) fn multidim_scalar_array_geometry(
-        &self,
-        arr: &CType,
-    ) -> Option<(IrType, Vec<usize>, usize)> {
-        let CType::Array(elem, Some(n)) = arr else {
-            return None;
-        };
-        if !matches!(**elem, CType::Array(..)) {
-            return None;
-        }
-        let mut strides = Vec::new();
-        let mut total = *n;
-        let mut cur: &CType = elem;
-        loop {
-            strides.push(self.resolve_ctype_size(cur));
-            match cur {
-                CType::Array(inner, Some(m)) => {
-                    total *= *m;
-                    cur = inner;
-                }
-                CType::Array(_, None) => return None,
-                _ => break,
-            }
-        }
-        let scalar = cur.is_integer()
-            || matches!(
-                cur,
-                CType::Pointer(..) | CType::Float | CType::Double | CType::LongDouble
-            );
-        if !scalar || cur.is_complex() || strides.last().copied().unwrap_or(0) == 0 {
-            return None;
-        }
-        Some((IrType::from_ctype(cur), strides, total))
-    }
-
-    /// Initialize a multi-dimensional array member from the initializers of
-    /// the ENCLOSING list with its braces elided (C11 6.7.9p20): take items
-    /// from the front of `items` until the member is full or an item carries
-    /// a designator (which belongs to the enclosing aggregate).  Returns the
-    /// number of items consumed; at least the first is.  `base` addresses the
-    /// member.
-    pub(super) fn lower_array_member_elided(
-        &mut self,
-        items: &[InitializerItem],
-        base: Value,
-        base_ty: IrType,
-        array_dim_strides: &[usize],
-        total_elems: usize,
-    ) -> usize {
-        let mut flat_index = 0usize;
-        let mut consumed = 0usize;
-        while consumed < items.len() && flat_index < total_elems {
-            if consumed > 0 && !items[consumed].designators.is_empty() {
-                break;
-            }
-            self.lower_array_init_recursive(
-                &items[consumed..consumed + 1],
-                base,
-                base_ty,
-                array_dim_strides,
-                &mut flat_index,
-            );
-            consumed += 1;
-        }
-        consumed.max(1)
+        self.lower_array_init_recursive(items, alloca, base_ct, array_dim_strides, &mut flat_index);
     }
 
     /// Recursive helper for multi-dimensional array initialization.
@@ -1365,10 +1278,11 @@ impl Lowerer {
         &mut self,
         items: &[InitializerItem],
         alloca: Value,
-        base_ty: IrType,
+        base_ct: &CType,
         array_dim_strides: &[usize],
         flat_index: &mut usize,
     ) {
+        let base_ty = IrType::from_ctype(base_ct);
         let elem_size = *array_dim_strides.last().unwrap_or(&1);
         let base_type_size = base_ty.size().max(1);
         let sub_elem_count = if array_dim_strides.len() > 1 && elem_size > 0 {
@@ -1432,14 +1346,14 @@ impl Lowerer {
                             self.lower_array_init_recursive(
                                 sub_items,
                                 alloca,
-                                base_ty,
+                                base_ct,
                                 sub_strides,
                                 flat_index,
                             );
                         } else {
                             for sub_item in sub_items {
                                 if let Initializer::Expr(e) = &sub_item.init {
-                                    let val = self.lower_and_cast_init_expr(e, base_ty);
+                                    let val = self.lower_init_leaf(e, base_ct);
                                     self.emit_array_element_store(
                                         alloca,
                                         val,
@@ -1473,7 +1387,7 @@ impl Lowerer {
                                 continue;
                             }
                         }
-                        let val = self.lower_and_cast_init_expr(e, base_ty);
+                        let val = self.lower_init_leaf(e, base_ct);
                         self.emit_array_element_store(
                             alloca,
                             val,
@@ -1510,7 +1424,7 @@ impl Lowerer {
                         self.lower_array_init_recursive(
                             sub_items,
                             alloca,
-                            base_ty,
+                            base_ct,
                             &array_dim_strides[1..],
                             flat_index,
                         );
@@ -1518,7 +1432,7 @@ impl Lowerer {
                         // Bottom level: treat as flat elements
                         for sub_item in sub_items {
                             if let Initializer::Expr(e) = &sub_item.init {
-                                let val = self.lower_and_cast_init_expr(e, base_ty);
+                                let val = self.lower_init_leaf(e, base_ct);
                                 self.emit_array_element_store(
                                     alloca,
                                     val,
@@ -1559,35 +1473,11 @@ impl Lowerer {
                         }
                     }
                     // Bare scalar: fills one base element without sub-array padding
-                    let val = self.lower_and_cast_init_expr(e, base_ty);
+                    let val = self.lower_init_leaf(e, base_ct);
                     self.emit_array_element_store(alloca, val, *flat_index * elem_size, base_ty);
                     *flat_index += 1;
                 }
             }
-        }
-    }
-
-    /// Lower an expression and cast it to the target type (e.g., int to float).
-    pub(super) fn lower_and_cast_init_expr(&mut self, expr: &Expr, target_ty: IrType) -> Operand {
-        let val = self.lower_expr(expr);
-        let expr_ty = self.get_expr_type(expr);
-        self.emit_implicit_cast(val, expr_ty, target_ty)
-    }
-
-    /// Lower an init expression with bool-aware handling.
-    /// For bool targets, normalizes to 0/1. For other types, casts to target_ty.
-    pub(super) fn lower_init_expr_bool_aware(
-        &mut self,
-        expr: &Expr,
-        target_ty: IrType,
-        is_bool: bool,
-    ) -> Operand {
-        if is_bool {
-            let val = self.lower_expr(expr);
-            let expr_ty = self.get_expr_type(expr);
-            self.emit_expr_bool_conversion(val, expr_ty, expr)
-        } else {
-            self.lower_and_cast_init_expr(expr, target_ty)
         }
     }
 

@@ -914,7 +914,7 @@ impl Lowerer {
     /// decline (fall back to the raw cast, i.e. status quo ante):
     /// - `U128` is shared by `_Float128` and `unsigned __int128`;
     /// - pointers/void/aggregates never reach decimal conversions.
-    fn decimal_conversion_target_ct(target_ty: IrType) -> Option<CType> {
+    pub(super) fn decimal_conversion_target_ct(target_ty: IrType) -> Option<CType> {
         Some(match target_ty {
             IrType::F32 => CType::Float,
             IrType::F64 => CType::Double,

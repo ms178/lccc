@@ -415,13 +415,14 @@ impl Lowerer {
         }
     }
 
-    /// Evaluate a cast expression at compile time.
     /// The C truth value of a folded constant, decided by `expr`'s C type
     /// (see `common::const_eval::const_truth`).
     pub(super) fn const_truth(&self, val: &IrConst, expr: &Expr) -> bool {
         shared_const_eval::const_truth(val, self.get_expr_ctype(expr).as_ref())
     }
 
+    /// Evaluate a cast expression at compile time.
+    /// Evaluate a cast expression at compile time.
     pub(super) fn eval_const_cast(
         &self,
         target_type: &TypeSpecifier,
@@ -689,7 +690,17 @@ impl Lowerer {
                 Some(IrConst::F32(f))
             }
             IrType::F64 => Some(IrConst::F64(to_f64()?)),
-            IrType::F128 => Some(IrConst::long_double(to_f64()?)),
+            // Round ONCE to the target long double format (x87 extended or
+            // binary128): `0.1DD` is the long double nearest 0.1, not the
+            // double nearest 0.1 widened (`...ccd000` vs GCC's `...cccd`).
+            IrType::F128 => match dec {
+                Dec::Finite(neg, c, e) => {
+                    let text = format!("{}{c}e{e}", if neg { "-" } else { "" });
+                    let bytes = crate::common::long_double::parse_long_double_value_bytes(&text);
+                    Some(IrConst::long_double_with_bytes(to_f64()?, bytes))
+                }
+                Dec::Inf(_) | Dec::Nan(_) => Some(IrConst::long_double(to_f64()?)),
+            },
             IrType::I8
             | IrType::U8
             | IrType::I16
@@ -1237,7 +1248,7 @@ impl Lowerer {
 
     /// The by-value half of [`Self::coerce_init_const`]; `None` when the IR
     /// coercion is already value-correct.
-    fn convert_const_by_value(
+    pub(super) fn convert_const_by_value(
         val: &IrConst,
         src_ct: Option<&CType>,
         dst: &CType,

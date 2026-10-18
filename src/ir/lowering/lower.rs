@@ -2316,8 +2316,6 @@ impl Lowerer {
         )
     }
 
-    /// Convert `val` (of C type `from_ct`) to _Float128 via the libgcc
-    /// widening helpers, matching GCC's codegen.
     /// Convert a scalar operand of C type `src_ct` to C type `target_ct`.
     ///
     /// This is the CType-aware sibling of `emit_implicit_cast`: when either
@@ -2334,6 +2332,11 @@ impl Lowerer {
         target_ct: &CType,
     ) -> Operand {
         use crate::common::types::CType;
+        if let Operand::Const(c) = &src {
+            if let Some(folded) = self.fold_value_conversion(c, src_ct, target_ct) {
+                return Operand::Const(folded);
+            }
+        }
         // C23 decimal floating point: any conversion touching a decimal type
         // is a genuine value conversion through the libbid helpers — bit-cast
         // machinery must never see decimal carriers.
@@ -2359,6 +2362,90 @@ impl Lowerer {
         self.emit_implicit_cast(src, src_ty, target_ty)
     }
 
+    /// `true` for the C types whose IR carrier does not determine how they
+    /// convert: `_Float128` shares `U128` with `unsigned __int128`, and the
+    /// decimal types are BID encodings, not binary values.  A conversion
+    /// touching one is a value conversion decided by the C types.
+    pub(super) fn is_value_converted_ctype(ct: &CType) -> bool {
+        *ct == CType::Float128 || ct.is_decimal()
+    }
+
+    /// Compile-time form of [`Self::convert_scalar_ctype`] for a constant
+    /// operand: the exact by-value conversion static initializers use
+    /// (`convert_const_by_value`), so `_Float128 x = 1;` is a constant load
+    /// instead of a `__floatsitf` call and `int i = 2.75Q;` is `2` instead
+    /// of a `__fixtfsi` call.  The function-body policy is that of explicit
+    /// casts (`lower_cast`): nothing folds while the floating-point
+    /// environment is observable (FENV_ACCESS, -frounding-math: rounding and
+    /// exceptions are run-time events), and a non-finite binary128 never
+    /// folds to an integer (IEEE invalid stays a run-time conversion, as
+    /// for double; non-finite decimals decline in `cast_bid_to_ir_type`).
+    fn fold_value_conversion(
+        &self,
+        c: &IrConst,
+        src_ct: &CType,
+        target_ct: &CType,
+    ) -> Option<IrConst> {
+        if !(Self::is_value_converted_ctype(src_ct) || Self::is_value_converted_ctype(target_ct))
+            || self.pass_policy.fp_environment_observable
+        {
+            return None;
+        }
+        if *src_ct == CType::Float128 && target_ct.is_integer() {
+            let bytes = crate::common::const_eval::f128_bytes_of(c, Some(src_ct))?;
+            if (u128::from_le_bytes(bytes) >> 112) & 0x7FFF == 0x7FFF {
+                return None;
+            }
+        }
+        Self::convert_const_by_value(c, Some(src_ct), target_ct, IrType::from_ctype(target_ct))
+    }
+
+    /// Convert `val` (IR type `src_ty`, C type `src_ct` when known) to an
+    /// object of C type `target_ct` stored as `target_ty`, as by simple
+    /// assignment (C11 6.5.16.1p2; initializers convert the same way,
+    /// 6.7.9p11).  When either side is `_Float128` or decimal the C types
+    /// decide; otherwise the IR conversion is exact.  An unknown source C
+    /// type is recovered from its IR type where that is unambiguous.
+    /// `_Bool` targets are normalized by the caller, which owns the source
+    /// expression (`emit_expr_bool_conversion`).
+    pub(super) fn convert_assign_value(
+        &mut self,
+        val: Operand,
+        src_ty: IrType,
+        src_ct: Option<&CType>,
+        target_ct: &CType,
+        target_ty: IrType,
+    ) -> Operand {
+        let src_ct = src_ct
+            .cloned()
+            .or_else(|| Self::decimal_conversion_target_ct(src_ty));
+        if let Some(src_ct) = src_ct {
+            if Self::is_value_converted_ctype(&src_ct) || Self::is_value_converted_ctype(target_ct)
+            {
+                return self.convert_scalar_ctype(val, src_ty, &src_ct, target_ct);
+            }
+        }
+        self.emit_implicit_cast(val, src_ty, target_ty)
+    }
+
+    /// Lower one initializer leaf and convert it to its object's C type
+    /// `target_ct` (C11 6.7.9p11).  `_Bool` normalizes at the source type
+    /// (6.3.1.2: truncating first would make 256 false); every other type
+    /// converts as by assignment, decided by the C types and not the IR
+    /// carrier: `int a[] = {2.75Q}` is 2, not the low bits of the payload.
+    pub(super) fn lower_init_leaf(&mut self, expr: &Expr, target_ct: &CType) -> Operand {
+        let src_ty = self.get_expr_type(expr);
+        let val = self.lower_expr(expr);
+        if *target_ct == CType::Bool {
+            return self.emit_expr_bool_conversion(val, src_ty, expr);
+        }
+        let src_ct = self.get_expr_ctype(expr);
+        let target_ty = IrType::from_ctype(target_ct);
+        self.convert_assign_value(val, src_ty, src_ct.as_ref(), target_ct, target_ty)
+    }
+
+    /// Convert `val` (of C type `from_ct`) to _Float128 via the libgcc
+    /// widening helpers, matching GCC's codegen.
     pub(super) fn convert_to_f128(
         &mut self,
         val: Operand,
@@ -2535,24 +2622,17 @@ impl Lowerer {
         });
     }
 
-    /// Lower an expression, cast to target type, then store at base + byte_offset.
-    /// When target_is_bool is true, normalizes the value (any nonzero -> 1) per C11 6.3.1.2.
-    pub(super) fn emit_init_expr_to_offset_bool(
+    /// Lower an initializer leaf, convert it to `target_ct` (see
+    /// [`Self::lower_init_leaf`]) and store it at `base + byte_offset`.
+    pub(super) fn emit_init_expr_to_offset(
         &mut self,
         e: &Expr,
         base: Value,
         byte_offset: usize,
-        target_ty: IrType,
-        target_is_bool: bool,
+        target_ct: &CType,
     ) {
-        let expr_ty = self.get_expr_type(e);
-        let val = self.lower_expr(e);
-        let val = if target_is_bool {
-            self.emit_expr_bool_conversion(val, expr_ty, e)
-        } else {
-            self.emit_implicit_cast(val, expr_ty, target_ty)
-        };
-        self.emit_store_at_offset(base, byte_offset, val, target_ty);
+        let val = self.lower_init_leaf(e, target_ct);
+        self.emit_store_at_offset(base, byte_offset, val, IrType::from_ctype(target_ct));
     }
 
     /// Emit a GEP to compute base + byte_offset and return the address Value.
@@ -3377,8 +3457,10 @@ impl Lowerer {
             if Self::decimal_width(src_ct).is_none()
                 && !src_ct.is_integer()
                 && !src_ct.is_floating()
+                && *src_ct != CType::Float128
             {
-                // Pointer/aggregate source: not a valid decimal conversion;
+                // Pointer/aggregate source (`is_floating` excludes
+                // _Float128, which converts through `__bid_trunctf*`): not a valid decimal conversion;
                 // fall through to the generic bit-cast machinery, which
                 // produces the appropriate diagnostic downstream.
                 let target_ty = IrType::from_ctype(target_ct);

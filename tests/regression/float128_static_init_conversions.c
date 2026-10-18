@@ -85,6 +85,37 @@ static struct {
 static Q *s_cl = (Q[]){1, 2.5, 0.1};
 static int *s_cli = (int[]){2.75Q, -1.5Q};
 
+/* Array typedefs and typeof name the whole array: the element type must
+ * come from the object's type, not the declaration's specifier. */
+typedef _Bool B3[3];
+static B3 s_tb = {2, 0.5, -0.0Q};
+typedef Q Q2[2];
+static Q2 s_tq = {3, 0.5f};
+static __typeof__(s_qa) s_tyq = {7, 0.25};
+/* Brace-enclosed scalars. */
+static Q s_brq[2] = {{2.75}, {-1}};
+static int s_bri[2] = {{2.75Q}, {-1.5Q}};
+/* Struct members: _Bool arrays, _Bool from -0.0Q, bit-fields from Q. */
+static struct {
+    _Bool ba[3];
+    _Bool bz;
+    int bf : 5;
+    unsigned ubf : 3;
+    _Bool b1 : 1;
+} s_bits = {{2, 0.5, 4}, -0.0Q, -7.75Q, 6.5Q, 0.0Q};
+/* A pointer member forces the relocation-bearing struct path. */
+static int s_target;
+static struct {
+    int *p;
+    Q q;
+    int i;
+    _Bool b;
+    int bf : 4;
+} s_ptrs = {&s_target, 9, 2.75Q, -0.0Q, -3.5Q};
+#ifdef __SIZEOF_INT128__
+static __int128 s_i128[2] = {2.75Q, -18446744073709551616.5Q};
+#endif
+
 typedef float v4f __attribute__((vector_size(16)));
 typedef int v4i __attribute__((vector_size(16)));
 typedef double v2d __attribute__((vector_size(16)));
@@ -135,6 +166,39 @@ static void statics(void) {
     B(s_v4f);
     printf("s_v4i %d %d %d %d\n", s_v4i[0], s_v4i[1], s_v4i[2], s_v4i[3]);
     B(s_v2d);
+    printf("s_tb %d %d %d\n", s_tb[0], s_tb[1], s_tb[2]);
+    B(s_tq[0]);
+    B(s_tq[1]);
+    for (int i = 0; i < 5; i++)
+        bits("s_tyq", &s_tyq[i], sizeof(Q));
+    B(s_brq[0]);
+    B(s_brq[1]);
+    printf("s_bri %d %d\n", s_bri[0], s_bri[1]);
+    printf("s_bits %d %d %d %d %d %d %d\n", s_bits.ba[0], s_bits.ba[1], s_bits.ba[2],
+           s_bits.bz, s_bits.bf, s_bits.ubf, s_bits.b1);
+    printf("s_ptrs %d %d %d %d\n", s_ptrs.p == &s_target, s_ptrs.i, s_ptrs.b, s_ptrs.bf);
+    B(s_ptrs.q);
+#ifdef __SIZEOF_INT128__
+    printf("s_i128 %lld %lld %llu\n", (long long)s_i128[0], (long long)(s_i128[1] >> 64),
+           (unsigned long long)s_i128[1]);
+#endif
+}
+
+/* Automatic arrays: the local array planner (ArrayGeometry). */
+static void autos(void) {
+    Q qa[3] = {1, 2.5, 0.1f};
+    int ia[3] = {2.75Q, -3.5Q, 1e3Q};
+    _Bool ba[3] = {2, -0.0Q, 0.5Q};
+    float fa[2] = {0x1.000001000000001p0Q, 0.1Q};
+    for (int i = 0; i < 3; i++)
+        bits("auto qa", &qa[i], sizeof(Q));
+    printf("auto ia %d %d %d ba %d %d %d\n", ia[0], ia[1], ia[2], ba[0], ba[1], ba[2]);
+    B(fa);
+#ifdef __SIZEOF_INT128__
+    __int128 la[2] = {2.75Q, -18446744073709551616.5Q};
+    printf("auto la %lld %lld %llu\n", (long long)la[0], (long long)(la[1] >> 64),
+           (unsigned long long)la[1]);
+#endif
 }
 
 /* --- function bodies (folded at compile time unless FENV_ACCESS) -------- */
@@ -180,6 +244,7 @@ static void runtime(void) {
 
 int main(void) {
     statics();
+    autos();
     bodies();
     runtime();
     return 0;

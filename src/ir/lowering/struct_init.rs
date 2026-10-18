@@ -323,7 +323,6 @@ impl Lowerer {
         field_offset: usize,
     ) {
         let elem_size = self.resolve_ctype_size(elem_ty);
-        let elem_ir_ty = IrType::from_ctype(elem_ty);
 
         // Find the first index designator in the remaining designators
         let remaining_desigs = &item.designators[1..];
@@ -376,14 +375,13 @@ impl Lowerer {
                 );
             } else {
                 // No further designators — store element value
-                self.emit_array_elem_value(item, base_alloca, elem_ty, elem_offset, elem_ir_ty);
+                self.emit_array_elem_value(item, base_alloca, elem_ty, elem_offset);
             }
         }
         *item_idx += 1;
 
         // Continue consuming subsequent non-designated items for array
         // positions idx+1, idx+2, ... (C11 6.7.9p17)
-        let elem_is_bool = *elem_ty == CType::Bool;
         let mut ai = idx + 1;
         while ai < arr_size && *item_idx < items.len() {
             let next_item = &items[*item_idx];
@@ -396,13 +394,7 @@ impl Lowerer {
             };
             if let Some(e) = expr_opt {
                 let elem_offset = field_offset + ai * elem_size;
-                self.emit_init_expr_to_offset_bool(
-                    e,
-                    base_alloca,
-                    elem_offset,
-                    elem_ir_ty,
-                    elem_is_bool,
-                );
+                self.emit_init_expr_to_offset(e, base_alloca, elem_offset, elem_ty);
             } else {
                 break;
             }
@@ -455,8 +447,6 @@ impl Lowerer {
                 .unwrap_or(0);
             if inner_idx < *inner_size {
                 let inner_elem_size = self.resolve_ctype_size(inner_elem_ty);
-                let inner_ir_ty = IrType::from_ctype(inner_elem_ty);
-                let inner_is_bool = **inner_elem_ty == CType::Bool;
                 let inner_offset = elem_offset + inner_idx * inner_elem_size;
                 if let Initializer::Expr(e) = &item.init {
                     if let Expr::StringLiteral(s, _) = e {
@@ -466,13 +456,7 @@ impl Lowerer {
                             return;
                         }
                     }
-                    self.emit_init_expr_to_offset_bool(
-                        e,
-                        base_alloca,
-                        inner_offset,
-                        inner_ir_ty,
-                        inner_is_bool,
-                    );
+                    self.emit_init_expr_to_offset(e, base_alloca, inner_offset, inner_elem_ty);
                 }
             }
         }
@@ -486,7 +470,6 @@ impl Lowerer {
         base_alloca: Value,
         elem_ty: &CType,
         elem_offset: usize,
-        elem_ir_ty: IrType,
     ) {
         match &item.init {
             Initializer::Expr(e) => {
@@ -499,33 +482,24 @@ impl Lowerer {
                         }
                     }
                 }
-                self.emit_init_expr_to_offset_bool(
-                    e,
-                    base_alloca,
-                    elem_offset,
-                    elem_ir_ty,
-                    *elem_ty == CType::Bool,
-                );
+                self.emit_init_expr_to_offset(e, base_alloca, elem_offset, elem_ty);
             }
             Initializer::List(sub_items) => {
                 // Handle list init for array element (e.g., .a[1] = {1,2,3})
                 match elem_ty {
                     CType::Array(inner_elem_ty, Some(inner_size)) => {
                         let inner_elem_size = self.resolve_ctype_size(inner_elem_ty);
-                        let inner_ir_ty = IrType::from_ctype(inner_elem_ty);
-                        let inner_is_bool = **inner_elem_ty == CType::Bool;
                         for (si, sub_item) in sub_items.iter().enumerate() {
                             if si >= *inner_size {
                                 break;
                             }
                             if let Initializer::Expr(e) = &sub_item.init {
                                 let inner_offset = elem_offset + si * inner_elem_size;
-                                self.emit_init_expr_to_offset_bool(
+                                self.emit_init_expr_to_offset(
                                     e,
                                     base_alloca,
                                     inner_offset,
-                                    inner_ir_ty,
-                                    inner_is_bool,
+                                    inner_elem_ty,
                                 );
                             }
                         }
@@ -898,7 +872,6 @@ impl Lowerer {
         field_offset: usize,
         elem_size: usize,
     ) {
-        let elem_is_bool = *elem_ty == CType::Bool;
         let mut ai = 0usize;
         for sub_item in sub_items {
             if let Some(Designator::Index(idx_expr)) = sub_item.designators.first() {
@@ -928,20 +901,11 @@ impl Lowerer {
                             }
                         }
                     }
-                    let elem_ir_ty = IrType::from_ctype(elem_ty);
-                    self.emit_init_expr_to_offset_bool(
-                        e,
-                        base_alloca,
-                        elem_offset,
-                        elem_ir_ty,
-                        elem_is_bool,
-                    );
+                    self.emit_init_expr_to_offset(e, base_alloca, elem_offset, elem_ty);
                 }
                 Initializer::List(inner_items) => {
                     // Handle braced sub-init for array elements (e.g., int arr[2][3] = {{1,2,3},{4,5,6}})
                     if let CType::Array(inner_elem_ty, Some(inner_size)) = elem_ty {
-                        let inner_elem_ir_ty = IrType::from_ctype(inner_elem_ty);
-                        let inner_is_bool = **inner_elem_ty == CType::Bool;
                         let inner_elem_size = self.resolve_ctype_size(inner_elem_ty);
                         for (ii, inner_item) in inner_items.iter().enumerate() {
                             if ii >= *inner_size {
@@ -968,25 +932,17 @@ impl Lowerer {
                                         }
                                     }
                                 }
-                                self.emit_init_expr_to_offset_bool(
+                                self.emit_init_expr_to_offset(
                                     e,
                                     base_alloca,
                                     inner_offset,
-                                    inner_elem_ir_ty,
-                                    inner_is_bool,
+                                    inner_elem_ty,
                                 );
                             }
                         }
                     } else if let Some(e) = Self::unwrap_nested_init_expr(inner_items) {
                         // Extra braces around scalar array element: {{{42}}}
-                        let elem_ir_ty = IrType::from_ctype(elem_ty);
-                        self.emit_init_expr_to_offset_bool(
-                            e,
-                            base_alloca,
-                            elem_offset,
-                            elem_ir_ty,
-                            elem_is_bool,
-                        );
+                        self.emit_init_expr_to_offset(e, base_alloca, elem_offset, elem_ty);
                     }
                 }
             }
@@ -1080,8 +1036,6 @@ impl Lowerer {
             *item_idx += consumed.max(1);
         } else {
             // Flat init for scalar array
-            let elem_ir_ty = IrType::from_ctype(elem_ty);
-            let elem_is_bool = *elem_ty == CType::Bool;
             let start_ai = array_start_idx.unwrap_or(0);
             let mut consumed = 0usize;
             let mut ai = start_ai;
@@ -1096,13 +1050,7 @@ impl Lowerer {
                 };
                 if let Some(expr) = expr_opt {
                     let elem_offset = field_offset + ai * elem_size;
-                    self.emit_init_expr_to_offset_bool(
-                        expr,
-                        base_alloca,
-                        elem_offset,
-                        elem_ir_ty,
-                        elem_is_bool,
-                    );
+                    self.emit_init_expr_to_offset(expr, base_alloca, elem_offset, elem_ty);
                     consumed += 1;
                     ai += 1;
                 } else {
@@ -1191,7 +1139,14 @@ impl Lowerer {
                     let first = if matches!(elem_ty, CType::Bool) {
                         self.emit_expr_bool_conversion(first, first_ty, e)
                     } else {
-                        self.emit_implicit_cast(first, first_ty, elem_ir_ty)
+                        let src_ct = self.get_expr_ctype(e);
+                        self.convert_assign_value(
+                            first,
+                            first_ty,
+                            src_ct.as_ref(),
+                            elem_ty,
+                            elem_ir_ty,
+                        )
                     };
                     let first_ty = if matches!(elem_ty, CType::Bool) {
                         IrType::I32
@@ -1230,7 +1185,15 @@ impl Lowerer {
                                 IrType::I32,
                             )
                         } else {
-                            (self.emit_implicit_cast(val, src_ty, elem_ir_ty), elem_ir_ty)
+                            let src_ct = self.get_expr_ctype(expr);
+                            let val = self.convert_assign_value(
+                                val,
+                                src_ty,
+                                src_ct.as_ref(),
+                                elem_ty,
+                                elem_ir_ty,
+                            );
+                            (val, elem_ir_ty)
                         };
                         self.store_vector_lane(
                             field_addr,
@@ -1280,7 +1243,8 @@ impl Lowerer {
                 None => self.emit_bool_normalize_typed(val, expr_ty),
             }
         } else {
-            self.emit_implicit_cast(val, expr_ty, field_ty)
+            let src_ct = src_expr.and_then(|e| self.get_expr_ctype(e));
+            self.convert_assign_value(val, expr_ty, src_ct.as_ref(), &field.ty, field_ty)
         };
         let addr = self.emit_gep_offset(base_alloca, field_offset, field_ty);
         if let (Some(bit_offset), Some(bit_width)) = (field.bit_offset, field.bit_width) {

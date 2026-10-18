@@ -501,8 +501,6 @@ impl Lowerer {
                         Some(CType::Array(inner_elem_ty, Some(inner_size))) => {
                             // Nested array: initialize element-by-element
                             let inner_elem_size = self.resolve_ctype_size(inner_elem_ty);
-                            let inner_ir_ty = IrType::from_ctype(inner_elem_ty);
-                            let inner_is_bool = **inner_elem_ty == CType::Bool;
                             // Zero-init the element region for partial initialization
                             if sub_items.len() < *inner_size {
                                 self.zero_init_region(alloca, elem_offset, elem_size);
@@ -513,12 +511,11 @@ impl Lowerer {
                                 }
                                 if let Initializer::Expr(e) = &sub_item.init {
                                     let inner_offset = elem_offset + si * inner_elem_size;
-                                    self.emit_init_expr_to_offset_bool(
+                                    self.emit_init_expr_to_offset(
                                         e,
                                         alloca,
                                         inner_offset,
-                                        inner_ir_ty,
-                                        inner_is_bool,
+                                        inner_elem_ty,
                                     );
                                 }
                             }
