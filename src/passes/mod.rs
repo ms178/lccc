@@ -1752,7 +1752,11 @@ pub(crate) fn run_passes(
     // uses the size-aware policy at -Os/-Oz, so running the unrestricted
     // inliner unconditionally in this later phase defeats that decision and
     // can clone medium helpers at every call site after the first cleanup.
-    if !pass_disabled(&disabled, "postinline") {
+    // "inline" gates the LATE phase too: the pass name is the A/B kill
+    // switch for inlining as a whole, and a late phase that re-inlines
+    // everything the disabled primary phase skipped made
+    // CCC_DISABLE_PASSES=inline a silent no-op for the final binary.
+    if !pass_disabled(&disabled, "postinline") && !pass_disabled(&disabled, "inline") {
         if optimize_for_size {
             inline::run_size_optimized(module);
         } else {
