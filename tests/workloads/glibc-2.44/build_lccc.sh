@@ -39,7 +39,10 @@ PATCH=${MS178_GLIBC_PATCH:-/home/user/archpkgbuilds/toolchain-stable/glibc/ms178
 PATCH_SHA256=52c9953f8e3ec710d73308464bd98bbe752895d83c6b17201235edcb1c974aeb
 BINUTILS=${GLIBC_BINUTILS_PREFIX:-/home/user/tools/binutils-2.47/bin}
 JOBS=${JOBS:-2}
-CFLAGS=${GLIBC_CFLAGS:--O2 -march=x86-64-v3 -mtune=native -fomit-frame-pointer -fcf-protection=none -mharden-sls=none -fno-stack-protector}
+# The resulting glibc is loaded at process startup, so Initial-Exec TLS is
+# valid and avoids Local-Dynamic __tls_get_addr sequences. It is not a safe
+# default for arbitrary DSOs that may be dlopen'd after threads exist.
+CFLAGS=${GLIBC_CFLAGS:--O2 -march=x86-64-v3 -mtune=native -ftls-model=initial-exec -fomit-frame-pointer -fcf-protection=none -mharden-sls=none -fno-stack-protector}
 
 mkdir -p "$WORK" "$CACHE"
 "$ROOT/scripts/ensure_swap.sh"

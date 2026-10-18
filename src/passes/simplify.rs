@@ -3362,13 +3362,17 @@ pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
                         if let Some(new_inst) =
                             simplify_math_call(d, callee, &info.args, info.return_type)
                         {
-                            // fabs/copysign are pure sign-bit operations: they
-                            // neither round nor raise an FP exception, so
-                            // -frounding-math/-ftrapping-math must not leave
-                            // their compiler-runtime helpers unresolved.  Do
-                            // not extend this exemption to sqrt, directed
-                            // rounding, FMA, or pow: those can observe the FP
-                            // environment and remain behind the normal guard.
+                            // fabs/copysign are pure sign-bit operations. FMA
+                            // and hardware sqrt are also valid under strict FP:
+                            // their instructions obey MXCSR rounding and raise
+                            // arithmetic FP exceptions while preserving the
+                            // builtin operation's rounding. GCC emits these
+                            // instructions with both -frounding-math and
+                            // -ftrapping-math. Keeping libcalls here makes
+                            // glibc's builtin-backed implementations recurse
+                            // through their own public aliases. Do not extend
+                            // this exemption to directed-rounding functions or
+                            // pow, whose replacement constraints differ.
                             let environment_safe = matches!(
                                 new_inst,
                                 Instruction::Intrinsic {
@@ -3379,7 +3383,11 @@ pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
                                         | IntrinsicOp::CopysignF32
                                         | IntrinsicOp::CopysignF64
                                         | IntrinsicOp::F128Copysign
-                                        | IntrinsicOp::LDCopysign,
+                                        | IntrinsicOp::LDCopysign
+                                        | IntrinsicOp::FmaScalarF32
+                                        | IntrinsicOp::FmaScalarF64
+                                        | IntrinsicOp::SqrtF32
+                                        | IntrinsicOp::SqrtF64,
                                     ..
                                 }
                             );
