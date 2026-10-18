@@ -234,8 +234,8 @@ ceiling sadd 18        # struct-wrapped compound assign: lane stores + memcpy
 ceiling s4i_add 26     # struct-wrapped 128-bit add
 ceiling tern_se 53     # ternary whose arms are calls (two sret temporaries)
 ceiling viacall 30     # by-value call into a GCC-built callee + return
-ceiling shr_v32l 23    # signed 64-bit lanes: no vpsravq below AVX-512VL
-ceiling shr_v16l 15    # (GCC: 6 — it emulates with vpsrlvq + sign fixup)
+ceiling shr_v32l 6     # signed 64-bit lanes: vpsrlvq + sign fix-up (xor/sub), GCC: 6
+ceiling shr_v16l 6
 # Byte multiply through the word family: pmullw + mask + two shifts +
 # pmullw + shift + or (GCC: 10 / 12).
 ceiling mul_v32c 8

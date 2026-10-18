@@ -1653,11 +1653,13 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             j += 1;
             continue;
         }
-        // A load folds only into the copy-out with its own upper-bit
-        // behaviour: VEX load (zeroes above) into a VEX full-width copy,
-        // legacy load (leaves above alone) into a legacy full-width copy.
+        // A load folds only into a full-width copy-out: VEX load /
+        // broadcast (zeroes above) into a VEX copy, or -- like any VEX.128
+        // producer -- into a legacy 128-bit copy under the wide-reader
+        // argument below; a legacy load (leaves above alone) only into a
+        // legacy full-width copy.
         let legacy_full_copy_out = full_copy_out && !copy_out.zeroes_above && pw == W128;
-        if ((is_vex_load || is_broadcast) && !full_vex_copy_out)
+        if ((is_vex_load || is_broadcast) && !(full_vex_copy_out || legacy_full_copy_out))
             || (is_legacy_load && !legacy_full_copy_out)
         {
             j += 1;
@@ -4147,10 +4149,11 @@ mod tests {
             vec!["vmovdqu 16(%rsi), %xmm0", "ret"]
         );
         // A legacy copy-out merges into the upper bits where the VEX load
-        // zeroes them: refused (only the full-width VEX copy-out folds).
+        // zeroes them: folded only under the wide-reader rule (as for any
+        // VEX.128 producer) -- here nothing reads `%ymm0` after the copy.
         assert_eq!(
-            retarget_only("    vmovups (%rdi), %xmm2\n    movdqa %xmm2, %xmm0\n    ret\n").len(),
-            3
+            retarget_only("    vmovups (%rdi), %xmm2\n    movdqa %xmm2, %xmm0\n    ret\n"),
+            vec!["vmovups (%rdi), %xmm0", "ret"]
         );
         // Legacy load into a legacy full-width copy: both leave the bits
         // above 128 alone, so the fold is exact at every width.
@@ -4173,6 +4176,26 @@ mod tests {
         assert_eq!(
             retarget_only("    vbroadcastss (%rdi), %ymm3\n    vmovaps %ymm3, %ymm1\n    ret\n"),
             vec!["vbroadcastss (%rdi), %ymm1", "ret"]
+        );
+        // A VEX.128 load or broadcast into a legacy 128-bit copy-out: like
+        // any VEX.128 producer, under the wide-reader rule (no reader of
+        // the target wider than the copy).
+        assert_eq!(
+            retarget_only(
+                "    vmovdqa .LCVEC_1(%rip), %xmm15\n    movdqa %xmm15, %xmm0\n    ret\n"
+            ),
+            vec!["vmovdqa .LCVEC_1(%rip), %xmm0", "ret"]
+        );
+        assert_eq!(
+            retarget_only("    vpbroadcastw %xmm1, %xmm14\n    movdqa %xmm14, %xmm0\n    ret\n"),
+            vec!["vpbroadcastw %xmm1, %xmm0", "ret"]
+        );
+        assert_eq!(
+            retarget_only(
+                "    vmovdqa .LCVEC_1(%rip), %xmm15\n    movdqa %xmm15, %xmm0\n    vpaddd %ymm0, %ymm1, %ymm1\n    vmovdqa %ymm1, %ymm0\n    ret\n"
+            )
+            .len(),
+            5
         );
         // A register-to-register `vmovdqa` is a copy, not a load: refused.
         assert_eq!(

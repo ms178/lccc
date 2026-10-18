@@ -938,12 +938,17 @@ impl CodegenState {
             self.out.emit("    .quad 0");
         }
         // Full-width vector constants: 16 or 32 little-endian bytes each,
-        // .p2align 4 (VEX memory operands carry no alignment requirement;
-        // the alignment keeps the pool tidy and legacy-safe).
+        // aligned to their own size -- the splat loads use the aligned
+        // `vmovdqa`/`movdqa` forms (a 32-byte entry at 16-byte alignment
+        // faulted `vmovdqa .LCVEC(%rip), %ymm` in the -O2 runtime matrix).
         let mut ventries: Vec<_> = self.vec_const_pool.iter().collect();
         ventries.sort_by_key(|(_, label)| (*label).clone());
         for (bytes, label) in ventries {
-            self.out.emit(".p2align 4");
+            self.out.emit(if bytes.len() > 16 {
+                ".p2align 5"
+            } else {
+                ".p2align 4"
+            });
             self.out.emit_fmt(format_args!("{}:", label));
             for chunk in bytes.chunks(8) {
                 let mut q = [0u8; 8];

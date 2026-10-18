@@ -537,8 +537,8 @@ impl Lowerer {
 
     /// Per-lane variable shift (`lhs` a vector; `rhs` a vector of counts
     /// or a non-constant scalar splat), AVX2 `vpsllv*`/`vpsrlv*`/`vpsravd`.
-    /// Lanes are 32-bit (any direction) or 64-bit (left/logical right:
-    /// there is no `vpsravq` below AVX-512VL). A count at or beyond the
+    /// Lanes are 32-bit (any direction) or 64-bit (the signed right shift
+    /// is the `vpsrlvq` sign fix-up expansion). A count at or beyond the
     /// lane width is undefined for GNU vector shifts (as for the scalar
     /// lanes), so the ISA's "shift out to zero / sign fill" is admissible.
     fn try_lower_vector_variable_shift(
@@ -557,18 +557,29 @@ impl Lowerer {
             return None;
         }
         let ir_op = Self::binop_to_ir(*op, is_unsigned);
-        let packed = match (shape.bytes, shape.elem_ir.size(), ir_op) {
-            (32, 4, IrBinOp::Shl) => IntrinsicOp::VecShlvI32x8,
-            (32, 4, IrBinOp::LShr) => IntrinsicOp::VecLShrvI32x8,
-            (32, 4, IrBinOp::AShr) => IntrinsicOp::VecAShrvI32x8,
-            (32, 8, IrBinOp::Shl) => IntrinsicOp::VecShlvI64x4,
-            (32, 8, IrBinOp::LShr) => IntrinsicOp::VecLShrvI64x4,
-            (16, 4, IrBinOp::Shl) => IntrinsicOp::VecShlvI32x4,
-            (16, 4, IrBinOp::LShr) => IntrinsicOp::VecLShrvI32x4,
-            (16, 4, IrBinOp::AShr) => IntrinsicOp::VecAShrvI32x4,
-            (16, 8, IrBinOp::Shl) => IntrinsicOp::VecShlvI64x2,
-            (16, 8, IrBinOp::LShr) => IntrinsicOp::VecLShrvI64x2,
-            _ => return None,
+        // Signed 64-bit lanes: no `vpsravq` below AVX-512VL.  GCC's
+        // expansion over the logical shift: with `s` the sign-bit splat,
+        // `t = a >>u c`, `m = s >>u c`, `(t ^ m) - m` (the `m` lanes are
+        // the sign-extension bits for lanes whose top bit was set; the
+        // xor-sub pair moves them in as ones).  5 instructions + 1 load.
+        let (ashr64, packed) = match (shape.bytes, shape.elem_ir.size(), ir_op) {
+            (32, 8, IrBinOp::AShr) => (
+                Some((
+                    IntrinsicOp::VecBroadcastI64x4,
+                    IntrinsicOp::VecXorI64x4,
+                    IntrinsicOp::VecSubI64x4,
+                )),
+                IntrinsicOp::VecLShrvI64x4,
+            ),
+            (16, 8, IrBinOp::AShr) => (
+                Some((
+                    IntrinsicOp::VecBroadcastI64x2,
+                    IntrinsicOp::VecXorI64x2,
+                    IntrinsicOp::VecSubI64x2,
+                )),
+                IntrinsicOp::VecLShrvI64x2,
+            ),
+            (b, l, o) => (None, Self::variable_shift_op(b, l, o)?),
         };
         // The count operand: a vector of the same register image (any
         // signedness — only the lane width matters) or a scalar splat.
@@ -589,9 +600,42 @@ impl Lowerer {
         let a = self.vec_operand_value(lhs, true, shape);
         let b = self.vec_operand_value(rhs, rhs_plan, shape);
         let r = self.emit_vec_binary(packed, a, b);
+        let r = match ashr64 {
+            None => r,
+            Some((broadcast, xor, sub)) => {
+                let sign = self.fresh_value();
+                self.emit(Instruction::Intrinsic {
+                    dest: Some(sign),
+                    op: broadcast,
+                    dest_ptr: None,
+                    args: vec![Operand::Const(IrConst::I64(i64::MIN))],
+                });
+                let m = self.emit_vec_binary(packed, sign, b);
+                let x = self.emit_vec_binary(xor, r, m);
+                self.emit_vec_binary(sub, x, m)
+            }
+        };
         let result = self.vec_result_alloca(vec_ct);
         self.emit_vec_store(shape, r, result);
         Some(Operand::Value(result))
+    }
+
+    /// The AVX2 per-lane variable shift for a (bytes, lane size, op)
+    /// triple; `None` where the ISA has no encoding.
+    fn variable_shift_op(bytes: usize, lane: usize, op: IrBinOp) -> Option<IntrinsicOp> {
+        Some(match (bytes, lane, op) {
+            (32, 4, IrBinOp::Shl) => IntrinsicOp::VecShlvI32x8,
+            (32, 4, IrBinOp::LShr) => IntrinsicOp::VecLShrvI32x8,
+            (32, 4, IrBinOp::AShr) => IntrinsicOp::VecAShrvI32x8,
+            (32, 8, IrBinOp::Shl) => IntrinsicOp::VecShlvI64x4,
+            (32, 8, IrBinOp::LShr) => IntrinsicOp::VecLShrvI64x4,
+            (16, 4, IrBinOp::Shl) => IntrinsicOp::VecShlvI32x4,
+            (16, 4, IrBinOp::LShr) => IntrinsicOp::VecLShrvI32x4,
+            (16, 4, IrBinOp::AShr) => IntrinsicOp::VecAShrvI32x4,
+            (16, 8, IrBinOp::Shl) => IntrinsicOp::VecShlvI64x2,
+            (16, 8, IrBinOp::LShr) => IntrinsicOp::VecLShrvI64x2,
+            _ => return None,
+        })
     }
 
     /// Packed form of the element-wise comparison `lhs op rhs` producing the

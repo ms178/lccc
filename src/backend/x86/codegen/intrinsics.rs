@@ -1166,6 +1166,76 @@ impl X86Codegen {
         true
     }
 
+    /// Splat of any other integer constant: one aligned load of the
+    /// tiled `.rodata` vector (`vmovdqa .LCVEC_n(%rip), %ymmN`) instead
+    /// of the `mov`/`vmovd`/`vpbroadcast` staging chain -- GCC's and
+    /// Clang's spelling.  Width from `lane_bytes`; `wide` selects the
+    /// 32-byte family.  Zero and all-ones are the callers' cheaper
+    /// register-only idioms and are declined here.
+    fn try_const_splat_load(
+        &mut self,
+        args: &[Operand],
+        dest: &Option<Value>,
+        lane_bytes: usize,
+        wide: bool,
+    ) -> bool {
+        let lane = match args.first() {
+            Some(Operand::Const(IrConst::I8(v))) if lane_bytes == 1 => *v as u8 as u64,
+            Some(Operand::Const(IrConst::I16(v))) if lane_bytes == 2 => *v as u16 as u64,
+            Some(Operand::Const(IrConst::I32(v))) if lane_bytes == 4 => *v as u32 as u64,
+            Some(Operand::Const(IrConst::I64(v))) if lane_bytes == 8 => *v as u64,
+            _ => return false,
+        };
+        if lane == 0 {
+            return self.try_zero_splat(args, dest, wide);
+        }
+        let total = if wide { 32 } else { 16 };
+        let mut bytes = vec![0u8; total];
+        for l in 0..total / lane_bytes {
+            bytes[l * lane_bytes..(l + 1) * lane_bytes]
+                .copy_from_slice(&lane.to_le_bytes()[..lane_bytes]);
+        }
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+        let label = self.state.get_vec_const_label(&bytes);
+        let mnemonic = if self.avx2_enabled {
+            "vmovdqa"
+        } else {
+            "movdqa"
+        };
+        if let Some(d) = dest {
+            if let Some(&reg) = self.reg_assignments.get(&d.0) {
+                if is_xmm_reg(reg) {
+                    if wide {
+                        let name = phys_reg_name_256(reg);
+                        self.state
+                            .emit_fmt(format_args!("    {} {}(%rip), %{}", mnemonic, label, name));
+                        self.note_vec_dest_in_home(d, &format!("%{}", name));
+                    } else {
+                        let name: &'static str = phys_reg_name(reg);
+                        self.state
+                            .emit_fmt(format_args!("    {} {}(%rip), %{}", mnemonic, label, name));
+                        self.sse_commit_dest_direct(d, name);
+                    }
+                    self.state.vector_values.insert(d.0);
+                    return true;
+                }
+            }
+        }
+        let stage = if wide { "ymm0" } else { "xmm0" };
+        self.state
+            .emit_fmt(format_args!("    {} {}(%rip), %{}", mnemonic, label, stage));
+        if let Some(d) = dest {
+            self.state.vector_values.insert(d.0);
+            if wide {
+                self.avx_store_dest(d);
+            } else {
+                self.sse_store_dest(d, "xmm0");
+            }
+        }
+        true
+    }
+
     /// Store an extracted F64 lane (sitting in %xmm1) to its scalar
     /// dest. The dest is an ordinary F64: an 8-BYTE slot or XMM home.
     /// `sse_store_dest` is WRONG here — its `movdqu` writes 16 bytes
@@ -4666,7 +4736,9 @@ impl X86Codegen {
             IntrinsicOp::VecBroadcastI64x2 => {
                 // All-ones splat: one self-compare instead of the staged
                 // movq/movd/unpcklpd chain.
-                if !self.try_all_ones_splat(args, dest, false) {
+                if !self.try_all_ones_splat(args, dest, false)
+                    && !self.try_const_splat_load(args, dest, 8, false)
+                {
                     self.flush_pending_vec_store_impl();
                     self.state.invalidate_vec_peephole();
                     match &args[0] {
@@ -4892,7 +4964,9 @@ impl X86Codegen {
             }
             IntrinsicOp::VecBroadcastI64x4 => {
                 // All-ones splat: one vpcmpeqd instead of the staged chain.
-                if !self.try_all_ones_splat(args, dest, true) {
+                if !self.try_all_ones_splat(args, dest, true)
+                    && !self.try_const_splat_load(args, dest, 8, true)
+                {
                     self.flush_pending_vec_store_impl();
                     self.state.invalidate_vec_peephole();
                     match &args[0] {
@@ -6194,6 +6268,7 @@ impl X86Codegen {
                 // is_zero contract emitter-locally).
                 if !self.try_zero_splat(args, dest, true)
                     && !self.try_all_ones_splat(args, dest, true)
+                    && !self.try_const_splat_load(args, dest, 2, true)
                 {
                     self.flush_pending_vec_store_impl();
                     self.state.invalidate_vec_peephole();
@@ -6213,6 +6288,7 @@ impl X86Codegen {
                 // the staged movd/punpcklwd/pshufd chain.
                 if !self.try_zero_splat(args, dest, false)
                     && !self.try_all_ones_splat(args, dest, false)
+                    && !self.try_const_splat_load(args, dest, 2, false)
                 {
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
@@ -6237,6 +6313,7 @@ impl X86Codegen {
                 // the staged movd/vpbroadcastb chain.
                 if !self.try_zero_splat(args, dest, true)
                     && !self.try_all_ones_splat(args, dest, true)
+                    && !self.try_const_splat_load(args, dest, 1, true)
                 {
                     self.flush_pending_vec_store_impl();
                     self.state.invalidate_vec_peephole();
@@ -6258,6 +6335,7 @@ impl X86Codegen {
                 // the movd/punpcklbw/punpcklwd/pshufd chain.
                 if !self.try_zero_splat(args, dest, false)
                     && !self.try_all_ones_splat(args, dest, false)
+                    && !self.try_const_splat_load(args, dest, 1, false)
                 {
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
@@ -6754,7 +6832,9 @@ impl X86Codegen {
             IntrinsicOp::VecBroadcastI32x4 => {
                 // All-ones splat: one self-compare instead of
                 // movq/movd/pshufd.
-                if !self.try_all_ones_splat(args, dest, false) {
+                if !self.try_all_ones_splat(args, dest, false)
+                    && !self.try_const_splat_load(args, dest, 4, false)
+                {
                     self.flush_pending_vec_store_impl();
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
@@ -6793,7 +6873,9 @@ impl X86Codegen {
             }
             IntrinsicOp::VecBroadcastI32x8 => {
                 // All-ones splat: one vpcmpeqd instead of the staged chain.
-                if !self.try_all_ones_splat(args, dest, true) {
+                if !self.try_all_ones_splat(args, dest, true)
+                    && !self.try_const_splat_load(args, dest, 4, true)
+                {
                     self.flush_pending_vec_store_impl();
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
