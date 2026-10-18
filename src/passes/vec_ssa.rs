@@ -1106,4 +1106,132 @@ mod tests {
         assert_eq!(promote_function(&mut f, &table), 0);
         assert_eq!(f.blocks[0].instructions.len(), 3);
     }
+
+    fn intr(dest: u32, op: IntrinsicOp, args: Vec<Operand>) -> Instruction {
+        Instruction::Intrinsic {
+            dest: Some(Value(dest)),
+            op,
+            dest_ptr: None,
+            args,
+        }
+    }
+
+    fn val(v: u32) -> Operand {
+        Operand::Value(Value(v))
+    }
+
+    fn fold_ops(instructions: Vec<Instruction>) -> (usize, IrFunction) {
+        crate::passes::vectorize::set_x86_simd_isa(true, false, true, false);
+        let mut f = func_with_blocks(vec![block(
+            0,
+            instructions,
+            Terminator::Return(Some(val(9))),
+        )]);
+        f.next_value_id = 20;
+        let n = fold_zero_identities(&mut f);
+        (n, f)
+    }
+
+    fn returned(f: &IrFunction) -> u32 {
+        match &f.blocks[0].terminator {
+            Terminator::Return(Some(Operand::Value(v))) => v.0,
+            other => panic!("unexpected terminator {:?}", other),
+        }
+    }
+
+    #[test]
+    fn integer_zero_identities_fold_on_either_side() {
+        use crate::ir::reexports::IrConst;
+        let x = intr(
+            1,
+            IntrinsicOp::VecBroadcastI32x4,
+            vec![Operand::Const(IrConst::I32(7))],
+        );
+        let z = intr(2, IntrinsicOp::VecZeroI32x4, vec![]);
+        for (op, a, b) in [
+            (IntrinsicOp::VecAddI32x4, 1, 2),
+            (IntrinsicOp::VecAddI32x4, 2, 1),
+            (IntrinsicOp::VecOrI32x4, 2, 1),
+            (IntrinsicOp::VecXorI32x4, 1, 2),
+            (IntrinsicOp::VecSubI32x4, 1, 2),
+        ] {
+            let (n, f) = fold_ops(vec![
+                x.clone(),
+                z.clone(),
+                intr(9, op, vec![val(a), val(b)]),
+            ]);
+            assert_eq!(n, 1, "{:?}", op);
+            assert_eq!(returned(&f), 1, "{:?}", op);
+            assert_eq!(f.blocks[0].instructions.len(), 2, "{:?}", op);
+        }
+        // A chain resolves in one pass: ((x + 0) ^ 0) -> x.
+        let (n, f) = fold_ops(vec![
+            x.clone(),
+            z.clone(),
+            intr(3, IntrinsicOp::VecAddI32x4, vec![val(1), val(2)]),
+            intr(9, IntrinsicOp::VecXorI32x4, vec![val(3), val(2)]),
+        ]);
+        assert_eq!(n, 2);
+        assert_eq!(returned(&f), 1);
+    }
+
+    #[test]
+    fn zero_minus_x_and_fp_and_nonzero_broadcasts_are_kept() {
+        use crate::ir::reexports::IrConst;
+        let x = intr(
+            1,
+            IntrinsicOp::VecBroadcastI32x4,
+            vec![Operand::Const(IrConst::I32(7))],
+        );
+        let z = intr(2, IntrinsicOp::VecZeroI32x4, vec![]);
+        // 0 - x is a negation, not an identity.
+        let (n, f) = fold_ops(vec![
+            x.clone(),
+            z.clone(),
+            intr(9, IntrinsicOp::VecSubI32x4, vec![val(2), val(1)]),
+        ]);
+        assert_eq!(n, 0);
+        assert_eq!(f.blocks[0].instructions.len(), 3);
+        // x + 0.0 is not an identity for -0.0.
+        let (n, _) = fold_ops(vec![
+            intr(
+                1,
+                IntrinsicOp::VecBroadcastF32x4,
+                vec![Operand::Const(IrConst::F32(1.0))],
+            ),
+            intr(2, IntrinsicOp::VecZeroF32x4, vec![]),
+            intr(9, IntrinsicOp::VecAddF32x4, vec![val(1), val(2)]),
+        ]);
+        assert_eq!(n, 0);
+        // The byte family's zero IS its broadcast: only constant 0 counts.
+        let (n, _) = fold_ops(vec![
+            intr(
+                1,
+                IntrinsicOp::VecBroadcastI8x16,
+                vec![Operand::Const(IrConst::I8(5))],
+            ),
+            intr(
+                2,
+                IntrinsicOp::VecBroadcastI8x16,
+                vec![Operand::Const(IrConst::I8(3))],
+            ),
+            intr(9, IntrinsicOp::VecXorI8x16, vec![val(1), val(2)]),
+        ]);
+        assert_eq!(n, 0);
+        let (n, f) = fold_ops(vec![
+            intr(
+                1,
+                IntrinsicOp::VecBroadcastI8x16,
+                vec![Operand::Const(IrConst::I8(5))],
+            ),
+            intr(
+                2,
+                IntrinsicOp::VecBroadcastI8x16,
+                vec![Operand::Const(IrConst::I8(0))],
+            ),
+            intr(9, IntrinsicOp::VecXorI8x16, vec![val(1), val(2)]),
+        ]);
+        assert_eq!(n, 1);
+        assert_eq!(returned(&f), 1);
+    }
 }
