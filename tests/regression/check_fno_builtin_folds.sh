@@ -25,7 +25,7 @@ EOF
 # Baseline (hosted default): the bare alias folds — the initializer is
 # accepted and no libm call is emitted.
 "$CCC" -O0 -c "$td/static_fabs.c" -o "$td/base.o"
-if nm "$td/base.o" 2>/dev/null | grep -q ' U fabs'; then
+if nm "$td/base.o" 2>/dev/null | grep -c ' U fabs' >/dev/null; then
     echo "FAIL: default-hosted static fabs(2.5) did not fold to a constant" >&2
     exit 1
 fi
