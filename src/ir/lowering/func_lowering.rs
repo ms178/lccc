@@ -1354,7 +1354,7 @@ impl Lowerer {
                     let ptr_int_ty = crate::common::types::target_int_ir_type();
                     let dim_val = if let Some(ref expr) = dim_info.dim_expr {
                         let op = self.lower_expr(expr);
-                        let expr_ty = self.get_expr_type(expr);
+                        let expr_ty = self.value_ir_type(expr);
                         let casted = self.emit_implicit_cast(op, expr_ty, ptr_int_ty);
                         match casted {
                             Operand::Value(v) => v,

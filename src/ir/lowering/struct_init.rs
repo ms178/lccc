@@ -1135,7 +1135,7 @@ impl Lowerer {
                     // non-designated items fill the logical lanes, not padding.
                     self.zero_init_alloca(field_addr, total_size);
                     let first = self.lower_expr(e);
-                    let first_ty = self.get_expr_type(e);
+                    let first_ty = self.value_ir_type(e);
                     let first = if matches!(elem_ty, CType::Bool) {
                         self.emit_expr_bool_conversion(first, first_ty, e)
                     } else {
@@ -1178,7 +1178,7 @@ impl Lowerer {
                         };
                         let Some(expr) = expr else { break };
                         let val = self.lower_expr(expr);
-                        let src_ty = self.get_expr_type(expr);
+                        let src_ty = self.value_ir_type(expr);
                         let (val, val_ty) = if matches!(elem_ty, CType::Bool) {
                             (
                                 self.emit_expr_bool_conversion(val, src_ty, expr),
@@ -1228,7 +1228,7 @@ impl Lowerer {
         };
         let (val, expr_ty) = match src_expr {
             Some(e) => {
-                let et = self.get_expr_type(e);
+                let et = self.value_ir_type(e);
                 (self.lower_expr(e), et)
             }
             None => (

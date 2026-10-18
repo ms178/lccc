@@ -1287,7 +1287,7 @@ impl Lowerer {
                 } else if is_bool_elem_array {
                     // _Bool array elements: normalize (any nonzero -> 1) per C11 6.3.1.2
                     let val = self.lower_expr(e);
-                    let expr_ty = self.get_expr_type(e);
+                    let expr_ty = self.value_ir_type(e);
                     let val = self.emit_expr_bool_conversion(val, expr_ty, e);
                     self.emit_array_element_store(
                         alloca,
@@ -1297,7 +1297,7 @@ impl Lowerer {
                     );
                 } else {
                     let val = self.lower_expr(e);
-                    let expr_ty = self.get_expr_type(e);
+                    let expr_ty = self.value_ir_type(e);
                     let val = match &elem_ct {
                         Some(ct) => {
                             let src_ct = self.get_expr_ctype(e);
@@ -1369,7 +1369,7 @@ impl Lowerer {
             };
             if let (true, Some(e)) = (idx < num_elems, init_expr) {
                 let val = self.lower_expr(e);
-                let expr_ty = self.get_expr_type(e);
+                let expr_ty = self.value_ir_type(e);
                 let val = if matches!(elem_ct, CType::Bool) {
                     self.emit_expr_bool_conversion(val, expr_ty, e)
                 } else {
@@ -1403,7 +1403,7 @@ impl Lowerer {
     ) {
         if let Some(expr) = Self::unwrap_nested_init_expr(items) {
             let val = self.lower_expr(expr);
-            let expr_ty = self.get_expr_type(expr);
+            let expr_ty = self.value_ir_type(expr);
             // For _Bool, normalize before any truncation to preserve high bits
             let val = if da.is_bool {
                 self.emit_expr_bool_conversion(val, expr_ty, expr)

@@ -367,7 +367,7 @@ impl Lowerer {
         if let Some(ref rct) = ret_ct {
             if rct.is_complex() {
                 let val = self.lower_expr(e);
-                let src_ir_ty = self.get_expr_type(e);
+                let src_ir_ty = self.value_ir_type(e);
                 let rct_clone = rct.clone();
                 let complex_val = self.scalar_to_complex(val, src_ir_ty, &rct_clone);
                 let src_addr = self.operand_to_value(complex_val);
@@ -753,7 +753,7 @@ impl Lowerer {
         }
 
         let val = self.lower_expr(e);
-        let src_ir_ty = self.get_expr_type(e);
+        let src_ir_ty = self.value_ir_type(e);
         let rct_clone = rct.clone();
         let complex_val = self.scalar_to_complex(val, src_ir_ty, &rct_clone);
 

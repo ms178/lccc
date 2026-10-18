@@ -2436,7 +2436,7 @@ impl Lowerer {
     /// converts as by assignment, decided by the C types and not the IR
     /// carrier: `int a[] = {2.75Q}` is 2, not the low bits of the payload.
     pub(super) fn lower_init_leaf(&mut self, expr: &Expr, target_ct: &CType) -> Operand {
-        let src_ty = self.get_expr_type(expr);
+        let src_ty = self.value_ir_type(expr);
         let val = self.lower_expr(expr);
         if *target_ct == CType::Bool {
             return self.emit_expr_bool_conversion(val, src_ty, expr);
@@ -3606,7 +3606,7 @@ impl Lowerer {
         if let Some(lv) = self.lower_lvalue(lhs) {
             let lhs_ir = self.get_expr_type(lhs);
             let loaded = self.load_lvalue_typed(&lv, lhs_ir);
-            let rhs_ir = self.get_expr_type(rhs);
+            let rhs_ir = self.value_ir_type(rhs);
             let l = self.convert_scalar_ctype(loaded, lhs_ir, lhs_ct, common_ct);
             let r = self.convert_scalar_ctype(rhs_val, rhs_ir, rhs_ct, common_ct);
             let common_ir = IrType::from_ctype(common_ct);

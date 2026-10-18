@@ -156,7 +156,7 @@ impl Lowerer {
             }
         } else {
             let raw = self.lower_expr(rhs);
-            let raw_ty = self.get_expr_type(rhs);
+            let raw_ty = self.value_ir_type(rhs);
             let v = self.emit_implicit_cast(raw, raw_ty, elem_ir_ty);
             operands.resize(count, v);
         }
@@ -1669,7 +1669,7 @@ impl Lowerer {
             self.operand_to_value(lowered)
         };
         let rhs_scalar = if !rhs_is_vector {
-            let src_ty = self.get_expr_type(rhs);
+            let src_ty = self.value_ir_type(rhs);
             Some(self.emit_implicit_cast(Operand::Value(rhs_val), src_ty, elem_ir_ty))
         } else {
             None
@@ -1749,13 +1749,13 @@ impl Lowerer {
         };
 
         let lhs_scalar = if !lhs_is_vector {
-            let src_ty = self.get_expr_type(lhs);
+            let src_ty = self.value_ir_type(lhs);
             Some(self.emit_implicit_cast(Operand::Value(lhs_val), src_ty, elem_ir_ty))
         } else {
             None
         };
         let rhs_scalar = if !rhs_is_vector {
-            let src_ty = self.get_expr_type(rhs);
+            let src_ty = self.value_ir_type(rhs);
             Some(self.emit_implicit_cast(Operand::Value(rhs_val), src_ty, elem_ir_ty))
         } else {
             None
@@ -1850,13 +1850,13 @@ impl Lowerer {
             self.operand_to_value(lowered)
         };
         let lhs_scalar = if !lhs_is_vector {
-            let src_ty = self.get_expr_type(lhs);
+            let src_ty = self.value_ir_type(lhs);
             Some(self.emit_implicit_cast(Operand::Value(lhs_val), src_ty, elem_ir_ty))
         } else {
             None
         };
         let rhs_scalar = if !rhs_is_vector {
-            let src_ty = self.get_expr_type(rhs);
+            let src_ty = self.value_ir_type(rhs);
             Some(self.emit_implicit_cast(Operand::Value(rhs_val), src_ty, elem_ir_ty))
         } else {
             None

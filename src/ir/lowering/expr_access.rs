@@ -141,7 +141,7 @@ impl Lowerer {
         if !inner_ctype.is_vector() && target_ctype.is_vector() {
             let vec_size = self.ctype_size(&target_ctype);
             let src = self.lower_expr(inner);
-            let from_ty = self.get_expr_type(inner);
+            let from_ty = self.value_ir_type(inner);
 
             let alloca = self.fresh_value();
             self.emit(Instruction::Alloca {
@@ -453,7 +453,7 @@ impl Lowerer {
                         let val = self.lower_expr(expr);
                         // For vector compound literals, cast each element to the vector element type
                         let val = if let Some(vec_elem_ty) = vector_elem_ir_ty {
-                            let expr_ty = self.get_expr_type(expr);
+                            let expr_ty = self.value_ir_type(expr);
                             Operand::Value(self.emit_cast_val(val, expr_ty, vec_elem_ty))
                         } else {
                             val
@@ -908,6 +908,25 @@ impl Lowerer {
                     if let Some(ref layout) = struct_layout {
                         self.zero_init_alloca(alloca, layout.size);
                         self.emit_struct_init(items, alloca, layout, 0);
+                    } else if !ctype.is_complex() {
+                        // A scalar literal converts its (possibly brace-
+                        // nested) initializer as by initialization (C11
+                        // 6.5.2.5p4, 6.7.9p11): `(double){ i - 3 }` is the
+                        // value i - 3, not the int's bits read as a double.
+                        // An empty list (C23 `(int){}`) is zero.
+                        match Self::unwrap_nested_init_expr(items) {
+                            Some(e) => {
+                                let val = self.lower_init_leaf(e, &ctype);
+                                self.emit(Instruction::Store {
+                                    volatile: false,
+                                    val,
+                                    ptr: alloca,
+                                    ty: IrType::from_ctype(&ctype),
+                                    seg_override: AddressSpace::Default,
+                                });
+                            }
+                            None => self.zero_init_alloca(alloca, size),
+                        }
                     } else {
                         self.init_array_compound_literal(alloca, items, type_spec, ty, size);
                     }

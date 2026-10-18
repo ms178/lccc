@@ -719,7 +719,7 @@ impl Lowerer {
                 ElemInit::Unit(u) => Operand::Const(IrConst::from_i64(i64::from(u), geo.base_ty)),
                 ElemInit::Expr(e) => {
                     let v = self.lower_expr(e);
-                    let src = self.get_expr_type(e);
+                    let src = self.value_ir_type(e);
                     if geo.is_bool() {
                         self.emit_expr_bool_conversion(v, src, e)
                     } else {

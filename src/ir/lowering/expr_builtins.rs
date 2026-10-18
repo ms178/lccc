@@ -1805,7 +1805,7 @@ impl Lowerer {
             }
         } else if is_real {
             let val = self.lower_expr(&args[0]);
-            let val_ty = self.get_expr_type(&args[0]);
+            let val_ty = self.value_ir_type(&args[0]);
             Some(self.emit_implicit_cast(val, val_ty, target_ty))
         } else {
             // Imaginary part of a non-complex value is zero
