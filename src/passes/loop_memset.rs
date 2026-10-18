@@ -144,14 +144,32 @@ fn run_once(func: &mut IrFunction) -> usize {
 // ── Recognition structures ───────────────────────────────────────────────────
 
 /// How the loop addresses memory.
+/// Entry-value offset of an [`AddrForm::Indexed`] fill window.
+#[derive(Clone, Debug, PartialEq)]
+enum StartOff {
+    /// `scale*init + base_off` folded to a constant (zero -> use `base`).
+    Const(i64),
+    /// A runtime entry offset with scale 1 and no constant base_off: the
+    /// init value itself.
+    Value(Value),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum AddrForm {
     /// `GEP(base, scale*iv + base_off)` — element-wise addressing; `scale`
-    /// is in bytes and must equal the memory-access width.
+    /// is in bytes and must equal the memory-access width. `start_off` is
+    /// the ENTRY-VALUE offset `scale*iv.init + base_off`, folded at resolve
+    /// time: `memset` must begin at the address the FIRST removed store
+    /// wrote, not at the array base — an iv that does not start at zero
+    /// (a constant start like `for (i = 3; ...)` or a runtime cursor like
+    /// zlib-ng's running `length`) moves the fill window. `Value` carries
+    /// the loop-entry offset (scale 1, base_off 0); a runtime init under a
+    /// scale != 1 is refused — it would need an instruction the resolve
+    /// phase cannot emit.
     Indexed {
         base: Value,
         scale: i64,
-        base_off: i64,
+        start_off: StartOff,
     },
     /// A phi stepping +1 byte per iteration.
     Advancing { init: Value },
@@ -1395,15 +1413,50 @@ fn resolve_addr(
                 // (handled above); GEP chains refuse.
                 return Err(format!("{which} GEP base is loop-defined (GEP chain)"));
             }
-            let (scale, off) = resolve_affine(func, op_block, offset, ivs, defs, 0)
+            let (scale, off, counter) = resolve_affine(func, op_block, offset, ivs, defs, 0)
                 .ok_or_else(|| format!("{which} GEP offset is not affine in a counter iv"))?;
             if !matches!(scale, 1 | 2 | 4 | 8) {
                 return Err(format!("{which} GEP scale {scale} is not 1/2/4/8"));
             }
+            // Fold the fill window's ENTRY offset: scale*iv.init + off. A
+            // counter that does not start at zero moves the first removed
+            // store away from the base — the emit must GEP.
+            let start_off = match counter {
+                None => StartOff::Const(off),
+                Some(phi) => {
+                    let init = ivs
+                        .iter()
+                        .find(|iv| iv.phi.0 == phi.0)
+                        .map(|iv| iv.init.clone())
+                        .ok_or_else(|| format!("{which} GEP counter has no recognized iv"))?;
+                    match init {
+                        Operand::Const(c) => {
+                            let ci = const_to_i64(&c).ok_or_else(|| {
+                                format!("{which} GEP counter init is not an integer")
+                            })?;
+                            StartOff::Const(
+                                scale
+                                    .checked_mul(ci)
+                                    .and_then(|m| m.checked_add(off))
+                                    .ok_or_else(|| format!("{which} GEP start offset overflows"))?,
+                            )
+                        }
+                        Operand::Value(v) => {
+                            if scale == 1 && off == 0 {
+                                StartOff::Value(v)
+                            } else {
+                                return Err(format!(
+                                    "{which} GEP start offset needs runtime scaling (unsupported)"
+                                ));
+                            }
+                        }
+                    }
+                }
+            };
             Ok(AddrForm::Indexed {
                 base: bv,
                 scale,
-                base_off: off,
+                start_off,
             })
         }
         _ => Err(format!(
@@ -1421,15 +1474,15 @@ fn resolve_affine(
     ivs: &[Iv],
     defs: &FxHashMap<u32, usize>,
     fuel: u8,
-) -> Option<(i64, i64)> {
+) -> Option<(i64, i64, Option<Value>)> {
     if fuel > 6 {
         return None;
     }
     match op {
-        Operand::Const(c) => Some((0, const_to_i64(c)?)),
+        Operand::Const(c) => Some((0, const_to_i64(c)?, None)),
         Operand::Value(v) => {
-            if ivs.iter().any(|iv| iv.phi.0 == v.0) {
-                return Some((1, 0));
+            if let Some(iv) = ivs.iter().find(|iv| iv.phi.0 == v.0) {
+                return Some((1, 0, Some(iv.phi)));
             }
             if defs.get(&v.0) != Some(&header_idx) {
                 // Loop-invariant offsets live in the GEP base, not here.
@@ -1454,11 +1507,11 @@ fn resolve_affine(
                     if !(0..4).contains(&k) {
                         return None;
                     }
-                    let (s, b) = resolve_affine(func, header_idx, lhs, ivs, defs, fuel + 1)?;
+                    let (s, b, iv) = resolve_affine(func, header_idx, lhs, ivs, defs, fuel + 1)?;
                     if s != 0 && b != 0 {
                         return None;
                     }
-                    Some((s << k, b << k))
+                    Some((s << k, b << k, iv))
                 }
                 Instruction::BinOp {
                     op: IrBinOp::Mul,
@@ -1467,8 +1520,8 @@ fn resolve_affine(
                     ..
                 } => {
                     let k = const_to_i64(k)?;
-                    let (s, b) = resolve_affine(func, header_idx, lhs, ivs, defs, fuel + 1)?;
-                    Some((s.checked_mul(k)?, b.checked_mul(k)?))
+                    let (s, b, iv) = resolve_affine(func, header_idx, lhs, ivs, defs, fuel + 1)?;
+                    Some((s.checked_mul(k)?, b.checked_mul(k)?, iv))
                 }
                 Instruction::BinOp {
                     op: IrBinOp::Add,
@@ -1476,12 +1529,12 @@ fn resolve_affine(
                     rhs,
                     ..
                 } => {
-                    let (s1, b1) = resolve_affine(func, header_idx, lhs, ivs, defs, fuel + 1)?;
-                    let (s2, b2) = resolve_affine(func, header_idx, rhs, ivs, defs, fuel + 1)?;
+                    let (s1, b1, iv1) = resolve_affine(func, header_idx, lhs, ivs, defs, fuel + 1)?;
+                    let (s2, b2, iv2) = resolve_affine(func, header_idx, rhs, ivs, defs, fuel + 1)?;
                     if s1 != 0 && s2 != 0 {
                         return None;
                     }
-                    Some((s1 + s2, b1 + b2))
+                    Some((s1 + s2, b1 + b2, if s1 != 0 { iv1 } else { iv2 }))
                 }
                 _ => None,
             }
@@ -1689,13 +1742,13 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
 
     let start_of = |em: &mut Emitter, form: &AddrForm| -> Value {
         match form {
-            AddrForm::Indexed { base, base_off, .. } => {
-                if *base_off == 0 {
-                    *base
-                } else {
-                    em.gep(*base, Operand::Const(IrConst::I64(*base_off)), IrType::Ptr)
-                }
-            }
+            AddrForm::Indexed {
+                base, start_off, ..
+            } => match start_off {
+                StartOff::Const(0) => *base,
+                StartOff::Const(k) => em.gep(*base, Operand::Const(IrConst::I64(*k)), IrType::Ptr),
+                StartOff::Value(v) => em.gep(*base, Operand::Value(*v), IrType::Ptr),
+            },
             AddrForm::Advancing { init } => *init,
         }
     };

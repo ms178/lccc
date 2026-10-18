@@ -77,6 +77,30 @@ static unsigned fill_offset_init(void) {
     return i;
 }
 
+// iv INIT != 0 with the iv itself as the index: the fill window starts at
+// G+init, not at the base. The emitted memset must begin at the folded
+// entry offset scale*init + base_off — writing from the base silently
+// zero-shifts the whole table (the masking behind the Slt refusal).
+static unsigned fill_ivinit_offset(void) {
+    unsigned i;
+    for (i = 3; i < 259; i++) G[i] = 0x22;
+    return i;
+}
+
+// runtime running cursor as the address offset (scale 1, runtime entry
+// value): each nested window must start where the previous one ended —
+// the zlib-ng tr_static_init shape (gcc-16 memsets it with the cursor
+// advance; base-only addressing corrupts everything past the first row).
+static unsigned fill_running_cursor(void) {
+    unsigned len = 0;
+    unsigned char tags[3] = {0x31, 0x32, 0x33};
+    unsigned widths[3] = {5, 2, 9};
+    for (unsigned k = 0; k < 3; k++)
+        for (unsigned j = 0; j < widths[k]; j++)
+            G[len++] = tags[k];
+    return len;
+}
+
 int main(void) {
     fill_byte(0, 4000);
     printf("b0 %lu\n", sum8(G, 4000));
@@ -104,5 +128,11 @@ int main(void) {
     // Sequence explicitly: printf argument evaluation order is unspecified.
     unsigned off_i = fill_offset_init();
     printf("offinit %u %lu\n", off_i, sum8(G, 256));
+
+    unsigned iv_i = fill_ivinit_offset();
+    printf("ivinit %u %lu\n", iv_i, sum8(G, 259));
+
+    unsigned cur = fill_running_cursor();
+    printf("cursor %u %lu\n", cur, sum8(G, 16));
     return 0;
 }
