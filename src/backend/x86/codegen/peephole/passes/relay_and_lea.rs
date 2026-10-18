@@ -2110,7 +2110,8 @@ fn dest_width(name: &str) -> Option<u8> {
 ///
 /// Conditions:
 /// * the producer is a pure producer (no read-modify-write) and does not
-///   mention the copy's destination family anywhere;
+///   mention the copy's destination family or (after the rewrite) its own
+///   register -- the `aliasing` form below lifts this;
 /// * the copy is an adjacent plain register move whose width is compatible —
 ///   a 32-bit producer may feed a `movl` or a `movq` copy (both leave the
 ///   destination zero-extended), a 64-bit producer only a `movq` copy
@@ -2118,6 +2119,41 @@ fn dest_width(name: &str) -> Option<u8> {
 ///   that the copy discarded);
 /// * the producer's register is provably dead after the copy (module header).
 pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    retarget_producer_into_copy_impl(store, infos, false)
+}
+
+/// The late form of [`retarget_producer_into_copy`]: the producer's sources
+/// may name either register. Every `PURE_PRODUCERS` form reads all of its
+/// operands before writing its one destination and never reads that
+/// destination implicitly (no `cmov`, no `bsf`), so
+///
+/// ```text
+///     movzbl %al, %edx            movzbl %al, %eax
+///     movq %rdx, %rax       ->
+/// ```
+///
+/// and `movzbl %dl, %edx; movq %rdx, %rax` -> `movzbl %dl, %eax` are exact:
+/// the read still happens at the producer, before any write. A resulting
+/// `movq %R, %R` is deleted; `movl %R, %R` stays a zero-extension (the
+/// self-zext cleanup removes it when the upper half is already zero).
+///
+/// Phase ordering: it runs once after the local fixpoints. Inside them it
+/// would merge chains into one register before the RMW coalescing and the
+/// copy+shift -> `lea` folds see them (`sarl; movslq %eax, %r11; movq %r11,
+/// %rax; shlq $2, %rax; movq %rax, %rcx` loses its `leaq 0(,%r11,4), %rcx`),
+/// so here it only removes copies those passes left behind.
+pub(super) fn retarget_producer_into_copy_aliasing(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    retarget_producer_into_copy_impl(store, infos, true)
+}
+
+fn retarget_producer_into_copy_impl(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    aliasing: bool,
+) -> bool {
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
     let mut changed = false;
@@ -2211,9 +2247,9 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
             i += 1;
             continue;
         }
-        // The producer must not read the destination family (its source is
-        // evaluated before the write, but a rewrite would alias them).
-        if line_refs_family(prod_src, d_fam) || line_refs_family(copy_dst, a_fam) {
+        // The strict form keeps the producer's sources off D (the aliasing
+        // form allows it; see `retarget_producer_into_copy_aliasing`).
+        if (!aliasing && line_refs_family(prod_src, d_fam)) || line_refs_family(copy_dst, a_fam) {
             i += 1;
             continue;
         }
@@ -2228,8 +2264,17 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
             REG_NAMES[1][d_fam as usize]
         };
         let new_line = format!("    {}{}, {}", op, prod_src, new_dst);
-        if line_refs_family(&new_line, a_fam) {
+        if !aliasing && line_refs_family(&new_line, a_fam) {
             i += 1;
+            continue;
+        }
+        if op.trim_end() == "movq" && prod_src == new_dst {
+            // `movq %rax, %rdx; movq %rdx, %rax`: the pair is the identity.
+            mark_nop(&mut infos[i]);
+            mark_nop(&mut infos[j]);
+            lv.refresh_span(store, infos, i, j);
+            changed = true;
+            i = j + 1;
             continue;
         }
         replace_line(store, &mut infos[i], i, new_line);
@@ -5899,6 +5944,51 @@ mod tests {
             out.contains("movzbl (%rdx,%r12), %r10d") || out.contains("movq %rax, (%rsi)"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn producer_retarget_allows_sources_naming_either_register() {
+        // The return-value tail: the zero-extend reads %al and the copy
+        // writes %rax. x86 reads the source before the write.
+        let ret = |prod: &str| {
+            run(&format!(
+                "foo:\n.cfi_startproc\n    # LCCC_RET_XMM 0\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 1\n    addq %rsi, %rax\n    {prod}\n    movq %rdx, %rax\n    ret\n.cfi_endproc\n"
+            ))
+        };
+        let out = ret("movzbl %al, %edx");
+        assert!(
+            out.contains("movzbl %al, %eax") && !out.contains("%rdx"),
+            "{out}"
+        );
+        // The producer reads its own register (dead after the copy).
+        let out = ret("movzbl %dl, %edx");
+        assert!(
+            out.contains("movzbl %dl, %eax") && !out.contains("movq %rdx"),
+            "{out}"
+        );
+        // A 64-bit round trip is the identity: both lines go.
+        let out = ret("movq %rax, %rdx");
+        assert!(
+            !out.contains("%rdx") && !out.contains("movq %rax, %rax"),
+            "{out}"
+        );
+        // A memory source whose address names the destination.
+        let out = ret("movl 8(%rax,%rdx), %edx");
+        assert!(
+            out.contains("movl 8(%rax,%rdx), %eax") && !out.contains("movq %rdx"),
+            "{out}"
+        );
+        // The producer's register stays live: no retarget.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movzbl %al, %edx\n",
+            "    movq %rdx, %rax\n",
+            "    movq %rdx, (%rsi)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movzbl %al, %edx"), "{out}");
     }
 
     #[test]
