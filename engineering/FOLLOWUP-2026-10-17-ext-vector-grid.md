@@ -496,11 +496,18 @@ with the fix for each:**
   with VEX-256 state is a transition-penalty hazard). Fix: route every
   128-bit integer emitter through the three-operand VEX spelling when
   `avx_enabled`, exactly as the float twins already do.
-- *Vector-by-vector shifts* — `shl_v32i` 41 / 2, `shl_v16i` 25 / 2,
-  `shl_v32l` 23 / 2: only `vector << constant` is packed. Fix: new
-  `VecShlvI32x{4,8}`/`VecSrlv`/`VecSrav` intrinsics (`vpsllvd`/`vpsrlvd`/
-  `vpsravd`, `vpsllvq`/`vpsrlvq`; AVX2 only, no `vpsravq` before
-  AVX-512) in `packed_shift`, `vec_shift_plan` and the x86 emitter.
+- *Vector-by-vector shifts* — DONE (same change, second commit):
+  `shl_v32i`/`shr_v32i`/`shl_v32l`/`shl_v16i`/`shr_v16i`/`shl_v16l` 2 / 2
+  (`vpsllvd`/`vpsrlvd`/`vpsravd`/`vpsllvq`/`vpsrlvq`, 256-bit and
+  VEX.128; `VecShlvI32x{8,4}`, `VecLShrvI32x{8,4}`, `VecAShrvI32x{8,4}`,
+  `VecShlvI64x{4,2}`, `VecLShrvI64x{4,2}` in
+  `try_lower_vector_variable_shift`), including a non-constant scalar
+  count (splat + variable shift: 6 / 4 — GCC shifts by an `%xmm` count
+  without the broadcast; a `vpslld %xmm, %ymm` form would close it) and
+  a count vector of the other signedness. Remaining: the signed 64-bit
+  right shift (`shr_v32l` 23 / 6, `shr_v16l` 15 / 6) — no `vpsravq`
+  below AVX-512VL; GCC emulates with `vpsrlvq` + sign fix-up, which is
+  the next step.
 - *64-bit lane compares* — `eq_v32l`/`lt_v32l` 41 / 2, `eq_v16l`/`lt_v16l`
   25 / 2: `packed_cmp_blendv` has no I64 family. Fix: `VecCmpI64x{2,4}`
   over `vpcmpeqq`/`vpcmpgtq` (SSE4.1/4.2 — gate on AVX2 like the others),

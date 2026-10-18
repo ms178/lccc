@@ -3844,8 +3844,9 @@ Decisions taken when retiring it (numbers in
 - *Ceilings ratchet, including the debt.* The codegen gate pins the
   register-shaped functions at GCC parity and the scalar-residue functions
   at their measured counts, each annotated with the missing instruction
-  (`vpsllvd`, `vpcmpgtq`, the `pmullw` byte expansion, VEX-128 integer
-  emitters). A residue function may only get smaller.
+  (`vpcmpgtq`, the `pmullw` byte expansion, VEX-128 integer emitters;
+  `vpsllvd` and its siblings have since landed, see the addendum below).
+  A residue function may only get smaller.
 - *Runtime levels follow the host CPU, assembly ceilings do not.* The
   hosted runner is not guaranteed AVX-512 (or AVX2); the gate executes
   only the levels `/proc/cpuinfo` supports and always checks the
@@ -3916,3 +3917,37 @@ register-handoff ranking, the SLP shared-load schedule) settled these:
   `returned_vector_values`) and the map-intermediate class table
   (`x86_map_intrinsic_class`) were lifted out when the census ratchet
   tripped; the baseline file was not touched.
+
+### Addendum — per-lane variable shifts, and why the 16-byte forms are AVX2-gated (2026-10-18)
+
+`v << w` with a vector count (and `v << n` with a non-constant scalar)
+was the largest remaining per-lane residue of the matrix (`shl_v32i` 41
+instructions vs GCC's 2). It is now one `vpsllvd`/`vpsrlvd`/`vpsravd`/
+`vpsllvq`/`vpsrlvq` through ten new intrinsics (`VecShlv*`, `VecLShrv*`,
+`VecAShrv*` at 8×I32/4×I64 and 4×I32/2×I64).
+
+- *Semantics.* GNU vector shifts are undefined for a count at or beyond
+  the lane width, exactly like the scalar lanes, so the ISA's
+  shift-out-to-zero / sign-fill is admissible and no masking is emitted.
+  The count vector may have the other signedness (only the lane width
+  matters); a scalar count is splat through the existing operand plan.
+- *All ten encodings are AVX2.* The 32-byte lowering ceiling is published
+  only at the AVX2 code-generation level (`Driver::run`), so the lowering
+  gates the whole family — including the 16-byte shapes — on
+  `target_vector_lowering_bytes() == 32`. A `-mavx` (AVX1) TU keeps the
+  scalar form rather than emitting an encoding the ISA does not have.
+- *The 16-byte forms use `emit_vex_binary_128`*, the three-operand VEX
+  emitter that had been written for the ARX pass and never wired: the
+  legacy destructive `emit_sse_binary_128` has no non-VEX spelling to
+  fall back to for these mnemonics. They are deliberately NOT registered
+  as memfold consumers (`memfold_consumer_128` returns `None`): that
+  emitter does not resolve a pending elided load, and the VLFOLD contract
+  is "resolution is mandatory".
+- *Signed 64-bit right shift stays scalar.* There is no `vpsravq` below
+  AVX-512VL; GCC's `vpsrlvq` + sign fix-up emulation is a follow-up.
+- *Gate.* The matrix gains a `shr` column (every lane type, both widths)
+  and twelve hand-written shift shapes (unsigned lanes, scalar counts of
+  both widths, mixed-signedness counts, chains); the runtime differential
+  masks the counts into range. Ceilings: 2 for every packed shape, and a
+  `vpsravd` must appear in `shr_v32i`.
+

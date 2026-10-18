@@ -22,6 +22,7 @@ v16c G_and_v16c(v16c a,v16c b);
 v16c G_or_v16c(v16c a,v16c b);
 v16c G_xor_v16c(v16c a,v16c b);
 v16c G_shl_v16c(v16c a,v16c b);
+v16c G_shr_v16c(v16c a,v16c b);
 v16c G_neg_v16c(v16c a,v16c b);
 v16c G_not_v16c(v16c a,v16c b);
 v16c G_eq_v16c(v16c a,v16c b);
@@ -41,6 +42,7 @@ v32c G_and_v32c(v32c a,v32c b);
 v32c G_or_v32c(v32c a,v32c b);
 v32c G_xor_v32c(v32c a,v32c b);
 v32c G_shl_v32c(v32c a,v32c b);
+v32c G_shr_v32c(v32c a,v32c b);
 v32c G_neg_v32c(v32c a,v32c b);
 v32c G_not_v32c(v32c a,v32c b);
 v32c G_eq_v32c(v32c a,v32c b);
@@ -60,6 +62,7 @@ v16s G_and_v16s(v16s a,v16s b);
 v16s G_or_v16s(v16s a,v16s b);
 v16s G_xor_v16s(v16s a,v16s b);
 v16s G_shl_v16s(v16s a,v16s b);
+v16s G_shr_v16s(v16s a,v16s b);
 v16s G_neg_v16s(v16s a,v16s b);
 v16s G_not_v16s(v16s a,v16s b);
 v16s G_eq_v16s(v16s a,v16s b);
@@ -79,6 +82,7 @@ v32s G_and_v32s(v32s a,v32s b);
 v32s G_or_v32s(v32s a,v32s b);
 v32s G_xor_v32s(v32s a,v32s b);
 v32s G_shl_v32s(v32s a,v32s b);
+v32s G_shr_v32s(v32s a,v32s b);
 v32s G_neg_v32s(v32s a,v32s b);
 v32s G_not_v32s(v32s a,v32s b);
 v32s G_eq_v32s(v32s a,v32s b);
@@ -98,6 +102,7 @@ v16i G_and_v16i(v16i a,v16i b);
 v16i G_or_v16i(v16i a,v16i b);
 v16i G_xor_v16i(v16i a,v16i b);
 v16i G_shl_v16i(v16i a,v16i b);
+v16i G_shr_v16i(v16i a,v16i b);
 v16i G_neg_v16i(v16i a,v16i b);
 v16i G_not_v16i(v16i a,v16i b);
 v16i G_eq_v16i(v16i a,v16i b);
@@ -117,6 +122,7 @@ v32i G_and_v32i(v32i a,v32i b);
 v32i G_or_v32i(v32i a,v32i b);
 v32i G_xor_v32i(v32i a,v32i b);
 v32i G_shl_v32i(v32i a,v32i b);
+v32i G_shr_v32i(v32i a,v32i b);
 v32i G_neg_v32i(v32i a,v32i b);
 v32i G_not_v32i(v32i a,v32i b);
 v32i G_eq_v32i(v32i a,v32i b);
@@ -136,6 +142,7 @@ v16l G_and_v16l(v16l a,v16l b);
 v16l G_or_v16l(v16l a,v16l b);
 v16l G_xor_v16l(v16l a,v16l b);
 v16l G_shl_v16l(v16l a,v16l b);
+v16l G_shr_v16l(v16l a,v16l b);
 v16l G_neg_v16l(v16l a,v16l b);
 v16l G_not_v16l(v16l a,v16l b);
 v16l G_eq_v16l(v16l a,v16l b);
@@ -155,6 +162,7 @@ v32l G_and_v32l(v32l a,v32l b);
 v32l G_or_v32l(v32l a,v32l b);
 v32l G_xor_v32l(v32l a,v32l b);
 v32l G_shl_v32l(v32l a,v32l b);
+v32l G_shr_v32l(v32l a,v32l b);
 v32l G_neg_v32l(v32l a,v32l b);
 v32l G_not_v32l(v32l a,v32l b);
 v32l G_eq_v32l(v32l a,v32l b);
@@ -238,6 +246,7 @@ v16c L_and_v16c(v16c a,v16c b);
 v16c L_or_v16c(v16c a,v16c b);
 v16c L_xor_v16c(v16c a,v16c b);
 v16c L_shl_v16c(v16c a,v16c b);
+v16c L_shr_v16c(v16c a,v16c b);
 v16c L_neg_v16c(v16c a,v16c b);
 v16c L_not_v16c(v16c a,v16c b);
 v16c L_eq_v16c(v16c a,v16c b);
@@ -257,6 +266,7 @@ v32c L_and_v32c(v32c a,v32c b);
 v32c L_or_v32c(v32c a,v32c b);
 v32c L_xor_v32c(v32c a,v32c b);
 v32c L_shl_v32c(v32c a,v32c b);
+v32c L_shr_v32c(v32c a,v32c b);
 v32c L_neg_v32c(v32c a,v32c b);
 v32c L_not_v32c(v32c a,v32c b);
 v32c L_eq_v32c(v32c a,v32c b);
@@ -276,6 +286,7 @@ v16s L_and_v16s(v16s a,v16s b);
 v16s L_or_v16s(v16s a,v16s b);
 v16s L_xor_v16s(v16s a,v16s b);
 v16s L_shl_v16s(v16s a,v16s b);
+v16s L_shr_v16s(v16s a,v16s b);
 v16s L_neg_v16s(v16s a,v16s b);
 v16s L_not_v16s(v16s a,v16s b);
 v16s L_eq_v16s(v16s a,v16s b);
@@ -295,6 +306,7 @@ v32s L_and_v32s(v32s a,v32s b);
 v32s L_or_v32s(v32s a,v32s b);
 v32s L_xor_v32s(v32s a,v32s b);
 v32s L_shl_v32s(v32s a,v32s b);
+v32s L_shr_v32s(v32s a,v32s b);
 v32s L_neg_v32s(v32s a,v32s b);
 v32s L_not_v32s(v32s a,v32s b);
 v32s L_eq_v32s(v32s a,v32s b);
@@ -314,6 +326,7 @@ v16i L_and_v16i(v16i a,v16i b);
 v16i L_or_v16i(v16i a,v16i b);
 v16i L_xor_v16i(v16i a,v16i b);
 v16i L_shl_v16i(v16i a,v16i b);
+v16i L_shr_v16i(v16i a,v16i b);
 v16i L_neg_v16i(v16i a,v16i b);
 v16i L_not_v16i(v16i a,v16i b);
 v16i L_eq_v16i(v16i a,v16i b);
@@ -333,6 +346,7 @@ v32i L_and_v32i(v32i a,v32i b);
 v32i L_or_v32i(v32i a,v32i b);
 v32i L_xor_v32i(v32i a,v32i b);
 v32i L_shl_v32i(v32i a,v32i b);
+v32i L_shr_v32i(v32i a,v32i b);
 v32i L_neg_v32i(v32i a,v32i b);
 v32i L_not_v32i(v32i a,v32i b);
 v32i L_eq_v32i(v32i a,v32i b);
@@ -352,6 +366,7 @@ v16l L_and_v16l(v16l a,v16l b);
 v16l L_or_v16l(v16l a,v16l b);
 v16l L_xor_v16l(v16l a,v16l b);
 v16l L_shl_v16l(v16l a,v16l b);
+v16l L_shr_v16l(v16l a,v16l b);
 v16l L_neg_v16l(v16l a,v16l b);
 v16l L_not_v16l(v16l a,v16l b);
 v16l L_eq_v16l(v16l a,v16l b);
@@ -371,6 +386,7 @@ v32l L_and_v32l(v32l a,v32l b);
 v32l L_or_v32l(v32l a,v32l b);
 v32l L_xor_v32l(v32l a,v32l b);
 v32l L_shl_v32l(v32l a,v32l b);
+v32l L_shr_v32l(v32l a,v32l b);
 v32l L_neg_v32l(v32l a,v32l b);
 v32l L_not_v32l(v32l a,v32l b);
 v32l L_eq_v32l(v32l a,v32l b);
@@ -492,6 +508,15 @@ v32f G_fma_two(v32f,v32f,v32f,v32f); v32f L_fma_two(v32f,v32f,v32f,v32f);
 void G_fma_loop(v32f*,const v32f*,const v32f*,const v32f*,int); void L_fma_loop(v32f*,const v32f*,const v32f*,const v32f*,int);
 void G_fma_acc(v32d*,const v32d*,const v32d*,int); void L_fma_acc(v32d*,const v32d*,const v32d*,int);
 struct W8 { v32f v; int tag; };
+typedef unsigned v32u __attribute__((vector_size(32)));
+typedef unsigned long v32ul __attribute__((vector_size(32)));
+typedef unsigned v16u __attribute__((vector_size(16)));
+#define SH(pfx) v32u pfx##sh_vv_u(v32u,v32u); v32ul pfx##sh_vv_ul(v32ul,v32ul); v16u pfx##sh_vv_u4(v16u,v16u); \
+  v32i pfx##sh_vs_shl(v32i,int); v32i pfx##sh_vs_sar(v32i,int); v32u pfx##sh_vs_shr(v32u,unsigned); \
+  v32l pfx##sh_vs_shl_l(v32l,long); v32ul pfx##sh_vs_shr_ul(v32ul,int); v32i pfx##sh_mixsign(v32i,v32u); \
+  v32u pfx##sh_mixsign2(v32u,v32i); v32i pfx##sh_chain(v32i,v32i,v32i); v32i pfx##sh_then_add(v32i,v32i); \
+  v16i pfx##sh4_vs_sar(v16i,int); v16l pfx##sh4_vv_shl_l(v16l,v16l); v16i pfx##sh4_chain(v16i,v16i,v16i);
+SH(G_) SH(L_)
 #define CF(pfx) v32f pfx##cf_phi_call(v32f,v32f,int); v32f pfx##cf_loop_acc(const v32f*,int); v32f pfx##cf_loop_acc_call(const v32f*,int); \
   v32f pfx##cf_nested_tern(v32f,v32f,int); v32f pfx##cf_sw(v32f,v32f,int); v32f pfx##cf_goto_loop(const v32f*,int); v32f pfx##cf_two_lives(v32f,v32f); \
   v32l pfx##cf_l_phi(v32l,v32l,int); v32d pfx##cf_d_mix(v32d,v32d,double); float pfx##cf_lane_after(v32f,v32f); v32f pfx##cf_cond_assign(v32f,v32f,int); \
@@ -546,6 +571,23 @@ static void cf_checks(void){
   { v32i r1=G_cf_cmp_chain(a,b,c), r2=L_cf_cmp_chain(a,b,c); check("cf_cmp_chain",&r1,&r2,sizeof r1); }
   check("cf_sink_count",&G_sink_count,&L_sink_count,sizeof(int));
 }
+/* counts reduced modulo the lane width: wider counts are undefined for
+   GNU vector shifts exactly as for the scalar lanes */
+#define SHVV(T,N,W) { T a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(unsigned i=0;i<sizeof a/sizeof a[0];i++) b[i]=(b[i]&(W-1)); \
+  T r1=G_##N(a,b), r2=L_##N(a,b); check(#N,&r1,&r2,sizeof r1); }
+#define SHVS(T,N,CT,W) { T a; fill(&a,sizeof a,0); CT n=(CT)(rnd()%W); T r1=G_##N(a,n), r2=L_##N(a,n); check(#N,&r1,&r2,sizeof r1); }
+static void shift_checks(void){
+  for(int rep=0;rep<4;rep++){
+    SHVV(v32u,sh_vv_u,32) SHVV(v32ul,sh_vv_ul,64) SHVV(v16u,sh_vv_u4,32) SHVV(v32i,sh_then_add,32)
+    SHVS(v32i,sh_vs_shl,int,32) SHVS(v32i,sh_vs_sar,int,32) SHVS(v32u,sh_vs_shr,unsigned,32)
+    SHVS(v32l,sh_vs_shl_l,long,64) SHVS(v32ul,sh_vs_shr_ul,int,64)
+    SHVS(v16i,sh4_vs_sar,int,32) SHVV(v16l,sh4_vv_shl_l,64)
+    { v16i a,b,c; fill(&a,sizeof a,0); fill(&b,sizeof b,0); fill(&c,sizeof c,0); for(int i=0;i<4;i++){ b[i]&=31; c[i]&=31; } v16i r1=G_sh4_chain(a,b,c), r2=L_sh4_chain(a,b,c); check("sh4_chain",&r1,&r2,sizeof r1); }
+    { v32i a; v32u b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<8;i++) b[i]&=31; v32i r1=G_sh_mixsign(a,b), r2=L_sh_mixsign(a,b); check("sh_mixsign",&r1,&r2,sizeof r1); }
+    { v32u a; v32i b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<8;i++) b[i]&=31; v32u r1=G_sh_mixsign2(a,b), r2=L_sh_mixsign2(a,b); check("sh_mixsign2",&r1,&r2,sizeof r1); }
+    { v32i a,b,c; fill(&a,sizeof a,0); fill(&b,sizeof b,0); fill(&c,sizeof c,0); for(int i=0;i<8;i++){ b[i]&=31; c[i]&=31; } v32i r1=G_sh_chain(a,b,c), r2=L_sh_chain(a,b,c); check("sh_chain",&r1,&r2,sizeof r1); }
+  }
+}
 static void handoff_checks(void){
   for(int rep=0;rep<3;rep++){
     HOFFC(v16f,ho_f4,fillx4) HOFFC(v16d,ho_d2,fillxd2) HOFFC(v32f,ho_f8,fillx8) HOFFC(v32d,ho_d4,fillxd4)
@@ -578,7 +620,7 @@ static void extra_checks(void){
   { v32f a,b; v32i x,y; fillf8(&a); fillf8(&b); fill(&x,sizeof x,0); fill(&y,sizeof y,0); v32i r1=G_sel_mask(a,b,x,y), r2=L_sel_mask(a,b,x,y); check("sel_mask",&r1,&r2,sizeof r1); }
 }
 
-int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks();
+int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shift_checks();
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16c r1=G_add_v16c(a,b), r2=L_add_v16c(a,b); check("add_v16c",&r1,&r2,sizeof r1); }
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
@@ -594,6 +636,9 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks();
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<16;i++) b[i]=(char)(((unsigned)b[i])%8);
   v16c r1=G_shl_v16c(a,b), r2=L_shl_v16c(a,b); check("shl_v16c",&r1,&r2,sizeof r1); }
+{ v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  for(int i=0;i<16;i++) b[i]=(char)(((unsigned)b[i])%8);
+  v16c r1=G_shr_v16c(a,b), r2=L_shr_v16c(a,b); check("shr_v16c",&r1,&r2,sizeof r1); }
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16c r1=G_neg_v16c(a,b), r2=L_neg_v16c(a,b); check("neg_v16c",&r1,&r2,sizeof r1); }
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
@@ -627,6 +672,9 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks();
   for(int i=0;i<32;i++) b[i]=(char)(((unsigned)b[i])%8);
   v32c r1=G_shl_v32c(a,b), r2=L_shl_v32c(a,b); check("shl_v32c",&r1,&r2,sizeof r1); }
 { v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  for(int i=0;i<32;i++) b[i]=(char)(((unsigned)b[i])%8);
+  v32c r1=G_shr_v32c(a,b), r2=L_shr_v32c(a,b); check("shr_v32c",&r1,&r2,sizeof r1); }
+{ v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32c r1=G_neg_v32c(a,b), r2=L_neg_v32c(a,b); check("neg_v32c",&r1,&r2,sizeof r1); }
 { v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32c r1=G_not_v32c(a,b), r2=L_not_v32c(a,b); check("not_v32c",&r1,&r2,sizeof r1); }
@@ -658,6 +706,9 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks();
 { v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<8;i++) b[i]=(short)(((unsigned)b[i])%16);
   v16s r1=G_shl_v16s(a,b), r2=L_shl_v16s(a,b); check("shl_v16s",&r1,&r2,sizeof r1); }
+{ v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  for(int i=0;i<8;i++) b[i]=(short)(((unsigned)b[i])%16);
+  v16s r1=G_shr_v16s(a,b), r2=L_shr_v16s(a,b); check("shr_v16s",&r1,&r2,sizeof r1); }
 { v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16s r1=G_neg_v16s(a,b), r2=L_neg_v16s(a,b); check("neg_v16s",&r1,&r2,sizeof r1); }
 { v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
@@ -691,6 +742,9 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks();
   for(int i=0;i<16;i++) b[i]=(short)(((unsigned)b[i])%16);
   v32s r1=G_shl_v32s(a,b), r2=L_shl_v32s(a,b); check("shl_v32s",&r1,&r2,sizeof r1); }
 { v32s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  for(int i=0;i<16;i++) b[i]=(short)(((unsigned)b[i])%16);
+  v32s r1=G_shr_v32s(a,b), r2=L_shr_v32s(a,b); check("shr_v32s",&r1,&r2,sizeof r1); }
+{ v32s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32s r1=G_neg_v32s(a,b), r2=L_neg_v32s(a,b); check("neg_v32s",&r1,&r2,sizeof r1); }
 { v32s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32s r1=G_not_v32s(a,b), r2=L_not_v32s(a,b); check("not_v32s",&r1,&r2,sizeof r1); }
@@ -722,6 +776,9 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks();
 { v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<4;i++) b[i]=(int)(((unsigned)b[i])%32);
   v16i r1=G_shl_v16i(a,b), r2=L_shl_v16i(a,b); check("shl_v16i",&r1,&r2,sizeof r1); }
+{ v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  for(int i=0;i<4;i++) b[i]=(int)(((unsigned)b[i])%32);
+  v16i r1=G_shr_v16i(a,b), r2=L_shr_v16i(a,b); check("shr_v16i",&r1,&r2,sizeof r1); }
 { v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16i r1=G_neg_v16i(a,b), r2=L_neg_v16i(a,b); check("neg_v16i",&r1,&r2,sizeof r1); }
 { v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
@@ -755,6 +812,9 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks();
   for(int i=0;i<8;i++) b[i]=(int)(((unsigned)b[i])%32);
   v32i r1=G_shl_v32i(a,b), r2=L_shl_v32i(a,b); check("shl_v32i",&r1,&r2,sizeof r1); }
 { v32i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  for(int i=0;i<8;i++) b[i]=(int)(((unsigned)b[i])%32);
+  v32i r1=G_shr_v32i(a,b), r2=L_shr_v32i(a,b); check("shr_v32i",&r1,&r2,sizeof r1); }
+{ v32i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32i r1=G_neg_v32i(a,b), r2=L_neg_v32i(a,b); check("neg_v32i",&r1,&r2,sizeof r1); }
 { v32i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32i r1=G_not_v32i(a,b), r2=L_not_v32i(a,b); check("not_v32i",&r1,&r2,sizeof r1); }
@@ -787,6 +847,9 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks();
   for(int i=0;i<2;i++) b[i]=(long)(((unsigned)b[i])%64);
   v16l r1=G_shl_v16l(a,b), r2=L_shl_v16l(a,b); check("shl_v16l",&r1,&r2,sizeof r1); }
 { v16l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  for(int i=0;i<2;i++) b[i]=(long)(((unsigned)b[i])%64);
+  v16l r1=G_shr_v16l(a,b), r2=L_shr_v16l(a,b); check("shr_v16l",&r1,&r2,sizeof r1); }
+{ v16l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16l r1=G_neg_v16l(a,b), r2=L_neg_v16l(a,b); check("neg_v16l",&r1,&r2,sizeof r1); }
 { v16l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16l r1=G_not_v16l(a,b), r2=L_not_v16l(a,b); check("not_v16l",&r1,&r2,sizeof r1); }
@@ -818,6 +881,9 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks();
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<4;i++) b[i]=(long)(((unsigned)b[i])%64);
   v32l r1=G_shl_v32l(a,b), r2=L_shl_v32l(a,b); check("shl_v32l",&r1,&r2,sizeof r1); }
+{ v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  for(int i=0;i<4;i++) b[i]=(long)(((unsigned)b[i])%64);
+  v32l r1=G_shr_v32l(a,b), r2=L_shr_v32l(a,b); check("shr_v32l",&r1,&r2,sizeof r1); }
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32l r1=G_neg_v32l(a,b), r2=L_neg_v32l(a,b); check("neg_v32l",&r1,&r2,sizeof r1); }
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);

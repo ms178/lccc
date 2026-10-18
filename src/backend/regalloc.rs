@@ -7453,6 +7453,9 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // home-aware immediate-shift emitter reads/writes the YMM
             // home directly).
             O::VecShlI32x8 | O::VecLShrI32x8 | O::VecAShrI32x8 => Some(5),
+            // Per-lane variable dword shifts: two I32x8 operands, I32x8
+            // result (`emit_avx_binary_256`, like the sub/bitwise ops).
+            O::VecShlvI32x8 | O::VecLShrvI32x8 | O::VecAShrvI32x8 => Some(5),
             // v12 Fix F: Max reduction producers. VecBroadcastI32x8 seeds the
             // max accumulator (init = arr[0] broadcast), VecMaxI32x8 produces
             // the new accumulator each iteration. Classifying them as class 5
@@ -7470,6 +7473,9 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             O::VecRotlI32x4 | O::VecShufdI32x4 | O::VecXorI32x4 => Some(6),
             // BB-SLP 128-bit dword shifts: class 6 (I32x4 family).
             O::VecShlI32x4 | O::VecLShrI32x4 | O::VecAShrI32x4 => Some(6),
+            // Per-lane variable dword shifts (VEX.128 three-operand form,
+            // `emit_vex_binary_128`): class 6 (I32x4 family).
+            O::VecShlvI32x4 | O::VecLShrvI32x4 | O::VecAShrvI32x4 => Some(6),
             O::VecZeroI64x2 | O::VecLoadI64x2 | O::VecAddI64x2 | O::VecMulI64x2 => Some(7),
             // v12 Fix C: the widening reductions PRODUCE an I64x2 dest (the
             // new accumulator). Classifying them as class 7 lets the Copy-web
@@ -7507,10 +7513,14 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecBroadcastI64x4 => Some(8),
             // BB-SLP 256-bit qword shifts: class 8 (I64x4 family).
             O::VecShlI64x4 | O::VecLShrI64x4 => Some(8),
+            // Per-lane variable qword shifts: class 8 (I64x4 family).
+            O::VecShlvI64x4 | O::VecLShrvI64x4 => Some(8),
             // BB-SLP I64x2 bitwise + gather.
             O::VecAndI64x2 | O::VecOrI64x2 | O::VecXorI64x2 | O::VecPackI64x2 => Some(7),
             // BB-SLP 128-bit qword shifts: class 7 (I64x2 family).
             O::VecShlI64x2 | O::VecLShrI64x2 => Some(7),
+            // Per-lane variable qword shifts: class 7 (I64x2 family).
+            O::VecShlvI64x2 | O::VecLShrvI64x2 => Some(7),
             // BB-SLP F64x2 gather.
             O::VecPackF64x2 => Some(4),
             // BB-SLP I32x4 gather.
@@ -7594,6 +7604,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecShlI32x8
                     | O::VecLShrI32x8
                     | O::VecAShrI32x8
+                    // Variable dword shifts: `emit_avx_binary_256` reads
+                    // both homed sources in place.
+                    | O::VecShlvI32x8
+                    | O::VecLShrvI32x8
+                    | O::VecAShrvI32x8
                     // BB-SLP 256-bit lane extract: reads the YMM home
                     // (half staging), scratch confined to xmm1.
                     | O::VecExtractLaneI32x8
@@ -7626,6 +7641,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecShlI32x4
                     | O::VecLShrI32x4
                     | O::VecAShrI32x4
+                    // Variable dword shifts: `emit_vex_binary_128` reads
+                    // both homed sources in place (`vex128_source`).
+                    | O::VecShlvI32x4
+                    | O::VecLShrvI32x4
+                    | O::VecAShrvI32x4
                     // The ARX pass's exit materialization consumes the
                     // loop-carried state through a 128-bit store; the
                     // register-home store path (vec_store_source_128)
@@ -7663,6 +7683,10 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // immediate-shift contract as the bitwise consumes.
                     | O::VecShlI64x2
                     | O::VecLShrI64x2
+                    // Variable qword shifts: same `emit_vex_binary_128`
+                    // home-reading contract.
+                    | O::VecShlvI64x2
+                    | O::VecLShrvI64x2
             ),
             // I64x4 counting family: the sad partials are consumed by the
             // accumulator add, and the accumulator itself by the horizontal
@@ -7693,6 +7717,10 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // immediate-shift contract as the sub/bitwise ops.
                     | O::VecShlI64x4
                     | O::VecLShrI64x4
+                    // Variable qword shifts: same `emit_avx_binary_256`
+                    // home-reading contract as the sub/bitwise ops.
+                    | O::VecShlvI64x4
+                    | O::VecLShrvI64x4
             ),
             // BB-SLP byte/halfword chains: store (vec_store_source_128
             // register-home path), add/sub/bitwise (emit_sse_binary_128
@@ -8106,6 +8134,9 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecOrI32x8
                     | O::VecXorI32x8
                     | O::VecSubI32x8
+                    | O::VecShlvI32x8
+                    | O::VecLShrvI32x8
+                    | O::VecAShrvI32x8
                     // Byte-lane maps share the 256-bit integer class:
                     // same YMM register file, same VecLoad/StoreI32x8
                     // endpoints, only the lane width of the ALU differs.
@@ -8185,6 +8216,11 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecOrI32x4
                     | O::VecXorI32x4
                     | O::VecSubI32x4
+                    | O::VecShlvI32x4
+                    | O::VecLShrvI32x4
+                    | O::VecAShrvI32x4
+                    | O::VecShlvI64x2
+                    | O::VecLShrvI64x2
                     | O::VecAddI8x16
                     | O::VecSubI8x16
                     | O::VecCmpI8x16
@@ -8218,6 +8254,8 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecAndI64x4
                     | O::VecOrI64x4
                     | O::VecXorI64x4
+                    | O::VecShlvI64x4
+                    | O::VecLShrvI64x4
             ),
             _ => false,
         }
@@ -8486,7 +8524,14 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecLShrI32x8
         | O::VecAShrI32x8
         | O::VecShlI64x4
-        | O::VecLShrI64x4 => Some(3),
+        | O::VecLShrI64x4
+        // Per-lane variable shifts: two-source `emit_avx_binary_256`
+        // forms, same 256-bit integer class.
+        | O::VecShlvI32x8
+        | O::VecLShrvI32x8
+        | O::VecAShrvI32x8
+        | O::VecShlvI64x4
+        | O::VecLShrvI64x4 => Some(3),
         // W5: the I64x4 family rides the SAME audited emitters as the
         // I32x8 twins above (emit_avx_binary_256 / vec_store_source_
         // 256). Without these producer entries a rotate diamond
@@ -8537,6 +8582,12 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecAShrI32x4
         | O::VecShlI64x2
         | O::VecLShrI64x2
+        // Per-lane variable shifts (VEX.128 three-operand form).
+        | O::VecShlvI32x4
+        | O::VecLShrvI32x4
+        | O::VecAShrvI32x4
+        | O::VecShlvI64x2
+        | O::VecLShrvI64x2
         // W5: I64x2 family (emit_sse_binary_128 / vec_store_source_
         // 128, the I32x4 twins) and the SSE4.1 signed dword min/max
         // (emit_sse_binary_128 via emit_sminmax_i32x4) — same rotate-
@@ -8714,6 +8765,11 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecAShrI32x8
                     | O::VecShlI64x4
                     | O::VecLShrI64x4
+                    | O::VecShlvI32x8
+                    | O::VecLShrvI32x8
+                    | O::VecAShrvI32x8
+                    | O::VecShlvI64x4
+                    | O::VecLShrvI64x4
                     // W5: the I64x4 binary family + store — the exact
                     // emitters of the I32x8 twins above.
                     | O::VecAddI64x4
@@ -8765,6 +8821,11 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecAShrI32x4
                     | O::VecShlI64x2
                     | O::VecLShrI64x2
+                    | O::VecShlvI32x4
+                    | O::VecLShrvI32x4
+                    | O::VecAShrvI32x4
+                    | O::VecShlvI64x2
+                    | O::VecLShrvI64x2
                     // W5: I64x2 binaries + store (emit_sse_binary_128 /
                     // vec_store_source_128 — the I32x4 twins) and the
                     // SSE4.1 signed dword min/max (emit_sse_binary_128).

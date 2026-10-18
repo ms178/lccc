@@ -6,6 +6,7 @@ v16c and_v16c(v16c a,v16c b){return a&b;}
 v16c or_v16c(v16c a,v16c b){return a|b;}
 v16c xor_v16c(v16c a,v16c b){return a^b;}
 v16c shl_v16c(v16c a,v16c b){return a<<b;}
+v16c shr_v16c(v16c a,v16c b){return a>>b;}
 v16c neg_v16c(v16c a,v16c b){return -a;}
 v16c not_v16c(v16c a,v16c b){return ~a;}
 v16c eq_v16c(v16c a,v16c b){return a==b;}
@@ -26,6 +27,7 @@ v32c and_v32c(v32c a,v32c b){return a&b;}
 v32c or_v32c(v32c a,v32c b){return a|b;}
 v32c xor_v32c(v32c a,v32c b){return a^b;}
 v32c shl_v32c(v32c a,v32c b){return a<<b;}
+v32c shr_v32c(v32c a,v32c b){return a>>b;}
 v32c neg_v32c(v32c a,v32c b){return -a;}
 v32c not_v32c(v32c a,v32c b){return ~a;}
 v32c eq_v32c(v32c a,v32c b){return a==b;}
@@ -46,6 +48,7 @@ v16s and_v16s(v16s a,v16s b){return a&b;}
 v16s or_v16s(v16s a,v16s b){return a|b;}
 v16s xor_v16s(v16s a,v16s b){return a^b;}
 v16s shl_v16s(v16s a,v16s b){return a<<b;}
+v16s shr_v16s(v16s a,v16s b){return a>>b;}
 v16s neg_v16s(v16s a,v16s b){return -a;}
 v16s not_v16s(v16s a,v16s b){return ~a;}
 v16s eq_v16s(v16s a,v16s b){return a==b;}
@@ -66,6 +69,7 @@ v32s and_v32s(v32s a,v32s b){return a&b;}
 v32s or_v32s(v32s a,v32s b){return a|b;}
 v32s xor_v32s(v32s a,v32s b){return a^b;}
 v32s shl_v32s(v32s a,v32s b){return a<<b;}
+v32s shr_v32s(v32s a,v32s b){return a>>b;}
 v32s neg_v32s(v32s a,v32s b){return -a;}
 v32s not_v32s(v32s a,v32s b){return ~a;}
 v32s eq_v32s(v32s a,v32s b){return a==b;}
@@ -86,6 +90,7 @@ v16i and_v16i(v16i a,v16i b){return a&b;}
 v16i or_v16i(v16i a,v16i b){return a|b;}
 v16i xor_v16i(v16i a,v16i b){return a^b;}
 v16i shl_v16i(v16i a,v16i b){return a<<b;}
+v16i shr_v16i(v16i a,v16i b){return a>>b;}
 v16i neg_v16i(v16i a,v16i b){return -a;}
 v16i not_v16i(v16i a,v16i b){return ~a;}
 v16i eq_v16i(v16i a,v16i b){return a==b;}
@@ -106,6 +111,7 @@ v32i and_v32i(v32i a,v32i b){return a&b;}
 v32i or_v32i(v32i a,v32i b){return a|b;}
 v32i xor_v32i(v32i a,v32i b){return a^b;}
 v32i shl_v32i(v32i a,v32i b){return a<<b;}
+v32i shr_v32i(v32i a,v32i b){return a>>b;}
 v32i neg_v32i(v32i a,v32i b){return -a;}
 v32i not_v32i(v32i a,v32i b){return ~a;}
 v32i eq_v32i(v32i a,v32i b){return a==b;}
@@ -126,6 +132,7 @@ v16l and_v16l(v16l a,v16l b){return a&b;}
 v16l or_v16l(v16l a,v16l b){return a|b;}
 v16l xor_v16l(v16l a,v16l b){return a^b;}
 v16l shl_v16l(v16l a,v16l b){return a<<b;}
+v16l shr_v16l(v16l a,v16l b){return a>>b;}
 v16l neg_v16l(v16l a,v16l b){return -a;}
 v16l not_v16l(v16l a,v16l b){return ~a;}
 v16l eq_v16l(v16l a,v16l b){return a==b;}
@@ -146,6 +153,7 @@ v32l and_v32l(v32l a,v32l b){return a&b;}
 v32l or_v32l(v32l a,v32l b){return a|b;}
 v32l xor_v32l(v32l a,v32l b){return a^b;}
 v32l shl_v32l(v32l a,v32l b){return a<<b;}
+v32l shr_v32l(v32l a,v32l b){return a>>b;}
 v32l neg_v32l(v32l a,v32l b){return -a;}
 v32l not_v32l(v32l a,v32l b){return ~a;}
 v32l eq_v32l(v32l a,v32l b){return a==b;}
@@ -340,4 +348,26 @@ v32f cf_self_assign(v32f a){ a=a; a=a*a; a=a; return a; }
 v32f cf_dead_store(v32f a, v32f b){ v32f t=a+b; t=a-b; t=t*b; return t; }
 v32f cf_all_lanes(v32f a){ v32f t=a*a; for(int i=0;i<8;i++) t[i]=t[i]+(float)i; return t; }
 v32f cf_uninit(v32f a){ v32f t={}; return t+a; }
+/* Per-lane variable shifts (`vpsllv*`/`vpsrlv*`/`vpsravd`): unsigned lanes
+   (logical right), non-constant scalar counts (splat), a count vector of
+   the other signedness, 64-bit lanes (no `vpsravq` below AVX-512VL: the
+   signed 64-bit right shift stays scalar), and 16-byte shapes. */
+typedef unsigned v32u __attribute__((vector_size(32)));
+typedef unsigned long v32ul __attribute__((vector_size(32)));
+typedef unsigned v16u __attribute__((vector_size(16)));
+v32u sh_vv_u(v32u a, v32u b){ return a >> b; }
+v32ul sh_vv_ul(v32ul a, v32ul b){ return a >> b; }
+v16u sh_vv_u4(v16u a, v16u b){ return a >> b; }
+v32i sh_vs_shl(v32i a, int n){ return a << n; }
+v32i sh_vs_sar(v32i a, int n){ return a >> n; }
+v32u sh_vs_shr(v32u a, unsigned n){ return a >> n; }
+v32l sh_vs_shl_l(v32l a, long n){ return a << n; }
+v32ul sh_vs_shr_ul(v32ul a, int n){ return a >> n; }
+v32i sh_mixsign(v32i a, v32u b){ return a << b; }
+v32u sh_mixsign2(v32u a, v32i b){ return a >> b; }
+v32i sh_chain(v32i a, v32i b, v32i c){ return (a << b) >> c; }
+v32i sh_then_add(v32i a, v32i b){ return (a << b) + a; }
+v16i sh4_vs_sar(v16i a, int n){ return a >> n; }
+v16l sh4_vv_shl_l(v16l a, v16l b){ return a << b; }
+v16i sh4_chain(v16i a, v16i b, v16i c){ return (a << b) + (a >> c); }
 

@@ -322,7 +322,16 @@ impl Lowerer {
             if !lhs_plan {
                 return None;
             }
-            let (packed, amount) = self.vec_shift_plan(op, rhs, &shape, is_unsigned)?;
+            let Some((packed, amount)) = self.vec_shift_plan(op, rhs, &shape, is_unsigned) else {
+                return self.try_lower_vector_variable_shift(
+                    op,
+                    lhs,
+                    rhs,
+                    &shape,
+                    vec_ct,
+                    is_unsigned,
+                );
+            };
             let a = self.vec_operand_value(lhs, true, &shape);
             let dest = self.fresh_value();
             self.emit(Instruction::Intrinsic {
@@ -344,6 +353,65 @@ impl Lowerer {
         let r = self.emit_vec_binary(packed, a, b);
         let result = self.vec_result_alloca(vec_ct);
         self.emit_vec_store(&shape, r, result);
+        Some(Operand::Value(result))
+    }
+
+    /// Per-lane variable shift (`lhs` a vector; `rhs` a vector of counts
+    /// or a non-constant scalar splat), AVX2 `vpsllv*`/`vpsrlv*`/`vpsravd`.
+    /// Lanes are 32-bit (any direction) or 64-bit (left/logical right:
+    /// there is no `vpsravq` below AVX-512VL). A count at or beyond the
+    /// lane width is undefined for GNU vector shifts (as for the scalar
+    /// lanes), so the ISA's "shift out to zero / sign fill" is admissible.
+    fn try_lower_vector_variable_shift(
+        &mut self,
+        op: &BinOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        shape: &SimdShape,
+        vec_ct: &CType,
+        is_unsigned: bool,
+    ) -> Option<Operand> {
+        // Every variable-shift encoding (256- and VEX.128) is AVX2: the
+        // 32-byte lowering ceiling is exactly the AVX2 code-generation
+        // level (`Driver::run`), so a 16-byte shape is packed only there.
+        if shape.elem_ir.is_float() || target_vector_lowering_bytes() != 32 {
+            return None;
+        }
+        let ir_op = Self::binop_to_ir(*op, is_unsigned);
+        let packed = match (shape.bytes, shape.elem_ir.size(), ir_op) {
+            (32, 4, IrBinOp::Shl) => IntrinsicOp::VecShlvI32x8,
+            (32, 4, IrBinOp::LShr) => IntrinsicOp::VecLShrvI32x8,
+            (32, 4, IrBinOp::AShr) => IntrinsicOp::VecAShrvI32x8,
+            (32, 8, IrBinOp::Shl) => IntrinsicOp::VecShlvI64x4,
+            (32, 8, IrBinOp::LShr) => IntrinsicOp::VecLShrvI64x4,
+            (16, 4, IrBinOp::Shl) => IntrinsicOp::VecShlvI32x4,
+            (16, 4, IrBinOp::LShr) => IntrinsicOp::VecLShrvI32x4,
+            (16, 4, IrBinOp::AShr) => IntrinsicOp::VecAShrvI32x4,
+            (16, 8, IrBinOp::Shl) => IntrinsicOp::VecShlvI64x2,
+            (16, 8, IrBinOp::LShr) => IntrinsicOp::VecLShrvI64x2,
+            _ => return None,
+        };
+        // The count operand: a vector of the same register image (any
+        // signedness — only the lane width matters) or a scalar splat.
+        let rhs_ct = self.expr_ctype(rhs);
+        let rhs_plan = if rhs_ct.is_vector() {
+            let (rhs_elem, rhs_lanes) = rhs_ct.vector_info()?;
+            if rhs_lanes != shape.lanes
+                || rhs_elem.size() != shape.elem_ir.size()
+                || !rhs_elem.is_integer()
+                || self.expr_access_is_volatile(rhs)
+            {
+                return None;
+            }
+            true
+        } else {
+            self.vec_operand_plan(rhs, shape, vec_ct)?
+        };
+        let a = self.vec_operand_value(lhs, true, shape);
+        let b = self.vec_operand_value(rhs, rhs_plan, shape);
+        let r = self.emit_vec_binary(packed, a, b);
+        let result = self.vec_result_alloca(vec_ct);
+        self.emit_vec_store(shape, r, result);
         Some(Operand::Value(result))
     }
 

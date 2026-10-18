@@ -2,8 +2,8 @@
 # GNU vector-extension (`vector_size`) whole-vector lowering: runtime
 # differential against GCC plus per-function code-quality ceilings.
 #
-# Part 1 -- runtime.  `vector_ext/matrix.c` (236 functions: every lane type
-# x {16, 32} bytes x {add sub mul div and or xor shl neg not == <}, loops,
+# Part 1 -- runtime.  `vector_ext/matrix.c` (every lane type x {16, 32}
+# bytes x {add sub mul div and or xor shl shr neg not == <}, loops,
 # splats, lane access, ternaries, assignments, nine-argument functions,
 # struct/union wrappers, sign-of-zero negation, call-through-GCC) is
 # compiled by lccc and by GCC at every ISA/opt level below; both objects
@@ -157,6 +157,20 @@ for fn in add_v32f sub_v32f mul_v32f div_v32f add_v32d mul_v32d add_v32i sub_v32
 done
 # Negate / not: constant load folded into the xor + ret (GCC: 2).
 for fn in neg_v32f neg_v32d neg_v16f negz negz2 not_v32i; do ceiling "$fn" 3; done
+# Per-lane variable shifts: one vpsllvd/vpsrlvd/vpsravd/vpsllvq/vpsrlvq
+# + ret (GCC: 2); scalar-count forms broadcast the count (GCC: 4, it
+# shifts by an xmm count without the broadcast).
+for fn in shl_v32i shr_v32i shl_v32l sh_vv_u sh_vv_ul sh_mixsign sh_mixsign2 \
+          shl_v16i shr_v16i shl_v16l sh_vv_u4 sh4_vv_shl_l; do ceiling "$fn" 2; done
+ceiling sh_chain 3
+ceiling sh_then_add 3
+ceiling sh4_chain 4
+ceiling sh4_vs_sar 6
+for fn in sh_vs_shl sh_vs_sar sh_vs_shr sh_vs_shl_l sh_vs_shr_ul; do ceiling "$fn" 6; done
+if ! awk '$0 == "shr_v32i:" {on=1; next} on && /\.cfi_endproc/ {exit} on' "$tmp/m.s" |
+    grep -q 'vpsravd'; then
+    fail "shr_v32i: expected a per-lane vpsravd at -O2 -mavx2"
+fi
 # Compare masks (GCC: 2).
 for fn in eq_v32i lt_v32i eq_v32f lt_v32f lt_v16f; do ceiling "$fn" 2; done
 # DEBT (VEX-128-INT-1): the 128-bit integer compare/arith emitters stage
@@ -188,7 +202,8 @@ ceiling sadd 18        # struct-wrapped compound assign: lane stores + memcpy
 ceiling s4i_add 26     # struct-wrapped 128-bit add
 ceiling tern_se 53     # ternary whose arms are calls (two sret temporaries)
 ceiling viacall 30     # by-value call into a GCC-built callee + return
-ceiling shl_v32i 41    # vector-by-vector shift (no vpsllvd lowering yet)
+ceiling shr_v32l 23    # signed 64-bit lanes: no vpsravq below AVX-512VL
+ceiling shr_v16l 15    # (GCC: 6 — it emulates with vpsrlvq + sign fixup)
 ceiling eq_v32l 41     # 64-bit lane compare (no vpcmpeqq/vpcmpgtq lowering yet)
 ceiling mul_v32c 136   # byte multiply (no pmullw/pack expansion yet)
 # FMA contraction (`vecfma`): `a*b + c` and its sign variants are one

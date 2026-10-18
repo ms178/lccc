@@ -4816,6 +4816,59 @@ impl X86Codegen {
                     self.emit_avx_binary_256(d, args, "vpxor", true);
                 }
             }
+            // Per-lane variable shifts (AVX2): `src1 op src2` lane-wise.
+            IntrinsicOp::VecShlvI32x8 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpsllvd", false);
+                }
+            }
+            IntrinsicOp::VecLShrvI32x8 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpsrlvd", false);
+                }
+            }
+            IntrinsicOp::VecAShrvI32x8 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpsravd", false);
+                }
+            }
+            IntrinsicOp::VecShlvI64x4 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpsllvq", false);
+                }
+            }
+            IntrinsicOp::VecLShrvI64x4 => {
+                if let Some(d) = dest {
+                    self.emit_avx_binary_256(d, args, "vpsrlvq", false);
+                }
+            }
+            // VEX.128 variable shifts: AVX2-only encodings (the lowering
+            // emits them only under the 32-byte ceiling, i.e. AVX2).
+            IntrinsicOp::VecShlvI32x4 => {
+                if let Some(d) = dest {
+                    self.emit_vex_binary_128(d, args, "vpsllvd");
+                }
+            }
+            IntrinsicOp::VecLShrvI32x4 => {
+                if let Some(d) = dest {
+                    self.emit_vex_binary_128(d, args, "vpsrlvd");
+                }
+            }
+            IntrinsicOp::VecAShrvI32x4 => {
+                if let Some(d) = dest {
+                    self.emit_vex_binary_128(d, args, "vpsravd");
+                }
+            }
+            IntrinsicOp::VecShlvI64x2 => {
+                if let Some(d) = dest {
+                    self.emit_vex_binary_128(d, args, "vpsllvq");
+                }
+            }
+            IntrinsicOp::VecLShrvI64x2 => {
+                if let Some(d) = dest {
+                    self.emit_vex_binary_128(d, args, "vpsrlvq");
+                }
+            }
             IntrinsicOp::VecBroadcastI64x4 => {
                 // All-ones splat: one vpcmpeqd instead of the staged chain.
                 if !self.try_all_ones_splat(args, dest, true) {
@@ -8598,7 +8651,6 @@ impl X86Codegen {
     /// deferred-store chain when it has none. Replaces the legacy
     /// two-operand staging (movdqa+movdqa+op+movdqa) with ONE instruction
     /// for every homed shape.
-    #[expect(dead_code)] // wired by the ARX emitters below when targeted
     pub(super) fn emit_vex_binary_128(&mut self, dest_ptr: &Value, args: &[Operand], inst: &str) {
         assert!(
             args.len() >= 2,

@@ -4,14 +4,14 @@
 Run from this directory; both outputs are checked in."""
 import itertools
 elems={'c':'char','s':'short','i':'int','l':'long','f':'float','d':'double'}
-ops={'add':'a+b','sub':'a-b','mul':'a*b','and':'a&b','or':'a|b','xor':'a^b','shl':'a<<b','neg':'-a','not':'~a','eq':'a==b','lt':'a<b','div':'a/b'}
+ops={'add':'a+b','sub':'a-b','mul':'a*b','and':'a&b','or':'a|b','xor':'a^b','shl':'a<<b','shr':'a>>b','neg':'-a','not':'~a','eq':'a==b','lt':'a<b','div':'a/b'}
 out=[]
 for e,ct in elems.items():
     for w in (16,32):
         t=f"v{w}{e}"
         out.append(f"typedef {ct} {t} __attribute__((vector_size({w})));")
         for o,ex in ops.items():
-            if e in 'fd' and o in ('and','or','xor','shl','not'): continue
+            if e in 'fd' and o in ('and','or','xor','shl','shr','not'): continue
             if e not in 'fd' and o=='div': continue
             if o in ('eq','lt'):
                 rt = t if e not in 'fd' else (f"v{w}i" if e=='f' else f"v{w}l")
@@ -152,13 +152,35 @@ v32f cf_self_assign(v32f a){ a=a; a=a*a; a=a; return a; }
 v32f cf_dead_store(v32f a, v32f b){ v32f t=a+b; t=a-b; t=t*b; return t; }
 v32f cf_all_lanes(v32f a){ v32f t=a*a; for(int i=0;i<8;i++) t[i]=t[i]+(float)i; return t; }
 v32f cf_uninit(v32f a){ v32f t={}; return t+a; }
+/* Per-lane variable shifts (`vpsllv*`/`vpsrlv*`/`vpsravd`): unsigned lanes
+   (logical right), non-constant scalar counts (splat), a count vector of
+   the other signedness, 64-bit lanes (no `vpsravq` below AVX-512VL: the
+   signed 64-bit right shift stays scalar), and 16-byte shapes. */
+typedef unsigned v32u __attribute__((vector_size(32)));
+typedef unsigned long v32ul __attribute__((vector_size(32)));
+typedef unsigned v16u __attribute__((vector_size(16)));
+v32u sh_vv_u(v32u a, v32u b){ return a >> b; }
+v32ul sh_vv_ul(v32ul a, v32ul b){ return a >> b; }
+v16u sh_vv_u4(v16u a, v16u b){ return a >> b; }
+v32i sh_vs_shl(v32i a, int n){ return a << n; }
+v32i sh_vs_sar(v32i a, int n){ return a >> n; }
+v32u sh_vs_shr(v32u a, unsigned n){ return a >> n; }
+v32l sh_vs_shl_l(v32l a, long n){ return a << n; }
+v32ul sh_vs_shr_ul(v32ul a, int n){ return a >> n; }
+v32i sh_mixsign(v32i a, v32u b){ return a << b; }
+v32u sh_mixsign2(v32u a, v32i b){ return a >> b; }
+v32i sh_chain(v32i a, v32i b, v32i c){ return (a << b) >> c; }
+v32i sh_then_add(v32i a, v32i b){ return (a << b) + a; }
+v16i sh4_vs_sar(v16i a, int n){ return a >> n; }
+v16l sh4_vv_shl_l(v16l a, v16l b){ return a << b; }
+v16i sh4_chain(v16i a, v16i b, v16i c){ return (a << b) + (a >> c); }
 """
 out.append(EXTRA)
 open('matrix.c','w').write("\n".join(out)+"\n")
 
 import re, sys
 elems={'c':'char','s':'short','i':'int','l':'long','f':'float','d':'double'}
-ops={'add':2,'sub':2,'mul':2,'and':2,'or':2,'xor':2,'shl':2,'neg':1,'not':1,'eq':2,'lt':2,'div':2}
+ops={'add':2,'sub':2,'mul':2,'and':2,'or':2,'xor':2,'shl':2,'shr':2,'neg':1,'not':1,'eq':2,'lt':2,'div':2}
 src=open('matrix.c').read().split('/* scalar + vector register interleave')[0]
 fns=[]
 for line in src.splitlines():
@@ -192,7 +214,7 @@ for rt,name,args in fns:
         w=int(t[1:-1]); e=t[-1]; elem=elems[e]; lanes=w//{'c':1,'s':2,'i':4,'l':8,'f':4,'d':8}[e]
     if kind in ops and ops[kind]==2:
         body.append(f'{{ {t} a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);')
-        if kind=='shl':
+        if kind in ('shl','shr'):
             body.append(f'  for(int i=0;i<{lanes};i++) b[i]=({elem})(((unsigned)b[i])%{8*w//lanes});')
         if kind=='div':
             body.append(f'  for(int i=0;i<{lanes};i++) {{ if(b[i]==0) b[i]=3; if(a[i]==({elem})(1ull<<{8*w//lanes-1}) && b[i]==({elem})-1) b[i]=2; }}')
@@ -267,6 +289,15 @@ v32f G_fma_two(v32f,v32f,v32f,v32f); v32f L_fma_two(v32f,v32f,v32f,v32f);
 void G_fma_loop(v32f*,const v32f*,const v32f*,const v32f*,int); void L_fma_loop(v32f*,const v32f*,const v32f*,const v32f*,int);
 void G_fma_acc(v32d*,const v32d*,const v32d*,int); void L_fma_acc(v32d*,const v32d*,const v32d*,int);
 struct W8 { v32f v; int tag; };
+typedef unsigned v32u __attribute__((vector_size(32)));
+typedef unsigned long v32ul __attribute__((vector_size(32)));
+typedef unsigned v16u __attribute__((vector_size(16)));
+#define SH(pfx) v32u pfx##sh_vv_u(v32u,v32u); v32ul pfx##sh_vv_ul(v32ul,v32ul); v16u pfx##sh_vv_u4(v16u,v16u); \
+  v32i pfx##sh_vs_shl(v32i,int); v32i pfx##sh_vs_sar(v32i,int); v32u pfx##sh_vs_shr(v32u,unsigned); \
+  v32l pfx##sh_vs_shl_l(v32l,long); v32ul pfx##sh_vs_shr_ul(v32ul,int); v32i pfx##sh_mixsign(v32i,v32u); \
+  v32u pfx##sh_mixsign2(v32u,v32i); v32i pfx##sh_chain(v32i,v32i,v32i); v32i pfx##sh_then_add(v32i,v32i); \
+  v16i pfx##sh4_vs_sar(v16i,int); v16l pfx##sh4_vv_shl_l(v16l,v16l); v16i pfx##sh4_chain(v16i,v16i,v16i);
+SH(G_) SH(L_)
 #define CF(pfx) v32f pfx##cf_phi_call(v32f,v32f,int); v32f pfx##cf_loop_acc(const v32f*,int); v32f pfx##cf_loop_acc_call(const v32f*,int); \
   v32f pfx##cf_nested_tern(v32f,v32f,int); v32f pfx##cf_sw(v32f,v32f,int); v32f pfx##cf_goto_loop(const v32f*,int); v32f pfx##cf_two_lives(v32f,v32f); \
   v32l pfx##cf_l_phi(v32l,v32l,int); v32d pfx##cf_d_mix(v32d,v32d,double); float pfx##cf_lane_after(v32f,v32f); v32f pfx##cf_cond_assign(v32f,v32f,int); \
@@ -321,6 +352,23 @@ static void cf_checks(void){
   { v32i r1=G_cf_cmp_chain(a,b,c), r2=L_cf_cmp_chain(a,b,c); check("cf_cmp_chain",&r1,&r2,sizeof r1); }
   check("cf_sink_count",&G_sink_count,&L_sink_count,sizeof(int));
 }
+/* counts reduced modulo the lane width: wider counts are undefined for
+   GNU vector shifts exactly as for the scalar lanes */
+#define SHVV(T,N,W) { T a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(unsigned i=0;i<sizeof a/sizeof a[0];i++) b[i]=(b[i]&(W-1)); \
+  T r1=G_##N(a,b), r2=L_##N(a,b); check(#N,&r1,&r2,sizeof r1); }
+#define SHVS(T,N,CT,W) { T a; fill(&a,sizeof a,0); CT n=(CT)(rnd()%W); T r1=G_##N(a,n), r2=L_##N(a,n); check(#N,&r1,&r2,sizeof r1); }
+static void shift_checks(void){
+  for(int rep=0;rep<4;rep++){
+    SHVV(v32u,sh_vv_u,32) SHVV(v32ul,sh_vv_ul,64) SHVV(v16u,sh_vv_u4,32) SHVV(v32i,sh_then_add,32)
+    SHVS(v32i,sh_vs_shl,int,32) SHVS(v32i,sh_vs_sar,int,32) SHVS(v32u,sh_vs_shr,unsigned,32)
+    SHVS(v32l,sh_vs_shl_l,long,64) SHVS(v32ul,sh_vs_shr_ul,int,64)
+    SHVS(v16i,sh4_vs_sar,int,32) SHVV(v16l,sh4_vv_shl_l,64)
+    { v16i a,b,c; fill(&a,sizeof a,0); fill(&b,sizeof b,0); fill(&c,sizeof c,0); for(int i=0;i<4;i++){ b[i]&=31; c[i]&=31; } v16i r1=G_sh4_chain(a,b,c), r2=L_sh4_chain(a,b,c); check("sh4_chain",&r1,&r2,sizeof r1); }
+    { v32i a; v32u b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<8;i++) b[i]&=31; v32i r1=G_sh_mixsign(a,b), r2=L_sh_mixsign(a,b); check("sh_mixsign",&r1,&r2,sizeof r1); }
+    { v32u a; v32i b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<8;i++) b[i]&=31; v32u r1=G_sh_mixsign2(a,b), r2=L_sh_mixsign2(a,b); check("sh_mixsign2",&r1,&r2,sizeof r1); }
+    { v32i a,b,c; fill(&a,sizeof a,0); fill(&b,sizeof b,0); fill(&c,sizeof c,0); for(int i=0;i<8;i++){ b[i]&=31; c[i]&=31; } v32i r1=G_sh_chain(a,b,c), r2=L_sh_chain(a,b,c); check("sh_chain",&r1,&r2,sizeof r1); }
+  }
+}
 static void handoff_checks(void){
   for(int rep=0;rep<3;rep++){
     HOFFC(v16f,ho_f4,fillx4) HOFFC(v16d,ho_d2,fillxd2) HOFFC(v32f,ho_f8,fillx8) HOFFC(v32d,ho_d4,fillxd4)
@@ -353,7 +401,7 @@ static void extra_checks(void){
   { v32f a,b; v32i x,y; fillf8(&a); fillf8(&b); fill(&x,sizeof x,0); fill(&y,sizeof y,0); v32i r1=G_sel_mask(a,b,x,y), r2=L_sel_mask(a,b,x,y); check("sel_mask",&r1,&r2,sizeof r1); }
 }
 """)
-out.append('int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks();')
+out.append('int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shift_checks();')
 out.extend(body)
 out.append('printf("%d/%d checks passed\\n", total-fails, total); return fails!=0; }')
 open('driver.c','w').write('\n'.join(out)+'\n')
