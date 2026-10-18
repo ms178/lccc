@@ -351,7 +351,7 @@ mod tests {
             )],
             902,
         );
-        assert_eq!(run(&mut f, 64, 2), 0);
+        assert_eq!(run(&mut f, 64, 2, &FxHashSet::default()), 0);
     }
 
     #[test]
@@ -370,7 +370,7 @@ mod tests {
             )],
             11,
         );
-        assert_eq!(run(&mut f, 64, 2), 0);
+        assert_eq!(run(&mut f, 64, 2, &FxHashSet::default()), 0);
     }
 
     #[test]
@@ -454,7 +454,7 @@ mod tests {
             )],
             900,
         );
-        let n = run(&mut f, 64, 2);
+        let n = run(&mut f, 64, 2, &FxHashSet::default());
         assert!(n >= 1, "remat must fire under pressure");
         assert!(
             count(&f, |i| matches!(i, Instruction::GlobalAddr { .. })) >= 2,
@@ -463,6 +463,74 @@ mod tests {
         // Remat never builds a stack slot.
         assert_eq!(count(&f, |i| matches!(i, Instruction::Alloca { .. })), 0);
         verify_rewrite(&f, &FxHashSet::default()).expect("rewrite verifies");
+    }
+
+    /// -O0 (Debug tier): every value is stack-homed, so a remat clone
+    /// removes a slot reload whatever the register pressure -- the tier
+    /// budget is 0 and a GlobalAddr live across just three values is
+    /// rematerialized. A thread-local address costs more than the reload it
+    /// would replace and is never cloned at -O0; the register tier keeps it
+    /// as a candidate (relief there is a register over the whole range).
+    #[test]
+    fn debug_tier_remats_regardless_of_pressure_but_never_tls() {
+        assert_eq!(tier_budget(Tier::Debug), 0);
+        assert_eq!(tier_budget(Tier::Speed), pressure_budget());
+        let low = || {
+            let mut v = vec![global(1, "G")];
+            for k in 0..3u32 {
+                v.push(add(100 + k, 800 + k, 820 + k));
+            }
+            v.push(add(200, 1, 100));
+            v.push(add(201, 200, 101));
+            v.push(add(202, 201, 102));
+            func_with(
+                vec![blk(
+                    0,
+                    v,
+                    Terminator::Return(Some(Operand::Value(Value(202)))),
+                )],
+                900,
+            )
+        };
+        let globals = |f: &IrFunction| count(f, |i| matches!(i, Instruction::GlobalAddr { .. }));
+        let tls: FxHashSet<String> = std::iter::once("G".to_string()).collect();
+
+        let mut f = low();
+        assert!(
+            run(&mut f, 64, 0, &FxHashSet::default()) >= 1,
+            "-O0 remat must fire at low pressure"
+        );
+        assert!(globals(&f) >= 2, "expected a rematerialized GlobalAddr");
+        verify_rewrite(&f, &FxHashSet::default()).expect("rewrite verifies");
+
+        let mut f = low();
+        assert_eq!(
+            run(&mut f, 64, 0, &tls),
+            0,
+            "-O0 must not clone a TLS address"
+        );
+        assert_eq!(globals(&f), 1);
+
+        let mut f = low();
+        assert_eq!(
+            run(&mut f, 64, 2, &FxHashSet::default()),
+            0,
+            "-O2 budget not exceeded"
+        );
+
+        let mut f = func_with(
+            vec![blk(
+                0,
+                remat_ladder(),
+                Terminator::Return(Some(Operand::Value(Value(211)))),
+            )],
+            900,
+        );
+        assert!(
+            run(&mut f, 64, 2, &tls) >= 1,
+            "-O2 keeps TLS remat under pressure"
+        );
+        assert!(globals(&f) >= 2);
     }
 
     #[test]
@@ -685,9 +753,10 @@ mod tests {
             ),
         ];
         // Direct closure invariant: v3 is DEFINED in block 3 and feeds the
-        // header φ from block 3's end, so liveness conservatively reports it
-        // live-in to its own def block. The closure seeded in its
-        // predecessor block 2 must still not enter block 3.
+        // header φ from block 3's end. Exact liveness keeps it out of its
+        // own def block's live-in (the φ reads it on the 3 -> 1 edge); the
+        // closure seeded in its predecessor block 2 must not enter block 3
+        // either way (the def-block stop test is defence in depth).
         let mut f = func_with(blocks, 900);
         assert_use_index_matches_scans(&f);
         // Explicit direct probe before the rewrite.
@@ -695,11 +764,9 @@ mod tests {
             let live = crate::backend::liveness::compute_live_intervals(&f);
             let lm = analysis::build_label_map(&f);
             let (_preds, succs) = analysis::build_cfg(&f, &lm);
-            // Document the conservative precondition: without the def-block
-            // stop test the closure would have somewhere to run.
             assert!(
-                live.is_live_in(3, 3),
-                "test shape requires the φ edge-copy live-in over-approximation"
+                !live.is_live_in(3, 3),
+                "a latch-defined φ incoming is not live-in to its def block"
             );
             let ix = UseIndex::build(&live, &f);
             let reached = memory_closure(&live, &f, &ix, &succs, 3, 2);
@@ -1092,8 +1159,8 @@ mod tests {
         };
         let mut a = make();
         let mut b = make();
-        run(&mut a, 64, 2);
-        run(&mut b, 64, 2);
+        run(&mut a, 64, 2, &FxHashSet::default());
+        run(&mut b, 64, 2, &FxHashSet::default());
         let ca: Vec<usize> = a.blocks.iter().map(|x| x.instructions.len()).collect();
         let cb: Vec<usize> = b.blocks.iter().map(|x| x.instructions.len()).collect();
         assert_eq!(ca, cb);
@@ -1340,7 +1407,7 @@ mod tests {
         // The same shape fires remat with a normal id space
         // (`global_addr_rematerializes_under_pressure`); with no id left
         // the plan must be applied zero times.
-        let n = run(&mut f, 64, 2);
+        let n = run(&mut f, 64, 2, &FxHashSet::default());
         assert_eq!(n, 0, "exhausted id space must not apply any split");
         assert_eq!(
             count(&f, |i| matches!(i, Instruction::GlobalAddr { .. })),

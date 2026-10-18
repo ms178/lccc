@@ -3285,19 +3285,9 @@ pub(crate) fn run_passes(
     //   exactly the way AArch64 did before fix B, because this gate (not
     //   the in-pass model) was what silenced the pass there.
     // * i686: no-op (nothing this pass sees pays a 64-bit materialization).
-    if !pass_disabled(&disabled, "intconst")
-        && matches!(
-            target,
-            crate::backend::Target::Aarch64
-                | crate::backend::Target::X86_64
-                | crate::backend::Target::Riscv64
-        )
+    if let Some(model) =
+        int_const_hoist::model_for(target).filter(|_| !pass_disabled(&disabled, "intconst"))
     {
-        let model = match target {
-            crate::backend::Target::Aarch64 => int_const_hoist::ImmModel::Aarch64,
-            crate::backend::Target::Riscv64 => int_const_hoist::ImmModel::Riscv,
-            _ => int_const_hoist::ImmModel::X86_64,
-        };
         int_const_hoist::set_target_model(model);
         module.for_each_function(int_const_hoist::run);
     }

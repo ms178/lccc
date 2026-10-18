@@ -375,6 +375,28 @@ fn collect_derived_pointers(func: &IrFunction, root: Value) -> FxHashSet<u32> {
 
 /// Propagate copies within a single function.
 pub(crate) fn propagate_copies(func: &mut IrFunction) -> usize {
+    propagate_copies_impl(func, None)
+}
+
+/// The backend's final cleanup (after the live-range splitters): forward
+/// every value-sourced copy and every constant copy except a deliberate
+/// constant home -- a `Copy dest = Const` that predates the splitters
+/// (`dest < fresh_floor`, the function's id bound before they ran) and
+/// whose constant `spare` accepts (the hoisting passes' own predicates).
+/// Such a copy survived every earlier copy propagation on purpose; the
+/// splitters' fresh copies (remat clones) are always forwarded.
+pub(crate) fn propagate_copies_sparing(
+    func: &mut IrFunction,
+    fresh_floor: u32,
+    spare: &dyn Fn(&IrConst) -> bool,
+) -> usize {
+    propagate_copies_impl(func, Some((fresh_floor, spare)))
+}
+
+fn propagate_copies_impl(
+    func: &mut IrFunction,
+    spare: Option<(u32, &dyn Fn(&IrConst) -> bool)>,
+) -> usize {
     let max_id = func.max_value_id() as usize;
 
     // Multi-def guard (SOUNDNESS): forwarding `use(x)` to `use(src)` is valid
@@ -400,7 +422,7 @@ pub(crate) fn propagate_copies(func: &mut IrFunction) -> usize {
         .collect();
 
     // Phase 1: Build the copy map as a flat lookup table (dest -> resolved source)
-    let (mut copy_map, has_copies) = build_copy_map(func, max_id);
+    let (mut copy_map, has_copies) = build_copy_map(func, max_id, spare);
     if has_copies {
         for i in 0..copy_map.len() {
             if let Some(Operand::Value(src)) = copy_map[i] {
@@ -437,7 +459,15 @@ pub(crate) fn propagate_copies(func: &mut IrFunction) -> usize {
 /// updated to point directly to the final resolved value. This makes
 /// resolution amortized O(1) per entry instead of O(chain_length).
 /// Also avoids allocating a separate `resolved` vector by resolving in-place.
-fn build_copy_map(func: &IrFunction, max_id: usize) -> (Vec<Option<Operand>>, bool) {
+///
+/// `spare = (fresh_floor, pred)`: a single-def `Copy dest = Const(c)` with
+/// `dest < fresh_floor` and `pred(c)` is left out of the table (see
+/// [`propagate_copies_sparing`]); chains through it stop at `dest`.
+fn build_copy_map(
+    func: &IrFunction,
+    max_id: usize,
+    spare: Option<(u32, &dyn Fn(&IrConst) -> bool)>,
+) -> (Vec<Option<Operand>>, bool) {
     // First pass: collect direct copy relationships into flat table.
     // If a Value has multiple Copy definitions (e.g. from single-phi elimination),
     // we mark it as multi-def using a sentinel (self-referencing copy) and skip it.
@@ -463,6 +493,18 @@ fn build_copy_map(func: &IrFunction, max_id: usize) -> (Vec<Option<Operand>>, bo
 
     if !has_copies {
         return (direct, false);
+    }
+
+    // Protected constants are dropped only after the multi-def scan above:
+    // a value with two Copy definitions holds the self-referencing
+    // `Value` sentinel, never a `Const`, so it stays poisoned. (Shape test,
+    // not equality: a NaN constant never compares equal to itself.)
+    if let Some((floor, pred)) = spare {
+        for entry in direct.iter_mut().take(floor as usize) {
+            if matches!(entry, Some(Operand::Const(c)) if pred(c)) {
+                *entry = None;
+            }
+        }
     }
 
     // Second pass: resolve chains in-place with path compression.

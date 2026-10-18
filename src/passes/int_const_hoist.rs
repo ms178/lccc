@@ -47,6 +47,28 @@ thread_local! {
 pub(crate) fn set_target_model(model: ImmModel) {
     MODEL.with(|c| c.set(model));
 }
+
+/// The immediate model of the targets this pass runs on (`None`: i686,
+/// where nothing it sees pays a 64-bit materialization).
+pub(crate) fn model_for(target: crate::backend::Target) -> Option<ImmModel> {
+    match target {
+        crate::backend::Target::Aarch64 => Some(ImmModel::Aarch64),
+        crate::backend::Target::Riscv64 => Some(ImmModel::Riscv),
+        crate::backend::Target::X86_64 => Some(ImmModel::X86_64),
+        _ => None,
+    }
+}
+
+/// Whether this pass can materialize `c` in a loop preheader under
+/// `model`: the constant is unencodable even in a plain immediate position
+/// of its own width (32-bit forms take the imm32 pattern verbatim). Late
+/// passes that forward constant copies must spare such copies -- forwarding
+/// one re-sinks the `movabsq`/`movz`+`movk`/`lui`+`addi` into every
+/// iteration (sum_div7's magic multiplier).
+pub(crate) fn is_hoisted_int_const(model: ImmModel, c: &IrConst) -> bool {
+    let imm32_exact = matches!(c, IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_));
+    large_int_const_in(model, &Operand::Const(*c), false, imm32_exact).is_some()
+}
 use crate::common::types::IrType;
 use crate::ir::analysis;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
@@ -149,6 +171,16 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 ///
 /// Returns the value as u64 bits.
 fn large_int_const(op: &Operand, needs_reg: bool, imm32_exact: bool) -> Option<u64> {
+    large_int_const_in(MODEL.with(|c| c.get()), op, needs_reg, imm32_exact)
+}
+
+/// [`large_int_const`] under an explicit model.
+fn large_int_const_in(
+    model: ImmModel,
+    op: &Operand,
+    needs_reg: bool,
+    imm32_exact: bool,
+) -> Option<u64> {
     let v: i64 = match op {
         Operand::Const(IrConst::I8(v)) => *v as i64,
         Operand::Const(IrConst::I16(v)) => *v as i64,
@@ -156,7 +188,6 @@ fn large_int_const(op: &Operand, needs_reg: bool, imm32_exact: bool) -> Option<u
         Operand::Const(IrConst::I64(v)) => *v,
         _ => return None,
     };
-    let model = MODEL.with(|c| c.get());
     if model == ImmModel::Riscv {
         // RISC-V: the backend stages EVERY integer constant through `li`
         // (the ALU emitters are register-form only — there is no imm32

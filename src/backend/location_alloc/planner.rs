@@ -127,6 +127,47 @@ pub(super) fn rematerializable_template(inst: &Instruction) -> Option<Instructio
     }
 }
 
+/// Live regions of `vid` that the remat segment cap counts: its
+/// hole-aware segments, except a segment lying wholly inside a block's
+/// leading φ group and ending AT a φ that `vid` feeds. That piece is the
+/// φ's own edge read (all φs of a block read their incomings in parallel
+/// at its head), kept in the liveness so a copy phi elimination places at
+/// the φ (`target_copies`) stays covered; it is not a separate region the
+/// value is resident across. Counting it made every φ-incoming remat look
+/// two-segment and fall to the cap once φ incomings stopped being
+/// (over-approximately) live into the φ block.
+pub(super) fn live_region_count(
+    live: &LivenessResult,
+    func: &IrFunction,
+    ix: &UseIndex,
+    vid: u32,
+) -> usize {
+    let nblocks = func.blocks.len();
+    let feeds = |inst: Option<&Instruction>| {
+        matches!(
+            inst,
+            Some(Instruction::Phi { incoming, .. })
+                if incoming.iter().any(|(op, _)| matches!(op, Operand::Value(v) if v.0 == vid))
+        )
+    };
+    ix.segments(live, vid)
+        .filter(|iv| {
+            let bi = live.block_ends[..nblocks].partition_point(|&ge| ge < iv.start);
+            let Some(b) = func.blocks.get(bi) else {
+                return true;
+            };
+            if iv.end > live.block_ends[bi] {
+                return true;
+            }
+            let lo = (iv.start - live.block_starts[bi]) as usize;
+            let hi = (iv.end - live.block_starts[bi]) as usize;
+            let in_phi_group =
+                (lo..=hi).all(|i| matches!(b.instructions.get(i), Some(Instruction::Phi { .. })));
+            !(in_phi_group && feeds(b.instructions.get(hi)))
+        })
+        .count()
+}
+
 /// Locate a value's unique static definition: (block, instruction index,
 /// true when the def is a φ at that block's head).
 pub(super) fn find_def(func: &IrFunction, vid: u32) -> Option<(usize, usize, bool)> {
@@ -141,10 +182,12 @@ pub(super) fn find_def(func: &IrFunction, vid: u32) -> Option<(usize, usize, boo
 }
 
 /// Whether `vid` is (re-)defined inside block `bi`. The memory-region
-/// closure must never propagate INTO such a block: liveness's φ-incoming
-/// edge copies conservatively mark even an in-block-defined value live-in
-/// (safe for spilling, not for memory-state propagation), and a reload
-/// before a definition's capture anchor would read a stale slot.
+/// closure must never propagate INTO such a block: a reload before a
+/// definition's capture anchor would read a stale slot. Exact SSA liveness
+/// never reports a value live-in to its own def block (φ incomings are
+/// live only on their edges), so this is defence in depth against any
+/// conservative live-in -- a liveness over-approximation is safe for
+/// spilling but not for memory-state propagation.
 ///
 /// Reference scan behind [`UseIndex::defines`] (pinned by
 /// `use_index_matches_the_scans`).
@@ -463,6 +506,14 @@ pub(super) fn plan_function(
     let mut pressure = Pressure::build(live, func, eligible, &classes);
     let ix = UseIndex::build(live, func);
     if split_debug_enabled() && std::env::var("CCC_GLA_TRACE").is_ok() {
+        // The derived policy, printed whether or not any block exceeds the
+        // budget: the per-target reach band is a planning input, and its
+        // gates must observe it even when exact liveness leaves a function
+        // under budget everywhere.
+        eprintln!(
+            "[GLA] {}: policy budget={} reach={} max_splits={}",
+            func.name, budget, policy.reach_band, max_splits
+        );
         for (bi, b) in func.blocks.iter().enumerate() {
             let (pt, pk) = pressure.peak(bi);
             if pk as usize > budget {
@@ -494,7 +545,7 @@ pub(super) fn plan_function(
             break;
         }
         let wuses = weighted_use_count(&ix, vid, depths);
-        let nseg = ix.segments(live, vid).count();
+        let nseg = live_region_count(live, func, &ix, vid);
         let covers = covers_over_budget_point(live, &ix, func, &pressure, vid, policy);
         if split_debug_enabled() && std::env::var("CCC_GLA_TRACE").is_ok() {
             let ranges: Vec<String> = live
@@ -836,16 +887,33 @@ pub(super) fn plan_function(
 /// Public entry point. Policy comes from the A/B environment and the
 /// compilation's target/optimization tier. Returns the count of logical
 /// values rewritten (spilled or rematerialized), 0 when nothing applied.
-pub(crate) fn run(func: &mut IrFunction, max_splits: usize, opt_level: u32) -> usize {
+/// `tls_symbols`: the module's thread-local symbols (their `GlobalAddr`
+/// is a multi-instruction thread-pointer computation, see
+/// [`GlaPolicy::remat_affordable`]).
+pub(crate) fn run(
+    func: &mut IrFunction,
+    max_splits: usize,
+    opt_level: u32,
+    tls_symbols: &FxHashSet<String>,
+) -> usize {
     if func.blocks.is_empty() || max_splits == 0 {
         return 0;
     }
-    run_with_policy(func, GlaPolicy::from_env(max_splits, opt_level))
+    run_planned(
+        func,
+        GlaPolicy::from_env(max_splits, opt_level),
+        tls_symbols,
+    )
 }
 
 /// Entry point with an explicit policy (unit tests use this so their
 /// expectations never depend on process-wide environment knobs).
+#[cfg(test)]
 pub(super) fn run_with_policy(func: &mut IrFunction, policy: GlaPolicy) -> usize {
+    run_planned(func, policy, &FxHashSet::default())
+}
+
+fn run_planned(func: &mut IrFunction, policy: GlaPolicy, tls_symbols: &FxHashSet<String>) -> usize {
     let max_splits = policy.max_splits;
     if func.blocks.is_empty() || max_splits == 0 || !policy.enabled() {
         return 0;
@@ -873,7 +941,9 @@ pub(super) fn run_with_policy(func: &mut IrFunction, policy: GlaPolicy) -> usize
         for inst in &b.instructions {
             if let Some(d) = inst.dest() {
                 if eligible.contains(&d.0) {
-                    if let Some(t) = rematerializable_template(inst) {
+                    if let Some(t) = rematerializable_template(inst)
+                        .filter(|t| policy.remat_affordable(t, tls_symbols))
+                    {
                         remattable.insert(d.0);
                         templates.insert(d.0, t);
                     }

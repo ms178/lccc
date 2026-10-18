@@ -2298,14 +2298,21 @@ impl Driver {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30);
-            let mut did_split = false;
+            // Which functions the global location allocator split: RA-06 is
+            // skipped for exactly those (it subsumes the intra-block pass for
+            // the same function; a module-wide flag skipped it everywhere).
+            let nfuncs = module.functions.len();
+            // Each function's value-id bound before any splitter ran: ids at
+            // or above it are the splitters' own (see
+            // `propagate_copies_sparing`).
+            let fresh_floor: Vec<u32> = module
+                .functions
+                .iter()
+                .map(|f| f.max_value_id().saturating_add(1))
+                .collect();
             for func in &mut module.functions {
                 if !func.is_declaration && func.blocks.len() > 10 {
-                    let n =
-                        crate::backend::split_ranges::split_call_spanning_ranges(func, max_splits);
-                    if n > 0 {
-                        did_split = true;
-                    }
+                    crate::backend::split_ranges::split_call_spanning_ranges(func, max_splits);
                 }
             }
             // P0-A global location allocation: cross-block Belady-MIN
@@ -2318,16 +2325,24 @@ impl Driver {
             // the intra-block RA-06 splitter below; when it runs it
             // subsumes the intra-block pass for the same function (double
             // splitting would pay for both stores).
-            let mut global_location_split = false;
+            let mut global_location_split = vec![false; nfuncs];
             if crate::backend::location_alloc::gate_enabled() {
                 let gmax = crate::backend::location_alloc::max_splits_from_env();
-                for func in &mut module.functions {
+                let tls_symbols: crate::common::fx_hash::FxHashSet<String> = module
+                    .globals
+                    .iter()
+                    .filter(|g| g.is_thread_local)
+                    .map(|g| g.name.clone())
+                    .collect();
+                for (fi, func) in module.functions.iter_mut().enumerate() {
                     if !func.is_declaration && !func.blocks.is_empty() {
-                        let n = crate::backend::location_alloc::run(func, gmax, self.opt_level);
-                        if n > 0 {
-                            did_split = true;
-                            global_location_split = true;
-                        }
+                        let n = crate::backend::location_alloc::run(
+                            func,
+                            gmax,
+                            self.opt_level,
+                            &tls_symbols,
+                        );
+                        global_location_split[fi] = n > 0;
                     }
                 }
             }
@@ -2338,18 +2353,15 @@ impl Driver {
             // benchmark corpus because the loops that spill contain no
             // calls). Opt-in until the A/B census says otherwise. Skipped
             // when the global location allocator already split a function.
-            if std::env::var("CCC_PRESSURE_SPLIT").is_ok() && !global_location_split {
+            if std::env::var("CCC_PRESSURE_SPLIT").is_ok() {
                 let pmax = std::env::var("CCC_PRESSURE_SPLIT_MAX")
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(64);
-                for func in &mut module.functions {
-                    if !func.is_declaration && !func.blocks.is_empty() {
-                        let n =
-                            crate::backend::split_ranges::split_high_pressure_ranges(func, pmax);
-                        if n > 0 {
-                            did_split = true;
-                        }
+                for (fi, func) in module.functions.iter_mut().enumerate() {
+                    if !func.is_declaration && !func.blocks.is_empty() && !global_location_split[fi]
+                    {
+                        crate::backend::split_ranges::split_high_pressure_ranges(func, pmax);
                     }
                 }
             }
@@ -2362,23 +2374,35 @@ impl Driver {
             if std::env::var("CCC_LOOP_SPLIT").is_ok() {
                 for func in &mut module.functions {
                     if !func.is_declaration && !func.blocks.is_empty() {
-                        let n = crate::backend::split_ranges::split_loop_transparent_ranges(
+                        crate::backend::split_ranges::split_loop_transparent_ranges(
                             func, max_splits,
                         );
-                        if n > 0 {
-                            did_split = true;
-                        }
                     }
                 }
             }
-            // Run cleanup passes on split IR: copy propagation + DCE
-            // to eliminate redundant Store/Load → Copy chains from mem2reg
-            if did_split {
-                for func in &mut module.functions {
-                    if !func.is_declaration && !func.blocks.is_empty() {
-                        crate::passes::copy_prop::propagate_copies(func);
-                        crate::passes::dce::eliminate_dead_code(func);
-                    }
+            // Final cleanup of EVERY function, split or not: copy propagation
+            // + DCE remove the splitters' Store/Load -> Copy chains and, at
+            // -O0 (no IR pipeline), the lowering's temporaries. It used to run
+            // module-wide only when some function split, so a function's code
+            // depended on its neighbours (measured: -O0 x86-64 2942 / i686
+            // 3060 corpus instructions between the two scopes). Deliberate
+            // constant homes the hoisting passes created (opt >= 2: the -O1
+            // tier returns before fp/int constant hoisting) are spared:
+            // forwarding them re-sank movabsq magic multipliers and, on i686,
+            // x87 F64 constants (a stack-temporary rebuild per use) into loops.
+            let int_model = crate::passes::int_const_hoist::model_for(self.target);
+            let hoists_ran = self.opt_level >= 2;
+            let spare = |c: &crate::ir::reexports::IrConst| {
+                hoists_ran
+                    && (crate::passes::fp_const_hoist::is_hoisted_fp_const(c)
+                        || int_model.is_some_and(|m| {
+                            crate::passes::int_const_hoist::is_hoisted_int_const(m, c)
+                        }))
+            };
+            for (func, &floor) in module.functions.iter_mut().zip(&fresh_floor) {
+                if !func.is_declaration && !func.blocks.is_empty() {
+                    crate::passes::copy_prop::propagate_copies_sparing(func, floor, &spare);
+                    crate::passes::dce::eliminate_dead_code(func);
                 }
             }
         }

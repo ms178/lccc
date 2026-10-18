@@ -75,6 +75,14 @@ fn const_of(op: &Operand) -> Option<FpConst> {
     }
 }
 
+/// Whether this pass materializes `c` in loop preheaders (a non-zero
+/// F32/F64 bit pattern; +0.0 has a free zeroing idiom). Late passes that
+/// forward constant copies must spare such copies: they are register
+/// homes this pass created on purpose.
+pub(crate) fn is_hoisted_fp_const(c: &IrConst) -> bool {
+    const_of(&Operand::Const(*c)).is_some_and(|f| !f.is_zero())
+}
+
 /// Visit operands that can hold an FP constant (the arithmetic/comparison
 /// forms that appear in FP loop bodies).
 fn for_each_fp_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand)) {
