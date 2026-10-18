@@ -31,6 +31,9 @@ impl Lowerer {
         if let Some(op) = self.try_i686_ext_vector_xmm_or_fp_return(e) {
             return op;
         }
+        if let Some(op) = self.try_lower_vector_return_simd(e) {
+            return op;
+        }
 
         // Try sret return first (large structs and complex types via hidden pointer)
         if let Some(sret_alloca) = self.func().sret_ptr {

@@ -83,8 +83,10 @@ pub(crate) mod univsr;
 pub(crate) mod use_def;
 pub(crate) mod vec_addr_fold;
 pub(crate) mod vec_arx;
+pub(crate) mod vec_fma_contract;
 pub(crate) mod vec_interleave;
 pub(crate) mod vec_load_sink;
+pub(crate) mod vec_ssa;
 pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
 pub(crate) mod verify;
@@ -3356,6 +3358,24 @@ pub(crate) fn run_passes(
                 removed
             });
         }
+    }
+
+    // Phase 11a': Whole-vector SSA promotion. GNU-vector objects that the
+    // SIMD lowering touches only through full-width VecLoad/VecStore pairs
+    // leave memory here (mem2reg for register images); the cleanups below
+    // then see register-valued vector chains instead of slot round trips.
+    if !pass_disabled(&disabled, "vecssa") {
+        vec_ssa::promote_vector_allocas(module);
+        verify::verify_after_pass(module, "vecssa");
+    }
+
+    // Phase 11a'': Packed FMA contraction over the register-valued vector
+    // chains `vecssa` just exposed (`VecMul*` → `VecAdd*`/`VecSub*` of one
+    // float family becomes the family's fused op). Same FMA3 / -ffp-contract
+    // gate as the scalar mul+add fusion in the backend detector.
+    if !pass_disabled(&disabled, "vecfma") {
+        vec_fma_contract::contract_module(module, fp_contract);
+        verify::verify_after_pass(module, "vecfma");
     }
 
     // Phase 11b: Vector temp promotion. Runs on the final IR (after inlining and

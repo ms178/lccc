@@ -597,6 +597,11 @@ pub struct CodegenState {
     /// skip the alloca load for these and just emit a no-op (the value is
     /// already in the register-allocated destination).
     pub param_pre_stored: FxHashSet<usize>,
+    /// Entry-prefix `VecLoad` results whose value the prologue already moved
+    /// from the incoming `%xmmN`/`%ymmN` argument register into the load's
+    /// register home (`regalloc_helpers::x86_vector_param_loads`). The load
+    /// instruction itself emits nothing.
+    pub vec_param_preloaded: FxHashSet<u32>,
     /// Whether the current function returns a struct via hidden pointer (sret).
     /// On i386 SysV ABI, such functions must use `ret $4` to pop the hidden
     /// pointer argument from the caller's stack.
@@ -786,6 +791,7 @@ impl CodegenState {
             frame_offset_aliases: FxHashMap::default(),
             dead_param_ref_dests: FxHashSet::default(),
             param_pre_stored: FxHashSet::default(),
+            vec_param_preloaded: FxHashSet::default(),
             uses_sret: false,
             function_sections: false,
             data_sections: false,
@@ -1028,6 +1034,7 @@ impl CodegenState {
         self.ra_accumulator_values.clear();
         self.asm_output_values.clear();
         self.param_pre_stored.clear();
+        self.vec_param_preloaded.clear();
         self.vec_last_store_slot = None;
         self.vec_last_store_val = None;
         self.vec_last_store_reg = false;

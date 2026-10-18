@@ -1967,6 +1967,35 @@ impl Driver {
         // Pass sema's TypeContext, function signatures, and expression type annotations
         // to the lowerer so it has pre-populated type info upfront.
         let t4 = std::time::Instant::now();
+        // Packed lowering ceiling for GCC vector-extension arithmetic. The
+        // frontend lowers a whole `vector_size` operation to the x86-64
+        // `Vec*` families when the code-generation ISA has the register
+        // (`x86_isa()`: SSE2 `%xmm` always on x86-64, `%ymm` under the
+        // AVX2 ceiling) and the optimizer runs (the -O0 contract keeps the
+        // per-lane scalar form, which is the differential oracle of the
+        // packed path in tests/regression/check_vector_ext_codegen.sh).
+        // Publishing it here, before `Lowerer::lower`, mirrors the ABI
+        // width above and is reset per TU like every other target cell.
+        {
+            let isa = self.x86_isa();
+            let bytes = if self.target != Target::X86_64 || !isa.simd || self.opt_level == 0 {
+                0
+            } else if isa.ymm {
+                32
+            } else {
+                16
+            };
+            crate::common::types::set_target_vector_lowering_bytes(bytes);
+            crate::passes::vectorize::set_x86_simd_isa(
+                isa.simd,
+                isa.ymm,
+                isa.sse41,
+                self.target == Target::X86_64
+                    && self.enable_avx512f
+                    && self.enable_avx512vl
+                    && !self.no_sse,
+            );
+        }
         let lowerer = Lowerer::with_type_context(
             self.target,
             sema_result.type_context,

@@ -1718,6 +1718,16 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecAndI64x4
             | O::VecOrI64x4
             | O::VecXorI64x4
+            | O::VecShlvI32x8
+            | O::VecLShrvI32x8
+            | O::VecAShrvI32x8
+            | O::VecShlvI64x4
+            | O::VecLShrvI64x4
+            | O::VecShlvI32x4
+            | O::VecLShrvI32x4
+            | O::VecAShrvI32x4
+            | O::VecShlvI64x2
+            | O::VecLShrvI64x2
             | O::VecAndI8x16
             | O::VecOrI8x16
             | O::VecXorI8x16
@@ -1860,6 +1870,10 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecFnmaF64x2
             | O::VecFmaF32x4
             | O::VecFnmaF32x4
+            | O::VecFmsF64x2
+            | O::VecFnmsF64x2
+            | O::VecFmsF32x4
+            | O::VecFnmsF32x4
             | O::VecAddI32x4
             | O::VecAddF32x4
             | O::VecMulF32x4
@@ -2417,6 +2431,14 @@ pub(crate) fn memfold_consumer_256(op: &crate::ir::intrinsics::IntrinsicOp) -> O
         // packed min/max contract above.
         O::VecAndI32x8 | O::VecOrI32x8 | O::VecXorI32x8 => Some(true),
         O::VecSubI32x8 => Some(false),
+        // Per-lane variable shifts are `src1 << src2` / `src1 >> src2`:
+        // only the count (args[1]) may be the folded memory source
+        // (`vpsllvd mem, %ymm_src1, %ymm_dst`).
+        O::VecShlvI32x8
+        | O::VecLShrvI32x8
+        | O::VecAShrvI32x8
+        | O::VecShlvI64x4
+        | O::VecLShrvI64x4 => Some(false),
         // Byte lanes: `vpaddb`, the bitwise byte ops, and the byte/word
         // integer min/max are commutative (integer min/max has none of the
         // FP unordered/signed-zero asymmetry, so either operand may carry
@@ -2524,7 +2546,14 @@ pub(crate) fn memfold_consumer_fma_128(op: &crate::ir::intrinsics::IntrinsicOp) 
     use crate::ir::intrinsics::IntrinsicOp as O;
     matches!(
         op,
-        O::VecFmaF64x2 | O::VecFnmaF64x2 | O::VecFmaF32x4 | O::VecFnmaF32x4
+        O::VecFmaF64x2
+            | O::VecFnmaF64x2
+            | O::VecFmaF32x4
+            | O::VecFnmaF32x4
+            | O::VecFmsF64x2
+            | O::VecFmsF32x4
+            | O::VecFnmsF64x2
+            | O::VecFnmsF32x4
     )
 }
 

@@ -6040,6 +6040,10 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecFnmaF64x2
             | O::VecFmaF32x4
             | O::VecFnmaF32x4
+            | O::VecFmsF64x2
+            | O::VecFnmsF64x2
+            | O::VecFmsF32x4
+            | O::VecFnmsF32x4
             | O::VecBlendvI32x8
             | O::VecBlendvI32x4
             | O::VecBlendvI8x32
@@ -6190,6 +6194,10 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
                 | O::VecFnmaF64x2
                 | O::VecFmaF32x4
                 | O::VecFnmaF32x4
+                | O::VecFmsF64x2
+                | O::VecFnmsF64x2
+                | O::VecFmsF32x4
+                | O::VecFnmsF32x4
                 | O::VecAddI32x4
                 | O::VecAddI32x8
                 | O::VecAddI8x32
@@ -6543,6 +6551,25 @@ fn synthetic_vec_intervals(
 /// destructive allocator's handoff detector: two-operand 128-bit integer/FP
 /// SIMD intrinsics (plus rotate/shuffle) whose destination may share its
 /// first operand's home when that operand dies at the defining instruction.
+fn is_fma3_op(op: &IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecFmaF64x2
+            | O::VecFnmaF64x2
+            | O::VecFmsF64x2
+            | O::VecFnmsF64x2
+            | O::VecFmaF32x4
+            | O::VecFnmaF32x4
+            | O::VecFmsF32x4
+            | O::VecFnmsF32x4
+            | O::VecMaddF32x8
+            | O::VecMaddF32x8Signed(..)
+            | O::VecMaddF64x4
+            | O::VecMaddF64x4Signed(..)
+    )
+}
+
 fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
     matches!(
@@ -6574,6 +6601,19 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             | O::VecFnmaF64x2
             | O::VecFmaF32x4
             | O::VecFnmaF32x4
+            | O::VecFmsF64x2
+            | O::VecFnmsF64x2
+            | O::VecFmsF32x4
+            | O::VecFnmsF32x4
+            // 256-bit FMA3 (`vecfma` contraction): destructive on x86 like
+            // every FMA3 form.  `emit_avx_map_fma_inner` re-encodes the
+            // 132/231 family for whichever operand the destination home
+            // already holds, so a first-operand handoff turns the staged
+            // `vmovaps a, d; vfmadd132ps b, c, d` pair into one instruction.
+            | O::VecMaddF32x8
+            | O::VecMaddF32x8Signed(..)
+            | O::VecMaddF64x4
+            | O::VecMaddF64x4Signed(..)
             | O::VecXorF64x2
             | O::VecMinF64x2
             | O::VecMaxF64x2
@@ -6611,7 +6651,10 @@ fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
                 if is_sse128_chain_op(op) && !args.is_empty() {
                     if let Operand::Value(a0) = &args[0] {
                         let same_as_a1 = matches!(&args[1.min(args.len() - 1)], Operand::Value(v) if v.0 == a0.0);
-                        if !same_as_a1 {
+                        // A squared multiplicand (`a*a + c`) is fine for
+                        // FMA3: the 132 form reads both sources before the
+                        // write, so `d == a == b` is exact.
+                        if !same_as_a1 || is_fma3_op(op) {
                             // Home the chain DEST and its first operand
                             // unconditionally: each gets its own register
                             // whenever one is free for its live coverage
@@ -6782,6 +6825,47 @@ fn sse_chain_pieces_fit(held: &[(u32, u32)], pieces: &[(u32, u32)]) -> bool {
 /// hence the per-segment call-spanning veto; the scratch registers
 /// (xmm0/xmm1, xmm2 for pblendvb/VNNI) never enter this pool (call site
 /// filters `>= 21`).
+/// Entry vector-parameter loads (`x86_vector_param_loads`) whose incoming
+/// ABI register is the vector RETURN register (%xmm0/%ymm0).  The
+/// destructive FMA handoff prefers them when the result is returned, so the
+/// copy peephole can collapse the whole function onto %ymm0.  Empty off
+/// x86-64.
+fn x86_return_register_param_loads(func: &IrFunction) -> FxHashSet<u32> {
+    let mut out = FxHashSet::default();
+    if crate::common::types::target_elf_machine() != 62 {
+        return out;
+    }
+    let loads = crate::backend::stack_layout::x86_vector_param_loads(func);
+    if !loads.iter().any(Option::is_some) {
+        return out;
+    }
+    let classes = crate::backend::call_abi::classify_params(
+        func,
+        &crate::backend::call_abi::CallAbiConfig::sysv_x86_64(),
+    );
+    for (idx, load) in loads.iter().enumerate() {
+        if let (
+            Some((v, _)),
+            Some(crate::backend::call_abi::ParamClass::F128SseReg { reg_idx: 0, .. }),
+        ) = (load, classes.get(idx))
+        {
+            out.insert(v.0);
+        }
+    }
+    out
+}
+
+/// Values returned directly by some `Return` terminator of `func`.
+fn returned_vector_values(func: &IrFunction) -> FxHashSet<u32> {
+    func.blocks
+        .iter()
+        .filter_map(|b| match &b.terminator {
+            Terminator::Return(Some(Operand::Value(v))) => Some(v.0),
+            _ => None,
+        })
+        .collect()
+}
+
 fn allocate_vector_registers_destructive(
     func: &IrFunction,
     candidates: &FxHashSet<u32>,
@@ -6908,6 +6992,9 @@ fn allocate_vector_registers_destructive(
         }
     }
 
+    let ret_reg_param_loads = x86_return_register_param_loads(func);
+    let returned_values = returned_vector_values(func);
+
     // Pass 2: destructive handoff edges.  At the chain instruction defining
     // `d` from first operand `a0`, the edge `d <- a0` is proven when `a0`
     // is never read again afterwards (its exact last read is this very
@@ -6926,18 +7013,56 @@ fn allocate_vector_registers_destructive(
             } = inst
             {
                 if is_sse128_chain_op(op) && coverage.contains_key(&d.0) {
-                    if let Some(Operand::Value(a0)) = args.first() {
-                        let a0_reused = args[1..]
-                            .iter()
-                            .any(|a| matches!(a, Operand::Value(v) if v.0 == a0.0));
-                        if !a0_reused
-                            && coverage.contains_key(&a0.0)
-                            && !hidden.contains(&a0.0)
-                            && !liveness.folded_read_points.contains_key(&a0.0)
-                            && last_read.get(&a0.0) == Some(&point)
+                    // FMA3 is destructive in ANY operand position — the
+                    // emitter re-encodes the 132/231 family for whichever
+                    // operand the destination home holds, and every form
+                    // reads all three sources before the write, so an
+                    // aliased operand (`a*a + c`, `a*b + a`) is exact too.
+                    // Two-operand SSE forms overwrite only the first operand
+                    // and need it unaliased.
+                    // Among several dying FMA operands: when the result is
+                    // RETURNED, the parameter that arrived in the return
+                    // register wins (dest ← its home; the copy peephole then
+                    // collapses prestore + result + return move onto %ymm0 —
+                    // `a*b + c` becomes the single `vfmadd132ps`).  Otherwise
+                    // the operand defined LAST wins (the chain temporary, a
+                    // broadcast, the previous FMA): an entry parameter dies
+                    // here just as well, but its incoming ABI register is
+                    // better left alone (`mix_sab`: dest ← broadcast home,
+                    // retargeted to %ymm0 by the peephole; dest ← param home
+                    // would cost the prestore copy plus the return move).
+                    let fma3 = is_fma3_op(op);
+                    let positions = if fma3 { args.len() } else { 1.min(args.len()) };
+                    let returned = returned_values.contains(&d.0);
+                    let mut best: Option<(u32, u32)> = None; // (rank, value)
+                    for (pos, arg) in args.iter().take(positions).enumerate() {
+                        let Operand::Value(a) = arg else { continue };
+                        let reused = !fma3
+                            && args[pos + 1..]
+                                .iter()
+                                .any(|o| matches!(o, Operand::Value(v) if v.0 == a.0));
+                        if reused
+                            || hidden.contains(&a.0)
+                            || liveness.folded_read_points.contains_key(&a.0)
+                            || last_read.get(&a.0) != Some(&point)
                         {
-                            death_from.insert(d.0, a0.0);
+                            continue;
                         }
+                        let Some(pieces) = coverage.get(&a.0) else {
+                            continue;
+                        };
+                        let def = pieces.iter().map(|p| p.0).min().unwrap_or(0);
+                        let rank = if returned && ret_reg_param_loads.contains(&a.0) {
+                            u32::MAX
+                        } else {
+                            def
+                        };
+                        if best.is_none_or(|(br, _)| rank > br) {
+                            best = Some((rank, a.0));
+                        }
+                    }
+                    if let Some((_, a)) = best {
+                        death_from.insert(d.0, a);
                     }
                 }
             }
@@ -7312,18 +7437,25 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecAddF32x4
             | O::VecMulF32x4
             | O::VecFmaF32x4
-            | O::VecFnmaF32x4 => Some(3),
+            | O::VecFnmaF32x4
+            | O::VecFmsF32x4
+            | O::VecFnmsF32x4 => Some(3),
             O::VecZeroF64x2
             | O::VecLoadF64x2
             | O::VecAddF64x2
             | O::VecMulF64x2
             | O::VecFmaF64x2
-            | O::VecFnmaF64x2 => Some(4),
+            | O::VecFnmaF64x2
+            | O::VecFmsF64x2
+            | O::VecFnmsF64x2 => Some(4),
             O::VecZeroI32x8 | O::VecLoadI32x8 | O::VecAddI32x8 | O::VecMulI32x8 => Some(5),
             // BB-SLP 256-bit dword shifts: class 5 (I32x8 family; the
             // home-aware immediate-shift emitter reads/writes the YMM
             // home directly).
             O::VecShlI32x8 | O::VecLShrI32x8 | O::VecAShrI32x8 => Some(5),
+            // Per-lane variable dword shifts: two I32x8 operands, I32x8
+            // result (`emit_avx_binary_256`, like the sub/bitwise ops).
+            O::VecShlvI32x8 | O::VecLShrvI32x8 | O::VecAShrvI32x8 => Some(5),
             // v12 Fix F: Max reduction producers. VecBroadcastI32x8 seeds the
             // max accumulator (init = arr[0] broadcast), VecMaxI32x8 produces
             // the new accumulator each iteration. Classifying them as class 5
@@ -7341,6 +7473,9 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             O::VecRotlI32x4 | O::VecShufdI32x4 | O::VecXorI32x4 => Some(6),
             // BB-SLP 128-bit dword shifts: class 6 (I32x4 family).
             O::VecShlI32x4 | O::VecLShrI32x4 | O::VecAShrI32x4 => Some(6),
+            // Per-lane variable dword shifts (VEX.128 three-operand form,
+            // `emit_vex_binary_128`): class 6 (I32x4 family).
+            O::VecShlvI32x4 | O::VecLShrvI32x4 | O::VecAShrvI32x4 => Some(6),
             O::VecZeroI64x2 | O::VecLoadI64x2 | O::VecAddI64x2 | O::VecMulI64x2 => Some(7),
             // v12 Fix C: the widening reductions PRODUCE an I64x2 dest (the
             // new accumulator). Classifying them as class 7 lets the Copy-web
@@ -7378,10 +7513,14 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecBroadcastI64x4 => Some(8),
             // BB-SLP 256-bit qword shifts: class 8 (I64x4 family).
             O::VecShlI64x4 | O::VecLShrI64x4 => Some(8),
+            // Per-lane variable qword shifts: class 8 (I64x4 family).
+            O::VecShlvI64x4 | O::VecLShrvI64x4 => Some(8),
             // BB-SLP I64x2 bitwise + gather.
             O::VecAndI64x2 | O::VecOrI64x2 | O::VecXorI64x2 | O::VecPackI64x2 => Some(7),
             // BB-SLP 128-bit qword shifts: class 7 (I64x2 family).
             O::VecShlI64x2 | O::VecLShrI64x2 => Some(7),
+            // Per-lane variable qword shifts: class 7 (I64x2 family).
+            O::VecShlvI64x2 | O::VecLShrvI64x2 => Some(7),
             // BB-SLP F64x2 gather.
             O::VecPackF64x2 => Some(4),
             // BB-SLP I32x4 gather.
@@ -7428,6 +7567,8 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                 O::VecAddF32x4 | O::VecMulF32x4 | O::VecHorizontalAddF32x4
                     | O::VecFmaF32x4
                     | O::VecFnmaF32x4
+                    | O::VecFmsF32x4
+                    | O::VecFnmsF32x4
                     // BB-SLP lane extract (128-bit F32): reads the XMM
                     // home; scratch confined to xmm1.
                     | O::VecExtractLaneF32x4
@@ -7437,6 +7578,8 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                 O::VecAddF64x2 | O::VecMulF64x2 | O::VecHorizontalAddF64x2
                     | O::VecFmaF64x2
                     | O::VecFnmaF64x2
+                    | O::VecFmsF64x2
+                    | O::VecFnmsF64x2
                     // BB-SLP sinks: the 128-bit store reads a homed source
                     // directly (vec_store_source_128); the lane extract
                     // stages through xmm1 only (sse_load_arg discipline).
@@ -7461,6 +7604,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecShlI32x8
                     | O::VecLShrI32x8
                     | O::VecAShrI32x8
+                    // Variable dword shifts: `emit_avx_binary_256` reads
+                    // both homed sources in place.
+                    | O::VecShlvI32x8
+                    | O::VecLShrvI32x8
+                    | O::VecAShrvI32x8
                     // BB-SLP 256-bit lane extract: reads the YMM home
                     // (half staging), scratch confined to xmm1.
                     | O::VecExtractLaneI32x8
@@ -7493,6 +7641,11 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecShlI32x4
                     | O::VecLShrI32x4
                     | O::VecAShrI32x4
+                    // Variable dword shifts: `emit_vex_binary_128` reads
+                    // both homed sources in place (`vex128_source`).
+                    | O::VecShlvI32x4
+                    | O::VecLShrvI32x4
+                    | O::VecAShrvI32x4
                     // The ARX pass's exit materialization consumes the
                     // loop-carried state through a 128-bit store; the
                     // register-home store path (vec_store_source_128)
@@ -7530,6 +7683,10 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // immediate-shift contract as the bitwise consumes.
                     | O::VecShlI64x2
                     | O::VecLShrI64x2
+                    // Variable qword shifts: same `emit_vex_binary_128`
+                    // home-reading contract.
+                    | O::VecShlvI64x2
+                    | O::VecLShrvI64x2
             ),
             // I64x4 counting family: the sad partials are consumed by the
             // accumulator add, and the accumulator itself by the horizontal
@@ -7560,6 +7717,10 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     // immediate-shift contract as the sub/bitwise ops.
                     | O::VecShlI64x4
                     | O::VecLShrI64x4
+                    // Variable qword shifts: same `emit_avx_binary_256`
+                    // home-reading contract as the sub/bitwise ops.
+                    | O::VecShlvI64x4
+                    | O::VecLShrvI64x4
             ),
             // BB-SLP byte/halfword chains: store (vec_store_source_128
             // register-home path), add/sub/bitwise (emit_sse_binary_128
@@ -7973,6 +8134,9 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecOrI32x8
                     | O::VecXorI32x8
                     | O::VecSubI32x8
+                    | O::VecShlvI32x8
+                    | O::VecLShrvI32x8
+                    | O::VecAShrvI32x8
                     // Byte-lane maps share the 256-bit integer class:
                     // same YMM register file, same VecLoad/StoreI32x8
                     // endpoints, only the lane width of the ALU differs.
@@ -8032,6 +8196,8 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMaxF64x2
                     | O::VecFmaF64x2
                     | O::VecFnmaF64x2
+                    | O::VecFmsF64x2
+                    | O::VecFnmsF64x2
             ),
             6 => matches!(
                 op,
@@ -8050,6 +8216,11 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecOrI32x4
                     | O::VecXorI32x4
                     | O::VecSubI32x4
+                    | O::VecShlvI32x4
+                    | O::VecLShrvI32x4
+                    | O::VecAShrvI32x4
+                    | O::VecShlvI64x2
+                    | O::VecLShrvI64x2
                     | O::VecAddI8x16
                     | O::VecSubI8x16
                     | O::VecCmpI8x16
@@ -8083,6 +8254,8 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecAndI64x4
                     | O::VecOrI64x4
                     | O::VecXorI64x4
+                    | O::VecShlvI64x4
+                    | O::VecLShrvI64x4
             ),
             _ => false,
         }
@@ -8139,6 +8312,302 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
     candidates.into_keys().collect()
 }
 
+/// Copy webs (mem2reg/vec_ssa phi lowering: `%m = copy %arm` in each
+/// predecessor, the join reads `%m`): a Copy whose source is a candidate
+/// makes its destination a candidate of the same class, to a fixpoint (a
+/// web may chain through several joins).  Returns the destinations reached
+/// from two different classes -- contradictory, poisoned by the caller.
+fn propagate_copy_webs(func: &IrFunction, candidates: &mut FxHashMap<u32, u8>) -> FxHashSet<u32> {
+    let mut web_conflict: FxHashSet<u32> = FxHashSet::default();
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                } = inst
+                else {
+                    continue;
+                };
+                let Some(&class) = candidates.get(&src.0) else {
+                    continue;
+                };
+                match candidates.get(&dest.0) {
+                    None => {
+                        candidates.insert(dest.0, class);
+                        changed = true;
+                    }
+                    Some(&existing) if existing != class => {
+                        web_conflict.insert(dest.0);
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    web_conflict
+}
+
+/// Poison whole Copy webs: every member of a web either keeps its home or
+/// none does, so no transport copy ever pairs a homed source with a
+/// slot-homed destination (or vice versa).
+fn poison_copy_webs(func: &IrFunction, candidates: &FxHashMap<u32, u8>, bad: &mut FxHashSet<u32>) {
+    loop {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let Instruction::Copy {
+                    dest,
+                    src: Operand::Value(src),
+                } = inst
+                else {
+                    continue;
+                };
+                if !candidates.contains_key(&dest.0) || !candidates.contains_key(&src.0) {
+                    continue;
+                }
+                if bad.contains(&dest.0) != bad.contains(&src.0) {
+                    bad.insert(dest.0);
+                    bad.insert(src.0);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Element-family class of a map-intermediate producer
+/// (`collect_x86_map_intermediate_values`): `None` for every op that is not
+/// a packed map producer.  Mirrors the broadcast/reduction classing so the
+/// Copy-web and phi-merge machinery treats the classes uniformly.
+fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8> {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    match op {
+        // The family zero seeds (`vec_ssa` reads of an indeterminate or
+        // `{}`-initialised object): a `vxorps %ymmD,%ymmD,%ymmD` into
+        // the home. Unclassified, the seed of `v32f s = {}; for (...)
+        // s += p[i]` was stored to a 32-byte slot and reloaded into the
+        // homed accumulator web — a dead frame plus two memory
+        // operations per function for nothing.
+        O::VecZeroF32x8
+        | O::VecLoadF32x8
+        | O::VecSubF32x8
+        | O::VecDivF32x8
+        | O::VecXorF32x8
+        | O::VecSqrtF32x8
+        | O::VecMaddF32x8
+                | O::VecMaddF32x8Signed(..)
+        | O::VecCmpF32x8
+        | O::VecBlendvF32x8
+        | O::VecMinF32x8
+        | O::VecMaxF32x8
+        // Add/Mul ride `emit_avx_binary_256`, the same audited emitter
+        // as Sub/Div (W5: a streamed load feeding an add/mul chain was
+        // rejected here and paid a 32-byte dead slot + spill round
+        // trips).
+        | O::VecAddF32x8
+        | O::VecMulF32x8 => Some(1),
+        O::VecZeroF64x4
+        | O::VecLoadF64x4
+        | O::VecSubF64x4
+        | O::VecDivF64x4
+        | O::VecXorF64x4
+        | O::VecSqrtF64x4
+        | O::VecMaddF64x4
+                | O::VecMaddF64x4Signed(..)
+        | O::VecCmpF64x4
+        | O::VecBlendvF64x4
+        | O::VecMinF64x4
+        | O::VecMaxF64x4
+        | O::VecAddF64x4
+        | O::VecMulF64x4 => Some(2),
+        O::VecZeroF32x4
+        | O::VecLoadF32x4
+        | O::VecSubF32x4
+        | O::VecDivF32x4
+        | O::VecXorF32x4
+        | O::VecSqrtF32x4
+        | O::VecCmpF32x4
+        | O::VecBlendvF32x4
+        | O::VecMinF32x4
+        | O::VecMaxF32x4
+        | O::VecAddF32x4
+        | O::VecMulF32x4
+        // The 128-bit F32 fused family (BB-SLP and the `vecfma`
+        // contraction): `emit_vec_fma_128` resolves homed sources in
+        // place and writes only the destination home / xmm0..xmm3
+        // scratch — the same contract as the F64x2 trio below. Missing
+        // here, a `v16f` `a*b + c` fell to the memory path (15
+        // instructions, legacy `movdqu` staging) while the F64x2 twin
+        // was one instruction.
+        | O::VecFmaF32x4
+        | O::VecFnmaF32x4
+        | O::VecFmsF32x4
+        | O::VecFnmsF32x4 => Some(4),
+        O::VecZeroF64x2
+        | O::VecLoadF64x2
+        | O::VecSubF64x2
+        | O::VecDivF64x2
+        | O::VecXorF64x2
+        | O::VecSqrtF64x2
+        | O::VecCmpF64x2
+        | O::VecBlendvF64x2
+        | O::VecMinF64x2
+        | O::VecMaxF64x2
+        | O::VecAddF64x2
+        | O::VecMulF64x2
+        | O::VecFmaF64x2
+        | O::VecFnmaF64x2
+        | O::VecFmsF64x2
+        | O::VecFnmsF64x2 => Some(5),
+        // Integer map intermediates (class numbering mirrors the
+        // broadcast collector): dword lanes, AVX2 8-wide and SSE2
+        // 4-wide. Conditional-map results (compare masks, blends)
+        // included — their emitters resolve every vector operand
+        // through the register cache.
+        O::VecLoadI32x8
+        | O::VecSubI32x8
+        | O::VecAddI32x8
+        | O::VecMulI32x8
+        | O::VecAndI32x8
+        | O::VecOrI32x8
+        | O::VecXorI32x8
+        | O::VecCmpI32x8
+        | O::VecBlendvI32x8
+        | O::VecMinI32x8
+        | O::VecMaxI32x8
+     // Byte-lane map intermediates (AVX2 32xI8): identical home-
+        // aware emitter paths (emit_avx_binary_256, emit_int_cmp_i8,
+        // emit_avx_blendv_256, shared VecStore arm via
+        // vec_store_source_256).
+        | O::VecLoadI8x32
+        | O::VecLoadI16x16
+        | O::VecSubI8x32
+        | O::VecAddI8x32
+        | O::VecAndI8x32
+        | O::VecOrI8x32
+        | O::VecXorI8x32
+        | O::VecCmpI8x32
+        | O::VecBlendvI8x32
+        | O::VecMinU8x32
+        | O::VecMaxU8x32
+        | O::VecMinI8x32
+        | O::VecMaxI8x32
+        // Word lanes (OP-05g) share the 256-bit integer class: same
+        // YMM file, same VecLoad/StoreI32x8 endpoints.
+        | O::VecAddI16x16
+        | O::VecSubI16x16
+        | O::VecMulI16x16
+        | O::VecCmpI16x16
+        | O::VecMinI16x16
+        | O::VecMaxI16x16
+        | O::VecMinU16x16
+        | O::VecMaxU16x16
+        | O::VecBlendvI16x16
+        | O::VecAndI16x16
+        | O::VecOrI16x16
+        | O::VecXorI16x16
+        // BB-SLP 256-bit packed lane shifts (word/dword/qword): same
+        // 256-bit integer class, same YMM file.
+        | O::VecShlI16x16
+        | O::VecLShrI16x16
+        | O::VecAShrI16x16
+        | O::VecShlI32x8
+        | O::VecPackssdwI16x16
+        | O::VecLShrI32x8
+        | O::VecAShrI32x8
+        | O::VecShlI64x4
+        | O::VecLShrI64x4
+        // Per-lane variable shifts: two-source `emit_avx_binary_256`
+        // forms, same 256-bit integer class.
+        | O::VecShlvI32x8
+        | O::VecLShrvI32x8
+        | O::VecAShrvI32x8
+        | O::VecShlvI64x4
+        | O::VecLShrvI64x4 => Some(3),
+        // W5: the I64x4 family rides the SAME audited emitters as the
+        // I32x8 twins above (emit_avx_binary_256 / vec_store_source_
+        // 256). Without these producer entries a rotate diamond
+        // (load → {shl, shr} → or) left every value slot-homed: 7
+        // memory ops where 2 suffice, plus a dead frame. Deferral
+        // cannot cover the shift results: the second shift is an
+        // intervening Intrinsic, rejected by the window analysis —
+        // homing is the only sound cover.
+        | O::VecLoadI64x4
+        | O::VecAddI64x4
+        | O::VecSubI64x4
+        | O::VecAndI64x4
+        | O::VecOrI64x4
+        | O::VecXorI64x4 => Some(3),
+        O::VecLoadI32x4
+        | O::VecSubI32x4
+        | O::VecAddI32x4
+        | O::VecMulI32x4
+        | O::VecAndI32x4
+        | O::VecOrI32x4
+        | O::VecXorI32x4
+        | O::VecCmpI32x4
+        | O::VecBlendvI32x4
+     | O::VecRotlI32x4
+        | O::VecShufdI32x4
+        | O::VecShufbI32x4
+        | O::VecPackI32x4
+        | O::VecAddI8x16
+        | O::VecSubI8x16
+        | O::VecCmpI8x16
+        | O::VecMinU8x16
+        | O::VecMaxU8x16
+        | O::VecBlendvI8x16
+        | O::VecAddI16x8
+        | O::VecSubI16x8
+        | O::VecMulI16x8
+        | O::VecCmpI16x8
+        | O::VecMinI16x8
+        | O::VecMaxI16x8
+     | O::VecBlendvI16x8
+        // BB-SLP 128-bit packed lane shifts (word/dword/qword): same
+        // 128-bit integer class, same XMM file.
+        | O::VecShlI16x8
+        | O::VecLShrI16x8
+        | O::VecAShrI16x8
+        | O::VecShlI32x4
+        | O::VecLShrI32x4
+        | O::VecAShrI32x4
+        | O::VecShlI64x2
+        | O::VecLShrI64x2
+        // Per-lane variable shifts (VEX.128 three-operand form).
+        | O::VecShlvI32x4
+        | O::VecLShrvI32x4
+        | O::VecAShrvI32x4
+        | O::VecShlvI64x2
+        | O::VecLShrvI64x2
+        // W5: I64x2 family (emit_sse_binary_128 / vec_store_source_
+        // 128, the I32x4 twins) and the SSE4.1 signed dword min/max
+        // (emit_sse_binary_128 via emit_sminmax_i32x4) — same rotate-
+        // diamond and dead-slot reasoning as the 256-bit arms above.
+        | O::VecLoadI64x2
+        | O::VecAddI64x2
+        | O::VecSubI64x2
+        | O::VecAndI64x2
+        | O::VecOrI64x2
+        | O::VecXorI64x2
+        | O::VecSminI32x4
+        | O::VecSmaxI32x4
+        // HALF-WIDE dword-pair endpoints (the ops between them are
+        // the ordinary I32x4 intrinsics above).
+        | O::VecLoadI32x4Pair
+        | O::VecPackI32x4Pair => Some(6),
+        _ => None,
+    }
+}
+
 /// Map-loop intermediates (OP-05a and the FP min/max/select extension):
 /// stream loads, packed compares, blends, min/max and arithmetic results
 /// whose EVERY consumer reads them through a home-aware path.  Same
@@ -8152,191 +8621,6 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
 fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
     use crate::ir::intrinsics::IntrinsicOp as O;
 
-    // Class = element family (mirrors the broadcast/reduction classing so
-    // the Copy-web and phi-merge machinery treats them uniformly).
-    let class_of = |op: &O| -> Option<u8> {
-        match op {
-            O::VecLoadF32x8
-            | O::VecSubF32x8
-            | O::VecDivF32x8
-            | O::VecXorF32x8
-            | O::VecSqrtF32x8
-            | O::VecMaddF32x8
-                    | O::VecMaddF32x8Signed(..)
-            | O::VecCmpF32x8
-            | O::VecBlendvF32x8
-            | O::VecMinF32x8
-            | O::VecMaxF32x8
-            // Add/Mul ride `emit_avx_binary_256`, the same audited emitter
-            // as Sub/Div (W5: a streamed load feeding an add/mul chain was
-            // rejected here and paid a 32-byte dead slot + spill round
-            // trips).
-            | O::VecAddF32x8
-            | O::VecMulF32x8 => Some(1),
-            O::VecLoadF64x4
-            | O::VecSubF64x4
-            | O::VecDivF64x4
-            | O::VecXorF64x4
-            | O::VecSqrtF64x4
-            | O::VecMaddF64x4
-                    | O::VecMaddF64x4Signed(..)
-            | O::VecCmpF64x4
-            | O::VecBlendvF64x4
-            | O::VecMinF64x4
-            | O::VecMaxF64x4
-            | O::VecAddF64x4
-            | O::VecMulF64x4 => Some(2),
-            O::VecLoadF32x4
-            | O::VecSubF32x4
-            | O::VecDivF32x4
-            | O::VecXorF32x4
-            | O::VecSqrtF32x4
-            | O::VecCmpF32x4
-            | O::VecBlendvF32x4
-            | O::VecMinF32x4
-            | O::VecMaxF32x4
-            | O::VecAddF32x4
-            | O::VecMulF32x4 => Some(4),
-            O::VecLoadF64x2
-            | O::VecSubF64x2
-            | O::VecDivF64x2
-            | O::VecXorF64x2
-            | O::VecSqrtF64x2
-            | O::VecCmpF64x2
-            | O::VecBlendvF64x2
-            | O::VecMinF64x2
-            | O::VecMaxF64x2
-            | O::VecAddF64x2
-            | O::VecMulF64x2
-            | O::VecFmaF64x2
-            | O::VecFnmaF64x2 => Some(5),
-            // Integer map intermediates (class numbering mirrors the
-            // broadcast collector): dword lanes, AVX2 8-wide and SSE2
-            // 4-wide. Conditional-map results (compare masks, blends)
-            // included — their emitters resolve every vector operand
-            // through the register cache.
-            O::VecLoadI32x8
-            | O::VecSubI32x8
-            | O::VecAddI32x8
-            | O::VecMulI32x8
-            | O::VecAndI32x8
-            | O::VecOrI32x8
-            | O::VecXorI32x8
-            | O::VecCmpI32x8
-            | O::VecBlendvI32x8
-            | O::VecMinI32x8
-            | O::VecMaxI32x8
-         // Byte-lane map intermediates (AVX2 32xI8): identical home-
-            // aware emitter paths (emit_avx_binary_256, emit_int_cmp_i8,
-            // emit_avx_blendv_256, shared VecStore arm via
-            // vec_store_source_256).
-            | O::VecLoadI8x32
-            | O::VecLoadI16x16
-            | O::VecSubI8x32
-            | O::VecAddI8x32
-            | O::VecAndI8x32
-            | O::VecOrI8x32
-            | O::VecXorI8x32
-            | O::VecCmpI8x32
-            | O::VecBlendvI8x32
-            | O::VecMinU8x32
-            | O::VecMaxU8x32
-            | O::VecMinI8x32
-            | O::VecMaxI8x32
-            // Word lanes (OP-05g) share the 256-bit integer class: same
-            // YMM file, same VecLoad/StoreI32x8 endpoints.
-            | O::VecAddI16x16
-            | O::VecSubI16x16
-            | O::VecMulI16x16
-            | O::VecCmpI16x16
-            | O::VecMinI16x16
-            | O::VecMaxI16x16
-            | O::VecMinU16x16
-            | O::VecMaxU16x16
-            | O::VecBlendvI16x16
-            | O::VecAndI16x16
-            | O::VecOrI16x16
-            | O::VecXorI16x16
-            // BB-SLP 256-bit packed lane shifts (word/dword/qword): same
-            // 256-bit integer class, same YMM file.
-            | O::VecShlI16x16
-            | O::VecLShrI16x16
-            | O::VecAShrI16x16
-            | O::VecShlI32x8
-            | O::VecPackssdwI16x16
-            | O::VecLShrI32x8
-            | O::VecAShrI32x8
-            | O::VecShlI64x4
-            | O::VecLShrI64x4 => Some(3),
-            // W5: the I64x4 family rides the SAME audited emitters as the
-            // I32x8 twins above (emit_avx_binary_256 / vec_store_source_
-            // 256). Without these producer entries a rotate diamond
-            // (load → {shl, shr} → or) left every value slot-homed: 7
-            // memory ops where 2 suffice, plus a dead frame. Deferral
-            // cannot cover the shift results: the second shift is an
-            // intervening Intrinsic, rejected by the window analysis —
-            // homing is the only sound cover.
-            | O::VecLoadI64x4
-            | O::VecAddI64x4
-            | O::VecSubI64x4
-            | O::VecAndI64x4
-            | O::VecOrI64x4
-            | O::VecXorI64x4 => Some(3),
-            O::VecLoadI32x4
-            | O::VecSubI32x4
-            | O::VecAddI32x4
-            | O::VecMulI32x4
-            | O::VecAndI32x4
-            | O::VecOrI32x4
-            | O::VecXorI32x4
-            | O::VecCmpI32x4
-            | O::VecBlendvI32x4
-         | O::VecRotlI32x4
-            | O::VecShufdI32x4
-            | O::VecShufbI32x4
-            | O::VecPackI32x4
-            | O::VecAddI8x16
-            | O::VecSubI8x16
-            | O::VecCmpI8x16
-            | O::VecMinU8x16
-            | O::VecMaxU8x16
-            | O::VecBlendvI8x16
-            | O::VecAddI16x8
-            | O::VecSubI16x8
-            | O::VecMulI16x8
-            | O::VecCmpI16x8
-            | O::VecMinI16x8
-            | O::VecMaxI16x8
-         | O::VecBlendvI16x8
-            // BB-SLP 128-bit packed lane shifts (word/dword/qword): same
-            // 128-bit integer class, same XMM file.
-            | O::VecShlI16x8
-            | O::VecLShrI16x8
-            | O::VecAShrI16x8
-            | O::VecShlI32x4
-            | O::VecLShrI32x4
-            | O::VecAShrI32x4
-            | O::VecShlI64x2
-            | O::VecLShrI64x2
-            // W5: I64x2 family (emit_sse_binary_128 / vec_store_source_
-            // 128, the I32x4 twins) and the SSE4.1 signed dword min/max
-            // (emit_sse_binary_128 via emit_sminmax_i32x4) — same rotate-
-            // diamond and dead-slot reasoning as the 256-bit arms above.
-            | O::VecLoadI64x2
-            | O::VecAddI64x2
-            | O::VecSubI64x2
-            | O::VecAndI64x2
-            | O::VecOrI64x2
-            | O::VecXorI64x2
-            | O::VecSminI32x4
-            | O::VecSmaxI32x4
-            // HALF-WIDE dword-pair endpoints (the ops between them are
-            // the ordinary I32x4 intrinsics above).
-            | O::VecLoadI32x4Pair
-            | O::VecPackI32x4Pair => Some(6),
-            _ => None,
-        }
-    };
     // Every consumer must be home-aware (see the broadcast collector).  The
     // final VecStore reads its source through vec_store_source_256/128.
     let legal_consumer = |op: &O, class: u8| -> bool {
@@ -8394,6 +8678,10 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecAddF32x4
                     | O::VecMulF32x4
                     | O::VecXorF32x4
+                    | O::VecFmaF32x4
+                    | O::VecFnmaF32x4
+                    | O::VecFmsF32x4
+                    | O::VecFnmsF32x4
             ),
             5 => matches!(
                 op,
@@ -8411,6 +8699,8 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecXorF64x2
                     | O::VecFmaF64x2
                     | O::VecFnmaF64x2
+                    | O::VecFmsF64x2
+                    | O::VecFnmsF64x2
             ),
             3 => matches!(
                 op,
@@ -8475,6 +8765,11 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecAShrI32x8
                     | O::VecShlI64x4
                     | O::VecLShrI64x4
+                    | O::VecShlvI32x8
+                    | O::VecLShrvI32x8
+                    | O::VecAShrvI32x8
+                    | O::VecShlvI64x4
+                    | O::VecLShrvI64x4
                     // W5: the I64x4 binary family + store — the exact
                     // emitters of the I32x8 twins above.
                     | O::VecAddI64x4
@@ -8526,6 +8821,11 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecAShrI32x4
                     | O::VecShlI64x2
                     | O::VecLShrI64x2
+                    | O::VecShlvI32x4
+                    | O::VecLShrvI32x4
+                    | O::VecAShrvI32x4
+                    | O::VecShlvI64x2
+                    | O::VecLShrvI64x2
                     // W5: I64x2 binaries + store (emit_sse_binary_128 /
                     // vec_store_source_128 — the I32x4 twins) and the
                     // SSE4.1 signed dword min/max (emit_sse_binary_128).
@@ -8549,14 +8849,15 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                 dest: Some(d), op, ..
             } = inst
             {
-                if let Some(class) = class_of(op) {
+                if let Some(class) = x86_map_intrinsic_class(op) {
                     candidates.insert(d.0, class);
                 }
             }
         }
     }
 
-    let mut bad = FxHashSet::default();
+    let web_conflict = propagate_copy_webs(func, &mut candidates);
+    let mut bad = web_conflict;
     for block in &func.blocks {
         for inst in &block.instructions {
             for_each_operand_in_instruction(inst, |operand| {
@@ -8566,8 +8867,27 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                 let Some(&class) = candidates.get(&value.0) else {
                     return;
                 };
-                let legal =
-                    matches!(inst, Instruction::Intrinsic { op, .. } if legal_consumer(op, class));
+                let legal = match inst {
+                    // A homed 256-bit (classes 1..=3) or 128-bit (4..=6)
+                    // value is one register image whatever lane type
+                    // produced it: a float compare mask feeding
+                    // `VecAndI32x8` (`v32i m = a < b; m & x`) reads the home
+                    // exactly like an integer producer would.  The width
+                    // group never crosses (a YMM home is not an XMM one).
+                    Instruction::Intrinsic { op, .. } => {
+                        let group: &[u8] = if (1..=3).contains(&class) {
+                            &[1, 2, 3]
+                        } else {
+                            &[4, 5, 6]
+                        };
+                        group.iter().any(|&c| legal_consumer(op, c))
+                    }
+                    // Web transport: `emit_copy_value` moves a homed vector
+                    // register to register.  The web poisoning below keeps a
+                    // homed source from ever meeting a slot-homed destination.
+                    Instruction::Copy { dest, .. } => candidates.get(&dest.0) == Some(&class),
+                    _ => false,
+                };
                 if !legal {
                     bad.insert(value.0);
                 }
@@ -8581,14 +8901,23 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                 }
             });
         }
+        // A register-valued vector return (`try_lower_vector_return_simd`)
+        // is home-aware: `emit_return_impl` resolves the operand through
+        // `sse_load_arg` / `avx_load_arg_to` (register home first). Every
+        // other terminator position evicts.
+        let return_of_vector = matches!(
+            &block.terminator,
+            Terminator::Return(Some(Operand::Value(_)))
+        );
         for_each_operand_in_terminator(&block.terminator, |operand| {
             if let Operand::Value(value) = operand {
-                if candidates.contains_key(&value.0) {
+                if candidates.contains_key(&value.0) && !return_of_vector {
                     bad.insert(value.0);
                 }
             }
         });
     }
+    poison_copy_webs(func, &candidates, &mut bad);
     candidates.retain(|value, _| !bad.contains(value));
     candidates.into_keys().collect()
 }
@@ -13245,7 +13574,8 @@ mod map_collector_tests {
 
     #[test]
     fn rejects_terminator_consumers() {
-        // The load feeds a Return in addition to the min chain.
+        // The load feeds a CondBranch in addition to the min chain: a
+        // terminator position that reads the value as a scalar.
         let f = func(
             vec![
                 intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
@@ -13256,7 +13586,11 @@ mod map_collector_tests {
                 ),
                 store(O::VecStoreF32x8, 2, Some(101)),
             ],
-            Terminator::Return(Some(Operand::Value(Value(1)))),
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(1)),
+                true_label: BlockId(0),
+                false_label: BlockId(0),
+            },
         );
         let set = collect_x86_map_intermediate_values(&f);
         assert!(
@@ -13264,6 +13598,27 @@ mod map_collector_tests {
             "terminator consumer must strand the load"
         );
         assert!(set.contains(&2), "min still admissible");
+    }
+
+    #[test]
+    fn admits_register_valued_vector_return() {
+        // `return a + b;` as the SIMD lowering shapes it: the packed result
+        // is the Return operand (`emit_return_impl` resolves it through the
+        // register home), so the value keeps its home.
+        let f = func(
+            vec![
+                intrinsic(O::VecLoadF32x8, 1, vec![Operand::Value(Value(100))]),
+                intrinsic(
+                    O::VecMinF32x8,
+                    2,
+                    vec![Operand::Value(Value(1)), Operand::Value(Value(1))],
+                ),
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        );
+        let set = collect_x86_map_intermediate_values(&f);
+        assert!(set.contains(&1), "load admitted: {set:?}");
+        assert!(set.contains(&2), "returned result keeps its home: {set:?}");
     }
 
     #[test]

@@ -322,6 +322,11 @@ impl Lowerer {
     /// values using the same size-correct path used for ordinary vector copy
     /// initialization.
     fn copy_vector_expr_to_alloca(&mut self, expr: &Expr, destination: Value, vector_ct: &CType) {
+        // Packed whole-object initialization (`vector_simd.rs`): one load,
+        // one store, no Memcpy.  Total fallback below.
+        if self.try_lower_vector_init_simd(expr, destination, vector_ct) {
+            return;
+        }
         let total_size = vector_ct.size();
         let is_small_vec_call = self.rhs_is_small_vector_call(expr, total_size);
         let src = self.lower_aggregate_rvalue(expr);
@@ -1319,6 +1324,11 @@ impl Lowerer {
         // not defined by a plain lane store: a short or designated list
         // leaves C-mandated zero lanes, packed `_Bool` lane stores are
         // read-modify-write, and ext-vector padding is written by no lane.
+        // Uniform constant lists (`{}`, `{0}`, `{c, c, ...}`) on a SIMD
+        // shape: one packed zero/broadcast store (`vector_simd.rs`).
+        if self.try_lower_vector_init_list_simd(items, alloca, vector_ct) {
+            return;
+        }
         let designated = items.iter().any(|it| !it.designators.is_empty());
         if designated
             || items.len() < num_elems

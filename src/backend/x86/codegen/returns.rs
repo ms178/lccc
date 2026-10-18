@@ -9,6 +9,27 @@ impl X86Codegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
         use crate::backend::state::SlotAddr;
         if let Some(val) = val {
+            // A register-valued vector return (`try_lower_vector_return_simd`):
+            // the psABI carrier is `%xmm0` (16 bytes) or `%ymm0` (32 bytes,
+            // AVX ABI level). The value's home is an XMM/YMM register or
+            // its protected slot; one move/load puts it in place.
+            if let Operand::Value(v) = val {
+                if self.state.vector_values.contains(&v.0) {
+                    if self.state.vector128_values.contains(&v.0) {
+                        self.sse_load_arg(val, "xmm0");
+                        self.emit_epilogue_and_ret_impl(frame_size);
+                    } else {
+                        self.avx_load_arg_to(val, "ymm0");
+                        // No `vzeroupper` on this exit (see the hidden-buffer
+                        // path below): it would zero the upper lanes of
+                        // the value just loaded.
+                        let dirty = std::mem::replace(&mut self.state.dirty_upper_ymm, false);
+                        self.emit_epilogue_and_ret_impl(frame_size);
+                        self.state.dirty_upper_ymm = dirty;
+                    }
+                    return;
+                }
+            }
             let ret_ty = self.current_return_type;
             if matches!(
                 ret_ty,

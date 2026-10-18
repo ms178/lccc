@@ -342,12 +342,25 @@ pub enum IntrinsicOp {
     /// Packed FMS contraction (BB-SLP): args = [a, b, acc] → acc − a·b,
     /// 2×F64 (vfnmadd231pd). Same single-rounding contract.
     VecFnmaF64x2,
+    /// Packed `a·b − acc` contraction (`vecfma`): args = [a, b, acc],
+    /// 2×F64 (vfmsub231pd). Same single-rounding contract.
+    VecFmsF64x2,
+    /// Packed `−a·b − acc` contraction (`vecfma`, the negated-product
+    /// shape `-(a*b) - c`): args = [a, b, acc], 2×F64 (vfnmsub231pd).
+    /// Same single-rounding contract.
+    VecFnmsF64x2,
     /// Packed FMA contraction (BB-SLP): args = [a, b, acc] → acc + a·b,
     /// 4×F32 (vfmadd231ps).
     VecFmaF32x4,
     /// Packed FMS contraction (BB-SLP): args = [a, b, acc] → acc − a·b,
     /// 4×F32 (vfnmadd231ps).
     VecFnmaF32x4,
+    /// Packed `a·b − acc` contraction (`vecfma`): args = [a, b, acc],
+    /// 4×F32 (vfmsub231ps).
+    VecFmsF32x4,
+    /// Packed `−a·b − acc` contraction (`vecfma`): args = [a, b, acc],
+    /// 4×F32 (vfnmsub231ps).
+    VecFnmsF32x4,
     /// Vector add: %dest_vec = %src1_vec + %src2_vec - AVX2 8×I32
     /// args[0] = src1 vector value, args[1] = src2 vector value; dest = result vector
     VecAddI32x8,
@@ -985,6 +998,29 @@ pub enum IntrinsicOp {
     VecLShrI64x4,
     /// SSE2 qword logical shift right: 2×I64 (`vpsrlq $imm`).
     VecLShrI64x2,
+    /// AVX2 per-lane variable dword shift left: 8×I32 (`vpsllvd`);
+    /// `args[0] << args[1]` lane-wise, counts ≥ 32 yield 0.
+    VecShlvI32x8,
+    /// AVX2 per-lane variable dword logical shift right: 8×I32 (`vpsrlvd`).
+    VecLShrvI32x8,
+    /// AVX2 per-lane variable dword arithmetic shift right: 8×I32
+    /// (`vpsravd`); counts ≥ 32 yield the sign fill.
+    VecAShrvI32x8,
+    /// AVX2 per-lane variable qword shift left: 4×I64 (`vpsllvq`).
+    VecShlvI64x4,
+    /// AVX2 per-lane variable qword logical shift right: 4×I64 (`vpsrlvq`).
+    /// (There is no `vpsravq` below AVX-512VL, so no arithmetic twin.)
+    VecLShrvI64x4,
+    /// AVX2 VEX.128 per-lane variable dword shift left: 4×I32 (`vpsllvd`).
+    VecShlvI32x4,
+    /// AVX2 VEX.128 per-lane variable dword logical shift right: 4×I32.
+    VecLShrvI32x4,
+    /// AVX2 VEX.128 per-lane variable dword arithmetic shift right: 4×I32.
+    VecAShrvI32x4,
+    /// AVX2 VEX.128 per-lane variable qword shift left: 2×I64 (`vpsllvq`).
+    VecShlvI64x2,
+    /// AVX2 VEX.128 per-lane variable qword logical shift right: 2×I64.
+    VecLShrvI64x2,
     /// AVX2 horizontal signed max: %scalar = max over all 8 I32 lanes of the
     /// source vector. x86 has no single smaxv; the lowering folds the 8 lanes
     /// with vextracti128 + vpmaxsd + vpshufd + vpmaxsd pairs, ending in vmovd
@@ -1783,6 +1819,12 @@ impl IntrinsicOp {
             | VecAShrI32x8
             | VecShlI64x4
             | VecLShrI64x4
+            // GNU-vector per-lane variable shifts (two vector operands).
+            | VecShlvI32x8
+            | VecLShrvI32x8
+            | VecAShrvI32x8
+            | VecShlvI64x4
+            | VecLShrvI64x4
             // Newly wired AVX/AVX2 ops (previously scalar header loops)
             | Pmulld256 | Psubd256 | Paddq256 | Psubq256 | Pandn256
             | Pcmpeqd256 | Pcmpeqq256 | Pcmpgtd256 | Pcmpgtq256
@@ -1853,6 +1895,7 @@ impl IntrinsicOp {
             | VecMinF32x4 | VecMaxF32x4 | VecCmpF32x4 | VecBlendvF32x4
             | VecMinF64x2 | VecMaxF64x2 | VecCmpF64x2 | VecBlendvF64x2
             | VecFmaF64x2 | VecFnmaF64x2 | VecFmaF32x4 | VecFnmaF32x4
+            | VecFmsF64x2 | VecFmsF32x4 | VecFnmsF64x2 | VecFnmsF32x4
             | VecCmpI32x4 | VecBlendvI32x4
             | VecAddI8x16 | VecSubI8x16 | VecCmpI8x16
             | VecMinU8x16 | VecMaxU8x16 | VecBlendvI8x16
@@ -1874,6 +1917,12 @@ impl IntrinsicOp {
             | VecAShrI32x4
             | VecShlI64x2
             | VecLShrI64x2
+            // GNU-vector per-lane variable shifts (VEX.128, AVX2-only).
+            | VecShlvI32x4
+            | VecLShrvI32x4
+            | VecAShrvI32x4
+            | VecShlvI64x2
+            | VecLShrvI64x2
             | VecWidenAddI32x4ToI64x2
             | VecWidenMaskedAddI32x4ToI64x2
             | VecLoadWidenI32ToI64x2 | VecLoadI64x2 | VecAddI64x2 | VecMulI64x2 | VecStoreI64x2 | VecBroadcastI64x2 | VecZeroI64x2
@@ -2141,6 +2190,10 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecFnmaF64x2
                 | IntrinsicOp::VecFmaF32x4
                 | IntrinsicOp::VecFnmaF32x4
+                | IntrinsicOp::VecFmsF64x2
+                | IntrinsicOp::VecFnmsF64x2
+                | IntrinsicOp::VecFmsF32x4
+                | IntrinsicOp::VecFnmsF32x4
                 | IntrinsicOp::VecAddI32x8
                 | IntrinsicOp::VecMaxI32x8
                 | IntrinsicOp::VecMinI32x8
@@ -2207,6 +2260,16 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecLShrI64x4
                 | IntrinsicOp::VecShlI64x2
                 | IntrinsicOp::VecLShrI64x2
+                | IntrinsicOp::VecShlvI32x8
+                | IntrinsicOp::VecLShrvI32x8
+                | IntrinsicOp::VecAShrvI32x8
+                | IntrinsicOp::VecShlvI64x4
+                | IntrinsicOp::VecLShrvI64x4
+                | IntrinsicOp::VecShlvI32x4
+                | IntrinsicOp::VecLShrvI32x4
+                | IntrinsicOp::VecAShrvI32x4
+                | IntrinsicOp::VecShlvI64x2
+                | IntrinsicOp::VecLShrvI64x2
                 | IntrinsicOp::VecAndI32x8
                 | IntrinsicOp::VecAndI32x4
                 | IntrinsicOp::VecOrI32x8
@@ -2573,6 +2636,10 @@ mod vector_width_tests {
             "VecFnmaF64x2" => IntrinsicOp::VecFnmaF64x2,
             "VecFmaF32x4" => IntrinsicOp::VecFmaF32x4,
             "VecFnmaF32x4" => IntrinsicOp::VecFnmaF32x4,
+            "VecFmsF64x2" => IntrinsicOp::VecFmsF64x2,
+            "VecFnmsF64x2" => IntrinsicOp::VecFnmsF64x2,
+            "VecFmsF32x4" => IntrinsicOp::VecFmsF32x4,
+            "VecFnmsF32x4" => IntrinsicOp::VecFnmsF32x4,
             "VecMaskedAddI32x8" => IntrinsicOp::VecMaskedAddI32x8,
             "VecMaxF32x4" => IntrinsicOp::VecMaxF32x4,
             "VecMaxF32x8" => IntrinsicOp::VecMaxF32x8,
@@ -2656,6 +2723,16 @@ mod vector_width_tests {
             "VecMinI8x32" => IntrinsicOp::VecMinI8x32,
             "VecSubI32x4" => IntrinsicOp::VecSubI32x4,
             "VecSubI32x8" => IntrinsicOp::VecSubI32x8,
+            "VecShlvI32x8" => IntrinsicOp::VecShlvI32x8,
+            "VecLShrvI32x8" => IntrinsicOp::VecLShrvI32x8,
+            "VecAShrvI32x8" => IntrinsicOp::VecAShrvI32x8,
+            "VecShlvI64x4" => IntrinsicOp::VecShlvI64x4,
+            "VecLShrvI64x4" => IntrinsicOp::VecLShrvI64x4,
+            "VecShlvI32x4" => IntrinsicOp::VecShlvI32x4,
+            "VecLShrvI32x4" => IntrinsicOp::VecLShrvI32x4,
+            "VecAShrvI32x4" => IntrinsicOp::VecAShrvI32x4,
+            "VecShlvI64x2" => IntrinsicOp::VecShlvI64x2,
+            "VecLShrvI64x2" => IntrinsicOp::VecLShrvI64x2,
             "VecSubI64x2" => IntrinsicOp::VecSubI64x2,
             "VecWidenAddI32x4ToI64x2" => IntrinsicOp::VecWidenAddI32x4ToI64x2,
             "VecWidenMaskedAddI32x4ToI64x2" => IntrinsicOp::VecWidenMaskedAddI32x4ToI64x2,
