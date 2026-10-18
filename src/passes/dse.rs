@@ -17,10 +17,12 @@
 //!   value (params, phis, computed pointers).
 //! * Scanning a block backwards, a "pending" set holds later stores that
 //!   have not yet been proven observable. When the scan reaches a store
-//!   whose cell is fully covered by a pending store (same root, same
-//!   offset, pending size >= size) with **no intervening read of that
-//!   cell**, the earlier store is dead: any reader between the two would
-//!   have killed the pending entry first.
+//!   whose cell is fully covered by a pending store (same root, the
+//!   pending byte range contains the store's) with **no intervening read
+//!   of that cell**, the earlier store is dead: any reader between the two
+//!   would have killed the pending entry first. Vector store intrinsics
+//!   (`VecStore*`) are stores of their exact width here: they cover earlier
+//!   stores, die under later ones, and read nothing.
 //! * Read events (loads, calls, atomics, memcpy sources, inline asm,
 //!   varargs, ...) kill pending entries they may alias:
 //!   - a load with a resolved `(alloca/global root, const offset)` kills
@@ -362,6 +364,40 @@ fn kill_opaque(pending: &mut Vec<Pending>, ctx: &DseContext) {
     pending.retain(|p| matches!(&p.root, CellRoot::Alloca(a) if ctx.closed_allocas.contains(a)));
 }
 
+/// Does a pending later write to `root` definitely overwrite every byte of
+/// `[off, off + len)`? Containment, not offset equality: reads kill pending
+/// entries on any byte overlap, so a surviving entry that contains the
+/// range proves no read of it intervenes (one 32-byte vector store hides
+/// the four 8-byte stores under it).
+fn covered(pending: &[Pending], root: &CellRoot, off: i64, len: i64) -> bool {
+    let Some(end) = off.checked_add(len) else {
+        return false;
+    };
+    pending.iter().any(|p| {
+        p.root == *root && p.offset <= off && p.offset.checked_add(p.size).is_some_and(|e| end <= e)
+    })
+}
+
+/// The `(root, constant byte offset)` a vector store writes at, when its
+/// base resolves to a constant-offset cell and its index is a constant.
+fn vec_store_cell(
+    ctx: &DseContext,
+    base: &Operand,
+    index: &Operand,
+    disp: i64,
+) -> Option<(CellRoot, i64)> {
+    let Operand::Value(base) = base else {
+        return None;
+    };
+    let index = match index {
+        Operand::Const(c) => c.to_i64()?,
+        Operand::Value(_) => return None,
+    };
+    let addr = ctx.resolve(*base)?;
+    let off = addr.offset?.checked_add(index)?.checked_add(disp)?;
+    Some((addr.root, off))
+}
+
 /// Backward scan of one block. Returns indices of dead stores.
 fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<usize> {
     let mut pending: Vec<Pending> = Vec::new();
@@ -393,9 +429,7 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
                         // Exact cell: does a pending later store definitely
                         // overwrite every byte this one may write?
                         if !*volatile {
-                            if let Some(_p) = pending.iter().find(|p| {
-                                p.root == addr.root && p.offset == off && p.size >= may_write
-                            }) {
+                            if covered(&pending, &addr.root, off, may_write) {
                                 dead.push(ii);
                                 // The dead store is removed, but the pending
                                 // overwriter stays: an even earlier store to
@@ -471,7 +505,32 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
             | Instruction::StackRestore { .. } => {
                 kill_opaque(&mut pending, ctx);
             }
-            Instruction::Intrinsic { op, dest_ptr, .. } => {
+            Instruction::Intrinsic {
+                op, dest_ptr, args, ..
+            } => {
+                // A vector store is a plain write of a known width
+                // (`vec_intrinsic_access`: `[src, base, index, disp]`): it
+                // reads nothing, so it never kills a pending entry, and at a
+                // resolved constant address it is a store like any other --
+                // an overwriter for earlier stores it covers, and dead when
+                // a later write covers it. An unresolvable one, like an
+                // unresolvable `Store`, proves nothing either way.
+                if let Some((true, bytes, base, index, disp)) =
+                    super::alias::vec_intrinsic_access(op, args)
+                {
+                    if let Some((root, off)) = vec_store_cell(ctx, base, index, disp) {
+                        if covered(&pending, &root, off, bytes) {
+                            dead.push(ii);
+                        } else {
+                            pending.push(Pending {
+                                root,
+                                offset: off,
+                                size: bytes,
+                            });
+                        }
+                    }
+                    continue;
+                }
                 // Pure means no observable effects, not independence from memory.
                 if !op.is_pure() || dest_ptr.is_some() || op.may_read_memory() {
                     kill_opaque(&mut pending, ctx);
@@ -1322,5 +1381,150 @@ mod displaced_alias_tests {
             DseContext::build(&f).resolve(Value(2)).unwrap().offset,
             None
         );
+    }
+
+    fn alloca(dest: u32, size: usize) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        }
+    }
+    fn store64(ptr: u32) -> Instruction {
+        Instruction::Store {
+            ptr: Value(ptr),
+            val: Operand::Const(IrConst::I64(0)),
+            ty: IrType::I64,
+            volatile: false,
+            seg_override: AddressSpace::Default,
+        }
+    }
+    fn vec_store(op: crate::ir::intrinsics::IntrinsicOp, base: u32, index: Operand) -> Instruction {
+        Instruction::Intrinsic {
+            dest: None,
+            op,
+            dest_ptr: Some(Value(base)),
+            args: vec![
+                Operand::Value(Value(90)),
+                Operand::Value(Value(base)),
+                index,
+            ],
+        }
+    }
+    fn surviving_stores(f: &IrFunction) -> Vec<usize> {
+        f.blocks[0]
+            .instructions
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| matches!(i, Instruction::Store { .. } | Instruction::Intrinsic { .. }))
+            .map(|(n, _)| n)
+            .collect()
+    }
+
+    /// The zero-initializer shape SLP leaves behind: a 32-byte vector store
+    /// over the four 8-byte stores at offsets 0..24 hides them all (byte
+    /// containment, not offset equality); the store at 32 and a store
+    /// straddling the vector's end (28..36) survive. A load of offset 8
+    /// between them kills the whole pending 32-byte entry (entries are not
+    /// split per byte), so every store under it survives: sound, and
+    /// exactly as conservative as for a scalar overwriter.
+    #[test]
+    fn vector_store_covers_the_scalar_stores_beneath_it() {
+        use crate::ir::intrinsics::IntrinsicOp as O;
+        let c = |v| Operand::Const(IrConst::I64(v));
+        for read_8 in [false, true] {
+            let mut insts = vec![
+                alloca(0, 48),
+                gep(1, 0, 8),
+                gep(2, 0, 16),
+                gep(3, 0, 24),
+                gep(4, 0, 32),
+                gep(5, 0, 28),
+                store64(0), // 6
+                store64(1), // 7
+                store64(2), // 8
+                store64(3), // 9
+                store64(4), // 10
+                store64(5), // 11
+            ];
+            if read_8 {
+                insts.push(Instruction::Load {
+                    volatile: false,
+                    dest: Value(20),
+                    ptr: Value(1),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                });
+            }
+            insts.push(vec_store(O::VecStoreI64x4, 0, c(0)));
+            let mut f = function(insts);
+            let removed = eliminate_dead_stores(&mut f);
+            assert_eq!(removed, if read_8 { 0 } else { 4 }, "read_8={read_8}");
+            let n = surviving_stores(&f).len();
+            assert_eq!(n, if read_8 { 7 } else { 3 }, "read_8={read_8}");
+            let has_store_to = |ptr: u32| {
+                f.blocks[0]
+                    .instructions
+                    .iter()
+                    .any(|i| matches!(i, Instruction::Store { ptr: p, .. } if p.0 == ptr))
+            };
+            assert!(has_store_to(4) && has_store_to(5));
+            for ptr in [0, 1, 2, 3] {
+                assert_eq!(has_store_to(ptr), read_8, "ptr={ptr} read_8={read_8}");
+            }
+        }
+    }
+
+    /// A vector store is itself a store: it dies under a later write that
+    /// contains it (16 bytes at 8 under 32 at 0, via the index operand), and
+    /// survives one that only overlaps it.
+    #[test]
+    fn vector_store_dies_under_a_later_covering_write() {
+        use crate::ir::intrinsics::IntrinsicOp as O;
+        let c = |v| Operand::Const(IrConst::I64(v));
+        let mut f = function(vec![
+            alloca(0, 64),
+            vec_store(O::VecStoreI64x2, 0, c(8)),
+            vec_store(O::VecStoreI64x4, 0, c(0)),
+        ]);
+        assert_eq!(eliminate_dead_stores(&mut f), 1);
+        assert!(matches!(
+            f.blocks[0].instructions[1],
+            Instruction::Intrinsic {
+                op: O::VecStoreI64x4,
+                ..
+            }
+        ));
+        let mut f = function(vec![
+            alloca(0, 64),
+            vec_store(O::VecStoreI64x2, 0, c(24)),
+            vec_store(O::VecStoreI64x4, 0, c(0)),
+        ]);
+        assert_eq!(eliminate_dead_stores(&mut f), 0);
+    }
+
+    /// A vector store at an unresolvable address (variable index) covers
+    /// nothing, and -- reading nothing -- does not hide an earlier store
+    /// from a later overwriter either.
+    #[test]
+    fn unresolved_vector_store_neither_covers_nor_observes() {
+        use crate::ir::intrinsics::IntrinsicOp as O;
+        let mut f = function(vec![
+            alloca(0, 64),
+            store64(0),
+            vec_store(O::VecStoreI64x4, 0, Operand::Value(Value(30))),
+            store64(0),
+        ]);
+        assert_eq!(eliminate_dead_stores(&mut f), 1);
+        assert_eq!(surviving_stores(&f), vec![1, 2]);
+        let mut f = function(vec![
+            alloca(0, 64),
+            store64(0),
+            vec_store(O::VecStoreI64x4, 0, Operand::Value(Value(30))),
+        ]);
+        assert_eq!(eliminate_dead_stores(&mut f), 0);
     }
 }
