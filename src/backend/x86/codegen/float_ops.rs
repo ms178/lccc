@@ -1726,25 +1726,26 @@ impl X86Codegen {
         // declined shape never interns an unused pool constant.
         match (lh, rh) {
             (Some(l), Some(r)) => Some((FmaSrc1::Home(l), format!("%{}", r))),
-            (Some(l), None) if self.fma_mem_ok(mul_rhs) => {
-                Some((FmaSrc1::Home(l), self.fma_mem_src(mul_rhs)))
+            (Some(l), None) => {
+                let m = self.fma_mem(mul_rhs)?;
+                Some((FmaSrc1::Home(l), self.fma_mem_text(m)))
             }
-            (None, Some(r)) if self.fma_mem_ok(mul_lhs) => {
-                Some((FmaSrc1::Home(r), self.fma_mem_src(mul_lhs)))
+            (None, Some(r)) => {
+                let m = self.fma_mem(mul_lhs)?;
+                Some((FmaSrc1::Home(r), self.fma_mem_text(m)))
             }
-            (None, None) if self.fma_mem_ok(mul_lhs) => {
+            (None, None) => {
+                self.fma_mem(mul_lhs)?;
                 let same = matches!((mul_lhs, mul_rhs),
                     (Operand::Value(a), Operand::Value(b)) if a.0 == b.0);
                 let src2 = if same {
                     "%xmm1".to_string()
-                } else if self.fma_mem_ok(mul_rhs) {
-                    self.fma_mem_src(mul_rhs)
                 } else {
-                    return None;
+                    let m = self.fma_mem(mul_rhs)?;
+                    self.fma_mem_text(m)
                 };
                 Some((FmaSrc1::Stage(mul_lhs.clone()), src2))
             }
-            _ => None,
         }
     }
 
@@ -1757,35 +1758,25 @@ impl X86Codegen {
         is_xmm_reg(reg).then(|| phys_reg_name(reg))
     }
 
-    /// Whether `op` is a legal FMA memory source that is not a register
-    /// home: a slot-resident value or an F32/F64 pool constant.
-    fn fma_mem_ok(&self, op: &Operand) -> bool {
+    /// `op` as a legal FMA memory source that is not a register home: a
+    /// slot-resident value or an F32/F64 pool constant. Pure (interns no
+    /// constant), so a declined shape leaves the pool untouched.
+    fn fma_mem(&self, op: &Operand) -> Option<FmaMem> {
         match op {
-            Operand::Value(v) => {
-                !self.reg_assignments.contains_key(&v.0) && self.state.get_slot(v.0).is_some()
+            Operand::Value(v) if !self.reg_assignments.contains_key(&v.0) => {
+                self.state.get_slot(v.0).map(|slot| FmaMem::Slot(slot.0))
             }
-            Operand::Const(IrConst::F64(_) | IrConst::F32(_)) => true,
-            _ => false,
+            Operand::Const(IrConst::F64(c)) => Some(FmaMem::Pool(c.to_bits())),
+            Operand::Const(IrConst::F32(c)) => Some(FmaMem::Pool(c.to_bits() as u64)),
+            _ => None,
         }
     }
 
-    /// The memory operand text for an `fma_mem_ok` source.
-    fn fma_mem_src(&mut self, op: &Operand) -> String {
-        match op {
-            Operand::Value(v) => {
-                let slot = self.state.get_slot(v.0).expect("fma_mem_ok: slot-resident");
-                self.slot_ref(slot.0)
-            }
-            Operand::Const(IrConst::F64(c)) => {
-                format!("{}(%rip)", self.state.get_fp_const_label(c.to_bits()))
-            }
-            Operand::Const(IrConst::F32(c)) => {
-                format!(
-                    "{}(%rip)",
-                    self.state.get_fp_const_label(c.to_bits() as u64)
-                )
-            }
-            _ => unreachable!("fma_mem_src: caller checked fma_mem_ok"),
+    /// The memory operand text of an `fma_mem` source (interns a constant).
+    fn fma_mem_text(&mut self, m: FmaMem) -> String {
+        match m {
+            FmaMem::Slot(off) => self.slot_ref(off),
+            FmaMem::Pool(bits) => format!("{}(%rip)", self.state.get_fp_const_label(bits)),
         }
     }
 
@@ -1934,7 +1925,7 @@ impl X86Codegen {
                                 // xmm0 or a memory operand, so the load
                                 // clobbers no source. Before, this shape
                                 // fell to the 4-instruction scratch path.
-                                _ if self.fma_mem_ok(acc) => {
+                                _ if self.fma_mem(acc).is_some() => {
                                     self.load_fp_to_xmm0(acc, ty);
                                     Some("%xmm0".to_string())
                                 }
@@ -2135,6 +2126,15 @@ impl X86Codegen {
         }
         self.store_xmm0_fp_dest(add_dest, ty);
     }
+}
+
+/// A legal FMA memory source that is not a register home (`fma_mem`).
+#[derive(Clone, Copy)]
+enum FmaMem {
+    /// Slot-resident value at this frame offset.
+    Slot(i64),
+    /// F32/F64 pool constant (bit pattern; F32 bits zero-extended).
+    Pool(u64),
 }
 
 /// The register source of an in-place 231-form FMA (`fma_mul_sources`).
