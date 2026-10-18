@@ -3351,9 +3351,7 @@ fn simplify_math_call(
 /// Semantics-preserving: the fold is a rename to the backend's own intrinsic.
 pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
     for func in &mut module.functions {
-        if super::fp_environment_blocks_reordering(func) {
-            continue;
-        }
+        let strict_fp_environment = super::fp_environment_blocks_reordering(func);
         for block in &mut func.blocks {
             for inst in &mut block.instructions {
                 if let Instruction::Call { func: callee, info } = inst {
@@ -3364,7 +3362,30 @@ pub fn fold_math_intrinsic_calls(module: &mut IrModule) {
                         if let Some(new_inst) =
                             simplify_math_call(d, callee, &info.args, info.return_type)
                         {
-                            *inst = new_inst;
+                            // fabs/copysign are pure sign-bit operations: they
+                            // neither round nor raise an FP exception, so
+                            // -frounding-math/-ftrapping-math must not leave
+                            // their compiler-runtime helpers unresolved.  Do
+                            // not extend this exemption to sqrt, directed
+                            // rounding, FMA, or pow: those can observe the FP
+                            // environment and remain behind the normal guard.
+                            let environment_safe = matches!(
+                                new_inst,
+                                Instruction::Intrinsic {
+                                    op: IntrinsicOp::FabsF32
+                                        | IntrinsicOp::FabsF64
+                                        | IntrinsicOp::F128Fabs
+                                        | IntrinsicOp::LDFabs
+                                        | IntrinsicOp::CopysignF32
+                                        | IntrinsicOp::CopysignF64
+                                        | IntrinsicOp::F128Copysign
+                                        | IntrinsicOp::LDCopysign,
+                                    ..
+                                }
+                            );
+                            if !strict_fp_environment || environment_safe {
+                                *inst = new_inst;
+                            }
                         }
                     }
                 }

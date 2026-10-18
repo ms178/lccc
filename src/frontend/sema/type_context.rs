@@ -622,6 +622,28 @@ impl TypeContext {
         }
     }
 
+    /// Return the visible enumerator and its lexical depth (file scope is 0).
+    /// This is paired with `SymbolTable::lookup_with_depth`: enumerators and
+    /// objects occupy C's same ordinary-identifier namespace even though their
+    /// compiler payloads are intentionally stored separately.
+    pub fn enum_constant_with_depth(&self, name: &str) -> Option<(&EnumConstant, usize)> {
+        let constant = self.enum_constants.get(name)?;
+        let depth = self
+            .scope_stack
+            .borrow()
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, frame)| {
+                frame
+                    .enums_changed
+                    .iter()
+                    .any(|(changed, _)| changed == name)
+            })
+            .map_or(0, |(index, _)| index + 1);
+        Some((constant, depth))
+    }
+
     /// Insert an enum constant, tracking the change in the current scope frame.
     ///
     /// The previous value is recorded too, so a block-scope enum that redefines

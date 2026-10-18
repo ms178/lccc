@@ -1052,6 +1052,12 @@ gate "destructive-path-guards" fast bash tests/regression/check_destructive_guar
 gate "tls-model-selection" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_selection.sh
 
+gate "tls-model-option" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_option.sh
+
+gate "f128-sign-intrinsics-strict-fp" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_f128_sign_intrinsics_strict_fp.sh
+
 gate "call-secondary-cache" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_call_secondary_cache.sh
 

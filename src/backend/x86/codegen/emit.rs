@@ -1586,6 +1586,7 @@ impl X86Codegen {
     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
         self.state.disable_regalloc = opts.disable_regalloc;
         self.state.shared_lib = opts.shared_lib;
+        self.state.tls_initial_exec = opts.tls_initial_exec;
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
         self.set_function_return_thunk(opts.function_return_thunk);

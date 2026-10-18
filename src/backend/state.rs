@@ -341,6 +341,9 @@ pub struct CodegenState {
     /// form: legal in executables (PIE included), rejected by the linker for
     /// `ET_DYN` shared objects.
     pub shared_lib: bool,
+    /// The command line explicitly selected Initial-Exec TLS.  Unlike
+    /// `shared_lib`, this survives separate compile and link invocations.
+    pub tls_initial_exec: bool,
     /// Set of symbol names that are locally defined (not extern) and have internal
     /// linkage (static) — these can use direct addressing even in PIC mode.
     pub local_symbols: FxHashSet<String>,
@@ -736,6 +739,7 @@ impl CodegenState {
             trampoline_data_blocks: Vec::new(),
             pic_mode: false,
             shared_lib: false,
+            tls_initial_exec: false,
             pie_mode: false,
             local_symbols: FxHashSet::default(),
             extern_function_symbols: FxHashSet::default(),

@@ -96,6 +96,11 @@ pub(crate) struct CodegenOptions {
     /// `R_X86_64_TPOFF32` when producing a shared object. Codegen needs to
     /// tell those two apart; `pic` alone cannot.
     pub(crate) shared_lib: bool,
+    /// Force the ELF Initial-Exec TLS model (`-ftls-model=initial-exec`).
+    /// This matters for separately compiled PIC objects: the compile command
+    /// cannot infer a later `-shared` link, and Local-Exec TPOFF relocations are
+    /// illegal in shared objects.
+    pub(crate) tls_initial_exec: bool,
     /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern)
     pub(crate) function_return_thunk: bool,
     /// Whether to replace indirect calls/jumps with retpoline thunks (-mindirect-branch=thunk-extern)

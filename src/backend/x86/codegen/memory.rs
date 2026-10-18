@@ -4431,7 +4431,7 @@ impl X86Codegen {
         // Shared objects only: `R_X86_64_TPOFF32` cannot be resolved by the
         // linker for `ET_DYN`. A PIE executable is fine (and is lccc's
         // default), so the gate is `-shared`, not `pic_mode`.
-        if self.state.shared_lib || self.state.disable_regalloc {
+        if self.state.shared_lib || self.state.tls_initial_exec || self.state.disable_regalloc {
             return None;
         }
         let mut cur = ptr;

@@ -101,12 +101,21 @@ impl SymbolTable {
     }
 
     pub fn lookup(&self, name: &str) -> Option<&Symbol> {
-        for scope in self.scopes.iter().rev() {
-            if let Some(sym) = scope.symbols.get(name) {
-                return Some(sym);
-            }
-        }
-        None
+        self.lookup_with_depth(name).map(|(symbol, _)| symbol)
+    }
+
+    /// Look up the innermost symbol and its lexical depth (file scope is 0).
+    ///
+    /// C enumerators and objects share the ordinary-identifier namespace.  The
+    /// semantic analyzer keeps their payloads in separate maps, so callers
+    /// resolving an identifier need the depth to choose whichever declaration
+    /// is lexically nearer rather than unconditionally preferring one map.
+    pub fn lookup_with_depth(&self, name: &str) -> Option<(&Symbol, usize)> {
+        self.scopes
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(depth, scope)| scope.symbols.get(name).map(|symbol| (symbol, depth)))
     }
 
     /// Look up a declaration in this scope only. A nested function definition

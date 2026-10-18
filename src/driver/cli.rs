@@ -2081,6 +2081,8 @@ impl Driver {
                     self.pic = false;
                     self.pie = false;
                 }
+                "-ftls-model=initial-exec" => self.tls_initial_exec = true,
+                "-ftls-model=local-exec" => self.tls_initial_exec = false,
                 "-fcf-protection=branch" => {
                     self.cf_protection_branch = true;
                     self.cf_protection_value = Some("1");
