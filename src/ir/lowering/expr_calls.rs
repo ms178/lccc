@@ -1340,19 +1340,21 @@ impl Lowerer {
                 // as a pointer and segfaulted (AUD-VABI-4 chained-call
                 // witness).
                 {
+                    // Spill when the expression yields PACKED data; keep the
+                    // ADDRESS when it yields an object. `expr_produces_packed_
+                    // struct_data` already classifies every carrier: a call
+                    // result is packed iff the callee returns it in registers
+                    // (GP, one-XMM, two-register, x87), while a MEMORY-class
+                    // return — vector_size V1SF/V1DF per GCC 16.2.0 — comes
+                    // back as the sret buffer ADDRESS and must be forwarded
+                    // as an address; spilling that address as if it were the
+                    // value pushed 8 bytes of pointer bits as the argument.
                     let produces_packed_aggregate = {
                         let ct = self.get_expr_ctype(a);
-                        let is_struct =
-                            matches!(ct, Some(CType::Struct(_)) | Some(CType::Union(_)));
-                        let is_small_vec = ct.as_ref().is_some_and(|c| c.is_vector())
-                            && !crate::common::types::target_is_32bit()
-                            && ct.as_ref().map(|c| c.size()).unwrap_or(0) <= 8;
-                        (is_struct && self.expr_produces_packed_struct_data(a))
-                            || (is_small_vec
-                                && matches!(
-                                    a,
-                                    crate::frontend::parser::ast::Expr::FunctionCall(..)
-                                ))
+                        let is_agg = ct
+                            .as_ref()
+                            .is_some_and(|c| c.is_struct_or_union() || c.is_vector());
+                        is_agg && self.expr_produces_packed_struct_data(a)
                     };
                     if produces_packed_aggregate {
                         let agg_size = if let Some(ct) = self.get_expr_ctype(a) {
