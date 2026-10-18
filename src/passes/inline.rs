@@ -2947,6 +2947,23 @@ fn extern_inline_admission(func: &IrFunction, ctx: &CalleeContext) -> bool {
     if ctx.semantic_interposition || func.is_static {
         return false;
     }
+    // Leaf helpers only: a callee that itself calls out (libm `fma@PLT`, the
+    // guarded `__lccc_cpu_init` probe initialiser, Fortify wrappers) must
+    // keep its call sites unique — GCC declines these too, and duplicating
+    // them changed pinned contracts in the paired A/B (the fma ISA gate's
+    // byte-for-byte 8-call libm count became 10; the cpu_supports runtime
+    // gate's 2 initialiser calls became 4). Opaque inline asm is refused for
+    // the same reason.
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Call { .. }
+                | Instruction::CallIndirect { .. }
+                | Instruction::InlineAsm { .. } => return false,
+                _ => {}
+            }
+        }
+    }
     if func.uses_sret
         || func.ret_is_f128_sse
         || !func.ret_eightbyte_classes.is_empty()

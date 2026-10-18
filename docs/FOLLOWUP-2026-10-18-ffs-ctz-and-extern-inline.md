@@ -55,6 +55,13 @@ keeping the out-of-line copy; lccc refused every non-static callee. Admission
 3. **at most one natural loop** — matmul (3 loops, 34 IR instructions)
    cloned into `main` lost the vectorized form: 2.56× slower in the paired
    A/B. Multi-loop extern kernels keep the call and the optimized body.
+4. **leaf callees only** — a callee that itself calls out (libm `fma@PLT`,
+   the guarded `__lccc_cpu_init` probe initialiser) is refused: GCC declines
+   this class too, and duplicating such sites broke two pinned CI contracts
+   in the paired run (the fma ISA gate's byte-for-byte 8-call libm count
+   became 10; the cpu_supports runtime gate's 2 initialiser calls became 4).
+   Opaque inline asm is refused for the same reason. CI caught both; both
+   gates PASS locally again with the gate.
 
 The single-call-site death exemption stays static-only. Discovered and fixed
 en route: **`CCC_DISABLE_PASSES=inline` was a silent no-op** — the late
