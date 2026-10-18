@@ -255,6 +255,23 @@ expect_no_library_fill() { # <cfile> <fn> <sym> <flags...>
     fi
 }
 
+# `$fn` touches no stack: an inlined-and-folded body leaves no dead local
+# store or frame behind (GCC 16.2 emits `xorl %eax, %eax; ret` here).
+expect_no_stack() { # <cfile> <fn> <flags...>
+    local src=$1 fn=$2; shift 2
+    local asm; asm=$(asm_of "$src" "$@")
+    if ! has_fn "$asm" "$fn"; then bad "$(basename "$src") $*: $fn not emitted"; return; fi
+    if awk -v fn="$fn" '
+            index($0, fn ":") == 1 { in_fn = 1; next }
+            in_fn && /^\.size/ { in_fn = 0 }
+            in_fn && /%rsp|%rbp/ { found = 1 }
+            END { exit found ? 1 : 0 }' <<<"$asm"; then
+        note "folded    $(basename "$src") $*  ($fn: no stack traffic)"
+    else
+        bad "$(basename "$src") $*: $fn keeps stack traffic -- dead local store after forwarding"
+    fi
+}
+
 expect_no_call() { # <cfile> <flags...>: the whole TU must contain no call
     local src=$1; shift
     local asm; asm=$(asm_of "$src" "$@")
@@ -306,14 +323,30 @@ expect_no_call "$tmp/fortify_call.c" -O2 -D_FORTIFY_SOURCE=2
 expect_no_call "$tmp/fortify_call.c" -O2 -D_FORTIFY_SOURCE=2 -fno-builtin-memcpy
 expect_call   "$tmp/fortify_call.c" f memset -O2 -D_FORTIFY_SOURCE=2 -fno-builtin-memset
 # a TU *definition* of the callee also stops the expansion (no flag needed).
-# Either definition (global or static) may legitimately be inlined -- that
-# honours it, exactly as GCC inlines a TU-defined global at -O2 without
-# -fPIC / -fsemantic-interposition -- so the assertion is semantic on both:
-# the call survives, or the inlined body carries no library fill byte.
+# A TU definition is honoured whether it stays a call or is inlined, so in an
+# executable the assertion is semantic: no library fill byte may appear. A
+# static definition always may be inlined; a global one is inlined into
+# executables since #853/#863 (small external leaf definitions; GCC 16.2 does
+# the same). Under -fPIC the global definition is interposable -- another
+# DSO's memset may win at run time -- so the call must stay.
 expect_no_library_fill "$tmp/tu_def_const_call.c" f memset -O2
+expect_call            "$tmp/tu_def_const_call.c" f memset -O2 -fPIC
+expect_no_stack        "$tmp/tu_def_const_call.c" f -O2
 expect_no_library_fill "$tmp/tu_static_const_call.c" f memset -O2
 
 # ── 5. runtime ──────────────────────────────────────────────────────────────
+# The fill check above sees stores only; a library-semantics fold returns the
+# fill in a register (`movl $7, %eax`: Clang 23.1.3 in every mode, GCC 16.2
+# under -fPIC). Pin the TU definition's result: f() == 0.
+printf 'int f(void);\nint main(void) { return f(); }\n' >"$tmp/tu_def_main.c"
+for pic in "" -fPIC; do
+    if "$CCC" -O2 $pic -o "$tmp/rtd" "$tmp/tu_def_const_call.c" "$tmp/tu_def_main.c" 2>"$tmp/err" \
+        && "$tmp/rtd"; then
+        note "runtime   -O2 $pic TU-defined global memset honoured (f() == 0)"
+    else
+        bad "runtime -O2 $pic: f() != 0 -- library fill assumed for a TU-defined memset"
+    fi
+done
 if "$CCC" -O2 -o "$tmp/rt" "$tmp/runtime.c" 2>"$tmp/err" && out=$("$tmp/rt"); then
     if [ "$out" = "ok" ]; then
         note "runtime   -O2 program honours the TU's own library functions"

@@ -3167,12 +3167,33 @@ pub(crate) fn run_passes(
     // becomes SSA dataflow). Hardened rewrite of levkropp's 0980060d pass:
     // default-closed transfer function, volatile/escape/segment guards.
     // Iterate: each round can expose new dead stores for the next.
+    //
+    // A forwarded load can be the last reader of its field. The store it
+    // read is then dead, but the aggregate dead-field-store proof above ran
+    // before the forward and cannot see it, and a forwarded constant leaves a
+    // `Cast Const` the backend materializes (`xorl; movsbq`). Functions the
+    // forward changed re-run exactly those two existing proofs (e.g. an
+    // inlined TU `memset` writing U8 bytes that the caller reads as `char`:
+    // the in-loop forwarders refuse the U8/I8 pair, this pass does not).
     if !pass_disabled(&disabled, "slforward") {
-        for _ in 0..4 {
-            if module.for_each_function(store_load_forward::run) == 0 {
-                break;
+        let agg_cleanup = std::env::var_os("CCC_NO_AGG_COPY_FWD").is_none();
+        module.for_each_function(|func| {
+            let mut forwarded = 0;
+            for _ in 0..4 {
+                let n = store_load_forward::run(func);
+                if n == 0 {
+                    break;
+                }
+                forwarded += n;
             }
-        }
+            if forwarded > 0 {
+                constant_fold::fold_function(func);
+                if agg_cleanup {
+                    aggregate_copy_forward::eliminate_dead_aggregate_field_stores(func);
+                }
+            }
+            forwarded
+        });
     }
     module.for_each_function(dce::eliminate_dead_code);
     if std::env::var("LCCC_DUMP_IR_PROMOTE").is_ok() {
