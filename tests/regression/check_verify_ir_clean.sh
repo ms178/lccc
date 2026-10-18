@@ -8,12 +8,36 @@
 # time (scripts/measure_verify_ir_cost.py); this gate uses 80 files, so it
 # costs seconds.
 #
-# Scope: this proves the verifier is clean on the subset, not that it is
-# live.  The verifier's detection itself is covered by its unit tests in
+# Scope: this proves the verifier is clean on the subset, and -- via the
+# static liveness wiring below -- that the verifier is still invoked at all.
+# Detection strength itself is covered by the unit tests in
 # src/passes/verify/tests.rs, which feed it malformed IR.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
+
+# Static liveness wiring, fail closed.  Without hooks this gate would pass
+# vacuously forever (no hook calls -> no violations), so a neutered wiring
+# must be as fatal as a real violation:
+#   1. The exact number of verify::verify_after_pass(module, ...) call lines
+#      in run_passes is pinned.  Adding or removing a hook must update the
+#      pin in the same commit -- that is the deliberate-recovery step.
+#   2. The "abort" mode spelling MUST exist in the mode parser, or
+#      CCC_VERIFY_IR=abort silently degrades below.
+#   3. The same-block self-use unit test MUST exist: it is the fixture that
+#      keeps the verifier's strict def<use same-block rule detectable.
+HOOKS=$(grep -c 'verify::verify_after_pass(module,' src/passes/mod.rs || true)
+WANT_HOOKS=19
+if [ "$HOOKS" -ne "$WANT_HOOKS" ]; then
+    echo "FAIL: $HOOKS verify::verify_after_pass hooks in src/passes/mod.rs, pinned at $WANT_HOOKS." >&2
+    echo "      If a pass hook was added/removed on purpose, update WANT_HOOKS in this same change." >&2
+    exit 1
+fi
+grep -q '"abort"' src/passes/verify.rs \
+    || { echo 'FAIL: "abort" mode spelling missing from src/passes/verify.rs' >&2; exit 1; }
+grep -q 'fn an_instruction_consuming_its_own_result_is_reported' src/passes/verify/tests.rs \
+    || { echo 'FAIL: same-block self-use verifier unit test missing' >&2; exit 1; }
+echo "liveness: $HOOKS verify_after_pass hooks pinned, abort spelling + self-use test present"
 
 CCC=${CCC:-target/fastbuild/lccc}
 LIST=tests/regression/verify_ir_gate_files.txt

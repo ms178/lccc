@@ -74,7 +74,9 @@ class Reducer:
         if self.tests >= self._max_tests:
             raise Budget()
         self.tests += 1
-        path = self._scratch / f"cand-{self.tests % 2}.c"
+        # One scratch path is enough: the predicate runs synchronously, so no
+        # second candidate can be in flight while this one is judged.
+        path = self._scratch / "cand.c"
         path.write_text(text, encoding="utf-8", errors="surrogateescape")
         verdict = self._check(path)
         self._memo[key] = verdict

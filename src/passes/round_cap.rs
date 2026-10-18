@@ -24,6 +24,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Every budgeted loop that reports a cap hit. Adding a site means adding a
 /// variant here, a `name`, and exactly one [`note_cap_hit`] call at the exit.
+///
+/// Deliberate exclusions (every other bounded "stop when nothing changes"
+/// loop was checked and falls in exactly one of these classes):
+/// * `inline.rs`'s `SNAPSHOT_CLEANUP_ROUNDS` bounds work on a throwaway
+///   sizing clone, never on shipped IR; a cap exit there biases the inline
+///   cost estimate towards *not* inlining, the conservative direction, so a
+///   hit carries no missed-optimization signal worth a report line.
+/// * `run_passes`' `pass_disabled("all")` early exit runs no pass at all, so
+///   every counter is provably zero there and is the one exit without a
+///   [`report`] call. Every other pipeline exit, `-O0`'s always-inline tier
+///   included, reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Site {
     LoopCarriedForward,
@@ -36,8 +47,16 @@ pub(crate) enum Site {
 }
 
 impl Site {
+    /// Number of sites, derived from the LAST variant.  [`Site::ALL`] and the
+    /// counter arrays are both sized with this constant, so adding a variant
+    /// without listing it in `ALL` (or in the wrong order, if the `name` arms
+    /// are also skipped) is a *compile* error instead of a runtime index
+    /// panic on the first cap hit.  The order check in the unit tests covers
+    /// the permutation case the compiler cannot see.
+    pub(crate) const COUNT: usize = Site::InlineSecondPassRounds as usize + 1;
+
     /// Every site, in declaration order (the order `report` prints).
-    pub(crate) const ALL: [Site; 7] = [
+    pub(crate) const ALL: [Site; Site::COUNT] = [
         Site::LoopCarriedForward,
         Site::BackedgePre,
         Site::ReassocLatency,
@@ -63,13 +82,13 @@ impl Site {
 
 /// One relaxed counter per [`Site`].
 pub(crate) struct CapCounters {
-    hits: [AtomicU64; Site::ALL.len()],
+    hits: [AtomicU64; Site::COUNT],
 }
 
 impl CapCounters {
     pub(crate) const fn new() -> Self {
         Self {
-            hits: [const { AtomicU64::new(0) }; Site::ALL.len()],
+            hits: [const { AtomicU64::new(0) }; Site::COUNT],
         }
     }
 
@@ -154,6 +173,14 @@ mod tests {
             }
         });
         assert_eq!(c.get(Site::InlineSecondPassRounds), 4000);
+    }
+
+    #[test]
+    fn every_site_renders_a_line_when_nonzero() {
+        for site in Site::ALL {
+            let line = report_line(site, 1).expect("nonzero count must render a line");
+            assert_eq!(line, format!("[PASS] round_cap {}: 1 hit(s)", site.name()));
+        }
     }
 
     #[test]

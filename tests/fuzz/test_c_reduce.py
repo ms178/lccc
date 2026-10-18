@@ -124,6 +124,100 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stderr)
 
 
+class ScratchPath(unittest.TestCase):
+    def test_reducer_uses_one_stable_scratch_path(self):
+        """The predicate runs synchronously, so every candidate must be
+        presented through the one scratch file (no path alternation left
+        behind from a hypothetical concurrent mode)."""
+        seen: set[str] = set()
+        lines = [f"x{i}\n" for i in range(8)]
+        with tempfile.TemporaryDirectory() as tmp:
+            def check(path: Path) -> bool:
+                seen.add(path.name)
+                return "x0" in path.read_text()
+            red = c_reduce.Reducer(check, Path(tmp), 100, lines)
+            red.one_minimal(red.ddmin(list(lines)))
+        self.assertEqual(seen, {"cand.c"})
+
+
+@unittest.skipUnless(have_gcc(), "needs a reference C compiler")
+class LeakTolerance(unittest.TestCase):
+    """The reference oracle must accept a defined-but-leaking candidate.
+
+    -fsanitize=address enables LeakSanitizer, which forces exit status 1 for
+    ANY allocation still alive at exit.  Leaks are not undefined behaviour,
+    so without ASAN_OPTIONS=detect_leaks=0 the oracle would reject exactly
+    the candidates a reducer most often produces (an initialiser-with-free
+    line deleted, a leak left behind).
+    """
+
+    # The ``7 * 3`` is the fake miscompiler's known target: it becomes
+    # ``7 * 4`` under FAKE_MISCOMPILE=1, so an honest judge reports
+    # interesting (stdout differs) only if the reference run accepted the
+    # leaking-but-defined program in the first place.
+    LEAK = (
+        "#include <stdlib.h>\n#include <stdio.h>\n"
+        "int main(void) { void *p = malloc(4096); (void)p;\n"
+        "    printf(\"kept %d\\n\", 7 * 3); return 0; }\n"
+    )
+
+    _asan_probe: bool | None = None
+
+    @classmethod
+    def _have_working_asan(cls) -> bool:
+        if cls._asan_probe is None:
+            with tempfile.TemporaryDirectory() as tmp:
+                src = Path(tmp) / "p.c"
+                exe = Path(tmp) / "p.exe"
+                src.write_text(cls.LEAK)
+                ref = os.environ.get("REF_CC", "gcc")
+                built = subprocess.run(
+                    [ref, "-fsanitize=undefined,address", "-fno-sanitize-recover=all",
+                     str(src), "-o", str(exe), "-lm"],
+                    capture_output=True, timeout=120, check=False)
+                cls._asan_probe = built.returncode == 0
+        return cls._asan_probe
+
+    def test_leaking_candidate_stays_interesting(self):
+        if not self._have_working_asan():
+            self.skipTest("reference compiler cannot build ASan programs")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "leak.c"
+            src.write_text(self.LEAK)
+            env = dict(os.environ, FAKE_MISCOMPILE="1")
+            proc = subprocess.run(
+                [sys.executable, str(PRED), "--ccc", str(FAKE),
+                 "--kind", "miscompile", str(src)],
+                env=env, capture_output=True, text=True, timeout=300, check=False)
+            self.assertEqual(proc.returncode, 0,
+                             f"defined-but-leaking candidate rejected: {proc.stderr}")
+
+    def test_leak_sanitizer_itself_is_still_armed(self):
+        """Guard the guard: if this host's ASan stops reporting leaks by
+        default, the fix above would silently become a no-op assumption."""
+        if not self._have_working_asan():
+            self.skipTest("reference compiler cannot build ASan programs")
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "leak.c"
+            exe = Path(tmp) / "leak.exe"
+            src.write_text(self.LEAK)
+            ref = os.environ.get("REF_CC", "gcc")
+            subprocess.run(
+                [ref, "-fsanitize=undefined,address", "-fno-sanitize-recover=all",
+                 str(src), "-o", str(exe), "-lm"],
+                capture_output=True, timeout=120, check=True)
+            default = subprocess.run([str(exe)], capture_output=True, timeout=60,
+                                     check=False)
+            self.assertNotEqual(default.returncode, 0,
+                                "LSan did not fire by default; the detect_leaks=0 "
+                                "rationale needs re-checking on this host")
+            quiet = subprocess.run([str(exe)], capture_output=True, timeout=60,
+                                   check=False,
+                                   env={**os.environ, "ASAN_OPTIONS": "detect_leaks=0"})
+            self.assertEqual(quiet.returncode, 0,
+                             "detect_leaks=0 did not disarm LSan on this host")
+
+
 class PredicateContract(unittest.TestCase):
     def test_predicate_usage_error_aborts_instead_of_meaning_not_interesting(self):
         """Mutation: a predicate exiting 2 must abort the reduction (exit 1), not be read as a verdict."""
