@@ -55,6 +55,7 @@ struct Family {
     load: IntrinsicOp,
     store: IntrinsicOp,
     zero: IntrinsicOp,
+    zero_needs_operand: bool,
     lane_ty: IrType,
     bytes: usize,
 }
@@ -91,6 +92,7 @@ fn family_table() -> FxHashMap<IntrinsicOp, Family> {
                 load: fam.load,
                 store: fam.store,
                 zero: fam.zero,
+                zero_needs_operand: fam.zero == fam.broadcast,
                 lane_ty,
                 bytes,
             };
@@ -197,6 +199,7 @@ fn find_candidates(func: &IrFunction, table: &FxHashMap<IntrinsicOp, Family>) ->
                             load: IntrinsicOp::VecZeroF32x4,
                             store: IntrinsicOp::VecZeroF32x4,
                             zero: IntrinsicOp::VecZeroF32x4,
+                            zero_needs_operand: false,
                             lane_ty: IrType::Void,
                             bytes: 0,
                         },
@@ -454,7 +457,11 @@ fn seed_value(
             dest: Some(z),
             op: cand.family.zero,
             dest_ptr: None,
-            args: Vec::new(),
+            args: if cand.family.zero_needs_operand {
+                vec![Operand::Const(crate::ir::reexports::IrConst::I64(0))]
+            } else {
+                Vec::new()
+            },
         }
     });
     z
@@ -634,8 +641,11 @@ fn promote_function(func: &mut IrFunction, table: &FxHashMap<IntrinsicOp, Family
     //    the first non-load instruction), then the zero seeds.
     if !zero_insts.is_empty() {
         let at = entry_insert_point(&func.blocks[0]);
-        let is_load =
-            |i: &Instruction| !matches!(i, Instruction::Intrinsic { args, .. } if args.is_empty());
+        let is_load = |i: &Instruction| {
+            matches!(i,
+            Instruction::Intrinsic { op, .. }
+                if table.get(op).is_some_and(|fam| *op == fam.load))
+        };
         let (loads, zeros): (Vec<Instruction>, Vec<Instruction>) =
             zero_insts.into_iter().partition(is_load);
         for (k, inst) in loads.into_iter().chain(zeros).enumerate() {
@@ -866,6 +876,44 @@ mod tests {
             instructions,
             terminator,
             source_spans: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn zero_seeds_have_the_family_opcode_arity() {
+        crate::passes::vectorize::set_x86_simd_isa(true, true, true, false);
+        let table = family_table();
+        for op in [
+            IntrinsicOp::VecLoadI8x16,
+            IntrinsicOp::VecLoadI8x32,
+            IntrinsicOp::VecLoadI16x8,
+            IntrinsicOp::VecLoadI16x16,
+            IntrinsicOp::VecLoadF32x4,
+        ] {
+            let family = fam(&table, op);
+            let cand = Candidate {
+                alloca: 0,
+                family,
+                def_blocks: FxHashSet::default(),
+                is_param: false,
+            };
+            let mut f = func_with_blocks(vec![block(0, vec![], Terminator::Return(None))]);
+            let mut insts = vec![];
+            seed_value(&mut f, &cand, &mut None, &mut insts);
+            let Instruction::Intrinsic { op, args, .. } = &insts[0] else {
+                panic!("seed");
+            };
+            let is_broadcast = matches!(
+                op,
+                IntrinsicOp::VecBroadcastI8x16
+                    | IntrinsicOp::VecBroadcastI8x32
+                    | IntrinsicOp::VecBroadcastI16x8
+                    | IntrinsicOp::VecBroadcastI16x16
+            );
+            assert_eq!(args.len(), usize::from(is_broadcast), "{op:?}");
+            if is_broadcast {
+                assert!(matches!(args[0], Operand::Const(ref c) if c.to_i64() == Some(0)));
+            }
         }
     }
 

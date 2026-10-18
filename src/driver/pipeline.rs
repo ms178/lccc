@@ -2240,7 +2240,7 @@ impl Driver {
             ra_config.as_ref(),
             // `-fPIC`/`-shared` units keep calls to their own external
             // definitions (semantic interposition, GCC -fPIC default).
-            self.pic,
+            self.pic || self.shared_lib,
         );
         if time_phases {
             eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64());

@@ -36,9 +36,12 @@
 set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 ccc=${CCC:-$root/target/fastbuild/lccc}
-gcc_bin=${GCC:-gcc}
+gcc_bin=${GCC:-gcc-16}
 [ -x "$ccc" ] || { echo "FAIL: compiler not built: $ccc" >&2; exit 1; }
 command -v "$gcc_bin" >/dev/null || { echo "FAIL: no GCC ($gcc_bin)" >&2; exit 1; }
+[[ $("$gcc_bin" -dumpfullversion) == 16.2.0 ]] || {
+    echo 'FAIL: vector-extension oracle must be GCC 16.2.0' >&2; exit 1;
+}
 command -v objcopy >/dev/null || { echo "FAIL: objcopy not found" >&2; exit 1; }
 case $(uname -m) in
     x86_64) ;;
@@ -111,11 +114,11 @@ for flags in "${levels[@]}"; do
         continue
     fi
     # shellcheck disable=SC2086
-    "$gcc_bin" $gflags -w -Wno-psabi -c "$src" -o "$tmp/m.g.o"
+    "$gcc_bin" $gflags -Werror -Wno-psabi -c "$src" -o "$tmp/m.g.o"
     objcopy --prefix-symbols=L_ "$tmp/m.l.o"
     objcopy --prefix-symbols=G_ "$tmp/m.g.o"
     # shellcheck disable=SC2086
-    "$gcc_bin" -O0 $gflags -w -Wno-psabi "$drv" "$tmp/m.l.o" "$tmp/m.g.o" -o "$tmp/rt.bin"
+    "$gcc_bin" -O0 $gflags -Werror -Wno-psabi "$drv" "$tmp/m.l.o" "$tmp/m.g.o" -o "$tmp/rt.bin"
     if ! out=$("$tmp/rt.bin" 2>&1); then
         fail "runtime differential at $flags:"$'\n'"$out"
         continue
@@ -173,10 +176,12 @@ if ! awk '$0 == "shr_v32i:" {on=1; next} on && /\.cfi_endproc/ {exit} on' "$tmp/
 fi
 # Compare masks (GCC: 2).
 for fn in eq_v32i lt_v32i eq_v32f lt_v32f lt_v16f; do ceiling "$fn" 2; done
-# DEBT (VEX-128-INT-1): the 128-bit integer compare/arith emitters stage
-# through legacy destructive SSE forms under AVX (GCC: 2 / 4).
-ceiling eq_v16i 4
-ceiling mix_sab4 7
+# VEX.128 signed compares now write their home directly (GCC: 2).
+ceiling eq_v16i 2
+ceiling lt_v16i 2
+# Broadcast/FMA staging remains one instruction above the older ceiling's
+# improvement (was 7, now 6; GCC: 4). This is not claimed as closed debt.
+ceiling mix_sab4 6
 # Scalar/vector interleave: broadcast + fma + ret (GCC: 3).
 ceiling mix_sab 3
 # Parameter passthrough (GCC: 1).

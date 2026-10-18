@@ -673,6 +673,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_designator_init.sh
     - name: Vector initializers inside aggregates
       run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_vector_static_init.sh
+    - name: Guarded bit scans and shared interposition
+      run: env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_joint_optimizer_audit.sh
     - name: GNU vector-extension whole-vector lowering (runtime vs GCC + ceilings)
       run: |
         set -o pipefail
