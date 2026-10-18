@@ -20,8 +20,11 @@
 //!   uniform patterns like `0xAAAAAAAA` fill each byte with `0xAA`);
 //! - store address affine in a loop iv (GEP scale == store width for the
 //!   indexed form, or a +1-advancing pointer iv);
-//! - exact trip count `n = bound - init` for `Ult`/`Ne` exits, static
-//!   overflow gate, dynamic `n != 0` guard around the call;
+//! - exact trip count `n = bound - init` for `Ult`/`Ne`/`Slt` exits, static
+//!   overflow gate, dynamic `n != 0` guard around the call (`Slt` — the
+//!   canonical `for (int i = 0; i < n; i++)` shape — clamps n to
+//!   `max(0, bound - init)` in the pointer-width type, so a negative bound
+//!   reaches the guard as 0, never as a huge size_t);
 //! - exit values reconstructed (`exit iv → bound`, `other ivs → init + n`)
 //!   with mechanical external-use checking.
 //!
@@ -219,7 +222,7 @@ struct Plan {
     /// Store side addressing.
     store_addr: AddrForm,
     /// The fill byte and the store width.
-    fill_byte: u8,
+    fill_byte: Operand,
     fill_width: u32,
     /// While-form, loop-defined invariant-global bound: (original bound
     /// value, global address value, loaded type). The rewrite re-materializes
@@ -382,10 +385,12 @@ fn try_recognize(func: &IrFunction, header_idx: usize, cfg: &CfgAnalysis) -> Opt
         refuse!("loop bound is defined inside the header");
     }
     // Supported exit forms: the iv stops exactly at `bound` (Ne) or first
-    // reaches it from below (Ult). Ugt with a +1 iv never exits; signed
-    // forms are refused (ivs here are unsigned or pointers).
-    if !matches!(cmp_op, IrCmpOp::Ne | IrCmpOp::Ult) {
-        refuse!("unsupported exit predicate {:?} (want Ne/Ult)", cmp_op);
+    // reaches it from below (Ult unsigned, Slt signed — the canonical
+    // `for (int i = 0; i < n; i++)` fill the frontend emits for signed
+    // counters; GCC 16.2.0 folds it to memset(3), so refusing it cedes a
+    // whole-call idiom). Ugt with a +1 iv never exits.
+    if !matches!(cmp_op, IrCmpOp::Ne | IrCmpOp::Ult | IrCmpOp::Slt) {
+        refuse!("unsupported exit predicate {:?} (want Ne/Ult/Slt)", cmp_op);
     }
 
     // Rotate-guard signature: a separate block branching { header, exit }
@@ -542,6 +547,44 @@ fn try_recognize(func: &IrFunction, header_idx: usize, cfg: &CfgAnalysis) -> Opt
     })
 }
 
+/// The `Slt` exit's clamped trip count: `init <s bound ? bound - init : 0`,
+/// computed in the POINTER-WIDTH type. The bound may be <= init (the loop
+/// runs zero times); doing the subtraction in the iv's own (possibly 32-bit)
+/// signed type could wrap for the extreme span (init = INT_MIN,
+/// bound = INT_MAX wraps to -1), and a negative n cast to size_t would hand
+/// memset a SIZE_MAX byte count. In the pointer-width type the difference of
+/// two values that each fit the iv type cannot overflow, and the clamp keeps
+/// it non-negative; the M-guard then skips the call for the zero-trip case.
+/// The result is already `size_ty`.
+fn slt_trip_count(
+    em: &mut Emitter,
+    init_arith: &Operand,
+    bound_arith: &Operand,
+    iv_arith_ty: IrType,
+    size_ty: IrType,
+) -> Operand {
+    let init_wide = em.cast(init_arith.clone(), iv_arith_ty, size_ty);
+    let bound_wide = em.cast(bound_arith.clone(), iv_arith_ty, size_ty);
+    let diff_wide = em.binop(
+        IrBinOp::Sub,
+        Operand::Value(bound_wide),
+        Operand::Value(init_wide),
+        size_ty,
+    );
+    let c = em.cmp(
+        IrCmpOp::Slt,
+        init_arith.clone(),
+        bound_arith.clone(),
+        iv_arith_ty,
+    );
+    Operand::Value(em.select(
+        Operand::Value(c),
+        Operand::Value(diff_wide),
+        Operand::Const(zero_const(size_ty)),
+        size_ty,
+    ))
+}
+
 // ── Small IR utilities ───────────────────────────────────────────────────────
 
 /// Values defined per block index.
@@ -660,7 +703,7 @@ fn recognize_ivs(
         if lv.0 != dest.0 || const_to_u64(r) != Some(1) {
             continue;
         }
-        // Only unsigned/pointer ivs (the exit forms are Ne/Ult).
+        // Unsigned, signed and pointer ivs (the exit forms are Ne/Ult/Slt).
         if *ty == IrType::Ptr || ty.is_integer() {
             ivs.push(Iv {
                 phi: *dest,
@@ -795,8 +838,8 @@ fn try_recognize_while(
     // in the header). Validated after the store address resolves (the
     // disjointness argument needs the fill's root object).
     let bound_loop_defined = !bound_invariant;
-    if !matches!(cmp_op, IrCmpOp::Ne | IrCmpOp::Ult) {
-        refuse!("unsupported guard predicate {:?} (want Ne/Ult)", cmp_op);
+    if !matches!(cmp_op, IrCmpOp::Ne | IrCmpOp::Ult | IrCmpOp::Slt) {
+        refuse!("unsupported guard predicate {:?} (want Ne/Ult/Slt)", cmp_op);
     }
 
     // Body census: straight-line fill/copy work only.
@@ -1128,18 +1171,23 @@ struct BodyCensus {
     store: Option<usize>,
     /// The stored constant byte (None until the store is classified).
     store_byte: Option<u8>,
+    /// A runtime fill byte: the stored loop-invariant value of a 1-byte
+    /// store (`for (i) d[i] = v;` with parameter `v` — GCC 16.2.0 folds the
+    /// same shape to memset(3)). None for constant fills.
+    store_val: Option<Operand>,
 }
 
 fn census_body(
     func: &IrFunction,
     block_idx: usize,
     ivs: &[Iv],
-    _defs: &FxHashMap<u32, usize>,
+    defs: &FxHashMap<u32, usize>,
 ) -> Result<BodyCensus, String> {
     let header = &func.blocks[block_idx];
     let mut c = BodyCensus {
         store: None,
         store_byte: None,
+        store_val: None,
     };
 
     for (ii, inst) in header.instructions.iter().enumerate() {
@@ -1205,10 +1253,35 @@ fn census_body(
                 c.store = Some(ii);
                 c.store_byte = Some(b as u8);
             }
-            Instruction::Store { .. } => {
-                return Err(
-                    "stored value is not a constant (copy loop — loop_idiom's job)".to_string(),
-                );
+            Instruction::Store {
+                val: Operand::Value(v),
+                ty,
+                volatile,
+                ..
+            } => {
+                if c.store.is_some() || *volatile {
+                    return Err("multiple/volatile stores".to_string());
+                }
+                // A RUNTIME fill byte is memset-able only when the store is
+                // already one byte wide: a wider store writes EVERY byte of
+                // the value, not `width` copies of its low byte, so folding
+                // `d32[i] = v` to memset(d, (uchar)v, 4n) would change the
+                // program. The value must also be loop-invariant: not an iv
+                // phi and not defined inside this block (every body-defined
+                // value the census otherwise allows is one of the
+                // whitelisted iv/address-affine shapes above; a value
+                // defined before the loop dominates the body, so the call
+                // placed at the store can read it).
+                if ty.size() != 1 {
+                    return Err("runtime fill byte needs a 1-byte store".to_string());
+                }
+                if ivs.iter().any(|iv| iv.phi.0 == v.0)
+                    || defs.get(&v.0).copied() == Some(block_idx)
+                {
+                    return Err("runtime fill byte is not loop-invariant".to_string());
+                }
+                c.store = Some(ii);
+                c.store_val = Some(Operand::Value(*v));
             }
             _ => {
                 let name = inst.short_name();
@@ -1249,14 +1322,14 @@ fn const_to_i64(c: &IrConst) -> Option<i64> {
 }
 
 /// Resolve memory op addressing. Returns
-/// (store_addr, store_width, store_const_byte). Fill loops have no load.
+/// (store_addr, store_width, fill_byte). Fill loops have no load.
 fn resolve_memory_ops(
     func: &IrFunction,
     op_block: usize,
     body: &BodyCensus,
     ivs: &[Iv],
     defs: &FxHashMap<u32, usize>,
-) -> Result<(AddrForm, u32, u8), String> {
+) -> Result<(AddrForm, u32, Operand), String> {
     let store_ii = body
         .store
         .ok_or_else(|| "census lost the store".to_string())?;
@@ -1266,12 +1339,18 @@ fn resolve_memory_ops(
     else {
         return Err("census index not a store".to_string());
     };
-    let store_const_byte = body
-        .store_byte
-        .ok_or_else(|| "census lost the store constant".to_string())?;
+    // Constant fills carry the classified byte; runtime fills carry the
+    // invariant value operand itself.
+    let fill_byte = if let Some(b) = body.store_byte {
+        Operand::Const(IrConst::I8(b as i8))
+    } else {
+        body.store_val
+            .clone()
+            .ok_or_else(|| "census lost the fill byte".to_string())?
+    };
 
     let store_addr = resolve_addr(func, op_block, ptr, ivs, defs, "store")?;
-    Ok((store_addr, store_ty.size() as u32, store_const_byte))
+    Ok((store_addr, store_ty.size() as u32, fill_byte))
 }
 
 /// Resolve a pointer operand into an [`AddrForm`].
@@ -1558,8 +1637,9 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
         init_arith.clone(),
         iv_arith_ty,
     );
-    let n_val = match plan.exit_op {
-        IrCmpOp::Ne => diff,
+    let n_val: Operand = match plan.exit_op {
+        IrCmpOp::Ne => Operand::Value(diff),
+        IrCmpOp::Slt => slt_trip_count(&mut em, &init_arith, &bound_arith, iv_arith_ty, size_ty),
         _ => {
             // Ult with a zero init needs no select: n = bound - 0 = bound,
             // and bound == 0 yields n == 0, which the M-guard skips — the
@@ -1570,7 +1650,7 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
             };
             if zero_init {
                 let zero = Operand::Const(zero_const(iv_arith_ty));
-                em.binop(IrBinOp::Sub, bound_arith.clone(), zero, iv_arith_ty)
+                Operand::Value(em.binop(IrBinOp::Sub, bound_arith.clone(), zero, iv_arith_ty))
             } else {
                 let c = em.cmp(
                     IrCmpOp::Ult,
@@ -1578,31 +1658,33 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
                     bound_arith.clone(),
                     iv_arith_ty,
                 );
-                em.select(
+                Operand::Value(em.select(
                     Operand::Value(c),
                     Operand::Value(diff),
                     Operand::Const(zero_const(iv_arith_ty)),
                     iv_arith_ty,
-                )
+                ))
             }
         }
     };
-    let n_size = if iv_arith_ty == size_ty {
+    let n_size = if iv_arith_ty == size_ty || plan.exit_op == IrCmpOp::Slt {
+        // The Slt arm computes n directly in the pointer-width type (see
+        // above), so it needs no further widening.
         n_val
     } else {
-        em.cast(Operand::Value(n_val), iv_arith_ty, size_ty)
+        Operand::Value(em.cast(n_val, iv_arith_ty, size_ty))
     };
 
     // ── G: byte count + start addresses ──────────────────────────────────
-    let bytes = if plan.fill_width == 1 {
+    let bytes: Operand = if plan.fill_width == 1 {
         n_size
     } else {
-        em.binop(
+        Operand::Value(em.binop(
             IrBinOp::Mul,
-            Operand::Value(n_size),
+            n_size,
             Operand::Const(IrConst::I64(i64::from(plan.fill_width))),
             size_ty,
-        )
+        ))
     };
 
     let start_of = |em: &mut Emitter, form: &AddrForm| -> Value {
@@ -1619,18 +1701,20 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
     };
     let dst0 = start_of(&mut em, &plan.store_addr);
     // Call shape mirrors the frontend's memset lowering (lower.rs
-    // emit_memset_zero): args [dst, byte(I32), n(size_ty)].
-    let call_args = vec![
-        Operand::Value(dst0),
-        Operand::Const(IrConst::I32(i32::from(plan.fill_byte))),
-        Operand::Value(bytes),
-    ];
+    // emit_memset_zero): args [dst, byte(I32), n(size_ty)]. A runtime fill
+    // byte is widened from its 1-byte store type; memset consumes only the
+    // low byte, which is exactly the byte the removed store wrote.
+    let byte_arg = match &plan.fill_byte {
+        Operand::Const(c) => Operand::Const(IrConst::I32(const_to_i64(c).unwrap_or(0) as i32)),
+        Operand::Value(v) => Operand::Value(em.cast(Operand::Value(*v), IrType::I8, IrType::I32)),
+    };
+    let call_args = vec![Operand::Value(dst0), byte_arg, bytes];
     let callee = "memset";
 
     // ── G: the n != 0 guard ──────────────────────────────────────────────
     let nz = em.cmp(
         IrCmpOp::Ne,
-        Operand::Value(n_size),
+        n_size,
         Operand::Const(zero_const(size_ty)),
         size_ty,
     );
@@ -1662,9 +1746,9 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
             let n_a = if other_ty == size_ty {
                 n_size
             } else {
-                em.cast(Operand::Value(n_size), size_ty, other_ty)
+                Operand::Value(em.cast(n_size, size_ty, other_ty))
             };
-            let summed = em.binop(IrBinOp::Add, init_a, Operand::Value(n_a), other_ty);
+            let summed = em.binop(IrBinOp::Add, init_a, n_a, other_ty);
             let final_val = if other_ty == other.ty {
                 summed
             } else {
@@ -1819,9 +1903,9 @@ fn apply_idiom(func: &mut IrFunction, plan: Plan) -> usize {
                 let n_a = if other_ty == size_ty {
                     n_size
                 } else {
-                    em.cast(Operand::Value(n_size), size_ty, other_ty)
+                    Operand::Value(em.cast(n_size, size_ty, other_ty))
                 };
-                let summed = em.binop(IrBinOp::Add, init_a, Operand::Value(n_a), other_ty);
+                let summed = em.binop(IrBinOp::Add, init_a, n_a, other_ty);
                 let final_val = if other_ty == iv.ty {
                     summed
                 } else {
