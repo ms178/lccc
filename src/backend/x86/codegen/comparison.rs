@@ -1991,6 +1991,59 @@ impl X86Codegen {
         return true;
     }
 
+    /// Is this select arm the address of an over-aligned (> 16) alloca?
+    fn select_arm_over_aligned(&self, op: &Operand) -> bool {
+        matches!(op, Operand::Value(v) if self.state.alloca_over_align(v.0).is_some())
+    }
+
+    /// Select whose arm is an over-aligned alloca (> 16 bytes: a 32-byte GNU
+    /// vector object whose address escapes, under the SSE ABI level).  Such
+    /// an arm materializes as `leaq; addq $align-1; andq $-align` -- the
+    /// `addq`/`andq` write the flags, so the flag-neutral staging contract of
+    /// the in-place select paths does not hold.  The condition's flags are
+    /// already live when `live_cc` is `Some` (fused / replayed compare or an
+    /// in-place test); otherwise the legacy test is emitted first.  Either
+    /// way the staging is bracketed with `pushfq`/`popfq` and the cmov uses
+    /// the same condition code.
+    ///
+    /// Cost: `popfq` is ~20 uops on Intel cores; this path is cold by
+    /// construction (`downgrade_nonescaping_vector_align` removes the
+    /// over-alignment of every vector temporary whose address does not
+    /// escape, so only an escaped 32-byte object selected under `-mno-avx`
+    /// reaches it).  Observed miscompile before this path existed:
+    /// `r = c ? a : b` over `float vector_size(32)` at `-mno-avx` selected
+    /// the wrong object for every `c` (the matrix's `tern_assign`).
+    fn emit_select_over_aligned_arms(
+        &mut self,
+        dest: &Value,
+        cond: &Operand,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+        live_cc: Option<&'static str>,
+    ) {
+        let cc = match live_cc {
+            Some(cc) => cc,
+            None => {
+                self.emit_legacy_cond_test(cond);
+                "ne"
+            }
+        };
+        self.state.emit("    pushfq");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size += 8;
+        }
+        self.operand_to_rax(false_val);
+        self.operand_to_rcx(true_val);
+        self.state.emit("    popfq");
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size -= 8;
+        }
+        self.emit_cmov_typed(cc, "rcx", "rax", ty);
+        self.state.reg_cache.invalidate_acc();
+        self.store_rax_to(dest);
+    }
+
     pub(super) fn emit_select_impl(
         &mut self,
         dest: &Value,
@@ -2157,6 +2210,18 @@ impl X86Codegen {
             (None, None, Some((op, _, _, _))) => Self::cmp_cmov(*op),
             (None, None, None) => "ne",
         };
+
+        if self.select_arm_over_aligned(true_val) || self.select_arm_over_aligned(false_val) {
+            self.emit_select_over_aligned_arms(
+                dest,
+                cond,
+                true_val,
+                false_val,
+                ty,
+                tested_in_place.then_some(cmov_cc),
+            );
+            return;
+        }
 
         // Register-direct: when dest has a register, operate directly on it.
         if let Some(d_reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {

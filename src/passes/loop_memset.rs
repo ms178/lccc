@@ -452,7 +452,7 @@ fn try_recognize(func: &IrFunction, header_idx: usize, cfg: &CfgAnalysis) -> Opt
         .ok()?;
 
     // Body census: classify every non-phi instruction.
-    let body = census_body(func, header_idx, &ivs, &defs)
+    let body = census_body(func, header_idx, &[header_idx], &ivs, &defs)
         .map_err(|e| {
             if trace_enabled() {
                 eprintln!("[loop-memset] refuse: body census ({e})");
@@ -861,7 +861,7 @@ fn try_recognize_while(
     }
 
     // Body census: straight-line fill/copy work only.
-    let body = census_body(func, body_idx, &ivs, &defs)
+    let body = census_body(func, body_idx, &[header_idx, body_idx], &ivs, &defs)
         .map_err(|e| {
             if trace_enabled() {
                 eprintln!("[loop-memset] refuse: body census ({e})");
@@ -1195,9 +1195,47 @@ struct BodyCensus {
     store_val: Option<Operand>,
 }
 
+/// `v` is a phi of the loop header whose incomings are only itself and ONE
+/// other value `x` defined outside the loop (the shape `loop_carried_forward`
+/// leaves for the forward-overlap smear `G[i+1] = G[i]`: `v = φ(G[0], v)`).
+/// Returns `x`; `None` for every other shape.
+fn degenerate_header_phi_source(
+    func: &IrFunction,
+    header_idx: usize,
+    v: Value,
+    loop_blocks: &[usize],
+    defs: &FxHashMap<u32, usize>,
+) -> Option<Value> {
+    let phi = func.blocks[header_idx]
+        .instructions
+        .iter()
+        .find_map(|inst| match inst {
+            Instruction::Phi { dest, incoming, .. } if dest.0 == v.0 => Some(incoming),
+            _ => None,
+        })?;
+    let mut source: Option<Value> = None;
+    for (op, _) in phi {
+        match op {
+            Operand::Value(x) if x.0 == v.0 => {}
+            Operand::Value(x) => {
+                if source.is_some_and(|s| s.0 != x.0) {
+                    return None;
+                }
+                if defs.get(&x.0).is_some_and(|b| loop_blocks.contains(b)) {
+                    return None;
+                }
+                source = Some(*x);
+            }
+            Operand::Const(_) => return None,
+        }
+    }
+    source
+}
+
 fn census_body(
     func: &IrFunction,
     block_idx: usize,
+    loop_blocks: &[usize],
     ivs: &[Iv],
     defs: &FxHashMap<u32, usize>,
 ) -> Result<BodyCensus, String> {
@@ -1285,21 +1323,38 @@ fn census_body(
                 // the value, not `width` copies of its low byte, so folding
                 // `d32[i] = v` to memset(d, (uchar)v, 4n) would change the
                 // program. The value must also be loop-invariant: not an iv
-                // phi and not defined inside this block (every body-defined
-                // value the census otherwise allows is one of the
-                // whitelisted iv/address-affine shapes above; a value
+                // phi and not defined in ANY block of the loop (every
+                // body-defined value the census otherwise allows is one of
+                // the whitelisted iv/address-affine shapes above; a value
                 // defined before the loop dominates the body, so the call
-                // placed at the store can read it).
+                // placed at the store can read it).  The header counts: a
+                // non-iv header phi (`loop_carried_forward` turns the
+                // forward-overlap smear `G[i+1] = G[i]` into `v = φ(G[0],
+                // v)`) dies with the loop, and a memset reading it was a
+                // use of an undefined value (`loop_idiom_copy_norewrite`,
+                // caught by the IR verifier).
                 if ty.size() != 1 {
                     return Err("runtime fill byte needs a 1-byte store".to_string());
                 }
-                if ivs.iter().any(|iv| iv.phi.0 == v.0)
-                    || defs.get(&v.0).copied() == Some(block_idx)
-                {
+                // A degenerate header phi `v = φ(x entry, v backedge)` IS
+                // the loop-invariant `x` (the smear's fill byte); every
+                // other loop-defined value refuses.
+                let fill = if ivs.iter().any(|iv| iv.phi.0 == v.0) {
+                    None
+                } else if let Some(&b) = defs.get(&v.0) {
+                    if b == block_idx || loop_blocks.contains(&b) {
+                        degenerate_header_phi_source(func, loop_blocks[0], *v, loop_blocks, defs)
+                    } else {
+                        Some(*v)
+                    }
+                } else {
+                    Some(*v)
+                };
+                let Some(fill) = fill else {
                     return Err("runtime fill byte is not loop-invariant".to_string());
-                }
+                };
                 c.store = Some(ii);
-                c.store_val = Some(Operand::Value(*v));
+                c.store_val = Some(Operand::Value(fill));
             }
             _ => {
                 let name = inst.short_name();

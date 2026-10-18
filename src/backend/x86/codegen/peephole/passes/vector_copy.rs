@@ -1032,10 +1032,24 @@ fn prev_real(store: &LineStore, infos: &[LineInfo], before: usize, fstart: usize
 
 /// Both operands of a register copy are spelled `%xmm`.
 fn copy_spelled_xmm(t: &str) -> bool {
+    copy_spelled_width(t) == Some(W128)
+}
+
+/// The common spelled width of every register operand of `t`
+/// (`Some(128)` for an all-`%xmm` line), `None` when operands disagree or
+/// any operand is not a vector register.
+fn copy_spelled_width(t: &str) -> Option<u16> {
     let (_, ops) = split_mn(t);
-    operand_list(ops)
-        .iter()
-        .all(|op| vec_operand(op.trim()).is_some_and(|(_, w)| w == W128))
+    let mut width = None;
+    for op in operand_list(ops) {
+        let (_, w) = vec_operand(op.trim())?;
+        match width {
+            None => width = Some(w),
+            Some(seen) if seen == w => {}
+            Some(_) => return None,
+        }
+    }
+    width
 }
 
 /// Re-home a scalar FMA so that the copies around it disappear.
@@ -1304,6 +1318,9 @@ pub(super) fn reassociate_fma_accumulator(store: &mut LineStore, infos: &mut [Li
 const VEX_PLAIN_OUTPUT_BASES: &[&str] = &[
     "add", "sub", "mul", "div", "min", "max", "sqrt", "rsqrt", "rcp", "round", "xor", "and",
     "andn", "or", "blendv",
+    // `vcmpps $imm, b, a, d` (and `pd`/`ss`/`sd`): the predicate immediate
+    // leads, the mask is written from the two sources alone.
+    "cmp",
 ];
 
 /// `Some(true)` when `mn` is a VEX (`v`-prefixed) instruction from
@@ -1321,6 +1338,33 @@ fn vex_plain_output(mn: &str) -> bool {
         return false;
     };
     VEX_PLAIN_OUTPUT_BASES.contains(&base)
+}
+
+/// VEX/AVX2 packed-integer instructions whose destination is a plain output:
+/// every source is read before the write, the full spelled width of the
+/// destination is written from the sources alone, and the bits above the
+/// spelled width are zeroed.  Exactly the list the SIMD vector lowering
+/// (`vector_simd.rs`) and the BB-SLP/map emitters produce for `vector_size`
+/// integer lanes; nothing here merges into or reads its destination
+/// (no FMA, no `vpinsr*`, no `vpblendw`-with-dest-as-source, no masking).
+fn vex_int_plain_output(mn: &str) -> bool {
+    let Some(rest) = mn.strip_prefix("vp") else {
+        return false;
+    };
+    // Bitwise forms carry no lane suffix at all.
+    if matches!(rest, "and" | "andn" | "or" | "xor") {
+        return true;
+    }
+    const BASES: &[&str] = &[
+        "add", "adds", "addus", "sub", "subs", "subus", "mull", "mulh", "mulhu", "mulu", "mul",
+        "cmpeq", "cmpgt", "mins", "minu", "maxs", "maxu", "sll", "srl", "sra", "sllv", "srlv",
+        "srav", "shuf", "blendv", "abs", "avg", "unpckl", "unpckh", "ackss", "ackus",
+    ];
+    const LANES: &[&str] = &["b", "w", "d", "q", "bw", "wd", "dq", "qdq", "dw", "wb"];
+    BASES.iter().any(|base| {
+        rest.strip_prefix(base)
+            .is_some_and(|lane| LANES.contains(&lane))
+    })
 }
 
 /// Re-home a VEX instruction whose result is only ever copied somewhere else:
@@ -1366,6 +1410,25 @@ fn vex_plain_output(mn: &str) -> bool {
 ///   [`FpLiveness`]: the rewrite stops writing it.
 /// * The two lines are adjacent up to nops, in one basic block, neither is
 ///   pinned, and every register operand is spelled `%xmm`.
+/// Longest straight-line interior `retarget_vex_result` renames between the
+/// producer and the copy-out.  Small by design: the rule is a local
+/// bracket fold, not a register allocator.
+const MAX_RETARGET_INTERIOR: usize = 6;
+
+/// An interior line whose mention of the temporary may be renamed: a
+/// VEX-spelled instruction (`v…`), whose register operands are all written
+/// with the VEX zero-above semantics -- so after the rename every write to
+/// the new destination is a full `pw`-wide VEX write, exactly what the
+/// deleted copy-out produced.  Legacy SSE spellings merge into the upper
+/// bits and are refused.
+fn vex_rename_safe(t: &str) -> bool {
+    let (mn, _) = split_mn(t);
+    mn.starts_with('v')
+        && !mn.starts_with("vmovs")
+        && !mn.starts_with("vmovl")
+        && !mn.starts_with("vmovh")
+}
+
 pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
@@ -1378,7 +1441,7 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
         }
         let t_op = infos[j].trimmed(store.get(j)).to_string();
         let (mn, operands) = split_mn(&t_op);
-        if !vex_plain_output(mn) || operands.contains('{') {
+        if !(vex_plain_output(mn) || vex_int_plain_output(mn)) || operands.contains('{') {
             j += 1;
             continue;
         }
@@ -1396,13 +1459,21 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             j += 1;
             continue;
         }
-        let Some((t, W128)) = vec_operand(ops[ops.len() - 1]) else {
+        // The producer's spelled width `pw` (128/256/512): every register
+        // source must be spelled the same width (no mixed-width forms such
+        // as `vpmovzx`/`vcvtps2pd`, whose read widths differ), and the
+        // copy-out below must be spelled the same width too.
+        let Some((t, pw)) = vec_operand(ops[ops.len() - 1]) else {
             j += 1;
             continue;
         };
+        if pw != W128 && !vex_int_plain_output(mn) && !vex_plain_output(mn) {
+            j += 1;
+            continue;
+        }
         let sources_ok = ops[..ops.len() - 1]
             .iter()
-            .all(|op| !op.starts_with('%') || vec_operand(op).is_some_and(|(_, w)| w == W128));
+            .all(|op| !op.starts_with('%') || vec_operand(op).is_some_and(|(_, w)| w == pw));
         if !sources_ok {
             j += 1;
             continue;
@@ -1411,24 +1482,103 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             j += 1;
             continue;
         };
-        let Some(k) = next_real(store, infos, j + 1, fend) else {
+        // The copy-out: the first copy OF `T` after the producer, either
+        // adjacent or behind a short straight-line interior that only
+        // consumes `T` at the producer's width -- `t = a + b; return
+        // b*t + t;` is `vaddps %ymm1,%ymm0,%ymm14; vfmadd132ps
+        // %ymm1,%ymm14,%ymm14; vmovdqa %ymm14,%ymm0` (an FMA reads its
+        // destination, so the FMA itself cannot be retargeted; the ADD
+        // can, and the interior is renamed with it).  The interior may not
+        // mention `D` at any width (it is about to hold the result) and
+        // may not mention `T` at another width (the rename is exact-width),
+        // and every interior write to `T` is a VEX write at `pw`, so `D`'s
+        // final state is bit-identical to what the copy left.  Barriers
+        // (labels, transfers, calls, pinned lines) end the search.
+        let Some((t_fam_lo, _)) = vec_operand(ops[ops.len() - 1]) else {
             j += 1;
             continue;
         };
-        if infos[k].pinned {
+        debug_assert_eq!(t_fam_lo, t);
+        let mut k_found: Option<usize> = None;
+        let mut interior: Vec<usize> = Vec::new();
+        let mut n = j + 1;
+        while n < fend && interior.len() <= MAX_RETARGET_INTERIOR {
+            if infos[n].is_nop() || infos[n].kind == LineKind::Empty {
+                n += 1;
+                continue;
+            }
+            if infos[n].pinned {
+                break;
+            }
+            let tn = infos[n].trimmed(store.get(n));
+            if let Some(c) = parse_vec_copy(tn) {
+                if c.src == t {
+                    k_found = Some(n);
+                    break;
+                }
+            }
+            if is_barrier(&infos[n], tn) || tn.contains('{') {
+                break;
+            }
+            let tw = vec_mention_width(tn, t);
+            if tw != 0 && tw != pw {
+                break;
+            }
+            if tw != 0 && !vex_rename_safe(tn) {
+                break;
+            }
+            interior.push(n);
+            n += 1;
+        }
+        let Some(k) = k_found else {
             j += 1;
             continue;
-        }
+        };
         let t_out = infos[k].trimmed(store.get(k)).to_string();
         let Some(copy_out) = parse_vec_copy(&t_out) else {
             j += 1;
             continue;
         };
-        if copy_out.src != t
-            || copy_out.width >= W128
-            || copy_out.zeroes_above
-            || !copy_spelled_xmm(&t_out)
-        {
+        // An interior that touches `D` cannot be renamed onto it; an
+        // interior is only accepted for the full-width VEX copy-out shape
+        // (the scalar / legacy shapes keep their adjacency).
+        if !interior.is_empty() {
+            let d_fam = VEC_FAMILY_BASE + copy_out.dst;
+            let d_clean = interior
+                .iter()
+                .all(|&n| !mentions_family(infos[n].trimmed(store.get(n)).as_bytes(), d_fam));
+            let full_vex = copy_out.width == pw
+                && copy_spelled_width(&t_out) == Some(pw)
+                && copy_out.zeroes_above;
+            if !d_clean || !full_vex {
+                j += 1;
+                continue;
+            }
+        }
+        // Two copy-out shapes are folded:
+        //  * a legacy element-width move (`movsd`/`movss`, width < 128) of a
+        //    128-bit producer -- the original scalar rule, which needs the
+        //    upper-bit argument below;
+        //  * a full-width VEX move (`vmovdqa`/`vmovaps`/... spelled `pw`,
+        //    zeroes above): the producer, retargeted to `D`, writes exactly
+        //    the bits the copy wrote (all of `D` up to `pw`, zero above),
+        //    so `D`'s final state is bit-identical and no reader of `D`
+        //    can tell -- the 256-bit `vector_size` return shape
+        //    (`vaddps %ymm1, %ymm0, %ymm4; vmovdqa %ymm4, %ymm0; ret`).
+        //  * a legacy full-width move (`movdqa %xmm4, %xmm0` after a VEX.128
+        //    producer): bits 127:0 of `D` are identical either way; the
+        //    producer additionally zeroes `D`'s bits above 128 where the
+        //    legacy move left them alone, so this shape keeps the wide-reader
+        //    argument of the scalar rule (refused when any other line of the
+        //    function mentions `D` wider than the copy).
+        let copy_spelling = copy_spelled_width(&t_out);
+        let scalar_copy_out = pw == W128
+            && copy_out.width < W128
+            && !copy_out.zeroes_above
+            && copy_spelling == Some(W128);
+        let full_copy_out = copy_out.width == pw && copy_spelling == Some(pw);
+        let full_vex_copy_out = full_copy_out && copy_out.zeroes_above;
+        if copy_out.src != t || !(scalar_copy_out || full_copy_out) {
             j += 1;
             continue;
         }
@@ -1442,6 +1592,7 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             .find(|&n| !debug_transparent(store, infos[n], n) && infos[n].kind != LineKind::Empty)
             .is_some_and(|n| infos[n].kind == LineKind::Ret && !infos[n].pinned);
         let wide_reader = (!immediate_return)
+            && !full_vex_copy_out
             && (fstart..fend).any(|n| {
                 n != j
                     && n != k
@@ -1459,13 +1610,25 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
         }
         let mut new_ops: Vec<String> = ops.iter().map(|o| (*o).to_string()).collect();
         let last = new_ops.len() - 1;
-        new_ops[last] = format!("%xmm{d}");
+        let prefix = match pw {
+            W256 => "ymm",
+            W512 => "zmm",
+            _ => "xmm",
+        };
+        new_ops[last] = format!("%{prefix}{d}");
         replace_line(
             store,
             &mut infos[j],
             j,
             format!("    {mn} {}", new_ops.join(", ")),
         );
+        for &n in &interior {
+            let tn = infos[n].trimmed(store.get(n)).to_string();
+            let renamed = replace_vec_reg(&tn, t, d);
+            if renamed != tn {
+                replace_line(store, &mut infos[n], n, format!("    {renamed}"));
+            }
+        }
         mark_nop(&mut infos[k]);
         if let Some(oracle) = fp.as_mut() {
             oracle.refresh_at(store, infos, j);
@@ -2642,6 +2805,118 @@ mod tests {
         );
     }
 
+    // ── whole-register copy-outs (the `vector_size` return shapes) ──────────
+
+    #[test]
+    fn retarget_folds_full_width_vex_copy_out_into_256_bit_producer() {
+        // `add8`: the home-to-%ymm0 move of a register-valued vector return.
+        let text = "    vaddps %ymm1, %ymm0, %ymm4\n    vmovdqa %ymm4, %ymm0\n    ret\n";
+        assert_eq!(
+            retarget_only(text),
+            insns("    vaddps %ymm1, %ymm0, %ymm0\n    ret\n")
+        );
+        // Integer lanes (`vpaddd`) and the leading-immediate compare.
+        let text = "    vpaddd %ymm1, %ymm0, %ymm4\n    vmovdqa %ymm4, %ymm0\n    ret\n";
+        assert_eq!(
+            retarget_only(text),
+            insns("    vpaddd %ymm1, %ymm0, %ymm0\n    ret\n")
+        );
+        let text = "    vcmpps $1, %xmm1, %xmm0, %xmm4\n    movdqa %xmm4, %xmm0\n    ret\n";
+        assert_eq!(
+            retarget_only(text),
+            insns("    vcmpps $1, %xmm1, %xmm0, %xmm0\n    ret\n")
+        );
+    }
+
+    #[test]
+    fn retarget_renames_a_straight_line_interior_onto_the_copy_out_register() {
+        // `t = a + b; return b*t + t;`: the FMA reads its destination, so
+        // only the ADD can move; the interior is renamed with it.
+        let text = "    vaddps %ymm1, %ymm0, %ymm14\n    vfmadd132ps %ymm1, %ymm14, %ymm14\n    vmovdqa %ymm14, %ymm0\n    ret\n";
+        assert_eq!(
+            retarget_only(text),
+            insns("    vaddps %ymm1, %ymm0, %ymm0\n    vfmadd132ps %ymm1, %ymm0, %ymm0\n    ret\n")
+        );
+        // Refused: the interior reads the copy-out register (`a` is still
+        // needed there), ...
+        let text = "    vaddps %ymm1, %ymm0, %ymm14\n    vfmadd132ps %ymm0, %ymm14, %ymm14\n    vmovdqa %ymm14, %ymm0\n    ret\n";
+        assert_eq!(retarget_only(text), insns(text));
+        // ... mentions the temporary at another width, ...
+        let text = "    vaddps %ymm1, %ymm0, %ymm14\n    vaddss %xmm1, %xmm14, %xmm14\n    vmovdqa %ymm14, %ymm0\n    ret\n";
+        assert_eq!(retarget_only(text), insns(text));
+        // ... writes it with a legacy (upper-merging) spelling, ...
+        let text = "    vaddps %ymm1, %ymm0, %ymm14\n    addps %xmm1, %xmm14\n    vmovdqa %ymm14, %ymm0\n    ret\n";
+        assert_eq!(retarget_only(text), insns(text));
+        // ... or has a barrier between producer and copy-out.
+        let text =
+            "    vaddps %ymm1, %ymm0, %ymm14\n    call f\n    vmovdqa %ymm14, %ymm0\n    ret\n";
+        assert_eq!(retarget_only(text), insns(text));
+    }
+
+    #[test]
+    fn retarget_full_width_copy_out_needs_same_spelling_and_dead_source() {
+        // Mixed spelling (a 128-bit copy of a 256-bit producer) is not a
+        // whole-register copy; the producer's home stays.
+        let text = "    vaddps %ymm1, %ymm0, %ymm4\n    vmovdqa %xmm4, %xmm0\n    ret\n";
+        assert_eq!(retarget_only(text), insns(text));
+        // The old destination is read again after the copy: no fold.
+        let text = "    vaddps %ymm1, %ymm0, %ymm4\n    vmovdqa %ymm4, %ymm2\n    vaddps %ymm4, %ymm2, %ymm0\n    ret\n";
+        assert_eq!(retarget_only(text), insns(text));
+        // A legacy full-width copy leaves bits above 128 of the destination
+        // alone where the VEX producer would zero them: refused when a wide
+        // reader of the destination exists, folded for a leaf return.
+        let text = "    vaddps %xmm1, %xmm0, %xmm4\n    movaps %xmm4, %xmm3\n    vaddps %ymm3, %ymm2, %ymm0\n    ret\n";
+        assert_eq!(retarget_only(text), insns(text));
+    }
+
+    #[test]
+    fn vex_int_plain_output_classifies_lane_suffixes_exactly() {
+        for mn in [
+            "vpaddd",
+            "vpaddb",
+            "vpsubq",
+            "vpmulld",
+            "vpmullw",
+            "vpmuludq",
+            "vpand",
+            "vpandn",
+            "vpor",
+            "vpxor",
+            "vpcmpeqd",
+            "vpcmpgtb",
+            "vpminsd",
+            "vpmaxub",
+            "vpsllvd",
+            "vpsrad",
+            "vpshufb",
+            "vpblendvb",
+            "vpabsd",
+            "vpavgw",
+            "vpunpcklbw",
+            "vpackssdw",
+            "vpackuswb",
+        ] {
+            assert!(vex_int_plain_output(mn), "{mn}");
+        }
+        for mn in [
+            "vpinsrd",
+            "vpextrd",
+            "vpblendw",
+            "vpmovzxbw",
+            "vpmaddwd",
+            "vpsadbw",
+            "vpaddsbx",
+            "vpadd",
+            "paddd",
+            "vfmadd231ps",
+            "vpand d",
+            "vpermd",
+            "vpgatherdd",
+        ] {
+            assert!(!vex_int_plain_output(mn), "{mn}");
+        }
+    }
+
     const PRO: &str = "f:\n.cfi_startproc\n";
     const EPI: &str = ".cfi_endproc\n.size f, .-f\n";
 
@@ -3694,16 +3969,29 @@ mod tests {
         let got =
             retarget_only("    vfmadd231sd %xmm1, %xmm2, %xmm3\n    movsd %xmm3, %xmm0\n    ret\n");
         assert_eq!(got.len(), 3, "an FMA reads its destination: {got:?}");
-        // A VEX (zeroing) copy-out is not the legacy merge this rule models.
+        // The self-merging VEX move (`vmovsd %t, %t, %d`) copies all of T and
+        // zeroes above: a whole-register copy-out, folded like any other.
         let got = retarget_only(
             "    vaddsd %xmm1, %xmm2, %xmm3\n    vmovsd %xmm3, %xmm3, %xmm0\n    ret\n",
         );
+        assert_eq!(got.len(), 2, "{got:?}");
+        // A VEX merge from a THIRD register is neither the legacy element
+        // merge nor a whole-register copy: refused.
+        let got = retarget_only(
+            "    vaddsd %xmm1, %xmm2, %xmm3\n    vmovsd %xmm3, %xmm5, %xmm0\n    ret\n",
+        );
         assert_eq!(got.len(), 3, "{got:?}");
-        // A full-width copy-out reads all of T, which the retarget would
-        // leave undefined in D's upper lane.
+        // A legacy full-width copy-out of a VEX.128 producer: bits 127:0 of
+        // D are identical either way, so a leaf return folds ...
         let got =
             retarget_only("    vaddsd %xmm1, %xmm2, %xmm3\n    movapd %xmm3, %xmm0\n    ret\n");
-        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got.len(), 2, "{got:?}");
+        // ... but a reader of D's bits above 128 (left alone by the legacy
+        // copy, zeroed by the retargeted producer) keeps the copy.
+        let got = retarget_only(
+            "    vaddsd %xmm1, %xmm2, %xmm3\n    movapd %xmm3, %xmm0\n    vaddps %ymm0, %ymm2, %ymm2\n    ret\n",
+        );
+        assert_eq!(got.len(), 4, "{got:?}");
         // Not adjacent: a barrier between.
         let got = retarget_only(
             "    vaddsd %xmm1, %xmm2, %xmm3\n    call f\n    movsd %xmm3, %xmm0\n    ret\n",

@@ -1431,6 +1431,11 @@ impl Lowerer {
         let lhs_ptr = self.lower_expr(lhs);
         let lhs_ptr_val = self.operand_to_value(lhs_ptr);
 
+        // Packed whole-object copy (`vector_simd.rs`); total fallback below.
+        if self.try_lower_vector_assign_simd(lhs, lhs_ptr_val, rhs, lhs_ct) {
+            return Operand::Value(lhs_ptr_val);
+        }
+
         // Check if the RHS is a function call returning a small vector in a register.
         // Small vectors (<=8 bytes) are returned as packed I64 values, not pointers.
         let rhs_is_small_vec_call = self.rhs_is_small_vector_call(rhs, total_size);
@@ -1526,6 +1531,9 @@ impl Lowerer {
             Some((elem_ct, num_elems)) => (elem_ct.clone(), num_elems),
             None => return Operand::Const(IrConst::I64(0)),
         };
+        if let Some(packed) = self.try_lower_vector_compound_assign_simd(op, lhs, rhs, lhs_ct) {
+            return packed;
+        }
         let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
         let is_unsigned = elem_ct.is_unsigned();
         let ir_op = Self::binop_to_ir(*op, is_unsigned);
@@ -1588,6 +1596,11 @@ impl Lowerer {
             Some((elem_ct, num_elems)) => (elem_ct.clone(), num_elems),
             None => return Operand::Const(IrConst::I64(0)),
         };
+        // Whole-vector form first (see `vector_simd.rs`); the lane loop
+        // below is the exact fallback for every shape it declines.
+        if let Some(packed) = self.try_lower_vector_binary_simd(op, lhs, rhs, vec_ct) {
+            return packed;
+        }
         let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
         let total_size = vec_ct.size();
         let result_align = self.ctype_align(vec_ct);
@@ -1694,6 +1707,9 @@ impl Lowerer {
             Some((elem_ct, num_elems)) => (elem_ct.clone(), num_elems),
             None => return Operand::Const(IrConst::I64(0)),
         };
+        if let Some(packed) = self.try_lower_vector_cmp_simd(op, lhs, rhs, vec_ct) {
+            return packed;
+        }
         let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
         let total_size = vec_ct.size();
         let result_alloca =
@@ -1807,6 +1823,9 @@ impl Lowerer {
             Some((elem_ct, num_elems)) => (elem_ct.clone(), num_elems),
             None => return Operand::Const(IrConst::I64(0)),
         };
+        if let Some(packed) = self.try_lower_vector_unary_simd(ir_unary, inner, vec_ct) {
+            return packed;
+        }
         let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
         let total_size = vec_ct.size();
         let result_alloca =

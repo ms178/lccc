@@ -443,6 +443,37 @@ pub struct CallAbiConfig {
     pub i386_ext_vector_lanes: bool,
 }
 
+impl CallAbiConfig {
+    /// The x86-64 SysV configuration.  The single source of truth shared by
+    /// `X86Codegen::call_abi_config_impl` (prologue/call emission) and the
+    /// stack-layout dead-parameter-alloca predicate
+    /// (`stack_layout::analysis`): both must classify a vector parameter
+    /// identically, or the layout drops a slot the prologue still stores to.
+    pub fn sysv_x86_64() -> CallAbiConfig {
+        CallAbiConfig {
+            max_int_regs: 6,
+            max_float_regs: 8,
+            align_i128_pairs: false,
+            f128_in_fp_regs: false,
+            f128_in_gp_pairs: false,
+            variadic_floats_in_gp: false,
+            large_struct_by_ref: false,
+            use_sysv_struct_classification: true,
+            use_riscv_float_struct_classification: false,
+            allow_struct_split_reg_stack: false,
+            align_struct_pairs: false,
+            sret_uses_dedicated_reg: false,
+            gcc_regparm_mode: false,
+            // GCC >= 4.6 honors the full natural alignment of MEMORY-class
+            // stack arguments (SysV AMD64); the >16 case is completed by the
+            // caller's dynamic %rsp realignment (emit_call_stack_args_impl).
+            stack_arg_align_cap: usize::MAX,
+            vector_xmm_regs: 0,
+            i386_ext_vector_lanes: false,
+        }
+    }
+}
+
 /// Result of SysV per-eightbyte struct classification.
 /// Describes how a small struct (<=16 bytes) should be passed in registers.
 #[derive(Debug, Clone, Copy)]
@@ -1735,24 +1766,7 @@ mod tests {
 
     /// The x86-64 SysV configuration (`X86Codegen::call_abi_config_impl`).
     fn sysv_x86_64() -> CallAbiConfig {
-        CallAbiConfig {
-            max_int_regs: 6,
-            max_float_regs: 8,
-            align_i128_pairs: false,
-            f128_in_fp_regs: false,
-            f128_in_gp_pairs: false,
-            variadic_floats_in_gp: false,
-            large_struct_by_ref: false,
-            use_sysv_struct_classification: true,
-            use_riscv_float_struct_classification: false,
-            allow_struct_split_reg_stack: false,
-            align_struct_pairs: false,
-            sret_uses_dedicated_reg: false,
-            gcc_regparm_mode: false,
-            stack_arg_align_cap: usize::MAX,
-            vector_xmm_regs: 0,
-            i386_ext_vector_lanes: false,
-        }
+        CallAbiConfig::sysv_x86_64()
     }
 
     /// The i686 `-mregparm=3` configuration (`I686Codegen::call_abi_config_impl`).

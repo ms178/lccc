@@ -175,7 +175,45 @@ pub(super) fn find_dead_param_allocas(
         }
     }
 
+    // Vector parameters read through one entry-prefix VecLoad whose dest
+    // has an XMM home: the x86 prologue moves the incoming register straight
+    // into that home (`emit_store_params_impl`, same predicate), so the
+    // alloca is never written or read.
+    // The predicate is the prologue's, term for term: (1) the helper hit,
+    // (2) the load dest has an XMM home, (3) the parameter is passed in an
+    // XMM register of exactly the vector's size (`ParamClass::F128SseReg`).
+    // A 32-byte vector below the AVX ABI level (or any vector past the
+    // eighth XMM) arrives in MEMORY: the prologue captures it through the
+    // slot, so the slot must stay.
+    let vector_direct = if crate::common::types::target_elf_machine() == 62 {
+        super::regalloc_helpers::x86_vector_param_loads(func)
+    } else {
+        Vec::new()
+    };
+    let x86_param_classes = if vector_direct.iter().any(Option::is_some) {
+        crate::backend::call_abi::classify_params(
+            func,
+            &crate::backend::call_abi::CallAbiConfig::sysv_x86_64(),
+        )
+    } else {
+        Vec::new()
+    };
     for (idx, pv) in func.param_alloca_values.iter().enumerate() {
+        if let Some(Some((dest, bytes))) = vector_direct.get(idx) {
+            let in_xmm = matches!(
+                x86_param_classes.get(idx),
+                Some(crate::backend::call_abi::ParamClass::F128SseReg { size, .. })
+                    if *size == *bytes && matches!(*size, 16 | 32)
+            );
+            if in_xmm
+                && reg_assigned
+                    .get(&dest.0)
+                    .is_some_and(|phys| (20..=33).contains(&phys.0))
+            {
+                dead.insert(pv.0);
+                continue;
+            }
+        }
         if !used_values.contains(&pv.0) {
             match paramref_dests.get(idx).copied().flatten() {
                 Some(dest_id) => {

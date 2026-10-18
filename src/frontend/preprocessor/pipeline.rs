@@ -968,7 +968,19 @@ impl Preprocessor {
 
     /// Define a macro from a command-line -D flag.
     /// Takes a name and value (e.g., name="FOO", value="1").
+    ///
+    /// `-D name(args)=body` is a function-like definition: GCC processes the
+    /// `-D` text "as if it appeared in a `#define` directive", so
+    /// `-D'P(x)=L_##x'` defines the two-token-pasting macro `P`, not an
+    /// object-like macro literally named `P(x)` (which could never be
+    /// invoked and left every `P(...)` in the source unexpanded).
     pub fn define_macro(&mut self, name: &str, value: &str) {
+        if name.contains('(') {
+            if let Some(def) = parse_define(&format!("{name} {value}")) {
+                self.macros.define(def);
+                return;
+            }
+        }
         self.macros.define(MacroDef {
             name: name.to_string(),
             is_function_like: false,
@@ -1520,5 +1532,51 @@ mod line_resolver_share_tests {
             out.contains("int line = 5;"),
             "__LINE__ after splice+comment must be physical 5, got:\n{out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod define_macro_tests {
+    use super::*;
+
+    /// `-D'NAME(args)=body'` is a FUNCTION-LIKE definition (GCC: "processed
+    /// as if it appeared in a `#define` directive").  The driver splits the
+    /// flag text at the first `=`, so `define_macro` receives the parameter
+    /// list inside `name`.  Before the fix it defined an object-like macro
+    /// literally named `P(x)`, which nothing can invoke, and every `P(...)`
+    /// in the source reached the parser unexpanded.
+    #[test]
+    fn dash_d_function_like_macro_expands_with_token_pasting() {
+        let mut pp = Preprocessor::new();
+        pp.set_filename("d.c");
+        pp.define_macro("P(x)", "L_##x");
+        pp.define_macro("ADD(a,b)", "((a)+(b))");
+        let out = pp.preprocess("int P(foo) = ADD(1, 2);\n");
+        assert!(
+            out.contains("int L_foo = ((1)+(2));"),
+            "function-like -D macro must expand and paste, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dash_d_variadic_function_like_macro() {
+        let mut pp = Preprocessor::new();
+        pp.set_filename("d.c");
+        pp.define_macro("LOG(fmt,...)", "printf(fmt, __VA_ARGS__)");
+        let out = pp.preprocess("LOG(\"%d\", 1);\n");
+        assert!(out.contains("printf(\"%d\", 1);"), "got:\n{out}");
+    }
+
+    /// Object-like `-D` definitions are unchanged, including the GCC
+    /// `-DNAME` (no `=`) spelling the driver turns into value `1`, and a
+    /// value that itself contains parentheses.
+    #[test]
+    fn dash_d_object_like_macro_unchanged() {
+        let mut pp = Preprocessor::new();
+        pp.set_filename("d.c");
+        pp.define_macro("FLAG", "1");
+        pp.define_macro("EXPR", "(2*3)");
+        let out = pp.preprocess("int a = FLAG, b = EXPR;\n");
+        assert!(out.contains("int a = 1, b = (2*3);"), "got:\n{out}");
     }
 }

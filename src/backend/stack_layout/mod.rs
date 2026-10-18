@@ -49,7 +49,7 @@ pub use inline_asm::{
 };
 pub use regalloc_helpers::{
     filter_available_regs, find_param_alloca, run_regalloc_and_merge_clobbers,
-    run_regalloc_and_merge_clobbers_ex,
+    run_regalloc_and_merge_clobbers_ex, x86_vector_param_loads,
 };
 pub use slot_census::{build_slot_census, emit_slot_census, slot_census_enabled};
 
@@ -106,13 +106,6 @@ struct StackLayoutContext {
     used_values: FxHashSet<u32>,
     /// Dead parameter allocas (unused params, skip slot allocation).
     dead_param_allocas: FxHashSet<u32>,
-    /// ABI alignment of each struct/union parameter alloca (value id ->
-    /// alignment), taken from the authoritative `IrParam.struct_align`. Used to
-    /// recover over-aligned (>16) parameter allocas whose `Alloca.align` was
-    /// dropped by a later pass — the slot must still honor the param's declared
-    /// `_Alignas(32)` etc. so `&s` (and vector accesses on the param) are
-    /// correctly aligned.
-    param_aligns: FxHashMap<u32, usize>,
     /// Alloca coalescing analysis results.
     coalescable_allocas: CoalescableAllocas,
     /// Values that are produced and immediately consumed by the next instruction,
@@ -716,19 +709,6 @@ fn build_layout_context(
         ra_config,
     );
 
-    // Authoritative ABI alignment of parameter allocas (the Alloca.align may
-    // have been dropped by a pass; IrParam.struct_align / IrParam.param_align
-    // are not). struct_align covers struct/union params; param_align covers
-    // typedef-aligned scalar params (`aligned(32) int` parameter types).
-    // `param_alloca_values` and `params` are index-aligned (both include the
-    // sret pointer at index 0 when present).
-    let param_aligns: FxHashMap<u32, usize> = func
-        .params
-        .iter()
-        .zip(func.param_alloca_values.iter())
-        .filter_map(|(p, v)| p.param_align.or(p.struct_align).map(|a| (v.0, a)))
-        .collect();
-
     // Alloca coalescability analysis.
     let coalescable_allocas = if coalesce {
         alloca_coalescing::compute_coalescable_allocas(
@@ -946,7 +926,6 @@ fn build_layout_context(
         loop_phi_aliases,
         used_values,
         dead_param_allocas,
-        param_aligns,
         coalescable_allocas,
         immediately_consumed,
         vector_defer_values,

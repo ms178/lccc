@@ -973,6 +973,15 @@ impl Lowerer {
         let else_ct = self.expr_ctype(else_expr);
         let result_is_complex = then_ct.is_complex() || else_ct.is_complex();
 
+        // Packed vector arms (`vector_simd.rs`): one merge object, no
+        // pointer phi + Memcpy.  Total fallback when the shape is not packable.
+        if then_ct.is_vector() && else_ct.is_vector() {
+            if let Some(result) = self.try_lower_vector_conditional_simd(cond, then_expr, else_expr)
+            {
+                return result;
+            }
+        }
+
         // C23 decimals: both arms convert to the UAC common type through the
         // libbid helpers (raw IR casts would emit binary conversions on BID
         // carriers). Mirrors the complex path below, including dead-branch

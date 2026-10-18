@@ -387,6 +387,13 @@ gate "designator-init" fast \
 gate "vector-static-init" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_vector_static_init.sh
 
+# GNU vector-extension whole-vector lowering: 236-function matrix run
+# against GCC 16.2 at nine ISA/opt levels (bit-exact results, cross-compiler
+# psABI link both ways) plus per-function instruction ceilings at
+# -O2 -mavx2 (`add8` 2, GCC parity; it was 37).
+gate "vector-ext-codegen" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_vector_ext_codegen.sh
+
 # `void` objects, members, parameters and initializers (C11 6.7.6.3p10,
 # 6.7.9p3): every row's verdict and message against GCC 16.2.
 gate "void-declarators" fast \
@@ -480,7 +487,7 @@ gate "vector-arg-forms" fast \
 # -mavx512f (host permitting), none, -mno-avx}: every binary's output must
 # equal gcc/gcc's.
 gate "vector-abi-wide" fast \
-    env CCC="$LCCC" bash tests/regression/check_vector_abi_wide.sh
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_vector_abi_wide.sh
 
 # ABI-EXTVEC-VA-1 and its `vector_size` twin: a vector type's alignment is its
 # size (GCC `layout_type`), which fixes struct layout, object alignment and
