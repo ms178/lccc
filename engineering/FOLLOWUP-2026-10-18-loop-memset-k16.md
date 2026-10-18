@@ -91,6 +91,28 @@ was untouched by them.
   loops not yet weight-diffed against gcc-16.2.0 (k13/k18 verified par).
 - **F6 still queued**: f32×1 `vector_size(4)` into the abi-grid fixture
   (the SysV MEMORY decision is committed; the grid fixture leg is not).
+
+## 6. Correction — the ext_vector_type f32x1 "float twin" arm was wrong
+
+The grid lane caught it after the merge un-skipped the step: my
+AUD-VABI-4 change gave `ext_vector_type(1)` float returns an SSE arm
+("twin of f64x1"), validated only against GCC 16.2.0 — which IGNORES
+`ext_vector_type` and therefore is no oracle for that spelling. The
+pinned Clang 23.1.3 ext_vector_abi_grid (exact expectations, all four
+link directions, green on main through many runs) returns ext f32x1
+through the INTEGER eightbyte (%eax/%rax bit pattern, like u32x1),
+while ext f64x1 really is %xmm0. Fixed in three places, all keyed on
+the oracle: classify_return lost the Float arm (main's classifier
+restored, with the false-analogy story recorded in a comment);
+`sysv_vector_carrier` (indirect convention) now maps only the 8-byte
+ext FP vector to SSE and lets the 4-byte one fall through to INTEGER;
+`func_return_ir_type` demotes per spelling (ext f64x1 → F64, ext f32x1
+→ I32, vector_size one-lane FP → Ptr/sret-address). Receipts:
+one-lane gate PASS at -O0/-O1/-O2 (the fptr seam `as_f(fp(fx))` was
+the repro), 5154 lib tests, varargs gate PASS, gcc-16 vector_size
+V1SF/V1DF spot matrix MATCH, clippy/fmt/census clean. Lesson recorded:
+never infer an ext_vector_type convention from GCC evidence — only the
+Clang grid speaks for that attribute.
 - **debs-bookworm.tar.xz + mold-2.42.1 + qemu (harness-cache-3) still
   packed** in the toolchain cache — unpacking closes the i686 env gaps
   (8 of the 9 corpus fails are i686-multilib).

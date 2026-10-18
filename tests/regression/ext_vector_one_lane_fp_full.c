@@ -1,6 +1,7 @@
-// AUD-VABI-4 exhaustive regression: one-lane FP vectors (f32x1/f64x1)
-// return/pass in xmm0 without GPR bounce; arithmetic, fptrs, volatile,
-// memcpy, NaN/Inf/subnormal chains all work at O0/O1/O2.
+// AUD-VABI-4 exhaustive regression: one-lane FP vectors (f64x1 in xmm0,
+// f32x1 in the INTEGER eightbyte, per the pinned Clang 23.1.3 grid);
+// arithmetic, fptrs, volatile, memcpy, NaN/Inf/subnormal chains all work
+// at O0/O1/O2 with one convention per shape end to end.
 #include <stdio.h>
 #include <string.h>
 typedef double double1 __attribute__((ext_vector_type(1)));

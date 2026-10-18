@@ -177,27 +177,23 @@ pub fn classify_return(ty: &CType, ctx: &dyn StructLayoutProvider) -> Option<Sys
         if layout.lanes == 1 && matches!(**elem, CType::Double) {
             return Some(SysvPassing::Regs(vec![EightbyteClass::Sse]));
         }
-        // The float twin: a one-lane `float` ext vector comes back as the
-        // scalar in the low half of %xmm0, exactly like f64x1 (same-compiler
-        // GCC 16 / Clang codegen, pinned end to end by
-        // `check_ext_vector_one_lane_fp.sh`). Classified INTEGER here, the
-        // callee returned the bits in %rax while the indirect-call carrier
-        // (and both oracles) say %xmm0 — a cross-TU ABI seam.
-        if layout.lanes == 1 && matches!(**elem, CType::Float) {
-            return Some(SysvPassing::Regs(vec![EightbyteClass::Sse]));
-        }
         // 256 bits is MEMORY without AVX, but a vector is not an aggregate
         // for Clang's ABI code, so the return goes "direct" to LLVM, which
         // scalarizes `<2 x x86_fp80>` into the x87 register pair.
         if layout.lanes == 2 && matches!(**elem, CType::LongDouble) {
             return Some(SysvPassing::X87Pair);
         }
+        // A one-lane FLOAT ext vector deliberately has NO special arm: the
+        // pinned Clang 23.1.3 oracle (the ext_vector_abi_grid, exact-
+        // expectations, green on the pinned release through many runs)
+        // returns it through the INTEGER eightbyte — `%eax`/`%rax` carries
+        // the bit pattern, exactly like a `u32x1`/`u64x1`. The "float twin
+        // of f64x1" analogy was validated only against GCC 16.2.0, which
+        // IGNORES `ext_vector_type` entirely and therefore compiles a plain
+        // `float` — no oracle for this spelling. The `vector_size` spelling
+        // of the one-lane FP shapes IS answered by `classify` below: GCC
+        // 16.2.0 measured V1SF/V1DF as MEMORY (BLKmode, hidden sret).
     }
-    // The `vector_size` spelling of the one-lane FP shapes is answered by
-    // `classify` itself: GCC 16.2.0 measured V1SF/V1DF as MEMORY (sret), so
-    // no return-position departure exists there — see the arm in `classify`.
-    // The `ext_vector_type` spellings follow Clang (the only oracle that
-    // accepts the attribute) and keep their SSE return arms.
     classify(ty, ctx)
 }
 

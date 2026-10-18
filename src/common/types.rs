@@ -2407,25 +2407,30 @@ impl CType {
                 _ => None,
             };
         }
-        // A ONE-element floating-point vector is SysV-SSE in the
-        // `ext_vector_type` spelling: it travels in the low half of ONE xmm
-        // register exactly like the scalar element, matching Clang's
-        // same-compiler codegen (the gate asserts the -O1 chained-call shape
-        // end to end). The legacy INTEGER carrier here was doubly wrong: it
-        // diverged from both oracles, and the backend's missing
-        // packed-result spill made `dadd(did(x), dadd(y, y))` segfault at
-        // -O1.  32-bit targets never reach this classifier (their ext
-        // vectors use the GP-word path).  The `vector_size` spelling returns
-        // None: GCC 16.2.0 measured V1SF/V1DF as MEMORY (stack argument,
-        // sret return), and the indirect convention must equal the direct
-        // one — `classify` answers SysvPassing::Memory for those types, so
-        // the sret path is taken.
+        // ONE-element floating-point vectors, per oracle, per spelling:
+        //   - `vector_size`: None — GCC 16.2.0 measured V1SF/V1DF as MEMORY
+        //     (stack argument, sret return), and the indirect convention
+        //     must equal the direct one — `classify` answers
+        //     SysvPassing::Memory for those types, so the sret path is
+        //     taken.
+        //   - `ext_vector_type` double: SSE — the pinned Clang 23.1.3
+        //     returns it in the low half of %xmm0 (the gate asserts the
+        //     -O1 chained-call shape end to end; the backend's packed-result
+        //     spill fix keeps `dadd(did(x), dadd(y, y))` alive at -O1).
+        //   - `ext_vector_type` float: falls through to the `1..=4` INTEGER
+        //     arm below — the pinned Clang 23.1.3 ext_vector_abi_grid
+        //     (exact expectations, all four link directions) returns it as
+        //     INTEGER bits in %eax/%rax, like u32x1. The "scalar in xmm0"
+        //     reading came from GCC 16 evidence, and GCC 16 does not accept
+        //     the attribute at all — no oracle for this spelling.
+        // 32-bit targets never reach this classifier (their ext vectors use
+        // the GP-word path).
         if self.elem_is_fp_scalar() {
             if matches!(self, CType::Vector(_, _)) {
                 return None;
             }
             return match self.size() {
-                4 | 8 => Some((vec![EightbyteClass::Sse], false)),
+                8 => Some((vec![EightbyteClass::Sse], false)),
                 _ => None,
             };
         }

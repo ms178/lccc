@@ -2203,18 +2203,29 @@ impl Lowerer {
             // This case shouldn't normally be reached for sret calls, but return Ptr
             // as a safe default matching the hidden pointer convention.
             CType::Struct(_) | CType::Union(_) if is_32bit => IrType::Ptr,
-            // AUD-VABI-4: a ONE-LANE FP vector returns as the SCALAR F32/F64
-            // directly — matching the callee's IR return carrier in
-            // `register_function_sig`. Before this, a vector return kept the
-            // Ptr carrier that `from_ctype` assigns; the caller then fell
+            // AUD-VABI-4: a ONE-LANE FP vector's indirect-call IR carrier,
+            // per spelling, exactly as the pinned oracles measure them:
+            //   - `ext_vector_type` double: SSE, %xmm0 (Clang 23.1.3 grid)
+            //     → F64.
+            //   - `ext_vector_type` float: INTEGER bit pattern in
+            //     %eax/%rax (the same grid; the scalar F32 demotion made
+            //     the indirect caller read %xmm0 against an INTEGER callee
+            //     — the fptr seam the one-lane fixtures caught at -O1).
+            //   - `vector_size` V1SF/V1DF: MEMORY both ways (GCC 16.2.0),
+            //     the call is sret and yields the buffer ADDRESS, like the
+            //     direct-call signature carrier.
+            // Before this arm existed at all, a vector return kept the Ptr
+            // carrier that `from_ctype` assigns; the caller then fell
             // through to the pointer-return path (store %rax) while the
             // callee wrote %xmm0, and the result was read as garbage.
             other if !is_32bit && other.is_vector() && other.elem_is_fp_scalar() => {
                 // No unwrap: `vector_info` is Some for every vector shape,
                 // but the census ratchet counts panic sites — stay None-safe.
+                let is_ext = matches!(other, CType::ExtVector(..));
                 match other.vector_info().map(|(e, _)| e.size()) {
-                    Some(4) => IrType::F32,
-                    Some(8) => IrType::F64,
+                    Some(8) if is_ext => IrType::F64,
+                    Some(4) if is_ext => IrType::I32,
+                    Some(_) if !is_ext => IrType::Ptr,
                     _ => IrType::I64,
                 }
             }

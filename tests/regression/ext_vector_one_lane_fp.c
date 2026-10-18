@@ -1,9 +1,11 @@
-// AUD-VABI-4: one-lane floating-point ext_vector_type returns travel in the
-// low half of %xmm0 on x86-64 (matching scalar f32/f64 returns, Clang, and
-// GCC).  Earlier LCCC builds carried a ONE-element double vector in %rax via
-// the INTEGER eightbyte class, which broke lccc->lccc at -O1 (the callee
+// AUD-VABI-4: one-lane ext_vector_type ABI per the pinned oracles — the
+// DOUBLE vector returns in the low half of %xmm0 (Clang 23.1.3 measured),
+// while the FLOAT vector returns through the INTEGER eightbyte (%rax bit
+// pattern), also Clang 23.1.3-measured via the exact-expectation ABI grid.
+// Earlier LCCC builds carried the ONE-element double vector in %rax via the
+// INTEGER eightbyte class, which broke lccc->lccc at -O1 (the callee
 // materialised a `vaddsd` into %xmm2 and emitted no movq into %rax) and
-// diverged from the oracles' same-compiler codegen.  This gate exercises the
+// diverged from the oracle's same-compiler codegen.  This gate exercises the
 // return register at -O0/-O1/-O2, chain-calls a returned vector into another
 // function (which forced an IR-lowering fix: packed-vector results had to be
 // spilled to a temp before being passed as a struct-by-value SSE argument),
