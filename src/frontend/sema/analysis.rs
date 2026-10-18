@@ -24,13 +24,14 @@ use crate::common::symbol_table::{FoldedValue, Symbol, SymbolTable};
 use crate::common::type_builder;
 use crate::common::type_builder::TypeConvertContext;
 use crate::common::types::{
-    AddressSpace, CType, ExtVectorLayout, FunctionType, RcLayout, StructFieldLayout, StructLayout,
+    AddressSpace, CType, ExtVectorLayout, ExtVectorSelectorError, FunctionType, RcLayout,
+    StructFieldLayout, StructLayout,
 };
 use crate::frontend::parser::ast::{
     BinOp, BlockItem, CompoundStmt, Declaration, DerivedDeclarator, Designator, EnumVariant, Expr,
     ExprId, ExternalDecl, ForInit, FunctionDef, GenericAssociation, InitDeclarator, Initializer,
-    InitializerItem, ParamDecl, SizeofArg, StaticAssert, Stmt, StructFieldDecl, TranslationUnit,
-    TypeSpecifier,
+    InitializerItem, ParamDecl, PostfixOp, SizeofArg, StaticAssert, Stmt, StructFieldDecl,
+    TranslationUnit, TypeSpecifier, UnaryOp,
 };
 use crate::frontend::sema::builtins;
 use crate::frontend::sema::intrinsic_arity;
@@ -2659,15 +2660,22 @@ impl SemanticAnalyzer {
                 }
                 self.check_pointer_comparison_spaces(op, lhs, rhs, *span);
             }
-            Expr::UnaryOp(_, operand, _) => {
+            Expr::UnaryOp(op, operand, span) => {
                 self.analyze_expr(operand);
+                if matches!(op, UnaryOp::PreInc | UnaryOp::PreDec) {
+                    self.check_ext_vector_assignable(operand, *span);
+                    self.check_ext_vector_step(operand, *op == UnaryOp::PreInc, *span);
+                }
             }
-            Expr::PostfixOp(_, operand, _) => {
+            Expr::PostfixOp(op, operand, span) => {
                 self.analyze_expr(operand);
+                self.check_ext_vector_assignable(operand, *span);
+                self.check_ext_vector_step(operand, *op == PostfixOp::PostInc, *span);
             }
             Expr::Assign(lhs, rhs, span) => {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
+                self.check_ext_vector_assignable(lhs, *span);
                 // Check for invalid pointer <-> float conversions in assignment
                 let checker = super::type_checker::ExprTypeChecker {
                     symbols: &self.symbol_table,
@@ -2690,9 +2698,10 @@ impl SemanticAnalyzer {
                     );
                 }
             }
-            Expr::CompoundAssign(_, lhs, rhs, _) => {
+            Expr::CompoundAssign(_, lhs, rhs, span) => {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
+                self.check_ext_vector_assignable(lhs, *span);
             }
             Expr::Conditional(cond, then_expr, else_expr, span) => {
                 self.analyze_expr(cond);
@@ -2778,8 +2787,9 @@ impl SemanticAnalyzer {
             Expr::AlignofExpr(inner, _) | Expr::GnuAlignofExpr(inner, _) => {
                 self.analyze_expr(inner);
             }
-            Expr::AddressOf(inner, _) => {
+            Expr::AddressOf(inner, span) => {
                 self.analyze_expr(inner);
+                self.check_address_of_vector_element(inner, *span);
             }
             Expr::Deref(inner, _) => {
                 self.analyze_expr(inner);
@@ -2961,6 +2971,123 @@ impl SemanticAnalyzer {
         self.diagnostics.borrow_mut().error(message, span);
     }
 
+    /// The type of the object a member access names the member of: the
+    /// type of `base_expr` for `.`, its pointee for `->`.
+    /// An expression type checker over this analyzer's current state.
+    fn expr_checker(&self) -> super::type_checker::ExprTypeChecker<'_> {
+        super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
+        }
+    }
+
+    fn member_base_ctype(&self, base_expr: &Expr, is_pointer: bool) -> Option<CType> {
+        let base_ctype = self.expr_checker().infer_expr_ctype(base_expr)?;
+        if !is_pointer {
+            return Some(base_ctype);
+        }
+        match base_ctype {
+            CType::Pointer(inner, _) | CType::Array(inner, _) => Some(*inner),
+            _ => None,
+        }
+    }
+
+    /// The ext vector and selector of `expr` when it is an ext-vector
+    /// element selection (`v.x`, `p->zy`, `v.wzyx.xy`).
+    fn ext_vector_selection_of<'e>(&self, expr: &'e Expr) -> Option<(&'e Expr, &'e str, CType)> {
+        let (base, field, is_pointer) = match expr {
+            Expr::MemberAccess(b, f, _) => (&**b, f.as_str(), false),
+            Expr::PointerMemberAccess(b, f, _) => (&**b, f.as_str(), true),
+            _ => return None,
+        };
+        let vector = self.member_base_ctype(base, is_pointer)?;
+        matches!(vector, CType::ExtVector(..)).then_some((base, field, vector))
+    }
+
+    /// Clang: an ext-vector element selection that repeats a lane is not
+    /// assignable, at any level of a nested selection (`v.xx.y`, and
+    /// `v.xxyy.yz` although the composed lanes 0 and 1 differ). A
+    /// selection through `->` ends the chain: its base is a pointer.
+    fn ext_vector_selection_has_duplicate_lanes(&self, expr: &Expr) -> bool {
+        let mut cur = expr;
+        while let Some((base, field, vector)) = self.ext_vector_selection_of(cur) {
+            if let Some(lanes) = vector.ext_vector_swizzle(field) {
+                if lanes
+                    .iter()
+                    .enumerate()
+                    .any(|(i, l)| lanes[..i].contains(l))
+                {
+                    return true;
+                }
+            }
+            if matches!(cur, Expr::PointerMemberAccess(..)) {
+                break;
+            }
+            cur = base;
+        }
+        false
+    }
+
+    /// The operand of `=`, a compound assignment, `++` or `--`: report an
+    /// ext-vector selection with a repeated lane at the operator, with
+    /// Clang 23.1.3's message.
+    fn check_ext_vector_assignable(&self, target: &Expr, op_span: Span) {
+        if self.ext_vector_selection_has_duplicate_lanes(target) {
+            self.diagnostics.borrow_mut().error(
+                "vector is not assignable (contains duplicate components)",
+                op_span,
+            );
+        }
+    }
+
+    /// `++`/`--` on an ext vector, whole or a multi-lane selection: Clang
+    /// 23.1.3 has no vector increment in C ("cannot increment value of type
+    /// ..."), at the operator. One lane is a scalar and steps normally. A
+    /// GNU `vector_size` operand keeps GCC's element-wise `v++`.
+    fn check_ext_vector_step(&self, operand: &Expr, increment: bool, op_span: Span) {
+        let Some(ct @ CType::ExtVector(..)) = self.expr_checker().infer_expr_ctype(operand) else {
+            return;
+        };
+        let Some((elem, lanes)) = ct.vector_info() else {
+            return;
+        };
+        let verb = if increment { "increment" } else { "decrement" };
+        let plural = if lanes == 1 { "" } else { "s" };
+        self.diagnostics.borrow_mut().error(
+            format!(
+                "cannot {verb} value of type '{ct}' (vector of {lanes} '{elem}' value{plural})"
+            ),
+            op_span,
+        );
+    }
+
+    /// `&v.x`, `&p->zy`, `&v[i]` on a Clang ext vector: Clang 23.1.3 says
+    /// "address of vector element requested" (an element has no address of
+    /// its own: `_Bool` lanes are bits, `long double` lanes are 10 bytes
+    /// apart). GNU `vector_size` subscripts keep GCC's rule, which allows
+    /// `&v[i]`.
+    fn check_address_of_vector_element(&self, operand: &Expr, op_span: Span) {
+        let is_ext_vector = |e: &Expr| {
+            self.member_base_ctype(e, false)
+                .is_some_and(|ct| matches!(ct, CType::ExtVector(..)))
+        };
+        let element = match operand {
+            Expr::MemberAccess(..) | Expr::PointerMemberAccess(..) => {
+                self.ext_vector_selection_of(operand).is_some()
+            }
+            Expr::ArraySubscript(a, b, _) => is_ext_vector(a) || is_ext_vector(b),
+            _ => false,
+        };
+        if element {
+            self.diagnostics
+                .borrow_mut()
+                .error("address of vector element requested", op_span);
+        }
+    }
+
     fn check_member_exists(
         &self,
         base_expr: &Expr,
@@ -2968,26 +3095,7 @@ impl SemanticAnalyzer {
         span: Span,
         is_pointer: bool,
     ) {
-        let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        };
-
-        // Get the base type, dereferencing for pointer member access (->)
-        let base_ctype = if is_pointer {
-            match checker.infer_expr_ctype(base_expr) {
-                Some(CType::Pointer(inner, _)) => Some(*inner),
-                Some(CType::Array(inner, _)) => Some(*inner),
-                _ => None,
-            }
-        } else {
-            checker.infer_expr_ctype(base_expr)
-        };
-
-        let base_ctype = match base_ctype {
+        let base_ctype = match self.member_base_ctype(base_expr, is_pointer) {
             Some(ct) => ct,
             None => return, // Can't determine base type; skip check
         };
@@ -2995,23 +3103,30 @@ impl SemanticAnalyzer {
         let key = match &base_ctype {
             CType::Struct(key) | CType::Union(key) => key.clone(),
             CType::ExtVector(..) => {
-                // Clang ext-vector component access (`v.x`, `v.xyzw`, `v.s0`,
+                // Clang ext-vector element selection (`v.x`, `v.xyzw`, `v.s0`,
                 // `v.lo`): validate the spelling here so a typo or an
                 // out-of-range component is an error, not offset-0 garbage.
-                if base_ctype.ext_vector_swizzle(field_name).is_none() {
-                    let lanes = base_ctype.vector_info().map_or(0, |(_, n)| n);
-                    let msg =
-                        if crate::common::types::ext_vector_component_indices(field_name, lanes)
-                            .is_some()
-                        {
-                            format!(
-                                "vector component access '{}' exceeds type '{}' ({} lanes)",
-                                field_name, base_ctype, lanes
-                            )
-                        } else {
-                            format!("illegal vector component name '{}'", field_name)
-                        };
-                    self.diagnostics.borrow_mut().error(msg, span);
+                // Clang 23.1.3 carets an illegal component one byte past the
+                // operator's first byte plus the component's byte index
+                // (`p  ->  zyq` and `v.xyq` both point at the `q` that way),
+                // and an out-of-range access at the operator.
+                if let Some(Err(err)) = base_ctype.ext_vector_selection(field_name) {
+                    let at = match &err {
+                        ExtVectorSelectorError::IllegalName(range) => {
+                            let offset = u32::try_from(range.start).unwrap_or(u32::MAX);
+                            let len = u32::try_from(range.len().max(1)).unwrap_or(1);
+                            let start = span.start.saturating_add(1).saturating_add(offset);
+                            Span {
+                                start,
+                                end: start.saturating_add(len),
+                                file_id: span.file_id,
+                            }
+                        }
+                        ExtVectorSelectorError::ExceedsType => span,
+                    };
+                    self.diagnostics
+                        .borrow_mut()
+                        .error(err.message(field_name, &base_ctype), at);
                 }
                 return;
             }

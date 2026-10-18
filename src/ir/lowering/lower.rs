@@ -102,10 +102,12 @@ pub struct Lowerer {
     /// `_Bool` lane reads route through it for the byte/bit address)
     /// and must not trip the diagnostic.
     pub(super) lvalue_for_mutation: bool,
-    /// Set while lowering an `Expr::Assign` whose value is discarded
-    /// (expression statement, for-increment): a swizzle assignment then
-    /// skips materialising its result vector. Captured at the start of
-    /// `try_lower_swizzle_assign`; any nested `lower_expr` clears it.
+    /// Set while lowering an `Expr::Assign` or `Expr::CompoundAssign` whose
+    /// value is discarded (expression statement, for-increment): a
+    /// multi-lane ext-vector selection target then skips materialising its
+    /// result vector. Captured at the start of `try_lower_swizzle_assign`
+    /// and `lower_ext_vector_selection_compound_assign`; any nested
+    /// `lower_expr` clears it.
     pub(super) discard_assign_result: bool,
     /// Set of function names that have at least one file-scope declaration
     /// without the `inline` specifier OR with `extern`. Per C99 6.7.4p7,

@@ -259,7 +259,8 @@ impl Lowerer {
         ) {
             self.discard_expr_result = false;
         }
-        self.discard_assign_result = saved_discard && matches!(expr, Expr::Assign(..));
+        self.discard_assign_result =
+            saved_discard && matches!(expr, Expr::Assign(..) | Expr::CompoundAssign(..));
         let result = self.lower_expr_inner(expr);
         self.discard_assign_result = false;
         self.discard_expr_result = saved_discard;

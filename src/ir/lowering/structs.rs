@@ -6,6 +6,39 @@ use crate::frontend::parser::ast::{
 use crate::ir::reexports::{Instruction, IrConst, Operand, Value};
 use std::rc::Rc;
 
+/// A Clang ext-vector element selection resolved to its root vector.
+/// Nested selections compose (`v.wzyx.xy` names lanes 3 and 2 of `v`), so
+/// the root is evaluated once and every lane is read or written in place:
+/// a nested selection without a repeated lane is an lvalue, as in Clang
+/// (sema rejects repeated lanes in a target), and no intermediate vector
+/// is materialised.
+pub(super) struct ExtVectorSelection<'e> {
+    /// The innermost base that is not itself a selection (`v`, `p`, `f()`).
+    pub(super) root: &'e Expr,
+    /// `root` points to the vector (`p->...`).
+    pub(super) root_is_pointer: bool,
+    /// The root vector's type.
+    pub(super) vector_ct: CType,
+    /// The selected lanes of the root, in result order. A lane at or past
+    /// the root's logical lane count (a halving selector's padding lane, or
+    /// lane 1 of a one-lane vector, which lies outside the object) reads as
+    /// zero and absorbs stores without touching memory (`load_vector_lane`,
+    /// `store_vector_lane`); Clang reads it as poison.
+    pub(super) lanes: Vec<usize>,
+    /// The selection's type: the element for one lane, else an ext vector.
+    pub(super) result_ct: CType,
+}
+
+impl ExtVectorSelection<'_> {
+    pub(super) fn elem_ct(&self) -> &CType {
+        self.vector_ct.vector_lanes().0
+    }
+
+    pub(super) fn logical_lanes(&self) -> usize {
+        self.vector_ct.vector_lanes().1
+    }
+}
+
 /// Dynamic byte/bit cursor for laying out the part of a struct that follows
 /// a VLA member (GCC's VLA-in-struct extension).
 ///
@@ -1540,6 +1573,84 @@ impl Lowerer {
         };
         let lanes = vec_ct.ext_vector_swizzle(field_name)?;
         Some((vec_ct, lanes))
+    }
+
+    /// The ext-vector element selection `expr` (`v.zx`, `p->hi`,
+    /// `v.wzyx.xy`) resolved to its root vector; `None` for anything else.
+    pub(super) fn ext_vector_selection_expr<'e>(
+        &self,
+        expr: &'e Expr,
+    ) -> Option<ExtVectorSelection<'e>> {
+        match expr {
+            Expr::MemberAccess(b, f, _) => self.ext_vector_selection_parts(b, f, false),
+            Expr::PointerMemberAccess(b, f, _) => self.ext_vector_selection_parts(b, f, true),
+            _ => None,
+        }
+    }
+
+    /// `base.field` / `base->field` as an ext-vector element selection
+    /// resolved to its root vector (see [`ExtVectorSelection`]).
+    pub(super) fn ext_vector_selection_parts<'e>(
+        &self,
+        base_expr: &'e Expr,
+        field_name: &str,
+        is_pointer: bool,
+    ) -> Option<ExtVectorSelection<'e>> {
+        let (vector_ct, lanes) = self.vector_member_lanes(base_expr, field_name, is_pointer)?;
+        let (elem, _) = vector_ct.vector_info()?;
+        let result_ct = CType::ext_vector_selection_ctype(elem, lanes.len())?;
+        if !is_pointer {
+            if let Some(mut inner) = self.ext_vector_selection_expr(base_expr) {
+                // Lane `l` of the inner selection is lane `inner.lanes[l]`
+                // of the root. A halving selector may name the inner
+                // selection's own padding lane, which is no lane of the
+                // root: it maps past the root's logical lanes, where it
+                // reads as zero and absorbs stores like any padding lane.
+                let past = inner.logical_lanes();
+                inner.lanes = lanes
+                    .iter()
+                    .map(|&l| inner.lanes.get(l).copied().unwrap_or(past))
+                    .collect();
+                inner.result_ct = result_ct;
+                return Some(inner);
+            }
+        }
+        Some(ExtVectorSelection {
+            root: base_expr,
+            root_is_pointer: is_pointer,
+            vector_ct,
+            lanes,
+            result_ct,
+        })
+    }
+
+    /// The address space and volatility of the root vector of `sel`.
+    pub(super) fn ext_vector_selection_access(
+        &self,
+        sel: &ExtVectorSelection<'_>,
+    ) -> (AddressSpace, bool) {
+        if sel.root_is_pointer {
+            (
+                self.get_addr_space_of_ptr_expr(sel.root),
+                self.pointee_expr_is_volatile(sel.root),
+            )
+        } else {
+            (
+                self.get_addr_space_of_struct_expr(sel.root),
+                self.expr_access_is_volatile(sel.root),
+            )
+        }
+    }
+
+    /// The address of the root vector of `sel`, evaluating the root (and
+    /// so its side effects: `p++->xy`, `make().zx`) exactly once.
+    pub(super) fn ext_vector_selection_base(&mut self, sel: &ExtVectorSelection<'_>) -> Value {
+        if sel.root_is_pointer {
+            let ptr = self.lower_expr(sel.root);
+            self.operand_to_value(ptr)
+        } else {
+            self.get_struct_base_addr(sel.root)
+        }
     }
 
     /// Resolve member access to get the CType of the field (not just the IrType).

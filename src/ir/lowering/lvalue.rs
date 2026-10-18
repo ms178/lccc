@@ -206,14 +206,14 @@ impl Lowerer {
                     .vector_member_lanes(base_expr, field_name, false)
                     .is_some() =>
             {
-                self.vector_component_lvalue(expr, base_expr, field_name, false, vol)
+                self.vector_component_lvalue(expr, vol)
             }
             Expr::PointerMemberAccess(base_expr, field_name, _)
                 if self
                     .vector_member_lanes(base_expr, field_name, true)
                     .is_some() =>
             {
-                self.vector_component_lvalue(expr, base_expr, field_name, true, vol)
+                self.vector_component_lvalue(expr, vol)
             }
             Expr::MemberAccess(base_expr, field_name, _) => {
                 // s.field as lvalue -> compute address of the field
@@ -607,10 +607,12 @@ impl Lowerer {
         let Some((elem_ct, lanes)) = vector_ct.vector_info() else {
             return Operand::Const(IrConst::I64(0));
         };
-        if lane >= lanes {
-            return Operand::Const(IrConst::I64(0));
-        }
         let elem_ir_ty = IrType::from_ctype(elem_ct);
+        if lane >= lanes {
+            // A padding lane, or one outside the object (`v1.hi`): Clang
+            // reads poison; never touch memory for it.
+            return Operand::Const(IrConst::zero(elem_ir_ty));
+        }
         if vector_ct.is_bitpacked_bool_vector() {
             let byte_ptr = self.vector_lane_byte_addr(base, lane / 8);
             let raw = self.fresh_value();
@@ -754,74 +756,39 @@ impl Lowerer {
         self.vector_lane_byte_addr(base, lane.saturating_mul(stride))
     }
 
-    /// `v.x = ...` / `p->y += ...`: a single ext-vector component is an
-    /// lvalue of the element (a bit for packed `_Bool`, a 10-byte x87 lane
-    /// for `long double`). A multi-component swizzle is not assignable in
-    /// lccc yet; Clang accepts `v.xy = w` -- diagnosed, not miscompiled.
-    fn vector_component_lvalue(
-        &mut self,
-        expr: &Expr,
-        base_expr: &Expr,
-        field_name: &str,
-        is_pointer: bool,
-        vol: bool,
-    ) -> Option<LValue> {
-        let (vec_ct, lanes) = self.vector_member_lanes(base_expr, field_name, is_pointer)?;
-        if lanes.len() != 1 {
+    /// `v.x = ...` / `p->y += ...` / `v.wzyx.xy.x++`: a one-lane ext-vector
+    /// selection is an lvalue of the element (a 10-byte x87 lane for `long
+    /// double`), addressed in its root vector. A multi-lane selection is
+    /// assigned and compound-assigned lane by lane (`try_lower_swizzle_assign`,
+    /// `lower_ext_vector_selection_compound_assign`); it has no address and
+    /// cannot be stepped, so sema rejects every other lvalue use (`&`, `++`).
+    fn vector_component_lvalue(&mut self, expr: &Expr, vol: bool) -> Option<LValue> {
+        let sel = self.ext_vector_selection_expr(expr)?;
+        let [lane] = sel.lanes[..] else {
             self.emit_error(
-                format!(
-                    "assignment to the vector swizzle '.{field_name}' is not supported; \
-                     assign the components one at a time"
-                ),
+                "a multi-component vector element selection has no address",
                 expr.span(),
             );
             return None;
-        }
-        let lane = lanes[0];
-        // `v.lo.x = ...`: the inner swizzle is an rvalue temporary (Clang:
-        // "expression is not assignable"); writing into it would be lost.
-        let inner_swizzle = match base_expr {
-            Expr::MemberAccess(b, f, _) => self.vector_member_lanes(b, f, false),
-            Expr::PointerMemberAccess(b, f, _) => self.vector_member_lanes(b, f, true),
-            _ => None,
         };
-        if inner_swizzle.is_some_and(|(_, l)| l.len() > 1) {
-            self.emit_error("expression is not assignable", expr.span());
-            return None;
+        if lane >= sel.logical_lanes() {
+            // A halving selector's padding lane, or lane 1 of a one-lane
+            // vector (outside the object): evaluate the root for its side
+            // effects; the lane is a zeroed scratch that absorbs stores,
+            // exactly as the lane helpers treat it.
+            self.ext_vector_selection_base(&sel);
+            let elem_ct = sel.elem_ct().clone();
+            let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
+            let size = elem_ct.size().max(elem_ir_ty.size());
+            let align = self.ctype_align(&elem_ct);
+            let scratch = self.emit_entry_alloca(elem_ir_ty, size, align, false);
+            self.zero_init_alloca(scratch, size);
+            return Some(LValue::address(scratch, AddressSpace::Default, false));
         }
-        let addr_space = if is_pointer {
-            self.get_addr_space_of_ptr_expr(base_expr)
-        } else {
-            self.get_addr_space_of_struct_expr(base_expr)
-        };
-        if vec_ct.is_bitpacked_bool_vector() {
-            let base = if is_pointer {
-                let ptr_val = self.lower_expr(base_expr);
-                self.operand_to_value(ptr_val)
-            } else {
-                self.get_struct_base_addr(base_expr)
-            };
-            let byte_addr = self.vector_lane_byte_addr(base, lane / 8);
-            let bit_index = self.fresh_value();
-            self.emit(Instruction::Copy {
-                dest: bit_index,
-                src: Operand::Const(IrConst::I64((lane % 8) as i64)),
-            });
-            let bit_index =
-                self.emit_implicit_cast(Operand::Value(bit_index), IrType::I64, IrType::U8);
-            let bit_index = self.operand_to_value(bit_index);
-            return Some(LValue {
-                kind: LValueKind::PackedBoolVectorLane {
-                    byte_addr,
-                    bit_index,
-                    address_space: addr_space,
-                },
-                volatile: vol,
-                sso: SsoMode::None,
-            });
-        }
-        let addr = self.vector_lane_addr_of_expr(base_expr, &vec_ct, lane, is_pointer);
-        if vec_ct.is_x87_lane_vector() {
+        let (addr_space, _) = self.ext_vector_selection_access(&sel);
+        let addr =
+            self.vector_lane_addr_of_expr(sel.root, &sel.vector_ct, lane, sel.root_is_pointer);
+        if sel.vector_ct.is_x87_lane_vector() {
             return Some(LValue {
                 kind: LValueKind::X87VectorLane(addr, addr_space),
                 volatile: vol,

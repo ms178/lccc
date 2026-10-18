@@ -6,6 +6,7 @@
 
 use super::lower::Lowerer;
 use super::string_init::StringInit;
+use super::structs::ExtVectorSelection;
 use crate::common::types::{AddressSpace, CType, IrType, SsoMode};
 use crate::frontend::parser::ast::{
     BlockItem, CompoundStmt, Designator, Expr, GenericAssociation, Initializer, InitializerItem,
@@ -1212,56 +1213,31 @@ impl Lowerer {
     // Member access (s.field, p->field)
     // -----------------------------------------------------------------------
 
-    /// Clang ext-vector component access as an rvalue: `v.x` loads one lane
-    /// (through the lane helper, so packed `_Bool` and 10-byte x87 lanes are
-    /// right); `v.zyx` builds a fresh vector of the named lanes in order.
-    fn lower_vector_component_rvalue(
-        &mut self,
-        base_expr: &Expr,
-        field_name: &str,
-        is_pointer: bool,
-        vec_ct: &CType,
-        lanes: &[usize],
-    ) -> Operand {
-        let addr_space = if is_pointer {
-            self.get_addr_space_of_ptr_expr(base_expr)
-        } else {
-            self.get_addr_space_of_struct_expr(base_expr)
-        };
-        let volatile = if is_pointer {
-            self.pointee_expr_is_volatile(base_expr)
-        } else {
-            self.expr_access_is_volatile(base_expr)
-        };
-        let src = if is_pointer {
-            let ptr_val = self.lower_expr(base_expr);
-            self.operand_to_value(ptr_val)
-        } else {
-            // Any vector-valued expression: an object's address, or the
-            // temporary an rvalue (call, arithmetic, swizzle) was built in.
-            self.get_struct_base_addr(base_expr)
-        };
-        if lanes.len() == 1 {
-            return self.load_vector_lane(src, vec_ct, lanes[0], addr_space, volatile);
+    /// Clang ext-vector element selection as an rvalue: `v.x` loads one lane
+    /// (through the lane helper, so 10-byte x87 lanes are right); `v.zyx`
+    /// builds a fresh vector of the named lanes in order. Nested selections
+    /// read straight out of the root vector.
+    fn lower_vector_component_rvalue(&mut self, sel: &ExtVectorSelection<'_>) -> Operand {
+        let (addr_space, volatile) = self.ext_vector_selection_access(sel);
+        // Any vector-valued root: an object's address, or the temporary an
+        // rvalue (call, arithmetic) was built in.
+        let src = self.ext_vector_selection_base(sel);
+        if let [lane] = sel.lanes[..] {
+            return self.load_vector_lane(src, &sel.vector_ct, lane, addr_space, volatile);
         }
-        let Some(result_ct) = vec_ct.ext_vector_swizzle_ctype(field_name) else {
-            return Operand::Const(IrConst::I64(0));
-        };
-        let Some((elem_ct, _)) = vec_ct.vector_info() else {
-            return Operand::Const(IrConst::I64(0));
-        };
-        let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
+        let result_ct = &sel.result_ct;
+        let elem_ir_ty = Self::vector_elem_ir_type(sel.elem_ct());
         let total_size = result_ct.size();
-        let align = self.ctype_align(&result_ct);
+        let align = self.ctype_align(result_ct);
         let result = self.emit_entry_alloca(IrType::Ptr, total_size, align, false);
-        if crate::ir::lowering::lower::vector_temp_needs_zero_init(&result_ct, lanes.len()) {
+        if crate::ir::lowering::lower::vector_temp_needs_zero_init(result_ct, sel.lanes.len()) {
             self.zero_init_alloca(result, total_size);
         }
-        for (i, &lane) in lanes.iter().enumerate() {
-            let v = self.load_vector_lane(src, vec_ct, lane, addr_space, volatile);
+        for (i, &lane) in sel.lanes.iter().enumerate() {
+            let v = self.load_vector_lane(src, &sel.vector_ct, lane, addr_space, volatile);
             self.store_vector_lane(
                 result,
-                &result_ct,
+                result_ct,
                 i,
                 v,
                 elem_ir_ty,
@@ -1278,9 +1254,8 @@ impl Lowerer {
         field_name: &str,
         is_pointer: bool,
     ) -> Operand {
-        if let Some((vec_ct, lanes)) = self.vector_member_lanes(base_expr, field_name, is_pointer) {
-            return self
-                .lower_vector_component_rvalue(base_expr, field_name, is_pointer, &vec_ct, &lanes);
+        if let Some(sel) = self.ext_vector_selection_parts(base_expr, field_name, is_pointer) {
+            return self.lower_vector_component_rvalue(&sel);
         }
         let (field_offset, field_ty, bitfield, field_ctype) = if is_pointer {
             self.resolve_pointer_member_access_with_ctype(base_expr, field_name)

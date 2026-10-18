@@ -8,94 +8,59 @@
 //! - Arithmetic conversion helpers: usual_arithmetic_conversions, promote_for_op, narrow_from_op
 
 use super::lower::Lowerer;
+use super::structs::ExtVectorSelection;
 use crate::common::types::{AddressSpace, CType, IrType, SsoMode, widened_op_type};
 use crate::frontend::parser::ast::{BinOp, Expr};
 use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand, Value};
 
 impl Lowerer {
-    /// `v.yz = w` / `p->xy = w`: a multi-component ext-vector swizzle on the
-    /// left stores each named lane from the matching lane of the right-hand
-    /// vector. Clang forbids a repeated component on the left (`v.xx = w`).
-    /// `None` when `lhs` is not such a swizzle (or is a single component,
-    /// which is an ordinary element lvalue).
+    /// `v.yz = w` / `p->xy = w` / `n.wzyx.zw = w`: a multi-lane ext-vector
+    /// selection on the left stores each selected lane of its root vector
+    /// from the matching lane of the right-hand vector (a scalar is
+    /// splatted). Sema rejects a repeated lane in the target (Clang).
+    /// `None` when `lhs` is not such a selection (a one-lane selection is
+    /// an ordinary element lvalue).
     fn try_lower_swizzle_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Option<Operand> {
         let discard_result = std::mem::replace(&mut self.discard_assign_result, false);
-        let (base_expr, field_name, is_pointer) = match lhs {
-            Expr::MemberAccess(b, f, _) => (&**b, f.as_str(), false),
-            Expr::PointerMemberAccess(b, f, _) => (&**b, f.as_str(), true),
-            _ => return None,
-        };
-        let (vec_ct, lanes) = self.vector_member_lanes(base_expr, field_name, is_pointer)?;
-        if lanes.len() < 2 {
+        let sel = self.ext_vector_selection_expr(lhs)?;
+        if sel.lanes.len() < 2 {
             return None;
         }
-        let result_ct = vec_ct.ext_vector_swizzle_ctype(field_name)?;
-        for (i, lane) in lanes.iter().enumerate() {
-            if lanes[..i].contains(lane) {
-                self.emit_error(
-                    format!(
-                        "vector is not assignable (contains duplicate components '{field_name}')"
-                    ),
-                    lhs.span(),
-                );
-                return Some(Operand::Const(IrConst::I64(0)));
-            }
-        }
-        let (elem_ct, _) = vec_ct.vector_info()?;
-        let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
+        debug_assert!(
+            sel.lanes
+                .iter()
+                .enumerate()
+                .all(|(i, l)| !sel.lanes[..i].contains(l)),
+            "sema rejects an ext-vector selection target with a repeated lane"
+        );
+        let elem_ir_ty = Self::vector_elem_ir_type(sel.elem_ct());
         let rhs_ct = self.expr_ctype(rhs);
-        let addr_space = if is_pointer {
-            self.get_addr_space_of_ptr_expr(base_expr)
-        } else {
-            self.get_addr_space_of_struct_expr(base_expr)
-        };
-        let volatile = if is_pointer {
-            self.pointee_expr_is_volatile(base_expr)
-        } else {
-            self.expr_access_is_volatile(base_expr)
-        };
+        let (addr_space, volatile) = self.ext_vector_selection_access(&sel);
         // Evaluate the right side first (C: the store is not sequenced
         // before the operand evaluation), then the destination address.
         // Every source lane is loaded before the first store: the source
         // may overlap the destination (`v.xy = v.yx` swaps; `d->xyz =
-        // s->zyx` with `d == s`). A swizzle on the right reads its lanes
-        // straight out of the source vector instead of through a temporary.
-        let rhs_swizzle = match rhs {
-            Expr::MemberAccess(b, f, _) => self
-                .vector_member_lanes(b, f, false)
-                .map(|(ct, l)| (&**b, ct, l, false)),
-            Expr::PointerMemberAccess(b, f, _) => self
-                .vector_member_lanes(b, f, true)
-                .map(|(ct, l)| (&**b, ct, l, true)),
-            _ => None,
-        }
-        .filter(|(_, _, l, _)| l.len() == lanes.len());
-        let mut values: Vec<Operand> = Vec::with_capacity(lanes.len());
-        if let Some((src_expr, src_ct, src_lanes, src_is_pointer)) = rhs_swizzle {
-            let src_space = if src_is_pointer {
-                self.get_addr_space_of_ptr_expr(src_expr)
-            } else {
-                self.get_addr_space_of_struct_expr(src_expr)
-            };
-            let src_volatile = if src_is_pointer {
-                self.pointee_expr_is_volatile(src_expr)
-            } else {
-                self.expr_access_is_volatile(src_expr)
-            };
-            let src = self.vector_lane_addr_of_expr(src_expr, &src_ct, 0, src_is_pointer);
-            let src_elem = src_ct
-                .vector_info()
-                .map_or(elem_ir_ty, |(e, _)| Self::vector_elem_ir_type(&e));
-            for &sl in &src_lanes {
-                let v = self.load_vector_lane(src, &src_ct, sl, src_space, src_volatile);
+        // s->zyx` with `d == s`). A selection on the right reads its lanes
+        // straight out of its root vector instead of through a temporary.
+        let rhs_selection = self
+            .ext_vector_selection_expr(rhs)
+            .filter(|src| src.lanes.len() == sel.lanes.len());
+        let mut values: Vec<Operand> = Vec::with_capacity(sel.lanes.len());
+        if let Some(src) = rhs_selection {
+            let (src_space, src_volatile) = self.ext_vector_selection_access(&src);
+            let src_base = self.ext_vector_selection_base(&src);
+            let src_elem = Self::vector_elem_ir_type(src.elem_ct());
+            for &sl in &src.lanes {
+                let v =
+                    self.load_vector_lane(src_base, &src.vector_ct, sl, src_space, src_volatile);
                 values.push(self.emit_implicit_cast(v, src_elem, elem_ir_ty));
             }
         } else if rhs_ct.is_vector() {
             let ptr = self.vector_operand_ptr(rhs, &rhs_ct);
             let src_elem = rhs_ct
                 .vector_info()
-                .map_or(elem_ir_ty, |(e, _)| Self::vector_elem_ir_type(&e));
-            for i in 0..lanes.len() {
+                .map_or(elem_ir_ty, |(e, _)| Self::vector_elem_ir_type(e));
+            for i in 0..sel.lanes.len() {
                 let v = self.load_vector_lane(ptr, &rhs_ct, i, AddressSpace::Default, false);
                 values.push(self.emit_implicit_cast(v, src_elem, elem_ir_ty));
             }
@@ -104,13 +69,13 @@ impl Lowerer {
             let raw = self.lower_expr(rhs);
             let raw_ty = self.value_ir_type(rhs);
             let v = self.emit_implicit_cast(raw, raw_ty, elem_ir_ty);
-            values.resize(lanes.len(), v);
+            values.resize(sel.lanes.len(), v);
         }
-        let dest = self.vector_lane_addr_of_expr(base_expr, &vec_ct, 0, is_pointer);
-        for (&lane, v) in lanes.iter().zip(values.iter()) {
+        let dest = self.ext_vector_selection_base(&sel);
+        for (&lane, v) in sel.lanes.iter().zip(values.iter()) {
             self.store_vector_lane(
                 dest,
-                &vec_ct,
+                &sel.vector_ct,
                 lane,
                 v.clone(),
                 elem_ir_ty,
@@ -118,25 +83,36 @@ impl Lowerer {
                 volatile,
             );
         }
-        let stored = values;
         // The value of the assignment is the right operand converted to
-        // the swizzle's type. An expression statement never reads it; a
+        // the selection's type. An expression statement never reads it; a
         // consumer gets a fresh vector built from the values just stored
         // (not re-read from the destination: a volatile object must not
         // see an access the source does not contain).
         if discard_result {
             return Some(Operand::Const(IrConst::I64(0)));
         }
-        let size = result_ct.size();
-        let align = self.ctype_align(&result_ct);
+        Some(self.ext_vector_from_lanes(&sel.result_ct, values, elem_ir_ty))
+    }
+
+    /// A fresh vector of type `vector_ct` whose lane `i` is `values[i]`
+    /// (of IR type `elem_ir_ty`), in the vector-value convention of
+    /// `lower_vector_binary_op` (the temporary's address).
+    pub(super) fn ext_vector_from_lanes(
+        &mut self,
+        vector_ct: &CType,
+        values: Vec<Operand>,
+        elem_ir_ty: IrType,
+    ) -> Operand {
+        let size = vector_ct.size();
+        let align = self.ctype_align(vector_ct);
         let out = self.emit_entry_alloca(IrType::Ptr, size, align, false);
-        if crate::ir::lowering::lower::vector_temp_needs_zero_init(&result_ct, lanes.len()) {
+        if crate::ir::lowering::lower::vector_temp_needs_zero_init(vector_ct, values.len()) {
             self.zero_init_alloca(out, size);
         }
-        for (i, v) in stored.into_iter().enumerate() {
+        for (i, v) in values.into_iter().enumerate() {
             self.store_vector_lane(
                 out,
-                &result_ct,
+                vector_ct,
                 i,
                 v,
                 elem_ir_ty,
@@ -144,7 +120,71 @@ impl Lowerer {
                 false,
             );
         }
-        Some(Operand::Value(out))
+        Operand::Value(out)
+    }
+
+    /// `v.zx op= w` (Clang): each selected lane of the root vector becomes
+    /// `lane op w[i]`, at the element width (a scalar `w` is splatted). The
+    /// root is evaluated once, before the right operand, as for a whole
+    /// vector. The operand's lanes are loaded first, then every selected
+    /// lane, and only then is anything stored, so an operand overlapping the
+    /// target (`v.zx += v.xz`, `p->yx += *q` with `q` aliasing `p`) sees
+    /// only old values. The value is a fresh vector of the new lanes.
+    fn lower_ext_vector_selection_compound_assign(
+        &mut self,
+        op: &BinOp,
+        sel: &ExtVectorSelection<'_>,
+        rhs: &Expr,
+    ) -> Operand {
+        let discard_result = std::mem::replace(&mut self.discard_assign_result, false);
+        let elem_ct = sel.elem_ct().clone();
+        let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
+        let ir_op = Self::binop_to_ir(*op, elem_ct.is_unsigned());
+        let count = sel.lanes.len();
+        let (seg, volatile) = self.ext_vector_selection_access(sel);
+        let base = self.ext_vector_selection_base(sel);
+        let rhs_ct = self.expr_ctype(rhs);
+        let mut operands = Vec::with_capacity(count);
+        if rhs_ct.is_vector() {
+            let ptr = self.vector_operand_ptr(rhs, &rhs_ct);
+            let src_elem = rhs_ct
+                .vector_info()
+                .map_or(elem_ir_ty, |(e, _)| Self::vector_elem_ir_type(e));
+            for i in 0..count {
+                let v = self.load_vector_lane(ptr, &rhs_ct, i, AddressSpace::Default, false);
+                operands.push(self.emit_implicit_cast(v, src_elem, elem_ir_ty));
+            }
+        } else {
+            let raw = self.lower_expr(rhs);
+            let raw_ty = self.get_expr_type(rhs);
+            let v = self.emit_implicit_cast(raw, raw_ty, elem_ir_ty);
+            operands.resize(count, v);
+        }
+        let mut old = Vec::with_capacity(count);
+        for &lane in &sel.lanes {
+            old.push(self.load_vector_lane(base, &sel.vector_ct, lane, seg, volatile));
+        }
+        let mut new = Vec::with_capacity(count);
+        for (cur, r) in old.into_iter().zip(operands) {
+            new.push(Operand::Value(
+                self.emit_binop_val(ir_op, cur, r, elem_ir_ty),
+            ));
+        }
+        for (&lane, v) in sel.lanes.iter().zip(new.iter()) {
+            self.store_vector_lane(
+                base,
+                &sel.vector_ct,
+                lane,
+                v.clone(),
+                elem_ir_ty,
+                seg,
+                volatile,
+            );
+        }
+        if discard_result {
+            return Operand::Const(IrConst::I64(0));
+        }
+        self.ext_vector_from_lanes(&sel.result_ct, new, elem_ir_ty)
     }
 
     pub(super) fn lower_assign(&mut self, lhs: &Expr, rhs: &Expr) -> Operand {
@@ -1088,18 +1128,11 @@ impl Lowerer {
         // Vector compound assignment (element-wise)
         let lhs_ct = self.expr_ctype(lhs);
         if lhs_ct.is_vector() {
-            let swizzle = match lhs {
-                Expr::MemberAccess(b, f, _) => self.vector_member_lanes(b, f, false),
-                Expr::PointerMemberAccess(b, f, _) => self.vector_member_lanes(b, f, true),
-                _ => None,
-            };
-            if swizzle.is_some_and(|(_, lanes)| lanes.len() > 1) {
-                self.emit_error(
-                    "compound assignment to a multi-component vector swizzle is not supported; \
-                     write `v.xy = v.xy op w`",
-                    lhs.span(),
-                );
-                return Operand::Const(IrConst::I64(0));
+            if let Some(sel) = self
+                .ext_vector_selection_expr(lhs)
+                .filter(|sel| sel.lanes.len() > 1)
+            {
+                return self.lower_ext_vector_selection_compound_assign(op, &sel, rhs);
             }
             return self.lower_vector_compound_assign(op, lhs, rhs, &lhs_ct);
         }

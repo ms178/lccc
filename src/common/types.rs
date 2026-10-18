@@ -453,51 +453,99 @@ pub enum I386ExtVectorCarrier {
 /// `<N x x86_fp80>` at the element's 80-bit size (see `ExtVectorLayout`).
 pub const X87_LANE_STRIDE: usize = 10;
 
-/// The lane indices a Clang ext-vector component spelling names on a
-/// vector of `lanes` lanes, WITHOUT the range check (`ext_vector_swizzle`
-/// adds it): `None` only when `name` is not a component spelling at all.
-/// One naming set per access -- `xyzw`, `rgba`, or `s`/`S` followed by hex
-/// digits -- and the four halving names `lo`/`hi`/`even`/`odd`, which stand
-/// alone and are resolved against the lane count. Sema uses the split to
-/// tell "illegal vector component name" from "access exceeds type".
-pub fn ext_vector_component_indices(name: &str, lanes: usize) -> Option<Vec<usize>> {
-    let idx: Vec<usize> = match name {
-        "lo" => (0..lanes / 2).collect(),
-        "hi" => (lanes / 2..lanes).collect(),
-        "even" => (0..lanes).step_by(2).collect(),
-        "odd" => (1..lanes).step_by(2).collect(),
-        _ => {
-            let bytes = name.as_bytes();
-            if bytes.is_empty() {
-                return None;
+/// Why a Clang ext-vector element selector is invalid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtVectorSelectorError {
+    /// `illegal vector component name '...'`, quoting the selector bytes in
+    /// this range (char boundaries): the offending character, or the whole
+    /// selector on a `_Bool` vector. Clang places the caret `range.start`
+    /// bytes after the byte that follows the `.`/`->` operator's first byte.
+    IllegalName(std::ops::Range<usize>),
+    /// `vector component access exceeds type ...`, at the operator.
+    ExceedsType,
+}
+
+impl ExtVectorSelectorError {
+    /// Clang 23.1.3's message for this error in `<vector>.<selector>`.
+    /// Clang spells the vector by its typedef name where lccc has none.
+    pub fn message(&self, selector: &str, vector: &CType) -> String {
+        match self {
+            ExtVectorSelectorError::IllegalName(range) => {
+                let name = selector.get(range.clone()).unwrap_or(selector);
+                format!("illegal vector component name '{name}'")
             }
-            if bytes[0] == b's' || bytes[0] == b'S' {
-                if bytes.len() < 2 {
-                    return None;
-                }
-                bytes[1..]
-                    .iter()
-                    .map(|&b| (b as char).to_digit(16).map(|d| d as usize))
-                    .collect::<Option<Vec<_>>>()?
-            } else {
-                let set: &[u8] = if bytes.iter().all(|b| b"xyzw".contains(b)) {
-                    b"xyzw"
-                } else if bytes.iter().all(|b| b"rgba".contains(b)) {
-                    b"rgba"
-                } else {
-                    return None;
-                };
-                bytes
-                    .iter()
-                    .map(|b| set.iter().position(|c| c == b))
-                    .collect::<Option<Vec<_>>>()?
+            ExtVectorSelectorError::ExceedsType => {
+                let (elem, lanes) = vector.vector_info().map_or_else(
+                    || (String::new(), 0),
+                    |(elem, lanes)| (elem.to_string(), lanes),
+                );
+                let plural = if lanes == 1 { "" } else { "s" };
+                format!(
+                    "vector component access exceeds type '{vector}' \
+                     (vector of {lanes} '{elem}' value{plural})"
+                )
             }
         }
-    };
-    if idx.is_empty() {
-        return None;
     }
-    Some(idx)
+}
+
+/// The lanes an ext-vector element selector (`v.wzyx`, `v.s3`, `v.hi`) names
+/// on a vector of `lanes` logical lanes, in result order.
+///
+/// Rules measured against Clang 23.1.3 (`Sema::CheckExtVectorComponent`):
+/// the first character picks one accessor set, `xyzw` or `rgba` (lanes
+/// 0-3), or `s`/`S` followed by one or more hex digits; the first character
+/// outside that set is the illegal one; every named lane must be a logical
+/// lane. The whole names `hi`, `lo`, `even` and `odd` select
+/// `(lanes + 1) / 2` lanes: `lo` from 0, `hi` from `(lanes + 1) / 2`,
+/// `even`/`odd` every other lane. Those may name the padding lane of an
+/// odd-length vector (`v3.hi` is lanes 2 and 3) and, on a one-lane vector,
+/// lane 1, outside the object: Clang reads such a lane as poison, and the
+/// lane helpers read it as zero and drop stores to it without touching
+/// memory. Selectors may repeat lanes and have any length.
+pub fn ext_vector_selector_lanes(
+    name: &str,
+    lanes: usize,
+) -> Result<Vec<usize>, ExtVectorSelectorError> {
+    let half = lanes.div_ceil(2);
+    // (first lane, stride) of a halving selector.
+    let halving = match name {
+        "lo" => Some((0, 1)),
+        "hi" => Some((half, 1)),
+        "even" => Some((0, 2)),
+        "odd" => Some((1, 2)),
+        _ => None,
+    };
+    if let Some((first, stride)) = halving {
+        return Ok((0..half).map(|i| first + stride * i).collect());
+    }
+    let illegal = |at: usize, c: char| ExtVectorSelectorError::IllegalName(at..at + c.len_utf8());
+    let Some(first) = name.chars().next() else {
+        return Err(ExtVectorSelectorError::IllegalName(0..0));
+    };
+    let numeric = matches!(first, 's' | 'S');
+    let lane_of: fn(char) -> Option<usize> = if numeric {
+        |c| c.to_digit(16).map(|d| d as usize)
+    } else if "xyzw".contains(first) {
+        |c| "xyzw".find(c)
+    } else if "rgba".contains(first) {
+        |c| "rgba".find(c)
+    } else {
+        return Err(illegal(0, first));
+    };
+    // Byte offset of the first component: `s`/`S` is a prefix, not a lane.
+    let start = if numeric { first.len_utf8() } else { 0 };
+    if start == name.len() {
+        return Err(illegal(0, first));
+    }
+    let mut selected = Vec::with_capacity(name.len() - start);
+    for (at, c) in name[start..].char_indices() {
+        selected.push(lane_of(c).ok_or_else(|| illegal(start + at, c))?);
+    }
+    if selected.iter().any(|&lane| lane >= lanes) {
+        return Err(ExtVectorSelectorError::ExceedsType);
+    }
+    Ok(selected)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2710,23 +2758,27 @@ impl CType {
         (1..=3).contains(&words).then_some(words)
     }
 
-    /// Resolve a Clang ext-vector component access (`v.x`, `v.zyx`, `v.rgb`,
-    /// `v.s03`, `v.lo`/`.hi`/`.even`/`.odd`) on this vector type to the lane
-    /// indices it names, in order. `None` when `self` is not an ext vector
-    /// or the spelling is not a component name for it (callers diagnose:
-    /// Clang says "illegal vector component name" / "vector component access
-    /// exceeds type"). Mirrors `Sema::CheckExtVectorComponent`: one naming
-    /// set per access (`xyzw`, `rgba`, or `s` followed by hex digits), every
-    /// index below the lane count; the four halving names stand alone.
-    pub fn ext_vector_swizzle(&self, name: &str) -> Option<Vec<usize>> {
+    /// The lanes the Clang ext-vector element selection `self.<name>` names
+    /// (see [`ext_vector_selector_lanes`]). `None` when `self` is not an ext
+    /// vector; an error for every selector on a `_Bool` ext vector, which
+    /// Clang 23.1.3 rejects quoting the whole name (`b.x`, `b.lo`, `b.s1`).
+    pub fn ext_vector_selection(
+        &self,
+        name: &str,
+    ) -> Option<Result<Vec<usize>, ExtVectorSelectorError>> {
         let CType::ExtVector(_, layout) = self else {
             return None;
         };
-        let idx = ext_vector_component_indices(name, layout.lanes)?;
-        if idx.iter().any(|&i| i >= layout.lanes) {
-            return None;
+        if layout.bitpacked_bool {
+            return Some(Err(ExtVectorSelectorError::IllegalName(0..name.len())));
         }
-        Some(idx)
+        Some(ext_vector_selector_lanes(name, layout.lanes))
+    }
+
+    /// The lanes of a valid ext-vector element selection `self.<name>`;
+    /// `None` for a non-ext-vector or an invalid selector (sema diagnoses).
+    pub fn ext_vector_swizzle(&self, name: &str) -> Option<Vec<usize>> {
+        self.ext_vector_selection(name)?.ok()
     }
 
     /// The type of the component access `self.name`: the element type for a
@@ -2737,11 +2789,17 @@ impl CType {
         let CType::ExtVector(elem, _) = self else {
             return None;
         };
-        if lanes.len() == 1 {
-            return Some((**elem).clone());
+        Self::ext_vector_selection_ctype(elem, lanes.len())
+    }
+
+    /// The type of an ext-vector selection of `count` lanes of `elem`: the
+    /// element itself for one lane, else an ext vector of `count` lanes.
+    pub fn ext_vector_selection_ctype(elem: &CType, count: usize) -> Option<CType> {
+        if count == 1 {
+            return Some(elem.clone());
         }
-        let layout = ExtVectorLayout::new(elem, lanes.len())?;
-        Some(CType::ExtVector(elem.clone(), layout))
+        let layout = ExtVectorLayout::new(elem, count)?;
+        Some(CType::ExtVector(Box::new(elem.clone()), layout))
     }
 
     /// An ext vector of `long double` lanes: lanes are 10 bytes apart (the
@@ -3737,5 +3795,146 @@ mod cast_predicate_tests {
             }
         }
         assert!(!IrType::Ptr.cast_preserves_offset_value(IrType::Ptr));
+    }
+}
+
+#[cfg(test)]
+mod ext_vector_selector_tests {
+    use super::{CType, ExtVectorLayout, ExtVectorSelectorError, ext_vector_selector_lanes};
+
+    fn lanes(name: &str, n: usize) -> Vec<usize> {
+        ext_vector_selector_lanes(name, n).unwrap_or_else(|e| panic!("{name} on {n}: {e:?}"))
+    }
+
+    fn ext_vector(elem: CType, n: usize) -> CType {
+        let layout = ExtVectorLayout::new(&elem, n).expect("x86 ext-vector layout");
+        CType::ExtVector(Box::new(elem), layout)
+    }
+
+    /// Expected lanes are Clang 23.1.3 results on int vectors {10, 11, ...}.
+    #[test]
+    fn accessor_sets_and_numeric_selectors() {
+        assert_eq!(lanes("wzyx", 4), [3, 2, 1, 0]);
+        assert_eq!(lanes("abgr", 4), [3, 2, 1, 0]);
+        assert_eq!(lanes("s3210", 4), [3, 2, 1, 0]);
+        assert_eq!(lanes("S0", 4), [0]);
+        assert_eq!(lanes("sF0", 16), [15, 0]);
+        assert_eq!(lanes("sf0", 16), [15, 0]);
+        assert_eq!(lanes("xyzw", 8), [0, 1, 2, 3]);
+        assert_eq!(lanes("xx", 2), [0, 0]);
+        assert_eq!(lanes("xyzwxyzwxyzwxyzwx", 4).len(), 17);
+    }
+
+    #[test]
+    fn halving_selectors_round_up_and_may_name_padding() {
+        assert_eq!(lanes("hi", 4), [2, 3]);
+        assert_eq!(lanes("lo", 4), [0, 1]);
+        assert_eq!(lanes("even", 4), [0, 2]);
+        assert_eq!(lanes("odd", 8), [1, 3, 5, 7]);
+        // I3 {20, 21, 22}: lo = {20, 21}, hi.x = 22 (lane 3 is padding).
+        assert_eq!(lanes("lo", 3), [0, 1]);
+        assert_eq!(lanes("hi", 3), [2, 3]);
+        assert_eq!(lanes("even", 3), [0, 2]);
+        assert_eq!(lanes("odd", 3), [1, 3]);
+        // I1: lo is the element, hi lane 1 lies outside the object.
+        assert_eq!(lanes("lo", 1), [0]);
+        assert_eq!(lanes("hi", 1), [1]);
+        assert_eq!(lanes("odd", 5), [1, 3, 5]);
+    }
+
+    /// Clang 23.1.3's diagnostic for each rejected selector: the range is
+    /// the quoted name, at which Clang's caret points.
+    #[test]
+    fn clang_rejections() {
+        use ExtVectorSelectorError::{ExceedsType, IllegalName};
+        for (name, n, err) in [
+            ("xg", 4, IllegalName(1..2)),
+            ("xr", 4, IllegalName(1..2)),
+            ("q", 4, IllegalName(0..1)),
+            ("s", 4, IllegalName(0..1)),
+            ("sx", 4, IllegalName(1..2)),
+            ("s1x", 4, IllegalName(2..3)),
+            ("x0", 4, IllegalName(1..2)),
+            ("hix", 4, IllegalName(0..1)),
+            ("Hi", 4, IllegalName(0..1)),
+            ("zyq", 4, IllegalName(2..3)),
+            ("x\u{e9}", 4, IllegalName(1..3)),
+            ("", 4, IllegalName(0..0)),
+            ("s4", 4, ExceedsType),
+            ("sA", 4, ExceedsType),
+            ("w", 3, ExceedsType),
+            ("s3", 3, ExceedsType),
+            ("y", 1, ExceedsType),
+        ] {
+            assert_eq!(
+                ext_vector_selector_lanes(name, n),
+                Err(err),
+                "{name} on {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn clang_messages() {
+        let int4 = ext_vector(CType::Int, 4);
+        let int1 = ext_vector(CType::Int, 1);
+        let illegal = ExtVectorSelectorError::IllegalName(1..2);
+        assert_eq!(
+            illegal.message("xr", &int4),
+            "illegal vector component name 'r'"
+        );
+        let exceeds = ExtVectorSelectorError::ExceedsType.message("s4", &int4);
+        assert!(exceeds.starts_with("vector component access exceeds type '"));
+        assert!(
+            exceeds.ends_with("' (vector of 4 'int' values)"),
+            "{exceeds}"
+        );
+        let one = ExtVectorSelectorError::ExceedsType.message("y", &int1);
+        assert!(one.ends_with("' (vector of 1 'int' value)"), "{one}");
+    }
+
+    /// Clang 23.1.3 rejects every selector on a `_Bool` ext vector, quoting
+    /// the whole name: `b.s1`, `b.x`, `b.lo` and invalid ones alike.
+    #[test]
+    fn bool_vectors_reject_every_selector() {
+        let bool8 = ext_vector(CType::Bool, 8);
+        for name in ["s1", "x", "lo", "xyzw", "q"] {
+            let err = bool8
+                .ext_vector_selection(name)
+                .expect("a _Bool ext vector is an ext vector")
+                .expect_err(name);
+            assert_eq!(err, ExtVectorSelectorError::IllegalName(0..name.len()));
+            assert_eq!(
+                err.message(name, &bool8),
+                format!("illegal vector component name '{name}'")
+            );
+            assert_eq!(bool8.ext_vector_swizzle(name), None);
+        }
+        let int4 = ext_vector(CType::Int, 4);
+        assert_eq!(int4.ext_vector_swizzle("s1"), Some(vec![1]));
+        assert_eq!(CType::Int.ext_vector_selection("x"), None);
+    }
+
+    #[test]
+    fn selection_types() {
+        let int3 = ext_vector(CType::Int, 3);
+        assert_eq!(int3.ext_vector_swizzle_ctype("x"), Some(CType::Int));
+        assert_eq!(
+            int3.ext_vector_swizzle_ctype("hi"),
+            Some(ext_vector(CType::Int, 2))
+        );
+        let int1 = ext_vector(CType::Int, 1);
+        assert_eq!(int1.ext_vector_swizzle_ctype("lo"), Some(CType::Int));
+        assert_eq!(int1.ext_vector_swizzle_ctype("hi"), Some(CType::Int));
+        assert_eq!(
+            int3.ext_vector_swizzle_ctype("xyzwx"),
+            None,
+            "w exceeds a three-lane vector"
+        );
+        let int4 = ext_vector(CType::Int, 4);
+        assert_eq!(
+            int4.ext_vector_swizzle_ctype("xyzwx"),
+            Some(ext_vector(CType::Int, 5))
+        );
     }
 }

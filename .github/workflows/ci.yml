@@ -640,7 +640,7 @@ jobs:
     - name: Shuffle builtin diagnostics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_shuffle_diagnostics.sh
     - name: ext-vector swizzle diagnostics
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_swizzle_diagnostics.sh
+      run: env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_swizzle_diagnostics.sh
     - name: vector scalar conversion diagnostics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_scalar_conversions.sh
     - name: Subscript constraint diagnostics
