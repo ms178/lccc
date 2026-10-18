@@ -1514,7 +1514,7 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
         // sources + dest — the mask is a fourth source read, the dest a
         // plain output; VEX reads every source before writing, so retargeting
         // the dest is sound even when `D` is itself the mask).
-        let is_var_blend = matches!(mn, "vblendvps" | "vblendvpd");
+        let is_var_blend = matches!(mn, "vblendvps" | "vblendvpd" | "vpblendvb");
         let arity_ok = ops.len() == 3
             || (ops.len() == 4 && ops[0].starts_with('$'))
             || (is_var_blend && ops.len() == 4)
@@ -4176,6 +4176,14 @@ mod tests {
         assert_eq!(
             retarget_only("    vbroadcastss (%rdi), %ymm3\n    vmovaps %ymm3, %ymm1\n    ret\n"),
             vec!["vbroadcastss (%rdi), %ymm1", "ret"]
+        );
+        // The byte variable blend is a four-operand plain output like
+        // `vblendvps`: retargeted into the copy-out.
+        assert_eq!(
+            retarget_only(
+                "    vpblendvb %ymm6, %ymm2, %ymm3, %ymm7\n    vmovdqa %ymm7, %ymm0\n    ret\n"
+            ),
+            vec!["vpblendvb %ymm6, %ymm2, %ymm3, %ymm0", "ret"]
         );
         // A VEX.128 load or broadcast into a legacy 128-bit copy-out: like
         // any VEX.128 producer, under the wide-reader rule (no reader of
