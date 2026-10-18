@@ -306,6 +306,7 @@ impl SemanticAnalyzer {
             name: func.name.clone(),
             ty: func_ctype,
             explicit_alignment: None,
+            type_align: None,
             address_space: AddressSpace::Default,
         });
 
@@ -319,6 +320,7 @@ impl SemanticAnalyzer {
                     name: name.clone(),
                     ty,
                     explicit_alignment: None,
+                    type_align: None,
                     address_space: AddressSpace::Default,
                 });
                 self.symbol_table.mark_automatic(name);
@@ -391,6 +393,7 @@ impl SemanticAnalyzer {
             name: func.name.clone(),
             ty: func_ctype,
             explicit_alignment: None,
+            type_align: None,
             address_space: AddressSpace::Default,
         });
 
@@ -410,6 +413,7 @@ impl SemanticAnalyzer {
                     name: name.clone(),
                     ty,
                     explicit_alignment: None,
+                    type_align: None,
                     address_space: AddressSpace::Default,
                 });
                 self.symbol_table.mark_automatic(name);
@@ -981,6 +985,7 @@ impl SemanticAnalyzer {
                         name: init_decl.name.clone(),
                         ty: full_type,
                         explicit_alignment: None,
+                        type_align: None,
                         // The same object-storage predicate the ordinary path below
                         // uses (one rule for both, so a `__seggs` block-scope
                         // declaration cannot mean one thing to sema and another to
@@ -1115,6 +1120,7 @@ impl SemanticAnalyzer {
                 name: init_decl.name.clone(),
                 ty: full_type,
                 explicit_alignment,
+                type_align: self.resolve_typedef_alignment(&decl.type_spec),
                 address_space: object_address_space,
             });
             if links && !self.symbol_table.at_file_scope() {
@@ -1688,6 +1694,7 @@ impl SemanticAnalyzer {
                 name: variant.name.clone(),
                 ty: constant.ty.clone(),
                 explicit_alignment: None,
+                type_align: None,
                 address_space: AddressSpace::Default,
             });
             self.result
@@ -1710,6 +1717,7 @@ impl SemanticAnalyzer {
                 name: variant.clone(),
                 ty: ty.clone(),
                 explicit_alignment: None,
+                type_align: None,
                 address_space: AddressSpace::Default,
             });
         }
@@ -2860,6 +2868,58 @@ impl SemanticAnalyzer {
 
         let key = match &base_ctype {
             CType::Struct(key) | CType::Union(key) => key.clone(),
+            CType::ExtVector(..) => {
+                // Clang ext-vector component access (`v.x`, `v.xyzw`, `v.s0`,
+                // `v.lo`): validate the spelling here so a typo or an
+                // out-of-range component is an error, not offset-0 garbage.
+                if base_ctype.ext_vector_swizzle(field_name).is_none() {
+                    let lanes = base_ctype.vector_info().map_or(0, |(_, n)| n);
+                    let msg =
+                        if crate::common::types::ext_vector_component_indices(field_name, lanes)
+                            .is_some()
+                        {
+                            format!(
+                                "vector component access '{}' exceeds type '{}' ({} lanes)",
+                                field_name, base_ctype, lanes
+                            )
+                        } else {
+                            format!("illegal vector component name '{}'", field_name)
+                        };
+                    self.diagnostics.borrow_mut().error(msg, span);
+                }
+                return;
+            }
+            // A definite scalar base (arithmetic, pointer, a GNU vector):
+            // `x.y` on a float, `p->z` on an `int *`, `w.hi.y` on a two-lane
+            // ext vector whose `.hi` is already the scalar lane. Used to be
+            // accepted and lowered as field offset 0 (a miscompile with no
+            // diagnostic). Anything the checker cannot name (`None`,
+            // typeof, incomplete) still skips.
+            CType::Int
+            | CType::UInt
+            | CType::Char
+            | CType::UChar
+            | CType::Short
+            | CType::UShort
+            | CType::Long
+            | CType::ULong
+            | CType::LongLong
+            | CType::ULongLong
+            | CType::Bool
+            | CType::Float
+            | CType::Double
+            | CType::LongDouble
+            | CType::Pointer(..)
+            | CType::Vector(..) => {
+                self.diagnostics.borrow_mut().error(
+                    format!(
+                        "request for member '{}' in something not a structure or union (base type '{}')",
+                        field_name, base_ctype
+                    ),
+                    span,
+                );
+                return;
+            }
             _ => return, // Not a struct/union; skip check
         };
 
@@ -3686,6 +3746,17 @@ impl SemanticAnalyzer {
             | (CType::Union(_), _)
             | (_, CType::Struct(_))
             | (_, CType::Union(_)) => true,
+            // Vectors of different sizes never convert implicitly (GCC:
+            // "incompatible types when assigning"; Clang: "assigning to
+            // 'float2' from incompatible type 'float4'"), including a
+            // multi-component swizzle target (`v.xy = v`). Same-size
+            // vectors with different lanes are GCC's lax conversion and
+            // a scalar converts to an ext vector by splat; both stay
+            // accepted.
+            (
+                CType::Vector(..) | CType::ExtVector(..),
+                CType::Vector(..) | CType::ExtVector(..),
+            ) => from_ty.size() != to_ty.size(),
             _ => false,
         };
         if incompatible {
@@ -3914,11 +3985,11 @@ impl SemanticAnalyzer {
                         .align_ctx(&*self.result.type_context.borrow_struct_layouts());
                     natural.max(self.resolve_typedef_alignment(ts).unwrap_or(0))
                 });
-                let field_alignment = crate::common::types::strictest_alignment([
-                    f.alignment,
-                    self.resolve_typedef_alignment(&f.type_spec),
-                    alignas_type,
-                ]);
+                let field_alignment =
+                    crate::common::types::strictest_alignment([f.alignment, alignas_type]);
+                // A typedef-level `aligned` REPLACES the type's alignment
+                // (it may lower it); see `StructField::type_align`.
+                let type_align = self.resolve_typedef_alignment(&f.type_spec);
                 // C11 6.7.2.1p13: unnamed non-aggregate members are constraint
                 // violations GCC ignores entirely; drop from layout + init.
                 if f.name.is_none()
@@ -3936,6 +4007,7 @@ impl SemanticAnalyzer {
                     ty,
                     bit_width,
                     alignment: field_alignment,
+                    type_align,
                     is_packed: f.is_packed,
                     base_volatile: f.base_volatile,
                     object_volatile: f.object_volatile,
@@ -4203,13 +4275,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                     reverse_sso,
                 )
             };
-            if let Some(a) = struct_aligned {
-                if a > layout.align {
-                    layout.align = a;
-                    let mask = layout.align - 1;
-                    layout.size = (layout.size + mask) & !mask;
-                }
-            }
+            layout.apply_struct_aligned(struct_aligned);
             Some(layout)
         };
         // C 6.7.2.3: a record definition in an inner scope declares a NEW type,
@@ -4303,6 +4369,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
                 is_union,
                 is_transparent_union: false,
                 reverse_sso: false,
+                user_align: struct_aligned.is_some(),
             };
             self.result
                 .type_context
@@ -4679,6 +4746,7 @@ mod record_layouts_correspond_tests {
             is_union,
             is_transparent_union: false,
             reverse_sso: false,
+            user_align: false,
         }
     }
 

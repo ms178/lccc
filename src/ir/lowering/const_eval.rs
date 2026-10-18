@@ -308,7 +308,7 @@ impl Lowerer {
                 Some(IrConst::I64(size as i64))
             }
             Expr::Alignof(ts, _) => {
-                let align = self.alignof_type(ts);
+                let align = self.c11_alignof_type(ts);
                 Some(IrConst::I64(align as i64))
             }
             Expr::AlignofExpr(inner_expr, _) => {

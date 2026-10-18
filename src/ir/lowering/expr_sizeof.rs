@@ -471,14 +471,17 @@ impl Lowerer {
                 return alignment;
             }
             if let Some(vi) = self.lookup_var_info(name) {
-                if let Some(explicit_align) = vi.explicit_alignment {
+                if vi.explicit_alignment.is_some() || vi.type_align.is_some() {
                     // Return max of natural type alignment and explicit alignment
-                    let natural = if let Some(ref ctype) = vi.c_type {
+                    // (a typedef-level `aligned` replaces the natural figure).
+                    let natural = if let Some(type_align) = vi.type_align {
+                        type_align
+                    } else if let Some(ref ctype) = vi.c_type {
                         self.ctype_align(ctype)
                     } else {
                         vi.ty.align()
                     };
-                    return natural.max(explicit_align);
+                    return natural.max(vi.explicit_alignment.unwrap_or(0));
                 }
             }
         }
@@ -515,8 +518,11 @@ impl Lowerer {
                 return alignment;
             }
             if let Some(vi) = self.lookup_var_info(name) {
-                if let Some(explicit_align) = vi.explicit_alignment {
-                    let natural = if let Some(ref ctype) = vi.c_type {
+                if vi.explicit_alignment.is_some() || vi.type_align.is_some() {
+                    let explicit_align = vi.explicit_alignment.unwrap_or(0);
+                    let natural = if let Some(type_align) = vi.type_align {
+                        type_align
+                    } else if let Some(ref ctype) = vi.c_type {
                         ctype.preferred_align_ctx(&*self.types.borrow_struct_layouts())
                     } else {
                         // Fallback: use size as preferred alignment (min 1, max 16)

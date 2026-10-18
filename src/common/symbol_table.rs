@@ -9,6 +9,11 @@ pub struct Symbol {
     /// Explicit alignment from _Alignas or __attribute__((aligned(N))).
     /// Used by _Alignof(var) to return the correct alignment per C11 6.2.8p3.
     pub explicit_alignment: Option<usize>,
+    /// Alignment of the declared type when the declaration's type specifier
+    /// is a typedef carrying `__attribute__((aligned(N)))` — it REPLACES the
+    /// natural alignment (may lower it), so `_Alignof(var)` reports it (GCC
+    /// `DECL_ALIGN`). Mirrors `VarInfo::type_align` in the lowering.
+    pub type_align: Option<usize>,
     /// Named address space of the *object* this symbol designates
     /// (`__seg_gs`/`__seg_fs`, the kernel's `__percpu`).
     ///
@@ -234,6 +239,7 @@ mod binding_depth_tests {
                 variadic: false,
             })),
             explicit_alignment: None,
+            type_align: None,
             // A test that builds a `Symbol` by literal has to spell every field, and that is
             // the point: this fixture is about *bindings*, so the address space
             // it names is `Default`, written rather than defaulted-with-`..`.

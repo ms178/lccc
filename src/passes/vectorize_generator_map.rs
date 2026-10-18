@@ -2,7 +2,9 @@
 //!
 //! Recognizes the counted loop with no source streams
 //!
-//!     for (i = C0; i < N; ++i) dst[i] = (u8)F(i);
+//! ```c
+//! for (i = C0; i < N; ++i) dst[i] = (u8)F(i);
+//! ```
 //!
 //! where `F` is a pure chain of 32/64-bit integer operations over `i` and
 //! constants. The packed map vectorizer requires at least one load and declines

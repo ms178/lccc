@@ -83,14 +83,16 @@ check_objects() {
         read -r name size align <<<"$spec"
         if [[ $compiler == Clang && $name == global_ld3 ]]; then
             # Clang 19.1.7 and ICX 2026.2 report sizeof/alignof as 64/64,
-            # but emit a 32-byte ELF object for this x87 vector initializer.
-            # Keep the alignment check, report the oracle defect explicitly,
-            # and retain the strict size check for LCCC below.
+            # but emit a 32-byte ELF object for this x87 vector initializer:
+            # LLVM packs `<3 x x86_fp80>` at the 80-bit element size (30
+            # bytes, allocated as 32) while the C object is 64. lccc matches
+            # the 10-byte lane stride (ABI-EXTVEC-LD-1) but emits the full
+            # C-object size, so only the alignment is compared for Clang.
             check_symbol_alignment "$object" "$name" "$align"
             actual_size=$("$readelf_bin" -sW "$object" | awk -v name="$name" \
                 '$4 == "OBJECT" && $8 == name { print $3; exit }')
             if [[ $actual_size != "$size" ]]; then
-                echo "KNOWN ORACLE LIMITATION: Clang global_ld3 ELF size is ${actual_size:-missing}, expected 64 from sizeof(ld3); size comparison excluded"
+                echo "NOTE: Clang global_ld3 ELF size is ${actual_size:-missing} (LLVM alloc size of <3 x x86_fp80>), sizeof(ld3) is 64; size comparison excluded"
             else
                 echo "PASS: Clang global_ld3 ELF size matches sizeof(ld3)"
             fi

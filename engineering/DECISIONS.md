@@ -3697,4 +3697,79 @@ re-baselining.
   legs (lccc reads an unwritten slot), so those carry class `flaky`:
   counted, never judged, retired only by the fix. Defects are documented with reproductions in
   `engineering/FOLLOWUP-2026-10-17-ext-vector-grid.md`
-  (ABI-EXTVEC-VA-1, ABI-EXTVEC-LD-1, ABI-EXTVEC-I386-O2-1).
+  (ABI-EXTVEC-VA-1, ABI-EXTVEC-LD-1, ABI-EXTVEC-I386-O2-1 — all three
+  since fixed; the x86-64 `long double` lane conventions are pinned
+  against GCC's x87 struct / `_Complex long double` spellings in
+  `check_gnu_vector_align_abi.sh` because Clang's `X86_64ABIInfo` hands
+  a MEMORY-class *vector* return to LLVM direct, which scalarizes
+  `<2 x x86_fp80>` onto `%st(0)/%st(1)`; `SysvPassing::X87Pair`).
+
+## 2026-10-18 — `long double` ext-vector lanes at 10 bytes, component swizzles, oracle self-consistency leg
+
+**Problem.** The hosted re-measurement of the ext-vector grid after
+ABI-EXTVEC-LD-1 still failed every multi-lane `long double` check in both
+directions: lccc laid the lanes 16 bytes apart (the C `sizeof(long double)`),
+Clang lowers the type to LLVM's `<N x x86_fp80>` whose elements are packed
+at the 80-bit store size (lane `i` at byte `10*i`) inside a 16/32/64-byte C
+object. GCC cannot oracle this (no `ext_vector_type`), and GCC's struct /
+`_Complex` x87 spellings — the oracle used offline — have 16-byte members,
+which is exactly how the stride went unnoticed. Separately, `v.x` on any
+ext vector resolved like a missing struct field (offset 0, type `int`, no
+diagnostic). The third measurement then showed `ldx3` -O2 cross legs
+failing in both directions while -O0 passed.
+
+**Decisions.**
+- *Lane stride is a layout fact, not a store width.* `ExtVectorLayout`
+  carries `X87_LANE_STRIDE = 10` for `long double` lanes on both x86
+  targets; object size and alignment are unchanged. Because an IR `F128`
+  store writes 16 bytes, a lane store writes the 80-bit image only
+  (`store_x87_lane`: constant lanes as two immediate stores, others via a
+  16-byte scratch and a 10-byte copy; `LValueKind::X87VectorLane` for
+  `v[i] op= x`); lane loads stay direct (the six bytes past a lane are
+  inside the object). Considered and rejected: a 10-byte `F80` IR type
+  (touches every x87 path in three backends for one niche carrier) and
+  keeping 16-byte lanes behind a Clang-incompatibility note (an ABI gate
+  that documents its own disagreement is not a gate).
+- *Swizzles are resolved on the base C type, in sema and lowering, never
+  by parser desugaring.* `v.x`/`v.zyx`/`v.rgba`/`v.sN`/`lo`/`hi`/`even`/`odd`
+  follow `Sema::CheckExtVectorComponent` (one naming set per access,
+  range-checked, 1-component results are the element type). Multi-component
+  assignment reads every source lane before the first store (overlap is
+  legal C) and reads a swizzle source directly; the assignment's value is
+  built from the stored values and only when used. Compound assignment to
+  a multi-component swizzle is diagnosed, not emulated — the one Clang
+  form left out, documented in the follow-up.
+- *Diagnose what used to be offset-0 garbage.* Member access on a scalar
+  base and vector assignment across sizes are errors (GCC wording), with
+  a fixture gate whose one GCC-expressible case is oracle-checked and whose
+  positive control runs.
+- *An oracle must be shown to agree with itself across -O levels before
+  lccc is blamed.* The grid gained the `clangO0:clang` leg (Clang -O0
+  provider under the Clang -O2 caller, no lccc code). lccc -O0 ↔ lccc -O2
+  passes for `ldx3` and lccc -O0 agrees with Clang -O0, so the -O2 cross
+  failures are Clang -O0 vs Clang -O2 (`ORACLE-CLANG-2313-2`), and the new
+  leg pins that as a measured expectation instead of a deduction. The
+  i386 `ldx3` rows (`ABI-EXTVEC-LD-I386-1`) turned out to be the same two
+  effects: the -O0 rows retired with the stride, the -O2 `hash2` rows are
+  the oracle class.
+
+### Addendum — oracle assembly must be scoped, not grepped (2026-10-18)
+
+The first hosted run of `check_gnu_vector_align_abi.sh` (it had sat behind
+the then-red grid step) failed all four `-m64` constant legs while all 39
+values agreed. The GitHub runner's GCC enables `-fcf-protection` by default
+and appends a `.note.gnu.property` (`.long 1f - 0f`, `.long 0xc0000002`,
+…) after the probe's data; the gate harvested every `.long` in the file.
+Locally (Debian gcc-16, no CET default) the gate was green, including seven
+environment/stack-residue variations, so the host CPU was ruled out before
+the runner toolchain default was found — reproduced with a `gcc-16
+-fcf-protection` wrapper (old extraction: 6/6 FAIL; new: 50/50 PASS).
+
+Decision: oracle-derived constants are extracted from the probe object's own
+initialiser (`r:` label up to the first non-`.long` line, `awk`), never from
+a whole-file directive grep. Any gate that compares emitted data against an
+oracle must scope the same way; `check_ext_vector_layout.sh` already runs
+its probes rather than reading assembly and is unaffected. The step also
+now tees its log and emits `::error` annotations on failure (the same
+wrapper the grid step has), so the next hosted-only divergence is visible
+without log downloads.

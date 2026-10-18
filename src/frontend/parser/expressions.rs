@@ -98,10 +98,9 @@ impl Parser {
                     spec = self.typedef_type_specs.get(name)?;
                 }
                 TypeSpecifier::TypeofType(inner) => spec = inner,
-                // i686 long double's object sizeof is 12, but a vector lane
-                // occupies 16 bytes (as on LP64). Preserve that distinct
-                // storage contract; using scalar sizeof would make a 48-byte
-                // vector where Clang and the existing declaration path use 64.
+                // Only the *existence* of a width matters here (the total is
+                // used to validate the element type); the object size and the
+                // 10-byte x87 lane stride are resolved by `ExtVectorLayout`.
                 TypeSpecifier::LongDouble => return Some(16),
                 TypeSpecifier::Char
                 | TypeSpecifier::UnsignedChar

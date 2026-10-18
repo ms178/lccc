@@ -111,12 +111,18 @@ impl Lowerer {
             self.globals.insert(declarator.name.clone(), ginfo);
 
             let init = self.lower_declarator_init(decl, declarator, &da);
-            let (align, has_explicit_align) = self.compute_global_alignment(decl, &da);
-
-            if has_explicit_align {
-                if let Some(ginfo) = self.globals.get_mut(&declarator.name) {
-                    ginfo.var.explicit_alignment = Some(align);
-                }
+            let (align, explicit_request) = self.compute_global_alignment(decl, &da);
+            let has_explicit_align = explicit_request.is_some();
+            let type_align = self
+                .typedef_alignment_for_type_spec(&decl.type_spec)
+                .copied();
+            if let Some(ginfo) = self.globals.get_mut(&declarator.name) {
+                // Record the REQUESTED alignment, not the merged object
+                // alignment: `alignof_expr` folds in the natural (or
+                // typedef-replaced) alignment itself, and a merged value
+                // would hide a typedef `aligned(N)` that lowers it.
+                ginfo.var.explicit_alignment = explicit_request;
+                ginfo.var.type_align = type_align;
             }
 
             // Skip emitting storage for alias/weakref declarations.
@@ -523,7 +529,14 @@ impl Lowerer {
         }
     }
 
-    fn compute_global_alignment(&self, decl: &Declaration, da: &DeclAnalysis) -> (usize, bool) {
+    /// Object alignment of a global and, when the declaration carries one,
+    /// the explicit alignment request (`aligned(N)`, `_Alignas`, typedef
+    /// `aligned`) before merging with the natural alignment.
+    fn compute_global_alignment(
+        &self,
+        decl: &Declaration,
+        da: &DeclAnalysis,
+    ) -> (usize, Option<usize>) {
         let c_align = self.alignof_type(&decl.type_spec);
         let is_vector_object = da
             .c_type
@@ -549,10 +562,9 @@ impl Lowerer {
         if let Some(&td_align) = self.typedef_alignment_for_type_spec(&decl.type_spec) {
             explicit = Some(explicit.map_or(td_align, |a| a.max(td_align)));
         }
-        if let Some(explicit_val) = explicit {
-            (natural.max(explicit_val), true)
-        } else {
-            (natural, false)
+        match explicit {
+            Some(explicit_val) => (natural.max(explicit_val), Some(explicit_val)),
+            None => (natural, None),
         }
     }
 

@@ -1357,7 +1357,7 @@ impl Lowerer {
         };
         let elem_ir_ty = IrType::from_ctype(elem_ct);
         // Byte stride of one lane: the element size for `vector_size`, the
-        // padded stride for an ext-vector (x87 lanes take 16 bytes); `None`
+        // ext-vector stride (x87 lanes are 10 bytes apart); `None`
         // for a bit-packed `_Bool` ext-vector, whose lane `i` is bit `i % 8`
         // of byte `i / 8`.
         let lane_stride = vec_ct.vector_element_storage_size();
@@ -1390,6 +1390,20 @@ impl Lowerer {
                     self.coerce_const_to_type_with_src(val, elem_ir_ty, self.get_expr_type(e));
                 let val = if is_bool { val.bool_normalize() } else { val };
                 match lane_stride {
+                    Some(stride) if vec_ct.is_x87_lane_vector() => {
+                        // x87 lanes are 10 bytes apart: write the 16-byte
+                        // F128 image to a scratch and copy only the 80-bit
+                        // payload, so a designated out-of-order lane does
+                        // not zero the first six bytes of its neighbour.
+                        let mut image = [0u8; 16];
+                        self.write_const_to_bytes(&mut image, 0, &val, elem_ir_ty);
+                        let at = offset + pos * stride;
+                        for (i, b) in image.iter().take(stride).enumerate() {
+                            if let Some(dst) = bytes.get_mut(at + i) {
+                                *dst = *b;
+                            }
+                        }
+                    }
                     Some(stride) => {
                         self.write_const_to_bytes(bytes, offset + pos * stride, &val, elem_ir_ty);
                     }

@@ -259,7 +259,9 @@ impl Lowerer {
         ) {
             self.discard_expr_result = false;
         }
+        self.discard_assign_result = saved_discard && matches!(expr, Expr::Assign(..));
         let result = self.lower_expr_inner(expr);
+        self.discard_assign_result = false;
         self.discard_expr_result = saved_discard;
         result
     }
@@ -351,7 +353,7 @@ impl Lowerer {
             }
             Expr::Sizeof(arg, _) => self.lower_sizeof(arg),
             Expr::Alignof(type_spec, _) => {
-                let align = self.alignof_type(type_spec);
+                let align = self.c11_alignof_type(type_spec);
                 Operand::Const(IrConst::I64(align as i64))
             }
             Expr::AlignofExpr(inner_expr, _) => {

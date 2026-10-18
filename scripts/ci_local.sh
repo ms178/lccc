@@ -464,6 +464,16 @@ gate "vector-arg-forms" fast \
 gate "vector-abi-wide-latched" fast \
     env CCC="$LCCC" bash tests/regression/check_vector_abi_wide.sh
 
+# ABI-EXTVEC-VA-1 and its `vector_size` twin: a vector type's alignment is its
+# size (GCC `layout_type`), which fixes struct layout, object alignment and
+# the >16-byte MEMORY-class argument slot; only C11 `_Alignof(type)` is capped
+# at BIGGEST_ALIGNMENT. Layout constants are compared with GCC 16 verbatim
+# across -m64/-mavx/-mavx512f/-m32, the x86-64 runtime cross matrix must agree
+# in all four pairings, and the i386 cross legs are latched as divergent under
+# ABI-GNUVEC-I386-1.
+gate "gnu-vector-align-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_gnu_vector_align_abi.sh
+
 # AUD-TMP-1: temp files must be symlink-proof. Drives the pre-placed-symlink
 # reproducer (and its pre-placed-directory variant) against the built compiler
 # and asserts the victim file is untouched, the compile still succeeds and
@@ -493,6 +503,14 @@ gate "ivsr-reproducers" fast \
 # GCC does.
 gate "shuffle-diagnostics" fast \
     env CCC="$LCCC" bash tests/regression/check_shuffle_diagnostics.sh
+
+# Clang ext_vector_type component access: every form Clang rejects (illegal
+# or mixed component names, out-of-range lanes, duplicate or compound
+# swizzle assignment, width-mismatched vector assignment, member access on
+# a scalar) is a positioned diagnostic, never offset-0 garbage or an ICE; the
+# accepted forms compile and run.
+gate "ext-vector-swizzle-diagnostics" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_swizzle_diagnostics.sh
 
 # C11 6.5.2.1p1: a subscript whose operands are not pointer + integer must be
 # diagnosed (LCCC lowered it as a pointer access, crashing struct-based

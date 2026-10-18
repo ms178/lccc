@@ -1431,6 +1431,11 @@ impl Lowerer {
         field_name: &str,
         is_pointer_access: bool,
     ) -> Option<CType> {
+        if let Some((vec_ct, _)) =
+            self.vector_member_lanes(base_expr, field_name, is_pointer_access)
+        {
+            return vec_ct.ext_vector_swizzle_ctype(field_name);
+        }
         let raw_base_ctype = self.get_expr_ctype(base_expr);
         let base_ctype = if is_pointer_access {
             // For p->field, get CType of p, then dereference

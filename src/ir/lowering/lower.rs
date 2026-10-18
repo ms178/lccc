@@ -89,6 +89,11 @@ pub struct Lowerer {
     /// (expression statement, for-increment), so a discarded post-inc/dec can
     /// skip its volatile old-value spill.
     pub(super) discard_expr_result: bool,
+    /// Set while lowering an `Expr::Assign` whose value is discarded
+    /// (expression statement, for-increment): a swizzle assignment then
+    /// skips materialising its result vector. Captured at the start of
+    /// `try_lower_swizzle_assign`; any nested `lower_expr` clears it.
+    pub(super) discard_assign_result: bool,
     /// Set of function names that have at least one file-scope declaration
     /// without the `inline` specifier OR with `extern`. Per C99 6.7.4p7,
     /// an inline definition is only an "inline definition" (no external def)
@@ -265,6 +270,7 @@ impl Lowerer {
             pure_functions: FxHashSet::default(),
             const_functions: FxHashSet::default(),
             discard_expr_result: false,
+            discard_assign_result: false,
             has_non_inline_decl: FxHashSet::default(),
             types: type_context,
             func_meta: FunctionMeta::default(),
@@ -1266,9 +1272,11 @@ impl Lowerer {
                     let abi = self.aggregate_return(&full_ret_ctype, size);
                     sret_size = abi.sret_size;
                     two_reg_ret_size = abi.two_reg_size;
-                    if abi.x87 {
+                    if abi.x87 || abi.x87_pair {
                         // X87 class (`struct { long double }`): %st(0), carried
-                        // in the IR as the long double scalar.
+                        // in the IR as the long double scalar. The two-lane
+                        // `long double` ext vector adds %st(1) through
+                        // `SetReturnF128Second`.
                         ret_ty = IrType::F128;
                     } else if full_ret_ctype.is_vector()
                         && abi.sret_size.is_none()
@@ -1503,6 +1511,7 @@ impl Lowerer {
             .collect();
 
         let ret_x87_aggregate = ret_aggregate_abi.as_ref().is_some_and(|a| a.x87);
+        let ret_x87_pair = ret_aggregate_abi.as_ref().is_some_and(|a| a.x87_pair);
         if !variadic || !param_tys.is_empty() {
             FuncSig {
                 return_type: ret_ty,
@@ -1516,6 +1525,7 @@ impl Lowerer {
                 ret_eightbyte_classes: ret_eightbyte_classes.clone(),
                 ret_is_f128_sse,
                 ret_x87_aggregate,
+                ret_x87_pair,
                 param_struct_sizes,
                 param_struct_classes,
                 param_riscv_float_classes,
@@ -1534,6 +1544,7 @@ impl Lowerer {
                 ret_eightbyte_classes,
                 ret_is_f128_sse,
                 ret_x87_aggregate,
+                ret_x87_pair,
                 param_struct_sizes: Vec::new(),
                 param_struct_classes: Vec::new(),
                 param_riscv_float_classes: Vec::new(),

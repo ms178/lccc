@@ -454,15 +454,15 @@ impl Lowerer {
                 // (`unsigned int` unless an enumerator is negative), which
                 // `struct_field_ctype` already resolves.
                 let ty = self.struct_field_ctype(f);
-                // Merge per-field alignment with typedef alignment.
-                // If the field's type is a typedef with __aligned__, that alignment
-                // must be applied even when the field itself has no explicit alignment.
+                // Member-level requests (`aligned(N)`, `_Alignas`) only raise;
+                // a typedef-level `aligned` REPLACES the type's alignment (it
+                // may lower it) — see `StructField::type_align`.
                 // `alignof_type` already includes an aligned typedef's override.
                 let field_alignment = crate::common::types::strictest_alignment([
                     f.alignment,
-                    self.typedef_alignment_for_type_spec(&f.type_spec).copied(),
                     f.alignas_type.as_ref().map(|ts| self.alignof_type(ts)),
                 ]);
+                let type_align = self.typedef_alignment_for_type_spec(&f.type_spec).copied();
                 // C11 6.7.2.1p13: unnamed members must be struct/union. An unnamed
                 // non-aggregate (no name, no bit-width) is a constraint violation GCC
                 // ignores entirely; drop it from layout + initializers.
@@ -477,6 +477,7 @@ impl Lowerer {
                     ty,
                     bit_width,
                     alignment: field_alignment,
+                    type_align,
                     is_packed: f.is_packed,
                     base_volatile: f.base_volatile,
                     object_volatile: f.object_volatile,
@@ -559,9 +560,12 @@ impl Lowerer {
             } else {
                 crate::common::types::target_ptr_size() // fallback
             };
-            // If the typedef has an __aligned__ override, take the max
+            // A typedef-level `aligned(N)` REPLACES the alignment — it can
+            // both raise and lower it (GCC documentation; measured on GCC
+            // 16.2: `typedef double D4 aligned(4)` → `_Alignof(D4)` 4,
+            // `typedef v64 A8 aligned(8)` → 8).
             if let Some(&td_align) = self.types.typedef_alignments.get(name) {
-                return natural.max(td_align);
+                return td_align;
             }
             return natural;
         }
@@ -576,12 +580,15 @@ impl Lowerer {
         if let TypeSpecifier::TypeofType(inner) = ts {
             return self.alignof_type(inner);
         }
-        // vector_size retains its existing capped alignment; ext_vector_type
-        // uses the target-specific padded layout computed by CType.
-        if let TypeSpecifier::Vector(_, total_bytes) = ts {
-            return (*total_bytes).min(16);
-        }
-        if matches!(ts, TypeSpecifier::ExtVector(..) | TypeSpecifier::Enum(..)) {
+        // Vectors: GCC TYPE_ALIGN (full size on x86 — drives struct layout,
+        // parameter passing and object alignment; see
+        // `common::types::vector_type_align`); ext_vector_type uses the
+        // target-specific padded layout computed by CType. The C11 _Alignof
+        // cap is applied by `c11_alignof_type`, never here.
+        if matches!(
+            ts,
+            TypeSpecifier::Vector(..) | TypeSpecifier::ExtVector(..) | TypeSpecifier::Enum(..)
+        ) {
             return self.ctype_align(&self.type_spec_to_ctype(ts));
         }
         let ts = self.resolve_type_spec(ts);
@@ -594,6 +601,27 @@ impl Lowerer {
         self.struct_union_layout(ts)
             .map(|l| l.align)
             .unwrap_or(crate::common::types::target_ptr_size())
+    }
+
+    /// C11 `_Alignof(type-name)`: GCC's `min_align_of_type` — `alignof_type`
+    /// capped at `BIGGEST_ALIGNMENT` unless the type is user-aligned (see
+    /// `CType::c11_alignof_ctx`). A typedef carrying its own `aligned`
+    /// override is user-aligned by definition.
+    pub(super) fn c11_alignof_type(&self, ts: &TypeSpecifier) -> usize {
+        let align = self.alignof_type(ts);
+        if align <= crate::common::types::target_biggest_alignment() {
+            return align;
+        }
+        if let TypeSpecifier::TypedefName(name) = ts {
+            if self.types.typedef_alignments.contains_key(name) {
+                return align;
+            }
+        }
+        let ctype = self.type_spec_to_ctype(ts);
+        let capped = ctype.c11_alignof_ctx(&*self.types.borrow_struct_layouts());
+        // `alignof_type` may know more than the CType (typeof, typedef
+        // chains); the cap can only lower the answer.
+        align.min(capped)
     }
 
     /// Compute preferred (natural) alignment of a type in bytes (__alignof__).
@@ -611,8 +639,9 @@ impl Lowerer {
             } else {
                 target_ptr_size()
             };
+            // Typedef `aligned(N)` replaces the alignment (see `alignof_type`).
             if let Some(&td_align) = self.types.typedef_alignments.get(name) {
-                return natural.max(td_align);
+                return td_align;
             }
             return natural;
         }
@@ -625,10 +654,10 @@ impl Lowerer {
         if let TypeSpecifier::TypeofType(inner) = ts {
             return self.preferred_alignof_type(inner);
         }
-        if let TypeSpecifier::Vector(_, total_bytes) = ts {
-            return (*total_bytes).min(16);
-        }
-        if matches!(ts, TypeSpecifier::ExtVector(..) | TypeSpecifier::Enum(..)) {
+        if matches!(
+            ts,
+            TypeSpecifier::Vector(..) | TypeSpecifier::ExtVector(..) | TypeSpecifier::Enum(..)
+        ) {
             return self
                 .type_spec_to_ctype(ts)
                 .preferred_align_ctx(&*self.types.borrow_struct_layouts());

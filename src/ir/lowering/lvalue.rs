@@ -155,7 +155,28 @@ impl Lowerer {
                 // including segment-qualified member arrays.
                 let addr_space = self.get_addr_space_of_struct_expr(expr);
                 let addr = self.compute_array_element_addr(base, index);
+                if base_ct.is_x87_lane_vector() {
+                    return Some(LValue {
+                        kind: LValueKind::X87VectorLane(addr, addr_space),
+                        volatile: vol,
+                        sso: SsoMode::None,
+                    });
+                }
                 Some(LValue::address(addr, addr_space, vol))
+            }
+            Expr::MemberAccess(base_expr, field_name, _)
+                if self
+                    .vector_member_lanes(base_expr, field_name, false)
+                    .is_some() =>
+            {
+                self.vector_component_lvalue(expr, base_expr, field_name, false, vol)
+            }
+            Expr::PointerMemberAccess(base_expr, field_name, _)
+                if self
+                    .vector_member_lanes(base_expr, field_name, true)
+                    .is_some() =>
+            {
+                self.vector_component_lvalue(expr, base_expr, field_name, true, vol)
             }
             Expr::MemberAccess(base_expr, field_name, _) => {
                 // s.field as lvalue -> compute address of the field
@@ -264,7 +285,9 @@ impl Lowerer {
     /// Get the address (as a Value) from an LValue.
     pub(super) fn lvalue_addr(&self, lv: &LValue) -> Value {
         match &lv.kind {
-            LValueKind::Variable(v) | LValueKind::Address(v, _) => *v,
+            LValueKind::Variable(v)
+            | LValueKind::Address(v, _)
+            | LValueKind::X87VectorLane(v, _) => *v,
             LValueKind::PackedBoolVectorLane { byte_addr, .. } => *byte_addr,
         }
     }
@@ -273,7 +296,7 @@ impl Lowerer {
     pub(super) fn lvalue_addr_space(&self, lv: &LValue) -> AddressSpace {
         match &lv.kind {
             LValueKind::Variable(_) => AddressSpace::Default,
-            LValueKind::Address(_, seg) => *seg,
+            LValueKind::Address(_, seg) | LValueKind::X87VectorLane(_, seg) => *seg,
             LValueKind::PackedBoolVectorLane { address_space, .. } => *address_space,
         }
     }
@@ -515,6 +538,11 @@ impl Lowerer {
             });
             return;
         }
+        if let LValueKind::X87VectorLane(addr, seg) = lv.kind {
+            let val = self.emit_implicit_cast(val, ty, IrType::F128);
+            self.store_x87_lane(addr, val, lv.volatile, seg);
+            return;
+        }
         let addr = self.lvalue_addr(lv);
         let seg_override = self.lvalue_addr_space(lv);
         // Reverse scalar_storage_order members are byte-fixed-up before write.
@@ -655,12 +683,213 @@ impl Lowerer {
             .unwrap_or_else(|| elem_ct.size());
         let addr = self.vector_lane_byte_addr(base, lane.saturating_mul(stride));
         let val = self.emit_implicit_cast(val, val_ty, elem_ir_ty);
+        if vector_ct.is_x87_lane_vector() {
+            self.store_x87_lane(addr, val, volatile, seg_override);
+            return;
+        }
         self.emit(Instruction::Store {
             volatile,
             val,
             ptr: addr,
             ty: elem_ir_ty,
             seg_override,
+        });
+    }
+
+    /// Address of lane `lane` of the ext vector denoted by `base_expr`
+    /// (`is_pointer`: `base_expr` is a pointer to it).
+    pub(super) fn vector_lane_addr_of_expr(
+        &mut self,
+        base_expr: &Expr,
+        vec_ct: &CType,
+        lane: usize,
+        is_pointer: bool,
+    ) -> Value {
+        let base = if is_pointer {
+            let ptr_val = self.lower_expr(base_expr);
+            self.operand_to_value(ptr_val)
+        } else {
+            self.get_struct_base_addr(base_expr)
+        };
+        let stride = vec_ct
+            .vector_element_storage_size()
+            .unwrap_or_else(|| vec_ct.vector_info().map_or(1, |(e, _)| e.size()));
+        self.vector_lane_byte_addr(base, lane.saturating_mul(stride))
+    }
+
+    /// `v.x = ...` / `p->y += ...`: a single ext-vector component is an
+    /// lvalue of the element (a bit for packed `_Bool`, a 10-byte x87 lane
+    /// for `long double`). A multi-component swizzle is not assignable in
+    /// lccc yet; Clang accepts `v.xy = w` -- diagnosed, not miscompiled.
+    fn vector_component_lvalue(
+        &mut self,
+        expr: &Expr,
+        base_expr: &Expr,
+        field_name: &str,
+        is_pointer: bool,
+        vol: bool,
+    ) -> Option<LValue> {
+        let (vec_ct, lanes) = self.vector_member_lanes(base_expr, field_name, is_pointer)?;
+        if lanes.len() != 1 {
+            self.emit_error(
+                format!(
+                    "assignment to the vector swizzle '.{field_name}' is not supported; \
+                     assign the components one at a time"
+                ),
+                expr.span(),
+            );
+            return None;
+        }
+        let lane = lanes[0];
+        // `v.lo.x = ...`: the inner swizzle is an rvalue temporary (Clang:
+        // "expression is not assignable"); writing into it would be lost.
+        let inner_swizzle = match base_expr {
+            Expr::MemberAccess(b, f, _) => self.vector_member_lanes(b, f, false),
+            Expr::PointerMemberAccess(b, f, _) => self.vector_member_lanes(b, f, true),
+            _ => None,
+        };
+        if inner_swizzle.is_some_and(|(_, l)| l.len() > 1) {
+            self.emit_error("expression is not assignable", expr.span());
+            return None;
+        }
+        let addr_space = if is_pointer {
+            self.get_addr_space_of_ptr_expr(base_expr)
+        } else {
+            self.get_addr_space_of_struct_expr(base_expr)
+        };
+        if vec_ct.is_bitpacked_bool_vector() {
+            let base = if is_pointer {
+                let ptr_val = self.lower_expr(base_expr);
+                self.operand_to_value(ptr_val)
+            } else {
+                self.get_struct_base_addr(base_expr)
+            };
+            let byte_addr = self.vector_lane_byte_addr(base, lane / 8);
+            let bit_index = self.fresh_value();
+            self.emit(Instruction::Copy {
+                dest: bit_index,
+                src: Operand::Const(IrConst::I64((lane % 8) as i64)),
+            });
+            let bit_index =
+                self.emit_implicit_cast(Operand::Value(bit_index), IrType::I64, IrType::U8);
+            let bit_index = self.operand_to_value(bit_index);
+            return Some(LValue {
+                kind: LValueKind::PackedBoolVectorLane {
+                    byte_addr,
+                    bit_index,
+                    address_space: addr_space,
+                },
+                volatile: vol,
+                sso: SsoMode::None,
+            });
+        }
+        let addr = self.vector_lane_addr_of_expr(base_expr, &vec_ct, lane, is_pointer);
+        if vec_ct.is_x87_lane_vector() {
+            return Some(LValue {
+                kind: LValueKind::X87VectorLane(addr, addr_space),
+                volatile: vol,
+                sso: SsoMode::None,
+            });
+        }
+        Some(LValue::address(addr, addr_space, vol))
+    }
+
+    /// Store a `long double` lane of an ext vector at `addr`. Lanes are
+    /// `X87_LANE_STRIDE` (10) bytes apart while an `F128` store writes 16
+    /// bytes, so a direct store would clobber the first six bytes of the
+    /// next lane: write the value to a 16-byte scratch and copy the 80-bit
+    /// image. Lane *loads* stay direct: the extra six bytes read past a lane
+    /// are inside the vector object (`lanes * 10 + 6 <= pow2(lanes * 16)`)
+    /// and the x87 ignores them.
+    pub(super) fn store_x87_lane(
+        &mut self,
+        addr: Value,
+        val: Operand,
+        volatile: bool,
+        seg_override: AddressSpace,
+    ) {
+        // A constant lane value needs no x87 round trip: store its 80-bit
+        // image as an 8-byte and a 2-byte immediate store (`v.x = 1.0L`).
+        if let Operand::Const(IrConst::LongDouble(_, f128_bytes)) = &val {
+            let x87 = crate::common::long_double::f128_bytes_to_x87_bytes(f128_bytes);
+            let lo = u64::from_le_bytes([
+                x87[0], x87[1], x87[2], x87[3], x87[4], x87[5], x87[6], x87[7],
+            ]);
+            let hi = u16::from_le_bytes([x87[8], x87[9]]);
+            self.emit(Instruction::Store {
+                volatile,
+                val: Operand::Const(IrConst::I64(lo as i64)),
+                ptr: addr,
+                ty: IrType::U64,
+                seg_override,
+            });
+            let hi_dst = self.emit_gep_offset(addr, 8, IrType::U16);
+            self.emit(Instruction::Store {
+                volatile,
+                val: Operand::Const(IrConst::I64(i64::from(hi))),
+                ptr: hi_dst,
+                ty: IrType::U16,
+                seg_override,
+            });
+            return;
+        }
+        let scratch = self.fresh_value();
+        self.emit(Instruction::Alloca {
+            dest: scratch,
+            ty: IrType::F128,
+            size: 16,
+            align: 16,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        self.emit(Instruction::Store {
+            volatile: false,
+            val,
+            ptr: scratch,
+            ty: IrType::F128,
+            seg_override: AddressSpace::Default,
+        });
+        if volatile || seg_override != AddressSpace::Default {
+            // Copy the ten bytes as two typed stores so the access keeps
+            // its volatility / segment (Memcpy carries neither).
+            let lo = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: lo,
+                ptr: scratch,
+                ty: IrType::U64,
+                seg_override: AddressSpace::Default,
+            });
+            let hi_src = self.emit_gep_offset(scratch, 8, IrType::U16);
+            let hi = self.fresh_value();
+            self.emit(Instruction::Load {
+                volatile: false,
+                dest: hi,
+                ptr: hi_src,
+                ty: IrType::U16,
+                seg_override: AddressSpace::Default,
+            });
+            self.emit(Instruction::Store {
+                volatile,
+                val: Operand::Value(lo),
+                ptr: addr,
+                ty: IrType::U64,
+                seg_override,
+            });
+            let hi_dst = self.emit_gep_offset(addr, 8, IrType::U16);
+            self.emit(Instruction::Store {
+                volatile,
+                val: Operand::Value(hi),
+                ptr: hi_dst,
+                ty: IrType::U16,
+                seg_override,
+            });
+            return;
+        }
+        self.emit(Instruction::Memcpy {
+            dest: addr,
+            src: scratch,
+            size: crate::common::types::X87_LANE_STRIDE,
         });
     }
 

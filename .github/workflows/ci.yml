@@ -584,6 +584,16 @@ jobs:
       run: python3 tests/regression/check_vector_arg_forms.py --lccc target/fastbuild/lccc --cc gcc-16
     - name: Wide-vector ABI debt (latched)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_abi_wide.sh
+    - name: GNU vector_size alignment model and MEMORY-class vector argument ABI against GCC 16
+      run: |
+        set -o pipefail
+        env CCC=target/fastbuild/lccc bash tests/regression/check_gnu_vector_align_abi.sh 2>&1 |
+          tee "$RUNNER_TEMP/gnu-vector-align-abi.log"
+    - name: Surface GNU vector alignment ABI failures in annotations
+      if: failure()
+      run: |
+        [ -s "$RUNNER_TEMP/gnu-vector-align-abi.log" ] &&
+          python3 scripts/ci_annotate_log.py --title "GNU vector alignment ABI" "$RUNNER_TEMP/gnu-vector-align-abi.log" || true
     - name: LCCC vs GCC compatibility suite
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_compat_suite.sh
     - name: IVSR/univsr loop-strength-reduction probe contracts
@@ -597,6 +607,8 @@ jobs:
         env CCC=target/fastbuild/lccc python3 scripts/check_repro_replay.py
     - name: Shuffle builtin diagnostics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_shuffle_diagnostics.sh
+    - name: ext-vector swizzle diagnostics
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_swizzle_diagnostics.sh
     - name: Subscript constraint diagnostics
       run: env CCC=target/fastbuild/lccc python3 tests/regression/check_subscript_diagnostics.py
     - name: Cross-target intrinsic trap

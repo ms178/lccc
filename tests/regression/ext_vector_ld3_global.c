@@ -1,8 +1,11 @@
 /*
  * Focused regression for real memory access to an initialized long-double
- * ext-vector global. Keep this LCCC-only: Clang 19.1.7 and ICX 2026.2 report
- * sizeof/alignof(ld3) as 64/64 but emit only a 32-byte ELF object for this
- * initializer, so they are not a valid object-representation oracle here.
+ * ext-vector global. Keep this LCCC-only: GCC ignores ext_vector_type.
+ * Clang 19.1.7 and ICX 2026.2 report sizeof/alignof(ld3) as 64/64 but emit
+ * a 32-byte ELF object for this initializer -- that is not an oracle defect
+ * but the layout itself: LLVM packs `<3 x x86_fp80>` at the 80-bit element
+ * size (3 * 10 = 30 bytes, allocated as 32) inside the 64-byte C object, and
+ * lccc now uses the same 10-byte lane stride (ABI-EXTVEC-LD-1).
  */
 typedef long double ld3 __attribute__((ext_vector_type(3)));
 

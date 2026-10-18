@@ -41,13 +41,16 @@ impl Lowerer {
 
         // X87-class aggregate (`struct { long double }`): the value leaves in
         // %st(0), so the IR returns the long double read out of the object.
+        // The two-lane `long double` ext vector additionally leaves lane 1
+        // in %st(1) (`SetReturnF128Second`, the `_Complex long double`
+        // pair); lane 0 is the IR return value.
         let fname = self.func().name.clone();
-        if self
+        let (x87_single, x87_pair) = self
             .func_meta
             .sigs
             .get(fname.as_str())
-            .is_some_and(|s| s.ret_x87_aggregate)
-        {
+            .map_or((false, false), |s| (s.ret_x87_aggregate, s.ret_x87_pair));
+        if x87_single || x87_pair {
             let seg = self.aggregate_lvalue_space(e);
             let addr = self.get_struct_base_addr(e);
             let val = self.fresh_value();
@@ -58,6 +61,21 @@ impl Lowerer {
                 ty: IrType::F128,
                 seg_override: seg,
             });
+            if x87_pair {
+                let lane1_ptr =
+                    self.emit_gep_offset(addr, crate::common::types::X87_LANE_STRIDE, IrType::F128);
+                let lane1 = self.fresh_value();
+                self.emit(Instruction::Load {
+                    volatile: false,
+                    dest: lane1,
+                    ptr: lane1_ptr,
+                    ty: IrType::F128,
+                    seg_override: seg,
+                });
+                self.emit(Instruction::SetReturnF128Second {
+                    src: Operand::Value(lane1),
+                });
+            }
             return Operand::Value(val);
         }
 
