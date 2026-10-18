@@ -1202,6 +1202,24 @@ gate "got64-old-spelling" fast \
 gate "tls-pie-preemptible" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_pie_preemptible.sh
 
+# T5 (vellvm/vir transplant register): bounded fixpoint loops that exhaust
+# their round budget are observable under CCC_TIME_PASSES, and the
+# cross_pr_redteam.c backedge_pre cap hit (measured over 2,654 files) is the
+# witness that the report is wired end to end.
+gate "round-cap-observability" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_round_cap_observability.sh
+
+# T6: the IR verifier (CCC_VERIFY_IR=abort) stays clean on a fixed 80-file subset.
+gate "verify-ir-clean" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_verify_ir_clean.sh
+
+# T4/T7: mutation self-tests for the C reducer and the punning fuzzer's model.
+gate "c-reduce-selftest" fast \
+    python3 -m unittest discover -s tests/fuzz -p test_c_reduce.py
+
+gate "punning-fuzz-selftest" fast \
+    python3 -m unittest discover -s tests/fuzz -p test_punning_fuzz.py
+
 gate "rmw-sib-folds" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_rmw_sib_folds.sh
 

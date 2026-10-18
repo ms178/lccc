@@ -363,6 +363,24 @@ fn a_use_before_its_definition_in_the_same_block_is_reported() {
 }
 
 #[test]
+fn an_instruction_consuming_its_own_result_is_reported() {
+    // `v9 = copy v9`: the only definition of v9 is the use itself. Block-level
+    // dominance holds trivially, so only the same-block rule can reject it. The
+    // rule is strict (`def index < use index`); an equal-index acceptance
+    // (`<=`) is the classic off-by-one, which the use-before-def fixture above
+    // (two different instructions) cannot detect.
+    let f = func_of(vec![blk(
+        0,
+        vec![Instruction::Copy {
+            dest: Value(9),
+            src: v(9),
+        }],
+        ret(),
+    )]);
+    assert_reports(&f, "does not dominate its use");
+}
+
+#[test]
 fn a_definition_in_one_diamond_arm_does_not_dominate_the_join() {
     // v11 exists only on the left path; the join consumes it regardless.
     let f = func_of(vec![

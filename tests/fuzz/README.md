@@ -69,3 +69,51 @@ stdout/exit only; the engines pass `-w` so stderr stays empty for both
 sides), and `intcmp_thread`'s separate gcc-`-O0`-vs-gcc-`-O2` stability
 check is not reproduced — the unified oracle compares gcc against lccc at
 each level instead.
+
+## Type-punning (byte-precise) fuzzing
+
+`punning_fuzz.py` generates deterministic C translation units that store and load a
+`union` (8 bytes) through defined punning forms only: union member access, `memcpy`
+at arbitrary byte offsets, and `unsigned char` access. The expected output comes from
+an independent Python byte model (little-endian, modular conversions) in the spirit of
+Vellvm's `MemoryBytes` (concept only; no code copied).
+
+```bash
+# 1. Oracle self-check first: the model must agree with a trusted compiler.
+python3 tests/fuzz/punning_fuzz.py --ccc gcc --seeds 0:300 --levels O0,O1,O2,O3,Os --out /tmp/p-gcc
+# 2. Then the compiler under test.
+python3 tests/fuzz/punning_fuzz.py --ccc ./target/fastbuild/lccc --seeds 0:1000 --out /tmp/p-lccc
+# Inspect one case:
+python3 tests/fuzz/punning_fuzz.py --emit-only 3
+```
+
+Failures keep their source under `--out`. `test_punning_fuzz.py` runs in the
+`unittest discover` gate. Scope and coverage gaps (floats, `__int128`, bit-fields,
+structs, overlapping `memcpy`) are tracked as T7 in
+`docs/VELLVM_VIR_TRANSPLANT_AUDIT.md`.
+
+## C-level miscompile reduction (`c_reduce.py`)
+
+`scripts/c_reduce.py` shrinks a C file while a predicate keeps accepting it
+(ddmin, then a one-line fixpoint, so the result is 1-minimal).
+`scripts/c_reduce_predicate.py` is the predicate: it accepts a candidate only
+if GCC `-O0` with UBSan and ASan runs it cleanly and deterministically, and
+then only if the compiler under test disagrees (`--kind miscompile`) or dies
+(`--kind crash`).  Without the reference oracle a reduction can turn a real bug
+into undefined behaviour and report a false miscompile.
+
+```
+scripts/c_reduce.py case.c --out min.c -- \
+    python3 scripts/c_reduce_predicate.py --ccc target/fastbuild/lccc --level=-O2
+```
+
+The reducer and predicate are covered by `tests/fuzz/test_c_reduce.py`
+(mutation tests with `fake_miscompiler.py`, a compiler with a known miscompile).
+
+## Punning lanes (T7)
+
+`punning_fuzz.py` now covers `float`/`double` (bit patterns, exponent forced
+finite), `__int128`, and two lanes: `--lanes base,v3` (`v3` adds
+`-march=x86-64-v3`).  Self-check the model against a reference before trusting
+any verdict: `--ccc gcc`, `--ccc clang`, or `--ccc icx` (the model agreed with all
+three, 240 of 240 each).  Not yet covered: bit-fields and struct padding.

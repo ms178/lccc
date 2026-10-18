@@ -102,6 +102,7 @@ use crate::common::types::IrType;
 use crate::ir::reexports::{
     BlockId, Instruction, IrCmpOp, IrConst, IrFunction, Operand, Terminator, Value,
 };
+use crate::passes::round_cap;
 
 /// Safety bound on the per-function fixpoint. In loop-free CFGs the edge
 /// count into merges strictly decreases and functions converge in a few
@@ -117,12 +118,17 @@ const MAX_ROUNDS: usize = 512;
 /// predecessor edges.
 pub(crate) fn run(func: &mut IrFunction) -> usize {
     let mut total = 0usize;
+    let mut converged = false;
     for _ in 0..MAX_ROUNDS {
         let n = thread_round(func);
         total += n;
         if n == 0 {
+            converged = true;
             break;
         }
+    }
+    if !converged {
+        round_cap::note_cap_hit(round_cap::Site::BoolThread);
     }
     total
 }

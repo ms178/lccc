@@ -90,6 +90,7 @@ use super::loop_analysis::{self, NaturalLoop};
 use crate::common::fx_hash::FxHashSet;
 use crate::ir::analysis;
 use crate::ir::reexports::{BasicBlock, BlockId, Instruction, IrFunction, Operand, Terminator};
+use crate::passes::round_cap;
 
 /// Rewrite every edge `old -> new` in a terminator.  Returns true if any edge
 /// was rewritten.
@@ -534,11 +535,13 @@ pub fn run_function(func: &mut IrFunction) -> usize {
     // that finds nothing.  A pathological CFG must not turn into an
     // unbounded rebuild loop.
     let max_rounds = func.blocks.len() + 1;
+    let mut converged = false;
     for _ in 0..max_rounds {
         let cfg = analysis::CfgAnalysis::build(func);
         let loops =
             loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
         if loops.is_empty() {
+            converged = true;
             break;
         }
         let loops = loop_analysis::merge_loops_by_header(loops);
@@ -555,14 +558,19 @@ pub fn run_function(func: &mut IrFunction) -> usize {
             .collect();
         let plans = plan_insertions(func, &paying, &cfg, &mut census);
         if plans.is_empty() {
+            converged = true;
             break;
         }
         let n = apply_insertions(func, &plans);
         if n == 0 {
+            converged = true;
             break;
         }
         total += n;
         census.inserted += n;
+    }
+    if !converged {
+        round_cap::note_cap_hit(round_cap::Site::LoopPreheader);
     }
     report_census(&func.name, census);
     total

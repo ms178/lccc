@@ -622,6 +622,125 @@ mod dominator_tests {
             assert_eq!(snca, chk, "succs = {succs:?}");
         }
     }
+
+    /// Ground truth that shares no code with either production algorithm: the
+    /// textbook set equations `Dom(entry) = {entry}` and
+    /// `Dom(n) = {n} ∪ ⋂ Dom(p)` over reachable predecessors, iterated to a
+    /// fixed point. The immediate dominator of `n` is its strict dominator with
+    /// the largest dominator set, because strict dominators form a chain.
+    /// Unreachable blocks map to `usize::MAX`, the convention of `compute_dominators`.
+    fn naive_idom(succs: &[Vec<usize>]) -> Vec<usize> {
+        const UNREACHABLE: usize = usize::MAX;
+        let n = succs.len();
+        let preds = preds_of(succs);
+        let mut reach = vec![false; n];
+        let mut stack = vec![0usize];
+        reach[0] = true;
+        while let Some(b) = stack.pop() {
+            for &s in &succs[b] {
+                if !reach[s] {
+                    reach[s] = true;
+                    stack.push(s);
+                }
+            }
+        }
+        // dom[b][d] == true iff d dominates b.
+        let mut dom = vec![vec![true; n]; n];
+        for (row, &r) in dom.iter_mut().zip(&reach) {
+            if !r {
+                row.fill(false);
+            }
+        }
+        dom[0].fill(false);
+        dom[0][0] = true;
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in (1..n).filter(|&b| reach[b]) {
+                let mut next = vec![true; n];
+                for &p in preds[b].iter().filter(|&&p| reach[p]) {
+                    for (x, &y) in next.iter_mut().zip(&dom[p]) {
+                        *x &= y;
+                    }
+                }
+                next[b] = true;
+                if next != dom[b] {
+                    dom[b] = next;
+                    changed = true;
+                }
+            }
+        }
+        let mut idom = vec![UNREACHABLE; n];
+        for (b, &r) in reach.iter().enumerate() {
+            if !r {
+                continue;
+            }
+            idom[b] = if b == 0 {
+                0
+            } else {
+                (0..n)
+                    .filter(|&d| d != b && dom[b][d])
+                    .max_by_key(|&d| dom[d].iter().filter(|&&x| x).count())
+                    .expect("a reachable non-entry block has the entry as a strict dominator")
+            };
+        }
+        idom
+    }
+
+    /// Validates the oracle itself on the textbook shapes before it is trusted.
+    #[test]
+    fn set_equation_oracle_matches_textbook_shapes() {
+        const U: usize = usize::MAX;
+        assert_eq!(
+            naive_idom(&[vec![1, 2], vec![3], vec![3], vec![], vec![3]]),
+            vec![0, 0, 0, 0, U]
+        );
+        // Irreducible loop entered at both 1 and 2: neither entry dominates the other.
+        assert_eq!(
+            naive_idom(&[vec![1, 2], vec![2], vec![1, 3], vec![]]),
+            vec![0, 0, 0, 2]
+        );
+        assert_eq!(naive_idom(&[vec![0]]), vec![0]);
+    }
+
+    /// Third, independent oracle on random CFGs with back edges, self loops,
+    /// unreachable islands and parallel edges. SNCA and CHK can agree with each
+    /// other while sharing a convention bug (both consume the same
+    /// predecessor/reachability view), so both must also match the set equations.
+    #[test]
+    fn matches_set_equation_ground_truth_on_random_cfgs() {
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut rnd = |m: usize| -> usize {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % m as u64) as usize
+        };
+        for _ in 0..1500 {
+            let n = 1 + rnd(48);
+            let mut succs = vec![Vec::new(); n];
+            for (b, row) in succs.iter_mut().enumerate() {
+                for _ in 0..rnd(4) {
+                    let t = match rnd(4) {
+                        0 => rnd(n),
+                        1 => b.saturating_sub(rnd(3)),
+                        _ => (b + 1 + rnd(4)).min(n - 1),
+                    };
+                    row.push(t);
+                }
+            }
+            let expected = naive_idom(&succs);
+            let (snca, chk) = both(&succs);
+            assert_eq!(
+                snca, expected,
+                "SNCA disagrees with set equations: succs = {succs:?}"
+            );
+            assert_eq!(
+                chk, expected,
+                "CHK disagrees with set equations: succs = {succs:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
