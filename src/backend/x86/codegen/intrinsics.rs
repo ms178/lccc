@@ -31,6 +31,10 @@ pub(super) enum IntCmpLane {
     Byte,
     /// 16-bit lanes: `pcmpeqw` / `pcmpgtw`, bias 0x8000 in every word.
     Word,
+    /// 64-bit lanes: `pcmpeqq` (SSE4.1) / `pcmpgtq` (SSE4.2), bias
+    /// 0x8000_0000_0000_0000.  No packed unsigned min/max below AVX-512,
+    /// so `le` keeps the bias + invert form.
+    Qword,
 }
 
 /// Mnemonic domain for the SSE2-baseline lane-mask select (see
@@ -5868,6 +5872,12 @@ impl X86Codegen {
                     self.emit_int_cmp(d, args, avx2, IntCmpLane::Dword);
                 }
             }
+            IntrinsicOp::VecCmpI64x4 | IntrinsicOp::VecCmpI64x2 => {
+                if let Some(d) = dest {
+                    let avx2 = matches!(op, IntrinsicOp::VecCmpI64x4);
+                    self.emit_int_cmp(d, args, avx2, IntCmpLane::Qword);
+                }
+            }
             // ---- Byte-lane (I8/U8) map ops -------------------------------
             //
             // 32 elements per YMM instead of the 8 an `int`-promoted tree
@@ -8675,6 +8685,13 @@ impl X86Codegen {
         // commit clears a pending naming the committed value (a SOURCE
         // pending consumed by this write); the dest's own pending must
         // survive it (the hsum stale-slot miscompile class).
+        self.vex128_commit_dest(dest_ptr, dst_home);
+    }
+
+    /// Commit a VEX.128 result written straight into `dst_home` (or into
+    /// `%xmm0` when the destination has no register home): bookkeeping,
+    /// then the slot store / deferral an unhomed destination needs.
+    fn vex128_commit_dest(&mut self, dest_ptr: &Value, dst_home: Option<&'static str>) {
         let dst_static: &'static str = dst_home.unwrap_or("xmm0");
         self.sse_commit_dest_direct(dest_ptr, dst_static);
         if dst_home.is_none() {
@@ -9038,76 +9055,124 @@ impl X86Codegen {
         // that can drift (the unsigned bias is the subtle part: it must be
         // the sign bit OF EACH LANE, i.e. 0x80 replicated per byte, not one
         // 0x8000_0000 word).
-        let (sfx, bias_lane, bias_lane_bytes) = match lane {
-            IntCmpLane::Dword => ("d", 0x8000_0000u64, 4u8),
-            IntCmpLane::Byte => ("b", 0x8080_8080u64, 4u8),
-            IntCmpLane::Word => ("w", 0x8000_8000u64, 4u8),
+        let (sfx, bias_lane, bias_lane_bytes, minmax) = match lane {
+            IntCmpLane::Dword => ("d", 0x8000_0000u64, 4u8, Some(("vpminsd", "vpminud"))),
+            IntCmpLane::Byte => ("b", 0x8080_8080u64, 4u8, Some(("vpminsb", "vpminub"))),
+            IntCmpLane::Word => ("w", 0x8000_8000u64, 4u8, Some(("vpminsw", "vpminuw"))),
+            IntCmpLane::Qword => ("q", 0x8000_0000_0000_0000u64, 8u8, None),
         };
         self.state.invalidate_vec_peephole();
-        if avx2 {
-            // All-homed three-operand VEX form for the four SIGNED
-            // predicates.  x86 provides only `pcmpeq` and `pcmpgt`, so the
-            // predicate vocabulary maps as
-            //
-            //   imm 0  eq     -> vpcmpeq b, a, d
-            //   imm 1  lt.s   -> vpcmpgt a, b, d           (d = b > a)
-            //   imm 2  le.s   -> vpcmpgt b, a, d ; invert  (d = !(a > b))
-            //   imm 4  ne     -> vpcmpeq b, a, d ; invert
-            //
-            // and the inversion needs an all-ones vector, which is built in
-            // the reserved `%ymm1` scratch (the staging path below uses the
-            // same register for the same reason, so it is scratch by
-            // contract).  Even with the inversion this is three instructions
-            // against the staging path's five, and it writes no `%ymm0`.
-            //
-            // The unsigned forms need a sign-biased COPY of both operands
-            // and therefore cannot run register-to-register; they keep the
-            // staging path.  (In practice the unsigned range fusion of
-            // OP-05c rewrites the common ones into `lt.s` before they ever
-            // reach here.)
-            //
-            // HISTORY -- do not "simplify" this guard.  It was once written
-            // `if !unsigned && (eq || !invert)`, which admits `ne`
-            // (eq = true, invert = true) and then fell into the `eq` arm and
-            // emitted a bare `vpcmpeqd`: `v != 0 ? -v : v` silently
-            // computed `v == 0 ? -v : v`.  The regression corpus missed it
-            // because no map kernel there used a `!=` mask at AVX2; the
-            // differential correctness gate caught it.  `emit_int_cmp` is
-            // now covered predicate-by-predicate by
-            // `tests/correctness` case `vectorize_cmp_predicate_matrix`.
-            if !unsigned {
-                if let Some(homes) = self.all_vec_homes_256(&[&args[0], &args[1]], dest) {
-                    let (a, b, d) = (&homes[0], &homes[1], &homes[2]);
-                    match (eq, invert) {
-                        // eq: symmetric, operand order irrelevant.
-                        (true, false) => self
-                            .state
-                            .emit_fmt(format_args!("    vpcmpeq{} {}, {}, {}", sfx, b, a, d)),
-                        // lt.s: dst = b > a, and AT&T `vpcmpgt src2, src1, dst`
-                        // computes `src1 > src2`, so `b` is the FIRST source.
-                        (false, false) => self
-                            .state
-                            .emit_fmt(format_args!("    vpcmpgt{} {}, {}, {}", sfx, a, b, d)),
-                        // ne: !(a == b)
-                        (true, true) => self
-                            .state
-                            .emit_fmt(format_args!("    vpcmpeq{} {}, {}, {}", sfx, b, a, d)),
-                        // le.s: !(a > b) -- `a` is the greater-side source.
-                        (false, true) => self
-                            .state
-                            .emit_fmt(format_args!("    vpcmpgt{} {}, {}, {}", sfx, b, a, d)),
-                    }
-                    if invert {
-                        // `vpcmpeqd %r, %r, %r` is the canonical all-ones
-                        // idiom and is lane-agnostic (every lane equals
-                        // itself at any element width).
-                        self.state.emit("    vpcmpeqd %ymm1, %ymm1, %ymm1");
-                        self.state
-                            .emit_fmt(format_args!("    vpxor %ymm1, {}, {}", d, d));
-                    }
-                    self.note_vec_dest_in_home(dest, d);
-                    return;
+        // VEX three-operand spellings shared by the 256-bit all-homed path
+        // and the VEX.128 path.  x86 provides only `pcmpeq` and `pcmpgt`
+        // (plus packed min below the qword width), so the predicate
+        // vocabulary maps as
+        //
+        //   imm 0  eq     -> vpcmpeq b, a, d
+        //   imm 1  lt.s   -> vpcmpgt a, b, d              (d = b > a)
+        //   imm 2  le.s   -> vpmins b, a, t ; vpcmpeq t, a, d   (min(a,b) == a)
+        //                    qword: vpcmpgt b, a, d ; invert
+        //   imm 4  ne     -> vpcmpeq b, a, d ; invert
+        //   imm 5  lt.u   -> vpxor bias, a, s0 ; vpxor bias, b, s1 ; vpcmpgt s0, s1, d
+        //   imm 6  le.u   -> vpminu b, a, t ; vpcmpeq t, a, d
+        //                    qword: bias both ; vpcmpgt s1, s0, d ; invert
+        //
+        // AT&T `vpcmpgt src2, src1, dst` computes `src1 > src2`.  The
+        // inversion xors with an all-ones built by `vpcmpeqd t, t, t`
+        // (lane-agnostic: every lane equals itself at any width) in the
+        // dead second scratch.  `d` may alias `a` or `b` (destructive chain
+        // handoff): every form reads all sources before the single write.
+        //
+        // HISTORY -- do not "simplify" the predicate decode.  A guard once
+        // written `if !unsigned && (eq || !invert)` admitted `ne` (eq =
+        // true, invert = true) into the `eq` arm and emitted a bare
+        // `vpcmpeqd`: `v != 0 ? -v : v` silently computed `v == 0 ? -v :
+        // v`.  `emit_int_cmp` is covered predicate-by-predicate by
+        // `tests/correctness` case `vectorize_cmp_predicate_matrix` and the
+        // vector-extension compare matrix.
+        struct VexCmp<'a> {
+            a: &'a str,
+            b: &'a str,
+            d: &'a str,
+            s0: &'a str,
+            s1: &'a str,
+            bias: String,
+        }
+        fn vex_cmp_lines(
+            imm: i64,
+            sfx: &str,
+            minmax: Option<(&str, &str)>,
+            r: &VexCmp<'_>,
+        ) -> Vec<String> {
+            let (a, b, d, s0, s1) = (r.a, r.b, r.d, r.s0, r.s1);
+            let invert = |v: &mut Vec<String>| {
+                v.push(format!("    vpcmpeqd {s1}, {s1}, {s1}"));
+                v.push(format!("    vpxor {s1}, {d}, {d}"));
+            };
+            let mut v = Vec::new();
+            match imm {
+                0 => v.push(format!("    vpcmpeq{sfx} {b}, {a}, {d}")),
+                4 => {
+                    v.push(format!("    vpcmpeq{sfx} {b}, {a}, {d}"));
+                    invert(&mut v);
                 }
+                1 => v.push(format!("    vpcmpgt{sfx} {a}, {b}, {d}")),
+                2 => match minmax {
+                    Some((mins, _)) => {
+                        v.push(format!("    {mins} {b}, {a}, {s1}"));
+                        v.push(format!("    vpcmpeq{sfx} {s1}, {a}, {d}"));
+                    }
+                    None => {
+                        v.push(format!("    vpcmpgt{sfx} {b}, {a}, {d}"));
+                        invert(&mut v);
+                    }
+                },
+                5 => {
+                    v.push(format!("    vpxor {}, {a}, {s0}", r.bias));
+                    v.push(format!("    vpxor {}, {b}, {s1}", r.bias));
+                    v.push(format!("    vpcmpgt{sfx} {s0}, {s1}, {d}"));
+                }
+                _ => match minmax {
+                    Some((_, minu)) => {
+                        v.push(format!("    {minu} {b}, {a}, {s1}"));
+                        v.push(format!("    vpcmpeq{sfx} {s1}, {a}, {d}"));
+                    }
+                    None => {
+                        v.push(format!("    vpxor {}, {a}, {s0}", r.bias));
+                        v.push(format!("    vpxor {}, {b}, {s1}", r.bias));
+                        v.push(format!("    vpcmpgt{sfx} {s1}, {s0}, {d}"));
+                        invert(&mut v);
+                    }
+                },
+            }
+            v
+        }
+        if avx2 {
+            // All-homed three-operand VEX form: no staging copies, no
+            // `%ymm0` write except as the unsigned bias scratch (flushed
+            // first: a deferred value may be parked there).
+            if let Some(homes) = self.all_vec_homes_256(&[&args[0], &args[1]], dest) {
+                let uses_s0 = unsigned && (!invert || minmax.is_none());
+                if uses_s0 {
+                    self.flush_pending_vec_store_impl();
+                }
+                let bias = if unsigned {
+                    self.lane_const_rip_operand(bias_lane, bias_lane_bytes, 32)
+                } else {
+                    String::new()
+                };
+                let r = VexCmp {
+                    a: &homes[0],
+                    b: &homes[1],
+                    d: &homes[2],
+                    s0: "%ymm0",
+                    s1: "%ymm1",
+                    bias,
+                };
+                for line in vex_cmp_lines(imm, sfx, minmax, &r) {
+                    self.state.emit(&line);
+                }
+                self.note_vec_dest_in_home(dest, &homes[2]);
+                return;
             }
 
             // b: RA home, or staged in the reserved second scratch.
@@ -9166,6 +9231,34 @@ impl X86Codegen {
             }
             self.state.vec_last_store_reg = false;
             self.avx_store_dest(dest);
+        } else if self.avx2_enabled {
+            // VEX.128: the same non-destructive three-operand forms on the
+            // XMM file (`emit_vex_binary_128`'s source/commit discipline).
+            // The qword forms need SSE4.2 (`pcmpgtq`), which VEX implies.
+            let src2 = self.vex128_source(&args[1], "xmm1");
+            let src1 = self.vex128_source(&args[0], "xmm0");
+            let dst_home = self.dest_xmm_home_name(dest);
+            let dst = match dst_home {
+                Some(name) => format!("%{}", name),
+                None => "%xmm0".to_string(),
+            };
+            let bias = if unsigned {
+                self.lane_const_rip_operand(bias_lane, bias_lane_bytes, 16)
+            } else {
+                String::new()
+            };
+            let r = VexCmp {
+                a: &src1,
+                b: &src2,
+                d: &dst,
+                s0: "%xmm0",
+                s1: "%xmm1",
+                bias,
+            };
+            for line in vex_cmp_lines(imm, sfx, minmax, &r) {
+                self.state.emit(&line);
+            }
+            self.vex128_commit_dest(dest, dst_home);
         } else {
             // SSE2 legacy two-operand forms (`op src, dst` = dst OP src):
             // the destination register must carry the GREATER-side operand

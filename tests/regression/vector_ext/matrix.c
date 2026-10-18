@@ -370,4 +370,29 @@ v32i sh_then_add(v32i a, v32i b){ return (a << b) + a; }
 v16i sh4_vs_sar(v16i a, int n){ return a >> n; }
 v16l sh4_vv_shl_l(v16l a, v16l b){ return a << b; }
 v16i sh4_chain(v16i a, v16i b, v16i c){ return (a << b) + (a >> c); }
+/* Integer compare predicates the operator grid does not reach: 64-bit
+   lanes (vpcmpeqq/vpcmpgtq), unsigned orderings (sign-bias remap), le/ge
+   (min-equality or inversion), ne, the VEX.128 twins, and a compare mask
+   consumed by a select. */
+typedef unsigned long v16ul __attribute__((vector_size(16)));
+typedef short v16s_ __attribute__((vector_size(16)));
+v32l cq_lt_s(v32l a, v32l b){ return a < b; }
+v32l cq_le_s(v32l a, v32l b){ return a <= b; }
+v32l cq_gt_s(v32l a, v32l b){ return a > b; }
+v32l cq_ne_s(v32l a, v32l b){ return a != b; }
+v32l cq_lt_u(v32ul a, v32ul b){ return a < b; }
+v32l cq_le_u(v32ul a, v32ul b){ return a <= b; }
+v32l cq_ge_u(v32ul a, v32ul b){ return a >= b; }
+v32l cq_eq_u(v32ul a, v32ul b){ return a == b; }
+v16l cq4_lt_s(v16l a, v16l b){ return a < b; }
+v16l cq4_ne_s(v16l a, v16l b){ return a != b; }
+v16l cq4_lt_u(v16ul a, v16ul b){ return a < b; }
+v16l cq4_le_u(v16ul a, v16ul b){ return a <= b; }
+v16i cd4_le_s(v16i a, v16i b){ return a <= b; }
+v16i cd4_ne_s(v16i a, v16i b){ return a != b; }
+v16i cd4_lt_u(v16u a, v16u b){ return a < b; }
+v16i cd4_le_u(v16u a, v16u b){ return a <= b; }
+v16s_ cw4_ne_s(v16s_ a, v16s_ b){ return a != b; }
+v16c cb4_le_s(v16c a, v16c b){ return a <= b; }
+v32l cq_sel(v32l a, v32l b, v32l x, v32l y){ v32l m = a < b; return (m & x) | (~m & y); }
 

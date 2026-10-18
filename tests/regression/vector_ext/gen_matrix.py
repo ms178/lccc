@@ -174,6 +174,31 @@ v32i sh_then_add(v32i a, v32i b){ return (a << b) + a; }
 v16i sh4_vs_sar(v16i a, int n){ return a >> n; }
 v16l sh4_vv_shl_l(v16l a, v16l b){ return a << b; }
 v16i sh4_chain(v16i a, v16i b, v16i c){ return (a << b) + (a >> c); }
+/* Integer compare predicates the operator grid does not reach: 64-bit
+   lanes (vpcmpeqq/vpcmpgtq), unsigned orderings (sign-bias remap), le/ge
+   (min-equality or inversion), ne, the VEX.128 twins, and a compare mask
+   consumed by a select. */
+typedef unsigned long v16ul __attribute__((vector_size(16)));
+typedef short v16s_ __attribute__((vector_size(16)));
+v32l cq_lt_s(v32l a, v32l b){ return a < b; }
+v32l cq_le_s(v32l a, v32l b){ return a <= b; }
+v32l cq_gt_s(v32l a, v32l b){ return a > b; }
+v32l cq_ne_s(v32l a, v32l b){ return a != b; }
+v32l cq_lt_u(v32ul a, v32ul b){ return a < b; }
+v32l cq_le_u(v32ul a, v32ul b){ return a <= b; }
+v32l cq_ge_u(v32ul a, v32ul b){ return a >= b; }
+v32l cq_eq_u(v32ul a, v32ul b){ return a == b; }
+v16l cq4_lt_s(v16l a, v16l b){ return a < b; }
+v16l cq4_ne_s(v16l a, v16l b){ return a != b; }
+v16l cq4_lt_u(v16ul a, v16ul b){ return a < b; }
+v16l cq4_le_u(v16ul a, v16ul b){ return a <= b; }
+v16i cd4_le_s(v16i a, v16i b){ return a <= b; }
+v16i cd4_ne_s(v16i a, v16i b){ return a != b; }
+v16i cd4_lt_u(v16u a, v16u b){ return a < b; }
+v16i cd4_le_u(v16u a, v16u b){ return a <= b; }
+v16s_ cw4_ne_s(v16s_ a, v16s_ b){ return a != b; }
+v16c cb4_le_s(v16c a, v16c b){ return a <= b; }
+v32l cq_sel(v32l a, v32l b, v32l x, v32l y){ v32l m = a < b; return (m & x) | (~m & y); }
 """
 out.append(EXTRA)
 open('matrix.c','w').write("\n".join(out)+"\n")
@@ -298,6 +323,14 @@ typedef unsigned v16u __attribute__((vector_size(16)));
   v32u pfx##sh_mixsign2(v32u,v32i); v32i pfx##sh_chain(v32i,v32i,v32i); v32i pfx##sh_then_add(v32i,v32i); \
   v16i pfx##sh4_vs_sar(v16i,int); v16l pfx##sh4_vv_shl_l(v16l,v16l); v16i pfx##sh4_chain(v16i,v16i,v16i);
 SH(G_) SH(L_)
+typedef unsigned long v16ul __attribute__((vector_size(16)));
+typedef short v16s_ __attribute__((vector_size(16)));
+#define CQ(pfx) v32l pfx##cq_lt_s(v32l,v32l); v32l pfx##cq_le_s(v32l,v32l); v32l pfx##cq_gt_s(v32l,v32l); v32l pfx##cq_ne_s(v32l,v32l); \
+  v32l pfx##cq_lt_u(v32ul,v32ul); v32l pfx##cq_le_u(v32ul,v32ul); v32l pfx##cq_ge_u(v32ul,v32ul); v32l pfx##cq_eq_u(v32ul,v32ul); \
+  v16l pfx##cq4_lt_s(v16l,v16l); v16l pfx##cq4_ne_s(v16l,v16l); v16l pfx##cq4_lt_u(v16ul,v16ul); v16l pfx##cq4_le_u(v16ul,v16ul); \
+  v16i pfx##cd4_le_s(v16i,v16i); v16i pfx##cd4_ne_s(v16i,v16i); v16i pfx##cd4_lt_u(v16u,v16u); v16i pfx##cd4_le_u(v16u,v16u); \
+  v16s_ pfx##cw4_ne_s(v16s_,v16s_); v16c pfx##cb4_le_s(v16c,v16c); v32l pfx##cq_sel(v32l,v32l,v32l,v32l);
+CQ(G_) CQ(L_)
 #define CF(pfx) v32f pfx##cf_phi_call(v32f,v32f,int); v32f pfx##cf_loop_acc(const v32f*,int); v32f pfx##cf_loop_acc_call(const v32f*,int); \
   v32f pfx##cf_nested_tern(v32f,v32f,int); v32f pfx##cf_sw(v32f,v32f,int); v32f pfx##cf_goto_loop(const v32f*,int); v32f pfx##cf_two_lives(v32f,v32f); \
   v32l pfx##cf_l_phi(v32l,v32l,int); v32d pfx##cf_d_mix(v32d,v32d,double); float pfx##cf_lane_after(v32f,v32f); v32f pfx##cf_cond_assign(v32f,v32f,int); \
@@ -369,6 +402,22 @@ static void shift_checks(void){
     { v32i a,b,c; fill(&a,sizeof a,0); fill(&b,sizeof b,0); fill(&c,sizeof c,0); for(int i=0;i<8;i++){ b[i]&=31; c[i]&=31; } v32i r1=G_sh_chain(a,b,c), r2=L_sh_chain(a,b,c); check("sh_chain",&r1,&r2,sizeof r1); }
   }
 }
+/* compare operands: random lanes, with some lanes forced equal and some to
+   the sign-bit boundary so eq/le/unsigned-order paths are all exercised */
+#define CMPV(T,N,AT) { AT a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); \
+  for(unsigned i=0;i<sizeof a/sizeof a[0];i++){ if(i%3==0) b[i]=a[i]; if(i%4==1) a[i]=(__typeof__(a[0]))((__typeof__(a[0]))1<<(sizeof a[0]*8-1)); } \
+  T r1=G_##N(a,b), r2=L_##N(a,b); check(#N,&r1,&r2,sizeof r1); }
+static void cmp64_checks(void){
+  for(int rep=0;rep<4;rep++){
+    CMPV(v32l,cq_lt_s,v32l) CMPV(v32l,cq_le_s,v32l) CMPV(v32l,cq_gt_s,v32l) CMPV(v32l,cq_ne_s,v32l)
+    CMPV(v32l,cq_lt_u,v32ul) CMPV(v32l,cq_le_u,v32ul) CMPV(v32l,cq_ge_u,v32ul) CMPV(v32l,cq_eq_u,v32ul)
+    CMPV(v16l,cq4_lt_s,v16l) CMPV(v16l,cq4_ne_s,v16l) CMPV(v16l,cq4_lt_u,v16ul) CMPV(v16l,cq4_le_u,v16ul)
+    CMPV(v16i,cd4_le_s,v16i) CMPV(v16i,cd4_ne_s,v16i) CMPV(v16i,cd4_lt_u,v16u) CMPV(v16i,cd4_le_u,v16u)
+    CMPV(v16s_,cw4_ne_s,v16s_) CMPV(v16c,cb4_le_s,v16c)
+    { v32l a,b,x,y; fill(&a,sizeof a,0); fill(&b,sizeof b,0); fill(&x,sizeof x,0); fill(&y,sizeof y,0); b[1]=a[1];
+      v32l r1=G_cq_sel(a,b,x,y), r2=L_cq_sel(a,b,x,y); check("cq_sel",&r1,&r2,sizeof r1); }
+  }
+}
 static void handoff_checks(void){
   for(int rep=0;rep<3;rep++){
     HOFFC(v16f,ho_f4,fillx4) HOFFC(v16d,ho_d2,fillxd2) HOFFC(v32f,ho_f8,fillx8) HOFFC(v32d,ho_d4,fillxd4)
@@ -401,7 +450,7 @@ static void extra_checks(void){
   { v32f a,b; v32i x,y; fillf8(&a); fillf8(&b); fill(&x,sizeof x,0); fill(&y,sizeof y,0); v32i r1=G_sel_mask(a,b,x,y), r2=L_sel_mask(a,b,x,y); check("sel_mask",&r1,&r2,sizeof r1); }
 }
 """)
-out.append('int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shift_checks();')
+out.append('int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shift_checks(); cmp64_checks();')
 out.extend(body)
 out.append('printf("%d/%d checks passed\\n", total-fails, total); return fails!=0; }')
 open('driver.c','w').write('\n'.join(out)+'\n')

@@ -6010,6 +6010,8 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecCmpF64x2
             | O::VecCmpI32x8
             | O::VecCmpI32x4
+            | O::VecCmpI64x4
+            | O::VecCmpI64x2
          | O::VecCmpI8x32
             | O::VecCmpI8x16
             | O::VecMinU8x32
@@ -6634,6 +6636,27 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             | O::VecAndI64x2
             | O::VecOrI64x2
             | O::VecXorI64x2
+            // GNU-vector 128-bit integer shapes that were missing from the
+            // chain family and therefore never register-homed (every
+            // `v8s + v8s` paid two prologue spills and four reloads):
+            // word add/sub/min/max (emit_sse_binary_128), the four
+            // integer lane compares (`emit_int_cmp*`: the all-homed VEX
+            // path writes the destination last, so a first-operand
+            // handoff is sound) and the VEX.128 variable shifts
+            // (`emit_vex_binary_128`, three-operand).
+            | O::VecAddI16x8
+            | O::VecSubI16x8
+            | O::VecMinI16x8
+            | O::VecMaxI16x8
+            | O::VecCmpI32x4
+            | O::VecCmpI64x2
+            | O::VecCmpI16x8
+            | O::VecCmpI8x16
+            | O::VecShlvI32x4
+            | O::VecLShrvI32x4
+            | O::VecAShrvI32x4
+            | O::VecShlvI64x2
+            | O::VecLShrvI64x2
     )
 }
 
@@ -8120,6 +8143,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     // Conditional-map consumers: a broadcast invariant is
                     // the compare rhs / blend true-arm (clamp shapes).
                     | O::VecCmpI32x8
+                    | O::VecCmpI64x4
                     | O::VecBlendvI32x8
                     // Integer min/max maps: the broadcast is a clamp bound.
                     | O::VecMinI32x8
@@ -8205,6 +8229,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMulI32x4
                     | O::VecAddI32x4
                     | O::VecCmpI32x4
+                    | O::VecCmpI64x2
                     | O::VecBlendvI32x4
                     // Bitwise lane maps: the broadcast is the operand of
                     // `x & K` / `x | K` / `x ^ K`, including the `mask & K`
@@ -8480,6 +8505,7 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecOrI32x8
         | O::VecXorI32x8
         | O::VecCmpI32x8
+        | O::VecCmpI64x4
         | O::VecBlendvI32x8
         | O::VecMinI32x8
         | O::VecMaxI32x8
@@ -8554,6 +8580,7 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecOrI32x4
         | O::VecXorI32x4
         | O::VecCmpI32x4
+        | O::VecCmpI64x2
         | O::VecBlendvI32x4
      | O::VecRotlI32x4
         | O::VecShufdI32x4
@@ -8711,6 +8738,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecOrI32x8
                     | O::VecXorI32x8
                     | O::VecCmpI32x8
+                    | O::VecCmpI64x4
                     | O::VecBlendvI32x8
                     | O::VecMinI32x8
                     | O::VecMaxI32x8
@@ -8789,6 +8817,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecOrI32x4
                     | O::VecXorI32x4
                     | O::VecCmpI32x4
+                    | O::VecCmpI64x2
                     | O::VecBlendvI32x4
                     | O::VecAddI8x16
                     | O::VecSubI8x16

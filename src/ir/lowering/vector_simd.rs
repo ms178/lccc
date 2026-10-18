@@ -433,7 +433,22 @@ impl Lowerer {
         let is_unsigned = elem_ct.is_unsigned();
         let cmp_op = Self::binop_to_cmp(op, is_unsigned);
         let (pred, swap) = cmp_predicate_imm(cmp_op, shape.elem_ir.is_float())?;
-        let (cmp_intrinsic, _) = packed_cmp_blendv(shape.elem_ir, shape.lanes)?;
+        let cmp_intrinsic = match packed_cmp_blendv(shape.elem_ir, shape.lanes) {
+            Some((cmp, _)) => cmp,
+            // 64-bit integer lanes have no blend family for the loop
+            // vectorizer but do have a packed compare (`vpcmpeqq` /
+            // `vpcmpgtq`, SSE4.1/4.2 -- gated on the AVX2 lowering ceiling
+            // like every other integer compare here), at both widths.
+            None if matches!(shape.elem_ir, IrType::I64 | IrType::U64)
+                && target_vector_lowering_bytes() == 32 =>
+            {
+                match shape.bytes {
+                    32 => IntrinsicOp::VecCmpI64x4,
+                    _ => IntrinsicOp::VecCmpI64x2,
+                }
+            }
+            None => return None,
+        };
         let lhs_plan = self.vec_operand_plan(lhs, &shape, vec_ct)?;
         let rhs_plan = self.vec_operand_plan(rhs, &shape, vec_ct)?;
         let a = self.vec_operand_value(lhs, lhs_plan, &shape);

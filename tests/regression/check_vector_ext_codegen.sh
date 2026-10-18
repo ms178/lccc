@@ -184,11 +184,16 @@ if ! awk '$0 == "shr_v32i:" {on=1; next} on && /\.cfi_endproc/ {exit} on' "$tmp/
     grep -q 'vpsravd'; then
     fail "shr_v32i: expected a per-lane vpsravd at -O2 -mavx2"
 fi
-# Compare masks (GCC: 2).
-for fn in eq_v32i lt_v32i eq_v32f lt_v32f lt_v16f; do ceiling "$fn" 2; done
-# DEBT (VEX-128-INT-1): the 128-bit integer compare/arith emitters stage
-# through legacy destructive SSE forms under AVX (GCC: 2 / 4).
-ceiling eq_v16i 4
+# Compare masks (GCC: 2): every lane width at both register widths, the
+# 128-bit forms through the VEX.128 three-operand path.
+for fn in eq_v32i lt_v32i eq_v32f lt_v32f lt_v16f eq_v16i lt_v16i eq_v16l lt_v16l \
+          eq_v32l lt_v32l eq_v16s lt_v16s eq_v16c lt_v16c \
+          cq_lt_s cq_gt_s cq4_lt_s cq4_lt_u cq_eq_u; do ceiling "$fn" 2; done
+# le / ne / unsigned orderings: min+eq (3), eq/gt+invert (4), bias+gt (5),
+# qword le.u = bias+gt+invert (6).  GCC: 3-5 (it has the same ISA gap).
+for fn in cd4_le_s cd4_le_u cq4_le_u cq_le_u cq_le_s; do ceiling "$fn" 6; done
+for fn in cq_ne_s cq4_ne_s cd4_ne_s cw4_ne_s cb4_le_s cq_lt_u cq_ge_u cd4_lt_u; do ceiling "$fn" 5; done
+ceiling cq_sel 7
 ceiling mix_sab4 7
 # Scalar/vector interleave: broadcast + fma + ret (GCC: 3).
 ceiling mix_sab 3
@@ -217,7 +222,6 @@ ceiling tern_se 53     # ternary whose arms are calls (two sret temporaries)
 ceiling viacall 30     # by-value call into a GCC-built callee + return
 ceiling shr_v32l 23    # signed 64-bit lanes: no vpsravq below AVX-512VL
 ceiling shr_v16l 15    # (GCC: 6 — it emulates with vpsrlvq + sign fixup)
-ceiling eq_v32l 41     # 64-bit lane compare (no vpcmpeqq/vpcmpgtq lowering yet)
 ceiling mul_v32c 136   # byte multiply (no pmullw/pack expansion yet)
 # FMA contraction (`vecfma`): `a*b + c` and its sign variants are one
 # vfmadd/vfmsub/vfnmadd + ret at 256 and 128 bits (GCC: 2).  The squared
