@@ -196,7 +196,7 @@ for fn in cd4_le_s cd4_le_u cb4_le_s; do ceiling "$fn" 3; done
 for fn in cq_le_s cq_ne_s cq4_ne_s cd4_ne_s cw4_ne_s cq_lt_u cq4_lt_u cd4_lt_u; do ceiling "$fn" 4; done
 for fn in cq4_le_u cq_le_u; do ceiling "$fn" 6; done
 ceiling cq_ge_u 7
-ceiling cq_sel 2       # (m & x) | (~m & y) -> vpcmpgtq + vpblendvb (GCC: 2)
+ceiling cq_sel 3       # (m & x) | (~m & y) -> vpcmpgtq + vpblendvb + ret (GCC: 3)
 # Scalar splats (`(T){} + x`): the integer zero identity folds, the
 # broadcast is homed and returned directly (GCC: 3).  FP keeps the
 # `{} + x` add (not an identity for -0.0): 4.
@@ -221,7 +221,7 @@ ceiling cond_v32f 9
 ceiling cond_v16i 9
 ceiling tern_lv 8
 ceiling tern_assign 10
-ceiling sel_mask 2     # vcmpps + vpblendvb (GCC: 2)
+ceiling sel_mask 3     # vcmpps + vpblendvb + ret (GCC: 3)
 # Streaming loop `r[i] = a[i]*b[i] + r[i]`: the body is load/mul/add/store
 # + control (GCC: 14 / 13 / 14 incl. its prologue).
 ceiling loop_v32f 16
