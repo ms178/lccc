@@ -1,46 +1,51 @@
 #!/usr/bin/env bash
-# AUD-VABI-2: 32-byte vectors across a compiler boundary -- measured, latched.
+# AUD-VABI-2: 32- and 64-byte vectors across a compiler boundary.
 #
-# The sibling gate (check_vector_abi_boundary.sh) pins the 16-byte case, which
-# AUD-VABI-1 fixed: a `<4 x i32>` argument or return is ONE %xmm and lccc now
-# speaks that.  The 32-byte case is a different rule with the same shape of bug:
-# the psABI classifies a vector as SSE + one SSEUP per further eightbyte, so
-# WITH AVX ENABLED a 32-byte vector is ONE %ymm register.  lccc's struct rule
-# has no SSEUP notion and stops at 16 bytes, so a 32-byte vector falls back to
-# the memory convention -- which is what a gcc caller does NOT do the moment
-# `-mavx2` is on.  Measured at the commit that added this gate:
+# The sibling gate (check_vector_abi_boundary.sh) pins the 16-byte case
+# (AUD-VABI-1: a `<4 x i32>` argument or return is ONE %xmm).  The wider
+# case is the same rule one register class up: the psABI classifies a vector
+# as SSE + one SSEUP per further eightbyte, so WITH AVX ENABLED a 32-byte
+# vector is ONE %ymm, and with AVX-512F a 64-byte vector is ONE %zmm -- for
+# arguments, for returns, and for a struct/union whose only member is such a
+# vector.  Without the AVX ABI level the same types are MEMORY.
 #
-#   with -mavx2     gcc/gcc        -> `add: 42 42 42 42 42 42 42 42`
-#                   lccc/lccc      -> `add: 42 42 42 42 42 42 42 42` (consistent)
-#                   lccc + gcc     -> `add: 0 0 0 0 0 0 0 0`   SILENT GARBAGE
-#                   gcc + lccc     -> SIGSEGV
-#   without -mavx2  all four legs  -> `add: 42 ...`            (memory convention)
+# History: this gate used to LATCH the debt (lccc had no SSEUP notion past 16
+# bytes: lccc caller + gcc callee returned silent garbage, gcc caller + lccc
+# callee crashed with SIGSEGV under -mavx2).  The fix landed with a sized
+# vector-register carrier (`StructXmmReg { size }` / `F128SseReg { size }`,
+# the hidden `%ymm0`/`%zmm0` return buffer, the variadic MEMORY demotion of
+# unnamed wide vectors), so every leg below is now required to AGREE with
+# gcc/gcc.  There is no latch left: a disagreement is a failure.
 #
-# The default code-generation baseline of this project is x86-64-v3, i.e. AVX2
-# on, so this is not a corner: it is the default configuration, and the failure
-# mode on the caller side is a silently wrong answer.
+# Two reproducers:
+#   * wide.c      -- the original `v8si`/`v4df` argument/return shapes plus
+#                    the 32-byte STRUCT control (`struct { double a,b,c,d; }`
+#                    is four SSE eightbytes, NOT SSEUP: it must keep the
+#                    memory convention under every configuration);
+#   * wide_avx.c  -- the full rule set: 32/64-byte vectors, one-member
+#                    structs/unions, the two-member and 40/96-byte structs
+#                    that stay MEMORY, the transactional SSE overflow (ninth
+#                    vector on the stack at its 32-byte alignment, the scalar
+#                    after it still in a GPR), mixed scalar/vector walks,
+#                    unnamed vectors of variadic calls (MEMORY, %al counts
+#                    only the SSE registers in use), RVO through %ymm0,
+#                    function-pointer calls and by-pointer/global state.
 #
-# The fix is a %ymm carrier (the 16-byte fix's shape again: one register, a
-# wider one), which touches return/argument classification, the prologue,
-# location allocation and the call sequence -- a project, not a patch, so this
-# gate LATCHES the debt instead of pretending it is fixed:
-#
-#   * the gcc/gcc reference and lccc/lccc are asserted to be CORRECT -- those
-#     are the parts that work and must keep working;
-#   * the two cross legs are required to show exactly the documented verdicts
-#     (`wrong-values` and `signal`).  A leg that changes -- fixed, or broken in
-#     a new way -- FAILS the gate and demands the budget below be updated in
-#     the commit that changed it.  A debt that cannot be re-measured is how a
-#     worse bug hides behind a known one.
-#   * the no-AVX2 configuration must stay green on all four legs, which also
-#     proves the comparison in this gate is live (a gate whose diffs never fire
-#     passes vacuously).
+# Each reproducer is built in four combinations (gcc/gcc reference, lccc/lccc,
+# lccc caller + gcc callee, gcc caller + lccc callee) per configuration and
+# every binary's output must equal the reference's.  Configurations:
+#   -O0/-O2 x { -mavx2, -march=x86-64-v3, -mavx512f, (none), -mno-avx }
+# The -mavx512f configuration is run only on a host whose CPU executes
+# AVX-512F (the objects are still compiled and linked everywhere).  The
+# no-AVX configurations are also the gate's liveness proof: the same diffs
+# that are silent when the two compilers agree do fire on a convention
+# mismatch, and the memory convention must keep interoperating.
 set -euo pipefail
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 ccc=${CCC:-$repo/target/fastbuild/lccc}
 gcc_bin=${GCC:-gcc}
-src=$repo/tests/regression/vector_abi_boundary/wide.c
+dir=$repo/tests/regression/vector_abi_boundary
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -50,88 +55,80 @@ command -v "$gcc_bin" >/dev/null 2>&1 || {
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-# The measured verdict of the two cross-compiler legs in the AVX-enabled
-# configuration.  Update ONLY together with the fix (then both are `agree`).
-DEBT_LCCC_CALLER=garbage
-DEBT_GCC_CALLER=signal
-
-# run_leg <opt> <extra-flags...>: build the four combinations and classify them.
-# Prints "<leg-A> <leg-B>" where each is `agree`, `garbage`, or `signal`.
-classify() {
-    local bin=$1 ref=$2
-    local out rc
-    set +e
-    out=$("$bin" 2>&1)
-    rc=$?
-    set -e
-    if [ "$rc" -ge 128 ]; then
-        echo signal
-    elif [ "$out" = "$(cat "$ref")" ]; then
-        echo agree
-    else
-        echo garbage
-    fi
+host_has_avx512f() {
+    grep -qw avx512f /proc/cpuinfo 2>/dev/null
 }
 
+# one_config <src-basename> <tag> <flags...>: build the four combinations
+# and compare every binary's output with the gcc/gcc reference.
 one_config() {
-    local tag=$1 opt=$2
+    local base=$1 tag=$2
     shift 2
-    local flags=("$opt" "$@")
+    local src=$dir/$base.c
+    local flags=("$@")
+    local p=$tmp/${base}_$tag
 
-    # -Wno-psabi: the no-AVX2 configuration IS the memory convention, and gcc's
-    # "AVX vector argument without AVX enabled changes the ABI" note is exactly
-    # the property under test there -- the warning is expected, not a finding.
-    "$gcc_bin" -Wno-psabi "${flags[@]}" -DCALLEE_ONLY -c "$src" -o "$tmp/callee_gcc_$tag.o"
-    "$ccc" "${flags[@]}" -DCALLEE_ONLY -c "$src" -o "$tmp/callee_lccc_$tag.o"
-    "$gcc_bin" -Wno-psabi "${flags[@]}" -c "$src" -o "$tmp/caller_gcc_$tag.o"
-    "$ccc" "${flags[@]}" -c "$src" -o "$tmp/caller_lccc_$tag.o"
+    # -Wno-psabi: the no-AVX configurations ARE the memory convention, and
+    # gcc's "AVX vector argument without AVX enabled changes the ABI" note is
+    # exactly the property under test there -- expected, not a finding.
+    "$gcc_bin" -Wno-psabi "${flags[@]}" -DCALLEE_ONLY -c "$src" -o "${p}_callee_gcc.o"
+    "$ccc" "${flags[@]}" -DCALLEE_ONLY -c "$src" -o "${p}_callee_lccc.o" ||
+        fail "$base $tag: lccc failed to compile the callee TU"
+    "$gcc_bin" -Wno-psabi "${flags[@]}" -c "$src" -o "${p}_caller_gcc.o"
+    "$ccc" "${flags[@]}" -c "$src" -o "${p}_caller_lccc.o" ||
+        fail "$base $tag: lccc failed to compile the caller TU"
 
-    "$gcc_bin" "${flags[@]}" "$tmp/caller_gcc_$tag.o" "$tmp/callee_gcc_$tag.o" -o "$tmp/ref_$tag"
-    "$tmp/ref_$tag" >"$tmp/ref_$tag.out"
+    "$gcc_bin" "${p}_caller_gcc.o" "${p}_callee_gcc.o" -o "${p}_ref"
+    "${p}_ref" >"${p}_ref.out"
     # The oracle's own output must be the arithmetic answer: if gcc/gcc were
     # itself broken, every comparison below would be against garbage.
-    grep -q '^add: 42 42 42 42 42 42 42 42$' "$tmp/ref_$tag.out" ||
-        { cat "$tmp/ref_$tag.out" >&2;
-          fail "$tag: the gcc/gcc reference did not produce the expected answer"; }
+    grep -q "^${ref_probe}\$" "${p}_ref.out" ||
+        { cat "${p}_ref.out" >&2;
+          fail "$base $tag: the gcc/gcc reference did not produce the expected answer"; }
 
-    # lccc/lccc: self-consistency. This works today and must not regress.
-    "$gcc_bin" "${flags[@]}" "$tmp/caller_lccc_$tag.o" "$tmp/callee_lccc_$tag.o" -o "$tmp/cc_$tag" ||
-        fail "$tag: linking the two lccc objects failed"
-    "$tmp/cc_$tag" >"$tmp/cc_$tag.out"
-    diff -u "$tmp/ref_$tag.out" "$tmp/cc_$tag.out" >&2 ||
-        fail "$tag: lccc/lccc disagrees with gcc/gcc (this part works and must keep working)"
-
-    "$gcc_bin" "${flags[@]}" "$tmp/caller_lccc_$tag.o" "$tmp/callee_gcc_$tag.o" -o "$tmp/legA_$tag" ||
-        fail "$tag: linking the lccc caller against the gcc callee failed"
-    "$gcc_bin" "${flags[@]}" "$tmp/caller_gcc_$tag.o" "$tmp/callee_lccc_$tag.o" -o "$tmp/legB_$tag" ||
-        fail "$tag: linking the gcc caller against the lccc callee failed"
-    echo "$(classify "$tmp/legA_$tag" "$tmp/ref_$tag.out") $(classify "$tmp/legB_$tag" "$tmp/ref_$tag.out")"
+    local leg caller callee
+    for leg in "lccc lccc" "lccc gcc" "gcc lccc"; do
+        read -r caller callee <<<"$leg"
+        "$gcc_bin" "${p}_caller_$caller.o" "${p}_callee_$callee.o" -o "${p}_${caller}_$callee" ||
+            fail "$base $tag: linking the $caller caller against the $callee callee failed"
+        set +e
+        "${p}_${caller}_$callee" >"${p}_${caller}_$callee.out" 2>&1
+        local rc=$?
+        set -e
+        [ "$rc" -eq 0 ] ||
+            fail "$base $tag: $caller caller + $callee callee exited with $rc (signal $((rc - 128)) if >128)"
+        diff -u "${p}_ref.out" "${p}_${caller}_$callee.out" >&2 ||
+            fail "$base $tag: $caller caller + $callee callee disagrees with gcc/gcc"
+    done
+    echo "ok: $base [${flags[*]}]: all four combinations agree with gcc/gcc"
 }
 
+configs=(
+    "avx2|-mavx2"
+    "v3|-march=x86-64-v3"
+    "avx512f|-mavx512f"
+    "mem|"
+    "noavx|-mno-avx"
+)
+ran512=0
 for opt in -O0 -O2; do
-    read -r a b <<<"$(one_config "avx${opt#-}" "$opt" -mavx2)"
-
-    # The AVX-enabled configuration: the documented debt, exactly.
-    [ "$a" = "$DEBT_LCCC_CALLER" ] ||
-        fail "$opt -mavx2: lccc caller + gcc callee is '$a', the latched debt is '$DEBT_LCCC_CALLER'.
-  If it is now 'agree' the AUD-VABI-2 fix landed: set DEBT_LCCC_CALLER=agree and DEBT_GCC_CALLER=agree here.
-  If it changed to something else, the failure mode moved and the reproducer has to be re-measured."
-    [ "$b" = "$DEBT_GCC_CALLER" ] ||
-        fail "$opt -mavx2: gcc caller + lccc callee is '$b', the latched debt is '$DEBT_GCC_CALLER'.
-  If it is now 'agree' the AUD-VABI-2 fix landed: set DEBT_LCCC_CALLER=agree and DEBT_GCC_CALLER=agree here.
-  If it changed to something else, the failure mode moved and the reproducer has to be re-measured."
-    echo "ok: $opt -mavx2: latched AUD-VABI-2 debt reproduced (lccc caller: $a, gcc caller: $b)"
-
-    # The memory-convention configuration: all four legs must agree. This is
-    # also the gate's own liveness proof -- the same diffs that are silent above
-    # (because both compilers agree) do fire when the convention matches.
-    read -r a b <<<"$(one_config "mem${opt#-}" "$opt")"
-    [ "$a" = agree ] ||
-        fail "$opt (no -mavx2): lccc caller + gcc callee is '$a', expected 'agree' -- the 32-byte memory convention must keep interoperating"
-    [ "$b" = agree ] ||
-        fail "$opt (no -mavx2): gcc caller + lccc callee is '$b', expected 'agree' -- the 32-byte memory convention must keep interoperating"
-    echo "ok: $opt (no -mavx2): all four combinations agree with gcc/gcc"
+    for cfg in "${configs[@]}"; do
+        name=${cfg%%|*}
+        extra=${cfg#*|}
+        if [ "$name" = avx512f ] && ! host_has_avx512f; then
+            echo "skip: $opt -mavx512f: host CPU has no AVX-512F (objects not run)"
+            continue
+        fi
+        [ "$name" = avx512f ] && ran512=1
+        flags=("$opt")
+        [ -n "$extra" ] && flags+=("$extra")
+        ref_probe='add: 42 42 42 42 42 42 42 42' \
+            one_config wide "$name${opt#-}" "${flags[@]}"
+        ref_probe='acc 42579.375' \
+            one_config wide_avx "$name${opt#-}" "${flags[@]}"
+    done
 done
 
-echo "PASS: AUD-VABI-2 debt latched (32-byte vectors: the AVX %ymm convention is"
-echo "      missing, measured on both call directions; the no-AVX2 convention agrees)"
+echo "PASS: AUD-VABI-2: 32-byte (%ymm) and 64-byte (%zmm) vector ABI agrees with"
+echo "      gcc in both call directions under AVX2/x86-64-v3$([ $ran512 = 1 ] && echo /AVX-512F),"
+echo "      and the memory convention agrees without the AVX ABI level"

@@ -1207,7 +1207,7 @@ impl I686Codegen {
             // CoreArgClass::StructXmmReg -> ParamClass::F128SseReg). Nothing
             // in the prologue uses an XMM register, so the store can sit in
             // parameter order; the parameter object is its 16-byte alloca.
-            if let ParamClass::F128SseReg { reg_idx } = class {
+            if let ParamClass::F128SseReg { reg_idx, .. } = class {
                 if let Some(slot) =
                     find_param_alloca(func, i).and_then(|(dest, _)| self.state.get_slot(dest.0))
                 {

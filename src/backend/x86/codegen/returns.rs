@@ -25,6 +25,25 @@ impl X86Codegen {
                 self.emit_epilogue_and_ret_impl(frame_size);
                 return;
             }
+            // A `__m256` / `__m512` aggregate under the AVX ABI level: the IR
+            // returns the hidden pointer (the private frame buffer the
+            // callee's returns copied into); the psABI wants the bytes in
+            // `%ymm0` / `%zmm0`. `%rax` carries nothing meaningful after
+            // this -- the caller stores the register through its own
+            // buffer.
+            if self.vector_ret_buffer_bytes > 0 {
+                self.operand_to_rax(val);
+                let (mov, reg) = super::calls::vector_reg_move(self.vector_ret_buffer_bytes, 0);
+                self.state
+                    .emit_fmt(format_args!("    {mov} (%rax), %{reg}"));
+                // No `vzeroupper` on this exit: it would zero the upper
+                // lanes of the value just loaded. GCC/Clang skip it as
+                // well (a `%ymm0`/`%zmm0` return has an AVX-aware caller).
+                let dirty = std::mem::replace(&mut self.state.dirty_upper_ymm, false);
+                self.emit_epilogue_and_ret_impl(frame_size);
+                self.state.dirty_upper_ymm = dirty;
+                return;
+            }
             if ret_ty.is_long_double() {
                 if let Operand::Value(v) = val {
                     if self.state.f128_direct_slots.contains(&v.0) {

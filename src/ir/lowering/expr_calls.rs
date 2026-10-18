@@ -458,6 +458,9 @@ impl Lowerer {
                     } else {
                         param_ctypes_for_decompose.as_ref()
                     };
+                    // The hidden sret pointer is argument 0 and counts as
+                    // named: `num_fixed_args` indexes `args`.
+                    let sret_slots = usize::from(sret_alloca.is_some());
                     if let Some(param_ctypes) = fixed_param_ctypes {
                         let decomposes_cld = self.decomposes_complex_long_double();
                         let decomposes_cd = self.decomposes_complex_double();
@@ -483,9 +486,10 @@ impl Lowerer {
                                     _ => 1,
                                 }
                             })
-                            .sum()
+                            .sum::<usize>()
+                            + sret_slots
                     } else if !sig.param_types.is_empty() {
-                        sig.param_types.len()
+                        sig.param_types.len() + sret_slots
                     } else {
                         arg_vals.len()
                     }

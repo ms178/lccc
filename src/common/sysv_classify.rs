@@ -21,8 +21,14 @@
 //!   at every aggregate level; so does this.
 //! * An array classifies its first element and repeats that pattern over its
 //!   eightbytes (GCC does not re-check the alignment of later elements).
-//! * Objects larger than two eightbytes are MEMORY (the >16-byte SSE/SSEUP
-//!   form only exists for AVX vector arguments, which LCCC does not model).
+//! * Objects larger than two eightbytes are MEMORY, except the AVX vector
+//!   form: under `-mavx` (`-mavx512f`) an object of up to four (eight)
+//!   eightbytes whose classes are exactly SSE followed by SSEUPs travels in
+//!   ONE `%ymm` (`%zmm`) register — psABI §3.2.3 rule (c) of the
+//!   post-merger cleanup, GCC's `TARGET_AVX` / `TARGET_AVX512F` arms of
+//!   `classify_argument`. The width ceiling is
+//!   `types::target_vector_abi_bytes()`, which the driver derives from the
+//!   TU's requested ISA exactly like `__AVX__`.
 //!
 //! Only the *location* classes are modelled. GCC's INTEGERSI/SSESF/SSEDF
 //! refinements choose the register mode within the same register and do not
@@ -93,8 +99,48 @@ impl SysvPassing {
 
     /// SSE + SSEUP: the whole 16-byte value in ONE `%xmm` register.
     pub fn one_xmm(&self) -> bool {
-        matches!(self, SysvPassing::Regs(c) if c[..] == [EightbyteClass::Sse, EightbyteClass::SseUp])
+        self.vector_reg_bytes() == Some(16)
     }
+
+    /// The whole value in ONE vector register: `Some(16)` for SSE + SSEUP
+    /// (`%xmm`), `Some(32)` for SSE + 3×SSEUP (`%ymm`, AVX), `Some(64)` for
+    /// SSE + 7×SSEUP (`%zmm`, AVX-512); `None` for everything else.
+    pub fn vector_reg_bytes(&self) -> Option<usize> {
+        match self {
+            SysvPassing::Regs(c) => vector_reg_bytes_of(c),
+            _ => None,
+        }
+    }
+}
+
+/// `Some(bytes)` when `classes` is the one-vector-register shape SSE
+/// followed only by SSEUPs with 2, 4 or 8 entries (16, 32 or 64 bytes).
+pub fn vector_reg_bytes_of(classes: &[EightbyteClass]) -> Option<usize> {
+    match classes {
+        [EightbyteClass::Sse, rest @ ..]
+            if matches!(rest.len(), 1 | 3 | 7)
+                && rest.iter().all(|c| *c == EightbyteClass::SseUp) =>
+        {
+            Some((rest.len() + 1) * 8)
+        }
+        _ => None,
+    }
+}
+
+/// The most eightbytes an object may span and still be classified: two,
+/// or the AVX / AVX-512 vector-register width when the TU's ABI level
+/// grants it (`target_vector_abi_bytes`).
+fn max_words() -> usize {
+    super::types::target_vector_abi_bytes() / 8
+}
+
+/// psABI post-merger rule (c): an object of more than two eightbytes is
+/// MEMORY unless its first eightbyte is SSE and every other one is SSEUP
+/// (the one-`%ymm` / one-`%zmm` shape). GCC applies this at every
+/// aggregate level (`classify_argument`), and so does `classify_at`.
+fn wide_shape_ok(classes: &[Class]) -> bool {
+    classes.len() <= 2
+        || (classes[0] == Class::Sse && classes[1..].iter().all(|c| *c == Class::SseUp))
 }
 
 /// Classify `ty` for by-value passing. `None` for types that are not
@@ -135,7 +181,9 @@ pub fn classify_layout(layout: &StructLayout, ctx: &dyn StructLayoutProvider) ->
     let words = layout.size.div_ceil(8);
     let classes = match words {
         0 => Some(vec![Class::NoClass]),
-        1 | 2 => classify_record(layout, words, 0, ctx),
+        w if w <= max_words() => {
+            classify_record(layout, words, 0, ctx).filter(|c| wide_shape_ok(c))
+        }
         _ => None,
     };
     finish(classes)
@@ -191,16 +239,22 @@ fn classify_at(
         // Zero-sized records and arrays occupy nothing.
         return Some(vec![Class::NoClass]);
     }
-    if words > 2 {
+    if words > max_words() {
         return None;
     }
     match ty {
         CType::Struct(key) | CType::Union(key) => {
             classify_record(ctx.get_struct_layout(key)?, words, bit_offset, ctx)
+                .filter(|c| wide_shape_ok(c))
         }
         CType::Array(elem, _) => {
             let sub = classify_at(elem, bit_offset, ctx)?;
-            Some((0..words).map(|i| sub[i % sub.len()]).collect())
+            Some(
+                (0..words)
+                    .map(|i| sub[i % sub.len()])
+                    .collect::<Vec<Class>>(),
+            )
+            .filter(|c| wide_shape_ok(c))
         }
         _ => {
             let (classes, align_bits) = leaf(ty)?;
@@ -294,6 +348,11 @@ fn leaf(ty: &CType) -> Option<(Vec<Class>, usize)> {
                 return None; // V1SF / V1DF: no vector mode, BLKmode
             }
             match *total {
+                // `__m256` / `__m512`: one `%ymm` / `%zmm` under the AVX
+                // (AVX-512) ABI level, MEMORY below it (`classify_at`
+                // already returned None for the latter: the object spans
+                // more eightbytes than `max_words`).
+                32 | 64 => (wide_vector_classes(*total), *total * 8),
                 16 => (vec![Sse, SseUp], 128),
                 8 => (vec![Sse], 64),
                 // Sub-eightbyte vectors: integer vector modes (or the
@@ -312,11 +371,22 @@ fn leaf(ty: &CType) -> Option<(Vec<Class>, usize)> {
     })
 }
 
+/// SSE followed by SSEUPs over every eightbyte of a `total`-byte vector
+/// (32 or 64): the one-`%ymm` / one-`%zmm` carrier.
+fn wide_vector_classes(total: usize) -> Vec<Class> {
+    let mut classes = vec![Class::SseUp; total / 8];
+    classes[0] = Class::Sse;
+    classes
+}
+
 /// Clang's x86-64 classification of an `ext_vector_type` (measured against
 /// Clang 23.1.3, including bit-packed `_Bool` vectors, padded three-lane
 /// shapes and members): 1, 2 and 4 bytes are INTEGER; 8 bytes are SSE except
 /// one `double` lane (MEMORY); 16 bytes are SSE + SSEUP (except a 128-lane
-/// `_Bool` vector, MEMORY); larger is MEMORY. A
+/// `_Bool` vector, MEMORY); 32 and 64 bytes are SSE + SSEUPs — one `%ymm` /
+/// `%zmm` — when the TU's AVX level admits them (`X86_64ABIInfo::classify`:
+/// `Size == 128 || (IsNamedArg && Size <= getNativeVectorSizeForAVXABI)`)
+/// and MEMORY otherwise. A
 /// `long double` lane is the X87 pair, so a one-lane vector behaves exactly
 /// like `long double` (MEMORY argument, `%st(0)` return).
 fn ext_vector_leaf(
@@ -338,6 +408,8 @@ fn ext_vector_leaf(
         8 if layout.lanes == 1 && matches!(elem, CType::Double) => return None,
         8 => (vec![Sse], 64),
         16 => (vec![Sse, SseUp], 128),
+        32 | 64 if layout.bitpacked_bool => return None,
+        32 | 64 => (wide_vector_classes(size), size * 8),
         _ => return None,
     })
 }

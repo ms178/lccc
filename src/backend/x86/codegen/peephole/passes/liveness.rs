@@ -1988,6 +1988,66 @@ mod tests {
         );
     }
 
+    /// `mulss`/`divsd`/... write only their explicit `%xmm` destination.
+    /// `parse_dest_reg_fast` used to prefix-match them as the one-operand
+    /// integer `mul`/`div` (implicit `%rax:%rdx` write), which made the
+    /// realigned-alloca base below "dead" after `andq` and let
+    /// dead-flag-write elimination delete the `addq $63`/`andq $-64` of
+    /// every `-mno-avx` over-aligned vector store (wrong-address store).
+    #[test]
+    fn sse_scalar_arith_is_not_an_implicit_rax_write() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    subq $152, %rsp\n",
+            "    movss .LCFP_0(%rip), %xmm2\n",
+            "    xorl %r11d, %r11d\n",
+            ".LBB1:\n",
+            "    cmpq $16, %r11\n",
+            "jge .LBB3\n",
+            ".LBB2:\n",
+            "    leaq 0(,%r11,4), %r10\n",
+            "    leaq 16(%rsp), %rax\n",
+            "    addq $63, %rax\n",
+            "    andq $-64, %rax\n",
+            "    pxor %xmm3, %xmm3\n",
+            "    cvtsi2ssq %r11, %xmm3\n",
+            "    mulss %xmm2, %xmm3\n",
+            "    movss %xmm3, (%r10, %rax)\n",
+            "    divsd %xmm2, %xmm4\n",
+            "    addq $1, %r11\n",
+            "    cmpq $16, %r11\n",
+            "jl .LBB2\n",
+            ".LBB3:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        for (line, rax_written) in [
+            ("mulss %xmm2, %xmm3", false),
+            ("divsd %xmm2, %xmm4", false),
+            ("andq $-64, %rax", true),
+        ] {
+            let n = line_of(&store, line);
+            assert_eq!(lv.effect[n].1 & 1 != 0, rax_written, "writes of `{line}`");
+        }
+        let idx = line_of(&store, "andq $-64, %rax");
+        assert_eq!(lv.live_after(idx, 0), Some(true), "SIB base must stay live");
+        // The one-operand integer forms keep their implicit accumulator write.
+        for m in ["mulq %rcx", "divl %ecx", "idivq %r8", "mul %rbx"] {
+            assert_eq!(parse_dest_reg_fast(m), 0, "{m}");
+        }
+        // The SSE forms classify their explicit `%xmm` destination (a
+        // non-GP family), never the accumulator.
+        for m in [
+            "mulss %xmm2, %xmm3",
+            "divpd %xmm1, %xmm0",
+            "mulsd (%rax), %xmm1",
+        ] {
+            assert!(parse_dest_reg_fast(m) > REG_GP_MAX, "{m}");
+        }
+    }
+
     #[test]
     fn loop_body_write_is_dead_when_only_the_prologue_reads_it() {
         // %rdi is read by the prologue copy, then written (never read) in the
