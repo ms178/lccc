@@ -120,11 +120,34 @@ pub fn classify_return(ty: &CType, ctx: &dyn StructLayoutProvider) -> Option<Sys
         if layout.lanes == 1 && matches!(**elem, CType::Double) {
             return Some(SysvPassing::Regs(vec![EightbyteClass::Sse]));
         }
+        // The float twin: a one-lane `float` ext vector comes back as the
+        // scalar in the low half of %xmm0, exactly like f64x1 (same-compiler
+        // GCC 16 / Clang codegen, pinned end to end by
+        // `check_ext_vector_one_lane_fp.sh`). Classified INTEGER here, the
+        // callee returned the bits in %rax while the indirect-call carrier
+        // (and both oracles) say %xmm0 — a cross-TU ABI seam.
+        if layout.lanes == 1 && matches!(**elem, CType::Float) {
+            return Some(SysvPassing::Regs(vec![EightbyteClass::Sse]));
+        }
         // 256 bits is MEMORY without AVX, but a vector is not an aggregate
         // for Clang's ABI code, so the return goes "direct" to LLVM, which
         // scalarizes `<2 x x86_fp80>` into the x87 register pair.
         if layout.lanes == 2 && matches!(**elem, CType::LongDouble) {
             return Some(SysvPassing::X87Pair);
+        }
+    }
+    // The `vector_size` spelling of the one-lane FP shapes: f32x1/f64x1
+    // return in the low half of %xmm0 like the scalar (GCC 16's psABI
+    // small-vector update; system gcc-12 still routes these through MEMORY —
+    // disclosed in `check_ext_vector_one_lane_fp.sh`). Without this the
+    // callee BLKmode-classified the return (sret/%rax) while the
+    // indirect-call vector carrier promised %xmm0.
+    if let CType::Vector(elem, total) = ty {
+        if (*total == 4 || *total == 8)
+            && *total == elem.size()
+            && matches!(**elem, CType::Float | CType::Double)
+        {
+            return Some(SysvPassing::Regs(vec![EightbyteClass::Sse]));
         }
     }
     classify(ty, ctx)
