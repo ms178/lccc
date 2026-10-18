@@ -354,6 +354,24 @@ impl Lowerer {
     /// The operand of a folded global relational or logical expression: an
     /// integer constant, or the address of a named global with a byte offset.
     fn global_operand(&self, expr: &Expr) -> Option<GlobalOperand> {
+        // __builtin_choose_expr selects one operand at compile time; the
+        // choice can be an ADDRESS constant (the kernel's
+        // PIN_GROUP(.modes = __builtin_choose_expr(
+        // __builtin_constant_p((m)), (const void *)0, (m))) names the static
+        // pin array in the unselected-by-constant_p arm), so the selection
+        // must consult the address path, not just the value path.
+        if let Expr::FunctionCall(callee, args, _) = expr {
+            if matches!(callee.as_ref(), Expr::Identifier(name, _) if name == "__builtin_choose_expr")
+                && args.len() >= 3
+            {
+                let chosen = match self.eval_const_expr(&args[0]) {
+                    Some(v) if v.is_nonzero() => &args[1],
+                    Some(_) => &args[2],
+                    None => return None,
+                };
+                return self.global_operand(chosen);
+            }
+        }
         if let Some(v) = self.eval_const_expr(expr).and_then(|c| c.to_i64()) {
             return Some(GlobalOperand::Int(v));
         }
