@@ -1179,13 +1179,16 @@ gate "strlen-embedded-nul" fast \
     env CCC="$LCCC" bash tests/regression/check_strlen_embedded_nul.sh
 # Enum/enumerator types and `_Alignas(type)` member layout on x86-64 and i686:
 # the corpus compares x86-64 output only, and both layouts differ on i686.
+# The oracle is pinned to GCC 16 (`CC` defaults to the host `gcc` inside the
+# scripts): enumerator types follow C23 6.7.2.2 only from GCC 13 onward, so a
+# GCC 12 host oracle rejects the fixture's own static assertions.
 gate "type-layout-fixtures" fast \
-    env CCC="$LCCC" bash tests/regression/check_fixture_modes.sh \
+    env CCC="$LCCC" CC="${GCC:-gcc-16}" bash tests/regression/check_fixture_modes.sh \
     enum_type_semantics.c alignas_type_layout.c
 # False type-dependent `_Static_assert`s (sizeof, _Generic, enumerator types)
 # used to compile: the parser accepted whatever it could not evaluate.
 gate "static-assert-sema" fast \
-    env CCC="$LCCC" bash tests/regression/check_static_assert_sema.sh
+    env CCC="$LCCC" CC="${GCC:-gcc-16}" bash tests/regression/check_static_assert_sema.sh
 
 gate "copy-alias-sizes" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_copy_alias_sizes.sh
