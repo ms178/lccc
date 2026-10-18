@@ -28,7 +28,6 @@ import concurrent.futures as cf
 import os
 import re
 import subprocess
-import sys
 import tempfile
 from collections import defaultdict
 from pathlib import Path

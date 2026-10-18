@@ -7,7 +7,7 @@ stderr, and prints the corpus-wide coverage plus a ranked rejection table.
 
 Usage: CCC_BIN=path/to/lccc [OPT=-O2] [JOBS=N] python3 scripts/isel_census.py
 """
-import os, re, subprocess, sys, tempfile, collections
+import os, re, subprocess, tempfile, collections
 from concurrent.futures import ThreadPoolExecutor
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

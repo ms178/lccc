@@ -14,7 +14,6 @@ import json
 import random
 from pathlib import Path
 import struct
-import sys
 import subprocess
 import tempfile
 

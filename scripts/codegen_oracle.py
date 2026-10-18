@@ -63,15 +63,10 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import hashlib
 import json
 import os
 import re
-import shlex
-import statistics
-import subprocess
 import sys
-import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path

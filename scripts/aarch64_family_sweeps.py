@@ -139,7 +139,7 @@ def casp() -> list[str]:
     for mn in ("casp", "caspa", "caspal", "caspl"):
         for r0 in (0, 2, 28, 30):
             for first in (f"x{r0}", f"x{r0 + 1}", "xzr", "sp", "lr"):
-                for second in (f"x4", "x5", "xzr", "sp"):
+                for second in ("x4", "x5", "xzr", "sp"):
                     out.append(f"{mn} x{r0}, {first}, x4, {second}, [x8]")
         # Odd pair starts, and the zero register as the first half.
         for r0 in (1, 31):

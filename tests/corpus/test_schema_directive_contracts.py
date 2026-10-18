@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 """Compiler-free fail-closed contracts for strict metadata and RUN identity."""
-import copy
-import hashlib
 import importlib.util
 from pathlib import Path
 import sys

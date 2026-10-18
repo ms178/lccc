@@ -73,7 +73,6 @@ S mkw(int k) {{ S r = {{{{{lanes_init(elem, n, "k * 2")}}}}}; return r; }}
     lines = []
     for fid, expr in FORMS:
         e = expr.replace("LANES", lanes_init(elem, n, 9))
-        w = e if fid not in ("member", "call_member") else None
         # vector-typed argument
         lines.append(f'  sel = 1; loc = g_arr[1]; printf("{fid} direct %lld\\n", take(1, {e}, 2));')
         lines.append(f'  sel = 0; loc = g_arr[1]; printf("{fid} va %lld\\n", take_va(3, {e}, 4));')

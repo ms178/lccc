@@ -17,13 +17,10 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as futures
 import json
-import os
 import random
 import subprocess
-import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Iterable
 
 MASK64 = (1 << 64) - 1
 

@@ -89,9 +89,9 @@ python3 tests/fuzz/punning_fuzz.py --emit-only 3
 ```
 
 Failures keep their source under `--out`. `test_punning_fuzz.py` runs in the
-`unittest discover` gate. Scope and coverage gaps (floats, `__int128`, bit-fields,
-structs, overlapping `memcpy`) are tracked as T7 in
-`docs/VELLVM_VIR_TRANSPLANT_AUDIT.md`.
+`unittest discover` gate. Remaining scope gaps (overlapping `memcpy` between two
+objects, bit-fields that straddle a storage unit, arrays of padded structs) are
+tracked as T7 in `docs/VELLVM_VIR_TRANSPLANT_AUDIT.md`.
 
 ## C-level miscompile reduction (`c_reduce.py`)
 
@@ -113,8 +113,12 @@ The reducer and predicate are covered by `tests/fuzz/test_c_reduce.py`
 
 ## Punning lanes (T7)
 
-`punning_fuzz.py` now covers `float`/`double` (bit patterns, exponent forced
-finite), `__int128`, and two lanes: `--lanes base,v3` (`v3` adds
-`-march=x86-64-v3`).  Self-check the model against a reference before trusting
-any verdict: `--ccc gcc`, `--ccc clang`, or `--ccc icx` (the model agreed with all
-three, 240 of 240 each).  Not yet covered: bit-fields and struct padding.
+`punning_fuzz.py` covers `float`/`double` (bit patterns, exponent forced
+finite), `__int128`, bit-fields (`struct bits`: signed and unsigned fields packed
+into one 32-bit unit), padded structs (`struct pad`: padding bytes are never read,
+whole-struct `memcpy` reads only the copy's members), and two lanes:
+`--lanes base,v3` (`v3` adds `-march=x86-64-v3`).  Self-check the model against a
+reference before trusting any verdict: `--ccc gcc`, `--ccc clang`, or `--ccc icx`
+(the model agreed with all three, 240 of 240 each, for the bit-field and padding
+corpus).  The layout of `struct pad` is also checked against GCC's
+`sizeof`/`offsetof` in `test_punning_fuzz.py`.

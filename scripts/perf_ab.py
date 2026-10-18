@@ -49,11 +49,9 @@ Usage Examples:
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
 import json
 import os
 import re
-import shutil
 import statistics
 import subprocess
 import sys
@@ -575,7 +573,7 @@ def run_insns_metric(
         md_lines = [
             f"# Static A/B Screen: {header_label}",
             f"- **Flags**: `{' '.join(flags)}`",
-            f"- **Metric**: static instruction count + behaviour identity",
+            "- **Metric**: static instruction count + behaviour identity",
             f"- **Total**: A {total_a} / B {total_b} ({total_b - total_a:+d})",
             "",
             "| Benchmark | A insns | B insns | B-A | Behaviour |",

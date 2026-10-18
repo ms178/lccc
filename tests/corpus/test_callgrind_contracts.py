@@ -140,7 +140,7 @@ class MainContract(unittest.TestCase):
             root=Path(td);self.assertEqual(self.mock_measurement(root,ev(0)),2)
             doc=schema.loads((root/'manifest.json').read_text());self.assertEqual(doc['comparable'],0);self.assertIn('fib',doc['failures']);self.assertNotIn('geomean_ir_mine_over_ref',doc)
     def test_partial_failure_returns_failure_not_success(self):
-        with tempfile.TemporaryDirectory() as td,mock.patch.object(cg,'_measure',return_value=1) as measure,mock.patch.object(cg,'geometry',return_value=({'I1':cg.CG_I1,'D1':cg.CG_D1,'LL':cg.CG_LL},{})):
+        with tempfile.TemporaryDirectory() as td,mock.patch.object(cg,'_measure',return_value=1),mock.patch.object(cg,'geometry',return_value=({'I1':cg.CG_I1,'D1':cg.CG_D1,'LL':cg.CG_LL},{})):
             self.assertEqual(cg.main(['mock-a','mock-b','-O2','fib','--out-root',td]),1)
     def test_setup_error_manifest_observable(self):
         with tempfile.TemporaryDirectory() as td,mock.patch.object(cg,'gcc_include',side_effect=ValueError('missing GCC')):

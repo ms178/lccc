@@ -285,9 +285,12 @@ def _ok(r, what):
 
 def _probe(e):
     """Independent -m32 eligibility: compile, link and run with the system
-    linker.  Returns None when eligible, else the reason."""
+    linker.  Returns None when eligible, else the reason.
+
+    The probe links -no-pie, the same mode as every -m32 reference link in
+    this file, so the probe checks the mode the suite actually runs."""
     _w(e.td, "probe.c", "#include <stdio.h>\nint main(void){puts(\"ok\");return 0;}\n")
-    r = e.gcc("probe.c", "-o", "probe", lccc=False)
+    r = e.gcc("-no-pie", "probe.c", "-o", "probe", lccc=False)
     if r.returncode != 0:
         return "gcc -m32 cannot link (no i386 multilib): " + r.stderr.decode()[:200]
     r = e.run(e.path("probe"), False)

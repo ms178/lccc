@@ -22,7 +22,7 @@ def sections(path):
         body = line[line.index("]") + 1:].split()
         if len(body) < 5:
             continue
-        name, typ, addr, off, size = body[0], body[1], body[2], body[3], body[4]
+        name, _, addr, off, size = body[0], body[1], body[2], body[3], body[4]
         try:
             secs[name] = (int(addr, 16), int(off, 16), int(size, 16))
         except ValueError:

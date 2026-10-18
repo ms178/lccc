@@ -175,7 +175,6 @@ def diagram_constraints(diagram: ET.Element) -> Constraint | None:
                 text = ""
             if colspan < 1 or colspan > remaining:
                 return None
-            low = pos - colspan + 1
             # Normalize `(1)`-style parenthesized constants.
             pm = re.fullmatch(r"\(([01xX]+)\)", text)
             if pm:

@@ -12,7 +12,6 @@ Exit 0 = all cases agree, 1 = any divergence (printed), 2 = setup error.
 from __future__ import annotations
 
 import argparse
-import shutil
 import subprocess
 import sys
 import tempfile

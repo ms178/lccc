@@ -36,11 +36,8 @@ defect (reference disagreement, build failure of the reference).
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import os
 import random
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -338,7 +335,6 @@ def main():
     args = ap.parse_args()
     lo, hi = (int(x) for x in args.seeds.split(':'))
     args.out.mkdir(parents=True, exist_ok=True)
-    env = {k: v for k, v in os.environ.items() if not k.startswith('CCC_')}
     report = dict(lccc=args.lccc, gcc=args.gcc, seeds=args.seeds, levels=args.levels,
                   march=args.march, cases=0, mismatches=[], generator_defects=[], builds=0)
     status = 0

@@ -57,6 +57,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+from typing import NoReturn
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -96,7 +97,7 @@ DEF_ROW = re.compile(
 RUST_ROW = re.compile(r'^\s*\("([a-z0-9_]+)",\s*(0x[0-9a-f]{4})\),\s*$', re.MULTILINE)
 
 
-def die(msg: str, code: int = 1) -> "NoReturn":  # noqa: F821
+def die(msg: str, code: int = 1) -> NoReturn:
     print(f"aarch64_sysreg_table: {msg}", file=sys.stderr)
     raise SystemExit(code)
 

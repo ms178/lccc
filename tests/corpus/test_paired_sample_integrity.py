@@ -3,7 +3,6 @@
 import importlib.util
 import io
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
