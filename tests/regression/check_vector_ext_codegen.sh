@@ -197,6 +197,13 @@ for fn in cq_le_s cq_ne_s cq4_ne_s cd4_ne_s cw4_ne_s cq_lt_u cq4_lt_u cd4_lt_u; 
 for fn in cq4_le_u cq_le_u; do ceiling "$fn" 6; done
 ceiling cq_ge_u 7
 ceiling cq_sel 7
+# Scalar splats (`(T){} + x`): the integer zero identity folds, the
+# broadcast is homed and returned directly (GCC: 3).  FP keeps the
+# `{} + x` add (not an identity for -0.0): 4.
+for fn in splat_v32i splat_v32c splat_v32s splat_v32l splat_v16i splat_v16c splat_v16s splat_v16l; do ceiling "$fn" 3; done
+for fn in splat_v32f splat_v32d splat_v16f splat_v16d; do ceiling "$fn" 4; done
+# A scalar integer constant operand is a `.rodata` lane constant (GCC: 4).
+ceiling splat_r 2
 # Whole-register `__builtin_memcpy` load/store idioms (GCC: 2).  The byte/
 # word 128-bit shapes are register-homed like the dword ones.
 for fn in ld_v32f ld_v32i ld_v32c ld_v16f ld_v16i ld_v16c ld_v16s \

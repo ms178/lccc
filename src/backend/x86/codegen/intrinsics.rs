@@ -621,6 +621,14 @@ impl X86Codegen {
             sse_inst,
             args.len()
         );
+        // A lane constant in the src2 position: `.rodata` r/m operand
+        // (VEX.128 three-operand under AVX, legacy `op MEM, dst` below).
+        if let Some(lane_bytes) = Self::int_lane_const_bytes(args.get(1)) {
+            let vex = format!("v{}", sse_inst);
+            if self.try_emit_bitwise_lane_const(dest_ptr, args, lane_bytes, false, &vex) {
+                return;
+            }
+        }
 
         // VLFOLD (memfold-FIRST, before every in-place/accumulator path —
         // the emit_avx_binary_256_inner discipline): an elided single-use
@@ -6209,8 +6217,13 @@ impl X86Codegen {
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
                     self.state.emit("    movd %eax, %xmm0");
-                    self.state.emit("    punpcklwd %xmm0, %xmm0");
-                    self.state.emit("    pshufd $0, %xmm0, %xmm0");
+                    if self.avx2_enabled {
+                        // AVX2: one lane broadcast from the XMM source.
+                        self.state.emit("    vpbroadcastw %xmm0, %xmm0");
+                    } else {
+                        self.state.emit("    punpcklwd %xmm0, %xmm0");
+                        self.state.emit("    pshufd $0, %xmm0, %xmm0");
+                    }
                     if let Some(d) = dest {
                         self.state.vector_values.insert(d.0);
                         self.sse_store_dest(d, "xmm0");
@@ -6249,9 +6262,14 @@ impl X86Codegen {
                     self.state.invalidate_vec_peephole();
                     self.operand_to_reg(&args[0], "rax");
                     self.state.emit("    movd %eax, %xmm0");
-                    self.state.emit("    punpcklbw %xmm0, %xmm0");
-                    self.state.emit("    punpcklwd %xmm0, %xmm0");
-                    self.state.emit("    pshufd $0, %xmm0, %xmm0");
+                    if self.avx2_enabled {
+                        // AVX2: one lane broadcast from the XMM source.
+                        self.state.emit("    vpbroadcastb %xmm0, %xmm0");
+                    } else {
+                        self.state.emit("    punpcklbw %xmm0, %xmm0");
+                        self.state.emit("    punpcklwd %xmm0, %xmm0");
+                        self.state.emit("    pshufd $0, %xmm0, %xmm0");
+                    }
                     if let Some(d) = dest {
                         self.state.vector_values.insert(d.0);
                         self.sse_store_dest(d, "xmm0");
@@ -8850,6 +8868,18 @@ impl X86Codegen {
     /// streams through the scratch pair exactly like the memfold consumers
     /// (a pending VLFOLD on args[0] is materialised first: this emitter
     /// cannot fold a second memory operand into the same instruction).
+    /// Byte width of an integer lane constant operand (`None` for values
+    /// and non-integer constants).
+    fn int_lane_const_bytes(arg: Option<&Operand>) -> Option<usize> {
+        match arg {
+            Some(Operand::Const(IrConst::I8(_))) => Some(1),
+            Some(Operand::Const(IrConst::I16(_))) => Some(2),
+            Some(Operand::Const(IrConst::I32(_))) => Some(4),
+            Some(Operand::Const(IrConst::I64(_))) => Some(8),
+            _ => None,
+        }
+    }
+
     fn try_emit_bitwise_lane_const(
         &mut self,
         dest: &Value,
@@ -10418,6 +10448,14 @@ impl X86Codegen {
         avx_inst: &str,
         commutative: bool,
     ) {
+        // A lane constant in the src2 position (the SIMD lowering's
+        // `v + 3`, `v & 0xff`, ...): a tiled `.rodata` r/m operand, no
+        // broadcast sequence.  Width from the constant's own type.
+        if let Some(lane_bytes) = Self::int_lane_const_bytes(args.get(1)) {
+            if self.try_emit_bitwise_lane_const(dest_ptr, args, lane_bytes, true, avx_inst) {
+                return;
+            }
+        }
         let folded = self
             .state
             .pending_vec_memfold

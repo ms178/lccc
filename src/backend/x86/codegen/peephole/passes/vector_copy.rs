@@ -1454,6 +1454,23 @@ fn legacy_full_width_load(mn: &str) -> bool {
     )
 }
 
+/// A VEX register/memory-source broadcast (`vpbroadcast{b,w,d,q}`,
+/// `vbroadcastss`/`vbroadcastsd`): the whole spelled destination is
+/// written from the source's low element and the bits above are zeroed --
+/// a plain output whose SOURCE is narrower than the destination (an XMM
+/// or a memory operand), so the same-width source rule does not apply.
+fn vex_broadcast(mn: &str) -> bool {
+    matches!(
+        mn,
+        "vpbroadcastb"
+            | "vpbroadcastw"
+            | "vpbroadcastd"
+            | "vpbroadcastq"
+            | "vbroadcastss"
+            | "vbroadcastsd"
+    )
+}
+
 pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
@@ -1469,7 +1486,8 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
         let is_vex_load = full_width_load_zeroes_above(mn);
         let is_legacy_load = legacy_full_width_load(mn);
         let is_full_load = is_vex_load || is_legacy_load;
-        if !(vex_plain_output(mn) || vex_int_plain_output(mn) || is_full_load)
+        let is_broadcast = vex_broadcast(mn);
+        if !(vex_plain_output(mn) || vex_int_plain_output(mn) || is_full_load || is_broadcast)
             || operands.contains('{')
         {
             j += 1;
@@ -1485,6 +1503,12 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             j += 1;
             continue;
         }
+        // A broadcast: two operands, the source a vector register or a
+        // memory operand; folded only into the full-width VEX copy-out.
+        if is_broadcast && !(ops.len() == 2 && !ops[0].starts_with('$')) {
+            j += 1;
+            continue;
+        }
         // Three operands, four with a leading immediate (`vroundsd`), or the
         // four-operand variable blend (`vblendvps`/`vblendvpd`: mask + two
         // sources + dest — the mask is a fourth source read, the dest a
@@ -1494,7 +1518,8 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
         let arity_ok = ops.len() == 3
             || (ops.len() == 4 && ops[0].starts_with('$'))
             || (is_var_blend && ops.len() == 4)
-            || is_full_load;
+            || is_full_load
+            || is_broadcast;
         if !arity_ok {
             j += 1;
             continue;
@@ -1507,13 +1532,19 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             j += 1;
             continue;
         };
-        if pw != W128 && !vex_int_plain_output(mn) && !vex_plain_output(mn) && !is_full_load {
+        if pw != W128
+            && !vex_int_plain_output(mn)
+            && !vex_plain_output(mn)
+            && !is_full_load
+            && !is_broadcast
+        {
             j += 1;
             continue;
         }
-        let sources_ok = ops[..ops.len() - 1]
-            .iter()
-            .all(|op| !op.starts_with('%') || vec_operand(op).is_some_and(|(_, w)| w == pw));
+        let sources_ok = is_broadcast
+            || ops[..ops.len() - 1]
+                .iter()
+                .all(|op| !op.starts_with('%') || vec_operand(op).is_some_and(|(_, w)| w == pw));
         if !sources_ok {
             j += 1;
             continue;
@@ -1626,7 +1657,9 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
         // behaviour: VEX load (zeroes above) into a VEX full-width copy,
         // legacy load (leaves above alone) into a legacy full-width copy.
         let legacy_full_copy_out = full_copy_out && !copy_out.zeroes_above && pw == W128;
-        if (is_vex_load && !full_vex_copy_out) || (is_legacy_load && !legacy_full_copy_out) {
+        if ((is_vex_load || is_broadcast) && !full_vex_copy_out)
+            || (is_legacy_load && !legacy_full_copy_out)
+        {
             j += 1;
             continue;
         }
@@ -4130,6 +4163,16 @@ mod tests {
         assert_eq!(
             retarget_only("    movdqu (%rdi), %xmm2\n    vmovdqa %xmm2, %xmm0\n    ret\n").len(),
             3
+        );
+        // A broadcast's source is narrower than its destination; it folds
+        // into a full-width VEX copy-out like a load.
+        assert_eq!(
+            retarget_only("    vpbroadcastd %xmm0, %ymm2\n    vmovdqa %ymm2, %ymm0\n    ret\n"),
+            vec!["vpbroadcastd %xmm0, %ymm0", "ret"]
+        );
+        assert_eq!(
+            retarget_only("    vbroadcastss (%rdi), %ymm3\n    vmovaps %ymm3, %ymm1\n    ret\n"),
+            vec!["vbroadcastss (%rdi), %ymm1", "ret"]
         );
         // A register-to-register `vmovdqa` is a copy, not a load: refused.
         assert_eq!(

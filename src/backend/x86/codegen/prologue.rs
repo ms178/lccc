@@ -3040,11 +3040,24 @@ impl X86Codegen {
         // I128/U128 (low half). It is read by NOBODY for Void returns and
         // for pure-SSE / x87 returns (F32/F64/D32/D64 in %xmm0, F128 in
         // %st0). Naked functions fail closed (live), as with RDX.
+        //
+        // A GNU vector returned in `%xmm0`/`%ymm0` (`vector_ret_in_xmm0`:
+        // the IR return type is the lowering's `Ptr`, the bytes travel in
+        // the vector register, `returns.rs` never writes `%rax`) reads
+        // `%rax` by nobody either; without this exemption every
+        // `movq %rdi, %rax` the broadcast emitters stage survived into
+        // the text (`splat_v32i`: 4 instructions, GCC 3).
         let ret_rax_live = func.is_naked
-            || !matches!(
-                func.return_type,
-                IrType::Void | IrType::F32 | IrType::F64 | IrType::D32 | IrType::D64 | IrType::F128
-            );
+            || !vector_ret_in_xmm0
+                && !matches!(
+                    func.return_type,
+                    IrType::Void
+                        | IrType::F32
+                        | IrType::F64
+                        | IrType::D32
+                        | IrType::D64
+                        | IrType::F128
+                );
         self.state.emit_fmt(format_args!(
             "    # LCCC_RET_RAX {}",
             u8::from(ret_rax_live)

@@ -6660,6 +6660,26 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
     )
 }
 
+/// The GNU-vector scalar broadcasts of every family and width.
+fn is_vector_broadcast_op(op: &IntrinsicOp) -> bool {
+    use IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecBroadcastF32x8
+            | O::VecBroadcastF64x4
+            | O::VecBroadcastI32x8
+            | O::VecBroadcastI64x4
+            | O::VecBroadcastI16x16
+            | O::VecBroadcastI8x32
+            | O::VecBroadcastF32x4
+            | O::VecBroadcastF64x2
+            | O::VecBroadcastI32x4
+            | O::VecBroadcastI64x2
+            | O::VecBroadcastI16x8
+            | O::VecBroadcastI8x16
+    )
+}
+
 fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
     let mut out: FxHashSet<u32> = FxHashSet::default();
     for block in &func.blocks {
@@ -6671,6 +6691,18 @@ fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
                 ..
             } = inst
             {
+                // A vector broadcast's operand is a SCALAR (GP or XMM
+                // scalar), never a chain operand: home only the result.
+                // The emitters commit a homed destination through
+                // `avx_store_dest` / `sse_store_dest` (one register copy
+                // the peephole retargets away); unhomed, a broadcast that
+                // feeds a terminator or a multi-use web paid a slot round
+                // trip (`(v32i){} + x` after the zero fold is a bare
+                // broadcast returned directly).
+                if is_vector_broadcast_op(op) {
+                    out.insert(d.0);
+                    continue;
+                }
                 if is_sse128_chain_op(op) && !args.is_empty() {
                     if let Operand::Value(a0) = &args[0] {
                         let same_as_a1 = matches!(&args[1.min(args.len() - 1)], Operand::Value(v) if v.0 == a0.0);

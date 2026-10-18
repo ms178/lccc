@@ -832,6 +832,134 @@ fn hoist_param_loads(func: &mut IrFunction, table: &FxHashMap<IntrinsicOp, Famil
 }
 
 /// Module driver. Returns the number of allocas promoted.
+/// Integer identity folds the promotion exposes: once the `{}` seed and
+/// the operation on it meet in registers, `x + 0`, `0 + x`, `x - 0`,
+/// `x | 0`, `0 | x`, `x ^ 0`, `0 ^ x` are the other operand.  Integer
+/// families only -- FP `x + 0.0` is not an identity for `-0.0`, and the
+/// `-0.0` xor is the negation idiom.  `(v32i){} + x` (the GNU splat
+/// spelling) becomes the bare broadcast.
+///
+/// A zero is the family's zero op, or a broadcast of the constant 0
+/// (the byte/word families spell zero that way).  The folded instruction
+/// is deleted and its uses rewritten (a `Phi`-free function-wide map);
+/// the zero producer stays and dies with the ordinary dead-code sweep.
+fn fold_zero_identities(func: &mut IrFunction) -> usize {
+    use crate::ir::reexports::IrBinOp;
+    let ops: Vec<(IntrinsicOp, IrBinOp)> = {
+        let mut v = Vec::new();
+        for ty in [IrType::I8, IrType::I16, IrType::I32, IrType::I64] {
+            for bytes in [16usize, 32] {
+                let lanes = bytes / ty.size();
+                for bin in [IrBinOp::Add, IrBinOp::Sub, IrBinOp::Or, IrBinOp::Xor] {
+                    if let Some(op) = crate::passes::slp_vectorizer::packed_binop(bin, ty, lanes) {
+                        v.push((op, bin));
+                    }
+                }
+            }
+        }
+        v
+    };
+    let zero_ops: FxHashSet<IntrinsicOp> = [IrType::I8, IrType::I16, IrType::I32, IrType::I64]
+        .iter()
+        .flat_map(|&ty| [16usize, 32].into_iter().map(move |b| (ty, b / ty.size())))
+        .filter_map(|(ty, lanes)| family_for(ty, lanes))
+        .map(|f| f.zero)
+        .collect();
+    let broadcast_ops: FxHashSet<IntrinsicOp> = [IrType::I8, IrType::I16, IrType::I32, IrType::I64]
+        .iter()
+        .flat_map(|&ty| [16usize, 32].into_iter().map(move |b| (ty, b / ty.size())))
+        .filter_map(|(ty, lanes)| family_for(ty, lanes))
+        .map(|f| f.broadcast)
+        .collect();
+
+    // Zero-valued vector defs.
+    let mut zeros: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Intrinsic {
+                dest: Some(d),
+                op,
+                args,
+                ..
+            } = inst
+            {
+                // The byte/word families' `zero` IS their broadcast op:
+                // a broadcast is zero only with the constant-0 operand.
+                let is_zero = if broadcast_ops.contains(op) {
+                    args.first().is_some_and(const_is_zero)
+                } else {
+                    zero_ops.contains(op)
+                };
+                if is_zero {
+                    zeros.insert(d.0);
+                }
+            }
+        }
+    }
+    if zeros.is_empty() {
+        return 0;
+    }
+    let mut map: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut drops: Vec<FxHashSet<usize>> = vec![FxHashSet::default(); func.blocks.len()];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Intrinsic {
+                dest: Some(d),
+                op,
+                args,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            let Some((_, bin)) = ops.iter().find(|(o, _)| o == op) else {
+                continue;
+            };
+            let (Some(Operand::Value(a)), Some(Operand::Value(b))) = (args.first(), args.get(1))
+            else {
+                continue;
+            };
+            let a_zero = zeros.contains(&a.0);
+            let b_zero = zeros.contains(&b.0);
+            let keep = match bin {
+                IrBinOp::Sub => {
+                    if b_zero {
+                        Some(a.0)
+                    } else {
+                        None
+                    }
+                }
+                _ => {
+                    if b_zero {
+                        Some(a.0)
+                    } else if a_zero {
+                        Some(b.0)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(src) = keep {
+                // Chase an earlier fold so chains resolve in one pass.
+                let src = *map.get(&src).unwrap_or(&src);
+                map.insert(d.0, src);
+                drops[bi].insert(ii);
+            }
+        }
+    }
+    if map.is_empty() {
+        return 0;
+    }
+    for (bi, block) in func.blocks.iter_mut().enumerate() {
+        retain_instructions(block, &drops[bi]);
+        for inst in &mut block.instructions {
+            replace_values_in_inst_map(inst, &map);
+        }
+        replace_values_in_terminator_map(&mut block.terminator, &map);
+    }
+    map.len()
+}
+
 pub(crate) fn promote_vector_allocas(module: &mut IrModule) -> usize {
     let table = family_table();
     if table.is_empty() {
@@ -841,6 +969,7 @@ pub(crate) fn promote_vector_allocas(module: &mut IrModule) -> usize {
     for func in &mut module.functions {
         total += promote_function(func, &table);
         total += hoist_param_loads(func, &table);
+        total += fold_zero_identities(func);
     }
     total
 }

@@ -351,6 +351,58 @@ impl Lowerer {
             Some(Self::vec_binop_intrinsic(op, &shape, is_unsigned)?)
         };
         let rhs_plan = self.vec_operand_plan(rhs, &shape, vec_ct)?;
+        // A scalar integer constant operand of an integer add/sub/mul/
+        // bitwise op rides on the intrinsic as a lane constant (`v + 3`
+        // is `vpaddd .LCVEC_n(%rip), %ymm0, %ymm0`; the backend tiles the
+        // `.rodata` entry).  Only the src2 position folds; a constant lhs
+        // of a commutative op is swapped there.
+        if let Some(packed) = packed {
+            if !shape.elem_ir.is_float()
+                && matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                )
+            {
+                let lane_const = |this: &mut Self, e: &Expr, plan: bool| -> Option<IrConst> {
+                    if plan {
+                        return None;
+                    }
+                    let v = this.eval_const_expr(e)?.to_i64()?;
+                    Some(match shape.elem_ir.size() {
+                        1 => IrConst::I8(v as i8),
+                        2 => IrConst::I16(v as i16),
+                        4 => IrConst::I32(v as i32),
+                        _ => IrConst::I64(v),
+                    })
+                };
+                let (vec_e, vec_plan, c) = match lane_const(self, rhs, rhs_plan) {
+                    Some(c) => (lhs, lhs_plan, Some(c)),
+                    None if !matches!(op, BinOp::Sub) => match lane_const(self, lhs, lhs_plan) {
+                        Some(c) => (rhs, rhs_plan, Some(c)),
+                        None => (lhs, lhs_plan, None),
+                    },
+                    None => (lhs, lhs_plan, None),
+                };
+                if let Some(c) = c {
+                    let a = self.vec_operand_value(vec_e, vec_plan, &shape);
+                    let r = self.fresh_value();
+                    self.emit(Instruction::Intrinsic {
+                        dest: Some(r),
+                        op: packed,
+                        dest_ptr: None,
+                        args: vec![Operand::Value(a), Operand::Const(c)],
+                    });
+                    let result = self.vec_result_alloca(vec_ct);
+                    self.emit_vec_store(&shape, r, result);
+                    return Some(Operand::Value(result));
+                }
+            }
+        }
         // Evaluation order: C leaves it unspecified between the operands;
         // the scalar lowering evaluates lhs then rhs, keep that.
         let a = self.vec_operand_value(lhs, lhs_plan, &shape);
