@@ -47,7 +47,7 @@ impl Lowerer {
         // Handle bitfield targets: pack the value into the storage unit bytes
         if let (Some(bo), Some(bw)) = (drill.bit_offset, drill.bit_width) {
             let ir_ty = IrType::from_ctype(&current_ty);
-            let val = self.eval_init_scalar(&item.init);
+            let val = self.init_scalar_for(&item.init, &current_ty);
             // Emit zero bytes before the storage unit
             push_zero_bytes(elements, sub_offset);
             // Create a small buffer for the storage unit, write bitfield, emit as bytes

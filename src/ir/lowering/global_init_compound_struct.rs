@@ -324,7 +324,7 @@ impl Lowerer {
 
                         let inits = &field_inits[fi];
                         let val = if !inits.is_empty() {
-                            self.eval_init_scalar(&inits[0].init)
+                            self.init_scalar_for(&inits[0].init, &layout.fields[fi].ty)
                         } else {
                             IrConst::I32(0) // Zero-init for missing initializers
                         };
