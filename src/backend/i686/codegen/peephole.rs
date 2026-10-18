@@ -1105,37 +1105,263 @@ fn is_debug_location(store: &LineStore, infos: &[LineInfo], idx: usize) -> bool 
         && syntax_of(store, infos, idx).split_whitespace().next() == Some(".loc")
 }
 
-/// Check if the next instruction reads the carry flag (CF).
-/// Instructions like `adcl`, `sbbl`, `rcl`, `rcr` depend on CF.
-/// `incl`/`decl` do NOT set CF (unlike `addl`/`subl`), so converting
-/// `addl $1` → `incl` or `subl $1` → `decl` is invalid when the next
-/// instruction reads CF.
-fn next_reads_carry_flag(store: &LineStore, infos: &[LineInfo], start: usize) -> bool {
-    let len = infos.len();
-    for j in (start + 1)..len {
+/// How one instruction touches EFLAGS, for the forward liveness scan.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FlagUse {
+    /// Reads CF, possibly with other flags (jb/ja/setbe/cmovae, adc/sbb, ...).
+    Reads,
+    /// Reads arithmetic flags but never CF (je/jl/setne/cmovg/fcmove, ...).
+    ReadsNoCf,
+    /// Leaves no arithmetic flag of the previous state observable: each is
+    /// redefined or architecturally undefined (imul, bsf, div), and no
+    /// correct code depends on an undefined flag surviving.
+    WritesAll,
+    /// Defines every flag except CF (inc/dec).
+    WritesAllButCf,
+    /// Defines CF while some other flag survives (bt/bts/btr/btc keep ZF,
+    /// sahf keeps OF, clc/stc touch CF only).
+    WritesCf,
+    /// Leaves EFLAGS alone, or may leave it unchanged: moves, lea, push/pop,
+    /// x87 ops (FPU status word only), SSE data ops, `rep stos`, and shifts
+    /// by `%cl` (a zero count keeps the flags).
+    Neutral,
+    /// Flags are dead afterwards: call (clobbered by the callee under the
+    /// psABI) and ret.
+    Kills,
+    /// Unmodeled, or control leaves the fallthrough path (jmp, jecxz):
+    /// the scan must assume the flags are live.
+    Unknown,
+}
+
+/// The condition codes whose predicate involves CF.
+const CF_CONDS: [&str; 10] = ["b", "c", "nae", "ae", "nb", "nc", "be", "na", "a", "nbe"];
+
+const FLAG_CONDS: [&str; 30] = [
+    "o", "no", "b", "c", "nae", "ae", "nb", "nc", "e", "z", "ne", "nz", "be", "na", "a", "nbe",
+    "s", "ns", "p", "pe", "np", "po", "l", "nge", "ge", "nl", "le", "ng", "g", "nle",
+];
+
+/// Strip one AT&T size suffix (`addl` -> `add`) when the stem is known.
+fn flag_stem<'a>(m: &'a str, stems: &[&str]) -> Option<&'a str> {
+    if stems.contains(&m) {
+        return Some(m);
+    }
+    let base = m.strip_suffix(['b', 'w', 'l'])?;
+    stems.contains(&base).then_some(base)
+}
+
+/// Classify one instruction's EFLAGS behaviour from its trimmed AT&T text.
+/// Anything not modeled is `Unknown`, never `Neutral`: the scan fails closed.
+fn flag_use(insn: &str) -> FlagUse {
+    let (m, ops) = match insn.split_once(char::is_whitespace) {
+        Some((m, ops)) => (m, ops.trim()),
+        None => (insn, ""),
+    };
+    if m == "call" || m == "calll" {
+        // The PIC thunk is `movl (%esp), %reg; ret`: flags pass through.
+        return if ops.contains("get_pc_thunk") {
+            FlagUse::Neutral
+        } else {
+            FlagUse::Kills
+        };
+    }
+    if m == "ret" || m == "retl" {
+        return FlagUse::Kills;
+    }
+    for p in ["j", "set", "cmov", "fcmov"] {
+        if let Some(rest) = m.strip_prefix(p) {
+            let rest = if p == "cmov" {
+                rest.strip_suffix(['w', 'l'])
+                    .filter(|r| FLAG_CONDS.contains(r))
+                    .unwrap_or(rest)
+            } else {
+                rest
+            };
+            if FLAG_CONDS.contains(&rest) || (p == "fcmov" && matches!(rest, "u" | "nu")) {
+                return if CF_CONDS.contains(&rest) {
+                    FlagUse::Reads
+                } else {
+                    FlagUse::ReadsNoCf
+                };
+            }
+        }
+    }
+    if flag_stem(m, &["adc", "sbb", "rcl", "rcr"]).is_some()
+        || matches!(m, "cmc" | "pushf" | "pushfl" | "lahf")
+    {
+        return FlagUse::Reads;
+    }
+    if m == "rep" {
+        let op = ops.split_whitespace().next().unwrap_or("");
+        return if ["stos", "movs", "lods"].iter().any(|s| op.starts_with(s)) {
+            FlagUse::Neutral
+        } else {
+            FlagUse::Unknown
+        };
+    }
+    if matches!(m, "fcomi" | "fcomip" | "fucomi" | "fucomip") {
+        return FlagUse::WritesAll;
+    }
+    if m.starts_with('f') {
+        // x87 arithmetic, compares and stores touch only the FPU status word.
+        return FlagUse::Neutral;
+    }
+    if insn.contains("%xmm") || insn.contains("%ymm") || insn.contains("%zmm") {
+        let b = m.strip_prefix('v').unwrap_or(m);
+        let writes = b.starts_with("comis")
+            || b.starts_with("ucomis")
+            || b == "ptest"
+            || b.starts_with("testp")
+            || b.starts_with("pcmpestr")
+            || b.starts_with("pcmpistr");
+        return if writes {
+            FlagUse::WritesAll
+        } else {
+            FlagUse::Neutral
+        };
+    }
+    if flag_stem(m, &["bt", "bts", "btr", "btc"]).is_some() || matches!(m, "sahf" | "clc" | "stc") {
+        return FlagUse::WritesCf;
+    }
+    // Single and double shifts: the count is the first operand.
+    if flag_stem(m, &["shl", "sal", "shr", "sar", "shld", "shrd"]).is_some() {
+        let Some((count, _)) = ops.split_once(',') else {
+            return FlagUse::WritesAll; // implicit count of 1
+        };
+        let count = count.trim();
+        return match count.strip_prefix('$').map(str::parse::<i64>) {
+            Some(Ok(n)) if n & 31 != 0 => FlagUse::WritesAll,
+            Some(Ok(_)) => FlagUse::Neutral, // a zero count keeps EFLAGS
+            Some(Err(_)) => FlagUse::Unknown,
+            None if count == "%cl" => FlagUse::Neutral, // the count may be zero
+            None => FlagUse::Unknown,
+        };
+    }
+    if flag_stem(m, &["add", "sub", "and", "or", "xor", "cmp", "test", "neg"]).is_some()
+        || flag_stem(m, &["imul", "mul", "div", "idiv", "bsf", "bsr"]).is_some()
+        || flag_stem(m, &["popcnt", "lzcnt", "tzcnt"]).is_some()
+        || matches!(m, "popf" | "popfl")
+    {
+        return FlagUse::WritesAll;
+    }
+    if flag_stem(m, &["inc", "dec"]).is_some() {
+        return FlagUse::WritesAllButCf;
+    }
+    if m.starts_with("mov")
+        || m.starts_with("lea")
+        || m.starts_with("push")
+        || m.starts_with("pop")
+        || m.starts_with("xchg")
+        || m.starts_with("bswap")
+        || m.starts_with("not")
+        || matches!(m, "cltd" | "cdq" | "cwtl" | "cbtw" | "nop")
+    {
+        return FlagUse::Neutral;
+    }
+    FlagUse::Unknown
+}
+
+/// Longest fallthrough window the scan inspects before assuming "live".
+const FLAG_SCAN_LIMIT: usize = 256;
+/// Conditional-branch targets one CF query may follow (each costs a label
+/// lookup) before it assumes "live".
+const FLAG_SCAN_BRANCH_FOLLOWS: u32 = 3;
+
+/// Whether some EFLAGS bit (only CF when `cf_only`) defined by line `start`
+/// can still be read. Forward scan of the fallthrough path: labels are
+/// crossed (the path continues there; other predecessors bring their own
+/// flags), directives that emit no flag-touching bytes (`.loc`, `.cfi_*`,
+/// NOP alignment padding) are transparent, and any other directive or
+/// unmodeled instruction means "live".
+fn flags_live_after(store: &LineStore, infos: &[LineInfo], start: usize, cf_only: bool) -> bool {
+    let mut follows = FLAG_SCAN_BRANCH_FOLLOWS;
+    flags_live_from(store, infos, start, cf_only, &mut follows)
+}
+
+/// The scan behind [`flags_live_after`]. A direct `jmp` continues at its
+/// target label. A reader that never consults CF ends the scan as "live"
+/// unless only CF matters; then a non-jump reader (setne, cmovl) is
+/// transparent, and a conditional jump forks: its target and its
+/// fallthrough must both be CF-dead. Every label lookup spends one unit of
+/// the query's `follows` budget; an exhausted budget, an unresolvable or
+/// indirect target means "live".
+fn flags_live_from(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    cf_only: bool,
+    follows: &mut u32,
+) -> bool {
+    let mut seen = 0;
+    for j in (start + 1)..infos.len() {
+        if infos[j].is_nop() || is_debug_location(store, infos, j) {
+            continue;
+        }
         let s = store.get(j).trim();
         if s.is_empty() || s.starts_with('#') || s.starts_with("//") || s.ends_with(':') {
             continue;
         }
-        // Check if the instruction reads CF
-        return s.starts_with("adcl ")
-            || s.starts_with("adcb ")
-            || s.starts_with("adcw ")
-            || s.starts_with("sbbl ")
-            || s.starts_with("sbbb ")
-            || s.starts_with("sbbw ")
-            || s.starts_with("rcl ")
-            || s.starts_with("rcr ")
-            || s.starts_with("setc ")
-            || s.starts_with("setb ")
-            || s.starts_with("jc ")
-            || s.starts_with("jb ")
-            || s.starts_with("jnc ")
-            || s.starts_with("jnb ")
-            || s.starts_with("jae ")
-            || s.starts_with("cmc");
+        if let Some(d) = s.strip_prefix('.') {
+            let d = d.split_whitespace().next().unwrap_or("");
+            if d.starts_with("cfi_") || matches!(d, "loc" | "p2align" | "align" | "balign") {
+                continue;
+            }
+            return true;
+        }
+        seen += 1;
+        if seen > FLAG_SCAN_LIMIT {
+            return true;
+        }
+        if infos[j].kind == LineKind::Jmp {
+            return match parse_jmp_target(s).and_then(|t| flag_label_line(store, infos, t)) {
+                Some(k) if *follows > 0 => {
+                    *follows -= 1;
+                    flags_live_from(store, infos, k, cf_only, follows)
+                }
+                _ => true,
+            };
+        }
+        match flag_use(s) {
+            FlagUse::ReadsNoCf if cf_only => {
+                if infos[j].kind == LineKind::CondJmp {
+                    if *follows == 0 {
+                        return true;
+                    }
+                    *follows -= 1;
+                    let at = parse_condjmp(s).and_then(|(_, t)| flag_label_line(store, infos, t));
+                    match at {
+                        Some(k) => {
+                            if flags_live_from(store, infos, k, true, follows) {
+                                return true;
+                            }
+                        }
+                        None => return true,
+                    }
+                }
+            }
+            FlagUse::Reads | FlagUse::ReadsNoCf | FlagUse::Unknown => return true,
+            FlagUse::WritesAll | FlagUse::Kills => return false,
+            FlagUse::WritesAllButCf if !cf_only => return false,
+            FlagUse::WritesCf if cf_only => return false,
+            FlagUse::WritesAllButCf | FlagUse::WritesCf | FlagUse::Neutral => {}
+        }
     }
     false
+}
+
+/// The line defining local label `name` (linear: only reached through the
+/// small per-query follow budget).
+fn flag_label_line(store: &LineStore, infos: &[LineInfo], name: &str) -> Option<usize> {
+    (0..infos.len()).find(|&k| {
+        infos[k].kind == LineKind::Label && store.get(k).trim().strip_suffix(':') == Some(name)
+    })
+}
+
+/// `incl`/`decl` leave CF unchanged (unlike `addl`/`subl`), so rewriting
+/// `addl $1` -> `incl` is invalid while a later reader still sees CF --
+/// not only an adjacent `adcl`, but also e.g. `ja` or `cmovbe` further down.
+fn next_reads_carry_flag(store: &LineStore, infos: &[LineInfo], start: usize) -> bool {
+    flags_live_after(store, infos, start, true)
 }
 
 // ── Pass 1: Local patterns ───────────────────────────────────────────────────
@@ -1253,7 +1479,9 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 }
             }
         }
-        // movl $0, %reg → xorl %reg, %reg (saves 3 bytes, clears flags)
+        // movl $0, %reg → xorl %reg, %reg (saves 3 bytes). Unlike movl,
+        // xorl DEFINES EFLAGS, so only where no later reader can still see
+        // the previous flags (e.g. a zero dword loaded inside an sbbl chain).
         if let LineKind::Other { dest_reg } = infos[i].kind {
             if dest_reg != REG_NONE
                 && dest_reg <= REG_GP_MAX
@@ -1262,7 +1490,9 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             {
                 let s = trimmed(store, &infos[i], i);
                 let rn = reg32_name(dest_reg);
-                if s == format!("movl $0, {}", rn) {
+                if s.strip_prefix("movl $0, ") == Some(rn)
+                    && !flags_live_after(store, infos, i, false)
+                {
                     store.replace(i, format!("    xorl {}, {}", rn, rn));
                     infos[i] = LineInfo {
                         kind: LineKind::Other { dest_reg },
@@ -14902,6 +15132,171 @@ fn merge_duplicate_epilogues_terminal(asm: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flag_use_classifies_eflags_effects() {
+        use FlagUse::*;
+        let table: &[(&str, FlagUse)] = &[
+            ("ja .L3", Reads),
+            ("cmovbe %ecx, %eax", Reads),
+            ("cmovael %ecx, %eax", Reads),
+            ("setnae %al", Reads),
+            ("adcl $0, %edx", Reads),
+            ("sbbb %al, %al", Reads),
+            ("fcmovnbe %st(1), %st", Reads),
+            ("fcmovu %st(1), %st", ReadsNoCf),
+            ("jne .L1", ReadsNoCf),
+            ("cmovl %ecx, %eax", ReadsNoCf),
+            ("setg %al", ReadsNoCf),
+            ("pushfl", Reads),
+            ("cmpl %ebx, %eax", WritesAll),
+            ("testb $1, %al", WritesAll),
+            ("imull %ecx, %eax", WritesAll),
+            ("idivl %ecx", WritesAll),
+            ("popcntl %eax, %eax", WritesAll),
+            ("shll $3, %eax", WritesAll),
+            ("sarl %eax", WritesAll),
+            ("ucomiss %xmm1, %xmm0", WritesAll),
+            ("vptest %xmm0, %xmm0", WritesAll),
+            ("fucomip %st(1), %st", WritesAll),
+            ("popfl", WritesAll),
+            ("incl %eax", WritesAllButCf),
+            ("decb %cl", WritesAllButCf),
+            ("movl $0, %ecx", Neutral),
+            ("leal 4(%eax), %ecx", Neutral),
+            ("leave", Neutral),
+            ("notl %eax", Neutral),
+            ("rep stosl", Neutral),
+            ("shll %cl, %eax", Neutral),
+            ("shll $0, %eax", Neutral),
+            ("faddp %st, %st(1)", Neutral),
+            ("fcompl 8(%ebp)", Neutral),
+            ("addss %xmm1, %xmm0", Neutral),
+            ("pxor %xmm0, %xmm0", Neutral),
+            ("call __x86.get_pc_thunk.bx", Neutral),
+            ("call memcpy", Kills),
+            ("ret $4", Kills),
+            ("jmp .L5", Unknown),
+            ("jecxz .L5", Unknown),
+            ("sahf", WritesCf),
+            ("btl $3, %eax", WritesCf),
+            ("btcl $31, %eax", WritesCf),
+            ("clc", WritesCf),
+            ("shrdl $1, %edx, %eax", WritesAll),
+            ("shldl %cl, %edx, %eax", Neutral),
+            ("roll $3, %eax", Unknown),
+            ("repe cmpsb", Unknown),
+            ("lock xaddl %eax, (%ecx)", Unknown),
+        ];
+        for &(insn, want) in table {
+            assert_eq!(flag_use(insn), want, "{insn}");
+        }
+    }
+
+    #[test]
+    fn zero_idiom_keeps_movl_while_flags_are_live() {
+        // A borrow chain loads a zero dword between its flag ops: `xorl`
+        // there would clear CF and corrupt the sbbl result.
+        let asm = concat!(
+            "    cmpl %ebx, %eax\n",
+            "    movl $0, %ecx\n",
+            "    .cfi_def_cfa_offset 8\n",
+            "    sbbl %edx, %ecx\n",
+            "    movl %ecx, %eax\n",
+            "    ret\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("movl $0, %ecx") && !out.contains("xorl %ecx, %ecx"),
+            "flags-live zero rewritten:\n{out}"
+        );
+        // Flags redefined before any reader (across .cfi, rep stos and a
+        // shift): the 2-byte zero idiom must still be used.
+        let asm2 = concat!(
+            "    cmpl %ebx, %eax\n",
+            "    movl $0, %ecx\n",
+            "    .cfi_def_cfa_offset 8\n",
+            "    rep stosl\n",
+            "    shll $2, %edx\n",
+            "    setb %al\n",
+            "    addl %ecx, %eax\n",
+            "    addl %edx, %eax\n",
+            "    ret\n",
+        );
+        let out2 = peephole_optimize(asm2.to_string());
+        assert!(
+            out2.contains("xorl %ecx, %ecx"),
+            "dead-flags zero not rewritten:\n{out2}"
+        );
+        // A direct jmp continues at its target: dead there (cmpl redefines
+        // the flags) -> rewrite; live there (sbbl reads CF) -> keep.
+        let via_jmp = |at_target: &str| {
+            let asm = format!(
+                "    cmpl %ebx, %eax\n    movl $0, %ecx\n    jmp .L7\n.L6:\n    ret\n\
+                 .L7:\n    {at_target}\n    movl %ecx, %eax\n    jmp .L6\n"
+            );
+            peephole_optimize(asm)
+        };
+        let dead = via_jmp("cmpl %edx, %ecx");
+        assert!(
+            dead.contains("xorl %ecx, %ecx"),
+            "jmp target redefines flags:\n{dead}"
+        );
+        let live = via_jmp("sbbl %edx, %ecx");
+        assert!(
+            live.contains("movl $0, %ecx") && !live.contains("xorl %ecx, %ecx"),
+            "jmp target reads CF:\n{live}"
+        );
+    }
+
+    #[test]
+    fn inc_rewrite_respects_distant_carry_readers() {
+        // CF of `addl $1` is read two lines later by `ja` (a live branch: the
+        // fallthrough rewrites %eax): incl would leave the cmpl's stale CF.
+        let asm = concat!(
+            "    cmpl %ebx, %ecx\n",
+            "    addl $1, %eax\n",
+            "    movl %eax, %edx\n",
+            "    ja .L2\n",
+            "    movl $5, %eax\n",
+            ".L2:\n",
+            "    ret\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("addl $1, %eax"),
+            "CF-live addl became incl:\n{out}"
+        );
+        // Only ZF is read afterwards: the shorter incl is fine.
+        let asm2 = concat!(
+            "    addl $1, %eax\n",
+            "    movl %eax, %edx\n",
+            "    jne .L2\n",
+            "    movl $5, %eax\n",
+            ".L2:\n",
+            "    ret\n",
+        );
+        let out2 = peephole_optimize(asm2.to_string());
+        assert!(
+            out2.contains("incl %eax"),
+            "CF-dead addl not rewritten:\n{out2}"
+        );
+        // A ZF-only branch forks: CF is read at its TARGET, so addl stays.
+        let asm3 = concat!(
+            "    addl $1, %eax\n",
+            "    jne .L2\n",
+            "    movl $5, %eax\n",
+            "    ret\n",
+            ".L2:\n",
+            "    adcl $0, %edx\n",
+            "    ret\n",
+        );
+        let out3 = peephole_optimize(asm3.to_string());
+        assert!(
+            out3.contains("addl $1, %eax"),
+            "CF read at the branch target, addl became incl:\n{out3}"
+        );
+    }
 
     #[test]
     fn ret_n_observes_return_register() {
