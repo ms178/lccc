@@ -93,6 +93,19 @@ lccc_isa_flags() {
         *) echo "$1 -ffp-contract=off" ;;
     esac
 }
+# Prefix the matrix's OWN symbols (its definitions, and the two helpers
+# the driver defines per side: `sink`, `call8`) so the lccc and GCC twins
+# coexist in one executable.  Not a blanket `--prefix-symbols`: a GCC
+# configured with `--enable-default-ssp` (Debian's packages, hence the
+# hosted runner) emits `__stack_chk_fail` for the vector locals, and
+# `memcpy`/`memset` may appear at -O0 — a prefixed runtime symbol is an
+# undefined reference and the link fails before a single check runs.
+prefix_symbols() {
+    local pfx=$1 obj=$2
+    nm --defined-only -g "$obj" | awk -v p="$pfx" 'NF == 3 { print $3, p $3 }' >"$tmp/syms"
+    printf 'sink %ssink\ncall8 %scall8\n' "$pfx" "$pfx" >>"$tmp/syms"
+    objcopy --redefine-syms="$tmp/syms" "$obj"
+}
 runs=0
 for flags in "${levels[@]}"; do
     gflags=$(gcc_isa_flags "$flags")
@@ -112,8 +125,8 @@ for flags in "${levels[@]}"; do
     fi
     # shellcheck disable=SC2086
     "$gcc_bin" $gflags -w -Wno-psabi -c "$src" -o "$tmp/m.g.o"
-    objcopy --prefix-symbols=L_ "$tmp/m.l.o"
-    objcopy --prefix-symbols=G_ "$tmp/m.g.o"
+    prefix_symbols L_ "$tmp/m.l.o"
+    prefix_symbols G_ "$tmp/m.g.o"
     # shellcheck disable=SC2086
     "$gcc_bin" -O0 $gflags -w -Wno-psabi "$drv" "$tmp/m.l.o" "$tmp/m.g.o" -o "$tmp/rt.bin"
     if ! out=$("$tmp/rt.bin" 2>&1); then
