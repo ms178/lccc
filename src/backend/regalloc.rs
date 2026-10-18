@@ -455,9 +455,31 @@ pub(crate) fn analyze_accumulator_assignments_with_config(
     config: &RaConfig,
 ) -> Vec<AccumulatorAssignment> {
     let lhs_first = matches!(policy.operand_order, AccumulatorOperandOrder::LhsFirst);
-    let candidates = crate::backend::stack_layout::copy_coalescing::compute_immediately_consumed(
-        func, lhs_first,
-    );
+    let mut candidates =
+        crate::backend::stack_layout::copy_coalescing::compute_immediately_consumed(
+            func, lhs_first,
+        );
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    // An accumulator home is one register: a value proven wider than it (an
+    // 8-byte I64/U64/F64/D64 pair on a 32-bit target, a 16-byte value
+    // anywhere) would be consumed with a stale upper half. The candidate scan
+    // types values by their producer, and a Copy has none of its own, so a
+    // copy of a wide phi, constant, call result or parameter slipped through.
+    // The fixpoint value-type map types every Copy/Phi web and consuming
+    // context; untyped values keep the historical GPR treatment.
+    let accumulator_bytes = if crate::common::types::target_is_32bit() {
+        4
+    } else {
+        8
+    };
+    let value_types = crate::backend::common::compute_value_type_map(func);
+    candidates.retain(|id| {
+        value_types
+            .get(id)
+            .is_none_or(|ty| ty.size() <= accumulator_bytes)
+    });
     if candidates.is_empty() {
         return Vec::new();
     }
@@ -7383,12 +7405,21 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                         }
                     }
                 }
+                Instruction::Phi { dest, ty, .. } => {
+                    if is_non_gpr_type(ty, is_32bit) {
+                        non_gpr_values.insert(dest.0);
+                    }
+                }
                 Instruction::Copy { dest, src } => {
                     let src_is_non_gpr = match src {
                         Operand::Const(IrConst::F32(_))
                         | Operand::Const(IrConst::F64(_))
                         | Operand::Const(IrConst::LongDouble(..))
-                        | Operand::Const(IrConst::I128(_)) => true,
+                        | Operand::Const(IrConst::I128(_))
+                        // Decimal BID carriers are FP-class (`IrType::is_float`):
+                        // a D64 copy in a GPR loses its high word on i686.
+                        | Operand::Const(IrConst::D32(_))
+                        | Operand::Const(IrConst::D64(_)) => true,
                         // Ambiguous storage form: trust the value's own
                         // width evidence over the constant's spelling
                         // (see the value_type_map comment above).
@@ -15381,6 +15412,58 @@ mod scalar_lane_class_tests {
             assert!(
                 !non_gpr.contains(&id),
                 "integer lane v{id} must remain GPR-eligible"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_copies_and_phis_are_never_gpr_homed() {
+        // `c ? 1.5DD : 2.25DD` after phi elimination: two constant copies
+        // into the merge value plus the D64 phi itself.  Every member is
+        // FP-class on both word sizes (on i686 a GPR holds 4 of 8 bytes).
+        let mut f = IrFunction::new("dec_phi".into(), IrType::Void, vec![], false);
+        let bb = |label: u32, instructions: Vec<Instruction>| BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        };
+        f.blocks.push(bb(
+            0,
+            vec![
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::D64(0x31a0_0000_0000_000f)),
+                },
+                Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Const(IrConst::D32(0x3280_0001)),
+                },
+                Instruction::Copy {
+                    dest: Value(4),
+                    src: Operand::Const(IrConst::I32(7)),
+                },
+            ],
+        ));
+        f.blocks.push(bb(
+            1,
+            vec![Instruction::Phi {
+                dest: Value(3),
+                ty: IrType::D64,
+                incoming: vec![(Operand::Value(Value(1)), BlockId(0))],
+            }],
+        ));
+        for is_32bit in [true, false] {
+            let non_gpr = collect_non_gpr_values(&f, is_32bit);
+            for id in [1, 2, 3] {
+                assert!(
+                    non_gpr.contains(&id),
+                    "v{id} (decimal) is FP-class, 32-bit={is_32bit}"
+                );
+            }
+            assert!(
+                !non_gpr.contains(&4),
+                "an int constant copy stays GPR-eligible"
             );
         }
     }

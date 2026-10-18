@@ -336,7 +336,7 @@ impl I686Codegen {
             self.state.reg_cache.invalidate_acc();
             return;
         }
-        if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 || ty == IrType::D64 {
+        if super::emit::is_pair_scalar(ty) {
             let mut addr = self.state.resolve_slot_addr(ptr.0);
             // Base homed in %eax/%edx dies when the VALUE pair is staged
             // into the accumulator below. Stash such a base into the %ecx
@@ -467,7 +467,7 @@ impl I686Codegen {
             }
             return;
         }
-        if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 || ty == IrType::D64 {
+        if super::emit::is_pair_scalar(ty) {
             let addr = self.state.resolve_slot_addr(ptr.0);
             if let Some(addr) = addr {
                 match addr {
@@ -577,9 +577,7 @@ impl I686Codegen {
         // which silently emits nothing for a slot-less base.  The base is
         // callee-saved by the fold predicate, so the staging cannot clobber
         // it.
-        if (ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64)
-            && !self.state.is_alloca(base.0)
-        {
+        if super::emit::is_pair_scalar(ty) && !self.state.is_alloca(base.0) {
             if let Some(&phys) = self.reg_assignments.get(&base.0) {
                 if matches!(phys.0, 0 | 1 | 2 | 3) {
                     let base_name = phys_reg_name(phys);
@@ -597,7 +595,7 @@ impl I686Codegen {
                 }
             }
         }
-        if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
+        if super::emit::is_pair_scalar(ty) {
             let mut addr = self.state.resolve_slot_addr(base.0);
             // Same %eax/%edx-base hazard as the plain pair store: the value
             // staging below overwrites both accumulator halves, so stash
@@ -823,9 +821,7 @@ impl I686Codegen {
         // which silently emits nothing for a slot-less base.  The fold
         // predicate (const_offset_fold_reg_base_ok) guarantees the base sits
         // in a callee-saved register, never the %eax:%edx accumulator pair.
-        if (ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64)
-            && !self.state.is_alloca(base.0)
-        {
+        if super::emit::is_pair_scalar(ty) && !self.state.is_alloca(base.0) {
             if let Some(&phys) = self.reg_assignments.get(&base.0) {
                 if matches!(phys.0, 0 | 1 | 2 | 3) {
                     let base_name = phys_reg_name(phys);
@@ -843,7 +839,7 @@ impl I686Codegen {
                 }
             }
         }
-        if ty == IrType::I64 || ty == IrType::U64 || ty == IrType::F64 {
+        if super::emit::is_pair_scalar(ty) {
             let addr = self.state.resolve_slot_addr(base.0);
             if let Some(addr) = addr {
                 match addr {

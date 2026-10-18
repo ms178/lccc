@@ -6905,7 +6905,9 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
 
     let is_wide = match src {
         Operand::Value(v) => cg.state_ref().is_wide_value(v.0),
-        Operand::Const(IrConst::F64(_)) => crate::common::types::target_is_32bit(),
+        Operand::Const(IrConst::F64(_) | IrConst::D64(_)) => {
+            crate::common::types::target_is_32bit()
+        }
         Operand::Const(IrConst::I64(val)) => {
             crate::common::types::target_is_32bit()
                 && (*val < i32::MIN as i64 || *val > u32::MAX as i64)

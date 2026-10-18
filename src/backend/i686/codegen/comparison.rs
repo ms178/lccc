@@ -535,7 +535,7 @@ impl I686Codegen {
         }
 
         let cond_is_wide = matches!(cond, Operand::Value(v) if self.state.is_wide_value(v.0));
-        let result_is_wide = matches!(ty, IrType::F64 | IrType::I64 | IrType::U64);
+        let result_is_wide = super::emit::is_pair_scalar(ty);
 
         if !cond_is_wide && !result_is_wide {
             let label_id = self.state.next_label_id();

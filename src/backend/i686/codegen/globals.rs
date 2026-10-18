@@ -109,7 +109,7 @@ impl I686Codegen {
             "i686 absolute global load fold does not support F128"
         );
 
-        if matches!(ty, IrType::I64 | IrType::U64 | IrType::F64) {
+        if super::emit::is_pair_scalar(ty) {
             emit!(self.state, "    movl {}, %eax", sym);
             emit!(self.state, "    movl {}+4, %edx", sym);
 
@@ -157,7 +157,7 @@ impl I686Codegen {
             "i686 absolute global store fold does not support F128"
         );
 
-        if matches!(ty, IrType::I64 | IrType::U64 | IrType::F64) {
+        if super::emit::is_pair_scalar(ty) {
             self.emit_load_acc_pair_impl(val);
             emit!(self.state, "    movl %eax, {}", sym);
             emit!(self.state, "    movl %edx, {}+4", sym);

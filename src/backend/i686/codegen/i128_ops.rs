@@ -709,38 +709,17 @@ impl I686Codegen {
                     self.state.emit("    xorl %edx, %edx");
                 }
             }
-            Operand::Const(IrConst::I128(v)) => {
-                let low = (*v & 0xFFFFFFFF) as i32;
-                let high = ((*v >> 32) & 0xFFFFFFFF) as i32;
-                emit!(self.state, "    movl ${}, %eax", low);
-                emit!(self.state, "    movl ${}, %edx", high);
-            }
-            Operand::Const(IrConst::I64(v)) => {
-                let low = (*v & 0xFFFFFFFF) as i32;
-                let high = ((*v >> 32) & 0xFFFFFFFF) as i32;
-                emit!(self.state, "    movl ${}, %eax", low);
-                emit!(self.state, "    movl ${}, %edx", high);
-            }
-            Operand::Const(IrConst::F64(f)) => {
-                let bits = f.to_bits();
-                let low = (bits & 0xFFFFFFFF) as i32;
-                let high = (bits >> 32) as i32;
-                emit!(self.state, "    movl ${}, %eax", low);
-                emit!(self.state, "    movl ${}, %edx", high);
-            }
             Operand::Const(IrConst::Zero) => {
                 self.state.emit("    xorl %eax, %eax");
                 self.state.emit("    xorl %edx, %edx");
             }
-            Operand::Const(c)
-                if matches!(c, IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_)) =>
-            {
-                if let Some(ext) = c.to_i64() {
-                    let low = (ext & 0xFFFFFFFF) as i32;
-                    let high = ((ext >> 32) & 0xFFFFFFFF) as i32;
-                    emit!(self.state, "    movl ${}, %eax", low);
-                    emit!(self.state, "    movl ${}, %edx", high);
-                }
+            // Every constant with a high word of its own (a `_Decimal64`
+            // BID pattern included: zero-extending its low half stored
+            // 1.5DD as 0x...0000000f) loads both halves exactly.
+            Operand::Const(c) if super::emit::pair_const_bits(c).is_some() => {
+                let bits = super::emit::pair_const_bits(c).expect("guarded");
+                emit!(self.state, "    movl ${}, %eax", bits as u32 as i32);
+                emit!(self.state, "    movl ${}, %edx", (bits >> 32) as u32 as i32);
             }
             _ => {
                 self.operand_to_eax(op);

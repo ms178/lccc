@@ -38,7 +38,7 @@ impl I686Codegen {
                 self.state.f128_direct_slots.insert(dest.0);
             }
             self.state.emit("    addl $12, %ecx");
-        } else if result_ty == IrType::F64 || result_ty == IrType::I64 || result_ty == IrType::U64 {
+        } else if super::emit::is_pair_scalar(result_ty) {
             if let Some(dest_slot) = self.state.get_slot(dest.0) {
                 let sr0 = self.slot_ref(dest_slot);
                 let sr4 = self.slot_ref_offset(dest_slot, 4);

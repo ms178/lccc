@@ -1747,7 +1747,7 @@ impl I686Codegen {
                 }
                 self.state.f128_direct_slots.insert(dest.0);
             }
-        } else if ty == IrType::F64 || ty == IrType::I64 || ty == IrType::U64 || ty == IrType::D64 {
+        } else if super::emit::is_pair_scalar(ty) {
             if let Some(slot) = self.state.get_slot(dest.0) {
                 let src_ref = self.param_ref(param_offset);
                 let dst_ref = self.slot_ref(slot);
