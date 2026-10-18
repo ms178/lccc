@@ -3366,6 +3366,7 @@ pub(crate) fn run_passes(
     // then see register-valued vector chains instead of slot round trips.
     if !pass_disabled(&disabled, "vecssa") {
         vec_ssa::promote_vector_allocas(module);
+        verify::verify_after_pass(module, "vecssa");
     }
 
     // Phase 11a'': Packed FMA contraction over the register-valued vector
