@@ -364,6 +364,62 @@ impl Lowerer {
         Some(Operand::Value(result))
     }
 
+    /// The vector object a `memcpy` pointer argument designates, when it
+    /// is one: `&v` names `v` directly; a pointer expression contributes
+    /// its pointee type.  Returns `(vector type, access is volatile)`.
+    fn memcpy_arg_vector_pointee(&self, e: &Expr) -> Option<(CType, bool)> {
+        if let Expr::AddressOf(inner, _) = e {
+            let ct = self.expr_ctype(inner);
+            if ct.is_vector() {
+                return Some((ct, self.expr_access_is_volatile(inner)));
+            }
+            return None;
+        }
+        match self.expr_ctype(e) {
+            CType::Pointer(inner, _) if inner.is_vector() => {
+                Some(((*inner).clone(), self.pointee_expr_is_volatile(e)))
+            }
+            _ => None,
+        }
+    }
+
+    /// `__builtin_memcpy(dst, src, N)` where one side is a whole vector
+    /// object of exactly `N` bytes with a packed family: a `VecLoad` from
+    /// `src` and a `VecStore` to `dst` with that family (`memcpy` already
+    /// promises no overlap, and a vector object's bytes are its register
+    /// image).  Declined -- nothing emitted -- for volatile accesses,
+    /// partial sizes, and shapes without a family, so the generic byte
+    /// copy keeps its exact semantics.
+    pub(super) fn try_emit_vector_memcpy(
+        &mut self,
+        dst_e: &Expr,
+        src_e: &Expr,
+        dp: Value,
+        sp: Value,
+        size: usize,
+    ) -> bool {
+        if !matches!(size, 16 | 32) {
+            return false;
+        }
+        let dst = self.memcpy_arg_vector_pointee(dst_e);
+        let src = self.memcpy_arg_vector_pointee(src_e);
+        if dst.as_ref().is_some_and(|(_, vol)| *vol) || src.as_ref().is_some_and(|(_, vol)| *vol) {
+            return false;
+        }
+        let Some((vec_ct, _)) = dst.or(src) else {
+            return false;
+        };
+        if vec_ct.size() != size {
+            return false;
+        }
+        let Some(shape) = simd_shape(&vec_ct) else {
+            return false;
+        };
+        let v = self.emit_vec_load(&shape, sp);
+        self.emit_vec_store(&shape, v, dp);
+        true
+    }
+
     /// Byte-lane multiply through the word family (x86 has no `pmullb`):
     ///
     ///   even = pmullw(a, b) & 0x00ff      (low byte of a word product is

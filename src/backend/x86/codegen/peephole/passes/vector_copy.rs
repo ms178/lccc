@@ -1429,6 +1429,19 @@ fn vex_rename_safe(t: &str) -> bool {
         && !mn.starts_with("vmovh")
 }
 
+/// A VEX full-width vector load from memory: writes every bit of the
+/// spelled destination from memory alone and zeroes above it, so its
+/// destination is a plain output exactly like the arithmetic producers
+/// (`vmovups (%rdi), %ymm2; vmovdqa %ymm2, %ymm0` is the whole-register
+/// `memcpy`-into-return shape).  Scalar (`vmovss`/`vmovsd`), half
+/// (`vmovlps`/`vmovhps`), broadcast and legacy spellings are excluded.
+fn full_width_load_zeroes_above(mn: &str) -> bool {
+    matches!(
+        mn,
+        "vmovups" | "vmovaps" | "vmovupd" | "vmovapd" | "vmovdqu" | "vmovdqa" | "vlddqu"
+    )
+}
+
 pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
@@ -1441,11 +1454,23 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
         }
         let t_op = infos[j].trimmed(store.get(j)).to_string();
         let (mn, operands) = split_mn(&t_op);
-        if !(vex_plain_output(mn) || vex_int_plain_output(mn)) || operands.contains('{') {
+        let is_full_load = full_width_load_zeroes_above(mn);
+        if !(vex_plain_output(mn) || vex_int_plain_output(mn) || is_full_load)
+            || operands.contains('{')
+        {
             j += 1;
             continue;
         }
         let ops: Vec<&str> = operand_list(operands).iter().map(|o| o.trim()).collect();
+        // A full-width load: two operands, the source a memory operand
+        // (a register-to-register `vmovdqa` is itself a copy, handled by
+        // the copy rules), folded only into the full-width VEX copy-out
+        // shape below.
+        if is_full_load && !(ops.len() == 2 && !ops[0].starts_with('%') && !ops[0].starts_with('$'))
+        {
+            j += 1;
+            continue;
+        }
         // Three operands, four with a leading immediate (`vroundsd`), or the
         // four-operand variable blend (`vblendvps`/`vblendvpd`: mask + two
         // sources + dest — the mask is a fourth source read, the dest a
@@ -1454,7 +1479,8 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
         let is_var_blend = matches!(mn, "vblendvps" | "vblendvpd");
         let arity_ok = ops.len() == 3
             || (ops.len() == 4 && ops[0].starts_with('$'))
-            || (is_var_blend && ops.len() == 4);
+            || (is_var_blend && ops.len() == 4)
+            || is_full_load;
         if !arity_ok {
             j += 1;
             continue;
@@ -1467,7 +1493,7 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             j += 1;
             continue;
         };
-        if pw != W128 && !vex_int_plain_output(mn) && !vex_plain_output(mn) {
+        if pw != W128 && !vex_int_plain_output(mn) && !vex_plain_output(mn) && !is_full_load {
             j += 1;
             continue;
         }
@@ -1579,6 +1605,10 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
         let full_copy_out = copy_out.width == pw && copy_spelling == Some(pw);
         let full_vex_copy_out = full_copy_out && copy_out.zeroes_above;
         if copy_out.src != t || !(scalar_copy_out || full_copy_out) {
+            j += 1;
+            continue;
+        }
+        if is_full_load && !full_vex_copy_out {
             j += 1;
             continue;
         }
@@ -3918,6 +3948,40 @@ mod tests {
             .map(|i| store.get(i).trim().to_string())
             .filter(|t| !t.is_empty() && !t.starts_with('.') && !t.ends_with(':'))
             .collect()
+    }
+
+    #[test]
+    fn a_full_width_vex_load_whose_result_is_only_copied_loads_the_target_directly() {
+        // The whole-register `memcpy(&v, p, 32); return v` shape.
+        assert_eq!(
+            retarget_only("    vmovups (%rdi), %ymm2\n    vmovdqa %ymm2, %ymm0\n    ret\n"),
+            vec!["vmovups (%rdi), %ymm0", "ret"]
+        );
+        assert_eq!(
+            retarget_only("    vmovdqu 16(%rsi), %xmm3\n    vmovdqa %xmm3, %xmm0\n    ret\n"),
+            vec!["vmovdqu 16(%rsi), %xmm0", "ret"]
+        );
+        // A legacy copy-out merges into the upper bits where the VEX load
+        // zeroes them: refused (only the full-width VEX copy-out folds).
+        assert_eq!(
+            retarget_only("    vmovups (%rdi), %xmm2\n    movdqa %xmm2, %xmm0\n    ret\n").len(),
+            3
+        );
+        // A register-to-register `vmovdqa` is a copy, not a load: refused.
+        assert_eq!(
+            retarget_only("    vmovdqa %ymm5, %ymm2\n    vmovdqa %ymm2, %ymm0\n    ret\n").len(),
+            3
+        );
+        // Scalar / partial loads merge or do not zero above: refused.
+        assert_eq!(
+            retarget_only("    vmovsd (%rdi), %xmm2\n    vmovdqa %xmm2, %xmm0\n    ret\n").len(),
+            3
+        );
+        // A mismatched copy width is refused.
+        assert_eq!(
+            retarget_only("    vmovups (%rdi), %ymm2\n    vmovdqa %xmm2, %xmm0\n    ret\n").len(),
+            3
+        );
     }
 
     #[test]
