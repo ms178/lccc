@@ -2812,6 +2812,78 @@ impl X86Codegen {
         }
     }
 
+    /// The `# LCCC_RET_RDX` / `# LCCC_RET_RAX` markers: whether `ret`
+    /// reads `%rdx` / `%rax` at all, for the late text peephole's GP
+    /// liveness oracle (authoritative when present, tail-block inference
+    /// otherwise).  `vector_ret_in_xmm0`: a GNU vector returned in
+    /// `%xmm0`/`%ymm0`.
+    fn emit_gp_return_liveness_markers(&mut self, func: &IrFunction, vector_ret_in_xmm0: bool) {
+        // Publish whether `%rdx` is read by `ret` (a 128-bit or two-GP
+        // eightbyte return) so the late text peephole's GP liveness oracle
+        // (`liveness.rs`) need not infer it from the epilogue's tail block
+        // (which any `%rdx` traffic — even a mere read — defeats, hiding
+        // every `%rdx`-sourced coalescing opportunity). Same contract as the
+        // XMM marker: authoritative when present, tail-block inference
+        // otherwise. `%rax` stays unconditionally live (unchanged).
+        //
+        // Only 128-bit IR returns can keep `%rdx` live: plain `i128` (whose
+        // classification is empty — it is not a struct) and two-register
+        // structs/vectors (packed into `I128` by the lowering). A classified
+        // non-`[Integer, Integer]` pair is shuffled out of `%rdx` before
+        // every `ret` (see `returns.rs`), so it reads dead; anything
+        // unclassifiable fails closed to live, as do naked functions.
+        let ret_rdx_live = func.is_naked
+            || matches!(func.return_type, IrType::I128 | IrType::U128)
+                && (func.ret_eightbyte_classes.len() != 2
+                    || func.ret_eightbyte_classes
+                        == [EightbyteClass::Integer, EightbyteClass::Integer]);
+        self.state.emit_fmt(format_args!(
+            "    # LCCC_RET_RDX {}",
+            u8::from(ret_rdx_live)
+        ));
+
+        // Publish whether `%rax` is read by `ret` AT ALL, so the late text
+        // peephole's GP liveness oracle need not keep the accumulator
+        // artificially live in void and FP-only functions. This is the
+        // same contract as the RDX marker above, and it unlocks a large
+        // copy-folding class: the RA's phi-convergence copies
+        // (`movq %r9, %rax` feeding one byte store) were unconditionally
+        // retained because RET_LIVE contains %rax and the text liveness
+        // cannot see the C signature. Oracle evidence: gcc's g() for
+        // `buf[i] = (uint8_t)(x >> 24)` stores `%dil` directly (4 insns)
+        // where lccc kept movzbl + movq + movb (6 insns).
+        //
+        // %rax is read by `ret` for every INTEGER/POINTER return, every
+        // in-register struct return (INTEGER class eightbytes land in the
+        // accumulator), every MEMORY-class struct return (the sret
+        // pointer must be returned in %rax per the SysV psABI), and
+        // I128/U128 (low half). It is read by NOBODY for Void returns and
+        // for pure-SSE / x87 returns (F32/F64/D32/D64 in %xmm0, F128 in
+        // %st0). Naked functions fail closed (live), as with RDX.
+        //
+        // A GNU vector returned in `%xmm0`/`%ymm0` (`vector_ret_in_xmm0`:
+        // the IR return type is the lowering's `Ptr`, the bytes travel in
+        // the vector register, `returns.rs` never writes `%rax`) reads
+        // `%rax` by nobody either; without this exemption every
+        // `movq %rdi, %rax` the broadcast emitters stage survived into
+        // the text (`splat_v32i`: 4 instructions, GCC 3).
+        let ret_rax_live = func.is_naked
+            || !vector_ret_in_xmm0
+                && !matches!(
+                    func.return_type,
+                    IrType::Void
+                        | IrType::F32
+                        | IrType::F64
+                        | IrType::D32
+                        | IrType::D64
+                        | IrType::F128
+                );
+        self.state.emit_fmt(format_args!(
+            "    # LCCC_RET_RAX {}",
+            u8::from(ret_rax_live)
+        ));
+    }
+
     pub(super) fn emit_prologue_impl(&mut self, func: &IrFunction, frame_size: i64) {
         self.current_return_type = func.return_type;
         self.func_ret_classes = func.ret_eightbyte_classes.clone();
@@ -2998,70 +3070,7 @@ impl X86Codegen {
         self.state
             .emit_fmt(format_args!("    # LCCC_RET_XMM {}", ret_xmm_mask));
 
-        // Publish whether `%rdx` is read by `ret` (a 128-bit or two-GP
-        // eightbyte return) so the late text peephole's GP liveness oracle
-        // (`liveness.rs`) need not infer it from the epilogue's tail block
-        // (which any `%rdx` traffic — even a mere read — defeats, hiding
-        // every `%rdx`-sourced coalescing opportunity). Same contract as the
-        // XMM marker: authoritative when present, tail-block inference
-        // otherwise. `%rax` stays unconditionally live (unchanged).
-        //
-        // Only 128-bit IR returns can keep `%rdx` live: plain `i128` (whose
-        // classification is empty — it is not a struct) and two-register
-        // structs/vectors (packed into `I128` by the lowering). A classified
-        // non-`[Integer, Integer]` pair is shuffled out of `%rdx` before
-        // every `ret` (see `returns.rs`), so it reads dead; anything
-        // unclassifiable fails closed to live, as do naked functions.
-        let ret_rdx_live = func.is_naked
-            || matches!(func.return_type, IrType::I128 | IrType::U128)
-                && (func.ret_eightbyte_classes.len() != 2
-                    || func.ret_eightbyte_classes
-                        == [EightbyteClass::Integer, EightbyteClass::Integer]);
-        self.state.emit_fmt(format_args!(
-            "    # LCCC_RET_RDX {}",
-            u8::from(ret_rdx_live)
-        ));
-
-        // Publish whether `%rax` is read by `ret` AT ALL, so the late text
-        // peephole's GP liveness oracle need not keep the accumulator
-        // artificially live in void and FP-only functions. This is the
-        // same contract as the RDX marker above, and it unlocks a large
-        // copy-folding class: the RA's phi-convergence copies
-        // (`movq %r9, %rax` feeding one byte store) were unconditionally
-        // retained because RET_LIVE contains %rax and the text liveness
-        // cannot see the C signature. Oracle evidence: gcc's g() for
-        // `buf[i] = (uint8_t)(x >> 24)` stores `%dil` directly (4 insns)
-        // where lccc kept movzbl + movq + movb (6 insns).
-        //
-        // %rax is read by `ret` for every INTEGER/POINTER return, every
-        // in-register struct return (INTEGER class eightbytes land in the
-        // accumulator), every MEMORY-class struct return (the sret
-        // pointer must be returned in %rax per the SysV psABI), and
-        // I128/U128 (low half). It is read by NOBODY for Void returns and
-        // for pure-SSE / x87 returns (F32/F64/D32/D64 in %xmm0, F128 in
-        // %st0). Naked functions fail closed (live), as with RDX.
-        //
-        // A GNU vector returned in `%xmm0`/`%ymm0` (`vector_ret_in_xmm0`:
-        // the IR return type is the lowering's `Ptr`, the bytes travel in
-        // the vector register, `returns.rs` never writes `%rax`) reads
-        // `%rax` by nobody either; without this exemption every
-        // `movq %rdi, %rax` the broadcast emitters stage survived into
-        // the text (`splat_v32i`: 4 instructions, GCC 3).
-        let ret_rax_live = func.is_naked
-            || !vector_ret_in_xmm0
-                && !matches!(
-                    func.return_type,
-                    IrType::Void
-                        | IrType::F32
-                        | IrType::F64
-                        | IrType::D32
-                        | IrType::D64
-                        | IrType::F128
-                );
-        self.state.emit_fmt(format_args!(
-            "    # LCCC_RET_RAX {}",
-            u8::from(ret_rax_live)
-        ));
+        self.emit_gp_return_liveness_markers(func, vector_ret_in_xmm0);
 
         if func.is_variadic {
             let base = self.reg_save_area_offset;
