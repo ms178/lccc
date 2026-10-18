@@ -1080,15 +1080,20 @@ pub(crate) fn x86_param_caller_homes_safe_with_config(
                 if crate::backend::generation::inline_memcpy_len(name, info).is_some()
                     || crate::backend::generation::x86_inline_memset_len(name, info).is_some())
     };
+    // Real calls do not disqualify: every consumer of this predicate grants
+    // a parameter a caller-saved home only through the allocator's Phase 2,
+    // which refuses call-spanning values and keeps later call arguments out
+    // of the argument registers (`RegAllocConfig::call_arg_regs`) -- the same
+    // guarantees every other caller-saved home in a non-leaf function rests
+    // on. So a parameter read only before the first call stays in its ABI
+    // register (`f(p) { x = p->a; g(x); }` paid push/mov/pop of %rbx for it),
+    // and one live across a call still takes a callee-saved home. Inline asm
+    // may clobber argument registers without a precise clobber list: it
+    // keeps the conservative path.
     if func.blocks.iter().any(|b| {
-        b.instructions.iter().any(|inst| {
-            matches!(
-                inst,
-                Instruction::Call { .. }
-                    | Instruction::CallIndirect { .. }
-                    | Instruction::InlineAsm { .. }
-            ) && !inline_libc(inst)
-        })
+        b.instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::InlineAsm { .. }))
     }) {
         return false;
     }
