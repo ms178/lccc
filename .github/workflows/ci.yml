@@ -539,6 +539,8 @@ jobs:
       run: env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_a9987_salvage.sh
     - name: ext_vector_type padded layout vs the compiler oracle
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_layout.sh
+    - name: Ext-vector rvalue subscript cross-ABI
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_rvalue_subscript.sh
     - name: ext_vector_type cross-compiler by-value ABI
       run: |
         set -o pipefail
@@ -832,8 +834,6 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_enum_tag_scope_compat.sh
     - name: Enum layout semantics (widening, packed, struct inheritance, static asserts)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_enum_layout_semantics.sh
-    - name: Ext-vector rvalue subscript cross-ABI
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_rvalue_subscript.sh
     - name: One-lane FP vector ABI (AUD-VABI-4)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_one_lane_fp.sh
     - name: Embedded-NUL strlen contract
