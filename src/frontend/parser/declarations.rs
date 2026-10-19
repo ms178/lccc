@@ -160,6 +160,10 @@ impl Parser {
         // Bare type with no declarator (e.g., struct definition)
         if self.at_eof() || matches!(self.peek(), TokenKind::Semicolon) {
             self.consume_if(&TokenKind::Semicolon);
+            // `union U { ... } __attribute__((transparent_union));` names the
+            // attribute here and nowhere else; it must also not leak into the
+            // next declaration (see `take_transparent_union`).
+            let is_transparent_union = self.take_transparent_union();
             let mut d = Declaration::new(
                 type_spec,
                 Vec::new(),
@@ -181,6 +185,7 @@ impl Parser {
             d.set_volatile(self.attrs.parsing_volatile());
             d.set_pointer_const(self.attrs.parsing_pointer_const());
             d.set_thread_local(self.attrs.parsing_thread_local());
+            d.set_transparent_union(is_transparent_union);
             return Some(ExternalDecl::Declaration(d));
         }
 
@@ -876,8 +881,7 @@ impl Parser {
 
         // Register typedef names
         let is_typedef = self.attrs.parsing_typedef();
-        let is_transparent_union = self.attrs.parsing_transparent_union();
-        self.attrs.set_transparent_union(false);
+        let is_transparent_union = self.take_transparent_union();
         self.register_typedefs(&type_spec, &declarators, decl_addr_space);
 
         self.expect_after(&TokenKind::Semicolon, "after declaration");
@@ -906,6 +910,17 @@ impl Parser {
         d.set_transparent_union(is_transparent_union);
         d.set_inline(self.attrs.parsing_inline());
         Some(ExternalDecl::Declaration(d))
+    }
+
+    /// The pending `transparent_union` attribute, cleared. Every path that
+    /// builds a declaration takes it: one that left it set handed it to the
+    /// NEXT declaration and lost it for its own -- `union U { int i; float f;
+    /// } __attribute__((transparent_union));` was never transparent, so the
+    /// call `f(7)` copied a union from address 7 at runtime.
+    fn take_transparent_union(&mut self) -> bool {
+        let pending = self.attrs.parsing_transparent_union();
+        self.attrs.set_transparent_union(false);
+        pending
     }
 
     pub(super) fn parse_local_declaration(&mut self) -> Option<Declaration> {
@@ -950,6 +965,7 @@ impl Parser {
         // Handle bare type with semicolon (struct/enum/union definition)
         if matches!(self.peek(), TokenKind::Semicolon) {
             self.advance();
+            let is_transparent_union = self.take_transparent_union();
             // The declaration's address space is lexical to it: a nested
             // declaration parsed inside this one's type specifier (a
             // statement expression inside typeof) must not leave its space
@@ -976,6 +992,7 @@ impl Parser {
             d.set_volatile(self.attrs.parsing_volatile());
             d.set_pointer_const(self.attrs.parsing_pointer_const());
             d.set_thread_local(self.attrs.parsing_thread_local());
+            d.set_transparent_union(is_transparent_union);
             return Some(d);
         }
 
@@ -1099,8 +1116,7 @@ impl Parser {
         }
         let alignas_type = self.attrs.parsed_alignas_type.take();
         let alignment_sizeof_type = self.attrs.parsed_alignment_sizeof_type.take();
-        let is_transparent_union = self.attrs.parsing_transparent_union();
-        self.attrs.set_transparent_union(false);
+        let is_transparent_union = self.take_transparent_union();
         let mut d = Declaration::new(
             type_spec,
             declarators,

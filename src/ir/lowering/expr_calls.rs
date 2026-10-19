@@ -678,6 +678,112 @@ impl Lowerer {
         }
         None
     }
+    /// The argument of a GCC `transparent_union` parameter whose type is a
+    /// MEMBER's, as the union's FIRST member value -- the scalar such a
+    /// parameter travels as (GCC passes the union with its first member's
+    /// ABI, and the callee side reads it so) -- with that member's IR type.
+    /// None keeps the argument as lowered: `key` is not a transparent union
+    /// with a scalar first member, or the argument is the union itself (an
+    /// aggregate argument, whose ABI path loads the first member through
+    /// its address). A member value used to be passed through unchanged,
+    /// right only when it already had the first member's representation:
+    /// `f(1.5f)` for `union { int i; float f; }` passed the float in %xmm0
+    /// (GCC: its bits in %edi), and before the union was marked at all,
+    /// `f(7)` was copied as a union from address 7.
+    ///
+    /// Sema admitted the argument (`transparent_member_accepts`): it matches
+    /// a member exactly, is pointer-shaped (pointer, array, function
+    /// designator) for a pointer member, has an enum's integer type, or is a
+    /// null pointer constant for a pointer member. It is converted to that
+    /// member, then reinterpreted as the first member through a union
+    /// temporary unless both share an IR type.
+    fn transparent_union_arg(
+        &mut self,
+        val: Operand,
+        arg_ty: IrType,
+        arg_ct: Option<&CType>,
+        key: &str,
+    ) -> Option<(Operand, IrType)> {
+        let ct = arg_ct.filter(|ct| !matches!(ct, CType::Union(k) if k.as_ref() == key))?;
+        let (size, first, member) = {
+            let layouts = self.types.borrow_struct_layouts();
+            let layout = layouts.get(key).filter(|l| l.is_transparent_union)?;
+            let members: Vec<&CType> = layout.fields.iter().map(|f| &f.ty).collect();
+            let first = (*members.first()?).clone();
+            if !(first.is_integer() || first.is_pointer_like()) {
+                return None;
+            }
+            let is_ptr_member = |m: &&&CType| m.is_pointer_like();
+            let pointer_shaped = ct.is_pointer_like() || matches!(ct, CType::Function(_));
+            let member = members
+                .iter()
+                .find(|m| **m == ct)
+                .or_else(|| {
+                    pointer_shaped
+                        .then(|| members.iter().find(is_ptr_member))
+                        .flatten()
+                })
+                .or_else(|| {
+                    ct.is_integer()
+                        .then(|| {
+                            members
+                                .iter()
+                                .find(|m| m.is_integer() && m.size() == ct.size())
+                                .or_else(|| members.iter().find(is_ptr_member))
+                        })
+                        .flatten()
+                })
+                .map_or_else(|| first.clone(), |m| (*m).clone());
+            (layout.size, first, member)
+        };
+        if member.is_struct_or_union() || member.is_vector() {
+            return None;
+        }
+        let first_ty = IrType::from_ctype(&first);
+        let member_ty = IrType::from_ctype(&member);
+        let converted = self.emit_implicit_cast(val, arg_ty, member_ty);
+        if member_ty == first_ty {
+            return Some((converted, first_ty));
+        }
+        let alloca = self.fresh_value();
+        let carrier = Self::packed_store_type(size);
+        self.emit(Instruction::Alloca {
+            dest: alloca,
+            size,
+            ty: carrier,
+            align: 0,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        // A member narrower than the union leaves the rest unspecified (GCC
+        // passes whatever the stack held); zero it for a deterministic image.
+        if self.ctype_size(&member) < size {
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: Operand::Const(IrConst::zero(carrier)),
+                ptr: alloca,
+                ty: carrier,
+                seg_override: AddressSpace::Default,
+            });
+        }
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: converted,
+            ptr: alloca,
+            ty: member_ty,
+            seg_override: AddressSpace::Default,
+        });
+        let dest = self.fresh_value();
+        self.emit(Instruction::Load {
+            dest,
+            ptr: alloca,
+            ty: first_ty,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        Some((Operand::Value(dest), first_ty))
+    }
+
     fn unpack_two_reg_return(&mut self, dest: Value, size: usize) -> Operand {
         let alloca = self.fresh_value();
         self.emit(Instruction::Alloca {
@@ -1421,6 +1527,18 @@ impl Lowerer {
                     // ICE on i686).
                     if self.get_expr_ctype(a).is_some_and(|ct| ct.is_vector()) {
                         arg_ty = IrType::Ptr;
+                    }
+                }
+
+                // A GCC transparent_union parameter travels as its FIRST
+                // member (see `transparent_union_arg`).
+                if let Some(CType::Union(key)) = param_ctypes.as_ref().and_then(|p| p.get(i)) {
+                    let arg_ct = self.get_expr_ctype(a);
+                    if let Some((v, ty)) =
+                        self.transparent_union_arg(val, arg_ty, arg_ct.as_ref(), key)
+                    {
+                        val = v;
+                        arg_ty = ty;
                     }
                 }
 

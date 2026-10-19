@@ -681,8 +681,7 @@ impl<'a> SemaConstEval<'a> {
     fn eval_offsetof_pattern_with_type(&self, expr: &Expr) -> Option<(usize, CType)> {
         match expr {
             Expr::PointerMemberAccess(base, field_name, _) => {
-                let (type_spec, base_offset) = self.extract_null_pointer_cast_with_offset(base)?;
-                let layout = self.get_struct_layout_for_type(&type_spec)?;
+                let (layout, base_offset) = self.offsetof_base_layout(base)?;
                 let (field_offset, field_ty) =
                     layout.field_offset(field_name, &*self.types.borrow_struct_layouts())?;
                 Some((base_offset + field_offset, field_ty))
@@ -690,9 +689,7 @@ impl<'a> SemaConstEval<'a> {
             Expr::MemberAccess(base, field_name, _) => {
                 // First try: base is *((type*)0) (deref pattern)
                 if let Expr::Deref(inner, _) = base.as_ref() {
-                    let (type_spec, base_offset) =
-                        self.extract_null_pointer_cast_with_offset(inner)?;
-                    let layout = self.get_struct_layout_for_type(&type_spec)?;
+                    let (layout, base_offset) = self.offsetof_base_layout(inner)?;
                     let (field_offset, field_ty) =
                         layout.field_offset(field_name, &*self.types.borrow_struct_layouts())?;
                     return Some((base_offset + field_offset, field_ty));
@@ -728,6 +725,34 @@ impl<'a> SemaConstEval<'a> {
             }
             _ => None,
         }
+    }
+
+    /// The record layout and starting offset behind the null-pointer base of
+    /// an offsetof pattern (`((T *)0)->m`, `(*(T *)0).m`).
+    ///
+    /// The record is taken from the type sema recorded for `base` when it
+    /// analyzed the expression: the pointee of `->`'s operand is by definition
+    /// the record accessed. That is the only way to reach an anonymous record
+    /// (`offsetof(struct { char c; int i; }, i)`): its specifier has no tag,
+    /// and its layout was registered under the `__anon_struct_N` key minted
+    /// when the type checker resolved that very cast. The specifier is the
+    /// fallback for an evaluator constructed without the annotation map.
+    fn offsetof_base_layout(&self, base: &Expr) -> Option<(crate::common::types::RcLayout, usize)> {
+        let (type_spec, base_offset) = self.extract_null_pointer_cast_with_offset(base)?;
+        let annotated = match self.lookup_expr_type(base) {
+            Some(CType::Pointer(pointee, _)) => match &*pointee {
+                CType::Struct(key) | CType::Union(key) => {
+                    self.types.borrow_struct_layouts().get(&**key).cloned()
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let layout = match annotated {
+            Some(layout) => layout,
+            None => self.get_struct_layout_for_type(&type_spec)?,
+        };
+        Some((layout, base_offset))
     }
 
     /// Extract the struct type from a (type*)0 pattern.

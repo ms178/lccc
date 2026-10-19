@@ -15,6 +15,9 @@
 
 use super::loop_analysis;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
+use crate::ir::analysis;
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 use std::cell::Cell;
 
 /// Target immediate-encoding model that drives the hoist decision. One
@@ -56,6 +59,46 @@ pub(crate) fn model_for(target: crate::backend::Target) -> Option<ImmModel> {
         crate::backend::Target::Riscv64 => Some(ImmModel::Riscv),
         crate::backend::Target::X86_64 => Some(ImmModel::X86_64),
         _ => None,
+    }
+}
+
+/// Whether `model` materializes `c` into a register with ONE instruction
+/// that reads no register -- the case where rematerializing at a use never
+/// costs more than a spill reload, so a register held for it through a hot
+/// loop that does not use it can only lose (see `run`'s leaf-loop rule):
+///
+/// * x86-64: `movl $imm32` (zero-extends; every u32 and every 32-bit-typed
+///   constant) or `movq $simm32`. A 64-bit `movabsq` is excluded: ten bytes,
+///   the shape whose per-use cost the hoist exists to remove.
+/// * AArch64: one `movz` (at most one non-zero halfword) or one `movn` (at
+///   most one halfword other than 0xffff), in the constant's own width.
+///   Bitmask (`orr`) immediates are not modelled and count as costly -- the
+///   conservative side (such a constant keeps the unconditional hoist).
+/// * RISC-V: one `addi` (imm12) or one `lui` (a sign-extended 32-bit value
+///   with the low 12 bits clear).
+pub(crate) fn single_insn_materialization(model: ImmModel, c: &IrConst) -> bool {
+    let (v, wide) = match *c {
+        IrConst::I8(v) => (i64::from(v), false),
+        IrConst::I16(v) => (i64::from(v), false),
+        IrConst::I32(v) => (i64::from(v), false),
+        IrConst::I64(v) => (v, true),
+        _ => return false,
+    };
+    match model {
+        ImmModel::X86_64 => !wide || i32::try_from(v).is_ok() || u32::try_from(v).is_ok(),
+        ImmModel::Aarch64 => {
+            let (bits, halfwords) = if wide {
+                (v as u64, 4)
+            } else {
+                (u64::from(v as u32), 2)
+            };
+            let halfword = |i: u32| (bits >> (16 * i)) & 0xffff;
+            (0..halfwords).filter(|&i| halfword(i) != 0).count() <= 1
+                || (0..halfwords).filter(|&i| halfword(i) != 0xffff).count() <= 1
+        }
+        ImmModel::Riscv => {
+            (-2048..=2047).contains(&v) || (i32::try_from(v).is_ok() && v & 0xfff == 0)
+        }
     }
 }
 
@@ -102,9 +145,6 @@ pub(crate) fn const_homes(func: &IrFunction, model: ImmModel) -> FxHashSet<u32> 
     }
     homes
 }
-use crate::common::types::IrType;
-use crate::ir::analysis;
-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 
 /// Run integer-constant hoisting on a function. Returns the number of
 /// distinct constants materialized in preheaders.
@@ -129,15 +169,35 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     // possible and inner loops can reuse the dominating value.
     loops.sort_by_key(|l| l.body.len());
     loops.reverse();
+    // The candidate constants of every loop body, taken before any rewrite
+    // (an outer hoist turns the inner loops' operands into values).
+    let consts_in: Vec<FxHashSet<u64>> = loops
+        .iter()
+        .map(|lp| {
+            let mut set = FxHashSet::default();
+            for &bi in &lp.body {
+                for inst in &func.blocks[bi].instructions {
+                    for_each_int_operand(inst, &mut |op, needs_reg, imm32_exact| {
+                        if let Some(bits) = large_int_const(op, needs_reg, imm32_exact) {
+                            set.insert(bits);
+                        }
+                    });
+                }
+            }
+            set
+        })
+        .collect();
+    let leaves_in = leaf_subloops(&loops);
+    let model = MODEL.with(|c| c.get());
 
     // const bits -> (hoisted value id, body of the loop whose preheader defines it)
     let mut hoisted: FxHashMap<u64, (u32, FxHashSet<usize>)> = FxHashMap::default();
     let mut count = 0;
-    for lp in &loops {
+    for (li, lp) in loops.iter().enumerate() {
         let Some(preheader) = loop_analysis::find_preheader(lp.header, &lp.body, &cfg.preds) else {
             continue;
         };
-        // Distinct large constants used in this loop body.
+        // Distinct large constants used in this loop body, in program order.
         let mut consts: Vec<u64> = Vec::new();
         let mut seen: FxHashSet<u64> = FxHashSet::default();
         for &bi in &lp.body {
@@ -151,6 +211,21 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                 });
             }
         }
+        // A constant one register-free instruction rematerializes leaves
+        // this loop only if every leaf loop nested in it uses the constant:
+        // otherwise the hoisted register stays live through a hot leaf loop
+        // that gains nothing, to save one instruction per execution of a
+        // colder block -- and under pressure costs a spill there instead
+        // (measured: zlib_ng_adler32 held its `% 65521` reciprocal in %r15
+        // across the byte loop and spilled the block bound, +2 stack
+        // operands and a callee-saved push/pop). A leaf loop that uses it
+        // still hoists it to its own preheader when its turn comes.
+        consts.retain(|&bits| {
+            !single_insn_materialization(model, &IrConst::I64(bits as i64))
+                || leaves_in[li]
+                    .iter()
+                    .all(|&leaf| consts_in[leaf].contains(&bits))
+        });
 
         for bits in consts {
             // Reuse a previously hoisted value when its definition dominates
@@ -180,6 +255,29 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         }
     }
     count
+}
+
+/// For each loop (by index), the leaf loops strictly nested in it: loops
+/// whose body is a proper subset of its own and that contain no other loop.
+/// Loops merged by header are distinct bodies, so subset is nesting. A leaf
+/// loop has no leaves of its own. O(n^2) set tests over a function's natural
+/// loops, which stay few.
+fn leaf_subloops(loops: &[loop_analysis::NaturalLoop]) -> Vec<Vec<usize>> {
+    let inside = |inner: usize, outer: usize| {
+        inner != outer
+            && loops[inner].body.len() < loops[outer].body.len()
+            && loops[inner].body.is_subset(&loops[outer].body)
+    };
+    let is_leaf: Vec<bool> = (0..loops.len())
+        .map(|i| !(0..loops.len()).any(|j| inside(j, i)))
+        .collect();
+    (0..loops.len())
+        .map(|outer| {
+            (0..loops.len())
+                .filter(|&inner| is_leaf[inner] && inside(inner, outer))
+                .collect()
+        })
+        .collect()
 }
 
 /// Whether `run` would hoist anything for this loop.
@@ -968,5 +1066,172 @@ mod tests {
             func.blocks[block_defining_copy_of(&func, 0x1_0000_0000)].label,
             BlockId(0)
         );
+    }
+
+    /// entry -> outer header -> inner header <-> inner body; inner header ->
+    /// outer latch -> outer header; outer header -> exit. One `%10 = %9 * K`
+    /// (64-bit) sits in the inner body (`in_leaf`) or in the outer latch.
+    fn nested_loops(k: IrConst, in_leaf: bool) -> IrFunction {
+        let mut func = IrFunction::new("nested".to_string(), IrType::I64, vec![], false);
+        let use_k = Instruction::BinOp {
+            dest: Value(10),
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(Value(9)),
+            rhs: Operand::Const(k),
+            ty: IrType::I64,
+        };
+        let (inner_body, latch) = if in_leaf {
+            (vec![use_k], vec![])
+        } else {
+            (vec![], vec![use_k])
+        };
+        let cond = |t: u32, f: u32| Terminator::CondBranch {
+            cond: Operand::Value(Value(0)),
+            true_label: BlockId(t),
+            false_label: BlockId(f),
+        };
+        let blocks = [
+            (
+                vec![
+                    Instruction::Copy {
+                        dest: Value(0),
+                        src: Operand::Const(IrConst::I64(1)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(9),
+                        src: Operand::Const(IrConst::I64(3)),
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            (vec![], cond(2, 5)),
+            (vec![], cond(3, 4)),
+            (inner_body, Terminator::Branch(BlockId(2))),
+            (latch, Terminator::Branch(BlockId(1))),
+            (vec![], Terminator::Return(Some(Operand::Value(Value(0))))),
+        ];
+        for (id, (instructions, terminator)) in blocks.into_iter().enumerate() {
+            func.blocks.push(BasicBlock {
+                label: BlockId(id as u32),
+                instructions,
+                terminator,
+                source_spans: Vec::new(),
+            });
+        }
+        func.next_value_id = 11;
+        func
+    }
+
+    /// The multiplier operand of `%10`, wherever the pass left it.
+    fn use_rhs(func: &IrFunction) -> Operand {
+        func.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|inst| match inst {
+                Instruction::BinOp {
+                    dest: Value(10),
+                    rhs,
+                    ..
+                } => Some(rhs.clone()),
+                _ => None,
+            })
+            .expect("the multiply survives")
+    }
+
+    /// x86-64 leaf-loop rule. adler32's `% 65521` reciprocal (one `movl`)
+    /// used only in the outer loop's own block stays at its use: hoisting it
+    /// would hold a register through the leaf loop for nothing. Used inside
+    /// the leaf loop it is hoisted. A `movabsq` constant is hoisted either
+    /// way -- its per-use cost is what the pass exists to remove.
+    #[test]
+    fn single_insn_constants_hoist_only_into_loops_whose_leaves_use_them() {
+        let recip = IrConst::I64(0x8007_8071);
+        let mut f = nested_loops(recip, false);
+        run(&mut f);
+        assert_eq!(use_rhs(&f), Operand::Const(recip));
+
+        let mut f = nested_loops(recip, true);
+        assert!(run(&mut f) > 0);
+        assert!(matches!(use_rhs(&f), Operand::Value(_)));
+
+        let wide = IrConst::I64(1 << 40);
+        let mut f = nested_loops(wide, false);
+        assert!(run(&mut f) > 0);
+        assert!(matches!(use_rhs(&f), Operand::Value(_)));
+    }
+
+    #[test]
+    fn leaf_subloops_lists_strictly_nested_leaves() {
+        let body = |b: &[usize]| loop_analysis::NaturalLoop {
+            header: b[0],
+            body: b.iter().copied().collect(),
+        };
+        // outer {1..=6} holds leaves {2,3} and {5,6}; {2,3} has none.
+        let loops = vec![body(&[1, 2, 3, 4, 5, 6]), body(&[2, 3]), body(&[5, 6])];
+        let leaves = leaf_subloops(&loops);
+        assert_eq!(leaves[0], vec![1, 2]);
+        assert!(leaves[1].is_empty() && leaves[2].is_empty());
+    }
+
+    /// The single-instruction set is exactly what each backend encodes in
+    /// one register-free instruction (see [`single_insn_materialization`]).
+    #[test]
+    fn single_insn_materialization_matches_the_encodings() {
+        let x86 = ImmModel::X86_64;
+        // adler32's `% 65521` reciprocal: one `movl` (zero-extending).
+        assert!(single_insn_materialization(x86, &IrConst::I64(0x8007_8071)));
+        assert!(single_insn_materialization(
+            x86,
+            &IrConst::I64(u32::MAX as i64)
+        ));
+        assert!(single_insn_materialization(
+            x86,
+            &IrConst::I64(i32::MIN as i64)
+        ));
+        assert!(single_insn_materialization(x86, &IrConst::I32(-1)));
+        // `movabsq` territory stays costly.
+        assert!(!single_insn_materialization(x86, &IrConst::I64(1 << 32)));
+        assert!(!single_insn_materialization(
+            x86,
+            &IrConst::I64(i32::MIN as i64 - 1)
+        ));
+        assert!(!single_insn_materialization(
+            x86,
+            &IrConst::I64(0x9e37_79b9_7f4a_7c15_u64 as i64)
+        ));
+
+        let a64 = ImmModel::Aarch64;
+        assert!(single_insn_materialization(a64, &IrConst::I64(7)));
+        assert!(single_insn_materialization(
+            a64,
+            &IrConst::I64(0xffff << 48)
+        ));
+        assert!(single_insn_materialization(a64, &IrConst::I64(-2))); // movn
+        assert!(single_insn_materialization(a64, &IrConst::I32(-65536))); // movn w
+        assert!(!single_insn_materialization(
+            a64,
+            &IrConst::I64(0x8007_8071)
+        ));
+        assert!(!single_insn_materialization(
+            a64,
+            &IrConst::I32(0x1234_5678)
+        ));
+        assert!(!single_insn_materialization(
+            a64,
+            &IrConst::I64(0xffff_0000_ffff)
+        ));
+
+        let rv = ImmModel::Riscv;
+        assert!(single_insn_materialization(rv, &IrConst::I64(2047)));
+        assert!(single_insn_materialization(rv, &IrConst::I64(-2048)));
+        assert!(single_insn_materialization(rv, &IrConst::I64(0x7fff_f000)));
+        assert!(single_insn_materialization(rv, &IrConst::I64(-0x8000_0000)));
+        assert!(!single_insn_materialization(rv, &IrConst::I64(2048)));
+        assert!(!single_insn_materialization(rv, &IrConst::I64(0x8000_0000)));
+        assert!(!single_insn_materialization(rv, &IrConst::I64(0x1001)));
+
+        for model in [x86, a64, rv] {
+            assert!(!single_insn_materialization(model, &IrConst::F64(1.0)));
+        }
     }
 }

@@ -671,16 +671,6 @@ impl Lowerer {
         self.seed_builtin_typedefs();
         self.seed_libc_math_functions();
 
-        // Mark transparent_union on union StructLayouts before the first pass,
-        // so that register_function_meta can exclude them from param_struct_sizes.
-        for decl in &tu.decls {
-            if let ExternalDecl::Declaration(decl) = decl {
-                if decl.is_transparent_union() {
-                    self.mark_transparent_union(decl);
-                }
-            }
-        }
-
         // Pre-pass: update typedefs that have __attribute__((vector_size(N))) or
         // __attribute__((ext_vector_type(N))).
         // Sema doesn't handle vector_size, so the typedef map has the unwrapped base type.
@@ -737,6 +727,17 @@ impl Lowerer {
                     }
                 }
                 ExternalDecl::TopLevelAsm(_) | ExternalDecl::StaticAssert(_) => {}
+            }
+        }
+
+        // Mark transparent_union on the union layouts the pre-pass above just
+        // (re)built -- marking before it was undone by the rebuild -- so that
+        // register_function_meta passes such parameters as their first member.
+        for decl in &tu.decls {
+            if let ExternalDecl::Declaration(decl) = decl {
+                if decl.is_transparent_union() {
+                    self.mark_transparent_union(decl);
+                }
             }
         }
 

@@ -37,6 +37,11 @@ impl Lowerer {
 
     pub(super) fn lower_global_decl(&mut self, decl: &Declaration) {
         self.register_struct_type(&decl.type_spec);
+        // The rebuilt layout lost the attribute (typedefs re-mark in
+        // `lower_typedef`, once the typedef name resolves).
+        if decl.is_transparent_union() && !decl.is_typedef() {
+            self.mark_transparent_union(decl);
+        }
         self.collect_enum_constants(&decl.type_spec);
         self.declare_declarator_type_name_tags(decl);
 

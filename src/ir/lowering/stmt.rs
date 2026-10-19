@@ -77,7 +77,13 @@ impl Lowerer {
 
         if decl.is_typedef() {
             self.lower_local_typedef(decl, type_spec);
+            if decl.is_transparent_union() {
+                self.mark_transparent_union(decl);
+            }
             return;
+        }
+        if decl.is_transparent_union() {
+            self.mark_transparent_union(decl);
         }
 
         // `typeof(expr)` of VM type: the operand is evaluated once for the

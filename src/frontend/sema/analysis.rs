@@ -719,6 +719,9 @@ impl SemanticAnalyzer {
         } else {
             self.type_spec_to_ctype(&decl.type_spec)
         };
+        if decl.is_transparent_union() {
+            self.mark_transparent_union(&base_type, decl.span);
+        }
 
         // Handle typedef declarations: populate TypeContext with typedef info
         if decl.is_typedef() {
@@ -1947,9 +1950,10 @@ impl SemanticAnalyzer {
     /// Decide a `_Static_assert` the parser left open because its condition
     /// needs types (`sizeof`, `_Generic`, enumerator types). Evaluated at its
     /// lexical position, so the enumerators, typedefs and tags in scope there
-    /// are the ones it sees. A condition this evaluator cannot fold is
-    /// accepted, as the parser did before, so an evaluator gap never rejects
-    /// a valid program.
+    /// are the ones it sees. A condition that does not fold is rejected as
+    /// not constant, so an evaluator gap rejects a valid program: every
+    /// constant form the oracles fold must fold here (`offsetof` of an
+    /// anonymous record included -- `tests/regression/c23_attrs.c`).
     /// C11 6.7.10: the condition is an integer constant expression; GCC
     /// 16.2 (followed here) asks only that it have integer type and fold,
     /// with enumerators and C23 `constexpr` objects the only named values
@@ -3846,7 +3850,22 @@ impl SemanticAnalyzer {
                     .is_some_and(|layout| layout.is_transparent_union),
                 _ => false,
             };
-            if !transparent && self.check_assignment_operand(arg, param_ty, arg.span()) {
+            if transparent {
+                // GCC's member rule replaces the assignment constraints; an
+                // argument whose type is unknown gets no verdict, as below.
+                let accepted = checker.infer_expr_ctype(arg).is_none_or(|arg_ty| {
+                    let arg_ty = self.conversion_source_ctype(arg, arg_ty);
+                    self.transparent_union_accepts(arg, &arg_ty, param_ty)
+                });
+                if !accepted {
+                    self.diagnostics.borrow_mut().error(
+                        format!("incompatible type for argument {} of '{}'", index + 1, name),
+                        arg.span(),
+                    );
+                }
+                continue;
+            }
+            if self.check_assignment_operand(arg, param_ty, arg.span()) {
                 continue;
             }
             if let Some(arg_ty) = checker.infer_expr_ctype(arg) {
@@ -3913,6 +3932,69 @@ impl SemanticAnalyzer {
             )
         };
         self.diagnostics.borrow_mut().error(message, span);
+    }
+
+    /// GCC `transparent_union`, on the union or on a typedef of it: mark the
+    /// sema layout the call check reads, as lowering's own
+    /// `mark_transparent_union` marks its layout. GCC drops the attribute
+    /// with this warning unless the union has its first member's machine
+    /// mode -- measured on GCC 16.2: an empty union, a later member larger
+    /// than the first, or a binary/decimal floating, complex or vector first
+    /// member (never the union's integer mode) leaves an ordinary union.
+    fn mark_transparent_union(&self, ty: &CType, span: Span) {
+        let CType::Union(key) = ty else {
+            return;
+        };
+        let valid = {
+            let layouts = self.result.type_context.borrow_struct_layouts();
+            let Some(layout) = layouts.get(&**key) else {
+                return;
+            };
+            layout.fields.first().is_some_and(|first| {
+                let fp_mode = first.ty.is_floating()
+                    || first.ty.is_complex()
+                    || first.ty.is_decimal()
+                    || matches!(first.ty, CType::Float128)
+                    || first.ty.is_vector();
+                !fp_mode && first.ty.size_ctx(&*layouts) == layout.size
+            })
+        };
+        if !valid {
+            self.diagnostics
+                .borrow_mut()
+                .warning("union cannot be made transparent".to_string(), span);
+            return;
+        }
+        if let Some(layout) = self
+            .result
+            .type_context
+            .borrow_struct_layouts_mut()
+            .get_mut(&**key)
+        {
+            Rc::make_mut(layout).is_transparent_union = true;
+        }
+    }
+
+    /// Whether `arg` may be passed for a `transparent_union` parameter: it is
+    /// the union itself, or [`transparent_member_accepts`] one of its members.
+    fn transparent_union_accepts(&self, arg: &Expr, arg_ty: &CType, union_ty: &CType) -> bool {
+        if arg_ty == union_ty {
+            return true;
+        }
+        let CType::Union(key) = union_ty else {
+            return false;
+        };
+        let null_constant = self.expr_type_checker().is_null_pointer_constant(arg);
+        self.result
+            .type_context
+            .borrow_struct_layouts()
+            .get(&**key)
+            .is_some_and(|layout| {
+                layout
+                    .fields
+                    .iter()
+                    .any(|m| transparent_member_accepts(&m.ty, arg_ty, null_constant))
+            })
     }
 
     fn check_record_argument_compatibility(
@@ -5676,6 +5758,44 @@ fn pointer_argument_compat(from: &CType, to: &CType) -> PtrCompat {
     }
 }
 
+/// One member of a `transparent_union` against an argument type (after
+/// array/function decay), as GCC's `convert_for_assignment` member loop
+/// decides it -- each rule measured on GCC 16.2, c17 and c23 alike:
+///
+/// * the same type, or an enum against its compatible integer type (`enum
+///   E` for an `unsigned` member; `_Bool` for `unsigned`, `double` for
+///   `float`, `long` for `int` and two distinct enums are all rejected:
+///   arithmetic types are never converted here);
+/// * a pointer member: a pointer argument with a compatible target or a
+///   `void` target on either side -- but NOT a target differing only in
+///   signedness (`char *` for `unsigned char *`, which an ordinary argument
+///   only warns about) -- or a null pointer constant. Dropped qualifiers
+///   are a warning there and CType carries none, so they cannot reject.
+///
+/// `PtrCompat::Unknown` (an unresolved pointee) accepts: a false rejection
+/// breaks a valid program, a miss only loses a diagnostic.
+fn transparent_member_accepts(member: &CType, arg: &CType, null_constant: bool) -> bool {
+    if member == arg {
+        return true;
+    }
+    match (member, arg) {
+        (CType::Enum(e), other) | (other, CType::Enum(e))
+            if other.is_integer() && !matches!(other, CType::Enum(_)) =>
+        {
+            e.compatible_ctype() == *other
+        }
+        (CType::Pointer(target, _), CType::Pointer(..) | CType::Array(..) | CType::Function(_)) => {
+            let sign_only = match arg {
+                CType::Pointer(a, _) | CType::Array(a, _) => same_scalar_modulo_sign(a, target),
+                _ => false,
+            };
+            !sign_only && pointer_argument_compat(arg, member) != PtrCompat::Incompatible
+        }
+        (CType::Pointer(..), _) => null_constant,
+        _ => false,
+    }
+}
+
 /// The first pointer layer, outermost first, whose named address space
 /// changes in a conversion from `from` to `to`. Each pointer layer's space is
 /// the space of the memory it addresses. Arrays are stepped over on both
@@ -5862,9 +5982,76 @@ mod record_layouts_correspond_tests {
 
 #[cfg(test)]
 mod pointer_argument_compat_tests {
-    use super::{PtrCompat, function_types_compatible, pointee_compat, pointer_argument_compat};
+    use super::{
+        PtrCompat, function_types_compatible, pointee_compat, pointer_argument_compat,
+        transparent_member_accepts,
+    };
     use crate::common::types::{AddressSpace, CType, EnumType, FunctionType};
     use std::rc::Rc;
+
+    /// GCC 16.2's transparent_union member rule, row by row
+    /// (`tests/regression/check_record_tag_identity.sh` drives the same
+    /// shapes end to end).
+    #[test]
+    fn transparent_member_rule_matches_gcc() {
+        // Arithmetic: the same type only.
+        assert!(transparent_member_accepts(&CType::Int, &CType::Int, false));
+        assert!(!transparent_member_accepts(
+            &CType::Float,
+            &CType::Double,
+            false
+        ));
+        assert!(!transparent_member_accepts(
+            &CType::Int,
+            &CType::Long,
+            false
+        ));
+        assert!(!transparent_member_accepts(
+            &CType::Int,
+            &CType::Short,
+            false
+        ));
+        assert!(!transparent_member_accepts(
+            &CType::UInt,
+            &CType::Bool,
+            false
+        ));
+        // Pointers: compatible or void targets, a null constant, an array.
+        let lp = ptr(CType::Long);
+        assert!(transparent_member_accepts(&lp, &lp, false));
+        assert!(transparent_member_accepts(&lp, &ptr(CType::Void), false));
+        assert!(transparent_member_accepts(
+            &ptr(CType::Void),
+            &ptr(CType::Int),
+            false
+        ));
+        assert!(transparent_member_accepts(&lp, &CType::Int, true));
+        assert!(transparent_member_accepts(
+            &lp,
+            &CType::Array(Box::new(CType::Long), Some(2)),
+            false
+        ));
+        assert!(!transparent_member_accepts(&lp, &CType::Int, false));
+        assert!(!transparent_member_accepts(&lp, &ptr(CType::Int), false));
+        // A signedness-only pointee difference is rejected (an ordinary
+        // argument would merely warn).
+        assert!(!transparent_member_accepts(
+            &ptr(CType::UChar),
+            &ptr(CType::Char),
+            false
+        ));
+        assert!(!transparent_member_accepts(
+            &ptr(CType::UInt),
+            &ptr(CType::Int),
+            false
+        ));
+        // A non-pointer member never takes a null constant.
+        assert!(!transparent_member_accepts(
+            &CType::Float,
+            &CType::Int,
+            true
+        ));
+    }
 
     fn ptr(t: CType) -> CType {
         CType::Pointer(Box::new(t), AddressSpace::Default)
