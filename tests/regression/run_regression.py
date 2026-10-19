@@ -138,7 +138,8 @@ def split_flags_for_gcc(flags: str, src: str) -> list[str]:
     libs = [w for w in words if w.startswith(("-l", "-Wl,"))]
     rest = [w for w in words if not w.startswith(("-l", "-Wl,"))]
     # GCC's -m32 reference executables are linked non-PIE to match lccc's
-    # non-PIE -m32 output (like-for-like; default-PIE -m32 also runs here).
+    # non-PIE -m32 output (like-for-like). This is a matching choice: the
+    # default-PIE -m32 reference also runs correctly with GNU ld 2.47.
     if "-m32" in rest and "-no-pie" not in rest:
         rest.append("-no-pie")
     return [*rest, src, *libs]

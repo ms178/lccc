@@ -163,8 +163,15 @@ def sh(cmd, cwd=None, timeout=60, env=None):
     e = dict(os.environ)
     if env:
         e.update(env)
-    return subprocess.run(cmd, cwd=cwd, timeout=timeout, env=e,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        return subprocess.run(cmd, cwd=cwd, timeout=timeout, env=e,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError as exc:
+        # Fail LOUDLY and by name. Many setup steps ignore their return code,
+        # and negative cases expect a link to fail, so a silent 127 here would
+        # let a missing toolchain pass as "expected failure".
+        raise RuntimeError(f"required tool not found: {cmd[0]!r} ({exc}); "
+                           "install it or skip this suite explicitly") from exc
 
 # ============================================================================
 # 1. SYMBOL RESOLUTION

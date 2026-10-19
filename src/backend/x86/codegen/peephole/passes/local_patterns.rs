@@ -11789,6 +11789,47 @@ mod broadcast_fold_tests {
         );
     }
     #[test]
+    fn movq_extension_fusion_rejects_non_gpr_source_classes() {
+        use super::super::super::types::classify_line;
+        use crate::backend::peephole_common::LineStore;
+
+        let run = |asm: &str| -> Vec<String> {
+            let mut store = LineStore::new(asm.to_string());
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            super::fuse_movq_ext_truncation(&mut store, &mut infos);
+            (0..store.len())
+                .filter(|&i| !infos[i].is_nop())
+                .map(|i| store.get(i).trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        };
+
+        // Only a plain GPR source has byte/word/dword aliases.  XMM-to-GPR,
+        // GPR-to-XMM, and memory-source moves must never index REG_NAMES as if
+        // their source were a GPR family accepted by this fusion.
+        for asm in [
+            "    movq %xmm2, %rax\n    movl %eax, %eax\n",
+            "    movq %rax, %xmm2\n    movl %eax, %eax\n",
+            "    movq 8(%rsp), %rax\n    movl %eax, %eax\n",
+        ] {
+            assert_eq!(
+                run(asm),
+                asm.lines()
+                    .map(str::trim)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            run("    movq %r10, %rax\n    movl %eax, %eax\n"),
+            vec!["movl %r10d, %eax"],
+            "plain GPR control must still fuse"
+        );
+    }
+
+    #[test]
     fn vector_self_moves_of_every_spelling_are_deleted_and_nothing_else_is() {
         use super::super::super::types::classify_line;
         use crate::backend::peephole_common::LineStore;

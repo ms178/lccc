@@ -341,8 +341,10 @@ pub struct CodegenState {
     /// form: legal in executables (PIE included), rejected by the linker for
     /// `ET_DYN` shared objects.
     pub shared_lib: bool,
-    /// The command line explicitly selected Initial-Exec TLS.  Unlike
-    /// `shared_lib`, this survives separate compile and link invocations.
+    /// The command line selected Initial-Exec TLS for the whole compilation
+    /// unit. Unlike `shared_lib`, this survives separate compile and link
+    /// invocations. This is intentionally not per-symbol: declaration-level
+    /// TLS-model attributes and the Dynamic models are not implemented yet.
     pub tls_initial_exec: bool,
     /// Set of symbol names that are locally defined (not extern) and have internal
     /// linkage (static) — these can use direct addressing even in PIC mode.

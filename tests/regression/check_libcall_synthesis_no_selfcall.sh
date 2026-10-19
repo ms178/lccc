@@ -11,8 +11,10 @@
 #     meaning),
 #   * `call memset@PLT` inside a TU-defined `memset` with a constant fill,
 #   * a self-recursive `call puts@PLT` inside a TU-defined `puts` via the
-#     printf->puts fold (GCC 16.2, Clang 23.1 and ICX 2025 still do this one;
-#     GCC 14.2 SIGSEGVs), and
+#     printf->puts fold. Measured on this host (main calls puts("x"); the TU
+#     puts calls printf("hello\n")): GCC 16.2 recurses and SIGSEGVs; Clang 23.1.3
+#     and ICX 2026.2 compile the body to `jmp puts` (an infinite loop, timeout);
+#     LCCC prints "hello" and returns 0, the C semantics. The runtime section (TU-defined puts row) pins it.
 #   * a constant-size `memset`/`memcpy` call expanded inline with the
 #     *library* semantics even when the TU defines the callee (A14b: the
 #     pre-fix code stored `0x0707...07` where GCC called the TU's function).

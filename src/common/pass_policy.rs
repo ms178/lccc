@@ -22,81 +22,66 @@ impl PassPolicy {
     }
 }
 
-/// The library functions lccc creates calls to (by synthesis or by folding
-/// one call into another).  These are the names whose status a
-/// function-level policy must carry: a pass about to CREATE a call has no
-/// call site to read [`CallInfo::assume_library`] from.  Passes that only
-/// interpret an existing call (strlen folding, math intrinsics, purity
-/// tables) read that per-call fact instead, which covers every name.
-///
-/// [`CallInfo::assume_library`]: crate::ir::reexports::CallInfo::assume_library
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Libcall {
-    Memset,
-    Memcpy,
-    Memmove,
-    MemsetChk,
-    MemcpyChk,
-    Printf,
-    Vprintf,
-    Fprintf,
-    Vfprintf,
-    PrintfChk,
-    VprintfChk,
-    FprintfChk,
-    VfprintfChk,
-    Puts,
-    Putchar,
-    Fputs,
-    Fputc,
-    Fwrite,
+// Declares `Libcall`, its complete `ALL` table and `name()` from ONE list: a
+// variant cannot exist without its name, and cannot be missing from `ALL`
+// (the array length is derived from the same list), so the exhaustive
+// admission tests always cover every synthesizable library name.
+macro_rules! libcalls {
+    ($(#[$doc:meta])* $($variant:ident = $name:literal,)+) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Libcall {
+            $($variant,)+
+        }
+
+        impl Libcall {
+            /// Every variant, in declaration order.
+            pub const ALL: [Libcall; [$(stringify!($variant)),+].len()] =
+                [$(Libcall::$variant),+];
+
+            /// The C-visible symbol name of this library function.
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $(Libcall::$variant => $name,)+
+                }
+            }
+        }
+    };
 }
 
+libcalls! {
+    /// The library functions lccc creates calls to (by synthesis or by folding
+    /// one call into another).  These are the names whose status a
+    /// function-level policy must carry: a pass about to CREATE a call has no
+    /// call site to read [`CallInfo::assume_library`] from.  Passes that only
+    /// interpret an existing call (strlen folding, math intrinsics, purity
+    /// tables) read that per-call fact instead, which covers every name.
+    ///
+    /// [`CallInfo::assume_library`]: crate::ir::reexports::CallInfo::assume_library
+    Memset = "memset",
+    Memcpy = "memcpy",
+    Memmove = "memmove",
+    MemsetChk = "__memset_chk",
+    MemcpyChk = "__memcpy_chk",
+    Printf = "printf",
+    Vprintf = "vprintf",
+    Fprintf = "fprintf",
+    Vfprintf = "vfprintf",
+    PrintfChk = "__printf_chk",
+    VprintfChk = "__vprintf_chk",
+    FprintfChk = "__fprintf_chk",
+    VfprintfChk = "__vfprintf_chk",
+    Puts = "puts",
+    Putchar = "putchar",
+    Fputs = "fputs",
+    Fputc = "fputc",
+    Fwrite = "fwrite",
+}
+
+// `bit()` packs one variant per bit of a u32 mask: the table must fit.
+const _: () = assert!(Libcall::ALL.len() <= u32::BITS as usize);
+
 impl Libcall {
-    pub const ALL: [Libcall; 18] = [
-        Libcall::Memset,
-        Libcall::Memcpy,
-        Libcall::Memmove,
-        Libcall::MemsetChk,
-        Libcall::MemcpyChk,
-        Libcall::Printf,
-        Libcall::Vprintf,
-        Libcall::Fprintf,
-        Libcall::Vfprintf,
-        Libcall::PrintfChk,
-        Libcall::VprintfChk,
-        Libcall::FprintfChk,
-        Libcall::VfprintfChk,
-        Libcall::Puts,
-        Libcall::Putchar,
-        Libcall::Fputs,
-        Libcall::Fputc,
-        Libcall::Fwrite,
-    ];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Libcall::Memset => "memset",
-            Libcall::Memcpy => "memcpy",
-            Libcall::Memmove => "memmove",
-            Libcall::MemsetChk => "__memset_chk",
-            Libcall::MemcpyChk => "__memcpy_chk",
-            Libcall::Printf => "printf",
-            Libcall::Vprintf => "vprintf",
-            Libcall::Fprintf => "fprintf",
-            Libcall::Vfprintf => "vfprintf",
-            Libcall::PrintfChk => "__printf_chk",
-            Libcall::VprintfChk => "__vprintf_chk",
-            Libcall::FprintfChk => "__fprintf_chk",
-            Libcall::VfprintfChk => "__vfprintf_chk",
-            Libcall::Puts => "puts",
-            Libcall::Putchar => "putchar",
-            Libcall::Fputs => "fputs",
-            Libcall::Fputc => "fputc",
-            Libcall::Fwrite => "fwrite",
-        }
-    }
-
     pub fn from_name(name: &str) -> Option<Libcall> {
         Libcall::ALL.into_iter().find(|l| l.name() == name)
     }
@@ -243,6 +228,35 @@ mod tests {
                 assert_eq!(policy.fp_environment_observable, fenv);
                 assert_eq!(policy.builtins, BuiltinPolicy::HOSTED);
             }
+        }
+    }
+
+    #[test]
+    fn names_are_unique_and_the_table_fits_the_mask() {
+        let mut names: Vec<&str> = Libcall::ALL.iter().map(|l| l.name()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(names.len(), before, "duplicate Libcall name");
+        assert!(Libcall::ALL.len() <= u32::BITS as usize);
+        // Every variant owns a distinct mask bit.
+        let mask = Libcall::ALL.iter().fold(0u32, |m, l| m | l.bit());
+        assert_eq!(mask.count_ones() as usize, Libcall::ALL.len());
+    }
+
+    #[test]
+    fn from_name_is_exact() {
+        // No prefix, suffix, case or `__builtin_` aliasing: a spelled builtin
+        // is a per-call fact (`CallInfo::assume_library`), not a Libcall name.
+        for name in [
+            "",
+            "mem",
+            "memsetx",
+            "MEMSET",
+            "__builtin_memset",
+            " memset",
+        ] {
+            assert_eq!(Libcall::from_name(name), None, "{name:?}");
         }
     }
 

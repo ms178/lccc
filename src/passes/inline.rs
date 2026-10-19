@@ -2947,6 +2947,17 @@ fn extern_inline_admission(func: &IrFunction, ctx: &CalleeContext) -> bool {
     if ctx.semantic_interposition || func.is_static {
         return false;
     }
+    // A global definition of a name lccc may itself synthesize as a library
+    // call (memset/memcpy/memmove/puts and the printf family, see
+    // `common::pass_policy::Libcall`) stays a call. That definition is the
+    // program's library function: copying its body into callers freezes the
+    // semantics that the program's libc contract and the linker still own.
+    // This is the shape `tests/regression/check_libcall_synthesis_no_selfcall.sh`
+    // pins ("the global definition stays a call"); upstream 21772cf8 admitted
+    // external definitions without this carve-out and broke that contract.
+    if crate::common::pass_policy::Libcall::from_name(&func.name).is_some() {
+        return false;
+    }
     // Leaf helpers only: a callee that itself calls out (libm `fma@PLT`, the
     // guarded `__lccc_cpu_init` probe initialiser, Fortify wrappers) must
     // keep its call sites unique — GCC declines these too, and duplicating
@@ -7072,5 +7083,103 @@ mod feature_switch_tests {
             calls_to(&off, "g", "helper") > 0,
             "negative control: the raw snapshot re-exposes expanded calls"
         );
+    }
+}
+
+#[cfg(test)]
+mod extern_admission_tests {
+    use super::*;
+    use crate::common::pass_policy::Libcall;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{BasicBlock, IrConst, Operand, Terminator};
+
+    /// A leaf, loop-free, scalar-returning, global (non-static) definition named
+    /// `name`: the shape `extern_inline_admission` admits, so the only thing that
+    /// can refuse it is the name.
+    fn leaf_definition(name: &str) -> IrFunction {
+        IrFunction {
+            pass_policy: Default::default(),
+            name: name.into(),
+            return_type: IrType::I32,
+            params: vec![],
+            blocks: vec![BasicBlock {
+                label: BlockId(1),
+                instructions: vec![],
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+                source_spans: Vec::new(),
+            }],
+            is_variadic: false,
+            is_declaration: false,
+            is_static: false,
+            is_inline: false,
+            is_always_inline: false,
+            is_noinline: false,
+            next_value_id: 2,
+            fp_expr_tags: Default::default(),
+            next_label: 2,
+            section: None,
+            visibility: None,
+            is_weak: false,
+            is_used: false,
+            has_inlined_calls: false,
+            param_alloca_values: vec![],
+            uses_sret: false,
+            is_fastcall: false,
+            regparm: None,
+            is_naked: false,
+            no_instrument: false,
+            global_init_label_blocks: vec![],
+            ret_eightbyte_classes: vec![],
+            ret_is_f128_sse: false,
+            is_gnu_inline_def: false,
+            loop_promoted_f64_values: Vec::new(),
+        }
+    }
+
+    fn quiet_context() -> CalleeContext {
+        CalleeContext {
+            call_counts: Default::default(),
+            value_referenced: Default::default(),
+            asm_templates: Vec::new(),
+            call_site_counts: Default::default(),
+            sole_caller: Default::default(),
+            debug_callee: false,
+            semantic_interposition: false,
+        }
+    }
+
+    /// Positive control: the leaf shape IS admitted under a non-library name, so
+    /// the refusals below are caused by the name and nothing else.
+    #[test]
+    fn non_library_global_leaf_is_admitted() {
+        assert!(extern_inline_admission(
+            &leaf_definition("helper"),
+            &quiet_context()
+        ));
+    }
+
+    /// A global definition of a library name stays a call (see the comment in
+    /// `extern_inline_admission`). Covers the three names the libcall gate pins.
+    #[test]
+    fn global_definition_of_a_library_name_is_refused() {
+        for name in ["memset", "memcpy", "puts"] {
+            assert!(
+                !extern_inline_admission(&leaf_definition(name), &quiet_context()),
+                "global `{name}` must keep its call"
+            );
+        }
+    }
+
+    /// Exhaustive over every name lccc can synthesize, so a new `Libcall` variant
+    /// cannot silently become inlinable.
+    #[test]
+    fn every_synthesizable_library_name_is_refused() {
+        for lib in Libcall::ALL {
+            assert!(
+                !extern_inline_admission(&leaf_definition(lib.name()), &quiet_context()),
+                "global `{}` must keep its call",
+                lib.name()
+            );
+        }
     }
 }

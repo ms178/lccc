@@ -24,21 +24,29 @@
 #   GLIBC_WORK_DIR=/large/disk/path GLIBC_RUN_SMOKE=1 build_lccc.sh
 set -euo pipefail
 
-ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
+ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/../../.." && pwd)
 LCCC=${LCCC:-$ROOT/target/fastbuild/lccc}
 LCCC_LD=${LCCC_LD:-$(dirname "$LCCC")/lccc-ld}
 WORK=${GLIBC_WORK_DIR:-/home/user/workloads/glibc-2.44}
 CACHE=${GLIBC_CACHE:-/home/user/source-cache}
 GLIBC_COMMIT=afd131806b25715a7617ab757db43f0bb610acbf
-GLIBC_RECIPE_VERSION=2.44+r25+gafd131806b
 TARBALL=${GLIBC_TARBALL:-$CACHE/glibc-$GLIBC_COMMIT.tar.gz}
 TARBALL_URL=https://github.com/bminor/glibc/archive/$GLIBC_COMMIT.tar.gz
 TARBALL_SHA256=764ea4a5f2aebf9d9b61f07a50a1f54854055a913dd66a0f05e1d0a9b7f08bb2
-ARCHPKGBUILDS_REV=4587e7caa08ada404dd603be8ae066ae8745220e
+EXPECTED_ARCHPKGBUILDS_REV=4587e7caa08ada404dd603be8ae066ae8745220e
 PATCH=${MS178_GLIBC_PATCH:-/home/user/archpkgbuilds/toolchain-stable/glibc/ms178-glibc.patch}
 PATCH_SHA256=52c9953f8e3ec710d73308464bd98bbe752895d83c6b17201235edcb1c974aeb
 BINUTILS=${GLIBC_BINUTILS_PREFIX:-/home/user/tools/binutils-2.47/bin}
 JOBS=${JOBS:-2}
+# C and C++ host tools are a pair: glibc's support helper uses the C++
+# compiler's private headers, while the smoke setup queries the C compiler.
+# Requiring both overrides prevents an accidental gcc/clang split.
+if [[ ${HOST_CC+x} != "${HOST_CXX+x}" ]]; then
+    echo 'error: set HOST_CC and HOST_CXX together' >&2
+    exit 2
+fi
+HOST_CC=${HOST_CC:-$(command -v gcc || true)}
+HOST_CXX=${HOST_CXX:-$(command -v g++ || true)}
 # The resulting glibc is loaded at process startup, so Initial-Exec TLS is
 # valid and avoids Local-Dynamic __tls_get_addr sequences. It is not a safe
 # default for arbitrary DSOs that may be dlopen'd after threads exist.
@@ -48,15 +56,36 @@ mkdir -p "$WORK" "$CACHE"
 "$ROOT/scripts/ensure_swap.sh"
 [[ -x "$LCCC" ]] || { echo "error: LCCC is not executable: $LCCC" >&2; exit 2; }
 [[ -x "$LCCC_LD" ]] || { echo "error: lccc-ld is not executable: $LCCC_LD" >&2; exit 2; }
+[[ -x "$HOST_CC" ]] || { echo "error: HOST_CC is not executable: $HOST_CC" >&2; exit 2; }
+[[ -x "$HOST_CXX" ]] || { echo "error: HOST_CXX is not executable: $HOST_CXX" >&2; exit 2; }
+host_cc_target=$($HOST_CC -dumpmachine)
+host_cxx_target=$($HOST_CXX -dumpmachine)
+[[ $host_cc_target == "$host_cxx_target" ]] || {
+    echo "error: incoherent host compiler targets: CC=$host_cc_target CXX=$host_cxx_target" >&2
+    exit 2
+}
 [[ -f "$PATCH" ]] || { echo "error: ms178 patch not found: $PATCH" >&2; exit 2; }
 patch_sha=$(sha256sum "$PATCH" | awk '{print $1}')
 [[ "$patch_sha" == "$PATCH_SHA256" ]] || {
     echo "error: ms178 patch checksum mismatch: $patch_sha (expected $PATCH_SHA256)" >&2
     exit 1
 }
+# Capture provenance from the checkout that actually supplied the patch.  The
+# checksum remains the content authority; when this is the pinned
+# archpkgbuilds checkout, also reject a stale/wrong Git revision.
+ARCHPKGBUILDS_REV=not-a-git-checkout
+ARCHPKGBUILDS_DIR=
+if ARCHPKGBUILDS_DIR=$(git -C "$(dirname "$PATCH")" rev-parse --show-toplevel 2>/dev/null); then
+    ARCHPKGBUILDS_REV=$(git -C "$ARCHPKGBUILDS_DIR" rev-parse HEAD)
+    [[ $ARCHPKGBUILDS_REV == "$EXPECTED_ARCHPKGBUILDS_REV" ]] || {
+        echo "error: archpkgbuilds revision $ARCHPKGBUILDS_REV (expected $EXPECTED_ARCHPKGBUILDS_REV)" >&2
+        exit 1
+    }
+fi
 # A path containing "2.47" proves nothing.  Every binutils program the build
 # invokes is independently checked with the shared exact-token policy.
-# shellcheck source=../../../tools/linker/oracle_versions.sh
+# ROOT is computed from this script's location.
+# shellcheck disable=SC1091
 source "$ROOT/tools/linker/oracle_versions.sh"
 for tool in as ld ar ranlib objdump readelf; do
     [[ -x "$BINUTILS/$tool" ]] || {
@@ -88,10 +117,10 @@ STAGE="$WORK/stage-lccc"
 # compile.  It is safe only when every build input agrees with the receipt from
 # the completed build; path or version-string equality is insufficient.
 if [[ ${GLIBC_REUSE_BUILD:-0} == 1 ]]; then
-    python3 - "$WORK/manifest.json" "$archive_sha" "$patch_sha" "$LCCC" "$LCCC_LD" "$BINUTILS" "$CFLAGS" "$GLIBC_COMMIT" "$ARCHPKGBUILDS_REV" <<'PY'
+    python3 - "$WORK/manifest.json" "$archive_sha" "$patch_sha" "$LCCC" "$LCCC_LD" "$BINUTILS" "$CFLAGS" "$GLIBC_COMMIT" "$ARCHPKGBUILDS_REV" "$HOST_CC" "$HOST_CXX" <<'PY'
 import hashlib, json, pathlib, sys
 (manifest, archive, patch, lccc, ld, binutils, cflags, commit,
- archpkgbuilds_rev) = sys.argv[1:]
+ archpkgbuilds_rev, host_cc, host_cxx) = sys.argv[1:]
 def digest(path):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -107,6 +136,8 @@ expected = {
     'lccc': str(pathlib.Path(lccc).resolve()), 'lccc_sha256': digest(lccc),
     'lccc_ld': str(pathlib.Path(ld).resolve()), 'lccc_ld_sha256': digest(ld),
     'binutils_247': str(pathlib.Path(binutils).resolve()),
+    'host_cc': str(pathlib.Path(host_cc).resolve()), 'host_cc_sha256': digest(host_cc),
+    'host_cxx': str(pathlib.Path(host_cxx).resolve()), 'host_cxx_sha256': digest(host_cxx),
     'binutils_sha256': {name: digest(str(pathlib.Path(binutils) / name))
                         for name in ('as', 'ld', 'ar', 'ranlib', 'objdump', 'readelf')},
 }
@@ -117,7 +148,25 @@ if diffs:
 PY
 fi
 if [[ ${GLIBC_REUSE_BUILD:-0} != 1 ]]; then
-    rm -rf "$SRC" "$BUILD" "$STAGE"
+    # rm -rf is intentionally confined to three known children of WORK.  This
+    # catches empty/root/home overrides and symlink/.. escapes before deleting.
+    work_real=$(realpath -m -- "$WORK")
+    [[ $work_real != / && $work_real != "$HOME" ]] || {
+        echo "error: refusing destructive GLIBC_WORK_DIR: $work_real" >&2
+        exit 2
+    }
+    safe_remove_tree() {
+        local candidate_real
+        candidate_real=$(realpath -m -- "$1")
+        case "$candidate_real" in
+            "$work_real"/glibc-*|"$work_real"/build-lccc|"$work_real"/stage-lccc)
+                rm -rf --one-file-system -- "$candidate_real" ;;
+            *) echo "error: refusing rm outside guarded work children: $candidate_real" >&2; exit 2 ;;
+        esac
+    }
+    safe_remove_tree "$SRC"
+    safe_remove_tree "$BUILD"
+    safe_remove_tree "$STAGE"
     tar -xf "$TARBALL" -C "$WORK"
     patch --dry-run -Np1 --fuzz=0 -i "$PATCH" -d "$SRC" >/dev/null
     patch -Np1 --fuzz=0 -i "$PATCH" -d "$SRC" >/dev/null
@@ -126,19 +175,34 @@ if [[ ${GLIBC_REUSE_BUILD:-0} != 1 ]]; then
     # CXX needs GCC's internal and multiarch headers because glibc's support
     # helper is compiled with -nostdinc.  Query the selected host compiler;
     # hardcoding Debian's GCC 14 paths breaks Sid and non-Debian hosts.
-    HOST_CXX=${HOST_CXX:-$(command -v g++)}
     gcc_include=$($HOST_CXX -print-file-name=include)
     multiarch=$($HOST_CXX -print-multiarch)
     [[ -d "$gcc_include" ]] || { echo "error: GCC include dir missing: $gcc_include" >&2; exit 2; }
     CXX="$HOST_CXX -isystem $gcc_include"
     [[ -z "$multiarch" || ! -d "/usr/include/$multiarch" ]] || CXX+=" -isystem /usr/include/$multiarch"
     BINUTILS_PATH="$BINUTILS:$(dirname "$LCCC"):/usr/bin"
+    BUILD_CFLAGS=$CFLAGS
+    {
+        printf 'source_commit=%s\narchive_sha256=%s\npatch_sha256=%s\n' \
+            "$GLIBC_COMMIT" "$archive_sha" "$patch_sha"
+        printf 'archpkgbuilds_revision=%s\nhost_cc=%s\nhost_cxx=%s\nhost_target=%s\n' \
+            "$ARCHPKGBUILDS_REV" "$HOST_CC" "$HOST_CXX" "$host_cc_target"
+        "$HOST_CC" --version | head -n1
+        "$HOST_CXX" --version | head -n1
+    } | tee "$BUILD/inputs.log"
+    report_build_failure() {
+        local status=$?
+        echo "error: glibc build failed (status $status); log tails:" >&2
+        tail -n 40 "$BUILD"/{configure,build,install}.log 2>/dev/null >&2 || true
+        exit "$status"
+    }
+    trap report_build_failure ERR
     (
         cd "$BUILD"
         PATH="$BINUTILS_PATH" CC="$LCCC" CXX="$CXX" LD="$LCCC_LD" \
           AS="$BINUTILS/as" AR="$BINUTILS/ar" RANLIB="$BINUTILS/ranlib" \
           OBJDUMP="$BINUTILS/objdump" READELF="$BINUTILS/readelf" \
-          CPPFLAGS='-D_FORTIFY_SOURCE=0' CFLAGS="$CFLAGS" CXXFLAGS="$CFLAGS" \
+          CPPFLAGS='-D_FORTIFY_SOURCE=0' CFLAGS="$BUILD_CFLAGS" CXXFLAGS="$BUILD_CFLAGS" \
           "$SRC/configure" \
             --prefix="$WORK/install-lccc" \
             --libdir="$WORK/install-lccc/lib" \
@@ -151,6 +215,7 @@ if [[ ${GLIBC_REUSE_BUILD:-0} != 1 ]]; then
         PATH="$BINUTILS_PATH" make -j"$JOBS" -Oline CXX="$CXX" >build.log 2>&1
         PATH="$BINUTILS_PATH" make install DESTDIR="$STAGE" >install.log 2>&1
     )
+    trap - ERR
 else
     INSTALL_REUSE="$STAGE$WORK/install-lccc"
     [[ -x "$INSTALL_REUSE/lib/libc.so.6" ]] || {
@@ -183,9 +248,8 @@ int main(void) {
     return 0;
 }
 EOF
-    host_cc=${HOST_CC:-$(command -v gcc)}
-    gcc_include=$($host_cc -print-file-name=include)
-    multiarch=$($host_cc -print-multiarch)
+    gcc_include=$($HOST_CC -print-file-name=include)
+    multiarch=$($HOST_CC -print-multiarch)
     smoke_includes=(-isystem "$INSTALL/include" -isystem "$gcc_include" -isystem /usr/include)
     [[ -z "$multiarch" || ! -d "/usr/include/$multiarch" ]] || smoke_includes+=(-isystem "/usr/include/$multiarch")
     "$LCCC" -O2 -nostdinc "${smoke_includes[@]}" \
@@ -196,10 +260,10 @@ EOF
     LD_LIBRARY_PATH="$INSTALL/lib" "$WORK/smoke-lccc"
 fi
 
-python3 - "$WORK/manifest.json" "$archive_sha" "$patch_sha" "$LCCC" "$LCCC_LD" "$BINUTILS" "$INSTALL" "$CFLAGS" "$GLIBC_COMMIT" "$ARCHPKGBUILDS_REV" <<'PY'
+python3 - "$WORK/manifest.json" "$archive_sha" "$patch_sha" "$LCCC" "$LCCC_LD" "$BINUTILS" "$INSTALL" "$CFLAGS" "$GLIBC_COMMIT" "$ARCHPKGBUILDS_REV" "$HOST_CC" "$HOST_CXX" <<'PY'
 import hashlib, json, pathlib, subprocess, sys
 (out, archive, patch, lccc, ld, binutils, install, cflags, commit,
- archpkgbuilds_rev) = sys.argv[1:]
+ archpkgbuilds_rev, host_cc, host_cxx) = sys.argv[1:]
 def digest(path):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -217,6 +281,10 @@ p = {
   'lccc_ld': str(pathlib.Path(ld).resolve()), 'lccc_ld_sha256': digest(ld),
   'lccc_ld_version': v(ld),
   'binutils_247': str(pathlib.Path(binutils).resolve()),
+  'host_cc': str(pathlib.Path(host_cc).resolve()), 'host_cc_sha256': digest(host_cc),
+  'host_cc_version': v(host_cc),
+  'host_cxx': str(pathlib.Path(host_cxx).resolve()), 'host_cxx_sha256': digest(host_cxx),
+  'host_cxx_version': v(host_cxx),
   'binutils_sha256': {name: digest(str(pathlib.Path(binutils) / name))
                       for name in ('as', 'ld', 'ar', 'ranlib', 'objdump', 'readelf')},
   'capability_gates': ['--disable-multi-arch', '--disable-mathvec', '--disable-sframe'],

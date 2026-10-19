@@ -1,8 +1,10 @@
 """Pins the GCC reference link policy of run_regression.py.
 
-GCC's -m32 reference executables must link -no-pie on this host: GNU ld 2.44's
-default-PIE i386 output jumps to 0x1 before main.  The x86-64 reference links
-must not change, and library inputs must keep following the source file.
+GCC's -m32 reference executables link -no-pie so they are like-for-like with
+LCCC's non-PIE -m32 output.  This is a matching choice, not a linker bug: a
+default-PIE -m32 reference also runs correctly with GNU ld 2.47 (measured).
+The x86-64 reference links must not change, and library inputs must keep
+following the source file.
 """
 import importlib.util
 import pathlib
