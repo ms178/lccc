@@ -110,11 +110,11 @@ printf 'int f(void) { return __builtin_choose_expr(1 << 31, 1, 2); }\n' >"$t/ch8
 ! "$CCC" -std=gnu17 -fsyntax-only "$t/ch89.c" 2>/dev/null
 printf 'struct P { int a, b; };\nint f(void) { return __builtin_choose_expr((long)&((struct P *)0)->b, 1, 2); }\n' >"$t/ch_off.c"
 ! "$CCC" -fsyntax-only "$t/ch_off.c" 2>/dev/null
-# Enumerator scope in the parser's `_Static_assert` evaluator: an object
-# hides an enumerator, a block-scope enumerator ends with its block.
+# Enumerator scope in `_Static_assert` conditions: an object hides an
+# enumerator, a block-scope enumerator ends with its block (GCC 16.2 wording).
 printf 'enum { A = 1 };\nint h(void) { int A = 5; _Static_assert(A, "x"); return A; }\n' >"$t/en_shadow.c"
 printf 'void f(void) { enum { X = 1 }; }\n_Static_assert(X, "leak");\n' >"$t/en_leak.c"
 for f in en_shadow en_leak; do
   ! "$CCC" -fsyntax-only "$t/$f.c" 2>"$t/$f.e"
-  grep -q "expression in static assertion is not an integer constant expression" "$t/$f.e"
+  grep -q "expression in static assertion is not constant" "$t/$f.e"
 done

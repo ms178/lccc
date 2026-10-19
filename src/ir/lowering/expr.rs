@@ -393,6 +393,9 @@ impl Lowerer {
             Expr::GenericSelection(controlling, associations, _) => {
                 self.lower_generic_selection(controlling, associations)
             }
+            // A type operand has no value: the parser builds one only as the
+            // controlling operand of `_Generic`, which is never evaluated.
+            Expr::TypeOperand(..) => Operand::Const(IrConst::I64(0)),
             Expr::LabelAddr(label_name, _) => {
                 // GNU C nested functions: &&label of an ENCLOSING function's
                 // label resolves to the parent's named alias (block IDs are

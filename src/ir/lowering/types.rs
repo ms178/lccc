@@ -220,13 +220,14 @@ impl Lowerer {
         let is_32bit = target_is_32bit();
         match ts {
             TypeSpecifier::Void => IrType::Void,
+            TypeSpecifier::NullPtrT => IrType::Ptr,
             TypeSpecifier::Bool => IrType::U8,
             // NOTE: plain char vs signed char is resolved at PARSE time (the
             // parser emits UnsignedChar for plain char on unsigned-char
             // targets), so TypeSpecifier::Char here always means explicit
             // `signed char` and lowers to I8 unconditionally.
-            TypeSpecifier::Char => IrType::I8,
-            TypeSpecifier::UnsignedChar => IrType::U8,
+            TypeSpecifier::Char | TypeSpecifier::SignedChar => IrType::I8,
+            TypeSpecifier::UnsignedChar | TypeSpecifier::PlainUnsignedChar => IrType::U8,
             TypeSpecifier::Short => IrType::I16,
             TypeSpecifier::UnsignedShort => IrType::U16,
             TypeSpecifier::Int | TypeSpecifier::Signed => IrType::I32,
@@ -262,17 +263,10 @@ impl Lowerer {
             TypeSpecifier::Pointer(_, _) => IrType::Ptr,
             TypeSpecifier::Array(_, _) => IrType::Ptr,
             TypeSpecifier::Struct(..) | TypeSpecifier::Union(..) => IrType::Ptr,
-            TypeSpecifier::Enum(_, _, false) => {
-                // Non-packed enum: resolve to CType to get correct size and signedness.
-                // Enums with values like `1U << 31` (0x80000000) are unsigned 32-bit.
-                let ctype = self.type_spec_to_ctype(ts);
-                IrType::from_ctype(&ctype)
-            }
-            TypeSpecifier::Enum(_, _, true) => {
-                // Packed enum: resolve to CType to get the correct IR type
-                let ctype = self.type_spec_to_ctype(ts);
-                IrType::from_ctype(&ctype)
-            }
+            // Size and signedness come from the enum's compatible type: its
+            // values (`1U << 31` is unsigned 32-bit), packing, or C23 fixed
+            // underlying type.
+            TypeSpecifier::Enum(..) => IrType::from_ctype(&self.type_spec_to_ctype(ts)),
             TypeSpecifier::TypedefName(name) => {
                 // Resolve typedef through CType
                 if let Some(ctype) = self.types.typedefs.get(name) {
@@ -325,7 +319,10 @@ impl Lowerer {
         // On i686 (ILP32): long=4, pointer=4, double aligned to 4, long double=12 aligned to 4
         match ts {
             TypeSpecifier::Void | TypeSpecifier::Bool => Some((1, 1)),
-            TypeSpecifier::Char | TypeSpecifier::UnsignedChar => Some((1, 1)),
+            TypeSpecifier::Char
+            | TypeSpecifier::SignedChar
+            | TypeSpecifier::UnsignedChar
+            | TypeSpecifier::PlainUnsignedChar => Some((1, 1)),
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => Some((2, 2)),
             TypeSpecifier::Int
             | TypeSpecifier::UnsignedInt
@@ -370,7 +367,7 @@ impl Lowerer {
                     Some((32, 16))
                 }
             }
-            TypeSpecifier::Pointer(_, _) => Some((ptr_sz, ptr_sz)),
+            TypeSpecifier::Pointer(_, _) | TypeSpecifier::NullPtrT => Some((ptr_sz, ptr_sz)),
             // Enums resolve through their CType (callers' enum branch).
             TypeSpecifier::TypedefName(_) => Some((ptr_sz, ptr_sz)), // fallback for unresolved typedefs
             _ => None,

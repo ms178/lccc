@@ -12,6 +12,7 @@ pub(crate) mod fx_hash;
 pub(crate) mod hex_float;
 pub(crate) mod isa_features;
 pub(crate) mod long_double;
+pub(crate) mod qualifiers;
 pub(crate) mod source;
 pub(crate) mod symbol_table;
 pub(crate) mod sysv_classify;

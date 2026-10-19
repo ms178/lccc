@@ -52,7 +52,7 @@ impl Lowerer {
             ("wchar_t", crate::common::types::wchar_ctype()),
             ("wint_t", CType::UInt),
             // <stdint.h> - exact width types
-            ("int8_t", CType::Char),
+            ("int8_t", CType::signed_char()),
             ("int16_t", CType::Short),
             ("int32_t", CType::Int),
             ("int64_t", i64_type.clone()),
@@ -65,7 +65,7 @@ impl Lowerer {
             ("intmax_t", i64_type.clone()),
             ("uintmax_t", u64_type.clone()),
             // least types
-            ("int_least8_t", CType::Char),
+            ("int_least8_t", CType::signed_char()),
             ("int_least16_t", CType::Short),
             ("int_least32_t", CType::Int),
             ("int_least64_t", i64_type.clone()),
@@ -74,7 +74,7 @@ impl Lowerer {
             ("uint_least32_t", CType::UInt),
             ("uint_least64_t", u64_type.clone()),
             // fast types
-            ("int_fast8_t", CType::Char),
+            ("int_fast8_t", CType::signed_char()),
             ("int_fast16_t", fast_s.clone()),
             ("int_fast32_t", fast_s.clone()),
             ("int_fast64_t", i64_type.clone()),
@@ -111,7 +111,7 @@ impl Lowerer {
             ("__u16", CType::UShort),
             ("__u32", CType::UInt),
             ("__u64", u64_type.clone()),
-            ("__s8", CType::Char),
+            ("__s8", CType::signed_char()),
             ("__s16", CType::Short),
             ("__s32", CType::Int),
             ("__s64", i64_type),
@@ -185,7 +185,7 @@ impl Lowerer {
             }
             Target::I686 => {
                 // i686 cdecl: va_list = char* (simple pointer to stack args)
-                CType::Pointer(Box::new(CType::Char), AddressSpace::Default)
+                CType::Pointer(Box::new(CType::plain_char()), AddressSpace::Default)
             }
         };
         self.types
@@ -203,7 +203,7 @@ impl Lowerer {
             ("__u_short", CType::UShort),
             ("__u_int", CType::UInt),
             ("__u_long", CType::ULong),
-            ("__int8_t", CType::Char),
+            ("__int8_t", CType::signed_char()),
             ("__int16_t", CType::Short),
             ("__int32_t", CType::Int),
             ("__uint8_t", CType::UChar),

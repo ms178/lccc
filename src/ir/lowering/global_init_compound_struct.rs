@@ -138,7 +138,10 @@ impl Lowerer {
             let is_string_literal =
                 matches!(&item.init, Initializer::Expr(Expr::StringLiteral(..)));
             if let CType::Array(elem_ty, Some(arr_size)) = field_ty {
-                let is_char_array = matches!(elem_ty.as_ref(), CType::Char | CType::UChar);
+                let is_char_array = matches!(
+                    elem_ty.as_ref(),
+                    CType::Char | CType::SChar | CType::UChar | CType::PlainUChar
+                );
                 let skip_flat = is_string_literal && is_char_array;
                 if matches!(&item.init, Initializer::Expr(_)) && !skip_flat {
                     // Flat init: consume the right number of items for this array field.

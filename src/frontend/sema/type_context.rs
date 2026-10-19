@@ -141,6 +141,8 @@ pub struct TypeScopeFrame {
     /// Every change to `qualified_pointee_typedefs` in this scope, with the
     /// membership it replaced; undone last-write-first.
     pub qualified_pointee_changed: Vec<(String, bool)>,
+    /// Same, for `const_base_typedefs`.
+    pub const_base_changed: Vec<(String, bool)>,
 }
 
 impl TypeScopeFrame {
@@ -161,6 +163,7 @@ impl TypeScopeFrame {
             typedef_alignments_added: Vec::new(),
             typedef_alignments_shadowed: Vec::new(),
             qualified_pointee_changed: Vec::new(),
+            const_base_changed: Vec::new(),
         }
     }
 }
@@ -199,6 +202,10 @@ pub struct TypeContext {
     /// here for the null pointer constant rule: `(CNPT)0` is not one. Scoped
     /// like `typedefs` (see [`Self::set_typedef_pointee_qualified`]).
     pub qualified_pointee_typedefs: FxHashSet<String>,
+    /// Typedefs whose base specifier is `const` (`typedef const int CI;`,
+    /// `typedef const char *CS;`; see `common::qualifiers`). Scoped like
+    /// `typedefs` (see [`Self::set_typedef_const_base`]).
+    pub const_base_typedefs: FxHashSet<String>,
     /// Function typedef info (bare function typedefs like `typedef int func_t(int)`)
     pub function_typedefs: FxHashMap<String, FunctionTypedefInfo>,
     /// Set of typedef names that are function pointer types
@@ -241,6 +248,7 @@ impl TypeContext {
             typedefs: FxHashMap::default(),
             typedef_alignments: FxHashMap::default(),
             qualified_pointee_typedefs: FxHashSet::default(),
+            const_base_typedefs: FxHashSet::default(),
             function_typedefs: FxHashMap::default(),
             func_ptr_typedefs: FxHashSet::default(),
             func_ptr_typedef_info: FxHashMap::default(),
@@ -303,7 +311,7 @@ impl TypeContext {
             ("wchar_t", crate::common::types::wchar_ctype()),
             ("wint_t", CType::UInt),
             // <stdint.h> - exact width types
-            ("int8_t", CType::Char),
+            ("int8_t", CType::signed_char()),
             ("int16_t", CType::Short),
             ("int32_t", CType::Int),
             ("int64_t", i64_type.clone()),
@@ -316,7 +324,7 @@ impl TypeContext {
             ("intmax_t", i64_type.clone()),
             ("uintmax_t", u64_type.clone()),
             // least types
-            ("int_least8_t", CType::Char),
+            ("int_least8_t", CType::signed_char()),
             ("int_least16_t", CType::Short),
             ("int_least32_t", CType::Int),
             ("int_least64_t", i64_type.clone()),
@@ -325,7 +333,7 @@ impl TypeContext {
             ("uint_least32_t", CType::UInt),
             ("uint_least64_t", u64_type.clone()),
             // fast types
-            ("int_fast8_t", CType::Char),
+            ("int_fast8_t", CType::signed_char()),
             ("int_fast16_t", fast_s.clone()),
             ("int_fast32_t", fast_s.clone()),
             ("int_fast64_t", i64_type.clone()),
@@ -362,7 +370,7 @@ impl TypeContext {
             ("__u16", CType::UShort),
             ("__u32", CType::UInt),
             ("__u64", u64_type.clone()),
-            ("__s8", CType::Char),
+            ("__s8", CType::signed_char()),
             ("__s16", CType::Short),
             ("__s32", CType::Int),
             ("__s64", i64_type.clone()),
@@ -420,7 +428,7 @@ impl TypeContext {
             ("__u_short", CType::UShort),
             ("__u_int", CType::UInt),
             ("__u_long", CType::ULong),
-            ("__int8_t", CType::Char),
+            ("__int8_t", CType::signed_char()),
             ("__int16_t", CType::Short),
             ("__int32_t", CType::Int),
             ("__uint8_t", CType::UChar),
@@ -574,6 +582,13 @@ impl TypeContext {
             // Last-write-first: each entry holds the value that write
             // replaced, so restoring in reverse rebuilds the pre-scope state
             // exactly.  `None` marks a name this scope introduced.
+            for (key, was_const) in frame.const_base_changed.into_iter().rev() {
+                if was_const {
+                    self.const_base_typedefs.insert(key);
+                } else {
+                    self.const_base_typedefs.remove(&key);
+                }
+            }
             for (key, was_qualified) in frame.qualified_pointee_changed.into_iter().rev() {
                 if was_qualified {
                     self.qualified_pointee_typedefs.insert(key);
@@ -694,6 +709,24 @@ impl TypeContext {
         ty
     }
 
+    /// The enum tag `name` declared in the innermost scope, if any (C11
+    /// 6.7.2.3: only a declaration in the same scope redeclares the tag).
+    pub fn enum_type_in_current_scope(
+        &self,
+        name: &str,
+    ) -> Option<&crate::common::types::EnumType> {
+        let in_scope = match self.scope_stack.borrow().last() {
+            Some(frame) => frame.enum_types_tracked.contains(name),
+            // File scope: no frame.
+            None => true,
+        };
+        if in_scope {
+            self.enum_types.get(name)
+        } else {
+            None
+        }
+    }
+
     /// Insert a completed enum tag definition, tracking lexical shadowing so
     /// body-less references after scope exit recover the outer definition.
     pub fn insert_enum_type_scoped(
@@ -758,6 +791,23 @@ impl TypeContext {
             self.qualified_pointee_typedefs.insert(name.to_string());
         } else {
             self.qualified_pointee_typedefs.remove(name);
+        }
+    }
+
+    /// Record whether typedef `name` has a `const` base specifier, undone when
+    /// the current scope is popped (see `set_typedef_pointee_qualified`).
+    pub fn set_typedef_const_base(&mut self, name: &str, is_const: bool) {
+        let was_const = self.const_base_typedefs.contains(name);
+        if was_const == is_const {
+            return;
+        }
+        if let Some(frame) = self.scope_stack.get_mut().last_mut() {
+            frame.const_base_changed.push((name.to_string(), was_const));
+        }
+        if is_const {
+            self.const_base_typedefs.insert(name.to_string());
+        } else {
+            self.const_base_typedefs.remove(name);
         }
     }
 
@@ -932,6 +982,7 @@ mod enum_type_scope_tests {
             name: Some(name.to_string()),
             variants: vec![(variant.0.to_string(), variant.1)],
             is_packed,
+            fixed: None,
         }
     }
 

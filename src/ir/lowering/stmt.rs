@@ -108,6 +108,11 @@ impl Lowerer {
 
             let mut da = self.analyze_declaration(type_spec, &declarator.derived);
             da.base_type_volatile = decl.is_volatile();
+            da.base_type_const = crate::common::qualifiers::type_name_const_base(
+                &decl.type_spec,
+                decl.is_const(),
+                self,
+            );
             da.object_volatile = declarator.attrs.object_volatile;
             da.apply_decl_vector_type(decl);
             self.fixup_unsized_array(&mut da, type_spec, &declarator.derived, &declarator.init);
@@ -309,6 +314,13 @@ impl Lowerer {
             }
             self.types
                 .insert_typedef_scoped(declarator.name.clone(), resolved_ctype);
+            let const_base = crate::common::qualifiers::type_name_const_base(
+                &decl.type_spec,
+                decl.is_const(),
+                self,
+            );
+            self.types
+                .set_typedef_const_base(&declarator.name, const_base);
 
             let effective_alignment = {
                 let mut align = decl.alignment;
@@ -429,7 +441,7 @@ impl Lowerer {
         explicit_align: usize,
         vla_size: Option<Value>,
     ) {
-        let mut local_info = LocalInfo::from_analysis(da, alloca, decl.is_const());
+        let mut local_info = LocalInfo::from_analysis(da, alloca);
         local_info.var.address_space =
             crate::common::type_builder::object_storage_address_space_with_object(
                 self.declaration_address_space(decl.address_space, &decl.type_spec),
@@ -726,7 +738,7 @@ impl Lowerer {
 
         // Store type info in locals (with static_global_name set so each use site
         // emits a fresh GlobalAddr in its own basic block, avoiding unreachable-block issues).
-        let mut local_info = LocalInfo::for_static(da, static_name, decl.is_const());
+        let mut local_info = LocalInfo::for_static(da, static_name);
         if let Some(ea) = explicit_align {
             local_info.var.explicit_alignment = Some(ea);
         }
@@ -1059,7 +1071,10 @@ impl Lowerer {
                     } else if let CType::Array(ref elem_ty, Some(arr_size)) = field.ty {
                         // Char array field initialized by a string literal:
                         // copy the string bytes instead of storing the pointer.
-                        let is_char_array = matches!(**elem_ty, CType::Char | CType::UChar);
+                        let is_char_array = matches!(
+                            **elem_ty,
+                            CType::Char | CType::SChar | CType::UChar | CType::PlainUChar
+                        );
                         if is_char_array {
                             if let Expr::StringLiteral(s, _) = e {
                                 self.emit_string_to_alloca(base, s, field_offset, arr_size);

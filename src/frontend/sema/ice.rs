@@ -31,6 +31,15 @@ use crate::frontend::parser::ast::{
 };
 use crate::ir::reexports::IrConst;
 
+/// What a named constant (C23 6.6p7) may contribute to an ICE: an integer
+/// one is an operand, a floating one only the immediate operand of a cast to
+/// an integer type (6.6p8).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum NamedConstant {
+    Integer,
+    Floating,
+}
+
 pub(super) struct IceChecker<'s> {
     /// The constant evaluator in GCC's `folding_initializer` mode:
     /// `__builtin_constant_p` answers now (0 unless proven), because a
@@ -40,9 +49,10 @@ pub(super) struct IceChecker<'s> {
     ctype: &'s dyn Fn(&Expr) -> Option<CType>,
     /// The `_Generic` selection rule: the index of the selected association.
     select: &'s dyn Fn(&Expr, &[GenericAssociation]) -> Option<usize>,
-    /// Whether an identifier names an enumeration constant in scope (not
-    /// shadowed by an object).
-    is_enumerator: &'s dyn Fn(&str) -> bool,
+    /// Whether an identifier or member access is a named constant: an
+    /// enumeration constant in scope (not shadowed by an object), a C23
+    /// `constexpr` object, or a member of one (`s.m`).
+    named_constant: &'s dyn Fn(&Expr) -> Option<NamedConstant>,
     /// Whether `name` is a builtin function.
     is_builtin: &'s dyn Fn(&str) -> bool,
     /// C90/C94: a signed left shift that overflows is still a constant (GCC
@@ -55,7 +65,7 @@ impl<'s> IceChecker<'s> {
         eval: &'s dyn Fn(&Expr) -> Option<IrConst>,
         ctype: &'s dyn Fn(&Expr) -> Option<CType>,
         select: &'s dyn Fn(&Expr, &[GenericAssociation]) -> Option<usize>,
-        is_enumerator: &'s dyn Fn(&str) -> bool,
+        named_constant: &'s dyn Fn(&Expr) -> Option<NamedConstant>,
         is_builtin: &'s dyn Fn(&str) -> bool,
         pre_c99: bool,
     ) -> Self {
@@ -63,7 +73,7 @@ impl<'s> IceChecker<'s> {
             eval,
             ctype,
             select,
-            is_enumerator,
+            named_constant,
             is_builtin,
             pre_c99,
         }
@@ -91,7 +101,9 @@ impl<'s> IceChecker<'s> {
             | Expr::LongLongLiteral(..)
             | Expr::ULongLongLiteral(..)
             | Expr::CharLiteral(..) => true,
-            Expr::Identifier(name, _) => (self.is_enumerator)(name),
+            Expr::Identifier(..) | Expr::MemberAccess(..) => {
+                (self.named_constant)(expr) == Some(NamedConstant::Integer)
+            }
             Expr::UnaryOp(
                 UnaryOp::Plus
                 | UnaryOp::Neg
@@ -188,6 +200,10 @@ impl<'s> IceChecker<'s> {
         }
         if let Some(value) = floating_literal(inner) {
             return !evaluated || float_converts(value, &target);
+        }
+        if (self.named_constant)(inner) == Some(NamedConstant::Floating) {
+            let value = (self.eval)(inner).and_then(|c| c.to_f64());
+            return !evaluated || value.is_some_and(|v| float_converts(v, &target));
         }
         if matches!(inner, Expr::AddressOf(..)) {
             // `__builtin_offsetof` (see the module comment).

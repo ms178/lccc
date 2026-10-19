@@ -52,6 +52,7 @@ impl Parser {
         let mut mode_kind: Option<ModeKind> = None;
         let mut any_base_specifier = false;
         let mut any_storage_class = false;
+        let mut saw_auto = false;
 
         // Collect qualifiers, storage classes, and type specifiers
         loop {
@@ -60,6 +61,17 @@ impl Parser {
                 TokenKind::Const => {
                     self.advance();
                     self.attrs.set_const(true);
+                }
+                // C23 `constexpr` (6.7.1): the object is const and its
+                // initializer a constant expression.
+                TokenKind::Constexpr => {
+                    self.advance();
+                    self.attrs.set_const(true);
+                    self.attrs.set_constexpr(true);
+                    if saw_auto && any_base_specifier {
+                        self.attrs.mark_constexpr_last();
+                    }
+                    any_storage_class = true;
                 }
                 TokenKind::Volatile => {
                     self.advance();
@@ -83,6 +95,7 @@ impl Parser {
                 TokenKind::Auto => {
                     self.advance();
                     any_storage_class = true;
+                    saw_auto = true;
                     self.attrs.set_nested_fn(true);
                 }
                 TokenKind::Noreturn => {
@@ -154,6 +167,9 @@ impl Parser {
                 // we just parse and return the inner type.
                 TokenKind::Atomic => {
                     self.advance();
+                    // Atomic-ness is not tracked in types; the flag records the
+                    // object qualifier (`DeclAttributes::object_atomic`).
+                    self.attrs.set_atomic(true);
                     if matches!(self.peek(), TokenKind::LParen) {
                         let open = self.peek_span();
                         self.advance(); // consume '('
@@ -417,6 +433,12 @@ impl Parser {
             // type specifier was found, the type defaults to int.
             // E.g., "static x = 5;" means "static int x = 5;",
             //       "register y;" means "register int y;".
+            // C23 6.7.10: `auto` with no type specifier infers the type from
+            // the initializer, exactly as GNU `__auto_type` (arrays and
+            // functions decay). Before C23 it is implicit int.
+            if saw_auto && self.c23 {
+                return Some(TypeSpecifier::AutoType);
+            }
             if any_storage_class {
                 return Some(TypeSpecifier::Int);
             }
@@ -478,8 +500,13 @@ impl Parser {
                         self.advance();
                         flags.has_complex = true;
                     }
-                    TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
-                        self.advance();
+                    // Qualifiers after the base type (`char const c`) are the
+                    // declaration's, exactly as before it.
+                    TokenKind::Const
+                    | TokenKind::Constexpr
+                    | TokenKind::Volatile
+                    | TokenKind::Restrict => {
+                        self.consume_qualifier_after_base();
                     }
                     TokenKind::SegGs => {
                         self.advance();
@@ -545,8 +572,13 @@ impl Parser {
                         self.advance();
                         flags.has_complex = true;
                     }
-                    TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
-                        self.advance();
+                    // Qualifiers after the base type (`char const c`) are the
+                    // declaration's, exactly as before it.
+                    TokenKind::Const
+                    | TokenKind::Constexpr
+                    | TokenKind::Volatile
+                    | TokenKind::Restrict => {
+                        self.consume_qualifier_after_base();
                     }
                     TokenKind::SegGs => {
                         self.advance();
@@ -608,8 +640,13 @@ impl Parser {
                         self.advance();
                         flags.has_complex = true;
                     }
-                    TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
-                        self.advance();
+                    // Qualifiers after the base type (`char const c`) are the
+                    // declaration's, exactly as before it.
+                    TokenKind::Const
+                    | TokenKind::Constexpr
+                    | TokenKind::Volatile
+                    | TokenKind::Restrict => {
+                        self.consume_qualifier_after_base();
                     }
                     TokenKind::SegGs => {
                         self.advance();
@@ -722,19 +759,21 @@ impl Parser {
             if has_unsigned {
                 TypeSpecifier::UnsignedChar
             } else {
-                // C11 6.7.2p5: plain char's signedness is target-defined —
-                // unsigned on AArch64/RISC-V SysV (unsigned char default),
-                // signed on x86. Resolving at the parse boundary makes
-                // TypeSpecifier::Char mean ONLY explicit `signed char`
-                // everywhere downstream (sema, IR lowering, typeof and
-                // typedef round-trips), so no later layer needs the flag.
-                if !has_signed && crate::common::types::char_is_unsigned() {
-                    // plain `char` on an unsigned-char target
-                    TypeSpecifier::UnsignedChar
-                } else {
-                    // `signed char` (explicit), or plain char on a
-                    // signed-char target
-                    TypeSpecifier::Char
+                // C11 6.7.2p5 + 6.2.5p15: plain char's signedness is
+                // target-defined (unsigned on AArch64/RISC-V SysV, signed on
+                // x86), yet char, signed char and unsigned char are three
+                // distinct types. Resolve the representation here so no later
+                // layer needs the flag; the alias variants carry identity.
+                let unsigned_target = crate::common::types::char_is_unsigned();
+                match (has_signed, unsigned_target) {
+                    // plain `char`, unsigned target: unsigned layout, plain identity
+                    (false, true) => TypeSpecifier::PlainUnsignedChar,
+                    // plain `char`, signed target
+                    (false, false) => TypeSpecifier::Char,
+                    // explicit `signed char`, signed target: distinct from plain
+                    (true, false) => TypeSpecifier::SignedChar,
+                    // explicit `signed char`, unsigned target
+                    (true, true) => TypeSpecifier::Char,
                 }
             }
         } else if has_short {
@@ -919,6 +958,7 @@ impl Parser {
         };
         let (packed2, _, _, _, _) = self.parse_gcc_attributes();
         is_packed = is_packed || packed2;
+        let underlying = self.parse_enum_underlying_type();
         let variants = if matches!(self.peek(), TokenKind::LBrace) {
             let v = self.parse_enum_variants();
             // Register enum constant values so that later constant expressions
@@ -930,7 +970,34 @@ impl Parser {
         };
         let (packed3, _, _, _, _) = self.parse_gcc_attributes();
         is_packed = is_packed || packed3;
-        TypeSpecifier::Enum(name, variants, is_packed)
+        TypeSpecifier::Enum(name, variants, is_packed, underlying)
+    }
+
+    /// C23 6.7.2.2: the optional `: specifier-qualifier-list` naming an
+    /// enum's fixed underlying type. A `:` not followed by a type specifier
+    /// is a bit-field width (`struct S { enum E : 3; };`) and is left alone.
+    /// The type may only accompany a definition or stand alone (`enum E :
+    /// int;`); validity of the type itself is sema's (GCC 16.2 wording).
+    fn parse_enum_underlying_type(&mut self) -> Option<Box<TypeSpecifier>> {
+        if !matches!(self.peek(), TokenKind::Colon) {
+            return None;
+        }
+        let colon = self.pos;
+        let span = self.peek_span();
+        self.advance();
+        if !self.is_type_specifier() {
+            self.pos = colon;
+            return None;
+        }
+        // The list's qualifiers and specifiers are its own, not those of the
+        // declaration the enum specifier sits in.
+        let enclosing = self.attrs.flags;
+        let underlying = self.parse_type_specifier();
+        self.attrs.flags = enclosing;
+        if !matches!(self.peek(), TokenKind::LBrace | TokenKind::Semicolon) {
+            self.emit_error("'enum' underlying type may not be specified here", span);
+        }
+        underlying.map(Box::new)
     }
 
     /// Parse typeof(expr) or typeof(type-name).
@@ -972,6 +1039,25 @@ impl Parser {
 
     /// Consume trailing qualifiers and _Complex that may follow a resolved base type.
     /// C allows "int static x;" and "double _Complex".
+    /// A `const`, `constexpr`, `volatile` or `restrict` after a base type
+    /// specifier. An `auto` before it is a storage class by now, so a
+    /// `constexpr` here is the later of the two (GCC 16.2 diagnostic order).
+    fn consume_qualifier_after_base(&mut self) {
+        match self.peek() {
+            TokenKind::Const => self.attrs.set_const(true),
+            TokenKind::Volatile => self.attrs.set_volatile(true),
+            TokenKind::Constexpr => {
+                self.attrs.set_const(true);
+                self.attrs.set_constexpr(true);
+                if self.attrs.parsing_nested_fn() {
+                    self.attrs.mark_constexpr_last();
+                }
+            }
+            _ => {}
+        }
+        self.advance();
+    }
+
     fn consume_trailing_qualifiers(&mut self, mut base: TypeSpecifier) -> TypeSpecifier {
         loop {
             match self.peek() {
@@ -984,8 +1070,13 @@ impl Parser {
                         _ => TypeSpecifier::ComplexDouble,
                     };
                 }
-                TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
-                    self.advance();
+                // Qualifiers after the base type (`char const c`) are the
+                // declaration's, exactly as before it.
+                TokenKind::Const
+                | TokenKind::Constexpr
+                | TokenKind::Volatile
+                | TokenKind::Restrict => {
+                    self.consume_qualifier_after_base();
                 }
                 TokenKind::Static => {
                     self.advance();
@@ -1075,23 +1166,21 @@ impl Parser {
                 continue;
             }
             // C11 6.7.2.1: _Static_assert is allowed as a struct-declaration.
-            // Struct members carry no AST slot for assertions; the parse-time
-            // fast-path decides literal conditions, and tag-dependent
-            // conditions stay accepted (the enclosing struct's own layout is
-            // still being built here, so there is no sema state to defer to).
+            // Struct members carry no AST slot for assertions, so the
+            // assertion is queued and emitted after the enclosing item, where
+            // sema decides it like any other.
             if matches!(self.peek(), TokenKind::StaticAssert) {
-                if let Some(deferred) = self.parse_static_assert() {
-                    // Speculative parses (nested-function and cast lookahead)
-                    // can parse one member list twice inside an item; the
-                    // queue drains only between items, so the span identifies
-                    // a re-parse exactly.
-                    if !self
-                        .deferred_static_asserts
-                        .iter()
-                        .any(|queued| queued.span == deferred.span)
-                    {
-                        self.deferred_static_asserts.push(deferred);
-                    }
+                let deferred = self.parse_static_assert();
+                // Speculative parses (nested-function and cast lookahead)
+                // can parse one member list twice inside an item; the
+                // queue drains only between items, so the span identifies
+                // a re-parse exactly.
+                if !self
+                    .deferred_static_asserts
+                    .iter()
+                    .any(|queued| queued.span == deferred.span)
+                {
+                    self.deferred_static_asserts.push(deferred);
                 }
                 continue;
             }
@@ -1328,7 +1417,10 @@ impl Parser {
     fn consume_struct_field_qualifiers(&mut self, alignas: &mut Option<usize>) {
         loop {
             match self.peek() {
-                TokenKind::Const | TokenKind::Volatile | TokenKind::Restrict => {
+                TokenKind::Const
+                | TokenKind::Constexpr
+                | TokenKind::Volatile
+                | TokenKind::Restrict => {
                     self.advance();
                 }
                 TokenKind::SegGs => {
@@ -1454,6 +1546,7 @@ impl Parser {
         while !matches!(self.peek(), TokenKind::RBrace | TokenKind::Eof) {
             if let TokenKind::Identifier(name) = self.peek() {
                 let name = name.clone();
+                let span = self.peek_span();
                 self.advance();
                 // Enumerator attributes belong to this enumerator, not the
                 // enclosing declaration. Consume them before looking for `=`;
@@ -1474,7 +1567,7 @@ impl Parser {
                 } else {
                     None
                 };
-                variants.push(EnumVariant { name, value });
+                variants.push(EnumVariant { name, value, span });
                 self.consume_if(&TokenKind::Comma);
             } else {
                 self.advance();
@@ -1881,6 +1974,20 @@ impl Parser {
                 }
             } else {
                 self.pos = save;
+                // Not a parenthesized declarator, so the function abstract
+                // declarator of `int (void)` (C23 6.7.8), as in
+                // `typeof(int (int))` or a `_Generic` type name. Its
+                // parameter list cannot be an identifier list, so requiring
+                // `)`, `...` or a declaration specifier keeps an expression
+                // like `(T(x))` from being read as a type.
+                self.advance();
+                let is_param_list = matches!(self.peek(), TokenKind::RParen | TokenKind::Ellipsis)
+                    || self.is_type_specifier();
+                self.pos = save;
+                if is_param_list {
+                    let (params, variadic) = self.parse_param_list();
+                    return TypeSpecifier::BareFunction(Box::new(result_type), params, variadic);
+                }
             }
         }
         // Parse trailing array dimensions, collecting them first so we can

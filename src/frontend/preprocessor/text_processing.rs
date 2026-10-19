@@ -5,7 +5,7 @@
 //! balancing checks, and directive line splitting.
 
 use super::pipeline::Preprocessor;
-use super::utils::{copy_literal_bytes_raw, skip_literal_bytes};
+use super::utils::{copy_literal_bytes_raw, is_digit_separator, skip_literal_bytes};
 
 /// Mapping from output line numbers to original source line numbers.
 ///
@@ -148,7 +148,7 @@ impl SpliceState {
             let b = bytes[i];
             match self {
                 Self::Code => match (b, bytes.get(i + 1)) {
-                    (b'"' | b'\'', _) => self = Self::Literal(b),
+                    (b'"' | b'\'', _) if !is_digit_separator(bytes, i) => self = Self::Literal(b),
                     (b'/', Some(b'*')) => {
                         self = Self::BlockComment;
                         i += 1;
@@ -235,7 +235,7 @@ impl Preprocessor {
 
         while i < len {
             match bytes[i] {
-                b'"' | b'\'' => {
+                b'"' | b'\'' if !is_digit_separator(bytes, i) => {
                     i = skip_literal_bytes(bytes, i, bytes[i]);
                 }
                 b'(' => {
@@ -331,7 +331,7 @@ impl Preprocessor {
 
         while i < len {
             match bytes[i] {
-                b'"' | b'\'' => {
+                b'"' | b'\'' if !is_digit_separator(bytes, i) => {
                     // Copy string/char literals verbatim (don't strip comments inside)
                     let old_i = i;
                     let old_result_len = result.len();
@@ -639,7 +639,7 @@ pub(super) fn strip_line_comment(line: &str) -> std::borrow::Cow<'_, str> {
 
     while i < len {
         match bytes[i] {
-            b'"' | b'\'' => {
+            b'"' | b'\'' if !is_digit_separator(bytes, i) => {
                 i = skip_literal_bytes(bytes, i, bytes[i]);
             }
             b'/' if i + 1 < len && bytes[i + 1] == b'/' => {

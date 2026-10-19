@@ -436,6 +436,10 @@ pub mod decl_flag {
     /// The POINTER itself is const (`T *const p`), as opposed to `CONST`
     /// which describes the pointee for pointer declarators.
     pub const POINTER_CONST: u16 = 1 << 9;
+    /// C23 `constexpr` storage-class specifier (6.7.1).
+    pub const CONSTEXPR: u16 = 1 << 10;
+    /// `constexpr` came after `_Thread_local` or `auto` (diagnostic order).
+    pub const CONSTEXPR_LAST: u16 = 1 << 11;
 }
 
 /// A variable/type declaration.
@@ -547,6 +551,24 @@ impl Declaration {
     #[inline]
     pub fn set_pointer_const(&mut self, v: bool) {
         self.set_flag(decl_flag::POINTER_CONST, v)
+    }
+    #[inline]
+    pub fn set_constexpr(&mut self, v: bool) {
+        self.set_flag(decl_flag::CONSTEXPR, v)
+    }
+    /// C23 `constexpr`: a named constant (6.7.1p5-p6, 6.6p7-p8).
+    #[inline]
+    pub fn is_constexpr(&self) -> bool {
+        self.flags & decl_flag::CONSTEXPR != 0
+    }
+    #[inline]
+    pub fn set_constexpr_last(&mut self, v: bool) {
+        self.set_flag(decl_flag::CONSTEXPR_LAST, v)
+    }
+    /// `constexpr` followed `_Thread_local` or `auto` in the specifiers.
+    #[inline]
+    pub fn is_constexpr_last(&self) -> bool {
+        self.flags & decl_flag::CONSTEXPR_LAST != 0
     }
     /// True for `T *const p`: the pointer object itself is read-only.
     #[inline]
@@ -691,6 +713,12 @@ pub struct DeclAttributes {
     /// declarator has no derivations. A typedef recorded with this flag makes
     /// each object declared through it volatile, as its written text would.
     pub object_volatile: bool,
+    /// Whether the declared object is itself `restrict`- or `_Atomic`-
+    /// qualified, by the same rule as `object_volatile` (an array's object
+    /// qualifier is its elements'). Atomic-ness through a typedef name is not
+    /// tracked.
+    pub object_restrict: bool,
+    pub object_atomic: bool,
     /// Whether the declaration's specifiers are `volatile`-qualified (the base
     /// qualifier, not the declarator's own). A typedef recorded with this flag
     /// qualifies each use of the name (see `Parser::typedef_base_volatile`).
@@ -1129,7 +1157,13 @@ pub enum Designator {
 #[derive(Debug, Clone)]
 pub enum TypeSpecifier {
     Void,
+    /// Signed 8-bit char; see `CType::Char` (plain on signed-char targets,
+    /// explicit `signed char` on unsigned-char targets).
     Char,
+    /// Explicit `signed char` on signed-char targets (`CType::SChar`).
+    SignedChar,
+    /// Plain `char` on unsigned-char targets (`CType::PlainUChar`).
+    PlainUnsignedChar,
     Short,
     Int,
     Long,
@@ -1178,8 +1212,13 @@ pub enum TypeSpecifier {
         Option<usize>,
         Option<bool>,
     ),
-    /// Enum: (name, variants, is_packed)
-    Enum(Option<String>, Option<Vec<EnumVariant>>, bool),
+    /// Enum: (name, variants, is_packed, C23 fixed underlying type `: T`)
+    Enum(
+        Option<String>,
+        Option<Vec<EnumVariant>>,
+        bool,
+        Option<Box<TypeSpecifier>>,
+    ),
     TypedefName(String),
     Pointer(Box<TypeSpecifier>, AddressSpace),
     Array(Box<TypeSpecifier>, Option<Box<Expr>>),
@@ -1198,6 +1237,8 @@ pub enum TypeSpecifier {
     TypeofType(Box<TypeSpecifier>),
     /// __auto_type - GCC extension: type inferred from initializer expression
     AutoType,
+    /// C23 `nullptr_t`, produced by `typeof(nullptr)` round-trips.
+    NullPtrT,
     /// __attribute__((vector_size(N))) applied directly in cast/compound-literal/sizeof.
     /// Wraps the base element type and total vector size in bytes.
     /// E.g., `(__attribute__((vector_size(16))) float){...}` becomes Vector(Float, 16).
@@ -1239,6 +1280,8 @@ pub struct StructFieldDecl {
 pub struct EnumVariant {
     pub name: String,
     pub value: Option<Box<Expr>>,
+    /// The enumerator's identifier.
+    pub span: Span,
 }
 
 /// A compound statement (block).
@@ -1416,6 +1459,9 @@ pub struct CastQualifiers {
     /// A `const` or `volatile` appears before the type's first top-level `*`
     /// (`(const void *)0`). The null-pointer-constant rule excludes these.
     pub pointee_qualified: bool,
+    /// A `const` appears before the type's first top-level `*`: the base
+    /// type is const (`(const char *)s`). See `common::qualifiers`.
+    pub base_const: bool,
     /// The type is a single-level pointer whose pointee is `volatile`
     /// (`(volatile u32 *)addr`, the MMIO idiom): `*cast` is a volatile access.
     pub pointee_volatile: bool,
@@ -1495,6 +1541,12 @@ pub enum Expr {
     Deref(Box<Expr>, Span),
     /// _Generic(controlling_expr, type1: expr1, type2: expr2, ..., default: exprN)
     GenericSelection(Box<Expr>, Vec<GenericAssociation>, Span),
+    /// A type name as the controlling operand of `_Generic` (C2y N3260,
+    /// accepted by GCC 16.2 and Clang 23.1.3 in C23 mode). It is never
+    /// evaluated and, unlike an expression operand, undergoes no lvalue
+    /// conversion: `_Generic(const int, const int: 1)` selects 1. The flag is
+    /// the association-style constness (`GenericAssociation::is_const`).
+    TypeOperand(Box<TypeSpecifier>, bool, Span),
     /// GCC extension: &&label (address of label, for computed goto)
     LabelAddr(String, Span),
     /// GCC extension: __builtin_types_compatible_p(type1, type2).
@@ -1627,6 +1679,7 @@ impl TypeSpecifier {
         match self {
             TypeSpecifier::Void
             | TypeSpecifier::Char
+            | TypeSpecifier::SignedChar
             | TypeSpecifier::Short
             | TypeSpecifier::Int
             | TypeSpecifier::Long
@@ -1641,6 +1694,7 @@ impl TypeSpecifier {
             | TypeSpecifier::Signed
             | TypeSpecifier::Unsigned
             | TypeSpecifier::UnsignedChar
+            | TypeSpecifier::PlainUnsignedChar
             | TypeSpecifier::UnsignedShort
             | TypeSpecifier::UnsignedInt
             | TypeSpecifier::UnsignedLong
@@ -1653,9 +1707,11 @@ impl TypeSpecifier {
             | TypeSpecifier::ComplexLongDouble
             | TypeSpecifier::TypedefName(_)
             | TypeSpecifier::AutoType
+            | TypeSpecifier::NullPtrT
             | TypeSpecifier::Struct(_, None, ..)
             | TypeSpecifier::Union(_, None, ..)
-            | TypeSpecifier::Enum(_, None, _) => {}
+            | TypeSpecifier::Enum(_, None, _, None) => {}
+            TypeSpecifier::Enum(_, None, _, Some(underlying)) => underlying.for_each_expr(f),
             TypeSpecifier::Struct(_, Some(fields), ..)
             | TypeSpecifier::Union(_, Some(fields), ..) => {
                 for field in fields {
@@ -1668,7 +1724,10 @@ impl TypeSpecifier {
                     }
                 }
             }
-            TypeSpecifier::Enum(_, Some(variants), _) => {
+            TypeSpecifier::Enum(_, Some(variants), _, underlying) => {
+                if let Some(underlying) = underlying {
+                    underlying.for_each_expr(f);
+                }
                 for value in variants.iter().filter_map(|v| v.value.as_deref()) {
                     f(value);
                 }
@@ -1783,6 +1842,7 @@ impl Expr {
             | Expr::StmtExpr(..)
             | Expr::Alignof(..)
             | Expr::GnuAlignof(..)
+            | Expr::TypeOperand(..)
             | Expr::LabelAddr(..)
             | Expr::BuiltinTypesCompatibleP(..) => {}
             Expr::BinaryOp(_, lhs, rhs, _)
@@ -1851,6 +1911,7 @@ impl Expr {
                 f(first);
                 f(second);
             }
+            Expr::TypeOperand(ts, _, _) => f(ts),
             Expr::GenericSelection(_, associations, _) => {
                 associations
                     .iter()
@@ -1972,6 +2033,7 @@ impl Expr {
             | Expr::AddressOf(_, s)
             | Expr::Deref(_, s)
             | Expr::GenericSelection(_, _, s)
+            | Expr::TypeOperand(_, _, s)
             | Expr::LabelAddr(_, s)
             | Expr::BuiltinTypesCompatibleP(_, _, _, _, s) => *s,
         }

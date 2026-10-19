@@ -2506,14 +2506,16 @@ impl Lowerer {
             CType::LongDouble => ("__extendxftf2", IrType::F128, None),
             CType::Bool
             | CType::Char
+            | CType::SChar
             | CType::UChar
+            | CType::PlainUChar
             | CType::Short
             | CType::UShort
             | CType::Int
             | CType::UInt => {
                 let signed = matches!(
                     from_ct,
-                    CType::Bool | CType::Char | CType::Short | CType::Int
+                    CType::Bool | CType::Char | CType::SChar | CType::Short | CType::Int
                 );
                 (
                     if signed {
@@ -2592,12 +2594,17 @@ impl Lowerer {
             // An enum converts as its compatible integer type.
             CType::Enum(e) => return self.convert_from_f128(val, &e.compatible_ctype()),
             CType::Char
+            | CType::SChar
             | CType::UChar
+            | CType::PlainUChar
             | CType::Short
             | CType::UShort
             | CType::Int
             | CType::UInt => {
-                let signed = matches!(to_ct, CType::Char | CType::Short | CType::Int);
+                let signed = matches!(
+                    to_ct,
+                    CType::Char | CType::SChar | CType::Short | CType::Int
+                );
                 (
                     if signed { "__fixtfsi" } else { "__fixunstfsi" },
                     IrType::I32,
@@ -2826,16 +2833,37 @@ impl Lowerer {
     /// Collect enum constants from a type specifier.
     fn collect_enum_constants_impl(&mut self, ts: &TypeSpecifier, scoped: bool) {
         match ts {
-            TypeSpecifier::Enum(name, Some(variants), is_packed) => {
+            TypeSpecifier::Enum(name, Some(variants), is_packed, underlying) => {
+                // Sema verified the fixed type and every value; this mirrors
+                // its registration (`process_enum_variants`).
+                let fixed = underlying.as_deref().and_then(|u| {
+                    crate::common::types::EnumType::fixed_underlying(self.type_spec_to_ctype(u))
+                });
+                let fixed_enum = fixed.as_ref().map(|f| {
+                    CType::Enum(crate::common::types::EnumType {
+                        name: name.clone(),
+                        variants: Vec::new(),
+                        is_packed: *is_packed,
+                        fixed: Some(Box::new(f.clone())),
+                    })
+                });
                 let mut next_val: i64 = 0;
                 let mut variant_values = Vec::new();
                 for variant in variants {
                     if let Some(v) = self.enum_variant_value(variant) {
                         next_val = v;
                     }
-                    // Provisional type inside the body; retyped on completion.
-                    let constant =
-                        crate::frontend::sema::type_context::EnumConstant::provisional(next_val);
+                    // Provisional type inside the body (with a fixed type, the
+                    // enumerated type); retyped on completion.
+                    let constant = match &fixed_enum {
+                        Some(ty) => crate::frontend::sema::type_context::EnumConstant {
+                            value: next_val,
+                            ty: ty.clone(),
+                        },
+                        None => {
+                            crate::frontend::sema::type_context::EnumConstant::provisional(next_val)
+                        }
+                    };
                     if scoped {
                         self.insert_enum_scoped(variant.name.clone(), constant);
                     } else {
@@ -2844,12 +2872,13 @@ impl Lowerer {
                             .insert(variant.name.clone(), constant);
                     }
                     variant_values.push((variant.name.clone(), next_val));
-                    next_val += 1;
+                    next_val = next_val.wrapping_add(1);
                 }
                 let enum_type = crate::common::types::EnumType {
                     name: name.clone(),
                     variants: variant_values,
                     is_packed: *is_packed,
+                    fixed: fixed.map(Box::new),
                 };
                 self.types.complete_enum_constants(&enum_type, scoped);
                 // Keep completed definitions available for later body-less
@@ -2858,6 +2887,23 @@ impl Lowerer {
                 // type context tracks tag shadowing on its lexical scope stack.
                 if let Some(tag) = name {
                     self.types.insert_enum_type_scoped(tag.clone(), enum_type);
+                }
+            }
+            // C23 `enum E : T;` declares the tag, complete with its fixed type.
+            TypeSpecifier::Enum(Some(tag), None, is_packed, Some(underlying)) => {
+                let fixed = crate::common::types::EnumType::fixed_underlying(
+                    self.type_spec_to_ctype(underlying),
+                );
+                if fixed.is_some() && self.types.enum_type_in_current_scope(tag).is_none() {
+                    self.types.insert_enum_type_scoped(
+                        tag.clone(),
+                        crate::common::types::EnumType {
+                            name: Some(tag.clone()),
+                            variants: Vec::new(),
+                            is_packed: *is_packed,
+                            fixed: fixed.map(Box::new),
+                        },
+                    );
                 }
             }
             TypeSpecifier::Struct(_, Some(fields), ..)
@@ -3831,7 +3877,7 @@ impl Lowerer {
 fn stmt_defines_type_name_enum(stmt: &Stmt) -> bool {
     fn defines_enum(ts: &TypeSpecifier) -> bool {
         match ts {
-            TypeSpecifier::Enum(_, Some(_), _) => true,
+            TypeSpecifier::Enum(_, Some(_), ..) => true,
             TypeSpecifier::Struct(_, Some(fields), ..)
             | TypeSpecifier::Union(_, Some(fields), ..) => {
                 fields.iter().any(|field| defines_enum(&field.type_spec))

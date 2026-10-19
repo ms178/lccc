@@ -450,7 +450,10 @@ impl Lowerer {
                 let inner_offset = elem_offset + inner_idx * inner_elem_size;
                 if let Initializer::Expr(e) = &item.init {
                     if let Expr::StringLiteral(s, _) = e {
-                        if matches!(inner_elem_ty.as_ref(), CType::Char | CType::UChar) {
+                        if matches!(
+                            inner_elem_ty.as_ref(),
+                            CType::Char | CType::SChar | CType::UChar | CType::PlainUChar
+                        ) {
                             let max_bytes = (*inner_size - inner_idx) * inner_elem_size;
                             self.emit_string_to_alloca(base_alloca, s, inner_offset, max_bytes);
                             return;
@@ -476,7 +479,10 @@ impl Lowerer {
                 // Check for string literal targeting a char sub-array
                 if let Expr::StringLiteral(s, _) = e {
                     if let CType::Array(inner, Some(arr_size)) = elem_ty {
-                        if matches!(inner.as_ref(), CType::Char | CType::UChar) {
+                        if matches!(
+                            inner.as_ref(),
+                            CType::Char | CType::SChar | CType::UChar | CType::PlainUChar
+                        ) {
                             self.emit_string_to_alloca(base_alloca, s, elem_offset, *arr_size);
                             return;
                         }
@@ -679,7 +685,10 @@ impl Lowerer {
         // Check for brace-wrapped string literal: {"hello"} for char[]
         if sub_items.len() == 1 && sub_items[0].designators.is_empty() {
             if let Initializer::Expr(Expr::StringLiteral(s, _)) = &sub_items[0].init {
-                if matches!(elem_ty, CType::Char | CType::UChar) {
+                if matches!(
+                    elem_ty,
+                    CType::Char | CType::SChar | CType::UChar | CType::PlainUChar
+                ) {
                     self.emit_string_to_alloca(base_alloca, s, field_offset, arr_size * elem_size);
                     return;
                 }
@@ -889,7 +898,10 @@ impl Lowerer {
                     // into the array memory instead of storing a pointer.
                     if let Expr::StringLiteral(s, _) = e {
                         if let CType::Array(inner, Some(sub_arr_size)) = elem_ty {
-                            if matches!(inner.as_ref(), CType::Char | CType::UChar) {
+                            if matches!(
+                                inner.as_ref(),
+                                CType::Char | CType::SChar | CType::UChar | CType::PlainUChar
+                            ) {
                                 self.emit_string_to_alloca(
                                     base_alloca,
                                     s,
@@ -920,7 +932,10 @@ impl Lowerer {
                                     {
                                         if matches!(
                                             inner_inner.as_ref(),
-                                            CType::Char | CType::UChar
+                                            CType::Char
+                                                | CType::SChar
+                                                | CType::UChar
+                                                | CType::PlainUChar
                                         ) {
                                             self.emit_string_to_alloca(
                                                 base_alloca,
@@ -969,7 +984,10 @@ impl Lowerer {
     ) {
         // String literal for char array field
         if let Expr::StringLiteral(s, _) = e {
-            if matches!(elem_ty, CType::Char | CType::UChar) {
+            if matches!(
+                elem_ty,
+                CType::Char | CType::SChar | CType::UChar | CType::PlainUChar
+            ) {
                 self.emit_string_to_alloca(base_alloca, s, field_offset, arr_size * elem_size);
                 *item_idx += 1;
                 return;

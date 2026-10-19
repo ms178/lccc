@@ -1,4 +1,4 @@
-use super::token::{Token, TokenKind};
+use super::token::{Token, TokenKind, UnicodeCharKind};
 use crate::common::encoding::decode_pua_byte;
 use crate::common::source::Span;
 
@@ -8,6 +8,8 @@ pub struct Lexer {
     pos: usize,
     file_id: u32,
     gnu_extensions: bool,
+    /// C23 dialect: C23 keywords and digit separators (`1'000`).
+    c23: bool,
     at_line_start: bool,
     ident_pool: std::collections::HashMap<Vec<u8>, String>,
     pub diagnostics: Vec<(String, crate::common::source::Span)>,
@@ -20,6 +22,7 @@ impl Lexer {
             pos: 0,
             file_id,
             gnu_extensions: true,
+            c23: false,
             at_line_start: true,
             ident_pool: std::collections::HashMap::with_capacity(512),
             diagnostics: Vec::new(),
@@ -28,6 +31,11 @@ impl Lexer {
 
     pub fn set_gnu_extensions(&mut self, enabled: bool) {
         self.gnu_extensions = enabled;
+    }
+
+    /// Select the C23 dialect (keywords and digit separators).
+    pub fn set_c23(&mut self, enabled: bool) {
+        self.c23 = enabled;
     }
 
     fn intern_ident(&mut self, bytes: &[u8]) -> String {
@@ -218,6 +226,11 @@ impl Lexer {
     }
 
     fn lex_number(&mut self, start: usize) -> Token {
+        if self.c23 {
+            if let Some(tok) = self.lex_number_with_separators(start) {
+                return tok;
+            }
+        }
         if self.pos + 1 < self.input.len()
             && self.input[self.pos] == b'0'
             && (self.input[self.pos + 1] == b'x' || self.input[self.pos + 1] == b'X')
@@ -237,6 +250,88 @@ impl Lexer {
         }
 
         self.lex_decimal_number(start)
+    }
+
+    /// C23 6.4.4.1/6.4.4.2: a `'` between two digits of a numeric constant is
+    /// a digit separator with no effect on its value. When the pp-number at
+    /// `self.pos` contains one, the constant is lexed from its separator-free
+    /// spelling by the ordinary scanners and spans the original text. A `'`
+    /// not between two digits (`1''0`, `0x'1`, `1'.5`) is diagnosed, as GCC
+    /// does. Returns `None` when the number has no separator.
+    fn lex_number_with_separators(&mut self, start: usize) -> Option<Token> {
+        let input = &self.input;
+        let mut end = self.pos;
+        let mut has_separator = false;
+        while end < input.len() {
+            let c = input[end];
+            let continues = c.is_ascii_alphanumeric()
+                || c == b'.'
+                || c == b'_'
+                || ((c == b'+' || c == b'-')
+                    && end > self.pos
+                    && matches!(input[end - 1], b'e' | b'E' | b'p' | b'P'))
+                || (c == b'\''
+                    && end > self.pos
+                    && input
+                        .get(end + 1)
+                        .is_some_and(|&n| n.is_ascii_alphanumeric() || n == b'_'));
+            if !continues {
+                break;
+            }
+            has_separator |= c == b'\'';
+            end += 1;
+        }
+        if !has_separator {
+            return None;
+        }
+        let is_hex =
+            input[self.pos] == b'0' && matches!(input.get(self.pos + 1), Some(b'x' | b'X'));
+        let is_digit = |c: u8| {
+            if is_hex {
+                c.is_ascii_hexdigit()
+            } else {
+                c.is_ascii_digit()
+            }
+        };
+        let mut clean = Vec::with_capacity(end - self.pos);
+        let mut misplaced = Vec::new();
+        for k in self.pos..end {
+            let c = input[k];
+            if c == b'\'' {
+                // `0x'1`: the `'` follows the prefix, not a digit.
+                let prev_ok = is_digit(input[k - 1]) && !(is_hex && k == self.pos + 2);
+                if !(prev_ok && is_digit(input[k + 1])) {
+                    misplaced.push(k);
+                }
+            } else {
+                clean.push(c);
+            }
+        }
+        for k in misplaced {
+            self.emit_lex_diag("digit separator outside digit sequence", k, k + 1);
+        }
+        let text = String::from_utf8_lossy(&clean).into_owned();
+        let mut sub = Lexer::new(&text, self.file_id);
+        sub.set_gnu_extensions(self.gnu_extensions);
+        let kind = sub.lex_number(0).kind;
+        if sub.pos != text.len() {
+            self.emit_lex_diag(
+                format!(
+                    "invalid suffix \"{}\" on numeric constant",
+                    &text[sub.pos..]
+                ),
+                start,
+                end,
+            );
+        }
+        for (msg, _) in std::mem::take(&mut sub.diagnostics) {
+            self.emit_lex_diag(msg, start, end);
+        }
+        self.pos = end;
+        Some(Token::new(
+            kind,
+            Span::new(start as u32, end as u32, self.file_id),
+        ))
     }
 
     /// Lex a hexadecimal integer or hex float literal (0x/0X prefix).
@@ -1020,7 +1115,7 @@ impl Lexer {
         )
     }
 
-    fn lex_wide_char(&mut self, start: usize) -> Token {
+    fn lex_wide_char(&mut self, start: usize, kind: Option<UnicodeCharKind>) -> Token {
         self.pos += 1; // skip opening '
         let mut value: u32 = 0;
         if self.pos < self.input.len() && self.input[self.pos] != b'\'' {
@@ -1069,8 +1164,20 @@ impl Lexer {
             self.pos += 1; // skip closing '
         }
         let span = Span::new(start as u32, self.pos as u32, self.file_id);
-        // Wide char literals have type int (wchar_t)
-        Token::new(TokenKind::IntLiteral(value as i64), span)
+        match kind {
+            // The code unit the constant denotes, in its unsigned type.
+            Some(k @ UnicodeCharKind::Utf8) => {
+                Token::new(TokenKind::UnicodeCharLiteral(value & 0xff, k), span)
+            }
+            Some(k @ UnicodeCharKind::Utf16) => {
+                Token::new(TokenKind::UnicodeCharLiteral(value & 0xffff, k), span)
+            }
+            Some(k @ UnicodeCharKind::Utf32) => {
+                Token::new(TokenKind::UnicodeCharLiteral(value, k), span)
+            }
+            // L'x' has type wchar_t = int.
+            None => Token::new(TokenKind::IntLiteral(value as i64), span),
+        }
     }
 
     fn lex_char(&mut self, start: usize) -> Token {
@@ -1242,7 +1349,13 @@ impl Lexer {
                 if is_wide_prefix {
                     if next == b'\'' {
                         // Wide/unicode char literal: value is the Unicode code point
-                        return self.lex_wide_char(start);
+                        let kind = match prefix {
+                            b"u8" => Some(UnicodeCharKind::Utf8),
+                            b"u" => Some(UnicodeCharKind::Utf16),
+                            b"U" => Some(UnicodeCharKind::Utf32),
+                            _ => None, // L'x': wchar_t, which is int on every target here
+                        };
+                        return self.lex_wide_char(start, kind);
                     } else {
                         // Wide/unicode string literal: L"...", u"...", U"...", u8"..."
                         let is_wide_32 = text_len == 1 && (prefix[0] == b'L' || prefix[0] == b'U');
@@ -1274,7 +1387,7 @@ impl Lexer {
             return Token::new(vis_tok, span);
         }
 
-        if let Some(kw) = TokenKind::from_keyword(text, self.gnu_extensions) {
+        if let Some(kw) = TokenKind::from_keyword(text, self.gnu_extensions, self.c23) {
             Token::new(kw, span)
         } else {
             let bytes = self.input[start..self.pos].to_vec();

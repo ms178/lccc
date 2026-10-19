@@ -722,138 +722,19 @@ impl Lowerer {
         self.lower_expr(selected)
     }
 
-    /// Resolve a _Generic selection to the matching association expression.
-    /// Used by both lower_generic_selection (rvalue) and lower_lvalue (lvalue context).
+    /// Resolve a _Generic selection to the matching association expression,
+    /// for rvalue (`lower_generic_selection`) and lvalue (`lower_lvalue`)
+    /// contexts: the one selection rule of `resolve_generic_selection_expr`,
+    /// so a selection's value and its type always agree. Sema rejects a
+    /// selection that matches nothing, so the first association is only a
+    /// recovery value after that error.
     pub(super) fn resolve_generic_selection<'a>(
         &mut self,
         controlling: &Expr,
         associations: &'a [GenericAssociation],
     ) -> &'a Expr {
-        let controlling_ctype = self.get_expr_ctype(controlling);
-        let controlling_ir_type = self.get_expr_type(controlling);
-        // Per C11 6.5.1.1p2, the controlling expression undergoes lvalue
-        // conversion, which includes array-to-pointer and function-to-pointer
-        // decay, and strips top-level qualifiers.
-        let controlling_ctype = controlling_ctype.map(|ct| ct.decayed_value_ctype());
-        // Determine if the controlling expression's type has a const-qualified pointee.
-        // Lvalue conversion strips top-level qualifiers. So for non-pointer types like
-        // `const int x`, the type becomes `int` (ctrl_is_const = false).
-        // For pointer types like `const int *p`, lvalue conversion strips the top-level
-        // pointer const but preserves the pointee const, so ctrl_is_const reflects
-        // whether the pointee is const.
-        let ctrl_is_const = if let Some(ref ct) = controlling_ctype {
-            matches!(ct, CType::Pointer(_, _)) && self.expr_is_const_qualified(controlling)
-        } else {
-            false
-        };
-
-        // Check if const-aware matching is needed. This is the case when:
-        // (a) associations differ in const-ness (some have is_const=true, others false), OR
-        // (b) the controlling expression is a pointer with const pointee (ctrl_is_const=true),
-        //     which means non-const pointer associations should not match.
-        let has_const_differentiated_assocs = {
-            let non_default: Vec<_> = associations
-                .iter()
-                .filter(|a| a.type_spec.is_some())
-                .collect();
-            let assocs_differ =
-                non_default.iter().any(|a| a.is_const) && non_default.iter().any(|a| !a.is_const);
-            assocs_differ || ctrl_is_const
-        };
-
-        let mut default_expr: Option<&Expr> = None;
-        let mut matched_expr: Option<&Expr> = None;
-
-        for assoc in associations {
-            match &assoc.type_spec {
-                None => {
-                    default_expr = Some(&assoc.expr);
-                }
-                Some(type_spec) => {
-                    let assoc_ctype = self.type_spec_to_ctype(type_spec);
-                    if let Some(ref ctrl_ct) = controlling_ctype {
-                        if self.ctype_matches_generic(ctrl_ct, &assoc_ctype) {
-                            // When const-aware matching is active, also check
-                            // that the const qualification matches.
-                            if has_const_differentiated_assocs && assoc.is_const != ctrl_is_const {
-                                continue;
-                            }
-                            matched_expr = Some(&assoc.expr);
-                            break;
-                        }
-                    } else {
-                        let assoc_ir_type = self.type_spec_to_ir(type_spec);
-                        if assoc_ir_type == controlling_ir_type {
-                            if has_const_differentiated_assocs && assoc.is_const != ctrl_is_const {
-                                continue;
-                            }
-                            matched_expr = Some(&assoc.expr);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        matched_expr
-            .or(default_expr)
+        self.resolve_generic_selection_expr(controlling, associations)
             .unwrap_or(&associations[0].expr)
-    }
-
-    pub(super) fn ctype_matches_generic(&self, controlling: &CType, assoc: &CType) -> bool {
-        // Per C11 6.5.1.1p2, the controlling expression undergoes lvalue conversion,
-        // which includes array-to-pointer decay.
-        // Const/volatile qualification is checked separately via is_const flags.
-
-        // Exact structural match (same discriminant)
-        if std::mem::discriminant(controlling) == std::mem::discriminant(assoc) {
-            match (controlling, assoc) {
-                (CType::Pointer(a, _), CType::Pointer(b, _)) => {
-                    return self.ctype_matches_generic(a, b);
-                }
-                (CType::Array(a, _), CType::Array(b, _)) => {
-                    return self.ctype_matches_generic(a, b);
-                }
-                // For types that carry identity data (Struct, Union, Enum, Function,
-                // Vector), we must compare the full type, not just the discriminant.
-                // Primitive types (Int, Float, etc.) have no data so PartialEq works too.
-                _ => return controlling == assoc,
-            }
-        }
-        // Array decays to pointer for _Generic matching
-        if let CType::Array(elem, _) = controlling {
-            if let CType::Pointer(pointee, _) = assoc {
-                return self.ctype_matches_generic(elem, pointee);
-            }
-        }
-        // Enum matches int
-        if matches!(controlling, CType::Enum(_)) && matches!(assoc, CType::Int) {
-            return true;
-        }
-        if matches!(controlling, CType::Int) && matches!(assoc, CType::Enum(_)) {
-            return true;
-        }
-        false
-    }
-
-    /// Check if an expression's type is const-qualified (for _Generic matching).
-    /// Handles local variable identifiers, address-of, and comma expressions.
-    pub(super) fn expr_is_const_qualified(&self, expr: &Expr) -> bool {
-        match expr {
-            Expr::Identifier(name, _) => {
-                if let Some(ref fs) = self.func_state {
-                    if let Some(info) = fs.locals.get(name) {
-                        return info.is_const;
-                    }
-                }
-                false
-            }
-            // Address-of: &y where y is `const int` produces `const int *`.
-            Expr::AddressOf(inner, _) => self.expr_is_const_qualified(inner),
-            // Comma: const-ness comes from the right-hand operand.
-            Expr::Comma(_, rhs, _) => self.expr_is_const_qualified(rhs),
-            _ => false,
-        }
     }
 
     // -----------------------------------------------------------------------

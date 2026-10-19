@@ -17,6 +17,7 @@
 use super::analysis::FunctionInfo;
 use super::type_context::TypeContext;
 use crate::common::fx_hash::FxHashMap;
+use crate::common::qualifiers;
 use crate::common::symbol_table::SymbolTable;
 use crate::common::types::{AddressSpace, CType, FunctionType};
 use crate::frontend::parser::ast::{
@@ -50,6 +51,23 @@ pub struct ExprTypeChecker<'a> {
     /// The TU is C90/C94: an overflowing signed left shift is still an
     /// integer constant expression (see `ice.rs`).
     pub pre_c99: bool,
+}
+
+impl qualifiers::ConstLookup for ExprTypeChecker<'_> {
+    fn object_const_base(&self, name: &str) -> bool {
+        self.symbols.is_const_base(name)
+    }
+
+    fn typedef_const_base(&self, name: &str) -> bool {
+        self.types.const_base_typedefs.contains(name)
+    }
+
+    fn is_pointer(&self, expr: &Expr) -> bool {
+        matches!(
+            self.infer_expr_ctype(expr),
+            Some(CType::Pointer(..) | CType::Array(..))
+        )
+    }
 }
 
 impl<'a> ExprTypeChecker<'a> {
@@ -129,9 +147,10 @@ impl<'a> ExprTypeChecker<'a> {
             Expr::ImaginaryLiteral(_, _) => Some(CType::ComplexDouble),
             Expr::ImaginaryLiteralF32(_, _) => Some(CType::ComplexFloat),
             Expr::ImaginaryLiteralLongDouble(_, _, _) => Some(CType::ComplexLongDouble),
-            Expr::StringLiteral(_, _) => {
-                Some(CType::Pointer(Box::new(CType::Char), AddressSpace::Default))
-            }
+            Expr::StringLiteral(_, _) => Some(CType::Pointer(
+                Box::new(CType::plain_char()),
+                AddressSpace::Default,
+            )),
             Expr::WideStringLiteral(_, _) => {
                 Some(CType::Pointer(Box::new(CType::Int), AddressSpace::Default))
             }
@@ -149,7 +168,10 @@ impl<'a> ExprTypeChecker<'a> {
                     && self.symbols.lookup(name).is_none()
                 {
                     let text = crate::frontend::parser::ast::function_name_builtin_text(name, None);
-                    return Some(CType::Array(Box::new(CType::Char), Some(text.len() + 1)));
+                    return Some(CType::Array(
+                        Box::new(CType::plain_char()),
+                        Some(text.len() + 1),
+                    ));
                 }
                 // Objects/functions and enumerators share C's ordinary-name
                 // namespace (C11 6.2.3): the innermost visible declaration
@@ -406,6 +428,7 @@ impl<'a> ExprTypeChecker<'a> {
             }
 
             // Label address: void*
+            Expr::TypeOperand(ts, _, _) => Some(self.resolve_type_spec(ts)),
             Expr::LabelAddr(_, _) => {
                 Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
             }
@@ -650,59 +673,34 @@ impl<'a> ExprTypeChecker<'a> {
         controlling: &Expr,
         associations: &[GenericAssociation],
     ) -> Option<usize> {
-        let controlling_ct = self.infer_expr_ctype(controlling);
+        // An expression operand undergoes lvalue conversion; a type operand
+        // (C2y) none. Constness follows the rule lowering shares.
+        let controlling_ct = match controlling {
+            Expr::TypeOperand(ts, ..) => Some(self.resolve_type_spec(ts)),
+            _ => self
+                .infer_expr_ctype(controlling)
+                .map(|ct| ct.decayed_value_ctype()),
+        };
+        let (ctrl_const, compare_const) =
+            qualifiers::controlling_const(controlling, associations, self);
         let mut default_index = None;
         for (index, assoc) in associations.iter().enumerate() {
             match &assoc.type_spec {
                 None => default_index = Some(index),
                 Some(type_spec) => {
                     let assoc_ct = self.resolve_type_spec(type_spec);
-                    if let Some(ref ctrl_ct) = controlling_ct {
-                        if self.ctype_matches_generic(ctrl_ct, &assoc_ct) {
-                            return Some(index);
-                        }
+                    if controlling_ct
+                        .as_ref()
+                        .is_some_and(|ct| ct.generic_association_matches(&assoc_ct))
+                        && (!compare_const
+                            || qualifiers::association_const_base(assoc, self) == ctrl_const)
+                    {
+                        return Some(index);
                     }
                 }
             }
         }
         default_index
-    }
-
-    /// Check if two CTypes match for _Generic selection purposes.
-    /// Uses compatible-type rules: ignores qualifiers, matches arrays with pointers.
-    fn ctype_matches_generic(&self, controlling: &CType, assoc: &CType) -> bool {
-        // Exact match
-        if std::mem::discriminant(controlling) == std::mem::discriminant(assoc) {
-            match (controlling, assoc) {
-                (CType::Pointer(a, _), CType::Pointer(b, _)) => {
-                    return self.ctype_matches_generic(a, b);
-                }
-                (CType::Array(a, _), CType::Array(b, _)) => {
-                    return self.ctype_matches_generic(a, b);
-                }
-                // For types that carry identity data (Struct, Union, Enum, Function,
-                // Vector), we must compare the full type, not just the discriminant.
-                // Primitive types (Int, Float, etc.) have no data so PartialEq works too.
-                _ => return controlling == assoc,
-            }
-        }
-        // Array decays to pointer for _Generic matching
-        if let CType::Array(elem, _) = controlling {
-            if let CType::Pointer(pointee, _) = assoc {
-                return self.ctype_matches_generic(elem, pointee);
-            }
-        }
-        // An enum type is compatible with its compatible integer type
-        // (C11 6.7.2.2p4) and with nothing else; two enums compare by
-        // identity above.
-        match (controlling, assoc) {
-            (CType::Enum(e), other) | (other, CType::Enum(e))
-                if !matches!(other, CType::Enum(_)) =>
-            {
-                e.compatible_ctype() == *other
-            }
-            _ => false,
-        }
     }
 
     /// Resolve a TypeSpecifier to a CType using sema's type context.
@@ -713,7 +711,9 @@ impl<'a> ExprTypeChecker<'a> {
             TypeSpecifier::Void => CType::Void,
             TypeSpecifier::Bool => CType::Bool,
             TypeSpecifier::Char => CType::Char,
+            TypeSpecifier::SignedChar => CType::SChar,
             TypeSpecifier::UnsignedChar => CType::UChar,
+            TypeSpecifier::PlainUnsignedChar => CType::PlainUChar,
             TypeSpecifier::Short => CType::Short,
             TypeSpecifier::UnsignedShort => CType::UShort,
             TypeSpecifier::Int | TypeSpecifier::Signed => CType::Int,
@@ -779,35 +779,20 @@ impl<'a> ExprTypeChecker<'a> {
                     CType::Int // fallback for unknown typedef
                 }
             }
-            TypeSpecifier::Enum(name, variants, is_packed) => {
+            TypeSpecifier::Enum(name, variants, is_packed, underlying) => {
                 // The same enum the analyzer resolves (`resolve_enum`): the
                 // completed definition visible here, or this body's values.
                 // Every integer property of the result (size, signedness,
                 // rank, promotion, `_Generic` match) is that of its
                 // compatible type, so no width rule lives here.
-                let completed = name.as_ref().and_then(|n| self.types.enum_types.get(n));
-                let variants = match variants {
-                    Some(vars) => {
-                        let mut values = Vec::with_capacity(vars.len());
-                        let mut next_val: i64 = 0;
-                        for v in vars {
-                            if let Some(val) =
-                                v.value.as_ref().and_then(|e| self.eval_const_expr(e))
-                            {
-                                next_val = val;
-                            }
-                            values.push((v.name.clone(), next_val));
-                            next_val = next_val.wrapping_add(1);
-                        }
-                        values
-                    }
-                    None => completed.map(|et| et.variants.clone()).unwrap_or_default(),
-                };
-                CType::Enum(crate::common::types::EnumType {
-                    name: name.clone(),
+                CType::Enum(crate::common::type_builder::enum_type_of(
+                    name,
                     variants,
-                    is_packed: *is_packed || completed.is_some_and(|et| et.is_packed),
-                })
+                    *is_packed,
+                    name.as_ref().and_then(|n| self.types.enum_types.get(n)),
+                    underlying.as_deref().map(|u| self.resolve_type_spec(u)),
+                    |v| v.value.as_ref().and_then(|e| self.eval_const_expr(e)),
+                ))
             }
             TypeSpecifier::Struct(
                 tag,
@@ -909,8 +894,38 @@ impl<'a> ExprTypeChecker<'a> {
                     AddressSpace::Default,
                 )
             }
-            // TODO: handle remaining TypeSpecifier variants
-            _ => CType::Int,
+            TypeSpecifier::BareFunction(ret, params, variadic) => {
+                let ret_ct = self.resolve_type_spec(ret);
+                let param_cts: Vec<(CType, Option<String>)> = params
+                    .iter()
+                    .map(|p| {
+                        (
+                            crate::common::type_builder::param_decl_to_ctype_with(
+                                &|ts| self.resolve_type_spec(ts),
+                                p,
+                            ),
+                            p.name.clone(),
+                        )
+                    })
+                    .collect();
+                CType::Function(Box::new(FunctionType {
+                    return_type: ret_ct,
+                    params: param_cts,
+                    variadic: *variadic,
+                }))
+            }
+            TypeSpecifier::ExtVector(elem, lanes) => {
+                let elem_ct = self.resolve_type_spec(elem);
+                match crate::common::types::ExtVectorLayout::new(&elem_ct, *lanes) {
+                    Some(layout) => CType::ExtVector(Box::new(elem_ct), layout),
+                    // Same recovery as `type_builder`: the element type.
+                    None => elem_ct,
+                }
+            }
+            TypeSpecifier::NullPtrT => CType::NullPtr,
+            // `__auto_type`/C23 `auto` is replaced by the initializer's type
+            // before any expression can name it; `type_builder` agrees.
+            TypeSpecifier::AutoType => CType::Int,
         }
     }
 
@@ -940,6 +955,35 @@ impl<'a> ExprTypeChecker<'a> {
     /// structural test of `ice.rs` over this checker's types, enumerators
     /// and required-constant evaluation. The one ICE predicate behind
     /// `__builtin_choose_expr` and the null pointer constant rule.
+    /// Whether `expr` is a named constant (C23 6.6p7) and of which kind: an
+    /// enumeration constant, a `constexpr` object, or a member of one reached
+    /// by `.` (subscripts and `->` are not named constants: GCC 16.2 rejects
+    /// `a[1]` of a `constexpr` array in an ICE).
+    pub(super) fn named_constant(&self, expr: &Expr) -> Option<super::ice::NamedConstant> {
+        use super::ice::NamedConstant;
+        let mut root = expr;
+        while let Expr::MemberAccess(base, _, _) = root {
+            root = base;
+        }
+        let Expr::Identifier(name, _) = root else {
+            return None;
+        };
+        if std::ptr::eq(root, expr) && self.symbols.is_enumerator(name) {
+            return Some(NamedConstant::Integer);
+        }
+        if !self.symbols.is_constexpr(name) {
+            return None;
+        }
+        let ty = self.infer_expr_ctype(expr)?;
+        if ty.is_integer() {
+            Some(NamedConstant::Integer)
+        } else if ty.is_floating() {
+            Some(NamedConstant::Floating)
+        } else {
+            None
+        }
+    }
+
     pub fn is_integer_constant_expr(&self, expr: &Expr) -> bool {
         let evaluator = self.sema_const_eval();
         let eval = |e: &Expr| evaluator.eval_required_constant(e);
@@ -947,13 +991,13 @@ impl<'a> ExprTypeChecker<'a> {
         let select = |controlling: &Expr, associations: &[GenericAssociation]| {
             self.generic_selection_index(controlling, associations)
         };
-        let is_enumerator = |name: &str| self.symbols.is_enumerator(name);
+        let named_constant = |e: &Expr| self.named_constant(e);
         let is_builtin = |name: &str| super::builtins::is_builtin(name);
         super::ice::IceChecker::new(
             &eval,
             &ctype,
             &select,
-            &is_enumerator,
+            &named_constant,
             &is_builtin,
             self.pre_c99,
         )
@@ -969,8 +1013,11 @@ impl<'a> ExprTypeChecker<'a> {
                 .is_some_and(|c| c.is_zero())
     }
 
-    /// Whether `expr` is a null pointer constant (C11 6.3.2.3p3): an integer
-    /// constant expression with the value 0, or one cast to `void *`.
+    /// Whether `expr` is a null pointer constant (C23 6.3.2.3p3): an integer
+    /// constant expression with the value 0, one cast to `void *`, or the
+    /// predefined constant `nullptr` (which the parser spells `(nullptr_t)0`
+    /// through `TypeSpecifier::NullPtrT`, a specifier no source text names;
+    /// a written `(nullptr_t)0` goes through the typedef and is not one).
     ///
     /// Exactness matters beyond diagnostics: the type of `?:` depends on it,
     /// and the kernel's `__is_constexpr(x)` -- `sizeof(int) == sizeof(*(8 ?
@@ -980,7 +1027,9 @@ impl<'a> ExprTypeChecker<'a> {
     /// 0 and took the other `__builtin_choose_expr` arm) and accepts any
     /// cast of 0, `(char *)0` included.
     pub fn is_null_pointer_constant(&self, expr: &Expr) -> bool {
-        self.is_integer_constant_zero(expr) || self.is_void_pointer_null_constant(expr)
+        matches!(expr, Expr::Cast(TypeSpecifier::NullPtrT, ..))
+            || self.is_integer_constant_zero(expr)
+            || self.is_void_pointer_null_constant(expr)
     }
 
     /// The `void *` form of a null pointer constant: an integer constant
@@ -1022,6 +1071,7 @@ impl<'a> ExprTypeChecker<'a> {
             builtin_policy: self.builtin_policy.clone(),
             folding_initializer: false,
             pre_c99: self.pre_c99,
+            named_constants_only: false,
         }
     }
 

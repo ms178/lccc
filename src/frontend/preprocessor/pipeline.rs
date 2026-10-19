@@ -147,6 +147,9 @@ pub struct Preprocessor {
 
 impl Preprocessor {
     pub fn new() -> Self {
+        // A fresh preprocessor starts in the default dialect (gnu17); the
+        // driver selects C23 afterwards via `set_c23`.
+        super::utils::set_c23_dialect(false);
         let mut pp = Self {
             macros: MacroTable::new(),
             conditionals: ConditionalStack::new(),
@@ -1000,6 +1003,14 @@ impl Preprocessor {
         self.macros.asm_mode = asm_mode;
     }
 
+    /// Select C23 preprocessing: `true` and `false` are keywords there, and
+    /// in an `#if` they evaluate to 1 and 0 (C23 6.10.2p6). Before C23 they
+    /// are ordinary identifiers, which evaluate to 0 unless `<stdbool.h>`
+    /// defined them as macros (measured on GCC 16.2 and Clang 23.1.3).
+    pub fn set_c23(&mut self, c23: bool) {
+        super::utils::set_c23_dialect(c23);
+    }
+
     /// Set the filename for __FILE__ and __BASE_FILE__ macros and set as the base include directory.
     pub fn set_filename(&mut self, filename: &str) {
         self.filename = filename.to_string();
@@ -1246,6 +1257,11 @@ impl Preprocessor {
             }
             "elif" => {
                 self.handle_elif(rest, line_num);
+                return None;
+            }
+            // C23 6.10.2; GCC accepts both in every dialect.
+            "elifdef" | "elifndef" => {
+                self.handle_elifdef(rest, keyword == "elifndef");
                 return None;
             }
             "else" => {
@@ -1536,6 +1552,15 @@ impl Preprocessor {
         let final_expr = self.replace_remaining_idents_with_zero(&expanded);
         let condition = evaluate_condition(&final_expr, &self.macros);
         self.conditionals.push_if(condition);
+    }
+
+    /// `#elifdef NAME` / `#elifndef NAME`: an `#elif` whose condition is
+    /// whether NAME is a macro. The name is only consulted when no earlier
+    /// group of the conditional was taken, like `#elif`'s expression.
+    fn handle_elifdef(&mut self, rest: &str, negate: bool) {
+        let name = rest.split_whitespace().next().unwrap_or("");
+        let defined = self.macros.is_defined(name);
+        self.conditionals.handle_elif(defined != negate);
     }
 
     fn handle_elif(&mut self, expr: &str, diag_line: usize) {

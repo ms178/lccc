@@ -411,11 +411,15 @@ impl<'s> StaticInitChecker<'s> {
                         Kind::Address(Some(name))
                     }
                 }
-                _ if self.symbols.is_folded(name) => match sym.ty {
-                    // A folded const pointer carries an address constant.
-                    CType::Pointer(..) => Kind::Address(None),
-                    _ => Kind::Value,
-                },
+                // A C23 `constexpr` object holds a constant by construction
+                // (a pointer one is null), even when no value was folded.
+                _ if self.symbols.is_folded(name) || self.symbols.is_constexpr(name) => {
+                    match sym.ty {
+                        // A folded const pointer carries an address constant.
+                        CType::Pointer(..) => Kind::Address(None),
+                        _ => Kind::Value,
+                    }
+                }
                 _ => Kind::Bad,
             },
         }
@@ -424,7 +428,9 @@ impl<'s> StaticInitChecker<'s> {
     /// Whether `e` reads an element or member of a folded const object.
     fn folded_object_read(&self, e: &Expr) -> bool {
         match e {
-            Expr::Identifier(name, _) => self.symbols.is_folded(name),
+            Expr::Identifier(name, _) => {
+                self.symbols.is_folded(name) || self.symbols.is_constexpr(name)
+            }
             Expr::MemberAccess(base, _, _) => self.folded_object_read(base),
             Expr::ArraySubscript(base, index, _) => {
                 matches!((self.ctype)(base), Some(CType::Array(..)))

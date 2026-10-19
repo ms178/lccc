@@ -1082,6 +1082,7 @@ impl Driver {
             source_manager.set_macro_expansions(macro_expansions);
             let mut lexer = Lexer::new(source_manager.get_content(file_id), file_id);
             lexer.set_gnu_extensions(self.gnu_extensions);
+            lexer.set_c23(self.c23_dialect());
             let tokens = lexer.tokenize();
             let lexer_diags = std::mem::take(&mut lexer.diagnostics);
 
@@ -1095,6 +1096,7 @@ impl Driver {
             }
             let mut parser = Parser::new(tokens);
             parser.set_diagnostics(diagnostics);
+            parser.set_c23(self.c23_dialect());
             let ast = parser.parse();
             let diagnostics = parser.take_diagnostics();
             // Lexer diagnostics were seeded into this engine before parsing.
@@ -1699,6 +1701,7 @@ impl Driver {
         }
         // Dialect-selected `__STDC_VERSION__`, applied BEFORE the user's
         // `-D`s so an explicit `-D__STDC_VERSION__=...` still wins.
+        preprocessor.set_c23(self.c23_dialect());
         if let Some(v) = self.stdc_version {
             match v {
                 Some(val) => preprocessor.define_macro("__STDC_VERSION__", val),
@@ -1892,6 +1895,7 @@ impl Driver {
         source_manager.set_macro_expansions(macro_expansions);
         let mut lexer = Lexer::new(source_manager.get_content(file_id), file_id);
         lexer.set_gnu_extensions(self.gnu_extensions);
+        lexer.set_c23(self.c23_dialect());
         let tokens = lexer.tokenize();
         let lexer_diags = std::mem::take(&mut lexer.diagnostics);
         if time_phases {
@@ -1918,6 +1922,7 @@ impl Driver {
         }
         let mut parser = Parser::new(tokens);
         parser.set_diagnostics(diagnostics);
+        parser.set_c23(self.c23_dialect());
         let ast = parser.parse();
         if time_phases {
             eprintln!("[TIME] parse: {:.3}s", t2.elapsed().as_secs_f64());
@@ -3476,6 +3481,15 @@ impl Driver {
     /// follows it where the dialects differ.
     pub(crate) fn pre_c99_dialect(&self) -> bool {
         matches!(self.stdc_version, Some(None) | Some(Some("199409L")))
+    }
+
+    /// Whether `-std=` selected C23 or later (c23/gnu23/c2x/gnu2x/c2y/gnu2y).
+    /// The default dialect is gnu17 (`__STDC_VERSION__` 201710L), so this is
+    /// false unless requested. Lexer keywords, `#if true`, `auto` type
+    /// inference and the other C23-only meanings key off this one fact.
+    pub(crate) fn c23_dialect(&self) -> bool {
+        matches!(self.stdc_version, Some(Some(v))
+            if v.trim_end_matches('L').parse::<u32>().is_ok_and(|n| n >= 202311))
     }
 }
 #[cfg(test)]

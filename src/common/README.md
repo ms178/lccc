@@ -42,6 +42,7 @@ and provides enough context to understand the system without reading code.
 | `source.rs`         | Span, SourceLocation, SourceManager                  | Lexer, parser, sema, backend                   |
 | `symbol_table.rs`   | Scoped symbol table for name resolution              | Sema, sema const_eval                          |
 | `type_builder.rs`   | Shared AST-to-CType conversion trait                 | Sema, lowering                                 |
+| `qualifiers.rs`     | `const` model shared by both `_Generic` selections   | Sema, lowering                                 |
 | `const_arith.rs`    | Low-level integer/float constant arithmetic          | Sema const_eval, lowering const_eval           |
 | `const_eval.rs`     | Shared constant expression evaluation logic          | Sema const_eval, lowering const_eval           |
 | `hex_float.rs` | Bounded guard/sticky hexadecimal parsing; direct binary32/64/128 and x87 rounding | lexer, long-double hexadecimal parser |

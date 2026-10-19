@@ -366,8 +366,20 @@ impl std::fmt::Display for AddressSpace {
 pub enum CType {
     Void,
     Bool,
+    /// Signed 8-bit char: plain `char` where plain char is signed (x86,
+    /// i686), explicit `signed char` where it is unsigned (AArch64, RISC-V).
     Char,
+    /// Unsigned 8-bit `unsigned char`.
     UChar,
+    /// Explicit `signed char` where plain char is signed. Layout-, value- and
+    /// promotion-identical to `Char`; differs only in type identity (C11
+    /// 6.2.5p15: char, signed char and unsigned char are three distinct types),
+    /// which `_Generic`, `__builtin_types_compatible_p` and pointer
+    /// compatibility observe. Every pattern naming `Char` also names `SChar`.
+    SChar,
+    /// Plain `char` where plain char is unsigned: the `UChar` counterpart of
+    /// `SChar`. Every pattern naming `UChar` also names `PlainUChar`.
+    PlainUChar,
     Short,
     UShort,
     Int,
@@ -401,6 +413,11 @@ pub enum CType {
     /// C99 _Complex long double: two f128 values (real, imag) - uses F128 storage per component
     ComplexLongDouble,
     Pointer(Box<CType>, AddressSpace),
+    /// C23 `nullptr_t` (6.2.5p25), the type of `nullptr`: an unqualified
+    /// scalar with the size, alignment and representation of `void *` whose
+    /// only value is the null pointer. It converts to any pointer type and
+    /// to `bool`, compares with pointers, and is never arithmetic.
+    NullPtr,
     Array(Box<CType>, Option<usize>),
     Function(Box<FunctionType>),
     /// Struct type, identified by key (e.g., "struct.Foo" or "__anon_struct_7").
@@ -605,7 +622,9 @@ impl ExtVectorLayout {
         } else {
             match element {
                 CType::Char
+                | CType::SChar
                 | CType::UChar
+                | CType::PlainUChar
                 | CType::Short
                 | CType::UShort
                 | CType::Int
@@ -701,9 +720,20 @@ pub struct EnumType {
     /// When true (__attribute__((packed))), the enum uses the smallest
     /// integer type that can represent all variant values.
     pub is_packed: bool,
+    /// C23 fixed underlying type (`enum E : T`, 6.7.2.2p5): the enum is
+    /// compatible with it, has its size and alignment, and its enumerators
+    /// have the enumerated type. Overrides `is_packed` and the value rules.
+    pub fixed: Option<Box<CType>>,
 }
 
 impl EnumType {
+    /// The fixed underlying type `: T` names, if it is a valid one (C23
+    /// 6.7.2.2p5: an integer type other than an enumerated type; its
+    /// qualifiers are dropped, and `CType` carries none).
+    pub fn fixed_underlying(ty: CType) -> Option<CType> {
+        (ty.is_integer() && !matches!(ty, CType::Enum(_))).then_some(ty)
+    }
+
     /// The integer type this enumeration is *compatible* with.
     ///
     /// C11 6.7.2.2p4: "Each enumerated type shall be compatible with char, a
@@ -724,11 +754,15 @@ impl EnumType {
     /// follows `packed_size` so a packed enum's compatible type is the same
     /// smallest type it occupies.
     pub fn compatible_ctype(&self) -> CType {
+        if let Some(fixed) = &self.fixed {
+            return (**fixed).clone();
+        }
         let any_negative = self.variants.iter().any(|(_, v)| *v < 0);
         match self.packed_size() {
             1 => {
                 if any_negative {
-                    CType::Char
+                    // GCC c_common_type_for_size(8, signed): `signed char`
+                    CType::signed_char()
                 } else {
                     CType::UChar
                 }
@@ -764,6 +798,9 @@ impl EnumType {
     /// on LP64). GCC 16.2 and Clang 23.1.3 agree in every `-std` mode
     /// (measured with `_Generic` and `sizeof` under gnu17, gnu23 and c11).
     pub fn constant_ctype(&self) -> CType {
+        if self.fixed.is_some() {
+            return CType::Enum(self.clone());
+        }
         if self.variants.iter().all(|(_, v)| i32::try_from(*v).is_ok()) {
             CType::Int
         } else {
@@ -775,6 +812,9 @@ impl EnumType {
     /// Non-packed enums are always 4 bytes (int). Packed enums use the
     /// smallest integer type that can represent all variant values.
     pub fn packed_size(&self) -> usize {
+        if let Some(fixed) = &self.fixed {
+            return fixed.size();
+        }
         if !self.is_packed {
             // Non-packed enum: 4 bytes when ONE 32-bit type holds every value
             // (`unsigned int` without negatives, else `int`), otherwise 8 (GCC
@@ -1285,7 +1325,7 @@ impl StructLayout {
     fn smallest_int_ctype_for_bytes(needed_bytes: usize, is_signed: bool) -> CType {
         if is_signed {
             match needed_bytes {
-                0..=1 => CType::Char,
+                0..=1 => CType::signed_char(),
                 2 => CType::Short,
                 3..=4 => CType::Int,
                 _ => CType::LongLong,
@@ -1930,8 +1970,11 @@ impl std::fmt::Display for CType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CType::Void => write!(f, "void"),
+            CType::NullPtr => write!(f, "nullptr_t"),
             CType::Bool => write!(f, "_Bool"),
-            CType::Char => write!(f, "char"),
+            CType::Char if char_is_unsigned() => write!(f, "signed char"),
+            CType::Char | CType::PlainUChar => write!(f, "char"),
+            CType::SChar => write!(f, "signed char"),
             CType::UChar => write!(f, "unsigned char"),
             CType::Short => write!(f, "short"),
             CType::UShort => write!(f, "unsigned short"),
@@ -2057,6 +2100,34 @@ pub fn set_char_unsigned(unsigned: bool) {
 }
 
 /// The target's plain-char signedness (true: `char` behaves as `unsigned char`).
+impl CType {
+    /// The type of plain `char` on the current target.
+    pub fn plain_char() -> CType {
+        if char_is_unsigned() {
+            CType::PlainUChar
+        } else {
+            CType::Char
+        }
+    }
+
+    /// The type of explicit `signed char` on the current target.
+    pub fn signed_char() -> CType {
+        if char_is_unsigned() {
+            CType::Char
+        } else {
+            CType::SChar
+        }
+    }
+
+    /// Whether this is one of the three character types (C11 6.2.5p15).
+    pub fn is_char_type(&self) -> bool {
+        matches!(
+            self,
+            CType::Char | CType::SChar | CType::UChar | CType::PlainUChar
+        )
+    }
+}
+
 pub fn char_is_unsigned() -> bool {
     CHAR_UNSIGNED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -2156,7 +2227,7 @@ impl CType {
             // no size yet (linked structs/unions whose layout is not computed),
             // which must NOT read as 1.
             CType::Void => 1,
-            CType::Bool | CType::Char | CType::UChar => 1,
+            CType::Bool | CType::Char | CType::SChar | CType::UChar | CType::PlainUChar => 1,
             CType::Short | CType::UShort => 2,
             CType::Int | CType::UInt => 4,
             // ILP32: long = 4 bytes; LP64: long = 8 bytes
@@ -2190,7 +2261,7 @@ impl CType {
                     32
                 }
             }
-            CType::Pointer(_, _) => ptr_sz,
+            CType::Pointer(_, _) | CType::NullPtr => ptr_sz,
             // Saturation, not wrapping: a length that overflows `usize`
             // must only ever make the object *larger* than it can be, never
             // smaller, so that no path can silently produce an under-sized
@@ -2215,7 +2286,7 @@ impl CType {
         let ptr_sz = target_ptr_size();
         match self {
             CType::Void => 1,
-            CType::Bool | CType::Char | CType::UChar => 1,
+            CType::Bool | CType::Char | CType::SChar | CType::UChar | CType::PlainUChar => 1,
             CType::Short | CType::UShort => 2,
             CType::Int | CType::UInt => 4,
             // ILP32: long aligned to 4; LP64: long aligned to 8
@@ -2273,7 +2344,7 @@ impl CType {
                     16
                 }
             }
-            CType::Pointer(_, _) => ptr_sz,
+            CType::Pointer(_, _) | CType::NullPtr => ptr_sz,
             CType::Array(elem, _) => elem.align_ctx(ctx),
             CType::Function(_) => ptr_sz,
             CType::Struct(key) | CType::Union(key) => {
@@ -2380,7 +2451,9 @@ impl CType {
             CType::Void => 0,
             CType::Bool
             | CType::Char
+            | CType::SChar
             | CType::UChar
+            | CType::PlainUChar
             | CType::Short
             | CType::UShort
             | CType::Int
@@ -2401,6 +2474,8 @@ impl CType {
             | CType::Decimal128 => 8,
             CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => 9,
             CType::Pointer(..) | CType::Array(..) | CType::Function(_) => 5,
+            // GCC 16.2: `__builtin_classify_type(nullptr)` is -1 (no class).
+            CType::NullPtr => -1,
             CType::Struct(_) => 12,
             CType::Union(_) => 13,
             CType::Vector(..) | CType::ExtVector(..) => 19,
@@ -2412,7 +2487,9 @@ impl CType {
             self,
             CType::Bool
                 | CType::Char
+                | CType::SChar
                 | CType::UChar
+                | CType::PlainUChar
                 | CType::Short
                 | CType::UShort
                 | CType::Int
@@ -2433,7 +2510,13 @@ impl CType {
         }
         matches!(
             self,
-            CType::Char | CType::Short | CType::Int | CType::Long | CType::LongLong | CType::Int128
+            CType::Char
+                | CType::SChar
+                | CType::Short
+                | CType::Int
+                | CType::Long
+                | CType::LongLong
+                | CType::Int128
         )
     }
 
@@ -2877,7 +2960,8 @@ impl CType {
     pub fn vector_comparison_result(&self) -> Option<CType> {
         let signed_lane = |elem: &CType| -> Option<CType> {
             Some(match elem.size() {
-                1 => CType::Char,
+                // GCC and Clang: `__vector signed char`
+                1 => CType::signed_char(),
                 2 => CType::Short,
                 4 => CType::Int,
                 8 => CType::LongLong,
@@ -2928,7 +3012,13 @@ impl CType {
     /// Short/UShort all fit in int).
     pub fn integer_promoted(&self) -> CType {
         match self {
-            CType::Bool | CType::Char | CType::UChar | CType::Short | CType::UShort => CType::Int,
+            CType::Bool
+            | CType::Char
+            | CType::SChar
+            | CType::UChar
+            | CType::PlainUChar
+            | CType::Short
+            | CType::UShort => CType::Int,
             // An enum promotes as its compatible type does (C11 6.3.1.1p2): a
             // packed one to `int`, an `unsigned int` one stays unsigned.
             CType::Enum(e) => e.compatible_ctype().integer_promoted(),
@@ -2956,6 +3046,7 @@ impl CType {
             self,
             CType::Bool
                 | CType::UChar
+                | CType::PlainUChar
                 | CType::UShort
                 | CType::UInt
                 | CType::ULong
@@ -2969,7 +3060,7 @@ impl CType {
     pub fn integer_rank(&self) -> u32 {
         match self {
             CType::Bool => 0,
-            CType::Char | CType::UChar => 1,
+            CType::Char | CType::SChar | CType::UChar | CType::PlainUChar => 1,
             CType::Short | CType::UShort => 2,
             CType::Int | CType::UInt => 3,
             // An enum ranks as its compatible type (C11 6.3.1.1p1).
@@ -3108,7 +3199,7 @@ impl CType {
     /// The unsigned type corresponding to a signed integer type (C11 6.3.1.8).
     fn to_unsigned_version(self) -> CType {
         match self {
-            CType::Char => CType::UChar,
+            CType::Char | CType::SChar => CType::UChar,
             CType::Short => CType::UShort,
             CType::Int => CType::UInt,
             CType::Long => CType::ULong,
@@ -3165,7 +3256,9 @@ impl CType {
                 ct,
                 CType::Bool
                     | CType::Char
+                    | CType::SChar
                     | CType::UChar
+                    | CType::PlainUChar
                     | CType::Short
                     | CType::UShort
                     | CType::Int
@@ -3199,6 +3292,37 @@ impl CType {
         }
     }
 
+    /// Whether a `_Generic` association of type `assoc` matches a controlling
+    /// operand of type `self`: compatible types (C23 6.5.1.1p2, 6.2.7) on
+    /// lccc's qualifier-free `CType`, whose constness the callers compare
+    /// through `GenericAssociation::is_const`. The operand type is taken as
+    /// given -- callers apply lvalue conversion to an expression operand and
+    /// none to a type operand -- and nothing decays below the top level:
+    /// `int (*)[3]` is not compatible with `int **`, nor with `int (*)[4]`.
+    /// An enumeration is compatible with its compatible integer type (which
+    /// is `unsigned int` when no enumerator is negative), not with `int`.
+    pub fn generic_association_matches(&self, assoc: &CType) -> bool {
+        match (self, assoc) {
+            (CType::Enum(_), CType::Enum(_)) => self == assoc,
+            (CType::Enum(e), other) | (other, CType::Enum(e)) => e.compatible_ctype() == *other,
+            (CType::Pointer(a, _), CType::Pointer(b, _)) => a.generic_association_matches(b),
+            (CType::Array(a, la), CType::Array(b, lb)) => {
+                (la.is_none() || lb.is_none() || la == lb) && a.generic_association_matches(b)
+            }
+            // Parameter names are not part of the type.
+            (CType::Function(a), CType::Function(b)) => {
+                a.variadic == b.variadic
+                    && a.params.len() == b.params.len()
+                    && a.return_type.generic_association_matches(&b.return_type)
+                    && a.params
+                        .iter()
+                        .zip(&b.params)
+                        .all(|((pa, _), (pb, _))| pa.generic_association_matches(pb))
+            }
+            _ => self == assoc,
+        }
+    }
+
     pub fn conditional_composite_type(
         then_ct: Option<CType>,
         else_ct: Option<CType>,
@@ -3212,6 +3336,14 @@ impl CType {
                 // Both void
                 if matches!(&t, CType::Void) && matches!(&e, CType::Void) {
                     return Some(CType::Void);
+                }
+                // C23 6.5.15p6: `nullptr_t` against a pointer is the pointer
+                // type (both oracles: `c ? nullptr : (int *)p` is `int *`).
+                // Two `nullptr_t` arms fall through to the shared type below.
+                match (&t, &e) {
+                    (CType::NullPtr, CType::Pointer(..)) => return Some(e),
+                    (CType::Pointer(..), CType::NullPtr) => return Some(t),
+                    _ => {}
                 }
                 // Both pointers: C11 6.5.15p6 rules
                 if let (CType::Pointer(inner_t, _), CType::Pointer(inner_e, _)) = (&t, &e) {
@@ -3651,8 +3783,8 @@ impl IrType {
         match ct {
             CType::Void => IrType::Void,
             CType::Bool => IrType::U8,
-            CType::Char => IrType::I8,
-            CType::UChar => IrType::U8,
+            CType::Char | CType::SChar => IrType::I8,
+            CType::UChar | CType::PlainUChar => IrType::U8,
             CType::Short => IrType::I16,
             CType::UShort => IrType::U16,
             CType::Int => IrType::I32,
@@ -3695,7 +3827,9 @@ impl IrType {
             CType::Decimal128 => IrType::U128,
             // Complex types are handled as aggregate (pointer to stack slot)
             CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => IrType::Ptr,
-            CType::Pointer(_, _) | CType::Array(_, _) | CType::Function(_) => IrType::Ptr,
+            CType::Pointer(_, _) | CType::Array(_, _) | CType::Function(_) | CType::NullPtr => {
+                IrType::Ptr
+            }
             CType::Struct(_) | CType::Union(_) => IrType::Ptr,
             // Vectors are treated as aggregate types (pointer to stack slot)
             CType::Vector(_, _) | CType::ExtVector(_, _) => IrType::Ptr,

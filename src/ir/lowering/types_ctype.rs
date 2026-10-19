@@ -16,9 +16,12 @@ impl Lowerer {
     pub(super) fn ctype_to_type_spec(ctype: &CType) -> TypeSpecifier {
         match ctype {
             CType::Void => TypeSpecifier::Void,
+            CType::NullPtr => TypeSpecifier::NullPtrT,
             CType::Bool => TypeSpecifier::Bool,
             CType::Char => TypeSpecifier::Char,
+            CType::SChar => TypeSpecifier::SignedChar,
             CType::UChar => TypeSpecifier::UnsignedChar,
+            CType::PlainUChar => TypeSpecifier::PlainUnsignedChar,
             CType::Short => TypeSpecifier::Short,
             CType::UShort => TypeSpecifier::UnsignedShort,
             CType::Int => TypeSpecifier::Int,
@@ -102,7 +105,14 @@ impl Lowerer {
                     TypeSpecifier::Union(Some(key.to_string()), None, false, None, None, None)
                 }
             }
-            CType::Enum(et) => TypeSpecifier::Enum(et.name.clone(), None, et.is_packed),
+            CType::Enum(et) => TypeSpecifier::Enum(
+                et.name.clone(),
+                None,
+                et.is_packed,
+                et.fixed
+                    .as_deref()
+                    .map(|t| Box::new(Self::ctype_to_type_spec(t))),
+            ),
             CType::Function(ft) => {
                 // Bare function type — NOT a pointer. Use BareFunction so that
                 // typeof(func_name) preserves the function type without adding a
@@ -521,74 +531,17 @@ impl type_builder::TypeConvertContext for Lowerer {
         // Body-less references reuse the definition visible in this scope.
         // Besides packed size, its values carry the signedness chosen for the
         // enum's compatible integer type (a negative value means `int`; an
-        // all-nonnegative enum through UINT_MAX means `unsigned int`).
-        let completed = name.as_ref().and_then(|n| self.types.enum_types.get(n));
-        let effective_packed = is_packed || completed.is_some_and(|et| et.is_packed);
-        if !effective_packed {
-            let variant_values = if let Some(vars) = variants {
-                let mut values = Vec::with_capacity(vars.len());
-                let mut next_val: i64 = 0;
-                for v in vars {
-                    if let Some(val) = self.enum_variant_value(v) {
-                        next_val = val;
-                    }
-                    values.push((v.name.clone(), next_val));
-                    next_val += 1;
-                }
-                values
-            } else {
-                completed.map(|et| et.variants.clone()).unwrap_or_default()
-            };
-            return crate::common::types::EnumType {
-                name: name.clone(),
-                variants: variant_values,
-                is_packed: false,
-            }
-            .compatible_ctype();
-        }
-        // For packed enums, compute the minimum integer type from variant values
-        let variant_values: Vec<i64> = if let Some(vars) = variants {
-            let mut values = Vec::new();
-            let mut next_val: i64 = 0;
-            for v in vars {
-                if let Some(val) = self.enum_variant_value(v) {
-                    next_val = val;
-                }
-                values.push(next_val);
-                next_val += 1;
-            }
-            values
-        } else if let Some(n) = name {
-            // Forward reference: look up stored packed enum info
-            if let Some(et) = self.types.enum_types.get(n) {
-                et.variants.iter().map(|(_, v)| *v).collect()
-            } else {
-                return CType::Char; // packed enum with no known variants, default 1 byte
-            }
-        } else {
-            return CType::Char; // anonymous packed enum with no body
-        };
-
-        if variant_values.is_empty() {
-            return CType::Char;
-        }
-        let min_val = *variant_values.iter().min().unwrap();
-        let max_val = *variant_values.iter().max().unwrap();
-        if min_val >= 0 {
-            if max_val <= 0xFF {
-                CType::UChar
-            } else if max_val <= 0xFFFF {
-                CType::UShort
-            } else {
-                CType::UInt
-            }
-        } else if min_val >= -128 && max_val <= 127 {
-            CType::Char
-        } else if min_val >= -32768 && max_val <= 32767 {
-            CType::Short
-        } else {
-            CType::Int
-        }
+        // all-nonnegative enum through UINT_MAX means `unsigned int`), and
+        // its fixed type. The width rules are `EnumType`'s, as in sema.
+        crate::common::type_builder::enum_type_of(
+            name,
+            variants,
+            is_packed,
+            name.as_ref().and_then(|n| self.types.enum_types.get(n)),
+            None,
+            |v| self.enum_variant_value(v),
+        )
+        .compatible_ctype()
     }
 
     fn resolve_typeof_expr(&self, expr: &Expr) -> CType {

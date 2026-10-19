@@ -17,8 +17,8 @@ use std::cell::Cell;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::utils::{
-    bytes_to_str, copy_literal_bytes_to_string, is_ident_cont_byte, is_ident_start_byte,
-    skip_literal_bytes,
+    bytes_to_str, copy_literal_bytes_to_string, is_digit_separator, is_ident_cont_byte,
+    is_ident_start_byte, ppnumber_end, skip_literal_bytes,
 };
 
 /// Check if two adjacent bytes would form an unintended multi-character token
@@ -126,7 +126,7 @@ fn normalize_internal_markers(s: &str, final_output: bool) -> std::borrow::Cow<'
     let mut start = 0;
     let mut i = 0;
     while i < bytes.len() {
-        if matches!(bytes[i], b'"' | b'\'') {
+        if matches!(bytes[i], b'"' | b'\'') && !is_digit_separator(bytes, i) {
             i = skip_literal_bytes(bytes, i, bytes[i]);
         } else if is_marker(bytes[i]) {
             let out = result.get_or_insert_with(|| String::with_capacity(s.len()));
@@ -241,6 +241,7 @@ impl MacroTable {
             // special functions in #if expressions by resolve_defined_in_expr().
             || name == "__has_builtin"
             || name == "__has_attribute"
+            || name == "__has_c_attribute"
             || name == "__has_feature"
             || name == "__has_extension"
             || name == "__has_include"
@@ -378,7 +379,7 @@ impl MacroTable {
         let mut i = 0usize;
         while i < len {
             let c = bytes[i];
-            if c == b'"' || c == b'\'' {
+            if c == b'"' || (c == b'\'' && !is_digit_separator(bytes, i)) {
                 // Copy string/char literals verbatim: `_Pragma` inside a
                 // literal is ordinary text.
                 let quote = c;
@@ -552,7 +553,7 @@ impl MacroTable {
         while i < len {
             let b = bytes[i];
 
-            if b == b'"' || b == b'\'' {
+            if b == b'"' || (b == b'\'' && !is_digit_separator(bytes, i)) {
                 i = copy_literal_bytes_to_string(bytes, i, b, &mut result);
             } else if b == BLUE_PAINT_MARKER {
                 i = Self::copy_blue_painted(bytes, i, &mut result);
@@ -1132,23 +1133,8 @@ impl MacroTable {
     /// Copy a pp-number (numeric literal) verbatim.
     /// Uses batch slice copy instead of per-byte push.
     fn copy_ppnumber(bytes: &[u8], i: usize, result: &mut String) -> usize {
-        let len = bytes.len();
-        let mut j = i;
-        while j < len {
-            if bytes[j].is_ascii_alphanumeric()
-                || bytes[j] == b'.'
-                || bytes[j] == b'_'
-                || ((bytes[j] == b'+' || bytes[j] == b'-')
-                    && j > i
-                    && matches!(bytes[j - 1], b'e' | b'E' | b'p' | b'P'))
-            {
-                j += 1;
-            } else {
-                break;
-            }
-        }
-        let slice = std::str::from_utf8(&bytes[i..j]).unwrap_or("");
-        result.push_str(slice);
+        let j = ppnumber_end(bytes, i);
+        result.push_str(std::str::from_utf8(&bytes[i..j]).unwrap_or(""));
         j
     }
 
@@ -1206,7 +1192,7 @@ impl MacroTable {
                     i += 1;
                     arg_start = i;
                 }
-                b'"' | b'\'' => {
+                b'"' | b'\'' if !is_digit_separator(bytes, i) => {
                     // Skip past string/char literal (they are part of the argument
                     // text and will be included in the byte span)
                     i = skip_literal_bytes(bytes, i, bytes[i]);
@@ -1596,7 +1582,7 @@ impl MacroTable {
                 i += 1; // skip the start marker
                 let start = i;
                 while i < len && bytes[i] != PASTE_PROTECT_END {
-                    if matches!(bytes[i], b'"' | b'\'') {
+                    if matches!(bytes[i], b'"' | b'\'') && !is_digit_separator(bytes, i) {
                         i = skip_literal_bytes(bytes, i, bytes[i]);
                     } else {
                         i += 1;
@@ -1610,7 +1596,7 @@ impl MacroTable {
                 continue;
             }
 
-            if bytes[i] == b'"' || bytes[i] == b'\'' {
+            if bytes[i] == b'"' || (bytes[i] == b'\'' && !is_digit_separator(bytes, i)) {
                 i = copy_literal_bytes_to_string(bytes, i, bytes[i], &mut result);
                 continue;
             }
@@ -1733,7 +1719,7 @@ impl MacroTable {
                         match bytes[j] {
                             b'(' => depth += 1,
                             b')' => depth -= 1,
-                            b'"' | b'\'' => {
+                            b'"' | b'\'' if !is_digit_separator(bytes, j) => {
                                 j = skip_literal_bytes(bytes, j, bytes[j]);
                                 continue;
                             }
@@ -1894,7 +1880,7 @@ fn stringify_arg(arg: &str) -> String {
 
         // Stringification escapes quotes and backslashes in literal tokens,
         // but preserves their payload bytes (including UTF-8 and whitespace).
-        if matches!(bytes[i], b'"' | b'\'') {
+        if matches!(bytes[i], b'"' | b'\'') && !is_digit_separator(bytes, i) {
             let end = skip_literal_bytes(bytes, i, bytes[i]);
             for ch in trimmed[i..end].chars() {
                 if matches!(ch, '"' | '\\') {

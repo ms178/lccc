@@ -327,7 +327,12 @@ impl Lowerer {
             CType::Array(elem, _) => {
                 matches!(
                     elem.as_ref(),
-                    CType::Char | CType::UChar | CType::Int | CType::UInt
+                    CType::Char
+                        | CType::SChar
+                        | CType::UChar
+                        | CType::PlainUChar
+                        | CType::Int
+                        | CType::UInt
                 )
             }
             _ => false,

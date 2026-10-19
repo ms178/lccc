@@ -707,6 +707,11 @@ impl Lowerer {
             orig_param.fptr_params.is_some() && orig_param.fptr_inner_ptr_depth >= 2;
 
         let name = orig_param.name.clone().unwrap_or_default();
+        let base_const = crate::common::qualifiers::type_name_const_base(
+            &orig_param.type_spec,
+            orig_param.is_const,
+            self,
+        );
         self.insert_local_scoped(
             name,
             LocalInfo {
@@ -723,6 +728,7 @@ impl Lowerer {
                     address_space: AddressSpace::Default,
                     explicit_alignment: None,
                     type_align: None,
+                    base_const,
                 },
                 alloca,
                 alloc_size: param_size,
@@ -733,7 +739,6 @@ impl Lowerer {
                 asm_register: None,
                 asm_register_has_init: false,
                 cleanup_fn: None,
-                is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
                 // Parameter declarators do not record the object qualifier yet.
                 object_volatile: false,
@@ -792,6 +797,11 @@ impl Lowerer {
         let c_type = Some(self.type_spec_to_ctype(&orig_param.type_spec));
 
         let name = orig_param.name.clone().unwrap_or_default();
+        let base_const = crate::common::qualifiers::type_name_const_base(
+            &orig_param.type_spec,
+            orig_param.is_const,
+            self,
+        );
         self.insert_local_scoped(
             name,
             LocalInfo {
@@ -808,6 +818,7 @@ impl Lowerer {
                     address_space: AddressSpace::Default,
                     explicit_alignment: None,
                     type_align: None,
+                    base_const,
                 },
                 alloca,
                 alloc_size: size,
@@ -818,7 +829,6 @@ impl Lowerer {
                 asm_register: None,
                 asm_register_has_init: false,
                 cleanup_fn: None,
-                is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
                 // Parameter declarators do not record the object qualifier yet.
                 object_volatile: false,
@@ -878,6 +888,11 @@ impl Lowerer {
     fn register_packed_complex_float_param(&mut self, orig_param: &ParamDecl, alloca: Value) {
         let ct = self.type_spec_to_ctype(&orig_param.type_spec);
         let name = orig_param.name.clone().unwrap_or_default();
+        let base_const = crate::common::qualifiers::type_name_const_base(
+            &orig_param.type_spec,
+            orig_param.is_const,
+            self,
+        );
         self.insert_local_scoped(
             name,
             LocalInfo {
@@ -894,6 +909,7 @@ impl Lowerer {
                     address_space: AddressSpace::Default,
                     explicit_alignment: None,
                     type_align: None,
+                    base_const,
                 },
                 alloca,
                 alloc_size: 8,
@@ -904,7 +920,6 @@ impl Lowerer {
                 asm_register: None,
                 asm_register_has_init: false,
                 cleanup_fn: None,
-                is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
                 // Parameter declarators do not record the object qualifier yet.
                 object_volatile: false,
@@ -975,6 +990,11 @@ impl Lowerer {
         });
 
         let name = orig_param.name.clone().unwrap_or_default();
+        let base_const = crate::common::qualifiers::type_name_const_base(
+            &orig_param.type_spec,
+            orig_param.is_const,
+            self,
+        );
         self.func_mut().locals.insert(
             name,
             LocalInfo {
@@ -991,6 +1011,7 @@ impl Lowerer {
                     address_space: AddressSpace::Default,
                     explicit_alignment: None,
                     type_align: None,
+                    base_const,
                 },
                 alloca: complex_alloca,
                 alloc_size: complex_size,
@@ -1001,7 +1022,6 @@ impl Lowerer {
                 asm_register: None,
                 asm_register_has_init: false,
                 cleanup_fn: None,
-                is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
                 // Parameter declarators do not record the object qualifier yet.
                 object_volatile: false,

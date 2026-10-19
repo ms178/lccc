@@ -73,6 +73,12 @@ pub struct SemaConstEval<'a> {
     /// expressions admit an overflowing signed left shift; passed on to the
     /// type checker's ICE test (see `ice.rs`).
     pub pre_c99: bool,
+    /// Only C23 named constants (6.6p7) name values: enumerators and
+    /// `constexpr` objects. A plain `const` object's folded value -- GCC's
+    /// static-initializer extension -- is no constant here (`const int k = 1;
+    /// _Static_assert(k, "");` is "not constant": GCC 16.2). Set for static
+    /// assertions; the bottom-up cache, which holds such values, is skipped.
+    pub named_constants_only: bool,
 }
 
 impl<'a> SemaConstEval<'a> {
@@ -395,6 +401,22 @@ impl<'a> SemaConstEval<'a> {
                 self.bits_to_irconst(truncated, &target_ctype, target_signed)
             }
 
+            // A member of a C23 `constexpr` structure or union object, reached
+            // by `.` from the object (`s.a.b`), is a named constant (6.6p7).
+            Expr::MemberAccess(..) => {
+                let mut path = String::new();
+                let mut cur = expr;
+                while let Expr::MemberAccess(base, field, _) = cur {
+                    path.insert_str(0, field);
+                    path.insert(0, '.');
+                    cur = base;
+                }
+                let Expr::Identifier(name, _) = cur else {
+                    return None;
+                };
+                Some(self.symbols.constexpr_member(name, &path)?.to_ir_const())
+            }
+
             // Identifier: enum constants
             Expr::Identifier(name, _) => {
                 // Objects and enumerators share the ordinary-identifier
@@ -403,11 +425,12 @@ impl<'a> SemaConstEval<'a> {
                 // object, function or typedef hides an enumerator of the same
                 // name (`enum { A = 1 }; void f(void) { int A = 5;
                 // _Static_assert(A, ""); }` is not constant: GCC 16.2).
-                if let Some(val) = self.symbols.folded_value(name) {
-                    return Some(match val {
-                        FoldedValue::Int(v) => IrConst::I64(v),
-                        FoldedValue::Float(v) => IrConst::F64(v),
-                    });
+                if let Some(val) = self
+                    .symbols
+                    .folded_value(name)
+                    .filter(|_| !self.named_constants_only || self.symbols.is_constexpr(name))
+                {
+                    return Some(val.to_ir_const());
                 }
                 if self
                     .symbols
@@ -1039,28 +1062,21 @@ impl<'a> SemaConstEval<'a> {
         name: &Option<String>,
         variants: &Option<Vec<crate::frontend::parser::ast::EnumVariant>>,
         is_packed: bool,
+        underlying: Option<&TypeSpecifier>,
     ) -> crate::common::types::EnumType {
-        let completed = name.as_ref().and_then(|tag| self.types.enum_types.get(tag));
-        let variant_values = match variants {
-            Some(vars) => {
-                let mut result = Vec::with_capacity(vars.len());
-                let mut next_val: i64 = 0;
-                for v in vars {
-                    if let Some(val) = v.value.as_ref().and_then(|e| self.eval_const_expr(e)) {
-                        next_val = val.to_i64().unwrap_or(next_val);
-                    }
-                    result.push((v.name.clone(), next_val));
-                    next_val = next_val.wrapping_add(1);
-                }
-                result
-            }
-            None => completed.map(|et| et.variants.clone()).unwrap_or_default(),
-        };
-        crate::common::types::EnumType {
-            name: name.clone(),
-            variants: variant_values,
-            is_packed: is_packed || completed.is_some_and(|et| et.is_packed),
-        }
+        crate::common::type_builder::enum_type_of(
+            name,
+            variants,
+            is_packed,
+            name.as_ref().and_then(|tag| self.types.enum_types.get(tag)),
+            underlying.map(|u| self.ctype_from_type_spec(u)),
+            |v| {
+                v.value
+                    .as_ref()
+                    .and_then(|e| self.eval_const_expr(e))
+                    .and_then(|c| c.to_i64())
+            },
+        )
     }
 
     /// Compute sizeof for a type specifier.
@@ -1070,7 +1086,10 @@ impl<'a> SemaConstEval<'a> {
         let ptr_sz = target_ptr_size();
         match spec {
             TypeSpecifier::Void => Some(0),
-            TypeSpecifier::Char | TypeSpecifier::UnsignedChar => Some(1),
+            TypeSpecifier::Char
+            | TypeSpecifier::SignedChar
+            | TypeSpecifier::UnsignedChar
+            | TypeSpecifier::PlainUnsignedChar => Some(1),
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => Some(2),
             TypeSpecifier::Int
             | TypeSpecifier::UnsignedInt
@@ -1086,7 +1105,9 @@ impl<'a> SemaConstEval<'a> {
             TypeSpecifier::ComplexFloat => Some(8),
             TypeSpecifier::ComplexDouble => Some(16),
             TypeSpecifier::ComplexLongDouble => Some(if ptr_sz == 4 { 24 } else { 32 }),
-            TypeSpecifier::Pointer(_, _) | TypeSpecifier::FunctionPointer(_, _, _) => Some(ptr_sz),
+            TypeSpecifier::Pointer(_, _)
+            | TypeSpecifier::FunctionPointer(_, _, _)
+            | TypeSpecifier::NullPtrT => Some(ptr_sz),
             TypeSpecifier::Array(elem, Some(size)) => {
                 let elem_size = self.sizeof_type_spec(elem)?;
                 let n = self.eval_const_expr(size)?.to_i64()?;
@@ -1160,8 +1181,8 @@ impl<'a> SemaConstEval<'a> {
                 }
                 Some(0)
             }
-            TypeSpecifier::Enum(name, variants, is_packed) => Some(
-                self.resolve_enum_type(name, variants, *is_packed)
+            TypeSpecifier::Enum(name, variants, is_packed, underlying) => Some(
+                self.resolve_enum_type(name, variants, *is_packed, underlying.as_deref())
                     .packed_size(),
             ),
             TypeSpecifier::TypedefName(name) => {
@@ -1230,7 +1251,10 @@ impl<'a> SemaConstEval<'a> {
         let ptr_sz = target_ptr_size();
         match spec {
             TypeSpecifier::Void | TypeSpecifier::Bool => 1,
-            TypeSpecifier::Char | TypeSpecifier::UnsignedChar => 1,
+            TypeSpecifier::Char
+            | TypeSpecifier::SignedChar
+            | TypeSpecifier::UnsignedChar
+            | TypeSpecifier::PlainUnsignedChar => 1,
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => 2,
             TypeSpecifier::Int
             | TypeSpecifier::UnsignedInt
@@ -1276,7 +1300,9 @@ impl<'a> SemaConstEval<'a> {
                     16
                 }
             }
-            TypeSpecifier::Pointer(_, _) | TypeSpecifier::FunctionPointer(_, _, _) => ptr_sz,
+            TypeSpecifier::Pointer(_, _)
+            | TypeSpecifier::FunctionPointer(_, _, _)
+            | TypeSpecifier::NullPtrT => ptr_sz,
             TypeSpecifier::Array(elem, _) => self.alignof_type_spec(elem),
             TypeSpecifier::Struct(
                 tag,
@@ -1341,8 +1367,13 @@ impl<'a> SemaConstEval<'a> {
                 }
                 struct_aligned.unwrap_or(1)
             }
-            TypeSpecifier::Enum(name, variants, is_packed) => {
-                let enum_type = CType::Enum(self.resolve_enum_type(name, variants, *is_packed));
+            TypeSpecifier::Enum(name, variants, is_packed, underlying) => {
+                let enum_type = CType::Enum(self.resolve_enum_type(
+                    name,
+                    variants,
+                    *is_packed,
+                    underlying.as_deref(),
+                ));
                 enum_type.align_ctx(&*self.types.borrow_struct_layouts())
             }
             TypeSpecifier::TypedefName(name) => {
@@ -1407,10 +1438,10 @@ impl<'a> SemaConstEval<'a> {
             }
             TypeSpecifier::TypeofType(inner) => self.preferred_alignof_type_spec(inner),
             // An 8-byte enum prefers 8 like `long long` (GCC `__alignof__`, -m32).
-            TypeSpecifier::Enum(name, variants, is_packed) => {
-                CType::Enum(self.resolve_enum_type(name, variants, *is_packed))
-                    .preferred_align_ctx(&*self.types.borrow_struct_layouts())
-            }
+            TypeSpecifier::Enum(name, variants, is_packed, underlying) => CType::Enum(
+                self.resolve_enum_type(name, variants, *is_packed, underlying.as_deref()),
+            )
+            .preferred_align_ctx(&*self.types.borrow_struct_layouts()),
             TypeSpecifier::Typeof(expr, _) => {
                 if let Some(ctype) = self.infer_expr_ctype(expr) {
                     ctype.preferred_align_ctx(&*self.types.borrow_struct_layouts())
@@ -1508,7 +1539,9 @@ impl<'a> SemaConstEval<'a> {
             TypeSpecifier::Void => CType::Void,
             TypeSpecifier::Bool => CType::Bool,
             TypeSpecifier::Char => CType::Char,
+            TypeSpecifier::SignedChar => CType::SChar,
             TypeSpecifier::UnsignedChar => CType::UChar,
+            TypeSpecifier::PlainUnsignedChar => CType::PlainUChar,
             TypeSpecifier::Short => CType::Short,
             TypeSpecifier::UnsignedShort => CType::UShort,
             TypeSpecifier::Int | TypeSpecifier::Signed => CType::Int,
@@ -1592,9 +1625,9 @@ impl<'a> SemaConstEval<'a> {
                     CType::Int // anonymous union without context
                 }
             }
-            TypeSpecifier::Enum(name, variants, is_packed) => {
-                CType::Enum(self.resolve_enum_type(name, variants, *is_packed))
-            }
+            TypeSpecifier::Enum(name, variants, is_packed, underlying) => CType::Enum(
+                self.resolve_enum_type(name, variants, *is_packed, underlying.as_deref()),
+            ),
             TypeSpecifier::TypeofType(inner) => self.ctype_from_type_spec(inner),
             TypeSpecifier::FunctionPointer(_, _, _) => {
                 CType::Pointer(Box::new(CType::Void), AddressSpace::Default) // function pointers are pointer-sized
