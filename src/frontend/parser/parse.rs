@@ -230,6 +230,8 @@ pub(super) struct ParsedDeclAttrs {
     pub parsing_visibility: Option<String>,
     /// `__attribute__((section("...")))` section name.
     pub parsing_section: Option<String>,
+    /// `__attribute__((tls_model("...")))` per-symbol ELF TLS model.
+    pub parsing_tls_model: Option<String>,
     /// `__attribute__((cleanup(func)))` cleanup function name.
     pub parsing_cleanup_fn: Option<String>,
     /// `__attribute__((symver("name@@VERSION")))` symbol version string.
@@ -1712,6 +1714,20 @@ impl Parser {
             "section" | "__section__" => {
                 self.advance();
                 self.attrs.parsing_section = self.parse_string_attr_arg();
+            }
+            "tls_model" | "__tls_model__" => {
+                let span = self.peek_span();
+                self.advance();
+                let model = self.parse_string_attr_arg();
+                if let Some(ref value) = model
+                    && !matches!(
+                        value.as_str(),
+                        "local-exec" | "initial-exec" | "local-dynamic" | "global-dynamic"
+                    )
+                {
+                    self.emit_error(format!("unknown TLS model '{value}'"), span);
+                }
+                self.attrs.parsing_tls_model = model;
             }
             "__diagnose_as"
             | "diagnose_as"

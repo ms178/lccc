@@ -146,12 +146,15 @@ fn walk_list<'a>(
         loop {
             // Leave completed aggregates (brace elision continues in the
             // enclosing one).
-            while frame_done(cx, stack.last().expect("non-empty")) {
+            while stack.last().is_some_and(|top| frame_done(cx, top)) {
                 if stack.len() == 1 {
                     break 'items; // excess initializers
                 }
                 stack.pop();
-                advance(stack.last_mut().expect("non-empty"));
+                let Some(parent) = stack.last_mut() else {
+                    break 'items;
+                };
+                advance(parent);
             }
             let Some((child_ty, child_path, child_bits)) = current_child(cx, &stack) else {
                 break 'items;
@@ -159,7 +162,10 @@ fn walk_list<'a>(
             match &item.init {
                 Initializer::List(_) => {
                     walk(cx, &child_ty, child_path, child_bits, &item.init, out);
-                    advance(stack.last_mut().expect("non-empty"));
+                    let Some(top) = stack.last_mut() else {
+                        break 'items;
+                    };
+                    advance(top);
                     break;
                 }
                 Initializer::Expr(expr) => {
@@ -173,7 +179,10 @@ fn walk_list<'a>(
                         expr,
                         bit_width: child_bits,
                     });
-                    advance(stack.last_mut().expect("non-empty"));
+                    let Some(top) = stack.last_mut() else {
+                        break 'items;
+                    };
+                    advance(top);
                     break;
                 }
             }
@@ -274,8 +283,10 @@ fn designate(cx: &dyn InitContext, stack: &mut Vec<Frame>, designator: &Designat
             };
             let last = chain.len() - 1;
             for (k, pos) in chain.into_iter().enumerate() {
-                let f = stack.last_mut().expect("non-empty");
-                f.pos = pos;
+                let Some(top) = stack.last_mut() else {
+                    return false;
+                };
+                top.pos = pos;
                 if k < last {
                     let Some((child_ty, child_path, _)) = current_child(cx, stack) else {
                         return false;

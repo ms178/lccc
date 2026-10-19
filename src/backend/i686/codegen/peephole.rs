@@ -13698,6 +13698,24 @@ fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
     }
 }
 
+/// Lower the opaque GNU2 descriptor call after register-aware optimization.
+/// Its ABI preserves i386 homes other than the EAX result, unlike cdecl.
+pub fn lower_tls_call_markers(asm: String) -> String {
+    if !asm.contains("lccc_tls_call32") {
+        return asm;
+    }
+    asm.split_inclusive('\n')
+        .map(|line| {
+            let trimmed = line.trim();
+            if let Some(symbol) = trimmed.strip_prefix("lccc_tls_call32 ") {
+                format!("    call *{}@TLSCALL(%eax)\n", symbol)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect()
+}
+
 pub fn peephole_optimize(asm: String) -> String {
     if let Ok(path) = std::env::var("LCCC_DEBUG_PEEPHOLE_IN") {
         let _ = std::fs::write(path, &asm);

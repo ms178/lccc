@@ -122,8 +122,15 @@ impl SymbolTable {
         self.scopes.push(Scope::new());
     }
 
-    pub fn pop_scope(&mut self) {
+    /// Pop one block scope, returning whether a scope was removed.
+    /// File scope is permanent; an unbalanced caller gets `false` without
+    /// corrupting all subsequent name resolution.
+    pub fn pop_scope(&mut self) -> bool {
+        if self.scopes.len() <= 1 {
+            return false;
+        }
         self.scopes.pop();
+        true
     }
 
     pub fn declare(&mut self, symbol: Symbol) {
@@ -386,5 +393,15 @@ mod binding_depth_tests {
             Some(0),
             "and it stops at the scope end"
         );
+    }
+
+    #[test]
+    fn unbalanced_pop_never_destroys_file_scope() {
+        let mut table = SymbolTable::new();
+        table.declare(fn_sym("before"));
+        assert!(!table.pop_scope());
+        assert_eq!(table.lookup_depth("before"), Some(0));
+        table.declare(fn_sym("after"));
+        assert_eq!(table.lookup_depth("after"), Some(0));
     }
 }

@@ -1761,6 +1761,7 @@ impl Lowerer {
             is_const: false,
             is_used: false,
             is_thread_local: false,
+            tls_model: None,
         });
 
         GlobalInit::GlobalAddr(label)

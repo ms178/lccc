@@ -367,6 +367,54 @@ fn mapped_gep_memory_access(
     }
 }
 
+/// TLS accesses carry model-specific segment/GOT semantics that the generic
+/// MachInst memory selector cannot reconstruct from a materialized pointer.
+/// Keep root-symbol accesses on the address-aware path, where LE/IE folding
+/// and dynamic-model legality are decided together.
+fn tls_global_memory_access(inst: &Instruction, tls_global_addrs: &FxHashSet<u32>) -> bool {
+    match inst {
+        Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
+            tls_global_addrs.contains(&ptr.0)
+        }
+        _ => false,
+    }
+}
+
+/// TLS roots whose every use is an integer/pointer load can be omitted: the
+/// x86-64 load hook reconstructs LE directly or loads the IE GOT offset. Keep
+/// stores and FP/wide loads out until their staging rules have dedicated folds.
+fn foldable_tls_load_roots(func: &IrFunction, tls_global_addrs: &FxHashSet<u32>) -> FxHashSet<u32> {
+    let mut foldable = tls_global_addrs.clone();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Load { ptr, ty, .. } = inst
+                && foldable.contains(&ptr.0)
+                && matches!(
+                    ty,
+                    IrType::I8
+                        | IrType::U8
+                        | IrType::I16
+                        | IrType::U16
+                        | IrType::I32
+                        | IrType::U32
+                        | IrType::I64
+                        | IrType::U64
+                        | IrType::Ptr
+                )
+            {
+                continue;
+            }
+            for used in inst.used_values() {
+                foldable.remove(&used);
+            }
+        }
+        for used in block.terminator.used_values() {
+            foldable.remove(&used);
+        }
+    }
+    foldable
+}
+
 fn can_indexed_addr_fold(
     cg: &dyn ArchCodegen,
     info: &IndexedGepInfo,
@@ -3963,6 +4011,12 @@ fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
         }
         if global.is_thread_local {
             state.tls_symbols.insert(global.name.clone());
+            if !global.is_extern {
+                state.tls_definitions.insert(global.name.clone());
+            }
+            if let Some(model) = global.tls_model {
+                state.tls_models.insert(global.name.clone(), model);
+            }
         }
         if global.is_weak && global.is_extern {
             state.weak_extern_symbols.insert(global.name.clone());
@@ -4962,6 +5016,36 @@ fn generate_function(
         m
     };
 
+    let tls_global_addrs: FxHashSet<u32> = func
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::GlobalAddr { dest, name } if cg.state_ref().tls_symbols.contains(name) => {
+                Some(dest.0)
+            }
+            _ => None,
+        })
+        .collect();
+    let tls_load_addrs: FxHashSet<u32> = func
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::GlobalAddr { dest, name }
+                if cg.state_ref().tls_symbols.contains(name)
+                    && (cg.supports_tls_dynamic_load_fold()
+                        || matches!(
+                            cg.state_ref().tls_model_for_symbol(name),
+                            crate::ir::reexports::TlsModel::LocalExec
+                                | crate::ir::reexports::TlsModel::InitialExec
+                        )) =>
+            {
+                Some(dest.0)
+            }
+            _ => None,
+        })
+        .collect();
     let mut global_addr_map = build_global_addr_map(
         func,
         &cg.state_ref().tls_symbols,
@@ -5002,6 +5086,9 @@ fn generate_function(
         FxHashSet::default()
     };
     dead_global_addrs.extend(remat_global_addrs.iter().copied());
+    if cg.supports_global_addr_fold() && !cg.state_ref().disable_regalloc {
+        dead_global_addrs.extend(foldable_tls_load_roots(func, &tls_load_addrs));
+    }
     // PF-07: the prologue promoted PIC indexed-symbol bases (defined at a
     // shallower loop depth than their consumers) out of the
     // never-materialized set so RA homes them. Honour that here: skipping
@@ -5924,6 +6011,7 @@ fn generate_function(
             // pointer home instead of using the indexed-address map.  Route
             // every map-managed access through the address-aware generator.
             if !mapped_gep_memory_access(inst, &gep_fold_map, &indexed_gep_map)
+                && !tls_global_memory_access(inst, &tls_global_addrs)
                 && cg.try_lower_machinst(inst, &dead_global_addrs)
             {
                 cg.state().current_program_point += 1;

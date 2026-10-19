@@ -2160,6 +2160,7 @@ pub(crate) fn is_known_reloc_modifier(m: &str) -> bool {
             | "INDNTPOFF"
             | "TLSGD"
             | "TLSLD"
+            | "TLSLDM"
             | "DTPMOD"
             | "DTPOFF"
             | "TLSDESC"

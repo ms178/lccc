@@ -14,7 +14,17 @@ use crate::frontend::parser::ast::{
     Declaration, DerivedDeclarator, Expr, InitDeclarator, Initializer, TypeSpecifier,
 };
 use crate::ir::lowering::const_object_images::{ConstObjectImage, const_object_bytes};
-use crate::ir::reexports::{GlobalInit, IrGlobal};
+use crate::ir::reexports::{GlobalInit, IrGlobal, TlsModel};
+
+pub(super) fn lower_tls_model(model: Option<&str>) -> Option<TlsModel> {
+    match model {
+        Some("local-exec") => Some(TlsModel::LocalExec),
+        Some("initial-exec") => Some(TlsModel::InitialExec),
+        Some("local-dynamic") => Some(TlsModel::LocalDynamic),
+        Some("global-dynamic") => Some(TlsModel::GlobalDynamic),
+        _ => None,
+    }
+}
 
 enum RedeclResult {
     Skip,
@@ -295,6 +305,22 @@ impl Lowerer {
         if !decl.is_extern() || declarator.init.is_some() {
             return false;
         }
+        // GCC applies an explicit tls_model on the latest redeclaration. Keep
+        // the single canonical IrGlobal, but refresh its policy rather than
+        // silently freezing the first declaration's attribute. An unannotated
+        // redeclaration deliberately leaves the inherited policy unchanged.
+        if decl.is_thread_local() {
+            if let Some(model) = lower_tls_model(declarator.attrs.tls_model.as_deref()) {
+                if let Some(global) = self
+                    .module
+                    .globals
+                    .iter_mut()
+                    .find(|global| global.name == declarator.name)
+                {
+                    global.tls_model = Some(model);
+                }
+            }
+        }
         // `int x[]; extern int x[300];` -- the extern declaration completes
         // the composite type of the earlier tentative definition (C11
         // 6.2.7p3), whose storage therefore has 300 elements, not one.
@@ -354,6 +380,7 @@ impl Lowerer {
                 is_const: false,
                 is_used: false,
                 is_thread_local: true,
+                tls_model: lower_tls_model(declarator.attrs.tls_model.as_deref()),
             });
             self.emitted_global_names.insert(declarator.name.clone());
         }
@@ -710,6 +737,7 @@ impl Lowerer {
             is_const: var_is_const,
             is_used: declarator.attrs.is_used(),
             is_thread_local: decl.is_thread_local(),
+            tls_model: lower_tls_model(declarator.attrs.tls_model.as_deref()),
         });
     }
 

@@ -23,6 +23,7 @@ use super::emit::I686Codegen;
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
 use crate::emit;
+use crate::ir::reexports::TlsModel;
 use crate::ir::reexports::{IrConst, Operand, Value};
 
 /// Return the register spelling needed for a scalar store of `ty`.
@@ -244,12 +245,33 @@ impl I686Codegen {
             None => ("eax", true),
         };
 
-        if self.state.pic_mode {
-            emit!(self.state, "    movl {}@GOTNTPOFF(%ebx), %{}", name, reg);
-            emit!(self.state, "    addl %gs:0, %{}", reg);
-        } else {
-            emit!(self.state, "    movl %gs:0, %{}", reg);
-            emit!(self.state, "    addl ${}@NTPOFF, %{}", name, reg);
+        let model = self.state.tls_model_for_symbol(name);
+        match model {
+            TlsModel::LocalExec => {
+                emit!(self.state, "    movl %gs:0, %{}", reg);
+                emit!(self.state, "    addl ${}@NTPOFF, %{}", name, reg);
+            }
+            TlsModel::InitialExec => {
+                if self.state.pic_mode {
+                    emit!(self.state, "    movl {}@GOTNTPOFF(%ebx), %{}", name, reg);
+                } else {
+                    emit!(self.state, "    movl {}@INDNTPOFF, %{}", name, reg);
+                }
+                emit!(self.state, "    addl %gs:0, %{}", reg);
+            }
+            TlsModel::GlobalDynamic | TlsModel::LocalDynamic => {
+                // GNU2 TLS descriptors have the same crucial property on
+                // i386 as x86-64: the special resolver ABI preserves every
+                // allocator home other than the EAX result. This is shorter
+                // than classic GD/LDM and remains linker-relaxable.
+                emit!(self.state, "    leal {}@TLSDESC(%ebx), %eax", name);
+                emit!(self.state, "    lccc_tls_call32 {}", name);
+                emit!(self.state, "    addl %gs:0, %eax");
+                if reg != "eax" {
+                    emit!(self.state, "    movl %eax, %{}", reg);
+                }
+                self.state.reg_cache.invalidate_all();
+            }
         }
 
         if needs_store {

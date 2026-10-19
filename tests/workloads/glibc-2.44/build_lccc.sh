@@ -33,20 +33,16 @@ GLIBC_COMMIT=afd131806b25715a7617ab757db43f0bb610acbf
 TARBALL=${GLIBC_TARBALL:-$CACHE/glibc-$GLIBC_COMMIT.tar.gz}
 TARBALL_URL=https://github.com/bminor/glibc/archive/$GLIBC_COMMIT.tar.gz
 TARBALL_SHA256=764ea4a5f2aebf9d9b61f07a50a1f54854055a913dd66a0f05e1d0a9b7f08bb2
-EXPECTED_ARCHPKGBUILDS_REV=4587e7caa08ada404dd603be8ae066ae8745220e
 PATCH=${MS178_GLIBC_PATCH:-/home/user/archpkgbuilds/toolchain-stable/glibc/ms178-glibc.patch}
 PATCH_SHA256=52c9953f8e3ec710d73308464bd98bbe752895d83c6b17201235edcb1c974aeb
 BINUTILS=${GLIBC_BINUTILS_PREFIX:-/home/user/tools/binutils-2.47/bin}
 JOBS=${JOBS:-2}
-# C and C++ host tools are a pair: glibc's support helper uses the C++
-# compiler's private headers, while the smoke setup queries the C compiler.
-# Requiring both overrides prevents an accidental gcc/clang split.
-if [[ ${HOST_CC+x} != "${HOST_CXX+x}" ]]; then
-    echo 'error: set HOST_CC and HOST_CXX together' >&2
-    exit 2
-fi
-HOST_CC=${HOST_CC:-$(command -v gcc || true)}
-HOST_CXX=${HOST_CXX:-$(command -v g++ || true)}
+# Host compiler values are bare executable paths (no wrapper arguments). A
+# single recognized override derives its same-install sibling; arbitrary
+# wrappers must provide both explicitly. Target coherence is still mandatory.
+# shellcheck source=tests/workloads/glibc-2.44/build_guards.sh
+source "$ROOT/tests/workloads/glibc-2.44/build_guards.sh"
+glibc_resolve_host_pair "${HOST_CC-}" "${HOST_CXX-}"
 # The resulting glibc is loaded at process startup, so Initial-Exec TLS is
 # valid and avoids Local-Dynamic __tls_get_addr sequences. It is not a safe
 # default for arbitrary DSOs that may be dlopen'd after threads exist.
@@ -56,32 +52,16 @@ mkdir -p "$WORK" "$CACHE"
 "$ROOT/scripts/ensure_swap.sh"
 [[ -x "$LCCC" ]] || { echo "error: LCCC is not executable: $LCCC" >&2; exit 2; }
 [[ -x "$LCCC_LD" ]] || { echo "error: lccc-ld is not executable: $LCCC_LD" >&2; exit 2; }
-[[ -x "$HOST_CC" ]] || { echo "error: HOST_CC is not executable: $HOST_CC" >&2; exit 2; }
-[[ -x "$HOST_CXX" ]] || { echo "error: HOST_CXX is not executable: $HOST_CXX" >&2; exit 2; }
-host_cc_target=$($HOST_CC -dumpmachine)
-host_cxx_target=$($HOST_CXX -dumpmachine)
-[[ $host_cc_target == "$host_cxx_target" ]] || {
-    echo "error: incoherent host compiler targets: CC=$host_cc_target CXX=$host_cxx_target" >&2
-    exit 2
-}
 [[ -f "$PATCH" ]] || { echo "error: ms178 patch not found: $PATCH" >&2; exit 2; }
 patch_sha=$(sha256sum "$PATCH" | awk '{print $1}')
 [[ "$patch_sha" == "$PATCH_SHA256" ]] || {
     echo "error: ms178 patch checksum mismatch: $patch_sha (expected $PATCH_SHA256)" >&2
     exit 1
 }
-# Capture provenance from the checkout that actually supplied the patch.  The
-# checksum remains the content authority; when this is the pinned
-# archpkgbuilds checkout, also reject a stale/wrong Git revision.
-ARCHPKGBUILDS_REV=not-a-git-checkout
-ARCHPKGBUILDS_DIR=
-if ARCHPKGBUILDS_DIR=$(git -C "$(dirname "$PATCH")" rev-parse --show-toplevel 2>/dev/null); then
-    ARCHPKGBUILDS_REV=$(git -C "$ARCHPKGBUILDS_DIR" rev-parse HEAD)
-    [[ $ARCHPKGBUILDS_REV == "$EXPECTED_ARCHPKGBUILDS_REV" ]] || {
-        echo "error: archpkgbuilds revision $ARCHPKGBUILDS_REV (expected $EXPECTED_ARCHPKGBUILDS_REV)" >&2
-        exit 1
-    }
-fi
+# Log the supplying checkout when available, but do not confuse repository HEAD
+# with consumed input identity: PATCH_SHA256 is the content authority. The same
+# verified bytes remain valid after unrelated commits or when copied elsewhere.
+ARCHPKGBUILDS_REV=$(glibc_patch_git_provenance "$PATCH")
 # A path containing "2.47" proves nothing.  Every binutils program the build
 # invokes is independently checked with the shared exact-token policy.
 # ROOT is computed from this script's location.
@@ -117,10 +97,10 @@ STAGE="$WORK/stage-lccc"
 # compile.  It is safe only when every build input agrees with the receipt from
 # the completed build; path or version-string equality is insufficient.
 if [[ ${GLIBC_REUSE_BUILD:-0} == 1 ]]; then
-    python3 - "$WORK/manifest.json" "$archive_sha" "$patch_sha" "$LCCC" "$LCCC_LD" "$BINUTILS" "$CFLAGS" "$GLIBC_COMMIT" "$ARCHPKGBUILDS_REV" "$HOST_CC" "$HOST_CXX" <<'PY'
+    python3 - "$WORK/manifest.json" "$archive_sha" "$patch_sha" "$LCCC" "$LCCC_LD" "$BINUTILS" "$CFLAGS" "$GLIBC_COMMIT" "$HOST_CC" "$HOST_CXX" <<'PY'
 import hashlib, json, pathlib, sys
 (manifest, archive, patch, lccc, ld, binutils, cflags, commit,
- archpkgbuilds_rev, host_cc, host_cxx) = sys.argv[1:]
+ host_cc, host_cxx) = sys.argv[1:]
 def digest(path):
     h = hashlib.sha256()
     with open(path, 'rb') as f:
@@ -130,8 +110,7 @@ p = pathlib.Path(manifest)
 if not p.is_file(): raise SystemExit(f'error: reuse manifest missing: {p}')
 got = json.loads(p.read_text())
 expected = {
-    'schema': 2, 'source_commit': commit,
-    'archpkgbuilds_revision': archpkgbuilds_rev, 'archive_sha256': archive,
+    'schema': 2, 'source_commit': commit, 'archive_sha256': archive,
     'ms178_patch_sha256': patch, 'cflags': cflags,
     'lccc': str(pathlib.Path(lccc).resolve()), 'lccc_sha256': digest(lccc),
     'lccc_ld': str(pathlib.Path(ld).resolve()), 'lccc_ld_sha256': digest(ld),
@@ -148,25 +127,11 @@ if diffs:
 PY
 fi
 if [[ ${GLIBC_REUSE_BUILD:-0} != 1 ]]; then
-    # rm -rf is intentionally confined to three known children of WORK.  This
-    # catches empty/root/home overrides and symlink/.. escapes before deleting.
-    work_real=$(realpath -m -- "$WORK")
-    [[ $work_real != / && $work_real != "$HOME" ]] || {
-        echo "error: refusing destructive GLIBC_WORK_DIR: $work_real" >&2
-        exit 2
-    }
-    safe_remove_tree() {
-        local candidate_real
-        candidate_real=$(realpath -m -- "$1")
-        case "$candidate_real" in
-            "$work_real"/glibc-*|"$work_real"/build-lccc|"$work_real"/stage-lccc)
-                rm -rf --one-file-system -- "$candidate_real" ;;
-            *) echo "error: refusing rm outside guarded work children: $candidate_real" >&2; exit 2 ;;
-        esac
-    }
-    safe_remove_tree "$SRC"
-    safe_remove_tree "$BUILD"
-    safe_remove_tree "$STAGE"
+    # rm -rf is confined to three named canonical children. Symlink and `..`
+    # escapes are rejected by the independently tested helper.
+    glibc_safe_remove_tree "$WORK" "$SRC"
+    glibc_safe_remove_tree "$WORK" "$BUILD"
+    glibc_safe_remove_tree "$WORK" "$STAGE"
     tar -xf "$TARBALL" -C "$WORK"
     patch --dry-run -Np1 --fuzz=0 -i "$PATCH" -d "$SRC" >/dev/null
     patch -Np1 --fuzz=0 -i "$PATCH" -d "$SRC" >/dev/null
@@ -181,19 +146,18 @@ if [[ ${GLIBC_REUSE_BUILD:-0} != 1 ]]; then
     CXX="$HOST_CXX -isystem $gcc_include"
     [[ -z "$multiarch" || ! -d "/usr/include/$multiarch" ]] || CXX+=" -isystem /usr/include/$multiarch"
     BINUTILS_PATH="$BINUTILS:$(dirname "$LCCC"):/usr/bin"
-    BUILD_CFLAGS=$CFLAGS
     {
         printf 'source_commit=%s\narchive_sha256=%s\npatch_sha256=%s\n' \
             "$GLIBC_COMMIT" "$archive_sha" "$patch_sha"
         printf 'archpkgbuilds_revision=%s\nhost_cc=%s\nhost_cxx=%s\nhost_target=%s\n' \
-            "$ARCHPKGBUILDS_REV" "$HOST_CC" "$HOST_CXX" "$host_cc_target"
-        "$HOST_CC" --version | head -n1
-        "$HOST_CXX" --version | head -n1
+            "$ARCHPKGBUILDS_REV" "$HOST_CC" "$HOST_CXX" "$HOST_TARGET"
+        glibc_version_line "$HOST_CC"
+        glibc_version_line "$HOST_CXX"
     } | tee "$BUILD/inputs.log"
     report_build_failure() {
         local status=$?
-        echo "error: glibc build failed (status $status); log tails:" >&2
-        tail -n 40 "$BUILD"/{configure,build,install}.log 2>/dev/null >&2 || true
+        trap - ERR
+        glibc_report_build_failure "$status" "$BUILD"
         exit "$status"
     }
     trap report_build_failure ERR
@@ -202,7 +166,7 @@ if [[ ${GLIBC_REUSE_BUILD:-0} != 1 ]]; then
         PATH="$BINUTILS_PATH" CC="$LCCC" CXX="$CXX" LD="$LCCC_LD" \
           AS="$BINUTILS/as" AR="$BINUTILS/ar" RANLIB="$BINUTILS/ranlib" \
           OBJDUMP="$BINUTILS/objdump" READELF="$BINUTILS/readelf" \
-          CPPFLAGS='-D_FORTIFY_SOURCE=0' CFLAGS="$BUILD_CFLAGS" CXXFLAGS="$BUILD_CFLAGS" \
+          env CPPFLAGS='-D_FORTIFY_SOURCE=0' CFLAGS="$CFLAGS" CXXFLAGS="$CFLAGS" \
           "$SRC/configure" \
             --prefix="$WORK/install-lccc" \
             --libdir="$WORK/install-lccc/lib" \
@@ -270,8 +234,12 @@ def digest(path):
         for block in iter(lambda: f.read(1024 * 1024), b''): h.update(block)
     return h.hexdigest()
 def v(cmd):
-    try: return subprocess.run([cmd, '--version'], capture_output=True, text=True).stdout.splitlines()[0]
-    except OSError as e: return f'{type(e).__name__}: {e}'
+    try:
+        result = subprocess.run([cmd, '--version'], capture_output=True, text=True)
+    except OSError as e:
+        return f'{type(e).__name__}: {e}'
+    lines = (result.stdout or result.stderr).splitlines()
+    return lines[0] if lines else f'<empty version output; exit={result.returncode}>'
 p = {
   'schema': 2, 'workload': 'glibc', 'version': '2.44+r25+gafd131806b',
   'source_commit': commit, 'archpkgbuilds_revision': archpkgbuilds_rev,
