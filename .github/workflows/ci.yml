@@ -539,6 +539,7 @@ jobs:
       run: env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_a9987_salvage.sh
     - name: ext_vector_type padded layout vs the compiler oracle
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_layout.sh
+
     - name: Ext-vector rvalue subscript cross-ABI
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_rvalue_subscript.sh
     - name: ext_vector_type cross-compiler by-value ABI
@@ -640,6 +641,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_shuffle_diagnostics.sh
     - name: ext-vector swizzle diagnostics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_swizzle_diagnostics.sh
+    - name: vector scalar conversion diagnostics
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_scalar_conversions.sh
     - name: Subscript constraint diagnostics
       run: env CCC=target/fastbuild/lccc python3 tests/regression/check_subscript_diagnostics.py
     - name: Cross-target intrinsic trap

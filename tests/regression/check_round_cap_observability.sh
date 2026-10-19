@@ -82,13 +82,21 @@ fail = 0
 exempt = 0
 returns = []
 for n, line in enumerate(lines, 1):
-    if re.fullmatch(r"\s*return;\s*", line):
+    # Comment-stripped code only. Match the unit-return TOKEN, not the
+    # whole line: a fullmatch on `\s*return;\s*` silently missed one-line
+    # forms (`if (c) { return; }`, `} else { return; }`), so a future
+    # compact early exit could skip the report without this gate noticing.
+    # `return EXPR;` stays out of scope: it can only appear inside a
+    # nested closure in this unit-returning function (the i686 walk below
+    # has one), and a closure return never exits the pipeline.
+    code = line.split("//")[0]
+    if re.search(r"\breturn;", code):
         window = "\n".join(lines[max(0, n - 9):n])
         if 'pass_disabled(&disabled, "all")' in window:
             exempt += 1
             continue
         if "round_cap::report()" not in window:
-            print(f"FAIL: run_passes body line {n}: bare 'return;' without a "
+            print(f"FAIL: run_passes body line {n}: 'return' without a "
                   f"round_cap::report() dominating it", file=sys.stderr)
             fail = 1
         returns.append(n)

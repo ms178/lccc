@@ -5,6 +5,19 @@ use crate::frontend::parser::ast::{BinOp, Expr, TypeSpecifier, UnaryOp};
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
 
 impl Lowerer {
+    /// [`lower_lvalue`] for a destination that will be STORED through
+    /// (assignment LHS, ++/--, unary `&` on a lane): value-only vector
+    /// subscript bases (call results, ternaries, commas, casts) are
+    /// diagnosed as "expression is not assignable" instead of materializing
+    /// a temporary the store would silently die in.
+    pub(super) fn lower_lvalue_for_mutation(&mut self, expr: &Expr) -> Option<LValue> {
+        let saved = self.lvalue_for_mutation;
+        self.lvalue_for_mutation = true;
+        let lv = self.lower_lvalue(expr);
+        self.lvalue_for_mutation = saved;
+        lv
+    }
+
     /// Try to get the lvalue (address) of an expression.
     /// Returns Some(LValue) if the expression is an lvalue, None otherwise.
     pub(super) fn lower_lvalue(&mut self, expr: &Expr) -> Option<LValue> {
@@ -103,11 +116,35 @@ impl Lowerer {
                 }
             }
             Expr::ArraySubscript(base, index, _) => {
+                let base_ct = self.expr_ctype(base);
+                // A lane of a vector RVALUE is not an lvalue, exactly like a
+                // multi-component swizzle temporary: the object the index
+                // addresses dies at the end of the full expression, so a
+                // store would be silently discarded (the read
+                // materialization in `get_array_base_addr` stages it in an
+                // anonymous temporary). GCC and Clang both diagnose every
+                // one of these forms (`lvalue required as left operand of
+                // assignment` / `expression is not assignable`):
+                // `f()[0] = x`, `(c ? v : w)[0] = x`, `(0, v)[0] = x`,
+                // `((Vec)v)[0] = x` and the lane through a call-returned
+                // aggregate `sf().v[0] = x`. Statement expressions keep
+                // their tail's value category in both oracles, so
+                // `({ v; })[0] = x` stays assignable, and
+                // `vecarr[i][0]`/`p[i].vec[0]` write through too. Only a
+                // mutation context diagnoses: reads of the same
+                // non-storage bases share this arm (bit-packed `_Bool`
+                // lanes reach the byte/bit LValue here) and are legal.
+                if base_ct.is_vector()
+                    && self.lvalue_for_mutation
+                    && !Self::vector_subscript_base_is_lvalue(base)
+                {
+                    self.emit_error("expression is not assignable", expr.span());
+                    return None;
+                }
                 // A _Bool ext-vector lane has no separately addressable byte;
                 // retain its containing-byte address and dynamic bit position
                 // so reads and read-modify-write assignments can use the packed
                 // representation without manufacturing `&v[i]`.
-                let base_ct = self.expr_ctype(base);
                 if base_ct.is_bitpacked_bool_vector() {
                     let ptr_int_ty = crate::common::types::target_int_ir_type();
                     let index_ty = self.value_ir_type(index);
@@ -914,17 +951,25 @@ impl Lowerer {
     pub(super) fn compute_array_element_addr(&mut self, base: &Expr, index: &Expr) -> Value {
         // In C, a[i] == i[a] == *(a + i). The parser always puts the expression
         // before '[' as base and the one inside as index. We normalize so the
-        // pointer/array is always the base.
-        let (actual_base, actual_index) =
-            if self.expr_is_pointer(base) || self.expr_is_array_name(base) {
-                (base, index)
-            } else if self.expr_is_pointer(index) || self.expr_is_array_name(index) {
-                // Reverse subscript: integer[array] -> swap to array[integer]
-                (index, base)
-            } else {
-                // Default: assume first is base
-                (base, index)
-            };
+        // pointer/array is always the base. A vector operand plays the base
+        // role for the same reason: vector subscripting addresses lanes of
+        // the vector operand, not of the integer, so `0[f()]` reads lane 0
+        // of the call result and must not index address 0 with the vector.
+        let (actual_base, actual_index) = if self.expr_is_pointer(base)
+            || self.expr_is_array_name(base)
+            || self.expr_ctype(base).is_vector()
+        {
+            (base, index)
+        } else if self.expr_is_pointer(index)
+            || self.expr_is_array_name(index)
+            || self.expr_ctype(index).is_vector()
+        {
+            // Reverse subscript: integer[array-or-vector] -> swap
+            (index, base)
+        } else {
+            // Default: assume first is base
+            (base, index)
+        };
 
         let ptr_int_ty = crate::common::types::target_int_ir_type();
         // The storage annotation can be I64 for an I32 arithmetic result.
@@ -1091,6 +1136,35 @@ impl Lowerer {
 
     /// Get the base address for an array expression.
     /// For declared arrays, this is the alloca itself.
+    /// Whether the base of a vector subscript designates STORAGE, so that
+    /// its lanes are assignable lvalues: plain identifiers (locals, params,
+    /// globals), dereferences, pointer member access, compound literals,
+    /// statement expressions (both oracles keep the tail's value category),
+    /// nested subscripts (`p[i].vec[0]` dereferences a pointer — always an
+    /// object — and `vecarr[i][0]` addresses an element of an array
+    /// object), and member access whose aggregate base itself has storage
+    /// (`s.vec[0]` but NOT `sf().vec[0]`: both oracles reject the lane
+    /// store through a call-returned struct). Everything else — call
+    /// results, conditionals, comma chains, casts — is a value-only
+    /// temporary whose lanes die with the full expression; assignments to
+    /// them are diagnosed, not miscompiled. This predicate is deliberately
+    /// separate from the packed-carrier classifier that drives the read
+    /// materialization: that one answers the carrier question (register
+    /// image vs. address), while this one answers the C value-category
+    /// question for stores.
+    fn vector_subscript_base_is_lvalue(base: &Expr) -> bool {
+        match base {
+            Expr::Identifier(..)
+            | Expr::Deref(..)
+            | Expr::PointerMemberAccess(..)
+            | Expr::ArraySubscript(..)
+            | Expr::CompoundLiteral(..)
+            | Expr::StmtExpr(..) => true,
+            Expr::MemberAccess(obj, _, _) => Self::vector_subscript_base_is_lvalue(obj),
+            _ => false,
+        }
+    }
+
     /// For pointers, this is the loaded pointer value.
     /// For nested subscripts (a[i] where a is multi-dim), compute address without loading.
     pub(super) fn get_array_base_addr(&mut self, base: &Expr) -> Operand {

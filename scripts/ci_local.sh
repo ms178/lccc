@@ -548,6 +548,16 @@ gate "shuffle-diagnostics" fast \
 gate "ext-vector-swizzle-diagnostics" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_swizzle_diagnostics.sh
 
+# Scalar <-> GNU vector conversions: size-mismatched casts both directions,
+# implicit scalar-vector assignments/initialisations at any size (GCC
+# verdict for the same-size vector->scalar leg Clang accepts), or a silent
+# runtime fault from the address-confusion class; oracle-checked against
+# the pinned gcc/clang; the ext-vector splat and equal-size raw-reinterpret
+# are running positive controls.
+gate "vector-scalar-conversions" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" CLANG="${CLANG:-clang-23}" \
+        bash tests/regression/check_vector_scalar_conversions.sh
+
 # C11 6.5.2.1p1: a subscript whose operands are not pointer + integer must be
 # diagnosed (LCCC lowered it as a pointer access, crashing struct-based
 # `__m256` code at run time); oracle-checked against gcc.

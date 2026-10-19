@@ -930,7 +930,7 @@ impl Lowerer {
             return Operand::Value(alloca);
         }
 
-        if let Some(lv) = self.lower_lvalue(inner) {
+        if let Some(lv) = self.lower_lvalue_for_mutation(inner) {
             // GEP +0 is a no-op. Emitting it used to make a local look
             // address-taken through a derived pointer even after a helper
             // that took `&x` was inlined (`*p = v` stores through the GEP

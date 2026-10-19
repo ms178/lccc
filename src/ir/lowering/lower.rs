@@ -94,6 +94,14 @@ pub struct Lowerer {
     /// (expression statement, for-increment), so a discarded post-inc/dec can
     /// skip its volatile old-value spill.
     pub(super) discard_expr_result: bool,
+    /// Set only while lowering an lvalue that will be STORED through
+    /// (assignment LHS, ++/--, unary `&` on a lane): the
+    /// vector-subscript arm rejects value-only bases (call results,
+    /// ternaries, commas, casts) as "expression is not assignable" in
+    /// that context. Reads deliberately share `lower_lvalue` (bit-packed
+    /// `_Bool` lane reads route through it for the byte/bit address)
+    /// and must not trip the diagnostic.
+    pub(super) lvalue_for_mutation: bool,
     /// Set while lowering an `Expr::Assign` whose value is discarded
     /// (expression statement, for-increment): a swizzle assignment then
     /// skips materialising its result vector. Captured at the start of
@@ -284,6 +292,7 @@ impl Lowerer {
             pure_functions: FxHashSet::default(),
             const_functions: FxHashSet::default(),
             discard_expr_result: false,
+            lvalue_for_mutation: false,
             discard_assign_result: false,
             has_non_inline_decl: FxHashSet::default(),
             types: type_context,
