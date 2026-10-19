@@ -2,7 +2,9 @@
 
 ## Reproducible configuration
 
-- LCCC base: `644f4145ccc9c8252e5135489d05d63ec1d64adc` (then task commits)
+- LCCC base actually used for the final validated series:
+  `59f061d21dc73155e2bc0af814c8942dac8cc5f9`; the five commits
+  `532669b7..20078a5f` are merged by `d8f79a6b` (PR #868)
 - glibc source: `afd131806b25715a7617ab757db43f0bb610acbf`
   (`2.44+r25+gafd131806b`)
 - source archive SHA-256:
@@ -39,7 +41,10 @@ Evidence:
 The driver previously warned and ignored this option. Local TLS in `-fPIC`
 objects therefore used `R_X86_64_TPOFF32`; `lccc-ld` correctly refused those
 relocations in `libc.so`. The option now reaches x86 codegen, selects GOTTPOFF,
-and disables the direct Local-Exec memory fold.
+and disables the direct Local-Exec memory fold.  This is a compilation-wide
+(per-object) choice, not a per-declaration implementation: every TLS reference
+in an object compiled with the option uses Initial-Exec.  Local-Dynamic and
+Global-Dynamic are rejected explicitly rather than silently approximated.
 
 Evidence:
 
@@ -76,6 +81,30 @@ restriction was added after red-team testing caught four SysV aggregate crashes
 in a 186-shape cross-compiler ABI grid. All 186 shapes now pass in every tested
 caller/callee direction.
 
+The pointer-width correction was also measured across that grid rather than
+assigned a speculative spill-size benefit.  With seed `20261017`, 160 random
+plus 26 curated top-level shapes, compile both generated TUs at `-O2 -w -S`
+using `532669b7` (before the pointer-width correction) and `95bbb4cd` (after):
+
+```sh
+python3 tests/regression/check_sysv_aggregate_abi.py \
+  --lccc /bin/false --emit-only --keep /tmp/sysvabi
+for tu in prov call; do
+  BEFORE/target/fastbuild/lccc -O2 -w -S /tmp/sysvabi/$tu.c -o /tmp/$tu.before.s
+  AFTER/target/fastbuild/lccc  -O2 -w -S /tmp/sysvabi/$tu.c -o /tmp/$tu.after.s
+  cmp /tmp/$tu.before.s /tmp/$tu.after.s
+done
+```
+
+The paired assembly files were byte-identical: **0 generated assembly bytes and
+0 spill bytes changed** in this corpus.  The `call` assembly SHA-256 was
+`422d8eb6267dcee018b5731e1fefa71604d87d87ae95e236ff808ee6bf4bd4bf` and
+`prov.c` assembly was
+`8fcd0d3a11b0f8d85eb0b35a377eac8f985a3be388d5bfe1239c058a1fc7d3e9`.
+This grid validates the ABI boundary but does not exercise glibc's
+pointer-return/load path, so no performance improvement is claimed from this
+zero delta.
+
 Strict-FP glibc exposed two self-recursive builtin implementations as well:
 `__fma` called its public `fma` alias, and `__ieee754_sqrt` called `sqrt`.
 Hardware FMA and sqrt obey MXCSR rounding and exception state; GCC 16.2 also
@@ -107,6 +136,22 @@ adding packed round nodes touches the vectorizer's parsing, legality, reduction,
 remainder and backend tables and requires exception/rounding-mode tests. The
 current patch deliberately keeps the correct scalar implementation rather than
 claiming a size-only or unvalidated speed win.
+
+## Follow-up audit verification (2026-10-19)
+
+The repository census is a Python ratchet, not a Cargo binary.  The commands
+actually run were:
+
+```sh
+python3 scripts/audit_census.py --selftest
+python3 scripts/audit_census.py --check
+```
+
+Both passed against `scripts/audit_census_baseline.json`; no metric grew, so the
+baseline was correctly left unchanged rather than regenerated gratuitously.
+Patch applicability is checked with `git apply --check`.  No unsupported
+`git am --fuzz` command is claimed (`--fuzz` belongs to `patch`, as used by the
+glibc workload runner, not to `git am`).
 
 ## Red-team conclusions
 

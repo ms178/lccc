@@ -362,13 +362,18 @@ def main():
     ap.add_argument("--count", type=int, default=160, help="random shapes in addition to the curated set")
     ap.add_argument("--opt", default="-O2")
     ap.add_argument("--keep", help="write the generated sources to this directory")
+    ap.add_argument("--emit-only", action="store_true",
+                    help="generate sources under --keep without requiring compilers")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
-    err = oracle_error(args.cc)
-    if err:
-        print(f"check_sysv_aggregate_abi: FAIL: {err}", file=sys.stderr)
-        return 2
+    if args.emit_only and not args.keep:
+        ap.error("--emit-only requires --keep")
+    if not args.emit_only:
+        err = oracle_error(args.cc)
+        if err:
+            print(f"check_sysv_aggregate_abi: FAIL: {err}", file=sys.stderr)
+            return 2
     rng = random.Random(args.seed)
     gen = Gen(rng)
     tops = curated() + [gen.shape() for _ in range(args.count)]
@@ -381,6 +386,9 @@ def main():
     for name, text in (("abi.h", hdr), ("prov.c", prov), ("call.c", call)):
         with open(os.path.join(work, name), "w") as f:
             f.write(text)
+    if args.emit_only:
+        print(f"check_sysv_aggregate_abi: emitted {len(tops)} shapes to {work}")
+        return 0
 
     # Compilation runs inside the work directory: resolve path-like compiler
     # arguments now so a relative `--lccc target/.../lccc` keeps working.

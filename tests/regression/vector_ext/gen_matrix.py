@@ -2,7 +2,6 @@
 """Generate matrix.c (the vector-extension function matrix) and driver.c
 (the lccc-vs-GCC runtime differential driver) for check_vector_ext_codegen.sh.
 Run from this directory; both outputs are checked in."""
-import itertools
 elems={'c':'char','s':'short','i':'int','l':'long','f':'float','d':'double'}
 ops={'add':'a+b','sub':'a-b','mul':'a*b','and':'a&b','or':'a|b','xor':'a^b','shl':'a<<b','shr':'a>>b','neg':'-a','not':'~a','eq':'a==b','lt':'a<b','div':'a/b'}
 out=[]

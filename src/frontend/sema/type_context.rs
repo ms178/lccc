@@ -237,6 +237,9 @@ impl TypeContext {
             enum_types: FxHashMap::default(),
             func_return_ctypes: FxHashMap::default(),
             ctype_cache: RefCell::new(FxHashMap::default()),
+            // Frames are lexical undo logs, not scope identities. File scope
+            // deliberately has no disposable frame; its canonical depth is 0,
+            // and frame index N corresponds to lexical depth N + 1.
             scope_stack: RefCell::new(Vec::new()),
             anon_ctype_counter: std::cell::Cell::new(0),
             struct_variant_counter: std::cell::Cell::new(0),
@@ -949,5 +952,58 @@ mod enum_type_scope_tests {
         assert!(ctx.enum_types.contains_key("Local"));
         ctx.pop_scope();
         assert!(!ctx.enum_types.contains_key("Local"));
+    }
+}
+
+#[cfg(test)]
+mod ordinary_namespace_depth_tests {
+    use super::{EnumConstant, TypeContext};
+    use crate::common::symbol_table::{Symbol, SymbolTable};
+    use crate::common::types::{AddressSpace, CType};
+
+    fn object(name: &str) -> Symbol {
+        Symbol {
+            name: name.to_string(),
+            ty: CType::Int,
+            explicit_alignment: None,
+            type_align: None,
+            address_space: AddressSpace::Default,
+        }
+    }
+
+    #[test]
+    fn enumerator_and_object_maps_share_canonical_lexical_depths() {
+        let mut types = TypeContext::new();
+        let mut symbols = SymbolTable::new();
+
+        types.insert_enum_scoped("file_enum".into(), EnumConstant::provisional(1));
+        symbols.declare(object("file_object"));
+        assert_eq!(types.enum_constant_with_depth("file_enum").unwrap().1, 0);
+        assert_eq!(symbols.lookup_depth("file_object"), Some(0));
+
+        for depth in 1..=3 {
+            types.push_scope();
+            symbols.push_scope();
+            let enum_name = format!("enum_{depth}");
+            let object_name = format!("object_{depth}");
+            types.insert_enum_scoped(enum_name.clone(), EnumConstant::provisional(depth as i64));
+            symbols.declare(object(&object_name));
+            assert_eq!(types.enum_constant_with_depth(&enum_name).unwrap().1, depth);
+            assert_eq!(symbols.lookup_depth(&object_name), Some(depth));
+        }
+
+        for depth in (1..=3).rev() {
+            types.pop_scope();
+            symbols.pop_scope();
+            assert!(
+                types
+                    .enum_constant_with_depth(&format!("enum_{depth}"))
+                    .is_none()
+            );
+            assert_eq!(symbols.lookup_depth(&format!("object_{depth}")), None);
+        }
+        // File scope has no disposable undo frame, so an extra pop is a no-op.
+        types.pop_scope();
+        assert_eq!(types.enum_constant_with_depth("file_enum").unwrap().1, 0);
     }
 }

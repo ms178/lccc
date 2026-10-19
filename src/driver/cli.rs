@@ -2081,8 +2081,18 @@ impl Driver {
                     self.pic = false;
                     self.pie = false;
                 }
+                // This is currently a compilation-wide switch: every TLS
+                // reference emitted into the object uses the selected model.
+                // Per-declaration tls_model attributes are not implemented.
                 "-ftls-model=initial-exec" => self.tls_initial_exec = true,
                 "-ftls-model=local-exec" => self.tls_initial_exec = false,
+                arg if arg.starts_with("-ftls-model=") => {
+                    let model = &arg["-ftls-model=".len()..];
+                    return Err(format!(
+                        "unsupported TLS model '{model}'; LCCC currently supports only \
+                         'local-exec' and compilation-wide 'initial-exec'"
+                    ));
+                }
                 "-fcf-protection=branch" => {
                     self.cf_protection_branch = true;
                     self.cf_protection_value = Some("1");

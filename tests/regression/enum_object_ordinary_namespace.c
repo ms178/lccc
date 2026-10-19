@@ -22,8 +22,21 @@ static int local_enumerator_shadows_file_object(void)
     return file_object;
 }
 
+static int nested_object_shadows_function_enumerator(void)
+{
+    enum { name = 3 };
+    {
+        struct payload name = { 23 };
+        return name.value;
+    }
+}
+
 int main(void)
 {
     return local_object_shadows_file_enumerator()
-        + local_enumerator_shadows_file_object() == 66 ? 0 : 1;
+                + local_enumerator_shadows_file_object()
+                + nested_object_shadows_function_enumerator()
+            == 89
+        ? 0
+        : 1;
 }
