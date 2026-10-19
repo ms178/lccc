@@ -184,11 +184,30 @@ if ! awk '$0 == "shr_v32i:" {on=1; next} on && /\.cfi_endproc/ {exit} on' "$tmp/
     grep -q 'vpsravd'; then
     fail "shr_v32i: expected a per-lane vpsravd at -O2 -mavx2"
 fi
-# Compare masks (GCC: 2).
-for fn in eq_v32i lt_v32i eq_v32f lt_v32f lt_v16f; do ceiling "$fn" 2; done
-# DEBT (VEX-128-INT-1): the 128-bit integer compare/arith emitters stage
-# through legacy destructive SSE forms under AVX (GCC: 2 / 4).
-ceiling eq_v16i 4
+# Compare masks (GCC: 2): every lane width at both register widths, the
+# 128-bit forms through the VEX.128 three-operand path.
+for fn in eq_v32i lt_v32i eq_v32f lt_v32f lt_v16f eq_v16i lt_v16i eq_v16l lt_v16l \
+          eq_v32l lt_v32l eq_v16s lt_v16s eq_v16c lt_v16c \
+          cq_lt_s cq_gt_s cq4_lt_s cq_eq_u; do ceiling "$fn" 2; done
+# le / ne / unsigned orderings (counts include `ret`): min+eq (3),
+# eq/gt+invert (4), bias+gt (4), qword le.u = bias+gt+invert (6); the
+# swapped `>=` form pays one RA handoff copy (7).  GCC: 3-6.
+for fn in cd4_le_s cd4_le_u cb4_le_s; do ceiling "$fn" 3; done
+for fn in cq_le_s cq_ne_s cq4_ne_s cd4_ne_s cw4_ne_s cq_lt_u cq4_lt_u cd4_lt_u; do ceiling "$fn" 4; done
+for fn in cq4_le_u cq_le_u; do ceiling "$fn" 6; done
+ceiling cq_ge_u 7
+ceiling cq_sel 3       # (m & x) | (~m & y) -> vpcmpgtq + vpblendvb + ret (GCC: 3)
+# Scalar splats (`(T){} + x`): the integer zero identity folds, the
+# broadcast is homed and returned directly (GCC: 3).  FP keeps the
+# `{} + x` add (not an identity for -0.0): 4.
+for fn in splat_v32i splat_v32c splat_v32s splat_v32l splat_v16i splat_v16c splat_v16s splat_v16l; do ceiling "$fn" 3; done
+for fn in splat_v32f splat_v32d splat_v16f splat_v16d; do ceiling "$fn" 4; done
+# A scalar integer constant operand is a `.rodata` lane constant (GCC: 4).
+ceiling splat_r 2
+# Whole-register `__builtin_memcpy` load/store idioms (GCC: 2).  The byte/
+# word 128-bit shapes are register-homed like the dword ones.
+for fn in ld_v32f ld_v32i ld_v32c ld_v16f ld_v16i ld_v16c ld_v16s \
+          st_v32f st_v32i st_v32c st_v32s st_v16f st_v16i st_v16c st_v16s; do ceiling "$fn" 2; done
 ceiling mix_sab4 7
 # Scalar/vector interleave: broadcast + fma + ret (GCC: 3).
 ceiling mix_sab 3
@@ -202,7 +221,7 @@ ceiling cond_v32f 9
 ceiling cond_v16i 9
 ceiling tern_lv 8
 ceiling tern_assign 10
-ceiling sel_mask 7
+ceiling sel_mask 3     # vcmpps + vpblendvb + ret (GCC: 3)
 # Streaming loop `r[i] = a[i]*b[i] + r[i]`: the body is load/mul/add/store
 # + control (GCC: 14 / 13 / 14 incl. its prologue).
 ceiling loop_v32f 16
@@ -211,14 +230,16 @@ ceiling loop_v32i 16
 # Shapes still on the per-lane scalar path, ratcheted at their measured
 # counts so the memory-object cost model cannot regress unnoticed
 # (GCC: 2 / 11 / 11 / 15; see FOLLOWUP "vector-ext scalar residue").
-ceiling sadd 18        # struct-wrapped compound assign: lane stores + memcpy
+ceiling sadd 2         # single-member vector record: returned like the bare vector (GCC: 2)
 ceiling s4i_add 26     # struct-wrapped 128-bit add
 ceiling tern_se 53     # ternary whose arms are calls (two sret temporaries)
 ceiling viacall 30     # by-value call into a GCC-built callee + return
-ceiling shr_v32l 23    # signed 64-bit lanes: no vpsravq below AVX-512VL
-ceiling shr_v16l 15    # (GCC: 6 — it emulates with vpsrlvq + sign fixup)
-ceiling eq_v32l 41     # 64-bit lane compare (no vpcmpeqq/vpcmpgtq lowering yet)
-ceiling mul_v32c 136   # byte multiply (no pmullw/pack expansion yet)
+ceiling shr_v32l 6     # signed 64-bit lanes: vpsrlvq + sign fix-up (xor/sub), GCC: 6
+ceiling shr_v16l 6
+# Byte multiply through the word family: pmullw + mask + two shifts +
+# pmullw + shift + or (GCC: 10 / 12).
+ceiling mul_v32c 8
+ceiling mul_v16c 8
 # FMA contraction (`vecfma`): `a*b + c` and its sign variants are one
 # vfmadd/vfmsub/vfnmadd + ret at 256 and 128 bits (GCC: 2).  The squared
 # and self-addend forms coalesce onto the dying multiplicand (GCC: 2; ours

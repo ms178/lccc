@@ -1429,6 +1429,48 @@ fn vex_rename_safe(t: &str) -> bool {
         && !mn.starts_with("vmovh")
 }
 
+/// A VEX full-width vector load from memory: writes every bit of the
+/// spelled destination from memory alone and zeroes above it, so its
+/// destination is a plain output exactly like the arithmetic producers
+/// (`vmovups (%rdi), %ymm2; vmovdqa %ymm2, %ymm0` is the whole-register
+/// `memcpy`-into-return shape).  Scalar (`vmovss`/`vmovsd`), half
+/// (`vmovlps`/`vmovhps`), broadcast and legacy spellings are excluded.
+fn full_width_load_zeroes_above(mn: &str) -> bool {
+    matches!(
+        mn,
+        "vmovups" | "vmovaps" | "vmovupd" | "vmovapd" | "vmovdqu" | "vmovdqa" | "vlddqu"
+    )
+}
+
+/// A legacy-SSE full-width load from memory: writes bits 127:0 of its
+/// destination from memory alone and leaves the bits above untouched --
+/// exactly what a legacy full-width register copy (`movdqa %T, %D`) does
+/// to `D`, so `load -> %T; movdqa %T, %D` and `load -> %D` leave every bit
+/// of `D` identical, with no upper-bit argument needed.
+fn legacy_full_width_load(mn: &str) -> bool {
+    matches!(
+        mn,
+        "movups" | "movaps" | "movupd" | "movapd" | "movdqu" | "movdqa" | "lddqu"
+    )
+}
+
+/// A VEX register/memory-source broadcast (`vpbroadcast{b,w,d,q}`,
+/// `vbroadcastss`/`vbroadcastsd`): the whole spelled destination is
+/// written from the source's low element and the bits above are zeroed --
+/// a plain output whose SOURCE is narrower than the destination (an XMM
+/// or a memory operand), so the same-width source rule does not apply.
+fn vex_broadcast(mn: &str) -> bool {
+    matches!(
+        mn,
+        "vpbroadcastb"
+            | "vpbroadcastw"
+            | "vpbroadcastd"
+            | "vpbroadcastq"
+            | "vbroadcastss"
+            | "vbroadcastsd"
+    )
+}
+
 pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
@@ -1441,20 +1483,43 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
         }
         let t_op = infos[j].trimmed(store.get(j)).to_string();
         let (mn, operands) = split_mn(&t_op);
-        if !(vex_plain_output(mn) || vex_int_plain_output(mn)) || operands.contains('{') {
+        let is_vex_load = full_width_load_zeroes_above(mn);
+        let is_legacy_load = legacy_full_width_load(mn);
+        let is_full_load = is_vex_load || is_legacy_load;
+        let is_broadcast = vex_broadcast(mn);
+        if !(vex_plain_output(mn) || vex_int_plain_output(mn) || is_full_load || is_broadcast)
+            || operands.contains('{')
+        {
             j += 1;
             continue;
         }
         let ops: Vec<&str> = operand_list(operands).iter().map(|o| o.trim()).collect();
+        // A full-width load: two operands, the source a memory operand
+        // (a register-to-register `vmovdqa` is itself a copy, handled by
+        // the copy rules), folded only into the full-width VEX copy-out
+        // shape below.
+        if is_full_load && !(ops.len() == 2 && !ops[0].starts_with('%') && !ops[0].starts_with('$'))
+        {
+            j += 1;
+            continue;
+        }
+        // A broadcast: two operands, the source a vector register or a
+        // memory operand; folded only into the full-width VEX copy-out.
+        if is_broadcast && !(ops.len() == 2 && !ops[0].starts_with('$')) {
+            j += 1;
+            continue;
+        }
         // Three operands, four with a leading immediate (`vroundsd`), or the
         // four-operand variable blend (`vblendvps`/`vblendvpd`: mask + two
         // sources + dest — the mask is a fourth source read, the dest a
         // plain output; VEX reads every source before writing, so retargeting
         // the dest is sound even when `D` is itself the mask).
-        let is_var_blend = matches!(mn, "vblendvps" | "vblendvpd");
+        let is_var_blend = matches!(mn, "vblendvps" | "vblendvpd" | "vpblendvb");
         let arity_ok = ops.len() == 3
             || (ops.len() == 4 && ops[0].starts_with('$'))
-            || (is_var_blend && ops.len() == 4);
+            || (is_var_blend && ops.len() == 4)
+            || is_full_load
+            || is_broadcast;
         if !arity_ok {
             j += 1;
             continue;
@@ -1467,13 +1532,19 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             j += 1;
             continue;
         };
-        if pw != W128 && !vex_int_plain_output(mn) && !vex_plain_output(mn) {
+        if pw != W128
+            && !vex_int_plain_output(mn)
+            && !vex_plain_output(mn)
+            && !is_full_load
+            && !is_broadcast
+        {
             j += 1;
             continue;
         }
-        let sources_ok = ops[..ops.len() - 1]
-            .iter()
-            .all(|op| !op.starts_with('%') || vec_operand(op).is_some_and(|(_, w)| w == pw));
+        let sources_ok = is_broadcast
+            || ops[..ops.len() - 1]
+                .iter()
+                .all(|op| !op.starts_with('%') || vec_operand(op).is_some_and(|(_, w)| w == pw));
         if !sources_ok {
             j += 1;
             continue;
@@ -1582,6 +1653,18 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
             j += 1;
             continue;
         }
+        // A load folds only into a full-width copy-out: VEX load /
+        // broadcast (zeroes above) into a VEX copy, or -- like any VEX.128
+        // producer -- into a legacy 128-bit copy under the wide-reader
+        // argument below; a legacy load (leaves above alone) only into a
+        // legacy full-width copy.
+        let legacy_full_copy_out = full_copy_out && !copy_out.zeroes_above && pw == W128;
+        if ((is_vex_load || is_broadcast) && !(full_vex_copy_out || legacy_full_copy_out))
+            || (is_legacy_load && !legacy_full_copy_out)
+        {
+            j += 1;
+            continue;
+        }
         let d = copy_out.dst;
         // A scalar copy-out immediately followed by return cannot reach an
         // earlier wide reader again. The old whole-function approximation
@@ -1635,6 +1718,77 @@ pub(super) fn retarget_vex_result(store: &mut LineStore, infos: &mut [LineInfo])
         }
         changed = true;
         j = k + 1;
+    }
+    changed
+}
+
+/// Delete the `vzeroupper` of a function that never WRITES an upper YMM/ZMM
+/// half itself.
+///
+/// The epilogue arms `vzeroupper` whenever a 256-bit register is touched,
+/// including a function whose only 256-bit activity is reading its own
+/// incoming `%ymm` arguments (`void st(v32f *p, v32f v) { *p = v; }` is
+/// `vmovdqu %ymm0, (%rdi); vzeroupper; ret`).  The upper state such a
+/// function returns with is exactly the state it was entered with: every
+/// `%ymm` it reads was written by its caller, which is therefore already
+/// in the dirty state and responsible for its own transition.  GCC and
+/// Clang omit the `vzeroupper` here for the same reason.
+///
+/// Refused -- the whole function is left alone -- when any line writes a
+/// `%ymm`/`%zmm` register (last operand at 256/512 bits, `vzeroall`, an
+/// AVX-512 masked form), contains a `call` (the callee may dirty the state
+/// on this function's behalf), or is pinned (inline asm).  Reads of 256-bit
+/// registers (stores, `vextract*128` into an XMM, `vmovmsk`) are what the
+/// rule exists for.
+pub(super) fn elide_vzeroupper_without_upper_writes(
+    store: &LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut j = 0;
+    while j < len {
+        if infos[j].is_nop() || infos[j].pinned || infos[j].trimmed(store.get(j)) != "vzeroupper" {
+            j += 1;
+            continue;
+        }
+        let Some((fstart, fend)) = function_range(store, infos, j) else {
+            j += 1;
+            continue;
+        };
+        let writes_upper = (fstart..fend).any(|n| {
+            if infos[n].is_nop() {
+                return false;
+            }
+            if infos[n].pinned || infos[n].kind == LineKind::Call {
+                return true;
+            }
+            let t = infos[n].trimmed(store.get(n));
+            if t.starts_with('.') || t.ends_with(':') {
+                return false;
+            }
+            let (mn, operands) = split_mn(t);
+            if mn == "vzeroall" || mn.starts_with("call") || operands.contains('{') {
+                return true;
+            }
+            let ops = operand_list(operands);
+            ops.last()
+                .is_some_and(|last| vec_operand(last.trim()).is_some_and(|(_, w)| w > W128))
+        });
+        if writes_upper {
+            j = fend;
+            continue;
+        }
+        for n in fstart..fend {
+            if !infos[n].is_nop()
+                && !infos[n].pinned
+                && infos[n].trimmed(store.get(n)) == "vzeroupper"
+            {
+                mark_nop(&mut infos[n]);
+                changed = true;
+            }
+        }
+        j = fend;
     }
     changed
 }
@@ -3330,8 +3484,11 @@ mod tests {
     fn vzeroupper_inside_the_bracket_blocks_it() {
         // Rule 6: it rewrites the upper half of every register without naming
         // any of them, so no mention scan can see what it did.
-        let asm =
-            body("    movapd %xmm0, %xmm2\n    vzeroupper\n    movapd %xmm2, %xmm0\n    ret\n");
+        // (The `vaddps` upper write keeps the `vzeroupper` itself alive
+        // past `elide_vzeroupper_without_upper_writes`.)
+        let asm = body(
+            "    vaddps %ymm5, %ymm5, %ymm5\n    movapd %xmm0, %xmm2\n    vzeroupper\n    movapd %xmm2, %xmm0\n    ret\n",
+        );
         let out = run(&asm);
         assert!(
             out.contains("movapd %xmm0, %xmm2"),
@@ -3906,6 +4063,66 @@ mod tests {
         );
     }
 
+    /// Run just the entry-state `vzeroupper` elision on a full function
+    /// body and report the surviving lines.
+    fn vzeroupper_only(text: &str) -> Vec<String> {
+        let store = LineStore::new(body(text));
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        elide_vzeroupper_without_upper_writes(&store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .filter(|t| !t.is_empty() && !t.starts_with('.') && !t.ends_with(':'))
+            .collect()
+    }
+
+    #[test]
+    fn vzeroupper_is_elided_when_the_function_only_reads_incoming_ymm_state() {
+        // A store of a `%ymm` argument: read only, the caller owns the state.
+        assert_eq!(
+            vzeroupper_only("    vmovdqu %ymm0, (%rdi)\n    vzeroupper\n    ret\n"),
+            vec!["vmovdqu %ymm0, (%rdi)", "ret"]
+        );
+        // `vextracti128` into an XMM reads the upper half, writes none.
+        assert_eq!(
+            vzeroupper_only(
+                "    vextracti128 $1, %ymm0, %xmm1\n    vmovd %xmm1, %eax\n    vzeroupper\n    ret\n"
+            )
+            .len(),
+            3
+        );
+        // Any 256-bit write keeps it.
+        assert_eq!(
+            vzeroupper_only("    vaddps %ymm1, %ymm0, %ymm2\n    vmovdqu %ymm2, (%rdi)\n    vzeroupper\n    ret\n")
+                .len(),
+            4
+        );
+        // A call may dirty the state on this function's behalf: kept.
+        assert_eq!(
+            vzeroupper_only("    call g\n    vmovdqu %ymm0, (%rbx)\n    vzeroupper\n    ret\n")
+                .len(),
+            4
+        );
+        // `vzeroall` and masked forms are upper writes: kept.
+        assert_eq!(
+            vzeroupper_only("    vzeroall\n    vzeroupper\n    ret\n").len(),
+            3
+        );
+        assert_eq!(
+            vzeroupper_only("    vmovdqu32 %zmm0, (%rdi){%k1}\n    vzeroupper\n    ret\n").len(),
+            3
+        );
+        // No `.cfi_startproc` bracket: no whole-function claim, kept.
+        let store =
+            LineStore::new("    vmovdqu %ymm0, (%rdi)\n    vzeroupper\n    ret\n".to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(!elide_vzeroupper_without_upper_writes(&store, &mut infos));
+    }
+
     /// Run just the result retarget and report the surviving lines.
     fn retarget_only(text: &str) -> Vec<String> {
         let mut store = LineStore::new(body(text));
@@ -3918,6 +4135,91 @@ mod tests {
             .map(|i| store.get(i).trim().to_string())
             .filter(|t| !t.is_empty() && !t.starts_with('.') && !t.ends_with(':'))
             .collect()
+    }
+
+    #[test]
+    fn a_full_width_vex_load_whose_result_is_only_copied_loads_the_target_directly() {
+        // The whole-register `memcpy(&v, p, 32); return v` shape.
+        assert_eq!(
+            retarget_only("    vmovups (%rdi), %ymm2\n    vmovdqa %ymm2, %ymm0\n    ret\n"),
+            vec!["vmovups (%rdi), %ymm0", "ret"]
+        );
+        assert_eq!(
+            retarget_only("    vmovdqu 16(%rsi), %xmm3\n    vmovdqa %xmm3, %xmm0\n    ret\n"),
+            vec!["vmovdqu 16(%rsi), %xmm0", "ret"]
+        );
+        // A legacy copy-out merges into the upper bits where the VEX load
+        // zeroes them: folded only under the wide-reader rule (as for any
+        // VEX.128 producer) -- here nothing reads `%ymm0` after the copy.
+        assert_eq!(
+            retarget_only("    vmovups (%rdi), %xmm2\n    movdqa %xmm2, %xmm0\n    ret\n"),
+            vec!["vmovups (%rdi), %xmm0", "ret"]
+        );
+        // Legacy load into a legacy full-width copy: both leave the bits
+        // above 128 alone, so the fold is exact at every width.
+        assert_eq!(
+            retarget_only("    movdqu (%rdi), %xmm2\n    movdqa %xmm2, %xmm0\n    ret\n"),
+            vec!["movdqu (%rdi), %xmm0", "ret"]
+        );
+        // ... but not into a VEX copy (which zeroes above where the
+        // legacy load would not).
+        assert_eq!(
+            retarget_only("    movdqu (%rdi), %xmm2\n    vmovdqa %xmm2, %xmm0\n    ret\n").len(),
+            3
+        );
+        // A broadcast's source is narrower than its destination; it folds
+        // into a full-width VEX copy-out like a load.
+        assert_eq!(
+            retarget_only("    vpbroadcastd %xmm0, %ymm2\n    vmovdqa %ymm2, %ymm0\n    ret\n"),
+            vec!["vpbroadcastd %xmm0, %ymm0", "ret"]
+        );
+        assert_eq!(
+            retarget_only("    vbroadcastss (%rdi), %ymm3\n    vmovaps %ymm3, %ymm1\n    ret\n"),
+            vec!["vbroadcastss (%rdi), %ymm1", "ret"]
+        );
+        // The byte variable blend is a four-operand plain output like
+        // `vblendvps`: retargeted into the copy-out.
+        assert_eq!(
+            retarget_only(
+                "    vpblendvb %ymm6, %ymm2, %ymm3, %ymm7\n    vmovdqa %ymm7, %ymm0\n    ret\n"
+            ),
+            vec!["vpblendvb %ymm6, %ymm2, %ymm3, %ymm0", "ret"]
+        );
+        // A VEX.128 load or broadcast into a legacy 128-bit copy-out: like
+        // any VEX.128 producer, under the wide-reader rule (no reader of
+        // the target wider than the copy).
+        assert_eq!(
+            retarget_only(
+                "    vmovdqa .LCVEC_1(%rip), %xmm15\n    movdqa %xmm15, %xmm0\n    ret\n"
+            ),
+            vec!["vmovdqa .LCVEC_1(%rip), %xmm0", "ret"]
+        );
+        assert_eq!(
+            retarget_only("    vpbroadcastw %xmm1, %xmm14\n    movdqa %xmm14, %xmm0\n    ret\n"),
+            vec!["vpbroadcastw %xmm1, %xmm0", "ret"]
+        );
+        assert_eq!(
+            retarget_only(
+                "    vmovdqa .LCVEC_1(%rip), %xmm15\n    movdqa %xmm15, %xmm0\n    vpaddd %ymm0, %ymm1, %ymm1\n    vmovdqa %ymm1, %ymm0\n    ret\n"
+            )
+            .len(),
+            5
+        );
+        // A register-to-register `vmovdqa` is a copy, not a load: refused.
+        assert_eq!(
+            retarget_only("    vmovdqa %ymm5, %ymm2\n    vmovdqa %ymm2, %ymm0\n    ret\n").len(),
+            3
+        );
+        // Scalar / partial loads merge or do not zero above: refused.
+        assert_eq!(
+            retarget_only("    vmovsd (%rdi), %xmm2\n    vmovdqa %xmm2, %xmm0\n    ret\n").len(),
+            3
+        );
+        // A mismatched copy width is refused.
+        assert_eq!(
+            retarget_only("    vmovups (%rdi), %ymm2\n    vmovdqa %xmm2, %xmm0\n    ret\n").len(),
+            3
+        );
     }
 
     #[test]

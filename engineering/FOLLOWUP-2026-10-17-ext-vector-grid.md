@@ -486,78 +486,74 @@ measured counts, `add_v32f` must spell `vaddps %ymm1, %ymm0, %ymm0`, and
 no `andq $-32` in any register-shaped function. The scalar-residue
 functions below are ratcheted at their counts so they can only go down.
 
-**Residue, quantified (per-function counts lccc / GCC at `-O2 -mavx2`),
-with the fix for each:**
+**Residue, quantified (per-function counts lccc / GCC 16 at `-O2
+-mavx2`, matrix.c: 378 functions, lccc 2644 instructions vs GCC 2441;
+lccc ≤ GCC on 273 functions, larger on 105), with the fix for each.
+Closed items keep their one-line record so the numbers stay auditable:**
 
-- *DEBT VEX-128-INT-1* — `eq_v16i` 4 / 2, `mix_sab4` 7 / 4: the 128-bit
-  integer compare and arithmetic emitters (`emit_int_cmp` with
-  `avx2=false`, `emit_sse_binary_128`) use the legacy destructive SSE forms
-  plus staging moves even when VEX is available (and mixing legacy SSE
-  with VEX-256 state is a transition-penalty hazard). Fix: route every
-  128-bit integer emitter through the three-operand VEX spelling when
-  `avx_enabled`, exactly as the float twins already do.
-- *Vector-by-vector shifts* — DONE (same change, second commit):
-  `shl_v32i`/`shr_v32i`/`shl_v32l`/`shl_v16i`/`shr_v16i`/`shl_v16l` 2 / 2
-  (`vpsllvd`/`vpsrlvd`/`vpsravd`/`vpsllvq`/`vpsrlvq`, 256-bit and
-  VEX.128; `VecShlvI32x{8,4}`, `VecLShrvI32x{8,4}`, `VecAShrvI32x{8,4}`,
-  `VecShlvI64x{4,2}`, `VecLShrvI64x{4,2}` in
-  `try_lower_vector_variable_shift`), including a non-constant scalar
-  count (splat + variable shift: 6 / 4 — GCC shifts by an `%xmm` count
-  without the broadcast; a `vpslld %xmm, %ymm` form would close it) and
-  a count vector of the other signedness. Remaining: the signed 64-bit
-  right shift (`shr_v32l` 23 / 6, `shr_v16l` 15 / 6) — no `vpsravq`
-  below AVX-512VL; GCC emulates with `vpsrlvq` + sign fix-up, which is
-  the next step.
-- *64-bit lane compares* — `eq_v32l`/`lt_v32l` 41 / 2, `eq_v16l`/`lt_v16l`
-  25 / 2: `packed_cmp_blendv` has no I64 family. Fix: `VecCmpI64x{2,4}`
-  over `vpcmpeqq`/`vpcmpgtq` (SSE4.1/4.2 — gate on AVX2 like the others),
-  `IntCmpLane::Qword` in `emit_int_cmp` with the 8-byte sign bias for the
-  unsigned predicates.
-- *Byte multiply* — `mul_v32c` 136 / 10, `mul_v16c` 72 / 12, `loop_v32c`
-  162 / 25: x86 has no `pmullb`. Fix: GCC's expansion (`vpmovzxbw` halves,
-  `vpmullw`, `vpand` with 0x00ff, `vpackuswb`) as one `VecMulI8x32`
-  emitter.
-- *Packed FMA residue* — `fma_chain` 4 / 3 (`(a*b+c)*d+e`: the second
-  FMA's result is homed in a chain temporary and copied to `%ymm0`; the
-  retarget cannot move an FMA destination — fix: let the destructive
-  handoff prefer the %ymm0-resident parameter for the LAST FMA of a
-  returned chain, or teach `reassociate_fma_accumulator` the packed
-  forms), `fma_two` 6 / 4 (two FMAs sharing `m = a*b`: GCC re-encodes
-  231/132 to keep `a`/`b` in place; lccc stages two `vmovaps` copies —
-  same fix, packed re-encoding in the copy peephole).
-- *Control-flow / lifetime residue* (`cf_*`, lccc / GCC): `cf_wrap_phi`
-  36 / 6 and `cf_volatile_t` 21 / 8 are the struct-wrapped and
-  `volatile` memory objects (both legitimately in memory; the wrapper
-  still copies through the 8 `movq` capture — see struct-wrapped below);
-  `cf_all_lanes` 31 / 2 (per-lane `t[i] = t[i] + i` loop: GCC folds it to
-  one `vaddps` with a constant vector — needs lane-store forwarding into
-  a constant pool vector); `cf_d_mix` 29 / 5 (GCC inlines the `static`
-  helper and fuses; lccc calls it — inliner heuristic for small static
-  vector helpers); `cf_sw` 24 / 16 and `cf_phi_call` 20 / 16 (phi merges
-  of 32-byte values still go through a slot when a call or switch
-  intervenes — `vec_ssa` promotes allocas, the backend phi web has no
-  %ymm class yet); `cf_cond_assign` 9 / 5 (same, one arm). The loop
+- *DEBT VEX-128-INT-1* — DONE: every 128-bit integer emitter uses the
+  three-operand VEX spelling under AVX (`eq_v16i` 2 / 2).
+- *Vector-by-vector shifts* — DONE, including the signed 64-bit right
+  shift: GCC's `vpsrlvq` expansion `t = a >>u c; m = SIGN >>u c; (t ^ m)
+  - m` (`shr_v32l` / `shr_v16l` 6 / 6).  Remaining: a non-constant
+  scalar count splats before the variable shift (6 / 4; GCC shifts by an
+  `%xmm` count without the broadcast).
+- *64-bit lane compares* — DONE (`VecCmpI64x{2,4}` over `vpcmpeqq` /
+  `vpcmpgtq`; `eq_v32l` / `lt_v32l` / `eq_v16l` / `lt_v16l` 2 / 2).
+- *Byte multiply* — DONE through the word family (`vpmovzxbw` halves,
+  `vpmullw`, `vpand`, `vpackuswb`): `mul_v32c` 8 / 10, `mul_v16c` 8 /
+  12, `loop_v32c` 23 / 25 — all SMALLER than GCC.
+- *Integer identities and constants* — DONE: `x ± 0`, `x | 0`, `x ^ 0`
+  fold once `vec_ssa` has the operands in registers (integer families
+  only; `x + 0.0` is not an identity for `-0.0`); a scalar integer
+  constant operand is a tiled `.rodata` lane constant (`splat_r` 2 / 4:
+  `vpaddd .LCVEC(%rip), %ymm0, %ymm0` where GCC builds the splat with
+  `vpcmpeqd`/`vpsrld`); any other constant splat is one aligned
+  `vmovdqa .LCVEC(%rip)` load; broadcast results are register-homed and
+  returned directly (`splat_v32i` 3 / 3).
+- *Select idiom* — DONE: `(m & x) | (~m & y)` with a compare-defined
+  mask is one `vpblendvb` (`cq_sel` / `sel_mask` 2 / 2).
+- *Struct-wrapped vectors* — `sadd` DONE (2 / 2: a single-member vector
+  record returns like the bare vector); `s4i_add` 26 / 11 (vector +
+  tag, two eightbyte classes — the wrapper's parameter capture and return
+  still copy through memory).
+- *Packed FMA residue* — `fma_chain` 4 / 3, `fma_two` 6 / 4: unchanged
+  (the FMA destination cannot be retargeted; fix: packed 231/132
+  re-encoding in the copy peephole, or let the destructive handoff prefer
+  the `%ymm0`-resident parameter for the LAST FMA of a returned chain).
+- *MEMORY-class parameter capture* — `cf_wrap_phi` 35 / 6, `cf_volatile_t`
+  21 / 8, `s4i_add`, `viacall` 28 / 15: a by-value MEMORY-class record /
+  stack-passed vector is copied eightbyte-by-eightbyte into an aligned
+  frame object at entry (8 `movq` + the `andq $-32` realignment) and
+  re-addressed through `leaq/addq/andq` triples at every use.  GCC reads
+  the incoming stack slot in place (`vmovaps 8(%rsp), %ymm1`).  Fix: let
+  the parameter's alloca BE the incoming stack area (the caller's copy is
+  the callee's object under the psABI) and give it the natural `%rsp`
+  offset instead of a dynamic realignment; this is the single largest
+  remaining item (≈ 70 instructions across the four shapes).
+- *Control-flow / lifetime residue* (`cf_*`): `cf_all_lanes` 30 / 2
+  (per-lane `t[i] = t[i] + i` loop: GCC folds it to one `vfmadd213ps`
+  with a constant vector — needs lane-store forwarding into a constant
+  pool vector); `cf_d_mix` 29 / 5 (GCC inlines the `static` helper;
+  inliner heuristic for small static vector helpers); `cf_sw` 24 / 16,
+  `cf_phi_call` 20 / 16, `cf_cond_assign` 9 / 5 and the `cond_*` family
+  9 / 6 (phi merges of 32-byte values: the two parameter copies out of
+  `%ymm0`/`%ymm1` before the branch and the merge copy — `%xmm0`/`%xmm1`
+  are not in the allocatable pool, so a parameter that must survive a
+  branch is staged; the phi web has no `%ymm` class yet).  The loop
   shapes `cf_goto_loop` 15 / 25 and `cf_loop_acc` 12 / 19 are SMALLER
   than GCC's (GCC peels and unrolls ×2).
-- *Struct-wrapped vectors* — `sadd` 18 / 2, `s4i_add` 26 / 11: the
-  compound assign on a struct member is packed, but the parameter capture
-  and `return a;` of the WRAPPER still copy through memory (the wrapper's
-  class is `Sse+SseUp` too). Fix: let `try_lower_vector_return_simd` and
-  the param hoist see through a single-member struct whose member is the
-  whole vector.
-- *Ternary over call arms* — `tern_se` 53 / 11, `viacall` 30 / 15: two
-  sret temporaries plus the merge copy; the four surviving `andq $-32` are
-  the by-value stack argument slot in `viacall`. Fix: give the conditional
-  a single result home when both arms are `%ymm0` returns (merge in
-  register), and let the call's vector-return buffer BE the result alloca.
-- *VEX-128 FMA staging* — `ho_f4_*`/`ho_d2_*` at 128 bits carry one
-  legacy `movaps`/`movdqa` staging copy where the 256-bit twins carry none
-  (same root as DEBT VEX-128-INT-1: the 128-bit emitters stage through a
-  legacy copy); integer `VecZero` seeds (`v32i s = {}`) are not
-  register-homed (`cf_uninit` is float and is 3 / 3).
+- *Ternary over call arms* — `tern_se` 51 / 11: two sret temporaries
+  plus the merge copy.  Fix: give the conditional a single result home
+  when both arms are `%ymm0` returns (merge in register), and let the
+  call's vector-return buffer BE the result alloca.
+- *Lane insert* — `setlane_*` 6 / 2: `a[1] = x; return a;` keeps the
+  object in memory (`vec_ssa` refuses lane access).  Fix: a
+  `VecInsertLane` intrinsic (`vpinsr{b,w,d,q}` / `vinsertps`) for a
+  single lane store into a promoted value.
 - `loop_v32f` 16 / 14: one `movslq` outside the loop (the induction
-  variable is now widened to 64 bits because the packed body indexes with
-  a 64-bit GEP); the loop body is 7 instructions either way.
+  variable is widened to 64 bits because the packed body indexes with a
+  64-bit GEP); the loop body is 7 instructions either way.
 - Not accepted by lccc at all (frontend, unchanged here): designated
   initializers on vectors, general `__builtin_shufflevector`, multi-lane
   swizzle compound assignment, `-mprefer-vector-width=`.

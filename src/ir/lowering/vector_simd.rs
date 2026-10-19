@@ -344,22 +344,201 @@ impl Lowerer {
             self.emit_vec_store(&shape, dest, result);
             return Some(Operand::Value(result));
         }
-        let packed = Self::vec_binop_intrinsic(op, &shape, is_unsigned)?;
+        let byte_mul = matches!(op, BinOp::Mul) && shape.elem_ir.size() == 1;
+        let packed = if byte_mul {
+            None
+        } else {
+            Some(Self::vec_binop_intrinsic(op, &shape, is_unsigned)?)
+        };
         let rhs_plan = self.vec_operand_plan(rhs, &shape, vec_ct)?;
+        // A scalar integer constant operand of an integer add/sub/mul/
+        // bitwise op rides on the intrinsic as a lane constant (`v + 3`
+        // is `vpaddd .LCVEC_n(%rip), %ymm0, %ymm0`; the backend tiles the
+        // `.rodata` entry).  Only the src2 position folds; a constant lhs
+        // of a commutative op is swapped there.
+        if let Some(packed) = packed {
+            if !shape.elem_ir.is_float()
+                && matches!(
+                    op,
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::BitAnd
+                        | BinOp::BitOr
+                        | BinOp::BitXor
+                )
+            {
+                let lane_const = |this: &mut Self, e: &Expr, plan: bool| -> Option<IrConst> {
+                    if plan {
+                        return None;
+                    }
+                    let v = this.eval_const_expr(e)?.to_i64()?;
+                    Some(match shape.elem_ir.size() {
+                        1 => IrConst::I8(v as i8),
+                        2 => IrConst::I16(v as i16),
+                        4 => IrConst::I32(v as i32),
+                        _ => IrConst::I64(v),
+                    })
+                };
+                let (vec_e, vec_plan, c) = match lane_const(self, rhs, rhs_plan) {
+                    Some(c) => (lhs, lhs_plan, Some(c)),
+                    None if !matches!(op, BinOp::Sub) => match lane_const(self, lhs, lhs_plan) {
+                        Some(c) => (rhs, rhs_plan, Some(c)),
+                        None => (lhs, lhs_plan, None),
+                    },
+                    None => (lhs, lhs_plan, None),
+                };
+                if let Some(c) = c {
+                    let a = self.vec_operand_value(vec_e, vec_plan, &shape);
+                    let r = self.fresh_value();
+                    self.emit(Instruction::Intrinsic {
+                        dest: Some(r),
+                        op: packed,
+                        dest_ptr: None,
+                        args: vec![Operand::Value(a), Operand::Const(c)],
+                    });
+                    let result = self.vec_result_alloca(vec_ct);
+                    self.emit_vec_store(&shape, r, result);
+                    return Some(Operand::Value(result));
+                }
+            }
+        }
         // Evaluation order: C leaves it unspecified between the operands;
         // the scalar lowering evaluates lhs then rhs, keep that.
         let a = self.vec_operand_value(lhs, lhs_plan, &shape);
         let b = self.vec_operand_value(rhs, rhs_plan, &shape);
-        let r = self.emit_vec_binary(packed, a, b);
+        let r = match packed {
+            Some(packed) => self.emit_vec_binary(packed, a, b),
+            None => self.emit_vec_byte_mul(&shape, a, b)?,
+        };
         let result = self.vec_result_alloca(vec_ct);
         self.emit_vec_store(&shape, r, result);
         Some(Operand::Value(result))
     }
 
+    /// The vector object a `memcpy` pointer argument designates, when it
+    /// is one: `&v` names `v` directly; a pointer expression contributes
+    /// its pointee type.  Returns `(vector type, access is volatile)`.
+    fn memcpy_arg_vector_pointee(&self, e: &Expr) -> Option<(CType, bool)> {
+        if let Expr::AddressOf(inner, _) = e {
+            let ct = self.expr_ctype(inner);
+            if ct.is_vector() {
+                return Some((ct, self.expr_access_is_volatile(inner)));
+            }
+            return None;
+        }
+        match self.expr_ctype(e) {
+            CType::Pointer(inner, _) if inner.is_vector() => {
+                Some(((*inner).clone(), self.pointee_expr_is_volatile(e)))
+            }
+            _ => None,
+        }
+    }
+
+    /// `__builtin_memcpy(dst, src, N)` where one side is a whole vector
+    /// object of exactly `N` bytes with a packed family: a `VecLoad` from
+    /// `src` and a `VecStore` to `dst` with that family (`memcpy` already
+    /// promises no overlap, and a vector object's bytes are its register
+    /// image).  Declined -- nothing emitted -- for volatile accesses,
+    /// partial sizes, and shapes without a family, so the generic byte
+    /// copy keeps its exact semantics.
+    pub(super) fn try_emit_vector_memcpy(
+        &mut self,
+        dst_e: &Expr,
+        src_e: &Expr,
+        dp: Value,
+        sp: Value,
+        size: usize,
+    ) -> bool {
+        if !matches!(size, 16 | 32) {
+            return false;
+        }
+        let dst = self.memcpy_arg_vector_pointee(dst_e);
+        let src = self.memcpy_arg_vector_pointee(src_e);
+        if dst.as_ref().is_some_and(|(_, vol)| *vol) || src.as_ref().is_some_and(|(_, vol)| *vol) {
+            return false;
+        }
+        let Some((vec_ct, _)) = dst.or(src) else {
+            return false;
+        };
+        if vec_ct.size() != size {
+            return false;
+        }
+        let Some(shape) = simd_shape(&vec_ct) else {
+            return false;
+        };
+        let v = self.emit_vec_load(&shape, sp);
+        self.emit_vec_store(&shape, v, dp);
+        true
+    }
+
+    /// Byte-lane multiply through the word family (x86 has no `pmullb`):
+    ///
+    ///   even = pmullw(a, b) & 0x00ff      (low byte of a word product is
+    ///                                      the low byte of the byte product)
+    ///   odd  = pmullw(a >> 8, b >> 8) << 8 (logical word shifts isolate the
+    ///                                      odd bytes; the result's low byte
+    ///                                      is zero so no mask is needed)
+    ///   r    = even | odd
+    ///
+    /// Signedness is irrelevant: multiplication modulo 2^8 is the same for
+    /// both.  The word family of the same register image carries the ops;
+    /// the result is stored with the byte shape (bit-identical image).
+    fn emit_vec_byte_mul(&mut self, shape: &SimdShape, a: Value, b: Value) -> Option<Value> {
+        let (mul, shl, shr, and, or) = match shape.bytes {
+            32 => (
+                IntrinsicOp::VecMulI16x16,
+                IntrinsicOp::VecShlI16x16,
+                IntrinsicOp::VecLShrI16x16,
+                IntrinsicOp::VecAndI16x16,
+                IntrinsicOp::VecOrI16x16,
+            ),
+            16 => (
+                IntrinsicOp::VecMulI16x8,
+                IntrinsicOp::VecShlI16x8,
+                IntrinsicOp::VecLShrI16x8,
+                IntrinsicOp::VecAndI16x8,
+                IntrinsicOp::VecOrI16x8,
+            ),
+            _ => return None,
+        };
+        let even_full = self.emit_vec_binary(mul, a, b);
+        // The mask rides as a lane constant on the AND itself: the backend
+        // folds it into a `.rodata` memory operand
+        // (`try_emit_bitwise_lane_const`), no broadcast sequence.
+        let even = self.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(even),
+            op: and,
+            dest_ptr: None,
+            args: vec![
+                Operand::Value(even_full),
+                Operand::Const(IrConst::I16(0x00ff)),
+            ],
+        });
+        let a_hi = self.emit_vec_shift_imm(shr, a, 8);
+        let b_hi = self.emit_vec_shift_imm(shr, b, 8);
+        let odd_lo = self.emit_vec_binary(mul, a_hi, b_hi);
+        let odd = self.emit_vec_shift_imm(shl, odd_lo, 8);
+        Some(self.emit_vec_binary(or, even, odd))
+    }
+
+    /// Packed shift by an immediate lane count.
+    fn emit_vec_shift_imm(&mut self, op: IntrinsicOp, a: Value, amount: i64) -> Value {
+        let dest = self.fresh_value();
+        self.emit(Instruction::Intrinsic {
+            dest: Some(dest),
+            op,
+            dest_ptr: None,
+            args: vec![Operand::Value(a), Operand::Const(IrConst::I64(amount))],
+        });
+        dest
+    }
+
     /// Per-lane variable shift (`lhs` a vector; `rhs` a vector of counts
     /// or a non-constant scalar splat), AVX2 `vpsllv*`/`vpsrlv*`/`vpsravd`.
-    /// Lanes are 32-bit (any direction) or 64-bit (left/logical right:
-    /// there is no `vpsravq` below AVX-512VL). A count at or beyond the
+    /// Lanes are 32-bit (any direction) or 64-bit (the signed right shift
+    /// is the `vpsrlvq` sign fix-up expansion). A count at or beyond the
     /// lane width is undefined for GNU vector shifts (as for the scalar
     /// lanes), so the ISA's "shift out to zero / sign fill" is admissible.
     fn try_lower_vector_variable_shift(
@@ -378,18 +557,29 @@ impl Lowerer {
             return None;
         }
         let ir_op = Self::binop_to_ir(*op, is_unsigned);
-        let packed = match (shape.bytes, shape.elem_ir.size(), ir_op) {
-            (32, 4, IrBinOp::Shl) => IntrinsicOp::VecShlvI32x8,
-            (32, 4, IrBinOp::LShr) => IntrinsicOp::VecLShrvI32x8,
-            (32, 4, IrBinOp::AShr) => IntrinsicOp::VecAShrvI32x8,
-            (32, 8, IrBinOp::Shl) => IntrinsicOp::VecShlvI64x4,
-            (32, 8, IrBinOp::LShr) => IntrinsicOp::VecLShrvI64x4,
-            (16, 4, IrBinOp::Shl) => IntrinsicOp::VecShlvI32x4,
-            (16, 4, IrBinOp::LShr) => IntrinsicOp::VecLShrvI32x4,
-            (16, 4, IrBinOp::AShr) => IntrinsicOp::VecAShrvI32x4,
-            (16, 8, IrBinOp::Shl) => IntrinsicOp::VecShlvI64x2,
-            (16, 8, IrBinOp::LShr) => IntrinsicOp::VecLShrvI64x2,
-            _ => return None,
+        // Signed 64-bit lanes: no `vpsravq` below AVX-512VL.  GCC's
+        // expansion over the logical shift: with `s` the sign-bit splat,
+        // `t = a >>u c`, `m = s >>u c`, `(t ^ m) - m` (the `m` lanes are
+        // the sign-extension bits for lanes whose top bit was set; the
+        // xor-sub pair moves them in as ones).  5 instructions + 1 load.
+        let (ashr64, packed) = match (shape.bytes, shape.elem_ir.size(), ir_op) {
+            (32, 8, IrBinOp::AShr) => (
+                Some((
+                    IntrinsicOp::VecBroadcastI64x4,
+                    IntrinsicOp::VecXorI64x4,
+                    IntrinsicOp::VecSubI64x4,
+                )),
+                IntrinsicOp::VecLShrvI64x4,
+            ),
+            (16, 8, IrBinOp::AShr) => (
+                Some((
+                    IntrinsicOp::VecBroadcastI64x2,
+                    IntrinsicOp::VecXorI64x2,
+                    IntrinsicOp::VecSubI64x2,
+                )),
+                IntrinsicOp::VecLShrvI64x2,
+            ),
+            (b, l, o) => (None, Self::variable_shift_op(b, l, o)?),
         };
         // The count operand: a vector of the same register image (any
         // signedness — only the lane width matters) or a scalar splat.
@@ -410,9 +600,42 @@ impl Lowerer {
         let a = self.vec_operand_value(lhs, true, shape);
         let b = self.vec_operand_value(rhs, rhs_plan, shape);
         let r = self.emit_vec_binary(packed, a, b);
+        let r = match ashr64 {
+            None => r,
+            Some((broadcast, xor, sub)) => {
+                let sign = self.fresh_value();
+                self.emit(Instruction::Intrinsic {
+                    dest: Some(sign),
+                    op: broadcast,
+                    dest_ptr: None,
+                    args: vec![Operand::Const(IrConst::I64(i64::MIN))],
+                });
+                let m = self.emit_vec_binary(packed, sign, b);
+                let x = self.emit_vec_binary(xor, r, m);
+                self.emit_vec_binary(sub, x, m)
+            }
+        };
         let result = self.vec_result_alloca(vec_ct);
         self.emit_vec_store(shape, r, result);
         Some(Operand::Value(result))
+    }
+
+    /// The AVX2 per-lane variable shift for a (bytes, lane size, op)
+    /// triple; `None` where the ISA has no encoding.
+    fn variable_shift_op(bytes: usize, lane: usize, op: IrBinOp) -> Option<IntrinsicOp> {
+        Some(match (bytes, lane, op) {
+            (32, 4, IrBinOp::Shl) => IntrinsicOp::VecShlvI32x8,
+            (32, 4, IrBinOp::LShr) => IntrinsicOp::VecLShrvI32x8,
+            (32, 4, IrBinOp::AShr) => IntrinsicOp::VecAShrvI32x8,
+            (32, 8, IrBinOp::Shl) => IntrinsicOp::VecShlvI64x4,
+            (32, 8, IrBinOp::LShr) => IntrinsicOp::VecLShrvI64x4,
+            (16, 4, IrBinOp::Shl) => IntrinsicOp::VecShlvI32x4,
+            (16, 4, IrBinOp::LShr) => IntrinsicOp::VecLShrvI32x4,
+            (16, 4, IrBinOp::AShr) => IntrinsicOp::VecAShrvI32x4,
+            (16, 8, IrBinOp::Shl) => IntrinsicOp::VecShlvI64x2,
+            (16, 8, IrBinOp::LShr) => IntrinsicOp::VecLShrvI64x2,
+            _ => return None,
+        })
     }
 
     /// Packed form of the element-wise comparison `lhs op rhs` producing the
@@ -433,7 +656,22 @@ impl Lowerer {
         let is_unsigned = elem_ct.is_unsigned();
         let cmp_op = Self::binop_to_cmp(op, is_unsigned);
         let (pred, swap) = cmp_predicate_imm(cmp_op, shape.elem_ir.is_float())?;
-        let (cmp_intrinsic, _) = packed_cmp_blendv(shape.elem_ir, shape.lanes)?;
+        let cmp_intrinsic = match packed_cmp_blendv(shape.elem_ir, shape.lanes) {
+            Some((cmp, _)) => cmp,
+            // 64-bit integer lanes have no blend family for the loop
+            // vectorizer but do have a packed compare (`vpcmpeqq` /
+            // `vpcmpgtq`, SSE4.1/4.2 -- gated on the AVX2 lowering ceiling
+            // like every other integer compare here), at both widths.
+            None if matches!(shape.elem_ir, IrType::I64 | IrType::U64)
+                && target_vector_lowering_bytes() == 32 =>
+            {
+                match shape.bytes {
+                    32 => IntrinsicOp::VecCmpI64x4,
+                    _ => IntrinsicOp::VecCmpI64x2,
+                }
+            }
+            None => return None,
+        };
         let lhs_plan = self.vec_operand_plan(lhs, &shape, vec_ct)?;
         let rhs_plan = self.vec_operand_plan(rhs, &shape, vec_ct)?;
         let a = self.vec_operand_value(lhs, lhs_plan, &shape);
@@ -600,10 +838,17 @@ impl Lowerer {
             return None;
         }
         let ret_ct = self.func().return_ctype.clone()?;
-        if !ret_ct.is_vector() {
+        // A record whose single member is the whole vector (`struct S8f {
+        // v32f v; }`) has the vector's own register image and classes
+        // (`Sse+SseUp`): it returns the packed member exactly like the
+        // bare vector.
+        let vec_ct = self
+            .whole_vector_record_member(&ret_ct)
+            .unwrap_or_else(|| ret_ct.clone());
+        if !vec_ct.is_vector() {
             return None;
         }
-        let shape = simd_shape(&ret_ct)?;
+        let shape = simd_shape(&vec_ct)?;
         let fname = self.func().name.clone();
         let sig = self.func_meta.sigs.get(fname.as_str())?;
         let register_return = match shape.bytes {
@@ -629,9 +874,10 @@ impl Lowerer {
         }
         // The expression's own type must be the same dense object (a
         // `return` of a differently typed vector goes through the generic
-        // conversion paths).
+        // conversion paths); a record's size needs the layout context.
         let expr_ct = self.expr_ctype(e);
-        if expr_ct.size() != shape.bytes || !expr_ct.is_vector() {
+        let expr_size = expr_ct.size_ctx(&*self.types.borrow_struct_layouts());
+        if expr_size != shape.bytes || (!expr_ct.is_vector() && expr_ct != ret_ct) {
             return None;
         }
         if self.aggregate_lvalue_space(e) != AddressSpace::Default {
@@ -640,6 +886,29 @@ impl Lowerer {
         let addr = self.get_struct_base_addr(e);
         let value = self.emit_vec_load(&shape, addr);
         Some(Operand::Value(value))
+    }
+
+    /// The vector type of a record (struct, not union) with exactly one
+    /// non-bitfield member that is a dense vector covering the record's
+    /// whole size (an over-aligned record pads past it), else `None`.
+    pub(super) fn whole_vector_record_member(&self, ct: &CType) -> Option<CType> {
+        if !matches!(ct, CType::Struct(_)) {
+            return None;
+        }
+        let layout = self.get_struct_layout_for_ctype(ct)?;
+        if layout.is_union || layout.fields.len() != 1 {
+            return None;
+        }
+        let f = &layout.fields[0];
+        if f.offset != 0
+            || f.bit_width.is_some()
+            || !f.ty.is_vector()
+            || f.ty.size() != layout.size
+            || simd_shape(&f.ty).is_none()
+        {
+            return None;
+        }
+        Some(f.ty.clone())
     }
 
     /// The single predicate behind `try_lower_vector_conditional_simd`:

@@ -428,6 +428,13 @@ impl Lowerer {
                         {
                             let dp = *dp;
                             let sp = *sp;
+                            // A whole-register vector copy (`memcpy(&v, p,
+                            // sizeof v)` / `memcpy(p, &v, sizeof v)`) is a
+                            // packed load + store the vector passes see
+                            // through (`vec_ssa` dissolves the temporary).
+                            if self.try_emit_vector_memcpy(&args[0], &args[1], dp, sp, size) {
+                                return Some(Operand::Value(dp));
+                            }
                             self.emit(Instruction::Memcpy {
                                 dest: dp,
                                 src: sp,

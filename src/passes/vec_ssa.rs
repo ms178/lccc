@@ -832,6 +832,312 @@ fn hoist_param_loads(func: &mut IrFunction, table: &FxHashMap<IntrinsicOp, Famil
 }
 
 /// Module driver. Returns the number of allocas promoted.
+/// Integer identity folds the promotion exposes: once the `{}` seed and
+/// the operation on it meet in registers, `x + 0`, `0 + x`, `x - 0`,
+/// `x | 0`, `0 | x`, `x ^ 0`, `0 ^ x` are the other operand.  Integer
+/// families only -- FP `x + 0.0` is not an identity for `-0.0`, and the
+/// `-0.0` xor is the negation idiom.  `(v32i){} + x` (the GNU splat
+/// spelling) becomes the bare broadcast.
+///
+/// A zero is the family's zero op, or a broadcast of the constant 0
+/// (the byte/word families spell zero that way).  The folded instruction
+/// is deleted and its uses rewritten (a `Phi`-free function-wide map);
+/// the zero producer stays and dies with the ordinary dead-code sweep.
+fn fold_zero_identities(func: &mut IrFunction) -> usize {
+    use crate::ir::reexports::IrBinOp;
+    let ops: Vec<(IntrinsicOp, IrBinOp)> = {
+        let mut v = Vec::new();
+        for ty in [IrType::I8, IrType::I16, IrType::I32, IrType::I64] {
+            for bytes in [16usize, 32] {
+                let lanes = bytes / ty.size();
+                for bin in [IrBinOp::Add, IrBinOp::Sub, IrBinOp::Or, IrBinOp::Xor] {
+                    if let Some(op) = crate::passes::slp_vectorizer::packed_binop(bin, ty, lanes) {
+                        v.push((op, bin));
+                    }
+                }
+            }
+        }
+        v
+    };
+    let zero_ops: FxHashSet<IntrinsicOp> = [IrType::I8, IrType::I16, IrType::I32, IrType::I64]
+        .iter()
+        .flat_map(|&ty| [16usize, 32].into_iter().map(move |b| (ty, b / ty.size())))
+        .filter_map(|(ty, lanes)| family_for(ty, lanes))
+        .map(|f| f.zero)
+        .collect();
+    let broadcast_ops: FxHashSet<IntrinsicOp> = [IrType::I8, IrType::I16, IrType::I32, IrType::I64]
+        .iter()
+        .flat_map(|&ty| [16usize, 32].into_iter().map(move |b| (ty, b / ty.size())))
+        .filter_map(|(ty, lanes)| family_for(ty, lanes))
+        .map(|f| f.broadcast)
+        .collect();
+
+    // Zero-valued vector defs.
+    let mut zeros: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Intrinsic {
+                dest: Some(d),
+                op,
+                args,
+                ..
+            } = inst
+            {
+                // The byte/word families' `zero` IS their broadcast op:
+                // a broadcast is zero only with the constant-0 operand.
+                let is_zero = if broadcast_ops.contains(op) {
+                    args.first().is_some_and(const_is_zero)
+                } else {
+                    zero_ops.contains(op)
+                };
+                if is_zero {
+                    zeros.insert(d.0);
+                }
+            }
+        }
+    }
+    if zeros.is_empty() {
+        return 0;
+    }
+    let mut map: FxHashMap<u32, u32> = FxHashMap::default();
+    let mut drops: Vec<FxHashSet<usize>> = vec![FxHashSet::default(); func.blocks.len()];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Intrinsic {
+                dest: Some(d),
+                op,
+                args,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            let Some((_, bin)) = ops.iter().find(|(o, _)| o == op) else {
+                continue;
+            };
+            let (Some(Operand::Value(a)), Some(Operand::Value(b))) = (args.first(), args.get(1))
+            else {
+                continue;
+            };
+            let a_zero = zeros.contains(&a.0);
+            let b_zero = zeros.contains(&b.0);
+            let keep = match bin {
+                IrBinOp::Sub => {
+                    if b_zero {
+                        Some(a.0)
+                    } else {
+                        None
+                    }
+                }
+                _ => {
+                    if b_zero {
+                        Some(a.0)
+                    } else if a_zero {
+                        Some(b.0)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(src) = keep {
+                // Chase an earlier fold so chains resolve in one pass.
+                let src = *map.get(&src).unwrap_or(&src);
+                map.insert(d.0, src);
+                drops[bi].insert(ii);
+            }
+        }
+    }
+    if map.is_empty() {
+        return 0;
+    }
+    for (bi, block) in func.blocks.iter_mut().enumerate() {
+        retain_instructions(block, &drops[bi]);
+        for inst in &mut block.instructions {
+            replace_values_in_inst_map(inst, &map);
+        }
+        replace_values_in_terminator_map(&mut block.terminator, &map);
+    }
+    map.len()
+}
+
+/// `(m & x) | (~m & y)` with `m` a packed compare result (every lane
+/// all-ones or all-zeros) is one byte-granular variable blend,
+/// `VecBlendvI8x{32,16}(y, x, m)` (`vpblendvb`): the mask bytes are
+/// uniform per lane, so the sign-bit select IS the bitwise select.
+/// `~m` is the all-ones xor in either operand order, the all-ones a
+/// `-1` broadcast or a `-1` lane constant; the and/or operands commute.
+/// The mask's producer is required to be a compare so a mask with
+/// arbitrary payload bits never meets the sign-bit rule.
+fn fold_select_idioms(func: &mut IrFunction) -> usize {
+    use crate::ir::reexports::IrBinOp;
+    let int_tys = [IrType::I8, IrType::I16, IrType::I32, IrType::I64];
+    let mut and_ops: FxHashMap<IntrinsicOp, usize> = FxHashMap::default();
+    let mut or_ops: FxHashMap<IntrinsicOp, usize> = FxHashMap::default();
+    let mut xor_ops: FxHashMap<IntrinsicOp, usize> = FxHashMap::default();
+    let mut ones_ops: FxHashSet<IntrinsicOp> = FxHashSet::default();
+    for ty in int_tys {
+        for bytes in [16usize, 32] {
+            let lanes = bytes / ty.size();
+            if let Some(op) = crate::passes::slp_vectorizer::packed_binop(IrBinOp::And, ty, lanes) {
+                and_ops.insert(op, bytes);
+            }
+            if let Some(op) = crate::passes::slp_vectorizer::packed_binop(IrBinOp::Or, ty, lanes) {
+                or_ops.insert(op, bytes);
+            }
+            if let Some(op) = crate::passes::slp_vectorizer::packed_binop(IrBinOp::Xor, ty, lanes) {
+                xor_ops.insert(op, bytes);
+            }
+            if let Some(f) = family_for(ty, lanes) {
+                ones_ops.insert(f.broadcast);
+            }
+        }
+    }
+    let is_cmp = |op: &IntrinsicOp| {
+        matches!(
+            op,
+            IntrinsicOp::VecCmpF32x8
+                | IntrinsicOp::VecCmpF32x4
+                | IntrinsicOp::VecCmpF64x4
+                | IntrinsicOp::VecCmpF64x2
+                | IntrinsicOp::VecCmpI32x8
+                | IntrinsicOp::VecCmpI32x4
+                | IntrinsicOp::VecCmpI64x4
+                | IntrinsicOp::VecCmpI64x2
+                | IntrinsicOp::VecCmpI8x32
+                | IntrinsicOp::VecCmpI8x16
+                | IntrinsicOp::VecCmpI16x16
+                | IntrinsicOp::VecCmpI16x8
+        )
+    };
+    // Single pass over the defs: (op, args) per value id.
+    let mut defs: FxHashMap<u32, (IntrinsicOp, Vec<Operand>)> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Intrinsic {
+                dest: Some(d),
+                op,
+                args,
+                ..
+            } = inst
+            {
+                defs.insert(d.0, (*op, args.clone()));
+            }
+        }
+    }
+    let val = |o: &Operand| match o {
+        Operand::Value(v) => Some(v.0),
+        _ => None,
+    };
+    let is_all_ones = |o: &Operand| match o {
+        Operand::Const(c) => c.to_i64() == Some(-1),
+        Operand::Value(v) => defs.get(&v.0).is_some_and(|(op, args)| {
+            ones_ops.contains(op)
+                && matches!(args.first(), Some(Operand::Const(c)) if c.to_i64() == Some(-1))
+        }),
+    };
+    // `~m` for a compare-defined `m`: Some(m).
+    let not_of = |v: u32| -> Option<u32> {
+        let (op, args) = defs.get(&v)?;
+        let bytes = *xor_ops.get(op)?;
+        let (a, b) = (args.first()?, args.get(1)?);
+        let m = if is_all_ones(b) {
+            val(a)?
+        } else if is_all_ones(a) {
+            val(b)?
+        } else {
+            return None;
+        };
+        let (mop, _) = defs.get(&m)?;
+        (is_cmp(mop) && mop.vector_home_width() == Some(bytes as u32)).then_some(m)
+    };
+    // `And(m, x)` with a compare-defined `m` or `And(~m, y)`:
+    // (mask, payload, negated).
+    let and_of = |v: u32| -> Option<(u32, u32, bool, usize)> {
+        let (op, args) = defs.get(&v)?;
+        let bytes = *and_ops.get(op)?;
+        let (a, b) = (val(args.first()?)?, val(args.get(1)?)?);
+        for (cand, other) in [(a, b), (b, a)] {
+            if let Some((mop, _)) = defs.get(&cand) {
+                if is_cmp(mop) && mop.vector_home_width() == Some(bytes as u32) {
+                    return Some((cand, other, false, bytes));
+                }
+            }
+            if let Some(m) = not_of(cand) {
+                return Some((m, other, true, bytes));
+            }
+        }
+        None
+    };
+    let mut rewrites: Vec<(u32, IntrinsicOp, Vec<Operand>)> = Vec::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Instruction::Intrinsic {
+                dest: Some(d),
+                op,
+                args,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            let Some(&bytes) = or_ops.get(op) else {
+                continue;
+            };
+            let (Some(a), Some(b)) = (args.first().and_then(val), args.get(1).and_then(val)) else {
+                continue;
+            };
+            let (Some(pa), Some(pb)) = (and_of(a), and_of(b)) else {
+                continue;
+            };
+            if pa.0 != pb.0 || pa.2 == pb.2 || pa.3 != bytes || pb.3 != bytes {
+                continue;
+            }
+            // (mask & x) | (~mask & y) -> blendv(y, x, mask).
+            let (x, y) = if pa.2 { (pb.1, pa.1) } else { (pa.1, pb.1) };
+            let blend = if bytes == 32 {
+                IntrinsicOp::VecBlendvI8x32
+            } else {
+                IntrinsicOp::VecBlendvI8x16
+            };
+            rewrites.push((
+                d.0,
+                blend,
+                vec![
+                    Operand::Value(Value(y)),
+                    Operand::Value(Value(x)),
+                    Operand::Value(Value(pa.0)),
+                ],
+            ));
+        }
+    }
+    if rewrites.is_empty() {
+        return 0;
+    }
+    let by_dest: FxHashMap<u32, (IntrinsicOp, Vec<Operand>)> = rewrites
+        .into_iter()
+        .map(|(d, op, args)| (d, (op, args)))
+        .collect();
+    let mut n = 0;
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            if let Instruction::Intrinsic {
+                dest: Some(d),
+                op,
+                args,
+                ..
+            } = inst
+            {
+                if let Some((nop, nargs)) = by_dest.get(&d.0) {
+                    *op = *nop;
+                    *args = nargs.clone();
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
 pub(crate) fn promote_vector_allocas(module: &mut IrModule) -> usize {
     let table = family_table();
     if table.is_empty() {
@@ -841,6 +1147,8 @@ pub(crate) fn promote_vector_allocas(module: &mut IrModule) -> usize {
     for func in &mut module.functions {
         total += promote_function(func, &table);
         total += hoist_param_loads(func, &table);
+        total += fold_zero_identities(func);
+        total += fold_select_idioms(func);
     }
     total
 }
@@ -976,5 +1284,211 @@ mod tests {
         f.next_value_id = 10;
         assert_eq!(promote_function(&mut f, &table), 0);
         assert_eq!(f.blocks[0].instructions.len(), 3);
+    }
+
+    fn intr(dest: u32, op: IntrinsicOp, args: Vec<Operand>) -> Instruction {
+        Instruction::Intrinsic {
+            dest: Some(Value(dest)),
+            op,
+            dest_ptr: None,
+            args,
+        }
+    }
+
+    fn val(v: u32) -> Operand {
+        Operand::Value(Value(v))
+    }
+
+    fn fold_ops(instructions: Vec<Instruction>) -> (usize, IrFunction) {
+        crate::passes::vectorize::set_x86_simd_isa(true, false, true, false);
+        let mut f = func_with_blocks(vec![block(
+            0,
+            instructions,
+            Terminator::Return(Some(val(9))),
+        )]);
+        f.next_value_id = 20;
+        let n = fold_zero_identities(&mut f);
+        (n, f)
+    }
+
+    fn returned(f: &IrFunction) -> u32 {
+        match &f.blocks[0].terminator {
+            Terminator::Return(Some(Operand::Value(v))) => v.0,
+            other => panic!("unexpected terminator {:?}", other),
+        }
+    }
+
+    #[test]
+    fn integer_zero_identities_fold_on_either_side() {
+        use crate::ir::reexports::IrConst;
+        let x = intr(
+            1,
+            IntrinsicOp::VecBroadcastI32x4,
+            vec![Operand::Const(IrConst::I32(7))],
+        );
+        let z = intr(2, IntrinsicOp::VecZeroI32x4, vec![]);
+        for (op, a, b) in [
+            (IntrinsicOp::VecAddI32x4, 1, 2),
+            (IntrinsicOp::VecAddI32x4, 2, 1),
+            (IntrinsicOp::VecOrI32x4, 2, 1),
+            (IntrinsicOp::VecXorI32x4, 1, 2),
+            (IntrinsicOp::VecSubI32x4, 1, 2),
+        ] {
+            let (n, f) = fold_ops(vec![
+                x.clone(),
+                z.clone(),
+                intr(9, op, vec![val(a), val(b)]),
+            ]);
+            assert_eq!(n, 1, "{:?}", op);
+            assert_eq!(returned(&f), 1, "{:?}", op);
+            assert_eq!(f.blocks[0].instructions.len(), 2, "{:?}", op);
+        }
+        // A chain resolves in one pass: ((x + 0) ^ 0) -> x.
+        let (n, f) = fold_ops(vec![
+            x.clone(),
+            z.clone(),
+            intr(3, IntrinsicOp::VecAddI32x4, vec![val(1), val(2)]),
+            intr(9, IntrinsicOp::VecXorI32x4, vec![val(3), val(2)]),
+        ]);
+        assert_eq!(n, 2);
+        assert_eq!(returned(&f), 1);
+    }
+
+    #[test]
+    fn mask_and_or_select_idiom_becomes_a_byte_blend() {
+        use crate::ir::reexports::IrConst;
+        // The 32-byte families are AVX2.
+        crate::passes::vectorize::set_x86_simd_isa(true, true, true, false);
+        // m = a < b (compare); (m & x) | (~m & y) in mixed operand orders.
+        let base =
+            |xor_args: Vec<Operand>, and1: Vec<Operand>, and2: Vec<Operand>, or: Vec<Operand>| {
+                vec![
+                    intr(
+                        1,
+                        IntrinsicOp::VecCmpI32x8,
+                        vec![val(10), val(11), Operand::Const(IrConst::I64(1))],
+                    ),
+                    intr(
+                        2,
+                        IntrinsicOp::VecBroadcastI32x8,
+                        vec![Operand::Const(IrConst::I32(-1))],
+                    ),
+                    intr(3, IntrinsicOp::VecXorI32x8, xor_args),
+                    intr(4, IntrinsicOp::VecAndI32x8, and1),
+                    intr(5, IntrinsicOp::VecAndI32x8, and2),
+                    intr(9, IntrinsicOp::VecOrI32x8, or),
+                ]
+            };
+        for (xa, a1, a2, o) in [
+            (
+                vec![val(1), val(2)],
+                vec![val(1), val(12)],
+                vec![val(3), val(13)],
+                vec![val(4), val(5)],
+            ),
+            (
+                vec![val(2), val(1)],
+                vec![val(12), val(1)],
+                vec![val(13), val(3)],
+                vec![val(5), val(4)],
+            ),
+        ] {
+            let mut f = func_with_blocks(vec![block(
+                0,
+                base(xa, a1, a2, o),
+                Terminator::Return(Some(val(9))),
+            )]);
+            f.next_value_id = 20;
+            assert_eq!(fold_select_idioms(&mut f), 1);
+            let last = f.blocks[0].instructions.last().unwrap();
+            match last {
+                Instruction::Intrinsic { op, args, .. } => {
+                    assert_eq!(*op, IntrinsicOp::VecBlendvI8x32);
+                    // blendv(false = y, true = x, mask).
+                    assert_eq!(args, &vec![val(13), val(12), val(1)]);
+                }
+                other => panic!("unexpected {:?}", other),
+            }
+        }
+        // A mask that is not a compare result (payload bits) is kept.
+        let mut f = func_with_blocks(vec![block(
+            0,
+            vec![
+                intr(1, IntrinsicOp::VecAddI32x8, vec![val(10), val(11)]),
+                intr(
+                    2,
+                    IntrinsicOp::VecBroadcastI32x8,
+                    vec![Operand::Const(IrConst::I32(-1))],
+                ),
+                intr(3, IntrinsicOp::VecXorI32x8, vec![val(1), val(2)]),
+                intr(4, IntrinsicOp::VecAndI32x8, vec![val(1), val(12)]),
+                intr(5, IntrinsicOp::VecAndI32x8, vec![val(3), val(13)]),
+                intr(9, IntrinsicOp::VecOrI32x8, vec![val(4), val(5)]),
+            ],
+            Terminator::Return(Some(val(9))),
+        )]);
+        f.next_value_id = 20;
+        assert_eq!(fold_select_idioms(&mut f), 0);
+        crate::passes::vectorize::set_x86_simd_isa(true, false, true, false);
+    }
+
+    #[test]
+    fn zero_minus_x_and_fp_and_nonzero_broadcasts_are_kept() {
+        use crate::ir::reexports::IrConst;
+        let x = intr(
+            1,
+            IntrinsicOp::VecBroadcastI32x4,
+            vec![Operand::Const(IrConst::I32(7))],
+        );
+        let z = intr(2, IntrinsicOp::VecZeroI32x4, vec![]);
+        // 0 - x is a negation, not an identity.
+        let (n, f) = fold_ops(vec![
+            x.clone(),
+            z.clone(),
+            intr(9, IntrinsicOp::VecSubI32x4, vec![val(2), val(1)]),
+        ]);
+        assert_eq!(n, 0);
+        assert_eq!(f.blocks[0].instructions.len(), 3);
+        // x + 0.0 is not an identity for -0.0.
+        let (n, _) = fold_ops(vec![
+            intr(
+                1,
+                IntrinsicOp::VecBroadcastF32x4,
+                vec![Operand::Const(IrConst::F32(1.0))],
+            ),
+            intr(2, IntrinsicOp::VecZeroF32x4, vec![]),
+            intr(9, IntrinsicOp::VecAddF32x4, vec![val(1), val(2)]),
+        ]);
+        assert_eq!(n, 0);
+        // The byte family's zero IS its broadcast: only constant 0 counts.
+        let (n, _) = fold_ops(vec![
+            intr(
+                1,
+                IntrinsicOp::VecBroadcastI8x16,
+                vec![Operand::Const(IrConst::I8(5))],
+            ),
+            intr(
+                2,
+                IntrinsicOp::VecBroadcastI8x16,
+                vec![Operand::Const(IrConst::I8(3))],
+            ),
+            intr(9, IntrinsicOp::VecXorI8x16, vec![val(1), val(2)]),
+        ]);
+        assert_eq!(n, 0);
+        let (n, f) = fold_ops(vec![
+            intr(
+                1,
+                IntrinsicOp::VecBroadcastI8x16,
+                vec![Operand::Const(IrConst::I8(5))],
+            ),
+            intr(
+                2,
+                IntrinsicOp::VecBroadcastI8x16,
+                vec![Operand::Const(IrConst::I8(0))],
+            ),
+            intr(9, IntrinsicOp::VecXorI8x16, vec![val(1), val(2)]),
+        ]);
+        assert_eq!(n, 1);
+        assert_eq!(returned(&f), 1);
     }
 }

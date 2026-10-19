@@ -2013,6 +2013,8 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             // same SSA-scratch-pair contract as the ops above.
             | O::VecCmpI32x8
             | O::VecCmpI32x4
+            | O::VecCmpI64x4
+            | O::VecCmpI64x2
             | O::VecBlendvI32x8
             | O::VecBlendvI32x4
             // Integer min/max map results: with the exact ternary fold
@@ -2304,6 +2306,8 @@ pub(crate) fn is_cache_aware_3op(op: &crate::ir::intrinsics::IntrinsicOp) -> boo
             | O::VecBlendvF64x2
             | O::VecCmpI32x8
             | O::VecCmpI32x4
+            | O::VecCmpI64x4
+            | O::VecCmpI64x2
             | O::VecBlendvI32x8
             | O::VecBlendvI32x4
             // Byte/word-lane Cmp/Blendv follow their dword twins: their

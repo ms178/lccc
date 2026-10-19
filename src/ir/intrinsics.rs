@@ -523,6 +523,14 @@ pub enum IntrinsicOp {
     /// Packed integer compare (see `VecCmpI32x8`) - SSE2 4×I32/U32
     /// (pcmpeqd/pcmpgtd; le/ne invert through a self-compare all-ones).
     VecCmpI32x4,
+    /// Packed integer compare (see `VecCmpI32x8`) on 64-bit lanes - AVX2
+    /// 4×I64/U64 (`vpcmpeqq`/`vpcmpgtq`; the unsigned forms bias with
+    /// `xor 0x8000000000000000`).
+    VecCmpI64x4,
+    /// Packed integer compare (see `VecCmpI32x8`) on 64-bit lanes -
+    /// 2×I64/U64 (`vpcmpeqq` SSE4.1 / `vpcmpgtq` SSE4.2; produced only at
+    /// the AVX2 lowering level).
+    VecCmpI64x2,
     /// Lane-mask select on integer dword lanes: `dest[i] = mask[i] ?
     /// true[i] : false[i]` with `args = [false_vec, true_vec, mask]`.
     /// vblendvps is a BITWISE dword select driven by each mask lane's
@@ -1791,7 +1799,7 @@ impl IntrinsicOp {
             | VecBroadcastF32x8 | VecZeroF32x8
             | VecMinF32x8 | VecMaxF32x8 | VecCmpF32x8 | VecBlendvF32x8
             | VecMinF64x4 | VecMaxF64x4 | VecCmpF64x4 | VecBlendvF64x4
-            | VecCmpI32x8 | VecBlendvI32x8 | VecMinI32x8
+            | VecCmpI32x8 | VecCmpI64x4 | VecBlendvI32x8 | VecMinI32x8
             | VecLoadI8x32 | VecBroadcastI8x32
             | VecCmpI8x32 | VecBlendvI8x32 | VecMinU8x32 | VecMaxU8x32
             | VecMinI8x32 | VecMaxI8x32
@@ -1896,7 +1904,7 @@ impl IntrinsicOp {
             | VecMinF64x2 | VecMaxF64x2 | VecCmpF64x2 | VecBlendvF64x2
             | VecFmaF64x2 | VecFnmaF64x2 | VecFmaF32x4 | VecFnmaF32x4
             | VecFmsF64x2 | VecFmsF32x4 | VecFnmsF64x2 | VecFnmsF32x4
-            | VecCmpI32x4 | VecBlendvI32x4
+            | VecCmpI32x4 | VecCmpI64x2 | VecBlendvI32x4
             | VecAddI8x16 | VecSubI8x16 | VecCmpI8x16
             | VecMinU8x16 | VecMaxU8x16 | VecBlendvI8x16
             | VecBroadcastI8x16
@@ -2365,6 +2373,8 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecBlendvF64x2
                 | IntrinsicOp::VecCmpI32x8
                 | IntrinsicOp::VecCmpI32x4
+                | IntrinsicOp::VecCmpI64x4
+                | IntrinsicOp::VecCmpI64x2
                 | IntrinsicOp::VecBlendvI32x8
                 | IntrinsicOp::VecBlendvI32x4
                 | IntrinsicOp::VecLoadI8x32
@@ -2600,6 +2610,8 @@ mod vector_width_tests {
             "VecOrI8x32" => IntrinsicOp::VecOrI8x32,
             "VecXorI8x32" => IntrinsicOp::VecXorI8x32,
             "VecCmpI32x8" => IntrinsicOp::VecCmpI32x8,
+            "VecCmpI64x4" => IntrinsicOp::VecCmpI64x4,
+            "VecCmpI64x2" => IntrinsicOp::VecCmpI64x2,
             "VecCmpF64x2" => IntrinsicOp::VecCmpF64x2,
             "VecCmpF64x4" => IntrinsicOp::VecCmpF64x4,
             "VecDivF32x4" => IntrinsicOp::VecDivF32x4,

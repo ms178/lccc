@@ -3951,3 +3951,58 @@ instructions vs GCC's 2). It is now one `vpsllvd`/`vpsrlvd`/`vpsravd`/
   masks the counts into range. Ceilings: 2 for every packed shape, and a
   `vpsravd` must appear in `shr_v32i`.
 
+
+### Addendum — the whole-vector residue sweep (2026-10-19)
+
+The matrix moved from 2751 to 2644 instructions over 378 functions (GCC
+16: 2441; lccc is at or below GCC on 273 functions). The decisions that
+are not obvious from the diff:
+
+- *Integer zero identities fold; floating ones never do.* `x + 0`, `x -
+  0`, `x | 0`, `x ^ 0` (either operand where commutative) resolve in
+  `vec_ssa` once the `{}` seed is a register value. `x + 0.0` is NOT an
+  identity (`-0.0 + 0.0 = +0.0`), and `x ^ -0.0` is the negation idiom
+  the FMA contraction matches, so the FP families are excluded by
+  construction, not by a flag. A byte/word broadcast is "zero" only with
+  the constant-0 operand (those families' zero op IS their broadcast op;
+  the first cut folded every byte splat and the asm diff caught it).
+- *A scalar constant operand rides on the intrinsic as a `Const`.* Only
+  the src2 position folds into an r/m operand, so a constant lhs of a
+  commutative op is swapped there and `c - v` keeps the splat. Integer
+  add/sub/mul/and/or/xor only: `vec_fma_contract` matches `Value`
+  operands and must never see a `Const` in a multiply it may drop.
+- *Constant splats load, they do not broadcast.* Any integer splat other
+  than 0 / -1 is one aligned `vmovdqa .LCVEC(%rip)` of the tiled
+  constant (GCC's and Clang's text). The pool aligns 32-byte entries to
+  32 — the first cut kept the pool's `.p2align 4` and `vmovdqa … %ymm`
+  faulted at three runtime levels of the gate before commit. Lesson
+  re-learned: an aligned-load spelling is a contract with the pool, and
+  the differential runtime matrix is the gate that holds it.
+- *The signed 64-bit variable right shift is an expansion, not a
+  scalar fallback.* No `vpsravq` below AVX-512VL; GCC's `vpsrlvq` twice
+  + `vpxor` + `vpsubq` over the sign-bit splat is exact for every count
+  the language defines (counts ≥ 64 are undefined for GNU vector shifts
+  as for the scalar lanes). 6 instructions, GCC's 6.
+- *`(m & x) | (~m & y)` is `vpblendvb` only for a compare-defined
+  mask.* The byte blend keys on each mask byte's sign bit; a compare
+  result has uniform bytes per lane, so the sign-bit select equals the
+  bitwise select. Any other mask producer (payload bits) is refused —
+  the fold checks the producer, not the shape.
+- *A single-member vector record returns like the bare vector.* Its
+  classes are the vector's (`Sse+SseUp…`), so the callee returns the
+  packed member in `%ymm0`/`%xmm0` with no change to the boundary; both
+  cross-links (lccc callee / GCC caller and the reverse) agree. An
+  over-aligned record (padding past the member) and the vector + tag
+  record (`s4i_add`) stay generic.
+- *A VEX.128 load or broadcast may fold into a legacy 128-bit copy-out.*
+  Same wide-reader rule as any VEX.128 producer: the only observable
+  difference is the destination's bits above 128, refused when any line
+  of the function reads the destination wider than the copy.
+- *`# LCCC_RET_RAX 0` for a vector return.* The IR return type of a
+  `%ymm0`-returned vector is the lowering's `Ptr`; nothing reads `%rax`
+  at `ret`, and the text liveness no longer keeps the broadcast
+  emitters' staging `movq %rdi, %rax` alive.
+
+The remaining debt is listed, measured, with its fix in
+`FOLLOWUP-2026-10-17-ext-vector-grid.md` (MEMORY-class parameter capture
+is the largest single item).

@@ -304,10 +304,11 @@ expect_no_call "$tmp/fortify_call.c" -O2 -D_FORTIFY_SOURCE=2
 expect_no_call "$tmp/fortify_call.c" -O2 -D_FORTIFY_SOURCE=2 -fno-builtin-memcpy
 expect_call   "$tmp/fortify_call.c" f memset -O2 -D_FORTIFY_SOURCE=2 -fno-builtin-memset
 # a TU *definition* of the callee also stops the expansion (no flag needed).
-# The global definition stays a call; a *static* one may legitimately be
-# inlined (that honours it), so the assertion there is semantic: no library
-# fill byte may appear.
-expect_call          "$tmp/tu_def_const_call.c" f memset -O2
+# Either definition (global or static) may legitimately be inlined -- that
+# honours it, exactly as GCC inlines a TU-defined global at -O2 without
+# -fPIC / -fsemantic-interposition -- so the assertion is semantic on both:
+# the call survives, or the inlined body carries no library fill byte.
+expect_no_library_fill "$tmp/tu_def_const_call.c" f memset -O2
 expect_no_library_fill "$tmp/tu_static_const_call.c" f memset -O2
 
 # ── 5. runtime ──────────────────────────────────────────────────────────────

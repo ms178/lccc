@@ -6010,6 +6010,8 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             | O::VecCmpF64x2
             | O::VecCmpI32x8
             | O::VecCmpI32x4
+            | O::VecCmpI64x4
+            | O::VecCmpI64x2
          | O::VecCmpI8x32
             | O::VecCmpI8x16
             | O::VecMinU8x32
@@ -6634,6 +6636,47 @@ fn is_sse128_chain_op(op: &IntrinsicOp) -> bool {
             | O::VecAndI64x2
             | O::VecOrI64x2
             | O::VecXorI64x2
+            // GNU-vector 128-bit integer shapes that were missing from the
+            // chain family and therefore never register-homed (every
+            // `v8s + v8s` paid two prologue spills and four reloads):
+            // word add/sub/min/max (emit_sse_binary_128), the four
+            // integer lane compares (`emit_int_cmp*`: the all-homed VEX
+            // path writes the destination last, so a first-operand
+            // handoff is sound) and the VEX.128 variable shifts
+            // (`emit_vex_binary_128`, three-operand).
+            | O::VecAddI16x8
+            | O::VecSubI16x8
+            | O::VecMinI16x8
+            | O::VecMaxI16x8
+            | O::VecCmpI32x4
+            | O::VecCmpI64x2
+            | O::VecCmpI16x8
+            | O::VecCmpI8x16
+            | O::VecShlvI32x4
+            | O::VecLShrvI32x4
+            | O::VecAShrvI32x4
+            | O::VecShlvI64x2
+            | O::VecLShrvI64x2
+    )
+}
+
+/// The GNU-vector scalar broadcasts of every family and width.
+fn is_vector_broadcast_op(op: &IntrinsicOp) -> bool {
+    use IntrinsicOp as O;
+    matches!(
+        op,
+        O::VecBroadcastF32x8
+            | O::VecBroadcastF64x4
+            | O::VecBroadcastI32x8
+            | O::VecBroadcastI64x4
+            | O::VecBroadcastI16x16
+            | O::VecBroadcastI8x32
+            | O::VecBroadcastF32x4
+            | O::VecBroadcastF64x2
+            | O::VecBroadcastI32x4
+            | O::VecBroadcastI64x2
+            | O::VecBroadcastI16x8
+            | O::VecBroadcastI8x16
     )
 }
 
@@ -6648,6 +6691,18 @@ fn collect_sse128_chain_values(func: &IrFunction) -> FxHashSet<u32> {
                 ..
             } = inst
             {
+                // A vector broadcast's operand is a SCALAR (GP or XMM
+                // scalar), never a chain operand: home only the result.
+                // The emitters commit a homed destination through
+                // `avx_store_dest` / `sse_store_dest` (one register copy
+                // the peephole retargets away); unhomed, a broadcast that
+                // feeds a terminator or a multi-use web paid a slot round
+                // trip (`(v32i){} + x` after the zero fold is a bare
+                // broadcast returned directly).
+                if is_vector_broadcast_op(op) {
+                    out.insert(d.0);
+                    continue;
+                }
                 if is_sse128_chain_op(op) && !args.is_empty() {
                     if let Operand::Value(a0) = &args[0] {
                         let same_as_a1 = matches!(&args[1.min(args.len() - 1)], Operand::Value(v) if v.0 == a0.0);
@@ -8120,6 +8175,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     // Conditional-map consumers: a broadcast invariant is
                     // the compare rhs / blend true-arm (clamp shapes).
                     | O::VecCmpI32x8
+                    | O::VecCmpI64x4
                     | O::VecBlendvI32x8
                     // Integer min/max maps: the broadcast is a clamp bound.
                     | O::VecMinI32x8
@@ -8205,6 +8261,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecMulI32x4
                     | O::VecAddI32x4
                     | O::VecCmpI32x4
+                    | O::VecCmpI64x2
                     | O::VecBlendvI32x4
                     // Bitwise lane maps: the broadcast is the operand of
                     // `x & K` / `x | K` / `x ^ K`, including the `mask & K`
@@ -8480,6 +8537,7 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecOrI32x8
         | O::VecXorI32x8
         | O::VecCmpI32x8
+        | O::VecCmpI64x4
         | O::VecBlendvI32x8
         | O::VecMinI32x8
         | O::VecMaxI32x8
@@ -8554,6 +8612,7 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecOrI32x4
         | O::VecXorI32x4
         | O::VecCmpI32x4
+        | O::VecCmpI64x2
         | O::VecBlendvI32x4
      | O::VecRotlI32x4
         | O::VecShufdI32x4
@@ -8600,6 +8659,19 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecXorI64x2
         | O::VecSminI32x4
         | O::VecSmaxI32x4
+        // Byte/word 128-bit loads and bitwise ops: the GNU-vector
+        // `v16c`/`v8s` shapes.  Home-direct `movdqu` loads (the I32x4
+        // arm's discipline) and `emit_sse_binary_128`/VEX.128 bitwise
+        // forms; without these entries every `v8s` parameter round-
+        // tripped through a 16-byte slot.
+        | O::VecLoadI8x16
+        | O::VecLoadI16x8
+        | O::VecAndI8x16
+        | O::VecOrI8x16
+        | O::VecXorI8x16
+        | O::VecAndI16x8
+        | O::VecOrI16x8
+        | O::VecXorI16x8
         // HALF-WIDE dword-pair endpoints (the ops between them are
         // the ordinary I32x4 intrinsics above).
         | O::VecLoadI32x4Pair
@@ -8711,6 +8783,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecOrI32x8
                     | O::VecXorI32x8
                     | O::VecCmpI32x8
+                    | O::VecCmpI64x4
                     | O::VecBlendvI32x8
                     | O::VecMinI32x8
                     | O::VecMaxI32x8
@@ -8778,6 +8851,9 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecOrI64x4
                     | O::VecXorI64x4
                     | O::VecStoreI64x4
+                    // Word-lane store: the `vec_store_source_256` arm
+                    // shared with I32x8/I8x32.
+                    | O::VecStoreI16x16
             ),
             6 => matches!(
                 op,
@@ -8789,6 +8865,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecOrI32x4
                     | O::VecXorI32x4
                     | O::VecCmpI32x4
+                    | O::VecCmpI64x2
                     | O::VecBlendvI32x4
                     | O::VecAddI8x16
                     | O::VecSubI8x16
@@ -8837,6 +8914,16 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecSminI32x4
                     | O::VecSmaxI32x4
                     | O::VecStoreI64x2
+                    // Byte/word 128-bit bitwise ops and stores (the
+                    // `vec_store_source_128` arm shared with I32x4).
+                    | O::VecAndI8x16
+                    | O::VecOrI8x16
+                    | O::VecXorI8x16
+                    | O::VecAndI16x8
+                    | O::VecOrI16x8
+                    | O::VecXorI16x8
+                    | O::VecStoreI8x16
+                    | O::VecStoreI16x8
             ),
             _ => false,
         }
