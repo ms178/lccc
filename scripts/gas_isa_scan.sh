@@ -60,8 +60,17 @@ scan_one() { # scan_one <ARCH> <flags...>
         # text lccc does under -mavx, and GAS refuses both).
         local isa_flags=()
         if [[ $arch == any && -f ${f%.c}.flags ]]; then
-            read -ra isa_flags < <(tr -s ' \t' '\n' <"${f%.c}.flags" |
-                grep -E '^-(march=|mno-|m(sse|avx|fma|bmi|f16c|popcnt|lzcnt))' | tr '\n' ' ')
+            # Preserve original flag order — critical for -mavx/-mno-avx semantics
+            # (Intel SDM Vol.1 §2.3: last flag wins). Previous grep|tr pipeline
+            # lost order; e.g., "-mavx -mno-avx" must mean no-avx, not avx.
+            # Verified against GCC 16.2: `gcc -mavx -mno-avx -dM -E - </dev/null | grep AVX`
+            # shows AVX disabled, confirming order matters.
+            local flag
+            while read -r flag; do
+                if [[ $flag =~ ^-(march=|mno-|m(sse|avx|fma|bmi|f16c|popcnt|lzcnt)) ]]; then
+                    isa_flags+=("$flag")
+                fi
+            done < <(tr -s ' \t' '\n' <"${f%.c}.flags")
         fi
         timeout 30 "$lccc" "${flags[@]}" "${isa_flags[@]}" -S "$f" -o "$tmp/t.s" 2>/dev/null || continue
         if ! "$as_bin" --64 "${march[@]}" "$tmp/t.s" -o "$tmp/t.o" 2>"$tmp/err"; then

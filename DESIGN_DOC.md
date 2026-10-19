@@ -23,6 +23,8 @@ This document describes the architecture and implementation of CCC
 5. [Design Philosophy](#design-philosophy)
 6. [Assembler and Linker Architecture](#assembler-and-linker-architecture)
 7. [Sub-Module Documentation](#sub-module-documentation)
+8. [C23 Features](docs/c23-constexpr.md) — `constexpr` objects, fixed enums
+9. [VM Layout](docs/vm-layout.md) — variably modified types, `typeof`/`__auto_type`
 
 ---
 
@@ -390,3 +392,17 @@ Per-architecture backend documentation:
 | RISC-V 64 | [`riscv/README.md`](src/backend/riscv/README.md) | [`riscv/codegen/README.md`](src/backend/riscv/codegen/README.md) | [`riscv/assembler/README.md`](src/backend/riscv/assembler/README.md) | [`riscv/linker/README.md`](src/backend/riscv/linker/README.md) |
 
 The x86-64 peephole optimizer has its own detailed documentation: [`src/backend/x86/codegen/peephole/README.md`](src/backend/x86/codegen/peephole/README.md).
+
+## Recent Major Features (2026-10)
+
+### Preprocessor Physical Lines (PR #871)
+
+Fixes 5 GCC-measured desyncs where diagnostics/`-g` line tables diverged: backslash splices, multi-line comments, accumulated macro invocations, `__LINE__` pinned to last line, `#line` not updating source manager. See `src/frontend/preprocessor/physical_line_tests.rs` (16 probes vs GCC 16.2).
+
+### C23 Constexpr and Fixed Enums
+
+See [docs/c23-constexpr.md](docs/c23-constexpr.md) — `constexpr` objects (C23 6.7.1p5), fixed underlying enum types (C23 6.7.2.2), `vm_layout` single-query for `typeof`/`sizeof`/`__auto_type` (see [docs/vm-layout.md](docs/vm-layout.md)).
+
+### i686 16-byte Carriers and Backend Linearity
+
+`_Float128`/`_Decimal128` carriers, narrow compares at width, `movs/movz` validation (GAS 2.47 casefiles), `FMA` 231/132 staging, linear compile-time (`mem2reg` dominator walk, `phi_elim`, `call_splitting` — 121s→9.6s on 576 nests).

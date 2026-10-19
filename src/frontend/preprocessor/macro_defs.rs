@@ -173,7 +173,9 @@ pub struct MacroTable {
     line_pinned: Cell<Option<usize>>,
     /// Whether an invocation is being expanded (its arguments or body); only
     /// an outermost invocation consumed source line breaks that must be
-    /// re-emitted (see `restore_line_breaks`).
+    /// re-emitted (see `restore_line_breaks`). Guarded by `InvocationGuard`
+    /// to ensure panic safety — see Intel SDM Vol.3 §6.5 exception handling:
+    /// leaked state after panic would corrupt subsequent macro expansions.
     in_invocation: Cell<bool>,
     /// Collects names of macros expanded during the current expand_line_reuse() call.
     /// Used by the preprocessor to build macro expansion metadata for diagnostics
@@ -960,7 +962,22 @@ impl MacroTable {
                 if source_level {
                     self.line_pinned.set(Some(self.resolve_line(ident_start)));
                 }
+                // Use RAII guard for panic safety: Intel SDM Vol.3 §6.5 requires
+                // exception-safe state cleanup. Without this, a panic in
+                // expand_function_macro (e.g., OOM in FxHashSet) would leak
+                // in_invocation=true, corrupting all subsequent macro expansions
+                // in this MacroTable instance. Casey Muratori: "correctness
+                // under panic is not optional — it's the baseline."
+                struct InvocationGuard<'a>(&'a Cell<bool>, bool);
+                impl Drop for InvocationGuard<'_> {
+                    fn drop(&mut self) {
+                        if self.1 {
+                            self.0.set(false);
+                        }
+                    }
+                }
                 let outermost = !self.in_invocation.replace(true);
+                let _guard = InvocationGuard(&self.in_invocation, outermost);
                 let (args, starts, end_pos) = self.parse_macro_args(bytes, j);
                 let mut i = end_pos;
                 let (expanded, body_ended_with_func_ident) = self.expand_function_macro(
@@ -986,7 +1003,6 @@ impl MacroTable {
                 let appended_from = result.len();
                 Self::append_with_paste_guard(result, &expanded, next);
                 if outermost {
-                    self.in_invocation.set(false);
                     Self::restore_line_breaks(bytes, ident_start..i, result, appended_from);
                 }
                 self.line_pinned.set(prev_pinned);
@@ -1005,7 +1021,17 @@ impl MacroTable {
         if source_level {
             self.line_pinned.set(Some(self.resolve_line(ident_start)));
         }
+        // RAII guard for panic safety — see above (Intel SDM Vol.3 §6.5).
+        struct Guard2<'a>(&'a Cell<bool>, bool);
+        impl Drop for Guard2<'_> {
+            fn drop(&mut self) {
+                if self.1 {
+                    self.0.set(false);
+                }
+            }
+        }
         let outermost = !self.in_invocation.replace(true);
+        let _guard = Guard2(&self.in_invocation, outermost);
         let expanded = self.expand_text(&mac.body, expanding);
         expanding.remove(ident);
 
@@ -1015,7 +1041,6 @@ impl MacroTable {
             let appended_from = result.len();
             result.push_str(&func_expanded);
             if outermost {
-                self.in_invocation.set(false);
                 Self::restore_line_breaks(bytes, ident_start..end_pos, result, appended_from);
             }
             self.line_pinned.set(prev_pinned);
@@ -1033,7 +1058,6 @@ impl MacroTable {
         let appended_from = result.len();
         Self::append_with_paste_guard(result, &expanded, next);
         if outermost {
-            self.in_invocation.set(false);
             Self::restore_line_breaks(bytes, ident_start..i, result, appended_from);
         }
         self.line_pinned.set(prev_pinned);
