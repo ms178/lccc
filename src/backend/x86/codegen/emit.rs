@@ -3316,12 +3316,17 @@ impl X86Codegen {
                 } else if let Some(slot) = self.state.get_slot(v.0) {
                     // value_to_reg is a 64-bit loader and historically calls
                     // emitted `movq slot, %eax` when passed a 32-bit register.
-                    // For a small integer return use a width-consistent load.
+                    // For a small integer return use a width-consistent load:
+                    // the sign extensions name %rax, as their `q` suffix
+                    // requires (GNU as rejects `movswq m, %eax`; the integrated
+                    // assembler already encoded REX.W, so the bytes are
+                    // unchanged), the zero extensions write %eax and so clear
+                    // the upper half.
                     match self.value_types.get(&v.0).copied().unwrap_or(IrType::I64) {
                         IrType::I8 => {
                             self.state
                                 .out
-                                .emit_instr_rbp_reg("    movsbq", slot.0, "eax")
+                                .emit_instr_rbp_reg("    movsbq", slot.0, "rax")
                         }
                         IrType::U8 => {
                             self.state
@@ -3331,7 +3336,7 @@ impl X86Codegen {
                         IrType::I16 => {
                             self.state
                                 .out
-                                .emit_instr_rbp_reg("    movswq", slot.0, "eax")
+                                .emit_instr_rbp_reg("    movswq", slot.0, "rax")
                         }
                         IrType::U16 => {
                             self.state

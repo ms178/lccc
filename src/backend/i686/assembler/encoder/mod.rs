@@ -17,8 +17,9 @@ pub(crate) use registers::*;
 pub(crate) use crate::backend::x86::assembler::encoder::strip_plt_suffix;
 
 use crate::backend::x86::assembler::encoder::{
-    InstructionEncoder as X86InstructionEncoder, gp_id, is_reg64, is_size_matched_accumulator,
-    is_vex_xop_encoding, normalize_bare_label, op_decorated, string_op_size, vec_reg_id,
+    InstructionEncoder as X86InstructionEncoder, check_movext_register_sizes, gp_id, is_reg64,
+    is_size_matched_accumulator, is_vex_xop_encoding, normalize_bare_label, op_decorated,
+    string_op_size, vec_reg_id,
 };
 use crate::backend::x86::assembler::parser::*;
 
