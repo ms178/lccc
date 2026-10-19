@@ -624,6 +624,7 @@ pub fn instrument_module(
             is_const: false,
             is_used: true,
             is_thread_local: false,
+            tls_model: None,
         });
 
         // ── Insert increments ────────────────────────────────────────────
@@ -787,6 +788,7 @@ pub fn instrument_module(
                             is_const: false,
                             is_used: true,
                             is_thread_local: false,
+                            tls_model: None,
                         };
                         if !m.globals.iter().any(|x| x.name == g.name) {
                             m.globals.push(g);
@@ -2121,6 +2123,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             is_const: true,
             is_used: true,
             is_thread_local: false,
+            tls_model: None,
         });
     }
 
@@ -2151,6 +2154,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             is_const: false,
             is_used: true,
             is_thread_local: false,
+            tls_model: None,
         });
     }
     // Pool node.
@@ -2170,6 +2174,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
         is_const: false,
         is_used: true,
         is_thread_local: false,
+        tls_model: None,
     });
     // addr2name table: {addr, name} pairs for every defined function.
     let mut elems: Vec<GlobalInit> = Vec::new();
@@ -2206,6 +2211,7 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             is_const: true,
             is_used: true,
             is_thread_local: false,
+            tls_model: None,
         });
     }
 

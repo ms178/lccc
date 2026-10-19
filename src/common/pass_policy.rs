@@ -24,8 +24,8 @@ impl PassPolicy {
 
 // Declares `Libcall`, its complete `ALL` table and `name()` from ONE list: a
 // variant cannot exist without its name, and cannot be missing from `ALL`
-// (the array length is derived from the same list), so the exhaustive
-// admission tests always cover every synthesizable library name.
+// (the array length is derived from the same list), so exhaustive policy
+// tests and passes iterate every synthesizable library name.
 macro_rules! libcalls {
     ($(#[$doc:meta])* $($variant:ident = $name:literal,)+) => {
         $(#[$doc])*
@@ -173,6 +173,16 @@ impl BuiltinPolicy {
         self.may_assume_libcall(l)
     }
 
+    /// Meet two policies conservatively.  Code cloned from `other` into a
+    /// function may only make assumptions allowed in BOTH original contexts;
+    /// a withdrawal is monotonic across inlining.
+    pub const fn conservative_merge(self, other: BuiltinPolicy) -> BuiltinPolicy {
+        BuiltinPolicy {
+            blanket_withdrawn: self.blanket_withdrawn || other.blanket_withdrawn,
+            withdrawn: self.withdrawn | other.withdrawn,
+        }
+    }
+
     fn may_assume_libcall(self, l: Libcall) -> bool {
         self.withdrawn & l.bit() == 0 && !self.blanket_withdrawn
     }
@@ -248,15 +258,20 @@ mod tests {
     fn from_name_is_exact() {
         // No prefix, suffix, case or `__builtin_` aliasing: a spelled builtin
         // is a per-call fact (`CallInfo::assume_library`), not a Libcall name.
-        for name in [
-            "",
-            "mem",
-            "memsetx",
-            "MEMSET",
-            "__builtin_memset",
-            " memset",
-        ] {
-            assert_eq!(Libcall::from_name(name), None, "{name:?}");
+        assert_eq!(Libcall::from_name(""), None);
+        for lib in Libcall::ALL {
+            let name = lib.name();
+            for invalid in [
+                format!("x{name}"),
+                format!("{name}x"),
+                name.to_ascii_uppercase(),
+                format!("__builtin_{name}"),
+                format!(" {name}"),
+                format!("{name} "),
+            ] {
+                assert_eq!(Libcall::from_name(&invalid), None, "{invalid:?}");
+            }
+            assert_eq!(Libcall::from_name(name), Some(lib), "{name:?}");
         }
     }
 
@@ -266,6 +281,22 @@ mod tests {
             assert_eq!(Libcall::from_name(l.name()), Some(l));
         }
         assert_eq!(Libcall::from_name("strlen"), None);
+    }
+
+    #[test]
+    fn conservative_merge_preserves_every_withdrawal() {
+        let mut left = BuiltinPolicy::HOSTED;
+        left.withdraw_libcall(Libcall::Memcpy);
+        let mut right = BuiltinPolicy::HOSTED;
+        right.withdraw_libcall(Libcall::Memset);
+        let merged = left.conservative_merge(right);
+        assert!(!merged.may_synthesize(Libcall::Memcpy));
+        assert!(!merged.may_synthesize(Libcall::Memset));
+        assert!(merged.may_synthesize(Libcall::Puts));
+
+        right.withdraw_all();
+        let merged = left.conservative_merge(right);
+        assert!(Libcall::ALL.iter().all(|l| !merged.may_synthesize(*l)));
     }
 
     #[test]

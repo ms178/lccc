@@ -398,6 +398,12 @@ pub trait ArchCodegen {
         false
     }
 
+    /// Whether dynamic x86 TLS descriptor offsets can be consumed directly by
+    /// a segmented load, without first materializing the full address.
+    fn supports_tls_dynamic_load_fold(&self) -> bool {
+        false
+    }
+
     /// Whether the backend can reconstruct an omitted GlobalAddr at audited
     /// Add/Sub/GEP uses. x86-64 opts in; all other targets default off.
     fn supports_global_addr_remat(&self) -> bool {

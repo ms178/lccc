@@ -775,6 +775,18 @@ impl X86Codegen {
                     Instruction::CallIndirect { .. } => {
                         has_calls = true;
                     }
+                    Instruction::GlobalAddr { name, .. }
+                        if self.state.tls_symbols.contains(name) =>
+                    {
+                        let model = self.state.tls_model_for_symbol(name);
+                        if matches!(
+                            model,
+                            crate::ir::reexports::TlsModel::LocalDynamic
+                                | crate::ir::reexports::TlsModel::GlobalDynamic
+                        ) {
+                            has_calls = true;
+                        }
+                    }
                     Instruction::BinOp { ty, .. } => {
                         if matches!(ty, IrType::I128 | IrType::U128) {
                             has_i128_ops = true;

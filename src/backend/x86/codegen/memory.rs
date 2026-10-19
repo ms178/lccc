@@ -4417,21 +4417,23 @@ impl X86Codegen {
     //     sequences there for exactly this reason). A PIE executable is
     //     fine, which is why the gate is the dedicated `shared_lib` flag and
     //     not `pic_mode`: lccc codegen defaults to PIC and links PIE.
-    //   * only for a symbol this module owns (a `static`/hidden `__thread`):
-    //     GCC keeps Initial-Exec for an external TLS symbol even non-PIC, and
-    //     a preemptible symbol's block offset is not a link-time constant;
+    //   * only for a symbol this module owns (a `static`/hidden `__thread`)
+    //     under an effective Local-Exec policy. Full PIC defaults local symbols
+    //     to Local-Dynamic, and preemptible symbols never have a link-time-
+    //     constant block offset;
     //   * only at optimized levels — `-O0` keeps non-SSA value identities
     //     after phi elimination, so `get_defining_instruction` may name a
     //     definition that does not reach this access (the same restriction
     //     the accumulator-address fast path carries).
 
-    /// Resolve `ptr` (+ `extra`) to `(symbol, total_offset)` for a legal
-    /// Local-Exec direct access, walking constant-offset GEP hops.
-    pub(super) fn tls_local_exec_access(&self, ptr: u32, extra: i64) -> Option<(String, i64)> {
-        // Shared objects only: `R_X86_64_TPOFF32` cannot be resolved by the
-        // linker for `ET_DYN`. A PIE executable is fine (and is lccc's
-        // default), so the gate is `-shared`, not `pic_mode`.
-        if self.state.shared_lib || self.state.tls_initial_exec || self.state.disable_regalloc {
+    /// Resolve `ptr` (+ `extra`) to a TLS symbol, effective model and addend,
+    /// walking the bounded constant-offset GEP/Copy chain.
+    fn tls_symbol_access(
+        &self,
+        ptr: u32,
+        extra: i64,
+    ) -> Option<(String, i64, crate::ir::reexports::TlsModel)> {
+        if self.state.disable_regalloc {
             return None;
         }
         let mut cur = ptr;
@@ -4444,12 +4446,10 @@ impl X86Codegen {
                 let inst = self.get_defining_instruction(cur)?;
                 match inst {
                     crate::ir::reexports::Instruction::GlobalAddr { name, .. } => {
-                        if !self.state.tls_symbols.contains(name)
-                            || !self.state.local_symbols.contains(name)
-                        {
+                        if !self.state.tls_symbols.contains(name) {
                             return None;
                         }
-                        return Some((name.clone(), total));
+                        return Some((name.clone(), total, self.state.tls_model_for_symbol(name)));
                     }
                     crate::ir::reexports::Instruction::GetElementPtr { base, offset, .. } => {
                         match offset {
@@ -4472,9 +4472,25 @@ impl X86Codegen {
                 }
             };
             cur = step.0;
-            total += step.1;
+            total = total.checked_add(step.1)?;
         }
         None
+    }
+
+    /// Resolve a legal Local-Exec direct access. Shared objects cannot carry
+    /// TPOFF32, and only definitions owned by this output have a fixed offset.
+    pub(super) fn tls_local_exec_access(&self, ptr: u32, extra: i64) -> Option<(String, i64)> {
+        if self.state.shared_lib {
+            return None;
+        }
+        let (name, offset, model) = self.tls_symbol_access(ptr, extra)?;
+        if model != crate::ir::reexports::TlsModel::LocalExec
+            || !(self.state.local_symbols.contains(&name)
+                || self.state.tls_definitions.contains(&name))
+        {
+            return None;
+        }
+        Some((name, offset))
     }
 
     /// The GAS/objdump spelling of the operand: `%fs:sym@TPOFF` or
@@ -4505,23 +4521,7 @@ impl X86Codegen {
         )
     }
 
-    /// Emit a load straight out of a Local-Exec TLS slot. Returns false when
-    /// the access is not a legal direct form, leaving the caller unchanged.
-    pub(super) fn try_emit_tls_direct_load_impl(
-        &mut self,
-        dest: &Value,
-        ptr: &Value,
-        offset: i64,
-        ty: IrType,
-    ) -> bool {
-        if !Self::tls_direct_type_ok(ty) {
-            return false;
-        }
-        let (sym, off) = match self.tls_local_exec_access(ptr.0, offset) {
-            Some(v) => v,
-            None => return false,
-        };
-        let operand = Self::tls_local_exec_operand(&sym, off);
+    fn emit_tls_load_operand(&mut self, dest: &Value, ty: IrType, operand: &str) {
         // 64-bit loads straight into a GPR home skip the rax round-trip.
         if matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr) {
             if let Some(&reg) = self.reg_assignments.get(&dest.0) {
@@ -4536,7 +4536,7 @@ impl X86Codegen {
                     // load never wrote.
                     self.note_inplace_compute(reg, dest.0);
                     self.state.reg_cache.invalidate_acc();
-                    return true;
+                    return;
                 }
             }
         }
@@ -4545,6 +4545,58 @@ impl X86Codegen {
         self.state
             .emit_fmt(format_args!("    {} {}, {}", load_instr, operand, dest_reg));
         self.store_rax_to(dest);
+    }
+
+    /// Fold a load through either a Local-Exec address or an Initial-Exec GOT
+    /// offset. IE still needs one GOT load, but avoids materialising and adding
+    /// the thread pointer: `mov GOTTPOFF,%rax; mov %fs:(%rax),dest`.
+    pub(super) fn try_emit_tls_direct_load_impl(
+        &mut self,
+        dest: &Value,
+        ptr: &Value,
+        offset: i64,
+        ty: IrType,
+    ) -> bool {
+        if !Self::tls_direct_type_ok(ty) {
+            return false;
+        }
+        if let Some((sym, off, model)) = self.tls_symbol_access(ptr.0, offset) {
+            match model {
+                crate::ir::reexports::TlsModel::InitialExec => {
+                    self.state
+                        .emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %rax", sym));
+                }
+                crate::ir::reexports::TlsModel::LocalDynamic
+                | crate::ir::reexports::TlsModel::GlobalDynamic => {
+                    self.emit_tls_dynamic_offset(&sym);
+                }
+                crate::ir::reexports::TlsModel::LocalExec => {}
+            }
+            if model != crate::ir::reexports::TlsModel::LocalExec {
+                let operand = if off == 0 {
+                    "%fs:(%rax)".to_string()
+                } else {
+                    format!("%fs:{off}(%rax)")
+                };
+                if matches!(
+                    model,
+                    crate::ir::reexports::TlsModel::LocalDynamic
+                        | crate::ir::reexports::TlsModel::GlobalDynamic
+                ) {
+                    // End the opaque descriptor-call region before the memory
+                    // operation. This still blocks address folding across the
+                    // call while allowing ordinary load/copy propagation.
+                    self.state.emit("    # LCCC_VOLATILE_END");
+                }
+                self.emit_tls_load_operand(dest, ty, &operand);
+                return true;
+            }
+        }
+        let Some((sym, off)) = self.tls_local_exec_access(ptr.0, offset) else {
+            return false;
+        };
+        let operand = Self::tls_local_exec_operand(&sym, off);
+        self.emit_tls_load_operand(dest, ty, &operand);
         true
     }
 

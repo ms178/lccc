@@ -33,7 +33,22 @@ impl I686Codegen {
     fn function_needs_got(&self, func: &IrFunction) -> bool {
         use crate::ir::reexports::{Instruction, Terminator};
         if !self.state.pic_mode {
-            return false;
+            // Explicit GNU2 dynamic TLS still addresses its descriptor through
+            // the GOT. Unlike ordinary non-PIC globals, it therefore needs a
+            // valid %ebx base even in an ET_EXEC compilation.
+            return func.blocks.iter().any(|block| {
+                block.instructions.iter().any(|inst| {
+                    let Instruction::GlobalAddr { name, .. } = inst else {
+                        return false;
+                    };
+                    self.state.tls_symbols.contains(name)
+                        && matches!(
+                            self.state.tls_model_for_symbol(name),
+                            crate::ir::reexports::TlsModel::LocalDynamic
+                                | crate::ir::reexports::TlsModel::GlobalDynamic
+                        )
+                })
+            });
         }
         for block in &func.blocks {
             // A Switch may be lowered to a GOTOFF-relative jump table. The

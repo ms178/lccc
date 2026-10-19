@@ -154,9 +154,23 @@ pub(crate) fn apply(module: &mut IrModule, cli: &BuiltinFlags) {
             policy.withdraw_libcall(l);
         }
     }
+    let asm_labels = &module.asm_labels;
     let mut blocked: FxHashMap<String, bool> = FxHashMap::default();
     for func in &mut module.functions {
-        func.pass_policy.builtins = policy;
+        let mut function_policy = policy;
+        // A GNU extern-inline body is not an out-of-line TU definition, so it
+        // must not globally hide the real libc symbol.  But if that body is
+        // cloned, optimizing its own implementation into a call to the same
+        // effective symbol changes the inline definition's semantics.  Carry
+        // the local withdrawal with the body; the inliner conservatively
+        // merges it into callers that receive the clone.
+        if func.is_gnu_inline_def {
+            function_policy.withdraw_name(&func.name);
+            if let Some(label) = asm_labels.get(&func.name) {
+                function_policy.withdraw_name(label);
+            }
+        }
+        func.pass_policy.builtins = function_policy;
         for inst in func
             .blocks
             .iter_mut()
@@ -378,6 +392,23 @@ mod tests {
         apply(&mut m, &BuiltinFlags::default());
         assert_eq!(assumed(&m, "main"), pairs(&[("memcpy", true)]));
         assert!(may_synthesize(&m, "main", Libcall::Memcpy));
+    }
+
+    #[test]
+    fn gnu_inline_libcall_body_keeps_a_local_withdrawal() {
+        let mut inline = func("memset", true, &[]);
+        inline.is_gnu_inline_def = true;
+        let mut m = module(vec![inline, func("main", true, &[])]);
+        apply(&mut m, &BuiltinFlags::default());
+
+        assert!(
+            may_synthesize(&m, "main", Libcall::Memset),
+            "no out-of-line TU definition hides libc from ordinary callers"
+        );
+        assert!(
+            !may_synthesize(&m, "memset", Libcall::Memset),
+            "the inline implementation must not rewrite itself into libc"
+        );
     }
 
     /// From #844: an alias defines both names.

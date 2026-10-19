@@ -1586,7 +1586,7 @@ impl X86Codegen {
     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
         self.state.disable_regalloc = opts.disable_regalloc;
         self.state.shared_lib = opts.shared_lib;
-        self.state.tls_initial_exec = opts.tls_initial_exec;
+        self.state.tls_model = opts.tls_model;
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
         self.set_function_return_thunk(opts.function_return_thunk);
@@ -8936,6 +8936,10 @@ impl ArchCodegen for X86Codegen {
         self.store_rax_to(dest)
     }
     fn supports_global_addr_fold(&self) -> bool {
+        true
+    }
+
+    fn supports_tls_dynamic_load_fold(&self) -> bool {
         true
     }
 

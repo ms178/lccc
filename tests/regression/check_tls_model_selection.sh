@@ -16,8 +16,8 @@
 #   2. THE SHARED-OBJECT MODEL. `-fPIC -shared` must LINK. Local-Exec is
 #      illegal there: the linker rejects `R_X86_64_TPOFF32` for `ET_DYN`,
 #      and lccc used to fail every `static __thread` shared build with
-#      "recompile with -fPIC". The dlopen round-trip proves the Initial-Exec
-#      fallback is not merely linkable but functionally correct.
+#      "recompile with -fPIC". The dlopen round-trip proves the dynamic descriptor
+#      path is not merely linkable but functionally correct.
 #
 #   3. THE MECHANISM FIRES, AND ONLY WHERE IT MAY. `-O2` must contain the
 #      one-instruction `%fs:sym@TPOFF` form (a fold that silently stops
@@ -63,8 +63,10 @@ note "contract 1: output parity over 5 levels x 4 code models"
 # ---------------------------------------------------------------- contract 2
 cat > "$work/tlsmin.c" <<'EOF'
 static __thread unsigned long slot;
+static __thread volatile unsigned long volatile_slot;
 void setv(unsigned long v) { slot = v; }
 unsigned long getv(void) { return slot; }
+unsigned long sumv(void) { return volatile_slot + volatile_slot; }
 EOF
 cat > "$work/dlmain.c" <<'EOF'
 #include <stdio.h>
@@ -104,13 +106,66 @@ if grep -q '%fs:.*@TPOFF' "$work/o2.s"; then
 else
     bad "-O2 emitted no `%fs:sym@TPOFF` access: the fold stopped firing"
 fi
+cat >"$work/public-definition.c" <<'C'
+__thread unsigned public_tls;
+unsigned get_public(void) { return public_tls; }
+C
+for mode in '' '-fPIE'; do
+    "$CCC" -O2 $mode -S "$work/public-definition.c" -o "$work/public${mode:-default}.s"
+    if ! grep -q '%fs:public_tls@TPOFF' "$work/public${mode:-default}.s"; then
+        bad "executable $mode externally-visible TLS definition missed Local-Exec folding"
+    fi
+done
+note "contract 3: executable TLS definitions use direct Local-Exec"
+cat >"$work/external-ie.c" <<'C'
+extern __thread unsigned long external_tls;
+unsigned long get_external(void) { return external_tls; }
+C
+"$CCC" -O2 -fno-pic -S "$work/external-ie.c" -o "$work/external-ie.s"
+sed -n '/^get_external:/,/^\.size get_external/p' "$work/external-ie.s" \
+    >"$work/external-ie-fn.s"
+grep -q 'external_tls@GOTTPOFF' "$work/external-ie-fn.s"
+grep -q 'movq %fs:(%rax), %rax' "$work/external-ie-fn.s"
+if grep -q 'addq %fs:0' "$work/external-ie-fn.s"; then
+    bad "Initial-Exec load materialized the thread pointer instead of folding it"
+else
+    note "contract 3: Initial-Exec load matches the two-instruction oracle"
+fi
 if [ -f "$work/tlsmin.so" ]; then
     "$CCC" -O2 -fPIC -shared -S "$work/tlsmin.c" -o "$work/shared.s" 2>/dev/null || true
     if [ -f "$work/shared.s" ] && grep -q '%fs:.*@TPOFF' "$work/shared.s"; then
         bad "-shared must not use the Local-Exec direct form"
     else
-        note "contract 3: -shared keeps the GOT-based model"
+        note "contract 3: -shared keeps a dynamic TLS model"
     fi
+    if [ -f "$work/shared.s" ]; then
+        sed -n '/^getv:/,/^\.size getv/p' "$work/shared.s" >"$work/shared-getv.s"
+        if grep -q '@TLSDESC' "$work/shared-getv.s" && \
+            grep -q 'movq %fs:(%rax), %rax' "$work/shared-getv.s" && \
+            ! grep -q 'addq %fs:0' "$work/shared-getv.s" && \
+            ! grep -q 'movq (%rax)' "$work/shared-getv.s"; then
+            note "contract 3: dynamic TLS load consumes the descriptor offset directly"
+        else
+            bad "dynamic TLS load missed the canonical segmented form"
+        fi
+        sed -n '/^sumv:/,/^\.size sumv/p' "$work/shared.s" >"$work/shared-sumv.s"
+        calls=$(grep -c '@TLSCALL' "$work/shared-sumv.s" || true)
+        loads=$(grep -c 'movq %fs:(%rax)' "$work/shared-sumv.s" || true)
+        if [ "$calls" -eq 2 ] && [ "$loads" -eq 2 ]; then
+            note "contract 3: nested descriptor guards preserve both volatile loads"
+        else
+            bad "dynamic volatile loads were coalesced (calls=$calls loads=$loads)"
+        fi
+    fi
+fi
+# `-shared` itself determines legality even if the caller omitted -fPIC. This
+# mutation-sensitive arm catches a direct-fold check that looks only at PIC.
+"$CCC" -O2 -shared -S "$work/tlsmin.c" -o "$work/shared-no-pic.s"
+if grep -q '%fs:.*@TPOFF' "$work/shared-no-pic.s" || \
+    ! grep -q '@TLSDESC' "$work/shared-no-pic.s"; then
+    bad "-shared without -fPIC selected or folded to Local-Exec"
+else
+    note "contract 3: -shared alone selects dynamic TLS"
 fi
 
 [ "$fail" -eq 0 ] || { echo "check_tls_model_selection: FAILED" >&2; exit 1; }

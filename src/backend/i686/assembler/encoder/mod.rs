@@ -195,6 +195,8 @@ pub const R_386_TLS_GD: u32 = 18;
 pub const R_386_TLS_LDM: u32 = 19;
 pub const R_386_TLS_LDO_32: u32 = 32;
 pub const R_386_TLS_GOTIE: u32 = 16;
+pub const R_386_TLS_GOTDESC: u32 = 39;
+pub const R_386_TLS_DESC_CALL: u32 = 40;
 // There is no R_386_32S in the i386 ABI -- that is an x86-64 type. This constant
 // held 38, which <elf.h> defines as R_386_SIZE32 (a symbol-size relocation), and
 // the `@TPOFF` modifier was emitted as it: an i386 object asking for a TLS offset

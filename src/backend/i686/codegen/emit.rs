@@ -550,6 +550,8 @@ impl I686Codegen {
         self.state.disable_regalloc = opts.disable_regalloc;
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
+        self.state.shared_lib = opts.shared_lib;
+        self.state.tls_model = opts.tls_model;
         self.set_no_jump_tables(opts.no_jump_tables);
         self.state.mcount = opts.mcount;
         self.base_regparm = opts.regparm;

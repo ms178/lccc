@@ -37,7 +37,6 @@ pub(super) fn compact_frame(store: &mut LineStore, infos: &mut [LineInfo]) {
     if len == 0 {
         return;
     }
-
     let mut i = 0;
     while i < len {
         // Look for prologue: pushq %rbp
@@ -49,7 +48,6 @@ pub(super) fn compact_frame(store: &mut LineStore, infos: &mut [LineInfo]) {
             i += 1;
             continue;
         }
-
         // Next non-nop/directive should be "movq %rsp, %rbp"
         let mut j = next_non_nop_or_directive(store, infos, i + 1, len);
         if j >= len {
@@ -62,7 +60,6 @@ pub(super) fn compact_frame(store: &mut LineStore, infos: &mut [LineInfo]) {
             continue;
         }
         j += 1;
-
         // Next non-nop/directive should be "subq $N, %rsp"
         j = next_non_nop_or_directive(store, infos, j, len);
         if j >= len {
@@ -89,7 +86,6 @@ pub(super) fn compact_frame(store: &mut LineStore, infos: &mut [LineInfo]) {
             continue;
         };
         j += 1;
-
         // Collect callee-saved register saves immediately after subq.
         struct CalleeSave {
             reg: RegId,
@@ -414,7 +410,6 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-
         // Audit the whole function body: collect the epilogue `addq`s,
         // require every ret to be paired with one, reject any other
         // reference to the stack pointer or opaque/stack-shaping line.
@@ -472,6 +467,11 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
                 } else {
                     rsp_named = true;
                 }
+                j += 1;
+                continue;
+            }
+            if body.starts_with("lccc_tls_call ") {
+                has_call = true;
                 j += 1;
                 continue;
             }

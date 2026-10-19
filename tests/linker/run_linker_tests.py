@@ -160,6 +160,8 @@ def case(*a, **kw):
     CASES.append(Case(*a, **kw))
 
 def sh(cmd, cwd=None, timeout=60, env=None):
+    if not cmd:
+        raise ValueError("sh() requires a non-empty command")
     e = dict(os.environ)
     if env:
         e.update(env)
@@ -167,11 +169,16 @@ def sh(cmd, cwd=None, timeout=60, env=None):
         return subprocess.run(cmd, cwd=cwd, timeout=timeout, env=e,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except FileNotFoundError as exc:
-        # Fail LOUDLY and by name. Many setup steps ignore their return code,
-        # and negative cases expect a link to fail, so a silent 127 here would
-        # let a missing toolchain pass as "expected failure".
-        raise RuntimeError(f"required tool not found: {cmd[0]!r} ({exc}); "
-                           "install it or skip this suite explicitly") from exc
+        # Fail LOUDLY and name what the OS actually could not open. A missing
+        # cwd and a missing executable use the same exception; blaming cmd[0]
+        # for both sends the operator in exactly the wrong direction.
+        missing = exc.filename or os.fspath(cmd[0])
+        if cwd is not None and os.path.abspath(missing) == os.path.abspath(cwd):
+            what = "working directory"
+        else:
+            what = "required tool"
+        raise RuntimeError(f"{what} not found: {missing!r} ({exc}); "
+                           "install/create it or skip this suite explicitly") from exc
 
 # ============================================================================
 # 1. SYMBOL RESOLUTION

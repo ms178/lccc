@@ -483,8 +483,21 @@ gate "vector-abi-boundary" fast \
 # bit-fields, packed, nested, x87, _Float128, vectors) through scalar-only and
 # aggregate-argument signatures, initializers, assignments, conditionals,
 # register exhaustion and va_arg.
-gate "sysv-aggregate-abi" fast \
-    python3 tests/regression/check_sysv_aggregate_abi.py --lccc "$LCCC" --cc "${GCC:-gcc-16}"
+sysv_aggregate_abi_gate() (
+    local emitted
+    emitted=$(mktemp -d)
+    trap 'rm -rf "$emitted"' EXIT
+    python3 tests/regression/check_sysv_aggregate_abi.py --emit-only --keep "$emitted" || return
+    for source in abi.h prov.c call.c; do
+        [[ -s $emitted/$source ]] || {
+            echo "FAIL: --emit-only did not create $source" >&2
+            return 1
+        }
+    done
+    python3 tests/regression/check_sysv_aggregate_abi.py \
+        --lccc "$LCCC" --cc "${GCC:-gcc-16}"
+)
+gate "sysv-aggregate-abi" fast sysv_aggregate_abi_gate
 
 # Every operand form of a vector argument (lvalues, call results, conditionals,
 # comma, statement expressions, compound literals, ...) through direct,
@@ -1993,6 +2006,8 @@ if [ -x target/fastbuild/lccc-ld ]; then
     # check_nocfi_peephole_parity.sh), not to this one.
     gate "kernel-relocs-tool" fast \
         bash tests/linker/setup_kernel_tools.sh --prefix "$HOME/.cache/lccc-kernel-tools"
+    gate "linker-harness-selftest" fast \
+        python3 tests/linker/test_run_linker_helpers.py
     gate "linker-suite" fast env \
         LCCC_TEST_ASSEMBLER="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
         PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
@@ -2247,6 +2262,8 @@ gate "glibc-triage-selftest" fast \
     python3 scripts/test_glibc_check_triage.py
 gate "glibc-triage-cli-selftest" fast \
     python3 scripts/glibc_check_triage.py --self-test
+gate "glibc-build-guards-selftest" fast \
+    bash tests/workloads/glibc-2.44/test_build_guards.sh
 
 # MS-01: Compiler Explorer oracle delta gate logic (metrics, tolerance,
 # baseline handling). Networked surveys are opt-in research, not merge gates.

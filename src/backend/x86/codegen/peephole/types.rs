@@ -2637,6 +2637,22 @@ mod implicit_oracle_tests {
     }
 
     #[test]
+    fn movq_extension_producer_class_excludes_wrong_operand_shapes() {
+        assert_eq!(
+            classify_line("    movq %xmm2, %rax").ext_kind,
+            ExtKind::ProducerMovqRegToRax,
+            "the fusion itself must reject non-GPR register families"
+        );
+        for line in ["    movq %rax, %xmm2", "    movq 8(%rsp), %rax"] {
+            assert_ne!(
+                classify_line(line).ext_kind,
+                ExtKind::ProducerMovqRegToRax,
+                "{line} must not enter the register-to-RAX fusion"
+            );
+        }
+    }
+
+    #[test]
     fn the_widening_branch_writes_rdx_and_only_reads_rax() {
         // The heart of the stress-lab `intexpr` seed 1 miscompile: `cqto`
         // rewrote %rdx while being invisible to every textual scan.

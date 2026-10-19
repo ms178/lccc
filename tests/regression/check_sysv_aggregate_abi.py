@@ -356,7 +356,7 @@ def oracle_error(cc):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--lccc", required=True)
+    ap.add_argument("--lccc", help="LCCC executable (required unless --emit-only)")
     ap.add_argument("--cc", default="gcc-16", help="oracle compiler (GCC is the authority for vector_size)")
     ap.add_argument("--seed", type=int, default=20261017)
     ap.add_argument("--count", type=int, default=160, help="random shapes in addition to the curated set")
@@ -369,6 +369,8 @@ def main():
 
     if args.emit_only and not args.keep:
         ap.error("--emit-only requires --keep")
+    if not args.emit_only and not args.lccc:
+        ap.error("--lccc is required unless --emit-only is used")
     if not args.emit_only:
         err = oracle_error(args.cc)
         if err:

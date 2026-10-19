@@ -341,11 +341,9 @@ pub struct CodegenState {
     /// form: legal in executables (PIE included), rejected by the linker for
     /// `ET_DYN` shared objects.
     pub shared_lib: bool,
-    /// The command line selected Initial-Exec TLS for the whole compilation
-    /// unit. Unlike `shared_lib`, this survives separate compile and link
-    /// invocations. This is intentionally not per-symbol: declaration-level
-    /// TLS-model attributes and the Dynamic models are not implemented yet.
-    pub tls_initial_exec: bool,
+    /// Explicit compilation-wide ELF TLS policy. `None` selects LE/IE for an
+    /// executable and LD/GD for full PIC according to symbol preemptibility.
+    pub tls_model: Option<crate::ir::reexports::TlsModel>,
     /// Set of symbol names that are locally defined (not extern) and have internal
     /// linkage (static) — these can use direct addressing even in PIC mode.
     pub local_symbols: FxHashSet<String>,
@@ -367,6 +365,13 @@ pub struct CodegenState {
     /// Set of symbol names that are thread-local (_Thread_local / __thread).
     /// These require TLS-specific access patterns (e.g., %fs:x@TPOFF on x86-64).
     pub tls_symbols: FxHashSet<String>,
+    /// TLS objects defined by this translation unit. In an executable these
+    /// are non-preemptible and qualify for Local-Exec even when their source
+    /// linkage is external; a shared object still consults `local_symbols`.
+    pub tls_definitions: FxHashSet<String>,
+    /// Per-symbol source `tls_model` attributes. These take precedence over
+    /// the compilation-wide driver policy.
+    pub tls_models: FxHashMap<String, crate::ir::reexports::TlsModel>,
     /// Whether the current function contains DynAlloca instructions.
     /// When true, the epilogue must restore SP from the frame pointer instead of
     /// adding back the compile-time frame size.
@@ -668,6 +673,35 @@ pub struct CodegenState {
 }
 
 impl CodegenState {
+    /// Resolve the effective ELF TLS model for one symbol.
+    ///
+    /// Declaration attributes outrank the command-line policy. Without either,
+    /// executable code takes the zero-resolver LE/IE paths while full PIC uses
+    /// LD/GD according to whether the symbol is non-preemptible. Keeping this
+    /// policy here prevents prologue analysis and individual backends from
+    /// disagreeing about whether an access contains a descriptor call.
+    pub(crate) fn tls_model_for_symbol(&self, name: &str) -> crate::ir::reexports::TlsModel {
+        use crate::ir::reexports::TlsModel;
+
+        self.tls_models
+            .get(name)
+            .copied()
+            .or(self.tls_model)
+            .unwrap_or_else(|| {
+                if (self.pic_mode && !self.pie_mode) || self.shared_lib {
+                    if self.local_symbols.contains(name) {
+                        TlsModel::LocalDynamic
+                    } else {
+                        TlsModel::GlobalDynamic
+                    }
+                } else if self.local_symbols.contains(name) || self.tls_definitions.contains(name) {
+                    TlsModel::LocalExec
+                } else {
+                    TlsModel::InitialExec
+                }
+            })
+    }
+
     /// Record what the callee of the call just emitted pops on return; see
     /// `callee_pops_direct`. `direct` is the callee symbol, `None` for an
     /// indirect call. Every call is recorded, pop or not: a direct callee's
@@ -741,13 +775,15 @@ impl CodegenState {
             trampoline_data_blocks: Vec::new(),
             pic_mode: false,
             shared_lib: false,
-            tls_initial_exec: false,
+            tls_model: None,
             pie_mode: false,
             local_symbols: FxHashSet::default(),
             extern_function_symbols: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
             absolute_symbols: FxHashSet::default(),
             tls_symbols: FxHashSet::default(),
+            tls_definitions: FxHashSet::default(),
+            tls_models: FxHashMap::default(),
             has_dyn_alloca: false,
             omit_frame_pointer: false,
             fpo_requested: true, // -fomit-frame-pointer is the default at -O1+

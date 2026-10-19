@@ -2367,6 +2367,9 @@ fn analyze_va_arg_pack(func: &IrFunction) -> Option<VaArgPackPlan> {
 #[derive(Clone)]
 struct CalleeData {
     blocks: Vec<BasicBlock>,
+    /// Builtin assumptions under which this body was formed. Cloning must
+    /// conservatively merge these into the caller before later synthesis.
+    builtin_policy: crate::common::pass_policy::BuiltinPolicy,
     /// For each param, Some(size) if it's a struct-by-value parameter, None otherwise.
     param_struct_sizes: Vec<Option<usize>>,
     return_type: IrType,
@@ -2947,17 +2950,6 @@ fn extern_inline_admission(func: &IrFunction, ctx: &CalleeContext) -> bool {
     if ctx.semantic_interposition || func.is_static {
         return false;
     }
-    // A global definition of a name lccc may itself synthesize as a library
-    // call (memset/memcpy/memmove/puts and the printf family, see
-    // `common::pass_policy::Libcall`) stays a call. That definition is the
-    // program's library function: copying its body into callers freezes the
-    // semantics that the program's libc contract and the linker still own.
-    // This is the shape `tests/regression/check_libcall_synthesis_no_selfcall.sh`
-    // pins ("the global definition stays a call"); upstream 21772cf8 admitted
-    // external definitions without this carve-out and broke that contract.
-    if crate::common::pass_policy::Libcall::from_name(&func.name).is_some() {
-        return false;
-    }
     // Leaf helpers only: a callee that itself calls out (libm `fma@PLT`, the
     // guarded `__lccc_cpu_init` probe initialiser, Fortify wrappers) must
     // keep its call sites unique — GCC declines these too, and duplicating
@@ -3414,6 +3406,7 @@ fn callee_data_for(
 
         Some(CalleeData {
             blocks: func.blocks.clone(),
+            builtin_policy: func.pass_policy.builtins,
             param_struct_sizes,
             return_type: func.return_type,
             num_params: func.params.len(),
@@ -4859,6 +4852,15 @@ fn inline_call_site(
     // (exit CondBranch retargeted onto the loop header).
     caller.next_label = std::cmp::max(caller.next_label, merge_block_id.0 + 1);
 
+    // The cloned body keeps the stricter builtin contract of either source
+    // context. This matters for GNU extern-inline implementations of libc
+    // names: they have no out-of-line TU body, yet their copied loop must not
+    // be re-synthesized into a call to the different external libc function.
+    caller.pass_policy.builtins = caller
+        .pass_policy
+        .builtins
+        .conservative_merge(callee.builtin_policy);
+
     true
 }
 
@@ -5638,6 +5640,7 @@ mod inline_limit_tests {
 
     fn wrapper_policy_data(block_count: usize) -> CalleeData {
         CalleeData {
+            builtin_policy: Default::default(),
             blocks: (0..block_count)
                 .map(|index| BasicBlock {
                     label: BlockId(index as u32),
@@ -5930,6 +5933,7 @@ mod value_reference_tests {
             is_const: false,
             is_used: false,
             is_thread_local: false,
+            tls_model: None,
         }];
         let (referenced, asm) = collect_value_referenced_functions(&module);
         assert!(function_referenced_as_value("callee", &referenced, &asm));
@@ -7093,47 +7097,18 @@ mod extern_admission_tests {
     use crate::common::types::IrType;
     use crate::ir::reexports::{BasicBlock, IrConst, Operand, Terminator};
 
-    /// A leaf, loop-free, scalar-returning, global (non-static) definition named
-    /// `name`: the shape `extern_inline_admission` admits, so the only thing that
-    /// can refuse it is the name.
+    /// A leaf, loop-free, scalar-returning, global (non-static) definition.
     fn leaf_definition(name: &str) -> IrFunction {
-        IrFunction {
-            pass_policy: Default::default(),
-            name: name.into(),
-            return_type: IrType::I32,
-            params: vec![],
-            blocks: vec![BasicBlock {
-                label: BlockId(1),
-                instructions: vec![],
-                terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
-                source_spans: Vec::new(),
-            }],
-            is_variadic: false,
-            is_declaration: false,
-            is_static: false,
-            is_inline: false,
-            is_always_inline: false,
-            is_noinline: false,
-            next_value_id: 2,
-            fp_expr_tags: Default::default(),
-            next_label: 2,
-            section: None,
-            visibility: None,
-            is_weak: false,
-            is_used: false,
-            has_inlined_calls: false,
-            param_alloca_values: vec![],
-            uses_sret: false,
-            is_fastcall: false,
-            regparm: None,
-            is_naked: false,
-            no_instrument: false,
-            global_init_label_blocks: vec![],
-            ret_eightbyte_classes: vec![],
-            ret_is_f128_sse: false,
-            is_gnu_inline_def: false,
-            loop_promoted_f64_values: Vec::new(),
-        }
+        let mut func = IrFunction::new(name.into(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 2;
+        func.next_label = 2;
+        func
     }
 
     fn quiet_context() -> CalleeContext {
@@ -7148,37 +7123,16 @@ mod extern_admission_tests {
         }
     }
 
-    /// Positive control: the leaf shape IS admitted under a non-library name, so
-    /// the refusals below are caused by the name and nothing else.
+    /// A known external leaf is admitted irrespective of its spelling.  Libcall
+    /// synthesis safety is a per-TU `BuiltinPolicy` fact applied before this
+    /// phase and copied with the body; the inliner must not add a name-based
+    /// performance cliff after that policy has already proved the body safe.
     #[test]
-    fn non_library_global_leaf_is_admitted() {
-        assert!(extern_inline_admission(
-            &leaf_definition("helper"),
-            &quiet_context()
-        ));
-    }
-
-    /// A global definition of a library name stays a call (see the comment in
-    /// `extern_inline_admission`). Covers the three names the libcall gate pins.
-    #[test]
-    fn global_definition_of_a_library_name_is_refused() {
-        for name in ["memset", "memcpy", "puts"] {
+    fn global_leaf_admission_is_not_name_based() {
+        for name in std::iter::once("helper").chain(Libcall::ALL.iter().map(|l| l.name())) {
             assert!(
-                !extern_inline_admission(&leaf_definition(name), &quiet_context()),
-                "global `{name}` must keep its call"
-            );
-        }
-    }
-
-    /// Exhaustive over every name lccc can synthesize, so a new `Libcall` variant
-    /// cannot silently become inlinable.
-    #[test]
-    fn every_synthesizable_library_name_is_refused() {
-        for lib in Libcall::ALL {
-            assert!(
-                !extern_inline_admission(&leaf_definition(lib.name()), &quiet_context()),
-                "global `{}` must keep its call",
-                lib.name()
+                extern_inline_admission(&leaf_definition(name), &quiet_context()),
+                "global leaf `{name}` should be admitted"
             );
         }
     }

@@ -729,6 +729,8 @@ pub struct DeclAttributes {
     pub visibility: Option<String>,
     /// __attribute__((section("..."))) - place in specific ELF section
     pub section: Option<String>,
+    /// __attribute__((tls_model("..."))) - per-symbol ELF TLS policy.
+    pub tls_model: Option<String>,
     /// register var __asm__("regname") - pin to specific register for inline asm
     pub asm_register: Option<String>,
     /// __attribute__((cleanup(func))) - call func(&var) when var goes out of scope.
@@ -911,6 +913,7 @@ impl std::fmt::Debug for DeclAttributes {
             .field("regparm", &self.regparm)
             .field("visibility", &self.visibility)
             .field("section", &self.section)
+            .field("tls_model", &self.tls_model)
             .field("asm_register", &self.asm_register)
             .field("cleanup_fn", &self.cleanup_fn)
             .finish()

@@ -227,6 +227,7 @@ impl Parser {
             .take()
             .or_else(|| self.pragma_default_visibility.clone());
         let section = self.attrs.parsing_section.take();
+        let tls_model = self.attrs.parsing_tls_model.take();
         let is_error_attr = self.attrs.parsing_error_attr();
         let is_noreturn = self.attrs.parsing_noreturn();
         let cleanup_fn = self.attrs.parsing_cleanup_fn.take();
@@ -264,6 +265,7 @@ impl Parser {
         decl_attrs.alias_target = alias_target;
         decl_attrs.visibility = visibility;
         decl_attrs.section = section;
+        decl_attrs.tls_model = tls_model;
         decl_attrs.asm_register = first_asm_reg;
         decl_attrs.cleanup_fn = cleanup_fn;
         decl_attrs.symver = symver;
@@ -1010,6 +1012,7 @@ impl Parser {
             let (skip_mode, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
             let local_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
             let local_section = self.attrs.parsing_section.take();
+            let local_tls_model = self.attrs.parsing_tls_model.take();
             mode_kind = mode_kind.or(decl_mode).or(skip_mode);
             // Merge alignment from declarator and post-declarator attributes
             for a in [decl_aligned, skip_aligned].iter().copied().flatten() {
@@ -1031,6 +1034,7 @@ impl Parser {
                     (da.object_restrict, da.object_atomic) = l_object_quals;
                     da.base_volatile = l_base_volatile;
                     da.section = local_section;
+                    da.tls_model = local_tls_model;
                     da.asm_register = skip_asm_reg;
                     da.cleanup_fn = local_cleanup_fn;
                     da.set_used(self.attrs.parsing_used());

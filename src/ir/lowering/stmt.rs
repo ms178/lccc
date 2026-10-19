@@ -731,6 +731,7 @@ impl Lowerer {
             is_const: var_is_const,
             is_used: declarator.attrs.is_used(),
             is_thread_local: decl.is_thread_local(),
+            tls_model: super::global_decl::lower_tls_model(declarator.attrs.tls_model.as_deref()),
         });
 
         let type_align = self.typedef_alignment_for_type_spec(type_spec).copied();

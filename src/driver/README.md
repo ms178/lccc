@@ -431,6 +431,21 @@ Compiles C source files through `compile_to_assembly()` and writes the
 resulting `.s` file. With the `gcc_m16` feature enabled and `-m16`, delegates
 to GCC instead (see GCC `-m16` Delegation below).
 
+### TLS model selection
+
+The x86-64 and i386 backends implement all four GNU models:
+`local-exec`, `initial-exec`, `local-dynamic`, and `global-dynamic`. Without an
+explicit option they choose LE/IE for executable code and LD/GD for full PIC
+according to symbol preemptibility. x86-64 dynamic accesses use the GNU2 TLS
+descriptor ABI, allowing linker relaxation without an ordinary call's register
+clobbers on either ABI.
+
+`__attribute__((tls_model("...")))` is supported per declaration and takes
+precedence over the compilation-wide option. Unknown and empty values are hard
+errors. AArch64 and RISC-V currently accept only Local-Exec rather than silently
+approximating a dynamic model. When the optional `gcc_m16` feature delegates an
+`-m16` compilation to GCC, GCC owns the option and receives it unchanged.
+
 ### ObjectOnly (`-c`)
 
 Compiles and assembles. Assembly source files (`.s`/`.S`) are assembled
