@@ -144,50 +144,8 @@ impl Lowerer {
                     self.emit_error("expression is not assignable", expr.span());
                     return None;
                 }
-                // A _Bool ext-vector lane has no separately addressable byte;
-                // retain its containing-byte address and dynamic bit position
-                // so reads and read-modify-write assignments can use the packed
-                // representation without manufacturing `&v[i]`.
                 if base_ct.is_bitpacked_bool_vector() {
-                    let ptr_int_ty = crate::common::types::target_int_ir_type();
-                    let index_ty = self.value_ir_type(index);
-                    let index_val = self.lower_expr(index);
-                    let index_val = self.emit_implicit_cast(index_val, index_ty, ptr_int_ty);
-                    let byte_index = self.emit_binop_val(
-                        IrBinOp::LShr,
-                        index_val,
-                        Operand::Const(IrConst::I64(3)),
-                        ptr_int_ty,
-                    );
-                    let bit_index = self.emit_binop_val(
-                        IrBinOp::And,
-                        index_val,
-                        Operand::Const(IrConst::I64(7)),
-                        ptr_int_ty,
-                    );
-                    let base_operand = self.get_array_base_addr(base);
-                    let base_addr = self.operand_to_value(base_operand);
-                    let byte_addr = self.fresh_value();
-                    self.emit(Instruction::GetElementPtr {
-                        dest: byte_addr,
-                        base: base_addr,
-                        offset: Operand::Value(byte_index),
-                        ty: IrType::U8,
-                    });
-                    let bit_index =
-                        self.emit_implicit_cast(Operand::Value(bit_index), ptr_int_ty, IrType::U8);
-                    let Operand::Value(bit_index) = bit_index else {
-                        unreachable!("integer cast must produce a value")
-                    };
-                    return Some(LValue {
-                        kind: LValueKind::PackedBoolVectorLane {
-                            byte_addr,
-                            bit_index,
-                            address_space: self.get_addr_space_of_struct_expr(expr),
-                        },
-                        volatile: vol,
-                        sso: SsoMode::None,
-                    });
+                    return Some(self.packed_bool_vector_lane_lvalue(expr, base, index, vol));
                 }
 
                 // Ordinary vector lanes and array elements are byte-addressed.
@@ -325,6 +283,58 @@ impl Lowerer {
                 None => None,
             },
             _ => None,
+        }
+    }
+
+    /// The lvalue of lane `index` of a bit-packed `_Bool` ext vector. A lane has
+    /// no separately addressable byte, so this keeps its containing byte's
+    /// address and the dynamic bit position: reads and read-modify-write
+    /// assignments then use the packed representation without manufacturing
+    /// `&v[i]`.
+    fn packed_bool_vector_lane_lvalue(
+        &mut self,
+        expr: &Expr,
+        base: &Expr,
+        index: &Expr,
+        vol: bool,
+    ) -> LValue {
+        let ptr_int_ty = crate::common::types::target_int_ir_type();
+        let index_ty = self.value_ir_type(index);
+        let index_val = self.lower_expr(index);
+        let index_val = self.emit_implicit_cast(index_val, index_ty, ptr_int_ty);
+        let byte_index = self.emit_binop_val(
+            IrBinOp::LShr,
+            index_val,
+            Operand::Const(IrConst::I64(3)),
+            ptr_int_ty,
+        );
+        let bit_index = self.emit_binop_val(
+            IrBinOp::And,
+            index_val,
+            Operand::Const(IrConst::I64(7)),
+            ptr_int_ty,
+        );
+        let base_operand = self.get_array_base_addr(base);
+        let base_addr = self.operand_to_value(base_operand);
+        let byte_addr = self.fresh_value();
+        self.emit(Instruction::GetElementPtr {
+            dest: byte_addr,
+            base: base_addr,
+            offset: Operand::Value(byte_index),
+            ty: IrType::U8,
+        });
+        let bit_index = self.emit_implicit_cast(Operand::Value(bit_index), ptr_int_ty, IrType::U8);
+        let Operand::Value(bit_index) = bit_index else {
+            unreachable!("integer cast must produce a value")
+        };
+        LValue {
+            kind: LValueKind::PackedBoolVectorLane {
+                byte_addr,
+                bit_index,
+                address_space: self.get_addr_space_of_struct_expr(expr),
+            },
+            volatile: vol,
+            sso: SsoMode::None,
         }
     }
 

@@ -2539,117 +2539,7 @@ impl SemanticAnalyzer {
                         .error(format!("'{}' undeclared", name), *span);
                 }
             }
-            Expr::FunctionCall(callee, args, _) => {
-                // Check for builtin calls
-                if let Expr::Identifier(name, callee_span) = callee.as_ref() {
-                    if builtins::is_builtin(name) {
-                        // A builtin under its own name carries no prototype, so
-                        // nothing below could check the call and lowering used
-                        // to pass whatever the user wrote straight through to
-                        // the backend's operand indexing -- `_mm_add_ps()` was
-                        // a compiler ICE (AUD-ICE-1) where GCC says "too few
-                        // arguments to function '_mm_add_ps'".  The arity comes
-                        // from the bundled headers
-                        // (scripts/check_intrinsic_arity.py keeps that table in
-                        // step with include/*.h); a builtin whose headers do not
-                        // pin the count down stays unconstrained.
-                        //
-                        // Only undeclared names: once a header is included the
-                        // name has a prototype, the ordinary argument check
-                        // below already reports the mismatch, and reporting it
-                        // twice would be noise.
-                        if self.symbol_table.lookup(name).is_none()
-                            && !self.result.functions.contains_key(name)
-                        {
-                            if let Some(expected) = intrinsic_arity::builtin_intrinsic_arity(name) {
-                                if args.len() != expected {
-                                    self.diagnostics.borrow_mut().error(
-                                        format!(
-                                            "{} arguments to function '{}' (expected {}, have {})",
-                                            if args.len() < expected {
-                                                "too few"
-                                            } else {
-                                                "too many"
-                                            },
-                                            name,
-                                            expected,
-                                            args.len()
-                                        ),
-                                        *callee_span,
-                                    );
-                                }
-                            }
-                        }
-                    } else if !self.result.functions.contains_key(name)
-                        && self.symbol_table.lookup(name).is_none()
-                    {
-                        // Implicit function declaration (C89 style) - register it
-                        self.diagnostics.borrow_mut().warning_with_kind(
-                            format!("implicit declaration of function '{}'", name),
-                            *callee_span,
-                            crate::common::error::WarningKind::ImplicitFunctionDeclaration,
-                        );
-                        let func_info = FunctionInfo {
-                            return_type: CType::Int, // implicit return int
-                            params: Vec::new(),
-                            variadic: true, // unknown params
-                            prototype: None,
-                            is_defined: false,
-                            is_noreturn: false,
-                        };
-                        self.result.functions.insert(name.clone(), func_info);
-                    }
-                }
-                // C11 6.2.1p4 settles a call's binding at the call, so that is
-                // where the answer is captured.  `is_noreturn_call` is asked in two
-                // places with different scoping context -- per statement during the
-                // walk, and for a whole body when -Wreturn-type asks whether
-                // control can fall out, by which time the declaring block's scope
-                // has been unwound -- and a mutable scope stack can only answer the
-                // first.  Measured on `extern void die(void) __attribute__((
-                // noreturn)); int g(void) { auto void die(void) { return; } die(); }`
-                // the whole-body query read the file-scope record and stayed silent
-                // where GCC warns.
-                if let Expr::Identifier(name, _) = callee.as_ref() {
-                    if let Some(key) = self.scoped_call_entity(name) {
-                        self.result.call_entities.insert(ExprId::of(expr), key);
-                    }
-                }
-                self.analyze_expr(callee);
-                for arg in args {
-                    self.analyze_expr(arg);
-                }
-                // Resolve the callable through lexical scope, not through
-                // the TU-wide body-metadata map. Local function pointers and
-                // GNU nested functions both shadow a file-scope function.
-                // K&R body declarations intentionally contribute no prototype;
-                // only a separately visible declaration can supply one.
-                let checker = super::type_checker::ExprTypeChecker {
-                    symbols: &self.symbol_table,
-                    types: &self.result.type_context,
-                    functions: &self.result.functions,
-                    expr_types: Some(&self.result.expr_types),
-                    builtin_policy: self.builtin_policy.clone(),
-                };
-                let signature = match checker.infer_expr_ctype(callee) {
-                    Some(CType::Function(ft)) => Some(*ft),
-                    Some(CType::Pointer(inner, _)) => match *inner {
-                        CType::Function(ft) => Some(*ft),
-                        _ => None,
-                    },
-                    _ => None,
-                };
-                // Empty lists retain the existing unspecified-arguments
-                // convention; distinguishing f(void) from f() is independent
-                // of preserving a nonempty prototype vs a K&R body list.
-                if let Some(ft) = signature.filter(|ft| !ft.params.is_empty()) {
-                    let name = match callee.as_ref() {
-                        Expr::Identifier(name, _) => name.as_str(),
-                        _ => "function pointer",
-                    };
-                    self.check_call_arguments(name, args, &ft.params, ft.variadic, expr.span());
-                }
-            }
+            Expr::FunctionCall(callee, args, _) => self.analyze_call(expr, callee, args),
             Expr::BinaryOp(op, lhs, rhs, span) => {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
@@ -2872,6 +2762,120 @@ impl SemanticAnalyzer {
         // The lowerer will consult the const_values map as an O(1) fast path
         // before doing its own eval_const_expr.
         self.annotate_const_value(expr);
+    }
+
+    /// A call: builtin argument rules, implicit declarations, noreturn
+    /// bookkeeping and the argument checks against the callee's prototype.
+    fn analyze_call(&mut self, expr: &Expr, callee: &Expr, args: &[Expr]) {
+        // Check for builtin calls
+        if let Expr::Identifier(name, callee_span) = callee {
+            if builtins::is_builtin(name) {
+                // A builtin under its own name carries no prototype, so
+                // nothing below could check the call and lowering used
+                // to pass whatever the user wrote straight through to
+                // the backend's operand indexing -- `_mm_add_ps()` was
+                // a compiler ICE (AUD-ICE-1) where GCC says "too few
+                // arguments to function '_mm_add_ps'".  The arity comes
+                // from the bundled headers
+                // (scripts/check_intrinsic_arity.py keeps that table in
+                // step with include/*.h); a builtin whose headers do not
+                // pin the count down stays unconstrained.
+                //
+                // Only undeclared names: once a header is included the
+                // name has a prototype, the ordinary argument check
+                // below already reports the mismatch, and reporting it
+                // twice would be noise.
+                if self.symbol_table.lookup(name).is_none()
+                    && !self.result.functions.contains_key(name)
+                {
+                    if let Some(expected) = intrinsic_arity::builtin_intrinsic_arity(name) {
+                        if args.len() != expected {
+                            self.diagnostics.borrow_mut().error(
+                                format!(
+                                    "{} arguments to function '{}' (expected {}, have {})",
+                                    if args.len() < expected {
+                                        "too few"
+                                    } else {
+                                        "too many"
+                                    },
+                                    name,
+                                    expected,
+                                    args.len()
+                                ),
+                                *callee_span,
+                            );
+                        }
+                    }
+                }
+            } else if !self.result.functions.contains_key(name)
+                && self.symbol_table.lookup(name).is_none()
+            {
+                // Implicit function declaration (C89 style) - register it
+                self.diagnostics.borrow_mut().warning_with_kind(
+                    format!("implicit declaration of function '{}'", name),
+                    *callee_span,
+                    crate::common::error::WarningKind::ImplicitFunctionDeclaration,
+                );
+                let func_info = FunctionInfo {
+                    return_type: CType::Int, // implicit return int
+                    params: Vec::new(),
+                    variadic: true, // unknown params
+                    prototype: None,
+                    is_defined: false,
+                    is_noreturn: false,
+                };
+                self.result.functions.insert(name.clone(), func_info);
+            }
+        }
+        // C11 6.2.1p4 settles a call's binding at the call, so that is
+        // where the answer is captured.  `is_noreturn_call` is asked in two
+        // places with different scoping context -- per statement during the
+        // walk, and for a whole body when -Wreturn-type asks whether
+        // control can fall out, by which time the declaring block's scope
+        // has been unwound -- and a mutable scope stack can only answer the
+        // first.  Measured on `extern void die(void) __attribute__((
+        // noreturn)); int g(void) { auto void die(void) { return; } die(); }`
+        // the whole-body query read the file-scope record and stayed silent
+        // where GCC warns.
+        if let Expr::Identifier(name, _) = callee {
+            if let Some(key) = self.scoped_call_entity(name) {
+                self.result.call_entities.insert(ExprId::of(expr), key);
+            }
+        }
+        self.analyze_expr(callee);
+        for arg in args {
+            self.analyze_expr(arg);
+        }
+        // Resolve the callable through lexical scope, not through
+        // the TU-wide body-metadata map. Local function pointers and
+        // GNU nested functions both shadow a file-scope function.
+        // K&R body declarations intentionally contribute no prototype;
+        // only a separately visible declaration can supply one.
+        let checker = super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
+        };
+        let signature = match checker.infer_expr_ctype(callee) {
+            Some(CType::Function(ft)) => Some(*ft),
+            Some(CType::Pointer(inner, _)) => match *inner {
+                CType::Function(ft) => Some(*ft),
+                _ => None,
+            },
+            _ => None,
+        };
+        // Empty lists retain the existing unspecified-arguments
+        // convention; distinguishing f(void) from f() is independent
+        // of preserving a nonempty prototype vs a K&R body list.
+        if let Some(ft) = signature.filter(|ft| !ft.params.is_empty()) {
+            let name = match callee {
+                Expr::Identifier(name, _) => name.as_str(),
+                _ => "function pointer",
+            };
+            self.check_call_arguments(name, args, &ft.params, ft.variadic, expr.span());
+        }
     }
 
     /// Infer the CType of an expression via ExprTypeChecker and record it

@@ -13,6 +13,17 @@ use crate::common::types::IrType;
 use crate::emit;
 use crate::ir::reexports::{IrBinOp, IrCmpOp, IrConst, Operand, Value};
 
+/// A 128-bit operand reached i686 codegen in a form lowering never produces:
+/// C has no 128-bit integer type on i686 (the frontend rejects `__int128`, as
+/// GCC does), and the `_Float128`/`_Decimal128` carriers live in 16-byte stack
+/// slots and convert only through helper calls. Every such site shares this
+/// one cold, caller-tracked exit rather than emitting wrong code.
+#[cold]
+#[track_caller]
+fn i128_lowering_invariant(what: std::fmt::Arguments<'_>) -> ! {
+    panic!("i686: {what}")
+}
+
 /// A FUSED mul-acc chain, with every operand reference resolved against the
 /// FINAL register allocation (homes + slots). Produced by
 /// `resolve_mulacc_plans` after the RA; consumed by `emit_mulacc_chain_head`.
@@ -792,7 +803,9 @@ impl I686Codegen {
         // i386 __floattidf to call, and the former x87 sequence converted
         // only the low 64 bits and returned a double's low dword: fail
         // loudly instead of miscompiling if a lowering bug ever emits one.
-        panic!("i686: a 128-bit integer to {to_ty:?} conversion has no lowering");
+        i128_lowering_invariant(format_args!(
+            "a 128-bit integer to {to_ty:?} conversion has no lowering"
+        ));
     }
 
     pub(super) fn emit_float_to_i128_call_impl(
@@ -1115,7 +1128,7 @@ impl I686Codegen {
         match op {
             Operand::Value(v) => {
                 let Some(slot) = self.state.get_slot(v.0) else {
-                    panic!("i686: 128-bit value {v:?} has no stack slot");
+                    i128_lowering_invariant(format_args!("128-bit value {v:?} has no stack slot"));
                 };
                 let sr = self.slot_ref_offset(slot, 4 * k);
                 emit!(self.state, "    movl {}, %{}", sr, reg);
