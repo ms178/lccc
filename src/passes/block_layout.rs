@@ -506,7 +506,14 @@ fn relayout_blocks_loop_aware_impl(func: &mut IrFunction, start: BlockLayoutStar
 ///
 /// Kill switch: `CCC_NO_STATIC_CHAIN` (any value) restores the historical
 /// `Existing`-start behavior, preserving the A/B bisection surface.
-pub(crate) fn relayout_blocks_static_chain(func: &mut IrFunction) -> usize {
+///
+/// `dual_layout` selects whether a reordering is recorded for the backend's
+/// dual-layout selection, which emits the function in both block orders and
+/// keeps the smaller.  Without the record the chain order ships directly.
+pub(crate) fn relayout_blocks_static_chain(
+    func: &mut IrFunction,
+    dual_layout: DualLayout,
+) -> usize {
     if std::env::var("CCC_NO_STATIC_CHAIN").is_ok() {
         return relayout_blocks_loop_aware(func);
     }
@@ -833,10 +840,21 @@ pub(crate) fn relayout_blocks_static_chain(func: &mut IrFunction) -> usize {
         })
         .collect();
     let identity: Vec<usize> = (0..n).collect();
-    if final_perm != identity {
+    if dual_layout == DualLayout::Explore && final_perm != identity {
         record_chain_candidate(&func.name, final_perm);
     }
     moved + compacted
+}
+
+/// Whether the static chain layout offers its reordering to the backend's
+/// dual-layout selection (see [`relayout_blocks_static_chain`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DualLayout {
+    /// Record the permutation: the backend emits both orders, runs the
+    /// peephole over each and keeps the one with fewer instructions.
+    Explore,
+    /// Ship the chain order without the two exploratory emissions.
+    ChainOnly,
 }
 
 // ── Dual-layout selection side channel ─────────────────────────────────────
@@ -1217,7 +1235,7 @@ mod chain_tests {
             blk(2, br(3)), // body
         ]);
         let mut f = f;
-        relayout_blocks_static_chain(&mut f);
+        relayout_blocks_static_chain(&mut f, DualLayout::Explore);
         // The chain must start with entry and keep {1,2,3} contiguous with
         // the exit (5) right after the loop, before the return (6).
         assert_eq!(labels(&f)[0], 0);
@@ -1240,7 +1258,7 @@ mod chain_tests {
             blk(5, ret()),
         ];
         let mut f = func_of(good.clone());
-        relayout_blocks_static_chain(&mut f);
+        relayout_blocks_static_chain(&mut f, DualLayout::Explore);
         assert_eq!(labels(&f), labels(&func_of(good)));
     }
 
@@ -1254,7 +1272,7 @@ mod chain_tests {
             blk(7, ret()), // unreachable
             blk(8, br(7)), // unreachable
         ]);
-        relayout_blocks_static_chain(&mut f);
+        relayout_blocks_static_chain(&mut f, DualLayout::Explore);
         let l = labels(&f);
         assert_eq!(&l[..2], &[0, 1]);
         assert_eq!(&l[2..], &[7, 8], "unreachable keep relative order");
@@ -1275,7 +1293,7 @@ mod chain_tests {
             blk(2, br(3)),
         ]);
         let original_labels = labels(&f);
-        relayout_blocks_static_chain(&mut f);
+        relayout_blocks_static_chain(&mut f, DualLayout::Explore);
         let perm = take_chain_candidate("t").expect("chain fired and recorded");
         assert!(
             take_chain_candidate("t").is_none(),
@@ -1294,6 +1312,44 @@ mod chain_tests {
         assert_eq!(
             restored.iter().map(|b| b.label.0).collect::<Vec<_>>(),
             original_labels
+        );
+    }
+
+    /// `DualLayout::ChainOnly` (the -O0 policy) produces the same order as
+    /// `Explore` but leaves no record, so the backend emits the function
+    /// once. Distinct function names: the record map is process-global and
+    /// the test harness runs tests concurrently.
+    #[test]
+    fn chain_only_reorders_identically_without_a_record() {
+        let shape = || {
+            vec![
+                blk(0, cond(1, 6)),
+                blk(6, ret()),
+                blk(3, br(1)),
+                blk(1, cond(2, 5)),
+                blk(5, br(6)),
+                blk(2, br(3)),
+            ]
+        };
+        let mut explored = func_of(shape());
+        explored.name = "chain_only_ref".to_string();
+        relayout_blocks_static_chain(&mut explored, DualLayout::Explore);
+        assert!(
+            take_chain_candidate("chain_only_ref").is_some(),
+            "Explore records the reorder"
+        );
+        let mut chain_only = func_of(shape());
+        chain_only.name = "chain_only_probe".to_string();
+        relayout_blocks_static_chain(&mut chain_only, DualLayout::ChainOnly);
+        assert!(
+            take_chain_candidate("chain_only_probe").is_none(),
+            "ChainOnly records nothing"
+        );
+        assert_eq!(labels(&chain_only), labels(&explored));
+        assert_ne!(
+            labels(&chain_only),
+            vec![0, 6, 3, 1, 5, 2],
+            "the chain did reorder"
         );
     }
 

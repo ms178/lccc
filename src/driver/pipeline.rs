@@ -2549,12 +2549,27 @@ impl Driver {
             // branches. Measured ~570 B of .text on the linux-cachymod setup
             // corpus, which is the margin that keeps _end under the 32 KiB
             // gate (see block_layout::relayout_blocks_loop_aware_rpo).
+            //
+            // -O0 ships the chain order without the dual-layout exploration
+            // (two extra emissions plus two peephole runs per reordered
+            // function). Measured on four binutils 2.47 TUs (gas expr.c,
+            // read.c, tc-i386.c; bfd elflink.c): identical instruction counts
+            // and equal or smaller .text, at 35-40% less compile time. -O1
+            // and up keep it: there it buys 0.2-0.6% .text.
+            let dual_layout = if self.opt_level == 0 {
+                crate::passes::block_layout::DualLayout::ChainOnly
+            } else {
+                crate::passes::block_layout::DualLayout::Explore
+            };
             for func in &mut module.functions {
                 if !func.is_declaration {
                     if self.optimize_size {
                         crate::passes::block_layout::relayout_blocks_loop_aware_rpo(func);
                     } else {
-                        crate::passes::block_layout::relayout_blocks_static_chain(func);
+                        crate::passes::block_layout::relayout_blocks_static_chain(
+                            func,
+                            dual_layout,
+                        );
                     }
                 }
             }
