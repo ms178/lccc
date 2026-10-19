@@ -1603,6 +1603,15 @@ pub(crate) fn run_passes(
         constant_fold::run(module);
         module.for_each_function(cfg_simplify::simplify_cfg);
         o1_checkpoint!("constfold3+cfg");
+        // Literal strlen/strcmp/memcmp answer before the IsConstant resolver, so
+        // a folded compare can still prove a __builtin_constant_p query in this
+        // tier. -O0 deliberately keeps the call: that tier's contract is "skip the
+        // optimizer completely", and a folded literal compare is exactly the kind
+        // of thing a debugger single-steps through. Both reference compilers fold
+        // at -O1 (measured: gcc 14.2 and clang 23.1.3 print the sign at -O1/-O2
+        // and glibc's magnitude at -O0), so this is parity, not aggression.
+        constant_fold::fold_string_library_calls(module);
+        o1_checkpoint!("string_library_fold");
         // Resolve remaining __builtin_constant_p queries BEFORE the final DCE:
         // an unresolved IsConstant node keeps both select arms alive, so the
         // not-taken arm's calls (20010119-1: undef()) only become removable
@@ -1697,7 +1706,7 @@ pub(crate) fn run_passes(
     // Fold strlen("literal") after inlining so __builtin_constant_p patterns
     // (glibc _startup_fatal) resolve to 1 and the not-constant fallback
     // disappears.
-    constant_fold::fold_strlen_literals(module);
+    constant_fold::fold_string_library_calls(module);
     constant_fold::resolve_remaining_is_constant(module);
 
     // Switch case outlining: extract case bodies from large switch statements

@@ -103,26 +103,34 @@ fn fold_const_global_loads(module: &mut IrModule) -> usize {
     total
 }
 
-/// Fold `strlen`/`__builtin_strlen` calls whose argument is a string-literal
-/// global into the literal's byte length. The builtin policy follows
-/// `-fno-builtin`: ordinary `strlen` folding is disabled there, while an
-/// explicit `__builtin_strlen` remains a compiler builtin. glibc's startup.h pattern
+/// Fold `strlen`/`strcmp`/`memcmp` of string literals, after inlining.
+///
+/// `-fno-builtin`: ordinary spellings are disabled there, while an explicit
+/// `__builtin_*` remains a compiler builtin -- both are decided by the caller's
+/// `assume_library` flag, which `passes::builtin_policy::apply` resolves per call
+/// at every optimization level. glibc's startup.h pattern
 /// `__builtin_constant_p (__builtin_strlen (message))` with a string-literal
 /// message becomes 1 after inlining; without this, the branch to
-/// `_startup_fatal_not_constant` survives into static links. Runs after
-/// inlining so parameter -> literal propagation has already happened.
-pub fn fold_strlen_literals(module: &mut IrModule) -> usize {
+/// `_startup_fatal_not_constant` survives into static links. Runs after inlining
+/// so parameter -> literal propagation has already happened.
+///
+/// The compare arms answer with the SIGN, the only thing C specifies and the
+/// value both reference compilers fold to; see
+/// `common::const_eval::narrow_compare_sign`. Operands are resolved through
+/// `GlobalAddr` of a string-literal global, which is how a *runtime* expression
+/// (`memcmp(pick ? "a" : "c", "b", 1)` after propagation, or a literal handed
+/// through an inlined parameter) reaches the fold: sema only annotates
+/// constant-expression contexts, so without this pass those rows kept calling
+/// glibc and printed magnitudes at -O1/-O2 where gcc and clang print signs.
+pub fn fold_string_library_calls(module: &mut IrModule) -> usize {
     // Narrow string literals store one C byte per Rust char, so the byte
     // length is chars().count(); String::len() over-counts bytes >= 0x80.
-    let literals: crate::common::fx_hash::FxHashMap<String, usize> = module
+    // Keyed by label, borrowed from `module.string_literals` -- a disjoint
+    // field from the `module.functions` walked below.
+    let literals: crate::common::fx_hash::FxHashMap<&str, &str> = module
         .string_literals
         .iter()
-        .map(|(label, value)| {
-            (
-                label.clone(),
-                crate::common::const_eval::narrow_string_strlen(value),
-            )
-        })
+        .map(|(label, value)| (label.as_str(), value.as_str()))
         .collect();
     if literals.is_empty() {
         return 0;
@@ -132,42 +140,69 @@ pub fn fold_strlen_literals(module: &mut IrModule) -> usize {
         if func.is_declaration || func.blocks.is_empty() {
             continue;
         }
-        // Map Value -> string length from GlobalAddr instructions naming a
+        // Map Value -> literal text from GlobalAddr instructions naming a
         // string-literal global (per function; allocas/params excluded).
-        let mut addr_lens: crate::common::fx_hash::FxHashMap<u32, usize> =
+        let mut addr_text: crate::common::fx_hash::FxHashMap<u32, &str> =
             crate::common::fx_hash::FxHashMap::default();
         for block in &func.blocks {
             for inst in &block.instructions {
                 if let Instruction::GlobalAddr { dest, name } = inst {
-                    if let Some(&len) = literals.get(name) {
-                        addr_lens.insert(dest.0, len);
+                    if let Some(&text) = literals.get(name.as_str()) {
+                        addr_text.insert(dest.0, text);
                     }
                 }
             }
         }
-        if addr_lens.is_empty() {
+        if addr_text.is_empty() {
             continue;
         }
         for block in &mut func.blocks {
             for inst in &mut block.instructions {
                 if let Instruction::Call { func: callee, info } = inst {
-                    if callee != "strlen" && callee != "__builtin_strlen" {
-                        continue;
-                    }
-                    // Only the library `strlen` has a known result
-                    // (`-fno-builtin[-strlen]` keeps the call, as GCC does).
+                    // Only the library function has a known result
+                    // (`-fno-builtin[-strlen]` keeps the call, as GCC does, and
+                    // so does a TU definition of the name).
                     if !info.assume_library {
                         continue;
                     }
                     let Some(dest) = info.dest else { continue };
-                    if let Some(Operand::Value(v)) = info.args.first() {
-                        if let Some(&len) = addr_lens.get(&v.0) {
-                            *inst = Instruction::Copy {
-                                dest,
-                                src: Operand::Const(IrConst::I64(len as i64)),
-                            };
-                            total += 1;
+                    let text_of = |operand: &Operand| match operand {
+                        Operand::Value(v) => addr_text.get(&v.0).copied(),
+                        _ => None,
+                    };
+                    let args = &info.args;
+                    let folded: Option<IrConst> = (|| match callee.as_str() {
+                        "strlen" | "__builtin_strlen" => Some(IrConst::I64(
+                            crate::common::const_eval::narrow_string_strlen(text_of(args.first()?)?)
+                                as i64,
+                        )),
+                        "strcmp" | "__builtin_strcmp" => {
+                            let (a, b) = (text_of(args.first()?)?, text_of(args.get(1)?)?);
+                            crate::common::const_eval::narrow_compare_sign(a, b, None)
+                                .map(IrConst::I32)
                         }
+                        "memcmp" | "__builtin_memcmp" => {
+                            let (a, b) = (text_of(args.first()?)?, text_of(args.get(1)?)?);
+                            let Operand::Const(len) = args.get(2)? else {
+                                return None;
+                            };
+                            // A negative length is UB and one past either literal
+                            // is out of the stored text: both decline into the call.
+                            let len = len.to_i64()?;
+                            if len < 0 {
+                                return None;
+                            }
+                            crate::common::const_eval::narrow_compare_sign(a, b, Some(len as usize))
+                                .map(IrConst::I32)
+                        }
+                        _ => None,
+                    })();
+                    if let Some(value) = folded {
+                        *inst = Instruction::Copy {
+                            dest,
+                            src: Operand::Const(value),
+                        };
+                        total += 1;
                     }
                 }
             }

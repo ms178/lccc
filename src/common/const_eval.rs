@@ -71,6 +71,71 @@ pub(crate) fn narrow_string_strlen(text: &str) -> usize {
     text.chars().take_while(|&c| c != '\0').count()
 }
 
+/// The sign of the first difference between two narrow string literals compared
+/// as `unsigned char`: -1, 0 or 1, or `None` when the answer is not foldable.
+///
+/// `limit` is `memcmp`'s `n`; `None` means `strcmp`, i.e. stop at the first NUL.
+/// Both answer with the SIGN, which is all C specifies and what gcc 14.2 and
+/// clang 23.1.3 both emit for a folded literal compare (measured: `memcmp("c",
+/// "a", 1)` -> 1, `memcmp("z", "a", 1)` -> 1, `memcmp("\x80", "\x7f", 1)` -> 1,
+/// `strcmp("abc", "abx")` -> -1). glibc's runtime answer is a magnitude (25, 1,
+/// -21), so folding to the magnitude would make the same program print different
+/// numbers at -O0 and -O2.
+///
+/// `strncmp` is deliberately absent from the table: gcc folds it to the glibc
+/// magnitude (2) and clang to the sign (1), so there is no vendor consensus to
+/// fold towards and a unit test pins the refusal.
+pub(crate) fn narrow_compare_sign(a: &str, b: &str, limit: Option<usize>) -> Option<i32> {
+    let n = match limit {
+        Some(n) => {
+            // Fold only inside the bytes both literals actually spell: the
+            // terminating NUL is part of the literal's array object but not of
+            // the stored text, and reasoning about reading it buys nothing --
+            // declining leaves the call, which answers the same sign.
+            if n > a.chars().count() || n > b.chars().count() {
+                return None;
+            }
+            n
+        }
+        None => usize::MAX,
+    };
+    let mut left = a.chars();
+    let mut right = b.chars();
+    for _ in 0..n {
+        // Narrow literals are stored one C byte per Rust char (see lex_string),
+        // so a char IS the byte; `str::len()` would be the UTF-8 encoding size.
+        let (l, r) = match (left.next(), right.next()) {
+            (Some(l), Some(r)) => (l as u32 as u8, r as u32 as u8),
+            // `strcmp`: the stored text ends where the terminator begins, and
+            // the terminator is 0 and part of the object.
+            (None, None) => return Some(0),
+            (None, Some(_)) => return Some(-1),
+            (Some(_), None) => return Some(1),
+        };
+        if l != r {
+            return Some(if l > r { 1 } else { -1 });
+        }
+        if limit.is_none() && l == 0 {
+            return Some(0);
+        }
+    }
+    Some(0)
+}
+
+/// The two narrow string literal arguments of a `strcmp`/`memcmp` call.
+///
+/// Wide and char16 literals are separate AST variants (`WideStringLiteral`,
+/// `Char16StringLiteral`) and separate IR vectors, so matching `StringLiteral`
+/// alone cannot pick one up -- which is what makes the `as u8` byte view in
+/// `narrow_compare_sign` exact rather than a truncation.
+fn two_narrow_literals(args: &[Expr]) -> Option<(&str, &str)> {
+    let (first, second) = (args.first()?, args.get(1)?);
+    let (Expr::StringLiteral(a, _), Expr::StringLiteral(b, _)) = (first, second) else {
+        return None;
+    };
+    Some((a.as_str(), b.as_str()))
+}
+
 /// Whether `__builtin_constant_p(expr)` is 1 because `expr` is the address of
 /// a string literal, by GCC 16.2's rule (`fold_builtin_constant_p`, measured
 /// in static initializers): after stripping no-op conversions, the argument
@@ -191,6 +256,21 @@ pub fn eval_builtin_call_with_mode(
             } else {
                 None
             }
+        }
+        "__builtin_strcmp" | "strcmp" => {
+            let (a, b) = two_narrow_literals(args)?;
+            Some(IrConst::I32(narrow_compare_sign(a, b, None)?))
+        }
+        "__builtin_memcmp" | "memcmp" => {
+            let (a, b) = two_narrow_literals(args)?;
+            // The length has to be a compile-time value in range: a negative
+            // length is UB and one past either literal is out of the stored
+            // text, and both decline into the call rather than guess.
+            let n = eval_fn(args.get(2)?)?.to_i64()?;
+            if n < 0 {
+                return None;
+            }
+            Some(IrConst::I32(narrow_compare_sign(a, b, Some(n as usize))?))
         }
         "__builtin_choose_expr" if args.len() >= 3 => {
             let cond = eval_fn(&args[0])?;
@@ -1388,5 +1468,153 @@ mod string_length_tests {
     #[test]
     fn narrow_strlen_uses_existing_character_count_for_plain_literals() {
         assert_eq!(narrow_string_strlen("abcd"), 4);
+    }
+
+    // ---- strcmp/memcmp of string literals: the sign contract -------------
+    //
+    // C specifies only the SIGN of a compare result, and both reference
+    // compilers fold a literal compare to -1/0/1 (measured on gcc 14.2 and
+    // clang 23.1.3: memcmp("c","a",1) -> 1, memcmp("z","a",1) -> 1,
+    // memcmp("\x80","\x7f",1) -> 1, strcmp("abc","abx") -> -1) while glibc's
+    // runtime answer is a magnitude (2, 25, -21). These tests pin the folded
+    // answer, the refusals, and the spelling/flag rule around it.
+
+    fn cmp_lit(text: &str) -> Expr {
+        Expr::StringLiteral(text.to_string(), Span::dummy())
+    }
+
+    fn cmp_int(value: i64) -> Expr {
+        Expr::IntLiteral(value, Span::dummy())
+    }
+
+    fn cmp_eval_int(e: &Expr) -> Option<IrConst> {
+        match e {
+            Expr::IntLiteral(v, _) => Some(IrConst::I64(*v)),
+            _ => None,
+        }
+    }
+
+    fn cmp_call(name: &str, args: &[Expr]) -> Option<IrConst> {
+        eval_builtin_call(name, args, &cmp_eval_int)
+    }
+
+    #[test]
+    fn memcmp_of_literals_answers_with_the_sign_both_vendors_give() {
+        let sign =
+            |a: &str, b: &str, n: i64| cmp_call("memcmp", &[cmp_lit(a), cmp_lit(b), cmp_int(n)]);
+        assert_eq!(sign("c", "a", 1), Some(IrConst::I32(1)));
+        assert_eq!(sign("a", "c", 1), Some(IrConst::I32(-1)));
+        assert_eq!(sign("z", "a", 1), Some(IrConst::I32(1)));
+        // `unsigned char` comparison (C11 7.1.4p4 refers to the comparison
+        // functions' byte-wise rule): 0x80 is GREATER than 0x7f, not negative.
+        // A narrow literal stores one C byte per Rust char, so `\u{80}` here is
+        // exactly the byte the C escape `"\x80"` produces (Rust string literals
+        // are UTF-8 and reject `\x80` outright).
+        assert_eq!(sign("\u{80}", "\u{7f}", 1), Some(IrConst::I32(1)));
+        assert_eq!(sign("ab", "aa", 2), Some(IrConst::I32(1)));
+        assert_eq!(sign("abc", "abx", 3), Some(IrConst::I32(-1)));
+        assert_eq!(sign("abc", "abc", 3), Some(IrConst::I32(0)));
+        // memcmp compares THROUGH an embedded NUL, unlike strcmp.
+        assert_eq!(sign("a\0b", "a\0c", 3), Some(IrConst::I32(-1)));
+        // n == 0 compares nothing: both vendors answer 0.
+        assert_eq!(sign("abc", "xyz", 0), Some(IrConst::I32(0)));
+    }
+
+    #[test]
+    fn strcmp_of_literals_stops_at_the_terminator() {
+        let sign = |a: &str, b: &str| cmp_call("strcmp", &[cmp_lit(a), cmp_lit(b)]);
+        assert_eq!(sign("c", "a"), Some(IrConst::I32(1)));
+        assert_eq!(sign("a", "c"), Some(IrConst::I32(-1)));
+        assert_eq!(sign("abc", "abx"), Some(IrConst::I32(-1)));
+        assert_eq!(sign("abc", "abc"), Some(IrConst::I32(0)));
+        // A prefix is ordered by the terminator, which is part of the object.
+        assert_eq!(sign("ab", "abc"), Some(IrConst::I32(-1)));
+        assert_eq!(sign("abc", "ab"), Some(IrConst::I32(1)));
+        // The stored text ends at the first NUL, so what follows it is not
+        // compared: strcmp, unlike memcmp, never looks past the terminator.
+        assert_eq!(sign("a\0zzz", "a\0bbb"), Some(IrConst::I32(0)));
+    }
+
+    #[test]
+    fn memcmp_declines_when_the_length_leaves_the_literals() {
+        // One past either literal is out of the stored text; declining leaves
+        // the call, which answers the same sign at runtime.
+        assert_eq!(
+            cmp_call("memcmp", &[cmp_lit("ab"), cmp_lit("abc"), cmp_int(4)]),
+            None
+        );
+        assert_eq!(
+            cmp_call("memcmp", &[cmp_lit("abc"), cmp_lit("ab"), cmp_int(3)]),
+            None
+        );
+        // Exactly the stored length is inside it.
+        assert_eq!(
+            cmp_call("memcmp", &[cmp_lit("abc"), cmp_lit("abd"), cmp_int(3)]),
+            Some(IrConst::I32(-1))
+        );
+    }
+
+    #[test]
+    fn memcmp_declines_a_negative_or_non_constant_length() {
+        // A negative length is UB: no answer may be invented.
+        assert_eq!(
+            cmp_call("memcmp", &[cmp_lit("abc"), cmp_lit("abd"), cmp_int(-1)]),
+            None
+        );
+        // A length the caller cannot prove constant declines too, and so does a
+        // missing third argument.
+        let opaque = Expr::Identifier("n".to_string(), Span::dummy());
+        assert_eq!(
+            cmp_call("memcmp", &[cmp_lit("abc"), cmp_lit("abd"), opaque]),
+            None
+        );
+        assert_eq!(cmp_call("memcmp", &[cmp_lit("abc"), cmp_lit("abd")]), None);
+    }
+
+    #[test]
+    fn strncmp_is_not_folded_because_the_vendors_disagree() {
+        // gcc 14.2 folds strncmp("cd","ab",1) to glibc's magnitude 2 and clang
+        // 23.1.3 folds it to the sign 1 (both measured at -O0 and -O2). With no
+        // consensus to fold towards, the call stays and glibc answers.
+        for name in ["strncmp", "__builtin_strncmp"] {
+            assert_eq!(
+                cmp_call(name, &[cmp_lit("cd"), cmp_lit("ab"), cmp_int(1)]),
+                None,
+                "{name} must not be folded"
+            );
+        }
+    }
+
+    #[test]
+    fn the_prefixed_spelling_folds_when_the_bare_one_is_withdrawn() {
+        let args = [cmp_lit("c"), cmp_lit("a"), cmp_int(1)];
+        let both = [cmp_lit("c"), cmp_lit("a")];
+        // Hosted mode: bare and prefixed agree.
+        assert_eq!(
+            eval_builtin_call_with_mode("memcmp", &args, &cmp_eval_int, true),
+            Some(IrConst::I32(1))
+        );
+        assert_eq!(
+            eval_builtin_call_with_mode("__builtin_memcmp", &args, &cmp_eval_int, true),
+            Some(IrConst::I32(1))
+        );
+        // `-fno-builtin` / `-ffreestanding` withdraw the bare spelling only: the
+        // compiler's own interface is not a library name to withdraw.
+        assert_eq!(
+            eval_builtin_call_with_mode("memcmp", &args, &cmp_eval_int, false),
+            None
+        );
+        assert_eq!(
+            eval_builtin_call_with_mode("__builtin_memcmp", &args, &cmp_eval_int, false),
+            Some(IrConst::I32(1))
+        );
+        assert_eq!(
+            eval_builtin_call_with_mode("strcmp", &both, &cmp_eval_int, false),
+            None
+        );
+        assert_eq!(
+            eval_builtin_call_with_mode("__builtin_strcmp", &both, &cmp_eval_int, false),
+            Some(IrConst::I32(1))
+        );
     }
 }

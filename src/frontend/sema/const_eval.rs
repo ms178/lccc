@@ -597,13 +597,55 @@ impl<'a> SemaConstEval<'a> {
                 })
             }
             "__builtin_constant_p" => self.eval_builtin_constant_p(args.first()?),
-            _ => shared_const_eval::eval_builtin_call_with_mode(
-                name.as_str(),
-                args,
-                &|e| self.eval_const_expr(e),
-                self.builtin_policy.may_assume(name.as_str()),
-            ),
+            _ => {
+                if !self.fold_as_library_function(name) {
+                    return None;
+                }
+                shared_const_eval::eval_builtin_call_with_mode(
+                    name.as_str(),
+                    args,
+                    &|e| self.eval_const_expr(e),
+                    self.builtin_policy.may_assume(name.as_str()),
+                )
+            }
         }
+    }
+
+    /// Whether a call spelled `name` denotes the *library* function of that name,
+    /// which is the only thing the shared builtin fold table speaks for.
+    ///
+    /// The table answers for `strlen`, `memcmp`, `abs`, ... the library function;
+    /// when the identifier denotes something else that shares the basename, the
+    /// folded value and the emitted call disagree, and the disagreement is silent
+    /// (measured: a file-scope `size_t (*strlen)(const char *)` object turned
+    /// `strlen("abc")` into the constant 3 instead of a call through the object,
+    /// and a GNU nested function named `strlen` was folded away entirely; gcc
+    /// 14.2 calls the object and the nested function respectively).
+    ///
+    /// By what the innermost visible declaration of `name` is:
+    ///
+    /// * nothing visible: an ordinary library call, so fold.
+    /// * a function: fold only at file scope (`lookup_depth == 0`). A block-scope
+    ///   function declaration of a library name is either a redundant prototype
+    ///   (folding is harmless) or a GNU nested function *definition* (folding is
+    ///   wrong). Telling them apart means scanning `functions` for mangled
+    ///   `parent.name` keys, which is quadratic in the number of functions, so
+    ///   the depth rule declines both -- the safe answer, and the one that
+    ///   matches gcc on every measured cell of the shadowing matrix.
+    /// * anything else (an object, a typedef, an enumerator): that declaration
+    ///   shadows the library name (C11 6.2.1p4), so do not fold.
+    ///
+    /// `__builtin_*` spellings are unaffected: a shadowing declaration carries
+    /// the bare basename, so the lookup below never matches the prefixed name,
+    /// and `eval_builtin_call_with_mode` keeps its own rule that the compiler's
+    /// interface stays foldable when bare spellings are withdrawn.
+    fn fold_as_library_function(&self, name: &str) -> bool {
+        library_call_is_foldable(
+            self.symbols
+                .lookup(name)
+                .map(|symbol| matches!(symbol.ty, CType::Function(_))),
+            self.symbols.lookup_depth(name),
+        )
     }
 
     /// `__builtin_constant_p(arg)`: 1 once proven, 0 where the answer can no
@@ -1715,5 +1757,96 @@ impl<'a> SemaConstEval<'a> {
             }
         }
         ty
+    }
+}
+
+/// The shadowing decision of [`SemaConstEval::fold_as_library_function`], split
+/// out from the symbol table so it can be tested without building a sema
+/// context.
+///
+/// `declared_function` is `None` when nothing visible declares the name,
+/// `Some(true)` when the innermost visible declaration is a function, and
+/// `Some(false)` when it is anything else (an object, a typedef, an enumerator).
+/// `depth` is the scope depth of that declaration, 0 being file scope.
+fn library_call_is_foldable(declared_function: Option<bool>, depth: Option<usize>) -> bool {
+    match declared_function {
+        // Nothing visible: an ordinary call to the library function.
+        None => true,
+        // A function declaration at file scope is a prototype for the library
+        // function itself (or a definition of it, which the A13/A14 symbol
+        // inventory handles separately). A block-scope one is either a redundant
+        // prototype, where folding is harmless, or a GNU nested function
+        // definition, where folding is wrong; distinguishing them needs a scan
+        // of the mangled `parent.name` keys in `functions`, which is quadratic,
+        // so both are declined -- the safe answer, and the one gcc 14.2 agrees
+        // with on every measured cell of the shadowing matrix.
+        Some(true) => depth.unwrap_or(0) == 0,
+        // An object, typedef or enumerator of that name shadows the library
+        // function (C11 6.2.1p4), at any depth.
+        Some(false) => false,
+    }
+}
+
+#[cfg(test)]
+mod library_name_shadowing_tests {
+    use super::library_call_is_foldable;
+
+    #[test]
+    fn nothing_visible_folds_as_the_library_function() {
+        assert!(library_call_is_foldable(None, None));
+    }
+
+    #[test]
+    fn a_file_scope_function_declaration_folds() {
+        // The ordinary hosted shape: <string.h> declares `size_t strlen(const
+        // char *)` at file scope, and the call is to the library function.
+        assert!(library_call_is_foldable(Some(true), Some(0)));
+    }
+
+    #[test]
+    fn a_block_scope_function_declaration_declines() {
+        // Redundant prototype or GNU nested definition: declined, both.
+        assert!(!library_call_is_foldable(Some(true), Some(1)));
+        assert!(!library_call_is_foldable(Some(true), Some(3)));
+    }
+
+    #[test]
+    fn an_unknown_depth_is_treated_as_file_scope() {
+        // `lookup_depth` answers `None` when the symbol table has no scope for
+        // the name (global constant evaluation before any scope is pushed);
+        // treating that as file scope keeps static initializers foldable.
+        assert!(library_call_is_foldable(Some(true), None));
+    }
+
+    #[test]
+    fn a_non_function_declaration_declines_at_every_depth() {
+        // A pointer object, a plain object, a typedef or an enumerator named
+        // after a library function shadows it wherever it is declared.
+        assert!(!library_call_is_foldable(Some(false), Some(0)));
+        assert!(!library_call_is_foldable(Some(false), Some(1)));
+        assert!(!library_call_is_foldable(Some(false), None));
+    }
+
+    #[test]
+    fn the_decision_space_is_exhaustively_pinned() {
+        // Every input the seam can receive, so a future edit cannot flip one
+        // case without flipping a pinned answer.
+        let table = [
+            ((None, None), true),
+            ((Some(true), None), true),
+            ((Some(true), Some(0)), true),
+            ((Some(true), Some(1)), false),
+            ((Some(true), Some(2)), false),
+            ((Some(false), None), false),
+            ((Some(false), Some(0)), false),
+            ((Some(false), Some(1)), false),
+        ];
+        for ((declared, depth), want) in table {
+            assert_eq!(
+                library_call_is_foldable(declared, depth),
+                want,
+                "declared={declared:?} depth={depth:?}"
+            );
+        }
     }
 }
