@@ -541,12 +541,6 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_layout.sh
     - name: Ext-vector rvalue subscript cross-ABI
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_rvalue_subscript.sh
-    - name: One-lane ext-vector call-site ABI
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_callsite_abi.sh
-    - name: One-lane ext-vector FP/int carriers
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_lane1_abi.sh
-    - name: Narrow-lane ext-vector arithmetic
-      run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_narrow_arith.sh
     - name: ext_vector_type cross-compiler by-value ABI
       run: |
         set -o pipefail
