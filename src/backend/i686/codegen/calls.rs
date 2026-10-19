@@ -97,10 +97,7 @@ impl I686Codegen {
             max_arg_align = max_arg_align.max(align);
             total = (total + align - 1) & !(align - 1);
             match ac {
-                call_abi::CallArgClass::Stack => match ty {
-                    IrType::F64 | IrType::I64 | IrType::U64 => total += 8,
-                    _ => total += 4,
-                },
+                call_abi::CallArgClass::Stack => total += Self::stack_scalar_arg_size(ty),
                 call_abi::CallArgClass::F128Stack => total += 12,
                 call_abi::CallArgClass::I128Stack => total += 16,
                 call_abi::CallArgClass::StructByValStack { size } => total += (*size + 3) & !3,
@@ -140,6 +137,19 @@ impl I686Codegen {
     /// classes the staging loop's fallback arm stores as one 4-byte word.
     /// Everything with sub-4-byte granularity, wide (8/12/16-byte) footprint,
     /// struct copies, register-param classes and zero-size skips is excluded.
+    /// Bytes a scalar `Stack`-class argument occupies in the i386 argument
+    /// area: two words for the pair scalars (`_Decimal64` included: the
+    /// emitter stores 8 bytes, so sizing it as 4 under-allocated the area
+    /// and shifted every later argument), one word for everything else.
+    /// The single source of truth for sizing, staging and emission.
+    pub(super) fn stack_scalar_arg_size(ty: IrType) -> usize {
+        if super::emit::is_pair_scalar(ty) {
+            8
+        } else {
+            4
+        }
+    }
+
     fn push_staging_class_ok(ac: &call_abi::CallArgClass, ty: IrType) -> bool {
         if ty.size() > 4 {
             return false;
@@ -196,10 +206,7 @@ impl I686Codegen {
                         v.push((stack_offset, i));
                     }
                     stack_offset += match ac {
-                        call_abi::CallArgClass::Stack => match ty {
-                            IrType::F64 | IrType::I64 | IrType::U64 => 8,
-                            _ => 4,
-                        },
+                        call_abi::CallArgClass::Stack => Self::stack_scalar_arg_size(ty),
                         call_abi::CallArgClass::F128Stack => 12,
                         call_abi::CallArgClass::I128Stack => 16,
                         call_abi::CallArgClass::StructByValStack { size }
@@ -265,15 +272,9 @@ impl I686Codegen {
                 }
                 call_abi::CallArgClass::Stack => {
                     let ty = arg_types[i];
-                    // D64: BID bit container, moved as an integer pair (never
-                    // through x87 — that would reinterpret the bits).
-                    if ty == IrType::F64
-                        || ty == IrType::I64
-                        || ty == IrType::U64
-                        || ty == IrType::D64
-                    {
-                        self.emit_call_8byte_stack_arg(&args[i], ty, stack_offset);
-                        stack_offset += 8;
+                    if super::emit::is_pair_scalar(ty) {
+                        self.emit_call_8byte_stack_arg(&args[i], stack_offset);
+                        stack_offset += Self::stack_scalar_arg_size(ty);
                     } else {
                         // A constant argument is stored directly; only operands
                         // that genuinely need `%eax` take the two-instruction

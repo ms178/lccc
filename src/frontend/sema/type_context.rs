@@ -138,6 +138,11 @@ pub struct TypeScopeFrame {
     pub typedef_alignments_added: Vec<String>,
     /// Keys that were overwritten in `typedef_alignments`: (key, previous_value).
     pub typedef_alignments_shadowed: Vec<(String, usize)>,
+    /// Every change to `qualified_pointee_typedefs` in this scope, with the
+    /// membership it replaced; undone last-write-first.
+    pub qualified_pointee_changed: Vec<(String, bool)>,
+    /// Same, for `const_base_typedefs`.
+    pub const_base_changed: Vec<(String, bool)>,
 }
 
 impl TypeScopeFrame {
@@ -157,6 +162,8 @@ impl TypeScopeFrame {
             typedefs_shadowed: Vec::new(),
             typedef_alignments_added: Vec::new(),
             typedef_alignments_shadowed: Vec::new(),
+            qualified_pointee_changed: Vec::new(),
+            const_base_changed: Vec::new(),
         }
     }
 }
@@ -190,6 +197,15 @@ pub struct TypeContext {
     /// stores `"aligned_S" -> 32`.  Consulted when computing field / variable alignment
     /// for declarations that use the typedef name.
     pub typedef_alignments: FxHashMap<String, usize>,
+    /// Pointer typedefs whose pointee is `const`/`volatile` (`typedef const
+    /// void *CNPT;`). `CType` carries no qualifiers, so the name is recorded
+    /// here for the null pointer constant rule: `(CNPT)0` is not one. Scoped
+    /// like `typedefs` (see [`Self::set_typedef_pointee_qualified`]).
+    pub qualified_pointee_typedefs: FxHashSet<String>,
+    /// Typedefs whose base specifier is `const` (`typedef const int CI;`,
+    /// `typedef const char *CS;`; see `common::qualifiers`). Scoped like
+    /// `typedefs` (see [`Self::set_typedef_const_base`]).
+    pub const_base_typedefs: FxHashSet<String>,
     /// Function typedef info (bare function typedefs like `typedef int func_t(int)`)
     pub function_typedefs: FxHashMap<String, FunctionTypedefInfo>,
     /// Set of typedef names that are function pointer types
@@ -231,6 +247,8 @@ impl TypeContext {
             enum_constants: FxHashMap::default(),
             typedefs: FxHashMap::default(),
             typedef_alignments: FxHashMap::default(),
+            qualified_pointee_typedefs: FxHashSet::default(),
+            const_base_typedefs: FxHashSet::default(),
             function_typedefs: FxHashMap::default(),
             func_ptr_typedefs: FxHashSet::default(),
             func_ptr_typedef_info: FxHashMap::default(),
@@ -284,12 +302,16 @@ impl TypeContext {
         let builtins: &[(&str, CType)] = &[
             // <stddef.h>
             ("size_t", size_type.clone()),
+            (
+                crate::common::types::OFFSETOF_SIZE_TYPEDEF,
+                size_type.clone(),
+            ),
             ("ssize_t", ssize_type.clone()),
             ("ptrdiff_t", ptrdiff_type),
             ("wchar_t", crate::common::types::wchar_ctype()),
             ("wint_t", CType::UInt),
             // <stdint.h> - exact width types
-            ("int8_t", CType::Char),
+            ("int8_t", CType::signed_char()),
             ("int16_t", CType::Short),
             ("int32_t", CType::Int),
             ("int64_t", i64_type.clone()),
@@ -302,7 +324,7 @@ impl TypeContext {
             ("intmax_t", i64_type.clone()),
             ("uintmax_t", u64_type.clone()),
             // least types
-            ("int_least8_t", CType::Char),
+            ("int_least8_t", CType::signed_char()),
             ("int_least16_t", CType::Short),
             ("int_least32_t", CType::Int),
             ("int_least64_t", i64_type.clone()),
@@ -311,7 +333,7 @@ impl TypeContext {
             ("uint_least32_t", CType::UInt),
             ("uint_least64_t", u64_type.clone()),
             // fast types
-            ("int_fast8_t", CType::Char),
+            ("int_fast8_t", CType::signed_char()),
             ("int_fast16_t", fast_s.clone()),
             ("int_fast32_t", fast_s.clone()),
             ("int_fast64_t", i64_type.clone()),
@@ -348,7 +370,7 @@ impl TypeContext {
             ("__u16", CType::UShort),
             ("__u32", CType::UInt),
             ("__u64", u64_type.clone()),
-            ("__s8", CType::Char),
+            ("__s8", CType::signed_char()),
             ("__s16", CType::Short),
             ("__s32", CType::Int),
             ("__s64", i64_type.clone()),
@@ -406,7 +428,7 @@ impl TypeContext {
             ("__u_short", CType::UShort),
             ("__u_int", CType::UInt),
             ("__u_long", CType::ULong),
-            ("__int8_t", CType::Char),
+            ("__int8_t", CType::signed_char()),
             ("__int16_t", CType::Short),
             ("__int32_t", CType::Int),
             ("__uint8_t", CType::UChar),
@@ -560,6 +582,20 @@ impl TypeContext {
             // Last-write-first: each entry holds the value that write
             // replaced, so restoring in reverse rebuilds the pre-scope state
             // exactly.  `None` marks a name this scope introduced.
+            for (key, was_const) in frame.const_base_changed.into_iter().rev() {
+                if was_const {
+                    self.const_base_typedefs.insert(key);
+                } else {
+                    self.const_base_typedefs.remove(&key);
+                }
+            }
+            for (key, was_qualified) in frame.qualified_pointee_changed.into_iter().rev() {
+                if was_qualified {
+                    self.qualified_pointee_typedefs.insert(key);
+                } else {
+                    self.qualified_pointee_typedefs.remove(&key);
+                }
+            }
             for (key, previous) in frame.enums_changed.into_iter().rev() {
                 match previous {
                     Some(value) => {
@@ -625,28 +661,6 @@ impl TypeContext {
         }
     }
 
-    /// Return the visible enumerator and its lexical depth (file scope is 0).
-    /// This is paired with `SymbolTable::lookup_with_depth`: enumerators and
-    /// objects occupy C's same ordinary-identifier namespace even though their
-    /// compiler payloads are intentionally stored separately.
-    pub fn enum_constant_with_depth(&self, name: &str) -> Option<(&EnumConstant, usize)> {
-        let constant = self.enum_constants.get(name)?;
-        let depth = self
-            .scope_stack
-            .borrow()
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, frame)| {
-                frame
-                    .enums_changed
-                    .iter()
-                    .any(|(changed, _)| changed == name)
-            })
-            .map_or(0, |(index, _)| index + 1);
-        Some((constant, depth))
-    }
-
     /// Insert an enum constant, tracking the change in the current scope frame.
     ///
     /// The previous value is recorded too, so a block-scope enum that redefines
@@ -695,6 +709,24 @@ impl TypeContext {
         ty
     }
 
+    /// The enum tag `name` declared in the innermost scope, if any (C11
+    /// 6.7.2.3: only a declaration in the same scope redeclares the tag).
+    pub fn enum_type_in_current_scope(
+        &self,
+        name: &str,
+    ) -> Option<&crate::common::types::EnumType> {
+        let in_scope = match self.scope_stack.borrow().last() {
+            Some(frame) => frame.enum_types_tracked.contains(name),
+            // File scope: no frame.
+            None => true,
+        };
+        if in_scope {
+            self.enum_types.get(name)
+        } else {
+            None
+        }
+    }
+
     /// Insert a completed enum tag definition, tracking lexical shadowing so
     /// body-less references after scope exit recover the outer definition.
     pub fn insert_enum_type_scoped(
@@ -739,6 +771,44 @@ impl TypeContext {
             }
         }
         self.typedefs.insert(name, ctype);
+    }
+
+    /// Record whether typedef `name` is a pointer to a qualified type, undone
+    /// when the current scope is popped: a block-scope `typedef void *P;`
+    /// must not erase the mark of a file-scope `typedef const void *P;` for
+    /// the rest of the translation unit.
+    pub fn set_typedef_pointee_qualified(&mut self, name: &str, qualified: bool) {
+        let was_qualified = self.qualified_pointee_typedefs.contains(name);
+        if was_qualified == qualified {
+            return;
+        }
+        if let Some(frame) = self.scope_stack.get_mut().last_mut() {
+            frame
+                .qualified_pointee_changed
+                .push((name.to_string(), was_qualified));
+        }
+        if qualified {
+            self.qualified_pointee_typedefs.insert(name.to_string());
+        } else {
+            self.qualified_pointee_typedefs.remove(name);
+        }
+    }
+
+    /// Record whether typedef `name` has a `const` base specifier, undone when
+    /// the current scope is popped (see `set_typedef_pointee_qualified`).
+    pub fn set_typedef_const_base(&mut self, name: &str, is_const: bool) {
+        let was_const = self.const_base_typedefs.contains(name);
+        if was_const == is_const {
+            return;
+        }
+        if let Some(frame) = self.scope_stack.get_mut().last_mut() {
+            frame.const_base_changed.push((name.to_string(), was_const));
+        }
+        if is_const {
+            self.const_base_typedefs.insert(name.to_string());
+        } else {
+            self.const_base_typedefs.remove(name);
+        }
     }
 
     /// Insert a typedef alignment, tracking the change in the current scope frame
@@ -912,6 +982,7 @@ mod enum_type_scope_tests {
             name: Some(name.to_string()),
             variants: vec![(variant.0.to_string(), variant.1)],
             is_packed,
+            fixed: None,
         }
     }
 
@@ -973,12 +1044,21 @@ mod ordinary_namespace_depth_tests {
 
     #[test]
     fn enumerator_and_object_maps_share_canonical_lexical_depths() {
+        // Names resolve in the symbol table's one ordinary namespace; the
+        // enumerator *values* live in `TypeContext::enum_constants`. The two
+        // must bind and unwind at the same lexical depths.
         let mut types = TypeContext::new();
         let mut symbols = SymbolTable::new();
+        let enumerator = |types: &mut TypeContext, symbols: &mut SymbolTable, name: &str, v| {
+            types.insert_enum_scoped(name.to_string(), EnumConstant::provisional(v));
+            symbols.declare(object(name));
+            symbols.mark_enumerator(name);
+        };
 
-        types.insert_enum_scoped("file_enum".into(), EnumConstant::provisional(1));
+        enumerator(&mut types, &mut symbols, "file_enum", 1);
         symbols.declare(object("file_object"));
-        assert_eq!(types.enum_constant_with_depth("file_enum").unwrap().1, 0);
+        assert_eq!(symbols.lookup_depth("file_enum"), Some(0));
+        assert!(types.enum_constants.contains_key("file_enum"));
         assert_eq!(symbols.lookup_depth("file_object"), Some(0));
 
         for depth in 1..=3 {
@@ -986,24 +1066,61 @@ mod ordinary_namespace_depth_tests {
             symbols.push_scope();
             let enum_name = format!("enum_{depth}");
             let object_name = format!("object_{depth}");
-            types.insert_enum_scoped(enum_name.clone(), EnumConstant::provisional(depth as i64));
+            enumerator(&mut types, &mut symbols, &enum_name, depth as i64);
             symbols.declare(object(&object_name));
-            assert_eq!(types.enum_constant_with_depth(&enum_name).unwrap().1, depth);
+            assert_eq!(symbols.lookup_depth(&enum_name), Some(depth));
+            assert!(symbols.lookup_ordinary(&enum_name).is_some_and(|(_, e)| e));
+            assert!(types.enum_constants.contains_key(&enum_name));
             assert_eq!(symbols.lookup_depth(&object_name), Some(depth));
+            assert!(
+                symbols
+                    .lookup_ordinary(&object_name)
+                    .is_some_and(|(_, e)| !e)
+            );
         }
+        // An object in the innermost scope hides a file-scope enumerator.
+        symbols.declare(object("file_enum"));
+        assert!(
+            symbols
+                .lookup_ordinary("file_enum")
+                .is_some_and(|(_, e)| !e)
+        );
 
         for depth in (1..=3).rev() {
             types.pop_scope();
             symbols.pop_scope();
-            assert!(
-                types
-                    .enum_constant_with_depth(&format!("enum_{depth}"))
-                    .is_none()
-            );
+            let enum_name = format!("enum_{depth}");
+            assert!(!types.enum_constants.contains_key(&enum_name));
+            assert_eq!(symbols.lookup_depth(&enum_name), None);
             assert_eq!(symbols.lookup_depth(&format!("object_{depth}")), None);
         }
+        assert!(symbols.lookup_ordinary("file_enum").is_some_and(|(_, e)| e));
         // File scope has no disposable undo frame, so an extra pop is a no-op.
         types.pop_scope();
-        assert_eq!(types.enum_constant_with_depth("file_enum").unwrap().1, 0);
+        assert!(types.enum_constants.contains_key("file_enum"));
+    }
+}
+
+#[cfg(test)]
+mod qualified_pointee_typedef_tests {
+    use super::TypeContext;
+
+    #[test]
+    fn block_scope_typedef_restores_the_outer_mark() {
+        // `typedef const void *P;` at file scope, `typedef void *P;` in a
+        // block: `(P)0` is a null pointer constant only inside the block.
+        let mut ctx = TypeContext::new();
+        ctx.set_typedef_pointee_qualified("P", true);
+        ctx.push_scope();
+        ctx.set_typedef_pointee_qualified("P", false);
+        assert!(!ctx.qualified_pointee_typedefs.contains("P"));
+        ctx.push_scope();
+        ctx.set_typedef_pointee_qualified("P", true);
+        ctx.set_typedef_pointee_qualified("Q", true);
+        ctx.pop_scope();
+        assert!(!ctx.qualified_pointee_typedefs.contains("P"));
+        assert!(!ctx.qualified_pointee_typedefs.contains("Q"));
+        ctx.pop_scope();
+        assert!(ctx.qualified_pointee_typedefs.contains("P"));
     }
 }

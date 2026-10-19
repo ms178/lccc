@@ -58,19 +58,15 @@ for bits in 64 32; do
     done
 done
 
-# --- 2. Reversed form and statement-expression value category -------------
-# `0[f()]` reads lane 0 of the call result (the integer is the index, not
-# the base); it segfaulted even after the materialization landed because
-# the subscript normalizer only knew pointers/arrays. Statement
-# expressions keep their tail's value category in both oracles, so
-# `({ v; })[0] = x` writes into v -- pinned at -O0/-O1/-O2.
+# --- 2. Statement-expression value category (GNU vectors) ----------------
+# GCC, which defines statement expressions, gives `({ v; })` its tail's value
+# category, so `({ v; })[0] = x` writes into a GNU `vector_size` v -- pinned
+# at -O0/-O1/-O2. (Clang treats the statement expression as an rvalue; for
+# Clang's own ext vectors lccc follows Clang, see section 3.)
 cat >"$work/self_forms.c" <<'EOF'
-typedef double d1 __attribute__((ext_vector_type(1)));
-d1 f(void) { return (d1){3.0}; }
+typedef double g1 __attribute__((vector_size(8)));
 int main(void) {
-    if ((int)0[f()] != 3)
-        return 10;
-    d1 v = {13.0};
+    g1 v = {13.0};
     ({ v; })[0] = 17.0;
     if ((int)v[0] != 17)
         return 11;
@@ -81,46 +77,72 @@ for opt in -O0 -O1 -O2; do
     "$ccc" "$opt" "$work/self_forms.c" -o "$work/self_forms"
     "$work/self_forms" || {
         rc=$?
-        echo "FAIL: reversed-form/stmt-expr rvalue subscript at $opt (rc=$rc)" >&2
+        echo "FAIL: stmt-expr GNU vector subscript store at $opt (rc=$rc)" >&2
         exit 1
     }
 done
 
-# --- 3. Oracle-diagnosed rvalue lane stores --------------------------------
-# A lane of a vector rvalue is not an lvalue: the materialized temporary
-# dies at the end of the full expression, so a store must be DIAGNOSED,
-# never silently discarded. GCC says "lvalue required as left operand of
-# assignment", Clang "expression is not assignable"; lccc pins the second
-# spelling for all eight forms.
+# --- 3. Oracle-diagnosed rvalue lane forms --------------------------------
+# A lane or selection of a vector rvalue is not an lvalue: the materialized
+# temporary dies at the end of the full expression, so a store must be
+# DIAGNOSED, never silently discarded. Each form carries Clang 23.1.3's
+# first diagnostic (ext vectors are Clang's extension): a store says
+# "expression is not assignable", `&` "cannot take the address of an
+# rvalue", and the reversed `0[v]` is no subscript at all (commutativity is
+# pointer + integer only; GCC rejects it for GNU vectors too).
 diag_header='typedef double d1 __attribute__((ext_vector_type(1)));
+typedef float f4 __attribute__((ext_vector_type(4)));
 typedef _Bool bb17 __attribute__((ext_vector_type(17)));
+struct S { f4 v; };
 d1 f(void){return (d1){3.0};}
+f4 f4f(void){f4 r={}; return r;}
 bb17 fb(void){bb17 r={}; return r;}
-d1 v={3.0}, w={5.0};
+struct S sf(void){struct S s={}; return s;}
+d1 v={3.0}, w={5.0}; f4 a;
 int c;'
+assignable='expression is not assignable'
+rvalue_addr='cannot take the address of an rvalue of type'
+reversed='subscripted value is'
 rejects=(
-    'f()[0] = 9.0;'
-    'f()[0] += 2.0;'
-    'f()[0]++;'
-    'double *p = &f()[0]; (void)p;'
-    'fb()[3] = 1;'
-    '(c?v:w)[0] = 9.0;'
-    '(0,v)[0] = 9.0;'
-    '((d1)v)[0] = 9.0;'
+    "f()[0] = 9.0;|$assignable"
+    "f()[0] += 2.0;|$assignable"
+    "f()[0]++;|$assignable"
+    "double *p = &f()[0]; (void)p;|$rvalue_addr 'double'"
+    "fb()[3] = 1;|$assignable"
+    "(c?v:w)[0] = 9.0;|$assignable"
+    "(0,v)[0] = 9.0;|$assignable"
+    "((d1)v)[0] = 9.0;|$assignable"
+    "({ v; })[0] = 9.0;|$assignable"
+    "f().x = 9.0;|$assignable"
+    "f4f().yx = a.xy;|$assignable"
+    "f4f().x += 1;|$assignable"
+    "++f4f().w;|$assignable"
+    "sf().v.z = 1;|$assignable"
+    "({ a; }).x = 1;|$assignable"
+    "float *p = &f4f().y; (void)p;|$rvalue_addr 'float'"
+    "float *p = &sf().v[2]; (void)p;|$rvalue_addr 'float'"
+    "double d = 0[v]; (void)d;|$reversed"
+    "double d = 0[f()]; (void)d;|$reversed"
 )
 n=0
-for body in "${rejects[@]}"; do
+for entry in "${rejects[@]}"; do
     n=$((n + 1))
+    body=${entry%%|*}
+    want=${entry#*|}
     printf '%s\nint main(void){ %s return 0; }\n' "$diag_header" "$body" \
         >"$work/reject-$n.c"
     if out=$("$ccc" -O2 "$work/reject-$n.c" -o "$work/reject-$n" 2>&1); then
-        echo "FAIL: accepted invalid rvalue-lane store: $body" >&2
+        echo "FAIL: accepted invalid rvalue-lane form: $body" >&2
         exit 1
     fi
-    grep -q 'not assignable' <<<"$out" || {
-        echo "FAIL: wrong diagnostic for '$body': $(head -1 <<<"$out")" >&2
-        exit 1
-    }
+    # Pipefail-safe: avoid `grep -m1 | grep -q` (early-exit consumer under pipefail
+    # makes SIGPIPE=141 look like failure — see scripts/check_pipefail_sigpipe.py).
+    # Use command substitution + case (no pipe, no SIGPIPE, preserves GCC 16.2/Clang 23.1.3 parity).
+    err_line=$(grep 'error:' <<<"$out" | sed -n '1p')
+    case "$err_line" in
+        *"$want"*) ;;
+        *) echo "FAIL: wrong diagnostic for '$body' (want '$want'): $err_line" >&2; exit 1 ;;
+    esac
 done
 
-echo "PASS: vector rvalue subscript (${#compilers[@]} compiler(s), separate TUs, -O0/-O1/-O2, m64/m32; reversed form; stmt-expr write-through; ${n} oracle-rejected store forms)"
+echo "PASS: vector rvalue subscript (${#compilers[@]} compiler(s), separate TUs, -O0/-O1/-O2, m64/m32; GNU stmt-expr write-through; ${n} oracle-rejected rvalue-lane forms)"

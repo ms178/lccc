@@ -37,7 +37,13 @@ impl Lowerer {
 
     pub(super) fn lower_global_decl(&mut self, decl: &Declaration) {
         self.register_struct_type(&decl.type_spec);
+        // The rebuilt layout lost the attribute (typedefs re-mark in
+        // `lower_typedef`, once the typedef name resolves).
+        if decl.is_transparent_union() && !decl.is_typedef() {
+            self.mark_transparent_union(decl);
+        }
         self.collect_enum_constants(&decl.type_spec);
+        self.declare_declarator_type_name_tags(decl);
 
         if decl.is_typedef() {
             self.lower_typedef(decl);
@@ -193,6 +199,13 @@ impl Lowerer {
             self.types
                 .typedefs
                 .insert(declarator.name.clone(), resolved_ctype);
+            let const_base = crate::common::qualifiers::type_name_const_base(
+                &decl.type_spec,
+                decl.is_const(),
+                self,
+            );
+            self.types
+                .set_typedef_const_base(&declarator.name, const_base);
             let effective_alignment = {
                 let mut align = decl.alignment;
                 if let Some(ref sizeof_ts) = decl.alignment_sizeof_type {
@@ -437,6 +450,8 @@ impl Lowerer {
     ) -> DeclAnalysis {
         let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
         da.base_type_volatile = decl.is_volatile();
+        da.base_type_const =
+            crate::common::qualifiers::type_name_const_base(&decl.type_spec, decl.is_const(), self);
         da.object_volatile = declarator.attrs.object_volatile;
         da.apply_decl_vector_type(decl);
         if da.is_array_of_pointers || da.is_array_of_func_ptrs {
@@ -888,6 +903,7 @@ impl Lowerer {
             elem_ir_ty,
             is_ptr_to_func_ptr,
             base_type_volatile: false,
+            base_type_const: false,
             object_volatile: false,
         }
     }

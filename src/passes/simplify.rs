@@ -1276,8 +1276,8 @@ fn fold_const_cast(c: &IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrCons
 
     // Float-to-other constant cast
     // For LongDouble, use full x87 precision for integer targets
-    if let IrConst::LongDouble(fv, bytes) = c {
-        return IrConst::cast_long_double_to_target(*fv, bytes, to_ty);
+    if let IrConst::LongDouble(_, bytes) = c {
+        return IrConst::cast_long_double_to_target(bytes, to_ty);
     }
     if let Some(fval) = c.to_f64() {
         return IrConst::cast_float_to_target(fval, to_ty);

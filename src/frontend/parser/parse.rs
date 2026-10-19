@@ -39,14 +39,19 @@ impl ModeKind {
                 | TypeSpecifier::UnsignedLongLong
                 | TypeSpecifier::Unsigned
                 | TypeSpecifier::UnsignedChar
+                | TypeSpecifier::PlainUnsignedChar
                 | TypeSpecifier::UnsignedShort
         );
         match self {
             ModeKind::QI => {
                 if is_unsigned {
                     TypeSpecifier::UnsignedChar
-                } else {
+                } else if crate::common::types::char_is_unsigned() {
                     TypeSpecifier::Char
+                } else {
+                    // GCC's c_common_type_for_mode(QImode, signed) is
+                    // `signed char`, distinct from plain char.
+                    TypeSpecifier::SignedChar
                 }
             }
             ModeKind::HI => {
@@ -160,6 +165,20 @@ pub(super) mod parsed_attr_flag {
     /// execute (error paths, fatal handlers). Lowers to the `.text.unlikely`
     /// section unless an explicit `section(...)` overrides it.
     pub const COLD: u32 = 1 << 23;
+    /// C23 `constexpr` storage-class specifier (6.7.1).
+    pub const CONSTEXPR: u32 = 1 << 27;
+    /// `_Atomic` qualifier or `_Atomic(type-name)` specifier in the
+    /// specifiers, or after the `*` being parsed (see `skip_cv_qualifiers`).
+    pub const ATOMIC: u32 = 1 << 28;
+    /// `restrict` after the `*` being parsed.
+    pub const RESTRICT: u32 = 1 << 29;
+    /// `constexpr` came after `_Thread_local` or `auto`: GCC 16.2 names the
+    /// later of the two first ("'constexpr' used with '_Thread_local'").
+    pub const CONSTEXPR_LAST: u32 = 1 << 30;
+    /// The storage-class specifiers a declaration carries (C11 6.7.1; GNU
+    /// `auto` is NESTED_FN). `register` is not tracked.
+    pub const STORAGE_CLASSES: u32 =
+        TYPEDEF | STATIC | EXTERN | THREAD_LOCAL | NESTED_FN | CONSTEXPR | CONSTEXPR_LAST;
 }
 
 /// Accumulated storage-class specifiers, type qualifiers, and GCC attributes
@@ -193,6 +212,10 @@ pub(super) struct ParsedDeclAttrs {
     /// qualifier: the object for a non-pointer, the pointee for a pointer).
     /// Set by `parse_declarator_with_attrs`; read by the typedef registration.
     pub(super) declarator_base_volatile: bool,
+    /// `restrict` / `_Atomic` of the object the last declarator names (see
+    /// `DeclAttributes::object_restrict`). Set by `parse_declarator_with_attrs`.
+    pub(super) declarator_object_restrict: bool,
+    pub(super) declarator_object_atomic: bool,
 
     /// Named address space of the declaration being parsed, moved out of
     /// `parsing_address_space` right after its type specifier. Parameter
@@ -275,6 +298,61 @@ impl ParsedDeclAttrs {
     #[inline]
     pub fn parsing_volatile(&self) -> bool {
         self.flags & parsed_attr_flag::VOLATILE != 0
+    }
+    #[inline]
+    pub fn parsing_constexpr(&self) -> bool {
+        self.flags & parsed_attr_flag::CONSTEXPR != 0
+    }
+    #[inline]
+    pub fn set_constexpr(&mut self, v: bool) {
+        // `auto` is a storage class only once a type specifier accompanies
+        // it; the specifier parser marks that case (`mark_constexpr_last`).
+        let peer = parsed_attr_flag::THREAD_LOCAL;
+        self.set_flag(
+            parsed_attr_flag::CONSTEXPR_LAST,
+            v && self.flags & peer != 0,
+        );
+        self.set_flag(parsed_attr_flag::CONSTEXPR, v)
+    }
+    /// `constexpr` follows an `auto` that a type specifier made a storage
+    /// class.
+    #[inline]
+    pub fn mark_constexpr_last(&mut self) {
+        self.set_flag(parsed_attr_flag::CONSTEXPR_LAST, true)
+    }
+    #[inline]
+    pub fn parsing_constexpr_last(&self) -> bool {
+        self.flags & parsed_attr_flag::CONSTEXPR_LAST != 0
+    }
+    /// Clear the storage-class specifiers, returning them for
+    /// [`Self::restore_storage_classes`]: a parameter's specifiers are its
+    /// own, and must neither inherit nor leave behind the enclosing
+    /// declaration's.
+    #[inline]
+    pub fn take_storage_classes(&mut self) -> u32 {
+        let bits = self.flags & parsed_attr_flag::STORAGE_CLASSES;
+        self.flags &= !parsed_attr_flag::STORAGE_CLASSES;
+        bits
+    }
+    #[inline]
+    pub fn restore_storage_classes(&mut self, bits: u32) {
+        self.flags = (self.flags & !parsed_attr_flag::STORAGE_CLASSES) | bits;
+    }
+    #[inline]
+    pub fn parsing_atomic(&self) -> bool {
+        self.flags & parsed_attr_flag::ATOMIC != 0
+    }
+    #[inline]
+    pub fn set_atomic(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::ATOMIC, v)
+    }
+    #[inline]
+    pub fn parsing_restrict(&self) -> bool {
+        self.flags & parsed_attr_flag::RESTRICT != 0
+    }
+    #[inline]
+    pub fn set_restrict(&mut self, v: bool) {
+        self.set_flag(parsed_attr_flag::RESTRICT, v)
     }
     #[inline]
     pub fn parsing_typedef_use(&self) -> bool {
@@ -532,6 +610,9 @@ impl std::fmt::Debug for ParsedDeclAttrs {
 pub struct Parser {
     pub(super) tokens: Vec<Token>,
     pub(super) pos: usize,
+    /// C23 dialect: `auto` without a type specifier infers the type
+    /// (C23 6.7.10); the lexer already recognised the C23 keywords.
+    pub(super) c23: bool,
     pub(super) typedefs: FxHashSet<String>,
     /// Type specifier each typedef name was declared with (parser-side, for
     /// parse-time sizeof(typedef) resolution in constant expressions such as
@@ -592,6 +673,16 @@ pub struct Parser {
     /// (e.g., `MY_SIZE = sizeof(some_typedef)`). These are still valid constants,
     /// just not evaluable by our constant-expression evaluator.
     pub(super) unevaluable_enum_constants: FxHashSet<String>,
+    /// Undo log for the two enumeration-constant tables: each entry is a name
+    /// a block changed -- an enumerator it declared, or one an object, typedef
+    /// or parameter of that name hides -- with its prior state (value, whether
+    /// unevaluable). Leaving the block restores them, so a block-scope enum
+    /// does not leak out (`void f(void) { enum { X = 1 }; }
+    /// _Static_assert(X, "");` is an undeclared `X`, GCC 16.2) and a hidden
+    /// enumerator is no constant inside (`int A; _Static_assert(A, "");`).
+    pub(super) enum_scope_log: Vec<(String, Option<i64>, bool)>,
+    /// Compound-statement nesting: zero at file scope, where nothing is undone.
+    pub(super) block_depth: u32,
     /// `_Static_assert`s from struct member lists awaiting sema, emitted after
     /// the enclosing file-scope or block item (the members are not in scope
     /// as identifiers, so the assertion means the same there).
@@ -605,10 +696,42 @@ pub struct Parser {
 }
 
 impl Parser {
+    /// Remove `name` from the enumeration-constant tables until the current
+    /// scope ends (see `enum_scope_log`), recording its prior state.
+    pub(super) fn hide_enum_constant(&mut self, name: &str) {
+        let value = self.enum_constants.remove(name);
+        let unevaluable = self.unevaluable_enum_constants.remove(name);
+        self.enum_scope_log
+            .push((name.to_string(), value, unevaluable));
+    }
+
+    /// Undo every enumeration-constant change logged since `mark`.
+    pub(super) fn restore_enum_scope(&mut self, mark: usize) {
+        while self.enum_scope_log.len() > mark {
+            let Some((name, value, unevaluable)) = self.enum_scope_log.pop() else {
+                break;
+            };
+            self.enum_constants.remove(&name);
+            self.unevaluable_enum_constants.remove(&name);
+            if let Some(v) = value {
+                self.enum_constants.insert(name.clone(), v);
+            }
+            if unevaluable {
+                self.unevaluable_enum_constants.insert(name);
+            }
+        }
+    }
+
+    /// Whether `name` is currently an enumeration constant to the parser.
+    pub(super) fn is_parser_enum_constant(&self, name: &str) -> bool {
+        self.enum_constants.contains_key(name) || self.unevaluable_enum_constants.contains(name)
+    }
+
     pub fn new(tokens: Vec<Token>) -> Self {
         Self {
             tokens,
             pos: 0,
+            c23: false,
             typedefs: Self::builtin_typedefs_cached(),
             typedef_type_specs: FxHashMap::default(),
             typedef_object_spaces: FxHashMap::default(),
@@ -627,6 +750,8 @@ impl Parser {
             diagnostics: DiagnosticEngine::new(),
             enum_constants: FxHashMap::default(),
             unevaluable_enum_constants: FxHashSet::default(),
+            enum_scope_log: Vec::new(),
+            block_depth: 0,
             deferred_static_asserts: Vec::new(),
             struct_tag_alignments: FxHashMap::default(),
         }
@@ -636,6 +761,11 @@ impl Parser {
     /// Called by the driver after setting up the source manager on the engine.
     pub fn set_diagnostics(&mut self, engine: DiagnosticEngine) {
         self.diagnostics = engine;
+    }
+
+    /// Select the C23 dialect (see the `c23` field).
+    pub fn set_c23(&mut self, enabled: bool) {
+        self.c23 = enabled;
     }
 
     /// Take the diagnostic engine back from the parser (transfers ownership).
@@ -860,6 +990,7 @@ impl Parser {
         [
             // <stddef.h>
             "size_t",
+            crate::common::types::OFFSETOF_SIZE_TYPEDEF,
             "ssize_t",
             "ptrdiff_t",
             "wchar_t",
@@ -1245,6 +1376,7 @@ impl Parser {
             | TokenKind::Decimal64
             | TokenKind::Decimal128
             | TokenKind::ThreadLocal
+            | TokenKind::Constexpr
             | TokenKind::SegGs
             | TokenKind::SegFs => true,
             TokenKind::Identifier(name) => {
@@ -1259,6 +1391,9 @@ impl Parser {
             match self.peek() {
                 TokenKind::Const | TokenKind::Restrict => {
                     let was_const = matches!(self.peek(), TokenKind::Const);
+                    if !was_const {
+                        self.attrs.set_restrict(true);
+                    }
                     self.advance();
                     // `skip_cv_qualifiers` is called right after each `*` in a
                     // declarator, so a `const` seen here qualifies the POINTER
@@ -1269,6 +1404,13 @@ impl Parser {
                     if was_const {
                         self.attrs.set_pointer_const(true);
                     }
+                }
+                // After a `*` only qualifiers can follow, so `_Atomic` is the
+                // qualifier even before `(` (a parenthesized declarator):
+                // `int *_Atomic p;` declares an atomic pointer (C11 6.7.3).
+                TokenKind::Atomic => {
+                    self.advance();
+                    self.attrs.set_atomic(true);
                 }
                 TokenKind::Volatile => {
                     self.advance();
@@ -2346,7 +2488,9 @@ impl Parser {
             TypeSpecifier::Void
             | TypeSpecifier::Bool
             | TypeSpecifier::Char
-            | TypeSpecifier::UnsignedChar => Some(1),
+            | TypeSpecifier::SignedChar
+            | TypeSpecifier::UnsignedChar
+            | TypeSpecifier::PlainUnsignedChar => Some(1),
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => Some(2),
             TypeSpecifier::Int
             | TypeSpecifier::UnsignedInt
@@ -2357,7 +2501,9 @@ impl Parser {
             TypeSpecifier::LongLong | TypeSpecifier::UnsignedLongLong | TypeSpecifier::Double => {
                 Some(8)
             }
-            TypeSpecifier::Pointer(_, _) | TypeSpecifier::FunctionPointer(_, _, _) => Some(ptr_sz),
+            TypeSpecifier::Pointer(_, _)
+            | TypeSpecifier::FunctionPointer(_, _, _)
+            | TypeSpecifier::NullPtrT => Some(ptr_sz),
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => Some(16),
             TypeSpecifier::LongDouble => Some(if ptr_sz == 4 { 12 } else { 16 }),
             TypeSpecifier::ComplexFloat => Some(8),
@@ -2381,6 +2527,7 @@ impl Parser {
         matches!(
             ts,
             TypeSpecifier::UnsignedChar
+                | TypeSpecifier::PlainUnsignedChar
                 | TypeSpecifier::UnsignedShort
                 | TypeSpecifier::UnsignedInt
                 | TypeSpecifier::Unsigned
@@ -2411,7 +2558,9 @@ impl Parser {
             TypeSpecifier::Void
             | TypeSpecifier::Bool
             | TypeSpecifier::Char
-            | TypeSpecifier::UnsignedChar => 1,
+            | TypeSpecifier::SignedChar
+            | TypeSpecifier::UnsignedChar
+            | TypeSpecifier::PlainUnsignedChar => 1,
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => 2,
             TypeSpecifier::Int
             | TypeSpecifier::UnsignedInt
@@ -2427,7 +2576,9 @@ impl Parser {
                     8
                 }
             }
-            TypeSpecifier::Pointer(_, _) | TypeSpecifier::FunctionPointer(_, _, _) => ptr_sz,
+            TypeSpecifier::Pointer(_, _)
+            | TypeSpecifier::FunctionPointer(_, _, _)
+            | TypeSpecifier::NullPtrT => ptr_sz,
             TypeSpecifier::Int128 | TypeSpecifier::UnsignedInt128 => 16,
             // On i686, long double is 80-bit x87 but aligned to 4 bytes
             TypeSpecifier::LongDouble => {

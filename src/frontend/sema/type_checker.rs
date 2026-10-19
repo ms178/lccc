@@ -17,6 +17,7 @@
 use super::analysis::FunctionInfo;
 use super::type_context::TypeContext;
 use crate::common::fx_hash::FxHashMap;
+use crate::common::qualifiers;
 use crate::common::symbol_table::SymbolTable;
 use crate::common::types::{AddressSpace, CType, FunctionType};
 use crate::frontend::parser::ast::{
@@ -47,6 +48,26 @@ pub struct ExprTypeChecker<'a> {
     pub expr_types: Option<&'a FxHashMap<ExprId, CType>>,
     /// Whether hosted-library builtin aliases are disabled for constant queries.
     pub builtin_policy: crate::common::pass_policy::BuiltinFlags,
+    /// The TU is C90/C94: an overflowing signed left shift is still an
+    /// integer constant expression (see `ice.rs`).
+    pub pre_c99: bool,
+}
+
+impl qualifiers::ConstLookup for ExprTypeChecker<'_> {
+    fn object_const_base(&self, name: &str) -> bool {
+        self.symbols.is_const_base(name)
+    }
+
+    fn typedef_const_base(&self, name: &str) -> bool {
+        self.types.const_base_typedefs.contains(name)
+    }
+
+    fn is_pointer(&self, expr: &Expr) -> bool {
+        matches!(
+            self.infer_expr_ctype(expr),
+            Some(CType::Pointer(..) | CType::Array(..))
+        )
+    }
 }
 
 impl<'a> ExprTypeChecker<'a> {
@@ -126,9 +147,10 @@ impl<'a> ExprTypeChecker<'a> {
             Expr::ImaginaryLiteral(_, _) => Some(CType::ComplexDouble),
             Expr::ImaginaryLiteralF32(_, _) => Some(CType::ComplexFloat),
             Expr::ImaginaryLiteralLongDouble(_, _, _) => Some(CType::ComplexLongDouble),
-            Expr::StringLiteral(_, _) => {
-                Some(CType::Pointer(Box::new(CType::Char), AddressSpace::Default))
-            }
+            Expr::StringLiteral(_, _) => Some(CType::Pointer(
+                Box::new(CType::plain_char()),
+                AddressSpace::Default,
+            )),
             Expr::WideStringLiteral(_, _) => {
                 Some(CType::Pointer(Box::new(CType::Int), AddressSpace::Default))
             }
@@ -139,27 +161,34 @@ impl<'a> ExprTypeChecker<'a> {
 
             // Identifiers: look up in symbol table or enum constants
             Expr::Identifier(name, _) => {
-                if crate::frontend::parser::ast::is_function_name_builtin(name) {
-                    return Some(CType::Pointer(Box::new(CType::Char), AddressSpace::Default));
+                // Inside a function the body scope declares it (an array of
+                // the name's length plus one); at file scope it is GCC's
+                // string for that spelling.
+                if crate::frontend::parser::ast::is_function_name_builtin(name)
+                    && self.symbols.lookup(name).is_none()
+                {
+                    let text = crate::frontend::parser::ast::function_name_builtin_text(name, None);
+                    return Some(CType::Array(
+                        Box::new(CType::plain_char()),
+                        Some(text.len() + 1),
+                    ));
                 }
                 // Objects/functions and enumerators share C's ordinary-name
-                // namespace.  They live in separate compiler maps, so resolve
-                // by lexical depth; map order is not a shadowing rule.
-                let symbol = self.symbols.lookup_with_depth(name);
-                let enumerator = self.types.enum_constant_with_depth(name);
-                match (symbol, enumerator) {
-                    (Some((sym, sym_depth)), Some((constant, enum_depth))) => {
-                        return Some(if sym_depth > enum_depth {
-                            sym.ty.clone()
-                        } else {
-                            // Enumerators are also entered in the symbol table,
-                            // so equal depths denote that enumerator.
-                            constant.ty.clone()
-                        });
+                // namespace (C11 6.2.3): the innermost visible declaration
+                // decides. Sema enters every enumerator in the symbol table as
+                // well; one known only to `enum_constants` (a block-scope enum
+                // seen by lowering's type context) applies when no symbol of
+                // that name is visible at all.
+                match self.symbols.lookup_ordinary(name) {
+                    Some((sym, false)) => return Some(sym.ty.clone()),
+                    found => {
+                        if let Some(constant) = self.types.enum_constants.get(name) {
+                            return Some(constant.ty.clone());
+                        }
+                        if let Some((sym, _)) = found {
+                            return Some(sym.ty.clone());
+                        }
                     }
-                    (Some((sym, _)), None) => return Some(sym.ty.clone()),
-                    (None, Some((constant, _))) => return Some(constant.ty.clone()),
-                    (None, None) => {}
                 }
                 // Check function signatures for implicitly declared functions
                 if let Some(func_info) = self.functions.get(name) {
@@ -219,6 +248,11 @@ impl<'a> ExprTypeChecker<'a> {
                     match base_ct {
                         CType::Array(elem, _) => return Some(*elem),
                         CType::Pointer(pointee, _) => return Some(*pointee),
+                        // A vector lane has the element type (GNU vector_size
+                        // and Clang ext_vector_type alike).
+                        ref v if v.is_vector() => {
+                            return v.vector_info().map(|(elem, _)| elem.clone());
+                        }
                         _ => {}
                     }
                 }
@@ -274,23 +308,9 @@ impl<'a> ExprTypeChecker<'a> {
 
             // Conditional: C11 6.5.15 composite type rules
             Expr::Conditional(_, then_expr, else_expr, _) => {
-                use crate::common::const_arith::is_null_pointer_constant;
-                CType::conditional_composite_type(
-                    self.infer_expr_ctype(then_expr),
-                    self.infer_expr_ctype(else_expr),
-                    is_null_pointer_constant(then_expr),
-                    is_null_pointer_constant(else_expr),
-                )
+                self.conditional_ctype(then_expr, else_expr)
             }
-            Expr::GnuConditional(cond, else_expr, _) => {
-                use crate::common::const_arith::is_null_pointer_constant;
-                CType::conditional_composite_type(
-                    self.infer_expr_ctype(cond),
-                    self.infer_expr_ctype(else_expr),
-                    is_null_pointer_constant(cond),
-                    is_null_pointer_constant(else_expr),
-                )
-            }
+            Expr::GnuConditional(cond, else_expr, _) => self.conditional_ctype(cond, else_expr),
 
             // Comma: the result is the right operand's value and type
             // (C11 6.5.17p3) AFTER the usual lvalue conversion, so an array
@@ -314,8 +334,7 @@ impl<'a> ExprTypeChecker<'a> {
                 // of the selected branch, not a fixed return type.
                 if let Expr::Identifier(name, _) = func.as_ref() {
                     if name == "__builtin_choose_expr" && args.len() >= 3 {
-                        let cond = self.eval_const_expr(&args[0]).unwrap_or(1);
-                        return if cond != 0 {
+                        return if self.choose_expr_takes_first(&args[0]) {
                             self.infer_expr_ctype(&args[1])
                         } else {
                             self.infer_expr_ctype(&args[2])
@@ -409,6 +428,7 @@ impl<'a> ExprTypeChecker<'a> {
             }
 
             // Label address: void*
+            Expr::TypeOperand(ts, _, _) => Some(self.resolve_type_spec(ts)),
             Expr::LabelAddr(_, _) => {
                 Some(CType::Pointer(Box::new(CType::Void), AddressSpace::Default))
             }
@@ -653,59 +673,34 @@ impl<'a> ExprTypeChecker<'a> {
         controlling: &Expr,
         associations: &[GenericAssociation],
     ) -> Option<usize> {
-        let controlling_ct = self.infer_expr_ctype(controlling);
+        // An expression operand undergoes lvalue conversion; a type operand
+        // (C2y) none. Constness follows the rule lowering shares.
+        let controlling_ct = match controlling {
+            Expr::TypeOperand(ts, ..) => Some(self.resolve_type_spec(ts)),
+            _ => self
+                .infer_expr_ctype(controlling)
+                .map(|ct| ct.decayed_value_ctype()),
+        };
+        let (ctrl_const, compare_const) =
+            qualifiers::controlling_const(controlling, associations, self);
         let mut default_index = None;
         for (index, assoc) in associations.iter().enumerate() {
             match &assoc.type_spec {
                 None => default_index = Some(index),
                 Some(type_spec) => {
                     let assoc_ct = self.resolve_type_spec(type_spec);
-                    if let Some(ref ctrl_ct) = controlling_ct {
-                        if self.ctype_matches_generic(ctrl_ct, &assoc_ct) {
-                            return Some(index);
-                        }
+                    if controlling_ct
+                        .as_ref()
+                        .is_some_and(|ct| ct.generic_association_matches(&assoc_ct))
+                        && (!compare_const
+                            || qualifiers::association_const_base(assoc, self) == ctrl_const)
+                    {
+                        return Some(index);
                     }
                 }
             }
         }
         default_index
-    }
-
-    /// Check if two CTypes match for _Generic selection purposes.
-    /// Uses compatible-type rules: ignores qualifiers, matches arrays with pointers.
-    fn ctype_matches_generic(&self, controlling: &CType, assoc: &CType) -> bool {
-        // Exact match
-        if std::mem::discriminant(controlling) == std::mem::discriminant(assoc) {
-            match (controlling, assoc) {
-                (CType::Pointer(a, _), CType::Pointer(b, _)) => {
-                    return self.ctype_matches_generic(a, b);
-                }
-                (CType::Array(a, _), CType::Array(b, _)) => {
-                    return self.ctype_matches_generic(a, b);
-                }
-                // For types that carry identity data (Struct, Union, Enum, Function,
-                // Vector), we must compare the full type, not just the discriminant.
-                // Primitive types (Int, Float, etc.) have no data so PartialEq works too.
-                _ => return controlling == assoc,
-            }
-        }
-        // Array decays to pointer for _Generic matching
-        if let CType::Array(elem, _) = controlling {
-            if let CType::Pointer(pointee, _) = assoc {
-                return self.ctype_matches_generic(elem, pointee);
-            }
-        }
-        // An enum type is compatible with its compatible integer type
-        // (C11 6.7.2.2p4) and with nothing else; two enums compare by
-        // identity above.
-        match (controlling, assoc) {
-            (CType::Enum(e), other) | (other, CType::Enum(e))
-                if !matches!(other, CType::Enum(_)) =>
-            {
-                e.compatible_ctype() == *other
-            }
-            _ => false,
-        }
     }
 
     /// Resolve a TypeSpecifier to a CType using sema's type context.
@@ -716,7 +711,9 @@ impl<'a> ExprTypeChecker<'a> {
             TypeSpecifier::Void => CType::Void,
             TypeSpecifier::Bool => CType::Bool,
             TypeSpecifier::Char => CType::Char,
+            TypeSpecifier::SignedChar => CType::SChar,
             TypeSpecifier::UnsignedChar => CType::UChar,
+            TypeSpecifier::PlainUnsignedChar => CType::PlainUChar,
             TypeSpecifier::Short => CType::Short,
             TypeSpecifier::UnsignedShort => CType::UShort,
             TypeSpecifier::Int | TypeSpecifier::Signed => CType::Int,
@@ -782,35 +779,20 @@ impl<'a> ExprTypeChecker<'a> {
                     CType::Int // fallback for unknown typedef
                 }
             }
-            TypeSpecifier::Enum(name, variants, is_packed) => {
+            TypeSpecifier::Enum(name, variants, is_packed, underlying) => {
                 // The same enum the analyzer resolves (`resolve_enum`): the
                 // completed definition visible here, or this body's values.
                 // Every integer property of the result (size, signedness,
                 // rank, promotion, `_Generic` match) is that of its
                 // compatible type, so no width rule lives here.
-                let completed = name.as_ref().and_then(|n| self.types.enum_types.get(n));
-                let variants = match variants {
-                    Some(vars) => {
-                        let mut values = Vec::with_capacity(vars.len());
-                        let mut next_val: i64 = 0;
-                        for v in vars {
-                            if let Some(val) =
-                                v.value.as_ref().and_then(|e| self.eval_const_expr(e))
-                            {
-                                next_val = val;
-                            }
-                            values.push((v.name.clone(), next_val));
-                            next_val = next_val.wrapping_add(1);
-                        }
-                        values
-                    }
-                    None => completed.map(|et| et.variants.clone()).unwrap_or_default(),
-                };
-                CType::Enum(crate::common::types::EnumType {
-                    name: name.clone(),
+                CType::Enum(crate::common::type_builder::enum_type_of(
+                    name,
                     variants,
-                    is_packed: *is_packed || completed.is_some_and(|et| et.is_packed),
-                })
+                    *is_packed,
+                    name.as_ref().and_then(|n| self.types.enum_types.get(n)),
+                    underlying.as_deref().map(|u| self.resolve_type_spec(u)),
+                    |v| v.value.as_ref().and_then(|e| self.eval_const_expr(e)),
+                ))
             }
             TypeSpecifier::Struct(
                 tag,
@@ -912,16 +894,175 @@ impl<'a> ExprTypeChecker<'a> {
                     AddressSpace::Default,
                 )
             }
-            // TODO: handle remaining TypeSpecifier variants
-            _ => CType::Int,
+            TypeSpecifier::BareFunction(ret, params, variadic) => {
+                let ret_ct = self.resolve_type_spec(ret);
+                let param_cts: Vec<(CType, Option<String>)> = params
+                    .iter()
+                    .map(|p| {
+                        (
+                            crate::common::type_builder::param_decl_to_ctype_with(
+                                &|ts| self.resolve_type_spec(ts),
+                                p,
+                            ),
+                            p.name.clone(),
+                        )
+                    })
+                    .collect();
+                CType::Function(Box::new(FunctionType {
+                    return_type: ret_ct,
+                    params: param_cts,
+                    variadic: *variadic,
+                }))
+            }
+            TypeSpecifier::ExtVector(elem, lanes) => {
+                let elem_ct = self.resolve_type_spec(elem);
+                match crate::common::types::ExtVectorLayout::new(&elem_ct, *lanes) {
+                    Some(layout) => CType::ExtVector(Box::new(elem_ct), layout),
+                    // Same recovery as `type_builder`: the element type.
+                    None => elem_ct,
+                }
+            }
+            TypeSpecifier::NullPtrT => CType::NullPtr,
+            // `__auto_type`/C23 `auto` is replaced by the initializer's type
+            // before any expression can name it; `type_builder` agrees.
+            TypeSpecifier::AutoType => CType::Int,
         }
     }
 
-    /// Evaluate a constant expression for array sizes and similar contexts.
-    /// Delegates to SemaConstEval for the full implementation, unifying
-    /// const_eval across all sema modules.
-    fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
-        let evaluator = super::const_eval::SemaConstEval {
+    /// The type of `c ? then_expr : else_expr` (C11 6.5.15p3-p6).
+    fn conditional_ctype(&self, then_expr: &Expr, else_expr: &Expr) -> Option<CType> {
+        let then_ct = self.infer_expr_ctype(then_expr);
+        let else_ct = self.infer_expr_ctype(else_expr);
+        let then_is_npc = self.conditional_arm_is_npc(then_expr, &then_ct, &else_ct);
+        let else_is_npc = self.conditional_arm_is_npc(else_expr, &else_ct, &then_ct);
+        CType::conditional_composite_type(then_ct, else_ct, then_is_npc, else_is_npc)
+    }
+
+    /// Whether a `?:` arm is a null pointer constant, decided only where the
+    /// answer can change the type ([`CType::conditional_arm_npc_matters`]);
+    /// every other pair skips the structural ICE walk.
+    fn conditional_arm_is_npc(
+        &self,
+        arm: &Expr,
+        arm_ct: &Option<CType>,
+        other_ct: &Option<CType>,
+    ) -> bool {
+        CType::conditional_arm_npc_matters(arm_ct.as_ref(), other_ct.as_ref())
+            && self.is_null_pointer_constant(arm)
+    }
+
+    /// Whether `expr` is an integer constant expression (C11 6.6p6): the
+    /// structural test of `ice.rs` over this checker's types, enumerators
+    /// and required-constant evaluation. The one ICE predicate behind
+    /// `__builtin_choose_expr` and the null pointer constant rule.
+    /// Whether `expr` is a named constant (C23 6.6p7) and of which kind: an
+    /// enumeration constant, a `constexpr` object, or a member of one reached
+    /// by `.` (subscripts and `->` are not named constants: GCC 16.2 rejects
+    /// `a[1]` of a `constexpr` array in an ICE).
+    pub(super) fn named_constant(&self, expr: &Expr) -> Option<super::ice::NamedConstant> {
+        use super::ice::NamedConstant;
+        let mut root = expr;
+        while let Expr::MemberAccess(base, _, _) = root {
+            root = base;
+        }
+        let Expr::Identifier(name, _) = root else {
+            return None;
+        };
+        if std::ptr::eq(root, expr) && self.symbols.is_enumerator(name) {
+            return Some(NamedConstant::Integer);
+        }
+        if !self.symbols.is_constexpr(name) {
+            return None;
+        }
+        let ty = self.infer_expr_ctype(expr)?;
+        if ty.is_integer() {
+            Some(NamedConstant::Integer)
+        } else if ty.is_floating() {
+            Some(NamedConstant::Floating)
+        } else {
+            None
+        }
+    }
+
+    pub fn is_integer_constant_expr(&self, expr: &Expr) -> bool {
+        let evaluator = self.sema_const_eval();
+        let eval = |e: &Expr| evaluator.eval_required_constant(e);
+        let ctype = |e: &Expr| self.infer_expr_ctype(e);
+        let select = |controlling: &Expr, associations: &[GenericAssociation]| {
+            self.generic_selection_index(controlling, associations)
+        };
+        let named_constant = |e: &Expr| self.named_constant(e);
+        let is_builtin = |name: &str| super::builtins::is_builtin(name);
+        super::ice::IceChecker::new(
+            &eval,
+            &ctype,
+            &select,
+            &named_constant,
+            &is_builtin,
+            self.pre_c99,
+        )
+        .is_ice(expr)
+    }
+
+    /// An integer constant expression with the value 0.
+    fn is_integer_constant_zero(&self, expr: &Expr) -> bool {
+        self.is_integer_constant_expr(expr)
+            && self
+                .sema_const_eval()
+                .eval_required_constant(expr)
+                .is_some_and(|c| c.is_zero())
+    }
+
+    /// Whether `expr` is a null pointer constant (C23 6.3.2.3p3): an integer
+    /// constant expression with the value 0, one cast to `void *`, or the
+    /// predefined constant `nullptr` (which the parser spells `(nullptr_t)0`
+    /// through `TypeSpecifier::NullPtrT`, a specifier no source text names;
+    /// a written `(nullptr_t)0` goes through the typedef and is not one).
+    ///
+    /// Exactness matters beyond diagnostics: the type of `?:` depends on it,
+    /// and the kernel's `__is_constexpr(x)` -- `sizeof(int) == sizeof(*(8 ?
+    /// ((void *)((long)(x) * 0l)) : (int *)8))` -- selects code through that
+    /// type. The syntactic `const_arith` approximation knows no enumerators
+    /// (GCC 16.2: `__is_constexpr(N)` is 1 for an enumerator `N`; lccc said
+    /// 0 and took the other `__builtin_choose_expr` arm) and accepts any
+    /// cast of 0, `(char *)0` included.
+    pub fn is_null_pointer_constant(&self, expr: &Expr) -> bool {
+        matches!(expr, Expr::Cast(TypeSpecifier::NullPtrT, ..))
+            || self.is_integer_constant_zero(expr)
+            || self.is_void_pointer_null_constant(expr)
+    }
+
+    /// The `void *` form of a null pointer constant: an integer constant
+    /// zero cast to an unqualified `void *`, typedef names resolved (`(CNPT)0`
+    /// with `typedef const void *CNPT;` is not one). GCC accepts exactly this
+    /// shape where a named-address-space pointer is expected.
+    pub fn is_void_pointer_null_constant(&self, expr: &Expr) -> bool {
+        crate::common::const_arith::is_void_pointer_null_constant(
+            expr,
+            &|ts| {
+                if let TypeSpecifier::TypedefName(name) = ts {
+                    if self.types.qualified_pointee_typedefs.contains(name) {
+                        return false;
+                    }
+                }
+                self.resolve_type_spec(ts)
+                    == CType::Pointer(Box::new(CType::Void), AddressSpace::Default)
+            },
+            &|operand| self.is_integer_constant_zero(operand),
+        )
+    }
+
+    /// Whether `__builtin_choose_expr` with condition `cond` selects its
+    /// first operand ([`super::const_eval::SemaConstEval::eval_required_constant`];
+    /// a condition that is no constant has been diagnosed by sema).
+    fn choose_expr_takes_first(&self, cond: &Expr) -> bool {
+        self.sema_const_eval()
+            .eval_required_constant(cond)
+            .is_none_or(|c| c.is_nonzero())
+    }
+
+    fn sema_const_eval(&self) -> super::const_eval::SemaConstEval<'_> {
+        super::const_eval::SemaConstEval {
             types: self.types,
             symbols: self.symbols,
             functions: self.functions,
@@ -929,8 +1070,16 @@ impl<'a> ExprTypeChecker<'a> {
             expr_types: self.expr_types,
             builtin_policy: self.builtin_policy.clone(),
             folding_initializer: false,
-        };
-        evaluator.eval_const_expr(expr)?.to_i64()
+            pre_c99: self.pre_c99,
+            named_constants_only: false,
+        }
+    }
+
+    /// Evaluate a constant expression for array sizes and similar contexts.
+    /// Delegates to SemaConstEval for the full implementation, unifying
+    /// const_eval across all sema modules.
+    fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
+        self.sema_const_eval().eval_const_expr(expr)?.to_i64()
     }
 
     /// Resolve an anonymous struct or union with inline field declarations.
@@ -1053,7 +1202,7 @@ impl<'a> ExprTypeChecker<'a> {
     /// Return CType for known builtins.
     /// This is the CType-level equivalent of the lowerer's builtin_return_type (IrType).
     /// TODO: consolidate with sema/builtins.rs BuiltinInfo to avoid duplication.
-    fn builtin_return_ctype(name: &str) -> Option<CType> {
+    pub(crate) fn builtin_return_ctype(name: &str) -> Option<CType> {
         match name {
             // BMI2 BZHI returns its operand type.
             "__builtin_ia32_bzhi_si" => Some(CType::UInt),
@@ -1062,6 +1211,7 @@ impl<'a> ExprTypeChecker<'a> {
             "__builtin_inf"
             | "__builtin_huge_val"
             | "__builtin_nan"
+            | "__builtin_nans"
             | "__builtin_fma"
             | "__builtin_trunc"
             | "__builtin_rint"
@@ -1086,6 +1236,7 @@ impl<'a> ExprTypeChecker<'a> {
             "__builtin_inff"
             | "__builtin_huge_valf"
             | "__builtin_nanf"
+            | "__builtin_nansf"
             | "__builtin_fmaf"
             | "__builtin_truncf"
             | "__builtin_rintf"
@@ -1107,8 +1258,23 @@ impl<'a> ExprTypeChecker<'a> {
             "__builtin_infl"
             | "__builtin_huge_vall"
             | "__builtin_nanl"
+            | "__builtin_nansl"
             | "__builtin_fabsl"
             | "__builtin_nextafterl" => Some(CType::LongDouble),
+
+            // _Float128 builtins (sema/builtins.rs): binary128 results.
+            "__builtin_inff128"
+            | "__builtin_huge_valf128"
+            | "__builtin_nanf128"
+            | "__builtin_nansf128"
+            | "__builtin_copysignf128"
+            | "__builtin_fabsf128"
+            | "__builtin_infq"
+            | "__builtin_huge_valq"
+            | "__builtin_nanq"
+            | "__builtin_nansq"
+            | "__builtin_copysignq"
+            | "__builtin_fabsq" => Some(CType::Float128),
 
             // Integer-returning builtins
             "__builtin_fpclassify"

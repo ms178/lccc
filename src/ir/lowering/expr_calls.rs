@@ -678,6 +678,112 @@ impl Lowerer {
         }
         None
     }
+    /// The argument of a GCC `transparent_union` parameter whose type is a
+    /// MEMBER's, as the union's FIRST member value -- the scalar such a
+    /// parameter travels as (GCC passes the union with its first member's
+    /// ABI, and the callee side reads it so) -- with that member's IR type.
+    /// None keeps the argument as lowered: `key` is not a transparent union
+    /// with a scalar first member, or the argument is the union itself (an
+    /// aggregate argument, whose ABI path loads the first member through
+    /// its address). A member value used to be passed through unchanged,
+    /// right only when it already had the first member's representation:
+    /// `f(1.5f)` for `union { int i; float f; }` passed the float in %xmm0
+    /// (GCC: its bits in %edi), and before the union was marked at all,
+    /// `f(7)` was copied as a union from address 7.
+    ///
+    /// Sema admitted the argument (`transparent_member_accepts`): it matches
+    /// a member exactly, is pointer-shaped (pointer, array, function
+    /// designator) for a pointer member, has an enum's integer type, or is a
+    /// null pointer constant for a pointer member. It is converted to that
+    /// member, then reinterpreted as the first member through a union
+    /// temporary unless both share an IR type.
+    fn transparent_union_arg(
+        &mut self,
+        val: Operand,
+        arg_ty: IrType,
+        arg_ct: Option<&CType>,
+        key: &str,
+    ) -> Option<(Operand, IrType)> {
+        let ct = arg_ct.filter(|ct| !matches!(ct, CType::Union(k) if k.as_ref() == key))?;
+        let (size, first, member) = {
+            let layouts = self.types.borrow_struct_layouts();
+            let layout = layouts.get(key).filter(|l| l.is_transparent_union)?;
+            let members: Vec<&CType> = layout.fields.iter().map(|f| &f.ty).collect();
+            let first = (*members.first()?).clone();
+            if !(first.is_integer() || first.is_pointer_like()) {
+                return None;
+            }
+            let is_ptr_member = |m: &&&CType| m.is_pointer_like();
+            let pointer_shaped = ct.is_pointer_like() || matches!(ct, CType::Function(_));
+            let member = members
+                .iter()
+                .find(|m| **m == ct)
+                .or_else(|| {
+                    pointer_shaped
+                        .then(|| members.iter().find(is_ptr_member))
+                        .flatten()
+                })
+                .or_else(|| {
+                    ct.is_integer()
+                        .then(|| {
+                            members
+                                .iter()
+                                .find(|m| m.is_integer() && m.size() == ct.size())
+                                .or_else(|| members.iter().find(is_ptr_member))
+                        })
+                        .flatten()
+                })
+                .map_or_else(|| first.clone(), |m| (*m).clone());
+            (layout.size, first, member)
+        };
+        if member.is_struct_or_union() || member.is_vector() {
+            return None;
+        }
+        let first_ty = IrType::from_ctype(&first);
+        let member_ty = IrType::from_ctype(&member);
+        let converted = self.emit_implicit_cast(val, arg_ty, member_ty);
+        if member_ty == first_ty {
+            return Some((converted, first_ty));
+        }
+        let alloca = self.fresh_value();
+        let carrier = Self::packed_store_type(size);
+        self.emit(Instruction::Alloca {
+            dest: alloca,
+            size,
+            ty: carrier,
+            align: 0,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        // A member narrower than the union leaves the rest unspecified (GCC
+        // passes whatever the stack held); zero it for a deterministic image.
+        if self.ctype_size(&member) < size {
+            self.emit(Instruction::Store {
+                volatile: false,
+                val: Operand::Const(IrConst::zero(carrier)),
+                ptr: alloca,
+                ty: carrier,
+                seg_override: AddressSpace::Default,
+            });
+        }
+        self.emit(Instruction::Store {
+            volatile: false,
+            val: converted,
+            ptr: alloca,
+            ty: member_ty,
+            seg_override: AddressSpace::Default,
+        });
+        let dest = self.fresh_value();
+        self.emit(Instruction::Load {
+            dest,
+            ptr: alloca,
+            ty: first_ty,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        });
+        Some((Operand::Value(dest), first_ty))
+    }
+
     fn unpack_two_reg_return(&mut self, dest: Value, size: usize) -> Operand {
         let alloca = self.fresh_value();
         self.emit(Instruction::Alloca {
@@ -1232,10 +1338,6 @@ impl Lowerer {
                 .is_some_and(|(_, _, _, variadic)| *variadic);
 
         let mut arg_types = Vec::with_capacity(args.len());
-        // Track argument indices where a complex expression was converted to a
-        // scalar type (e.g., complex-to-bool). These should NOT get a
-        // struct_arg_size based on the original expression's CType.
-        let mut complex_converted_to_scalar: Vec<bool> = vec![false; args.len()];
         let arg_vals: Vec<Operand> = args
             .iter()
             .enumerate()
@@ -1344,7 +1446,6 @@ impl Lowerer {
                             if is_param_bool {
                                 let cast_val = self.lower_complex_to_bool(ptr, &arg_ct);
                                 arg_types.push(IrType::I8);
-                                complex_converted_to_scalar[i] = true;
                                 return cast_val;
                             }
                             let real_part = self.load_complex_real(ptr, &arg_ct);
@@ -1355,7 +1456,6 @@ impl Lowerer {
                                 .unwrap_or(comp_ir_ty);
                             let cast_val = self.emit_implicit_cast(real_part, comp_ir_ty, param_ty);
                             arg_types.push(param_ty);
-                            complex_converted_to_scalar[i] = true;
                             return cast_val;
                         }
                     }
@@ -1430,6 +1530,18 @@ impl Lowerer {
                     }
                 }
 
+                // A GCC transparent_union parameter travels as its FIRST
+                // member (see `transparent_union_arg`).
+                if let Some(CType::Union(key)) = param_ctypes.as_ref().and_then(|p| p.get(i)) {
+                    let arg_ct = self.get_expr_ctype(a);
+                    if let Some((v, ty)) =
+                        self.transparent_union_arg(val, arg_ty, arg_ct.as_ref(), key)
+                    {
+                        val = v;
+                        arg_ty = ty;
+                    }
+                }
+
                 let is_bool_param = param_bool_flags
                     .as_ref()
                     .is_some_and(|flags| i < flags.len() && flags[i]);
@@ -1440,7 +1552,7 @@ impl Lowerer {
                         arg_types.push(param_ty);
                         if is_bool_param {
                             // For _Bool params, normalize at source type before truncation.
-                            return self.emit_bool_normalize_typed(val, arg_ty);
+                            return self.emit_expr_bool_conversion(val, arg_ty, a);
                         }
                         // C23 decimals (either side) route through the libbid
                         // helpers, mirroring the _Float128 soft-float routing
@@ -1489,6 +1601,34 @@ impl Lowerer {
             })
             .collect();
 
+        // The C type that decides how each argument travels (C11 6.5.2.2p7).
+        // A prototyped non-aggregate parameter receives the argument
+        // converted as if by assignment, so the parameter's type decides:
+        // a _Float128 converted to a `double` parameter is an F64 in an XMM
+        // register, not a 16-byte carrier, and a `double` converted to a
+        // _Float128 parameter IS one (taking the expression type passed the
+        // 0/1 of `take_bool(q)` as the address of a 16-byte aggregate, and
+        // misaligned the i686 slot of `f(1, d)` for `f(int, _Float128)`).
+        // An aggregate argument already has its parameter's compatible type
+        // and keeps the expression type, which also resolves vector typedefs
+        // that a first-pass signature may lack; a transparent-union
+        // parameter receives a member value; variadic and unprototyped
+        // arguments are their (promoted) expression type.
+        let arg_abi_ctypes: Vec<Option<CType>> = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let expr_ct = self.get_expr_ctype(a);
+                let is_aggregate = |ct: &CType| ct.is_struct_or_union() || ct.is_vector();
+                match param_ctypes.as_ref().and_then(|p| p.get(i)) {
+                    Some(p) if !is_aggregate(p) && !expr_ct.as_ref().is_some_and(is_aggregate) => {
+                        Some(p.clone())
+                    }
+                    _ => expr_ct,
+                }
+            })
+            .collect();
+
         // Build struct_arg_sizes: for each arg, check if it's a struct/union by value
         let func_name = if let Expr::Identifier(name, _) = func {
             Some(name.as_str())
@@ -1511,18 +1651,12 @@ impl Lowerer {
             args.iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    // If Stage A already converted this complex argument to a scalar
-                    // (e.g., complex-to-bool or complex-to-real), the value is no
-                    // longer a struct-like type and must not get a struct_arg_size.
-                    if complex_converted_to_scalar.get(i).copied().unwrap_or(false) {
-                        return None;
-                    }
                     let registered = if i < sizes.len() { sizes[i] } else { None };
                     if registered.is_some() {
                         return registered;
                     }
                     // Fall back to expression-based inference for unregistered types
-                    let ctype = self.get_expr_ctype(a);
+                    let ctype = arg_abi_ctypes[i].clone();
                     let decomposes_cd = self.decomposes_complex_double();
                     let decomposes_cf = self.decomposes_complex_float();
                     match ctype {
@@ -1568,13 +1702,7 @@ impl Lowerer {
             args.iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    // If Stage A already converted this complex argument to a scalar
-                    // (e.g., complex-to-bool or complex-to-real), the value is no
-                    // longer a struct-like type and must not get a struct_arg_size.
-                    if complex_converted_to_scalar.get(i).copied().unwrap_or(false) {
-                        return None;
-                    }
-                    let ctype = self.get_expr_ctype(a);
+                    let ctype = arg_abi_ctypes[i].clone();
                     match ctype {
                         Some(CType::Struct(_)) | Some(CType::Union(_)) => {
                             if pre_call_variadic && self.dynamic_struct_value_size(a).is_some() {
@@ -1611,14 +1739,13 @@ impl Lowerer {
         // Build struct_arg_aligns: for each struct arg, record its alignment.
         // This is used by RISC-V to even-align register pairs for 2×XLEN-aligned structs
         // (e.g., struct containing long double with 16-byte alignment).
-        let struct_arg_aligns: Vec<Option<usize>> = args
+        let struct_arg_aligns: Vec<Option<usize>> = arg_abi_ctypes
             .iter()
             .enumerate()
-            .map(|(i, a)| {
+            .map(|(i, ctype)| {
                 struct_arg_sizes.get(i).copied().flatten()?;
-                let ctype = self.get_expr_ctype(a);
                 match ctype {
-                    Some(ref ct @ CType::Struct(_)) | Some(ref ct @ CType::Union(_)) => self
+                    Some(ct @ CType::Struct(_)) | Some(ct @ CType::Union(_)) => self
                         .get_struct_layout_for_ctype(ct)
                         .map(|layout| layout.align),
                     // Vectors carry their natural alignment (size for ext
@@ -1636,7 +1763,7 @@ impl Lowerer {
                     // `ctype_align` for vector params (func_lowering), so the
                     // caller and callee layouts agree. i686 (cap 4) and ARM
                     // (cap 16) clamp this through `stack_arg_align_cap`.
-                    Some(ref ct) if ct.is_vector() => Some(self.ctype_align(ct)),
+                    Some(ct) if ct.is_vector() => Some(self.ctype_align(ct)),
                     // _Float128/_Decimal128 args are 16-byte TFmode carriers:
                     // the i686 stack layout aligns them to 16 in the outgoing
                     // area (GCC i386 psABI), mirroring the struct_align Some(16)

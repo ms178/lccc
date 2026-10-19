@@ -111,7 +111,9 @@ pub trait TypeConvertContext {
             // === 22 primitive types (identical in sema and lowering) ===
             TypeSpecifier::Void => CType::Void,
             TypeSpecifier::Char => CType::Char,
+            TypeSpecifier::SignedChar => CType::SChar,
             TypeSpecifier::UnsignedChar => CType::UChar,
+            TypeSpecifier::PlainUnsignedChar => CType::PlainUChar,
             TypeSpecifier::Short => CType::Short,
             TypeSpecifier::UnsignedShort => CType::UShort,
             TypeSpecifier::Bool => CType::Bool,
@@ -232,6 +234,7 @@ pub trait TypeConvertContext {
             }
             TypeSpecifier::TypeofType(inner) => self.resolve_type_spec_to_ctype(inner),
             TypeSpecifier::AutoType => CType::Int,
+            TypeSpecifier::NullPtrT => CType::NullPtr,
 
             // === Divergent cases (delegated to implementors) ===
             TypeSpecifier::TypedefName(name) => self.resolve_typedef(name),
@@ -267,8 +270,23 @@ pub trait TypeConvertContext {
                 *struct_aligned,
                 reverse_sso.is_some_and(|v| v),
             ),
-            TypeSpecifier::Enum(name, variants, is_packed) => {
-                self.resolve_enum(name, variants, *is_packed)
+            TypeSpecifier::Enum(name, variants, is_packed, underlying) => {
+                let resolved = self.resolve_enum(name, variants, *is_packed);
+                let fixed = underlying.as_deref().and_then(|u| {
+                    crate::common::types::EnumType::fixed_underlying(
+                        self.resolve_type_spec_to_ctype(u),
+                    )
+                });
+                match (resolved, fixed) {
+                    (CType::Enum(mut et), Some(fixed)) => {
+                        et.fixed = Some(Box::new(fixed));
+                        CType::Enum(et)
+                    }
+                    // A context that resolves an enum to its compatible
+                    // integer type (lowering) takes the fixed type itself.
+                    (_, Some(fixed)) => fixed,
+                    (resolved, None) => resolved,
+                }
             }
             TypeSpecifier::Typeof(expr, _) => self.resolve_typeof_expr(expr),
             TypeSpecifier::Vector(inner, total_bytes) => {
@@ -288,6 +306,55 @@ pub trait TypeConvertContext {
                 }
             }
         }
+    }
+}
+
+/// The values of an enum body's enumerators (C11 6.7.2.2p3): an explicit
+/// value re-anchors the count, an implicit one continues it. `value` gives a
+/// variant's explicit value; where there is none, or it cannot be folded
+/// (sema reports that), the count continues.
+pub fn enum_variant_values(
+    variants: &[EnumVariant],
+    mut value: impl FnMut(&EnumVariant) -> Option<i64>,
+) -> Vec<(String, i64)> {
+    let mut next: i64 = 0;
+    variants
+        .iter()
+        .map(|v| {
+            if let Some(explicit) = value(v) {
+                next = explicit;
+            }
+            let entry = (v.name.clone(), next);
+            next = next.wrapping_add(1);
+            entry
+        })
+        .collect()
+}
+
+/// The enum type an `enum` specifier names in some context: `completed` is
+/// the definition visible for its tag, `underlying` the resolved C23 `: T`,
+/// `value` as for [`enum_variant_values`]. A body-less reference takes the
+/// visible definition's values, packing and fixed type.
+pub fn enum_type_of(
+    name: &Option<String>,
+    variants: &Option<Vec<EnumVariant>>,
+    is_packed: bool,
+    completed: Option<&crate::common::types::EnumType>,
+    underlying: Option<CType>,
+    value: impl FnMut(&EnumVariant) -> Option<i64>,
+) -> crate::common::types::EnumType {
+    crate::common::types::EnumType {
+        name: name.clone(),
+        variants: match variants {
+            Some(vars) => enum_variant_values(vars, value),
+            None => completed.map(|et| et.variants.clone()).unwrap_or_default(),
+        },
+        is_packed: is_packed || completed.is_some_and(|et| et.is_packed),
+        fixed: match (variants, underlying) {
+            (_, Some(u)) => crate::common::types::EnumType::fixed_underlying(u).map(Box::new),
+            (None, None) => completed.and_then(|et| et.fixed.clone()),
+            (Some(_), None) => None,
+        },
     }
 }
 

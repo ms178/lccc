@@ -2597,7 +2597,9 @@ impl I686Codegen {
     }
 
     /// _Float128 copysign: high dword = (x & ~sign) | (y & sign), low 12
-    /// bytes = x. Pure GPR; `shll $31` isolates y's sign bit.
+    /// bytes = x. Pure GPR; `andl $0x80000000` isolates y's sign bit (bit 31
+    /// of its high dword; a `shll $31` moved bit 0 there instead, so
+    /// `copysignf128(2.75Q, -3.25Q)` returned 2.75).
     fn emit_f128_copysign(&mut self, dest: &Option<Value>, x: &Operand, y: &Operand) {
         let Some(d) = dest else { return };
         let Some(dest_slot) = self.state.get_slot(d.0) else {
@@ -2656,7 +2658,7 @@ impl I686Codegen {
                         if let Some(y_slot) = self.state.get_slot(yv.0) {
                             let ysr = self.slot_ref_offset(y_slot, Self::F128_SIGN_DWORD_OFF);
                             emit!(self.state, "    movl {}, %ecx", ysr);
-                            self.state.emit("    shll $31, %ecx");
+                            self.state.emit("    andl $0x80000000, %ecx");
                             self.state.emit("    orl %ecx, %eax");
                         }
                     }

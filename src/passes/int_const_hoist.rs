@@ -15,6 +15,9 @@
 
 use super::loop_analysis;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::types::IrType;
+use crate::ir::analysis;
+use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 use std::cell::Cell;
 
 /// Target immediate-encoding model that drives the hoist decision. One
@@ -47,9 +50,101 @@ thread_local! {
 pub(crate) fn set_target_model(model: ImmModel) {
     MODEL.with(|c| c.set(model));
 }
-use crate::common::types::IrType;
-use crate::ir::analysis;
-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
+
+/// The immediate model of the targets this pass runs on (`None`: i686,
+/// where nothing it sees pays a 64-bit materialization).
+pub(crate) fn model_for(target: crate::backend::Target) -> Option<ImmModel> {
+    match target {
+        crate::backend::Target::Aarch64 => Some(ImmModel::Aarch64),
+        crate::backend::Target::Riscv64 => Some(ImmModel::Riscv),
+        crate::backend::Target::X86_64 => Some(ImmModel::X86_64),
+        _ => None,
+    }
+}
+
+/// Whether `model` materializes `c` into a register with ONE instruction
+/// that reads no register -- the case where rematerializing at a use never
+/// costs more than a spill reload, so a register held for it through a hot
+/// loop that does not use it can only lose (see `run`'s leaf-loop rule):
+///
+/// * x86-64: `movl $imm32` (zero-extends; every u32 and every 32-bit-typed
+///   constant) or `movq $simm32`. A 64-bit `movabsq` is excluded: ten bytes,
+///   the shape whose per-use cost the hoist exists to remove.
+/// * AArch64: one `movz` (at most one non-zero halfword) or one `movn` (at
+///   most one halfword other than 0xffff), in the constant's own width.
+///   Bitmask (`orr`) immediates are not modelled and count as costly -- the
+///   conservative side (such a constant keeps the unconditional hoist).
+/// * RISC-V: one `addi` (imm12) or one `lui` (a sign-extended 32-bit value
+///   with the low 12 bits clear).
+pub(crate) fn single_insn_materialization(model: ImmModel, c: &IrConst) -> bool {
+    let (v, wide) = match *c {
+        IrConst::I8(v) => (i64::from(v), false),
+        IrConst::I16(v) => (i64::from(v), false),
+        IrConst::I32(v) => (i64::from(v), false),
+        IrConst::I64(v) => (v, true),
+        _ => return false,
+    };
+    match model {
+        ImmModel::X86_64 => !wide || i32::try_from(v).is_ok() || u32::try_from(v).is_ok(),
+        ImmModel::Aarch64 => {
+            let (bits, halfwords) = if wide {
+                (v as u64, 4)
+            } else {
+                (u64::from(v as u32), 2)
+            };
+            let halfword = |i: u32| (bits >> (16 * i)) & 0xffff;
+            (0..halfwords).filter(|&i| halfword(i) != 0).count() <= 1
+                || (0..halfwords).filter(|&i| halfword(i) != 0xffff).count() <= 1
+        }
+        ImmModel::Riscv => {
+            (-2048..=2047).contains(&v) || (i32::try_from(v).is_ok() && v & 0xfff == 0)
+        }
+    }
+}
+
+/// The integer constant homes of `func` under `model`: every single-def
+/// `Copy dest = Const(c)` that feeds at least one operand position where
+/// this pass's own criterion ([`large_int_const_in`] with that position's
+/// `needs_reg`/`imm32_exact`) says `c` costs a materialization. Late passes
+/// that forward constant copies must spare these -- forwarding one re-sinks
+/// the `movabsq`/`movz`+`movk`/`lui`+`addi` (or AArch64's `mov` for a `mul`
+/// or `sdiv` operand, which has no immediate form at all) into every use.
+/// Position-exact on purpose: the pass hoists a small constant only for a
+/// register-only position, so a test on the constant alone cannot tell
+/// such a home from an ordinary copy.
+pub(crate) fn const_homes(func: &IrFunction, model: ImmModel) -> FxHashSet<u32> {
+    let mut consts: FxHashMap<u32, Option<IrConst>> = FxHashMap::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::Copy {
+            dest,
+            src: Operand::Const(c),
+        } = inst
+        {
+            // A second Copy definition poisons the entry (not single-def).
+            consts
+                .entry(dest.0)
+                .and_modify(|e| *e = None)
+                .or_insert(Some(*c));
+        }
+    }
+    let mut homes = FxHashSet::default();
+    if consts.is_empty() {
+        return homes;
+    }
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        for_each_int_operand_in(model, inst, &mut |op, needs_reg, imm32_exact| {
+            if let Operand::Value(v) = op {
+                if let Some(Some(c)) = consts.get(&v.0) {
+                    let op = Operand::Const(*c);
+                    if large_int_const_in(model, &op, needs_reg, imm32_exact).is_some() {
+                        homes.insert(v.0);
+                    }
+                }
+            }
+        });
+    }
+    homes
+}
 
 /// Run integer-constant hoisting on a function. Returns the number of
 /// distinct constants materialized in preheaders.
@@ -57,6 +152,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     if func.blocks.len() < 2 {
         return 0;
     }
+    // Never hoist into a sibling loop's header (see
+    // `loop_preheader::dedicate_foreign_preheaders`).
+    super::loop_preheader::dedicate_foreign_preheaders(func, loop_has_candidate);
     let cfg = analysis::CfgAnalysis::build(func);
     let mut loops = loop_analysis::merge_loops_by_header(loop_analysis::find_natural_loops(
         cfg.num_blocks,
@@ -71,15 +169,35 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     // possible and inner loops can reuse the dominating value.
     loops.sort_by_key(|l| l.body.len());
     loops.reverse();
+    // The candidate constants of every loop body, taken before any rewrite
+    // (an outer hoist turns the inner loops' operands into values).
+    let consts_in: Vec<FxHashSet<u64>> = loops
+        .iter()
+        .map(|lp| {
+            let mut set = FxHashSet::default();
+            for &bi in &lp.body {
+                for inst in &func.blocks[bi].instructions {
+                    for_each_int_operand(inst, &mut |op, needs_reg, imm32_exact| {
+                        if let Some(bits) = large_int_const(op, needs_reg, imm32_exact) {
+                            set.insert(bits);
+                        }
+                    });
+                }
+            }
+            set
+        })
+        .collect();
+    let leaves_in = leaf_subloops(&loops);
+    let model = MODEL.with(|c| c.get());
 
     // const bits -> (hoisted value id, body of the loop whose preheader defines it)
     let mut hoisted: FxHashMap<u64, (u32, FxHashSet<usize>)> = FxHashMap::default();
     let mut count = 0;
-    for lp in &loops {
+    for (li, lp) in loops.iter().enumerate() {
         let Some(preheader) = loop_analysis::find_preheader(lp.header, &lp.body, &cfg.preds) else {
             continue;
         };
-        // Distinct large constants used in this loop body.
+        // Distinct large constants used in this loop body, in program order.
         let mut consts: Vec<u64> = Vec::new();
         let mut seen: FxHashSet<u64> = FxHashSet::default();
         for &bi in &lp.body {
@@ -93,6 +211,21 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                 });
             }
         }
+        // A constant one register-free instruction rematerializes leaves
+        // this loop only if every leaf loop nested in it uses the constant:
+        // otherwise the hoisted register stays live through a hot leaf loop
+        // that gains nothing, to save one instruction per execution of a
+        // colder block -- and under pressure costs a spill there instead
+        // (measured: zlib_ng_adler32 held its `% 65521` reciprocal in %r15
+        // across the byte loop and spilled the block bound, +2 stack
+        // operands and a callee-saved push/pop). A leaf loop that uses it
+        // still hoists it to its own preheader when its turn comes.
+        consts.retain(|&bits| {
+            !single_insn_materialization(model, &IrConst::I64(bits as i64))
+                || leaves_in[li]
+                    .iter()
+                    .all(|&leaf| consts_in[leaf].contains(&bits))
+        });
 
         for bits in consts {
             // Reuse a previously hoisted value when its definition dominates
@@ -124,6 +257,45 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     count
 }
 
+/// For each loop (by index), the leaf loops strictly nested in it: loops
+/// whose body is a proper subset of its own and that contain no other loop.
+/// Loops merged by header are distinct bodies, so subset is nesting. A leaf
+/// loop has no leaves of its own. O(n^2) set tests over a function's natural
+/// loops, which stay few.
+fn leaf_subloops(loops: &[loop_analysis::NaturalLoop]) -> Vec<Vec<usize>> {
+    let inside = |inner: usize, outer: usize| {
+        inner != outer
+            && loops[inner].body.len() < loops[outer].body.len()
+            && loops[inner].body.is_subset(&loops[outer].body)
+    };
+    let is_leaf: Vec<bool> = (0..loops.len())
+        .map(|i| !(0..loops.len()).any(|j| inside(j, i)))
+        .collect();
+    (0..loops.len())
+        .map(|outer| {
+            (0..loops.len())
+                .filter(|&inner| is_leaf[inner] && inside(inner, outer))
+                .collect()
+        })
+        .collect()
+}
+
+/// Whether `run` would hoist anything for this loop.
+fn loop_has_candidate(func: &IrFunction, lp: &loop_analysis::NaturalLoop) -> bool {
+    let mut found = false;
+    for &bi in &lp.body {
+        for inst in &func.blocks[bi].instructions {
+            for_each_int_operand(inst, &mut |op, needs_reg, imm32_exact| {
+                found |= large_int_const(op, needs_reg, imm32_exact).is_some();
+            });
+            if found {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// An integer constant that is NOT encodable as a target immediate and so
 /// would be materialized into a register inside the loop:
 ///
@@ -149,6 +321,16 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 ///
 /// Returns the value as u64 bits.
 fn large_int_const(op: &Operand, needs_reg: bool, imm32_exact: bool) -> Option<u64> {
+    large_int_const_in(MODEL.with(|c| c.get()), op, needs_reg, imm32_exact)
+}
+
+/// [`large_int_const`] under an explicit model.
+fn large_int_const_in(
+    model: ImmModel,
+    op: &Operand,
+    needs_reg: bool,
+    imm32_exact: bool,
+) -> Option<u64> {
     let v: i64 = match op {
         Operand::Const(IrConst::I8(v)) => *v as i64,
         Operand::Const(IrConst::I16(v)) => *v as i64,
@@ -156,7 +338,6 @@ fn large_int_const(op: &Operand, needs_reg: bool, imm32_exact: bool) -> Option<u
         Operand::Const(IrConst::I64(v)) => *v,
         _ => return None,
     };
-    let model = MODEL.with(|c| c.get());
     if model == ImmModel::Riscv {
         // RISC-V: the backend stages EVERY integer constant through `li`
         // (the ALU emitters are register-form only — there is no imm32
@@ -236,6 +417,15 @@ fn large_int_const(op: &Operand, needs_reg: bool, imm32_exact: bool) -> Option<u
 /// pays a materialization there (Lev Kropp's 558e3ed9 insight, generalized
 /// per target).
 fn for_each_int_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand, bool, bool)) {
+    for_each_int_operand_in(MODEL.with(|c| c.get()), inst, f);
+}
+
+/// [`for_each_int_operand`] under an explicit immediate model.
+fn for_each_int_operand_in(
+    model: ImmModel,
+    inst: &Instruction,
+    f: &mut dyn FnMut(&Operand, bool, bool),
+) {
     match inst {
         Instruction::BinOp {
             op, lhs, rhs, ty, ..
@@ -246,7 +436,7 @@ fn for_each_int_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand, bool, bo
                 // take imm12, so a small constant is a materialization ONLY
                 // at that position. RISC-V has no immediate forms anywhere
                 // (uniform `li` staging), so `mul` is not special there.
-                IrBinOp::Mul => MODEL.with(|c| c.get()) == ImmModel::Aarch64,
+                IrBinOp::Mul => model == ImmModel::Aarch64,
                 _ => false,
             };
             // Shift counts are a separate encoding (imm8 / %cl) and never take
@@ -610,5 +800,438 @@ mod tests {
             assert_eq!(run(&mut func), 1);
             assert!(matches!(mul_rhs(&func), Operand::Value(_)));
         });
+    }
+
+    /// One block: `Copy %1 = Const(c)`, then `%3 = %2 <op> %1` in type `ty`
+    /// (and a second Copy of %1 when `twice`), returning %3.
+    fn home_func(c: IrConst, op: IrBinOp, ty: IrType, twice: bool) -> IrFunction {
+        let mut func = IrFunction::new("homes".to_string(), IrType::I64, vec![], false);
+        let mut instructions = vec![Instruction::Copy {
+            dest: Value(1),
+            src: Operand::Const(c),
+        }];
+        if twice {
+            instructions.push(Instruction::Copy {
+                dest: Value(1),
+                src: Operand::Const(c),
+            });
+        }
+        instructions.push(Instruction::Copy {
+            dest: Value(2),
+            src: Operand::Const(IrConst::I64(3)),
+        });
+        instructions.push(Instruction::BinOp {
+            dest: Value(3),
+            op,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Value(Value(1)),
+            ty,
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 4;
+        func
+    }
+
+    fn is_home(model: ImmModel, c: IrConst, op: IrBinOp, ty: IrType) -> bool {
+        const_homes(&home_func(c, op, ty, false), model).contains(&1)
+    }
+
+    /// The homes are exactly the copies this pass would have created for
+    /// their use positions: AArch64 hoists a small constant only for `mul`
+    /// / `sdiv` (no immediate form), so `#7` is a home there and not under
+    /// `add`; x86-64 64-bit forms sign-extend imm32 while 32-bit forms take
+    /// the bit pattern verbatim; RISC-V's boundary is imm12. %2 (a small
+    /// constant in the left position) is never a home, and a multiply
+    /// defined copy never is either.
+    #[test]
+    fn const_homes_follow_the_hoisting_criterion_per_position() {
+        use IrBinOp::{Add, Mul, SDiv};
+        use IrType::{I32, I64};
+        let a64 = ImmModel::Aarch64;
+        assert!(is_home(a64, IrConst::I64(7), Mul, I64));
+        assert!(is_home(a64, IrConst::I64(7), SDiv, I64));
+        assert!(!is_home(a64, IrConst::I64(7), Add, I64));
+        assert!(!is_home(a64, IrConst::I64(4095), Add, I64));
+        assert!(is_home(a64, IrConst::I64(4096), Add, I64));
+
+        let x86 = ImmModel::X86_64;
+        assert!(!is_home(x86, IrConst::I64(7), Mul, I64));
+        assert!(!is_home(x86, IrConst::I64(i32::MAX as i64), Add, I64));
+        assert!(is_home(x86, IrConst::I64(1 << 32), Add, I64));
+        assert!(is_home(x86, IrConst::I64(0x9e37_79b1), Mul, I64));
+        assert!(!is_home(x86, IrConst::I64(0x9e37_79b1), Mul, I32));
+        assert!(is_home(x86, IrConst::I64(1 << 40), SDiv, I64));
+
+        let rv = ImmModel::Riscv;
+        assert!(!is_home(rv, IrConst::I64(2047), Add, I64));
+        assert!(!is_home(rv, IrConst::I64(-2048), Mul, I64));
+        assert!(is_home(rv, IrConst::I64(2048), Add, I64));
+
+        for model in [a64, x86, rv] {
+            let f = home_func(IrConst::I64(1 << 40), Add, I64, false);
+            assert!(!const_homes(&f, model).contains(&2), "{model:?}");
+            let f = home_func(IrConst::I64(1 << 40), Add, I64, true);
+            assert!(const_homes(&f, model).is_empty(), "{model:?}");
+        }
+        assert_eq!(model_for(crate::backend::Target::I686), None);
+    }
+
+    // ---- frequency: never hoist into a sibling loop's header -------------
+
+    fn blk(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        }
+    }
+
+    fn counter_loop(
+        header: u32,
+        body: u32,
+        exit: u32,
+        entry: (Operand, u32),
+        iv: u32,
+        body_insts: Vec<Instruction>,
+    ) -> [BasicBlock; 2] {
+        let (next, cmp) = (iv + 1, iv + 2);
+        let mut insts = body_insts;
+        insts.push(Instruction::BinOp {
+            dest: Value(next),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(iv)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        });
+        [
+            blk(
+                header,
+                vec![
+                    Instruction::Phi {
+                        dest: Value(iv),
+                        ty: IrType::I32,
+                        incoming: vec![
+                            (entry.0, BlockId(entry.1)),
+                            (Operand::Value(Value(next)), BlockId(body)),
+                        ],
+                    },
+                    Instruction::Cmp {
+                        dest: Value(cmp),
+                        op: IrCmpOp::Slt,
+                        lhs: Operand::Value(Value(iv)),
+                        rhs: Operand::Const(IrConst::I32(64)),
+                        ty: IrType::I32,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(cmp)),
+                    true_label: BlockId(body),
+                    false_label: BlockId(exit),
+                },
+            ),
+            blk(body, insts, Terminator::Branch(BlockId(header))),
+        ]
+    }
+
+    /// Loop B's body multiplies by a constant that needs a register.
+    fn wide_mul(dest: u32, src: u32) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(Value(src)),
+            rhs: Operand::Const(IrConst::I64(0x1_0000_0000)),
+            ty: IrType::U64,
+        }
+    }
+
+    fn block_defining_copy_of(func: &IrFunction, bits: i64) -> usize {
+        func.blocks
+            .iter()
+            .position(|b| {
+                b.instructions.iter().any(|i| {
+                    matches!(i, Instruction::Copy { src: Operand::Const(IrConst::I64(v)), .. }
+                        if *v == bits)
+                })
+            })
+            .expect("hoisted copy")
+    }
+
+    /// zlib_ng_adler32's shape: loop A's header exits straight into loop B's
+    /// header, so A's header is B's unique outside predecessor. Appending
+    /// the hoisted copy there ran it once per A iteration (2,097,153 times,
+    /// and it cost A its bottom-test rotation). The copy must land in a new
+    /// dedicated block on the A-exit edge instead.
+    #[test]
+    fn hoist_never_lands_in_a_sibling_loop_header() {
+        let mut func = IrFunction::new("sibling".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(blk(
+            0,
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(0)),
+            }],
+            Terminator::Branch(BlockId(1)),
+        ));
+        let a = counter_loop(1, 2, 3, (Operand::Value(Value(0)), 0), 10, vec![]);
+        let b = counter_loop(
+            3,
+            4,
+            5,
+            (Operand::Value(Value(10)), 1),
+            20,
+            vec![wide_mul(30, 20)],
+        );
+        func.blocks.extend(a);
+        func.blocks.extend(b);
+        func.blocks.push(blk(
+            5,
+            vec![],
+            Terminator::Return(Some(Operand::Value(Value(20)))),
+        ));
+        func.next_value_id = 31;
+        func.next_label = 6;
+        let a_header_len = func.blocks[1].instructions.len();
+
+        assert_eq!(run(&mut func), 1);
+
+        let home = block_defining_copy_of(&func, 0x1_0000_0000);
+        let home_label = func.blocks[home].label;
+        assert!(
+            home_label.0 >= 6,
+            "copy must live in a new block, got {home_label:?}"
+        );
+        assert!(matches!(
+            func.blocks[home].terminator,
+            Terminator::Branch(BlockId(3))
+        ));
+        let a_header = func.blocks.iter().find(|b| b.label == BlockId(1)).unwrap();
+        assert_eq!(
+            a_header.instructions.len(),
+            a_header_len,
+            "loop A's header gained code"
+        );
+        assert!(matches!(&a_header.terminator,
+            Terminator::CondBranch { false_label, .. } if *false_label == home_label));
+        let b_header = func.blocks.iter().find(|b| b.label == BlockId(3)).unwrap();
+        let Instruction::Phi { incoming, .. } = &b_header.instructions[0] else {
+            panic!("expected B's phi");
+        };
+        assert!(incoming.iter().any(|(_, l)| *l == home_label));
+        assert!(incoming.iter().all(|(_, l)| *l != BlockId(1)));
+    }
+
+    /// A guard block outside every loop runs at most once per entry: no
+    /// block is spent on it and the copy goes to the guard as before.
+    #[test]
+    fn guard_preheader_is_not_split() {
+        let mut func = IrFunction::new("guarded".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(blk(
+            0,
+            vec![Instruction::Copy {
+                dest: Value(0),
+                src: Operand::Const(IrConst::I32(0)),
+            }],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(1),
+                false_label: BlockId(3),
+            },
+        ));
+        func.blocks.extend(counter_loop(
+            1,
+            2,
+            3,
+            (Operand::Value(Value(0)), 0),
+            10,
+            vec![wide_mul(30, 10)],
+        ));
+        func.blocks.push(blk(
+            3,
+            vec![],
+            Terminator::Return(Some(Operand::Value(Value(0)))),
+        ));
+        func.next_value_id = 31;
+        func.next_label = 4;
+
+        assert_eq!(run(&mut func), 1);
+
+        assert_eq!(func.blocks.len(), 4, "no block for a guard preheader");
+        assert_eq!(
+            func.blocks[block_defining_copy_of(&func, 0x1_0000_0000)].label,
+            BlockId(0)
+        );
+    }
+
+    /// entry -> outer header -> inner header <-> inner body; inner header ->
+    /// outer latch -> outer header; outer header -> exit. One `%10 = %9 * K`
+    /// (64-bit) sits in the inner body (`in_leaf`) or in the outer latch.
+    fn nested_loops(k: IrConst, in_leaf: bool) -> IrFunction {
+        let mut func = IrFunction::new("nested".to_string(), IrType::I64, vec![], false);
+        let use_k = Instruction::BinOp {
+            dest: Value(10),
+            op: IrBinOp::Mul,
+            lhs: Operand::Value(Value(9)),
+            rhs: Operand::Const(k),
+            ty: IrType::I64,
+        };
+        let (inner_body, latch) = if in_leaf {
+            (vec![use_k], vec![])
+        } else {
+            (vec![], vec![use_k])
+        };
+        let cond = |t: u32, f: u32| Terminator::CondBranch {
+            cond: Operand::Value(Value(0)),
+            true_label: BlockId(t),
+            false_label: BlockId(f),
+        };
+        let blocks = [
+            (
+                vec![
+                    Instruction::Copy {
+                        dest: Value(0),
+                        src: Operand::Const(IrConst::I64(1)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(9),
+                        src: Operand::Const(IrConst::I64(3)),
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            (vec![], cond(2, 5)),
+            (vec![], cond(3, 4)),
+            (inner_body, Terminator::Branch(BlockId(2))),
+            (latch, Terminator::Branch(BlockId(1))),
+            (vec![], Terminator::Return(Some(Operand::Value(Value(0))))),
+        ];
+        for (id, (instructions, terminator)) in blocks.into_iter().enumerate() {
+            func.blocks.push(BasicBlock {
+                label: BlockId(id as u32),
+                instructions,
+                terminator,
+                source_spans: Vec::new(),
+            });
+        }
+        func.next_value_id = 11;
+        func
+    }
+
+    /// The multiplier operand of `%10`, wherever the pass left it.
+    fn use_rhs(func: &IrFunction) -> Operand {
+        func.blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .find_map(|inst| match inst {
+                Instruction::BinOp {
+                    dest: Value(10),
+                    rhs,
+                    ..
+                } => Some(rhs.clone()),
+                _ => None,
+            })
+            .expect("the multiply survives")
+    }
+
+    /// x86-64 leaf-loop rule. adler32's `% 65521` reciprocal (one `movl`)
+    /// used only in the outer loop's own block stays at its use: hoisting it
+    /// would hold a register through the leaf loop for nothing. Used inside
+    /// the leaf loop it is hoisted. A `movabsq` constant is hoisted either
+    /// way -- its per-use cost is what the pass exists to remove.
+    #[test]
+    fn single_insn_constants_hoist_only_into_loops_whose_leaves_use_them() {
+        let recip = IrConst::I64(0x8007_8071);
+        let mut f = nested_loops(recip, false);
+        run(&mut f);
+        assert_eq!(use_rhs(&f), Operand::Const(recip));
+
+        let mut f = nested_loops(recip, true);
+        assert!(run(&mut f) > 0);
+        assert!(matches!(use_rhs(&f), Operand::Value(_)));
+
+        let wide = IrConst::I64(1 << 40);
+        let mut f = nested_loops(wide, false);
+        assert!(run(&mut f) > 0);
+        assert!(matches!(use_rhs(&f), Operand::Value(_)));
+    }
+
+    #[test]
+    fn leaf_subloops_lists_strictly_nested_leaves() {
+        let body = |b: &[usize]| loop_analysis::NaturalLoop {
+            header: b[0],
+            body: b.iter().copied().collect(),
+        };
+        // outer {1..=6} holds leaves {2,3} and {5,6}; {2,3} has none.
+        let loops = vec![body(&[1, 2, 3, 4, 5, 6]), body(&[2, 3]), body(&[5, 6])];
+        let leaves = leaf_subloops(&loops);
+        assert_eq!(leaves[0], vec![1, 2]);
+        assert!(leaves[1].is_empty() && leaves[2].is_empty());
+    }
+
+    /// The single-instruction set is exactly what each backend encodes in
+    /// one register-free instruction (see [`single_insn_materialization`]).
+    #[test]
+    fn single_insn_materialization_matches_the_encodings() {
+        let x86 = ImmModel::X86_64;
+        // adler32's `% 65521` reciprocal: one `movl` (zero-extending).
+        assert!(single_insn_materialization(x86, &IrConst::I64(0x8007_8071)));
+        assert!(single_insn_materialization(
+            x86,
+            &IrConst::I64(u32::MAX as i64)
+        ));
+        assert!(single_insn_materialization(
+            x86,
+            &IrConst::I64(i32::MIN as i64)
+        ));
+        assert!(single_insn_materialization(x86, &IrConst::I32(-1)));
+        // `movabsq` territory stays costly.
+        assert!(!single_insn_materialization(x86, &IrConst::I64(1 << 32)));
+        assert!(!single_insn_materialization(
+            x86,
+            &IrConst::I64(i32::MIN as i64 - 1)
+        ));
+        assert!(!single_insn_materialization(
+            x86,
+            &IrConst::I64(0x9e37_79b9_7f4a_7c15_u64 as i64)
+        ));
+
+        let a64 = ImmModel::Aarch64;
+        assert!(single_insn_materialization(a64, &IrConst::I64(7)));
+        assert!(single_insn_materialization(
+            a64,
+            &IrConst::I64(0xffff << 48)
+        ));
+        assert!(single_insn_materialization(a64, &IrConst::I64(-2))); // movn
+        assert!(single_insn_materialization(a64, &IrConst::I32(-65536))); // movn w
+        assert!(!single_insn_materialization(
+            a64,
+            &IrConst::I64(0x8007_8071)
+        ));
+        assert!(!single_insn_materialization(
+            a64,
+            &IrConst::I32(0x1234_5678)
+        ));
+        assert!(!single_insn_materialization(
+            a64,
+            &IrConst::I64(0xffff_0000_ffff)
+        ));
+
+        let rv = ImmModel::Riscv;
+        assert!(single_insn_materialization(rv, &IrConst::I64(2047)));
+        assert!(single_insn_materialization(rv, &IrConst::I64(-2048)));
+        assert!(single_insn_materialization(rv, &IrConst::I64(0x7fff_f000)));
+        assert!(single_insn_materialization(rv, &IrConst::I64(-0x8000_0000)));
+        assert!(!single_insn_materialization(rv, &IrConst::I64(2048)));
+        assert!(!single_insn_materialization(rv, &IrConst::I64(0x8000_0000)));
+        assert!(!single_insn_materialization(rv, &IrConst::I64(0x1001)));
+
+        for model in [x86, a64, rv] {
+            assert!(!single_insn_materialization(model, &IrConst::F64(1.0)));
+        }
     }
 }

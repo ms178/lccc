@@ -25,7 +25,7 @@ use super::helpers::{
 };
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
-    LazyDeadness, fam_written_only_as_dest, function_range, is_writable_family_gpr,
+    CfiIndex, LazyDeadness, fam_written_only_as_dest, function_range, is_writable_family_gpr,
     line_refs_family, plain_gp_operand, provably_dead_lv, rbp_is_gpr_in_function,
     splice_lea_into_mem_operand, split_two_operands,
 };
@@ -4678,15 +4678,18 @@ pub(super) fn coalesce_phi_register_copies(store: &mut LineStore, infos: &mut [L
 /// the enclosing function vetoes the hoist. (`loop_is_single_entry` is the
 /// fall-through-entry variant — it forbids the entry edge itself — so it
 /// cannot be reused here.)
+///
+/// `func_range` is the enclosing function's [`function_range`] of `header`
+/// (the whole store when it has no CFI).
 fn loop_entry_is_unique(
     store: &LineStore,
     infos: &[LineInfo],
+    (func_start, func_end): (usize, usize),
     header: usize,
     latch: usize,
     entry: usize,
     fallthrough_ok: bool,
 ) -> bool {
-    let (func_start, func_end) = function_range(store, infos, header).unwrap_or((0, store.len()));
     let mut labels: Vec<&str> = Vec::new();
     for n in header..=latch {
         if !infos[n].is_nop() && infos[n].kind == LineKind::Label {
@@ -4793,6 +4796,19 @@ pub(super) fn hoist_loop_invariant_gpr_load(
 ) -> bool {
     let mut len = store.len();
     let mut changed = false;
+    // Per-pass indices (one scan each, not one per back-edge): function
+    // boundaries and label positions.  The pass never rewrites, nops or
+    // inserts a label or CFI line; its single `insert_line` shifts both.
+    use crate::common::fx_hash::FxHashMap;
+    let mut cfi = CfiIndex::build(store, infos);
+    let mut label_at: FxHashMap<String, usize> = FxHashMap::default();
+    for (n, info) in infos.iter().enumerate().take(len) {
+        if info.kind == LineKind::Label {
+            label_at
+                .entry(info.trimmed(store.get(n)).to_string())
+                .or_insert(n);
+        }
+    }
 
     let mut i = 0;
     while i < len {
@@ -4828,19 +4844,11 @@ pub(super) fn hoist_loop_invariant_gpr_load(
         }
         let target_label = format!("{}:", target);
 
-        // Find the target label (must be before the branch = back-edge)
-        let mut header_pos = None;
-        for lbl in 0..i {
-            if infos[lbl].kind == LineKind::Label {
-                if infos[lbl].trimmed(store.get(lbl)) == target_label {
-                    header_pos = Some(lbl);
-                    break;
-                }
-            }
-        }
-        let header = match header_pos {
-            Some(h) => h,
-            None => {
+        // Find the target label (must be before the branch = back-edge):
+        // its first occurrence, which precedes `i` iff any occurrence does.
+        let header = match label_at.get(&target_label) {
+            Some(&h) if h < i => h,
+            _ => {
                 i += 1;
                 continue;
             }
@@ -4855,9 +4863,8 @@ pub(super) fn hoist_loop_invariant_gpr_load(
         // The scan never crosses the enclosing function's start (without
         // CFI the range defaults to the whole file, i.e. today's behavior):
         // an entry above the function label would rewrite another function.
-        let func_start = function_range(store, infos, header)
-            .map(|(s, _)| s)
-            .unwrap_or(0);
+        let header_fn = cfi.function_range(header, len);
+        let func_start = header_fn.map(|(s, _)| s).unwrap_or(0);
         let mut entry_jmp: Option<usize> = None;
         let mut p = header;
         while p > func_start {
@@ -4961,7 +4968,15 @@ pub(super) fn hoist_loop_invariant_gpr_load(
         }
         if has_ret
             || has_call
-            || !loop_entry_is_unique(store, infos, header, i, entry, insert_entry.is_some())
+            || !loop_entry_is_unique(
+                store,
+                infos,
+                header_fn.unwrap_or((0, len)),
+                header,
+                i,
+                entry,
+                insert_entry.is_some(),
+            )
         {
             i += 1;
             continue;
@@ -4977,9 +4992,7 @@ pub(super) fn hoist_loop_invariant_gpr_load(
         }
         // Rule 6 scans to the enclosing function's end (past-the-end on
         // missing CFI: scanning into the next function only over-refuses).
-        let func_end = function_range(store, infos, i)
-            .map(|(_, e)| e)
-            .unwrap_or(len);
+        let func_end = cfi.function_range(i, len).map(|(_, e)| e).unwrap_or(len);
 
         // Scan body for movq OFFSET(%rsp), %REG (or %rbp) candidates.
         // Only hoist one load per loop per pass (to avoid interactions).
@@ -5240,6 +5253,12 @@ pub(super) fn hoist_loop_invariant_gpr_load(
                         // candidate `pos` (always > ins: the candidate is
                         // inside the loop, the insertion before its header).
                         store.insert_line(ins, lea_text.clone());
+                        cfi.shift_for_insert(ins);
+                        for at in label_at.values_mut() {
+                            if *at >= ins {
+                                *at += 1;
+                            }
+                        }
                         let new_info = classify_line(&lea_text);
                         // Vec splice: the pass contract keeps
                         // `infos.len() == store.len()` — both grew by

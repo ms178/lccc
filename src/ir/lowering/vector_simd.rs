@@ -240,7 +240,10 @@ impl Lowerer {
             let ptr = self.vector_operand_ptr(e, &ct);
             self.emit_vec_load(shape, ptr)
         } else {
-            let src_ty = self.get_expr_type(e);
+            // The width of the bits lower_expr produces (`i - 3` is I32),
+            // not get_expr_type's widened storage type: converting from I64
+            // zero-extended a negative int before cvtsi2sdq.
+            let src_ty = self.value_ir_type(e);
             let lowered = self.lower_expr(e);
             let scalar = self.emit_implicit_cast(lowered, src_ty, shape.elem_ir);
             self.emit_vec_splat(shape, scalar)

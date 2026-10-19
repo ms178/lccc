@@ -707,6 +707,11 @@ impl Lowerer {
             orig_param.fptr_params.is_some() && orig_param.fptr_inner_ptr_depth >= 2;
 
         let name = orig_param.name.clone().unwrap_or_default();
+        let base_const = crate::common::qualifiers::type_name_const_base(
+            &orig_param.type_spec,
+            orig_param.is_const,
+            self,
+        );
         self.insert_local_scoped(
             name,
             LocalInfo {
@@ -723,6 +728,7 @@ impl Lowerer {
                     address_space: AddressSpace::Default,
                     explicit_alignment: None,
                     type_align: None,
+                    base_const,
                 },
                 alloca,
                 alloc_size: param_size,
@@ -733,7 +739,6 @@ impl Lowerer {
                 asm_register: None,
                 asm_register_has_init: false,
                 cleanup_fn: None,
-                is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
                 // Parameter declarators do not record the object qualifier yet.
                 object_volatile: false,
@@ -792,6 +797,11 @@ impl Lowerer {
         let c_type = Some(self.type_spec_to_ctype(&orig_param.type_spec));
 
         let name = orig_param.name.clone().unwrap_or_default();
+        let base_const = crate::common::qualifiers::type_name_const_base(
+            &orig_param.type_spec,
+            orig_param.is_const,
+            self,
+        );
         self.insert_local_scoped(
             name,
             LocalInfo {
@@ -808,6 +818,7 @@ impl Lowerer {
                     address_space: AddressSpace::Default,
                     explicit_alignment: None,
                     type_align: None,
+                    base_const,
                 },
                 alloca,
                 alloc_size: size,
@@ -818,7 +829,6 @@ impl Lowerer {
                 asm_register: None,
                 asm_register_has_init: false,
                 cleanup_fn: None,
-                is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
                 // Parameter declarators do not record the object qualifier yet.
                 object_volatile: false,
@@ -878,6 +888,11 @@ impl Lowerer {
     fn register_packed_complex_float_param(&mut self, orig_param: &ParamDecl, alloca: Value) {
         let ct = self.type_spec_to_ctype(&orig_param.type_spec);
         let name = orig_param.name.clone().unwrap_or_default();
+        let base_const = crate::common::qualifiers::type_name_const_base(
+            &orig_param.type_spec,
+            orig_param.is_const,
+            self,
+        );
         self.insert_local_scoped(
             name,
             LocalInfo {
@@ -894,6 +909,7 @@ impl Lowerer {
                     address_space: AddressSpace::Default,
                     explicit_alignment: None,
                     type_align: None,
+                    base_const,
                 },
                 alloca,
                 alloc_size: 8,
@@ -904,7 +920,6 @@ impl Lowerer {
                 asm_register: None,
                 asm_register_has_init: false,
                 cleanup_fn: None,
-                is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
                 // Parameter declarators do not record the object qualifier yet.
                 object_volatile: false,
@@ -975,6 +990,11 @@ impl Lowerer {
         });
 
         let name = orig_param.name.clone().unwrap_or_default();
+        let base_const = crate::common::qualifiers::type_name_const_base(
+            &orig_param.type_spec,
+            orig_param.is_const,
+            self,
+        );
         self.func_mut().locals.insert(
             name,
             LocalInfo {
@@ -991,6 +1011,7 @@ impl Lowerer {
                     address_space: AddressSpace::Default,
                     explicit_alignment: None,
                     type_align: None,
+                    base_const,
                 },
                 alloca: complex_alloca,
                 alloc_size: complex_size,
@@ -1001,7 +1022,6 @@ impl Lowerer {
                 asm_register: None,
                 asm_register_has_init: false,
                 cleanup_fn: None,
-                is_const: orig_param.is_const,
                 base_type_volatile: orig_param.is_volatile,
                 // Parameter declarators do not record the object qualifier yet.
                 object_volatile: false,
@@ -1339,77 +1359,86 @@ impl Lowerer {
             }
         }
 
-        // Now emit runtime stride computations
         for (param_name, dim_infos) in vla_params {
-            let num_strides = dim_infos.len() + 1; // +1 for base element size
-            let mut vla_strides: Vec<Option<Value>> = vec![None; num_strides];
-
-            let base_elem_size = dim_infos.last().map_or(1, |d| d.base_elem_size);
-            let mut current_stride: Option<Value> = None;
-            let mut current_const_stride = base_elem_size;
-
-            // Process dimensions from innermost to outermost
-            for (i, dim_info) in dim_infos.iter().enumerate().rev() {
-                if dim_info.is_vla {
-                    let ptr_int_ty = crate::common::types::target_int_ir_type();
-                    let dim_val = if let Some(ref expr) = dim_info.dim_expr {
-                        let op = self.lower_expr(expr);
-                        let expr_ty = self.get_expr_type(expr);
-                        let casted = self.emit_implicit_cast(op, expr_ty, ptr_int_ty);
-                        match casted {
-                            Operand::Value(v) => v,
-                            Operand::Const(c) => {
-                                let v = self.fresh_value();
-                                self.emit(Instruction::Copy {
-                                    dest: v,
-                                    src: Operand::Const(c),
-                                });
-                                v
-                            }
-                        }
-                    } else {
-                        self.load_vla_dim_value(&dim_info.dim_expr_name)
-                    };
-                    let stride_val = if let Some(prev) = current_stride {
-                        self.emit_binop_val(
-                            IrBinOp::Mul,
-                            Operand::Value(dim_val),
-                            Operand::Value(prev),
-                            ptr_int_ty,
-                        )
-                    } else {
-                        self.emit_binop_val(
-                            IrBinOp::Mul,
-                            Operand::Value(dim_val),
-                            Operand::Const(IrConst::ptr_int(current_const_stride as i64)),
-                            ptr_int_ty,
-                        )
-                    };
-                    vla_strides[i] = Some(stride_val);
-                    current_stride = Some(stride_val);
-                    current_const_stride = 0;
-                } else {
-                    let const_dim = dim_info.const_size.unwrap_or(1) as usize;
-                    if let Some(prev) = current_stride {
-                        let ptr_int_ty = crate::common::types::target_int_ir_type();
-                        let result = self.emit_binop_val(
-                            IrBinOp::Mul,
-                            Operand::Value(prev),
-                            Operand::Const(IrConst::ptr_int(const_dim as i64)),
-                            ptr_int_ty,
-                        );
-                        vla_strides[i] = Some(result);
-                        current_stride = Some(result);
-                    } else {
-                        current_const_stride *= const_dim;
-                    }
-                }
-            }
-
+            let vla_strides = self.emit_vla_pointee_strides(&dim_infos);
             if let Some(local) = self.func_mut().locals.get_mut(&param_name) {
                 local.vla_strides = vla_strides;
             }
         }
+    }
+
+    /// Emit the runtime strides of a pointer to `dim_infos` (outermost
+    /// dimension first): `strides[d]` is the byte size of what `d + 1`
+    /// subscripts reach, `None` where it is a compile-time constant.
+    pub(super) fn emit_vla_pointee_strides(
+        &mut self,
+        dim_infos: &[VlaDimInfo],
+    ) -> Vec<Option<Value>> {
+        let num_strides = dim_infos.len() + 1; // +1 for base element size
+        let mut vla_strides: Vec<Option<Value>> = vec![None; num_strides];
+
+        let base_elem_size = dim_infos.last().map_or(1, |d| d.base_elem_size);
+        let mut current_stride: Option<Value> = None;
+        let mut current_const_stride = base_elem_size;
+
+        // Process dimensions from innermost to outermost
+        for (i, dim_info) in dim_infos.iter().enumerate().rev() {
+            if dim_info.is_vla {
+                let ptr_int_ty = crate::common::types::target_int_ir_type();
+                let dim_val = if let Some(ref expr) = dim_info.dim_expr {
+                    let op = self.lower_expr(expr);
+                    let expr_ty = self.value_ir_type(expr);
+                    let casted = self.emit_implicit_cast(op, expr_ty, ptr_int_ty);
+                    match casted {
+                        Operand::Value(v) => v,
+                        Operand::Const(c) => {
+                            let v = self.fresh_value();
+                            self.emit(Instruction::Copy {
+                                dest: v,
+                                src: Operand::Const(c),
+                            });
+                            v
+                        }
+                    }
+                } else {
+                    self.load_vla_dim_value(&dim_info.dim_expr_name)
+                };
+                let stride_val = if let Some(prev) = current_stride {
+                    self.emit_binop_val(
+                        IrBinOp::Mul,
+                        Operand::Value(dim_val),
+                        Operand::Value(prev),
+                        ptr_int_ty,
+                    )
+                } else {
+                    self.emit_binop_val(
+                        IrBinOp::Mul,
+                        Operand::Value(dim_val),
+                        Operand::Const(IrConst::ptr_int(current_const_stride as i64)),
+                        ptr_int_ty,
+                    )
+                };
+                vla_strides[i] = Some(stride_val);
+                current_stride = Some(stride_val);
+                current_const_stride = 0;
+            } else {
+                let const_dim = dim_info.const_size.unwrap_or(1) as usize;
+                if let Some(prev) = current_stride {
+                    let ptr_int_ty = crate::common::types::target_int_ir_type();
+                    let result = self.emit_binop_val(
+                        IrBinOp::Mul,
+                        Operand::Value(prev),
+                        Operand::Const(IrConst::ptr_int(const_dim as i64)),
+                        ptr_int_ty,
+                    );
+                    vla_strides[i] = Some(result);
+                    current_stride = Some(result);
+                } else {
+                    current_const_stride *= const_dim;
+                }
+            }
+        }
+        vla_strides
     }
 
     /// Load the value of a VLA dimension variable (a function parameter).
@@ -1506,10 +1535,7 @@ impl Lowerer {
         // Match the lowering behavior: only push a scope (increment depth) when the
         // compound statement contains declarations. Declaration-free compound statements
         // don't push a scope in lower_compound_stmt, so we must not increment depth here.
-        let has_declarations = compound.items.iter().any(|item| {
-            matches!(item, BlockItem::Declaration(_))
-                || matches!(item, BlockItem::NestedFunction(_))
-        });
+        let has_declarations = Self::block_needs_scope(compound);
         let inner_depth = if has_declarations { depth + 1 } else { depth };
         for item in &compound.items {
             match item {

@@ -1,0 +1,93 @@
+# Sign/zero-extension operand widths (movs*/movz* with size suffixes).
+# GNU as checks every register operand against the width its suffix spells;
+# lccc's encoders once encoded the suffix width regardless, which hid a
+# codegen defect (`movswq slot, %eax`, a short return at -O0) behind -S
+# output GAS refuses.  Valid forms must encode byte-identically; every
+# mismatch must be refused by both assemblers, one instruction per case.
+
+;;; movext_valid_forms
+.text
+movsbw %al, %ax
+movsbl %al, %eax
+movsbq %al, %rax
+movswl %ax, %eax
+movswq %ax, %rax
+movslq %eax, %rax
+movzbw %al, %ax
+movzbl %al, %eax
+movzbq %al, %rax
+movzwl %ax, %eax
+movzwq %ax, %rax
+movsbl %ah, %ecx
+movzbl %bh, %edx
+movsbq %sil, %r9
+movzbl %r15b, %r8d
+movswq %r10w, %r11
+movslq %r12d, %r13
+movsbq (%rax), %rax
+movswq -252(%rbp), %rax
+movswl -252(%rbp), %eax
+movsbl 7(%rsp), %eax
+movzbl (%rdi,%rsi,1), %ecx
+movzwq 8(%rdx), %r14
+movslq (%rcx), %r8
+
+;;; movext_reject_00 reject
+.text
+movswq -252(%rbp), %eax
+
+;;; movext_reject_01 reject
+.text
+movsbq -8(%rbp), %eax
+
+;;; movext_reject_02 reject
+.text
+movswq %ax, %eax
+
+;;; movext_reject_03 reject
+.text
+movswl %ax, %rax
+
+;;; movext_reject_04 reject
+.text
+movsbl %ax, %eax
+
+;;; movext_reject_05 reject
+.text
+movsbl %al, %ax
+
+;;; movext_reject_06 reject
+.text
+movswl %al, %eax
+
+;;; movext_reject_07 reject
+.text
+movslq %eax, %eax
+
+;;; movext_reject_08 reject
+.text
+movslq %ax, %rax
+
+;;; movext_reject_09 reject
+.text
+movzbq (%rax), %eax
+
+;;; movext_reject_10 reject
+.text
+movzwl %ax, %rax
+
+;;; movext_reject_11 reject
+.text
+movzbl %ax, %eax
+
+;;; movext_reject_12 reject
+.text
+movzwq %al, %rax
+
+;;; movext_reject_13 reject
+.text
+movzbw %al, %eax
+
+;;; movext_reject_14 reject
+.text
+movzbl %al, %r8w

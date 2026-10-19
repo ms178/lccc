@@ -16,7 +16,7 @@ use super::ast::*;
 use super::parse::Parser;
 use crate::common::source::Span;
 use crate::common::types::AddressSpace;
-use crate::frontend::lexer::token::TokenKind;
+use crate::frontend::lexer::token::{TokenKind, UnicodeCharKind};
 
 /// Build the AST node for an `L"..."` literal, honouring `-fshort-wchar`.
 ///
@@ -103,7 +103,9 @@ impl Parser {
                 // 10-byte x87 lane stride are resolved by `ExtVectorLayout`.
                 TypeSpecifier::LongDouble => return Some(16),
                 TypeSpecifier::Char
+                | TypeSpecifier::SignedChar
                 | TypeSpecifier::UnsignedChar
+                | TypeSpecifier::PlainUnsignedChar
                 | TypeSpecifier::Short
                 | TypeSpecifier::UnsignedShort
                 | TypeSpecifier::Int
@@ -287,7 +289,10 @@ impl Parser {
         let mut volatile_before_star = false;
         for n in 0..64 {
             match self.peek_nth(n) {
-                TokenKind::Const if before_first_star => q.pointee_qualified = true,
+                TokenKind::Const if before_first_star => {
+                    q.pointee_qualified = true;
+                    q.base_const = true;
+                }
                 TokenKind::Volatile if before_first_star => {
                     q.pointee_qualified = true;
                     if depth == 0 {
@@ -806,6 +811,48 @@ impl Parser {
                 self.advance();
                 Expr::CharLiteral(c, span)
             }
+            // C23 `true` / `false`: integer constants of type bool with value
+            // 1 / 0 (C23 6.4.4.6), exactly `(bool)1` / `(bool)0`.
+            TokenKind::True | TokenKind::False => {
+                let value = i64::from(matches!(self.peek(), TokenKind::True));
+                let span = self.peek_span();
+                self.advance();
+                Expr::Cast(
+                    TypeSpecifier::Bool,
+                    Box::new(Expr::IntLiteral(value, span)),
+                    span,
+                    CastQualifiers::default(),
+                )
+            }
+            // C23 `nullptr` (6.4.4.6): the null pointer constant of type
+            // `nullptr_t`, i.e. the null value `(nullptr_t)0`.
+            TokenKind::Nullptr => {
+                let span = self.peek_span();
+                self.advance();
+                Expr::Cast(
+                    TypeSpecifier::NullPtrT,
+                    Box::new(Expr::IntLiteral(0, span)),
+                    span,
+                    CastQualifiers::default(),
+                )
+            }
+            // `u8'x'`, `u'x'`, `U'x'`: the code unit in its unsigned type.
+            TokenKind::UnicodeCharLiteral(value, kind) => {
+                let ty = match kind {
+                    UnicodeCharKind::Utf8 => TypeSpecifier::UnsignedChar,
+                    UnicodeCharKind::Utf16 => TypeSpecifier::UnsignedShort,
+                    UnicodeCharKind::Utf32 => TypeSpecifier::UnsignedInt,
+                };
+                let value = i64::from(*value);
+                let span = self.peek_span();
+                self.advance();
+                Expr::Cast(
+                    ty,
+                    Box::new(Expr::IntLiteral(value, span)),
+                    span,
+                    CastQualifiers::default(),
+                )
+            }
             TokenKind::Identifier(name) => {
                 let name = name.clone();
                 let span = self.peek_span();
@@ -912,42 +959,32 @@ impl Parser {
         self.advance(); // consume _Generic
         let open = self.peek_span();
         self.expect_context(&TokenKind::LParen, "after '_Generic'");
-        let controlling = self.parse_assignment_expr();
+        // C2y N3260 (GCC 16.2 and Clang 23.1.3 accept it in C23 mode): the
+        // controlling operand may be a type name, which is not converted.
+        let controlling = if self.is_type_specifier() {
+            let operand_span = self.peek_span();
+            match self.parse_generic_type_name() {
+                Some((ts, is_const)) => Expr::TypeOperand(Box::new(ts), is_const, operand_span),
+                None => self.parse_assignment_expr(),
+            }
+        } else {
+            self.parse_assignment_expr()
+        };
         self.expect_context(&TokenKind::Comma, "after '_Generic' controlling expression");
         let mut associations = Vec::with_capacity(8);
         loop {
             if matches!(self.peek(), TokenKind::RParen) {
                 break;
             }
-            // Save and reset parsing_const before parsing each association type,
-            // so we can detect whether `const` appeared in the type specifier.
-            let saved_const = self.attrs.parsing_const();
-            self.attrs.set_const(false);
-            // A _Generic association type is a nested type-name: scope the
-            // pending address-space qualifier around it so its abstract
-            // declarator cannot steal an enclosing declaration's
-            // `__seg_gs`/`__seg_fs`, and the enclosing qualifier is
-            // restored on every path. The const capture between the two
-            // parse steps is preserved, so the "pointee is const" logic
-            // below is unchanged.
-            let enclosing_address_space = self.attrs.parsing_address_space;
-            self.attrs.parsing_address_space = AddressSpace::Default;
             let (type_spec, is_const) = if matches!(self.peek(), TokenKind::Default) {
                 self.advance();
                 (None, false)
-            } else if let Some(ts) = self.parse_type_specifier() {
-                // Capture whether the base type had `const` before pointer declarators.
-                // For `const int *`, parsing_const is true after parse_type_specifier
-                // (from the `const` keyword), and the `*` is applied in
-                // parse_abstract_declarator_suffix. This means the pointee is const.
-                let base_const = self.attrs.parsing_const();
-                let full_type = self.parse_abstract_declarator_suffix(ts);
-                (Some(full_type), base_const)
             } else {
-                (None, false)
+                match self.parse_generic_type_name() {
+                    Some((ts, is_const)) => (Some(ts), is_const),
+                    None => (None, false),
+                }
             };
-            self.attrs.parsing_address_space = enclosing_address_space;
-            self.attrs.set_const(saved_const);
             self.expect_context(&TokenKind::Colon, "in '_Generic' association");
             let expr = self.parse_assignment_expr();
             associations.push(GenericAssociation {
@@ -961,5 +998,30 @@ impl Parser {
         }
         self.expect_closing(&TokenKind::RParen, open);
         Expr::GenericSelection(Box::new(controlling), associations, span)
+    }
+
+    /// A `_Generic` type name -- an association type or a type operand --
+    /// with whether `const` qualifies its base type (the pointee, for a
+    /// pointer such as `const int *`), which `GenericAssociation::is_const`
+    /// records because `CType` carries no qualifiers.
+    fn parse_generic_type_name(&mut self) -> Option<(TypeSpecifier, bool)> {
+        // Reset parsing_const so a `const` in this type name is detected.
+        let saved_const = self.attrs.parsing_const();
+        self.attrs.set_const(false);
+        // A nested type name: scope the pending address-space qualifier so
+        // its abstract declarator cannot steal an enclosing declaration's
+        // `__seg_gs`/`__seg_fs`; the enclosing qualifier is restored on every
+        // path.
+        let enclosing_address_space = self.attrs.parsing_address_space;
+        self.attrs.parsing_address_space = AddressSpace::Default;
+        let result = self.parse_type_specifier().map(|ts| {
+            // `const` seen before the pointer declarators qualifies the base
+            // type: for `const int *`, the pointee.
+            let base_const = self.attrs.parsing_const();
+            (self.parse_abstract_declarator_suffix(ts), base_const)
+        });
+        self.attrs.parsing_address_space = enclosing_address_space;
+        self.attrs.set_const(saved_const);
+        result
     }
 }

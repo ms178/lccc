@@ -15,12 +15,19 @@
 #
 #  2. RISC-V default planning must stay at reach=6: on double_reduction the
 #     three global bases are `covers_reachable=false` at the default and zero
-#     edits are applied; forcing reach=11 admits them, and the register-
-#     allocator cascade then remats the LCG constants *inside* the hot loop
-#     (304 insns vs GCC's 74 — moving away from the oracle). This pin fails
-#     loudly if a future "ABI says 11" change reintroduces that regression.
+#     edits are applied. Forcing reach=11 used to admit them, and the
+#     register-allocator cascade then rematerialized the LCG constants
+#     *inside* the hot loop (main 304 insns vs 299 at band 6). Since phi
+#     incomings are live only on their edges (liveness.rs), no block of
+#     main exceeds the 12-register budget, so the band has nothing to admit:
+#     forcing 11 must now leave the output byte-identical to band 6. This
+#     pin fails loudly if pressure or a future "ABI says 11" change revives
+#     the cliff.
 #
 #  3. The x86-64 host default remains reach=6.
+#
+# The band is read from the planner's per-function `policy ... reach=N`
+# trace line, which is printed whether or not any block is over budget.
 set -euo pipefail
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 arm_cc=$repo/target/fastbuild/lccc-arm
@@ -54,7 +61,7 @@ if [[ -x $arm_cc ]]; then
   env -u CCC_GLA_REACH CCC_DEBUG_SPLIT=1 CCC_RA_GLOBAL_LOCATION=1 CCC_GLA_TRACE=1 \
     "$arm_cc" "${arm_inc_flag[@]}" -O2 -S "$matmul" -o /dev/null \
     >"$tmp/arm-trace.txt" 2>&1
-  grep -q "reach=10" "$tmp/arm-trace.txt" || {
+  grep -q "policy budget=[0-9]* reach=10 " "$tmp/arm-trace.txt" || {
     echo "FAIL: aarch64 default Speed reach band is not 10"; fail=1; }
 
   env -u CCC_GLA_REACH "$arm_cc" "${arm_inc_flag[@]}" -O2 -S "$matmul" -o "$tmp/mm10.s"
@@ -95,7 +102,7 @@ if [[ -x $rv_cc ]]; then
   env -u CCC_GLA_REACH CCC_DEBUG_SPLIT=1 CCC_RA_GLOBAL_LOCATION=1 CCC_GLA_TRACE=1 \
     "$rv_cc" -O2 -S "$dred_nohdr" -o "$tmp/dr6.s" \
     >"$tmp/rv6-trace.txt" 2>&1
-  grep -q "reach=6" "$tmp/rv6-trace.txt" || {
+  grep -q "policy budget=[0-9]* reach=6 " "$tmp/rv6-trace.txt" || {
     echo "FAIL: riscv64 default Speed reach band is not 6"; fail=1; }
   if grep -q "covers_reachable=true b0..b2" "$tmp/rv6-trace.txt"; then
     echo "FAIL: riscv64 double_reduction bases reachable at band 6 (hot-loop cascade; RA-GLA-03)"; fail=1
@@ -104,15 +111,20 @@ if [[ -x $rv_cc ]]; then
     echo "FAIL: riscv64 double_reduction applied GLA edits at band 6"; fail=1
   fi
 
-  # Forcing 11 reopens the documented cliff: three weighted-1 global bases
-  # become reachable and are applied, and three large li pairs move into the
-  # LCG loop.
+  # Forcing 11 must not reopen the documented cliff (three large li pairs
+  # moved into the LCG loop): with exact edge liveness nothing is over
+  # budget, so the forced band applies nothing and changes no byte.
   env CCC_DEBUG_SPLIT=1 CCC_RA_GLOBAL_LOCATION=1 CCC_GLA_REACH=11 CCC_GLA_TRACE=1 \
     "$rv_cc" -O2 -S "$dred_nohdr" -o "$tmp/dr11.s" \
     >"$tmp/rv11-trace.txt" 2>&1
-  grep -q "applied: 3 values (3 remat" "$tmp/rv11-trace.txt" || {
-    echo "FAIL: forced riscv64 band 11 no longer admits the 3 bases (RA-GLA-03 corpus changed - re-triage)"; fail=1; }
-  echo "ok: riscv64 reach band 6 (band-11 hot-loop cliff pinned)"
+  grep -q "policy budget=[0-9]* reach=11 " "$tmp/rv11-trace.txt" || {
+    echo "FAIL: CCC_GLA_REACH=11 did not reach the riscv64 planner"; fail=1; }
+  if grep -q "\[GLA\] main applied: [1-9]" "$tmp/rv11-trace.txt"; then
+    echo "FAIL: forced riscv64 band 11 applied GLA edits (hot-loop cliff revived; RA-GLA-03)"; fail=1
+  fi
+  cmp -s "$tmp/dr6.s" "$tmp/dr11.s" || {
+    echo "FAIL: forced riscv64 band 11 changed double_reduction's code (pinned: identical to band 6)"; fail=1; }
+  [[ $fail -eq 0 ]] && echo "ok: riscv64 reach band 6 (band 11 inert: no over-budget block)"
 else
   echo "SKIP: riscv64 cross compiler unavailable"
 fi
@@ -121,7 +133,7 @@ fi
 if [[ -x $x64_cc ]]; then
   env -u CCC_GLA_REACH CCC_DEBUG_SPLIT=1 CCC_RA_GLOBAL_LOCATION=1 CCC_GLA_TRACE=1 \
     "$x64_cc" -O2 -S "$nbody" -o /dev/null >"$tmp/x64-trace.txt" 2>&1
-  grep -q "reach=6" "$tmp/x64-trace.txt" || {
+  grep -q "policy budget=[0-9]* reach=6 " "$tmp/x64-trace.txt" || {
     echo "FAIL: x86-64 default Speed reach band is not 6"; fail=1; }
   echo "ok: x86-64 reach band 6"
 fi

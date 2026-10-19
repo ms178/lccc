@@ -1082,6 +1082,7 @@ impl Driver {
             source_manager.set_macro_expansions(macro_expansions);
             let mut lexer = Lexer::new(source_manager.get_content(file_id), file_id);
             lexer.set_gnu_extensions(self.gnu_extensions);
+            lexer.set_c23(self.c23_dialect());
             let tokens = lexer.tokenize();
             let lexer_diags = std::mem::take(&mut lexer.diagnostics);
 
@@ -1095,6 +1096,7 @@ impl Driver {
             }
             let mut parser = Parser::new(tokens);
             parser.set_diagnostics(diagnostics);
+            parser.set_c23(self.c23_dialect());
             let ast = parser.parse();
             let diagnostics = parser.take_diagnostics();
             // Lexer diagnostics were seeded into this engine before parsing.
@@ -1111,6 +1113,7 @@ impl Driver {
             // Semantic analysis.
             let mut sema = SemanticAnalyzer::new();
             sema.set_builtin_policy(self.builtin_policy.clone());
+            sema.set_pre_c99_dialect(self.pre_c99_dialect());
             sema.set_diagnostics(diagnostics);
             if let Err(error_count) = sema.analyze(&ast) {
                 return Err(format!("{} error(s) during semantic analysis", error_count));
@@ -1698,6 +1701,7 @@ impl Driver {
         }
         // Dialect-selected `__STDC_VERSION__`, applied BEFORE the user's
         // `-D`s so an explicit `-D__STDC_VERSION__=...` still wins.
+        preprocessor.set_c23(self.c23_dialect());
         if let Some(v) = self.stdc_version {
             match v {
                 Some(val) => preprocessor.define_macro("__STDC_VERSION__", val),
@@ -1891,6 +1895,7 @@ impl Driver {
         source_manager.set_macro_expansions(macro_expansions);
         let mut lexer = Lexer::new(source_manager.get_content(file_id), file_id);
         lexer.set_gnu_extensions(self.gnu_extensions);
+        lexer.set_c23(self.c23_dialect());
         let tokens = lexer.tokenize();
         let lexer_diags = std::mem::take(&mut lexer.diagnostics);
         if time_phases {
@@ -1917,6 +1922,7 @@ impl Driver {
         }
         let mut parser = Parser::new(tokens);
         parser.set_diagnostics(diagnostics);
+        parser.set_c23(self.c23_dialect());
         let ast = parser.parse();
         if time_phases {
             eprintln!("[TIME] parse: {:.3}s", t2.elapsed().as_secs_f64());
@@ -1941,6 +1947,7 @@ impl Driver {
         let t3 = std::time::Instant::now();
         let mut sema = SemanticAnalyzer::new();
         sema.set_builtin_policy(self.builtin_policy.clone());
+        sema.set_pre_c99_dialect(self.pre_c99_dialect());
         sema.set_diagnostics(diagnostics);
         if let Err(error_count) = sema.analyze(&ast) {
             // Errors already emitted through diagnostic engine with source spans
@@ -2013,7 +2020,8 @@ impl Driver {
             self.wrap_signed_overflow,
             fp_environment_observable,
         ))
-        .with_builtin_policy(self.builtin_policy.clone());
+        .with_builtin_policy(self.builtin_policy.clone())
+        .with_enumerator_refs(sema_result.enumerator_refs);
         let (mut module, mut diagnostics) = lowerer.lower(&ast);
         // IR lowering is a user-facing phase: it rejects ill-typed builtins,
         // target-specific intrinsics and unsupported constructs, and every one
@@ -2298,14 +2306,21 @@ impl Driver {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30);
-            let mut did_split = false;
+            // Which functions the global location allocator split: RA-06 is
+            // skipped for exactly those (it subsumes the intra-block pass for
+            // the same function; a module-wide flag skipped it everywhere).
+            let nfuncs = module.functions.len();
+            // Each function's value-id bound before any splitter ran: ids at
+            // or above it are the splitters' own (see
+            // `propagate_copies_sparing`).
+            let fresh_floor: Vec<u32> = module
+                .functions
+                .iter()
+                .map(|f| f.max_value_id().saturating_add(1))
+                .collect();
             for func in &mut module.functions {
                 if !func.is_declaration && func.blocks.len() > 10 {
-                    let n =
-                        crate::backend::split_ranges::split_call_spanning_ranges(func, max_splits);
-                    if n > 0 {
-                        did_split = true;
-                    }
+                    crate::backend::split_ranges::split_call_spanning_ranges(func, max_splits);
                 }
             }
             // P0-A global location allocation: cross-block Belady-MIN
@@ -2318,16 +2333,24 @@ impl Driver {
             // the intra-block RA-06 splitter below; when it runs it
             // subsumes the intra-block pass for the same function (double
             // splitting would pay for both stores).
-            let mut global_location_split = false;
+            let mut global_location_split = vec![false; nfuncs];
             if crate::backend::location_alloc::gate_enabled() {
                 let gmax = crate::backend::location_alloc::max_splits_from_env();
-                for func in &mut module.functions {
+                let tls_symbols: crate::common::fx_hash::FxHashSet<String> = module
+                    .globals
+                    .iter()
+                    .filter(|g| g.is_thread_local)
+                    .map(|g| g.name.clone())
+                    .collect();
+                for (fi, func) in module.functions.iter_mut().enumerate() {
                     if !func.is_declaration && !func.blocks.is_empty() {
-                        let n = crate::backend::location_alloc::run(func, gmax, self.opt_level);
-                        if n > 0 {
-                            did_split = true;
-                            global_location_split = true;
-                        }
+                        let n = crate::backend::location_alloc::run(
+                            func,
+                            gmax,
+                            self.opt_level,
+                            &tls_symbols,
+                        );
+                        global_location_split[fi] = n > 0;
                     }
                 }
             }
@@ -2338,18 +2361,15 @@ impl Driver {
             // benchmark corpus because the loops that spill contain no
             // calls). Opt-in until the A/B census says otherwise. Skipped
             // when the global location allocator already split a function.
-            if std::env::var("CCC_PRESSURE_SPLIT").is_ok() && !global_location_split {
+            if std::env::var("CCC_PRESSURE_SPLIT").is_ok() {
                 let pmax = std::env::var("CCC_PRESSURE_SPLIT_MAX")
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(64);
-                for func in &mut module.functions {
-                    if !func.is_declaration && !func.blocks.is_empty() {
-                        let n =
-                            crate::backend::split_ranges::split_high_pressure_ranges(func, pmax);
-                        if n > 0 {
-                            did_split = true;
-                        }
+                for (fi, func) in module.functions.iter_mut().enumerate() {
+                    if !func.is_declaration && !func.blocks.is_empty() && !global_location_split[fi]
+                    {
+                        crate::backend::split_ranges::split_high_pressure_ranges(func, pmax);
                     }
                 }
             }
@@ -2362,23 +2382,40 @@ impl Driver {
             if std::env::var("CCC_LOOP_SPLIT").is_ok() {
                 for func in &mut module.functions {
                     if !func.is_declaration && !func.blocks.is_empty() {
-                        let n = crate::backend::split_ranges::split_loop_transparent_ranges(
+                        crate::backend::split_ranges::split_loop_transparent_ranges(
                             func, max_splits,
                         );
-                        if n > 0 {
-                            did_split = true;
-                        }
                     }
                 }
             }
-            // Run cleanup passes on split IR: copy propagation + DCE
-            // to eliminate redundant Store/Load → Copy chains from mem2reg
-            if did_split {
-                for func in &mut module.functions {
-                    if !func.is_declaration && !func.blocks.is_empty() {
-                        crate::passes::copy_prop::propagate_copies(func);
-                        crate::passes::dce::eliminate_dead_code(func);
-                    }
+            // Final cleanup of EVERY function, split or not: copy propagation
+            // + DCE remove the splitters' Store/Load -> Copy chains and, at
+            // -O0 (no IR pipeline), the lowering's temporaries. It used to run
+            // module-wide only when some function split, so a function's code
+            // depended on its neighbours (measured: -O0 x86-64 2942 / i686
+            // 3060 corpus instructions between the two scopes). Deliberate
+            // constant homes the hoisting passes created (opt >= 2: the -O1
+            // tier returns before fp/int constant hoisting) are spared:
+            // forwarding them re-sank movabsq magic multipliers and, on i686,
+            // x87 F64 constants (a stack-temporary rebuild per use) into loops.
+            let int_model = crate::passes::int_const_hoist::model_for(self.target);
+            let hoists_ran = self.opt_level >= 2;
+            for (func, &floor) in module.functions.iter_mut().zip(&fresh_floor) {
+                if !func.is_declaration && !func.blocks.is_empty() {
+                    let int_homes = match int_model {
+                        Some(m) if hoists_ran => {
+                            crate::passes::int_const_hoist::const_homes(func, m)
+                        }
+                        _ => Default::default(),
+                    };
+                    let spare =
+                        |v: crate::ir::reexports::Value, c: &crate::ir::reexports::IrConst| {
+                            hoists_ran
+                                && (crate::passes::fp_const_hoist::is_hoisted_fp_const(c)
+                                    || int_homes.contains(&v.0))
+                        };
+                    crate::passes::copy_prop::propagate_copies_sparing(func, floor, &spare);
+                    crate::passes::dce::eliminate_dead_code(func);
                 }
             }
         }
@@ -2517,12 +2554,27 @@ impl Driver {
             // branches. Measured ~570 B of .text on the linux-cachymod setup
             // corpus, which is the margin that keeps _end under the 32 KiB
             // gate (see block_layout::relayout_blocks_loop_aware_rpo).
+            //
+            // -O0 ships the chain order without the dual-layout exploration
+            // (two extra emissions plus two peephole runs per reordered
+            // function). Measured on four binutils 2.47 TUs (gas expr.c,
+            // read.c, tc-i386.c; bfd elflink.c): identical instruction counts
+            // and equal or smaller .text, at 35-40% less compile time. -O1
+            // and up keep it: there it buys 0.2-0.6% .text.
+            let dual_layout = if self.opt_level == 0 {
+                crate::passes::block_layout::DualLayout::ChainOnly
+            } else {
+                crate::passes::block_layout::DualLayout::Explore
+            };
             for func in &mut module.functions {
                 if !func.is_declaration {
                     if self.optimize_size {
                         crate::passes::block_layout::relayout_blocks_loop_aware_rpo(func);
                     } else {
-                        crate::passes::block_layout::relayout_blocks_static_chain(func);
+                        crate::passes::block_layout::relayout_blocks_static_chain(
+                            func,
+                            dual_layout,
+                        );
                     }
                 }
             }
@@ -3423,6 +3475,23 @@ fn first_arm_simd_reference(asm: &str) -> Option<(String, String)> {
     None
 }
 
+impl Driver {
+    /// Whether `-std=` selected a dialect before C99 (C90, or C94 =
+    /// `iso9899:199409`): GCC's `flag_isoc99` is clear there, and sema
+    /// follows it where the dialects differ.
+    pub(crate) fn pre_c99_dialect(&self) -> bool {
+        matches!(self.stdc_version, Some(None) | Some(Some("199409L")))
+    }
+
+    /// Whether `-std=` selected C23 or later (c23/gnu23/c2x/gnu2x/c2y/gnu2y).
+    /// The default dialect is gnu17 (`__STDC_VERSION__` 201710L), so this is
+    /// false unless requested. Lexer keywords, `#if true`, `auto` type
+    /// inference and the other C23-only meanings key off this one fact.
+    pub(crate) fn c23_dialect(&self) -> bool {
+        matches!(self.stdc_version, Some(Some(v))
+            if v.trim_end_matches('L').parse::<u32>().is_ok_and(|n| n >= 202311))
+    }
+}
 #[cfg(test)]
 mod arm_simd_reference_tests {
     use super::first_arm_simd_reference;

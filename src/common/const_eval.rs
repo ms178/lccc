@@ -19,7 +19,7 @@
 //! respective callers.
 
 use super::const_arith;
-use super::types::{target_is_32bit, target_ptr_size};
+use super::types::{CType, target_is_32bit, target_ptr_size};
 use crate::frontend::parser::ast::{BinOp, Expr, TypeSpecifier};
 use crate::ir::reexports::IrConst;
 
@@ -146,6 +146,22 @@ pub fn eval_builtin_call(
     eval_builtin_call_with_mode(name, args, eval_fn, true)
 }
 
+/// `abs`/`labs`/`llabs` of an integer constant, in `int` or (`wide`) a
+/// 64-bit type; `None` for the most negative value, whose absolute value
+/// overflows.
+fn int_abs(
+    args: &[Expr],
+    eval_fn: &dyn Fn(&Expr) -> Option<IrConst>,
+    wide: bool,
+) -> Option<IrConst> {
+    let v = eval_fn(args.first()?)?.to_i64()?;
+    if wide {
+        v.checked_abs().map(IrConst::I64)
+    } else {
+        (v as i32).checked_abs().map(IrConst::I32)
+    }
+}
+
 /// Evaluate a compile-time builtin call under an explicit builtin policy.
 /// `allow_nonprefixed_builtins=false` (`-fno-builtin` / `-ffreestanding`)
 /// withdraws EVERY non-`__`-prefixed spelling — the whole bare-name fold
@@ -198,6 +214,15 @@ pub fn eval_builtin_call_with_mode(
             }
         }
         "__builtin_expect" | "__builtin_expect_with_probability" => args.first().and_then(eval_fn),
+        // The absolute value in the function's own type; the most negative
+        // value has none (undefined), so it does not fold.
+        "__builtin_abs" | "abs" => int_abs(args, eval_fn, false),
+        "__builtin_labs" | "labs" => {
+            int_abs(args, eval_fn, !crate::common::types::target_is_32bit())
+        }
+        "__builtin_llabs" | "llabs" | "__builtin_imaxabs" | "imaxabs" => {
+            int_abs(args, eval_fn, true)
+        }
         "__builtin_bswap16" => {
             let val = eval_fn(args.first()?)?;
             let v = val.to_i64()? as u16;
@@ -543,20 +568,22 @@ pub fn eval_builtin_call_with_mode(
         // for an empty payload is 0x7ff4000000000000 / 0x7fa00000.
         "__builtin_nans" => Some(nan_f64(nan_payload(args)?, true)),
         "__builtin_nansf" => Some(nan_f32(nan_payload(args)?, true)),
-        // A long double NaN keeps its canonical bit pattern: the payload of
-        // `__builtin_nanl("7")` lives in the x87 significand
-        // (0xc000000000000007) while lccc carries a long double as
-        // `(f64 approximation, binary128 bytes)`, so the *value* is exact (a
-        // NaN) but its payload is not preserved.  The alternative -- declining
-        // -- would reject a program GCC accepts, which is worse.
-        "__builtin_nanl" | "nanl" => {
-            let _ = nan_payload(args)?;
-            Some(IrConst::long_double(f64::NAN))
+        // A long double NaN keeps its payload in the target format (x87:
+        // `nanl("7")` is 0x7fff:c000000000000007; binary128: low significand
+        // bits). The constant's binary128 bytes carry it losslessly: the
+        // x87<->binary128 NaN mappings are top-aligned and inverse.
+        "__builtin_nanl" | "nanl" => Some(nan_long_double(nan_payload(args)?, false)),
+        "__builtin_nansl" | "nansl" => Some(nan_long_double(nan_payload(args)?, true)),
+        // _Float128 (and GCC's x86 `q` spellings for __float128): the
+        // binary128 bits ride the I128 carrier.
+        "__builtin_nanf128" | "__builtin_nanq" | "nanf128" => {
+            Some(nan_f128(nan_payload(args)?, false))
         }
-        "__builtin_nansl" | "nansl" => {
-            let _ = nan_payload(args)?;
-            Some(IrConst::long_double(f64::from_bits(0x7ff4_0000_0000_0000)))
-        }
+        "__builtin_nansf128" | "__builtin_nansq" => Some(nan_f128(nan_payload(args)?, true)),
+        "__builtin_inff128"
+        | "__builtin_infq"
+        | "__builtin_huge_valf128"
+        | "__builtin_huge_valq" => Some(IrConst::I128((0x7FFFu128 << 112) as i128)),
         _ => None,
     }
 }
@@ -620,37 +647,54 @@ fn nan_payload_digits(digits: &str, radix: u32) -> Option<u64> {
     Some(value)
 }
 
+/// The trailing significand of a NaN with `frac_bits` fraction bits carrying
+/// `payload`, as GCC encodes it (real.c `encode_ieee_*`, measured against
+/// GCC 16.2): a quiet NaN sets the top fraction bit over the payload; a
+/// signaling NaN clears it, and when nothing is left (empty payload, or one
+/// whose bits all fall outside the field) uses the canonical signaling bit
+/// just below it -- never the all-zero fraction, which would be infinity
+/// (`nans("0x10000000000000")` is 0x7ff4000000000000).
+fn nan_significand(payload: u64, signaling: bool, frac_bits: u32) -> u128 {
+    let quiet = 1u128 << (frac_bits - 1);
+    let p = u128::from(payload) & ((1u128 << frac_bits) - 1);
+    if !signaling {
+        return quiet | p;
+    }
+    match p & !quiet {
+        0 => quiet >> 1,
+        p => p,
+    }
+}
+
 /// A `double` NaN carrying `payload`: quiet for `__builtin_nan`, signaling for
-/// `__builtin_nans`, with GCC's canonical bit patterns for an empty payload.
+/// `__builtin_nans`. See [`nan_significand`].
 fn nan_f64(payload: u64, signaling: bool) -> IrConst {
-    const MANTISSA: u64 = 0x000f_ffff_ffff_ffff;
-    const QUIET: u64 = 0x0008_0000_0000_0000;
-    const CANONICAL_SIGNALING: u64 = 0x0004_0000_0000_0000;
-    let bits = if signaling {
-        match payload {
-            0 => 0x7ff0_0000_0000_0000 | CANONICAL_SIGNALING,
-            p => 0x7ff0_0000_0000_0000 | (p & MANTISSA),
-        }
-    } else {
-        0x7ff0_0000_0000_0000 | QUIET | (payload & MANTISSA)
-    };
-    IrConst::F64(f64::from_bits(bits))
+    let frac = nan_significand(payload, signaling, 52) as u64;
+    IrConst::F64(f64::from_bits(0x7ff0_0000_0000_0000 | frac))
 }
 
 /// [`nan_f64`] in `float` precision.
 fn nan_f32(payload: u64, signaling: bool) -> IrConst {
-    const MANTISSA: u64 = 0x007f_ffff;
-    const QUIET: u64 = 0x0040_0000;
-    const CANONICAL_SIGNALING: u64 = 0x0020_0000;
-    let bits = if signaling {
-        match payload {
-            0 => 0x7f80_0000 | CANONICAL_SIGNALING,
-            p => 0x7f80_0000 | (p & MANTISSA),
-        }
+    let frac = nan_significand(payload, signaling, 23) as u32;
+    IrConst::F32(f32::from_bits(0x7f80_0000 | frac))
+}
+
+/// [`nan_f64`] for `_Float128`: the binary128 bits in the I128 carrier.
+fn nan_f128(payload: u64, signaling: bool) -> IrConst {
+    IrConst::I128(((0x7FFFu128 << 112) | nan_significand(payload, signaling, 112)) as i128)
+}
+
+/// [`nan_f64`] for `long double` in the target format: x87 extended (explicit
+/// integer bit, 63 fraction bits) or binary128.
+fn nan_long_double(payload: u64, signaling: bool) -> IrConst {
+    use super::long_double as ld;
+    let bytes = if super::types::target_long_double_is_f128() {
+        ((0x7FFFu128 << 112) | nan_significand(payload, signaling, 112)).to_le_bytes()
     } else {
-        0x7f80_0000 | QUIET | (payload & MANTISSA)
+        let sig = (1u128 << 63) | nan_significand(payload, signaling, 63);
+        ld::x87_bytes_to_f128_bytes(&((0x7FFFu128 << 64) | sig).to_le_bytes())
     };
-    IrConst::F32(f32::from_bits(bits as u32))
+    IrConst::long_double_with_bytes(f64::NAN, bytes)
 }
 
 /// The `f64` value of `val`, when `val` *is* that value exactly: an integer
@@ -1110,6 +1154,207 @@ pub fn eval_binop_with_types(
         lhs_unsigned,
         rhs_unsigned,
     )
+}
+
+// ---------------------------------------------------------------------------
+// Value semantics of the 16-byte carrier
+//
+// `IrConst::I128` carries three different C types: `__int128` (two's
+// complement), `_Float128` (IEEE binary128 bits) and `_Decimal128` (BID128
+// bits). Only the C type tells them apart, so every truth test, conversion and
+// fold of such a constant must consult it; the bits alone misread -0.0Q and
+// -0.0DL as nonzero and `2.75Q` as a huge integer. Sema and lowering both fold
+// these constants, and both use the helpers below so the two layers cannot
+// disagree.
+// ---------------------------------------------------------------------------
+
+/// The C truth value (`!= 0`, C11 6.3.1.2) of a folded constant of type `ct`.
+/// Binary floating values compare by value (+-0 false, NaN true); decimal
+/// values by BID decoding (every zero quantum false). `ct == None` falls back
+/// to the carrier's own notion, which is only correct for unambiguous kinds.
+pub fn const_truth(val: &IrConst, ct: Option<&CType>) -> bool {
+    use super::decimal;
+    match (ct, val) {
+        (Some(CType::Float128), IrConst::I128(bits)) => (*bits as u128) & !(1u128 << 127) != 0,
+        (Some(CType::Decimal128), IrConst::I128(bits)) => {
+            let b = *bits as u128;
+            !decimal::bid128_is_zero((b >> 64) as u64, b as u64)
+        }
+        (Some(CType::Decimal32), IrConst::I32(v)) => !decimal::bid32_is_zero(*v as u32),
+        (Some(CType::Decimal64), IrConst::I64(v)) => !decimal::bid64_is_zero(*v as u64),
+        _ => val.is_nonzero(),
+    }
+}
+
+/// The exact binary128 value of a real constant `val` of C type `ct`, or
+/// `None` for non-arithmetic types. Integers up to 64 bits and every binary
+/// floating constant are exact; 128-bit integers and decimal values round
+/// once (nearest-even), exactly like the runtime conversions
+/// (`__floattitf`, `__bid_*totf`). A long double constant contributes its
+/// value in the target format (x87 bytes are rounded to 64 bits first).
+pub fn f128_bytes_of(val: &IrConst, ct: Option<&CType>) -> Option<[u8; 16]> {
+    use super::decimal;
+    use super::long_double as ld;
+    let ct = ct?;
+    let bid = |neg: bool, dec: Option<(u128, i32)>, special_bits_nan: bool| -> [u8; 16] {
+        match dec {
+            Some((c, e)) => {
+                let sign = if neg { "-" } else { "" };
+                ld::parse_long_double_to_f128_bytes(&format!("{sign}{c}e{e}"))
+            }
+            None if special_bits_nan => ld::parse_long_double_to_f128_bytes("nan"),
+            None => ld::parse_long_double_to_f128_bytes(if neg { "-inf" } else { "inf" }),
+        }
+    };
+    match ct {
+        CType::Float128 => match val {
+            IrConst::I128(bits) => Some((*bits as u128).to_le_bytes()),
+            IrConst::Zero => Some([0; 16]),
+            _ => None,
+        },
+        CType::Decimal32 | CType::Decimal64 | CType::Decimal128 => {
+            // Sign, finite (coefficient, exponent), or NaN-vs-infinity from
+            // the combination field (0b11111 = NaN, 0b11110 = infinity).
+            let (neg, dec, nan) = match (ct, val) {
+                (CType::Decimal32, IrConst::D32(v)) => {
+                    let d = decimal::decode_bid32(*v);
+                    (
+                        v >> 31 != 0,
+                        d.map(|(_, c, e)| (u128::from(c), e)),
+                        (v >> 26) & 0x1F == 0x1F,
+                    )
+                }
+                (CType::Decimal64, IrConst::D64(v)) => {
+                    let d = decimal::decode_bid64(*v);
+                    (
+                        v >> 63 != 0,
+                        d.map(|(_, c, e)| (u128::from(c), e)),
+                        (v >> 58) & 0x1F == 0x1F,
+                    )
+                }
+                (CType::Decimal128, IrConst::I128(v)) => {
+                    let (hi, lo) = ((*v as u128 >> 64) as u64, *v as u64);
+                    let d = decimal::decode_bid128(hi, lo);
+                    (
+                        hi >> 63 != 0,
+                        d.map(|(_, c, e)| (c, e)),
+                        (hi >> 58) & 0x1F == 0x1F,
+                    )
+                }
+                _ => return None,
+            };
+            Some(bid(neg, dec, nan))
+        }
+        _ if !(ct.is_integer() || ct.is_floating()) => None,
+        _ => Some(match val {
+            IrConst::LongDouble(_, bytes) => ld::long_double_value_bytes(bytes),
+            IrConst::F64(f) => ld::f64_to_f128_bytes_lossless(*f),
+            IrConst::F32(f) => ld::f64_to_f128_bytes_lossless(f64::from(*f)),
+            IrConst::I128(v) if ct.is_unsigned() => ld::u128_to_f128_bytes(*v as u128),
+            IrConst::I128(v) => ld::i128_to_f128_bytes(*v),
+            IrConst::D32(_) | IrConst::D64(_) => return None,
+            other => {
+                let v = other.to_i64()?;
+                if ct.is_unsigned() {
+                    ld::u64_to_f128_bytes(v as u64)
+                } else {
+                    ld::i64_to_f128_bytes(v)
+                }
+            }
+        }),
+    }
+}
+
+/// `l op r` in binary128 with IEEE semantics, exactly rounded (the soft-float
+/// helpers match libgcc's `__addtf3` & co. in round-to-nearest). Comparisons
+/// with a NaN are false except `!=`, and +0 == -0. Results are the carrier
+/// for arithmetic and an `int` 0/1 for comparisons and logical operators.
+pub fn fold_f128_binop(op: &BinOp, l: &[u8; 16], r: &[u8; 16]) -> Option<IrConst> {
+    use super::long_double as ld;
+    let carrier = |b: [u8; 16]| IrConst::I128(u128::from_le_bytes(b) as i128);
+    let truth = |b: bool| IrConst::I32(i32::from(b));
+    let nonzero = |b: &[u8; 16]| u128::from_le_bytes(*b) & !(1u128 << 127) != 0;
+    let ord = ld::f128_cmp(l, r);
+    let ordered = ord != i32::MIN;
+    Some(match op {
+        BinOp::Add => carrier(ld::f128_add(l, r)),
+        BinOp::Sub => carrier(ld::f128_sub(l, r)),
+        BinOp::Mul => carrier(ld::f128_mul(l, r)),
+        BinOp::Div => carrier(ld::f128_div(l, r)),
+        BinOp::Lt => truth(ordered && ord < 0),
+        BinOp::Le => truth(ordered && ord <= 0),
+        BinOp::Gt => truth(ordered && ord > 0),
+        BinOp::Ge => truth(ordered && ord >= 0),
+        BinOp::Eq => truth(ordered && ord == 0),
+        BinOp::Ne => truth(!(ordered && ord == 0)),
+        BinOp::LogicalAnd => truth(nonzero(l) && nonzero(r)),
+        BinOp::LogicalOr => truth(nonzero(l) || nonzero(r)),
+        _ => return None,
+    })
+}
+
+/// Convert the binary128 value `bytes` to the real C type `target` by value
+/// (C11 6.3.1.4, 6.3.1.5), as the runtime conversions do in round-to-nearest:
+/// one rounding to `float`, `double` or an x87 `long double`; truncation
+/// toward zero to integers. An out-of-range integer conversion is undefined;
+/// it folds like GCC's constant folder (NaN -> 0, saturation at the type's
+/// bounds) so an initializer stays constant. Integer results follow the
+/// sema convention: unsigned sub-int values are zero-extended `I32`.
+/// Decimal and non-arithmetic targets return `None`.
+pub fn f128_to_ctype(bytes: &[u8; 16], target: &CType) -> Option<IrConst> {
+    use super::long_double as ld;
+    let raw = u128::from_le_bytes(*bytes);
+    Some(match target {
+        CType::Float128 => IrConst::I128(raw as i128),
+        CType::Enum(e) => return f128_to_ctype(bytes, &e.compatible_ctype()),
+        CType::LongDouble => {
+            let v = ld::long_double_value_bytes(bytes);
+            IrConst::long_double_with_bytes(ld::f128_bytes_to_f64(&v), v)
+        }
+        CType::Double => IrConst::F64(ld::f128_bytes_to_f64(bytes)),
+        CType::Float => IrConst::F32(ld::f128_bytes_to_f32(bytes)),
+        CType::Bool => IrConst::I8(i8::from(raw & !(1u128 << 127) != 0)),
+        t if t.is_integer() => {
+            let size = t.size();
+            let unsigned = t.is_unsigned();
+            let bits = (size * 8) as u32;
+            let is_nan = (raw >> 112) & 0x7FFF == 0x7FFF && raw & ((1u128 << 112) - 1) != 0;
+            let negative = raw >> 127 != 0;
+            // Saturated two's-complement image, truncated toward zero.
+            let v: u128 = if is_nan {
+                0
+            } else if unsigned {
+                let max = if bits == 128 {
+                    u128::MAX
+                } else {
+                    (1u128 << bits) - 1
+                };
+                match ld::f128_bytes_to_i128(bytes) {
+                    Some(v) if v < 0 => 0,
+                    _ if negative => 0,
+                    _ => ld::f128_bytes_to_u128(bytes).map_or(max, |u| u.min(max)),
+                }
+            } else {
+                let max = (1i128 << (bits - 1)).wrapping_sub(1);
+                let min = if bits == 128 {
+                    i128::MIN
+                } else {
+                    -(1i128 << (bits - 1))
+                };
+                let v = ld::f128_bytes_to_i128(bytes).unwrap_or(if negative { min } else { max });
+                v.clamp(min, max) as u128
+            };
+            match (size, unsigned) {
+                (1, false) => IrConst::I8(v as i8),
+                (2, false) => IrConst::I16(v as i16),
+                (1 | 2 | 4, _) => IrConst::I32(v as u32 as i32),
+                (8, _) => IrConst::I64(v as u64 as i64),
+                (16, _) => IrConst::I128(v as i128),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

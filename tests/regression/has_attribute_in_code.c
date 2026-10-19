@@ -9,7 +9,8 @@
  *
  * Also asserts the boundaries of the fix:
  *   - inside a STRING literal the token must NOT be rewritten;
- *   - a supported attribute reports 1, an invented one reports 0;
+ *   - a supported GNU attribute reports 1, a standard one 202311 (as
+ *     GCC 16.2), an invented one 0;
  *   - __has_builtin works on both sides of the same expression.
  */
 #include <stdio.h>
@@ -24,9 +25,11 @@ int main(void)
                return 1;
        }
 
-       /* A universally supported attribute must be 1. */
-       if (__has_attribute(noreturn) != 1) {
-               printf("FAIL noreturn=0\n");
+       /* A supported GNU attribute is 1; a standard attribute reports the
+        * C23 revision that defines it, 202311 (GCC 16.2, every dialect). */
+       if (__has_attribute(packed) != 1 || __has_attribute(noreturn) != 202311) {
+               printf("FAIL packed=%d noreturn=%d\n", __has_attribute(packed),
+                      __has_attribute(noreturn));
                return 2;
        }
 

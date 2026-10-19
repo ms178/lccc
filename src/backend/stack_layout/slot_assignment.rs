@@ -776,7 +776,7 @@ fn classify_value(
     if crate::common::types::target_is_32bit() {
         let is_wide = matches!(
             inst.result_type(),
-            Some(IrType::F64) | Some(IrType::I64) | Some(IrType::U64)
+            Some(IrType::F64 | IrType::I64 | IrType::U64 | IrType::D64)
         );
         if is_wide {
             state.wide_values.insert(dest.0);
@@ -863,17 +863,11 @@ fn classify_value(
 
     // Skip immediately-consumed values: produced and consumed in adjacent
     // instructions, kept alive in the accumulator register cache without
-    // needing a stack slot. Not for i128/f128 (need 16-byte special handling).
-    // On 32-bit targets, also exclude F64/I64/U64 ("wide" values) because
-    // they can't fit in the 32-bit accumulator (EAX). F64 values use x87
-    // and must be stored to memory between operations; I64/U64 need
-    // multi-word handling via edx:eax pairs that require stack slots.
-    let is_wide_on_32bit = crate::common::types::target_is_32bit()
-        && matches!(
-            inst.result_type(),
-            Some(IrType::F64) | Some(IrType::I64) | Some(IrType::U64)
-        );
-    if !is_i128 && !is_f128 && !is_wide_on_32bit && ctx.immediately_consumed.contains(&dest.0) {
+    // needing a stack slot. Values wider than the accumulator never get here:
+    // the allocator's accumulator-home selection excludes them by their
+    // value-type-map width (which, unlike `result_type()`, also types Copy
+    // destinations). Not for i128/f128 (need 16-byte special handling).
+    if !is_i128 && !is_f128 && ctx.immediately_consumed.contains(&dest.0) {
         return;
     }
 

@@ -729,14 +729,18 @@ pub(crate) fn eval_cast_const(src: IrConst, from_ty: IrType, to_ty: IrType) -> O
 /// Cast evaluation for the cases where at least one side is floating point.
 fn eval_float_cast_const(src: IrConst, from_ty: IrType, to_ty: IrType) -> Option<IrConst> {
     match (from_ty.is_float(), to_ty.is_float()) {
-        // float → float
-        (true, true) => Some(make_float_const(const_as_f64(src)?, to_ty)),
+        // float → float. A long double narrows from its value in the target
+        // format, rounding once (its f64 shadow would double-round to F32).
+        (true, true) => match src {
+            IrConst::LongDouble(_, bytes) => IrConst::cast_long_double_to_target(&bytes, to_ty),
+            _ => Some(make_float_const(const_as_f64(src)?, to_ty)),
+        },
         // float → int
         (true, false) => {
             // Long double keeps full x87 precision; going through f64 first
             // would lose mantissa bits before the truncation.
-            if let IrConst::LongDouble(fv, bytes) = src {
-                return IrConst::cast_long_double_to_target(fv, &bytes, to_ty);
+            if let IrConst::LongDouble(_, bytes) = src {
+                return IrConst::cast_long_double_to_target(&bytes, to_ty);
             }
             // GCC -fno-trapping-math saturates finite out-of-range values to
             // the destination min/max. NaN/Inf stay unfolded (IEEE invalid).

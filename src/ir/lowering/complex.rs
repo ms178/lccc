@@ -18,14 +18,19 @@ use crate::ir::reexports::{
 };
 
 impl Lowerer {
+    /// The C type of a complex type's real and imaginary components
+    /// (`double` for a non-complex type, the historical fallback).
+    pub(super) fn complex_component_ctype(ctype: &CType) -> CType {
+        match ctype {
+            CType::ComplexFloat => CType::Float,
+            CType::ComplexLongDouble => CType::LongDouble,
+            _ => CType::Double,
+        }
+    }
+
     /// Get the IR float type for a complex type's component.
     pub(super) fn complex_component_ir_type(ctype: &CType) -> IrType {
-        match ctype {
-            CType::ComplexFloat => IrType::F32,
-            CType::ComplexDouble => IrType::F64,
-            CType::ComplexLongDouble => IrType::F128,
-            _ => IrType::F64, // fallback
-        }
+        IrType::from_ctype(&Self::complex_component_ctype(ctype))
     }
 
     /// Get the component size in bytes for a complex type.

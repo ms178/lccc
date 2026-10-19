@@ -209,10 +209,10 @@ impl IrConst {
             IrConst::LongDouble(_, bytes) => (u128::from_le_bytes(*bytes) << 1) == 0,
             // C23 decimals: BID-decoded truthiness (+0 == -0 in any
             // quantum; Inf/NaN nonzero). Powers branch/logical folding
-            // over decimal constants. (D128 rides I128 and stays
-            // integer-exact there: the carrier is ambiguous with plain
-            // integers, so non-canonical-zero D128 bit patterns do not
-            // fold — same conservative corner as _Float128 -0.0.)
+            // over decimal constants. `_Decimal128` and `_Float128` ride
+            // I128, whose bits alone cannot answer (-0.0DL and -0.0Q have
+            // nonzero bits): C-level folders must ask
+            // `common::const_eval::const_truth` with the C type.
             IrConst::D32(v) => crate::common::decimal::bid32_is_zero(*v),
             IrConst::D64(v) => crate::common::decimal::bid64_is_zero(*v),
             IrConst::Zero => true,
@@ -469,18 +469,19 @@ impl IrConst {
 
     /// Cast a long double (with f128 bytes) to the target IR type.
     /// Uses full precision for integer conversions.
-    pub fn cast_long_double_to_target(
-        fv: f64,
-        bytes: &[u8; 16],
-        target: IrType,
-    ) -> Option<IrConst> {
+    pub fn cast_long_double_to_target(bytes: &[u8; 16], target: IrType) -> Option<IrConst> {
         use crate::common::long_double::{
-            f128_bytes_to_i64, f128_bytes_to_i128, f128_bytes_to_u64, f128_bytes_to_u128,
+            f128_bytes_to_f32, f128_bytes_to_f64, f128_bytes_to_i64, f128_bytes_to_i128,
+            f128_bytes_to_u64, f128_bytes_to_u128, long_double_value_bytes,
         };
+        // Convert the value in the target long double format (x87: 64-bit
+        // significand), rounding once: the f64 shadow would double-round to
+        // float and truncate integers from a rounded value.
+        let bytes = &long_double_value_bytes(bytes);
         Some(match target {
-            IrType::F64 => IrConst::F64(fv),
-            IrType::F128 => IrConst::long_double_with_bytes(fv, *bytes),
-            IrType::F32 => IrConst::F32(fv as f32),
+            IrType::F64 => IrConst::F64(f128_bytes_to_f64(bytes)),
+            IrType::F128 => IrConst::long_double_with_bytes(f128_bytes_to_f64(bytes), *bytes),
+            IrType::F32 => IrConst::F32(f128_bytes_to_f32(bytes)),
             // For integer targets, use full precision via f128 bytes
             IrType::I8 => IrConst::I8(f128_bytes_to_i64(bytes)? as i8),
             IrType::U8 => IrConst::I8(f128_bytes_to_u64(bytes)? as u8 as i8),

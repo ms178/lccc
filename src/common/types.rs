@@ -171,6 +171,13 @@ pub fn target_ptr_size() -> usize {
     TARGET_PTR_SIZE.with(|c| c.get())
 }
 
+/// The builtin typedef (the target's `size_t`) that `__builtin_offsetof`'s
+/// expansion casts to: `((__lccc_offsetof_size_t)&((type *)0)->member)`. The
+/// reserved name marks the expansion, so the integer-constant-expression
+/// rules can accept `offsetof` while rejecting the spelled-out idiom
+/// `(size_t)&((T *)0)->m`, as GCC does.
+pub const OFFSETOF_SIZE_TYPEDEF: &str = "__lccc_offsetof_size_t";
+
 /// Whether the current target is 32-bit (ILP32).
 pub fn target_is_32bit() -> bool {
     target_ptr_size() == 4
@@ -359,8 +366,20 @@ impl std::fmt::Display for AddressSpace {
 pub enum CType {
     Void,
     Bool,
+    /// Signed 8-bit char: plain `char` where plain char is signed (x86,
+    /// i686), explicit `signed char` where it is unsigned (AArch64, RISC-V).
     Char,
+    /// Unsigned 8-bit `unsigned char`.
     UChar,
+    /// Explicit `signed char` where plain char is signed. Layout-, value- and
+    /// promotion-identical to `Char`; differs only in type identity (C11
+    /// 6.2.5p15: char, signed char and unsigned char are three distinct types),
+    /// which `_Generic`, `__builtin_types_compatible_p` and pointer
+    /// compatibility observe. Every pattern naming `Char` also names `SChar`.
+    SChar,
+    /// Plain `char` where plain char is unsigned: the `UChar` counterpart of
+    /// `SChar`. Every pattern naming `UChar` also names `PlainUChar`.
+    PlainUChar,
     Short,
     UShort,
     Int,
@@ -394,6 +413,11 @@ pub enum CType {
     /// C99 _Complex long double: two f128 values (real, imag) - uses F128 storage per component
     ComplexLongDouble,
     Pointer(Box<CType>, AddressSpace),
+    /// C23 `nullptr_t` (6.2.5p25), the type of `nullptr`: an unqualified
+    /// scalar with the size, alignment and representation of `void *` whose
+    /// only value is the null pointer. It converts to any pointer type and
+    /// to `bool`, compares with pointers, and is never arithmetic.
+    NullPtr,
     Array(Box<CType>, Option<usize>),
     Function(Box<FunctionType>),
     /// Struct type, identified by key (e.g., "struct.Foo" or "__anon_struct_7").
@@ -453,51 +477,99 @@ pub enum I386ExtVectorCarrier {
 /// `<N x x86_fp80>` at the element's 80-bit size (see `ExtVectorLayout`).
 pub const X87_LANE_STRIDE: usize = 10;
 
-/// The lane indices a Clang ext-vector component spelling names on a
-/// vector of `lanes` lanes, WITHOUT the range check (`ext_vector_swizzle`
-/// adds it): `None` only when `name` is not a component spelling at all.
-/// One naming set per access -- `xyzw`, `rgba`, or `s`/`S` followed by hex
-/// digits -- and the four halving names `lo`/`hi`/`even`/`odd`, which stand
-/// alone and are resolved against the lane count. Sema uses the split to
-/// tell "illegal vector component name" from "access exceeds type".
-pub fn ext_vector_component_indices(name: &str, lanes: usize) -> Option<Vec<usize>> {
-    let idx: Vec<usize> = match name {
-        "lo" => (0..lanes / 2).collect(),
-        "hi" => (lanes / 2..lanes).collect(),
-        "even" => (0..lanes).step_by(2).collect(),
-        "odd" => (1..lanes).step_by(2).collect(),
-        _ => {
-            let bytes = name.as_bytes();
-            if bytes.is_empty() {
-                return None;
+/// Why a Clang ext-vector element selector is invalid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtVectorSelectorError {
+    /// `illegal vector component name '...'`, quoting the selector bytes in
+    /// this range (char boundaries): the offending character, or the whole
+    /// selector on a `_Bool` vector. Clang places the caret `range.start`
+    /// bytes after the byte that follows the `.`/`->` operator's first byte.
+    IllegalName(std::ops::Range<usize>),
+    /// `vector component access exceeds type ...`, at the operator.
+    ExceedsType,
+}
+
+impl ExtVectorSelectorError {
+    /// Clang 23.1.3's message for this error in `<vector>.<selector>`.
+    /// Clang spells the vector by its typedef name where lccc has none.
+    pub fn message(&self, selector: &str, vector: &CType) -> String {
+        match self {
+            ExtVectorSelectorError::IllegalName(range) => {
+                let name = selector.get(range.clone()).unwrap_or(selector);
+                format!("illegal vector component name '{name}'")
             }
-            if bytes[0] == b's' || bytes[0] == b'S' {
-                if bytes.len() < 2 {
-                    return None;
-                }
-                bytes[1..]
-                    .iter()
-                    .map(|&b| (b as char).to_digit(16).map(|d| d as usize))
-                    .collect::<Option<Vec<_>>>()?
-            } else {
-                let set: &[u8] = if bytes.iter().all(|b| b"xyzw".contains(b)) {
-                    b"xyzw"
-                } else if bytes.iter().all(|b| b"rgba".contains(b)) {
-                    b"rgba"
-                } else {
-                    return None;
-                };
-                bytes
-                    .iter()
-                    .map(|b| set.iter().position(|c| c == b))
-                    .collect::<Option<Vec<_>>>()?
+            ExtVectorSelectorError::ExceedsType => {
+                let (elem, lanes) = vector.vector_info().map_or_else(
+                    || (String::new(), 0),
+                    |(elem, lanes)| (elem.to_string(), lanes),
+                );
+                let plural = if lanes == 1 { "" } else { "s" };
+                format!(
+                    "vector component access exceeds type '{vector}' \
+                     (vector of {lanes} '{elem}' value{plural})"
+                )
             }
         }
-    };
-    if idx.is_empty() {
-        return None;
     }
-    Some(idx)
+}
+
+/// The lanes an ext-vector element selector (`v.wzyx`, `v.s3`, `v.hi`) names
+/// on a vector of `lanes` logical lanes, in result order.
+///
+/// Rules measured against Clang 23.1.3 (`Sema::CheckExtVectorComponent`):
+/// the first character picks one accessor set, `xyzw` or `rgba` (lanes
+/// 0-3), or `s`/`S` followed by one or more hex digits; the first character
+/// outside that set is the illegal one; every named lane must be a logical
+/// lane. The whole names `hi`, `lo`, `even` and `odd` select
+/// `(lanes + 1) / 2` lanes: `lo` from 0, `hi` from `(lanes + 1) / 2`,
+/// `even`/`odd` every other lane. Those may name the padding lane of an
+/// odd-length vector (`v3.hi` is lanes 2 and 3) and, on a one-lane vector,
+/// lane 1, outside the object: Clang reads such a lane as poison, and the
+/// lane helpers read it as zero and drop stores to it without touching
+/// memory. Selectors may repeat lanes and have any length.
+pub fn ext_vector_selector_lanes(
+    name: &str,
+    lanes: usize,
+) -> Result<Vec<usize>, ExtVectorSelectorError> {
+    let half = lanes.div_ceil(2);
+    // (first lane, stride) of a halving selector.
+    let halving = match name {
+        "lo" => Some((0, 1)),
+        "hi" => Some((half, 1)),
+        "even" => Some((0, 2)),
+        "odd" => Some((1, 2)),
+        _ => None,
+    };
+    if let Some((first, stride)) = halving {
+        return Ok((0..half).map(|i| first + stride * i).collect());
+    }
+    let illegal = |at: usize, c: char| ExtVectorSelectorError::IllegalName(at..at + c.len_utf8());
+    let Some(first) = name.chars().next() else {
+        return Err(ExtVectorSelectorError::IllegalName(0..0));
+    };
+    let numeric = matches!(first, 's' | 'S');
+    let lane_of: fn(char) -> Option<usize> = if numeric {
+        |c| c.to_digit(16).map(|d| d as usize)
+    } else if "xyzw".contains(first) {
+        |c| "xyzw".find(c)
+    } else if "rgba".contains(first) {
+        |c| "rgba".find(c)
+    } else {
+        return Err(illegal(0, first));
+    };
+    // Byte offset of the first component: `s`/`S` is a prefix, not a lane.
+    let start = if numeric { first.len_utf8() } else { 0 };
+    if start == name.len() {
+        return Err(illegal(0, first));
+    }
+    let mut selected = Vec::with_capacity(name.len() - start);
+    for (at, c) in name[start..].char_indices() {
+        selected.push(lane_of(c).ok_or_else(|| illegal(start + at, c))?);
+    }
+    if selected.iter().any(|&lane| lane >= lanes) {
+        return Err(ExtVectorSelectorError::ExceedsType);
+    }
+    Ok(selected)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -550,7 +622,9 @@ impl ExtVectorLayout {
         } else {
             match element {
                 CType::Char
+                | CType::SChar
                 | CType::UChar
+                | CType::PlainUChar
                 | CType::Short
                 | CType::UShort
                 | CType::Int
@@ -646,9 +720,20 @@ pub struct EnumType {
     /// When true (__attribute__((packed))), the enum uses the smallest
     /// integer type that can represent all variant values.
     pub is_packed: bool,
+    /// C23 fixed underlying type (`enum E : T`, 6.7.2.2p5): the enum is
+    /// compatible with it, has its size and alignment, and its enumerators
+    /// have the enumerated type. Overrides `is_packed` and the value rules.
+    pub fixed: Option<Box<CType>>,
 }
 
 impl EnumType {
+    /// The fixed underlying type `: T` names, if it is a valid one (C23
+    /// 6.7.2.2p5: an integer type other than an enumerated type; its
+    /// qualifiers are dropped, and `CType` carries none).
+    pub fn fixed_underlying(ty: CType) -> Option<CType> {
+        (ty.is_integer() && !matches!(ty, CType::Enum(_))).then_some(ty)
+    }
+
     /// The integer type this enumeration is *compatible* with.
     ///
     /// C11 6.7.2.2p4: "Each enumerated type shall be compatible with char, a
@@ -669,11 +754,15 @@ impl EnumType {
     /// follows `packed_size` so a packed enum's compatible type is the same
     /// smallest type it occupies.
     pub fn compatible_ctype(&self) -> CType {
+        if let Some(fixed) = &self.fixed {
+            return (**fixed).clone();
+        }
         let any_negative = self.variants.iter().any(|(_, v)| *v < 0);
         match self.packed_size() {
             1 => {
                 if any_negative {
-                    CType::Char
+                    // GCC c_common_type_for_size(8, signed): `signed char`
+                    CType::signed_char()
                 } else {
                     CType::UChar
                 }
@@ -709,6 +798,9 @@ impl EnumType {
     /// on LP64). GCC 16.2 and Clang 23.1.3 agree in every `-std` mode
     /// (measured with `_Generic` and `sizeof` under gnu17, gnu23 and c11).
     pub fn constant_ctype(&self) -> CType {
+        if self.fixed.is_some() {
+            return CType::Enum(self.clone());
+        }
         if self.variants.iter().all(|(_, v)| i32::try_from(*v).is_ok()) {
             CType::Int
         } else {
@@ -720,6 +812,9 @@ impl EnumType {
     /// Non-packed enums are always 4 bytes (int). Packed enums use the
     /// smallest integer type that can represent all variant values.
     pub fn packed_size(&self) -> usize {
+        if let Some(fixed) = &self.fixed {
+            return fixed.size();
+        }
         if !self.is_packed {
             // Non-packed enum: 4 bytes when ONE 32-bit type holds every value
             // (`unsigned int` without negatives, else `int`), otherwise 8 (GCC
@@ -1230,7 +1325,7 @@ impl StructLayout {
     fn smallest_int_ctype_for_bytes(needed_bytes: usize, is_signed: bool) -> CType {
         if is_signed {
             match needed_bytes {
-                0..=1 => CType::Char,
+                0..=1 => CType::signed_char(),
                 2 => CType::Short,
                 3..=4 => CType::Int,
                 _ => CType::LongLong,
@@ -1875,8 +1970,11 @@ impl std::fmt::Display for CType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CType::Void => write!(f, "void"),
+            CType::NullPtr => write!(f, "nullptr_t"),
             CType::Bool => write!(f, "_Bool"),
-            CType::Char => write!(f, "char"),
+            CType::Char if char_is_unsigned() => write!(f, "signed char"),
+            CType::Char | CType::PlainUChar => write!(f, "char"),
+            CType::SChar => write!(f, "signed char"),
             CType::UChar => write!(f, "unsigned char"),
             CType::Short => write!(f, "short"),
             CType::UShort => write!(f, "unsigned short"),
@@ -1976,10 +2074,13 @@ impl std::fmt::Display for CType {
                 write!(f, "__attribute__((vector_size({}))) {}", total_size, elem)
             }
             CType::ExtVector(elem, layout) => {
+                // Clang's canonical spelling (the element first); Clang shows
+                // a typedef name instead where one was written, which a
+                // CType does not record.
                 write!(
                     f,
-                    "__attribute__((ext_vector_type({}))) {}",
-                    layout.lanes, elem
+                    "{} __attribute__((ext_vector_type({})))",
+                    elem, layout.lanes
                 )
             }
         }
@@ -1999,6 +2100,34 @@ pub fn set_char_unsigned(unsigned: bool) {
 }
 
 /// The target's plain-char signedness (true: `char` behaves as `unsigned char`).
+impl CType {
+    /// The type of plain `char` on the current target.
+    pub fn plain_char() -> CType {
+        if char_is_unsigned() {
+            CType::PlainUChar
+        } else {
+            CType::Char
+        }
+    }
+
+    /// The type of explicit `signed char` on the current target.
+    pub fn signed_char() -> CType {
+        if char_is_unsigned() {
+            CType::Char
+        } else {
+            CType::SChar
+        }
+    }
+
+    /// Whether this is one of the three character types (C11 6.2.5p15).
+    pub fn is_char_type(&self) -> bool {
+        matches!(
+            self,
+            CType::Char | CType::SChar | CType::UChar | CType::PlainUChar
+        )
+    }
+}
+
 pub fn char_is_unsigned() -> bool {
     CHAR_UNSIGNED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -2098,7 +2227,7 @@ impl CType {
             // no size yet (linked structs/unions whose layout is not computed),
             // which must NOT read as 1.
             CType::Void => 1,
-            CType::Bool | CType::Char | CType::UChar => 1,
+            CType::Bool | CType::Char | CType::SChar | CType::UChar | CType::PlainUChar => 1,
             CType::Short | CType::UShort => 2,
             CType::Int | CType::UInt => 4,
             // ILP32: long = 4 bytes; LP64: long = 8 bytes
@@ -2132,7 +2261,7 @@ impl CType {
                     32
                 }
             }
-            CType::Pointer(_, _) => ptr_sz,
+            CType::Pointer(_, _) | CType::NullPtr => ptr_sz,
             // Saturation, not wrapping: a length that overflows `usize`
             // must only ever make the object *larger* than it can be, never
             // smaller, so that no path can silently produce an under-sized
@@ -2157,7 +2286,7 @@ impl CType {
         let ptr_sz = target_ptr_size();
         match self {
             CType::Void => 1,
-            CType::Bool | CType::Char | CType::UChar => 1,
+            CType::Bool | CType::Char | CType::SChar | CType::UChar | CType::PlainUChar => 1,
             CType::Short | CType::UShort => 2,
             CType::Int | CType::UInt => 4,
             // ILP32: long aligned to 4; LP64: long aligned to 8
@@ -2215,7 +2344,7 @@ impl CType {
                     16
                 }
             }
-            CType::Pointer(_, _) => ptr_sz,
+            CType::Pointer(_, _) | CType::NullPtr => ptr_sz,
             CType::Array(elem, _) => elem.align_ctx(ctx),
             CType::Function(_) => ptr_sz,
             CType::Struct(key) | CType::Union(key) => {
@@ -2313,12 +2442,54 @@ impl CType {
         }
     }
 
+    /// GCC's `__builtin_classify_type` class of a value of this type (its
+    /// `enum type_class`), after the argument's array and function
+    /// decay. Measured with GCC 16.2: `char`, `_Bool` and enums are
+    /// `integer_type_class` (1) in C; vectors are `vector_type_class` (19).
+    pub fn gcc_type_class(&self) -> i64 {
+        match self {
+            CType::Void => 0,
+            CType::Bool
+            | CType::Char
+            | CType::SChar
+            | CType::UChar
+            | CType::PlainUChar
+            | CType::Short
+            | CType::UShort
+            | CType::Int
+            | CType::UInt
+            | CType::Long
+            | CType::ULong
+            | CType::LongLong
+            | CType::ULongLong
+            | CType::Int128
+            | CType::UInt128
+            | CType::Enum(_) => 1,
+            CType::Float
+            | CType::Double
+            | CType::LongDouble
+            | CType::Float128
+            | CType::Decimal32
+            | CType::Decimal64
+            | CType::Decimal128 => 8,
+            CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => 9,
+            CType::Pointer(..) | CType::Array(..) | CType::Function(_) => 5,
+            // GCC 16.2: `__builtin_classify_type(nullptr)` is -1 (no class).
+            CType::NullPtr => -1,
+            CType::Struct(_) => 12,
+            CType::Union(_) => 13,
+            CType::Vector(..) | CType::ExtVector(..) => 19,
+        }
+    }
+
     pub fn is_integer(&self) -> bool {
         matches!(
             self,
             CType::Bool
                 | CType::Char
+                | CType::SChar
                 | CType::UChar
+                | CType::PlainUChar
                 | CType::Short
                 | CType::UShort
                 | CType::Int
@@ -2339,7 +2510,13 @@ impl CType {
         }
         matches!(
             self,
-            CType::Char | CType::Short | CType::Int | CType::Long | CType::LongLong | CType::Int128
+            CType::Char
+                | CType::SChar
+                | CType::Short
+                | CType::Int
+                | CType::Long
+                | CType::LongLong
+                | CType::Int128
         )
     }
 
@@ -2377,9 +2554,23 @@ impl CType {
         }
     }
 
-    /// Whether this is an arithmetic type (integer, floating-point, or complex).
+    /// Whether values of this type live in an integer carrier and take
+    /// their arithmetic, comparisons, conversions and truthiness from
+    /// library helpers: the decimal types (libbid) and _Float128 (libgcc
+    /// soft-float). Raw IR integer operations on such a carrier are wrong.
+    pub fn is_soft_float(&self) -> bool {
+        self.is_decimal() || matches!(self, CType::Float128)
+    }
+
+    /// Whether this is an arithmetic type (integer, real floating, or
+    /// complex). _Float128 is a real floating type (C23 6.2.5) and so
+    /// arithmetic, although `is_floating()` excludes it: that predicate
+    /// gates hardware FP codegen, which binary128 never reaches.
     pub fn is_arithmetic(&self) -> bool {
-        self.is_integer() || self.is_floating() || self.is_complex()
+        self.is_integer()
+            || self.is_floating()
+            || matches!(self, CType::Float128)
+            || self.is_complex()
     }
 
     /// SysV AMD64 by-value argument convention of a struct, union or vector
@@ -2696,23 +2887,27 @@ impl CType {
         (1..=3).contains(&words).then_some(words)
     }
 
-    /// Resolve a Clang ext-vector component access (`v.x`, `v.zyx`, `v.rgb`,
-    /// `v.s03`, `v.lo`/`.hi`/`.even`/`.odd`) on this vector type to the lane
-    /// indices it names, in order. `None` when `self` is not an ext vector
-    /// or the spelling is not a component name for it (callers diagnose:
-    /// Clang says "illegal vector component name" / "vector component access
-    /// exceeds type"). Mirrors `Sema::CheckExtVectorComponent`: one naming
-    /// set per access (`xyzw`, `rgba`, or `s` followed by hex digits), every
-    /// index below the lane count; the four halving names stand alone.
-    pub fn ext_vector_swizzle(&self, name: &str) -> Option<Vec<usize>> {
+    /// The lanes the Clang ext-vector element selection `self.<name>` names
+    /// (see [`ext_vector_selector_lanes`]). `None` when `self` is not an ext
+    /// vector; an error for every selector on a `_Bool` ext vector, which
+    /// Clang 23.1.3 rejects quoting the whole name (`b.x`, `b.lo`, `b.s1`).
+    pub fn ext_vector_selection(
+        &self,
+        name: &str,
+    ) -> Option<Result<Vec<usize>, ExtVectorSelectorError>> {
         let CType::ExtVector(_, layout) = self else {
             return None;
         };
-        let idx = ext_vector_component_indices(name, layout.lanes)?;
-        if idx.iter().any(|&i| i >= layout.lanes) {
-            return None;
+        if layout.bitpacked_bool {
+            return Some(Err(ExtVectorSelectorError::IllegalName(0..name.len())));
         }
-        Some(idx)
+        Some(ext_vector_selector_lanes(name, layout.lanes))
+    }
+
+    /// The lanes of a valid ext-vector element selection `self.<name>`;
+    /// `None` for a non-ext-vector or an invalid selector (sema diagnoses).
+    pub fn ext_vector_swizzle(&self, name: &str) -> Option<Vec<usize>> {
+        self.ext_vector_selection(name)?.ok()
     }
 
     /// The type of the component access `self.name`: the element type for a
@@ -2723,11 +2918,17 @@ impl CType {
         let CType::ExtVector(elem, _) = self else {
             return None;
         };
-        if lanes.len() == 1 {
-            return Some((**elem).clone());
+        Self::ext_vector_selection_ctype(elem, lanes.len())
+    }
+
+    /// The type of an ext-vector selection of `count` lanes of `elem`: the
+    /// element itself for one lane, else an ext vector of `count` lanes.
+    pub fn ext_vector_selection_ctype(elem: &CType, count: usize) -> Option<CType> {
+        if count == 1 {
+            return Some(elem.clone());
         }
-        let layout = ExtVectorLayout::new(elem, lanes.len())?;
-        Some(CType::ExtVector(elem.clone(), layout))
+        let layout = ExtVectorLayout::new(elem, count)?;
+        Some(CType::ExtVector(Box::new(elem.clone()), layout))
     }
 
     /// An ext vector of `long double` lanes: lanes are 10 bytes apart (the
@@ -2759,7 +2960,8 @@ impl CType {
     pub fn vector_comparison_result(&self) -> Option<CType> {
         let signed_lane = |elem: &CType| -> Option<CType> {
             Some(match elem.size() {
-                1 => CType::Char,
+                // GCC and Clang: `__vector signed char`
+                1 => CType::signed_char(),
                 2 => CType::Short,
                 4 => CType::Int,
                 8 => CType::LongLong,
@@ -2810,7 +3012,13 @@ impl CType {
     /// Short/UShort all fit in int).
     pub fn integer_promoted(&self) -> CType {
         match self {
-            CType::Bool | CType::Char | CType::UChar | CType::Short | CType::UShort => CType::Int,
+            CType::Bool
+            | CType::Char
+            | CType::SChar
+            | CType::UChar
+            | CType::PlainUChar
+            | CType::Short
+            | CType::UShort => CType::Int,
             // An enum promotes as its compatible type does (C11 6.3.1.1p2): a
             // packed one to `int`, an `unsigned int` one stays unsigned.
             CType::Enum(e) => e.compatible_ctype().integer_promoted(),
@@ -2838,6 +3046,7 @@ impl CType {
             self,
             CType::Bool
                 | CType::UChar
+                | CType::PlainUChar
                 | CType::UShort
                 | CType::UInt
                 | CType::ULong
@@ -2851,7 +3060,7 @@ impl CType {
     pub fn integer_rank(&self) -> u32 {
         match self {
             CType::Bool => 0,
-            CType::Char | CType::UChar => 1,
+            CType::Char | CType::SChar | CType::UChar | CType::PlainUChar => 1,
             CType::Short | CType::UShort => 2,
             CType::Int | CType::UInt => 3,
             // An enum ranks as its compatible type (C11 6.3.1.1p1).
@@ -2935,6 +3144,18 @@ impl CType {
             // one decimal + one binary float: binary float wins (see above)
         }
 
+        // _Float128 (IEEE binary128) holds every value of every standard
+        // floating type on every lccc target (x87 extended has the same
+        // exponent range and 64 < 113 significand bits; elsewhere long
+        // double is binary128 itself or double), so it is the common type of
+        // any mix with a real arithmetic type, integers included (C23
+        // 6.3.1.8; GCC: the interchange type wins over a long double of the
+        // same format). Without this arm a float or double operand won and
+        // an integer one was ranked like `int`.
+        if matches!(&l, CType::Float128) || matches!(&r, CType::Float128) {
+            return CType::Float128;
+        }
+
         // Non-complex: standard type hierarchy
         if matches!(&l, CType::LongDouble) || matches!(&r, CType::LongDouble) {
             return CType::LongDouble;
@@ -2978,7 +3199,7 @@ impl CType {
     /// The unsigned type corresponding to a signed integer type (C11 6.3.1.8).
     fn to_unsigned_version(self) -> CType {
         match self {
-            CType::Char => CType::UChar,
+            CType::Char | CType::SChar => CType::UChar,
             CType::Short => CType::UShort,
             CType::Int => CType::UInt,
             CType::Long => CType::ULong,
@@ -3009,6 +3230,99 @@ impl CType {
     /// conversion first (C11 6.3.2.1p3-p4): `1 ? arr : arr` is an `int *`.
     /// Decaying here, not in each caller, keeps sema and lowering agreeing
     /// (sema once sized that conditional as the array, 16 bytes, not 8).
+    /// Whether a `?:` arm's null-pointer-constant status can change
+    /// [`Self::conditional_composite_type`]: only for a `void *` arm against
+    /// a pointer to a non-void type, where `(void *)0` takes the other arm's
+    /// type and any other `void *` makes the result `void *` (C11 6.5.15p6).
+    /// An integer arm against a pointer yields the pointer type either way.
+    pub fn conditional_arm_npc_matters(arm: Option<&CType>, other: Option<&CType>) -> bool {
+        let pointee_is_void = |ct: &CType| match ct.decayed_value_ctype() {
+            CType::Pointer(pointee, _) => Some(matches!(*pointee, CType::Void)),
+            _ => None,
+        };
+        arm.and_then(pointee_is_void) == Some(true)
+            && other.and_then(pointee_is_void) == Some(false)
+    }
+
+    /// Whether two pointee types are certainly not compatible (C11 6.2.7),
+    /// judged only where `CType` carries enough to be sure: distinct basic
+    /// arithmetic types, distinct structure/union tags, a record against a
+    /// scalar, recursing through pointer levels. Enumerations (compatible
+    /// with their underlying integer type), arrays, functions and vectors
+    /// (composite-type rules) answer `false`.
+    fn pointees_definitely_incompatible(a: &CType, b: &CType) -> bool {
+        let basic = |ct: &CType| {
+            matches!(
+                ct,
+                CType::Bool
+                    | CType::Char
+                    | CType::SChar
+                    | CType::UChar
+                    | CType::PlainUChar
+                    | CType::Short
+                    | CType::UShort
+                    | CType::Int
+                    | CType::UInt
+                    | CType::Long
+                    | CType::ULong
+                    | CType::LongLong
+                    | CType::ULongLong
+                    | CType::Int128
+                    | CType::UInt128
+                    | CType::Float
+                    | CType::Double
+                    | CType::LongDouble
+                    | CType::Float128
+                    | CType::Decimal32
+                    | CType::Decimal64
+                    | CType::Decimal128
+                    | CType::ComplexFloat
+                    | CType::ComplexDouble
+                    | CType::ComplexLongDouble
+            )
+        };
+        let record = |ct: &CType| matches!(ct, CType::Struct(_) | CType::Union(_));
+        match (a, b) {
+            (CType::Pointer(pa, _), CType::Pointer(pb, _)) => {
+                Self::pointees_definitely_incompatible(pa, pb)
+            }
+            _ if basic(a) && basic(b) => a != b,
+            _ if record(a) && record(b) => a != b,
+            _ => (basic(a) && record(b)) || (record(a) && basic(b)),
+        }
+    }
+
+    /// Whether a `_Generic` association of type `assoc` matches a controlling
+    /// operand of type `self`: compatible types (C23 6.5.1.1p2, 6.2.7) on
+    /// lccc's qualifier-free `CType`, whose constness the callers compare
+    /// through `GenericAssociation::is_const`. The operand type is taken as
+    /// given -- callers apply lvalue conversion to an expression operand and
+    /// none to a type operand -- and nothing decays below the top level:
+    /// `int (*)[3]` is not compatible with `int **`, nor with `int (*)[4]`.
+    /// An enumeration is compatible with its compatible integer type (which
+    /// is `unsigned int` when no enumerator is negative), not with `int`.
+    pub fn generic_association_matches(&self, assoc: &CType) -> bool {
+        match (self, assoc) {
+            (CType::Enum(_), CType::Enum(_)) => self == assoc,
+            (CType::Enum(e), other) | (other, CType::Enum(e)) => e.compatible_ctype() == *other,
+            (CType::Pointer(a, _), CType::Pointer(b, _)) => a.generic_association_matches(b),
+            (CType::Array(a, la), CType::Array(b, lb)) => {
+                (la.is_none() || lb.is_none() || la == lb) && a.generic_association_matches(b)
+            }
+            // Parameter names are not part of the type.
+            (CType::Function(a), CType::Function(b)) => {
+                a.variadic == b.variadic
+                    && a.params.len() == b.params.len()
+                    && a.return_type.generic_association_matches(&b.return_type)
+                    && a.params
+                        .iter()
+                        .zip(&b.params)
+                        .all(|((pa, _), (pb, _))| pa.generic_association_matches(pb))
+            }
+            _ => self == assoc,
+        }
+    }
+
     pub fn conditional_composite_type(
         then_ct: Option<CType>,
         else_ct: Option<CType>,
@@ -3023,6 +3337,14 @@ impl CType {
                 if matches!(&t, CType::Void) && matches!(&e, CType::Void) {
                     return Some(CType::Void);
                 }
+                // C23 6.5.15p6: `nullptr_t` against a pointer is the pointer
+                // type (both oracles: `c ? nullptr : (int *)p` is `int *`).
+                // Two `nullptr_t` arms fall through to the shared type below.
+                match (&t, &e) {
+                    (CType::NullPtr, CType::Pointer(..)) => return Some(e),
+                    (CType::Pointer(..), CType::NullPtr) => return Some(t),
+                    _ => {}
+                }
                 // Both pointers: C11 6.5.15p6 rules
                 if let (CType::Pointer(inner_t, _), CType::Pointer(inner_e, _)) = (&t, &e) {
                     let t_is_void = matches!(inner_t.as_ref(), CType::Void);
@@ -3035,16 +3357,33 @@ impl CType {
                         // then=T*, else=void*: if else is NPC, result is T*; else void*
                         return if else_is_npc { Some(t) } else { Some(e) };
                     }
+                    // Pointers to incompatible types: GCC diagnoses the
+                    // mismatch (an error since GCC 14, a warning under
+                    // -fpermissive) and types the result `void *`; lccc
+                    // accepts the mismatch, so the type must still be
+                    // GCC's: `(c ? (int *)a : (char *)b) + 1` advances one
+                    // byte, not four.
+                    if Self::pointees_definitely_incompatible(inner_t, inner_e) {
+                        let space = match &t {
+                            CType::Pointer(_, space) => *space,
+                            _ => AddressSpace::Default,
+                        };
+                        return Some(CType::Pointer(Box::new(CType::Void), space));
+                    }
                     return Some(t);
                 }
-                // One pointer, one integer 0 (null pointer constant)
+                // One pointer, one integer: the pointer type, whether or not
+                // the integer is a null pointer constant (GCC 16.2: `c ? 1 :
+                // p` is a `char *` with a pointer/integer mismatch
+                // diagnostic). Taking the integer arm's type truncated the
+                // pointer arm to 32 bits.
                 if let CType::Pointer(..) = &t {
-                    if e.is_arithmetic() && else_is_npc {
+                    if e.is_integer() {
                         return Some(t);
                     }
                 }
                 if let CType::Pointer(..) = &e {
-                    if t.is_arithmetic() && then_is_npc {
+                    if t.is_integer() {
                         return Some(e);
                     }
                 }
@@ -3444,8 +3783,8 @@ impl IrType {
         match ct {
             CType::Void => IrType::Void,
             CType::Bool => IrType::U8,
-            CType::Char => IrType::I8,
-            CType::UChar => IrType::U8,
+            CType::Char | CType::SChar => IrType::I8,
+            CType::UChar | CType::PlainUChar => IrType::U8,
             CType::Short => IrType::I16,
             CType::UShort => IrType::U16,
             CType::Int => IrType::I32,
@@ -3488,7 +3827,9 @@ impl IrType {
             CType::Decimal128 => IrType::U128,
             // Complex types are handled as aggregate (pointer to stack slot)
             CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => IrType::Ptr,
-            CType::Pointer(_, _) | CType::Array(_, _) | CType::Function(_) => IrType::Ptr,
+            CType::Pointer(_, _) | CType::Array(_, _) | CType::Function(_) | CType::NullPtr => {
+                IrType::Ptr
+            }
             CType::Struct(_) | CType::Union(_) => IrType::Ptr,
             // Vectors are treated as aggregate types (pointer to stack slot)
             CType::Vector(_, _) | CType::ExtVector(_, _) => IrType::Ptr,
@@ -3711,5 +4052,270 @@ mod cast_predicate_tests {
             }
         }
         assert!(!IrType::Ptr.cast_preserves_offset_value(IrType::Ptr));
+    }
+}
+
+#[cfg(test)]
+mod ext_vector_selector_tests {
+    use super::{CType, ExtVectorLayout, ExtVectorSelectorError, ext_vector_selector_lanes};
+
+    fn lanes(name: &str, n: usize) -> Vec<usize> {
+        ext_vector_selector_lanes(name, n).unwrap_or_else(|e| panic!("{name} on {n}: {e:?}"))
+    }
+
+    fn ext_vector(elem: CType, n: usize) -> CType {
+        let layout = ExtVectorLayout::new(&elem, n).expect("x86 ext-vector layout");
+        CType::ExtVector(Box::new(elem), layout)
+    }
+
+    /// Expected lanes are Clang 23.1.3 results on int vectors {10, 11, ...}.
+    #[test]
+    fn accessor_sets_and_numeric_selectors() {
+        assert_eq!(lanes("wzyx", 4), [3, 2, 1, 0]);
+        assert_eq!(lanes("abgr", 4), [3, 2, 1, 0]);
+        assert_eq!(lanes("s3210", 4), [3, 2, 1, 0]);
+        assert_eq!(lanes("S0", 4), [0]);
+        assert_eq!(lanes("sF0", 16), [15, 0]);
+        assert_eq!(lanes("sf0", 16), [15, 0]);
+        assert_eq!(lanes("xyzw", 8), [0, 1, 2, 3]);
+        assert_eq!(lanes("xx", 2), [0, 0]);
+        assert_eq!(lanes("xyzwxyzwxyzwxyzwx", 4).len(), 17);
+    }
+
+    #[test]
+    fn halving_selectors_round_up_and_may_name_padding() {
+        assert_eq!(lanes("hi", 4), [2, 3]);
+        assert_eq!(lanes("lo", 4), [0, 1]);
+        assert_eq!(lanes("even", 4), [0, 2]);
+        assert_eq!(lanes("odd", 8), [1, 3, 5, 7]);
+        // I3 {20, 21, 22}: lo = {20, 21}, hi.x = 22 (lane 3 is padding).
+        assert_eq!(lanes("lo", 3), [0, 1]);
+        assert_eq!(lanes("hi", 3), [2, 3]);
+        assert_eq!(lanes("even", 3), [0, 2]);
+        assert_eq!(lanes("odd", 3), [1, 3]);
+        // I1: lo is the element, hi lane 1 lies outside the object.
+        assert_eq!(lanes("lo", 1), [0]);
+        assert_eq!(lanes("hi", 1), [1]);
+        assert_eq!(lanes("odd", 5), [1, 3, 5]);
+    }
+
+    /// Clang 23.1.3's diagnostic for each rejected selector: the range is
+    /// the quoted name, at which Clang's caret points.
+    #[test]
+    fn clang_rejections() {
+        use ExtVectorSelectorError::{ExceedsType, IllegalName};
+        for (name, n, err) in [
+            ("xg", 4, IllegalName(1..2)),
+            ("xr", 4, IllegalName(1..2)),
+            ("q", 4, IllegalName(0..1)),
+            ("s", 4, IllegalName(0..1)),
+            ("sx", 4, IllegalName(1..2)),
+            ("s1x", 4, IllegalName(2..3)),
+            ("x0", 4, IllegalName(1..2)),
+            ("hix", 4, IllegalName(0..1)),
+            ("Hi", 4, IllegalName(0..1)),
+            ("zyq", 4, IllegalName(2..3)),
+            ("x\u{e9}", 4, IllegalName(1..3)),
+            ("", 4, IllegalName(0..0)),
+            ("s4", 4, ExceedsType),
+            ("sA", 4, ExceedsType),
+            ("w", 3, ExceedsType),
+            ("s3", 3, ExceedsType),
+            ("y", 1, ExceedsType),
+        ] {
+            assert_eq!(
+                ext_vector_selector_lanes(name, n),
+                Err(err),
+                "{name} on {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn clang_messages() {
+        let int4 = ext_vector(CType::Int, 4);
+        let int1 = ext_vector(CType::Int, 1);
+        let illegal = ExtVectorSelectorError::IllegalName(1..2);
+        assert_eq!(
+            illegal.message("xr", &int4),
+            "illegal vector component name 'r'"
+        );
+        let exceeds = ExtVectorSelectorError::ExceedsType.message("s4", &int4);
+        assert!(exceeds.starts_with("vector component access exceeds type '"));
+        assert!(
+            exceeds.ends_with("' (vector of 4 'int' values)"),
+            "{exceeds}"
+        );
+        let one = ExtVectorSelectorError::ExceedsType.message("y", &int1);
+        assert!(one.ends_with("' (vector of 1 'int' value)"), "{one}");
+    }
+
+    /// Clang 23.1.3 rejects every selector on a `_Bool` ext vector, quoting
+    /// the whole name: `b.s1`, `b.x`, `b.lo` and invalid ones alike.
+    #[test]
+    fn bool_vectors_reject_every_selector() {
+        let bool8 = ext_vector(CType::Bool, 8);
+        for name in ["s1", "x", "lo", "xyzw", "q"] {
+            let err = bool8
+                .ext_vector_selection(name)
+                .expect("a _Bool ext vector is an ext vector")
+                .expect_err(name);
+            assert_eq!(err, ExtVectorSelectorError::IllegalName(0..name.len()));
+            assert_eq!(
+                err.message(name, &bool8),
+                format!("illegal vector component name '{name}'")
+            );
+            assert_eq!(bool8.ext_vector_swizzle(name), None);
+        }
+        let int4 = ext_vector(CType::Int, 4);
+        assert_eq!(int4.ext_vector_swizzle("s1"), Some(vec![1]));
+        assert_eq!(CType::Int.ext_vector_selection("x"), None);
+    }
+
+    #[test]
+    fn selection_types() {
+        let int3 = ext_vector(CType::Int, 3);
+        assert_eq!(int3.ext_vector_swizzle_ctype("x"), Some(CType::Int));
+        assert_eq!(
+            int3.ext_vector_swizzle_ctype("hi"),
+            Some(ext_vector(CType::Int, 2))
+        );
+        let int1 = ext_vector(CType::Int, 1);
+        assert_eq!(int1.ext_vector_swizzle_ctype("lo"), Some(CType::Int));
+        assert_eq!(int1.ext_vector_swizzle_ctype("hi"), Some(CType::Int));
+        assert_eq!(
+            int3.ext_vector_swizzle_ctype("xyzwx"),
+            None,
+            "w exceeds a three-lane vector"
+        );
+        let int4 = ext_vector(CType::Int, 4);
+        assert_eq!(
+            int4.ext_vector_swizzle_ctype("xyzwx"),
+            Some(ext_vector(CType::Int, 5))
+        );
+    }
+}
+
+#[cfg(test)]
+mod conditional_type_tests {
+    use super::{AddressSpace, CType};
+
+    fn ptr(ct: CType) -> CType {
+        CType::Pointer(Box::new(ct), AddressSpace::Default)
+    }
+
+    #[test]
+    fn pointer_against_any_integer_is_the_pointer() {
+        // GCC 16.2: `c ? 1 : p` and `c ? p : 1L` are `char *`, null pointer
+        // constant or not; the integer arm's type truncated the pointer.
+        let p = ptr(CType::Char);
+        for int in [CType::Int, CType::Long, CType::Bool] {
+            for npc in [false, true] {
+                assert_eq!(
+                    CType::conditional_composite_type(
+                        Some(int.clone()),
+                        Some(p.clone()),
+                        npc,
+                        false
+                    ),
+                    Some(p.clone())
+                );
+                assert_eq!(
+                    CType::conditional_composite_type(
+                        Some(p.clone()),
+                        Some(int.clone()),
+                        false,
+                        npc
+                    ),
+                    Some(p.clone())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn void_pointer_arm_follows_its_null_pointer_constant_status() {
+        let (void_ptr, int_ptr) = (ptr(CType::Void), ptr(CType::Int));
+        assert_eq!(
+            CType::conditional_composite_type(
+                Some(void_ptr.clone()),
+                Some(int_ptr.clone()),
+                true,
+                false
+            ),
+            Some(int_ptr.clone())
+        );
+        assert_eq!(
+            CType::conditional_composite_type(
+                Some(int_ptr.clone()),
+                Some(void_ptr.clone()),
+                false,
+                false
+            ),
+            Some(void_ptr.clone())
+        );
+        assert!(CType::conditional_arm_npc_matters(
+            Some(&void_ptr),
+            Some(&int_ptr)
+        ));
+        // Only that pair: an integer or a non-void pointer arm, or `void *`
+        // against `void *` or an integer, gets the same type either way.
+        assert!(!CType::conditional_arm_npc_matters(
+            Some(&CType::Int),
+            Some(&int_ptr)
+        ));
+        assert!(!CType::conditional_arm_npc_matters(
+            Some(&int_ptr),
+            Some(&void_ptr)
+        ));
+        assert!(!CType::conditional_arm_npc_matters(
+            Some(&void_ptr),
+            Some(&void_ptr)
+        ));
+        assert!(!CType::conditional_arm_npc_matters(
+            Some(&void_ptr),
+            Some(&CType::Int)
+        ));
+        assert!(!CType::conditional_arm_npc_matters(None, Some(&int_ptr)));
+    }
+
+    #[test]
+    fn incompatible_object_pointers_give_void_pointer() {
+        // GCC 16.2 (-fpermissive): `c ? (char *)0 : ip` is `void *`.
+        let void_ptr = ptr(CType::Void);
+        let incompatible = [
+            (ptr(CType::Char), ptr(CType::Int)),
+            (ptr(CType::Long), ptr(CType::LongLong)),
+            (
+                ptr(CType::Struct("struct.A".into())),
+                ptr(CType::Struct("struct.B".into())),
+            ),
+            (ptr(CType::Struct("struct.A".into())), ptr(CType::Int)),
+            (ptr(ptr(CType::Char)), ptr(ptr(CType::Int))),
+        ];
+        for (a, b) in incompatible {
+            assert_eq!(
+                CType::conditional_composite_type(Some(a), Some(b), false, false),
+                Some(void_ptr.clone())
+            );
+        }
+        // Same, or not provably incompatible from `CType` alone: unchanged.
+        let kept = [
+            (ptr(CType::Int), ptr(CType::Int)),
+            (
+                ptr(CType::Struct("struct.A".into())),
+                ptr(CType::Struct("struct.A".into())),
+            ),
+            (
+                ptr(CType::Array(Box::new(CType::Int), Some(3))),
+                ptr(CType::Array(Box::new(CType::Int), None)),
+            ),
+        ];
+        for (a, b) in kept {
+            assert_eq!(
+                CType::conditional_composite_type(Some(a.clone()), Some(b), false, false),
+                Some(a)
+            );
+        }
     }
 }

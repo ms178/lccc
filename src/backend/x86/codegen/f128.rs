@@ -465,19 +465,13 @@ impl X86Codegen {
         match classify_cast(from_ty, to_ty) {
             CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => {}
 
-            CastKind::FloatToSigned { from_f64 } => {
+            CastKind::FloatToSigned { from_f64 } | CastKind::FloatToUnsigned { from_f64, .. } => {
                 if from_f64 {
                     self.state.emit("    movq %rax, %xmm0");
-                    self.state.emit("    cvttsd2siq %xmm0, %rax");
                 } else {
                     self.state.emit("    movd %eax, %xmm0");
-                    self.state.emit("    cvttss2siq %xmm0, %rax");
                 }
-                self.emit_sign_extend_to_rax(to_ty);
-            }
-
-            CastKind::FloatToUnsigned { from_f64, to_u64 } => {
-                self.emit_float_to_unsigned(from_f64, to_u64, to_ty);
+                self.emit_cvtt_xmm0_to_rax(from_f64, to_ty);
             }
 
             CastKind::SignedToFloat { to_f64, from_ty } => {
@@ -540,33 +534,67 @@ impl X86Codegen {
         }
     }
 
-    fn emit_float_to_unsigned(&mut self, from_f64: bool, to_u64: bool, to_ty: IrType) {
-        if from_f64 {
-            self.state.emit("    movq %rax, %xmm0");
-            if to_u64 {
+    /// Truncating SSE float -> integer conversion of `%xmm0` (f64 when
+    /// `from_f64`, else f32) into `%rax`, canonically extended for `to_ty`.
+    ///
+    /// Instruction selection matches GCC/Clang so even the C-undefined
+    /// out-of-range/NaN results agree with the reference compilers:
+    /// - I8/I16/I32/U8/U16: 32-bit `cvtts?2si` (range-safe for every
+    ///   defined input; out of range yields the 0x80000000 indefinite
+    ///   integer, not the low bits of the 64-bit indefinite value);
+    /// - I64/U32: 64-bit `cvtts?2siq` (U32 needs the wider range);
+    /// - U64: values >= 2^63 are biased down by 2^63 before converting and
+    ///   bit 63 is restored afterwards (for both f32 and f64; this is
+    ///   defined behaviour, so f32 must not take the plain signed path).
+    ///
+    /// Clobbers `%rcx` and `%xmm1` on the U64 path.
+    pub(super) fn emit_cvtt_xmm0_to_rax(&mut self, from_f64: bool, to_ty: IrType) {
+        let (sfx, cvt) = if from_f64 {
+            ("sd", "cvttsd2si")
+        } else {
+            ("ss", "cvttss2si")
+        };
+        match to_ty {
+            IrType::U64 => {
                 let big_label = self.state.fresh_label("f2u_big");
                 let done_label = self.state.fresh_label("f2u_done");
-                self.state.emit("    movabsq $4890909195324358656, %rcx");
-                self.state.emit("    movq %rcx, %xmm1");
-                self.state.emit("    ucomisd %xmm1, %xmm0");
+                if from_f64 {
+                    // 2^63 as f64.
+                    self.state.emit("    movabsq $4890909195324358656, %rcx");
+                    self.state.emit("    movq %rcx, %xmm1");
+                } else {
+                    // 2^63 as f32.
+                    self.state.emit("    movl $1593835520, %ecx");
+                    self.state.emit("    movd %ecx, %xmm1");
+                }
+                self.state
+                    .emit_fmt(format_args!("    ucomi{sfx} %xmm1, %xmm0"));
                 self.state.out.emit_jcc_label("    jae", &big_label);
-                self.state.emit("    cvttsd2siq %xmm0, %rax");
+                self.state.emit_fmt(format_args!("    {cvt}q %xmm0, %rax"));
                 self.state.out.emit_jmp_label(&done_label);
                 self.state.out.emit_named_label(&big_label);
-                self.state.emit("    subsd %xmm1, %xmm0");
-                self.state.emit("    cvttsd2siq %xmm0, %rax");
-                self.state.emit("    movabsq $9223372036854775808, %rcx");
-                self.state.emit("    addq %rcx, %rax");
+                self.state
+                    .emit_fmt(format_args!("    sub{sfx} %xmm1, %xmm0"));
+                self.state.emit_fmt(format_args!("    {cvt}q %xmm0, %rax"));
+                self.state.emit("    btcq $63, %rax");
                 self.state.out.emit_named_label(&done_label);
-            } else {
-                self.state.emit("    cvttsd2siq %xmm0, %rax");
             }
-        } else {
-            self.state.emit("    movd %eax, %xmm0");
-            self.state.emit("    cvttss2siq %xmm0, %rax");
-        }
-        if !to_u64 {
-            self.emit_zero_extend_to_rax(to_ty);
+            IrType::I32 | IrType::I16 | IrType::I8 | IrType::U16 | IrType::U8 => {
+                self.state.emit_fmt(format_args!("    {cvt}l %xmm0, %eax"));
+                if to_ty.is_signed() {
+                    self.emit_sign_extend_to_rax(to_ty);
+                } else {
+                    self.emit_zero_extend_to_rax(to_ty);
+                }
+            }
+            // I64, U32 (needs the wider range) and every other 8-byte
+            // carrier (Ptr): the 64-bit form, upstream's former default.
+            _ => {
+                self.state.emit_fmt(format_args!("    {cvt}q %xmm0, %rax"));
+                if to_ty == IrType::U32 {
+                    self.state.emit("    movl %eax, %eax");
+                }
+            }
         }
     }
 

@@ -1762,6 +1762,18 @@ fn peephole_optimize_inner(
     // which may remove the conditional back-edge that this pass uses to detect loops).
     // fuse_add_sign_extend removed (unsound: uninitialized dest + dropped sext).
 
+    // Phase 3c: the producer retarget whose sources may name either register,
+    // once the local fixpoints have converged (see
+    // `retarget_producer_into_copy_aliasing` for why not inside them).
+    if !skip_phase1
+        && !sk("producer_retarget")
+        && relay_and_lea::retarget_producer_into_copy_aliasing(&mut store, &mut infos)
+        && !sk("dead_regs")
+    {
+        self_zext::eliminate_redundant_self_zext(&store, &mut infos);
+        dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+    }
+
     // Phase 4: Eliminate loop backedge trampoline blocks.
     let trampoline_changed = if skip_phase4 || sk("loop_trampoline") {
         false

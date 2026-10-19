@@ -770,7 +770,19 @@ fn assign_program_points(
                 }
             }
 
-            collect_instruction_gen_dense(inst, alloca_set, id_to_dense, &kill, &mut gen_set);
+            // A phi reads each incoming value on its predecessor edge, not
+            // at the top of its own block: making the operands upward
+            // exposed here put a loop's back-edge value (defined later, in
+            // the latch) live-in at the header and so live-out of every
+            // predecessor, back to the function entry -- and its preheader
+            // value live across the whole loop.  The edge uses are added at
+            // the predecessors' ends below.  The phi-point use itself stays
+            // recorded (`record_instruction_uses_dense` above), so the
+            // intervals still cover the phi position, where phi elimination
+            // may place an edge's copy (`target_copies`).
+            if !matches!(inst, Instruction::Phi { .. }) {
+                collect_instruction_gen_dense(inst, alloca_set, id_to_dense, &kill, &mut gen_set);
+            }
 
             if let Some(dest) = inst.dest() {
                 if !alloca_set.contains(&dest.0) {
@@ -829,7 +841,14 @@ fn assign_program_points(
                                 if *entry == u32::MAX || pred_end > *entry {
                                     *entry = pred_end;
                                 }
-                                block_gen[pred_idx].insert(dense);
+                                // Upward exposed in `pred` only when `pred`
+                                // does not define V; a latch computing V
+                                // reads it after its own def, and the touch
+                                // at `pred_end` already extends V's segment
+                                // there to the block end.
+                                if !block_kill[pred_idx].contains(dense) {
+                                    block_gen[pred_idx].insert(dense);
+                                }
                                 touches.add(dense, pred_idx, pred_end, false);
                             }
                         }
@@ -3012,6 +3031,100 @@ mod tests {
         let result = compute_live_intervals(&func);
         let base = result.intervals.iter().find(|iv| iv.value_id == 0).unwrap();
         assert!(base.end >= 2, "base ended before folded Load: {base:?}");
+    }
+
+    /// A phi reads each incoming on its predecessor EDGE. b0 -> b1(header:
+    /// v1 = phi[v10 from b0, v2 from b2]) -> b2(latch: v2 = v1 + 2) -> b1,
+    /// exit b3. The back-edge value v2 is defined in the latch, so it must
+    /// not be live anywhere in the preheader b0 (gen'ing phi operands at
+    /// the header made it live-in there and live-out of b0, back to the
+    /// entry); the preheader value v10 dies on the b0 -> b1 edge and must
+    /// not be live through the latch b2 (it was carried around the loop).
+    #[test]
+    fn phi_incomings_are_live_only_on_their_edges() {
+        let add = |d: u32, a: u32, k: i64| Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(a)),
+            rhs: Operand::Const(IrConst::I64(k)),
+            ty: IrType::I64,
+        };
+        let mut func = IrFunction::new("phi_edges".to_string(), IrType::I64, vec![], false);
+        let block = |l: u32, instructions: Vec<Instruction>, terminator: Terminator| BasicBlock {
+            label: BlockId(l),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        };
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::I64,
+                    },
+                    add(10, 0, 1),
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![
+                    Instruction::Phi {
+                        dest: Value(1),
+                        ty: IrType::I64,
+                        incoming: vec![
+                            (Operand::Value(Value(10)), BlockId(0)),
+                            (Operand::Value(Value(2)), BlockId(2)),
+                        ],
+                    },
+                    add(3, 1, 1),
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(3)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(2, vec![add(2, 1, 2)], Terminator::Branch(BlockId(1))),
+            block(
+                3,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(1)))),
+            ),
+        ];
+        func.next_value_id = 11;
+
+        let r = compute_live_intervals(&func);
+        let overlaps = |vid: u32, b: usize| {
+            r.segments.iter().any(|iv| {
+                iv.value_id == vid && iv.start <= r.block_ends[b] && iv.end >= r.block_starts[b]
+            })
+        };
+        assert!(
+            !overlaps(2, 0),
+            "back-edge v2 live in the preheader: {:?}",
+            r.segments
+        );
+        assert!(
+            !overlaps(10, 2),
+            "preheader v10 live in the latch: {:?}",
+            r.segments
+        );
+        // The edges themselves stay covered: v10 to the end of b0, v2 to the
+        // end of the latch (where phi elimination places the edge copies).
+        assert!(
+            r.segments
+                .iter()
+                .any(|iv| iv.value_id == 10 && iv.end >= r.block_ends[0])
+        );
+        assert!(
+            r.segments
+                .iter()
+                .any(|iv| iv.value_id == 2 && iv.end >= r.block_ends[2])
+        );
     }
 
     #[test]

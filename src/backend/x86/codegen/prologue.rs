@@ -838,16 +838,22 @@ impl X86Codegen {
             caller_saved_regs.push(PhysReg(16)); // rdx
         }
 
-        // For a one-block leaf, ParamRefs are eligible for caller-saved homes.
-        // Prefer their incoming ABI registers in argument order so the common
-        // case needs no entry copy at all (rdi->rdi, rsi->rsi, rdx->rdx).
-        // RCX remains reserved scratch; remaining homes follow ABI order and
-        // the ordered parallel-copy emitter handles overlaps such as rcx->r8
-        // while a later argument still arrives in r8.
-        if crate::backend::regalloc::x86_param_caller_homes_safe_with_config(
-            func,
-            &self.state.ra_config,
-        ) {
+        // For a leaf, ParamRefs are eligible for caller-saved homes. Prefer
+        // their incoming ABI registers in argument order so the common case
+        // needs no entry copy at all (rdi->rdi, rsi->rsi, rdx->rdx). RCX
+        // remains reserved scratch; remaining homes follow ABI order and the
+        // ordered parallel-copy emitter handles overlaps such as rcx->r8
+        // while a later argument still arrives in r8. Leaves only: with real
+        // calls the reordered pool hands the argument registers to ordinary
+        // temporaries first, which the call staging must then evict (an extra
+        // callee-saved register or copy per call); there the parameters reach
+        // their ABI registers through the allocator's `reg_hints` instead.
+        if !has_calls
+            && crate::backend::regalloc::x86_param_caller_homes_safe_with_config(
+                func,
+                &self.state.ra_config,
+            )
+        {
             let preferred = [14u8, 15, 16, 12, 13, 10, 11];
             caller_saved_regs.sort_by_key(|reg| {
                 preferred

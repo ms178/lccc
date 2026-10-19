@@ -353,6 +353,8 @@ impl Lowerer {
                     result.vars.insert(name.clone());
                 }
             }
+            // Never evaluated, so it captures nothing.
+            Expr::TypeOperand(..) => {}
             Expr::LabelAddr(name, _) => {
                 // Handled by the caller's label bookkeeping: &&label of an
                 // enclosing function's label is a cross-function constant.

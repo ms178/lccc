@@ -394,7 +394,8 @@ impl Preprocessor {
             (
                 "__builtin_offsetof",
                 &["type", "member"],
-                "((unsigned long)&((type *)0)->member)",
+                // The cast type is `OFFSETOF_SIZE_TYPEDEF` (common/types.rs).
+                "((__lccc_offsetof_size_t)&((type *)0)->member)",
             ),
             // __has_builtin, __has_attribute, __has_feature, __has_extension,
             // __has_include, and __has_include_next are NOT defined as macros.

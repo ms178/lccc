@@ -486,6 +486,37 @@ pub(crate) fn register_size_suffix(name: &str) -> Option<char> {
     None
 }
 
+/// GNU as rejects a sign/zero extension whose register operand disagrees
+/// with the width its mnemonic spells (`movswq m, %eax`: "incorrect register
+/// `%eax' used with `q' suffix"; `movsbl %ax, %eax`: ... `b' suffix).
+/// Encoding the suffix's width regardless let a codegen defect ship `-S`
+/// output no GNU toolchain assembles; both x86 encoders reject such text
+/// exactly as GAS does.  Non-GPR operands are left to the caller's checks.
+pub(crate) fn check_movext_register_sizes(
+    ops: &[Operand],
+    src_size: u8,
+    dst_size: u8,
+) -> Result<(), String> {
+    let suffix = |size: u8| match size {
+        1 => 'b',
+        2 => 'w',
+        4 => 'l',
+        _ => 'q',
+    };
+    for (op, size) in ops.iter().zip([src_size, dst_size]) {
+        if let Operand::Register(reg) = op {
+            let want = suffix(size);
+            if register_size_suffix(&reg.name).is_some_and(|got| got != want) {
+                return Err(format!(
+                    "incorrect register `%{}' used with `{want}' suffix",
+                    reg.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Set of base mnemonics that accept AT&T size suffixes (b/w/l/q).
 /// Only these mnemonics will have suffixes inferred from operand types.
 pub(crate) const SUFFIXABLE_MNEMONICS: &[&str] = &[

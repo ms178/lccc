@@ -118,6 +118,20 @@ pub(super) fn allow_intra_block_gaps() -> bool {
     *A.get_or_init(|| opt_in_env("CCC_GLA_ALLOW_INTRA", false))
 }
 
+/// Register residency the production allocator of `tier` can hold per
+/// point: the colorer's GPR budget at the speed/size tiers, and none at
+/// -O0, where the coloring allocator is off and every value is
+/// stack-homed -- relief (a slot round trip removed) is direct at any
+/// residency, not only above a register count no -O0 allocator uses.
+/// (Deriving the -O0 budget from the colorer's made remat fire only where
+/// an over-approximated liveness inflated pressure past it.)
+pub(super) fn tier_budget(tier: Tier) -> usize {
+    match tier {
+        Tier::Debug => 0,
+        Tier::Speed | Tier::Size => pressure_budget(),
+    }
+}
+
 /// Which production allocator tier the planner prepares code for. See
 /// [`Tier`] for what differs between the three operating points.
 pub(super) fn tier_for(opt_level: u32) -> Tier {
@@ -357,7 +371,7 @@ impl GlaPolicy {
         let tier = tier_for(opt_level);
         GlaPolicy {
             tier,
-            budget: pressure_budget(),
+            budget: tier_budget(tier),
             max_splits,
             remat_max_weight: remat_max_weight(),
             remat_max_segments: remat_max_segments(),
@@ -378,6 +392,26 @@ impl GlaPolicy {
     /// Size tiers never plan: see [`Tier::Size`].
     pub(super) fn enabled(&self) -> bool {
         self.tier != Tier::Size
+    }
+
+    /// Whether rematerializing `template` can pay for itself at this tier.
+    /// At -O0 a remat clone replaces exactly one slot reload, so only a
+    /// single-instruction template can win there: a thread-local
+    /// `GlobalAddr` is a thread-pointer read plus an offset add on every
+    /// target (x86 `%fs:0`/`%gs:0` + `lea`/`add`, AArch64 `mrs` + two `add`s,
+    /// RISC-V `lui` + `add` + `addi`) and its clone also needs a slot of
+    /// its own (measured: tls_local_exec_direct.c -O0 grew 38 instructions
+    /// and its frame 336 -> 400 bytes). The register tiers keep it: there
+    /// the relief is a register over the whole range, not one reload.
+    pub(super) fn remat_affordable(
+        &self,
+        template: &Instruction,
+        tls_symbols: &FxHashSet<String>,
+    ) -> bool {
+        match (self.tier, template) {
+            (Tier::Debug, Instruction::GlobalAddr { name, .. }) => !tls_symbols.contains(name),
+            _ => true,
+        }
     }
 
     /// Whether residency relief must be net of the value's own def/read

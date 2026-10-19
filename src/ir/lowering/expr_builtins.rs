@@ -8,6 +8,7 @@
 //! - expr_builtins_fpclass.rs: FP classification (fpclassify, isnan, isinf, etc.)
 
 use super::lower::Lowerer;
+use crate::common::const_eval as shared_const_eval;
 use crate::common::source::Span;
 use crate::common::types::{AddressSpace, CType, IrType, target_is_32bit};
 use crate::frontend::parser::ast::{Expr, TypeSpecifier, UnaryOp};
@@ -208,32 +209,12 @@ impl Lowerer {
             }
         }
 
-        // Handle __builtin_choose_expr(const_expr, expr1, expr2)
-        // This is a compile-time selection: if const_expr is nonzero, returns expr1, else expr2.
+        // __builtin_choose_expr(c, a, b) is `a` or `b` itself, chosen at
+        // compile time (`resolve_builtin_choose_expr`).
         if name == "__builtin_choose_expr" {
             if args.len() >= 3 {
-                let condition = self.eval_const_expr(&args[0]);
-                let is_nonzero = match condition {
-                    Some(IrConst::I64(v)) => v != 0,
-                    Some(IrConst::I32(v)) => v != 0,
-                    Some(IrConst::I128(v)) => v != 0,
-                    Some(IrConst::F64(v)) => v != 0.0,
-                    Some(IrConst::F32(v)) => v != 0.0,
-                    _ => {
-                        // Try lowering to get a constant
-                        let cond_val = self.lower_expr(&args[0]);
-                        match cond_val {
-                            Operand::Const(IrConst::I64(v)) => v != 0,
-                            Operand::Const(IrConst::I32(v)) => v != 0,
-                            _ => true, // default to first expr if indeterminate
-                        }
-                    }
-                };
-                return Some(if is_nonzero {
-                    self.lower_expr(&args[1])
-                } else {
-                    self.lower_expr(&args[2])
-                });
+                let chosen = self.resolve_builtin_choose_expr(args);
+                return Some(self.lower_expr(chosen));
             }
             return Some(Operand::Const(IrConst::I64(0)));
         }
@@ -355,7 +336,22 @@ impl Lowerer {
         }
 
         let builtin_info = builtins::resolve_builtin(name)?;
-        match &builtin_info.kind {
+        // A NaN builtin whose payload is not a string literal cannot fold: it
+        // is a call to the library function (GCC: `__builtin_nan(s)` calls
+        // `nan(s)`), not the canonical NaN.
+        let nan_call;
+        let kind = match (&builtin_info.kind, nan_library_function(name)) {
+            (BuiltinKind::ConstantF64(_) | BuiltinKind::ConstantF128(_), Some(lib))
+                if args
+                    .first()
+                    .is_some_and(|a| !matches!(a, Expr::StringLiteral(..))) =>
+            {
+                nan_call = BuiltinKind::LibcAlias(lib.to_string());
+                &nan_call
+            }
+            (kind, _) => kind,
+        };
+        match kind {
             BuiltinKind::LibcAlias(libc_name) => {
                 // Source types must describe the values `lower_expr` really
                 // produces (see the long note in `expr_calls.rs`):
@@ -516,56 +512,27 @@ impl Lowerer {
             BuiltinKind::ConstantF128(bytes) => {
                 // _Float128 constant: full 16-byte binary128 payload carried
                 // as an I128 bit pattern (the F128-const materializers in
-                // calls/returns/memory all speak I128).
+                // calls/returns/memory all speak I128). The shared folder
+                // owns NaN payloads (`__builtin_nanf128("7")`).
+                if let Some(c) = shared_const_eval::eval_builtin_call(name, args, &|_| None) {
+                    return Some(Operand::Const(c));
+                }
                 let bits = u128::from_be_bytes(*bytes) as i128;
                 Some(Operand::Const(IrConst::I128(bits)))
             }
             BuiltinKind::ConstantF64(val) => {
+                // NaN payloads, signaling NaNs and long double NaNs in the
+                // target format: one implementation, shared with the
+                // static-initializer folder.
+                if let Some(c) = shared_const_eval::eval_builtin_call(name, args, &|_| None) {
+                    return Some(Operand::Const(c));
+                }
                 let is_float_variant = name == "__builtin_inff"
                     || name == "__builtin_huge_valf"
                     || name == "__builtin_nanf";
                 let is_long_double_variant = name == "__builtin_infl"
                     || name == "__builtin_huge_vall"
                     || name == "__builtin_nanl";
-                // NaN builtins with a payload string: GCC/glibc semantics.
-                // The argument is an n-char-sequence parsed with
-                // strtoull-style base-0 rules (0x hex, leading-0 octal,
-                // decimal); the value becomes the quiet-NaN significand
-                // (glibc: `0x7fc00000 | (payload & 0x7fffff)` for f32,
-                // analogously f64/f128 — the exponent is all-ones and the
-                // quiet bit forced, the payload fills the remaining
-                // mantissa bits). Empty/absent string → canonical qNaN
-                // (the ConstantF64(f64::NAN) fallback below).
-                if matches!(name, "__builtin_nan" | "__builtin_nanf" | "__builtin_nanl") {
-                    let payload: Option<u64> = match args.first() {
-                        Some(Expr::StringLiteral(s, _)) if !s.is_empty() => {
-                            parse_n_char_sequence(s)
-                        }
-                        _ => None,
-                    };
-                    if let Some(p) = payload {
-                        if name == "__builtin_nanf" {
-                            let bits = 0x7fc0_0000u32 | (p as u32 & 0x007f_ffff);
-                            return Some(Operand::Const(IrConst::F32(f32::from_bits(bits))));
-                        } else if name == "__builtin_nan" {
-                            let bits = 0x7ff8_0000_0000_0000u64 | (p & 0x000f_ffff_ffff_ffff);
-                            return Some(Operand::Const(IrConst::F64(f64::from_bits(bits))));
-                        } else {
-                            // nanl: binary128 qNaN (the LongDouble const
-                            // carries explicit big-endian f128 bytes);
-                            // the u64 payload fills mantissa bits 63..0.
-                            let mut bytes = [0u8; 16];
-                            bytes[0] = 0x7F;
-                            bytes[1] = 0xFF;
-                            bytes[2] = 0x80;
-                            bytes[8..16].copy_from_slice(&p.to_be_bytes());
-                            return Some(Operand::Const(IrConst::long_double_with_bytes(
-                                f64::NAN,
-                                bytes,
-                            )));
-                        }
-                    }
-                }
                 if is_float_variant {
                     Some(Operand::Const(IrConst::F32(*val as f32)))
                 } else if is_long_double_variant {
@@ -994,27 +961,9 @@ impl Lowerer {
                 Some(Operand::Const(IrConst::I64(result)))
             }
             // __builtin_classify_type(expr) -> GCC type class integer
-            BuiltinIntrinsic::ClassifyType => {
-                let result = if let Some(arg) = args.first() {
-                    // Special case: bare function identifiers decay to pointer
-                    // type (class 5). expr_ctype may return CType::Int as
-                    // fallback since functions aren't stored as variables.
-                    if let Expr::Identifier(fname, _) = arg {
-                        if self.known_functions.contains(fname.as_str()) {
-                            5i64 // pointer_type_class (function decays to pointer)
-                        } else {
-                            let ctype = self.expr_ctype(arg);
-                            classify_ctype(&ctype)
-                        }
-                    } else {
-                        let ctype = self.expr_ctype(arg);
-                        classify_ctype(&ctype)
-                    }
-                } else {
-                    0i64 // no_type_class
-                };
-                Some(Operand::Const(IrConst::I64(result)))
-            }
+            BuiltinIntrinsic::ClassifyType => Some(Operand::Const(IrConst::I64(
+                self.classify_type_of(args.first()),
+            ))),
             // Nop intrinsic - just evaluate args for side effects and return 0
             BuiltinIntrinsic::Nop => {
                 for arg in args {
@@ -1818,7 +1767,7 @@ impl Lowerer {
             }
         } else if is_real {
             let val = self.lower_expr(&args[0]);
-            let val_ty = self.get_expr_type(&args[0]);
+            let val_ty = self.value_ir_type(&args[0]);
             Some(self.emit_implicit_cast(val, val_ty, target_ty))
         } else {
             // Imaginary part of a non-complex value is zero
@@ -3553,92 +3502,13 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
     }
 }
 
-/// Classify a CType according to GCC's __builtin_classify_type conventions.
-/// Returns the GCC type class integer:
-///   0 = no_type_class (void)
-///   1 = integer_type_class
-///   2 = char_type_class
-///   3 = enumeral_type_class
-///   4 = boolean_type_class
-///   5 = pointer_type_class
-///   6 = reference_type_class (C++ only, not used in C)
-///   8 = real_type_class
-///   9 = complex_type_class
-///  12 = record_type_class (struct)
-///  13 = union_type_class
-///  14 = array_type_class
-///  16 = lang_type_class
-fn classify_ctype(ty: &CType) -> i64 {
-    // GCC __builtin_classify_type returns integer type classes.
-    // GCC treats char, _Bool, and enum as integer_type_class (1) in practice.
-    match ty {
-        CType::Void => 0, // no_type_class
-        CType::Bool
-        | CType::Char
-        | CType::UChar
-        | CType::Short
-        | CType::UShort
-        | CType::Int
-        | CType::UInt
-        | CType::Long
-        | CType::ULong
-        | CType::LongLong
-        | CType::ULongLong
-        | CType::Int128
-        | CType::UInt128
-        | CType::Enum(_) => 1, // integer_type_class
-        CType::Float | CType::Double | CType::LongDouble | CType::Float128 => 8, // real_type_class
-        CType::Decimal32 | CType::Decimal64 | CType::Decimal128 => 8, // real_type_class (decimal FP)
-        CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => 9, // complex_type_class
-        CType::Pointer(_, _) => 5, // pointer_type_class
-        CType::Array(_, _) => 5,   // GCC decays arrays to pointers
-        CType::Function(_) => 5,   // function decays to pointer
-        CType::Struct(_) => 12,    // record_type_class
-        CType::Union(_) => 13,     // union_type_class
-        CType::Vector(_, _) | CType::ExtVector(_, _) => 14, // array_type_class (GCC classifies vectors here)
-    }
-}
-
-/// Parse a C99 `n-char-sequence` (the payload string of
-/// `nan("...")`/`__builtin_nan*`) with `strtoull` base-0 semantics:
-/// `0x`/`0X` prefix → hexadecimal, a leading `0` → octal, otherwise
-/// decimal. Parsing stops at the first character that cannot belong to
-/// the chosen base (exactly like strtoull); an empty parse yields 0 —
-/// glibc's own `nan()` behaviour, and the canonical-qNaN result for
-/// garbage strings. Values saturate at u64::MAX (strtoull's ERANGE
-/// behaviour). Some(_) is only returned for a non-empty, at least
-/// partially valid sequence.
-fn parse_n_char_sequence(s: &str) -> Option<u64> {
-    let b = s.as_bytes();
-    if b.is_empty() {
-        return None;
-    }
-    let (digits_start, radix) = if b.len() >= 2 && b[0] == b'0' && (b[1] | 0x20) == b'x' {
-        (2, 16u32)
-    } else if b[0] == b'0' {
-        (1, 8u32)
-    } else {
-        (0, 10u32)
-    };
-    if digits_start >= b.len() {
-        // "0x" alone: strtoull parses the "0" and leaves "x" unconsumed.
-        return Some(0);
-    }
-    let mut acc: u64 = 0;
-    let mut any = false;
-    for &c in &b[digits_start..] {
-        let d = match (c as char).to_digit(radix) {
-            Some(d) => d as u64,
-            None => break,
-        };
-        any = true;
-        acc = acc.saturating_mul(radix as u64).saturating_add(d);
-    }
-    if !any {
-        // No valid digit in the chosen base (e.g. "0xzz" after the 0x
-        // prefix, or a "9" in an octal prefix "09..."): strtoull still
-        // consumed the "0" prefix — value 0.
-        return Some(0);
-    }
-    Some(acc)
+/// The C library function a non-constant NaN builtin calls.
+fn nan_library_function(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "__builtin_nan" => "nan",
+        "__builtin_nanf" => "nanf",
+        "__builtin_nanl" => "nanl",
+        "__builtin_nanf128" | "__builtin_nanq" => "nanf128",
+        _ => return None,
+    })
 }

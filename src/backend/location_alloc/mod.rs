@@ -213,6 +213,53 @@ pub(crate) use policy::{gate_enabled, max_splits_from_env};
 mod tests {
     use super::*;
 
+    /// `UseIndex` answers exactly what the per-query scans compute, for
+    /// every value id the fixtures use and every block.
+    fn assert_use_index_matches_scans(f: &IrFunction) {
+        let live = crate::backend::liveness::compute_live_intervals(f);
+        let ix = UseIndex::build(&live, f);
+        for vid in 0..2048u32 {
+            let mut use_blocks = Vec::new();
+            let mut feed_blocks = Vec::new();
+            for bi in 0..f.blocks.len() {
+                let scan = block_use_points(&live, f, bi, vid);
+                assert_eq!(ix.points(bi, vid), scan.as_slice(), "points b{bi} v{vid}");
+                if !scan.is_empty() {
+                    use_blocks.push(bi as u32);
+                }
+                let feeds = block_feeds_successor_phi(f, bi, vid);
+                assert_eq!(ix.feeds_phi(bi, vid), feeds, "φ feed b{bi} v{vid}");
+                if feeds {
+                    feed_blocks.push(bi as u32);
+                }
+                assert_eq!(
+                    ix.defines(bi, vid),
+                    block_defines_value(f, bi, vid),
+                    "defines b{bi} v{vid}"
+                );
+            }
+            assert_eq!(
+                ix.use_blocks(vid),
+                use_blocks.as_slice(),
+                "use blocks v{vid}"
+            );
+            assert_eq!(
+                ix.feed_blocks(vid),
+                feed_blocks.as_slice(),
+                "feed blocks v{vid}"
+            );
+            assert_eq!(ix.def(vid), find_def(f, vid), "def v{vid}");
+            let segs = |it: &mut dyn Iterator<Item = &crate::backend::liveness::LiveInterval>| {
+                it.map(|iv| (iv.start, iv.end)).collect::<Vec<_>>()
+            };
+            assert_eq!(
+                segs(&mut ix.segments(&live, vid)),
+                segs(&mut live.segments.iter().filter(|iv| iv.value_id == vid)),
+                "segments v{vid}"
+            );
+        }
+    }
+
     fn func_with(blocks: Vec<BasicBlock>, next: u32) -> IrFunction {
         let mut f = IrFunction::new("t".to_string(), IrType::I32, Vec::new(), false);
         f.blocks = blocks;
@@ -304,7 +351,7 @@ mod tests {
             )],
             902,
         );
-        assert_eq!(run(&mut f, 64, 2), 0);
+        assert_eq!(run(&mut f, 64, 2, &FxHashSet::default()), 0);
     }
 
     #[test]
@@ -323,7 +370,7 @@ mod tests {
             )],
             11,
         );
-        assert_eq!(run(&mut f, 64, 2), 0);
+        assert_eq!(run(&mut f, 64, 2, &FxHashSet::default()), 0);
     }
 
     #[test]
@@ -407,7 +454,7 @@ mod tests {
             )],
             900,
         );
-        let n = run(&mut f, 64, 2);
+        let n = run(&mut f, 64, 2, &FxHashSet::default());
         assert!(n >= 1, "remat must fire under pressure");
         assert!(
             count(&f, |i| matches!(i, Instruction::GlobalAddr { .. })) >= 2,
@@ -416,6 +463,74 @@ mod tests {
         // Remat never builds a stack slot.
         assert_eq!(count(&f, |i| matches!(i, Instruction::Alloca { .. })), 0);
         verify_rewrite(&f, &FxHashSet::default()).expect("rewrite verifies");
+    }
+
+    /// -O0 (Debug tier): every value is stack-homed, so a remat clone
+    /// removes a slot reload whatever the register pressure -- the tier
+    /// budget is 0 and a GlobalAddr live across just three values is
+    /// rematerialized. A thread-local address costs more than the reload it
+    /// would replace and is never cloned at -O0; the register tier keeps it
+    /// as a candidate (relief there is a register over the whole range).
+    #[test]
+    fn debug_tier_remats_regardless_of_pressure_but_never_tls() {
+        assert_eq!(tier_budget(Tier::Debug), 0);
+        assert_eq!(tier_budget(Tier::Speed), pressure_budget());
+        let low = || {
+            let mut v = vec![global(1, "G")];
+            for k in 0..3u32 {
+                v.push(add(100 + k, 800 + k, 820 + k));
+            }
+            v.push(add(200, 1, 100));
+            v.push(add(201, 200, 101));
+            v.push(add(202, 201, 102));
+            func_with(
+                vec![blk(
+                    0,
+                    v,
+                    Terminator::Return(Some(Operand::Value(Value(202)))),
+                )],
+                900,
+            )
+        };
+        let globals = |f: &IrFunction| count(f, |i| matches!(i, Instruction::GlobalAddr { .. }));
+        let tls: FxHashSet<String> = std::iter::once("G".to_string()).collect();
+
+        let mut f = low();
+        assert!(
+            run(&mut f, 64, 0, &FxHashSet::default()) >= 1,
+            "-O0 remat must fire at low pressure"
+        );
+        assert!(globals(&f) >= 2, "expected a rematerialized GlobalAddr");
+        verify_rewrite(&f, &FxHashSet::default()).expect("rewrite verifies");
+
+        let mut f = low();
+        assert_eq!(
+            run(&mut f, 64, 0, &tls),
+            0,
+            "-O0 must not clone a TLS address"
+        );
+        assert_eq!(globals(&f), 1);
+
+        let mut f = low();
+        assert_eq!(
+            run(&mut f, 64, 2, &FxHashSet::default()),
+            0,
+            "-O2 budget not exceeded"
+        );
+
+        let mut f = func_with(
+            vec![blk(
+                0,
+                remat_ladder(),
+                Terminator::Return(Some(Operand::Value(Value(211)))),
+            )],
+            900,
+        );
+        assert!(
+            run(&mut f, 64, 2, &tls) >= 1,
+            "-O2 keeps TLS remat under pressure"
+        );
+        assert!(globals(&f) >= 2);
     }
 
     #[test]
@@ -478,6 +593,7 @@ mod tests {
             blk(2, b2, Terminator::Return(Some(Operand::Value(Value(300))))),
         ];
         let mut f = func_with(blocks, 900);
+        assert_use_index_matches_scans(&f);
         let n = run_with_policy(
             &mut f,
             GlaPolicy {
@@ -637,22 +753,23 @@ mod tests {
             ),
         ];
         // Direct closure invariant: v3 is DEFINED in block 3 and feeds the
-        // header φ from block 3's end, so liveness conservatively reports it
-        // live-in to its own def block. The closure seeded in its
-        // predecessor block 2 must still not enter block 3.
+        // header φ from block 3's end. Exact liveness keeps it out of its
+        // own def block's live-in (the φ reads it on the 3 -> 1 edge); the
+        // closure seeded in its predecessor block 2 must not enter block 3
+        // either way (the def-block stop test is defence in depth).
         let mut f = func_with(blocks, 900);
+        assert_use_index_matches_scans(&f);
         // Explicit direct probe before the rewrite.
         {
             let live = crate::backend::liveness::compute_live_intervals(&f);
             let lm = analysis::build_label_map(&f);
             let (_preds, succs) = analysis::build_cfg(&f, &lm);
-            // Document the conservative precondition: without the def-block
-            // stop test the closure would have somewhere to run.
             assert!(
-                live.is_live_in(3, 3),
-                "test shape requires the φ edge-copy live-in over-approximation"
+                !live.is_live_in(3, 3),
+                "a latch-defined φ incoming is not live-in to its def block"
             );
-            let reached = memory_closure(&live, &f, &succs, 3, 2);
+            let ix = UseIndex::build(&live, &f);
+            let reached = memory_closure(&live, &f, &ix, &succs, 3, 2);
             assert!(
                 reached.iter().all(|(b, _)| *b != 3),
                 "closure re-entered the value's own def block: {reached:?}"
@@ -767,6 +884,11 @@ mod tests {
             !pts.contains(&0),
             "earlier-block folded read mapped into φ prefix: {pts:?}"
         );
+        assert!(
+            live.folded_read_points.contains_key(&1),
+            "fixture must exercise a folded hidden read"
+        );
+        assert_use_index_matches_scans(&f);
     }
 
     // ── stale next_value_id (an upstream pass leaked a high id) must
@@ -1037,8 +1159,8 @@ mod tests {
         };
         let mut a = make();
         let mut b = make();
-        run(&mut a, 64, 2);
-        run(&mut b, 64, 2);
+        run(&mut a, 64, 2, &FxHashSet::default());
+        run(&mut b, 64, 2, &FxHashSet::default());
         let ca: Vec<usize> = a.blocks.iter().map(|x| x.instructions.len()).collect();
         let cb: Vec<usize> = b.blocks.iter().map(|x| x.instructions.len()).collect();
         assert_eq!(ca, cb);
@@ -1285,7 +1407,7 @@ mod tests {
         // The same shape fires remat with a normal id space
         // (`global_addr_rematerializes_under_pressure`); with no id left
         // the plan must be applied zero times.
-        let n = run(&mut f, 64, 2);
+        let n = run(&mut f, 64, 2, &FxHashSet::default());
         assert_eq!(n, 0, "exhausted id space must not apply any split");
         assert_eq!(
             count(&f, |i| matches!(i, Instruction::GlobalAddr { .. })),
@@ -1335,7 +1457,11 @@ mod tests {
         let classes = ColorClasses::phi_webs(&f);
         let eligible: FxHashSet<u32> = (1u32..=211).collect();
         let pressure = Pressure::build(&live, &f, &eligible, &classes);
-        assert!(covers_over_budget_point(&live, &f, &pressure, 1, &policy));
+        let ix = UseIndex::build(&live, &f);
+        assert_use_index_matches_scans(&f);
+        assert!(covers_over_budget_point(
+            &live, &ix, &f, &pressure, 1, &policy
+        ));
 
         // Shape B (nbody -Os-style): 12 producers hold the block at
         // exactly budget; global v1 is defined late and read at the very
@@ -1364,13 +1490,15 @@ mod tests {
         let c2 = ColorClasses::phi_webs(&g);
         let elig2: FxHashSet<u32> = (1u32..=300).collect();
         let p2 = Pressure::build(&live2, &g, &elig2, &c2);
+        let ix2 = UseIndex::build(&live2, &g);
+        assert_use_index_matches_scans(&g);
         let (_, peak) = p2.peak(0);
         assert!(
             (13..=14).contains(&peak),
             "fixture peaks just over budget, got {peak}"
         );
         assert!(
-            !covers_over_budget_point(&live2, &g, &p2, 1, &policy),
+            !covers_over_budget_point(&live2, &ix2, &g, &p2, 1, &policy),
             "def/read-only residency is not net relief"
         );
         // The debug tier (-O0) credits the full resident span: at -O0 the
@@ -1378,7 +1506,7 @@ mod tests {
         let mut debug = conservative_policy(64);
         debug.tier = Tier::Debug;
         debug.reach_band = 64;
-        assert!(covers_over_budget_point(&live2, &g, &p2, 1, &debug));
+        assert!(covers_over_budget_point(&live2, &ix2, &g, &p2, 1, &debug));
     }
 
     #[test]
@@ -1630,6 +1758,7 @@ mod tests {
             blk(1, b1, Terminator::Return(Some(Operand::Value(Value(211))))),
         ];
         let mut f = func_with(blocks, 900);
+        assert_use_index_matches_scans(&f);
         f.next_label = 3;
         let n = run_with_policy(&mut f, conservative_policy(64));
         assert_eq!(n, 1);
@@ -1825,6 +1954,7 @@ mod tests {
             blk(1, b1, Terminator::Return(Some(Operand::Value(Value(211))))),
         ];
         let mut f = func_with(blocks, 900);
+        assert_use_index_matches_scans(&f);
         f.next_label = 3;
         let n = run_with_policy(&mut f, conservative_policy(64));
         assert_eq!(n, 1, "global v1 must remat; nothing else is eligible");
@@ -1953,6 +2083,7 @@ mod tests {
             blk(1, b1, Terminator::Return(Some(Operand::Value(Value(211))))),
         ];
         let mut f = func_with(blocks, 900);
+        assert_use_index_matches_scans(&f);
         f.next_label = 3;
         let n = run_with_policy(&mut f, conservative_policy(64));
         assert_eq!(n, 1, "global v1 must remat; nothing else is eligible");
@@ -2069,6 +2200,7 @@ mod tests {
             blk(1, b1, Terminator::Return(Some(Operand::Value(Value(211))))),
         ];
         let mut f = func_with(blocks, 900);
+        assert_use_index_matches_scans(&f);
         f.next_label = 3;
         let n = run_with_policy(&mut f, conservative_policy(64));
         // v1 still remats for its false-arm in-body cluster, but no edge
@@ -2161,6 +2293,7 @@ mod tests {
             blk(2, b2, Terminator::Return(Some(Operand::Value(Value(301))))),
         ];
         let mut f = func_with(blocks, 900);
+        assert_use_index_matches_scans(&f);
         f.next_label = 5;
         let n = run_with_policy(&mut f, conservative_policy(64));
         assert_eq!(n, 1, "only v1 is eligible");
@@ -2284,6 +2417,7 @@ mod tests {
             ),
         ];
         let mut f = func_with(blocks, 900);
+        assert_use_index_matches_scans(&f);
         f.next_label = 5;
         let n = run_with_policy(&mut f, conservative_policy(64));
         assert_eq!(n, 2, "both globals rematerialized");

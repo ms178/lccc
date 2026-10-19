@@ -53,6 +53,13 @@ REJECTED = {
     'struct_reversed.c': ('struct S { int a; };\n'
                           'int f(struct S s) { return 0[s]; }\n', NOT_ADDRESSABLE),
     'int_base.c': ('int f(int x) { return x[0]; }\n', NOT_ADDRESSABLE),
+    # Commutativity is pointer + integer only (6.5.2.1p1): a vector operand
+    # cannot be the "pointer" of a reversed subscript, lvalue or call result.
+    'vector_reversed.c': ('typedef int V __attribute__((vector_size(16)));\n'
+                          'int f(V v) { return 1[v]; }\n', NOT_ADDRESSABLE),
+    'vector_call_reversed.c': ('typedef int V __attribute__((vector_size(16)));\n'
+                               'V g(void);\n'
+                               'int f(void) { return 0[g()]; }\n', NOT_ADDRESSABLE),
     'double_index.c': ('int f(int *p) { return p[1.0]; }\n', NOT_INTEGER),
     'pointer_index.c': ('int f(int *p, int *q) { return p[q]; }\n', NOT_INTEGER),
     'struct_index.c': ('struct S { int a; };\n'

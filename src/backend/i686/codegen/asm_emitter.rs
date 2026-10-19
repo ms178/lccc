@@ -610,10 +610,19 @@ impl InlineAsmEmitter for I686Codegen {
                 let ty = op.operand_type;
                 if self.state.is_direct_slot(ptr.0) {
                     let sr = self.slot_ref(slot);
-                    let store_instr = Self::i686_mov_store_for_type(ty);
-                    let src = Self::src_reg_for_type(reg, ty);
-                    self.state
-                        .emit_fmt(format_args!("    {} %{}, {}", store_instr, src, sr));
+                    if self.output_is_value_home(ptr) {
+                        // Promoted value: the full zero-extended dword.
+                        self.state.emit_fmt(format_args!(
+                            "    movl %{}, {}",
+                            Self::reg_to_32(reg),
+                            sr
+                        ));
+                    } else {
+                        let store_instr = Self::i686_mov_store_for_type(ty);
+                        let src = Self::src_reg_for_type(reg, ty);
+                        self.state
+                            .emit_fmt(format_args!("    {} %{}, {}", store_instr, src, sr));
+                    }
                 } else {
                     let scratch = if reg != "ecx" { "ecx" } else { "edx" };
                     self.state.emit_fmt(format_args!("    pushl %{}", scratch));
@@ -693,10 +702,25 @@ impl InlineAsmEmitter for I686Codegen {
                 }
             } else if self.state.is_direct_slot(ptr.0) {
                 let sr = self.slot_ref(slot);
-                let store_instr = Self::i686_mov_store_for_type(ty);
                 let src = Self::src_reg_for_type(reg, ty);
-                self.state
-                    .emit_fmt(format_args!("    {} %{}, {}", store_instr, src, sr));
+                let extend = Self::i686_mov_load_for_type(ty);
+                if Self::is_extending_load(extend) && self.output_is_value_home(ptr) {
+                    // A promoted narrow VALUE's home is a 4-byte slot that
+                    // every 32-bit reader (`cmpl $0, S` for a typeless
+                    // CondBranch, `movl S` reloads) reads whole: store the
+                    // extension by the IR type, as a narrow Load would.  The
+                    // output register is this operand's own and was already
+                    // clobbered by the asm.
+                    let r32 = Self::reg_to_32(reg);
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, %{}", extend, src, r32));
+                    self.state
+                        .emit_fmt(format_args!("    movl %{}, {}", r32, sr));
+                } else {
+                    let store_instr = Self::i686_mov_store_for_type(ty);
+                    self.state
+                        .emit_fmt(format_args!("    {} %{}, {}", store_instr, src, sr));
+                }
             } else {
                 let scratch = if reg != "ecx" { "ecx" } else { "edx" };
                 self.state.emit_fmt(format_args!("    pushl %{}", scratch));
@@ -749,6 +773,17 @@ impl InlineAsmEmitter for I686Codegen {
 // Register conversion and condition code mapping delegate to the shared
 // `x86_common` module to avoid duplication with the x86-64 backend.
 impl I686Codegen {
+    /// Whether an output's destination is a promoted SSA value's own home
+    /// (a full 4-byte scalar slot) rather than user memory: an `Alloca` is
+    /// the C object itself (a `char` variable is ONE byte — a wider store
+    /// would clobber its neighbours), so only non-alloca direct slots may
+    /// take a widened store.
+    fn output_is_value_home(&self, ptr: &Value) -> bool {
+        !self.state.is_alloca(ptr.0)
+            && !self.state.wide_values.contains(&ptr.0)
+            && !self.state.f128_direct_slots.contains(&ptr.0)
+    }
+
     /// Return the i686 store mnemonic for a given IR type.
     /// Uses movb/movw for sub-32-bit types, movl for everything else.
     fn i686_mov_store_for_type(ty: IrType) -> &'static str {

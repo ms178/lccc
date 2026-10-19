@@ -118,6 +118,10 @@ impl ColorClasses {
 /// a hole in this block is not counted across the hole).
 pub(super) struct Pressure {
     pub(super) per_block: Vec<Vec<u32>>,
+    /// `peak` of each row, kept current by every mutator (`relieve`, `cap`):
+    /// the planner asks for a block's peak per candidate value, and a
+    /// rescan of the row per question was quadratic in the block length.
+    peaks: Vec<(usize, u32)>,
 }
 
 impl Pressure {
@@ -175,16 +179,32 @@ impl Pressure {
             }
             per_block.push(row);
         }
-        Pressure { per_block }
+        let peaks = per_block.iter().map(|row| Self::row_peak(row)).collect();
+        Pressure { per_block, peaks }
     }
 
-    pub(super) fn peak(&self, bi: usize) -> (usize, u32) {
-        self.per_block[bi]
-            .iter()
+    /// Highest residency of `row` and its first point.
+    fn row_peak(row: &[u32]) -> (usize, u32) {
+        row.iter()
             .enumerate()
             .max_by_key(|&(i, &c)| (c, std::cmp::Reverse(i)))
             .map(|(i, &c)| (i, c))
             .unwrap_or((0, 0))
+    }
+
+    pub(super) fn peak(&self, bi: usize) -> (usize, u32) {
+        debug_assert_eq!(self.peaks[bi], Self::row_peak(&self.per_block[bi]));
+        self.peaks[bi]
+    }
+
+    /// Clamp block `bi`'s residency to `budget` (an un-splittable peak).
+    pub(super) fn cap(&mut self, bi: usize, budget: u32) {
+        for p in self.per_block[bi].iter_mut() {
+            if *p > budget {
+                *p = budget;
+            }
+        }
+        self.peaks[bi] = Self::row_peak(&self.per_block[bi]);
     }
 
     /// Subtract one unit of residency over half-open `[from,to)`.
@@ -197,6 +217,7 @@ impl Pressure {
         for p in row.iter_mut().take(to).skip(from) {
             *p = p.saturating_sub(1);
         }
+        self.peaks[bi] = Self::row_peak(row);
     }
 }
 
@@ -242,6 +263,7 @@ impl Plan {
 pub(super) fn memory_closure(
     live: &LivenessResult,
     func: &IrFunction,
+    ix: &UseIndex,
     succs: &analysis::FlatAdj,
     vid: u32,
     start_block: usize,
@@ -257,13 +279,13 @@ pub(super) fn memory_closure(
             }
             // A (re-)definition of vid joins a new incarnation; the memory
             // region neither enters nor flows through that block.
-            if block_defines_value(func, s, vid) {
+            if ix.defines(s, vid) {
                 continue;
             }
             if !live.is_live_in(s, vid) {
                 continue;
             }
-            let uses = block_use_points(live, func, s, vid);
+            let uses = ix.points(s, vid);
             let first = uses
                 .first()
                 .copied()
@@ -279,27 +301,31 @@ pub(super) fn memory_closure(
 
 /// Weighted count of dynamic read points (use-density currency), including
 /// edge φ reads.
-pub(super) fn weighted_use_count(
-    live: &LivenessResult,
-    func: &IrFunction,
-    vid: u32,
-    depths: &[u32],
-) -> u64 {
+///
+/// Sums over the blocks that read `vid` or feed it to a successor φ only
+/// (the index lists them): every other block contributes zero.  Saturating
+/// addition of non-negative terms is order-independent.
+pub(super) fn weighted_use_count(ix: &UseIndex, vid: u32, depths: &[u32]) -> u64 {
     let mut w = 0u64;
-    for bi in 0..func.blocks.len() {
-        let f = block_frequency(depths[bi]);
-        w = w.saturating_add(block_use_points(live, func, bi, vid).len() as u64 * f);
-        if block_feeds_successor_phi(func, bi, vid) {
-            w = w.saturating_add(f);
-        }
+    for &bi in ix.use_blocks(vid) {
+        let bi = bi as usize;
+        w = w.saturating_add(ix.points(bi, vid).len() as u64 * block_frequency(depths[bi]));
+    }
+    for &bi in ix.feed_blocks(vid) {
+        w = w.saturating_add(block_frequency(depths[bi as usize]));
     }
     w
 }
 
 /// Local point of `vid`'s definition in block `bi`, if any (φ defs anchor
 /// at the first non-φ point — the position past the φ prefix).
-pub(super) fn local_def_point(func: &IrFunction, bi: usize, vid: u32) -> Option<usize> {
-    find_def(func, vid).and_then(|(db, di, is_phi)| {
+pub(super) fn local_def_point(
+    ix: &UseIndex,
+    func: &IrFunction,
+    bi: usize,
+    vid: u32,
+) -> Option<usize> {
+    ix.def(vid).and_then(|(db, di, is_phi)| {
         if db != bi {
             return None;
         }
@@ -326,14 +352,14 @@ pub(super) fn local_def_point(func: &IrFunction, bi: usize, vid: u32) -> Option<
 /// adler32 table base) and any hole between runs / after the last read
 /// before the value was formerly carried out to a successor.
 pub(super) fn remat_no_relief_spans(
-    live: &LivenessResult,
+    ix: &UseIndex,
     func: &IrFunction,
     bi: usize,
     vid: u32,
     lo: usize,
     hi: usize,
 ) -> Vec<(usize, usize)> {
-    let reads = block_use_points(live, func, bi, vid);
+    let reads = ix.points(bi, vid);
     let mut spans: Vec<(usize, usize)> = reads
         .iter()
         .filter(|&&p| p >= lo && p <= hi)
@@ -348,7 +374,7 @@ pub(super) fn remat_no_relief_spans(
             std::iter::once((first.min(last), last.max(first) + 1))
         })
         .collect();
-    if let Some(d) = local_def_point(func, bi, vid) {
+    if let Some(d) = local_def_point(ix, func, bi, vid) {
         if d >= lo && d <= hi {
             spans.push((d, d + 1));
         }
@@ -376,8 +402,18 @@ pub(super) fn point_in_spans(p: usize, spans: &[(usize, usize)]) -> bool {
 /// only reachable over-budget points are its own use clusters tipped the
 /// planner but left generated code with zero fewer stack references and
 /// five extra instructions.
+///
+/// Only the blocks `vid`'s own segments overlap can qualify, so the walk
+/// visits exactly those (block ranges are disjoint and ordered: the first is
+/// a binary search on `block_ends`), and the per-block gate is the cached
+/// peak.  Scanning every block and every segment, plus a whole-row
+/// relievability pre-scan (a pure shortcut of the point loop below), per
+/// candidate value was quadratic in the function size.  The verdict is an
+/// existential over the same (block, segment, point) triples, so the visit
+/// order does not matter.
 pub(super) fn covers_over_budget_point(
     live: &LivenessResult,
+    ix: &UseIndex,
     func: &IrFunction,
     pressure: &Pressure,
     vid: u32,
@@ -385,7 +421,9 @@ pub(super) fn covers_over_budget_point(
 ) -> bool {
     let budget = policy.budget;
     let relievable = |c: u32| c as usize > budget && policy.peak_is_reachable(c);
-    for (bi, row) in pressure.per_block.iter().enumerate() {
+    // Whether segment `iv`'s residency in block `bi` reaches a relievable
+    // point.
+    let covers_in_block = |bi: usize, iv: &crate::backend::liveness::LiveInterval| {
         // Block-level gate: a block whose PEAK is beyond the reach band
         // cannot be made colorable by editing this (or any handful of)
         // value(s); crediting its reachable buildup points would only
@@ -394,37 +432,35 @@ pub(super) fn covers_over_budget_point(
         // edit can plausibly tip under budget.
         let (_, block_peak) = pressure.peak(bi);
         if block_peak as usize <= budget || !policy.peak_is_reachable(block_peak) {
-            continue;
+            return false;
         }
-        if !row.iter().any(|&c| relievable(c)) {
-            continue;
-        }
+        let row = &pressure.per_block[bi];
         let gs = live.block_starts[bi];
         let ge = live.block_ends[bi];
-        for iv in live.segments.iter().filter(|iv| iv.value_id == vid) {
-            if iv.end < gs || iv.start > ge {
-                continue;
+        let lo = (iv.start.max(gs) - gs) as usize;
+        let hi = ((iv.end.min(ge) - gs) as usize).min(row.len() - 1);
+        // Speed tier: the clone re-occupies a register over the def
+        // point and each contiguous read run, so only the carried
+        // residency outside those spans is net relief. Debug tier
+        // (-O0): values are stack-homed regardless, so even use-point
+        // remats eliminate slot store/reload traffic; credit the full
+        // resident span.
+        let no_relief = if policy.net_relief() {
+            remat_no_relief_spans(ix, func, bi, vid, lo, hi)
+        } else {
+            Vec::new()
+        };
+        (lo..=hi).any(|p| !point_in_spans(p, &no_relief) && relievable(row[p]))
+    };
+    let nblocks = pressure.per_block.len();
+    for iv in ix.segments(live, vid) {
+        let first = live.block_ends[..nblocks].partition_point(|&ge| ge < iv.start);
+        for bi in first..nblocks {
+            if live.block_starts[bi] > iv.end {
+                break;
             }
-            let lo = (iv.start.max(gs) - gs) as usize;
-            let hi = ((iv.end.min(ge) - gs) as usize).min(row.len() - 1);
-            // Speed tier: the clone re-occupies a register over the def
-            // point and each contiguous read run, so only the carried
-            // residency outside those spans is net relief. Debug tier
-            // (-O0): values are stack-homed regardless, so even use-point
-            // remats eliminate slot store/reload traffic; credit the full
-            // resident span.
-            let no_relief = if policy.net_relief() {
-                remat_no_relief_spans(live, func, bi, vid, lo, hi)
-            } else {
-                Vec::new()
-            };
-            for p in lo..=hi {
-                if point_in_spans(p, &no_relief) {
-                    continue;
-                }
-                if relievable(row[p]) {
-                    return true;
-                }
+            if covers_in_block(bi, iv) {
+                return true;
             }
         }
     }

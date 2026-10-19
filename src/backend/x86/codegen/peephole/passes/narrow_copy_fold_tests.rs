@@ -98,10 +98,17 @@ fn a_32_bit_self_move_survives_across_a_call() {
         "    movq %rcx, %rax\n",
         "    ret"
     )));
+    // The zero-extension must survive: either the self-move stays, or the
+    // producer retarget folds it into the copy as `movl %ecx, %eax` (also a
+    // 32-bit write). A bare `movq %rcx, %rax` would keep stale upper bits.
+    assert!(
+        !out.contains("movq %rcx, %rax") || out.contains("movl %ecx, %ecx"),
+        "{out}"
+    );
     assert_eq!(
-        count(&out, "movl %ecx, %ecx"),
+        count(&out, "movl %ecx, %ecx") + count(&out, "movl %ecx, %eax"),
         1,
-        "must not be removed:\n{}",
+        "the zero-extension must not be removed:\n{}",
         out
     );
 }

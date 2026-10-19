@@ -529,6 +529,7 @@ impl super::InstructionEncoder {
         if ops.len() != 2 {
             return Err("movsx requires 2 operands".to_string());
         }
+        check_movext_register_sizes(ops, src_size, dst_size)?;
 
         let opcode = match (src_size, dst_size) {
             (1, _) => vec![0x0F, 0xBE], // movsbq/movsbl/movsbw
@@ -577,6 +578,7 @@ impl super::InstructionEncoder {
         if ops.len() != 2 {
             return Err("movzx requires 2 operands".to_string());
         }
+        check_movext_register_sizes(ops, src_size, dst_size)?;
 
         let opcode = match src_size {
             1 => vec![0x0F, 0xB6], // movzbl/movzbq/movzbw

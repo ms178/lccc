@@ -207,10 +207,10 @@ int h(void) { struct S { int c; } a; struct S b; b = a; return b.c; }'
 # sizeof/alignof must see the inner record too. These are separate sema lookup
 # sites from the ones that build CTypes, so they need their own row.
 # sizeof must see the inner record. This goes through sema's const-eval, which
-# resolves the tag through the alias map. The _Alignof counterpart does NOT
-# work and is pinned separately as gap_alignof_static_assert below -- asserting
-# both here hid that, because a row that fails for a second reason still looks
-# like one row.
+# resolves the tag through the alias map. The _Alignof counterpart has its own
+# rows (pos_alignof_inner / neg_alignof_outer below): asserting both here once
+# hid a failure of one, because a row that fails for a second reason still
+# looks like one row.
 write_case pos_sizeof_inner '
 struct S { char c; };
 int h(void) {
@@ -264,21 +264,29 @@ struct S { struct { int i; }; };
 void f(struct S p);
 void g(void) { struct S { struct { int i; }; } s; f(s); }'
 
-# PARSER-ALIGN-1, tracked in backlog.md. `_Static_assert` is evaluated by the
-# PARSER (parse_static_assert), which resolves `_Alignof(struct S)` through its
-# own flat `struct_tag_alignments` map. That map is keyed by bare tag and is
-# never unwound at block scope -- the parser has no block scoping at all -- so
-# inside a shadowing scope it still holds the OUTER record's alignment and the
-# assertion reads 1 where the answer is 4. sizeof is unaffected because it
-# resolves in sema, and the same `_Alignof` is correct in an array bound and in
-# an enum constant, which do go through sema. Fixing it means giving the parser
-# block-scope tracking; pinning it here is what stops it widening silently.
-write_case gap_alignof_static_assert '
+# PARSER-ALIGN-1 (fixed): `_Static_assert` was decided by the PARSER, which
+# resolved `_Alignof(struct S)` through a flat tag map never unwound at block
+# scope, so inside a shadowing scope it read the OUTER record (1, not 4) and
+# rejected this valid program. Static assertions are now decided by sema at
+# their lexical position, where the tag resolves to the inner record. The
+# negative twin is what proves the value: an evaluator that accepted every
+# `_Alignof` condition would pass the positive row alone, but must reject the
+# outer record's alignment for the reason the oracle gives.
+write_case pos_alignof_inner '
 struct S { char c; };
 int h(void) {
     struct S { int c; } a;
     (void)a;
     _Static_assert(_Alignof(struct S) == _Alignof(int), "alignof must see the inner record");
+    return 0;
+}'
+
+write_case neg_alignof_outer '
+struct S { char c; };
+int h(void) {
+    struct S { int c; } a;
+    (void)a;
+    _Static_assert(_Alignof(struct S) == 1, "alignof read the outer record");
     return 0;
 }'
 
@@ -394,7 +402,7 @@ for case in neg_ptr_inner_vs_outer neg_array_of_inner neg_ptr_diff_tag \
         ROWS+=("verdict|$case|$std|$PTR_GCC|$PTR_LCCC")
     done
 done
-for case in pos_tagonly_assign pos_sizeof_inner pos_transparent_union \
+for case in pos_tagonly_assign pos_sizeof_inner pos_alignof_inner pos_transparent_union \
             pos_ptr_same pos_void_ptr pos_ptr_sign pos_array_decay; do
     for std in c17 c23; do
         ROWS+=("verdict|$case|$std|-|-")
@@ -404,7 +412,9 @@ ROWS+=("verdict|pos_n3037|c23|-|-")
 ROWS+=("verdict|pos_anon_member|c23|-|-")
 ROWS+=("divergence|pos_n3037|c17|REJECT|accept|C23 N3037 correspondence is unconditional; diagnostics only, layouts identical")
 ROWS+=("divergence|pos_anon_member|c17|REJECT|accept|same class as pos_n3037")
-ROWS+=("divergence|gap_alignof_static_assert|c23|accept|REJECT|PARSER-ALIGN-1: _Alignof in _Static_assert uses the parser's flat, non-scoped tag map")
+for std in c17 c23; do
+    ROWS+=("verdict|neg_alignof_outer|$std|static assertion failed|static assertion failed")
+done
 ROWS+=("runtime|runtime_same_type|42")
 ROWS+=("runtime|runtime_nested_consistent|7 7")
 ROWS+=("runtime|runtime_elaborated_after_inner|300 12345 4")

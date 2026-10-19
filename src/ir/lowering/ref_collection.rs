@@ -10,8 +10,8 @@
 use super::lower::Lowerer;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::frontend::parser::ast::{
-    BlockItem, CompoundStmt, Expr, ExternalDecl, ForInit, FunctionDef, Initializer, Stmt,
-    TranslationUnit,
+    BlockItem, CompoundStmt, Declaration, Expr, ExternalDecl, ForInit, FunctionDef, Initializer,
+    Stmt, TranslationUnit,
 };
 use std::collections::VecDeque;
 
@@ -60,7 +60,7 @@ impl Lowerer {
                         // For skippable functions, collect their refs into a separate map
                         // so we can do transitive closure later
                         let mut func_refs = FxHashSet::default();
-                        self.collect_refs_from_compound(&func.body, &mut func_refs);
+                        self.collect_refs_from_function(func, &mut func_refs);
                         skippable_refs.insert(func.name.clone(), func_refs);
                     } else {
                         // Root function: collect refs directly into the referenced set.
@@ -72,15 +72,12 @@ impl Lowerer {
                         if func.attrs.is_used() {
                             referenced.insert(func.name.clone());
                         }
-                        self.collect_refs_from_compound(&func.body, &mut referenced);
+                        self.collect_refs_from_function(func, &mut referenced);
                     }
                 }
                 ExternalDecl::Declaration(decl) => {
-                    // Check global variable initializers for function references
+                    self.collect_refs_from_declaration(decl, &mut referenced);
                     for declarator in &decl.declarators {
-                        if let Some(ref init) = declarator.init {
-                            self.collect_refs_from_initializer(init, &mut referenced);
-                        }
                         // Alias targets reference the aliased function
                         if let Some(ref target) = declarator.attrs.alias_target {
                             referenced.insert(target.clone());
@@ -121,6 +118,18 @@ impl Lowerer {
         referenced
     }
 
+    /// Collect the functions a function definition references: in its
+    /// parameter types (a variably modified parameter's bounds are evaluated
+    /// on entry) and in its body.
+    fn collect_refs_from_function(&self, func: &FunctionDef, refs: &mut FxHashSet<String>) {
+        func.return_type
+            .for_each_expr(&mut |e| self.collect_refs_from_expr(e, refs));
+        for param in &func.params {
+            param.for_each_type_expr(&mut |e| self.collect_refs_from_expr(e, refs));
+        }
+        self.collect_refs_from_compound(&func.body, refs);
+    }
+
     /// Collect function name references from a compound statement.
     pub(super) fn collect_refs_from_compound(
         &self,
@@ -129,210 +138,109 @@ impl Lowerer {
     ) {
         for item in &compound.items {
             match item {
-                BlockItem::Declaration(decl) => {
-                    for declarator in &decl.declarators {
-                        if let Some(ref init) = declarator.init {
-                            self.collect_refs_from_initializer(init, refs);
-                        }
-                        // __attribute__((cleanup(func))) references func
-                        if let Some(ref cleanup_fn) = declarator.attrs.cleanup_fn {
-                            if self.known_functions.contains(cleanup_fn) {
-                                refs.insert(cleanup_fn.clone());
-                            }
-                        }
-                    }
-                }
-                BlockItem::Statement(stmt) => {
-                    self.collect_refs_from_stmt(stmt, refs);
-                }
-                // A nested function body may call static functions; those
-                // references keep the callees alive exactly like parent-body
-                // references do (the nested function is only reachable from
-                // the parent).
+                BlockItem::Declaration(decl) => self.collect_refs_from_declaration(decl, refs),
+                BlockItem::Statement(stmt) => self.collect_refs_from_stmt(stmt, refs),
                 // Decided by sema; a static assertion generates nothing.
-                BlockItem::StaticAssert(_) => {
-                    // Decided by sema; a static assertion generates nothing.
-                }
-                BlockItem::NestedFunction(nested) => {
-                    self.collect_refs_from_compound(&nested.body, refs);
-                }
+                BlockItem::StaticAssert(_) => {}
+                // A nested function is reachable only from its parent, so
+                // its references keep callees alive like the parent's own.
+                BlockItem::NestedFunction(nested) => self.collect_refs_from_function(nested, refs),
             }
         }
     }
 
-    /// Collect function name references from a statement.
-    pub(super) fn collect_refs_from_stmt(&self, stmt: &Stmt, refs: &mut FxHashSet<String>) {
-        match stmt {
-            Stmt::Expr(Some(expr)) => {
-                self.collect_refs_from_expr(expr, refs);
-            }
-            Stmt::Return(Some(expr), _) => {
-                self.collect_refs_from_expr(expr, refs);
-            }
-            Stmt::Compound(compound) => {
-                self.collect_refs_from_compound(compound, refs);
-            }
-            Stmt::If(cond, then_s, else_s, _) => {
-                self.collect_refs_from_expr(cond, refs);
-                self.collect_refs_from_stmt(then_s, refs);
-                if let Some(e) = else_s {
-                    self.collect_refs_from_stmt(e, refs);
-                }
-            }
-            Stmt::While(cond, body, _) => {
-                self.collect_refs_from_expr(cond, refs);
-                self.collect_refs_from_stmt(body, refs);
-            }
-            Stmt::DoWhile(body, cond, _) => {
-                self.collect_refs_from_stmt(body, refs);
-                self.collect_refs_from_expr(cond, refs);
-            }
-            Stmt::For(init, cond, inc, body, _) => {
-                if let Some(init) = init {
-                    match init.as_ref() {
-                        ForInit::Expr(e) => self.collect_refs_from_expr(e, refs),
-                        ForInit::Declaration(d) => {
-                            for declarator in &d.declarators {
-                                if let Some(ref init) = declarator.init {
-                                    self.collect_refs_from_initializer(init, refs);
-                                }
-                                // __attribute__((cleanup(func))) references func
-                                if let Some(ref cleanup_fn) = declarator.attrs.cleanup_fn {
-                                    if self.known_functions.contains(cleanup_fn) {
-                                        refs.insert(cleanup_fn.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(c) = cond {
-                    self.collect_refs_from_expr(c, refs);
-                }
-                if let Some(i) = inc {
-                    self.collect_refs_from_expr(i, refs);
-                }
-                self.collect_refs_from_stmt(body, refs);
-            }
-            Stmt::Switch(expr, body, _) => {
-                self.collect_refs_from_expr(expr, refs);
-                self.collect_refs_from_stmt(body, refs);
-            }
-            Stmt::Case(expr, stmt, _) => {
-                self.collect_refs_from_expr(expr, refs);
-                self.collect_refs_from_stmt(stmt, refs);
-            }
-            Stmt::CaseRange(low_expr, high_expr, stmt, _) => {
-                self.collect_refs_from_expr(low_expr, refs);
-                self.collect_refs_from_expr(high_expr, refs);
-                self.collect_refs_from_stmt(stmt, refs);
-            }
-            Stmt::Default(stmt, _) | Stmt::Label(_, stmt, _) => {
-                self.collect_refs_from_stmt(stmt, refs);
-            }
-            Stmt::Declaration(decl) => {
-                for declarator in &decl.declarators {
-                    if let Some(ref init) = declarator.init {
-                        self.collect_refs_from_initializer(init, refs);
-                    }
-                    if let Some(ref cleanup_fn) = declarator.attrs.cleanup_fn {
-                        if self.known_functions.contains(cleanup_fn) {
-                            refs.insert(cleanup_fn.clone());
-                        }
-                    }
-                }
-            }
-            Stmt::GotoIndirect(expr, _) => {
-                self.collect_refs_from_expr(expr, refs);
-            }
-            Stmt::InlineAsm {
-                inputs, outputs, ..
-            } => {
-                for op in inputs.iter().chain(outputs.iter()) {
-                    self.collect_refs_from_expr(&op.expr, refs);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Collect function name references from an expression.
-    pub(super) fn collect_refs_from_expr(&self, expr: &Expr, refs: &mut FxHashSet<String>) {
-        match expr {
-            Expr::Identifier(name, _) => {
-                if self.known_functions.contains(name) {
-                    refs.insert(name.clone());
-                }
-            }
-            Expr::FunctionCall(callee, args, _) => {
-                self.collect_refs_from_expr(callee, refs);
-                for arg in args {
-                    self.collect_refs_from_expr(arg, refs);
-                }
-            }
-            Expr::BinaryOp(_, lhs, rhs, _)
-            | Expr::Assign(lhs, rhs, _)
-            | Expr::CompoundAssign(_, lhs, rhs, _) => {
-                self.collect_refs_from_expr(lhs, refs);
-                self.collect_refs_from_expr(rhs, refs);
-            }
-            Expr::UnaryOp(_, operand, _)
-            | Expr::PostfixOp(_, operand, _)
-            | Expr::Cast(_, operand, _, _) => {
-                self.collect_refs_from_expr(operand, refs);
-            }
-            Expr::Conditional(c, t, f, _) => {
-                self.collect_refs_from_expr(c, refs);
-                self.collect_refs_from_expr(t, refs);
-                self.collect_refs_from_expr(f, refs);
-            }
-            Expr::GnuConditional(c, f, _) => {
-                self.collect_refs_from_expr(c, refs);
-                self.collect_refs_from_expr(f, refs);
-            }
-            Expr::Comma(lhs, rhs, _) => {
-                self.collect_refs_from_expr(lhs, refs);
-                self.collect_refs_from_expr(rhs, refs);
-            }
-            Expr::MemberAccess(base, _, _) | Expr::PointerMemberAccess(base, _, _) => {
-                self.collect_refs_from_expr(base, refs);
-            }
-            Expr::ArraySubscript(base, idx, _) => {
-                self.collect_refs_from_expr(base, refs);
-                self.collect_refs_from_expr(idx, refs);
-            }
-            Expr::Deref(inner, _) | Expr::AddressOf(inner, _) | Expr::VaArg(inner, _, _) => {
-                self.collect_refs_from_expr(inner, refs);
-            }
-            Expr::CompoundLiteral(_, init, _) => {
-                self.collect_refs_from_initializer(init, refs);
-            }
-            Expr::StmtExpr(compound, _) => {
-                self.collect_refs_from_compound(compound, refs);
-            }
-            Expr::GenericSelection(ctrl, assocs, _) => {
-                self.collect_refs_from_expr(ctrl, refs);
-                for assoc in assocs {
-                    self.collect_refs_from_expr(&assoc.expr, refs);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Collect function name references from an initializer.
-    pub(super) fn collect_refs_from_initializer(
+    /// Collect the functions a declaration references: in its type (VLA
+    /// bounds, `typeof`), its declarators' array bounds and parameter types,
+    /// its initializers, and `__attribute__((cleanup(fn)))`.
+    pub(super) fn collect_refs_from_declaration(
         &self,
-        init: &Initializer,
+        decl: &Declaration,
         refs: &mut FxHashSet<String>,
     ) {
-        match init {
-            Initializer::Expr(e) => self.collect_refs_from_expr(e, refs),
-            Initializer::List(items) => {
-                for item in items {
-                    self.collect_refs_from_initializer(&item.init, refs);
+        let mut visit = |e: &Expr| self.collect_refs_from_expr(e, refs);
+        decl.type_spec.for_each_expr(&mut visit);
+        if let Some(ts) = &decl.alignas_type {
+            ts.for_each_expr(&mut visit);
+        }
+        for declarator in &decl.declarators {
+            for derived in &declarator.derived {
+                derived.for_each_expr(&mut visit);
+            }
+            if let Some(init) = &declarator.init {
+                init.for_each_expr(&mut visit);
+            }
+        }
+        for declarator in &decl.declarators {
+            if let Some(cleanup_fn) = &declarator.attrs.cleanup_fn {
+                if self.known_functions.contains(cleanup_fn) {
+                    refs.insert(cleanup_fn.clone());
                 }
             }
+        }
+    }
+
+    /// Collect function name references from a statement and the statements
+    /// nested in it.
+    pub(super) fn collect_refs_from_stmt(&self, stmt: &Stmt, refs: &mut FxHashSet<String>) {
+        stmt.for_each_own_expr(&mut |e| self.collect_refs_from_expr(e, refs));
+        match stmt {
+            Stmt::Compound(compound) => self.collect_refs_from_compound(compound, refs),
+            Stmt::If(_, then_s, else_s, _) => {
+                self.collect_refs_from_stmt(then_s, refs);
+                if let Some(else_s) = else_s {
+                    self.collect_refs_from_stmt(else_s, refs);
+                }
+            }
+            Stmt::For(init, _, _, body, _) => {
+                if let Some(init) = init {
+                    if let ForInit::Declaration(decl) = init.as_ref() {
+                        self.collect_refs_from_declaration(decl, refs);
+                    }
+                }
+                self.collect_refs_from_stmt(body, refs);
+            }
+            Stmt::While(_, body, _)
+            | Stmt::DoWhile(body, ..)
+            | Stmt::Switch(_, body, _)
+            | Stmt::Case(_, body, _)
+            | Stmt::CaseRange(_, _, body, _)
+            | Stmt::Default(body, _)
+            | Stmt::Label(_, body, _) => self.collect_refs_from_stmt(body, refs),
+            Stmt::Declaration(decl) => self.collect_refs_from_declaration(decl, refs),
+            Stmt::Expr(_)
+            | Stmt::Return(..)
+            | Stmt::Break(_)
+            | Stmt::Continue(_)
+            | Stmt::Goto(..)
+            | Stmt::GotoIndirect(..)
+            | Stmt::InlineAsm { .. } => {}
+        }
+    }
+
+    /// Collect the functions an expression may reference when lowered.
+    ///
+    /// Deliberately a superset: every sub-expression and every expression in
+    /// the type-names it is written with (VLA bounds, `typeof`) counts,
+    /// including unevaluated `sizeof`/`_Alignof`/`typeof` operands -- whether
+    /// one is evaluated depends on its type being variably modified, which
+    /// lowering decides. A static function kept only by such a reference is
+    /// lowered and then removed by `dead_statics`, which works on the IR's
+    /// actual references and runs at every optimization level; missing a
+    /// reference instead leaves an undefined symbol at link time.
+    pub(super) fn collect_refs_from_expr(&self, expr: &Expr, refs: &mut FxHashSet<String>) {
+        let mut pending = vec![expr];
+        while let Some(e) = pending.pop() {
+            match e {
+                Expr::Identifier(name, _) => {
+                    if self.known_functions.contains(name) {
+                        refs.insert(name.clone());
+                    }
+                }
+                Expr::StmtExpr(compound, _) => self.collect_refs_from_compound(compound, refs),
+                _ => {}
+            }
+            e.for_each_type_name(&mut |ts| ts.for_each_expr(&mut |bound| pending.push(bound)));
+            e.for_each_child(&mut |child| pending.push(child));
         }
     }
 }

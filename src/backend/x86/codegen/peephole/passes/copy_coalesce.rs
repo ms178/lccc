@@ -94,7 +94,12 @@ pub(super) fn coalesce_register_copies(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         }
-        let Some((fstart, fend)) = function_range(store, infos, i) else {
+        // The recorded bounds are O(1); the rescan is O(function) per
+        // candidate (quadratic in long functions).  Same range either way.
+        let Some((fstart, fend)) = lv
+            .recorded_function(store, infos, i)
+            .or_else(|| function_range(store, infos, i))
+        else {
             i += 1;
             continue;
         };
@@ -124,6 +129,10 @@ pub(super) fn coalesce_register_copies(store: &mut LineStore, infos: &mut [LineI
                 ok = false;
                 break;
             }
+        }
+        if !ok {
+            i += 1;
+            continue;
         }
 
         // Rule 6: the DESTINATION family must have no implicit reader after the

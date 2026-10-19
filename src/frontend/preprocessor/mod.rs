@@ -10,3 +10,6 @@ mod text_processing;
 pub(crate) mod utils;
 
 pub(crate) use pipeline::Preprocessor;
+
+#[cfg(test)]
+mod physical_line_tests;

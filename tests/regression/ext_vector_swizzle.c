@@ -81,16 +81,20 @@ int main(void) {
     T3 t = {1.5L, 2.5L, 3.5L};
     t.y = t.z * 2;
     if (t.x != 1.5L || t.y != 7.0L || t.z != 3.5L || t.s1 != 7.0L) bad |= 1 << 15;
-    t.x += t.hi.y;
+    t.x += t.hi.x; /* odd N: hi = lanes {2, 3}; lane 3 is padding (Clang) */
     t.xz = t.zx;
     if (t.x != 3.5L || t.y != 7.0L || t.z != 5.0L) bad |= 1 << 16;
 
-    /* packed bool lanes */
+    /* packed bool lanes.  Clang 23.1.3 gives bool ext vectors subscripts
+     * only: `m.s1` / `m.lo` are "illegal vector component name" (lccc
+     * matches; the diagnostic is pinned by the swizzle diagnostics gate). */
     B8 m = {1, 0, 1, 0, 1, 0, 1, 0};
-    m.s1 = 1;
-    m.s07 = 0;
-    if (m.s0 + m.s1 + m.s2 + m.s3 + m.s4 + m.s5 + m.s6 + m.s7 != 4 || m.s0 || m.s7 || !m.s1) bad |= 1 << 17;
-    if (m.lo.y != 1 || m.hi.s3 != 0) bad |= 1 << 18;
+    m[1] = 1;
+    m[0] = 0;
+    m[7] = 0;
+    if (m[0] + m[1] + m[2] + m[3] + m[4] + m[5] + m[6] + m[7] != 4 || m[0] || m[7] || !m[1]) bad |= 1 << 17;
+    if (m[1] != 1 || m[7] != 0 || m[2] != 1 || m[3] != 0 || m[4] != 1 || m[5] != 0 || m[6] != 1)
+        bad |= 1 << 18;
 
     volatile F4 vv = v;
     vv.x = 100;
@@ -114,8 +118,8 @@ int main(void) {
     tc.x = 1.0L;
     tc.y = -2.5L;
     tc.z = 0.0L;
-    if (tc.x != 1.0L || tc.y != -2.5L || tc.z != 0.0L || tc.hi.y != 0.0L) bad |= 1 << 25;
+    if (tc.x != 1.0L || tc.y != -2.5L || tc.z != 0.0L || tc.hi.x != 0.0L) bad |= 1 << 25;
 
     printf("swizzle: %s (0x%x)\n", bad ? "FAIL" : "ok", bad);
-    return bad;
+    return bad != 0; /* an exit status keeps 8 bits: `return bad` hid bits 8+ */
 }

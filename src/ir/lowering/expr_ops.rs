@@ -4,6 +4,7 @@
 //! Extracted from expr.rs to keep expression lowering manageable.
 
 use super::lower::Lowerer;
+use crate::common::const_eval as shared_const_eval;
 use crate::common::types::{AddressSpace, CType, IrType, widened_op_type};
 use crate::frontend::parser::ast::{BinOp, Expr, PostfixOp, UnaryOp};
 use crate::ir::reexports::{
@@ -79,6 +80,42 @@ impl Lowerer {
             let rhs_dec = self.expr_ctype(rhs).is_decimal();
             if lhs_dec || rhs_dec {
                 return self.lower_decimal_binop(op, lhs, rhs);
+            }
+        }
+
+        // _Float128 constant arithmetic and comparisons fold exactly: the
+        // binary128 soft-float helpers round like libgcc's __addtf3, __lttf2
+        // & co. in round-to-nearest, so a constant operation need not become
+        // a library call. An observable floating-point environment keeps it
+        // at run time (the rounding mode or exception flags may differ).
+        if matches!(
+            op,
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge
+        ) && !self.pass_policy.fp_environment_observable
+        {
+            let (lct, rct) = (self.expr_ctype(lhs), self.expr_ctype(rhs));
+            let real = |ct: &CType| ct.is_arithmetic() && !ct.is_complex();
+            if (lct == CType::Float128 || rct == CType::Float128) && real(&lct) && real(&rct) {
+                if let Some(v) = self
+                    .eval_const_expr(lhs)
+                    .zip(self.eval_const_expr(rhs))
+                    .and_then(|(l, r)| {
+                        let a = shared_const_eval::f128_bytes_of(&l, Some(&lct))?;
+                        let b = shared_const_eval::f128_bytes_of(&r, Some(&rct))?;
+                        shared_const_eval::fold_f128_binop(op, &a, &b)
+                    })
+                {
+                    return Operand::Const(v);
+                }
             }
         }
 
@@ -847,10 +884,10 @@ impl Lowerer {
             UnaryOp::LogicalNot => {
                 let int_ty = crate::common::types::target_int_ir_type();
                 let inner_ct = self.expr_ctype(inner);
-                if inner_ct.is_decimal() {
-                    // !d == (d == 0) under decimal semantics.
+                if inner_ct.is_soft_float() {
+                    // !d == (d == 0) under decimal / _Float128 semantics.
                     let val = self.lower_expr(inner);
-                    let truthy = self.lower_decimal_truthiness(val, &inner_ct);
+                    let truthy = self.lower_soft_float_truthiness(val, &inner_ct);
                     let dest = self.emit_cmp_val(
                         IrCmpOp::Eq,
                         truthy,
@@ -982,17 +1019,21 @@ impl Lowerer {
             }
         }
 
-        // C23 decimals: both arms convert to the UAC common type through the
-        // libbid helpers (raw IR casts would emit binary conversions on BID
-        // carriers). Mirrors the complex path below, including dead-branch
-        // elimination for constant conditions. When the common type is a
-        // binary float (the decimal-vs-binary UAC rule), convert_scalar_ctype
-        // performs the decimal->binary conversion on each arm.
-        if then_ct.is_decimal() || else_ct.is_decimal() {
+        // C23 decimals and _Float128: both arms convert to the UAC common
+        // type through the libbid / soft-float helpers (raw IR casts would
+        // reinterpret their integer carriers: `0 ? q : 1.5` yielded 0).
+        // Mirrors the complex path below, including dead-branch elimination
+        // for constant conditions. When the common type is a binary float
+        // (the decimal-vs-binary UAC rule), convert_scalar_ctype performs
+        // the decimal->binary conversion on each arm.
+        let float128_arms = (then_ct == CType::Float128 || else_ct == CType::Float128)
+            && then_ct.is_arithmetic()
+            && else_ct.is_arithmetic();
+        if then_ct.is_decimal() || else_ct.is_decimal() || float128_arms {
             let common_ct = CType::usual_arithmetic_conversion(&then_ct, &else_ct);
             let common_ir = IrType::from_ctype(&common_ct);
             if let Some(const_val) = self.eval_const_expr(cond) {
-                let (live_expr, live_ct) = if const_val.is_nonzero() {
+                let (live_expr, live_ct) = if self.const_truth(&const_val, cond) {
                     (then_expr, &then_ct)
                 } else {
                     (else_expr, &else_ct)
@@ -1027,7 +1068,7 @@ impl Lowerer {
         // dead branches bloat the IR beyond inlining limits and cause linker
         // errors when always_inline functions can't be inlined.
         if let Some(const_val) = self.eval_const_expr(cond) {
-            let is_true = const_val.is_nonzero();
+            let is_true = self.const_truth(&const_val, cond);
             if is_true {
                 let then_val = self.lower_aggregate_rvalue(then_expr);
                 if result_is_complex {
@@ -1221,18 +1262,19 @@ impl Lowerer {
             );
         }
 
-        // C23 decimals: both arms convert to the UAC common type through the
-        // libbid helpers (same rationale as lower_conditional). The condition
-        // value doubles as the "then" arm; test it with decimal truthiness
-        // (+0 == -0), not an integer comparison of the BID carrier.
-        if cond_ct.is_decimal() || else_ct.is_decimal() {
+        // C23 decimals and _Float128: both arms convert to the UAC common
+        // type through the libbid / soft-float helpers (same rationale as
+        // lower_conditional). The condition value doubles as the "then" arm;
+        // test it with the type's own truthiness (+0 == -0), not an integer
+        // comparison of its carrier.
+        if cond_ct.is_soft_float() || else_ct.is_soft_float() {
             let common_ct = CType::usual_arithmetic_conversion(&cond_ct, &else_ct);
             let common_ir = IrType::from_ctype(&common_ct);
-            // Booleanize the condition: decimal truthiness for decimal
-            // conditions, the generic != 0 comparison otherwise (a raw
+            // Booleanize the condition: soft-float truthiness for decimal /
+            // _Float128 conditions, the generic != 0 comparison otherwise (a raw
             // integer is not a valid branch condition).
-            let cond_bool_val = if cond_ct.is_decimal() {
-                let truthy = self.lower_decimal_truthiness(cond_val, &cond_ct);
+            let cond_bool_val = if cond_ct.is_soft_float() {
+                let truthy = self.lower_soft_float_truthiness(cond_val, &cond_ct);
                 self.operand_to_value(truthy)
             } else {
                 let int_ty = crate::common::types::target_int_ir_type();
@@ -1535,7 +1577,7 @@ impl Lowerer {
         for op in &ops {
             match self.eval_const_expr(op) {
                 Some(c) => {
-                    let truthy = c.is_nonzero();
+                    let truthy = self.const_truth(&c, op);
                     // `||` short-circuits on true; `&&` on false.
                     if truthy != is_and {
                         for &k in &kept {
@@ -1681,6 +1723,26 @@ impl Lowerer {
         is_inc: bool,
         return_new: bool,
     ) -> Operand {
+        // `discard_expr_result` reaches here set only when this inc/dec is
+        // the discarded top-level expression (`lower_expr_unmaterialized`).
+        // It describes this expression alone: the operand's subexpressions
+        // still need their values, so it is cleared while the operand is
+        // lowered. Otherwise the `p++` in `(p++)->w++;` also took the
+        // discarded-result path, yielded the incremented pointer, and the
+        // increment landed in the next element.
+        let discard = std::mem::replace(&mut self.discard_expr_result, false);
+        let result = self.lower_inc_dec_operand(inner, is_inc, return_new, discard);
+        self.discard_expr_result = discard;
+        result
+    }
+
+    fn lower_inc_dec_operand(
+        &mut self,
+        inner: &Expr,
+        is_inc: bool,
+        return_new: bool,
+        discard: bool,
+    ) -> Operand {
         if let Some(result) = self.try_lower_bitfield_inc_dec(inner, is_inc, return_new) {
             return result;
         }
@@ -1693,10 +1755,37 @@ impl Lowerer {
         // of 0xffff).
         let inner_ct = self.expr_ctype(inner);
         if inner_ct.is_vector() {
-            return self.lower_vector_inc_dec(inner, is_inc, return_new, &inner_ct);
+            return self.lower_vector_inc_dec(inner, is_inc, return_new, discard, &inner_ct);
         }
 
         let ty = self.get_expr_type(inner);
+
+        // _Float128 lives in an integer carrier: the step is binary128 1.0
+        // through the soft-float helpers, never an integer add of 1 to the
+        // bit pattern.
+        if inner_ct == CType::Float128 {
+            if let Some(lv) = self.lower_lvalue_for_mutation(inner) {
+                let loaded = self.load_lvalue_typed(&lv, ty);
+                let loaded_val = self.operand_to_value(loaded);
+                let one = u128::from_le_bytes(
+                    crate::common::long_double::f64_to_f128_bytes_lossless(1.0),
+                );
+                let helper = if is_inc { "__addtf3" } else { "__subtf3" };
+                let result = self.emit_f128_binop_call(
+                    helper,
+                    Operand::Value(loaded_val),
+                    Operand::Const(IrConst::I128(one as i128)),
+                );
+                self.store_lvalue_typed(&lv, Operand::Value(result), ty);
+                return if return_new || discard {
+                    Operand::Value(result)
+                } else {
+                    Operand::Value(loaded_val)
+                };
+            }
+            return self.lower_expr(inner);
+        }
+
         if let Some(lv) = self.lower_lvalue_for_mutation(inner) {
             let loaded = self.load_lvalue_typed(&lv, ty);
             let loaded_val = self.operand_to_value(loaded);
@@ -1723,7 +1812,7 @@ impl Lowerer {
             }
             // A discarded result needs no old value.  Otherwise the pre-update
             // load is exactly the value required by C post-inc/dec semantics.
-            if self.discard_expr_result {
+            if discard {
                 return store_op;
             }
             return Operand::Value(loaded_val);
@@ -1743,6 +1832,7 @@ impl Lowerer {
         inner: &Expr,
         is_inc: bool,
         return_new: bool,
+        discard: bool,
         vec_ct: &CType,
     ) -> Operand {
         let (elem_ct, num_elems) = match vec_ct.vector_info() {
@@ -1774,7 +1864,7 @@ impl Lowerer {
         let seg = self.lvalue_addr_space(&lv);
         let base = self.lvalue_addr(&lv);
 
-        let old_copy = if !return_new && !self.discard_expr_result {
+        let old_copy = if !return_new && !discard {
             let old_alloca =
                 self.emit_entry_alloca(IrType::Ptr, total_size, self.ctype_align(vec_ct), false);
             self.zero_init_alloca(old_alloca, total_size);
@@ -1880,6 +1970,11 @@ impl Lowerer {
     fn inc_dec_step_and_type(&self, ty: IrType, expr: &Expr) -> (Operand, IrType) {
         if ty == IrType::Ptr {
             let ptr_int_ty = crate::common::types::target_int_ir_type();
+            // A pointer to a VLA steps by its runtime pointee size, as in
+            // `p + 1` (try_lower_pointer_arithmetic).
+            if let Some(stride) = self.get_vla_stride_for_subscript(expr) {
+                return (Operand::Value(stride), ptr_int_ty);
+            }
             let elem_size = self.get_pointer_elem_size_from_expr(expr);
             (
                 Operand::Const(IrConst::ptr_int(elem_size as i64)),

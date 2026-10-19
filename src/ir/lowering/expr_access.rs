@@ -6,6 +6,7 @@
 
 use super::lower::Lowerer;
 use super::string_init::StringInit;
+use super::structs::ExtVectorSelection;
 use crate::common::types::{AddressSpace, CType, IrType, SsoMode};
 use crate::frontend::parser::ast::{
     BlockItem, CompoundStmt, Designator, Expr, GenericAssociation, Initializer, InitializerItem,
@@ -140,7 +141,7 @@ impl Lowerer {
         if !inner_ctype.is_vector() && target_ctype.is_vector() {
             let vec_size = self.ctype_size(&target_ctype);
             let src = self.lower_expr(inner);
-            let from_ty = self.get_expr_type(inner);
+            let from_ty = self.value_ir_type(inner);
 
             let alloca = self.fresh_value();
             self.emit(Instruction::Alloca {
@@ -194,6 +195,24 @@ impl Lowerer {
             return Operand::Value(alloca);
         }
 
+        // Fold constant casts at lowering time so -O0 matches GCC
+        // -fno-trapping-math saturation (gcc.c-torture 20031003-1:
+        // `(int)2147483648.0f` is INT_MAX, not the x86 indefinite INT_MIN).
+        // This precedes the decimal and _Float128 runtime paths: their
+        // constant conversions fold exactly (shared value helpers) instead of
+        // calling libbid/libgcc at run time. Any floating side -- binary,
+        // _Float128 or decimal, whose rounding modes are all part of the
+        // floating-point environment -- keeps the conversion at run time
+        // when that environment is observable (FENV_ACCESS, -frounding-math).
+        let is_fp = |ct: &CType| ct.is_floating() || *ct == CType::Float128 || ct.is_decimal();
+        let observable_fp = self.pass_policy.fp_environment_observable
+            && (is_fp(&inner_ctype) || is_fp(&target_ctype));
+        if !observable_fp {
+            if let Some(c) = self.eval_const_cast(target_type, inner) {
+                return Operand::Const(c);
+            }
+        }
+
         // C23 decimal floating point casts: route through the libbid
         // (__bid_*) conversion helpers, exactly like GCC.
         if (inner_ctype.is_decimal() || target_ctype.is_decimal()) && target_ctype != CType::Bool {
@@ -221,17 +240,6 @@ impl Lowerer {
         if target_ctype == CType::Float128 && inner_ctype != CType::Float128 {
             let src = self.lower_expr(inner);
             return self.convert_to_f128(src, &inner_ctype);
-        }
-
-        // Fold constant casts at lowering time so -O0 matches GCC
-        // -fno-trapping-math saturation (gcc.c-torture 20031003-1:
-        // `(int)2147483648.0f` is INT_MAX, not the x86 indefinite INT_MIN).
-        let observable_fp = self.pass_policy.fp_environment_observable
-            && (inner_ctype.is_floating() || target_ctype.is_floating());
-        if !observable_fp {
-            if let Some(c) = self.eval_const_cast(target_type, inner) {
-                return Operand::Const(c);
-            }
         }
 
         let src = self.lower_expr(inner);
@@ -262,11 +270,11 @@ impl Lowerer {
 
         // C standard: conversion to _Bool yields 0 or 1
         if target_ctype == CType::Bool {
-            if inner_ctype.is_decimal() {
-                // decimal zero test: +0 == -0 compares equal (IEEE 754
+            if inner_ctype.is_soft_float() {
+                // decimal / _Float128 zero test: +0 == -0 compares equal (IEEE 754
                 // totalOrder semantics do NOT apply here; plain ==/!= does)
                 let dsrc = self.lower_expr(inner);
-                return self.lower_decimal_truthiness(dsrc, &inner_ctype);
+                return self.lower_soft_float_truthiness(dsrc, &inner_ctype);
             }
             if from_ty.is_float() {
                 let zero = match from_ty {
@@ -445,7 +453,7 @@ impl Lowerer {
                         let val = self.lower_expr(expr);
                         // For vector compound literals, cast each element to the vector element type
                         let val = if let Some(vec_elem_ty) = vector_elem_ir_ty {
-                            let expr_ty = self.get_expr_type(expr);
+                            let expr_ty = self.value_ir_type(expr);
                             Operand::Value(self.emit_cast_val(val, expr_ty, vec_elem_ty))
                         } else {
                             val
@@ -494,8 +502,6 @@ impl Lowerer {
                         Some(CType::Array(inner_elem_ty, Some(inner_size))) => {
                             // Nested array: initialize element-by-element
                             let inner_elem_size = self.resolve_ctype_size(inner_elem_ty);
-                            let inner_ir_ty = IrType::from_ctype(inner_elem_ty);
-                            let inner_is_bool = **inner_elem_ty == CType::Bool;
                             // Zero-init the element region for partial initialization
                             if sub_items.len() < *inner_size {
                                 self.zero_init_region(alloca, elem_offset, elem_size);
@@ -506,12 +512,11 @@ impl Lowerer {
                                 }
                                 if let Initializer::Expr(e) = &sub_item.init {
                                     let inner_offset = elem_offset + si * inner_elem_size;
-                                    self.emit_init_expr_to_offset_bool(
+                                    self.emit_init_expr_to_offset(
                                         e,
                                         alloca,
                                         inner_offset,
-                                        inner_ir_ty,
-                                        inner_is_bool,
+                                        inner_elem_ty,
                                     );
                                 }
                             }
@@ -553,6 +558,12 @@ impl Lowerer {
     // -----------------------------------------------------------------------
 
     pub(super) fn lower_sizeof(&mut self, arg: &SizeofArg) -> Operand {
+        // An operand of variably modified type is evaluated (C11 6.5.3.4p2).
+        if let SizeofArg::Expr(expr) = arg {
+            if self.expr_is_variably_modified(expr) && expr.may_have_side_effects() {
+                self.lower_expr_discarded(expr);
+            }
+        }
         if let Some(vla_val) = self.get_vla_sizeof(arg) {
             return Operand::Value(vla_val);
         }
@@ -571,7 +582,24 @@ impl Lowerer {
 
     fn get_vla_sizeof(&self, arg: &SizeofArg) -> Option<Value> {
         match arg {
-            SizeofArg::Expr(Expr::Identifier(name, _)) => {
+            SizeofArg::Expr(expr) => self.vla_sizeof_of_expr(expr),
+            SizeofArg::Type(_) => None,
+        }
+    }
+
+    /// The runtime size of `expr` when its type is a VLA this function
+    /// tracks: a VLA object or typedef name, or what a subscript or
+    /// dereference of a VLA or pointer to one reaches. `sizeof` lowers to it,
+    /// and constant folding must not fold such a `sizeof`.
+    /// Whether `expr` has a variably modified type this function tracks.
+    pub(super) fn expr_is_variably_modified(&self, expr: &Expr) -> bool {
+        self.func_state.is_some()
+            && (self.vm_layout_of_expr(expr).is_some() || self.vla_sizeof_of_expr(expr).is_some())
+    }
+
+    pub(super) fn vla_sizeof_of_expr(&self, expr: &Expr) -> Option<Value> {
+        match expr {
+            Expr::Identifier(name, _) => {
                 // Check local VLA variables first
                 if let Some(info) = self.func().locals.get(name) {
                     if info.vla_size.is_some() {
@@ -583,12 +611,12 @@ impl Lowerer {
                     return Some(vla_size);
                 }
             }
-            SizeofArg::Expr(Expr::ArraySubscript(base, _, _)) => {
+            Expr::ArraySubscript(base, _, _) => {
                 if let Some(stride) = self.get_vla_stride_for_subscript(base) {
                     return Some(stride);
                 }
             }
-            SizeofArg::Expr(Expr::Deref(inner, _)) => {
+            Expr::Deref(inner, _) => {
                 if let Some(stride) = self.get_vla_stride_for_subscript(inner) {
                     return Some(stride);
                 }
@@ -603,6 +631,12 @@ impl Lowerer {
     /// with non-constant size expressions. Also looks up struct/union tags
     /// whose layout was recorded as a VLA at the type definition.
     fn compute_vla_sizeof_for_type(&mut self, ts: &TypeSpecifier) -> Option<Value> {
+        // `typeof(expr)` of VM type: evaluated, and sized from its layout.
+        if let Some(base) = self.typeof_vm_base(ts) {
+            if base.size.is_some() {
+                return base.size;
+            }
+        }
         // Check if it's a VLA typedef name with a pre-computed runtime size
         if let TypeSpecifier::TypedefName(name) = ts {
             if let Some(&vla_size) = self.func().vla_typedef_sizes.get(name) {
@@ -688,138 +722,19 @@ impl Lowerer {
         self.lower_expr(selected)
     }
 
-    /// Resolve a _Generic selection to the matching association expression.
-    /// Used by both lower_generic_selection (rvalue) and lower_lvalue (lvalue context).
+    /// Resolve a _Generic selection to the matching association expression,
+    /// for rvalue (`lower_generic_selection`) and lvalue (`lower_lvalue`)
+    /// contexts: the one selection rule of `resolve_generic_selection_expr`,
+    /// so a selection's value and its type always agree. Sema rejects a
+    /// selection that matches nothing, so the first association is only a
+    /// recovery value after that error.
     pub(super) fn resolve_generic_selection<'a>(
         &mut self,
         controlling: &Expr,
         associations: &'a [GenericAssociation],
     ) -> &'a Expr {
-        let controlling_ctype = self.get_expr_ctype(controlling);
-        let controlling_ir_type = self.get_expr_type(controlling);
-        // Per C11 6.5.1.1p2, the controlling expression undergoes lvalue
-        // conversion, which includes array-to-pointer and function-to-pointer
-        // decay, and strips top-level qualifiers.
-        let controlling_ctype = controlling_ctype.map(|ct| ct.decayed_value_ctype());
-        // Determine if the controlling expression's type has a const-qualified pointee.
-        // Lvalue conversion strips top-level qualifiers. So for non-pointer types like
-        // `const int x`, the type becomes `int` (ctrl_is_const = false).
-        // For pointer types like `const int *p`, lvalue conversion strips the top-level
-        // pointer const but preserves the pointee const, so ctrl_is_const reflects
-        // whether the pointee is const.
-        let ctrl_is_const = if let Some(ref ct) = controlling_ctype {
-            matches!(ct, CType::Pointer(_, _)) && self.expr_is_const_qualified(controlling)
-        } else {
-            false
-        };
-
-        // Check if const-aware matching is needed. This is the case when:
-        // (a) associations differ in const-ness (some have is_const=true, others false), OR
-        // (b) the controlling expression is a pointer with const pointee (ctrl_is_const=true),
-        //     which means non-const pointer associations should not match.
-        let has_const_differentiated_assocs = {
-            let non_default: Vec<_> = associations
-                .iter()
-                .filter(|a| a.type_spec.is_some())
-                .collect();
-            let assocs_differ =
-                non_default.iter().any(|a| a.is_const) && non_default.iter().any(|a| !a.is_const);
-            assocs_differ || ctrl_is_const
-        };
-
-        let mut default_expr: Option<&Expr> = None;
-        let mut matched_expr: Option<&Expr> = None;
-
-        for assoc in associations {
-            match &assoc.type_spec {
-                None => {
-                    default_expr = Some(&assoc.expr);
-                }
-                Some(type_spec) => {
-                    let assoc_ctype = self.type_spec_to_ctype(type_spec);
-                    if let Some(ref ctrl_ct) = controlling_ctype {
-                        if self.ctype_matches_generic(ctrl_ct, &assoc_ctype) {
-                            // When const-aware matching is active, also check
-                            // that the const qualification matches.
-                            if has_const_differentiated_assocs && assoc.is_const != ctrl_is_const {
-                                continue;
-                            }
-                            matched_expr = Some(&assoc.expr);
-                            break;
-                        }
-                    } else {
-                        let assoc_ir_type = self.type_spec_to_ir(type_spec);
-                        if assoc_ir_type == controlling_ir_type {
-                            if has_const_differentiated_assocs && assoc.is_const != ctrl_is_const {
-                                continue;
-                            }
-                            matched_expr = Some(&assoc.expr);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        matched_expr
-            .or(default_expr)
+        self.resolve_generic_selection_expr(controlling, associations)
             .unwrap_or(&associations[0].expr)
-    }
-
-    pub(super) fn ctype_matches_generic(&self, controlling: &CType, assoc: &CType) -> bool {
-        // Per C11 6.5.1.1p2, the controlling expression undergoes lvalue conversion,
-        // which includes array-to-pointer decay.
-        // Const/volatile qualification is checked separately via is_const flags.
-
-        // Exact structural match (same discriminant)
-        if std::mem::discriminant(controlling) == std::mem::discriminant(assoc) {
-            match (controlling, assoc) {
-                (CType::Pointer(a, _), CType::Pointer(b, _)) => {
-                    return self.ctype_matches_generic(a, b);
-                }
-                (CType::Array(a, _), CType::Array(b, _)) => {
-                    return self.ctype_matches_generic(a, b);
-                }
-                // For types that carry identity data (Struct, Union, Enum, Function,
-                // Vector), we must compare the full type, not just the discriminant.
-                // Primitive types (Int, Float, etc.) have no data so PartialEq works too.
-                _ => return controlling == assoc,
-            }
-        }
-        // Array decays to pointer for _Generic matching
-        if let CType::Array(elem, _) = controlling {
-            if let CType::Pointer(pointee, _) = assoc {
-                return self.ctype_matches_generic(elem, pointee);
-            }
-        }
-        // Enum matches int
-        if matches!(controlling, CType::Enum(_)) && matches!(assoc, CType::Int) {
-            return true;
-        }
-        if matches!(controlling, CType::Int) && matches!(assoc, CType::Enum(_)) {
-            return true;
-        }
-        false
-    }
-
-    /// Check if an expression's type is const-qualified (for _Generic matching).
-    /// Handles local variable identifiers, address-of, and comma expressions.
-    pub(super) fn expr_is_const_qualified(&self, expr: &Expr) -> bool {
-        match expr {
-            Expr::Identifier(name, _) => {
-                if let Some(ref fs) = self.func_state {
-                    if let Some(info) = fs.locals.get(name) {
-                        return info.is_const;
-                    }
-                }
-                false
-            }
-            // Address-of: &y where y is `const int` produces `const int *`.
-            Expr::AddressOf(inner, _) => self.expr_is_const_qualified(inner),
-            // Comma: const-ness comes from the right-hand operand.
-            Expr::Comma(_, rhs, _) => self.expr_is_const_qualified(rhs),
-            _ => false,
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -903,6 +818,25 @@ impl Lowerer {
                     if let Some(ref layout) = struct_layout {
                         self.zero_init_alloca(alloca, layout.size);
                         self.emit_struct_init(items, alloca, layout, 0);
+                    } else if !ctype.is_complex() {
+                        // A scalar literal converts its (possibly brace-
+                        // nested) initializer as by initialization (C11
+                        // 6.5.2.5p4, 6.7.9p11): `(double){ i - 3 }` is the
+                        // value i - 3, not the int's bits read as a double.
+                        // An empty list (C23 `(int){}`) is zero.
+                        match Self::unwrap_nested_init_expr(items) {
+                            Some(e) => {
+                                let val = self.lower_init_leaf(e, &ctype);
+                                self.emit(Instruction::Store {
+                                    volatile: false,
+                                    val,
+                                    ptr: alloca,
+                                    ty: IrType::from_ctype(&ctype),
+                                    seg_override: AddressSpace::Default,
+                                });
+                            }
+                            None => self.zero_init_alloca(alloca, size),
+                        }
                     } else {
                         self.init_array_compound_literal(alloca, items, type_spec, ty, size);
                     }
@@ -1208,56 +1142,31 @@ impl Lowerer {
     // Member access (s.field, p->field)
     // -----------------------------------------------------------------------
 
-    /// Clang ext-vector component access as an rvalue: `v.x` loads one lane
-    /// (through the lane helper, so packed `_Bool` and 10-byte x87 lanes are
-    /// right); `v.zyx` builds a fresh vector of the named lanes in order.
-    fn lower_vector_component_rvalue(
-        &mut self,
-        base_expr: &Expr,
-        field_name: &str,
-        is_pointer: bool,
-        vec_ct: &CType,
-        lanes: &[usize],
-    ) -> Operand {
-        let addr_space = if is_pointer {
-            self.get_addr_space_of_ptr_expr(base_expr)
-        } else {
-            self.get_addr_space_of_struct_expr(base_expr)
-        };
-        let volatile = if is_pointer {
-            self.pointee_expr_is_volatile(base_expr)
-        } else {
-            self.expr_access_is_volatile(base_expr)
-        };
-        let src = if is_pointer {
-            let ptr_val = self.lower_expr(base_expr);
-            self.operand_to_value(ptr_val)
-        } else {
-            // Any vector-valued expression: an object's address, or the
-            // temporary an rvalue (call, arithmetic, swizzle) was built in.
-            self.get_struct_base_addr(base_expr)
-        };
-        if lanes.len() == 1 {
-            return self.load_vector_lane(src, vec_ct, lanes[0], addr_space, volatile);
+    /// Clang ext-vector element selection as an rvalue: `v.x` loads one lane
+    /// (through the lane helper, so 10-byte x87 lanes are right); `v.zyx`
+    /// builds a fresh vector of the named lanes in order. Nested selections
+    /// read straight out of the root vector.
+    fn lower_vector_component_rvalue(&mut self, sel: &ExtVectorSelection<'_>) -> Operand {
+        let (addr_space, volatile) = self.ext_vector_selection_access(sel);
+        // Any vector-valued root: an object's address, or the temporary an
+        // rvalue (call, arithmetic) was built in.
+        let src = self.ext_vector_selection_base(sel);
+        if let [lane] = sel.lanes[..] {
+            return self.load_vector_lane(src, &sel.vector_ct, lane, addr_space, volatile);
         }
-        let Some(result_ct) = vec_ct.ext_vector_swizzle_ctype(field_name) else {
-            return Operand::Const(IrConst::I64(0));
-        };
-        let Some((elem_ct, _)) = vec_ct.vector_info() else {
-            return Operand::Const(IrConst::I64(0));
-        };
-        let elem_ir_ty = Self::vector_elem_ir_type(&elem_ct);
+        let result_ct = &sel.result_ct;
+        let elem_ir_ty = Self::vector_elem_ir_type(sel.elem_ct());
         let total_size = result_ct.size();
-        let align = self.ctype_align(&result_ct);
+        let align = self.ctype_align(result_ct);
         let result = self.emit_entry_alloca(IrType::Ptr, total_size, align, false);
-        if crate::ir::lowering::lower::vector_temp_needs_zero_init(&result_ct, lanes.len()) {
+        if crate::ir::lowering::lower::vector_temp_needs_zero_init(result_ct, sel.lanes.len()) {
             self.zero_init_alloca(result, total_size);
         }
-        for (i, &lane) in lanes.iter().enumerate() {
-            let v = self.load_vector_lane(src, vec_ct, lane, addr_space, volatile);
+        for (i, &lane) in sel.lanes.iter().enumerate() {
+            let v = self.load_vector_lane(src, &sel.vector_ct, lane, addr_space, volatile);
             self.store_vector_lane(
                 result,
-                &result_ct,
+                result_ct,
                 i,
                 v,
                 elem_ir_ty,
@@ -1274,9 +1183,8 @@ impl Lowerer {
         field_name: &str,
         is_pointer: bool,
     ) -> Operand {
-        if let Some((vec_ct, lanes)) = self.vector_member_lanes(base_expr, field_name, is_pointer) {
-            return self
-                .lower_vector_component_rvalue(base_expr, field_name, is_pointer, &vec_ct, &lanes);
+        if let Some(sel) = self.ext_vector_selection_parts(base_expr, field_name, is_pointer) {
+            return self.lower_vector_component_rvalue(&sel);
         }
         let (field_offset, field_ty, bitfield, field_ctype) = if is_pointer {
             self.resolve_pointer_member_access_with_ctype(base_expr, field_name)
@@ -1428,14 +1336,7 @@ impl Lowerer {
         // expressions that re-declare the same variable name (extremely common in
         // kernel macros like READ_ONCE, per-CPU accessors, container_of) permanently
         // overwrite the outer binding, producing wrong code.
-        let has_declarations = compound.items.iter().any(|item| {
-            matches!(item, BlockItem::Declaration(_)) || {
-                // Nested definitions contribute a scope entry exactly
-                // like declarations do (the nested function name is
-                // declared in this block).
-                matches!(item, BlockItem::NestedFunction(_))
-            }
-        });
+        let has_declarations = Self::block_needs_scope(compound);
         if has_declarations {
             self.push_scope();
         }
@@ -1471,13 +1372,14 @@ impl Lowerer {
                             self.lower_stmt(inner);
                         }
                     } else if let Stmt::Expr(Some(expr)) = stmt {
+                        self.declare_type_name_tags_in(expr);
                         last_val = self.lower_expr(expr);
                     } else {
                         self.lower_stmt(stmt);
                     }
                 }
                 BlockItem::Declaration(decl) => {
-                    self.collect_enum_constants_scoped(&decl.type_spec);
+                    self.declare_local_decl_tags(decl);
                     self.lower_local_decl(decl);
                 }
                 // Decided by sema; a static assertion generates nothing.

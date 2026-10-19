@@ -20,8 +20,8 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::{AddressSpace, CType, IrType, SsoMode};
 use crate::frontend::parser::ast::{
-    self, DerivedDeclarator, EnumVariant, Expr, ExprId, ExternalDecl, ParamDecl, TranslationUnit,
-    TypeSpecifier,
+    self, BlockItem, CompoundStmt, Declaration, DerivedDeclarator, EnumVariant, Expr, ExprId,
+    ExternalDecl, ParamDecl, Stmt, TranslationUnit, TypeSpecifier,
 };
 use crate::frontend::sema::type_context::TypeContext;
 use crate::frontend::sema::{ConstMap, ExprTypeMap, FunctionInfo};
@@ -102,10 +102,12 @@ pub struct Lowerer {
     /// `_Bool` lane reads route through it for the byte/bit address)
     /// and must not trip the diagnostic.
     pub(super) lvalue_for_mutation: bool,
-    /// Set while lowering an `Expr::Assign` whose value is discarded
-    /// (expression statement, for-increment): a swizzle assignment then
-    /// skips materialising its result vector. Captured at the start of
-    /// `try_lower_swizzle_assign`; any nested `lower_expr` clears it.
+    /// Set while lowering an `Expr::Assign` or `Expr::CompoundAssign` whose
+    /// value is discarded (expression statement, for-increment): a
+    /// multi-lane ext-vector selection target then skips materialising its
+    /// result vector. Captured at the start of `try_lower_swizzle_assign`
+    /// and `lower_ext_vector_selection_compound_assign`; any nested
+    /// `lower_expr` clears it.
     pub(super) discard_assign_result: bool,
     /// Set of function names that have at least one file-scope declaration
     /// without the `inline` specifier OR with `extern`. Per C99 6.7.4p7,
@@ -155,6 +157,9 @@ pub struct Lowerer {
     /// falls back to its own evaluation (which handles lowering-specific cases
     /// like global addresses, func_state const locals, etc.).
     pub(super) sema_const_values: ConstMap,
+    /// Sema's `SemaResult::enumerator_refs`: identifier uses that denote an
+    /// enumeration constant. Authoritative over the lowerer's own lookup.
+    pub(super) sema_enumerator_refs: FxHashMap<ExprId, i64>,
     /// Stack of local label scopes from GNU __label__ declarations.
     /// Each entry maps a label name to its scope-qualified name.
     /// When resolving a label, the stack is searched top-down so that
@@ -237,6 +242,12 @@ impl Lowerer {
         self
     }
 
+    /// Attach sema's enumerator verdicts (`SemaResult::enumerator_refs`).
+    pub fn with_enumerator_refs(mut self, refs: FxHashMap<ExprId, i64>) -> Self {
+        self.sema_enumerator_refs = refs;
+        self
+    }
+
     /// Create a new Lowerer with pre-populated state from semantic analysis.
     ///
     /// The sema-provided TypeContext contains typedefs, enum constants, struct layouts,
@@ -306,6 +317,7 @@ impl Lowerer {
             sema_functions,
             sema_expr_types,
             sema_const_values,
+            sema_enumerator_refs: FxHashMap::default(),
             local_label_scopes: Vec::new(),
             next_local_label_scope: 0,
             asm_label_map: FxHashMap::default(),
@@ -439,6 +451,37 @@ impl Lowerer {
     /// Checks locals first, then globals. Returns `&VarInfo` which provides
     /// access to the shared fields (ty, elem_size, is_array, pointee_type,
     /// struct_layout, is_struct, array_dim_strides, c_type).
+    /// The enumeration constant identifier `expr` (spelled `name`) denotes,
+    /// if any: its value and type. Objects, functions, typedef names and
+    /// enumerators share C's ordinary-identifier namespace, so the innermost
+    /// declaration decides (C11 6.2.1p4, 6.2.3). Sema resolved every node it
+    /// analyzed with its scopes live: a node in `sema_enumerator_refs` is an
+    /// enumerator, and any other annotated node names an object, function or
+    /// typedef that hides every enumerator of that spelling. Only a node sema
+    /// never saw falls back to the lowerer's scopes, where a local hides it.
+    pub(super) fn identifier_enumerator(&self, expr: &Expr, name: &str) -> Option<(i64, CType)> {
+        let id = expr.id();
+        if let Some(&value) = self.sema_enumerator_refs.get(&id) {
+            let ty = self
+                .sema_expr_types
+                .get(&id)
+                .cloned()
+                .or_else(|| self.types.enum_constants.get(name).map(|c| c.ty.clone()))
+                .unwrap_or(CType::Int);
+            return Some((value, ty));
+        }
+        if self.sema_expr_types.contains_key(&id)
+            || self
+                .func_state
+                .as_ref()
+                .is_some_and(|fs| fs.locals.contains_key(name))
+        {
+            return None;
+        }
+        let constant = self.types.enum_constants.get(name)?;
+        Some((constant.value, constant.ty.clone()))
+    }
+
     pub(super) fn lookup_var_info(&self, name: &str) -> Option<&VarInfo> {
         if let Some(ref fs) = self.func_state {
             if let Some(info) = fs.locals.get(name) {
@@ -628,16 +671,6 @@ impl Lowerer {
         self.seed_builtin_typedefs();
         self.seed_libc_math_functions();
 
-        // Mark transparent_union on union StructLayouts before the first pass,
-        // so that register_function_meta can exclude them from param_struct_sizes.
-        for decl in &tu.decls {
-            if let ExternalDecl::Declaration(decl) = decl {
-                if decl.is_transparent_union() {
-                    self.mark_transparent_union(decl);
-                }
-            }
-        }
-
         // Pre-pass: update typedefs that have __attribute__((vector_size(N))) or
         // __attribute__((ext_vector_type(N))).
         // Sema doesn't handle vector_size, so the typedef map has the unwrapped base type.
@@ -694,6 +727,17 @@ impl Lowerer {
                     }
                 }
                 ExternalDecl::TopLevelAsm(_) | ExternalDecl::StaticAssert(_) => {}
+            }
+        }
+
+        // Mark transparent_union on the union layouts the pre-pass above just
+        // (re)built -- marking before it was undone by the rebuild -- so that
+        // register_function_meta passes such parameters as their first member.
+        for decl in &tu.decls {
+            if let ExternalDecl::Declaration(decl) = decl {
+                if decl.is_transparent_union() {
+                    self.mark_transparent_union(decl);
+                }
             }
         }
 
@@ -2316,8 +2360,6 @@ impl Lowerer {
         )
     }
 
-    /// Convert `val` (of C type `from_ct`) to _Float128 via the libgcc
-    /// widening helpers, matching GCC's codegen.
     /// Convert a scalar operand of C type `src_ct` to C type `target_ct`.
     ///
     /// This is the CType-aware sibling of `emit_implicit_cast`: when either
@@ -2334,6 +2376,11 @@ impl Lowerer {
         target_ct: &CType,
     ) -> Operand {
         use crate::common::types::CType;
+        if let Operand::Const(c) = &src {
+            if let Some(folded) = self.fold_value_conversion(c, src_ct, target_ct) {
+                return Operand::Const(folded);
+            }
+        }
         // C23 decimal floating point: any conversion touching a decimal type
         // is a genuine value conversion through the libbid helpers — bit-cast
         // machinery must never see decimal carriers.
@@ -2341,16 +2388,13 @@ impl Lowerer {
             return self.convert_decimal_scalar(src, src_ty, src_ct, target_ct);
         }
         if *target_ct == CType::Float128 {
-            // A source that is ALREADY the 128-bit carrier — an I128 constant
-            // payload (a `1.5F128` literal or a `__builtin_*f128` result) or a
-            // U128-typed value (a _Float128 variable) — must be copied
-            // bit-exactly. Anything else is a genuine value conversion
-            // (double/int/... -> binary128) via the soft-float helpers.
-            // (An unsigned __int128 constant would also take the identity path
-            // instead of __floatuntitf — a rare corner.)
-            let already_carrier =
-                matches!(&src, Operand::Const(IrConst::I128(_))) || src_ty == IrType::U128;
-            if already_carrier {
+            // The C type decides: a _Float128 source (a variable, a `1.5F128`
+            // literal's I128 payload, a `__builtin_*f128` result) is already
+            // the binary128 carrier and is copied bit-exactly; every other
+            // source is a value conversion through the soft-float helpers.
+            // The IR type cannot decide, because unsigned __int128 shares
+            // the U128 carrier: `(_Float128)u128` must call __floatuntitf.
+            if *src_ct == CType::Float128 {
                 return src;
             }
             return self.convert_to_f128(src, src_ct);
@@ -2362,6 +2406,90 @@ impl Lowerer {
         self.emit_implicit_cast(src, src_ty, target_ty)
     }
 
+    /// `true` for the C types whose IR carrier does not determine how they
+    /// convert: `_Float128` shares `U128` with `unsigned __int128`, and the
+    /// decimal types are BID encodings, not binary values.  A conversion
+    /// touching one is a value conversion decided by the C types.
+    pub(super) fn is_value_converted_ctype(ct: &CType) -> bool {
+        *ct == CType::Float128 || ct.is_decimal()
+    }
+
+    /// Compile-time form of [`Self::convert_scalar_ctype`] for a constant
+    /// operand: the exact by-value conversion static initializers use
+    /// (`convert_const_by_value`), so `_Float128 x = 1;` is a constant load
+    /// instead of a `__floatsitf` call and `int i = 2.75Q;` is `2` instead
+    /// of a `__fixtfsi` call.  The function-body policy is that of explicit
+    /// casts (`lower_cast`): nothing folds while the floating-point
+    /// environment is observable (FENV_ACCESS, -frounding-math: rounding and
+    /// exceptions are run-time events), and a non-finite binary128 never
+    /// folds to an integer (IEEE invalid stays a run-time conversion, as
+    /// for double; non-finite decimals decline in `cast_bid_to_ir_type`).
+    fn fold_value_conversion(
+        &self,
+        c: &IrConst,
+        src_ct: &CType,
+        target_ct: &CType,
+    ) -> Option<IrConst> {
+        if !(Self::is_value_converted_ctype(src_ct) || Self::is_value_converted_ctype(target_ct))
+            || self.pass_policy.fp_environment_observable
+        {
+            return None;
+        }
+        if *src_ct == CType::Float128 && target_ct.is_integer() {
+            let bytes = crate::common::const_eval::f128_bytes_of(c, Some(src_ct))?;
+            if (u128::from_le_bytes(bytes) >> 112) & 0x7FFF == 0x7FFF {
+                return None;
+            }
+        }
+        Self::convert_const_by_value(c, Some(src_ct), target_ct, IrType::from_ctype(target_ct))
+    }
+
+    /// Convert `val` (IR type `src_ty`, C type `src_ct` when known) to an
+    /// object of C type `target_ct` stored as `target_ty`, as by simple
+    /// assignment (C11 6.5.16.1p2; initializers convert the same way,
+    /// 6.7.9p11).  When either side is `_Float128` or decimal the C types
+    /// decide; otherwise the IR conversion is exact.  An unknown source C
+    /// type is recovered from its IR type where that is unambiguous.
+    /// `_Bool` targets are normalized by the caller, which owns the source
+    /// expression (`emit_expr_bool_conversion`).
+    pub(super) fn convert_assign_value(
+        &mut self,
+        val: Operand,
+        src_ty: IrType,
+        src_ct: Option<&CType>,
+        target_ct: &CType,
+        target_ty: IrType,
+    ) -> Operand {
+        let src_ct = src_ct
+            .cloned()
+            .or_else(|| Self::decimal_conversion_target_ct(src_ty));
+        if let Some(src_ct) = src_ct {
+            if Self::is_value_converted_ctype(&src_ct) || Self::is_value_converted_ctype(target_ct)
+            {
+                return self.convert_scalar_ctype(val, src_ty, &src_ct, target_ct);
+            }
+        }
+        self.emit_implicit_cast(val, src_ty, target_ty)
+    }
+
+    /// Lower one initializer leaf and convert it to its object's C type
+    /// `target_ct` (C11 6.7.9p11).  `_Bool` normalizes at the source type
+    /// (6.3.1.2: truncating first would make 256 false); every other type
+    /// converts as by assignment, decided by the C types and not the IR
+    /// carrier: `int a[] = {2.75Q}` is 2, not the low bits of the payload.
+    pub(super) fn lower_init_leaf(&mut self, expr: &Expr, target_ct: &CType) -> Operand {
+        let src_ty = self.value_ir_type(expr);
+        let val = self.lower_expr(expr);
+        if *target_ct == CType::Bool {
+            return self.emit_expr_bool_conversion(val, src_ty, expr);
+        }
+        let src_ct = self.get_expr_ctype(expr);
+        let target_ty = IrType::from_ctype(target_ct);
+        self.convert_assign_value(val, src_ty, src_ct.as_ref(), target_ct, target_ty)
+    }
+
+    /// Convert `val` (of C type `from_ct`) to _Float128 via the libgcc
+    /// widening helpers, matching GCC's codegen.
     pub(super) fn convert_to_f128(
         &mut self,
         val: Operand,
@@ -2379,14 +2507,16 @@ impl Lowerer {
             CType::LongDouble => ("__extendxftf2", IrType::F128, None),
             CType::Bool
             | CType::Char
+            | CType::SChar
             | CType::UChar
+            | CType::PlainUChar
             | CType::Short
             | CType::UShort
             | CType::Int
             | CType::UInt => {
                 let signed = matches!(
                     from_ct,
-                    CType::Bool | CType::Char | CType::Short | CType::Int
+                    CType::Bool | CType::Char | CType::SChar | CType::Short | CType::Int
                 );
                 (
                     if signed {
@@ -2422,6 +2552,8 @@ impl Lowerer {
                     None,
                 )
             }
+            // An enum converts as its compatible integer type (C11 6.3.1.1).
+            CType::Enum(e) => return self.convert_to_f128(val, &e.compatible_ctype()),
             CType::Float128 => return val,
             _ => return val,
         };
@@ -2454,14 +2586,26 @@ impl Lowerer {
             CType::Double => ("__trunctfdf2", IrType::F64, Vec::new()),
             // x87 long double: returned in st(0) (the backend's F128 return path).
             CType::LongDouble => ("__trunctfxf2", IrType::F128, Vec::new()),
-            CType::Bool
-            | CType::Char
+            // Conversion to _Bool is `value != 0` (C11 6.3.1.2), not a
+            // truncation: (_Bool)0.5Q is 1, and a NaN is nonzero too.
+            CType::Bool => {
+                let truth = self.lower_soft_float_truthiness(val, &CType::Float128);
+                return self.emit_implicit_cast(truth, IrType::I32, IrType::from_ctype(to_ct));
+            }
+            // An enum converts as its compatible integer type.
+            CType::Enum(e) => return self.convert_from_f128(val, &e.compatible_ctype()),
+            CType::Char
+            | CType::SChar
             | CType::UChar
+            | CType::PlainUChar
             | CType::Short
             | CType::UShort
             | CType::Int
             | CType::UInt => {
-                let signed = matches!(to_ct, CType::Bool | CType::Char | CType::Short | CType::Int);
+                let signed = matches!(
+                    to_ct,
+                    CType::Char | CType::SChar | CType::Short | CType::Int
+                );
                 (
                     if signed { "__fixtfsi" } else { "__fixunstfsi" },
                     IrType::I32,
@@ -2496,6 +2640,12 @@ impl Lowerer {
             ret_classes,
             false,
         );
+        // char/short results come back as the helper's int: narrow them to
+        // the target's own IR type so the operand type matches its C type.
+        let target_ir = IrType::from_ctype(to_ct);
+        if to_ct.is_integer() && target_ir != ret_ty {
+            return self.emit_implicit_cast(Operand::Value(dest), ret_ty, target_ir);
+        }
         Operand::Value(dest)
     }
 
@@ -2523,24 +2673,17 @@ impl Lowerer {
         });
     }
 
-    /// Lower an expression, cast to target type, then store at base + byte_offset.
-    /// When target_is_bool is true, normalizes the value (any nonzero -> 1) per C11 6.3.1.2.
-    pub(super) fn emit_init_expr_to_offset_bool(
+    /// Lower an initializer leaf, convert it to `target_ct` (see
+    /// [`Self::lower_init_leaf`]) and store it at `base + byte_offset`.
+    pub(super) fn emit_init_expr_to_offset(
         &mut self,
         e: &Expr,
         base: Value,
         byte_offset: usize,
-        target_ty: IrType,
-        target_is_bool: bool,
+        target_ct: &CType,
     ) {
-        let expr_ty = self.get_expr_type(e);
-        let val = self.lower_expr(e);
-        let val = if target_is_bool {
-            self.emit_bool_normalize_typed(val, expr_ty)
-        } else {
-            self.emit_implicit_cast(val, expr_ty, target_ty)
-        };
-        self.emit_store_at_offset(base, byte_offset, val, target_ty);
+        let val = self.lower_init_leaf(e, target_ct);
+        self.emit_store_at_offset(base, byte_offset, val, IrType::from_ctype(target_ct));
     }
 
     /// Emit a GEP to compute base + byte_offset and return the address Value.
@@ -2691,16 +2834,37 @@ impl Lowerer {
     /// Collect enum constants from a type specifier.
     fn collect_enum_constants_impl(&mut self, ts: &TypeSpecifier, scoped: bool) {
         match ts {
-            TypeSpecifier::Enum(name, Some(variants), is_packed) => {
+            TypeSpecifier::Enum(name, Some(variants), is_packed, underlying) => {
+                // Sema verified the fixed type and every value; this mirrors
+                // its registration (`process_enum_variants`).
+                let fixed = underlying.as_deref().and_then(|u| {
+                    crate::common::types::EnumType::fixed_underlying(self.type_spec_to_ctype(u))
+                });
+                let fixed_enum = fixed.as_ref().map(|f| {
+                    CType::Enum(crate::common::types::EnumType {
+                        name: name.clone(),
+                        variants: Vec::new(),
+                        is_packed: *is_packed,
+                        fixed: Some(Box::new(f.clone())),
+                    })
+                });
                 let mut next_val: i64 = 0;
                 let mut variant_values = Vec::new();
                 for variant in variants {
                     if let Some(v) = self.enum_variant_value(variant) {
                         next_val = v;
                     }
-                    // Provisional type inside the body; retyped on completion.
-                    let constant =
-                        crate::frontend::sema::type_context::EnumConstant::provisional(next_val);
+                    // Provisional type inside the body (with a fixed type, the
+                    // enumerated type); retyped on completion.
+                    let constant = match &fixed_enum {
+                        Some(ty) => crate::frontend::sema::type_context::EnumConstant {
+                            value: next_val,
+                            ty: ty.clone(),
+                        },
+                        None => {
+                            crate::frontend::sema::type_context::EnumConstant::provisional(next_val)
+                        }
+                    };
                     if scoped {
                         self.insert_enum_scoped(variant.name.clone(), constant);
                     } else {
@@ -2709,12 +2873,13 @@ impl Lowerer {
                             .insert(variant.name.clone(), constant);
                     }
                     variant_values.push((variant.name.clone(), next_val));
-                    next_val += 1;
+                    next_val = next_val.wrapping_add(1);
                 }
                 let enum_type = crate::common::types::EnumType {
                     name: name.clone(),
                     variants: variant_values,
                     is_packed: *is_packed,
+                    fixed: fixed.map(Box::new),
                 };
                 self.types.complete_enum_constants(&enum_type, scoped);
                 // Keep completed definitions available for later body-less
@@ -2723,6 +2888,23 @@ impl Lowerer {
                 // type context tracks tag shadowing on its lexical scope stack.
                 if let Some(tag) = name {
                     self.types.insert_enum_type_scoped(tag.clone(), enum_type);
+                }
+            }
+            // C23 `enum E : T;` declares the tag, complete with its fixed type.
+            TypeSpecifier::Enum(Some(tag), None, is_packed, Some(underlying)) => {
+                let fixed = crate::common::types::EnumType::fixed_underlying(
+                    self.type_spec_to_ctype(underlying),
+                );
+                if fixed.is_some() && self.types.enum_type_in_current_scope(tag).is_none() {
+                    self.types.insert_enum_type_scoped(
+                        tag.clone(),
+                        crate::common::types::EnumType {
+                            name: Some(tag.clone()),
+                            variants: Vec::new(),
+                            is_packed: *is_packed,
+                            fixed: fixed.map(Box::new),
+                        },
+                    );
                 }
             }
             TypeSpecifier::Struct(_, Some(fields), ..)
@@ -2746,6 +2928,72 @@ impl Lowerer {
     /// Collect enum constants from a type specifier, using scoped insertion.
     pub(super) fn collect_enum_constants_scoped(&mut self, ts: &TypeSpecifier) {
         self.collect_enum_constants_impl(ts, true);
+    }
+
+    /// Register the type-name tags of `expr` and all of its sub-expressions.
+    pub(super) fn declare_type_name_tags_in(&mut self, expr: &Expr) {
+        let mut pending = vec![expr];
+        while let Some(e) = pending.pop() {
+            self.declare_type_name_tags(e);
+            let mark = pending.len();
+            e.for_each_child(&mut |child| pending.push(child));
+            pending[mark..].reverse();
+        }
+    }
+
+    /// Register the type-name tags of the expressions `stmt` evaluates
+    /// itself; nested statements do this when they are lowered.
+    pub(super) fn declare_stmt_type_name_tags(&mut self, stmt: &Stmt) {
+        let mut own = Vec::new();
+        stmt.for_each_own_expr(&mut |e| own.push(e));
+        for e in own {
+            self.declare_type_name_tags_in(e);
+        }
+    }
+
+    /// A block-scope declaration's tags -- its specifier's, then those in
+    /// the type-names of its array bounds and initializers -- ahead of
+    /// lowering it.
+    pub(super) fn declare_local_decl_tags(&mut self, decl: &Declaration) {
+        self.collect_enum_constants_scoped(&decl.type_spec);
+        self.declare_declarator_type_name_tags(decl);
+    }
+
+    /// The type-name tags in a declaration's array bounds and initializers.
+    pub(super) fn declare_declarator_type_name_tags(&mut self, decl: &Declaration) {
+        let mut exprs = Vec::new();
+        for declarator in &decl.declarators {
+            declarator.for_each_expr(&mut |e| exprs.push(e));
+        }
+        for e in exprs {
+            self.declare_type_name_tags_in(e);
+        }
+    }
+
+    /// Whether lowering `compound` changes scoped state, so its block needs
+    /// a scope frame: a declaration, a nested function definition, or an
+    /// enum defined in a type-name of one of its statements' expressions.
+    pub(super) fn block_needs_scope(compound: &CompoundStmt) -> bool {
+        compound.items.iter().any(|item| match item {
+            BlockItem::Declaration(_) | BlockItem::NestedFunction(_) => true,
+            BlockItem::Statement(stmt) => stmt_defines_type_name_enum(stmt),
+            BlockItem::StaticAssert(_) => false,
+        })
+    }
+
+    /// A tagged type defined inside an expression's type-name (`sizeof(enum
+    /// T { E = 30 })`, casts, compound literals, `va_arg`, `_Alignof`,
+    /// `__builtin_types_compatible_p`, `_Generic` associations) is in scope
+    /// from that point on (C11 6.2.1p7). Uses of its enumerators are resolved
+    /// by sema's verdict (`sema_enumerator_refs`); this keeps the lowerer's
+    /// type context -- the tag's definition and enumerator types -- in step
+    /// for a later `enum T x;`. Mirrors sema's `declare_type_name_tags`.
+    /// Registered per statement, before any of it is lowered: folding may
+    /// skip a sub-expression's lowering entirely (`x = 1 + sizeof(enum T
+    /// {...})`), and enumerator values do not depend on this order.
+    fn declare_type_name_tags(&mut self, expr: &Expr) {
+        let scoped = self.func_state.is_some();
+        expr.for_each_type_name(&mut |ts| self.collect_enum_constants_impl(ts, scoped));
     }
 
     /// Check if a user-defined goto label has already been defined (i.e., the
@@ -3365,8 +3613,10 @@ impl Lowerer {
             if Self::decimal_width(src_ct).is_none()
                 && !src_ct.is_integer()
                 && !src_ct.is_floating()
+                && *src_ct != CType::Float128
             {
-                // Pointer/aggregate source: not a valid decimal conversion;
+                // Pointer/aggregate source (`is_floating` excludes
+                // _Float128, which converts through `__bid_trunctf*`): not a valid decimal conversion;
                 // fall through to the generic bit-cast machinery, which
                 // produces the appropriate diagnostic downstream.
                 let target_ty = IrType::from_ctype(target_ct);
@@ -3492,11 +3742,12 @@ impl Lowerer {
     ///
     /// The LHS is evaluated exactly once through the lvalue machinery (like
     /// the generic path); both sides convert to the UAC common type and the
-    /// operation runs through the libbid helpers. When UAC picks a binary
-    /// float (the decimal-vs-binary rule), the operation is a plain IR float
-    /// op on the converted values. The result converts back to the LHS type
-    /// before the store (mirroring `narrow_from_op`).
-    pub(super) fn lower_decimal_compound_assign(
+    /// operation runs through the libbid helpers (decimal common type) or
+    /// the libgcc soft-float helpers (_Float128). When UAC picks another
+    /// binary float (the decimal-vs-binary rule), the operation is a plain
+    /// IR float op on the converted values. The result converts back to the
+    /// LHS type before the store (mirroring `narrow_from_op`).
+    pub(super) fn lower_libcall_compound_assign(
         &mut self,
         op: &ast::BinOp,
         lhs: &Expr,
@@ -3509,33 +3760,11 @@ impl Lowerer {
         if let Some(lv) = self.lower_lvalue(lhs) {
             let lhs_ir = self.get_expr_type(lhs);
             let loaded = self.load_lvalue_typed(&lv, lhs_ir);
-            let rhs_ir = self.get_expr_type(rhs);
+            let rhs_ir = self.value_ir_type(rhs);
             let l = self.convert_scalar_ctype(loaded, lhs_ir, lhs_ct, common_ct);
             let r = self.convert_scalar_ctype(rhs_val, rhs_ir, rhs_ct, common_ct);
             let common_ir = IrType::from_ctype(common_ct);
-            let result = if let Some(w) = Self::decimal_width(common_ct) {
-                let s = Self::dec_suffix(w);
-                let name = match op {
-                    ast::BinOp::Add => "add",
-                    ast::BinOp::Sub => "sub",
-                    ast::BinOp::Mul => "mul",
-                    ast::BinOp::Div => "div",
-                    _ => unreachable!("non-arithmetic decimal compound op: {op:?}"),
-                };
-                let dec_ty = Self::dec_ty(w);
-                self.emit_decimal_call(
-                    &format!("__bid_{name}{s}3"),
-                    vec![(l, dec_ty, w == 128), (r, dec_ty, w == 128)],
-                    dec_ty,
-                    w == 128,
-                )
-            } else {
-                // Binary-float common type: plain IR float arithmetic on the
-                // converted values (IrBinOp::{Add, Sub, Mul, Div} lower by
-                // operand type, exactly like the generic float path).
-                let ir_op = Self::binop_to_ir(*op, false);
-                self.emit_binop_val(ir_op, l, r, common_ir)
-            };
+            let result = self.emit_arith_in_ctype(op, l, r, common_ct);
             let store_val =
                 self.convert_scalar_ctype(Operand::Value(result), common_ir, common_ct, lhs_ct);
             self.store_lvalue_typed(&lv, store_val, lhs_ir);
@@ -3544,9 +3773,61 @@ impl Lowerer {
         rhs_val
     }
 
-    /// Truthiness test for a decimal operand (`x != 0` under decimal
-    /// semantics, where +0 == -0). Used by conditions and logical operators.
-    pub(super) fn lower_decimal_truthiness(&mut self, val: Operand, ct: &CType) -> Operand {
+    /// `l op r` for Add/Sub/Mul/Div with both operands already converted to
+    /// the floating common type `common_ct`: libbid helpers for a decimal
+    /// type, libgcc soft-float helpers for _Float128, a plain IR float op
+    /// otherwise (IrBinOp::{Add, Sub, Mul, Div} lower by operand type).
+    pub(super) fn emit_arith_in_ctype(
+        &mut self,
+        op: &ast::BinOp,
+        l: Operand,
+        r: Operand,
+        common_ct: &CType,
+    ) -> Value {
+        // Decimal and _Float128 arithmetic are libcalls named by one stem;
+        // sema admits only + - * / on these types, stated once here.
+        let soft_stem = || match op {
+            ast::BinOp::Add => "add",
+            ast::BinOp::Sub => "sub",
+            ast::BinOp::Mul => "mul",
+            ast::BinOp::Div => "div",
+            _ => unreachable!("non-arithmetic soft-float op: {op:?}"),
+        };
+        if let Some(w) = Self::decimal_width(common_ct) {
+            let s = Self::dec_suffix(w);
+            let name = soft_stem();
+            let dec_ty = Self::dec_ty(w);
+            return self.emit_decimal_call(
+                &format!("__bid_{name}{s}3"),
+                vec![(l, dec_ty, w == 128), (r, dec_ty, w == 128)],
+                dec_ty,
+                w == 128,
+            );
+        }
+        if *common_ct == CType::Float128 {
+            let helper = format!("__{}tf3", soft_stem());
+            return self.emit_f128_binop_call(&helper, l, r);
+        }
+        let ir_op = Self::binop_to_ir(*op, false);
+        self.emit_binop_val(ir_op, l, r, IrType::from_ctype(common_ct))
+    }
+
+    /// Truthiness test for a decimal or _Float128 operand (`x != 0` under
+    /// the type's own semantics: +0 == -0, and a NaN is true), as an I32
+    /// 0/1. Used by conditions, logical operators and conversion to _Bool.
+    /// Testing the integer carrier instead is wrong for -0 and, when the
+    /// test narrows the carrier, for every value whose low bits are zero.
+    pub(super) fn lower_soft_float_truthiness(&mut self, val: Operand, ct: &CType) -> Operand {
+        if *ct == CType::Float128 {
+            let ne = self.emit_f128_cmp_call("__netf2", val, Operand::Const(IrConst::I128(0)));
+            let z = self.emit_cmp_val(
+                IrCmpOp::Ne,
+                Operand::Value(ne),
+                Operand::Const(IrConst::I64(0)),
+                IrType::I32,
+            );
+            return Operand::Value(z);
+        }
         let Some(w) = Self::decimal_width(ct) else {
             return val;
         };
@@ -3576,13 +3857,47 @@ impl Lowerer {
 
     /// Canonical +0 encodings (biased exponent, zero coefficient) — the
     /// exact bit patterns GCC emits for `0.DF/0.DD/0.DL` literals.
+    // Derived from the literal encoder, the single source of the BID
+    // layouts: a hand-rolled BID128 zero once put the exponent field at bit
+    // 49 of the LOW word (the field is bits 113..126), so every _Decimal128
+    // truth test compared with a tiny nonzero value and `!0.0DL` was 0.
     fn dec_zero32() -> u32 {
-        (96u32) << 23 // bias 96
+        crate::common::decimal::encode_int_bid32(0, false)
     }
     fn dec_zero64() -> u64 {
-        (398u64) << 53 // bias 398
+        crate::common::decimal::encode_int_bid64(0, false)
     }
     fn dec_zero128() -> i128 {
-        ((6176u128) << 49) as i128 // bias 6176
+        let (hi, lo) = crate::common::decimal::encode_int_bid128(0, false);
+        ((u128::from(hi) << 64) | u128::from(lo)) as i128
     }
+}
+
+/// Whether one of `stmt`'s own expressions defines an enum (directly or in
+/// a member of a struct or union) inside a type-name.
+fn stmt_defines_type_name_enum(stmt: &Stmt) -> bool {
+    fn defines_enum(ts: &TypeSpecifier) -> bool {
+        match ts {
+            TypeSpecifier::Enum(_, Some(_), ..) => true,
+            TypeSpecifier::Struct(_, Some(fields), ..)
+            | TypeSpecifier::Union(_, Some(fields), ..) => {
+                fields.iter().any(|field| defines_enum(&field.type_spec))
+            }
+            TypeSpecifier::Array(inner, _) | TypeSpecifier::Pointer(inner, _) => {
+                defines_enum(inner)
+            }
+            _ => false,
+        }
+    }
+    fn type_names_define_enum(expr: &Expr) -> bool {
+        let mut found = false;
+        expr.for_each_type_name(&mut |ts| found = found || defines_enum(ts));
+        if !found {
+            expr.for_each_child(&mut |child| found = found || type_names_define_enum(child));
+        }
+        found
+    }
+    let mut found = false;
+    stmt.for_each_own_expr(&mut |e| found = found || type_names_define_enum(e));
+    found
 }

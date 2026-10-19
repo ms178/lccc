@@ -1483,6 +1483,12 @@ pub(crate) fn run_passes(
         // __fabstf2); LCCC links no libgcc, so fold them to the backend's own
         // inline intrinsics even at -O0 (semantics-preserving rename).
         simplify::fold_math_intrinsic_calls(module);
+        // Unreachable internal-linkage functions go at every level, as with
+        // GCC's call graph: lowering keeps a static function on a superset
+        // of its AST references (an unevaluated `sizeof`/`typeof` operand
+        // counts), and only the IR knows which survive.  An unreachable one
+        // may call functions defined nowhere, which must not reach the link.
+        dead_statics::eliminate_dead_static_functions(module);
         // -O0 runs one budgeted fixpoint above: the always-inline rounds,
         // whose second-pass budget is a correctness budget (an unexpanded
         // must-inline call cannot link).  Its cap hits must surface too.
@@ -1635,6 +1641,8 @@ pub(crate) fn run_passes(
             verify::verify_after_pass(module, "fmanegpeel");
         }
         resolve_asm::resolve_inline_asm_symbols(module);
+        // Unreachable internal-linkage functions go, as at -O0 and -O2+.
+        dead_statics::eliminate_dead_static_functions(module);
         if time_passes {
             round_cap::report();
         }
@@ -3167,12 +3175,33 @@ pub(crate) fn run_passes(
     // becomes SSA dataflow). Hardened rewrite of levkropp's 0980060d pass:
     // default-closed transfer function, volatile/escape/segment guards.
     // Iterate: each round can expose new dead stores for the next.
+    //
+    // A forwarded load can be the last reader of its field. The store it
+    // read is then dead, but the aggregate dead-field-store proof above ran
+    // before the forward and cannot see it, and a forwarded constant leaves a
+    // `Cast Const` the backend materializes (`xorl; movsbq`). Functions the
+    // forward changed re-run exactly those two existing proofs (e.g. an
+    // inlined TU `memset` writing U8 bytes that the caller reads as `char`:
+    // the in-loop forwarders refuse the U8/I8 pair, this pass does not).
     if !pass_disabled(&disabled, "slforward") {
-        for _ in 0..4 {
-            if module.for_each_function(store_load_forward::run) == 0 {
-                break;
+        let agg_cleanup = std::env::var_os("CCC_NO_AGG_COPY_FWD").is_none();
+        module.for_each_function(|func| {
+            let mut forwarded = 0;
+            for _ in 0..4 {
+                let n = store_load_forward::run(func);
+                if n == 0 {
+                    break;
+                }
+                forwarded += n;
             }
-        }
+            if forwarded > 0 {
+                constant_fold::fold_function(func);
+                if agg_cleanup {
+                    aggregate_copy_forward::eliminate_dead_aggregate_field_stores(func);
+                }
+            }
+            forwarded
+        });
     }
     module.for_each_function(dce::eliminate_dead_code);
     if std::env::var("LCCC_DUMP_IR_PROMOTE").is_ok() {
@@ -3285,19 +3314,9 @@ pub(crate) fn run_passes(
     //   exactly the way AArch64 did before fix B, because this gate (not
     //   the in-pass model) was what silenced the pass there.
     // * i686: no-op (nothing this pass sees pays a 64-bit materialization).
-    if !pass_disabled(&disabled, "intconst")
-        && matches!(
-            target,
-            crate::backend::Target::Aarch64
-                | crate::backend::Target::X86_64
-                | crate::backend::Target::Riscv64
-        )
+    if let Some(model) =
+        int_const_hoist::model_for(target).filter(|_| !pass_disabled(&disabled, "intconst"))
     {
-        let model = match target {
-            crate::backend::Target::Aarch64 => int_const_hoist::ImmModel::Aarch64,
-            crate::backend::Target::Riscv64 => int_const_hoist::ImmModel::Riscv,
-            _ => int_const_hoist::ImmModel::X86_64,
-        };
         int_const_hoist::set_target_model(model);
         module.for_each_function(int_const_hoist::run);
     }

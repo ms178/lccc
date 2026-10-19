@@ -127,6 +127,47 @@ pub(super) fn rematerializable_template(inst: &Instruction) -> Option<Instructio
     }
 }
 
+/// Live regions of `vid` that the remat segment cap counts: its
+/// hole-aware segments, except a segment lying wholly inside a block's
+/// leading φ group and ending AT a φ that `vid` feeds. That piece is the
+/// φ's own edge read (all φs of a block read their incomings in parallel
+/// at its head), kept in the liveness so a copy phi elimination places at
+/// the φ (`target_copies`) stays covered; it is not a separate region the
+/// value is resident across. Counting it made every φ-incoming remat look
+/// two-segment and fall to the cap once φ incomings stopped being
+/// (over-approximately) live into the φ block.
+pub(super) fn live_region_count(
+    live: &LivenessResult,
+    func: &IrFunction,
+    ix: &UseIndex,
+    vid: u32,
+) -> usize {
+    let nblocks = func.blocks.len();
+    let feeds = |inst: Option<&Instruction>| {
+        matches!(
+            inst,
+            Some(Instruction::Phi { incoming, .. })
+                if incoming.iter().any(|(op, _)| matches!(op, Operand::Value(v) if v.0 == vid))
+        )
+    };
+    ix.segments(live, vid)
+        .filter(|iv| {
+            let bi = live.block_ends[..nblocks].partition_point(|&ge| ge < iv.start);
+            let Some(b) = func.blocks.get(bi) else {
+                return true;
+            };
+            if iv.end > live.block_ends[bi] {
+                return true;
+            }
+            let lo = (iv.start - live.block_starts[bi]) as usize;
+            let hi = (iv.end - live.block_starts[bi]) as usize;
+            let in_phi_group =
+                (lo..=hi).all(|i| matches!(b.instructions.get(i), Some(Instruction::Phi { .. })));
+            !(in_phi_group && feeds(b.instructions.get(hi)))
+        })
+        .count()
+}
+
 /// Locate a value's unique static definition: (block, instruction index,
 /// true when the def is a φ at that block's head).
 pub(super) fn find_def(func: &IrFunction, vid: u32) -> Option<(usize, usize, bool)> {
@@ -141,10 +182,16 @@ pub(super) fn find_def(func: &IrFunction, vid: u32) -> Option<(usize, usize, boo
 }
 
 /// Whether `vid` is (re-)defined inside block `bi`. The memory-region
-/// closure must never propagate INTO such a block: liveness's φ-incoming
-/// edge copies conservatively mark even an in-block-defined value live-in
-/// (safe for spilling, not for memory-state propagation), and a reload
-/// before a definition's capture anchor would read a stale slot.
+/// closure must never propagate INTO such a block: a reload before a
+/// definition's capture anchor would read a stale slot. Exact SSA liveness
+/// never reports a value live-in to its own def block (φ incomings are
+/// live only on their edges), so this is defence in depth against any
+/// conservative live-in -- a liveness over-approximation is safe for
+/// spilling but not for memory-state propagation.
+///
+/// Reference scan behind [`UseIndex::defines`] (pinned by
+/// `use_index_matches_the_scans`).
+#[cfg(test)]
 pub(super) fn block_defines_value(func: &IrFunction, bi: usize, vid: u32) -> bool {
     func.blocks[bi]
         .instructions
@@ -223,11 +270,190 @@ pub(super) fn phi_incoming_uses(func: &IrFunction, s: usize, bi: usize, vid: u32
 }
 
 /// Whether `vid` reaches ANY successor φ from block `bi`.
+///
+/// Reference scan behind [`UseIndex::feeds_phi`] (pinned by
+/// `use_index_matches_the_scans`).
+#[cfg(test)]
 pub(super) fn block_feeds_successor_phi(func: &IrFunction, bi: usize, vid: u32) -> bool {
     func.blocks
         .iter()
         .enumerate()
         .any(|(s, _)| phi_incoming_uses(func, s, bi, vid))
+}
+
+/// Per-plan index of the facts candidate evaluation asks per (block, value).
+///
+/// `plan_function` sees `func` and `live` immutably, so one build answers
+/// every query of the plan.  Each accessor returns exactly what its scanning
+/// counterpart computes -- [`block_use_points`], [`block_feeds_successor_phi`],
+/// [`find_def`], [`block_defines_value`] and the `live.segments` filter by
+/// value -- which the unit test `use_index_matches_the_scans` pins over every
+/// (block, value) pair.  The scans cost O(block) or O(function) per query and
+/// were asked per value per block: quadratic in the instruction count, and
+/// cubic in the block count for the φ feed (a 4000-call straight-line `main`
+/// spent most of its -O2 compile in them).  The scans stay for the
+/// materializer, which edits `func` and asks at most `max_splits` times.
+pub(super) struct UseIndex {
+    /// `(block, value)` -> `block_use_points`.
+    points: FxHashMap<(u32, u32), Vec<usize>>,
+    /// value -> ascending blocks with a non-empty `points` entry.
+    use_blocks: FxHashMap<u32, Vec<u32>>,
+    /// `(pred block, value)` pairs for which `block_feeds_successor_phi`.
+    feeds: FxHashSet<(u32, u32)>,
+    /// value -> ascending pred blocks of `feeds`.
+    feed_blocks: FxHashMap<u32, Vec<u32>>,
+    /// value -> `find_def` (the first definition in block order).
+    defs: FxHashMap<u32, (usize, usize, bool)>,
+    /// `(block, value)` pairs for which `block_defines_value`.
+    def_blocks: FxHashSet<(u32, u32)>,
+    /// value -> indices of its `live.segments`, in segment order.
+    segments: FxHashMap<u32, Vec<usize>>,
+}
+
+impl UseIndex {
+    pub(super) fn build(live: &LivenessResult, func: &IrFunction) -> Self {
+        let mut points: FxHashMap<(u32, u32), Vec<usize>> = FxHashMap::default();
+        let mut defs: FxHashMap<u32, (usize, usize, bool)> = FxHashMap::default();
+        let mut def_blocks: FxHashSet<(u32, u32)> = FxHashSet::default();
+        let mut feeds: FxHashSet<(u32, u32)> = FxHashSet::default();
+        // `phi_incoming_uses` matches an incoming edge by label equality.
+        let mut label_blocks: FxHashMap<BlockId, Vec<u32>> = FxHashMap::default();
+        for (bi, b) in func.blocks.iter().enumerate() {
+            label_blocks.entry(b.label).or_default().push(bi as u32);
+        }
+        for (bi, block) in func.blocks.iter().enumerate() {
+            let b = bi as u32;
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                if let Some(d) = inst.dest() {
+                    defs.entry(d.0)
+                        .or_insert((bi, ii, matches!(inst, Instruction::Phi { .. })));
+                    def_blocks.insert((b, d.0));
+                }
+                if let Instruction::Phi { incoming, .. } = inst {
+                    for (op, pred) in incoming {
+                        if let (Operand::Value(v), Some(preds)) = (op, label_blocks.get(pred)) {
+                            for &pb in preds {
+                                feeds.insert((pb, v.0));
+                            }
+                        }
+                    }
+                    continue; // φ operands are edge reads, not block reads
+                }
+                let mut push = |v: u32| {
+                    let pts = points.entry((b, v)).or_default();
+                    if pts.last() != Some(&ii) {
+                        pts.push(ii);
+                    }
+                };
+                crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        push(v.0);
+                    }
+                });
+                crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| push(v.0));
+            }
+            let n = block.instructions.len();
+            crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+                if let Operand::Value(v) = op {
+                    let pts = points.entry((b, v.0)).or_default();
+                    if pts.last() != Some(&n) {
+                        pts.push(n);
+                    }
+                }
+            });
+        }
+        // Folded hidden reads: block point ranges are disjoint and ordered,
+        // so the one block containing a global point is a binary search
+        // (the scan's `gs <= gp <= ge` filter, per block).
+        for (&vid, folded) in &live.folded_read_points {
+            for &gp in folded {
+                let Some(bi) = live.block_index_at(gp) else {
+                    continue;
+                };
+                if bi >= func.blocks.len() {
+                    continue;
+                }
+                let local = (gp - live.block_starts[bi]) as usize;
+                if local <= func.blocks[bi].instructions.len() {
+                    points.entry((bi as u32, vid)).or_default().push(local);
+                }
+            }
+        }
+        let mut use_blocks: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        for (&(b, v), pts) in points.iter_mut() {
+            pts.sort_unstable();
+            pts.dedup();
+            use_blocks.entry(v).or_default().push(b);
+        }
+        for blocks in use_blocks.values_mut() {
+            blocks.sort_unstable();
+        }
+        let mut feed_blocks: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+        for &(b, v) in &feeds {
+            feed_blocks.entry(v).or_default().push(b);
+        }
+        for blocks in feed_blocks.values_mut() {
+            blocks.sort_unstable();
+        }
+        let mut segments: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
+        for (si, iv) in live.segments.iter().enumerate() {
+            segments.entry(iv.value_id).or_default().push(si);
+        }
+        UseIndex {
+            points,
+            use_blocks,
+            feeds,
+            feed_blocks,
+            defs,
+            def_blocks,
+            segments,
+        }
+    }
+
+    /// [`block_use_points`]`(live, func, bi, vid)`.
+    pub(super) fn points(&self, bi: usize, vid: u32) -> &[usize] {
+        self.points
+            .get(&(bi as u32, vid))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Blocks in which `vid` has a read point, ascending.
+    pub(super) fn use_blocks(&self, vid: u32) -> &[u32] {
+        self.use_blocks.get(&vid).map_or(&[], Vec::as_slice)
+    }
+
+    /// [`block_feeds_successor_phi`]`(func, bi, vid)`.
+    pub(super) fn feeds_phi(&self, bi: usize, vid: u32) -> bool {
+        self.feeds.contains(&(bi as u32, vid))
+    }
+
+    /// Blocks `bi` for which [`Self::feeds_phi`] holds, ascending.
+    pub(super) fn feed_blocks(&self, vid: u32) -> &[u32] {
+        self.feed_blocks.get(&vid).map_or(&[], Vec::as_slice)
+    }
+
+    /// [`find_def`]`(func, vid)`.
+    pub(super) fn def(&self, vid: u32) -> Option<(usize, usize, bool)> {
+        self.defs.get(&vid).copied()
+    }
+
+    /// [`block_defines_value`]`(func, bi, vid)`.
+    pub(super) fn defines(&self, bi: usize, vid: u32) -> bool {
+        self.def_blocks.contains(&(bi as u32, vid))
+    }
+
+    /// `live.segments` of `vid`, in segment order.
+    pub(super) fn segments<'a>(
+        &'a self,
+        live: &'a LivenessResult,
+        vid: u32,
+    ) -> impl Iterator<Item = &'a crate::backend::liveness::LiveInterval> + 'a {
+        self.segments
+            .get(&vid)
+            .into_iter()
+            .flatten()
+            .map(move |&si| &live.segments[si])
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -278,7 +504,16 @@ pub(super) fn plan_function(
     let depths = &live.block_loop_depth;
     let classes = ColorClasses::phi_webs(func);
     let mut pressure = Pressure::build(live, func, eligible, &classes);
+    let ix = UseIndex::build(live, func);
     if split_debug_enabled() && std::env::var("CCC_GLA_TRACE").is_ok() {
+        // The derived policy, printed whether or not any block exceeds the
+        // budget: the per-target reach band is a planning input, and its
+        // gates must observe it even when exact liveness leaves a function
+        // under budget everywhere.
+        eprintln!(
+            "[GLA] {}: policy budget={} reach={} max_splits={}",
+            func.name, budget, policy.reach_band, max_splits
+        );
         for (bi, b) in func.blocks.iter().enumerate() {
             let (pt, pk) = pressure.peak(bi);
             if pk as usize > budget {
@@ -309,9 +544,9 @@ pub(super) fn plan_function(
         if used >= max_splits {
             break;
         }
-        let wuses = weighted_use_count(live, func, vid, depths);
-        let nseg = live.segments.iter().filter(|iv| iv.value_id == vid).count();
-        let covers = covers_over_budget_point(live, func, &pressure, vid, policy);
+        let wuses = weighted_use_count(&ix, vid, depths);
+        let nseg = live_region_count(live, func, &ix, vid);
+        let covers = covers_over_budget_point(live, &ix, func, &pressure, vid, policy);
         if split_debug_enabled() && std::env::var("CCC_GLA_TRACE").is_ok() {
             let ranges: Vec<String> = live
                 .segments
@@ -363,14 +598,14 @@ pub(super) fn plan_function(
             let gs = live.block_starts[bi];
             let ge = live.block_ends[bi];
             let row_len = pressure.per_block[bi].len();
-            for iv in live.segments.iter().filter(|iv| iv.value_id == vid) {
+            for iv in ix.segments(live, vid) {
                 if iv.end < gs || iv.start > ge {
                     continue;
                 }
                 let lo = (iv.start.max(gs) - gs) as usize;
                 let hi = ((iv.end.min(ge) - gs) as usize).min(row_len - 1);
                 let no_relief = if policy.net_relief() {
-                    remat_no_relief_spans(live, func, bi, vid, lo, hi)
+                    remat_no_relief_spans(&ix, func, bi, vid, lo, hi)
                 } else {
                     Vec::new()
                 };
@@ -432,19 +667,20 @@ pub(super) fn plan_function(
         let n = func.blocks[bi].instructions.len();
 
         let mut best: Option<Candidate> = None;
+        // The candidate scan does not edit the pressure: one peak serves it.
+        let peak_pt = pressure.peak(bi).0;
         for &vid in eligible.iter() {
             if remats.contains(&vid) || done_block.contains(&(vid, bi)) {
                 continue;
             }
-            if !live.is_live_at(vid, live.block_starts[bi] + pressure.peak(bi).0 as u32) {
+            if !live.is_live_at(vid, live.block_starts[bi] + peak_pt as u32) {
                 continue;
             }
-            let uses = block_use_points(live, func, bi, vid);
-            let peak_pt = pressure.peak(bi).0;
+            let uses = ix.points(bi, vid);
             if uses.contains(&peak_pt) {
                 continue; // read at the peak: bits required now
             }
-            let def_local = find_def(func, vid).filter(|(db, _, _)| *db == bi);
+            let def_local = ix.def(vid).filter(|(db, _, _)| *db == bi);
             if let Some((_, di, false)) = def_local {
                 if di == peak_pt {
                     continue; // defined at the peak
@@ -500,8 +736,8 @@ pub(super) fn plan_function(
 
             let mut closure: Vec<(usize, usize)> = Vec::new();
             if next_in_block.is_none() && live.is_live_out(bi, vid) {
-                closure = memory_closure(live, func, succs, vid, bi);
-                if closure.is_empty() && !block_feeds_successor_phi(func, bi, vid) {
+                closure = memory_closure(live, func, &ix, succs, vid, bi);
+                if closure.is_empty() && !ix.feeds_phi(bi, vid) {
                     continue; // value dies here: the colorer drops it
                 }
             }
@@ -537,7 +773,7 @@ pub(super) fn plan_function(
 
             // Cost: one immutable capture store (def-block frequency) plus
             // weighted reload clusters.
-            let Some((def_block, _, _)) = find_def(func, vid) else {
+            let Some((def_block, _, _)) = ix.def(vid) else {
                 continue;
             };
             let mut cost = block_frequency(depths[def_block]);
@@ -547,15 +783,15 @@ pub(super) fn plan_function(
             for &(cb, first) in &closure {
                 let ncb = func.blocks[cb].instructions.len();
                 let has_use = first < ncb
-                    || !block_use_points(live, func, cb, vid).is_empty()
+                    || !ix.points(cb, vid).is_empty()
                     || terminator_uses_value(&func.blocks[cb].terminator, vid)
-                    || block_feeds_successor_phi(func, cb, vid);
+                    || ix.feeds_phi(cb, vid);
                 if has_use {
                     cost = cost.saturating_add(block_frequency(depths[cb]));
                 }
             }
             if next_in_block.is_none()
-                && block_feeds_successor_phi(func, bi, vid)
+                && ix.feeds_phi(bi, vid)
                 && !closure
                     .iter()
                     .any(|(cb, _)| succs.row(bi).iter().any(|s| *s as usize == *cb))
@@ -588,11 +824,7 @@ pub(super) fn plan_function(
         let Some(cand) = best else {
             // Relieve the scan of this un-splittable peak so the fixed-point
             // loop targets genuinely solvable peaks instead of spinning.
-            for p in pressure.per_block[bi].iter_mut() {
-                if *p as usize > budget {
-                    *p = budget as u32;
-                }
-            }
+            pressure.cap(bi, budget as u32);
             continue;
         };
 
@@ -655,16 +887,33 @@ pub(super) fn plan_function(
 /// Public entry point. Policy comes from the A/B environment and the
 /// compilation's target/optimization tier. Returns the count of logical
 /// values rewritten (spilled or rematerialized), 0 when nothing applied.
-pub(crate) fn run(func: &mut IrFunction, max_splits: usize, opt_level: u32) -> usize {
+/// `tls_symbols`: the module's thread-local symbols (their `GlobalAddr`
+/// is a multi-instruction thread-pointer computation, see
+/// [`GlaPolicy::remat_affordable`]).
+pub(crate) fn run(
+    func: &mut IrFunction,
+    max_splits: usize,
+    opt_level: u32,
+    tls_symbols: &FxHashSet<String>,
+) -> usize {
     if func.blocks.is_empty() || max_splits == 0 {
         return 0;
     }
-    run_with_policy(func, GlaPolicy::from_env(max_splits, opt_level))
+    run_planned(
+        func,
+        GlaPolicy::from_env(max_splits, opt_level),
+        tls_symbols,
+    )
 }
 
 /// Entry point with an explicit policy (unit tests use this so their
 /// expectations never depend on process-wide environment knobs).
+#[cfg(test)]
 pub(super) fn run_with_policy(func: &mut IrFunction, policy: GlaPolicy) -> usize {
+    run_planned(func, policy, &FxHashSet::default())
+}
+
+fn run_planned(func: &mut IrFunction, policy: GlaPolicy, tls_symbols: &FxHashSet<String>) -> usize {
     let max_splits = policy.max_splits;
     if func.blocks.is_empty() || max_splits == 0 || !policy.enabled() {
         return 0;
@@ -692,7 +941,9 @@ pub(super) fn run_with_policy(func: &mut IrFunction, policy: GlaPolicy) -> usize
         for inst in &b.instructions {
             if let Some(d) = inst.dest() {
                 if eligible.contains(&d.0) {
-                    if let Some(t) = rematerializable_template(inst) {
+                    if let Some(t) = rematerializable_template(inst)
+                        .filter(|t| policy.remat_affordable(t, tls_symbols))
+                    {
                         remattable.insert(d.0);
                         templates.insert(d.0, t);
                     }

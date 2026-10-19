@@ -32,6 +32,19 @@ impl Lowerer {
 
     /// Get the sizeof for an identifier expression.
     fn sizeof_identifier(&self, name: &str) -> usize {
+        // `static const char __func__[] = "name";` (C11 6.4.2.2p1).
+        if crate::frontend::parser::ast::is_function_name_builtin(name)
+            && self
+                .func_state
+                .as_ref()
+                .is_none_or(|fs| !fs.locals.contains_key(name))
+        {
+            let text = crate::frontend::parser::ast::function_name_builtin_text(
+                name,
+                self.func_state.as_ref().map(|fs| fs.source_name()),
+            );
+            return text.len() + 1;
+        }
         if let Some(info) = self.func_state.as_ref().and_then(|fs| fs.locals.get(name)) {
             if info.is_array || info.is_struct {
                 return info.alloc_size;
@@ -49,12 +62,7 @@ impl Lowerer {
             }
             return info.ty.size();
         }
-        // An enumerator has its enum's constant type (`enum { A, B = 1LL << 32 }`
-        // makes `sizeof A` 8). A file-scope enumerator cannot share its name
-        // with a global object, so a hit here is the innermost declaration.
-        if let Some(constant) = self.types.enum_constants.get(name) {
-            return self.ctype_size(&constant.ty);
-        }
+        // Enumerators were resolved by the caller (`identifier_enumerator`).
         if let Some(ginfo) = self.globals.get(name) {
             // For arrays, prefer the actual allocation size from the module global
             // (handles implicit-size arrays like `int x[] = {1,2,3}` where
@@ -332,7 +340,12 @@ impl Lowerer {
             Expr::Char16StringLiteral(s, _) => (s.encode_utf16().count() + 1) * 2,
 
             // Variable: look up its alloc_size or type
-            Expr::Identifier(name, _) => self.sizeof_identifier(name),
+            // An enumerator has its enum's constant type (`enum { A, B = 1LL
+            // << 32 }` makes `sizeof A` 8).
+            Expr::Identifier(name, _) => match self.identifier_enumerator(expr, name) {
+                Some((_, ty)) => self.ctype_size(&ty),
+                None => self.sizeof_identifier(name),
+            },
 
             // Dereference: element type size
             Expr::Deref(inner, _) => self.sizeof_deref(inner),

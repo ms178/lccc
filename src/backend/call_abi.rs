@@ -1552,8 +1552,13 @@ fn classify_param_slice(
                 if is_float {
                     // Float that overflowed FP registers
                     if slot_size == 4 {
-                        let float_stack_size = if param_ty == Some(IrType::F64) { 8 } else { 4 };
-                        stack_offset += float_stack_size;
+                        // i386: a stack scalar occupies its size rounded up
+                        // to whole words: float/_Decimal32 4, double and the
+                        // _Decimal64 BID container 8 (`is_float` covers the
+                        // decimals; sizing D64 as 4 shifted every later
+                        // parameter).  The caller sizes it identically
+                        // (`I686Codegen::stack_scalar_arg_size`).
+                        stack_offset += param_ty.map_or(4, |t| (t.size() as i64 + 3) & !3);
                     } else {
                         stack_offset += 8;
                     }

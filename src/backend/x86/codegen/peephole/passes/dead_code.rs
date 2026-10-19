@@ -366,37 +366,15 @@ pub(super) fn eliminate_dead_stores(store: &LineStore, infos: &mut [LineInfo]) -
         let mut pattern_len: usize = 0;
 
         for j in (i + 1)..end {
+            // A NOP'd line has no effect: it neither reads our slot nor
+            // overwrites it. (No pass revives a NOP slot with its preserved
+            // text; the one NOP-slot reuse -- the FP constant hoist -- writes
+            // new text and re-classifies the line, so it is seen here as a
+            // live line.) Counting a NOP'd load as a read kept the store that
+            // fed a forwarded reload alive forever; counting a NOP'd store as
+            // an overwrite was unsound for any store deleted because the slot
+            // already held its value (the earlier store is then the writer).
             if infos[j].is_nop() {
-                // ms178 SOUNDNESS FIX: another pass (store_fwd / copy_prop /
-                // dead_regs / phase-1 locals) may have NOP'd this line, but the
-                // LineStore preserves its original text. If that line was a LOAD
-                // or STORE of OUR slot, then our store's value was consumed (or
-                // the slot was rewritten) — deleting our store would orphan the
-                // forwarded value / reintroduce a live store. Check the
-                // preserved text (trimmed: NOP'd lines may retain their original
-                // indentation, which the line parsers do not tolerate): any
-                // same-slot access on a nop'd line counts as a read
-                // (conservative) or overwrite.
-                let nt = infos[j].trimmed(store.get(j)).trim();
-                if let Some((off_str, _reg, sz)) = parse_load_from_rbp_str(nt) {
-                    let off = fast_parse_i32(off_str);
-                    if ranges_overlap(store_offset, store_bytes, off, sz.byte_size()) {
-                        slot_read = true;
-                        break;
-                    }
-                }
-                if let Some((_reg, off_str, sz)) = parse_store_to_rbp_str(nt) {
-                    let off = fast_parse_i32(off_str);
-                    let nb = sz.byte_size();
-                    if off <= store_offset && off + nb >= store_offset + store_bytes {
-                        slot_overwritten = true;
-                        break;
-                    }
-                    if ranges_overlap(store_offset, store_bytes, off, nb) {
-                        slot_read = true;
-                        break;
-                    }
-                }
                 continue;
             }
 
@@ -1471,6 +1449,37 @@ mod tests {
             .map(|i| classify_line(store.get(i)))
             .collect();
         (store, infos)
+    }
+
+    /// The windowed DSE models NOP'd lines as absent: a forwarded (NOP'd)
+    /// reload does not keep the store alive, and a NOP'd covering store does
+    /// not kill an earlier store whose value a later load reads.
+    #[test]
+    fn windowed_dse_treats_nop_lines_as_absent() {
+        let asm = "f:\n.cfi_startproc\n    subq $24, %rsp\n    movq %rdi, 8(%rsp)\n    movq 8(%rsp), %rax\n    movq %rdi, 8(%rsp)\n    movq 8(%rsp), %rcx\n    addq $24, %rsp\n    ret\n.cfi_endproc\n";
+        let (store, mut infos) = build(asm);
+        let line = |text: &str, nth: usize| {
+            (0..store.len())
+                .filter(|&i| store.get(i).trim() == text)
+                .nth(nth)
+                .unwrap()
+        };
+        let (first, reload, second, read) = (
+            line("movq %rdi, 8(%rsp)", 0),
+            line("movq 8(%rsp), %rax", 0),
+            line("movq %rdi, 8(%rsp)", 1),
+            line("movq 8(%rsp), %rcx", 0),
+        );
+        // Forwarded reload: the first store is dead (overwritten, unread).
+        mark_nop(&mut infos[reload]);
+        assert!(eliminate_dead_stores(&store, &mut infos));
+        assert!(infos[first].is_nop() && !infos[second].is_nop());
+        // A deleted second store is not an overwrite: the first store feeds
+        // the final read and must stay.
+        let (store, mut infos) = build(asm);
+        mark_nop(&mut infos[second]);
+        eliminate_dead_stores(&store, &mut infos);
+        assert!(!infos[first].is_nop(), "the first store feeds {read}");
     }
 
     #[test]

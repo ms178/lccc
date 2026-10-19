@@ -10,7 +10,9 @@
 //! String allocations.
 
 use super::macro_defs::MacroTable;
-use super::utils::{bytes_to_str, is_ident_cont_byte, is_ident_start_byte};
+use super::utils::{
+    bytes_to_str, is_digit_separator, is_ident_cont_byte, is_ident_start_byte, ppnumber_end,
+};
 
 /// State of a single conditional (#if/#ifdef/#ifndef block).
 #[derive(Debug, Clone, Copy)]
@@ -114,7 +116,7 @@ fn expand_condition_macros(expr: &str, macros: &MacroTable) -> String {
         let b = bytes[i];
 
         // Skip character literals verbatim (don't expand macros inside)
-        if b == b'\'' {
+        if b == b'\'' && !is_digit_separator(bytes, i) {
             let start = i;
             i += 1;
             while i < len && bytes[i] != b'\'' {
@@ -291,41 +293,44 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
             continue;
         }
 
-        // Number (decimal, hex, octal)
+        // Number: the whole pp-number (C23 digit separators included) is one
+        // token; its value comes from the separator-free spelling.
         if b.is_ascii_digit() {
-            let start = i;
-            let (raw_val, is_hex_or_oct) =
-                if b == b'0' && i + 1 < len && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X') {
-                    i += 2;
-                    let hex_start = i;
-                    while i < len && bytes[i].is_ascii_hexdigit() {
-                        i += 1;
-                    }
-                    let hex_str = bytes_to_str(bytes, hex_start, i);
-                    (u64::from_str_radix(hex_str, 16).unwrap_or(0), true)
-                } else if b == b'0' && i + 1 < len && bytes[i + 1].is_ascii_digit() {
-                    // Octal
-                    i += 1;
-                    let oct_start = i;
-                    while i < len && bytes[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                    let oct_str = bytes_to_str(bytes, oct_start, i);
-                    (u64::from_str_radix(oct_str, 8).unwrap_or(0), true)
-                } else {
-                    while i < len && bytes[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                    let num_str = bytes_to_str(bytes, start, i);
-                    (num_str.parse::<u64>().unwrap_or(0), false)
-                };
+            let end = ppnumber_end(bytes, i);
+            let spelling: String = bytes_to_str(bytes, i, end)
+                .chars()
+                .filter(|&c| c != '\'')
+                .collect();
+            // No digit of any base is u/U/l/L, so the first one starts the suffix.
+            let digits_end = spelling
+                .find(|c: char| matches!(c, 'u' | 'U' | 'l' | 'L'))
+                .unwrap_or(spelling.len());
+            let (digits, suffix) = spelling.split_at(digits_end);
+            let (raw_val, is_hex_or_oct) = if let Some(h) = digits
+                .strip_prefix("0x")
+                .or_else(|| digits.strip_prefix("0X"))
+            {
+                (u64::from_str_radix(h, 16).unwrap_or(0), true)
+            } else if let Some(bin) = digits
+                .strip_prefix("0b")
+                .or_else(|| digits.strip_prefix("0B"))
+            {
+                (u64::from_str_radix(bin, 2).unwrap_or(0), true)
+            } else if digits.len() > 1 && digits.starts_with('0') {
+                (u64::from_str_radix(&digits[1..], 8).unwrap_or(0), true)
+            } else {
+                (digits.parse::<u64>().unwrap_or(0), false)
+            };
+            i = end;
+            let suffix_bytes = suffix.as_bytes();
+            let mut k = 0;
             // Parse suffixes (U, L, UL, LL, ULL) - track unsigned
             let mut is_unsigned = false;
-            while i < len && matches!(bytes[i], b'u' | b'U' | b'l' | b'L') {
-                if bytes[i] == b'u' || bytes[i] == b'U' {
+            while k < suffix_bytes.len() && matches!(suffix_bytes[k], b'u' | b'U' | b'l' | b'L') {
+                if suffix_bytes[k] == b'u' || suffix_bytes[k] == b'U' {
                     is_unsigned = true;
                 }
-                i += 1;
+                k += 1;
             }
             // Per C99: decimal without U suffix: int -> long -> long long
             // Hex/octal without U suffix: int -> unsigned int -> long -> unsigned long -> long long -> unsigned long long
@@ -346,7 +351,7 @@ fn tokenize_expr(expr: &str) -> Vec<ExprToken> {
         }
 
         // Character literal
-        if b == b'\'' {
+        if b == b'\'' && !is_digit_separator(bytes, i) {
             i += 1;
             let val = if i < len && bytes[i] == b'\\' {
                 i += 1;
