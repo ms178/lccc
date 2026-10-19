@@ -187,7 +187,11 @@ fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
 /// to recognize the flag in `fold_memory_rmw`. The markers are comments
 /// and reach the assembler harmlessly.
 fn pin_volatile_access_regions(store: &LineStore, infos: &mut [LineInfo]) {
-    let mut in_volatile = false;
+    // Regions may nest: descriptor lowering uses an inner region to protect
+    // its special-ABI call, and that sequence may itself implement a C
+    // volatile access. A boolean would let the inner END accidentally unpin
+    // the actual volatile memory operation.
+    let mut volatile_depth = 0usize;
     for i in 0..store.len() {
         let trimmed = infos[i].trimmed(store.get(i));
         // The markers are consumed here, so they are deleted from the output:
@@ -195,16 +199,16 @@ fn pin_volatile_access_regions(store: &LineStore, infos: &mut [LineInfo]) {
         // them does not weaken the region, because the region's own lines are
         // pinned `InlineAsm` (a barrier to every pass) regardless of neighbours.
         if trimmed == "# LCCC_VOLATILE_BEGIN" {
-            in_volatile = true;
+            volatile_depth = volatile_depth.saturating_add(1);
             mark_nop(&mut infos[i]);
             continue;
         }
         if trimmed == "# LCCC_VOLATILE_END" {
-            in_volatile = false;
+            volatile_depth = volatile_depth.saturating_sub(1);
             mark_nop(&mut infos[i]);
             continue;
         }
-        if !in_volatile
+        if volatile_depth == 0
             || trimmed.is_empty()
             || trimmed.starts_with('#')
             || trimmed.starts_with('.')

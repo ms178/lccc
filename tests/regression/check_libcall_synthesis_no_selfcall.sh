@@ -134,6 +134,28 @@ static void *memset(void *d, int c, size_t n) {   /* static: TU-local symbol */
 }
 int f(void) { char b[8]; memset(b, 7, 8); return b[0]; }
 C
+# Attribute-mandated inline definitions have no special libcall-name embargo.
+# The TU builtin policy still prevents their copied loops from synthesising a
+# call back to the program's own symbol.
+cat >"$tmp/tu_always_inline_memset.c" <<'C'
+typedef __SIZE_TYPE__ size_t;
+__attribute__((always_inline)) inline void *memset(void *d, int c, size_t n) {
+    unsigned char *p = d; (void)c;
+    for (size_t i = 0; i < n; i++) p[i] = 0;
+    return d;
+}
+int f(char *p, size_t n) { memset(p, 7, n); return p[0]; }
+C
+cat >"$tmp/tu_gnu_inline_memset.c" <<'C'
+typedef __SIZE_TYPE__ size_t;
+extern __inline __attribute__((gnu_inline, always_inline))
+void *memset(void *d, int c, size_t n) {
+    unsigned char *p = d; (void)c;
+    for (size_t i = 0; i < n; i++) p[i] = 0;
+    return d;
+}
+int f(char *p, size_t n) { memset(p, 7, n); return p[0]; }
+C
 cat >"$tmp/runtime.c" <<'C'
 #include <stdio.h>
 typedef __SIZE_TYPE__ size_t;
@@ -333,6 +355,8 @@ expect_no_library_fill "$tmp/tu_def_const_call.c" f memset -O2
 expect_call            "$tmp/tu_def_const_call.c" f memset -O2 -fPIC
 expect_no_stack        "$tmp/tu_def_const_call.c" f -O2
 expect_no_library_fill "$tmp/tu_static_const_call.c" f memset -O2
+expect_no_call_to "$tmp/tu_always_inline_memset.c" f memset -O2
+expect_no_call_to "$tmp/tu_gnu_inline_memset.c" f memset -O2
 
 # ── 5. runtime ──────────────────────────────────────────────────────────────
 # The fill check above sees stores only; a library-semantics fold returns the

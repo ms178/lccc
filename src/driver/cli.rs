@@ -687,6 +687,25 @@ impl Driver {
     /// Parse GCC-compatible command-line arguments and populate driver fields.
     /// Returns `Ok(true)` if early exit was handled (query flags like -dumpmachine),
     /// `Ok(false)` if normal compilation should proceed, or `Err` for invalid args.
+    fn validate_target_tls_model(&self) -> Result<(), String> {
+        if matches!(self.target, Target::Aarch64 | Target::Riscv64)
+            && !matches!(
+                self.tls_model,
+                None | Some(crate::ir::reexports::TlsModel::LocalExec)
+            )
+        {
+            let arch = if self.target == Target::Aarch64 {
+                "aarch64"
+            } else {
+                "riscv64"
+            };
+            return Err(format!(
+                "{arch} currently supports only the local-exec TLS model"
+            ));
+        }
+        Ok(())
+    }
+
     pub fn parse_cli_args(&mut self, args: &[String]) -> Result<bool, String> {
         // Detect target from binary name (argv[0])
         let binary_name = std::path::Path::new(&args[0])
@@ -725,6 +744,7 @@ impl Driver {
         // command line would exceed OS limits.
         let expanded_args = Self::expand_response_files(&args[1..]);
         self.parse_main_args(&expanded_args)?;
+        self.validate_target_tls_model()?;
 
         // Store raw args for GCC -m16 passthrough. We keep everything except
         // argv[0], -o <output>, -c/-S/-E (we set mode ourselves), and input files.
@@ -1122,6 +1142,11 @@ impl Driver {
         // build that cannot see one value for the whole command line is worse
         // than either answer.
         let strict_options = std::env::var_os("LCCC_STRICT_OPTIONS").is_some();
+        // With the optional gcc_m16 delegate, GCC—not LCCC—owns target-affecting
+        // options. Preserve its full TLS-model surface instead of rejecting an
+        // option that will never reach LCCC codegen. Detect this from the whole
+        // command line so option order cannot change the answer.
+        let gcc_m16_passthrough = cfg!(feature = "gcc_m16") && args.iter().any(|arg| arg == "-m16");
         let mut unknown_options: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         // The last `-fprofile-dir=`, which a bare profile mode switch uses
@@ -2081,17 +2106,26 @@ impl Driver {
                     self.pic = false;
                     self.pie = false;
                 }
-                // This is currently a compilation-wide switch: every TLS
-                // reference emitted into the object uses the selected model.
-                // Per-declaration tls_model attributes are not implemented.
-                "-ftls-model=initial-exec" => self.tls_initial_exec = true,
-                "-ftls-model=local-exec" => self.tls_initial_exec = false,
+                // Compilation-wide GNU TLS policy. The x86 backends lower
+                // dynamic models through ABI TLS descriptors, whose resolver
+                // preserves every allocatable home and permits linker relaxation.
+                "-ftls-model=local-exec" => {
+                    self.tls_model = Some(crate::ir::reexports::TlsModel::LocalExec)
+                }
+                "-ftls-model=initial-exec" => {
+                    self.tls_model = Some(crate::ir::reexports::TlsModel::InitialExec)
+                }
+                "-ftls-model=local-dynamic" => {
+                    self.tls_model = Some(crate::ir::reexports::TlsModel::LocalDynamic)
+                }
+                "-ftls-model=global-dynamic" => {
+                    self.tls_model = Some(crate::ir::reexports::TlsModel::GlobalDynamic)
+                }
                 arg if arg.starts_with("-ftls-model=") => {
-                    let model = &arg["-ftls-model=".len()..];
-                    return Err(format!(
-                        "unsupported TLS model '{model}'; LCCC currently supports only \
-                         'local-exec' and compilation-wide 'initial-exec'"
-                    ));
+                    if !gcc_m16_passthrough {
+                        let model = &arg["-ftls-model=".len()..];
+                        return Err(format!("unknown TLS model '{model}'"));
+                    }
                 }
                 "-fcf-protection=branch" => {
                     self.cf_protection_branch = true;
@@ -3086,6 +3120,48 @@ mod cli_tests {
         args.extend(flags.iter().map(|f| f.to_string()));
         args.push("x.c".to_string());
         d.parse_cli_args(&args).map(|_| d)
+    }
+
+    #[test]
+    fn tls_models_are_explicit_and_last_value_wins() {
+        use crate::ir::reexports::TlsModel;
+        for (spelling, expected) in [
+            ("local-exec", TlsModel::LocalExec),
+            ("initial-exec", TlsModel::InitialExec),
+            ("local-dynamic", TlsModel::LocalDynamic),
+            ("global-dynamic", TlsModel::GlobalDynamic),
+        ] {
+            assert_eq!(
+                parse_flags(&[&format!("-ftls-model={spelling}")]).map(|driver| driver.tls_model),
+                Ok(Some(expected))
+            );
+        }
+        assert_eq!(
+            parse_flags(&[
+                "-ftls-model=global-dynamic",
+                "-ftls-model=local-exec",
+                "-ftls-model=initial-exec",
+            ])
+            .map(|driver| driver.tls_model),
+            Ok(Some(TlsModel::InitialExec))
+        );
+        for model in ["bogus", ""] {
+            assert_eq!(
+                parse_flags(&[&format!("-ftls-model={model}")]).map(|_| ()),
+                Err(format!("unknown TLS model '{model}'"))
+            );
+        }
+    }
+
+    #[cfg(feature = "gcc_m16")]
+    #[test]
+    fn gcc_m16_delegate_retains_gcc_tls_models_in_any_order() {
+        for flags in [
+            ["-m16", "-ftls-model=global-dynamic"],
+            ["-ftls-model=local-dynamic", "-m16"],
+        ] {
+            assert_eq!(parse_flags(&flags).map(|_| ()), Ok(()), "{flags:?}");
+        }
     }
 
     /// Profile paths, as GCC 16.2 places the `.gcda` files (measured): the

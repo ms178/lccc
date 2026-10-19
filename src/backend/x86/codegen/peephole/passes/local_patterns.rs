@@ -11808,7 +11808,7 @@ mod broadcast_fold_tests {
         );
     }
     #[test]
-    fn movq_extension_fusion_rejects_non_gpr_source_classes() {
+    fn movq_extension_fusion_rejects_xmm_for_every_consumer() {
         use super::super::super::types::classify_line;
         use crate::backend::peephole_common::LineStore;
 
@@ -11825,27 +11825,35 @@ mod broadcast_fold_tests {
                 .collect()
         };
 
-        // Only a plain GPR source has byte/word/dword aliases.  XMM-to-GPR,
-        // GPR-to-XMM, and memory-source moves must never index REG_NAMES as if
-        // their source were a GPR family accepted by this fusion.
-        for asm in [
-            "    movq %xmm2, %rax\n    movl %eax, %eax\n",
-            "    movq %rax, %xmm2\n    movl %eax, %eax\n",
-            "    movq 8(%rsp), %rax\n    movl %eax, %eax\n",
-        ] {
+        // XMM->RAX is classified as a producer but has no byte/word/dword GPR
+        // aliases. Exercise every consumer arm: removing the REG_GP_MAX guard
+        // must make this test panic or manufacture an invalid alias.
+        let consumers = [
+            ("movl %eax, %eax", "movl %r10d, %eax"),
+            ("movslq %eax, %rax", "movslq %r10d, %rax"),
+            ("cltq", "movslq %r10d, %rax"),
+            ("movzbq %al, %rax", "movzbl %r10b, %eax"),
+            ("movzwq %ax, %rax", "movzwl %r10w, %eax"),
+            ("movsbq %al, %rax", "movsbq %r10b, %rax"),
+        ];
+        for (consumer, fused) in consumers {
+            let xmm = format!("    movq %xmm2, %rax\n    {consumer}\n");
             assert_eq!(
-                run(asm),
-                asm.lines()
+                run(&xmm),
+                xmm.lines()
                     .map(str::trim)
                     .map(str::to_string)
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>(),
+                "XMM source reached the {consumer} fusion"
+            );
+
+            let gpr = format!("    movq %r10, %rax\n    {consumer}\n");
+            assert_eq!(
+                run(&gpr),
+                vec![fused],
+                "plain GPR control for {consumer} must still fuse"
             );
         }
-        assert_eq!(
-            run("    movq %r10, %rax\n    movl %eax, %eax\n"),
-            vec!["movl %r10d, %eax"],
-            "plain GPR control must still fuse"
-        );
     }
 
     #[test]

@@ -258,6 +258,7 @@ impl Parser {
         def_attrs.alias_target = self.attrs.parsing_alias_target.take();
         def_attrs.visibility = self.attrs.parsing_visibility.take();
         def_attrs.section = self.attrs.parsing_section.take();
+        def_attrs.tls_model = self.attrs.parsing_tls_model.take();
         def_attrs.symver = self.attrs.parsing_symver.take();
         def_attrs.diagnose_as = self.attrs.parsing_diagnose_as.take();
         def_attrs.cleanup_fn = self.attrs.parsing_cleanup_fn.take();

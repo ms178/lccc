@@ -2346,6 +2346,37 @@ impl super::InstructionEncoder {
                         Ok(())
                     }
                     Operand::Memory(mem) => {
+                        // GNU2 i386 TLS descriptor call: the TLSCALL symbol is
+                        // an annotation relocation at the FF /2 instruction,
+                        // not a displacement. GAS emits `ff 10` for
+                        // `call *x@TLSCALL(%eax)`.
+                        if let Displacement::SymbolMod(sym, modifier) = &mem.displacement
+                            && modifier.eq_ignore_ascii_case("tlscall")
+                        {
+                            if mem.index.is_some() {
+                                return Err(
+                                    "operand type mismatch for `call' after @tlscall".to_string()
+                                );
+                            }
+                            let Some(base) = mem.base.clone() else {
+                                return Err(
+                                    "operand type mismatch for `call' after @tlscall".to_string()
+                                );
+                            };
+                            let zero_mem = MemoryOperand {
+                                segment: mem.segment.clone(),
+                                displacement: Displacement::Integer(0),
+                                base: Some(base),
+                                index: None,
+                                scale: None,
+                                mask: None,
+                                zeroing: false,
+                                broadcast: None,
+                            };
+                            self.add_relocation(sym, R_386_TLS_DESC_CALL, 0);
+                            self.bytes.push(0xFF);
+                            return self.encode_modrm_mem(2, &zero_mem);
+                        }
                         self.bytes.push(0xFF);
                         self.encode_modrm_mem(2, mem)
                     }

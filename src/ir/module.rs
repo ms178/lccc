@@ -46,6 +46,17 @@ pub struct IrModule {
     pub symver_directives: Vec<(String, String)>,
 }
 
+/// ELF thread-local storage access model requested by the source or driver.
+/// `None` at both levels means the backend selects the fastest model that
+/// preserves preemption and dynamic-loading semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsModel {
+    LocalExec,
+    InitialExec,
+    LocalDynamic,
+    GlobalDynamic,
+}
+
 /// A global variable.
 #[derive(Debug, Clone)]
 pub struct IrGlobal {
@@ -79,6 +90,9 @@ pub struct IrGlobal {
     /// Whether this global has _Thread_local or __thread storage class.
     /// Thread-local globals are placed in .tdata/.tbss and accessed via TLS mechanisms.
     pub is_thread_local: bool,
+    /// Per-declaration `__attribute__((tls_model("...")))`, which overrides
+    /// the compilation-wide command-line policy for references to this symbol.
+    pub tls_model: Option<TlsModel>,
 }
 
 /// Initializer for a global variable.

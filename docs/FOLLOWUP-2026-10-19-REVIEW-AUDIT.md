@@ -1,89 +1,88 @@
-# Review-AI follow-up audit — 2026-10-19
+# Review follow-up decisions — 2026-10-19
 
-This note records which review suggestions survived source inspection and
-measurement. It intentionally distinguishes a real defect from a plausible
-but incorrect proposed implementation.
+This is a decision record, not a validation log. Exact commands and the final
+Git tree belong in the change review so they cannot become stale prose here.
 
-## 1. Ordinary-identifier lexical depth — finding valid, proposed file frame rejected
+## Lexical depth and binary128 zero
 
-`SymbolTable` already exposed `lookup_with_depth` and `lookup_depth`; adding a
-second `depth_of` API would duplicate an `Option<usize>` API and make absence
-ambiguous. Its initial map is file scope (depth 0). `TypeContext` instead stores
-only disposable lexical undo frames: frame index 0 is function scope (depth 1),
-so `enum_constant_with_depth` correctly maps index N to N + 1 and uses 0 when
-no frame recorded the file-scope enumerator.
+`SymbolTable` and `TypeContext` intentionally have different storage models but
+the same public depth convention: file scope is 0 and lexical scopes are 1+.
+`TypeContext` frames are undo logs, so adding a disposable file frame would
+corrupt shadow detection and scope unwind. Cross-map tests pin depths 0–3.
+`SymbolTable::pop_scope` now also refuses to destroy its final file scope and
+diagnoses an unbalanced pop in debug builds.
 
-Initializing `TypeContext::scope_stack` with a file frame was rejected. The
-frames record changes to typedef, tag, layout, alias, cache, and enumerator
-maps and `pop_scope` undoes them. Making file scope an undo frame also made
-queries such as `is_struct_key_shadowed` treat ordinary file-scope completion
-as lexical shadowing. The retained design keeps file scope canonical without
-conflating identity with undo ownership. A cross-map unit test now checks depths
-0 through 3 and unwind behavior; the C regression adds a nested object over a
-function-scope enumerator.
+The actual integer `IrConst` variants are `I8`, `I16`, `I32`, `I64`, and
+`I128`; every zero form is covered. Floating constants are excluded because
+`-0.0` must keep its sign. The runtime regression checks all 128 bits after both
+integer zero and `-0.0F128` cross the same ABI boundary.
 
-## 2. binary128 zero — matcher complete, sign regression strengthened
+## Builtin policy and inlining
 
-The actual `IrConst` integer variants are `I8`, `I16`, `I32`, `I64`, and
-`I128`; all five zero forms plus `Zero` are already matched explicitly. There
-are no unsigned integer variants. Floating constants are deliberately excluded
-(the broad `IrConst::is_zero` helper would incorrectly include negative zero).
-The runtime regression now sends both integer zero and `-0.0F128` through the
-same SysV argument path and checks all 128 payload bits, including the negative
-zero sign bit.
+A name-based ban on inlining TU-defined libcalls was removed after mutation
+measurement. Deleting the ban did **not** break the complete libcall synthesis
+gate: ordinary external `memset` was inlined while its custom semantics and all
+runtime rows remained correct. This is expected: `builtin_policy::apply`
+withdraws synthesis for a TU definition before inlining, and the body carries
+that policy.
 
-## 3. TLS model CLI — accepted and narrowed
+The experiment exposed a narrower real defect. A GNU extern-inline libc body
+has no out-of-line TU definition, so ordinary calls may still denote libc; yet
+once its body is cloned, later loop-idiom synthesis must not rewrite the custom
+inline implementation into a call to libc. GNU-inline bodies now carry a local
+withdrawal and inlining conservatively merges builtin policies. End-to-end rows
+pin ordinary, `always_inline`, and GNU-inline libc-named definitions. This is
+more precise than either globally disabling libc optimization or imposing a
+spelling-based inlining performance cliff.
 
-`local-exec` and `initial-exec` remain implemented. `global-dynamic`,
-`local-dynamic`, an empty value, and unknown values now fail explicitly instead
-of entering the generic warning/ignore policy. Documentation states the actual
-limitation: Initial-Exec is a compilation-wide per-object choice; per-symbol
-TLS model attributes are not implemented.
+Commit `21772cf83` is valid and is an ancestor of the original change; the
+review claim that it did not exist was a harness/repository-history error. The
+review was correct that the old shell assertion allowed either a call or a
+semantically correct inline body and therefore did not justify a call-retention
+claim.
 
-## 4. pointer-width spill claim — measured, no benefit claimed
+## TLS models
 
-The deterministic SysV generator gained `--emit-only` so the exact 186-shape
-source grid can be reproduced without an oracle compiler. Assembly from
-`532669b7` and `95bbb4cd`, at `-O2 -w -S`, was byte-identical for both generated
-translation units: zero assembly-byte delta and therefore zero spill-byte
-delta. The primary glibc follow-up records commands and SHA-256 values. This
-grid did not exercise the original glibc pointer-return/load witness, so the
-correctness fix is retained without a performance claim.
+The first follow-up deliberately rejected unimplemented dynamic models rather
+than approximating them. Native x86-64 and i386 codegen now implements all four
+GNU models, automatic linkage/PIC-sensitive selection, and per-declaration
+`tls_model` overrides. x86-64 uses GNU2 descriptors so dynamic accesses stay
+linker-relaxable without an ordinary call's register clobbers on either ABI. A DSO loaded after a worker thread exists verifies
+real dynamic allocation on both ABIs. AArch64 and RISC-V remain explicit
+Local-Exec-only errors until their object writers and dynamic linkers support
+the complete contract. Optional `gcc_m16` delegation continues to hand GCC the
+original model option unchanged.
 
-## 5. glibc workload script — accepted
+## Peephole operand classes
 
-Host C and C++ compilers must now be supplied together and report the same
-target. Their resolved paths, binary hashes, and versions are logged and stored
-in the reuse manifest. Patch provenance is captured from the checkout that
-actually contains it and checked against the pinned recipe revision when Git
-metadata exists. Destructive cleanup is confined to named children of a
-canonical, non-root, non-home work directory. Failure handling prints useful
-configure/build/install log tails.
+The `movq` extension fusion test now drives an XMM→RAX producer through all six
+consumer kinds and retains a positive GPR control for each. Removing the GPR
+family bound makes the test fail by indexing beyond the 16-family alias table.
+GPR→XMM and memory-source forms are tested at classification, where they are
+rejected, rather than presented as vacuous fusion tests. The memory form is not
+pinned as a permanent missed optimization.
 
-## 6. peephole operand classes — accepted
+## Harness and workload safety
 
-A focused unit test covers XMM-to-GPR, GPR-to-XMM, and memory-source `movq`
-forms around the extension fusion, plus a positive plain-GPR control. Non-GPR
-forms remain unfused and cannot index GPR alias tables.
+The SysV generator's `--emit-only` mode no longer requires a fake LCCC path and
+is exercised in local and hosted CI with all three generated files checked.
+The linker process wrapper handles an empty command, reports a missing working
+directory separately from a missing executable, and has focused tests.
 
-## 7. provenance — accepted
+The glibc workload treats patch bytes—not an unrelated repository HEAD—as the
+input authority. Git revision remains logged provenance. Host compiler values
+are explicitly bare paths; one recognized compiler can derive its sibling,
+while arbitrary wrappers must provide both paths. Same-target validation,
+destructive-cleanup confinement, symlink-escape rejection, version fallback,
+and failure-log reporting are covered by a fast hermetic shell test.
 
-The primary follow-up now names the actual validated base (`59f061d2`), merged
-commit range (`532669b7..20078a5f`), merge commit (`d8f79a6b`), and PR #868.
-Patch applicability is described with the command actually used,
-`git apply --check`. It explicitly does not claim a nonexistent
-`git am --fuzz` option; `--fuzz=0` is used only with GNU `patch` for the
-pinned glibc patch.
+## Reproducible measurements
 
-## 8. census — review command rejected, real interface verified
+The pointer-width correction remains a correctness fix with no invented speed
+claim. Across the deterministic 186-shape SysV grid, assembly before and after
+was byte-identical: zero assembly-byte and zero spill-byte delta. The commands
+and hashes remain in the glibc follow-up document.
 
-There is no repository `cargo run --bin audit` interface. The authoritative
-commands are:
-
-```sh
-python3 scripts/audit_census.py --selftest
-python3 scripts/audit_census.py --check
-```
-
-Both passed. No metric grew, so regenerating the baseline would add churn and
-weaken the ratchet rather than improve it.
+The repository census is `python3 scripts/audit_census.py --selftest` followed
+by `--check`; there is no `cargo run --bin audit` interface. A held ratchet is
+left unchanged rather than regenerated gratuitously.

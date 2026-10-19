@@ -2,6 +2,7 @@
 
 use super::emit::{X86Codegen, is_xmm_reg, phys_reg_name, phys_reg_name_32, typed_phys_reg_name};
 use crate::common::types::IrType;
+use crate::ir::reexports::TlsModel;
 use crate::ir::reexports::{Operand, Value};
 
 impl X86Codegen {
@@ -134,31 +135,71 @@ impl X86Codegen {
         true
     }
 
+    /// Select the psABI model when the command line did not force one.
+    /// Full PIC must preserve dlopen/interposition semantics, while an
+    /// executable can use the cheaper static models.
+    fn tls_model_for_symbol(&self, name: &str) -> TlsModel {
+        self.state.tls_model_for_symbol(name)
+    }
+
+    /// Emit the GNU2 TLS-descriptor sequence. Its resolver ABI preserves all
+    /// allocatable registers except `%rax`, which is deliberately not a value
+    /// home in this backend. This avoids hidden ordinary-call clobbers and is
+    /// both shorter and more readily relaxed than the classic TLSGD sequence.
+    pub(super) fn emit_tls_dynamic_offset(&mut self, name: &str) {
+        // The generic peephole treats textual `call` as the normal SysV ABI.
+        // A TLS descriptor has a special ABI, so carry an opaque pseudo through
+        // optimization and lower it only afterwards. Treating it as an unknown
+        // instruction is conservative for `%rax` without inventing clobbers of
+        // the other caller-saved homes that TLSDESC is required to preserve.
+        self.state.emit("    # LCCC_VOLATILE_BEGIN");
+        self.state
+            .emit_fmt(format_args!("    leaq {}@TLSDESC(%rip), %rax", name));
+        self.state
+            .emit_fmt(format_args!("    lccc_tls_call {}", name));
+        self.state.reg_cache.invalidate_all();
+    }
+
+    fn emit_tls_dynamic_addr(&mut self, name: &str, reg: &str) {
+        self.emit_tls_dynamic_offset(name);
+        self.state.emit("    addq %fs:0, %rax");
+        if reg != "rax" {
+            self.state.emit_fmt(format_args!("    movq %rax, %{}", reg));
+        }
+        self.state.emit("    # LCCC_VOLATILE_END");
+    }
+
     pub(super) fn emit_tls_global_addr_impl(&mut self, dest: &Value, name: &str) {
         // TLS requires %rax for the fs:0 base — can't fully avoid accumulator.
         // But when dest has a register, we can skip the final store_rax_to relay.
-        // TLS model selection: LOCAL symbols (static/visibility-hidden TLS, the
-        // common `static __thread` case) use the Local-Exec model — a direct
-        // %fs:offset with NO GOT entry — even under -fPIC, exactly like GCC.
-        // Only external TLS symbols need the GOT-based General-Dynamic sequence
-        // in PIC mode (globals_tls regression: static __thread read garbage
-        // when GOTTPOFF was forced for a local symbol).
-        // A shared object must not use Local-Exec even for a symbol it owns:
-        // the linker rejects `R_X86_64_TPOFF32` when producing `ET_DYN`
-        // (lccc -fPIC -shared on any `static __thread` failed to link at all
-        // before this; GCC links the same source). Initial-Exec through the
-        // GOT is valid there, so `-shared` routes local TLS symbols to it.
-        if self.state.tls_initial_exec
-            || (self.state.pic_mode && !self.state.local_symbols.contains(name))
-            || self.state.shared_lib
-        {
-            self.state
-                .emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %rax", name));
-            self.state.emit("    addq %fs:0, %rax");
-        } else {
-            self.state.emit("    movq %fs:0, %rax");
-            self.state
-                .emit_fmt(format_args!("    leaq {}@TPOFF(%rax), %rax", name));
+        // Automatic selection is linkage- and output-sensitive: executable
+        // code uses LE for local symbols and IE for preemptible ones; full PIC
+        // uses LD/GD semantics through TLS descriptors. An explicit command-
+        // line or declaration model overrides that policy. In particular, a
+        // shared object must never silently use LE/IE merely because a symbol
+        // is defined in the current translation unit: that breaks dlopen after
+        // threads exist and, for LE, produces an illegal TPOFF32 relocation.
+        match self.tls_model_for_symbol(name) {
+            TlsModel::LocalExec => {
+                self.state.emit("    movq %fs:0, %rax");
+                self.state
+                    .emit_fmt(format_args!("    leaq {}@TPOFF(%rax), %rax", name));
+            }
+            TlsModel::InitialExec => {
+                self.state
+                    .emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %rax", name));
+                self.state.emit("    addq %fs:0, %rax");
+            }
+            TlsModel::LocalDynamic | TlsModel::GlobalDynamic => {
+                if let Some(reg) = self.dest_reg(dest)
+                    && !is_xmm_reg(reg)
+                {
+                    self.emit_tls_dynamic_addr(name, phys_reg_name(reg));
+                    self.note_inplace_compute(reg, dest.0);
+                    return;
+                }
+                self.emit_tls_dynamic_addr(name, "rax");
+            }
         }
         self.store_rax_to(dest);
     }
@@ -176,24 +217,26 @@ impl X86Codegen {
     /// `&buf[k]` pointer arithmetic (torture execute/20000412-6.c: `buf+3`
     /// decoded as `6`, not `&buf[3]`). Credit: Agent C torture triage.
     ///
-    /// TLS model selection mirrors emit_tls_global_addr_impl: Local-Exec for
-    /// local symbols (even under -fPIC, like GCC), Initial-Exec via GOTTPOFF
-    /// only for external TLS symbols in PIC mode.
+    /// TLS model selection exactly mirrors `emit_tls_global_addr_impl`,
+    /// including per-symbol overrides and dynamic full-PIC defaults.
     pub(super) fn emit_global_addr_into_reg(&mut self, name: &str, reg: &str) {
         if self.state.tls_symbols.contains(name) {
-            if self.state.tls_initial_exec
-                || (self.state.pic_mode && !self.state.local_symbols.contains(name))
-                || self.state.shared_lib
-            {
-                self.state
-                    .emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %{}", name, reg));
-                self.state
-                    .emit_fmt(format_args!("    addq %fs:0, %{}", reg));
-            } else {
-                self.state
-                    .emit_fmt(format_args!("    movq %fs:0, %{}", reg));
-                self.state
-                    .emit_fmt(format_args!("    leaq {}@TPOFF(%{}), %{}", name, reg, reg));
+            match self.tls_model_for_symbol(name) {
+                TlsModel::LocalExec => {
+                    self.state
+                        .emit_fmt(format_args!("    movq %fs:0, %{}", reg));
+                    self.state
+                        .emit_fmt(format_args!("    leaq {}@TPOFF(%{}), %{}", name, reg, reg));
+                }
+                TlsModel::InitialExec => {
+                    self.state
+                        .emit_fmt(format_args!("    movq {}@GOTTPOFF(%rip), %{}", name, reg));
+                    self.state
+                        .emit_fmt(format_args!("    addq %fs:0, %{}", reg));
+                }
+                TlsModel::LocalDynamic | TlsModel::GlobalDynamic => {
+                    self.emit_tls_dynamic_addr(name, reg);
+                }
             }
         } else if self.state.needs_got_for_addr(name) {
             let n = self.got_name(name);

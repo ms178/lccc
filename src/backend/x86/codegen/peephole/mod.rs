@@ -25,6 +25,25 @@ mod types;
 
 pub(crate) use passes::{peephole_optimize, peephole_optimize_with_config};
 
+/// Lower the opaque TLS-descriptor pseudo after optimization. During the
+/// peephole it must be an unknown `%rax`-transforming instruction, not a normal
+/// SysV call: the TLSDESC resolver ABI preserves all other register homes.
+pub(crate) fn lower_tls_call_markers(asm: String) -> String {
+    if !asm.contains("lccc_tls_call") {
+        return asm;
+    }
+    asm.split_inclusive('\n')
+        .map(|line| {
+            let trimmed = line.trim();
+            if let Some(symbol) = trimmed.strip_prefix("lccc_tls_call ") {
+                format!("    call *{}@TLSCALL(%rax)\n", symbol)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect()
+}
+
 /// Delete the `# LCCC_VOLATILE_BEGIN` / `# LCCC_VOLATILE_END` markers from
 /// assembly that bypasses the peephole (`LCCC_NO_PEEPHOLE=1`). The optimized
 /// path deletes them in `pin_volatile_access_regions`; this keeps the escape
@@ -40,4 +59,20 @@ pub(crate) fn strip_volatile_markers(asm: String) -> String {
             t != "# LCCC_VOLATILE_BEGIN" && t != "# LCCC_VOLATILE_END"
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tls_call_tests {
+    use super::lower_tls_call_markers;
+
+    #[test]
+    fn tls_call_marker_lowers_only_after_optimization() {
+        let input = "    leaq x@TLSDESC(%rip), %rax\n    lccc_tls_call x\n    addq %fs:0, %rax\n";
+        let output = lower_tls_call_markers(input.to_string());
+        assert_eq!(
+            output,
+            "    leaq x@TLSDESC(%rip), %rax\n    call *x@TLSCALL(%rax)\n    addq %fs:0, %rax\n"
+        );
+        assert!(!output.contains("lccc_tls_call"));
+    }
 }

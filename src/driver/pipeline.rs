@@ -144,9 +144,9 @@ pub struct Driver {
     /// `-fpie`, the x86-64 Linux default). PIE permits direct references to
     /// ordinary executable data where full PIC requires the GOT.
     pub(super) pie: bool,
-    /// Explicit `-ftls-model=initial-exec` policy for separately compiled PIC
-    /// objects (glibc uses this for libc's internal TLS references).
-    pub(super) tls_initial_exec: bool,
+    /// Explicit compilation-wide ELF TLS model. `None` keeps the psABI-safe
+    /// automatic choice based on linkage and PIC mode.
+    pub(super) tls_model: Option<crate::ir::reexports::TlsModel>,
     /// Files to force-include before the main source (-include flag)
     pub(super) force_includes: Vec<String>,
     /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern)
@@ -545,7 +545,7 @@ impl Driver {
             // while explicit -fPIC/-shared remains interposition-safe.
             pic: false,
             pie: true,
-            tls_initial_exec: false,
+            tls_model: None,
             force_includes: Vec::new(),
             function_return_thunk: false,
             indirect_branch_thunk: false,
@@ -2878,7 +2878,7 @@ impl Driver {
             pic: self.pic || self.shared_lib,
             shared_lib: self.shared_lib,
             pie: self.pie && !self.pic && !self.shared_lib,
-            tls_initial_exec: self.tls_initial_exec,
+            tls_model: self.tls_model,
             function_return_thunk: self.function_return_thunk,
             indirect_branch_thunk: self.indirect_branch_thunk,
             indirect_branch_thunk_inline: self.indirect_branch_thunk_inline,

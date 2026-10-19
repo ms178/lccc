@@ -88,7 +88,7 @@ using `532669b7` (before the pointer-width correction) and `95bbb4cd` (after):
 
 ```sh
 python3 tests/regression/check_sysv_aggregate_abi.py \
-  --lccc /bin/false --emit-only --keep /tmp/sysvabi
+  --emit-only --keep /tmp/sysvabi
 for tu in prov call; do
   BEFORE/target/fastbuild/lccc -O2 -w -S /tmp/sysvabi/$tu.c -o /tmp/$tu.before.s
   AFTER/target/fastbuild/lccc  -O2 -w -S /tmp/sysvabi/$tu.c -o /tmp/$tu.after.s

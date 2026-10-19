@@ -313,6 +313,8 @@ impl super::InstructionEncoder {
             "TPOFF" => R_386_TLS_LE_32,
             "TLSGD" => R_386_TLS_GD,
             "TLSLDM" => R_386_TLS_LDM,
+            "TLSDESC" => R_386_TLS_GOTDESC,
+            "TLSCALL" => R_386_TLS_DESC_CALL,
             "DTPOFF" => R_386_TLS_LDO_32,
             "GOT" => R_386_GOT32,
             "GOTOFF" => R_386_GOTOFF,
