@@ -2352,6 +2352,8 @@ struct CtzLoop {
     /// The counter's value entering the loop (preheader edge operand).
     r_init: Operand,
     r_ty: IrType,
+    /// See `CtzPhis::r_add_ty`.
+    r_add_ty: IrType,
 }
 
 /// Follow same-width `Cast` chains (cycle-guarded). The frontend's parameter
@@ -2382,6 +2384,9 @@ struct CtzPhis {
     r: (Value, Operand, IrType),
     x_step: Option<Value>,
     r_step: Option<Value>,
+    /// Type the counter's `+ 1` is computed in: the phi type, or the
+    /// promoted type when the step truncates back (`unsigned char r; r++`).
+    r_add_ty: IrType,
 }
 
 /// Scan the header phis of a ctz candidate: exactly the shifted word
@@ -2401,6 +2406,7 @@ fn ctz_collect_header_phis(
     let mut r: Option<(Value, Operand, IrType)> = None;
     let mut x_step_dest: Option<Value> = None;
     let mut r_step_dest: Option<Value> = None;
+    let mut r_add_ty: Option<IrType> = None;
     for inst in &func.blocks[header].instructions {
         let Instruction::Phi { dest, ty, incoming } = inst else {
             continue;
@@ -2451,6 +2457,28 @@ fn ctz_collect_header_phis(
                 return None;
             }
         };
+        // A narrow word or counter steps in its promoted type and truncates
+        // back: `(T)((int)x >> 1)`, `(T)((int)r + 1)`. Look through exactly
+        // that integer truncation to the phi's width. Wrapping arithmetic
+        // makes the low bits equal the narrow step: `r + 1 mod 2^w`, and
+        // after k shifts bit 0 is bit k of x0 whatever the fill bit, so the
+        // loop still exits after ctz_w(x0) < w iterations.
+        let (step_v, through_trunc) = match defs.get(&step_v.0) {
+            Some(Instruction::Cast {
+                src: Operand::Value(inner),
+                from_ty,
+                to_ty,
+                ..
+            }) if from_ty.is_integer()
+                && to_ty.is_integer()
+                && to_ty.size() == ty.size()
+                && from_ty.size() > to_ty.size()
+                && from_ty.size() <= 8 =>
+            {
+                (strip(*inner), true)
+            }
+            _ => (step_v, false),
+        };
         if def_blocks.get(&step_v.0) != Some(&latch) {
             dlog!(
                 "{name} loop@{header}: ctz bail (phi {} step outside latch)",
@@ -2458,17 +2486,61 @@ fn ctz_collect_header_phis(
             );
             return None;
         }
-        let Some(Instruction::BinOp { op, lhs, rhs, .. }) = defs.get(&step_v.0) else {
+        let Some(Instruction::BinOp {
+            op,
+            lhs,
+            rhs,
+            ty: step_ty,
+            ..
+        }) = defs.get(&step_v.0)
+        else {
             dlog!(
                 "{name} loop@{header}: ctz bail (phi {} step not a BinOp)",
                 dest.0
             );
             return None;
         };
-        let feeds_self =
-            |o: &Operand| -> bool { matches!(o, Operand::Value(u) if strip(*u) == *dest) };
+        // Through a truncation the step must compute in the promoted (wider)
+        // type; the counter's sum is then formed there and truncated back.
+        if through_trunc && step_ty.size() <= ty.size() {
+            dlog!(
+                "{name} loop@{header}: ctz bail (phi {} truncated step not promoted)",
+                dest.0
+            );
+            return None;
+        }
+        let add_ty = if through_trunc { *step_ty } else { *ty };
+        // The phi itself, possibly widened to the promoted step type.
+        let feeds_self = |o: &Operand| -> bool {
+            let Operand::Value(u) = o else { return false };
+            let mut v = strip(*u);
+            for _ in 0..4 {
+                if v == *dest {
+                    return true;
+                }
+                match defs.get(&v.0) {
+                    Some(Instruction::Cast {
+                        src: Operand::Value(inner),
+                        from_ty,
+                        to_ty,
+                        ..
+                    }) if from_ty.is_integer()
+                        && to_ty.is_integer()
+                        && from_ty.size() <= to_ty.size() =>
+                    {
+                        v = strip(*inner);
+                    }
+                    _ => return false,
+                }
+            }
+            false
+        };
         match (*op, lhs, rhs) {
-            (IrBinOp::LShr, l, Operand::Const(c)) if feeds_self(l) && c.to_i64() == Some(1) => {
+            // Arithmetic or logical: the fill bit never reaches bit 0
+            // before the loop exits (x0 != 0), so both count ctz(x0).
+            (IrBinOp::LShr | IrBinOp::AShr, l, Operand::Const(c))
+                if feeds_self(l) && c.to_i64() == Some(1) =>
+            {
                 if x.is_some() {
                     dlog!("{name} loop@{header}: ctz bail (two shifted words)");
                     return None;
@@ -2483,6 +2555,7 @@ fn ctz_collect_header_phis(
                 }
                 r = Some((*dest, init, *ty));
                 r_step_dest = Some(step_v);
+                r_add_ty = Some(add_ty);
             }
             (IrBinOp::Add, ll, Operand::Const(c)) if c.to_i64() == Some(1) && feeds_self(ll) => {
                 if r.is_some() {
@@ -2491,6 +2564,7 @@ fn ctz_collect_header_phis(
                 }
                 r = Some((*dest, init, *ty));
                 r_step_dest = Some(step_v);
+                r_add_ty = Some(add_ty);
             }
             (op, _, _) => {
                 dlog!(
@@ -2513,6 +2587,7 @@ fn ctz_collect_header_phis(
         }
     };
     Some(CtzPhis {
+        r_add_ty: r_add_ty.unwrap_or(r.2),
         x,
         r,
         x_step: x_step_dest,
@@ -2549,6 +2624,21 @@ fn ctz_header_test_polarity(
         },
         _ => return None,
     };
+    // Bit 0 survives any integer widening (zero- or sign-extending), so a
+    // narrow word tested in its promoted type, `((int)x) & 1`, tests `x & 1`.
+    let through_widen = |v: Value| -> Value {
+        match defs.get(&v.0) {
+            Some(Instruction::Cast {
+                src: Operand::Value(src),
+                from_ty,
+                to_ty,
+                ..
+            }) if from_ty.is_integer() && to_ty.is_integer() && from_ty.size() < to_ty.size() => {
+                strip(*src)
+            }
+            _ => v,
+        }
+    };
     let header_and = |cv: Value| -> Option<Value> {
         match defs.get(&cv.0)? {
             Instruction::BinOp {
@@ -2560,12 +2650,12 @@ fn ctz_header_test_polarity(
                 let one = |o: &Operand| matches!(o, Operand::Const(c) if c.to_i64() == Some(1));
                 if let Some(l) = as_val(lhs) {
                     if one(rhs) {
-                        return Some(strip(l));
+                        return Some(through_widen(strip(l)));
                     }
                 }
                 if let Some(rr) = as_val(rhs) {
                     if one(lhs) {
-                        return Some(strip(rr));
+                        return Some(through_widen(strip(rr)));
                     }
                 }
                 None
@@ -2924,6 +3014,7 @@ fn try_match_ctz_loop(
     let (r_phi, r_init, r_ty) = phis.r;
     let x_step_dest = phis.x_step;
     let r_step_dest = phis.r_step;
+    let r_add_ty = phis.r_add_ty;
 
     ctz_header_test_polarity(
         func,
@@ -3010,6 +3101,7 @@ fn try_match_ctz_loop(
         r_phi,
         r_init,
         r_ty,
+        r_add_ty,
     })
 }
 
@@ -3080,25 +3172,47 @@ fn rewrite_ctz_loop(func: &mut IrFunction, m: &CtzLoop, body: &FxHashSet<usize>)
     }
 
     // Materialize `res = r0 + ctz_nonzero(x0)` at the end of the preheader.
+    // A word narrower than the counter's add type is widened first and
+    // counted there: x0 != 0, and zero- or sign-extension keeps its lowest
+    // set bit, so ctz(widen(x0)) == ctz(x0) -- and the result needs no
+    // extension afterwards (the backend widens a sub-32-bit operand for
+    // tzcnt/bsf anyway).
+    let mut extra: Vec<Instruction> = Vec::new();
+    let widen = m.x_ty.is_integer() && m.r_add_ty.is_integer() && m.x_ty.size() < m.r_add_ty.size();
+    let (ctz_src, ctz_ty) = if widen {
+        let wide_v = alloc_value(func);
+        extra.push(Instruction::Cast {
+            dest: wide_v,
+            src: m.x_init.clone(),
+            from_ty: m.x_ty,
+            to_ty: m.r_add_ty,
+        });
+        (Operand::Value(wide_v), m.r_add_ty)
+    } else {
+        (m.x_init.clone(), m.x_ty)
+    };
     let ctz_v = alloc_value(func);
-    let mut extra: Vec<Instruction> = vec![Instruction::UnaryOp {
+    extra.push(Instruction::UnaryOp {
         dest: ctz_v,
         op: IrUnaryOp::CtzNonZero,
-        src: m.x_init.clone(),
-        ty: m.x_ty,
-    }];
+        src: ctz_src,
+        ty: ctz_ty,
+    });
+    // The sum is formed exactly like the source step: in the counter's
+    // add type, truncated back when the counter is narrower (`unsigned
+    // char r = 250` wraps). ctz < 64 is representable in every type.
     let mut res = ctz_v;
-    if m.r_ty != m.x_ty {
+    if m.r_add_ty != ctz_ty {
         let cast_v = alloc_value(func);
         extra.push(Instruction::Cast {
             dest: cast_v,
             src: Operand::Value(ctz_v),
-            from_ty: m.x_ty,
-            to_ty: m.r_ty,
+            from_ty: ctz_ty,
+            to_ty: m.r_add_ty,
         });
         res = cast_v;
     }
-    let res_val = if matches!(&m.r_init, Operand::Const(c) if c.to_i64() == Some(0)) {
+    let mut res_val = if matches!(&m.r_init, Operand::Const(c) if c.to_i64() == Some(0)) {
         res
     } else {
         let add_v = alloc_value(func);
@@ -3107,17 +3221,68 @@ fn rewrite_ctz_loop(func: &mut IrFunction, m: &CtzLoop, body: &FxHashSet<usize>)
             op: IrBinOp::Add,
             lhs: Operand::Value(res),
             rhs: m.r_init.clone(),
-            ty: m.r_ty,
+            ty: m.r_add_ty,
         });
         add_v
     };
+    if m.r_add_ty != m.r_ty {
+        let trunc_v = alloc_value(func);
+        extra.push(Instruction::Cast {
+            dest: trunc_v,
+            src: Operand::Value(res_val),
+            from_ty: m.r_add_ty,
+            to_ty: m.r_ty,
+        });
+        res_val = trunc_v;
+    }
+
+    // Where the computation goes. A conditional preheader is the guard
+    // (`if (!x) return 0;`): computing there runs the count on the zero path
+    // too and keeps x live across it for the test (on i686 a callee-saved
+    // register). When every predecessor of the exit is a loop block, the
+    // exit's only predecessor after the rewrite is the guard's loop arm, so
+    // the count sinks into the exit -- test first, count only when nonzero,
+    // as GCC does. An exit phi would consume the result before its
+    // definition, so exits with phis keep the preheader placement.
+    let sink_into_exit = !matches!(m.edge, PreheaderEdge::Uncond)
+        && !func.blocks[m.exit]
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::Phi { .. }))
+        && {
+            let label_to_idx = analysis::build_label_map(func);
+            let (preds, _) = analysis::build_cfg(func, &label_to_idx);
+            preds
+                .row(m.exit)
+                .iter()
+                .all(|&p| body.contains(&(p as usize)))
+        };
 
     // Retarget the preheader to the exit and install the computation. A
     // conditional preheader keeps its guard arm and only the loop arm moves
     // to the exit (the guard test still selects the zero path).
     {
+        // Debug spans stay index-parallel with the instructions (dummy spans
+        // for the new ones), or are dropped when they already were not.
+        let at = if sink_into_exit { m.exit } else { m.preheader };
+        let block = &mut func.blocks[at];
+        let pos = if sink_into_exit {
+            0
+        } else {
+            block.instructions.len()
+        };
+        if !block.source_spans.is_empty() {
+            if block.source_spans.len() == block.instructions.len() {
+                block.source_spans.splice(
+                    pos..pos,
+                    (0..extra.len()).map(|_| crate::common::source::Span::dummy()),
+                );
+            } else {
+                block.source_spans.clear();
+            }
+        }
+        block.instructions.splice(pos..pos, extra);
         let pre = &mut func.blocks[m.preheader];
-        pre.instructions.extend(extra);
         match m.edge {
             PreheaderEdge::Uncond => {
                 debug_assert!(matches!(pre.terminator, Terminator::Branch(_)));
@@ -4010,5 +4175,164 @@ mod tests {
             f.blocks.iter().any(|b| b.label == BlockId(2)),
             "loop retained"
         );
+    }
+
+    /// Mutate the latch step of `ctz_func(true)` that defines `dest`.
+    fn ctz_latch_step(f: &mut IrFunction, dest: u32) -> &mut Instruction {
+        f.blocks
+            .iter_mut()
+            .find(|b| b.label == BlockId(3))
+            .and_then(|b| {
+                b.instructions
+                    .iter_mut()
+                    .find(|i| i.dest() == Some(Value(dest)))
+            })
+            .expect("latch step")
+    }
+
+    /// The block holding the (single) materialized `CtzNonZero`.
+    fn ctz_block(f: &IrFunction) -> &BasicBlock {
+        f.blocks
+            .iter()
+            .find(|b| {
+                b.instructions.iter().any(|i| {
+                    matches!(
+                        i,
+                        Instruction::UnaryOp {
+                            op: IrUnaryOp::CtzNonZero,
+                            ..
+                        }
+                    )
+                })
+            })
+            .expect("a CtzNonZero")
+    }
+
+    #[test]
+    fn ctz_count_sinks_below_the_guard() {
+        // The guard is the exit's only predecessor after the rewrite: the
+        // count runs on the nonzero path only (x is not live past the test).
+        let mut f = ctz_func(true);
+        assert_eq!(run_function(&mut f), 1);
+        assert_eq!(ctz_block(&f).label, BlockId(4), "count in the exit block");
+        let guard = f.blocks.iter().find(|b| b.label == BlockId(0)).unwrap();
+        assert_eq!(guard.instructions.len(), 1, "guard keeps only its ParamRef");
+        // An exit with phis (the counter itself never feeds one: the matcher
+        // refuses that escape) keeps the count in the preheader, where every
+        // phi of the block is still at its head.
+        let mut f = ctz_func(true);
+        let exit = f.blocks.iter_mut().find(|b| b.label == BlockId(4)).unwrap();
+        exit.instructions.push(Instruction::Phi {
+            dest: Value(18),
+            ty: IrType::I32,
+            incoming: vec![(i32c(7), BlockId(2))],
+        });
+        assert_eq!(run_function(&mut f), 1);
+        assert_eq!(ctz_block(&f).label, BlockId(0), "count stays in the guard");
+    }
+
+    fn has_ctz_nonzero(f: &IrFunction) -> bool {
+        f.blocks.iter().any(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(
+                    i,
+                    Instruction::UnaryOp {
+                        op: IrUnaryOp::CtzNonZero,
+                        ..
+                    }
+                )
+            })
+        })
+    }
+
+    #[test]
+    fn ctz_arithmetic_shift_of_signed_word_rewrites() {
+        // `int x; while (!(x & 1)) x >>= 1;` — sar fills from the sign bit,
+        // which never reaches bit 0 before a nonzero word's lowest set bit.
+        let mut f = ctz_func(true);
+        if let Instruction::BinOp { op, ty, .. } = ctz_latch_step(&mut f, 12) {
+            *op = IrBinOp::AShr;
+            *ty = IrType::I32;
+        }
+        assert_eq!(run_function(&mut f), 1, "sar loop rewrites");
+        assert!(has_ctz_nonzero(&f));
+    }
+
+    #[test]
+    fn ctz_narrow_counter_sums_in_promoted_type_and_truncates() {
+        // `unsigned char r = 250; ... r++;` steps as `(u8)((int)r + 1)`: the
+        // rewrite must form `250 + ctz` in I32 and truncate to U8 (wraps).
+        let mut f = ctz_func(true);
+        for b in f.blocks.iter_mut() {
+            for inst in b.instructions.iter_mut() {
+                if let Instruction::Phi { dest, ty, incoming } = inst {
+                    if *dest == Value(11) {
+                        *ty = IrType::U8;
+                        incoming[0].0 = Operand::Const(IrConst::I64(250));
+                    }
+                }
+            }
+        }
+        if let Instruction::BinOp { dest, .. } = ctz_latch_step(&mut f, 13) {
+            *dest = Value(15);
+        }
+        let latch = f.blocks.iter_mut().find(|b| b.label == BlockId(3)).unwrap();
+        latch.instructions.push(Instruction::Cast {
+            dest: Value(13),
+            src: val(15),
+            from_ty: IrType::I32,
+            to_ty: IrType::U8,
+        });
+        assert_eq!(run_function(&mut f), 1, "truncating counter rewrites");
+        let at = ctz_block(&f);
+        let tail: Vec<_> = at.instructions.iter().rev().take(2).collect();
+        assert!(
+            matches!(
+                tail[0],
+                Instruction::Cast {
+                    from_ty: IrType::I32,
+                    to_ty: IrType::U8,
+                    ..
+                }
+            ) && matches!(
+                tail[1],
+                Instruction::BinOp {
+                    op: IrBinOp::Add,
+                    ty: IrType::I32,
+                    ..
+                }
+            ),
+            "sum in I32, then truncated to U8: {tail:?}"
+        );
+    }
+
+    #[test]
+    fn ctz_truncated_step_must_be_promoted() {
+        // A truncation around a step that is not wider than the phi is not
+        // the promotion shape; refuse rather than guess its semantics.
+        let mut f = ctz_func(true);
+        if let Instruction::BinOp { dest, ty, .. } = ctz_latch_step(&mut f, 13) {
+            *dest = Value(15);
+            *ty = IrType::I16;
+        }
+        let latch = f.blocks.iter_mut().find(|b| b.label == BlockId(3)).unwrap();
+        latch.instructions.push(Instruction::Cast {
+            dest: Value(13),
+            src: val(15),
+            from_ty: IrType::I64,
+            to_ty: IrType::I32,
+        });
+        assert_eq!(run_function(&mut f), 0, "unpromoted truncated step refused");
+        assert!(!has_ctz_nonzero(&f));
+    }
+
+    #[test]
+    fn ctz_shift_by_two_is_kept() {
+        let mut f = ctz_func(true);
+        if let Instruction::BinOp { rhs, .. } = ctz_latch_step(&mut f, 12) {
+            *rhs = Operand::Const(IrConst::I64(2));
+        }
+        assert_eq!(run_function(&mut f), 0, "x >>= 2 does not count ctz");
+        assert!(!has_ctz_nonzero(&f));
     }
 }
