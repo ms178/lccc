@@ -219,6 +219,11 @@ impl<'a> ExprTypeChecker<'a> {
                     match base_ct {
                         CType::Array(elem, _) => return Some(*elem),
                         CType::Pointer(pointee, _) => return Some(*pointee),
+                        // A vector lane has the element type (GNU vector_size
+                        // and Clang ext_vector_type alike).
+                        ref v if v.is_vector() => {
+                            return v.vector_info().map(|(elem, _)| elem.clone());
+                        }
                         _ => {}
                     }
                 }

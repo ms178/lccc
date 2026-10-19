@@ -2663,19 +2663,27 @@ impl SemanticAnalyzer {
             Expr::UnaryOp(op, operand, span) => {
                 self.analyze_expr(operand);
                 if matches!(op, UnaryOp::PreInc | UnaryOp::PreDec) {
-                    self.check_ext_vector_assignable(operand, *span);
-                    self.check_ext_vector_step(operand, *op == UnaryOp::PreInc, *span);
+                    if !self.check_ext_vector_assignable(operand, *span)
+                        && !self.check_ext_vector_step(operand, *op == UnaryOp::PreInc, *span)
+                    {
+                        self.check_lvalue_operand(operand, *span);
+                    }
                 }
             }
             Expr::PostfixOp(op, operand, span) => {
                 self.analyze_expr(operand);
-                self.check_ext_vector_assignable(operand, *span);
-                self.check_ext_vector_step(operand, *op == PostfixOp::PostInc, *span);
+                if !self.check_ext_vector_assignable(operand, *span)
+                    && !self.check_ext_vector_step(operand, *op == PostfixOp::PostInc, *span)
+                {
+                    self.check_lvalue_operand(operand, *span);
+                }
             }
             Expr::Assign(lhs, rhs, span) => {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
-                self.check_ext_vector_assignable(lhs, *span);
+                if !self.check_ext_vector_assignable(lhs, *span) {
+                    self.check_lvalue_operand(lhs, *span);
+                }
                 // Check for invalid pointer <-> float conversions in assignment
                 let checker = super::type_checker::ExprTypeChecker {
                     symbols: &self.symbol_table,
@@ -2701,7 +2709,9 @@ impl SemanticAnalyzer {
             Expr::CompoundAssign(_, lhs, rhs, span) => {
                 self.analyze_expr(lhs);
                 self.analyze_expr(rhs);
-                self.check_ext_vector_assignable(lhs, *span);
+                if !self.check_ext_vector_assignable(lhs, *span) {
+                    self.check_lvalue_operand(lhs, *span);
+                }
             }
             Expr::Conditional(cond, then_expr, else_expr, span) => {
                 self.analyze_expr(cond);
@@ -2789,7 +2799,11 @@ impl SemanticAnalyzer {
             }
             Expr::AddressOf(inner, span) => {
                 self.analyze_expr(inner);
-                self.check_address_of_vector_element(inner, *span);
+                // Clang checks the value category first: `&f()[0]` is the
+                // address of an rvalue, `&v[0]` of a vector element.
+                if !self.check_address_of_rvalue(inner, *span) {
+                    self.check_address_of_vector_element(inner, *span);
+                }
             }
             Expr::Deref(inner, _) => {
                 self.analyze_expr(inner);
@@ -2948,7 +2962,10 @@ impl SemanticAnalyzer {
                     | Expr::FloatLiteralLongDouble(..)
                     | Expr::StringLiteral(..)
             );
-            (declared || matches!(ty, CType::Struct(_) | CType::Union(_))).then_some(ty)
+            // A vector's type is exact wherever it comes from (a call
+            // result, a cast, a selection): `1[f()]` is checked too.
+            (declared || ty.is_vector() || matches!(ty, CType::Struct(_) | CType::Union(_)))
+                .then_some(ty)
         };
         let (Some(base_ty), Some(index_ty)) = (trusted(base), trusted(index)) else {
             return;
@@ -2964,6 +2981,12 @@ impl SemanticAnalyzer {
         };
         let message = match (addressable(&base_ty), addressable(&index_ty)) {
             (true, _) if index_ty.is_integer() => return,
+            // `0[v]`: subscript commutativity is pointer + integer (C11
+            // 6.5.2.1p1); a vector is not a pointer, so GCC 16.2 and Clang
+            // 23.1.3 both reject the reversed form for vectors.
+            (false, true) if index_ty.is_vector() => {
+                "subscripted value is neither array nor pointer nor vector"
+            }
             (false, true) if base_ty.is_integer() => return,
             (true, _) | (false, true) => "array subscript is not an integer",
             (false, false) => "subscripted value is neither array nor pointer nor vector",
@@ -3034,25 +3057,27 @@ impl SemanticAnalyzer {
     /// The operand of `=`, a compound assignment, `++` or `--`: report an
     /// ext-vector selection with a repeated lane at the operator, with
     /// Clang 23.1.3's message.
-    fn check_ext_vector_assignable(&self, target: &Expr, op_span: Span) {
-        if self.ext_vector_selection_has_duplicate_lanes(target) {
+    fn check_ext_vector_assignable(&self, target: &Expr, op_span: Span) -> bool {
+        let duplicate = self.ext_vector_selection_has_duplicate_lanes(target);
+        if duplicate {
             self.diagnostics.borrow_mut().error(
                 "vector is not assignable (contains duplicate components)",
                 op_span,
             );
         }
+        duplicate
     }
 
     /// `++`/`--` on an ext vector, whole or a multi-lane selection: Clang
     /// 23.1.3 has no vector increment in C ("cannot increment value of type
     /// ..."), at the operator. One lane is a scalar and steps normally. A
     /// GNU `vector_size` operand keeps GCC's element-wise `v++`.
-    fn check_ext_vector_step(&self, operand: &Expr, increment: bool, op_span: Span) {
+    fn check_ext_vector_step(&self, operand: &Expr, increment: bool, op_span: Span) -> bool {
         let Some(ct @ CType::ExtVector(..)) = self.expr_checker().infer_expr_ctype(operand) else {
-            return;
+            return false;
         };
         let Some((elem, lanes)) = ct.vector_info() else {
-            return;
+            return false;
         };
         let verb = if increment { "increment" } else { "decrement" };
         let plural = if lanes == 1 { "" } else { "s" };
@@ -3062,6 +3087,161 @@ impl SemanticAnalyzer {
             ),
             op_span,
         );
+        true
+    }
+
+    /// Whether `expr` is an rvalue in C (C11 6.3.2.1p1, 6.5.2.3p3) for the
+    /// lvalue constraints of `=`, compound assignment, `++`/`--` and unary
+    /// `&`. Deliberately a DENY-list: only forms that GCC 16.2 and Clang
+    /// 23.1.3 both treat as rvalues answer `true`; anything not modelled
+    /// (identifiers, `*p`, `p->m`, compound and string literals, `_Generic`,
+    /// ...) answers `false`, so an omission here can never reject a valid
+    /// program.
+    ///
+    /// `.member`, a vector lane `v[i]` and an ext-vector selection `v.xy`
+    /// inherit their operand's category, as do `__real__`/`__imag__` and the
+    /// chosen arm of `__builtin_choose_expr`. A statement expression takes
+    /// its tail expression's category (GCC, which defines the extension) --
+    /// except under an ext-vector element: ext vectors are Clang's
+    /// extension, and Clang treats `({ v; })` as an rvalue.
+    fn is_known_rvalue(&self, expr: &Expr, under_ext_vector: bool) -> bool {
+        let is_ext_vector = |e: &Expr| {
+            self.member_base_ctype(e, false)
+                .is_some_and(|ct| matches!(ct, CType::ExtVector(..)))
+        };
+        match expr {
+            Expr::IntLiteral(..)
+            | Expr::UIntLiteral(..)
+            | Expr::LongLiteral(..)
+            | Expr::ULongLiteral(..)
+            | Expr::LongLongLiteral(..)
+            | Expr::ULongLongLiteral(..)
+            | Expr::FloatLiteral(..)
+            | Expr::FloatLiteralF32(..)
+            | Expr::FloatLiteralLongDouble(..)
+            | Expr::FloatLiteralF128(..)
+            | Expr::FloatLiteralDecimal(..)
+            | Expr::ImaginaryLiteral(..)
+            | Expr::ImaginaryLiteralF32(..)
+            | Expr::ImaginaryLiteralLongDouble(..)
+            | Expr::CharLiteral(..)
+            | Expr::BinaryOp(..)
+            | Expr::PostfixOp(..)
+            | Expr::Assign(..)
+            | Expr::CompoundAssign(..)
+            | Expr::Conditional(..)
+            | Expr::GnuConditional(..)
+            | Expr::Cast(..)
+            | Expr::Sizeof(..)
+            | Expr::VaArg(..)
+            | Expr::ConvertVector(..)
+            | Expr::Alignof(..)
+            | Expr::AlignofExpr(..)
+            | Expr::GnuAlignof(..)
+            | Expr::GnuAlignofExpr(..)
+            | Expr::Comma(..)
+            | Expr::AddressOf(..)
+            | Expr::LabelAddr(..)
+            | Expr::BuiltinTypesCompatibleP(..) => true,
+            Expr::UnaryOp(UnaryOp::RealPart | UnaryOp::ImagPart, inner, _) => {
+                self.is_known_rvalue(inner, under_ext_vector)
+            }
+            Expr::UnaryOp(..) => true,
+            Expr::FunctionCall(callee, args, _) => {
+                let choose = args.len() >= 3
+                    && matches!(&**callee, Expr::Identifier(n, _) if n == "__builtin_choose_expr");
+                if !choose {
+                    return true;
+                }
+                // The chosen arm's category (the condition is an integer
+                // constant expression); unevaluable, an rvalue only when
+                // both arms are.
+                match self.eval_const_expr_value(&args[0]) {
+                    Some(c) => {
+                        let arm = if c.is_nonzero() { &args[1] } else { &args[2] };
+                        self.is_known_rvalue(arm, under_ext_vector)
+                    }
+                    None => {
+                        self.is_known_rvalue(&args[1], under_ext_vector)
+                            && self.is_known_rvalue(&args[2], under_ext_vector)
+                    }
+                }
+            }
+            Expr::MemberAccess(obj, _, _) => {
+                let selection = self.ext_vector_selection_of(expr).is_some();
+                self.is_known_rvalue(obj, under_ext_vector || selection)
+            }
+            Expr::ArraySubscript(a, b, _) => {
+                let vector_operand = |e: &Expr| {
+                    self.expr_checker()
+                        .infer_expr_ctype(e)
+                        .is_some_and(|ct| ct.is_vector())
+                };
+                let lane_of = if vector_operand(a) {
+                    Some(&**a)
+                } else if vector_operand(b) {
+                    Some(&**b)
+                } else {
+                    None // array/pointer subscript: always an lvalue
+                };
+                lane_of
+                    .is_some_and(|v| self.is_known_rvalue(v, under_ext_vector || is_ext_vector(v)))
+            }
+            Expr::StmtExpr(compound, _) => {
+                if under_ext_vector {
+                    return true;
+                }
+                match compound.items.last() {
+                    Some(BlockItem::Statement(Stmt::Expr(Some(tail)))) => {
+                        self.is_known_rvalue(tail, false)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// The operand of `=`, a compound assignment, `++` or `--` must be a
+    /// modifiable lvalue (C11 6.5.16p2, 6.5.2.4p1, 6.5.3.1p1). Clang
+    /// 23.1.3's spellings, in its precedence (duplicate lanes and the
+    /// ext-vector step are reported by their own checks first): a cast says
+    /// "assignment to cast is illegal, lvalue casts are not supported",
+    /// every other rvalue "expression is not assignable". Without this an
+    /// assignment to `f()`, `x + 1`, `(a, b)` or `sf().m` compiled to
+    /// nothing.
+    fn check_lvalue_operand(&self, target: &Expr, op_span: Span) {
+        if !self.is_known_rvalue(target, false) {
+            return;
+        }
+        let message = if matches!(target, Expr::Cast(..)) {
+            "assignment to cast is illegal, lvalue casts are not supported"
+        } else {
+            "expression is not assignable"
+        };
+        self.diagnostics.borrow_mut().error(message, op_span);
+    }
+
+    /// `&` needs an lvalue (C11 6.5.3.2p1): Clang 23.1.3's "cannot take the
+    /// address of an rvalue of type 'T'". Returns whether it reported.
+    fn check_address_of_rvalue(&self, operand: &Expr, op_span: Span) -> bool {
+        if !self.is_known_rvalue(operand, false) {
+            return false;
+        }
+        let message = match self.expr_checker().infer_expr_ctype(operand) {
+            Some(ct) => match ct.vector_info() {
+                Some((elem, lanes)) if matches!(ct, CType::ExtVector(..)) => {
+                    let plural = if lanes == 1 { "" } else { "s" };
+                    format!(
+                        "cannot take the address of an rvalue of type '{ct}' (vector of {lanes} '{elem}' value{plural})"
+                    )
+                }
+                _ => format!("cannot take the address of an rvalue of type '{ct}'"),
+            },
+            None => "cannot take the address of an rvalue".to_string(),
+        };
+        self.diagnostics.borrow_mut().error(message, op_span);
+        true
     }
 
     /// `&v.x`, `&p->zy`, `&v[i]` on a Clang ext vector: Clang 23.1.3 says

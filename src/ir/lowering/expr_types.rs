@@ -1070,14 +1070,30 @@ impl Lowerer {
 
     /// Resolve __builtin_choose_expr(const_expr, expr1, expr2) to the selected branch.
     /// Returns a reference to args[1] if the condition is nonzero, or args[2] otherwise.
-    fn resolve_builtin_choose_expr<'a>(&self, args: &'a [Expr]) -> &'a Expr {
-        let cond = self.eval_const_expr(&args[0]);
-        let is_nonzero = match cond {
-            Some(IrConst::I64(v)) => v != 0,
-            Some(IrConst::I32(v)) => v != 0,
-            _ => true,
-        };
+    pub(super) fn resolve_builtin_choose_expr<'a>(&self, args: &'a [Expr]) -> &'a Expr {
+        // Any integer constant width selects by its value (a narrow or
+        // 128-bit constant is not "true" by default). A non-constant
+        // condition keeps the historical first-arm choice.
+        let is_nonzero = self
+            .eval_const_expr(&args[0])
+            .is_none_or(|c| c.is_nonzero());
         if is_nonzero { &args[1] } else { &args[2] }
+    }
+
+    /// The operand `__builtin_choose_expr(c, a, b)` designates, when `expr`
+    /// is one: the selected arm, which keeps its value category (GCC: the
+    /// result is an lvalue iff the chosen operand is), so stores, member
+    /// stores and `&` go through it instead of a materialized call result.
+    pub(super) fn choose_expr_selected<'a>(&self, expr: &'a Expr) -> Option<&'a Expr> {
+        match expr {
+            Expr::FunctionCall(callee, args, _)
+                if args.len() >= 3
+                    && matches!(&**callee, Expr::Identifier(n, _) if n == "__builtin_choose_expr") =>
+            {
+                Some(self.resolve_builtin_choose_expr(args))
+            }
+            _ => None,
+        }
     }
 
     // expr_is_const_qualified is defined in expr.rs as pub(super)

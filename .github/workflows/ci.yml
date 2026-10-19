@@ -645,6 +645,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_vector_scalar_conversions.sh
     - name: Subscript constraint diagnostics
       run: env CCC=target/fastbuild/lccc python3 tests/regression/check_subscript_diagnostics.py
+    - name: Sema constraints (incl. lvalue constraints)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_sema_constraints.sh
     - name: Cross-target intrinsic trap
       run: |
         env CCC=target/fastbuild/lccc \

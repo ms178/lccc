@@ -2024,10 +2024,13 @@ impl std::fmt::Display for CType {
                 write!(f, "__attribute__((vector_size({}))) {}", total_size, elem)
             }
             CType::ExtVector(elem, layout) => {
+                // Clang's canonical spelling (the element first); Clang shows
+                // a typedef name instead where one was written, which a
+                // CType does not record.
                 write!(
                     f,
-                    "__attribute__((ext_vector_type({}))) {}",
-                    layout.lanes, elem
+                    "{} __attribute__((ext_vector_type({})))",
+                    elem, layout.lanes
                 )
             }
         }

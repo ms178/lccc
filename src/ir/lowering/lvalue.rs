@@ -127,9 +127,12 @@ impl Lowerer {
                 // assignment` / `expression is not assignable`):
                 // `f()[0] = x`, `(c ? v : w)[0] = x`, `(0, v)[0] = x`,
                 // `((Vec)v)[0] = x` and the lane through a call-returned
-                // aggregate `sf().v[0] = x`. Statement expressions keep
-                // their tail's value category in both oracles, so
-                // `({ v; })[0] = x` stays assignable, and
+                // aggregate `sf().v[0] = x`. Sema reports these first, with
+                // the oracle spelling (`is_known_rvalue`); this arm is the
+                // lowering backstop. A GNU statement expression keeps its
+                // tail's value category (GCC), so `({ v; })[0] = x` writes
+                // through for a `vector_size` v (Clang, the only oracle for
+                // ext vectors, rejects it there, and so does sema), and
                 // `vecarr[i][0]`/`p[i].vec[0]` write through too. Only a
                 // mutation context diagnoses: reads of the same
                 // non-storage bases share this arm (bit-packed `_Bool`
@@ -315,6 +318,12 @@ impl Lowerer {
                 let selected = self.resolve_generic_selection(controlling, associations);
                 self.lower_lvalue(selected)
             }
+            // `__builtin_choose_expr(1, x, y) = v`: the selected arm is the
+            // object (without this the store went nowhere).
+            Expr::FunctionCall(..) => match self.choose_expr_selected(expr) {
+                Some(selected) => self.lower_lvalue(selected),
+                None => None,
+            },
             _ => None,
         }
     }
@@ -1135,6 +1144,9 @@ impl Lowerer {
     /// For pointers, this is the loaded pointer value.
     /// For nested subscripts (a[i] where a is multi-dim), compute address without loading.
     pub(super) fn get_array_base_addr(&mut self, base: &Expr) -> Operand {
+        if let Some(selected) = self.choose_expr_selected(base) {
+            return self.get_array_base_addr(selected);
+        }
         // A small vector call yields packed register bits, not an address.
         // Subscripts need object storage just like component/member access.
         // Use the shared ABI-aware materializer: sret, XMM bundles and x87

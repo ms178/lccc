@@ -660,6 +660,11 @@ impl Lowerer {
     /// For struct locals, the alloca IS the struct base.
     /// For struct globals, we emit GlobalAddr.
     pub(super) fn get_struct_base_addr(&mut self, expr: &Expr) -> Value {
+        // `__builtin_choose_expr(1, s, t).m`: the selected object, not a
+        // temporary holding a "call result" (a store through it was lost).
+        if let Some(selected) = self.choose_expr_selected(expr) {
+            return self.get_struct_base_addr(selected);
+        }
         match expr {
             Expr::ConvertVector(_, _, _) => {
                 // Lowering returns the 16-byte result alloca pointer.

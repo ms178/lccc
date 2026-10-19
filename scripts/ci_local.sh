@@ -564,6 +564,12 @@ gate "vector-scalar-conversions" fast \
 gate "subscript-diagnostics" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" python3 tests/regression/check_subscript_diagnostics.py
 
+# Sema constraints: return/assignment/call-arity rules, and the lvalue
+# constraints of `=`, `op=`, `++`/`--` and `&` (an rvalue target compiled to a
+# store that went nowhere); the valid lvalue forms must store and run.
+gate "sema-constraints" fast \
+    env CCC="$LCCC" bash tests/regression/check_sema_constraints.sh
+
 # AUD-SILENT-ZERO-1: a target that cannot execute an x86-only intrinsic must
 # trap at the first execution, not silently compute zeros (and must not trap
 # anything it CAN compute).  The host cannot execute AArch64/RISC-V, so the
