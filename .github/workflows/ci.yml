@@ -1487,6 +1487,9 @@ jobs:
         bash tests/regression/check_got64_old_spelling.sh
         bash tests/regression/check_tls_pie_preemptible.sh
         bash tests/regression/check_tls_model_selection.sh
+        bash tests/regression/check_tls_model_option.sh
+        bash tests/regression/check_f128_sign_intrinsics_strict_fp.sh
+        bash tests/regression/check_fma_builtin_strict_fp.sh
         # T5 round-cap observability (engineering/FOLLOWUP-2026-10-18-vellvm-vir-transplant.md):
         # the report must print under CCC_TIME_PASSES and nowhere else. Mirrors the
         # ci_local.sh gate; check_ci_gate_parity.py fails if the two lists drift.

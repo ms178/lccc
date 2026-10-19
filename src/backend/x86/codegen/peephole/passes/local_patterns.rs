@@ -19,8 +19,9 @@ use super::flag_peepholes::{FlagsEffect, flags_dead_after, flags_effect};
 use super::fp_liveness::FpLiveness;
 use super::helpers::{
     get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family, is_callee_saved_reg,
-    is_read_modify_write, is_valid_gp_reg, replace_reg_family, replace_reg_name_exact,
-    self_zeroing_full_write, src_mentions_family, writes_family, writes_family_full,
+    is_read_modify_write, is_valid_gp_reg, parse_reg_to_reg_movq, replace_reg_family,
+    replace_reg_name_exact, self_zeroing_full_write, src_mentions_family, writes_family,
+    writes_family_full,
 };
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
@@ -3520,12 +3521,20 @@ pub(super) fn fuse_copy_and_operation(store: &mut LineStore, infos: &mut [LineIn
                 continue;
             }
             let line_i = infos[i].trimmed(store.get(i));
-            if !line_i.starts_with("movq %") {
+            // `movq` also transfers raw bits between XMM and GP registers.
+            // Textually accepting every `%...` operand here used to turn
+            //
+            //     movq %xmm6, %r11; addq $1, %r11
+            //
+            // into the unencodable `leaq 1(%xmm6), %r11`.  Use the shared
+            // physical-GP parser instead of inferring the source class from
+            // the destination's LineKind.
+            if parse_reg_to_reg_movq(&infos[i], line_i).is_none() {
                 i += 1;
                 continue;
             }
 
-            // Parse "movq %<src>, %<dst>"
+            // Parse the now-proven GP-to-GP "movq %<src>, %<dst>".
             if let Some(comma) = line_i.find(", %") {
                 let src_reg = &line_i[6..comma]; // after "movq %"
                 let dst_reg_str = &line_i[comma + 3..]; // after ", %"
@@ -3609,6 +3618,38 @@ pub(super) fn fuse_copy_and_operation(store: &mut LineStore, infos: &mut [LineIn
         i += 1;
     }
     changed
+}
+
+#[cfg(test)]
+mod fuse_copy_and_operation_operand_class_tests {
+    use super::*;
+
+    fn run(asm: &str) -> String {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        fuse_copy_and_operation(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i))
+            .collect()
+    }
+
+    #[test]
+    fn xmm_to_gp_bit_copy_never_becomes_an_xmm_address() {
+        let out = run("    movq %xmm6, %r11\n    addq $1, %r11\n    retq\n");
+        assert!(out.contains("movq %xmm6, %r11"), "{out}");
+        assert!(out.contains("addq $1, %r11"), "{out}");
+        assert!(!out.contains("(%xmm6)"), "{out}");
+    }
+
+    #[test]
+    fn gp_copy_still_folds_when_the_add_flags_are_dead() {
+        let out = run("    movq %r10, %r11\n    addq $1, %r11\n    testq %rax, %rax\n    retq\n");
+        assert!(!out.contains("movq %r10, %r11"), "{out}");
+        assert!(out.contains("leaq 1(%r10), %r11"), "{out}");
+    }
 }
 
 /// Returns true if %rax is live (potentially read) at instruction index `at`.

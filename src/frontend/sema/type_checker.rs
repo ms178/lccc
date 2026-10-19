@@ -142,11 +142,24 @@ impl<'a> ExprTypeChecker<'a> {
                 if crate::frontend::parser::ast::is_function_name_builtin(name) {
                     return Some(CType::Pointer(Box::new(CType::Char), AddressSpace::Default));
                 }
-                if let Some(constant) = self.types.enum_constants.get(name) {
-                    return Some(constant.ty.clone());
-                }
-                if let Some(sym) = self.symbols.lookup(name) {
-                    return Some(sym.ty.clone());
+                // Objects/functions and enumerators share C's ordinary-name
+                // namespace.  They live in separate compiler maps, so resolve
+                // by lexical depth; map order is not a shadowing rule.
+                let symbol = self.symbols.lookup_with_depth(name);
+                let enumerator = self.types.enum_constant_with_depth(name);
+                match (symbol, enumerator) {
+                    (Some((sym, sym_depth)), Some((constant, enum_depth))) => {
+                        return Some(if sym_depth > enum_depth {
+                            sym.ty.clone()
+                        } else {
+                            // Enumerators are also entered in the symbol table,
+                            // so equal depths denote that enumerator.
+                            constant.ty.clone()
+                        });
+                    }
+                    (Some((sym, _)), None) => return Some(sym.ty.clone()),
+                    (None, Some((constant, _))) => return Some(constant.ty.clone()),
+                    (None, None) => {}
                 }
                 // Check function signatures for implicitly declared functions
                 if let Some(func_info) = self.functions.get(name) {

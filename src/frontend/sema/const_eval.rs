@@ -318,18 +318,23 @@ impl<'a> SemaConstEval<'a> {
 
             // Identifier: enum constants
             Expr::Identifier(name, _) => {
-                // A folded const object's value: the innermost declaration
-                // decides, so a shadowing object or enumerator is not used.
-                if let Some(val) = self.symbols.folded_value(name) {
-                    return Some(match val {
-                        FoldedValue::Int(v) => IrConst::I64(v),
-                        FoldedValue::Float(v) => IrConst::F64(v),
-                    });
+                // Objects and enumerators share the ordinary-identifier
+                // namespace.  Pick the lexically nearer declaration before
+                // considering its value; otherwise a file-scope enumerator can
+                // turn a shadowing automatic object into a constant.
+                let symbol = self.symbols.lookup_with_depth(name);
+                let enumerator = self.types.enum_constant_with_depth(name);
+                if let Some((_, symbol_depth)) = symbol {
+                    // Equal depths are the enumerator's companion symbol-table
+                    // entry; only a strictly nearer symbol shadows it.
+                    if enumerator.is_none_or(|(_, enum_depth)| symbol_depth > enum_depth) {
+                        return self.symbols.folded_value(name).map(|val| match val {
+                            FoldedValue::Int(v) => IrConst::I64(v),
+                            FoldedValue::Float(v) => IrConst::F64(v),
+                        });
+                    }
                 }
-                if let Some(constant) = self.types.enum_constants.get(name) {
-                    return Some(IrConst::I64(constant.value));
-                }
-                None
+                enumerator.map(|(constant, _)| IrConst::I64(constant.value))
             }
 
             // sizeof

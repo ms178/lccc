@@ -784,6 +784,16 @@ impl Lowerer {
         if matches!(expr, Expr::UnaryOp(UnaryOp::LogicalNot, _, _)) {
             return IrType::I32;
         }
+        // Pointer-valued expressions always materialise a full target pointer.
+        // Prefer the semantic CType before the storage-oriented fallback:
+        // member expressions in very large TUs can have a conservative I32
+        // layout fallback even while lower_expr emits `Load ty: Ptr`.
+        if self
+            .get_expr_ctype(expr)
+            .is_some_and(|ctype| matches!(ctype, CType::Pointer(..) | CType::Array(..)))
+        {
+            return IrType::Ptr;
+        }
         if let Expr::BinaryOp(op, lhs, rhs, _) = expr {
             if !op.is_comparison() && !matches!(op, BinOp::LogicalAnd | BinOp::LogicalOr) {
                 // C23 decimal FP: decimal operands carry the result in the
@@ -1065,6 +1075,17 @@ impl Lowerer {
     pub(super) fn get_expr_type(&self, expr: &Expr) -> IrType {
         use crate::common::types::target_is_32bit;
         let is_32bit = target_is_32bit();
+        // CType is authoritative for pointer width. The case-by-case IR
+        // fallback below is intentionally best-effort and may return I32 for
+        // an unresolved member/subscript in a very large translation unit;
+        // allowing that fallback to type pointer-valued phis/copies narrows
+        // their spill stores and leaves stale upper pointer bits.
+        if self
+            .get_expr_ctype(expr)
+            .is_some_and(|ctype| matches!(ctype, CType::Pointer(..) | CType::Array(..)))
+        {
+            return IrType::Ptr;
+        }
         match expr {
             Expr::IntLiteral(val, _) => {
                 // Storage-level type query: LP64 reports I64 (ILP32: I32 when

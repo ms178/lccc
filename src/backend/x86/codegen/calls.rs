@@ -1672,7 +1672,19 @@ impl X86Codegen {
                 self.state.out.emit_instr_rbp_reg("    movdqu", slot.0, xmm);
                 return;
             }
-            Operand::Const(IrConst::Zero) => {
+            Operand::Const(
+                IrConst::Zero
+                | IrConst::I8(0)
+                | IrConst::I16(0)
+                | IrConst::I32(0)
+                | IrConst::I64(0)
+                | IrConst::I128(0),
+            ) => {
+                // Integer zero is the canonical IR representation produced by
+                // implicit conversion in calls such as hypotf128(real, 0).
+                // Its binary128 representation is all-zero bits just like the
+                // dedicated Zero variant.  Do not use IrConst::is_zero here:
+                // -0.0 must retain its sign bit.
                 self.state.emit_fmt(format_args!("    pxor %{xmm}, %{xmm}"));
                 return;
             }

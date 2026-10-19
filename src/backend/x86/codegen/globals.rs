@@ -148,7 +148,8 @@ impl X86Codegen {
         // (lccc -fPIC -shared on any `static __thread` failed to link at all
         // before this; GCC links the same source). Initial-Exec through the
         // GOT is valid there, so `-shared` routes local TLS symbols to it.
-        if (self.state.pic_mode && !self.state.local_symbols.contains(name))
+        if self.state.tls_initial_exec
+            || (self.state.pic_mode && !self.state.local_symbols.contains(name))
             || self.state.shared_lib
         {
             self.state
@@ -180,7 +181,8 @@ impl X86Codegen {
     /// only for external TLS symbols in PIC mode.
     pub(super) fn emit_global_addr_into_reg(&mut self, name: &str, reg: &str) {
         if self.state.tls_symbols.contains(name) {
-            if (self.state.pic_mode && !self.state.local_symbols.contains(name))
+            if self.state.tls_initial_exec
+                || (self.state.pic_mode && !self.state.local_symbols.contains(name))
                 || self.state.shared_lib
             {
                 self.state

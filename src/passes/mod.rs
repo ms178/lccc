@@ -1675,6 +1675,13 @@ pub(crate) fn run_passes(
         ra_config,
     );
     preloop_dump!("inline_phase");
+    // The regular simplify loop folds math libcalls at -O2+, but strict
+    // -frounding-math/-ftrapping-math functions bypass that transform.  The
+    // dedicated fold knows which sign-bit-only operations remain legal under
+    // a strict FP environment and is also the lowering authority for compiler
+    // runtime helpers such as __fabstf2 that LCCC deliberately does not link.
+    simplify::fold_math_intrinsic_calls(module);
+    preloop_dump!("math_intrinsic_fold");
     if !pass_disabled(&disabled, "fortifyfold") {
         fortify_fold::run(module, target.is_32bit());
         preloop_dump!("fortify_fold");
