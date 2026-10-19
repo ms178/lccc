@@ -592,6 +592,16 @@ pub struct Parser {
     /// (e.g., `MY_SIZE = sizeof(some_typedef)`). These are still valid constants,
     /// just not evaluable by our constant-expression evaluator.
     pub(super) unevaluable_enum_constants: FxHashSet<String>,
+    /// Undo log for the two enumeration-constant tables: each entry is a name
+    /// a block changed -- an enumerator it declared, or one an object, typedef
+    /// or parameter of that name hides -- with its prior state (value, whether
+    /// unevaluable). Leaving the block restores them, so a block-scope enum
+    /// does not leak out (`void f(void) { enum { X = 1 }; }
+    /// _Static_assert(X, "");` is an undeclared `X`, GCC 16.2) and a hidden
+    /// enumerator is no constant inside (`int A; _Static_assert(A, "");`).
+    pub(super) enum_scope_log: Vec<(String, Option<i64>, bool)>,
+    /// Compound-statement nesting: zero at file scope, where nothing is undone.
+    pub(super) block_depth: u32,
     /// `_Static_assert`s from struct member lists awaiting sema, emitted after
     /// the enclosing file-scope or block item (the members are not in scope
     /// as identifiers, so the assertion means the same there).
@@ -605,6 +615,37 @@ pub struct Parser {
 }
 
 impl Parser {
+    /// Remove `name` from the enumeration-constant tables until the current
+    /// scope ends (see `enum_scope_log`), recording its prior state.
+    pub(super) fn hide_enum_constant(&mut self, name: &str) {
+        let value = self.enum_constants.remove(name);
+        let unevaluable = self.unevaluable_enum_constants.remove(name);
+        self.enum_scope_log
+            .push((name.to_string(), value, unevaluable));
+    }
+
+    /// Undo every enumeration-constant change logged since `mark`.
+    pub(super) fn restore_enum_scope(&mut self, mark: usize) {
+        while self.enum_scope_log.len() > mark {
+            let Some((name, value, unevaluable)) = self.enum_scope_log.pop() else {
+                break;
+            };
+            self.enum_constants.remove(&name);
+            self.unevaluable_enum_constants.remove(&name);
+            if let Some(v) = value {
+                self.enum_constants.insert(name.clone(), v);
+            }
+            if unevaluable {
+                self.unevaluable_enum_constants.insert(name);
+            }
+        }
+    }
+
+    /// Whether `name` is currently an enumeration constant to the parser.
+    pub(super) fn is_parser_enum_constant(&self, name: &str) -> bool {
+        self.enum_constants.contains_key(name) || self.unevaluable_enum_constants.contains(name)
+    }
+
     pub fn new(tokens: Vec<Token>) -> Self {
         Self {
             tokens,
@@ -627,6 +668,8 @@ impl Parser {
             diagnostics: DiagnosticEngine::new(),
             enum_constants: FxHashMap::default(),
             unevaluable_enum_constants: FxHashSet::default(),
+            enum_scope_log: Vec::new(),
+            block_depth: 0,
             deferred_static_asserts: Vec::new(),
             struct_tag_alignments: FxHashMap::default(),
         }
@@ -860,6 +903,7 @@ impl Parser {
         [
             // <stddef.h>
             "size_t",
+            crate::common::types::OFFSETOF_SIZE_TYPEDEF,
             "ssize_t",
             "ptrdiff_t",
             "wchar_t",

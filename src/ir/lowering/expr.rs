@@ -337,7 +337,10 @@ impl Lowerer {
             Expr::StringLiteral(s, _) => self.lower_string_literal(s, false),
             Expr::WideStringLiteral(s, _) => self.lower_string_literal(s, true),
             Expr::Char16StringLiteral(s, _) => self.lower_char16_string_literal(s),
-            Expr::Identifier(name, _) => self.lower_identifier(name),
+            Expr::Identifier(name, _) => match self.identifier_enumerator(expr, name) {
+                Some((value, _)) => Operand::Const(IrConst::I64(value)),
+                None => self.lower_identifier(name),
+            },
             Expr::BinaryOp(op, lhs, rhs, _) => self.lower_binary_op(op, lhs, rhs),
             Expr::UnaryOp(op, inner, _) => self.lower_unary_op(*op, inner),
             Expr::PostfixOp(op, inner, _) => self.lower_post_inc_dec(inner, *op),
@@ -535,8 +538,12 @@ impl Lowerer {
 
     fn lower_identifier(&mut self, name: &str) -> Operand {
         if crate::frontend::parser::ast::is_function_name_builtin(name) {
-            let name = self.func().name.clone();
-            return self.lower_string_literal(&name, false);
+            let text = crate::frontend::parser::ast::function_name_builtin_text(
+                name,
+                self.func_state.as_ref().map(|fs| fs.source_name()),
+            )
+            .to_string();
+            return self.lower_string_literal(&text, false);
         }
         if name == "NULL" {
             return Operand::Const(IrConst::I64(0));
@@ -614,10 +621,7 @@ impl Lowerer {
             return Operand::Value(dest);
         }
 
-        if let Some(constant) = self.types.enum_constants.get(name) {
-            return Operand::Const(IrConst::I64(constant.value));
-        }
-
+        // Enumerators were resolved by the caller (`identifier_enumerator`).
         if let Some(mangled) = self.func_mut().static_local_names.get(name).cloned() {
             if let Some(ginfo) = self.globals.get(&mangled).cloned() {
                 return self.load_global_var(mangled, &ginfo);

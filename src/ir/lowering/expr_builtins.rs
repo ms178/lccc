@@ -209,32 +209,12 @@ impl Lowerer {
             }
         }
 
-        // Handle __builtin_choose_expr(const_expr, expr1, expr2)
-        // This is a compile-time selection: if const_expr is nonzero, returns expr1, else expr2.
+        // __builtin_choose_expr(c, a, b) is `a` or `b` itself, chosen at
+        // compile time (`resolve_builtin_choose_expr`).
         if name == "__builtin_choose_expr" {
             if args.len() >= 3 {
-                let condition = self.eval_const_expr(&args[0]);
-                let is_nonzero = match condition {
-                    Some(IrConst::I64(v)) => v != 0,
-                    Some(IrConst::I32(v)) => v != 0,
-                    Some(IrConst::I128(v)) => v != 0,
-                    Some(IrConst::F64(v)) => v != 0.0,
-                    Some(IrConst::F32(v)) => v != 0.0,
-                    _ => {
-                        // Try lowering to get a constant
-                        let cond_val = self.lower_expr(&args[0]);
-                        match cond_val {
-                            Operand::Const(IrConst::I64(v)) => v != 0,
-                            Operand::Const(IrConst::I32(v)) => v != 0,
-                            _ => true, // default to first expr if indeterminate
-                        }
-                    }
-                };
-                return Some(if is_nonzero {
-                    self.lower_expr(&args[1])
-                } else {
-                    self.lower_expr(&args[2])
-                });
+                let chosen = self.resolve_builtin_choose_expr(args);
+                return Some(self.lower_expr(chosen));
             }
             return Some(Operand::Const(IrConst::I64(0)));
         }
@@ -981,27 +961,9 @@ impl Lowerer {
                 Some(Operand::Const(IrConst::I64(result)))
             }
             // __builtin_classify_type(expr) -> GCC type class integer
-            BuiltinIntrinsic::ClassifyType => {
-                let result = if let Some(arg) = args.first() {
-                    // Special case: bare function identifiers decay to pointer
-                    // type (class 5). expr_ctype may return CType::Int as
-                    // fallback since functions aren't stored as variables.
-                    if let Expr::Identifier(fname, _) = arg {
-                        if self.known_functions.contains(fname.as_str()) {
-                            5i64 // pointer_type_class (function decays to pointer)
-                        } else {
-                            let ctype = self.expr_ctype(arg);
-                            classify_ctype(&ctype)
-                        }
-                    } else {
-                        let ctype = self.expr_ctype(arg);
-                        classify_ctype(&ctype)
-                    }
-                } else {
-                    0i64 // no_type_class
-                };
-                Some(Operand::Const(IrConst::I64(result)))
-            }
+            BuiltinIntrinsic::ClassifyType => Some(Operand::Const(IrConst::I64(
+                self.classify_type_of(args.first()),
+            ))),
             // Nop intrinsic - just evaluate args for side effects and return 0
             BuiltinIntrinsic::Nop => {
                 for arg in args {
@@ -3537,52 +3499,6 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
             "x86_intrinsic_op called with non-X86 intrinsic: {:?}",
             intrinsic
         ),
-    }
-}
-
-/// Classify a CType according to GCC's __builtin_classify_type conventions.
-/// Returns the GCC type class integer:
-///   0 = no_type_class (void)
-///   1 = integer_type_class
-///   2 = char_type_class
-///   3 = enumeral_type_class
-///   4 = boolean_type_class
-///   5 = pointer_type_class
-///   6 = reference_type_class (C++ only, not used in C)
-///   8 = real_type_class
-///   9 = complex_type_class
-///  12 = record_type_class (struct)
-///  13 = union_type_class
-///  14 = array_type_class
-///  16 = lang_type_class
-fn classify_ctype(ty: &CType) -> i64 {
-    // GCC __builtin_classify_type returns integer type classes.
-    // GCC treats char, _Bool, and enum as integer_type_class (1) in practice.
-    match ty {
-        CType::Void => 0, // no_type_class
-        CType::Bool
-        | CType::Char
-        | CType::UChar
-        | CType::Short
-        | CType::UShort
-        | CType::Int
-        | CType::UInt
-        | CType::Long
-        | CType::ULong
-        | CType::LongLong
-        | CType::ULongLong
-        | CType::Int128
-        | CType::UInt128
-        | CType::Enum(_) => 1, // integer_type_class
-        CType::Float | CType::Double | CType::LongDouble | CType::Float128 => 8, // real_type_class
-        CType::Decimal32 | CType::Decimal64 | CType::Decimal128 => 8, // real_type_class (decimal FP)
-        CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => 9, // complex_type_class
-        CType::Pointer(_, _) => 5, // pointer_type_class
-        CType::Array(_, _) => 5,   // GCC decays arrays to pointers
-        CType::Function(_) => 5,   // function decays to pointer
-        CType::Struct(_) => 12,    // record_type_class
-        CType::Union(_) => 13,     // union_type_class
-        CType::Vector(_, _) | CType::ExtVector(_, _) => 14, // array_type_class (GCC classifies vectors here)
     }
 }
 

@@ -1320,10 +1320,21 @@ impl Lowerer {
             // stale/zero high bits and can walk far past the object (SQLite's
             // yy_reduce shape: stack pointer += signed-char table entry + 1).
             let actual_rhs = if ty == IrType::Ptr && matches!(op, BinOp::Add | BinOp::Sub) {
-                let elem_size = self.get_pointer_elem_size_from_expr(lhs);
                 let ptr_int_ty = crate::common::types::target_int_ir_type();
                 let rhs_wide = self.emit_implicit_cast(rhs_val, rhs_ir_ty, ptr_int_ty);
-                self.scale_index(rhs_wide, elem_size)
+                // A pointer to a VLA scales by its runtime pointee size.
+                match self.get_vla_stride_for_subscript(lhs) {
+                    Some(stride) => Operand::Value(self.emit_binop_val(
+                        IrBinOp::Mul,
+                        rhs_wide,
+                        Operand::Value(stride),
+                        ptr_int_ty,
+                    )),
+                    None => {
+                        let elem_size = self.get_pointer_elem_size_from_expr(lhs);
+                        self.scale_index(rhs_wide, elem_size)
+                    }
+                }
             } else {
                 rhs_val
             };

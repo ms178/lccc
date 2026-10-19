@@ -1503,6 +1503,9 @@ impl Parser {
             } else {
                 next_value
             };
+            if self.block_depth > 0 {
+                self.hide_enum_constant(&variant.name);
+            }
             if let Some(val) = evaluated {
                 self.enum_constants.insert(variant.name.clone(), val);
                 next_value = Some(val + 1);

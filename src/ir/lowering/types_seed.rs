@@ -43,6 +43,10 @@ impl Lowerer {
         let builtins: &[(&str, CType)] = &[
             // <stddef.h>
             ("size_t", size_type.clone()),
+            (
+                crate::common::types::OFFSETOF_SIZE_TYPEDEF,
+                size_type.clone(),
+            ),
             ("ssize_t", ssize_type.clone()),
             ("ptrdiff_t", ptrdiff_type),
             ("wchar_t", crate::common::types::wchar_ctype()),

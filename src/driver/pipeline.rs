@@ -1111,6 +1111,7 @@ impl Driver {
             // Semantic analysis.
             let mut sema = SemanticAnalyzer::new();
             sema.set_builtin_policy(self.builtin_policy.clone());
+            sema.set_pre_c99_dialect(self.pre_c99_dialect());
             sema.set_diagnostics(diagnostics);
             if let Err(error_count) = sema.analyze(&ast) {
                 return Err(format!("{} error(s) during semantic analysis", error_count));
@@ -1941,6 +1942,7 @@ impl Driver {
         let t3 = std::time::Instant::now();
         let mut sema = SemanticAnalyzer::new();
         sema.set_builtin_policy(self.builtin_policy.clone());
+        sema.set_pre_c99_dialect(self.pre_c99_dialect());
         sema.set_diagnostics(diagnostics);
         if let Err(error_count) = sema.analyze(&ast) {
             // Errors already emitted through diagnostic engine with source spans
@@ -2013,7 +2015,8 @@ impl Driver {
             self.wrap_signed_overflow,
             fp_environment_observable,
         ))
-        .with_builtin_policy(self.builtin_policy.clone());
+        .with_builtin_policy(self.builtin_policy.clone())
+        .with_enumerator_refs(sema_result.enumerator_refs);
         let (mut module, mut diagnostics) = lowerer.lower(&ast);
         // IR lowering is a user-facing phase: it rejects ill-typed builtins,
         // target-specific intrinsics and unsupported constructs, and every one
@@ -3452,6 +3455,14 @@ fn first_arm_simd_reference(asm: &str) -> Option<(String, String)> {
     None
 }
 
+impl Driver {
+    /// Whether `-std=` selected a dialect before C99 (C90, or C94 =
+    /// `iso9899:199409`): GCC's `flag_isoc99` is clear there, and sema
+    /// follows it where the dialects differ.
+    pub(crate) fn pre_c99_dialect(&self) -> bool {
+        matches!(self.stdc_version, Some(None) | Some(Some("199409L")))
+    }
+}
 #[cfg(test)]
 mod arm_simd_reference_tests {
     use super::first_arm_simd_reference;

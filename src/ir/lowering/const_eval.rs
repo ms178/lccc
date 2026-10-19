@@ -64,6 +64,18 @@ impl Lowerer {
     /// that sema could evaluate). Falls back to the lowerer's own evaluation
     /// for expressions that require lowering-specific state (global addresses,
     /// const local values, etc.).
+    /// Evaluate an expression the language requires to be constant now --
+    /// the condition of `__builtin_choose_expr` -- in GCC's
+    /// `folding_initializer` mode, exactly as sema decided it
+    /// (`SemaConstEval::eval_required_constant`): `__builtin_constant_p`
+    /// answers 0 unless proven.
+    pub(super) fn eval_required_constant(&self, expr: &Expr) -> Option<IrConst> {
+        let outer = self.folding_initializer.replace(true);
+        let value = self.eval_const_expr(expr);
+        self.folding_initializer.set(outer);
+        value
+    }
+
     pub(super) fn eval_const_expr(&self, expr: &Expr) -> Option<IrConst> {
         // Fast path: consult sema's pre-computed constant values.
         // This avoids re-evaluating expressions that sema already handled.
@@ -96,7 +108,7 @@ impl Lowerer {
         // "initializer element is not constant" diagnostic while `cc * 2`
         // folded through the parent expression's map entry.
         if let Expr::Identifier(name, _) = expr {
-            if let Some(val) = self.eval_const_identifier(name) {
+            if let Some(val) = self.eval_const_identifier(expr, name) {
                 return Some(val);
             }
             return self.lookup_sema_const(expr);
@@ -141,6 +153,26 @@ impl Lowerer {
                 }
             },
             Expr::UnaryOp(UnaryOp::Plus, inner, _) => self.eval_const_expr(inner),
+            // Of a real operand, `__real__` is the value and `__imag__` a zero
+            // of its type (GCC 16.2 folds both; complex constants are not
+            // modelled here).
+            Expr::UnaryOp(op @ (UnaryOp::RealPart | UnaryOp::ImagPart), inner, _) => {
+                let val = self.eval_const_expr(inner)?;
+                if *op == UnaryOp::RealPart {
+                    return Some(val);
+                }
+                Some(match val {
+                    IrConst::F32(_) => IrConst::F32(0.0),
+                    IrConst::F64(_) => IrConst::F64(0.0),
+                    IrConst::I8(_) => IrConst::I8(0),
+                    IrConst::I16(_) => IrConst::I16(0),
+                    IrConst::I32(_) => IrConst::I32(0),
+                    IrConst::I64(_) => IrConst::I64(0),
+                    IrConst::I128(_) => IrConst::I128(0),
+                    IrConst::Zero => IrConst::Zero,
+                    IrConst::LongDouble(..) | IrConst::D32(_) | IrConst::D64(_) => return None,
+                })
+            }
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
                 // _Float128 constants are carried as I128 bit patterns
@@ -306,7 +338,7 @@ impl Lowerer {
                 Some(result)
             }
             Expr::Cast(target_type, inner, _, _) => self.eval_const_cast(target_type, inner),
-            Expr::Identifier(name, _) => self.eval_const_identifier(name),
+            Expr::Identifier(name, _) => self.eval_const_identifier(expr, name),
             Expr::Sizeof(arg, _) => {
                 // VLA sizeof is a runtime value (C99 6.7.6.2 / 6.5.3.4): the
                 // size is captured at the point of the declaration, not a
@@ -379,6 +411,12 @@ impl Lowerer {
             // Handle compile-time builtin function calls in constant expressions.
             Expr::FunctionCall(func, args, _) => {
                 if let Expr::Identifier(name, _) = func.as_ref() {
+                    if name == "__builtin_choose_expr" && args.len() >= 3 {
+                        return self.eval_const_expr(self.resolve_builtin_choose_expr(args));
+                    }
+                    if name == "__builtin_classify_type" {
+                        return Some(IrConst::I64(self.classify_type_of(args.first())));
+                    }
                     let folded = shared_const_eval::eval_builtin_call_with_mode(
                         name.as_str(),
                         args,
@@ -740,15 +778,9 @@ impl Lowerer {
         }
     }
 
-    fn eval_const_identifier(&self, name: &str) -> Option<IrConst> {
-        let is_local = self
-            .func_state
-            .as_ref()
-            .is_some_and(|fs| fs.locals.contains_key(name));
-        if !is_local {
-            if let Some(constant) = self.types.enum_constants.get(name) {
-                return Some(IrConst::I64(constant.value));
-            }
+    fn eval_const_identifier(&self, expr: &Expr, name: &str) -> Option<IrConst> {
+        if let Some((value, _)) = self.identifier_enumerator(expr, name) {
+            return Some(IrConst::I64(value));
         }
         if let Some(ref fs) = self.func_state {
             if let Some(&val) = fs.const_local_values.get(name) {
@@ -1392,26 +1424,17 @@ impl Lowerer {
     }
 
     fn expr_sizeof_is_vla(&self, expr: &Expr) -> bool {
-        if let Expr::Identifier(name, _) = expr {
-            if let Some(fs) = self.func_state.as_ref() {
-                if fs.vla_typedef_sizes.contains_key(name) {
-                    return true;
-                }
-                if fs
-                    .locals
-                    .get(name)
-                    .is_some_and(|info| info.vla_size.is_some())
-                {
-                    return true;
-                }
-            }
-        }
-        false
+        self.expr_is_variably_modified(expr)
     }
 
     /// Recursively detect a variably-modified type (VLA array dimension, or
     /// a struct/union containing one, or a typedef of either).
     fn type_spec_is_vla(&self, ts: &TypeSpecifier) -> bool {
+        if let Some(operand) = Self::typeof_operand(ts) {
+            if self.expr_is_variably_modified(operand) {
+                return true;
+            }
+        }
         if let Some(fs) = self.func_state.as_ref() {
             match ts {
                 TypeSpecifier::TypedefName(name) => {

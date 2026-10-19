@@ -1970,6 +1970,11 @@ impl Lowerer {
     fn inc_dec_step_and_type(&self, ty: IrType, expr: &Expr) -> (Operand, IrType) {
         if ty == IrType::Ptr {
             let ptr_int_ty = crate::common::types::target_int_ir_type();
+            // A pointer to a VLA steps by its runtime pointee size, as in
+            // `p + 1` (try_lower_pointer_arithmetic).
+            if let Some(stride) = self.get_vla_stride_for_subscript(expr) {
+                return (Operand::Value(stride), ptr_int_ty);
+            }
             let elem_size = self.get_pointer_elem_size_from_expr(expr);
             (
                 Operand::Const(IrConst::ptr_int(elem_size as i64)),

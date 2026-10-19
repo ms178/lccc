@@ -343,10 +343,15 @@ impl Parser {
         // prototypes (sema applies it to CType::Function's return type).
         apply_decl_address_space_to_spec(&mut return_type, self.attrs.decl_address_space);
 
-        // Shadow typedef names used as parameter names
+        // Shadow typedef names used as parameter names, and hide enumerators
+        // of the same name until the body ends.
+        let enum_mark = self.enum_scope_log.len();
         let mut shadowed_added: Vec<String> = Vec::new();
         for param in &final_params {
             if let Some(ref pname) = param.name {
+                if self.is_parser_enum_constant(pname) {
+                    self.hide_enum_constant(pname);
+                }
                 if self.typedefs.contains(pname) && !self.shadowed_typedefs.contains(pname) {
                     self.shadowed_typedefs.insert(pname.clone());
                     shadowed_added.push(pname.clone());
@@ -369,6 +374,7 @@ impl Parser {
         for n in shadowed_added {
             self.shadowed_typedefs.remove(&n);
         }
+        self.restore_enum_scope(enum_mark);
 
         Some(ExternalDecl::FunctionDef(FunctionDef {
             alignment,
@@ -1027,6 +1033,15 @@ impl Parser {
         } else {
             type_spec
         };
+
+        // A block-scope declaration hides an enumerator of the same name.
+        if self.block_depth > 0 {
+            for decl in &declarators {
+                if self.is_parser_enum_constant(&decl.name) {
+                    self.hide_enum_constant(&decl.name);
+                }
+            }
+        }
 
         // Register typedef names or shadow them for variable declarations
         let is_typedef = self.attrs.parsing_typedef();

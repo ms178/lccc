@@ -58,3 +58,63 @@ int main(void){
 }
 C
 for o in -O0 -O2; do "$CCC" $o "$t/lv_good.c" -o "$t/lv_g"; "$t/lv_g"; done
+
+# `__builtin_choose_expr` takes an integer constant expression (C11 6.6p6,
+# `ice.rs`): an object -- a `const` one, a local hiding an enumerator --
+# comma, a string subscript, an address, an unevaluated non-constant arm,
+# a float outside an integer cast, an undefined value, a VLA `sizeof` or a
+# non-folding builtin is not one. Every form measured with gcc-16 -std=gnu17
+# (15 errors); lccc used to fold several of them and pick an arm.
+cat >"$t/ch_bad.c" <<'C'
+struct P { int a, b; }; enum { E1 = 1, E_shadow = 2 }; int gk; const char *s;
+int b1(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr(k, 1, 2); }
+int b2(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr(x - x, 1, 2); }
+int b3(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr((1, 1), 1, 2); }
+int b4(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr("ab"[0], 1, 2); }
+int b5(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr((void *)0 == 0, 1, 2); }
+int b6(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr(&gk != 0, 1, 2); }
+int b7(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr(1 ? 2 : x, 1, 2); }
+int b8(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr(0 && x, 1, 2); }
+int b9(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr(1.5, 1, 2); }
+int b10(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr((int)1e100, 1, 2); }
+int b11(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr(1 / 0, 1, 2); }
+int b12(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr(1 << 40, 1, 2); }
+int b13(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr(sizeof(int[x]), 1, 2); }
+int b14(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr(__builtin_strlen(s), 1, 2); }
+int b15(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr(E_shadow, 1, 2); }
+C
+! "$CCC" -std=gnu17 -fsyntax-only "$t/ch_bad.c" 2>"$t/ch_e"
+[ "$(grep -c "first argument to '__builtin_choose_expr' not a constant" "$t/ch_e")" = 15 ]
+# The accepted forms select GCC's arm. `__builtin_constant_p` of a parameter
+# is 0 there (the kernel idiom; lccc took the constant arm once inlined),
+# `__builtin_offsetof` is a constant while the spelled-out `&((T *)0)->m`
+# cast is not, and C90 still admits an overflowing signed shift.
+cat >"$t/ch_good.c" <<'C'
+#include <stddef.h>
+struct P { int a, b; }; enum { E1 = 1 };
+__attribute__((noinline)) int kern(int x) { return __builtin_choose_expr(__builtin_constant_p(x), 100, x); }
+int main(void) {
+  int x = 3, r = 0;
+  r += __builtin_choose_expr(E1, 1, 2) + __builtin_choose_expr(sizeof(long) == 8, 10, 20);
+  r += __builtin_choose_expr(__builtin_types_compatible_p(int, long), 1000, 100);
+  r += __builtin_choose_expr(_Generic(x, int: 1, default: 0), 1, 2) + __builtin_choose_expr((int)1.5, 1, 2);
+  r += __builtin_choose_expr(__builtin_popcount(7) == 3 && __builtin_strlen("ab") == 2, 1, 2);
+  r += __builtin_choose_expr(1 ? 2 : 3, 1, 2) + __builtin_choose_expr(0 && 1 / 0, 2, 1);
+  r += __builtin_choose_expr(offsetof(struct P, b) == 4, 1, 2) + __builtin_choose_expr(__builtin_LINE() > 0, 1, 2);
+  return r == (sizeof(long) == 8 ? 10 : 20) + 108 && kern(5) == 5 ? 0 : 1;
+}
+C
+for o in -O0 -O2; do "$CCC" $o "$t/ch_good.c" -o "$t/ch_g"; "$t/ch_g"; done
+printf 'int f(void) { return __builtin_choose_expr(1 << 31, 1, 2); }\n' >"$t/ch89.c"
+"$CCC" -std=gnu89 -fsyntax-only "$t/ch89.c"
+! "$CCC" -std=gnu17 -fsyntax-only "$t/ch89.c" 2>/dev/null
+printf 'struct P { int a, b; };\nint f(void) { return __builtin_choose_expr((long)&((struct P *)0)->b, 1, 2); }\n' >"$t/ch_off.c"
+! "$CCC" -fsyntax-only "$t/ch_off.c" 2>/dev/null
+# Enumerator scope in the parser's `_Static_assert` evaluator: an object
+# hides an enumerator, a block-scope enumerator ends with its block.
+printf 'enum { A = 1 };\nint h(void) { int A = 5; _Static_assert(A, "x"); return A; }\n' >"$t/en_shadow.c"
+printf 'void f(void) { enum { X = 1 }; }\n_Static_assert(X, "leak");\n' >"$t/en_leak.c"
+for f in en_shadow en_leak; do
+  ! "$CCC" -fsyntax-only "$t/$f.c" 2>"$t/$f.e"
+  grep -q "expression in static assertion is not an integer constant expression" "$t/$f.e"
+done

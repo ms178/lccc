@@ -708,6 +708,42 @@ impl MacroTable {
             return i;
         }
 
+        // GCC's source-location builtins, `__builtin_LINE()`,
+        // `__builtin_FILE()` and `__builtin_FUNCTION()`: the line (pinned to
+        // the invocation inside a macro, like `__LINE__`), the presumed file
+        // name (`#line` applies, like `__FILE__`) and the enclosing
+        // function's name (`""` at file scope), as an `int` constant and two
+        // `const char *` (GCC 16.2: `static int a[__builtin_LINE()];` is
+        // valid, `sizeof __builtin_FILE()` is a pointer's size).
+        if matches!(
+            ident,
+            "__builtin_LINE" | "__builtin_FILE" | "__builtin_FUNCTION"
+        ) && !self.macros.contains_key(ident)
+        {
+            if let Some(after) = empty_call_parens(bytes, i) {
+                match ident {
+                    "__builtin_LINE" => {
+                        let val = match self.line_pinned.get() {
+                            Some(v) => v,
+                            None => self.resolve_line(start),
+                        };
+                        let mut buf = itoa::Buffer::new();
+                        result.push_str(buf.format(val));
+                    }
+                    "__builtin_FILE" => {
+                        result.push_str("((const char *)");
+                        match self.macros.get("__FILE__") {
+                            Some(file) => result.push_str(&file.body),
+                            None => result.push_str("\"\""),
+                        }
+                        result.push(')');
+                    }
+                    _ => result.push_str("((const char *)__FUNCTION__)"),
+                }
+                return after;
+            }
+        }
+
         // C11 string/char encoding prefixes: u8, u, U, L.
         // When an identifier matches one of these and is immediately followed by
         // a quote ('"' or '\''), it's a string/char literal prefix, not a macro name.
@@ -2044,6 +2080,26 @@ mod itoa {
             std::str::from_utf8(&self.bytes[..self.len]).expect("digit buffer is not valid UTF-8")
         }
     }
+}
+
+/// The index just past `( )` (blanks allowed) starting at `i`, if the text
+/// there is an empty argument list.
+fn empty_call_parens(bytes: &[u8], mut i: usize) -> Option<usize> {
+    let skip = |mut j: usize| {
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        j
+    };
+    i = skip(i);
+    if bytes.get(i) != Some(&b'(') {
+        return None;
+    }
+    i = skip(i + 1);
+    if bytes.get(i) != Some(&b')') {
+        return None;
+    }
+    Some(i + 1)
 }
 
 #[cfg(test)]

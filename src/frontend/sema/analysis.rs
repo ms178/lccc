@@ -116,6 +116,13 @@ pub struct SemaResult {
     /// binary ops with proper signedness semantics). The lowerer consults
     /// this as an O(1) fast path before its own eval_const_expr.
     pub const_values: ConstMap,
+    /// Identifier uses that denote an enumeration constant, with its value.
+    /// Sema resolves C's ordinary-identifier namespace with the scopes live
+    /// (`SymbolTable::lookup_ordinary`), so this verdict is exact where the
+    /// lowerer's own lookup is not: an enumerator declared in an expression's
+    /// type-name (`sizeof(enum { E = 30 }) + E`) or in an inner block that
+    /// shadows an outer object of the same name.
+    pub enumerator_refs: FxHashMap<ExprId, i64>,
 }
 
 impl Default for SemaResult {
@@ -126,6 +133,7 @@ impl Default for SemaResult {
             expr_types: ExprTypeMap::default(),
             call_entities: FxHashMap::default(),
             const_values: ConstMap::default(),
+            enumerator_refs: FxHashMap::default(),
         }
     }
 }
@@ -138,10 +146,6 @@ pub struct SemanticAnalyzer {
     result: SemaResult,
     /// Current enum counter for auto-incrementing enum values.
     enum_counter: i64,
-    /// Pointer typedefs whose pointee is `const`/`volatile` (`typedef const
-    /// void *CNPT;`). `CType` carries no qualifiers, so the name is recorded
-    /// here for the null pointer constant rule: `(CNPT)0` is not one.
-    qualified_pointee_typedefs: FxHashSet<String>,
     // Anonymous struct/union keys are generated via TypeContext::next_anon_struct_id()
     // to ensure a single shared counter across both declaration processing and
     // expression type inference, avoiding key collisions between the two paths.
@@ -170,6 +174,9 @@ pub struct SemanticAnalyzer {
     /// Whether ordinary hosted-library builtin folds are disabled.
     no_builtins: bool,
     builtin_policy: crate::common::pass_policy::BuiltinFlags,
+    /// The dialect predates C99 (`-std=c90`/`gnu89`/`iso9899:199409`): GCC
+    /// then still treats an overflowing signed left shift as a constant.
+    pre_c99: bool,
 }
 
 impl SemanticAnalyzer {
@@ -178,13 +185,13 @@ impl SemanticAnalyzer {
             symbol_table: SymbolTable::new(),
             result: SemaResult::default(),
             enum_counter: 0,
-            qualified_pointee_typedefs: FxHashSet::default(),
             diagnostics: RefCell::new(DiagnosticEngine::new()),
             defined_structs: RefCell::new(FxHashSet::default()),
             current_return_type: None,
             function_nesting_stack: Vec::new(),
             no_builtins: false,
             builtin_policy: crate::common::pass_policy::BuiltinFlags::default(),
+            pre_c99: false,
         };
         // Pre-populate with common implicit declarations
         analyzer.declare_implicit_functions();
@@ -239,6 +246,11 @@ impl SemanticAnalyzer {
     /// state).  Evaluators consult this instead of an ambient mode.
     pub fn set_builtin_policy(&mut self, policy: crate::common::pass_policy::BuiltinFlags) {
         self.builtin_policy = policy;
+    }
+
+    /// Select a pre-C99 dialect (see [`Self::pre_c99`]).
+    pub fn set_pre_c99_dialect(&mut self, pre_c99: bool) {
+        self.pre_c99 = pre_c99;
     }
 
     /// Take the diagnostic engine back from the analyzer.
@@ -438,6 +450,19 @@ impl SemanticAnalyzer {
             }
         }
 
+        // C11 6.4.2.2p1: each function body begins as if with `static const
+        // char __func__[] = "function-name";` (GCC's two spellings alike), so
+        // `sizeof __func__` is the name's length plus one and the identifier
+        // is an array, an address constant.
+        for builtin in ["__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"] {
+            self.symbol_table.declare(Symbol {
+                name: builtin.to_string(),
+                ty: CType::Array(Box::new(CType::Char), Some(func.name.len() + 1)),
+                explicit_alignment: None,
+                type_align: None,
+                address_space: AddressSpace::Default,
+            });
+        }
         // Analyze function body with explicit return-type context.
         let previous_return_type = self.current_return_type.replace(return_type.clone());
         self.analyze_compound_stmt(&func.body);
@@ -664,19 +689,15 @@ impl SemanticAnalyzer {
         }
         self.check_void_declaration(decl, is_global);
 
-        // Handle __auto_type: infer base type from the first declarator's
-        // initializer expression rather than defaulting to int.
+        // Handle __auto_type: the type of the first declarator's initializer
+        // after array and function decay (as GCC, and C23 `auto` 6.7.10).
         let base_type = if matches!(&decl.type_spec, TypeSpecifier::AutoType) {
             if let Some(first) = decl.declarators.first() {
                 if let Some(Initializer::Expr(ref init_expr)) = first.init {
-                    let checker = super::type_checker::ExprTypeChecker {
-                        symbols: &self.symbol_table,
-                        types: &self.result.type_context,
-                        functions: &self.result.functions,
-                        expr_types: Some(&self.result.expr_types),
-                        builtin_policy: self.builtin_policy.clone(),
-                    };
-                    checker.infer_expr_ctype(init_expr).unwrap_or(CType::Int)
+                    let checker = self.expr_type_checker();
+                    checker
+                        .infer_expr_ctype(init_expr)
+                        .map_or(CType::Int, |ct| ct.decayed_value_ctype())
                 } else {
                     CType::Int
                 }
@@ -807,13 +828,10 @@ impl SemanticAnalyzer {
                     && matches!(resolved_ctype, CType::Pointer(..))
                     || (declarator.derived.is_empty()
                         && matches!(&decl.type_spec, TypeSpecifier::TypedefName(base)
-                            if self.qualified_pointee_typedefs.contains(base)));
-                if pointee_qualified {
-                    self.qualified_pointee_typedefs
-                        .insert(declarator.name.clone());
-                } else {
-                    self.qualified_pointee_typedefs.remove(&declarator.name);
-                }
+                            if self.result.type_context.qualified_pointee_typedefs.contains(base)));
+                self.result
+                    .type_context
+                    .set_typedef_pointee_qualified(&declarator.name, pointee_qualified);
                 self.result
                     .type_context
                     .typedefs
@@ -1176,13 +1194,7 @@ impl SemanticAnalyzer {
                         .lookup(&init_decl.name)
                         .map(|s| s.ty.clone());
                     if let Some(var_ty) = var_ty {
-                        let checker = super::type_checker::ExprTypeChecker {
-                            symbols: &self.symbol_table,
-                            types: &self.result.type_context,
-                            functions: &self.result.functions,
-                            expr_types: Some(&self.result.expr_types),
-                            builtin_policy: self.builtin_policy.clone(),
-                        };
+                        let checker = self.expr_type_checker();
                         if let Some(init_ty) = checker.infer_expr_ctype(init_expr) {
                             self.check_pointer_float_conversion(
                                 &init_ty,
@@ -1372,13 +1384,7 @@ impl SemanticAnalyzer {
         init: &Initializer,
     ) {
         let (non_constant, folds) = {
-            let type_checker = super::type_checker::ExprTypeChecker {
-                symbols: &self.symbol_table,
-                types: &self.result.type_context,
-                functions: &self.result.functions,
-                expr_types: Some(&self.result.expr_types),
-                builtin_policy: self.builtin_policy.clone(),
-            };
+            let type_checker = self.expr_type_checker();
             // An object with static storage (file scope, or a block-scope
             // `static`) needs a constant initializer (C11 6.7.9p4), and its
             // initializer is folded the way GCC folds one; an automatic
@@ -1456,6 +1462,7 @@ impl SemanticAnalyzer {
             expr_types: Some(&self.result.expr_types),
             builtin_policy: self.builtin_policy.clone(),
             folding_initializer: false,
+            pre_c99: self.pre_c99,
         };
         let value = evaluator.eval_const_expr(expr)?;
         let is_float = matches!(value, IrConst::F32(_) | IrConst::F64(_));
@@ -1745,6 +1752,7 @@ impl SemanticAnalyzer {
                 type_align: None,
                 address_space: AddressSpace::Default,
             });
+            self.symbol_table.mark_enumerator(&variant.name);
             self.result
                 .type_context
                 .insert_enum_scoped(variant.name.clone(), constant);
@@ -1768,6 +1776,7 @@ impl SemanticAnalyzer {
                 type_align: None,
                 address_space: AddressSpace::Default,
             });
+            self.symbol_table.mark_enumerator(variant);
         }
         enum_type
     }
@@ -1841,6 +1850,15 @@ impl SemanticAnalyzer {
         }
     }
 
+    /// A tagged type defined inside an expression's type-name (`sizeof(enum
+    /// { E = 30 })`, a cast, a compound literal, `va_arg`, `_Alignof`,
+    /// `__builtin_types_compatible_p`, a `_Generic` association) declares its
+    /// enumerators in the enclosing scope from that point on (C11 6.2.1p7),
+    /// exactly as the same specifier does in a declaration (GCC 16.2).
+    fn declare_type_name_tags(&mut self, expr: &Expr) {
+        expr.for_each_type_name(&mut |ts| self.collect_enum_constants_from_type_spec(ts));
+    }
+
     // === Statement analysis ===
 
     fn analyze_compound_stmt(&mut self, compound: &CompoundStmt) {
@@ -1881,7 +1899,41 @@ impl SemanticAnalyzer {
         }
     }
 
+    /// A selection or iteration statement is a block, and so is each of its
+    /// substatements (C11 6.8.4p3, 6.8.5p5): an identifier or tag declared
+    /// in one -- an enumerator or tag of a type-name -- ends with it. `for`
+    /// opens its scope itself (its clause may declare objects). Mirrored by
+    /// lowering's `lower_stmt`.
     fn analyze_stmt(&mut self, stmt: &Stmt) {
+        if matches!(
+            stmt,
+            Stmt::If(..) | Stmt::While(..) | Stmt::DoWhile(..) | Stmt::Switch(..)
+        ) {
+            self.symbol_table.push_scope();
+            self.result.type_context.push_scope();
+            self.analyze_stmt_in_scope(stmt);
+            self.result.type_context.pop_scope();
+            self.symbol_table.pop_scope();
+        } else {
+            self.analyze_stmt_in_scope(stmt);
+        }
+    }
+
+    /// Analyze a substatement of a selection or iteration statement in a
+    /// scope of its own (a compound statement opens its own).
+    fn analyze_substatement(&mut self, stmt: &Stmt) {
+        if matches!(stmt, Stmt::Compound(_)) {
+            self.analyze_stmt(stmt);
+        } else {
+            self.symbol_table.push_scope();
+            self.result.type_context.push_scope();
+            self.analyze_stmt(stmt);
+            self.result.type_context.pop_scope();
+            self.symbol_table.pop_scope();
+        }
+    }
+
+    fn analyze_stmt_in_scope(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Expr(Some(expr)) => {
                 self.analyze_expr(expr);
@@ -1898,13 +1950,7 @@ impl SemanticAnalyzer {
                         // Returning a real VALUE from a void function is a
                         // default-on warning in GCC, not an error; the value
                         // is discarded.
-                        let checker = super::type_checker::ExprTypeChecker {
-                            symbols: &self.symbol_table,
-                            types: &self.result.type_context,
-                            functions: &self.result.functions,
-                            expr_types: Some(&self.result.expr_types),
-                            builtin_policy: self.builtin_policy.clone(),
-                        };
+                        let checker = self.expr_type_checker();
                         let expr_is_void =
                             matches!(checker.infer_expr_ctype(expr), Some(CType::Void) | None);
                         if !expr_is_void {
@@ -1914,13 +1960,7 @@ impl SemanticAnalyzer {
                             );
                         }
                     } else {
-                        let checker = super::type_checker::ExprTypeChecker {
-                            symbols: &self.symbol_table,
-                            types: &self.result.type_context,
-                            functions: &self.result.functions,
-                            expr_types: Some(&self.result.expr_types),
-                            builtin_policy: self.builtin_policy.clone(),
-                        };
+                        let checker = self.expr_type_checker();
                         if let Some(actual) = checker.infer_expr_ctype(expr) {
                             let actual = self.conversion_source_ctype(expr, actual);
                             let null_constant = self.is_void_null_pointer_constant(expr);
@@ -1953,17 +1993,17 @@ impl SemanticAnalyzer {
             }
             Stmt::If(cond, then_br, else_br, _) => {
                 self.analyze_expr(cond);
-                self.analyze_stmt(then_br);
+                self.analyze_substatement(then_br);
                 if let Some(else_stmt) = else_br {
-                    self.analyze_stmt(else_stmt);
+                    self.analyze_substatement(else_stmt);
                 }
             }
             Stmt::While(cond, body, _) => {
                 self.analyze_expr(cond);
-                self.analyze_stmt(body);
+                self.analyze_substatement(body);
             }
             Stmt::DoWhile(body, cond, _) => {
-                self.analyze_stmt(body);
+                self.analyze_substatement(body);
                 self.analyze_expr(cond);
             }
             Stmt::For(init, cond, inc, body, _) => {
@@ -1985,7 +2025,7 @@ impl SemanticAnalyzer {
                 if let Some(inc) = inc {
                     self.analyze_expr(inc);
                 }
-                self.analyze_stmt(body);
+                self.analyze_substatement(body);
                 self.result.type_context.pop_scope();
                 self.symbol_table.pop_scope();
             }
@@ -2012,7 +2052,7 @@ impl SemanticAnalyzer {
                         self.diagnostics.borrow_mut().emit(&diag);
                     }
                 }
-                self.analyze_stmt(body);
+                self.analyze_substatement(body);
             }
             Stmt::Case(expr, body, _) => {
                 self.analyze_expr(expr);
@@ -2525,8 +2565,15 @@ impl SemanticAnalyzer {
     // === Expression analysis ===
 
     fn analyze_expr(&mut self, expr: &Expr) {
+        self.declare_type_name_tags(expr);
         match expr {
             Expr::Identifier(name, span) => {
+                if name == "__func__" && self.symbol_table.lookup(name).is_none() {
+                    self.diagnostics.borrow_mut().warning(
+                        "'__func__' is not defined outside of function scope".to_string(),
+                        *span,
+                    );
+                }
                 // Check if it's a known symbol
                 if self.symbol_table.lookup(name).is_none()
                     && !self.result.type_context.enum_constants.contains_key(name)
@@ -2575,13 +2622,7 @@ impl SemanticAnalyzer {
                     self.check_lvalue_operand(lhs, *span);
                 }
                 // Check for invalid pointer <-> float conversions in assignment
-                let checker = super::type_checker::ExprTypeChecker {
-                    symbols: &self.symbol_table,
-                    types: &self.result.type_context,
-                    functions: &self.result.functions,
-                    expr_types: Some(&self.result.expr_types),
-                    builtin_policy: self.builtin_policy.clone(),
-                };
+                let checker = self.expr_type_checker();
                 if let (Some(lhs_ty), Some(rhs_ty)) =
                     (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
                 {
@@ -2636,13 +2677,7 @@ impl SemanticAnalyzer {
                 // casts are the documented raw reinterpretation. An unresolved
                 // operand type (`inner` depends on a not-yet-inferable decl)
                 // skips the check rather than risking a false positive.
-                let checker = super::type_checker::ExprTypeChecker {
-                    symbols: &self.symbol_table,
-                    types: &self.result.type_context,
-                    functions: &self.result.functions,
-                    expr_types: Some(&self.result.expr_types),
-                    builtin_policy: self.builtin_policy.clone(),
-                };
+                let checker = self.expr_type_checker();
                 if let Some(inner_ty) = checker.infer_expr_ctype(inner) {
                     let target_ty = self.type_spec_to_ctype(ts);
                     if Self::is_vector_scalar_size_mismatch(&inner_ty, &target_ty) {
@@ -2769,6 +2804,22 @@ impl SemanticAnalyzer {
     fn analyze_call(&mut self, expr: &Expr, callee: &Expr, args: &[Expr]) {
         // Check for builtin calls
         if let Expr::Identifier(name, callee_span) = callee {
+            // GCC 16.2's wording and position (the builtin's name); Clang
+            // 23.1.3 agrees on every form but `1 << 31`-style signed shift
+            // overflow, `(_Bool)1e300` and `INT_MIN / -1` (see `ice.rs`).
+            // Lowering used to take the first arm of any condition it could
+            // not fold, so `__builtin_choose_expr(__builtin_constant_p(x),
+            // 100, x)` returned 100 where GCC returns x.
+            if name == "__builtin_choose_expr"
+                && args.len() == 3
+                && self.symbol_table.lookup(name).is_none()
+                && !self.is_integer_constant_expr(&args[0])
+            {
+                self.diagnostics.borrow_mut().error(
+                    "first argument to '__builtin_choose_expr' not a constant".to_string(),
+                    *callee_span,
+                );
+            }
             if builtins::is_builtin(name) {
                 // A builtin under its own name carries no prototype, so
                 // nothing below could check the call and lowering used
@@ -2851,13 +2902,7 @@ impl SemanticAnalyzer {
         // GNU nested functions both shadow a file-scope function.
         // K&R body declarations intentionally contribute no prototype;
         // only a separately visible declaration can supply one.
-        let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        };
+        let checker = self.expr_type_checker();
         let signature = match checker.infer_expr_ctype(callee) {
             Some(CType::Function(ft)) => Some(*ft),
             Some(CType::Pointer(inner, _)) => match *inner {
@@ -2881,13 +2926,7 @@ impl SemanticAnalyzer {
     /// Infer the CType of an expression via ExprTypeChecker and record it
     /// in the expr_types annotation map, keyed by the expression's `ExprId`.
     fn annotate_expr_type(&mut self, expr: &Expr) {
-        let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        };
+        let checker = self.expr_type_checker();
         if let Some(ctype) = checker.infer_expr_ctype(expr) {
             self.result.expr_types.insert(expr.id(), ctype);
         }
@@ -2897,9 +2936,18 @@ impl SemanticAnalyzer {
     /// SemaConstEval and record the result in the const_values map.
     /// The lowerer will consult this as an O(1) fast path.
     fn annotate_const_value(&mut self, expr: &Expr) {
-        // Only a folded const object is recorded for an identifier. Enumerators
-        // are not: the lowerer resolves them itself, after its local scopes.
+        // A folded const object is recorded in the const map; an enumerator
+        // in `enumerator_refs`, which the lowerer consults before its own
+        // scopes (both only when that declaration is the innermost one).
         if let Expr::Identifier(name, _) = expr {
+            if let Some((_, true)) = self.symbol_table.lookup_ordinary(name) {
+                if let Some(constant) = self.result.type_context.enum_constants.get(name) {
+                    self.result
+                        .enumerator_refs
+                        .insert(expr.id(), constant.value);
+                }
+                return;
+            }
             let folded = match self.symbol_table.folded_value(name) {
                 Some(FoldedValue::Int(v)) => Some(IrConst::I64(v)),
                 Some(FoldedValue::Float(v)) => Some(IrConst::F64(v)),
@@ -2918,6 +2966,7 @@ impl SemanticAnalyzer {
             expr_types: Some(&self.result.expr_types),
             builtin_policy: self.builtin_policy.clone(),
             folding_initializer: false,
+            pre_c99: self.pre_c99,
         };
         if let Some(val) = evaluator.eval_const_expr(expr) {
             self.result.const_values.insert(expr.id(), val);
@@ -2940,13 +2989,7 @@ impl SemanticAnalyzer {
     /// or any expression inferred as a struct/union.  Other operands are left
     /// to lowering, as before.
     fn check_subscript_operands(&self, base: &Expr, index: &Expr, span: Span) {
-        let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        };
+        let checker = self.expr_type_checker();
         let trusted = |expr: &Expr| {
             let ty = checker.infer_expr_ctype(expr)?;
             let declared = matches!(
@@ -3002,13 +3045,7 @@ impl SemanticAnalyzer {
     /// type of `base_expr` for `.`, its pointee for `->`.
     /// An expression type checker over this analyzer's current state.
     fn expr_checker(&self) -> super::type_checker::ExprTypeChecker<'_> {
-        super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        }
+        self.expr_type_checker()
     }
 
     fn member_base_ctype(&self, base_expr: &Expr, is_pointer: bool) -> Option<CType> {
@@ -3160,7 +3197,7 @@ impl SemanticAnalyzer {
                 // The chosen arm's category (the condition is an integer
                 // constant expression); unevaluable, an rvalue only when
                 // both arms are.
-                match self.eval_const_expr_value(&args[0]) {
+                match self.sema_const_eval().eval_required_constant(&args[0]) {
                     Some(c) => {
                         let arm = if c.is_nonzero() { &args[1] } else { &args[2] };
                         self.is_known_rvalue(arm, under_ext_vector)
@@ -3392,13 +3429,7 @@ impl SemanticAnalyzer {
     /// C11 6.5.6p3: both operands must point to compatible types.
     /// Emits an error if both operands are pointers to different struct/union types.
     fn check_pointer_subtraction_compat(&self, lhs: &Expr, rhs: &Expr, span: Span) {
-        let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        };
+        let checker = self.expr_type_checker();
         let lct = match checker.infer_expr_ctype(lhs) {
             Some(ct) => ct,
             None => return,
@@ -3460,13 +3491,7 @@ impl SemanticAnalyzer {
                 span,
             );
         }
-        let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        };
+        let checker = self.expr_type_checker();
         for (index, (arg, (param_ty, _))) in args.iter().zip(params).enumerate() {
             if let Some(arg_ty) = checker.infer_expr_ctype(arg) {
                 let arg_ty = self.conversion_source_ctype(arg, arg_ty);
@@ -3637,22 +3662,7 @@ impl SemanticAnalyzer {
     /// shape where a named-address-space pointer is expected. A bare integer
     /// `0` never reaches the address-space check, since it is not a pointer.
     fn is_void_null_pointer_constant(&self, expr: &Expr) -> bool {
-        // The predicate is shared with lowering (`const_arith`); sema supplies
-        // the one thing the syntax cannot tell: whether the cast's type,
-        // typedef names included, is an unqualified `void *`.
-        crate::common::const_arith::is_void_pointer_null_constant(
-            expr,
-            &|ts| {
-                if let TypeSpecifier::TypedefName(name) = ts {
-                    if self.qualified_pointee_typedefs.contains(name) {
-                        return false;
-                    }
-                }
-                self.type_spec_to_ctype(ts)
-                    == CType::Pointer(Box::new(CType::Void), AddressSpace::Default)
-            },
-            &|operand| self.eval_const_expr(operand) == Some(0),
-        )
+        self.expr_type_checker().is_void_pointer_null_constant(expr)
     }
 
     /// Brace-list and compound-literal elements convert implicitly into their
@@ -3765,13 +3775,7 @@ impl SemanticAnalyzer {
         if !slot.is_struct_or_union() && !matches!(slot, CType::Array(..)) {
             return true;
         }
-        let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        };
+        let checker = self.expr_type_checker();
         match checker.infer_expr_ctype(expr) {
             Some(CType::Struct(_) | CType::Union(_) | CType::Array(..)) | None => true,
             Some(_) => false,
@@ -3902,13 +3906,7 @@ impl SemanticAnalyzer {
         if !matches!(target, CType::Pointer(..)) {
             return;
         }
-        let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        };
+        let checker = self.expr_type_checker();
         let Some(from) = checker.infer_expr_ctype(expr) else {
             return;
         };
@@ -3938,13 +3936,7 @@ impl SemanticAnalyzer {
         {
             return;
         }
-        let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        };
+        let checker = self.expr_type_checker();
         let (Some(lt), Some(rt)) = (checker.infer_expr_ctype(lhs), checker.infer_expr_ctype(rhs))
         else {
             return;
@@ -3985,13 +3977,7 @@ impl SemanticAnalyzer {
         {
             return;
         }
-        let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        };
+        let checker = self.expr_type_checker();
         let (Some(tt), Some(et)) = (
             checker.infer_expr_ctype(then_expr),
             checker.infer_expr_ctype(else_expr),
@@ -4054,13 +4040,7 @@ impl SemanticAnalyzer {
 
     /// The type of an expression, by the same checker the call sites use.
     fn expr_ctype(&self, expr: &Expr) -> Option<CType> {
-        let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        };
+        let checker = self.expr_type_checker();
         checker.infer_expr_ctype(expr)
     }
 
@@ -4119,13 +4099,7 @@ impl SemanticAnalyzer {
     /// warns even through a null constant (verified against GCC 12/14).
     /// Wording follows GCC's two directions.
     fn check_explicit_cast_address_space(&self, cast: &Expr, inner: &Expr, span: Span) {
-        let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        };
+        let checker = self.expr_type_checker();
         let (Some(CType::Pointer(_, from_space)), Some(CType::Pointer(_, to_space))) = (
             checker.infer_expr_ctype(inner),
             checker.infer_expr_ctype(cast),
@@ -4529,6 +4503,24 @@ impl SemanticAnalyzer {
 
     // === Constant expression evaluation ===
 
+    /// The expression type checker over this analyzer's state.
+    fn expr_type_checker(&self) -> super::type_checker::ExprTypeChecker<'_> {
+        super::type_checker::ExprTypeChecker {
+            symbols: &self.symbol_table,
+            types: &self.result.type_context,
+            functions: &self.result.functions,
+            expr_types: Some(&self.result.expr_types),
+            builtin_policy: self.builtin_policy.clone(),
+            pre_c99: self.pre_c99,
+        }
+    }
+
+    /// Whether `expr` is an integer constant expression (C11 6.6p6), the
+    /// condition `__builtin_choose_expr` requires (see `ice.rs`).
+    fn is_integer_constant_expr(&self, expr: &Expr) -> bool {
+        self.expr_type_checker().is_integer_constant_expr(expr)
+    }
+
     /// The constant evaluator, as used by enum values, bitfield widths, array
     /// sizes, `case` labels and static-initializer folding.
     fn sema_const_eval(&self) -> SemaConstEval<'_> {
@@ -4540,6 +4532,7 @@ impl SemanticAnalyzer {
             expr_types: Some(&self.result.expr_types),
             builtin_policy: self.builtin_policy.clone(),
             folding_initializer: false,
+            pre_c99: self.pre_c99,
         }
     }
 
@@ -4712,13 +4705,7 @@ fn record_layouts_correspond(
 
 impl type_builder::TypeConvertContext for SemanticAnalyzer {
     fn typeof_object_space(&self, expr: &Expr) -> AddressSpace {
-        let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        };
+        let checker = self.expr_type_checker();
         checker.lvalue_address_space(expr)
     }
 
@@ -4920,13 +4907,7 @@ impl type_builder::TypeConvertContext for SemanticAnalyzer {
 
     fn resolve_typeof_expr(&self, expr: &Expr) -> CType {
         // Use the ExprTypeChecker to infer typeof(expr) from sema state.
-        let checker = super::type_checker::ExprTypeChecker {
-            symbols: &self.symbol_table,
-            types: &self.result.type_context,
-            functions: &self.result.functions,
-            expr_types: Some(&self.result.expr_types),
-            builtin_policy: self.builtin_policy.clone(),
-        };
+        let checker = self.expr_type_checker();
         checker.infer_expr_ctype(expr).unwrap_or(CType::Int)
     }
 

@@ -69,6 +69,10 @@ pub struct SemaConstEval<'a> {
     /// __builtin_constant_p(n++);` with `b == 0`, `n` untouched).  Elsewhere
     /// an unproven answer stays deferred for inlining and propagation.
     pub folding_initializer: bool,
+    /// The TU is C90/C94 (`-std=c89`/`gnu89`), whose integer constant
+    /// expressions admit an overflowing signed left shift; passed on to the
+    /// type checker's ICE test (see `ice.rs`).
+    pub pre_c99: bool,
 }
 
 impl<'a> SemaConstEval<'a> {
@@ -77,6 +81,22 @@ impl<'a> SemaConstEval<'a> {
     /// Returns `Some(IrConst)` for expressions that can be fully evaluated using
     /// sema state. Returns `None` for expressions that require lowering state
     /// (global addresses, runtime values, etc.).
+    /// Evaluate an expression the language requires to be constant now --
+    /// the condition of `__builtin_choose_expr` -- in GCC's
+    /// `folding_initializer` mode: `__builtin_constant_p` answers 0 unless
+    /// proven, because the choice is made before any pass could prove more
+    /// (GCC 16.2 and Clang 23.1.3 select `x` in
+    /// `__builtin_choose_expr(__builtin_constant_p(x), 100, x)` for a
+    /// parameter `x`, even when every caller passes a constant).
+    pub fn eval_required_constant(&self, expr: &Expr) -> Option<IrConst> {
+        SemaConstEval {
+            builtin_policy: self.builtin_policy.clone(),
+            folding_initializer: true,
+            ..*self
+        }
+        .eval_const_expr(expr)
+    }
+
     pub fn eval_const_expr(&self, expr: &Expr) -> Option<IrConst> {
         // Memoization: if this expression's constant value was already computed
         // during the bottom-up sema walk, return it in O(1).
@@ -101,6 +121,26 @@ impl<'a> SemaConstEval<'a> {
             | Expr::FloatLiteralF128(..) => shared_const_eval::eval_literal(expr),
 
             Expr::UnaryOp(UnaryOp::Plus, inner, _) => self.eval_const_expr(inner),
+            // Of a real operand, `__real__` is the value and `__imag__` a zero
+            // of its type (GCC 16.2 folds both; complex constants are not
+            // modelled here).
+            Expr::UnaryOp(op @ (UnaryOp::RealPart | UnaryOp::ImagPart), inner, _) => {
+                let val = self.eval_const_expr(inner)?;
+                if *op == UnaryOp::RealPart {
+                    return Some(val);
+                }
+                Some(match val {
+                    IrConst::F32(_) => IrConst::F32(0.0),
+                    IrConst::F64(_) => IrConst::F64(0.0),
+                    IrConst::I8(_) => IrConst::I8(0),
+                    IrConst::I16(_) => IrConst::I16(0),
+                    IrConst::I32(_) => IrConst::I32(0),
+                    IrConst::I64(_) => IrConst::I64(0),
+                    IrConst::I128(_) => IrConst::I128(0),
+                    IrConst::Zero => IrConst::Zero,
+                    IrConst::LongDouble(..) | IrConst::D32(_) | IrConst::D64(_) => return None,
+                })
+            }
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
                 if matches!(self.const_ctype(inner), Some(CType::Float128)) {
@@ -358,22 +398,28 @@ impl<'a> SemaConstEval<'a> {
             // Identifier: enum constants
             Expr::Identifier(name, _) => {
                 // Objects and enumerators share the ordinary-identifier
-                // namespace.  Pick the lexically nearer declaration before
-                // considering its value; otherwise a file-scope enumerator can
-                // turn a shadowing automatic object into a constant.
-                let symbol = self.symbols.lookup_with_depth(name);
-                let enumerator = self.types.enum_constant_with_depth(name);
-                if let Some((_, symbol_depth)) = symbol {
-                    // Equal depths are the enumerator's companion symbol-table
-                    // entry; only a strictly nearer symbol shadows it.
-                    if enumerator.is_none_or(|(_, enum_depth)| symbol_depth > enum_depth) {
-                        return self.symbols.folded_value(name).map(|val| match val {
-                            FoldedValue::Int(v) => IrConst::I64(v),
-                            FoldedValue::Float(v) => IrConst::F64(v),
-                        });
-                    }
+                // namespace (C11 6.2.3), so the innermost visible declaration
+                // decides. A folded const object's value comes first; any other
+                // object, function or typedef hides an enumerator of the same
+                // name (`enum { A = 1 }; void f(void) { int A = 5;
+                // _Static_assert(A, ""); }` is not constant: GCC 16.2).
+                if let Some(val) = self.symbols.folded_value(name) {
+                    return Some(match val {
+                        FoldedValue::Int(v) => IrConst::I64(v),
+                        FoldedValue::Float(v) => IrConst::F64(v),
+                    });
                 }
-                enumerator.map(|(constant, _)| IrConst::I64(constant.value))
+                if self
+                    .symbols
+                    .lookup_ordinary(name)
+                    .is_some_and(|(_, enumerator)| !enumerator)
+                {
+                    return None;
+                }
+                self.types
+                    .enum_constants
+                    .get(name)
+                    .map(|constant| IrConst::I64(constant.value))
             }
 
             // sizeof
@@ -497,63 +543,85 @@ impl<'a> SemaConstEval<'a> {
             Expr::AddressOf(inner, _) => self.eval_offsetof_pattern(inner),
 
             // Handle compile-time builtin function calls in constant expressions.
-            Expr::FunctionCall(func, args, _) => {
-                if let Expr::Identifier(name, _) = func.as_ref() {
-                    if name == "__builtin_constant_p" {
-                        let arg = args.first()?;
-                        let cast_is_nop = |target: &TypeSpecifier| {
-                            let ty = self.type_spec_to_ctype(target);
-                            matches!(ty, CType::Pointer(..))
-                                || (ty.is_integer()
-                                    && ty.size() == crate::common::types::target_ptr_size())
-                        };
-                        if self.eval_const_expr(arg).is_some()
-                            || shared_const_eval::is_string_literal_address(
-                                arg,
-                                &cast_is_nop,
-                                &|e| self.eval_const_expr(e),
-                            )
-                        {
-                            return Some(IrConst::I32(1));
-                        }
-                        // A file-scope object's value is never a compile-time
-                        // constant. Resolve this negative answer even in a
-                        // required integer-constant-expression context (global
-                        // initializer / __builtin_choose_expr). Parameters and
-                        // locals remain deferred so inlining/propagation may
-                        // prove them constant later.
-                        if self.folding_initializer
-                            || matches!(arg, Expr::Identifier(id, _) if self.symbols.lookup_global(id).is_some())
-                        {
-                            return Some(IrConst::I32(0));
-                        }
-                        // The same for a block-scope object with static
-                        // storage (a static local): GCC 16.2 answers 0 for
-                        // any object address, and the kernel's
-                        // PIN_GROUP(.mode = __builtin_choose_expr(
-                        // __builtin_constant_p((m)), (m), 0)) needs the 0
-                        // when `m` is a static-local pin array.
-                        if matches!(arg, Expr::Identifier(id, _) if
-                            self.symbols.lookup(id).is_some()
-                                && !self.symbols.is_automatic_object(id))
-                        {
-                            return Some(IrConst::I32(0));
-                        }
-                        return None;
-                    }
-                    shared_const_eval::eval_builtin_call_with_mode(
-                        name.as_str(),
-                        args,
-                        &|e| self.eval_const_expr(e),
-                        self.builtin_policy.may_assume(name.as_str()),
-                    )
-                } else {
-                    None
-                }
-            }
+            Expr::FunctionCall(func, args, _) => self.eval_call_const(func, args),
 
             _ => None,
         }
+    }
+
+    /// A compile-time builtin call in a constant expression; `None` for any
+    /// other call (and for a builtin whose value is not yet known).
+    fn eval_call_const(&self, func: &Expr, args: &[Expr]) -> Option<IrConst> {
+        let Expr::Identifier(name, _) = func else {
+            return None;
+        };
+        match name.as_str() {
+            "__builtin_classify_type" => {
+                // The argument is not evaluated; a function designator or
+                // array decays (`CType::gcc_type_class`).
+                let class = match args.first() {
+                    Some(arg) => self.infer_expr_ctype(arg)?.gcc_type_class(),
+                    None => 0,
+                };
+                Some(IrConst::I64(class))
+            }
+            "__builtin_choose_expr" if args.len() >= 3 => {
+                let cond = self.eval_required_constant(&args[0])?;
+                self.eval_const_expr(if cond.is_nonzero() {
+                    &args[1]
+                } else {
+                    &args[2]
+                })
+            }
+            "__builtin_constant_p" => self.eval_builtin_constant_p(args.first()?),
+            _ => shared_const_eval::eval_builtin_call_with_mode(
+                name.as_str(),
+                args,
+                &|e| self.eval_const_expr(e),
+                self.builtin_policy.may_assume(name.as_str()),
+            ),
+        }
+    }
+
+    /// `__builtin_constant_p(arg)`: 1 once proven, 0 where the answer can no
+    /// longer change, `None` while later folding may still prove it.
+    fn eval_builtin_constant_p(&self, arg: &Expr) -> Option<IrConst> {
+        let cast_is_nop = |target: &TypeSpecifier| {
+            let ty = self.type_spec_to_ctype(target);
+            matches!(ty, CType::Pointer(..))
+                || (ty.is_integer() && ty.size() == crate::common::types::target_ptr_size())
+        };
+        if self.eval_const_expr(arg).is_some()
+            || shared_const_eval::is_string_literal_address(arg, &cast_is_nop, &|e| {
+                self.eval_const_expr(e)
+            })
+        {
+            return Some(IrConst::I32(1));
+        }
+        // A file-scope object's value is never a compile-time
+        // constant. Resolve this negative answer even in a
+        // required integer-constant-expression context (global
+        // initializer / __builtin_choose_expr). Parameters and
+        // locals remain deferred so inlining/propagation may
+        // prove them constant later.
+        if self.folding_initializer
+            || matches!(arg, Expr::Identifier(id, _) if self.symbols.lookup_global(id).is_some())
+        {
+            return Some(IrConst::I32(0));
+        }
+        // The same for a block-scope object with static
+        // storage (a static local): GCC 16.2 answers 0 for
+        // any object address, and the kernel's
+        // PIN_GROUP(.mode = __builtin_choose_expr(
+        // __builtin_constant_p((m)), (m), 0)) needs the 0
+        // when `m` is a static-local pin array.
+        if matches!(arg, Expr::Identifier(id, _) if
+            self.symbols.lookup(id).is_some()
+                && !self.symbols.is_automatic_object(id))
+        {
+            return Some(IrConst::I32(0));
+        }
+        None
     }
 
     /// Evaluate a constant expression, returning raw u64 bits and signedness.
@@ -745,6 +813,7 @@ impl<'a> SemaConstEval<'a> {
             functions: self.functions,
             expr_types: self.expr_types,
             builtin_policy: self.builtin_policy.clone(),
+            pre_c99: self.pre_c99,
         }
     }
 

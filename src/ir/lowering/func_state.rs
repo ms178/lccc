@@ -280,6 +280,15 @@ pub struct NonlocalGotoTarget {
 }
 
 impl FunctionBuildState {
+    /// The function's name in the source, which `__func__` designates: a
+    /// GNU nested function is built as `parent.child` (`.` cannot occur in
+    /// a C identifier), and GCC's `__func__` there is `child`.
+    pub fn source_name(&self) -> &str {
+        self.name
+            .rsplit_once('.')
+            .map_or(self.name.as_str(), |(_, child)| child)
+    }
+
     /// Create a new function build state for the given function.
     pub fn new(name: String, return_type: IrType, return_is_bool: bool) -> Self {
         Self {

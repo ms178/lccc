@@ -146,6 +146,22 @@ pub fn eval_builtin_call(
     eval_builtin_call_with_mode(name, args, eval_fn, true)
 }
 
+/// `abs`/`labs`/`llabs` of an integer constant, in `int` or (`wide`) a
+/// 64-bit type; `None` for the most negative value, whose absolute value
+/// overflows.
+fn int_abs(
+    args: &[Expr],
+    eval_fn: &dyn Fn(&Expr) -> Option<IrConst>,
+    wide: bool,
+) -> Option<IrConst> {
+    let v = eval_fn(args.first()?)?.to_i64()?;
+    if wide {
+        v.checked_abs().map(IrConst::I64)
+    } else {
+        (v as i32).checked_abs().map(IrConst::I32)
+    }
+}
+
 /// Evaluate a compile-time builtin call under an explicit builtin policy.
 /// `allow_nonprefixed_builtins=false` (`-fno-builtin` / `-ffreestanding`)
 /// withdraws EVERY non-`__`-prefixed spelling — the whole bare-name fold
@@ -198,6 +214,15 @@ pub fn eval_builtin_call_with_mode(
             }
         }
         "__builtin_expect" | "__builtin_expect_with_probability" => args.first().and_then(eval_fn),
+        // The absolute value in the function's own type; the most negative
+        // value has none (undefined), so it does not fold.
+        "__builtin_abs" | "abs" => int_abs(args, eval_fn, false),
+        "__builtin_labs" | "labs" => {
+            int_abs(args, eval_fn, !crate::common::types::target_is_32bit())
+        }
+        "__builtin_llabs" | "llabs" | "__builtin_imaxabs" | "imaxabs" => {
+            int_abs(args, eval_fn, true)
+        }
         "__builtin_bswap16" => {
             let val = eval_fn(args.first()?)?;
             let v = val.to_i64()? as u16;

@@ -251,13 +251,16 @@ impl Lowerer {
         // helpers — lib/maple_tree.c trace_ma_op — do exactly that). Material
         // the function name as the same interned string literal the
         // expression path lowers it to.
+        // At file scope it is GCC's string for that spelling
+        // (`function_name_builtin_text`).
         if let Expr::Identifier(name, _) = expr {
-            if matches!(
-                name.as_str(),
-                "__func__" | "__FUNCTION__" | "__PRETTY_FUNCTION__"
-            ) {
-                let fname = self.func().name.clone();
-                return GlobalInit::GlobalAddr(self.intern_string_literal(&fname));
+            if crate::frontend::parser::ast::is_function_name_builtin(name) {
+                let text = crate::frontend::parser::ast::function_name_builtin_text(
+                    name,
+                    self.func_state.as_ref().map(|fs| fs.source_name()),
+                )
+                .to_string();
+                return GlobalInit::GlobalAddr(self.intern_string_literal(&text));
             }
         }
 
@@ -1643,10 +1646,11 @@ impl Lowerer {
             Expr::Identifier(name, _)
                 if crate::frontend::parser::ast::is_function_name_builtin(name) =>
             {
-                Some((
-                    self.func_state.as_ref()?.name.clone(),
-                    StringLitKind::Narrow,
-                ))
+                let text = crate::frontend::parser::ast::function_name_builtin_text(
+                    name,
+                    self.func_state.as_ref().map(|fs| fs.source_name()),
+                );
+                Some((text.to_string(), StringLitKind::Narrow))
             }
             Expr::Cast(_, inner, _, _) => self.function_name_string(inner),
             _ => None,

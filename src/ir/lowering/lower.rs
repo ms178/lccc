@@ -20,8 +20,8 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::source::Span;
 use crate::common::types::{AddressSpace, CType, IrType, SsoMode};
 use crate::frontend::parser::ast::{
-    self, DerivedDeclarator, EnumVariant, Expr, ExprId, ExternalDecl, ParamDecl, TranslationUnit,
-    TypeSpecifier,
+    self, BlockItem, CompoundStmt, Declaration, DerivedDeclarator, EnumVariant, Expr, ExprId,
+    ExternalDecl, ParamDecl, Stmt, TranslationUnit, TypeSpecifier,
 };
 use crate::frontend::sema::type_context::TypeContext;
 use crate::frontend::sema::{ConstMap, ExprTypeMap, FunctionInfo};
@@ -157,6 +157,9 @@ pub struct Lowerer {
     /// falls back to its own evaluation (which handles lowering-specific cases
     /// like global addresses, func_state const locals, etc.).
     pub(super) sema_const_values: ConstMap,
+    /// Sema's `SemaResult::enumerator_refs`: identifier uses that denote an
+    /// enumeration constant. Authoritative over the lowerer's own lookup.
+    pub(super) sema_enumerator_refs: FxHashMap<ExprId, i64>,
     /// Stack of local label scopes from GNU __label__ declarations.
     /// Each entry maps a label name to its scope-qualified name.
     /// When resolving a label, the stack is searched top-down so that
@@ -239,6 +242,12 @@ impl Lowerer {
         self
     }
 
+    /// Attach sema's enumerator verdicts (`SemaResult::enumerator_refs`).
+    pub fn with_enumerator_refs(mut self, refs: FxHashMap<ExprId, i64>) -> Self {
+        self.sema_enumerator_refs = refs;
+        self
+    }
+
     /// Create a new Lowerer with pre-populated state from semantic analysis.
     ///
     /// The sema-provided TypeContext contains typedefs, enum constants, struct layouts,
@@ -308,6 +317,7 @@ impl Lowerer {
             sema_functions,
             sema_expr_types,
             sema_const_values,
+            sema_enumerator_refs: FxHashMap::default(),
             local_label_scopes: Vec::new(),
             next_local_label_scope: 0,
             asm_label_map: FxHashMap::default(),
@@ -441,6 +451,37 @@ impl Lowerer {
     /// Checks locals first, then globals. Returns `&VarInfo` which provides
     /// access to the shared fields (ty, elem_size, is_array, pointee_type,
     /// struct_layout, is_struct, array_dim_strides, c_type).
+    /// The enumeration constant identifier `expr` (spelled `name`) denotes,
+    /// if any: its value and type. Objects, functions, typedef names and
+    /// enumerators share C's ordinary-identifier namespace, so the innermost
+    /// declaration decides (C11 6.2.1p4, 6.2.3). Sema resolved every node it
+    /// analyzed with its scopes live: a node in `sema_enumerator_refs` is an
+    /// enumerator, and any other annotated node names an object, function or
+    /// typedef that hides every enumerator of that spelling. Only a node sema
+    /// never saw falls back to the lowerer's scopes, where a local hides it.
+    pub(super) fn identifier_enumerator(&self, expr: &Expr, name: &str) -> Option<(i64, CType)> {
+        let id = expr.id();
+        if let Some(&value) = self.sema_enumerator_refs.get(&id) {
+            let ty = self
+                .sema_expr_types
+                .get(&id)
+                .cloned()
+                .or_else(|| self.types.enum_constants.get(name).map(|c| c.ty.clone()))
+                .unwrap_or(CType::Int);
+            return Some((value, ty));
+        }
+        if self.sema_expr_types.contains_key(&id)
+            || self
+                .func_state
+                .as_ref()
+                .is_some_and(|fs| fs.locals.contains_key(name))
+        {
+            return None;
+        }
+        let constant = self.types.enum_constants.get(name)?;
+        Some((constant.value, constant.ty.clone()))
+    }
+
     pub(super) fn lookup_var_info(&self, name: &str) -> Option<&VarInfo> {
         if let Some(ref fs) = self.func_state {
             if let Some(info) = fs.locals.get(name) {
@@ -2842,6 +2883,72 @@ impl Lowerer {
         self.collect_enum_constants_impl(ts, true);
     }
 
+    /// Register the type-name tags of `expr` and all of its sub-expressions.
+    pub(super) fn declare_type_name_tags_in(&mut self, expr: &Expr) {
+        let mut pending = vec![expr];
+        while let Some(e) = pending.pop() {
+            self.declare_type_name_tags(e);
+            let mark = pending.len();
+            e.for_each_child(&mut |child| pending.push(child));
+            pending[mark..].reverse();
+        }
+    }
+
+    /// Register the type-name tags of the expressions `stmt` evaluates
+    /// itself; nested statements do this when they are lowered.
+    pub(super) fn declare_stmt_type_name_tags(&mut self, stmt: &Stmt) {
+        let mut own = Vec::new();
+        stmt.for_each_own_expr(&mut |e| own.push(e));
+        for e in own {
+            self.declare_type_name_tags_in(e);
+        }
+    }
+
+    /// A block-scope declaration's tags -- its specifier's, then those in
+    /// the type-names of its array bounds and initializers -- ahead of
+    /// lowering it.
+    pub(super) fn declare_local_decl_tags(&mut self, decl: &Declaration) {
+        self.collect_enum_constants_scoped(&decl.type_spec);
+        self.declare_declarator_type_name_tags(decl);
+    }
+
+    /// The type-name tags in a declaration's array bounds and initializers.
+    pub(super) fn declare_declarator_type_name_tags(&mut self, decl: &Declaration) {
+        let mut exprs = Vec::new();
+        for declarator in &decl.declarators {
+            declarator.for_each_expr(&mut |e| exprs.push(e));
+        }
+        for e in exprs {
+            self.declare_type_name_tags_in(e);
+        }
+    }
+
+    /// Whether lowering `compound` changes scoped state, so its block needs
+    /// a scope frame: a declaration, a nested function definition, or an
+    /// enum defined in a type-name of one of its statements' expressions.
+    pub(super) fn block_needs_scope(compound: &CompoundStmt) -> bool {
+        compound.items.iter().any(|item| match item {
+            BlockItem::Declaration(_) | BlockItem::NestedFunction(_) => true,
+            BlockItem::Statement(stmt) => stmt_defines_type_name_enum(stmt),
+            BlockItem::StaticAssert(_) => false,
+        })
+    }
+
+    /// A tagged type defined inside an expression's type-name (`sizeof(enum
+    /// T { E = 30 })`, casts, compound literals, `va_arg`, `_Alignof`,
+    /// `__builtin_types_compatible_p`, `_Generic` associations) is in scope
+    /// from that point on (C11 6.2.1p7). Uses of its enumerators are resolved
+    /// by sema's verdict (`sema_enumerator_refs`); this keeps the lowerer's
+    /// type context -- the tag's definition and enumerator types -- in step
+    /// for a later `enum T x;`. Mirrors sema's `declare_type_name_tags`.
+    /// Registered per statement, before any of it is lowered: folding may
+    /// skip a sub-expression's lowering entirely (`x = 1 + sizeof(enum T
+    /// {...})`), and enumerator values do not depend on this order.
+    fn declare_type_name_tags(&mut self, expr: &Expr) {
+        let scoped = self.func_state.is_some();
+        expr.for_each_type_name(&mut |ts| self.collect_enum_constants_impl(ts, scoped));
+    }
+
     /// Check if a user-defined goto label has already been defined (i.e., the
     /// label statement was already lowered). Used to determine backward vs forward gotos.
     /// This checks `defined_user_labels` (set when `label:` is lowered), NOT `user_labels`
@@ -3717,4 +3824,33 @@ impl Lowerer {
         let (hi, lo) = crate::common::decimal::encode_int_bid128(0, false);
         ((u128::from(hi) << 64) | u128::from(lo)) as i128
     }
+}
+
+/// Whether one of `stmt`'s own expressions defines an enum (directly or in
+/// a member of a struct or union) inside a type-name.
+fn stmt_defines_type_name_enum(stmt: &Stmt) -> bool {
+    fn defines_enum(ts: &TypeSpecifier) -> bool {
+        match ts {
+            TypeSpecifier::Enum(_, Some(_), _) => true,
+            TypeSpecifier::Struct(_, Some(fields), ..)
+            | TypeSpecifier::Union(_, Some(fields), ..) => {
+                fields.iter().any(|field| defines_enum(&field.type_spec))
+            }
+            TypeSpecifier::Array(inner, _) | TypeSpecifier::Pointer(inner, _) => {
+                defines_enum(inner)
+            }
+            _ => false,
+        }
+    }
+    fn type_names_define_enum(expr: &Expr) -> bool {
+        let mut found = false;
+        expr.for_each_type_name(&mut |ts| found = found || defines_enum(ts));
+        if !found {
+            expr.for_each_child(&mut |child| found = found || type_names_define_enum(child));
+        }
+        found
+    }
+    let mut found = false;
+    stmt.for_each_own_expr(&mut |e| found = found || type_names_define_enum(e));
+    found
 }

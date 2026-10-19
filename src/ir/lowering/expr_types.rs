@@ -1071,13 +1071,32 @@ impl Lowerer {
     /// Resolve __builtin_choose_expr(const_expr, expr1, expr2) to the selected branch.
     /// Returns a reference to args[1] if the condition is nonzero, or args[2] otherwise.
     pub(super) fn resolve_builtin_choose_expr<'a>(&self, args: &'a [Expr]) -> &'a Expr {
-        // Any integer constant width selects by its value (a narrow or
-        // 128-bit constant is not "true" by default). A non-constant
-        // condition keeps the historical first-arm choice.
+        // Sema has proven the condition an integer constant expression
+        // (`sema/ice.rs`), so it folds here; any constant width selects by
+        // its value.
         let is_nonzero = self
-            .eval_const_expr(&args[0])
+            .eval_required_constant(&args[0])
             .is_none_or(|c| c.is_nonzero());
         if is_nonzero { &args[1] } else { &args[2] }
+    }
+
+    /// `__builtin_classify_type(arg)` ([`CType::gcc_type_class`]); a
+    /// function designator decays to a pointer, unless a local object hides
+    /// the function's name.
+    pub(super) fn classify_type_of(&self, arg: Option<&Expr>) -> i64 {
+        let Some(arg) = arg else {
+            return 0;
+        };
+        if let Expr::Identifier(name, _) = arg {
+            let local = self
+                .func_state
+                .as_ref()
+                .is_some_and(|fs| fs.locals.contains_key(name.as_str()));
+            if !local && self.known_functions.contains(name.as_str()) {
+                return 5;
+            }
+        }
+        self.expr_ctype(arg).gcc_type_class()
     }
 
     /// The operand `__builtin_choose_expr(c, a, b)` designates, when `expr`
@@ -1271,8 +1290,8 @@ impl Lowerer {
                 if crate::frontend::parser::ast::is_function_name_builtin(name) {
                     return IrType::Ptr;
                 }
-                if let Some(constant) = self.types.enum_constants.get(name) {
-                    return IrType::from_ctype(&constant.ty);
+                if let Some((_, ty)) = self.identifier_enumerator(expr, name) {
+                    return IrType::from_ctype(&ty);
                 }
                 if let Some(vi) = self.lookup_var_info(name) {
                     if vi.is_array {
@@ -1523,6 +1542,55 @@ impl Lowerer {
         self.sema_expr_types.get(&expr.id()).cloned()
     }
 
+    /// The type of the `?:` `expr` with arms `then_expr`/`else_expr` (C11
+    /// 6.5.15p3-p6).
+    ///
+    /// Whether a `void *` arm is a null pointer constant picks between that
+    /// arm's type and the other's, and takes the integer-constant-expression
+    /// rules -- enumerators, `(void *)(N - N)`, qualified-pointee typedefs --
+    /// that sema implements exactly (`ExprTypeChecker::is_null_pointer_constant`)
+    /// and the syntactic `const_arith` test approximates. Sema typed this very
+    /// conditional with them, so its annotation decides; it is trusted only
+    /// when it equals one of the two possible outcomes, so an annotation of
+    /// another node at a reused address can never inject a type. The
+    /// syntactic test stays the fallback for expressions sema never typed.
+    fn conditional_expr_ctype(
+        &self,
+        expr: &Expr,
+        then_expr: &Expr,
+        else_expr: &Expr,
+    ) -> Option<CType> {
+        use crate::common::const_arith::is_null_pointer_constant;
+        let then_ct = self.get_expr_ctype(then_expr);
+        let else_ct = self.get_expr_ctype(else_expr);
+        let compose = |then_is_npc: bool, else_is_npc: bool| {
+            CType::conditional_composite_type(
+                then_ct.clone(),
+                else_ct.clone(),
+                then_is_npc,
+                else_is_npc,
+            )
+        };
+        let then_matters = CType::conditional_arm_npc_matters(then_ct.as_ref(), else_ct.as_ref());
+        let else_matters = CType::conditional_arm_npc_matters(else_ct.as_ref(), then_ct.as_ref());
+        if then_matters || else_matters {
+            if let Some(sema) = self.lookup_sema_expr_type(expr) {
+                let npc = compose(then_matters, else_matters);
+                if npc.as_ref() == Some(&sema) {
+                    return npc;
+                }
+                let not_npc = compose(false, false);
+                if not_npc.as_ref() == Some(&sema) {
+                    return not_npc;
+                }
+            }
+        }
+        compose(
+            is_null_pointer_constant(then_expr),
+            is_null_pointer_constant(else_expr),
+        )
+    }
+
     /// Get the full CType of an expression by recursion.
     /// Returns None if the type cannot be determined from CType tracking.
     ///
@@ -1612,6 +1680,9 @@ impl Lowerer {
     fn get_expr_ctype_lowerer(&self, expr: &Expr) -> Option<CType> {
         match expr {
             Expr::Identifier(name, _) => {
+                if let Some((_, ty)) = self.identifier_enumerator(expr, name) {
+                    return Some(ty);
+                }
                 if let Some(vi) = self.lookup_var_info(name) {
                     return vi.c_type.clone();
                 }
@@ -1625,9 +1696,6 @@ impl Lowerer {
                             variadic: func_info.variadic,
                         },
                     )));
-                }
-                if let Some(constant) = self.types.enum_constants.get(name) {
-                    return Some(constant.ty.clone());
                 }
                 None
             }
@@ -1702,25 +1770,13 @@ impl Lowerer {
             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
                 self.get_expr_ctype(lhs)
             }
+            // The arms' lvalue conversion (`1 ? arr : (int *)0` is an
+            // `int *`) happens inside the shared composite rule.
             Expr::Conditional(_, then_expr, else_expr, _) => {
-                use crate::common::const_arith::is_null_pointer_constant;
-                // The arms' lvalue conversion (`1 ? arr : (int *)0` is an
-                // `int *`) happens inside the shared composite rule.
-                CType::conditional_composite_type(
-                    self.get_expr_ctype(then_expr),
-                    self.get_expr_ctype(else_expr),
-                    is_null_pointer_constant(then_expr),
-                    is_null_pointer_constant(else_expr),
-                )
+                self.conditional_expr_ctype(expr, then_expr, else_expr)
             }
             Expr::GnuConditional(cond, else_expr, _) => {
-                use crate::common::const_arith::is_null_pointer_constant;
-                CType::conditional_composite_type(
-                    self.get_expr_ctype(cond),
-                    self.get_expr_ctype(else_expr),
-                    is_null_pointer_constant(cond),
-                    is_null_pointer_constant(else_expr),
-                )
+                self.conditional_expr_ctype(expr, cond, else_expr)
             }
             // The comma operator yields the right operand's *value*
             // (C11 6.5.17p3), so the result undergoes lvalue conversion:
@@ -1998,7 +2054,7 @@ impl Lowerer {
                                 .or_else(|| self.get_expr_ctype_with_scope(init_expr, &local_scope))
                             {
                                 let full_ctype = self.build_full_ctype(
-                                    &Self::ctype_to_type_spec(&ctype),
+                                    &Self::ctype_to_type_spec(&ctype.decayed_value_ctype()),
                                     &declarator.derived,
                                 );
                                 local_scope.insert(declarator.name.clone(), full_ctype);

@@ -558,6 +558,12 @@ impl Lowerer {
     // -----------------------------------------------------------------------
 
     pub(super) fn lower_sizeof(&mut self, arg: &SizeofArg) -> Operand {
+        // An operand of variably modified type is evaluated (C11 6.5.3.4p2).
+        if let SizeofArg::Expr(expr) = arg {
+            if self.expr_is_variably_modified(expr) && expr.may_have_side_effects() {
+                self.lower_expr_discarded(expr);
+            }
+        }
         if let Some(vla_val) = self.get_vla_sizeof(arg) {
             return Operand::Value(vla_val);
         }
@@ -576,7 +582,24 @@ impl Lowerer {
 
     fn get_vla_sizeof(&self, arg: &SizeofArg) -> Option<Value> {
         match arg {
-            SizeofArg::Expr(Expr::Identifier(name, _)) => {
+            SizeofArg::Expr(expr) => self.vla_sizeof_of_expr(expr),
+            SizeofArg::Type(_) => None,
+        }
+    }
+
+    /// The runtime size of `expr` when its type is a VLA this function
+    /// tracks: a VLA object or typedef name, or what a subscript or
+    /// dereference of a VLA or pointer to one reaches. `sizeof` lowers to it,
+    /// and constant folding must not fold such a `sizeof`.
+    /// Whether `expr` has a variably modified type this function tracks.
+    pub(super) fn expr_is_variably_modified(&self, expr: &Expr) -> bool {
+        self.func_state.is_some()
+            && (self.vm_layout_of_expr(expr).is_some() || self.vla_sizeof_of_expr(expr).is_some())
+    }
+
+    pub(super) fn vla_sizeof_of_expr(&self, expr: &Expr) -> Option<Value> {
+        match expr {
+            Expr::Identifier(name, _) => {
                 // Check local VLA variables first
                 if let Some(info) = self.func().locals.get(name) {
                     if info.vla_size.is_some() {
@@ -588,12 +611,12 @@ impl Lowerer {
                     return Some(vla_size);
                 }
             }
-            SizeofArg::Expr(Expr::ArraySubscript(base, _, _)) => {
+            Expr::ArraySubscript(base, _, _) => {
                 if let Some(stride) = self.get_vla_stride_for_subscript(base) {
                     return Some(stride);
                 }
             }
-            SizeofArg::Expr(Expr::Deref(inner, _)) => {
+            Expr::Deref(inner, _) => {
                 if let Some(stride) = self.get_vla_stride_for_subscript(inner) {
                     return Some(stride);
                 }
@@ -608,6 +631,12 @@ impl Lowerer {
     /// with non-constant size expressions. Also looks up struct/union tags
     /// whose layout was recorded as a VLA at the type definition.
     fn compute_vla_sizeof_for_type(&mut self, ts: &TypeSpecifier) -> Option<Value> {
+        // `typeof(expr)` of VM type: evaluated, and sized from its layout.
+        if let Some(base) = self.typeof_vm_base(ts) {
+            if base.size.is_some() {
+                return base.size;
+            }
+        }
         // Check if it's a VLA typedef name with a pre-computed runtime size
         if let TypeSpecifier::TypedefName(name) = ts {
             if let Some(&vla_size) = self.func().vla_typedef_sizes.get(name) {
@@ -1426,14 +1455,7 @@ impl Lowerer {
         // expressions that re-declare the same variable name (extremely common in
         // kernel macros like READ_ONCE, per-CPU accessors, container_of) permanently
         // overwrite the outer binding, producing wrong code.
-        let has_declarations = compound.items.iter().any(|item| {
-            matches!(item, BlockItem::Declaration(_)) || {
-                // Nested definitions contribute a scope entry exactly
-                // like declarations do (the nested function name is
-                // declared in this block).
-                matches!(item, BlockItem::NestedFunction(_))
-            }
-        });
+        let has_declarations = Self::block_needs_scope(compound);
         if has_declarations {
             self.push_scope();
         }
@@ -1469,13 +1491,14 @@ impl Lowerer {
                             self.lower_stmt(inner);
                         }
                     } else if let Stmt::Expr(Some(expr)) = stmt {
+                        self.declare_type_name_tags_in(expr);
                         last_val = self.lower_expr(expr);
                     } else {
                         self.lower_stmt(stmt);
                     }
                 }
                 BlockItem::Declaration(decl) => {
-                    self.collect_enum_constants_scoped(&decl.type_spec);
+                    self.declare_local_decl_tags(decl);
                     self.lower_local_decl(decl);
                 }
                 // Decided by sema; a static assertion generates nothing.

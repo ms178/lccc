@@ -49,6 +49,9 @@ struct Scope {
     /// The value of a folded const object, converted to its type, so that
     /// `int a = cc;` can be evaluated for `const int cc = 5;`.
     folded_values: FxHashMap<String, FoldedValue>,
+    /// Enumeration constants declared in this scope: a block-scope object of
+    /// the same name hides one (`enum { A = 1 }; void f(void) { int A; }`).
+    enumerators: FxHashSet<String>,
 }
 
 /// The value of a folded const object (see `Scope::folded_values`).
@@ -69,6 +72,7 @@ impl Scope {
             automatic: FxHashSet::default(),
             folded: FxHashSet::default(),
             folded_values: FxHashMap::default(),
+            enumerators: FxHashSet::default(),
         }
     }
 }
@@ -101,21 +105,23 @@ impl SymbolTable {
     }
 
     pub fn lookup(&self, name: &str) -> Option<&Symbol> {
-        self.lookup_with_depth(name).map(|(symbol, _)| symbol)
+        self.lookup_ordinary(name).map(|(symbol, _)| symbol)
     }
 
-    /// Look up the innermost symbol and its lexical depth (file scope is 0).
-    ///
-    /// C enumerators and objects share the ordinary-identifier namespace.  The
-    /// semantic analyzer keeps their payloads in separate maps, so callers
-    /// resolving an identifier need the depth to choose whichever declaration
-    /// is lexically nearer rather than unconditionally preferring one map.
-    pub fn lookup_with_depth(&self, name: &str) -> Option<(&Symbol, usize)> {
-        self.scopes
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(depth, scope)| scope.symbols.get(name).map(|symbol| (symbol, depth)))
+    /// The innermost visible declaration of `name` and whether it is an
+    /// enumeration constant. Enumerators share C's ordinary-identifier
+    /// namespace with objects, functions and typedefs (C11 6.2.3), so the
+    /// innermost declaration decides which one a use denotes; sema keeps the
+    /// enumerator's value in `TypeContext::enum_constants`, and this flag is
+    /// what selects it. One scope walk, and no invariant tying this table's
+    /// scope depth to another structure's.
+    pub fn lookup_ordinary(&self, name: &str) -> Option<(&Symbol, bool)> {
+        self.scopes.iter().rev().find_map(|scope| {
+            scope
+                .symbols
+                .get(name)
+                .map(|symbol| (symbol, scope.enumerators.contains(name)))
+        })
     }
 
     /// Look up a declaration in this scope only. A nested function definition
@@ -154,6 +160,20 @@ impl SymbolTable {
                 scope.folded_values.insert(name.to_string(), v);
             }
         }
+    }
+
+    /// Record that the innermost scope's `name` is an enumeration constant.
+    pub fn mark_enumerator(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.enumerators.insert(name.to_string());
+        }
+    }
+
+    /// Whether the innermost visible declaration of `name` is an enumeration
+    /// constant, i.e. no object, function or typedef of that name hides it.
+    pub fn is_enumerator(&self, name: &str) -> bool {
+        self.lookup_ordinary(name)
+            .is_some_and(|(_, enumerator)| enumerator)
     }
 
     /// Whether the innermost visible declaration of `name` is an automatic

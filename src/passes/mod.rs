@@ -1483,6 +1483,12 @@ pub(crate) fn run_passes(
         // __fabstf2); LCCC links no libgcc, so fold them to the backend's own
         // inline intrinsics even at -O0 (semantics-preserving rename).
         simplify::fold_math_intrinsic_calls(module);
+        // Unreachable internal-linkage functions go at every level, as with
+        // GCC's call graph: lowering keeps a static function on a superset
+        // of its AST references (an unevaluated `sizeof`/`typeof` operand
+        // counts), and only the IR knows which survive.  An unreachable one
+        // may call functions defined nowhere, which must not reach the link.
+        dead_statics::eliminate_dead_static_functions(module);
         // -O0 runs one budgeted fixpoint above: the always-inline rounds,
         // whose second-pass budget is a correctness budget (an unexpanded
         // must-inline call cannot link).  Its cap hits must surface too.
@@ -1635,6 +1641,8 @@ pub(crate) fn run_passes(
             verify::verify_after_pass(module, "fmanegpeel");
         }
         resolve_asm::resolve_inline_asm_symbols(module);
+        // Unreachable internal-linkage functions go, as at -O0 and -O2+.
+        dead_statics::eliminate_dead_static_functions(module);
         if time_passes {
             round_cap::report();
         }

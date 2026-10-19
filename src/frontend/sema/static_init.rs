@@ -389,12 +389,15 @@ impl<'s> StaticInitChecker<'s> {
         // Inside a function, `__func__` (and GCC's `__FUNCTION__` and, in C,
         // `__PRETTY_FUNCTION__`) is a static const char array (C11 6.4.2.2p1),
         // so it is an address constant like any static array: GCC 16.2
-        // accepts `static const char *s = __func__ + 1;`. At file scope it
-        // names nothing; it stays undeclared here, as in C (GCC only warns).
-        if crate::frontend::parser::ast::is_function_name_builtin(name)
-            && !self.symbols.at_file_scope()
-        {
-            return Kind::Address(Some(name));
+        // accepts `static const char *s = __func__ + 1;`. At file scope C
+        // defines none; GCC makes it a string literal (`function_name_
+        // builtin_text`), an address constant too.
+        if crate::frontend::parser::ast::is_function_name_builtin(name) {
+            return if self.symbols.at_file_scope() {
+                Kind::Address(None)
+            } else {
+                Kind::Address(Some(name))
+            };
         }
         match self.symbols.lookup(name) {
             // Undeclared: already diagnosed; do not report a second error.

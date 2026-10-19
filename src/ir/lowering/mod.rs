@@ -50,5 +50,6 @@ mod types_ctype;
 mod types_seed;
 mod vector_array_init;
 mod vector_simd;
+mod vm_layout;
 
 pub(crate) use lower::Lowerer;

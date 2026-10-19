@@ -171,6 +171,13 @@ pub fn target_ptr_size() -> usize {
     TARGET_PTR_SIZE.with(|c| c.get())
 }
 
+/// The builtin typedef (the target's `size_t`) that `__builtin_offsetof`'s
+/// expansion casts to: `((__lccc_offsetof_size_t)&((type *)0)->member)`. The
+/// reserved name marks the expansion, so the integer-constant-expression
+/// rules can accept `offsetof` while rejecting the spelled-out idiom
+/// `(size_t)&((T *)0)->m`, as GCC does.
+pub const OFFSETOF_SIZE_TYPEDEF: &str = "__lccc_offsetof_size_t";
+
 /// Whether the current target is 32-bit (ILP32).
 pub fn target_is_32bit() -> bool {
     target_ptr_size() == 4
@@ -2364,6 +2371,42 @@ impl CType {
         }
     }
 
+    /// GCC's `__builtin_classify_type` class of a value of this type (its
+    /// `enum type_class`), after the argument's array and function
+    /// decay. Measured with GCC 16.2: `char`, `_Bool` and enums are
+    /// `integer_type_class` (1) in C; vectors are `vector_type_class` (19).
+    pub fn gcc_type_class(&self) -> i64 {
+        match self {
+            CType::Void => 0,
+            CType::Bool
+            | CType::Char
+            | CType::UChar
+            | CType::Short
+            | CType::UShort
+            | CType::Int
+            | CType::UInt
+            | CType::Long
+            | CType::ULong
+            | CType::LongLong
+            | CType::ULongLong
+            | CType::Int128
+            | CType::UInt128
+            | CType::Enum(_) => 1,
+            CType::Float
+            | CType::Double
+            | CType::LongDouble
+            | CType::Float128
+            | CType::Decimal32
+            | CType::Decimal64
+            | CType::Decimal128 => 8,
+            CType::ComplexFloat | CType::ComplexDouble | CType::ComplexLongDouble => 9,
+            CType::Pointer(..) | CType::Array(..) | CType::Function(_) => 5,
+            CType::Struct(_) => 12,
+            CType::Union(_) => 13,
+            CType::Vector(..) | CType::ExtVector(..) => 19,
+        }
+    }
+
     pub fn is_integer(&self) -> bool {
         matches!(
             self,
@@ -3096,6 +3139,66 @@ impl CType {
     /// conversion first (C11 6.3.2.1p3-p4): `1 ? arr : arr` is an `int *`.
     /// Decaying here, not in each caller, keeps sema and lowering agreeing
     /// (sema once sized that conditional as the array, 16 bytes, not 8).
+    /// Whether a `?:` arm's null-pointer-constant status can change
+    /// [`Self::conditional_composite_type`]: only for a `void *` arm against
+    /// a pointer to a non-void type, where `(void *)0` takes the other arm's
+    /// type and any other `void *` makes the result `void *` (C11 6.5.15p6).
+    /// An integer arm against a pointer yields the pointer type either way.
+    pub fn conditional_arm_npc_matters(arm: Option<&CType>, other: Option<&CType>) -> bool {
+        let pointee_is_void = |ct: &CType| match ct.decayed_value_ctype() {
+            CType::Pointer(pointee, _) => Some(matches!(*pointee, CType::Void)),
+            _ => None,
+        };
+        arm.and_then(pointee_is_void) == Some(true)
+            && other.and_then(pointee_is_void) == Some(false)
+    }
+
+    /// Whether two pointee types are certainly not compatible (C11 6.2.7),
+    /// judged only where `CType` carries enough to be sure: distinct basic
+    /// arithmetic types, distinct structure/union tags, a record against a
+    /// scalar, recursing through pointer levels. Enumerations (compatible
+    /// with their underlying integer type), arrays, functions and vectors
+    /// (composite-type rules) answer `false`.
+    fn pointees_definitely_incompatible(a: &CType, b: &CType) -> bool {
+        let basic = |ct: &CType| {
+            matches!(
+                ct,
+                CType::Bool
+                    | CType::Char
+                    | CType::UChar
+                    | CType::Short
+                    | CType::UShort
+                    | CType::Int
+                    | CType::UInt
+                    | CType::Long
+                    | CType::ULong
+                    | CType::LongLong
+                    | CType::ULongLong
+                    | CType::Int128
+                    | CType::UInt128
+                    | CType::Float
+                    | CType::Double
+                    | CType::LongDouble
+                    | CType::Float128
+                    | CType::Decimal32
+                    | CType::Decimal64
+                    | CType::Decimal128
+                    | CType::ComplexFloat
+                    | CType::ComplexDouble
+                    | CType::ComplexLongDouble
+            )
+        };
+        let record = |ct: &CType| matches!(ct, CType::Struct(_) | CType::Union(_));
+        match (a, b) {
+            (CType::Pointer(pa, _), CType::Pointer(pb, _)) => {
+                Self::pointees_definitely_incompatible(pa, pb)
+            }
+            _ if basic(a) && basic(b) => a != b,
+            _ if record(a) && record(b) => a != b,
+            _ => (basic(a) && record(b)) || (record(a) && basic(b)),
+        }
+    }
+
     pub fn conditional_composite_type(
         then_ct: Option<CType>,
         else_ct: Option<CType>,
@@ -3122,16 +3225,33 @@ impl CType {
                         // then=T*, else=void*: if else is NPC, result is T*; else void*
                         return if else_is_npc { Some(t) } else { Some(e) };
                     }
+                    // Pointers to incompatible types: GCC diagnoses the
+                    // mismatch (an error since GCC 14, a warning under
+                    // -fpermissive) and types the result `void *`; lccc
+                    // accepts the mismatch, so the type must still be
+                    // GCC's: `(c ? (int *)a : (char *)b) + 1` advances one
+                    // byte, not four.
+                    if Self::pointees_definitely_incompatible(inner_t, inner_e) {
+                        let space = match &t {
+                            CType::Pointer(_, space) => *space,
+                            _ => AddressSpace::Default,
+                        };
+                        return Some(CType::Pointer(Box::new(CType::Void), space));
+                    }
                     return Some(t);
                 }
-                // One pointer, one integer 0 (null pointer constant)
+                // One pointer, one integer: the pointer type, whether or not
+                // the integer is a null pointer constant (GCC 16.2: `c ? 1 :
+                // p` is a `char *` with a pointer/integer mismatch
+                // diagnostic). Taking the integer arm's type truncated the
+                // pointer arm to 32 bits.
                 if let CType::Pointer(..) = &t {
-                    if e.is_arithmetic() && else_is_npc {
+                    if e.is_integer() {
                         return Some(t);
                     }
                 }
                 if let CType::Pointer(..) = &e {
-                    if t.is_arithmetic() && then_is_npc {
+                    if t.is_integer() {
                         return Some(e);
                     }
                 }
@@ -3939,5 +4059,129 @@ mod ext_vector_selector_tests {
             int4.ext_vector_swizzle_ctype("xyzwx"),
             Some(ext_vector(CType::Int, 5))
         );
+    }
+}
+
+#[cfg(test)]
+mod conditional_type_tests {
+    use super::{AddressSpace, CType};
+
+    fn ptr(ct: CType) -> CType {
+        CType::Pointer(Box::new(ct), AddressSpace::Default)
+    }
+
+    #[test]
+    fn pointer_against_any_integer_is_the_pointer() {
+        // GCC 16.2: `c ? 1 : p` and `c ? p : 1L` are `char *`, null pointer
+        // constant or not; the integer arm's type truncated the pointer.
+        let p = ptr(CType::Char);
+        for int in [CType::Int, CType::Long, CType::Bool] {
+            for npc in [false, true] {
+                assert_eq!(
+                    CType::conditional_composite_type(
+                        Some(int.clone()),
+                        Some(p.clone()),
+                        npc,
+                        false
+                    ),
+                    Some(p.clone())
+                );
+                assert_eq!(
+                    CType::conditional_composite_type(
+                        Some(p.clone()),
+                        Some(int.clone()),
+                        false,
+                        npc
+                    ),
+                    Some(p.clone())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn void_pointer_arm_follows_its_null_pointer_constant_status() {
+        let (void_ptr, int_ptr) = (ptr(CType::Void), ptr(CType::Int));
+        assert_eq!(
+            CType::conditional_composite_type(
+                Some(void_ptr.clone()),
+                Some(int_ptr.clone()),
+                true,
+                false
+            ),
+            Some(int_ptr.clone())
+        );
+        assert_eq!(
+            CType::conditional_composite_type(
+                Some(int_ptr.clone()),
+                Some(void_ptr.clone()),
+                false,
+                false
+            ),
+            Some(void_ptr.clone())
+        );
+        assert!(CType::conditional_arm_npc_matters(
+            Some(&void_ptr),
+            Some(&int_ptr)
+        ));
+        // Only that pair: an integer or a non-void pointer arm, or `void *`
+        // against `void *` or an integer, gets the same type either way.
+        assert!(!CType::conditional_arm_npc_matters(
+            Some(&CType::Int),
+            Some(&int_ptr)
+        ));
+        assert!(!CType::conditional_arm_npc_matters(
+            Some(&int_ptr),
+            Some(&void_ptr)
+        ));
+        assert!(!CType::conditional_arm_npc_matters(
+            Some(&void_ptr),
+            Some(&void_ptr)
+        ));
+        assert!(!CType::conditional_arm_npc_matters(
+            Some(&void_ptr),
+            Some(&CType::Int)
+        ));
+        assert!(!CType::conditional_arm_npc_matters(None, Some(&int_ptr)));
+    }
+
+    #[test]
+    fn incompatible_object_pointers_give_void_pointer() {
+        // GCC 16.2 (-fpermissive): `c ? (char *)0 : ip` is `void *`.
+        let void_ptr = ptr(CType::Void);
+        let incompatible = [
+            (ptr(CType::Char), ptr(CType::Int)),
+            (ptr(CType::Long), ptr(CType::LongLong)),
+            (
+                ptr(CType::Struct("struct.A".into())),
+                ptr(CType::Struct("struct.B".into())),
+            ),
+            (ptr(CType::Struct("struct.A".into())), ptr(CType::Int)),
+            (ptr(ptr(CType::Char)), ptr(ptr(CType::Int))),
+        ];
+        for (a, b) in incompatible {
+            assert_eq!(
+                CType::conditional_composite_type(Some(a), Some(b), false, false),
+                Some(void_ptr.clone())
+            );
+        }
+        // Same, or not provably incompatible from `CType` alone: unchanged.
+        let kept = [
+            (ptr(CType::Int), ptr(CType::Int)),
+            (
+                ptr(CType::Struct("struct.A".into())),
+                ptr(CType::Struct("struct.A".into())),
+            ),
+            (
+                ptr(CType::Array(Box::new(CType::Int), Some(3))),
+                ptr(CType::Array(Box::new(CType::Int), None)),
+            ),
+        ];
+        for (a, b) in kept {
+            assert_eq!(
+                CType::conditional_composite_type(Some(a.clone()), Some(b), false, false),
+                Some(a)
+            );
+        }
     }
 }

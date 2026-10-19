@@ -30,10 +30,7 @@ impl Lowerer {
 
         // Check if this block contains any declarations. If not, we can skip
         // scope tracking entirely since statements don't introduce new bindings.
-        let has_declarations = compound.items.iter().any(|item| {
-            matches!(item, BlockItem::Declaration(_))
-                || matches!(item, BlockItem::NestedFunction(_))
-        });
+        let has_declarations = Self::block_needs_scope(compound);
 
         if has_declarations {
             // Push a scope frame to track additions/modifications in this block.
@@ -44,7 +41,7 @@ impl Lowerer {
                 match item {
                     BlockItem::Declaration(decl) => {
                         self.func_mut().current_span = decl.span;
-                        self.collect_enum_constants_scoped(&decl.type_spec);
+                        self.declare_local_decl_tags(decl);
                         self.lower_local_decl(decl);
                     }
                     BlockItem::Statement(stmt) => self.lower_stmt(stmt),
@@ -83,6 +80,21 @@ impl Lowerer {
             return;
         }
 
+        // `typeof(expr)` of VM type: the operand is evaluated once for the
+        // declaration, and each declarator's layout derives from its own.
+        // `__auto_type x = e` takes e's type after array decay; the
+        // initializer itself is evaluated as usual.
+        let typeof_vm = if decl.is_extern() {
+            None
+        } else if matches!(decl.type_spec, TypeSpecifier::AutoType) {
+            match decl.declarators.first().and_then(|d| d.init.as_ref()) {
+                Some(Initializer::Expr(init)) => self.vm_layout_of_expr(init).map(|l| l.decayed()),
+                _ => None,
+            }
+        } else {
+            self.typeof_vm_base(&decl.type_spec)
+        };
+
         for declarator in &decl.declarators {
             if declarator.name.is_empty() {
                 continue;
@@ -112,7 +124,16 @@ impl Lowerer {
                 continue;
             }
 
-            let vla_size = if da.is_array {
+            let typeof_layout = match &typeof_vm {
+                Some(base) => {
+                    let base_const_size = self.sizeof_type(type_spec);
+                    self.declared_vm_layout(base, base_const_size, &declarator.derived)
+                }
+                None => None,
+            };
+            let vla_size = if let Some(layout) = &typeof_layout {
+                layout.size
+            } else if da.is_array {
                 self.compute_vla_runtime_size(type_spec, &declarator.derived)
             } else if da.is_struct {
                 // GCC extension: block-scope structs may contain VLA members
@@ -169,6 +190,11 @@ impl Lowerer {
                 alloca_align,
                 vla_size,
             );
+            if let Some(layout) = typeof_layout {
+                if let Some(info) = self.func_mut().locals.get_mut(&declarator.name) {
+                    info.vla_strides = layout.strides;
+                }
+            }
             self.track_fptr_sig(declarator, type_spec);
 
             if let Some(ref init) = declarator.init {
@@ -200,8 +226,9 @@ impl Lowerer {
         let ts = if matches!(&decl.type_spec, TypeSpecifier::AutoType) {
             if let Some(first) = decl.declarators.first() {
                 if let Some(Initializer::Expr(ref init_expr)) = first.init {
+                    // The initializer's type after array and function decay.
                     if let Some(ctype) = self.get_expr_ctype(init_expr) {
-                        Self::ctype_to_type_spec(&ctype)
+                        Self::ctype_to_type_spec(&ctype.decayed_value_ctype())
                     } else {
                         self.emit_warning(
                             "could not infer type for '__auto_type'; defaulting to 'int'",
@@ -227,6 +254,13 @@ impl Lowerer {
     }
 
     fn lower_local_typedef(&mut self, decl: &Declaration, type_spec: &TypeSpecifier) {
+        // `typedef typeof(expr) T` of VM type: the operand is evaluated, and
+        // T's runtime size derives from the operand's layout.
+        let typeof_vm = if self.func_state.is_some() {
+            self.typeof_vm_base(&decl.type_spec)
+        } else {
+            None
+        };
         for declarator in &decl.declarators {
             if declarator.name.is_empty() {
                 continue;
@@ -302,7 +336,15 @@ impl Lowerer {
                         _ => None,
                     }
                 };
-                if let Some(vla_size) = copied_from_struct {
+                let typeof_size = match &typeof_vm {
+                    Some(base) => {
+                        let base_const_size = self.sizeof_type(type_spec);
+                        self.declared_vm_layout(base, base_const_size, &declarator.derived)
+                            .and_then(|layout| layout.size)
+                    }
+                    None => None,
+                };
+                if let Some(vla_size) = copied_from_struct.or(typeof_size) {
                     self.func_mut()
                         .insert_vla_typedef_size_scoped(declarator.name.clone(), vla_size);
                 } else if let Some(vla_size) =
@@ -413,11 +455,13 @@ impl Lowerer {
         }
         local_info.var.type_align = self.typedef_alignment_for_type_spec(type_spec).copied();
         local_info.vla_size = vla_size;
-        if vla_size.is_some() {
-            let strides = self.compute_vla_local_strides(type_spec, &declarator.derived);
-            if !strides.is_empty() {
-                local_info.vla_strides = strides;
-            }
+        let strides = if vla_size.is_some() {
+            self.compute_vla_local_strides(type_spec, &declarator.derived)
+        } else {
+            self.compute_vla_pointee_strides(type_spec, &declarator.derived)
+        };
+        if !strides.is_empty() {
+            local_info.vla_strides = strides;
         }
         local_info.asm_register = declarator.attrs.asm_register.clone();
         local_info.asm_register_has_init =
@@ -1482,11 +1526,48 @@ impl Lowerer {
     }
 
     /// Main statement lowering dispatcher. Delegates to per-statement-type methods.
+    ///
+    /// A selection or iteration statement is a block, and so is each of its
+    /// substatements (C11 6.8.4p3, 6.8.5p5; see `lower_substatement`): a tag
+    /// defined in one of their type-names ends with it. Only the type scope
+    /// is opened -- such a block declares no objects, so no cleanup, VLA or
+    /// label-depth bookkeeping is involved. Mirrors sema's `analyze_stmt`.
     pub(super) fn lower_stmt(&mut self, stmt: &Stmt) {
+        if Self::is_block_statement(stmt) {
+            self.types.push_scope();
+            self.lower_stmt_in_scope(stmt);
+            self.types.pop_scope();
+        } else {
+            self.lower_stmt_in_scope(stmt);
+        }
+    }
+
+    /// Whether `stmt` is a selection or iteration statement.
+    pub(super) fn is_block_statement(stmt: &Stmt) -> bool {
+        matches!(
+            stmt,
+            Stmt::If(..) | Stmt::While(..) | Stmt::DoWhile(..) | Stmt::For(..) | Stmt::Switch(..)
+        )
+    }
+
+    /// Lower a substatement of a selection or iteration statement in a type
+    /// scope of its own (a compound statement opens its own).
+    pub(super) fn lower_substatement(&mut self, stmt: &Stmt) {
+        if matches!(stmt, Stmt::Compound(_)) {
+            self.lower_stmt(stmt);
+        } else {
+            self.types.push_scope();
+            self.lower_stmt(stmt);
+            self.types.pop_scope();
+        }
+    }
+
+    fn lower_stmt_in_scope(&mut self, stmt: &Stmt) {
         // Fresh FP expression root per statement (OP-36): every FP arith
         // result lowered inside this statement is tagged with it, so
         // -ffp-contract=on fuses mul+add only within one source expression.
         self.func_mut().fp_expr_root = self.func_mut().fp_expr_root.wrapping_add(1);
+        self.declare_stmt_type_name_tags(stmt);
         // Set the current span for debug info tracking. All instructions emitted
         // while lowering this statement will inherit this source location.
         if let Some(span) = stmt.span() {
@@ -1549,6 +1630,7 @@ impl Lowerer {
             Stmt::Label(name, stmt, _span) => self.lower_label_stmt(name, stmt),
             Stmt::Declaration(decl) => {
                 self.func_mut().current_span = decl.span;
+                self.declare_local_decl_tags(decl);
                 self.lower_local_decl(decl);
             }
             Stmt::InlineAsm {
@@ -1753,6 +1835,65 @@ impl Lowerer {
     ///
     /// We process dimensions from innermost to outermost, accumulating the
     /// product of inner dimensions * base element size.
+    /// Runtime strides of a pointer to a variably modified array (`int
+    /// (*p)[n]`, `int (*p)[a][b]`), as for a parameter of that type: the
+    /// bounds are evaluated once, where the declaration is reached (C11
+    /// 6.8p3), and subscripts, `sizeof *p` and pointer arithmetic scale by
+    /// them. Empty when the object is not such a pointer.
+    pub(super) fn compute_vla_pointee_strides(
+        &mut self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> Vec<Option<Value>> {
+        let Some(full) = Self::object_type_spec(type_spec, derived) else {
+            return vec![];
+        };
+        let pointee = match self.resolve_type_spec(&full) {
+            TypeSpecifier::Pointer(inner, _) => (**inner).clone(),
+            _ => return vec![],
+        };
+        let dims = self.collect_vla_dims(&pointee);
+        if !dims.iter().any(|d| d.is_vla) {
+            return vec![];
+        }
+        self.emit_vla_pointee_strides(&dims)
+    }
+
+    /// The declared object's full type as one specifier, folding pointer and
+    /// array declarators the way `build_full_ctype_with_base` applies them
+    /// (left to right, a run of array bounds innermost-last); `None` for a
+    /// function declarator. Address spaces are not carried.
+    fn object_type_spec(
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> Option<TypeSpecifier> {
+        let mut result = type_spec.clone();
+        let mut i = 0;
+        while i < derived.len() {
+            match &derived[i] {
+                DerivedDeclarator::Pointer(_) => {
+                    result = TypeSpecifier::Pointer(Box::new(result), AddressSpace::Default);
+                    i += 1;
+                }
+                DerivedDeclarator::Array(_) => {
+                    let start = i;
+                    while matches!(derived.get(i), Some(DerivedDeclarator::Array(_))) {
+                        i += 1;
+                    }
+                    for d in derived[start..i].iter().rev() {
+                        if let DerivedDeclarator::Array(bound) = d {
+                            result = TypeSpecifier::Array(Box::new(result), bound.clone());
+                        }
+                    }
+                }
+                DerivedDeclarator::Function(..) | DerivedDeclarator::FunctionPointer(..) => {
+                    return None;
+                }
+            }
+        }
+        Some(result)
+    }
+
     pub(super) fn compute_vla_local_strides(
         &mut self,
         type_spec: &TypeSpecifier,
@@ -1938,17 +2079,13 @@ impl Lowerer {
                 return Some(vla_size);
             }
         }
-        if let TypeSpecifier::Typeof(expr, _) = type_spec {
-            if let Expr::Identifier(name, _) = &**expr {
-                if let Some(vla_size) = self
-                    .func_state
-                    .as_ref()
-                    .and_then(|fs| fs.locals.get(name))
-                    .and_then(|info| info.vla_size)
-                {
-                    return Some(vla_size);
-                }
-            }
+        // `typeof(expr)` of VM type (e.g. a VLA-struct member declared with
+        // it): sized from the operand's layout.
+        if let Some(size) = Self::typeof_operand(type_spec)
+            .and_then(|operand| self.vm_layout_of_expr(operand))
+            .and_then(|layout| layout.size)
+        {
+            return Some(size);
         }
         let resolved = self.resolve_type_spec(type_spec).clone();
         match &resolved {

@@ -38,6 +38,7 @@ impl Lowerer {
     pub(super) fn lower_global_decl(&mut self, decl: &Declaration) {
         self.register_struct_type(&decl.type_spec);
         self.collect_enum_constants(&decl.type_spec);
+        self.declare_declarator_type_name_tags(decl);
 
         if decl.is_typedef() {
             self.lower_typedef(decl);

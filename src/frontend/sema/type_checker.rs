@@ -47,6 +47,9 @@ pub struct ExprTypeChecker<'a> {
     pub expr_types: Option<&'a FxHashMap<ExprId, CType>>,
     /// Whether hosted-library builtin aliases are disabled for constant queries.
     pub builtin_policy: crate::common::pass_policy::BuiltinFlags,
+    /// The TU is C90/C94: an overflowing signed left shift is still an
+    /// integer constant expression (see `ice.rs`).
+    pub pre_c99: bool,
 }
 
 impl<'a> ExprTypeChecker<'a> {
@@ -139,27 +142,31 @@ impl<'a> ExprTypeChecker<'a> {
 
             // Identifiers: look up in symbol table or enum constants
             Expr::Identifier(name, _) => {
-                if crate::frontend::parser::ast::is_function_name_builtin(name) {
-                    return Some(CType::Pointer(Box::new(CType::Char), AddressSpace::Default));
+                // Inside a function the body scope declares it (an array of
+                // the name's length plus one); at file scope it is GCC's
+                // string for that spelling.
+                if crate::frontend::parser::ast::is_function_name_builtin(name)
+                    && self.symbols.lookup(name).is_none()
+                {
+                    let text = crate::frontend::parser::ast::function_name_builtin_text(name, None);
+                    return Some(CType::Array(Box::new(CType::Char), Some(text.len() + 1)));
                 }
                 // Objects/functions and enumerators share C's ordinary-name
-                // namespace.  They live in separate compiler maps, so resolve
-                // by lexical depth; map order is not a shadowing rule.
-                let symbol = self.symbols.lookup_with_depth(name);
-                let enumerator = self.types.enum_constant_with_depth(name);
-                match (symbol, enumerator) {
-                    (Some((sym, sym_depth)), Some((constant, enum_depth))) => {
-                        return Some(if sym_depth > enum_depth {
-                            sym.ty.clone()
-                        } else {
-                            // Enumerators are also entered in the symbol table,
-                            // so equal depths denote that enumerator.
-                            constant.ty.clone()
-                        });
+                // namespace (C11 6.2.3): the innermost visible declaration
+                // decides. Sema enters every enumerator in the symbol table as
+                // well; one known only to `enum_constants` (a block-scope enum
+                // seen by lowering's type context) applies when no symbol of
+                // that name is visible at all.
+                match self.symbols.lookup_ordinary(name) {
+                    Some((sym, false)) => return Some(sym.ty.clone()),
+                    found => {
+                        if let Some(constant) = self.types.enum_constants.get(name) {
+                            return Some(constant.ty.clone());
+                        }
+                        if let Some((sym, _)) = found {
+                            return Some(sym.ty.clone());
+                        }
                     }
-                    (Some((sym, _)), None) => return Some(sym.ty.clone()),
-                    (None, Some((constant, _))) => return Some(constant.ty.clone()),
-                    (None, None) => {}
                 }
                 // Check function signatures for implicitly declared functions
                 if let Some(func_info) = self.functions.get(name) {
@@ -279,23 +286,9 @@ impl<'a> ExprTypeChecker<'a> {
 
             // Conditional: C11 6.5.15 composite type rules
             Expr::Conditional(_, then_expr, else_expr, _) => {
-                use crate::common::const_arith::is_null_pointer_constant;
-                CType::conditional_composite_type(
-                    self.infer_expr_ctype(then_expr),
-                    self.infer_expr_ctype(else_expr),
-                    is_null_pointer_constant(then_expr),
-                    is_null_pointer_constant(else_expr),
-                )
+                self.conditional_ctype(then_expr, else_expr)
             }
-            Expr::GnuConditional(cond, else_expr, _) => {
-                use crate::common::const_arith::is_null_pointer_constant;
-                CType::conditional_composite_type(
-                    self.infer_expr_ctype(cond),
-                    self.infer_expr_ctype(else_expr),
-                    is_null_pointer_constant(cond),
-                    is_null_pointer_constant(else_expr),
-                )
-            }
+            Expr::GnuConditional(cond, else_expr, _) => self.conditional_ctype(cond, else_expr),
 
             // Comma: the result is the right operand's value and type
             // (C11 6.5.17p3) AFTER the usual lvalue conversion, so an array
@@ -319,8 +312,7 @@ impl<'a> ExprTypeChecker<'a> {
                 // of the selected branch, not a fixed return type.
                 if let Expr::Identifier(name, _) = func.as_ref() {
                     if name == "__builtin_choose_expr" && args.len() >= 3 {
-                        let cond = self.eval_const_expr(&args[0]).unwrap_or(1);
-                        return if cond != 0 {
+                        return if self.choose_expr_takes_first(&args[0]) {
                             self.infer_expr_ctype(&args[1])
                         } else {
                             self.infer_expr_ctype(&args[2])
@@ -922,11 +914,106 @@ impl<'a> ExprTypeChecker<'a> {
         }
     }
 
-    /// Evaluate a constant expression for array sizes and similar contexts.
-    /// Delegates to SemaConstEval for the full implementation, unifying
-    /// const_eval across all sema modules.
-    fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
-        let evaluator = super::const_eval::SemaConstEval {
+    /// The type of `c ? then_expr : else_expr` (C11 6.5.15p3-p6).
+    fn conditional_ctype(&self, then_expr: &Expr, else_expr: &Expr) -> Option<CType> {
+        let then_ct = self.infer_expr_ctype(then_expr);
+        let else_ct = self.infer_expr_ctype(else_expr);
+        let then_is_npc = self.conditional_arm_is_npc(then_expr, &then_ct, &else_ct);
+        let else_is_npc = self.conditional_arm_is_npc(else_expr, &else_ct, &then_ct);
+        CType::conditional_composite_type(then_ct, else_ct, then_is_npc, else_is_npc)
+    }
+
+    /// Whether a `?:` arm is a null pointer constant, decided only where the
+    /// answer can change the type ([`CType::conditional_arm_npc_matters`]);
+    /// every other pair skips the structural ICE walk.
+    fn conditional_arm_is_npc(
+        &self,
+        arm: &Expr,
+        arm_ct: &Option<CType>,
+        other_ct: &Option<CType>,
+    ) -> bool {
+        CType::conditional_arm_npc_matters(arm_ct.as_ref(), other_ct.as_ref())
+            && self.is_null_pointer_constant(arm)
+    }
+
+    /// Whether `expr` is an integer constant expression (C11 6.6p6): the
+    /// structural test of `ice.rs` over this checker's types, enumerators
+    /// and required-constant evaluation. The one ICE predicate behind
+    /// `__builtin_choose_expr` and the null pointer constant rule.
+    pub fn is_integer_constant_expr(&self, expr: &Expr) -> bool {
+        let evaluator = self.sema_const_eval();
+        let eval = |e: &Expr| evaluator.eval_required_constant(e);
+        let ctype = |e: &Expr| self.infer_expr_ctype(e);
+        let select = |controlling: &Expr, associations: &[GenericAssociation]| {
+            self.generic_selection_index(controlling, associations)
+        };
+        let is_enumerator = |name: &str| self.symbols.is_enumerator(name);
+        let is_builtin = |name: &str| super::builtins::is_builtin(name);
+        super::ice::IceChecker::new(
+            &eval,
+            &ctype,
+            &select,
+            &is_enumerator,
+            &is_builtin,
+            self.pre_c99,
+        )
+        .is_ice(expr)
+    }
+
+    /// An integer constant expression with the value 0.
+    fn is_integer_constant_zero(&self, expr: &Expr) -> bool {
+        self.is_integer_constant_expr(expr)
+            && self
+                .sema_const_eval()
+                .eval_required_constant(expr)
+                .is_some_and(|c| c.is_zero())
+    }
+
+    /// Whether `expr` is a null pointer constant (C11 6.3.2.3p3): an integer
+    /// constant expression with the value 0, or one cast to `void *`.
+    ///
+    /// Exactness matters beyond diagnostics: the type of `?:` depends on it,
+    /// and the kernel's `__is_constexpr(x)` -- `sizeof(int) == sizeof(*(8 ?
+    /// ((void *)((long)(x) * 0l)) : (int *)8))` -- selects code through that
+    /// type. The syntactic `const_arith` approximation knows no enumerators
+    /// (GCC 16.2: `__is_constexpr(N)` is 1 for an enumerator `N`; lccc said
+    /// 0 and took the other `__builtin_choose_expr` arm) and accepts any
+    /// cast of 0, `(char *)0` included.
+    pub fn is_null_pointer_constant(&self, expr: &Expr) -> bool {
+        self.is_integer_constant_zero(expr) || self.is_void_pointer_null_constant(expr)
+    }
+
+    /// The `void *` form of a null pointer constant: an integer constant
+    /// zero cast to an unqualified `void *`, typedef names resolved (`(CNPT)0`
+    /// with `typedef const void *CNPT;` is not one). GCC accepts exactly this
+    /// shape where a named-address-space pointer is expected.
+    pub fn is_void_pointer_null_constant(&self, expr: &Expr) -> bool {
+        crate::common::const_arith::is_void_pointer_null_constant(
+            expr,
+            &|ts| {
+                if let TypeSpecifier::TypedefName(name) = ts {
+                    if self.types.qualified_pointee_typedefs.contains(name) {
+                        return false;
+                    }
+                }
+                self.resolve_type_spec(ts)
+                    == CType::Pointer(Box::new(CType::Void), AddressSpace::Default)
+            },
+            &|operand| self.is_integer_constant_zero(operand),
+        )
+    }
+
+    /// Whether `__builtin_choose_expr` with condition `cond` selects its
+    /// first operand ([`super::const_eval::SemaConstEval::eval_required_constant`];
+    /// a condition that is no constant has been diagnosed by sema).
+    fn choose_expr_takes_first(&self, cond: &Expr) -> bool {
+        self.sema_const_eval()
+            .eval_required_constant(cond)
+            .is_none_or(|c| c.is_nonzero())
+    }
+
+    fn sema_const_eval(&self) -> super::const_eval::SemaConstEval<'_> {
+        super::const_eval::SemaConstEval {
             types: self.types,
             symbols: self.symbols,
             functions: self.functions,
@@ -934,8 +1021,15 @@ impl<'a> ExprTypeChecker<'a> {
             expr_types: self.expr_types,
             builtin_policy: self.builtin_policy.clone(),
             folding_initializer: false,
-        };
-        evaluator.eval_const_expr(expr)?.to_i64()
+            pre_c99: self.pre_c99,
+        }
+    }
+
+    /// Evaluate a constant expression for array sizes and similar contexts.
+    /// Delegates to SemaConstEval for the full implementation, unifying
+    /// const_eval across all sema modules.
+    fn eval_const_expr(&self, expr: &Expr) -> Option<i64> {
+        self.sema_const_eval().eval_const_expr(expr)?.to_i64()
     }
 
     /// Resolve an anonymous struct or union with inline field declarations.

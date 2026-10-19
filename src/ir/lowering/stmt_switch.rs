@@ -81,7 +81,7 @@ impl Lowerer {
 
         // Lower the body first; case/default stmts register their labels
         self.start_block(body_label);
-        self.lower_stmt(body);
+        self.lower_substatement(body);
         self.terminate(Terminator::Branch(end_label));
 
         // Pop switch context and emit dispatch chain
