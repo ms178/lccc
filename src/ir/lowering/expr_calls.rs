@@ -14,6 +14,26 @@ use crate::frontend::parser::ast::Expr;
 use crate::ir::reexports::{CallInfo, Instruction, IrBinOp, IrConst, Operand, Terminator, Value};
 
 impl Lowerer {
+    /// Whether a freshly lowered operand's defining instruction materialises a
+    /// pointer. Semantic expression recovery is best-effort; this def-site
+    /// query is the narrow tie-breaker used at call-conversion boundaries.
+    fn operand_is_materialized_pointer(&self, operand: Operand) -> bool {
+        let Operand::Value(value) = operand else {
+            return false;
+        };
+        self.func_state
+            .as_ref()
+            .and_then(|state| {
+                state
+                    .instrs
+                    .iter()
+                    .rev()
+                    .find(|inst| inst.dest() == Some(value))
+            })
+            .and_then(Instruction::result_type)
+            == Some(IrType::Ptr)
+    }
+
     /// Classify a struct return size into sret (hidden pointer) or two-register return.
     /// Returns (sret_size, two_reg_size).
     ///
@@ -1253,23 +1273,10 @@ impl Lowerer {
                 // units; if it disagrees with `Load { ty: Ptr }`, using its
                 // I32 fallback here creates malformed IR and truncates the
                 // pointer before the call (glibc vfprintf's end_of_fmt).
-                if let Operand::Value(value) = val
-                    && let Some(IrType::Ptr) = self
-                        .func_state
-                        .as_ref()
-                        .and_then(|state| {
-                            state
-                                .instrs
-                                .iter()
-                                .rev()
-                                .find(|inst| inst.dest() == Some(value))
-                        })
-                        .and_then(Instruction::result_type)
-                {
-                    // Only strengthen a misclassified scalar to Ptr. Aggregate
-                    // rvalues deliberately use integer ABI carriers for small
-                    // structs; replacing their semantic type with that carrier
-                    // breaks the dedicated struct-argument path.
+                if self.operand_is_materialized_pointer(val) {
+                    // Only strengthen to Ptr. Aggregate rvalues deliberately
+                    // use integer ABI carriers for small structs; adopting
+                    // their carrier type breaks the struct-argument path.
                     arg_ty = IrType::Ptr;
                 }
 
