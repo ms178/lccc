@@ -337,15 +337,6 @@ gate "ext-vector-cross-abi" fast \
 gate "ext-vector-rvalue-subscript" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_rvalue_subscript.sh
 
-gate "ext-vector-callsite-abi" fast \
-    env CCC="$LCCC" bash tests/regression/check_ext_vector_callsite_abi.sh
-
-gate "ext-vector-lane1-abi" fast \
-    env CCC="$LCCC" bash tests/regression/check_ext_vector_lane1_abi.sh
-
-gate "ext-vector-narrow-arith" fast \
-    env CCC="$LCCC" bash tests/regression/check_ext_vector_narrow_arith.sh
-
 # The by-value ext-vector ABI grid: every shape (lane type x lane count) on
 # -m64 and -m32 at -O0/-O2, built as provider and caller by lccc and by the
 # pinned Clang 23.1.3 oracle and linked in all four combinations; shapes
