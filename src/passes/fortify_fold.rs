@@ -86,7 +86,7 @@
 //! never inline away; running after inlining keeps the Copy/Cast flag-staging
 //! shapes canonical).  Disable with `CCC_DISABLE_PASSES=fortifyfold`.
 
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::instruction::{CallInfo, Instruction};
 use crate::ir::module::{IrFunction, IrModule};
@@ -191,20 +191,18 @@ fn max_value_id(func: &IrFunction) -> u32 {
     max
 }
 
-/// True when no instruction or terminator in the function uses `v`.
-fn value_unused(func: &IrFunction, v: Value) -> bool {
-    let id = v.0;
+/// Every value id some instruction or terminator of the function uses.
+/// Built once per function: asking "is this call's result unused?" with a
+/// whole-function scan per call made the pass quadratic in call-dense code.
+fn used_value_ids(func: &IrFunction) -> FxHashSet<u32> {
+    let mut used = FxHashSet::default();
     for block in &func.blocks {
         for inst in &block.instructions {
-            if inst.used_values().contains(&id) {
-                return false;
-            }
+            used.extend(inst.used_values());
         }
-        if block.terminator.used_values().contains(&id) {
-            return false;
-        }
+        used.extend(block.terminator.used_values());
     }
-    true
+    used
 }
 
 /// Build a plain non-variadic `int name(args...)` call with an unused result.
@@ -653,6 +651,9 @@ pub fn run(module: &mut IrModule, size_t_is_u32: bool) {
 
         let mut next_val = func.next_value_id.max(max_value_id(func) + 1);
         let mut decisions: Vec<(usize, usize, Decision)> = Vec::new();
+        // The function is not edited until every decision is taken, so one
+        // use set answers every call's question (built on first need).
+        let mut used: Option<FxHashSet<u32>> = None;
         for (bi, block) in func.blocks.iter().enumerate() {
             for (ii, inst) in block.instructions.iter().enumerate() {
                 let Instruction::Call { func: callee, info } = inst else {
@@ -665,12 +666,6 @@ pub fn run(module: &mut IrModule, size_t_is_u32: bool) {
                 if !info.assume_library {
                     continue;
                 }
-                // Result must be unused (absent or dead).
-                if let Some(dest) = info.dest {
-                    if !value_unused(func, dest) {
-                        continue;
-                    }
-                }
                 let (stream_first, variadic, plain) = match callee.as_str() {
                     "__printf_chk" => (false, true, false),
                     "__vprintf_chk" => (false, false, false),
@@ -682,6 +677,15 @@ pub fn run(module: &mut IrModule, size_t_is_u32: bool) {
                     "vfprintf" => (true, false, true),
                     _ => continue,
                 };
+                // Result must be unused (absent or dead).
+                if let Some(dest) = info.dest {
+                    if used
+                        .get_or_insert_with(|| used_value_ids(func))
+                        .contains(&dest.0)
+                    {
+                        continue;
+                    }
+                }
                 let fresh = format!(".Lchkfold{}", literal_counter);
                 if let Some(decision) = classify(
                     &ctx,

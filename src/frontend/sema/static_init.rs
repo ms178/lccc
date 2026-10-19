@@ -389,12 +389,15 @@ impl<'s> StaticInitChecker<'s> {
         // Inside a function, `__func__` (and GCC's `__FUNCTION__` and, in C,
         // `__PRETTY_FUNCTION__`) is a static const char array (C11 6.4.2.2p1),
         // so it is an address constant like any static array: GCC 16.2
-        // accepts `static const char *s = __func__ + 1;`. At file scope it
-        // names nothing; it stays undeclared here, as in C (GCC only warns).
-        if crate::frontend::parser::ast::is_function_name_builtin(name)
-            && !self.symbols.at_file_scope()
-        {
-            return Kind::Address(Some(name));
+        // accepts `static const char *s = __func__ + 1;`. At file scope C
+        // defines none; GCC makes it a string literal (`function_name_
+        // builtin_text`), an address constant too.
+        if crate::frontend::parser::ast::is_function_name_builtin(name) {
+            return if self.symbols.at_file_scope() {
+                Kind::Address(None)
+            } else {
+                Kind::Address(Some(name))
+            };
         }
         match self.symbols.lookup(name) {
             // Undeclared: already diagnosed; do not report a second error.
@@ -408,11 +411,15 @@ impl<'s> StaticInitChecker<'s> {
                         Kind::Address(Some(name))
                     }
                 }
-                _ if self.symbols.is_folded(name) => match sym.ty {
-                    // A folded const pointer carries an address constant.
-                    CType::Pointer(..) => Kind::Address(None),
-                    _ => Kind::Value,
-                },
+                // A C23 `constexpr` object holds a constant by construction
+                // (a pointer one is null), even when no value was folded.
+                _ if self.symbols.is_folded(name) || self.symbols.is_constexpr(name) => {
+                    match sym.ty {
+                        // A folded const pointer carries an address constant.
+                        CType::Pointer(..) => Kind::Address(None),
+                        _ => Kind::Value,
+                    }
+                }
                 _ => Kind::Bad,
             },
         }
@@ -421,7 +428,9 @@ impl<'s> StaticInitChecker<'s> {
     /// Whether `e` reads an element or member of a folded const object.
     fn folded_object_read(&self, e: &Expr) -> bool {
         match e {
-            Expr::Identifier(name, _) => self.symbols.is_folded(name),
+            Expr::Identifier(name, _) => {
+                self.symbols.is_folded(name) || self.symbols.is_constexpr(name)
+            }
             Expr::MemberAccess(base, _, _) => self.folded_object_read(base),
             Expr::ArraySubscript(base, index, _) => {
                 matches!((self.ctype)(base), Some(CType::Array(..)))

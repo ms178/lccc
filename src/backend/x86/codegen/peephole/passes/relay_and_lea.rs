@@ -331,6 +331,68 @@ pub(super) fn function_range(
     Some((start, end))
 }
 
+/// The `.cfi_startproc` / `.cfi_endproc` markers of a line store, answering
+/// [`function_range`] in O(log F) for passes that ask once per loop or per
+/// candidate (a scan per query is quadratic in the function's length).
+///
+/// Exact while the caller reports every `insert_line` through
+/// [`CfiIndex::shift_for_insert`] and never rewrites, nops or inserts a CFI
+/// marker line itself.
+pub(super) struct CfiIndex {
+    /// Every live marker, ascending: `(line, is_startproc)`.
+    marks: Vec<(usize, bool)>,
+}
+
+impl CfiIndex {
+    pub(super) fn build(store: &LineStore, infos: &[LineInfo]) -> Self {
+        let mut marks = Vec::new();
+        for (n, info) in infos.iter().enumerate().take(store.len()) {
+            if info.is_nop() {
+                continue;
+            }
+            let t = info.trimmed(store.get(n));
+            if t.starts_with(".cfi_startproc") {
+                marks.push((n, true));
+            } else if t.starts_with(".cfi_endproc") {
+                marks.push((n, false));
+            }
+        }
+        CfiIndex { marks }
+    }
+
+    /// [`function_range`]`(store, infos, idx)` for a store of `len` lines.
+    pub(super) fn function_range(&self, idx: usize, len: usize) -> Option<(usize, usize)> {
+        if len == 0 {
+            return None;
+        }
+        // Nearest marker at or above the clamped index going backward: a
+        // startproc opens the function, an endproc means `idx` lies
+        // between two functions.
+        let k = self.marks.partition_point(|&(n, _)| n <= idx.min(len - 1));
+        let (start, is_start) = *self.marks.get(k.checked_sub(1)?)?;
+        if !is_start {
+            return None;
+        }
+        // First endproc at or after `idx` (startprocs are stepped over, as
+        // the forward scan does); past-the-end when there is none.
+        let from = self.marks.partition_point(|&(n, _)| n < idx);
+        let end = self.marks[from..]
+            .iter()
+            .find(|&&(_, is_start)| !is_start)
+            .map_or(len, |&(n, _)| n);
+        Some((start, end))
+    }
+
+    /// Account for `store.insert_line(ins, ..)` of a non-CFI line.
+    pub(super) fn shift_for_insert(&mut self, ins: usize) {
+        for (n, _) in &mut self.marks {
+            if *n >= ins {
+                *n += 1;
+            }
+        }
+    }
+}
+
 /// Registers an ABI-visible control transfer can READ without naming them in
 /// the instruction text: the SysV argument registers (`%rdi %rsi %rdx %rcx
 /// %r8 %r9`) and `%rax` (vector-argument count for variadic callees).
@@ -430,10 +492,43 @@ pub(super) fn family_private_to(
     fam: RegId,
     owned: &[usize],
 ) -> bool {
+    match function_range(store, infos, idx) {
+        Some(range) => family_private_in(store, infos, range, fam, owned),
+        None => false,
+    }
+}
+
+/// [`family_private_to`] for a caller holding the [`FileLiveness`] of the
+/// file: the enclosing function's bounds come from its record (O(1), the
+/// same `[start, end)` as [`function_range`] -- see
+/// `FileLiveness::recorded_function`) instead of a rescan for the
+/// delimiters.  The rescan is O(function) per query, and this proof runs
+/// for every candidate the dataflow calls live -- nearly all of them in
+/// -O0 code, where the accumulator is live everywhere: compile time was
+/// quadratic in function length.
+fn family_private_lv(
+    lv: &FileLiveness,
+    store: &LineStore,
+    infos: &[LineInfo],
+    idx: usize,
+    fam: RegId,
+    owned: &[usize],
+) -> bool {
+    match lv.recorded_function(store, infos, idx) {
+        Some(range) => family_private_in(store, infos, range, fam, owned),
+        None => family_private_to(store, infos, idx, fam, owned),
+    }
+}
+
+/// The scan behind [`family_private_to`] over the function `[start, end)`.
+fn family_private_in(
+    store: &LineStore,
+    infos: &[LineInfo],
+    (start, end): (usize, usize),
+    fam: RegId,
+    owned: &[usize],
+) -> bool {
     let mask = 1u16 << fam;
-    let Some((start, end)) = function_range(store, infos, idx) else {
-        return false;
-    };
     let mut n = start;
     while n < end {
         if infos[n].is_nop() {
@@ -540,7 +635,8 @@ pub(super) fn provably_dead_lv(
     if matches!(lv.live_after(use_idx, fam), Some(false)) {
         return true;
     }
-    provably_dead(store, infos, use_idx, fam, owned)
+    dead_in_block_after(store, infos, use_idx + 1, fam)
+        || family_private_lv(lv, store, infos, use_idx, fam, owned)
 }
 
 /// Deadness oracle for passes that delete a definition and rewrite its
@@ -2014,7 +2110,8 @@ fn dest_width(name: &str) -> Option<u8> {
 ///
 /// Conditions:
 /// * the producer is a pure producer (no read-modify-write) and does not
-///   mention the copy's destination family anywhere;
+///   mention the copy's destination family or (after the rewrite) its own
+///   register -- the `aliasing` form below lifts this;
 /// * the copy is an adjacent plain register move whose width is compatible —
 ///   a 32-bit producer may feed a `movl` or a `movq` copy (both leave the
 ///   destination zero-extended), a 64-bit producer only a `movq` copy
@@ -2022,6 +2119,41 @@ fn dest_width(name: &str) -> Option<u8> {
 ///   that the copy discarded);
 /// * the producer's register is provably dead after the copy (module header).
 pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    retarget_producer_into_copy_impl(store, infos, false)
+}
+
+/// The late form of [`retarget_producer_into_copy`]: the producer's sources
+/// may name either register. Every `PURE_PRODUCERS` form reads all of its
+/// operands before writing its one destination and never reads that
+/// destination implicitly (no `cmov`, no `bsf`), so
+///
+/// ```text
+///     movzbl %al, %edx            movzbl %al, %eax
+///     movq %rdx, %rax       ->
+/// ```
+///
+/// and `movzbl %dl, %edx; movq %rdx, %rax` -> `movzbl %dl, %eax` are exact:
+/// the read still happens at the producer, before any write. A resulting
+/// `movq %R, %R` is deleted; `movl %R, %R` stays a zero-extension (the
+/// self-zext cleanup removes it when the upper half is already zero).
+///
+/// Phase ordering: it runs once after the local fixpoints. Inside them it
+/// would merge chains into one register before the RMW coalescing and the
+/// copy+shift -> `lea` folds see them (`sarl; movslq %eax, %r11; movq %r11,
+/// %rax; shlq $2, %rax; movq %rax, %rcx` loses its `leaq 0(,%r11,4), %rcx`),
+/// so here it only removes copies those passes left behind.
+pub(super) fn retarget_producer_into_copy_aliasing(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    retarget_producer_into_copy_impl(store, infos, true)
+}
+
+fn retarget_producer_into_copy_impl(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    aliasing: bool,
+) -> bool {
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
     let mut changed = false;
@@ -2115,9 +2247,9 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
             i += 1;
             continue;
         }
-        // The producer must not read the destination family (its source is
-        // evaluated before the write, but a rewrite would alias them).
-        if line_refs_family(prod_src, d_fam) || line_refs_family(copy_dst, a_fam) {
+        // The strict form keeps the producer's sources off D (the aliasing
+        // form allows it; see `retarget_producer_into_copy_aliasing`).
+        if (!aliasing && line_refs_family(prod_src, d_fam)) || line_refs_family(copy_dst, a_fam) {
             i += 1;
             continue;
         }
@@ -2132,13 +2264,22 @@ pub(super) fn retarget_producer_into_copy(store: &mut LineStore, infos: &mut [Li
             REG_NAMES[1][d_fam as usize]
         };
         let new_line = format!("    {}{}, {}", op, prod_src, new_dst);
-        if line_refs_family(&new_line, a_fam) {
+        if !aliasing && line_refs_family(&new_line, a_fam) {
             i += 1;
+            continue;
+        }
+        if op.trim_end() == "movq" && prod_src == new_dst {
+            // `movq %rax, %rdx; movq %rdx, %rax`: the pair is the identity.
+            mark_nop(&mut infos[i]);
+            mark_nop(&mut infos[j]);
+            lv.refresh_span(store, infos, i, j);
+            changed = true;
+            i = j + 1;
             continue;
         }
         replace_line(store, &mut infos[i], i, new_line);
         mark_nop(&mut infos[j]);
-        lv.refresh_at(store, infos, i);
+        lv.refresh_span(store, infos, i, j);
         changed = true;
         i = j + 1;
     }
@@ -3485,7 +3626,7 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
             || dead_in_block_after(store, infos, li + 1, s_fam)
             || (is_caller_saved_family(s_fam)
                 && !copy_in_loop(store, infos, li)
-                && family_private_to(store, infos, li, s_fam, &[li])))
+                && family_private_lv(&lv, store, infos, li, s_fam, &[li])))
         {
             continue;
         }
@@ -3676,6 +3817,72 @@ fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String> 
 
 #[cfg(test)]
 mod tests {
+
+    /// `CfiIndex` answers exactly what the `function_range` scan answers, for
+    /// every line: before the first function, inside one, on a marker,
+    /// between two functions (an `endproc` nearer than any `startproc`),
+    /// across a marker nopped before the index was built, inside a function
+    /// left open at the end of the text, and after an `insert_line`.
+    #[test]
+    fn cfi_index_matches_function_range_scan() {
+        let asm = concat!(
+            "    .text\n",
+            "f:\n.cfi_startproc\n",
+            "    movl $1, %eax\n",
+            "    ret\n.cfi_endproc\n",
+            "    .p2align 4\n",
+            "g:\n.cfi_startproc\n",
+            "    .cfi_endproc\n", // nopped below: g continues past it
+            "    movl $2, %eax\n",
+            "    ret\n.cfi_endproc\n",
+            "h:\n.cfi_startproc\n",
+            "    movl $3, %eax\n",
+            "    ret\n",
+        );
+        let mut store = super::LineStore::new(asm.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| super::classify_line(store.get(i)))
+            .collect();
+        let stray = (0..store.len())
+            .filter(|&i| store.get(i).trim() == ".cfi_endproc")
+            .nth(1)
+            .expect("fixture has a second endproc");
+        super::mark_nop(&mut infos[stray]);
+
+        let check = |store: &super::LineStore, infos: &[super::LineInfo], idx: &super::CfiIndex| {
+            for i in 0..store.len() {
+                assert_eq!(
+                    idx.function_range(i, store.len()),
+                    super::function_range(store, infos, i),
+                    "line {i}: {:?}",
+                    store.get(i)
+                );
+            }
+        };
+        let mut idx = super::CfiIndex::build(&store, &infos);
+        check(&store, &infos, &idx);
+        // Unterminated `h` runs to the end; the gap between f and g is in
+        // no function.
+        let last = store.len() - 1;
+        assert_eq!(
+            idx.function_range(last, store.len()).map(|r| r.1),
+            Some(store.len())
+        );
+        let gap = (0..store.len())
+            .find(|&i| store.get(i).trim() == ".p2align 4")
+            .unwrap();
+        assert_eq!(idx.function_range(gap, store.len()), None);
+
+        // Insert inside g (and at the very front): the shifted index still
+        // agrees with a fresh scan.
+        for at in [stray + 2, 0] {
+            let text = "    nop".to_string();
+            store.insert_line(at, text.clone());
+            infos.insert(at, super::classify_line(&text));
+            idx.shift_for_insert(at);
+            check(&store, &infos, &idx);
+        }
+    }
 
     #[test]
     fn mem_index_relay_folds_movl_copy() {
@@ -5737,6 +5944,51 @@ mod tests {
             out.contains("movzbl (%rdx,%r12), %r10d") || out.contains("movq %rax, (%rsi)"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn producer_retarget_allows_sources_naming_either_register() {
+        // The return-value tail: the zero-extend reads %al and the copy
+        // writes %rax. x86 reads the source before the write.
+        let ret = |prod: &str| {
+            run(&format!(
+                "foo:\n.cfi_startproc\n    # LCCC_RET_XMM 0\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 1\n    addq %rsi, %rax\n    {prod}\n    movq %rdx, %rax\n    ret\n.cfi_endproc\n"
+            ))
+        };
+        let out = ret("movzbl %al, %edx");
+        assert!(
+            out.contains("movzbl %al, %eax") && !out.contains("%rdx"),
+            "{out}"
+        );
+        // The producer reads its own register (dead after the copy).
+        let out = ret("movzbl %dl, %edx");
+        assert!(
+            out.contains("movzbl %dl, %eax") && !out.contains("movq %rdx"),
+            "{out}"
+        );
+        // A 64-bit round trip is the identity: both lines go.
+        let out = ret("movq %rax, %rdx");
+        assert!(
+            !out.contains("%rdx") && !out.contains("movq %rax, %rax"),
+            "{out}"
+        );
+        // A memory source whose address names the destination.
+        let out = ret("movl 8(%rax,%rdx), %edx");
+        assert!(
+            out.contains("movl 8(%rax,%rdx), %eax") && !out.contains("movq %rdx"),
+            "{out}"
+        );
+        // The producer's register stays live: no retarget.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movzbl %al, %edx\n",
+            "    movq %rdx, %rax\n",
+            "    movq %rdx, (%rsi)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movzbl %al, %edx"), "{out}");
     }
 
     #[test]

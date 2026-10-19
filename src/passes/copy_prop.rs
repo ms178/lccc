@@ -375,6 +375,28 @@ fn collect_derived_pointers(func: &IrFunction, root: Value) -> FxHashSet<u32> {
 
 /// Propagate copies within a single function.
 pub(crate) fn propagate_copies(func: &mut IrFunction) -> usize {
+    propagate_copies_impl(func, None)
+}
+
+/// The backend's final cleanup (after the live-range splitters): forward
+/// every value-sourced copy and every constant copy except a deliberate
+/// constant home -- a `Copy dest = Const` that predates the splitters
+/// (`dest < fresh_floor`, the function's id bound before they ran) and
+/// that `spare(dest, constant)` accepts (the hoisting passes' own criteria).
+/// Such a copy survived every earlier copy propagation on purpose; the
+/// splitters' fresh copies (remat clones) are always forwarded.
+pub(crate) fn propagate_copies_sparing(
+    func: &mut IrFunction,
+    fresh_floor: u32,
+    spare: &dyn Fn(Value, &IrConst) -> bool,
+) -> usize {
+    propagate_copies_impl(func, Some((fresh_floor, spare)))
+}
+
+fn propagate_copies_impl(
+    func: &mut IrFunction,
+    spare: Option<(u32, &dyn Fn(Value, &IrConst) -> bool)>,
+) -> usize {
     let max_id = func.max_value_id() as usize;
 
     // Multi-def guard (SOUNDNESS): forwarding `use(x)` to `use(src)` is valid
@@ -400,7 +422,7 @@ pub(crate) fn propagate_copies(func: &mut IrFunction) -> usize {
         .collect();
 
     // Phase 1: Build the copy map as a flat lookup table (dest -> resolved source)
-    let (mut copy_map, has_copies) = build_copy_map(func, max_id);
+    let (mut copy_map, has_copies) = build_copy_map(func, max_id, spare);
     if has_copies {
         for i in 0..copy_map.len() {
             if let Some(Operand::Value(src)) = copy_map[i] {
@@ -437,7 +459,15 @@ pub(crate) fn propagate_copies(func: &mut IrFunction) -> usize {
 /// updated to point directly to the final resolved value. This makes
 /// resolution amortized O(1) per entry instead of O(chain_length).
 /// Also avoids allocating a separate `resolved` vector by resolving in-place.
-fn build_copy_map(func: &IrFunction, max_id: usize) -> (Vec<Option<Operand>>, bool) {
+///
+/// `spare = (fresh_floor, pred)`: a single-def `Copy dest = Const(c)` with
+/// `dest < fresh_floor` and `pred(dest, c)` is left out of the table (see
+/// [`propagate_copies_sparing`]); chains through it stop at `dest`.
+fn build_copy_map(
+    func: &IrFunction,
+    max_id: usize,
+    spare: Option<(u32, &dyn Fn(Value, &IrConst) -> bool)>,
+) -> (Vec<Option<Operand>>, bool) {
     // First pass: collect direct copy relationships into flat table.
     // If a Value has multiple Copy definitions (e.g. from single-phi elimination),
     // we mark it as multi-def using a sentinel (self-referencing copy) and skip it.
@@ -463,6 +493,18 @@ fn build_copy_map(func: &IrFunction, max_id: usize) -> (Vec<Option<Operand>>, bo
 
     if !has_copies {
         return (direct, false);
+    }
+
+    // Protected constants are dropped only after the multi-def scan above:
+    // a value with two Copy definitions holds the self-referencing
+    // `Value` sentinel, never a `Const`, so it stays poisoned. (Shape test,
+    // not equality: a NaN constant never compares equal to itself.)
+    if let Some((floor, pred)) = spare {
+        for (id, entry) in direct.iter_mut().enumerate().take(floor as usize) {
+            if matches!(entry, Some(Operand::Const(c)) if pred(Value(id as u32), c)) {
+                *entry = None;
+            }
+        }
     }
 
     // Second pass: resolve chains in-place with path compression.
@@ -1394,5 +1436,116 @@ mod tests {
 
         let replacements = propagate_copies(&mut func);
         assert_eq!(replacements, 0);
+    }
+
+    /// `%1 = Copy K1`, `%2 = Copy K2`, `%3 = Copy %1`, `%4 = Copy K1` (the
+    /// last created "by a splitter": id >= floor 4), and a use of each in a
+    /// sum returned from the block.
+    fn sparing_func() -> IrFunction {
+        let mut func = IrFunction::new("spare".to_string(), IrType::I64, vec![], false);
+        let k = |v| Operand::Const(IrConst::I64(v));
+        let val = |v| Operand::Value(Value(v));
+        let add = |dest, lhs, rhs| Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty: IrType::I64,
+        };
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: k(1 << 40),
+                },
+                Instruction::Copy {
+                    dest: Value(2),
+                    src: k(5),
+                },
+                Instruction::Copy {
+                    dest: Value(3),
+                    src: val(1),
+                },
+                Instruction::Copy {
+                    dest: Value(4),
+                    src: k(1 << 40),
+                },
+                add(5, val(1), val(2)),
+                add(6, val(3), val(4)),
+                add(7, val(5), val(6)),
+            ],
+            terminator: Terminator::Return(Some(val(7))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 8;
+        func
+    }
+
+    fn operands_of(func: &IrFunction, dest: u32) -> (Operand, Operand) {
+        for inst in &func.blocks[0].instructions {
+            if let Instruction::BinOp {
+                dest: d, lhs, rhs, ..
+            } = inst
+            {
+                if d.0 == dest {
+                    return (*lhs, *rhs);
+                }
+            }
+        }
+        panic!("no BinOp %{dest}");
+    }
+
+    /// The final cleanup keeps a pre-split constant home the predicate
+    /// accepts (uses of %1 and of the chain %3 -> %1 stop at %1), forwards
+    /// a constant it rejects (%2), and always forwards the splitters' own
+    /// fresh constant copies (%4, above the floor) even when the predicate
+    /// would accept the constant. Without a predicate everything forwards.
+    #[test]
+    fn sparing_cleanup_keeps_only_accepted_pre_split_constant_homes() {
+        let big = Operand::Const(IrConst::I64(1 << 40));
+        let mut func = sparing_func();
+        let accept_big = |_: Value, c: &IrConst| matches!(c, IrConst::I64(v) if *v == 1 << 40);
+        propagate_copies_sparing(&mut func, 4, &accept_big);
+        assert_eq!(
+            operands_of(&func, 5),
+            (Operand::Value(Value(1)), Operand::Const(IrConst::I64(5)))
+        );
+        assert_eq!(operands_of(&func, 6), (Operand::Value(Value(1)), big));
+
+        // The dest decides too: the predicate sees which copy it judges.
+        let mut func = sparing_func();
+        propagate_copies_sparing(&mut func, 4, &|v: Value, _: &IrConst| v.0 == 2);
+        assert_eq!(operands_of(&func, 5), (big, Operand::Value(Value(2))));
+
+        let mut func = sparing_func();
+        propagate_copies(&mut func);
+        assert_eq!(
+            operands_of(&func, 5),
+            (big, Operand::Const(IrConst::I64(5)))
+        );
+        assert_eq!(operands_of(&func, 6), (big, big));
+    }
+
+    /// A constant copy with two definitions is never forwarded, whatever
+    /// the predicate says: sparing only removes table entries, and the
+    /// multi-def sentinel must survive a predicate that rejects the
+    /// constant (forwarding either definition would be unsound).
+    #[test]
+    fn sparing_cleanup_never_forwards_a_multi_def_copy() {
+        let accept_2 = |v: Value, _: &IrConst| v.0 == 2;
+        let reject = |_: Value, _: &IrConst| false;
+        for spare in [&accept_2 as &dyn Fn(Value, &IrConst) -> bool, &reject] {
+            let mut func = sparing_func();
+            func.blocks[0].instructions.insert(
+                1,
+                Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Const(IrConst::I64(6)),
+                },
+            );
+            propagate_copies_sparing(&mut func, 4, spare);
+            assert_eq!(operands_of(&func, 5).1, Operand::Value(Value(2)));
+        }
     }
 }

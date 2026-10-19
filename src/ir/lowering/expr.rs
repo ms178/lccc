@@ -184,11 +184,11 @@ impl Lowerer {
     /// For complex types, tests (real != 0) || (imag != 0) per C11 6.3.1.2.
     pub(super) fn lower_condition_expr(&mut self, expr: &Expr) -> Operand {
         let expr_ct = self.expr_ctype(expr);
-        if expr_ct.is_decimal() {
-            // C23 decimal truthiness: `if (d)` is `(d != 0)` under decimal
-            // semantics (so -0 tests false like +0).
+        if expr_ct.is_soft_float() {
+            // Decimal / _Float128 truthiness: `if (d)` is `(d != 0)` under the
+            // type's semantics (so -0 tests false like +0).
             let val = self.lower_expr(expr);
-            return self.lower_decimal_truthiness(val, &expr_ct);
+            return self.lower_soft_float_truthiness(val, &expr_ct);
         }
         if expr_ct.is_complex() {
             let val = self.lower_expr(expr);
@@ -259,7 +259,8 @@ impl Lowerer {
         ) {
             self.discard_expr_result = false;
         }
-        self.discard_assign_result = saved_discard && matches!(expr, Expr::Assign(..));
+        self.discard_assign_result =
+            saved_discard && matches!(expr, Expr::Assign(..) | Expr::CompoundAssign(..));
         let result = self.lower_expr_inner(expr);
         self.discard_assign_result = false;
         self.discard_expr_result = saved_discard;
@@ -336,7 +337,10 @@ impl Lowerer {
             Expr::StringLiteral(s, _) => self.lower_string_literal(s, false),
             Expr::WideStringLiteral(s, _) => self.lower_string_literal(s, true),
             Expr::Char16StringLiteral(s, _) => self.lower_char16_string_literal(s),
-            Expr::Identifier(name, _) => self.lower_identifier(name),
+            Expr::Identifier(name, _) => match self.identifier_enumerator(expr, name) {
+                Some((value, _)) => Operand::Const(IrConst::I64(value)),
+                None => self.lower_identifier(name),
+            },
             Expr::BinaryOp(op, lhs, rhs, _) => self.lower_binary_op(op, lhs, rhs),
             Expr::UnaryOp(op, inner, _) => self.lower_unary_op(*op, inner),
             Expr::PostfixOp(op, inner, _) => self.lower_post_inc_dec(inner, *op),
@@ -389,6 +393,9 @@ impl Lowerer {
             Expr::GenericSelection(controlling, associations, _) => {
                 self.lower_generic_selection(controlling, associations)
             }
+            // A type operand has no value: the parser builds one only as the
+            // controlling operand of `_Generic`, which is never evaluated.
+            Expr::TypeOperand(..) => Operand::Const(IrConst::I64(0)),
             Expr::LabelAddr(label_name, _) => {
                 // GNU C nested functions: &&label of an ENCLOSING function's
                 // label resolves to the parent's named alias (block IDs are
@@ -534,8 +541,12 @@ impl Lowerer {
 
     fn lower_identifier(&mut self, name: &str) -> Operand {
         if crate::frontend::parser::ast::is_function_name_builtin(name) {
-            let name = self.func().name.clone();
-            return self.lower_string_literal(&name, false);
+            let text = crate::frontend::parser::ast::function_name_builtin_text(
+                name,
+                self.func_state.as_ref().map(|fs| fs.source_name()),
+            )
+            .to_string();
+            return self.lower_string_literal(&text, false);
         }
         if name == "NULL" {
             return Operand::Const(IrConst::I64(0));
@@ -613,10 +624,7 @@ impl Lowerer {
             return Operand::Value(dest);
         }
 
-        if let Some(constant) = self.types.enum_constants.get(name) {
-            return Operand::Const(IrConst::I64(constant.value));
-        }
-
+        // Enumerators were resolved by the caller (`identifier_enumerator`).
         if let Some(mangled) = self.func_mut().static_local_names.get(name).cloned() {
             if let Some(ginfo) = self.globals.get(&mangled).cloned() {
                 return self.load_global_var(mangled, &ginfo);
@@ -914,7 +922,7 @@ impl Lowerer {
     /// decline (fall back to the raw cast, i.e. status quo ante):
     /// - `U128` is shared by `_Float128` and `unsigned __int128`;
     /// - pointers/void/aggregates never reach decimal conversions.
-    fn decimal_conversion_target_ct(target_ty: IrType) -> Option<CType> {
+    pub(super) fn decimal_conversion_target_ct(target_ty: IrType) -> Option<CType> {
         Some(match target_ty {
             IrType::F32 => CType::Float,
             IrType::F64 => CType::Double,
@@ -1000,6 +1008,30 @@ impl Lowerer {
             return Operand::Value(dest);
         }
         src
+    }
+
+    /// Convert `val`, the lowered value of `e` with IR type `ir_ty`, to
+    /// _Bool: `e != 0` (C11 6.3.1.2) as an I32 0/1. Every conversion site
+    /// that still has its source expression must use this rather than
+    /// `emit_bool_normalize_typed`, which sees only the IR type: decimal
+    /// and _Float128 values live in integer carriers that do not encode
+    /// zero uniquely (-0.0Q, BID zeros with any exponent such as 0.00DD),
+    /// so a carrier test is wrong for them. Binary-float carriers skip the
+    /// C type lookup (`IrType::is_float` is not the test: it includes the
+    /// decimal carriers D32/D64).
+    pub(super) fn emit_expr_bool_conversion(
+        &mut self,
+        val: Operand,
+        ir_ty: IrType,
+        e: &Expr,
+    ) -> Operand {
+        if !matches!(ir_ty, IrType::F32 | IrType::F64 | IrType::F128) {
+            let ct = self.expr_ctype(e);
+            if ct.is_soft_float() {
+                return self.lower_soft_float_truthiness(val, &ct);
+            }
+        }
+        self.emit_bool_normalize_typed(val, ir_ty)
     }
 
     /// Normalize a value for _Bool storage at the given source type.

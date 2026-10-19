@@ -17,7 +17,7 @@ fn type_size(ty: crate::common::types::IrType) -> i64 {
 }
 
 /// Remove stores to fields of non-escaping stack aggregates that are never read.
-fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> usize {
+pub(crate) fn eliminate_dead_aggregate_field_stores(func: &mut IrFunction) -> usize {
     // Track aggregate roots separately from precise paths. Loop pointer phis
     // commonly merge offsets 0 and 48; they still share the same allocation
     // root even though `pointer_paths` deliberately rejects the differing paths.

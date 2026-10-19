@@ -24,6 +24,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     if func.blocks.len() < 2 {
         return 0;
     }
+    // Never hoist into a sibling loop's header (see
+    // `loop_preheader::dedicate_foreign_preheaders`).
+    super::loop_preheader::dedicate_foreign_preheaders(func, loop_has_candidate);
     let cfg = analysis::CfgAnalysis::build(func);
     let mut loops =
         loop_analysis::find_natural_loops(cfg.num_blocks, &cfg.preds, &cfg.succs, &cfg.idom);
@@ -75,6 +78,14 @@ fn const_of(op: &Operand) -> Option<FpConst> {
     }
 }
 
+/// Whether this pass materializes `c` in loop preheaders (a non-zero
+/// F32/F64 bit pattern; +0.0 has a free zeroing idiom). Late passes that
+/// forward constant copies must spare such copies: they are register
+/// homes this pass created on purpose.
+pub(crate) fn is_hoisted_fp_const(c: &IrConst) -> bool {
+    const_of(&Operand::Const(*c)).is_some_and(|f| !f.is_zero())
+}
+
 /// Visit operands that can hold an FP constant (the arithmetic/comparison
 /// forms that appear in FP loop bodies).
 fn for_each_fp_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand)) {
@@ -96,6 +107,22 @@ fn for_each_fp_operand(inst: &Instruction, f: &mut dyn FnMut(&Operand)) {
         }
         _ => {}
     }
+}
+
+/// Whether `hoist_in_loop` would hoist anything for this loop.
+fn loop_has_candidate(func: &IrFunction, lp: &loop_analysis::NaturalLoop) -> bool {
+    let mut found = false;
+    for &bi in &lp.body {
+        for inst in &func.blocks[bi].instructions {
+            for_each_fp_operand(inst, &mut |op| {
+                found |= const_of(op).is_some_and(|c| !c.is_zero());
+            });
+            if found {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn hoist_in_loop(
@@ -168,5 +195,27 @@ fn rewrite_fp_operands(inst: &mut Instruction, c: FpConst, new_val: u32) {
             sub(false_val);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Exactly the constants the pass hoists: every non-zero F32/F64 bit
+    /// pattern. +0.0 has a free zeroing idiom and is not hoisted; -0.0 is a
+    /// distinct bit pattern (sign bit set) that must be materialized, as
+    /// must NaN. Integers and other widths are not this pass's.
+    #[test]
+    fn hoisted_fp_constants_are_the_nonzero_bit_patterns() {
+        assert!(!is_hoisted_fp_const(&IrConst::F64(0.0)));
+        assert!(!is_hoisted_fp_const(&IrConst::F32(0.0)));
+        assert!(is_hoisted_fp_const(&IrConst::F64(-0.0)));
+        assert!(is_hoisted_fp_const(&IrConst::F32(-0.0)));
+        assert!(is_hoisted_fp_const(&IrConst::F64(1.5)));
+        assert!(is_hoisted_fp_const(&IrConst::F32(f32::NAN)));
+        assert!(is_hoisted_fp_const(&IrConst::F64(f64::MIN_POSITIVE / 2.0)));
+        assert!(!is_hoisted_fp_const(&IrConst::I64(0x3ff0_0000_0000_0000)));
+        assert!(!is_hoisted_fp_const(&IrConst::I32(1)));
     }
 }

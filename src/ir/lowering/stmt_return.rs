@@ -109,7 +109,7 @@ impl Lowerer {
         let expr_ct = self.expr_ctype(e);
         if self.func_mut().return_is_bool {
             // For _Bool return, normalize at the source type before any truncation.
-            self.emit_bool_normalize_typed(val, expr_ty)
+            self.emit_expr_bool_conversion(val, expr_ty, e)
         } else if let Some(ret_ct) = self.func_mut().return_ctype.clone() {
             if ret_ct == CType::Float128
                 || expr_ct == CType::Float128
@@ -367,7 +367,7 @@ impl Lowerer {
         if let Some(ref rct) = ret_ct {
             if rct.is_complex() {
                 let val = self.lower_expr(e);
-                let src_ir_ty = self.get_expr_type(e);
+                let src_ir_ty = self.value_ir_type(e);
                 let rct_clone = rct.clone();
                 let complex_val = self.scalar_to_complex(val, src_ir_ty, &rct_clone);
                 let src_addr = self.operand_to_value(complex_val);
@@ -753,7 +753,7 @@ impl Lowerer {
         }
 
         let val = self.lower_expr(e);
-        let src_ir_ty = self.get_expr_type(e);
+        let src_ir_ty = self.value_ir_type(e);
         let rct_clone = rct.clone();
         let complex_val = self.scalar_to_complex(val, src_ir_ty, &rct_clone);
 

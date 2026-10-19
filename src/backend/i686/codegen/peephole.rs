@@ -1105,37 +1105,263 @@ fn is_debug_location(store: &LineStore, infos: &[LineInfo], idx: usize) -> bool 
         && syntax_of(store, infos, idx).split_whitespace().next() == Some(".loc")
 }
 
-/// Check if the next instruction reads the carry flag (CF).
-/// Instructions like `adcl`, `sbbl`, `rcl`, `rcr` depend on CF.
-/// `incl`/`decl` do NOT set CF (unlike `addl`/`subl`), so converting
-/// `addl $1` → `incl` or `subl $1` → `decl` is invalid when the next
-/// instruction reads CF.
-fn next_reads_carry_flag(store: &LineStore, infos: &[LineInfo], start: usize) -> bool {
-    let len = infos.len();
-    for j in (start + 1)..len {
+/// How one instruction touches EFLAGS, for the forward liveness scan.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FlagUse {
+    /// Reads CF, possibly with other flags (jb/ja/setbe/cmovae, adc/sbb, ...).
+    Reads,
+    /// Reads arithmetic flags but never CF (je/jl/setne/cmovg/fcmove, ...).
+    ReadsNoCf,
+    /// Leaves no arithmetic flag of the previous state observable: each is
+    /// redefined or architecturally undefined (imul, bsf, div), and no
+    /// correct code depends on an undefined flag surviving.
+    WritesAll,
+    /// Defines every flag except CF (inc/dec).
+    WritesAllButCf,
+    /// Defines CF while some other flag survives (bt/bts/btr/btc keep ZF,
+    /// sahf keeps OF, clc/stc touch CF only).
+    WritesCf,
+    /// Leaves EFLAGS alone, or may leave it unchanged: moves, lea, push/pop,
+    /// x87 ops (FPU status word only), SSE data ops, `rep stos`, and shifts
+    /// by `%cl` (a zero count keeps the flags).
+    Neutral,
+    /// Flags are dead afterwards: call (clobbered by the callee under the
+    /// psABI) and ret.
+    Kills,
+    /// Unmodeled, or control leaves the fallthrough path (jmp, jecxz):
+    /// the scan must assume the flags are live.
+    Unknown,
+}
+
+/// The condition codes whose predicate involves CF.
+const CF_CONDS: [&str; 10] = ["b", "c", "nae", "ae", "nb", "nc", "be", "na", "a", "nbe"];
+
+const FLAG_CONDS: [&str; 30] = [
+    "o", "no", "b", "c", "nae", "ae", "nb", "nc", "e", "z", "ne", "nz", "be", "na", "a", "nbe",
+    "s", "ns", "p", "pe", "np", "po", "l", "nge", "ge", "nl", "le", "ng", "g", "nle",
+];
+
+/// Strip one AT&T size suffix (`addl` -> `add`) when the stem is known.
+fn flag_stem<'a>(m: &'a str, stems: &[&str]) -> Option<&'a str> {
+    if stems.contains(&m) {
+        return Some(m);
+    }
+    let base = m.strip_suffix(['b', 'w', 'l'])?;
+    stems.contains(&base).then_some(base)
+}
+
+/// Classify one instruction's EFLAGS behaviour from its trimmed AT&T text.
+/// Anything not modeled is `Unknown`, never `Neutral`: the scan fails closed.
+fn flag_use(insn: &str) -> FlagUse {
+    let (m, ops) = match insn.split_once(char::is_whitespace) {
+        Some((m, ops)) => (m, ops.trim()),
+        None => (insn, ""),
+    };
+    if m == "call" || m == "calll" {
+        // The PIC thunk is `movl (%esp), %reg; ret`: flags pass through.
+        return if ops.contains("get_pc_thunk") {
+            FlagUse::Neutral
+        } else {
+            FlagUse::Kills
+        };
+    }
+    if m == "ret" || m == "retl" {
+        return FlagUse::Kills;
+    }
+    for p in ["j", "set", "cmov", "fcmov"] {
+        if let Some(rest) = m.strip_prefix(p) {
+            let rest = if p == "cmov" {
+                rest.strip_suffix(['w', 'l'])
+                    .filter(|r| FLAG_CONDS.contains(r))
+                    .unwrap_or(rest)
+            } else {
+                rest
+            };
+            if FLAG_CONDS.contains(&rest) || (p == "fcmov" && matches!(rest, "u" | "nu")) {
+                return if CF_CONDS.contains(&rest) {
+                    FlagUse::Reads
+                } else {
+                    FlagUse::ReadsNoCf
+                };
+            }
+        }
+    }
+    if flag_stem(m, &["adc", "sbb", "rcl", "rcr"]).is_some()
+        || matches!(m, "cmc" | "pushf" | "pushfl" | "lahf")
+    {
+        return FlagUse::Reads;
+    }
+    if m == "rep" {
+        let op = ops.split_whitespace().next().unwrap_or("");
+        return if ["stos", "movs", "lods"].iter().any(|s| op.starts_with(s)) {
+            FlagUse::Neutral
+        } else {
+            FlagUse::Unknown
+        };
+    }
+    if matches!(m, "fcomi" | "fcomip" | "fucomi" | "fucomip") {
+        return FlagUse::WritesAll;
+    }
+    if m.starts_with('f') {
+        // x87 arithmetic, compares and stores touch only the FPU status word.
+        return FlagUse::Neutral;
+    }
+    if insn.contains("%xmm") || insn.contains("%ymm") || insn.contains("%zmm") {
+        let b = m.strip_prefix('v').unwrap_or(m);
+        let writes = b.starts_with("comis")
+            || b.starts_with("ucomis")
+            || b == "ptest"
+            || b.starts_with("testp")
+            || b.starts_with("pcmpestr")
+            || b.starts_with("pcmpistr");
+        return if writes {
+            FlagUse::WritesAll
+        } else {
+            FlagUse::Neutral
+        };
+    }
+    if flag_stem(m, &["bt", "bts", "btr", "btc"]).is_some() || matches!(m, "sahf" | "clc" | "stc") {
+        return FlagUse::WritesCf;
+    }
+    // Single and double shifts: the count is the first operand.
+    if flag_stem(m, &["shl", "sal", "shr", "sar", "shld", "shrd"]).is_some() {
+        let Some((count, _)) = ops.split_once(',') else {
+            return FlagUse::WritesAll; // implicit count of 1
+        };
+        let count = count.trim();
+        return match count.strip_prefix('$').map(str::parse::<i64>) {
+            Some(Ok(n)) if n & 31 != 0 => FlagUse::WritesAll,
+            Some(Ok(_)) => FlagUse::Neutral, // a zero count keeps EFLAGS
+            Some(Err(_)) => FlagUse::Unknown,
+            None if count == "%cl" => FlagUse::Neutral, // the count may be zero
+            None => FlagUse::Unknown,
+        };
+    }
+    if flag_stem(m, &["add", "sub", "and", "or", "xor", "cmp", "test", "neg"]).is_some()
+        || flag_stem(m, &["imul", "mul", "div", "idiv", "bsf", "bsr"]).is_some()
+        || flag_stem(m, &["popcnt", "lzcnt", "tzcnt"]).is_some()
+        || matches!(m, "popf" | "popfl")
+    {
+        return FlagUse::WritesAll;
+    }
+    if flag_stem(m, &["inc", "dec"]).is_some() {
+        return FlagUse::WritesAllButCf;
+    }
+    if m.starts_with("mov")
+        || m.starts_with("lea")
+        || m.starts_with("push")
+        || m.starts_with("pop")
+        || m.starts_with("xchg")
+        || m.starts_with("bswap")
+        || m.starts_with("not")
+        || matches!(m, "cltd" | "cdq" | "cwtl" | "cbtw" | "nop")
+    {
+        return FlagUse::Neutral;
+    }
+    FlagUse::Unknown
+}
+
+/// Longest fallthrough window the scan inspects before assuming "live".
+const FLAG_SCAN_LIMIT: usize = 256;
+/// Conditional-branch targets one CF query may follow (each costs a label
+/// lookup) before it assumes "live".
+const FLAG_SCAN_BRANCH_FOLLOWS: u32 = 3;
+
+/// Whether some EFLAGS bit (only CF when `cf_only`) defined by line `start`
+/// can still be read. Forward scan of the fallthrough path: labels are
+/// crossed (the path continues there; other predecessors bring their own
+/// flags), directives that emit no flag-touching bytes (`.loc`, `.cfi_*`,
+/// NOP alignment padding) are transparent, and any other directive or
+/// unmodeled instruction means "live".
+fn flags_live_after(store: &LineStore, infos: &[LineInfo], start: usize, cf_only: bool) -> bool {
+    let mut follows = FLAG_SCAN_BRANCH_FOLLOWS;
+    flags_live_from(store, infos, start, cf_only, &mut follows)
+}
+
+/// The scan behind [`flags_live_after`]. A direct `jmp` continues at its
+/// target label. A reader that never consults CF ends the scan as "live"
+/// unless only CF matters; then a non-jump reader (setne, cmovl) is
+/// transparent, and a conditional jump forks: its target and its
+/// fallthrough must both be CF-dead. Every label lookup spends one unit of
+/// the query's `follows` budget; an exhausted budget, an unresolvable or
+/// indirect target means "live".
+fn flags_live_from(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    cf_only: bool,
+    follows: &mut u32,
+) -> bool {
+    let mut seen = 0;
+    for j in (start + 1)..infos.len() {
+        if infos[j].is_nop() || is_debug_location(store, infos, j) {
+            continue;
+        }
         let s = store.get(j).trim();
         if s.is_empty() || s.starts_with('#') || s.starts_with("//") || s.ends_with(':') {
             continue;
         }
-        // Check if the instruction reads CF
-        return s.starts_with("adcl ")
-            || s.starts_with("adcb ")
-            || s.starts_with("adcw ")
-            || s.starts_with("sbbl ")
-            || s.starts_with("sbbb ")
-            || s.starts_with("sbbw ")
-            || s.starts_with("rcl ")
-            || s.starts_with("rcr ")
-            || s.starts_with("setc ")
-            || s.starts_with("setb ")
-            || s.starts_with("jc ")
-            || s.starts_with("jb ")
-            || s.starts_with("jnc ")
-            || s.starts_with("jnb ")
-            || s.starts_with("jae ")
-            || s.starts_with("cmc");
+        if let Some(d) = s.strip_prefix('.') {
+            let d = d.split_whitespace().next().unwrap_or("");
+            if d.starts_with("cfi_") || matches!(d, "loc" | "p2align" | "align" | "balign") {
+                continue;
+            }
+            return true;
+        }
+        seen += 1;
+        if seen > FLAG_SCAN_LIMIT {
+            return true;
+        }
+        if infos[j].kind == LineKind::Jmp {
+            return match parse_jmp_target(s).and_then(|t| flag_label_line(store, infos, t)) {
+                Some(k) if *follows > 0 => {
+                    *follows -= 1;
+                    flags_live_from(store, infos, k, cf_only, follows)
+                }
+                _ => true,
+            };
+        }
+        match flag_use(s) {
+            FlagUse::ReadsNoCf if cf_only => {
+                if infos[j].kind == LineKind::CondJmp {
+                    if *follows == 0 {
+                        return true;
+                    }
+                    *follows -= 1;
+                    let at = parse_condjmp(s).and_then(|(_, t)| flag_label_line(store, infos, t));
+                    match at {
+                        Some(k) => {
+                            if flags_live_from(store, infos, k, true, follows) {
+                                return true;
+                            }
+                        }
+                        None => return true,
+                    }
+                }
+            }
+            FlagUse::Reads | FlagUse::ReadsNoCf | FlagUse::Unknown => return true,
+            FlagUse::WritesAll | FlagUse::Kills => return false,
+            FlagUse::WritesAllButCf if !cf_only => return false,
+            FlagUse::WritesCf if cf_only => return false,
+            FlagUse::WritesAllButCf | FlagUse::WritesCf | FlagUse::Neutral => {}
+        }
     }
     false
+}
+
+/// The line defining local label `name` (linear: only reached through the
+/// small per-query follow budget).
+fn flag_label_line(store: &LineStore, infos: &[LineInfo], name: &str) -> Option<usize> {
+    (0..infos.len()).find(|&k| {
+        infos[k].kind == LineKind::Label && store.get(k).trim().strip_suffix(':') == Some(name)
+    })
+}
+
+/// `incl`/`decl` leave CF unchanged (unlike `addl`/`subl`), so rewriting
+/// `addl $1` -> `incl` is invalid while a later reader still sees CF --
+/// not only an adjacent `adcl`, but also e.g. `ja` or `cmovbe` further down.
+fn next_reads_carry_flag(store: &LineStore, infos: &[LineInfo], start: usize) -> bool {
+    flags_live_after(store, infos, start, true)
 }
 
 // ── Pass 1: Local patterns ───────────────────────────────────────────────────
@@ -1253,7 +1479,9 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
                 }
             }
         }
-        // movl $0, %reg → xorl %reg, %reg (saves 3 bytes, clears flags)
+        // movl $0, %reg → xorl %reg, %reg (saves 3 bytes). Unlike movl,
+        // xorl DEFINES EFLAGS, so only where no later reader can still see
+        // the previous flags (e.g. a zero dword loaded inside an sbbl chain).
         if let LineKind::Other { dest_reg } = infos[i].kind {
             if dest_reg != REG_NONE
                 && dest_reg <= REG_GP_MAX
@@ -1262,7 +1490,9 @@ fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             {
                 let s = trimmed(store, &infos[i], i);
                 let rn = reg32_name(dest_reg);
-                if s == format!("movl $0, {}", rn) {
+                if s.strip_prefix("movl $0, ") == Some(rn)
+                    && !flags_live_after(store, infos, i, false)
+                {
                     store.replace(i, format!("    xorl {}, {}", rn, rn));
                     infos[i] = LineInfo {
                         kind: LineKind::Other { dest_reg },
@@ -2698,22 +2928,23 @@ fn frame_mem_width(mn: &str) -> i32 {
     match mn {
         "movb" | "movzbl" | "movsbl" | "addb" | "subb" | "andb" | "orb" | "xorb" | "adcb"
         | "sbbb" | "incb" | "decb" | "negb" | "notb" | "shlb" | "shrb" | "sarb" | "rolb"
-        | "rorb" | "rclb" | "rcrb" | "xchgb" | "cmpxchgb" | "fistpb" | "btsb" | "btrb" | "btcb"
-        | "movntib" | "xaddb" => 1,
+        | "rorb" | "rclb" | "rcrb" | "xchgb" | "cmpxchgb" | "btsb" | "btrb" | "btcb" | "movntib"
+        | "xaddb" | "cmpb" | "testb" => 1,
         "movw" | "movzwl" | "movsbw" | "addw" | "subw" | "andw" | "orw" | "xorw" | "adcw"
         | "sbbw" | "incw" | "decw" | "negw" | "notw" | "shlw" | "shrw" | "sarw" | "rolw"
-        | "rorw" | "rclw" | "rcrw" | "xchgw" | "cmpxchgw" | "fistpw" | "fisttpw" | "fnstsw"
-        | "fstsw" | "fstcw" | "fnstcw" | "fldcw" | "movntiw" | "fistb" | "xaddw" => 2,
+        | "rorw" | "rclw" | "rcrw" | "xchgw" | "cmpxchgw" | "fnstsw" | "fstsw" | "fstcw"
+        | "fnstcw" | "fldcw" | "movntiw" | "xaddw" | "cmpw" | "testw"
+        // AT&T x87 integer suffixes: `s` = 16-bit, `l` = 32-bit, `q` = 64-bit.
+        | "filds" | "fists" | "fistps" | "fisttps" => 2,
         "movl" | "addl" | "subl" | "andl" | "orl" | "xorl" | "adcl" | "sbbl" | "incl" | "decl"
         | "negl" | "notl" | "shll" | "shrl" | "sarl" | "roll" | "rorl" | "rcll" | "rcrl"
         | "xchgl" | "cmpxchgl" | "btsl" | "btrl" | "btcl" | "xaddl" | "movd" | "movss"
-        | "fildl" | "filds" | "fistl" | "fistpl" | "fstps" | "fists" | "flds" | "movntil"
-        | "cmpl" | "testl" | "cmpw" | "testw" | "cmpb" | "testb" | "fisttpl" | "stmxcsr"
-        | "ldmxcsr" => 4,
+        | "fildl" | "fistl" | "fistpl" | "fisttpl" | "fstps" | "flds" | "movntil" | "cmpl"
+        | "testl" | "stmxcsr" | "ldmxcsr" => 4,
         // `cmpl`/`testl` are reads and never invalidate, but they get the right
         // width anyway so the table stays a single source of truth for both
         // passes and for the tests that pin it.
-        "movq" | "movsd" | "fstpl" | "fstl" | "fldl" | "fildq" | "fistpq" | "fisttpq" | "fistq"
+        "movq" | "movsd" | "fstpl" | "fstl" | "fldl" | "fildq" | "fistpq" | "fisttpq"
         | "movlps" | "movhps" | "movlpd" | "movhpd" | "movntlq" => 8,
         "fldt" | "fstt" | "fstpt" | "fbstp" => 10,
         "fstp" | "fst" => 8,
@@ -2799,8 +3030,8 @@ fn frame_write_extents(s: &str, out: &mut [(i32, i32)]) -> usize {
     let store_family = matches!(
         mn,
         "fstps" | "fstpl" | "fstpt" | "fstp" | "fst"
-            | "fists" | "fistl" | "fistq" | "fistpl" | "fistpq" | "fisttp"
-            | "fisttpl" | "fisttpq" | "fbstp" | "fxsave" | "fxsave64"
+            | "fists" | "fistps" | "fistl" | "fistpl" | "fistpq" | "fisttp"
+            | "fisttps" | "fisttpl" | "fisttpq" | "fbstp" | "fxsave" | "fxsave64"
             | "fnsave" | "fsave" | "fnstsw" | "fstsw" | "fstcw" | "fnstcw"
             // fstenv/fnstenv STORE the 28-byte FPU environment; only fldenv and
             // frstor read it. Classifying these as reads was an
@@ -5084,9 +5315,26 @@ fn mnemonic_only_reads_memory(mn: &str) -> bool {
             | "fldl"
             | "fldt"
             | "fild"
+            | "filds"
             | "fildl"
             | "fildll"
             | "fildq"
+            | "fiadds"
+            | "fiaddl"
+            | "fisubs"
+            | "fisubl"
+            | "fisubrs"
+            | "fisubrl"
+            | "fimuls"
+            | "fimull"
+            | "fidivs"
+            | "fidivl"
+            | "fidivrs"
+            | "fidivrl"
+            | "ficoms"
+            | "ficoml"
+            | "ficomps"
+            | "ficompl"
             | "fadd"
             | "fadds"
             | "faddl"
@@ -5165,9 +5413,12 @@ fn esp_store_operand(mn: &str, op: &str) -> Option<(i32, i32)> {
         "movb" => 1,
         "movq" | "movsd" | "movlps" | "movups" | "movaps" | "movapd" | "movupd" => 8,
         "movdqa" | "movdqu" => 16,
-        "fstl" | "fstpl" | "fistpl" => 8,
-        "fsts" | "fstps" | "fistl" => 4,
-        "fstt" | "fstpt" | "fisttpl" => 10,
+        // x87 stores: the width is the MEMORY format, never the register's.
+        // Overstating it would "prove" bytes overwritten that are not.
+        "fstl" | "fstpl" | "fistpq" | "fisttpq" => 8,
+        "fsts" | "fstps" | "fistl" | "fistpl" | "fisttpl" => 4,
+        "fists" | "fistps" | "fisttps" => 2,
+        "fstt" | "fstpt" => 10,
         _ => return None,
     };
     let disp = esp_slot_displacement(op)?;
@@ -6729,16 +6980,30 @@ fn collect_non_nop_indices<const N: usize>(
     count
 }
 
-/// Fuse `cmpl/testl + setCC %al + movzbl %al, %eax + [store/load] + testl %eax, %eax + jne/je`
-/// into a single `jCC`/`j!CC` directly.
+/// Fuse `cmp/test + setCC %al + [extensions, spills, reloads] + re-test of
+/// the boolean + jne/je` into `jCC`/`j!CC`.
 ///
-/// This enhanced version can skip over store/load pairs between the movzbl and
-/// testl, allowing fusion even when the boolean is temporarily spilled to the
-/// stack. It tracks stored offsets and verifies each has a matching load nearby,
-/// ensuring the stored boolean is only consumed locally.
+/// The scan models exactly where the boolean lives and fails closed on any
+/// line outside the model: `%al` holds it after the setCC; ALL of `%eax`
+/// only after `movzbl/movsbl %al, %eax` (setCC writes the low byte alone,
+/// so `testl %eax, %eax` straight after it reads unspecified bits 8..31);
+/// a slot holds it only after `movl %eax, S` and gives it back only through
+/// `movl S, %eax`.  Every admitted line preserves EFLAGS, so the jump may
+/// read the compare's flags itself: the re-test (`testl %eax,%eax`,
+/// `cmpl $0,%eax`, `testb %al,%al`, `cmpb $0,%al`) is always removed.
+///
+/// Removing the setCC and its extensions is a second, separate claim: no
+/// store may have published the boolean (the slot can be read anywhere
+/// later; a nearby reload proves nothing about other readers) and `%eax`
+/// must be dead after the jump (a fallthrough successor may read the cached
+/// boolean, e.g. `addl $10, %eax` after `je`).  Stores and loads into other
+/// registers are never removed.
 fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = infos.len();
     let mut changed = false;
+    // Whole-function GPR liveness, computed on first need.  Later fusions
+    // only delete reads, so a cached answer stays conservative.
+    let mut liveness_cache: Option<GprLiveness> = None;
 
     let mut i = 0;
     while i < len {
@@ -6774,50 +7039,82 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
         }
         let setcc_cc = setcc_cc.unwrap();
 
-        // Scan for testl %eax, %eax pattern.
-        // Track StoreEbp offsets so we can bail out if any store's slot is
-        // potentially read by another basic block (no matching load nearby).
+        // Where the boolean lives (see the doc comment): `%al` always holds
+        // it once admitted; `eax_ext` = bits 8..31 of %eax are zero.
+        let mut eax_ext = false;
+        // Dword slots holding a copy of %eax: (offset, eax_ext at the store).
+        let mut slots: [(i32, bool); MAX_TRACKED_STORE_LOAD_OFFSETS] =
+            [(0, false); MAX_TRACKED_STORE_LOAD_OFFSETS];
+        let mut slot_count = 0usize;
+        let mut published = false;
         let mut test_idx = None;
-        let mut store_offsets: [i32; MAX_TRACKED_STORE_LOAD_OFFSETS] =
-            [0; MAX_TRACKED_STORE_LOAD_OFFSETS];
-        let mut store_count = 0usize;
         let mut scan = 2;
         while scan < seq_count {
             let si = seq_indices[scan];
             let line = trimmed(store, &infos[si], si);
-
-            // Skip zero-extend of setcc result
-            if line == "movzbl %al, %eax" {
-                scan += 1;
-                continue;
+            match infos[si].kind {
+                LineKind::StoreEbp { reg, offset, size } => {
+                    let bytes = match size {
+                        MoveSize::L => 4,
+                        MoveSize::W => 2,
+                        MoveSize::B => 1,
+                    };
+                    // Any store may overwrite a tracked copy.
+                    let mut k = 0;
+                    while k < slot_count {
+                        if ranges_overlap(slots[k].0, 4, offset, bytes) {
+                            slot_count -= 1;
+                            slots[k] = slots[slot_count];
+                        } else {
+                            k += 1;
+                        }
+                    }
+                    if reg == REG_EAX {
+                        published = true;
+                        if size == MoveSize::L {
+                            if slot_count == MAX_TRACKED_STORE_LOAD_OFFSETS {
+                                break;
+                            }
+                            slots[slot_count] = (offset, eax_ext);
+                            slot_count += 1;
+                        }
+                    }
+                    scan += 1;
+                    continue;
+                }
+                LineKind::LoadEbp { reg, offset, size } => {
+                    if reg != REG_EAX {
+                        // Writes another register, reads no flags: kept.
+                        scan += 1;
+                        continue;
+                    }
+                    match slots[..slot_count].iter().find(|t| t.0 == offset) {
+                        Some(&(_, ext)) if size == MoveSize::L => {
+                            eax_ext = ext;
+                            scan += 1;
+                            continue;
+                        }
+                        // An unrelated value (or a partial reload) replaces
+                        // the boolean: the test no longer reads it.
+                        _ => break,
+                    }
+                }
+                _ => {}
             }
-            // Skip store/load to ebp (pre-parsed fast check).
-            if let LineKind::StoreEbp { offset, .. } = infos[si].kind {
-                if store_count < MAX_TRACKED_STORE_LOAD_OFFSETS {
-                    store_offsets[store_count] = offset;
-                    store_count += 1;
-                } else {
-                    store_count = usize::MAX;
+            match line {
+                "movzbl %al, %eax" | "movsbl %al, %eax" => eax_ext = true,
+                "cwtl" | "movswl %ax, %eax" if eax_ext => {}
+                "testl %eax, %eax" | "cmpl $0, %eax" if eax_ext => {
+                    test_idx = Some(scan);
                     break;
                 }
-                scan += 1;
-                continue;
+                "testb %al, %al" | "cmpb $0, %al" => {
+                    test_idx = Some(scan);
+                    break;
+                }
+                _ => break,
             }
-            if matches!(infos[si].kind, LineKind::LoadEbp { .. }) {
-                scan += 1;
-                continue;
-            }
-            // Skip cwtl (sign-extend ax->eax, i686 equivalent of cltq)
-            if line == "cwtl" || line.starts_with("movswl ") || line.starts_with("movsbl ") {
-                scan += 1;
-                continue;
-            }
-            // Check for test
-            if line == "testl %eax, %eax" {
-                test_idx = Some(scan);
-                break;
-            }
-            break;
+            scan += 1;
         }
 
         let test_scan = match test_idx {
@@ -6828,57 +7125,14 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
             }
         };
 
-        // If there are stores in the sequence, verify each has a matching load nearby.
-        if store_count == usize::MAX {
-            i += 1;
-            continue;
-        }
-        if store_count > 0 {
-            let range_start = seq_indices[1];
-            let range_end = seq_indices[test_scan];
-            let mut load_offsets: [i32; MAX_TRACKED_STORE_LOAD_OFFSETS] =
-                [0; MAX_TRACKED_STORE_LOAD_OFFSETS];
-            let mut load_count = 0usize;
-            for ri in range_start..=range_end {
-                let off = match infos[ri].kind {
-                    LineKind::LoadEbp { offset, .. } => Some(offset),
-                    // Check NOP'd lines too - earlier passes (store/load forwarding)
-                    // may have NOP'd a load that originally matched a store.
-                    LineKind::Nop => {
-                        let orig = classify_line(store.get(ri));
-                        match orig.kind {
-                            LineKind::LoadEbp { offset, .. } => Some(offset),
-                            _ => None,
-                        }
-                    }
-                    _ => None,
-                };
-                if let Some(o) = off {
-                    if load_count < MAX_TRACKED_STORE_LOAD_OFFSETS {
-                        load_offsets[load_count] = o;
-                        load_count += 1;
-                    }
-                }
-            }
-            let has_unmatched_store = (0..store_count)
-                .any(|si| !(0..load_count).any(|li| load_offsets[li] == store_offsets[si]));
-            if has_unmatched_store {
-                i += 1;
-                continue;
-            }
-        }
-
         if test_scan + 1 >= seq_count {
             i += 1;
             continue;
         }
 
         // Find jne/je after test
-        let jmp_line = trimmed(
-            store,
-            &infos[seq_indices[test_scan + 1]],
-            seq_indices[test_scan + 1],
-        );
+        let jmp_idx = seq_indices[test_scan + 1];
+        let jmp_line = trimmed(store, &infos[jmp_idx], jmp_idx);
         let (is_jne, branch_target) = if let Some(target) = jmp_line.strip_prefix("jne ") {
             (true, target.trim())
         } else if let Some(target) = jmp_line.strip_prefix("je ") {
@@ -6902,9 +7156,23 @@ fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineInfo]) -> boo
 
         let fused_jcc = format!("    j{} {}", fused_cc, branch_target);
 
-        // NOP out everything from setCC through testl
-        for s in 1..=test_scan {
-            infos[seq_indices[s]].kind = LineKind::Nop;
+        // The re-test is redundant unconditionally (flags preserved).  The
+        // setCC and its extensions die only with an unpublished boolean
+        // and %eax dead past the jump.
+        infos[seq_indices[test_scan]].kind = LineKind::Nop;
+        if !published
+            && liveness_cache
+                .get_or_insert_with(|| GprLiveness::compute(store, infos))
+                .dead_after(jmp_idx, REG_EAX)
+        {
+            for s in 1..test_scan {
+                if !matches!(
+                    infos[seq_indices[s]].kind,
+                    LineKind::LoadEbp { .. } | LineKind::StoreEbp { .. }
+                ) {
+                    infos[seq_indices[s]].kind = LineKind::Nop;
+                }
+            }
         }
         // Replace the jne/je with the fused conditional jump
         let idx = seq_indices[test_scan + 1];
@@ -8361,7 +8629,32 @@ fn try_fold_memory_operand(
 //     adjacency one;
 //   * `%esp` is never the loaded register (dataflow only).
 //
+// Width-matched consumers (`cmpb $I, %al` / `testb %al, %al` after a byte
+// load into %eax, `cmpw`/`testw` on %ax after a word load) are the exact
+// case: the compare already reads only the loaded bytes, so `cmp{b,w} $I, M`
+// and `cmp{b,w} $0, M` (for the test: CF=OF=0, SF/ZF/PF of the same byte in
+// both) set EVERY flag identically -- no immediate window, no flags-reader
+// gate, and a sign-extending load folds too (the extension bits are never
+// read).  The register must be the LOW sub-register of the loaded family
+// (`%ah` names the same family and a different byte) and dead after the
+// consumer.  The compare emitters produce exactly this shape for narrow IR
+// compares (a narrow value's upper register bits are unspecified, so the
+// compare must be narrow), which the 32-bit-only matcher used to miss.
+//
 // Kill switch: CCC_NO_NARROW_CMP_FOLD.
+/// The zero compare of the fold's narrow operand: `test{b,w} %r, %r` for a
+/// register source (same flags as `cmp $0` — CF=OF=0, ZF/SF/PF of the same
+/// bits — and the canonical shape later setCC/branch fusions match),
+/// `cmp{b,w} $0, M` for memory (`test` would need the operand twice).
+fn narrow_zero_test(width: MoveSize, operand: &str) -> String {
+    let suffix = if width == MoveSize::B { 'b' } else { 'w' };
+    if operand.starts_with('%') {
+        format!("    test{} {}, {}", suffix, operand, operand)
+    } else {
+        format!("    cmp{} $0, {}", suffix, operand)
+    }
+}
+
 fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     if std::env::var_os("CCC_NO_NARROW_CMP_FOLD").is_some() {
         return false;
@@ -8375,7 +8668,8 @@ fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -
             i += 1;
             continue;
         }
-        let Some((width, src, dst_reg)) = parse_narrow_zext_src(store, &infos[i], i) else {
+        let Some((width, src, dst_reg, sign_extends)) = parse_narrow_zext_src(store, &infos[i], i)
+        else {
             i += 1;
             continue;
         };
@@ -8398,7 +8692,35 @@ fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -
         let mut replacement: Option<String> = None;
         // Consumer 2: `testl %R, %R` — ZF-only, gated on the flag reader.
         let mut test_shape = false;
-        if infos[j].kind == LineKind::Cmp {
+        let mnem = if width == MoveSize::B { "cmpb" } else { "cmpw" };
+        let operand = match &src {
+            NarrowSrc::Slot(disp, base) => format!("{}({})", disp, base),
+            NarrowSrc::Verbatim(v) => v.clone(),
+        };
+        // Consumers 3/4: the width-matched compare/test (exact, see above).
+        if infos[j].kind == LineKind::Cmp
+            && let Some(low) = narrow_reg_name(dst_reg, width)
+        {
+            let (cmp_prefix, test_prefix) = if width == MoveSize::B {
+                ("cmpb $", "testb ")
+            } else {
+                ("cmpw $", "testw ")
+            };
+            if let Some((imm_str, reg_str)) =
+                s.strip_prefix(cmp_prefix).and_then(|r| r.split_once(", "))
+            {
+                if reg_str.trim() == low && imm_str.trim().parse::<i64>().is_ok() {
+                    replacement = Some(format!("    {} ${}, {}", mnem, imm_str.trim(), operand));
+                }
+            } else if let Some((a, b)) = s.strip_prefix(test_prefix).and_then(|r| r.split_once(','))
+            {
+                if a.trim() == low && b.trim() == low {
+                    replacement = Some(narrow_zero_test(width, &operand));
+                }
+            }
+        }
+        // The 32-bit consumers' flag law assumes a zero-extended operand.
+        if replacement.is_none() && !sign_extends && infos[j].kind == LineKind::Cmp {
             if let Some(rest) = s.strip_prefix("cmpl $") {
                 if let Some((imm_str, reg_str)) = rest.split_once(", %") {
                     if let Ok(imm) = imm_str.trim().parse::<i64>() {
@@ -8419,11 +8741,6 @@ fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -
                                 NARROW_CF_ZF_SETCC,
                             )
                         {
-                            let mnem = if width == MoveSize::B { "cmpb" } else { "cmpw" };
-                            let operand = match src {
-                                NarrowSrc::Slot(disp, base) => format!("{}({})", disp, base),
-                                NarrowSrc::Verbatim(v) => v,
-                            };
                             replacement = Some(format!("    {} ${}, {}", mnem, imm, operand));
                         }
                     }
@@ -8445,11 +8762,7 @@ fn fold_narrow_load_imm_compare(store: &mut LineStore, infos: &mut [LineInfo]) -
                             )
                         {
                             test_shape = true;
-                            let operand = match src {
-                                NarrowSrc::Slot(disp, base) => format!("{}({})", disp, base),
-                                NarrowSrc::Verbatim(v) => v,
-                            };
-                            replacement = Some(format!("    cmpb $0, {}", operand));
+                            replacement = Some(narrow_zero_test(width, &operand));
                         }
                     }
                 }
@@ -8500,12 +8813,16 @@ fn parse_narrow_zext_src(
     store: &LineStore,
     info: &LineInfo,
     idx: usize,
-) -> Option<(MoveSize, NarrowSrc, RegId)> {
+) -> Option<(MoveSize, NarrowSrc, RegId, bool)> {
     let t = trimmed(store, info, idx);
-    let (mnem, width) = if let Some(r) = t.strip_prefix("movzbl ") {
-        (r, MoveSize::B)
+    let (mnem, width, sign_extends) = if let Some(r) = t.strip_prefix("movzbl ") {
+        (r, MoveSize::B, false)
     } else if let Some(r) = t.strip_prefix("movzwl ") {
-        (r, MoveSize::W)
+        (r, MoveSize::W, false)
+    } else if let Some(r) = t.strip_prefix("movsbl ") {
+        (r, MoveSize::B, true)
+    } else if let Some(r) = t.strip_prefix("movswl ") {
+        (r, MoveSize::W, true)
     } else {
         return None;
     };
@@ -8542,7 +8859,7 @@ fn parse_narrow_zext_src(
         } else {
             parse_offset(disp_str)
         };
-        return Some((width, NarrowSrc::Slot(disp, base), dst));
+        return Some((width, NarrowSrc::Slot(disp, base), dst, sign_extends));
     }
     // Source shape 2: a narrow register spelling, or a base-only indirect
     // operand `DISP(%reg)` (pointer loads: `movzwl (%edi), %edx`).  For the
@@ -8551,7 +8868,12 @@ fn parse_narrow_zext_src(
     // flag law carries over unchanged.  Adjacency (nops only between load
     // and consumer) is what makes "the memory is unchanged" local.
     if src_part.starts_with('%') && register_family(src_part) != REG_NONE {
-        return Some((width, NarrowSrc::Verbatim(src_part.to_string()), dst));
+        return Some((
+            width,
+            NarrowSrc::Verbatim(src_part.to_string()),
+            dst,
+            sign_extends,
+        ));
     }
     if let Some(paren) = src_part.find("(%") {
         let disp_str = &src_part[..paren];
@@ -8564,7 +8886,12 @@ fn parse_narrow_zext_src(
         {
             return None;
         }
-        return Some((width, NarrowSrc::Verbatim(src_part.to_string()), dst));
+        return Some((
+            width,
+            NarrowSrc::Verbatim(src_part.to_string()),
+            dst,
+            sign_extends,
+        ));
     }
     None
 }
@@ -14807,6 +15134,171 @@ mod tests {
     use super::*;
 
     #[test]
+    fn flag_use_classifies_eflags_effects() {
+        use FlagUse::*;
+        let table: &[(&str, FlagUse)] = &[
+            ("ja .L3", Reads),
+            ("cmovbe %ecx, %eax", Reads),
+            ("cmovael %ecx, %eax", Reads),
+            ("setnae %al", Reads),
+            ("adcl $0, %edx", Reads),
+            ("sbbb %al, %al", Reads),
+            ("fcmovnbe %st(1), %st", Reads),
+            ("fcmovu %st(1), %st", ReadsNoCf),
+            ("jne .L1", ReadsNoCf),
+            ("cmovl %ecx, %eax", ReadsNoCf),
+            ("setg %al", ReadsNoCf),
+            ("pushfl", Reads),
+            ("cmpl %ebx, %eax", WritesAll),
+            ("testb $1, %al", WritesAll),
+            ("imull %ecx, %eax", WritesAll),
+            ("idivl %ecx", WritesAll),
+            ("popcntl %eax, %eax", WritesAll),
+            ("shll $3, %eax", WritesAll),
+            ("sarl %eax", WritesAll),
+            ("ucomiss %xmm1, %xmm0", WritesAll),
+            ("vptest %xmm0, %xmm0", WritesAll),
+            ("fucomip %st(1), %st", WritesAll),
+            ("popfl", WritesAll),
+            ("incl %eax", WritesAllButCf),
+            ("decb %cl", WritesAllButCf),
+            ("movl $0, %ecx", Neutral),
+            ("leal 4(%eax), %ecx", Neutral),
+            ("leave", Neutral),
+            ("notl %eax", Neutral),
+            ("rep stosl", Neutral),
+            ("shll %cl, %eax", Neutral),
+            ("shll $0, %eax", Neutral),
+            ("faddp %st, %st(1)", Neutral),
+            ("fcompl 8(%ebp)", Neutral),
+            ("addss %xmm1, %xmm0", Neutral),
+            ("pxor %xmm0, %xmm0", Neutral),
+            ("call __x86.get_pc_thunk.bx", Neutral),
+            ("call memcpy", Kills),
+            ("ret $4", Kills),
+            ("jmp .L5", Unknown),
+            ("jecxz .L5", Unknown),
+            ("sahf", WritesCf),
+            ("btl $3, %eax", WritesCf),
+            ("btcl $31, %eax", WritesCf),
+            ("clc", WritesCf),
+            ("shrdl $1, %edx, %eax", WritesAll),
+            ("shldl %cl, %edx, %eax", Neutral),
+            ("roll $3, %eax", Unknown),
+            ("repe cmpsb", Unknown),
+            ("lock xaddl %eax, (%ecx)", Unknown),
+        ];
+        for &(insn, want) in table {
+            assert_eq!(flag_use(insn), want, "{insn}");
+        }
+    }
+
+    #[test]
+    fn zero_idiom_keeps_movl_while_flags_are_live() {
+        // A borrow chain loads a zero dword between its flag ops: `xorl`
+        // there would clear CF and corrupt the sbbl result.
+        let asm = concat!(
+            "    cmpl %ebx, %eax\n",
+            "    movl $0, %ecx\n",
+            "    .cfi_def_cfa_offset 8\n",
+            "    sbbl %edx, %ecx\n",
+            "    movl %ecx, %eax\n",
+            "    ret\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("movl $0, %ecx") && !out.contains("xorl %ecx, %ecx"),
+            "flags-live zero rewritten:\n{out}"
+        );
+        // Flags redefined before any reader (across .cfi, rep stos and a
+        // shift): the 2-byte zero idiom must still be used.
+        let asm2 = concat!(
+            "    cmpl %ebx, %eax\n",
+            "    movl $0, %ecx\n",
+            "    .cfi_def_cfa_offset 8\n",
+            "    rep stosl\n",
+            "    shll $2, %edx\n",
+            "    setb %al\n",
+            "    addl %ecx, %eax\n",
+            "    addl %edx, %eax\n",
+            "    ret\n",
+        );
+        let out2 = peephole_optimize(asm2.to_string());
+        assert!(
+            out2.contains("xorl %ecx, %ecx"),
+            "dead-flags zero not rewritten:\n{out2}"
+        );
+        // A direct jmp continues at its target: dead there (cmpl redefines
+        // the flags) -> rewrite; live there (sbbl reads CF) -> keep.
+        let via_jmp = |at_target: &str| {
+            let asm = format!(
+                "    cmpl %ebx, %eax\n    movl $0, %ecx\n    jmp .L7\n.L6:\n    ret\n\
+                 .L7:\n    {at_target}\n    movl %ecx, %eax\n    jmp .L6\n"
+            );
+            peephole_optimize(asm)
+        };
+        let dead = via_jmp("cmpl %edx, %ecx");
+        assert!(
+            dead.contains("xorl %ecx, %ecx"),
+            "jmp target redefines flags:\n{dead}"
+        );
+        let live = via_jmp("sbbl %edx, %ecx");
+        assert!(
+            live.contains("movl $0, %ecx") && !live.contains("xorl %ecx, %ecx"),
+            "jmp target reads CF:\n{live}"
+        );
+    }
+
+    #[test]
+    fn inc_rewrite_respects_distant_carry_readers() {
+        // CF of `addl $1` is read two lines later by `ja` (a live branch: the
+        // fallthrough rewrites %eax): incl would leave the cmpl's stale CF.
+        let asm = concat!(
+            "    cmpl %ebx, %ecx\n",
+            "    addl $1, %eax\n",
+            "    movl %eax, %edx\n",
+            "    ja .L2\n",
+            "    movl $5, %eax\n",
+            ".L2:\n",
+            "    ret\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("addl $1, %eax"),
+            "CF-live addl became incl:\n{out}"
+        );
+        // Only ZF is read afterwards: the shorter incl is fine.
+        let asm2 = concat!(
+            "    addl $1, %eax\n",
+            "    movl %eax, %edx\n",
+            "    jne .L2\n",
+            "    movl $5, %eax\n",
+            ".L2:\n",
+            "    ret\n",
+        );
+        let out2 = peephole_optimize(asm2.to_string());
+        assert!(
+            out2.contains("incl %eax"),
+            "CF-dead addl not rewritten:\n{out2}"
+        );
+        // A ZF-only branch forks: CF is read at its TARGET, so addl stays.
+        let asm3 = concat!(
+            "    addl $1, %eax\n",
+            "    jne .L2\n",
+            "    movl $5, %eax\n",
+            "    ret\n",
+            ".L2:\n",
+            "    adcl $0, %edx\n",
+            "    ret\n",
+        );
+        let out3 = peephole_optimize(asm3.to_string());
+        assert!(
+            out3.contains("addl $1, %eax"),
+            "CF read at the branch target, addl became incl:\n{out3}"
+        );
+    }
+
+    #[test]
     fn ret_n_observes_return_register() {
         // `ret $N` (fastcall/stdcall/sret callee-pop) must classify as a
         // return: the return-value move right before it is LIVE and must
@@ -17209,109 +17701,155 @@ mod tests {
         );
     }
 
+    /// Run the peephole over `f: <body>`; `.L2` redefines %eax before
+    /// `ret`, so %eax is dead at the branch target.  A body that wants
+    /// %eax dead on the fallthrough too must redefine it itself.
+    fn fuse_out(body: &str) -> String {
+        let asm =
+            format!("f:\n.cfi_startproc\n{body}.L2:\n    xorl %eax, %eax\n    ret\n.cfi_endproc\n");
+        peephole_optimize(asm)
+    }
+
+    const FUSE_DEAD_FALLTHROUGH: &str = "    movl $1, %eax\n    ret\n";
+
     #[test]
     fn test_compare_branch_fusion() {
-        let asm = [
-            "    cmpl %ecx, %eax",
-            "    setl %al",
-            "    movzbl %al, %eax",
-            "    testl %eax, %eax",
-            "    jne .LBB2",
-        ]
-        .join("\n")
-            + "\n";
-        let result = peephole_optimize(asm.to_string());
-        assert!(result.contains("jl .LBB2"), "should fuse to jl: {}", result);
-        assert!(
-            !result.contains("setl"),
-            "should eliminate setl: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_compare_branch_fusion_with_store_load() {
-        // Pattern: cmp + setCC + movzbl + store + load + test + jne
-        // The store/load pair should be skipped, allowing fusion.
-        let asm = [
-            "    cmpl %ecx, %eax",
-            "    setge %al",
-            "    movzbl %al, %eax",
-            "    movl %eax, -16(%ebp)",
-            "    movl -16(%ebp), %eax",
-            "    testl %eax, %eax",
-            "    jne .LBB5",
-        ]
-        .join("\n")
-            + "\n";
-        let result = peephole_optimize(asm.to_string());
-        assert!(
-            result.contains("jge .LBB5"),
-            "should fuse to jge: {}",
-            result
-        );
-        assert!(
-            !result.contains("setge"),
-            "should eliminate setge: {}",
-            result
-        );
-        assert!(
-            !result.contains("movzbl"),
-            "should eliminate movzbl: {}",
-            result
-        );
-        assert!(
-            !result.contains("testl"),
-            "should eliminate testl: {}",
-            result
-        );
-    }
-
-    #[test]
-    fn test_compare_branch_fusion_unmatched_store_bails() {
-        // If the store has no matching load, we should NOT fuse (the boolean
-        // escapes to another basic block).
-        let asm = [
-            "    cmpl %ecx, %eax",
-            "    setge %al",
-            "    movzbl %al, %eax",
-            "    movl %eax, -16(%ebp)",
-            "    testl %eax, %eax",
-            "    jne .LBB5",
-        ]
-        .join("\n")
-            + "\n";
-        let result = peephole_optimize(asm.to_string());
-        // Should NOT fuse because the store has no matching load
-        assert!(
-            result.contains("setge"),
-            "should keep setge (unmatched store): {}",
-            result
-        );
+        let out = fuse_out(&format!(
+            "    cmpl %ecx, %eax\n    setl %al\n    movzbl %al, %eax\n    testl %eax, %eax\n    jne .L2\n{FUSE_DEAD_FALLTHROUGH}"
+        ));
+        assert!(out.contains("jl .L2"), "should fuse to jl:\n{out}");
+        for gone in ["setl", "movzbl", "testl"] {
+            assert!(!out.contains(gone), "{gone} survived:\n{out}");
+        }
     }
 
     #[test]
     fn test_compare_branch_fusion_inverted() {
-        // Test je (inverted condition)
-        let asm = [
-            "    cmpl %ecx, %eax",
-            "    setl %al",
-            "    movzbl %al, %eax",
-            "    testl %eax, %eax",
-            "    je .LBB3",
-        ]
-        .join("\n")
-            + "\n";
-        let result = peephole_optimize(asm.to_string());
+        let out = fuse_out(&format!(
+            "    cmpl %ecx, %eax\n    setl %al\n    movzbl %al, %eax\n    testl %eax, %eax\n    je .L2\n{FUSE_DEAD_FALLTHROUGH}"
+        ));
+        assert!(out.contains("jge .L2"), "should fuse to jge:\n{out}");
+        assert!(!out.contains("setl"), "setl survived:\n{out}");
+    }
+
+    #[test]
+    fn test_compare_branch_fusion_with_store_load() {
+        // The stored boolean is PUBLISHED: -16(%ebp) may be read on either
+        // path later, so the store and the setCC feeding it stay.  The
+        // re-test is still redundant (mov/movzbl preserve EFLAGS).
+        let out = fuse_out(&format!(
+            "    cmpl %ecx, %eax\n    setge %al\n    movzbl %al, %eax\n    movl %eax, -16(%ebp)\n    movl -16(%ebp), %eax\n    testl %eax, %eax\n    jne .L2\n{FUSE_DEAD_FALLTHROUGH}"
+        ));
+        assert!(out.contains("jge .L2"), "should fuse to jge:\n{out}");
+        assert!(!out.contains("testl"), "testl survived:\n{out}");
+        assert!(out.contains("setge %al"), "published setge removed:\n{out}");
         assert!(
-            result.contains("jge .LBB3"),
-            "should fuse to jge (inverted): {}",
-            result
+            out.contains("movl %eax, -16(%ebp)"),
+            "published store removed:\n{out}"
+        );
+    }
+
+    #[test]
+    fn test_compare_branch_fusion_published_store_keeps_boolean() {
+        let out = fuse_out(&format!(
+            "    cmpl %ecx, %eax\n    setge %al\n    movzbl %al, %eax\n    movl %eax, -16(%ebp)\n    testl %eax, %eax\n    jne .L2\n{FUSE_DEAD_FALLTHROUGH}"
+        ));
+        assert!(
+            out.contains("setge"),
+            "should keep setge (published):\n{out}"
         );
         assert!(
-            !result.contains("setl"),
-            "should eliminate setl: {}",
-            result
+            out.contains("jge .L2"),
+            "redundant re-test not fused:\n{out}"
+        );
+    }
+
+    #[test]
+    fn compare_branch_fusion_keeps_boolean_live_past_the_jump() {
+        // switch ((x < 0) + 0) shape: the fallthrough reads the boolean.
+        // Deleting setl/movzbl here returned garbage (`sw_cmp`, i686 -O1).
+        let out = fuse_out(
+            "    cmpl $0, 16(%esp)\n    setl %al\n    movzbl %al, %eax\n    testl %eax, %eax\n    je .L2\n    cmpl $1, %eax\n    sete %al\n    ret\n",
+        );
+        assert!(
+            out.contains("jge .L2"),
+            "redundant re-test not fused:\n{out}"
+        );
+        assert!(
+            out.contains("setl %al") && out.contains("movzbl %al, %eax"),
+            "live boolean deleted:\n{out}"
+        );
+    }
+
+    #[test]
+    fn compare_branch_fusion_accepts_byte_retests() {
+        for retest in ["testb %al, %al", "cmpb $0, %al"] {
+            let out = fuse_out(&format!(
+                "    cmpl %ecx, %edx\n    setb %al\n    {retest}\n    jne .L2\n{FUSE_DEAD_FALLTHROUGH}"
+            ));
+            assert!(out.contains("jb .L2"), "{retest}: not fused:\n{out}");
+            assert!(!out.contains("setb"), "{retest}: dead setb kept:\n{out}");
+        }
+    }
+
+    #[test]
+    fn compare_branch_fusion_refusals() {
+        for (mid, why) in [
+            // bits 8..31 of %eax are unspecified after setCC alone.
+            (
+                "    setl %al\n    testl %eax, %eax\n",
+                "no extension before testl",
+            ),
+            // An unrelated value replaces the boolean before the test.
+            (
+                "    setl %al\n    movzbl %al, %eax\n    movl -12(%ebp), %eax\n    testl %eax, %eax\n",
+                "unrelated reload",
+            ),
+            (
+                "    setl %al\n    movzbl %al, %eax\n    movsbl 8(%esp), %eax\n    testl %eax, %eax\n",
+                "extension of another value",
+            ),
+            // The spilled copy is overwritten by another register first.
+            (
+                "    setl %al\n    movzbl %al, %eax\n    movl %eax, -16(%ebp)\n    movl %ecx, -16(%ebp)\n    movl -16(%ebp), %eax\n    testl %eax, %eax\n",
+                "clobbered spill slot",
+            ),
+        ] {
+            let out = fuse_out(&format!(
+                "    cmpl %ecx, %edx\n{mid}    jne .L2\n{FUSE_DEAD_FALLTHROUGH}"
+            ));
+            assert!(!out.contains("jl .L2"), "{why}: fused:\n{out}");
+            assert!(out.contains("jne .L2"), "{why}: branch rewritten:\n{out}");
+        }
+    }
+
+    #[test]
+    fn narrow_fold_zero_test_matches_the_load_width() {
+        // A 32-bit test of a zero-extended WORD is a word zero test: the old
+        // `cmpb $0` read one byte (0x0100 compared equal to zero) and spelled
+        // `cmpb $0, %ax` for register sources.
+        for (load, want) in [
+            ("movzwl 2(%edi), %ecx", "cmpw $0, 2(%edi)"),
+            ("movzwl (%ebx), %edx", "cmpw $0, (%ebx)"),
+            ("movzwl %si, %ecx", "testw %si, %si"),
+            ("movzbl %dl, %ecx", "testb %dl, %dl"),
+            ("movzbl 3(%esp), %ecx", "cmpb $0, 3(%esp)"),
+        ] {
+            let r = load.rsplit(", ").next().unwrap();
+            let out = narrow_fold_out(&format!(
+                "    {load}\n    testl {r}, {r}\n    je .L1\n    xorl %ebx, %ebx\n"
+            ));
+            assert!(out.contains(want), "{load}: want {want}:\n{out}");
+            if load.starts_with("movzw") {
+                assert!(!out.contains("cmpb"), "{load}: byte test of a word:\n{out}");
+            }
+        }
+        // Width-matched register source: `test r,r`, never `cmp $0, %r`.
+        let out = narrow_fold_out("    movzbl %cl, %eax\n    testb %al, %al\n    jne .L1\n");
+        assert!(out.contains("testb %cl, %cl"), "register zero test:\n{out}");
+        assert!(
+            !out.contains("cmpb $0, %cl"),
+            "cmp $0 on a register:\n{out}"
         );
     }
 
@@ -20553,6 +21091,69 @@ f:
     }
 
     #[test]
+    fn x87_integer_store_widths_are_memory_format_widths() {
+        // AT&T x87 integer suffixes: s = 16, l = 32, q = 64 bits. The
+        // slot-overwrite proof must never overstate a store: `fistpl` was 8
+        // and `fisttpl` 10, which "proved" the untouched high half of an
+        // 8-byte slot dead.
+        for (mn, w) in [
+            ("fists", 2),
+            ("fistps", 2),
+            ("fisttps", 2),
+            ("fistl", 4),
+            ("fistpl", 4),
+            ("fisttpl", 4),
+            ("fistpq", 8),
+            ("fisttpq", 8),
+            ("fsts", 4),
+            ("fstpl", 8),
+            ("fstpt", 10),
+        ] {
+            assert_eq!(esp_store_operand(mn, "4(%esp)"), Some((4, w)), "{mn}");
+            assert_eq!(frame_mem_width(mn), w, "{mn}");
+        }
+        for (mn, w) in [("filds", 2), ("fildl", 4), ("fildq", 8)] {
+            assert_eq!(frame_mem_width(mn), w, "{mn}");
+        }
+        for (mn, w) in [("cmpb", 1), ("testb", 1), ("cmpw", 2), ("testw", 2)] {
+            assert_eq!(frame_mem_width(mn), w, "{mn}");
+        }
+        // Slot [8, 16): a 32-bit store covers exactly one half (the old
+        // widths reported Both for `fistpl 8(%esp)` / `fisttpl 8(%esp)`).
+        assert!(matches!(
+            slot_write_extent("    fisttpl 8(%esp)", 8, 12),
+            SlotWrite::Lo
+        ));
+        assert!(matches!(
+            slot_write_extent("    fistpl 8(%esp)", 8, 12),
+            SlotWrite::Lo
+        ));
+        assert!(matches!(
+            slot_write_extent("    fistpl 12(%esp)", 8, 12),
+            SlotWrite::Hi
+        ));
+        assert!(matches!(
+            slot_write_extent("    fisttpq 8(%esp)", 8, 12),
+            SlotWrite::Both
+        ));
+        assert!(matches!(
+            slot_write_extent("    fisttps 8(%esp)", 8, 12),
+            SlotWrite::ReadOrUnknown
+        ));
+    }
+
+    #[test]
+    fn x87_short_integer_stores_invalidate_their_two_bytes() {
+        let mut ext = [(0i32, 0i32); 4];
+        for line in ["fisttps 8(%esp)", "fistps 8(%esp)", "fists 8(%esp)"] {
+            let n = frame_write_extents(line, &mut ext);
+            assert_eq!(&ext[..n], &[(ESP_SLOT_BIAS + 8, 2)], "{line}");
+        }
+        let n = frame_write_extents("filds 8(%esp)", &mut ext);
+        assert_eq!(n, 0, "filds only reads its operand");
+    }
+
+    #[test]
     fn frame_write_extents_sees_every_operand_on_the_line() {
         // ebp_offset records ONE displacement; a line can name two. Missing the
         // second is the deleted pass's defect (b) in a new costume.
@@ -21145,6 +21746,134 @@ f:
             !out.contains("cmpl $4, 176(%esp)"),
             "cmpl must not appear:\n{out}"
         );
+    }
+
+    /// Run the fold over `f: <body>` and return the output.
+    fn narrow_fold_out(body: &str) -> String {
+        let asm =
+            format!("f:\n.cfi_startproc\n{body}.L1:\n    xorl %eax, %eax\n    ret\n.cfi_endproc\n");
+        peephole_optimize(asm)
+    }
+
+    #[test]
+    fn narrow_fold_width_matched_compare_folds_for_every_flag_reader() {
+        // `cmpb $I, %al` after the byte load reads exactly the loaded byte:
+        // every flag matches `cmpb $I, M`, so signed readers and immediates
+        // outside the zero-extension window fold too.
+        for (load, cmp, jcc, want) in [
+            (
+                "movzbl 12(%esp), %eax",
+                "cmpb $4, %al",
+                "je",
+                "cmpb $4, 12(%esp)",
+            ),
+            (
+                "movzbl 12(%esp), %eax",
+                "cmpb $-6, %al",
+                "jl",
+                "cmpb $-6, 12(%esp)",
+            ),
+            (
+                "movzbl (%esi), %eax",
+                "cmpb $200, %al",
+                "jg",
+                "cmpb $200, (%esi)",
+            ),
+            (
+                "movsbl 3(%edi), %ecx",
+                "cmpb $-1, %cl",
+                "jle",
+                "cmpb $-1, 3(%edi)",
+            ),
+            (
+                "movzwl 8(%ebp), %edx",
+                "cmpw $513, %dx",
+                "jb",
+                "cmpw $513, 8(%ebp)",
+            ),
+            (
+                "movswl (%ecx), %eax",
+                "cmpw $-300, %ax",
+                "jge",
+                "cmpw $-300, (%ecx)",
+            ),
+        ] {
+            let out = narrow_fold_out(&format!(
+                "    {load}\n    {cmp}\n    {jcc} .L1\n    xorl %ebx, %ebx\n"
+            ));
+            assert!(out.contains(want), "{load}; {cmp} did not fold:\n{out}");
+            assert!(!out.contains(load), "the load survived:\n{out}");
+        }
+    }
+
+    #[test]
+    fn narrow_fold_width_matched_test_folds_to_compare_with_zero() {
+        // testb/testw and cmp{b,w} $0 agree on CF=OF=0 and SF/ZF/PF.
+        for (load, test, jcc, want) in [
+            (
+                "movzbl 5(%esp), %eax",
+                "testb %al, %al",
+                "js",
+                "cmpb $0, 5(%esp)",
+            ),
+            (
+                "movsbl (%ebx), %edx",
+                "testb %dl, %dl",
+                "jne",
+                "cmpb $0, (%ebx)",
+            ),
+            (
+                "movzwl 2(%edi), %ecx",
+                "testw %cx, %cx",
+                "jle",
+                "cmpw $0, 2(%edi)",
+            ),
+        ] {
+            let out = narrow_fold_out(&format!(
+                "    {load}\n    {test}\n    {jcc} .L1\n    xorl %ebx, %ebx\n"
+            ));
+            assert!(out.contains(want), "{load}; {test} did not fold:\n{out}");
+            assert!(!out.contains(load), "the load survived:\n{out}");
+        }
+    }
+
+    #[test]
+    fn narrow_fold_width_matched_refusals() {
+        for (body, why) in [
+            // %ah is the loaded family but a different byte.
+            (
+                "    movzbl 12(%esp), %eax\n    cmpb $4, %ah\n    je .L1\n",
+                "high byte",
+            ),
+            // A byte compare after a WORD load reads only half of it... and
+            // a word compare after a byte load reads a byte that was not
+            // loaded: neither is width-matched.
+            (
+                "    movzwl 12(%esp), %eax\n    cmpb $4, %al\n    je .L1\n",
+                "byte of a word",
+            ),
+            (
+                "    movzbl 12(%esp), %eax\n    cmpw $4, %ax\n    je .L1\n",
+                "word of a byte",
+            ),
+            // The loaded register is read (and observably stored) after the
+            // compare: the load stays.
+            (
+                "    movzbl 12(%esp), %eax\n    cmpb $4, %al\n    je .L1\n    movl %eax, (%edi)\n",
+                "live after",
+            ),
+            // A different register than the one loaded.
+            (
+                "    movzbl 12(%esp), %eax\n    cmpb $4, %cl\n    je .L1\n",
+                "other register",
+            ),
+        ] {
+            let out = narrow_fold_out(body);
+            assert!(
+                out.contains("movzbl 12(%esp)") || out.contains("movzwl 12(%esp)"),
+                "{why}: folded:\n{out}"
+            );
+        }
     }
 
     #[test]

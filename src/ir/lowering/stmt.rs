@@ -30,10 +30,7 @@ impl Lowerer {
 
         // Check if this block contains any declarations. If not, we can skip
         // scope tracking entirely since statements don't introduce new bindings.
-        let has_declarations = compound.items.iter().any(|item| {
-            matches!(item, BlockItem::Declaration(_))
-                || matches!(item, BlockItem::NestedFunction(_))
-        });
+        let has_declarations = Self::block_needs_scope(compound);
 
         if has_declarations {
             // Push a scope frame to track additions/modifications in this block.
@@ -44,7 +41,7 @@ impl Lowerer {
                 match item {
                     BlockItem::Declaration(decl) => {
                         self.func_mut().current_span = decl.span;
-                        self.collect_enum_constants_scoped(&decl.type_spec);
+                        self.declare_local_decl_tags(decl);
                         self.lower_local_decl(decl);
                     }
                     BlockItem::Statement(stmt) => self.lower_stmt(stmt),
@@ -83,6 +80,21 @@ impl Lowerer {
             return;
         }
 
+        // `typeof(expr)` of VM type: the operand is evaluated once for the
+        // declaration, and each declarator's layout derives from its own.
+        // `__auto_type x = e` takes e's type after array decay; the
+        // initializer itself is evaluated as usual.
+        let typeof_vm = if decl.is_extern() {
+            None
+        } else if matches!(decl.type_spec, TypeSpecifier::AutoType) {
+            match decl.declarators.first().and_then(|d| d.init.as_ref()) {
+                Some(Initializer::Expr(init)) => self.vm_layout_of_expr(init).map(|l| l.decayed()),
+                _ => None,
+            }
+        } else {
+            self.typeof_vm_base(&decl.type_spec)
+        };
+
         for declarator in &decl.declarators {
             if declarator.name.is_empty() {
                 continue;
@@ -96,6 +108,11 @@ impl Lowerer {
 
             let mut da = self.analyze_declaration(type_spec, &declarator.derived);
             da.base_type_volatile = decl.is_volatile();
+            da.base_type_const = crate::common::qualifiers::type_name_const_base(
+                &decl.type_spec,
+                decl.is_const(),
+                self,
+            );
             da.object_volatile = declarator.attrs.object_volatile;
             da.apply_decl_vector_type(decl);
             self.fixup_unsized_array(&mut da, type_spec, &declarator.derived, &declarator.init);
@@ -112,7 +129,16 @@ impl Lowerer {
                 continue;
             }
 
-            let vla_size = if da.is_array {
+            let typeof_layout = match &typeof_vm {
+                Some(base) => {
+                    let base_const_size = self.sizeof_type(type_spec);
+                    self.declared_vm_layout(base, base_const_size, &declarator.derived)
+                }
+                None => None,
+            };
+            let vla_size = if let Some(layout) = &typeof_layout {
+                layout.size
+            } else if da.is_array {
                 self.compute_vla_runtime_size(type_spec, &declarator.derived)
             } else if da.is_struct {
                 // GCC extension: block-scope structs may contain VLA members
@@ -169,6 +195,11 @@ impl Lowerer {
                 alloca_align,
                 vla_size,
             );
+            if let Some(layout) = typeof_layout {
+                if let Some(info) = self.func_mut().locals.get_mut(&declarator.name) {
+                    info.vla_strides = layout.strides;
+                }
+            }
             self.track_fptr_sig(declarator, type_spec);
 
             if let Some(ref init) = declarator.init {
@@ -200,8 +231,9 @@ impl Lowerer {
         let ts = if matches!(&decl.type_spec, TypeSpecifier::AutoType) {
             if let Some(first) = decl.declarators.first() {
                 if let Some(Initializer::Expr(ref init_expr)) = first.init {
+                    // The initializer's type after array and function decay.
                     if let Some(ctype) = self.get_expr_ctype(init_expr) {
-                        Self::ctype_to_type_spec(&ctype)
+                        Self::ctype_to_type_spec(&ctype.decayed_value_ctype())
                     } else {
                         self.emit_warning(
                             "could not infer type for '__auto_type'; defaulting to 'int'",
@@ -227,6 +259,13 @@ impl Lowerer {
     }
 
     fn lower_local_typedef(&mut self, decl: &Declaration, type_spec: &TypeSpecifier) {
+        // `typedef typeof(expr) T` of VM type: the operand is evaluated, and
+        // T's runtime size derives from the operand's layout.
+        let typeof_vm = if self.func_state.is_some() {
+            self.typeof_vm_base(&decl.type_spec)
+        } else {
+            None
+        };
         for declarator in &decl.declarators {
             if declarator.name.is_empty() {
                 continue;
@@ -275,6 +314,13 @@ impl Lowerer {
             }
             self.types
                 .insert_typedef_scoped(declarator.name.clone(), resolved_ctype);
+            let const_base = crate::common::qualifiers::type_name_const_base(
+                &decl.type_spec,
+                decl.is_const(),
+                self,
+            );
+            self.types
+                .set_typedef_const_base(&declarator.name, const_base);
 
             let effective_alignment = {
                 let mut align = decl.alignment;
@@ -302,7 +348,15 @@ impl Lowerer {
                         _ => None,
                     }
                 };
-                if let Some(vla_size) = copied_from_struct {
+                let typeof_size = match &typeof_vm {
+                    Some(base) => {
+                        let base_const_size = self.sizeof_type(type_spec);
+                        self.declared_vm_layout(base, base_const_size, &declarator.derived)
+                            .and_then(|layout| layout.size)
+                    }
+                    None => None,
+                };
+                if let Some(vla_size) = copied_from_struct.or(typeof_size) {
                     self.func_mut()
                         .insert_vla_typedef_size_scoped(declarator.name.clone(), vla_size);
                 } else if let Some(vla_size) =
@@ -387,7 +441,7 @@ impl Lowerer {
         explicit_align: usize,
         vla_size: Option<Value>,
     ) {
-        let mut local_info = LocalInfo::from_analysis(da, alloca, decl.is_const());
+        let mut local_info = LocalInfo::from_analysis(da, alloca);
         local_info.var.address_space =
             crate::common::type_builder::object_storage_address_space_with_object(
                 self.declaration_address_space(decl.address_space, &decl.type_spec),
@@ -413,11 +467,13 @@ impl Lowerer {
         }
         local_info.var.type_align = self.typedef_alignment_for_type_spec(type_spec).copied();
         local_info.vla_size = vla_size;
-        if vla_size.is_some() {
-            let strides = self.compute_vla_local_strides(type_spec, &declarator.derived);
-            if !strides.is_empty() {
-                local_info.vla_strides = strides;
-            }
+        let strides = if vla_size.is_some() {
+            self.compute_vla_local_strides(type_spec, &declarator.derived)
+        } else {
+            self.compute_vla_pointee_strides(type_spec, &declarator.derived)
+        };
+        if !strides.is_empty() {
+            local_info.vla_strides = strides;
         }
         local_info.asm_register = declarator.attrs.asm_register.clone();
         local_info.asm_register_has_init =
@@ -682,7 +738,7 @@ impl Lowerer {
 
         // Store type info in locals (with static_global_name set so each use site
         // emits a fresh GlobalAddr in its own basic block, avoiding unreachable-block issues).
-        let mut local_info = LocalInfo::for_static(da, static_name, decl.is_const());
+        let mut local_info = LocalInfo::for_static(da, static_name);
         if let Some(ea) = explicit_align {
             local_info.var.explicit_alignment = Some(ea);
         }
@@ -764,9 +820,8 @@ impl Lowerer {
         // Store real part
         if let Some(first) = sub_items.first() {
             if let Initializer::Expr(e) = &first.init {
-                let val = self.lower_expr(e);
-                let expr_ty = self.get_expr_type(e);
-                let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
+                let comp_ct = Self::complex_component_ctype(complex_ctype);
+                let val = self.lower_init_leaf(e, &comp_ct);
                 self.emit(Instruction::Store {
                     volatile: false,
                     val,
@@ -789,9 +844,8 @@ impl Lowerer {
         let imag_ptr = self.emit_gep_offset(dest_addr, comp_size, IrType::I8);
         if let Some(item) = sub_items.get(1) {
             if let Initializer::Expr(e) = &item.init {
-                let val = self.lower_expr(e);
-                let expr_ty = self.get_expr_type(e);
-                let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
+                let comp_ct = Self::complex_component_ctype(complex_ctype);
+                let val = self.lower_init_leaf(e, &comp_ct);
                 self.emit(Instruction::Store {
                     volatile: false,
                     val,
@@ -1017,7 +1071,10 @@ impl Lowerer {
                     } else if let CType::Array(ref elem_ty, Some(arr_size)) = field.ty {
                         // Char array field initialized by a string literal:
                         // copy the string bytes instead of storing the pointer.
-                        let is_char_array = matches!(**elem_ty, CType::Char | CType::UChar);
+                        let is_char_array = matches!(
+                            **elem_ty,
+                            CType::Char | CType::SChar | CType::UChar | CType::PlainUChar
+                        );
                         if is_char_array {
                             if let Expr::StringLiteral(s, _) = e {
                                 self.emit_string_to_alloca(base, s, field_offset, arr_size);
@@ -1033,7 +1090,7 @@ impl Lowerer {
                                     );
                                 }
                             } else {
-                                let val = self.lower_and_cast_init_expr(e, field_ty);
+                                let val = self.lower_init_leaf(e, &field.ty);
                                 let field_addr = self.emit_gep_offset(base, field_offset, field_ty);
                                 self.emit(Instruction::Store {
                                     volatile: false,
@@ -1079,8 +1136,7 @@ impl Lowerer {
                             // consume up to arr_size items from the init list to fill array elements
                             let elem_ir_ty = IrType::from_ctype(elem_ty);
                             let elem_size = elem_ir_ty.size().max(1);
-                            let elem_is_bool = **elem_ty == CType::Bool;
-                            let val = self.lower_init_expr_bool_aware(e, elem_ir_ty, elem_is_bool);
+                            let val = self.lower_init_leaf(e, elem_ty);
                             let field_addr = self.emit_gep_offset(base, field_offset, elem_ir_ty);
                             self.emit(Instruction::Store {
                                 volatile: false,
@@ -1106,11 +1162,7 @@ impl Lowerer {
                                     }
                                 };
                                 if let Some(next_e) = expr_opt {
-                                    let next_val = self.lower_init_expr_bool_aware(
-                                        next_e,
-                                        elem_ir_ty,
-                                        elem_is_bool,
-                                    );
+                                    let next_val = self.lower_init_leaf(next_e, elem_ty);
                                     let offset = field_offset + arr_idx * elem_size;
                                     let elem_addr = self.emit_gep_offset(base, offset, elem_ir_ty);
                                     self.emit(Instruction::Store {
@@ -1125,8 +1177,7 @@ impl Lowerer {
                             }
                         }
                     } else {
-                        let val =
-                            self.lower_init_expr_bool_aware(e, field_ty, field.ty == CType::Bool);
+                        let val = self.lower_init_leaf(e, &field.ty);
                         let field_addr = self.emit_gep_offset(base, field_offset, field_ty);
                         if let (Some(bit_offset), Some(bit_width)) =
                             (field.bit_offset, field.bit_width)
@@ -1206,7 +1257,6 @@ impl Lowerer {
                             ai = idx;
                         }
                     }
-                    let elem_is_bool = **elem_ty == CType::Bool;
                     // A literal for a row of a multi-dimensional array field
                     // (`struct { char a[2][4]; } s = { { "ab", "c" } };`).
                     let row_string = match (&**elem_ty, &item.init) {
@@ -1223,7 +1273,7 @@ impl Lowerer {
                             self.zero_fill_after_string(base, at + len, at + elem_size);
                         }
                         Initializer::Expr(e) => {
-                            let val = self.lower_init_expr_bool_aware(e, elem_ir_ty, elem_is_bool);
+                            let val = self.lower_init_leaf(e, elem_ty);
                             self.emit_store_at_offset(base, ai * elem_size, val, elem_ir_ty);
                         }
                         Initializer::List(sub_items) => {
@@ -1240,11 +1290,7 @@ impl Lowerer {
                 if let Some(first) = items.first() {
                     if let Initializer::Expr(e) = &first.init {
                         let field_ir_ty = IrType::from_ctype(field_ctype);
-                        let val = self.lower_init_expr_bool_aware(
-                            e,
-                            field_ir_ty,
-                            *field_ctype == CType::Bool,
-                        );
+                        let val = self.lower_init_leaf(e, field_ctype);
                         self.emit(Instruction::Store {
                             volatile: false,
                             val,
@@ -1277,85 +1323,11 @@ impl Lowerer {
         &mut self,
         items: &[InitializerItem],
         alloca: Value,
-        base_ty: IrType,
+        base_ct: &CType,
         array_dim_strides: &[usize],
     ) {
         let mut flat_index = 0usize;
-        self.lower_array_init_recursive(items, alloca, base_ty, array_dim_strides, &mut flat_index);
-    }
-
-    /// Base element type and per-dimension byte strides (the
-    /// `DeclAnalysis::array_dim_strides` shape: stride of each index, the
-    /// last being the element size) of a sized multi-dimensional array whose
-    /// innermost element is a plain scalar, plus its total element count.
-    /// Those are exactly the objects [`Self::lower_array_init_recursive`]
-    /// initializes; `None` for anything else (1-D arrays, which have their
-    /// own paths, and arrays of aggregates).
-    pub(super) fn multidim_scalar_array_geometry(
-        &self,
-        arr: &CType,
-    ) -> Option<(IrType, Vec<usize>, usize)> {
-        let CType::Array(elem, Some(n)) = arr else {
-            return None;
-        };
-        if !matches!(**elem, CType::Array(..)) {
-            return None;
-        }
-        let mut strides = Vec::new();
-        let mut total = *n;
-        let mut cur: &CType = elem;
-        loop {
-            strides.push(self.resolve_ctype_size(cur));
-            match cur {
-                CType::Array(inner, Some(m)) => {
-                    total *= *m;
-                    cur = inner;
-                }
-                CType::Array(_, None) => return None,
-                _ => break,
-            }
-        }
-        let scalar = cur.is_integer()
-            || matches!(
-                cur,
-                CType::Pointer(..) | CType::Float | CType::Double | CType::LongDouble
-            );
-        if !scalar || cur.is_complex() || strides.last().copied().unwrap_or(0) == 0 {
-            return None;
-        }
-        Some((IrType::from_ctype(cur), strides, total))
-    }
-
-    /// Initialize a multi-dimensional array member from the initializers of
-    /// the ENCLOSING list with its braces elided (C11 6.7.9p20): take items
-    /// from the front of `items` until the member is full or an item carries
-    /// a designator (which belongs to the enclosing aggregate).  Returns the
-    /// number of items consumed; at least the first is.  `base` addresses the
-    /// member.
-    pub(super) fn lower_array_member_elided(
-        &mut self,
-        items: &[InitializerItem],
-        base: Value,
-        base_ty: IrType,
-        array_dim_strides: &[usize],
-        total_elems: usize,
-    ) -> usize {
-        let mut flat_index = 0usize;
-        let mut consumed = 0usize;
-        while consumed < items.len() && flat_index < total_elems {
-            if consumed > 0 && !items[consumed].designators.is_empty() {
-                break;
-            }
-            self.lower_array_init_recursive(
-                &items[consumed..consumed + 1],
-                base,
-                base_ty,
-                array_dim_strides,
-                &mut flat_index,
-            );
-            consumed += 1;
-        }
-        consumed.max(1)
+        self.lower_array_init_recursive(items, alloca, base_ct, array_dim_strides, &mut flat_index);
     }
 
     /// Recursive helper for multi-dimensional array initialization.
@@ -1365,10 +1337,11 @@ impl Lowerer {
         &mut self,
         items: &[InitializerItem],
         alloca: Value,
-        base_ty: IrType,
+        base_ct: &CType,
         array_dim_strides: &[usize],
         flat_index: &mut usize,
     ) {
+        let base_ty = IrType::from_ctype(base_ct);
         let elem_size = *array_dim_strides.last().unwrap_or(&1);
         let base_type_size = base_ty.size().max(1);
         let sub_elem_count = if array_dim_strides.len() > 1 && elem_size > 0 {
@@ -1432,14 +1405,14 @@ impl Lowerer {
                             self.lower_array_init_recursive(
                                 sub_items,
                                 alloca,
-                                base_ty,
+                                base_ct,
                                 sub_strides,
                                 flat_index,
                             );
                         } else {
                             for sub_item in sub_items {
                                 if let Initializer::Expr(e) = &sub_item.init {
-                                    let val = self.lower_and_cast_init_expr(e, base_ty);
+                                    let val = self.lower_init_leaf(e, base_ct);
                                     self.emit_array_element_store(
                                         alloca,
                                         val,
@@ -1473,7 +1446,7 @@ impl Lowerer {
                                 continue;
                             }
                         }
-                        let val = self.lower_and_cast_init_expr(e, base_ty);
+                        let val = self.lower_init_leaf(e, base_ct);
                         self.emit_array_element_store(
                             alloca,
                             val,
@@ -1510,7 +1483,7 @@ impl Lowerer {
                         self.lower_array_init_recursive(
                             sub_items,
                             alloca,
-                            base_ty,
+                            base_ct,
                             &array_dim_strides[1..],
                             flat_index,
                         );
@@ -1518,7 +1491,7 @@ impl Lowerer {
                         // Bottom level: treat as flat elements
                         for sub_item in sub_items {
                             if let Initializer::Expr(e) = &sub_item.init {
-                                let val = self.lower_and_cast_init_expr(e, base_ty);
+                                let val = self.lower_init_leaf(e, base_ct);
                                 self.emit_array_element_store(
                                     alloca,
                                     val,
@@ -1559,7 +1532,7 @@ impl Lowerer {
                         }
                     }
                     // Bare scalar: fills one base element without sub-array padding
-                    let val = self.lower_and_cast_init_expr(e, base_ty);
+                    let val = self.lower_init_leaf(e, base_ct);
                     self.emit_array_element_store(alloca, val, *flat_index * elem_size, base_ty);
                     *flat_index += 1;
                 }
@@ -1567,36 +1540,49 @@ impl Lowerer {
         }
     }
 
-    /// Lower an expression and cast it to the target type (e.g., int to float).
-    pub(super) fn lower_and_cast_init_expr(&mut self, expr: &Expr, target_ty: IrType) -> Operand {
-        let val = self.lower_expr(expr);
-        let expr_ty = self.get_expr_type(expr);
-        self.emit_implicit_cast(val, expr_ty, target_ty)
-    }
-
-    /// Lower an init expression with bool-aware handling.
-    /// For bool targets, normalizes to 0/1. For other types, casts to target_ty.
-    pub(super) fn lower_init_expr_bool_aware(
-        &mut self,
-        expr: &Expr,
-        target_ty: IrType,
-        is_bool: bool,
-    ) -> Operand {
-        if is_bool {
-            let val = self.lower_expr(expr);
-            let expr_ty = self.get_expr_type(expr);
-            self.emit_bool_normalize_typed(val, expr_ty)
+    /// Main statement lowering dispatcher. Delegates to per-statement-type methods.
+    ///
+    /// A selection or iteration statement is a block, and so is each of its
+    /// substatements (C11 6.8.4p3, 6.8.5p5; see `lower_substatement`): a tag
+    /// defined in one of their type-names ends with it. Only the type scope
+    /// is opened -- such a block declares no objects, so no cleanup, VLA or
+    /// label-depth bookkeeping is involved. Mirrors sema's `analyze_stmt`.
+    pub(super) fn lower_stmt(&mut self, stmt: &Stmt) {
+        if Self::is_block_statement(stmt) {
+            self.types.push_scope();
+            self.lower_stmt_in_scope(stmt);
+            self.types.pop_scope();
         } else {
-            self.lower_and_cast_init_expr(expr, target_ty)
+            self.lower_stmt_in_scope(stmt);
         }
     }
 
-    /// Main statement lowering dispatcher. Delegates to per-statement-type methods.
-    pub(super) fn lower_stmt(&mut self, stmt: &Stmt) {
+    /// Whether `stmt` is a selection or iteration statement.
+    pub(super) fn is_block_statement(stmt: &Stmt) -> bool {
+        matches!(
+            stmt,
+            Stmt::If(..) | Stmt::While(..) | Stmt::DoWhile(..) | Stmt::For(..) | Stmt::Switch(..)
+        )
+    }
+
+    /// Lower a substatement of a selection or iteration statement in a type
+    /// scope of its own (a compound statement opens its own).
+    pub(super) fn lower_substatement(&mut self, stmt: &Stmt) {
+        if matches!(stmt, Stmt::Compound(_)) {
+            self.lower_stmt(stmt);
+        } else {
+            self.types.push_scope();
+            self.lower_stmt(stmt);
+            self.types.pop_scope();
+        }
+    }
+
+    fn lower_stmt_in_scope(&mut self, stmt: &Stmt) {
         // Fresh FP expression root per statement (OP-36): every FP arith
         // result lowered inside this statement is tagged with it, so
         // -ffp-contract=on fuses mul+add only within one source expression.
         self.func_mut().fp_expr_root = self.func_mut().fp_expr_root.wrapping_add(1);
+        self.declare_stmt_type_name_tags(stmt);
         // Set the current span for debug info tracking. All instructions emitted
         // while lowering this statement will inherit this source location.
         if let Some(span) = stmt.span() {
@@ -1659,6 +1645,7 @@ impl Lowerer {
             Stmt::Label(name, stmt, _span) => self.lower_label_stmt(name, stmt),
             Stmt::Declaration(decl) => {
                 self.func_mut().current_span = decl.span;
+                self.declare_local_decl_tags(decl);
                 self.lower_local_decl(decl);
             }
             Stmt::InlineAsm {
@@ -1863,6 +1850,65 @@ impl Lowerer {
     ///
     /// We process dimensions from innermost to outermost, accumulating the
     /// product of inner dimensions * base element size.
+    /// Runtime strides of a pointer to a variably modified array (`int
+    /// (*p)[n]`, `int (*p)[a][b]`), as for a parameter of that type: the
+    /// bounds are evaluated once, where the declaration is reached (C11
+    /// 6.8p3), and subscripts, `sizeof *p` and pointer arithmetic scale by
+    /// them. Empty when the object is not such a pointer.
+    pub(super) fn compute_vla_pointee_strides(
+        &mut self,
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> Vec<Option<Value>> {
+        let Some(full) = Self::object_type_spec(type_spec, derived) else {
+            return vec![];
+        };
+        let pointee = match self.resolve_type_spec(&full) {
+            TypeSpecifier::Pointer(inner, _) => (**inner).clone(),
+            _ => return vec![],
+        };
+        let dims = self.collect_vla_dims(&pointee);
+        if !dims.iter().any(|d| d.is_vla) {
+            return vec![];
+        }
+        self.emit_vla_pointee_strides(&dims)
+    }
+
+    /// The declared object's full type as one specifier, folding pointer and
+    /// array declarators the way `build_full_ctype_with_base` applies them
+    /// (left to right, a run of array bounds innermost-last); `None` for a
+    /// function declarator. Address spaces are not carried.
+    fn object_type_spec(
+        type_spec: &TypeSpecifier,
+        derived: &[DerivedDeclarator],
+    ) -> Option<TypeSpecifier> {
+        let mut result = type_spec.clone();
+        let mut i = 0;
+        while i < derived.len() {
+            match &derived[i] {
+                DerivedDeclarator::Pointer(_) => {
+                    result = TypeSpecifier::Pointer(Box::new(result), AddressSpace::Default);
+                    i += 1;
+                }
+                DerivedDeclarator::Array(_) => {
+                    let start = i;
+                    while matches!(derived.get(i), Some(DerivedDeclarator::Array(_))) {
+                        i += 1;
+                    }
+                    for d in derived[start..i].iter().rev() {
+                        if let DerivedDeclarator::Array(bound) = d {
+                            result = TypeSpecifier::Array(Box::new(result), bound.clone());
+                        }
+                    }
+                }
+                DerivedDeclarator::Function(..) | DerivedDeclarator::FunctionPointer(..) => {
+                    return None;
+                }
+            }
+        }
+        Some(result)
+    }
+
     pub(super) fn compute_vla_local_strides(
         &mut self,
         type_spec: &TypeSpecifier,
@@ -2048,17 +2094,13 @@ impl Lowerer {
                 return Some(vla_size);
             }
         }
-        if let TypeSpecifier::Typeof(expr, _) = type_spec {
-            if let Expr::Identifier(name, _) = &**expr {
-                if let Some(vla_size) = self
-                    .func_state
-                    .as_ref()
-                    .and_then(|fs| fs.locals.get(name))
-                    .and_then(|info| info.vla_size)
-                {
-                    return Some(vla_size);
-                }
-            }
+        // `typeof(expr)` of VM type (e.g. a VLA-struct member declared with
+        // it): sized from the operand's layout.
+        if let Some(size) = Self::typeof_operand(type_spec)
+            .and_then(|operand| self.vm_layout_of_expr(operand))
+            .and_then(|layout| layout.size)
+        {
+            return Some(size);
         }
         let resolved = self.resolve_type_spec(type_spec).clone();
         match &resolved {

@@ -75,5 +75,5 @@ int main(void) {
     T2 fine = {1.0L + 0x1p-60L, 0x1p-62L};
     if (fine[0] + fine[1] * 3 != (1.0L + 0x1p-60L) + 0x1p-62L * 3) bad |= 1 << 15;
     printf("ld layout: %s (0x%x)\n", bad ? "FAIL" : "ok", bad);
-    return bad;
+    return bad != 0; /* an exit status keeps 8 bits: `return bad` hid bits 8+ */
 }

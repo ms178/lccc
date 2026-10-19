@@ -455,9 +455,31 @@ pub(crate) fn analyze_accumulator_assignments_with_config(
     config: &RaConfig,
 ) -> Vec<AccumulatorAssignment> {
     let lhs_first = matches!(policy.operand_order, AccumulatorOperandOrder::LhsFirst);
-    let candidates = crate::backend::stack_layout::copy_coalescing::compute_immediately_consumed(
-        func, lhs_first,
-    );
+    let mut candidates =
+        crate::backend::stack_layout::copy_coalescing::compute_immediately_consumed(
+            func, lhs_first,
+        );
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    // An accumulator home is one register: a value proven wider than it (an
+    // 8-byte I64/U64/F64/D64 pair on a 32-bit target, a 16-byte value
+    // anywhere) would be consumed with a stale upper half. The candidate scan
+    // types values by their producer, and a Copy has none of its own, so a
+    // copy of a wide phi, constant, call result or parameter slipped through.
+    // The fixpoint value-type map types every Copy/Phi web and consuming
+    // context; untyped values keep the historical GPR treatment.
+    let accumulator_bytes = if crate::common::types::target_is_32bit() {
+        4
+    } else {
+        8
+    };
+    let value_types = crate::backend::common::compute_value_type_map(func);
+    candidates.retain(|id| {
+        value_types
+            .get(id)
+            .is_none_or(|ty| ty.size() <= accumulator_bytes)
+    });
     if candidates.is_empty() {
         return Vec::new();
     }
@@ -1058,15 +1080,20 @@ pub(crate) fn x86_param_caller_homes_safe_with_config(
                 if crate::backend::generation::inline_memcpy_len(name, info).is_some()
                     || crate::backend::generation::x86_inline_memset_len(name, info).is_some())
     };
+    // Real calls do not disqualify: every consumer of this predicate grants
+    // a parameter a caller-saved home only through the allocator's Phase 2,
+    // which refuses call-spanning values and keeps later call arguments out
+    // of the argument registers (`RegAllocConfig::call_arg_regs`) -- the same
+    // guarantees every other caller-saved home in a non-leaf function rests
+    // on. So a parameter read only before the first call stays in its ABI
+    // register (`f(p) { x = p->a; g(x); }` paid push/mov/pop of %rbx for it),
+    // and one live across a call still takes a callee-saved home. Inline asm
+    // may clobber argument registers without a precise clobber list: it
+    // keeps the conservative path.
     if func.blocks.iter().any(|b| {
-        b.instructions.iter().any(|inst| {
-            matches!(
-                inst,
-                Instruction::Call { .. }
-                    | Instruction::CallIndirect { .. }
-                    | Instruction::InlineAsm { .. }
-            ) && !inline_libc(inst)
-        })
+        b.instructions
+            .iter()
+            .any(|inst| matches!(inst, Instruction::InlineAsm { .. }))
     }) {
         return false;
     }
@@ -5215,12 +5242,30 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
 
         if !f64_intervals.is_empty() {
-            let mut f64_ranges = live_range::build_live_ranges_with_config(
+            let (mut f64_ranges, f64_meta) = live_range::build_live_ranges_with_config_and_meta(
                 &f64_intervals,
                 &liveness.block_loop_depth,
                 func,
                 &config.ra_config,
             );
+            // Slot-operand classification for the XMM pool, so a hoisted FP
+            // constant whose every use folds its slot as a memory operand is
+            // the scan's free victim instead of a temporary that would
+            // round-trip the stack (`select_evict_victim`). Only the
+            // classification is shared with the GPR scan; the loop-span
+            // admission machinery of `mark_loop_spanning` is GPR-tuned.
+            if x86_fp_pool {
+                let mut fp_members_of: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+                for (&member, &leader) in &fp_web_member_of {
+                    fp_members_of.entry(leader).or_default().push(member);
+                }
+                live_range::mark_slot_operand_only(
+                    &mut f64_ranges,
+                    func,
+                    &fp_members_of,
+                    &f64_meta.uses,
+                );
+            }
             // RA-05: hole-aware coverage for the XMM scan as well — FP phi
             // webs spanning mutually exclusive arms get the same treatment
             // as the GPR scan. Use the FP web map so member segments attach
@@ -5238,6 +5283,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             };
             let mut xmm_allocator =
                 LinearScanAllocator::new_with_config(f64_ranges, scan_pool, &config.ra_config);
+            xmm_allocator.free_slot_victims = x86_fp_pool;
             xmm_allocator.run();
             for (&vid, &reg) in &xmm_allocator.assignments {
                 assignments.insert(vid, reg);
@@ -7383,12 +7429,21 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                         }
                     }
                 }
+                Instruction::Phi { dest, ty, .. } => {
+                    if is_non_gpr_type(ty, is_32bit) {
+                        non_gpr_values.insert(dest.0);
+                    }
+                }
                 Instruction::Copy { dest, src } => {
                     let src_is_non_gpr = match src {
                         Operand::Const(IrConst::F32(_))
                         | Operand::Const(IrConst::F64(_))
                         | Operand::Const(IrConst::LongDouble(..))
-                        | Operand::Const(IrConst::I128(_)) => true,
+                        | Operand::Const(IrConst::I128(_))
+                        // Decimal BID carriers are FP-class (`IrType::is_float`):
+                        // a D64 copy in a GPR loses its high word on i686.
+                        | Operand::Const(IrConst::D32(_))
+                        | Operand::Const(IrConst::D64(_)) => true,
                         // Ambiguous storage form: trust the value's own
                         // width evidence over the constant's spelling
                         // (see the value_type_map comment above).
@@ -15381,6 +15436,58 @@ mod scalar_lane_class_tests {
             assert!(
                 !non_gpr.contains(&id),
                 "integer lane v{id} must remain GPR-eligible"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_copies_and_phis_are_never_gpr_homed() {
+        // `c ? 1.5DD : 2.25DD` after phi elimination: two constant copies
+        // into the merge value plus the D64 phi itself.  Every member is
+        // FP-class on both word sizes (on i686 a GPR holds 4 of 8 bytes).
+        let mut f = IrFunction::new("dec_phi".into(), IrType::Void, vec![], false);
+        let bb = |label: u32, instructions: Vec<Instruction>| BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        };
+        f.blocks.push(bb(
+            0,
+            vec![
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::D64(0x31a0_0000_0000_000f)),
+                },
+                Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Const(IrConst::D32(0x3280_0001)),
+                },
+                Instruction::Copy {
+                    dest: Value(4),
+                    src: Operand::Const(IrConst::I32(7)),
+                },
+            ],
+        ));
+        f.blocks.push(bb(
+            1,
+            vec![Instruction::Phi {
+                dest: Value(3),
+                ty: IrType::D64,
+                incoming: vec![(Operand::Value(Value(1)), BlockId(0))],
+            }],
+        ));
+        for is_32bit in [true, false] {
+            let non_gpr = collect_non_gpr_values(&f, is_32bit);
+            for id in [1, 2, 3] {
+                assert!(
+                    non_gpr.contains(&id),
+                    "v{id} (decimal) is FP-class, 32-bit={is_32bit}"
+                );
+            }
+            assert!(
+                !non_gpr.contains(&4),
+                "an int constant copy stays GPR-eligible"
             );
         }
     }

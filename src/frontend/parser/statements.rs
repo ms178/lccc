@@ -27,6 +27,8 @@ impl Parser {
 
         // Save typedef shadowing state for this scope
         let saved_shadowed = self.shadowed_typedefs.clone();
+        let enum_mark = self.enum_scope_log.len();
+        self.block_depth += 1;
 
         // Save declaration attribute flags so that storage-class specifiers
         // (extern, static, typedef, etc.) from declarations inside this
@@ -100,9 +102,8 @@ impl Parser {
                     break 'item;
                 }
                 if matches!(self.peek(), TokenKind::StaticAssert) {
-                    if let Some(deferred) = self.parse_static_assert() {
-                        items.push(BlockItem::StaticAssert(deferred));
-                    }
+                    let assertion = self.parse_static_assert();
+                    items.push(BlockItem::StaticAssert(assertion));
                 } else if self.is_type_specifier() && !self.is_typedef_label() {
                     // GNU C nested function definition? (`int f(int *p) { ... }`
                     // at block scope). Try to parse one; on mismatch the parser
@@ -149,6 +150,8 @@ impl Parser {
 
         self.expect_closing(&TokenKind::RBrace, open_brace);
         self.shadowed_typedefs = saved_shadowed;
+        self.block_depth -= 1;
+        self.restore_enum_scope(enum_mark);
         self.attrs.restore_flags(saved_attr_flags);
         self.exit_parser_frame();
         CompoundStmt {

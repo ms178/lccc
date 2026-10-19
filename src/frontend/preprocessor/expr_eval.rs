@@ -8,7 +8,9 @@
 //! All scanning operates on byte slices for performance (no `Vec<char>` allocation).
 
 use super::pipeline::Preprocessor;
-use super::utils::{bytes_to_str, is_ident_cont_byte, is_ident_start_byte};
+use super::utils::{
+    bytes_to_str, c23_dialect, is_digit_separator, is_ident_cont_byte, is_ident_start_byte,
+};
 
 impl Preprocessor {
     /// Replace remaining identifiers (not keywords) with 0 in a #if expression.
@@ -21,7 +23,7 @@ impl Preprocessor {
 
         while i < len {
             // Skip character literals verbatim
-            if bytes[i] == b'\'' {
+            if bytes[i] == b'\'' && !is_digit_separator(bytes, i) {
                 result.push(bytes[i] as char);
                 i += 1;
                 while i < len && bytes[i] != b'\'' {
@@ -87,7 +89,7 @@ impl Preprocessor {
                     i += 1;
                 }
                 let ident = bytes_to_str(bytes, start, i);
-                if ident == "defined" || ident == "true" || ident == "false" {
+                if ident == "defined" || (c23_dialect() && (ident == "true" || ident == "false")) {
                     result.push_str(ident);
                 } else {
                     result.push('0');
@@ -130,7 +132,7 @@ impl Preprocessor {
         while i < len {
             // Skip string and char literals verbatim: `"__has_attribute"` in
             // a string must not be rewritten.
-            if bytes[i] == b'"' || bytes[i] == b'\'' {
+            if bytes[i] == b'"' || (bytes[i] == b'\'' && !is_digit_separator(bytes, i)) {
                 let quote = bytes[i];
                 result.push(bytes[i] as char);
                 i += 1;
@@ -161,7 +163,11 @@ impl Preprocessor {
                         result.push_str(val);
                     }
                     "__has_attribute" => {
-                        let val = self.resolve_has_attribute_call_bytes(bytes, &mut i);
+                        let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, false);
+                        result.push_str(val);
+                    }
+                    "__has_c_attribute" => {
+                        let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, true);
                         result.push_str(val);
                     }
                     "__has_feature" | "__has_extension" => {
@@ -386,7 +392,10 @@ impl Preprocessor {
                     let val = self.resolve_has_builtin_call_bytes(bytes, &mut i);
                     result.push_str(val);
                 } else if ident == "__has_attribute" {
-                    let val = self.resolve_has_attribute_call_bytes(bytes, &mut i);
+                    let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, false);
+                    result.push_str(val);
+                } else if ident == "__has_c_attribute" {
+                    let val = self.resolve_has_attribute_call_bytes(bytes, &mut i, true);
                     result.push_str(val);
                 } else if ident == "__has_feature" || ident == "__has_extension" {
                     self.skip_paren_arg_bytes(bytes, &mut i);
@@ -447,35 +456,57 @@ impl Preprocessor {
         }
     }
 
-    /// Parse `(name)` after `__has_attribute` and return "1" or "0" (byte-oriented).
-    fn resolve_has_attribute_call_bytes(&self, bytes: &[u8], i: &mut usize) -> &'static str {
+    /// Parse `(attribute-token)` after `__has_attribute` (`c_syntax` false)
+    /// or `__has_c_attribute` (true) and return its value, following GCC
+    /// 16.2 in every dialect:
+    /// * a standard attribute (C23 6.7.13), in either spelling, is
+    ///   `202311` under both operators;
+    /// * `gnu::name` / `__gnu__::__name__` is 1 when `name` is a supported
+    ///   GNU attribute, and any other vendor scope is 0;
+    /// * an unscoped GNU attribute is 1 under `__has_attribute` but 0 under
+    ///   `__has_c_attribute` (the `[[...]]` syntax spells it `gnu::name`).
+    fn resolve_has_attribute_call_bytes(
+        &self,
+        bytes: &[u8],
+        i: &mut usize,
+        c_syntax: bool,
+    ) -> &'static str {
         let len = bytes.len();
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
+        let skip_blanks = |i: &mut usize| {
+            while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
+                *i += 1;
+            }
+        };
+        let ident = |i: &mut usize| {
+            let start = *i;
+            while *i < len && is_ident_cont_byte(bytes[*i]) {
+                *i += 1;
+            }
+            bytes_to_str(bytes, start, *i)
+        };
+        skip_blanks(i);
         if *i >= len || bytes[*i] != b'(' {
             return "0";
         }
         *i += 1;
-        while *i < len && (bytes[*i] == b' ' || bytes[*i] == b'\t') {
-            *i += 1;
-        }
-        let start = *i;
-        while *i < len && is_ident_cont_byte(bytes[*i]) {
-            *i += 1;
-        }
-        let name = bytes_to_str(bytes, start, *i);
+        skip_blanks(i);
+        let first = ident(i);
+        skip_blanks(i);
+        let scoped = *i + 1 < len && bytes[*i] == b':' && bytes[*i + 1] == b':';
+        let (scope, name) = if scoped {
+            *i += 2;
+            skip_blanks(i);
+            (Some(first), ident(i))
+        } else {
+            (None, first)
+        };
         while *i < len && bytes[*i] != b')' {
             *i += 1;
         }
         if *i < len {
             *i += 1;
         }
-        if Self::is_supported_attribute(name) {
-            "1"
-        } else {
-            "0"
-        }
+        attribute_token_value(scope, name, c_syntax)
     }
 
     /// Parse `(<header.h>)` or `("header.h")` after `__has_include` / `__has_include_next`
@@ -645,7 +676,10 @@ impl Preprocessor {
             name,
             "__builtin_va_arg" |              // Special token (BuiltinVaArg)
             "__builtin_types_compatible_p" |  // Special AST node (BuiltinTypesCompatibleP)
-            "__builtin_offsetof" // Predefined macro
+            "__builtin_offsetof" |            // Predefined macro
+            "__builtin_LINE" |                // Expanded by the preprocessor
+            "__builtin_FILE" |
+            "__builtin_FUNCTION"
         )
     }
 
@@ -795,8 +829,66 @@ impl Preprocessor {
     }
 }
 
+/// Strip the reserved `__x__` spelling of an attribute name or scope.
+fn attribute_base_name(name: &str) -> &str {
+    name.strip_prefix("__")
+        .and_then(|n| n.strip_suffix("__"))
+        .filter(|n| !n.is_empty())
+        .unwrap_or(name)
+}
+
+/// The value of `__has_attribute` / `__has_c_attribute` for one attribute
+/// token (see `Preprocessor::resolve_has_attribute_call_bytes`).
+fn attribute_token_value(scope: Option<&str>, name: &str, c_syntax: bool) -> &'static str {
+    let supported_gnu = |n: &str| Preprocessor::is_supported_attribute(attribute_base_name(n));
+    match scope.map(attribute_base_name) {
+        Some("gnu") => {
+            if supported_gnu(name) {
+                "1"
+            } else {
+                "0"
+            }
+        }
+        Some(_) => "0",
+        None => match attribute_base_name(name) {
+            "deprecated" | "fallthrough" | "maybe_unused" | "nodiscard" | "noreturn"
+            | "_Noreturn" | "unsequenced" | "reproducible" => "202311",
+            _ if !c_syntax && supported_gnu(name) => "1",
+            _ => "0",
+        },
+    }
+}
+
 #[cfg(test)]
 mod has_attribute_tests {
+    /// `__has_attribute` / `__has_c_attribute` values, measured on GCC 16.2
+    /// (identical under -std=gnu17 and -std=c23).
+    #[test]
+    fn attribute_token_values_match_gcc() {
+        use super::attribute_token_value as v;
+        for std_attr in [
+            "nodiscard",
+            "__nodiscard__",
+            "deprecated",
+            "fallthrough",
+            "maybe_unused",
+            "noreturn",
+            "_Noreturn",
+            "unsequenced",
+            "reproducible",
+        ] {
+            assert_eq!(v(None, std_attr, true), "202311", "{std_attr}");
+            assert_eq!(v(None, std_attr, false), "202311", "{std_attr}");
+        }
+        assert_eq!(v(Some("gnu"), "packed", true), "1");
+        assert_eq!(v(Some("__gnu__"), "__packed__", false), "1");
+        assert_eq!(v(Some("gnu"), "nonexistent_zz", true), "0");
+        assert_eq!(v(Some("clang"), "fallthrough", true), "0");
+        assert_eq!(v(None, "packed", true), "0");
+        assert_eq!(v(None, "packed", false), "1");
+        assert_eq!(v(None, "foo_zz", false), "0");
+    }
+
     use super::*;
 
     /// Every attribute the parser's attribute dispatch implements must be

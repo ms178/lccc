@@ -17,8 +17,8 @@ use std::cell::Cell;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::utils::{
-    bytes_to_str, copy_literal_bytes_to_string, is_ident_cont_byte, is_ident_start_byte,
-    skip_literal_bytes,
+    bytes_to_str, copy_literal_bytes_to_string, is_digit_separator, is_ident_cont_byte,
+    is_ident_start_byte, ppnumber_end, skip_literal_bytes,
 };
 
 /// Check if two adjacent bytes would form an unintended multi-character token
@@ -126,7 +126,7 @@ fn normalize_internal_markers(s: &str, final_output: bool) -> std::borrow::Cow<'
     let mut start = 0;
     let mut i = 0;
     while i < bytes.len() {
-        if matches!(bytes[i], b'"' | b'\'') {
+        if matches!(bytes[i], b'"' | b'\'') && !is_digit_separator(bytes, i) {
             i = skip_literal_bytes(bytes, i, bytes[i]);
         } else if is_marker(bytes[i]) {
             let out = result.get_or_insert_with(|| String::with_capacity(s.len()));
@@ -171,6 +171,10 @@ pub struct MacroTable {
     /// §6.10.8, __LINE__ inside a macro body expands to the line of the
     /// INVOCATION, not of the body text.
     line_pinned: Cell<Option<usize>>,
+    /// Whether an invocation is being expanded (its arguments or body); only
+    /// an outermost invocation consumed source line breaks that must be
+    /// re-emitted (see `restore_line_breaks`).
+    in_invocation: Cell<bool>,
     /// Collects names of macros expanded during the current expand_line_reuse() call.
     /// Used by the preprocessor to build macro expansion metadata for diagnostics
     /// ("in expansion of macro 'X'" notes). Wrapped in RefCell because expansion
@@ -205,6 +209,7 @@ impl MacroTable {
             line_offset_base: Cell::new(0),
             line_override: Cell::new(None),
             line_pinned: Cell::new(None),
+            in_invocation: Cell::new(false),
             expanded_macros: std::cell::RefCell::new(Vec::new()),
             track_expansions: Cell::new(false),
             asm_mode: false,
@@ -236,6 +241,7 @@ impl MacroTable {
             // special functions in #if expressions by resolve_defined_in_expr().
             || name == "__has_builtin"
             || name == "__has_attribute"
+            || name == "__has_c_attribute"
             || name == "__has_feature"
             || name == "__has_extension"
             || name == "__has_include"
@@ -373,7 +379,7 @@ impl MacroTable {
         let mut i = 0usize;
         while i < len {
             let c = bytes[i];
-            if c == b'"' || c == b'\'' {
+            if c == b'"' || (c == b'\'' && !is_digit_separator(bytes, i)) {
                 // Copy string/char literals verbatim: `_Pragma` inside a
                 // literal is ordinary text.
                 let quote = c;
@@ -448,6 +454,7 @@ impl MacroTable {
         mut expanded: String,
         bytes: &[u8],
         mut i: usize,
+        source_level: bool,
         expanding: &mut FxHashSet<String>,
     ) -> (String, usize) {
         let len = bytes.len();
@@ -462,7 +469,8 @@ impl MacroTable {
                                 k += 1;
                             }
                             if k < len && bytes[k] == b'(' {
-                                let (trail_args, trail_end) = self.parse_macro_args(bytes, k);
+                                let (trail_args, trail_starts, trail_end) =
+                                    self.parse_macro_args(bytes, k);
                                 i = trail_end;
                                 let trail_mac_clone = trail_mac.clone();
                                 let trimmed_len = expanded.trim_end().len();
@@ -471,6 +479,7 @@ impl MacroTable {
                                 let (trail_expanded, _) = self.expand_function_macro(
                                     &trail_mac_clone,
                                     &trail_args,
+                                    source_level.then_some(&trail_starts[..]),
                                     expanding,
                                 );
                                 expanded.push_str(&trail_expanded);
@@ -494,6 +503,7 @@ impl MacroTable {
         expanded: &str,
         bytes: &[u8],
         i: usize,
+        source_level: bool,
         expanding: &mut FxHashSet<String>,
     ) -> Option<(String, usize)> {
         let len = bytes.len();
@@ -519,9 +529,14 @@ impl MacroTable {
         if j >= len || bytes[j] != b'(' {
             return None;
         }
-        let (args, end_pos) = self.parse_macro_args(bytes, j);
+        let (args, starts, end_pos) = self.parse_macro_args(bytes, j);
         let target_mac_clone = target_mac.clone();
-        let (func_expanded, _) = self.expand_function_macro(&target_mac_clone, &args, expanding);
+        let (func_expanded, _) = self.expand_function_macro(
+            &target_mac_clone,
+            &args,
+            source_level.then_some(&starts[..]),
+            expanding,
+        );
         Some((func_expanded, end_pos))
     }
 
@@ -538,7 +553,7 @@ impl MacroTable {
         while i < len {
             let b = bytes[i];
 
-            if b == b'"' || b == b'\'' {
+            if b == b'"' || (b == b'\'' && !is_digit_separator(bytes, i)) {
                 i = copy_literal_bytes_to_string(bytes, i, b, &mut result);
             } else if b == BLUE_PAINT_MARKER {
                 i = Self::copy_blue_painted(bytes, i, &mut result);
@@ -692,6 +707,42 @@ impl MacroTable {
             let mut buf = itoa::Buffer::new();
             result.push_str(buf.format(val));
             return i;
+        }
+
+        // GCC's source-location builtins, `__builtin_LINE()`,
+        // `__builtin_FILE()` and `__builtin_FUNCTION()`: the line (pinned to
+        // the invocation inside a macro, like `__LINE__`), the presumed file
+        // name (`#line` applies, like `__FILE__`) and the enclosing
+        // function's name (`""` at file scope), as an `int` constant and two
+        // `const char *` (GCC 16.2: `static int a[__builtin_LINE()];` is
+        // valid, `sizeof __builtin_FILE()` is a pointer's size).
+        if matches!(
+            ident,
+            "__builtin_LINE" | "__builtin_FILE" | "__builtin_FUNCTION"
+        ) && !self.macros.contains_key(ident)
+        {
+            if let Some(after) = empty_call_parens(bytes, i) {
+                match ident {
+                    "__builtin_LINE" => {
+                        let val = match self.line_pinned.get() {
+                            Some(v) => v,
+                            None => self.resolve_line(start),
+                        };
+                        let mut buf = itoa::Buffer::new();
+                        result.push_str(buf.format(val));
+                    }
+                    "__builtin_FILE" => {
+                        result.push_str("((const char *)");
+                        match self.macros.get("__FILE__") {
+                            Some(file) => result.push_str(&file.body),
+                            None => result.push_str("\"\""),
+                        }
+                        result.push(')');
+                    }
+                    _ => result.push_str("((const char *)__FUNCTION__)"),
+                }
+                return after;
+            }
         }
 
         // C11 string/char encoding prefixes: u8, u, U, L.
@@ -900,15 +951,24 @@ impl MacroTable {
                 // in a macro body to expand to the line of the invocation.
                 // Body/argument offsets are not source-line offsets, so the
                 // per-offset resolver must not be consulted inside.
+                // Source-level text (no __LINE__ pinned yet): the arguments
+                // are source tokens too, so they are prescanned at their own
+                // positions (`expand_function_macro`).
                 let ident_start = i.saturating_sub(ident.len());
                 let prev_pinned = self.line_pinned.get();
-                if prev_pinned.is_none() {
+                let source_level = prev_pinned.is_none();
+                if source_level {
                     self.line_pinned.set(Some(self.resolve_line(ident_start)));
                 }
-                let (args, end_pos) = self.parse_macro_args(bytes, j);
+                let outermost = !self.in_invocation.replace(true);
+                let (args, starts, end_pos) = self.parse_macro_args(bytes, j);
                 let mut i = end_pos;
-                let (expanded, body_ended_with_func_ident) =
-                    self.expand_function_macro(mac, &args, expanding);
+                let (expanded, body_ended_with_func_ident) = self.expand_function_macro(
+                    mac,
+                    &args,
+                    source_level.then_some(&starts[..]),
+                    expanding,
+                );
                 // Per C11 §6.10.3.4, only connect trailing function-like macro
                 // identifiers with subsequent source `(` if the substituted body
                 // (before rescan) truly ended with that identifier. If the body
@@ -917,13 +977,18 @@ impl MacroTable {
                 // act as a barrier during left-to-right scanning, preventing FOO from
                 // connecting with `(` in the source.
                 let (expanded, new_i) = if body_ended_with_func_ident {
-                    self.expand_trailing_func_macros(expanded, bytes, i, expanding)
+                    self.expand_trailing_func_macros(expanded, bytes, i, source_level, expanding)
                 } else {
                     (expanded, i)
                 };
                 i = new_i;
                 let next = if i < len { Some(bytes[i]) } else { None };
+                let appended_from = result.len();
                 Self::append_with_paste_guard(result, &expanded, next);
+                if outermost {
+                    self.in_invocation.set(false);
+                    Self::restore_line_breaks(bytes, ident_start..i, result, appended_from);
+                }
                 self.line_pinned.set(prev_pinned);
                 return i;
             }
@@ -936,17 +1001,24 @@ impl MacroTable {
         // Pin __LINE__ to the invocation site (see function-like path above).
         let ident_start = i.saturating_sub(ident.len());
         let prev_pinned = self.line_pinned.get();
-        if prev_pinned.is_none() {
+        let source_level = prev_pinned.is_none();
+        if source_level {
             self.line_pinned.set(Some(self.resolve_line(ident_start)));
         }
+        let outermost = !self.in_invocation.replace(true);
         let expanded = self.expand_text(&mac.body, expanding);
         expanding.remove(ident);
 
         if let Some((func_expanded, end_pos)) =
-            self.try_resolve_objlike_to_funclike(&expanded, bytes, i, expanding)
+            self.try_resolve_objlike_to_funclike(&expanded, bytes, i, source_level, expanding)
         {
-            self.line_pinned.set(prev_pinned);
+            let appended_from = result.len();
             result.push_str(&func_expanded);
+            if outermost {
+                self.in_invocation.set(false);
+                Self::restore_line_breaks(bytes, ident_start..end_pos, result, appended_from);
+            }
+            self.line_pinned.set(prev_pinned);
             return end_pos;
         }
 
@@ -954,12 +1026,76 @@ impl MacroTable {
         // macro name (e.g. `#define i_cmp -c_default_cmp` expands to `-c_default_cmp`).
         // If the remaining source starts with `(`, we need to chain into function-like
         // expansion for the trailing identifier.
-        let (expanded, i) = self.expand_trailing_func_macros(expanded, bytes, i, expanding);
+        let (expanded, i) =
+            self.expand_trailing_func_macros(expanded, bytes, i, source_level, expanding);
 
         let next = if i < len { Some(bytes[i]) } else { None };
+        let appended_from = result.len();
         Self::append_with_paste_guard(result, &expanded, next);
+        if outermost {
+            self.in_invocation.set(false);
+            Self::restore_line_breaks(bytes, ident_start..i, result, appended_from);
+        }
         self.line_pinned.set(prev_pinned);
         i
+    }
+
+    /// Expand `text`, the source slice at offset `start` of the text being
+    /// expanded, with offsets resolved at its own position and `__LINE__`
+    /// unpinned.
+    fn expand_source_slice(
+        &self,
+        text: &str,
+        start: usize,
+        expanding: &mut FxHashSet<String>,
+    ) -> String {
+        let base = self.line_offset_base.get();
+        let pinned = self.line_pinned.replace(None);
+        self.line_offset_base.set(base + start);
+        let expanded = self.expand_text(text, expanding);
+        self.line_offset_base.set(base);
+        self.line_pinned.set(pinned);
+        expanded
+    }
+
+    /// After the expansion (`result[appended_from..]`) of an outermost
+    /// invocation whose source `bytes[consumed]` spans lines (arguments, or
+    /// a `(` on a later line), move those line breaks after it: line breaks
+    /// that survived inside the expansion (from arguments) become spaces --
+    /// every expansion token belongs to the expansion point -- and all the
+    /// consumed ones follow, plus spaces up to the column of the byte after
+    /// the invocation. The tokens after it then keep their physical line and
+    /// column (where diagnostics and line tables point) and the pipeline
+    /// counts the lines exactly once. Multi-line text only reaches the
+    /// expander from accumulated ordinary lines, never from a directive, so
+    /// line breaks are plain white space (and never inside a literal).
+    /// Nested invocations (argument prescan, rescanning) must not do this:
+    /// the outermost one accounts for every line break of its source.
+    fn restore_line_breaks(
+        bytes: &[u8],
+        consumed: std::ops::Range<usize>,
+        result: &mut String,
+        appended_from: usize,
+    ) {
+        let end = consumed.end;
+        let consumed = &bytes[consumed.start..end];
+        let breaks = consumed.iter().filter(|&&b| b == b'\n').count();
+        if breaks == 0 {
+            return;
+        }
+        if result.as_bytes()[appended_from..].contains(&b'\n') {
+            let flat = result[appended_from..].replace('\n', " ");
+            result.truncate(appended_from);
+            result.push_str(&flat);
+        }
+        result.extend(std::iter::repeat_n('\n', breaks));
+        if !matches!(bytes.get(end), None | Some(b'\n')) {
+            let tail_start = consumed
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |k| k + 1);
+            result.extend(std::iter::repeat_n(' ', consumed.len() - tail_start));
+        }
     }
 
     /// Copy a C-style block comment verbatim.
@@ -997,23 +1133,8 @@ impl MacroTable {
     /// Copy a pp-number (numeric literal) verbatim.
     /// Uses batch slice copy instead of per-byte push.
     fn copy_ppnumber(bytes: &[u8], i: usize, result: &mut String) -> usize {
-        let len = bytes.len();
-        let mut j = i;
-        while j < len {
-            if bytes[j].is_ascii_alphanumeric()
-                || bytes[j] == b'.'
-                || bytes[j] == b'_'
-                || ((bytes[j] == b'+' || bytes[j] == b'-')
-                    && j > i
-                    && matches!(bytes[j - 1], b'e' | b'E' | b'p' | b'P'))
-            {
-                j += 1;
-            } else {
-                break;
-            }
-        }
-        let slice = std::str::from_utf8(&bytes[i..j]).unwrap_or("");
-        result.push_str(slice);
+        let j = ppnumber_end(bytes, i);
+        result.push_str(std::str::from_utf8(&bytes[i..j]).unwrap_or(""));
         j
     }
 
@@ -1024,10 +1145,21 @@ impl MacroTable {
     /// per-argument String allocations in the common case where arguments contain
     /// no string/char literals. When all content is plain text, arguments are
     /// extracted as trimmed `&str` slices and converted to String only once.
-    fn parse_macro_args(&self, bytes: &[u8], start: usize) -> (Vec<String>, usize) {
+    /// Parse the arguments of the invocation whose `(` is at `bytes[start]`:
+    /// the trimmed argument texts, the offset in `bytes` of each, and the
+    /// position after the closing `)`.
+    fn parse_macro_args(&self, bytes: &[u8], start: usize) -> (Vec<String>, Vec<usize>, usize) {
         let len = bytes.len();
         let mut i = start + 1; // skip '('
         let mut args: Vec<String> = Vec::new();
+        let mut starts: Vec<usize> = Vec::new();
+        // Offset of the trimmed argument `bytes[from..to]`.
+        let trimmed_start = |from: usize, to: usize| {
+            from + bytes[from..to]
+                .iter()
+                .take_while(|b| b.is_ascii_whitespace())
+                .count()
+        };
         let mut paren_depth = 0;
         // Start position of the current argument in bytes
         let mut arg_start = i;
@@ -1045,8 +1177,9 @@ impl MacroTable {
                         let trimmed = arg_slice.trim();
                         if !trimmed.is_empty() || !args.is_empty() {
                             args.push(trimmed.to_string());
+                            starts.push(trimmed_start(arg_start, i));
                         }
-                        return (args, i + 1);
+                        return (args, starts, i + 1);
                     } else {
                         paren_depth -= 1;
                         i += 1;
@@ -1055,10 +1188,11 @@ impl MacroTable {
                 b',' if paren_depth == 0 => {
                     let arg_slice = std::str::from_utf8(&bytes[arg_start..i]).unwrap_or("");
                     args.push(arg_slice.trim().to_string());
+                    starts.push(trimmed_start(arg_start, i));
                     i += 1;
                     arg_start = i;
                 }
-                b'"' | b'\'' => {
+                b'"' | b'\'' if !is_digit_separator(bytes, i) => {
                     // Skip past string/char literal (they are part of the argument
                     // text and will be included in the byte span)
                     i = skip_literal_bytes(bytes, i, bytes[i]);
@@ -1074,17 +1208,27 @@ impl MacroTable {
         let trimmed = arg_slice.trim();
         if !trimmed.is_empty() || !args.is_empty() {
             args.push(trimmed.to_string());
+            starts.push(trimmed_start(arg_start, i));
         }
-        (args, i)
+        (args, starts, i)
     }
 
-    /// Expand a function-like macro with given arguments.
+    /// Expand a function-like macro with given arguments, returning
+    /// (expanded_text, body_ended_with_func_ident).
     ///
     /// Per C11 §6.10.3.1: Arguments are fully macro-expanded before substitution
     /// into the body. Occurrences adjacent to # or ## use the raw (unexpanded)
     /// argument, handled by handle_stringify_and_paste. After substitution, the
     /// result is rescanned with the current macro name suppressed (§6.10.3.4).
-    /// Expand a function-like macro, returning (expanded_text, body_ended_with_func_ident).
+    ///
+    /// `arg_starts` holds the offset of each argument in the text being
+    /// expanded when that text is source (not a macro body): the arguments
+    /// are then prescanned at their own positions, unpinned, so `__LINE__`
+    /// in an argument is its own physical line and a nested invocation pins
+    /// its body to its own name's line, as in GCC and Clang
+    /// (`F(__LINE__,\n__LINE__)` is `F(1, 2)`); body tokens keep the
+    /// invocation's pinned line.
+    ///
     /// The second return value indicates whether the substituted body (before rescan)
     /// ended with a function-like macro identifier. This is needed to correctly implement
     /// C11 §6.10.3.4: the rescan of the replacement list "along with all subsequent
@@ -1096,6 +1240,7 @@ impl MacroTable {
         &self,
         mac: &MacroDef,
         args: &[String],
+        arg_starts: Option<&[usize]>,
         expanding: &mut FxHashSet<String>,
     ) -> (String, bool) {
         // Step 1-2: Prescan - expand ALL arguments (C11 §6.10.3.1).
@@ -1110,7 +1255,13 @@ impl MacroTable {
         // expansion create additional arguments during rescanning.
         let expanded_args: Vec<String> = args
             .iter()
-            .map(|arg| self.expand_text(arg, expanding))
+            .enumerate()
+            .map(
+                |(k, arg)| match arg_starts.and_then(|starts| starts.get(k)) {
+                    Some(&start) => self.expand_source_slice(arg, start, expanding),
+                    None => self.expand_text(arg, expanding),
+                },
+            )
             .collect();
 
         // C2x __VA_OPT__: include its balanced token sequence iff the variadic
@@ -1431,7 +1582,7 @@ impl MacroTable {
                 i += 1; // skip the start marker
                 let start = i;
                 while i < len && bytes[i] != PASTE_PROTECT_END {
-                    if matches!(bytes[i], b'"' | b'\'') {
+                    if matches!(bytes[i], b'"' | b'\'') && !is_digit_separator(bytes, i) {
                         i = skip_literal_bytes(bytes, i, bytes[i]);
                     } else {
                         i += 1;
@@ -1445,7 +1596,7 @@ impl MacroTable {
                 continue;
             }
 
-            if bytes[i] == b'"' || bytes[i] == b'\'' {
+            if bytes[i] == b'"' || (bytes[i] == b'\'' && !is_digit_separator(bytes, i)) {
                 i = copy_literal_bytes_to_string(bytes, i, bytes[i], &mut result);
                 continue;
             }
@@ -1568,7 +1719,7 @@ impl MacroTable {
                         match bytes[j] {
                             b'(' => depth += 1,
                             b')' => depth -= 1,
-                            b'"' | b'\'' => {
+                            b'"' | b'\'' if !is_digit_separator(bytes, j) => {
                                 j = skip_literal_bytes(bytes, j, bytes[j]);
                                 continue;
                             }
@@ -1729,7 +1880,7 @@ fn stringify_arg(arg: &str) -> String {
 
         // Stringification escapes quotes and backslashes in literal tokens,
         // but preserves their payload bytes (including UTF-8 and whitespace).
-        if matches!(bytes[i], b'"' | b'\'') {
+        if matches!(bytes[i], b'"' | b'\'') && !is_digit_separator(bytes, i) {
             let end = skip_literal_bytes(bytes, i, bytes[i]);
             for ch in trimmed[i..end].chars() {
                 if matches!(ch, '"' | '\\') {
@@ -1915,6 +2066,26 @@ mod itoa {
             std::str::from_utf8(&self.bytes[..self.len]).expect("digit buffer is not valid UTF-8")
         }
     }
+}
+
+/// The index just past `( )` (blanks allowed) starting at `i`, if the text
+/// there is an empty argument list.
+fn empty_call_parens(bytes: &[u8], mut i: usize) -> Option<usize> {
+    let skip = |mut j: usize| {
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        j
+    };
+    i = skip(i);
+    if bytes.get(i) != Some(&b'(') {
+        return None;
+    }
+    i = skip(i + 1);
+    if bytes.get(i) != Some(&b')') {
+        return None;
+    }
+    Some(i + 1)
 }
 
 #[cfg(test)]

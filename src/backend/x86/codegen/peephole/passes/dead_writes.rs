@@ -18,7 +18,7 @@
 use super::super::types::*;
 use super::flag_peepholes::flags_dead_after;
 use super::helpers::{HIGH_BYTE_NAMES, get_dest_reg, has_implicit_reg_usage, writes_family};
-use super::liveness::FileLiveness;
+use super::liveness::{DeadWriteRefresh, FileLiveness};
 use super::relay_and_lea::{
     is_relayable_family, plain_gp_operand, provably_dead_lv, split_two_operands,
 };
@@ -130,6 +130,7 @@ pub(super) fn eliminate_dead_flag_writes(store: &LineStore, infos: &mut [LineInf
     }
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
+    let mut upkeep = DeadWriteRefresh::new();
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -171,6 +172,7 @@ pub(super) fn eliminate_dead_flag_writes(store: &LineStore, infos: &mut [LineInf
             continue;
         }
         // Guard 3: the destination family dies here.
+        upkeep.before_query(&mut lv, store, infos, i, fam);
         if !provably_dead_lv(&lv, store, infos, i, fam, &[i]) {
             i += 1;
             continue;
@@ -180,8 +182,7 @@ pub(super) fn eliminate_dead_flag_writes(store: &LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-        mark_nop(&mut infos[i]);
-        lv.refresh_at(store, infos, i);
+        upkeep.delete(&mut lv, store, infos, i);
         changed = true;
         i += 1;
     }
@@ -192,6 +193,7 @@ pub(super) fn eliminate_dead_flag_writes(store: &LineStore, infos: &mut [LineInf
 pub(super) fn eliminate_dead_pure_writes(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
+    let mut upkeep = DeadWriteRefresh::new();
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -229,9 +231,9 @@ pub(super) fn eliminate_dead_pure_writes(store: &LineStore, infos: &mut [LineInf
         // (`leaq 1(%rax), %rax`) is not dead just because the family dies —
         // it is dead exactly when the family dies, which the proof covers, but
         // the proof scans from the NEXT line, so the self-read is already past.
+        upkeep.before_query(&mut lv, store, infos, i, fam);
         if provably_dead_lv(&lv, store, infos, i, fam, &[i]) {
-            mark_nop(&mut infos[i]);
-            lv.refresh_at(store, infos, i);
+            upkeep.delete(&mut lv, store, infos, i);
             changed = true;
         }
         i += 1;

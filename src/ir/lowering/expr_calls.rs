@@ -1232,10 +1232,6 @@ impl Lowerer {
                 .is_some_and(|(_, _, _, variadic)| *variadic);
 
         let mut arg_types = Vec::with_capacity(args.len());
-        // Track argument indices where a complex expression was converted to a
-        // scalar type (e.g., complex-to-bool). These should NOT get a
-        // struct_arg_size based on the original expression's CType.
-        let mut complex_converted_to_scalar: Vec<bool> = vec![false; args.len()];
         let arg_vals: Vec<Operand> = args
             .iter()
             .enumerate()
@@ -1344,7 +1340,6 @@ impl Lowerer {
                             if is_param_bool {
                                 let cast_val = self.lower_complex_to_bool(ptr, &arg_ct);
                                 arg_types.push(IrType::I8);
-                                complex_converted_to_scalar[i] = true;
                                 return cast_val;
                             }
                             let real_part = self.load_complex_real(ptr, &arg_ct);
@@ -1355,7 +1350,6 @@ impl Lowerer {
                                 .unwrap_or(comp_ir_ty);
                             let cast_val = self.emit_implicit_cast(real_part, comp_ir_ty, param_ty);
                             arg_types.push(param_ty);
-                            complex_converted_to_scalar[i] = true;
                             return cast_val;
                         }
                     }
@@ -1440,7 +1434,7 @@ impl Lowerer {
                         arg_types.push(param_ty);
                         if is_bool_param {
                             // For _Bool params, normalize at source type before truncation.
-                            return self.emit_bool_normalize_typed(val, arg_ty);
+                            return self.emit_expr_bool_conversion(val, arg_ty, a);
                         }
                         // C23 decimals (either side) route through the libbid
                         // helpers, mirroring the _Float128 soft-float routing
@@ -1489,6 +1483,34 @@ impl Lowerer {
             })
             .collect();
 
+        // The C type that decides how each argument travels (C11 6.5.2.2p7).
+        // A prototyped non-aggregate parameter receives the argument
+        // converted as if by assignment, so the parameter's type decides:
+        // a _Float128 converted to a `double` parameter is an F64 in an XMM
+        // register, not a 16-byte carrier, and a `double` converted to a
+        // _Float128 parameter IS one (taking the expression type passed the
+        // 0/1 of `take_bool(q)` as the address of a 16-byte aggregate, and
+        // misaligned the i686 slot of `f(1, d)` for `f(int, _Float128)`).
+        // An aggregate argument already has its parameter's compatible type
+        // and keeps the expression type, which also resolves vector typedefs
+        // that a first-pass signature may lack; a transparent-union
+        // parameter receives a member value; variadic and unprototyped
+        // arguments are their (promoted) expression type.
+        let arg_abi_ctypes: Vec<Option<CType>> = args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let expr_ct = self.get_expr_ctype(a);
+                let is_aggregate = |ct: &CType| ct.is_struct_or_union() || ct.is_vector();
+                match param_ctypes.as_ref().and_then(|p| p.get(i)) {
+                    Some(p) if !is_aggregate(p) && !expr_ct.as_ref().is_some_and(is_aggregate) => {
+                        Some(p.clone())
+                    }
+                    _ => expr_ct,
+                }
+            })
+            .collect();
+
         // Build struct_arg_sizes: for each arg, check if it's a struct/union by value
         let func_name = if let Expr::Identifier(name, _) = func {
             Some(name.as_str())
@@ -1511,18 +1533,12 @@ impl Lowerer {
             args.iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    // If Stage A already converted this complex argument to a scalar
-                    // (e.g., complex-to-bool or complex-to-real), the value is no
-                    // longer a struct-like type and must not get a struct_arg_size.
-                    if complex_converted_to_scalar.get(i).copied().unwrap_or(false) {
-                        return None;
-                    }
                     let registered = if i < sizes.len() { sizes[i] } else { None };
                     if registered.is_some() {
                         return registered;
                     }
                     // Fall back to expression-based inference for unregistered types
-                    let ctype = self.get_expr_ctype(a);
+                    let ctype = arg_abi_ctypes[i].clone();
                     let decomposes_cd = self.decomposes_complex_double();
                     let decomposes_cf = self.decomposes_complex_float();
                     match ctype {
@@ -1568,13 +1584,7 @@ impl Lowerer {
             args.iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    // If Stage A already converted this complex argument to a scalar
-                    // (e.g., complex-to-bool or complex-to-real), the value is no
-                    // longer a struct-like type and must not get a struct_arg_size.
-                    if complex_converted_to_scalar.get(i).copied().unwrap_or(false) {
-                        return None;
-                    }
-                    let ctype = self.get_expr_ctype(a);
+                    let ctype = arg_abi_ctypes[i].clone();
                     match ctype {
                         Some(CType::Struct(_)) | Some(CType::Union(_)) => {
                             if pre_call_variadic && self.dynamic_struct_value_size(a).is_some() {
@@ -1611,14 +1621,13 @@ impl Lowerer {
         // Build struct_arg_aligns: for each struct arg, record its alignment.
         // This is used by RISC-V to even-align register pairs for 2×XLEN-aligned structs
         // (e.g., struct containing long double with 16-byte alignment).
-        let struct_arg_aligns: Vec<Option<usize>> = args
+        let struct_arg_aligns: Vec<Option<usize>> = arg_abi_ctypes
             .iter()
             .enumerate()
-            .map(|(i, a)| {
+            .map(|(i, ctype)| {
                 struct_arg_sizes.get(i).copied().flatten()?;
-                let ctype = self.get_expr_ctype(a);
                 match ctype {
-                    Some(ref ct @ CType::Struct(_)) | Some(ref ct @ CType::Union(_)) => self
+                    Some(ct @ CType::Struct(_)) | Some(ct @ CType::Union(_)) => self
                         .get_struct_layout_for_ctype(ct)
                         .map(|layout| layout.align),
                     // Vectors carry their natural alignment (size for ext
@@ -1636,7 +1645,7 @@ impl Lowerer {
                     // `ctype_align` for vector params (func_lowering), so the
                     // caller and callee layouts agree. i686 (cap 4) and ARM
                     // (cap 16) clamp this through `stack_arg_align_cap`.
-                    Some(ref ct) if ct.is_vector() => Some(self.ctype_align(ct)),
+                    Some(ct) if ct.is_vector() => Some(self.ctype_align(ct)),
                     // _Float128/_Decimal128 args are 16-byte TFmode carriers:
                     // the i686 stack layout aligns them to 16 in the outgoing
                     // area (GCC i386 psABI), mirroring the struct_align Some(16)

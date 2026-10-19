@@ -524,47 +524,11 @@ impl X86Codegen {
                 }
                 true
             }
-            CastKind::FloatToSigned { from_f64 } => {
+            CastKind::FloatToSigned { from_f64 } | CastKind::FloatToUnsigned { from_f64, .. } => {
                 self.emit_fp_operand_to_xmm(src, from_ty, "xmm0");
-                if from_f64 {
-                    self.state.emit("    cvttsd2siq %xmm0, %rax");
-                } else {
-                    self.state.emit("    cvttss2siq %xmm0, %rax");
-                }
-                // Sign-extend to the target width (Noop for 64-bit targets).
-                self.emit_cast_instrs_x86(IrType::I64, to_ty);
-                self.state.reg_cache.invalidate_acc();
-                self.store_rax_to(dest);
-                true
-            }
-            CastKind::FloatToUnsigned { from_f64, to_u64 } => {
-                self.emit_fp_operand_to_xmm(src, from_ty, "xmm0");
-                if from_f64 && to_u64 {
-                    // F64 → U64: handle values >= 2^63 (mirrors
-                    // emit_float_to_unsigned, but the input is already in %xmm0).
-                    let big_label = self.state.fresh_label("f2u_big");
-                    let done_label = self.state.fresh_label("f2u_done");
-                    self.state.emit("    movabsq $4890909195324358656, %rcx");
-                    self.state.emit("    movq %rcx, %xmm1");
-                    self.state.emit("    ucomisd %xmm1, %xmm0");
-                    self.state.out.emit_jcc_label("    jae", &big_label);
-                    self.state.emit("    cvttsd2siq %xmm0, %rax");
-                    self.state.out.emit_jmp_label(&done_label);
-                    self.state.out.emit_named_label(&big_label);
-                    self.state.emit("    subsd %xmm1, %xmm0");
-                    self.state.emit("    cvttsd2siq %xmm0, %rax");
-                    self.state.emit("    movabsq $9223372036854775808, %rcx");
-                    self.state.emit("    addq %rcx, %rax");
-                    self.state.out.emit_named_label(&done_label);
+                self.emit_cvtt_xmm0_to_rax(from_f64, to_ty);
+                if to_ty == IrType::U64 {
                     self.state.reg_cache.invalidate_sec(); // clobbered %rcx
-                } else if from_f64 {
-                    self.state.emit("    cvttsd2siq %xmm0, %rax");
-                } else {
-                    self.state.emit("    cvttss2siq %xmm0, %rax");
-                }
-                if !to_u64 {
-                    // Zero-extend/truncate to the target unsigned width.
-                    self.emit_cast_instrs_x86(IrType::I64, to_ty);
                 }
                 self.state.reg_cache.invalidate_acc();
                 self.store_rax_to(dest);

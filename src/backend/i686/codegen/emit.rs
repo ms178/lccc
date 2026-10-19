@@ -174,6 +174,11 @@ pub struct I686Codegen {
     /// cross term and carries with an immediate 0 — the parser hot shape
     /// `res = res * base + val` (GCC: imull/mull/addl/adcl $0).
     pub(super) zext_wide_values: FxHashSet<u32>,
+    /// Narrow values whose 32-bit image is a proven extension
+    /// (`comparison::compute_narrow_images`): lets a byte/word compare in a
+    /// register without that sub-register (`%esi`/`%edi`/`%ebp`) run at 32
+    /// bits exactly instead of staging through `%eax`.
+    pub(super) narrow_images: FxHashMap<u32, super::comparison::NarrowImage>,
 }
 
 // Callee-saved physical register indices for i686
@@ -195,6 +200,31 @@ pub(super) const I686_CALLEE_SAVED_WITH_EBP: &[PhysReg] =
 // on the 32 KiB kernel setup binary: values that live between two compares
 // can sit in %edx instead of forcing a %ebx..%ebp spill + push/pop pair.
 pub(super) const I686_CALLER_SAVED: &[PhysReg] = &[PhysReg(5), PhysReg(4)];
+
+/// The 8-byte scalars an i686 value carries as a 32-bit pair (`%eax:%edx`
+/// in the accumulator, two words in memory and in the argument area):
+/// 64-bit integers, `double` when moved as bits, and the `_Decimal64` BID
+/// container, which is only ever moved (its arithmetic is libbid calls) and
+/// never goes through x87, which would reinterpret the bits.
+pub(super) fn is_pair_scalar(ty: IrType) -> bool {
+    matches!(ty, IrType::I64 | IrType::U64 | IrType::F64 | IrType::D64)
+}
+
+/// The exact 64-bit image of a constant held in an i686 register pair, or
+/// `None` for a constant of at most 32 bits that has no high word of its
+/// own (it zero-extends).  Integers are their sign-extended IR value,
+/// `I128` contributes its low half (the 64-bit pair family serves the low
+/// 64 bits), and `double`/`_Decimal64` constants are their bit patterns.
+pub(super) fn pair_const_bits(c: &IrConst) -> Option<u64> {
+    Some(match c {
+        IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_) | IrConst::I64(_) => c.to_i64()? as u64,
+        IrConst::I128(v) => *v as u64,
+        IrConst::F64(f) => f.to_bits(),
+        IrConst::D64(v) => *v,
+        IrConst::Zero => 0,
+        _ => return None,
+    })
+}
 
 pub(super) fn phys_reg_name(reg: PhysReg) -> &'static str {
     match reg.0 {
@@ -472,6 +502,7 @@ impl I686Codegen {
             current_return_i686_xmm: false,
             is_variadic: false,
             reg_assignments: FxHashMap::default(),
+            narrow_images: FxHashMap::default(),
             divrem_tail_dests: FxHashSet::default(),
             divrem_head_partners: FxHashMap::default(),
             divrem_broken_tails: FxHashSet::default(),
@@ -1358,7 +1389,7 @@ impl I686Codegen {
 
     /// Check if a type requires 64-bit atomic handling on i686 (needs cmpxchg8b).
     pub(super) fn is_atomic_wide(&self, ty: IrType) -> bool {
-        matches!(ty, IrType::I64 | IrType::U64 | IrType::F64)
+        is_pair_scalar(ty)
     }
 
     /// 64-bit atomic RMW using lock cmpxchg8b loop.
@@ -1694,7 +1725,7 @@ impl I686Codegen {
             }
 
             match ty {
-                IrType::I64 | IrType::U64 | IrType::F64 => {
+                _ if is_pair_scalar(ty) => {
                     self.emit_load_acc_pair(arg);
                     emit!(self.state, "    movl %eax, {}(%esp)", offset);
                     emit!(self.state, "    movl %edx, {}(%esp)", offset + 4);
@@ -2214,13 +2245,29 @@ impl I686Codegen {
         }
     }
 
-    /// Emit 8-byte scalar (F64/I64/U64) to call stack.
-    pub(super) fn emit_call_8byte_stack_arg(
-        &mut self,
-        arg: &Operand,
-        ty: IrType,
-        stack_offset: usize,
-    ) {
+    /// Store an 8-byte pair scalar argument (`is_pair_scalar`) at
+    /// `stack_offset(%esp)`: constants as their exact two-word image
+    /// (`pair_const_bits`: a `_Decimal64` BID high word, a sign-extended
+    /// narrow integer), slot values word by word, anything else through
+    /// the accumulator pair.
+    pub(super) fn emit_call_8byte_stack_arg(&mut self, arg: &Operand, stack_offset: usize) {
+        if let Operand::Const(c) = arg {
+            if let Some(bits) = pair_const_bits(c) {
+                emit!(
+                    self.state,
+                    "    movl ${}, {}(%esp)",
+                    bits as u32 as i32,
+                    stack_offset
+                );
+                emit!(
+                    self.state,
+                    "    movl ${}, {}(%esp)",
+                    (bits >> 32) as u32 as i32,
+                    stack_offset + 4
+                );
+                return;
+            }
+        }
         if let Operand::Value(v) = arg {
             if let Some(slot) = self.state.get_slot(v.0) {
                 let sr0 = self.slot_ref(slot);
@@ -2230,65 +2277,13 @@ impl I686Codegen {
                 emit!(self.state, "    movl {}, %eax", sr4);
                 emit!(self.state, "    movl %eax, {}(%esp)", stack_offset + 4);
                 self.state.reg_cache.invalidate_acc();
-            } else {
-                self.operand_to_eax(arg);
-                emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
-                emit!(self.state, "    movl $0, {}(%esp)", stack_offset + 4);
-            }
-        } else if ty == IrType::D64 {
-            if let Operand::Const(IrConst::D64(bits)) = arg {
-                let lo = (bits & 0xFFFF_FFFF) as u32;
-                let hi = (bits >> 32) as u32;
-                emit!(
-                    self.state,
-                    "    movl ${}, {}(%esp)",
-                    lo as i32,
-                    stack_offset
-                );
-                emit!(
-                    self.state,
-                    "    movl ${}, {}(%esp)",
-                    hi as i32,
-                    stack_offset + 4
-                );
-            } else {
-                self.operand_to_eax(arg);
-                emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
-                emit!(self.state, "    movl $0, {}(%esp)", stack_offset + 4);
-            }
-        } else if ty == IrType::F64 {
-            if let Operand::Const(IrConst::F64(f)) = arg {
-                let bits = f.to_bits();
-                let lo = (bits & 0xFFFF_FFFF) as u32;
-                let hi = (bits >> 32) as u32;
-                emit!(
-                    self.state,
-                    "    movl ${}, {}(%esp)",
-                    lo as i32,
-                    stack_offset
-                );
-                emit!(
-                    self.state,
-                    "    movl ${}, {}(%esp)",
-                    hi as i32,
-                    stack_offset + 4
-                );
-            } else {
-                self.operand_to_eax(arg);
-                emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
-                emit!(self.state, "    movl $0, {}(%esp)", stack_offset + 4);
-            }
-        } else {
-            // I64/U64 constant
-            self.operand_to_eax(arg);
-            emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
-            if let Operand::Const(IrConst::I64(v)) = arg {
-                let hi = ((*v as u64) >> 32) as i32;
-                emit!(self.state, "    movl ${}, {}(%esp)", hi, stack_offset + 4);
-            } else {
-                emit!(self.state, "    movl $0, {}(%esp)", stack_offset + 4);
+                return;
             }
         }
+        self.emit_load_acc_pair(arg);
+        emit!(self.state, "    movl %eax, {}(%esp)", stack_offset);
+        emit!(self.state, "    movl %edx, {}(%esp)", stack_offset + 4);
+        self.state.reg_cache.invalidate_acc();
     }
 }
 
@@ -2631,12 +2626,16 @@ impl ArchCodegen for I686Codegen {
             self.emit_float_cmp(dest, op, lhs, rhs, ty);
             return;
         }
-        if matches!(ty, IrType::I64 | IrType::U64) || crate::backend::generation::is_i128_type(ty) {
-            if !crate::backend::generation::is_i128_type(ty)
-                && self.try_emit_i64_cmp_fast(dest, op, lhs, rhs)
-            {
+        if crate::backend::generation::is_i128_type(ty) {
+            self.emit_i128_carrier_cmp(dest, op, lhs, rhs);
+            return;
+        }
+        if matches!(ty, IrType::I64 | IrType::U64) {
+            if self.try_emit_i64_cmp_fast(dest, op, lhs, rhs) {
                 return;
             }
+            // The register-pair compare family (`emit_i128_cmp`) is 64-bit
+            // on i686: it serves I64/U64 only.
             self.emit_i128_cmp(dest, op, lhs, rhs);
             return;
         }
@@ -2850,6 +2849,12 @@ impl ArchCodegen for I686Codegen {
         // (the simplify/set_membership legality gates never build I64
         // BitTests for this target).
         std::env::var_os("CCC_NO_BT_BRANCH_FUSION").is_none()
+    }
+
+    fn supports_fused_cmp_select(&self) -> bool {
+        // `cmp; jCC .Lsel_true` instead of `setCC; movzbl; test; jne`
+        // (emit_fused_cmp_select_impl). Kill switch: CCC_NO_FUSED_CSEL.
+        true
     }
 
     fn supports_load_cmp_mem_fold(&self) -> bool {
@@ -3313,7 +3318,7 @@ impl ArchCodegen for I686Codegen {
 
         let is_wide = match src {
             Operand::Value(v) => self.state.is_wide_value(v.0),
-            Operand::Const(IrConst::F64(_)) => true,
+            Operand::Const(IrConst::F64(_) | IrConst::D64(_)) => true,
             // Integer constants are represented as I64 even when their
             // semantic destination is U32 (for example a U32 phi incoming
             // value).  Treating every I64 container as a wide value wrote a
@@ -3329,42 +3334,51 @@ impl ArchCodegen for I686Codegen {
             _ => false,
         };
         if is_wide {
-            if let Some(dest_slot) = self.state.get_slot(dest.0) {
-                match src {
-                    Operand::Value(v) => {
-                        if let Some(src_slot) = self.state.get_slot(v.0) {
-                            let ssr0 = self.slot_ref(src_slot);
-                            let dsr0 = self.slot_ref(dest_slot);
-                            let ssr4 = self.slot_ref_offset(src_slot, 4);
-                            let dsr4 = self.slot_ref_offset(dest_slot, 4);
-                            emit!(self.state, "    movl {}, %eax", ssr0);
-                            emit!(self.state, "    movl %eax, {}", dsr0);
-                            emit!(self.state, "    movl {}, %eax", ssr4);
-                            emit!(self.state, "    movl %eax, {}", dsr4);
-                        }
-                    }
-                    Operand::Const(IrConst::F64(val)) => {
-                        let bits = val.to_bits();
-                        let lo = bits as u32;
-                        let hi = (bits >> 32) as u32;
-                        let dsr0 = self.slot_ref(dest_slot);
-                        let dsr4 = self.slot_ref_offset(dest_slot, 4);
-                        emit!(self.state, "    movl ${}, {}", lo as i32, dsr0);
-                        emit!(self.state, "    movl ${}, {}", hi as i32, dsr4);
-                    }
-                    Operand::Const(IrConst::I64(val)) => {
-                        let lo = *val as u32;
-                        let hi = (*val >> 32) as u32;
-                        let dsr0 = self.slot_ref(dest_slot);
-                        let dsr4 = self.slot_ref_offset(dest_slot, 4);
-                        emit!(self.state, "    movl ${}, {}", lo as i32, dsr0);
-                        emit!(self.state, "    movl ${}, {}", hi as i32, dsr4);
-                    }
-                    _ => unreachable!("unexpected wide constant type in i686 emit_copy"),
-                }
+            let Some(dest_slot) = self.state.get_slot(dest.0) else {
+                // No home of its own (an accumulator-consumed temporary):
+                // its consumer reads the pair from %eax:%edx.
+                self.emit_load_acc_pair(src);
                 self.state.reg_cache.invalidate_all();
                 return;
+            };
+            match src {
+                Operand::Value(v) => {
+                    if let Some(src_slot) = self.state.get_slot(v.0) {
+                        let ssr0 = self.slot_ref(src_slot);
+                        let dsr0 = self.slot_ref(dest_slot);
+                        let ssr4 = self.slot_ref_offset(src_slot, 4);
+                        let dsr4 = self.slot_ref_offset(dest_slot, 4);
+                        emit!(self.state, "    movl {}, %eax", ssr0);
+                        emit!(self.state, "    movl %eax, {}", dsr0);
+                        emit!(self.state, "    movl {}, %eax", ssr4);
+                        emit!(self.state, "    movl %eax, {}", dsr4);
+                    } else {
+                        // Register- or accumulator-resident source: the pair
+                        // loader handles every home.
+                        self.emit_load_acc_pair(src);
+                        let dsr0 = self.slot_ref(dest_slot);
+                        let dsr4 = self.slot_ref_offset(dest_slot, 4);
+                        emit!(self.state, "    movl %eax, {}", dsr0);
+                        emit!(self.state, "    movl %edx, {}", dsr4);
+                    }
+                }
+                Operand::Const(c) => {
+                    // `is_wide` admits exactly the pair constants.
+                    let bits = pair_const_bits(c)
+                        .unwrap_or_else(|| unreachable!("non-pair wide copy constant {c:?}"));
+                    let dsr0 = self.slot_ref(dest_slot);
+                    let dsr4 = self.slot_ref_offset(dest_slot, 4);
+                    emit!(self.state, "    movl ${}, {}", bits as u32 as i32, dsr0);
+                    emit!(
+                        self.state,
+                        "    movl ${}, {}",
+                        (bits >> 32) as u32 as i32,
+                        dsr4
+                    );
+                }
             }
+            self.state.reg_cache.invalidate_all();
+            return;
         }
 
         // Constant → spilled slot: fold the immediate directly into the
@@ -3526,6 +3540,7 @@ impl ArchCodegen for I686Codegen {
         fn emit_fused_cmp_branch(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType, true_label: &str, false_label: &str) => emit_fused_cmp_branch_impl;
         fn emit_fused_bit_test_branch_blocks(&mut self, base: &Operand, index: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_bit_test_branch_blocks_impl;
         fn emit_select(&mut self, dest: &Value, cond: &Operand, true_val: &Operand, false_val: &Operand, ty: IrType) => emit_select_impl;
+        fn emit_fused_cmp_select(&mut self, op: IrCmpOp, lhs: &Operand, rhs: &Operand, cmp_ty: IrType, true_val: &Operand, false_val: &Operand, dest: &Value, sel_ty: IrType) => emit_fused_cmp_select_impl;
         fn emit_f128_neg(&mut self, dest: &Value, src: &Operand) => emit_f128_neg_impl;
         // calls
         fn call_abi_config(&self) -> call_abi::CallAbiConfig => call_abi_config_impl;
@@ -4048,6 +4063,67 @@ impl I686Codegen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pair_scalars_are_the_eight_byte_moves() {
+        for ty in [IrType::I64, IrType::U64, IrType::F64, IrType::D64] {
+            assert!(is_pair_scalar(ty), "{ty:?} is carried as a pair");
+            assert_eq!(I686Codegen::stack_scalar_arg_size(ty), 8, "{ty:?}");
+        }
+        for ty in [
+            IrType::I32,
+            IrType::U32,
+            IrType::F32,
+            IrType::D32,
+            IrType::Ptr,
+            IrType::U8,
+        ] {
+            assert!(!is_pair_scalar(ty), "{ty:?} is a single word");
+            assert_eq!(I686Codegen::stack_scalar_arg_size(ty), 4, "{ty:?}");
+        }
+        // Wider carriers have their own classes (F128Stack, I128Stack).
+        // (`_Decimal128` has no IR variant: it travels as U128.)
+        for ty in [IrType::F128, IrType::I128, IrType::U128] {
+            assert!(!is_pair_scalar(ty), "{ty:?}");
+        }
+    }
+
+    #[test]
+    fn pair_constants_load_both_halves_exactly() {
+        let cases: &[(&str, IrConst, Option<u64>)] = &[
+            (
+                "D64 1.5DD keeps its BID high word",
+                IrConst::D64(0x31a0_0000_0000_000f),
+                Some(0x31a0_0000_0000_000f),
+            ),
+            ("D64(0)", IrConst::D64(0), Some(0)),
+            ("I64(-2) sign-extends", IrConst::I64(-2), Some(u64::MAX - 1)),
+            ("I32(-1) sign-extends", IrConst::I32(-1), Some(u64::MAX)),
+            (
+                "I8(-128) sign-extends",
+                IrConst::I8(-128),
+                Some((-128i64) as u64),
+            ),
+            ("I16(0x7fff)", IrConst::I16(0x7fff), Some(0x7fff)),
+            (
+                "I128 low half",
+                IrConst::I128(0x1111_2222_3333_4444_5555_6666_7777_8888),
+                Some(0x5555_6666_7777_8888),
+            ),
+            ("F64 bits", IrConst::F64(1.5), Some(0x3ff8_0000_0000_0000)),
+            (
+                "F64 -0.0 bits",
+                IrConst::F64(-0.0),
+                Some(0x8000_0000_0000_0000),
+            ),
+            ("Zero", IrConst::Zero, Some(0)),
+            ("F32 has no high word", IrConst::F32(1.5), None),
+            ("D32 has no high word", IrConst::D32(0x3280_0000), None),
+        ];
+        for (what, c, want) in cases {
+            assert_eq!(pair_const_bits(c), *want, "{what}");
+        }
+    }
 
     #[test]
     fn fastcall_zero_aggregate_keeps_register_chain() {

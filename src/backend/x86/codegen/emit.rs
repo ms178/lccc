@@ -3316,12 +3316,17 @@ impl X86Codegen {
                 } else if let Some(slot) = self.state.get_slot(v.0) {
                     // value_to_reg is a 64-bit loader and historically calls
                     // emitted `movq slot, %eax` when passed a 32-bit register.
-                    // For a small integer return use a width-consistent load.
+                    // For a small integer return use a width-consistent load:
+                    // the sign extensions name %rax, as their `q` suffix
+                    // requires (GNU as rejects `movswq m, %eax`; the integrated
+                    // assembler already encoded REX.W, so the bytes are
+                    // unchanged), the zero extensions write %eax and so clear
+                    // the upper half.
                     match self.value_types.get(&v.0).copied().unwrap_or(IrType::I64) {
                         IrType::I8 => {
                             self.state
                                 .out
-                                .emit_instr_rbp_reg("    movsbq", slot.0, "eax")
+                                .emit_instr_rbp_reg("    movsbq", slot.0, "rax")
                         }
                         IrType::U8 => {
                             self.state
@@ -3331,7 +3336,7 @@ impl X86Codegen {
                         IrType::I16 => {
                             self.state
                                 .out
-                                .emit_instr_rbp_reg("    movswq", slot.0, "eax")
+                                .emit_instr_rbp_reg("    movswq", slot.0, "rax")
                         }
                         IrType::U16 => {
                             self.state
@@ -8514,13 +8519,12 @@ impl ArchCodegen for X86Codegen {
             };
             for (reg_id, kind) in last_writes.iter() {
                 let home = PhysReg(*reg_id);
-                let resident = self
-                    .reg_assignments
-                    .iter()
-                    .filter(|(_, r)| **r == home)
-                    .map(|(&v, _)| v)
-                    .collect::<Vec<_>>();
-                if resident.is_empty() {
+                // `home_sharers` is the inverse of the function's final
+                // `reg_assignments` (built with it in the prologue): an O(1)
+                // answer where filtering the whole assignment map cost
+                // O(values) per written register per window -- quadratic in
+                // call-dense functions, which flush a window per call.
+                if self.home_sharers.get(reg_id).is_none_or(|s| s.is_empty()) {
                     // Not a home register in this function: nothing to track.
                     continue;
                 }

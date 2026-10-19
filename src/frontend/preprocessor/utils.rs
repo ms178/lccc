@@ -119,3 +119,146 @@ pub fn copy_literal_bytes_to_string(
     result.push_str(slice);
     i
 }
+
+// ── C23 pp-number lexing ────────────────────────────────────────────────────
+//
+// C23 6.4.8 adds `' digit` and `' nondigit` to the pp-number grammar, so a
+// digit separator (`1'000'000`, `0xFF'FF`) belongs to the number instead of
+// opening a character constant. Before C23 a `'` always starts one (GCC 16.2
+// and Clang 23.1.3 agree). The dialect is a property of the whole
+// translation unit; it lives in a thread-local so every scanner (most are
+// free functions) consults one fact. `Preprocessor::new` resets it and
+// `Preprocessor::set_c23` sets it; compilation and each unit test run on
+// their own thread.
+
+thread_local! {
+    static C23_DIALECT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Select (or clear) the C23 preprocessing dialect for this thread.
+pub(super) fn set_c23_dialect(on: bool) {
+    C23_DIALECT.with(|c| c.set(on));
+}
+
+/// Whether this thread preprocesses C23.
+pub(super) fn c23_dialect() -> bool {
+    C23_DIALECT.with(std::cell::Cell::get)
+}
+
+/// End of the pp-number starting at `bytes[i]` (a digit, or `.` followed by
+/// a digit): identifier characters, `.`, an exponent sign after `e E p P`,
+/// and in C23 a `'` followed by an identifier character.
+pub(super) fn ppnumber_end(bytes: &[u8], i: usize) -> usize {
+    let c23 = c23_dialect();
+    let len = bytes.len();
+    let mut j = i;
+    while j < len {
+        let c = bytes[j];
+        let continues = c.is_ascii_alphanumeric()
+            || c == b'.'
+            || c == b'_'
+            || ((c == b'+' || c == b'-')
+                && j > i
+                && matches!(bytes[j - 1], b'e' | b'E' | b'p' | b'P'))
+            || (c23
+                && c == b'\''
+                && j > i
+                && bytes
+                    .get(j + 1)
+                    .is_some_and(|&n| n.is_ascii_alphanumeric() || n == b'_'));
+        if !continues {
+            break;
+        }
+        j += 1;
+    }
+    j
+}
+
+/// Whether the `'` at `bytes[i]` is a C23 digit separator: inside a
+/// pp-number (the token it continues starts with a digit, or `.` digit) and
+/// followed by an identifier character. For scanners that walk byte by
+/// byte; `u8'a'`, `L'a'` and `x1'a'` stay character constants because their
+/// token starts with a letter.
+pub(super) fn is_digit_separator(bytes: &[u8], i: usize) -> bool {
+    if bytes.get(i) != Some(&b'\'') || !c23_dialect() {
+        return false;
+    }
+    if !bytes
+        .get(i + 1)
+        .is_some_and(|&n| n.is_ascii_alphanumeric() || n == b'_')
+    {
+        return false;
+    }
+    let in_token = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'\'';
+    let starts_ppnumber = |k: usize| {
+        bytes[k].is_ascii_digit()
+            || (bytes[k] == b'.' && bytes.get(k + 1).is_some_and(u8::is_ascii_digit))
+    };
+    let run_start = |mut k: usize| {
+        while k > 0 && in_token(bytes[k - 1]) {
+            k -= 1;
+        }
+        k
+    };
+    let mut k = run_start(i);
+    // An exponent sign joins two runs into one pp-number (`1e+1'0`) only when
+    // the run before it is itself a pp-number (`abe+1'0` is three tokens).
+    while k >= 2
+        && matches!(bytes[k - 1], b'+' | b'-')
+        && matches!(bytes[k - 2], b'e' | b'E' | b'p' | b'P')
+    {
+        let prev = run_start(k - 2);
+        if !starts_ppnumber(prev) {
+            break;
+        }
+        k = prev;
+    }
+    k < i && starts_ppnumber(k)
+}
+
+#[cfg(test)]
+mod digit_separator_tests {
+    use super::*;
+
+    fn with_c23<R>(on: bool, f: impl FnOnce() -> R) -> R {
+        set_c23_dialect(on);
+        let r = f();
+        set_c23_dialect(false);
+        r
+    }
+
+    #[test]
+    fn separators_are_recognised_only_inside_c23_pp_numbers() {
+        with_c23(true, || {
+            let s = b"x = 1'000 + 0xFF'FF + 1e+1'0 + .5'5;";
+            for (i, &b) in s.iter().enumerate() {
+                if b == b'\'' {
+                    assert!(is_digit_separator(s, i), "offset {i}");
+                }
+            }
+            for lit in [
+                &b"c = u8'a';"[..],
+                b"c = L'a';",
+                b"c = x1'a';",
+                b"c = abe+1 ? 'a' : 0;",
+            ] {
+                let q = lit.iter().position(|&b| b == b'\'').unwrap();
+                assert!(
+                    !is_digit_separator(lit, q),
+                    "{}",
+                    String::from_utf8_lossy(lit)
+                );
+            }
+            assert!(
+                !is_digit_separator(b"1' ", 1),
+                "a separator needs a following digit or nondigit"
+            );
+            assert_eq!(ppnumber_end(b"1'000'000;", 0), 9);
+            assert_eq!(ppnumber_end(b"0x1p-3'0f)", 0), 9);
+        });
+        with_c23(false, || {
+            assert!(!is_digit_separator(b"1'000", 1));
+            assert_eq!(ppnumber_end(b"1'000", 0), 1);
+        });
+    }
+}

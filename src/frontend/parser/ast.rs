@@ -436,6 +436,10 @@ pub mod decl_flag {
     /// The POINTER itself is const (`T *const p`), as opposed to `CONST`
     /// which describes the pointee for pointer declarators.
     pub const POINTER_CONST: u16 = 1 << 9;
+    /// C23 `constexpr` storage-class specifier (6.7.1).
+    pub const CONSTEXPR: u16 = 1 << 10;
+    /// `constexpr` came after `_Thread_local` or `auto` (diagnostic order).
+    pub const CONSTEXPR_LAST: u16 = 1 << 11;
 }
 
 /// A variable/type declaration.
@@ -547,6 +551,24 @@ impl Declaration {
     #[inline]
     pub fn set_pointer_const(&mut self, v: bool) {
         self.set_flag(decl_flag::POINTER_CONST, v)
+    }
+    #[inline]
+    pub fn set_constexpr(&mut self, v: bool) {
+        self.set_flag(decl_flag::CONSTEXPR, v)
+    }
+    /// C23 `constexpr`: a named constant (6.7.1p5-p6, 6.6p7-p8).
+    #[inline]
+    pub fn is_constexpr(&self) -> bool {
+        self.flags & decl_flag::CONSTEXPR != 0
+    }
+    #[inline]
+    pub fn set_constexpr_last(&mut self, v: bool) {
+        self.set_flag(decl_flag::CONSTEXPR_LAST, v)
+    }
+    /// `constexpr` followed `_Thread_local` or `auto` in the specifiers.
+    #[inline]
+    pub fn is_constexpr_last(&self) -> bool {
+        self.flags & decl_flag::CONSTEXPR_LAST != 0
     }
     /// True for `T *const p`: the pointer object itself is read-only.
     #[inline]
@@ -691,6 +713,12 @@ pub struct DeclAttributes {
     /// declarator has no derivations. A typedef recorded with this flag makes
     /// each object declared through it volatile, as its written text would.
     pub object_volatile: bool,
+    /// Whether the declared object is itself `restrict`- or `_Atomic`-
+    /// qualified, by the same rule as `object_volatile` (an array's object
+    /// qualifier is its elements'). Atomic-ness through a typedef name is not
+    /// tracked.
+    pub object_restrict: bool,
+    pub object_atomic: bool,
     /// Whether the declaration's specifiers are `volatile`-qualified (the base
     /// qualifier, not the declarator's own). A typedef recorded with this flag
     /// qualifies each use of the name (see `Parser::typedef_base_volatile`).
@@ -1129,7 +1157,13 @@ pub enum Designator {
 #[derive(Debug, Clone)]
 pub enum TypeSpecifier {
     Void,
+    /// Signed 8-bit char; see `CType::Char` (plain on signed-char targets,
+    /// explicit `signed char` on unsigned-char targets).
     Char,
+    /// Explicit `signed char` on signed-char targets (`CType::SChar`).
+    SignedChar,
+    /// Plain `char` on unsigned-char targets (`CType::PlainUChar`).
+    PlainUnsignedChar,
     Short,
     Int,
     Long,
@@ -1178,8 +1212,13 @@ pub enum TypeSpecifier {
         Option<usize>,
         Option<bool>,
     ),
-    /// Enum: (name, variants, is_packed)
-    Enum(Option<String>, Option<Vec<EnumVariant>>, bool),
+    /// Enum: (name, variants, is_packed, C23 fixed underlying type `: T`)
+    Enum(
+        Option<String>,
+        Option<Vec<EnumVariant>>,
+        bool,
+        Option<Box<TypeSpecifier>>,
+    ),
     TypedefName(String),
     Pointer(Box<TypeSpecifier>, AddressSpace),
     Array(Box<TypeSpecifier>, Option<Box<Expr>>),
@@ -1198,6 +1237,8 @@ pub enum TypeSpecifier {
     TypeofType(Box<TypeSpecifier>),
     /// __auto_type - GCC extension: type inferred from initializer expression
     AutoType,
+    /// C23 `nullptr_t`, produced by `typeof(nullptr)` round-trips.
+    NullPtrT,
     /// __attribute__((vector_size(N))) applied directly in cast/compound-literal/sizeof.
     /// Wraps the base element type and total vector size in bytes.
     /// E.g., `(__attribute__((vector_size(16))) float){...}` becomes Vector(Float, 16).
@@ -1239,6 +1280,8 @@ pub struct StructFieldDecl {
 pub struct EnumVariant {
     pub name: String,
     pub value: Option<Box<Expr>>,
+    /// The enumerator's identifier.
+    pub span: Span,
 }
 
 /// A compound statement (block).
@@ -1306,6 +1349,45 @@ pub enum Stmt {
 }
 
 impl Stmt {
+    /// Calls `f` on each expression this statement evaluates itself -- not
+    /// those of nested statements, nor of a `for` clause's declaration (a
+    /// declaration's own expressions come from `InitDeclarator::for_each_expr`).
+    pub fn for_each_own_expr<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+        match self {
+            Stmt::Expr(Some(e)) | Stmt::Return(Some(e), _) => f(e),
+            Stmt::If(cond, ..)
+            | Stmt::While(cond, ..)
+            | Stmt::DoWhile(_, cond, _)
+            | Stmt::Switch(cond, ..)
+            | Stmt::Case(cond, ..) => f(cond),
+            Stmt::CaseRange(lo, hi, ..) => {
+                f(lo);
+                f(hi);
+            }
+            Stmt::For(init, cond, inc, ..) => {
+                if let Some(init) = init {
+                    if let ForInit::Expr(e) = init.as_ref() {
+                        f(e);
+                    }
+                }
+                cond.iter().chain(inc).for_each(&mut *f);
+            }
+            Stmt::GotoIndirect(e, _) => f(e),
+            Stmt::InlineAsm {
+                outputs, inputs, ..
+            } => outputs.iter().chain(inputs).for_each(|op| f(&op.expr)),
+            Stmt::Expr(None)
+            | Stmt::Return(None, _)
+            | Stmt::Compound(_)
+            | Stmt::Break(_)
+            | Stmt::Continue(_)
+            | Stmt::Default(..)
+            | Stmt::Goto(..)
+            | Stmt::Label(..)
+            | Stmt::Declaration(_) => {}
+        }
+    }
+
     /// Extract the source span from this statement, if available.
     /// Used by IR lowering to propagate source locations for debug info.
     pub fn span(&self) -> Option<Span> {
@@ -1377,6 +1459,9 @@ pub struct CastQualifiers {
     /// A `const` or `volatile` appears before the type's first top-level `*`
     /// (`(const void *)0`). The null-pointer-constant rule excludes these.
     pub pointee_qualified: bool,
+    /// A `const` appears before the type's first top-level `*`: the base
+    /// type is const (`(const char *)s`). See `common::qualifiers`.
+    pub base_const: bool,
     /// The type is a single-level pointer whose pointee is `volatile`
     /// (`(volatile u32 *)addr`, the MMIO idiom): `*cast` is a volatile access.
     pub pointee_volatile: bool,
@@ -1456,6 +1541,12 @@ pub enum Expr {
     Deref(Box<Expr>, Span),
     /// _Generic(controlling_expr, type1: expr1, type2: expr2, ..., default: exprN)
     GenericSelection(Box<Expr>, Vec<GenericAssociation>, Span),
+    /// A type name as the controlling operand of `_Generic` (C2y N3260,
+    /// accepted by GCC 16.2 and Clang 23.1.3 in C23 mode). It is never
+    /// evaluated and, unlike an expression operand, undergoes no lvalue
+    /// conversion: `_Generic(const int, const int: 1)` selects 1. The flag is
+    /// the association-style constness (`GenericAssociation::is_const`).
+    TypeOperand(Box<TypeSpecifier>, bool, Span),
     /// GCC extension: &&label (address of label, for computed goto)
     LabelAddr(String, Span),
     /// GCC extension: __builtin_types_compatible_p(type1, type2).
@@ -1564,7 +1655,331 @@ pub enum PostfixOp {
     PostDec,
 }
 
+impl InitDeclarator {
+    /// Calls `f` on each expression of this declarator: array bounds, then
+    /// the initializer's values and designator indices, in source order.
+    pub fn for_each_expr<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+        for derived in &self.derived {
+            if let DerivedDeclarator::Array(Some(bound)) = derived {
+                f(bound);
+            }
+        }
+        if let Some(init) = &self.init {
+            init.for_each_expr(f);
+        }
+    }
+}
+
+impl TypeSpecifier {
+    /// Calls `f` on each expression written inside this type, recursively
+    /// through the types it is built from: array bounds, `typeof` operands,
+    /// member bit-widths and array bounds, enumerator values, and those of
+    /// parameter types. Exhaustive on purpose, like `Expr::for_each_child`.
+    pub fn for_each_expr<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+        match self {
+            TypeSpecifier::Void
+            | TypeSpecifier::Char
+            | TypeSpecifier::SignedChar
+            | TypeSpecifier::Short
+            | TypeSpecifier::Int
+            | TypeSpecifier::Long
+            | TypeSpecifier::LongLong
+            | TypeSpecifier::Float
+            | TypeSpecifier::Double
+            | TypeSpecifier::LongDouble
+            | TypeSpecifier::Float128
+            | TypeSpecifier::Decimal32
+            | TypeSpecifier::Decimal64
+            | TypeSpecifier::Decimal128
+            | TypeSpecifier::Signed
+            | TypeSpecifier::Unsigned
+            | TypeSpecifier::UnsignedChar
+            | TypeSpecifier::PlainUnsignedChar
+            | TypeSpecifier::UnsignedShort
+            | TypeSpecifier::UnsignedInt
+            | TypeSpecifier::UnsignedLong
+            | TypeSpecifier::UnsignedLongLong
+            | TypeSpecifier::Int128
+            | TypeSpecifier::UnsignedInt128
+            | TypeSpecifier::Bool
+            | TypeSpecifier::ComplexFloat
+            | TypeSpecifier::ComplexDouble
+            | TypeSpecifier::ComplexLongDouble
+            | TypeSpecifier::TypedefName(_)
+            | TypeSpecifier::AutoType
+            | TypeSpecifier::NullPtrT
+            | TypeSpecifier::Struct(_, None, ..)
+            | TypeSpecifier::Union(_, None, ..)
+            | TypeSpecifier::Enum(_, None, _, None) => {}
+            TypeSpecifier::Enum(_, None, _, Some(underlying)) => underlying.for_each_expr(f),
+            TypeSpecifier::Struct(_, Some(fields), ..)
+            | TypeSpecifier::Union(_, Some(fields), ..) => {
+                for field in fields {
+                    field.type_spec.for_each_expr(f);
+                    for derived in &field.derived {
+                        derived.for_each_expr(f);
+                    }
+                    if let Some(width) = &field.bit_width {
+                        f(width);
+                    }
+                }
+            }
+            TypeSpecifier::Enum(_, Some(variants), _, underlying) => {
+                if let Some(underlying) = underlying {
+                    underlying.for_each_expr(f);
+                }
+                for value in variants.iter().filter_map(|v| v.value.as_deref()) {
+                    f(value);
+                }
+            }
+            TypeSpecifier::Pointer(inner, _)
+            | TypeSpecifier::TypeofType(inner)
+            | TypeSpecifier::Vector(inner, _)
+            | TypeSpecifier::ExtVector(inner, _) => inner.for_each_expr(f),
+            TypeSpecifier::Array(element, bound) => {
+                element.for_each_expr(f);
+                if let Some(bound) = bound {
+                    f(bound);
+                }
+            }
+            TypeSpecifier::FunctionPointer(ret, params, _)
+            | TypeSpecifier::BareFunction(ret, params, _) => {
+                ret.for_each_expr(f);
+                for param in params {
+                    param.for_each_type_expr(f);
+                }
+            }
+            TypeSpecifier::Typeof(operand, _) => f(operand),
+        }
+    }
+}
+
+impl DerivedDeclarator {
+    /// Calls `f` on each expression in this declarator part: an array
+    /// bound, or the expressions of its parameter types.
+    pub fn for_each_expr<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+        match self {
+            DerivedDeclarator::Pointer(_) | DerivedDeclarator::Array(None) => {}
+            DerivedDeclarator::Array(Some(bound)) => f(bound),
+            DerivedDeclarator::Function(params, _)
+            | DerivedDeclarator::FunctionPointer(params, _) => {
+                for param in params {
+                    param.for_each_type_expr(f);
+                }
+            }
+        }
+    }
+}
+
+impl ParamDecl {
+    /// Calls `f` on each expression in this parameter's type, including a
+    /// `_Alignas(type-name)` and a function-pointer parameter's own
+    /// parameter types.
+    pub fn for_each_type_expr<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+        self.type_spec.for_each_expr(f);
+        if let Some(ts) = &self.alignas_type {
+            ts.for_each_expr(f);
+        }
+        for param in self.fptr_params.iter().flatten() {
+            param.for_each_type_expr(f);
+        }
+    }
+}
+
+impl Initializer {
+    /// Calls `f` on each expression of this initializer: element values and
+    /// designator indices, in source order.
+    pub fn for_each_expr<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+        match self {
+            Initializer::Expr(e) => f(e),
+            Initializer::List(items) => {
+                for item in items {
+                    for designator in &item.designators {
+                        match designator {
+                            Designator::Index(e) => f(e),
+                            Designator::Range(lo, hi) => {
+                                f(lo);
+                                f(hi);
+                            }
+                            Designator::Field(_) => {}
+                        }
+                    }
+                    item.init.for_each_expr(f);
+                }
+            }
+        }
+    }
+}
+
 impl Expr {
+    /// Calls `f` on each direct sub-expression, in source order: operands,
+    /// the callee and arguments of a call, a compound literal's initializer
+    /// expressions, a `sizeof` operand, `_Generic`'s controlling expression
+    /// and association results. A statement expression's statements are not
+    /// visited: they are statements of their own. The match is exhaustive on
+    /// purpose -- a new variant must decide what its children are.
+    pub fn for_each_child<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+        match self {
+            Expr::IntLiteral(..)
+            | Expr::UIntLiteral(..)
+            | Expr::LongLiteral(..)
+            | Expr::ULongLiteral(..)
+            | Expr::LongLongLiteral(..)
+            | Expr::ULongLongLiteral(..)
+            | Expr::FloatLiteral(..)
+            | Expr::FloatLiteralF32(..)
+            | Expr::FloatLiteralLongDouble(..)
+            | Expr::FloatLiteralF128(..)
+            | Expr::FloatLiteralDecimal(..)
+            | Expr::ImaginaryLiteral(..)
+            | Expr::ImaginaryLiteralF32(..)
+            | Expr::ImaginaryLiteralLongDouble(..)
+            | Expr::StringLiteral(..)
+            | Expr::WideStringLiteral(..)
+            | Expr::Char16StringLiteral(..)
+            | Expr::CharLiteral(..)
+            | Expr::Identifier(..)
+            | Expr::StmtExpr(..)
+            | Expr::Alignof(..)
+            | Expr::GnuAlignof(..)
+            | Expr::TypeOperand(..)
+            | Expr::LabelAddr(..)
+            | Expr::BuiltinTypesCompatibleP(..) => {}
+            Expr::BinaryOp(_, lhs, rhs, _)
+            | Expr::Assign(lhs, rhs, _)
+            | Expr::CompoundAssign(_, lhs, rhs, _)
+            | Expr::ArraySubscript(lhs, rhs, _)
+            | Expr::Comma(lhs, rhs, _) => {
+                f(lhs);
+                f(rhs);
+            }
+            Expr::UnaryOp(_, e, _)
+            | Expr::PostfixOp(_, e, _)
+            | Expr::MemberAccess(e, ..)
+            | Expr::PointerMemberAccess(e, ..)
+            | Expr::Cast(_, e, ..)
+            | Expr::VaArg(e, ..)
+            | Expr::ConvertVector(e, ..)
+            | Expr::AlignofExpr(e, _)
+            | Expr::GnuAlignofExpr(e, _)
+            | Expr::AddressOf(e, _)
+            | Expr::Deref(e, _) => f(e),
+            Expr::Conditional(cond, then_e, else_e, _) => {
+                f(cond);
+                f(then_e);
+                f(else_e);
+            }
+            Expr::GnuConditional(cond, else_e, _) => {
+                f(cond);
+                f(else_e);
+            }
+            Expr::FunctionCall(callee, args, _) => {
+                f(callee);
+                args.iter().for_each(&mut *f);
+            }
+            Expr::CompoundLiteral(_, init, _) => init.for_each_expr(f),
+            Expr::Sizeof(arg, _) => {
+                if let SizeofArg::Expr(e) = arg.as_ref() {
+                    f(e);
+                }
+            }
+            Expr::GenericSelection(controlling, associations, _) => {
+                f(controlling);
+                associations.iter().for_each(|a| f(&a.expr));
+            }
+        }
+    }
+
+    /// Calls `f` on each type-name this node itself is written with: a cast,
+    /// compound literal, `va_arg`, `__builtin_convertvector`, `_Alignof` or
+    /// `sizeof` type operand, both `__builtin_types_compatible_p` operands,
+    /// and `_Generic` association types. Exhaustive on purpose.
+    pub fn for_each_type_name<'a>(&'a self, f: &mut dyn FnMut(&'a TypeSpecifier)) {
+        match self {
+            Expr::Cast(ts, ..)
+            | Expr::CompoundLiteral(ts, ..)
+            | Expr::VaArg(_, ts, _)
+            | Expr::ConvertVector(_, ts, _)
+            | Expr::Alignof(ts, _)
+            | Expr::GnuAlignof(ts, _) => f(ts),
+            Expr::Sizeof(arg, _) => {
+                if let SizeofArg::Type(ts) = arg.as_ref() {
+                    f(ts);
+                }
+            }
+            Expr::BuiltinTypesCompatibleP(first, second, ..) => {
+                f(first);
+                f(second);
+            }
+            Expr::TypeOperand(ts, _, _) => f(ts),
+            Expr::GenericSelection(_, associations, _) => {
+                associations
+                    .iter()
+                    .filter_map(|a| a.type_spec.as_ref())
+                    .for_each(f);
+            }
+            Expr::IntLiteral(..)
+            | Expr::UIntLiteral(..)
+            | Expr::LongLiteral(..)
+            | Expr::ULongLiteral(..)
+            | Expr::LongLongLiteral(..)
+            | Expr::ULongLongLiteral(..)
+            | Expr::FloatLiteral(..)
+            | Expr::FloatLiteralF32(..)
+            | Expr::FloatLiteralLongDouble(..)
+            | Expr::FloatLiteralF128(..)
+            | Expr::FloatLiteralDecimal(..)
+            | Expr::ImaginaryLiteral(..)
+            | Expr::ImaginaryLiteralF32(..)
+            | Expr::ImaginaryLiteralLongDouble(..)
+            | Expr::StringLiteral(..)
+            | Expr::WideStringLiteral(..)
+            | Expr::Char16StringLiteral(..)
+            | Expr::CharLiteral(..)
+            | Expr::Identifier(..)
+            | Expr::StmtExpr(..)
+            | Expr::LabelAddr(..)
+            | Expr::BinaryOp(..)
+            | Expr::Assign(..)
+            | Expr::CompoundAssign(..)
+            | Expr::ArraySubscript(..)
+            | Expr::Comma(..)
+            | Expr::UnaryOp(..)
+            | Expr::PostfixOp(..)
+            | Expr::MemberAccess(..)
+            | Expr::PointerMemberAccess(..)
+            | Expr::AlignofExpr(..)
+            | Expr::GnuAlignofExpr(..)
+            | Expr::AddressOf(..)
+            | Expr::Deref(..)
+            | Expr::Conditional(..)
+            | Expr::GnuConditional(..)
+            | Expr::FunctionCall(..) => {}
+        }
+    }
+
+    /// Whether evaluating this expression may have a side effect: a call,
+    /// assignment, increment or decrement, `va_arg`, or statement
+    /// expression anywhere in it. Syntactic and conservative (a call to a
+    /// pure function counts); volatile reads are not considered.
+    pub fn may_have_side_effects(&self) -> bool {
+        let here = match self {
+            Expr::FunctionCall(..)
+            | Expr::Assign(..)
+            | Expr::CompoundAssign(..)
+            | Expr::PostfixOp(..)
+            | Expr::VaArg(..)
+            | Expr::StmtExpr(..) => true,
+            Expr::UnaryOp(op, ..) => matches!(op, UnaryOp::PreInc | UnaryOp::PreDec),
+            _ => false,
+        };
+        let mut found = here;
+        if !found {
+            self.for_each_child(&mut |child| found = found || child.may_have_side_effects());
+        }
+        found
+    }
+
     /// Returns a type-safe identity key for this expression node.
     /// Used as a HashMap key for caching expression types and constant values.
     #[inline]
@@ -1618,6 +2033,7 @@ impl Expr {
             | Expr::AddressOf(_, s)
             | Expr::Deref(_, s)
             | Expr::GenericSelection(_, _, s)
+            | Expr::TypeOperand(_, _, s)
             | Expr::LabelAddr(_, s)
             | Expr::BuiltinTypesCompatibleP(_, _, _, _, s) => *s,
         }
@@ -1629,4 +2045,17 @@ impl Expr {
 /// string) `__PRETTY_FUNCTION__`.
 pub fn is_function_name_builtin(name: &str) -> bool {
     matches!(name, "__func__" | "__FUNCTION__" | "__PRETTY_FUNCTION__")
+}
+
+/// The string a function-name identifier designates: the enclosing
+/// function's name (C11 6.4.2.2p1; GCC's C `__PRETTY_FUNCTION__` is the bare
+/// name too), or, at file scope, where C defines none, GCC 16.2's: `""` for
+/// `__func__` (with a warning) and `__FUNCTION__`, `"top level"` for
+/// `__PRETTY_FUNCTION__` (Clang 23.1.3 agrees on all three).
+pub fn function_name_builtin_text<'a>(name: &str, function: Option<&'a str>) -> &'a str {
+    match function {
+        Some(f) => f,
+        None if name == "__PRETTY_FUNCTION__" => "top level",
+        None => "",
+    }
 }

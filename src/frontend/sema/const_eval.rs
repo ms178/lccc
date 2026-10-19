@@ -69,6 +69,16 @@ pub struct SemaConstEval<'a> {
     /// __builtin_constant_p(n++);` with `b == 0`, `n` untouched).  Elsewhere
     /// an unproven answer stays deferred for inlining and propagation.
     pub folding_initializer: bool,
+    /// The TU is C90/C94 (`-std=c89`/`gnu89`), whose integer constant
+    /// expressions admit an overflowing signed left shift; passed on to the
+    /// type checker's ICE test (see `ice.rs`).
+    pub pre_c99: bool,
+    /// Only C23 named constants (6.6p7) name values: enumerators and
+    /// `constexpr` objects. A plain `const` object's folded value -- GCC's
+    /// static-initializer extension -- is no constant here (`const int k = 1;
+    /// _Static_assert(k, "");` is "not constant": GCC 16.2). Set for static
+    /// assertions; the bottom-up cache, which holds such values, is skipped.
+    pub named_constants_only: bool,
 }
 
 impl<'a> SemaConstEval<'a> {
@@ -77,6 +87,22 @@ impl<'a> SemaConstEval<'a> {
     /// Returns `Some(IrConst)` for expressions that can be fully evaluated using
     /// sema state. Returns `None` for expressions that require lowering state
     /// (global addresses, runtime values, etc.).
+    /// Evaluate an expression the language requires to be constant now --
+    /// the condition of `__builtin_choose_expr` -- in GCC's
+    /// `folding_initializer` mode: `__builtin_constant_p` answers 0 unless
+    /// proven, because the choice is made before any pass could prove more
+    /// (GCC 16.2 and Clang 23.1.3 select `x` in
+    /// `__builtin_choose_expr(__builtin_constant_p(x), 100, x)` for a
+    /// parameter `x`, even when every caller passes a constant).
+    pub fn eval_required_constant(&self, expr: &Expr) -> Option<IrConst> {
+        SemaConstEval {
+            builtin_policy: self.builtin_policy.clone(),
+            folding_initializer: true,
+            ..*self
+        }
+        .eval_const_expr(expr)
+    }
+
     pub fn eval_const_expr(&self, expr: &Expr) -> Option<IrConst> {
         // Memoization: if this expression's constant value was already computed
         // during the bottom-up sema walk, return it in O(1).
@@ -97,11 +123,39 @@ impl<'a> SemaConstEval<'a> {
             | Expr::CharLiteral(..)
             | Expr::FloatLiteral(..)
             | Expr::FloatLiteralF32(..)
-            | Expr::FloatLiteralLongDouble(..) => shared_const_eval::eval_literal(expr),
+            | Expr::FloatLiteralLongDouble(..)
+            | Expr::FloatLiteralF128(..) => shared_const_eval::eval_literal(expr),
 
             Expr::UnaryOp(UnaryOp::Plus, inner, _) => self.eval_const_expr(inner),
+            // Of a real operand, `__real__` is the value and `__imag__` a zero
+            // of its type (GCC 16.2 folds both; complex constants are not
+            // modelled here).
+            Expr::UnaryOp(op @ (UnaryOp::RealPart | UnaryOp::ImagPart), inner, _) => {
+                let val = self.eval_const_expr(inner)?;
+                if *op == UnaryOp::RealPart {
+                    return Some(val);
+                }
+                Some(match val {
+                    IrConst::F32(_) => IrConst::F32(0.0),
+                    IrConst::F64(_) => IrConst::F64(0.0),
+                    IrConst::I8(_) => IrConst::I8(0),
+                    IrConst::I16(_) => IrConst::I16(0),
+                    IrConst::I32(_) => IrConst::I32(0),
+                    IrConst::I64(_) => IrConst::I64(0),
+                    IrConst::I128(_) => IrConst::I128(0),
+                    IrConst::Zero => IrConst::Zero,
+                    IrConst::LongDouble(..) | IrConst::D32(_) | IrConst::D64(_) => return None,
+                })
+            }
             Expr::UnaryOp(UnaryOp::Neg, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
+                if matches!(self.const_ctype(inner), Some(CType::Float128)) {
+                    // Negation flips the binary128 sign bit (-0.0Q, -NaN).
+                    let IrConst::I128(bits) = val else {
+                        return None;
+                    };
+                    return Some(IrConst::I128(bits ^ i128::MIN));
+                }
                 let promoted =
                     shared_const_eval::promote_sub_int(val, self.is_expr_unsigned(inner));
                 const_arith::negate_const(promoted)
@@ -140,7 +194,11 @@ impl<'a> SemaConstEval<'a> {
             // Logical NOT
             Expr::UnaryOp(UnaryOp::LogicalNot, inner, _) => {
                 if let Some(val) = self.eval_const_expr(inner) {
-                    Some(IrConst::I64(if val.is_nonzero() { 0 } else { 1 }))
+                    Some(IrConst::I64(if self.const_truth(&val, inner) {
+                        0
+                    } else {
+                        1
+                    }))
                 } else if Self::expr_is_always_nonzero(inner) {
                     Some(IrConst::I64(0))
                 } else {
@@ -171,13 +229,17 @@ impl<'a> SemaConstEval<'a> {
                     let lhs_unsigned = lhs_ctype.as_ref().is_some_and(|ct| ct.is_unsigned());
                     let rhs_size = rhs_ctype.as_ref().map_or(4, |ct| self.ctype_size(ct));
                     let rhs_unsigned = rhs_ctype.as_ref().is_some_and(|ct| ct.is_unsigned());
-                    // F33: _Float128 constants ride the I128 carrier; the
-                    // shared folders would compute on their BITS. Decline
-                    // any 128-bit-float-side binop (sema never produces
-                    // D32/D64 constants, so no decimal check is needed).
+                    // F33: _Float128 constants ride the I128 carrier, so the
+                    // shared folders would compute on their BITS. A binop
+                    // with a _Float128 side folds exactly in binary128 (the
+                    // common type, C23 6.3.1.8); anything it cannot fold
+                    // (pointer operands, constraint violations) declines.
+                    // Sema never produces D32/D64 constants.
                     let wide_side = |ct: &Option<CType>| matches!(ct, Some(CType::Float128));
                     if wide_side(&lhs_ctype) || wide_side(&rhs_ctype) {
-                        return None;
+                        let l128 = shared_const_eval::f128_bytes_of(lv, lhs_ctype.as_ref())?;
+                        let r128 = shared_const_eval::f128_bytes_of(rv, rhs_ctype.as_ref())?;
+                        return shared_const_eval::fold_f128_binop(op, &l128, &r128);
                     }
                     let result = shared_const_eval::eval_binop_with_types(
                         op,
@@ -200,15 +262,15 @@ impl<'a> SemaConstEval<'a> {
                     // LHS is UNKNOWN drops the LHS's side effects (e.g.
                     // `(*q = 10) || 60`); only the LHS-side short-circuit (or a
                     // known-pure LHS constant) permits folding.
-                    let l_nonzero = l.as_ref().is_some_and(|v| v.is_nonzero())
+                    let l_nonzero = l.as_ref().is_some_and(|v| self.const_truth(v, lhs))
                         || Self::expr_is_always_nonzero(lhs);
-                    let r_nonzero = r.as_ref().is_some_and(|v| v.is_nonzero())
+                    let r_nonzero = r.as_ref().is_some_and(|v| self.const_truth(v, rhs))
                         || Self::expr_is_always_nonzero(rhs);
                     if l_nonzero || (r_nonzero && l.is_some()) {
                         return Some(IrConst::I64(1));
                     }
-                    if l.as_ref().is_some_and(|v| !v.is_nonzero())
-                        && r.as_ref().is_some_and(|v| !v.is_nonzero())
+                    if l.as_ref().is_some_and(|v| !self.const_truth(v, lhs))
+                        && r.as_ref().is_some_and(|v| !self.const_truth(v, rhs))
                     {
                         return Some(IrConst::I64(0));
                     }
@@ -219,14 +281,14 @@ impl<'a> SemaConstEval<'a> {
                     // LHS is UNKNOWN drops the LHS's side effects; only the
                     // LHS-side short-circuit (or a known-pure LHS constant) is
                     // safe to fold.
-                    if l.as_ref().is_some_and(|v| !v.is_nonzero())
-                        || (r.as_ref().is_some_and(|v| !v.is_nonzero()) && l.is_some())
+                    if l.as_ref().is_some_and(|v| !self.const_truth(v, lhs))
+                        || (r.as_ref().is_some_and(|v| !self.const_truth(v, rhs)) && l.is_some())
                     {
                         return Some(IrConst::I64(0));
                     }
-                    let l_nonzero = l.as_ref().is_some_and(|v| v.is_nonzero())
+                    let l_nonzero = l.as_ref().is_some_and(|v| self.const_truth(v, lhs))
                         || Self::expr_is_always_nonzero(lhs);
-                    let r_nonzero = r.as_ref().is_some_and(|v| v.is_nonzero())
+                    let r_nonzero = r.as_ref().is_some_and(|v| self.const_truth(v, rhs))
                         || Self::expr_is_always_nonzero(rhs);
                     if l_nonzero && r_nonzero {
                         return Some(IrConst::I64(1));
@@ -240,15 +302,38 @@ impl<'a> SemaConstEval<'a> {
                 let target_ctype = self.type_spec_to_ctype(target_type);
                 let src_val = self.eval_const_expr(inner)?;
 
-                // Handle float source types: use value-based conversion
-                // For LongDouble, use full x87 precision for integer conversions
-                if let IrConst::LongDouble(fv, bytes) = &src_val {
-                    return self.cast_long_double_to_ctype(*fv, bytes, &target_ctype);
+                // _Float128 on either side converts by value (its I128
+                // carrier is not an integer: `(int)2.75Q` is 2, and
+                // `(_Float128)3` is binary128 3.0, not the bit pattern 3).
+                let src_ctype = self.const_ctype(inner);
+                if target_ctype == CType::Float128 {
+                    let bytes = shared_const_eval::f128_bytes_of(&src_val, src_ctype.as_ref())?;
+                    return Some(IrConst::I128(u128::from_le_bytes(bytes) as i128));
                 }
-                if let Some(fv) = src_val.to_f64() {
-                    if matches!(&src_val, IrConst::F32(_) | IrConst::F64(_)) {
-                        return self.cast_float_to_ctype(fv, &target_ctype);
-                    }
+                if matches!(src_ctype, Some(CType::Float128)) {
+                    let IrConst::I128(bits) = src_val else {
+                        return None;
+                    };
+                    return shared_const_eval::f128_to_ctype(
+                        &(bits as u128).to_le_bytes(),
+                        &target_ctype,
+                    );
+                }
+
+                // Handle float source types: use value-based conversion.
+                // A long double converts from its value in the target format
+                // (x87: 64-bit significand), never from its f64 shadow.
+                if let IrConst::LongDouble(_, bytes) = &src_val {
+                    let value = crate::common::long_double::long_double_value_bytes(bytes);
+                    return shared_const_eval::f128_to_ctype(&value, &target_ctype);
+                }
+                // float/double are exact in binary128, so one converter
+                // serves every binary floating source (target-width `long`,
+                // target-signedness `char`, single rounding to `float`).
+                if let IrConst::F32(_) | IrConst::F64(_) = src_val {
+                    let fv = src_val.to_f64()?;
+                    let value = crate::common::long_double::f64_to_f128_bytes_lossless(fv);
+                    return shared_const_eval::f128_to_ctype(&value, &target_ctype);
                 }
 
                 // Handle I128 source: use full 128-bit value to avoid truncation
@@ -316,25 +401,48 @@ impl<'a> SemaConstEval<'a> {
                 self.bits_to_irconst(truncated, &target_ctype, target_signed)
             }
 
+            // A member of a C23 `constexpr` structure or union object, reached
+            // by `.` from the object (`s.a.b`), is a named constant (6.6p7).
+            Expr::MemberAccess(..) => {
+                let mut path = String::new();
+                let mut cur = expr;
+                while let Expr::MemberAccess(base, field, _) = cur {
+                    path.insert_str(0, field);
+                    path.insert(0, '.');
+                    cur = base;
+                }
+                let Expr::Identifier(name, _) = cur else {
+                    return None;
+                };
+                Some(self.symbols.constexpr_member(name, &path)?.to_ir_const())
+            }
+
             // Identifier: enum constants
             Expr::Identifier(name, _) => {
                 // Objects and enumerators share the ordinary-identifier
-                // namespace.  Pick the lexically nearer declaration before
-                // considering its value; otherwise a file-scope enumerator can
-                // turn a shadowing automatic object into a constant.
-                let symbol = self.symbols.lookup_with_depth(name);
-                let enumerator = self.types.enum_constant_with_depth(name);
-                if let Some((_, symbol_depth)) = symbol {
-                    // Equal depths are the enumerator's companion symbol-table
-                    // entry; only a strictly nearer symbol shadows it.
-                    if enumerator.is_none_or(|(_, enum_depth)| symbol_depth > enum_depth) {
-                        return self.symbols.folded_value(name).map(|val| match val {
-                            FoldedValue::Int(v) => IrConst::I64(v),
-                            FoldedValue::Float(v) => IrConst::F64(v),
-                        });
-                    }
+                // namespace (C11 6.2.3), so the innermost visible declaration
+                // decides. A folded const object's value comes first; any other
+                // object, function or typedef hides an enumerator of the same
+                // name (`enum { A = 1 }; void f(void) { int A = 5;
+                // _Static_assert(A, ""); }` is not constant: GCC 16.2).
+                if let Some(val) = self
+                    .symbols
+                    .folded_value(name)
+                    .filter(|_| !self.named_constants_only || self.symbols.is_constexpr(name))
+                {
+                    return Some(val.to_ir_const());
                 }
-                enumerator.map(|(constant, _)| IrConst::I64(constant.value))
+                if self
+                    .symbols
+                    .lookup_ordinary(name)
+                    .is_some_and(|(_, enumerator)| !enumerator)
+                {
+                    return None;
+                }
+                self.types
+                    .enum_constants
+                    .get(name)
+                    .map(|constant| IrConst::I64(constant.value))
             }
 
             // sizeof
@@ -416,7 +524,7 @@ impl<'a> SemaConstEval<'a> {
             // Ternary conditional
             Expr::Conditional(cond, then_e, else_e, _) => {
                 let cond_val = self.eval_const_expr(cond)?;
-                if cond_val.is_nonzero() {
+                if self.const_truth(&cond_val, cond) {
                     self.eval_const_expr(then_e)
                 } else {
                     self.eval_const_expr(else_e)
@@ -426,7 +534,7 @@ impl<'a> SemaConstEval<'a> {
             // GNU conditional (a ?: b)
             Expr::GnuConditional(cond, else_e, _) => {
                 let cond_val = self.eval_const_expr(cond)?;
-                if cond_val.is_nonzero() {
+                if self.const_truth(&cond_val, cond) {
                     Some(cond_val)
                 } else {
                     self.eval_const_expr(else_e)
@@ -458,63 +566,85 @@ impl<'a> SemaConstEval<'a> {
             Expr::AddressOf(inner, _) => self.eval_offsetof_pattern(inner),
 
             // Handle compile-time builtin function calls in constant expressions.
-            Expr::FunctionCall(func, args, _) => {
-                if let Expr::Identifier(name, _) = func.as_ref() {
-                    if name == "__builtin_constant_p" {
-                        let arg = args.first()?;
-                        let cast_is_nop = |target: &TypeSpecifier| {
-                            let ty = self.type_spec_to_ctype(target);
-                            matches!(ty, CType::Pointer(..))
-                                || (ty.is_integer()
-                                    && ty.size() == crate::common::types::target_ptr_size())
-                        };
-                        if self.eval_const_expr(arg).is_some()
-                            || shared_const_eval::is_string_literal_address(
-                                arg,
-                                &cast_is_nop,
-                                &|e| self.eval_const_expr(e),
-                            )
-                        {
-                            return Some(IrConst::I32(1));
-                        }
-                        // A file-scope object's value is never a compile-time
-                        // constant. Resolve this negative answer even in a
-                        // required integer-constant-expression context (global
-                        // initializer / __builtin_choose_expr). Parameters and
-                        // locals remain deferred so inlining/propagation may
-                        // prove them constant later.
-                        if self.folding_initializer
-                            || matches!(arg, Expr::Identifier(id, _) if self.symbols.lookup_global(id).is_some())
-                        {
-                            return Some(IrConst::I32(0));
-                        }
-                        // The same for a block-scope object with static
-                        // storage (a static local): GCC 16.2 answers 0 for
-                        // any object address, and the kernel's
-                        // PIN_GROUP(.mode = __builtin_choose_expr(
-                        // __builtin_constant_p((m)), (m), 0)) needs the 0
-                        // when `m` is a static-local pin array.
-                        if matches!(arg, Expr::Identifier(id, _) if
-                            self.symbols.lookup(id).is_some()
-                                && !self.symbols.is_automatic_object(id))
-                        {
-                            return Some(IrConst::I32(0));
-                        }
-                        return None;
-                    }
-                    shared_const_eval::eval_builtin_call_with_mode(
-                        name.as_str(),
-                        args,
-                        &|e| self.eval_const_expr(e),
-                        self.builtin_policy.may_assume(name.as_str()),
-                    )
-                } else {
-                    None
-                }
-            }
+            Expr::FunctionCall(func, args, _) => self.eval_call_const(func, args),
 
             _ => None,
         }
+    }
+
+    /// A compile-time builtin call in a constant expression; `None` for any
+    /// other call (and for a builtin whose value is not yet known).
+    fn eval_call_const(&self, func: &Expr, args: &[Expr]) -> Option<IrConst> {
+        let Expr::Identifier(name, _) = func else {
+            return None;
+        };
+        match name.as_str() {
+            "__builtin_classify_type" => {
+                // The argument is not evaluated; a function designator or
+                // array decays (`CType::gcc_type_class`).
+                let class = match args.first() {
+                    Some(arg) => self.infer_expr_ctype(arg)?.gcc_type_class(),
+                    None => 0,
+                };
+                Some(IrConst::I64(class))
+            }
+            "__builtin_choose_expr" if args.len() >= 3 => {
+                let cond = self.eval_required_constant(&args[0])?;
+                self.eval_const_expr(if cond.is_nonzero() {
+                    &args[1]
+                } else {
+                    &args[2]
+                })
+            }
+            "__builtin_constant_p" => self.eval_builtin_constant_p(args.first()?),
+            _ => shared_const_eval::eval_builtin_call_with_mode(
+                name.as_str(),
+                args,
+                &|e| self.eval_const_expr(e),
+                self.builtin_policy.may_assume(name.as_str()),
+            ),
+        }
+    }
+
+    /// `__builtin_constant_p(arg)`: 1 once proven, 0 where the answer can no
+    /// longer change, `None` while later folding may still prove it.
+    fn eval_builtin_constant_p(&self, arg: &Expr) -> Option<IrConst> {
+        let cast_is_nop = |target: &TypeSpecifier| {
+            let ty = self.type_spec_to_ctype(target);
+            matches!(ty, CType::Pointer(..))
+                || (ty.is_integer() && ty.size() == crate::common::types::target_ptr_size())
+        };
+        if self.eval_const_expr(arg).is_some()
+            || shared_const_eval::is_string_literal_address(arg, &cast_is_nop, &|e| {
+                self.eval_const_expr(e)
+            })
+        {
+            return Some(IrConst::I32(1));
+        }
+        // A file-scope object's value is never a compile-time
+        // constant. Resolve this negative answer even in a
+        // required integer-constant-expression context (global
+        // initializer / __builtin_choose_expr). Parameters and
+        // locals remain deferred so inlining/propagation may
+        // prove them constant later.
+        if self.folding_initializer
+            || matches!(arg, Expr::Identifier(id, _) if self.symbols.lookup_global(id).is_some())
+        {
+            return Some(IrConst::I32(0));
+        }
+        // The same for a block-scope object with static
+        // storage (a static local): GCC 16.2 answers 0 for
+        // any object address, and the kernel's
+        // PIN_GROUP(.mode = __builtin_choose_expr(
+        // __builtin_constant_p((m)), (m), 0)) needs the 0
+        // when `m` is a static-local pin array.
+        if matches!(arg, Expr::Identifier(id, _) if
+            self.symbols.lookup(id).is_some()
+                && !self.symbols.is_automatic_object(id))
+        {
+            return Some(IrConst::I32(0));
+        }
+        None
     }
 
     /// Evaluate a constant expression, returning raw u64 bits and signedness.
@@ -706,6 +836,7 @@ impl<'a> SemaConstEval<'a> {
             functions: self.functions,
             expr_types: self.expr_types,
             builtin_policy: self.builtin_policy.clone(),
+            pre_c99: self.pre_c99,
         }
     }
 
@@ -737,53 +868,16 @@ impl<'a> SemaConstEval<'a> {
         false
     }
 
-    /// Cast a long double value (with f128 bytes) to a target CType.
-    /// Uses full precision for integer conversions.
-    fn cast_long_double_to_ctype(
-        &self,
-        fv: f64,
-        bytes: &[u8; 16],
-        target: &CType,
-    ) -> Option<IrConst> {
-        use crate::common::long_double::{
-            f128_bytes_to_i64, f128_bytes_to_i128, f128_bytes_to_u64, f128_bytes_to_u128,
-        };
-        Some(match target {
-            CType::Float => IrConst::F32(fv as f32),
-            CType::Double => IrConst::F64(fv),
-            CType::LongDouble => IrConst::long_double_with_bytes(fv, *bytes),
-            CType::Char => IrConst::I8(f128_bytes_to_i64(bytes)? as i8),
-            CType::UChar => IrConst::I32(f128_bytes_to_u64(bytes)? as u8 as i32),
-            CType::Short => IrConst::I16(f128_bytes_to_i64(bytes)? as i16),
-            CType::UShort => IrConst::I32(f128_bytes_to_u64(bytes)? as u16 as i32),
-            CType::Int => IrConst::I32(f128_bytes_to_i64(bytes)? as i32),
-            CType::UInt => IrConst::I32(f128_bytes_to_u64(bytes)? as u32 as i32),
-            CType::Long | CType::LongLong => IrConst::I64(f128_bytes_to_i64(bytes)?),
-            CType::ULong | CType::ULongLong => IrConst::I64(f128_bytes_to_u64(bytes)? as i64),
-            CType::Bool => IrConst::I8(if fv != 0.0 { 1 } else { 0 }),
-            CType::Int128 => IrConst::I128(f128_bytes_to_i128(bytes)?),
-            CType::UInt128 => IrConst::I128(f128_bytes_to_u128(bytes)? as i128),
-            _ => return None,
-        })
+    /// The C type of a constant operand, for value-dependent folding.
+    fn const_ctype(&self, expr: &Expr) -> Option<CType> {
+        self.lookup_expr_type(expr)
+            .or_else(|| self.infer_expr_ctype(expr))
     }
 
-    /// Cast a float value to a target CType.
-    fn cast_float_to_ctype(&self, fv: f64, target: &CType) -> Option<IrConst> {
-        Some(match target {
-            CType::Float => IrConst::F32(fv as f32),
-            CType::Double => IrConst::F64(fv),
-            CType::LongDouble => IrConst::long_double(fv),
-            CType::Char => IrConst::I8(fv as i8),
-            CType::UChar => IrConst::I32(fv as u8 as i32),
-            CType::Short => IrConst::I16(fv as i16),
-            CType::UShort => IrConst::I32(fv as u16 as i32),
-            CType::Int => IrConst::I32(fv as i32),
-            CType::UInt => IrConst::I32(fv as u32 as i32),
-            CType::Long | CType::LongLong => IrConst::I64(fv as i64),
-            CType::ULong | CType::ULongLong => IrConst::I64(fv as u64 as i64),
-            CType::Bool => IrConst::I8(if fv != 0.0 { 1 } else { 0 }),
-            _ => return None,
-        })
+    /// The truth value of a folded constant (C11 6.3.1.2: `!= 0`), decided by
+    /// its C type: the I128 carrier of -0.0Q or -0.0DL is false, a NaN true.
+    fn const_truth(&self, val: &IrConst, expr: &Expr) -> bool {
+        shared_const_eval::const_truth(val, self.const_ctype(expr).as_ref())
     }
 
     /// Convert raw bits to an IrConst based on target CType.
@@ -968,28 +1062,21 @@ impl<'a> SemaConstEval<'a> {
         name: &Option<String>,
         variants: &Option<Vec<crate::frontend::parser::ast::EnumVariant>>,
         is_packed: bool,
+        underlying: Option<&TypeSpecifier>,
     ) -> crate::common::types::EnumType {
-        let completed = name.as_ref().and_then(|tag| self.types.enum_types.get(tag));
-        let variant_values = match variants {
-            Some(vars) => {
-                let mut result = Vec::with_capacity(vars.len());
-                let mut next_val: i64 = 0;
-                for v in vars {
-                    if let Some(val) = v.value.as_ref().and_then(|e| self.eval_const_expr(e)) {
-                        next_val = val.to_i64().unwrap_or(next_val);
-                    }
-                    result.push((v.name.clone(), next_val));
-                    next_val = next_val.wrapping_add(1);
-                }
-                result
-            }
-            None => completed.map(|et| et.variants.clone()).unwrap_or_default(),
-        };
-        crate::common::types::EnumType {
-            name: name.clone(),
-            variants: variant_values,
-            is_packed: is_packed || completed.is_some_and(|et| et.is_packed),
-        }
+        crate::common::type_builder::enum_type_of(
+            name,
+            variants,
+            is_packed,
+            name.as_ref().and_then(|tag| self.types.enum_types.get(tag)),
+            underlying.map(|u| self.ctype_from_type_spec(u)),
+            |v| {
+                v.value
+                    .as_ref()
+                    .and_then(|e| self.eval_const_expr(e))
+                    .and_then(|c| c.to_i64())
+            },
+        )
     }
 
     /// Compute sizeof for a type specifier.
@@ -999,7 +1086,10 @@ impl<'a> SemaConstEval<'a> {
         let ptr_sz = target_ptr_size();
         match spec {
             TypeSpecifier::Void => Some(0),
-            TypeSpecifier::Char | TypeSpecifier::UnsignedChar => Some(1),
+            TypeSpecifier::Char
+            | TypeSpecifier::SignedChar
+            | TypeSpecifier::UnsignedChar
+            | TypeSpecifier::PlainUnsignedChar => Some(1),
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => Some(2),
             TypeSpecifier::Int
             | TypeSpecifier::UnsignedInt
@@ -1015,7 +1105,9 @@ impl<'a> SemaConstEval<'a> {
             TypeSpecifier::ComplexFloat => Some(8),
             TypeSpecifier::ComplexDouble => Some(16),
             TypeSpecifier::ComplexLongDouble => Some(if ptr_sz == 4 { 24 } else { 32 }),
-            TypeSpecifier::Pointer(_, _) | TypeSpecifier::FunctionPointer(_, _, _) => Some(ptr_sz),
+            TypeSpecifier::Pointer(_, _)
+            | TypeSpecifier::FunctionPointer(_, _, _)
+            | TypeSpecifier::NullPtrT => Some(ptr_sz),
             TypeSpecifier::Array(elem, Some(size)) => {
                 let elem_size = self.sizeof_type_spec(elem)?;
                 let n = self.eval_const_expr(size)?.to_i64()?;
@@ -1089,8 +1181,8 @@ impl<'a> SemaConstEval<'a> {
                 }
                 Some(0)
             }
-            TypeSpecifier::Enum(name, variants, is_packed) => Some(
-                self.resolve_enum_type(name, variants, *is_packed)
+            TypeSpecifier::Enum(name, variants, is_packed, underlying) => Some(
+                self.resolve_enum_type(name, variants, *is_packed, underlying.as_deref())
                     .packed_size(),
             ),
             TypeSpecifier::TypedefName(name) => {
@@ -1159,7 +1251,10 @@ impl<'a> SemaConstEval<'a> {
         let ptr_sz = target_ptr_size();
         match spec {
             TypeSpecifier::Void | TypeSpecifier::Bool => 1,
-            TypeSpecifier::Char | TypeSpecifier::UnsignedChar => 1,
+            TypeSpecifier::Char
+            | TypeSpecifier::SignedChar
+            | TypeSpecifier::UnsignedChar
+            | TypeSpecifier::PlainUnsignedChar => 1,
             TypeSpecifier::Short | TypeSpecifier::UnsignedShort => 2,
             TypeSpecifier::Int
             | TypeSpecifier::UnsignedInt
@@ -1205,7 +1300,9 @@ impl<'a> SemaConstEval<'a> {
                     16
                 }
             }
-            TypeSpecifier::Pointer(_, _) | TypeSpecifier::FunctionPointer(_, _, _) => ptr_sz,
+            TypeSpecifier::Pointer(_, _)
+            | TypeSpecifier::FunctionPointer(_, _, _)
+            | TypeSpecifier::NullPtrT => ptr_sz,
             TypeSpecifier::Array(elem, _) => self.alignof_type_spec(elem),
             TypeSpecifier::Struct(
                 tag,
@@ -1270,8 +1367,13 @@ impl<'a> SemaConstEval<'a> {
                 }
                 struct_aligned.unwrap_or(1)
             }
-            TypeSpecifier::Enum(name, variants, is_packed) => {
-                let enum_type = CType::Enum(self.resolve_enum_type(name, variants, *is_packed));
+            TypeSpecifier::Enum(name, variants, is_packed, underlying) => {
+                let enum_type = CType::Enum(self.resolve_enum_type(
+                    name,
+                    variants,
+                    *is_packed,
+                    underlying.as_deref(),
+                ));
                 enum_type.align_ctx(&*self.types.borrow_struct_layouts())
             }
             TypeSpecifier::TypedefName(name) => {
@@ -1336,10 +1438,10 @@ impl<'a> SemaConstEval<'a> {
             }
             TypeSpecifier::TypeofType(inner) => self.preferred_alignof_type_spec(inner),
             // An 8-byte enum prefers 8 like `long long` (GCC `__alignof__`, -m32).
-            TypeSpecifier::Enum(name, variants, is_packed) => {
-                CType::Enum(self.resolve_enum_type(name, variants, *is_packed))
-                    .preferred_align_ctx(&*self.types.borrow_struct_layouts())
-            }
+            TypeSpecifier::Enum(name, variants, is_packed, underlying) => CType::Enum(
+                self.resolve_enum_type(name, variants, *is_packed, underlying.as_deref()),
+            )
+            .preferred_align_ctx(&*self.types.borrow_struct_layouts()),
             TypeSpecifier::Typeof(expr, _) => {
                 if let Some(ctype) = self.infer_expr_ctype(expr) {
                     ctype.preferred_align_ctx(&*self.types.borrow_struct_layouts())
@@ -1437,7 +1539,9 @@ impl<'a> SemaConstEval<'a> {
             TypeSpecifier::Void => CType::Void,
             TypeSpecifier::Bool => CType::Bool,
             TypeSpecifier::Char => CType::Char,
+            TypeSpecifier::SignedChar => CType::SChar,
             TypeSpecifier::UnsignedChar => CType::UChar,
+            TypeSpecifier::PlainUnsignedChar => CType::PlainUChar,
             TypeSpecifier::Short => CType::Short,
             TypeSpecifier::UnsignedShort => CType::UShort,
             TypeSpecifier::Int | TypeSpecifier::Signed => CType::Int,
@@ -1521,9 +1625,9 @@ impl<'a> SemaConstEval<'a> {
                     CType::Int // anonymous union without context
                 }
             }
-            TypeSpecifier::Enum(name, variants, is_packed) => {
-                CType::Enum(self.resolve_enum_type(name, variants, *is_packed))
-            }
+            TypeSpecifier::Enum(name, variants, is_packed, underlying) => CType::Enum(
+                self.resolve_enum_type(name, variants, *is_packed, underlying.as_deref()),
+            ),
             TypeSpecifier::TypeofType(inner) => self.ctype_from_type_spec(inner),
             TypeSpecifier::FunctionPointer(_, _, _) => {
                 CType::Pointer(Box::new(CType::Void), AddressSpace::Default) // function pointers are pointer-sized

@@ -15,21 +15,24 @@
 # SEGMENT CAP is the binding rejector under the default policy. This
 # script pins the current facts:
 #
-#   default (reach=6, cap=1):   v94 is rejected by BOTH gates — the
-#     pressure profile shifted again with the IVSR marching-pointer
-#     recurrence (2026-10-12: the pair loop's two loop-carried pointer
-#     webs push the covered blocks to a 23/12 peak, so the reach band now
-#     rejects too, `covers_reachable=false`), and the one-segment cap
-#     rejects independently ("2 segments > 1") — nothing is applied;
+#   default (reach=6, cap=1):   the band ADMITS v94 (covers_reachable=
+#     true) and the one-segment cap is the binding rejector ("2 segments
+#     > 1") — nothing is applied. (History: the 2026-10-12 IVSR recurrence
+#     pushed the covered blocks to a 23/12 peak and the band rejected too;
+#     since phi incomings are live only on their predecessor edges
+#     (liveness.rs, 2026-10-18) the peaks are 13-16/12 and every
+#     over-budget block lies inside v94's segments.)
 #   reach=999, cap=1:           the band admits at wide reach
 #     (covers_reachable=true) but the cap still rejects (the cap is
 #     reach-independent);
-#   reach=6, cap=2:             the band is now the BINDING rejector
-#     (`covers_reachable=false`, silent — no rejected line) — nothing is
-#     applied at the default reach.  (Historical: before the 2026-10-12
-#     pressure shift this cell ADMITTED and applied exactly one remat;
-#     the machinery's positive path is still pinned by the `open` cell
-#     below, so application coverage is not lost.)
+#   reach=6, cap=2:             both gates admit: exactly one remat (v94,
+#     globaladdr) applies, and the assembly is BYTE-IDENTICAL to the
+#     default plan — under exact liveness the remat no longer reorders the
+#     FP-loop colouring (the +28/+88 above), so the cap costs nothing here
+#     and any future divergence fails this cell for re-measurement;
+#   reach=0, cap=2:             the band is the binding rejector
+#     (`covers_reachable=false`, silent) — nothing is applied, so the band
+#     itself keeps deterministic coverage independent of pressure drift;
 #   reach=999, cap=2:           BOTH gates open -> exactly one remat
 #     applies.
 #
@@ -75,7 +78,11 @@ CCC=${CCC:-./target/fastbuild/lccc}
 CCC="$(cd "$(dirname "$CCC")" && pwd)/$(basename "$CCC")"
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 src="$dir/../benchmark/programs/nbody.c"
-fire_src="$dir/../benchmark/programs/zlib_ng_adler32.c"
+# The master-gate leg needs a TU the default policy edits. zlib_ng_adler32
+# stopped firing once phi incomings became edge-live (no block of its main
+# exceeds the budget, so remat buys nothing there); the dedicated trampoline
+# test is built to stay over budget at its fan-out block.
+fire_src="$dir/gla_remat_trampoline.c"
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/lccc-gla-remat.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
@@ -100,10 +107,10 @@ must_not_grep() { # must_not_grep PAT FILE [description]
   fi
 }
 
-# --- default policy: BOTH gates reject (band + one-segment cap) --------
+# --- default policy: the band admits, the one-segment cap rejects ------
 run_trace default
 must_grep 'v94' "$tmp/default.log"
-must_grep 'v94 .*segments=2 covers_reachable=false' "$tmp/default.log"
+must_grep 'v94 .*segments=2 covers_reachable=true' "$tmp/default.log"
 must_grep 'rejected: 2 segments > 1' "$tmp/default.log"
 must_not_grep '\[GLA\] main applied:' "$tmp/default.log" \
   "default policy edited nbody"
@@ -115,11 +122,20 @@ must_grep 'rejected: 2 segments > 1' "$tmp/capshut.log"
 must_not_grep '\[GLA\] main applied:' "$tmp/capshut.log" \
   "segment cap did not reject nbody"
 
-# --- segment cap open, default reach: the BAND is the binding rejector --
+# --- segment cap open, default reach: one remat, codegen-neutral -------
 run_trace bandadmits CCC_GLA_REMAT_MAX_SEGMENTS=2
-must_grep 'v94 .*segments=2 covers_reachable=false' "$tmp/bandadmits.log"
-must_not_grep '\[GLA\] main applied:' "$tmp/bandadmits.log" \
-  "default reach must not apply a two-segment remat"
+must_grep 'v94 .*segments=2 covers_reachable=true' "$tmp/bandadmits.log"
+must_grep '\[GLA\] main applied: 1 values \(1 remat' "$tmp/bandadmits.log"
+cmp -s "$tmp/default.s" "$tmp/bandadmits.s" || {
+  >&2 echo "FAIL: the admitted two-segment remat changed nbody's code (pinned: identical to the default plan; re-measure before relaxing the cap)"
+  exit 1
+}
+
+# --- reach shut, cap open: the BAND is the binding rejector -------------
+run_trace bandrejects CCC_GLA_REACH=0 CCC_GLA_REMAT_MAX_SEGMENTS=2
+must_grep 'v94 .*segments=2 covers_reachable=false' "$tmp/bandrejects.log"
+must_not_grep '\[GLA\] main applied:' "$tmp/bandrejects.log" \
+  "reach 0 must not apply a remat"
 
 # --- both gates open: the candidate applies -----------------------------
 run_trace open CCC_GLA_REACH=999 CCC_GLA_REMAT_MAX_SEGMENTS=2
@@ -146,8 +162,8 @@ fi
 #     is UNSET and silences for every documented off token ----------------
 env -u CCC_RA_GLOBAL_LOCATION CCC_DEBUG_SPLIT=1 CCC_GLA_TRACE=1 \
   "$CCC" -O2 -S -o "$tmp/fire-default.s" "$fire_src" 2>"$tmp/fire-default.log"
-must_grep '\[GLA\] main applied:' "$tmp/fire-default.log" \
-  "GLA did not default-ON on adler32"
+must_grep '\[GLA\] select_ptr_64 applied:' "$tmp/fire-default.log" \
+  "GLA did not default-ON on gla_remat_trampoline"
 CCC_RA_GLOBAL_LOCATION=0 CCC_DEBUG_SPLIT=1 CCC_GLA_TRACE=1 \
   "$CCC" -O2 -S -o "$tmp/fire-off.s" "$fire_src" 2>"$tmp/fire-off.log"
 must_not_grep 'applied:' "$tmp/fire-off.log" "=0 did not disable GLA"

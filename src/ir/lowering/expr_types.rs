@@ -6,6 +6,7 @@
 
 use super::lower::Lowerer;
 use crate::common::fx_hash::FxHashMap;
+use crate::common::qualifiers;
 use crate::common::types::{AddressSpace, CType, IrType, target_int_ir_type, widened_op_type};
 use crate::frontend::parser::ast::{
     BinOp, BlockItem, CompoundStmt, Expr, GenericAssociation, Initializer, Stmt, TypeSpecifier,
@@ -56,6 +57,23 @@ pub(super) fn bitfield_promoted_type(field_ty: IrType, bf_info: Option<(u32, u32
         }
     } else {
         field_ty
+    }
+}
+
+impl qualifiers::ConstLookup for Lowerer {
+    fn object_const_base(&self, name: &str) -> bool {
+        self.lookup_var_info(name).is_some_and(|v| v.base_const)
+    }
+
+    fn typedef_const_base(&self, name: &str) -> bool {
+        self.types.const_base_typedefs.contains(name)
+    }
+
+    fn is_pointer(&self, expr: &Expr) -> bool {
+        matches!(
+            self.get_expr_ctype(expr),
+            Some(CType::Pointer(..) | CType::Array(..))
+        )
     }
 }
 
@@ -431,12 +449,19 @@ impl Lowerer {
             "__builtin_inf" | "__builtin_huge_val" => Some(IrType::F64),
             "__builtin_inff" | "__builtin_huge_valf" => Some(IrType::F32),
             "__builtin_infl" | "__builtin_huge_vall" => Some(IrType::F128),
-            "__builtin_inff128" | "__builtin_huge_valf128" | "__builtin_nanf128" => {
-                Some(IrType::F128)
-            }
-            "__builtin_nan" => Some(IrType::F64),
-            "__builtin_nanf" => Some(IrType::F32),
-            "__builtin_nanl" => Some(IrType::F128),
+            // _Float128 constants are binary128 bit patterns in the U128
+            // carrier (F128 is the x87 long double type).
+            "__builtin_inff128"
+            | "__builtin_huge_valf128"
+            | "__builtin_nanf128"
+            | "__builtin_nansf128"
+            | "__builtin_infq"
+            | "__builtin_huge_valq"
+            | "__builtin_nanq"
+            | "__builtin_nansq" => Some(IrType::U128),
+            "__builtin_nan" | "__builtin_nans" => Some(IrType::F64),
+            "__builtin_nanf" | "__builtin_nansf" => Some(IrType::F32),
+            "__builtin_nanl" | "__builtin_nansl" => Some(IrType::F128),
             "__builtin_fma"
             | "__builtin_trunc"
             | "__builtin_rint"
@@ -536,7 +561,10 @@ impl Lowerer {
             // _Float128-specific builtins: results are 16-byte binary128 BIT
             // PATTERNS (U128). Returning F128 here makes the caller cast
             // F128->U128 via __fixunstfti, corrupting the value.
-            "__builtin_copysignf128" | "__builtin_fabsf128" => Some(IrType::U128),
+            "__builtin_copysignf128"
+            | "__builtin_fabsf128"
+            | "__builtin_copysignq"
+            | "__builtin_fabsq" => Some(IrType::U128),
             // Integer-returning classification builtins
             "__builtin_fpclassify"
             | "__builtin_isnan"
@@ -979,57 +1007,37 @@ impl Lowerer {
         controlling: &Expr,
         associations: &'a [GenericAssociation],
     ) -> Option<&'a Expr> {
-        // For _Generic, compute the controlling expression's type fresh to avoid
-        // stale cached values that may have been computed before the controlling
-        // expression's dependencies were fully available.
-        let controlling_ctype = self
-            .get_expr_ctype_lowerer(controlling)
-            .or_else(|| self.lookup_sema_expr_type(controlling));
+        // C23 6.5.1.1p2: an expression operand undergoes lvalue conversion
+        // (array and function decay included); a type operand (C2y) none.
+        // Its type is computed fresh, not from the ExprId cache, which can
+        // hold a type computed before the operand's declarations were seen.
+        let controlling_ctype = match controlling {
+            Expr::TypeOperand(ts, ..) => Some(self.type_spec_to_ctype(ts)),
+            _ => self
+                .get_expr_ctype_lowerer(controlling)
+                .or_else(|| self.lookup_sema_expr_type(controlling))
+                .map(|ct| ct.decayed_value_ctype()),
+        };
+        let (ctrl_is_const, compare_const) =
+            qualifiers::controlling_const(controlling, associations, self);
         let controlling_ir_type = self.get_expr_type(controlling);
-        // Per C11 6.5.1.1p2, lvalue conversion includes array-to-pointer and
-        // function-to-pointer decay; one shared spelling of that conversion.
-        let controlling_ctype = controlling_ctype.map(|ct| ct.decayed_value_ctype());
-        // Lvalue conversion also strips top-level qualifiers.
-        // Only use ctrl_is_const for pointer types (where it reflects pointee constness).
-        let ctrl_is_const = if let Some(ref ct) = controlling_ctype {
-            matches!(ct, CType::Pointer(_, _)) && self.expr_is_const_qualified(controlling)
-        } else {
-            false
-        };
-        let has_const_diff = {
-            let non_default: Vec<_> = associations
-                .iter()
-                .filter(|a| a.type_spec.is_some())
-                .collect();
-            let assocs_differ =
-                non_default.iter().any(|a| a.is_const) && non_default.iter().any(|a| !a.is_const);
-            assocs_differ || ctrl_is_const
-        };
         let mut default_expr: Option<&Expr> = None;
         for assoc in associations {
-            match &assoc.type_spec {
-                None => {
-                    default_expr = Some(&assoc.expr);
+            let Some(type_spec) = &assoc.type_spec else {
+                default_expr = Some(&assoc.expr);
+                continue;
+            };
+            let matches = match &controlling_ctype {
+                Some(ctrl_ct) => {
+                    ctrl_ct.generic_association_matches(&self.type_spec_to_ctype(type_spec))
                 }
-                Some(type_spec) => {
-                    let assoc_ctype = self.type_spec_to_ctype(type_spec);
-                    if let Some(ref ctrl_ct) = controlling_ctype {
-                        if self.ctype_matches_generic(ctrl_ct, &assoc_ctype) {
-                            if has_const_diff && assoc.is_const != ctrl_is_const {
-                                continue;
-                            }
-                            return Some(&assoc.expr);
-                        }
-                    } else {
-                        let assoc_ir_type = self.type_spec_to_ir(type_spec);
-                        if assoc_ir_type == controlling_ir_type {
-                            if has_const_diff && assoc.is_const != ctrl_is_const {
-                                continue;
-                            }
-                            return Some(&assoc.expr);
-                        }
-                    }
-                }
+                None => self.type_spec_to_ir(type_spec) == controlling_ir_type,
+            };
+            if matches
+                && (!compare_const
+                    || qualifiers::association_const_base(assoc, self) == ctrl_is_const)
+            {
+                return Some(&assoc.expr);
             }
         }
         default_expr
@@ -1060,14 +1068,49 @@ impl Lowerer {
 
     /// Resolve __builtin_choose_expr(const_expr, expr1, expr2) to the selected branch.
     /// Returns a reference to args[1] if the condition is nonzero, or args[2] otherwise.
-    fn resolve_builtin_choose_expr<'a>(&self, args: &'a [Expr]) -> &'a Expr {
-        let cond = self.eval_const_expr(&args[0]);
-        let is_nonzero = match cond {
-            Some(IrConst::I64(v)) => v != 0,
-            Some(IrConst::I32(v)) => v != 0,
-            _ => true,
-        };
+    pub(super) fn resolve_builtin_choose_expr<'a>(&self, args: &'a [Expr]) -> &'a Expr {
+        // Sema has proven the condition an integer constant expression
+        // (`sema/ice.rs`), so it folds here; any constant width selects by
+        // its value.
+        let is_nonzero = self
+            .eval_required_constant(&args[0])
+            .is_none_or(|c| c.is_nonzero());
         if is_nonzero { &args[1] } else { &args[2] }
+    }
+
+    /// `__builtin_classify_type(arg)` ([`CType::gcc_type_class`]); a
+    /// function designator decays to a pointer, unless a local object hides
+    /// the function's name.
+    pub(super) fn classify_type_of(&self, arg: Option<&Expr>) -> i64 {
+        let Some(arg) = arg else {
+            return 0;
+        };
+        if let Expr::Identifier(name, _) = arg {
+            let local = self
+                .func_state
+                .as_ref()
+                .is_some_and(|fs| fs.locals.contains_key(name.as_str()));
+            if !local && self.known_functions.contains(name.as_str()) {
+                return 5;
+            }
+        }
+        self.expr_ctype(arg).gcc_type_class()
+    }
+
+    /// The operand `__builtin_choose_expr(c, a, b)` designates, when `expr`
+    /// is one: the selected arm, which keeps its value category (GCC: the
+    /// result is an lvalue iff the chosen operand is), so stores, member
+    /// stores and `&` go through it instead of a materialized call result.
+    pub(super) fn choose_expr_selected<'a>(&self, expr: &'a Expr) -> Option<&'a Expr> {
+        match expr {
+            Expr::FunctionCall(callee, args, _)
+                if args.len() >= 3
+                    && matches!(&**callee, Expr::Identifier(n, _) if n == "__builtin_choose_expr") =>
+            {
+                Some(self.resolve_builtin_choose_expr(args))
+            }
+            _ => None,
+        }
     }
 
     // expr_is_const_qualified is defined in expr.rs as pub(super)
@@ -1245,8 +1288,8 @@ impl Lowerer {
                 if crate::frontend::parser::ast::is_function_name_builtin(name) {
                     return IrType::Ptr;
                 }
-                if let Some(constant) = self.types.enum_constants.get(name) {
-                    return IrType::from_ctype(&constant.ty);
+                if let Some((_, ty)) = self.identifier_enumerator(expr, name) {
+                    return IrType::from_ctype(&ty);
                 }
                 if let Some(vi) = self.lookup_var_info(name) {
                     if vi.is_array {
@@ -1497,6 +1540,55 @@ impl Lowerer {
         self.sema_expr_types.get(&expr.id()).cloned()
     }
 
+    /// The type of the `?:` `expr` with arms `then_expr`/`else_expr` (C11
+    /// 6.5.15p3-p6).
+    ///
+    /// Whether a `void *` arm is a null pointer constant picks between that
+    /// arm's type and the other's, and takes the integer-constant-expression
+    /// rules -- enumerators, `(void *)(N - N)`, qualified-pointee typedefs --
+    /// that sema implements exactly (`ExprTypeChecker::is_null_pointer_constant`)
+    /// and the syntactic `const_arith` test approximates. Sema typed this very
+    /// conditional with them, so its annotation decides; it is trusted only
+    /// when it equals one of the two possible outcomes, so an annotation of
+    /// another node at a reused address can never inject a type. The
+    /// syntactic test stays the fallback for expressions sema never typed.
+    fn conditional_expr_ctype(
+        &self,
+        expr: &Expr,
+        then_expr: &Expr,
+        else_expr: &Expr,
+    ) -> Option<CType> {
+        use crate::common::const_arith::is_null_pointer_constant;
+        let then_ct = self.get_expr_ctype(then_expr);
+        let else_ct = self.get_expr_ctype(else_expr);
+        let compose = |then_is_npc: bool, else_is_npc: bool| {
+            CType::conditional_composite_type(
+                then_ct.clone(),
+                else_ct.clone(),
+                then_is_npc,
+                else_is_npc,
+            )
+        };
+        let then_matters = CType::conditional_arm_npc_matters(then_ct.as_ref(), else_ct.as_ref());
+        let else_matters = CType::conditional_arm_npc_matters(else_ct.as_ref(), then_ct.as_ref());
+        if then_matters || else_matters {
+            if let Some(sema) = self.lookup_sema_expr_type(expr) {
+                let npc = compose(then_matters, else_matters);
+                if npc.as_ref() == Some(&sema) {
+                    return npc;
+                }
+                let not_npc = compose(false, false);
+                if not_npc.as_ref() == Some(&sema) {
+                    return not_npc;
+                }
+            }
+        }
+        compose(
+            is_null_pointer_constant(then_expr),
+            is_null_pointer_constant(else_expr),
+        )
+    }
+
     /// Get the full CType of an expression by recursion.
     /// Returns None if the type cannot be determined from CType tracking.
     ///
@@ -1586,6 +1678,9 @@ impl Lowerer {
     fn get_expr_ctype_lowerer(&self, expr: &Expr) -> Option<CType> {
         match expr {
             Expr::Identifier(name, _) => {
+                if let Some((_, ty)) = self.identifier_enumerator(expr, name) {
+                    return Some(ty);
+                }
                 if let Some(vi) = self.lookup_var_info(name) {
                     return vi.c_type.clone();
                 }
@@ -1599,9 +1694,6 @@ impl Lowerer {
                             variadic: func_info.variadic,
                         },
                     )));
-                }
-                if let Some(constant) = self.types.enum_constants.get(name) {
-                    return Some(constant.ty.clone());
                 }
                 None
             }
@@ -1676,25 +1768,13 @@ impl Lowerer {
             Expr::Assign(lhs, _, _) | Expr::CompoundAssign(_, lhs, _, _) => {
                 self.get_expr_ctype(lhs)
             }
+            // The arms' lvalue conversion (`1 ? arr : (int *)0` is an
+            // `int *`) happens inside the shared composite rule.
             Expr::Conditional(_, then_expr, else_expr, _) => {
-                use crate::common::const_arith::is_null_pointer_constant;
-                // The arms' lvalue conversion (`1 ? arr : (int *)0` is an
-                // `int *`) happens inside the shared composite rule.
-                CType::conditional_composite_type(
-                    self.get_expr_ctype(then_expr),
-                    self.get_expr_ctype(else_expr),
-                    is_null_pointer_constant(then_expr),
-                    is_null_pointer_constant(else_expr),
-                )
+                self.conditional_expr_ctype(expr, then_expr, else_expr)
             }
             Expr::GnuConditional(cond, else_expr, _) => {
-                use crate::common::const_arith::is_null_pointer_constant;
-                CType::conditional_composite_type(
-                    self.get_expr_ctype(cond),
-                    self.get_expr_ctype(else_expr),
-                    is_null_pointer_constant(cond),
-                    is_null_pointer_constant(else_expr),
-                )
+                self.conditional_expr_ctype(expr, cond, else_expr)
             }
             // The comma operator yields the right operand's *value*
             // (C11 6.5.17p3), so the result undergoes lvalue conversion:
@@ -1702,7 +1782,10 @@ impl Lowerer {
             Expr::Comma(_, last, _) => self.get_expr_ctype(last).map(|ct| ct.decayed_value_ctype()),
             Expr::StringLiteral(_, _) => {
                 // String literals have type char[] which decays to char*
-                Some(CType::Pointer(Box::new(CType::Char), AddressSpace::Default))
+                Some(CType::Pointer(
+                    Box::new(CType::plain_char()),
+                    AddressSpace::Default,
+                ))
             }
             Expr::BinaryOp(op, lhs, rhs, _) => self.get_binop_ctype(op, lhs, rhs),
             // Literal types for _Generic support
@@ -1805,6 +1888,16 @@ impl Lowerer {
                     // Fall back to sema's authoritative function signatures
                     if let Some(func_info) = self.sema_functions.get(sig_key.as_str()) {
                         return Some(func_info.return_type.clone());
+                    }
+                    // An undeclared builtin is typed by sema's builtin table
+                    // (`typeof(__builtin_nan(""))` is double, not the
+                    // implicit-int fallback).
+                    if let Some(ct) =
+                        crate::frontend::sema::type_checker::ExprTypeChecker::builtin_return_ctype(
+                            name,
+                        )
+                    {
+                        return Some(ct);
                     }
                 }
                 // For indirect calls through function pointer variables,
@@ -1962,7 +2055,7 @@ impl Lowerer {
                                 .or_else(|| self.get_expr_ctype_with_scope(init_expr, &local_scope))
                             {
                                 let full_ctype = self.build_full_ctype(
-                                    &Self::ctype_to_type_spec(&ctype),
+                                    &Self::ctype_to_type_spec(&ctype.decayed_value_ctype()),
                                     &declarator.derived,
                                 );
                                 local_scope.insert(declarator.name.clone(), full_ctype);

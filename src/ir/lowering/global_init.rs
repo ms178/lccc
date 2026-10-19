@@ -57,21 +57,18 @@ impl Lowerer {
         array_dim_strides: &[usize],
         obj_ty: Option<&CType>,
     ) -> GlobalInit {
-        let is_long_double_target = self.is_type_spec_long_double(type_spec);
-        let is_bool_target = self.is_type_bool(type_spec);
+        // Every scalar leaf of the initializer converts to the object's
+        // innermost element type, taken from the object's C type itself (an
+        // array typedef or `typeof` names the array, not the element).
+        let elem_ct = self.init_leaf_ctype(obj_ty, type_spec);
+        let elem_ct = &elem_ct;
 
         // GCC's `folding_initializer`: see `Lowerer::folding_initializer`.
         let outer = self.folding_initializer.replace(true);
         let lowered = match init {
-            Initializer::Expr(expr) => self.lower_global_init_expr(
-                expr,
-                type_spec,
-                base_ty,
-                is_array,
-                obj_ty,
-                is_long_double_target,
-                is_bool_target,
-            ),
+            Initializer::Expr(expr) => {
+                self.lower_global_init_expr(expr, base_ty, is_array, obj_ty, elem_ct)
+            }
             Initializer::List(items) => {
                 // Resolve brace elision, designator chains and overrides of
                 // struct/union and array-of-aggregate initializers once
@@ -83,21 +80,37 @@ impl Lowerer {
                 let items = canonical.as_deref().unwrap_or(items);
                 self.lower_global_init_list(
                     items,
-                    type_spec,
                     base_ty,
                     is_array,
                     elem_size,
                     total_size,
                     struct_layout,
                     array_dim_strides,
-                    is_long_double_target,
-                    is_bool_target,
+                    elem_ct,
                     obj_ty,
                 )
             }
         };
         self.folding_initializer.set(outer);
         lowered
+    }
+
+    /// The innermost non-array C type of the object being initialized: the
+    /// type every scalar leaf of its initializer converts to. Taken from the
+    /// object's C type when known (an array typedef or `typeof` names the
+    /// whole array), otherwise from the declaration's type specifier.
+    pub(super) fn init_leaf_ctype(
+        &self,
+        obj_ty: Option<&CType>,
+        type_spec: &TypeSpecifier,
+    ) -> CType {
+        let mut ct = obj_ty
+            .cloned()
+            .unwrap_or_else(|| self.type_spec_to_ctype(type_spec));
+        while let CType::Array(inner, _) = ct {
+            ct = *inner;
+        }
+        ct
     }
 }
 
@@ -111,42 +124,35 @@ impl Lowerer {
     fn lower_global_init_expr(
         &mut self,
         expr: &Expr,
-        type_spec: &TypeSpecifier,
         base_ty: IrType,
         is_array: bool,
         obj_ty: Option<&CType>,
-        is_long_double_target: bool,
-        is_bool_target: bool,
+        elem_ct: &CType,
     ) -> GlobalInit {
         // Resolve _Generic selections: unwrap to the selected expression before
         // any other processing, so all downstream logic (const eval, string
         // literals, address expressions, etc.) sees the resolved expression.
         if let Expr::GenericSelection(controlling, associations, _) = expr {
             if let Some(selected) = self.resolve_generic_selection_expr(controlling, associations) {
-                return self.lower_global_init_expr(
-                    selected,
-                    type_spec,
-                    base_ty,
-                    is_array,
-                    obj_ty,
-                    is_long_double_target,
-                    is_bool_target,
-                );
+                return self.lower_global_init_expr(selected, base_ty, is_array, obj_ty, elem_ct);
             }
         }
 
         // Complex types: handle before scalar evaluation to prevent misinterpretation
         // of scalar values (e.g., `_Complex float g = 1.0f;`).
-        {
-            let ctype = self.type_spec_to_ctype(type_spec);
-            if ctype.is_complex() {
-                if let Some(init) = self.eval_complex_global_init(expr, &ctype) {
-                    return init;
-                }
+        //
+        // Every type decision below uses `elem_ct`, the object's own scalar
+        // type -- never `type_spec`, the declaration's base specifier: for
+        // `_Decimal64 *p = (_Decimal64 *)64;` the base is `_Decimal64` but
+        // the object is a pointer, and converting the address as a decimal
+        // stored its BID encoding (likewise `long double *`, `_Bool *`).
+        if elem_ct.is_complex() {
+            if let Some(init) = self.eval_complex_global_init(expr, elem_ct) {
+                return init;
             }
         }
         // A vector from a constant vector expression (`v = (T){ ... }`). The
-        // object's own type decides: `type_spec` is only the declaration's
+        // object's own type decides: the declaration's type specifier is only its
         // base specifier (`T (*fp)(int) = f;` has base type `T`).
         if let Some(vec_ct) = obj_ty.filter(|t| t.is_vector()) {
             let mut bytes = vec![0u8; self.resolve_ctype_size(vec_ct)];
@@ -194,7 +200,7 @@ impl Lowerer {
             // expansion, BID sources by decode/re-encode) — never a raw
             // integer/float bit-cast (`_Decimal32 g = 5` used to emit the
             // I64 {5}). Unhandled kinds fall through to coerce (status quo).
-            let target_ct = self.type_spec_to_ctype(type_spec);
+            let target_ct = elem_ct.clone();
             if target_ct.is_decimal() {
                 let width = match target_ct {
                     CType::Decimal32 => 32,
@@ -223,21 +229,13 @@ impl Lowerer {
                     }
                 }
             }
-            // _Float128 (binary128): the initializer must become the IEEE
-            // binary128 BIT PATTERN (via the exact long_double-module
-            // conversions), never an integer/float bit-cast of the U128
-            // carrier (`_Float128 g = 100.0` used to emit the I128 {100,0}).
-            if target_ct == CType::Float128 {
-                if let Some(bits) = Self::const_to_f128_bits(&val) {
-                    return GlobalInit::Scalar(IrConst::I128(bits as i128));
-                }
-            }
+            // _Float128 targets and _Float128 / long double / decimal sources
+            // convert by value (`coerce_init_const`), never by carrier bits.
             return GlobalInit::Scalar(self.coerce_scalar_const(
                 val,
                 expr,
                 base_ty,
-                is_long_double_target,
-                is_bool_target,
+                Some(&target_ct),
             ));
         }
 
@@ -253,13 +251,16 @@ impl Lowerer {
         // helpers — lib/maple_tree.c trace_ma_op — do exactly that). Material
         // the function name as the same interned string literal the
         // expression path lowers it to.
+        // At file scope it is GCC's string for that spelling
+        // (`function_name_builtin_text`).
         if let Expr::Identifier(name, _) = expr {
-            if matches!(
-                name.as_str(),
-                "__func__" | "__FUNCTION__" | "__PRETTY_FUNCTION__"
-            ) {
-                let fname = self.func().name.clone();
-                return GlobalInit::GlobalAddr(self.intern_string_literal(&fname));
+            if crate::frontend::parser::ast::is_function_name_builtin(name) {
+                let text = crate::frontend::parser::ast::function_name_builtin_text(
+                    name,
+                    self.func_state.as_ref().map(|fs| fs.source_name()),
+                )
+                .to_string();
+                return GlobalInit::GlobalAddr(self.intern_string_literal(&text));
             }
         }
 
@@ -325,8 +326,7 @@ impl Lowerer {
                 IrConst::I64(v),
                 expr,
                 base_ty,
-                is_long_double_target,
-                is_bool_target,
+                Some(elem_ct),
             ));
         }
 
@@ -384,9 +384,13 @@ impl Lowerer {
 
     /// The truth value of a folded operand: an address is never null.
     fn global_truth(&self, expr: &Expr) -> Option<bool> {
-        match self.global_operand(expr)? {
-            GlobalOperand::Int(v) => Some(v != 0),
-            GlobalOperand::Addr(..) => Some(true),
+        match self.global_operand(expr) {
+            Some(GlobalOperand::Int(v)) => Some(v != 0),
+            Some(GlobalOperand::Addr(..)) => Some(true),
+            // A nested relation or logical form: `!(&g == 0)`,
+            // `(&g != 0) && (&h != 0)` (GCC folds both).  Each call descends
+            // into a strict subexpression, so the recursion terminates.
+            None => self.eval_global_relational(expr).map(|v| v != 0),
         }
     }
 
@@ -419,6 +423,25 @@ impl Lowerer {
                 self.global_truth(lhs)? || self.global_truth(rhs)?,
             )),
             Expr::BinaryOp(op, lhs, rhs, _) => self.eval_global_compare(*op, lhs, rhs),
+            // `(T)(&g != 0)`: GCC folds the cast of such a value too.  Every
+            // conversion to an integer, `_Bool`, pointer, binary or decimal
+            // floating type maps 0 to 0 and 1 to 1 exactly (GCC's integer to
+            // pointer conversion keeps the value), so the cast is peeled only
+            // for those targets and only for a 0/1 operand; a string
+            // character outside {0, 1} or a vector/complex/aggregate target
+            // still declines.
+            Expr::Cast(ts, inner, _, _) => {
+                let to = self.type_spec_to_ctype(ts);
+                let exact = to.is_integer()
+                    || to.is_floating()
+                    || to.is_decimal()
+                    || matches!(to, CType::Float128 | CType::Pointer(..));
+                if !exact {
+                    return None;
+                }
+                self.eval_global_relational(inner)
+                    .filter(|v| matches!(v, 0 | 1))
+            }
             _ => None,
         }
     }
@@ -518,50 +541,16 @@ impl Lowerer {
 
     /// Coerce a scalar constant to the target type, handling bool normalization
     /// and long double promotion.
-    /// Convert a const-evaluated scalar to the IEEE binary128 (u128) bit
-    /// pattern of `_Float128`. Uses the exact widening conversions from the
-    /// long_double module (f64 → binary128 is lossless; i64/u64/i128 are exact).
-    /// An `I128` source is taken as an existing binary128 payload (e.g. a
-    /// `1.5F128` literal or a `_Float128`-typed constant).
-    fn const_to_f128_bits(val: &IrConst) -> Option<u128> {
-        use crate::common::long_double::{
-            f64_to_f128_bytes_lossless, i64_to_f128_bytes, i128_to_f128_bytes, u64_to_f128_bytes,
-            u128_to_f128_bytes,
-        };
-        let le = |b: [u8; 16]| u128::from_le_bytes(b);
-        Some(match val {
-            IrConst::F64(v) => le(f64_to_f128_bytes_lossless(*v)),
-            IrConst::F32(v) => le(f64_to_f128_bytes_lossless(*v as f64)),
-            IrConst::LongDouble(v, _) => le(f64_to_f128_bytes_lossless(*v)),
-            IrConst::I64(v) => le(i64_to_f128_bytes(*v)),
-            IrConst::I32(v) => le(i64_to_f128_bytes(*v as i64)),
-            IrConst::I16(v) => le(i64_to_f128_bytes(*v as i64)),
-            IrConst::I8(v) => le(i64_to_f128_bytes(*v as i64)),
-            IrConst::I128(v) => *v as u128, // already a binary128 payload
-            // Decimal FP bit containers: pass BID bits through unchanged
-            // (only reachable for Decimal128 globals, which use this exact
-            // payload path; D32/D64 targets never call this helper).
-            IrConst::D64(v) => *v as u128,
-            IrConst::D32(v) => *v as u128,
-            IrConst::Zero => le(i64_to_f128_bytes(0)),
-        })
-    }
-
     fn coerce_scalar_const(
         &self,
         val: IrConst,
         expr: &Expr,
         base_ty: IrType,
-        is_long_double_target: bool,
-        is_bool_target: bool,
+        target_ct: Option<&CType>,
     ) -> IrConst {
         let src_ty = self.get_expr_type(expr);
-        let val = if is_bool_target {
-            val.bool_normalize()
-        } else {
-            self.coerce_const_to_type_with_src(val, base_ty, src_ty)
-        };
-        if is_long_double_target {
+        let val = self.coerce_init_const(val, expr, base_ty, target_ct);
+        if target_ct == Some(&CType::LongDouble) {
             Self::promote_to_long_double_with_signedness(val, src_ty)
         } else {
             val
@@ -700,15 +689,13 @@ impl Lowerer {
     fn lower_global_init_list(
         &mut self,
         items: &[InitializerItem],
-        type_spec: &TypeSpecifier,
         base_ty: IrType,
         is_array: bool,
         elem_size: usize,
         total_size: usize,
         struct_layout: &Option<RcLayout>,
         array_dim_strides: &[usize],
-        is_long_double_target: bool,
-        is_bool_target: bool,
+        elem_ct: &CType,
         obj_ty: Option<&CType>,
     ) -> GlobalInit {
         // Brace-wrapped string literal: char c[] = {"hello"}
@@ -719,10 +706,11 @@ impl Lowerer {
             }
         }
 
-        // Complex array: double _Complex arr[] = { ... }
-        let complex_ctype = self.type_spec_to_ctype(type_spec);
-        if is_array && complex_ctype.is_complex() {
-            return self.lower_complex_array_init(items, &complex_ctype, total_size, elem_size);
+        // Complex array: double _Complex arr[] = { ... }.  The leaf type
+        // decides, not the base specifier: `_Complex double *a[2]` is an
+        // array of pointers (it was lowered as complex values).
+        if is_array && elem_ct.is_complex() {
+            return self.lower_complex_array_init(items, elem_ct, total_size, elem_size);
         }
 
         // Arrays of ext-vectors have vector objects as their leaf
@@ -764,8 +752,7 @@ impl Lowerer {
                 total_size,
                 struct_layout,
                 array_dim_strides,
-                is_long_double_target,
-                is_bool_target,
+                elem_ct,
             );
         }
 
@@ -847,9 +834,8 @@ impl Lowerer {
     ) -> Option<GlobalInit> {
         let expr = Self::unwrap_nested_init_expr(items)?;
         if let Some(val) = self.eval_const_expr(expr) {
-            let expr_ty = self.get_expr_type(expr);
             return Some(GlobalInit::Scalar(
-                self.coerce_const_to_type_with_src(val, base_ty, expr_ty),
+                self.coerce_init_const(val, expr, base_ty, None),
             ));
         }
         self.eval_global_addr_expr(expr)
@@ -862,7 +848,7 @@ impl Lowerer {
             .map(|item| {
                 if let Initializer::Expr(expr) = &item.init {
                     self.eval_const_expr(expr)
-                        .map(|v| v.coerce_to(base_ty))
+                        .map(|v| self.coerce_init_const(v, expr, base_ty, None))
                         .unwrap_or_else(|| {
                             self.diagnose_non_constant(expr);
                             self.zero_const(base_ty)
@@ -897,15 +883,14 @@ impl Lowerer {
         total_size: usize,
         struct_layout: &Option<RcLayout>,
         array_dim_strides: &[usize],
-        is_long_double_target: bool,
-        is_bool_target: bool,
+        elem_ct: &CType,
     ) -> GlobalInit {
         let num_elems = self.compute_num_elems(
             base_ty,
             elem_size,
             total_size,
             struct_layout,
-            is_long_double_target,
+            *elem_ct == CType::LongDouble,
         );
 
         // Struct array (byte-serialized or compound for pointer fields)
@@ -937,8 +922,7 @@ impl Lowerer {
             num_elems,
             total_size,
             array_dim_strides,
-            is_long_double_target,
-            is_bool_target,
+            elem_ct,
         )
     }
 
@@ -1422,8 +1406,7 @@ impl Lowerer {
                     IrConst::I64(0)
                 });
                 let val =
-                    self.coerce_const_to_type_with_src(val, elem_ir_ty, self.get_expr_type(e));
-                let val = if is_bool { val.bool_normalize() } else { val };
+                    self.coerce_init_const(val, e, elem_ir_ty, is_bool.then_some(&CType::Bool));
                 match lane_stride {
                     Some(stride) if vec_ct.is_x87_lane_vector() => {
                         // x87 lanes are 10 bytes apart: write the 16-byte
@@ -1502,9 +1485,9 @@ impl Lowerer {
         num_elems: usize,
         total_size: usize,
         array_dim_strides: &[usize],
-        is_long_double_target: bool,
-        is_bool_target: bool,
+        elem_ct: &CType,
     ) -> GlobalInit {
+        let is_long_double_target = *elem_ct == CType::LongDouble;
         let zero_val = self.typed_zero_const(base_ty, is_long_double_target);
 
         if array_dim_strides.len() > 1 {
@@ -1519,7 +1502,7 @@ impl Lowerer {
                 array_dim_strides,
                 base_ty,
                 &mut flat,
-                is_bool_target,
+                elem_ct,
             );
             for (i, v) in flat.into_iter().enumerate() {
                 if i < total_scalar_elems {
@@ -1538,7 +1521,7 @@ impl Lowerer {
                     }
                 }
                 if current_idx < num_elems {
-                    let val = self.eval_array_element(&item.init, base_ty, is_bool_target);
+                    let val = self.eval_array_element(&item.init, base_ty, elem_ct);
                     values[current_idx] =
                         Self::maybe_promote_long_double(val, is_long_double_target);
                 }
@@ -1549,39 +1532,20 @@ impl Lowerer {
     }
 
     /// Evaluate a single array element from its initializer.
-    fn eval_array_element(
-        &self,
-        init: &Initializer,
-        base_ty: IrType,
-        is_bool_target: bool,
-    ) -> IrConst {
+    fn eval_array_element(&self, init: &Initializer, base_ty: IrType, elem_ct: &CType) -> IrConst {
         match init {
             Initializer::Expr(expr) => {
                 let raw = self
                     .eval_const_expr(expr)
                     .unwrap_or(self.zero_const(base_ty));
-                if is_bool_target {
-                    raw.bool_normalize()
-                } else {
-                    let expr_ty = self.get_expr_type(expr);
-                    self.coerce_const_to_type_with_src(raw, base_ty, expr_ty)
-                }
+                self.coerce_init_const(raw, expr, base_ty, Some(elem_ct))
             }
-            Initializer::List(sub_items) => {
-                let mut sub_vals = Vec::new();
-                for sub in sub_items {
-                    self.flatten_global_init_item(&sub.init, base_ty, &mut sub_vals);
-                }
-                let raw = sub_vals
-                    .into_iter()
-                    .next()
-                    .unwrap_or(self.zero_const(base_ty));
-                if is_bool_target {
-                    raw.bool_normalize()
-                } else {
-                    raw.coerce_to(base_ty)
-                }
-            }
+            // A brace-enclosed scalar (`{{2.75Q}}`): its first leaf, converted
+            // like any other element.
+            Initializer::List(sub_items) => sub_items.first().map_or_else(
+                || self.zero_const(base_ty),
+                |first| self.eval_array_element(&first.init, base_ty, elem_ct),
+            ),
         }
     }
 
@@ -1682,10 +1646,11 @@ impl Lowerer {
             Expr::Identifier(name, _)
                 if crate::frontend::parser::ast::is_function_name_builtin(name) =>
             {
-                Some((
-                    self.func_state.as_ref()?.name.clone(),
-                    StringLitKind::Narrow,
-                ))
+                let text = crate::frontend::parser::ast::function_name_builtin_text(
+                    name,
+                    self.func_state.as_ref().map(|fs| fs.source_name()),
+                );
+                Some((text.to_string(), StringLitKind::Narrow))
             }
             Expr::Cast(_, inner, _, _) => self.function_name_string(inner),
             _ => None,
@@ -1849,7 +1814,10 @@ impl Lowerer {
                 let num_elems = match &item.init {
                     Initializer::List(sub_items) => sub_items.len(),
                     Initializer::Expr(Expr::StringLiteral(s, _)) => {
-                        if matches!(elem_ty.as_ref(), CType::Char | CType::UChar) {
+                        if matches!(
+                            elem_ty.as_ref(),
+                            CType::Char | CType::SChar | CType::UChar | CType::PlainUChar
+                        ) {
                             s.len() + 1
                         } else {
                             items.len() - item_idx
@@ -1959,7 +1927,10 @@ impl Lowerer {
                 if matches!(&item.init, Initializer::Expr(_)) && item.designators.is_empty() {
                     let is_string_literal =
                         matches!(&item.init, Initializer::Expr(Expr::StringLiteral(..)));
-                    let is_char_array = matches!(elem_ty.as_ref(), CType::Char | CType::UChar);
+                    let is_char_array = matches!(
+                        elem_ty.as_ref(),
+                        CType::Char | CType::SChar | CType::UChar | CType::PlainUChar
+                    );
                     if !(is_string_literal && is_char_array) {
                         let scalars_per_elem = h::count_flat_init_scalars(
                             elem_ty,
@@ -2177,11 +2148,11 @@ impl Lowerer {
         array_dim_strides: &[usize],
         base_ty: IrType,
         values: &mut Vec<IrConst>,
-        is_bool_target: bool,
+        elem_ct: &CType,
     ) {
         let base_type_size = base_ty.size().max(1);
         if array_dim_strides.len() <= 1 {
-            self.flatten_1d_array(items, base_ty, values, is_bool_target);
+            self.flatten_1d_array(items, base_ty, values, elem_ct);
             return;
         }
 
@@ -2215,7 +2186,7 @@ impl Lowerer {
                     base_type_size,
                     sub_elem_count,
                     values,
-                    is_bool_target,
+                    elem_ct,
                 );
                 current_outer_idx = index_designators[0] + 1;
                 continue;
@@ -2230,7 +2201,7 @@ impl Lowerer {
                 start_len,
                 &mut current_outer_idx,
                 values,
-                is_bool_target,
+                elem_ct,
             );
         }
     }
@@ -2241,7 +2212,7 @@ impl Lowerer {
         items: &[InitializerItem],
         base_ty: IrType,
         values: &mut Vec<IrConst>,
-        is_bool_target: bool,
+        elem_ct: &CType,
     ) {
         let mut current_idx = 0usize;
         for item in items {
@@ -2257,14 +2228,14 @@ impl Lowerer {
             if current_idx < values.len() {
                 // Backward jump or overwrite
                 let mut tmp = Vec::new();
-                self.flatten_global_init_item_bool(&item.init, base_ty, &mut tmp, is_bool_target);
+                self.flatten_global_init_item(&item.init, base_ty, &mut tmp, elem_ct);
                 let n = tmp.len();
                 let zero_fn = || self.zero_const(base_ty);
                 Self::overwrite_or_extend_values(values, current_idx, tmp, &zero_fn);
                 current_idx += n.max(1);
             } else {
                 // Forward: append at end
-                self.flatten_global_init_item_bool(&item.init, base_ty, values, is_bool_target);
+                self.flatten_global_init_item(&item.init, base_ty, values, elem_ct);
                 current_idx = values.len();
             }
         }
@@ -2280,7 +2251,7 @@ impl Lowerer {
         base_type_size: usize,
         sub_elem_count: usize,
         values: &mut Vec<IrConst>,
-        is_bool_target: bool,
+        elem_ct: &CType,
     ) {
         let flat_idx = self.compute_flat_index_from_designators(
             index_designators,
@@ -2301,19 +2272,14 @@ impl Lowerer {
                 let sub_strides = &array_dim_strides[array_dim_strides.len() - remaining_dims..];
                 let mut tmp = Vec::new();
                 if sub_strides.is_empty() || remaining_dims == 0 {
-                    self.flatten_global_init_item_bool(
-                        &item.init,
-                        base_ty,
-                        &mut tmp,
-                        is_bool_target,
-                    );
+                    self.flatten_global_init_item(&item.init, base_ty, &mut tmp, elem_ct);
                 } else {
                     self.flatten_global_array_init_bool(
                         sub_items,
                         sub_strides,
                         base_ty,
                         &mut tmp,
-                        is_bool_target,
+                        elem_ct,
                     );
                 }
                 Self::overwrite_or_extend_values(values, flat_idx, tmp, &zero_fn);
@@ -2340,12 +2306,7 @@ impl Lowerer {
                     self.inline_string_to_values(s, string_sub_count, base_ty, &mut tmp);
                     Self::overwrite_or_extend_values(values, flat_idx, tmp, &zero_fn);
                 } else if let Some(val) = self.eval_const_expr(expr) {
-                    values[flat_idx] = if is_bool_target {
-                        val.bool_normalize()
-                    } else {
-                        let expr_ty = self.get_expr_type(expr);
-                        self.coerce_const_to_type_with_src(val, base_ty, expr_ty)
-                    };
+                    values[flat_idx] = self.coerce_init_const(val, expr, base_ty, Some(elem_ct));
                 }
             }
         }
@@ -2361,7 +2322,7 @@ impl Lowerer {
         start_len: usize,
         current_outer_idx: &mut usize,
         values: &mut Vec<IrConst>,
-        is_bool_target: bool,
+        elem_ct: &CType,
     ) {
         match &item.init {
             Initializer::List(sub_items) => {
@@ -2383,7 +2344,7 @@ impl Lowerer {
                     &array_dim_strides[1..],
                     base_ty,
                     &mut sub_values,
-                    is_bool_target,
+                    elem_ct,
                 );
                 while sub_values.len() < sub_elem_count {
                     sub_values.push(self.zero_const(base_ty));
@@ -2400,12 +2361,7 @@ impl Lowerer {
                     self.inline_string_to_values(s, sub_elem_count, base_ty, values);
                     *current_outer_idx += 1;
                 } else if let Some(val) = self.eval_const_expr(expr) {
-                    values.push(if is_bool_target {
-                        val.bool_normalize()
-                    } else {
-                        let expr_ty = self.get_expr_type(expr);
-                        self.coerce_const_to_type_with_src(val, base_ty, expr_ty)
-                    });
+                    values.push(self.coerce_init_const(val, expr, base_ty, Some(elem_ct)));
                     let relative_pos = values.len() - start_len;
                     if sub_elem_count > 0 {
                         *current_outer_idx = relative_pos.div_ceil(sub_elem_count);
@@ -2607,23 +2563,14 @@ impl Lowerer {
         }
     }
 
-    /// Flatten a single initializer item, recursing into nested lists.
+    /// Flatten a single initializer item, recursing into nested lists; every
+    /// scalar leaf converts by value to `elem_ct`.
     fn flatten_global_init_item(
         &self,
         init: &Initializer,
         base_ty: IrType,
         values: &mut Vec<IrConst>,
-    ) {
-        self.flatten_global_init_item_bool(init, base_ty, values, false)
-    }
-
-    /// Flatten a single initializer item with _Bool awareness.
-    fn flatten_global_init_item_bool(
-        &self,
-        init: &Initializer,
-        base_ty: IrType,
-        values: &mut Vec<IrConst>,
-        is_bool_target: bool,
+        elem_ct: &CType,
     ) {
         match init {
             Initializer::Expr(expr) => {
@@ -2633,19 +2580,14 @@ impl Lowerer {
                     }
                     values.push(IrConst::I64(0));
                 } else if let Some(val) = self.eval_const_expr(expr) {
-                    values.push(if is_bool_target {
-                        val.bool_normalize()
-                    } else {
-                        let expr_ty = self.get_expr_type(expr);
-                        self.coerce_const_to_type_with_src(val, base_ty, expr_ty)
-                    });
+                    values.push(self.coerce_init_const(val, expr, base_ty, Some(elem_ct)));
                 } else {
                     values.push(self.zero_const(base_ty));
                 }
             }
             Initializer::List(items) => {
                 for item in items {
-                    self.flatten_global_init_item_bool(&item.init, base_ty, values, is_bool_target);
+                    self.flatten_global_init_item(&item.init, base_ty, values, elem_ct);
                 }
             }
         }

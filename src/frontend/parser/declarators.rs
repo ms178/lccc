@@ -97,6 +97,11 @@ impl Parser {
         // `volatile` written after the most recent `*` (the last one is the
         // object's own qualifier).
         let mut last_star_volatile: Option<bool> = None;
+        // `_Atomic` in the specifiers, and `restrict`/`_Atomic` after the
+        // most recent `*`, by the same rule.
+        let spec_atomic = self.attrs.parsing_atomic();
+        let mut last_star_restrict = false;
+        let mut last_star_atomic = false;
         loop {
             let star_span = self.peek_span();
             if !self.consume_if(&TokenKind::Star) {
@@ -116,10 +121,18 @@ impl Parser {
             // back; the declaration-wide flag keeps the union, as before.
             let outer_volatile = self.attrs.parsing_volatile();
             self.attrs.set_volatile(false);
+            // Likewise `restrict`/`_Atomic`: the specifiers' `_Atomic` is the
+            // pointee's (`_Atomic int *p`), not this star's.
+            self.attrs.set_restrict(false);
+            self.attrs.set_atomic(false);
             self.skip_cv_qualifiers();
             let star_volatile = self.attrs.parsing_volatile();
             self.attrs.set_volatile(outer_volatile || star_volatile);
             last_star_volatile = Some(star_volatile);
+            last_star_restrict = self.attrs.parsing_restrict();
+            last_star_atomic = self.attrs.parsing_atomic();
+            self.attrs.set_restrict(false);
+            self.attrs.set_atomic(spec_atomic);
             let star_space = std::mem::replace(&mut self.attrs.parsing_address_space, base_space);
             // Each star keeps its own qualifier (see `DerivedDeclarator::Pointer`).
             // The last star's is also the declared object's space.
@@ -133,6 +146,9 @@ impl Parser {
         // (`long (*__seg_gs ap)[4]`). The inner call records it in
         // `declarator_object_space`, which the outer call must not overwrite.
         let mut inner_object_space = AddressSpace::Default;
+        // The inner declarator's object qualifiers: when it has a `*`, the
+        // declared object is that pointer (`int (*_Atomic p)[3]`).
+        let mut inner_object_quals = (false, false);
         let (name, inner_derived) = if let TokenKind::Identifier(n) = self.peek() {
             let n = n.clone();
             self.advance();
@@ -142,9 +158,14 @@ impl Parser {
             self.advance(); // consume '('
             let (inner_name, inner_derived) = self.parse_declarator();
             inner_object_space = self.attrs.declarator_object_space;
+            inner_object_quals = (
+                self.attrs.declarator_object_restrict,
+                self.attrs.declarator_object_atomic,
+            );
             if !self.consume_if(&TokenKind::RParen) {
                 self.pos = save;
                 inner_object_space = AddressSpace::Default;
+                inner_object_quals = (false, false);
                 (None, Vec::new())
             } else {
                 (inner_name, inner_derived)
@@ -156,6 +177,9 @@ impl Parser {
         // Parse outer suffixes: array dimensions and function params.  A
         // parenthesised inner declarator without `*` (`(g(void))`) ends in the
         // suffix the outer ones wrap directly.
+        let inner_derived_has_pointer = inner_derived
+            .iter()
+            .any(|d| matches!(d, DerivedDeclarator::Pointer(_)));
         let mut outer_suffixes = Vec::with_capacity(4);
         let mut innermost_suffix_is_function = if inner_derived
             .iter()
@@ -259,6 +283,24 @@ impl Parser {
             None => spec_volatile,
             Some(DerivedDeclarator::Pointer(_)) => last_star_volatile.unwrap_or(false),
             Some(_) => false,
+        };
+        let inner_has_pointer = inner_derived_has_pointer;
+        let all_arrays = !combined.is_empty()
+            && combined
+                .iter()
+                .all(|d| matches!(d, DerivedDeclarator::Array(_)));
+        (
+            self.attrs.declarator_object_restrict,
+            self.attrs.declarator_object_atomic,
+        ) = if inner_has_pointer {
+            inner_object_quals
+        } else {
+            match combined.last() {
+                None => (false, spec_atomic),
+                Some(DerivedDeclarator::Pointer(_)) => (last_star_restrict, last_star_atomic),
+                Some(_) if all_arrays => (false, spec_atomic),
+                Some(_) => (false, false),
+            }
         };
         self.attrs.declarator_object_space = if object_space == AddressSpace::Default {
             inner_object_space
@@ -611,6 +653,7 @@ impl Parser {
         let decl_volatile = self.attrs.parsing_volatile();
         let decl_typedef_use = self.attrs.parsing_typedef_use();
         let decl_typedef_object = self.attrs.parsing_typedef_object_volatile();
+        let decl_storage = self.attrs.take_storage_classes();
         let result = self.parse_param_list_inner();
         // Single restore point, deliberately: every exit from the list --
         // including the K&R identifier-list path -- goes through here, so no
@@ -620,6 +663,7 @@ impl Parser {
         self.attrs.set_volatile(decl_volatile);
         self.attrs.set_typedef_use(decl_typedef_use);
         self.attrs.set_typedef_object_volatile(decl_typedef_object);
+        self.attrs.restore_storage_classes(decl_storage);
         result
     }
 
@@ -690,6 +734,7 @@ impl Parser {
             // a qualifier left over from the enclosing declaration cannot be
             // taken as this parameter's.
             self.attrs.parsing_address_space = AddressSpace::Default;
+            self.attrs.take_storage_classes();
             if let Some(mut type_spec) = self.parse_type_specifier() {
                 // Snapshot the declaration-level named address space NOW, before
                 // the declarator parser runs (the same rule struct fields follow
@@ -717,6 +762,15 @@ impl Parser {
                     paren_ptr_total,
                     star_spaces,
                 ) = self.parse_param_declarator_full();
+                // C11 6.7.6.3p2: `register` is a parameter's only storage
+                // class (GCC 16.2 wording).
+                if self.attrs.take_storage_classes() != 0 {
+                    let message = match &name {
+                        Some(n) => format!("storage class specified for parameter '{n}'"),
+                        None => "storage class specified for unnamed parameter".to_string(),
+                    };
+                    self.emit_error(message, param_span);
+                }
                 // A parameter has automatic storage, so a named space cannot
                 // hold it: GCC 14.2 rejects `long __seg_gs x`. A pointer parameter
                 // (`long __seg_gs *p`) is fine; its qualifier names the pointee.

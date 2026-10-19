@@ -34,7 +34,7 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::analysis;
-use crate::ir::reexports::{CallInfo, Instruction, IrFunction, Operand, Value};
+use crate::ir::reexports::{CallInfo, Instruction, IrConst, IrFunction, Operand, Value};
 
 /// A constant byte path from an alloca root: (root value id, byte offset).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -66,6 +66,56 @@ fn forwardable(store_ty: IrType, load_ty: IrType) -> bool {
         }
         _ => false,
     }
+}
+
+/// The constant a non-forwardable integer load reads when every one of its
+/// bytes was last written by a constant integer store still in `map`: several
+/// narrower stores (a `char16_t` zero written as two bytes), or one wider
+/// store (an `int` read back as `short`). The map's entries are pairwise
+/// disjoint and each is the last writer of its bytes -- any overlapping store,
+/// copy or unknown write removed it -- so the composed value is exactly the
+/// memory image. Every target is little-endian: byte `k` of the load is bits
+/// `8k..8k+8`. An intersecting store that is not a constant integer (or a
+/// byte that no entry covers) refuses.
+fn constant_cover(
+    map: &FxHashMap<FieldPath, (Operand, IrType)>,
+    at: FieldPath,
+    load_ty: IrType,
+) -> Option<IrConst> {
+    if !load_ty.is_integer() {
+        return None;
+    }
+    let width = type_size(load_ty);
+    if !(1..=8).contains(&width) {
+        return None;
+    }
+    let (lo, hi) = (at.offset, at.offset + width);
+    let mut bits = 0u64;
+    let mut covered = 0u8;
+    for (fp, &(op, sty)) in map {
+        let size = type_size(sty);
+        if fp.root != at.root || fp.offset >= hi || fp.offset + size <= lo {
+            continue;
+        }
+        let (Operand::Const(c), true) = (op, sty.is_integer() && size <= 8) else {
+            return None;
+        };
+        let image = c.to_u64()?;
+        for byte in fp.offset.max(lo)..(fp.offset + size).min(hi) {
+            let (src, dst) = ((byte - fp.offset) as u32, (byte - lo) as u32);
+            if covered & (1 << dst) != 0 {
+                return None;
+            }
+            covered |= 1 << dst;
+            bits |= ((image >> (8 * src)) & 0xff) << (8 * dst);
+        }
+    }
+    let full = if width == 8 {
+        u8::MAX
+    } else {
+        (1u8 << width) - 1
+    };
+    (covered == full).then(|| IrConst::from_i64(bits as i64, load_ty))
 }
 
 /// Resolve pointer values to (alloca root, constant byte offset), and compute
@@ -258,6 +308,19 @@ fn apply_inst(
                 return;
             }
             if let Some(fp) = paths.get(&ptr.0) {
+                let exact = map
+                    .get(fp)
+                    .is_some_and(|&(_, store_ty)| forwardable(store_ty, *ty));
+                if rewrite && !exact {
+                    if let Some(c) = constant_cover(map, *fp, *ty) {
+                        *inst = Instruction::Copy {
+                            dest: *dest,
+                            src: Operand::Const(c),
+                        };
+                        *changed += 1;
+                        return;
+                    }
+                }
                 if let Some(&(stored_op, store_ty)) = map.get(fp) {
                     let is_self_copy = match stored_op {
                         Operand::Value(v) => v.0 == dest.0,
@@ -422,7 +485,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 mod tests {
     use super::*;
     use crate::common::types::AddressSpace;
-    use crate::ir::reexports::{BasicBlock, BlockId, IrConst, Terminator};
+    use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
 
     fn mk_func(blocks: Vec<BasicBlock>) -> IrFunction {
         let mut f = IrFunction::new("t".into(), IrType::I64, vec![], false);
@@ -722,5 +785,172 @@ mod tests {
             Terminator::Return(Some(Operand::Value(Value(2)))),
         )]);
         assert_eq!(run(&mut f), 0);
+    }
+
+    fn cgep(dest: u32, off: i64) -> Instruction {
+        Instruction::GetElementPtr {
+            dest: Value(dest),
+            base: Value(1),
+            offset: Operand::Const(IrConst::I64(off)),
+            ty: IrType::I8,
+        }
+    }
+
+    fn cstore(val: IrConst, ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Store {
+            volatile: false,
+            val: Operand::Const(val),
+            ptr: Value(ptr),
+            ty,
+            seg_override: AddressSpace::Default,
+        }
+    }
+
+    fn tload(dest: u32, ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Load {
+            volatile: false,
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty,
+            seg_override: AddressSpace::Default,
+        }
+    }
+
+    /// Run `body` (after `alloca(1)` and GEPs 10..=17 at offsets 0..=7) with
+    /// a final load into v2 and return what v2 became.
+    fn cover(body: Vec<Instruction>, load_ptr: u32, load_ty: IrType) -> Option<IrConst> {
+        let mut insts = vec![alloca(1)];
+        insts.extend((0..8).map(|k| cgep(10 + k, k as i64)));
+        insts.extend(body);
+        insts.push(tload(2, load_ptr, load_ty));
+        let mut f = mk_func(vec![block(
+            0,
+            insts,
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        )]);
+        run(&mut f);
+        match f.blocks[0].instructions.last() {
+            Some(Instruction::Copy {
+                src: Operand::Const(c),
+                ..
+            }) => Some(*c),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn constant_cover_composes_narrow_stores_little_endian() {
+        // char16_t zero terminator written as two bytes, read as one unit.
+        let zero = cover(
+            vec![
+                cstore(IrConst::I64(0), 14, IrType::U8),
+                cstore(IrConst::I64(0), 15, IrType::U8),
+            ],
+            14,
+            IrType::U16,
+        );
+        assert_eq!(zero.and_then(IrConst::to_i64), Some(0));
+        let le = cover(
+            vec![
+                cstore(IrConst::I64(0x34), 10, IrType::U8),
+                cstore(IrConst::I8(0x12), 11, IrType::I8),
+            ],
+            10,
+            IrType::U16,
+        );
+        assert_eq!(le.and_then(IrConst::to_i64), Some(0x1234));
+        // Signed load of 0xffff is -1; unsigned is 65535.
+        let bytes = || {
+            vec![
+                cstore(IrConst::I8(-1), 10, IrType::I8),
+                cstore(IrConst::I8(-1), 11, IrType::I8),
+            ]
+        };
+        assert_eq!(
+            cover(bytes(), 10, IrType::I16).and_then(IrConst::to_i64),
+            Some(-1)
+        );
+        assert_eq!(
+            cover(bytes(), 10, IrType::U16).and_then(IrConst::to_i64),
+            Some(0xffff)
+        );
+        // A U16 and two U8 pieces tile a U32.
+        let mixed = cover(
+            vec![
+                cstore(IrConst::I64(0xbeef), 10, IrType::U16),
+                cstore(IrConst::I64(0xad), 12, IrType::U8),
+                cstore(IrConst::I64(0xde), 13, IrType::U8),
+            ],
+            10,
+            IrType::U32,
+        );
+        assert_eq!(mixed.and_then(IrConst::to_i64), Some(0xdead_beef));
+    }
+
+    #[test]
+    fn constant_cover_extracts_from_a_wider_store() {
+        let hi = cover(
+            vec![cstore(IrConst::I32(0x1122_3344), 10, IrType::I32)],
+            12,
+            IrType::U16,
+        );
+        assert_eq!(hi.and_then(IrConst::to_i64), Some(0x1122));
+        let q = cover(
+            vec![cstore(IrConst::I64(-2), 10, IrType::I64)],
+            14,
+            IrType::I32,
+        );
+        assert_eq!(q.and_then(IrConst::to_i64), Some(-1));
+    }
+
+    #[test]
+    fn constant_cover_refuses_gaps_values_floats_and_kills() {
+        // Byte 5 never written.
+        let gap = vec![cstore(IrConst::I64(0), 14, IrType::U8)];
+        assert_eq!(cover(gap, 14, IrType::U16), None);
+        // One piece is not a constant.
+        let val = vec![
+            cstore(IrConst::I64(0), 14, IrType::U8),
+            Instruction::Store {
+                volatile: false,
+                val: Operand::Value(Value(9)),
+                ptr: Value(15),
+                ty: IrType::U8,
+                seg_override: AddressSpace::Default,
+            },
+        ];
+        assert_eq!(cover(val, 14, IrType::U16), None);
+        // Float loads are not composed from pieces (the exact same-width
+        // store forward is a separate, pre-existing rule).
+        let fl = vec![
+            cstore(IrConst::I64(0), 10, IrType::U16),
+            cstore(IrConst::I64(0), 12, IrType::U16),
+        ];
+        assert_eq!(cover(fl, 10, IrType::F32), None);
+        // A later untracked store kills the pieces.
+        let killed = vec![
+            cstore(IrConst::I64(0), 14, IrType::U8),
+            cstore(IrConst::I64(0), 15, IrType::U8),
+            Instruction::Store {
+                volatile: false,
+                val: Operand::Value(Value(9)),
+                ptr: Value(77),
+                ty: IrType::I8,
+                seg_override: AddressSpace::Default,
+            },
+        ];
+        assert_eq!(cover(killed, 14, IrType::U16), None);
+        // A volatile piece is never recorded.
+        let vol = vec![
+            cstore(IrConst::I64(0), 14, IrType::U8),
+            Instruction::Store {
+                volatile: true,
+                val: Operand::Const(IrConst::I64(0)),
+                ptr: Value(15),
+                ty: IrType::U8,
+                seg_override: AddressSpace::Default,
+            },
+        ];
+        assert_eq!(cover(vol, 14, IrType::U16), None);
     }
 }

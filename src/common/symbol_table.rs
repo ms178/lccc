@@ -46,9 +46,22 @@ struct Scope {
     /// static int v = c;` is accepted); their address is still not constant
     /// unless the object has static storage.
     folded: FxHashSet<String>,
+    /// Objects whose type's base specifier is `const` (see
+    /// `common::qualifiers`).
+    const_base: FxHashSet<String>,
     /// The value of a folded const object, converted to its type, so that
     /// `int a = cc;` can be evaluated for `const int cc = 5;`.
     folded_values: FxHashMap<String, FoldedValue>,
+    /// Enumeration constants declared in this scope: a block-scope object of
+    /// the same name hides one (`enum { A = 1 }; void f(void) { int A; }`).
+    enumerators: FxHashSet<String>,
+    /// C23 `constexpr` objects declared in this scope: named constants
+    /// (6.6p7), usable in integer constant expressions (6.6p8).
+    constexpr_objects: FxHashSet<String>,
+    /// The scalar members of `constexpr` structure and union objects, by
+    /// object name and member path (`.a.b`), converted to the member type:
+    /// `s.a.b` is a named constant too (6.6p7).
+    constexpr_members: FxHashMap<(String, String), FoldedValue>,
 }
 
 /// The value of a folded const object (see `Scope::folded_values`).
@@ -59,6 +72,21 @@ pub enum FoldedValue {
     /// A `float` or `double` object, rounded to its type (a `float` value is
     /// exactly representable as an `f64`).
     Float(f64),
+    /// A `long double` object: the nearest `f64` and the exact binary128
+    /// image, rounded to the target's long double (as `IrConst::LongDouble`).
+    LongDouble(f64, [u8; 16]),
+}
+
+impl FoldedValue {
+    /// The folded value as an IR constant.
+    pub fn to_ir_const(self) -> crate::ir::reexports::IrConst {
+        use crate::ir::reexports::IrConst;
+        match self {
+            FoldedValue::Int(v) => IrConst::I64(v),
+            FoldedValue::Float(v) => IrConst::F64(v),
+            FoldedValue::LongDouble(v, bytes) => IrConst::LongDouble(v, bytes),
+        }
+    }
 }
 
 impl Scope {
@@ -68,7 +96,11 @@ impl Scope {
             linked: FxHashSet::default(),
             automatic: FxHashSet::default(),
             folded: FxHashSet::default(),
+            constexpr_objects: FxHashSet::default(),
+            constexpr_members: FxHashMap::default(),
+            const_base: FxHashSet::default(),
             folded_values: FxHashMap::default(),
+            enumerators: FxHashSet::default(),
         }
     }
 }
@@ -101,21 +133,23 @@ impl SymbolTable {
     }
 
     pub fn lookup(&self, name: &str) -> Option<&Symbol> {
-        self.lookup_with_depth(name).map(|(symbol, _)| symbol)
+        self.lookup_ordinary(name).map(|(symbol, _)| symbol)
     }
 
-    /// Look up the innermost symbol and its lexical depth (file scope is 0).
-    ///
-    /// C enumerators and objects share the ordinary-identifier namespace.  The
-    /// semantic analyzer keeps their payloads in separate maps, so callers
-    /// resolving an identifier need the depth to choose whichever declaration
-    /// is lexically nearer rather than unconditionally preferring one map.
-    pub fn lookup_with_depth(&self, name: &str) -> Option<(&Symbol, usize)> {
-        self.scopes
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(depth, scope)| scope.symbols.get(name).map(|symbol| (symbol, depth)))
+    /// The innermost visible declaration of `name` and whether it is an
+    /// enumeration constant. Enumerators share C's ordinary-identifier
+    /// namespace with objects, functions and typedefs (C11 6.2.3), so the
+    /// innermost declaration decides which one a use denotes; sema keeps the
+    /// enumerator's value in `TypeContext::enum_constants`, and this flag is
+    /// what selects it. One scope walk, and no invariant tying this table's
+    /// scope depth to another structure's.
+    pub fn lookup_ordinary(&self, name: &str) -> Option<(&Symbol, bool)> {
+        self.scopes.iter().rev().find_map(|scope| {
+            scope
+                .symbols
+                .get(name)
+                .map(|symbol| (symbol, scope.enumerators.contains(name)))
+        })
     }
 
     /// Look up a declaration in this scope only. A nested function definition
@@ -156,6 +190,57 @@ impl SymbolTable {
         }
     }
 
+    /// Record that the innermost scope's `name` is a `constexpr` object, with
+    /// the values of its scalar members (path, value).
+    pub fn mark_constexpr(&mut self, name: &str, members: Vec<(String, FoldedValue)>) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.constexpr_objects.insert(name.to_string());
+            for (path, value) in members {
+                scope
+                    .constexpr_members
+                    .insert((name.to_string(), path), value);
+            }
+        }
+    }
+
+    /// Whether the innermost visible declaration of `name` is a `constexpr`
+    /// object.
+    pub fn is_constexpr(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.symbols.contains_key(name))
+            .is_some_and(|scope| scope.constexpr_objects.contains(name))
+    }
+
+    /// The value of member `path` (`.a.b`) of the `constexpr` object the
+    /// innermost visible declaration of `name` denotes.
+    pub fn constexpr_member(&self, name: &str, path: &str) -> Option<FoldedValue> {
+        let scope = self
+            .scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.symbols.contains_key(name))?;
+        scope
+            .constexpr_members
+            .get(&(name.to_string(), path.to_string()))
+            .copied()
+    }
+
+    /// Record that the innermost scope's `name` is an enumeration constant.
+    pub fn mark_enumerator(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.enumerators.insert(name.to_string());
+        }
+    }
+
+    /// Whether the innermost visible declaration of `name` is an enumeration
+    /// constant, i.e. no object, function or typedef of that name hides it.
+    pub fn is_enumerator(&self, name: &str) -> bool {
+        self.lookup_ordinary(name)
+            .is_some_and(|(_, enumerator)| enumerator)
+    }
+
     /// Whether the innermost visible declaration of `name` is an automatic
     /// object. Enumerators, functions and typedefs are never recorded, so
     /// they answer `false`.
@@ -165,6 +250,24 @@ impl SymbolTable {
             .rev()
             .find(|scope| scope.symbols.contains_key(name))
             .is_some_and(|scope| scope.automatic.contains(name))
+    }
+
+    /// Record that the innermost scope's object `name` has a `const` base
+    /// specifier (see `common::qualifiers`).
+    pub fn mark_const_base(&mut self, name: &str) {
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.const_base.insert(name.to_string());
+        }
+    }
+
+    /// Whether the innermost visible declaration of `name` is an object with
+    /// a `const` base specifier (see `mark_const_base`).
+    pub fn is_const_base(&self, name: &str) -> bool {
+        self.scopes
+            .iter()
+            .rev()
+            .find(|scope| scope.symbols.contains_key(name))
+            .is_some_and(|scope| scope.const_base.contains(name))
     }
 
     /// Whether the innermost visible declaration of `name` is a const object

@@ -543,25 +543,15 @@ impl Lowerer {
             // Truncating first (e.g. 0x100 -> U8 = 0) then normalizing gives wrong results.
             let val = self.lower_expr(expr);
             let expr_ty = self.value_ir_type(expr);
-            self.emit_bool_normalize_typed(val, expr_ty)
+            self.emit_expr_bool_conversion(val, expr_ty, expr)
         } else {
             let val = self.lower_expr(expr);
             let expr_ty = self.value_ir_type(expr);
             match &da.c_type {
-                // _Float128 (and its U128 carrier) must route through the
-                // soft-float helpers; a plain F64/F32->U128 bit-cast would
-                // store an integer bit pattern instead of binary128 bytes.
-                // C23 decimals likewise route through the libbid helpers; a
-                // raw IR cast would emit binary cvtsi2ss/sd on BID carriers.
-                Some(target_ct)
-                    if *target_ct == CType::Float128
-                        || rhs_ctype == CType::Float128
-                        || target_ct.is_decimal()
-                        || rhs_ctype.is_decimal() =>
-                {
-                    self.convert_scalar_ctype(val, expr_ty, &rhs_ctype, target_ct)
+                Some(target_ct) => {
+                    self.convert_assign_value(val, expr_ty, Some(&rhs_ctype), target_ct, da.var_ty)
                 }
-                _ => self.emit_implicit_cast(val, expr_ty, da.var_ty),
+                None => self.emit_implicit_cast(val, expr_ty, da.var_ty),
             }
         };
         self.emit(Instruction::Store {
@@ -631,9 +621,8 @@ impl Lowerer {
         // Store real part (first item)
         if let Some(item) = items.first() {
             if let Initializer::Expr(expr) = &item.init {
-                let val = self.lower_expr(expr);
-                let expr_ty = self.get_expr_type(expr);
-                let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
+                let comp_ct = Self::complex_component_ctype(&complex_ctype);
+                let val = self.lower_init_leaf(expr, &comp_ct);
                 self.emit(Instruction::Store {
                     volatile: false,
                     val,
@@ -657,9 +646,8 @@ impl Lowerer {
         let imag_ptr = self.emit_gep_offset(alloca, comp_size, IrType::I8);
         if let Some(item) = items.get(1) {
             if let Initializer::Expr(expr) = &item.init {
-                let val = self.lower_expr(expr);
-                let expr_ty = self.get_expr_type(expr);
-                let val = self.emit_implicit_cast(val, expr_ty, comp_ty);
+                let comp_ct = Self::complex_component_ctype(&complex_ctype);
+                let val = self.lower_init_leaf(expr, &comp_ct);
                 self.emit(Instruction::Store {
                     volatile: false,
                     val,
@@ -760,15 +748,16 @@ impl Lowerer {
             // is sizeof(pointer) not sizeof(struct), so we must NOT route to lower_array_of_structs_init.
             if da.array_dim_strides.len() > 1 {
                 self.zero_init_alloca(alloca, da.alloc_size);
-                self.lower_array_init_list(items, alloca, IrType::Ptr, &da.array_dim_strides);
+                let ptr_ct = CType::Pointer(Box::new(CType::Void), AddressSpace::Default);
+                self.lower_array_init_list(items, alloca, &ptr_ct, &da.array_dim_strides);
             } else {
                 self.lower_1d_array_init(items, alloca, da, decl);
             }
         } else if da.array_dim_strides.len() > 1 && elem_struct_layout.is_none() {
             // Multi-dimensional array of scalars
             self.zero_init_alloca(alloca, da.alloc_size);
-            let md_elem_ty = da.elem_ir_ty;
-            self.lower_array_init_list(items, alloca, md_elem_ty, &da.array_dim_strides);
+            let md_elem_ct = self.init_leaf_ctype(da.c_type.as_ref(), &decl.type_spec);
+            self.lower_array_init_list(items, alloca, &md_elem_ct, &da.array_dim_strides);
         } else if let Some(ref s_layout) = elem_struct_layout {
             // Array of structs
             self.lower_array_of_structs_init(items, alloca, da, s_layout);
@@ -1064,21 +1053,13 @@ impl Lowerer {
                         }
                     }
                 } else {
-                    let elem_ir_ty = IrType::from_ctype(elem_ty);
-                    let elem_is_bool = **elem_ty == CType::Bool;
                     for (ai, sub_item) in sub_items.iter().enumerate() {
                         if ai >= arr_size {
                             break;
                         }
                         if let Initializer::Expr(e) = &sub_item.init {
                             let elem_offset = field_offset + ai * elem_size;
-                            self.emit_init_expr_to_offset_bool(
-                                e,
-                                alloca,
-                                elem_offset,
-                                elem_ir_ty,
-                                elem_is_bool,
-                            );
+                            self.emit_init_expr_to_offset(e, alloca, elem_offset, elem_ty);
                         }
                     }
                 }
@@ -1091,7 +1072,7 @@ impl Lowerer {
             } else if let Some(first) = sub_items.first() {
                 if let Initializer::Expr(e) = &first.init {
                     let field_ir_ty = IrType::from_ctype(&field.ty);
-                    let val = self.lower_and_cast_init_expr(e, field_ir_ty);
+                    let val = self.lower_init_leaf(e, &field.ty);
                     self.emit_store_at_offset(alloca, field_offset, val, field_ir_ty);
                 }
             }
@@ -1114,13 +1095,7 @@ impl Lowerer {
                 self.emit_complex_expr_to_offset(e, alloca, field_offset, &field.ty);
             } else {
                 let field_ty = IrType::from_ctype(&field.ty);
-                let val = if field.ty == CType::Bool {
-                    let v = self.lower_expr(e);
-                    let et = self.get_expr_type(e);
-                    self.emit_bool_normalize_typed(v, et)
-                } else {
-                    self.lower_and_cast_init_expr(e, field_ty)
-                };
+                let val = self.lower_init_leaf(e, &field.ty);
                 self.emit_store_at_offset(alloca, base_byte_offset + field.offset, val, field_ty);
             }
         }
@@ -1236,9 +1211,12 @@ impl Lowerer {
         }
 
         let is_complex_elem_array = self.is_type_complex(&decl.type_spec);
-        let is_bool_elem_array = self.is_type_bool(&decl.type_spec)
-            && !da.is_array_of_pointers
-            && !da.is_array_of_func_ptrs;
+        // The innermost element C type of the object, through typedefs and
+        // `typeof` (`typedef _Bool B3[3]; B3 b = {...}` has `_Bool` elements
+        // although its type specifier is not `_Bool`).
+        let elem_ct = (!da.is_array_of_pointers && !da.is_array_of_func_ptrs)
+            .then(|| self.init_leaf_ctype(da.c_type.as_ref(), &decl.type_spec));
+        let is_bool_elem_array = elem_ct == Some(CType::Bool);
 
         let elem_store_ty = if da.is_array_of_pointers || da.is_array_of_func_ptrs {
             IrType::Ptr
@@ -1309,8 +1287,8 @@ impl Lowerer {
                 } else if is_bool_elem_array {
                     // _Bool array elements: normalize (any nonzero -> 1) per C11 6.3.1.2
                     let val = self.lower_expr(e);
-                    let expr_ty = self.get_expr_type(e);
-                    let val = self.emit_bool_normalize_typed(val, expr_ty);
+                    let expr_ty = self.value_ir_type(e);
+                    let val = self.emit_expr_bool_conversion(val, expr_ty, e);
                     self.emit_array_element_store(
                         alloca,
                         val,
@@ -1319,8 +1297,20 @@ impl Lowerer {
                     );
                 } else {
                     let val = self.lower_expr(e);
-                    let expr_ty = self.get_expr_type(e);
-                    let val = self.emit_implicit_cast(val, expr_ty, elem_store_ty);
+                    let expr_ty = self.value_ir_type(e);
+                    let val = match &elem_ct {
+                        Some(ct) => {
+                            let src_ct = self.get_expr_ctype(e);
+                            self.convert_assign_value(
+                                val,
+                                expr_ty,
+                                src_ct.as_ref(),
+                                ct,
+                                elem_store_ty,
+                            )
+                        }
+                        None => self.emit_implicit_cast(val, expr_ty, elem_store_ty),
+                    };
                     self.emit_array_element_store(
                         alloca,
                         val,
@@ -1379,11 +1369,12 @@ impl Lowerer {
             };
             if let (true, Some(e)) = (idx < num_elems, init_expr) {
                 let val = self.lower_expr(e);
-                let expr_ty = self.get_expr_type(e);
+                let expr_ty = self.value_ir_type(e);
                 let val = if matches!(elem_ct, CType::Bool) {
-                    self.emit_bool_normalize_typed(val, expr_ty)
+                    self.emit_expr_bool_conversion(val, expr_ty, e)
                 } else {
-                    self.emit_implicit_cast(val, expr_ty, elem_ir_ty)
+                    let src_ct = self.get_expr_ctype(e);
+                    self.convert_assign_value(val, expr_ty, src_ct.as_ref(), elem_ct, elem_ir_ty)
                 };
                 self.store_vector_lane(
                     alloca,
@@ -1412,10 +1403,13 @@ impl Lowerer {
     ) {
         if let Some(expr) = Self::unwrap_nested_init_expr(items) {
             let val = self.lower_expr(expr);
-            let expr_ty = self.get_expr_type(expr);
+            let expr_ty = self.value_ir_type(expr);
             // For _Bool, normalize before any truncation to preserve high bits
             let val = if da.is_bool {
-                self.emit_bool_normalize_typed(val, expr_ty)
+                self.emit_expr_bool_conversion(val, expr_ty, expr)
+            } else if let Some(target_ct) = &da.c_type {
+                let src_ct = self.get_expr_ctype(expr);
+                self.convert_assign_value(val, expr_ty, src_ct.as_ref(), target_ct, da.var_ty)
             } else {
                 self.emit_implicit_cast(val, expr_ty, da.var_ty)
             };

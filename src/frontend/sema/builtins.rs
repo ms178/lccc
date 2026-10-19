@@ -152,6 +152,9 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     // For common usage with "" this is correct; full payload support needs custom lowering.
     m.insert("__builtin_nan", BuiltinInfo::constant_f64(f64::NAN));
     m.insert("__builtin_nanf", BuiltinInfo::constant_f64(f64::NAN));
+    // Signaling NaNs: the bits (and payload) come from the shared folder.
+    m.insert("__builtin_nans", BuiltinInfo::constant_f64(f64::NAN));
+    m.insert("__builtin_nansf", BuiltinInfo::constant_f64(f64::NAN));
     m.insert("__builtin_inf", BuiltinInfo::constant_f64(f64::INFINITY));
     m.insert("__builtin_inff", BuiltinInfo::constant_f64(f64::INFINITY));
     m.insert("__builtin_infl", BuiltinInfo::constant_f64(f64::INFINITY));
@@ -168,6 +171,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::constant_f64(f64::INFINITY),
     );
     m.insert("__builtin_nanl", BuiltinInfo::constant_f64(f64::NAN));
+    m.insert("__builtin_nansl", BuiltinInfo::constant_f64(f64::NAN));
     // _Float128 variants (IEEE binary128): +Inf = 0x7FFF0000...0,
     // qNaN = 0x7FFF8000...0 (big-endian byte order in the 16-byte payload).
     m.insert(
@@ -183,10 +187,28 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::constant_f128([0x7F, 0xFF, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
     );
     m.insert(
+        "__builtin_nansf128",
+        BuiltinInfo::constant_f128([0x7F, 0xFF, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+    );
+    m.insert(
         "__builtin_copysignf128",
         BuiltinInfo::simple("__copysigntf3"),
     );
     m.insert("__builtin_fabsf128", BuiltinInfo::simple("__fabstf2"));
+    // GCC's `q` spellings of the __float128 builtins (x86; <quadmath.h>
+    // defines HUGE_VALQ as __builtin_huge_valq()). Without them each was an
+    // implicitly declared int function: silent wrong code.
+    for (q, f128) in [
+        ("__builtin_huge_valq", "__builtin_huge_valf128"),
+        ("__builtin_infq", "__builtin_inff128"),
+        ("__builtin_nanq", "__builtin_nanf128"),
+        ("__builtin_nansq", "__builtin_nansf128"),
+        ("__builtin_copysignq", "__builtin_copysignf128"),
+        ("__builtin_fabsq", "__builtin_fabsf128"),
+    ] {
+        let info = m[f128].clone();
+        m.insert(q, info);
+    }
 
     // I/O
     m.insert("__builtin_printf", BuiltinInfo::simple("printf"));

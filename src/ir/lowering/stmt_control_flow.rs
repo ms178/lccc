@@ -27,12 +27,12 @@ impl Lowerer {
         self.lower_condition_branch(cond, then_label, false_target);
 
         self.start_block(then_label);
-        self.lower_stmt(then_stmt);
+        self.lower_substatement(then_stmt);
         self.terminate(Terminator::Branch(end_label));
 
         if let Some(else_stmt) = else_stmt {
             self.start_block(else_label);
-            self.lower_stmt(else_stmt);
+            self.lower_substatement(else_stmt);
             self.terminate(Terminator::Branch(end_label));
         }
 
@@ -57,7 +57,7 @@ impl Lowerer {
         self.lower_condition_branch(cond, body_label, end_label);
 
         self.start_block(body_label);
-        self.lower_stmt(body);
+        self.lower_substatement(body);
         let continue_target = self
             .func()
             .continue_labels
@@ -90,7 +90,7 @@ impl Lowerer {
         if let Some(init) = init {
             match init.as_ref() {
                 ForInit::Declaration(decl) => {
-                    self.collect_enum_constants_scoped(&decl.type_spec);
+                    self.declare_local_decl_tags(decl);
                     self.lower_local_decl(decl);
                 }
                 ForInit::Expr(expr) => self.lower_expr_discarded(expr),
@@ -121,7 +121,7 @@ impl Lowerer {
 
         // Body
         self.start_block(body_label);
-        self.lower_stmt(body);
+        self.lower_substatement(body);
         self.terminate(Terminator::Branch(inc_label));
 
         // Increment
@@ -156,7 +156,7 @@ impl Lowerer {
         self.terminate(Terminator::Branch(body_label));
 
         self.start_block(body_label);
-        self.lower_stmt(body);
+        self.lower_substatement(body);
         self.terminate(Terminator::Branch(cond_label));
 
         self.start_block(cond_label);

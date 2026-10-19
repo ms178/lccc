@@ -17,8 +17,9 @@ pub(crate) use registers::*;
 pub(crate) use crate::backend::x86::assembler::encoder::strip_plt_suffix;
 
 use crate::backend::x86::assembler::encoder::{
-    InstructionEncoder as X86InstructionEncoder, gp_id, is_reg64, is_size_matched_accumulator,
-    is_vex_xop_encoding, normalize_bare_label, op_decorated, string_op_size, vec_reg_id,
+    InstructionEncoder as X86InstructionEncoder, check_movext_register_sizes, gp_id, is_reg64,
+    is_size_matched_accumulator, is_vex_xop_encoding, normalize_bare_label, op_decorated,
+    string_op_size, vec_reg_id,
 };
 use crate::backend::x86::assembler::parser::*;
 
@@ -2546,7 +2547,9 @@ impl InstructionEncoder {
                 Ok(())
             }
             "fistl" => self.encode_x87_mem(ops, &[0xDB], 2),
+            "fists" => self.encode_x87_mem(ops, &[0xDF], 2),
             "fistps" => self.encode_x87_mem(ops, &[0xDF], 3),
+            "fisttps" => self.encode_x87_mem(ops, &[0xDF], 1),
             "fildll" => self.encode_x87_mem(ops, &[0xDF], 5),
             "fisttpll" => self.encode_x87_mem(ops, &[0xDD], 1),
             "fistpll" => self.encode_x87_mem(ops, &[0xDF], 7),
@@ -3494,6 +3497,22 @@ mod merged_pr629_followup_tests {
             .map(|b| format!("{b:02x}"))
             .collect::<Vec<_>>()
             .join(" "))
+    }
+
+    #[test]
+    fn x87_integer_memory_forms_match_gnu_as() {
+        // Reference bytes: GNU as --32 + objdump. The 16-bit stores were
+        // missing, so the i686 cast path's `fisttps` failed to assemble.
+        for (line, hex) in [
+            ("fists (%esp)", "df 14 24"),
+            ("fistps 4(%esp)", "df 5c 24 04"),
+            ("fisttps (%esp)", "df 0c 24"),
+            ("fisttpl 8(%esp)", "db 4c 24 08"),
+            ("filds 2(%esp)", "df 44 24 02"),
+            ("fistl (%esp)", "db 14 24"),
+        ] {
+            assert_eq!(assemble(line).as_deref(), Ok(hex), "{line}");
+        }
     }
 
     #[test]

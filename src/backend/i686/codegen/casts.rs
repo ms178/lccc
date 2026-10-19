@@ -525,8 +525,17 @@ impl I686Codegen {
             if pair_result {
                 self.state.reg_cache.invalidate_sec();
             }
+        } else if matches!(to_ty, IrType::I8 | IrType::U8 | IrType::I16) {
+            // Every defined I8/U8/I16 result fits signed i16. Converting at
+            // 16 bits (as GCC does) also makes the C-undefined out-of-range
+            // result the 16-bit indefinite integer 0x8000, matching GCC.
+            self.state.emit("    subl $4, %esp");
+            self.state.emit("    fisttps (%esp)");
+            self.state.emit("    movswl (%esp), %eax");
+            self.state.emit("    addl $4, %esp");
+            self.state.reg_cache.invalidate_acc();
         } else {
-            // Every defined I8/U8/I16/U16/I32 result fits signed i32.
+            // Every defined U16/I32 result fits signed i32.
             self.state.emit("    subl $4, %esp");
             self.state.emit("    fisttpl (%esp)");
             self.state.emit("    movl (%esp), %eax");

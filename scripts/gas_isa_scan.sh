@@ -23,6 +23,9 @@
 #
 # TUs that opt into an ISA explicitly (intrinsic headers, __builtin_ia32_*,
 # __attribute__((target)), inline asm) are skipped unless ARCH is `any`.
+# Under `any`, a TU whose .flags file selects an ISA (-march=, -mno-*,
+# -msse*/-mavx*/...) is compiled with those flags appended: the scan checks
+# the TU at the ISA it declares, as the regression runner does.
 #
 # Usage:
 #   scripts/gas_isa_scan.sh <ARCH> [lccc flags...]
@@ -50,7 +53,17 @@ scan_one() { # scan_one <ARCH> <flags...>
             grep -qE '#include <(imm|emm|xmm|smm|tmm|nmm|pmm|wmm|amm|x86|x86gpr)intrin\.h>|__builtin_ia32|__attribute__\(\(target|__m128|__m256|\basm\b|__asm__' "$f" && continue
         fi
         n=$((n + 1))
-        timeout 30 "$lccc" "${flags[@]}" -S "$f" -o "$tmp/t.s" 2>/dev/null || continue
+        # A syntax-only scan keeps the TU's own ISA contract: inline asm is
+        # well-formed only under the ISA its .flags pins (`%vsqrtsd %d1, %d0`
+        # in inline_asm_gcc_vex_modifiers_noavx.c is a two-operand legacy
+        # form at -march=x86-64; GCC 16.2 emits the same four-operand VEX
+        # text lccc does under -mavx, and GAS refuses both).
+        local isa_flags=()
+        if [[ $arch == any && -f ${f%.c}.flags ]]; then
+            read -ra isa_flags < <(tr -s ' \t' '\n' <"${f%.c}.flags" |
+                grep -E '^-(march=|mno-|m(sse|avx|fma|bmi|f16c|popcnt|lzcnt))' | tr '\n' ' ')
+        fi
+        timeout 30 "$lccc" "${flags[@]}" "${isa_flags[@]}" -S "$f" -o "$tmp/t.s" 2>/dev/null || continue
         if ! "$as_bin" --64 "${march[@]}" "$tmp/t.s" -o "$tmp/t.o" 2>"$tmp/err"; then
             if grep -q "is not supported on" "$tmp/err"; then
                 isa=$((isa + 1))

@@ -1698,6 +1698,88 @@ impl X86Codegen {
         );
     }
 
+    /// Multiply sources for an in-place 231-form FMA into `dest_name`:
+    /// `src1` must be a register, `src2` may be a register, a slot or a
+    /// RIP-relative constant (one memory operand per instruction). Neither
+    /// may read `dest_name`, which holds (or receives) the accumulator.
+    ///
+    /// A register-homed factor is `src1` directly. With only the other
+    /// factor homed, the factors are swapped -- IEEE multiplication is
+    /// exactly commutative, so the fused result is bit-identical. With
+    /// neither homed, `lhs` is staged in the scratch %xmm1 and `rhs` rides
+    /// as the memory operand (or reads %xmm1 again for `x*x`). Before the
+    /// staging arm, a slot-resident factor sent the whole FMA through the
+    /// 4-instruction acc->xmm0 / lhs->xmm1 / fma / xmm0->dest scratch path
+    /// (struct_copy's `dy*dy + acc`: `vmovsd %xmm3,%xmm0; movsd N(%rsp),
+    /// %xmm1; vfmadd231sd %xmm1,%xmm1,%xmm0; vmovsd %xmm0,%xmm3`).
+    fn fma_mul_sources(
+        &mut self,
+        mul_lhs: &Operand,
+        mul_rhs: &Operand,
+        dest_name: &str,
+    ) -> Option<(FmaSrc1, String)> {
+        let (lh, rh) = (self.fma_xmm_home(mul_lhs), self.fma_xmm_home(mul_rhs));
+        if lh == Some(dest_name) || rh == Some(dest_name) {
+            return None; // a factor lives in dest: path 2b's 132-form shape
+        }
+        // Decide the shape with the pure feasibility test first, so a
+        // declined shape never interns an unused pool constant.
+        match (lh, rh) {
+            (Some(l), Some(r)) => Some((FmaSrc1::Home(l), format!("%{}", r))),
+            (Some(l), None) => {
+                let m = self.fma_mem(mul_rhs)?;
+                Some((FmaSrc1::Home(l), self.fma_mem_text(m)))
+            }
+            (None, Some(r)) => {
+                let m = self.fma_mem(mul_lhs)?;
+                Some((FmaSrc1::Home(r), self.fma_mem_text(m)))
+            }
+            (None, None) => {
+                self.fma_mem(mul_lhs)?;
+                let same = matches!((mul_lhs, mul_rhs),
+                    (Operand::Value(a), Operand::Value(b)) if a.0 == b.0);
+                let src2 = if same {
+                    "%xmm1".to_string()
+                } else {
+                    let m = self.fma_mem(mul_rhs)?;
+                    self.fma_mem_text(m)
+                };
+                Some((FmaSrc1::Stage(mul_lhs.clone()), src2))
+            }
+        }
+    }
+
+    /// The operand's XMM home, if it still holds the operand's bits
+    /// (`fresh_home_of`: a home already overwritten by an in-place
+    /// definition is not a readable source -- the same guard path 2b uses).
+    fn fma_xmm_home(&self, op: &Operand) -> Option<&'static str> {
+        let Operand::Value(v) = op else { return None };
+        let reg = self.fresh_home_of(v.0)?;
+        is_xmm_reg(reg).then(|| phys_reg_name(reg))
+    }
+
+    /// `op` as a legal FMA memory source that is not a register home: a
+    /// slot-resident value or an F32/F64 pool constant. Pure (interns no
+    /// constant), so a declined shape leaves the pool untouched.
+    fn fma_mem(&self, op: &Operand) -> Option<FmaMem> {
+        match op {
+            Operand::Value(v) if !self.reg_assignments.contains_key(&v.0) => {
+                self.state.get_slot(v.0).map(|slot| FmaMem::Slot(slot.0))
+            }
+            Operand::Const(IrConst::F64(c)) => Some(FmaMem::Pool(c.to_bits())),
+            Operand::Const(IrConst::F32(c)) => Some(FmaMem::Pool(c.to_bits() as u64)),
+            _ => None,
+        }
+    }
+
+    /// The memory operand text of an `fma_mem` source (interns a constant).
+    fn fma_mem_text(&mut self, m: FmaMem) -> String {
+        match m {
+            FmaMem::Slot(off) => self.slot_ref(off),
+            FmaMem::Pool(bits) => format!("{}(%rip)", self.state.get_fp_const_label(bits)),
+        }
+    }
+
     fn emit_scalar_fma231_with(
         &mut self,
         fma: &str,
@@ -1713,86 +1795,35 @@ impl X86Codegen {
         // in dot products and short FP reductions. It is safe only when neither
         // multiply source aliases the destructive destination; otherwise keep
         // the scratch path below.
-        let xmm_home = |op: &Operand| -> Option<&'static str> {
-            let Operand::Value(v) = op else { return None };
-            let reg = self.reg_assignments.get(&v.0).copied()?;
-            is_xmm_reg(reg).then(|| phys_reg_name(reg))
-        };
         if let Some(dest_reg) = self.dest_reg(add_dest).filter(|r| is_xmm_reg(*r)) {
             let dest_name = phys_reg_name(dest_reg);
-            if xmm_home(acc) == Some(dest_name) {
-                if let Some(lhs_name) = xmm_home(mul_lhs).filter(|name| *name != dest_name) {
-                    match mul_rhs {
-                        Operand::Value(v) => {
-                            if let Some(rhs_name) =
-                                xmm_home(mul_rhs).filter(|name| *name != dest_name)
-                            {
-                                self.state.emit_fmt(format_args!(
-                                    "    {} %{}, %{}, %{}",
-                                    fma, rhs_name, lhs_name, dest_name
-                                ));
-                                self.state.reg_cache.invalidate_acc();
-                                // Definition-writes-home accounting: the
-                                // destructive 231-form wrote the fused
-                                // dest's XMM home (and destroyed the acc's
-                                // bits there).
-                                self.note_inplace_compute(dest_reg, add_dest.0);
-                                return;
-                            }
-                            if let Some(slot) = self.state.get_slot(v.0) {
-                                let sr = self.slot_ref(slot.0);
-                                self.state.emit_fmt(format_args!(
-                                    "    {} {}, %{}, %{}",
-                                    fma, sr, lhs_name, dest_name
-                                ));
-                                self.state.reg_cache.invalidate_acc();
-                                self.note_inplace_compute(dest_reg, add_dest.0);
-                                return;
-                            }
-                        }
-                        _ => {}
-                    }
+            let acc_in_place = self.fma_xmm_home(acc) == Some(dest_name);
+            if let Some((src1, src2)) = self.fma_mul_sources(mul_lhs, mul_rhs, dest_name) {
+                // In place: the accumulator already lives in the destination
+                // (path 1, the dot-product/reduction shape) or is preloaded
+                // into it (one movsd, or one slot/constant load). Neither
+                // multiply source reads `dest_name` (`fma_mul_sources`), so
+                // the preload cannot clobber one.
+                if !acc_in_place {
+                    self.load_fp_to_reg(acc, ty, dest_name);
                 }
-            }
-            // General XMM-homed destination: preload the accumulator into
-            // the destination register (one movsd — or zero when the
-            // accumulator is slot-resident) and run the destructive
-            // 231-form in place. Replaces the acc->xmm0 / lhs->xmm1 /
-            // FMA / xmm0->dest scratch dance (4 insns -> <=2). Aliasing
-            // guards: both multiply sources must be readable from homes or
-            // slots DISTINCT from the destination, and the accumulator
-            // preload must not clobber a source (dest_name is excluded as
-            // either source's home below).
-            if xmm_home(acc) != Some(dest_name) {
-                if let Some(lhs_name) = xmm_home(mul_lhs).filter(|name| *name != dest_name) {
-                    let rhs_src: Option<String> = match mul_rhs {
-                        Operand::Value(v) => match xmm_home(mul_rhs) {
-                            Some(n) if n != dest_name => Some(format!("%{}", n)),
-                            Some(_) => None,
-                            None => self.state.get_slot(v.0).map(|slot| self.slot_ref(slot.0)),
-                        },
-                        // FP constant: RIP-relative memory operand, exactly
-                        // what GCC feeds vfmadd231sd for literal multipliers.
-                        Operand::Const(IrConst::F64(c)) => {
-                            let label = self.state.get_fp_const_label(c.to_bits());
-                            Some(format!("{}(%rip)", label))
-                        }
-                        _ => None,
-                    };
-                    if let Some(rhs) = rhs_src {
-                        self.load_fp_to_reg(acc, ty, dest_name);
-                        self.state.emit_fmt(format_args!(
-                            "    {} {}, %{}, %{}",
-                            fma, rhs, lhs_name, dest_name
-                        ));
-                        self.state.reg_cache.invalidate_acc();
-                        // Definition-writes-home accounting: the preload
-                        // staged the acc and the 231-form derived the fused
-                        // dest into its XMM home.
-                        self.note_inplace_compute(dest_reg, add_dest.0);
-                        return;
+                let src1_name = match src1 {
+                    FmaSrc1::Home(name) => name,
+                    FmaSrc1::Stage(op) => {
+                        self.load_fp_to_reg(&op, ty, "xmm1");
+                        "xmm1"
                     }
-                }
+                };
+                self.state.emit_fmt(format_args!(
+                    "    {} {}, %{}, %{}",
+                    fma, src2, src1_name, dest_name
+                ));
+                self.state.reg_cache.invalidate_acc();
+                // Definition-writes-home accounting: the destructive 231-form
+                // wrote the fused dest's XMM home (and destroyed the acc's
+                // bits there).
+                self.note_inplace_compute(dest_reg, add_dest.0);
+                return;
             }
         }
 
@@ -1887,6 +1918,16 @@ impl X86Codegen {
                                     } else {
                                         None // acc at dest: path 1's shape
                                     }
+                                }
+                                // A slot-resident addend is one load into
+                                // the xmm0 scratch, like a constant addend:
+                                // the other factor is a home distinct from
+                                // xmm0 or a memory operand, so the load
+                                // clobbers no source. Before, this shape
+                                // fell to the 4-instruction scratch path.
+                                _ if self.fma_mem(acc).is_some() => {
+                                    self.load_fp_to_xmm0(acc, ty);
+                                    Some("%xmm0".to_string())
                                 }
                                 _ => None,
                             },
@@ -2085,4 +2126,21 @@ impl X86Codegen {
         }
         self.store_xmm0_fp_dest(add_dest, ty);
     }
+}
+
+/// A legal FMA memory source that is not a register home (`fma_mem`).
+#[derive(Clone, Copy)]
+enum FmaMem {
+    /// Slot-resident value at this frame offset.
+    Slot(i64),
+    /// F32/F64 pool constant (bit pattern; F32 bits zero-extended).
+    Pool(u64),
+}
+
+/// The register source of an in-place 231-form FMA (`fma_mul_sources`).
+enum FmaSrc1 {
+    /// The factor's own XMM home.
+    Home(&'static str),
+    /// A slot- or pool-resident factor, loaded into the scratch %xmm1.
+    Stage(Operand),
 }

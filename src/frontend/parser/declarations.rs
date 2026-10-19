@@ -131,10 +131,7 @@ impl Parser {
 
         // Handle _Static_assert at file scope
         if matches!(self.peek(), TokenKind::StaticAssert) {
-            return Some(match self.parse_static_assert() {
-                Some(deferred) => ExternalDecl::StaticAssert(deferred),
-                None => ExternalDecl::Declaration(Declaration::empty()),
-            });
+            return Some(ExternalDecl::StaticAssert(self.parse_static_assert()));
         }
 
         let start = self.peek_span();
@@ -179,6 +176,8 @@ impl Parser {
             d.set_extern(self.attrs.parsing_extern());
             d.set_typedef(self.attrs.parsing_typedef());
             d.set_const(self.attrs.parsing_const());
+            d.set_constexpr(self.attrs.parsing_constexpr());
+            d.set_constexpr_last(self.attrs.parsing_constexpr_last());
             d.set_volatile(self.attrs.parsing_volatile());
             d.set_pointer_const(self.attrs.parsing_pointer_const());
             d.set_thread_local(self.attrs.parsing_thread_local());
@@ -192,6 +191,10 @@ impl Parser {
             self.parse_declarator_with_attrs();
         let declarator_object_space = self.attrs.declarator_object_space;
         let declarator_object_volatile = self.attrs.declarator_object_volatile;
+        let declarator_object_quals = (
+            self.attrs.declarator_object_restrict,
+            self.attrs.declarator_object_atomic,
+        );
         let declarator_base_volatile = self.attrs.declarator_base_volatile;
         let (post_ctor, post_dtor, post_mode, post_common, post_aligned, first_asm_reg) =
             self.parse_asm_and_attributes();
@@ -237,6 +240,7 @@ impl Parser {
         let mut decl_attrs = DeclAttributes::default();
         decl_attrs.object_space = declarator_object_space;
         decl_attrs.object_volatile = declarator_object_volatile;
+        (decl_attrs.object_restrict, decl_attrs.object_atomic) = declarator_object_quals;
         decl_attrs.base_volatile = declarator_base_volatile;
         decl_attrs.set_constructor(is_constructor);
         decl_attrs.set_destructor(is_destructor);
@@ -343,10 +347,15 @@ impl Parser {
         // prototypes (sema applies it to CType::Function's return type).
         apply_decl_address_space_to_spec(&mut return_type, self.attrs.decl_address_space);
 
-        // Shadow typedef names used as parameter names
+        // Shadow typedef names used as parameter names, and hide enumerators
+        // of the same name until the body ends.
+        let enum_mark = self.enum_scope_log.len();
         let mut shadowed_added: Vec<String> = Vec::new();
         for param in &final_params {
             if let Some(ref pname) = param.name {
+                if self.is_parser_enum_constant(pname) {
+                    self.hide_enum_constant(pname);
+                }
                 if self.typedefs.contains(pname) && !self.shadowed_typedefs.contains(pname) {
                     self.shadowed_typedefs.insert(pname.clone());
                     shadowed_added.push(pname.clone());
@@ -369,6 +378,7 @@ impl Parser {
         for n in shadowed_added {
             self.shadowed_typedefs.remove(&n);
         }
+        self.restore_enum_scope(enum_mark);
 
         Some(ExternalDecl::FunctionDef(FunctionDef {
             alignment,
@@ -778,6 +788,10 @@ impl Parser {
             let (dname, dderived) = self.parse_declarator();
             let d_object_space = self.attrs.declarator_object_space;
             let d_object_volatile = self.attrs.declarator_object_volatile;
+            let d_object_quals = (
+                self.attrs.declarator_object_restrict,
+                self.attrs.declarator_object_atomic,
+            );
             let d_base_volatile = self.attrs.declarator_base_volatile;
             let (d_ctor, d_dtor, _, d_common, _, d_asm_reg) = self.parse_asm_and_attributes();
             ctx.is_common = ctx.is_common || d_common;
@@ -839,6 +853,7 @@ impl Parser {
                     da.section = d_section;
                     da.object_space = d_object_space;
                     da.object_volatile = d_object_volatile;
+                    (da.object_restrict, da.object_atomic) = d_object_quals;
                     da.base_volatile = d_base_volatile;
                     da.asm_register = d_asm_reg;
                     da.cleanup_fn = d_cleanup_fn;
@@ -882,6 +897,8 @@ impl Parser {
         d.set_extern(self.attrs.parsing_extern());
         d.set_typedef(is_typedef);
         d.set_const(self.attrs.parsing_const());
+        d.set_constexpr(self.attrs.parsing_constexpr());
+        d.set_constexpr_last(self.attrs.parsing_constexpr_last());
         d.set_volatile(self.attrs.parsing_volatile());
         d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_common(ctx.is_common);
@@ -904,6 +921,9 @@ impl Parser {
         self.attrs.set_typedef(false);
         self.attrs.set_inline(false);
         self.attrs.set_const(false);
+        self.attrs.set_constexpr(false);
+        self.attrs.set_atomic(false);
+        self.attrs.set_restrict(false);
         self.attrs.set_volatile(false);
         self.attrs.set_typedef_use(false);
         self.attrs.set_typedef_object_volatile(false);
@@ -951,6 +971,8 @@ impl Parser {
             d.set_extern(is_extern);
             d.set_typedef(self.attrs.parsing_typedef());
             d.set_const(self.attrs.parsing_const());
+            d.set_constexpr(self.attrs.parsing_constexpr());
+            d.set_constexpr_last(self.attrs.parsing_constexpr_last());
             d.set_volatile(self.attrs.parsing_volatile());
             d.set_pointer_const(self.attrs.parsing_pointer_const());
             d.set_thread_local(self.attrs.parsing_thread_local());
@@ -963,6 +985,10 @@ impl Parser {
             let (name, derived, decl_mode, _, decl_aligned, _) = self.parse_declarator_with_attrs();
             let l_object_space = self.attrs.declarator_object_space;
             let l_object_volatile = self.attrs.declarator_object_volatile;
+            let l_object_quals = (
+                self.attrs.declarator_object_restrict,
+                self.attrs.declarator_object_atomic,
+            );
             let l_base_volatile = self.attrs.declarator_base_volatile;
             let (skip_mode, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
             let local_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
@@ -985,6 +1011,7 @@ impl Parser {
                     let mut da = DeclAttributes::default();
                     da.object_space = l_object_space;
                     da.object_volatile = l_object_volatile;
+                    (da.object_restrict, da.object_atomic) = l_object_quals;
                     da.base_volatile = l_base_volatile;
                     da.section = local_section;
                     da.asm_register = skip_asm_reg;
@@ -1027,6 +1054,15 @@ impl Parser {
         } else {
             type_spec
         };
+
+        // A block-scope declaration hides an enumerator of the same name.
+        if self.block_depth > 0 {
+            for decl in &declarators {
+                if self.is_parser_enum_constant(&decl.name) {
+                    self.hide_enum_constant(&decl.name);
+                }
+            }
+        }
 
         // Register typedef names or shadow them for variable declarations
         let is_typedef = self.attrs.parsing_typedef();
@@ -1081,6 +1117,8 @@ impl Parser {
         d.set_extern(is_extern);
         d.set_typedef(is_typedef);
         d.set_const(self.attrs.parsing_const());
+        d.set_constexpr(self.attrs.parsing_constexpr());
+        d.set_constexpr_last(self.attrs.parsing_constexpr_last());
         d.set_volatile(self.attrs.parsing_volatile());
         d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_thread_local(self.attrs.parsing_thread_local());
@@ -1438,6 +1476,11 @@ impl Parser {
                     self.advance();
                     self.attrs.set_const(true);
                 }
+                TokenKind::Constexpr => {
+                    self.advance();
+                    self.attrs.set_const(true);
+                    self.attrs.set_constexpr(true);
+                }
                 TokenKind::Volatile => {
                     self.advance();
                     self.attrs.set_volatile(true);
@@ -1575,75 +1618,14 @@ impl Parser {
         spec
     }
 
-    /// Check whether an expression contains identifiers that are NOT enum constants.
-    /// Such identifiers are variables/parameters, which make the expression not a
-    /// valid integer constant expression (C11 6.6).
-    fn expr_has_non_const_identifier(
-        expr: &Expr,
-        enum_consts: Option<&FxHashMap<String, i64>>,
-        unevaluable_consts: Option<&FxHashSet<String>>,
-    ) -> bool {
-        match expr {
-            Expr::Identifier(name, _) => {
-                // It's a variable/parameter reference if not in enum constants
-                // (either evaluated or unevaluable)
-                let in_evaluated = enum_consts.is_some_and(|m| m.contains_key(name.as_str()));
-                let in_unevaluable = unevaluable_consts.is_some_and(|m| m.contains(name.as_str()));
-                !(in_evaluated || in_unevaluable)
-            }
-            Expr::BinaryOp(_, lhs, rhs, _) => {
-                Self::expr_has_non_const_identifier(lhs, enum_consts, unevaluable_consts)
-                    || Self::expr_has_non_const_identifier(rhs, enum_consts, unevaluable_consts)
-            }
-            Expr::UnaryOp(_, inner, _) => {
-                Self::expr_has_non_const_identifier(inner, enum_consts, unevaluable_consts)
-            }
-            Expr::Conditional(cond, then_expr, else_expr, _) => {
-                Self::expr_has_non_const_identifier(cond, enum_consts, unevaluable_consts)
-                    || Self::expr_has_non_const_identifier(
-                        then_expr,
-                        enum_consts,
-                        unevaluable_consts,
-                    )
-                    || Self::expr_has_non_const_identifier(
-                        else_expr,
-                        enum_consts,
-                        unevaluable_consts,
-                    )
-            }
-            Expr::GnuConditional(cond, fallback, _) => {
-                Self::expr_has_non_const_identifier(cond, enum_consts, unevaluable_consts)
-                    || Self::expr_has_non_const_identifier(
-                        fallback,
-                        enum_consts,
-                        unevaluable_consts,
-                    )
-            }
-            Expr::Cast(_, inner, _, _) => {
-                Self::expr_has_non_const_identifier(inner, enum_consts, unevaluable_consts)
-            }
-            Expr::Comma(lhs, rhs, _) => {
-                Self::expr_has_non_const_identifier(lhs, enum_consts, unevaluable_consts)
-                    || Self::expr_has_non_const_identifier(rhs, enum_consts, unevaluable_consts)
-            }
-            // Sizeof, literals, builtin calls, function calls, etc. that aren't
-            // evaluable still don't make the expression "definitely non-constant"
-            // from a variable-reference perspective. The eval_const_int_expr_with_enums
-            // function returning None for these cases will cause silent acceptance.
-            _ => false,
-        }
-    }
-
-    /// Parse and evaluate `_Static_assert(constant-expr, "message")` or
-    /// the C23 single-argument form `_Static_assert(constant-expr)`.
+    /// Parse `_Static_assert(constant-expr, "message")` or the C23
+    /// single-argument form `_Static_assert(constant-expr)`.
     ///
-    /// If the constant expression evaluates to zero, emits a compile error
-    /// with the provided message (or a default message for the single-arg form).
-    /// A condition the parser cannot evaluate without types (`sizeof`,
-    /// `_Generic`, enumerator types, builtins) is returned for sema to decide;
-    /// GCC diagnoses those too, so accepting them here would let a false
-    /// assertion compile.
-    pub(super) fn parse_static_assert(&mut self) -> Option<StaticAssert> {
+    /// Sema decides every assertion (`check_static_assert`): whether the
+    /// condition is a constant depends on types and on which declaration of
+    /// each identifier is visible -- an enumerator, a C23 `constexpr` object,
+    /// or a plain object hiding either -- which only sema knows.
+    pub(super) fn parse_static_assert(&mut self) -> StaticAssert {
         let assert_span = self.peek_span();
         self.advance(); // consume _Static_assert
         let open = self.peek_span();
@@ -1671,47 +1653,10 @@ impl Parser {
         self.expect_closing(&TokenKind::RParen, open);
         self.consume_if(&TokenKind::Semicolon);
 
-        // Evaluate the constant expression
-        let enums = if self.enum_constants.is_empty() {
-            None
-        } else {
-            Some(&self.enum_constants)
-        };
-        let tag_aligns = if self.struct_tag_alignments.is_empty() {
-            None
-        } else {
-            Some(&self.struct_tag_alignments)
-        };
-        let unevaluable = if self.unevaluable_enum_constants.is_empty() {
-            None
-        } else {
-            Some(&self.unevaluable_enum_constants)
-        };
-        if let Some(value) = Self::eval_const_int_expr_with_enums(&expr, enums, tag_aligns) {
-            if value == 0 {
-                // Static assertion failed
-                let msg = if let Some(ref m) = message {
-                    format!("static assertion failed: {}", m)
-                } else {
-                    "static assertion failed".to_string()
-                };
-                self.emit_error(msg, assert_span);
-            }
-            None
-        } else if Self::expr_has_non_const_identifier(&expr, enums, unevaluable) {
-            // The expression references variables or non-enum identifiers, which
-            // means it's definitely not a valid integer constant expression (C11 6.6).
-            self.emit_error(
-                "expression in static assertion is not an integer constant expression",
-                assert_span,
-            );
-            None
-        } else {
-            Some(StaticAssert {
-                cond: expr,
-                message,
-                span: assert_span,
-            })
+        StaticAssert {
+            cond: expr,
+            message,
+            span: assert_span,
         }
     }
 }

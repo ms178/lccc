@@ -502,6 +502,7 @@ impl super::InstructionEncoder {
         if ops.len() != 2 {
             return Err("movsx requires 2 operands".to_string());
         }
+        check_movext_register_sizes(ops, src_size, dst_size)?;
 
         // movsx/movzx ALWAYS pick a destination width; sized_op must be set
         // for BOTH forms so the .code16 inversion adds 66 to the 32-bit form
@@ -550,6 +551,7 @@ impl super::InstructionEncoder {
         if ops.len() != 2 {
             return Err("movzx requires 2 operands".to_string());
         }
+        check_movext_register_sizes(ops, src_size, dst_size)?;
 
         // movsx/movzx ALWAYS pick a destination width; sized_op must be set
         // for BOTH forms so the .code16 inversion adds 66 to the 32-bit form

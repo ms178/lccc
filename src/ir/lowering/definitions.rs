@@ -58,6 +58,10 @@ pub(super) struct VarInfo {
     /// → `_Alignof(x)` 4). The object itself is still allocated at the
     /// stricter of this and the natural alignment (harmless over-alignment).
     pub type_align: Option<usize>,
+    /// Whether the declared type's base specifier is `const` (see
+    /// `common::qualifiers`); `_Generic` reads it since `CType` carries no
+    /// qualifiers.
+    pub base_const: bool,
 }
 
 /// Information about a local variable stored in an alloca.
@@ -95,10 +99,6 @@ pub(super) struct LocalInfo {
     /// __attribute__((cleanup(func))): cleanup function to call with &var when scope exits.
     /// The function is called as func(&var) with a pointer to the variable.
     pub cleanup_fn: Option<String>,
-    /// Whether this variable was declared with `const` qualifier.
-    /// Used by _Generic matching to distinguish e.g. `const int *` from `int *`,
-    /// since CType does not track const/volatile qualifiers.
-    pub is_const: bool,
     /// Whether the declared base type was `volatile`-qualified (see
     /// DeclAnalysis::base_type_volatile).  For scalar/array locals the
     /// variable's own accesses are volatile; for pointer locals the pointee
@@ -205,6 +205,9 @@ pub(super) struct DeclAnalysis {
     /// accesses are volatile; for pointer declarations the POINTEE accesses
     /// (deref) are volatile when exactly one pointer level was added.
     pub base_type_volatile: bool,
+    /// Whether the declared base type is `const`, directly or through a
+    /// typedef or `typeof` (see `common::qualifiers`).
+    pub base_type_const: bool,
     /// Whether the object itself is volatile: the qualifier after the
     /// declarator's last `*`, or the specifier's when nothing is derived.
     pub object_volatile: bool,
@@ -523,6 +526,7 @@ impl VarInfo {
             address_space: AddressSpace::Default,
             explicit_alignment: None,
             type_align: None,
+            base_const: da.base_type_const,
         }
     }
 }
@@ -541,7 +545,7 @@ impl GlobalInfo {
 
 impl LocalInfo {
     /// Construct a LocalInfo for a regular (non-static) local variable from DeclAnalysis.
-    pub(super) fn from_analysis(da: &DeclAnalysis, alloca: Value, is_const: bool) -> Self {
+    pub(super) fn from_analysis(da: &DeclAnalysis, alloca: Value) -> Self {
         LocalInfo {
             var: VarInfo::from_analysis(da),
             alloca,
@@ -553,7 +557,6 @@ impl LocalInfo {
             asm_register: None,
             asm_register_has_init: false,
             cleanup_fn: None,
-            is_const,
             base_type_volatile: da.base_type_volatile,
             object_volatile: da.object_volatile,
             fptr_sig: None,
@@ -561,7 +564,7 @@ impl LocalInfo {
     }
 
     /// Construct a LocalInfo for a static local variable from DeclAnalysis.
-    pub(super) fn for_static(da: &DeclAnalysis, static_name: String, is_const: bool) -> Self {
+    pub(super) fn for_static(da: &DeclAnalysis, static_name: String) -> Self {
         LocalInfo {
             var: VarInfo::from_analysis(da),
             alloca: Value(0), // placeholder; not used for static locals
@@ -573,7 +576,6 @@ impl LocalInfo {
             asm_register: None,
             asm_register_has_init: false,
             cleanup_fn: None,
-            is_const,
             base_type_volatile: da.base_type_volatile,
             object_volatile: da.object_volatile,
             fptr_sig: None,

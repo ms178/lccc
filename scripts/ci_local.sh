@@ -540,11 +540,11 @@ gate "ivsr-reproducers" fast \
 gate "shuffle-diagnostics" fast \
     env CCC="$LCCC" bash tests/regression/check_shuffle_diagnostics.sh
 
-# Clang ext_vector_type component access: every form Clang rejects (illegal
-# or mixed component names, out-of-range lanes, duplicate or compound
-# swizzle assignment, width-mismatched vector assignment, member access on
-# a scalar) is a positioned diagnostic, never offset-0 garbage or an ICE; the
-# accepted forms compile and run.
+# Clang ext_vector_type component access against the Clang 23.1.3 oracle:
+# LCCC's diagnostics for ext_vector_select/errors.c equal Clang's (line,
+# column, message), LCCC accepts exactly the forms Clang accepts and puts the
+# first error at Clang's position, and select.c prints what Clang -O0 prints
+# at LCCC -O0/-O1/-O2 on -m64 and -m32.
 gate "ext-vector-swizzle-diagnostics" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_swizzle_diagnostics.sh
 
@@ -563,6 +563,12 @@ gate "vector-scalar-conversions" fast \
 # `__m256` code at run time); oracle-checked against gcc.
 gate "subscript-diagnostics" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" python3 tests/regression/check_subscript_diagnostics.py
+
+# Sema constraints: return/assignment/call-arity rules, and the lvalue
+# constraints of `=`, `op=`, `++`/`--` and `&` (an rvalue target compiled to a
+# store that went nowhere); the valid lvalue forms must store and run.
+gate "sema-constraints" fast \
+    env CCC="$LCCC" bash tests/regression/check_sema_constraints.sh
 
 # AUD-SILENT-ZERO-1: a target that cannot execute an x86-only intrinsic must
 # trap at the first execution, not silently compute zeros (and must not trap

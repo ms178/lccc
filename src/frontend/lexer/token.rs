@@ -38,6 +38,10 @@ pub enum TokenKind {
     /// char16_t string literal (u"..."), stores content as Rust chars (each becomes char16_t = u16)
     Char16StringLiteral(String),
     CharLiteral(char),
+    /// A `u8'x'`, `u'x'` or `U'x'` character constant: its code-unit value
+    /// and the unsigned type it has (C23 6.4.4.5: `char8_t`, `char16_t`,
+    /// `char32_t`, i.e. unsigned char / unsigned short / unsigned int).
+    UnicodeCharLiteral(u32, UnicodeCharKind),
 
     // Identifiers and keywords
     Identifier(String),
@@ -88,6 +92,15 @@ pub enum TokenKind {
     Noreturn,
     StaticAssert,
     ThreadLocal,
+    // C23 keywords (only under -std=c23 and later)
+    /// `true`
+    True,
+    /// `false`
+    False,
+    /// `constexpr`
+    Constexpr,
+    /// `nullptr`
+    Nullptr,
 
     // GCC extensions
     Typeof,
@@ -237,7 +250,9 @@ impl std::fmt::Display for TokenKind {
             TokenKind::StringLiteral(_) => write!(f, "string literal"),
             TokenKind::WideStringLiteral(_) => write!(f, "wide string literal"),
             TokenKind::Char16StringLiteral(_) => write!(f, "char16_t string literal"),
-            TokenKind::CharLiteral(_) => write!(f, "character constant"),
+            TokenKind::CharLiteral(_) | TokenKind::UnicodeCharLiteral(..) => {
+                write!(f, "character constant")
+            }
 
             // Identifiers
             TokenKind::Identifier(name) => write!(f, "'{}'", name),
@@ -293,6 +308,10 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Noreturn => write!(f, "'_Noreturn'"),
             TokenKind::StaticAssert => write!(f, "'_Static_assert'"),
             TokenKind::ThreadLocal => write!(f, "'_Thread_local'"),
+            TokenKind::True => write!(f, "'true'"),
+            TokenKind::False => write!(f, "'false'"),
+            TokenKind::Constexpr => write!(f, "'constexpr'"),
+            TokenKind::Nullptr => write!(f, "'nullptr'"),
 
             // GCC extensions
             TokenKind::Typeof => write!(f, "'typeof'"),
@@ -383,11 +402,26 @@ impl std::fmt::Display for TokenKind {
     }
 }
 
+/// The type of a prefixed character constant (see `TokenKind::UnicodeCharLiteral`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnicodeCharKind {
+    /// `u8'x'`: `char8_t` = unsigned char.
+    Utf8,
+    /// `u'x'`: `char16_t` = unsigned short.
+    Utf16,
+    /// `U'x'`: `char32_t` = unsigned int.
+    Utf32,
+}
+
 impl TokenKind {
     /// Convert a keyword string to its token kind.
     /// When `gnu_extensions` is false (strict C standard mode, e.g. -std=c99),
     /// bare GNU keywords like `typeof` and `asm` are treated as identifiers.
     /// The double-underscore forms (`__typeof__`, `__asm__`) are always keywords.
+    /// When `c23` is set (-std=c23 and later), the C23 keywords `bool`,
+    /// `true`, `false`, `thread_local`, `constexpr`, `nullptr`, `typeof` and
+    /// `typeof_unqual` are recognised too; before C23 they are identifiers
+    /// (`<stdbool.h>` supplies `bool`/`true`/`false` as macros there).
     ///
     /// Performance: Uses a two-stage filter to quickly reject non-keywords.
     /// Stage 1: reject by length (keywords are 2-17 or 28 chars).
@@ -395,13 +429,13 @@ impl TokenKind {
     /// Most identifiers in typical C code are rejected by these filters
     /// without entering the match statement.
     #[inline]
-    pub fn from_keyword(s: &str, gnu_extensions: bool) -> Option<TokenKind> {
+    pub fn from_keyword(s: &str, gnu_extensions: bool, c23: bool) -> Option<TokenKind> {
         // Fast reject by length: C/GCC keywords have lengths 2-17 or 28.
         let len = s.len();
         if len < 2 || (len > 17 && len != 28) {
             return None;
         }
-        // Fast reject by first character: keywords only start with these 16 chars.
+        // Fast reject by first character: keywords only start with these 17 chars.
         let first = s.as_bytes()[0];
         if !matches!(
             first,
@@ -414,6 +448,7 @@ impl TokenKind {
                 | b'g'
                 | b'i'
                 | b'l'
+                | b'n'
                 | b'r'
                 | b's'
                 | b't'
@@ -472,7 +507,7 @@ impl TokenKind {
             "_Noreturn" | "__noreturn__" => Some(TokenKind::Noreturn),
             "_Static_assert" | "static_assert" => Some(TokenKind::StaticAssert),
             "_Thread_local" | "__thread" => Some(TokenKind::ThreadLocal),
-            "typeof" if gnu_extensions => Some(TokenKind::Typeof),
+            "typeof" if gnu_extensions || c23 => Some(TokenKind::Typeof),
             "__typeof__" | "__typeof" => Some(TokenKind::Typeof),
             // C23 typeof_unqual: like typeof but with top-level qualifiers
             // (const/volatile/_Atomic) removed. LCCC's `typeof` already yields
@@ -480,7 +515,13 @@ impl TokenKind {
             // Required by the kernel: arch/x86/include/asm/percpu.h uses
             // TYPEOF_UNQUAL() in every per-CPU accessor, so without it nothing
             // including <asm/current.h> or <asm/preempt.h> parses.
-            "typeof_unqual" if gnu_extensions => Some(TokenKind::TypeofUnqual),
+            "typeof_unqual" if gnu_extensions || c23 => Some(TokenKind::TypeofUnqual),
+            "bool" if c23 => Some(TokenKind::Bool),
+            "true" if c23 => Some(TokenKind::True),
+            "false" if c23 => Some(TokenKind::False),
+            "thread_local" if c23 => Some(TokenKind::ThreadLocal),
+            "constexpr" if c23 => Some(TokenKind::Constexpr),
+            "nullptr" if c23 => Some(TokenKind::Nullptr),
             "__typeof_unqual__" | "__typeof_unqual" => Some(TokenKind::TypeofUnqual),
             "asm" if gnu_extensions => Some(TokenKind::Asm),
             "__asm__" | "__asm" => Some(TokenKind::Asm),

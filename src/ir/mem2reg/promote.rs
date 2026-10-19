@@ -212,7 +212,6 @@ pub fn promote_function(func: &mut IrFunction, promote_params: bool) {
         &alloca_infos,
         &phi_locations,
         &dom_children,
-        &preds,
         &label_to_idx,
     );
 }
@@ -533,7 +532,6 @@ fn rename_variables(
     alloca_infos: &[AllocaInfo],
     phi_locations: &[FxHashSet<usize>],
     dom_children: &[Vec<usize>],
-    preds: &analysis::FlatAdj,
     label_to_idx: &FxHashMap<BlockId, usize>,
 ) {
     let num_allocas = alloca_infos.len();
@@ -595,16 +593,19 @@ fn rename_variables(
         def_stacks[i].push(Operand::Const(IrConst::zero(info.ty)));
     }
 
-    rename_block(
-        0,
+    // phi dest -> alloca index (value ids are unique in the function).
+    let phi_alloca: FxHashMap<u32, usize> = phi_dests
+        .iter()
+        .flat_map(|m| m.iter().map(|(&ai, &v)| (v.0, ai)))
+        .collect();
+    rename_blocks(
         func,
         &alloca_to_idx,
         alloca_infos,
         &mut def_stacks,
         &mut next_value,
-        &phi_dests,
+        &phi_alloca,
         dom_children,
-        preds,
         label_to_idx,
     );
 
@@ -615,295 +616,296 @@ fn rename_variables(
     func.next_value_id = next_value;
 }
 
-/// Recursive dominator-tree DFS for variable renaming.
-fn rename_block(
-    block_idx: usize,
+/// Push `val` as the current definition of alloca `ai`, logging the push so
+/// the dominator-tree walk can undo exactly this block's definitions.
+#[inline]
+fn push_def(def_stacks: &mut [Vec<Operand>], undo: &mut Vec<usize>, ai: usize, val: Operand) {
+    def_stacks[ai].push(val);
+    undo.push(ai);
+}
+
+/// One step of the dominator-tree walk in `rename_blocks`.
+enum RenameWork {
+    /// Rename `block`.  `goto_snapshot` holds the def-stack tops at the asm
+    /// goto that jumps to it from its dominator-tree parent: they are pushed
+    /// first, so the block sees the definitions live along the goto edge,
+    /// not those made after the asm in the parent.
+    Enter {
+        block: usize,
+        goto_snapshot: Option<Vec<Operand>>,
+    },
+    /// Pop every definition pushed since the undo log had length `mark`.
+    Exit { mark: usize },
+}
+
+/// Dominator-tree preorder walk for variable renaming (Cytron et al.).
+///
+/// Cost is linear in the size of the function: the definitions a block
+/// pushes are recorded in one undo log and exactly those are popped when the
+/// block's subtree is done (O(defs), where saving and restoring every
+/// alloca's stack depth per block was O(blocks x allocas), quadratic in a long
+/// function), a phi finds its alloca through `phi_alloca` (a per-block linear
+/// search was quadratic in a block's phis), and the walk is iterative, so a
+/// dominator chain thousands of blocks deep (a long sequence of loops) cannot
+/// exhaust the stack.  Children are visited in `dom_children` order, as the
+/// recursive walk did: fresh values (asm outputs) are numbered identically.
+fn rename_blocks(
     func: &mut IrFunction,
     alloca_to_idx: &FxHashMap<u32, usize>,
     alloca_infos: &[AllocaInfo],
     def_stacks: &mut [Vec<Operand>],
     next_value: &mut u32,
-    phi_dests: &[FxHashMap<usize, Value>],
+    phi_alloca: &FxHashMap<u32, usize>,
     dom_children: &[Vec<usize>],
-    _preds: &analysis::FlatAdj,
     label_to_idx: &FxHashMap<BlockId, usize>,
 ) {
-    // Record stack depths so we can pop on exit
-    let stack_depths: Vec<usize> = def_stacks.iter().map(|s| s.len()).collect();
-
-    // Process phi nodes in this block - push their dests onto stacks
-    for inst in &func.blocks[block_idx].instructions {
-        if let Instruction::Phi { dest, .. } = inst {
-            // Find which alloca this phi is for
-            if let Some(&alloca_idx) = phi_dests[block_idx]
-                .iter()
-                .find(|&(_, &v)| v == *dest)
-                .map(|(idx, _)| idx)
-            {
-                def_stacks[alloca_idx].push(Operand::Value(*dest));
+    let mut undo: Vec<usize> = Vec::new();
+    let undo = &mut undo;
+    let mut work = vec![RenameWork::Enter {
+        block: 0,
+        goto_snapshot: None,
+    }];
+    while let Some(step) = work.pop() {
+        let (block_idx, goto_snapshot) = match step {
+            RenameWork::Exit { mark } => {
+                // Unwind this subtree's pushes, newest first. `mark` was
+                // the log length at entry, so the clamp never truncates.
+                let keep = mark.min(undo.len());
+                for ai in undo.drain(keep..).rev() {
+                    def_stacks[ai].pop();
+                }
+                continue;
+            }
+            RenameWork::Enter {
+                block,
+                goto_snapshot,
+            } => (block, goto_snapshot),
+        };
+        work.push(RenameWork::Exit { mark: undo.len() });
+        if let Some(snapshot) = goto_snapshot {
+            for (ai, snap_val) in snapshot.into_iter().enumerate() {
+                push_def(def_stacks, undo, ai, snap_val);
             }
         }
-    }
 
-    // Rewrite instructions in this block.
-    //
-    // asm goto snapshot: An InlineAsm with goto_labels creates implicit
-    // control-flow edges from the *point of the asm* to its label targets.
-    // Any definitions that occur *after* the asm goto in the same block
-    // (e.g., a subsequent InlineAsm output) must NOT be visible along
-    // the goto edge.  We snapshot the def-stack tops at each asm goto
-    // and use those snapshots when filling in phi incoming values for
-    // the goto targets, instead of the end-of-block def-stack tops.
-    let mut new_instructions = Vec::with_capacity(func.blocks[block_idx].instructions.len());
-    let mut new_spans = Vec::new();
-    let has_spans = !func.blocks[block_idx].source_spans.is_empty();
-    if has_spans {
-        new_spans.reserve(func.blocks[block_idx].source_spans.len());
-    }
-    // Map from goto-target BlockId to the def-stack snapshot at the goto point.
-    // Each snapshot is a Vec<Operand> indexed by alloca_idx.
-    let mut goto_label_snapshots: FxHashMap<BlockId, Vec<Operand>> = FxHashMap::default();
-    let old_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
-    for (inst_idx, inst) in func.blocks[block_idx].instructions.drain(..).enumerate() {
-        match inst {
-            Instruction::Load {
-                dest,
-                ptr,
-                ty,
-                seg_override,
-                volatile,
-                ..
-            } => {
-                if let Some(&alloca_idx) = alloca_to_idx.get(&ptr.0) {
-                    // Replace load with copy from current SSA value
-                    let current_val = def_stacks[alloca_idx]
-                        .last()
-                        .cloned()
-                        .unwrap_or(Operand::Const(IrConst::zero(ty)));
-                    new_instructions.push(Instruction::Copy {
-                        dest,
-                        src: current_val,
-                    });
-                    if has_spans {
-                        new_spans.push(span_at(&old_spans, inst_idx));
-                    }
-                } else {
-                    new_instructions.push(Instruction::Load {
-                        volatile,
-                        dest,
-                        ptr,
-                        ty,
-                        seg_override,
-                    });
-                    if has_spans {
-                        new_spans.push(span_at(&old_spans, inst_idx));
-                    }
+        // Process phi nodes in this block - push their dests onto stacks
+        for inst in &func.blocks[block_idx].instructions {
+            if let Instruction::Phi { dest, .. } = inst {
+                if let Some(&alloca_idx) = phi_alloca.get(&dest.0) {
+                    push_def(def_stacks, undo, alloca_idx, Operand::Value(*dest));
                 }
             }
-            Instruction::Store {
-                val,
-                ptr,
-                ty,
-                seg_override,
-                volatile,
-                ..
-            } => {
-                if let Some(&alloca_idx) = alloca_to_idx.get(&ptr.0) {
-                    // Push the stored value onto the def stack.
-                    // Narrow constants to match the alloca type: the IR lowering
-                    // always produces I64 constants for integer literals, but on
-                    // 32-bit targets this causes phi copies to use 64-bit
-                    // operations for 32-bit values, leaving high bits
-                    // uninitialized in some paths.
-                    let narrowed_val = match val {
-                        Operand::Const(c) => {
-                            Operand::Const(c.narrowed_to(alloca_infos[alloca_idx].ty))
+        }
+
+        // Rewrite instructions in this block.
+        //
+        // asm goto snapshot: An InlineAsm with goto_labels creates implicit
+        // control-flow edges from the *point of the asm* to its label targets.
+        // Any definitions that occur *after* the asm goto in the same block
+        // (e.g., a subsequent InlineAsm output) must NOT be visible along
+        // the goto edge.  We snapshot the def-stack tops at each asm goto
+        // and use those snapshots when filling in phi incoming values for
+        // the goto targets, instead of the end-of-block def-stack tops.
+        let mut new_instructions = Vec::with_capacity(func.blocks[block_idx].instructions.len());
+        let mut new_spans = Vec::new();
+        let has_spans = !func.blocks[block_idx].source_spans.is_empty();
+        if has_spans {
+            new_spans.reserve(func.blocks[block_idx].source_spans.len());
+        }
+        // Map from goto-target BlockId to the def-stack snapshot at the goto point.
+        // Each snapshot is a Vec<Operand> indexed by alloca_idx.
+        let mut goto_label_snapshots: FxHashMap<BlockId, Vec<Operand>> = FxHashMap::default();
+        let old_spans = std::mem::take(&mut func.blocks[block_idx].source_spans);
+        for (inst_idx, inst) in func.blocks[block_idx].instructions.drain(..).enumerate() {
+            match inst {
+                Instruction::Load {
+                    dest,
+                    ptr,
+                    ty,
+                    seg_override,
+                    volatile,
+                    ..
+                } => {
+                    if let Some(&alloca_idx) = alloca_to_idx.get(&ptr.0) {
+                        // Replace load with copy from current SSA value
+                        let current_val = def_stacks[alloca_idx]
+                            .last()
+                            .cloned()
+                            .unwrap_or(Operand::Const(IrConst::zero(ty)));
+                        new_instructions.push(Instruction::Copy {
+                            dest,
+                            src: current_val,
+                        });
+                        if has_spans {
+                            new_spans.push(span_at(&old_spans, inst_idx));
                         }
-                        other => other,
-                    };
-                    def_stacks[alloca_idx].push(narrowed_val);
-                    // Remove the store (it's now represented by the SSA def)
-                    // (span is dropped along with the instruction)
-                } else {
-                    new_instructions.push(Instruction::Store {
-                        volatile,
-                        val,
-                        ptr,
-                        ty,
-                        seg_override,
-                    });
-                    if has_spans {
-                        new_spans.push(span_at(&old_spans, inst_idx));
+                    } else {
+                        new_instructions.push(Instruction::Load {
+                            volatile,
+                            dest,
+                            ptr,
+                            ty,
+                            seg_override,
+                        });
+                        if has_spans {
+                            new_spans.push(span_at(&old_spans, inst_idx));
+                        }
                     }
                 }
-            }
-            Instruction::InlineAsm {
-                template,
-                mut outputs,
-                inputs,
-                clobbers,
-                operand_types,
-                goto_labels,
-                input_symbols,
-                seg_overrides,
-            } => {
-                // Snapshot def stacks BEFORE processing outputs, so goto
-                // targets see the values that were live at the point of the
-                // asm goto, not any definitions produced by the asm outputs.
-                if !goto_labels.is_empty() {
-                    let snapshot: Vec<Operand> = (0..alloca_infos.len())
-                        .map(|ai| {
-                            def_stacks[ai]
-                                .last()
-                                .cloned()
-                                .unwrap_or(Operand::Const(IrConst::zero(alloca_infos[ai].ty)))
-                        })
-                        .collect();
-                    for (_, label) in &goto_labels {
-                        goto_label_snapshots.insert(*label, snapshot.clone());
+                Instruction::Store {
+                    val,
+                    ptr,
+                    ty,
+                    seg_override,
+                    volatile,
+                    ..
+                } => {
+                    if let Some(&alloca_idx) = alloca_to_idx.get(&ptr.0) {
+                        // Push the stored value onto the def stack.
+                        // Narrow constants to match the alloca type: the IR lowering
+                        // always produces I64 constants for integer literals, but on
+                        // 32-bit targets this causes phi copies to use 64-bit
+                        // operations for 32-bit values, leaving high bits
+                        // uninitialized in some paths.
+                        let narrowed_val = match val {
+                            Operand::Const(c) => {
+                                Operand::Const(c.narrowed_to(alloca_infos[alloca_idx].ty))
+                            }
+                            other => other,
+                        };
+                        push_def(def_stacks, undo, alloca_idx, narrowed_val);
+                        // Remove the store (it's now represented by the SSA def)
+                        // (span is dropped along with the instruction)
+                    } else {
+                        new_instructions.push(Instruction::Store {
+                            volatile,
+                            val,
+                            ptr,
+                            ty,
+                            seg_override,
+                        });
+                        if has_spans {
+                            new_spans.push(span_at(&old_spans, inst_idx));
+                        }
                     }
                 }
-
-                // Replace output pointers that are promoted allocas with fresh SSA values
-                for (_, out_ptr, _) in outputs.iter_mut() {
-                    if let Some(&alloca_idx) = alloca_to_idx.get(&out_ptr.0) {
-                        let fresh = Value(*next_value);
-                        *next_value += 1;
-                        *out_ptr = fresh;
-                        def_stacks[alloca_idx].push(Operand::Value(fresh));
-                    }
-                }
-                new_instructions.push(Instruction::InlineAsm {
+                Instruction::InlineAsm {
                     template,
-                    outputs,
+                    mut outputs,
                     inputs,
                     clobbers,
                     operand_types,
                     goto_labels,
                     input_symbols,
                     seg_overrides,
-                });
-                if has_spans {
-                    new_spans.push(span_at(&old_spans, inst_idx));
-                }
-            }
-            other => {
-                new_instructions.push(other);
-                if has_spans {
-                    new_spans.push(span_at(&old_spans, inst_idx));
-                }
-            }
-        }
-    }
-    func.blocks[block_idx].instructions = new_instructions;
-    func.blocks[block_idx].source_spans = new_spans;
-
-    // Also rewrite terminator operands if they reference promoted allocas
-    // (this shouldn't normally happen, but let's be safe)
-
-    // Fill in phi incoming values in successor blocks
-    let mut succ_labels = get_successor_labels(&func.blocks[block_idx].terminator);
-    // InlineAsm goto_labels are implicit control flow edges.
-    for inst in &func.blocks[block_idx].instructions {
-        if let Instruction::InlineAsm { goto_labels, .. } = inst {
-            for (_, label) in goto_labels {
-                if !succ_labels.contains(label) {
-                    succ_labels.push(*label);
-                }
-            }
-        }
-    }
-    let current_block_label = func.blocks[block_idx].label;
-
-    for succ_label in &succ_labels {
-        if let Some(&succ_idx) = label_to_idx.get(succ_label) {
-            // For each phi in the successor block, fill in our value.
-            // For asm goto targets, use the snapshotted def values from the
-            // point of the asm goto, not the end-of-block values.
-            let goto_snapshot = goto_label_snapshots.get(succ_label);
-            for inst in &mut func.blocks[succ_idx].instructions {
-                if let Instruction::Phi { dest, incoming, .. } = inst {
-                    // Find which alloca this phi is for
-                    if let Some(&alloca_idx) = phi_dests[succ_idx]
-                        .iter()
-                        .find(|&(_, &v)| v == *dest)
-                        .map(|(idx, _)| idx)
-                    {
-                        let current_val = if let Some(snapshot) = goto_snapshot {
-                            snapshot[alloca_idx]
-                        } else {
-                            def_stacks[alloca_idx]
-                                .last()
-                                .cloned()
-                                .unwrap_or(Operand::Const(IrConst::zero(
-                                    alloca_infos[alloca_idx].ty,
-                                )))
-                        };
-                        incoming.push((current_val, current_block_label));
+                } => {
+                    // Snapshot def stacks BEFORE processing outputs, so goto
+                    // targets see the values that were live at the point of the
+                    // asm goto, not any definitions produced by the asm outputs.
+                    if !goto_labels.is_empty() {
+                        let snapshot: Vec<Operand> = (0..alloca_infos.len())
+                            .map(|ai| {
+                                def_stacks[ai]
+                                    .last()
+                                    .cloned()
+                                    .unwrap_or(Operand::Const(IrConst::zero(alloca_infos[ai].ty)))
+                            })
+                            .collect();
+                        for (_, label) in &goto_labels {
+                            goto_label_snapshots.insert(*label, snapshot.clone());
+                        }
                     }
-                } else {
-                    break; // Phis are always at the start of a block
+
+                    // Replace output pointers that are promoted allocas with fresh SSA values
+                    for (_, out_ptr, _) in outputs.iter_mut() {
+                        if let Some(&alloca_idx) = alloca_to_idx.get(&out_ptr.0) {
+                            let fresh = Value(*next_value);
+                            *next_value += 1;
+                            *out_ptr = fresh;
+                            push_def(def_stacks, undo, alloca_idx, Operand::Value(fresh));
+                        }
+                    }
+                    new_instructions.push(Instruction::InlineAsm {
+                        template,
+                        outputs,
+                        inputs,
+                        clobbers,
+                        operand_types,
+                        goto_labels,
+                        input_symbols,
+                        seg_overrides,
+                    });
+                    if has_spans {
+                        new_spans.push(span_at(&old_spans, inst_idx));
+                    }
+                }
+                other => {
+                    new_instructions.push(other);
+                    if has_spans {
+                        new_spans.push(span_at(&old_spans, inst_idx));
+                    }
                 }
             }
         }
-    }
+        func.blocks[block_idx].instructions = new_instructions;
+        func.blocks[block_idx].source_spans = new_spans;
 
-    // Recurse into dominator tree children.
-    //
-    // For children that are asm-goto targets from this block, we must
-    // temporarily adjust the def stacks to the snapshot captured at the
-    // goto point. Otherwise the child would see definitions that were
-    // produced *after* the asm goto (e.g., InlineAsm outputs) which
-    // are not live along the goto edge.
-    let children: Vec<usize> = dom_children[block_idx].clone();
-    // Build a set of goto-target block indices for quick lookup.
-    let goto_target_indices: FxHashMap<usize, &Vec<Operand>> = goto_label_snapshots
-        .iter()
-        .filter_map(|(label, snapshot)| label_to_idx.get(label).map(|&idx| (idx, snapshot)))
-        .collect();
+        // Also rewrite terminator operands if they reference promoted allocas
+        // (this shouldn't normally happen, but let's be safe)
 
-    for child in children {
-        if let Some(snapshot) = goto_target_indices.get(&child) {
-            // This child is an asm-goto target: temporarily push snapshot
-            // values so that loads in the child block see the pre-goto defs.
-            let child_depths: Vec<usize> = def_stacks.iter().map(|s| s.len()).collect();
-            for (ai, snap_val) in snapshot.iter().enumerate() {
-                def_stacks[ai].push(*snap_val);
+        // Fill in phi incoming values in successor blocks
+        let mut succ_labels = get_successor_labels(&func.blocks[block_idx].terminator);
+        // InlineAsm goto_labels are implicit control flow edges.
+        for inst in &func.blocks[block_idx].instructions {
+            if let Instruction::InlineAsm { goto_labels, .. } = inst {
+                for (_, label) in goto_labels {
+                    if !succ_labels.contains(label) {
+                        succ_labels.push(*label);
+                    }
+                }
             }
-            rename_block(
-                child,
-                func,
-                alloca_to_idx,
-                alloca_infos,
-                def_stacks,
-                next_value,
-                phi_dests,
-                dom_children,
-                _preds,
-                label_to_idx,
-            );
-            for (i, &depth) in child_depths.iter().enumerate() {
-                def_stacks[i].truncate(depth);
-            }
-        } else {
-            rename_block(
-                child,
-                func,
-                alloca_to_idx,
-                alloca_infos,
-                def_stacks,
-                next_value,
-                phi_dests,
-                dom_children,
-                _preds,
-                label_to_idx,
-            );
         }
-    }
+        let current_block_label = func.blocks[block_idx].label;
 
-    // Pop definitions pushed in this block
-    for (i, &depth) in stack_depths.iter().enumerate() {
-        def_stacks[i].truncate(depth);
+        for succ_label in &succ_labels {
+            if let Some(&succ_idx) = label_to_idx.get(succ_label) {
+                // For each phi in the successor block, fill in our value.
+                // For asm goto targets, use the snapshotted def values from the
+                // point of the asm goto, not the end-of-block values.
+                let goto_snapshot = goto_label_snapshots.get(succ_label);
+                for inst in &mut func.blocks[succ_idx].instructions {
+                    if let Instruction::Phi { dest, incoming, .. } = inst {
+                        // Find which alloca this phi is for
+                        if let Some(&alloca_idx) = phi_alloca.get(&dest.0) {
+                            let current_val =
+                                if let Some(snapshot) = goto_snapshot {
+                                    snapshot[alloca_idx]
+                                } else {
+                                    def_stacks[alloca_idx].last().cloned().unwrap_or(
+                                        Operand::Const(IrConst::zero(alloca_infos[alloca_idx].ty)),
+                                    )
+                                };
+                            incoming.push((current_val, current_block_label));
+                        }
+                    } else {
+                        break; // Phis are always at the start of a block
+                    }
+                }
+            }
+        }
+
+        // Dominator-tree children, in order (pushed reversed onto the LIFO).
+        // A child that is an asm-goto target of this block starts from the
+        // snapshot taken at the goto (see `RenameWork::Enter`).
+        for &child in dom_children[block_idx].iter().rev() {
+            let goto_snapshot = goto_label_snapshots.iter().find_map(|(label, snapshot)| {
+                (label_to_idx.get(label) == Some(&child)).then(|| snapshot.clone())
+            });
+            work.push(RenameWork::Enter {
+                block: child,
+                goto_snapshot,
+            });
+        }
     }
 }
 
@@ -1086,6 +1088,121 @@ mod tests {
                 .iter()
                 .any(|inst| matches!(inst, Instruction::Store { ptr: Value(0), .. }))
         );
+    }
+
+    /// A dominator chain 50 000 blocks deep (a long sequence of statements
+    /// or loops each ending its block) renames on a 1 MiB stack: the walk is
+    /// iterative, so its depth costs heap, not stack.  Every load must
+    /// resolve to the store of the block before it.
+    #[test]
+    fn rename_walk_handles_deep_dominator_chain() {
+        const N: u32 = 50_000;
+        let run = || {
+            let mut func = IrFunction::new("deep".to_string(), IrType::I32, vec![], false);
+            let st = |val: Operand| Instruction::Store {
+                volatile: false,
+                val,
+                ptr: Value(0),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            };
+            let ld = |dest: u32| Instruction::Load {
+                volatile: false,
+                dest: Value(dest),
+                ptr: Value(0),
+                ty: IrType::I32,
+                seg_override: AddressSpace::Default,
+            };
+            func.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::Alloca {
+                        dest: Value(0),
+                        ty: IrType::I32,
+                        size: 4,
+                        align: 0,
+                        volatile: false,
+                        semantic_volatile: false,
+                    },
+                    st(Operand::Const(IrConst::I32(0))),
+                ],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: Vec::new(),
+            });
+            // Block b: v(2b-1) = load x; v(2b) = v(2b-1) + 1; store v(2b).
+            for b in 1..=N {
+                func.blocks.push(BasicBlock {
+                    label: BlockId(b),
+                    instructions: vec![
+                        ld(2 * b - 1),
+                        Instruction::BinOp {
+                            dest: Value(2 * b),
+                            op: IrBinOp::Add,
+                            lhs: Operand::Value(Value(2 * b - 1)),
+                            rhs: Operand::Const(IrConst::I32(1)),
+                            ty: IrType::I32,
+                        },
+                        st(Operand::Value(Value(2 * b))),
+                    ],
+                    terminator: Terminator::Branch(BlockId(b + 1)),
+                    source_spans: Vec::new(),
+                });
+            }
+            func.blocks.push(BasicBlock {
+                label: BlockId(N + 1),
+                instructions: vec![ld(2 * N + 1)],
+                terminator: Terminator::Return(Some(Operand::Value(Value(2 * N + 1)))),
+                source_spans: Vec::new(),
+            });
+            func.next_value_id = 2 * N + 2;
+            let mut module = IrModule::new();
+            module.functions.push(func);
+            promote_allocas(&mut module);
+            let func = &module.functions[0];
+            for blk in &func.blocks {
+                for inst in &blk.instructions {
+                    assert!(
+                        !matches!(
+                            inst,
+                            Instruction::Alloca { .. }
+                                | Instruction::Load { .. }
+                                | Instruction::Store { .. }
+                        ),
+                        "unpromoted {inst:?} in block {}",
+                        blk.label.0
+                    );
+                }
+            }
+            // Block b's load became a copy of block (b-1)'s sum (the
+            // constant 0 for block 1), and the return reads block N's sum.
+            for b in 1..=N as usize {
+                let want = if b == 1 {
+                    Operand::Const(IrConst::I32(0))
+                } else {
+                    Operand::Value(Value(2 * (b as u32 - 1)))
+                };
+                assert!(
+                    func.blocks[b].instructions.iter().any(|i| matches!(i,
+                        Instruction::Copy { dest, src }
+                            if dest.0 == 2 * b as u32 - 1 && *src == want)),
+                    "block {b}: load not renamed to {want:?}"
+                );
+            }
+            assert!(
+                func.blocks[N as usize + 1]
+                    .instructions
+                    .iter()
+                    .any(|i| matches!(i,
+                Instruction::Copy { dest, src: Operand::Value(Value(s)) }
+                    if dest.0 == 2 * N + 1 && *s == 2 * N))
+            );
+        };
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(run)
+            .expect("spawn")
+            .join()
+            .expect("deep-chain rename must not overflow a 1 MiB stack");
     }
 
     #[test]

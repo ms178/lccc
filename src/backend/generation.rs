@@ -2363,119 +2363,108 @@ pub fn build_rematerializable_global_addr_set_for(
     let op_is_root = |op: &Operand, id: u32| matches!(op, Operand::Value(v) if v.0 == id);
     let op_uses_root = |op: &Operand, id: u32| op_is_root(op, id);
 
-    let candidates: Vec<u32> = roots.iter().copied().collect();
-    for id in candidates {
-        let mut valid = true;
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                if !inst.used_values().contains(&id) {
-                    continue;
-                }
-                let allowed = match inst {
-                    Instruction::Load {
-                        ptr,
-                        ty,
-                        seg_override,
-                        ..
-                    } => {
-                        ptr.0 == id
-                            && *seg_override == AddressSpace::Default
-                            && is_foldable_mem_ty(*ty)
-                    }
-                    Instruction::Store {
-                        val,
-                        ptr,
-                        ty,
-                        seg_override,
-                        ..
-                    } => {
-                        ptr.0 == id
-                            && !op_uses_root(val, id)
-                            && *seg_override == AddressSpace::Default
-                            && is_foldable_mem_ty(*ty)
-                    }
-                    Instruction::GetElementPtr { base, offset, .. } => {
-                        base.0 == id && !op_uses_root(offset, id)
-                    }
-                    Instruction::BinOp {
-                        op: IrBinOp::Add,
-                        lhs,
-                        rhs,
-                        ty,
-                        ..
-                    } => {
-                        !ty.is_float()
-                            && ty.size() == 8
-                            && (op_is_root(lhs, id) ^ op_is_root(rhs, id))
-                    }
-                    Instruction::BinOp {
-                        op: IrBinOp::Sub,
-                        lhs,
-                        rhs,
-                        ty,
-                        ..
-                    } => {
-                        !ty.is_float()
-                            && ty.size() == 8
-                            && op_is_root(lhs, id)
-                            && !op_is_root(rhs, id)
-                    }
-                    Instruction::Call { func, info } => {
-                        // A call argument that is a bare GlobalAddr root: the
-                        // x86 call emitter rebuilds home-less GlobalAddrs
-                        // (operand_to_rax funnels into value_to_reg's LEA
-                        // rebuild; IntReg stages LEA directly into the
-                        // argument register), so spilling the address across
-                        // the call is pure waste — a store plus a reload the
-                        // callee-saved file or the slot need not carry.
-                        // Admitted only when the call REACHES the generic
-                        // emitter: inline-expanded memcpy/memset bypass it
-                        // (their expansion reads homed operands), and
-                        // sret/fastcall take unaudited argument paths.
-                        // used_values for Call is args-only, so reaching this
-                        // arm proves the root is used as an argument value.
-                        !info.is_sret
-                            && !info.is_fastcall
-                            && inline_memcpy_len(func.as_str(), info).is_none()
-                            && x86_inline_memset_len(func.as_str(), info).is_none()
-                    }
-                    // A Copy of the root forwards the ADDRESS VALUE into a
-                    // new SSA value (IVSR's recurrence initialization is
-                    // exactly `Copy rec ← GlobalAddr`). The copy emitter
-                    // rematerializes the root (`leaq sym(%rip), home`) at
-                    // the copy site (generate_instruction's Copy arm), so
-                    // the root itself needs no home. The copy DEST is an
-                    // ordinary homed value with unconstrained uses — the
-                    // audit only governs the root's own uses.
-                    // Pre-S38 this arm fell to `_ => false`, rejecting every
-                    // loop whose address is strength-reduced into a pointer
-                    // recurrence (rbtree main: eight node_pool roots, three
-                    // stack-homed, reloaded at every recurrence touch).
-                    Instruction::Copy { src, .. } => op_is_root(src, id),
-                    Instruction::CallIndirect { func_ptr, info } => {
-                        // Same audit as Call: indirect-call arguments stage
-                        // through the identical IntReg/Stack paths. The root
-                        // must not be the call TARGET — only argument
-                        // positions are audited (indirect calls never inline-
-                        // expand, so no memcpy/memset exclusion applies).
-                        !info.is_sret && !info.is_fastcall && !op_uses_root(func_ptr, id)
-                    }
-                    _ => false,
-                };
-                if !allowed {
-                    valid = false;
-                    break;
-                }
+    let allowed = |inst: &Instruction, id: u32| -> bool {
+        match inst {
+            Instruction::Load {
+                ptr,
+                ty,
+                seg_override,
+                ..
+            } => ptr.0 == id && *seg_override == AddressSpace::Default && is_foldable_mem_ty(*ty),
+            Instruction::Store {
+                val,
+                ptr,
+                ty,
+                seg_override,
+                ..
+            } => {
+                ptr.0 == id
+                    && !op_uses_root(val, id)
+                    && *seg_override == AddressSpace::Default
+                    && is_foldable_mem_ty(*ty)
             }
-            if !valid || block.terminator.used_values().contains(&id) {
-                valid = false;
-                break;
+            Instruction::GetElementPtr { base, offset, .. } => {
+                base.0 == id && !op_uses_root(offset, id)
+            }
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } => !ty.is_float() && ty.size() == 8 && (op_is_root(lhs, id) ^ op_is_root(rhs, id)),
+            Instruction::BinOp {
+                op: IrBinOp::Sub,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } => !ty.is_float() && ty.size() == 8 && op_is_root(lhs, id) && !op_is_root(rhs, id),
+            Instruction::Call { func, info } => {
+                // A call argument that is a bare GlobalAddr root: the
+                // x86 call emitter rebuilds home-less GlobalAddrs
+                // (operand_to_rax funnels into value_to_reg's LEA
+                // rebuild; IntReg stages LEA directly into the
+                // argument register), so spilling the address across
+                // the call is pure waste — a store plus a reload the
+                // callee-saved file or the slot need not carry.
+                // Admitted only when the call REACHES the generic
+                // emitter: inline-expanded memcpy/memset bypass it
+                // (their expansion reads homed operands), and
+                // sret/fastcall take unaudited argument paths.
+                // used_values for Call is args-only, so reaching this
+                // arm proves the root is used as an argument value.
+                !info.is_sret
+                    && !info.is_fastcall
+                    && inline_memcpy_len(func.as_str(), info).is_none()
+                    && x86_inline_memset_len(func.as_str(), info).is_none()
+            }
+            // A Copy of the root forwards the ADDRESS VALUE into a
+            // new SSA value (IVSR's recurrence initialization is
+            // exactly `Copy rec ← GlobalAddr`). The copy emitter
+            // rematerializes the root (`leaq sym(%rip), home`) at
+            // the copy site (generate_instruction's Copy arm), so
+            // the root itself needs no home. The copy DEST is an
+            // ordinary homed value with unconstrained uses — the
+            // audit only governs the root's own uses.
+            // Pre-S38 this arm fell to `_ => false`, rejecting every
+            // loop whose address is strength-reduced into a pointer
+            // recurrence (rbtree main: eight node_pool roots, three
+            // stack-homed, reloaded at every recurrence touch).
+            Instruction::Copy { src, .. } => op_is_root(src, id),
+            Instruction::CallIndirect { func_ptr, info } => {
+                // Same audit as Call: indirect-call arguments stage
+                // through the identical IntReg/Stack paths. The root
+                // must not be the call TARGET — only argument
+                // positions are audited (indirect calls never inline-
+                // expand, so no memcpy/memset exclusion applies).
+                !info.is_sret && !info.is_fastcall && !op_uses_root(func_ptr, id)
+            }
+            _ => false,
+        }
+    };
+
+    // One pass: each instruction's operands are collected once and checked
+    // against the roots they mention.  Auditing root by root re-walked the
+    // whole function per root (and allocated `used_values` for every
+    // instruction each time): quadratic in functions with many distinct
+    // globals -- every string literal of a `printf`-dense function is a root.
+    let mut rejected: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            for id in inst.used_values() {
+                if roots.contains(&id) && !rejected.contains(&id) && !allowed(inst, id) {
+                    rejected.insert(id);
+                }
             }
         }
-        if !valid {
-            roots.remove(&id);
+        for id in block.terminator.used_values() {
+            if roots.contains(&id) {
+                rejected.insert(id);
+            }
         }
     }
+    roots.retain(|id| !rejected.contains(id));
     roots
 }
 
@@ -6905,7 +6894,9 @@ fn generate_copy(cg: &mut dyn ArchCodegen, dest: &Value, src: &Operand) {
 
     let is_wide = match src {
         Operand::Value(v) => cg.state_ref().is_wide_value(v.0),
-        Operand::Const(IrConst::F64(_)) => crate::common::types::target_is_32bit(),
+        Operand::Const(IrConst::F64(_) | IrConst::D64(_)) => {
+            crate::common::types::target_is_32bit()
+        }
         Operand::Const(IrConst::I64(val)) => {
             crate::common::types::target_is_32bit()
                 && (*val < i32::MIN as i64 || *val > u32::MAX as i64)

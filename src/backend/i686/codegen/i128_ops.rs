@@ -13,6 +13,17 @@ use crate::common::types::IrType;
 use crate::emit;
 use crate::ir::reexports::{IrBinOp, IrCmpOp, IrConst, Operand, Value};
 
+/// A 128-bit operand reached i686 codegen in a form lowering never produces:
+/// C has no 128-bit integer type on i686 (the frontend rejects `__int128`, as
+/// GCC does), and the `_Float128`/`_Decimal128` carriers live in 16-byte stack
+/// slots and convert only through helper calls. Every such site shares this
+/// one cold, caller-tracked exit rather than emitting wrong code.
+#[cold]
+#[track_caller]
+fn i128_lowering_invariant(what: std::fmt::Arguments<'_>) -> ! {
+    panic!("i686: {what}")
+}
+
 /// A FUSED mul-acc chain, with every operand reference resolved against the
 /// FINAL register allocation (homes + slots). Produced by
 /// `resolve_mulacc_plans` after the RA; consumed by `emit_mulacc_chain_head`.
@@ -709,43 +720,23 @@ impl I686Codegen {
                     self.state.emit("    xorl %edx, %edx");
                 }
             }
-            Operand::Const(IrConst::I128(v)) => {
-                let low = (*v & 0xFFFFFFFF) as i32;
-                let high = ((*v >> 32) & 0xFFFFFFFF) as i32;
-                emit!(self.state, "    movl ${}, %eax", low);
-                emit!(self.state, "    movl ${}, %edx", high);
-            }
-            Operand::Const(IrConst::I64(v)) => {
-                let low = (*v & 0xFFFFFFFF) as i32;
-                let high = ((*v >> 32) & 0xFFFFFFFF) as i32;
-                emit!(self.state, "    movl ${}, %eax", low);
-                emit!(self.state, "    movl ${}, %edx", high);
-            }
-            Operand::Const(IrConst::F64(f)) => {
-                let bits = f.to_bits();
-                let low = (bits & 0xFFFFFFFF) as i32;
-                let high = (bits >> 32) as i32;
-                emit!(self.state, "    movl ${}, %eax", low);
-                emit!(self.state, "    movl ${}, %edx", high);
-            }
             Operand::Const(IrConst::Zero) => {
                 self.state.emit("    xorl %eax, %eax");
                 self.state.emit("    xorl %edx, %edx");
             }
-            Operand::Const(c)
-                if matches!(c, IrConst::I8(_) | IrConst::I16(_) | IrConst::I32(_)) =>
-            {
-                if let Some(ext) = c.to_i64() {
-                    let low = (ext & 0xFFFFFFFF) as i32;
-                    let high = ((ext >> 32) & 0xFFFFFFFF) as i32;
-                    emit!(self.state, "    movl ${}, %eax", low);
-                    emit!(self.state, "    movl ${}, %edx", high);
+            // Every constant with a high word of its own (a `_Decimal64`
+            // BID pattern included: zero-extending its low half stored
+            // 1.5DD as 0x...0000000f) loads both halves exactly.
+            Operand::Const(c) => match super::emit::pair_const_bits(c) {
+                Some(bits) => {
+                    emit!(self.state, "    movl ${}, %eax", bits as u32 as i32);
+                    emit!(self.state, "    movl ${}, %edx", (bits >> 32) as u32 as i32);
                 }
-            }
-            _ => {
-                self.operand_to_eax(op);
-                self.state.emit("    xorl %edx, %edx");
-            }
+                None => {
+                    self.operand_to_eax(op);
+                    self.state.emit("    xorl %edx, %edx");
+                }
+            },
         }
     }
 
@@ -801,57 +792,20 @@ impl I686Codegen {
 
     pub(super) fn emit_i128_to_float_call_impl(
         &mut self,
-        src: &Operand,
-        from_signed: bool,
+        _src: &Operand,
+        _from_signed: bool,
         to_ty: IrType,
     ) {
-        self.emit_load_acc_pair(src);
-        if from_signed {
-            self.state.emit("    pushl %edx");
-            self.state.emit("    pushl %eax");
-            self.state.emit("    fildq (%esp)");
-            if to_ty == IrType::F32 {
-                self.state.emit("    fstps (%esp)");
-                self.state.emit("    movl (%esp), %eax");
-            } else {
-                self.state.emit("    fstpl (%esp)");
-                self.state.emit("    movl (%esp), %eax");
-            }
-            self.state.emit("    addl $8, %esp");
-        } else {
-            let label_id = self.state.next_label_id();
-            let big_label = format!(".Lu64_to_f_big_{}", label_id);
-            let done_label = format!(".Lu64_to_f_done_{}", label_id);
-
-            self.state.emit("    pushl %edx");
-            self.state.emit("    pushl %eax");
-            self.state.emit("    testl %edx, %edx");
-            emit!(self.state, "    js {}", big_label);
-            self.state.emit("    fildq (%esp)");
-            emit!(self.state, "    jmp {}", done_label);
-            emit!(self.state, "{}:", big_label);
-            self.state.emit("    movl (%esp), %eax");
-            self.state.emit("    movl 4(%esp), %edx");
-            self.state.emit("    shrl $1, %eax");
-            self.state.emit("    movl %edx, %ecx");
-            self.state.emit("    shrl $1, %edx");
-            self.state.emit("    andl $1, %ecx");
-            self.state.emit("    shll $31, %ecx");
-            self.state.emit("    orl %ecx, %eax");
-            self.state.emit("    movl %eax, (%esp)");
-            self.state.emit("    movl %edx, 4(%esp)");
-            self.state.emit("    fildq (%esp)");
-            self.state.emit("    fadd %st(0), %st(0)");
-            emit!(self.state, "{}:", done_label);
-            if to_ty == IrType::F32 {
-                self.state.emit("    fstps (%esp)");
-                self.state.emit("    movl (%esp), %eax");
-            } else {
-                self.state.emit("    fstpl (%esp)");
-                self.state.emit("    movl (%esp), %eax");
-            }
-            self.state.emit("    addl $8, %esp");
-        }
+        // C has no 128-bit integer types on i686 (the frontend rejects
+        // __int128, as GCC does), and lowering converts the 128-bit
+        // _Float128/_Decimal128 carriers through soft-float and libbid
+        // helpers, never with an IR integer-to-float cast. libgcc has no
+        // i386 __floattidf to call, and the former x87 sequence converted
+        // only the low 64 bits and returned a double's low dword: fail
+        // loudly instead of miscompiling if a lowering bug ever emits one.
+        i128_lowering_invariant(format_args!(
+            "a 128-bit integer to {to_ty:?} conversion has no lowering"
+        ));
     }
 
     pub(super) fn emit_float_to_i128_call_impl(
@@ -1103,6 +1057,89 @@ impl I686Codegen {
         }
     }
 
+    /// Eq/Ne of two 16-byte I128/U128 values. C has no 128-bit integers on
+    /// i686, so these are the _Float128/_Decimal128 carriers (bit-pattern
+    /// tests); the 64-bit register-pair family compared only their low 8
+    /// bytes. All four dwords are compared: OR of the dword XORs, then
+    /// ZF. Ordered predicates (no C source today) use the exact 128-bit
+    /// subtraction chain of `emit_i128_ordered_cmp`.
+    pub(super) fn emit_i128_carrier_cmp(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+    ) {
+        // Ordered predicates as a less-than (operands swapped for > and
+        // <=) or its negation: (first, second, setcc).
+        let (a, b, set) = match op {
+            IrCmpOp::Eq => (lhs, rhs, "sete"),
+            IrCmpOp::Ne => (lhs, rhs, "setne"),
+            IrCmpOp::Ult => (lhs, rhs, "setb"),
+            IrCmpOp::Uge => (lhs, rhs, "setae"),
+            IrCmpOp::Ugt => (rhs, lhs, "setb"),
+            IrCmpOp::Ule => (rhs, lhs, "setae"),
+            IrCmpOp::Slt => (lhs, rhs, "setl"),
+            IrCmpOp::Sge => (lhs, rhs, "setge"),
+            IrCmpOp::Sgt => (rhs, lhs, "setl"),
+            IrCmpOp::Sle => (rhs, lhs, "setge"),
+        };
+        if !matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
+            self.emit_i128_ordered_cmp(dest, a, b, set);
+            return;
+        }
+        for k in 0..4 {
+            let acc = if k == 0 { "edx" } else { "eax" };
+            self.emit_load_i128_dword(lhs, k, acc);
+            self.emit_load_i128_dword(rhs, k, "ecx");
+            emit!(self.state, "    xorl %ecx, %{}", acc);
+            if k > 0 {
+                self.state.emit("    orl %eax, %edx");
+            }
+        }
+        emit!(self.state, "    {} %al", set);
+        self.state.emit("    movzbl %al, %eax");
+        self.state.reg_cache.invalidate_all();
+        self.store_eax_to(dest);
+    }
+
+    /// `a - b` over all 128 bits: `cmpl` on dword 0, `sbbl` up the chain.
+    /// The final flags are those of the full subtraction, so CF is the
+    /// unsigned borrow (a < b) and SF != OF the signed a < b. The loads
+    /// between the flag writers are `movl` only (flags untouched); the
+    /// peephole's `movl $0` -> `xorl` rewrite checks flag liveness.
+    fn emit_i128_ordered_cmp(&mut self, dest: &Value, a: &Operand, b: &Operand, set: &str) {
+        for k in 0..4 {
+            self.emit_load_i128_dword(a, k, "eax");
+            self.emit_load_i128_dword(b, k, "ecx");
+            let op = if k == 0 { "cmpl" } else { "sbbl" };
+            emit!(self.state, "    {} %ecx, %eax", op);
+        }
+        emit!(self.state, "    {} %al", set);
+        self.state.emit("    movzbl %al, %eax");
+        self.state.reg_cache.invalidate_all();
+        self.store_eax_to(dest);
+    }
+
+    /// Load dword `k` (0 = least significant) of a 16-byte operand: a
+    /// stack-slot value or a constant's 16-byte image (integers
+    /// sign-extended; see `carrier_image`).
+    fn emit_load_i128_dword(&mut self, op: &Operand, k: i64, reg: &str) {
+        match op {
+            Operand::Value(v) => {
+                let Some(slot) = self.state.get_slot(v.0) else {
+                    i128_lowering_invariant(format_args!("128-bit value {v:?} has no stack slot"));
+                };
+                let sr = self.slot_ref_offset(slot, 4 * k);
+                emit!(self.state, "    movl {}, %{}", sr, reg);
+            }
+            Operand::Const(c) => {
+                let word = (carrier_image(c) >> (32 * k)) as u32;
+                emit!(self.state, "    movl ${}, %{}", word as i32, reg);
+            }
+        }
+    }
+
     pub(super) fn emit_i128_cmp_eq_impl(&mut self, is_ne: bool) {
         self.state.emit("    cmpl (%esp), %eax");
         self.state.emit("    sete %al");
@@ -1236,5 +1273,119 @@ impl I686Codegen {
         // nothing.
         self.emit_load_operand(src);
         self.emit_store_result(dest);
+    }
+}
+
+/// The 16-byte image of a constant used as an I128/U128 carrier operand:
+/// integers sign-extend (an `I64(-2)` compare operand is all-ones above
+/// bit 63, as before); F32/F64/D32/D64 bit patterns zero-extend; a long
+/// double is its IEEE binary128 bytes (the i686 `_Float128` carrier).
+fn carrier_image(c: &IrConst) -> i128 {
+    match *c {
+        IrConst::F32(v) => i128::from(v.to_bits()),
+        IrConst::F64(v) => i128::from(v.to_bits()),
+        IrConst::D32(v) => i128::from(v),
+        IrConst::D64(v) => i128::from(v),
+        IrConst::LongDouble(_, bytes) => i128::from_le_bytes(bytes),
+        IrConst::I8(v) => i128::from(v),
+        IrConst::I16(v) => i128::from(v),
+        IrConst::I32(v) => i128::from(v),
+        IrConst::I64(v) => i128::from(v),
+        IrConst::I128(v) => v,
+        IrConst::Zero => 0,
+    }
+}
+
+#[cfg(test)]
+mod carrier_cmp_tests {
+    use super::*;
+
+    fn emit_cmp(op: IrCmpOp, rhs: Operand) -> (I686Codegen, String) {
+        let mut cg = I686Codegen::new();
+        cg.state.value_locations.insert(1, StackSlot(-32));
+        cg.state.value_locations.insert(2, StackSlot(-48));
+        cg.emit_i128_carrier_cmp(&Value(2), op, &Operand::Value(Value(1)), &rhs);
+        let asm = cg.state.out.buf.clone();
+        (cg, asm)
+    }
+
+    /// A 16-byte carrier compare reads every dword of both operands: the
+    /// register-pair family read only the low 8 bytes, so -0.0Q (sign in
+    /// dword 3) and 2.75Q (low 8 bytes zero) both compared equal to zero.
+    #[test]
+    fn eq_and_ne_compare_all_four_dwords() {
+        for (op, set) in [(IrCmpOp::Eq, "sete %al"), (IrCmpOp::Ne, "setne %al")] {
+            let rhs = Operand::Const(IrConst::I128((-1i128 << 64) | 5));
+            let (cg, asm) = emit_cmp(op, rhs);
+            for k in 0..4 {
+                let lhs_word = format!("movl {}, %", cg.slot_ref_offset(StackSlot(-32), 4 * k));
+                assert!(asm.contains(&lhs_word), "dword {k} of the value:\n{asm}");
+            }
+            // Constant dwords, least significant first: 5, 0, -1, -1.
+            for imm in ["movl $5, %ecx", "movl $0, %ecx", "movl $-1, %ecx"] {
+                assert!(asm.contains(imm), "{imm}:\n{asm}");
+            }
+            assert_eq!(asm.matches("xorl %ecx, %").count(), 4, "{asm}");
+            assert_eq!(asm.matches("orl %eax, %edx").count(), 3, "{asm}");
+            assert!(asm.contains(set), "{asm}");
+        }
+    }
+
+    /// An I64 constant operand is sign-extended to 128 bits.
+    #[test]
+    fn i64_constant_operand_is_sign_extended() {
+        let (_, asm) = emit_cmp(IrCmpOp::Eq, Operand::Const(IrConst::I64(-2)));
+        assert_eq!(asm.matches("movl $-2, %ecx").count(), 1, "{asm}");
+        assert_eq!(asm.matches("movl $-1, %ecx").count(), 3, "{asm}");
+    }
+
+    /// Ordered predicates: one 128-bit subtraction chain (cmpl + 3 sbbl,
+    /// least significant dword first), operands swapped for > and <=.
+    #[test]
+    fn ordered_comparisons_subtract_all_four_dwords() {
+        let cases = [
+            (IrCmpOp::Ult, "setb", false),
+            (IrCmpOp::Uge, "setae", false),
+            (IrCmpOp::Ugt, "setb", true),
+            (IrCmpOp::Ule, "setae", true),
+            (IrCmpOp::Slt, "setl", false),
+            (IrCmpOp::Sge, "setge", false),
+            (IrCmpOp::Sgt, "setl", true),
+            (IrCmpOp::Sle, "setge", true),
+        ];
+        for (op, set, swapped) in cases {
+            let (cg, asm) = emit_cmp(op, Operand::Const(IrConst::I128(7)));
+            assert_eq!(asm.matches("cmpl %ecx, %eax").count(), 1, "{op:?}:\n{asm}");
+            assert_eq!(asm.matches("sbbl %ecx, %eax").count(), 3, "{op:?}:\n{asm}");
+            assert!(asm.contains(&format!("{set} %al")), "{op:?}:\n{asm}");
+            // The value operand's dword 0 goes to %eax unless swapped.
+            let dw0 = cg.slot_ref_offset(StackSlot(-32), 0);
+            let reg = if swapped { "ecx" } else { "eax" };
+            assert!(
+                asm.contains(&format!("movl {dw0}, %{reg}")),
+                "{op:?}:\n{asm}"
+            );
+            // The cmpl precedes every sbbl (least significant dword first).
+            let c = asm.find("cmpl %ecx, %eax").unwrap_or(usize::MAX);
+            let s = asm.find("sbbl %ecx, %eax").unwrap_or(0);
+            assert!(c < s, "{op:?}:\n{asm}");
+        }
+    }
+
+    #[test]
+    fn carrier_image_is_total_and_exact() {
+        assert_eq!(carrier_image(&IrConst::I64(-2)), -2);
+        assert_eq!(
+            carrier_image(&IrConst::D64(0x31C0_0000_0000_0000)),
+            0x31C0_0000_0000_0000
+        );
+        assert_eq!(
+            carrier_image(&IrConst::F64(1.0)),
+            i128::from(1.0f64.to_bits())
+        );
+        let mut b = [0u8; 16];
+        b[15] = 0x80;
+        assert_eq!(carrier_image(&IrConst::LongDouble(-0.0, b)), i128::MIN);
+        assert_eq!(carrier_image(&IrConst::Zero), 0);
     }
 }
