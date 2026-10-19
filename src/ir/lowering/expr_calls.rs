@@ -82,12 +82,26 @@ impl Lowerer {
     /// A local variable always shadows a known function of the same name (e.g., a parameter
     /// named `free` that is a function pointer should produce an indirect call, not a direct
     /// call to the libc `free` symbol).
+    ///
+    /// The same holds at file scope, and the `known_functions` veto that used to
+    /// exempt it was the bug: `globals` only ever holds *objects* (see
+    /// `global_decl.rs`/`stmt_init.rs`), while `known_functions` holds every
+    /// function name sema reported -- including the implicit library prototypes
+    /// `declare_implicit_functions` pre-declares (`strlen`, `memcpy`, `malloc`,
+    /// `printf`, ...) and the basenames of nested functions. A name present in
+    /// both is therefore exactly a data object shadowing a library name, which
+    /// is the one case that must answer "indirect call". Answering "direct call"
+    /// instead emitted `call strlen` against a `size_t (*)(const char *)` object,
+    /// the linker happily bound it to that object's address, and the program
+    /// jumped into its own data (measured: SIGSEGV, gcc 14.2 exits 0). A C
+    /// program cannot declare a function and an object of one name in the same
+    /// scope (C11 6.7p4), so no valid program loses a direct call here.
     pub(super) fn is_func_ptr_variable(&self, name: &str) -> bool {
         // When called outside a function context (e.g., during global constant
         // evaluation), there are no locals, so this is not a func ptr variable.
         let func_state = match self.func_state.as_ref() {
             Some(fs) => fs,
-            None => return self.globals.contains_key(name) && !self.known_functions.contains(name),
+            None => return self.globals.contains_key(name),
         };
         if func_state.locals.contains_key(name) {
             // Local variable exists with this name. Check if it's a function pointer
@@ -107,9 +121,31 @@ impl Lowerer {
             // that happens to shadow a known function name. Not a func ptr variable.
             false
         } else {
-            // No local with this name. Check globals, excluding known functions.
-            self.globals.contains_key(name) && !self.known_functions.contains(name)
+            // No local with this name: a global object of this name is a pointer
+            // to call through, whatever else shares the basename.
+            self.globals.contains_key(name)
         }
+    }
+
+    /// True when `name`, **as spelled at the use site**, denotes something other
+    /// than the library function of that name: a pointer object at any scope
+    /// (`is_func_ptr_variable`) or a GNU nested function visible here
+    /// (`lookup_nested_function`). Those are the predicates `lower_function_call`
+    /// uses to choose between a direct call, an indirect call and the static-chain
+    /// path, so a fold that consults them agrees with the call the lowerer emits
+    /// by construction -- a rule restated in two vocabularies is a rule that
+    /// drifts apart.
+    ///
+    /// Keying on the spelled name is also what keeps the compiler's own interface
+    /// foldable: a shadowing declaration carries the bare basename, so a
+    /// `__builtin_*` spelling never matches one. Measured against gcc 14.2 inside
+    /// a function that defines a nested `strlen` returning 91: bare
+    /// `strlen("abc")` calls the nested function and yields 91, while
+    /// `__builtin_strlen("abc")` still folds to 3 -- including in constant
+    /// expression contexts (`enum { E = __builtin_strlen("abc") }`,
+    /// `int arr[__builtin_strlen("abcd")]`).
+    pub(super) fn library_name_is_shadowed(&self, name: &str) -> bool {
+        self.is_func_ptr_variable(name) || self.lookup_nested_function(name).is_some()
     }
 
     pub(super) fn lower_function_call(&mut self, func: &Expr, args: &[Expr]) -> Operand {
@@ -607,12 +643,23 @@ impl Lowerer {
         // `void *(*memcpy)(...)`) shadows the library function of that name
         // (C11 6.2.1p4); expanding the builtin anyway silently replaced a
         // call through `i64 (*abs)(i64)` with a constant-folded `int abs(int)`.
+        //
+        // A FILE-SCOPE pointer object shadows it exactly the same way and is
+        // not in `locals`, which is how `static int (*abs)(int) = my_abs;`
+        // still came back as the constant 5 for `abs(-5)` after the local test
+        // below was added (measured against gcc 14.2, which calls `my_abs`).
+        // `is_func_ptr_variable` is the predicate the rest of this function
+        // already uses to choose between a direct and an indirect call, so
+        // consulting it here keeps "expand the builtin" and "call the library
+        // symbol" from disagreeing about what the identifier denotes. The local
+        // test is kept alongside it: it also declines for a local that is not a
+        // pointer at all, which is invalid C but must not be expanded either.
         let callee_is_local = matches!(func, Expr::Identifier(n, _)
             if self.func_state.as_ref().is_some_and(|fs| fs.locals.contains_key(n.as_str())));
         let Expr::Identifier(name, _) = func else {
             return None;
         };
-        if callee_is_local {
+        if callee_is_local || self.is_func_ptr_variable(name) {
             return None;
         }
         if let Some(result) = self.try_lower_builtin_call(name, args) {

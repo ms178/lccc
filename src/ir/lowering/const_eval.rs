@@ -417,6 +417,16 @@ impl Lowerer {
                     if name == "__builtin_classify_type" {
                         return Some(IrConst::I64(self.classify_type_of(args.first())));
                     }
+                    // The bare-name fold table speaks for the library function of
+                    // this name, so it stays silent when the identifier denotes
+                    // something else that shares the basename: the same decision
+                    // `lower_function_call` makes, and sema's
+                    // `fold_as_library_function` makes one level up. It is
+                    // repeated here because the lowerer also folds expressions
+                    // sema never annotated.
+                    if self.library_name_is_shadowed(name) {
+                        return None;
+                    }
                     let folded = shared_const_eval::eval_builtin_call_with_mode(
                         name.as_str(),
                         args,
