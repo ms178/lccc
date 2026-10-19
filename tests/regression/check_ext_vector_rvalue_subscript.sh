@@ -135,10 +135,14 @@ for entry in "${rejects[@]}"; do
         echo "FAIL: accepted invalid rvalue-lane form: $body" >&2
         exit 1
     fi
-    grep -m1 'error:' <<<"$out" | grep -qF "$want" || {
-        echo "FAIL: wrong diagnostic for '$body' (want '$want'): $(grep -m1 'error:' <<<"$out")" >&2
-        exit 1
-    }
+    # Pipefail-safe: avoid `grep -m1 | grep -q` (early-exit consumer under pipefail
+    # makes SIGPIPE=141 look like failure — see scripts/check_pipefail_sigpipe.py).
+    # Use command substitution + case (no pipe, no SIGPIPE, preserves GCC 16.2/Clang 23.1.3 parity).
+    err_line=$(grep 'error:' <<<"$out" | sed -n '1p')
+    case "$err_line" in
+        *"$want"*) ;;
+        *) echo "FAIL: wrong diagnostic for '$body' (want '$want'): $err_line" >&2; exit 1 ;;
+    esac
 done
 
 echo "PASS: vector rvalue subscript (${#compilers[@]} compiler(s), separate TUs, -O0/-O1/-O2, m64/m32; GNU stmt-expr write-through; ${n} oracle-rejected rvalue-lane forms)"
