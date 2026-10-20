@@ -1106,6 +1106,9 @@ gate "kernel-tree-clear" fast bash tests/regression/check_kernel_tree_clear.sh
 # The shared mount-table helper and the chroot/kernel-tree root guards.
 gate "destructive-path-guards" fast bash tests/regression/check_destructive_guards.sh
 
+gate "tls-runtime-oracle" fast \
+    bash tests/regression/check_tls_runtime_oracle.sh
+
 gate "tls-model-selection" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_selection.sh
 
@@ -1113,6 +1116,9 @@ gate "tls-model-selection" fast \
 # (no compiler required).  Mirrors the hosted step that ran it
 # without a ci_local counterpart (parity break on main).
 gate "tls-runtime-oracle" fast bash tests/regression/check_tls_runtime_oracle.sh
+
+gate "volatile-reduction" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_reduction.sh
 
 gate "tls-model-option" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_option.sh
