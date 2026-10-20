@@ -14,6 +14,7 @@
 mod policy;
 use policy::fp_environment_blocks_reordering;
 
+mod address_form;
 pub(crate) mod aggregate_copy_forward;
 pub(crate) mod aggregate_sroa;
 pub(crate) mod alias;
@@ -1421,6 +1422,9 @@ pub(crate) fn run_passes(
     });
     let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
     apply_tree_vectorize_policy(&mut disabled, disable_tree_vectorize);
+    loop_unroll::set_reduction_enabled(
+        target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "reduction_unroll"),
+    );
     div_by_const::set_exact_enabled(!pass_disabled(&disabled, "exact_signed_div"));
     vectorize::set_strict_recip_pack_enabled(!pass_disabled(&disabled, "strict_recip_pack"));
     vectorize::set_byte_count_normalize_enabled(!pass_disabled(&disabled, "byte_count_normalize"));
@@ -2697,6 +2701,15 @@ pub(crate) fn run_passes(
                     *c = true;
                 }
             }
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
+        if target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "address_form") {
+            let n = timed_pass!(
+                "address_form",
+                run_on_visited(module, &dirty, &mut changed, address_form::run)
+            );
             total_changes += n;
             total_changes_excl_dce += n;
         }
