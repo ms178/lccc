@@ -180,6 +180,13 @@ pub(super) fn replace_reg_family_in_source(line: &str, old_id: RegId, new_id: Re
 /// Check if an instruction has implicit register usage that makes register
 /// substitution unsafe (div/idiv/mul use rax/rdx, shifts use cl, etc.).
 pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
+    // `trimmed` is the caller's contract, but a veto that silently answers
+    // "safe" for an untrimmed line is a landmine: the tail of this function
+    // asks the shared operand model, which only understands left-trimmed
+    // input, and an empty mnemonic models as "no effects". Trim here so the
+    // answer cannot depend on formatting. Callers that already pass a
+    // trimmed slice pay one byte comparison.
+    let trimmed = trimmed.trim_start();
     let nb = trimmed.as_bytes();
     if nb.len() < 3 {
         return false;
@@ -1538,5 +1545,116 @@ mod writes_family_tests {
         assert!(alignment_fill_is_explicit(" 4,0xf8"));
         assert!(alignment_fill_is_explicit(" 16, 0xcc"));
         assert!(alignment_fill_is_explicit(" 8, 0, 16"));
+    }
+}
+
+#[cfg(test)]
+mod implicit_veto_tests {
+    use super::has_implicit_reg_usage;
+    use crate::backend::x86::codegen::peephole::types::implicit_r_w_full;
+
+    /// CONTRACT: this veto must remain a SUPERSET of the shared operand
+    /// model's write half.  It is a veto, so over-reporting only costs an
+    /// optimisation while under-reporting is a miscompile: a pass that
+    /// renames or retires a register the instruction defines anonymously
+    /// would be working from a false premise.
+    ///
+    /// The property holds today because the tail of `has_implicit_reg_usage`
+    /// consults `has_bare_implicit_gp_effect`, which asks the model
+    /// directly.  This test exists so that a future "fast reject" arm added
+    /// above that tail cannot shadow a mnemonic the model knows about --
+    /// exactly the shape of the bug this area has produced before.
+    #[test]
+    fn every_modelled_implicit_write_is_vetoed() {
+        let samples = [
+            "cltd",
+            "cqto",
+            "cqo",
+            "cwd",
+            "cdq",
+            "cltq",
+            "cdqe",
+            "cbw",
+            "cwtl",
+            "idivl %ecx",
+            "idivq %rcx",
+            "divl %ecx",
+            "divq %rcx",
+            "divb %cl",
+            "imulq %rsi",
+            "imull %esi",
+            "imulw %bx",
+            "mulq %rsi",
+            "mull %esi",
+            "mulxq %rsi, %rdi, %rdx",
+            "fnstsw %ax",
+            "rdtsc",
+            "rdtscp",
+            "rdmsr",
+            "cpuid",
+            "syscall",
+            "sysenter",
+            "sysexitq",
+            "rsm",
+            "leave",
+            "rep movsq",
+            "repne scasb",
+            "rep stosb",
+            "popa",
+            "popal",
+            "pushfq",
+            "popfq",
+            "rdpkru",
+            "rdpru",
+            "clzero",
+            "enter $8, $0",
+        ];
+        let mut missed = Vec::new();
+        for asm in samples {
+            if implicit_r_w_full(asm.as_bytes()).1 != 0 && !has_implicit_reg_usage(asm) {
+                missed.push(asm);
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "the veto does not cover modelled implicit writes: {missed:?}"
+        );
+        assert!(samples.len() >= 40);
+    }
+
+    /// The veto must accept untrimmed input; a formatting difference must
+    /// never turn a refusal into an acceptance.
+    #[test]
+    fn leading_whitespace_cannot_silence_the_veto() {
+        for asm in ["cltd", "  cltd", "\tcltd", "    idivq %rcx"] {
+            assert!(has_implicit_reg_usage(asm), "{asm:?} must be vetoed");
+        }
+    }
+
+    /// ...and pure register-to-register forms must stay optimisable, or the
+    /// passes that ask this question would stop working entirely.
+    #[test]
+    fn plain_forms_are_not_vetoed() {
+        for asm in [
+            "movq %rax, %rbx",
+            "movl %eax, %ebx",
+            "addq %rcx, %rax",
+            "imulq $3, %rax, %rbx",
+            "imulq %rsi, %rdi",
+            "leaq 8(%rdi), %rax",
+            "cmpq %rsi, %rdi",
+            "sete %al",
+            "cmovne %rax, %rbx",
+            // Shift-by-%cl names its count register, so the caller's operand
+            // scan already sees the read; vetoing it here would only cost an
+            // optimisation.  (Read-only implicit traffic is modelled by
+            // `implicit_read_refs`, which the coalescers consult.)
+            "shlq %cl, %rax",
+            "sarq %cl, %rax",
+            "xsave (%rdi)",
+            "monitor %rax, %rcx, %rdx",
+        ] {
+            assert!(!has_implicit_reg_usage(asm), "{asm} must stay optimisable");
+        }
     }
 }

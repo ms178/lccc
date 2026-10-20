@@ -195,22 +195,18 @@ impl Lowerer {
                     }
                 }
                 let is_unsigned = self.is_expr_unsigned_for_const(inner);
-                let promoted = shared_const_eval::promote_sub_int(val, is_unsigned);
-                let result = const_arith::negate_const(promoted)?;
-                // C11 6.5.3.3p1 + 6.3.1.3p2: `-x` has the promoted type of
-                // the operand, and an unsigned result is reduced modulo
-                // 2^width. A 32-bit unsigned operand is carried as I64, so
-                // wrapping_neg on the carrier computes -x mod 2^64 instead
-                // of mod 2^32: -(3844603080U) folded to
+                // C11 6.5.3.3p1 + 6.3.1.3p2: `-x` has the operand's promoted
+                // type, and an unsigned result reduces modulo 2^width of that
+                // type. A 32-bit unsigned operand is carried as I64, so
+                // negating the carrier computes -x mod 2^64 instead of
+                // mod 2^32: -(3844603080U) folded to
                 // 18446744069864948536 instead of 450364216 (YARPGen seed
-                // 101). Mirror of the BitNot arm's truncation below and of
-                // the sema const evaluator's Neg arm.
-                if is_unsigned && self.infer_expr_type(inner).size() == 4 {
-                    if let IrConst::I64(v) = result {
-                        return Some(IrConst::I64((v as u32) as i64));
-                    }
-                }
-                Some(result)
+                // 101). The rule is shared with the sema folder.
+                shared_const_eval::negate_const_promoted(
+                    val,
+                    is_unsigned,
+                    Some(self.infer_expr_type(inner).size()),
+                )
             }
             Expr::BinaryOp(op, lhs, rhs, _) => {
                 let l = self.eval_const_expr(lhs);
@@ -332,24 +328,20 @@ impl Lowerer {
             Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
                 let is_unsigned = self.is_expr_unsigned_for_const(inner);
-                let promoted = shared_const_eval::promote_sub_int(val, is_unsigned);
-                let result = const_arith::bitnot_const(promoted)?;
-                // C11 6.5.3.3: the result of `~` has the promoted type of the
-                // operand. bitnot_const complements the FULL stored width, which
-                // over-widens when a 32-bit unsigned int is stored as I64:
-                // `~0xFFFFFFFFu` complements to 0xFFFFFFFF_00000000 instead of 0,
-                // flipping a boolean/short-circuit use (bug found via Regehr
-                // yarpgen test regress_logical_and_const_bitnot_short_circuit:
-                // `const unsigned u = 0xFFFFFFFFu; ~u && f()` wrongly called f()).
-                // Truncate to the operand's promoted width (integer promotion
-                // lifts sub-int to at least int, i.e. 4 bytes).
-                let inner_ty = self.infer_expr_type(inner);
-                if inner_ty.size() < 8 {
-                    if let IrConst::I64(v) = result {
-                        return Some(IrConst::I64((v as u32) as i64));
-                    }
-                }
-                Some(result)
+                // C11 6.5.3.3p4: the result of `~` has the promoted type of
+                // the operand, so the complement must be reduced to that
+                // width: `~0xFFFFFFFFu` complements to
+                // 0xFFFFFFFF_00000000 instead of 0, which flipped a
+                // boolean/short-circuit use (regress_logical_and_const_bitnot_
+                // short_circuit: `const unsigned u = 0xFFFFFFFFu; ~u && f()`
+                // wrongly called f()). Sub-int operands are promoted to int
+                // (4 bytes) before the operator runs, so their carrier is
+                // I32 and the reduction does not apply. Shared rule.
+                shared_const_eval::bitnot_const_promoted(
+                    val,
+                    is_unsigned,
+                    Some(self.infer_expr_type(inner).size()),
+                )
             }
             Expr::Cast(target_type, inner, _, _) => self.eval_const_cast(target_type, inner),
             Expr::Identifier(name, _) => self.eval_const_identifier(expr, name),
@@ -1080,7 +1072,7 @@ impl Lowerer {
                 // source bits, never bit-truncation to width 8
                 // (C11 6.3.1.2; mirror of the sema eval_const_expr fix).
                 if self.type_spec_to_ctype(target_type) == CType::Bool {
-                    return Some((u64::from(bits != 0), false));
+                    return Some((u64::from(shared_const_eval::c_bool_truth(bits)), false));
                 }
                 let target_ir_ty = self.type_spec_to_ir(target_type);
                 let target_width = target_ir_ty.size() * 8;

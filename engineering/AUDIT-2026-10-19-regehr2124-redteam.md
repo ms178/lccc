@@ -1,8 +1,9 @@
 # AUDIT 2026-10-19: red-team review of the REGEHR-2124 patch stack
 
-Scope: commits `ba39f8d0..HEAD` on base `2715bf90` (== `main`,
-verified by `git ls-remote`: main had not moved; the rebase is a
-no-op, and PR #871 merged today *is* the base). Method: re-read every
+Scope: the whole REGEHR-2124 change set on top of the then-current
+`main` (`2715bf90`, the merge of PR #871). Stated as a base commit, not
+as a commit range: the change landed squashed, so the individual stages
+never existed as standalone commits in this repository. Method: re-read every
 Rust hunk adversarially, probe each fix with cases its regression test
 does not cover, re-run differentials, and measure with deterministic
 tools (Cachegrind instruction counts; this VM has no PMU). Verdicts
@@ -154,7 +155,8 @@ follow-ups with exact shapes are in the FOLLOWUP.
 * The harness restored/tore `redundant_ext.rs` twice mid-session
   (duplicated `#[test]`, lost attribute, spliced EOF). Discipline
   that worked: read-before-edit, count-asserted replacements,
-  count tests before/after (1813→1814 caught the lost attribute),
+  count tests before/after (one lost `#[test]` attribute shows up
+  immediately as a count drop),
   commit+snapshot per validated step.
 * VM timing deltas under ~10% are meaningless without an
   ASM-identity check (a −7% crc32 "regression" was identical
@@ -265,3 +267,120 @@ disjoint regions). Semantic audit findings:
    72.024M GCC-16.2). Validation this round is surgical (targeted
    gates listed in the delivery notes); the full --fast run was
    last green on 4c0d36489 and is NOT re-claimed for e176a77a.
+## 5. Round 2 -- one architectural model, and a guard that cost codegen
+
+Re-auditing the redundant-extension work against the tree that #880 merged
+found two things the earlier round had wrong.
+
+### 5a. The pass had no implicit-write invalidation at all
+
+`redundant_ext` decides whether a widening cast can be deleted from
+per-family facts ("this value fits in 8 bits"). A fact must die at any
+instruction that defines a register *without naming it*. On the merged tree
+the pass handled `call` and nothing else, so a fact about `%rax`/`%rdx`
+survived `cltd`, `idiv`, `cpuid`, `rep movsb` and `syscall`.
+
+The backend already has one architectural model of unnamed operands,
+`types::classify_implicit_operands`, which models every implicit-operand form
+this backend can read (one-operand
+`imul`, `mulx`, `popa`/`pushf`, `rsm`, `sysenter`, the `xsave` family, `rep`
+string ops, `cpuid`/`rdtsc`, `int3`, hypervisor calls, x87 control ops). The
+pass sees them because the backend emits them (divisions, string ops,
+syscalls) or splices them in from inline assembly; `cltd`, `cqto`, `idivq`,
+`rep movs`, `cpuid`, `rdtsc` and `syscall` all occur in the corpus today.
+A 23-row fixture pins a reviewed subset and
+`scripts/check_implicit_operand_matrix.py` compiles the model against it;
+the pass's own property test samples 38 forms across the rest. The pass now
+reads that model's write mask (`ExtFacts::clear_implicit(u16)`) instead of
+keeping a narrower private table.
+
+Evidence:
+
+| claim | evidence |
+|---|---|
+| the ledger cannot depend on a value the instruction destroys | property test: for every family in the model's write mask, `ledger(start=all-true) == ledger(start=all-false)` after the instruction; 38 forms, non-vacuity floor of 30 |
+| the guard is load-bearing | replacing the model with the old four-mnemonic table makes that test fail on `cqo` |
+| `has_implicit_reg_usage` stays a superset of the model's write half | `every_modelled_implicit_write_is_vetoed`; it already passed before the change, because the veto's slow path consults the model -- so consulting the model *first* (the obvious "single source of truth" move) was measured at **+5.1 % compiler wall time** (corpus `-S` sweep, 45.5 s vs 43.3 s mean) for zero semantic change, and was dropped. What remains is a `trim_start()` that makes the veto total: an untrimmed line modelled as an empty mnemonic and answered "safe" |
+
+### 5b. A frame-pointer guard this work itself added was a codegen regression
+
+An earlier round added `is_frame_pointer()` to three rewrite sites in this
+pass, on the premise that "no producer establishes a sub-register fact for
+the stack or frame pointer". The premise is false for `%rbp`: in frameless
+functions the emitter uses it as an ordinary scratch register. Diffing
+`-O2 -S` output for the 1001-program corpus against the merged tree showed
+**32 programs differing, +44 instructions net**, every one of them a
+`movzbl mem,%eax` / `movzbl %al,%ebp` pair that the pass could no longer
+rewrite into a 32-bit copy (and then fold into the load).
+
+The exclusion bought no safety: `movzbl %al, %ebp` and `movl %eax, %ebp`
+write the SAME value to the same register whenever bits 8..31 of `%rax` are
+proven zero -- the original already writes the whole destination. The guard
+is removed, its doc comment is corrected, and its test is replaced by one
+that asserts the rewrite happens and explains why.
+
+After the removal the corpus diff against the merged tree is **2 files**. One
+is an improvement: a copy feeding `imull` is coalesced away
+(`movl %eax,%r11d; imull $1000,%r11d,%r11d` -> `imull $1000,%eax,%r11d`).
+
+The other was not. The first version of this document called it an
+improvement -- "a `u32` constant folded as `u32` instead of sign-extended"
+(`movq $-3,%rax` -> `movl $4294967293,%eax`) -- because the corpus program
+that exposed it prints nothing on the affected path. Diffing the assembly
+rather than the output is what made it visible, and it took a hand-written
+probe to show that `movl $4294967293,%eax` zero-extends a value that must be
+sign-extended: `(size_t)-(enum { E = 3 })` printed 4294967293 where GCC 16.2
+and Clang 23.1.3 print 18446744073709551613. Section 5d has the cause and
+the fix; after it, the corpus diff against the merged tree is that one
+`imull` coalescing, and the folded constant is back to `movq $-3,%rax`.
+
+### 5c. Gates that were not running
+
+* `scripts/check_implicit_operand_matrix.py` extracted
+  `implicit_full_write_refs` without the `_from_write_mask` helper it calls,
+  so its probe never compiled, and no workflow referenced it. Fixed and
+  wired into `.github/workflows/ci.yml` and `scripts/ci_local.sh`.
+* `ci_local.sh` never registered the TLS runtime oracle gate that the hosted
+  workflow ran, so `check_ci_gate_parity.py` was red on `main`. #881 landed
+  that registration while this delta was in review (with the same
+  "exactly one registration beside its rationale" comment this delta had
+  written); the resolution takes upstream's text. This delta adds the two
+  gates of its own -- the YARPGen provisioner contract and the
+  implicit-operand matrix -- taking parity from 314 to 316 commands.
+* `scripts/audit_census.py --check` is red on `main` at the time of writing
+  and remains red after #881 (fns_over_500 94 vs 93, knob_literals 513 vs
+  510, knobs_undocumented 289 vs 286; exit status 1, measured on a pristine
+  `origin/main` checkout). This delta contributes zero to all three, so the
+  baseline is re-tightened to the measured values in the commit that
+  carries the fix.
+
+### 5d. Constant folding
+
+#880 fixed the carrier bug inline at both folder sites. This delta does not
+fix it again; it removes the duplication that allowed it to exist in two
+places: `negate_const_promoted` / `bitnot_const_promoted` /
+`c_bool_const` / `c_bool_const_i128` in `common::const_eval` are now the
+only definitions, the four call sites pass their operand type through them,
+and `regress_const_fold_promoted_widths.c` pins the observable behaviour.
+That test consumes each folded value at 64-bit width, because `%u` and an
+`unsigned int` assignment both truncate and cannot see a carrier leak;
+removing the 2^32 reduction makes lines 9 and 10 print 18446744073709551615
+and the program exit 13 at the `k_widen_neg_one` check (measured by mutation).
+
+The same consolidation introduced a mirror-image bug, found by diffing
+assembly rather than program output. `reduce_to_operand_width` decided
+whether to mask a folded value to 32 bits from the carrier width alone,
+documenting the premise as "the `I64` carrier holding a 4-byte operand is
+itself the proof that the operand is unsigned (no signed 32-bit value is
+ever carried in 64 bits)". The premise is false: a **signed** 32-bit operand
+is carried in `I64` whenever the surrounding expression is 64-bit, which is
+exactly the shape of `(size_t)-(enum { E = 3 })`. Masking such a value
+zero-extends it, so the early-return value of `BIT_initDStream` (a `size_t`
+returning `ERROR(CORRUPTION_DETECTED)`) became 4294967293 instead of
+18446744073709551613. The reduction now requires `is_unsigned`, which both
+callers already compute for [`promote_sub_int`] from the same type query
+that produces the size, so the two cannot disagree; when no type is known
+the size is `None` and the carrier rule stays. A signed-operand witness
+(`k_widen_neg_signed`, consumed at 64-bit width and compared against a
+run-time twin) is in the regression test, and reverting the fix makes it
+exit 17 -- measured, not assumed.

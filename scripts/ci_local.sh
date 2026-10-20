@@ -923,6 +923,12 @@ gate "yarpgen-mutpair-tests" fast \
 gate "yarpgen-pair-smoke" fast \
     python3 scripts/yarpgen_mutpair.py --ci-smoke --lccc "$LCCC" --refs gcc
 
+# The provisioner's trust model as a contract: stamp/probe/drift/re-provision
+# decisions, with git and cmake replaced by PATH shims (no network, no
+# generator build). Mirrors the hosted step of the same name.
+gate "yarpgen-provisioner-contract" fast \
+    bash tests/regression/check_ensure_yarpgen.sh
+
 gate "strict-computed-recip-codegen" fast \
     bash tests/regression/check_strict_computed_recip_codegen.sh
 
@@ -1473,6 +1479,12 @@ gate "dispatcher-region-contract" fast \
 # pass hand-rolls the old `is_nop() || kind == Directive` test again.
 gate "peephole-directive-step" fast \
     python3 scripts/check_peephole_directive_step.py
+
+# The implicit-operand table is what every fact-tracking pass consults; the
+# fixture is the reviewer-facing statement of the architecture it encodes.
+# This gate had been broken (and unregistered) since it was written.
+gate "implicit-operand-matrix" fast \
+    python3 scripts/check_implicit_operand_matrix.py
 
 # A message that says "the ratchet is 151" while the gate still assigns 153 is
 # not a typo: it is a reader told the limit lives somewhere it does not.  The
