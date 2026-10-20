@@ -1125,6 +1125,7 @@ gate "volatile-reduction" fast \
 gate "llvm-missed-inventory-tests" fast python3 scripts/test_llvm_missed_inventory.py
 gate "llvm-missed-inventory-optimized-tests" fast python3 -O scripts/test_llvm_missed_inventory.py
 gate "llvm-missed-zero-choice" fast python3 tests/regression/check_llvm_missed_zero_choice.py
+gate "llvm-missed-integer-batch" fast python3 tests/regression/check_llvm_missed_integer_batch.py
 
 gate "tls-model-option" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_option.sh

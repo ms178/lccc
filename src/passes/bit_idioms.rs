@@ -2983,7 +2983,28 @@ pub(crate) fn recognize_function(
         }
         block.instructions.splice(ii..=ii, replacement);
     }
-    changes
+    // The demand-driven consumer sweep runs after all coordinate-based
+    // producer edits/expansions. Reuse the existing allocations, but rebuild
+    // a coherent immutable snapshot from the final layout. Ambiguous defs
+    // must not supply algebraic facts.
+    defs.resize(func.max_value_id() as usize + 1, None);
+    defs.fill(None);
+    def_counts.resize(defs.len(), 0);
+    def_counts.fill(0);
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                defs[dest.0 as usize] = Some(inst.clone());
+                def_counts[dest.0 as usize] += 1;
+            }
+        }
+    }
+    for (definition, count) in defs.iter_mut().zip(&def_counts) {
+        if *count != 1 {
+            *definition = None;
+        }
+    }
+    changes + observe::run(func, &defs)
 }
 
 #[cfg(test)]
@@ -5304,3 +5325,11 @@ mod range_tests;
 #[cfg(test)]
 #[path = "bit_idioms_zero_choice_tests.rs"]
 mod zero_choice_tests;
+
+#[path = "bit_idioms_observe.rs"]
+mod observe;
+
+/// Demand observations before div/rem strength reduction loses their structure.
+pub(crate) fn observe_before_division(func: &mut IrFunction) -> usize {
+    observe::early(func)
+}

@@ -1962,6 +1962,22 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
         }
 
+        // Observe quotient/remainder consumers before materializing magic
+        // multipliers. The same bit_idioms disable policy covers both entries.
+        if !pass_disabled(&disabled, "bit_idioms") {
+            let n = timed_pass!(
+                "bit_observations_pre_div",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    bit_idioms::observe_before_division
+                )
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         // Phase 2a: Division-by-constant strength reduction.
         // Replaces slow div/idiv instructions with fast multiply-and-shift sequences.
         // Run early so subsequent passes (narrowing, simplify, constant folding, DCE)

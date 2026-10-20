@@ -13,8 +13,10 @@ LCCC. A title/label match is not proof of relevance either.
 `inventory.csv` is the compact, searchable index. It deliberately includes
 unsupported targets and uncertain cases so nothing disappears through an
 optimistic filter. The batch ledger records manually reviewed scope separately
-from automatic routing. **Only one reduced pattern family is covered in this
-first batch; this does not claim optimal code for the other 3,110 posts.**
+from automatic routing. The first batch covered one reduced pattern family. [Batch 2](BATCH-002.md)
+adds **25 conservatively grouped implementation families with 45 native
+witnesses**. The cumulative `coverage.json` still limits coverage per upstream
+report; this is not a claim of optimal code for the entire inventory.
 
 Full API bodies, public conversation comments and hashes belong in ignored
 `work/llvm-missed/` or the downloadable artifact, not in the source tree. They
@@ -27,13 +29,13 @@ to the agent. Linked pages and code are not automatically executed.
 python3 scripts/llvm_missed_inventory.py \
   --output work/llvm-missed \
   --csv engineering/llvm-missed/inventory.csv \
-  --ledger engineering/llvm-missed/batch-001.json --comments
+  --ledger engineering/llvm-missed/coverage.json --comments
 
 # Continue a valid partial comment log against the original hashed post snapshot:
 python3 scripts/llvm_missed_inventory.py \
   --output work/llvm-missed \
   --csv engineering/llvm-missed/inventory.csv \
-  --ledger engineering/llvm-missed/batch-001.json --comments --resume
+  --ledger engineering/llvm-missed/coverage.json --comments --resume
 ```
 
 The collector uses authenticated `gh api` without handling credentials. It
