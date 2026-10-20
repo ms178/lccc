@@ -87,6 +87,32 @@ static unsigned wide_test(signed char x) {
     return n;
 }
 
+__attribute__((noinline))
+static unsigned wide_test_i16(int16_t x) {
+    unsigned n = 0;
+    int32_t wide;
+    if (!x) return 0;
+    do {
+        wide = (int32_t)x & ((int32_t)x - 1);
+        x = (int16_t)(uint16_t)wide;
+        ++n;
+    } while (wide);
+    return n;
+}
+
+__attribute__((noinline))
+static unsigned wide_test_i32(int32_t x) {
+    unsigned n = 0;
+    int64_t wide;
+    if (!x) return 0;
+    do {
+        wide = (int64_t)x & ((int64_t)x - 1);
+        x = (int32_t)(uint32_t)wide;
+        ++n;
+    } while (wide);
+    return n;
+}
+
 int main(void) {
     static const uint64_t samples[] = {
         0ULL,
@@ -133,6 +159,18 @@ int main(void) {
     for (int i = -128; i <= 127; ++i) {
         unsigned ref = reference_count((uint8_t)i) + (unsigned)(i < 0);
         if (wide_test((signed char)i) != ref) return 8;
+    }
+    for (int i = -32768; i <= 32767; ++i) {
+        unsigned ref = reference_count((uint16_t)i) + (unsigned)(i < 0);
+        if (wide_test_i16((int16_t)i) != ref) return 9;
+    }
+    static const int32_t signed_samples[] = {
+        0, 1, -1, INT32_MIN, INT32_MAX, INT32_MIN / 2, -123456789
+    };
+    for (unsigned i = 0; i < sizeof(signed_samples) / sizeof(signed_samples[0]); ++i) {
+        int32_t x = signed_samples[i];
+        unsigned ref = reference_count((uint32_t)x) + (unsigned)(x < 0);
+        if (wide_test_i32(x) != ref) return 10;
     }
     printf("ok %ld\n", sum);
     return 0;

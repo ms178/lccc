@@ -3,19 +3,30 @@
 use super::*;
 
 fn rotated(narrow_condition: bool, compare: Option<IrCmpOp>) -> IrFunction {
+    rotated_width(narrow_condition, compare, IrType::I8, IrType::I32)
+}
+
+fn rotated_width(
+    narrow_condition: bool,
+    compare: Option<IrCmpOp>,
+    narrow_ty: IrType,
+    wide_ty: IrType,
+) -> IrFunction {
+    let unsigned_ty = match narrow_ty {
+        IrType::I8 => IrType::U8,
+        IrType::I16 => IrType::U16,
+        IrType::I32 => IrType::U32,
+        _ => unreachable!(),
+    };
     let mut param = ptr_param();
-    param.ty = IrType::I8;
+    param.ty = narrow_ty;
     let mut f = IrFunction::new("rotated_popcount".into(), IrType::I32, vec![param], false);
     let tested = if narrow_condition { 12 } else { 16 };
-    let tested_ty = if narrow_condition {
-        IrType::I8
-    } else {
-        IrType::I32
-    };
+    let tested_ty = if narrow_condition { narrow_ty } else { wide_ty };
     let mut body = vec![
         Instruction::Phi {
             dest: Value(10),
-            ty: IrType::I8,
+            ty: narrow_ty,
             incoming: vec![(val(1), BlockId(0)), (val(12), BlockId(1))],
         },
         Instruction::Phi {
@@ -26,34 +37,34 @@ fn rotated(narrow_condition: bool, compare: Option<IrCmpOp>) -> IrFunction {
         Instruction::Cast {
             dest: Value(14),
             src: val(10),
-            from_ty: IrType::I8,
-            to_ty: IrType::I32,
+            from_ty: narrow_ty,
+            to_ty: wide_ty,
         },
         Instruction::BinOp {
             dest: Value(15),
             op: IrBinOp::Sub,
             lhs: val(14),
             rhs: i32c(1),
-            ty: IrType::I32,
+            ty: wide_ty,
         },
         Instruction::BinOp {
             dest: Value(16),
             op: IrBinOp::And,
             lhs: val(14),
             rhs: val(15),
-            ty: IrType::I32,
+            ty: wide_ty,
         },
         Instruction::Cast {
             dest: Value(17),
             src: val(16),
-            from_ty: IrType::I32,
-            to_ty: IrType::U8,
+            from_ty: wide_ty,
+            to_ty: unsigned_ty,
         },
         Instruction::Cast {
             dest: Value(12),
             src: val(17),
-            from_ty: IrType::U8,
-            to_ty: IrType::I8,
+            from_ty: unsigned_ty,
+            to_ty: narrow_ty,
         },
         Instruction::BinOp {
             dest: Value(13),
@@ -83,14 +94,14 @@ fn rotated(narrow_condition: bool, compare: Option<IrCmpOp>) -> IrFunction {
                 Instruction::ParamRef {
                     dest: Value(1),
                     param_idx: 0,
-                    ty: IrType::I8,
+                    ty: narrow_ty,
                 },
                 Instruction::Cmp {
                     dest: Value(2),
                     op: IrCmpOp::Ne,
                     lhs: val(1),
                     rhs: i32c(0),
-                    ty: IrType::I8,
+                    ty: narrow_ty,
                 },
             ],
             Terminator::CondBranch {
@@ -130,27 +141,39 @@ fn verify(f: &IrFunction) {
 
 #[test]
 fn wide_predicate_is_not_equivalent_to_truncated_recurrence() {
-    for cmp in [None, Some(IrCmpOp::Eq), Some(IrCmpOp::Ne)] {
-        let mut f = rotated(false, cmp);
-        verify(&f);
-        assert_eq!(run_function(&mut f), 0, "wide predicate {cmp:?}");
-        assert!(!has_popcount(&f));
-        verify(&f);
+    for (narrow, wide, bits) in [
+        (IrType::I8, IrType::I32, 8),
+        (IrType::I16, IrType::I32, 16),
+        (IrType::I32, IrType::I64, 32),
+    ] {
+        for cmp in [None, Some(IrCmpOp::Eq), Some(IrCmpOp::Ne)] {
+            let mut f = rotated_width(false, cmp, narrow, wide);
+            verify(&f);
+            assert_eq!(run_function(&mut f), 0, "{narrow:?} wide predicate {cmp:?}");
+            assert!(!has_popcount(&f));
+            verify(&f);
+        }
+        let x = -(1i64 << (bits - 1));
+        let wide = x & (x - 1);
+        assert_ne!(wide, 0);
+        assert_eq!(wide & ((1i64 << bits) - 1), 0);
     }
-    let x = -128i32;
-    let wide = x & (x - 1);
-    assert_ne!(wide, 0);
-    assert_eq!(wide as u8, 0);
 }
 
 #[test]
 fn normalized_rotated_predicates_rewrite_and_preserve_ssa_and_spans() {
-    for cmp in [None, Some(IrCmpOp::Eq), Some(IrCmpOp::Ne)] {
-        let mut f = rotated(true, cmp);
-        verify(&f);
-        assert_eq!(run_function(&mut f), 1, "narrow predicate {cmp:?}");
-        assert!(has_popcount(&f));
-        verify(&f);
+    for (narrow, wide) in [
+        (IrType::I8, IrType::I32),
+        (IrType::I16, IrType::I32),
+        (IrType::I32, IrType::I64),
+    ] {
+        for cmp in [None, Some(IrCmpOp::Eq), Some(IrCmpOp::Ne)] {
+            let mut f = rotated_width(true, cmp, narrow, wide);
+            verify(&f);
+            assert_eq!(run_function(&mut f), 1, "{narrow:?} narrow predicate {cmp:?}");
+            assert!(has_popcount(&f));
+            verify(&f);
+        }
     }
 }
 
