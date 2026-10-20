@@ -2580,6 +2580,8 @@ impl SemanticAnalyzer {
                     if matches!(
                         name.as_str(),
                         "__builtin_unreachable"
+                            | "__builtin_return"
+                            | "__builtin_longjmp"
                             | "__builtin_trap"
                             | "__builtin_abort"
                             | "abort"
@@ -6805,4 +6807,51 @@ struct WalkFrame {
 /// A member that takes an initializer slot. Unnamed bit-fields do not (C11 6.7.2.1p13).
 fn is_initializer_slot(field: &StructFieldLayout) -> bool {
     !(field.name.is_empty() && field.bit_width.is_some())
+}
+
+#[cfg(test)]
+mod builtin_return_flow_tests {
+    use super::SemanticAnalyzer;
+    use crate::frontend::lexer::Lexer;
+    use crate::frontend::parser::Parser;
+
+    fn warnings(body: &str) -> usize {
+        let source = format!("int f(void *block) {{ {body} }}");
+        let tokens = Lexer::new(&source, 0).tokenize();
+        let mut parser = Parser::new(tokens);
+        let tu = parser.parse();
+        assert_eq!(parser.error_count, 0, "{body}");
+        let mut analyzer = SemanticAnalyzer::new();
+        assert!(analyzer.analyze(&tu).is_ok(), "{body}");
+        analyzer.diagnostics.borrow().warning_count()
+    }
+
+    #[test]
+    fn nonlocal_return_builtins_terminate_fallthrough_analysis() {
+        // Lowering already terminates these paths. Their semantic classification
+        // must agree, including the existing cast/comma expression wrappers.
+        for body in [
+            "__builtin_return(block);",
+            "(void)__builtin_return(block);",
+            "((void)0, __builtin_return(block));",
+            "if (block) __builtin_return(block); else __builtin_return(block);",
+            "__builtin_longjmp(block, 1);",
+            "(void)__builtin_longjmp(block, 1);",
+        ] {
+            assert_eq!(warnings(body), 0, "{body}");
+        }
+    }
+
+    #[test]
+    fn ordinary_builtin_results_and_conditional_paths_still_warn() {
+        for body in [
+            "__builtin_return_address(0);",
+            "__builtin_apply_args();",
+            "__builtin_setjmp(block);",
+            "if (block) __builtin_return(block);",
+            "if (block) __builtin_longjmp(block, 1);",
+        ] {
+            assert_eq!(warnings(body), 1, "{body}");
+        }
+    }
 }
