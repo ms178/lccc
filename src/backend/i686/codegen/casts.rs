@@ -129,8 +129,15 @@ impl I686Codegen {
             if source.0 == dest.0 && from_ty == to_ty {
                 return;
             }
-            if matches!(from_ty, IrType::I32 | IrType::U32)
-                && matches!(to_ty, IrType::I32 | IrType::U32)
+            let narrow_already_extended = matches!(to_ty, IrType::I32 | IrType::U32 | IrType::Ptr)
+                && super::comparison::NarrowImage::of_type(from_ty).is_some_and(|req| {
+                    self.narrow_images
+                        .get(&source.0)
+                        .is_some_and(|img| img.extends_at(req.bits, req.signed))
+                });
+            if (matches!(from_ty, IrType::I32 | IrType::U32)
+                && matches!(to_ty, IrType::I32 | IrType::U32))
+                || narrow_already_extended
             {
                 if let (Some(&dp), Some(&sp)) = (
                     self.reg_assignments.get(&dest.0),
@@ -139,6 +146,21 @@ impl I686Codegen {
                     if dp == sp {
                         return;
                     }
+                    // A proved extension is a full 32-bit register image.
+                    // Between callee-saved homes, copy it directly without
+                    // disturbing either accumulator cache or scratch registers.
+                    // EAX/ECX/EDX retain the established staging paths below.
+                    if narrow_already_extended && dp.0 < 4 && sp.0 < 4 {
+                        let dst = super::emit::phys_reg_name(dp);
+                        let src = super::emit::phys_reg_name(sp);
+                        emit!(self.state, "    movl %{}, %{}", src, dst);
+                        return;
+                    }
+                }
+                if narrow_already_extended {
+                    self.operand_to_eax(src);
+                    self.store_eax_to(dest);
+                    return;
                 }
             }
         }
@@ -1053,5 +1075,84 @@ mod tests {
 
         assert_eq!(u32::from((-1i16) as u8), 255);
         assert_eq!(i32::from(128u8 as i16), 128);
+    }
+}
+
+#[cfg(test)]
+mod narrow_extension_tests {
+    use super::*;
+    use crate::backend::regalloc::PhysReg;
+    use crate::backend::state::StackSlot;
+
+    fn emitter(image: Option<IrType>, source: Option<u8>, dest: Option<u8>) -> I686Codegen {
+        let mut cg = I686Codegen::new();
+        if let Some(ty) = image {
+            cg.narrow_images.insert(
+                1,
+                super::super::comparison::NarrowImage::of_type(ty).unwrap(),
+            );
+        }
+        if let Some(reg) = source {
+            cg.reg_assignments.insert(1, PhysReg(reg));
+        }
+        if let Some(reg) = dest {
+            cg.reg_assignments.insert(2, PhysReg(reg));
+        }
+        cg.state.value_locations.insert(1, StackSlot(-4));
+        cg.state.value_locations.insert(2, StackSlot(-8));
+        cg
+    }
+
+    #[test]
+    fn normalized_narrow_cast_uses_zero_or_one_register_move() {
+        for ty in [IrType::U8, IrType::I8, IrType::U16, IrType::I16] {
+            for dest in [IrType::I32, IrType::U32, IrType::Ptr] {
+                let mut same = emitter(Some(ty), Some(0), Some(0));
+                same.emit_cast_impl(&Value(2), &Operand::Value(Value(1)), ty, dest);
+                assert!(same.state.out.buf.is_empty());
+                let mut distinct = emitter(Some(ty), Some(0), Some(1));
+                distinct.emit_cast_impl(&Value(2), &Operand::Value(Value(1)), ty, dest);
+                assert_eq!(distinct.state.out.buf.trim(), "movl %ebx, %esi");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_or_incompatible_image_keeps_normalization() {
+        for image in [None, Some(IrType::I8), Some(IrType::U16)] {
+            let mut cg = emitter(image, Some(0), Some(1));
+            cg.emit_cast_impl(
+                &Value(2),
+                &Operand::Value(Value(1)),
+                IrType::U8,
+                IrType::I32,
+            );
+            assert!(
+                cg.state.out.buf.contains("movzbl"),
+                "{image:?}: {}",
+                cg.state.out.buf
+            );
+        }
+    }
+
+    #[test]
+    fn spill_and_scratch_paths_keep_full_width_images() {
+        for (source, dest) in [
+            (None, Some(1)),
+            (Some(0), None),
+            (None, None),
+            (Some(6), Some(1)),
+            (Some(0), Some(6)),
+        ] {
+            let mut cg = emitter(Some(IrType::U8), source, dest);
+            cg.emit_cast_impl(
+                &Value(2),
+                &Operand::Value(Value(1)),
+                IrType::U8,
+                IrType::I32,
+            );
+            assert!(!cg.state.out.buf.contains("movzbl"));
+            assert!(cg.state.out.buf.contains("movl"));
+        }
     }
 }

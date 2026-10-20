@@ -1394,7 +1394,7 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
     let mut reg_offsets: RegHomes = std::array::from_fn(|_| SmallVec::default());
     let mut reg_zext: [bool; 16] = [false; 16];
     let mut lv = FileLiveness::new(store, infos);
-    let mut fp = FpLiveness::new(store, infos);
+    let mut fp: Option<FpLiveness> = None;
     let mut changed = false;
     let mut prev_was_unconditional_jump = false;
 
@@ -1658,6 +1658,7 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
                         invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, dst);
                     }
                 } else if xmm_forward_ok {
+                    let fp_ref = fp.get_or_insert_with(|| FpLiveness::new(store, infos));
                     changed |= gsf_handle_load_xmm(
                         store,
                         infos,
@@ -1667,7 +1668,7 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
                         &mut slot_entries,
                         &mut reg_offsets,
                         &mut lv,
-                        &mut fp,
+                        fp_ref,
                     );
                 } else if let Some(dst) = parse_xmm_family(infos[i].trimmed(store.get(i))) {
                     invalidate_reg_flat(&mut slot_entries, &mut reg_offsets, dst);

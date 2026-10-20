@@ -184,6 +184,51 @@ pub(super) fn has_implicit_reg_usage(trimmed: &str) -> bool {
     if nb.len() < 3 {
         return false;
     }
+    // Fast-reject common mnemonics with no implicit GP usage.
+    match nb[0] {
+        b'm' if nb[1] == b'o' && nb[2] == b'v' => {
+            if nb.len() > 3 && nb[3] != b's' {
+                return false;
+            }
+            if nb.starts_with(b"movslq ")
+                || nb.starts_with(b"movsbl ")
+                || nb.starts_with(b"movswl ")
+                || nb.starts_with(b"movsd ")
+                || nb.starts_with(b"movss ")
+            {
+                return false;
+            }
+        }
+        b'l' if nb.starts_with(b"leaq ") || nb.starts_with(b"leal ") => return false,
+        b'a' if nb.starts_with(b"add") || nb.starts_with(b"and") => return false,
+        b's' if nb.starts_with(b"sub")
+            || nb.starts_with(b"set")
+            || nb.starts_with(b"shlq ")
+            || nb.starts_with(b"shll ")
+            || nb.starts_with(b"shrq ")
+            || nb.starts_with(b"shrl ")
+            || nb.starts_with(b"sarq ")
+            || nb.starts_with(b"sarl ") =>
+        {
+            return false;
+        }
+        b'o' if nb.starts_with(b"orq ") || nb.starts_with(b"orl ") => return false,
+        b'x' if nb.starts_with(b"xor") => return false,
+        b'c' if nb.starts_with(b"cmpq ")
+            || nb.starts_with(b"cmpl ")
+            || nb.starts_with(b"cmpw ")
+            || nb.starts_with(b"cmpb ")
+            || nb.starts_with(b"cmov")
+            || nb.starts_with(b"call") =>
+        {
+            return false;
+        }
+        b't' if nb.starts_with(b"test") => return false,
+        b'j' | b'n' | b'b' => return false,
+        b'p' if nb.starts_with(b"pushq ") || nb.starts_with(b"popq ") => return false,
+        b'r' if nb.starts_with(b"ret") => return false,
+        _ => {}
+    }
     // Integer div/mul use implicit rax:rdx. Exclude SSE variants (divsd/mulsd/etc.)
     // which start with div[sp] or mul[sp] — these have no implicit register usage.
     (nb[0] == b'd' && nb[1] == b'i' && nb[2] == b'v'
@@ -895,6 +940,12 @@ pub(super) fn src_mentions_family(trimmed: &str, fam: RegId) -> bool {
         return false;
     };
     let src_part = &code[..comma];
+    if !src_part.as_bytes().contains(&b'%') {
+        return false;
+    }
+    if (fam as usize) >= 8 {
+        return src_part.contains(REG_NAMES[0][fam as usize]);
+    }
     if REG_NAMES
         .iter()
         .any(|row| src_part.contains(row[fam as usize]))

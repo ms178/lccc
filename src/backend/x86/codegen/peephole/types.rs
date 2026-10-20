@@ -2267,6 +2267,17 @@ pub(super) fn implicit_write_refs(b: &[u8]) -> u16 {
     classify_implicit_operands(b).1
 }
 
+/// Combined `(reads, writes, full_writes)` query so `liveness::straight_effect`
+/// classifies each instruction once instead of three times.
+#[inline]
+pub(super) fn implicit_r_w_full(b: &[u8]) -> (u16, u16, u16) {
+    let (ir, iw) = classify_implicit_operands(b);
+    if iw == 0 {
+        return (ir, 0, 0);
+    }
+    (ir, iw, implicit_full_write_refs_from_write_mask(b, iw))
+}
+
 /// One instruction's implicit (reads, writes) over the GP family numbering
 /// (0 = %rax .. 15 = %r15), derived from its mnemonic.  Both halves are
 /// EXACT for every instruction listed; unknown mnemonics yield (0, 0) —
@@ -2329,8 +2340,18 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
         m = m2;
         rest = r2;
     }
-    let has_comma = rest.contains(&b',');
     let table: (u16, u16) = match m {
+        // Fast path for the most frequent instructions that have no implicit
+        // GP registers.
+        b"movq" | b"movl" | b"movw" | b"movb" | b"movslq" | b"movzbl" | b"movzwl" | b"movsbl"
+        | b"movswl" | b"movabsq" | b"movsd" | b"movss" | b"movaps" | b"movups" | b"movapd"
+        | b"movupd" | b"movdqa" | b"movdqu" | b"leaq" | b"leal" | b"addq" | b"addl" | b"subq"
+        | b"subl" | b"andq" | b"andl" | b"orq" | b"orl" | b"xorq" | b"xorl" | b"cmpq" | b"cmpl"
+        | b"cmpw" | b"cmpb" | b"testq" | b"testl" | b"testw" | b"testb" | b"jmp" | b"je"
+        | b"jne" | b"jl" | b"jle" | b"jg" | b"jge" | b"ja" | b"jae" | b"jb" | b"jbe" | b"js"
+        | b"jns" | b"pushq" | b"popq" | b"call" | b"callq" | b"ret" | b"retq" | b"nop" => {
+            return (reads, writes);
+        }
         // Sign-extension of the accumulator in place.
         b"cbtw" | b"cwtl" | b"cltq" | b"cbw" | b"cwde" | b"cdqe" => (RAX, RAX),
         // Sign-extension into the data register: %rax is the INPUT.
@@ -2343,7 +2364,7 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
         | b"mul" | b"mulw" | b"mull" | b"mulq" => (RAX | RDX, RAX | RDX),
         // imul with a single operand is the widening form (rax:rdx); the
         // two/three-operand forms name every register they touch.
-        b"imul" | b"imulw" | b"imull" | b"imulq" if !has_comma => (RAX, RAX | RDX),
+        b"imul" | b"imulw" | b"imull" | b"imulq" if !rest.contains(&b',') => (RAX, RAX | RDX),
         // BMI2 mulx reads %rdx implicitly; both destinations are explicit.
         b"mulx" | b"mulxl" | b"mulxq" => (RDX, 0),
         // String instructions: %rsi source, %rdi destination, %rax data.  The
@@ -2504,6 +2525,14 @@ fn classify_implicit_operands(b: &[u8]) -> (u16, u16) {
 ///   failure path) and `xbegin` (abort status only);
 /// * over-approximate rows — `int` (the handler's contract is unknown).
 pub(super) fn implicit_full_write_refs(b: &[u8]) -> u16 {
+    let iw = classify_implicit_operands(b).1;
+    if iw == 0 {
+        return 0;
+    }
+    implicit_full_write_refs_from_write_mask(b, iw)
+}
+
+fn implicit_full_write_refs_from_write_mask(b: &[u8], iw: u16) -> u16 {
     const RAX: u16 = 1 << 0;
     const RDX: u16 = 1 << 2;
     // Skip `lock`/`rep*` prefixes exactly like classify_implicit_operands
@@ -2544,7 +2573,7 @@ pub(super) fn implicit_full_write_refs(b: &[u8]) -> u16 {
         b"int" => u16::MAX,
         _ => 0,
     };
-    classify_implicit_operands(b).1 & !partial
+    iw & !partial
 }
 
 /// Write an integer and the "(%rbp)" suffix into a buffer without using core::fmt.
@@ -3310,5 +3339,62 @@ mod indentation_tests {
                 assert_eq!(actual.trimmed(&line), text);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod combined_implicit_effect_tests {
+    use super::*;
+
+    #[test]
+    fn combined_query_matches_separate_read_write_and_full_write_contracts() {
+        for mnemonic in [
+            "movq %rax, %rbx",
+            "addl %eax, %r8d",
+            "imulq %rbx",
+            "imulq %rbx, %rax",
+            "idivb %bl",
+            "mulxq %rbx, %r8, %r9",
+            "movsb",
+            "stosq",
+            "lodsb",
+            "scasq",
+            "cpuid",
+            "rdtscp",
+            "syscall",
+            "lahf",
+            "sahf",
+            "cltq",
+            "cqto",
+            "int $0x80",
+            "xbegin .Lfail",
+            "cmpxchgq %rbx, (%rdi)",
+            "xsave64 (%rdi)",
+            "ret",
+            "nop",
+        ] {
+            for prefix in ["", "lock ", "rep ", "repne "] {
+                let text = format!("{prefix}{mnemonic}");
+                let b = text.as_bytes();
+                let combined = implicit_r_w_full(b);
+                assert_eq!(
+                    combined,
+                    (
+                        implicit_read_refs(b),
+                        implicit_write_refs(b),
+                        implicit_full_write_refs(b)
+                    ),
+                    "{text}"
+                );
+                assert_eq!(
+                    combined.2 & !combined.1,
+                    0,
+                    "full writes must be writes: {text}"
+                );
+            }
+        }
+        assert_eq!(implicit_r_w_full(b"cltq"), (1, 1, 1));
+        assert_eq!(implicit_r_w_full(b"lahf").2, 0);
+        assert_eq!(implicit_r_w_full(b"rep movsb"), (0xc2, 0xc2, 0xc2));
     }
 }

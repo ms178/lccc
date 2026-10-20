@@ -100,7 +100,7 @@ pub(super) struct NarrowImage {
 }
 
 impl NarrowImage {
-    fn of_type(ty: IrType) -> Option<Self> {
+    pub(super) fn of_type(ty: IrType) -> Option<Self> {
         match ty {
             IrType::U8 => Some(Self {
                 bits: 8,
@@ -126,7 +126,7 @@ impl NarrowImage {
     /// extension from `bits <= width` bits of the same kind is (extending
     /// twice is extending once); a ZERO extension from strictly fewer bits
     /// is also a SIGN extension at `width` (bit `width-1` is zero).
-    fn extends_at(self, width: u8, signed: bool) -> bool {
+    pub(super) fn extends_at(self, width: u8, signed: bool) -> bool {
         self.bits <= width && (self.signed == signed || (!self.signed && self.bits < width))
     }
 }

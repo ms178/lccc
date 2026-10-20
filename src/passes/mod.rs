@@ -1249,6 +1249,7 @@ pub(crate) fn run_passes(
     module: &mut IrModule,
     opt_level: u32,
     target: crate::backend::Target,
+    loop_idiom_capabilities: loop_idiom::Capabilities,
     code16gcc: bool,
     wrap_signed_overflow: bool,
     fp_environment_observable: bool,
@@ -2114,7 +2115,12 @@ pub(crate) fn run_passes(
             let n = timed_pass!(
                 "loop_idiom",
                 run_on_visited(module, &dirty, &mut changed, |func| {
-                    loop_idiom::run_function(func, &aliased_names, &local_globals)
+                    loop_idiom::run_function(
+                        func,
+                        &aliased_names,
+                        &local_globals,
+                        loop_idiom_capabilities,
+                    )
                 })
             );
             total_changes += n;
@@ -3510,7 +3516,18 @@ pub(crate) fn run_passes(
     // Producer ranges survive copies/casts without conflating carrier widths.
     // Run after transformations that reason about signed integer domains.
     if !pass_disabled(&disabled, "intbounds") {
-        module.for_each_function(integer_bounds::run);
+        module.for_each_function(|f| {
+            let changed = integer_bounds::run(f);
+            if changed != 0 {
+                if !pass_disabled(&disabled, "copyprop") {
+                    copy_prop::propagate_copies(f);
+                }
+                if !pass_disabled(&disabled, "dce") {
+                    dce::eliminate_dead_code(f);
+                }
+            }
+            changed
+        });
         verify::verify_after_pass(module, "intbounds");
     }
 
@@ -3950,6 +3967,7 @@ mod signed_wrap_policy_tests {
             module,
             level,
             crate::backend::Target::X86_64,
+            loop_idiom::Capabilities::default(),
             false,
             wrap,
             fenv,

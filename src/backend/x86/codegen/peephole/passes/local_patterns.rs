@@ -8357,7 +8357,7 @@ pub(super) fn fold_scalar_fp_memory_into_vex_op(
 ) -> bool {
     let len = store.len();
     let mut changed = false;
-    let mut lv = FpLiveness::new(store, infos);
+    let mut lv: Option<FpLiveness> = None;
     let mut i = 0;
 
     while i + 1 < len {
@@ -8436,7 +8436,8 @@ pub(super) fn fold_scalar_fp_memory_into_vex_op(
         // loop top of the next iteration) and to legacy destructive
         // consumers in -O0 code (patE.c).
         let d_num: u32 = dst_d[3..].parse().unwrap_or(u32::MAX);
-        if !lv.deleted_write_regions_dead_after(store, infos, j, d_num, &[i, j]) {
+        let lv_ref = lv.get_or_insert_with(|| FpLiveness::new(store, infos));
+        if !lv_ref.deleted_write_regions_dead_after(store, infos, j, d_num, &[i, j]) {
             i += 1;
             continue;
         }
@@ -8452,7 +8453,7 @@ pub(super) fn fold_scalar_fp_memory_into_vex_op(
             j,
             replacement,
         );
-        lv.refresh_at(store, infos, i);
+        lv_ref.refresh_at(store, infos, i);
         changed = true;
         i = j;
     }

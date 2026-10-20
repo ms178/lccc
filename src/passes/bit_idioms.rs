@@ -1544,26 +1544,255 @@ fn match_bit_reverse32(result: Operand, defs: &[Option<Instruction>]) -> Option<
 /// `[0, 2^bits)`), and a direct `Load` of an unsigned narrow type. A cast
 /// from a SIGNED narrow type sign-extends and can be negative in the wide
 /// domain — refused.
-fn fits_low_bits(op: Operand, bits: u32, ring_bits: usize, defs: &[Option<Instruction>]) -> bool {
+fn fits_low_bits(
+    mut op: Operand,
+    bits: u32,
+    mut ring_bits: usize,
+    defs: &[Option<Instruction>],
+    def_counts: &[u32],
+) -> bool {
     let mask = (1u64 << bits) - 1;
-    match op {
-        Operand::Const(_) => const_in_ring(op, ring_bits).is_some_and(|v| v <= mask),
-        Operand::Value(v) => match defs.get(v.0 as usize).and_then(Option::as_ref) {
-            Some(Instruction::Cast {
-                src,
-                from_ty,
-                to_ty,
-                ..
-            }) if to_ty.is_integer() && to_ty.size() * 8 == ring_bits => {
-                let from_ok = matches!((from_ty, bits), (IrType::U8, 8) | (IrType::U16, 16));
-                from_ok && fits_low_bits(*src, bits, from_ty.size() * 8, defs)
+    // This query follows one chain, never a tree. A fixed budget avoids heap
+    // allocation, recursion, and stack growth; cycles and deep webs fail closed.
+    for _ in 0..64 {
+        match op {
+            Operand::Const(_) => return const_in_ring(op, ring_bits).is_some_and(|v| v <= mask),
+            Operand::Value(v) => {
+                if def_counts.get(v.0 as usize).copied() != Some(1) {
+                    return false;
+                }
+                match defs.get(v.0 as usize).and_then(Option::as_ref) {
+                    Some(Instruction::Copy { src, .. }) => op = *src,
+                    Some(Instruction::Cast {
+                        src,
+                        from_ty,
+                        to_ty,
+                        ..
+                    }) if to_ty.is_integer() && to_ty.size() * 8 == ring_bits => {
+                        if matches!((to_ty, bits), (IrType::U8, 8) | (IrType::U16, 16)) {
+                            return true;
+                        }
+                        if !matches!((from_ty, bits), (IrType::U8, 8) | (IrType::U16, 16)) {
+                            return false;
+                        }
+                        op = *src;
+                        ring_bits = from_ty.size() * 8;
+                    }
+                    Some(Instruction::Load { ty, .. } | Instruction::ParamRef { ty, .. }) => {
+                        return matches!((ty, bits), (IrType::U8, 8) | (IrType::U16, 16));
+                    }
+                    Some(Instruction::BinOp {
+                        op: IrBinOp::And,
+                        lhs,
+                        rhs,
+                        ty,
+                        ..
+                    }) if ty.is_integer() && ty.size() * 8 == ring_bits => {
+                        return const_in_ring(*rhs, ring_bits).is_some_and(|m| m <= mask)
+                            || const_in_ring(*lhs, ring_bits).is_some_and(|m| m <= mask);
+                    }
+                    _ => return false,
+                }
             }
-            Some(Instruction::Load { ty, .. }) => {
-                matches!((ty, bits), (IrType::U8, 8) | (IrType::U16, 16))
-            }
-            _ => false,
-        },
+        }
     }
+    false
+}
+
+/// Canonicalize two narrow-integer patterns before the main `bit_idioms` scan:
+/// 1. A single-use non-volatile `Load` of `I8`/`I16` whose sole consumer is a
+///    same-width unsigned `Cast` (`I8 -> U8` or `I16 -> U16`, e.g. `(uint8_t)buf[i]`
+///    where `buf` is `const char *`) becomes an unsigned `Load` (`U8`/`U16`) plus
+///    a `Copy`, allowing `load_cast_fold` and `fits_low_bits` to treat the load
+///    directly as zero-extending (`movzbl`/`movzwl` instead of `movsbq`+`movzbl`).
+/// 2. A narrow unsigned truncation `Cast(a ^ b, W -> U8/U16)` whose sole consumer
+///    widens `U8/U16 -> final_ty` (e.g. `crc_tab[(uint8_t)(crc ^ buf[i])]`)
+///    distributes the narrow mask onto the wide operand when the other operand
+///    already fits in the low 8/16 bits: `x = a & 0xff; c1 = x ^ b; c2 = Cast(c1, W.to_unsigned() -> final_ty)`.
+fn canonicalize_narrow_crc_casts(func: &mut IrFunction) -> usize {
+    let max_id = func.max_value_id() as usize + 1;
+    let mut defs = vec![None; max_id];
+    let mut def_loc = vec![None; max_id];
+    let mut def_counts = vec![0u32; max_id];
+    let mut use_counts = vec![0u32; max_id];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(dest) = inst.dest() {
+                let idx = dest.0 as usize;
+                def_counts[idx] += 1;
+                defs[idx] = Some(inst.clone());
+                def_loc[idx] = Some((bi, ii));
+            }
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    use_counts[v.0 as usize] += 1;
+                }
+            });
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                use_counts[v.0 as usize] += 1;
+            });
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                use_counts[v.0 as usize] += 1;
+            }
+        });
+    }
+
+    let mut rewrites: Vec<(usize, usize, Instruction)> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::Cast {
+                dest: c_dest,
+                src: Operand::Value(lv),
+                from_ty: c_from @ (IrType::I8 | IrType::I16),
+                to_ty: c_to @ (IrType::U8 | IrType::U16),
+            } = inst
+                && c_from.to_unsigned() == *c_to
+                && def_counts.get(lv.0 as usize).copied() == Some(1)
+                && use_counts.get(lv.0 as usize).copied() == Some(1)
+                && def_counts.get(c_dest.0 as usize).copied() == Some(1)
+                && let Some((lbi, lii)) = def_loc.get(lv.0 as usize).copied().flatten()
+                && let Some(Some(Instruction::Load {
+                    dest: l_dest,
+                    ptr,
+                    ty: l_ty,
+                    seg_override,
+                    volatile: false,
+                })) = defs.get(lv.0 as usize)
+                && *l_dest == *lv
+                && *l_ty == *c_from
+            {
+                let new_load = Instruction::Load {
+                    dest: *l_dest,
+                    ptr: *ptr,
+                    ty: *c_to,
+                    seg_override: *seg_override,
+                    volatile: false,
+                };
+                let new_copy = Instruction::Copy {
+                    dest: *c_dest,
+                    src: Operand::Value(*lv),
+                };
+                defs[lv.0 as usize] = Some(new_load.clone());
+                defs[c_dest.0 as usize] = Some(new_copy.clone());
+                rewrites.push((lbi, lii, new_load));
+                rewrites.push((bi, ii, new_copy));
+            }
+        }
+    }
+
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Cast {
+                dest: c2_dest,
+                src: Operand::Value(c1),
+                from_ty: narrow_ty @ (IrType::U8 | IrType::U16),
+                to_ty: final_ty,
+            } = inst
+            else {
+                continue;
+            };
+            let bits = (narrow_ty.size() * 8) as u32;
+            if !final_ty.is_integer()
+                || final_ty.size() < 4
+                || def_counts.get(c2_dest.0 as usize).copied() != Some(1)
+                || def_counts.get(c1.0 as usize).copied() != Some(1)
+                || use_counts.get(c1.0 as usize).copied() != Some(1)
+            {
+                continue;
+            }
+            let Some((c1_bi, c1_ii)) = def_loc.get(c1.0 as usize).copied().flatten() else {
+                continue;
+            };
+            let Some(Some(Instruction::Cast {
+                dest: c1_d,
+                src: Operand::Value(x),
+                from_ty: wide_ty,
+                to_ty: c1_to,
+            })) = defs.get(c1.0 as usize).cloned()
+            else {
+                continue;
+            };
+            if c1_d != *c1
+                || c1_to != *narrow_ty
+                || !matches!(
+                    wide_ty,
+                    IrType::U32 | IrType::I32 | IrType::U64 | IrType::I64
+                )
+                || final_ty.size() < wide_ty.size()
+                || def_counts.get(x.0 as usize).copied() != Some(1)
+                || use_counts.get(x.0 as usize).copied() != Some(1)
+            {
+                continue;
+            }
+            let Some((x_bi, x_ii)) = def_loc.get(x.0 as usize).copied().flatten() else {
+                continue;
+            };
+            let Some(Some(Instruction::BinOp {
+                dest: x_d,
+                op: op @ (IrBinOp::Xor | IrBinOp::Or),
+                lhs: Operand::Value(a),
+                rhs: Operand::Value(b),
+                ty: x_ty,
+            })) = defs.get(x.0 as usize).cloned()
+            else {
+                continue;
+            };
+            if x_d != x || x_ty != wide_ty {
+                continue;
+            }
+            let ring_bits = wide_ty.size() * 8;
+            let a_fits = fits_low_bits(Operand::Value(a), bits, ring_bits, &defs, &def_counts);
+            let b_fits = fits_low_bits(Operand::Value(b), bits, ring_bits, &defs, &def_counts);
+            if a_fits == b_fits {
+                continue;
+            }
+            let (masked, narrow) = if b_fits { (a, b) } else { (b, a) };
+            let mask_val = (1i64 << bits) - 1;
+            let mask_const = if wide_ty.size() == 8 {
+                crate::ir::reexports::IrConst::I64(mask_val)
+            } else {
+                crate::ir::reexports::IrConst::I32(mask_val as i32)
+            };
+            let new_x = Instruction::BinOp {
+                dest: x,
+                op: IrBinOp::And,
+                lhs: Operand::Value(masked),
+                rhs: Operand::Const(mask_const),
+                ty: wide_ty,
+            };
+            let new_c1 = Instruction::BinOp {
+                dest: *c1,
+                op,
+                lhs: Operand::Value(x),
+                rhs: Operand::Value(narrow),
+                ty: wide_ty,
+            };
+            let new_c2 = if *final_ty == wide_ty {
+                Instruction::Copy {
+                    dest: *c2_dest,
+                    src: Operand::Value(*c1),
+                }
+            } else {
+                Instruction::Cast {
+                    dest: *c2_dest,
+                    src: Operand::Value(*c1),
+                    from_ty: wide_ty.to_unsigned(),
+                    to_ty: *final_ty,
+                }
+            };
+            rewrites.push((x_bi, x_ii, new_x));
+            rewrites.push((c1_bi, c1_ii, new_c1));
+            rewrites.push((bi, ii, new_c2));
+        }
+    }
+
+    let count = rewrites.len();
+    for (bi, ii, new_inst) in rewrites {
+        func.blocks[bi].instructions[ii] = new_inst;
+    }
+    count
 }
 
 /// Union-punned copysign through memory: `r = mag(a)|sign(b)` spelled with
@@ -2098,7 +2327,9 @@ pub(crate) fn recognize_function(
     min_rotate_bits: u32,
     has_scalar_andn: bool,
 ) -> usize {
+    let pre_changes = canonicalize_narrow_crc_casts(func);
     let mut defs = vec![None; func.max_value_id() as usize + 1];
+    let mut def_counts = vec![0u32; defs.len()];
     // (block index, instruction index) of each value's defining instruction,
     // for in-place rewrites of the PRODUCER while visiting the consumer.
     let mut def_loc = vec![None; func.max_value_id() as usize + 1];
@@ -2108,6 +2339,7 @@ pub(crate) fn recognize_function(
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             if let Some(dest) = inst.dest() {
+                def_counts[dest.0 as usize] += 1;
                 defs[dest.0 as usize] = Some(inst.clone());
                 def_loc[dest.0 as usize] = Some((bi, ii));
             }
@@ -2129,7 +2361,7 @@ pub(crate) fn recognize_function(
 
     // Union-punned copysign first: it mints fresh IDs (written back to
     // `func.next_value_id`) before the main scan seeds its own counter.
-    let mut changes = recognize_copysign_mem(func);
+    let mut changes = pre_changes + recognize_copysign_mem(func);
     let mut next_value_id = func.max_value_id().saturating_add(1);
     // Boolean mux/majority algebra kill switch (same authority contract as
     // the vectorizer's CCC_NO_* gates; A/B for the differential batteries).
@@ -2236,6 +2468,8 @@ pub(crate) fn recognize_function(
                 };
                 if bits != 0
                     && matches!(ty, IrType::U32 | IrType::I32 | IrType::U64 | IrType::I64)
+                    && def_counts.get(x.0 as usize).copied() == Some(1)
+                    && def_counts.get(dest.0 as usize).copied() == Some(1)
                     && use_counts.get(x.0 as usize).copied() == Some(1)
                 {
                     let xor = defs.get(x.0 as usize).and_then(Option::as_ref).cloned();
@@ -2252,10 +2486,20 @@ pub(crate) fn recognize_function(
                         let op = op;
                         let x_ty = x_ty;
                         if x_ty == ty {
-                            let a_fits =
-                                fits_low_bits(Operand::Value(a), bits, ty.size() * 8, &defs);
-                            let b_fits =
-                                fits_low_bits(Operand::Value(b), bits, ty.size() * 8, &defs);
+                            let a_fits = fits_low_bits(
+                                Operand::Value(a),
+                                bits,
+                                ty.size() * 8,
+                                &defs,
+                                &def_counts,
+                            );
+                            let b_fits = fits_low_bits(
+                                Operand::Value(b),
+                                bits,
+                                ty.size() * 8,
+                                &defs,
+                                &def_counts,
+                            );
                             // Exactly one side carries the narrow value; the
                             // other receives the mask. Both fitting is
                             // already optimal as-is (both and-free), and
@@ -4984,3 +5228,7 @@ mod tests {
 #[cfg(test)]
 #[path = "bit_idioms_review_tests.rs"]
 mod review_tests;
+
+#[cfg(test)]
+#[path = "bit_idioms_range_tests.rs"]
+mod range_tests;

@@ -294,7 +294,7 @@ fn parse_fp_reg_move(t: &str) -> Option<(u32, u32)> {
 pub(super) fn eliminate_dead_fp_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let len = store.len();
-    let fp = FpLiveness::new(store, infos);
+    let mut fp: Option<FpLiveness> = None;
     for i in 0..len {
         if infos[i].is_nop() || infos[i].pinned || infos[i].is_barrier() {
             continue;
@@ -306,7 +306,10 @@ pub(super) fn eliminate_dead_fp_moves(store: &LineStore, infos: &mut [LineInfo])
         let Some((_src, dst)) = parse_fp_reg_move(trimmed) else {
             continue;
         };
-        if fp.reg_move_dead_after(store, infos, i, dst) {
+        if fp
+            .get_or_insert_with(|| FpLiveness::new(store, infos))
+            .reg_move_dead_after(store, infos, i, dst)
+        {
             mark_nop(&mut infos[i]);
             changed = true;
         }

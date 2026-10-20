@@ -4,21 +4,19 @@ Keep unimplemented opportunities here only when a reproducible workload or
 assembly witness exists. Move completed work to its change review with measured
 results; do not turn unmeasured expectations into claims.
 
-## Population-count loop idiom
+## Population-count and CRC follow-through
 
-The glibc `bench-pthread-locks` fixture includes the classic loop
-`while (x) { x &= x - 1; n++; }`. Current LCCC emits a serial `lea`/`and`/`test`
-loop per set bit, while GCC, Clang, and ICX use a fixed-cost population-count
-sequence. Investigate a target-independent loop idiom with a target legality
-and cost hook, then validate zero and full-width edge cases. Measure runtime and
-Callgrind instruction counts on sparse and dense inputs; compare generated
-assembly against the configured compiler oracles. Do not force `popcnt` unless
-the selected target features permit it.
+The population-count loop recognizer and range-aware CRC index lowering are
+implemented. Their legality contracts and regression commands are recorded in
+[the optimization review](POPCOUNT-CRC-REVIEW.md). Remaining performance work
+must distinguish code shape from measured runtime:
 
-## CRC32 table index narrowing
-
-The glibc CRC32 witness contains redundant index extension/masking. Trace value
-ranges through IR and x86 lowering before adding a peephole: the preferred fix
-is range-aware narrowing that can benefit non-CRC code. Validate against the
-real workload, an exhaustive byte-index microtest, assembly size, and Callgrind
-instruction counts.
+- Measure sparse, dense, and zero population-count workloads separately, with
+  explicit target features and tuning. A native instruction removes the
+  per-set-bit loop, but does not by itself establish an end-to-end speedup.
+- Compare CRC witnesses using identical inputs and flags; retain the emitted
+  assembly, compiler identities, text sizes, and timing distributions. Relevant
+  workloads are `tests/benchmark/programs/gzip_crc32.c` and
+  `tests/benchmark/programs/crc32_nibble_hot.c`.
+- Keep the established exploratory block-layout policy at `-O1` unless a
+  separately measured compile-time/code-size tradeoff justifies changing it.

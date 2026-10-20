@@ -213,7 +213,7 @@ pub(super) fn fold_fp_memory_operands(store: &mut LineStore, infos: &mut [LineIn
 pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
-    let mut lv = FpLiveness::new(store, infos);
+    let mut lv: Option<FpLiveness> = None;
     let mut i = 0;
     while i + 1 < len {
         let j = next_non_debug(store, infos, i + 1, len);
@@ -294,7 +294,8 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
             .strip_prefix("%xmm")
             .and_then(|d| d.parse::<u32>().ok())
             .unwrap_or(u32::MAX);
-        if !lv.deleted_write_regions_dead_after(store, infos, j, src_n, &[i, j]) {
+        let lv_ref = lv.get_or_insert_with(|| FpLiveness::new(store, infos));
+        if !lv_ref.deleted_write_regions_dead_after(store, infos, j, src_n, &[i, j]) {
             i += 1;
             continue;
         }
@@ -308,7 +309,7 @@ pub(super) fn fold_fp_register_loads(store: &mut LineStore, infos: &mut [LineInf
         };
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, replacement);
-        lv.refresh_at(store, infos, i);
+        lv_ref.refresh_at(store, infos, i);
         changed = true;
         i = j + 1;
     }
@@ -1606,7 +1607,7 @@ fn is_transparent_for_store_fold(
 /// (the slot's high half is undefined).
 pub(super) fn fold_store_alu_memop(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
-    let lv = FpLiveness::new(store, infos);
+    let mut lv: Option<FpLiveness> = None;
     // Built on the first label the scan meets.  The folds below substitute
     // registers for slot operands and delete stores; they never add a label
     // reference (the `LabelRefs` staleness contract).
@@ -1713,7 +1714,9 @@ pub(super) fn fold_store_alu_memop(store: &mut LineStore, infos: &mut [LineInfo]
                             // closed (reports live) for opaque / address-taken
                             // functions, so the store is kept there — never folded
                             // across a possibly-aliasing access.
-                            let dead = lv.slot_dead_after(j, base, offset, size.byte_size());
+                            let dead = lv
+                                .get_or_insert_with(|| FpLiveness::new(store, infos))
+                                .slot_dead_after(j, base, offset, size.byte_size());
                             let regname = reg_id_to_name(reg, alu_size);
                             let new_inst = format!("    {} {}, {}", mn, regname, dstr);
                             replace_line(store, &mut infos[j], j, new_inst);
@@ -2099,7 +2102,7 @@ pub(super) fn fold_fma_memory_operand(store: &mut LineStore, infos: &mut [LineIn
 
     let len = store.len();
     let mut changed = false;
-    let mut lv = FpLiveness::new(store, infos);
+    let mut lv: Option<FpLiveness> = None;
     let mut i = 0;
     while i + 1 < len {
         if infos[i].is_nop() || infos[i].pinned {
@@ -2194,7 +2197,8 @@ pub(super) fn fold_fma_memory_operand(store: &mut LineStore, infos: &mut [LineIn
         //    every path (CFG-aware; a loop-top reader through the back edge,
         //    a call reading it as an FP argument, or a merge-form
         //    redefinition all keep it live). ─────────────────────────────
-        if !lv.deleted_write_regions_dead_after(store, infos, j, n, &[i, j]) {
+        let lv_ref = lv.get_or_insert_with(|| FpLiveness::new(store, infos));
+        if !lv_ref.deleted_write_regions_dead_after(store, infos, j, n, &[i, j]) {
             i += 1;
             continue;
         }
@@ -2211,7 +2215,7 @@ pub(super) fn fold_fma_memory_operand(store: &mut LineStore, infos: &mut [LineIn
 
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, rewritten);
-        lv.refresh_at(store, infos, i);
+        lv_ref.refresh_at(store, infos, i);
         changed = true;
         i = j + 1;
     }
@@ -2578,7 +2582,7 @@ pub(super) fn fold_zero_addend_fma213_to_132(
 
     let len = store.len();
     let mut changed = false;
-    let mut lv = FpLiveness::new(store, infos);
+    let mut lv: Option<FpLiveness> = None;
     let mut i = 0;
     while i + 2 < len {
         if infos[i].is_nop() || infos[i].pinned {
@@ -2643,7 +2647,8 @@ pub(super) fn fold_zero_addend_fma213_to_132(
         // ── liveness: the FMA must be the LAST reader of the loaded value
         //    (%xmmB) on every path — CFG-aware dataflow, same contract as
         //    fold_fma_memory_operand. ─────────────────────────────────────────
-        if !lv.deleted_write_regions_dead_after(store, infos, k, b, &[i, k]) {
+        let lv_ref = lv.get_or_insert_with(|| FpLiveness::new(store, infos));
+        if !lv_ref.deleted_write_regions_dead_after(store, infos, k, b, &[i, k]) {
             i += 1;
             continue;
         }
@@ -2655,7 +2660,7 @@ pub(super) fn fold_zero_addend_fma213_to_132(
             k,
             format!("    vfmadd132{} {}, %xmm0, {}", width, addr, ops[2]),
         );
-        lv.refresh_at(store, infos, i);
+        lv_ref.refresh_at(store, infos, i);
         changed = true;
         i = k + 1;
     }

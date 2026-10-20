@@ -2207,6 +2207,9 @@ impl Driver {
             &mut module,
             self.opt_level,
             self.target,
+            crate::passes::loop_idiom::Capabilities {
+                native_popcount: self.resolved_fast_popcount(),
+            },
             self.code16gcc,
             self.wrap_signed_overflow,
             fp_environment_observable,
@@ -3154,6 +3157,19 @@ impl Driver {
         }
     }
 
+    /// Whether the target has a direct hardware population-count lowering
+    /// (`popcnt` on x86/i686, AdvSIMD `cnt` + `addv` on AArch64 when SIMD
+    /// registers are permitted). Used by `loop_idiom` so `while (x) { x &= x - 1; n++; }`
+    /// folds to `IrUnaryOp::Popcount` only when the backend lowers `Popcount`
+    /// without a software bit-count loop (GCC 16 / Clang 23 / ICX 2026 parity).
+    pub(crate) fn resolved_fast_popcount(&self) -> bool {
+        match self.target {
+            Target::X86_64 | Target::I686 => self.resolved_popcnt(),
+            Target::Aarch64 => !self.general_regs_only,
+            Target::Riscv64 => false,
+        }
+    }
+
     /// Effective FP contraction policy (GCC parity, measured 2026-10-13 on
     /// gcc 14.2 with `-march=x86-64-v3` probes).
     ///
@@ -3578,5 +3594,34 @@ mod sse_reference_tests {
         let asm = ".type f, @function\nf:\n#APP\n    movaps %xmm0, %xmm1\n#NO_APP\n\
                    # note: %xmm0\n    ret\n";
         assert!(first_sse_reference(asm).is_none());
+    }
+}
+
+#[cfg(test)]
+mod loop_idiom_capability_tests {
+    use super::*;
+
+    #[test]
+    fn native_popcount_permission_obeys_every_target_and_explicit_veto() {
+        let mut driver = Driver::new();
+        for target in [Target::X86_64, Target::I686] {
+            driver.target = target;
+            driver.x86_march_explicit = true;
+            driver.enable_popcnt = false;
+            assert!(!driver.resolved_fast_popcount());
+            driver.enable_popcnt = true;
+            assert!(driver.resolved_fast_popcount());
+            driver.popcnt_explicitly_disabled = true;
+            assert!(!driver.resolved_fast_popcount());
+            driver.popcnt_explicitly_disabled = false;
+        }
+        driver.target = Target::Aarch64;
+        driver.general_regs_only = false;
+        assert!(driver.resolved_fast_popcount());
+        driver.general_regs_only = true;
+        assert!(!driver.resolved_fast_popcount());
+        driver.target = Target::Riscv64;
+        driver.general_regs_only = false;
+        assert!(!driver.resolved_fast_popcount());
     }
 }
