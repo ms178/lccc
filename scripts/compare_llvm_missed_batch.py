@@ -17,6 +17,10 @@ from check_llvm_missed_zero_choice import run, body  # noqa: E402
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--suite", choices=("batch2", "batch3"), default="batch2")
+    parser.add_argument(
+        "--wide", action="store_true", help="batch3 64-bit companion source"
+    )
     parser.add_argument("--compiler", default=str(ROOT / "target/fastbuild/lccc"))
     parser.add_argument(
         "--baseline", required=True, help="saved compiler from before this batch"
@@ -33,8 +37,14 @@ def main():
         r"\b23\.1\.3\b", versions["clang"]
     ):
         raise ValueError("requires GCC 16.2 and Clang 23.1.3")
-    source = ROOT / "tests/regression/llvm_missed_integer_batch.c"
-    rows = {c["name"]: {} for c in json.loads(source.with_suffix(".json").read_text())}
+    if args.wide and args.suite != "batch3":
+        raise ValueError("--wide requires --suite=batch3")
+    stem = (
+        "llvm_missed_integer_batch" if args.suite == "batch2" else "llvm_missed_batch3"
+    )
+    contracts = ROOT / "tests/regression" / (stem + ".json")
+    source = ROOT / "tests/regression" / (stem + ("_wide" if args.wide else "") + ".c")
+    rows = {c["name"]: {} for c in json.loads(contracts.read_text())}
     flags = ["-O3", "-march=x86-64-v3", "-S"]
     with tempfile.TemporaryDirectory() as directory:
         for name, tool in (

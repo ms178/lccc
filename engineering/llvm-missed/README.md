@@ -1,4 +1,4 @@
-# LLVM missed-optimization distillation: inventory and batch 1
+# LLVM missed-optimization distillation: inventory and implementation batches
 
 ## What this is (and is not)
 
@@ -15,7 +15,10 @@ unsupported targets and uncertain cases so nothing disappears through an
 optimistic filter. The batch ledger records manually reviewed scope separately
 from automatic routing. The first batch covered one reduced pattern family. [Batch 2](BATCH-002.md)
 adds **25 conservatively grouped implementation families with 45 native
-witnesses**. The cumulative `coverage.json` still limits coverage per upstream
+witnesses**. [Batch 3](BATCH-003.md) adds bounded demand reconstruction and
+Boolean-cardinality synthesis, with 60 reduced contracts and 120 width-specific
+native witnesses, plus a terminal boolean-return improvement for dispatch.
+Two contracts are already-optimized controls, not new assembly wins. The cumulative `coverage.json` still limits coverage per upstream
 report; this is not a claim of optimal code for the entire inventory.
 
 Full API bodies, public conversation comments and hashes belong in ignored

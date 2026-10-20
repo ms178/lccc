@@ -48,6 +48,7 @@ mod push_pop;
 mod pushf_elim;
 mod redundant_ext;
 mod relay_and_lea;
+mod return_bool;
 mod self_zext;
 mod spill_deref;
 mod store_forwarding;
@@ -1958,6 +1959,10 @@ fn peephole_optimize_inner(
     // leaves the peephole.
     if !sk("dead_pure_writes") {
         let _ = retire_dead_pure_writes(&store, &mut infos, !sk("dead_flag_writes"));
+    }
+
+    if !sk("return_bool") {
+        return_bool::run(&mut store, &mut infos);
     }
 
     // Phase 9: Re-run the always-on text passes on the FINAL text. The early
