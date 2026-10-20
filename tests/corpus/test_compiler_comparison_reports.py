@@ -48,7 +48,7 @@ def report():
 class ComparisonReport(unittest.TestCase):
     def test_full_correct_registry_is_required_and_never_deduplicated(self):
         data = report()
-        self.assertEqual(summary.summarize(data)['comparisons']['prior']['timing_eligible'], 45)
+        self.assertEqual(summary.summarize(data)['comparisons']['prior']['timing_eligible'], 46)
         for mutate in [lambda rows: rows.pop(), lambda rows: rows.append(copy.deepcopy(rows[0])),
                        lambda rows: rows[0].update(name='unknown')]:
             bad = copy.deepcopy(data)
@@ -60,8 +60,8 @@ class ComparisonReport(unittest.TestCase):
         data = report()
         data['benchmarks'][0]['runtime']['lccc']['wall']['median'] = .001
         result = summary.summarize(data)
-        self.assertEqual(result['comparisons']['prior']['correct'], 45)
-        self.assertEqual(result['comparisons']['prior']['timing_eligible'], 44)
+        self.assertEqual(result['comparisons']['prior']['correct'], 46)
+        self.assertEqual(result['comparisons']['prior']['timing_eligible'], 45)
         self.assertFalse(result['rows'][0]['ratios']['prior']['eligible'])
 
     def test_wrong_failed_unstable_and_short_arms_are_not_performance_evidence(self):
@@ -76,7 +76,7 @@ class ComparisonReport(unittest.TestCase):
         ]:
             data = report()
             mutate(data['benchmarks'][0])
-            self.assertEqual(summary.summarize(data)['comparisons']['prior']['timing_eligible'], 44)
+            self.assertEqual(summary.summarize(data)['comparisons']['prior']['timing_eligible'], 45)
 
     def test_raw_warmups_and_samples_override_cached_success_flags(self):
         for location, arm, observation in [
@@ -91,7 +91,7 @@ class ComparisonReport(unittest.TestCase):
                 data = report()
                 data['benchmarks'][0].setdefault(location, {}).setdefault(arm, []).append(observation)
                 result = summary.summarize(data)
-                self.assertEqual(result['comparisons']['prior']['timing_eligible'], 44)
+                self.assertEqual(result['comparisons']['prior']['timing_eligible'], 45)
                 self.assertFalse(result['rows'][0]['correct']['prior'])
 
     def test_codegen_counts_preserve_aliases_and_name_stack_references_truthfully(self):

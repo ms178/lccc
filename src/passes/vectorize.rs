@@ -6238,6 +6238,9 @@ enum MapExpr {
     BinOp(IrBinOp, Box<MapExpr>, Box<MapExpr>),
     /// Scalar sqrt over a subexpression (FP only).
     Sqrt(Box<MapExpr>),
+    /// Directed/dynamic FP rounding. The immediate is the scalar ROUNDSS/
+    /// ROUNDSD mode and is reused unchanged by packed ROUNDPS/ROUNDPD.
+    Round(u8, Box<MapExpr>),
     /// FP comparison `lhs op rhs`. The parser normalizes the predicate to
     /// the EQ/LT/LE/NE ordered subset (GT/GE enter with swapped operands),
     /// the exact subset the packed compare emitters accept as immediates.
@@ -6289,7 +6292,7 @@ impl MapExpr {
         match self {
             MapExpr::Load(_) | MapExpr::Invariant(_) => 1,
             MapExpr::BinOp(_, l, r) => 1 + l.node_count() + r.node_count(),
-            MapExpr::Sqrt(x) => 1 + x.node_count(),
+            MapExpr::Sqrt(x) | MapExpr::Round(_, x) => 1 + x.node_count(),
             MapExpr::Cmp(_, l, r) => 1 + l.node_count() + r.node_count(),
             MapExpr::Select(c, t, f) => 1 + c.node_count() + t.node_count() + f.node_count(),
             MapExpr::MinMax { l, r, .. } => 1 + l.node_count() + r.node_count(),
@@ -6310,7 +6313,7 @@ impl MapExpr {
             MapExpr::Load(_) => 1,
             MapExpr::Invariant(_) => 0,
             MapExpr::BinOp(_, l, r) => 1 + l.unroll_cost() + r.unroll_cost(),
-            MapExpr::Sqrt(x) => 1 + x.unroll_cost(),
+            MapExpr::Sqrt(x) | MapExpr::Round(_, x) => 1 + x.unroll_cost(),
             MapExpr::Cmp(_, l, r) => 1 + l.unroll_cost() + r.unroll_cost(),
             MapExpr::Select(c, t, f) => 1 + c.unroll_cost() + t.unroll_cost() + f.unroll_cost(),
             MapExpr::MinMax { l, r, .. } => 1 + l.unroll_cost() + r.unroll_cost(),
@@ -6333,6 +6336,7 @@ struct MapEmitCtx<'a> {
     load_op: IntrinsicOp,
     broadcast_op: IntrinsicOp,
     sqrt_op: Option<IntrinsicOp>,
+    round_op: Option<IntrinsicOp>,
     madd_op: Option<IntrinsicOp>,
     /// Packed-FMA op for the BUILTIN-semantics `MapExpr::Fma` node: gated
     /// on the packed FMA families being available (AVX2+FMA3, FP lanes)
@@ -6456,14 +6460,53 @@ impl<'a> MapEmitCtx<'a> {
                 Some(dest)
             }
             MapExpr::Sqrt(x) => {
-                let inner = self.emit(x)?;
                 let sqrt_op = self.sqrt_op?;
                 let dest = self.fresh();
+                let args = if let MapExpr::Load(stream) = x.as_ref() {
+                    let mut a = vec![
+                        Operand::Value(self.src_bases[*stream]),
+                        Operand::Value(self.byte_iv),
+                    ];
+                    if self.byte_disp != 0 {
+                        a.push(Operand::Const(IrConst::I64(self.byte_disp)));
+                    }
+                    a
+                } else {
+                    vec![Operand::Value(self.emit(x)?)]
+                };
                 self.vec_insts.push(Instruction::Intrinsic {
                     dest: Some(dest),
                     op: sqrt_op,
                     dest_ptr: None,
-                    args: vec![Operand::Value(inner)],
+                    args,
+                });
+                Some(dest)
+            }
+            MapExpr::Round(mode, x) => {
+                let round_op = self.round_op?;
+                let dest = self.fresh();
+                let mut args = if let MapExpr::Load(stream) = x.as_ref() {
+                    // ROUNDPS/ROUNDPD accept their source directly from
+                    // memory. Preserve the map load's base/index/disp shape
+                    // instead of manufacturing a one-use VecLoad and hoping
+                    // a later pass rediscovers the fold.
+                    let mut a = vec![
+                        Operand::Value(self.src_bases[*stream]),
+                        Operand::Value(self.byte_iv),
+                    ];
+                    if self.byte_disp != 0 {
+                        a.push(Operand::Const(IrConst::I64(self.byte_disp)));
+                    }
+                    a
+                } else {
+                    vec![Operand::Value(self.emit(x)?)]
+                };
+                args.push(Operand::Const(IrConst::I32(i32::from(*mode))));
+                self.vec_insts.push(Instruction::Intrinsic {
+                    dest: Some(dest),
+                    op: round_op,
+                    dest_ptr: None,
+                    args,
                 });
                 Some(dest)
             }
@@ -8616,6 +8659,12 @@ fn analyze_map_pattern(
                     op: IntrinsicOp::SqrtF32 | IntrinsicOp::SqrtF64,
                     ..
                 } => {}
+                // SSE4.1 scalar rounding intrinsics are pure elementwise
+                // operations and map directly to packed ROUNDPS/ROUNDPD.
+                Instruction::Intrinsic {
+                    op: IntrinsicOp::RoundScalarF32(_) | IntrinsicOp::RoundScalarF64(_),
+                    ..
+                } => {}
                 // The C99 builtin fma is pure and tree-parseable the same
                 // way (MapExpr::Fma); the sign variants come from the IR
                 // negation peel.
@@ -9058,6 +9107,42 @@ fn parse_map_expr(
                 depth + 1,
                 allow_ext_fp_ops,
             )?)))
+        }
+        Instruction::Intrinsic {
+            op: IntrinsicOp::RoundScalarF64(mode),
+            args,
+            ..
+        } if *elem_ty == IrType::F64 && allow_ext_fp_ops && args.len() == 1 => {
+            let inner = parse_map_operand(
+                func,
+                loop_blocks,
+                load_dests,
+                iv_derived,
+                is_invariant,
+                elem_ty,
+                &args[0],
+                depth + 1,
+                allow_ext_fp_ops,
+            )?;
+            Some(MapExpr::Round(*mode, Box::new(inner)))
+        }
+        Instruction::Intrinsic {
+            op: IntrinsicOp::RoundScalarF32(mode),
+            args,
+            ..
+        } if *elem_ty == IrType::F32 && allow_ext_fp_ops && args.len() == 1 => {
+            let inner = parse_map_operand(
+                func,
+                loop_blocks,
+                load_dests,
+                iv_derived,
+                is_invariant,
+                elem_ty,
+                &args[0],
+                depth + 1,
+                allow_ext_fp_ops,
+            )?;
+            Some(MapExpr::Round(*mode, Box::new(inner)))
         }
         Instruction::Intrinsic {
             op:
@@ -9630,7 +9715,11 @@ fn is_scalar_zero_one_tree(expr: &MapExpr) -> bool {
             Operand::Const(c) => matches!(c.to_i64(), Some(0) | Some(1)),
             _ => false,
         },
-        MapExpr::Sqrt(_) | MapExpr::MinMax { .. } | MapExpr::Load(_) | MapExpr::Fma { .. } => false,
+        MapExpr::Sqrt(_)
+        | MapExpr::Round(..)
+        | MapExpr::MinMax { .. }
+        | MapExpr::Load(_)
+        | MapExpr::Fma { .. } => false,
     }
 }
 
@@ -10844,6 +10933,7 @@ fn transform_byte_count_reduction_inner(
             load_op: IntrinsicOp::VecLoadI32x8,
             broadcast_op: IntrinsicOp::VecBroadcastI32x8,
             sqrt_op: None,
+            round_op: None,
             madd_op: None,
             builtin_fma_op: None,
             bin_op: &bin_op,
@@ -11443,7 +11533,7 @@ fn emit_scalar_count_tree(
             });
             Some(Operand::Value(d))
         }
-        MapExpr::Sqrt(_) | MapExpr::MinMax { .. } => None,
+        MapExpr::Sqrt(_) | MapExpr::Round(..) | MapExpr::MinMax { .. } => None,
     }
 }
 
@@ -13812,6 +13902,18 @@ fn map_tree_ops_available(
                     builtin_fma_op,
                 )
         }
+        MapExpr::Round(_, x) => {
+            x86_sse41_available()
+                && map_tree_ops_available(
+                    x,
+                    bin_op,
+                    sqrt_op,
+                    cmp_op,
+                    minmax_op,
+                    blendv_op,
+                    builtin_fma_op,
+                )
+        }
         MapExpr::Cmp(op, l, r) => {
             cmp_op(op).is_some()
                 && map_tree_ops_available(
@@ -14752,6 +14854,9 @@ fn fold_unsigned_range_masks(expr: &MapExpr, bits: u32) -> MapExpr {
             MapExpr::BinOp(*op, Box::new(lf), Box::new(rf))
         }
         MapExpr::Sqrt(x) => MapExpr::Sqrt(Box::new(fold_unsigned_range_masks(x, bits))),
+        MapExpr::Round(mode, x) => {
+            MapExpr::Round(*mode, Box::new(fold_unsigned_range_masks(x, bits)))
+        }
         MapExpr::Select(c, t, f) => MapExpr::Select(
             Box::new(fold_unsigned_range_masks(c, bits)),
             Box::new(fold_unsigned_range_masks(t, bits)),
@@ -15492,6 +15597,7 @@ fn strength_reduce_mask_select(expr: &MapExpr) -> MapExpr {
             r: Box::new(strength_reduce_mask_select(r)),
         },
         MapExpr::Sqrt(x) => MapExpr::Sqrt(Box::new(strength_reduce_mask_select(x))),
+        MapExpr::Round(mode, x) => MapExpr::Round(*mode, Box::new(strength_reduce_mask_select(x))),
         MapExpr::Load(_) | MapExpr::Invariant(_) => expr.clone(),
     };
     let MapExpr::Select(cond, t, f) = &rebuilt else {
@@ -15540,7 +15646,7 @@ fn expr_uses_stream(expr: &MapExpr, stream: usize) -> bool {
         MapExpr::Load(i) => *i == stream,
         MapExpr::Invariant(_) => false,
         MapExpr::BinOp(_, l, r) => expr_uses_stream(l, stream) || expr_uses_stream(r, stream),
-        MapExpr::Sqrt(x) => expr_uses_stream(x, stream),
+        MapExpr::Sqrt(x) | MapExpr::Round(_, x) => expr_uses_stream(x, stream),
         MapExpr::Fma { l, r, a, .. } => {
             expr_uses_stream(l, stream)
                 || expr_uses_stream(r, stream)
@@ -17770,36 +17876,74 @@ fn map_dynamic_u64_byte_limit(
     .then(|| i64::MAX / i64::from(elem_size))
 }
 
+fn map_dynamic_i64_byte_limit(
+    iv_ty: IrType,
+    limit: &Operand,
+    op: IrCmpOp,
+    elem_size: u32,
+) -> Option<i64> {
+    (iv_ty == IrType::I64
+        && op == IrCmpOp::Slt
+        && matches!(limit, Operand::Value(_))
+        && elem_size.is_power_of_two())
+    .then(|| i64::MAX / i64::from(elem_size))
+}
+
 fn map_offset_proof_limit(iv_ty: IrType, limit: &Operand, op: IrCmpOp, elem_size: u32) -> Operand {
     map_dynamic_u64_byte_limit(iv_ty, limit, op, elem_size)
+        .or_else(|| map_dynamic_i64_byte_limit(iv_ty, limit, op, elem_size))
         .map_or_else(|| limit.clone(), |n| Operand::Const(IrConst::I64(n)))
 }
 
 /// Gate only the packed quotient. The source limit remains unchanged in the
 /// scalar mirror; zero packed iterations resume it with the original IV zero.
-fn guard_u64_map_quotient(
+fn guard_map_quotient(
     limit: Value,
     quotient: Operand,
     max_trip: i64,
+    signed: bool,
     instructions: &mut Vec<Instruction>,
     next_value_id: &mut u32,
 ) -> Operand {
-    let safe = Value(*next_value_id);
+    let upper_safe = Value(*next_value_id);
+    let upper_selected = Value(*next_value_id + 1);
+    *next_value_id += 2;
+    instructions.push(Instruction::Cmp {
+        dest: upper_safe,
+        op: if signed { IrCmpOp::Sle } else { IrCmpOp::Ule },
+        lhs: Operand::Value(limit),
+        rhs: Operand::Const(IrConst::I64(max_trip)),
+        ty: if signed { IrType::I64 } else { IrType::U64 },
+    });
+    instructions.push(Instruction::Select {
+        dest: upper_selected,
+        cond: Operand::Value(upper_safe),
+        true_val: quotient,
+        false_val: Operand::Const(IrConst::I64(0)),
+        ty: if signed { IrType::I64 } else { IrType::U64 },
+    });
+    if !signed {
+        return Operand::Value(upper_selected);
+    }
+    // A negative signed limit executes zero source iterations. Select zero
+    // before scaling the quotient so even INT64_MIN can never overflow the
+    // preheader's byte-limit multiply.
+    let nonnegative = Value(*next_value_id);
     let selected = Value(*next_value_id + 1);
     *next_value_id += 2;
     instructions.push(Instruction::Cmp {
-        dest: safe,
-        op: IrCmpOp::Ule,
+        dest: nonnegative,
+        op: IrCmpOp::Sge,
         lhs: Operand::Value(limit),
-        rhs: Operand::Const(IrConst::I64(max_trip)),
-        ty: IrType::U64,
+        rhs: Operand::Const(IrConst::I64(0)),
+        ty: IrType::I64,
     });
     instructions.push(Instruction::Select {
         dest: selected,
-        cond: Operand::Value(safe),
-        true_val: quotient,
+        cond: Operand::Value(nonnegative),
+        true_val: Operand::Value(upper_selected),
         false_val: Operand::Const(IrConst::I64(0)),
-        ty: IrType::U64,
+        ty: IrType::I64,
     });
     Operand::Value(selected)
 }
@@ -18076,10 +18220,11 @@ mod map_offset_wrap_tests {
             .unwrap();
             let mut instructions = Vec::new();
             let mut next = 3;
-            let result = guard_u64_map_quotient(
+            let result = guard_map_quotient(
                 Value(1),
                 Operand::Value(Value(2)),
                 max,
+                false,
                 &mut instructions,
                 &mut next,
             );
@@ -18126,6 +18271,52 @@ mod map_offset_wrap_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn signed_i64_byte_guard_rejects_both_overflow_edges() {
+        let dynamic = Operand::Value(Value(1));
+        for size in [1u32, 2, 4, 8] {
+            let max = map_dynamic_i64_byte_limit(IrType::I64, &dynamic, IrCmpOp::Slt, size)
+                .expect("power-of-two element size has a signed guard");
+            let mut instructions = Vec::new();
+            let mut next = 3;
+            let result = guard_map_quotient(
+                Value(1),
+                Operand::Value(Value(2)),
+                max,
+                true,
+                &mut instructions,
+                &mut next,
+            );
+            assert_eq!(result, Operand::Value(Value(6)));
+            assert_eq!(next, 7);
+            assert_eq!(instructions.len(), 4);
+            assert!(matches!(
+                instructions[0],
+                Instruction::Cmp {
+                    op: IrCmpOp::Sle,
+                    ty: IrType::I64,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                instructions[2],
+                Instruction::Cmp {
+                    op: IrCmpOp::Sge,
+                    ty: IrType::I64,
+                    ..
+                }
+            ));
+            for n in [i64::MIN, -1, 0, 1, max, max.saturating_add(1), i64::MAX] {
+                let guarded = if (0..=max).contains(&n) { n / 8 } else { 0 };
+                let bytes = i128::from(guarded) * 8 * i128::from(size);
+                assert!((0..=i128::from(i64::MAX)).contains(&bytes));
+            }
+        }
+        assert!(map_dynamic_i64_byte_limit(IrType::I64, &dynamic, IrCmpOp::Ult, 8).is_none());
+        assert!(map_dynamic_i64_byte_limit(IrType::I32, &dynamic, IrCmpOp::Slt, 8).is_none());
+        assert!(map_dynamic_i64_byte_limit(IrType::I64, &dynamic, IrCmpOp::Slt, 3).is_none());
     }
 
     fn offset_function(
@@ -29609,6 +29800,19 @@ fn transform_map_vector(
         (IrType::F32, false) => Some(IntrinsicOp::VecSqrtF32x4),
         _ => None,
     };
+    // Packed ROUNDPS/ROUNDPD is SSE4.1 at 128 bits and AVX at 256 bits.
+    // Fail closed on a baseline SSE2 translation unit.
+    let round_op = if x86_sse41_available() {
+        match (pattern.elem_ty, avx2) {
+            (IrType::F64, true) => Some(IntrinsicOp::VecRoundF64x4),
+            (IrType::F64, false) => Some(IntrinsicOp::VecRoundF64x2),
+            (IrType::F32, true) => Some(IntrinsicOp::VecRoundF32x8),
+            (IrType::F32, false) => Some(IntrinsicOp::VecRoundF32x4),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let madd_op = if fp_contract == FpContract::Fast && avx2 && x86_fma_enabled() {
         match pattern.elem_ty {
             IrType::F64 => Some(IntrinsicOp::VecMaddF64x4),
@@ -29864,6 +30068,7 @@ fn transform_map_vector(
             load_op,
             broadcast_op,
             sqrt_op,
+            round_op,
             madd_op,
             builtin_fma_op,
             bin_op: &bin_op,
@@ -30030,19 +30235,31 @@ fn transform_map_vector(
                 quotient
             };
             let quotient = Operand::Value(div_dest);
-            let quotient = if let Some(max_trip) = map_dynamic_u64_byte_limit(
+            let dynamic_byte_guard = map_dynamic_u64_byte_limit(
                 pattern.iv_ty,
                 &pattern.limit,
                 pattern.exit_cmp_op,
                 elem_size,
-            ) {
+            )
+            .map(|max| (max, false))
+            .or_else(|| {
+                map_dynamic_i64_byte_limit(
+                    pattern.iv_ty,
+                    &pattern.limit,
+                    pattern.exit_cmp_op,
+                    elem_size,
+                )
+                .map(|max| (max, true))
+            });
+            let quotient = if let Some((max_trip, signed)) = dynamic_byte_guard {
                 // Every stream passed its offset proof under this exact bound
                 // in analysis. Unsafe domains execute zero packed iterations
                 // and the untouched scalar mirror, not widened offset math.
-                guard_u64_map_quotient(
+                guard_map_quotient(
                     *limit_val,
                     quotient,
                     max_trip,
+                    signed,
                     &mut quotient_insts,
                     &mut next_val_id,
                 )
@@ -30188,6 +30405,14 @@ fn transform_map_vector(
                         pattern.exit_cmp_op,
                         elem_size,
                     )
+                    .or_else(|| {
+                        map_dynamic_i64_byte_limit(
+                            pattern.iv_ty,
+                            &pattern.limit,
+                            pattern.exit_cmp_op,
+                            elem_size,
+                        )
+                    })
                     .is_none() =>
             {
                 None
@@ -31194,6 +31419,30 @@ fn emit_map_scalar_tree(
             remainder_insts.push(Instruction::Intrinsic {
                 dest: Some(dest),
                 op: sqrt_op,
+                dest_ptr: None,
+                args: vec![inner],
+            });
+            Some(Operand::Value(dest))
+        }
+        MapExpr::Round(mode, x) => {
+            let inner = emit_map_scalar_tree(
+                x,
+                src_bases,
+                pattern,
+                byte_offset,
+                remainder_insts,
+                next_val_id,
+            )?;
+            let dest = Value(*next_val_id);
+            *next_val_id += 1;
+            let op = match pattern.elem_ty {
+                IrType::F64 => IntrinsicOp::RoundScalarF64(*mode),
+                IrType::F32 => IntrinsicOp::RoundScalarF32(*mode),
+                _ => return None,
+            };
+            remainder_insts.push(Instruction::Intrinsic {
+                dest: Some(dest),
+                op,
                 dest_ptr: None,
                 args: vec![inner],
             });
@@ -33848,7 +34097,7 @@ mod map_expr_interpreter_tests {
                     a.min(b)
                 }
             }
-            MapExpr::Sqrt(_) => unreachable!("integer model"),
+            MapExpr::Sqrt(_) | MapExpr::Round(..) => unreachable!("integer model"),
         }
     }
 
@@ -33924,7 +34173,7 @@ mod map_expr_interpreter_tests {
                     a.min(b)
                 }
             }
-            MapExpr::Sqrt(_) => unreachable!("integer model"),
+            MapExpr::Sqrt(_) | MapExpr::Round(..) => unreachable!("integer model"),
         }
     }
 
@@ -33954,7 +34203,7 @@ mod map_expr_interpreter_tests {
                     cond_ok(c) && !is_mask(t) && !is_mask(f) && walk(t) && walk(f)
                 }
                 MapExpr::Cmp(..) | MapExpr::MaskConj { .. } => cond_ok(e),
-                MapExpr::Sqrt(x) => walk(x),
+                MapExpr::Sqrt(x) | MapExpr::Round(_, x) => walk(x),
             }
         }
         walk(e)

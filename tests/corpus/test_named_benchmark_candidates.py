@@ -71,7 +71,7 @@ class NamedCandidates(unittest.TestCase):
 
     def test_registry_keeps_distinct_macro_sized_shapes(self):
         registry = {item.name: item for item in bench.BENCHMARKS}
-        self.assertEqual(len(registry), 45)
+        self.assertEqual(len(registry), 46)
         for left, right in [('linux_find_bit', 'linux_find_bit_scaled'),
                             ('lz4_compress', 'lz4_match_extend')]:
             self.assertEqual(bench.source_for(registry[left]), bench.source_for(registry[right]))
