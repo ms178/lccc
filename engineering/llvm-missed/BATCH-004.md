@@ -132,6 +132,14 @@ No ICX runtime comparison or EPYC replication is claimed here.
   divisor for both widths, even-product identities and representative transfer
   lemmas. These are algebra checks, not a certificate of the Rust pass.
 
+A diagnostic-stream audit also found a pre-existing Clang format warning in
+`double_reduction.c`: LP64 `int64_t` is `long`, not `long long`. An explicit
+`(long long)` printf argument fixes that mismatch without changing the workload.
+All four generated executables (batch3, batch4, GCC, Clang) remained byte-identical
+after the cast, and their diagnostic streams were empty. The raw timed report
+retains the original source hash; this source-only warning fix was checked
+separately and does not alter those measured executables.
+
 ## Reproduction
 
 ```sh

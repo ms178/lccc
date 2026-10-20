@@ -45,6 +45,6 @@ int main(void) {
         total += t_a + t_b;
     }
 
-    printf("%lld\n", total);
+    printf("%lld\n", (long long)total);
     return 0;
 }
