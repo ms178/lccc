@@ -326,6 +326,20 @@ fn r_reg_width(n: &str) -> u8 {
 
 /// Eliminate redundant zero-extension moves. Returns true if any changed.
 pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
+    // Compile-time guardrail for YARPGen mega-TUs: seed 101 is 63k asm lines
+    // (580s at -O1, 486s peephole). If the function is huge, the per-line
+    // LineStore + implicit-operand churn dominates and no win justifies it.
+    // Skip with a clear marker so the budget is observable, not silent.
+    if asm.len() > 512 * 1024 || asm.lines().count() > 20_000 {
+        if std::env::var("CCC_PEEPHOLE_BUDGET").as_deref() != Ok("0") {
+            eprintln!(
+                "peephole: skipping huge asm ({} bytes, {} lines) — set CCC_PEEPHOLE_BUDGET=0 to force",
+                asm.len(),
+                asm.lines().count()
+            );
+            return false;
+        }
+    }
     let mut lines: Vec<String> = asm.lines().map(|s| s.to_string()).collect();
     let mut keep = vec![true; lines.len()];
     let mut changed = false;

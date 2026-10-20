@@ -414,12 +414,30 @@ FN_ATTRS = {
     "hot": "__attribute__((hot)) static",
     "cold": "__attribute__((cold)) static",
     "flatten": "__attribute__((flatten)) static",
+    "const": "__attribute__((const, noinline)) static",
+    "pure": "__attribute__((pure, noinline)) static",
+    "aligned": "__attribute__((aligned(16))) static",
+    "packed": "__attribute__((noinline, aligned(1))) static",
+    "may_alias": "static __attribute__((noinline))",
+    "restrict": "__attribute__((noinline)) static",
 }
 HELPER_ATTRS = {
     "noinline": "__attribute__((noinline)) static",
     "const": "__attribute__((const, noinline)) static",
     "pure": "__attribute__((pure, noinline)) static",
     "always_inline": "static inline __attribute__((always_inline))",
+    "hot": "__attribute__((hot)) static",
+    "cold": "__attribute__((cold)) static",
+}
+
+# Qualifier axis for parameters: tests that `restrict`, `const`, `volatile`
+# qualified parameters and `__attribute__((may_alias))` do not hide bugs.
+# The model is value-based, so qualifiers must not change observable results.
+PARAM_ATTRS = {
+    "plain": ("uint32_t", ""),
+    "restrict": ("uint32_t * restrict", "*"),  # call shape pointer variant
+    "const_ptr": ("uint32_t * const", "*"),
+    "may_alias": ("__attribute__((may_alias)) uint32_t", ""),
 }
 _SHAPE_WEIGHTS = (("expr", 0.40), ("loop", 0.20), ("mem", 0.20), ("call", 0.20))
 
