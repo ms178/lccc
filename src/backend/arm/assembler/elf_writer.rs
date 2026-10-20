@@ -426,6 +426,15 @@ impl ElfWriter {
 
             AsmDirective::Org { expr, fill } => self.base.emit_org(expr, *fill),
 
+            AsmDirective::TlsDescCall(symbol) => {
+                self.base.add_reloc(
+                    super::encoder::RelocType::TlsDescCall.elf_type(),
+                    symbol.clone(),
+                    0,
+                );
+                Ok(())
+            }
+
             AsmDirective::Cfi | AsmDirective::Ignored | AsmDirective::Ltorg => Ok(()),
         }
     }

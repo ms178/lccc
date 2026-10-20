@@ -1115,6 +1115,11 @@ gate "destructive-path-guards" fast bash tests/regression/check_destructive_guar
 gate "tls-model-selection" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_selection.sh
 
+# Cross-architecture TLS model/relocation/runtime contract. This catches the
+# formerly hard-coded LE lowering in PIC/shared AArch64 and RISC-V objects.
+gate "tls-cross-models" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_tls_cross_models.sh
+
 # Hermetic oracle self-tests for the TLS runtime comparison harness
 # (no compiler required). Keep exactly one registration beside its rationale.
 gate "tls-runtime-oracle" fast bash tests/regression/check_tls_runtime_oracle.sh

@@ -1072,6 +1072,42 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends mold lld
+    - name: Provision AArch64/RISC-V cross toolchains
+      # check_tls_cross_models.sh links lccc objects against GCC-built TLS
+      # definitions and executes them under qemu-user (installed above). With no
+      # cross compiler its runtime half reports SKIP, so the gate would assert
+      # relocation counts and assembly shapes without ever executing a TLS
+      # access.
+      #
+      # This MUST go through scripts/ensure_cross_toolchains.sh, which unpacks
+      # the .debs with `dpkg -x` and therefore bypasses apt's dependency solver.
+      # Installing gcc-aarch64-linux-gnu / gcc-riscv64-linux-gnu with apt-get
+      # makes the solver remove the gcc-multilib this job installed for the i386
+      # linker suite -- a dpkg dependency-graph artefact, not a filesystem
+      # collision, since cross packages own only triplet-prefixed paths -- and
+      # run_linker_tests.py then FAILS every i386 test instead of skipping it,
+      # because CI sets LCCC_REQUIRE_I386=1. The -m32 probe asserts that
+      # invariant here, at the point of cause, rather than 600 lines later in
+      # the linker suite.
+      #
+      # A missing cross toolchain is an infrastructure condition, not a code
+      # regression, and the gate already reports it as an explicit SKIP; so that
+      # path warns instead of failing the job. A broken i386 multilib is a real
+      # regression and fails hard.
+      run: |
+        probe="$RUNNER_TEMP/m32-probe"
+        printf 'int main(void) { return 0; }\n' > "$probe.c"
+        m32_ok() { gcc -m32 -O1 -o "$probe" "$probe.c"; }
+        m32_ok || { echo "::error::i386 multilib is broken before cross provisioning"; exit 1; }
+        if ! bash scripts/ensure_cross_toolchains.sh all; then
+          echo "::warning::cross toolchain provisioning failed; the TLS runtime half will SKIP"
+        fi
+        m32_ok || { echo "::error::cross provisioning broke the i386 multilib"; exit 1; }
+        for t in aarch64 riscv64; do
+          command -v "$t-linux-gnu-gcc" >/dev/null 2>&1 \
+            && "$t-linux-gnu-gcc" --version | head -n 1 \
+            || echo "::warning::$t-linux-gnu-gcc unavailable"
+        done
     - name: Verify GCC 16 C23 oracle
       run: |
         test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16
@@ -1512,6 +1548,11 @@ jobs:
         bash tests/regression/check_tls_pie_preemptible.sh
         bash tests/regression/check_tls_runtime_oracle.sh
         bash tests/regression/check_tls_model_selection.sh
+        # Cross-architecture TLS model/relocation/runtime contract. Catches the
+        # formerly hard-coded LE lowering in PIC/shared AArch64 and RISC-V
+        # objects. Mirrors the ci_local.sh gate of the same name;
+        # check_ci_gate_parity.py fails if the two lists drift.
+        bash tests/regression/check_tls_cross_models.sh
         bash tests/regression/check_volatile_reduction.sh
         python3 scripts/test_llvm_missed_inventory.py
         python3 -O scripts/test_llvm_missed_inventory.py

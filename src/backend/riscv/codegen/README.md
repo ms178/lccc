@@ -67,7 +67,7 @@ All files live under `src/backend/riscv/codegen/`.
 | `intrinsics.rs` | Hardware intrinsics (`fsqrt.{s,d}`, `fabs.{s,d}`, `fence`, `fence.tso`), software CRC32C, `__builtin_frame_address`, `__builtin_return_address`, thread pointer (`tp`). Software SSE-equivalent 128-bit SIMD: byte compare, dword compare, unsigned and signed saturating subtract, bitwise OR/AND/XOR, pmovmskb, byte/dword splat. |
 | `inline_asm.rs` | Constraint classification (`RvConstraintKind`), operand formatting for `%0`/`%[name]`/`%z` substitution, `%lo`/`%hi` modifier pass-through, template line substitution. |
 | `asm_emitter.rs` | `InlineAsmEmitter` trait implementation: scratch register allocation from t0-t6/a2-a7 (GP) and ft0-ft7 (FP), operand loading/storing with register-allocation awareness, memory operand resolution, RISC-V-specific immediate constraint validation (`I` = 12-bit signed, `K` = 5-bit CSR). |
-| `globals.rs` | Global symbol address loading: `lla` (PC-relative `auipc`+`addi`) for local symbols, `la` (GOT-indirect `auipc`+`ld`) for PIC externals, TLS Local Exec model (`lui`/`add tp`/`addi` with `%tprel_hi`/`%tprel_add`/`%tprel_lo`). |
+| `globals.rs` | Global symbol address loading plus model-correct TLS LE, IE (`TLS_GOT_HI20`) and GD/LD (`TLS_GD_HI20` + `__tls_get_addr`) sequences. |
 | `variadic.rs` | `va_arg` (load next 8-byte arg from va_list pointer, with 16-byte-aligned F128 handling), `va_start` (initialize va_list to point past named register args), `va_copy` (pointer copy). |
 | `returns.rs` | Return value marshalling: integer via `a0`, F32 via `fa0` (`fmv.w.x`), F64 via `fa0` (`fmv.d.x`), i128 via `a0:a1`, F128 via `a0:a1` (full 128-bit loaded directly; the shared trait path uses `__extenddftf2`), struct second-field returns via `fa1`. |
 | `peephole.rs` | Multi-pass peephole optimizer operating on assembly text lines. |
@@ -358,12 +358,40 @@ accumulator.
   `addi` with `R_RISCV_PCREL_HI20` relocation).
 - **PIC external symbols**: `la t0, <symbol>` (expands to `auipc` + `ld`
   with `R_RISCV_GOT_HI20` relocation, GOT-indirect load).
-- **TLS (Local Exec)**: three-instruction sequence using `tp`:
+- **TLS** honors all selected models:
   ```asm
+  # Local Exec
   lui  t0, %tprel_hi(sym)
   add  t0, t0, tp, %tprel_add(sym)
   addi t0, t0, %tprel_lo(sym)
+
+  # Initial Exec (the local label pairs HI20 and LO12 relocations)
+.Lie:
+  auipc t0, %tls_ie_pcrel_hi(sym)
+  ld    t0, %pcrel_lo(.Lie)(t0)
+  add   t0, t0, tp
+
+  # Global/Local Dynamic
+.Lgd:
+  auipc a0, %tls_gd_pcrel_hi(sym)
+  addi  a0, a0, %pcrel_lo(.Lgd)
+  call  __tls_get_addr
   ```
+  Dynamic TLS is treated as a hidden call by register allocation and frame
+  selection. `riscv_call_free_ir` is the single allowlist that decides what
+  counts as call-free, and it is shared by all three decisions that depend on
+  it — the caller-saved (a0–a7) pool, the `a0` homing of the resolver's result,
+  and the minimal RA-only frame — so they cannot disagree about what a call is.
+  A function whose ONLY call is the resolver homes that result in `a0` and gets
+  an RA-only frame, which is clang 23.1.3's exact shape for `external_address`.
+  Anything that can emit a second libcall (the i128 helpers, the F128
+  soft-float sequences, the libm intrinsics, the atomic RMW scratch) or that
+  reads `s0` (`__builtin_frame_address`, `__builtin_return_address`) falls back
+  to a callee-saved home and a full frame: `__divti3` clobbers a0–a7, and a
+  frame that never establishes `s0` would leave those builtins reading the
+  caller's frame pointer. The allowlist is fail-safe by construction — any IR
+  variant not explicitly proven call-free closes these optimizations. Static
+  address returns are generated directly in `a0` without a `t0` relay.
 - **Label addresses**: always use `lla` (labels are local symbols, avoiding
   unnecessary GOT indirection in PIC mode).
 

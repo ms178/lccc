@@ -149,6 +149,15 @@ pub struct RiscvCodegen {
     /// the prologue/epilogue (ra/s0 saves, sp adjust, s0 setup) are skipped
     /// entirely and the function is entered and left through `ra` untouched.
     pub(super) frameless_leaf: bool,
+    /// Whether the function's only `call` is the hidden dynamic-TLS resolver.
+    /// Established with the frame size (which already walks the IR) via
+    /// `riscv_call_free_ir(func, true)` and consumed by both the a0 homing and
+    /// the RA-only frame gate, so the two can never disagree about what counts
+    /// as a call.
+    pub(super) tls_resolver_only: bool,
+    /// A hidden TLS resolver call needs `ra` saved, but when there are no
+    /// stack slots or callee-saved value homes it does not need an s0 frame.
+    pub(super) ra_only_frame: bool,
 }
 
 impl RiscvCodegen {
@@ -173,6 +182,8 @@ impl RiscvCodegen {
             no_relax: false,
             current_func: None,
             frameless_leaf: false,
+            tls_resolver_only: false,
+            ra_only_frame: false,
         }
     }
 
