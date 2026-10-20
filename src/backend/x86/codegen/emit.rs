@@ -2412,7 +2412,7 @@ impl X86Codegen {
         is_unsigned: bool,
         dest_id: u32,
     ) {
-        if is_unsigned {
+        if is_unsigned || self.bitop_nonneg_values.contains(&dest_id) {
             return;
         }
         // Per-value check: if we computed the set and this value isn't in it, skip
@@ -5234,6 +5234,21 @@ impl X86Codegen {
                 self.operand_to_callee_reg(lhs, dest_phys);
             }
             ("rax".to_string(), "eax".to_string())
+        } else if op != IrBinOp::Sub
+            && rhs_phys.is_none()
+            && matches!(rhs, Operand::Value(v) if self.state.acc_has_verified(v.0, self.state.is_alloca(v.0)))
+            && let Some(lreg) = self
+                .operand_reg(lhs)
+                .filter(|r| !is_xmm_reg(*r) && r.0 != dest_phys.0)
+        {
+            self.note_staging_target(rhs, dest_phys);
+            self.state
+                .out
+                .emit_instr_reg_reg("    movq", "rax", dest_name);
+            (
+                phys_reg_name(lreg).to_string(),
+                phys_reg_name_32(lreg).to_string(),
+            )
         } else {
             self.operand_to_callee_reg(lhs, dest_phys);
             if let Some(rhs_phys) = rhs_phys {

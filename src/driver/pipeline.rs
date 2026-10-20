@@ -2202,6 +2202,7 @@ impl Driver {
         if self.instrument_functions {
             crate::passes::instrument::run(&mut module);
         }
+        crate::passes::loop_idiom::set_fast_popcount_enabled(self.resolved_fast_popcount());
         // If PGO use is active, run PGO layout before passes? Actually after, but we prepare
         run_passes(
             &mut module,
@@ -2561,7 +2562,7 @@ impl Driver {
             // read.c, tc-i386.c; bfd elflink.c): identical instruction counts
             // and equal or smaller .text, at 35-40% less compile time. -O1
             // and up keep it: there it buys 0.2-0.6% .text.
-            let dual_layout = if self.opt_level == 0 {
+            let dual_layout = if self.opt_level <= 1 {
                 crate::passes::block_layout::DualLayout::ChainOnly
             } else {
                 crate::passes::block_layout::DualLayout::Explore
@@ -3151,6 +3152,19 @@ impl Driver {
             Target::X86_64 => self.enable_popcnt || !self.x86_march_explicit,
             Target::I686 => self.enable_popcnt,
             _ => false,
+        }
+    }
+
+    /// Whether the target has a direct hardware population-count lowering
+    /// (`popcnt` on x86/i686, AdvSIMD `cnt` + `addv` on AArch64 when SIMD
+    /// registers are permitted). Used by `loop_idiom` so `while (x) { x &= x - 1; n++; }`
+    /// folds to `IrUnaryOp::Popcount` only when the backend lowers `Popcount`
+    /// without a software bit-count loop (GCC 16 / Clang 23 / ICX 2026 parity).
+    pub(crate) fn resolved_fast_popcount(&self) -> bool {
+        match self.target {
+            Target::X86_64 | Target::I686 => self.resolved_popcnt(),
+            Target::Aarch64 => !self.general_regs_only,
+            Target::Riscv64 => false,
         }
     }
 

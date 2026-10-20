@@ -7429,6 +7429,105 @@ pub fn is_wide_int_type(ty: IrType) -> bool {
     matches!(ty, IrType::I128 | IrType::U128)
 }
 
+/// Collect single-definition ≤32-bit SSA values whose 32-bit representation is
+/// provably non-negative (bit 31 == 0) and written by a 32-bit-zero-extending
+/// producer on x86-64 / AArch64.
+///
+/// For any value in this set, zero-extension from 32 to 64 bits equals
+/// sign-extension from 32 to 64 bits.
+pub(crate) fn collect_bitop_nonneg_values(func: &IrFunction) -> FxHashSet<u32> {
+    let mut def_counts: FxHashMap<u32, u32> = FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                *def_counts.entry(d.0).or_insert(0) += 1;
+            }
+        }
+    }
+    let op_nonneg_i32 = |op: &Operand, set: &FxHashSet<u32>| -> bool {
+        match op {
+            Operand::Const(c) => c.to_i64().is_some_and(|v| (v as i32) >= 0),
+            Operand::Value(v) => set.contains(&v.0),
+        }
+    };
+    let mut nonneg = FxHashSet::default();
+    for _ in 0..8 {
+        let mut changed = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                let Some(dest) = inst.dest() else { continue };
+                if nonneg.contains(&dest.0) || def_counts.get(&dest.0) != Some(&1) {
+                    continue;
+                }
+                let is_nonneg = match inst {
+                    Instruction::UnaryOp { op, ty, .. } => {
+                        matches!(
+                            op,
+                            crate::ir::reexports::IrUnaryOp::Clz
+                                | crate::ir::reexports::IrUnaryOp::ClzNonZero
+                                | crate::ir::reexports::IrUnaryOp::Ctz
+                                | crate::ir::reexports::IrUnaryOp::CtzNonZero
+                                | crate::ir::reexports::IrUnaryOp::Popcount
+                        ) && !ty.is_float()
+                            && ty.size() <= 4
+                    }
+                    Instruction::Cast {
+                        src: Operand::Value(sv),
+                        from_ty,
+                        to_ty,
+                        ..
+                    } => {
+                        matches!(to_ty, IrType::I32 | IrType::U32)
+                            && (matches!(from_ty, IrType::U8 | IrType::U16)
+                                || (matches!(from_ty, IrType::I32 | IrType::U32)
+                                    && nonneg.contains(&sv.0)))
+                    }
+                    Instruction::Copy {
+                        src: Operand::Value(sv),
+                        ..
+                    } => nonneg.contains(&sv.0),
+                    Instruction::BinOp {
+                        op, lhs, rhs, ty, ..
+                    } if matches!(ty, IrType::I32 | IrType::U32) => match op {
+                        IrBinOp::And => op_nonneg_i32(lhs, &nonneg) || op_nonneg_i32(rhs, &nonneg),
+                        IrBinOp::Or | IrBinOp::Xor => {
+                            op_nonneg_i32(lhs, &nonneg) && op_nonneg_i32(rhs, &nonneg)
+                        }
+                        IrBinOp::LShr => match rhs {
+                            Operand::Const(c) => c.to_i64().is_some_and(|k| {
+                                let s = (k as u32) & 31;
+                                s > 0 || op_nonneg_i32(lhs, &nonneg)
+                            }),
+                            _ => false,
+                        },
+                        IrBinOp::AShr | IrBinOp::UDiv | IrBinOp::URem => {
+                            op_nonneg_i32(lhs, &nonneg)
+                        }
+                        _ => false,
+                    },
+                    Instruction::Select {
+                        true_val,
+                        false_val,
+                        ty,
+                        ..
+                    } if matches!(ty, IrType::I32 | IrType::U32) => {
+                        op_nonneg_i32(true_val, &nonneg) && op_nonneg_i32(false_val, &nonneg)
+                    }
+                    _ => false,
+                };
+                if is_nonneg {
+                    nonneg.insert(dest.0);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    nonneg
+}
+
 pub use super::stack_layout::{
     calculate_stack_space_common, collect_inline_asm_callee_saved,
     collect_inline_asm_callee_saved_with_generic, filter_available_regs, find_param_alloca,
@@ -8179,5 +8278,55 @@ mod seg_fold_displacement_tests {
             foldable_const_disp(&narrow, false),
             Some(i64::from(i32::MAX))
         );
+    }
+
+    #[test]
+    fn collect_bitop_nonneg_values_closes_over_masked_and_shifted_ops() {
+        use super::collect_bitop_nonneg_values;
+        use crate::common::types::IrType;
+        use crate::ir::reexports::{
+            BasicBlock, BlockId, Instruction, IrBinOp, IrFunction, Operand, Terminator, Value,
+        };
+
+        let mut func = IrFunction::new("nonneg_test".into(), IrType::I64, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
+                Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(255)),
+                    ty: IrType::I32,
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::LShr,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Xor,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Value(Value(2)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 4;
+        let set = collect_bitop_nonneg_values(&func);
+        assert!(!set.contains(&0));
+        assert!(set.contains(&1));
+        assert!(set.contains(&2));
+        assert!(set.contains(&3));
     }
 }

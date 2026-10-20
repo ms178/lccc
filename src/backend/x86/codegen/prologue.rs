@@ -889,31 +889,10 @@ impl X86Codegen {
         self.implicit_sext_values = implicit_sext_set;
         self.signed_i32_defs = signed_i32_defs;
 
-        // PF-16b: Clz/Ctz/Popcount on <=32-bit types produce results in
-        // [0, bitwidth] — bit 31 is provably zero, so their widening casts
-        // can take the unsigned (movl) path (see bitop_nonneg_values).
-        {
-            let mut nonneg = crate::common::fx_hash::FxHashSet::default();
-            for block in &func.blocks {
-                for inst in &block.instructions {
-                    if let Instruction::UnaryOp { dest, op, ty, .. } = inst {
-                        if matches!(
-                            op,
-                            crate::ir::reexports::IrUnaryOp::Clz
-                                | crate::ir::reexports::IrUnaryOp::ClzNonZero
-                                | crate::ir::reexports::IrUnaryOp::Ctz
-                                | crate::ir::reexports::IrUnaryOp::CtzNonZero
-                                | crate::ir::reexports::IrUnaryOp::Popcount
-                        ) && !ty.is_float()
-                            && ty.size() <= 4
-                        {
-                            nonneg.insert(dest.0);
-                        }
-                    }
-                }
-            }
-            self.bitop_nonneg_values = nonneg;
-        }
+        // PF-16b: non-negative 32-bit bitop/masked results have bit 31 provably
+        // zero, so their widening casts and SIB index uses can take the
+        // unsigned (movl) path (see collect_bitop_nonneg_values).
+        self.bitop_nonneg_values = crate::backend::generation::collect_bitop_nonneg_values(func);
 
         // ── Value type map, use counts and Cmp→consumer flag fusion ──────
         //

@@ -118,6 +118,11 @@ impl X86Codegen {
             IrType::I32 | IrType::U32 | IrType::I16 | IrType::U16 | IrType::I8 | IrType::U8 => {
                 let r64 = phys_reg_name(reg);
                 let instr = match ty {
+                    IrType::I32 if self.bitop_nonneg_values.contains(&index.0) => format!(
+                        "    movl %{}, %{}",
+                        phys_reg_name_32(reg),
+                        phys_reg_name_32(reg)
+                    ),
                     IrType::I32 => format!("    movslq %{}, %{}", phys_reg_name_32(reg), r64),
                     IrType::U32 => format!(
                         "    movl %{}, %{}",

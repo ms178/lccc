@@ -1801,7 +1801,7 @@ pub(super) fn elide_vzeroupper_without_upper_writes(
 /// analysed. Its `%ymm`/`%zmm` aliasing is what makes "dead" mean dead for a
 /// register a later wide instruction still reads.
 pub(super) fn eliminate_dead_vector_copies(store: &LineStore, infos: &mut [LineInfo]) -> bool {
-    let fp = FpLiveness::new(store, infos);
+    let mut fp: Option<FpLiveness> = None;
     let mut changed = false;
     for i in 0..store.len() {
         if infos[i].is_nop() || infos[i].pinned {
@@ -1814,7 +1814,10 @@ pub(super) fn eliminate_dead_vector_copies(store: &LineStore, infos: &mut [LineI
         // `parse_vec_copy` has already declined self-copies: a VEX one is not a
         // no-op (it zeroes the bits above the lane it copies), so it is not this
         // pass's business.
-        if fp.deleted_write_regions_dead_after(store, infos, i, u32::from(copy.dst), &[i]) {
+        if fp
+            .get_or_insert_with(|| FpLiveness::new(store, infos))
+            .deleted_write_regions_dead_after(store, infos, i, u32::from(copy.dst), &[i])
+        {
             mark_nop(&mut infos[i]);
             changed = true;
         }

@@ -29,6 +29,9 @@ fn bits(ty: IrType) -> Option<u32> {
 fn mask(width: u32) -> u64 {
     u64::MAX >> (64 - width)
 }
+fn is_low_bit_mask(m: u64) -> bool {
+    m == u64::MAX || (m & (m + 1)) == 0
+}
 fn constant(op: Operand, width: u32) -> Option<u64> {
     let Operand::Const(c) = op else { return None };
     // This is explicit bit-vector normalization, NOT an address-offset cast.
@@ -130,14 +133,22 @@ impl<'a> Bounds<'a> {
             } => {
                 let from = bits(*from_ty)?;
                 let to = bits(*to_ty)?;
-                let input = self.operand(*src, from, depth)?;
-                if to > from && !from_ty.is_unsigned() && input.max >= (1u64 << (from - 1)) {
-                    return None;
+                if let Some(input) = self.operand(*src, from, depth) {
+                    if to > from && !from_ty.is_unsigned() && input.max >= (1u64 << (from - 1)) {
+                        return None;
+                    }
+                    return Some(Bound {
+                        bits: to,
+                        max: input.max.min(mask(to)),
+                    });
                 }
-                Some(Bound {
-                    bits: to,
-                    max: input.max.min(mask(to)),
-                })
+                if (to > from && from_ty.is_unsigned()) || (to <= from && to_ty.is_unsigned()) {
+                    return Some(Bound {
+                        bits: to,
+                        max: mask(from).min(mask(to)),
+                    });
+                }
+                None
             }
             Instruction::BinOp {
                 op: IrBinOp::And,
@@ -147,15 +158,50 @@ impl<'a> Bounds<'a> {
                 ..
             } => {
                 let width = bits(*ty)?;
-                let (limit, other) = if let Some(n) = constant(*rhs, width) {
-                    (n, *lhs)
-                } else {
-                    (constant(*lhs, width)?, *rhs)
+                let l = self.operand(*lhs, width, depth);
+                let r = self.operand(*rhs, width, depth);
+                let max = match (l, r) {
+                    (Some(lb), Some(rb)) => lb.max.min(rb.max),
+                    (Some(b), None) | (None, Some(b)) => b.max,
+                    (None, None) => return None,
                 };
-                let max = self
-                    .operand(other, width, depth)
-                    .map_or(limit, |b| b.max.min(limit));
                 Some(Bound { bits: width, max })
+            }
+            Instruction::BinOp {
+                op: IrBinOp::Xor,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } => {
+                let width = bits(*ty)?;
+                let lb = self.operand(*lhs, width, depth)?;
+                let rb = self.operand(*rhs, width, depth)?;
+                let combined = lb.max | rb.max;
+                let max = if combined == 0 {
+                    0
+                } else {
+                    u64::MAX >> combined.leading_zeros()
+                };
+                Some(Bound { bits: width, max })
+            }
+            Instruction::BinOp {
+                op: IrBinOp::Or,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } => {
+                let width = bits(*ty)?;
+                let lb = self.operand(*lhs, width, depth)?;
+                let rb = self.operand(*rhs, width, depth)?;
+                if !is_low_bit_mask(lb.max) || !is_low_bit_mask(rb.max) {
+                    return None;
+                }
+                Some(Bound {
+                    bits: width,
+                    max: lb.max | rb.max,
+                })
             }
             Instruction::BinOp {
                 op: IrBinOp::LShr,
@@ -233,6 +279,40 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                             ));
                         }
                     }
+                    Instruction::BinOp {
+                        dest,
+                        op: IrBinOp::And,
+                        lhs,
+                        rhs,
+                        ty,
+                    } => {
+                        let Some(width) = bits(*ty) else { continue };
+                        let mask_and_val = if let Some(m) = constant(*rhs, width) {
+                            Some((m, *lhs))
+                        } else {
+                            constant(*lhs, width).map(|m| (m, *rhs))
+                        };
+                        if let Some((m, Operand::Value(v))) = mask_and_val
+                            && is_low_bit_mask(m)
+                            && !bounds.multi.contains(&v.0)
+                            && bounds
+                                .defs
+                                .get(&v.0)
+                                .is_some_and(|d| d.result_type() == Some(*ty))
+                            && bounds
+                                .operand(Operand::Value(v), width, 64)
+                                .is_some_and(|b| b.max <= m)
+                        {
+                            plans.push((
+                                bi,
+                                ii,
+                                Instruction::Copy {
+                                    dest: *dest,
+                                    src: Operand::Value(v),
+                                },
+                            ));
+                        }
+                    }
                     Instruction::Cast {
                         dest,
                         src,
@@ -247,13 +327,59 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                                 .operand(*src, from, 64)
                                 .is_some_and(|b| b.max < (1u64 << (from - 1)))
                         {
+                            let new_from = from_ty.to_unsigned();
+                            if let Operand::Value(sv) = src
+                                && !bounds.multi.contains(&sv.0)
+                                && let Some(Instruction::Cast {
+                                    src: inner_src,
+                                    from_ty: inner_from,
+                                    to_ty: inner_to,
+                                    ..
+                                }) = bounds.defs.get(&sv.0).copied()
+                            {
+                                if *inner_from == new_from && *inner_to == *from_ty {
+                                    plans.push((
+                                        bi,
+                                        ii,
+                                        Instruction::Cast {
+                                            dest: *dest,
+                                            src: *inner_src,
+                                            from_ty: new_from,
+                                            to_ty: *to_ty,
+                                        },
+                                    ));
+                                    continue;
+                                }
+                                if bits(*inner_from) == Some(to)
+                                    && *inner_to == *from_ty
+                                    && bounds
+                                        .operand(*inner_src, to, 64)
+                                        .is_some_and(|b| b.max < (1u64 << (from - 1)))
+                                {
+                                    let replacement = if *inner_from == *to_ty {
+                                        Instruction::Copy {
+                                            dest: *dest,
+                                            src: *inner_src,
+                                        }
+                                    } else {
+                                        Instruction::Cast {
+                                            dest: *dest,
+                                            src: *inner_src,
+                                            from_ty: *inner_from,
+                                            to_ty: *to_ty,
+                                        }
+                                    };
+                                    plans.push((bi, ii, replacement));
+                                    continue;
+                                }
+                            }
                             plans.push((
                                 bi,
                                 ii,
                                 Instruction::Cast {
                                     dest: *dest,
                                     src: *src,
-                                    from_ty: from_ty.to_unsigned(),
+                                    from_ty: new_from,
                                     to_ty: *to_ty,
                                 },
                             ));
@@ -267,6 +393,83 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     let count = plans.len();
     for (bi, ii, replacement) in plans {
         func.blocks[bi].instructions[ii] = replacement;
+    }
+    if count > 0 {
+        // When a widening Cast was rewritten to `from_ty: U32` and its source
+        // (after peeling any Copy just formed from a redundant mask) is a
+        // single-use I32 bitwise op (`And`/`Or`/`Xor`), retype that bitwise op
+        // to `U32` so `build_indexed_gep_map` and `ensure_sib_index_form`
+        // peel the Cast directly into the SIB index without an extra move.
+        let max_id = func.max_value_id() as usize + 1;
+        let mut def_loc = vec![None; max_id];
+        let mut def_counts = vec![0u32; max_id];
+        let mut use_counts = vec![0u32; max_id];
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                if let Some(d) = inst.dest() {
+                    def_counts[d.0 as usize] += 1;
+                    def_loc[d.0 as usize] = Some((bi, ii));
+                }
+                inst.for_each_used_value(|u| {
+                    if (u as usize) < use_counts.len() {
+                        use_counts[u as usize] += 1;
+                    }
+                });
+            }
+            block.terminator.for_each_used_value(|u| {
+                if (u as usize) < use_counts.len() {
+                    use_counts[u as usize] += 1;
+                }
+            });
+        }
+        let mut bitop_retypes: Vec<(usize, usize, Value, usize, usize)> = Vec::new();
+        for (bi, block) in func.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                let Instruction::Cast {
+                    src: Operand::Value(sv),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::I64 | IrType::U64,
+                    ..
+                } = inst
+                else {
+                    continue;
+                };
+                let mut sv = *sv;
+                for _ in 0..4 {
+                    if def_counts.get(sv.0 as usize).copied() != Some(1)
+                        || use_counts.get(sv.0 as usize).copied() != Some(1)
+                    {
+                        break;
+                    }
+                    let Some((sbi, sii)) = def_loc.get(sv.0 as usize).copied().flatten() else {
+                        break;
+                    };
+                    match &func.blocks[sbi].instructions[sii] {
+                        Instruction::Copy {
+                            src: Operand::Value(inner),
+                            ..
+                        } => sv = *inner,
+                        Instruction::BinOp {
+                            op: IrBinOp::And | IrBinOp::Or | IrBinOp::Xor,
+                            ty: IrType::I32,
+                            ..
+                        } => {
+                            bitop_retypes.push((bi, ii, sv, sbi, sii));
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+        for (cbi, cii, sv, sbi, sii) in bitop_retypes {
+            if let Instruction::BinOp { ty, .. } = &mut func.blocks[sbi].instructions[sii] {
+                *ty = IrType::U32;
+            }
+            if let Instruction::Cast { src, .. } = &mut func.blocks[cbi].instructions[cii] {
+                *src = Operand::Value(sv);
+            }
+        }
     }
     count
 }
@@ -669,5 +872,86 @@ mod tests {
                 assert!(u64::from(value as u8) <= bound.max);
             }
         }
+    }
+
+    #[test]
+    fn redundant_low_bit_mask_rewrites_to_copy() {
+        let mut f = fixture(vec![
+            and(1, 15, IrType::U32),
+            Instruction::BinOp {
+                dest: Value(2),
+                op: IrBinOp::And,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I32(255)),
+                ty: IrType::U32,
+            },
+        ]);
+        assert_eq!(run(&mut f), 1);
+        assert!(matches!(
+            f.blocks[0].instructions[2],
+            Instruction::Copy {
+                dest: Value(2),
+                src: Operand::Value(Value(1)),
+            }
+        ));
+    }
+
+    #[test]
+    fn xor_of_bounded_operands_narrows_widening_cast_and_retypes_xor() {
+        let mut f = fixture(vec![
+            and(1, 255, IrType::I32),
+            and(2, 255, IrType::I32),
+            Instruction::BinOp {
+                dest: Value(3),
+                op: IrBinOp::Xor,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Value(Value(2)),
+                ty: IrType::I32,
+            },
+            cast(4, 3, IrType::I32, IrType::I64),
+        ]);
+        assert!(run(&mut f) >= 1);
+        assert!(matches!(
+            f.blocks[0].instructions[3],
+            Instruction::BinOp {
+                dest: Value(3),
+                op: IrBinOp::Xor,
+                ty: IrType::U32,
+                ..
+            }
+        ));
+        assert!(matches!(
+            f.blocks[0].instructions[4],
+            Instruction::Cast {
+                dest: Value(4),
+                src: Operand::Value(Value(3)),
+                from_ty: IrType::U32,
+                to_ty: IrType::I64,
+            }
+        ));
+    }
+
+    #[test]
+    fn round_trip_u64_i32_i64_popcount_cast_collapses() {
+        let mut f = fixture(vec![
+            Instruction::UnaryOp {
+                dest: Value(1),
+                op: IrUnaryOp::Popcount,
+                src: Operand::Value(Value(0)),
+                ty: IrType::U64,
+            },
+            cast(2, 1, IrType::U64, IrType::I32),
+            cast(3, 2, IrType::I32, IrType::I64),
+        ]);
+        assert_eq!(run(&mut f), 1);
+        assert!(matches!(
+            f.blocks[0].instructions[3],
+            Instruction::Cast {
+                dest: Value(3),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::U64,
+                to_ty: IrType::I64,
+            }
+        ));
     }
 }

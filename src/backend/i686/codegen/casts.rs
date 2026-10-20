@@ -129,8 +129,15 @@ impl I686Codegen {
             if source.0 == dest.0 && from_ty == to_ty {
                 return;
             }
-            if matches!(from_ty, IrType::I32 | IrType::U32)
-                && matches!(to_ty, IrType::I32 | IrType::U32)
+            let narrow_already_extended = matches!(to_ty, IrType::I32 | IrType::U32 | IrType::Ptr)
+                && super::comparison::NarrowImage::of_type(from_ty).is_some_and(|req| {
+                    self.narrow_images
+                        .get(&source.0)
+                        .is_some_and(|img| img.extends_at(req.bits, req.signed))
+                });
+            if (matches!(from_ty, IrType::I32 | IrType::U32)
+                && matches!(to_ty, IrType::I32 | IrType::U32))
+                || narrow_already_extended
             {
                 if let (Some(&dp), Some(&sp)) = (
                     self.reg_assignments.get(&dest.0),
@@ -139,6 +146,11 @@ impl I686Codegen {
                     if dp == sp {
                         return;
                     }
+                }
+                if narrow_already_extended {
+                    self.operand_to_eax(src);
+                    self.store_eax_to(dest);
+                    return;
                 }
             }
         }

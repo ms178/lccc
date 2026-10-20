@@ -387,11 +387,16 @@ fn is_pure_write_mnemonic(t: &str) -> bool {
 /// path).  The suffix test rejects the look-alikes `movsbl %al, %eax`
 /// (sign-extending move) and `movsd %xmm0, ...` (scalar double move).
 pub(crate) fn is_string_instruction(t: &str) -> bool {
+    if !matches!(t.as_bytes().first(), Some(b'r' | b'm' | b's' | b'l' | b'c')) {
+        return false;
+    }
     let mut m = t;
-    for p in ["repne ", "repnz ", "repe ", "repz ", "rep "] {
-        if let Some(rest) = m.strip_prefix(p) {
-            m = rest.trim_start();
-            break;
+    if m.as_bytes()[0] == b'r' {
+        for p in ["repne ", "repnz ", "repe ", "repz ", "rep "] {
+            if let Some(rest) = m.strip_prefix(p) {
+                m = rest.trim_start();
+                break;
+            }
         }
     }
     let m = m.split_whitespace().next().unwrap_or("");
@@ -407,6 +412,41 @@ pub(crate) fn is_string_instruction(t: &str) -> bool {
 }
 
 fn mnemonic_is_known(t: &str) -> bool {
+    let b = t.as_bytes();
+    if b.len() >= 3 {
+        let fast = match b[0] {
+            b'm' => b.starts_with(b"mov") || b.starts_with(b"mul"),
+            b'l' => b.starts_with(b"lea") || b.starts_with(b"lzcnt") || b.starts_with(b"leave"),
+            b'a' => b.starts_with(b"add") || b.starts_with(b"and") || b.starts_with(b"adc"),
+            b's' => {
+                b.starts_with(b"sub")
+                    || b.starts_with(b"sh")
+                    || b.starts_with(b"sar")
+                    || b.starts_with(b"sal")
+                    || b.starts_with(b"set")
+                    || b.starts_with(b"sbb")
+            }
+            b'x' => b.starts_with(b"xor") || b.starts_with(b"xchg") || b.starts_with(b"xadd"),
+            b'c' => {
+                b.starts_with(b"cmp")
+                    || b.starts_with(b"cmov")
+                    || b.starts_with(b"call")
+                    || b.starts_with(b"cvt")
+            }
+            b't' => b.starts_with(b"test") || b.starts_with(b"tzcnt"),
+            b'i' => b.starts_with(b"imul") || b.starts_with(b"inc") || b.starts_with(b"idiv"),
+            b'd' => b.starts_with(b"dec") || b.starts_with(b"div"),
+            b'n' => b.starts_with(b"neg") || b.starts_with(b"not") || b.starts_with(b"nop"),
+            b'o' => b.starts_with(b"or"),
+            b'p' => b.starts_with(b"push") || b.starts_with(b"pop"),
+            b'r' => b.starts_with(b"ret") || b.starts_with(b"rol") || b.starts_with(b"ror"),
+            b'j' => true,
+            _ => false,
+        };
+        if fast {
+            return true;
+        }
+    }
     const KNOWN: &[&str] = &[
         "mov",
         "lea",
@@ -1630,10 +1670,10 @@ impl FileLiveness {
                 // observable, so it must keep the family LIVE (model it as
                 // a read), never kill it: killing on `lahf` deleted a
                 // `movslq %eax, %rax` whose high bits `ret` still returned.
-                let iw = implicit_write_refs(t.as_bytes());
-                let iwf = implicit_full_write_refs(t.as_bytes());
+                let (ir, iw, iwf) =
+                    crate::backend::x86::codegen::peephole::types::implicit_r_w_full(t.as_bytes());
                 reads &= !iwf; // only a full implicit write cancels an observation
-                reads |= implicit_read_refs(t.as_bytes());
+                reads |= ir;
                 reads |= iw & !iwf; // partial implicit writes preserve the old value
                 writes |= iwf; // only a full implicit write is a kill
                 if t.starts_with("xchg") || t.starts_with("cmpxchg") || t.starts_with("xadd") {

@@ -48,6 +48,22 @@ use crate::ir::reexports::{
 };
 use crate::passes::loop_analysis::{DominanceChecker, find_natural_loops, merge_loops_by_header};
 
+thread_local! {
+    /// Whether the target has a direct hardware population-count instruction
+    /// (`popcnt` on x86/i686, AdvSIMD `cnt` + `addv` on AArch64 when SIMD
+    /// registers are permitted). Resolved per translation unit by the driver;
+    /// defaults to `true` so standalone unit tests exercise the idiom.
+    static FAST_POPCOUNT_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+pub(crate) fn set_fast_popcount_enabled(enabled: bool) {
+    FAST_POPCOUNT_ENABLED.with(|c| c.set(enabled));
+}
+
+pub(crate) fn fast_popcount_enabled() -> bool {
+    FAST_POPCOUNT_ENABLED.with(|c| c.get())
+}
+
 /// Per-function entry point for the dirty-tracking pipeline. Two globals
 /// prove disjoint only when *both* are strong private definitions and neither
 /// is an alias; extern declarations may resolve to the same storage in a
@@ -475,6 +491,32 @@ pub(crate) fn recognize_idioms(
                     total += 1;
                     progressed = true;
                     break;
+                }
+            }
+            // Brian Kernighan population-count idiom (`while (x) { x &= x - 1; r++; }`
+            // and the guarded `do { x &= x - 1; r++; } while (x)` form): each
+            // iteration clears the lowest set bit of `x`, so the trip count is
+            // `popcount(x0)` and the final accumulator is `r0 + popcount(x0)`.
+            // Gated on target hardware popcount availability (`popcnt` on x86,
+            // AdvSIMD `cnt` on AArch64).
+            if fast_popcount_enabled() {
+                if let Some(matched) = try_match_popcount_loop(func, lp, &cfg) {
+                    dlog!(
+                        "{} loop@{}: MATCH popcount (header={} pre={} exit={} x=phi{} r=phi{} rotated={})",
+                        func.name,
+                        lp.header,
+                        matched.header,
+                        matched.preheader,
+                        matched.exit,
+                        matched.x_phi.0,
+                        matched.r_phi.0,
+                        matched.rotated,
+                    );
+                    if rewrite_popcount_loop(func, &matched, &lp.body) {
+                        total += 1;
+                        progressed = true;
+                        break;
+                    }
                 }
             }
         }
@@ -3317,6 +3359,11 @@ fn rewrite_ctz_loop(func: &mut IrFunction, m: &CtzLoop, body: &FxHashSet<usize>)
             }
             continue;
         }
+        inst.for_each_operand_mut(|op| {
+            if *op == Operand::Value(m.r_phi) {
+                *op = Operand::Value(res_val);
+            }
+        });
         inst.for_each_value_use_mut(|u| {
             if *u == m.r_phi {
                 *u = res_val;
@@ -3365,6 +3412,783 @@ fn rewrite_ctz_loop(func: &mut IrFunction, m: &CtzLoop, body: &FxHashSet<usize>)
         m.header,
         dead_labels.len()
     );
+    true
+}
+
+/// A matched Brian Kernighan population-count loop (`while (x) { x &= x - 1; r++; }`).
+struct PopcountLoop {
+    header: usize,
+    preheader: usize,
+    latch: usize,
+    exit: usize,
+    x_phi: Value,
+    x_ty: IrType,
+    x_init: Operand,
+    r_phi: Value,
+    r_ty: IrType,
+    r_init: Operand,
+    r_out: Value,
+    rotated: bool,
+}
+
+/// Follow `Copy` and integer `Cast` instructions whose source and target types
+/// are at least `min_bytes` wide (preserving the low `min_bytes * 8` bits).
+fn popcnt_unwrap_cast_chain(
+    defs: &FxHashMap<u32, &Instruction>,
+    mut v: Value,
+    min_bytes: usize,
+) -> Value {
+    for _ in 0..32 {
+        match defs.get(&v.0) {
+            Some(Instruction::Copy {
+                src: Operand::Value(inner),
+                ..
+            }) => v = *inner,
+            Some(Instruction::Cast {
+                src: Operand::Value(inner),
+                from_ty,
+                to_ty,
+                ..
+            }) if is_int_type(*from_ty)
+                && is_int_type(*to_ty)
+                && from_ty.size() >= min_bytes
+                && to_ty.size() >= min_bytes =>
+            {
+                v = *inner;
+            }
+            _ => break,
+        }
+    }
+    v
+}
+
+/// Match `x_phi - 1` or `x_phi + (-1)` at width `>= min_bytes`.
+fn popcnt_is_minus_one(
+    defs: &FxHashMap<u32, &Instruction>,
+    v: Value,
+    x_phi: Value,
+    min_bytes: usize,
+) -> bool {
+    let v = popcnt_unwrap_cast_chain(defs, v, min_bytes);
+    let Some(Instruction::BinOp {
+        op, lhs, rhs, ty, ..
+    }) = defs.get(&v.0)
+    else {
+        return false;
+    };
+    if !is_int_type(*ty) || ty.size() < min_bytes || ty.size() > 8 {
+        return false;
+    }
+    match op {
+        IrBinOp::Sub => {
+            let Operand::Value(lv) = lhs else {
+                return false;
+            };
+            popcnt_unwrap_cast_chain(defs, *lv, min_bytes) == x_phi
+                && operand_const_int(rhs) == Some(1)
+        }
+        IrBinOp::Add => {
+            let all_ones = ty.truncate_i64(-1);
+            match (lhs, rhs) {
+                (Operand::Value(lv), Operand::Const(c)) => {
+                    popcnt_unwrap_cast_chain(defs, *lv, min_bytes) == x_phi
+                        && c.to_i64().map(|k| ty.truncate_i64(k)) == Some(all_ones)
+                }
+                (Operand::Const(c), Operand::Value(rv)) => {
+                    popcnt_unwrap_cast_chain(defs, *rv, min_bytes) == x_phi
+                        && c.to_i64().map(|k| ty.truncate_i64(k)) == Some(all_ones)
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Match `x_next = x_phi & (x_phi - 1)` (Either operand order, allowing
+/// C integer promotion casts for 8/16-bit `x_ty`).
+fn popcnt_is_clear_lsb(
+    defs: &FxHashMap<u32, &Instruction>,
+    x_next: Value,
+    x_phi: Value,
+    x_ty: IrType,
+) -> bool {
+    let min_bytes = x_ty.size();
+    let v = popcnt_unwrap_cast_chain(defs, x_next, min_bytes);
+    let Some(Instruction::BinOp {
+        op: IrBinOp::And,
+        lhs: Operand::Value(a),
+        rhs: Operand::Value(b),
+        ty,
+        ..
+    }) = defs.get(&v.0)
+    else {
+        return false;
+    };
+    if !is_int_type(*ty) || ty.size() < min_bytes || ty.size() > 8 {
+        return false;
+    }
+    let a_unwrapped = popcnt_unwrap_cast_chain(defs, *a, min_bytes);
+    let b_unwrapped = popcnt_unwrap_cast_chain(defs, *b, min_bytes);
+    (a_unwrapped == x_phi && popcnt_is_minus_one(defs, *b, x_phi, min_bytes))
+        || (b_unwrapped == x_phi && popcnt_is_minus_one(defs, *a, x_phi, min_bytes))
+}
+
+/// Match `r_next = r_phi + 1` (or `1 + r_phi` / `r_phi - (-1)`).
+fn popcnt_is_plus_one(
+    defs: &FxHashMap<u32, &Instruction>,
+    r_next: Value,
+    r_phi: Value,
+    r_ty: IrType,
+) -> bool {
+    let min_bytes = r_ty.size();
+    let v = popcnt_unwrap_cast_chain(defs, r_next, min_bytes);
+    let Some(Instruction::BinOp {
+        op, lhs, rhs, ty, ..
+    }) = defs.get(&v.0)
+    else {
+        return false;
+    };
+    if !is_int_type(*ty) || ty.size() < min_bytes || ty.size() > 8 {
+        return false;
+    }
+    match op {
+        IrBinOp::Add => match (lhs, rhs) {
+            (Operand::Value(lv), r) if popcnt_unwrap_cast_chain(defs, *lv, min_bytes) == r_phi => {
+                operand_const_int(r) == Some(1)
+            }
+            (l, Operand::Value(rv)) if popcnt_unwrap_cast_chain(defs, *rv, min_bytes) == r_phi => {
+                operand_const_int(l) == Some(1)
+            }
+            _ => false,
+        },
+        IrBinOp::Sub => match lhs {
+            Operand::Value(lv) if popcnt_unwrap_cast_chain(defs, *lv, min_bytes) == r_phi => {
+                operand_const_int(rhs) == Some(-1)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Resolve a `CondBranch` that tests `tested != 0` or `tested == 0`, returning
+/// `(nonzero_target_block, zero_target_block)`.
+fn popcnt_zero_branch_targets(
+    defs: &FxHashMap<u32, &Instruction>,
+    term: &Terminator,
+    tested: Value,
+    x_ty: IrType,
+    label_to_idx: &FxHashMap<BlockId, usize>,
+) -> Option<(usize, usize)> {
+    let Terminator::CondBranch {
+        cond: Operand::Value(cv),
+        true_label,
+        false_label,
+    } = term
+    else {
+        return None;
+    };
+    let t_idx = *label_to_idx.get(true_label)?;
+    let f_idx = *label_to_idx.get(false_label)?;
+    let min_bytes = x_ty.size();
+    let cv_resolved = resolve_copy(defs, *cv);
+    if popcnt_unwrap_cast_chain(defs, cv_resolved, min_bytes)
+        == popcnt_unwrap_cast_chain(defs, tested, min_bytes)
+    {
+        return Some((t_idx, f_idx));
+    }
+    let Some(Instruction::Cmp {
+        op, lhs, rhs, ty, ..
+    }) = defs.get(&cv_resolved.0)
+    else {
+        return None;
+    };
+    if !is_int_type(*ty) || ty.size() < min_bytes || ty.size() > 8 {
+        return None;
+    }
+    let tests_zero = match (lhs, rhs) {
+        (Operand::Value(lv), r) => {
+            popcnt_unwrap_cast_chain(defs, *lv, min_bytes)
+                == popcnt_unwrap_cast_chain(defs, tested, min_bytes)
+                && operand_const_int(r) == Some(0)
+        }
+        (l, Operand::Value(rv)) => {
+            popcnt_unwrap_cast_chain(defs, *rv, min_bytes)
+                == popcnt_unwrap_cast_chain(defs, tested, min_bytes)
+                && operand_const_int(l) == Some(0)
+        }
+        _ => false,
+    };
+    if !tests_zero {
+        return None;
+    }
+    match op {
+        IrCmpOp::Ne => Some((t_idx, f_idx)),
+        IrCmpOp::Eq => Some((f_idx, t_idx)),
+        _ => None,
+    }
+}
+
+/// Verify that every instruction in the loop body is side-effect-free and part
+/// of the popcount recurrence.
+fn popcnt_body_is_pure(
+    func: &IrFunction,
+    body: &FxHashSet<usize>,
+    header: usize,
+    x_phi: Value,
+    r_phi: Value,
+) -> bool {
+    for &b in body {
+        for inst in &func.blocks[b].instructions {
+            match inst {
+                Instruction::Phi { dest, .. } => {
+                    if b != header || (*dest != x_phi && *dest != r_phi) {
+                        return false;
+                    }
+                }
+                Instruction::Copy { .. } => {}
+                Instruction::Cast { from_ty, to_ty, .. } => {
+                    if !is_int_type(*from_ty)
+                        || !is_int_type(*to_ty)
+                        || from_ty.size() > 8
+                        || to_ty.size() > 8
+                    {
+                        return false;
+                    }
+                }
+                Instruction::BinOp {
+                    op: IrBinOp::Add | IrBinOp::Sub | IrBinOp::And,
+                    ty,
+                    ..
+                } => {
+                    if !is_int_type(*ty) || ty.size() > 8 {
+                        return false;
+                    }
+                }
+                Instruction::Cmp {
+                    op: IrCmpOp::Eq | IrCmpOp::Ne,
+                    ty,
+                    ..
+                } => {
+                    if !is_int_type(*ty) || ty.size() > 8 {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+    }
+    true
+}
+
+/// Verify that no value defined inside `body` is used outside `body` except
+/// `r_out`, and that any `Phi` in `exit` only takes `r_out` from `exit_pred`.
+fn popcnt_external_uses_valid(
+    func: &IrFunction,
+    body: &FxHashSet<usize>,
+    exit: usize,
+    exit_pred_label: BlockId,
+    r_out: Value,
+) -> bool {
+    let mut body_defs: FxHashSet<u32> = FxHashSet::default();
+    for &b in body {
+        for inst in &func.blocks[b].instructions {
+            if let Some(d) = inst.dest() {
+                body_defs.insert(d.0);
+            }
+        }
+    }
+    for inst in &func.blocks[exit].instructions {
+        if let Instruction::Phi { incoming, .. } = inst {
+            for (op, lbl) in incoming {
+                if *lbl == exit_pred_label && *op != Operand::Value(r_out) {
+                    return false;
+                }
+            }
+        }
+    }
+    let mut r_used_outside = false;
+    for (bi, block) in func.blocks.iter().enumerate() {
+        if body.contains(&bi) {
+            continue;
+        }
+        let mut bad = false;
+        for inst in &block.instructions {
+            inst.for_each_used_value(|u| {
+                if body_defs.contains(&u) {
+                    if u == r_out.0 {
+                        r_used_outside = true;
+                    } else {
+                        bad = true;
+                    }
+                }
+            });
+        }
+        match &block.terminator {
+            Terminator::Return(Some(Operand::Value(v)))
+            | Terminator::CondBranch {
+                cond: Operand::Value(v),
+                ..
+            }
+            | Terminator::Switch {
+                val: Operand::Value(v),
+                ..
+            }
+            | Terminator::IndirectBranch {
+                target: Operand::Value(v),
+                ..
+            } => {
+                if body_defs.contains(&v.0) {
+                    if *v == r_out {
+                        r_used_outside = true;
+                    } else {
+                        bad = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if bad {
+            return false;
+        }
+    }
+    r_used_outside
+}
+
+fn try_match_popcount_loop(
+    func: &IrFunction,
+    lp: &crate::passes::loop_analysis::NaturalLoop,
+    cfg: &CfgAnalysis,
+) -> Option<PopcountLoop> {
+    let header = lp.header;
+    if lp.body.len() > 2 {
+        return None;
+    }
+    let latch = lp.single_latch(&cfg.preds)?;
+    let preheaders: Vec<usize> = cfg
+        .preds
+        .row(header)
+        .iter()
+        .map(|&p| p as usize)
+        .filter(|p| !lp.body.contains(p))
+        .collect();
+    if preheaders.len() != 1 {
+        return None;
+    }
+    let preheader = preheaders[0];
+    let preheader_label = func.blocks[preheader].label;
+    let latch_label = func.blocks[latch].label;
+
+    let mut phis = Vec::new();
+    for inst in &func.blocks[header].instructions {
+        if let Instruction::Phi {
+            dest, ty, incoming, ..
+        } = inst
+        {
+            if !is_int_type(*ty) || ty.size() > 8 || incoming.len() != 2 {
+                return None;
+            }
+            let mut init_op = None;
+            let mut next_val = None;
+            for (op, lbl) in incoming {
+                if *lbl == preheader_label {
+                    init_op = Some(*op);
+                } else if *lbl == latch_label {
+                    if let Operand::Value(v) = op {
+                        next_val = Some(*v);
+                    }
+                }
+            }
+            phis.push((*dest, *ty, init_op?, next_val?));
+        }
+    }
+    if phis.len() != 2 {
+        return None;
+    }
+
+    let mut defs: FxHashMap<u32, &Instruction> = FxHashMap::default();
+    let mut def_blocks: FxHashMap<u32, usize> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                defs.insert(d.0, inst);
+                def_blocks.insert(d.0, bi);
+            }
+        }
+    }
+    let label_to_idx: FxHashMap<BlockId, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label, i))
+        .collect();
+
+    let (x_idx, r_idx) = if popcnt_is_clear_lsb(&defs, phis[0].3, phis[0].0, phis[0].1)
+        && popcnt_is_plus_one(&defs, phis[1].3, phis[1].0, phis[1].1)
+    {
+        (0, 1)
+    } else if popcnt_is_clear_lsb(&defs, phis[1].3, phis[1].0, phis[1].1)
+        && popcnt_is_plus_one(&defs, phis[0].3, phis[0].0, phis[0].1)
+    {
+        (1, 0)
+    } else {
+        return None;
+    };
+    let (x_phi, x_ty, x_init, x_next) = phis[x_idx];
+    let (r_phi, r_ty, r_init, r_next) = phis[r_idx];
+    if !matches!(r_ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
+        return None;
+    }
+    if !popcnt_body_is_pure(func, &lp.body, header, x_phi, r_phi) {
+        return None;
+    }
+
+    let dom = DominanceChecker::new(cfg.num_blocks, &cfg.idom);
+    let check_available = |op: &Operand| -> Option<()> {
+        let Operand::Value(v) = op else {
+            return Some(());
+        };
+        match def_blocks.get(&v.0) {
+            None => Some(()),
+            Some(&db) if db == preheader || dom.dominates(db, preheader) => Some(()),
+            Some(_) => None,
+        }
+    };
+    check_available(&x_init)?;
+    check_available(&r_init)?;
+
+    let edge = match &func.blocks[preheader].terminator {
+        Terminator::Branch(target) if label_to_idx.get(target) == Some(&header) => {
+            PreheaderEdge::Uncond
+        }
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
+            let t_is_header = label_to_idx.get(true_label) == Some(&header);
+            let f_is_header = label_to_idx.get(false_label) == Some(&header);
+            if t_is_header == f_is_header {
+                return None;
+            }
+            if t_is_header {
+                PreheaderEdge::CondTrue
+            } else {
+                PreheaderEdge::CondFalse
+            }
+        }
+        _ => return None,
+    };
+
+    // Two loop shapes:
+    // 1. Unrotated `while (x) { x &= x - 1; r++; }`: header tests `x_phi != 0`
+    //    before the body runs in `latch`, and exits on `x_phi == 0` with `r_phi`.
+    // 2. Guarded `do { x &= x - 1; r++; } while (x)`: body runs before `latch`
+    //    tests `x_next != 0`, and exits on `x_next == 0` with `r_next` (sound
+    //    only when the preheader proves `x_init != 0`).
+    let (exit, rotated, r_out, exit_pred_label) = if header != latch {
+        let (nz_target, z_target) = popcnt_zero_branch_targets(
+            &defs,
+            &func.blocks[header].terminator,
+            x_phi,
+            x_ty,
+            &label_to_idx,
+        )?;
+        if nz_target != latch || lp.body.contains(&z_target) {
+            return None;
+        }
+        for inst in &func.blocks[header].instructions {
+            if !matches!(inst, Instruction::Phi { .. } | Instruction::Cmp { .. }) {
+                return None;
+            }
+        }
+        if !matches!(
+            func.blocks[latch].terminator,
+            Terminator::Branch(lbl) if lbl == func.blocks[header].label
+        ) {
+            return None;
+        }
+        (z_target, false, r_phi, func.blocks[header].label)
+    } else {
+        let Operand::Value(x_init_val) = x_init else {
+            return None;
+        };
+        let x_init_val = strip_noop_casts(&defs, resolve_copy(&defs, x_init_val));
+        if !ctz_entry_proves_nonzero(func, cfg, preheader, edge, x_init_val, &defs, &label_to_idx) {
+            return None;
+        }
+        let (nz_target, z_target) = popcnt_zero_branch_targets(
+            &defs,
+            &func.blocks[latch].terminator,
+            x_next,
+            x_ty,
+            &label_to_idx,
+        )?;
+        if nz_target != header || lp.body.contains(&z_target) {
+            return None;
+        }
+        (z_target, true, r_next, func.blocks[latch].label)
+    };
+
+    if exit == preheader
+        || !popcnt_external_uses_valid(func, &lp.body, exit, exit_pred_label, r_out)
+    {
+        return None;
+    }
+
+    Some(PopcountLoop {
+        header,
+        preheader,
+        latch,
+        exit,
+        x_phi,
+        x_ty,
+        x_init,
+        r_phi,
+        r_ty,
+        r_init,
+        r_out,
+        rotated,
+    })
+}
+
+fn rewrite_popcount_loop(func: &mut IrFunction, m: &PopcountLoop, body: &FxHashSet<usize>) -> bool {
+    let header_label = func.blocks[m.header].label;
+    let latch_label = func.blocks[m.latch].label;
+    let preheader_label = func.blocks[m.preheader].label;
+    let exit_label = func.blocks[m.exit].label;
+    let exit_pred_label = if m.rotated { latch_label } else { header_label };
+
+    for inst in &func.blocks[m.exit].instructions {
+        if let Instruction::Phi { incoming, .. } = inst {
+            let mut pred_entries = 0u32;
+            let mut pre_entries = 0u32;
+            for (_, label) in incoming {
+                if *label == preheader_label {
+                    pre_entries += 1;
+                }
+                if *label == exit_pred_label {
+                    pred_entries += 1;
+                }
+            }
+            if pre_entries > 0 || pred_entries > 1 {
+                return false;
+            }
+        }
+    }
+
+    let mut extra: Vec<Instruction> = Vec::new();
+    let (pop_src, pop_ty) = match m.x_ty {
+        IrType::I8 => {
+            let v_u8 = alloc_value(func);
+            let v_u32 = alloc_value(func);
+            extra.push(Instruction::Cast {
+                dest: v_u8,
+                src: m.x_init,
+                from_ty: IrType::I8,
+                to_ty: IrType::U8,
+            });
+            extra.push(Instruction::Cast {
+                dest: v_u32,
+                src: Operand::Value(v_u8),
+                from_ty: IrType::U8,
+                to_ty: IrType::U32,
+            });
+            (Operand::Value(v_u32), IrType::U32)
+        }
+        IrType::U8 => {
+            let v_u32 = alloc_value(func);
+            extra.push(Instruction::Cast {
+                dest: v_u32,
+                src: m.x_init,
+                from_ty: IrType::U8,
+                to_ty: IrType::U32,
+            });
+            (Operand::Value(v_u32), IrType::U32)
+        }
+        IrType::I16 => {
+            let v_u16 = alloc_value(func);
+            let v_u32 = alloc_value(func);
+            extra.push(Instruction::Cast {
+                dest: v_u16,
+                src: m.x_init,
+                from_ty: IrType::I16,
+                to_ty: IrType::U16,
+            });
+            extra.push(Instruction::Cast {
+                dest: v_u32,
+                src: Operand::Value(v_u16),
+                from_ty: IrType::U16,
+                to_ty: IrType::U32,
+            });
+            (Operand::Value(v_u32), IrType::U32)
+        }
+        IrType::U16 => {
+            let v_u32 = alloc_value(func);
+            extra.push(Instruction::Cast {
+                dest: v_u32,
+                src: m.x_init,
+                from_ty: IrType::U16,
+                to_ty: IrType::U32,
+            });
+            (Operand::Value(v_u32), IrType::U32)
+        }
+        IrType::I32 | IrType::U32 => (m.x_init, m.x_ty),
+        IrType::I64 | IrType::U64 => (m.x_init, m.x_ty),
+        _ => return false,
+    };
+
+    let v_pop = alloc_value(func);
+    extra.push(Instruction::UnaryOp {
+        dest: v_pop,
+        op: IrUnaryOp::Popcount,
+        src: pop_src,
+        ty: pop_ty,
+    });
+
+    let v_pop_r = if pop_ty == m.r_ty {
+        v_pop
+    } else {
+        let vc = alloc_value(func);
+        extra.push(Instruction::Cast {
+            dest: vc,
+            src: Operand::Value(v_pop),
+            from_ty: pop_ty,
+            to_ty: m.r_ty,
+        });
+        vc
+    };
+
+    let v_res = if operand_const_int(&m.r_init) == Some(0) {
+        v_pop_r
+    } else {
+        let vr = alloc_value(func);
+        extra.push(Instruction::BinOp {
+            dest: vr,
+            op: IrBinOp::Add,
+            lhs: m.r_init,
+            rhs: Operand::Value(v_pop_r),
+            ty: m.r_ty,
+        });
+        vr
+    };
+
+    let sink_into_exit = matches!(
+        func.blocks[m.preheader].terminator,
+        Terminator::CondBranch { .. }
+    ) && !func.blocks[m.exit]
+        .instructions
+        .iter()
+        .any(|i| matches!(i, Instruction::Phi { .. }))
+        && {
+            let label_to_idx = analysis::build_label_map(func);
+            let (preds, _) = analysis::build_cfg(func, &label_to_idx);
+            preds
+                .row(m.exit)
+                .iter()
+                .all(|&p| body.contains(&(p as usize)))
+        };
+
+    match &mut func.blocks[m.preheader].terminator {
+        Terminator::Branch(lbl) if *lbl == header_label => *lbl = exit_label,
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => {
+            if *true_label == header_label {
+                *true_label = exit_label;
+            }
+            if *false_label == header_label {
+                *false_label = exit_label;
+            }
+        }
+        _ => return false,
+    }
+
+    let at = if sink_into_exit { m.exit } else { m.preheader };
+    let pos = if sink_into_exit {
+        0
+    } else {
+        func.blocks[at].instructions.len()
+    };
+    {
+        let block = &mut func.blocks[at];
+        if !block.source_spans.is_empty() {
+            if block.source_spans.len() == block.instructions.len() {
+                block.source_spans.splice(
+                    pos..pos,
+                    (0..extra.len()).map(|_| crate::common::source::Span::dummy()),
+                );
+            } else {
+                block.source_spans.clear();
+            }
+        }
+        block.instructions.splice(pos..pos, extra);
+    }
+
+    for inst in &mut func.blocks[m.exit].instructions {
+        if let Instruction::Phi { incoming, .. } = inst {
+            for (op, lbl) in incoming.iter_mut() {
+                if *lbl == exit_pred_label {
+                    *op = Operand::Value(v_res);
+                    *lbl = preheader_label;
+                }
+            }
+        }
+    }
+
+    for (bi, block) in func.blocks.iter_mut().enumerate() {
+        if body.contains(&bi) {
+            continue;
+        }
+        for inst in &mut block.instructions {
+            if matches!(inst, Instruction::Phi { .. }) && bi == m.exit {
+                continue;
+            }
+            inst.for_each_operand_mut(|op| {
+                if *op == Operand::Value(m.r_out) {
+                    *op = Operand::Value(v_res);
+                }
+            });
+            inst.for_each_value_use_mut(|u| {
+                if *u == m.r_out {
+                    *u = v_res;
+                }
+            });
+        }
+        match &mut block.terminator {
+            Terminator::Return(Some(Operand::Value(v)))
+            | Terminator::CondBranch {
+                cond: Operand::Value(v),
+                ..
+            }
+            | Terminator::Switch {
+                val: Operand::Value(v),
+                ..
+            }
+            | Terminator::IndirectBranch {
+                target: Operand::Value(v),
+                ..
+            } => {
+                if *v == m.r_out {
+                    *v = v_res;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let dead_labels: FxHashSet<BlockId> = body.iter().map(|&b| func.blocks[b].label).collect();
+    func.blocks.retain(|b| !dead_labels.contains(&b.label));
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                incoming.retain(|(_, lbl)| !dead_labels.contains(lbl));
+            }
+        }
+    }
     true
 }
 
@@ -4334,5 +5158,150 @@ mod tests {
         }
         assert_eq!(run_function(&mut f), 0, "x >>= 2 does not count ctz");
         assert!(!has_ctz_nonzero(&f));
+    }
+
+    fn popcnt_while_func(init_count: i32) -> IrFunction {
+        let mut f = IrFunction::new("popcnt_test".into(), IrType::I32, vec![], false);
+        f.blocks = vec![
+            block(
+                0,
+                vec![Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::U64,
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![
+                    Instruction::Phi {
+                        dest: Value(10),
+                        ty: IrType::U64,
+                        incoming: vec![(val(1), BlockId(0)), (val(12), BlockId(2))],
+                    },
+                    Instruction::Phi {
+                        dest: Value(11),
+                        ty: IrType::I32,
+                        incoming: vec![(i32c(init_count), BlockId(0)), (val(13), BlockId(2))],
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: val(10),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(14),
+                        op: IrBinOp::Sub,
+                        lhs: val(10),
+                        rhs: Operand::Const(IrConst::I64(1)),
+                        ty: IrType::U64,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(12),
+                        op: IrBinOp::And,
+                        lhs: val(10),
+                        rhs: val(14),
+                        ty: IrType::U64,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(13),
+                        op: IrBinOp::Add,
+                        lhs: val(11),
+                        rhs: i32c(1),
+                        ty: IrType::I32,
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(3, vec![], Terminator::Return(Some(val(11)))),
+        ];
+        f.next_value_id = 20;
+        f
+    }
+
+    fn has_popcount(f: &IrFunction) -> bool {
+        f.blocks.iter().any(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(
+                    i,
+                    Instruction::UnaryOp {
+                        op: IrUnaryOp::Popcount,
+                        ..
+                    }
+                )
+            })
+        })
+    }
+
+    #[test]
+    fn popcount_while_loop_rewrites_when_fast_popcount_enabled() {
+        let _flag = crate::test_support::ScopedFlag::new(
+            fast_popcount_enabled,
+            set_fast_popcount_enabled,
+            true,
+        );
+        let mut f = popcnt_while_func(0);
+        assert_eq!(run_function(&mut f), 1);
+        assert!(has_popcount(&f));
+        assert_eq!(f.blocks.len(), 2);
+    }
+
+    #[test]
+    fn popcount_while_loop_adds_nonzero_initial_count() {
+        let _flag = crate::test_support::ScopedFlag::new(
+            fast_popcount_enabled,
+            set_fast_popcount_enabled,
+            true,
+        );
+        let mut f = popcnt_while_func(7);
+        assert_eq!(run_function(&mut f), 1);
+        assert!(has_popcount(&f));
+        let has_add = f.blocks.iter().any(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(
+                    i,
+                    Instruction::BinOp {
+                        op: IrBinOp::Add,
+                        lhs: Operand::Const(IrConst::I32(7)),
+                        ty: IrType::I32,
+                        ..
+                    }
+                )
+            })
+        });
+        assert!(has_add);
+    }
+
+    #[test]
+    fn popcount_while_loop_refused_when_fast_popcount_disabled() {
+        let _flag = crate::test_support::ScopedFlag::new(
+            fast_popcount_enabled,
+            set_fast_popcount_enabled,
+            false,
+        );
+        let mut f = popcnt_while_func(0);
+        assert_eq!(run_function(&mut f), 0);
+        assert!(!has_popcount(&f));
+    }
+
+    #[test]
+    fn popcount_while_loop_refused_when_not_clear_lsb() {
+        let _flag = crate::test_support::ScopedFlag::new(
+            fast_popcount_enabled,
+            set_fast_popcount_enabled,
+            true,
+        );
+        let mut f = popcnt_while_func(0);
+        if let Instruction::BinOp { rhs, .. } = &mut f.blocks[2].instructions[0] {
+            *rhs = Operand::Const(IrConst::I64(2));
+        }
+        assert_eq!(run_function(&mut f), 0);
+        assert!(!has_popcount(&f));
     }
 }

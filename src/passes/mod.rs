@@ -3510,7 +3510,18 @@ pub(crate) fn run_passes(
     // Producer ranges survive copies/casts without conflating carrier widths.
     // Run after transformations that reason about signed integer domains.
     if !pass_disabled(&disabled, "intbounds") {
-        module.for_each_function(integer_bounds::run);
+        module.for_each_function(|f| {
+            let changed = integer_bounds::run(f);
+            if changed != 0 {
+                if !pass_disabled(&disabled, "copyprop") {
+                    copy_prop::propagate_copies(f);
+                }
+                if !pass_disabled(&disabled, "dce") {
+                    dce::eliminate_dead_code(f);
+                }
+            }
+            changed
+        });
         verify::verify_after_pass(module, "intbounds");
     }
 
