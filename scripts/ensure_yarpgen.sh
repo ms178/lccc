@@ -122,4 +122,11 @@ if ! probe "$BIN"; then
 fi
 write_stamp
 echo "ensure_yarpgen: provisioned $BIN (ref ${REF:0:12}, probe ok)" >&2
-[ "$print_bin" = 1 ] && echo "$BIN"
+# NOT `[ ... ] && echo`: as the last command that returns 1 whenever
+# --print-bin is absent, so a successful first-time provision reported
+# failure to every `set -e` caller. Reported by
+# tests/regression/check_ensure_yarpgen.sh (fresh-provision).
+if [ "$print_bin" = 1 ]; then
+    echo "$BIN"
+fi
+exit 0

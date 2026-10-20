@@ -157,57 +157,31 @@ impl<'a> SemaConstEval<'a> {
                     return Some(IrConst::I128(bits ^ i128::MIN));
                 }
                 let is_unsigned = self.is_expr_unsigned(inner);
-                let promoted = shared_const_eval::promote_sub_int(val, is_unsigned);
-                let result = const_arith::negate_const(promoted)?;
-                // C11 6.5.3.3p1 + 6.3.1.3p2: `-x` has the operand's
-                // promoted type; an unsigned result reduces mod 2^width.
-                // A 32-bit unsigned operand rides an I64 carrier, so
-                // carrier wrapping_neg computes -x mod 2^64, not 2^32
-                // (miscompiled YARPGen seed 101); mask it like BitNot.
-                if is_unsigned {
-                    let inner_ctype = self
-                        .lookup_expr_type(inner)
-                        .or_else(|| self.infer_expr_ctype(inner));
-                    let is_32bit_type = inner_ctype
-                        .as_ref()
-                        .map_or(false, |ct| self.ctype_size(ct) == 4);
-                    if is_32bit_type {
-                        if let IrConst::I64(v) = result {
-                            return Some(IrConst::I64(v as u32 as i64));
-                        }
-                    }
-                }
-                Some(result)
+                // C11 6.5.3.3p1 + 6.3.1.3p2: `-x` has the operand's promoted
+                // type, and an unsigned result reduces modulo 2^width of that
+                // type. The rule (including the 64-bit-carrier reduction)
+                // lives in the shared folder so the sema and lowering
+                // evaluators cannot drift: they used to ask the same
+                // question two different ways.
+                shared_const_eval::negate_const_promoted(
+                    val,
+                    is_unsigned,
+                    self.operand_size_for_unary(inner),
+                )
             }
             Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
                 let is_unsigned = self.is_expr_unsigned(inner);
-                let promoted = shared_const_eval::promote_sub_int(val, is_unsigned);
-                let result = const_arith::bitnot_const(promoted)?;
-                // For unsigned int operands (stored as I64 to preserve unsigned range),
-                // the bitwise NOT must be truncated to 32 bits. Without this, ~0u
-                // produces I64(-1) (all 64 bits set) instead of I64(0xFFFFFFFF).
-                // Check the promoted type's actual width via the inner expression type.
-                let inner_ctype = self
-                    .lookup_expr_type(inner)
-                    .or_else(|| self.infer_expr_ctype(inner));
-                let is_32bit_type =
-                    inner_ctype
-                        .as_ref()
-                        .map_or(matches!(result, IrConst::I32(_)), |ct| {
-                            let size = self.ctype_size(ct);
-                            size <= 4
-                        });
-                if is_32bit_type && is_unsigned {
-                    // Truncate to 32-bit unsigned: mask to 0xFFFFFFFF and store as I64
-                    if let Some(v) = result.to_i64() {
-                        Some(IrConst::I64(v as u32 as i64))
-                    } else {
-                        Some(result)
-                    }
-                } else {
-                    Some(result)
-                }
+                // C11 6.5.3.3p4: `~x` likewise has the operand's promoted
+                // type, so `~0u` is 0xFFFFFFFF (I64 carrier) and not
+                // 0xFFFFFFFF_00000000, which used to flip a short-circuit
+                // use (regress_logical_and_const_bitnot_short_circuit).
+                // Single definition, shared with the lowering folder.
+                shared_const_eval::bitnot_const_promoted(
+                    val,
+                    is_unsigned,
+                    self.operand_size_for_unary(inner),
+                )
             }
 
             // Logical NOT
@@ -401,7 +375,7 @@ impl<'a> SemaConstEval<'a> {
                 // already dropped.  Found by the resurrected YARPGen
                 // engine (seed 20261023; regress_const_bool_cast_zero_lowbyte).
                 if matches!(target_ctype, CType::Bool) {
-                    return Some(IrConst::I32(if bits != 0 { 1 } else { 0 }));
+                    return Some(shared_const_eval::c_bool_const(bits));
                 }
 
                 // Truncate to target width
@@ -731,7 +705,7 @@ impl<'a> SemaConstEval<'a> {
                 // source bits, not by truncation to 8 bits (C11 6.3.1.2;
                 // see the Cast arm in eval_const_expr).
                 if matches!(target_ctype, CType::Bool) {
-                    return Some((u64::from(bits != 0), false));
+                    return Some((u64::from(shared_const_eval::c_bool_truth(bits)), false));
                 }
                 let target_width = self.ctype_size(&target_ctype) * 8;
                 let target_signed = !target_ctype.is_unsigned() && !target_ctype.is_pointer_like();
@@ -953,6 +927,19 @@ impl<'a> SemaConstEval<'a> {
         ctype.size_ctx(&*self.types.borrow_struct_layouts())
     }
 
+    /// Size in bytes of `inner`'s type, when a type is known.
+    ///
+    /// This is the width a unary `-`/`~` fold must reduce to (C11
+    /// 6.3.1.3p2). Both constant folders ask this of the same operand, so
+    /// the resolution order is spelled once, here: the sema type map
+    /// first, then AST-level inference -- the same order every cast path
+    /// in this file uses.
+    fn operand_size_for_unary(&self, inner: &Expr) -> Option<usize> {
+        self.lookup_expr_type(inner)
+            .or_else(|| self.infer_expr_ctype(inner))
+            .map(|ct| self.ctype_size(&ct))
+    }
+
     /// Check if an expression has an unsigned type, using the expr_types cache
     /// or falling back to type inference from the AST structure.
     fn is_expr_unsigned(&self, expr: &Expr) -> bool {
@@ -1095,7 +1082,7 @@ impl<'a> SemaConstEval<'a> {
                     // cast path: truth is a property of the FULL value --
                     // (unsigned __int128)1 << 100 has zero low 64 bits but
                     // converts to _Bool 1.
-                    IrConst::I32(if v128 != 0 { 1 } else { 0 })
+                    shared_const_eval::c_bool_const_i128(v128)
                 } else if !target_signed {
                     IrConst::I32(bits_lo as u8 as i32)
                 } else {

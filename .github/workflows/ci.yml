@@ -515,6 +515,12 @@ jobs:
         python3 scripts/slice_superopt.py --self-test
         python3 scripts/yarpgen_mutpair.py --self-test
         python3 -m unittest scripts.test_mutpair scripts.test_slice_superopt scripts.test_yarpgen_mutpair
+    # The provisioner is the only thing between the differential harness
+    # and a generator that silently does not exist.  Its contract test is
+    # offline (git/cmake are PATH shims), so it costs seconds here; the
+    # real generator is exercised by the yarpgen job below.
+    - name: Verify the YARPGen provisioner contract (offline, no network)
+      run: bash tests/regression/check_ensure_yarpgen.sh
     - name: Verify binary-equivalence attribution contracts
       run: python3 tests/corpus/test_binary_equivalence.py
     - name: Verify benchmark harness oracle and timing contracts
@@ -1555,6 +1561,10 @@ jobs:
         python3 scripts/audit_census.py --selftest
         python3 scripts/audit_census.py --check
         python3 scripts/check_peephole_directive_step.py
+        # The architectural implicit-operand table is the single source of
+        # truth for every pass that reasons about registers an instruction
+        # does not name; its fixture is reviewed independently of the code.
+        python3 scripts/check_implicit_operand_matrix.py
         python3 scripts/check_pr_claim_fidelity.py
         bash tests/regression/check_ra_web_inloop_use.sh
         bash tests/regression/check_store_alu_cross_join.sh
