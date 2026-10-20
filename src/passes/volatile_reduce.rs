@@ -54,7 +54,9 @@ fn should_skip_for_compile_time(func: &IrFunction) -> bool {
     if func.blocks.len() > MAX_BLOCKS_BUDGET {
         eprintln!(
             "volatile_reduce: skipping {}: {} blocks > {} (budget)",
-            func.name, func.blocks.len(), MAX_BLOCKS_BUDGET
+            func.name,
+            func.blocks.len(),
+            MAX_BLOCKS_BUDGET
         );
         return true;
     }
@@ -436,7 +438,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         return 0;
     }
     if lanes != LANES {
-        eprintln!("volatile_reduce: non-default lanes={lanes} requested but only {LANES} is validated; using {LANES}");
+        eprintln!(
+            "volatile_reduce: non-default lanes={lanes} requested but only {LANES} is validated; using {LANES}"
+        );
     }
     if should_skip_for_compile_time(func) {
         return 0;
