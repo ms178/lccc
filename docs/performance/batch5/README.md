@@ -2,6 +2,12 @@
 
 ## Find-bit and SHA follow-ups
 
+**Current recovered-source results:** see [followups.md](followups.md) and
+[followup-screening.json](followup-screening.json). The fresh 15-round screen
+confirms SHA and scaled find-bit gains; all 46 workload outputs match.
+The earlier recovery warnings below describe provenance, not a current build
+failure. Hosted status is tracked on PR #886.
+
 The cumulative work includes the original PR #886 through 8547b16 plus the
 following follow-ups. After the sandbox failure, its restored snapshot only
 contained the original PR. The follow-up source and tests were reconstructed
