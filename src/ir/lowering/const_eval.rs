@@ -194,9 +194,23 @@ impl Lowerer {
                         return Some(IrConst::I128(toggled as i128));
                     }
                 }
-                let promoted =
-                    shared_const_eval::promote_sub_int(val, self.is_expr_unsigned_for_const(inner));
-                const_arith::negate_const(promoted)
+                let is_unsigned = self.is_expr_unsigned_for_const(inner);
+                let promoted = shared_const_eval::promote_sub_int(val, is_unsigned);
+                let result = const_arith::negate_const(promoted)?;
+                // C11 6.5.3.3p1 + 6.3.1.3p2: `-x` has the promoted type of
+                // the operand, and an unsigned result is reduced modulo
+                // 2^width. A 32-bit unsigned operand is carried as I64, so
+                // wrapping_neg on the carrier computes -x mod 2^64 instead
+                // of mod 2^32: -(3844603080U) folded to
+                // 18446744069864948536 instead of 450364216 (YARPGen seed
+                // 101). Mirror of the BitNot arm's truncation below and of
+                // the sema const evaluator's Neg arm.
+                if is_unsigned && self.infer_expr_type(inner).size() == 4 {
+                    if let IrConst::I64(v) = result {
+                        return Some(IrConst::I64((v as u32) as i64));
+                    }
+                }
+                Some(result)
             }
             Expr::BinaryOp(op, lhs, rhs, _) => {
                 let l = self.eval_const_expr(lhs);
@@ -1062,6 +1076,12 @@ impl Lowerer {
         match expr {
             Expr::Cast(target_type, inner, _, _) => {
                 let (bits, _src_signed) = self.eval_const_expr_as_bits(inner)?;
+                // _Bool: value semantics (nonzero -> 1) over the FULL
+                // source bits, never bit-truncation to width 8
+                // (C11 6.3.1.2; mirror of the sema eval_const_expr fix).
+                if self.type_spec_to_ctype(target_type) == CType::Bool {
+                    return Some((u64::from(bits != 0), false));
+                }
                 let target_ir_ty = self.type_spec_to_ir(target_type);
                 let target_width = target_ir_ty.size() * 8;
                 let target_signed = matches!(

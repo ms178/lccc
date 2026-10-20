@@ -896,6 +896,33 @@ gate "differential-fuzz-smoke" fast \
     python3 scripts/fuzz_diff.py --engine synthetic --count 4 \
         --lccc "$LCCC" --refs gcc --opts=-O0,-O2 --seed 20260906
 
+# Missed-alarm pairs (scripts/mutpair.py): execution-filtered known-inequivalent
+# / known-equivalent near-miss pairs in one TU, plus the harness's own
+# negative control (a fake optimiser must be caught) in the unit tests.
+gate "mutpair-harness-tests" fast \
+    sh -c 'python3 scripts/mutpair.py --self-test && python3 -m unittest scripts.test_mutpair -v'
+
+gate "mutpair-differential-smoke" fast \
+    python3 scripts/fuzz_diff.py --engine mutpair --count 4 \
+        --lccc "$LCCC" --refs gcc --opts=-O0,-O2 --seed 20261019
+
+# Minotaur-lite slice superoptimiser (scripts/slice_superopt.py): exhaustive
+# 8-bit refinement proofs + wider-width gate, with missed-alarm negative
+# controls.  Research tooling only -- no candidate is auto-applied to codegen.
+gate "slice-superopt-tests" fast \
+    sh -c 'python3 scripts/slice_superopt.py --self-test && python3 -m unittest scripts.test_slice_superopt -v'
+
+# Real-YARPGen missed-alarm pairs (scripts/yarpgen_mutpair.py): unit tests
+# run everywhere via a stub generator; the smoke gate judges real pairs
+# when intel/yarpgen is provisioned (scripts/ensure_yarpgen.sh) and SKIPs
+# explicitly otherwise -- an unprovisioned generator must never be a
+# silent pass OR a spurious failure.
+gate "yarpgen-mutpair-tests" fast \
+    sh -c 'python3 scripts/yarpgen_mutpair.py --self-test && python3 -m unittest scripts.test_yarpgen_mutpair -v'
+
+gate "yarpgen-pair-smoke" fast \
+    python3 scripts/yarpgen_mutpair.py --ci-smoke --lccc "$LCCC" --refs gcc
+
 gate "strict-computed-recip-codegen" fast \
     bash tests/regression/check_strict_computed_recip_codegen.sh
 
@@ -1081,6 +1108,11 @@ gate "destructive-path-guards" fast bash tests/regression/check_destructive_guar
 
 gate "tls-model-selection" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_selection.sh
+
+# Hermetic oracle self-tests for the TLS runtime comparison harness
+# (no compiler required).  Mirrors the hosted step that ran it
+# without a ci_local counterpart (parity break on main).
+gate "tls-runtime-oracle" fast bash tests/regression/check_tls_runtime_oracle.sh
 
 gate "tls-model-option" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_option.sh

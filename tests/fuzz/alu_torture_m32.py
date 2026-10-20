@@ -119,9 +119,16 @@ u32 probe(void) {
         u32 e = edges[i];
         pin8 = e; pin16 = e; pin32 = e;
         vi8 = (u8)e; vi16 = (u16)e; vi32 = e;
-        mix((u32)t_clz8(vi8));
-        mix((u32)t_clz16(vi16));
-        mix((u32)t_clz32(vi32));
+        /* clz(0) is UB exactly like ctz(0) below: __builtin_clz(0) may
+           return the operand width (lzcnt semantics, what lccc emits),
+           31 (the bsr-based sequence GCC emits at -O2 -m32), or anything
+           else. The unguarded calls here made the whole probe diverge at
+           -O2 on the very first edge value (e=0) while matching at -Os,
+           which masqueraded as an lccc miscompile. Guard clz the same way
+           ctz is guarded. */
+        if ((u8)e)  mix((u32)t_clz8(vi8));
+        if ((u16)e) mix((u32)t_clz16(vi16));
+        if (e)      mix((u32)t_clz32(vi32));
         /* ctz(0) is UB in C: only test truncated-nonzero values (e.g.
            e=0x10000 truncates to 0 in u16 — skipping those keeps the
            differential oracle well-defined for both compilers). */
@@ -159,17 +166,27 @@ u32 probe(void) {
         mix(t_udiv_0xAAAAAAAB(x));
         mix(t_urem7(x)); mix(t_urem10(x)); mix(t_urem8(x));
     }
-    /* f32 negation: assorted bit patterns incl. 0, -0, inf, nan, denormal */
+    /* f32 negation: assorted bit patterns incl. 0, -0, inf, nan, denormal.
+       The bit reinterpretation MUST go through memcpy: the original
+       *(const float *)&pinf / *(const u32 *)&vfout casts violate the
+       effective-type rules, and GCC -O2 uses TBAA to fold the u32 read of
+       vfout to its initial value 0, diverging from lccc's may-alias read
+       of the real bits -- another UB-oracle false alarm. __builtin_memcpy
+       keeps the freestanding probe libc-free. */
     static const u32 fbits[] = {0u, 0x80000000u, 0x3f800000u, 0xbf800000u,
         0x7f800000u, 0xff800000u, 0x7fc00000u, 0x00000001u, 0x41234567u};
     for (int i = 0; i < (int)(sizeof(fbits)/sizeof(fbits[0])); i++) {
         pinf = fbits[i];
-        vfin = *(const float *)&pinf;
+        __builtin_memcpy(&vfin, (const void *)&pinf, sizeof(vfin));
         t_fneg();
-        pinf = vfout == 0.0f ? (vfout == 0.0f ? 0u : 1u) : *(const u32 *)&vfout;
-        mix(pinf);  /* -0 vs 0 must distinguish: compare via bits */
-        t_fnegm(*(const float *)&fbits[i]);
-        pinf = *(const u32 *)&vfout;
+        __builtin_memcpy(&pinf, &vfout, sizeof(pinf));
+        mix(pinf);  /* -0 vs 0 distinguishable via the bits mixed here */
+        {
+            float fin;
+            __builtin_memcpy(&fin, &fbits[i], sizeof(fin));
+            t_fnegm(fin);
+        }
+        __builtin_memcpy(&pinf, &vfout, sizeof(pinf));
         mix(pinf);
     }
     va = 12345; vb = -7; vc = 0;

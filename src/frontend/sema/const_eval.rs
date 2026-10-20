@@ -156,9 +156,28 @@ impl<'a> SemaConstEval<'a> {
                     };
                     return Some(IrConst::I128(bits ^ i128::MIN));
                 }
-                let promoted =
-                    shared_const_eval::promote_sub_int(val, self.is_expr_unsigned(inner));
-                const_arith::negate_const(promoted)
+                let is_unsigned = self.is_expr_unsigned(inner);
+                let promoted = shared_const_eval::promote_sub_int(val, is_unsigned);
+                let result = const_arith::negate_const(promoted)?;
+                // C11 6.5.3.3p1 + 6.3.1.3p2: `-x` has the operand's
+                // promoted type; an unsigned result reduces mod 2^width.
+                // A 32-bit unsigned operand rides an I64 carrier, so
+                // carrier wrapping_neg computes -x mod 2^64, not 2^32
+                // (miscompiled YARPGen seed 101); mask it like BitNot.
+                if is_unsigned {
+                    let inner_ctype = self
+                        .lookup_expr_type(inner)
+                        .or_else(|| self.infer_expr_ctype(inner));
+                    let is_32bit_type = inner_ctype
+                        .as_ref()
+                        .map_or(false, |ct| self.ctype_size(ct) == 4);
+                    if is_32bit_type {
+                        if let IrConst::I64(v) = result {
+                            return Some(IrConst::I64(v as u32 as i64));
+                        }
+                    }
+                }
+                Some(result)
             }
             Expr::UnaryOp(UnaryOp::BitNot, inner, _) => {
                 let val = self.eval_const_expr(inner)?;
@@ -371,6 +390,18 @@ impl<'a> SemaConstEval<'a> {
                         bits as i128
                     };
                     return Some(IrConst::I128(v128));
+                }
+
+                // _Bool conversion is by VALUE (C11 6.3.1.2: nonzero -> 1),
+                // never by bit truncation: it must see the FULL source
+                // bits.  Truncating to 8 bits first folds (_Bool)256,
+                // (_Bool)65536 and (_Bool)67106816ULL to 0 -- the dual of
+                // the (_Bool)61-stays-61 bug fixed in bits_to_irconst,
+                // whose normalization never sees the bits this truncation
+                // already dropped.  Found by the resurrected YARPGen
+                // engine (seed 20261023; regress_const_bool_cast_zero_lowbyte).
+                if matches!(target_ctype, CType::Bool) {
+                    return Some(IrConst::I32(if bits != 0 { 1 } else { 0 }));
                 }
 
                 // Truncate to target width
@@ -696,6 +727,12 @@ impl<'a> SemaConstEval<'a> {
             Expr::Cast(target_type, inner, _, _) => {
                 let (bits, _src_signed) = self.eval_const_expr_as_bits(inner)?;
                 let target_ctype = self.type_spec_to_ctype(target_type);
+                // _Bool: the value is 0/1 by truthiness of the FULL
+                // source bits, not by truncation to 8 bits (C11 6.3.1.2;
+                // see the Cast arm in eval_const_expr).
+                if matches!(target_ctype, CType::Bool) {
+                    return Some((u64::from(bits != 0), false));
+                }
                 let target_width = self.ctype_size(&target_ctype) * 8;
                 let target_signed = !target_ctype.is_unsigned() && !target_ctype.is_pointer_like();
                 Some(const_arith::truncate_and_extend_bits(
@@ -1054,8 +1091,11 @@ impl<'a> SemaConstEval<'a> {
             0 => return None, // void cast
             1 => {
                 if matches!(target, CType::Bool) {
-                    // C11 6.3.1.2 _Bool normalization for the I128-source cast path.
-                    IrConst::I32(if bits_lo != 0 { 1 } else { 0 })
+                    // C11 6.3.1.2 _Bool normalization for the I128-source
+                    // cast path: truth is a property of the FULL value --
+                    // (unsigned __int128)1 << 100 has zero low 64 bits but
+                    // converts to _Bool 1.
+                    IrConst::I32(if v128 != 0 { 1 } else { 0 })
                 } else if !target_signed {
                     IrConst::I32(bits_lo as u8 as i32)
                 } else {

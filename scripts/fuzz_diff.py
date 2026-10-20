@@ -42,6 +42,12 @@ Engines Supported:
                     memcpy type-punning). Its own Vellvm-style byte model is
                     the oracle, so it needs NO reference compiler; SKIPs on
                     non-x86-64 hosts (the model encodes little-endian x86-64).
+ 15. mutpair      : scripts/mutpair.py missed-alarm pairs (Regehr/Livinskii
+                    transplant): a UB-free function plus a one-edit mutant,
+                    execution-filtered so the pair is *known* inequivalent
+                    (or known equivalent); both result columns are printed
+                    and judged by the standard reference oracle, catching
+                    optimisers that collapse distinct computations.
 
 The tests/fuzz engines use two absorption mechanisms, both preserving the
 standalone scripts byte-for-byte: generator-config engines (5-7) import the
@@ -283,6 +289,19 @@ def _signal_name(rc: int) -> str:
         return f"signal {-rc}"
 
 
+def _save_repro(repro_dir: Path, repro_file: Path, unit: CompileUnit, primary: str) -> None:
+    """Save a failing case: primary file at the historical path, siblings
+    alongside it.  Multi-file units (YARPGen driver.c+func.c+init.h) used
+    to save only the primary file, which does not compile stand-alone --
+    a reproducer that cannot reproduce anything."""
+    repro_dir.mkdir(parents=True, exist_ok=True)
+    repro_file.write_text(unit.files[primary])
+    stem = repro_file.name[:-2] if repro_file.name.endswith(".c") else repro_file.name
+    for name, contents in sorted(unit.files.items()):
+        if name != primary:
+            (repro_dir / f"{stem}_{name}").write_text(contents)
+
+
 def evaluate_single_test(
     test_id: str,
     unit: CompileUnit,
@@ -307,7 +326,12 @@ def evaluate_single_test(
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(contents)
 
-        source_names = sorted(unit.files)
+        # Compiler inputs are the .c files; headers ride along in the
+        # case directory for #include but must not be passed as
+        # translation units (a header-as-TU is at best a stray PCH, at
+        # worst a hard error -- YARPGen cases carry init.h).
+        source_names = [n for n in sorted(unit.files) if n.endswith(".c")] \
+            or sorted(unit.files)
         primary = source_names[0]
 
         for opt in opt_levels:
@@ -350,8 +374,7 @@ def evaluate_single_test(
                                                      env_extra=env_extra)
                             if l_rc == ref_rc:
                                 repro_file = repro_dir / f"genbug_{test_id}_{opt}.c"
-                                repro_dir.mkdir(parents=True, exist_ok=True)
-                                repro_file.write_text(unit.files[primary])
+                                _save_repro(repro_dir, repro_file, unit, primary)
                                 return DiffResult(
                                     test_id,
                                     "GEN-BUG",
@@ -382,8 +405,7 @@ def evaluate_single_test(
                                        env_extra=env_extra)
             if rc != 0:
                 repro_file = repro_dir / f"crash_{test_id}_{opt}.c"
-                repro_dir.mkdir(parents=True, exist_ok=True)
-                repro_file.write_text(unit.files[primary])
+                _save_repro(repro_dir, repro_file, unit, primary)
                 return DiffResult(
                     test_id,
                     "LCCC_CRASH",
@@ -398,8 +420,7 @@ def evaluate_single_test(
 
             if lccc_rc != ref_baseline[0] or lccc_out != ref_baseline[1] or lccc_err != ref_baseline[2]:
                 repro_file = repro_dir / f"miscompile_{test_id}_{opt}.c"
-                repro_dir.mkdir(parents=True, exist_ok=True)
-                repro_file.write_text(unit.files[primary])
+                _save_repro(repro_dir, repro_file, unit, primary)
                 msg = (f"output mismatch vs {','.join(ref_compilers)}: "
                        f"ref={ref_baseline[1].strip()!r} (rc={ref_baseline[0]}) "
                        f"vs lccc={lccc_out.strip()!r} (rc={lccc_rc})")
@@ -516,22 +537,83 @@ def run_yarpgen_pool(
         case_seed = int(test_id.split("_", 1)[1])
         with tempfile.TemporaryDirectory(prefix=f"yarpgen_{case_seed}_") as gendir:
             rc, out, err = run_command(
-                [yarpgen_bin, "--std=c", "--seed", str(case_seed), "-o", gendir],
+                # --max-array-dims=3: unconstrained multi-dim arrays reach
+                # tens-of-GB BSS (seed 424242: ~25 GB) that no host memory
+                # model links; upstream offers the knob for exactly such
+                # hosts.  Oversized survivors still SKIP via the
+                # reference-build-failure path, never FAIL.
+                [yarpgen_bin, "--std=c", f"--seed={case_seed}",
+                 "--max-array-dims=3", "-o", gendir],  # yarpgen options require = form
                 timeout=compile_timeout,
             )
             if rc != 0:
                 raise RuntimeError(f"yarpgen generation failed (seed {case_seed}): {(err or out).strip()[:200]}")
+            # Collect EVERY emitted source file.  Both public YARPGen
+            # lines (intel/yarpgen v1 scalar and main loop versions) emit
+            # driver.c + func.c + init.h, and both .c files #include
+            # "init.h" -- the old fixed list (driver.c/func.c/proto.h/
+            # data.h) silently dropped init.h, so no yarpgen case could
+            # ever compile: the engine tested nothing while looking
+            # wired.  Globbing is robust to future emitted files; the
+            # required-set check below fails loudly with what was found.
             files: dict[str, str] = {}
-            for name in ("driver.c", "func.c", "proto.h", "data.h"):
-                p = Path(gendir) / name
-                if p.is_file():
-                    files[name] = p.read_text(errors="replace")
-        if "driver.c" not in files or "func.c" not in files:
-            raise RuntimeError(f"yarpgen did not produce driver.c/func.c (seed {case_seed})")
+            for p in sorted(Path(gendir).iterdir()):
+                if p.is_file() and p.suffix in (".c", ".h"):
+                    files[p.name] = p.read_text(errors="replace")
+        required = {"driver.c", "func.c", "init.h"}
+        if not required.issubset(files):
+            raise RuntimeError(
+                f"yarpgen output incomplete (seed {case_seed}): "
+                f"need {sorted(required)}, found {sorted(files)}")
         # YARPGen programs target C99 semantics.
         return CompileUnit(files=files, extra_flags=["-std=c99", "-w"])
 
     return _generate_and_evaluate("yarpgen", count, seed, workers, evaluate, generate)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mutpair engine (missed-alarm pairs; see scripts/mutpair.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_mutpair_pool(
+    count: int,
+    seed: int,
+    workers: int,
+    evaluate,
+) -> list[DiffResult]:
+    """Regehr/Livinskii missed-alarm pairs as ordinary differential cases.
+
+    Each generated program contains a UB-free function and a one-edit mutant
+    whose outputs are *known* (execution-filtered Python model in
+    scripts/mutpair.py) to differ on some input -- or to agree everywhere,
+    for equivalent-by-construction mutants.  main() prints both result
+    columns, so the standard reference oracle judges the pair: if LCCC's
+    optimiser collapses an inequivalent pair or breaks an equivalent one,
+    its two columns diverge from every reference's.  The standalone
+    scripts/mutpair.py driver additionally judges against the Python model
+    itself, which stays meaningful even if all references shared a bug.
+    """
+    scripts_dir = str(Path(__file__).resolve().parent)
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import mutpair
+
+    def generate(test_id: str) -> CompileUnit:
+        case_seed = int(test_id.split("_", 1)[1])
+        # Discarded pairs (semantically no-op mutations) advance the seed
+        # deterministically; bounded so one case can never spin forever.
+        # case_seed * 200 + probe is injective over (case, probe) pairs, so
+        # two cases can never silently test the identical pair (the old
+        # case_seed + probe * 1_000_003 collided once iterations exceeded
+        # the stride).
+        for probe in range(200):
+            pair = mutpair.make_pair(case_seed * 200 + probe)
+            if pair is not None:
+                return CompileUnit(files={"test.c": mutpair.pair_to_c(pair)},
+                                   extra_flags=["-std=c99", "-w"])
+        raise RuntimeError(f"mutpair execution filter rejected 200 pairs (seed {case_seed})")
+
+    return _generate_and_evaluate("mutpair", count, seed, workers, evaluate, generate)
 
 
 def _generate_and_evaluate(engine: str, count: int, seed: int, workers: int, evaluate, generate) -> list[DiffResult]:
@@ -1074,6 +1156,7 @@ _ENGINE_RUNNERS = {
     "alu_torture": functools.partial(run_standalone_engine, "alu_torture"),
     "aarch64": functools.partial(run_standalone_engine, "aarch64"),
     "punning": functools.partial(run_standalone_engine, "punning"),
+    "mutpair": run_mutpair_pool,
 }
 
 # Every legacy engine's backing file in tests/fuzz (verified by
@@ -1463,6 +1546,8 @@ def main() -> int:
         results = run_phi_cfg_pool(count, seed, args.workers, evaluate)
     elif args.engine == "intcmp_thread":
         results = run_intcmp_pool(count, seed, args.workers, evaluate)
+    elif args.engine == "mutpair":
+        results = run_mutpair_pool(count, seed, args.workers, evaluate)
     elif args.engine in _STANDALONE_FUZZ_ENGINES:
         results = run_standalone_engine(args.engine, lccc_path, available_refs,
                                         opt_levels, seed, count, repro_dir)
