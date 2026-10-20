@@ -1169,6 +1169,25 @@ pub(super) fn fold_store_relay(store: &mut LineStore, infos: &mut [LineInfo]) ->
 /// again before the next write within a 64-instruction window starting at
 /// `start`. Calls follow `call_window_verdict`; every other barrier
 /// conservatively returns false.
+/// Adjacency may ignore source attribution and blank/comment lines, not
+/// layout, unwind, control-flow or protected instructions. Share this walk
+/// between the memory fold and its redundant-reload protection predicate.
+#[inline]
+fn next_memfold_instruction(
+    store: &LineStore,
+    infos: &[LineInfo],
+    mut i: usize,
+    len: usize,
+) -> usize {
+    while i < len
+        && (debug_transparent(store, infos[i], i)
+            || (!infos[i].pinned && infos[i].kind == LineKind::Empty))
+    {
+        i += 1;
+    }
+    i
+}
+
 fn is_reg_dead_after(
     store: &LineStore,
     infos: &[LineInfo],
@@ -1179,13 +1198,24 @@ fn is_reg_dead_after(
     if reg > REG_GP_MAX {
         return false; // fail-closed (also guards the shift below)
     }
-    let scan_limit = (start + 64).min(len);
+    let mut remaining = 64;
     let mask = 1u16 << reg;
     // Complete family names (all 16 fams, every width): the old two-family
     // mini-table fail-closed the relay fold for tmp >= rsi.
     let names = reg_names_family(reg);
     let mut scan = start;
-    while scan < scan_limit {
+    while scan < len {
+        scan = next_memfold_instruction(store, infos, scan, len);
+        if scan == len {
+            break;
+        }
+        // Exhausting a bounded search proves nothing about later readers.
+        // Count real lines, not debug attribution, so -g cannot change this
+        // proof budget. The scan remains bounded by 64 semantic lines.
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
         if infos[scan].is_nop() {
             scan += 1;
             continue;
@@ -1212,7 +1242,12 @@ fn is_reg_dead_after(
         }
         if infos[scan].reg_refs & mask != 0 {
             match infos[scan].kind {
-                LineKind::LoadRbp { reg: r, .. } if r == reg => return true,
+                LineKind::LoadRbp { reg: r, size, .. } if r == reg => {
+                    // Byte/word moves preserve upper bits; an address using
+                    // this family also reads the old value before overwriting.
+                    return matches!(size, MoveSize::Q | MoveSize::L | MoveSize::SLQ)
+                        && !src_mentions_family(infos[scan].trimmed(store.get(scan)), reg);
+                }
                 LineKind::Pop { reg: r } if r == reg => return true,
                 LineKind::Other { dest_reg } if dest_reg == reg => {
                     let t = infos[scan].trimmed(store.get(scan));
@@ -1243,7 +1278,7 @@ fn is_reg_dead_after(
         }
         scan += 1;
     }
-    true // ran out of window = assume dead
+    true // Reached the actual end, not merely the search limit.
 }
 
 /// Liveness for the redundant-reload protection predicate
@@ -1264,24 +1299,38 @@ fn scratch_dead_after_relaxed(
     if reg > REG_GP_MAX {
         return false; // fail-closed (also guards the shift below)
     }
-    let scan_limit = (start + 64).min(len);
+    let mut remaining = 64;
     let mask = 1u16 << reg;
     let names = reg_names_family(reg);
     let mut scan = start;
-    while scan < scan_limit {
+    while scan < len {
+        scan = next_memfold_instruction(store, infos, scan, len);
+        if scan == len {
+            break;
+        }
+        // Exhausting a bounded search proves nothing about later readers.
+        // Count real lines, not debug attribution, so -g cannot change this
+        // proof budget. The scan remains bounded by 64 semantic lines.
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
         if infos[scan].is_nop() {
             scan += 1;
             continue;
         }
         match infos[scan].kind {
             LineKind::Push { reg: r } => {
-                if r == reg {
+                if r == reg || reg == 4 {
                     return false;
                 }
                 scan += 1;
                 continue;
             }
             LineKind::Pop { reg: r } => {
+                if reg == 4 {
+                    return false;
+                }
                 if r == reg {
                     return true;
                 }
@@ -1304,7 +1353,12 @@ fn scratch_dead_after_relaxed(
         }
         if infos[scan].reg_refs & mask != 0 {
             match infos[scan].kind {
-                LineKind::LoadRbp { reg: r, .. } if r == reg => return true,
+                LineKind::LoadRbp { reg: r, size, .. } if r == reg => {
+                    // Byte/word moves preserve upper bits; an address using
+                    // this family also reads the old value before overwriting.
+                    return matches!(size, MoveSize::Q | MoveSize::L | MoveSize::SLQ)
+                        && !src_mentions_family(infos[scan].trimmed(store.get(scan)), reg);
+                }
                 LineKind::Other { dest_reg } if dest_reg == reg => {
                     let t = infos[scan].trimmed(store.get(scan));
                     if t == format!("xorl {}, {}", names[1], names[1]) {
@@ -1422,7 +1476,7 @@ fn resolve_alu_memfold_target(
     load_reg: RegId,
 ) -> Option<(usize, Option<RegId>)> {
     let len = store.len();
-    if j >= len {
+    if j >= len || infos[j].pinned {
         return None;
     }
     // An adjacent Other/Cmp line is the target even if it is not an ALU we
@@ -1440,12 +1494,9 @@ fn resolve_alu_memfold_target(
     let mut k = j;
     let mut moved_dst: Option<RegId> = None;
     for _ in 0..3 {
+        k = next_memfold_instruction(store, infos, k, len);
         if k >= len {
             return None;
-        }
-        if infos[k].is_nop() || infos[k].kind == LineKind::Empty {
-            k += 1;
-            continue;
         }
         let d = is_dst_establishing_move(store, infos, k, load_reg)?;
         if let Some(prev) = moved_dst {
@@ -1454,11 +1505,9 @@ fn resolve_alu_memfold_target(
             }
         }
         moved_dst = Some(d);
-        k += 1;
-        while k < len && (infos[k].is_nop() || infos[k].kind == LineKind::Empty) {
-            k += 1;
-        }
+        k = next_memfold_instruction(store, infos, k + 1, len);
         if k < len
+            && !infos[k].pinned
             && matches!(infos[k].kind, LineKind::Other { .. } | LineKind::Cmp)
             && is_dst_establishing_move(store, infos, k, load_reg).is_none()
         {
@@ -1776,10 +1825,7 @@ pub(super) fn load_would_memfold(store: &LineStore, infos: &[LineInfo], i: usize
     if load_size != MoveSize::Q && load_size != MoveSize::L {
         return false;
     }
-    let mut j = i + 1;
-    while j < len && (infos[j].is_nop() || infos[j].kind == LineKind::Empty) {
-        j += 1;
-    }
+    let j = next_memfold_instruction(store, infos, i + 1, len);
     let Some((alu_j, moved_dst)) = resolve_alu_memfold_target(store, infos, i, j, load_reg) else {
         return false;
     };
@@ -1831,7 +1877,7 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
     let mut i = 0;
 
     while i + 1 < len {
-        if infos[i].is_nop() {
+        if infos[i].is_nop() || infos[i].pinned {
             i += 1;
             continue;
         }
@@ -1856,10 +1902,7 @@ pub(super) fn fold_memory_operands(store: &mut LineStore, infos: &mut [LineInfo]
             }
 
             // Find the next non-NOP, non-empty instruction
-            let mut j = i + 1;
-            while j < len && (infos[j].is_nop() || infos[j].kind == LineKind::Empty) {
-                j += 1;
-            }
+            let mut j = next_memfold_instruction(store, infos, i + 1, len);
             if j >= len {
                 i += 1;
                 continue;
@@ -5133,6 +5176,143 @@ mod rmw_increment_form_tests {
         ];
         for (imm, width, want) in cases {
             assert_eq!(narrow_imm_text(imm, width), want, "{imm} at {width:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod debug_and_pin_memfold_tests {
+    use super::*;
+
+    fn run(asm: &str, pinned: Option<usize>) -> (bool, Vec<String>, bool) {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        if let Some(index) = pinned {
+            infos[index].pinned = true;
+        }
+        let predicted = load_would_memfold(&store, &infos, 0);
+        let changed = fold_memory_operands(&mut store, &mut infos);
+        let output = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect();
+        (changed, output, predicted)
+    }
+
+    #[test]
+    fn debug_directives_preserve_memory_fold_and_prediction() {
+        for gap in [".loc 1 23 4\n", ".file 1 \"kernel.c\"\n.loc 1 23 4\n"] {
+            let asm = format!("movq 176(%rsp), %rax\n{gap}addq %rax, %r11\nmovq $0, %rax\n");
+            let (changed, output, predicted) = run(&asm, None);
+            assert!(predicted && changed, "{output:?}");
+            assert!(output.iter().any(|s| s == "addq 176(%rsp), %r11"));
+            assert!(output.iter().any(|s| s.starts_with(".loc ")));
+        }
+    }
+
+    #[test]
+    fn debug_separated_destination_copy_is_transparent() {
+        let (changed, output, predicted) = run(
+            "movq 32(%rsp), %rcx\n.loc 1 2 0\nmovq %rdx, %r8\n.loc 1 3 0\naddq %rcx, %r8\nmovq $0, %rcx\n",
+            None,
+        );
+        assert!(predicted && changed, "{output:?}");
+        assert!(output.iter().any(|s| s == "addq 32(%rsp), %r8"));
+    }
+
+    #[test]
+    fn pinned_load_or_consumer_cannot_be_half_rewritten() {
+        let asm = "movq 32(%rsp), %rax\naddq %rax, %r11\nmovq $0, %rax\n";
+        for pinned in [0, 1] {
+            let (changed, output, predicted) = run(asm, Some(pinned));
+            assert!(!predicted && !changed, "pin={pinned}: {output:?}");
+            assert_eq!(output, asm.lines().collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn debug_transparency_does_not_cross_layout_or_unwind_barriers() {
+        for barrier in [
+            ".p2align 4,,10",
+            ".cfi_adjust_cfa_offset 8",
+            ".long 42",
+            ".Ljoin:",
+            "call f",
+        ] {
+            let asm = format!(
+                "movq 32(%rsp), %rax\n.loc 1 2 0\n{barrier}\naddq %rax, %r11\nmovq $0, %rax\n"
+            );
+            let (changed, _, predicted) = run(&asm, None);
+            assert!(!changed && !predicted, "crossed {barrier}");
+        }
+    }
+
+    #[test]
+    fn debug_transparency_keeps_width_and_liveness_guards() {
+        for asm in [
+            "movl 32(%rsp), %eax\n.loc 1 2 0\naddq %rax, %r11\nmovq $0, %rax\n",
+            "movq 32(%rsp), %rax\n.loc 1 2 0\naddq %rax, %r11\naddq %rax, %r10\n",
+            "movq 32(%rsp), %rax\n.loc 1 2 0\nmovq %r11, 32(%rsp)\naddq %rax, %r10\nmovq $0, %rax\n",
+        ] {
+            let (changed, _, predicted) = run(asm, None);
+            assert!(!changed && !predicted);
+        }
+    }
+    #[test]
+    fn exhausting_liveness_budget_is_not_a_deadness_proof() {
+        let asm = format!(
+            "movq 32(%rsp), %rax\naddq %rax, %r11\n{}movq %rax, %r9\n",
+            "addq $1, %r10\n".repeat(80)
+        );
+        let (changed, output, predicted) = run(&asm, None);
+        assert!(
+            !changed && !predicted,
+            "live scratch definition deleted: {output:?}"
+        );
+    }
+
+    #[test]
+    fn debug_markers_do_not_consume_liveness_budget() {
+        let asm = format!(
+            "movq 32(%rsp), %rax\naddq %rax, %r11\n{}movq $0, %rax\n",
+            ".loc 1 3 0\n".repeat(80)
+        );
+        let (changed, output, predicted) = run(&asm, None);
+        assert!(
+            changed && predicted,
+            "metadata hid the real kill: {output:?}"
+        );
+    }
+    #[test]
+    fn partial_stack_load_does_not_kill_upper_register_bits() {
+        for (mnemonic, destination) in [("movb", "%al"), ("movw", "%ax")] {
+            let asm = format!(
+                "movq 32(%rsp), %rax\naddq %rax, %r11\n{mnemonic} 8(%rsp), {destination}\nmovq %rax, %r9\n"
+            );
+            let (changed, output, predicted) = run(&asm, None);
+            assert!(!changed && !predicted, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn stack_load_that_reads_the_tracked_base_is_not_a_kill() {
+        let store = LineStore::new("movq 32(%rbp), %rbp\n".to_string());
+        let infos = vec![classify_line(store.get(0))];
+        assert!(!is_reg_dead_after(&store, &infos, 0, 1, 5));
+        assert!(!scratch_dead_after_relaxed(&store, &infos, 0, 1, 5));
+    }
+
+    #[test]
+    fn push_and_pop_read_the_old_stack_pointer() {
+        for line in ["pushq %r8\n", "popq %r8\n", "popq %rsp\n"] {
+            let store = LineStore::new(line.to_string());
+            let infos = vec![classify_line(store.get(0))];
+            assert!(
+                !scratch_dead_after_relaxed(&store, &infos, 0, 1, 4),
+                "{line}"
+            );
         }
     }
 }

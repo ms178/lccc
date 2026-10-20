@@ -12,6 +12,8 @@
 //! stores, FP/signed reassociation and wraparound IVs. The main bound n & ~3 never
 //! exceeds n; its last increment cannot wrap even when n is UINT_MAX.
 use super::loop_analysis;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
+use crate::common::source::Span;
 use crate::common::types::IrType;
 use crate::ir::analysis::CfgAnalysis;
 use crate::ir::reexports::{
@@ -63,6 +65,20 @@ fn should_skip_for_compile_time(func: &IrFunction) -> bool {
     false
 }
 
+// The mask, balanced combine and register-pressure policy are deliberately
+// fixed-four, not a generic unrolling knob.
+const _: () = assert!(LANES == 4);
+
+struct ReductionSpans {
+    iv: Span,
+    accumulator: Span,
+    compare: Span,
+    address: Span,
+    load: Span,
+    reduction: Span,
+    increment: Span,
+}
+
 struct Candidate {
     header: usize,
     preheader: usize,
@@ -74,6 +90,7 @@ struct Candidate {
     reduction: IrBinOp,
     address: Option<Instruction>,
     load: Instruction,
+    spans: ReductionSpans,
 }
 
 fn identity(op: IrBinOp, ty: IrType) -> Option<Operand> {
@@ -90,6 +107,7 @@ fn analyze(
     func: &IrFunction,
     cfg: &CfgAnalysis,
     lp: &loop_analysis::NaturalLoop,
+    costly: &CostlyAddresses,
 ) -> Option<Candidate> {
     if lp.body.len() != 2 {
         return None;
@@ -179,6 +197,9 @@ fn analyze(
     else {
         return None;
     };
+    if costly.contains(ptr.0) {
+        return None;
+    }
     let Instruction::BinOp {
         dest: updated,
         op: reduction,
@@ -255,6 +276,15 @@ fn analyze(
             return None;
         }
     }
+    let span = |block: &BasicBlock, index| {
+        block
+            .source_spans
+            .get(index)
+            .copied()
+            .unwrap_or_else(Span::dummy)
+    };
+    let iv_index =
+        usize::from(matches!(h.instructions[1], Instruction::Phi { dest, .. } if dest == iv));
     Some(Candidate {
         header,
         preheader,
@@ -266,13 +296,40 @@ fn analyze(
         reduction,
         address,
         load: b.instructions[load_idx].clone(),
+        spans: ReductionSpans {
+            iv: span(h, iv_index),
+            accumulator: span(h, 1 - iv_index),
+            compare: span(h, 2),
+            address: span(b, 0),
+            load: span(b, load_idx),
+            reduction: span(b, load_idx + 1),
+            increment: span(b, load_idx + 2),
+        },
     })
 }
 
 fn rewrite(func: &mut IrFunction, c: Candidate) -> Option<()> {
-    // Reserve a fixed upper bound before mutation: no wrapping SSA/label IDs.
+    // Revalidate the instruction variants before any mutation. Carry the full
+    // load in Candidate so newly added memory attributes cannot be lost silently.
+    if !matches!(c.load, Instruction::Load { volatile: true, .. }) {
+        return None;
+    }
+    let address = match &c.address {
+        None => None,
+        Some(Instruction::GetElementPtr {
+            base,
+            offset: offset @ Operand::Const(_),
+            ty: IrType::Ptr,
+            ..
+        }) => Some((*base, *offset)),
+        _ => return None,
+    };
+    // Four control values, two accumulator
+    // values per lane, one load and optionally one address per lane, then
+    // LANES-1 combine results.
+    let required_values = 4 + 3 * LANES + usize::from(address.is_some()) * LANES + (LANES - 1);
     let mut value_id = func.sound_next_value_id();
-    value_id.checked_add(32)?;
+    value_id.checked_add(required_values as u32)?;
     let label_id = func
         .blocks
         .iter()
@@ -305,7 +362,9 @@ fn rewrite(func: &mut IrFunction, c: Candidate) -> Option<()> {
             (Operand::Value(next_iv), mb),
         ],
     }];
+    let mut h_spans = vec![c.spans.iv];
     let neutral = identity(c.reduction, c.acc_ty)?;
+    let mut b_spans = Vec::with_capacity((2 + usize::from(address.is_some())) * LANES + 1);
     let mut b_insts = Vec::with_capacity(3 * LANES + 1);
     for lane in 0..LANES {
         h_insts.push(Instruction::Phi {
@@ -316,29 +375,31 @@ fn rewrite(func: &mut IrFunction, c: Candidate) -> Option<()> {
                 (Operand::Value(updates[lane]), mb),
             ],
         });
+        h_spans.push(c.spans.accumulator);
         let mut load = c.load.clone();
-        if let Some(Instruction::GetElementPtr {
-            base, offset, ty, ..
-        }) = &c.address
-        {
+        if let Some((base, offset)) = address {
             let address = fresh();
             b_insts.push(Instruction::GetElementPtr {
                 dest: address,
-                base: *base,
-                offset: *offset,
-                ty: *ty,
+                base,
+                offset,
+                ty: IrType::Ptr,
             });
-            if let Instruction::Load { ptr, .. } = &mut load {
-                *ptr = address;
-            }
+            b_spans.push(c.spans.address);
+            let Instruction::Load { ptr, .. } = &mut load else {
+                return None;
+            };
+            *ptr = address;
         }
         let loaded = fresh();
         // Only SSA names change: the address expression, segment, width and
         // volatility are preserved. Emit reads in original execution order.
-        if let Instruction::Load { dest, .. } = &mut load {
-            *dest = loaded;
-        }
+        let Instruction::Load { dest, .. } = &mut load else {
+            return None;
+        };
+        *dest = loaded;
         b_insts.push(load);
+        b_spans.extend([c.spans.load, c.spans.reduction]);
         b_insts.push(Instruction::BinOp {
             dest: updates[lane],
             op: c.reduction,
@@ -347,6 +408,8 @@ fn rewrite(func: &mut IrFunction, c: Candidate) -> Option<()> {
             ty: c.acc_ty,
         });
     }
+    h_spans.push(c.spans.compare);
+    b_spans.push(c.spans.increment);
     h_insts.push(Instruction::Cmp {
         dest: cond,
         op: IrCmpOp::Ult,
@@ -378,7 +441,13 @@ fn rewrite(func: &mut IrFunction, c: Candidate) -> Option<()> {
         ty: c.acc_ty,
     })
     .to_vec();
-    func.blocks[c.preheader].source_spans.clear();
+    // Empty input span vectors mean "unknown". Fill only those holes, never
+    // erase locations of untouched preheader instructions.
+    let preheader = &mut func.blocks[c.preheader];
+    preheader
+        .source_spans
+        .resize(preheader.instructions.len(), Span::dummy());
+    preheader.source_spans.push(c.spans.compare);
     func.blocks[c.preheader]
         .instructions
         .push(Instruction::BinOp {
@@ -391,10 +460,10 @@ fn rewrite(func: &mut IrFunction, c: Candidate) -> Option<()> {
     func.blocks[c.preheader].terminator = Terminator::Branch(mh);
     for inst in &mut func.blocks[c.header].instructions {
         if let Instruction::Phi { dest, incoming, .. } = inst {
-            for (op, label) in incoming {
-                if *label == pre_label {
-                    *label = combine;
-                    *op = Operand::Value(if *dest == c.iv { iv } else { result });
+            for (operand, predecessor) in incoming {
+                if *predecessor == pre_label {
+                    *operand = Operand::Value(if *dest == c.iv { iv } else { result });
+                    *predecessor = combine;
                 }
             }
         }
@@ -408,19 +477,19 @@ fn rewrite(func: &mut IrFunction, c: Candidate) -> Option<()> {
                 true_label: mb,
                 false_label: combine,
             },
-            source_spans: Vec::new(),
+            source_spans: h_spans,
         },
         BasicBlock {
             label: mb,
             instructions: b_insts,
             terminator: Terminator::Branch(mh),
-            source_spans: Vec::new(),
+            source_spans: b_spans,
         },
         BasicBlock {
             label: combine,
             instructions: combine_insts,
             terminator: Terminator::Branch(old_header),
-            source_spans: Vec::new(),
+            source_spans: vec![c.spans.reduction; LANES - 1],
         },
     ]);
     func.next_value_id = value_id;
@@ -428,11 +497,106 @@ fn rewrite(func: &mut IrFunction, c: Candidate) -> Option<()> {
     Some(())
 }
 
+/// Declaration attributes override TU policy; full PIC defaults to a dynamic
+/// model. Both dynamic models currently issue a resolver for each folded load,
+/// so interleaving adds register/setup cost without removing that bottleneck.
+pub(crate) fn costly_tls_symbols(
+    module: &crate::ir::reexports::IrModule,
+    pic: bool,
+    model: Option<crate::ir::reexports::TlsModel>,
+) -> FxHashSet<String> {
+    module
+        .globals
+        .iter()
+        .filter(|g| g.is_thread_local && dynamic_tls(g.tls_model, model, pic))
+        .map(|g| g.name.clone())
+        .collect()
+}
+
+fn dynamic_tls(
+    declaration: Option<crate::ir::reexports::TlsModel>,
+    command_line: Option<crate::ir::reexports::TlsModel>,
+    pic: bool,
+) -> bool {
+    use crate::ir::reexports::TlsModel;
+    matches!(
+        declaration.or(command_line).unwrap_or(if pic {
+            TlsModel::GlobalDynamic
+        } else {
+            TlsModel::LocalExec
+        }),
+        TlsModel::LocalDynamic | TlsModel::GlobalDynamic
+    )
+}
+
+/// Build once per function, before rewriting. Original pointer definitions do
+/// not change. Follow only the same bounded constant-address/Copy chains as the
+/// backend's TLS fold; other pointers remain eligible, without guessing aliases.
+struct CostlyAddresses {
+    roots: FxHashSet<u32>,
+    bases: FxHashMap<u32, u32>,
+}
+
+impl CostlyAddresses {
+    fn new(func: &IrFunction, symbols: &FxHashSet<String>) -> Self {
+        let mut result = Self {
+            roots: FxHashSet::default(),
+            bases: FxHashMap::default(),
+        };
+        if symbols.is_empty() {
+            return result;
+        }
+        result.roots = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|inst| match inst {
+                Instruction::GlobalAddr { dest, name } if symbols.contains(name) => Some(dest.0),
+                _ => None,
+            })
+            .collect();
+        if result.roots.is_empty() {
+            return result;
+        }
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            match inst {
+                Instruction::GetElementPtr {
+                    dest,
+                    base,
+                    offset: Operand::Const(_),
+                    ..
+                }
+                | Instruction::Copy {
+                    dest,
+                    src: Operand::Value(base),
+                } => {
+                    result.bases.insert(dest.0, base.0);
+                }
+                _ => (),
+            }
+        }
+        result
+    }
+
+    fn contains(&self, mut ptr: u32) -> bool {
+        for _ in 0..8 {
+            if self.roots.contains(&ptr) {
+                return true;
+            }
+            let Some(&base) = self.bases.get(&ptr) else {
+                return false;
+            };
+            ptr = base;
+        }
+        false
+    }
+}
+
 /// Pipeline caller owns target/optimization policy and the ordinary pass-disable
 /// switch. Tunable lanes via CCC_VOLATILE_REDUCE_LANES (0/2/4/8) and budget
 /// via CCC_VOLATILE_REDUCE_BUDGET are read here so A/B harnesses can vary them
 /// without recompiling; the core matcher stays pure.
-pub(crate) fn run(func: &mut IrFunction) -> usize {
+pub(crate) fn run(func: &mut IrFunction, costly_symbols: &FxHashSet<String>) -> usize {
     let lanes = lanes();
     if lanes == 0 {
         return 0;
@@ -452,9 +616,10 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
     }) {
         return 0;
     }
+    let costly = CostlyAddresses::new(func, costly_symbols);
     let mut count = 0;
     // Rebuild after each rewrite; original indices remain stable but CFG edges
-    // change. Main loops have five phis, remainders have a nonconstant IV init,
+    // change. Main loops have five phis; remainder IVs no longer start at zero,
     // so neither can be interleaved again (including on a subsequent pass run).
     loop {
         let cfg = CfgAnalysis::build(func);
@@ -464,7 +629,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             &cfg.succs,
             &cfg.idom,
         ));
-        let candidate = loops.iter().find_map(|lp| analyze(func, &cfg, lp));
+        let candidate = loops.iter().find_map(|lp| analyze(func, &cfg, lp, &costly));
         let Some(c) = candidate else {
             break;
         };

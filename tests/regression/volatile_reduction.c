@@ -25,6 +25,12 @@ __attribute__((noinline)) uint64_t tls_product(uint64_t n, uint64_t seed) {
     return seed;
 }
 
+__attribute__((noinline)) uint64_t live_out(volatile uint64_t *p, uint64_t n, uint64_t seed) {
+    uint64_t i;
+    for (i = 0; i < n; ++i) seed += *p;
+    return seed ^ i;
+}
+
 int main(void) {
     static const uint64_t values[] = {0, 1, 3, UINT64_C(0x9e3779b97f4a7c15), UINT64_MAX};
     static const uint64_t counts[] = {0,1,2,3,4,5,6,7,8,9,15,16,17,31,32,33,63,64,65,1023};
@@ -32,7 +38,8 @@ int main(void) {
     volatile uint32_t a;
     volatile uint64_t b;
     /* Zero iterations must not turn the main group into a speculative read. */
-    if (add32(0,0,7) != 7 || mul64(0,0,3) != 3) return 1;
+    volatile uint64_t zero = 0;
+    if (add32(0,zero,7) != 7 || mul64(0,zero,3) != 3) return 1;
     uint64_t hash = 0;
     for (unsigned v=0; v<sizeof(values)/sizeof(values[0]); ++v) {
         a = (uint32_t)values[v]; b = values[v];
@@ -52,7 +59,8 @@ int main(void) {
                     xor32(&a,n,(uint32_t)seed)!=(uint32_t)x ||
                     add64(&b,n,seed)!=sum || mul64(&b,n,seed)!=product ||
                     and64(&b,n,seed)!=both || or64(&b,n,seed)!=either ||
-                    xor64(&b,n,seed)!=x || tls_product(n,seed)!=product) return 2;
+                    xor64(&b,n,seed)!=x || tls_product(n,seed)!=product ||
+                    live_out(&b,n,seed)!=(sum^n)) return 2;
                 hash ^= sum + product + both + either + x;
             }
         }

@@ -256,7 +256,10 @@ def report_mismatch(
 def main():
     compiler = os.environ.get("CCC", str(ROOT / "target/fastbuild/lccc"))
     failures = []
+    # Diagnostic driver/kernel are not standalone benchmarks, but their debug
+    # attribution must still exercise the same late-backend parity contract.
     sources = sorted((ROOT / "tests/benchmark/programs").glob("*.c"))
+    sources += sorted((ROOT / "tests/benchmark/volatile").glob("*.c"))
     assert sources, "empty parity corpus"
     with tempfile.TemporaryDirectory(prefix="lccc-debug-parity-") as tmp:
         work = Path(tmp)

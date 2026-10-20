@@ -1269,6 +1269,7 @@ pub(crate) fn run_passes(
     // in this unit are interposable, so the inliner keeps calls to them
     // (GCC's default `-fsemantic-interposition` at -fPIC).
     pic: bool,
+    tls_model: Option<crate::ir::reexports::TlsModel>,
 ) {
     let policy = crate::common::pass_policy::PassPolicy::new(
         wrap_signed_overflow,
@@ -2298,15 +2299,16 @@ pub(crate) fn run_passes(
             && !dis.unroll
             && !pass_disabled(&disabled, "volatile_reduce")
         {
+            let costly_tls = volatile_reduce::costly_tls_symbols(module, pic, tls_model);
             let n = timed_pass!(
                 "volatile_reduce",
-                run_on_visited(module, &dirty, &mut changed, volatile_reduce::run)
+                run_on_visited(module, &dirty, &mut changed, |f| volatile_reduce::run(
+                    f,
+                    &costly_tls
+                ))
             );
             total_changes += n;
             total_changes_excl_dce += n;
-            if n > 0 {
-                verify::verify_after_pass(module, "volatile_reduce");
-            }
         }
 
         // Unroll/vectorize can clone loop bodies that still contained
@@ -4005,6 +4007,7 @@ mod signed_wrap_policy_tests {
             false,
             &crate::backend::regalloc::RaConfig::default(),
             false,
+            None,
         );
     }
 
