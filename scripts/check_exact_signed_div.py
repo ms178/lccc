@@ -16,7 +16,7 @@ def main():
     parser.add_argument(
         "--lccc", default=os.environ.get("CCC", str(ROOT / "target/fastbuild/lccc"))
     )
-    parser.add_argument("--gcc", default=os.environ.get("GCC", "gcc"))
+    parser.add_argument("--gcc", default=os.environ.get("GCC", "gcc-16"))
     parser.add_argument("--clang")
     args = parser.parse_args()
     source = ROOT / "tests/regression/exact_signed_pow2.c"

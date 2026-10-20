@@ -18,7 +18,11 @@ adds **25 conservatively grouped implementation families with 45 native
 witnesses**. [Batch 3](BATCH-003.md) adds bounded demand reconstruction and
 Boolean-cardinality synthesis, with 60 reduced contracts and 120 width-specific
 native witnesses, plus a terminal boolean-return improvement for dispatch.
-Two contracts are already-optimized controls, not new assembly wins. The cumulative `coverage.json` still limits coverage per upstream
+[Batch 4](BATCH-004.md) adds exact signed power-of-two division analysis,
+repairs the default-target ordered SIMD gate, and rejects unrelated loads in
+that prefix. It reports a measured spectral-norm win, not additional invented
+LLVM-family counts.
+Two batch 3 contracts are already-optimized controls, not new assembly wins. The cumulative `coverage.json` still limits coverage per upstream
 report; this is not a claim of optimal code for the entire inventory.
 
 Full API bodies, public conversation comments and hashes belong in ignored

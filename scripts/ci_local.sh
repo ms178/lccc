@@ -932,6 +932,9 @@ gate "yarpgen-provisioner-contract" fast \
 gate "strict-computed-recip-codegen" fast \
     bash tests/regression/check_strict_computed_recip_codegen.sh
 
+gate "exact-signed-division" fast \
+    python3 scripts/check_exact_signed_div.py
+
 gate "strict-packed-recip-bitwise" fast \
     python3 scripts/check_strict_packed_recip.py
 
