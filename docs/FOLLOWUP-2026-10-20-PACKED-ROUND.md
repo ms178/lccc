@@ -44,80 +44,14 @@ source arm for both element widths, so a working memory fold cannot conceal a
 broken producer/consumer chain. The gate rejects reintroduced vector stack
 traffic and missed memory-source folds.
 
-## Oracle and performance evidence
+## Oracle and performance evidence — see companion benchmark record
 
-Pinned compilers:
-
-- GCC 16.2.0 (`gcc (foss-mirror) 16.2.0`)
-- Clang 23.1.3, official LLVM release
-- ICX 2026.2.0.20261001
-
-The benchmark is the fixture's `BENCH_MAIN`: fourteen noinline array kernels,
-4096 elements, 200 repetitions. All four executables produced identical
-output. Sixty randomized, interleaved native runs after six warmups measured:
-
-| compiler | median ms | minimum ms |
-|---|---:|---:|
-| LCCC | 3.905 | 3.813 |
-| GCC 16.2 | 10.399 | 10.254 |
-| Clang 23.1.3 | 8.324 | 8.241 |
-| ICX 2026.2 | 3.924 | 3.856 |
-
-Three deterministic Callgrind runs per executable produced identical counts
-within each compiler:
-
-| build | Callgrind Ir |
-|---|---:|
-| LCCC packed | 13,148,000 |
-| LCCC `CCC_NO_MAP_VEC=1` | 69,030,386 |
-| GCC 16.2 | 93,770,385 |
-| Clang 23.1.3 | 57,207,032 |
-| ICX 2026.2 | 10,804,110 |
-
-Thus the transform removes 80.95% of LCCC's retired-instruction-model count
-versus its scalar negative control (5.25× fewer). ICX executes fewer modeled
-instructions; LCCC's compact loop was marginally faster in this native sample.
-This is reported as measured rather than as a universal cycle claim.
+For fully pinned measurements, see [`BENCH-2026-10-20-PACKED-ROUND.md`](./BENCH-2026-10-20-PACKED-ROUND.md) — native runtime (60 interleaved runs), Callgrind (3× deterministic), and the Compiler Explorer metric-trap audit. Summary: packed removes **80.95%** of LCCC’s scalar `Ir` (**5.25×**), **6.26×** after the signed-guard fix (`11,020,010` vs `69,030,386`), at parity with ICX `10,804,117`; median native `3.905 ms` vs GCC `10.399 ms` on the `BENCH_MAIN` fixture.
 
 ## Red-team follow-up after rebase
 
-A fresh Compiler Explorer run through `scripts/codegen_oracle.py` found an
-important metric trap. For standalone `floor_f64`, GCC 16.2 has only 10 static
-instructions because it remains scalar; LCCC and Clang each have 47 after
-counting vector setup and their complete remainder paths, while ICX has 24.
-Static function size therefore ranks GCC “best” while it performs four times
-less useful work per hot iteration. Inspection of the saved assembly confirms
-that LCCC and ICX have the same two memory operations in the packed data path;
-LCCC's hot body is packed round, packed store, and loop control. This is why the
-runtime and Callgrind evidence above—not the static score alone—is authoritative.
+- **Metric-trap finding**: `floor_f64` static sizes (GCC `10`, LCCC/Clang `47`, ICX `24`) rank scalar “best” despite 4× less work per hot iteration — see bench doc for why runtime/Callgrind are authoritative.
+- **Signed-guard fix**: Byte-IV fusion now handles dynamic signed `i64` bounds (`0…i64::MAX/elem_size` → byte IV, else `0` packed trips → scalar mirror), removing the redundant `addq $1` element IV from every hot iteration (−16.18% Ir, −1 uop per vector trip).
+- **Metadata choice rejected**: Unary `round`/`sqrt` remain **SSA producers** only — not two-operand binary consumers. Position-zero already covers their source; widening position-one would grant an unsound contract to immediates/indices.
 
-Initial revalidation on the rebased tree produced 13,147,955 Callgrind Ir for
-packed LCCC and 69,030,355 for `CCC_NO_MAP_VEC=1` (5.25× fewer). Red-team
-inspection then found that the existing byte-IV fusion declined dynamic signed
-64-bit bounds for multi-byte elements. A preheader range guard now maps negative
-or byte-scaling-overflowing limits to zero packed trips and leaves the exact
-scalar mirror in charge; safe limits use the byte IV for both addressing and
-loop control. This removes the redundant element-IV increment from every hot
-vector trip. Final Callgrind fell to 11,020,010 Ir, a further 16.18% reduction
-and 6.26× fewer than the scalar control, while ICX 2026.2 measured 10,804,117.
-Fifty randomized native LCCC/ICX rounds after warmup measured 4.004 ms versus
-4.081 ms median on this VM. Absolute native medians move with VM conditions;
-the guarded semantics, assembly reduction, and modeled-instruction reduction
-do not.
-
-The audit also rejected one tempting but incorrect metadata choice: unary
-round/sqrt are not members of the two-operand-binary consumer family. Their
-vector result must be classified as an SSA producer, while consumption of their
-source is already safe through the generic position-zero rule. Keeping the
-binary classification would broaden the position-one deferral contract to an
-immediate or address index without a corresponding backend guarantee.
-
-GDB 16.3 disassembly of the linked benchmark independently confirmed the hot
-body at machine addresses: memory-source `vroundpd`, `vmovupd`, then loop
-control, with no hidden stack traffic. Linux objtool's stack validator completed
-successfully on the generated object; its warnings are the expected kernel-ABI
-frame-pointer assumptions (`%rbp` used as a user-space scratch register and an
-omit-frame-pointer call), not malformed instruction flow. Pahole 1.30 correctly
-reported that this C object has no DWARF/BTF type section; it therefore supplies
-no layout evidence for this scalar-array fixture and is not used to manufacture
-a performance claim.
+Machine-level confirmation (details in companion doc): **GDB 16.3** shows `vroundpd mem,%ymm0` → `vmovupd`, **objtool** passes (only expected `%rbp`/`omit-frame-pointer` warnings), **pahole 1.30** correctly N/A for this C object.

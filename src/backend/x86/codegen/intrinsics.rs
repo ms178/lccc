@@ -2159,14 +2159,27 @@ impl X86Codegen {
                 // vfmadd231 form: dest_reg preloaded with the addend, then
                 // dest = src2*src1 + dest — exactly emit_scalar_fma231's
                 // contract (shared with the mul+add fusion pass).
-                if let Some(d) = dest {
-                    self.emit_scalar_fma231(&args[0], &args[1], &args[2], d, IrType::F64);
-                }
+                // Hardened: dest may be None only when DCE proves the
+                // result dead; silently skipping is correct, but we verify
+                // in debug that no live use was dropped.
+                let Some(d) = dest else {
+                    debug_assert!(
+                        false,
+                        "FmaScalarF64 with None dest: DCE should have removed the producer if dead"
+                    );
+                    return;
+                };
+                self.emit_scalar_fma231(&args[0], &args[1], &args[2], d, IrType::F64);
             }
             IntrinsicOp::FmaScalarF32 => {
-                if let Some(d) = dest {
-                    self.emit_scalar_fma231(&args[0], &args[1], &args[2], d, IrType::F32);
-                }
+                let Some(d) = dest else {
+                    debug_assert!(
+                        false,
+                        "FmaScalarF32 with None dest: DCE should have removed the producer if dead"
+                    );
+                    return;
+                };
+                self.emit_scalar_fma231(&args[0], &args[1], &args[2], d, IrType::F32);
             }
             IntrinsicOp::FmaScalarF64Signed(np, na) => {
                 // fma(-a, b, -c) & friends after the IR negation peel: the
@@ -2174,30 +2187,18 @@ impl X86Codegen {
                 // vfnmsub), the operand movement is the plain family's.
                 // (np, na) == (false, false) is defensive — the peel emits
                 // the plain intrinsic when both flags cancel.
-                if let Some(d) = dest {
-                    self.emit_scalar_fma_signed(
-                        &args[0],
-                        &args[1],
-                        &args[2],
-                        d,
-                        IrType::F64,
-                        *np,
-                        *na,
-                    );
-                }
+                let Some(d) = dest else {
+                    debug_assert!(false, "FmaScalarF64Signed({},{}) with None dest", np, na);
+                    return;
+                };
+                self.emit_scalar_fma_signed(&args[0], &args[1], &args[2], d, IrType::F64, *np, *na);
             }
             IntrinsicOp::FmaScalarF32Signed(np, na) => {
-                if let Some(d) = dest {
-                    self.emit_scalar_fma_signed(
-                        &args[0],
-                        &args[1],
-                        &args[2],
-                        d,
-                        IrType::F32,
-                        *np,
-                        *na,
-                    );
-                }
+                let Some(d) = dest else {
+                    debug_assert!(false, "FmaScalarF32Signed({},{}) with None dest", np, na);
+                    return;
+                };
+                self.emit_scalar_fma_signed(&args[0], &args[1], &args[2], d, IrType::F32, *np, *na);
             }
             IntrinsicOp::RoundScalarF64(imm) => {
                 self.emit_fp_scalar_round(dest, &args[0], IrType::F64, *imm);
@@ -6394,72 +6395,147 @@ impl X86Codegen {
             IntrinsicOp::VecRoundF64x4 | IntrinsicOp::VecRoundF32x8 => {
                 assert!(
                     matches!(args.len(), 2..=4),
-                    "packed round requires vector+imm or base+index[+disp]+imm"
+                    "packed round requires vector+imm or base+index[+disp]+imm: got {args:?}"
                 );
-                if let Some(d) = dest {
-                    let inst = if matches!(op, IntrinsicOp::VecRoundF64x4) {
-                        "vroundpd"
-                    } else {
-                        "vroundps"
-                    };
-                    let imm = self.operand_to_imm_i64(args.last().unwrap_or(&args[0]));
-                    if args.len() >= 3 {
-                        let disp = if args.len() == 4 {
-                            Self::vec_disp_arg(args, 2)
-                        } else {
-                            0
-                        };
-                        let mem = self.vec_mem_operand(&args[0], &args[1], disp);
-                        self.state
-                            .emit_fmt(format_args!("    {} ${}, {}, %ymm0", inst, imm, mem));
-                    } else {
-                        self.avx_load_arg_to(&args[0], "ymm0");
-                        self.state
-                            .emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, imm));
+                let Some(d) = dest else {
+                    debug_assert!(
+                        false,
+                        "VecRound 256b {op:?} with None dest — DCE should have removed it"
+                    );
+                    return;
+                };
+                // Godlike validation: mem-fold must be base+index (Value) + optional disp/imm (Const).
+                // Early typed assert gives a precise ICE rather than an opaque vec_mem_operand panic.
+                if args.len() >= 3 {
+                    assert!(
+                        matches!(args[0], Operand::Value(_))
+                            && matches!(args[1], Operand::Value(_)),
+                        "packed round mem-fold base/index must be Value: {args:?}"
+                    );
+                    if args.len() == 4 {
+                        assert!(
+                            matches!(args[2], Operand::Const(_)),
+                            "packed round disp must be Const: {args:?}"
+                        );
                     }
-                    self.state.vec_last_store_val = Some(d.0);
-                    self.state.vec_last_store_reg = true;
-                    self.state.vec_last_store_reg_name = Some("ymm0");
-                    self.avx_store_dest(d);
+                    assert!(
+                        matches!(args.last().unwrap(), Operand::Const(_)),
+                        "packed round imm must be Const: {args:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(args[0], Operand::Value(_)),
+                        "packed round register source must be Value: {args:?}"
+                    );
                 }
+                let inst = if matches!(op, IntrinsicOp::VecRoundF64x4) {
+                    "vroundpd"
+                } else {
+                    "vroundps"
+                };
+                let imm = self.operand_to_imm_i64(args.last().unwrap_or(&args[0]));
+                if args.len() >= 3 {
+                    let disp = if args.len() == 4 {
+                        Self::vec_disp_arg(args, 2)
+                    } else {
+                        0
+                    };
+                    let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, {}, %ymm0", inst, imm, mem));
+                } else {
+                    self.avx_load_arg_to(&args[0], "ymm0");
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, imm));
+                }
+                self.state.vec_last_store_val = Some(d.0);
+                self.state.vec_last_store_reg = true;
+                self.state.vec_last_store_reg_name = Some("ymm0");
+                self.avx_store_dest(d);
             }
             IntrinsicOp::VecRoundF64x2 | IntrinsicOp::VecRoundF32x4 => {
                 assert!(
                     matches!(args.len(), 2..=4),
-                    "packed round requires vector+imm or base+index[+disp]+imm"
+                    "packed round requires vector+imm or base+index[+disp]+imm: got {args:?}"
                 );
-                if let Some(d) = dest {
-                    let inst = if matches!(op, IntrinsicOp::VecRoundF64x2) {
-                        "roundpd"
-                    } else {
-                        "roundps"
-                    };
-                    let imm = self.operand_to_imm_i64(args.last().unwrap_or(&args[0]));
-                    if args.len() >= 3 {
-                        let disp = if args.len() == 4 {
-                            Self::vec_disp_arg(args, 2)
-                        } else {
-                            0
-                        };
-                        let mem = self.vec_mem_operand(&args[0], &args[1], disp);
-                        self.state
-                            .emit_fmt(format_args!("    {} ${}, {}, %xmm0", inst, imm, mem));
-                    } else {
-                        self.sse_load_arg(&args[0], "xmm0");
-                        self.state
-                            .emit_fmt(format_args!("    {} ${}, %xmm0, %xmm0", inst, imm));
+                let Some(d) = dest else {
+                    debug_assert!(false, "VecRound 128b {op:?} with None dest");
+                    return;
+                };
+                if args.len() >= 3 {
+                    assert!(
+                        matches!(args[0], Operand::Value(_))
+                            && matches!(args[1], Operand::Value(_)),
+                        "packed round mem-fold base/index must be Value: {args:?}"
+                    );
+                    if args.len() == 4 {
+                        assert!(
+                            matches!(args[2], Operand::Const(_)),
+                            "packed round disp must be Const: {args:?}"
+                        );
                     }
-                    self.sse_store_dest(d, "xmm0");
+                    assert!(
+                        matches!(args.last().unwrap(), Operand::Const(_)),
+                        "packed round imm must be Const: {args:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(args[0], Operand::Value(_)),
+                        "packed round register source must be Value: {args:?}"
+                    );
                 }
+                let inst = if matches!(op, IntrinsicOp::VecRoundF64x2) {
+                    "roundpd"
+                } else {
+                    "roundps"
+                };
+                let imm = self.operand_to_imm_i64(args.last().unwrap_or(&args[0]));
+                if args.len() >= 3 {
+                    let disp = if args.len() == 4 {
+                        Self::vec_disp_arg(args, 2)
+                    } else {
+                        0
+                    };
+                    let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, {}, %xmm0", inst, imm, mem));
+                } else {
+                    self.sse_load_arg(&args[0], "xmm0");
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, %xmm0, %xmm0", inst, imm));
+                }
+                self.sse_store_dest(d, "xmm0");
             }
             IntrinsicOp::VecSqrtF64x4 | IntrinsicOp::VecSqrtF32x8 => {
                 // Unary AVX; a direct map load stays in the instruction's
                 // legal r/m source slot instead of becoming a temporary.
                 assert!(
                     matches!(args.len(), 1..=3),
-                    "packed sqrt requires a vector or base+index[+disp]"
+                    "packed sqrt requires a vector or base+index[+disp]: got {args:?}"
                 );
-                if let Some(d) = dest {
+                let Some(d) = dest else {
+                    debug_assert!(false, "VecSqrt 256b {op:?} with None dest");
+                    return;
+                };
+                if args.len() >= 2 {
+                    assert!(
+                        matches!(args[0], Operand::Value(_))
+                            && matches!(args[1], Operand::Value(_)),
+                        "packed sqrt mem-fold base/index must be Value: {args:?}"
+                    );
+                    if args.len() == 3 {
+                        assert!(
+                            matches!(args[2], Operand::Const(_)),
+                            "packed sqrt disp must be Const: {args:?}"
+                        );
+                    }
+                } else {
+                    assert!(
+                        matches!(args[0], Operand::Value(_)),
+                        "packed sqrt register source must be Value: {args:?}"
+                    );
+                }
+                {
                     let inst = if matches!(op, IntrinsicOp::VecSqrtF64x4) {
                         "vsqrtpd"
                     } else {
@@ -6489,9 +6565,31 @@ impl X86Codegen {
                 // Unary SSE2, including its memory-source encoding.
                 assert!(
                     matches!(args.len(), 1..=3),
-                    "packed sqrt requires a vector or base+index[+disp]"
+                    "packed sqrt requires a vector or base+index[+disp]: got {args:?}"
                 );
-                if let Some(d) = dest {
+                let Some(d) = dest else {
+                    debug_assert!(false, "VecSqrt 128b {op:?} with None dest");
+                    return;
+                };
+                if args.len() >= 2 {
+                    assert!(
+                        matches!(args[0], Operand::Value(_))
+                            && matches!(args[1], Operand::Value(_)),
+                        "packed sqrt mem-fold base/index must be Value: {args:?}"
+                    );
+                    if args.len() == 3 {
+                        assert!(
+                            matches!(args[2], Operand::Const(_)),
+                            "packed sqrt disp must be Const: {args:?}"
+                        );
+                    }
+                } else {
+                    assert!(
+                        matches!(args[0], Operand::Value(_)),
+                        "packed sqrt register source must be Value: {args:?}"
+                    );
+                }
+                {
                     let inst = if matches!(op, IntrinsicOp::VecSqrtF64x2) {
                         "sqrtpd"
                     } else {

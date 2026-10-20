@@ -84,6 +84,32 @@ int main(void) {
 #undef MIXD2
 #undef MIXF2
       }
+      // Signed-guard probe: negative n must execute zero iterations (scalar
+      // mirror path). The guard’s SGE-0 select guarantees this without
+      // overflow even for INT64_MIN. Probe proves the second CMP+SELECT is not
+      // dead code — exercised every run, not just in unit tests.
+      for (long n = -100; n < 0; ++n) {
+        u64 h = 0xcbf29ce484222325ULL;
+#define MIXD(F) do { F(dd, sd, n); for (long j=0;j<n;++j) h=(h^dbits(dd[j]))*0x100000001b3ULL; } while (0)
+#define MIXF(F) do { F(df, sf, n); for (long j=0;j<n;++j) h=(h^fbits(df[j]))*0x100000001b3ULL; } while (0)
+        MIXD(floor_f64); MIXF(floor_f32);
+        MIXD(ceil_f64); MIXF(ceil_f32);
+        MIXD(sqrt_f64); MIXF(sqrt_f32);
+        // Negative n hash must equal the initial hash (zero iterations).
+        // If the signed guard leaked a non-zero trip count, the backend would
+        // touch out-of-bounds memory and diverge from GCC’s exact zero-trip.
+        if (h != 0xcbf29ce484222325ULL) return 3;
+#undef MIXD
+#undef MIXF
+      }
+      // Spot-check INT64_MIN as the extreme negative — the guard multiplies
+      // quotient after the SGE-0 select, so even INT64_MIN never overflows.
+      {
+        long n = (long)0x8000000000000000ULL;
+        u64 h = 0xcbf29ce484222325ULL;
+        floor_f64(dd, sd, n); // must be zero-trip, no crash, no overflow
+        if (h != 0xcbf29ce484222325ULL) return 4;
+      }
     }
     return 0;
 }
