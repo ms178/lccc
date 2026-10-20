@@ -304,8 +304,8 @@ fn memory_operand_families(mem: &str) -> u16 {
 }
 
 /// A memory source operand this pass is willing to carry into an ALU op:
-/// contains a parenthesised address, no immediate or register form, no `*`
-/// indirection marker, and at most a *validated* segment override.
+/// either a parenthesised address or a validated segment-qualified symbolic
+/// displacement, with no immediate/register form or `*` indirection marker.
 ///
 /// The override is an address-space qualifier, not part of the operand shape:
 /// `movq %gs:8(%rsi), %rax` is the per-CPU spelling of `movq 8(%rsi), %rax`
@@ -327,13 +327,19 @@ pub(super) fn is_plain_memory_operand(op: &str) -> bool {
             && !op.starts_with('*')
             && !op.contains(':');
     }
-    let (_, body) = super::relay_and_lea::strip_segment_prefix(op);
-    body.contains('(')
+    let (segment, body) = super::relay_and_lea::strip_segment_prefix(op);
+    let indexed = body.contains('(')
         && body.ends_with(')')
         && !body.starts_with('$')
         && !body.starts_with('%')
         && !body.starts_with('*')
-        && !body.contains(':')
+        && !body.contains(':');
+    // Local-Exec TLS is a segment-qualified symbolic displacement with no
+    // parenthesised base: `%fs:sym@TPOFF[+addend]`. Accept exactly the same
+    // validated symbol grammar used by address composition, and only behind
+    // a validated segment prefix; this does not broaden the pass to absolute
+    // DS-relative symbol operands.
+    indexed || (!segment.is_empty() && is_stable_symbol_expr(body))
 }
 
 fn is_reg_or_imm(op: &str) -> bool {
@@ -647,6 +653,29 @@ fn try_fuse_commuted_adjacent_load(
     Some(span_end)
 }
 
+/// Retire a proven-dead load and install its fused consumer. A volatile pin
+/// moves with the one surviving memory access; clearing it on the old carrier
+/// is deliberately confined to this post-legality-check helper.
+fn replace_fused_load(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    load: usize,
+    consumer: usize,
+    new_line: String,
+    volatile: bool,
+) {
+    if volatile {
+        infos[load].pinned = false;
+        infos[load].volatile_access = false;
+    }
+    mark_nop(&mut infos[load]);
+    replace_line(store, &mut infos[consumer], consumer, new_line);
+    if volatile {
+        infos[consumer].pinned = true;
+        infos[consumer].volatile_access = true;
+    }
+}
+
 /// Fuse `mov MEM, %T ... OP %T, %D` into `OP MEM, %D` (see module docs).
 pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
@@ -654,8 +683,18 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
     let mut changed = false;
     let mut i = 0;
     while i < len {
-        if infos[i].is_nop() || infos[i].pinned || !matches!(infos[i].kind, LineKind::Other { .. })
-        {
+        if infos[i].is_nop() || !matches!(infos[i].kind, LineKind::Other { .. }) {
+            i += 1;
+            continue;
+        }
+        // A volatile load is normally opaque to text peepholes. There is one
+        // exception which preserves the C abstract-machine access exactly:
+        // an immediately adjacent register ALU consumer can carry the same
+        // memory operand itself. No access is added, removed, widened, or
+        // moved across another instruction. The replacement is re-pinned
+        // below so later passes cannot erase or relocate the access.
+        let load_volatile = infos[i].pinned && infos[i].volatile_access;
+        if infos[i].pinned && !load_volatile {
             i += 1;
             continue;
         }
@@ -710,7 +749,7 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
         // mode there is no instruction that rebases DS.  (Labels and calls are
         // already window barriers in both cases, so no control flow can reach
         // the consumer on a different segment base.)
-        if gap != 0 && super::relay_and_lea::segment_prefix_len(mem).is_some() {
+        if (load_volatile || super::relay_and_lea::segment_prefix_len(mem).is_some()) && gap != 0 {
             i += 1;
             continue;
         }
@@ -727,11 +766,14 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
             {
                 let new_line =
                     format!("    {op}{suffix} {mem}, {}", REG_NAMES[width][dst as usize]);
-                mark_nop(&mut infos[i]);
-                replace_line(store, &mut infos[j], j, new_line);
+                replace_fused_load(store, infos, i, j, new_line, load_volatile);
                 lv.refresh_span(store, infos, i, j);
                 changed = true;
                 i = j + 1;
+                continue;
+            }
+            if load_volatile {
+                i += 1;
                 continue;
             }
             // ── mirror form: OP %C, %T ────────────────────────────────────
@@ -767,6 +809,11 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
                 i = span_end + 1;
                 continue;
             }
+            i += 1;
+            continue;
+        }
+
+        if load_volatile {
             i += 1;
             continue;
         }
@@ -2327,6 +2374,47 @@ mod tests {
     }
 
     #[test]
+    fn fuses_only_an_adjacent_volatile_load_and_repins_the_memory_alu() {
+        let asm = format!(
+            "{PRO}    movq %fs:tls_counter@TPOFF, %r9\n    addq %r9, %rdx\n    movq %rdx, %rax\n{EPI}"
+        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let load = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)).starts_with("movq %fs:"))
+            .expect("volatile load");
+        infos[load].pinned = true;
+        infos[load].volatile_access = true;
+
+        assert!(fuse_load_into_alu(&mut store, &mut infos));
+        let fused = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)) == "addq %fs:tls_counter@TPOFF, %rdx")
+            .expect("fused memory add");
+        assert!(infos[load].is_nop());
+        assert!(infos[fused].pinned);
+        assert!(infos[fused].volatile_access);
+
+        // Even a flag-neutral instruction is too much movement for a volatile
+        // access. The ordinary nonvolatile pass may cross such a gap, but this
+        // deliberately narrow exception must not.
+        let asm = format!(
+            "{PRO}    movq %fs:tls_counter@TPOFF, %r9\n    movq %r10, %r11\n    addq %r9, %rdx\n    movq %rdx, %rax\n{EPI}"
+        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let load = (0..store.len())
+            .find(|&i| infos[i].trimmed(store.get(i)).starts_with("movq %fs:"))
+            .expect("volatile load");
+        infos[load].pinned = true;
+        infos[load].volatile_access = true;
+        assert!(!fuse_load_into_alu(&mut store, &mut infos));
+    }
+
+    #[test]
     fn fuses_segment_qualified_cmp_mirror_and_case_insensitive_prefix() {
         // Direct form: the loaded scratch is the cmp SOURCE (`cmpl %ecx, %esi`
         // computes `%esi - %ecx`), and the folded `cmpl {mem}, %esi` keeps the
@@ -2421,6 +2509,18 @@ mod tests {
 
     #[test]
     fn malformed_segment_prefix_still_refused() {
+        assert!(is_plain_memory_operand("%fs:tls@TPOFF"));
+        assert!(is_plain_memory_operand("%fs:tls@TPOFF+24"));
+        for malformed in [
+            "%gss:tls@TPOFF",
+            "%fs:tls@TPOFF+bad",
+            "%fs:tls@TPOFF;call evil",
+            "%fs:*tls@TPOFF",
+            "%fs:",
+            "tls@TPOFF",
+        ] {
+            assert!(!is_plain_memory_operand(malformed), "{malformed}");
+        }
         // `%gss:` is not one of the six segment registers: the operand stays a
         // load, and nothing may fold it into the consumer.
         let asm = format!(

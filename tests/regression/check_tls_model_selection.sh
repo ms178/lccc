@@ -131,6 +131,29 @@ if grep -q 'addq %fs:0' "$work/external-ie-fn.s"; then
 else
     note "contract 3: Initial-Exec load matches the two-instruction oracle"
 fi
+# A volatile access remains observable when its load is carried directly by
+# an adjacent ALU instruction. This is the hot-loop shape where a separate
+# `%fs:` load consumed one extra instruction and one temporary GPR per trip.
+hot_src="$here/../benchmark/programs/tls_hot_loop.c"
+"$CCC" -O3 -fno-pic -S "$hot_src" -o "$work/hot-folded.s"
+CCC_NO_SEG_OPERAND_FUSE=1 "$CCC" -O3 -fno-pic -S "$hot_src" -o "$work/hot-control.s"
+sed -n '/^tls_hot_loop:/,/^\.size tls_hot_loop/p' "$work/hot-folded.s" >"$work/hot-folded-fn.s"
+sed -n '/^tls_hot_loop:/,/^\.size tls_hot_loop/p' "$work/hot-control.s" >"$work/hot-control-fn.s"
+if grep -q 'addq %fs:tls_hot_value@TPOFF, %' "$work/hot-folded-fn.s" && \
+    ! grep -q 'movq %fs:tls_hot_value@TPOFF' "$work/hot-folded-fn.s" && \
+    grep -q 'movq %fs:tls_hot_value@TPOFF' "$work/hot-control-fn.s"; then
+    note "contract 3: adjacent volatile TLS load folds into its ALU consumer"
+else
+    bad "volatile TLS load/ALU fold or its mutation control did not fire"
+fi
+"$CCC" -O3 -fno-pic -no-pie "$hot_src" -o "$work/hot-run"
+"$GCC" -O3 -fno-pic -no-pie "$hot_src" -o "$work/hot-ref"
+if [ "$("$work/hot-run" 100003)" = "$("$work/hot-ref" 100003)" ]; then
+    note "contract 3: folded volatile TLS hot loop preserves runtime result"
+else
+    bad "folded volatile TLS hot loop differs from GCC"
+fi
+
 if [ -f "$work/tlsmin.so" ]; then
     "$CCC" -O2 -fPIC -shared -S "$work/tlsmin.c" -o "$work/shared.s" 2>/dev/null || true
     if [ -f "$work/shared.s" ] && grep -q '%fs:.*@TPOFF' "$work/shared.s"; then
@@ -150,11 +173,11 @@ if [ -f "$work/tlsmin.so" ]; then
         fi
         sed -n '/^sumv:/,/^\.size sumv/p' "$work/shared.s" >"$work/shared-sumv.s"
         calls=$(grep -c '@TLSCALL' "$work/shared-sumv.s" || true)
-        loads=$(grep -c 'movq %fs:(%rax)' "$work/shared-sumv.s" || true)
-        if [ "$calls" -eq 2 ] && [ "$loads" -eq 2 ]; then
-            note "contract 3: nested descriptor guards preserve both volatile loads"
+        accesses=$(grep -Ec '(movq|addq) %fs:\(%rax\)' "$work/shared-sumv.s" || true)
+        if [ "$calls" -eq 2 ] && [ "$accesses" -eq 2 ]; then
+            note "contract 3: nested descriptor guards preserve both volatile accesses"
         else
-            bad "dynamic volatile loads were coalesced (calls=$calls loads=$loads)"
+            bad "dynamic volatile loads were coalesced (calls=$calls accesses=$accesses)"
         fi
     fi
 fi
