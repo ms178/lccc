@@ -331,14 +331,24 @@ its call-site relocation so a static linker can relax the sequence.
     add  x0, x1, x0
 
     // TLSDESC dynamic
-    mrs  x1, tpidr_el0
     adrp x0, :tlsdesc:sym
-    ldr  x2, [x0, :tlsdesc_lo12:sym]
+    ldr  x1, [x0, :tlsdesc_lo12:sym]
     add  x0, x0, :tlsdesc_lo12:sym
     .tlsdesccall sym
-    blr  x2
-    add  x0, x1, x0
+    blr  x1
+    mrs  x1, tpidr_el0
+    add  x0, x0, x1
 ```
+
+The TLSDESC sequence reads the thread pointer *after* `blr`, which is what GCC
+and Clang 23.1.3 emit. Only `x0`'s contract is normative — aaelf64 defers the
+resolver's own register behaviour to the TLSDESC paper — so reading TP before
+the call would depend on every resolver (glibc, musl, or one a linker
+synthesizes) preserving `x1`, in exchange for at most the ~1 cycle latency of a
+dependency-free `mrs` that an out-of-order core issues early regardless of
+program order. `x1` carries both the resolver target and the thread pointer
+because it is dead once `blr x1` has dispatched; Clang's `x8` is not available
+here, since `ARM_CALLER_SAVED` (x4–x8, x13, x14) makes x8 an allocator home.
 
 ### Stack-Relative Addressing
 

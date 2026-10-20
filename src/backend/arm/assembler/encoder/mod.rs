@@ -3646,3 +3646,82 @@ mod gas247_golden_word_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod tls_relocation_tests {
+    use super::*;
+
+    fn reg(r: &str) -> Operand {
+        Operand::Reg(r.to_string())
+    }
+
+    fn modifier(kind: &str, symbol: &str) -> Operand {
+        Operand::Modifier {
+            kind: kind.to_string(),
+            symbol: symbol.to_string(),
+        }
+    }
+
+    /// Encode and return the relocation the instruction carries.
+    fn reloc_of(mn: &str, ops: &[Operand]) -> Relocation {
+        match encode_instruction(mn, ops, "") {
+            Ok(EncodeResult::WordWithReloc { reloc, .. }) => reloc,
+            Ok(other) => panic!("{mn}: expected a word with a relocation, got {other:?}"),
+            Err(e) => panic!("{mn}: expected an encoding, got error: {e}"),
+        }
+    }
+
+    /// Pin every AArch64 TLS relocation number to the ELF for the Arm 64-bit
+    /// Architecture table.  These are magic constants written straight into
+    /// `.rela.text` for an external linker, so a transposed digit is silent
+    /// mis-relocation at link time rather than a compile error: 542 is
+    /// `R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC` while 543 is
+    /// `R_AARCH64_TLSIE_LD_GOTTPREL_PREL19`, and 569 is
+    /// `R_AARCH64_TLSDESC_CALL` while 567/568 are the `TLSDESC_LDR`/`TLSDESC_ADD`
+    /// relaxation markers -- which aaelf64 requires only for an LDR/ADD that
+    /// has no other relocation, so the value-carrying 563/564 supersede them.
+    /// Cross-checked against glibc's `elf.h` and against clang 23.1.3's own
+    /// object for the same source: 4 each of TLSDESC_ADR_PAGE21, LD64_LO12,
+    /// ADD_LO12 and CALL, and no TLSDESC_LDR/TLSDESC_ADD.
+    #[test]
+    fn tls_relocation_numbers_match_aaelf64() {
+        for (reloc, want) in [
+            (RelocType::TlsIeAdrGotTprelPage21, 541),
+            (RelocType::TlsIeLd64GotTprelLo12, 542),
+            (RelocType::TlsDescAdrPage21, 562),
+            (RelocType::TlsDescLd64Lo12, 563),
+            (RelocType::TlsDescAddLo12, 564),
+            (RelocType::TlsDescCall, 569),
+            // The Local Exec pair and the GOT pair these sit beside, pinned for
+            // the same reason: they are the numbers a wrong edit would land on.
+            (RelocType::TlsLeAddTprelHi12, 549),
+            (RelocType::TlsLeAddTprelLo12, 551),
+            (RelocType::AdrGotPage21, 311),
+            (RelocType::Ld64GotLo12, 312),
+        ] {
+            assert_eq!(
+                reloc.elf_type(),
+                want,
+                "{reloc:?} must carry ELF number {want}"
+            );
+        }
+    }
+
+    /// The three TLS modifier spellings must each reach their own relocation
+    /// through `adrp`.  `:got:`, `:gottprel:` and `:tlsdesc:` share one match
+    /// arm and one instruction word, so the relocation alone distinguishes
+    /// them: a swapped arm is invisible in the assembly and fatal in the link.
+    #[test]
+    fn adrp_tls_modifiers_select_distinct_relocations() {
+        for (kind, want) in [
+            ("got", RelocType::AdrGotPage21.elf_type()),
+            ("gottprel", RelocType::TlsIeAdrGotTprelPage21.elf_type()),
+            ("tlsdesc", RelocType::TlsDescAdrPage21.elf_type()),
+        ] {
+            let reloc = reloc_of("adrp", &[reg("x0"), modifier(kind, "sym")]);
+            assert_eq!(reloc.reloc_type.elf_type(), want, ":{kind}: on adrp");
+            assert_eq!(reloc.symbol, "sym", ":{kind}: must carry the symbol");
+            assert_eq!(reloc.addend, 0, ":{kind}: must carry a zero addend");
+        }
+    }
+}

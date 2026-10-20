@@ -17,8 +17,8 @@ use crate::ir::reexports::{
 };
 use std::sync::Arc;
 
-/// Callee-saved registers available for register allocation: x20-x28.
-/// x19 is reserved (some ABIs use it), x29=fp, x30=lr.
+/// Callee-saved registers available for register allocation: x19-x28.
+/// x29=fp and x30=lr are excluded because the prologue owns them.
 pub(super) const ARM_CALLEE_SAVED: [PhysReg; 10] = [
     PhysReg(19),
     PhysReg(20),
@@ -32,7 +32,7 @@ pub(super) const ARM_CALLEE_SAVED: [PhysReg; 10] = [
     PhysReg(28),
 ];
 
-/// Caller-saved registers available for register allocation: x13, x14.
+/// Caller-saved registers available for register allocation: x4-x8, x13, x14.
 ///
 /// These are a subset of the AAPCS64 "corruptible" registers (x9-x15).
 /// We exclude x9 (primary address register), x10 (memcpy source, secondary

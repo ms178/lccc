@@ -46,24 +46,35 @@ impl ArmCodegen {
                 self.state.emit("    add x0, x1, x0");
             }
             TlsModel::GlobalDynamic | TlsModel::LocalDynamic => {
-                // AArch64's TLSDESC resolver returns a TP-relative offset in
-                // x0 under its special register-preserving ABI. The marker is
-                // required for static-link relaxation; the final two
-                // instructions materialize the address for unrelaxed DSOs.
-                // Read TP before the independent descriptor loads so its
-                // latency overlaps their address generation. The TLSDESC ABI
-                // preserves x1; x2 carries the resolver target.
-                self.state.emit("    mrs x1, tpidr_el0");
+                // AArch64's TLSDESC resolver takes the descriptor address in x0
+                // and returns a TP-relative offset in x0; `.tlsdesccall` marks
+                // the `blr` so a static linker can relax the whole sequence to
+                // IE or LE.
+                //
+                // The thread pointer is read AFTER the call, exactly as GCC and
+                // clang 23.1.3 emit it. Only x0's contract is normative --
+                // aaelf64 defers the resolver's own register behaviour to the
+                // TLSDESC paper -- so hoisting the `mrs` above the call would
+                // trade a real correctness dependency on every resolver (glibc,
+                // musl, or one a linker synthesizes) for at most the ~1 cycle
+                // latency of a dependency-free `mrs`, which an out-of-order core
+                // issues early regardless of program order.
+                //
+                // x1 carries both the resolver target and the thread pointer: x1
+                // is dead once `blr x1` has dispatched, and unlike clang's x8 it
+                // is not an allocator home here (ARM_CALLER_SAVED is x4-x8 plus
+                // x13/x14), so no live value can be displaced.
                 self.state
                     .emit_fmt(format_args!("    adrp x0, :tlsdesc:{}", name));
                 self.state
-                    .emit_fmt(format_args!("    ldr x2, [x0, :tlsdesc_lo12:{}]", name));
+                    .emit_fmt(format_args!("    ldr x1, [x0, :tlsdesc_lo12:{}]", name));
                 self.state
                     .emit_fmt(format_args!("    add x0, x0, :tlsdesc_lo12:{}", name));
                 self.state
                     .emit_fmt(format_args!("    .tlsdesccall {}", name));
-                self.state.emit("    blr x2");
-                self.state.emit("    add x0, x1, x0");
+                self.state.emit("    blr x1");
+                self.state.emit("    mrs x1, tpidr_el0");
+                self.state.emit("    add x0, x0, x1");
             }
         }
         self.store_x0_to(dest);

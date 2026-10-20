@@ -1072,6 +1072,18 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends mold lld
+    - name: Install AArch64/RISC-V cross compilers and sysroots
+      # check_tls_cross_models.sh links lccc objects against GCC-built TLS
+      # definitions and executes them under qemu-user (installed above). Without
+      # these two packages its runtime half reports SKIP, so the gate would
+      # assert relocation counts only and never execute a single TLS access.
+      # Each package brings its /usr/<triplet> sysroot, which is exactly the -L
+      # path the gate passes to qemu.
+      run: |
+        sudo apt-get install -y --no-install-recommends \
+          gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu
+        aarch64-linux-gnu-gcc --version | head -n 1
+        riscv64-linux-gnu-gcc --version | head -n 1
     - name: Verify GCC 16 C23 oracle
       run: |
         test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16
@@ -1512,6 +1524,11 @@ jobs:
         bash tests/regression/check_tls_pie_preemptible.sh
         bash tests/regression/check_tls_runtime_oracle.sh
         bash tests/regression/check_tls_model_selection.sh
+        # Cross-architecture TLS model/relocation/runtime contract. Catches the
+        # formerly hard-coded LE lowering in PIC/shared AArch64 and RISC-V
+        # objects. Mirrors the ci_local.sh gate of the same name;
+        # check_ci_gate_parity.py fails if the two lists drift.
+        bash tests/regression/check_tls_cross_models.sh
         bash tests/regression/check_volatile_reduction.sh
         python3 scripts/test_llvm_missed_inventory.py
         python3 -O scripts/test_llvm_missed_inventory.py

@@ -378,8 +378,20 @@ accumulator.
   call  __tls_get_addr
   ```
   Dynamic TLS is treated as a hidden call by register allocation and frame
-  selection. A one-resolver address function uses a minimal RA-only frame;
-  static address returns are generated directly in `a0` without a `t0` relay.
+  selection. `riscv_call_free_ir` is the single allowlist that decides what
+  counts as call-free, and it is shared by all three decisions that depend on
+  it — the caller-saved (a0–a7) pool, the `a0` homing of the resolver's result,
+  and the minimal RA-only frame — so they cannot disagree about what a call is.
+  A function whose ONLY call is the resolver homes that result in `a0` and gets
+  an RA-only frame, which is clang 23.1.3's exact shape for `external_address`.
+  Anything that can emit a second libcall (the i128 helpers, the F128
+  soft-float sequences, the libm intrinsics, the atomic RMW scratch) or that
+  reads `s0` (`__builtin_frame_address`, `__builtin_return_address`) falls back
+  to a callee-saved home and a full frame: `__divti3` clobbers a0–a7, and a
+  frame that never establishes `s0` would leave those builtins reading the
+  caller's frame pointer. The allowlist is fail-safe by construction — any IR
+  variant not explicitly proven call-free closes these optimizations. Static
+  address returns are generated directly in `a0` without a `t0` relay.
 - **Label addresses**: always use `lla` (labels are local symbols, avoiding
   unnecessary GOT indirection in PIC mode).
 

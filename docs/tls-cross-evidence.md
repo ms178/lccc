@@ -38,8 +38,11 @@ python3 scripts/godbolt.py compile rv64-cgcc1610 \
 The minimal RISC-V dynamic address function now has the same eight expanded
 instructions as GCC 16.1 and Clang 23.1.3: a 16-byte RA-only frame, paired GD
 address materialization, resolver call, and frame teardown. AArch64 dynamic
-lowering uses the standard four TLSDESC relocations; reading TP before the
-descriptor loads overlaps TP-read latency with descriptor materialization.
+lowering uses the standard four TLSDESC relocations and Clang 23.1.3's exact
+instruction shape, reading TP after `blr` instead of before it: only x0's
+contract is normative, so the hoisted form would depend on every resolver
+preserving x1 in exchange for at most the ~1 cycle latency of a
+dependency-free `mrs` that an out-of-order core issues early anyway.
 
 ## Automated checks
 
@@ -51,6 +54,12 @@ CCC=target/fastbuild/lccc bash tests/regression/check_tls_cross_models.sh
 The gate checks exact relocation counts and assembly properties for LE, IE,
 GD/LD, rejects static TLS relocations in shared objects, verifies that the
 hidden RISC-V resolver call saves `ra`, and rejects an unnecessary frame
-pointer in the one-resolver address path. When cross linkers and QEMU are
-installed, it also links and executes AArch64 and RISC-V IE and dynamic
-producer/consumer combinations.
+pointer in the one-resolver address path. It also sweeps every generated
+function for two register-discipline invariants that need neither a linker nor
+an emulator, so they hold in CI wherever the runtime half has to skip: any
+function that reads the frame pointer must establish it (`s0` on RISC-V, `x29`
+on AArch64), and a function combining dynamic TLS with a hidden wide-type
+libcall must park the resolver's result in a callee-saved register instead of
+leaving it in `a0` for `__divti3` to destroy. When cross linkers and QEMU are
+installed, it also links and executes AArch64 and RISC-V IE, dynamic and
+wide-type producer/consumer combinations.
