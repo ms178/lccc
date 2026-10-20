@@ -237,6 +237,13 @@ impl ArmCodegen {
                 self.operand_to_x0(&args[0]);
                 self.state.emit("    dc civac, x0");
             }
+            IntrinsicOp::Prefetch(flavor) => {
+                // PRFM with the GCC locality mapping: 0 = streaming, 1-2 =
+                // L2, 3 = L1, 4 = store intent (see IntrinsicOp::Prefetch).
+                self.operand_to_x0(&args[0]);
+                self.state
+                    .emit_fmt(format_args!("    prfm {}, [x0]", prefetch_prfop(*flavor)));
+            }
             IntrinsicOp::Movnti => {
                 self.emit_nontemporal_store(dest_ptr, args, "w9", "w0");
             }
@@ -1181,4 +1188,33 @@ impl ArmCodegen {
     //   Arithmetic: __addtf3, __subtf3, __multf3, __divtf3
     //   Conversion: __extenddftf2 (f64->f128), __trunctfdf2 (f128->f64)
     // ABI: f128 passed/returned in Q registers (q0, q1). Int result in w0/x0.
+}
+
+/// AArch64 PRFM operation for an `IntrinsicOp::Prefetch` payload. The
+/// prefetch operation field is a hint selector, so every arm of this table
+/// is architecturally legal and cannot fault.
+pub(super) fn prefetch_prfop(flavor: u8) -> &'static str {
+    match flavor {
+        0 => "pldl1strm",
+        1 | 2 => "pldl2keep",
+        4 => "pstl1keep",
+        _ => "pldl1keep",
+    }
+}
+
+#[cfg(test)]
+mod prefetch_prfop_tests {
+    use super::prefetch_prfop;
+
+    #[test]
+    fn every_payload_maps_to_a_real_prfm_operation() {
+        assert_eq!(prefetch_prfop(0), "pldl1strm");
+        assert_eq!(prefetch_prfop(1), "pldl2keep");
+        assert_eq!(prefetch_prfop(2), "pldl2keep");
+        assert_eq!(prefetch_prfop(3), "pldl1keep");
+        assert_eq!(prefetch_prfop(4), "pstl1keep");
+        for f in 5u8..=255 {
+            assert_eq!(prefetch_prfop(f), "pldl1keep");
+        }
+    }
 }

@@ -1909,6 +1909,25 @@ impl X86Codegen {
                 self.operand_to_reg(&args[0], "rax");
                 self.state.emit("    clflush (%rax)");
             }
+            IntrinsicOp::Prefetch(flavor) => {
+                // args[0] = address to prefetch; the payload selects one of
+                // the SSE prefetch flavors (see IntrinsicOp::Prefetch's table
+                // for why payload 4 — write intent — maps to `prefetcht0`
+                // here rather than to `prefetchw`). Every emitted form is
+                // architecturally a hint that cannot fault.
+                // A prefetch never faults, so no address-form guard is
+                // needed — including the constant-0 fallback for an argument
+                // that materialises as an immediate.
+                // CCC_NO_PREFETCH drops the hint entirely. Prefetching is a
+                // pure performance decision with no semantic content, so it
+                // needs a bisection switch of its own: an arm built with it
+                // must be byte-comparable against one without it.
+                if std::env::var_os("CCC_NO_PREFETCH").is_none() {
+                    self.operand_to_reg(&args[0], "rax");
+                    self.state
+                        .emit_fmt(format_args!("    {} (%rax)", prefetch_mnemonic(*flavor)));
+                }
+            }
             IntrinsicOp::Movnti
             | IntrinsicOp::Movnti64
             | IntrinsicOp::Movntdq
@@ -10882,11 +10901,63 @@ impl X86Codegen {
     }
 }
 
+/// x86 mnemonic for an `IntrinsicOp::Prefetch` payload.
+///
+/// Payload 3 (GCC's default locality) is the safe catch-all: an unknown
+/// payload must never turn into a missing instruction, because the hint is
+/// the whole point of the intrinsic.
+pub(super) fn prefetch_mnemonic(flavor: u8) -> &'static str {
+    match flavor {
+        0 => "prefetchnta",
+        1 => "prefetcht2",
+        2 => "prefetcht1",
+        // 4 (write intent) maps to `prefetcht0` deliberately — see the
+        // IntrinsicOp::Prefetch table for why `prefetchw` is not emitted.
+        _ => "prefetcht0",
+    }
+}
+
 /// The closed 132→{213,231} family table (`fma_form_reencode`): every
 /// mnemonic the map-FMA emitter can be dispatched with has both siblings,
 /// and the re-encode preserves lane width and sign family exactly. A
 /// mnemonic added to the dispatch tables without extending this match
 /// fails the exhaustive test below (and the emitter's `unreachable!`).
+#[cfg(test)]
+mod prefetch_mnemonic_tests {
+    use super::prefetch_mnemonic;
+
+    /// The payload → mnemonic table is the only thing standing between GCC's
+    /// `__builtin_prefetch` hints and the emitted instruction, so pin every
+    /// arm, including the catch-all.
+    #[test]
+    fn every_payload_maps_to_a_real_prefetch_form() {
+        assert_eq!(prefetch_mnemonic(0), "prefetchnta");
+        assert_eq!(prefetch_mnemonic(1), "prefetcht2");
+        assert_eq!(prefetch_mnemonic(2), "prefetcht1");
+        assert_eq!(prefetch_mnemonic(3), "prefetcht0");
+        // Write intent: prefetcht0 on purpose (compat), not prefetchw.
+        assert_eq!(prefetch_mnemonic(4), "prefetcht0");
+        // Unknown payloads fall back to the default locality, never to a
+        // no-op or a panic.
+        for f in 5u8..=255 {
+            assert_eq!(prefetch_mnemonic(f), "prefetcht0");
+        }
+    }
+
+    /// Every emitted mnemonic must be one the x86 assembler round-trips
+    /// (tests/asm-diff/misc.casefile covers the encodings themselves).
+    #[test]
+    fn mnemonics_are_the_four_sse_forms() {
+        let mut seen: Vec<&str> = (0u8..=4).map(prefetch_mnemonic).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen,
+            vec!["prefetchnta", "prefetcht0", "prefetcht1", "prefetcht2"]
+        );
+    }
+}
+
 #[cfg(test)]
 mod fma_form_reencode_tests {
     use super::X86Codegen;

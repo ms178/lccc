@@ -25,6 +25,34 @@ pub enum IntrinsicOp {
     Pause,
     Vzeroupper,
     Clflush,
+    /// `__builtin_prefetch(addr, rw, locality)`: an architectural prefetch
+    /// hint for the cache line containing `addr` (args[0]). No result, no
+    /// fault, no memory-ordering effect — but not dead code: the whole point
+    /// of the builtin is the latency it hides, so the instruction must
+    /// survive DCE (it is deliberately NOT in `is_pure`).
+    ///
+    /// The payload is the target-independent encoding of GCC's hint pair,
+    /// chosen once in the frontend lowering so every backend only has to map
+    /// one small enum onto its own prefetch flavors:
+    ///
+    /// | payload | GCC `(rw, locality)` | x86-64        | arm64          |
+    /// |---------|----------------------|---------------|----------------|
+    /// | 0       | any, `locality = 0`  | `prefetchnta` | `pldl1strm`    |
+    /// | 1       | any, `locality = 1`  | `prefetcht2`  | `pldl2keep`    |
+    /// | 2       | any, `locality = 2`  | `prefetcht1`  | `pldl2keep`    |
+    /// | 3       | any, `locality = 3`  | `prefetcht0`  | `pldl1keep`    |
+    ///
+    /// [^w]: `prefetchw` (0F 0D /1) is AMD's 3DNow!-era write hint. Every
+    ///       AMD part and every Intel part since Broadwell executes it, but
+    ///       the encoding is not in any Intel baseline ISA extension, so a
+    ///       pre-2014 Intel core would see an reserved-NOP at best. GCC emits
+    ///       `prefetcht0` for `rw = 1` unless `-mprfchw` is given, and a
+    ///       missed write hint costs a cycle while a SIGILL costs the build.
+    ///       x86 backends therefore map payload 4 to `prefetcht0`; AArch64's
+    ///       `pstl1keep` is an architecturally-defined hint and is used
+    ///       directly.
+    /// | 4       | `rw = 1`             | `prefetcht0`[^w] | `pstl1keep` |
+    Prefetch(u8),
     /// Non-temporal stores: movnti (32-bit), movnti64 (64-bit), movntdq (128-bit), movntpd (128-bit double)
     Movnti,
     Movnti64,

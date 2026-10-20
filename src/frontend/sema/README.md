@@ -422,7 +422,8 @@ The `BuiltinIntrinsic` enum covers a wide range of operations:
   (used in always-inline fortification wrappers)
 - **CPU feature detection**: `__builtin_cpu_init` (no-op), `__builtin_cpu_supports`
   (conservatively returns 0)
-- **Prefetch**: `__builtin_prefetch` (lowered as a no-op)
+- **Prefetch**: `__builtin_prefetch` (real `IntrinsicOp::Prefetch` hint:
+  `prefetcht0/t1/t2/nta` on x86, `prfm` on AArch64, dropped on RISC-V)
 - **x86 SSE/SSE2/SSE4.1/AES-NI/CLMUL**: complete 128-bit SIMD instruction coverage
 
 The `is_builtin()` function extends the static map with direct recognition of
