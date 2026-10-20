@@ -43,32 +43,44 @@ fn maps(insts: &[Instruction]) -> (Vec<Option<Instruction>>, Vec<u32>) {
 #[test]
 fn range_proofs_reject_ambiguous_direct_and_transitive_definitions() {
     for duplicate in [1, 2, 3] {
-        let mut insts = vec![
-            param(0),
-            mask(1, 0),
-            Instruction::Copy {
-                dest: Value(2),
-                src: v(1),
-            },
-            Instruction::Cast {
-                dest: Value(3),
-                src: v(2),
-                from_ty: IrType::U32,
-                to_ty: IrType::U8,
-            },
-            Instruction::Cast {
-                dest: Value(4),
-                src: v(3),
-                from_ty: IrType::U8,
-                to_ty: IrType::U32,
-            },
-        ];
-        insts.push(param(duplicate));
-        let (defs, counts) = maps(&insts);
-        // Query the copy chain for duplicate 1/2; truncation itself establishes
-        // a range without needing the pre-truncation source for duplicate 3.
-        let root = if duplicate == 3 { 4 } else { 2 };
-        assert!(!fits_low_bits(v(root), 8, 32, &defs, &counts));
+        for bounded_last in [false, true] {
+            let mut insts = vec![
+                param(0),
+                mask(1, 0),
+                Instruction::Copy {
+                    dest: Value(2),
+                    src: v(1),
+                },
+                Instruction::Cast {
+                    dest: Value(3),
+                    src: v(2),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::U8,
+                },
+                Instruction::Cast {
+                    dest: Value(4),
+                    src: v(3),
+                    from_ty: IrType::U8,
+                    to_ty: IrType::U32,
+                },
+            ];
+            // Exercise both map orders. An unbounded last definition already
+            // returns unknown without uniqueness checks; a bounded last definition
+            // is the adversarial case that must not establish a reaching fact.
+            if bounded_last {
+                insts.insert(1, param(duplicate));
+            } else {
+                insts.push(param(duplicate));
+            }
+            let (defs, counts) = maps(&insts);
+            // Query the copy chain for duplicate 1/2; truncation itself establishes
+            // a range without needing the pre-truncation source for duplicate 3.
+            let root = if duplicate == 3 { 4 } else { 2 };
+            assert!(
+                !fits_low_bits(v(root), 8, 32, &defs, &counts),
+                "duplicate={duplicate} bounded_last={bounded_last}"
+            );
+        }
     }
 }
 
@@ -117,7 +129,7 @@ fn range_walk_is_bounded_and_handles_cycles_without_recursion() {
     assert!(!fits_low_bits(v(9999), 8, 32, &defs, &counts));
 }
 
-fn crc(duplicate: Option<u32>, cast_form: bool) -> IrFunction {
+fn crc(duplicate: Option<u32>, cast_form: bool, bounded_last: bool) -> IrFunction {
     let mut insts = vec![
         param(0),
         param(1),
@@ -151,7 +163,18 @@ fn crc(duplicate: Option<u32>, cast_form: bool) -> IrFunction {
         insts.push(mask(6, 4));
     }
     if let Some(d) = duplicate {
-        insts.push(param(d));
+        if bounded_last {
+            let index = insts
+                .iter()
+                .position(|i| i.dest() == Some(Value(d)))
+                .unwrap();
+            let bounded = std::mem::replace(&mut insts[index], param(d));
+            // This proof-producing definition comes AFTER the rewritten use.
+            // Last-definition lookup must not make the earlier value bounded.
+            insts.push(bounded);
+        } else {
+            insts.push(param(d));
+        }
     }
     let mut f = IrFunction::new("crc_proof".into(), IrType::U32, vec![], false);
     f.blocks.push(crate::ir::reexports::BasicBlock {
@@ -169,20 +192,18 @@ fn crc(duplicate: Option<u32>, cast_form: bool) -> IrFunction {
 fn both_crc_callers_fail_closed_for_ambiguous_dependencies() {
     for cast_form in [false, true] {
         for duplicate in [2, 3, 4, 6] {
-            let mut f = crc(Some(duplicate), cast_form);
-            recognize_function(&mut f, false, 64, 8, false);
-            assert!(
-                matches!(
-                    f.blocks[0].instructions[4],
-                    Instruction::BinOp {
-                        op: IrBinOp::Xor,
-                        ..
-                    }
-                ),
-                "cast={cast_form} duplicate={duplicate}"
-            );
+            for bounded_last in [false, true] {
+                let mut f = crc(Some(duplicate), cast_form, bounded_last);
+                let before = format!("{:?}", f.blocks);
+                assert_eq!(
+                    recognize_function(&mut f, false, 64, 8, false),
+                    0,
+                    "cast={cast_form} duplicate={duplicate} bounded_last={bounded_last}"
+                );
+                assert_eq!(format!("{:?}", f.blocks), before);
+            }
         }
-        let mut positive = crc(None, cast_form);
+        let mut positive = crc(None, cast_form, false);
         assert!(recognize_function(&mut positive, false, 64, 8, false) > 0);
         assert!(matches!(
             positive.blocks[0].instructions[4],
