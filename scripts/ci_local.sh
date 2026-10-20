@@ -1122,6 +1122,10 @@ gate "tls-runtime-oracle" fast bash tests/regression/check_tls_runtime_oracle.sh
 gate "volatile-reduction" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_volatile_reduction.sh
 
+gate "llvm-missed-inventory-tests" fast python3 scripts/test_llvm_missed_inventory.py
+gate "llvm-missed-inventory-optimized-tests" fast python3 -O scripts/test_llvm_missed_inventory.py
+gate "llvm-missed-zero-choice" fast python3 tests/regression/check_llvm_missed_zero_choice.py
+
 gate "tls-model-option" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_option.sh
 
