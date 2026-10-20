@@ -31,6 +31,7 @@ pub(super) const RBP_OFFSET_NONE: i32 = i32::MIN;
 /// Stored in a parallel array alongside the raw text, so hot loops
 /// can check integer fields instead of re-parsing strings.
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(super) struct LineInfo {
     pub(super) kind: LineKind,
     /// Pre-parsed extension classification for redundant extension elimination.
@@ -69,7 +70,9 @@ pub(super) struct LineInfo {
     /// `fold_memory_rmw` recognize a volatile load/op/store sequence and
     /// fuse it into the single memory RMW instruction that performs
     /// exactly the one read and one write the abstract machine requires --
-    /// the form GCC emits for `h += 3` on a volatile object.
+    /// the form GCC emits for `h += 3` on a volatile object. The adjacent
+    /// direct load-to-ALU fold may also transfer this protection to its single
+    /// surviving read after proving equal width and a dead load temporary.
     pub(super) volatile_access: bool,
 }
 

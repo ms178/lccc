@@ -182,10 +182,11 @@ fn pin_inline_asm_regions(store: &LineStore, infos: &mut [LineInfo]) {
 /// `*(volatile unsigned *)p` into a register copy, and one store of two
 /// consecutive volatile stores was folded away. Each line in the region is
 /// pinned (`pinned` + `volatile_access`), so no pass reorders, deletes,
-/// reuses or rewrites it; the one fold that preserves the contract --
-/// fusing the sequence into a single memory RMW instruction -- is taught
-/// to recognize the flag in `fold_memory_rmw`. The markers are comments
-/// and reach the assembler harmlessly.
+/// reuses or rewrites it. Two authorized exceptions preserve the access:
+/// `fold_memory_rmw` fuses a load/op/store into one memory RMW, and
+/// `fuse_load_into_alu` transfers an adjacent load to a direct ALU consumer.
+/// Both retain volatile protection on the surviving memory instruction.
+/// Comment markers are consumed here; they do not appear in final assembly.
 fn pin_volatile_access_regions(store: &LineStore, infos: &mut [LineInfo]) {
     // Regions may nest: descriptor lowering uses an inner region to protect
     // its special-ABI call, and that sequence may itself implement a C
@@ -196,8 +197,8 @@ fn pin_volatile_access_regions(store: &LineStore, infos: &mut [LineInfo]) {
         let trimmed = infos[i].trimmed(store.get(i));
         // The markers are consumed here, so they are deleted from the output:
         // a marker-free `.s` is what every other lccc path produces. Deleting
-        // them does not weaken the region, because the region's own lines are
-        // pinned `InlineAsm` (a barrier to every pass) regardless of neighbours.
+        // them does not weaken the region: its instructions retain their real
+        // classification but are pinned below, regardless of neighbours.
         if trimmed == "# LCCC_VOLATILE_BEGIN" {
             volatile_depth = volatile_depth.saturating_add(1);
             mark_nop(&mut infos[i]);
