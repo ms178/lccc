@@ -79,6 +79,24 @@ Attempts that did **not** pay off, measured, and therefore not shipped:
   text.tar L9 by up to 5 %. Not adopted.
 * **Peephole budget** widening: no effect at all (the budget was not
   binding for any zstd TU).
+* **Dispatch-trampoline specialization** (the closest match to what GCC
+  actually does here): 21 zstd wrappers such as
+  `ZSTD_compressBlock_lazy2_row` are 58-byte bodies that forward constant
+  `(depth, mlBase, rowLog, dictMode)` tuples to one 18 KB
+  `ZSTD_compressBlock_lazy_generic`. Admitting an oversized callee when the
+  caller is a pure trampoline — one block, one call, the call's result is the
+  function's result — produces exactly the shape GCC has (wrapper bodies grow
+  to 8.2 KB / 6.3 KB / 5.0 KB against GCC's 2.1 k / 1.8 k / 1.8 k
+  instructions) and the constants do fold. Measured: **1.4064 vs 1.3941**
+  geometric mean over 16 cases. Level 9 and level 5 compression gain 4-5 %
+  (1.271 vs 1.297, 1.290 vs 1.341 on text1m) but level 12 loses 12 %
+  (1.516 vs 1.351) and the library grows 22 % (1 104 532 → 1 344 172 bytes),
+  so the trade is a net loss and the change is not in the tree. Two lessons:
+  the inliner is not the binding constraint on this workload, and a rule that
+  clones a body into every wrapper needs a growth budget, not just a shape
+  predicate.
+* **`CCC_EVICT_SHORT_K`** 0 and 64 against the default 16 (the mode-3
+  next-use gate's cost-ratio escape): 1.3886 / 1.3862 / 1.3842. Keep 16.
 
 ## CLI standing (the number that matters for the acceptance bar)
 

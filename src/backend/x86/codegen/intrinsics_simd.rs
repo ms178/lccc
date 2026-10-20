@@ -1839,6 +1839,37 @@ impl X86Codegen {
             }
             this.avx_store_dest(dest_ptr);
         };
+        // Width-changing packed converts do NOT fit the ymm->ymm `unary`
+        // helper: VCVTPS2PD/VCVTDQ2PD are 1:2 widening (VEX source is always
+        // xmm: 4 floats -> 4 doubles), and VCVTPD2PS/VCVTPD2DQ/VCVTTPD2DQ are
+        // 2:1 narrowing (VEX destination is always xmm: 4 doubles -> 4
+        // floats/ints). Emitting the generic form produced
+        // `vcvtps2pd %ymm0, %ymm0`, which the assembler rejects as an operand
+        // size mismatch, so `_mm256_cvtps_pd` and its four siblings did not
+        // compile at all.
+        let widen = |this: &mut Self, inst: &str| {
+            if let Some(m) = this.evex_arg_mem(&args[0]) {
+                // A VEX widening convert's memory tuple is 16 bytes.
+                this.state
+                    .emit_fmt(format_args!("    {} {}, %ymm0", inst, m));
+            } else {
+                this.sse_load_arg(&args[0], "xmm0");
+                this.state
+                    .emit_fmt(format_args!("    {} %xmm0, %ymm0", inst));
+            }
+            this.avx_store_dest(dest_ptr);
+        };
+        let narrow = |this: &mut Self, inst: &str| {
+            if let Some(m) = this.evex_arg_mem(&args[0]) {
+                this.state
+                    .emit_fmt(format_args!("    {} {}, %xmm0", inst, m));
+            } else {
+                this.avx_load_arg(&args[0]);
+                this.state
+                    .emit_fmt(format_args!("    {} %ymm0, %xmm0", inst));
+            }
+            this.sse_store_dest(dest_ptr, "xmm0");
+        };
         match op {
             DivPs256 => binary(self, "vdivps", false),
             MinPs256 => binary(self, "vminps", true),
@@ -1865,11 +1896,11 @@ impl X86Codegen {
             CvtPs2Ep32_256 => unary(self, "vcvtps2dq"),
             CvtEp32ToPs256 => unary(self, "vcvtdq2ps"),
             CvttPs2Ep32_256 => unary(self, "vcvttps2dq"),
-            CvtPs2Pd256 => unary(self, "vcvtps2pd"),
-            CvtPd2Ps256 => unary(self, "vcvtpd2ps"),
-            CvtPd2Ep32_256 => unary(self, "vcvtpd2dq"),
-            CvtEp32ToPd256 => unary(self, "vcvtdq2pd"),
-            CvttPd2Ep32_256 => unary(self, "vcvttpd2dq"),
+            CvtPs2Pd256 => widen(self, "vcvtps2pd"),
+            CvtEp32ToPd256 => widen(self, "vcvtdq2pd"),
+            CvtPd2Ps256 => narrow(self, "vcvtpd2ps"),
+            CvtPd2Ep32_256 => narrow(self, "vcvtpd2dq"),
+            CvttPd2Ep32_256 => narrow(self, "vcvttpd2dq"),
             // 3-op with imm: vcmpps/vcmppd/vshufps/vshufpd/vblendps/vblendpd (a, b, imm)
             CmpPs256 | CmpPd256 | ShufPs256 | ShufPd256 | BlendPs256 | BlendPd256 => {
                 let inst = match op {
