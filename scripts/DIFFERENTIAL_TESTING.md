@@ -21,8 +21,9 @@ for finding compiler miscompiles. Those tools found the regression corpus in
 |---|---|---|
 | `synthetic` | Built-in randomized C generator (fixed-shape programs with random constants) | none |
 | `csmith` | [Csmith](https://github.com/csmith-project/csmith) | `csmith` binary + runtime headers |
-| `yarpgen` | [YARPGen](https://github.com/VoR0n0k/yarpgen) | `yarpgen` binary |
+| `yarpgen` | [YARPGen](https://github.com/intel/yarpgen) (provision pinned: `scripts/ensure_yarpgen.sh`) | `yarpgen` binary |
 | `stress_suite` | Repository stress generators (`gen_fp_stress`, `gen_gep_chain_stress`, `gen_slot_stress`) + a bounded `unroll_stress.py` sweep | none |
+| `mutpair` | Missed-alarm near-miss pairs (`scripts/mutpair.py`): UB-free function + one-edit mutant, execution-filtered to *known* inequivalent / known equivalent; both result columns printed and judged | none |
 
 Every advertised engine must be a real implementation: `--check-engines`
 verifies the dispatch wiring and is wired into CI. (This guard exists because
@@ -44,6 +45,12 @@ the csmith/yarpgen engines once regressed to silent no-op stubs that reported
 
 # Repository stress generators + bounded unroller sweep.
 ./scripts/fuzz_diff.py --engine stress_suite --seed 1234
+
+# Missed-alarm pairs (Regehr/Livinskii transplant): catches optimisers that
+# collapse two observably different computations.  Standalone mode judges
+# against the built-in Python model (no reference compiler needed).
+./scripts/fuzz_diff.py --engine mutpair --count 300 --seed 1000 -j2
+./scripts/mutpair.py --self-test   # invariants + fake-optimiser negative control
 
 # CI wiring guard.
 ./scripts/fuzz_diff.py --check-engines

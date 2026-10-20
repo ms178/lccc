@@ -509,6 +509,12 @@ jobs:
       run: |
         python3 scripts/test_local_oracles.py
         python3 scripts/test_icx_provision.py
+    - name: Verify missed-alarm pair engines and slice superoptimiser
+      run: |
+        python3 scripts/mutpair.py --self-test
+        python3 scripts/slice_superopt.py --self-test
+        python3 scripts/yarpgen_mutpair.py --self-test
+        python3 -m unittest scripts.test_mutpair scripts.test_slice_superopt scripts.test_yarpgen_mutpair
     - name: Verify binary-equivalence attribution contracts
       run: python3 tests/corpus/test_binary_equivalence.py
     - name: Verify benchmark harness oracle and timing contracts

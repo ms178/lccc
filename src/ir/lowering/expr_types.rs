@@ -2112,6 +2112,30 @@ impl Lowerer {
     /// This handles the common typeof patterns (identifier, deref, address-of, cast)
     /// where the identifier is declared in the same compound statement.
     /// More complex expressions (member access, subscript, etc.) are not supported.
+    /// Composite type of a conditional's arms resolved against a
+    /// statement-expression's compound-local scope (scope binding wins over
+    /// normal resolution, so locals shadow outer same-named bindings).
+    /// Mirrors `conditional_expr_ctype` for the scope-threaded path.
+    fn conditional_ctype_with_scope(
+        &self,
+        then_expr: &Expr,
+        else_expr: &Expr,
+        scope: &FxHashMap<String, CType>,
+    ) -> Option<CType> {
+        use crate::common::const_arith::is_null_pointer_constant;
+        let then_ct = self
+            .get_expr_ctype_with_scope(then_expr, scope)
+            .or_else(|| self.get_expr_ctype(then_expr));
+        let else_ct = self
+            .get_expr_ctype_with_scope(else_expr, scope)
+            .or_else(|| self.get_expr_ctype(else_expr));
+        let then_is_npc = CType::conditional_arm_npc_matters(then_ct.as_ref(), else_ct.as_ref())
+            && is_null_pointer_constant(then_expr);
+        let else_is_npc = CType::conditional_arm_npc_matters(else_ct.as_ref(), then_ct.as_ref())
+            && is_null_pointer_constant(else_expr);
+        CType::conditional_composite_type(then_ct, else_ct, then_is_npc, else_is_npc)
+    }
+
     fn get_expr_ctype_with_scope(
         &self,
         expr: &Expr,
@@ -2146,37 +2170,28 @@ impl Lowerer {
                 // typeof((type)expr) = type
                 Some(self.type_spec_to_ctype(type_spec))
             }
-            // Conditional: use the then-branch type (matches get_expr_ctype behavior)
-            Expr::Conditional(_, then_expr, _, _) => self
-                .get_expr_ctype(then_expr)
-                .or_else(|| self.get_expr_ctype_with_scope(then_expr, scope)),
-            // GNU conditional (`x ?: x`): both operands feed the result type, so
-            // resolve them against the scope too (allows a local `unsigned x` to
-            // shadow an outer `long x` when determining the statement-expression
-            // result type).
+            // Conditional: C11 6.5.15 composite type of the two arms
+            // (usual arithmetic conversions for arithmetic arms), with the
+            // arms resolved against the compound-local scope first (a local
+            // declaration shadows an outer same-named binding).  Taking the
+            // then-arm's type here -- the old behaviour -- mistyped every
+            // min/max-style statement expression whose arms have different
+            // types: `({ unsigned char _a = 225; unsigned long long _b =
+            // 4955; _a > _b ? _a : _b; })` came out `unsigned char`, so the
+            // result was truncated to 91 and enclosing comparisons were
+            // performed on the truncated value (YARPGen seed 20261020: the
+            // outer loop bound collapsed and the loop ran zero times at
+            // -O1).  This now matches get_expr_ctype's conditional_expr_ctype.
+            Expr::Conditional(_, then_expr, else_expr, _) => {
+                self.conditional_ctype_with_scope(then_expr, else_expr, scope)
+            }
+            // GNU conditional (`x ?: y` is `x ? x : y`): same composite rule,
+            // with the condition expression doubling as the then-arm.
+            // Resolving against the scope first lets a local `unsigned x`
+            // shadow an outer `long x` when determining the
+            // statement-expression result type.
             Expr::GnuConditional(cond, else_expr, _) => {
-                // Prefer the scope binding (local declaration shadows an outer
-                // same-named binding). Resolving against the normal scope first
-                // would pick up the outer `long x` instead of the inner
-                // `unsigned x`.
-                let cond_ct = self
-                    .get_expr_ctype_with_scope(cond, scope)
-                    .or_else(|| self.get_expr_ctype(cond));
-                let else_ct = self
-                    .get_expr_ctype_with_scope(else_expr, scope)
-                    .or_else(|| self.get_expr_ctype(else_expr));
-                match (cond_ct, else_ct) {
-                    (Some(l), Some(r)) => {
-                        if l.size() >= r.size() {
-                            Some(l)
-                        } else {
-                            Some(r)
-                        }
-                    }
-                    (Some(l), None) => Some(l),
-                    (None, Some(r)) => Some(r),
-                    (None, None) => None,
-                }
+                self.conditional_ctype_with_scope(cond, else_expr, scope)
             }
             // Binary ops: try to infer from operands using scope
             Expr::BinaryOp(op, lhs, rhs, _) => {

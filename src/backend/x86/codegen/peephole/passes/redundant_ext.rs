@@ -68,6 +68,113 @@ fn reg32_name(fam: u8) -> Option<&'static str> {
     }
 }
 
+/// Get the 64-bit register name for a family id (0=rax -> "rax", 8 -> "r8").
+fn reg64_name(fam: u8) -> Option<&'static str> {
+    match fam {
+        0 => Some("rax"),
+        1 => Some("rcx"),
+        2 => Some("rdx"),
+        3 => Some("rbx"),
+        4 => Some("rsp"),
+        5 => Some("rbp"),
+        6 => Some("rsi"),
+        7 => Some("rdi"),
+        8 => Some("r8"),
+        9 => Some("r9"),
+        10 => Some("r10"),
+        11 => Some("r11"),
+        12 => Some("r12"),
+        13 => Some("r13"),
+        14 => Some("r14"),
+        15 => Some("r15"),
+        _ => None,
+    }
+}
+
+/// Get the low-8-bit register name for a family id (0 -> "al", 8 -> "r8b").
+/// High-byte registers (ah/bh/ch/dh) deliberately have no entry anywhere in
+/// this pass: family_of_reg returns None for them, and the sign-extension
+/// consumer additionally requires the source text to equal this low-byte
+/// name, so a hypothetical `movsbq %ah, ...` can never be mistaken for a
+/// re-extension of the low byte.
+fn reg8_name(fam: u8) -> Option<&'static str> {
+    match fam {
+        0 => Some("al"),
+        1 => Some("cl"),
+        2 => Some("dl"),
+        3 => Some("bl"),
+        4 => Some("spl"),
+        5 => Some("bpl"),
+        6 => Some("sil"),
+        7 => Some("dil"),
+        8 => Some("r8b"),
+        9 => Some("r9b"),
+        10 => Some("r10b"),
+        11 => Some("r11b"),
+        12 => Some("r12b"),
+        13 => Some("r13b"),
+        14 => Some("r14b"),
+        15 => Some("r15b"),
+        _ => None,
+    }
+}
+
+/// Get the low-16-bit register name for a family id (0 -> "ax", 8 -> "r8w").
+fn reg16_name(fam: u8) -> Option<&'static str> {
+    match fam {
+        0 => Some("ax"),
+        1 => Some("cx"),
+        2 => Some("dx"),
+        3 => Some("bx"),
+        4 => Some("sp"),
+        5 => Some("bp"),
+        6 => Some("si"),
+        7 => Some("di"),
+        8 => Some("r8w"),
+        9 => Some("r9w"),
+        10 => Some("r10w"),
+        11 => Some("r11w"),
+        12 => Some("r12w"),
+        13 => Some("r13w"),
+        14 => Some("r14w"),
+        15 => Some("r15w"),
+        _ => None,
+    }
+}
+
+/// Parse the two operands of a two-operand instruction line ("op SRC, DST").
+/// Returns (src, dst) with whitespace trimmed, or None when the line cannot
+/// be split safely. The operand separator is the LAST comma that is not
+/// inside parentheses (memory operands contain commas: `(%rax,%rcx,4)`).
+/// Slicing is guarded the same way as the existing patterns: a comma that
+/// appears before the first space must never invert the source range.
+fn split_two_operands(t: &str) -> Option<(&str, &str)> {
+    let mut depth: i32 = 0;
+    let mut comma: Option<usize> = None;
+    for (idx, ch) in t.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => comma = Some(idx),
+            _ => {}
+        }
+    }
+    let comma = comma?;
+    let mut so = t.find(|c: char| c == ' ' || c == '\t')? + 1;
+    if so > comma || comma >= t.len() {
+        return None;
+    }
+    while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
+        so += 1;
+    }
+    let src = t[so..comma].trim();
+    let dst = t[comma + 1..].trim();
+    if src.is_empty() || dst.is_empty() {
+        return None;
+    }
+    Some((src, dst))
+}
+
 /// Is this a 32-bit or smaller register name (i.e. writing it zero-extends or
 /// truncates the upper 32 bits)? Note: the 32-bit names are eax/ebx/ecx/edx/
 /// esi/edi/ebp/esp/r8d..r15d; the 8-bit names are al/bl/cl/dl/sil/dil/bpl/spl/
@@ -263,6 +370,27 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
     // if bit 31 is set then sext(low32) has them all SET, so the values
     // differ. Only the two provable cases below establish the fact.
     let mut sext32 = vec![false; GP_FAMILIES];
+    // sext8[f] / sext16[f] = family f's 64-bit value is provably equal to
+    // sext(its own low 8 / low 16 bits) -- exactly the postcondition of
+    // `movsbq <any>, %f` / `movswq <any>, %f`. sext8 implies sext16 implies
+    // sext32 (sign-extending from a narrower width also reproduces the sign
+    // bit across every wider boundary), and the producers below maintain
+    // that implication. The consumer transform is the signed mirror image
+    // of the is_byte rule: an I8 load in this backend is emitted as a
+    // sign-extending `movsbq` into %rax, and the immediately following
+    // signed widening cast emits a SECOND `movsbq %al, %rXX` -- the value
+    // is already sign-extended in %rax, so the cast is a plain register
+    // copy. `movq` can be move-eliminated by register renaming on modern
+    // cores; `movsbq` cannot. Measured shape (base64 table decode loop,
+    // tests/bench/k_base64_decode.c): four adjacent
+    // `movsbq (mem),%rax` / `movsbq %al,%rNN` pairs per iteration.
+    // Soundness: the facts are set ONLY by movsbq/movswq/movslq producers and
+    // propagated only by register-to-register movq; every other write clears
+    // them, including the conservative catch-all, labels, calls and
+    // inline-asm boundaries. Kill switch: CCC_NO_SEXT (mirrors CCC_NO_EXT16).
+    let sext_enabled = std::env::var("CCC_NO_SEXT").is_err();
+    let mut sext8 = vec![false; GP_FAMILIES];
+    let mut sext16 = vec![false; GP_FAMILIES];
 
     // Inline-asm regions (`#APP` .. `#NO_APP`) are user-authored text that
     // must reach the assembler byte-for-byte (kernel ALTERNATIVE() length
@@ -290,6 +418,8 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
             is_byte = vec![false; GP_FAMILIES];
             is_16 = vec![false; GP_FAMILIES];
             sext32 = vec![false; GP_FAMILIES];
+            sext8 = vec![false; GP_FAMILIES];
+            sext16 = vec![false; GP_FAMILIES];
             continue;
         }
         if t == "#NO_APP" {
@@ -298,6 +428,8 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
             is_byte = vec![false; GP_FAMILIES];
             is_16 = vec![false; GP_FAMILIES];
             sext32 = vec![false; GP_FAMILIES];
+            sext8 = vec![false; GP_FAMILIES];
+            sext16 = vec![false; GP_FAMILIES];
             continue;
         }
         if in_asm {
@@ -325,6 +457,8 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
             is_byte = vec![false; GP_FAMILIES];
             is_16 = vec![false; GP_FAMILIES];
             sext32 = vec![false; GP_FAMILIES];
+            sext8 = vec![false; GP_FAMILIES];
+            sext16 = vec![false; GP_FAMILIES];
             continue;
         }
 
@@ -384,6 +518,19 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                 // return) so the remaining lines are still processed.
                 let mut so = t.find(' ').unwrap_or(0) + 1;
                 if so > comma || comma >= t.len() {
+                    // The consumer cannot parse this line, but the line
+                    // still REDEFINES its destination: run the producer
+                    // update (which classifies conservatively) instead of
+                    // skipping straight past it with stale facts.
+                    self_update(
+                        t,
+                        &mut upper32_zero,
+                        &mut is_byte,
+                        &mut is_16,
+                        &mut sext32,
+                        &mut sext8,
+                        &mut sext16,
+                    );
                     continue;
                 }
                 while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
@@ -431,6 +578,15 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                             if (df as usize).lt(&GP_FAMILIES) {
                                 upper32_zero[df as usize] = true;
                                 is_byte[df as usize] = false;
+                                // The copy REDEFINES df (and this rewrite
+                                // continues past self_update): every sign
+                                // fact about the old value must die here.
+                                // A zero-extended byte >= 0x80 is not
+                                // sext(low8), so a stale sext8 would
+                                // license a wrong movsbq->movq rewrite.
+                                sext32[df as usize] = false;
+                                sext8[df as usize] = false;
+                                sext16[df as usize] = false;
                             }
                             continue;
                         }
@@ -458,6 +614,19 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                 // return) so the remaining lines are still processed.
                 let mut so = t.find(' ').unwrap_or(0) + 1;
                 if so > comma || comma >= t.len() {
+                    // The consumer cannot parse this line, but the line
+                    // still REDEFINES its destination: run the producer
+                    // update (which classifies conservatively) instead of
+                    // skipping straight past it with stale facts.
+                    self_update(
+                        t,
+                        &mut upper32_zero,
+                        &mut is_byte,
+                        &mut is_16,
+                        &mut sext32,
+                        &mut sext8,
+                        &mut sext16,
+                    );
                     continue;
                 }
                 while so < comma && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
@@ -498,6 +667,11 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                                 upper32_zero[df as usize] = true;
                                 is_byte[df as usize] = false;
                                 is_16[df as usize] = false; // 32-bit copy: may exceed 16 bits
+                                // Redefinition past self_update: kill the
+                                // sign facts too (see the movzbl rewrite).
+                                sext32[df as usize] = false;
+                                sext8[df as usize] = false;
+                                sext16[df as usize] = false;
                             }
                             continue;
                         }
@@ -506,6 +680,34 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
             }
         }
 
+        // --- Pattern: redundant SIGN re-extension (signed mirror of the
+        //    is_byte / is_16 rules above) ---
+        // Proof obligations live in rewrite_sign_reextension.
+        if sext_enabled
+            && (t.starts_with("movsbq ")
+                || t.starts_with("movswq ")
+                || t.starts_with("movsbl ")
+                || t.starts_with("movswl ")
+                || t.starts_with("movslq ")
+                || t.starts_with("movsxd "))
+        {
+            let mut facts = ExtFacts {
+                upper32_zero: &mut upper32_zero,
+                is_byte: &mut is_byte,
+                is_16: &mut is_16,
+                sext32: &mut sext32,
+                sext8: &mut sext8,
+                sext16: &mut sext16,
+            };
+            if let Some(action) = rewrite_sign_reextension(t, &mut facts) {
+                match action {
+                    ExtRewrite::Delete => keep[i] = false,
+                    ExtRewrite::Replace(rep) => lines[i] = rep,
+                }
+                changed = true;
+                continue;
+            }
+        }
         // --- Pattern: 64-bit copy of a known zero-extended value ---
         //
         // Register allocation often emits a type-erased `movq %src64, %dst64`
@@ -566,6 +768,25 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                                                 upper32_zero[df as usize] = true;
                                                 is_byte[df as usize] = is_byte[sf as usize];
                                                 is_16[df as usize] = is_16[sf as usize];
+                                                // PRE-EXISTING SOUNDNESS BUG:
+                                                // this narrowing redefines df
+                                                // with a ZERO-extended value
+                                                // whose bit 31 is arbitrary,
+                                                // so sext32 (and the narrower
+                                                // sext facts) do NOT hold for
+                                                // the new value; they were
+                                                // left stale here, and a later
+                                                // `movslq %dfd, %df` could be
+                                                // deleted as a no-op on that
+                                                // stale fact, losing the sign
+                                                // extension.  (The byte/word
+                                                // rewrite sites above were
+                                                // only accidentally safe: their
+                                                // values provably have bit 31
+                                                // clear.  This one is not.)
+                                                sext32[df as usize] = false;
+                                                sext8[df as usize] = false;
+                                                sext16[df as usize] = false;
                                                 continue;
                                             }
                                         }
@@ -579,7 +800,15 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
         }
 
         // --- Update flags based on this instruction ---
-        self_update(t, &mut upper32_zero, &mut is_byte, &mut is_16, &mut sext32);
+        self_update(
+            t,
+            &mut upper32_zero,
+            &mut is_byte,
+            &mut is_16,
+            &mut sext32,
+            &mut sext8,
+            &mut sext16,
+        );
     }
 
     if changed {
@@ -599,6 +828,8 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
 /// Mnemonics whose 32-bit form writes the low 32 bits of the destination and
 /// zero-extends to 64 bits on x86-64.  `cmpl`/`testl` deliberately do NOT
 /// appear: they only set flags and leave the register value untouched.
+/// `cmov*` deliberately does NOT appear either: its write is conditional,
+/// so it can preserve but never establish a fact (handled separately).
 fn is_32bit_zero_extend_write(op: &str) -> bool {
     matches!(
         op,
@@ -612,19 +843,6 @@ fn is_32bit_zero_extend_write(op: &str) -> bool {
             | "shll"
             | "shrl"
             | "sarl"
-            | "cmovl"
-            | "cmovel"
-            | "cmovnel"
-            | "cmovsl"
-            | "cmovns"
-            | "cmovgl"
-            | "cmovgel"
-            | "cmovll"
-            | "cmovlel"
-            | "cmovbl"
-            | "cmovael"
-            | "cmovbel"
-            | "cmoval"
             | "popcntl"
             | "lzcntl"
             | "tzcntl"
@@ -638,12 +856,289 @@ fn is_32bit_zero_extend_write(op: &str) -> bool {
     )
 }
 
+/// Where a two-operand instruction writes, as far as fact tracking cares.
+enum DstKind {
+    /// `op src, %reg` -- destination register family.
+    Reg(u8),
+    /// `op src, disp(%base,...)` -- memory destination: no register is
+    /// written, so every tracked fact survives (address registers are
+    /// only read).
+    Store,
+    /// Unparsable or symbolic destination: the caller must clear
+    /// conservatively.  Returning early with the destination's facts
+    /// still live -- what the old rfind(',') parses did whenever the
+    /// operand split failed -- lets a stale fact license a wrong
+    /// rewrite later.  Parse failure must mean "know nothing", never
+    /// "change nothing".
+    Unknown,
+}
+
+fn classify_dst(t: &str) -> DstKind {
+    match split_two_operands(t) {
+        Some((_src, dst)) => {
+            if dst.contains('(') {
+                DstKind::Store
+            } else if let Some(df) = family_of_reg(dst) {
+                DstKind::Reg(df)
+            } else {
+                DstKind::Unknown
+            }
+        }
+        None => DstKind::Unknown,
+    }
+}
+
+/// Clear every fact of every register family mentioned in the line (the
+/// conservative catch-all, shared by producer branches whose destination
+/// could not be classified).
+#[allow(clippy::too_many_arguments)]
+fn clear_mentioned_families(
+    t: &str,
+    upper32_zero: &mut Vec<bool>,
+    is_byte: &mut Vec<bool>,
+    is_16: &mut Vec<bool>,
+    sext32: &mut Vec<bool>,
+    sext8: &mut Vec<bool>,
+    sext16: &mut Vec<bool>,
+) {
+    for tok in t.split_whitespace() {
+        if tok.starts_with('%') {
+            let name = tok.trim_end_matches(',');
+            if let Some(f) = family_of_reg(name) {
+                if (f as usize).lt(&upper32_zero.len()) {
+                    upper32_zero[f as usize] = false;
+                    is_byte[f as usize] = false;
+                    is_16[f as usize] = false;
+                    sext32[f as usize] = false;
+                    sext8[f as usize] = false;
+                    sext16[f as usize] = false;
+                }
+            }
+        }
+    }
+}
+
+/// The six fact vectors threaded through the consumer helpers.
+enum ExtRewrite {
+    Delete,
+    Replace(String),
+}
+
+struct ExtFacts<'a> {
+    upper32_zero: &'a mut Vec<bool>,
+    is_byte: &'a mut Vec<bool>,
+    is_16: &'a mut Vec<bool>,
+    sext32: &'a mut Vec<bool>,
+    sext8: &'a mut Vec<bool>,
+    sext16: &'a mut Vec<bool>,
+}
+
+/// Consumer for a redundant SIGN re-extension (signed mirror of the
+/// is_byte / is_16 rules in the main loop).
+///
+/// `movsbq %al, %rXX` where %rax provably already holds sext(its low
+/// 8 bits) computes a value that is ALREADY sitting in %rax: the
+/// instruction is a plain 64-bit copy (or a no-op when the families
+/// coincide). Emitted adjacently by "I8 load + signed widening cast"
+/// pairs (signed-char table lookups, base64 decode): the load is a
+/// sign-extending movsbq into the accumulator and the cast then
+/// re-extends the very same byte.
+///
+/// Returns the rewrite to apply, if any (the caller applies it and
+/// then skips the generic self_update, exactly as the inline patterns
+/// do). Fact updates for the rewritten destination happen here; the
+/// textual replacement is returned so the caller's live `t` borrow of
+/// the line is never invalidated inside the helper.
+fn rewrite_sign_reextension(t: &str, facts: &mut ExtFacts<'_>) -> Option<ExtRewrite> {
+    if let Some((src, dst)) = split_two_operands(t) {
+        if src.starts_with('%') {
+            if let (Some(sf), Some(df)) = (family_of_reg(src), family_of_reg(dst)) {
+                let (sfi, dfi) = (sf as usize, df as usize);
+                if sfi < GP_FAMILIES && dfi < GP_FAMILIES {
+                    let to64 = !is_32bit_or_smaller(dst);
+                    // The source must textually be the LOW
+                    // subregister of its family at exactly the
+                    // extended width.  family_of_reg already
+                    // rejects the high-byte registers, but the
+                    // facts are statements about low bits, so say
+                    // so in the match itself rather than relying
+                    // on that table never growing an "ah" entry.
+                    let src_name = src.trim_start_matches('%');
+                    let src_is_low = if t.starts_with("movsb") {
+                        reg8_name(sf) == Some(src_name)
+                    } else if t.starts_with("movsw") {
+                        reg16_name(sf) == Some(src_name)
+                    } else {
+                        reg32_name(sf) == Some(src_name)
+                    };
+                    // Exact-width fact required: a value known only
+                    // to be sext-from-16 may be 0x0080, where
+                    // sext-from-8 would produce ...FF80 -- rewriting
+                    // on the wider fact alone would miscompile.
+                    let proven = src_is_low
+                        && if t.starts_with("movsb") {
+                            facts.sext8[sfi]
+                        } else if t.starts_with("movsw") {
+                            facts.sext16[sfi]
+                        } else {
+                            facts.sext32[sfi]
+                        };
+                    if proven && to64 {
+                        if sf == df {
+                            return Some(ExtRewrite::Delete);
+                        }
+                        if let (Some(s64), Some(d64)) = (reg64_name(sf), reg64_name(df)) {
+                            let replacement = format!("    movq %{}, %{}", s64, d64);
+                            // Propagate like the movq producer.
+                            facts.upper32_zero[dfi] = facts.upper32_zero[sfi];
+                            facts.is_byte[dfi] = facts.is_byte[sfi];
+                            facts.is_16[dfi] = facts.is_16[sfi];
+                            facts.sext32[dfi] = facts.sext32[sfi];
+                            facts.sext8[dfi] = facts.sext8[sfi];
+                            facts.sext16[dfi] = facts.sext16[sfi];
+                            return Some(ExtRewrite::Replace(replacement));
+                        }
+                    }
+                    if proven && !to64 {
+                        // 32-bit destination: movsbl/movswl and movl
+                        // both write the same low 32 bits (the
+                        // source's low 32 already hold the
+                        // sign-extended pattern) and both zero
+                        // bits 32..63, so the copy is exact.
+                        if let (Some(s32), Some(d32)) = (reg32_name(sf), reg32_name(df)) {
+                            let replacement = format!("    movl %{}, %{}", s32, d32);
+                            facts.upper32_zero[dfi] = true;
+                            facts.is_byte[dfi] = false;
+                            facts.is_16[dfi] = false;
+                            facts.sext32[dfi] = false;
+                            facts.sext8[dfi] = false;
+                            facts.sext16[dfi] = false;
+                            return Some(ExtRewrite::Replace(replacement));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// movq producer: `%regA -> %regB` copies all facts from A to B; a movq
+/// from MEMORY or IMMEDIATE gives the destination an opaque 64-bit
+/// value, so every fact for the destination family is CLEARED.  (The
+/// old code returned early when the source was not a plain register,
+/// leaving stale flags: a later re-extension of the loaded value
+/// would then be wrongly removed, corrupting the upper bits seen by
+/// 64-bit consumers.  Stores change no register facts.)
+fn update_facts_for_movq(t: &str, op: &str, facts: &mut ExtFacts<'_>) {
+    if let Some(comma) = t.rfind(',') {
+        // Split "movq <src>, <dst>" at the FIRST comma that separates the
+        // operands -- but only when the mnemonic really ends before it.
+        //
+        // `so` was derived from the first space and then sliced as
+        // `t[so..comma]`, which panics ("byte range starts at 11 but ends
+        // at 9") whenever the first comma appears before that space, e.g.
+        // for a memory operand written without a space after the comma.
+        // Deriving the operand text from the already-tokenized mnemonic
+        // and guarding the range makes the slice impossible to invert.
+        let so = op.len();
+        let mut so = so.min(t.len());
+        while so < t.len() && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
+            so += 1;
+        }
+        if so > comma || comma >= t.len() {
+            // Unparsable shape: never return with facts untouched (the
+            // stale-fact class the classify_dst conversion eliminated
+            // from the other producer branches).  Unreachable for the
+            // emitter's own movq forms; clear conservatively anyway.
+            clear_mentioned_families(
+                t,
+                facts.upper32_zero,
+                facts.is_byte,
+                facts.is_16,
+                facts.sext32,
+                facts.sext8,
+                facts.sext16,
+            );
+            return;
+        }
+        let src = t[so..comma].trim();
+        let dst = t[comma + 1..].trim();
+        let src_fam = family_of_reg(src);
+        let dst_fam = family_of_reg(dst);
+        if let (Some(sf), Some(df)) = (src_fam, dst_fam) {
+            if (sf as usize).lt(&facts.upper32_zero.len()) {
+                facts.upper32_zero[df as usize] = facts.upper32_zero[sf as usize];
+                facts.is_byte[df as usize] = facts.is_byte[sf as usize];
+                facts.is_16[df as usize] = facts.is_16[sf as usize];
+                facts.sext32[df as usize] = facts.sext32[sf as usize];
+                facts.sext8[df as usize] = facts.sext8[sf as usize];
+                facts.sext16[df as usize] = facts.sext16[sf as usize];
+            }
+        } else if let Some(df) = dst_fam {
+            // movq from memory/immediate (or unparsable source): the
+            // 64-bit value is opaque — clear all dest flags.
+            if (df as usize).lt(&facts.upper32_zero.len()) {
+                facts.upper32_zero[df as usize] = false;
+                facts.is_byte[df as usize] = false;
+                facts.is_16[df as usize] = false;
+                facts.sext32[df as usize] = false;
+                facts.sext8[df as usize] = false;
+                facts.sext16[df as usize] = false;
+            }
+        }
+    }
+    return;
+}
+/// cmov* writes its destination ONLY when the condition holds.  It must
+/// never ESTABLISH a fact: if the move does not execute, the old value
+/// (with arbitrary upper bits) survives.  Treating a 32-bit cmov as an
+/// unconditional zero-extending write (its former home in
+/// is_32bit_zero_extend_write) set upper32_zero for a register that may
+/// still hold a full 64-bit value, licensing the movq->movl narrowing to
+/// drop the upper half.  The only sound preservation: a 32-bit cmov
+/// keeps a PRE-EXISTING upper32_zero fact (taken: the write zero-extends;
+/// not taken: the already-proven value is kept).  Every other fact for
+/// the destination becomes unprovable either way and is cleared; 16- and
+/// 64-bit forms clear upper32_zero too (a taken 64-bit cmov imports the
+/// source's arbitrary upper half).
+fn update_facts_for_cmov(t: &str, op: &str, facts: &mut ExtFacts<'_>) {
+    match classify_dst(t) {
+        DstKind::Reg(df) => {
+            let dfi = df as usize;
+            if dfi < facts.upper32_zero.len() {
+                if !op.ends_with('l') {
+                    facts.upper32_zero[dfi] = false;
+                }
+                facts.is_byte[dfi] = false;
+                facts.is_16[dfi] = false;
+                facts.sext32[dfi] = false;
+                facts.sext8[dfi] = false;
+                facts.sext16[dfi] = false;
+            }
+        }
+        DstKind::Store => {}
+        DstKind::Unknown => clear_mentioned_families(
+            t,
+            facts.upper32_zero,
+            facts.is_byte,
+            facts.is_16,
+            facts.sext32,
+            facts.sext8,
+            facts.sext16,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn self_update(
     t: &str,
     upper32_zero: &mut Vec<bool>,
     is_byte: &mut Vec<bool>,
     is_16: &mut Vec<bool>,
     sext32: &mut Vec<bool>,
+    sext8: &mut Vec<bool>,
+    sext16: &mut Vec<bool>,
 ) {
     let toks: Vec<&str> = t.split_whitespace().collect();
     if toks.is_empty() {
@@ -658,7 +1153,14 @@ fn self_update(
     // call is harmless; trusting stale upper-32-zero state across a call can
     // miscompile a later 64-bit copy.
     if op == "call" || op == "callq" {
-        for flags in [&mut *upper32_zero, &mut *is_byte, &mut *is_16, &mut *sext32] {
+        for flags in [
+            &mut *upper32_zero,
+            &mut *is_byte,
+            &mut *is_16,
+            &mut *sext32,
+            &mut *sext8,
+            &mut *sext16,
+        ] {
             for value in flags.iter_mut() {
                 *value = false;
             }
@@ -666,85 +1168,71 @@ fn self_update(
         return;
     }
 
-    // movq %regA, %regB : copies both flags from A to B.
-    // movq from MEMORY or IMMEDIATE: the destination holds an opaque 64-bit
-    // value — every zero-extension flag for the destination family must be
-    // CLEARED. (The old code returned early when the source was not a plain
-    // register, leaving stale flags: a later re-extension of the loaded
-    // value would then be wrongly removed, corrupting the upper bits seen by
-    // 64-bit consumers. Harmless for stores: movq %reg, mem changes no
-    // register flags.)
     if op == "movq" && t.contains('%') {
-        if let Some(comma) = t.rfind(',') {
-            // Split "movq <src>, <dst>" at the FIRST comma that separates the
-            // operands -- but only when the mnemonic really ends before it.
-            //
-            // `so` was derived from the first space and then sliced as
-            // `t[so..comma]`, which panics ("byte range starts at 11 but ends
-            // at 9") whenever the first comma appears before that space, e.g.
-            // for a memory operand written without a space after the comma.
-            // Deriving the operand text from the already-tokenized mnemonic
-            // and guarding the range makes the slice impossible to invert.
-            let so = op.len();
-            let mut so = so.min(t.len());
-            while so < t.len() && (t.as_bytes()[so] == b' ' || t.as_bytes()[so] == b'\t') {
-                so += 1;
-            }
-            if so > comma || comma >= t.len() {
-                return;
-            }
-            let src = t[so..comma].trim();
-            let dst = t[comma + 1..].trim();
-            let src_fam = family_of_reg(src);
-            let dst_fam = family_of_reg(dst);
-            if let (Some(sf), Some(df)) = (src_fam, dst_fam) {
-                if (sf as usize).lt(&upper32_zero.len()) {
-                    upper32_zero[df as usize] = upper32_zero[sf as usize];
-                    is_byte[df as usize] = is_byte[sf as usize];
-                    is_16[df as usize] = is_16[sf as usize];
-                    sext32[df as usize] = sext32[sf as usize];
-                }
-            } else if let Some(df) = dst_fam {
-                // movq from memory/immediate (or unparsable source): the
-                // 64-bit value is opaque — clear all dest flags.
-                if (df as usize).lt(&upper32_zero.len()) {
-                    upper32_zero[df as usize] = false;
-                    is_byte[df as usize] = false;
-                    is_16[df as usize] = false;
-                    sext32[df as usize] = false;
-                }
-            }
-        }
+        update_facts_for_movq(
+            t,
+            op,
+            &mut ExtFacts {
+                upper32_zero: &mut *upper32_zero,
+                is_byte: &mut *is_byte,
+                is_16: &mut *is_16,
+                sext32: &mut *sext32,
+                sext8: &mut *sext8,
+                sext16: &mut *sext16,
+            },
+        );
         return;
     }
-
     // Byte zero-extension into a register sets upper32_zero, is_byte AND
     // is_16 (a byte value fits in 16 bits).
-    if op.starts_with("movzbl") {
-        if let Some(comma) = t.rfind(',') {
-            let dst = t[comma + 1..].trim();
-            if let Some(df) = family_of_reg(dst) {
+    //
+    // PRE-EXISTING BUG: this branch tested `op.starts_with("movzbl")`, which
+    // `movzbq` does NOT satisfy, so a byte zero-extended to 64 bits fell into
+    // the 16-bit branch below and never set is_byte. The consumer rule then
+    // could not prove a directly following `movzbq %dil, %rdi` redundant and
+    // the duplicate extension survived into the emitted code.
+    if op == "movzbl" || op == "movzbq" {
+        match classify_dst(t) {
+            DstKind::Reg(df) => {
                 if (df as usize).lt(&upper32_zero.len()) {
                     upper32_zero[df as usize] = true;
                     is_byte[df as usize] = true;
                     is_16[df as usize] = std::env::var("CCC_NO_EXT16").is_err();
                     sext32[df as usize] = false;
+                    sext8[df as usize] = false;
+                    sext16[df as usize] = false;
                 }
+            }
+            DstKind::Store => {}
+            DstKind::Unknown => {
+                clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16)
             }
         }
         return;
     }
     // 16-bit zero-extension: upper-32 zero, fits-16, but NOT a byte.
-    if op.starts_with("movzwl") || op.starts_with("movzwq") || op.starts_with("movz") {
-        if let Some(comma) = t.rfind(',') {
-            let dst = t[comma + 1..].trim();
-            if let Some(df) = family_of_reg(dst) {
+    //
+    // PRE-EXISTING LATENT UNSOUNDNESS: the old third disjunct
+    // `op.starts_with("movz")` also matched `movzbw`, whose 16-bit
+    // destination leaves bits 16..63 STALE -- marking that family
+    // upper32_zero is false and could license a wrong movq->movl narrowing
+    // downstream. Only the exact 32/64-bit-destination forms establish the
+    // fact; `movzbw` now falls through to the conservative catch-all.
+    if op == "movzwl" || op == "movzwq" {
+        match classify_dst(t) {
+            DstKind::Reg(df) => {
                 if (df as usize).lt(&upper32_zero.len()) {
                     upper32_zero[df as usize] = true;
                     is_byte[df as usize] = false;
                     is_16[df as usize] = std::env::var("CCC_NO_EXT16").is_err();
                     sext32[df as usize] = false;
+                    sext8[df as usize] = false;
+                    sext16[df as usize] = false;
                 }
+            }
+            DstKind::Store => {}
+            DstKind::Unknown => {
+                clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16)
             }
         }
         return;
@@ -752,35 +1240,61 @@ fn self_update(
     // movl / xorl: zero-extends to 32 bits, but NOT necessarily a byte or
     // 16-bit value.
     if op == "movl" || op == "xorl" {
-        if let Some(comma) = t.rfind(',') {
-            let dst = t[comma + 1..].trim();
-            if let Some(df) = family_of_reg(dst) {
+        match classify_dst(t) {
+            DstKind::Reg(df) => {
                 if (df as usize).lt(&upper32_zero.len()) {
                     upper32_zero[df as usize] = true;
                     is_byte[df as usize] = false;
                     is_16[df as usize] = false;
                     sext32[df as usize] = false;
+                    sext8[df as usize] = false;
+                    sext16[df as usize] = false;
                 }
+            }
+            DstKind::Store => {}
+            DstKind::Unknown => {
+                clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16)
             }
         }
         return;
     }
-    // Any other 32-bit ALU write (addl, subl, andl, orl, leal, imull, shifts,
-    // cmovl) zero-extends to 64 bits on x86-64, so the destination family is
+    // Conditional moves: see update_facts_for_cmov (never establish).
+    if op.starts_with("cmov") {
+        update_facts_for_cmov(
+            t,
+            op,
+            &mut ExtFacts {
+                upper32_zero: &mut *upper32_zero,
+                is_byte: &mut *is_byte,
+                is_16: &mut *is_16,
+                sext32: &mut *sext32,
+                sext8: &mut *sext8,
+                sext16: &mut *sext16,
+            },
+        );
+        return;
+    }
+    // Any other 32-bit ALU write (addl, subl, andl, orl, leal, imull, shifts)
+    // zero-extends to 64 bits on x86-64, so the destination family is
     // upper-32-zero (but not byte/16-bit-known).  Without this, an
     // accumulator chain like `addl %eax, %esi` CLEARED the fact via the
     // conservative fallback below, and a following `movq %rsi, %r12` never
     // narrowed to the shorter, dependency-free `movl %esi, %r12d`.
     if is_32bit_zero_extend_write(op) {
-        if let Some(comma) = t.rfind(',') {
-            let dst = t[comma + 1..].trim();
-            if let Some(df) = family_of_reg(dst) {
+        match classify_dst(t) {
+            DstKind::Reg(df) => {
                 if (df as usize).lt(&upper32_zero.len()) {
                     upper32_zero[df as usize] = true;
                     is_byte[df as usize] = false;
                     is_16[df as usize] = false;
                     sext32[df as usize] = false;
+                    sext8[df as usize] = false;
+                    sext16[df as usize] = false;
                 }
+            }
+            DstKind::Store => {}
+            DstKind::Unknown => {
+                clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16)
             }
         }
         return;
@@ -791,15 +1305,70 @@ fn self_update(
     // zero-extension facts do not survive (bit 31 may have been replicated
     // into bits 32..63).
     if op == "movslq" || op == "movsxd" {
-        if let Some(comma) = t.rfind(',') {
-            let dst = t[comma + 1..].trim();
-            if let Some(df) = family_of_reg(dst) {
+        match classify_dst(t) {
+            DstKind::Reg(df) => {
                 if (df as usize).lt(&upper32_zero.len()) {
                     upper32_zero[df as usize] = false;
                     is_byte[df as usize] = false;
                     is_16[df as usize] = false;
                     sext32[df as usize] = true;
+                    sext8[df as usize] = false;
+                    sext16[df as usize] = false;
                 }
+            }
+            DstKind::Store => {}
+            DstKind::Unknown => {
+                clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16)
+            }
+        }
+        return;
+    }
+
+    // movsbq / movswq <any source>, <dst64>: the destination now holds the
+    // sign-extension of a byte / word to 64 bits. That establishes the
+    // matching narrow fact and, by the width implication, every wider one
+    // (sext-from-8 is also sext-from-16 and sext-from-32 of the resulting
+    // low bits, since the sign bit is replicated across all of them).
+    if op == "movsbq" || op == "movswq" {
+        match classify_dst(t) {
+            DstKind::Reg(df) => {
+                if (df as usize).lt(&upper32_zero.len()) {
+                    upper32_zero[df as usize] = false;
+                    is_byte[df as usize] = false;
+                    is_16[df as usize] = false;
+                    sext32[df as usize] = true;
+                    sext16[df as usize] = true;
+                    sext8[df as usize] = op == "movsbq";
+                }
+            }
+            DstKind::Store => {}
+            DstKind::Unknown => {
+                clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16)
+            }
+        }
+        return;
+    }
+
+    // movsbl / movswl <any source>, <dst32>: a 32-bit destination write,
+    // so bits 32..63 are zero (upper32_zero). The 64-bit sign-extension
+    // facts do NOT hold (a negative value has zeros, not ones, above bit
+    // 31), so they are cleared. Previously these fell into the catch-all,
+    // which also discarded the true upper32_zero fact.
+    if op == "movsbl" || op == "movswl" {
+        match classify_dst(t) {
+            DstKind::Reg(df) => {
+                if (df as usize).lt(&upper32_zero.len()) {
+                    upper32_zero[df as usize] = true;
+                    is_byte[df as usize] = false;
+                    is_16[df as usize] = false;
+                    sext32[df as usize] = false;
+                    sext8[df as usize] = false;
+                    sext16[df as usize] = false;
+                }
+            }
+            DstKind::Store => {}
+            DstKind::Unknown => {
+                clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16)
             }
         }
         return;
@@ -815,9 +1384,29 @@ fn self_update(
                 is_byte[fam as usize] = false;
                 is_16[fam as usize] = false;
                 sext32[fam as usize] = false;
+                sext8[fam as usize] = false;
+                sext16[fam as usize] = false;
             }
         }
         return;
+    }
+
+    // Pure stores (memory destination) write NO register, so every tracked
+    // fact survives them -- including facts about the registers used in the
+    // address. Without this, `movb %al, 1(%r10,%r15,4)` between two
+    // `movslq %r15d, %r15` reached the catch-all below, which cleared the
+    // sext32 fact for %r15 merely for being MENTIONED, and the duplicate
+    // extension survived. The load forms already preserve index facts via
+    // their early producer branches; this makes stores consistent.
+    if matches!(op, "movb" | "movw" | "movl" | "movq") {
+        // The destination address itself contains commas ((%r10,%r15,4)),
+        // so the separator must be found parenthesis-aware -- rfind(',')
+        // would land inside the address.
+        if let Some((_src, dst)) = split_two_operands(t) {
+            if dst.contains('(') {
+                return;
+            }
+        }
     }
 
     // Anything else that writes registers: conservatively clear the flags of
@@ -827,24 +1416,7 @@ fn self_update(
     // %r14`, shifts, etc. A stale upper-32-zero/is_byte flag on such a line
     // could wrongly eliminate a real re-extension (miscompile). Clearing
     // extra families is always safe (only loses optimizations).
-    {
-        let mut cleared = false;
-        for tok in toks {
-            if tok.starts_with('%') {
-                let name = tok.trim_end_matches(',');
-                if let Some(f) = family_of_reg(name) {
-                    if (f as usize).lt(&upper32_zero.len()) {
-                        upper32_zero[f as usize] = false;
-                        is_byte[f as usize] = false;
-                        is_16[f as usize] = false;
-                        sext32[f as usize] = false;
-                        cleared = true;
-                    }
-                }
-            }
-        }
-        let _ = cleared;
-    }
+    clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16);
 }
 
 #[cfg(test)]
@@ -1103,5 +1675,255 @@ mod tests {
         // The trailing movzbl must survive: %rax holds an opaque load result.
         assert!(asm.contains("movzbl %al, %eax"), "asm was:\n{asm}");
         assert!(asm.contains("movq (%rcx, %r12), %rax"), "asm was:\n{asm}");
+    }
+
+    // ── redundant sign re-extension (movsbq/movswq/movsbl/movswl) ───────
+
+    #[test]
+    fn collapses_signed_load_then_widen_pair_to_movq() {
+        // The base64-decode hot shape: an I8 load is a sign-extending movsbq
+        // into %rax and the widening cast re-extends the same byte into the
+        // target register. The second extension is a plain copy.
+        let out = run(concat!(
+            "foo:\n",
+            "    movsbq (%r10), %rax\n",
+            "    movsbq %al, %r11\n",
+        ));
+        assert_eq!(out.matches("movsbq").count(), 1, "asm was:\n{out}");
+        assert!(out.contains("movq %rax, %r11"), "asm was:\n{out}");
+    }
+
+    #[test]
+    fn removes_self_sign_reextension_of_a_byte() {
+        let out = run(concat!(
+            "foo:\n",
+            "    movsbq (%rdi), %rax\n",
+            "    movsbq %al, %rax\n",
+        ));
+        assert_eq!(out.matches("movsbq").count(), 1, "asm was:\n{out}");
+    }
+
+    #[test]
+    fn rewrites_32bit_sign_reextension_to_movl() {
+        let out = run(concat!(
+            "foo:\n",
+            "    movsbq (%rdi), %rax\n",
+            "    movsbl %al, %ecx\n",
+        ));
+        assert!(out.contains("movl %eax, %ecx"), "asm was:\n{out}");
+        assert_eq!(out.matches("movsb").count(), 1, "asm was:\n{out}");
+    }
+
+    #[test]
+    fn collapses_signed_word_load_then_widen_pair_to_movq() {
+        let out = run(concat!(
+            "foo:\n",
+            "    movswq (%rdi), %rax\n",
+            "    movswq %ax, %rcx\n",
+        ));
+        assert_eq!(out.matches("movswq").count(), 1, "asm was:\n{out}");
+        assert!(out.contains("movq %rax, %rcx"), "asm was:\n{out}");
+    }
+
+    #[test]
+    fn word_fact_does_not_license_a_byte_reextension_rewrite() {
+        // SOUNDNESS: 0x0080 is a valid sext-from-16 result whose low byte
+        // sign-extends to ...FF80. Requiring the exact-width fact keeps
+        // this genuine re-extension.
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    movswq (%rdi), %rax\n",
+            "    movsbq %al, %rcx\n",
+        ));
+        assert!(out.contains("movsbq %al, %rcx"), "asm was:\n{out}");
+    }
+
+    #[test]
+    fn keeps_sign_reextension_after_the_register_is_redefined() {
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    movsbq (%rdi), %rax\n",
+            "    addq $1, %rax\n",
+            "    movsbq %al, %rcx\n",
+        ));
+        assert!(out.contains("movsbq %al, %rcx"), "asm was:\n{out}");
+    }
+
+    #[test]
+    fn keeps_sign_reextension_across_a_label() {
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    movsbq (%rdi), %rax\n",
+            ".L1:\n",
+            "    movsbq %al, %rcx\n",
+        ));
+        assert!(out.contains("movsbq %al, %rcx"), "asm was:\n{out}");
+    }
+
+    #[test]
+    fn sign_fact_travels_through_movq_for_byte_values() {
+        let out = run(concat!(
+            "foo:\n",
+            "    movsbq (%rdi), %rax\n",
+            "    movq %rax, %rcx\n",
+            "    movsbq %cl, %rdx\n",
+        ));
+        assert!(out.contains("movq %rcx, %rdx"), "asm was:\n{out}");
+        assert_eq!(out.matches("movsbq").count(), 1, "asm was:\n{out}");
+    }
+
+    #[test]
+    fn movslq_from_a_known_sign_extended_register_becomes_movq() {
+        let out = run(concat!(
+            "foo:\n",
+            "    movslq %eax, %rax\n",
+            "    movslq %eax, %rcx\n",
+        ));
+        assert!(out.contains("movq %rax, %rcx"), "asm was:\n{out}");
+        assert_eq!(out.matches("movslq").count(), 1, "asm was:\n{out}");
+    }
+
+    #[test]
+    fn removes_a_duplicate_movzbq_of_the_same_register() {
+        // Regression for the movzbq producer missing is_byte: the cast of a
+        // freshly zero-extended argument emitted the identical extension
+        // twice in a row.
+        let out = run(concat!(
+            "foo:\n",
+            "    movzbq %dil, %rdi\n",
+            "    movzbq %dil, %rdi\n",
+        ));
+        assert_eq!(out.matches("movzbq").count(), 1, "asm was:\n{out}");
+    }
+
+    #[test]
+    fn a_pure_store_between_sign_extensions_preserves_the_fact() {
+        // A store that merely READS the index register in its address must
+        // not clear the sign-extension fact (loads already preserve it).
+        let out = run(concat!(
+            "foo:\n",
+            "    movslq %r15d, %r15\n",
+            "    movb %al, (%r10, %r15, 4)\n",
+            "    movslq %r15d, %r15\n",
+            "    movb %al, 1(%r10, %r15, 4)\n",
+        ));
+        assert_eq!(out.matches("movslq").count(), 1, "asm was:\n{out}");
+        assert_eq!(out.matches("movb").count(), 2, "asm was:\n{out}");
+    }
+
+    #[test]
+    fn cmov_does_not_establish_upper32_zero() {
+        // cmov writes its destination only when the condition holds, so a
+        // 32-bit cmov must NOT establish upper32_zero for the destination:
+        // if the move does not happen, the old (arbitrary) upper 32 bits
+        // survive.  Establishing the fact lets the movq->movl narrowing
+        // below drop those bits.  (%r15 arrives with a full 64-bit value;
+        // the cmov may or may not overwrite its low half.)
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    movq %rdi, %r15\n",
+            "    cmovel %eax, %r15d\n",
+            "    movq %r15, %rcx\n",
+            "    addl %ecx, %edx\n",
+        ));
+        assert!(
+            out.contains("movq %r15, %rcx"),
+            "cmov-established fact wrongly narrowed the copy:\n{out}"
+        );
+        // A fact that held BEFORE a 32-bit cmov still holds after it (taken:
+        // zero-extending write; not taken: proven value kept), so the
+        // narrowing remains available and must still fire.
+        let out = run(concat!(
+            "foo:\n",
+            "    movl %edi, %r15d\n",
+            "    cmovel %eax, %r15d\n",
+            "    movq %r15, %rcx\n",
+            "    addl %ecx, %edx\n",
+        ));
+        assert!(
+            out.contains("movl %r15d, %ecx"),
+            "pre-existing fact must survive a 32-bit cmov:\n{out}"
+        );
+    }
+
+    #[test]
+    fn movq_narrowing_to_movl_clears_the_sext32_fact() {
+        // Regression (pre-existing): the movq->movl narrowing site left
+        // sext32 stale for the REDEFINED destination.  The narrowed copy
+        // zero-extends an arbitrary 32-bit value, so a later self-movslq
+        // is a real sign extension and must survive.
+        let out = run(concat!(
+            "foo:\n",
+            "    movslq %r15d, %r15\n",
+            "    movzbl (%rdi), %eax\n",
+            "    movq %rax, %r15\n",
+            "    addl %r15d, %ecx\n",
+            "    movslq %r15d, %r15\n",
+        ));
+        assert!(
+            out.contains("movl %eax, %r15d"),
+            "narrowing must fire:\n{out}"
+        );
+        assert_eq!(out.matches("movslq").count(), 2, "asm was:\n{out}");
+    }
+
+    #[test]
+    fn byte_copy_rewrite_clears_the_sext8_fact() {
+        // The cross-family movzbl->movl rewrite redefines %ecx with a
+        // zero-extended byte (0x80..0xFF possible): a stale sext8 fact
+        // from the earlier movsbq into %rcx must not license rewriting
+        // the following genuine sign extension into a plain copy.
+        let out = run(concat!(
+            "foo:\n",
+            "    movzbq (%rdi), %rax\n",
+            "    movsbq (%rsi), %rcx\n",
+            "    movzbl %al, %ecx\n",
+            "    movsbq %cl, %rdx\n",
+        ));
+        assert!(
+            out.contains("movl %eax, %ecx"),
+            "byte rewrite must fire:\n{out}"
+        );
+        assert!(out.contains("movsbq %cl, %rdx"), "asm was:\n{out}");
+    }
+
+    #[test]
+    fn high_byte_sign_extension_is_never_rewritten() {
+        // %ah is bits 8..15, not the low byte the sext8 fact describes.
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    movsbq (%rdi), %rax\n",
+            "    movsbq %ah, %rcx\n",
+        ));
+        assert!(out.contains("movsbq %ah, %rcx"), "asm was:\n{out}");
+    }
+
+    #[test]
+    fn indexed_scale_sign_load_establishes_the_fact() {
+        // The destination parse must be parenthesis-aware: with the old
+        // rfind(',') split this producer was one operand-shape away from
+        // silently keeping stale facts.
+        let out = run(concat!(
+            "foo:\n",
+            "    movsbq (%rdi, %rcx, 4), %rax\n",
+            "    movsbq %al, %rdx\n",
+        ));
+        assert!(out.contains("movq %rax, %rdx"), "asm was:\n{out}");
+        assert_eq!(out.matches("movsbq").count(), 1, "asm was:\n{out}");
+    }
+
+    #[test]
+    fn movzbw_does_not_establish_upper32_zero() {
+        // SOUNDNESS: movzbw writes only %ax; bits 16..63 are stale. The old
+        // `op.starts_with("movz")` producer marked the family upper-32-zero
+        // and licensed narrowing the following 64-bit copy to movl.
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    movzbw (%rdi), %ax\n",
+            "    movq %rax, %rcx\n",
+            "    xorl %ecx, %edx\n",
+        ));
+        assert!(out.contains("movq %rax, %rcx"), "asm was:\n{out}");
+        assert!(!out.contains("movl %eax, %ecx"), "asm was:\n{out}");
     }
 }
