@@ -28,7 +28,7 @@ done
 # diagnostic above still runs all bitwise/exception/guard-page witnesses.
 "$CCC" "${flags[@]}" -march=x86-64-v3 -S "$src/kernels.c" -o "$work/packed.s"
 "$CCC" "${flags[@]}" -march=x86-64 -S "$src/kernels.c" -o "$work/scalar.s"
-"$CCC" "${flags[@]}" -mavx -msse4.1 -S "$src/kernels.c" -o "$work/avx.s"
+"$CCC" "${flags[@]}" -march=x86-64-v2 -mavx -msse4.1 -S "$src/kernels.c" -o "$work/avx.s"
 "$CCC" "${flags[@]}" -mavx2 -mno-sse4.1 -S "$src/kernels.c" -o "$work/no-sse41.s"
 python3 - "$work/packed.s" "$work/scalar.s" "$work/avx.s" "$work/no-sse41.s" <<'PY'
 import re, sys

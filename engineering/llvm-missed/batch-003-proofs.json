@@ -1,0 +1,363 @@
+[
+  {
+    "law": "word32/add",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word32/sub",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word32/mul",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word32/mul-trailing-zero-factor",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word32/left-shift",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word32/logical-right",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word32/arithmetic-right",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word32/rotate",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word32/not",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word32/negate",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word32/xor",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word32/or",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word32/and",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word32/required-sign-demand",
+    "expected": "sat",
+    "result": "sat",
+    "counterexample": "[x32 = 2147483648]"
+  },
+  {
+    "law": "word64/add",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word64/sub",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word64/mul",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word64/mul-trailing-zero-factor",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word64/left-shift",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word64/logical-right",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word64/arithmetic-right",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word64/rotate",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word64/not",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word64/negate",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word64/xor",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word64/or",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word64/and",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "word64/required-sign-demand",
+    "expected": "sat",
+    "result": "sat",
+    "counterexample": "[x64 = 9223372036854775808]"
+  },
+  {
+    "law": "integer/remainder-48-mod-16",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "integer/remainder-80-mod-16",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "integer/remainder-768-mod-256",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "integer/remainder-48-mod-4",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "guard/nondivisible-remainder",
+    "expected": "sat",
+    "result": "sat",
+    "counterexample": "[n = 49]"
+  },
+  {
+    "law": "domain8/ctz/odd-constant",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "domain8/ctz/odd-variable",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "domain8/ctz/negate",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "domain8/ctz/isolate",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "domain8/ctz/or-negate",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "domain8/ctz/or-left",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "domain8/ctz/xor-left",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "domain8/ctz/add-left",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "domain8/ctz/sub-left",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "domain8/ctz/and-not-left",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "domain8/clz/or-right",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "domain8/clz/xor-right",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "domain8/clz/and-not-right",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "guard/even-factor",
+    "expected": "sat",
+    "result": "sat",
+    "counterexample": "[x8 = 128]"
+  },
+  {
+    "law": "guard/zero-shift",
+    "expected": "sat",
+    "result": "sat",
+    "counterexample": "[x8 = 128]"
+  },
+  {
+    "law": "guard/wrong-direction",
+    "expected": "sat",
+    "result": "sat",
+    "counterexample": "[x8 = 43]"
+  },
+  {
+    "law": "bit/complement",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/partition",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/symmetric-difference",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/parity",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_and_xor",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_union_minus_xor",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_union_minus_left",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_union_minus_right",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_xor_minus_left",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_xor_minus_right",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_triangle_xor",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_triangle_and",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_triangle_or",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_doubled_or",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_demorgan_and",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_demorgan_or",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_complement_difference",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_xnor_minus_and",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_nor_plus_xor",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_partition_four",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_partition_three",
+    "expected": "unsat",
+    "result": "unsat"
+  },
+  {
+    "law": "bit/cardinality/pc_absorption",
+    "expected": "unsat",
+    "result": "unsat"
+  }
+]

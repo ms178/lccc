@@ -13,17 +13,19 @@ src="$dir/vectorize_strict_computed_recip.c"
 # The VEX pack must be correct at the emitter, not depend on the optional
 # final-text promotion pass to remove a costly AVX/SSE transition.
 CCC_NO_VEX_PROMOTE=1 "$CCC" -O2 -march=x86-64-v3 -S "$src" -o "$tmp/no-promote.s"
-"$CCC" -O2 -S "$src" -o "$tmp/baseline.s"
+"$CCC" -O2 -march=x86-64 -S "$src" -o "$tmp/baseline.s"
+"$CCC" -O2 -S "$src" -o "$tmp/default.s"
+"$CCC" -O2 -mno-avx2 -S "$src" -o "$tmp/no-avx2.s"
 # The optimizer intentionally requires AVX2 *and* SSE4.1 for this path;
 # keep both feature-gate fallbacks even though individual VEX FP operations
 # are available on some weaker targets.
-"$CCC" -O2 -mavx -msse4.1 -S "$src" -o "$tmp/avx-only.s"
+"$CCC" -O2 -march=x86-64-v2 -mavx -msse4.1 -S "$src" -o "$tmp/avx-only.s"
 "$CCC" -O2 -mavx2 -mno-sse4.1 -S "$src" -o "$tmp/no-sse41.s"
 # Exercise the private-allocation fallback too: no scalar XMM homes means the
 # packed product must spill once and be read as offsets 0, 8, 16, 24.
 CCC_NO_XMM_REGALLOC=1 "$CCC" -O2 -march=x86-64-v3 -S "$src" -o "$tmp/stack.s"
 
-python3 - "$tmp/v3.s" "$tmp/baseline.s" "$tmp/avx-only.s" "$tmp/no-sse41.s" "$tmp/stack.s" "$tmp/no-promote.s" <<'PY'
+python3 - "$tmp/v3.s" "$tmp/baseline.s" "$tmp/avx-only.s" "$tmp/no-sse41.s" "$tmp/stack.s" "$tmp/no-promote.s" "$tmp/default.s" "$tmp/no-avx2.s" <<'PY'
 import re
 import sys
 
@@ -33,6 +35,8 @@ avx_only = open(sys.argv[3], encoding="utf-8").read()
 no_sse41 = open(sys.argv[4], encoding="utf-8").read()
 stack = open(sys.argv[5], encoding="utf-8").read()
 no_promote = open(sys.argv[6], encoding="utf-8").read()
+default = open(sys.argv[7], encoding="utf-8").read()
+no_avx2 = open(sys.argv[8], encoding="utf-8").read()
 
 
 def body(text, name):
@@ -48,7 +52,7 @@ if "vcvtdq2pd" not in packed or "vdivpd" not in packed or "vmulpd" not in packed
 # The four i32 lanes are built entirely with VEX. Legacy movd/pinsrd
 # between VEX-256 instructions was correct but ~28x slower on the measured
 # Xeon VM; the optional final peephole is not an authority for this contract.
-for name, text in (("normal", v3), ("no final VEX promotion", no_promote),
+for name, text in (("normal", v3), ("default V3 permission", default), ("no final VEX promotion", no_promote),
                    ("no XMM register allocation", stack)):
     pack_body = body(text, "ordered_recip_sum")
     pack = re.search(r"(?s)\bvmovd %\w+, %xmm0\n(.*?)\bvcvtdq2pd %xmm0, %ymm0", pack_body)
@@ -61,7 +65,7 @@ if len(adds) < 4:
     raise SystemExit("v3 strict reciprocal loop lost ordered scalar lane adds")
 if "vaddpd" in packed:
     raise SystemExit("strict reciprocal loop formed a reassociated packed add")
-for name, text in (("baseline", baseline), ("AVX-only", avx_only), ("AVX2 without SSE4.1", no_sse41)):
+for name, text in (("baseline", baseline), ("AVX2 denial", no_avx2), ("AVX-only", avx_only), ("AVX2 without SSE4.1", no_sse41)):
     if any(op in text for op in ("vcvtdq2pd", "vdivpd", "vmulpd")):
         raise SystemExit(f"strict reciprocal lowering escaped its AVX2+SSE4.1 gate ({name})")
 

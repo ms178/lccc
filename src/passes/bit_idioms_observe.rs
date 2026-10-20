@@ -10,7 +10,7 @@ struct Test {
     constant: u64,
     op: IrCmpOp,
 }
-fn full(ty: IrType) -> Option<u64> {
+pub(super) fn full(ty: IrType) -> Option<u64> {
     match ty {
         IrType::I32 | IrType::U32 => Some(u32::MAX as u64),
         IrType::I64 | IrType::U64 => Some(u64::MAX),
@@ -33,16 +33,16 @@ fn view(mut value: Operand, defs: &[Option<Instruction>]) -> Operand {
     }
     value
 }
-fn same_bits(a: Operand, b: Operand, defs: &[Option<Instruction>]) -> bool {
+pub(super) fn same_bits(a: Operand, b: Operand, defs: &[Option<Instruction>]) -> bool {
     view(a, defs) == view(b, defs)
 }
-fn definition(value: Operand, defs: &[Option<Instruction>]) -> Option<&Instruction> {
+pub(super) fn definition(value: Operand, defs: &[Option<Instruction>]) -> Option<&Instruction> {
     let Operand::Value(v) = view(value, defs) else {
         return None;
     };
     defs.get(v.0 as usize)?.as_ref()
 }
-fn compatible(a: IrType, b: IrType) -> bool {
+pub(super) fn compatible(a: IrType, b: IrType) -> bool {
     full(a).is_some() && full(b).is_some() && a.size() == b.size()
 }
 fn inverse_odd(n: u64) -> u64 {
@@ -53,14 +53,14 @@ fn inverse_odd(n: u64) -> u64 {
     }
     inverse
 }
-fn swap(n: u64, ty: IrType) -> u64 {
+pub(super) fn swap(n: u64, ty: IrType) -> u64 {
     if ty.size() == 4 {
         (n as u32).swap_bytes() as u64
     } else {
         n.swap_bytes()
     }
 }
-fn rotate(n: u64, amount: u32, ty: IrType, left: bool) -> u64 {
+pub(super) fn rotate(n: u64, amount: u32, ty: IrType, left: bool) -> u64 {
     if ty.size() == 4 {
         if left {
             (n as u32).rotate_left(amount) as u64

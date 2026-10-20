@@ -2225,14 +2225,6 @@ impl Driver {
                 && self.enable_avx
                 && !self.no_sse
                 && !self.general_regs_only,
-            self.target == Target::X86_64
-                && self.enable_avx2
-                && !self.no_sse
-                && !self.general_regs_only,
-            self.target == Target::X86_64
-                && self.enable_sse4_1
-                && !self.no_sse
-                && !self.general_regs_only,
             self.enable_fma,
             // Scalar BMI1 (ANDN) for the middle end's CH-fold defer —
             // mirrors CodegenOptions::bmi1 for the x86-64 backend (the

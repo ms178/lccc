@@ -932,6 +932,9 @@ gate "yarpgen-provisioner-contract" fast \
 gate "strict-computed-recip-codegen" fast \
     bash tests/regression/check_strict_computed_recip_codegen.sh
 
+gate "exact-signed-division" fast \
+    python3 scripts/check_exact_signed_div.py
+
 gate "strict-packed-recip-bitwise" fast \
     python3 scripts/check_strict_packed_recip.py
 
@@ -1131,6 +1134,7 @@ gate "llvm-missed-inventory-tests" fast python3 scripts/test_llvm_missed_invento
 gate "llvm-missed-inventory-optimized-tests" fast python3 -O scripts/test_llvm_missed_inventory.py
 gate "llvm-missed-zero-choice" fast python3 tests/regression/check_llvm_missed_zero_choice.py
 gate "llvm-missed-integer-batch" fast python3 tests/regression/check_llvm_missed_integer_batch.py
+gate "llvm-missed-batch3" fast python3 tests/regression/check_llvm_missed_batch3.py
 
 gate "tls-model-option" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_option.sh
