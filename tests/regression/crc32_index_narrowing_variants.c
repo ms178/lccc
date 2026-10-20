@@ -1,6 +1,5 @@
 /* Regression test for CRC32 table-index narrowing across signed/unsigned mask,
- * narrow cast, nibble, and shifted index spellings, plus exhaustive 256x256
- * byte-index verification.
+ * narrow cast, nibble, and shifted index spellings, plus independent one-step Cartesian byte-index verification.
  */
 #include <stddef.h>
 #include <stdint.h>
@@ -57,6 +56,22 @@ uint32_t crc_nibble_signed_mask(uint32_t crc, const uint8_t *p, size_t n) {
     return crc;
 }
 
+static uint32_t reference_byte(uint32_t crc, uint8_t byte) {
+    crc ^= byte;
+    for (unsigned bit = 0; bit < 8; ++bit)
+        crc = (crc >> 1) ^ ((crc & 1u) ? 0xEDB88320u : 0u);
+    return crc;
+}
+
+static uint32_t reference_nibble(uint32_t crc, uint8_t byte) {
+    /* This witness uses table[idx*16], not the conventional nibble table.
+     * Reconstruct that entry independently without using either table. */
+    uint32_t entry = ((crc ^ byte) & 15u) << 4;
+    for (unsigned bit = 0; bit < 8; ++bit)
+        entry = (entry >> 1) ^ ((entry & 1u) ? 0xEDB88320u : 0u);
+    return entry ^ (crc >> 4);
+}
+
 int main(void) {
     init_tables();
     static const uint8_t msg[] = "123456789";
@@ -69,7 +84,23 @@ int main(void) {
         return 1;
     }
 
-    /* Exhaustive 256-byte index sweep across high-bit-set CRC seeds. */
+    /* Each pair is an independent one-byte update, not evolving CRC state. */
+    static const uint32_t upper[] = {0u, 0x80000000u, 0xffffff00u, 0x12345600u};
+    for (unsigned h = 0; h < sizeof(upper) / sizeof(upper[0]); ++h) {
+        for (unsigned low = 0; low < 256; ++low) {
+            for (unsigned byte = 0; byte < 256; ++byte) {
+                uint32_t seed = upper[h] | low;
+                uint8_t input = (uint8_t)byte;
+                uint32_t ref = reference_byte(seed, input);
+                if (crc_signed_mask_ptr(seed, &input, 1) != ref ||
+                    crc_u8_cast_idx(seed, &input, 1) != ref ||
+                    crc_signed_char_input(seed, (const signed char *)&input, 1) != ref ||
+                    crc_nibble_signed_mask(seed, &input, 1) != reference_nibble(seed, input)) return 3;
+            }
+        }
+    }
+
+    /* Multi-byte recurrence checks complement the Cartesian one-step sweep. */
     uint8_t all_bytes[256];
     for (unsigned i = 0; i < 256; ++i)
         all_bytes[i] = (uint8_t)i;
@@ -78,7 +109,9 @@ int main(void) {
         uint32_t r1 = crc_signed_mask_ptr(seed, all_bytes, 256);
         uint32_t r2 = crc_u8_cast_idx(seed, all_bytes, 256);
         uint32_t r3 = crc_signed_char_input(seed, (const signed char *)all_bytes, 256);
-        if (r1 != r2 || r1 != r3) {
+        uint32_t ref = seed;
+        for (unsigned i = 0; i < 256; ++i) ref = reference_byte(ref, all_bytes[i]);
+        if (r1 != ref || r2 != ref || r3 != ref) {
             printf("FAIL sweep hi=%u: %08x %08x %08x\n", hi, r1, r2, r3);
             return 2;
         }

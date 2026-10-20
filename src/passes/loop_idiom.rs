@@ -48,20 +48,12 @@ use crate::ir::reexports::{
 };
 use crate::passes::loop_analysis::{DominanceChecker, find_natural_loops, merge_loops_by_header};
 
-thread_local! {
-    /// Whether the target has a direct hardware population-count instruction
-    /// (`popcnt` on x86/i686, AdvSIMD `cnt` + `addv` on AArch64 when SIMD
-    /// registers are permitted). Resolved per translation unit by the driver;
-    /// defaults to `true` so standalone unit tests exercise the idiom.
-    static FAST_POPCOUNT_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
-}
-
-pub(crate) fn set_fast_popcount_enabled(enabled: bool) {
-    FAST_POPCOUNT_ENABLED.with(|c| c.set(enabled));
-}
-
-pub(crate) fn fast_popcount_enabled() -> bool {
-    FAST_POPCOUNT_ENABLED.with(|c| c.get())
+/// Immutable target permission for loop idioms. The conservative default keeps
+/// standalone and alternate pass entry points from synthesizing an operation
+/// without a native lowering. Production resolves it once per translation unit.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Capabilities {
+    pub native_popcount: bool,
 }
 
 /// Per-function entry point for the dirty-tracking pipeline. Two globals
@@ -72,8 +64,9 @@ pub(crate) fn run_function(
     func: &mut IrFunction,
     aliased_names: &FxHashSet<String>,
     local_globals: &FxHashSet<String>,
+    capabilities: Capabilities,
 ) -> usize {
-    recognize_idioms(func, aliased_names, local_globals)
+    recognize_idioms(func, aliased_names, local_globals, capabilities)
 }
 
 /// Maximum loops rewritten per function per fixpoint run. Each rewrite
@@ -393,6 +386,7 @@ pub(crate) fn recognize_idioms(
     func: &mut IrFunction,
     aliased_names: &FxHashSet<String>,
     local_globals: &FxHashSet<String>,
+    capabilities: Capabilities,
 ) -> usize {
     if std::env::var("CCC_NO_LOOP_IDIOM").is_ok() {
         return 0;
@@ -499,7 +493,7 @@ pub(crate) fn recognize_idioms(
             // `popcount(x0)` and the final accumulator is `r0 + popcount(x0)`.
             // Gated on target hardware popcount availability (`popcnt` on x86,
             // AdvSIMD `cnt` on AArch64).
-            if fast_popcount_enabled() {
+            if capabilities.native_popcount {
                 if let Some(matched) = try_match_popcount_loop(func, lp, &cfg) {
                     dlog!(
                         "{} loop@{}: MATCH popcount (header={} pre={} exit={} x=phi{} r=phi{} rotated={})",
@@ -3572,6 +3566,37 @@ fn popcnt_is_plus_one(
     }
 }
 
+/// Follow only integer conversions that preserve zero in both directions.
+/// Same-width casts and extensions preserve zero; a truncation needs a separate
+/// range/known-bits proof and must not be stripped merely because it preserves
+/// the recurrence's low bits. Bounded traversal fails closed on copy cycles.
+fn popcnt_zero_representative(
+    defs: &FxHashMap<u32, &Instruction>,
+    mut value: Value,
+) -> Option<Value> {
+    for _ in 0..32 {
+        match defs.get(&value.0) {
+            Some(Instruction::Copy {
+                src: Operand::Value(inner),
+                ..
+            }) => value = *inner,
+            Some(Instruction::Cast {
+                src: Operand::Value(inner),
+                from_ty,
+                to_ty,
+                ..
+            }) if is_int_type(*from_ty)
+                && is_int_type(*to_ty)
+                && from_ty.size() <= to_ty.size() =>
+            {
+                value = *inner
+            }
+            _ => return Some(value),
+        }
+    }
+    None
+}
+
 /// Resolve a `CondBranch` that tests `tested != 0` or `tested == 0`, returning
 /// `(nonzero_target_block, zero_target_block)`.
 fn popcnt_zero_branch_targets(
@@ -3593,9 +3618,8 @@ fn popcnt_zero_branch_targets(
     let f_idx = *label_to_idx.get(false_label)?;
     let min_bytes = x_ty.size();
     let cv_resolved = resolve_copy(defs, *cv);
-    if popcnt_unwrap_cast_chain(defs, cv_resolved, min_bytes)
-        == popcnt_unwrap_cast_chain(defs, tested, min_bytes)
-    {
+    let tested_zero = popcnt_zero_representative(defs, tested)?;
+    if popcnt_zero_representative(defs, cv_resolved)? == tested_zero {
         return Some((t_idx, f_idx));
     }
     let Some(Instruction::Cmp {
@@ -3609,14 +3633,10 @@ fn popcnt_zero_branch_targets(
     }
     let tests_zero = match (lhs, rhs) {
         (Operand::Value(lv), r) => {
-            popcnt_unwrap_cast_chain(defs, *lv, min_bytes)
-                == popcnt_unwrap_cast_chain(defs, tested, min_bytes)
-                && operand_const_int(r) == Some(0)
+            popcnt_zero_representative(defs, *lv)? == tested_zero && operand_const_int(r) == Some(0)
         }
         (l, Operand::Value(rv)) => {
-            popcnt_unwrap_cast_chain(defs, *rv, min_bytes)
-                == popcnt_unwrap_cast_chain(defs, tested, min_bytes)
-                && operand_const_int(l) == Some(0)
+            popcnt_zero_representative(defs, *rv)? == tested_zero && operand_const_int(l) == Some(0)
         }
         _ => false,
     };
@@ -3812,7 +3832,9 @@ fn try_match_popcount_loop(
     for (bi, block) in func.blocks.iter().enumerate() {
         for inst in &block.instructions {
             if let Some(d) = inst.dest() {
-                defs.insert(d.0, inst);
+                if defs.insert(d.0, inst).is_some() {
+                    return None;
+                }
                 def_blocks.insert(d.0, bi);
             }
         }
@@ -4202,7 +4224,14 @@ mod tests {
         // Synthetic D/S GlobalAddr instructions represent private, strong
         // definitions in these tests; G is intentionally unproven.
         let local_globals = ["D".to_string(), "S".to_string()].into_iter().collect();
-        super::run_function(func, &FxHashSet::default(), &local_globals)
+        super::run_function(
+            func,
+            &FxHashSet::default(),
+            &local_globals,
+            Capabilities {
+                native_popcount: true,
+            },
+        )
     }
 
     fn val(id: u32) -> Operand {
@@ -4360,7 +4389,10 @@ mod tests {
         let mut f = self_loop_copy_func(IrType::U8);
         let aliases: FxHashSet<String> = ["D".to_string(), "S".to_string()].into_iter().collect();
         let local_globals = aliases.clone();
-        assert_eq!(super::run_function(&mut f, &aliases, &local_globals,), 1);
+        assert_eq!(
+            super::run_function(&mut f, &aliases, &local_globals, Capabilities::default()),
+            1
+        );
         assert!(has_call(&f, "memmove"));
         assert!(!has_call(&f, "memcpy"));
         assert_guarded_scalar_fallback(&f);
@@ -4370,7 +4402,12 @@ mod tests {
     fn extern_global_names_cannot_prove_disjoint() {
         let mut f = self_loop_copy_func(IrType::U8);
         assert_eq!(
-            super::run_function(&mut f, &FxHashSet::default(), &FxHashSet::default(),),
+            super::run_function(
+                &mut f,
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                Capabilities::default()
+            ),
             1
         );
         assert!(has_call(&f, "memmove"));
@@ -5241,11 +5278,6 @@ mod tests {
 
     #[test]
     fn popcount_while_loop_rewrites_when_fast_popcount_enabled() {
-        let _flag = crate::test_support::ScopedFlag::new(
-            fast_popcount_enabled,
-            set_fast_popcount_enabled,
-            true,
-        );
         let mut f = popcnt_while_func(0);
         assert_eq!(run_function(&mut f), 1);
         assert!(has_popcount(&f));
@@ -5254,11 +5286,6 @@ mod tests {
 
     #[test]
     fn popcount_while_loop_adds_nonzero_initial_count() {
-        let _flag = crate::test_support::ScopedFlag::new(
-            fast_popcount_enabled,
-            set_fast_popcount_enabled,
-            true,
-        );
         let mut f = popcnt_while_func(7);
         assert_eq!(run_function(&mut f), 1);
         assert!(has_popcount(&f));
@@ -5280,28 +5307,29 @@ mod tests {
 
     #[test]
     fn popcount_while_loop_refused_when_fast_popcount_disabled() {
-        let _flag = crate::test_support::ScopedFlag::new(
-            fast_popcount_enabled,
-            set_fast_popcount_enabled,
-            false,
-        );
         let mut f = popcnt_while_func(0);
-        assert_eq!(run_function(&mut f), 0);
+        assert_eq!(
+            super::run_function(
+                &mut f,
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                Capabilities::default()
+            ),
+            0
+        );
         assert!(!has_popcount(&f));
     }
 
     #[test]
     fn popcount_while_loop_refused_when_not_clear_lsb() {
-        let _flag = crate::test_support::ScopedFlag::new(
-            fast_popcount_enabled,
-            set_fast_popcount_enabled,
-            true,
-        );
         let mut f = popcnt_while_func(0);
         if let Instruction::BinOp { rhs, .. } = &mut f.blocks[2].instructions[0] {
             *rhs = Operand::Const(IrConst::I64(2));
         }
         assert_eq!(run_function(&mut f), 0);
         assert!(!has_popcount(&f));
+    }
+    mod hardening {
+        include!("loop_idiom_hardening_tests.rs");
     }
 }

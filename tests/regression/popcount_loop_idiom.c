@@ -50,6 +50,43 @@ long popcnt_array_sum(const uint64_t *a, int len) {
     return total;
 }
 
+/* Fixed-bit reference: no bit-clear recurrence or popcount builtin. */
+static unsigned reference_count(uint64_t x) {
+    unsigned n = 0;
+    for (unsigned i = 0; i < 64; ++i)
+        n += (unsigned)((x >> i) & 1u);
+    return n;
+}
+
+__attribute__((noinline))
+static unsigned popcnt_u8(uint8_t x) {
+    unsigned n = 0;
+    while (x) { x &= x - 1; ++n; }
+    return n;
+}
+
+__attribute__((noinline))
+static unsigned popcnt_u16(uint16_t x) {
+    unsigned n = 0;
+    while (x) { x &= x - 1; ++n; }
+    return n;
+}
+
+/* The wide condition is deliberately NOT the normalized next recurrence.
+ * At x=-128, wide=-256 and next x=0: the original loop takes two trips. */
+__attribute__((noinline))
+static unsigned wide_test(signed char x) {
+    unsigned n = 0;
+    int wide;
+    if (!x) return 0;
+    do {
+        wide = (int)x & ((int)x - 1);
+        x = (signed char)(unsigned char)wide;
+        ++n;
+    } while (wide);
+    return n;
+}
+
 int main(void) {
     static const uint64_t samples[] = {
         0ULL,
@@ -66,7 +103,7 @@ int main(void) {
     long sum = 0;
     for (unsigned i = 0; i < sizeof(samples) / sizeof(samples[0]); ++i) {
         uint64_t v = samples[i];
-        int ref = __builtin_popcountll(v);
+        int ref = (int)reference_count(v);
         if (popcnt_u64_while(v) != ref) {
             printf("FAIL u64 i=%u\n", i);
             return 1;
@@ -76,7 +113,7 @@ int main(void) {
             return 2;
         }
         uint32_t v32 = (uint32_t)v;
-        unsigned ref32 = (unsigned)__builtin_popcount(v32) + 11u;
+        unsigned ref32 = reference_count(v32) + 11u;
         if (popcnt_u32_commuted(v32, 11u) != ref32) {
             printf("FAIL u32 i=%u\n", i);
             return 3;
@@ -86,6 +123,16 @@ int main(void) {
     if (popcnt_array_sum(samples, (int)(sizeof(samples) / sizeof(samples[0]))) != sum) {
         printf("FAIL sum\n");
         return 4;
+    }
+    for (unsigned i = 0; i < 65536; ++i) {
+        unsigned ref = reference_count(i);
+        if (popcnt_u16((uint16_t)i) != ref) return 5;
+        if (i < 256 && popcnt_u8((uint8_t)i) != ref) return 6;
+        if (popcnt_u32_commuted(i, UINT32_MAX - 3u) != ref + (UINT32_MAX - 3u)) return 7;
+    }
+    for (int i = -128; i <= 127; ++i) {
+        unsigned ref = reference_count((uint8_t)i) + (unsigned)(i < 0);
+        if (wide_test((signed char)i) != ref) return 8;
     }
     printf("ok %ld\n", sum);
     return 0;

@@ -1987,6 +1987,9 @@ gate "arm-address-contract" fast \
 gate "arm-popcount-contract" fast \
     env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_popcount_contract.py
 
+gate "popcount-loop-contract" fast \
+    python3 tests/regression/check_popcount_loop_contract.py
+
 # _Decimal64 indexed fold: the x86-64 indexed path must accept D64 on
 # the load half, the store half, and the decider. Structural SIB-movsd
 # assertions plus an integer-checksum gcc differential (mirrors the ci.yml

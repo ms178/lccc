@@ -749,8 +749,8 @@ fn review_mask_range_proofs_preserve_constant_casts_and_signs() {
     let defs = definitions(&g.insts);
     assert!(!high_bits_zero(and, 8, &defs));
     assert!(!high_bits_zero(cast_mask, 8, &defs));
-    assert!(!fits_low_bits(fake_mask, 8, 32, &defs));
-    assert!(fits_low_bits(fake_mask, 8, 8, &defs));
+    assert!(!fits_low_bits(fake_mask, 8, 32, &defs, &[]));
+    assert!(fits_low_bits(fake_mask, 8, 8, &defs, &[]));
     assert_eq!(const_in_ring(c(0), 128), None);
 }
 
@@ -789,4 +789,42 @@ fn review_same_condition_selects_preserve_polarity_widths_and_spans() {
     let mut f = g.function(result);
     assert_eq!(recognize_function(&mut f, false, 64, 8, false), 0);
     assert_eq!(evaluate(&f, &[256]), 8);
+}
+
+#[test]
+fn review_crc_cast_distribution_matches_bitvectors_for_xor_or_and_both_roles() {
+    for (narrow, mask) in [(IrType::U8, 255u64), (IrType::U16, 65535u64)] {
+        for op in [IrBinOp::Xor, IrBinOp::Or] {
+            for swap in [false, true] {
+                let mut g = Graph::new();
+                let wide = g.param(0, IrType::U32);
+                let small = g.param(1, narrow);
+                let extended = g.cast(small, narrow, IrType::U32);
+                let (lhs, rhs) = if swap {
+                    (extended, wide)
+                } else {
+                    (wide, extended)
+                };
+                let combined = g.bin(op, lhs, rhs, IrType::U32);
+                let truncated = g.cast(combined, IrType::U32, narrow);
+                let result = g.cast(truncated, narrow, IrType::U32);
+                let mut f = g.function(result);
+                assert!(recognize_function(&mut f, false, 64, 8, false) > 0);
+                for wide in [0u64, 1, 127, 255, 256, 65535, 0x8000_0000, 0xffff_ffff] {
+                    for small in (0..=255).chain([256, 32768, 65535]).filter(|x| *x <= mask) {
+                        let expected = match op {
+                            IrBinOp::Xor => wide ^ small,
+                            IrBinOp::Or => wide | small,
+                            _ => unreachable!(),
+                        } & mask;
+                        assert_eq!(
+                            evaluate(&f, &[wide, small]),
+                            expected,
+                            "{narrow:?} {op:?} swap={swap} {wide:x} {small:x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

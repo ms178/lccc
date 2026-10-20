@@ -1544,40 +1544,59 @@ fn match_bit_reverse32(result: Operand, defs: &[Option<Instruction>]) -> Option<
 /// `[0, 2^bits)`), and a direct `Load` of an unsigned narrow type. A cast
 /// from a SIGNED narrow type sign-extends and can be negative in the wide
 /// domain — refused.
-fn fits_low_bits(op: Operand, bits: u32, ring_bits: usize, defs: &[Option<Instruction>]) -> bool {
+fn fits_low_bits(
+    mut op: Operand,
+    bits: u32,
+    mut ring_bits: usize,
+    defs: &[Option<Instruction>],
+    def_counts: &[u32],
+) -> bool {
     let mask = (1u64 << bits) - 1;
-    match op {
-        Operand::Const(_) => const_in_ring(op, ring_bits).is_some_and(|v| v <= mask),
-        Operand::Value(v) => match defs.get(v.0 as usize).and_then(Option::as_ref) {
-            Some(Instruction::Copy { src, .. }) => fits_low_bits(*src, bits, ring_bits, defs),
-            Some(Instruction::Cast {
-                src,
-                from_ty,
-                to_ty,
-                ..
-            }) if to_ty.is_integer() && to_ty.size() * 8 == ring_bits => {
-                if matches!((to_ty, bits), (IrType::U8, 8) | (IrType::U16, 16)) {
-                    return true;
+    // This query follows one chain, never a tree. A fixed budget avoids heap
+    // allocation, recursion, and stack growth; cycles and deep webs fail closed.
+    for _ in 0..64 {
+        match op {
+            Operand::Const(_) => return const_in_ring(op, ring_bits).is_some_and(|v| v <= mask),
+            Operand::Value(v) => {
+                if def_counts.get(v.0 as usize).copied() != Some(1) {
+                    return false;
                 }
-                let from_ok = matches!((from_ty, bits), (IrType::U8, 8) | (IrType::U16, 16));
-                from_ok && fits_low_bits(*src, bits, from_ty.size() * 8, defs)
+                match defs.get(v.0 as usize).and_then(Option::as_ref) {
+                    Some(Instruction::Copy { src, .. }) => op = *src,
+                    Some(Instruction::Cast {
+                        src,
+                        from_ty,
+                        to_ty,
+                        ..
+                    }) if to_ty.is_integer() && to_ty.size() * 8 == ring_bits => {
+                        if matches!((to_ty, bits), (IrType::U8, 8) | (IrType::U16, 16)) {
+                            return true;
+                        }
+                        if !matches!((from_ty, bits), (IrType::U8, 8) | (IrType::U16, 16)) {
+                            return false;
+                        }
+                        op = *src;
+                        ring_bits = from_ty.size() * 8;
+                    }
+                    Some(Instruction::Load { ty, .. } | Instruction::ParamRef { ty, .. }) => {
+                        return matches!((ty, bits), (IrType::U8, 8) | (IrType::U16, 16));
+                    }
+                    Some(Instruction::BinOp {
+                        op: IrBinOp::And,
+                        lhs,
+                        rhs,
+                        ty,
+                        ..
+                    }) if ty.is_integer() && ty.size() * 8 == ring_bits => {
+                        return const_in_ring(*rhs, ring_bits).is_some_and(|m| m <= mask)
+                            || const_in_ring(*lhs, ring_bits).is_some_and(|m| m <= mask);
+                    }
+                    _ => return false,
+                }
             }
-            Some(Instruction::Load { ty, .. } | Instruction::ParamRef { ty, .. }) => {
-                matches!((ty, bits), (IrType::U8, 8) | (IrType::U16, 16))
-            }
-            Some(Instruction::BinOp {
-                op: IrBinOp::And,
-                lhs,
-                rhs,
-                ty,
-                ..
-            }) if ty.is_integer() && ty.size() * 8 == ring_bits => {
-                const_in_ring(*rhs, ring_bits).is_some_and(|m| m <= mask)
-                    || const_in_ring(*lhs, ring_bits).is_some_and(|m| m <= mask)
-            }
-            _ => false,
-        },
+        }
     }
+    false
 }
 
 /// Canonicalize two narrow-integer patterns before the main `bit_idioms` scan:
@@ -1724,8 +1743,8 @@ fn canonicalize_narrow_crc_casts(func: &mut IrFunction) -> usize {
                 continue;
             }
             let ring_bits = wide_ty.size() * 8;
-            let a_fits = fits_low_bits(Operand::Value(a), bits, ring_bits, &defs);
-            let b_fits = fits_low_bits(Operand::Value(b), bits, ring_bits, &defs);
+            let a_fits = fits_low_bits(Operand::Value(a), bits, ring_bits, &defs, &def_counts);
+            let b_fits = fits_low_bits(Operand::Value(b), bits, ring_bits, &defs, &def_counts);
             if a_fits == b_fits {
                 continue;
             }
@@ -2310,6 +2329,7 @@ pub(crate) fn recognize_function(
 ) -> usize {
     let pre_changes = canonicalize_narrow_crc_casts(func);
     let mut defs = vec![None; func.max_value_id() as usize + 1];
+    let mut def_counts = vec![0u32; defs.len()];
     // (block index, instruction index) of each value's defining instruction,
     // for in-place rewrites of the PRODUCER while visiting the consumer.
     let mut def_loc = vec![None; func.max_value_id() as usize + 1];
@@ -2319,6 +2339,7 @@ pub(crate) fn recognize_function(
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             if let Some(dest) = inst.dest() {
+                def_counts[dest.0 as usize] += 1;
                 defs[dest.0 as usize] = Some(inst.clone());
                 def_loc[dest.0 as usize] = Some((bi, ii));
             }
@@ -2447,6 +2468,8 @@ pub(crate) fn recognize_function(
                 };
                 if bits != 0
                     && matches!(ty, IrType::U32 | IrType::I32 | IrType::U64 | IrType::I64)
+                    && def_counts.get(x.0 as usize).copied() == Some(1)
+                    && def_counts.get(dest.0 as usize).copied() == Some(1)
                     && use_counts.get(x.0 as usize).copied() == Some(1)
                 {
                     let xor = defs.get(x.0 as usize).and_then(Option::as_ref).cloned();
@@ -2463,10 +2486,20 @@ pub(crate) fn recognize_function(
                         let op = op;
                         let x_ty = x_ty;
                         if x_ty == ty {
-                            let a_fits =
-                                fits_low_bits(Operand::Value(a), bits, ty.size() * 8, &defs);
-                            let b_fits =
-                                fits_low_bits(Operand::Value(b), bits, ty.size() * 8, &defs);
+                            let a_fits = fits_low_bits(
+                                Operand::Value(a),
+                                bits,
+                                ty.size() * 8,
+                                &defs,
+                                &def_counts,
+                            );
+                            let b_fits = fits_low_bits(
+                                Operand::Value(b),
+                                bits,
+                                ty.size() * 8,
+                                &defs,
+                                &def_counts,
+                            );
                             // Exactly one side carries the narrow value; the
                             // other receives the mask. Both fitting is
                             // already optimal as-is (both and-free), and
@@ -5195,3 +5228,7 @@ mod tests {
 #[cfg(test)]
 #[path = "bit_idioms_review_tests.rs"]
 mod review_tests;
+
+#[cfg(test)]
+#[path = "bit_idioms_range_tests.rs"]
+mod range_tests;

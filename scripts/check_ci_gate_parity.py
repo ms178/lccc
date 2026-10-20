@@ -627,6 +627,18 @@ INVOCATION_CONTRACTS: tuple[InvocationContract, ...] = (
         local_gate=("gas-oracle-pair-self-test", "fast"),
     ),
     InvocationContract(
+        program="tests/regression/check_popcount_loop_contract.py",
+        name="popcount-loop-contract",
+        sides=frozenset({"local"}),
+        local_gate=("popcount-loop-contract", "fast"),
+    ),
+    InvocationContract(
+        program="tests/regression/check_popcount_loop_contract.py",
+        name="popcount-loop-runtime",
+        sides=frozenset({"hosted"}),
+        rest_spec=("--run",),
+    ),
+    InvocationContract(
         program="tests/regression/check_arm_address_contract.py",
         name="arm-address-contract",
         sides=_BOTH,

@@ -2202,12 +2202,14 @@ impl Driver {
         if self.instrument_functions {
             crate::passes::instrument::run(&mut module);
         }
-        crate::passes::loop_idiom::set_fast_popcount_enabled(self.resolved_fast_popcount());
         // If PGO use is active, run PGO layout before passes? Actually after, but we prepare
         run_passes(
             &mut module,
             self.opt_level,
             self.target,
+            crate::passes::loop_idiom::Capabilities {
+                native_popcount: self.resolved_fast_popcount(),
+            },
             self.code16gcc,
             self.wrap_signed_overflow,
             fp_environment_observable,
@@ -2562,7 +2564,7 @@ impl Driver {
             // read.c, tc-i386.c; bfd elflink.c): identical instruction counts
             // and equal or smaller .text, at 35-40% less compile time. -O1
             // and up keep it: there it buys 0.2-0.6% .text.
-            let dual_layout = if self.opt_level <= 1 {
+            let dual_layout = if self.opt_level == 0 {
                 crate::passes::block_layout::DualLayout::ChainOnly
             } else {
                 crate::passes::block_layout::DualLayout::Explore
@@ -3592,5 +3594,34 @@ mod sse_reference_tests {
         let asm = ".type f, @function\nf:\n#APP\n    movaps %xmm0, %xmm1\n#NO_APP\n\
                    # note: %xmm0\n    ret\n";
         assert!(first_sse_reference(asm).is_none());
+    }
+}
+
+#[cfg(test)]
+mod loop_idiom_capability_tests {
+    use super::*;
+
+    #[test]
+    fn native_popcount_permission_obeys_every_target_and_explicit_veto() {
+        let mut driver = Driver::new();
+        for target in [Target::X86_64, Target::I686] {
+            driver.target = target;
+            driver.x86_march_explicit = true;
+            driver.enable_popcnt = false;
+            assert!(!driver.resolved_fast_popcount());
+            driver.enable_popcnt = true;
+            assert!(driver.resolved_fast_popcount());
+            driver.popcnt_explicitly_disabled = true;
+            assert!(!driver.resolved_fast_popcount());
+            driver.popcnt_explicitly_disabled = false;
+        }
+        driver.target = Target::Aarch64;
+        driver.general_regs_only = false;
+        assert!(driver.resolved_fast_popcount());
+        driver.general_regs_only = true;
+        assert!(!driver.resolved_fast_popcount());
+        driver.target = Target::Riscv64;
+        driver.general_regs_only = false;
+        assert!(!driver.resolved_fast_popcount());
     }
 }

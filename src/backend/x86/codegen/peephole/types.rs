@@ -3341,3 +3341,60 @@ mod indentation_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod combined_implicit_effect_tests {
+    use super::*;
+
+    #[test]
+    fn combined_query_matches_separate_read_write_and_full_write_contracts() {
+        for mnemonic in [
+            "movq %rax, %rbx",
+            "addl %eax, %r8d",
+            "imulq %rbx",
+            "imulq %rbx, %rax",
+            "idivb %bl",
+            "mulxq %rbx, %r8, %r9",
+            "movsb",
+            "stosq",
+            "lodsb",
+            "scasq",
+            "cpuid",
+            "rdtscp",
+            "syscall",
+            "lahf",
+            "sahf",
+            "cltq",
+            "cqto",
+            "int $0x80",
+            "xbegin .Lfail",
+            "cmpxchgq %rbx, (%rdi)",
+            "xsave64 (%rdi)",
+            "ret",
+            "nop",
+        ] {
+            for prefix in ["", "lock ", "rep ", "repne "] {
+                let text = format!("{prefix}{mnemonic}");
+                let b = text.as_bytes();
+                let combined = implicit_r_w_full(b);
+                assert_eq!(
+                    combined,
+                    (
+                        implicit_read_refs(b),
+                        implicit_write_refs(b),
+                        implicit_full_write_refs(b)
+                    ),
+                    "{text}"
+                );
+                assert_eq!(
+                    combined.2 & !combined.1,
+                    0,
+                    "full writes must be writes: {text}"
+                );
+            }
+        }
+        assert_eq!(implicit_r_w_full(b"cltq"), (1, 1, 1));
+        assert_eq!(implicit_r_w_full(b"lahf").2, 0);
+        assert_eq!(implicit_r_w_full(b"rep movsb"), (0xc2, 0xc2, 0xc2));
+    }
+}
