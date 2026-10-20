@@ -149,6 +149,17 @@ gate() {
 gate "no-conflict-markers" fast \
     python3 scripts/check_no_conflict_markers.py
 
+# The archive index in engineering/evidence/ARCHIVED-BULK.md is the contract
+# that keeps raw bulk profiles out of the tree: PR #829's three-way merge
+# resurrected 89 archived files (+749,607 lines) with zero conflicts, because
+# from the PR side they were pure additions. Every archived path is a table
+# row, so the check is mechanical -- and, like the conflict scan, needs no
+# compiler, so it runs before `build`.
+gate "archived-bulk-absent-selftest" fast \
+    python3 scripts/check_archived_bulk_absent.py --self-test
+gate "archived-bulk-absent" fast \
+    python3 scripts/check_archived_bulk_absent.py
+
 # Same reasoning, and equally compiler-independent: a workflow file is not a
 # shell script, so Actions step scaffolding pasted into a `run: |` block is
 # valid YAML that dies with exit 127 on the hosted runner. It is invisible
