@@ -15,21 +15,43 @@ impl RiscvCodegen {
 
     /// IR-level eligibility for the caller-saved (a0–a7) register pool.
     ///
+    /// Thin policy wrapper over [`Self::riscv_call_free_ir`]: the pool may open
+    /// only for a function that cannot emit any `call` at all, so the hidden
+    /// dynamic-TLS resolver disqualifies it like every other call.
+    fn riscv_caller_pool_eligible(&self, func: &IrFunction) -> bool {
+        if std::env::var_os("CCC_NO_RISCV_CALLER_POOL").is_some() {
+            return false;
+        }
+        self.riscv_call_free_ir(func, false)
+    }
+
+    /// IR-level proof that `func` emits no `call` other than -- when
+    /// `allow_dynamic_tls` is set -- the hidden dynamic-TLS resolver.
+    ///
     /// The Phase-2 allocator homes only non-call-spanning values in the
     /// caller-saved pool, which makes every IR-visible call safe (the same
     /// model x86-64/i686/AArch64 already run).  What the shared liveness
     /// cannot see on RISC-V are EMITTER-side a-register clobberers that are
     /// not IR call points: the F128 soft-float helper sequences, the i128
     /// helper calls, libm calls from the RoundScalar intrinsics, and the
-    /// a2–a5 scratch usage inside the atomic RMW sequences.  An eligible
+    /// a2–a5 scratch usage inside the atomic RMW sequences.  A call-free
     /// function therefore contains only instructions whose emitters touch
     /// t-regs and s-regs exclusively, over scalar (<=64-bit integer /
     /// F32/F64/Ptr) types.  Anything else keeps the pure callee-saved pool.
-    fn riscv_caller_pool_eligible(func: &IrFunction) -> bool {
+    ///
+    /// This is an allowlist, never a denylist, and that is load-bearing: any
+    /// IR variant not explicitly proven call-free falls into `_ => false`.  A
+    /// future lowering that emits a libcall therefore CLOSES these
+    /// optimizations instead of silently opening them, which is exactly how a
+    /// value parked in `a0` would otherwise be destroyed underneath its last
+    /// use.
+    ///
+    /// `allow_dynamic_tls` is the only difference between the two callers.  A
+    /// GD/LD `GlobalAddr` is itself a hidden call, so the register pool must
+    /// reject it outright; the TLS optimizations exist to serve precisely that
+    /// one call and so permit it while still rejecting every other libcall.
+    fn riscv_call_free_ir(&self, func: &IrFunction, allow_dynamic_tls: bool) -> bool {
         use crate::ir::reexports::{Instruction, IrConst, Operand};
-        if std::env::var_os("CCC_NO_RISCV_CALLER_POOL").is_some() {
-            return false;
-        }
         let scalar = |ty: &IrType| {
             matches!(
                 ty,
@@ -78,10 +100,21 @@ impl RiscvCodegen {
                         }
                     }
                     Instruction::GetElementPtr { .. }
-                    | Instruction::GlobalAddr { .. }
                     | Instruction::LabelAddr { .. }
                     | Instruction::GetStaticChain { .. }
                     | Instruction::SetStaticChain { .. } => {}
+                    Instruction::GlobalAddr { name, .. } => {
+                        if !allow_dynamic_tls
+                            && self.state.tls_symbols.contains(name)
+                            && matches!(
+                                self.state.tls_model_for_symbol(name),
+                                crate::ir::reexports::TlsModel::GlobalDynamic
+                                    | crate::ir::reexports::TlsModel::LocalDynamic
+                            )
+                        {
+                            return false;
+                        }
+                    }
                     // Everything else (calls, inline asm, memcpys, atomics,
                     // intrinsics, varargs, F128/i128 carriers, non-local
                     // goto plumbing, dynamic allocas) keeps the pure
@@ -91,24 +124,6 @@ impl RiscvCodegen {
             }
         }
         true
-    }
-
-    /// Whether the function contains any IR-visible call point.  Used by the
-    /// frameless-leaf gate: without a prologue the return address stays in
-    /// `ra`, so any call would clobber it before the closing `ret`.
-    fn riscv_is_call_free(func: &IrFunction) -> bool {
-        use crate::ir::reexports::Instruction;
-        !func.blocks.iter().any(|block| {
-            block.instructions.iter().any(|inst| {
-                matches!(
-                    inst,
-                    Instruction::Call { .. }
-                        | Instruction::CallIndirect { .. }
-                        | Instruction::InlineAsm { .. }
-                        | Instruction::Memcpy { .. }
-                )
-            })
-        })
     }
 
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
@@ -195,7 +210,7 @@ impl RiscvCodegen {
         let caller_saved_regs: Vec<crate::backend::regalloc::PhysReg> = if !self.state.disable_regalloc
                 && !self.is_variadic
                 && !func.uses_sret
-                && Self::riscv_caller_pool_eligible(func)
+                && self.riscv_caller_pool_eligible(func)
                 // The entry-prefix write guard is computed from block 0
                 // alone; opening the pool is only sound when every ParamRef
                 // really sits in that entry prefix (generation's lowering
@@ -211,7 +226,7 @@ impl RiscvCodegen {
         };
         let call_arg_regs = caller_saved_regs.clone();
         let (
-            reg_assigned,
+            mut reg_assigned,
             cached_liveness,
             _caller_save_spans,
             accumulator_assignments,
@@ -232,6 +247,71 @@ impl RiscvCodegen {
             // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
             &mut crate::common::fx_hash::FxHashMap::default(),
         );
+
+        // The hidden dynamic-TLS resolver is this function's ONLY call, so its
+        // result cannot be live across a call and nothing later can clobber it:
+        // home it in a0 and drop the otherwise artificial s-register relay from
+        // the dominant address/load shapes.  Other values stay in the pure
+        // callee-saved pool.
+        //
+        // `riscv_call_free_ir(func, true)` is what makes "nothing later can
+        // clobber it" true.  It rejects the emitter-side a-register clobberers
+        // that are NOT IR call points -- the i128 helper calls, the F128
+        // soft-float sequences, the libm intrinsic calls, the atomic RMW a2-a5
+        // scratch -- every one of which would otherwise destroy a0 between the
+        // resolver and the value's last use.  sret and variadic are excluded
+        // for the same reason both frame gates exclude them: each gives a0 an
+        // ABI meaning of its own.
+        let dynamic_tls_dests: Vec<u32> = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|inst| match inst {
+                crate::ir::reexports::Instruction::GlobalAddr { dest, name }
+                    if self.state.tls_symbols.contains(name)
+                        && matches!(
+                            self.state.tls_model_for_symbol(name),
+                            crate::ir::reexports::TlsModel::GlobalDynamic
+                                | crate::ir::reexports::TlsModel::LocalDynamic
+                        ) =>
+                {
+                    Some(dest.0)
+                }
+                _ => None,
+            })
+            .collect();
+        // Computed here, with the frame size, and consumed by the RA-only frame
+        // gate in `emit_prologue_impl`, so the a0 homing and the frame shape can
+        // never disagree about what counts as a call.
+        self.tls_resolver_only =
+            !dynamic_tls_dests.is_empty() && self.riscv_call_free_ir(func, true);
+        if self.tls_resolver_only
+            && dynamic_tls_dests.len() == 1
+            && !func.uses_sret
+            && !self.is_variadic
+        {
+            let dest = dynamic_tls_dests[0];
+            let a0 = crate::backend::regalloc::PhysReg(12);
+            // a0 is absent from `available_regs` (s1-s11 only) and becomes
+            // allocatable solely through `caller_saved_regs`, which stays closed
+            // for any dynamic-TLS function because `riscv_caller_pool_eligible`
+            // passes `allow_dynamic_tls = false`.  Assert that invariant instead
+            // of trusting it: were the pool ever opened here, two values would
+            // silently share a0.
+            debug_assert!(
+                !self.reg_assignments.values().any(|&reg| reg == a0),
+                "a0 must be free before the TLS resolver result is homed there"
+            );
+            let old = self.reg_assignments.insert(dest, a0);
+            reg_assigned.insert(dest, a0);
+            // Release the displaced callee-saved home only once nothing else
+            // still occupies it, so the frame never under-reserves a save slot.
+            if let Some(old) = old
+                && !self.reg_assignments.values().any(|&reg| reg == old)
+            {
+                self.used_callee_saved.retain(|&reg| reg != old);
+            }
+        }
 
         self.state.ra_accumulator_values =
             accumulator_assignments.iter().map(|a| a.value_id).collect();
@@ -285,8 +365,13 @@ impl RiscvCodegen {
         self.frameless_leaf = frame_size == 16
             && !self.is_variadic
             && !func.uses_sret
-            && Self::riscv_is_call_free(func)
-            && Self::riscv_caller_pool_eligible(func)
+            // `riscv_caller_pool_eligible` is an allowlist that rejects every
+            // call-shaped instruction and every dynamic-TLS `GlobalAddr`, so it
+            // already implies call-freeness.  That matters here: without a
+            // prologue the return address stays in `ra`, so any call -- including
+            // the hidden dynamic-TLS resolver -- would clobber it before the
+            // closing `ret`.
+            && self.riscv_caller_pool_eligible(func)
             && {
                 let mut config = self.call_abi_config_impl();
                 config.variadic_floats_in_gp = func.is_variadic;
@@ -303,7 +388,32 @@ impl RiscvCodegen {
                     )
                 })
             };
+        // Minimal RA-only frame: byte-for-byte clang 23.1.3's shape for a
+        // function whose only call is the dynamic-TLS resolver (`addi sp,sp,-16`
+        // / `sd ra,8(sp)`, no `s0` setup, resolver call, `ld ra,8(sp)` /
+        // `addi sp,sp,16`).  `tls_resolver_only` carries the call-free allowlist
+        // proof computed with the frame size, and that proof is load-bearing:
+        // `__builtin_frame_address`/`__builtin_return_address` lower to
+        // `mv t0, s0` / `ld t0, -8(s0)`, so a frame that never establishes `s0`
+        // would silently read the CALLER's frame -- and could fault outright on
+        // the load if the caller left no frame pointer at all.  The allowlist
+        // rejects every intrinsic, closing that hazard by construction instead
+        // of by enumerating builtin opcodes.
+        self.ra_only_frame = frame_size == 16
+            && !self.is_variadic
+            && !func.uses_sret
+            && self.used_callee_saved.is_empty()
+            && self.tls_resolver_only;
         if self.frameless_leaf {
+            return;
+        }
+        if self.ra_only_frame {
+            self.state.emit("    addi sp, sp, -16");
+            self.state.emit("    sd ra, 8(sp)");
+            if self.state.emit_cfi {
+                self.state.emit("    .cfi_def_cfa_offset 16");
+                self.state.emit("    .cfi_offset ra, -8");
+            }
             return;
         }
         self.emit_prologue_riscv(frame_size);
@@ -322,6 +432,15 @@ impl RiscvCodegen {
 
     pub(super) fn emit_epilogue_impl(&mut self, frame_size: i64) {
         if self.frameless_leaf {
+            return;
+        }
+        if self.ra_only_frame {
+            self.state.emit("    ld ra, 8(sp)");
+            self.state.emit("    addi sp, sp, 16");
+            if self.state.emit_cfi {
+                self.state.emit("    .cfi_restore ra");
+                self.state.emit("    .cfi_def_cfa_offset 0");
+            }
             return;
         }
         // Restore callee-saved registers before epilogue.
@@ -1023,6 +1142,16 @@ impl RiscvCodegen {
 
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
         if self.frameless_leaf {
+            self.state.emit("    ret");
+            return;
+        }
+        if self.ra_only_frame {
+            self.state.emit("    ld ra, 8(sp)");
+            self.state.emit("    addi sp, sp, 16");
+            if self.state.emit_cfi {
+                self.state.emit("    .cfi_restore ra");
+                self.state.emit("    .cfi_def_cfa_offset 0");
+            }
             self.state.emit("    ret");
             return;
         }

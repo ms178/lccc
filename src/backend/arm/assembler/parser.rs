@@ -190,6 +190,9 @@ pub enum AsmDirective {
     Previous,
     /// `.subsection N` — switch to numbered subsection within the current section
     Subsection(u64),
+    /// AArch64 TLSDESC call-site marker. Emits R_AARCH64_TLSDESC_CALL at
+    /// the current location (the following `blr`).
+    TlsDescCall(String),
     /// CFI directive (ignored for code generation)
     Cfi,
     /// `.incbin "file"[, skip[, count]]` — include binary file contents
@@ -1508,6 +1511,13 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             } else {
                 AsmDirective::Ignored
             }
+        }
+        ".tlsdesccall" => {
+            let symbol = args.trim();
+            if symbol.is_empty() {
+                return Err(".tlsdesccall requires a symbol".to_string());
+            }
+            AsmDirective::TlsDescCall(symbol.to_string())
         }
         // CFI directives
         ".cfi_startproc"
