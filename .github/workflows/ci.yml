@@ -1498,6 +1498,7 @@ jobs:
         bash tests/regression/check_linker_notype_code.sh
         bash tests/regression/check_got64_old_spelling.sh
         bash tests/regression/check_tls_pie_preemptible.sh
+        bash tests/regression/check_tls_runtime_oracle.sh
         bash tests/regression/check_tls_model_selection.sh
         bash tests/regression/check_tls_model_option.sh
         bash tests/regression/check_f128_sign_intrinsics_strict_fp.sh

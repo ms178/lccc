@@ -656,6 +656,8 @@ fn try_fuse_commuted_adjacent_load(
 /// Retire a proven-dead load and install its fused consumer. A volatile pin
 /// moves with the one surviving memory access; clearing it on the old carrier
 /// is deliberately confined to this post-legality-check helper.
+/// The caller must prove equal access widths, a dead temporary, and an editable
+/// consumer. A pinned load may be retired only for the adjacent volatile form.
 fn replace_fused_load(
     store: &mut LineStore,
     infos: &mut [LineInfo],
@@ -664,6 +666,10 @@ fn replace_fused_load(
     new_line: String,
     volatile: bool,
 ) {
+    debug_assert_ne!(load, consumer);
+    debug_assert!(!infos[consumer].pinned);
+    debug_assert_eq!(infos[load].pinned, volatile);
+    debug_assert_eq!(infos[load].volatile_access, volatile);
     if volatile {
         infos[load].pinned = false;
         infos[load].volatile_access = false;
@@ -708,7 +714,18 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
 
         // Walk forward to the first line that mentions T; every line before
         // it must satisfy the window rules.
-        let mut j = next_insn(store, infos, i + 1, len);
+        // Volatile accesses may cross only deleted lines and unpinned debug
+        // attribution, not CFI, alignment, or pinned bookkeeping directives.
+        // Keep the ordinary walker's established nonvolatile policy unchanged.
+        let mut j = if load_volatile {
+            let mut next = i + 1;
+            while next < len && debug_transparent(store, infos[next], next) {
+                next += 1;
+            }
+            next
+        } else {
+            next_insn(store, infos, i + 1, len)
+        };
         let mut consumer = None;
         let mut gap = 0usize;
         while j < len {
@@ -2371,6 +2388,199 @@ mod tests {
         let out = body(&run(&asm, fuse_load_into_alu));
         assert!(has(&out, "addq %gs:8(%rsi), %r8"), "{out:?}");
         assert!(!out.iter().any(|l| l.starts_with("movq %gs:")), "{out:?}");
+    }
+
+    fn volatile_fixture(code: &str) -> (LineStore, Vec<LineInfo>, usize) {
+        let store = LineStore::new(format!("{PRO}{code}{EPI}"));
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let load = (0..store.len())
+            .find(|&i| store.get(i).trim().starts_with("mov"))
+            .unwrap();
+        infos[load].pinned = true;
+        infos[load].volatile_access = true;
+        (store, infos, load)
+    }
+
+    fn assert_volatile_rejected(code: &str) {
+        let (mut store, mut infos, _) = volatile_fixture(code);
+        let text = store.build_result(|_| false);
+        let metadata = infos.clone();
+        assert!(!fuse_load_into_alu(&mut store, &mut infos), "{code}");
+        assert_eq!(store.build_result(|_| false), text, "{code}");
+        assert_eq!(infos, metadata, "{code}");
+    }
+
+    #[test]
+    fn volatile_direct_matrix_preserves_width_address_and_metadata() {
+        for (suffix, temp, dest, result) in
+            [("q", "%r9", "%rdx", "%rax"), ("l", "%r9d", "%edx", "%eax")]
+        {
+            for op in FUSIBLE_OPS {
+                for mem in ["(%rsi)", "8(%rdx)", "(%r9)", "%fs:tls@TPOFF+24"] {
+                    let code = format!(
+                        "mov{suffix} {mem}, {temp}\n{op}{suffix} {temp}, {dest}\nmov{suffix} {dest}, {result}\n"
+                    );
+                    let (mut store, mut infos, load) = volatile_fixture(&code);
+                    assert!(fuse_load_into_alu(&mut store, &mut infos), "{code}");
+                    assert!(infos[load].is_nop());
+                    let expected = format!("{op}{suffix} {mem}, {dest}");
+                    let consumer = (0..store.len())
+                        .find(|&i| store.get(i).trim() == expected)
+                        .unwrap();
+                    assert!(infos[consumer].pinned && infos[consumer].volatile_access);
+                    assert!(!fuse_load_into_alu(&mut store, &mut infos));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn volatile_sign_extended_load_folds_only_at_its_memory_width() {
+        let narrow = "movslq (%rsi), %r9\naddl %r9d, %edx\nmovl %edx, %eax\n";
+        let (mut store, mut infos, _) = volatile_fixture(narrow);
+        assert!(fuse_load_into_alu(&mut store, &mut infos));
+        assert!(
+            store
+                .build_result(|i| infos[i].is_nop())
+                .contains("addl (%rsi), %edx")
+        );
+        assert_volatile_rejected("movslq (%rsi), %r9\naddq %r9, %rdx\nmovq %rdx, %rax\n");
+    }
+
+    #[test]
+    fn volatile_unsegmented_gap_is_distinct_from_segment_policy() {
+        let code = "movq (%rsi), %r9\nmovq %r10, %r11\naddq %r9, %rdx\nmovq %rdx, %rax\n";
+        assert_volatile_rejected(code);
+        let (mut store, mut infos, load) = volatile_fixture(code);
+        infos[load].pinned = false;
+        infos[load].volatile_access = false;
+        assert!(fuse_load_into_alu(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn volatile_illegal_forms_leave_text_and_metadata_untouched() {
+        for code in [
+            "movq (%rsi), %r9\naddq %r9, %rdx\nmovq %r9, %rax\n",
+            "movq (%rsi), %r9\naddl %r9d, %edx\nmovq %rdx, %rax\n",
+            "movl (%rsi), %r9d\naddq %r9, %rdx\nmovq %rdx, %rax\n",
+            "movq (%rsi), %r9\naddq %r9, %r9\nmovq %r9, %rax\n",
+            "movq (%rsi), %r9\ncmpq %rdx, %r9\nsete %al\n",
+            "movq (%rsi), %r9\naddq %rdx, %r9\nmovq %r9, %rax\n",
+            "movq (%rsi), %r9\ncmpq $1, %r9\nsete %al\n",
+            "movq (%rsi), %r9\nandnq %r9, %rdx, %rax\n",
+            "movq (%rsi), %r9\nmovq %r9, %r8\naddq %rdx, %r8\nmovq %r8, %rax\n",
+        ] {
+            assert_volatile_rejected(code);
+        }
+        for barrier in [
+            "call other",
+            "barrier:",
+            "movq (%rdi), %r10",
+            ".byte 0x90",
+            ".cfi_adjust_cfa_offset 8",
+            ".p2align 4",
+            ".p2align 4,0xcc",
+        ] {
+            assert_volatile_rejected(&format!(
+                "movq (%rsi), %r9\n{barrier}\naddq %r9, %rdx\nmovq %rdx, %rax\n"
+            ));
+        }
+    }
+
+    #[test]
+    fn volatile_fusion_respects_other_pins_and_debug_attribution() {
+        let code = "movq (%rsi), %r9\naddq %r9, %rdx\nmovq %rdx, %rax\n";
+        for pin_consumer in [false, true] {
+            let (mut store, mut infos, load) = volatile_fixture(code);
+            if pin_consumer {
+                infos[load + 1].pinned = true;
+            } else {
+                infos[load].volatile_access = false;
+            }
+            let metadata = infos.clone();
+            assert!(!fuse_load_into_alu(&mut store, &mut infos));
+            assert_eq!(infos, metadata);
+        }
+        let code = "movq (%rsi), %r9\n.loc 1 2 0\naddq %r9, %rdx\nmovq %rdx, %rax\n";
+        let (mut store, mut infos, _) = volatile_fixture(code);
+        assert!(fuse_load_into_alu(&mut store, &mut infos));
+        let (mut store, mut infos, load) = volatile_fixture(code);
+        infos[load + 1].pinned = true;
+        assert!(!fuse_load_into_alu(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn real_nested_markers_preserve_two_reads_through_pipeline() {
+        let asm = format!(
+            "{PRO}# LCCC_VOLATILE_BEGIN\n# LCCC_VOLATILE_BEGIN\nmovq (%rsi), %r9\n# LCCC_VOLATILE_END\n# LCCC_VOLATILE_END\naddq %r9, %rdx\n# LCCC_VOLATILE_BEGIN\nmovq (%rdi), %r10\n# LCCC_VOLATILE_END\naddq %r10, %rdx\nmovq %rdx, %rax\n{EPI}"
+        );
+        let mut store = LineStore::new(asm.clone());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        super::super::pin_volatile_access_regions(&store, &mut infos);
+        assert!(fuse_load_into_alu(&mut store, &mut infos));
+        assert_eq!(
+            infos
+                .iter()
+                .filter(|i| i.pinned && i.volatile_access)
+                .count(),
+            2
+        );
+        let metadata = infos.clone();
+        assert!(!fuse_load_into_alu(&mut store, &mut infos));
+        assert_eq!(infos, metadata);
+        let out = super::super::peephole_optimize(asm);
+        let reads: Vec<_> = out
+            .lines()
+            .filter(|l| l.contains("(%rsi)") || l.contains("(%rdi)"))
+            .collect();
+        assert_eq!(reads.len(), 2, "{out}");
+        assert!(reads[0].contains("(%rsi)"), "{out}");
+        assert!(reads[1].contains("(%rdi)"), "{out}");
+        // Re-enter with real markers: finalized assembly intentionally strips
+        // internal metadata and is not a lossless IR serialization.
+        let wrapped = out
+            .lines()
+            .map(|l| {
+                if l.contains("(%rsi)") || l.contains("(%rdi)") {
+                    format!("# LCCC_VOLATILE_BEGIN\n{l}\n# LCCC_VOLATILE_END\n")
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect::<String>();
+        let again = super::super::peephole_optimize(wrapped);
+        assert_eq!(
+            again
+                .lines()
+                .filter(|l| l.contains("(%rsi)") || l.contains("(%rdi)"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn symbolic_tls_zero_extension_cmp_keeps_volatile_inputs_opaque() {
+        let asm = format!(
+            "{PRO}movzbl %fs:a@TPOFF, %r8d\nmovzbl %fs:b@TPOFF+1, %r9d\ncmpl %r9d, %r8d\nsete %al\n{EPI}"
+        );
+        let out = run(&asm, fuse_zero_ext_cmp);
+        assert!(out.contains("cmpb %fs:b@TPOFF+1, %r8b"), "{out}");
+        let mut store = LineStore::new(asm.clone());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        for i in &mut infos {
+            if matches!(i.kind, LineKind::Other { .. }) {
+                i.pinned = true;
+                i.volatile_access = true;
+            }
+        }
+        assert!(!fuse_zero_ext_cmp(&mut store, &mut infos));
+        assert_eq!(store.build_result(|_| false), asm);
     }
 
     #[test]

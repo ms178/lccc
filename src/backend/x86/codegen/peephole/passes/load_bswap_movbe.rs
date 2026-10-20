@@ -73,7 +73,7 @@ use super::relay_and_lea::{plain_gp_operand, split_two_operands};
 /// Parse `mov{l,q} MEM, %reg` into `(width, reg)`.  Only plain GP
 /// destinations spelled exactly as their bank (the shape the backend emits),
 /// and only plain memory operands: no register source, no immediate, no
-/// symbol-without-parenthesis form.
+/// unqualified symbolic displacement. Validated segmented symbols are allowed.
 fn parse_byte_load(t: &str) -> Option<(u8, RegId, &str)> {
     let (width, rest) = if let Some(r) = t.strip_prefix("movl ") {
         (4u8, r)
@@ -230,6 +230,29 @@ mod tests {
 
     fn run(asm: &str) -> String {
         run_with_permission(asm, true)
+    }
+
+    #[test]
+    fn symbolic_tls_movbe_obeys_feature_and_pin_policy() {
+        for (suffix, reg) in [("l", "%eax"), ("q", "%rax")] {
+            let asm = format!("f:\nmov{suffix} %fs:tls@TPOFF+8, {reg}\nbswap{suffix} {reg}\nret\n");
+            assert_eq!(run_with_permission(&asm, false), asm);
+            let out = run_with_permission(&asm, true);
+            assert!(
+                out.contains(&format!("movbe{suffix} %fs:tls@TPOFF+8, {reg}")),
+                "{out}"
+            );
+            for volatile in [false, true] {
+                let mut store = LineStore::new(asm.clone());
+                let mut infos: Vec<_> = (0..store.len())
+                    .map(|i| classify_line(store.get(i)))
+                    .collect();
+                infos[1].pinned = true;
+                infos[1].volatile_access = volatile;
+                assert!(!fuse_load_bswap(&mut store, &mut infos, true));
+                assert_eq!(store.build_result(|_| false), asm);
+            }
+        }
     }
 
     #[test]

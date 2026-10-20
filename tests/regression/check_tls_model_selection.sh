@@ -29,6 +29,7 @@
 set -euo pipefail
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+source "$here/tls_runtime_oracle.sh"
 CCC=${CCC:-$here/../../target/fastbuild/lccc}
 GCC=${GCC:-gcc}
 [[ -x $CCC ]] || { echo "check_tls_model_selection: lccc not found at $CCC" >&2; exit 1; }
@@ -148,17 +149,33 @@ else
 fi
 "$CCC" -O3 -fno-pic -no-pie "$hot_src" -o "$work/hot-run"
 "$GCC" -O3 -fno-pic -no-pie "$hot_src" -o "$work/hot-ref"
-if [ "$("$work/hot-run" 100003)" = "$("$work/hot-ref" 100003)" ]; then
-    note "contract 3: folded volatile TLS hot loop preserves runtime result"
-else
-    bad "folded volatile TLS hot loop differs from GCC"
-fi
+for iterations in 0 1 2 31 100003; do
+    if tls_compare_runtime "$work/hot-run" "$work/hot-ref" "$work/hot" 30 "$iterations"; then
+        note "contract 3: folded volatile TLS hot loop preserves result ($iterations trips)"
+    else
+        bad "folded volatile TLS hot loop failed ($iterations trips)"
+    fi
+done
+# Changing volatile slots exercise defined 32/64-bit arithmetic, comparisons,
+# and nonzero TLS addends under both the optimized and mutation-control paths.
+"$GCC" -O3 -fno-pic -no-pie "$here/tls_volatile_alu.c" -o "$work/mix-ref"
+"$CCC" -O3 -fno-pic -no-pie "$here/tls_volatile_alu.c" -o "$work/mix-run"
+CCC_NO_SEG_OPERAND_FUSE=1 "$CCC" -O3 -fno-pic -no-pie \
+    "$here/tls_volatile_alu.c" -o "$work/mix-control"
+for candidate in "$work/mix-run" "$work/mix-control"; do
+    if ! tls_compare_runtime "$candidate" "$work/mix-ref" "$work/mix" 30; then
+        bad "changing volatile TLS arithmetic differs from GCC: $candidate"
+    fi
+done
 
 if [ -f "$work/tlsmin.so" ]; then
-    "$CCC" -O2 -fPIC -shared -S "$work/tlsmin.c" -o "$work/shared.s" 2>/dev/null || true
+    if ! "$CCC" -O2 -fPIC -shared -S "$work/tlsmin.c" -o "$work/shared.s" 2>"$work/shared.err"; then
+        bad "shared TLS assembly failed: $(head -1 "$work/shared.err")"
+        rm -f "$work/shared.s"
+    fi
     if [ -f "$work/shared.s" ] && grep -q '%fs:.*@TPOFF' "$work/shared.s"; then
         bad "-shared must not use the Local-Exec direct form"
-    else
+    elif [ -f "$work/shared.s" ]; then
         note "contract 3: -shared keeps a dynamic TLS model"
     fi
     if [ -f "$work/shared.s" ]; then
