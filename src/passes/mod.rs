@@ -66,6 +66,7 @@ pub(crate) mod loop_square;
 pub(crate) mod loop_unroll;
 pub(crate) mod narrow;
 pub(crate) mod outline_switch;
+mod pair_load_carry;
 pub(crate) mod quadratic_sr;
 pub(crate) mod range_check;
 pub(crate) mod reassoc_accum;
@@ -1422,6 +1423,9 @@ pub(crate) fn run_passes(
     });
     let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
     apply_tree_vectorize_policy(&mut disabled, disable_tree_vectorize);
+    iv_strength_reduce::set_compare_recurrence_enabled(
+        target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "scalar_compare_iv"),
+    );
     loop_unroll::set_reduction_enabled(
         target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "reduction_unroll"),
     );
@@ -3598,6 +3602,10 @@ pub(crate) fn run_passes(
     // and after the unroller and vectorizers, whose matchers expect source
     // shape; before the FMA peel, which stays the last IR transform. Pass
     // name for CCC_DISABLE_PASSES: "reassoc_lat".
+    if target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "pair_load_carry") {
+        module.for_each_function(pair_load_carry::run);
+        verify::verify_after_pass(module, "pair_load_carry");
+    }
     if !pass_disabled(&disabled, "reassoc_lat") {
         module.for_each_function(reassoc_latency::run_function);
         verify::verify_after_pass(module, "reassoc_lat");

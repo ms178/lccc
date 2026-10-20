@@ -7580,7 +7580,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
             // class 6 to keep the web connected.
             O::VecLoadI32x4Pair | O::VecStoreI32x4Pair | O::VecPackI32x4Pair => Some(6),
             // ARX lane ops (rotate/shuffle): class 6 (I32x4 family).
-            O::VecRotlI32x4 | O::VecShufdI32x4 | O::VecXorI32x4 => Some(6),
+            O::VecRotlI32x4 | O::VecShufdI32x4 | O::VecXorI32x4 | O::VecOrI32x4 => Some(6),
             // BB-SLP 128-bit dword shifts: class 6 (I32x4 family).
             O::VecShlI32x4 | O::VecLShrI32x4 | O::VecAShrI32x4 => Some(6),
             // Per-lane variable dword shifts (VEX.128 three-operand form,
@@ -7746,6 +7746,7 @@ fn collect_x86_reduction_vector_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecRotlI32x4
                     | O::VecShufdI32x4
                     | O::VecXorI32x4
+                    | O::VecOrI32x4
                     // BB-SLP 128-bit dword shifts: VEX.128 immediate
                     // form reads the homed source in place.
                     | O::VecShlI32x4

@@ -1,4 +1,55 @@
-# Batch 5: byte-load reduction work in progress
+# Batch 5: cumulative PR #886 and recovered performance follow-ups
+
+## Find-bit and SHA follow-ups
+
+The cumulative work includes the original PR #886 through 8547b16 plus the
+following follow-ups. After the sandbox failure, its restored snapshot only
+contained the original PR. The follow-up source and tests were reconstructed
+from the recorded tool calls, formatted, and then validated afresh before
+being committed to the PR branch. The original PR's 14 green hosted checks
+must not be attributed to the follow-ups; current hosted status is tracked on
+the PR itself.
+
+* `scalar_compare_iv`: narrowly enable a U64 comparison-bound recurrence in
+  small, read-only search loops. General scalar IVSR stays opt-in. Affine Shl
+  recognition and unsigned runtime initialization cover `(i + 1) << 6`.
+* `pair_load_carry`: forward a single eight-byte SIMD store to its identical
+  next-iteration pair load in definitely-entered, two-block counted loops.
+  Admission requires a matching eight-byte pointer step, one writer, lane-local
+  zero-upper-half provenance and no escaping vector values. I32x4 OR producer
+  and consumer register-class support keeps the carried vector register-homed.
+* Add unit tests and executable regressions for unsigned wraparound, zero/tail
+  loops, protected-page boundaries, alias/barrier/escape refusals and source-span
+  preservation. The schedule regression uses local arrays to exercise packing.
+* Switch target-alignment experiments were neutral or slower; no alignment
+  change is included. The prior indirect-dispatch concern is not claimed fixed.
+
+Before the environment failure, the recorded 15-round VM screens (three
+warmups) gave current/previous-PR-head ratios of 0.913 [0.885, 0.932] for
+scaled find-bit and 0.896 [0.893, 0.899] for SHA. These are historical screening
+results, **not rerun measurements of this recovered export**, not EPYC evidence
+and not matched-ISA GCC comparisons. The follow-up Rust library suite recorded
+5,472 passes and strict Clippy passed before the final canonical constant-carrier
+adjustment and strengthened schedule regression. Those final adjustments built
+successfully and their emitted assembly was inspected, but comprehensive final
+checks were interrupted. The ignored workspace's raw follow-up runtime samples
+were not recovered; the original PR's retained evidence below remains available.
+
+Fresh recovery checks: warning-denied fastbuild of lccc/lccc-ld, 5,472 library
+tests plus one integration test, strict all-target Clippy and formatting PASS.
+Both new C regressions, including the strengthened local-array schedule case,
+PASS at -O0/-O1/-O2/-O3/-Os with inter-pass IR verification, and GCC16
+-Wall -Wextra -Werror. The full segment runtime contract PASS was repeated.
+A separate 3 GiB swap file was activated alongside the existing 1 GiB file;
+no package extraction into system paths was repeated. Current benchmark and
+CI results are recorded separately from the historical measurements below.
+
+The patch is a complete cumulative Git diff against base
+`b5a6b6b9c7568a002198249cf81ec9d70924683e`, not just an incremental update to an
+already-applied PR. Apply it to that base using `git apply ms178-1.patch`.
+
+## Original pushed PR evidence (historical)
+
 
 This is an initial, narrow improvement, **not completion of the GCC-gap mission**.
 Find-bit, SHA and switch dispatch still need profitable production changes.
