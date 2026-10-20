@@ -149,6 +149,9 @@ pub struct RiscvCodegen {
     /// the prologue/epilogue (ra/s0 saves, sp adjust, s0 setup) are skipped
     /// entirely and the function is entered and left through `ra` untouched.
     pub(super) frameless_leaf: bool,
+    /// A hidden TLS resolver call needs `ra` saved, but when there are no
+    /// stack slots or callee-saved value homes it does not need an s0 frame.
+    pub(super) ra_only_frame: bool,
 }
 
 impl RiscvCodegen {
@@ -173,6 +176,7 @@ impl RiscvCodegen {
             no_relax: false,
             current_func: None,
             frameless_leaf: false,
+            ra_only_frame: false,
         }
     }
 

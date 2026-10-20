@@ -13,6 +13,19 @@ impl RiscvCodegen {
                 self.emit_epilogue_and_ret_impl(frame_size);
                 return;
             }
+            // A full-width integer/pointer value already homed in the ABI
+            // return register needs no a0 -> t0 -> a0 relay. Restrict this to
+            // types requiring no narrow canonicalization.
+            if matches!(
+                ret_ty,
+                crate::common::types::IrType::I64
+                    | crate::common::types::IrType::U64
+                    | crate::common::types::IrType::Ptr
+            ) && matches!(val, Operand::Value(v) if self.reg_assignments.get(&v.0) == Some(&crate::backend::regalloc::PhysReg(12)))
+            {
+                self.emit_epilogue_and_ret_impl(frame_size);
+                return;
+            }
         }
         crate::backend::traits::emit_return_default(self, val, frame_size);
     }

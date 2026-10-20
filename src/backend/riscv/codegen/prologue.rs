@@ -25,7 +25,7 @@ impl RiscvCodegen {
     /// function therefore contains only instructions whose emitters touch
     /// t-regs and s-regs exclusively, over scalar (<=64-bit integer /
     /// F32/F64/Ptr) types.  Anything else keeps the pure callee-saved pool.
-    fn riscv_caller_pool_eligible(func: &IrFunction) -> bool {
+    fn riscv_caller_pool_eligible(&self, func: &IrFunction) -> bool {
         use crate::ir::reexports::{Instruction, IrConst, Operand};
         if std::env::var_os("CCC_NO_RISCV_CALLER_POOL").is_some() {
             return false;
@@ -78,10 +78,20 @@ impl RiscvCodegen {
                         }
                     }
                     Instruction::GetElementPtr { .. }
-                    | Instruction::GlobalAddr { .. }
                     | Instruction::LabelAddr { .. }
                     | Instruction::GetStaticChain { .. }
                     | Instruction::SetStaticChain { .. } => {}
+                    Instruction::GlobalAddr { name, .. } => {
+                        if self.state.tls_symbols.contains(name)
+                            && matches!(
+                                self.state.tls_model_for_symbol(name),
+                                crate::ir::reexports::TlsModel::GlobalDynamic
+                                    | crate::ir::reexports::TlsModel::LocalDynamic
+                            )
+                        {
+                            return false;
+                        }
+                    }
                     // Everything else (calls, inline asm, memcpys, atomics,
                     // intrinsics, varargs, F128/i128 carriers, non-local
                     // goto plumbing, dynamic allocas) keeps the pure
@@ -93,20 +103,43 @@ impl RiscvCodegen {
         true
     }
 
+    fn riscv_has_dynamic_tls(&self, func: &IrFunction) -> bool {
+        use crate::ir::reexports::Instruction;
+        func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                let Instruction::GlobalAddr { name, .. } = inst else {
+                    return false;
+                };
+                self.state.tls_symbols.contains(name)
+                    && matches!(
+                        self.state.tls_model_for_symbol(name),
+                        crate::ir::reexports::TlsModel::GlobalDynamic
+                            | crate::ir::reexports::TlsModel::LocalDynamic
+                    )
+            })
+        })
+    }
+
     /// Whether the function contains any IR-visible call point.  Used by the
     /// frameless-leaf gate: without a prologue the return address stays in
     /// `ra`, so any call would clobber it before the closing `ret`.
-    fn riscv_is_call_free(func: &IrFunction) -> bool {
+    fn riscv_is_call_free(&self, func: &IrFunction) -> bool {
         use crate::ir::reexports::Instruction;
         !func.blocks.iter().any(|block| {
-            block.instructions.iter().any(|inst| {
-                matches!(
-                    inst,
-                    Instruction::Call { .. }
-                        | Instruction::CallIndirect { .. }
-                        | Instruction::InlineAsm { .. }
-                        | Instruction::Memcpy { .. }
-                )
+            block.instructions.iter().any(|inst| match inst {
+                Instruction::Call { .. }
+                | Instruction::CallIndirect { .. }
+                | Instruction::InlineAsm { .. }
+                | Instruction::Memcpy { .. } => true,
+                Instruction::GlobalAddr { name, .. } => {
+                    self.state.tls_symbols.contains(name)
+                        && matches!(
+                            self.state.tls_model_for_symbol(name),
+                            crate::ir::reexports::TlsModel::GlobalDynamic
+                                | crate::ir::reexports::TlsModel::LocalDynamic
+                        )
+                }
+                _ => false,
             })
         })
     }
@@ -195,7 +228,7 @@ impl RiscvCodegen {
         let caller_saved_regs: Vec<crate::backend::regalloc::PhysReg> = if !self.state.disable_regalloc
                 && !self.is_variadic
                 && !func.uses_sret
-                && Self::riscv_caller_pool_eligible(func)
+                && self.riscv_caller_pool_eligible(func)
                 // The entry-prefix write guard is computed from block 0
                 // alone; opening the pool is only sound when every ParamRef
                 // really sits in that entry prefix (generation's lowering
@@ -211,7 +244,7 @@ impl RiscvCodegen {
         };
         let call_arg_regs = caller_saved_regs.clone();
         let (
-            reg_assigned,
+            mut reg_assigned,
             cached_liveness,
             _caller_save_spans,
             accumulator_assignments,
@@ -232,6 +265,53 @@ impl RiscvCodegen {
             // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
             &mut crate::common::fx_hash::FxHashMap::default(),
         );
+
+        // A function with exactly one hidden TLS resolver call and no
+        // IR-visible call can safely home that GlobalAddr's result in a0: the
+        // value is defined by the call, so it cannot be live across it, and no
+        // later call can clobber it. Other values remain in the callee-saved
+        // pool. This removes the otherwise artificial s-register relay from
+        // the dominant address/load shapes.
+        let has_visible_call = func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    crate::ir::reexports::Instruction::Call { .. }
+                        | crate::ir::reexports::Instruction::CallIndirect { .. }
+                        | crate::ir::reexports::Instruction::InlineAsm { .. }
+                        | crate::ir::reexports::Instruction::Memcpy { .. }
+                )
+            })
+        });
+        let dynamic_tls_dests: Vec<u32> = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter_map(|inst| match inst {
+                crate::ir::reexports::Instruction::GlobalAddr { dest, name }
+                    if self.state.tls_symbols.contains(name)
+                        && matches!(
+                            self.state.tls_model_for_symbol(name),
+                            crate::ir::reexports::TlsModel::GlobalDynamic
+                                | crate::ir::reexports::TlsModel::LocalDynamic
+                        ) =>
+                {
+                    Some(dest.0)
+                }
+                _ => None,
+            })
+            .collect();
+        if !has_visible_call && dynamic_tls_dests.len() == 1 {
+            let dest = dynamic_tls_dests[0];
+            let a0 = crate::backend::regalloc::PhysReg(12);
+            let old = self.reg_assignments.insert(dest, a0);
+            reg_assigned.insert(dest, a0);
+            if let Some(old) = old
+                && !self.reg_assignments.values().any(|&reg| reg == old)
+            {
+                self.used_callee_saved.retain(|&reg| reg != old);
+            }
+        }
 
         self.state.ra_accumulator_values =
             accumulator_assignments.iter().map(|a| a.value_id).collect();
@@ -285,8 +365,8 @@ impl RiscvCodegen {
         self.frameless_leaf = frame_size == 16
             && !self.is_variadic
             && !func.uses_sret
-            && Self::riscv_is_call_free(func)
-            && Self::riscv_caller_pool_eligible(func)
+            && self.riscv_is_call_free(func)
+            && self.riscv_caller_pool_eligible(func)
             && {
                 let mut config = self.call_abi_config_impl();
                 config.variadic_floats_in_gp = func.is_variadic;
@@ -303,7 +383,21 @@ impl RiscvCodegen {
                     )
                 })
             };
+        self.ra_only_frame = frame_size == 16
+            && !self.is_variadic
+            && !func.uses_sret
+            && self.used_callee_saved.is_empty()
+            && self.riscv_has_dynamic_tls(func);
         if self.frameless_leaf {
+            return;
+        }
+        if self.ra_only_frame {
+            self.state.emit("    addi sp, sp, -16");
+            self.state.emit("    sd ra, 8(sp)");
+            if self.state.emit_cfi {
+                self.state.emit("    .cfi_def_cfa_offset 16");
+                self.state.emit("    .cfi_offset ra, -8");
+            }
             return;
         }
         self.emit_prologue_riscv(frame_size);
@@ -322,6 +416,15 @@ impl RiscvCodegen {
 
     pub(super) fn emit_epilogue_impl(&mut self, frame_size: i64) {
         if self.frameless_leaf {
+            return;
+        }
+        if self.ra_only_frame {
+            self.state.emit("    ld ra, 8(sp)");
+            self.state.emit("    addi sp, sp, 16");
+            if self.state.emit_cfi {
+                self.state.emit("    .cfi_restore ra");
+                self.state.emit("    .cfi_def_cfa_offset 0");
+            }
             return;
         }
         // Restore callee-saved registers before epilogue.
@@ -1023,6 +1126,16 @@ impl RiscvCodegen {
 
     pub(super) fn emit_epilogue_and_ret_impl(&mut self, frame_size: i64) {
         if self.frameless_leaf {
+            self.state.emit("    ret");
+            return;
+        }
+        if self.ra_only_frame {
+            self.state.emit("    ld ra, 8(sp)");
+            self.state.emit("    addi sp, sp, 16");
+            if self.state.emit_cfi {
+                self.state.emit("    .cfi_restore ra");
+                self.state.emit("    .cfi_def_cfa_offset 0");
+            }
             self.state.emit("    ret");
             return;
         }

@@ -70,6 +70,18 @@ pub enum RelocType {
     TlsLeAddTprelHi12,
     /// R_AARCH64_TLSLE_ADD_TPREL_LO12_NC
     TlsLeAddTprelLo12,
+    /// R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21
+    TlsIeAdrGotTprelPage21,
+    /// R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC
+    TlsIeLd64GotTprelLo12,
+    /// R_AARCH64_TLSDESC_ADR_PAGE21
+    TlsDescAdrPage21,
+    /// R_AARCH64_TLSDESC_LD64_LO12
+    TlsDescLd64Lo12,
+    /// R_AARCH64_TLSDESC_ADD_LO12
+    TlsDescAddLo12,
+    /// R_AARCH64_TLSDESC_CALL
+    TlsDescCall,
     /// R_AARCH64_CONDBR19 - conditional branch, 19-bit offset
     CondBr19,
     /// R_AARCH64_TSTBR14 - test-and-branch, 14-bit offset
@@ -132,9 +144,15 @@ impl RelocType {
             RelocType::Ld64GotLo12 => 312,       // R_AARCH64_LD64_GOT_LO12_NC
             RelocType::TlsLeAddTprelHi12 => 549, // R_AARCH64_TLSLE_ADD_TPREL_HI12
             RelocType::TlsLeAddTprelLo12 => 551, // R_AARCH64_TLSLE_ADD_TPREL_LO12_NC
-            RelocType::CondBr19 => 280,          // R_AARCH64_CONDBR19
-            RelocType::TstBr14 => 279,           // R_AARCH64_TSTBR14
-            RelocType::Ldr19 => 273,             // R_AARCH64_LD_PREL_LO19
+            RelocType::TlsIeAdrGotTprelPage21 => 541,
+            RelocType::TlsIeLd64GotTprelLo12 => 542,
+            RelocType::TlsDescAdrPage21 => 562,
+            RelocType::TlsDescLd64Lo12 => 563,
+            RelocType::TlsDescAddLo12 => 564,
+            RelocType::TlsDescCall => 569,
+            RelocType::CondBr19 => 280, // R_AARCH64_CONDBR19
+            RelocType::TstBr14 => 279,  // R_AARCH64_TSTBR14
+            RelocType::Ldr19 => 273,    // R_AARCH64_LD_PREL_LO19
             // MOVW halfword relocations (IHI0056B / LLVM AArch64.def):
             // G0=0x107=263 .. G3=0x10d=269, SABS_G0=0x10e=270 .. SABS_G2=272
             RelocType::MovwUabsG0 => 263,

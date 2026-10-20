@@ -67,7 +67,7 @@ All codegen source files reside under `src/backend/arm/codegen/`.
 | `i128_ops.rs` | 128-bit integer arithmetic: add/sub via `ADDS`/`ADC`/`SUBS`/`SBC`, multiplication via `MUL`/`UMULH`/`MADD`, bitwise ops, shifts (with >64 and ==64 special cases), division/remainder via `__divti3`/`__modti3` libcalls, float-to-i128 and i128-to-float conversions, and comparisons. |
 | `atomics.rs` | Atomic operations: `LDXR`/`STXR` exclusive load/store loops for RMW (exchange, add, sub, and, or, xor, nand, test-and-set), compare-and-exchange with `CLREX` on failure, atomic loads (`LDAR`/`LDARB`/`LDARH`), atomic stores (`STLR`/`STLRB`/`STLRH`), and fences (`DMB ISH`/`ISHLD`/`ISHST`). |
 | `intrinsics.rs` | NEON/SIMD intrinsic emission (SSE-equivalent operations), hardware builtins (CRC32, `fsqrt`, `fabs`), memory barriers (`DMB`), non-temporal stores, cache maintenance (`DC CIVAC`), `__builtin_frame_address`, `__builtin_return_address`, and `__builtin_thread_pointer`. |
-| `globals.rs` | Global symbol addressing: `ADRP`+`ADD :lo12:` for direct access (used for all regular symbols, including in PIC/PIE mode), `ADRP`+`LDR :got:` for GOT-indirect access (weak extern symbols only), and TLS access via `MRS TPIDR_EL0` + `tprel_hi12`/`tprel_lo12_nc`. |
+| `globals.rs` | Global symbol addressing: direct `ADRP`+`ADD`, GOT-indirect `ADRP`+`LDR`, and model-correct TLS LE, IE and TLSDESC dynamic sequences. |
 | `returns.rs` | Return value handling: integer returns in `x0`, F32 in `s0`, F64 in `d0`, F128 in `q0` (with `__extenddftf2` promotion), I128 in `x0:x1`, struct return via `x8` (sret pointer), and second-slot float returns in `d1`/`s1`. |
 | `variadic.rs` | Variadic function support: `va_arg` implementation (GP register save area at offset 24, FP register save area at offset 28), `va_start` initialization of the `va_list` struct (stack pointer, `gr_top`, `vr_top`, `gr_offs`, `vr_offs`), and `va_copy`. |
 | `inline_asm.rs` | Inline assembly template substitution: `%0`/`%[name]` positional and named operand references, `%w`/`%x`/`%s`/`%d`/`%q`/`%c`/`%a` register modifiers, GCC `r0`-`r30` alias normalization, and `%%` literal percent. |
@@ -313,11 +313,31 @@ Regular extern symbols use direct PC-relative ADRP+ADD even in PIC/PIE mode,
 since this is inherently position-independent and works correctly for
 statically-linked executables and early boot code (pre-MMU).
 
-**Thread-Local Storage (TLS):**
+**Thread-Local Storage (TLS):** the selected ELF model is honored rather than
+assuming Local Exec. LE uses `TPIDR_EL0` plus TPREL relocations; IE loads a
+TP-relative offset from the GOT; GD/LD use the AArch64 TLSDESC ABI and retain
+its call-site relocation so a static linker can relax the sequence.
+
 ```asm
-    mrs  x0, tpidr_el0              // read thread pointer
-    add  x0, x0, :tprel_hi12:sym   // add high 12 bits of TLS offset
-    add  x0, x0, :tprel_lo12_nc:sym // add low 12 bits of TLS offset
+    // Local Exec
+    mrs  x0, tpidr_el0
+    add  x0, x0, :tprel_hi12:sym
+    add  x0, x0, :tprel_lo12_nc:sym
+
+    // Initial Exec
+    adrp x0, :gottprel:sym
+    ldr  x0, [x0, :gottprel_lo12:sym]
+    mrs  x1, tpidr_el0
+    add  x0, x1, x0
+
+    // TLSDESC dynamic
+    mrs  x1, tpidr_el0
+    adrp x0, :tlsdesc:sym
+    ldr  x2, [x0, :tlsdesc_lo12:sym]
+    add  x0, x0, :tlsdesc_lo12:sym
+    .tlsdesccall sym
+    blr  x2
+    add  x0, x1, x0
 ```
 
 ### Stack-Relative Addressing

@@ -734,6 +734,17 @@ pub(crate) fn encode_add_sub(
                 },
             });
         }
+        if kind == "tlsdesc_lo12" {
+            let word = ((sf << 31) | (op << 30) | (s_bit << 29) | (0b10001 << 24)) | (rn << 5) | rd;
+            return Ok(EncodeResult::WordWithReloc {
+                word,
+                reloc: Relocation {
+                    reloc_type: RelocType::TlsDescAddLo12,
+                    symbol: symbol.clone(),
+                    addend: 0,
+                },
+            });
+        }
     }
     if let Some(Operand::ModifierOffset {
         kind,
