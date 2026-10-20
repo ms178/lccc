@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import re
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).parent.parent.parent
@@ -45,6 +46,15 @@ def main():
     if args.filter:
         files = [f for f in files if args.filter in f.name]
 
+    # Binaries go to a private temporary directory. A fixed path (this runner
+    # used to fall back to /home/user/work) is unwritable wherever the checkout
+    # runs as a different user, which failed the whole gate before it tested
+    # anything; a temp dir is also self-cleaning and safe to run concurrently.
+    with tempfile.TemporaryDirectory(prefix="lccc-intrin-") as tmpdir:
+        return run_cases(args, files, Path(tmpdir))
+
+
+def run_cases(args, files, workdir):
     npass = nfail = nskip = 0
     failures = []
     for src in files:
@@ -59,9 +69,8 @@ def main():
         lccc_flags = (args.lccc_flags + " " + " ".join(extra)).split()
         gcc_flags = (args.gcc_flags + " " + " ".join(extra)).split()
 
-        lbin = REPO / "work" / f"it_{name}_lccc" if (REPO / "work").exists() else Path(f"/home/user/work/it_{name}_lccc")
-        gbin = Path(str(lbin).replace("_lccc", "_gcc"))
-        lbin.parent.mkdir(parents=True, exist_ok=True)
+        lbin = workdir / f"it_{name}_lccc"
+        gbin = workdir / f"it_{name}_gcc"
 
         # GCC must also find lccc's headers for _mm* availability tests? No:
         # GCC uses its own headers; lccc uses lccc's. lccc needs gcc's std headers.
