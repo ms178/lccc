@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-volatile __thread uint64_t tls_hot_value = UINT64_C(0x9e3779b97f4a7c15);
+__thread volatile uint64_t tls_hot_value = UINT64_C(0x9e3779b97f4a7c15);
 
 __attribute__((noinline)) uint64_t tls_hot_loop(uint64_t iterations) {
     uint64_t sum = 0;

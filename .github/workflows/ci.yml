@@ -1753,6 +1753,35 @@ jobs:
           "intel-evidence/$fixture-lccc" > "intel-evidence/$fixture-lccc.txt"
           diff -u "intel-evidence/$fixture-icx.txt" "intel-evidence/$fixture-lccc.txt"
         done
+    - name: Volatile reduction O3 contracts and ICX matrix
+      run: |
+        set -euo pipefail
+        for source in tests/regression/volatile_reduction.c tests/benchmark/programs/volatile_reduce.c; do
+          name=$(basename "$source" .c)
+          "$LCCC_ICX_BIN" -O3 -Wall -Wextra -Werror -fno-pic -no-pie "$source" -o "intel-evidence/$name-icx"
+          target/fastbuild/lccc -O3 -Wall -Wextra -Werror -fno-pic -no-pie "$source" -o "intel-evidence/$name-lccc"
+          for n in 0 1 2 3 4 5 7 8 9 16 17 1024; do
+            "intel-evidence/$name-icx" "$n" > "intel-evidence/$name-icx.txt"
+            "intel-evidence/$name-lccc" "$n" > "intel-evidence/$name-lccc.txt"
+            diff -u "intel-evidence/$name-icx.txt" "intel-evidence/$name-lccc.txt"
+          done
+        done
+        "$LCCC_ICX_BIN" -O3 -Wall -Wextra -Werror tests/benchmark/programs/volatile_reduce_driver.c -ldl -o intel-evidence/volatile-driver
+        for width in 32 64; do
+          for kind in 0 1 2 3 4; do
+            for address in 0 1; do
+              for pressure in 0 1; do
+                "$LCCC_ICX_BIN" -O3 -Wall -Wextra -Werror -fPIC -shared \
+                  -DWIDTH=$width -DKIND=$kind -DADDRESS=$address -DPRESSURE=$pressure \
+                  tests/benchmark/programs/volatile_reduce_matrix.c -o intel-evidence/volatile-kernel.so
+                for n in 0 1 2 3 4 5 7 8 9 16 17 1024; do
+                  intel-evidence/volatile-driver "$PWD/intel-evidence/volatile-kernel.so" \
+                    "$n" 32 "$kind" "$width" "$pressure" "$address" >> intel-evidence/volatile-matrix.txt
+                done
+              done
+            done
+          done
+        done
     - name: Retain authenticated package, probe and binary identities
       if: always()
       uses: actions/upload-artifact@v7
