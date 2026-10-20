@@ -19095,21 +19095,14 @@ fn analyze_strict_computed_recip_reduction(
         }
         _ => return None,
     };
-    // Do not omit any other potentially-faulting or observable load.
-    let f64_load_count = body
+    // Every vector iteration replaces FOUR scalar iterations. No other load,
+    // even of an integer type, may disappear: it may be volatile or fault.
+    // Checking only the F64 load count admitted unrelated integer loads.
+    if body
         .instructions
         .iter()
-        .filter(|inst| {
-            matches!(
-                inst,
-                Instruction::Load {
-                    ty: IrType::F64,
-                    ..
-                }
-            )
-        })
-        .count();
-    if f64_load_count != 1 {
+        .any(|inst| matches!(inst, Instruction::Load { dest, .. } if *dest != loaded_value))
+    {
         return None;
     }
     if !strict_external_value_available(func, cfg, &loop_info.body, preheader_idx, source_base) {

@@ -930,6 +930,8 @@ jobs:
         CCC: target/fastbuild/lccc
         GCC: gcc-16
       run: bash tests/regression/check_strict_packed_dag.sh
+    - name: Exact signed division and strict volatile-load legality
+      run: python3 scripts/check_exact_signed_div.py
     - name: Strict packed reciprocal bitwise oracle
       run: python3 scripts/check_strict_packed_recip.py
     - name: Observable FP environment semantics

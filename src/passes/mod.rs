@@ -1284,8 +1284,6 @@ pub(crate) fn run_passes(
     fp_contract: crate::common::fp_contract::FpContract,
     x86_isa: X86Isa,
     x86_avx: bool,
-    x86_avx2: bool,
-    x86_sse4_1: bool,
     x86_fma: bool,
     x86_bmi1: bool,
     x86_avx512vl: bool,
@@ -1393,9 +1391,11 @@ pub(crate) fn run_passes(
     // PERF-41's strict computed-reciprocal prefix uses VPINSRD (SSE4.1) plus
     // AVX2 packed conversion/division.  Do not infer this from generic x86
     // vectorization or from AVX alone; the pass must fail closed for a target
-    // which has not explicitly enabled both required ISA subsets.
+    // which does not permit both required ISA subsets. Raw driver request
+    // bits are NOT permissions: the default V3 ceiling enables both without
+    // explicit -mavx2/-msse4.1, and explicit denials constrain that ceiling.
     vectorize::set_x86_strict_recip_avx2_enabled(
-        target == crate::backend::Target::X86_64 && x86_avx2 && x86_sse4_1 && x86_isa.ymm,
+        target == crate::backend::Target::X86_64 && x86_isa.ymm && x86_isa.sse41,
     );
     // FMA3 availability for the fma/fmaf libcall fold (simplify.rs): the
     // fused form is required for the C99 single-rounding semantics, so the
@@ -1421,6 +1421,7 @@ pub(crate) fn run_passes(
     });
     let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
     apply_tree_vectorize_policy(&mut disabled, disable_tree_vectorize);
+    div_by_const::set_exact_enabled(!pass_disabled(&disabled, "exact_signed_div"));
     vectorize::set_strict_recip_pack_enabled(!pass_disabled(&disabled, "strict_recip_pack"));
     vectorize::set_byte_count_normalize_enabled(!pass_disabled(&disabled, "byte_count_normalize"));
     // Snapshot the map policy switches once, like the other pass-pipeline
@@ -4050,8 +4051,6 @@ mod signed_wrap_policy_tests {
             false,
             FpContract::Off,
             X86Isa::default(),
-            false,
-            false,
             false,
             false,
             false,

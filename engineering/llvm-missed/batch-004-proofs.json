@@ -1,0 +1,846 @@
+{
+  "scope": "Scoped bit-vector lemmas; not a certificate of the Rust implementation.",
+  "checks": [
+    {
+      "name": "i32/2^1",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^1",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^2",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^2",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^3",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^3",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^4",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^4",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^5",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^5",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^6",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^6",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^7",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^7",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^8",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^8",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^9",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^9",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^10",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^10",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^11",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^11",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^12",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^12",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^13",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^13",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^14",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^14",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^15",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^15",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^16",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^16",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^17",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^17",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^18",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^18",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^19",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^19",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^20",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^20",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^21",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^21",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^22",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^22",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^23",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^23",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^24",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^24",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^25",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^25",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^26",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^26",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^27",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^27",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^28",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^28",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^29",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^29",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32/2^30",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32%2^30",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32 opposite parity add",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32 opposite parity sub",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32 opposite parity xor",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32 complement product even",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32 transfer and",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32 transfer or",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32 transfer xor",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32 transfer add",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32 transfer sub",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32 transfer mul",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32 transfer shl",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32 transfer ashr",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i32 transfer lshr",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^1",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^1",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^2",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^2",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^3",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^3",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^4",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^4",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^5",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^5",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^6",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^6",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^7",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^7",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^8",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^8",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^9",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^9",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^10",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^10",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^11",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^11",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^12",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^12",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^13",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^13",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^14",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^14",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^15",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^15",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^16",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^16",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^17",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^17",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^18",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^18",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^19",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^19",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^20",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^20",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^21",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^21",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^22",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^22",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^23",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^23",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^24",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^24",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^25",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^25",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^26",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^26",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^27",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^27",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^28",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^28",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^29",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^29",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^30",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^30",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^31",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^31",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^32",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^32",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^33",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^33",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^34",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^34",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^35",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^35",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^36",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^36",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^37",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^37",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^38",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^38",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^39",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^39",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^40",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^40",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^41",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^41",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^42",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^42",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^43",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^43",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^44",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^44",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^45",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^45",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^46",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^46",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^47",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^47",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^48",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^48",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^49",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^49",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^50",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^50",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^51",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^51",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^52",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^52",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^53",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^53",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^54",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^54",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^55",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^55",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^56",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^56",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^57",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^57",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^58",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^58",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^59",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^59",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^60",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^60",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^61",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^61",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64/2^62",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64%2^62",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64 opposite parity add",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64 opposite parity sub",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64 opposite parity xor",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64 complement product even",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64 transfer and",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64 transfer or",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64 transfer xor",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64 transfer add",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64 transfer sub",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64 transfer mul",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64 transfer shl",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64 transfer ashr",
+      "negated_lemma": "unsat"
+    },
+    {
+      "name": "i64 transfer lshr",
+      "negated_lemma": "unsat"
+    }
+  ],
+  "complete": true
+}

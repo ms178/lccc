@@ -43,9 +43,21 @@
 use crate::common::types::IrType;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 
+#[path = "div_by_const_exact.rs"]
+mod exact;
+
+thread_local! {
+    static EXACT_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+pub(crate) fn set_exact_enabled(enabled: bool) {
+    EXACT_ENABLED.with(|cell| cell.set(enabled));
+}
+
 /// Transform division/modulo by constants in a single function.
 pub(crate) fn div_by_const_function(func: &mut IrFunction) -> usize {
-    let mut changes = 0;
+    let mut changes =
+        EXACT_ENABLED.with(|enabled| if enabled.get() { exact::run(func) } else { 0 });
     let mut next_id = func.next_value_id.max(func.max_value_id() + 1);
 
     // Build sets of values known to fit in unsigned 32-bit or signed 32-bit ranges.
