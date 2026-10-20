@@ -1125,9 +1125,6 @@ fn classified_f64(
 ///
 /// `is_unsigned` indicates whether the expression has an unsigned type.
 #[inline]
-/// Evaluate a compile-time builtin call under an explicit builtin policy.
-/// `allow_nonprefixed_builtins=false` (`-fno-builtin` / `-ffreestanding`)
-/// withdraws EVERY non-`__`-prefixed spelling — the whole bare-name fold
 pub fn promote_sub_int(val: IrConst, is_unsigned: bool) -> IrConst {
     match &val {
         IrConst::I8(v) => {
@@ -1146,6 +1143,100 @@ pub fn promote_sub_int(val: IrConst, is_unsigned: bool) -> IrConst {
         }
         _ => val,
     }
+}
+
+/// C11 6.3.1.2: converting any nonzero scalar to `_Bool` yields 1.
+///
+/// This is a property of the VALUE, not of its low bits, so every caller
+/// must hand over the full source bits **before** any truncation to the
+/// target width. Truncating first is what folded `(_Bool)256`,
+/// `(_Bool)65536u` and `(_Bool)67106816ULL` to 0. Defined once because
+/// four folding sites (sema `Cast` evaluation, sema `cast_i128_to_ctype`,
+/// and both `eval_const_expr_as_bits`) must agree; the site that is not
+/// taught the rule is the next miscompile.
+#[inline]
+pub fn c_bool_truth(bits: u64) -> bool {
+    bits != 0
+}
+
+/// 128-bit-source form of [`c_bool_truth`]: the value can have nonzero
+/// high bits and an all-zero low half, e.g. `(unsigned __int128)1 << 100`,
+/// which converts to `_Bool` 1 just like any other nonzero value.
+#[inline]
+pub fn c_bool_truth_i128(v: i128) -> bool {
+    v != 0
+}
+
+/// `_Bool` constant (0 or 1, carried as `int`) from full-width source bits.
+#[inline]
+pub fn c_bool_const(bits: u64) -> IrConst {
+    IrConst::I32(c_bool_truth(bits) as i32)
+}
+
+/// [`c_bool_const`] for a source carried in the `__int128` carrier.
+#[inline]
+pub fn c_bool_const_i128(v: i128) -> IrConst {
+    IrConst::I32(c_bool_truth_i128(v) as i32)
+}
+
+/// Reduce an integer constant to its operand's width when the value rides
+/// a wider carrier.
+///
+/// The evaluators keep `unsigned int` in the `I64` carrier so the full
+/// 32-bit range survives; the price is that a carrier-wide
+/// `negate_const`/`bitnot_const` computes mod 2^64 instead of mod 2^32.
+/// C11 6.5.3.3p1/p4 give `-x` and `~x` the operand's *promoted* type and
+/// 6.3.1.3p2 makes the unsigned result modular in that width, so the
+/// reduction must happen there.
+///
+/// `operand_size` is the size in bytes of the operand type. Only 4 can
+/// matter: a sub-int operand is promoted to `int` before the operator
+/// runs, so it arrives in the `I32` carrier and never reaches here, and
+/// an unknown size keeps the carrier rule -- the only choice that cannot
+/// corrupt a 64-bit operand. The `I64` carrier holding a 4-byte operand
+/// is itself the proof that the operand is unsigned (no signed 32-bit
+/// value is ever carried in 64 bits), so no separate signedness test is
+/// needed; that keeps the rule independent of `is_expr_unsigned`, which
+/// can be unavailable exactly when a type map is.
+#[inline]
+fn reduce_to_operand_width(val: IrConst, operand_size: Option<usize>) -> IrConst {
+    match val {
+        IrConst::I64(v) if operand_size == Some(4) => IrConst::I64(v as u32 as i64),
+        other => other,
+    }
+}
+
+/// Unary minus in the operand's promoted type (C11 6.5.3.3p1), with the
+/// unsigned result reduced modulo 2^width of that type (6.3.1.3p2).
+///
+/// `-(3844603080U)` must fold to `450364216`; negating the 64-bit carrier
+/// directly produced `18446744069864948536` and flipped a folded `min()`.
+#[inline]
+pub fn negate_const_promoted(
+    val: IrConst,
+    is_unsigned: bool,
+    operand_size: Option<usize>,
+) -> Option<IrConst> {
+    let promoted = promote_sub_int(val, is_unsigned);
+    let negated = const_arith::negate_const(promoted)?;
+    Some(reduce_to_operand_width(negated, operand_size))
+}
+
+/// Bitwise NOT in the operand's promoted type (C11 6.5.3.3p4), with the
+/// unsigned result reduced modulo 2^width of that type (6.3.1.3p2).
+///
+/// Without the reduction `~0xFFFFFFFFu` complements to
+/// `0xFFFFFFFF_00000000` instead of 0, which flipped a short-circuit use
+/// (`regress_logical_and_const_bitnot_short_circuit`).
+#[inline]
+pub fn bitnot_const_promoted(
+    val: IrConst,
+    is_unsigned: bool,
+    operand_size: Option<usize>,
+) -> Option<IrConst> {
+    let promoted = promote_sub_int(val, is_unsigned);
+    let inverted = const_arith::bitnot_const(promoted)?;
+    Some(reduce_to_operand_width(inverted, operand_size))
 }
 
 /// Evaluate a constant expression as raw u64 bits, with fallback to value conversion.
@@ -1615,6 +1706,158 @@ mod string_length_tests {
         assert_eq!(
             eval_builtin_call_with_mode("__builtin_strcmp", &both, &cmp_eval_int, false),
             Some(IrConst::I32(1))
+        );
+    }
+}
+
+/// Contract tests for the two C rules that the sema and lowering constant
+/// folders must agree on. They live here, next to the single definition of
+/// each rule, because the failure mode being guarded against is precisely
+/// "one of the four call sites was not taught the rule".
+#[cfg(test)]
+mod promoted_fold_tests {
+    use super::{
+        bitnot_const_promoted, c_bool_const, c_bool_const_i128, c_bool_truth, c_bool_truth_i128,
+        negate_const_promoted,
+    };
+    use crate::ir::constants::IrConst;
+
+    #[test]
+    fn bool_conversion_is_by_value_not_by_low_byte() {
+        // Every value here has a zero low byte or a zero low word; a
+        // truncate-then-normalise fold answers 0 for all of them.
+        for nonzero in [
+            256u64,
+            65536,
+            67_106_816,
+            1 << 24,
+            1 << 32,
+            u64::MAX,
+            0x8000_0000,
+        ] {
+            assert_eq!(c_bool_const(nonzero), IrConst::I32(1), "(_Bool){nonzero}");
+            assert!(c_bool_truth(nonzero));
+        }
+        assert_eq!(c_bool_const(0), IrConst::I32(0));
+        assert!(!c_bool_truth(0));
+    }
+
+    #[test]
+    fn bool_conversion_sees_the_whole_int128() {
+        // (unsigned __int128)1 << 100 has zero low 64 bits but is nonzero.
+        let high_only = 1i128 << 100;
+        assert_eq!(c_bool_const_i128(high_only), IrConst::I32(1));
+        assert!(c_bool_truth_i128(high_only));
+        assert_eq!(c_bool_const_i128(0), IrConst::I32(0));
+        // A value whose low 64 bits are all ones is also just "nonzero".
+        assert_eq!(c_bool_const_i128(i128::MIN), IrConst::I32(1));
+    }
+
+    #[test]
+    fn unary_minus_of_unsigned_int_is_mod_2_32() {
+        // The YARPGen seed-101 value: -(3844603080U) == 450364216 (mod 2^32).
+        assert_eq!(
+            negate_const_promoted(IrConst::I64(3_844_603_080), true, Some(4)),
+            Some(IrConst::I64(450_364_216))
+        );
+        // -(42U) == 4294967254 (mod 2^32), not 2^64-42.
+        assert_eq!(
+            negate_const_promoted(IrConst::I64(42), true, Some(4)),
+            Some(IrConst::I64(4_294_967_254))
+        );
+        // -(0U) stays 0.
+        assert_eq!(
+            negate_const_promoted(IrConst::I64(0), true, Some(4)),
+            Some(IrConst::I64(0))
+        );
+        // -(2^31 U) == 2^31 (mod 2^32), the wraparound boundary.
+        assert_eq!(
+            negate_const_promoted(IrConst::I64(1 << 31), true, Some(4)),
+            Some(IrConst::I64(1 << 31))
+        );
+    }
+
+    #[test]
+    fn unary_minus_of_unsigned_long_stays_mod_2_64() {
+        // An 8-byte operand must keep the carrier rule; masking here would
+        // truncate a real 64-bit value. -(42UL) is 2^64-42, which is the
+        // i64 bit pattern -42.
+        assert_eq!(
+            negate_const_promoted(IrConst::I64(42), true, Some(8)),
+            Some(IrConst::I64(-42))
+        );
+        assert_eq!(
+            negate_const_promoted(IrConst::I64(42), true, None),
+            Some(IrConst::I64(-42)),
+            "an unknown operand size must not license a 32-bit reduction"
+        );
+    }
+
+    #[test]
+    fn unary_minus_of_signed_sub_int_promotes_to_int() {
+        // C11 6.3.1.1: (signed char)-128 promotes to int -128, so -(-128)
+        // is 128 as an int, not a byte wrapping to -128.
+        assert_eq!(
+            negate_const_promoted(IrConst::I8(-128), false, Some(1)),
+            Some(IrConst::I32(128))
+        );
+        // (unsigned char)200 promotes to int 200.
+        assert_eq!(
+            negate_const_promoted(IrConst::I8(-56), true, Some(1)),
+            Some(IrConst::I32(-200))
+        );
+        assert_eq!(
+            negate_const_promoted(IrConst::I16(-1), true, Some(2)),
+            Some(IrConst::I32(-65535))
+        );
+    }
+
+    #[test]
+    fn unary_minus_leaves_floats_alone() {
+        assert_eq!(
+            negate_const_promoted(IrConst::F64(1.5), false, Some(8)),
+            Some(IrConst::F64(-1.5))
+        );
+        // -0.0 must stay -0.0 (sign-bit flip, not arithmetic negation).
+        assert_eq!(
+            negate_const_promoted(IrConst::F64(0.0), false, Some(8)),
+            Some(IrConst::F64(-0.0))
+        );
+    }
+
+    #[test]
+    fn bitwise_not_of_unsigned_int_is_mod_2_32() {
+        assert_eq!(
+            bitnot_const_promoted(IrConst::I64(0xFFFF_FFFF), true, Some(4)),
+            Some(IrConst::I64(0))
+        );
+        assert_eq!(
+            bitnot_const_promoted(IrConst::I64(0), true, Some(4)),
+            Some(IrConst::I64(0xFFFF_FFFF))
+        );
+        // 8-byte operand: complement the full carrier.
+        assert_eq!(
+            bitnot_const_promoted(IrConst::I64(0), true, Some(8)),
+            Some(IrConst::I64(-1))
+        );
+        // Sub-int promotes to int: ~(unsigned char)0 is -1 as an int.
+        assert_eq!(
+            bitnot_const_promoted(IrConst::I8(0), true, Some(1)),
+            Some(IrConst::I32(-1))
+        );
+    }
+
+    #[test]
+    fn int128_carrier_wraps_in_its_own_width() {
+        // -(unsigned __int128)1 is all-ones, i.e. i128 -1: wrapping_neg on
+        // the carrier already reduces mod 2^128, so no extra mask applies.
+        assert_eq!(
+            negate_const_promoted(IrConst::I128(1), true, Some(16)),
+            Some(IrConst::I128(-1))
+        );
+        assert_eq!(
+            bitnot_const_promoted(IrConst::I128(0), true, Some(16)),
+            Some(IrConst::I128(-1))
         );
     }
 }

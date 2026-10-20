@@ -1558,34 +1558,12 @@ impl Lowerer {
         then_expr: &Expr,
         else_expr: &Expr,
     ) -> Option<CType> {
-        use crate::common::const_arith::is_null_pointer_constant;
-        let then_ct = self.get_expr_ctype(then_expr);
-        let else_ct = self.get_expr_ctype(else_expr);
-        let compose = |then_is_npc: bool, else_is_npc: bool| {
-            CType::conditional_composite_type(
-                then_ct.clone(),
-                else_ct.clone(),
-                then_is_npc,
-                else_is_npc,
-            )
-        };
-        let then_matters = CType::conditional_arm_npc_matters(then_ct.as_ref(), else_ct.as_ref());
-        let else_matters = CType::conditional_arm_npc_matters(else_ct.as_ref(), then_ct.as_ref());
-        if then_matters || else_matters {
-            if let Some(sema) = self.lookup_sema_expr_type(expr) {
-                let npc = compose(then_matters, else_matters);
-                if npc.as_ref() == Some(&sema) {
-                    return npc;
-                }
-                let not_npc = compose(false, false);
-                if not_npc.as_ref() == Some(&sema) {
-                    return not_npc;
-                }
-            }
-        }
-        compose(
-            is_null_pointer_constant(then_expr),
-            is_null_pointer_constant(else_expr),
+        self.reconcile_conditional_ctype(
+            expr,
+            self.get_expr_ctype(then_expr),
+            self.get_expr_ctype(else_expr),
+            then_expr,
+            else_expr,
         )
     }
 
@@ -2112,28 +2090,72 @@ impl Lowerer {
     /// This handles the common typeof patterns (identifier, deref, address-of, cast)
     /// where the identifier is declared in the same compound statement.
     /// More complex expressions (member access, subscript, etc.) are not supported.
+    /// Compose a conditional's two arm types, reconciling the two
+    /// null-pointer-constant readings against sema's own type for the
+    /// whole conditional.
+    ///
+    /// `void *` against `0` has two readings, and sema has already decided
+    /// which one this program has; when it agrees with exactly one of them
+    /// that is the answer. Both type-resolution paths go through here:
+    /// before this was shared, the scope-threaded path skipped the
+    /// reconciliation, so the same conditional could be typed differently
+    /// depending on whether a statement expression happened to be in the
+    /// way.
+    fn reconcile_conditional_ctype(
+        &self,
+        expr: &Expr,
+        then_ct: Option<CType>,
+        else_ct: Option<CType>,
+        then_expr: &Expr,
+        else_expr: &Expr,
+    ) -> Option<CType> {
+        use crate::common::const_arith::is_null_pointer_constant;
+        let compose = |then_is_npc: bool, else_is_npc: bool| {
+            CType::conditional_composite_type(
+                then_ct.clone(),
+                else_ct.clone(),
+                then_is_npc,
+                else_is_npc,
+            )
+        };
+        let then_matters = CType::conditional_arm_npc_matters(then_ct.as_ref(), else_ct.as_ref());
+        let else_matters = CType::conditional_arm_npc_matters(else_ct.as_ref(), then_ct.as_ref());
+        if then_matters || else_matters {
+            if let Some(sema) = self.lookup_sema_expr_type(expr) {
+                let npc = compose(then_matters, else_matters);
+                if npc.as_ref() == Some(&sema) {
+                    return npc;
+                }
+                let not_npc = compose(false, false);
+                if not_npc.as_ref() == Some(&sema) {
+                    return not_npc;
+                }
+            }
+        }
+        compose(
+            is_null_pointer_constant(then_expr),
+            is_null_pointer_constant(else_expr),
+        )
+    }
+
     /// Composite type of a conditional's arms resolved against a
-    /// statement-expression's compound-local scope (scope binding wins over
-    /// normal resolution, so locals shadow outer same-named bindings).
-    /// Mirrors `conditional_expr_ctype` for the scope-threaded path.
+    /// statement-expression's compound-local scope (a scope binding wins
+    /// over normal resolution, so a local shadows an outer same-named
+    /// binding), then reconciled exactly as the plain path is.
     fn conditional_ctype_with_scope(
         &self,
+        expr: &Expr,
         then_expr: &Expr,
         else_expr: &Expr,
         scope: &FxHashMap<String, CType>,
     ) -> Option<CType> {
-        use crate::common::const_arith::is_null_pointer_constant;
         let then_ct = self
             .get_expr_ctype_with_scope(then_expr, scope)
             .or_else(|| self.get_expr_ctype(then_expr));
         let else_ct = self
             .get_expr_ctype_with_scope(else_expr, scope)
             .or_else(|| self.get_expr_ctype(else_expr));
-        let then_is_npc = CType::conditional_arm_npc_matters(then_ct.as_ref(), else_ct.as_ref())
-            && is_null_pointer_constant(then_expr);
-        let else_is_npc = CType::conditional_arm_npc_matters(else_ct.as_ref(), then_ct.as_ref())
-            && is_null_pointer_constant(else_expr);
-        CType::conditional_composite_type(then_ct, else_ct, then_is_npc, else_is_npc)
+        self.reconcile_conditional_ctype(expr, then_ct, else_ct, then_expr, else_expr)
     }
 
     fn get_expr_ctype_with_scope(
@@ -2183,7 +2205,7 @@ impl Lowerer {
             // outer loop bound collapsed and the loop ran zero times at
             // -O1).  This now matches get_expr_ctype's conditional_expr_ctype.
             Expr::Conditional(_, then_expr, else_expr, _) => {
-                self.conditional_ctype_with_scope(then_expr, else_expr, scope)
+                self.conditional_ctype_with_scope(expr, then_expr, else_expr, scope)
             }
             // GNU conditional (`x ?: y` is `x ? x : y`): same composite rule,
             // with the condition expression doubling as the then-arm.
@@ -2191,7 +2213,7 @@ impl Lowerer {
             // shadow an outer `long x` when determining the
             // statement-expression result type.
             Expr::GnuConditional(cond, else_expr, _) => {
-                self.conditional_ctype_with_scope(cond, else_expr, scope)
+                self.conditional_ctype_with_scope(expr, cond, else_expr, scope)
             }
             // Binary ops: try to infer from operands using scope
             Expr::BinaryOp(op, lhs, rhs, _) => {

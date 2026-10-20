@@ -13,8 +13,15 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 text = (ROOT / 'src/backend/x86/codegen/peephole/types.rs').read_text()
+# `implicit_full_write_refs` delegates to `_from_write_mask`; extracting one
+# without the other made the probe fail to compile, which is how this gate sat
+# broken and unwired.  Every body a checked function calls must be listed.
 functions = []
-for name in ['classify_implicit_operands', 'implicit_full_write_refs']:
+for name in [
+    'classify_implicit_operands',
+    'implicit_full_write_refs_from_write_mask',
+    'implicit_full_write_refs',
+]:
     start = text.index('fn ' + name + '(')
     end = text.index('\n}\n', start) + 3
     functions.append(text[start:end])
@@ -27,5 +34,8 @@ with tempfile.TemporaryDirectory(prefix='lccc-implicit-effects-') as tmp:
     source = Path(tmp) / 'probe.rs'
     binary = Path(tmp) / 'probe'
     source.write_text('\n'.join(functions + body))
-    subprocess.run(['rustc', '--edition=2024', '-Copt-level=1', '-Dwarnings', str(source), '-o', str(binary)], check=True)
+    subprocess.run(
+        ['rustc', '--edition=2024', '-Copt-level=1', '-Dwarnings', str(source), '-o', str(binary)],
+        check=True,
+    )
     raise SystemExit(subprocess.run([str(binary)]).returncode)

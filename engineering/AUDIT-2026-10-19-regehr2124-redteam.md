@@ -1,8 +1,9 @@
 # AUDIT 2026-10-19: red-team review of the REGEHR-2124 patch stack
 
-Scope: commits `ba39f8d0..HEAD` on base `2715bf90` (== `main`,
-verified by `git ls-remote`: main had not moved; the rebase is a
-no-op, and PR #871 merged today *is* the base). Method: re-read every
+Scope: the whole REGEHR-2124 change set on top of the then-current
+`main` (`2715bf90`, the merge of PR #871). Stated as a base commit, not
+as a commit range: the change landed squashed, so the individual stages
+never existed as standalone commits in this repository. Method: re-read every
 Rust hunk adversarially, probe each fix with cases its regression test
 does not cover, re-run differentials, and measure with deterministic
 tools (Cachegrind instruction counts; this VM has no PMU). Verdicts
@@ -154,7 +155,8 @@ follow-ups with exact shapes are in the FOLLOWUP.
 * The harness restored/tore `redundant_ext.rs` twice mid-session
   (duplicated `#[test]`, lost attribute, spliced EOF). Discipline
   that worked: read-before-edit, count-asserted replacements,
-  count tests before/after (1813→1814 caught the lost attribute),
+  count tests before/after (one lost `#[test]` attribute shows up
+  immediately as a count drop),
   commit+snapshot per validated step.
 * VM timing deltas under ~10% are meaningless without an
   ASM-identity check (a −7% crc32 "regression" was identical
@@ -230,3 +232,47 @@ effect hygiene class as the cmov defect). These are careful
 landings; no red verdicts. The remaining disagree-with-upstream
 items from 4b stand (ratchet discipline), softened by their own
 subsequent cleanup.
+
+## 5. Round 2 -- the implicit-operand model had three copies, and one
+##    of them was not consulted at all
+
+The first round fixed `cltd` in `helpers::has_implicit_reg_usage` and added a
+private `implicit_write_families` table for the redundant-extension pass.
+Re-auditing that work against the tree found the shape of the problem was
+different from the shape of the patch:
+
+* **`types::classify_implicit_operands` is the real model.** It is 200 lines,
+  covers ~90 mnemonics and forms (one-operand `imul`, `mulx`, `popa`/`pushf`,
+  `rsm`, `sysenter`, the `xsave` family, `rep` string ops, `cpuid`, `rdtsc`,
+  `int3`, hypervisor calls, ...), and is pinned by `tests/fixtures/
+  implicit_operands.tsv` plus `scripts/check_implicit_operand_matrix.py`.
+  The table the first round added was a 20-line subset of it.
+* **`redundant_ext` had no implicit-write invalidation at all.** The PR-tip
+  file handled `call` and nothing else, so a fact about `%rax`/`%rdx`
+  survived `cltd`, `idiv`, `cpuid`, `rep movsb` and `syscall`. The private
+  table was the first round's fix for that; the correct fix is to consume
+  the shared model, which is what the pass now does
+  (`implicit_r_w_full(..).1` -> `ExtFacts::clear_implicit(mask)`).
+
+Measured consequences, all reproducible:
+
+| claim | evidence |
+|---|---|
+| the private table was unsound for forms the model knows | mutation restoring the old four-mnemonic table makes `implicit_writes_reset_the_ledger_for_every_modelled_opcode` fail on `cqo` (fact for family 2 survived) |
+| the refactor changes no emitted code | `lccc -O2 -S` over all 1000 corpus programs: **0 differing `.s` files** vs the pre-refactor binary |
+| the fact ledger cannot depend on a value the instruction destroys | property test asserts, for every family in the model's write mask, `ledger(start=all-true) == ledger(start=all-false)`; 38 sample forms, non-vacuity floor of 30 |
+| the veto is a superset of the model's write half | `every_modelled_implicit_write_is_vetoed`; this **passes at HEAD already**, because the tail of `has_implicit_reg_usage` consults `has_bare_implicit_gp_effect` -> `implicit_write_refs`. The first round's `cltd` entry in that union was therefore redundant |
+
+The last row is the useful correction. Making `has_implicit_reg_usage` consult
+the model *first* — the obvious "single source of truth" move — measured
+**+5.1 % compiler wall time** (corpus `-S` sweep: 45.5 s mean vs 43.3 s mean,
+interleaved runs) for a semantic change of zero, because the model was already
+consulted on the slow path. It was reverted; the only change left in
+`helpers.rs` is a `trim_start()` that makes the veto total (an untrimmed line
+used to model as an empty mnemonic and answer "safe"), plus the contract tests.
+
+`scripts/check_implicit_operand_matrix.py` had never run in CI: it extracted
+`implicit_full_write_refs` without the `_from_write_mask` helper it calls, so
+the probe did not compile, and no workflow referenced it. Fixed and wired into
+both `.github/workflows/ci.yml` and `scripts/ci_local.sh` (parity now 315
+commands).

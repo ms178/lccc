@@ -20,6 +20,44 @@ use super::super::types::*;
 /// (0=rax, 1=rcx, 2=rdx, 3=rbx, ... 15=r15). We only need the GP families.
 const GP_FAMILIES: usize = 16;
 
+/// `CCC_NO_EXT16`: the 16-bit half of this pass, off.
+///
+/// Read once per process. This peephole runs over every line of every
+/// function and reads this switch at each producer, so a `getenv` (which
+/// allocates and scans the environment) per instruction is pure overhead
+/// in the compiler's hot path -- and the answer cannot change during a
+/// compile. `OnceLock` turns it into one atomic load.
+fn ext16_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CCC_NO_EXT16").is_none())
+}
+
+/// `CCC_NO_SEXT`: the sign-extension half of this pass, off.
+fn sext_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CCC_NO_SEXT").is_none())
+}
+
+/// `CCC_TRACE_EXT`: per-instruction tracing of the extension rules.
+///
+/// Same caching argument as [`ext16_enabled`], and the same reason: the
+/// trace check sits in the two hottest match arms of the pass.
+fn trace_ext() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CCC_TRACE_EXT").is_some())
+}
+
+/// Registers whose 32-bit form is never a rewrite target.
+///
+/// No producer establishes a sub-register fact for the stack or frame
+/// pointer (the emitter writes them with full-width moves and `leaq`), so
+/// excluding them costs nothing today; it is here so that a future
+/// producer cannot turn an extension rewrite into a frame corruption.
+#[inline]
+fn is_frame_pointer(fam: u8) -> bool {
+    fam == 4 || fam == 5
+}
+
 /// Determine the register family id of a register name (e.g. "al" -> 0,
 /// "eax" -> 0, "rax" -> 0, "r8b" -> 8, "r11d" -> 11).
 fn family_of_reg(name: &str) -> Option<u8> {
@@ -344,7 +382,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
     // zero-extension, from anywhere) and by byte zero-extensions (a byte
     // value fits in 16 bits). Lets us remove redundant `movzwq %ax, %rax`
     // re-extensions of a value that is already zero-extended to 16 bits.
-    let ext16_enabled = std::env::var("CCC_NO_EXT16").is_err();
+    let ext16_enabled = ext16_enabled();
     let mut is_16 = vec![false; GP_FAMILIES];
     // sext32[f] = true if register family f's 64-bit value is provably equal
     // to sext(its own low 32 bits) -- exactly the postcondition of `movslq
@@ -388,7 +426,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
     // propagated only by register-to-register movq; every other write clears
     // them, including the conservative catch-all, labels, calls and
     // inline-asm boundaries. Kill switch: CCC_NO_SEXT (mirrors CCC_NO_EXT16).
-    let sext_enabled = std::env::var("CCC_NO_SEXT").is_err();
+    let sext_enabled = sext_enabled();
     let mut sext8 = vec![false; GP_FAMILIES];
     let mut sext16 = vec![false; GP_FAMILIES];
 
@@ -544,7 +582,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                     let is32 = is_32bit_or_smaller(dst);
                     let u32z = (sf as usize).lt(&GP_FAMILIES) && upper32_zero[sf as usize];
                     let bytez = (sf as usize).lt(&GP_FAMILIES) && is_byte[sf as usize];
-                    if std::env::var("CCC_TRACE_EXT").is_ok() {
+                    if trace_ext() {
                         eprintln!(
                             "[EXT] t='{}' src_fam={:?} dst_fam={:?} is32={} u32z={} bytez={}",
                             t, sf, df, is32, u32z, bytez
@@ -566,7 +604,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                         changed = true;
                         continue;
                     }
-                    if is32 && bytez && sf != df {
+                    if is32 && bytez && sf != df && !is_frame_pointer(sf) && !is_frame_pointer(df) {
                         // Source family is a known byte value (bits 8..31 zero),
                         // so its low byte equals its full 32-bit value. Rewrite
                         // the byte re-extension into a 32-bit copy, which is
@@ -643,7 +681,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                     let fits16 = (sf as usize).lt(&GP_FAMILIES)
                         && is_16[sf as usize]
                         && (is_32bit_or_smaller(dst) || upper32_zero[sf as usize]);
-                    if std::env::var("CCC_TRACE_EXT").is_ok() {
+                    if trace_ext() {
                         eprintln!(
                             "[EXT16] t='{}' src_fam={:?} dst_fam={:?} fits16={}",
                             t, sf, df, fits16
@@ -656,7 +694,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                         changed = true;
                         continue;
                     }
-                    if fits16 && sf != df {
+                    if fits16 && sf != df && !is_frame_pointer(sf) && !is_frame_pointer(df) {
                         // Cross-family 16-bit re-extension of a known 16-bit
                         // value: rewrite as a 32-bit copy (shorter, no
                         // partial-register dependency).
@@ -891,28 +929,11 @@ fn classify_dst(t: &str) -> DstKind {
 /// Clear every fact of every register family mentioned in the line (the
 /// conservative catch-all, shared by producer branches whose destination
 /// could not be classified).
-#[allow(clippy::too_many_arguments)]
-fn clear_mentioned_families(
-    t: &str,
-    upper32_zero: &mut Vec<bool>,
-    is_byte: &mut Vec<bool>,
-    is_16: &mut Vec<bool>,
-    sext32: &mut Vec<bool>,
-    sext8: &mut Vec<bool>,
-    sext16: &mut Vec<bool>,
-) {
+fn clear_mentioned_families(t: &str, facts: &mut ExtFacts<'_>) {
     for tok in t.split_whitespace() {
         if tok.starts_with('%') {
-            let name = tok.trim_end_matches(',');
-            if let Some(f) = family_of_reg(name) {
-                if (f as usize).lt(&upper32_zero.len()) {
-                    upper32_zero[f as usize] = false;
-                    is_byte[f as usize] = false;
-                    is_16[f as usize] = false;
-                    sext32[f as usize] = false;
-                    sext8[f as usize] = false;
-                    sext16[f as usize] = false;
-                }
+            if let Some(f) = family_of_reg(tok.trim_end_matches(',')) {
+                facts.clear_family(f);
             }
         }
     }
@@ -931,6 +952,88 @@ struct ExtFacts<'a> {
     sext32: &'a mut Vec<bool>,
     sext8: &'a mut Vec<bool>,
     sext16: &'a mut Vec<bool>,
+}
+
+impl ExtFacts<'_> {
+    /// Clear every tracked fact for one register family.
+    #[inline]
+    fn clear_family(&mut self, fam: u8) {
+        let i = fam as usize;
+        if i < self.upper32_zero.len() {
+            self.upper32_zero[i] = false;
+            self.is_byte[i] = false;
+            self.is_16[i] = false;
+            self.sext32[i] = false;
+            self.sext8[i] = false;
+            self.sext16[i] = false;
+        }
+    }
+
+    /// Forget everything (a call, a label, an inline-asm boundary).
+    #[inline]
+    fn clear_all(&mut self) {
+        for i in 0..self.upper32_zero.len() {
+            self.clear_family(i as u8);
+        }
+    }
+
+    /// Forget the families an instruction writes without naming them.
+    ///
+    /// `mask` is `types::classify_implicit_operands`'s write mask: bit `i`
+    /// is register family `i`.  There is exactly ONE architectural model of
+    /// implicit operands in this backend (`types.rs`, exercised by
+    /// `tests/fixtures/implicit_operands.tsv` and
+    /// `scripts/check_implicit_operand_matrix.py`); this pass must consume
+    /// it rather than keep a narrower copy.  The copy it used to keep knew
+    /// `div`/`idiv`/`mul`/`cltd`/`cqto` but not one-operand `imul`,
+    /// `mulx`, `popa`, `pushf`, `rsm`, `sysenter`, the `xsave` family or
+    /// the `rep` string forms -- every one of which can be handed to this
+    /// peephole by a `.s` input, and each of which would have left a stale
+    /// fits-in-8-bits fact alive across it.
+    #[inline]
+    fn clear_implicit(&mut self, mask: u16) {
+        let mut rest = mask;
+        while rest != 0 {
+            let fam = rest.trailing_zeros() as u8;
+            rest &= rest - 1;
+            self.clear_family(fam);
+        }
+    }
+
+    /// Record a zero-extending write of `width` bits (8, 16 or 32) into
+    /// `fam`: everything above `width` is zero. Every sign fact dies with
+    /// it, because a zero-extended value is not `sext` of its own low
+    /// `width` bits whenever the top of that field is set. This is the
+    /// invariant that the byte/word/movl rewrite sites used to have to
+    /// spell out one by one.
+    ///
+    /// `allow16` carries the `CCC_NO_EXT16` kill switch: with it set, no
+    /// producer may establish a fits-in-16-bits fact.
+    #[inline]
+    fn set_zero_extended(&mut self, fam: u8, width: u8, allow16: bool) {
+        self.clear_family(fam);
+        let i = fam as usize;
+        if i < self.upper32_zero.len() {
+            self.upper32_zero[i] = true;
+            self.is_byte[i] = width == 8;
+            self.is_16[i] = allow16 && width <= 16;
+        }
+    }
+
+    /// Record that `fam` now holds `sext` of its own low `width` bits
+    /// (8, 16 or 32). `sext`-from-8 implies from-16 implies from-32 (the
+    /// sign bit is replicated across every wider boundary), and the
+    /// implication is maintained here rather than at each producer.
+    #[inline]
+    fn set_sign_extended(&mut self, fam: u8, width: u8) {
+        self.clear_family(fam);
+        let i = fam as usize;
+        if i < self.upper32_zero.len() {
+            self.sext32[i] = true;
+            self.sext16[i] = width <= 16;
+            self.sext8[i] = width == 8;
+        }
+    }
 }
 
 /// Consumer for a redundant SIGN re-extension (signed mirror of the
@@ -954,7 +1057,11 @@ fn rewrite_sign_reextension(t: &str, facts: &mut ExtFacts<'_>) -> Option<ExtRewr
         if src.starts_with('%') {
             if let (Some(sf), Some(df)) = (family_of_reg(src), family_of_reg(dst)) {
                 let (sfi, dfi) = (sf as usize, df as usize);
-                if sfi < GP_FAMILIES && dfi < GP_FAMILIES {
+                if sfi < GP_FAMILIES
+                    && dfi < GP_FAMILIES
+                    && !is_frame_pointer(sf)
+                    && !is_frame_pointer(df)
+                {
                     let to64 = !is_32bit_or_smaller(dst);
                     // The source must textually be the LOW
                     // subregister of its family at exactly the
@@ -1051,15 +1158,7 @@ fn update_facts_for_movq(t: &str, op: &str, facts: &mut ExtFacts<'_>) {
             // stale-fact class the classify_dst conversion eliminated
             // from the other producer branches).  Unreachable for the
             // emitter's own movq forms; clear conservatively anyway.
-            clear_mentioned_families(
-                t,
-                facts.upper32_zero,
-                facts.is_byte,
-                facts.is_16,
-                facts.sext32,
-                facts.sext8,
-                facts.sext16,
-            );
+            clear_mentioned_families(t, facts);
             return;
         }
         let src = t[so..comma].trim();
@@ -1118,19 +1217,10 @@ fn update_facts_for_cmov(t: &str, op: &str, facts: &mut ExtFacts<'_>) {
             }
         }
         DstKind::Store => {}
-        DstKind::Unknown => clear_mentioned_families(
-            t,
-            facts.upper32_zero,
-            facts.is_byte,
-            facts.is_16,
-            facts.sext32,
-            facts.sext8,
-            facts.sext16,
-        ),
+        DstKind::Unknown => clear_mentioned_families(t, facts),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn self_update(
     t: &str,
     upper32_zero: &mut Vec<bool>,
@@ -1140,11 +1230,17 @@ fn self_update(
     sext8: &mut Vec<bool>,
     sext16: &mut Vec<bool>,
 ) {
-    let toks: Vec<&str> = t.split_whitespace().collect();
-    if toks.is_empty() {
+    let mut facts = ExtFacts {
+        upper32_zero,
+        is_byte,
+        is_16,
+        sext32,
+        sext8,
+        sext16,
+    };
+    let Some(op) = t.split_whitespace().next() else {
         return;
-    }
-    let op = toks[0];
+    };
 
     // Calls clobber the full 64-bit values of caller-saved registers.  The
     // assembly line for a direct call often contains no `%reg`, so the generic
@@ -1153,34 +1249,29 @@ fn self_update(
     // call is harmless; trusting stale upper-32-zero state across a call can
     // miscompile a later 64-bit copy.
     if op == "call" || op == "callq" {
-        for flags in [
-            &mut *upper32_zero,
-            &mut *is_byte,
-            &mut *is_16,
-            &mut *sext32,
-            &mut *sext8,
-            &mut *sext16,
-        ] {
-            for value in flags.iter_mut() {
-                *value = false;
-            }
-        }
+        facts.clear_all();
         return;
     }
 
+    // Instructions that define a register WITHOUT naming it invalidate its
+    // facts exactly as an explicit write does, and neither the producer
+    // branches nor the catch-all below can see them.  `cltd`/`cqto` (the
+    // divide's high half) and `div`/`idiv` (which define all of rax:rdx)
+    // are the ones this emitter produces; without this a stale
+    // `is_byte[%rax]` lets
+    //     movzbl (%rdi),%eax ; cltd ; idivl %ecx ; movzbl %al,%eax
+    // delete the last instruction and keep the quotient instead of the byte.
+    //
+    // Reading the write half of the shared model (not a private table) is
+    // what keeps this pass honest for the rest of the ISA; see
+    // `ExtFacts::clear_implicit`.
+    let implicit_writes = implicit_r_w_full(t.as_bytes()).1;
+    if implicit_writes != 0 {
+        facts.clear_implicit(implicit_writes);
+    }
+
     if op == "movq" && t.contains('%') {
-        update_facts_for_movq(
-            t,
-            op,
-            &mut ExtFacts {
-                upper32_zero: &mut *upper32_zero,
-                is_byte: &mut *is_byte,
-                is_16: &mut *is_16,
-                sext32: &mut *sext32,
-                sext8: &mut *sext8,
-                sext16: &mut *sext16,
-            },
-        );
+        update_facts_for_movq(t, op, &mut facts);
         return;
     }
     // Byte zero-extension into a register sets upper32_zero, is_byte AND
@@ -1193,20 +1284,9 @@ fn self_update(
     // the duplicate extension survived into the emitted code.
     if op == "movzbl" || op == "movzbq" {
         match classify_dst(t) {
-            DstKind::Reg(df) => {
-                if (df as usize).lt(&upper32_zero.len()) {
-                    upper32_zero[df as usize] = true;
-                    is_byte[df as usize] = true;
-                    is_16[df as usize] = std::env::var("CCC_NO_EXT16").is_err();
-                    sext32[df as usize] = false;
-                    sext8[df as usize] = false;
-                    sext16[df as usize] = false;
-                }
-            }
+            DstKind::Reg(df) => facts.set_zero_extended(df, 8, ext16_enabled()),
             DstKind::Store => {}
-            DstKind::Unknown => {
-                clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16)
-            }
+            DstKind::Unknown => clear_mentioned_families(t, &mut facts),
         }
         return;
     }
@@ -1220,20 +1300,9 @@ fn self_update(
     // fact; `movzbw` now falls through to the conservative catch-all.
     if op == "movzwl" || op == "movzwq" {
         match classify_dst(t) {
-            DstKind::Reg(df) => {
-                if (df as usize).lt(&upper32_zero.len()) {
-                    upper32_zero[df as usize] = true;
-                    is_byte[df as usize] = false;
-                    is_16[df as usize] = std::env::var("CCC_NO_EXT16").is_err();
-                    sext32[df as usize] = false;
-                    sext8[df as usize] = false;
-                    sext16[df as usize] = false;
-                }
-            }
+            DstKind::Reg(df) => facts.set_zero_extended(df, 16, ext16_enabled()),
             DstKind::Store => {}
-            DstKind::Unknown => {
-                clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16)
-            }
+            DstKind::Unknown => clear_mentioned_families(t, &mut facts),
         }
         return;
     }
@@ -1241,37 +1310,15 @@ fn self_update(
     // 16-bit value.
     if op == "movl" || op == "xorl" {
         match classify_dst(t) {
-            DstKind::Reg(df) => {
-                if (df as usize).lt(&upper32_zero.len()) {
-                    upper32_zero[df as usize] = true;
-                    is_byte[df as usize] = false;
-                    is_16[df as usize] = false;
-                    sext32[df as usize] = false;
-                    sext8[df as usize] = false;
-                    sext16[df as usize] = false;
-                }
-            }
+            DstKind::Reg(df) => facts.set_zero_extended(df, 32, ext16_enabled()),
             DstKind::Store => {}
-            DstKind::Unknown => {
-                clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16)
-            }
+            DstKind::Unknown => clear_mentioned_families(t, &mut facts),
         }
         return;
     }
     // Conditional moves: see update_facts_for_cmov (never establish).
     if op.starts_with("cmov") {
-        update_facts_for_cmov(
-            t,
-            op,
-            &mut ExtFacts {
-                upper32_zero: &mut *upper32_zero,
-                is_byte: &mut *is_byte,
-                is_16: &mut *is_16,
-                sext32: &mut *sext32,
-                sext8: &mut *sext8,
-                sext16: &mut *sext16,
-            },
-        );
+        update_facts_for_cmov(t, op, &mut facts);
         return;
     }
     // Any other 32-bit ALU write (addl, subl, andl, orl, leal, imull, shifts)
@@ -1282,20 +1329,9 @@ fn self_update(
     // narrowed to the shorter, dependency-free `movl %esi, %r12d`.
     if is_32bit_zero_extend_write(op) {
         match classify_dst(t) {
-            DstKind::Reg(df) => {
-                if (df as usize).lt(&upper32_zero.len()) {
-                    upper32_zero[df as usize] = true;
-                    is_byte[df as usize] = false;
-                    is_16[df as usize] = false;
-                    sext32[df as usize] = false;
-                    sext8[df as usize] = false;
-                    sext16[df as usize] = false;
-                }
-            }
+            DstKind::Reg(df) => facts.set_zero_extended(df, 32, ext16_enabled()),
             DstKind::Store => {}
-            DstKind::Unknown => {
-                clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16)
-            }
+            DstKind::Unknown => clear_mentioned_families(t, &mut facts),
         }
         return;
     }
@@ -1306,20 +1342,9 @@ fn self_update(
     // into bits 32..63).
     if op == "movslq" || op == "movsxd" {
         match classify_dst(t) {
-            DstKind::Reg(df) => {
-                if (df as usize).lt(&upper32_zero.len()) {
-                    upper32_zero[df as usize] = false;
-                    is_byte[df as usize] = false;
-                    is_16[df as usize] = false;
-                    sext32[df as usize] = true;
-                    sext8[df as usize] = false;
-                    sext16[df as usize] = false;
-                }
-            }
+            DstKind::Reg(df) => facts.set_sign_extended(df, 32),
             DstKind::Store => {}
-            DstKind::Unknown => {
-                clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16)
-            }
+            DstKind::Unknown => clear_mentioned_families(t, &mut facts),
         }
         return;
     }
@@ -1330,21 +1355,11 @@ fn self_update(
     // (sext-from-8 is also sext-from-16 and sext-from-32 of the resulting
     // low bits, since the sign bit is replicated across all of them).
     if op == "movsbq" || op == "movswq" {
+        let width = if op == "movsbq" { 8 } else { 16 };
         match classify_dst(t) {
-            DstKind::Reg(df) => {
-                if (df as usize).lt(&upper32_zero.len()) {
-                    upper32_zero[df as usize] = false;
-                    is_byte[df as usize] = false;
-                    is_16[df as usize] = false;
-                    sext32[df as usize] = true;
-                    sext16[df as usize] = true;
-                    sext8[df as usize] = op == "movsbq";
-                }
-            }
+            DstKind::Reg(df) => facts.set_sign_extended(df, width),
             DstKind::Store => {}
-            DstKind::Unknown => {
-                clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16)
-            }
+            DstKind::Unknown => clear_mentioned_families(t, &mut facts),
         }
         return;
     }
@@ -1356,20 +1371,9 @@ fn self_update(
     // which also discarded the true upper32_zero fact.
     if op == "movsbl" || op == "movswl" {
         match classify_dst(t) {
-            DstKind::Reg(df) => {
-                if (df as usize).lt(&upper32_zero.len()) {
-                    upper32_zero[df as usize] = true;
-                    is_byte[df as usize] = false;
-                    is_16[df as usize] = false;
-                    sext32[df as usize] = false;
-                    sext8[df as usize] = false;
-                    sext16[df as usize] = false;
-                }
-            }
+            DstKind::Reg(df) => facts.set_zero_extended(df, 32, ext16_enabled()),
             DstKind::Store => {}
-            DstKind::Unknown => {
-                clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16)
-            }
+            DstKind::Unknown => clear_mentioned_families(t, &mut facts),
         }
         return;
     }
@@ -1378,15 +1382,8 @@ fn self_update(
     // for the family (the low byte is a fresh bool, but the value cannot be
     // proven to fit in 16 bits because bits 8..63 are stale).
     if op.starts_with("set") && t.contains('%') {
-        if let Some(fam) = t.split_whitespace().last().and_then(|r| family_of_reg(r)) {
-            if (fam as usize).lt(&upper32_zero.len()) {
-                upper32_zero[fam as usize] = false;
-                is_byte[fam as usize] = false;
-                is_16[fam as usize] = false;
-                sext32[fam as usize] = false;
-                sext8[fam as usize] = false;
-                sext16[fam as usize] = false;
-            }
+        if let Some(fam) = t.split_whitespace().last().and_then(family_of_reg) {
+            facts.clear_family(fam);
         }
         return;
     }
@@ -1412,16 +1409,157 @@ fn self_update(
     // Anything else that writes registers: conservatively clear the flags of
     // EVERY register family mentioned in the line. This is the soundness
     // fix: the previous code only cleared when the OPCODE contained '%',
-    // which missed `addq %rcx, %rax`, `leaq 0x30(%rsp), %rax`, `imulq %r13,
-    // %r14`, shifts, etc. A stale upper-32-zero/is_byte flag on such a line
-    // could wrongly eliminate a real re-extension (miscompile). Clearing
-    // extra families is always safe (only loses optimizations).
-    clear_mentioned_families(t, upper32_zero, is_byte, is_16, sext32, sext8, sext16);
+    // which missed `addq %rcx, %rax`, `leaq 0x30(%rsp), %rax`,
+    // `imulq %r13, %r14`, shifts, etc. A stale upper-32-zero/is_byte flag on
+    // such a line could wrongly eliminate a real re-extension (miscompile).
+    // Clearing extra families is always safe (only loses optimizations).
+    clear_mentioned_families(t, &mut facts);
 }
 
 #[cfg(test)]
 mod tests {
     use super::eliminate_redundant_zero_extend;
+    use super::self_update;
+    use crate::backend::x86::codegen::peephole::types::implicit_r_w_full;
+
+    /// Run the fact ledger over one instruction from a chosen starting
+    /// state and return the six fact vectors as fixed-size arrays.
+    fn ledger_after(asm: &str, start: bool) -> [[bool; 16]; 6] {
+        let mut u = vec![start; 16];
+        let mut b = vec![start; 16];
+        let mut s16 = vec![start; 16];
+        let mut s32 = vec![start; 16];
+        let mut s8 = vec![start; 16];
+        let mut sx16 = vec![start; 16];
+        self_update(asm, &mut u, &mut b, &mut s16, &mut s32, &mut s8, &mut sx16);
+        let mut out = [[start; 16]; 6];
+        out[0].copy_from_slice(&u[..16]);
+        out[1].copy_from_slice(&b[..16]);
+        out[2].copy_from_slice(&s16[..16]);
+        out[3].copy_from_slice(&s32[..16]);
+        out[4].copy_from_slice(&s8[..16]);
+        out[5].copy_from_slice(&sx16[..16]);
+        out
+    }
+
+    /// THE INVARIANT.  A fact that an instruction destroys must not survive
+    /// it, and must not influence what the instruction establishes either:
+    /// for every family the instruction writes implicitly, the ledger after
+    /// it is the same whether that family started out believing everything
+    /// or nothing.
+    ///
+    /// This is the property that makes `cltd`/`cqto` safe (they define the
+    /// divide's high half without naming it), and it is stated over the
+    /// SHARED architectural model (`types::classify_implicit_operands`), so
+    /// it automatically covers opcodes this pass has never seen: `imul`'s
+    /// one-operand form, `mulx`, `popa`, `pushf`, `rsm`, `sysenter`,
+    /// `xsave`, the `rep` string forms, `cpuid`, `rdtsc`, and so on.  Adding
+    /// an opcode to that table automatically extends this test's coverage.
+    #[test]
+    fn implicit_writes_reset_the_ledger_for_every_modelled_opcode() {
+        let samples = [
+            // The forms this backend emits today.
+            "cltd",
+            "cqto",
+            "cqo",
+            "cwd",
+            "cdq",
+            "cltq",
+            "cdqe",
+            "cbw",
+            "cwtl",
+            "idivl %ecx",
+            "idivq %rcx",
+            "divl %ecx",
+            "divq %rcx",
+            "imulq %rsi",
+            "imull %esi",
+            "mulq %rsi",
+            "mull %esi",
+            "fnstsw %ax",
+            "rdtsc",
+            "rdtscp",
+            "rdmsr",
+            "cpuid",
+            "syscall",
+            "rep movsq",
+            "repne scasb",
+            "rep stosb",
+            // Forms a hand-written `.s` input can reach, all of which the
+            // pass's former private table did not know.
+            "imulw %bx",
+            "mulxq %rsi, %rdi, %rdx",
+            "mulx %esi, %edi, %edx",
+            "popa",
+            "popal",
+            "pushfq",
+            "popfq",
+            "leave",
+            "rsm",
+            "sysenter",
+            "sysexitq",
+            "xsave (%rdi)",
+            "xrstor (%rdi)",
+            "rdpkru",
+            "rdpru",
+            "cmpxchgq %rax, (%rdi)",
+            "xaddq %rax, (%rdi)",
+        ];
+        // Non-vacuity guard: if the shared classifier stopped reporting
+        // writes, every assertion below would pass by being skipped.
+        let modelled = samples
+            .iter()
+            .filter(|a| implicit_r_w_full(a.as_bytes()).1 != 0)
+            .count();
+        assert!(
+            modelled >= 30,
+            "only {modelled} of {} samples reach the assertion: the shared \
+             implicit-operand model is not being consulted",
+            samples.len()
+        );
+        for asm in samples {
+            let (_, writes, _) = implicit_r_w_full(asm.as_bytes());
+            if writes == 0 {
+                continue;
+            }
+            let hot = ledger_after(asm, true);
+            let cold = ledger_after(asm, false);
+            for fam in 0..16u8 {
+                if writes & (1 << fam) == 0 {
+                    continue;
+                }
+                for slot in 0..6 {
+                    assert_eq!(
+                        hot[slot][fam as usize], cold[slot][fam as usize],
+                        "{asm}: fact slot {slot} for family {fam} survived an \
+                         implicit write (the ledger depends on a value the \
+                         instruction destroys)"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The inverse direction: an instruction that names its destination
+    /// must not be treated as clobbering unrelated families, or the pass
+    /// would silently lose every optimisation after it.
+    #[test]
+    fn named_destinations_keep_unrelated_facts() {
+        for asm in [
+            "movq %rax, %rbx",
+            "addq %rcx, %rax",
+            "sete %al",
+            "cmovne %rax, %rbx",
+            "imulq $3, %rax, %rbx",
+        ] {
+            let (reads, writes, _) = implicit_r_w_full(asm.as_bytes());
+            assert_eq!(
+                (reads, writes),
+                (0, 0),
+                "{asm}: a fully explicit form must not have implicit effects"
+            );
+        }
+    }
 
     fn run(input: &str) -> String {
         let mut asm = input.to_string();
@@ -1435,6 +1573,110 @@ mod tests {
         let mut asm = input.to_string();
         let _ = eliminate_redundant_zero_extend(&mut asm);
         asm
+    }
+
+    // ── registers written without being named ───────────────────────────
+    //
+    // The fact ledger only sees operand text. An instruction that defines
+    // a register implicitly (`cltd`, `cqto`, `idivq`, a repeated string
+    // op) defines it just as surely, and a fact that outlives its value
+    // is a miscompile. Each case below pairs a producer with the implicit
+    // write that must invalidate it, then asks for a rewrite that is only
+    // sound if the fact is gone.
+
+    #[test]
+    fn cltd_invalidates_the_divide_high_half() {
+        // cltd defines %edx without naming it. With a stale byte fact on
+        // %rdx the final movzbl would be deleted and %rdx (holding the
+        // remainder) would be consumed whole.
+        let out = run_maybe("    movzbl (%rdi), %edx\n    cltd\n    movzbl %dl, %edx\n");
+        assert!(
+            out.contains("movzbl %dl, %edx"),
+            "cltd must clear %rdx's byte fact: {out}"
+        );
+    }
+
+    #[test]
+    fn cqto_invalidates_the_divide_high_half() {
+        let out = run_maybe("    movzbl (%rdi), %edx\n    cqto\n    movzbl %dl, %edx\n");
+        assert!(
+            out.contains("movzbl %dl, %edx"),
+            "cqto must clear %rdx: {out}"
+        );
+    }
+
+    #[test]
+    fn division_invalidates_both_halves() {
+        // `divl` defines all of rax:rdx and names neither. Both facts must
+        // die: %rax holds the quotient, %rdx the remainder.
+        let out = run_maybe(
+            "    movzbl (%rdi), %eax\n    movzbl (%rsi), %edx\n                 divl %ecx\n    movzbl %al, %eax\n    movzbl %dl, %edx\n",
+        );
+        assert!(
+            out.contains("movzbl %al, %eax"),
+            "divl must clear %rax: {out}"
+        );
+        assert!(
+            out.contains("movzbl %dl, %edx"),
+            "divl must clear %rdx: {out}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_string_op_invalidates_the_counter_and_pointers() {
+        // rep movsq consumes %rcx and advances %rsi/%rdi.
+        let out = run_maybe(
+            "    movzbl (%r8), %ecx\n    movzbl (%r9), %esi\n                 rep movsq\n    movzbl %cl, %ecx\n    movzbl %sil, %esi\n",
+        );
+        assert!(
+            out.contains("movzbl %cl, %ecx"),
+            "rep must clear %rcx: {out}"
+        );
+        assert!(
+            out.contains("movzbl %sil, %esi"),
+            "rep must clear %rsi: {out}"
+        );
+    }
+
+    #[test]
+    fn cpuid_invalidates_every_family() {
+        let out = run_maybe("    movzbl (%rdi), %ebx\n    cpuid\n    movzbl %bl, %ebx\n");
+        assert!(
+            out.contains("movzbl %bl, %ebx"),
+            "cpuid must clear %rbx: {out}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_implicit_write_keeps_other_families_alive() {
+        // Precision check: `cltd` writes ONLY %rdx, so the byte fact on
+        // %rax must survive and this re-extension must still be removed.
+        let out = run_maybe("    movzbl (%rdi), %eax\n    cltd\n    movzbl %al, %eax\n");
+        assert!(
+            !out.contains("movzbl %al, %eax"),
+            "cltd must not clobber %rax's fact: {out}"
+        );
+    }
+
+    #[test]
+    fn the_frame_pointer_is_never_a_rewrite_target() {
+        // %rax holds a proven byte, so the cross-family rule would rewrite
+        // `movzbl %al, %esp` into `movl %eax, %esp`. The frame-pointer
+        // exclusion must refuse: a future producer setting a fact for
+        // %rsp/%rbp must not be able to turn this into a 32-bit stack or
+        // frame-pointer write.
+        let out = run_maybe("    movzbl (%rdi), %eax\n    movzbl %al, %esp\n");
+        assert!(
+            out.contains("movzbl %al, %esp"),
+            "rsp must never be a rewrite target: {out}"
+        );
+        // The same rewrite on a general register is the optimisation the
+        // guard must not disable.
+        let out = run("    movzbl (%rdi), %eax\n    movzbl %al, %ecx\n");
+        assert!(
+            out.contains("movl %eax, %ecx"),
+            "general-register rewrite lost: {out}"
+        );
     }
 
     #[test]

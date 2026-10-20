@@ -1,13 +1,18 @@
 # FOLLOWUP 2026-10-19: REGEHR 2124 transplant, YARPGen resurrection, untrusted-patch salvage
 
-Branch `regehr2124-perfected` on base `2715bf90277c84ee9a8048cb8d78f63bc7f92786`.
 Design/evidence narrative: `engineering/REGEHR_2124_TRANSPLANT.md`.
 All numbers below were produced on the 2-CPU / 1.9 GiB harness VM (GCC
 14.2.0 reference, no hardware PMU): timings are **screening only**.
 
-## Accomplished (commits, oldest first)
+The work reached `main` as one squashed change; the numbered items below
+are the *stages* it went through, not commits that exist in this
+repository, and they are named by what they did so they stay findable in
+the history of the files they touched. Section "State of the merged
+tree" at the end records what this repository actually measures.
 
-1. **`ba39f8d0` mutpair + slice_superopt (perfected salvage).**
+## Accomplished (stages, oldest first)
+
+1. **mutpair + slice_superopt (perfected salvage).**
    Missed-alarm pair engine (`scripts/mutpair.py`, `fuzz_diff --engine
    mutpair`) and Minotaur-lite superoptimiser. Red-team fixes vs the
    draft: shift-swap mutation emitted unmasked shift counts (real C UB
@@ -16,11 +21,11 @@ All numbers below were produced on the 2-CPU / 1.9 GiB harness VM (GCC
    variable-shift specs flagged masked-shift. Evidence: 17 unit tests,
    self-tests incl. collapsing-optimiser control, 120/120 vs GCC
    `-O0..-O3`, 2295-pair UB prober clean.
-2. **`29ef5d35` six bench kernels** (crc32 slice-8, base64, jhash,
+2. **six bench kernels** (crc32 slice-8, base64, jhash,
    SQLite varint, UTF-8 validate, Horspool) + `bench_verify` oracle;
    checksums equal GCC. VM screening geomean 0.795× vs GCC (base64
    0.51× and sqlite-varint 0.55× worst — see perf TODOs).
-3. **`f024ec77` YARPGen resurrection + `_Bool` miscompile fix.**
+3. **YARPGen resurrection + `_Bool` miscompile fix.**
    `ensure_yarpgen.sh` (pinned intel/yarpgen `1adb290…`, probe-gated);
    `fuzz_diff --engine yarpgen` repaired (multi-file cases incl.
    `init.h`, `--seed=N`, `--max-array-dims=3`, full repros);
@@ -29,15 +34,16 @@ All numbers below were produced on the 2-CPU / 1.9 GiB harness VM (GCC
    by truncation-then-normalise at four sites — fixed by value
    (C11 6.3.1.2), regression
    `regress_const_bool_cast_zero_lowbyte.c`.
-4. **`9cb508ab` redundant sign-extension peephole, hardened (F-1).**
+4. **redundant sign-extension peephole, hardened (F-1).**
    Salvaged pass made sound: extension facts cleared at *every*
    rewrite site (the `movq`→`movl` site was a **pre-existing latent
    miscompile** on main), low-subregister-exact consumers,
    parenthesis-aware destination classification with conservative
-   clearing. 1813 peephole lib tests at the time; mutation negative
+   clearing. 36 unit tests in the pass itself at the time (43 now);
+   mutation negative
    control binds; base64 `movsbq` 36→24, instructions 419→402,
    1.12× A/B vs `CCC_NO_SEXT=1` (VM screening).
-5. **`484ee183` alu_torture oracle UB removal** (`clz(0)` guards,
+5. **alu_torture oracle UB removal** (`clz(0)` guards,
    `__builtin_memcpy` punning). The claimed divergence does not
    reproduce under GCC 14.2; kept as hygiene, documented as such.
    MATCH at `-O0..-O3/-Os`.
@@ -49,7 +55,7 @@ All numbers below were produced on the 2-CPU / 1.9 GiB harness VM (GCC
    (compare compilers, never "0 trips" alone) → `sizeof` type probing
    → sema exonerated by instrumentation → lowering scope inference.
    Regression `regress_stmt_expr_conditional_composite_type.c`;
-   seeds 20261020/20261023 green at all `-O`; lib suite 5315/5315.
+   seeds 20261020/20261023 green at all `-O`; whole lib suite green.
 7. **Seed-101 `-(unsigned)` fold.** Single-global dump localisation
    again (var_419): constant folding computed unary minus on a 32-bit
    unsigned in its 64-bit carrier (mod 2^64, not mod 2^32) at both
@@ -71,7 +77,7 @@ All numbers below were produced on the 2-CPU / 1.9 GiB harness VM (GCC
 
 ## Validation state at hand-off
 
-* `cargo test --lib` (fastbuild): **5315 passed, 0 failed, 10 ignored**.
+* `cargo test --lib` (fastbuild): whole suite green, 10 ignored.
 * YARPGen classic engine, seeds 20261019..28: 7 PASS, 2 SKIP,
   1 timeout (seed 20261019 `-O1` — compiles correctly standalone,
   83 s on this VM; see compile-time TODO).
@@ -158,3 +164,34 @@ All numbers below were produced on the 2-CPU / 1.9 GiB harness VM (GCC
 - The audit census counts comment/blank lines toward function length,
   and main itself was ratchet-red from PR #871 (panic +3, fn300 +1) —
   see AUDIT doc section 4b before re-baselining anything.
+
+## State of the merged tree (measured, not recalled)
+
+Every number below was produced by running the command shown, on the
+tree that carries this document, with GCC 16.2.0 as the reference:
+
+| Claim | Command | Result |
+|---|---|---|
+| Unit suite | `cargo test --profile fastbuild --lib` | 5393 passed, 0 failed, 10 ignored |
+| Real YARPGen differential | `fuzz_diff.py --engine yarpgen --count 3 --opts=-O0,-O2` | 3/3 PASS |
+| Immutable pair judgements | `yarpgen_mutpair.py --ci-smoke` | 3 judged, 0 failures |
+| `_Bool` / negation / conditional regressions | `run_regression.py` + `gcc-16` oracle | byte-identical to GCC |
+| Whole corpus vs GCC 16.2 | `run_regression.py --gcc gcc-16 -j 2` | 1033 passed, 9 failed (all `-m32` link: no multilib on this host), 4 skipped-compare, 28 skipped-run |
+| Provisioner contract | `check_ensure_yarpgen.sh` | 20 assertions, all passing |
+| Gate parity | `check_ci_gate_parity.py` | PASS (315 commands) |
+| Formatting / lints | `cargo fmt --check`, `cargo clippy --all-targets` | clean |
+
+The two defects the follow-up list named as structural are closed in the
+same tree. The extension peephole now asks the backend's one architectural
+model of unnamed register writes (`types::classify_implicit_operands`)
+instead of keeping a partial private table: at the PR tip the pass had no
+implicit-write invalidation at all beyond `call`. The two constant folders
+share one definition of the `_Bool`-by-value and modular-negation rules
+(`common::const_eval::negate_const_promoted`, `bitnot_const_promoted`,
+`c_bool_const`) instead of asking the same question two different ways.
+
+Two pre-existing gate defects were also fixed: `check_ci_gate_parity.py`
+reported a gap that had been red on `main` (the TLS runtime oracle ran
+hosted but not locally), and `check_implicit_operand_matrix.py` had never
+run anywhere -- it extracted a function without the helper it calls, so the
+probe did not compile. Both are wired into the hosted and local gates now.
