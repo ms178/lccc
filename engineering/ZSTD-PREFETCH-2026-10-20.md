@@ -1,0 +1,118 @@
+# zstd runtime performance: the prefetch gap, and what is left
+
+Date: 2026-10-20. Base: `d8668ee` (merge of #882). Compilers under test:
+LCCC fastbuild, GCC 16.2.0 (`gcc-16-bookworm`), Clang 23.1.3, all from the
+`ms178/lccc` tag cache. zstd 1.5.7, `-O3 -march=x86-64-v3 -fno-lto`,
+`nbWorkers = 0`, single-threaded library defaults.
+
+Two harnesses, both checked into `/tmp` during the session and reproducible
+from the commands below:
+
+* **library A/B** — each arm builds upstream `lib/libzstd.a` with its own
+  compiler, and the *identical* GCC-built driver object is linked to every
+  arm. Timing is `CLOCK_PROCESS_CPUTIME_ID` inside the driver (this host has
+  2 cores and an involuntary-descheduling-heavy scheduler), median of
+  per-round ratios against a chosen base, shuffled arm order within a round,
+  ≥5 rounds. Every arm must reproduce the reference compressed frame
+  **byte-for-byte** and decode it back to the input before any timing runs.
+* **CLI** — each arm builds upstream `programs/zstd`; child CPU time
+  (rusage delta) of `zstd -<level> -c` and `zstd -d -c` on the same frame,
+  best of 5. Frames must be identical across arms at every level.
+
+## What was wrong: `__builtin_prefetch` was a no-op
+
+`__builtin_prefetch` reached the lowerer as `BuiltinIntrinsic::Nop`, the
+address was evaluated for its side effects, and the hint was dropped. GCC,
+Clang and ICX all emit the instruction.
+
+zstd's level-9 match finder is built on it: `ZSTD_RowFindBestMatch_noDict_5_4`
+issues `PREFETCH_L1` for the hash row and the tag row, and 81 % of level-9
+compression time is in that one function. Dropping the hints turned those
+rows into serialised load-use chains.
+
+With the hints restored (`IntrinsicOp::Prefetch`, see the commit message for
+the encoding table and the `prefetchw` rationale):
+
+| case (library A/B, 5 rounds, paired CPU time) | ratio to GCC before | after |
+|---|---|---|
+| text.tar L9 compress | 1.973 | **1.358** |
+| text1m L9 compress | 1.704 | **1.303** |
+| text.tar L9 decompress | 1.510 | **1.469** |
+| 12-case geometric mean (L1/3/9 × c/d × text1m/text.tar) | 1.455 | **1.378** |
+
+Compressed output is byte-identical in both arms (asserted by the harness),
+so this is pure speed.
+
+## Where the remaining gap is
+
+The remaining deficit is not concentrated in one bad construct. Instruction
+counts in the two hot functions are close to GCC's, but their *composition*
+is not:
+
+| function | LCCC | GCC |
+|---|---|---|
+| `ZSTD_RowFindBestMatch_noDict_5_4` (81 % of L9 c) | 572 insns, 279 `mov`, 104 frame refs, 9 prefetch | 559 insns, 195 `mov`, 83 frame refs, 9 prefetch |
+| `ZSTD_decompressSequences_default` (92 % of decode) | 709 insns, 128 frame loads | 726 insns, 50 frame loads |
+
+LCCC emits ~40 % more register-to-register moves and ~25-150 % more stack
+traffic for the same source. That is the linear-scan allocator's assignment
+quality, not a missed idiom: `ZSTD_compressBlock_fast_noDict_7_0` has 1503
+live intervals, 133 of them call-spanning, and **34 % of all value uses are
+stack-slot accesses** (`CCC_DEBUG_RA=1 CCC_DEBUG_RA_INTERVALS=1` dump of the
+TU, 26 580 lines; the three hottest spilled values have 1320, 670 and 563
+uses).
+
+Attempts that did **not** pay off, measured, and therefore not shipped:
+
+* **Call-free specialization** — inline a caller's last remaining callee so
+  the whole caller-saved bank (r10/r11/r8/r9/rdi/rsi/rdx) becomes available
+  to its hot loop. It works mechanically (`ZSTD_compressBlock_fast_noDict_*`
+  goes from 2 calls to 0), but the clone costs more than the freed registers
+  buy: 1.3865 vs 1.3782 geometric mean, text.tar L1 compress 1.438 vs 1.379.
+  The reason is visible in the dump: the values that were spilled are mostly
+  *not* call-spanning, so removing the call points does not free them.
+* **Eviction policy** (`CCC_EVICT_MODE` 1/2/6 vs default 3): mode 1 is
+  0.6 % better on the text suite (1.3694 vs 1.3780) but exactly neutral on
+  unseen binary/random inputs (1.2215 vs 1.2203) with a worse tail
+  (1.486 vs 1.412). Not a win.
+* **`CCC_RA_LOOP_SPAN_RESERVE`** 1-5: helps text1m L1/L3 by up to 4 %, hurts
+  text.tar L9 by up to 5 %. Not adopted.
+* **Peephole budget** widening: no effect at all (the budget was not
+  binding for any zstd TU).
+
+## CLI standing (the number that matters for the acceptance bar)
+
+15 MB text slice, child CPU time, best of 5, identical frames:
+
+| level | compress vs GCC | decompress vs GCC |
+|---|---|---|
+| 1 | 1.278 | 1.256 |
+| 3 | 1.239 | 1.325 |
+| 9 | 1.272 | 1.325 |
+| 12 | 1.357 | 1.432 |
+| 19 | 1.356 | 1.383 |
+| geo | **1.299** | **1.343** |
+
+1 MiB slice: compress geo 1.192 (worst 1.477 at L19), decompress geo 1.109
+(worst 1.144). Clang is at 0.99/0.97 on the same harness, i.e. the harness
+is not biased against a non-GCC compiler.
+
+So: the prefetch fix removes roughly a third of the original level-9
+regression, and the CLI is still ~30 % behind on large inputs. Closing that
+requires the allocator work described above (fewer register-to-register
+copies, fewer spill round-trips), not another idiom-level fix.
+
+## Reproducing
+
+```bash
+# library A/B (per-arm static library + one shared driver object)
+/tmp/prof/zbuild.sh <tag> <compiler>            # -> /tmp/zarms/<tag>/lib/libzstd.a + pdrv
+/tmp/prof/zmeasure.py <tag>... --base gcc --levels 1,3,9 \
+    --inputs /tmp/corpus/text1m.bin,/tmp/corpus/text.tar --rounds 5
+
+# CLI
+/tmp/prof/bench_cli.sh /tmp/zbench/cli /tmp/corpus/text15m.bin 1,3,9,12,19
+```
+
+`CCC_NO_PREFETCH=1` reproduces the pre-fix codegen from the same compiler
+binary, which is how the "before" column above was produced.
