@@ -491,6 +491,10 @@ jobs:
         sha256sum -c target/ci-build.sha256
     - name: No merge conflict markers
       run: python3 scripts/check_no_conflict_markers.py
+    - name: Archived bulk evidence stays archived
+      run: |
+        python3 scripts/check_archived_bulk_absent.py --self-test
+        python3 scripts/check_archived_bulk_absent.py
     - name: Verify native VEX flag-read architectural controls
       run: bash tests/regression/check_vex_flag_reads.sh
     - name: Verify W2 load->cast fold structure and runtime
