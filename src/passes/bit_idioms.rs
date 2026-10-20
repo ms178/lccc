@@ -1193,6 +1193,72 @@ fn fold_same_condition_select(
     })
 }
 
+/// LLVM #233753: negation is a bijection of the fixed-width integer ring,
+/// so select(c, -x, x) is zero exactly when x is zero, independently of c.
+/// Only Eq/Ne and identical 32/64-bit integer types are admitted. Copies are
+/// transparent; casts, shifts, FP operations and different roots are not.
+/// Producers (including an observable condition load) are never edited here.
+fn fold_sign_choice_zero(inst: &Instruction, defs: &[Option<Instruction>]) -> Option<Instruction> {
+    let Instruction::Cmp {
+        dest,
+        op,
+        lhs,
+        rhs,
+        ty,
+    } = inst
+    else {
+        return None;
+    };
+    if !matches!(op, IrCmpOp::Eq | IrCmpOp::Ne)
+        || !matches!(ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64)
+    {
+        return None;
+    }
+    let width = ty.size() * 8;
+    let value = if const_in_ring(*rhs, width) == Some(0) {
+        *lhs
+    } else if const_in_ring(*lhs, width) == Some(0) {
+        *rhs
+    } else {
+        return None;
+    };
+    let (_, yes, no, select_ty) = select(value, defs)?;
+    if select_ty != *ty {
+        return None;
+    }
+    for (negative, original) in [(yes, no), (no, yes)] {
+        let Operand::Value(v) = peel_copies(negative, defs) else {
+            continue;
+        };
+        let source = match defs.get(v.0 as usize).and_then(Option::as_ref) {
+            Some(Instruction::UnaryOp {
+                op: IrUnaryOp::Neg,
+                src,
+                ty: neg_ty,
+                ..
+            }) if neg_ty == ty => *src,
+            Some(Instruction::BinOp {
+                op: IrBinOp::Sub,
+                lhs: zero,
+                rhs: src,
+                ty: neg_ty,
+                ..
+            }) if neg_ty == ty && const_in_ring(*zero, width) == Some(0) => *src,
+            _ => continue,
+        };
+        if same_value(source, original, defs) {
+            return Some(Instruction::Cmp {
+                dest: *dest,
+                op: *op,
+                lhs: original,
+                rhs: Operand::Const(IrConst::from_i64(0, *ty)),
+                ty: *ty,
+            });
+        }
+    }
+    None
+}
+
 fn add_const(
     opnd: Operand,
     amount: u64,
@@ -2544,7 +2610,9 @@ pub(crate) fn recognize_function(
                 }
             }
 
-            if let Some(new) = fold_same_condition_select(&block.instructions[index], &defs) {
+            if let Some(new) = fold_same_condition_select(&block.instructions[index], &defs)
+                .or_else(|| fold_sign_choice_zero(&block.instructions[index], &defs))
+            {
                 // New direct arm uses must be counted BEFORE a later boolean
                 // matcher can repurpose a supposedly single-use producer.
                 crate::backend::liveness::for_each_operand_in_instruction(
@@ -2915,7 +2983,28 @@ pub(crate) fn recognize_function(
         }
         block.instructions.splice(ii..=ii, replacement);
     }
-    changes
+    // The demand-driven consumer sweep runs after all coordinate-based
+    // producer edits/expansions. Reuse the existing allocations, but rebuild
+    // a coherent immutable snapshot from the final layout. Ambiguous defs
+    // must not supply algebraic facts.
+    defs.resize(func.max_value_id() as usize + 1, None);
+    defs.fill(None);
+    def_counts.resize(defs.len(), 0);
+    def_counts.fill(0);
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                defs[dest.0 as usize] = Some(inst.clone());
+                def_counts[dest.0 as usize] += 1;
+            }
+        }
+    }
+    for (definition, count) in defs.iter_mut().zip(&def_counts) {
+        if *count != 1 {
+            *definition = None;
+        }
+    }
+    changes + observe::run(func, &defs)
 }
 
 #[cfg(test)]
@@ -5232,3 +5321,15 @@ mod review_tests;
 #[cfg(test)]
 #[path = "bit_idioms_range_tests.rs"]
 mod range_tests;
+
+#[cfg(test)]
+#[path = "bit_idioms_zero_choice_tests.rs"]
+mod zero_choice_tests;
+
+#[path = "bit_idioms_observe.rs"]
+mod observe;
+
+/// Demand observations before div/rem strength reduction loses their structure.
+pub(crate) fn observe_before_division(func: &mut IrFunction) -> usize {
+    observe::early(func)
+}

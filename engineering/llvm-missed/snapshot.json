@@ -1,0 +1,37 @@
+{
+  "repository": "llvm/llvm-project",
+  "label": "missed-optimization",
+  "started_at": "2026-10-20T16:00:58.529329+00:00",
+  "status": "complete",
+  "method": "REST Issues state=all (includes PRs); two stable membership enumerations; no Search API cap",
+  "limitations": [
+    "Not an atomic GitHub snapshot; membership must agree in two enumerations.",
+    "Label applies to current membership, not removed historical labels.",
+    "PR review threads, diffs, linked external pages and removed comments are not conversation comments.",
+    "Automatic scope classification is routing only; every row starts unreviewed."
+  ],
+  "posts": 3111,
+  "issues": 3101,
+  "prs": 10,
+  "requests": 64,
+  "posts_sha256": "79bceb5d6526c07e84c1775d8bb3eeb36ef1df73f5e4b342745f9982e190ee25",
+  "csv_sha256": "388771988804849309087611d6d95d602e13b5032d49a70619cdc618eb24d933",
+  "comment_counter_gaps": [
+    {
+      "number": 60854,
+      "missing_from_api_counter": 1
+    },
+    {
+      "number": 137912,
+      "missing_from_api_counter": 1
+    },
+    {
+      "number": 176655,
+      "missing_from_api_counter": 1
+    }
+  ],
+  "comments_sha256": "262905b041716939cd5840620904b62ad8ef5af44e277fcf767297be01530f73",
+  "completed_at": "2026-10-20T17:11:49.615086+00:00",
+  "requests_this_invocation": 0,
+  "ledger_sha256": "739530d59beb3b5fba1c0deba591923d165d92f1e1b6efb3c67f71cebc8b424d"
+}

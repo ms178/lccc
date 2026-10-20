@@ -1962,6 +1962,22 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
         }
 
+        // Observe quotient/remainder consumers before materializing magic
+        // multipliers. The same bit_idioms disable policy covers both entries.
+        if !pass_disabled(&disabled, "bit_idioms") {
+            let n = timed_pass!(
+                "bit_observations_pre_div",
+                run_on_visited(
+                    module,
+                    &dirty,
+                    &mut changed,
+                    bit_idioms::observe_before_division
+                )
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         // Phase 2a: Division-by-constant strength reduction.
         // Replaces slow div/idiv instructions with fast multiply-and-shift sequences.
         // Run early so subsequent passes (narrowing, simplify, constant folding, DCE)
@@ -2524,18 +2540,24 @@ pub(crate) fn run_passes(
             // when the 3-operand form is selectable (emit_and_not_impl).
             // `has_scalar_andn` is the per-compilation snapshot resolved at
             // the top of run_passes (same value as the post-ifconv call).
-            let n = timed_pass!(
-                "bit_idioms",
-                run_on_visited(module, &dirty, &mut changed, |func| {
-                    bit_idioms::recognize_function(
-                        func,
-                        enable_bit_reverse,
-                        max_rotate_bits,
-                        min_rotate_bits,
-                        has_scalar_andn,
-                    )
-                })
-            );
+            // The early placement must honor the same exact-token disable
+            // policy as the post-if-conversion placement.
+            let n = if pass_disabled(&disabled, "bit_idioms") {
+                0
+            } else {
+                timed_pass!(
+                    "bit_idioms",
+                    run_on_visited(module, &dirty, &mut changed, |func| {
+                        bit_idioms::recognize_function(
+                            func,
+                            enable_bit_reverse,
+                            max_rotate_bits,
+                            min_rotate_bits,
+                            has_scalar_andn,
+                        )
+                    })
+                )
+            };
             cur_pass_changes[3] += n;
             total_changes += n;
             total_changes_excl_dce += n;
