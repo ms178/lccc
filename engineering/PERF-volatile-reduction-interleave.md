@@ -1,116 +1,138 @@
 # Scalar interleaving for volatile unsigned reductions
 
-## Opportunity and scope
+## Opportunity and deliberately narrow scope
 
-Load-to-ALU fusion removes a register relay, but leaves one serial accumulator
-and a branch per volatile read. These reads cannot be CSE'd, widened or packed
-into vector loads. Instead, the new `volatile_reduce` IR pass creates four
-independent scalar chains and one backedge per four reads.
+Load-to-ALU fusion removes a register relay but leaves one serial accumulator
+and a branch per volatile read. The `volatile_reduce` pass creates four scalar
+chains and one backedge per four reads. It never vectorizes, widens, coalesces or
+speculates the volatile accesses.
 
-The pass is x86-64-only, at -O3, outside size optimization. It respects the
-ordinary `CCC_DISABLE_PASSES=volatile_reduce` and `CCC_DISABLE_PASSES=unroll`
-switches and adds no per-candidate environment access. No new ISA is required.
-It runs after vectorization and before loop rotation, while the canonical phis
-and top-of-loop condition are still explicit.
+The pass is x86-64-only, at O3, outside size optimization, after vectorization
+and before loop rotation. It respects both `CCC_DISABLE_PASSES=volatile_reduce`
+and `CCC_DISABLE_PASSES=unroll`. No new ISA or per-candidate environment read is
+required. i686, AArch64 and RISC-V are excluded and have explicit nonapplication
+checks.
 
-The intentionally narrow matcher requires:
+Eligibility requires a single-entry two-block loop with a dedicated
+unconditional preheader, two header phis, an unsigned U32/U64 unit IV starting
+at zero, an invariant unsigned limit, and one invariant-address volatile read.
+The body may contain one constant-offset GEP, one matching-width unsigned
+add/mul/and/or/xor reduction, and the unit increment; nothing else. Body results
+must not escape except through the original header phis. The seed is invariant
+and need not be zero. Signed/FP, atomics, stores, additional reads, side exits,
+variable addresses and non-unit IVs are not part of this feature.
 
-- A single-entry two-block loop: exactly two header phis and an unsigned `<`
-  guard, with a dedicated unconditional preheader.
-- A U32/U64 unit-step counter starting at zero, and an invariant bound.
-- One U32/U64 volatile read from an invariant pointer, optionally behind one
-  constant-offset GEP; no accumulator-dependent addresses.
-- Exactly one matching-width unsigned add, multiply, and, or, or xor reduction
-  and the IV increment, with no other body work or observable intermediate
-  accumulator. Body definitions cannot escape except through the header phis.
+## Correctness and setup policy
 
-Everything else remains unchanged: signed/FP reassociation, non-unit IVs,
-noncanonical guards, wider/narrower reads, stores, calls, atomics, dynamic
-addresses and side exits. This is not a new vectorizer or a general unroller.
+For unsigned `n`, `m = n & ~3` is the greatest multiple of four not exceeding
+`n`, computed in the IV's original width. The grouped loop processes exactly
+`m` reads and the original scalar loop resumes at IV `m`, performing zero to
+three remaining reads. Since `iv <= m-4` before each successful group,
+`iv+4 <= m <= n`: even UINT_MAX cannot wrap the main IV. Zero trips perform no
+volatile reads, though accumulator initialization/combine overhead remains.
 
-## Correctness argument
+Every cloned load retains the original address, segment, width and volatile
+flag. Optional GEPs are cloned inside the guarded body. The seed appears in one
+lane once, with neutral elements in the other lanes. Only unobservable modular
+unsigned arithmetic is regrouped. A balanced tree combines the partial values.
+The original accumulator and IV names remain the live-out interface.
 
-For unsigned bound n and group size 4, m = n & ~3 is the greatest multiple of
-four not exceeding n. The main loop executes exactly m source iterations in
-order; the original loop starts with IV m and processes n-m (0..3) reads.
-Inside the main loop, iv <= m-4, so iv+4 <= m <= n: even UINT_MAX cannot wrap
-the IV. The scalar tail retains its original exit condition and SSA live-outs.
+The original phi preheader inputs are replaced with grouped results from the
+combine edge. Main loops have five phis and remainder IVs no longer begin at a
+constant zero, preventing recursive interleaving. Fresh values (19 or 23 with a
+GEP) and three block labels are checked before mutation. Source spans for
+untouched and cloned instructions are retained. A compile-time assertion makes
+the fixed-four assumption explicit. The upstream 200-block and 32-rewrite
+budgets and lane-zero compatibility control remain intact.
 
-Each cloned read retains its width, address expression, segment and volatile
-flag. An optional GEP is cloned in each lane instead of being speculated on
-zero trips. There is no read before a successful guard, and no read beyond the
-original count. Arithmetic regrouping changes only unobservable unsigned
-modular operations. Four partial values combine with the same associative,
-commutative operation; the seed appears exactly once, and other lanes start
-at the operation's identity (0, 1, or all bits set). The combine tree is balanced.
+## Profitability decisions
 
-No existing body instruction is removed. The original loop is the tail, and
-only its preheader phi edges change. Fresh SSA/label ranges are checked before
-mutation; stale cached next IDs are cross-checked against actual IR IDs. New
-blocks carry no fabricated source locations, and the extended preheader drops
-stale instruction-span indexing. Main loops have five phis; tails have a
-nonconstant IV initializer. Neither can be interleaved again.
+Long U64 pointer/Local-Exec reductions gain from branch amortization and shorter
+accumulator dependencies. Four lanes are compared against a two-chain source
+alternative rather than selected by intuition alone. Code-size growth is real;
+O3/non-size gating remains essential.
 
-## Evidence
+The host matrix exposed an important exception: known Global-Dynamic or
+Local-Dynamic TLS accesses repeat a descriptor call per folded load in the
+current backend. Grouping did not remove that bottleneck and could regress
+runtime. Those addresses now retain the original loop. Declaration attributes
+override command-line TLS policy, which overrides output defaults; Local-Exec,
+Initial-Exec and ordinary pointers remain eligible. Bounded constant-GEP/Copy
+tracking recognizes the same address forms as the backend's fold.
 
-On the Intel Xeon 2.60 GHz virtual host, nine rotating-order samples per compiler
-and kernel, after two warm-up rounds, were pinned to CPU 0. Every binary used
--O3 -fno-pic -no-pie. Each kernel ran one billion iterations. Subprocess output
-and successful completion were checked for every run.
+This is a cost exclusion, not a correctness requirement or a claim that dynamic
+TLS can never be optimized. A backend resolver-hoisting change would need its
+own placement, ABI and profitability review. It is not silently bundled here.
+No short-trip bypass is added: earlier measurements showed a tiny-call benefit
+but medium-trip and Initial-Exec TLS regressions. Retaining the upstream CFG is
+the simpler evidence-supported choice, not an invented trip-count threshold.
 
-| Workload | Current-main LCCC | New LCCC | GCC 16.2 | Clang 23.1.3 | LCCC speedup |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Existing `tls_hot_loop` sum | 0.314249 s | 0.160568 s | 0.299427 s | 0.305281 s | 1.96x |
-| New sum + product workload | 1.224057 s | 0.460838 s | 1.226280 s | 1.240236 s | 2.66x |
+## Reproduction and attribution
 
-These are median wall times, not hardware cycle-counter measurements or claims
-about arbitrary C programs. CPU-time medians show the same effect. In the
-eligible main loops, four memory ALU operations plus IV increment, compare and
-branch replace four copies of a four-instruction rolled iteration: 7 versus 16
-architectural instructions for four reads (setup and tail excluded).
-
-Tradeoff: the benchmark's sum function grows from 57 to 155 bytes; product grows
-from 58 to 220 bytes, including setup, four chains, combine and cleanup. This
-justifies the -O3/non-size gate rather than applying the transform universally.
-Four chains hide the multiply dependency without the additional register
-pressure of eight chains, and a power-of-two group has a cheap overflow-safe
-bound mask. Short calls may not amortize setup. No speed guarantee is made for
-other CPUs, memory types or workloads. ICX was not locally available.
-
-Reproduce using cached/exact compiler paths:
+Both diagnostic scripts require exact paths for reference compilers and reject
+wrong versions: GCC 16.2, Clang 23.1.3, optionally ICX 2026.2. They validate child
+success/output, reject warnings, pin a CPU, warm up twice and rotate run order.
+Reports contain compiler and generated-binary hashes, source hashes, exact
+commands, host/CPU/environment, raw samples and dispersion. An incomplete matrix
+is marked explicitly and JSON checkpoints are atomic. Keep raw measurements in
+ignored `work/` or attached artifacts, not the source tree.
 
 ```sh
-python3 scripts/measure_volatile_reductions.py \
-  --baseline /path/to/main/lccc --candidate target/fastbuild/lccc \
+python3 scripts/measure_volatile_matrix.py \
+  --candidate target/fastbuild/lccc \
   --gcc /path/to/gcc-16 --clang /path/to/clang-23 \
-  --trips 1000000000 --samples 9 --output work/perf/measurement.json
+  --samples 5 --budget 5000000 --output work/perf/matrix.json
+
+python3 scripts/measure_volatile_reductions.py \
+  --baseline /path/to/baseline/lccc --candidate target/fastbuild/lccc \
+  --baseline-revision BASE --candidate-revision CANDIDATE \
+  --gcc /path/to/gcc-16 --clang /path/to/clang-23 \
+  --trips 1000000000 --samples 9 --output work/perf/long.json
 ```
 
-Timing is diagnostic, never a flaky CI pass/fail threshold.
+The matrix uses opaque shared-object calls to prevent cross-compiler inlining
+and internal CPU/wall timers to exclude process/loader startup. Every call has
+an independent modular oracle. It covers five operations, both widths, pointer
+and IE TLS, GD TLS controls and a register-pressure context, over counts 0–16,
+32, 64, 256, 1024 and 65536. Timing is diagnostic, never a flaky CI threshold.
+Steady repeated calls are not evidence about cold TLS allocation or arbitrary
+mixed application traffic. No universal speed or optimality claim is made.
 
-## Regression design
+## Executable assurance
 
-- An independent SSA interpreter supplies a changing read stream and compares
-  results, final IVs and the complete access trace. 3,040 combinations cover five
-  operations, both accumulator/counter widths, four seeds and 38 trip counts.
-- Another 90 scenarios cover constant address offsets and generic/FS/GS spaces.
-  Each rewritten scenario checks SSA validity and idempotence.
-- Explicit unsigned-extrema arithmetic checks prove grouping/tail bounds without
-  trying to execute UINT64_MAX iterations. Refusal tests assert no IR mutation,
-  including allocator-ID exhaustion and non-associative/unsupported semantics.
-- A C contract tests 500 input/seed/count combinations through eleven noinline
-  pointer/TLS functions (5,500 results per execution), null-pointer zero trips,
-  zero/small/large tails, and unsigned wraparound. Six optimization/code-model
-  configurations, two disabled controls and an assembly mechanism assertion
-  prevent an optimization that silently stops firing from passing unnoticed.
-- A dlopen test exercises 33 trip counts through the dynamic TLS descriptor
-  model at -O3. Existing TLS model contracts also remain in force.
-- The new regression is mirrored in hosted and local CI. The previously missing
-  local mirror of the compiler-independent TLS oracle test is repaired too.
+The pass has sixteen focused Rust tests, including 3,040 changing-stream cases,
+90 offset/segment cases and 160 high-bit terminal executions through the actual
+production-generated bound. Additional tests cover source spans, live-out IVs,
+nested/sibling loops, stale caches, exact allocator exhaustion and TLS policy
+precedence. Four production-source mutants were caught and restored.
 
-Local warning-denied fastbuild and strict all-target Clippy passed. The full
-library suite passed 5,361 tests with zero failures and ten existing ignores.
-The new C regression/benchmark fixtures compile with -Wall -Wextra -Werror under
-GCC 16.2 and Clang 23.1.3. Formatting, CI/local gate parity, benchmark-harness
-self-tests (nine), directive guard and complete TLS contracts passed. Remote CI
-results are reported on the PR rather than predicted here.
+The native C contract checks 6,000 results per execution plus opaque null/zero
+probes. Value parity, assembly and pass-output IR establish application and
+nonapplication independently across optimization policies and TLS models. Valid
+C negative fixtures protect atomics, signed/FP, strided IVs, changing addresses,
+intermediate stores and multiple reads. Dlopen checks the retained dynamic TLS
+path. The benchmark driver is smoke-tested in ordinary CI, and the combined
+sum/product workload is registered in the central benchmark harness.
+
+Checker self-tests run with and without Python optimization. The authenticated
+Intel job adds O3 comparisons and a 480-execution ICX matrix. Local host ICX is
+not available under the sandbox's allowed-network policy; authenticated remote
+results are separate evidence, not fabricated local timings.
+
+See [the adversarial audit](AUDIT-volatile-reduction.md) for per-function proof
+obligations, additional pre-existing peephole defects exposed and repaired, and
+explicit tool/feature limitations.
+
+## Attribution of this follow-up
+
+The merged main already has four-chain interleaving. Its original approximately
+2x TLS-sum and 2.6x combined sum/product gains must **not** be attributed to this
+follow-up. This change preserves those loops while fixing attribution, checked
+allocation, TLS cost selection and late-backend correctness. The proposed
+short-trip dispatch was rejected after its setup/register-placement trade-offs
+were measured. Source-level two-chain comparisons remain diagnostic, not an
+isolated lane-count experiment with identical CFG and allocation.
+
+Fresh results against an exact current-main binary are recorded in the PR and
+attached evidence. The full 24-case matrix records short, medium and long trips,
+including cases with no improvement; no universal speedup is claimed.

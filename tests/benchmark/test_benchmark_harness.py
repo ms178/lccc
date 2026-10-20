@@ -27,6 +27,8 @@ class BenchmarkHarnessTests(unittest.TestCase):
         import callgrind_corpus as corpus
         sizes = json.loads((ROOT / 'tests/benchmark/callgrind_sizes.json').read_text())
         by_name = {b.name: b for b in bench.BENCHMARKS}
+        self.assertEqual(set(sizes), set(by_name), "every registered workload needs bounded instrumentation sizes")
+        self.assertEqual(sizes['volatile_reduce'], '-DVOLATILE_REDUCE_TRIPS=4096')
         self.assertEqual(corpus.workload_flags(by_name['linux_find_bit_scaled'], sizes['linux_find_bit_scaled']), ['-DPASSES=128'])
         flags = corpus.workload_flags(by_name['lz4_match_extend'], sizes['lz4_match_extend'])
         self.assertEqual(flags.count('-DMATCH_RICH=1'), 1)

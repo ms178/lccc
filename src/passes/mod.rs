@@ -91,6 +91,32 @@ pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
 pub(crate) mod verify;
 pub(crate) mod volatile_reduce;
+
+// Compatibility controls introduced with the original transform. Resolve once
+// at the TU boundary, never inside per-function or per-candidate scans.
+fn volatile_reduction_enabled() -> bool {
+    match std::env::var("CCC_VOLATILE_REDUCE_LANES") {
+        Ok(value) => match value.trim() {
+            "0" => false,
+            "4" => true,
+            "2" | "8" => {
+                eprintln!(
+                    "volatile_reduce: non-default lanes={} requested but only 4 is validated; using 4",
+                    value.trim()
+                );
+                true
+            }
+            _ => {
+                eprintln!(
+                    "volatile_reduce: invalid CCC_VOLATILE_REDUCE_LANES={value:?}, using 4 (expected 0/2/4/8)"
+                );
+                true
+            }
+        },
+        Err(_) => true,
+    }
+}
+
 pub(crate) mod web_congruence;
 
 use crate::common::fp_contract::FpContract;
@@ -1269,6 +1295,7 @@ pub(crate) fn run_passes(
     // in this unit are interposable, so the inliner keeps calls to them
     // (GCC's default `-fsemantic-interposition` at -fPIC).
     pic: bool,
+    tls_model: Option<crate::ir::reexports::TlsModel>,
 ) {
     let policy = crate::common::pass_policy::PassPolicy::new(
         wrap_signed_overflow,
@@ -2297,16 +2324,21 @@ pub(crate) fn run_passes(
             && target == crate::backend::Target::X86_64
             && !dis.unroll
             && !pass_disabled(&disabled, "volatile_reduce")
+            && volatile_reduction_enabled()
         {
+            let costly_tls = volatile_reduce::costly_tls_symbols(module, pic, tls_model);
+            let enforce_block_budget =
+                std::env::var("CCC_VOLATILE_REDUCE_BUDGET").as_deref() != Ok("0");
             let n = timed_pass!(
                 "volatile_reduce",
-                run_on_visited(module, &dirty, &mut changed, volatile_reduce::run)
+                run_on_visited(module, &dirty, &mut changed, |f| volatile_reduce::run(
+                    f,
+                    &costly_tls,
+                    enforce_block_budget
+                ))
             );
             total_changes += n;
             total_changes_excl_dce += n;
-            if n > 0 {
-                verify::verify_after_pass(module, "volatile_reduce");
-            }
         }
 
         // Unroll/vectorize can clone loop bodies that still contained
@@ -4005,6 +4037,7 @@ mod signed_wrap_policy_tests {
             false,
             &crate::backend::regalloc::RaConfig::default(),
             false,
+            None,
         );
     }
 

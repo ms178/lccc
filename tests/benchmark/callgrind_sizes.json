@@ -43,5 +43,6 @@
   "zstd_count": "-DBUFFER_SIZE=16384 -DQUERY_COUNT=1024 -DPASSES=2",
   "lz4_compress": "-DSRC_SIZE=16384 -DPASSES=2",
   "lz4_match_extend": "-DSRC_SIZE=16384 -DPASSES=2 -DMATCH_RICH=1",
-  "glibc_strstr": "-DHAYSTACK_LEN=16384 -DQUERY_COUNT=32 -DPASSES=2"
+  "glibc_strstr": "-DHAYSTACK_LEN=16384 -DQUERY_COUNT=32 -DPASSES=2",
+  "volatile_reduce": "-DVOLATILE_REDUCE_TRIPS=4096"
 }

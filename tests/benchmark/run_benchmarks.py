@@ -69,6 +69,8 @@ class Benchmark:
 # Keep historical synthetic tests, then add workload-derived kernels.  Sources
 # may live in the legacy numbered directory until they are migrated.
 BENCHMARKS: tuple[Benchmark, ...] = (
+    Benchmark("volatile_reduce", "volatile TLS sum and product / scalar ILP",
+              ("volatile_reduce.c",), ("integer", "loop", "tls")),
     # Required source semantics, not optional tuning: these signed recurrences
     # intentionally overflow. Keeping the requirement here covers every native
     # and static caller, including correctness-only/default invocations.
