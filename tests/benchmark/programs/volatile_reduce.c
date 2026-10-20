@@ -4,6 +4,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#ifndef VOLATILE_REDUCE_TRIPS
+#define VOLATILE_REDUCE_TRIPS 2000000
+#endif
+
 __thread volatile uint64_t volatile_reduce_value = UINT64_C(0x9e3779b97f4a7c15);
 
 __attribute__((noinline)) uint64_t volatile_sum(uint64_t n, uint64_t seed) {
@@ -16,7 +20,7 @@ __attribute__((noinline)) uint64_t volatile_product(uint64_t n, uint64_t seed) {
 }
 
 int main(int argc, char **argv) {
-    uint64_t n=argc>1 ? strtoull(argv[1],0,0) : 2000000;
+    uint64_t n=argc>1 ? strtoull(argv[1],0,0) : VOLATILE_REDUCE_TRIPS;
     uint64_t value=volatile_reduce_value, power=1, base=value;
     for (uint64_t k=n;k;k>>=1) {
         if (k&1) power *= base;

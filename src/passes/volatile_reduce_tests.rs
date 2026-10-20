@@ -3,7 +3,7 @@ use crate::common::fx_hash::FxHashMap;
 use crate::common::types::AddressSpace;
 
 fn run(f: &mut IrFunction) -> usize {
-    super::run(f, &FxHashSet::default())
+    super::run(f, &FxHashSet::default(), true)
 }
 
 fn fixture(op: IrBinOp, ty: IrType, iv_ty: IrType, n: u64, seed: u64) -> IrFunction {
@@ -773,7 +773,7 @@ fn costly_tls_roots_and_constant_aliases_are_not_interleaved() {
         verify(&f);
         let before = format!("{f:?}");
         let costly = FxHashSet::from_iter(["device".to_string()]);
-        assert_eq!(super::run(&mut f, &costly), 0);
+        assert_eq!(super::run(&mut f, &costly, true), 0);
         assert_eq!(format!("{f:?}"), before);
         assert_eq!(run(&mut f), 1);
         verify(&f);
@@ -852,10 +852,12 @@ fn upstream_block_budget_rejects_without_mutation() {
         f.blocks.push(BasicBlock {
             label: BlockId(f.blocks.len() as u32),
             instructions: vec![],
-            terminator: Terminator::Return(None),
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::from_i64(0, IrType::U64)))),
             source_spans: vec![],
         });
     }
     f.next_label = f.blocks.len() as u32;
     assert_rejected(&mut f);
+    assert_eq!(super::run(&mut f, &FxHashSet::default(), false), 1);
+    verify(&f);
 }

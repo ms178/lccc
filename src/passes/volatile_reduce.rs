@@ -25,46 +25,6 @@ const LANES: usize = 4;
 const MAX_BLOCKS_BUDGET: usize = 200;
 const MAX_VOLATILE_LOOPS_BUDGET: usize = 32;
 
-fn lanes() -> usize {
-    // Tunable ILP width for measurement: 0=off, 2/4/8 explicit, otherwise 4.
-    // Env read is per-call (not per-process) so A/B harnesses can compare
-    // CCC_VOLATILE_REDUCE_LANES=2 vs 4 in the same invocation via --lccc-alt-env.
-    if let Ok(v) = std::env::var("CCC_VOLATILE_REDUCE_LANES") {
-        match v.trim() {
-            "0" => return 0,
-            "2" => return 2,
-            "4" => return 4,
-            "8" => return 8,
-            _ => {}
-        }
-        eprintln!(
-            "volatile_reduce: invalid CCC_VOLATILE_REDUCE_LANES={v:?}, using {LANES} (expected 0/2/4/8)"
-        );
-    }
-    LANES
-}
-
-fn should_skip_for_compile_time(func: &IrFunction) -> bool {
-    // Compile-time guardrail for YARPGen mega-TUs (seed 101: 63k asm lines,
-    // 580s peephole). Volatile reduction itself is cheap, but on a function
-    // with 200+ blocks or 32+ volatile loops the win is noise vs the risk of
-    // scaling a per-loop analysis across a pathological CFG. The budget is
-    // deliberately conservative and disable-able via CCC_VOLATILE_REDUCE_BUDGET=0.
-    if std::env::var("CCC_VOLATILE_REDUCE_BUDGET").as_deref() == Ok("0") {
-        return false;
-    }
-    if func.blocks.len() > MAX_BLOCKS_BUDGET {
-        eprintln!(
-            "volatile_reduce: skipping {}: {} blocks > {} (budget)",
-            func.name,
-            func.blocks.len(),
-            MAX_BLOCKS_BUDGET
-        );
-        return true;
-    }
-    false
-}
-
 // The mask, balanced combine and register-pressure policy are deliberately
 // fixed-four, not a generic unrolling knob.
 const _: () = assert!(LANES == 4);
@@ -592,21 +552,20 @@ impl CostlyAddresses {
     }
 }
 
-/// Pipeline caller owns target/optimization policy and the ordinary pass-disable
-/// switch. Tunable lanes via CCC_VOLATILE_REDUCE_LANES (0/2/4/8) and budget
-/// via CCC_VOLATILE_REDUCE_BUDGET are read here so A/B harnesses can vary them
-/// without recompiling; the core matcher stays pure.
-pub(crate) fn run(func: &mut IrFunction, costly_symbols: &FxHashSet<String>) -> usize {
-    let lanes = lanes();
-    if lanes == 0 {
-        return 0;
-    }
-    if lanes != LANES {
+/// Pipeline caller resolves environment policy once per translation unit.
+/// Keep block/loop budgets explicit; the matcher reads no process-global state.
+pub(crate) fn run(
+    func: &mut IrFunction,
+    costly_symbols: &FxHashSet<String>,
+    enforce_block_budget: bool,
+) -> usize {
+    if enforce_block_budget && func.blocks.len() > MAX_BLOCKS_BUDGET {
         eprintln!(
-            "volatile_reduce: non-default lanes={lanes} requested but only {LANES} is validated; using {LANES}"
+            "volatile_reduce: skipping {}: {} blocks > {} (budget)",
+            func.name,
+            func.blocks.len(),
+            MAX_BLOCKS_BUDGET
         );
-    }
-    if should_skip_for_compile_time(func) {
         return 0;
     }
     if !func.blocks.iter().any(|b| {

@@ -37,6 +37,11 @@ CCC_VOLATILE_REDUCE_LANES=0 "$CCC" -O3 -fno-pic -S "$src" -o "$work/lane-zero.s"
 python3 "$here/check_volatile_reduction_asm.py" "$work/lane-zero.s" 1
 CCC_VOLATILE_REDUCE_LANES=0 "$CCC" -O3 -fno-pic -no-pie "$src" -o "$work/lane-zero"
 tls_compare_runtime "$work/lane-zero" "$work/reference" "$work/lane-zero-out" 30
+for lanes in 2 8; do
+    CCC_VOLATILE_REDUCE_LANES=$lanes "$CCC" -O3 -fno-pic -S "$src" -o "$work/fixed-four.s" 2>"$work/lane-diagnostic"
+    grep -q "only 4 is validated; using 4" "$work/lane-diagnostic"
+    python3 "$here/check_volatile_reduction_asm.py" "$work/fixed-four.s" 5
+done
 python3 "$here/test_volatile_reduction_asm.py"
 python3 "$here/../../scripts/test_measure_volatile_reductions.py"
 python3 -O "$here/test_volatile_reduction_asm.py"
