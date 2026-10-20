@@ -92,7 +92,7 @@ python3 tests/benchmark/run_benchmarks.py --compilers lccc,gcc \
 
 * Warning-denied fastbuild of lccc/lccc-ld with active 1 GiB swap: PASS.
 * Warning-denied all-target Clippy, formatting and diff whitespace: PASS.
-* Rust suite: 5,463 library tests plus one integration test PASS; ignored tests
+* Rust suite: 5,464 library tests plus one integration test PASS; ignored tests
   and doctests remain ignored, not counted as passes.
 * Added unit cases cover wrapping U32/U64 evaluation (16,384 input witnesses),
   exact factors 2/4, private carried sums, refusal/transactionality boundaries,
@@ -107,3 +107,24 @@ python3 tests/benchmark/run_benchmarks.py --compilers lccc,gcc \
   because no prepared kernel tree. Hosted CI must cover provisioned platforms.
 * Broader GCC performance gate remains OPEN. No profitable find-bit, SHA or
   switch change has been established. Hosted checks must be reviewed separately.
+
+## Hosted failure found and corrected
+
+The first hosted run failed `check_seg_gs_runtime.sh`: `argument_imag` in
+`seg_gs_complex_rvalue.c` failed at -O2/-O3. Local ablation reproduced the
+failure with address normalization enabled and passed with it disabled.
+Normalization enabled store/load forwarding of a complex temporary; this made
+the primary result of a pure call dead. DCE retained GetReturnF64Second but
+removed the producing call, leaving the secondary ABI register stale.
+
+DCE now pins the nearest preceding direct/indirect call in the same block when
+seeding an ordered GetReturnF32/F64/F128Second root. The normal worklist then
+retains its operands, including indirect targets. This fixes the dependency
+rather than hiding the new optimization from segment/complex functions. Unit
+coverage includes all three return widths and direct/indirect producers, while
+the existing executable segment contract covers the observed failure. The
+full segment runtime contract now passes locally. Warning-denied tests/build,
+all-target Clippy and formatting were repeated. A fresh 46-workload run passes
+and every binary matches the pre-fix candidate, so the retained timing evidence
+still describes the final generated benchmark code. Hosted checks are rerun
+for this correction; do not treat the earlier failing run as green.

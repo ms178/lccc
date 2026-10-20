@@ -203,9 +203,26 @@ pub(crate) fn eliminate_dead_code(func: &mut IrFunction) -> usize {
     // ------------------------------------------------------------------
     for block in &func.blocks {
         block_off.push(insts.len() as u32);
+        // GetReturn* has an implicit use of the nearest preceding call's
+        // secondary ABI result. Its SSA dest does not name that dependency.
+        // These ordered reads are roots, so pin their producing call here,
+        // even when only its PRIMARY result has become dead after forwarding.
+        // Reset at each block: ABI result reads must not cross CFG edges.
+        let mut last_call = None;
         for inst in &block.instructions {
             let fi = insts.len() as u32;
             insts.push(inst);
+            match inst {
+                Instruction::Call { .. } | Instruction::CallIndirect { .. } => last_call = Some(fi),
+                Instruction::GetReturnF64Second { .. }
+                | Instruction::GetReturnF32Second { .. }
+                | Instruction::GetReturnF128Second { .. } => {
+                    if let Some(call) = last_call {
+                        mark_site_live(call, &mut live, &mut worklist);
+                    }
+                }
+                _ => {}
+            }
             if let Some(dest) = inst.dest() {
                 // In bounds by construction: def_len covers every dest seen
                 // in Pass 0 over the same, unmodified instruction lists.
@@ -683,6 +700,73 @@ mod tests {
         });
         assert_eq!(eliminate_dead_code(&mut func), 1);
         assert!(func.blocks[0].instructions.is_empty());
+    }
+
+    #[test]
+    fn secondary_abi_return_pins_pure_producer_and_arguments() {
+        for kind in 0..3 {
+            for indirect in [false, true] {
+                let mut f = IrFunction::new("secondary".into(), IrType::Void, vec![], false);
+                let info = CallInfo {
+                    dest: Some(Value(1)),
+                    args: vec![Operand::Value(Value(0))],
+                    is_pure: true,
+                    ..CallInfo::default()
+                };
+                let call = if indirect {
+                    Instruction::CallIndirect {
+                        func_ptr: Operand::Value(Value(4)),
+                        info,
+                    }
+                } else {
+                    Instruction::Call {
+                        func: "pure_complex".into(),
+                        info,
+                    }
+                };
+                let second = match kind {
+                    0 => Instruction::GetReturnF32Second { dest: Value(2) },
+                    1 => Instruction::GetReturnF64Second { dest: Value(2) },
+                    _ => Instruction::GetReturnF128Second { dest: Value(2) },
+                };
+                f.blocks.push(BasicBlock {
+                    label: BlockId(0),
+                    instructions: vec![
+                        Instruction::Copy {
+                            dest: Value(0),
+                            src: Operand::Const(IrConst::I64(7)),
+                        },
+                        Instruction::GlobalAddr {
+                            dest: Value(4),
+                            name: "callee".into(),
+                        },
+                        call,
+                        second,
+                    ],
+                    terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+                    source_spans: vec![],
+                });
+                eliminate_dead_code(&mut f);
+                assert!(f.blocks[0].instructions.iter().any(|i| matches!(
+                    i,
+                    Instruction::Call { .. } | Instruction::CallIndirect { .. }
+                )));
+                assert!(
+                    f.blocks[0]
+                        .instructions
+                        .iter()
+                        .any(|i| i.dest() == Some(Value(0)))
+                );
+                if indirect {
+                    assert!(
+                        f.blocks[0]
+                            .instructions
+                            .iter()
+                            .any(|i| i.dest() == Some(Value(4)))
+                    );
+                }
+            }
+        }
     }
 
     #[test]
