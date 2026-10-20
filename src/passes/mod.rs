@@ -90,6 +90,7 @@ pub(crate) mod vec_ssa;
 pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
 pub(crate) mod verify;
+pub(crate) mod volatile_reduce;
 pub(crate) mod web_congruence;
 
 use crate::common::fp_contract::FpContract;
@@ -2284,6 +2285,27 @@ pub(crate) fn run_passes(
                 if n > 0 {
                     verify::verify_after_pass(module, "slp");
                 }
+            }
+        }
+
+        // Volatile reductions cannot vectorize their accesses. Split only
+        // tiny unsigned invariant-address reductions into independent scalar
+        // chains, after vectorization and before rotation obscures the phis.
+        if iter == 0
+            && opt_level >= 3
+            && !optimize_for_size
+            && target == crate::backend::Target::X86_64
+            && !dis.unroll
+            && !pass_disabled(&disabled, "volatile_reduce")
+        {
+            let n = timed_pass!(
+                "volatile_reduce",
+                run_on_visited(module, &dirty, &mut changed, volatile_reduce::run)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+            if n > 0 {
+                verify::verify_after_pass(module, "volatile_reduce");
             }
         }
 

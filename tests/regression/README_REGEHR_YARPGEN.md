@@ -50,3 +50,17 @@ diffs). Fixed over the v1/v2 adoption sessions:
 All 28 corpus cases now pass. The reference
 fixes for most of them; adapt them to LCCC's diverged lowering rather than
 copying blindly (see the project rules: understand → implement → measure).
+
+## Found by LCCC's own YARPGen runs (resurrected engine, 2026-10-19)
+
+The corpus above is imported; the two cases below were found by
+`scripts/fuzz_diff.py --engine yarpgen` itself once the engine was
+repaired (pinned intel/yarpgen `1adb290…`, `scripts/ensure_yarpgen.sh`),
+reduced by per-global dump localisation + dual-oracle delta-debugging,
+and added to the same regression directory:
+
+| Test | Seed | Root cause fixed |
+|------|------|------------------|
+| `regress_const_bool_cast_zero_lowbyte` | 20261023 | Constant `(_Bool)` conversion folded by truncating to 8 bits *before* normalising, so `(_Bool)256` / `(_Bool)67106816ULL` folded to 0 (C11 6.3.1.2 wants 1 for any nonzero scalar) — the dual of corpus case #1. Fixed at four folding sites (`src/frontend/sema/` Cast eval + `cast_i128_to_ctype`, both `eval_const_expr_as_bits` in sema and `src/ir/lowering/`). |
+| `regress_stmt_expr_conditional_composite_type` | 20261020 | `get_expr_ctype_with_scope` in `src/ir/lowering/expr_types.rs` typed a statement-expression tail conditional as its then-arm's type instead of the C11 6.5.15 composite type, truncating mixed-type `min`/`max` statement expressions (the kernel idiom) whenever the compound contained a declaration: loop inits collapsed (0 trips at `-O1`), guarded stores were skipped at `-O2`, and an inner loop silently diverged at `-O0` (5 vs 30 iterations under counters) without changing the final checksum. Fixed for both `Conditional` and `GnuConditional` arms via `CType::conditional_composite_type` (`conditional_ctype_with_scope`). Related prior art in the same function: corpus cases #14–#16. |
+| `regress_const_neg_unsigned_wrap` | 101 (mutpair) | Unary minus on an `unsigned int` constant folded modulo 2^64 instead of 2^32 in both constant folders (`-(3844603080U)` → 18446744069864948536, not 450364216), flipping a folded `min()`. The sibling `~` fold (corpus case #2) already truncated to the promoted width; `-` now gets the same treatment in `src/frontend/sema/const_eval.rs` and `src/ir/lowering/const_eval.rs`. Found by `scripts/yarpgen_mutpair.py`; the same seed also exposes a compile-time pathology (581 s at `-O2` for a 248 KB TU on a 2-CPU VM, correct output) tracked in the FOLLOWUP. |

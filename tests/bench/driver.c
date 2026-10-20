@@ -16,6 +16,9 @@
 /* Volatile sink: prevents any arm from deleting the kernel as dead code. */
 volatile unsigned long long bench_sink;
 
+/* Weak default: kernels without an algorithm oracle verify trivially. */
+__attribute__((weak)) int bench_verify(void) { return 0; }
+
 static double now_seconds(void) {
     struct timespec ts;
     /* MONOTONIC_RAW is immune to NTP slew, which matters when samples are
@@ -35,6 +38,10 @@ int main(int argc, char **argv) {
     }
 
     bench_setup();
+    if (bench_verify()) {
+        printf("VERIFY-FAIL\n");
+        return 3;
+    }
 
     /* Warm caches, branch predictors and any lazy PLT resolution so the timed
      * region measures steady-state code quality rather than first-touch cost. */
