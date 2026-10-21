@@ -5,6 +5,8 @@ import importlib.util
 import pathlib
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 HERE = pathlib.Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("run_linker_tests", HERE / "run_linker_tests.py")
@@ -28,6 +30,49 @@ class ShellWrapperTests(unittest.TestCase):
             missing = str(pathlib.Path(parent) / "gone")
             with self.assertRaisesRegex(RuntimeError, r"working directory not found: .*gone"):
                 HARNESS.sh(["true"], cwd=missing)
+
+
+class CustomFixtureCodeModelTests(unittest.TestCase):
+    def test_custom_pic_fixtures_do_not_inherit_driver_defaults(self):
+        # Stop deliberately at the C/C++ compilation. Assembly and relocation
+        # probes are mocked, not the compile command whose contract we check.
+        # This catches regressions even on a default-PIE development machine.
+        fixtures = (
+            ("_gotpcrelx_relax_test", "-fPIE"),
+            ("_gotpcrel_edges_test", "-fPIE"),
+            ("_got64_spelling_matrix_test", "-fPIE"),
+            ("_absolute_symbols_pic_test", "-fPIE"),
+            ("_ie_to_le_forms_test", "-fPIE"),
+            ("_movrs_relocations_test", "-fPIE"),
+            ("_plain_gotpcrel_test", "-fPIE"),
+            ("_so_bound_ifunc_test", "-fPIE"),
+            ("_cxx_eh_local_type_test", "-fPIC"),
+        )
+        for fixture, flag in fixtures:
+            with self.subTest(fixture=fixture):
+                commands = []
+
+                def fake_sh(command, **kwargs):
+                    compiling_main = command[0] in ("unit-cc", "unit-cxx") and any(
+                        source in command for source in ("m.c", "main.c", "lt.cpp"))
+                    if compiling_main:
+                        commands.append(command)
+                    output = (b"R_X86_64_GOTPCREL \n" * 7 +
+                              b"R_X86_64_IRELATIVE\n" * 2)
+                    return SimpleNamespace(returncode=int(compiling_main),
+                                           stdout=output, stderr=b"compile stopped")
+
+                args = SimpleNamespace(lccc="/not-executed/lccc", keep=False)
+                with patch.object(HARNESS, "CC", "unit-cc"), \
+                     patch.object(HARNESS, "CXX", "unit-cxx"), \
+                     patch.object(HARNESS, "sh", side_effect=fake_sh), \
+                     patch.object(HARNESS, "_assembler_variants",
+                                  return_value=[("unit-as", ["unit-as"])]):
+                    result = getattr(HARNESS, fixture)(args, [])
+                self.assertNotEqual(result.status, "PASS")
+                self.assertEqual(len(commands), 1)
+                self.assertIn(flag, commands[0])
+                self.assertNotIn("-fno-pie", commands[0])
 
 
 if __name__ == "__main__":

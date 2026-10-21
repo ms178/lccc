@@ -19,11 +19,11 @@ fn count(cx: &Context<'_>, operand: Operand, ty: IrType) -> Option<(IrUnaryOp, O
 fn uses(cx: &Context<'_>, operand: Operand, expected: u32) -> bool {
     matches!(operand, Operand::Value(v) if cx.uses.get(v.0 as usize) == Some(&expected))
 }
-fn nonzero(op: IrUnaryOp) -> IrUnaryOp {
+fn nonzero(op: IrUnaryOp) -> Option<IrUnaryOp> {
     match op {
-        IrUnaryOp::Clz | IrUnaryOp::ClzNonZero => IrUnaryOp::ClzNonZero,
-        IrUnaryOp::Ctz | IrUnaryOp::CtzNonZero => IrUnaryOp::CtzNonZero,
-        _ => unreachable!("count matcher admits only zero counts"),
+        IrUnaryOp::Clz | IrUnaryOp::ClzNonZero => Some(IrUnaryOp::ClzNonZero),
+        IrUnaryOp::Ctz | IrUnaryOp::CtzNonZero => Some(IrUnaryOp::CtzNonZero),
+        _ => None,
     }
 }
 pub(super) fn fold(
@@ -70,6 +70,7 @@ pub(super) fn fold(
         let Some((op, x)) = count(cx, a, *ty) else {
             continue;
         };
+        let nonzero_op = nonzero(op)?;
         // Both occurrences must belong to this comparison/select network.
         // A shared scan or comparison would make a second scan extra work.
         if !uses(cx, a, 2) {
@@ -80,10 +81,10 @@ pub(super) fn fold(
             if op != other_op || !uses(cx, b, 2) {
                 continue;
             }
-            let proven_nonzero = op == nonzero(op)
+            let proven_nonzero = op == nonzero_op
                 || cx.known(x, *ty, facts, 8).1 != 0
                 || cx.known(y, *ty, facts, 8).1 != 0;
-            (y, if proven_nonzero { nonzero(op) } else { op })
+            (y, if proven_nonzero { nonzero_op } else { op })
         } else if let Some(cap) = const_in_ring(b, width) {
             // In particular reject negative signed constants and width-sized
             // shifts. Leading counts need width-1-cap, NOT width-cap.
@@ -95,7 +96,7 @@ pub(super) fn fold(
             } else {
                 cap
             };
-            (constant(1u64 << bit, *ty), nonzero(op))
+            (constant(1u64 << bit, *ty), nonzero_op)
         } else {
             continue;
         };

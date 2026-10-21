@@ -206,3 +206,18 @@ fn shared_mixed_maximum_and_invalid_caps_are_refused() {
     }
     assert!(rewrite(&width, None).is_none());
 }
+
+#[test]
+fn nonzero_refinement_refuses_other_unary_operators() {
+    for (input, output) in [
+        (IrUnaryOp::Clz, IrUnaryOp::ClzNonZero),
+        (IrUnaryOp::ClzNonZero, IrUnaryOp::ClzNonZero),
+        (IrUnaryOp::Ctz, IrUnaryOp::CtzNonZero),
+        (IrUnaryOp::CtzNonZero, IrUnaryOp::CtzNonZero),
+    ] {
+        assert_eq!(nonzero(input), Some(output));
+    }
+    for op in [IrUnaryOp::Neg, IrUnaryOp::Not, IrUnaryOp::Popcount] {
+        assert_eq!(nonzero(op), None);
+    }
+}

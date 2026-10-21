@@ -13,15 +13,17 @@ static int add3(int a, int b, int c)
   return a + b * 2 + c * 3;
 }
 
+/* GCC's apply API takes a generic void-function pointer, not add3's
+ * concrete signature. The saved argument block supplies the actual ABI. */
 static int forward(int a, int b, int c)
 {
-  void *r = __builtin_apply(add3, __builtin_apply_args(), 24);
+  void *r = __builtin_apply((void (*)())add3, __builtin_apply_args(), 24);
   __builtin_return(r);
 }
 
 static int forward_zero(int a, int b, int c)
 {
-  void *r = __builtin_apply(add3, __builtin_apply_args(), 24);
+  void *r = __builtin_apply((void (*)())add3, __builtin_apply_args(), 24);
   __builtin_return(r);
 }
 

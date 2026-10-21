@@ -73,7 +73,7 @@ class FailureAnnotationContracts(unittest.TestCase):
         result = self._run_mocked_provisioning(script, install, qemu)
 
         self.assertEqual(result.returncode, 23, result.stdout + result.stderr)
-        self.assertIn("GCC 16 / i686 provisioning failed", result.stdout)
+        self.assertIn("::error title=GCC 16 multilib provisioning::", result.stdout)
         self.assertIn("synthetic 100%25 failure%0Asecond line", result.stdout)
         self.assertNotIn("synthetic qemu provisioning success", result.stdout)
 
