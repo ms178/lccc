@@ -445,6 +445,15 @@ pub enum IntrinsicOp {
     VecSqrtF32x8,
     /// Vector square root: %dest_vec = sqrt(%src_vec) - SSE2 4×F32.
     VecSqrtF32x4,
+    /// Packed directed/dynamic rounding. Register form is `[vector, imm8]`;
+    /// a directly folded stream load is `[base, index, imm8]` or
+    /// `[base, index, displacement, imm8]`.
+    /// The immediate has the same ROUNDPS/ROUNDPD meaning as the scalar
+    /// RoundScalar family, preserving floor/ceil/trunc/rint/nearbyint modes.
+    VecRoundF64x4,
+    VecRoundF64x2,
+    VecRoundF32x8,
+    VecRoundF32x4,
     /// Packed FP bitwise XOR: %dest_vec = args[0] ^ args[1] per lane BIT
     /// (`vxorps`). Commutative, pure, and — crucially — NOT an FP compare
     /// or arithmetic op: it does not signal, canonicalise NaNs, or merge
@@ -1792,8 +1801,8 @@ impl IntrinsicOp {
             | LoadF64x4 | LoadI32x8 | AddF64x4 | MulF64x4 | AddI32x8
             | VecLoadF64x4 | VecLoadI32x8 | VecAddF64x4 | VecMulF64x4 | VecFmaF64x4 | VecMaddF64x4 | VecMaddF64x4Signed(..) | VecBroadcastF64x4 | VecAddI32x8 | VecMulI32x8 | VecBroadcastI32x8 | VecMaxI32x8
             | VecPackssdwI16x16 | VecSubI32x8 | VecAndI32x8 | VecOrI32x8 | VecXorI32x8
-            | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4 | VecXorF64x4
-            | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8 | VecXorF32x8
+            | VecSubF64x4 | VecDivF64x4 | VecSqrtF64x4 | VecRoundF64x4 | VecXorF64x4
+            | VecSubF32x8 | VecDivF32x8 | VecSqrtF32x8 | VecRoundF32x8 | VecXorF32x8
             | VecZeroF64x4 | VecZeroI32x8 | VecLoadF32x8 | VecAddF32x8
             | VecMulF32x8 | VecFmaF32x8 | VecMaddF32x8 | VecMaddF32x8Signed(..)
             | VecBroadcastF32x8 | VecZeroF32x8
@@ -1897,9 +1906,9 @@ impl IntrinsicOp {
             | FmaF64x2 | LoadF64x2 | LoadI32x4 | AddF64x2 | MulF64x2
             | AddI32x4 | VecLoadF64x2 | VecLoadI32x4 | VecAddF64x2
             | VecMulF64x2 | VecBroadcastF64x2 | VecAddI32x4 | VecZeroF64x2
-            | VecSubF64x2 | VecDivF64x2 | VecSqrtF64x2 | VecXorF64x2
+            | VecSubF64x2 | VecDivF64x2 | VecSqrtF64x2 | VecRoundF64x2 | VecXorF64x2
             | VecZeroI32x4 | VecLoadF32x4 | VecAddF32x4 | VecMulF32x4 | VecBroadcastF32x4 | VecZeroF32x4
-            | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4 | VecXorF32x4
+            | VecSubF32x4 | VecDivF32x4 | VecSqrtF32x4 | VecRoundF32x4 | VecXorF32x4
             | VecMinF32x4 | VecMaxF32x4 | VecCmpF32x4 | VecBlendvF32x4
             | VecMinF64x2 | VecMaxF64x2 | VecCmpF64x2 | VecBlendvF64x2
             | VecFmaF64x2 | VecFnmaF64x2 | VecFmaF32x4 | VecFnmaF32x4
@@ -2298,6 +2307,8 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecDivF64x2
                 | IntrinsicOp::VecSqrtF64x4
                 | IntrinsicOp::VecSqrtF64x2
+                | IntrinsicOp::VecRoundF64x4
+                | IntrinsicOp::VecRoundF64x2
                 | IntrinsicOp::VecXorF64x4
                 | IntrinsicOp::VecXorF64x2
                 | IntrinsicOp::VecBroadcastF64x4
@@ -2310,6 +2321,8 @@ impl IntrinsicOp {
                 | IntrinsicOp::VecDivF32x4
                 | IntrinsicOp::VecSqrtF32x8
                 | IntrinsicOp::VecSqrtF32x4
+                | IntrinsicOp::VecRoundF32x8
+                | IntrinsicOp::VecRoundF32x4
                 | IntrinsicOp::VecXorF32x8
                 | IntrinsicOp::VecXorF32x4
                 | IntrinsicOp::VecWidenAddI32x4ToI64x2
@@ -2681,6 +2694,10 @@ mod vector_width_tests {
             "VecSqrtF32x8" => IntrinsicOp::VecSqrtF32x8,
             "VecSqrtF64x2" => IntrinsicOp::VecSqrtF64x2,
             "VecSqrtF64x4" => IntrinsicOp::VecSqrtF64x4,
+            "VecRoundF32x4" => IntrinsicOp::VecRoundF32x4,
+            "VecRoundF32x8" => IntrinsicOp::VecRoundF32x8,
+            "VecRoundF64x2" => IntrinsicOp::VecRoundF64x2,
+            "VecRoundF64x4" => IntrinsicOp::VecRoundF64x4,
             "VecXorF32x4" => IntrinsicOp::VecXorF32x4,
             "VecXorF32x8" => IntrinsicOp::VecXorF32x8,
             "VecXorF64x2" => IntrinsicOp::VecXorF64x2,

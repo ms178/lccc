@@ -1590,6 +1590,7 @@ jobs:
         bash tests/regression/check_fma_gating.sh
         bash tests/regression/check_fma_dest_coalesce_codegen.sh
         bash tests/regression/check_vector_remainder_codegen.sh
+        bash tests/regression/check_vectorize_round_maps.sh
         bash tests/regression/check_fma_matcher_guards.sh
         bash tests/regression/check_redundant_test_elimination.sh
         # Escaped-local frame addresses stay direct operands, direct -c

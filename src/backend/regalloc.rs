@@ -8202,6 +8202,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecDivF32x8
                     | O::VecXorF32x8
                     | O::VecSqrtF32x8
+                    | O::VecRoundF32x8
                     | O::VecMaddF32x8
                     | O::VecMaddF32x8Signed(..)
                     | O::VecCmpF32x8
@@ -8217,6 +8218,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecDivF64x4
                     | O::VecXorF64x4
                     | O::VecSqrtF64x4
+                    | O::VecRoundF64x4
                     | O::VecMaddF64x4
                     | O::VecMaddF64x4Signed(..)
                     | O::VecCmpF64x4
@@ -8290,6 +8292,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecSubF32x4
                     | O::VecDivF32x4
                     | O::VecSqrtF32x4
+                    | O::VecRoundF32x4
                     | O::VecCmpF32x4
                     | O::VecBlendvF32x4
                     | O::VecMinF32x4
@@ -8302,6 +8305,7 @@ fn collect_x86_map_broadcast_values(func: &IrFunction) -> FxHashSet<u32> {
                     | O::VecSubF64x2
                     | O::VecDivF64x2
                     | O::VecSqrtF64x2
+                    | O::VecRoundF64x2
                     | O::VecCmpF64x2
                     | O::VecBlendvF64x2
                     | O::VecMinF64x2
@@ -8515,6 +8519,7 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecDivF32x8
         | O::VecXorF32x8
         | O::VecSqrtF32x8
+        | O::VecRoundF32x8
         | O::VecMaddF32x8
                 | O::VecMaddF32x8Signed(..)
         | O::VecCmpF32x8
@@ -8533,6 +8538,7 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecDivF64x4
         | O::VecXorF64x4
         | O::VecSqrtF64x4
+        | O::VecRoundF64x4
         | O::VecMaddF64x4
                 | O::VecMaddF64x4Signed(..)
         | O::VecCmpF64x4
@@ -8547,6 +8553,7 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecDivF32x4
         | O::VecXorF32x4
         | O::VecSqrtF32x4
+        | O::VecRoundF32x4
         | O::VecCmpF32x4
         | O::VecBlendvF32x4
         | O::VecMinF32x4
@@ -8570,6 +8577,7 @@ fn x86_map_intrinsic_class(op: &crate::ir::intrinsics::IntrinsicOp) -> Option<u8
         | O::VecDivF64x2
         | O::VecXorF64x2
         | O::VecSqrtF64x2
+        | O::VecRoundF64x2
         | O::VecCmpF64x2
         | O::VecBlendvF64x2
         | O::VecMinF64x2
@@ -8758,6 +8766,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                 O::VecSubF32x8
                     | O::VecDivF32x8
                     | O::VecSqrtF32x8
+                    | O::VecRoundF32x8
                     | O::VecMaddF32x8
                     | O::VecMaddF32x8Signed(..)
                     | O::VecCmpF32x8
@@ -8778,6 +8787,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                 O::VecSubF64x4
                     | O::VecDivF64x4
                     | O::VecSqrtF64x4
+                    | O::VecRoundF64x4
                     | O::VecMaddF64x4
                     | O::VecMaddF64x4Signed(..)
                     | O::VecCmpF64x4
@@ -8796,6 +8806,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                 O::VecSubF32x4
                     | O::VecDivF32x4
                     | O::VecSqrtF32x4
+                    | O::VecRoundF32x4
                     | O::VecCmpF32x4
                     | O::VecBlendvF32x4
                     | O::VecMinF32x4
@@ -8816,6 +8827,7 @@ fn collect_x86_map_intermediate_values(func: &IrFunction) -> FxHashSet<u32> {
                 O::VecSubF64x2
                     | O::VecDivF64x2
                     | O::VecSqrtF64x2
+                    | O::VecRoundF64x2
                     | O::VecCmpF64x2
                     | O::VecBlendvF64x2
                     | O::VecMinF64x2

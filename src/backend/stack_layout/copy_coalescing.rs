@@ -2079,6 +2079,14 @@ fn is_vec_ssa_producer(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::VecDivF64x4
             | O::VecDivF32x4
             | O::VecDivF32x8
+            | O::VecSqrtF64x2
+            | O::VecSqrtF64x4
+            | O::VecSqrtF32x4
+            | O::VecSqrtF32x8
+            | O::VecRoundF64x2
+            | O::VecRoundF64x4
+            | O::VecRoundF32x4
+            | O::VecRoundF32x8
             // W5: the FP-Neg sign-mask Xor composite (try_emit_fpxor_
             // sign_mask consumes args[0] via vec_home_256/128 →
             // avx_load_arg/sse_load_arg — never a raw slot read), the
