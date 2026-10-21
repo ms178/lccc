@@ -224,3 +224,30 @@ fn duplicate_inlined_coefficients_compare_structurally_not_by_load_address() {
         assert_eq!(run(&mut f), 0);
     }
 }
+
+#[test]
+fn neg_and_select_preserve_trailing_zeros() {
+    for ty in [IrType::I32, IrType::I64] {
+        let mut f = function(
+            ty,
+            vec![
+                bin(1, IrBinOp::Shl, v(0), c(3, ty), ty),
+                Instruction::UnaryOp {
+                    dest: Value(2),
+                    op: crate::ir::ops::IrUnaryOp::Neg,
+                    src: v(1),
+                    ty,
+                },
+                Instruction::Select {
+                    dest: Value(4),
+                    cond: v(0),
+                    true_val: v(2),
+                    false_val: c(24, ty),
+                    ty,
+                },
+                bin(3, IrBinOp::SDiv, v(4), c(8, ty), ty),
+            ],
+        );
+        assert_eq!(run(&mut f), 1);
+    }
+}

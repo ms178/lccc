@@ -311,6 +311,39 @@ impl RiscvCodegen {
             {
                 self.used_callee_saved.retain(|&reg| reg != old);
             }
+            // In the dominant single-load return shape (`GlobalAddr` -> `Load`
+            // -> `Return`), the address dies at the load and the loaded 64-bit
+            // scalar is returned directly in a0. Home the load destination in
+            // a0 too so it neither claims a callee-saved register nor forces a
+            // full s0 frame over the minimal ra-only frame.
+            if func.blocks.len() == 1
+                && let [
+                    crate::ir::reexports::Instruction::GlobalAddr { dest: ga_dest, .. },
+                    crate::ir::reexports::Instruction::Load {
+                        dest: load_dest,
+                        ptr,
+                        ty,
+                        ..
+                    },
+                ] = func.blocks[0].instructions.as_slice()
+                && ga_dest.0 == dest
+                && ptr.0 == dest
+                && matches!(ty, IrType::I64 | IrType::U64 | IrType::Ptr)
+                && matches!(
+                    func.blocks[0].terminator,
+                    crate::ir::reexports::Terminator::Return(Some(
+                        crate::ir::reexports::Operand::Value(ret_val)
+                    )) if ret_val.0 == load_dest.0
+                )
+            {
+                let old_load = self.reg_assignments.insert(load_dest.0, a0);
+                reg_assigned.insert(load_dest.0, a0);
+                if let Some(old_load) = old_load
+                    && !self.reg_assignments.values().any(|&reg| reg == old_load)
+                {
+                    self.used_callee_saved.retain(|&reg| reg != old_load);
+                }
+            }
         }
 
         self.state.ra_accumulator_values =

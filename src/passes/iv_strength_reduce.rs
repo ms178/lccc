@@ -1694,7 +1694,10 @@ fn find_derived_exprs(
                     };
                     if let Some(idx) = find_iv(v.0) {
                         (*dest, *ty, idx, 1i64 << shift, 0)
-                    } else if let Some((idx, k)) = find_affine(v.0, *ty) {
+                    } else if compare_recurrence::enabled()
+                        && shift > 3
+                        && let Some((idx, k)) = find_affine(v.0, *ty)
+                    {
                         (*dest, *ty, idx, 1i64 << shift, k)
                     } else {
                         continue;

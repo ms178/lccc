@@ -3153,7 +3153,22 @@ fn try_partial_unroll_two_block(
                 }
             )
         });
-        if !has_load || (!has_store && reduction.is_none()) {
+        let has_seg_access = work.iter().any(|inst| {
+            matches!(
+                inst,
+                Instruction::Load {
+                    volatile: false,
+                    seg_override,
+                    ..
+                }
+                | Instruction::Store {
+                    volatile: false,
+                    seg_override,
+                    ..
+                } if *seg_override != crate::common::types::AddressSpace::Default
+            )
+        });
+        if (!has_load || (!has_store && reduction.is_none())) && !has_seg_access {
             return false;
         }
     }

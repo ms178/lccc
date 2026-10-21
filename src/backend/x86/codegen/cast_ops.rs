@@ -361,6 +361,9 @@ impl X86Codegen {
         if self.try_record_pending_widen(dest, src, from_ty, to_ty) {
             return;
         }
+        if self.try_emit_zext_loaded_cast(dest, src, from_ty, to_ty) {
+            return;
+        }
         // PF-16b: widening casts of Clz/Ctz/Popcount results (bit31
         // provably zero, upper bits zeroed by the 32-bit write itself)
         // take the UNSIGNED path: zero-extension equals the required
@@ -447,6 +450,54 @@ impl X86Codegen {
 
         // Fall through to default implementation for all other cases
         crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
+    }
+
+    fn try_emit_zext_loaded_cast(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    ) -> bool {
+        let Operand::Value(v) = src else { return false };
+        if !self.zext_loaded_values.contains(&v.0)
+            || from_ty.is_signed()
+            || from_ty.is_float()
+            || from_ty.size() > 4
+            || to_ty.is_float()
+            || to_ty.size() < from_ty.size()
+            || is_i128_type(to_ty)
+        {
+            return false;
+        }
+        let (Some(&d_reg), Some(&s_reg)) = (
+            self.reg_assignments.get(&dest.0),
+            self.reg_assignments.get(&v.0),
+        ) else {
+            return false;
+        };
+        if super::emit::is_xmm_reg(d_reg)
+            || super::emit::is_xmm_reg(s_reg)
+            || self.fresh_home_of(v.0) != Some(s_reg)
+        {
+            return false;
+        }
+        if d_reg != s_reg {
+            if to_ty.size() == 8 {
+                let s64 = super::emit::phys_reg_name(s_reg);
+                let d64 = super::emit::phys_reg_name(d_reg);
+                self.state
+                    .emit_fmt(format_args!("    movq %{}, %{}", s64, d64));
+            } else {
+                let s32 = phys_reg_name_32(s_reg);
+                let d32 = phys_reg_name_32(d_reg);
+                self.state
+                    .emit_fmt(format_args!("    movl %{}, %{}", s32, d32));
+            }
+        }
+        self.zext_loaded_values.insert(dest.0);
+        self.note_inplace_compute(d_reg, dest.0);
+        true
     }
 
     /// Try to emit a scalar F64/F32 cast keeping FP values in XMM registers
@@ -586,6 +637,14 @@ impl X86Codegen {
                     _ => {
                         self.operand_to_callee_reg(src, dest_phys);
                     }
+                }
+            } else if matches!(src, Operand::Value(v) if self.zext_loaded_values.contains(&v.0))
+                && ft.size() <= 4
+            {
+                if src_reg != dest_phys {
+                    let src_64 = phys_reg_name(src_reg);
+                    self.state
+                        .emit_fmt(format_args!("    movq %{}, %{}", src_64, dest_64));
                 }
             } else {
                 match ft.size() {
@@ -753,6 +812,12 @@ impl X86Codegen {
         for slot in 0..2 {
             if let Some(p) = self.pending_widen[slot].take() {
                 self.emit_int_widen_move(&p.src, p.from_ty, p.dest_phys);
+                if !p.from_ty.is_signed()
+                    && p.from_ty.size() <= 4
+                    && matches!(p.src, Operand::Value(v) if self.zext_loaded_values.contains(&v.0))
+                {
+                    self.zext_loaded_values.insert(p.dest);
+                }
                 // Definition-writes-home accounting: the deferred widening
                 // move IS the cast dest's definition into its home.
                 self.note_inplace_compute(p.dest_phys, p.dest);

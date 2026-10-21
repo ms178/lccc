@@ -1028,7 +1028,7 @@ impl super::InstructionEncoder {
     }
 
     /// EVEX 2-source binary op, AT&T (src, vvvv, dst) with optional mask on dst.
-    /// Encodings verified byte-for-byte against GNU as 2.42 (see LCCC_ENGINEERING
+    /// Encodings verified byte-for-byte against GNU as 2.42 (see engineering/
     /// PLAN_PART3 WP-A; reference bytes captured from `as` on 2026-08-12).
     /// Example: vpaddd %zmm2, %zmm1, %zmm0  ->  62 f1 75 48 fe c2
     ///          vpmaddubsw %zmm2,%zmm1,%zmm0{%k1}{z} -> 62 f2 75 c9 04 c2

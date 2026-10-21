@@ -2685,6 +2685,7 @@ fn build_coalesce_groups(
     // a register (the cast emits nothing) — the strict non-overlap check that
     // guards general Copy coalescing does not apply.
     let mut same_value_edges: FxHashSet<(u32, u32)> = FxHashSet::default();
+    let mut coalesce_edges: Vec<(u32, u32)> = Vec::new();
     // Phi-web detection: a Copy whose DEST feeds a Phi (loop-latch / switch-arm
     // state transport) or whose SRC is a Phi result moves a bit-IDENTICAL
     // value — the same SSA renaming argument as the no-op casts above, so the
@@ -2718,8 +2719,15 @@ fn build_coalesce_groups(
         }
         root
     }
+    let mut has_calls = false;
     for block in &func.blocks {
         for inst in &block.instructions {
+            if matches!(
+                inst,
+                Instruction::Call { .. } | Instruction::CallIndirect { .. }
+            ) {
+                has_calls = true;
+            }
             if let Instruction::Phi { dest, incoming, .. } = inst {
                 phi_dests.insert(dest.0);
                 for (op, _) in incoming {
@@ -2853,6 +2861,7 @@ fn build_coalesce_groups(
                 {
                     parent.entry(d).or_insert(d);
                     parent.entry(s).or_insert(s);
+                    coalesce_edges.push((d, s));
                     let rd = find(&mut parent, d);
                     let rs = find(&mut parent, s);
                     if rd != rs {
@@ -2939,6 +2948,7 @@ fn build_coalesce_groups(
                 {
                     parent.entry(d).or_insert(d);
                     parent.entry(s).or_insert(s);
+                    coalesce_edges.push((d, s));
                     let rd = find(&mut parent, d);
                     let rs = find(&mut parent, s);
                     if rd != rs {
@@ -3021,12 +3031,42 @@ fn build_coalesce_groups(
             }
         }
         if accepted.len() > 1 {
-            let rep = if accepted.contains(&leader) {
-                leader
+            if !has_calls {
+                let accepted_set: FxHashSet<u32> = accepted.iter().copied().collect();
+                let mut comp_parent: FxHashMap<u32, u32> =
+                    accepted.iter().map(|&v| (v, v)).collect();
+                for &(d, s) in &coalesce_edges {
+                    if accepted_set.contains(&d) && accepted_set.contains(&s) {
+                        let rd = find(&mut comp_parent, d);
+                        let rs = find(&mut comp_parent, s);
+                        if rd != rs {
+                            comp_parent.insert(rs, rd);
+                        }
+                    }
+                }
+                let mut comps: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+                for &v in &accepted {
+                    let r = find(&mut comp_parent, v);
+                    comps.entry(r).or_default().push(v);
+                }
+                for (_, comp) in comps {
+                    if comp.len() > 1 {
+                        let rep = if comp.contains(&leader) {
+                            leader
+                        } else {
+                            comp[0]
+                        };
+                        result.insert(rep, comp);
+                    }
+                }
             } else {
-                accepted[0]
-            };
-            result.insert(rep, accepted);
+                let rep = if accepted.contains(&leader) {
+                    leader
+                } else {
+                    accepted[0]
+                };
+                result.insert(rep, accepted);
+            }
         }
     }
 
@@ -10585,6 +10625,58 @@ fn source_home_survives_dest_redefs(
     true
 }
 
+fn terminator_targets_label(term: &Terminator, label: crate::ir::reexports::BlockId) -> bool {
+    match term {
+        Terminator::Branch(target) => *target == label,
+        Terminator::CondBranch {
+            true_label,
+            false_label,
+            ..
+        } => *true_label == label || *false_label == label,
+        Terminator::Switch { cases, default, .. } => {
+            *default == label || cases.iter().any(|&(_, t)| t == label)
+        }
+        Terminator::IndirectBranch {
+            possible_targets, ..
+        } => possible_targets.contains(&label),
+        Terminator::Return(_) | Terminator::Unreachable => false,
+    }
+}
+
+fn single_pred_chain_blocks(
+    preds: &analysis::FlatAdj,
+    liveness: &LivenessResult,
+    source_block: usize,
+    copy_block: usize,
+) -> Option<Vec<usize>> {
+    if source_block == copy_block {
+        return None;
+    }
+    let min_depth = liveness
+        .block_loop_depth
+        .get(copy_block)
+        .copied()
+        .unwrap_or(0);
+    let mut mids = Vec::new();
+    let mut cur = copy_block;
+    while preds.len(cur) == 1 && mids.len() <= 4 {
+        let p = preds.row(cur)[0] as usize;
+        if liveness.block_loop_depth.get(p).copied().unwrap_or(0) < min_depth {
+            return None;
+        }
+        if p == source_block {
+            mids.reverse();
+            return Some(mids);
+        }
+        if p == copy_block || mids.contains(&p) {
+            return None;
+        }
+        mids.push(p);
+        cur = p;
+    }
+    None
+}
+
 fn phi_window_clobbers_caller_saved(func: &IrFunction, cand: &PhiCoalesceCandidate) -> bool {
     let Some(copy_block) = func.blocks.get(cand.block_idx) else {
         return false;
@@ -10605,10 +10697,35 @@ fn phi_window_clobbers_caller_saved(func: &IrFunction, cand: &PhiCoalesceCandida
             .iter()
             .any(instruction_clobbers_caller_saved)
     } else {
-        src_block.instructions[cand.source_def_idx + 1..]
+        if src_block.instructions[cand.source_def_idx + 1..]
             .iter()
             .chain(copy_block.instructions[..cand.copy_idx].iter())
             .any(instruction_clobbers_caller_saved)
+        {
+            return true;
+        }
+        if !terminator_targets_label(&src_block.terminator, copy_block.label) {
+            let label_to_idx = analysis::build_label_map(func);
+            let (preds, _) = analysis::build_cfg(func, &label_to_idx);
+            let mut cur = cand.block_idx;
+            let mut steps = 0usize;
+            while cur != cand.source_block_idx && preds.len(cur) == 1 && steps <= 4 {
+                let p = preds.row(cur)[0] as usize;
+                if p == cand.source_block_idx {
+                    break;
+                }
+                if func.blocks[p]
+                    .instructions
+                    .iter()
+                    .any(instruction_clobbers_caller_saved)
+                {
+                    return true;
+                }
+                cur = p;
+                steps += 1;
+            }
+        }
+        false
     }
 }
 
@@ -11332,16 +11449,13 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
             // (and anything derived from it before the update) may not be
             // observed after the source's definition along ANY path out of
             // the source block, not merely along the latch.
-            let pred_is_unique = !same_block
-                && preds.len(block_idx) == 1
-                && preds.row(block_idx)[0] as usize == source_block
-                // Do not coalesce a preheader/init definition into a loop phi:
-                // the source must be born on the same loop-carried path, not
-                // before the loop. Backedge PRE's branch-separated latch shape
-                // has equal loop depth for source and copy blocks; the
-                // 20041011-1 torture failure exposed the preheader case.
-                && liveness.block_loop_depth.get(source_block).copied().unwrap_or(0)
-                    >= liveness.block_loop_depth.get(block_idx).copied().unwrap_or(0);
+            let mid_blocks = if !same_block {
+                single_pred_chain_blocks(&preds, liveness, source_block, block_idx)
+            } else {
+                None
+            };
+            let pred_is_unique = mid_blocks.is_some();
+            let mid_blocks = mid_blocks.unwrap_or_default();
             // Part 2 proves its predecessor structure in `detect_part2_chain`
             // (`u`'s block is a pred of the copy block and every other pred
             // carries the passthrough), so it bypasses this gate; the
@@ -11364,6 +11478,11 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
             } else {
                 func.blocks[source_block].instructions[source_def_idx + 1..]
                     .iter()
+                    .chain(
+                        mid_blocks
+                            .iter()
+                            .flat_map(|&m| func.blocks[m].instructions.iter()),
+                    )
                     .chain(block.instructions[..copy_idx].iter())
                     .any(|middle| uses_value(middle, dest.0))
             };
@@ -11397,12 +11516,27 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
                 let derived = derived_before(src_blk, source_def_idx, dest.0);
                 let read_in_tail = src_blk.instructions[source_def_idx + 1..]
                     .iter()
+                    .chain(
+                        mid_blocks
+                            .iter()
+                            .flat_map(|&m| func.blocks[m].instructions.iter()),
+                    )
                     .chain(block.instructions[..copy_idx].iter())
                     .any(|middle| derived.iter().any(|&v| uses_value(middle, v)));
-                let read_by_terminator = terminator_uses(&src_blk.terminator, &derived);
+                let read_by_terminator = terminator_uses(&src_blk.terminator, &derived)
+                    || mid_blocks
+                        .iter()
+                        .any(|&m| terminator_uses(&func.blocks[m].terminator, &derived));
+                let first_hop = mid_blocks.first().copied().unwrap_or(block_idx);
                 let phi_escapes =
                     succs.row(source_block).iter().any(|&s| {
-                        s as usize != block_idx && liveness.is_live_in(s as usize, dest.0)
+                        s as usize != first_hop && liveness.is_live_in(s as usize, dest.0)
+                    }) || mid_blocks.iter().enumerate().any(|(i, &m)| {
+                        let next_hop = mid_blocks.get(i + 1).copied().unwrap_or(block_idx);
+                        liveness.is_live_in(m, dest.0)
+                            || succs.row(m).iter().any(|&s| {
+                                s as usize != next_hop && liveness.is_live_in(s as usize, dest.0)
+                            })
                     }) || liveness.is_live_in(block_idx, dest.0);
                 let derived_escapes = derived
                     .iter()
@@ -11495,6 +11629,11 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
                 windows
                     .iter()
                     .any(|&(lo, hi)| lo <= hi && pts.iter().any(|&p| lo <= p && p <= hi))
+                    || mid_blocks.iter().any(|&m| {
+                        let lo = liveness.block_starts[m];
+                        let hi = liveness.block_ends[m];
+                        pts.iter().any(|&p| lo <= p && p <= hi)
+                    })
             });
             let source_used_before_copy = !same_block
                 && block.instructions[..copy_idx]
@@ -15503,5 +15642,89 @@ mod scalar_lane_class_tests {
                 "an int constant copy stays GPR-eligible"
             );
         }
+    }
+
+    #[test]
+    fn phi_coalesce_admits_two_hop_short_circuit_latch_chain() {
+        use crate::ir::reexports::IrCmpOp;
+        // Rotated `while ((b & 0x80) != 0 && i < 5)` latch chain:
+        // Block 1 (body) computes `i_next = i + 1` and branches to Block 2 (`i < 5`)
+        // or Block 4 (exit); Block 2 branches to Block 3 (split latch copy `i = i_next`)
+        // or Block 4 (exit). Block 3 has single-pred chain `1 -> 2 -> 3`.
+        let mut f = IrFunction::new("varint_latch".into(), IrType::U32, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(10),
+                src: Operand::Const(IrConst::I32(2)),
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(11),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(10)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::U32,
+                },
+                Instruction::Cmp {
+                    dest: Value(12),
+                    op: IrCmpOp::Ne,
+                    lhs: Operand::Value(Value(11)),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::U32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(12)),
+                true_label: BlockId(2),
+                false_label: BlockId(4),
+            },
+            source_spans: vec![],
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![Instruction::Cmp {
+                dest: Value(13),
+                op: IrCmpOp::Ult,
+                lhs: Operand::Value(Value(11)),
+                rhs: Operand::Const(IrConst::I32(5)),
+                ty: IrType::U32,
+            }],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(13)),
+                true_label: BlockId(3),
+                false_label: BlockId(4),
+            },
+            source_spans: vec![],
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![Instruction::Copy {
+                dest: Value(10),
+                src: Operand::Value(Value(11)),
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        f.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(11)))),
+            source_spans: vec![],
+        });
+        f.next_value_id = 14;
+        let liveness = compute_live_intervals(&f);
+        let cands = detect_phi_coalesce_groups(&f, &liveness);
+        assert!(
+            cands
+                .iter()
+                .any(|c| c.phi_dest == 10 && c.backedge_src == 11),
+            "expected (10, 11) phi coalesce across 2-hop latch chain, got {cands:?}"
+        );
     }
 }

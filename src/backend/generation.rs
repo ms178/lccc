@@ -1439,7 +1439,12 @@ fn build_indexed_gep_map(
                 // outright (+60 static instructions against -18 on x86-64):
                 // every fold extends the SIB index's live interval and ILP32 has
                 // six general registers.
-                } if val_ty.get(&v.0) == Some(&from_ty)
+                } if (val_ty.get(&v.0) == Some(&from_ty)
+                    || (val_ty.get(&v.0).is_none()
+                        && from_ty.size() == 8
+                        && to_ty.size() == 8
+                        && !from_ty.is_float()
+                        && !to_ty.is_float()))
                     && from_ty.cast_preserves_integer_value(*to_ty) =>
                 {
                     id = v.0;
@@ -1813,18 +1818,69 @@ fn build_indexed_gep_map(
     // the GEP's emission is skipped and its offset chain declared dead.
     {
         let mut access: FxHashMap<u32, (Vec<IrType>, bool)> = FxHashMap::default();
+        let mut postinc_long_store: FxHashSet<u32> = FxHashSet::default();
         for block in &func.blocks {
-            for inst in &block.instructions {
-                let (ptr, ty, is_store) = match inst {
-                    Instruction::Load { ptr, ty, .. } => (ptr, ty, false),
-                    Instruction::Store { ptr, ty, .. } => (ptr, ty, true),
+            let mut gep_pos: FxHashMap<u32, usize> = FxHashMap::default();
+            let mut def_pos: FxHashMap<u32, usize> = FxHashMap::default();
+            for (idx, inst) in block.instructions.iter().enumerate() {
+                if let Some(d) = inst.dest() {
+                    def_pos.insert(d.0, idx);
+                }
+                if let Instruction::GetElementPtr { dest, .. } = inst {
+                    gep_pos.insert(dest.0, idx);
+                }
+                let (ptr, ty, is_store, is_default_seg) = match inst {
+                    Instruction::Load {
+                        ptr,
+                        ty,
+                        seg_override,
+                        ..
+                    } => (
+                        ptr,
+                        ty,
+                        false,
+                        *seg_override == crate::common::types::AddressSpace::Default,
+                    ),
+                    Instruction::Store {
+                        ptr,
+                        ty,
+                        seg_override,
+                        ..
+                    } => (
+                        ptr,
+                        ty,
+                        true,
+                        *seg_override == crate::common::types::AddressSpace::Default,
+                    ),
                     _ => continue,
                 };
+                if is_store && is_default_seg {
+                    if let (Some(&gp), Some(info)) = (gep_pos.get(&ptr.0), map.get(&ptr.0)) {
+                        if idx > gp + 2
+                            && block.instructions[(idx + 1)..].iter().any(|later| {
+                                matches!(
+                                    later,
+                                    Instruction::Copy {
+                                        dest,
+                                        src: Operand::Value(ar),
+                                    } if dest.0 == info.index.0
+                                        && def_pos.get(&ar.0).is_some_and(|&ap| ap < gp)
+                                )
+                            })
+                        {
+                            postinc_long_store.insert(ptr.0);
+                        }
+                    }
+                }
                 let e = access.entry(ptr.0).or_insert_with(|| (Vec::new(), false));
                 e.0.push(*ty);
                 e.1 |= is_store;
             }
         }
+        map.retain(|dest, _| {
+            !(postinc_long_store.contains(dest)
+                && access.get(dest).is_some_and(|(tys, _)| tys.len() == 1))
+        });
         for (dest, info) in map.iter_mut() {
             if let Some((tys, feeds_store)) = access.get(dest) {
                 info.access_tys = tys.clone();
@@ -7486,7 +7542,7 @@ pub(crate) fn collect_bitop_nonneg_values(func: &IrFunction) -> FxHashSet<u32> {
             });
         }
     }
-    let mut nonneg = FxHashSet::default();
+    let mut nonneg = crate::passes::integer_bounds::nonneg_i32_values(func);
     let mut worklist: Vec<usize> = (0..candidates.len()).rev().collect();
     while let Some(index) = worklist.pop() {
         let (inst, dest) = candidates[index];

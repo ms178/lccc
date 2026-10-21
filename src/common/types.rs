@@ -936,8 +936,9 @@ impl StructLayoutBuilder {
     ) -> (usize, usize) {
         let natural_align = field.type_align.unwrap_or_else(|| field.ty.align_ctx(ctx));
         let field_align = if field.is_packed {
-            // Per-field __attribute__((packed)) forces alignment to 1
-            1
+            // Per-field __attribute__((packed)) forces alignment to 1 unless an
+            // explicit aligned(N) / _Alignas(N) attribute also sets floor alignment.
+            field.alignment.unwrap_or(1)
         } else if let Some(explicit) = field.alignment {
             // Explicit _Alignas/aligned raises alignment, overrides struct-level packing
             natural_align.max(explicit)
@@ -1159,12 +1160,8 @@ impl StructLayoutBuilder {
     /// Finalize the layout: account for trailing bitfield and padding.
     fn finalize(mut self) -> StructLayout {
         if self.in_bitfield {
-            if self.is_packed_1 {
-                let total_bits = (self.bf_unit_offset * 8) as u32 + self.bf_bit_pos;
-                self.offset = (total_bits as usize).div_ceil(8);
-            } else {
-                self.offset = self.bf_unit_offset + self.bf_unit_size;
-            }
+            let total_bits = (self.bf_unit_offset * 8) as u32 + self.bf_bit_pos;
+            self.offset = (total_bits as usize).div_ceil(8);
         }
 
         let size = align_up(self.offset, self.max_align);
@@ -1189,7 +1186,7 @@ fn field_contributes_user_align(
     ctx: &dyn StructLayoutProvider,
 ) -> bool {
     if field.is_packed {
-        return false;
+        return field.alignment.is_some();
     }
     // A typedef-level `aligned` sets TYPE_USER_ALIGN on the typedef'd type.
     if field.type_align.is_some() {
@@ -1361,7 +1358,7 @@ impl StructLayout {
             if let Some(bw) = field.bit_width {
                 if bw == 0 {
                     b.layout_zero_width_bitfield(field_align);
-                } else if b.is_packed_1 {
+                } else if b.is_packed_1 || field.is_packed {
                     b.layout_packed_bitfield(field, bw, field_size);
                 } else {
                     b.layout_standard_bitfield(field, bw, field_size, field_align);
@@ -1394,8 +1391,9 @@ impl StructLayout {
             let natural_align = field.type_align.unwrap_or_else(|| field.ty.align_ctx(ctx));
             // Per-field alignment handling
             let field_align = if field.is_packed {
-                // Per-field __attribute__((packed)) forces alignment to 1
-                1
+                // Per-field __attribute__((packed)) forces alignment to 1 unless an
+                // explicit aligned(N) / _Alignas(N) attribute also sets floor alignment.
+                field.alignment.unwrap_or(1)
             } else if let Some(explicit) = field.alignment {
                 // Explicit alignment attribute overrides packing
                 natural_align.max(explicit)
@@ -4317,5 +4315,69 @@ mod conditional_type_tests {
                 Some(a)
             );
         }
+    }
+
+    #[test]
+    fn packed_and_aligned_field_honors_explicit_floor_alignment() {
+        let ctx: super::FxHashMap<String, super::RcLayout> = Default::default();
+        let fields = vec![
+            super::StructField {
+                name: "c".into(),
+                ty: CType::Char,
+                bit_width: None,
+                alignment: None,
+                type_align: None,
+                is_packed: false,
+                base_volatile: false,
+                object_volatile: false,
+            },
+            super::StructField {
+                name: "d".into(),
+                ty: CType::Double,
+                bit_width: None,
+                alignment: Some(2),
+                type_align: None,
+                is_packed: true,
+                base_volatile: false,
+                object_volatile: false,
+            },
+        ];
+        let layout = super::StructLayout::for_struct_with_packing(&fields, None, &ctx, false);
+        assert_eq!(layout.align, 2);
+        assert_eq!(layout.size, 10);
+        assert_eq!(layout.fields[1].offset, 2);
+        assert!(layout.user_align);
+    }
+
+    #[test]
+    fn per_field_packed_bitfield_and_pragma_pack_bitfield_size_match_gcc() {
+        let ctx: super::FxHashMap<String, super::RcLayout> = Default::default();
+        let packed_bf = vec![super::StructField {
+            name: "a".into(),
+            ty: CType::UInt,
+            bit_width: Some(4),
+            alignment: None,
+            type_align: None,
+            is_packed: true,
+            base_volatile: false,
+            object_volatile: false,
+        }];
+        let l1 = super::StructLayout::for_struct_with_packing(&packed_bf, None, &ctx, false);
+        assert_eq!(l1.align, 1);
+        assert_eq!(l1.size, 1);
+
+        let pack2_bf = vec![super::StructField {
+            name: "a".into(),
+            ty: CType::UInt,
+            bit_width: Some(4),
+            alignment: None,
+            type_align: None,
+            is_packed: false,
+            base_volatile: false,
+            object_volatile: false,
+        }];
+        let l2 = super::StructLayout::for_struct_with_packing(&pack2_bf, Some(2), &ctx, false);
+        assert_eq!(l2.align, 2);
+        assert_eq!(l2.size, 2);
     }
 }

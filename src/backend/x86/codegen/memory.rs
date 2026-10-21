@@ -115,6 +115,11 @@ impl X86Codegen {
         };
         match ty {
             IrType::I64 | IrType::U64 | IrType::Ptr => true,
+            IrType::U32 | IrType::U16 | IrType::U8
+                if self.zext_loaded_values.contains(&index.0) =>
+            {
+                true
+            }
             IrType::I32 | IrType::U32 | IrType::I16 | IrType::U16 | IrType::I8 | IrType::U8 => {
                 let r64 = phys_reg_name(reg);
                 let instr = match ty {
@@ -1905,6 +1910,10 @@ impl X86Codegen {
                                         self.fold_skip_cast = Some(fold_dest);
                                         self.note_inplace_compute(fr, fold_dest);
                                     } else {
+                                        if use_32bit_dest && matches!(ty, IrType::U8 | IrType::U16)
+                                        {
+                                            self.zext_loaded_values.insert(dest.0);
+                                        }
                                         self.note_inplace_compute(d_reg, dest.0);
                                     }
                                     return;
@@ -1963,6 +1972,9 @@ impl X86Codegen {
                                     self.fold_skip_cast = Some(fold_dest);
                                     self.note_inplace_compute(fr, fold_dest);
                                 } else {
+                                    if u && matches!(ty, IrType::U8 | IrType::U16) {
+                                        self.zext_loaded_values.insert(dest.0);
+                                    }
                                     self.note_inplace_compute(dr, dest.0);
                                 }
                                 return;
@@ -2018,6 +2030,9 @@ impl X86Codegen {
                                 self.fold_skip_cast = Some(fold_dest);
                                 self.note_inplace_compute(fr, fold_dest);
                             } else {
+                                if use_32bit_dest && matches!(ty, IrType::U8 | IrType::U16) {
+                                    self.zext_loaded_values.insert(dest.0);
+                                }
                                 self.note_inplace_compute(d_reg, dest.0);
                             }
                             return;
@@ -2293,6 +2308,10 @@ impl X86Codegen {
                 };
                 self.state
                     .emit_fmt(format_args!("    {} {}, %{}", load_instr, mem, d_name));
+                if use_32bit_dest {
+                    self.zext_loaded_values.insert(dest.0);
+                }
+                self.note_inplace_compute(d_reg, dest.0);
                 self.state.reg_cache.invalidate_acc();
                 return true;
             }

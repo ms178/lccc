@@ -1695,42 +1695,35 @@ impl X86Codegen {
             } else if reg64 == "rax" {
                 self.state.reg_cache.invalidate_acc();
             }
-            if c.is_zero() {
+            // CG-07r: Only all-zero bit patterns may materialize via `movl $0`.
+            // IEEE-754 negative zero (-0.0f / -0.0) and non-canonical decimal
+            // zeros have non-zero sign/exponent bits that `c.is_zero()` ignores.
+            if c.is_all_zero_bits() {
                 // PF-16: movl $0 writes the same canonical value (zero-extend)
                 // two bytes shorter; neither form touches flags.
-                self.state.emit_fmt(format_args!(
-                    "    movl $0, %{}",
-                    super::emit::reg_name_to_32(&reg64)
-                ));
+                self.state.emit_fmt(format_args!("    movl $0, %{}", reg32));
                 return;
             }
+            let emit_int_imm = |this: &mut Self, v: i64| {
+                if v >= 0 && v <= i32::MAX as i64 {
+                    this.state.out.emit_instr_imm_reg("    movl", v, reg32);
+                } else if v >= i32::MIN as i64 && v < 0 {
+                    this.state.out.emit_instr_imm_reg("    movq", v, reg64);
+                } else {
+                    this.state.out.emit_instr_imm_reg("    movabsq", v, reg64);
+                }
+            };
             match c {
-                IrConst::I8(v) => {
-                    self.state
-                        .out
-                        .emit_instr_imm_reg("    movq", *v as i64, reg64);
-                }
-                IrConst::I16(v) => {
-                    self.state
-                        .out
-                        .emit_instr_imm_reg("    movq", *v as i64, reg64);
-                }
-                IrConst::I32(v) => {
-                    self.state
-                        .out
-                        .emit_instr_imm_reg("    movq", *v as i64, reg64);
-                }
-                IrConst::I64(v) => {
-                    if *v >= i32::MIN as i64 && *v <= i32::MAX as i64 {
-                        self.state.out.emit_instr_imm_reg("    movq", *v, reg64);
-                    } else {
-                        self.state.out.emit_instr_imm_reg("    movabsq", *v, reg64);
-                    }
-                }
+                IrConst::I8(v) => emit_int_imm(self, *v as i64),
+                IrConst::I16(v) => emit_int_imm(self, *v as i64),
+                IrConst::I32(v) => emit_int_imm(self, *v as i64),
+                IrConst::I64(v) => emit_int_imm(self, *v),
                 IrConst::F32(v) => {
+                    // PF-16: 5-byte `movl` into the 32-bit sub-register avoids
+                    // 10-byte `movabsq` whenever bit 31 (sign bit) is set.
                     self.state
                         .out
-                        .emit_instr_imm_reg("    movq", v.to_bits() as i64, reg64);
+                        .emit_instr_imm_reg("    movl", v.to_bits() as i32 as i64, reg32);
                 }
                 IrConst::F64(v) => {
                     self.state
@@ -1746,31 +1739,20 @@ impl X86Codegen {
                 IrConst::D32(v) => {
                     self.state
                         .out
-                        .emit_instr_imm_reg("    movq", *v as i64, reg64);
+                        .emit_instr_imm_reg("    movl", *v as i32 as i64, reg32);
                 }
                 IrConst::D64(v) => {
                     self.state
                         .out
                         .emit_instr_imm_reg("    movabsq", *v as i64, reg64);
                 }
-                IrConst::I128(v) => {
-                    let low = *v as i64;
-                    if low >= i32::MIN as i64 && low <= i32::MAX as i64 {
-                        self.state.out.emit_instr_imm_reg("    movq", low, reg64);
-                    } else {
-                        self.state.out.emit_instr_imm_reg("    movabsq", low, reg64);
-                    }
-                }
+                IrConst::I128(v) => emit_int_imm(self, *v as i64),
                 IrConst::Zero => {
                     // PF-16: movl $0 writes the same canonical value (zero-extend)
                     // two bytes shorter; neither form touches flags.
-                    self.state.emit_fmt(format_args!(
-                        "    movl $0, %{}",
-                        super::emit::reg_name_to_32(&reg64)
-                    ));
+                    self.state.emit_fmt(format_args!("    movl $0, %{}", reg32));
                 }
             }
-            let _ = reg32;
             return;
         }
         if reg64 == "rcx" {
@@ -2499,5 +2481,36 @@ mod tests {
         let s = scan_n(vec![fcmp, sel(10), sel(11)], 2, false);
         assert!(!s.replay.contains_key(&7));
         assert!(!s.fp_select.contains_key(&7));
+    }
+
+    #[test]
+    fn select_operand_to_reg_preserves_negative_zero_and_uses_movl_for_32bit_consts() {
+        let mut cg = crate::backend::x86::codegen::emit::X86Codegen::new();
+        cg.select_operand_to_reg(&Operand::Const(IrConst::F64(-0.0)), "rax", "eax");
+        cg.select_operand_to_reg(&Operand::Const(IrConst::F32(-0.0)), "rcx", "ecx");
+        cg.select_operand_to_reg(&Operand::Const(IrConst::F32(-1.0)), "rdx", "edx");
+        cg.select_operand_to_reg(&Operand::Const(IrConst::I32(42)), "rsi", "esi");
+        cg.select_operand_to_reg(&Operand::Const(IrConst::F64(0.0)), "rdi", "edi");
+        let asm = cg.state.out.buf.as_str();
+        assert!(
+            asm.contains("movabsq $-9223372036854775808, %rax"),
+            "F64(-0.0) must preserve sign bit via movabsq, got:\n{asm}"
+        );
+        assert!(
+            asm.contains("movl $-2147483648, %ecx"),
+            "F32(-0.0) must preserve sign bit via movl, got:\n{asm}"
+        );
+        assert!(
+            asm.contains("movl $-1082130432, %edx"),
+            "F32(-1.0) must use 5-byte movl instead of movabsq, got:\n{asm}"
+        );
+        assert!(
+            asm.contains("movl $42, %esi"),
+            "positive I32(42) must use 5-byte movl, got:\n{asm}"
+        );
+        assert!(
+            asm.contains("movl $0, %edi"),
+            "F64(+0.0) must use movl $0, got:\n{asm}"
+        );
     }
 }

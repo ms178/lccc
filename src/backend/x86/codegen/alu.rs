@@ -581,104 +581,89 @@ impl X86Codegen {
             return false;
         }
         let dest8 = super::emit::typed_phys_reg_name(dest_phys, IrType::U8);
-        // Put the base into the destination first; BT reads the base and
-        // writes only CF. The index must go to %rcx after this, so it does
-        // not matter whether the base and index source registers alias.
-        match base {
+        let own_idx_reg = match index {
+            Operand::Value(v) => self
+                .reg_assignments
+                .get(&v.0)
+                .copied()
+                .filter(|r| !super::emit::is_xmm_reg(*r)),
+            _ => None,
+        };
+        // BT only reads the base and writes CF. When the base already lives in
+        // a GPR, read it in place without copying into dest_phys first; when
+        // the base is a constant or homeless value and the bit index lives in
+        // dest_phys, stage the base in %rax so the index register stays intact.
+        let base_w: &'static str = match base {
             Operand::Value(v) => {
-                // An XMM-homed base (bit-punned float word) has no GPR
-                // sub-register names; route it through the accumulator arm
-                // below, whose operand_to_rax performs the xmm->GPR movq
-                // (glibc s_nextupf: BitTest on GET_FLOAT_WORD's value).
                 if let Some(&reg) = self
                     .reg_assignments
                     .get(&v.0)
                     .filter(|r| !super::emit::is_xmm_reg(**r))
                 {
-                    let src64 = super::emit::phys_reg_name(reg);
-                    if src64 != dest64 {
-                        if use_32bit {
-                            let src32 = super::emit::phys_reg_name_32(reg);
-                            let dest32 = super::emit::phys_reg_name_32(dest_phys);
-                            self.state
-                                .emit_fmt(format_args!("    movl %{src32}, %{dest32}"));
-                        } else {
-                            self.state
-                                .emit_fmt(format_args!("    movq %{src64}, %{dest64}"));
-                        }
+                    if use_32bit {
+                        super::emit::phys_reg_name_32(reg)
+                    } else {
+                        super::emit::phys_reg_name(reg)
                     }
                 } else {
-                    // An adjacent producer may deliberately live only in the
-                    // allocator-owned accumulator location. `value_to_reg`
-                    // bypasses that cache and hard-fails for such a value;
-                    // consume through the normal operand path first, then copy
-                    // into BT's chosen result register. The canonical
-                    // `(x & y) >> bit & 1` handoff exercises this at -O1+.
                     self.operand_to_rax(base);
-                    if use_32bit {
+                    if own_idx_reg == Some(dest_phys) {
+                        if use_32bit { "eax" } else { "rax" }
+                    } else if use_32bit {
                         let dest32 = super::emit::phys_reg_name_32(dest_phys);
                         self.state
                             .emit_fmt(format_args!("    movl %eax, %{dest32}"));
+                        dest32
                     } else {
                         self.state
                             .emit_fmt(format_args!("    movq %rax, %{dest64}"));
+                        dest64
                     }
                 }
             }
-            Operand::Const(_) => self.operand_to_reg(base, dest64),
-        }
+            Operand::Const(_) => {
+                if own_idx_reg == Some(dest_phys) {
+                    self.operand_to_rax(base);
+                    if use_32bit { "eax" } else { "rax" }
+                } else {
+                    self.operand_to_reg(base, dest64);
+                    if use_32bit {
+                        super::emit::phys_reg_name_32(dest_phys)
+                    } else {
+                        dest64
+                    }
+                }
+            }
+        };
         let const_index = match index {
             Operand::Const(c) => c
                 .to_i64()
                 .filter(|v| *v >= i32::MIN as i64 && *v <= i32::MAX as i64),
             _ => None,
         };
-        // BT's base operand must be spelled at the instruction's width: a
-        // 32-bit `btl` names `%r8d`, never `%r8`.  The old `btl $31, %r8`
-        // was accepted by the builtin assembler (which encoded the intended
-        // 32-bit form) but GAS 2.44 rejects it ("incorrect register `%r8'
-        // used with `l' suffix") — every `-fno-integrated-as` / `.s`-oracle
-        // build of a BitTest died.
-        let dest_w = if use_32bit {
-            super::emit::phys_reg_name_32(dest_phys)
-        } else {
-            dest64
-        };
         if let Some(imm) = const_index {
             let width = if use_32bit { 32 } else { 64 };
             let bit = (imm as u32) % width;
             let bt = if use_32bit { "btl" } else { "btq" };
             self.state
-                .emit_fmt(format_args!("    {bt} ${bit}, %{dest_w}"));
+                .emit_fmt(format_args!("    {bt} ${bit}, %{base_w}"));
         } else {
-            // BT's bit index is an ordinary r/m operand — it has no fixed
-            // count register (that restriction belongs to variable shifts,
-            // which use %cl).  Consume the index's own register directly when
-            // it has one; only a home-less value needs %rcx staging.  The old
-            // unconditional `movq %rN, %rcx; btl %ecx, %dest` paid a copy plus
-            // a partial-register dependency per classify (Expat name scan).
             let bt = if use_32bit { "btl" } else { "btq" };
-            let own_reg = match index {
-                Operand::Value(v) => self.reg_assignments.get(&v.0).copied(),
-                _ => None,
-            };
-            match own_reg {
-                // The base was just staged into dest, so an index sharing
-                // dest's register is clobbered — stage those via %rcx.
-                Some(reg) if !super::emit::is_xmm_reg(reg) && reg != dest_phys => {
+            match own_idx_reg {
+                Some(reg) => {
                     let idx = if use_32bit {
                         super::emit::phys_reg_name_32(reg)
                     } else {
                         super::emit::phys_reg_name(reg)
                     };
                     self.state
-                        .emit_fmt(format_args!("    {bt} %{idx}, %{dest_w}"));
+                        .emit_fmt(format_args!("    {bt} %{idx}, %{base_w}"));
                 }
-                _ => {
+                None => {
                     self.operand_to_rcx(index);
                     let src = if use_32bit { "ecx" } else { "rcx" };
                     self.state
-                        .emit_fmt(format_args!("    {bt} %{src}, %{dest_w}"));
+                        .emit_fmt(format_args!("    {bt} %{src}, %{base_w}"));
                 }
             }
         }

@@ -17,7 +17,11 @@ pub(crate) fn run(f: &mut IrFunction) -> usize {
             Instruction::Load { ptr, .. } | Instruction::Store { ptr, .. } => {
                 addressed[ptr.0 as usize] = true
             }
-            Instruction::GetElementPtr { base, .. } => addressed[base.0 as usize] = true,
+            Instruction::GetElementPtr {
+                base,
+                offset: Operand::Const(_),
+                ..
+            } => addressed[base.0 as usize] = true,
             _ => {}
         }
     }
@@ -154,5 +158,23 @@ mod tests {
             src: Operand::Const(IrConst::I64(0)),
         });
         assert_eq!(run(&mut f), 0);
+    }
+    #[test]
+    fn preserves_variable_offset_gep_base_for_reg_off_sym_fold() {
+        let mut f = function(IrType::U64, IrType::Ptr, false);
+        f.blocks[0].instructions[3] = Instruction::GetElementPtr {
+            dest: Value(3),
+            base: Value(2),
+            offset: Operand::Value(Value(1)),
+            ty: IrType::Ptr,
+        };
+        assert_eq!(run(&mut f), 0);
+        f.blocks[0].instructions[3] = Instruction::GetElementPtr {
+            dest: Value(3),
+            base: Value(2),
+            offset: Operand::Const(IrConst::I64(4)),
+            ty: IrType::Ptr,
+        };
+        assert_eq!(run(&mut f), 1);
     }
 }

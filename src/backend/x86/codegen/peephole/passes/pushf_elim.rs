@@ -11,7 +11,7 @@
 //! This pass is deliberately conservative: it only removes a pair when every
 //! instruction between them is provably flag-neutral. It never reorders,
 //! never removes conditional branches, and never touches anything it cannot
-//! prove safe. It runs on every compilation (independent of `CCC_PEEPHOLE`).
+//! prove safe. It runs on every compilation (independent of `CCC_NO_PEEPHOLE`).
 
 /// Whether one line of the window is provably unable to modify the
 /// arithmetic/flag bits `cmovcc`/`setcc` read (OF/SF/ZF/AF/CF/PF).

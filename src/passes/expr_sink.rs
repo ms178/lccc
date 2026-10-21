@@ -342,7 +342,7 @@ fn blocks_before_first_target(
     let mut backward = FxHashSet::default();
     let mut stack = vec![to];
     while let Some(block) = stack.pop() {
-        if !backward.insert(block) {
+        if !backward.insert(block) || block == from {
             continue;
         }
         for &pred in preds.row(block) {
@@ -1441,5 +1441,27 @@ mod tests {
         assert_eq!(sink_expressions(&mut function), 0);
         assert!(has_dest(&function.blocks[0], 2));
         assert!(has_dest(&function.blocks[0], 3));
+    }
+
+    #[test]
+    fn backward_walk_stops_at_from_block() {
+        let func = function(vec![
+            block(
+                0,
+                vec![],
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I32(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(1, vec![], Terminator::Branch(BlockId(2))),
+            block(2, vec![], Terminator::Branch(BlockId(0))),
+        ]);
+        let cfg = analysis::CfgAnalysis::build(&func);
+        let region = blocks_before_first_target(&cfg.succs, &cfg.preds, 3, 0, 1);
+        assert!(region.contains(&0));
+        assert!(region.contains(&1));
+        assert!(!region.contains(&2));
     }
 }

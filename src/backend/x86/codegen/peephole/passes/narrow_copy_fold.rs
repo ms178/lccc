@@ -385,15 +385,25 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
         // whose only consumer is `movb %r9b, …` folds the store straight
         // onto `%dil`, which is exactly the shape GCC emits for byte
         // truncation stores).
-        let (rule_width, sfam, dfam) =
-            if let Some((width, sfam, dfam)) = parse_reg_to_reg_mov(trimmed) {
-                (width, sfam, dfam)
-            } else if let Some((sw, sfam, dfam)) = parse_reg_to_reg_ext(trimmed) {
-                (sw, sfam, dfam)
-            } else {
-                continue;
-            };
-        if sfam == dfam || is_frame_family(sfam) || is_frame_family(dfam) {
+        let (rule_width, sfam, dfam, is_ext) = if let Some((width, sfam, dfam)) =
+            parse_reg_to_reg_mov(trimmed)
+        {
+            let eff_width =
+                if width == W32 && super::relay_and_lea::upper32_zero_at(store, infos, i, sfam) {
+                    W64
+                } else {
+                    width
+                };
+            (eff_width, sfam, dfam, false)
+        } else if let Some((sw, sfam, dfam)) = parse_reg_to_reg_ext(trimmed) {
+            (sw, sfam, dfam, true)
+        } else {
+            continue;
+        };
+        if sfam == dfam
+            || (is_frame_family(sfam) && !(is_ext && sfam == 5))
+            || is_frame_family(dfam)
+        {
             continue;
         }
         if get_dest_reg(&infos[i]) != dfam {
@@ -611,6 +621,8 @@ enum CopybackProducer<'a> {
     /// redirected form becomes `addq $N, %D`; otherwise it is a plain
     /// destination redirect `leaq $N(%B), %D`.
     Lea { disp: &'a str, base: RegId },
+    /// `leaq MEM, %T` with a multi-register SIB operand (e.g. `(%rdx, %r9, 1)`).
+    LeaMem { mem: &'a str },
 }
 
 /// Parse the producer line for a copy-back fold.
@@ -628,7 +640,7 @@ fn parse_copyback_producer(trimmed: &str) -> Option<(CopybackProducer<'_>, RegId
         .or(trimmed.strip_prefix("movl "))
     {
         let is_q = trimmed.starts_with("movq ");
-        let (src, dst) = rest.split_once(',')?;
+        let (src, dst) = rest.rsplit_once(',')?;
         let src = src.trim();
         let dst = dst.trim();
         // Memory source only (register copies are fold_register_copies'
@@ -648,7 +660,7 @@ fn parse_copyback_producer(trimmed: &str) -> Option<(CopybackProducer<'_>, RegId
         return Some((CopybackProducer::Load { is_q, mem: src }, fam));
     }
     if let Some(rest) = trimmed.strip_prefix("leaq ") {
-        let (src, dst) = rest.split_once(',')?;
+        let (src, dst) = rest.rsplit_once(',')?;
         let dst = dst.trim();
         let fam = plain_reg_family(dst)?;
         if dst != REG_NAMES[W64][fam as usize] {
@@ -664,9 +676,11 @@ fn parse_copyback_producer(trimmed: &str) -> Option<(CopybackProducer<'_>, RegId
         }
         let disp = src[..open].trim();
         let base_str = &src[open + 1..src.len() - 1];
-        let base_str = base_str.split(',').next().unwrap_or(base_str).trim();
-        let base = plain_reg_family(base_str)?;
-        return Some((CopybackProducer::Lea { disp, base }, fam));
+        if !base_str.contains(',') {
+            let base = plain_reg_family(base_str.trim())?;
+            return Some((CopybackProducer::Lea { disp, base }, fam));
+        }
+        return Some((CopybackProducer::LeaMem { mem: src }, fam));
     }
     None
 }
@@ -859,6 +873,7 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
         // Barrier/CFC lines also end the window (the copy must stay in
         // the same straight-line region as its producer).
         let mut pre_uses: Vec<usize> = Vec::new();
+        let mut d_read_before_copy = false;
         let mut j = i + 1;
         let mut clean = true;
         while j < c {
@@ -874,8 +889,14 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
             let mentions_t = infos[j].reg_refs & t_bit != 0;
             let mentions_d = infos[j].reg_refs & d_bit != 0;
             if mentions_d {
-                clean = false;
-                break;
+                if matches!(producer, CopybackProducer::Lea { base, .. } if base == d_fam)
+                    && !writes_family(&infos[j], line, d_fam)
+                {
+                    d_read_before_copy = true;
+                } else {
+                    clean = false;
+                    break;
+                }
             }
             if mentions_t {
                 if writes_family(&infos[j], line, t_fam)
@@ -890,7 +911,7 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
             }
             j += 1;
         }
-        if !clean {
+        if !clean || (d_read_before_copy && !pre_uses.is_empty()) {
             continue;
         }
 
@@ -993,6 +1014,9 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
                     )
                 }
             }
+            CopybackProducer::LeaMem { mem } => {
+                format!("    leaq {}, {}", mem, REG_NAMES[W64][d_fam as usize])
+            }
         };
         // Pre-compute every use's rewritten form first: a use that mentions
         // %T in a spelling the width renaming cannot express (or that the
@@ -1024,8 +1048,22 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
         let Some(rewritten_uses) = plan_copyback_rewrites(store, infos, &all_uses, &t_names) else {
             continue;
         };
-        replace_line(store, &mut infos[i], i, new_producer);
-        mark_nop(&mut infos[c]);
+        if d_read_before_copy {
+            let CopybackProducer::Lea { disp, .. } = &producer else {
+                continue;
+            };
+            mark_nop(&mut infos[i]);
+            let d64 = REG_NAMES[W64][d_fam as usize];
+            replace_line(
+                store,
+                &mut infos[c],
+                c,
+                format!("    leaq {disp}({d64}), {d64}"),
+            );
+        } else {
+            replace_line(store, &mut infos[i], i, new_producer);
+            mark_nop(&mut infos[c]);
+        }
         for (j, rw) in rewritten_uses {
             replace_line(store, &mut infos[j], j, format!("    {}", rw.trim_start()));
         }

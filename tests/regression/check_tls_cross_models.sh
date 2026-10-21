@@ -74,6 +74,21 @@ sed -n '/^external_address:/,/^\.size external_address/p' "$TD/riscv64-dyn.s" >"
 if grep -Eq '\b(sd|ld) s0,|addi s0,' "$rv_dyn_addr"; then
     bad 'RISC-V one-resolver address path regressed to an unnecessary frame pointer'
 fi
+rv_dyn_load="$TD/riscv64-dyn-load.s"
+sed -n '/^external_load:/,/^\.size external_load/p' "$TD/riscv64-dyn.s" >"$rv_dyn_load"
+if grep -Eq '\b(sd|ld) s[0-9]+,|addi s0,' "$rv_dyn_load"; then
+    bad 'RISC-V one-resolver load path regressed to an unnecessary frame pointer or callee-saved spill'
+fi
+arm_dyn_load="$TD/aarch64-dyn-load.s"
+sed -n '/^external_load:/,/^\.size external_load/p' "$TD/aarch64-dyn.s" >"$arm_dyn_load"
+if grep -Eq '\b(str|ldr|stp|ldp) x19' "$arm_dyn_load"; then
+    bad 'AArch64 one-resolver load path saved an unused callee-saved register'
+fi
+arm_dyn_store="$TD/aarch64-dyn-store.s"
+sed -n '/^external_store:/,/^\.size external_store/p' "$TD/aarch64-dyn.s" >"$arm_dyn_store"
+if grep -Eq '\bx20\b' "$arm_dyn_store"; then
+    bad 'AArch64 one-resolver store path saved an unused second callee-saved register'
+fi
 
 # --- Static register discipline: linker-free, so it always runs --------------
 # Both frame optimizations are selected from IR alone, so a regression surfaces

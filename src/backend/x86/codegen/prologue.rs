@@ -893,6 +893,7 @@ impl X86Codegen {
         // zero, so their widening casts and SIB index uses can take the
         // unsigned (movl) path (see collect_bitop_nonneg_values).
         self.bitop_nonneg_values = crate::backend::generation::collect_bitop_nonneg_values(func);
+        self.zext_loaded_values.clear();
 
         // ── Value type map, use counts and Cmp→consumer flag fusion ──────
         //

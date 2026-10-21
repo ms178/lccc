@@ -976,6 +976,9 @@ pub struct X86Codegen {
     /// Membership is per-definition — derived values (adds etc. on top of
     /// a bitop result can wrap negative) are deliberately NOT propagated.
     pub(super) bitop_nonneg_values: FxHashSet<u32>,
+    /// Values whose GPR home was written by a 32-bit zero-extending indexed load
+    /// (`movzbl`, `movzwl`, `movl`), leaving bits 8..63 / 16..63 / 32..63 zeroed.
+    pub(super) zext_loaded_values: FxHashSet<u32>,
     /// Cmp destinations whose result is consumed ONLY by the immediately
     /// following Select/CondBranch (same block, possibly after a flag-neutral
     /// Copy chain): maps the Cmp dest to the chain-end value the consumer
@@ -1486,6 +1489,7 @@ impl X86Codegen {
             implicit_sext_values: FxHashSet::default(),
             signed_i32_defs: FxHashSet::default(),
             bitop_nonneg_values: FxHashSet::default(),
+            zext_loaded_values: FxHashSet::default(),
             fused_cmp_dests: FxHashMap::default(),
             fused_forward_dests: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
@@ -2993,13 +2997,15 @@ impl X86Codegen {
                     IrConst::I32(v) => self.emit_imm_to_gpr(*v as i64, "rax", "eax"),
                     IrConst::I64(v) => self.emit_imm_to_gpr(*v, "rax", "eax"),
                     IrConst::F32(v) => {
-                        let bits = v.to_bits() as u64;
+                        let bits = v.to_bits();
                         if bits == 0 {
                             self.state.emit("    xorl %eax, %eax");
                         } else {
-                            self.state
-                                .out
-                                .emit_instr_imm_reg("    movq", bits as i64, "rax");
+                            self.state.out.emit_instr_imm_reg(
+                                "    movl",
+                                bits as i32 as i64,
+                                "eax",
+                            );
                         }
                     }
                     IrConst::F64(v) => {
@@ -4050,13 +4056,15 @@ impl X86Codegen {
                     IrConst::I32(v) => self.emit_imm_to_gpr(*v as i64, "rcx", "ecx"),
                     IrConst::I64(v) => self.emit_imm_to_gpr(*v, "rcx", "ecx"),
                     IrConst::F32(v) => {
-                        let bits = v.to_bits() as u64;
+                        let bits = v.to_bits();
                         if bits == 0 {
                             self.state.emit("    xorl %ecx, %ecx");
                         } else {
-                            self.state
-                                .out
-                                .emit_instr_imm_reg("    movq", bits as i64, "rcx");
+                            self.state.out.emit_instr_imm_reg(
+                                "    movl",
+                                bits as i32 as i64,
+                                "ecx",
+                            );
                         }
                     }
                     IrConst::F64(v) => {
