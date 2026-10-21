@@ -185,11 +185,11 @@ fn copy_chains_are_transparent_without_new_ssa_or_producer_edits() {
     });
     f.next_value_id = 8;
     f.next_label = 1;
-    assert_eq!(recognize_function(&mut f, false, 0, 0, false), 1);
+    assert_eq!(recognize_function(&mut f, false, 0, 0, false, true), 1);
     assert_eq!(
         format!("{:?}", &f.blocks[0].instructions[..5]),
         format!("{:?}", &original[..5])
     );
     assert_eq!(f.next_value_id, 8);
-    assert_eq!(recognize_function(&mut f, false, 0, 0, false), 0);
+    assert_eq!(recognize_function(&mut f, false, 0, 0, false, true), 0);
 }

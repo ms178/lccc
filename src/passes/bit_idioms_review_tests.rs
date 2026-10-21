@@ -400,7 +400,7 @@ fn review_narrow_compare_has_an_observable_semantic_witness() {
     }
     let mut f = g.function(result);
     let before = evaluate(&f, &[0x100000]);
-    recognize_function(&mut f, false, 64, 8, false);
+    recognize_function(&mut f, false, 64, 8, false, true);
     assert_eq!(evaluate(&f, &[0x100000]), before);
 }
 
@@ -451,7 +451,7 @@ fn review_mixed_expansions_keep_coordinates_values_and_spans() {
             .zip(&f.blocks[0].source_spans)
             .map(|(i, s)| (i.dest().unwrap().0, *s))
             .collect();
-        assert!(recognize_function(&mut f, false, 64, 8, false) >= 5);
+        assert!(recognize_function(&mut f, false, 64, 8, false, true) >= 5);
         let b = &f.blocks[0];
         assert_eq!(b.source_spans.len(), b.instructions.len());
         for (i, s) in b.instructions.iter().zip(&b.source_spans) {
@@ -494,7 +494,7 @@ fn review_safe_count_expansions_are_exact_and_idempotent() {
                 }
             }
             let mut f = g.function(result);
-            assert_eq!(recognize_function(&mut f, false, 64, 8, false), 1);
+            assert_eq!(recognize_function(&mut f, false, 64, 8, false, true), 1);
             let ty = if signed { IrType::I32 } else { IrType::U32 };
             assert!(f.blocks[0].instructions.iter().any(|i| i.dest()
                 == match result {
@@ -520,7 +520,7 @@ fn review_safe_count_expansions_are_exact_and_idempotent() {
                 };
                 assert_eq!(evaluate(&f, &[x]), expected as u64);
             }
-            assert_eq!(recognize_function(&mut f, false, 64, 8, false), 0);
+            assert_eq!(recognize_function(&mut f, false, 64, 8, false, true), 0);
         }
     }
 }
@@ -565,7 +565,7 @@ fn review_ctz_accepts_both_condition_polarities_without_peeling_mask_casts() {
         assert!(matches(1, result, &definitions(&g.insts)));
         let mut f = g.function(result);
         let original = f.clone();
-        assert_eq!(recognize_function(&mut f, false, 64, 8, false), 1);
+        assert_eq!(recognize_function(&mut f, false, 64, 8, false, true), 1);
         for x in [0, 1, 0x100, 0x10000, 1 << 32, 1 << 63, u64::MAX] {
             assert_eq!(evaluate(&f, &[x]), evaluate(&original, &[x]));
         }
@@ -594,7 +594,7 @@ fn review_cross_block_mask_pair_survives_expanding_consumer_block() {
         terminator,
     });
     let original = f.clone();
-    assert_eq!(recognize_function(&mut f, false, 64, 8, false), 2);
+    assert_eq!(recognize_function(&mut f, false, 64, 8, false, true), 2);
     for args in [[0, 0], [1 << 63, 0x123456], [0x100, 255]] {
         assert_eq!(evaluate(&f, &args), evaluate(&original, &args));
     }
@@ -641,7 +641,7 @@ fn review_literal_carriers_are_not_arithmetic_masks() {
         let x = if family == 0 { 0x100000 } else { 1u64 << 32 };
         let expected = evaluate(&f, &[x]);
         assert_eq!(expected, 31);
-        recognize_function(&mut f, false, 64, 8, false);
+        recognize_function(&mut f, false, 64, 8, false, true);
         assert_eq!(evaluate(&f, &[x]), expected);
     }
     assert_eq!(
@@ -710,7 +710,7 @@ fn review_count_literals_accept_ring_equivalent_carriers() {
         assert!(matches(family, result, &definitions(&g.insts)));
         let mut f = g.function(result);
         let original = f.clone();
-        assert_eq!(recognize_function(&mut f, false, 64, 8, false), 1);
+        assert_eq!(recognize_function(&mut f, false, 64, 8, false, true), 1);
         for x in [0, 1, 0x100, 1u64 << 31, 1u64 << 32, 1u64 << 63, u64::MAX] {
             assert_eq!(evaluate(&f, &[x]), evaluate(&original, &[x]));
         }
@@ -733,7 +733,7 @@ fn review_narrow_rotate_range_proof_uses_promoted_ring() {
     assert!(match_narrow_rotate(combined, 16, &definitions(&g.insts)).is_none());
     let mut f = g.function(result);
     assert_eq!(evaluate(&f, &[]), 0xffff);
-    recognize_function(&mut f, false, 64, 8, false);
+    recognize_function(&mut f, false, 64, 8, false, true);
     assert_eq!(evaluate(&f, &[]), 0xffff);
 }
 
@@ -768,7 +768,7 @@ fn review_same_condition_selects_preserve_polarity_widths_and_spans() {
             let mut f = g.function(result);
             let original = f.clone();
             assert_eq!(
-                recognize_function(&mut f, false, 64, 8, false),
+                recognize_function(&mut f, false, 64, 8, false, true),
                 usize::from(!unrelated)
             );
             for a in [0, 1, 1u64 << 32, u64::MAX] {
@@ -777,7 +777,7 @@ fn review_same_condition_selects_preserve_polarity_widths_and_spans() {
                 }
             }
             assert_eq!(f.blocks[0].source_spans, original.blocks[0].source_spans);
-            assert_eq!(recognize_function(&mut f, false, 64, 8, false), 0);
+            assert_eq!(recognize_function(&mut f, false, 64, 8, false, true), 0);
         }
     }
     // A low-byte predicate cannot inherit a full-width nonzero proof.
@@ -787,7 +787,7 @@ fn review_same_condition_selects_preserve_polarity_widths_and_spans() {
     let yes = g.sel(truncated, c(7), c(8), IrType::U32);
     let result = g.sel(cond, yes, c(10), IrType::U32);
     let mut f = g.function(result);
-    assert_eq!(recognize_function(&mut f, false, 64, 8, false), 0);
+    assert_eq!(recognize_function(&mut f, false, 64, 8, false, true), 0);
     assert_eq!(evaluate(&f, &[256]), 8);
 }
 
@@ -809,7 +809,7 @@ fn review_crc_cast_distribution_matches_bitvectors_for_xor_or_and_both_roles() {
                 let truncated = g.cast(combined, IrType::U32, narrow);
                 let result = g.cast(truncated, narrow, IrType::U32);
                 let mut f = g.function(result);
-                assert!(recognize_function(&mut f, false, 64, 8, false) > 0);
+                assert!(recognize_function(&mut f, false, 64, 8, false, true) > 0);
                 for wide in [0u64, 1, 127, 255, 256, 65535, 0x8000_0000, 0xffff_ffff] {
                     for small in (0..=255).chain([256, 32768, 65535]).filter(|x| *x <= mask) {
                         let expected = match op {
