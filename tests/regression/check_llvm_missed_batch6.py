@@ -149,6 +149,44 @@ def main():
                         f"{name}: no structural improvement versus {label}: {len(yes)} >= {len(no)}"
                     )
                 print(f"{name}: {len(no)} -> {len(yes)} instructions versus {label}")
+        # Exercise the same scalar contracts on real i686 machine code without
+        # depending on an installed 32-bit libc or conflating ABI entry setup.
+        freestanding = (
+            SOURCE.read_text()
+            .replace(
+                "#include <stdint.h>",
+                "typedef unsigned long long uint64_t;\n"
+                "#define UINT64_C(x) x##ULL\n#define UINT64_MAX (~(uint64_t)0)",
+            )
+            .replace("int main(void)", "int cohort_main(void)")
+        )
+        freestanding += (
+            "\nvoid _start(void) { int code = cohort_main(); "
+            '__asm__ volatile("movl %0, %%ebx; movl $1, %%eax; int $0x80" '
+            ':: "r"(code) : "eax", "ebx"); __builtin_unreachable(); }\n'
+        )
+        narrow = p / "i686.c"
+        narrow.write_text(freestanding)
+        for compiler, settings in [
+            (args.gcc, env),
+            (args.compiler, env),
+            (args.compiler, env | {"CCC_DISABLE_PASSES": "bit_idioms"}),
+        ] + ([(args.baseline, env)] if args.baseline else []):
+            run(
+                [
+                    compiler,
+                    "-m32",
+                    "-O2",
+                    "-nostdlib",
+                    "-static",
+                    "-Wl,-e,_start",
+                    str(narrow),
+                    "-o",
+                    str(p / "i686"),
+                ],
+                env=settings,
+            )
+            run([str(p / "i686")])
         hot = ROOT / "tests/regression/hot_web_callee_saved.c"
         for compiler in [args.gcc] + ([args.clang] if args.clang else []):
             run(

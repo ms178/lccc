@@ -186,5 +186,9 @@ integers with modular output instead of a divider circuit; this distinction is
 recorded per row. This is not a proof of the Rust matcher or emitted machine
 code. Mutation/refusal tests and native differential execution remain separate.
 
-Fresh final-head runtime and hosted status are recorded with the measurement
-report and on the batch-6 PR; earlier-head green checks are not relabeled.
+Final-source measurements and exact-source/binary provenance are in
+[BENCH-006.md](BENCH-006.md), with raw runtime, correctness and static-count
+JSON companions. The 46 original workload binaries remain unchanged against
+latest main. The two synthetic witnesses improve by 7.60% and 4.50% in this VM;
+these are not application or EPYC results. Hosted status is recorded on PR #891;
+earlier-head green checks are not relabeled.

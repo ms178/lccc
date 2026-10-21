@@ -163,3 +163,6 @@ than replace outstanding work with broad claims of optimality.
 See [BATCH-006.md](BATCH-006.md) for the selected ten-report scalar cohort,
 proof/refusal boundaries, executable regressions and x86-64 whole-web
 callee-saved promotion. Existing coverage is not counted as new optimization.
+
+Final-source VM measurements, full-corpus binary-identity controls and exact
+reference limits are in [BENCH-006.md](BENCH-006.md).

@@ -1,0 +1,1698 @@
+{
+  "baseline_commit": "0c4f3929dd75354d80bae881b6d579e2426fe789",
+  "candidate_source_tree": "6beb4dc4e9b67279c67f03dfacd35cc288aec80f",
+  "baseline_source_tree": "4dbce2a2f392acfeb3dba52eb7f4642e756a0b49",
+  "compiler_sha256": {
+    "before": "9fb7e370ab441e4c4fd5f9df86fe01dfeff683cfa867e6bf58bb03a34a9be14a",
+    "lccc": "806862e4fc34133009423d019450a2a54afda66e177e5849c7cd6115e8a1b187"
+  },
+  "fixture_sha256": "61b3223f22e491207442b57dce979109b3144f1c55aaa6e50d32040b0486e94d",
+  "no_steal_wrapper": "CCC_NO_HOT_WEB_STEAL=1 exec /path/to/lccc-current \"$@\"",
+  "workloads": 48,
+  "binary_changed": [
+    "llvm_batch6_scalar",
+    "hot_web_loop"
+  ],
+  "correctness": [
+    {
+      "name": "volatile_reduce",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fa3d6d1c97aede87 c7513ddbe1e9c203\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fa3d6d1c97aede87 c7513ddbe1e9c203\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fa3d6d1c97aede87 c7513ddbe1e9c203\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fa3d6d1c97aede87 c7513ddbe1e9c203\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "56678cd92ae35cbee4d93d33b94fde1d44f61c113341cb1ed42d114650687727",
+        "clang": "06ecb1766fa024df3644f35ccb52b12a266cb90678f3b13b316f54f2bcbe3421",
+        "gcc": "ef4fdb02bb9d5f8875d5dd001be7525bab3f9d5951d01e1cad204c6677303b67",
+        "lccc": "56678cd92ae35cbee4d93d33b94fde1d44f61c113341cb1ed42d114650687727"
+      }
+    },
+    {
+      "name": "llvm_batch6_scalar",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "002dc88fa187f4bd\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "002dc88fa187f4bd\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "002dc88fa187f4bd\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "002dc88fa187f4bd\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "bd18f5f99383eecf22029273aa5b69dbca9b87ec54f39a7b81ca2bf6bb1e5a3f",
+        "clang": "a3f0ef8a31b5bacf5a56a5ea07505469c225552a7fb56aa052d51b245bb8a1ab",
+        "gcc": "c47a580251a94799d78035862514771c13f2bbd8ef74304e31c0a524eecb6965",
+        "lccc": "e430119abfc64cc1545c3815953c9d4cf8293c82f71e9e53d8f995529bb42d85"
+      }
+    },
+    {
+      "name": "hot_web_loop",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "b7ce7f4efe3694a5\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "b7ce7f4efe3694a5\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "b7ce7f4efe3694a5\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "b7ce7f4efe3694a5\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "2af12512e327aac741c577c1a356edd7928047b7fbca5cd4f16e1ecf6726dc91",
+        "clang": "e1ce09a7122002accd1f7612c2c4457a7465da41c897afd3a08c9d1721e47a24",
+        "gcc": "b8a04985aa2762e05ce8b5d56bf01c0ca442d268545bda7cd2aeae13a8d9d8c9",
+        "lccc": "00f1c95d33f978a41074c372afd7cff8d7fdaae06a1f0b6c2e981e9916734dfd"
+      }
+    },
+    {
+      "name": "arith_loop",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "arith_loop result: 1335433016\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "arith_loop result: 1335433016\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "arith_loop result: 1335433016\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "arith_loop result: 1335433016\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "108e736d5a83d7d7971dbada5cf31a0ea557b1056c4fd868439066207c75afe3",
+        "clang": "f2988a3e1686627ccaffa25063a89231a25ec6023150238f257d926f24c36e9e",
+        "gcc": "011b729b5d5336e479a4cd59ab706c294b251f9fc4502cb6e6375be2280a9803",
+        "lccc": "108e736d5a83d7d7971dbada5cf31a0ea557b1056c4fd868439066207c75afe3"
+      }
+    },
+    {
+      "name": "fib",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fib(40) = 102334155\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fib(40) = 102334155\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fib(40) = 102334155\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fib(40) = 102334155\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "1e014036b3ca9a30dafff1f69bd3ce90259e379617c86ab08c348bed98cd1d3f",
+        "clang": "74c01c338aec84c1b4d626d7b191ece37157d0eac4a92d9ac733dd98fd5fd3d7",
+        "gcc": "61649a25f6347ce7e186dbf6bb1fa3b586e65a151fb4c12ffea24bc1b1c2c949",
+        "lccc": "1e014036b3ca9a30dafff1f69bd3ce90259e379617c86ab08c348bed98cd1d3f"
+      }
+    },
+    {
+      "name": "matmul",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "matmul C[128][128] = 19019.7480\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "matmul C[128][128] = 19019.7480\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "matmul C[128][128] = 19019.7480\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "matmul C[128][128] = 19019.7480\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "1fcb79f59e77d597b75019e34897533169fb2b7d7ac94d5742a35fed94b9f4d7",
+        "clang": "02f2a0afdf06f258242cd1d23f9b001e8b414eabe23cf48146a34986d620e47a",
+        "gcc": "b2e9b2b9e5a3fce13f275e1fb52b4743997304a058ac23c2a74a646dcc91ee41",
+        "lccc": "1fcb79f59e77d597b75019e34897533169fb2b7d7ac94d5742a35fed94b9f4d7"
+      }
+    },
+    {
+      "name": "qsort",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "qsort: arr[500000] = 1071022847\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "qsort: arr[500000] = 1071022847\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "qsort: arr[500000] = 1071022847\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "qsort: arr[500000] = 1071022847\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "25cdfa84bcbf705c53d552ee46adf46a57dda546c872b3deb4d4cad13693db50",
+        "clang": "01a834a440603975e7fd5f81cc9511b4da3b2a386428925ad8b365dd0c93484e",
+        "gcc": "18275954732bb2083b0fbd6e702ed3b436e906b647987248ce97c9652fa05b09",
+        "lccc": "25cdfa84bcbf705c53d552ee46adf46a57dda546c872b3deb4d4cad13693db50"
+      }
+    },
+    {
+      "name": "sieve",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "primes up to 10000000: 664579\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "primes up to 10000000: 664579\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "primes up to 10000000: 664579\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "primes up to 10000000: 664579\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "f731358cbc3415a45108b9321cb2fbb3c9cf33eba82c70dd473ea7bda6dac39d",
+        "clang": "b049af55fc2ff20c28e9c657b07c7f8fb661fc8dbb496d0d54b94acaeb280ff7",
+        "gcc": "a0b370685724b6216b9abfd3ec927da9bc24c588fdea7ad28eede890b228303b",
+        "lccc": "f731358cbc3415a45108b9321cb2fbb3c9cf33eba82c70dd473ea7bda6dac39d"
+      }
+    },
+    {
+      "name": "tce_sum",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum(10000000) = 50000005000000\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum(10000000) = 50000005000000\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum(10000000) = 50000005000000\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum(10000000) = 50000005000000\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "81cfa1ed25883e76d61858955f27a4e24a3fe644d31299b6da815915985fe9d9",
+        "clang": "000489ee76f9091cf157254fe51c78eda74008efa236c09915e7d9b6a24e0356",
+        "gcc": "8ca558828b74c2c8d80e8bbd4b3702bbec7759ac445bef29d2a7d33f3195c9af",
+        "lccc": "81cfa1ed25883e76d61858955f27a4e24a3fe644d31299b6da815915985fe9d9"
+      }
+    },
+    {
+      "name": "nbody",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "-0.169075164\n-0.169083134\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "-0.169075164\n-0.169083134\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "-0.169075164\n-0.169083134\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "-0.169075164\n-0.169083134\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "3495f38691b1f3e10afe7dd71af56fb3e62d053f4a6215a204998795e82a1775",
+        "clang": "f5d5d7fdc08db62a2458d829378417774efce80854a907ceb5c61b36df69c602",
+        "gcc": "2d2712a6be543136e8ebcbbdee983c84e88b1c610a6e25c96f5ed9c5afe27da0",
+        "lccc": "3495f38691b1f3e10afe7dd71af56fb3e62d053f4a6215a204998795e82a1775"
+      }
+    },
+    {
+      "name": "binary_trees",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "stretch tree of depth 19\t check: 1048575\n262144\t trees of depth 4\t check: 8126464\n65536\t trees of depth 6\t check: 8323072\n16384\t trees of depth 8\t check: 8372224\n4096\t trees of depth 10\t check: 8384512\n1024\t trees of depth 12\t check: 8387584\n256\t trees of depth 14\t check: 8388352\n64\t trees of depth 16\t check: 8388544\n16\t trees of depth 18\t check: 8388592\nlong lived tree of depth 18\t check: 524287\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "stretch tree of depth 19\t check: 1048575\n262144\t trees of depth 4\t check: 8126464\n65536\t trees of depth 6\t check: 8323072\n16384\t trees of depth 8\t check: 8372224\n4096\t trees of depth 10\t check: 8384512\n1024\t trees of depth 12\t check: 8387584\n256\t trees of depth 14\t check: 8388352\n64\t trees of depth 16\t check: 8388544\n16\t trees of depth 18\t check: 8388592\nlong lived tree of depth 18\t check: 524287\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "stretch tree of depth 19\t check: 1048575\n262144\t trees of depth 4\t check: 8126464\n65536\t trees of depth 6\t check: 8323072\n16384\t trees of depth 8\t check: 8372224\n4096\t trees of depth 10\t check: 8384512\n1024\t trees of depth 12\t check: 8387584\n256\t trees of depth 14\t check: 8388352\n64\t trees of depth 16\t check: 8388544\n16\t trees of depth 18\t check: 8388592\nlong lived tree of depth 18\t check: 524287\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "stretch tree of depth 19\t check: 1048575\n262144\t trees of depth 4\t check: 8126464\n65536\t trees of depth 6\t check: 8323072\n16384\t trees of depth 8\t check: 8372224\n4096\t trees of depth 10\t check: 8384512\n1024\t trees of depth 12\t check: 8387584\n256\t trees of depth 14\t check: 8388352\n64\t trees of depth 16\t check: 8388544\n16\t trees of depth 18\t check: 8388592\nlong lived tree of depth 18\t check: 524287\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "8012370a807b2fadada56b89982278f5e8190f115cb21107444d7cccf0cd3f36",
+        "clang": "2ebdd7e3a8f17e8343df61f122e863681a137fddb3ec9665494cf9ef329c9359",
+        "gcc": "68806363ca80862b530169d57c4c965e40d9333d35dfd1335476df5df1471245",
+        "lccc": "8012370a807b2fadada56b89982278f5e8190f115cb21107444d7cccf0cd3f36"
+      }
+    },
+    {
+      "name": "spectral_norm",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "1.274224152\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "1.274224152\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "1.274224152\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "1.274224152\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "5daa43a403dca95340ca9835e57615bab951d0f13adac6151306e7ad024f5f7b",
+        "clang": "813f349ed753b36c7cf09a52cafa557942b1b942d6168b0eaace4807ec785cdb",
+        "gcc": "a9fda4e6f9b59908f2ea039f6b13dfe8ed5b8ac26433e0982419dfb67b4ba930",
+        "lccc": "5daa43a403dca95340ca9835e57615bab951d0f13adac6151306e7ad024f5f7b"
+      }
+    },
+    {
+      "name": "mandelbrot",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "mandelbrot total iterations: 380863975\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "mandelbrot total iterations: 380863975\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "mandelbrot total iterations: 380863975\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "mandelbrot total iterations: 380863975\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "837c9c2f3bdaf53b13eeb070968fe17ea734fa861ae86e1faf0af05e3b45a215",
+        "clang": "bc0041ea6a36a357536bd086df7d095c043c318f6c5773c96434991e5aba18de",
+        "gcc": "4d806bd5653abb7473b60f08ac7ceeda19617a7ca0c7ff303c301af537f7a013",
+        "lccc": "837c9c2f3bdaf53b13eeb070968fe17ea734fa861ae86e1faf0af05e3b45a215"
+      }
+    },
+    {
+      "name": "hash_table",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "hash_table sum: 1999998000000\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "hash_table sum: 1999998000000\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "hash_table sum: 1999998000000\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "hash_table sum: 1999998000000\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "34862808d6696477264c1094332d8c8b0f72ec5c2c6002770052c852616b36bb",
+        "clang": "a8a147706507d48d033d7c1630cd8c627521387622ee4359f15b17658456ed8b",
+        "gcc": "ed87677b29bbabcaf3c3c1d8c3864746d52efbf2505de294db24e7aab3ff50e1",
+        "lccc": "34862808d6696477264c1094332d8c8b0f72ec5c2c6002770052c852616b36bb"
+      }
+    },
+    {
+      "name": "strlen_bench",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "strlen total: 494896800, cmp_sum: 67, found: 2257, copy_sum: 544861400\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "strlen total: 494896800, cmp_sum: 67, found: 2257, copy_sum: 544861400\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "strlen total: 494896800, cmp_sum: 67, found: 2257, copy_sum: 544861400\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "strlen total: 494896800, cmp_sum: 67, found: 2257, copy_sum: 544861400\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "7fe36700c7d74b6d3245cd26d9041d5ae90604d5d6802b9e8b9df49f55cb1663",
+        "clang": "ebd739a258d9d5248c0814caf25b21c19f58c458aa6c34c19083cf9c44648fbe",
+        "gcc": "34a58668803dc9cd21abf6d1727da12218bba780f12b392fe6db93f1b5e385ff",
+        "lccc": "7fe36700c7d74b6d3245cd26d9041d5ae90604d5d6802b9e8b9df49f55cb1663"
+      }
+    },
+    {
+      "name": "switch_dispatch",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "switch_dispatch sum: 2023556049379541\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "switch_dispatch sum: 2023556049379541\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "switch_dispatch sum: 2023556049379541\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "switch_dispatch sum: 2023556049379541\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "ee5977200b9eb208574406ae7293eed37f23cfbd341f72672934fc92fc862afe",
+        "clang": "81d3284b3186d241002414caf42ce1f3bf360e13dafc4624fb73f1297d4b0e2a",
+        "gcc": "c6e1c762081951c21bbe38b5beec41098f28fbc0aa5227c8fa24f2c59205a1b2",
+        "lccc": "ee5977200b9eb208574406ae7293eed37f23cfbd341f72672934fc92fc862afe"
+      }
+    },
+    {
+      "name": "struct_copy",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "struct_copy total: 5600000.00\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "struct_copy total: 5600000.00\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "struct_copy total: 5600000.00\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "struct_copy total: 5600000.00\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "f3ec2d07c756b9810f279c86dae373d120d0bf87bb1c61f0409af470b8ef5598",
+        "clang": "1e5323b97b9070ba33a084a68622bbe4bbebfdf19ee8749b01d3c595b7da3977",
+        "gcc": "66686e541d0c6494377c76915a624114a7ca2eb4e4512225b25e8b70ab2e5dcd",
+        "lccc": "f3ec2d07c756b9810f279c86dae373d120d0bf87bb1c61f0409af470b8ef5598"
+      }
+    },
+    {
+      "name": "loop_patterns",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum=735339920561088 pos=3064670858719214 max=1147483487 scaled=-736921824307008 dot=3807954538875916160 prefix=492040\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum=735339920561088 pos=3064670858719214 max=1147483487 scaled=-736921824307008 dot=3807954538875916160 prefix=492040\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum=735339920561088 pos=3064670858719214 max=1147483487 scaled=-736921824307008 dot=3807954538875916160 prefix=492040\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum=735339920561088 pos=3064670858719214 max=1147483487 scaled=-736921824307008 dot=3807954538875916160 prefix=492040\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "a5f6dafced86530be37662f140e82f52c72c795a97135ac6d4bd7181d24445ec",
+        "clang": "f4ca6f95fb554cb4502c479dfbf11886cbd3b16d1661be634358a52ac765ca4e",
+        "gcc": "bfaa9450d33bfe7f41abe5724a798a4ec89d5aa4b2ad7b5428b9cd76d5e96abb",
+        "lccc": "a5f6dafced86530be37662f140e82f52c72c795a97135ac6d4bd7181d24445ec"
+      }
+    },
+    {
+      "name": "fannkuch",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "556355\nPfannkuchen(11) = 51\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "556355\nPfannkuchen(11) = 51\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "556355\nPfannkuchen(11) = 51\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "556355\nPfannkuchen(11) = 51\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "3907343e96b0fce79bd37d619bcc60d91230613ea95d96f80ac83ee29c6b3188",
+        "clang": "5d49266e86480692774f8fbf2ec36ad86187e14b5eb6fae4aa0d96c8f7c7a9e3",
+        "gcc": "b56a207033034949fbe73e25b0e07d849cdc5dfbce355817d9fc336073f687eb",
+        "lccc": "3907343e96b0fce79bd37d619bcc60d91230613ea95d96f80ac83ee29c6b3188"
+      }
+    },
+    {
+      "name": "ackermann",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ackermann(3,11) = 16381\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ackermann(3,11) = 16381\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ackermann(3,11) = 16381\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ackermann(3,11) = 16381\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "0574f50c1517b9cbb2584c99f2978ffefe9844c2358fcaa754108ce07578b83d",
+        "clang": "46105669fc96ac18590428a55fde2bca6af3dee39e066311befc64a19b3e51bf",
+        "gcc": "64a1df9e6d92d7e82283ce20b4b852867fcc40261330b3b59ba53496ee29bc7b",
+        "lccc": "0574f50c1517b9cbb2584c99f2978ffefe9844c2358fcaa754108ce07578b83d"
+      }
+    },
+    {
+      "name": "constant_recursion",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "constant ackermann: 16381\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "constant ackermann: 16381\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "constant ackermann: 16381\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "constant ackermann: 16381\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "dcbaff2a0afff76ab16beead9cc375d483f847be2795c1b4cb45fad13a22891f",
+        "clang": "8bbcf10f272d9df26b694793f1df22f627d4d144d219dfdb0dcdd45a78892c04",
+        "gcc": "91db86a7002ab548f5e74217a4680c631101c2d15a6b8caafe33a48dc3574fc5",
+        "lccc": "dcbaff2a0afff76ab16beead9cc375d483f847be2795c1b4cb45fad13a22891f"
+      }
+    },
+    {
+      "name": "bitops",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "pop=800020159 clz=49986357 rev=6375100514 pow2=2184481749767\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "pop=800020159 clz=49986357 rev=6375100514 pow2=2184481749767\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "pop=800020159 clz=49986357 rev=6375100514 pow2=2184481749767\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "pop=800020159 clz=49986357 rev=6375100514 pow2=2184481749767\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "4c508322a7682d4e5db6e9f3361f2266e6d311ec7287a3f59f6d4ce796e36c44",
+        "clang": "6fae63e8eac299e8621df5fd22abd23a71a9ecffa30f4ad6baa304398feb6da3",
+        "gcc": "635d36761659bb8b68257763e56064a4bc528c79cceeb394e23cadb6b003fc08",
+        "lccc": "4c508322a7682d4e5db6e9f3361f2266e6d311ec7287a3f59f6d4ce796e36c44"
+      }
+    },
+    {
+      "name": "double_reduction",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "201415680\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "201415680\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "201415680\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "201415680\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "84fdef9241ed2efede46c55ae76b2bbc0ca3ca5e0788ce376d4ec45c7ac317de",
+        "clang": "9406c10058dd873fa7e73251b99c17ea08e9cacd91dfd79c0ec86923ec676fab",
+        "gcc": "5092ecd781c738aefef4d5b9edb6bcf308770d29aa835184571de34c7966e392",
+        "lccc": "84fdef9241ed2efede46c55ae76b2bbc0ca3ca5e0788ce376d4ec45c7ac317de"
+      }
+    },
+    {
+      "name": "ascii_case_fold",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "259f9d73e51f429d8dfa0915c1b8baa7ad813984c61a712c6fc4cfddd4475bba",
+        "clang": "4dacdc708bb75c0cf26996d8d14dbb32c2724dc40759206f723d9c3314bc7b13",
+        "gcc": "66a98c7f9432000adaf66c52256ec610ad6e3586a2c87b83cdde6beae97a93de",
+        "lccc": "259f9d73e51f429d8dfa0915c1b8baa7ad813984c61a712c6fc4cfddd4475bba"
+      }
+    },
+    {
+      "name": "binary_search",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "cccb33e57b268c28458619643da63037d61a26b0fca73182d73de13bb7a15265",
+        "clang": "210e87a09d30866ad232c6ff701dc449a3b885ea48dcd5fbbe51b75d5e8e02cf",
+        "gcc": "63593738f78854da74996919622860c52287fbba5fff0509164c5521062d1fcb",
+        "lccc": "cccb33e57b268c28458619643da63037d61a26b0fca73182d73de13bb7a15265"
+      }
+    },
+    {
+      "name": "ring_fifo",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "3c7614d95c863b8d5661dc9bd45251b8df1bb0f0128dbf12eb8cd05d34190b79",
+        "clang": "40b14457f02c15f608c4a56494735f146c5409a344000dca8b0585356e394e86",
+        "gcc": "ded06f6344a7101ffe974f1c1c2f11de2803e43752af44a76e5bfbe073937d3d",
+        "lccc": "3c7614d95c863b8d5661dc9bd45251b8df1bb0f0128dbf12eb8cd05d34190b79"
+      }
+    },
+    {
+      "name": "aarch64_select_patterns",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "25000000 300737027\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "25000000 300737027\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "25000000 300737027\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "25000000 300737027\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "cb4fcf870311672f233f09e4e85f66fdb8019c58f9675592ad7fd08859ba2d55",
+        "clang": "f470dc89dbd7920f13ee77b5fa9a4a78a9fa6ca05b12dbff76e8995abfb18e0f",
+        "gcc": "a64ceb893647ae406f23bba863bf4ab4ec86007d58e554b6f151939a8850f9b2",
+        "lccc": "cb4fcf870311672f233f09e4e85f66fdb8019c58f9675592ad7fd08859ba2d55"
+      }
+    },
+    {
+      "name": "histogram",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "258e0843ceb23a2be969fd22eb7a64690d8bedfb4d26e47097a9d2d51c55d672",
+        "clang": "dcbe624341ea4b315df3fd171aa28f566e9dc3cf2dfee39e2718aa7b151a5c0b",
+        "gcc": "bdab075c8c7662d47c53c21d6cfa4a596baea0f6f15f5545686a18411fa58946",
+        "lccc": "258e0843ceb23a2be969fd22eb7a64690d8bedfb4d26e47097a9d2d51c55d672"
+      }
+    },
+    {
+      "name": "gzip_crc32",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "372e56ab\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "372e56ab\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "372e56ab\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "372e56ab\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "406efec9b26ca9e13691cb242abee70919a394a65fe3a2f4ff14e822c427cba4",
+        "clang": "0f5bbaa302e48b2a6ab906b4be2240a2fb766bf3ec4e989623acb59ff5338c5d",
+        "gcc": "4a447c2a73888725d7008d9199f357d1b3af964285b50bcc0724976091af22ee",
+        "lccc": "406efec9b26ca9e13691cb242abee70919a394a65fe3a2f4ff14e822c427cba4"
+      }
+    },
+    {
+      "name": "libm_round_family",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "libm-round-family: 18623110414.500000\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "libm-round-family: 18623110414.500000\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "libm-round-family: 18623110414.500000\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "libm-round-family: 18623110414.500000\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "67f998c9a823b1a74242d29958a358734dbc1230a37b23196d865726ef511719",
+        "clang": "080211b5491361855d48216b0ac8ecc0cf6f42b9c3242034f6de3c7a0da0924e",
+        "gcc": "3a15dc54a54599dc64fec0d23cdef0adf0a99285382cde87974b68384bbbfcd4",
+        "lccc": "67f998c9a823b1a74242d29958a358734dbc1230a37b23196d865726ef511719"
+      }
+    },
+    {
+      "name": "tls_seg_access",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "tls-seg-access: 41596549849953\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "tls-seg-access: 41596549849953\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "tls-seg-access: 41596549849953\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "tls-seg-access: 41596549849953\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "07dedf37d3e37d0de9e3368a901bec5a9fc3a9831ca0befc017c6fa5f8675ab6",
+        "clang": "a764a1dfceed3f44cc941626e8d109c9848b946ed8405491cc64e3fa13fc740f",
+        "gcc": "822247a76e75b26234c700b674d6beeb9a075fe7e1e6d2babdc96d4780a54f5c",
+        "lccc": "07dedf37d3e37d0de9e3368a901bec5a9fc3a9831ca0befc017c6fa5f8675ab6"
+      }
+    },
+    {
+      "name": "percpu_ptr_walk",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "percpu-ptr-walk: 158131200000\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "percpu-ptr-walk: 158131200000\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "percpu-ptr-walk: 158131200000\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "percpu-ptr-walk: 158131200000\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "fe1a2f91a8532719a9c7f2134b4a82d5e25931adc345932b755327dbb1b41f4f",
+        "clang": "c879c3e0f5a9d856321516188dda1bf3e66f603531bcd96ea93b0ca46c9b9f37",
+        "gcc": "16759234fa7538af16bc369494b3046a770b9d74bed369b94d5de05d1d04ae21",
+        "lccc": "fe1a2f91a8532719a9c7f2134b4a82d5e25931adc345932b755327dbb1b41f4f"
+      }
+    },
+    {
+      "name": "byte_load_reassembly",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7ee1f2c0 3dcf60f284155e00\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7ee1f2c0 3dcf60f284155e00\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7ee1f2c0 3dcf60f284155e00\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7ee1f2c0 3dcf60f284155e00\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "55ee3dc43b7815d39c71221b185b536b7603f2a7a032145ea663b5a3d936dd71",
+        "clang": "1d598d950acf4fa2535367877e82fae4421d54921e003da5c37c2ef3835c315c",
+        "gcc": "e64cb7846fb1257de803e731d0ae509a85086c50eedeaacd165f1b87b0459c20",
+        "lccc": "55ee3dc43b7815d39c71221b185b536b7603f2a7a032145ea663b5a3d936dd71"
+      }
+    },
+    {
+      "name": "zlib_ng_adler32",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "8c331ae0\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "8c331ae0\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "8c331ae0\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "8c331ae0\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "d4aba9310d134384d8e6c590c62037a65f67aa89d2dde3703f4718330c2172e3",
+        "clang": "8d830103bab70f6f41e1ad5e4f461cd5621e894b978113dcd25f938b3f513b65",
+        "gcc": "a76041ceec0dec1a9587236618eddba49ef4dcc356ae88b9e3d95067a84b6376",
+        "lccc": "d4aba9310d134384d8e6c590c62037a65f67aa89d2dde3703f4718330c2172e3"
+      }
+    },
+    {
+      "name": "zlib_ng_adler32_combine",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "zlib_ng_adler32_combine: 35498ead\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "zlib_ng_adler32_combine: 35498ead\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "zlib_ng_adler32_combine: 35498ead\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "zlib_ng_adler32_combine: 35498ead\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "88569ee7e8a671214af67f6aa93558c432d6b08cbc551070192f4658c8e15f67",
+        "clang": "2c8c02ee1baf0dd71de0d3a93766631ec3b727e9038d0a2658c543a8c67b6f84",
+        "gcc": "cfd2c3f79478e76dc0fbedb3dfcbc90adcfbbd627c98e869c02acc84c66fa410",
+        "lccc": "88569ee7e8a671214af67f6aa93558c432d6b08cbc551070192f4658c8e15f67"
+      }
+    },
+    {
+      "name": "expat_xml_scan",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "626766774715194881\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "626766774715194881\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "626766774715194881\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "626766774715194881\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "1cc06a0dff5dbde77593cde6f5acfddcca0d7708c26cddf694588563a3570912",
+        "clang": "d5844704da14bc63c801ea9d88323b0b9e5542050d919a0b383c3e9828a31e72",
+        "gcc": "9c37196c564d553fa712a337efdc108ef2152863aac9a0a9e44ca96d30047de7",
+        "lccc": "1cc06a0dff5dbde77593cde6f5acfddcca0d7708c26cddf694588563a3570912"
+      }
+    },
+    {
+      "name": "expat_siphash24",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "455b2fe83db74581\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "455b2fe83db74581\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "455b2fe83db74581\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "455b2fe83db74581\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "e84aee2d22860b014eed94309fd4b337b692f78dbd24dea84e6155dc7b6de481",
+        "clang": "1a87b4d56ec7877fd7326549805fd0430f8067f8e81a6a25ff93e37c37a6b7f6",
+        "gcc": "a1c3ac097df01b5835922347b99c8e806c257ff7109ede4c6a6b0ad612b52a19",
+        "lccc": "e84aee2d22860b014eed94309fd4b337b692f78dbd24dea84e6155dc7b6de481"
+      }
+    },
+    {
+      "name": "sqlite_varint",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "deedcdd4edc1c0f1\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "deedcdd4edc1c0f1\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "deedcdd4edc1c0f1\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "deedcdd4edc1c0f1\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "25b0fc9e75067e06e33397c80850c34ea29da5610eeb4c9c9654bdc7256db2ca",
+        "clang": "3e75d709c824764aba01616485ad2c22c51618b22f2a7051a30d7d2e25052ec7",
+        "gcc": "b886967113b22467c1a7d623647eb63f57bcf4f6eae1320efba41f5b3231f904",
+        "lccc": "25b0fc9e75067e06e33397c80850c34ea29da5610eeb4c9c9654bdc7256db2ca"
+      }
+    },
+    {
+      "name": "linux_find_bit",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "49e2ac4a4070762923d3ebcf8b4c40b094fb7ad0bdf2565e1df82823c5e99e16",
+        "clang": "3d826056ea09de831526672b2d3a0f5952e6928cee80d46f8b8b3ac765854568",
+        "gcc": "745d1121212aa392066010d7d840a1d140a53b9729ba129485e6f0c466aa8433",
+        "lccc": "49e2ac4a4070762923d3ebcf8b4c40b094fb7ad0bdf2565e1df82823c5e99e16"
+      }
+    },
+    {
+      "name": "linux_find_bit_scaled",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "e9e2591c3da9236c799ae792371bd53c46abaccaf18f998a36191ad95e1e19c5",
+        "clang": "5ccdcdb8147da4d6418621f8b91d19a81f12959e9113aa4171769feba3463e3c",
+        "gcc": "e0a3cc0952a6178e500ed346e9bf9c9fabf29e16eba4338d6c7d5439e2d640b5",
+        "lccc": "e9e2591c3da9236c799ae792371bd53c46abaccaf18f998a36191ad95e1e19c5"
+      }
+    },
+    {
+      "name": "glibc_memcmp",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "2158787064\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "2158787064\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "2158787064\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "2158787064\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "76ad84e8811988cb9ee5ab2199e7fa853e1e202aaefb7b31b9dad9d7cb8ca552",
+        "clang": "6d5b938bf346068a55dac22ede8e22ce20c3d954b268474f740331fffc71d8ea",
+        "gcc": "4c0267a313c19e2e1af692657152a28666b28ef31c9675b83a5f5dbb10843809",
+        "lccc": "76ad84e8811988cb9ee5ab2199e7fa853e1e202aaefb7b31b9dad9d7cb8ca552"
+      }
+    },
+    {
+      "name": "chacha20_block",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ff1bc75f6884e79f\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ff1bc75f6884e79f\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ff1bc75f6884e79f\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ff1bc75f6884e79f\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "246e10aab20eb4f202b02ca59e0b814f4703339b67ad87e7594752f9ec957451",
+        "clang": "89553b7b2692129787188c210f7dac8519d41154bd49d25ade8a466bab1a57d8",
+        "gcc": "fe9312202b49b45798c7b269948c0ab87b4a1ca8136a4d74788bb95c080744d7",
+        "lccc": "246e10aab20eb4f202b02ca59e0b814f4703339b67ad87e7594752f9ec957451"
+      }
+    },
+    {
+      "name": "sha256_transform",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "054db5f638d89d8b\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "054db5f638d89d8b\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "054db5f638d89d8b\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "054db5f638d89d8b\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "3682fe469bf0ae0ef297f15c761175706e2f4fc5b097c183cffae7f63eec63c5",
+        "clang": "93f77206b3fc79b1171aaf6af495421966b7e6a3228b8091e37f49dbc68fd135",
+        "gcc": "b4123d330f0a542d0915e03ae1cc53a660cf7bb53e85f9bdc6d9df70ef1384e8",
+        "lccc": "3682fe469bf0ae0ef297f15c761175706e2f4fc5b097c183cffae7f63eec63c5"
+      }
+    },
+    {
+      "name": "linux_rbtree",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7f13e4413fff0000\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7f13e4413fff0000\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7f13e4413fff0000\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7f13e4413fff0000\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "be420faade778ac1cad46ed5c39cdac1633ce60023a63b0787b14a2bbfaf4442",
+        "clang": "39d09c6fc0522f54e6f4181222e47ea736eb5fedf0eb9fdfbb8dd1601d817cef",
+        "gcc": "6a03091f6d8a69e742fd61c6a8d87cbf6473d7c99608420b95329d686ddb730e",
+        "lccc": "be420faade778ac1cad46ed5c39cdac1633ce60023a63b0787b14a2bbfaf4442"
+      }
+    },
+    {
+      "name": "zstd_count",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "49750a013cea17bd\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "49750a013cea17bd\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "49750a013cea17bd\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "49750a013cea17bd\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "d67ac54a4ff5956d2a631293556db3018c7b88887e159e66a60c48942dd9095e",
+        "clang": "45730b50e0aa6eaff6ff76d679d412e41076e8d446b2637a580dda3bb6637cc6",
+        "gcc": "4323120044b9fc22982a4a2b5932376420c3a8a582f3c4035b5cb765ca3af9ad",
+        "lccc": "d67ac54a4ff5956d2a631293556db3018c7b88887e159e66a60c48942dd9095e"
+      }
+    },
+    {
+      "name": "lz4_compress",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "00c000180ca81680\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "00c000180ca81680\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "00c000180ca81680\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "00c000180ca81680\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "4be41c7d7e1330daf2c50eea1aad82790a105dd698057f5ceccad0c8f2ee7a0a",
+        "clang": "e90a8b1b196de63171bd6722bb6982aff8726bd2aa51752cf35b2172a758533f",
+        "gcc": "da2a05d5027df7a797d87bd67baa8f9d4cbee13036d72c0f7e852edab4a79d80",
+        "lccc": "4be41c7d7e1330daf2c50eea1aad82790a105dd698057f5ceccad0c8f2ee7a0a"
+      }
+    },
+    {
+      "name": "lz4_match_extend",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "29f49acaab81f800\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "29f49acaab81f800\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "29f49acaab81f800\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "29f49acaab81f800\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "d77b8d3f6fd6d03687195dc27d2ba6b35b265692729655d8d3229fb6c5500945",
+        "clang": "ce7c160b9df5f7af4d6f83443ae727f153f3824b3f35e39a56b0482d73d6c404",
+        "gcc": "11c88e58412337295e9aa6f587409bfcda9b9f0a2a8c601217c77bd0b6915552",
+        "lccc": "d77b8d3f6fd6d03687195dc27d2ba6b35b265692729655d8d3229fb6c5500945"
+      }
+    },
+    {
+      "name": "glibc_strstr",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "000084b751d11348\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "000084b751d11348\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "000084b751d11348\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "000084b751d11348\n",
+          "stable_within_compiler": true
+        }
+      },
+      "binary_sha256": {
+        "before": "e9a8ab53efdbf8581ffdb45eb8ea01bd3c4a6b8c32e28c6839043c5545bfa4d9",
+        "clang": "5655ced49d648c925f8809023de4f0d17bac6da26402c6dbbe6a99b2d3a7336b",
+        "gcc": "27d4a7d517d2b0f721a1f8375455d5efcddb82d30df0b45c894fdb258843f6f4",
+        "lccc": "e9a8ab53efdbf8581ffdb45eb8ea01bd3c4a6b8c32e28c6839043c5545bfa4d9"
+      }
+    }
+  ]
+}
