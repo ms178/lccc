@@ -55,15 +55,18 @@ class WrappingContracts(unittest.TestCase):
     def test_bad_oracle_exit_or_output_still_fails(self):
         case = next(t for t in runner.discover([ROOT / 'tests/regression'])
                     if t.name == 'affine_control_proof')
-        for oracle in [(1, 'expected\n', ''), (0, 'wrong\n', '')]:
+        for oracle, expected_status, expected_phase in [
+            ((1, 'expected\n', ''), 'skip-compare', 'compare:oracle-skip'),
+            ((0, 'wrong\n', ''), 'fail', 'compare:fail'),
+        ]:
             with self.subTest(oracle=oracle), tempfile.TemporaryDirectory() as directory:
                 work = Path(directory)
                 (work / case.name).touch()
                 with patch.object(runner, 'run_checked', side_effect=[
                         (0, '', ''), (0, 'expected\n', ''), (0, '', ''), oracle]):
                     result = runner.compile_one(Path('lccc'), 'gcc', case, work)
-                self.assertEqual(result.status, 'fail')
-                self.assertIn('compare:fail', result.phases)
+                self.assertEqual(result.status, expected_status)
+                self.assertIn(expected_phase, result.phases)
 
     def test_oracle_gap_is_only_waived_when_the_fixture_declares_it(self):
         # An oracle whose *binary* fails the fixture's assertions is a

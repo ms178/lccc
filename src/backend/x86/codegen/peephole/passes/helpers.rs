@@ -789,29 +789,30 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
     // Dest-only two/three-operand BMI1/ABM: dest is written, not read.
     // Default-true would treat `popcntl %edi, %eax` as RMW of eax and keep
     // a dead staging `movq %rdi, %rax` that the producer never needed.
-    if trimmed.starts_with("popcnt")
-        || trimmed.starts_with("lzcnt")
-        || trimmed.starts_with("tzcnt")
-        || trimmed.starts_with("andn")
-        || trimmed.starts_with("blsr")
-        || trimmed.starts_with("blsi")
-        || trimmed.starts_with("blsmsk")
-        || trimmed.starts_with("bzhi")
-        || trimmed.starts_with("bextr")
-        || trimmed.starts_with("pext")
-        || trimmed.starts_with("pdep")
-        || trimmed.starts_with("shlx")
-        || trimmed.starts_with("shrx")
-        || trimmed.starts_with("sarx")
-        // RORX (BMI2) is the three-operand rotate: it never reads its
-        // destination.  Forgetting it here turns every `rorxl` into a
-        // phantom RMW, inflating the destination's liveness and killing
-        // every liveness-driven peephole around it (measured: the sha256
-        // K[i]/W[i] load→add fusions died and the loop ran ~9% slower on
-        // a Raptor Lake-class core with BMI2 on).  The plain `rol`/`ror`
-        // two-operand forms ARE read-modify-write and stay in the default.
-        || trimmed.starts_with("rorx")
-    {
+    if match b[0] {
+        b'p' => {
+            trimmed.starts_with("popcnt")
+                || trimmed.starts_with("pext")
+                || trimmed.starts_with("pdep")
+        }
+        b'l' => trimmed.starts_with("lzcnt"),
+        b't' => trimmed.starts_with("tzcnt"),
+        b'a' => trimmed.starts_with("andn"),
+        b'b' => {
+            trimmed.starts_with("blsr")
+                || trimmed.starts_with("blsi")
+                || trimmed.starts_with("blsmsk")
+                || trimmed.starts_with("bzhi")
+                || trimmed.starts_with("bextr")
+        }
+        b's' => {
+            trimmed.starts_with("shlx")
+                || trimmed.starts_with("shrx")
+                || trimmed.starts_with("sarx")
+        }
+        b'r' => trimmed.starts_with("rorx"),
+        _ => false,
+    } {
         return false;
     }
 
@@ -840,77 +841,81 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
     // read the family — as the SOURCE operand; callers that care consult
     // their own source-mentions-dest guard (see `is_pure_write_mnemonic`'s
     // contract), which subsumes that case exactly as it does for `popcnt`.
-    {
-        let mnemonic_end = trimmed
-            .find(|c: char| c.is_whitespace())
-            .unwrap_or(trimmed.len());
+    if matches!(b[0], b'n' | b'i' | b'd' | b'a' | b's' | b'o' | b'x') {
+        let mut mnemonic_end = 0;
+        while mnemonic_end < b.len() && !b[mnemonic_end].is_ascii_whitespace() {
+            mnemonic_end += 1;
+        }
         let mnemonic = &trimmed[..mnemonic_end];
-        let ndd_unary = matches!(
-            mnemonic,
-            "neg"
-                | "negb"
-                | "negw"
-                | "negl"
-                | "negq"
-                | "not"
-                | "notb"
-                | "notw"
-                | "notl"
-                | "notq"
-                | "inc"
-                | "incb"
-                | "incw"
-                | "incl"
-                | "incq"
-                | "dec"
-                | "decb"
-                | "decw"
-                | "decl"
-                | "decq"
-        );
-        let ndd_binary = matches!(
-            mnemonic,
-            "add"
-                | "addb"
-                | "addw"
-                | "addl"
-                | "addq"
-                | "sub"
-                | "subb"
-                | "subw"
-                | "subl"
-                | "subq"
-                | "adc"
-                | "adcb"
-                | "adcw"
-                | "adcl"
-                | "adcq"
-                | "sbb"
-                | "sbbb"
-                | "sbbw"
-                | "sbbl"
-                | "sbbq"
-                | "and"
-                | "andb"
-                | "andw"
-                | "andl"
-                | "andq"
-                | "or"
-                | "orb"
-                | "orw"
-                | "orl"
-                | "orq"
-                | "xor"
-                | "xorb"
-                | "xorw"
-                | "xorl"
-                | "xorq"
-                | "imul"
-                | "imulb"
-                | "imulw"
-                | "imull"
-                | "imulq"
-        );
+        let ndd_unary = matches!(b[0], b'n' | b'i' | b'd')
+            && matches!(
+                mnemonic,
+                "neg"
+                    | "negb"
+                    | "negw"
+                    | "negl"
+                    | "negq"
+                    | "not"
+                    | "notb"
+                    | "notw"
+                    | "notl"
+                    | "notq"
+                    | "inc"
+                    | "incb"
+                    | "incw"
+                    | "incl"
+                    | "incq"
+                    | "dec"
+                    | "decb"
+                    | "decw"
+                    | "decl"
+                    | "decq"
+            );
+        let ndd_binary = !ndd_unary
+            && matches!(b[0], b'a' | b's' | b'o' | b'x' | b'i')
+            && matches!(
+                mnemonic,
+                "add"
+                    | "addb"
+                    | "addw"
+                    | "addl"
+                    | "addq"
+                    | "sub"
+                    | "subb"
+                    | "subw"
+                    | "subl"
+                    | "subq"
+                    | "adc"
+                    | "adcb"
+                    | "adcw"
+                    | "adcl"
+                    | "adcq"
+                    | "sbb"
+                    | "sbbb"
+                    | "sbbw"
+                    | "sbbl"
+                    | "sbbq"
+                    | "and"
+                    | "andb"
+                    | "andw"
+                    | "andl"
+                    | "andq"
+                    | "or"
+                    | "orb"
+                    | "orw"
+                    | "orl"
+                    | "orq"
+                    | "xor"
+                    | "xorb"
+                    | "xorw"
+                    | "xorl"
+                    | "xorq"
+                    | "imul"
+                    | "imulb"
+                    | "imulw"
+                    | "imull"
+                    | "imulq"
+            );
         if ndd_unary || ndd_binary {
             let ops = trimmed[mnemonic_end..].split('#').next().unwrap_or("");
             let operands = count_top_level_operands(ops);

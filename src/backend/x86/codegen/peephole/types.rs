@@ -30,7 +30,7 @@ pub(super) const RBP_OFFSET_NONE: i32 = i32::MIN;
 /// Compact classification of a single assembly line.
 /// Stored in a parallel array alongside the raw text, so hot loops
 /// can check integer fields instead of re-parsing strings.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(super) struct LineInfo {
     pub(super) kind: LineKind,
@@ -78,7 +78,7 @@ pub(super) struct LineInfo {
 
 /// What kind of assembly line this is, with pre-extracted fields for the
 /// patterns we care about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum LineKind {
     Nop,   // Deleted line (marked via LineInfo only)
     Empty, // Blank line
@@ -149,7 +149,7 @@ pub(super) enum LineKind {
 /// Pre-parsed classification of what kind of extension/operation an instruction performs.
 /// Used by the redundant extension elimination pass to avoid repeated string comparisons
 /// in the hot combined_local_pass loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ExtKind {
     /// Not an extension or producer recognized for the extension elimination pass
     None,
@@ -190,7 +190,7 @@ pub(super) enum ExtKind {
     ProducerMovqRegToRax,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[expect(clippy::upper_case_acronyms)] // x86 mnemonic suffix conventions (SLQ = movslq)
 pub(super) enum MoveSize {
     Q,   // movq  (64-bit)
@@ -721,10 +721,9 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
     if first == b's' && sb.len() >= 4 && sb[1] == b'e' && sb[2] == b't' && parse_setcc(s).is_some()
     {
         let setcc_reg = if let Some(space_pos) = s.rfind(' ') {
-            let operand = s[space_pos + 1..].trim();
-            register_family_fast(operand)
+            register_family_fast(s[space_pos + 1..].trim())
         } else {
-            0 // default to rax family if can't parse
+            0
         };
         return line_info_with_regs(
             LineKind::SetCC { reg: setcc_reg },
@@ -733,19 +732,19 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
         );
     }
 
-    // Pre-classify 32-bit arithmetic producers for extension elimination
-    let ext = classify_arith_ext(s, sb, first);
+    classify_other_line_info(s, sb, first, ts)
+}
 
-    // Pre-parse destination register for fast modification checks.
+#[inline]
+fn classify_other_line_info(s: &str, sb: &[u8], first: u8, ts: u16) -> LineInfo {
+    let ext = classify_arith_ext(s, sb, first);
     let dest_reg = parse_dest_reg_fast(s);
-    // Cache has_indirect_memory_access for Other lines
     let has_indirect = has_indirect_memory_access(s);
     let rbp_off = if has_indirect {
         RBP_OFFSET_NONE
     } else {
         parse_rbp_offset(s)
     };
-    // Pre-scan register references for O(1) checks in eliminate_unused_callee_saves
     let reg_refs = scan_register_refs(sb);
     LineInfo {
         kind: LineKind::Other { dest_reg },

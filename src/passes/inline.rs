@@ -413,6 +413,140 @@ fn is_hot_leaf_candidate(data: &CalleeData) -> bool {
         && data.blocks.len() <= MAX_INLINE_BLOCKS_NO_LOOPS
 }
 
+/// Acyclic `static inline` leaf whose call site passes a pointer to a caller-
+/// local aggregate alloca (e.g. `BIT_flushBits(&blockStream)` or
+/// `BIT_addBits(&blockStream, ...)`): inlining it is what removes the last
+/// address-escape of that alloca so `aggregate_sroa` can split and promote its
+/// fields to SSA registers across the loop.
+fn is_sroa_unlockable_candidate(data: &CalleeData) -> bool {
+    data.is_static_inline && is_hot_leaf_candidate(data)
+}
+
+/// Collect caller values that alias a non-parameter local aggregate alloca
+/// (`size <= 64`) whose address only escapes as arguments to acyclic
+/// `static inline` helpers.
+fn sroa_unlockable_aliases_of(
+    func: &IrFunction,
+    callee_map: &FxHashMap<String, CalleeData>,
+) -> FxHashSet<Value> {
+    if func.blocks.is_empty() {
+        return FxHashSet::default();
+    }
+    // `param_alloca_values` is the block's own record of which allocas are
+    // parameter homes, and it is exactly what `aggregate_sroa` skips. Deriving
+    // the set from entry-block position instead (as this did) can both miss a
+    // home (a local alloca emitted among the first `params.len()` instructions
+    // would be treated as one) and invent one; the two passes must agree on
+    // the definition or the inliner unlocks an alloca SROA then refuses.
+    let param_homes: FxHashSet<Value> = func.param_alloca_values.iter().copied().collect();
+    let mut candidate_roots: FxHashSet<Value> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca {
+                dest,
+                size,
+                volatile: false,
+                semantic_volatile: false,
+                ..
+            } = inst
+                && *size > 0
+                && *size <= 64
+                && !param_homes.contains(dest)
+            {
+                candidate_roots.insert(*dest);
+            }
+        }
+    }
+    if candidate_roots.is_empty() {
+        return FxHashSet::default();
+    }
+    let mut root_of: FxHashMap<Value, Value> = candidate_roots.iter().map(|&v| (v, v)).collect();
+    // Monotone and bounded by the value count, so this terminates; the old
+    // `0..4` bound silently stopped seeing aliases on a longer `gep`/`copy`
+    // chain, which only ever *over*-reported escapes (a pessimisation, but a
+    // silent one).
+    loop {
+        let mut added = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(src),
+                    }
+                    | Instruction::GetElementPtr {
+                        dest, base: src, ..
+                    } => {
+                        if let Some(&r) = root_of.get(src)
+                            && root_of.insert(*dest, r).is_none()
+                        {
+                            added = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    let mut disqualified: FxHashSet<Value> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Load { .. }
+                | Instruction::GetElementPtr { .. }
+                | Instruction::Copy { .. } => {}
+                Instruction::Store { val, .. } => {
+                    if let Operand::Value(v) = val
+                        && let Some(&r) = root_of.get(v)
+                    {
+                        disqualified.insert(r);
+                    }
+                }
+                Instruction::Call {
+                    func: callee_name,
+                    info,
+                } => {
+                    let sroa_helper = callee_map
+                        .get(callee_name)
+                        .is_some_and(is_sroa_unlockable_candidate);
+                    if !sroa_helper {
+                        for arg in &info.args {
+                            if let Operand::Value(v) = arg
+                                && let Some(&r) = root_of.get(v)
+                            {
+                                disqualified.insert(r);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    inst.for_each_used_value(|v_id| {
+                        if let Some(&r) = root_of.get(&Value(v_id)) {
+                            disqualified.insert(r);
+                        }
+                    });
+                }
+            }
+        }
+    }
+    // A terminator that names the address (`return &local`, a branch on it)
+    // escapes it just as an instruction would; this scan was missing.
+    for block in &func.blocks {
+        block.terminator.for_each_used_value(|v| {
+            if let Some(&r) = root_of.get(&Value(v)) {
+                disqualified.insert(r);
+            }
+        });
+    }
+    root_of
+        .into_iter()
+        .filter_map(|(v, r)| (!disqualified.contains(&r)).then_some(v))
+        .collect()
+}
+
 /// Size/shape test for a declared-`inline` internal-linkage callee that
 /// contains a loop and may be inlined at an in-loop site despite the
 /// static-inline limit and the caller-size caps (`select_inline_site`).
@@ -477,6 +611,7 @@ fn select_inline_site(
     devirtualized_callees: &FxHashSet<String>,
     caller_has_loops: bool,
     hot_direct: bool,
+    sroa_unlockable_aliases: &FxHashSet<Value>,
 ) -> Option<(InlineCallSite, usize, bool, bool)> {
     // First pass: look for tiny/small callees anywhere in the function.
     // These are always inlined regardless of caller size because:
@@ -751,7 +886,15 @@ fn select_inline_site(
         // overhead (argument setup, a callee-saved frame, the return) is
         // paid on each. Same knob, budget and absolute caller cap, so the
         // 2.5k-instruction doubleFast loop above stays excluded.
-        let hot_inline_leaf = hot_leaf_budget_remaining.is_some()
+        let sroa_unlocking_leaf = hot_direct
+            && !caller_at_absolute_cap
+            && callee_data.is_static_inline
+            && is_sroa_unlockable_candidate(callee_data)
+            && site
+                .args
+                .iter()
+                .any(|arg| matches!(arg, Operand::Value(v) if sroa_unlockable_aliases.contains(v)));
+        let hot_inline_leaf = (hot_leaf_budget_remaining.is_some()
             && !size_optimized
             && ((every_iteration_blocks.contains(&site.block_idx)
                 && is_hot_leaf_candidate(callee_data)
@@ -760,7 +903,8 @@ fn select_inline_site(
                 || (hot_direct
                     && !caller_at_absolute_cap
                     && loop_blocks.contains(&site.block_idx)
-                    && is_hot_loop_helper_candidate(callee_data)));
+                    && is_hot_loop_helper_candidate(callee_data))))
+            || (!size_optimized && sroa_unlocking_leaf);
         // A hot-leaf candidate above the ordinary limit is offered by
         // `find_inline_call_sites` only for this decision; every other site
         // keeps the historical exceeds-normal-limits exclusion.
@@ -1393,6 +1537,11 @@ fn inline_run_with(
                         (FxHashSet::default(), FxHashSet::default())
                     };
                 let caller_has_loops = !loop_blocks.is_empty();
+                let sroa_unlockable_aliases = if hot_direct_enabled && !size_optimized {
+                    sroa_unlockable_aliases_of(&module.functions[func_idx], &callee_map)
+                } else {
+                    FxHashSet::default()
+                };
                 let found_site = select_inline_site(
                     &call_sites,
                     &callee_map,
@@ -1411,6 +1560,7 @@ fn inline_run_with(
                     &devirtualized_callees,
                     caller_has_loops,
                     hot_direct_enabled,
+                    &sroa_unlockable_aliases,
                 );
                 let (site, callee_inst_count, _use_relaxed, hot_leaf_charge) = match found_site {
                     Some(s) => s,
@@ -3970,6 +4120,12 @@ fn find_inline_call_sites(
                         if callee_data.exceeds_normal_limits
                             && !caller_has_section
                             && !callee_data.is_single_call_site_static
+                            // `is_sroa_unlockable_candidate` is a strict
+                            // subset of `is_hot_leaf_candidate` (see its
+                            // definition), so the hot-leaf clause below
+                            // already offers those sites; the SROA
+                            // admission decision is made per site in
+                            // `select_inline_site` (`sroa_unlocking_leaf`).
                             && !is_hot_leaf_candidate(callee_data)
                             && !is_hot_loop_helper_candidate(callee_data)
                         {
@@ -4078,6 +4234,273 @@ fn param_substitutable(callee: &CalleeData, param_idx: usize, home: Value) -> bo
         }
     }
     true
+}
+
+/// Widest local whose `memcpy` copy may be elided.
+///
+/// Eight bytes is the table-entry shape the transform exists for
+/// (`const FSE_symbolCompressionTransform symbolTT = table[symbol]`); sixteen
+/// covers a two-field struct. Wider copies are consumed by more loads than the
+/// copy itself costs, so eliding them would be a pessimisation.
+const ELIDE_MEMCPY_MAX_BYTES: usize = 16;
+
+/// Elide `Instruction::Memcpy { dest, src, size }` into a small (`<= 16` byte)
+/// read-only local `Alloca` inside a call-free inlined body by re-rooting its
+/// `GetElementPtr` and `Load` readers directly at `src`.
+///
+/// Hot inline leaves such as zstd's `FSE_encodeSymbol` copy an 8-byte table
+/// entry into a local struct and read two 32-bit fields from it. Leaving the
+/// `Memcpy` in place forces both a stack round-trip and a `call_spanning`
+/// barrier in liveness/regalloc across every inlined site.
+///
+/// # Soundness
+///
+/// The local must be provably read-only *through the copy*: every load that
+/// consumes it reads bytes the `memcpy` just copied, so re-rooting that load at
+/// `src` reads the identical bytes. Anything else touching the local is an
+/// escape and disqualifies it:
+///
+/// * a write through an alias (`Store`, `AtomicRmw`, ...), which would need a
+///   destination that no longer exists;
+/// * a volatile read (the access itself is observable, and its address changes);
+/// * a use of the address that is not a `GetElementPtr`/`Copy`/`Load` reader —
+///   storing it, returning it, passing it on, `Select`ing it, ...;
+/// * a second copy in or out of it, or a copy of a different width;
+/// * any call, indirect call or inline asm in the body, which could observe it.
+///
+/// The alias closure is computed to a fixpoint before any escape is judged,
+/// because `BasicBlock` order is not dominance order: after inlining, a block
+/// that *uses* a `GetElementPtr` can precede the block that defines it, and a
+/// single interleaved pass would then judge the use before knowing the alias.
+///
+/// `GetElementPtr` and `Copy` of an alias are the only forms that keep
+/// aliasing; both are rewritten, so a chain `g = gep a+8; c = copy g` stays
+/// coherent.
+fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
+    let Some(entry) = blocks.first() else {
+        return;
+    };
+    // ── candidates: non-volatile entry-block locals the copy could replace ──
+    let mut candidates: FxHashMap<u32, usize> = FxHashMap::default();
+    for inst in &entry.instructions {
+        if let Instruction::Alloca {
+            dest,
+            size,
+            volatile: false,
+            semantic_volatile: false,
+            ..
+        } = inst
+            && *size > 0
+            && *size <= ELIDE_MEMCPY_MAX_BYTES
+        {
+            candidates.insert(dest.0, *size);
+        }
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    // A call can read or write the local through a pointer this analysis
+    // cannot see (`lccc` marks nothing `restrict` here), and inline asm can do
+    // anything; both end the transform for the whole body.
+    if blocks.iter().any(|b| {
+        b.instructions.iter().any(|i| {
+            matches!(
+                i,
+                Instruction::Call { .. }
+                    | Instruction::CallIndirect { .. }
+                    | Instruction::InlineAsm { .. }
+            )
+        })
+    }) {
+        return;
+    }
+    // ── exactly one full-width copy per candidate, from the entry block ──
+    let mut src_of: FxHashMap<u32, Value> = FxHashMap::default();
+    let mut disqualified: FxHashSet<u32> = FxHashSet::default();
+    for inst in &entry.instructions {
+        if let Instruction::Memcpy { dest, src, size } = inst
+            && let Some(&alloca_sz) = candidates.get(&dest.0)
+        {
+            if *size == alloca_sz
+                && !src_of.contains_key(&dest.0)
+                && !disqualified.contains(&dest.0)
+            {
+                src_of.insert(dest.0, *src);
+            } else {
+                disqualified.insert(dest.0);
+            }
+        }
+    }
+    if src_of.is_empty() {
+        return;
+    }
+    // ── alias closure to a fixpoint (order-independent) ──
+    let mut root_of: FxHashMap<u32, u32> = src_of.keys().map(|&k| (k, k)).collect();
+    loop {
+        let mut grew = false;
+        for block in blocks.iter() {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::GetElementPtr { dest, base, .. } => {
+                        if let Some(&r) = root_of.get(&base.0) {
+                            grew |= root_of.insert(dest.0, r).is_none();
+                        }
+                    }
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(v),
+                    } => {
+                        if let Some(&r) = root_of.get(&v.0) {
+                            grew |= root_of.insert(dest.0, r).is_none();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    // ── escape scan: the local must be touched by nothing but its readers ──
+    for block in blocks.iter() {
+        for inst in &block.instructions {
+            match inst {
+                // Definitions and alias producers: not escapes.
+                Instruction::Alloca { .. }
+                | Instruction::GetElementPtr { .. }
+                | Instruction::Copy { .. }
+                | Instruction::Fence { .. } => {}
+                // A non-volatile read of the local: re-rooted at `src`.
+                Instruction::Load {
+                    volatile: false, ..
+                } => {}
+                // The copy itself: elided.
+                Instruction::Memcpy { dest, src, .. } if src_of.get(&dest.0) == Some(src) => {}
+                // Everything else: an alias in any operand is an escape. This
+                // includes writes through an alias, whose destination vanishes.
+                _ => inst.for_each_used_value(|v| {
+                    if let Some(&r) = root_of.get(&v) {
+                        disqualified.insert(r);
+                    }
+                }),
+            }
+        }
+        block.terminator.for_each_used_value(|v| {
+            if let Some(&r) = root_of.get(&v) {
+                disqualified.insert(r);
+            }
+        });
+    }
+    src_of.retain(|k, _| !disqualified.contains(k));
+    if src_of.is_empty() {
+        return;
+    }
+    // ── collapse copy chains to their ultimate source ──
+    //
+    // A candidate's source can itself be a candidate: `memcpy(a, b, 8)` where
+    // `b` is another small local with its own full-width copy. The inliner
+    // builds exactly those double-buffer chains for by-value struct
+    // parameters (`L2 home <- L1 home <- param pointer`). With a one-step
+    // rewrite, `a`'s readers would be re-rooted at `b` while `b`'s own copy
+    // and alloca are removed too, leaving a value with no definition -- an
+    // internal codegen error, or worse if the value happened to be reused.
+    // Resolving each chain to its last element makes the rewrite single-step
+    // again by construction. A cycle (`memcpy(a, b); memcpy(b, a)`) has no
+    // ultimate source and is left alone entirely.
+    let mut resolved: FxHashMap<u32, Value> = FxHashMap::default();
+    for (&cand, &src) in &src_of {
+        let mut cur = src;
+        let mut seen: FxHashSet<u32> = FxHashSet::default();
+        let mut chainable = true;
+        while let Some(&next) = src_of.get(&cur.0) {
+            if cur.0 == cand || !seen.insert(cur.0) {
+                chainable = false;
+                break;
+            }
+            cur = next;
+        }
+        if chainable {
+            resolved.insert(cand, cur);
+        }
+    }
+    let src_of = resolved;
+    if src_of.is_empty() {
+        return;
+    }
+    // ── rewrite: drop the local and its copy, re-root every reader ──
+    //
+    // Readers are `GetElementPtr`, `Copy`, non-volatile `Load`, and one more
+    // form that is easy to miss: a *surviving* `Memcpy` can read an elided
+    // local. The escape scan decides to skip a copy using the pre-retain map
+    // (`dest -> src`), so a copy whose destination is refused later -- by an
+    // escape elsewhere, or by the cycle rule -- survives while still reading a
+    // source that *is* elided. Its bytes are the ultimate source's bytes, so
+    // it is re-rooted there; leaving it alone would name a value whose
+    // definition was just removed.
+    for block in blocks.iter_mut() {
+        let parallel =
+            !block.source_spans.is_empty() && block.source_spans.len() == block.instructions.len();
+        let old_spans = std::mem::take(&mut block.source_spans);
+        let mut kept: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
+        let mut spans = Vec::with_capacity(old_spans.len());
+        for (idx, mut inst) in block.instructions.drain(..).enumerate() {
+            match &mut inst {
+                Instruction::Alloca { dest, .. } if src_of.contains_key(&dest.0) => continue,
+                Instruction::Memcpy { dest, .. } if src_of.contains_key(&dest.0) => continue,
+                Instruction::GetElementPtr { base, .. } => {
+                    if let Some(&src) = src_of.get(&base.0) {
+                        *base = src;
+                    }
+                }
+                Instruction::Load { ptr, .. } => {
+                    if let Some(&src) = src_of.get(&ptr.0) {
+                        *ptr = src;
+                    }
+                }
+                Instruction::Memcpy { src, .. } => {
+                    if let Some(&replacement) = src_of.get(&src.0) {
+                        *src = replacement;
+                    }
+                }
+                Instruction::Copy {
+                    src: Operand::Value(v),
+                    ..
+                } => {
+                    if let Some(&src) = src_of.get(&v.0) {
+                        *v = src;
+                    }
+                }
+                _ => {}
+            }
+            kept.push(inst);
+            if parallel {
+                spans.push(old_spans[idx]);
+            }
+        }
+        block.instructions = kept;
+        // Never drop a span vector: a vector that does not parallel the
+        // instruction list is better left as-is than discarded (imprecise
+        // debug locations beat none).
+        block.source_spans = if parallel { spans } else { old_spans };
+    }
+    // Machine-checked post-condition: nothing may still reference a local or
+    // copy that no longer exists. Debug builds pay one linear scan; the
+    // invariant is exactly what a future edit to this function could break.
+    debug_assert!(
+        blocks.iter().all(|b| {
+            let insts_clean = b.instructions.iter().all(|i| {
+                let mut clean = true;
+                i.for_each_used_value(|v| clean &= !src_of.contains_key(&v));
+                clean
+            });
+            let mut term_clean = true;
+            b.terminator
+                .for_each_used_value(|v| term_clean &= !src_of.contains_key(&v));
+            insts_clean && term_clean
+        }),
+        "elided memcpy local still referenced after rewrite"
+    );
 }
 
 /// IR type of a caller-side operand; needed to substitute call args at the
@@ -4618,6 +5041,7 @@ fn inline_call_site(
             block.source_spans = new_spans;
         }
     }
+    elide_readonly_local_memcpys(&mut inlined_blocks);
     // Replace every direct ParamRef use after removing ParamRef instructions.
     // This includes intrinsic arguments, phi incoming values, and terminators;
     // leaving even one remapped ParamRef unbound produces an invalid backend
@@ -7135,5 +7559,487 @@ mod extern_admission_tests {
                 "global leaf `{name}` should be admitted"
             );
         }
+    }
+
+    #[test]
+    fn elides_readonly_local_memcpy_in_call_free_inlined_body() {
+        use crate::common::types::AddressSpace;
+
+        let mut blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 8,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(10),
+                    size: 8,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(4)),
+                    ty: IrType::I32,
+                },
+                Instruction::Load {
+                    dest: Value(3),
+                    ptr: Value(2),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        }];
+        elide_readonly_local_memcpys(&mut blocks);
+        assert!(
+            !blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Memcpy { .. })),
+            "readonly local memcpy must be elided"
+        );
+        assert!(
+            blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::GetElementPtr {
+                    base: Value(10),
+                    ..
+                }
+            )),
+            "GEP base must be re-rooted at memcpy source"
+        );
+    }
+
+    /// One-block body: `alloca A(8); memcpy(A, S, 8); gep G = A+0; store 1, G`.
+    /// The store writes *through* an alias of the local, so the copy cannot be
+    /// elided: there would be no destination left to write.
+    #[test]
+    fn refuses_to_elide_when_a_field_is_written_through_an_alias() {
+        use crate::common::types::AddressSpace;
+
+        let mut blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 8,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(10),
+                    size: 8,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::I64,
+                },
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I64(1)),
+                    ptr: Value(2),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        }];
+        elide_readonly_local_memcpys(&mut blocks);
+        assert!(
+            blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Alloca { dest: Value(1), .. })),
+            "a local written through an alias must keep its alloca"
+        );
+        assert!(
+            blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Memcpy { dest: Value(1), .. })),
+            "a local written through an alias must keep its memcpy"
+        );
+    }
+
+    /// The alias closure must not depend on block *order*. `BasicBlock` order
+    /// is not dominance order: after inlining, the block that stores through a
+    /// `GetElementPtr` can precede the block that defines it. Judging the store
+    /// before discovering the alias (a single interleaved pass) elides the
+    /// local and leaves the store writing into the *source* object.
+    #[test]
+    fn alias_discovery_is_order_independent_across_blocks() {
+        use crate::common::types::AddressSpace;
+
+        let alloca_and_copy = vec![
+            Instruction::Alloca {
+                dest: Value(1),
+                ty: IrType::Ptr,
+                size: 8,
+                align: 4,
+                volatile: false,
+                semantic_volatile: false,
+            },
+            Instruction::Memcpy {
+                dest: Value(1),
+                src: Value(10),
+                size: 8,
+            },
+        ];
+        let mut blocks = vec![
+            // entry: the candidate local
+            BasicBlock {
+                label: BlockId(0),
+                instructions: alloca_and_copy,
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: Vec::new(),
+            },
+            // uses an alias defined only in block 2
+            BasicBlock {
+                label: BlockId(1),
+                instructions: vec![Instruction::Store {
+                    val: Operand::Const(IrConst::I64(1)),
+                    ptr: Value(2),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                }],
+                terminator: Terminator::Branch(BlockId(2)),
+                source_spans: Vec::new(),
+            },
+            // defines the alias
+            BasicBlock {
+                label: BlockId(2),
+                instructions: vec![Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::I64,
+                }],
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+            },
+        ];
+        elide_readonly_local_memcpys(&mut blocks);
+        assert!(
+            blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Memcpy { dest: Value(1), .. })),
+            "an escape discovered in a later block still disqualifies the local"
+        );
+    }
+
+    /// A `Copy` of the pointer is the same address, so it must join the alias
+    /// closure instead of counting as an escape. `mov`-style copies of the
+    /// alloca are routine in lowered IR; disqualifying them lost the elision.
+    #[test]
+    fn copy_of_the_local_is_an_alias_not_an_escape() {
+        use crate::common::types::AddressSpace;
+
+        let mut blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 8,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(10),
+                    size: 8,
+                },
+                Instruction::Copy {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(3),
+                    base: Value(2),
+                    offset: Operand::Const(IrConst::I64(4)),
+                    ty: IrType::I32,
+                },
+                Instruction::Load {
+                    dest: Value(4),
+                    ptr: Value(3),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
+            source_spans: Vec::new(),
+        }];
+        elide_readonly_local_memcpys(&mut blocks);
+        assert!(
+            !blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Memcpy { .. })),
+            "a copied pointer is still an alias, not an escape"
+        );
+        assert!(
+            !blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Alloca { .. })),
+            "the elided local's alloca must be removed"
+        );
+        assert!(
+            blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Copy {
+                    src: Operand::Value(Value(10)),
+                    ..
+                }
+            )),
+            "the pointer copy must be re-rooted at the memcpy source"
+        );
+    }
+
+    /// SROA-unlock candidates must use the *same* definition of "parameter
+    /// home" that `aggregate_sroa` uses (`param_alloca_values`), not entry-block
+    /// position: the inliner must never promise an unlock the splitter refuses.
+    #[test]
+    fn sroa_aliases_exclude_param_homes_recorded_by_the_block() {
+        use crate::common::types::AddressSpace;
+
+        let body = || {
+            vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 8,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(4)),
+                    ty: IrType::I32,
+                },
+                Instruction::Load {
+                    dest: Value(3),
+                    ptr: Value(2),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ]
+        };
+        let build = |param_home: bool| {
+            let mut func = IrFunction::new("f".into(), IrType::I64, vec![], false);
+            if param_home {
+                func.param_alloca_values = vec![Value(1)];
+            }
+            func.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: body(),
+                terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+                source_spans: Vec::new(),
+            });
+            func
+        };
+        let callees: FxHashMap<String, CalleeData> = FxHashMap::default();
+        assert!(
+            sroa_unlockable_aliases_of(&build(true), &callees).is_empty(),
+            "a parameter home is never an SROA unlock candidate"
+        );
+        let locals = sroa_unlockable_aliases_of(&build(false), &callees);
+        assert!(
+            locals.contains(&Value(1)) && locals.contains(&Value(2)),
+            "a non-escaping local aggregate and its GEP alias are candidates: {locals:?}"
+        );
+    }
+
+    /// Two locals chained by copies (the by-value struct parameter bridge the
+    /// inliner builds) must collapse to one source. A one-step rewrite would
+    /// leave the outer local's readers pointing at the inner local after the
+    /// inner one was removed.
+    #[test]
+    fn chained_copies_collapse_to_the_ultimate_source() {
+        use crate::common::types::AddressSpace;
+
+        let alloca = |dest: u32| Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size: 8,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        let mut blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                alloca(1), // outer local
+                alloca(2), // inner local
+                Instruction::Memcpy {
+                    dest: Value(2),
+                    src: Value(10),
+                    size: 8,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(2),
+                    size: 8,
+                },
+                Instruction::Load {
+                    dest: Value(3),
+                    ptr: Value(1),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        }];
+        elide_readonly_local_memcpys(&mut blocks);
+        assert!(
+            !blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Alloca { .. })),
+            "both locals and both copies must be elided"
+        );
+        assert!(
+            blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Load { ptr: Value(10), .. })),
+            "the reader must land on the ultimate source in one step"
+        );
+    }
+
+    /// The escape scan skips a copy by consulting `dest -> src` *before* the
+    /// map is pruned, so a copy whose destination is refused later survives
+    /// while reading a source that is still elided. That surviving copy must be
+    /// re-rooted instead of naming a value with no definition left.
+    #[test]
+    fn surviving_copy_reading_an_elided_local_is_rerooted() {
+        use crate::common::types::AddressSpace;
+
+        let alloca = |dest: u32| Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size: 8,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        let mut blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                alloca(1), // read into, then written through: refused
+                alloca(2), // read-only: elided
+                Instruction::Memcpy {
+                    dest: Value(2),
+                    src: Value(10),
+                    size: 8,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(2),
+                    size: 8,
+                },
+                // Refuses local 1 (a write through it) but leaves local 2
+                // read-only. The copy above is therefore not the elided copy
+                // of local 1 and survives -- while reading the elided local 2.
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I64(1)),
+                    ptr: Value(1),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        }];
+        elide_readonly_local_memcpys(&mut blocks);
+        assert!(
+            blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Alloca { dest: Value(1), .. })),
+            "the written-through local must survive"
+        );
+        assert!(
+            !blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Alloca { dest: Value(2), .. })),
+            "the read-only local is elided"
+        );
+        assert!(
+            blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(10),
+                    ..
+                }
+            )),
+            "the surviving copy must read the ultimate source, not the removed local"
+        );
+    }
+
+    /// Debug locations must survive the rewrite: dropping the span vector
+    /// silently loses `-g` line info for the whole block.
+    #[test]
+    fn elision_keeps_source_spans_parallel_to_instructions() {
+        use crate::common::types::AddressSpace;
+
+        let span = |start: u32| crate::common::source::Span::new(start, start + 1, 0);
+        let mut blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 8,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(10),
+                    size: 8,
+                },
+                Instruction::Load {
+                    dest: Value(2),
+                    ptr: Value(1),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: vec![span(1), span(2), span(3)],
+        }];
+        elide_readonly_local_memcpys(&mut blocks);
+        assert_eq!(blocks[0].instructions.len(), 1);
+        assert_eq!(blocks[0].source_spans.len(), 1);
+        assert_eq!(blocks[0].source_spans[0].start, 3);
     }
 }

@@ -132,8 +132,10 @@ struct Candidate {
 }
 
 /// The scalar types a field may have: fixed-width integers and floats whose
-/// size is a register. `Ptr` is deliberately excluded — a field holding an
-/// address invites the ABI/home-slot logic that the other forms own.
+/// size is a register, plus `Ptr`. A pointer field is itself one
+/// register-sized value, so it promotes like any other scalar; the
+/// address-escape refusal in `run_function` (an alloca whose address is
+/// stored as a value) is what keeps the ABI/home-slot hazards out.
 fn promotable_width(ty: IrType) -> Option<i64> {
     let w = ty_size(ty);
     match w {
@@ -147,7 +149,8 @@ fn promotable_width(ty: IrType) -> Option<i64> {
             | IrType::I64
             | IrType::U64
             | IrType::F32
-            | IrType::F64 => Some(w),
+            | IrType::F64
+            | IrType::Ptr => Some(w),
             _ => None,
         },
         _ => None,
@@ -355,12 +358,18 @@ pub(super) fn run_function(
                     });
                 }
                 Instruction::Store {
+                    val,
                     ptr,
                     ty,
                     volatile,
                     seg_override,
-                    ..
                 } => {
+                    if let Operand::Value(v) = val {
+                        let (val_root, _, _) = chain_root(&parent, &koff, v.0);
+                        if is_alloca(val_root) && !param_homes.contains(&val_root) {
+                            cand.entry(val_root).or_default().refuse = true;
+                        }
+                    }
                     let (root, off, cst) = chain_root(&parent, &koff, ptr.0);
                     if !is_alloca(root) || param_homes.contains(&root) {
                         continue;
@@ -820,4 +829,156 @@ fn root_of(parent: &FxHashMap<u32, u32>, mut v: u32) -> u32 {
         }
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::AddressSpace;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrModule, Terminator};
+
+    fn make_func(instructions: Vec<Instruction>, ret: Option<Operand>) -> IrFunction {
+        let mut func = IrFunction::new("test".to_string(), IrType::I64, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(ret),
+            source_spans: Vec::new(),
+        });
+        func
+    }
+
+    #[test]
+    fn splits_non_escaping_struct_with_ptr_and_int_fields() {
+        let mut module = IrModule::new();
+        module.functions.push(make_func(
+            vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 16,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::ParamRef {
+                    dest: Value(2),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::Store {
+                    val: Operand::Value(Value(2)),
+                    ptr: Value(1),
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(3),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::I64,
+                },
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I64(42)),
+                    ptr: Value(3),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Load {
+                    dest: Value(4),
+                    ptr: Value(3),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            Some(Operand::Value(Value(4))),
+        ));
+        let changed = super::super::run(&mut module);
+        assert!(changed > 0, "struct with Ptr + I64 fields must split");
+    }
+
+    #[test]
+    fn refuses_to_split_alloca_whose_address_is_stored_into_another_alloca() {
+        let mut module = IrModule::new();
+        module.functions.push(make_func(
+            vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 16,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Alloca {
+                    dest: Value(2),
+                    ty: IrType::Ptr,
+                    size: 16,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I64(10)),
+                    ptr: Value(1),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(3),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::I64,
+                },
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I64(20)),
+                    ptr: Value(3),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Store {
+                    val: Operand::Value(Value(1)),
+                    ptr: Value(2),
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(4),
+                    base: Value(2),
+                    offset: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::I64,
+                },
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I64(99)),
+                    ptr: Value(4),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Load {
+                    dest: Value(5),
+                    ptr: Value(1),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            Some(Operand::Value(Value(5))),
+        ));
+        super::super::run(&mut module);
+        let has_v1 = module.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .any(|i| matches!(i, Instruction::Alloca { dest: Value(1), .. }));
+        assert!(
+            has_v1,
+            "alloca v1 whose address is stored into v2 must not be split"
+        );
+    }
 }
