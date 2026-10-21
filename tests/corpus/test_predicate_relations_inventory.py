@@ -1,6 +1,8 @@
 """Every selected report and old deferral remains individually accountable."""
 import csv
 import json
+import importlib.util
+import sys
 from pathlib import Path
 import re
 import unittest
@@ -29,6 +31,25 @@ EXPECTED_PRIOR_DEFERRALS = {
 
 
 class PredicateRelationsInventory(unittest.TestCase):
+    def test_exact_and_supplemental_gcc_oracles_are_distinguished(self):
+        directory = ROOT / "tests/regression"
+        sys.path.insert(0, str(directory))
+        try:
+            spec = importlib.util.spec_from_file_location("predicate_relations_checker", directory / "check_llvm_predicate_relations.py")
+            checker = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(checker)
+        finally:
+            sys.path.pop(0)
+        for version in ("16.2", "16.2.0"):
+            self.assertTrue(checker.gcc_oracle_identity(version))
+        for version in ("16.0.1", "16.1.0"):
+            with self.assertRaises(ValueError):
+                checker.gcc_oracle_identity(version)
+            self.assertFalse(checker.gcc_oracle_identity(version, allow_snapshot=True))
+        for version in ("15.2.0", "17.0.1", "unknown"):
+            with self.assertRaises(ValueError):
+                checker.gcc_oracle_identity(version, allow_snapshot=True)
+
     def test_identity_sets_followups_and_current_dispositions(self):
         source = json.loads((DIRECTORY / "predicate-relations-sources.json").read_text())
         reports = source["reports"]
