@@ -36,11 +36,22 @@ trap 'rm -rf "$tmp"' EXIT
 # target/optimisation point and capture its output.  A build or run failure is
 # a gate failure, never a skip: both compilers accept this fixture by
 # construction, so a failure here is a real defect.
+#
+# The object is compiled by the compiler under test and linked by the HOST
+# driver, exactly like the ext-vector ABI grid: this gate measures the layout
+# the front end emitted, and a differential must not also vary the link
+# environment (a -m32 link is a property of the host toolchain, not of the
+# layout answer).
 build_and_run() {
     local compiler=$1 bits=$2 opt=$3 tag=$4
-    local exe=$tmp/$tag
-    if ! "$compiler" -m"$bits" -O"$opt" "$src" -o "$exe" >"$tmp/$tag.log" 2>&1; then
+    local obj=$tmp/$tag.o exe=$tmp/$tag
+    if ! "$compiler" -m"$bits" -O"$opt" -c "$src" -o "$obj" >"$tmp/$tag.log" 2>&1; then
         echo "FAIL: $tag: compile failed" >&2
+        sed -n '1,20p' "$tmp/$tag.log" >&2
+        return 1
+    fi
+    if ! "$gcc_bin" -m"$bits" -no-pie "$obj" -o "$exe" >>"$tmp/$tag.log" 2>&1; then
+        echo "FAIL: $tag: link failed" >&2
         sed -n '1,20p' "$tmp/$tag.log" >&2
         return 1
     fi
@@ -124,13 +135,20 @@ typedef unsigned long u3 __attribute__((ext_vector_type(3)));
 _Static_assert(sizeof(u3) == 32, "the LP64 three-lane unsigned long layout");
 int main(void) { return 0; }
 PCLAW
-if ! "$ccc" -m64 "$tmp/law_probe.c" -o "$tmp/law64" >"$tmp/law64.log" 2>&1; then
+# Compile-only (-c): the control is about the assert, so a link failure in a
+# host without a 32-bit crt must not be able to stand in for a rejection.
+if ! "$ccc" -m64 -c "$tmp/law_probe.c" -o "$tmp/law64.o" >"$tmp/law64.log" 2>&1; then
     echo "FAIL: control: the LP64 three-lane layout did not hold on -m64" >&2
     sed -n '1,10p' "$tmp/law64.log" >&2
     exit 1
 fi
-if "$ccc" -m32 "$tmp/law_probe.c" -o "$tmp/law32" >"$tmp/law32.log" 2>&1; then
+if "$ccc" -m32 -c "$tmp/law_probe.c" -o "$tmp/law32.o" >"$tmp/law32.log" 2>&1; then
     echo "FAIL: control: -m32 accepted the LP64 three-lane width" >&2
+    exit 1
+fi
+if ! grep -q 'the LP64 three-lane unsigned long layout' "$tmp/law32.log"; then
+    echo "FAIL: control: -m32 rejected the LP64 assert for the wrong reason" >&2
+    sed -n '1,10p' "$tmp/law32.log" >&2
     exit 1
 fi
 printf 'PASS: control: sizeof is evaluated in the target width domain (LP64 accepts, i686 rejects)\n'
