@@ -157,3 +157,33 @@ accesses to the merged `h` as interchangeable across the intervening 16-byte
 atomic. The candidates that were individually disabled without effect (`gvn`,
 `globaldse`, `dse`, `copyprop`, `simplify`, `constfold`, `licm`, `cvp`, `sccp`)
 should be re-tested in combination, since no single one of them is sufficient.
+
+### Narrowest reproducer found
+
+The merged address is the accumulator's, so the atomic object and the
+accumulator must both be file-scope. `gcc 16.2 -O2 -mcx16` returns 220; lccc
+`-O2` returns 181 with `gaddrcse` on and 220 with it off.
+
+```c
+typedef unsigned __int128 u128;
+static _Alignas(16) _Atomic u128 v;
+unsigned long long h;                 /* this is the address that gets merged */
+
+int main(void) {
+    u128 k = ((u128)0x0123456789ABCDEFULL << 64) | 0xFEDCBA9876543210ULL;
+#define MIX(x) do { u128 t_ = (x); \
+    h = h * 1000003ULL + (unsigned long long)t_ + (unsigned long long)(t_ >> 64); \
+} while (0)
+    {   __atomic_store_n(&v, k + 1, __ATOMIC_RELAXED);
+        u128 e = k + 1;
+        MIX((u128)__atomic_compare_exchange_n(&v, &e, k + 1 + (u128)1, 0,
+                                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+        MIX(e); MIX(v); }
+    {   __atomic_store_n(&v, k + 2, __ATOMIC_RELAXED);
+        u128 e = k + 2;
+        MIX((u128)__atomic_compare_exchange_n(&v, &e, k + 2 + (u128)1, 0,
+                                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+        MIX(e); MIX(v); }
+    return (int)h;
+}
+```
