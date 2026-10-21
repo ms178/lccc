@@ -8728,6 +8728,15 @@ impl ArchCodegen for X86Codegen {
         )
     }
 
+    fn peephole_pair_for_metric(&self, first: String, second: String) -> (String, String) {
+        crate::backend::x86::codegen::peephole::peephole_optimize_pair_with_config(
+            first,
+            second,
+            self.state_ref().ra_config.as_ref(),
+            self.optimize_for_size,
+        )
+    }
+
     fn emit_branch_nonzero(&mut self, label: &str) {
         self.state.emit("    testq %rax, %rax");
         self.state.out.emit_jcc_label("    jne", label);

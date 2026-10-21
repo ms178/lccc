@@ -4332,8 +4332,7 @@ fn emit_functions_and_sections(
                 crate::backend::state::EXPLORATORY_EMISSION
                     .store(true, std::sync::atomic::Ordering::Relaxed);
                 generate_function(cg, attr_align, func, source_mgr, file_table);
-                let chain_peep = cg.peephole_for_metric(cg.state_ref().out.buf[mark..].to_string());
-                let chain_count = crate::passes::block_layout::count_instruction_lines(&chain_peep);
+                let chain_raw = cg.state_ref().out.buf[mark..].to_string();
                 cg.state().out.buf.truncate(mark);
                 // Rebuild the pre-chain order: perm[j] is the ORIGINAL
                 // position of the block now at position j, so
@@ -4352,11 +4351,13 @@ fn emit_functions_and_sections(
                         .map(|b| b.expect("permutation covers every block"))
                         .collect();
                     generate_function(cg, attr_align, &alt, source_mgr, file_table);
-                    let orig_peep =
-                        cg.peephole_for_metric(cg.state_ref().out.buf[mark..].to_string());
+                    let orig_raw = cg.state_ref().out.buf[mark..].to_string();
+                    cg.state().out.buf.truncate(mark);
+                    let (chain_peep, orig_peep) = cg.peephole_pair_for_metric(chain_raw, orig_raw);
+                    let chain_count =
+                        crate::passes::block_layout::count_instruction_lines(&chain_peep);
                     let orig_count =
                         crate::passes::block_layout::count_instruction_lines(&orig_peep);
-                    cg.state().out.buf.truncate(mark);
                     crate::backend::state::EXPLORATORY_EMISSION
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     // Emit the measured winner for real: debug traces fire

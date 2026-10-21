@@ -23,7 +23,9 @@
 mod passes;
 mod types;
 
-pub(crate) use passes::{peephole_optimize, peephole_optimize_with_config};
+pub(crate) use passes::{
+    peephole_optimize, peephole_optimize_pair_with_config, peephole_optimize_with_config,
+};
 
 /// Lower the opaque TLS-descriptor pseudo after optimization. During the
 /// peephole it must be an unknown `%rax`-transforming instruction, not a normal

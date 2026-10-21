@@ -495,6 +495,273 @@ pub(crate) fn peephole_optimize_with_config(
     out
 }
 
+// ── Dual-layout metric pairs: scheduling policy, proof, determinism ────────
+//
+// `-O1` static-chain exploration emits two candidate block orders of one
+// function and peepholizes each to count instructions.  The candidates are
+// independent text fragments — no shared mutable state crosses the boundary:
+// the pipeline is text-in/text-out, `RaConfig` is plain data, and the only
+// thread-local state in the peephole is `#[cfg(test)]` — so the pair is the
+// coarsest safe and the finest profitable unit of codegen parallelism.
+//
+// The split is a *latency* optimization for one compiler process.  It is not
+// a throughput optimization: a `make -j N` build already saturates the host,
+// and this adds at most one thread at a time, only while a pair above the
+// floor is being measured.  `LCCC_PEEPHOLE_PAIR_PARALLEL=0` restores serial behaviour.
+
+/// Combined candidate bytes below which a pair stays serial.
+///
+/// Calibrated from measurement, not folklore.  On a current x86-64 host a
+/// scoped spawn+join costs 47-59 µs (10 000-iteration microbenchmark), while
+/// the peephole pipeline sustains roughly 0.4 bytes/µs, so splitting a pair
+/// pays for the spawn once a *candidate* holds ~130 bytes — its work is three
+/// orders of magnitude larger than the coupling cost well before 1 KiB.
+///
+/// 1 KiB is therefore an 8x safety floor over the measured crossover rather
+/// than a tuned optimum: it keeps degenerate fragments (a two-block stub) off
+/// the scheduler while leaving every pair the corpus actually produces
+/// splittable.  That corpus distribution is the reason the floor matters:
+/// 34 pairs across the `-O1` benchmark programs range 1 972 B - 16 063 B with
+/// a 5 714 B median, so a higher floor silently rejects most of them (the
+/// initial 8 KiB value rejected ~70% and cost 18.5% wall time on
+/// `glibc_memcmp`, measured with `scripts/measure_peephole_pair.py --arms
+/// serial,auto,forced`).
+pub(crate) const MIN_PARALLEL_PAIR_BYTES: usize = 1024;
+
+/// Which half of a dual-layout pair a metric peephole is processing.
+///
+/// Diagnostic only: the debug instruments name their output files from it so
+/// the two candidates cannot overwrite each other (they did, and once the pair
+/// ran concurrently the survivor became nondeterministic).  No pass reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetricCandidate {
+    Chain,
+    Original,
+}
+
+impl MetricCandidate {
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Chain => "-chain",
+            Self::Original => "-orig",
+        }
+    }
+}
+
+thread_local! {
+    static METRIC_CANDIDATE: std::cell::Cell<Option<MetricCandidate>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Label the fragment a metric peephole is processing, restoring the previous
+/// label on both normal return and unwind.  Thread-local by construction, so a
+/// concurrent candidate cannot see or clear the other's label.
+fn tag_metric_candidate<R>(candidate: MetricCandidate, job: impl FnOnce() -> R) -> R {
+    struct Untag(Option<MetricCandidate>);
+    impl Drop for Untag {
+        fn drop(&mut self) {
+            METRIC_CANDIDATE.with(|slot| slot.set(self.0));
+        }
+    }
+    let _untag = Untag(METRIC_CANDIDATE.with(|slot| slot.replace(Some(candidate))));
+    job()
+}
+
+/// `-chain`/`-orig` suffix for an instrument filename; empty outside a pair.
+fn metric_candidate_suffix() -> &'static str {
+    METRIC_CANDIDATE
+        .with(std::cell::Cell::get)
+        .map_or("", MetricCandidate::suffix)
+}
+
+/// Insert that suffix before the extension, so an explored function keeps both
+/// candidates instead of one silently replacing the other.
+fn candidate_path(path: &str) -> std::path::PathBuf {
+    let suffix = metric_candidate_suffix();
+    let mut out = std::path::PathBuf::from(path);
+    if suffix.is_empty() {
+        return out;
+    }
+    let stem = out
+        .file_stem()
+        .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let name = match out.extension() {
+        Some(ext) => format!("{stem}{suffix}.{}", ext.to_string_lossy()),
+        None => format!("{stem}{suffix}"),
+    };
+    out.set_file_name(name);
+    out
+}
+
+/// `LCCC_PEEPHOLE_PAIR_PARALLEL` — kill switch and A/B lever, resolved once.
+///
+/// `0`/`off`/`false` never spawns; `1`/`on`/`true` always spawns on a
+/// multi-thread host, ignoring the size gate (that is what makes the parallel
+/// branch reachable in a test on any machine); unset/`auto`/anything else
+/// keeps the size-and-host heuristic.  Unrecognised values never abort: a
+/// typo degrades to the default rather than failing a build.
+fn pair_override() -> Option<bool> {
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let raw = std::env::var("LCCC_PEEPHOLE_PAIR_PARALLEL").ok()?;
+        let raw = raw.trim();
+        if raw == "1" || raw.eq_ignore_ascii_case("true") || raw.eq_ignore_ascii_case("on") {
+            return Some(true);
+        }
+        if raw == "0" || raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("off") {
+            return Some(false);
+        }
+        None
+    })
+}
+
+/// Host capability, resolved once: `available_parallelism` is a `sysconf` and
+/// a cgroup read, and a pair decision happens once per explored function.
+fn host_is_multi_threaded() -> bool {
+    static MULTI: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MULTI.get_or_init(|| std::thread::available_parallelism().is_ok_and(|n| n.get() > 1))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairMode {
+    Serial,
+    Parallel,
+}
+
+impl PairMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Serial => "serial",
+            Self::Parallel => "parallel",
+        }
+    }
+}
+
+/// The scheduling decision, as a pure function of its three inputs.
+///
+/// Kept pure and separate from [`pair_override`]/[`host_is_multi_threaded`] so
+/// the whole policy matrix is testable without touching process environment or
+/// host topology — the cached env lookups make an environment-driven test
+/// order-dependent, and `cargo test` runs tests concurrently in one process.
+fn pair_mode_for(forced: Option<bool>, multi_thread: bool, combined_bytes: usize) -> PairMode {
+    let spawn = match forced {
+        Some(forced) => forced,
+        None => combined_bytes >= MIN_PARALLEL_PAIR_BYTES,
+    };
+    // A forced-parallel request still cannot spawn usefully on one hardware
+    // thread: the worker would timeshare the caller it is meant to overlap.
+    if spawn && multi_thread {
+        PairMode::Parallel
+    } else {
+        PairMode::Serial
+    }
+}
+
+/// Pair scheduling counters.  They are the only observable proof that the
+/// parallel branch executed: by contract both modes emit byte-identical text,
+/// so no assembly-level assertion can distinguish them.
+static PAIRS_PARALLEL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PAIRS_SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PAIRS_DEDUPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+const RELAXED: std::sync::atomic::Ordering = std::sync::atomic::Ordering::Relaxed;
+
+/// `(parallel, serial, deduped)` pair counts since process start.  Counters
+/// are process-global, so tests must assert on deltas, never on absolutes.
+pub(crate) fn pair_counters() -> (usize, usize, usize) {
+    (
+        PAIRS_PARALLEL.load(RELAXED),
+        PAIRS_SERIAL.load(RELAXED),
+        PAIRS_DEDUPED.load(RELAXED),
+    )
+}
+
+/// Run two independent jobs, concurrently when `mode` says so.
+///
+/// The worker takes the first job and the caller keeps the second.  The two
+/// candidates of a pair are the same function under two block orders, so their
+/// work is near-equal by construction and the assignment order cannot skew the
+/// critical path; keeping the simpler rule is what makes the result ordering
+/// (argument order, always) obvious by inspection.  At most one worker exists
+/// per pair, pairs never nest, and a worker panic is resumed on the caller so
+/// the failure is identical to the serial path.
+fn run_pair<A, B, R>(mode: PairMode, first: A, second: B) -> (R, R)
+where
+    A: FnOnce() -> R + Send,
+    B: FnOnce() -> R,
+    R: Send,
+{
+    if mode == PairMode::Serial {
+        return (first(), second());
+    }
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(first);
+        let second_result = second();
+        let first_result = match worker.join() {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        (first_result, second_result)
+    })
+}
+
+/// Optimize two independent dual-layout candidates, concurrently when the pair
+/// is worth splitting (see [`pair_mode_for`]).
+///
+/// The metric inputs are temporary function fragments, so this affects neither
+/// whole-file peephole ordering nor emitted assembly: the output is a pure
+/// function of each fragment and the policy, exactly as for the serial path.
+pub(crate) fn peephole_optimize_pair_with_config(
+    first: String,
+    second: String,
+    ra_config: &RaConfig,
+    optimize_for_size: bool,
+) -> (String, String) {
+    // Identical fragments have identical results by construction, because the
+    // pipeline is a pure function of text plus policy.  `String` equality
+    // exits at the first differing byte — for two block orders that is the
+    // first divergent instruction — so the check cannot cost more than a
+    // fraction of the pass mix it can skip.
+    if first == second {
+        PAIRS_DEDUPED.fetch_add(1, RELAXED);
+        let optimized = peephole_optimize_with_config(first, ra_config, optimize_for_size);
+        return (optimized.clone(), optimized);
+    }
+
+    // Saturating add: each `String` length is below `isize::MAX`, so the sum
+    // cannot wrap on any supported target; saturating keeps the threshold
+    // comparison total without introducing a panic path.
+    let combined = first.len().saturating_add(second.len());
+    let mode = pair_mode_for(pair_override(), host_is_multi_threaded(), combined);
+    match mode {
+        PairMode::Parallel => PAIRS_PARALLEL.fetch_add(1, RELAXED),
+        PairMode::Serial => PAIRS_SERIAL.fetch_add(1, RELAXED),
+    };
+    if std::env::var_os("CCC_TIME_PEEPHOLE").is_some() {
+        let (parallel, serial, deduped) = pair_counters();
+        eprintln!(
+            "[pair] chain={}B orig={}B mode={} parallel={parallel} serial={serial} deduped={deduped}",
+            first.len(),
+            second.len(),
+            mode.label()
+        );
+    }
+
+    run_pair(
+        mode,
+        || {
+            tag_metric_candidate(MetricCandidate::Chain, || {
+                peephole_optimize_with_config(first, ra_config, optimize_for_size)
+            })
+        },
+        || {
+            tag_metric_candidate(MetricCandidate::Original, || {
+                peephole_optimize_with_config(second, ra_config, optimize_for_size)
+            })
+        },
+    )
+}
+
 /// Delete GP pure writes whose value is provably dead, to a local fixpoint:
 /// retiring one relay can expose the next in an `mov A,B; mov B,C; ...` chain
 /// (each proof sees the reads the previous deletion removed).  Shared by the
@@ -729,7 +996,13 @@ fn peephole_optimize_inner(
             }
             if let Some(dir) = &trace_dir {
                 let _ = std::fs::create_dir_all(dir);
-                let path = dir.join(format!("{:03}-p{}-{}.s", trace_seq, iter, name));
+                let path = dir.join(format!(
+                    "{:03}-p{}-{}{}.s",
+                    trace_seq,
+                    iter,
+                    name,
+                    metric_candidate_suffix()
+                ));
                 let _ = std::fs::write(path, store.build_result(|i| infos[i].is_nop()));
                 trace_seq += 1;
             }
@@ -2004,6 +2277,174 @@ fn in_function(body: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Dual-layout metric pair: scheduling, determinism, instruments ──────
+
+    fn metric_candidate(name: &str, immediate: i32, padding: usize) -> String {
+        let mut text = format!(".text\n{name}:\n.cfi_startproc\n    movl ${immediate}, %eax\n");
+        for _ in 0..padding {
+            text.push_str("    nop\n");
+        }
+        text.push_str("    ret\n.cfi_endproc\n");
+        text
+    }
+
+    /// The whole scheduling matrix: both sides of the size gate, both forced
+    /// modes, and the single-thread host that must never spawn — a worker
+    /// there would timeshare the caller it is meant to overlap.
+    #[test]
+    fn pair_mode_matrix_honours_gate_override_and_host() {
+        assert_eq!(
+            pair_mode_for(None, true, MIN_PARALLEL_PAIR_BYTES - 1),
+            PairMode::Serial
+        );
+        assert_eq!(
+            pair_mode_for(None, true, MIN_PARALLEL_PAIR_BYTES),
+            PairMode::Parallel,
+            "the gate is inclusive"
+        );
+        assert_eq!(pair_mode_for(None, false, usize::MAX), PairMode::Serial);
+        assert_eq!(pair_mode_for(Some(true), true, 0), PairMode::Parallel);
+        assert_eq!(pair_mode_for(Some(true), false, 0), PairMode::Serial);
+        assert_eq!(
+            pair_mode_for(Some(false), true, usize::MAX),
+            PairMode::Serial,
+            "the kill switch wins over size and host"
+        );
+    }
+
+    /// `run_pair` is the seam that lets every host test the concurrent branch:
+    /// both jobs must run exactly once, and results must keep argument order
+    /// regardless of which side won the race.
+    #[test]
+    fn run_pair_runs_both_jobs_once_and_keeps_argument_order() {
+        for mode in [PairMode::Serial, PairMode::Parallel] {
+            let executed = std::sync::atomic::AtomicUsize::new(0);
+            let first = || {
+                executed.fetch_add(1, RELAXED);
+                11usize
+            };
+            let second = || {
+                executed.fetch_add(1, RELAXED);
+                22usize
+            };
+            assert_eq!(run_pair(mode, first, second), (11, 22), "{mode:?} order");
+            assert_eq!(executed.load(RELAXED), 2, "{mode:?} ran both jobs");
+        }
+    }
+
+    /// A panicking candidate must abort the pair with its own payload, exactly
+    /// like the serial path: `join().unwrap()` would have flattened the payload
+    /// and added a panic site.
+    #[test]
+    fn worker_panic_is_resumed_on_the_caller() {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_pair(
+                PairMode::Parallel,
+                || -> usize { panic!("pair payload") },
+                || 2usize,
+            )
+        }));
+        match outcome {
+            Ok(values) => panic!("worker panic must surface on the caller, got {values:?}"),
+            Err(payload) => assert_eq!(payload.downcast_ref::<&str>(), Some(&"pair payload")),
+        }
+    }
+
+    /// Identical candidates cannot produce different results (the pipeline is a
+    /// pure function of text plus policy), so the second pass is skipped — and
+    /// the counter proves the shortcut, not just the output.
+    #[test]
+    fn identical_candidates_are_peepholized_once() {
+        let config = RaConfig::default();
+        let text = metric_candidate("same", 17, 1200);
+        let expected = peephole_optimize_with_config(text.clone(), &config, false);
+        let before = pair_counters().2;
+        let (first, second) =
+            peephole_optimize_pair_with_config(text.clone(), text, &config, false);
+        assert_eq!(first, expected);
+        assert_eq!(second, expected);
+        assert!(
+            pair_counters().2 > before,
+            "the dedupe counter must advance (deltas only: it is process-global)"
+        );
+    }
+
+    /// End to end through the production entry point, on fragments large
+    /// enough to cross the parallel gate. Each side must equal its independent
+    /// serial result in both size modes; the candidates stay observably
+    /// distinct, so returning one result twice cannot satisfy the assertions.
+    #[test]
+    fn dual_layout_pair_is_byte_identical_to_serial_metrics() {
+        let config = RaConfig::default();
+        for optimize_for_size in [false, true] {
+            let first = metric_candidate("first", 17, 1200);
+            let second = metric_candidate("second", 29, 1200);
+            let expected_first =
+                peephole_optimize_with_config(first.clone(), &config, optimize_for_size);
+            let expected_second =
+                peephole_optimize_with_config(second.clone(), &config, optimize_for_size);
+            assert_ne!(
+                expected_first, expected_second,
+                "the candidates must stay distinguishable"
+            );
+            let (actual_first, actual_second) =
+                peephole_optimize_pair_with_config(first, second, &config, optimize_for_size);
+            assert_eq!(actual_first, expected_first, "size={optimize_for_size}");
+            assert_eq!(actual_second, expected_second, "size={optimize_for_size}");
+        }
+    }
+
+    /// The candidate label is scoped, nests, and is restored on unwind — the
+    /// property that keeps a concurrent candidate from clearing the other's
+    /// label.
+    #[test]
+    fn metric_candidate_label_is_scoped_and_restored_on_unwind() {
+        assert!(metric_candidate_suffix().is_empty(), "untagged by default");
+        assert_eq!(
+            tag_metric_candidate(MetricCandidate::Chain, metric_candidate_suffix),
+            "-chain"
+        );
+        let nested = tag_metric_candidate(MetricCandidate::Original, || {
+            tag_metric_candidate(MetricCandidate::Chain, metric_candidate_suffix)
+        });
+        assert_eq!(nested, "-chain", "the inner label wins while it runs");
+        assert!(
+            metric_candidate_suffix().is_empty(),
+            "both scopes restored their predecessor"
+        );
+        let unwound = std::panic::catch_unwind(|| {
+            tag_metric_candidate(MetricCandidate::Original, || panic!("unwind the label"))
+        });
+        assert!(unwound.is_err());
+        assert!(
+            metric_candidate_suffix().is_empty(),
+            "an unwinding job still restores the label"
+        );
+    }
+
+    /// Both candidates of a pair must reach distinct instrument files, or the
+    /// second silently replaces the first and the survivor depends on which
+    /// side of the pair finished last.
+    #[test]
+    fn candidate_path_keeps_both_candidates_of_a_pair() {
+        assert_eq!(
+            candidate_path("/tmp/dump.s"),
+            std::path::PathBuf::from("/tmp/dump.s"),
+            "no label, no suffix"
+        );
+        let chain = tag_metric_candidate(MetricCandidate::Chain, || candidate_path("/tmp/dump.s"));
+        let orig =
+            tag_metric_candidate(MetricCandidate::Original, || candidate_path("/tmp/dump.s"));
+        assert_eq!(chain, std::path::PathBuf::from("/tmp/dump-chain.s"));
+        assert_eq!(orig, std::path::PathBuf::from("/tmp/dump-orig.s"));
+        assert_ne!(chain, orig);
+        assert_eq!(
+            tag_metric_candidate(MetricCandidate::Chain, || candidate_path("/tmp/dump")),
+            std::path::PathBuf::from("/tmp/dump-chain"),
+            "a path without an extension still gains the suffix"
+        );
+    }
 
     #[test]
     fn test_never_read_store_eliminated_in_six_push_nofp_function() {

@@ -93,6 +93,27 @@ passes; the backend peepholes are documented per backend
   the redefinition* must be a rewritable address use. A `ret` invalidates it
   for x0-x7, which carry the return value.
 
+- **Dual-layout metric pairs** (`-O1`, x86-64) — when `block_layout`'s static
+  chain cannot predict whether its reordering helps, the backend emits both
+  candidate orders, runs the full text peephole over each and keeps the smaller
+  instruction count. The two candidates are independent fragments, so the pair
+  is split across a scoped worker and the caller. This is a compile-*latency*
+  change only: the pipeline is text-in/text-out, `RaConfig` is plain data, and
+  generated assembly is identical by contract.
+  `LCCC_PEEPHOLE_PAIR_PARALLEL` controls it: `0`/`off` never spawns, `1`/`on`
+  always spawns on a multi-thread host (the A/B lever used by the gate), and
+  unset/`auto` keeps the heuristic — serial below `MIN_PARALLEL_PAIR_BYTES`
+  (1 KiB combined, an 8x floor over the measured spawn crossover) or on a
+  single-thread host. `CCC_TIME_PEEPHOLE=1` prints one
+  `[pair] chain=…B orig=…B mode=… parallel=… serial=… deduped=…` line per pair,
+  which is the only way to observe the split (both modes emit the same text).
+  `tests/regression/check_peephole_pair_parallel.py` pins assembly identity
+  across the three modes, the kill switch, the single-thread fallback and pair
+  liveness; `scripts/measure_peephole_pair.py` regenerates the timings.
+  Identical candidates skip the second pass, and `CCC_DUMP_ASM` /
+  `CCC_PEEPHOLE_TRACE` now suffix their files `-chain`/`-orig` so an explored
+  function keeps both candidates instead of one overwriting the other.
+
 - **Identical basic-block merging** (`merge_identical_blocks`) — a block is
   deleted and its predecessors retargeted when its instruction text matches
   another block's and either (a) both have the **same non-empty predecessor

@@ -1,0 +1,39 @@
+{
+  "effective_threads": 2,
+  "sources": {
+    "expat_siphash24.c": {
+      "assembly_sha256": "ed46e8e31686eaafdce889d9149c2a30708085680d4ab637901b56ff6642efb6",
+      "pairs_auto": [
+        "parallel",
+        "parallel"
+      ],
+      "pairs_forced": [
+        "parallel",
+        "parallel"
+      ]
+    },
+    "glibc_memcmp.c": {
+      "assembly_sha256": "5120f13f427a0d8e417c1214ec58e6bc753eb512b3ac1cb294aa1cb8a2899dd4",
+      "pairs_auto": [
+        "parallel",
+        "parallel",
+        "parallel"
+      ],
+      "pairs_forced": [
+        "parallel",
+        "parallel",
+        "parallel"
+      ]
+    },
+    "zstd_count.c": {
+      "assembly_sha256": "1e8c43207d9bf43c9600165bf71ce49e98a274342f1ba04cc768e569124caf18",
+      "pairs_auto": [
+        "parallel"
+      ],
+      "pairs_forced": [
+        "parallel"
+      ]
+    }
+  },
+  "total_pairs": 6
+}

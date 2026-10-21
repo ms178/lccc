@@ -1564,6 +1564,10 @@ jobs:
         python3 tests/regression/check_llvm_scalar_facts.py
         python3 tests/regression/check_llvm_guarded_folds.py
         python3 tests/regression/check_llvm_word_counts.py
+        # Dual-layout metric pair contract: identical assembly across
+        # serial/heuristic/forced scheduling, kill switch honoured, no spawn
+        # on a single-thread host, and at least one pair actually measured.
+        python3 tests/regression/check_peephole_pair_parallel.py
         bash tests/regression/check_tls_model_option.sh
         bash tests/regression/check_f128_sign_intrinsics_strict_fp.sh
         bash tests/regression/check_fma_builtin_strict_fp.sh
