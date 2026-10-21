@@ -6003,7 +6003,11 @@ mod dominance_snapshot_contract {
         use crate::ir::reexports::IrCmpOp;
         // Disable `compare_recurrence` to prove that `find_derived_exprs` does
         // not depend on any target-specific compare-recurrence switch.
-        super::set_compare_recurrence_enabled(false);
+        let _restore = crate::test_support::ScopedFlag::new(
+            super::compare_recurrence::enabled,
+            super::set_compare_recurrence_enabled,
+            false,
+        );
 
         let build_loop = |shift: i64, use_as_gep: bool| -> IrFunction {
             let mut f = IrFunction::new("affine_shl".into(), IrType::U64, vec![], false);
@@ -6082,6 +6086,10 @@ mod dominance_snapshot_contract {
                 source_spans: vec![],
             });
             f.next_value_id = 6;
+            f.next_label = 3;
+            let mut violations = Vec::new();
+            crate::passes::verify::verify_function(&f, "affine_shl_fixture", &mut violations);
+            assert!(violations.is_empty(), "invalid fixture: {violations:?}");
             f
         };
 
@@ -6102,14 +6110,99 @@ mod dominance_snapshot_contract {
                 .collect()
         };
 
-        // 1. Non-GEP scalar shift `(i + 1) << 2` is recognized at shift <= 3
-        //    even with `compare_recurrence` disabled.
-        assert_eq!(inspect(&build_loop(2, false)), vec![(4, 1)]);
-        // 2. Wide GEP shift `(i + 1) << 4` (stride 16, beyond hardware SIB/lsl
-        //    scale) is recognized for GEP uses across all targets.
-        assert_eq!(inspect(&build_loop(4, true)), vec![(16, 1)]);
-        // 3. Hardware scaled-index GEP shift `(i + 1) << 2` (stride 4) is left
-        //    for backend indexed folding (`[xB, xI, lsl #2]` / SIB).
-        assert!(inspect(&build_loop(2, true)).is_empty());
+        for shift in 0..=4 {
+            let stride = 1i64 << shift;
+            assert_eq!(inspect(&build_loop(shift, false)), vec![(stride, 1)]);
+            let expected = if shift <= 3 {
+                vec![]
+            } else {
+                vec![(stride, 1)]
+            };
+            assert_eq!(inspect(&build_loop(shift, true)), expected);
+
+            // The new policy is deliberately GEP-specific. Pointer-integer
+            // Adds and vector byte-offset triples retain their existing affine
+            // eligibility; broadening the profitability veto needs separate
+            // target measurements, not an assumed universal scale rule.
+            for vector in [false, true] {
+                let mut f = build_loop(shift, true);
+                f.blocks[1].instructions[3] = if vector {
+                    Instruction::Intrinsic {
+                        dest: Some(Value(4)),
+                        op: crate::ir::reexports::IntrinsicOp::VecLoadI32x4,
+                        dest_ptr: None,
+                        args: vec![Operand::Value(Value(0)), Operand::Value(Value(3))],
+                    }
+                } else {
+                    Instruction::BinOp {
+                        dest: Value(4),
+                        op: IrBinOp::Add,
+                        ty: IrType::U64,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Value(Value(3)),
+                    }
+                };
+                if !vector {
+                    f.blocks[1].instructions.push(Instruction::Load {
+                        dest: Value(6),
+                        ptr: Value(4),
+                        ty: IrType::U8,
+                        volatile: false,
+                        seg_override: crate::common::types::AddressSpace::Default,
+                    });
+                    f.next_value_id = 7;
+                }
+                let mut violations = Vec::new();
+                crate::passes::verify::verify_function(
+                    &f,
+                    "affine_shl_other_address",
+                    &mut violations,
+                );
+                assert!(violations.is_empty(), "{violations:?}");
+                assert_eq!(
+                    inspect(&f),
+                    vec![(stride, 1)],
+                    "shift={shift}, vector={vector}"
+                );
+            }
+
+            // Alias glue and a simultaneous scalar user must not hide a GEP.
+            for cast in [false, true] {
+                let mut f = build_loop(shift, true);
+                let glue = if cast {
+                    Instruction::Cast {
+                        dest: Value(6),
+                        src: Operand::Value(Value(3)),
+                        from_ty: IrType::U64,
+                        to_ty: IrType::I64,
+                    }
+                } else {
+                    Instruction::Copy {
+                        dest: Value(6),
+                        src: Operand::Value(Value(3)),
+                    }
+                };
+                f.blocks[1].instructions.insert(3, glue);
+                if let Instruction::GetElementPtr { offset, .. } = &mut f.blocks[1].instructions[4]
+                {
+                    *offset = Operand::Value(Value(6));
+                }
+                f.blocks[1].instructions.push(Instruction::Cmp {
+                    dest: Value(7),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I64(1024)),
+                    ty: IrType::U64,
+                });
+                f.next_value_id = 8;
+                let mut violations = Vec::new();
+                crate::passes::verify::verify_function(&f, "affine_shl_alias", &mut violations);
+                assert!(
+                    violations.is_empty(),
+                    "invalid alias fixture: {violations:?}"
+                );
+                assert_eq!(inspect(&f), expected, "shift={shift}, cast={cast}");
+            }
+        }
     }
 }

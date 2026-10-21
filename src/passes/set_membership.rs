@@ -829,19 +829,18 @@ fn fold_round(func: &mut IrFunction) -> usize {
                 best = inside;
             }
         }
-        let (Some(lo), Some(hi)) = (
-            best.iter()
-                .filter(|_| best.len() >= 3)
-                .map(|&i| bounds(chain[i].kind).0)
-                .min(),
-            best.iter()
-                .filter(|_| best.len() >= 3)
-                .map(|&i| bounds(chain[i].kind).1)
-                .max(),
-        ) else {
+        if best.len() < 3 {
             bi = chain.last().map_or(bi + 1, |m| m.bi + 1);
             continue;
-        };
+        }
+        // The cardinality guard guarantees a nonempty cluster. Seed the
+        // reduction from its first member, then visit each other member once.
+        let (lo, hi) = best[1..]
+            .iter()
+            .fold(bounds(chain[best[0]].kind), |(lo, hi), &i| {
+                let (l, h) = bounds(chain[i].kind);
+                (lo.min(l), hi.max(h))
+            });
         let absorbed = best;
         let span = hi - lo;
         let mut mask: u64 = 0;
@@ -1584,6 +1583,39 @@ mod tests {
         ];
         f.next_value_id = 100;
         assert_eq!(run_function(&mut f), 0);
+    }
+
+    #[test]
+    fn cluster_span_boundaries_preserve_every_byte_value() {
+        for end in [31, 32, 63, 64] {
+            let x = Value(1);
+            let mut f = IrFunction::new("span_boundary".into(), IrType::I64, vec![], false);
+            f.blocks = vec![
+                eq_block(0, x, 0, 90, 1, Value(70)),
+                eq_block(1, x, 5, 90, 2, Value(71)),
+                tail_block(2, x, end, 90, Value(72)),
+                join_block(
+                    90,
+                    Value(50),
+                    vec![
+                        (Operand::Const(IrConst::I64(1)), BlockId(0)),
+                        (Operand::Const(IrConst::I64(1)), BlockId(1)),
+                        (Operand::Value(Value(72)), BlockId(2)),
+                    ],
+                ),
+            ];
+            f.next_value_id = 100;
+            let original = f.clone();
+            let folded = run_function(&mut f);
+            assert_eq!(folded, usize::from(end <= 63), "span={end}");
+            for byte in 0..=255u8 {
+                assert_eq!(
+                    eval(&f, byte),
+                    eval(&original, byte),
+                    "span={end}, byte={byte}"
+                );
+            }
+        }
     }
 
     #[test]

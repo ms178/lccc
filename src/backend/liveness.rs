@@ -41,6 +41,30 @@ pub struct LiveInterval {
     pub value_id: u32,
 }
 
+/// Count instructions plus terminators without consuming the undefined-point
+/// sentinel (`u32::MAX`). The final exclusive endpoint must also fit below it.
+/// Kept separate so boundary behavior is testable without enormous IR fixtures.
+fn checked_program_point_count(lengths: impl IntoIterator<Item = usize>) -> Option<u32> {
+    lengths.into_iter().try_fold(0u32, |total, len| {
+        total
+            .checked_add(u32::try_from(len).ok()?)?
+            .checked_add(1)
+            .filter(|&end| end < u32::MAX)
+    })
+}
+
+/// Reject unsupported functions before constructing any liveness coordinates.
+/// A capacity failure is deliberately explicit (reported by the compiler's
+/// worker-panic diagnostic), never a saturated/aliased coordinate or lost range.
+/// This O(blocks) preflight is shared by ordinary and synthetic liveness.
+pub(crate) fn validate_program_point_capacity(func: &IrFunction) {
+    assert!(
+        checked_program_point_count(func.blocks.iter().map(|b| b.instructions.len())).is_some(),
+        "function '{}' exceeds the supported liveness program-point capacity",
+        func.name,
+    );
+}
+
 /// Result of liveness analysis.
 ///
 /// Extra fields beyond `intervals` / `call_points` / `block_loop_depth` are
@@ -408,6 +432,7 @@ pub fn compute_live_intervals_with_hidden_reads(
     func: &IrFunction,
     hidden_reads: &FxHashMap<u32, Vec<u32>>,
 ) -> LivenessResult {
+    validate_program_point_capacity(func);
     let num_blocks = func.blocks.len();
     if num_blocks == 0 {
         return LivenessResult {
@@ -3440,5 +3465,26 @@ mod tests {
             .filter(|iv| iv.value_id == 0)
             .count();
         assert_eq!(n, 1, "{:?}", result.intervals);
+    }
+}
+
+#[cfg(test)]
+mod program_point_capacity_tests {
+    use super::checked_program_point_count;
+
+    #[test]
+    fn endpoints_reserve_the_undefined_sentinel_and_never_saturate() {
+        assert_eq!(checked_program_point_count([]), Some(0));
+        assert_eq!(checked_program_point_count([0, 2]), Some(4));
+        assert_eq!(
+            checked_program_point_count([u32::MAX as usize - 2]),
+            Some(u32::MAX - 1)
+        );
+        assert_eq!(checked_program_point_count([u32::MAX as usize - 1]), None);
+        assert_eq!(
+            checked_program_point_count([u32::MAX as usize - 2, 0]),
+            None
+        );
+        assert_eq!(checked_program_point_count([usize::MAX]), None);
     }
 }
