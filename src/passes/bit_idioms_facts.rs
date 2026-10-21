@@ -95,6 +95,19 @@ impl Context<'_> {
                     IrBinOp::And => (a.0 | b.0, a.1 & b.1),
                     IrBinOp::Or => (a.0 & b.0, a.1 | b.1),
                     IrBinOp::Xor => ((a.0 & b.0) | (a.1 & b.1), (a.0 & b.1) | (a.1 & b.0)),
+                    IrBinOp::LShr | IrBinOp::Shl
+                        if const_in_ring(*rhs, w).is_some_and(|n| n < w as u64) =>
+                    {
+                        let n = const_in_ring(*rhs, w).unwrap_or(0) as u32;
+                        if *op == IrBinOp::LShr {
+                            ((a.0 >> n) | (mask ^ (mask >> n)), a.1 >> n)
+                        } else {
+                            (
+                                ((a.0 << n) | (mask ^ ((mask << n) & mask))) & mask,
+                                (a.1 << n) & mask,
+                            )
+                        }
+                    }
                     IrBinOp::Add | IrBinOp::Sub if a.0 | a.1 == mask && b.0 | b.1 == mask => {
                         let n = if *op == IrBinOp::Add {
                             a.1.wrapping_add(b.1)
@@ -206,6 +219,19 @@ impl Context<'_> {
             }) if scalar(*ty) => {
                 let w = ty.size() * 8;
                 let mask = u64::MAX >> (64 - w);
+                if ((*op == IrCmpOp::Ne && truth) || (*op == IrCmpOp::Eq && !truth))
+                    && const_in_ring(*rhs, w) == Some(0)
+                    && let Some((base, m)) = self.with_const(*lhs, IrBinOp::And, *ty)
+                    && m.is_power_of_two()
+                {
+                    out.0.push((base, w, 0, m));
+                }
+                if ((*op == IrCmpOp::Ne && truth) || (*op == IrCmpOp::Eq && !truth))
+                    && const_in_ring(*rhs, w) == Some(0)
+                    && self.known(*lhs, *ty, out, 8).0 & (mask ^ 1) == mask ^ 1
+                {
+                    out.0.push((*lhs, w, mask ^ 1, 1));
+                }
                 for (x, c) in [(*lhs, *rhs), (*rhs, *lhs)] {
                     if let Some(c) = const_in_ring(c, w) {
                         if (*op == IrCmpOp::Eq && truth) || (*op == IrCmpOp::Ne && !truth) {
@@ -358,6 +384,9 @@ fn fold(
         return Some(replacement);
     }
     if let Some(replacement) = shift_observe::fold(inst, cx) {
+        return Some(replacement);
+    }
+    if let Some(replacement) = select_facts::fold(inst, cx, facts) {
         return Some(replacement);
     }
     if let Some(replacement) = logic::fold(inst, cx, fresh) {
@@ -933,3 +962,6 @@ mod complements;
 
 #[path = "bit_idioms_shift_observe.rs"]
 mod shift_observe;
+
+#[path = "bit_idioms_select_facts.rs"]
+mod select_facts;
