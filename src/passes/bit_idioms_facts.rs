@@ -4,6 +4,15 @@
 //! flags are assumed. This runs inside the existing bit_idioms policy.
 use super::*;
 
+// A count is not a ring operand: reject a wide literal before narrowing.
+fn fixed_shift_count(op: Operand, width: usize) -> Option<u32> {
+    let Operand::Const(c) = op else {
+        return None;
+    };
+    let n = u32::try_from(c.to_i128()?).ok()?;
+    (n < width as u32).then_some(n)
+}
+
 struct Facts(Vec<(Operand, usize, u64, u64)>);
 struct Context<'a> {
     defs: &'a [Option<Instruction>],
@@ -95,10 +104,8 @@ impl Context<'_> {
                     IrBinOp::And => (a.0 | b.0, a.1 & b.1),
                     IrBinOp::Or => (a.0 & b.0, a.1 | b.1),
                     IrBinOp::Xor => ((a.0 & b.0) | (a.1 & b.1), (a.0 & b.1) | (a.1 & b.0)),
-                    IrBinOp::LShr | IrBinOp::Shl
-                        if const_in_ring(*rhs, w).is_some_and(|n| n < w as u64) =>
-                    {
-                        let n = const_in_ring(*rhs, w).unwrap_or(0) as u32;
+                    IrBinOp::LShr | IrBinOp::Shl if fixed_shift_count(*rhs, w).is_some() => {
+                        let n = fixed_shift_count(*rhs, w).unwrap_or(0);
                         if *op == IrBinOp::LShr {
                             ((a.0 >> n) | (mask ^ (mask >> n)), a.1 >> n)
                         } else {

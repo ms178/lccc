@@ -533,3 +533,26 @@ fn predicate_parity_refuses_shared_choices_and_noncanonical_conditions() {
     prefix.push(sel(7, v(2), v(5), v(6), ty));
     assert!(rewrite(&prefix).is_none());
 }
+
+#[test]
+fn wide_or_negative_shift_literals_do_not_become_valid_by_ring_truncation() {
+    for ty in types() {
+        let width = ty.size() * 8;
+        for count in [
+            -1,
+            width as i128,
+            width as i128 + 1,
+            256,
+            257,
+            65536,
+            1i128 << 64,
+        ] {
+            let operand = Operand::Const(IrConst::I128(count));
+            assert!(fixed_shift_count(operand, width).is_none());
+            let source = [bin(Value(3), IrBinOp::LShr, v(0), operand, ty)];
+            context(&source, |cx| {
+                assert_eq!(cx.known(v(3), ty, &Facts(vec![]), 8), (0, 0))
+            });
+        }
+    }
+}

@@ -134,7 +134,7 @@ pub(super) fn fold(inst: &Instruction, cx: &Context<'_>) -> Option<Vec<Instructi
         && let Some((a, b)) = cx.binary(*lhs, IrBinOp::Or, *ty)
         && let Some((x, count)) = cx.binary(*rhs, IrBinOp::LShr, *ty)
         && (x == a || x == b)
-        && (const_in_ring(count, width).is_some_and(|n| n < width as u64)
+        && (fixed_shift_count(count, width).is_some()
             || shift_observe::bounded_count(count, cx, width, 8).is_some())
     {
         return Some(copy(
