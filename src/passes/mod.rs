@@ -79,6 +79,7 @@ pub(crate) mod sccp;
 pub(crate) mod set_membership;
 pub(crate) mod simplify;
 pub(crate) mod slp_vectorizer;
+pub(crate) mod sret_copy_elision;
 pub(crate) mod store_load_forward;
 pub(crate) mod tail_call_elim;
 pub(crate) mod univsr;
@@ -947,6 +948,14 @@ fn run_inline_phase(
         copy_prop::run(module);
     }
     iphase_dump!("cleanup-copyprop1");
+    // Sret copy elision: point a structure-returning call straight at the
+    // aggregate it is copied to, deleting the hidden-slot copy. It must run
+    // before the aggregate forwarders, which decline any copy whose
+    // destination escapes to a call — exactly the shape removed here.
+    if std::env::var_os("CCC_NO_SRET_COPY_ELISION").is_none() {
+        module.for_each_function(sret_copy_elision::run);
+    }
+    iphase_dump!("sret-copy-elision");
     // Copy forwarding can expose another temporary in a copy chain
     // (`object -> tmp1 -> tmp2 -> field load`), so run to a small fixed point.
     if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
@@ -3272,6 +3281,10 @@ pub(crate) fn run_passes(
                 removed
             });
         }
+    }
+    // Pre-loop sret copy elision (see the earlier site for the rationale).
+    if std::env::var_os("CCC_NO_SRET_COPY_ELISION").is_none() {
+        module.for_each_function(sret_copy_elision::run);
     }
     if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
         for _ in 0..8 {
