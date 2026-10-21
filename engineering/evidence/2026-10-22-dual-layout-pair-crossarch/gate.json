@@ -1,0 +1,86 @@
+{
+  "arches": {
+    "aarch64": {
+      "pairs": 1,
+      "sources": {
+        "peephole_pair_chain.c": {
+          "assembly_sha256": "f78dd563b85761f844a26a9de87104daf9b90fa9dc722bf535017fb3542be742",
+          "pairs_auto": [
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel"
+          ]
+        }
+      }
+    },
+    "i686": {
+      "pairs": 1,
+      "sources": {
+        "peephole_pair_chain.c": {
+          "assembly_sha256": "dc94e19d877d82c7469344a9f44a885db8437cbf3e97ba14c381a24125b952e9",
+          "pairs_auto": [
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel"
+          ]
+        }
+      }
+    },
+    "riscv64": {
+      "pairs": 1,
+      "sources": {
+        "peephole_pair_chain.c": {
+          "assembly_sha256": "912eb569f96e1a8f1a6d6d79e38fddb06245c0f75be174e7edce60c2010b4146",
+          "pairs_auto": [
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel"
+          ]
+        }
+      }
+    },
+    "x86-64": {
+      "pairs": 6,
+      "sources": {
+        "expat_siphash24.c": {
+          "assembly_sha256": "ed46e8e31686eaafdce889d9149c2a30708085680d4ab637901b56ff6642efb6",
+          "pairs_auto": [
+            "parallel",
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel",
+            "parallel"
+          ]
+        },
+        "glibc_memcmp.c": {
+          "assembly_sha256": "5120f13f427a0d8e417c1214ec58e6bc753eb512b3ac1cb294aa1cb8a2899dd4",
+          "pairs_auto": [
+            "parallel",
+            "parallel",
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel",
+            "parallel",
+            "parallel"
+          ]
+        },
+        "peephole_pair_chain.c": {
+          "assembly_sha256": "fec62430f3c0febde1b6f1830acbfc6330c8407aa095d19344feacc02628dcf1",
+          "pairs_auto": [
+            "parallel"
+          ],
+          "pairs_forced": [
+            "parallel"
+          ]
+        }
+      }
+    }
+  },
+  "effective_threads": 2,
+  "total_pairs": 9
+}

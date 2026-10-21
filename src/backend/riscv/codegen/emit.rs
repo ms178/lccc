@@ -810,6 +810,18 @@ impl ArchCodegen for RiscvCodegen {
         crate::backend::riscv::codegen::peephole::peephole_optimize(text)
     }
 
+    /// Dual-layout metric pair: the metric peephole is a free `text -> text`
+    /// function, so both candidates can be evaluated concurrently by the shared
+    /// scheduler (policy, counters and instrument labels live there).
+    fn peephole_pair_for_metric(&self, first: String, second: String) -> (String, String) {
+        crate::backend::metric_pair::run_metric_pair(
+            "riscv64",
+            first,
+            second,
+            crate::backend::riscv::codegen::peephole::peephole_optimize,
+        )
+    }
+
     fn emit_branch(&mut self, label: &str) {
         self.state.emit_fmt(format_args!("    jump {}, t6", label));
     }

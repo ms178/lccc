@@ -36,7 +36,9 @@ DEFAULT_SOURCES = [
     "tests/benchmark/programs/zstd_count.c",
     "tests/benchmark/programs/linux_rbtree.c",
 ]
-PAIR = re.compile(r"\[pair\] chain=(\d+)B orig=(\d+)B mode=(\w+)")
+# Format-tolerant: the telemetry line carries an `arch=` field, and the
+# script must keep parsing if more fields are added later.
+PAIR = re.compile(r"\[pair\][^\n]*?chain=(\d+)B orig=(\d+)B mode=(\w+)")
 
 
 def run_once(compiler, source, knob, out):

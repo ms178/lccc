@@ -7,6 +7,7 @@ pub(crate) mod elf_writer_common; // Shared x86/i686 assembler ELF writer
 #[cfg_attr(feature = "gcc_linker", allow(dead_code))]
 // Built-in linker code unused when gcc handles linking
 pub mod linker_common;
+pub(crate) mod metric_pair; // Dual-layout metric peephole pair scheduling (all backends)
 pub(crate) mod peephole_common; // Shared peephole optimizer utilities (word matching, LineStore)
 
 // Shared codegen framework, split into focused modules:

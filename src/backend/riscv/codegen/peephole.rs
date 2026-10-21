@@ -1571,8 +1571,12 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
         }
     }
     let mut labels: Vec<String> = vec![String::new(); nb];
-    let mut label_block: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::default();
+    // `FxHashMap`, not `std::collections::HashMap`: the standard hasher is
+    // seeded per process, and iterating a randomly-ordered map made the
+    // emitted assembly differ between identical compilations. Lookup-only
+    // here, but the same map feeds the identical-block pass below, where the
+    // iteration order decides which label survives a retarget.
+    let mut label_block: FxHashMap<&str, usize> = FxHashMap::default();
     for i in 0..n {
         if kinds[i] == LineKind::Label {
             let name = lines[i].trim().trim_end_matches(':');
@@ -1651,8 +1655,14 @@ fn merge_identical_blocks(lines: &mut [String], kinds: &mut [LineKind], n: usize
             t
         })
         .collect();
-    let mut groups: std::collections::HashMap<&str, Vec<usize>> =
-        std::collections::HashMap::default();
+    // Deterministic iteration is a correctness property, not a nicety: this
+    // map's `values()` order decides the order in which duplicate blocks are
+    // retargeted, and two groups can touch the same label. With a seeded
+    // hash the same source produced different `.Lskip_N` labels and different
+    // block placement on every run (RS-1: five serial compilations, five
+    // distinct SHA-256s), which breaks reproducible builds, cached objects and
+    // every `diff`-based gate. `FxHashMap` is the tree's deterministic map.
+    let mut groups: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
     for b in 0..nb {
         if unusable[b] || body[b].trim().is_empty() {
             continue;
@@ -2226,6 +2236,7 @@ fn eliminate_dead_reg_moves(lines: &[String], kinds: &mut [LineKind], n: usize) 
 #[cfg(test)]
 use crate::backend::peephole_common::replace_whole_word;
 use crate::backend::peephole_common::{has_whole_word, replace_source_reg_in_instruction};
+use crate::common::fx_hash::FxHashMap;
 
 // ── Global dead store elimination ────────────────────────────────────────────
 //

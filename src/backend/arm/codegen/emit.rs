@@ -2974,6 +2974,18 @@ impl ArchCodegen for ArmCodegen {
         crate::backend::arm::codegen::peephole::peephole_optimize(text)
     }
 
+    /// Dual-layout metric pair: the metric peephole is a free `text -> text`
+    /// function, so both candidates can be evaluated concurrently by the shared
+    /// scheduler (policy, counters and instrument labels live there).
+    fn peephole_pair_for_metric(&self, first: String, second: String) -> (String, String) {
+        crate::backend::metric_pair::run_metric_pair(
+            "arm64",
+            first,
+            second,
+            crate::backend::arm::codegen::peephole::peephole_optimize,
+        )
+    }
+
     fn emit_branch_nonzero(&mut self, label: &str) {
         let skip = self.state.fresh_label("skip");
         self.state.emit_fmt(format_args!("    cbz x0, {}", skip));

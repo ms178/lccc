@@ -93,26 +93,41 @@ passes; the backend peepholes are documented per backend
   the redefinition* must be a rewritable address use. A `ret` invalidates it
   for x0-x7, which carry the return value.
 
-- **Dual-layout metric pairs** (`-O1`, x86-64) — when `block_layout`'s static
-  chain cannot predict whether its reordering helps, the backend emits both
-  candidate orders, runs the full text peephole over each and keeps the smaller
-  instruction count. The two candidates are independent fragments, so the pair
-  is split across a scoped worker and the caller. This is a compile-*latency*
-  change only: the pipeline is text-in/text-out, `RaConfig` is plain data, and
-  generated assembly is identical by contract.
-  `LCCC_PEEPHOLE_PAIR_PARALLEL` controls it: `0`/`off` never spawns, `1`/`on`
-  always spawns on a multi-thread host (the A/B lever used by the gate), and
-  unset/`auto` keeps the heuristic — serial below `MIN_PARALLEL_PAIR_BYTES`
-  (1 KiB combined, an 8x floor over the measured spawn crossover) or on a
-  single-thread host. `CCC_TIME_PEEPHOLE=1` prints one
-  `[pair] chain=…B orig=…B mode=… parallel=… serial=… deduped=…` line per pair,
-  which is the only way to observe the split (both modes emit the same text).
-  `tests/regression/check_peephole_pair_parallel.py` pins assembly identity
-  across the three modes, the kill switch, the single-thread fallback and pair
-  liveness; `scripts/measure_peephole_pair.py` regenerates the timings.
-  Identical candidates skip the second pass, and `CCC_DUMP_ASM` /
-  `CCC_PEEPHOLE_TRACE` now suffix their files `-chain`/`-orig` so an explored
-  function keeps both candidates instead of one overwriting the other.
+- **Dual-layout metric pairs** (`-O1` and up, **all four backends**) — when
+  `block_layout`'s static chain cannot predict whether its reordering helps
+  (measured: -42 instructions on `linux_rbtree`, +38 on `strlen_bench`), the
+  backend emits both candidate orders, runs its full text peephole over each
+  and keeps the smaller instruction count. The candidates are independent
+  fragments, so the pair is split across a scoped worker and the caller. This
+  is a compile-*latency* change only: every backend's metric peephole is a
+  pure `text -> text` function, and generated assembly is byte-identical by
+  contract, per backend, in the gate.
+
+  The policy lives in `backend/metric_pair.rs` and is shared by x86-64, i686,
+  AArch64 and RISC-V; each backend's `ArchCodegen::peephole_pair_for_metric`
+  override supplies only its own `peephole_optimize`. `LCCC_PEEPHOLE_PAIR_PARALLEL`
+  controls it: `0`/`off` never spawns, `1`/`on` always spawns on a multi-thread
+  host (the A/B lever the gate uses to reach the concurrent path anywhere), and
+  unset/`auto`/a typo keeps the heuristic — serial below
+  `MIN_PARALLEL_PAIR_BYTES` (1 KiB combined, an 8x floor over the measured
+  spawn crossover) or on a single-thread host.
+  `CCC_TIME_PEEPHOLE=1` prints one
+  `[pair] arch=… chain=…B orig=…B mode=… parallel=… serial=… deduped=…` line per
+  pair, which is the only way to observe the split (both modes emit the same
+  text). Identical candidates skip the second pass.
+
+  `tests/regression/check_peephole_pair_parallel.py` pins, per backend and per
+  pair, assembly identity across the three modes, the kill switch, the
+  single-thread fallback, pair liveness, counter accounting
+  (`parallel + serial + deduped` = pairs reported), **and reproducibility**
+  (three compiles, one hash — the RISC-V identical-block pass used to iterate a
+  randomly seeded `HashMap` and emit different labels on every run). It uses a
+  header-free fixture that forces ten explorations per compile, so no cross
+  sysroot is needed and no backend's verdict rests on one lucky pair; x86-64
+  additionally compiles real benchmark TUs and repeats at `-O2`. `scripts/measure_peephole_pair.py`
+  regenerates the timings. `CCC_DUMP_ASM` / `CCC_PEEPHOLE_TRACE` suffix their
+  files `-chain`/`-orig` so an explored function keeps both candidates instead
+  of one overwriting the other.
 
 - **Identical basic-block merging** (`merge_identical_blocks`) — a block is
   deleted and its predecessors retargeted when its instruction text matches
