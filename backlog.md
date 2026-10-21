@@ -302,19 +302,22 @@ Launchpad window), so the whole gate set was run locally from the tag caches
 instead: all thirteen pinned assets verified against their `MANIFEST.sha256`,
 Rust 1.97.0 (the declared floor), the bookworm i686 sysroot, and the pinned
 `as`/`ld.bfd` 2.47, relocs, valgrind and A64 ISA XML oracles. `ci_local.sh
---fast` went from 51 failures to 0 and the linker suite from 295 pass / 9 fail
-to 304 pass / 0 fail / 0 warn / 0 skip. Four of the 51 were repository defects
-fixed here (stale benchmark-registry counts in three corpus modules; the
-`not_mask` bit idiom, now implemented with an exhaustive-model unit test; the
-stale audit-census baseline, re-baselined with the +1s it had accumulated; and
-the missing local mirror of the new layout-matrix gate). The remaining 47 were
+--fast` first reported 51 failures; on the pre-rebase tree it then ran 366
+passed / 1 failed, and the linker suite went from 295 pass / 9 fail to 304
+pass / 0 fail / 0 warn / 0 skip once the pinned oracles were in place. Four of
+the 51 were repository defects fixed here: stale benchmark-registry counts in
+three corpus modules; the `not_mask` bit idiom, now implemented with an
+exhaustive-model unit test; the missing local mirror of the new layout-matrix
+gate; and the audit-census drift, which a pristine base export reproduced and
+which upstream's own rename pass has since brought back to the recorded
+baseline (no baseline edit ships in this branch). The remaining 47 were
 sandbox-toolchain gaps: the tag-cache GCC defaults to `-fno-pie` where distro
 compilers default to `-fPIE`, the tarball ships no sanitizer archives, and the
 32-bit glibc headers live under Debian's host-triplet directory — each
 reproduced explicitly so a gate measures the compiler, never the host. With
-`LCCC_I686_SYSROOT` pointing at the extracted sysroot the differential suite
-reaches PASS=1026 FAIL=0 SKIP=3 (AB-diff 0), i.e. no `-m32` build failures
-remain. The maintainer directed that these local, pinned-cache runs are the
+`LCCC_I686_SYSROOT` pointing at the extracted sysroot the pre-rebase tree ran
+the differential suite to PASS=1026 FAIL=0 SKIP=3 (AB-diff 0), i.e. no `-m32`
+build failures remain. The maintainer directed that these local, pinned-cache runs are the
 evidence of record for this PR while GitHub's hosted runs are degraded, so
 `--fast` **and** `--slow` are both run here; the older "full/slow CI is not
 authorized locally" line above is superseded for this PR by that direction,
