@@ -4429,6 +4429,15 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
         return;
     }
     // ── rewrite: drop the local and its copy, re-root every reader ──
+    //
+    // Readers are `GetElementPtr`, `Copy`, non-volatile `Load`, and one more
+    // form that is easy to miss: a *surviving* `Memcpy` can read an elided
+    // local. The escape scan decides to skip a copy using the pre-retain map
+    // (`dest -> src`), so a copy whose destination is refused later -- by an
+    // escape elsewhere, or by the cycle rule -- survives while still reading a
+    // source that *is* elided. Its bytes are the ultimate source's bytes, so
+    // it is re-rooted there; leaving it alone would name a value whose
+    // definition was just removed.
     for block in blocks.iter_mut() {
         let parallel =
             !block.source_spans.is_empty() && block.source_spans.len() == block.instructions.len();
@@ -4449,10 +4458,6 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
                         *ptr = src;
                     }
                 }
-                // A surviving copy can still *read* an elided local (`d`'s own
-                // copy was refused while `src`'s was not). Its bytes are now
-                // the ultimate source's bytes, so read those instead of a
-                // value whose definition is about to disappear.
                 Instruction::Memcpy { src, .. } => {
                     if let Some(&replacement) = src_of.get(&src.0) {
                         *src = replacement;
@@ -7925,77 +7930,76 @@ mod extern_admission_tests {
         );
     }
 
-    /// Symmetric shape: the *inner* copy is refused (its local is written),
-    /// so the outer local is elided while a surviving copy still reads the
-    /// inner one. That copy must be re-rooted rather than left dangling.
+    /// The escape scan skips a copy by consulting `dest -> src` *before* the
+    /// map is pruned, so a copy whose destination is refused later survives
+    /// while reading a source that is still elided. That surviving copy must be
+    /// re-rooted instead of naming a value with no definition left.
     #[test]
-    fn surviving_copy_reads_the_source_not_a_removed_local() {
+    fn surviving_copy_reading_an_elided_local_is_rerooted() {
         use crate::common::types::AddressSpace;
 
+        let alloca = |dest: u32| Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size: 8,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        };
         let mut blocks = vec![BasicBlock {
             label: BlockId(0),
             instructions: vec![
-                Instruction::Alloca {
-                    dest: Value(1),
-                    ty: IrType::Ptr,
-                    size: 8,
-                    align: 8,
-                    volatile: false,
-                    semantic_volatile: false,
-                },
-                Instruction::Alloca {
-                    dest: Value(2),
-                    ty: IrType::Ptr,
-                    size: 16,
-                    align: 8,
-                    volatile: false,
-                    semantic_volatile: false,
-                },
+                alloca(1), // read into, then written through: refused
+                alloca(2), // read-only: elided
                 Instruction::Memcpy {
                     dest: Value(2),
                     src: Value(10),
-                    size: 16,
+                    size: 8,
                 },
                 Instruction::Memcpy {
                     dest: Value(1),
                     src: Value(2),
                     size: 8,
                 },
-                // A write through the inner local disqualifies only the inner.
+                // Refuses local 1 (a write through it) but leaves local 2
+                // read-only. The copy above is therefore not the elided copy
+                // of local 1 and survives -- while reading the elided local 2.
                 Instruction::Store {
                     val: Operand::Const(IrConst::I64(1)),
-                    ptr: Value(2),
-                    ty: IrType::I64,
-                    seg_override: AddressSpace::Default,
-                    volatile: false,
-                },
-                Instruction::Load {
-                    dest: Value(3),
                     ptr: Value(1),
                     ty: IrType::I64,
                     seg_override: AddressSpace::Default,
                     volatile: false,
                 },
             ],
-            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            terminator: Terminator::Return(None),
             source_spans: Vec::new(),
         }];
         elide_readonly_local_memcpys(&mut blocks);
-        // The outer local is elided; its reader reads the inner local, which
-        // still exists.
         assert!(
             blocks[0]
                 .instructions
                 .iter()
-                .any(|i| matches!(i, Instruction::Alloca { dest: Value(2), .. })),
-            "the written-through inner local must survive"
+                .any(|i| matches!(i, Instruction::Alloca { dest: Value(1), .. })),
+            "the written-through local must survive"
         );
         assert!(
             !blocks[0]
                 .instructions
                 .iter()
-                .any(|i| matches!(i, Instruction::Alloca { dest: Value(1), .. })),
-            "the read-only outer local is elided"
+                .any(|i| matches!(i, Instruction::Alloca { dest: Value(2), .. })),
+            "the read-only local is elided"
+        );
+        assert!(
+            blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(10),
+                    ..
+                }
+            )),
+            "the surviving copy must read the ultimate source, not the removed local"
         );
     }
 
