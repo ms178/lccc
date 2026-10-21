@@ -310,6 +310,13 @@ pub(super) struct FileLiveness {
     textual_ret: FxHashSet<usize>,
 }
 
+// Counts memo hits, so the tests can prove a hit happened rather than
+// inferring it from matching answers. Compiled out of release builds.
+#[cfg(test)]
+thread_local! {
+    static MEMO_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// `CCC_VERIFY_LIVENESS_SPAN` (see `FileLiveness::assert_matches_full_analysis`).
 fn verify_span_refresh() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -539,6 +546,26 @@ fn mnemonic_is_known(t: &str) -> bool {
 }
 
 impl FileLiveness {
+    /// Content key for the per-function liveness memo.
+    ///
+    /// The solver reads the function's *text* (markers, labels, jump tables,
+    /// mnemonics) and its per-line [`LineInfo`].  Folding both in makes a hit
+    /// observationally identical to a re-solve: the key covers every input.
+    ///
+    /// Hashing the whole `LineInfo` is not belt-and-braces.  `LineInfo` is
+    /// **not** a pure function of the text: `pinned_volatile_access` and the
+    /// `popcnt`/`bmi` folds in `passes/mod.rs` force `has_indirect_mem`,
+    /// `rbp_offset` and `kind` on lines whose text they did not touch.  The
+    /// solver's store/load modelling reads exactly those fields, so a key
+    /// built from text + `pinned` + `reg_refs` alone is sound only for as
+    /// long as every such mutation also happens to set `pinned`.  Deriving
+    /// `Hash` on the struct makes that coincidence unnecessary, and keeps the
+    /// key complete when a field is added (the derive fails to compile
+    /// otherwise).
+    ///
+    /// Two independent accumulators: an accidental hit then needs a collision
+    /// in both 64-bit halves.  Text is hashed through `FxHasher` (word-wise)
+    /// rather than a byte-at-a-time loop.
     fn hash_function(
         store: &LineStore,
         infos: &[LineInfo],
@@ -546,30 +573,30 @@ impl FileLiveness {
         end: usize,
     ) -> (u64, u64) {
         use std::hash::{Hash, Hasher};
-        let mut h1 = crate::common::fx_hash::FxHasher::default();
-        let mut h2: u64 = 0xcbf2_9ce4_8422_2325;
-        (end - start).hash(&mut h1);
-        for (idx, info) in infos[start..end].iter().enumerate() {
-            let n = start + idx;
-            if info.is_nop() {
-                0u8.hash(&mut h1);
-                h2 = h2.rotate_left(5) ^ 0x517c_c1b7_2722_0a95;
-            } else {
-                let flags = (u8::from(info.pinned))
-                    | (u8::from(info.inert_dir) << 1)
-                    | (u8::from(info.has_indirect_mem) << 2)
-                    | (u8::from(info.volatile_access) << 3);
-                flags.hash(&mut h1);
-                info.reg_refs.hash(&mut h1);
-                let s = info.trimmed(store.get(n));
-                s.hash(&mut h1);
-                h2 = h2.rotate_left(7) ^ (s.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-                for &b in s.as_bytes() {
-                    h2 = (h2 ^ (b as u64)).wrapping_mul(0x1000_0000_01b3);
-                }
-            }
+        // splitmix64 finalizer: full 64-bit avalanche for the returned key.
+        #[inline]
+        fn mix(mut z: u64) -> u64 {
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
         }
-        (h1.finish(), h2)
+        // Order-sensitive fold of one line digest into an accumulator.
+        #[inline]
+        fn fold(h: u64, w: u64) -> u64 {
+            (h.rotate_left(5) ^ w).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        }
+        let len = end.saturating_sub(start);
+        let mut h1 = 0x243f_6a88_85a3_08d3u64 ^ len as u64;
+        let mut h2 = 0x1319_8a2e_0370_7344u64 ^ (len as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+        for n in start..end {
+            let mut line = crate::common::fx_hash::FxHasher::default();
+            infos[n].hash(&mut line);
+            infos[n].trimmed(store.get(n)).hash(&mut line);
+            let w = line.finish();
+            h1 = fold(h1, w);
+            h2 = fold(h2, w ^ 0xa409_3822_299f_31d0);
+        }
+        (mix(h1), mix(h2))
     }
 
     /// Compute liveness for every function in the file.
@@ -1162,6 +1189,10 @@ impl FileLiveness {
             Vec<(u16, u16)>,
             bool,
         );
+        /// Entries kept across passes for one compilation thread.  Measured
+        /// against the code this replaces, which held the same 256 and then
+        /// threw the whole table away.
+        const FN_CACHE_CAP: usize = 256;
         thread_local! {
             static FN_CACHE: std::cell::RefCell<FxHashMap<(u64, u64), CachedFnLiveness>> =
                 std::cell::RefCell::new(FxHashMap::default());
@@ -1188,6 +1219,8 @@ impl FileLiveness {
                 }
             });
             if hit {
+                #[cfg(test)]
+                MEMO_HITS.with(|c| c.set(c.get() + 1));
                 return;
             }
             Some(key)
@@ -1358,20 +1391,24 @@ impl FileLiveness {
         if let Some(key) = cache_key {
             FN_CACHE.with(|c| {
                 let mut map = c.borrow_mut();
-                if map.len() > 256 {
-                    map.clear();
+                // Bounded memory, and no clear-the-world cliff: once the
+                // table is full the cache degrades to the pre-memo baseline
+                // for *new* functions while every cached one keeps hitting.
+                // Clearing here would discard precisely the entries the next
+                // pass re-asks for, forcing a full re-solve of the file.
+                if map.len() < FN_CACHE_CAP {
+                    map.insert(
+                        key,
+                        (
+                            self.live_out[start..end].to_vec(),
+                            self.live_in[start..end].to_vec(),
+                            self.known[start..end].to_vec(),
+                            self.structural[start..end].to_vec(),
+                            self.effect[start..end].to_vec(),
+                            self.textual_ret.contains(&start),
+                        ),
+                    );
                 }
-                map.insert(
-                    key,
-                    (
-                        self.live_out[start..end].to_vec(),
-                        self.live_in[start..end].to_vec(),
-                        self.known[start..end].to_vec(),
-                        self.structural[start..end].to_vec(),
-                        self.effect[start..end].to_vec(),
-                        self.textual_ret.contains(&start),
-                    ),
-                );
             });
         }
     }
@@ -2583,5 +2620,126 @@ mod tests {
         let (store, _infos, lv) = build(asm);
         let n = line_of(&store, "movl %r11d, %eax");
         assert_eq!(lv.live_after(n, 2), Some(false));
+    }
+
+    /// The memo key must cover `LineInfo` state that the *text* does not
+    /// encode. Passes force `has_indirect_mem` / `rbp_offset` / `kind` on lines
+    /// whose text they leave alone (`passes/mod.rs`), and the solver's
+    /// store/load modelling reads exactly those fields -- so a key built from
+    /// text + `pinned` + `reg_refs` could map two different programs onto one
+    /// entry and answer liveness for the wrong one.
+    #[test]
+    fn memo_key_covers_line_info_the_text_does_not_encode() {
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    # LCCC_RET_RDX 0\n",
+            "    movq %rdi, %rax\n",
+            "    movq 8(%rax), %rcx\n",
+            "    addq %rcx, %rdx\n",
+            "    movq %rcx, 16(%rax)\n",
+            "    movq -8(%rbp), %r8\n",
+            "    movq %r8, -16(%rbp)\n",
+            "    testq %rdx, %rdx\n",
+            "    je .L1\n",
+            "    movq %rdx, %r9\n",
+            "    addq $8, %r9\n",
+            "    movq %r9, 24(%rax)\n",
+            ".L1:\n",
+            "    movq %rcx, %r10\n",
+            "    subq %r8, %r10\n",
+            "    movq %r10, 32(%rax)\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let base = FileLiveness::hash_function(&store, &infos, 0, store.len());
+
+        // Same text, one classification field changed, exactly as a fold does.
+        for mutate in [
+            (|i: &mut LineInfo| i.has_indirect_mem = !i.has_indirect_mem) as fn(&mut LineInfo),
+            |i: &mut LineInfo| i.rbp_offset = i.rbp_offset.wrapping_add(8),
+        ] {
+            let mut altered = infos.clone();
+            if let Some(info) = altered.iter_mut().find(|i| !i.is_nop()) {
+                mutate(info);
+            }
+            assert_ne!(
+                base,
+                FileLiveness::hash_function(&store, &altered, 0, store.len()),
+                "a field the solver reads but the text does not spell must change the key"
+            );
+        }
+
+        // `pinned` and the nop mark are decisions of earlier passes, not text.
+        let mut pinned = infos.clone();
+        if let Some(info) = pinned.iter_mut().find(|i| !i.is_nop()) {
+            info.pinned = true;
+        }
+        assert_ne!(
+            base,
+            FileLiveness::hash_function(&store, &pinned, 0, store.len())
+        );
+    }
+
+    /// A memo hit must be indistinguishable from a fresh solve. Two functions
+    /// with identical bodies share one key; the second solve hits, and every
+    /// per-line answer must match the first.
+    #[test]
+    fn memo_hit_matches_a_fresh_solve() {
+        let body = concat!(
+            "    # LCCC_RET_RDX 0\n",
+            "    # LCCC_RET_RAX 0\n",
+            "    movq %rdi, %rax\n",
+            "    movq 8(%rax), %rcx\n",
+            "    addq %rcx, %rdx\n",
+            "    movq %rcx, 16(%rax)\n",
+            "    movq %rcx, %r8\n",
+            "    subq %rdx, %r8\n",
+            "    testq %r8, %r8\n",
+            "    je .L1\n",
+            "    movq %r8, %r9\n",
+            "    addq $8, %r9\n",
+            "    movq %r9, 24(%rax)\n",
+            ".L1:\n",
+            "    movq %r8, %r10\n",
+            "    addq %r9, %r10\n",
+            "    movq %r10, 32(%rax)\n",
+            "    ret\n",
+        );
+        let asm = format!(
+            "g1:\n.cfi_startproc\n{body}.cfi_endproc\ng2:\n.cfi_startproc\n{body}.cfi_endproc\n"
+        );
+        let store = LineStore::new(asm);
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let starts: Vec<usize> = (0..store.len())
+            .filter(|&i| store.get(i).trim() == ".cfi_startproc")
+            .collect();
+        assert_eq!(starts.len(), 2);
+        let ends: Vec<usize> = (0..store.len())
+            .filter(|&i| store.get(i).trim() == ".cfi_endproc")
+            .collect();
+        assert_eq!(ends.len(), 2);
+
+        MEMO_HITS.with(|c| c.set(0));
+        let lv = FileLiveness::new(&store, &infos);
+        assert_eq!(
+            MEMO_HITS.with(|c| c.get()),
+            1,
+            "the second identical function must be served from the memo"
+        );
+        let (a, b) = (starts[0]..ends[0], starts[1]..ends[1]);
+        assert_eq!(lv.live_out[a.clone()], lv.live_out[b.clone()]);
+        assert_eq!(lv.live_in[a.clone()], lv.live_in[b.clone()]);
+        assert_eq!(lv.known[a.clone()], lv.known[b.clone()]);
+        assert_eq!(lv.structural[a.clone()], lv.structural[b.clone()]);
+        assert_eq!(lv.effect[a.clone()], lv.effect[b]);
+        assert_eq!(
+            lv.textual_ret.contains(&starts[0]),
+            lv.textual_ret.contains(&starts[1])
+        );
     }
 }

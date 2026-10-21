@@ -576,7 +576,33 @@ fn names_family_at_width(text: &str, fam: RegId, wide: bool) -> bool {
 /// displacement), `A != D` so no operand is destroyed, and the flags the `add`
 /// used to write must be provably dead.
 pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    /// `%rbp` may serve as a value register here only in a function that never
+    /// establishes a frame pointer, and proving that scans the whole function.
+    /// Both arms below ask the same question at the same line, and a function
+    /// can hold many candidates, so the answer is memoised on the function's
+    /// start line (candidates are visited in order, so one entry covers the
+    /// repeats). `function_range` is memoised with it, being part of the same
+    /// scan.
+    fn rbp_is_gpr_at(
+        store: &LineStore,
+        infos: &[LineInfo],
+        at: usize,
+        memo: &mut Option<(usize, bool)>,
+    ) -> bool {
+        let Some((fs, fe)) = function_range(store, infos, at) else {
+            return false;
+        };
+        if let Some((cached, v)) = *memo
+            && cached == fs
+        {
+            return v;
+        }
+        let v = rbp_is_gpr_in_function(store, infos, fs, fe);
+        *memo = Some((fs, v));
+        v
+    }
     let len = store.len();
+    let mut rbp_memo: Option<(usize, bool)> = None;
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -664,13 +690,7 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
                 || r_fam == dst_fam
                 || r_fam == 4
                 || !names_family_at_width(imm_text, r_fam, add_wide)
-                || (dst_fam == 5
-                    && !{
-                        match function_range(store, infos, i) {
-                            Some((fs, fe)) => rbp_is_gpr_in_function(store, infos, fs, fe),
-                            None => false,
-                        }
-                    })
+                || (dst_fam == 5 && !rbp_is_gpr_at(store, infos, i, &mut rbp_memo))
                 || !flags_dead_after(store, infos, j + 1)
             {
                 i += 1;
@@ -691,13 +711,7 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
         // `%rbp` as destination participates only when the copy is not from
         // `%rsp` and `rbp_is_gpr_in_function` proves the function never
         // establishes a frame pointer — matching the register-addend arm above.
-        if dst_fam == 5
-            && (src_fam == 4
-                || !match function_range(store, infos, i) {
-                    Some((fs, fe)) => rbp_is_gpr_in_function(store, infos, fs, fe),
-                    None => false,
-                })
-        {
+        if dst_fam == 5 && (src_fam == 4 || !rbp_is_gpr_at(store, infos, i, &mut rbp_memo)) {
             i += 1;
             continue;
         }
@@ -1542,9 +1556,12 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
                 i += 1;
                 continue;
             };
+            // `%rsp` is encodable in either `test` position and the fold
+            // rewrites only flags, so a stack-pointer operand needs no
+            // exclusion: the destination arm already refuses `%rsp`/`%rbp`, so
+            // no stack adjustment can disappear. Excluding it (as this did)
+            // lost every `mov %rsp, %S; and %M, %S` / `and %rsp, %S` fold.
             if mask_fam == dst_fam
-                || src_fam == 4
-                || mask_fam == 4
                 || !names_family_at_width(imm_text, mask_fam, and_wide)
                 || !matches!(lv.live_after(j, dst_fam), Some(false))
             {
@@ -4521,5 +4538,97 @@ mod conditional_increment_tests {
         let out = store.build_result(|i| infos[i].is_nop());
         assert!(out.contains("testq %rcx, %r10"), "{out}");
         assert!(!out.contains("andq %rcx, %r8"), "{out}");
+    }
+
+    /// `%rsp` is encodable in either `test` position, and the fold can only
+    /// touch flags (the destination arm refuses `%rsp`/`%rbp`), so a stack
+    /// pointer operand must not block it. Excluding it lost real folds.
+    #[test]
+    fn fold_copy_and_mask_into_test_accepts_rsp_operands() {
+        let build = |asm: &str| {
+            let store = LineStore::new(asm.to_string());
+            let infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            (store, infos)
+        };
+        // %rsp as the copied source: `testq %rcx, %rsp`.
+        let (mut store, mut infos) = build(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %rsp, %r8\n",
+            "    andq %rcx, %r8\n",
+            "    je .LBB2\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".LBB2:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(fold_copy_and_mask_into_test(&mut store, &mut infos));
+        let out = store.build_result(|i| infos[i].is_nop());
+        assert!(out.contains("testq %rcx, %rsp"), "{out}");
+        assert!(!out.contains("andq %rcx, %r8"), "{out}");
+
+        // %rsp as the mask: `testq %rsp, %rax`.
+        let (mut store, mut infos) = build(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %rax, %r8\n",
+            "    andq %rsp, %r8\n",
+            "    je .LBB2\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".LBB2:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(fold_copy_and_mask_into_test(&mut store, &mut infos));
+        let out = store.build_result(|i| infos[i].is_nop());
+        assert!(out.contains("testq %rsp, %rax"), "{out}");
+    }
+
+    /// The memoised frame-pointer test must answer per function. A file with a
+    /// frame-pointer function followed by a leaf (and the reverse) must fold
+    /// only the leaf's `%rbp` candidate both times.
+    #[test]
+    fn rbp_destination_memo_does_not_leak_across_functions() {
+        let build = |asm: &str| {
+            let store = LineStore::new(asm.to_string());
+            let infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            (store, infos)
+        };
+        let leaf = concat!(
+            "    movq %r14, %rbp\n",
+            "    addq $8, %rbp\n",
+            "    cmpq %rsi, %rbp\n",
+            "    movq %rbp, %rax\n",
+            "    ret\n",
+        );
+        let framed = concat!(
+            "    pushq %rbp\n",
+            "    movq %rsp, %rbp\n",
+            "    movq %r14, %rbp\n",
+            "    addq $8, %rbp\n",
+            "    cmpq %rsi, %rbp\n",
+            "    popq %rbp\n",
+            "    ret\n",
+        );
+        for (first, second) in [(leaf, framed), (framed, leaf)] {
+            let asm = format!(
+                "a:\n.cfi_startproc\n{first}.cfi_endproc\nb:\n.cfi_startproc\n{second}.cfi_endproc\n"
+            );
+            let (mut store, mut infos) = build(&asm);
+            assert!(fold_copy_add_into_lea(&mut store, &mut infos));
+            let out = store.build_result(|i| infos[i].is_nop());
+            // Exactly one of the two functions folds -- the leaf -- whichever
+            // order they appear in, and the framed one keeps its `addq`.
+            assert_eq!(out.matches("leaq 8(%r14), %rbp").count(), 1, "{out}");
+            assert!(out.contains("addq $8, %rbp"), "{out}");
+        }
     }
 }

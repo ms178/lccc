@@ -30,7 +30,7 @@ pub(super) const RBP_OFFSET_NONE: i32 = i32::MIN;
 /// Compact classification of a single assembly line.
 /// Stored in a parallel array alongside the raw text, so hot loops
 /// can check integer fields instead of re-parsing strings.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Hash)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub(super) struct LineInfo {
     pub(super) kind: LineKind,
@@ -78,7 +78,7 @@ pub(super) struct LineInfo {
 
 /// What kind of assembly line this is, with pre-extracted fields for the
 /// patterns we care about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum LineKind {
     Nop,   // Deleted line (marked via LineInfo only)
     Empty, // Blank line
@@ -149,7 +149,7 @@ pub(super) enum LineKind {
 /// Pre-parsed classification of what kind of extension/operation an instruction performs.
 /// Used by the redundant extension elimination pass to avoid repeated string comparisons
 /// in the hot combined_local_pass loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ExtKind {
     /// Not an extension or producer recognized for the extension elimination pass
     None,
@@ -190,7 +190,7 @@ pub(super) enum ExtKind {
     ProducerMovqRegToRax,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[expect(clippy::upper_case_acronyms)] // x86 mnemonic suffix conventions (SLQ = movslq)
 pub(super) enum MoveSize {
     Q,   // movq  (64-bit)
