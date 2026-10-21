@@ -1161,8 +1161,9 @@ fn apply_m16_size_policy(disabled: &mut String, code16gcc: bool, opt_level: u32)
 /// x86-64 code-generation ISA permission for the translation unit being
 /// compiled — the same struct the backend consumes (`backend::x86::isa`),
 /// so the middle end and the emitters can never disagree about what is
-/// legal.  See that module for the policy (x86-64-v3 default, explicit
-/// `-march` is the ceiling, `-mno-*` denials are sticky).
+/// legal.  See that module for the policy (x86-64 default: every
+/// post-baseline class needs its explicit flag, `-march` sets the ceiling,
+/// `-mno-*` denials are sticky).
 pub(crate) use crate::backend::x86::isa::X86Isa;
 
 /// Widest rotate (in bits) `target` can lower to a single native instruction
@@ -1394,16 +1395,16 @@ pub(crate) fn run_passes(
     // AVX2 packed conversion/division.  Do not infer this from generic x86
     // vectorization or from AVX alone; the pass must fail closed for a target
     // which does not permit both required ISA subsets. Raw driver request
-    // bits are NOT permissions: the default V3 ceiling enables both without
-    // explicit -mavx2/-msse4.1, and explicit denials constrain that ceiling.
+    // bits are NOT permissions: `x86_isa` is the RESOLVED ceiling, which an
+    // explicit `-march=`/`-m*` grant raises and `-mno-*` denials lower.
     vectorize::set_x86_strict_recip_avx2_enabled(
         target == crate::backend::Target::X86_64 && x86_isa.ymm && x86_isa.sse41,
     );
     // FMA3 availability for the fma/fmaf libcall fold (simplify.rs): the
     // fused form is required for the C99 single-rounding semantics, so the
     // fold must only fire when the backend can actually emit vfmadd*.
-    // x86-64's project baseline is x86-64-v3, so FMA3 is present *unless* the
-    // TU disabled it: `-mno-fma` clears it, and `-mno-sse` clears the whole
+    // FMA3 is opt-in on x86-64 (`-mfma`, or an `-march=` profile that carries
+    // it) and `-mno-fma` clears it; `-mno-sse` clears the whole
     // SIMD register file (vfmadd is a VEX-encoded SSE instruction, so a
     // kernel TU built with `-mno-sse` would #UD on the folded form).
     simplify::set_has_fma3(match target {

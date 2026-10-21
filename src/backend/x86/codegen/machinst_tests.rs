@@ -28,6 +28,32 @@ use super::machinst_emit::*;
 use crate::backend::common::AsmOutput;
 use crate::backend::regalloc::PhysReg;
 
+/// Serializes every test that publishes the process-global emitter ISA.
+/// `isa::set_current` is process-wide, so without this lock a parallel test's
+/// restore can land between another test's set and its emit.
+static ISA_SCOPE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Scope the process-global emitter ISA to `isa` for one test, restoring the
+/// previous value on drop. The VEX forms are selected from that global, so a
+/// VEX expectation must name its target explicitly (the default is SSE2).
+struct IsaScope {
+    prev: crate::backend::x86::isa::X86Isa,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+fn scoped_isa(isa: crate::backend::x86::isa::X86Isa) -> IsaScope {
+    let lock = ISA_SCOPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = crate::backend::x86::isa::current();
+    crate::backend::x86::isa::set_current(isa);
+    IsaScope { prev, _lock: lock }
+}
+
+impl Drop for IsaScope {
+    fn drop(&mut self) {
+        crate::backend::x86::isa::set_current(self.prev);
+    }
+}
+
 /// Emit one instruction and return the trimmed text lines it produced.
 fn emit(inst: &MachInst) -> Vec<String> {
     let mut out = AsmOutput::new();
@@ -2565,6 +2591,7 @@ const XMM_REGS: &[u8] = &[20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33
 
 #[test]
 fn fmov_names_every_xmm_home_at_both_scalar_widths() {
+    let _isa = scoped_isa(crate::backend::x86::isa::X86Isa::V3);
     for (i, &a) in XMM_REGS.iter().enumerate() {
         let b = XMM_REGS[(i + 1) % XMM_REGS.len()];
         // Reg-to-reg uses the VEX PACKED move: full-register semantics (no
@@ -3027,6 +3054,7 @@ fn float_moves_outside_the_subset_stay_on_the_text_path() {
 
 #[test]
 fn falu_emits_vex_three_operand_forms() {
+    let _isa = scoped_isa(crate::backend::x86::isa::X86Isa::V3);
     // dst = src1 OP src2; AT&T prints `vop src2, %src1, %dst`.
     assert_eq!(
         emit1(&MachInst::FAlu {

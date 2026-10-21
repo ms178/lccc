@@ -35,7 +35,9 @@ def main():
         modes.append(('clang', args.clang, {}, FLAGS))
     for name, env, flags in [
         ('packed', {}, FLAGS),
-        ('default-v3', {}, [f for f in FLAGS if not f.startswith('-march=')]),
+        # No -march at all: pins that the default target is the plain x86-64
+        # baseline, distinct from the explicit -march=x86-64 arm below.
+        ('default', {}, [f for f in FLAGS if not f.startswith('-march=')]),
         ('no-xmm', {'CCC_NO_XMM_REGALLOC': '1'}, FLAGS),
         ('no-vecreg', {'CCC_NO_VECREG': '1'}, FLAGS),
         ('no-promotion', {'CCC_NO_VEX_PROMOTE': '1'}, FLAGS),
@@ -78,7 +80,7 @@ def main():
                         raise RuntimeError('missing packed_sum assembly')
                     body = match.group(1)
                     row['assembly'] = body
-                    if name in ('packed', 'default-v3', 'no-xmm', 'no-vecreg', 'no-promotion'):
+                    if name in ('packed', 'no-xmm', 'no-vecreg', 'no-promotion'):
                         for insn in ['pmulld', 'psrad', 'vcvtdq2pd', 'vdivpd', 'vmulpd']:
                             if insn not in body:
                                 raise RuntimeError(f'{name}: missing {insn}; packing not exercised')
@@ -87,9 +89,9 @@ def main():
                         for operand in re.findall(r'vcvtdq2pd\s+([^,]+),', body):
                             if '%ymm' in operand:
                                 raise RuntimeError(f'{name}: conversion reads more than 128 bits')
-                    if name in ('packed', 'default-v3', 'no-xmm', 'no-vecreg') and re.search(r'^\s*(?:movdqa|movdqu|movd|pmulld|paddd|psrad|pshufd)\s', body, re.M):
+                    if name in ('packed', 'no-xmm', 'no-vecreg') and re.search(r'^\s*(?:movdqa|movdqu|movd|pmulld|paddd|psrad|pshufd)\s', body, re.M):
                         raise RuntimeError(f'{name}: legacy SIMD in the promoted AVX loop')
-                    if name == 'baseline' and ('vdivpd' in body or 'vcvtdq2pd' in body):
+                    if name in ('baseline', 'default') and ('vdivpd' in body or 'vcvtdq2pd' in body):
                         raise RuntimeError('packed lowering escaped ISA gate')
                 report['arms'].append(row)
                 print(f'{name}: PASS {row["cases"]} bitwise cases' + (' + Memcheck' if args.memcheck else ''))

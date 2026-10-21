@@ -59,10 +59,14 @@ grep -q 'lz_m' "$tmp/m1.s" && grep -q 'pc_m' "$tmp/m1.s"
 ! grep -q 'lz_m' "$tmp/m2.s"
 ! grep -q 'pc_m' "$tmp/m2.s"
 
-# 5. x86-64 semantics unchanged: default grant still on, -mno still wins.
+# 5. x86-64 policy: the default build has no post-baseline integer class
+#    (POPCNT/TZCNT are opt-in); an explicit v3 profile grants them, and a later
+#    -mno-lzcnt still vetoes TZCNT under that profile.
 "$CCC" -O2 -S "$tmp/t.c" -o "$tmp/x64.s"
-grep -qE 'tzcnt|popcnt' "$tmp/x64.s"
-"$CCC" -O2 -mno-lzcnt -S "$tmp/t.c" -o "$tmp/x64v.s"
+! grep -qE 'tzcnt|popcnt' "$tmp/x64.s"
+"$CCC" -O2 -march=x86-64-v3 -S "$tmp/t.c" -o "$tmp/x64v3.s"
+grep -qE 'tzcnt|popcnt' "$tmp/x64v3.s"
+"$CCC" -O2 -march=x86-64-v3 -mno-lzcnt -S "$tmp/t.c" -o "$tmp/x64v.s"
 ! grep -q 'tzcnt' "$tmp/x64v.s"
 
 echo "i686 integer-ISA parity gate: PASS"

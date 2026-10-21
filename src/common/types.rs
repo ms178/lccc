@@ -44,8 +44,8 @@ thread_local! {
 /// vector-extension operation to (`0`, `16` or `32`). Distinct from
 /// [`set_target_vector_abi_bytes`]: that one is the psABI *classification*
 /// width, which follows the requested ISA only; this one is the code
-/// generation ceiling (the x86-64-v3 default baseline grants `%ymm` without
-/// changing the ABI). `0` keeps the per-lane scalar lowering — every target
+/// generation ceiling (an AVX2 grant widens the code the backend may emit
+/// without changing the ABI). `0` keeps the per-lane scalar lowering — every target
 /// without the x86-64 `Vec*` intrinsic families, `-mno-sse`, and `-O0`.
 pub fn set_target_vector_lowering_bytes(bytes: usize) {
     debug_assert!(matches!(bytes, 0 | 16 | 32));

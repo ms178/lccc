@@ -96,7 +96,7 @@ EOF
 # the argument parser. This fixture is independently required to emit AVX2 at
 # -O2 by check_vectorize_isa_gate.sh; with the flag it must remain scalar.
 vec_source="$repo/tests/regression/vectorize_isa_gate.c"
-"$CCC" -O2 -S "$vec_source" -o "$td/vector-default.s"
+"$CCC" -O2 -march=x86-64-v3 -S "$vec_source" -o "$td/vector-default.s"
 "$CCC" -O2 -fno-tree-vectorize -S "$vec_source" -o "$td/vector-disabled.s"
 if ! grep -Eq '\bymm[0-9]+\b' "$td/vector-default.s"; then
     echo "FAIL: the vectorizer control fixture did not emit its expected AVX2 baseline" >&2
@@ -106,7 +106,7 @@ if grep -Eq '\b[xyz]mm[0-9]+\b' "$td/vector-disabled.s"; then
     echo "FAIL: -fno-tree-vectorize left automatic SIMD in the fixture" >&2
     exit 1
 fi
-"$CCC" -O2 -fno-tree-vectorize -ftree-vectorize -S "$vec_source" -o "$td/vector-reenabled.s"
+"$CCC" -O2 -march=x86-64-v3 -fno-tree-vectorize -ftree-vectorize -S "$vec_source" -o "$td/vector-reenabled.s"
 if ! grep -Eq '\bymm[0-9]+\b' "$td/vector-reenabled.s"; then
     echo "FAIL: a later -ftree-vectorize did not re-enable automatic vectorization" >&2
     exit 1

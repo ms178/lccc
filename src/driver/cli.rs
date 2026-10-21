@@ -156,6 +156,7 @@ impl Driver {
         self.enable_lzcnt = false;
         self.enable_popcnt = false;
         self.enable_movbe = false;
+        self.enable_cx16 = false;
         self.enable_rdrnd = false;
         self.enable_avx512f = false;
         self.enable_avx512cd = false;
@@ -209,6 +210,39 @@ impl Driver {
         }
     }
 
+    /// The AVX-512 subsets and AVX-VNNI (AVX-512 / AVX10 feature flags;
+    /// backend coverage is partial and runtime dispatch must verify the host).
+    /// Each implies AVX2 and, for the AVX-512 subsets, AVX-512F, as GCC 16.2
+    /// implies them (measured). Returns `false` for any other flag.
+    fn grant_avx512_family(&mut self, flag: &str) -> bool {
+        let slot = match flag {
+            "-mavx512f" => &mut self.enable_avx512f,
+            "-mavx512cd" => &mut self.enable_avx512cd,
+            "-mavx512dq" => &mut self.enable_avx512dq,
+            "-mavx512bw" => &mut self.enable_avx512bw,
+            "-mavx512vl" => &mut self.enable_avx512vl,
+            "-mavx512ifma" => &mut self.enable_avx512ifma,
+            "-mavx512vbmi" => &mut self.enable_avx512vbmi,
+            "-mavx512vbmi2" => &mut self.enable_avx512vbmi2,
+            "-mavx512vnni" => &mut self.enable_avx512vnni,
+            "-mavx512bitalg" => &mut self.enable_avx512bitalg,
+            "-mavx512vpopcntdq" => &mut self.enable_avx512vpopcntdq,
+            "-mavx512bf16" => &mut self.enable_avx512bf16,
+            "-mavx512fp16" => &mut self.enable_avx512fp16,
+            "-mavx512er" => &mut self.enable_avx512er,
+            "-mavx512pf" => &mut self.enable_avx512pf,
+            "-mavx512vp2intersect" => &mut self.enable_avx512vp2intersect,
+            "-mavxvnni" => &mut self.enable_avxvnni,
+            _ => return false,
+        };
+        *slot = true;
+        if flag != "-mavxvnni" {
+            self.enable_avx512f = true;
+        }
+        self.grant_avx2_class();
+        true
+    }
+
     /// Apply one explicit x86 ISA `-m`/`-mno-` flag.  Returns `true` when
     /// `arg` is one of the flags owned here; the caller (the main argument
     /// loop) then records it for [`Driver::replay_x86_explicit_isa_flags`].
@@ -220,6 +254,9 @@ impl Driver {
     /// ...) return `false` and stay with the main match: they have no
     /// arch-set interaction.
     fn apply_x86_isa_mflag(&mut self, arg: &str) -> bool {
+        if self.grant_avx512_family(arg) {
+            return true;
+        }
         match arg {
             "-mno-sse" | "-mno-sse2" => {
                 // Sticky disable: later `-march=native` / CPU profiles must
@@ -292,7 +329,13 @@ impl Driver {
             // -mssse3 implies -msse3 (matching GCC's implication chain).
             "-maes" => self.enable_aes = true,
             "-mpclmul" => self.enable_pclmul = true,
-            "-mf16c" => self.enable_f16c = true,
+            // F16C, VAES and VPCLMULQDQ are VEX-encoded: GCC 16.2 implies
+            // `__AVX__` and `__SSE4_2__` for each (measured), so each grants
+            // the AVX class as `-mavx` does. None implies AVX2.
+            "-mf16c" => {
+                self.enable_f16c = true;
+                self.grant_avx_class();
+            }
             "-mfma" => {
                 // FMA3 exists only in the VEX encoding — there is no
                 // legacy-SSE FMA — so -mfma implies -mavx and its full
@@ -344,35 +387,26 @@ impl Driver {
                 self.enable_popcnt = true;
                 self.popcnt_explicitly_disabled = false;
             }
+            "-mcx16" => {
+                self.enable_cx16 = true;
+                self.cx16_explicitly_disabled = false;
+            }
             "-mmovbe" => {
                 self.enable_movbe = true;
                 self.movbe_explicitly_disabled = false;
             }
             "-mrdrnd" => self.enable_rdrnd = true,
-            // AVX-512 / AVX10 feature flags (completeness; backend coverage
-            // is partial and runtime dispatch must verify the host).
-            "-mavx512f" => self.enable_avx512f = true,
-            "-mavx512cd" => self.enable_avx512cd = true,
-            "-mavx512dq" => self.enable_avx512dq = true,
-            "-mavx512bw" => self.enable_avx512bw = true,
-            "-mavx512vl" => self.enable_avx512vl = true,
-            "-mavx512ifma" => self.enable_avx512ifma = true,
-            "-mavx512vbmi" => self.enable_avx512vbmi = true,
-            "-mavx512vbmi2" => self.enable_avx512vbmi2 = true,
-            "-mavx512vnni" => self.enable_avx512vnni = true,
-            "-mavx512bitalg" => self.enable_avx512bitalg = true,
-            "-mavx512vpopcntdq" => self.enable_avx512vpopcntdq = true,
-            "-mavx512bf16" => self.enable_avx512bf16 = true,
-            "-mavx512fp16" => self.enable_avx512fp16 = true,
-            "-mavx512er" => self.enable_avx512er = true,
-            "-mavx512pf" => self.enable_avx512pf = true,
-            "-mavx512vp2intersect" => self.enable_avx512vp2intersect = true,
-            "-mavxvnni" => self.enable_avxvnni = true,
             "-mavxifma" => self.enable_avxifma = true,
             "-mavxneconvert" => self.enable_avxneconvert = true,
             "-mgfni" => self.enable_gfni = true,
-            "-mavxvnniint8" => self.enable_avxvnniint8 = true,
-            "-mavxvnniint16" => self.enable_avxvnniint16 = true,
+            "-mavxvnniint8" => {
+                self.enable_avxvnniint8 = true;
+                self.grant_avx2_class();
+            }
+            "-mavxvnniint16" => {
+                self.enable_avxvnniint16 = true;
+                self.grant_avx2_class();
+            }
             "-msha512" => self.enable_sha512 = true,
             "-msm3" => self.enable_sm3 = true,
             "-msm4" => self.enable_sm4 = true,
@@ -399,8 +433,14 @@ impl Driver {
             "-mno-amx-int8" => self.enable_amx_int8 = false,
             "-mno-amx-bf16" => self.enable_amx_bf16 = false,
             "-mno-cmpccxadd" => self.enable_cmpccxadd = false,
-            "-mvaes" => self.enable_vaes = true,
-            "-mvpclmulqdq" => self.enable_vpclmulqdq = true,
+            "-mvaes" => {
+                self.enable_vaes = true;
+                self.grant_avx_class();
+            }
+            "-mvpclmulqdq" => {
+                self.enable_vpclmulqdq = true;
+                self.grant_avx_class();
+            }
             "-mno-aes" => self.enable_aes = false,
             "-mno-pclmul" => self.enable_pclmul = false,
             "-mno-f16c" => self.enable_f16c = false,
@@ -410,9 +450,8 @@ impl Driver {
             }
             "-mno-bmi" => {
                 self.enable_bmi = false;
-                // Sticky denial: the absent-march baseline is x86-64-v3,
-                // which carries BMI1; only this explicit denial removes
-                // the class from a default build (GCC keeps the denial
+                // Sticky denial: a later -march=x86-64-v3 grant carries
+                // BMI1; this explicit denial removes it from that grant (GCC keeps the denial
                 // sticky across a later `-march=native` probe too).
                 self.bmi_explicitly_disabled = true;
             }
@@ -422,17 +461,19 @@ impl Driver {
             }
             "-mno-lzcnt" => {
                 self.enable_lzcnt = false;
-                // Sticky denial: the absent-march baseline is x86-64-v3,
-                // which carries ABM (LZCNT/TZCNT); only this explicit
-                // denial removes it from a default build.
+                // Sticky denial: an explicit -march=x86-64-v3 grant carries
+                // ABM (LZCNT/TZCNT); this explicit denial removes it from that grant.
                 self.lzcnt_explicitly_disabled = true;
             }
             "-mno-popcnt" => {
                 self.enable_popcnt = false;
-                // Sticky denial: the absent-march baseline is x86-64-v3,
-                // which carries POPCNT (since v2); only this explicit
-                // denial removes it from a default build.
+                // Sticky denial: an explicit v2+ grant carries POPCNT;
+                // this explicit denial removes it from that grant.
                 self.popcnt_explicitly_disabled = true;
+            }
+            "-mno-cx16" => {
+                self.enable_cx16 = false;
+                self.cx16_explicitly_disabled = true;
             }
             "-mno-movbe" => {
                 self.enable_movbe = false;
@@ -450,34 +491,8 @@ impl Driver {
             "-mno-gfni" => self.enable_gfni = false,
             "-mno-vaes" => self.enable_vaes = false,
             "-mno-vpclmulqdq" => self.enable_vpclmulqdq = false,
-            "-mavx2" => {
-                // Explicit ISA enable wins over a prior `-mno-sse` (GCC).
-                self.no_sse = false;
-                self.sse_explicitly_disabled = false;
-                self.sse41_explicitly_disabled = false;
-                self.avx_explicitly_disabled = false;
-                self.avx2_explicitly_disabled = false;
-                self.enable_x86_avx2_profile();
-                // SSE4.2 ⇒ POPCNT (GCC: the Nehalem bundle — `-mavx2
-                // -march=x86-64` defines `__POPCNT__`; measured on
-                // gcc 14.2). AVX2 ⊃ AVX ⊃ SSE4.2, so the explicit flag
-                // carries the implied integer feature too.
-                self.enable_popcnt = true;
-            }
-            "-mavx" => {
-                self.no_sse = false;
-                self.sse_explicitly_disabled = false;
-                self.sse41_explicitly_disabled = false;
-                self.avx_explicitly_disabled = false;
-                self.enable_avx = true;
-                self.enable_sse4_2 = true;
-                self.enable_sse4_1 = true;
-                self.enable_ssse3 = true;
-                self.enable_sse3 = true;
-                // AVX ⊃ SSE4.2 ⇒ POPCNT (GCC, measured on gcc 14.2:
-                // `-mavx -march=x86-64` defines `__POPCNT__`).
-                self.enable_popcnt = true;
-            }
+            "-mavx2" => self.grant_avx2_class(),
+            "-mavx" => self.grant_avx_class(),
             "-msse4.2" => {
                 self.sse41_explicitly_disabled = false;
                 self.enable_sse4_2 = true;
@@ -527,6 +542,43 @@ impl Driver {
         self.enable_ssse3 = true;
         self.enable_sse3 = true;
     }
+    /// The AVX2 implication class (GCC 16.2 semantics, measured): `-mavx2`
+    /// and every flag that implies it (AVX-VNNI and its int8/int16 forms,
+    /// and all AVX-512 subsets) grant AVX2 with AVX, SSE4.2 and POPCNT.
+    /// Explicit `-mno-sse` is overridden, as GCC does.
+    /// The AVX class (`-mavx`): clears the xmm/AVX/SSE4.x denials and grants
+    /// the SSE3..SSE4.2 ladder it contains, plus POPCNT (GCC defines
+    /// `__POPCNT__` for `-mavx`). Shared by every flag that implies AVX.
+    fn grant_avx_class(&mut self) {
+        self.no_sse = false;
+        self.sse_explicitly_disabled = false;
+        self.sse41_explicitly_disabled = false;
+        self.avx_explicitly_disabled = false;
+        self.enable_avx = true;
+        self.enable_sse4_2 = true;
+        self.enable_sse4_1 = true;
+        self.enable_ssse3 = true;
+        self.enable_sse3 = true;
+        // AVX ⊃ SSE4.2 ⇒ POPCNT (GCC, measured on gcc 14.2:
+        // `-mavx -march=x86-64` defines `__POPCNT__`).
+        self.enable_popcnt = true;
+    }
+
+    fn grant_avx2_class(&mut self) {
+        // Explicit ISA enable wins over a prior `-mno-sse` (GCC).
+        self.no_sse = false;
+        self.sse_explicitly_disabled = false;
+        self.sse41_explicitly_disabled = false;
+        self.avx_explicitly_disabled = false;
+        self.avx2_explicitly_disabled = false;
+        self.enable_x86_avx2_profile();
+        // SSE4.2 => POPCNT (GCC: the Nehalem bundle; `-mavx2
+        // -march=x86-64` defines `__POPCNT__`, measured on gcc 14.2). AVX2
+        // contains AVX contains SSE4.2, so the implied integer feature rides
+        // with the explicit flag.
+        self.enable_popcnt = true;
+    }
+
     fn enable_x86_avx2_profile(&mut self) {
         self.enable_x86_avx_profile();
         if self.sse_explicitly_disabled {
@@ -541,6 +593,7 @@ impl Driver {
         self.enable_bmi2 = true;
         self.enable_lzcnt = true;
         self.enable_movbe = true;
+        self.enable_cx16 = true;
         // x86-64-v3 is a superset of v2, which added POPCNT.
         self.enable_popcnt = true;
         if self.sse_explicitly_disabled {
@@ -633,6 +686,9 @@ impl Driver {
         // x86-64-v2 baseline contract; like BMI/LZCNT it is integer ISA
         // and stays legal under `-mno-sse`.
         self.enable_popcnt = true;
+        // CMPXCHG16B is part of the x86-64-v2 contract; integer ISA, so it
+        // stays legal under `-mno-sse` like POPCNT.
+        self.enable_cx16 = true;
         if self.sse_explicitly_disabled {
             return;
         }
@@ -1723,9 +1779,6 @@ impl Driver {
                         // Remembered for the tuning-row fallback
                         // (cpu_model::resolve: -mtune > -march > generic).
                         self.x86_march = Some(march.to_string());
-                        // An explicit profile is the code-generation ceiling
-                        // (GCC-exact); only the absent-flag default is v3.
-                        self.x86_march_explicit = true;
                         // A later `-march=` REPLACES the arch-implied set
                         // (GCC: `-march=x86-64-v3 -march=x86-64` leaves
                         // `__BMI__`/`__MOVBE__`/`__AVX__` absent — measured,
@@ -1859,6 +1912,9 @@ impl Driver {
                                     }
                                     if std::arch::is_x86_feature_detected!("movbe") {
                                         self.enable_movbe = true;
+                                    }
+                                    if std::arch::is_x86_feature_detected!("cmpxchg16b") {
+                                        self.enable_cx16 = true;
                                     }
                                     if !self.sse_explicitly_disabled {
                                         if std::arch::is_x86_feature_detected!("aes") {
@@ -3064,6 +3120,7 @@ pub fn std_version_macro(std_value: &str) -> Option<Option<&'static str>> {
 #[cfg(test)]
 mod cli_tests {
     use super::cmp_version;
+    use crate::backend::Target;
     use crate::common::fp_contract::FpContract;
     use crate::driver::pipeline::Driver;
 
@@ -4055,37 +4112,50 @@ mod cli_tests {
         assert!(d.enable_avx);
     }
 
-    /// The absent-`-march` code-generation baseline is x86-64-v3 (the same
-    /// contract as `Driver::x86_isa` returning `X86Isa::V3`), and BMI1/BMI2
-    /// are v3 members: a default build must arm ANDN/RORX-class selection
-    /// without any explicit `-mbmi*`.  Before this policy the flags stayed
-    /// explicit-only, so default `-O2` emitted `notq;andq` where `-mbmi`
-    /// emitted one `andn` — while AVX2 (also v3) was already on by default.
+    /// The absent-`-march` baseline is plain x86-64 with no BMI1/BMI2, so a
+    /// default build must NOT emit ANDN/RORX-class code.  BMI1/BMI2 are v3
+    /// members and are granted only by an explicit `-march=x86-64-v3` or `-mbmi*`.
     #[test]
-    fn bmi_defaults_to_v3_baseline() {
+    fn bmi_is_opt_in_not_default() {
         let mut d = Driver::new();
         let args: Vec<String> = ["ccc", "x.c"].iter().map(|s| s.to_string()).collect();
         assert!(d.parse_cli_args(&args).is_ok());
-        assert!(d.resolved_bmi1(), "v3 default baseline carries BMI1");
-        assert!(d.resolved_bmi2(), "v3 default baseline carries BMI2");
+        assert!(
+            !d.resolved_bmi1(),
+            "default x86-64 baseline must not carry BMI1"
+        );
+        assert!(
+            !d.resolved_bmi2(),
+            "default x86-64 baseline must not carry BMI2"
+        );
+        let mut v3 = Driver::new();
+        let args3: Vec<String> = ["ccc", "-march=x86-64-v3", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(v3.parse_cli_args(&args3).is_ok());
+        assert!(
+            v3.resolved_bmi1() && v3.resolved_bmi2(),
+            "-march=x86-64-v3 grants BMI1/BMI2"
+        );
     }
 
-    /// `-mno-bmi` is a STICKY denial against the v3 default baseline — the
+    /// `-mno-bmi` is a STICKY denial against an explicit v3 grant — the
     /// default must not revive the class behind the user's back (GCC keeps
     /// the last-explicit ISA decision).
     #[test]
-    fn mno_bmi_sticky_denial_beats_default_baseline() {
+    fn mno_bmi_sticky_denial_beats_explicit_grant() {
         let mut d = Driver::new();
-        let args: Vec<String> = ["ccc", "-mno-bmi", "x.c"]
+        let args: Vec<String> = ["ccc", "-march=x86-64-v3", "-mno-bmi", "x.c"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         assert!(d.parse_cli_args(&args).is_ok());
-        assert!(!d.resolved_bmi1(), "-mno-bmi must deny the v3 default");
+        assert!(!d.resolved_bmi1(), "-mno-bmi must deny the v3 grant");
         assert!(d.resolved_bmi2(), "-mno-bmi leaves the BMI2 class alone");
 
         let mut d2 = Driver::new();
-        let args2: Vec<String> = ["ccc", "-mno-bmi2", "x.c"]
+        let args2: Vec<String> = ["ccc", "-march=x86-64-v3", "-mno-bmi2", "x.c"]
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -4107,28 +4177,126 @@ mod cli_tests {
         assert!(d.resolved_bmi1());
     }
 
-    /// ABM (LZCNT/TZCNT) is an x86-64-v3 member: the absent-`-march`
-    /// baseline projects it, so `tzcnt`/`lzcnt` are the default codegen
-    /// choices (they supersede `bsf`/`bsr` and are defined on zero input).
+    /// CMPXCHG16B gates the inline 16-byte compare-exchange: the default
+    /// baseline must not carry it (a default build's 16-byte CAS calls
+    /// libatomic), `-mcx16` and the v2+ profiles grant it, and a sticky
+    /// `-mno-cx16` denies it in either order.  It is integer ISA, so
+    /// `-mno-sse` leaves it alone.
     #[test]
-    fn lzcnt_baseline_default_on() {
+    fn cx16_is_opt_in_not_default() {
+        let parse = |flags: &[&str]| {
+            let mut d = Driver::new();
+            let mut args: Vec<String> = vec![String::from("ccc")];
+            args.extend(flags.iter().map(|s| s.to_string()));
+            args.push(String::from("x.c"));
+            assert!(d.parse_cli_args(&args).is_ok(), "{flags:?}");
+            d
+        };
+        assert!(
+            !parse(&[]).resolved_cx16(),
+            "default baseline must not carry CMPXCHG16B"
+        );
+        assert!(
+            !parse(&[]).x86_isa().cx16,
+            "default ISA permission must not carry CMPXCHG16B"
+        );
+        assert!(
+            parse(&["-mcx16"]).resolved_cx16(),
+            "-mcx16 grants CMPXCHG16B"
+        );
+        assert!(
+            parse(&["-mcx16"]).x86_isa().cx16,
+            "-mcx16 reaches the emitter"
+        );
+        assert!(
+            parse(&["-march=x86-64-v2"]).resolved_cx16(),
+            "x86-64-v2 carries CMPXCHG16B"
+        );
+        assert!(
+            parse(&["-march=x86-64-v3"]).resolved_cx16(),
+            "x86-64-v3 carries CMPXCHG16B"
+        );
+        assert!(
+            !parse(&["-march=x86-64-v3", "-mno-cx16"]).resolved_cx16(),
+            "-mno-cx16 must deny the v3 grant"
+        );
+        assert!(
+            !parse(&["-mno-cx16", "-march=x86-64-v2"]).resolved_cx16(),
+            "-mno-cx16 is sticky against a later v2 profile"
+        );
+        assert!(
+            parse(&["-mno-sse", "-mcx16"]).x86_isa().cx16,
+            "CMPXCHG16B is integer ISA and survives -mno-sse"
+        );
+    }
+
+    /// CMPXCHG16B is an x86-64 permission only: the 128-bit compare-exchange
+    /// lowering lives in the x86-64 backend, so no other target may report it
+    /// even with the flag set.  Reporting it elsewhere would promise an inline
+    /// `lock cmpxchg16b` that no emitter on that target can produce.
+    #[test]
+    fn cx16_is_x86_64_only() {
+        let mut d = Driver::new();
+        d.enable_cx16 = true;
+        for target in [
+            Target::X86_64,
+            Target::I686,
+            Target::Aarch64,
+            Target::Riscv64,
+        ] {
+            let want = target == Target::X86_64;
+            d.target = target;
+            let resolved = d.resolved_cx16();
+            assert!(
+                resolved == want,
+                "{target:?}: resolved_cx16() = {resolved}, expected {want}"
+            );
+            let perm = d.x86_isa().cx16;
+            assert!(
+                perm == want,
+                "{target:?}: x86_isa().cx16 = {perm}, expected {want}"
+            );
+        }
+        // The sticky denial still outranks the grant on the one target that
+        // has the permission.
+        d.target = Target::X86_64;
+        d.cx16_explicitly_disabled = true;
+        assert!(!d.resolved_cx16());
+        assert!(!d.x86_isa().cx16);
+    }
+
+    /// ABM (LZCNT/TZCNT) is an x86-64-v3 member: only an explicit grant
+    /// projects it, and then `tzcnt`/`lzcnt` supersede `bsf`/`bsr` (defined on
+    /// zero input).  The default build keeps `bsf`/`bsr`.
+    #[test]
+    fn lzcnt_is_opt_in_not_default() {
         let mut d = Driver::new();
         let args: Vec<String> = ["ccc", "x.c"].iter().map(|s| s.to_string()).collect();
         assert!(d.parse_cli_args(&args).is_ok());
-        assert!(d.resolved_lzcnt(), "v3 baseline must project ABM");
+        assert!(
+            !d.resolved_lzcnt(),
+            "default x86-64 baseline must not carry ABM"
+        );
+        let mut v3 = Driver::new();
+        let args3: Vec<String> = ["ccc", "-march=x86-64-v3", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(v3.parse_cli_args(&args3).is_ok());
+        assert!(v3.resolved_lzcnt(), "-march=x86-64-v3 must project ABM");
     }
 
-    /// Sticky `-mno-lzcnt` denial beats the v3 default baseline; the BMI
+    /// Sticky `-mno-lzcnt` denial beats an explicit v3 grant; the BMI
     /// classes are unaffected (independent ISA groups).
     #[test]
-    fn mno_lzcnt_sticky_denial_beats_default_baseline() {
+    fn mno_lzcnt_sticky_denial_beats_explicit_grant() {
         let mut d = Driver::new();
-        let args: Vec<String> = ["ccc", "-mno-lzcnt", "x.c"]
+        let args: Vec<String> = ["ccc", "-march=x86-64-v3", "-mno-lzcnt", "x.c"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         assert!(d.parse_cli_args(&args).is_ok());
-        assert!(!d.resolved_lzcnt(), "-mno-lzcnt must deny the v3 default");
+        assert!(!d.resolved_lzcnt(), "-mno-lzcnt must deny the v3 grant");
         assert!(d.resolved_bmi1());
         assert!(d.resolved_bmi2());
     }
@@ -4146,15 +4314,25 @@ mod cli_tests {
         assert!(d.resolved_lzcnt());
     }
 
-    /// POPCNT joined the baseline at x86-64-v2, so the v3 default
-    /// projects it; sticky `-mno-popcnt` wins; a later `-mpopcnt` lifts
+    /// POPCNT joined the baseline at x86-64-v2, so only an explicit v2+
+    /// profile projects it; sticky `-mno-popcnt` wins; a later `-mpopcnt` lifts
     /// the denial; an explicit v1 ceiling removes it.
     #[test]
-    fn popcnt_baseline_default_on_sticky_denial_and_ceiling() {
+    fn popcnt_opt_in_sticky_denial_and_ceiling() {
         let mut d = Driver::new();
         let args: Vec<String> = ["ccc", "x.c"].iter().map(|s| s.to_string()).collect();
         assert!(d.parse_cli_args(&args).is_ok());
-        assert!(d.resolved_popcnt(), "v3 baseline must project POPCNT");
+        assert!(
+            !d.resolved_popcnt(),
+            "default x86-64 baseline must not carry POPCNT"
+        );
+        let mut v3 = Driver::new();
+        let args_v3: Vec<String> = ["ccc", "-march=x86-64-v3", "x.c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(v3.parse_cli_args(&args_v3).is_ok());
+        assert!(v3.resolved_popcnt(), "-march=x86-64-v3 must project POPCNT");
 
         let mut d2 = Driver::new();
         let args2: Vec<String> = ["ccc", "-mno-popcnt", "x.c"]
@@ -4162,10 +4340,7 @@ mod cli_tests {
             .map(|s| s.to_string())
             .collect();
         assert!(d2.parse_cli_args(&args2).is_ok());
-        assert!(
-            !d2.resolved_popcnt(),
-            "-mno-popcnt must deny the v3 default"
-        );
+        assert!(!d2.resolved_popcnt(), "-mno-popcnt must deny the v3 grant");
 
         let mut d3 = Driver::new();
         let args3: Vec<String> = ["ccc", "-mno-popcnt", "-mpopcnt", "x.c"]
@@ -4331,11 +4506,11 @@ mod cli_tests {
     }
 
     /// BMI is an INTEGER class: `-mno-sse` denies the xmm world but leaves
-    /// ANDN/RORX legal — the v3 default baseline still applies.
+    /// ANDN/RORX legal — an explicit `-march=x86-64-v3` baseline still applies.
     #[test]
-    fn bmi_baseline_survives_mno_sse() {
+    fn bmi_survives_mno_sse() {
         let mut d = Driver::new();
-        let args: Vec<String> = ["ccc", "-mno-sse", "x.c"]
+        let args: Vec<String> = ["ccc", "-march=x86-64-v3", "-mno-sse", "x.c"]
             .iter()
             .map(|s| s.to_string())
             .collect();

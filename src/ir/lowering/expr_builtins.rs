@@ -3166,7 +3166,7 @@ struct IntrinsicRequirement {
 /// Only *unambiguous* families are listed.  The 256-bit AES/CLMUL forms are
 /// VAES/VPCLMULQDQ and the three dot-product groups are AVX-VNNI,
 /// AVX-VNNI-INT8 and AVX-VNNI-INT16, whose permissions are the conjunction the
-/// fold already encodes (256-bit vector class AND the extension's own request),
+/// fold already encodes (AVX class AND the extension's own request),
 /// so a single lookup covers both halves; the SHA/GFNI/AVX-512 families still
 /// have no bit -- see the follow-up document's AUD-CPU-3 entry.
 fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<IntrinsicRequirement> {
@@ -3210,16 +3210,16 @@ fn x86_intrinsic_required_feature(intrinsic: &BuiltinIntrinsic) -> Option<Intrin
             IntrinsicRequirement {
                 feature: F::Vaes,
                 flag: "-mvaes",
-                also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
+                also: Some(" and AVX (VEX.256)"),
             }
         }
         // VPCLMULQDQ: the 256-bit carry-less multiply.  Separate bit from
-        // VAES (GCC rejects `_mm256_clmulepi64_epi128` under `-mavx2 -mvaes`),
-        // so the two must not share a row.
+        // VAES, so the two must not share a row.  Both 256-bit forms need AVX
+        // only, not AVX2 (measured on gcc 14: `-mvaes -mno-avx2` accepts).
         B::X86Vpclmulqdq256 => IntrinsicRequirement {
             feature: F::Vpclmulqdq,
             flag: "-mvpclmulqdq",
-            also: Some(" and a 256-bit vector class (AVX2 or AVX-512)"),
+            also: Some(" and AVX (VEX.256)"),
         },
         // AVX-VNNI: `vpdpbusd(s)` and `vpdpwssd(s)`, the VEX-encoded
         // signed-byte-times-unsigned-byte and signed-word dot products.  This

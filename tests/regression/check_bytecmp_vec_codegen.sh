@@ -104,12 +104,14 @@ check_config() {
 KERNEL_ISA=(-mno-sse -mno-mmx -mno-sse2 -mno-3dnow -mno-avx -mno-sse4a)
 
 emit default
+emit v3 -march=x86-64-v3
 emit march -march=x86-64
 emit noavx -mno-avx
 emit nosse "${KERNEL_ISA[@]}"
 LCCC_NO_BYTECMP_VEC=1 "$ccc" -O2 -S "$kernel" -o "$tmp/kill.s"
 
-check_config default avx2
+check_config default sse2
+check_config v3 avx2
 check_config march sse2
 check_config noavx sse2
 check_config nosse none
@@ -133,7 +135,7 @@ run_case() { # run_case <tag> <source> <flags...>
     check_eq "$tag: lccc stdout matches GCC" "$out_l" "$out_g"
 }
 
-for cfg in "" "-march=x86-64" "-mno-avx"; do
+for cfg in "" "-march=x86-64" "-march=x86-64-v3" "-mno-avx"; do
     tag="bounds${cfg// /}"
     # shellcheck disable=SC2086
     run_case "$tag" "$bounds" $cfg

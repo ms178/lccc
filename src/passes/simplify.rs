@@ -3196,8 +3196,8 @@ fn has_round_insn() -> bool {
 /// fma/fmaf REQUIRE the fused form (single rounding, C99 F.10.10.1);
 /// converting the libcall is not just faster, it is what makes glibc's own
 /// s_fma.c/s_fmaf.c (built with math-use-builtins-fma.h) link at all.
-/// The x86-64 backend emits VEX FMA3 unconditionally at -O2 (project
-/// baseline is x86-64-v3), matching the existing mul+add fusion policy.
+/// The x86-64 backend emits VEX FMA3 whenever the TU's resolved ISA permission
+/// grants it, matching the existing mul+add fusion policy.
 const TERNARY_INTRINSICS: &[(&str, IntrinsicOp)] = &[
     ("fma", IntrinsicOp::FmaScalarF64),
     ("fmaf", IntrinsicOp::FmaScalarF32),

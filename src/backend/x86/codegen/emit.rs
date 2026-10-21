@@ -940,8 +940,8 @@ pub struct X86Codegen {
     /// True when the target has AVX2; gates YMM constant-size copies.
     pub(super) avx2_enabled: bool,
     /// Code-generation ISA permission for the current TU (VEX / SSE4.1 /
-    /// FMA3 / ymm).  Every text emitter consults this instead of assuming
-    /// the x86-64-v3 baseline; see `backend::x86::isa`.
+    /// FMA3 / ymm).  Every text emitter consults this instead of assuming a
+    /// baseline; the x86-64 default is SSE2 — see `backend::x86::isa`.
     pub(super) isa: super::super::isa::X86Isa,
     /// True when the target has AVX-512F; enables EVEX GPR-source broadcasts.
     pub(super) avx512_enabled: bool,
@@ -1642,9 +1642,9 @@ impl X86Codegen {
         // after the peephole when emit_cfi is off.
         self.state.fn_boundary_markers = true;
         self.fp_contract = opts.fp_contract;
-        // FMA3 contraction follows the permission, not the request bit: the
-        // baseline-v3 default grants it, `-mno-fma`/`-mno-avx`/`-march=x86-64`
-        // deny it (vfmadd* is VEX-only).
+        // FMA3 contraction follows the permission, not the request bit: it is
+        // granted by `-mfma` or an `-march=` profile carrying it, and
+        // `-mno-fma`/`-mno-avx`/`-march=x86-64` deny it (vfmadd* is VEX-only).
         self.fma_enabled = opts.isa.fma;
         self.optimize_for_size = opts.optimize_for_size;
     }

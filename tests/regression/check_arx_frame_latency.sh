@@ -92,7 +92,7 @@ host_has() { grep -qw "$1" /proc/cpuinfo; }
 # check FORM FUNC FLAGS MAX-BOUND run|skip
 check() {
   local form=$1 func=$2 flags=$3 max=$4 run=$5
-  local tag="$form ${flags:-(default v3)}"
+  local tag="$form ${flags:-(default: x86-64 baseline)}"
   # shellcheck disable=SC2086
   "$CCC" -O2 $flags -DBLOCK_COUNT=4096U -DPASSES=2U -S "$tmp/$form.c" -o "$tmp/$form.s"
   if ! has_lane_shuffle "$func" "$tmp/$form.s"; then
@@ -132,8 +132,11 @@ check() {
 for form in array:chacha20_core locals:core; do
   f=${form%%:*}
   fn=${form#*:}
-  check "$f" "$fn" "" 28 "$(host_has avx2 && echo run || echo skip)"
+  # Default build = x86-64 baseline (SSE2): anchored optimum 32.
+  check "$f" "$fn" "" 32 run
   check "$f" "$fn" "-march=x86-64" 32 run
+  # v3 is opt-in: the 28-cycle optimum needs the AVX2 (VEX) forms.
+  check "$f" "$fn" "-march=x86-64-v3" 28 "$(host_has avx2 && echo run || echo skip)"
   check "$f" "$fn" "-march=x86-64-v4" 24 "$(host_has avx512vl && echo run || echo skip)"
 done
 
