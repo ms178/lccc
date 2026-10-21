@@ -2748,7 +2748,7 @@ pub(crate) fn recognize_function(
                 }
                 Instruction::BinOp {
                     dest,
-                    op: IrBinOp::Or,
+                    op: IrBinOp::Or | IrBinOp::Xor,
                     ty,
                     ..
                 } if matches!(*ty, IrType::U32 | IrType::I32 | IrType::U64 | IrType::I64) => {
@@ -2788,6 +2788,27 @@ pub(crate) fn recognize_function(
                             index += 1;
                             continue;
                         }
+                    }
+                    if let Some(src) = bytes::bswap(Operand::Value(dest), ty, &defs) {
+                        let replacement = Instruction::UnaryOp {
+                            dest,
+                            op: IrUnaryOp::Bswap,
+                            src,
+                            ty,
+                        };
+                        // Later producer-repurposing rules consume these maps.
+                        // Keep direct read counts exact after replacing the consumer.
+                        block.instructions[index].for_each_used_value(|v| {
+                            use_counts[v as usize] -= 1;
+                        });
+                        replacement.for_each_used_value(|v| {
+                            use_counts[v as usize] += 1;
+                        });
+                        defs[dest.0 as usize] = Some(replacement.clone());
+                        block.instructions[index] = replacement;
+                        changes += 1;
+                        index += 1;
+                        continue;
                     }
                     if max_rotate_bits > 0
                         && let Some((value, amount, is_left)) =
@@ -5341,3 +5362,6 @@ mod demand;
 
 #[path = "bit_idioms_batch6.rs"]
 mod batch6;
+
+#[path = "bit_idioms_bytes.rs"]
+mod bytes;
