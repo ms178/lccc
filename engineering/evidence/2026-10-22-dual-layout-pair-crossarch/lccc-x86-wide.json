@@ -1,0 +1,245 @@
+{
+  "arms": [
+    "serial",
+    "auto",
+    "forced"
+  ],
+  "compiler": "/home/user/lccc/target/fastbuild/lccc",
+  "iters": 12,
+  "sources": {
+    "peephole_pair_chain_wide.c": {
+      "arms": {
+        "auto": {
+          "median_s": 0.2709776500000203,
+          "pairs": [
+            {
+              "chain_bytes": 1368,
+              "mode": "parallel",
+              "orig_bytes": 1284
+            },
+            {
+              "chain_bytes": 1366,
+              "mode": "parallel",
+              "orig_bytes": 1282
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            }
+          ],
+          "pairs_split": 10,
+          "ratio_ci95": [
+            0.8775169112677587,
+            0.9195437500204244
+          ],
+          "ratio_median": 0.8852899850598857,
+          "ratios": [
+            0.9119229870760418,
+            0.8804276427703661,
+            0.6722471997264516,
+            0.9234315080277191,
+            0.8746061797651512,
+            0.8817379545661702,
+            0.9773637104095361,
+            0.8851070991122293,
+            0.8485456734401207,
+            0.8854728710075421,
+            0.9156559920131297,
+            1.0334382827940038
+          ]
+        },
+        "forced": {
+          "median_s": 0.26883209300001454,
+          "pairs": [
+            {
+              "chain_bytes": 1368,
+              "mode": "parallel",
+              "orig_bytes": 1284
+            },
+            {
+              "chain_bytes": 1366,
+              "mode": "parallel",
+              "orig_bytes": 1282
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "parallel",
+              "orig_bytes": 1311
+            }
+          ],
+          "pairs_split": 10,
+          "ratio_ci95": [
+            0.8590210284068451,
+            0.9226316445440294
+          ],
+          "ratio_median": 0.8828917042578887,
+          "ratios": [
+            0.9228676943734692,
+            0.8814158022646044,
+            0.6535902318729587,
+            0.8305668344025867,
+            0.8695319706113329,
+            0.911283585358259,
+            0.9223955947145895,
+            0.8727128628889965,
+            0.8485100862023573,
+            1.0050151472341777,
+            0.8843676062511729,
+            1.016714211145293
+          ]
+        },
+        "serial": {
+          "median_s": 0.30195044399999915,
+          "pairs": [
+            {
+              "chain_bytes": 1368,
+              "mode": "serial",
+              "orig_bytes": 1284
+            },
+            {
+              "chain_bytes": 1366,
+              "mode": "serial",
+              "orig_bytes": 1282
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "serial",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "serial",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "serial",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "serial",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "serial",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "serial",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "serial",
+              "orig_bytes": 1311
+            },
+            {
+              "chain_bytes": 1394,
+              "mode": "serial",
+              "orig_bytes": 1311
+            }
+          ],
+          "pairs_split": 0,
+          "ratio_ci95": [
+            1.0,
+            1.0
+          ],
+          "ratio_median": 1.0,
+          "ratios": [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ]
+        }
+      },
+      "assembly_identical": true,
+      "assembly_sha256": [
+        "6346c4c4a13ae80518cd289a655f0f17a639934e216c8c556f41d0125c8e1e12"
+      ]
+    }
+  },
+  "warmups": 2
+}

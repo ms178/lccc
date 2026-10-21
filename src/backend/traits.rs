@@ -2415,9 +2415,16 @@ pub trait ArchCodegen {
         text
     }
 
-    /// Optimize both dual-layout candidates. Backends may override this to
-    /// evaluate the independent candidates concurrently; the default keeps
-    /// the historical serial behavior.
+    /// Optimize both dual-layout candidates for the instruction-count metric.
+    ///
+    /// Every shipped backend (x86-64, i686, AArch64, RISC-V) overrides this to
+    /// evaluate the independent candidates concurrently through
+    /// [`crate::backend::metric_pair::run_metric_pair`]. The default stays
+    /// serial, and deliberately cannot do better: this method is called through
+    /// `&mut dyn ArchCodegen`, so a default body cannot prove `Self: Sync` and
+    /// has no way to hand the second candidate to a worker. A new backend gets
+    /// the concurrency by adding the same three-line override, not by changing
+    /// this default.
     fn peephole_pair_for_metric(&self, first: String, second: String) -> (String, String) {
         // Two statements, not a tuple literal: the shape that survives any
         // rustfmt heuristic, since the calls are already at statement width.

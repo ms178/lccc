@@ -2954,6 +2954,18 @@ impl ArchCodegen for I686Codegen {
         crate::backend::i686::codegen::peephole::peephole_optimize(text)
     }
 
+    /// Dual-layout metric pair: the metric peephole is a free `text -> text`
+    /// function, so both candidates can be evaluated concurrently by the shared
+    /// scheduler (policy, counters and instrument labels live there).
+    fn peephole_pair_for_metric(&self, first: String, second: String) -> (String, String) {
+        crate::backend::metric_pair::run_metric_pair(
+            "i686",
+            first,
+            second,
+            crate::backend::i686::codegen::peephole::peephole_optimize,
+        )
+    }
+
     fn emit_branch_nonzero(&mut self, label: &str) {
         self.state.emit("    testl %eax, %eax");
         emit!(self.state, "    jne {}", label);
