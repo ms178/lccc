@@ -75,7 +75,7 @@ def semantic_report(root):
 
 
 class EvidencePublication(unittest.TestCase):
-    def test_all_46_native_rows_and_five_arms_fit_a_single_step(self):
+    def test_all_native_rows_and_five_arms_fit_a_single_step(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             write(root / 'native.json', native_report())
@@ -84,7 +84,7 @@ class EvidencePublication(unittest.TestCase):
             rows = [row for title, data in notices if title.startswith('compiler comparison rows')
                     for row in data]
             self.assertEqual({row['name'] for row in rows}, {case.name for case in summary.bench.BENCHMARKS})
-            self.assertEqual(len(rows), 46)
+            self.assertEqual(len(rows), len(summary.bench.BENCHMARKS))
             self.assertEqual(len(rows[0]['ratios']), 4)
             self.assertEqual(len(rows[0]['ratios']['pr835']), len(summary.COMPACT_RATIO_COLUMNS))
 
@@ -104,7 +104,7 @@ class EvidencePublication(unittest.TestCase):
             self.assertIs(notices[0][1]['timing_claim'], False)
             rows = [row for title, data in notices if title.startswith('compiler comparison rows')
                     for row in data]
-            self.assertEqual(len(rows), 46)
+            self.assertEqual(len(rows), len(summary.bench.BENCHMARKS))
             self.assertTrue(all(set(row) == {'name', 'correct'} for row in rows))
 
     def test_all_65_semantic_failure_rows_survive_without_failing_good_required_arms(self):
@@ -156,7 +156,7 @@ class EvidencePublication(unittest.TestCase):
                 self.assertEqual(status, 0, output)
                 self.assertTrue(notices[0][1]['full_registry_valid'])
                 rows = [row for _, data in notices[1:] for row in data]
-                self.assertEqual(len(rows), 46)
+                self.assertEqual(len(rows), len(names))
                 self.assertEqual({row['name'] for row in rows}, set(names))
 
     def test_missing_sections_and_partial_instrumentation_never_succeed(self):
