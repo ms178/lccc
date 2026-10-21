@@ -868,4 +868,37 @@ mod copyback_producer_tests {
         // Register-to-register copies belong to fold_register_copies.
         assert!(parse_copyback_producer("movq %rax, %r10").is_none());
     }
+
+    #[test]
+    fn upper32_zero_promotes_32bit_copy_and_base_read_rewrites_copy_site() {
+        // 1. A 32-bit producer (`movl (%rdi), %eax`) zeroes bits 32..63 of
+        //    `%rax`, so a subsequent `movl %eax, %ecx` can be treated as W64
+        //    and forwarded into a 64-bit use `(,%rcx,4)`.
+        let out = super::run(&super::f(concat!(
+            "    movl (%rdi), %eax\n",
+            "    movl %eax, %ecx\n",
+            "    movl (%rsi,%rcx,4), %eax\n",
+            "    ret"
+        )));
+        assert!(
+            out.contains("(%rsi,%rax,4)") && !out.contains("movl %eax, %ecx"),
+            "32-bit zero-extending producer must allow W64 index forwarding:\n{out}"
+        );
+
+        // 2. When `%rax` is read between `leaq 4(%rax), %r10` and the copy-back
+        //    `movq %r10, %rax` (with `%rax` live out at `ret`), the copy site
+        //    itself is rewritten to `leaq 4(%rax), %rax` and the earlier `leaq`
+        //    is dropped.
+        let out = super::run(&super::f(concat!(
+            "    leaq 4(%rax), %r10\n",
+            "    movl (%rax), %ecx\n",
+            "    movl %ecx, (%rsi)\n",
+            "    movq %r10, %rax\n",
+            "    ret"
+        )));
+        assert!(
+            out.contains("leaq 4(%rax), %rax") && !out.contains("%r10"),
+            "copyback with intermediate base read must collapse at the copy site:\n{out}"
+        );
+    }
 }

@@ -978,11 +978,7 @@ pub(super) fn fold_induction_copyback(store: &mut LineStore, infos: &mut [LineIn
         // with no uses at all, dead right after the copy).
         let mut all_uses: Vec<usize> = pre_uses;
         all_uses.extend_from_slice(&uses);
-        let dead_at = if all_uses.is_empty() {
-            c
-        } else {
-            *all_uses.last().unwrap()
-        };
+        let dead_at = all_uses.last().copied().unwrap_or(c);
         if lv.live_after(dead_at, t_fam) != Some(false) {
             continue;
         }

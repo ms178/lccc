@@ -6455,7 +6455,7 @@ fn synthetic_vec_intervals(
     for (block_index, block) in func.blocks.iter().enumerate() {
         let block_start = point;
         for inst in &block.instructions {
-            let end = point.checked_add(1).expect("IR program-point overflow");
+            let end = point.saturating_add(1);
             let mut read_values: FxHashSet<u32> = FxHashSet::default();
             let mut written_value: Option<u32> = None;
             match inst {
@@ -6512,7 +6512,7 @@ fn synthetic_vec_intervals(
             }
             point = end;
         }
-        let terminator_end = point.checked_add(1).expect("IR program-point overflow");
+        let terminator_end = point.saturating_add(1);
         for_each_operand_in_terminator(&block.terminator, |operand| {
             let Operand::Value(value) = operand else {
                 return;
@@ -7211,23 +7211,20 @@ fn allocate_vector_registers_destructive(
     let mut assigned_map: FxHashMap<u32, PhysReg> = FxHashMap::default();
     for v in order {
         let pieces = &coverage[&v];
+        let fits = |rn: u8| {
+            held.get(&rn)
+                .is_none_or(|h| sse_chain_pieces_fit(h, pieces))
+        };
         // Prefer the proven-dead first operand's register when it fits:
         // the preference failing the overlap test (segment overhang past
         // the proven death) is the automatic veto — the destination then
         // takes another free register instead of tripping a repair
         // eviction later.
-        let mut preference: Option<u8> = None;
-        if let Some(&a0) = death_from.get(&v) {
-            if let Some(&reg) = assigned_map.get(&a0) {
-                let fits = held
-                    .get(&reg.0)
-                    .map(|h| sse_chain_pieces_fit(h, pieces))
-                    .unwrap_or(true);
-                if fits {
-                    preference = Some(reg.0);
-                }
-            }
-        }
+        let preference = death_from
+            .get(&v)
+            .and_then(|a0| assigned_map.get(a0))
+            .map(|r| r.0)
+            .filter(|&rn| fits(rn));
         // Pending-handoff reservation: a handoff source whose target is not
         // yet assigned reserves its register.  A value without a usable
         // preference takes another free register when one fits, so an
@@ -7238,18 +7235,13 @@ fn allocate_vector_registers_destructive(
         let mut reserved: FxHashSet<u8> = FxHashSet::default();
         if preference.is_none() {
             for (&d, &a0) in death_from.iter() {
-                if !assigned_map.contains_key(&d) {
-                    if let Some(&reg) = assigned_map.get(&a0) {
-                        reserved.insert(reg.0);
-                    }
+                if !assigned_map.contains_key(&d)
+                    && let Some(&reg) = assigned_map.get(&a0)
+                {
+                    reserved.insert(reg.0);
                 }
             }
         }
-        let fits = |rn: u8| {
-            held.get(&rn)
-                .map(|h| sse_chain_pieces_fit(h, pieces))
-                .unwrap_or(true)
-        };
         let chosen = if let Some(rn) = preference {
             pool.iter().find(|r| r.0 == rn).copied()
         } else {
@@ -15851,6 +15843,7 @@ mod phi_chain_shape_tests {
         // those ARE empty chains -- reachability, not topology, decides.
         assert_eq!(single_pred_chain(&preds, 0, 1), Some(Vec::new()));
         assert_eq!(single_pred_chain(&preds, 0, 2), Some(Vec::new()));
+        assert_eq!(single_pred_chain(&preds, 1, 2), None);
 
         // Back edge: 0 -> 1 -> 2 -> 1. The walk stops at block 1 because the
         // back edge gives it two predecessors (the `mids.contains` guard is

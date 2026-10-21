@@ -603,8 +603,9 @@ fn fold_round(func: &mut IrFunction) -> usize {
         // ── Walk the chain, continuing over Skip members ──
         let mut chain: Vec<Member> = vec![first];
         loop {
-            let last = chain.last().unwrap();
-            let Some(miss) = last.miss else { break };
+            let Some(miss) = chain.last().and_then(|last| last.miss) else {
+                break;
+            };
             let Some(&next_idx) = label_to_idx.get(&miss.0) else {
                 break;
             };
@@ -802,7 +803,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
             .map(|(i, _)| i)
             .collect();
         if maskable.len() < 3 {
-            bi = chain.last().unwrap().bi + 1;
+            bi = chain.last().map_or(bi + 1, |m| m.bi + 1);
             continue;
         }
         let bounds = |k: Kind| -> (i64, i64) {
@@ -828,21 +829,20 @@ fn fold_round(func: &mut IrFunction) -> usize {
                 best = inside;
             }
         }
-        if best.len() < 3 {
-            bi = chain.last().unwrap().bi + 1;
+        let (Some(lo), Some(hi)) = (
+            best.iter()
+                .filter(|_| best.len() >= 3)
+                .map(|&i| bounds(chain[i].kind).0)
+                .min(),
+            best.iter()
+                .filter(|_| best.len() >= 3)
+                .map(|&i| bounds(chain[i].kind).1)
+                .max(),
+        ) else {
+            bi = chain.last().map_or(bi + 1, |m| m.bi + 1);
             continue;
-        }
+        };
         let absorbed = best;
-        let lo = absorbed
-            .iter()
-            .map(|&i| bounds(chain[i].kind).0)
-            .min()
-            .unwrap();
-        let hi = absorbed
-            .iter()
-            .map(|&i| bounds(chain[i].kind).1)
-            .max()
-            .unwrap();
         let span = hi - lo;
         let mut mask: u64 = 0;
         for &i in &absorbed {

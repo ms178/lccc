@@ -8200,4 +8200,130 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn wide_pointer_add_load_store_and_gep_base_widen_when_exact_and_refuse_when_inexact() {
+        let header_cmp = || {
+            Some(Instruction::Cmp {
+                dest: Value(2),
+                op: IrCmpOp::Ult,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I32(64)),
+                ty: IrType::U32,
+            })
+        };
+        // 1. Exact wide address chain `addr = Add(arr, zext(i))` consumed by
+        //    Load, Store, GEP-base and wide 64-bit integer Store value: must
+        //    widen the U32 IV to U64 and pass SSA verification.
+        let exact_body = vec![
+            Instruction::Cast {
+                dest: Value(10),
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::U32,
+                to_ty: IrType::U64,
+            },
+            Instruction::BinOp {
+                dest: Value(11),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(50)),
+                rhs: Operand::Value(Value(10)),
+                ty: IrType::U64,
+            },
+            Instruction::Load {
+                dest: Value(12),
+                ptr: Value(11),
+                ty: IrType::U8,
+                volatile: false,
+                seg_override: AddressSpace::Default,
+            },
+            Instruction::Store {
+                val: Operand::Value(Value(12)),
+                ptr: Value(11),
+                ty: IrType::U8,
+                volatile: false,
+                seg_override: AddressSpace::Default,
+            },
+            Instruction::GetElementPtr {
+                dest: Value(13),
+                base: Value(11),
+                offset: Operand::Const(IrConst::I64(4)),
+                ty: IrType::I8,
+            },
+            Instruction::Store {
+                val: Operand::Value(Value(10)),
+                ptr: Value(13),
+                ty: IrType::U64,
+                volatile: false,
+                seg_override: AddressSpace::Default,
+            },
+        ];
+        let mut func = counting_loop(
+            "wide_ptr_add_exact",
+            IrType::U32,
+            IrBinOp::Add,
+            exact_body,
+            header_cmp(),
+        );
+        check(&mut func, 1);
+
+        // 2. IVW-RANGE-1 negative control: if a narrow wrapping Add precedes
+        //    the U32->U64 cast under a runtime bound (so `intercept` is active
+        //    and `cur_exact` is false), Load/Store/GEP-base on `Add(arr, w)`
+        //    must refuse to widen.
+        let inexact_body = vec![
+            Instruction::BinOp {
+                dest: Value(9),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Const(IrConst::I32(100)),
+                ty: IrType::U32,
+            },
+            Instruction::Cast {
+                dest: Value(10),
+                src: Operand::Value(Value(9)),
+                from_ty: IrType::U32,
+                to_ty: IrType::U64,
+            },
+            Instruction::BinOp {
+                dest: Value(11),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(50)),
+                rhs: Operand::Value(Value(10)),
+                ty: IrType::U64,
+            },
+            Instruction::Load {
+                dest: Value(12),
+                ptr: Value(11),
+                ty: IrType::U8,
+                volatile: false,
+                seg_override: AddressSpace::Default,
+            },
+        ];
+        let mut inexact = counting_loop(
+            "wide_ptr_add_inexact",
+            IrType::U32,
+            IrBinOp::Add,
+            inexact_body,
+            None,
+        );
+        // Runtime bound in preheader (Value(60)) so range is full-domain and
+        // `intercept` is active.
+        inexact.blocks[0].instructions.push(Instruction::Copy {
+            dest: Value(60),
+            src: Operand::Const(IrConst::I32(64)),
+        });
+        inexact.blocks[1].instructions.push(Instruction::Cmp {
+            dest: Value(2),
+            op: IrCmpOp::Ult,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Value(Value(60)),
+            ty: IrType::U32,
+        });
+        inexact.blocks[1].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(2)),
+            true_label: BlockId(2),
+            false_label: BlockId(4),
+        };
+        check(&mut inexact, 0);
+    }
 }

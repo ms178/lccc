@@ -1812,12 +1812,19 @@ impl X86Codegen {
         self.operand_to_rcx(rhs);
 
         match op {
-            IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul => {
+            IrBinOp::Add
+            | IrBinOp::Sub
+            | IrBinOp::Mul
+            | IrBinOp::And
+            | IrBinOp::Or
+            | IrBinOp::Xor => {
                 let mnem = match op {
                     IrBinOp::Add => "add",
                     IrBinOp::Sub => "sub",
                     IrBinOp::Mul => "imul",
-                    _ => unreachable!("unexpected i64 binop: {:?}", op),
+                    IrBinOp::And => "and",
+                    IrBinOp::Or => "or",
+                    _ => "xor",
                 };
                 if use_32bit {
                     self.state
@@ -1827,61 +1834,28 @@ impl X86Codegen {
                         .emit_fmt(format_args!("    {}q %rcx, %rax", mnem));
                 }
             }
-            IrBinOp::SDiv => {
+            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => {
+                let signed = matches!(op, IrBinOp::SDiv | IrBinOp::SRem);
+                let is_rem = matches!(op, IrBinOp::SRem | IrBinOp::URem);
                 if use_32bit {
-                    self.state.emit("    cltd");
-                    self.state.emit("    idivl %ecx");
+                    self.state.emit(if signed {
+                        "    cltd"
+                    } else {
+                        "    xorl %edx, %edx"
+                    });
+                    self.state.emit(if signed {
+                        "    idivl %ecx"
+                    } else {
+                        "    divl %ecx"
+                    });
+                    if is_rem {
+                        self.state.emit("    movl %edx, %eax");
+                    }
                 } else {
-                    self.emit_div64(true);
-                }
-            }
-            IrBinOp::UDiv => {
-                if use_32bit {
-                    self.state.emit("    xorl %edx, %edx");
-                    self.state.emit("    divl %ecx");
-                } else {
-                    self.emit_div64(false);
-                }
-            }
-            IrBinOp::SRem => {
-                if use_32bit {
-                    self.state.emit("    cltd");
-                    self.state.emit("    idivl %ecx");
-                    self.state.emit("    movl %edx, %eax");
-                } else {
-                    self.emit_div64(true);
-                    self.state.emit("    movq %rdx, %rax");
-                }
-            }
-            IrBinOp::URem => {
-                if use_32bit {
-                    self.state.emit("    xorl %edx, %edx");
-                    self.state.emit("    divl %ecx");
-                    self.state.emit("    movl %edx, %eax");
-                } else {
-                    self.emit_div64(false);
-                    self.state.emit("    movq %rdx, %rax");
-                }
-            }
-            IrBinOp::And => {
-                if use_32bit {
-                    self.state.emit("    andl %ecx, %eax");
-                } else {
-                    self.state.emit("    andq %rcx, %rax");
-                }
-            }
-            IrBinOp::Or => {
-                if use_32bit {
-                    self.state.emit("    orl %ecx, %eax");
-                } else {
-                    self.state.emit("    orq %rcx, %rax");
-                }
-            }
-            IrBinOp::Xor => {
-                if use_32bit {
-                    self.state.emit("    xorl %ecx, %eax");
-                } else {
-                    self.state.emit("    xorq %rcx, %rax");
+                    self.emit_div64(signed);
+                    if is_rem {
+                        self.state.emit("    movq %rdx, %rax");
+                    }
                 }
             }
             IrBinOp::Shl | IrBinOp::AShr | IrBinOp::LShr => {
