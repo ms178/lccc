@@ -2386,12 +2386,54 @@ fn recognize_copysign_mem(func: &mut IrFunction) -> usize {
     changes
 }
 
+/// Charge (`add`) or discharge one direct read of `operand` in `use_counts`.
+///
+/// Counts are seeded from the two canonical visitors — scalar operands plus
+/// bare value uses (addresses, `dest_ptr`s, memcpy endpoints) — so every
+/// in-place rewrite that changes an instruction's operand set goes through
+/// here; otherwise a later single-use proof can reason about a producer whose
+/// value is still live.  An underflow means the accounting itself is wrong:
+/// debug-assertion builds (CI) fail loudly there, while release builds saturate
+/// rather than wrap, so a miscount can only ever cost an optimization, never a
+/// miscompile.
+fn note_use(use_counts: &mut [u32], operand: Operand, add: bool) {
+    let Operand::Value(v) = operand else { return };
+    let Some(count) = use_counts.get_mut(v.0 as usize) else {
+        return;
+    };
+    if add {
+        *count = count.saturating_add(1);
+    } else {
+        debug_assert!(*count > 0, "use-count underflow for value {}", v.0);
+        *count = count.saturating_sub(1);
+    }
+}
+
+/// Move every read count recorded for `old` to its replacement `new`.
+///
+/// Applying both canonical visitors keeps the counts exact for any instruction
+/// shape, not merely for the `BinOp`/`Or` -> `UnaryOp` rewrites that call it
+/// today, so a future rewrite cannot silently inherit a narrower assumption.
+fn retarget_use_counts(old: &Instruction, new: &Instruction, use_counts: &mut [u32]) {
+    fn visit(inst: &Instruction, use_counts: &mut [u32], add: bool) {
+        crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+            note_use(use_counts, *op, add);
+        });
+        crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+            note_use(use_counts, Operand::Value(*v), add);
+        });
+    }
+    visit(old, use_counts, false);
+    visit(new, use_counts, true);
+}
+
 pub(crate) fn recognize_function(
     func: &mut IrFunction,
     enable_bit_reverse: bool,
     max_rotate_bits: u32,
     min_rotate_bits: u32,
     has_scalar_andn: bool,
+    native_bswap: bool,
 ) -> usize {
     let pre_changes = canonicalize_narrow_crc_casts(func);
     let mut defs = vec![None; func.max_value_id() as usize + 1];
@@ -2442,8 +2484,12 @@ pub(crate) fn recognize_function(
     // No insertion is allowed during the scan: def_loc and pending mask
     // coordinates refer to the original layout. Boolean producer rewrites
     // remain immediate (with coherent defs/use_counts); every expanding
-    // rewrite is applied after the atomic mask pairs, in reverse order.
+    // rewrite is applied after the atomic mask pairs, highest coordinate first.
     let mut expansions: Vec<Expansion> = Vec::new();
+    // Partial byte reversals, ranked after the scan: a merge chain makes every
+    // prefix node a candidate, and only the widest one covers the whole
+    // network.  Entries: (tree ops, block, index, dest, ty, match).
+    let mut partial: Vec<(u16, usize, usize, Value, IrType, bytes::Match)> = Vec::new();
     for (block_bi, block) in func.blocks.iter_mut().enumerate() {
         let mut index = 0;
         while index < block.instructions.len() {
@@ -2500,6 +2546,14 @@ pub(crate) fn recognize_function(
                         if let Instruction::BinOp { rhs, .. } = &mut block.instructions[index] {
                             *rhs = forwarded;
                         }
+                        // This is a read transfer, not a free rename: the old
+                        // count operand loses this instruction's use and the
+                        // forwarded one gains it. Leaving the counts stale can
+                        // understate a value by one, and a later single-use
+                        // proof would then repurpose the producer of a value
+                        // that still feeds this shift.
+                        note_use(&mut use_counts, start, false);
+                        note_use(&mut use_counts, forwarded, true);
                         changes += 1;
                     }
                 }
@@ -2737,18 +2791,25 @@ pub(crate) fn recognize_function(
                 } if *ty == IrType::U32 || *ty == IrType::I32 => {
                     let dest = *dest;
                     if let Some(src) = match_popcount32(Operand::Value(dest), &defs) {
-                        block.instructions[index] = Instruction::UnaryOp {
+                        let replacement = Instruction::UnaryOp {
                             dest,
                             op: IrUnaryOp::Popcount,
                             src,
                             ty: IrType::U32,
                         };
+                        retarget_use_counts(
+                            &block.instructions[index],
+                            &replacement,
+                            &mut use_counts,
+                        );
+                        defs[dest.0 as usize] = Some(replacement.clone());
+                        block.instructions[index] = replacement;
                         changes += 1;
                     }
                 }
                 Instruction::BinOp {
                     dest,
-                    op: IrBinOp::Or,
+                    op: IrBinOp::Or | IrBinOp::Xor,
                     ty,
                     ..
                 } if matches!(*ty, IrType::U32 | IrType::I32 | IrType::U64 | IrType::I64) => {
@@ -2762,38 +2823,93 @@ pub(crate) fn recognize_function(
                     // `match_bswap32_network` and turn a one-instruction `bswap`
                     // back into the five-instruction network, so both specific
                     // matchers run first and bail out of this iteration when
-                    // either fires.
+                    // either fires.  The width-generic byte matcher below is
+                    // strictly more specific than a rotate as well: it only
+                    // accepts a full 32- or 64-bit lane permutation, so it
+                    // cannot claim a rotate's partial rotation.
                     if is_32bit {
                         if enable_bit_reverse
                             && let Some(src) = match_bit_reverse32(Operand::Value(dest), &defs)
                         {
-                            block.instructions[index] = Instruction::UnaryOp {
+                            let replacement = Instruction::UnaryOp {
                                 dest,
                                 op: IrUnaryOp::BitReverse,
                                 src,
                                 ty: IrType::U32,
                             };
+                            retarget_use_counts(
+                                &block.instructions[index],
+                                &replacement,
+                                &mut use_counts,
+                            );
+                            defs[dest.0 as usize] = Some(replacement.clone());
+                            block.instructions[index] = replacement;
                             changes += 1;
                             index += 1;
                             continue;
                         }
                         if let Some(src) = match_bswap32_network(Operand::Value(dest), &defs) {
-                            block.instructions[index] = Instruction::UnaryOp {
+                            let replacement = Instruction::UnaryOp {
                                 dest,
                                 op: IrUnaryOp::Bswap,
                                 src,
                                 ty: IrType::U32,
                             };
+                            retarget_use_counts(
+                                &block.instructions[index],
+                                &replacement,
+                                &mut use_counts,
+                            );
+                            defs[dest.0 as usize] = Some(replacement.clone());
+                            block.instructions[index] = replacement;
                             changes += 1;
                             index += 1;
                             continue;
                         }
                     }
+                    if let Some(hit) = bytes::bswap(Operand::Value(dest), ty, &defs, native_bswap) {
+                        // Later producer-repurposing rules consume these maps.
+                        // Keep direct read counts exact after replacing the
+                        // consumer.
+                        match hit.mask {
+                            // Full reversal: replace the consumer in place.
+                            None => {
+                                let replacement = Instruction::UnaryOp {
+                                    dest,
+                                    op: IrUnaryOp::Bswap,
+                                    src: hit.src,
+                                    ty,
+                                };
+                                // Discharge the tree before its root definition
+                                // is replaced: every value that this full swap
+                                // leaves without a reader is dead, so a deferred
+                                // candidate inside it is never applied on top.
+                                let mut budget = bytes::DISCHARGE_BUDGET;
+                                bytes::discharge(
+                                    &block.instructions[index],
+                                    &replacement,
+                                    &defs,
+                                    &mut use_counts,
+                                    &mut budget,
+                                );
+                                defs[dest.0 as usize] = Some(replacement.clone());
+                                block.instructions[index] = replacement;
+                                changes += 1;
+                            }
+                            // Partial reversal: ranked against every other
+                            // partial match below, because a merge chain makes
+                            // every prefix node a candidate and only the widest
+                            // one leaves no network behind.
+                            Some(_) => partial.push((hit.ops, block_bi, index, dest, ty, hit)),
+                        }
+                        index += 1;
+                        continue;
+                    }
                     if max_rotate_bits > 0
                         && let Some((value, amount, is_left)) =
                             match_rotate(Operand::Value(dest), max_rotate_bits, &defs)
                     {
-                        block.instructions[index] = Instruction::BinOp {
+                        let replacement = Instruction::BinOp {
                             dest,
                             op: if is_left {
                                 IrBinOp::RotateLeft
@@ -2804,6 +2920,13 @@ pub(crate) fn recognize_function(
                             rhs: amount,
                             ty,
                         };
+                        retarget_use_counts(
+                            &block.instructions[index],
+                            &replacement,
+                            &mut use_counts,
+                        );
+                        defs[dest.0 as usize] = Some(replacement.clone());
+                        block.instructions[index] = replacement;
                         changes += 1;
                     }
                 }
@@ -2937,6 +3060,61 @@ pub(crate) fn recognize_function(
             index += 1;
         }
     }
+    // Apply the partial byte reversals, widest first.  Accepting a match
+    // discharges the reads of every instruction it makes dead, so the strictly
+    // narrower candidates inside a merge chain drop to zero remaining readers
+    // and are skipped: the widest node covers the whole network, and the
+    // prefixes become dead code for DCE.  A narrower node that is still read
+    // outside the tree keeps a positive count and is folded on its own — the
+    // alternative would leave its whole expansion alive for the sake of one
+    // surviving consumer.
+    partial.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, block_bi, index, dest, ty, hit) in partial {
+        let Some(mask) = hit.mask else { continue };
+        if use_counts.get(dest.0 as usize).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        let block = &mut func.blocks[block_bi];
+        if block.instructions.get(index).and_then(Instruction::dest) != Some(dest) {
+            continue;
+        }
+        // `Bswap` needs a value of its own, and the scan forbids insertion, so
+        // this pair is spliced in after every coordinate-based rewrite.
+        let swapped = Value(next_value_id);
+        next_value_id = next_value_id.saturating_add(1);
+        let masked = Instruction::BinOp {
+            dest,
+            op: IrBinOp::And,
+            lhs: Operand::Value(swapped),
+            rhs: Operand::Const(IrConst::from_i64(mask as i64, ty)),
+            ty,
+        };
+        // Account for the pair while `defs[dest]` still names the network.
+        let mut budget = bytes::DISCHARGE_BUDGET;
+        bytes::discharge(
+            &block.instructions[index],
+            &masked,
+            &defs,
+            &mut use_counts,
+            &mut budget,
+        );
+        defs[dest.0 as usize] = Some(masked.clone());
+        expansions.push(Expansion {
+            block: block_bi,
+            index,
+            dest,
+            replacement: vec![
+                Instruction::UnaryOp {
+                    dest: swapped,
+                    op: IrUnaryOp::Bswap,
+                    src: hit.src,
+                    ty,
+                },
+                masked,
+            ],
+        });
+        changes += 1;
+    }
     func.next_value_id = next_value_id.max(func.next_value_id);
     for (pbi, pii, new_prod, cbi, cii, new_cons) in pending_masks {
         let x_dest = match &new_prod {
@@ -2958,15 +3136,22 @@ pub(crate) fn recognize_function(
             func.blocks[cbi].instructions[cii] = new_cons;
         }
     }
-    // Scan order is lexicographic (block, instruction); reverse application
-    // leaves every remaining coordinate intact. Preserve each replaced
-    // instruction's source span on ALL nodes, including the original dest.
+    // Applications must run from the highest coordinate down: a splice inserts
+    // instructions, shifting every later index in the same block, so applying a
+    // lower index first would invalidate a higher one. Scan-time rewrites are
+    // pushed in lexicographic order already, but the deferred partial
+    // reversals are pushed in profit order, so sort explicitly rather than
+    // relying on push order — a stale index is silently dropped by the
+    // destination check below.
+    expansions.sort_by(|a, b| (b.block, b.index).cmp(&(a.block, a.index)));
+    // Preserve each replaced instruction's source span on ALL nodes, including
+    // the original dest.
     for Expansion {
         block: bi,
         index: ii,
         dest,
         replacement,
-    } in expansions.into_iter().rev()
+    } in expansions
     {
         let block = &mut func.blocks[bi];
         if block.instructions.get(ii).and_then(Instruction::dest) != Some(dest) {
@@ -3159,7 +3344,7 @@ mod tests {
             source_spans: spans,
             terminator: Terminator::Return(Some(outputs[1])),
         });
-        assert_eq!(recognize_function(&mut func, false, 64, 8, false), 2);
+        assert_eq!(recognize_function(&mut func, false, 64, 8, false, true), 2);
         let b = &func.blocks[0];
         assert_eq!(b.instructions.len(), old_len + 2);
         assert_eq!(b.source_spans.len(), b.instructions.len());
@@ -3179,7 +3364,7 @@ mod tests {
             }
         }
         assert_eq!(seen, outputs);
-        assert_eq!(recognize_function(&mut func, false, 64, 8, false), 0);
+        assert_eq!(recognize_function(&mut func, false, 64, 8, false, true), 0);
     }
 
     #[test]
@@ -5341,3 +5526,6 @@ mod demand;
 
 #[path = "bit_idioms_facts.rs"]
 mod facts;
+
+#[path = "bit_idioms_bytes.rs"]
+mod bytes;

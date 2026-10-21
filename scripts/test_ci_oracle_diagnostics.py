@@ -2,7 +2,6 @@
 """Provisioning diagnostics preserve failures; no apt, root or network calls."""
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -13,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class OracleDiagnostics(unittest.TestCase):
-    def run_step(self, gcc_status, qemu_status, reporter_status=None):
+    def run_step(self, gcc_status, qemu_status):
         workflow = yaml.safe_load((ROOT / '.github/workflows/ci.yml').read_text())
         steps = [step['run'] for job in workflow['jobs'].values() for step in job.get('steps', [])
                  if step.get('name') == 'Install GCC 16 and i686 C runtime/development files']
@@ -23,12 +22,13 @@ class OracleDiagnostics(unittest.TestCase):
             p = Path(name)
             (p / 'scripts').mkdir()
             (p / 'bin').mkdir()
-            (p / 'scripts/ci_install_gcc16.sh').write_text(f'echo "E: resolver % failure"; exit {gcc_status}\n')
-            reporter = p / 'scripts/ci_annotate_log.py'
-            if reporter_status is None:
-                shutil.copyfile(ROOT / 'scripts/ci_annotate_log.py', reporter)
-            else:
-                reporter.write_text(f'raise SystemExit({reporter_status})\n')
+            # The helper owns annotation encoding now; the workflow must
+            # stream it unchanged and preserve its failure status.
+            helper = f'echo "GCC provisioning"; exit {gcc_status}\n'
+            if gcc_status:
+                helper = ('echo "::error title=GCC 16 provisioning failed (mode --multilib)::resolver %25 failure"; '
+                          f'exit {gcc_status}\n')
+            (p / 'scripts/ci_install_gcc16.sh').write_text(helper)
             sudo = p / 'bin/sudo'
             sudo.write_text(f'#!/bin/sh\ntouch qemu-called\necho "E: qemu resolver"\nexit {qemu_status}\n')
             sudo.chmod(0o755)
@@ -41,14 +41,13 @@ class OracleDiagnostics(unittest.TestCase):
         result, called = self.run_step(9, 0)
         self.assertEqual(result.returncode, 9)
         self.assertFalse(called)
-        self.assertIn('::error title=GCC 16 multilib provisioning::', result.stdout)
+        self.assertIn('::error title=GCC 16 provisioning failed (mode --multilib)::', result.stdout)
         self.assertIn('%25', result.stdout)
 
-    def test_qemu_failure_and_reporter_failure_cannot_turn_green(self):
-        for reporter in (None, 7):
-            result, called = self.run_step(0, 13, reporter)
-            self.assertTrue(called)
-            self.assertEqual(result.returncode, 13)
+    def test_qemu_failure_cannot_turn_green(self):
+        result, called = self.run_step(0, 13)
+        self.assertTrue(called)
+        self.assertEqual(result.returncode, 13)
 
     def test_fetch_failure_survives_long_resolver_diagnostics(self):
         lines = ['Err:4 https://ppa.example.invalid noble InRelease',

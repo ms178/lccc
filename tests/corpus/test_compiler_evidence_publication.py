@@ -75,7 +75,7 @@ def semantic_report(root):
 
 
 class EvidencePublication(unittest.TestCase):
-    def test_all_native_registry_rows_and_five_arms_fit_a_single_step(self):
+    def test_all_native_rows_and_five_arms_fit_a_single_step(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             write(root / 'native.json', native_report())
@@ -156,7 +156,7 @@ class EvidencePublication(unittest.TestCase):
                 self.assertEqual(status, 0, output)
                 self.assertTrue(notices[0][1]['full_registry_valid'])
                 rows = [row for _, data in notices[1:] for row in data]
-                self.assertEqual(len(rows), len(summary.bench.BENCHMARKS))
+                self.assertEqual(len(rows), len(names))
                 self.assertEqual({row['name'] for row in rows}, set(names))
 
     def test_missing_sections_and_partial_instrumentation_never_succeed(self):
