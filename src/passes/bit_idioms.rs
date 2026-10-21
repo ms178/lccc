@@ -128,6 +128,37 @@ fn xor_or_or_parts(
 
 /// If `opnd` names a value defined by `Not(x)`, the source `x`
 /// (copy-only peeling).
+/// Follow a copy chain only while every alias on it is single-use.
+///
+/// A rewrite that retargets a producer changes the value every alias of that
+/// producer observes.  `peel_copies` answers "which definition is behind this
+/// operand", which is the right question for a *read*; for a rewrite the chain
+/// must be linear as well, or a second reader of an intervening copy would
+/// silently see the new bits.  Returns `None` when the chain branches (or is
+/// implausibly long), so the caller refuses instead of guessing.
+fn peel_linear_copies(
+    op: Operand,
+    defs: &[Option<Instruction>],
+    use_counts: &[u32],
+) -> Option<Operand> {
+    let mut cur = op;
+    for _ in 0..32 {
+        let Operand::Value(v) = cur else {
+            return Some(cur);
+        };
+        match defs.get(v.0 as usize).and_then(Option::as_ref) {
+            Some(Instruction::Copy { src, .. }) => {
+                if use_counts.get(v.0 as usize).copied().unwrap_or(0) != 1 {
+                    return None;
+                }
+                cur = *src;
+            }
+            _ => return Some(cur),
+        }
+    }
+    None
+}
+
 fn not_source(opnd: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
     let Operand::Value(v) = peel_copies(opnd, defs) else {
         return None;
@@ -164,7 +195,9 @@ fn int_const(value: u64, ty: IrType) -> Operand {
 /// the comparison type so the caller can retarget the And at `x` (dropping the
 /// Not) and compare against C.  That is only legal when this comparison is the
 /// And's ONLY reader (`and_uses`): the rewrite changes what the And computes,
-/// so a second reader of the old value would observe the wrong bits.
+/// so a second reader of the old value would observe the wrong bits.  For the
+/// same reason every copy between the And and the comparison must itself be
+/// single-use — one reader of the value is not one alias of it.
 fn match_not_mask_cmp(
     inst: &Instruction,
     defs: &[Option<Instruction>],
@@ -187,7 +220,7 @@ fn match_not_mask_cmp(
     } else {
         return None;
     };
-    let Operand::Value(and_dest) = peel_copies(and_op, defs) else {
+    let Operand::Value(and_dest) = peel_linear_copies(and_op, defs, use_counts)? else {
         return None;
     };
     if use_counts.get(and_dest.0 as usize).copied().unwrap_or(0) != 1 {
@@ -3960,6 +3993,45 @@ mod tests {
             ty,
         });
         assert!(match_not_mask_cmp(plain[3].as_ref().unwrap(), &plain, &[0, 1, 1, 0]).is_none());
+    }
+
+    #[test]
+    fn not_mask_refuses_a_branching_copy_between_and_and_comparison() {
+        // `and` -> copy -> copy -> cmp: the And has exactly one reader, but the
+        // intermediate copy has two, so the second reader would observe the
+        // retargeted bits.  Only a linear chain is rewritable.
+        let ty = IrType::U32;
+        let and = Instruction::BinOp {
+            dest: Value(2),
+            op: IrBinOp::And,
+            lhs: v(1),
+            rhs: Operand::Const(IrConst::I32(0x5a5a)),
+            ty,
+        };
+        let not = Instruction::UnaryOp {
+            dest: Value(1),
+            op: IrUnaryOp::Not,
+            src: v(0),
+            ty,
+        };
+        let copy = Instruction::Copy {
+            dest: Value(4),
+            src: v(2),
+        };
+        let cmp = Instruction::Cmp {
+            dest: Value(3),
+            op: IrCmpOp::Eq,
+            lhs: v(4),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty,
+        };
+        let defs = vec![None, Some(not), Some(and), Some(cmp), Some(copy)];
+        // Linear chain: the copy is read only by the comparison.
+        assert!(match_not_mask_cmp(defs[3].as_ref().unwrap(), &defs, &[0, 1, 1, 0, 1]).is_some());
+        // Shared alias: the copy has a second reader, so the rewrite is refused.
+        assert!(match_not_mask_cmp(defs[3].as_ref().unwrap(), &defs, &[0, 1, 1, 0, 2]).is_none());
+        // A missing use-count entry must fail closed, never default to "single".
+        assert!(match_not_mask_cmp(defs[3].as_ref().unwrap(), &defs, &[0, 1, 1, 0]).is_none());
     }
 
     #[test]
