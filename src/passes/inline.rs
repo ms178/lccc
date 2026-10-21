@@ -4396,6 +4396,38 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
     if src_of.is_empty() {
         return;
     }
+    // ── collapse copy chains to their ultimate source ──
+    //
+    // A candidate's source can itself be a candidate: `memcpy(a, b, 8)` where
+    // `b` is another small local with its own full-width copy. The inliner
+    // builds exactly those double-buffer chains for by-value struct
+    // parameters (`L2 home <- L1 home <- param pointer`). With a one-step
+    // rewrite, `a`'s readers would be re-rooted at `b` while `b`'s own copy
+    // and alloca are removed too, leaving a value with no definition -- an
+    // internal codegen error, or worse if the value happened to be reused.
+    // Resolving each chain to its last element makes the rewrite single-step
+    // again by construction. A cycle (`memcpy(a, b); memcpy(b, a)`) has no
+    // ultimate source and is left alone entirely.
+    let mut resolved: FxHashMap<u32, Value> = FxHashMap::default();
+    for (&cand, &src) in &src_of {
+        let mut cur = src;
+        let mut seen: FxHashSet<u32> = FxHashSet::default();
+        let mut chainable = true;
+        while let Some(&next) = src_of.get(&cur.0) {
+            if cur.0 == cand || !seen.insert(cur.0) {
+                chainable = false;
+                break;
+            }
+            cur = next;
+        }
+        if chainable {
+            resolved.insert(cand, cur);
+        }
+    }
+    let src_of = resolved;
+    if src_of.is_empty() {
+        return;
+    }
     // ── rewrite: drop the local and its copy, re-root every reader ──
     for block in blocks.iter_mut() {
         let parallel =
@@ -4415,6 +4447,15 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
                 Instruction::Load { ptr, .. } => {
                     if let Some(&src) = src_of.get(&ptr.0) {
                         *ptr = src;
+                    }
+                }
+                // A surviving copy can still *read* an elided local (`d`'s own
+                // copy was refused while `src`'s was not). Its bytes are now
+                // the ultimate source's bytes, so read those instead of a
+                // value whose definition is about to disappear.
+                Instruction::Memcpy { src, .. } => {
+                    if let Some(&replacement) = src_of.get(&src.0) {
+                        *src = replacement;
                     }
                 }
                 Instruction::Copy {
@@ -7822,6 +7863,139 @@ mod extern_admission_tests {
         assert!(
             locals.contains(&Value(1)) && locals.contains(&Value(2)),
             "a non-escaping local aggregate and its GEP alias are candidates: {locals:?}"
+        );
+    }
+
+    /// Two locals chained by copies (the by-value struct parameter bridge the
+    /// inliner builds) must collapse to one source. A one-step rewrite would
+    /// leave the outer local's readers pointing at the inner local after the
+    /// inner one was removed.
+    #[test]
+    fn chained_copies_collapse_to_the_ultimate_source() {
+        use crate::common::types::AddressSpace;
+
+        let alloca = |dest: u32| Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size: 8,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        };
+        let mut blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                alloca(1), // outer local
+                alloca(2), // inner local
+                Instruction::Memcpy {
+                    dest: Value(2),
+                    src: Value(10),
+                    size: 8,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(2),
+                    size: 8,
+                },
+                Instruction::Load {
+                    dest: Value(3),
+                    ptr: Value(1),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        }];
+        elide_readonly_local_memcpys(&mut blocks);
+        assert!(
+            !blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Alloca { .. })),
+            "both locals and both copies must be elided"
+        );
+        assert!(
+            blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Load { ptr: Value(10), .. })),
+            "the reader must land on the ultimate source in one step"
+        );
+    }
+
+    /// Symmetric shape: the *inner* copy is refused (its local is written),
+    /// so the outer local is elided while a surviving copy still reads the
+    /// inner one. That copy must be re-rooted rather than left dangling.
+    #[test]
+    fn surviving_copy_reads_the_source_not_a_removed_local() {
+        use crate::common::types::AddressSpace;
+
+        let mut blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 8,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Alloca {
+                    dest: Value(2),
+                    ty: IrType::Ptr,
+                    size: 16,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Memcpy {
+                    dest: Value(2),
+                    src: Value(10),
+                    size: 16,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(2),
+                    size: 8,
+                },
+                // A write through the inner local disqualifies only the inner.
+                Instruction::Store {
+                    val: Operand::Const(IrConst::I64(1)),
+                    ptr: Value(2),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Load {
+                    dest: Value(3),
+                    ptr: Value(1),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        }];
+        elide_readonly_local_memcpys(&mut blocks);
+        // The outer local is elided; its reader reads the inner local, which
+        // still exists.
+        assert!(
+            blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Alloca { dest: Value(2), .. })),
+            "the written-through inner local must survive"
+        );
+        assert!(
+            !blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Alloca { dest: Value(1), .. })),
+            "the read-only outer local is elided"
         );
     }
 
