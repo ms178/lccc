@@ -413,6 +413,126 @@ fn is_hot_leaf_candidate(data: &CalleeData) -> bool {
         && data.blocks.len() <= MAX_INLINE_BLOCKS_NO_LOOPS
 }
 
+/// Acyclic `static inline` leaf whose call site passes a pointer to a caller-
+/// local aggregate alloca (e.g. `BIT_flushBits(&blockStream)` or
+/// `BIT_addBits(&blockStream, ...)`): inlining it is what removes the last
+/// address-escape of that alloca so `aggregate_sroa` can split and promote its
+/// fields to SSA registers across the loop.
+fn is_sroa_unlockable_candidate(data: &CalleeData) -> bool {
+    data.is_static_inline && is_hot_leaf_candidate(data)
+}
+
+/// Collect caller values that alias a non-parameter local aggregate alloca
+/// (`size <= 64`) whose address only escapes as arguments to acyclic
+/// `static inline` helpers.
+fn sroa_unlockable_aliases_of(
+    func: &IrFunction,
+    callee_map: &FxHashMap<String, CalleeData>,
+) -> FxHashSet<Value> {
+    let Some(entry) = func.blocks.first() else {
+        return FxHashSet::default();
+    };
+    let mut param_homes: FxHashSet<Value> = FxHashSet::default();
+    for inst in entry.instructions.iter().take(func.params.len()) {
+        if let Instruction::Alloca { dest, .. } = inst {
+            param_homes.insert(*dest);
+        }
+    }
+    let mut candidate_roots: FxHashSet<Value> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca {
+                dest,
+                size,
+                volatile: false,
+                semantic_volatile: false,
+                ..
+            } = inst
+                && *size > 0
+                && *size <= 64
+                && !param_homes.contains(dest)
+            {
+                candidate_roots.insert(*dest);
+            }
+        }
+    }
+    if candidate_roots.is_empty() {
+        return FxHashSet::default();
+    }
+    let mut root_of: FxHashMap<Value, Value> = candidate_roots.iter().map(|&v| (v, v)).collect();
+    for _ in 0..4 {
+        let mut added = false;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::Copy {
+                        dest,
+                        src: Operand::Value(src),
+                    }
+                    | Instruction::GetElementPtr {
+                        dest, base: src, ..
+                    } => {
+                        if let Some(&r) = root_of.get(src)
+                            && root_of.insert(*dest, r).is_none()
+                        {
+                            added = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    let mut disqualified: FxHashSet<Value> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Load { .. }
+                | Instruction::GetElementPtr { .. }
+                | Instruction::Copy { .. } => {}
+                Instruction::Store { val, .. } => {
+                    if let Operand::Value(v) = val
+                        && let Some(&r) = root_of.get(v)
+                    {
+                        disqualified.insert(r);
+                    }
+                }
+                Instruction::Call {
+                    func: callee_name,
+                    info,
+                } => {
+                    let sroa_helper = callee_map
+                        .get(callee_name)
+                        .is_some_and(is_sroa_unlockable_candidate);
+                    if !sroa_helper {
+                        for arg in &info.args {
+                            if let Operand::Value(v) = arg
+                                && let Some(&r) = root_of.get(v)
+                            {
+                                disqualified.insert(r);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    inst.for_each_used_value(|v_id| {
+                        if let Some(&r) = root_of.get(&Value(v_id)) {
+                            disqualified.insert(r);
+                        }
+                    });
+                }
+            }
+        }
+    }
+    root_of
+        .into_iter()
+        .filter_map(|(v, r)| (!disqualified.contains(&r)).then_some(v))
+        .collect()
+}
+
 /// Size/shape test for a declared-`inline` internal-linkage callee that
 /// contains a loop and may be inlined at an in-loop site despite the
 /// static-inline limit and the caller-size caps (`select_inline_site`).
@@ -477,6 +597,7 @@ fn select_inline_site(
     devirtualized_callees: &FxHashSet<String>,
     caller_has_loops: bool,
     hot_direct: bool,
+    sroa_unlockable_aliases: &FxHashSet<Value>,
 ) -> Option<(InlineCallSite, usize, bool, bool)> {
     // First pass: look for tiny/small callees anywhere in the function.
     // These are always inlined regardless of caller size because:
@@ -751,7 +872,15 @@ fn select_inline_site(
         // overhead (argument setup, a callee-saved frame, the return) is
         // paid on each. Same knob, budget and absolute caller cap, so the
         // 2.5k-instruction doubleFast loop above stays excluded.
-        let hot_inline_leaf = hot_leaf_budget_remaining.is_some()
+        let sroa_unlocking_leaf = hot_direct
+            && !caller_at_absolute_cap
+            && callee_data.is_static_inline
+            && is_sroa_unlockable_candidate(callee_data)
+            && site
+                .args
+                .iter()
+                .any(|arg| matches!(arg, Operand::Value(v) if sroa_unlockable_aliases.contains(v)));
+        let hot_inline_leaf = (hot_leaf_budget_remaining.is_some()
             && !size_optimized
             && ((every_iteration_blocks.contains(&site.block_idx)
                 && is_hot_leaf_candidate(callee_data)
@@ -760,7 +889,8 @@ fn select_inline_site(
                 || (hot_direct
                     && !caller_at_absolute_cap
                     && loop_blocks.contains(&site.block_idx)
-                    && is_hot_loop_helper_candidate(callee_data)));
+                    && is_hot_loop_helper_candidate(callee_data))))
+            || (!size_optimized && sroa_unlocking_leaf);
         // A hot-leaf candidate above the ordinary limit is offered by
         // `find_inline_call_sites` only for this decision; every other site
         // keeps the historical exceeds-normal-limits exclusion.
@@ -1393,6 +1523,11 @@ fn inline_run_with(
                         (FxHashSet::default(), FxHashSet::default())
                     };
                 let caller_has_loops = !loop_blocks.is_empty();
+                let sroa_unlockable_aliases = if hot_direct_enabled && !size_optimized {
+                    sroa_unlockable_aliases_of(&module.functions[func_idx], &callee_map)
+                } else {
+                    FxHashSet::default()
+                };
                 let found_site = select_inline_site(
                     &call_sites,
                     &callee_map,
@@ -1411,6 +1546,7 @@ fn inline_run_with(
                     &devirtualized_callees,
                     caller_has_loops,
                     hot_direct_enabled,
+                    &sroa_unlockable_aliases,
                 );
                 let (site, callee_inst_count, _use_relaxed, hot_leaf_charge) = match found_site {
                     Some(s) => s,
@@ -3971,6 +4107,7 @@ fn find_inline_call_sites(
                             && !caller_has_section
                             && !callee_data.is_single_call_site_static
                             && !is_hot_leaf_candidate(callee_data)
+                            && !is_sroa_unlockable_candidate(callee_data)
                             && !is_hot_loop_helper_candidate(callee_data)
                         {
                             continue;
@@ -4078,6 +4215,145 @@ fn param_substitutable(callee: &CalleeData, param_idx: usize, home: Value) -> bo
         }
     }
     true
+}
+
+/// Elide `Instruction::Memcpy { dest, src, size }` into a small (`<= 16` byte)
+/// read-only local `Alloca` inside a call-free inlined body by re-rooting its
+/// `GetElementPtr` and `Load` readers directly at `src`.
+///
+/// Hot inline leaves such as zstd's `FSE_encodeSymbol` copy an 8-byte table
+/// entry (`const FSE_symbolCompressionTransform symbolTT = table[symbol]`) into
+/// a local struct and read two 32-bit fields from it. Leaving the `Memcpy` in
+/// place forces both a stack round-trip and a `call_spanning` barrier in
+/// liveness/regalloc across every inlined site.
+fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
+    let Some(entry) = blocks.first() else {
+        return;
+    };
+    let mut local_allocas: FxHashMap<u32, usize> = FxHashMap::default();
+    for inst in &entry.instructions {
+        if let Instruction::Alloca {
+            dest,
+            size,
+            volatile: false,
+            semantic_volatile: false,
+            ..
+        } = inst
+            && *size > 0
+            && *size <= 16
+        {
+            local_allocas.insert(dest.0, *size);
+        }
+    }
+    if local_allocas.is_empty() {
+        return;
+    }
+    for block in blocks.iter() {
+        for inst in &block.instructions {
+            if matches!(
+                inst,
+                Instruction::Call { .. }
+                    | Instruction::CallIndirect { .. }
+                    | Instruction::InlineAsm { .. }
+            ) {
+                return;
+            }
+        }
+    }
+    let mut memcpy_src: FxHashMap<u32, Value> = FxHashMap::default();
+    let mut disqualified: FxHashSet<u32> = FxHashSet::default();
+    for inst in &entry.instructions {
+        if let Instruction::Memcpy { dest, src, size } = inst
+            && let Some(&alloca_sz) = local_allocas.get(&dest.0)
+        {
+            if *size == alloca_sz && !memcpy_src.contains_key(&dest.0) {
+                memcpy_src.insert(dest.0, *src);
+            } else {
+                disqualified.insert(dest.0);
+            }
+        }
+    }
+    if memcpy_src.is_empty() {
+        return;
+    }
+    let mut root_of: FxHashMap<u32, u32> = memcpy_src.keys().map(|&k| (k, k)).collect();
+    for block in blocks.iter() {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Alloca { .. } => {}
+                Instruction::Memcpy { dest, src, .. } => {
+                    if let Some(&r) = root_of.get(&src.0) {
+                        disqualified.insert(r);
+                    }
+                    if !memcpy_src.contains_key(&dest.0)
+                        && let Some(&r) = root_of.get(&dest.0)
+                    {
+                        disqualified.insert(r);
+                    }
+                }
+                Instruction::GetElementPtr { dest, base, .. } => {
+                    if let Some(&r) = root_of.get(&base.0) {
+                        root_of.insert(dest.0, r);
+                    }
+                }
+                Instruction::Load {
+                    ptr,
+                    volatile: false,
+                    ..
+                } => {
+                    let _ = ptr;
+                }
+                _ => {
+                    inst.for_each_used_value(|v_id| {
+                        if let Some(&r) = root_of.get(&v_id) {
+                            disqualified.insert(r);
+                        }
+                    });
+                }
+            }
+        }
+        block.terminator.for_each_used_value(|v_id| {
+            if let Some(&r) = root_of.get(&v_id) {
+                disqualified.insert(r);
+            }
+        });
+    }
+    memcpy_src.retain(|k, _| !disqualified.contains(k));
+    if memcpy_src.is_empty() {
+        return;
+    }
+    for block in blocks.iter_mut() {
+        let has_spans =
+            block.source_spans.len() == block.instructions.len() && !block.source_spans.is_empty();
+        let old_spans = std::mem::take(&mut block.source_spans);
+        let mut new_insts = Vec::with_capacity(block.instructions.len());
+        let mut new_spans = Vec::with_capacity(old_spans.len());
+        for (idx, mut inst) in block.instructions.drain(..).enumerate() {
+            match &mut inst {
+                Instruction::Alloca { dest, .. } if memcpy_src.contains_key(&dest.0) => continue,
+                Instruction::Memcpy { dest, .. } if memcpy_src.contains_key(&dest.0) => continue,
+                Instruction::GetElementPtr { base, .. } => {
+                    if let Some(&src) = memcpy_src.get(&base.0) {
+                        *base = src;
+                    }
+                }
+                Instruction::Load { ptr, .. } => {
+                    if let Some(&src) = memcpy_src.get(&ptr.0) {
+                        *ptr = src;
+                    }
+                }
+                _ => {}
+            }
+            new_insts.push(inst);
+            if has_spans {
+                new_spans.push(old_spans[idx]);
+            }
+        }
+        block.instructions = new_insts;
+        if has_spans {
+            block.source_spans = new_spans;
+        }
+    }
 }
 
 /// IR type of a caller-side operand; needed to substitute call args at the
@@ -4618,6 +4894,7 @@ fn inline_call_site(
             block.source_spans = new_spans;
         }
     }
+    elide_readonly_local_memcpys(&mut inlined_blocks);
     // Replace every direct ParamRef use after removing ParamRef instructions.
     // This includes intrinsic arguments, phi incoming values, and terminators;
     // leaving even one remapped ParamRef unbound produces an invalid backend
@@ -7135,5 +7412,62 @@ mod extern_admission_tests {
                 "global leaf `{name}` should be admitted"
             );
         }
+    }
+
+    #[test]
+    fn elides_readonly_local_memcpy_in_call_free_inlined_body() {
+        use crate::common::types::AddressSpace;
+
+        let mut blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::Ptr,
+                    size: 8,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(10),
+                    size: 8,
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(4)),
+                    ty: IrType::I32,
+                },
+                Instruction::Load {
+                    dest: Value(3),
+                    ptr: Value(2),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        }];
+        elide_readonly_local_memcpys(&mut blocks);
+        assert!(
+            !blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Memcpy { .. })),
+            "readonly local memcpy must be elided"
+        );
+        assert!(
+            blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::GetElementPtr {
+                    base: Value(10),
+                    ..
+                }
+            )),
+            "GEP base must be re-rooted at memcpy source"
+        );
     }
 }

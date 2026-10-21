@@ -1703,6 +1703,14 @@ fn compose_indexed_relay(
     if cons.base.as_deref() != Some(dst_text) {
         return None;
     }
+    let dst_fam = register_family_fast(dst_text);
+    if cons
+        .index
+        .as_ref()
+        .is_some_and(|(idx, _)| register_family_fast(idx) == dst_fam)
+    {
+        return None;
+    }
     // %T is substituted away, so only the consumer's own displacement and
     // index survive into the sum.
     let cons_rest = SibAddr {
@@ -1786,6 +1794,14 @@ pub(super) fn splice_lea_into_mem_operand(
     let producer = SibAddr::parse(producer_text)?;
     let cons = SibAddr::parse(&format!("{}{}", disp_text, &line[pos..=close]))?;
     if cons.base.as_deref() != Some(dst_text) {
+        return None;
+    }
+    let dst_fam = register_family_fast(dst_text);
+    if cons
+        .index
+        .as_ref()
+        .is_some_and(|(idx, _)| register_family_fast(idx) == dst_fam)
+    {
         return None;
     }
     let cons_rest = SibAddr {
@@ -7324,5 +7340,34 @@ mod rmw_window_tests {
             "an RMW reading the copy destination family must leave every line in place"
         );
         assert_eq!(removed_alias, 0);
+    }
+
+    #[test]
+    fn indexed_relay_and_splice_lea_refuse_when_consumer_index_aliases_lea_dst() {
+        use super::{compose_indexed_relay, splice_lea_into_mem_operand};
+        let line = "movq 8(%rcx,%rcx,8), %rax";
+        let pos = line.find('(').unwrap();
+        let close = line.find(')').unwrap();
+        assert_eq!(
+            compose_indexed_relay(line, pos, close, "%rcx", "(%rsi,%rcx,8)"),
+            None,
+            "compose_indexed_relay must refuse when consumer index shares family with lea dst"
+        );
+        assert_eq!(
+            splice_lea_into_mem_operand(line, "%rcx", "(%rsi,%rcx,8)"),
+            None,
+            "splice_lea_into_mem_operand must refuse when consumer index shares family with lea dst"
+        );
+        let ok_line = "movq 8(%r8,%rcx,8), %rax";
+        let ok_pos = ok_line.find('(').unwrap();
+        let ok_close = ok_line.find(')').unwrap();
+        assert_eq!(
+            compose_indexed_relay(ok_line, ok_pos, ok_close, "%r8", "(%rsi)").as_deref(),
+            Some("8(%rsi, %rcx, 8)"),
+        );
+        assert_eq!(
+            splice_lea_into_mem_operand(ok_line, "%r8", "(%rsi)").as_deref(),
+            Some("movq 8(%rsi, %rcx, 8), %rax"),
+        );
     }
 }

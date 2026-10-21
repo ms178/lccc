@@ -539,6 +539,39 @@ fn mnemonic_is_known(t: &str) -> bool {
 }
 
 impl FileLiveness {
+    fn hash_function(
+        store: &LineStore,
+        infos: &[LineInfo],
+        start: usize,
+        end: usize,
+    ) -> (u64, u64) {
+        use std::hash::{Hash, Hasher};
+        let mut h1 = crate::common::fx_hash::FxHasher::default();
+        let mut h2: u64 = 0xcbf2_9ce4_8422_2325;
+        (end - start).hash(&mut h1);
+        for (idx, info) in infos[start..end].iter().enumerate() {
+            let n = start + idx;
+            if info.is_nop() {
+                0u8.hash(&mut h1);
+                h2 = h2.rotate_left(5) ^ 0x517c_c1b7_2722_0a95;
+            } else {
+                let flags = (u8::from(info.pinned))
+                    | (u8::from(info.inert_dir) << 1)
+                    | (u8::from(info.has_indirect_mem) << 2)
+                    | (u8::from(info.volatile_access) << 3);
+                flags.hash(&mut h1);
+                info.reg_refs.hash(&mut h1);
+                let s = info.trimmed(store.get(n));
+                s.hash(&mut h1);
+                h2 = h2.rotate_left(7) ^ (s.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                for &b in s.as_bytes() {
+                    h2 = (h2 ^ (b as u64)).wrapping_mul(0x1000_0000_01b3);
+                }
+            }
+        }
+        (h1.finish(), h2)
+    }
+
     /// Compute liveness for every function in the file.
     #[expect(clippy::needless_range_loop)]
     pub(super) fn new(store: &LineStore, infos: &[LineInfo]) -> Self {
@@ -1121,6 +1154,47 @@ impl FileLiveness {
         end: usize,
         neutralise: Option<(usize, usize, u16)>,
     ) {
+        type CachedFnLiveness = (
+            Vec<u16>,
+            Vec<u16>,
+            Vec<bool>,
+            Vec<bool>,
+            Vec<(u16, u16)>,
+            bool,
+        );
+        thread_local! {
+            static FN_CACHE: std::cell::RefCell<FxHashMap<(u64, u64), CachedFnLiveness>> =
+                std::cell::RefCell::new(FxHashMap::default());
+        }
+        let fn_len = end.saturating_sub(start);
+        let cache_key = if neutralise.is_none() && fn_len >= 16 {
+            let key = Self::hash_function(store, infos, start, end);
+            let hit = FN_CACHE.with(|c| {
+                let map = c.borrow();
+                if let Some((lo, li, kn, st, ef, tret)) = map.get(&key)
+                    && lo.len() == fn_len
+                {
+                    self.live_out[start..end].copy_from_slice(lo);
+                    self.live_in[start..end].copy_from_slice(li);
+                    self.known[start..end].copy_from_slice(kn);
+                    self.structural[start..end].copy_from_slice(st);
+                    self.effect[start..end].copy_from_slice(ef);
+                    if *tret {
+                        self.textual_ret.insert(start);
+                    }
+                    true
+                } else {
+                    false
+                }
+            });
+            if hit {
+                return;
+            }
+            Some(key)
+        } else {
+            None
+        };
+
         let rdx_marker = Self::ret_rdx_marker(store, infos, start, end);
         if rdx_marker.is_none() {
             self.textual_ret.insert(start);
@@ -1280,6 +1354,25 @@ impl FileLiveness {
         }
         for n in start..end {
             self.structural[n] = is_structural(store, infos, n);
+        }
+        if let Some(key) = cache_key {
+            FN_CACHE.with(|c| {
+                let mut map = c.borrow_mut();
+                if map.len() > 256 {
+                    map.clear();
+                }
+                map.insert(
+                    key,
+                    (
+                        self.live_out[start..end].to_vec(),
+                        self.live_in[start..end].to_vec(),
+                        self.known[start..end].to_vec(),
+                        self.structural[start..end].to_vec(),
+                        self.effect[start..end].to_vec(),
+                        self.textual_ret.contains(&start),
+                    ),
+                );
+            });
         }
     }
 

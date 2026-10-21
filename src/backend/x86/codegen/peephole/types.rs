@@ -721,10 +721,9 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
     if first == b's' && sb.len() >= 4 && sb[1] == b'e' && sb[2] == b't' && parse_setcc(s).is_some()
     {
         let setcc_reg = if let Some(space_pos) = s.rfind(' ') {
-            let operand = s[space_pos + 1..].trim();
-            register_family_fast(operand)
+            register_family_fast(s[space_pos + 1..].trim())
         } else {
-            0 // default to rax family if can't parse
+            0
         };
         return line_info_with_regs(
             LineKind::SetCC { reg: setcc_reg },
@@ -733,19 +732,19 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
         );
     }
 
-    // Pre-classify 32-bit arithmetic producers for extension elimination
-    let ext = classify_arith_ext(s, sb, first);
+    classify_other_line_info(s, sb, first, ts)
+}
 
-    // Pre-parse destination register for fast modification checks.
+#[inline]
+fn classify_other_line_info(s: &str, sb: &[u8], first: u8, ts: u16) -> LineInfo {
+    let ext = classify_arith_ext(s, sb, first);
     let dest_reg = parse_dest_reg_fast(s);
-    // Cache has_indirect_memory_access for Other lines
     let has_indirect = has_indirect_memory_access(s);
     let rbp_off = if has_indirect {
         RBP_OFFSET_NONE
     } else {
         parse_rbp_offset(s)
     };
-    // Pre-scan register references for O(1) checks in eliminate_unused_callee_saves
     let reg_refs = scan_register_refs(sb);
     LineInfo {
         kind: LineKind::Other { dest_reg },

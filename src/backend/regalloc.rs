@@ -812,15 +812,45 @@ pub fn x86_inst_fixed_scratch(inst: &Instruction) -> X86FixedScratch {
         }
         // `lock xadd` / `xchg` / test-and-set run on rax+rcx only; bitwise
         // RMWs use a cmpxchg loop with old in rax, new in rdx and the operand
-        // value in rdi.
-        Instruction::AtomicRmw { op, .. } => match op {
-            AtomicRmwOp::Add | AtomicRmwOp::Sub | AtomicRmwOp::Xchg | AtomicRmwOp::TestAndSet => {
+        // value in rdi. 128-bit atomics stage arguments in rdi/rsi/rdx/rcx
+        // (and rbx for cmpxchg16b).
+        Instruction::AtomicRmw { op, ty, .. } => {
+            if matches!(ty, IrType::I128 | IrType::U128) {
+                RDX_RDI
+            } else {
+                match op {
+                    AtomicRmwOp::Add
+                    | AtomicRmwOp::Sub
+                    | AtomicRmwOp::Xchg
+                    | AtomicRmwOp::TestAndSet => NONE,
+                    _ => RDX_RDI,
+                }
+            }
+        }
+        // cmpxchg: desired in rdx (128-bit cmpxchg16b also clobbers rbx, and
+        // libatomic fallback stages in rdi/rsi/rdx/rcx/r8). Atomic store:
+        // value in rdx (128-bit store stages in rdi/rsi/rdx/rcx).
+        Instruction::AtomicCmpxchg { ty, .. } => {
+            if matches!(ty, IrType::I128 | IrType::U128) {
+                RDX_RDI
+            } else {
+                RDX
+            }
+        }
+        Instruction::AtomicStore { ty, .. } => {
+            if matches!(ty, IrType::I128 | IrType::U128) {
+                RDX_RDI
+            } else {
+                RDX
+            }
+        }
+        Instruction::AtomicLoad { ty, .. } => {
+            if matches!(ty, IrType::I128 | IrType::U128) {
+                RDX_RDI
+            } else {
                 NONE
             }
-            _ => RDX_RDI,
-        },
-        // cmpxchg: desired in rdx. Atomic store: value in rdx.
-        Instruction::AtomicCmpxchg { .. } | Instruction::AtomicStore { .. } => RDX,
+        }
         Instruction::Intrinsic { op, .. } => match op {
             IntrinsicOp::Rdtscp => RDX_RDI,
             // GCC __builtin_apply family and __builtin_longjmp: the emitters
@@ -9900,17 +9930,21 @@ pub(crate) struct PhiCoalesceCandidate {
 /// update across any of these is only legal in a callee-saved home.
 #[inline]
 fn instruction_clobbers_caller_saved(inst: &Instruction) -> bool {
-    matches!(
-        inst,
+    match inst {
         Instruction::Call { .. }
-            | Instruction::CallIndirect { .. }
-            | Instruction::InlineAsm { .. }
-            | Instruction::Memcpy { .. }
-            | Instruction::VaArg { .. }
-            | Instruction::VaStart { .. }
-            | Instruction::VaCopy { .. }
-            | Instruction::VaArgStruct { .. }
-    )
+        | Instruction::CallIndirect { .. }
+        | Instruction::InlineAsm { .. }
+        | Instruction::Memcpy { .. }
+        | Instruction::VaArg { .. }
+        | Instruction::VaStart { .. }
+        | Instruction::VaCopy { .. }
+        | Instruction::VaArgStruct { .. } => true,
+        Instruction::AtomicLoad { ty, .. }
+        | Instruction::AtomicStore { ty, .. }
+        | Instruction::AtomicRmw { ty, .. }
+        | Instruction::AtomicCmpxchg { ty, .. } => matches!(ty, IrType::I128 | IrType::U128),
+        _ => false,
+    }
 }
 
 /// Count uses of `value` outside the single instruction `(excl_block, excl_idx)`.

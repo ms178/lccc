@@ -105,9 +105,16 @@ pub(super) fn lookup(arg: &str) -> Option<Contract> {
     }
     let rationale = if arg == "-flto" || arg.starts_with("-flto=") {
         "LTO IR production and link-time consumption are not implemented."
-    } else if arg.starts_with("-fsanitize-recover") || arg.starts_with("-fsanitize-undefined") {
-        // Configuration OF sanitizer behaviour, not instrumentation: with no
-        // sanitizer there is nothing to make recoverable or trap on, so the
+    } else if arg.starts_with("-fsanitize-recover")
+        || arg.starts_with("-fsanitize-undefined")
+        || arg == "-fno-sanitize"
+        || arg.starts_with("-fno-sanitize=")
+        || arg.starts_with("-fno-sanitize-recover")
+        || arg.starts_with("-fno-sanitize-trap")
+        || arg.starts_with("-fno-sanitize-undefined")
+    {
+        // Configuration OF sanitizer behaviour, or disabling sanitizer
+        // instrumentation: with no sanitizer enabled by default, the
         // requested state is already the state.
         return Some(Contract {
             spelling: "option family",
@@ -161,6 +168,14 @@ mod tests {
             "-finstrument-functions-exclude-function-list=helper",
         ] {
             assert_eq!(lookup(flag).unwrap().class, Class::Refused, "{flag}");
+        }
+        for flag in [
+            "-fno-sanitize=all",
+            "-fno-sanitize=address",
+            "-fno-sanitize=undefined",
+            "-fno-sanitize-recover=all",
+        ] {
+            assert_eq!(lookup(flag).unwrap().class, Class::BenignNoop, "{flag}");
         }
         assert!(lookup("-fdefinitely-not-a-flag").is_none());
     }

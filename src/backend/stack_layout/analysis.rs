@@ -123,18 +123,25 @@ pub(super) fn function_makes_calls(func: &IrFunction) -> bool {
         return true;
     }
     func.blocks.iter().any(|b| {
-        b.instructions.iter().any(|i| {
-            matches!(
-                i,
-                Instruction::Call { .. }
-                    | Instruction::Memcpy { .. }
-                    | Instruction::CallIndirect { .. }
-                    | Instruction::VaArgStruct { .. }
-                    | Instruction::VaArg { .. }
-                    | Instruction::VaStart { .. }
-                    | Instruction::VaCopy { .. }
-                    | Instruction::VaEnd { .. }
-            )
+        b.instructions.iter().any(|i| match i {
+            Instruction::Call { .. }
+            | Instruction::Memcpy { .. }
+            | Instruction::CallIndirect { .. }
+            | Instruction::VaArgStruct { .. }
+            | Instruction::VaArg { .. }
+            | Instruction::VaStart { .. }
+            | Instruction::VaCopy { .. }
+            | Instruction::VaEnd { .. } => true,
+            Instruction::AtomicLoad { ty, .. }
+            | Instruction::AtomicStore { ty, .. }
+            | Instruction::AtomicRmw { ty, .. }
+            | Instruction::AtomicCmpxchg { ty, .. } => {
+                matches!(
+                    ty,
+                    crate::common::types::IrType::I128 | crate::common::types::IrType::U128
+                )
+            }
+            _ => false,
         })
     })
 }

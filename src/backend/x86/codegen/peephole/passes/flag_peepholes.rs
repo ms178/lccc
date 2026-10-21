@@ -688,9 +688,16 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
             i = j + 1;
             continue;
         };
-        // The immediate form keeps its %rbp-destination exclusion (an
-        // immediate adjustment of %rbp is the frame idiom, never a value).
-        if dst_fam == 5 {
+        // `%rbp` as destination participates only when the copy is not from
+        // `%rsp` and `rbp_is_gpr_in_function` proves the function never
+        // establishes a frame pointer — matching the register-addend arm above.
+        if dst_fam == 5
+            && (src_fam == 4
+                || !match function_range(store, infos, i) {
+                    Some((fs, fe)) => rbp_is_gpr_in_function(store, infos, fs, fe),
+                    None => false,
+                })
+        {
             i += 1;
             continue;
         }
@@ -1526,8 +1533,50 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         };
-        let Some(imm) = imm_value(imm_text) else {
+        if !names_family_at_width(and_dst, dst_fam, and_wide) {
             i += 1;
+            continue;
+        }
+        let Some(imm) = imm_value(imm_text) else {
+            let Some(mask_fam) = plain_gp_operand(imm_text) else {
+                i += 1;
+                continue;
+            };
+            if mask_fam == dst_fam
+                || src_fam == 4
+                || mask_fam == 4
+                || !names_family_at_width(imm_text, mask_fam, and_wide)
+                || !matches!(lv.live_after(j, dst_fam), Some(false))
+            {
+                i += 1;
+                continue;
+            }
+            let Some(k) = next_real(infos, j, len) else {
+                i += 1;
+                continue;
+            };
+            if !matches!(infos[k].kind, LineKind::CondJmp)
+                || flags_effect(infos[k].trimmed(store.get(k))) != FlagsEffect::Reads
+            {
+                i += 1;
+                continue;
+            };
+            let new_line = if and_wide {
+                format!(
+                    "    testq {}, {}",
+                    REG_NAMES[0][mask_fam as usize], REG_NAMES[0][src_fam as usize]
+                )
+            } else {
+                format!(
+                    "    testl {}, {}",
+                    REG_NAMES[1][mask_fam as usize], REG_NAMES[1][src_fam as usize]
+                )
+            };
+            mark_nop(&mut infos[i]);
+            replace_line(store, &mut infos[j], j, new_line);
+            lv.refresh_at(store, infos, j);
+            changed = true;
+            i = j + 1;
             continue;
         };
         if !names_family_at_width(and_dst, dst_fam, and_wide) {
@@ -4406,5 +4455,71 @@ mod conditional_increment_tests {
                 assert_eq!(a.wrapping_add(u8::from(x == 0)), a.wrapping_add(carry));
             }
         }
+    }
+
+    #[test]
+    fn fold_copy_add_into_lea_allows_rbp_when_omit_frame_pointer() {
+        let build = |asm: &str| {
+            let store = LineStore::new(asm.to_string());
+            let infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            (store, infos)
+        };
+        let (mut store, mut infos) = build(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r14, %rbp\n",
+            "    addq $8, %rbp\n",
+            "    cmpq %rsi, %rbp\n",
+            "    movq %rbp, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(fold_copy_add_into_lea(&mut store, &mut infos));
+        let out = store.build_result(|i| infos[i].is_nop());
+        assert!(out.contains("leaq 8(%r14), %rbp"), "{out}");
+
+        let (mut store_fp, mut infos_fp) = build(concat!(
+            "bar:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            "    movq %rsp, %rbp\n",
+            "    movq %r14, %rbp\n",
+            "    addq $8, %rbp\n",
+            "    cmpq %rsi, %rbp\n",
+            "    popq %rbp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!fold_copy_add_into_lea(&mut store_fp, &mut infos_fp));
+    }
+
+    #[test]
+    fn fold_copy_and_mask_into_test_supports_register_mask_when_dest_dies() {
+        let build = |asm: &str| {
+            let store = LineStore::new(asm.to_string());
+            let infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            (store, infos)
+        };
+        let (mut store, mut infos) = build(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %r10, %r8\n",
+            "    andq %rcx, %r8\n",
+            "    je .LBB2\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".LBB2:\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(fold_copy_and_mask_into_test(&mut store, &mut infos));
+        let out = store.build_result(|i| infos[i].is_nop());
+        assert!(out.contains("testq %rcx, %r10"), "{out}");
+        assert!(!out.contains("andq %rcx, %r8"), "{out}");
     }
 }

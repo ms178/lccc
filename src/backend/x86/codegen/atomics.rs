@@ -248,7 +248,7 @@ impl X86Codegen {
             AtomicRmwOp::Nand => "__atomic_fetch_nand_16",
             AtomicRmwOp::Xchg => "__atomic_exchange_16",
             // Test-and-set is byte-wide and returns from the fast path above.
-            AtomicRmwOp::TestAndSet => unreachable!("test-and-set is byte-wide"),
+            AtomicRmwOp::TestAndSet => "__atomic_exchange_16",
         }
     }
 
