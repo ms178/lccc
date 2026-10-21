@@ -309,9 +309,29 @@ fixed here (stale benchmark-registry counts in three corpus modules; the
 stale audit-census baseline, re-baselined with the +1s it had accumulated; and
 the missing local mirror of the new layout-matrix gate). The remaining 47 were
 sandbox-toolchain gaps: the tag-cache GCC defaults to `-fno-pie` where distro
-compilers default to `-fPIE`, Debian has no single-tree
-`/usr/include/i386-linux-gnu`, and the tarball ships no sanitizer archives —
-each reproduced explicitly so a gate measures the compiler, never the host.
+compilers default to `-fPIE`, the tarball ships no sanitizer archives, and the
+32-bit glibc headers live under Debian's host-triplet directory — each
+reproduced explicitly so a gate measures the compiler, never the host. With
+`LCCC_I686_SYSROOT` pointing at the extracted sysroot the differential suite
+reaches PASS=1026 FAIL=0 SKIP=3 (AB-diff 0), i.e. no `-m32` build failures
+remain. The maintainer directed that these local, pinned-cache runs are the
+evidence of record for this PR while GitHub's hosted runs are degraded, so
+`--fast` **and** `--slow` are both run here; the older "full/slow CI is not
+authorized locally" line above is superseded for this PR by that direction,
+not by a relaxation of any gate.
+
+**Progress 2026-10-21 (oracle-contract defect inherited from main):** the
+rebased tree failed one corpus test, and it fails identically on a pristine
+`git archive` of `origin/main` — `run_regression.py` (added in `8a4d424`)
+downgraded *any* oracle binary that exits non-zero to `SKIP-COMPARE`, while
+`test_wrapping_regression_contract` pins the same case as `FAIL`. A blanket
+waiver silently disables the differential comparison for every row an
+out-of-date oracle touches, so the waiver is now declared per fixture
+(`LCCC_ORACLE_SELFCHECK=skip` in the `.env` sidecar, with the reason) and a
+failed oracle self-check is otherwise a hard failure naming the declaration.
+The only fixture that needs it is `gnu_constant_builtins` (vector
+`__builtin_classify_type` is 19 on GCC 14+, -1 on GCC 12). Two tests cover the
+declared and undeclared paths plus the fail-closed key parse.
 
 ## Rejected/stale queue claims
 
