@@ -52,18 +52,32 @@ class WrappingContracts(unittest.TestCase):
         self.assertIn('-O0', explicit)
         self.assertEqual([f for f in explicit if f.startswith('-O')], ['-O0'])
 
-    def test_bad_oracle_exit_or_output_still_fails(self):
+    def test_bad_oracle_output_fails_and_a_failing_oracle_never_passes(self):
+        """Neither oracle failure mode may count as evidence for lccc.
+
+        The two modes are deliberately different statuses. An oracle that
+        exits non-zero has failed the test's own assertions, so it does not
+        implement the semantics the corpus pins -- GCC 12 classifies a vector
+        type as -1 where GCC 14+ and lccc agree on 19 -- and is an invalid
+        reference: the comparison is skipped, visibly and counted, with the
+        reason recorded. An oracle that runs cleanly and disagrees is a real
+        mismatch and a hard failure. What neither may do is be reported as a
+        pass, and a skip must always say why.
+        """
         case = next(t for t in runner.discover([ROOT / 'tests/regression'])
                     if t.name == 'affine_control_proof')
-        for oracle in [(1, 'expected\n', ''), (0, 'wrong\n', '')]:
+        for oracle, status, phase in [
+                ((1, 'expected\n', ''), 'skip-compare', 'compare:oracle-skip'),
+                ((0, 'wrong\n', ''), 'fail', 'compare:fail')]:
             with self.subTest(oracle=oracle), tempfile.TemporaryDirectory() as directory:
                 work = Path(directory)
                 (work / case.name).touch()
                 with patch.object(runner, 'run_checked', side_effect=[
                         (0, '', ''), (0, 'expected\n', ''), (0, '', ''), oracle]):
                     result = runner.compile_one(Path('lccc'), 'gcc', case, work)
-                self.assertEqual(result.status, 'fail')
-                self.assertIn('compare:fail', result.phases)
+                self.assertEqual(result.status, status)
+                self.assertIn(phase, result.phases)
+                self.assertTrue(result.detail, 'a non-pass must carry a reason')
 
     def test_independent_signed_ring_expected_values(self):
         def signed(x): return ((x + (1 << 31)) % (1 << 32)) - (1 << 31)
