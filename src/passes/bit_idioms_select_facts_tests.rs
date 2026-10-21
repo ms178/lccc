@@ -477,3 +477,42 @@ fn select_of_private_symmetric_selects_uses_canonical_predicate_parity() {
         }
     }
 }
+
+#[test]
+fn relational_guards_refuse_missing_bounds_sparse_masks_and_word_truthiness() {
+    let ty = IrType::U8;
+    for (pred, limit) in [(IrCmpOp::Eq, 255), (IrCmpOp::Ne, 254)] {
+        let source = vec![
+            bin(Value(3), IrBinOp::Add, v(0), constant(1, ty), ty),
+            cmp(4, pred, v(0), constant(limit, ty), ty),
+            cmp(5, IrCmpOp::Ule, v(3), v(1), ty),
+            bin(Value(6), IrBinOp::And, v(4), v(5), IrType::I32),
+        ];
+        assert!(rewrite(&source).is_none());
+    }
+    for mask in [0, 3, 5, 10, 20] {
+        let source = vec![
+            cmp(3, IrCmpOp::Ult, v(0), constant(16, ty), ty),
+            bin(Value(4), IrBinOp::And, v(0), constant(mask, ty), ty),
+            cmp(5, IrCmpOp::Ne, v(4), constant(mask, ty), ty),
+            bin(Value(6), IrBinOp::And, v(3), v(5), IrType::I32),
+        ];
+        assert!(rewrite(&source).is_none());
+    }
+    let cardinality = vec![
+        bin(Value(3), IrBinOp::Add, v(0), v(1), ty),
+        cmp(4, IrCmpOp::Eq, v(3), constant(1, ty), ty),
+    ];
+    assert!(rewrite(&cardinality).is_none());
+    for (a, b) in [(4, 5), (0, 255)] {
+        let source = vec![
+            cmp(3, IrCmpOp::Ne, v(0), constant(0, ty), ty),
+            cmp(4, IrCmpOp::Ne, v(1), constant(0, ty), ty),
+            sel(5, v(3), constant(a, ty), constant(b, ty), ty),
+            sel(6, v(4), constant(a, ty), constant(b, ty), ty),
+            bin(Value(7), IrBinOp::And, v(5), v(6), ty),
+            cmp(8, IrCmpOp::Eq, v(7), constant(0, ty), ty),
+        ];
+        assert!(rewrite(&source).is_none());
+    }
+}

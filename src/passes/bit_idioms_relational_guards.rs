@@ -53,7 +53,7 @@ pub(super) fn fold(inst: &Instruction, cx: &Context<'_>) -> Option<Vec<Instructi
                 && base == x
                 && const_in_ring(z, width) == Some(mask)
                 && mask != 0
-                && mask.checked_add(mask & mask.wrapping_neg()) == Some(bound)
+                && mask.checked_add(1u64 << mask.trailing_zeros()) == Some(bound)
             {
                 return Some(vec![Instruction::Cmp {
                     dest: *dest,
