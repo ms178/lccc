@@ -15885,8 +15885,13 @@ mod phi_chain_shape_tests {
         });
         let preds = preds_of(&f);
         assert_eq!(preds.len(3), 2, "precondition: block 3 is a join");
+        // No chain may END at a join: block 3 has two predecessors.
         assert_eq!(single_pred_chain(&preds, 1, 3), None);
-        assert_eq!(single_pred_chain(&preds, 0, 2), None);
+        assert_eq!(single_pred_chain(&preds, 0, 3), None);
+        // The diamond arms are still directly reachable from the entry, so
+        // those ARE empty chains -- reachability, not topology, decides.
+        assert_eq!(single_pred_chain(&preds, 0, 1), Some(Vec::new()));
+        assert_eq!(single_pred_chain(&preds, 0, 2), Some(Vec::new()));
 
         // Back edge: 0 -> 1 -> 2 -> 1. The walk stops at block 1 because the
         // back edge gives it two predecessors (the `mids.contains` guard is

@@ -1456,6 +1456,14 @@ mod zext_home_policy_tests {
         }
     }
 
+    /// Register homes for the emit tests: a caller-saved GPR pair and one
+    /// XMM home. The NUMBERS come from `PhysReg`'s allocator ids; the test
+    /// derives the expected spelling from `phys_reg_name`, so a change to
+    /// the id-to-name table cannot silently make these tests vacuous.
+    const SRC_REG: PhysReg = PhysReg(14); // %rdi
+    const DST_REG: PhysReg = PhysReg(15); // %rsi
+    const XMM_REG: PhysReg = PhysReg(20); // %xmm2
+
     /// A value recorded by a 32-bit zero-extending load widens with ONE
     /// register copy: no movzbl/movzwl/movslq re-extension.
     fn zext_cg(from: IrType) -> X86Codegen {
@@ -1463,8 +1471,8 @@ mod zext_home_policy_tests {
         cg.skip_i32_sext = true;
         cg.value_types.insert(1, from);
         cg.state.value_use_counts = vec![1; 10];
-        cg.reg_assignments.insert(1, PhysReg(1)); // %rcx, the loaded value
-        cg.reg_assignments.insert(9, PhysReg(2)); // %rdx, the cast dest
+        cg.reg_assignments.insert(1, SRC_REG);
+        cg.reg_assignments.insert(9, DST_REG);
         cg.zext_loaded_values.insert(1);
         cg
     }
@@ -1483,9 +1491,14 @@ mod zext_home_policy_tests {
                 "{from:?}->{to:?} must take the plain-copy path"
             );
             let out = cg.state.out.buf.clone();
+            let expect = format!(
+                "movq %{}, %{}",
+                phys_reg_name(SRC_REG),
+                phys_reg_name(DST_REG)
+            );
             assert!(
-                out.contains("movq %rcx, %rdx"),
-                "{from:?}->{to:?} must be a single 64-bit copy, got:\n{out}"
+                out.contains(&expect),
+                "{from:?}->{to:?} must be a single 64-bit copy ({expect}), got:\n{out}"
             );
             for ext in ["movzbl", "movzwl", "movslq"] {
                 assert!(
@@ -1539,7 +1552,11 @@ mod zext_home_policy_tests {
         // An XMM-homed source is a bit-punned float word: the GP copy path
         // must not claim it.
         let mut cg = zext_cg(IrType::U32);
-        cg.reg_assignments.insert(1, PhysReg(16));
+        assert!(
+            super::super::emit::is_xmm_reg(XMM_REG),
+            "precondition: a real XMM id"
+        );
+        cg.reg_assignments.insert(1, XMM_REG);
         assert!(!cg.try_emit_zext_loaded_cast(
             &Value(9),
             &Operand::Value(Value(1)),

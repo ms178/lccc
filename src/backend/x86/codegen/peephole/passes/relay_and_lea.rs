@@ -7186,61 +7186,90 @@ mod tests {
 
 /// Tests for the read-modify-write window of `retarget_producer_into_copy`.
 ///
-/// The pass may retarget a *memory* producer straight into the copy's
-/// destination and redirect up to two same-width RMWs on the producer's
-/// register onto that destination, dropping the copy. Both cases below are
-/// decided by the width rule alone, so the expected text is fixed:
-/// the RMW chain is admissible only when every RMW matches BOTH the
-/// producer width and the copy width.
+/// The pass is driven DIRECTLY rather than through `peephole_optimize`:
+/// the full pipeline relays the copy into its use before this phase runs,
+/// so a pipeline-level fixture can never reach the RMW window and would
+/// pass by observing a different transformation entirely.
+///
+/// `mark_nop` only sets line METADATA (`LineKind::Nop`); the peephole driver
+/// blanks the text afterwards. A direct-call test must therefore compare the
+/// program built from non-NOP lines, not the raw store text — otherwise a
+/// removed copy still reads like a live instruction.
 #[cfg(test)]
 mod rmw_window_tests {
+    /// Run the pass alone over `body`; return the emitted program (every
+    /// non-NOP line, trimmed) and whether any line was removed.
+    fn run(body: &str) -> (Vec<String>, usize) {
+        let asm = format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
+        let mut store = super::LineStore::new(asm);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| super::classify_line(store.get(i)))
+            .collect();
+        super::retarget_producer_into_copy(&mut store, &mut infos);
+        let emitted = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>();
+        let removed = (0..store.len()).filter(|&i| infos[i].is_nop()).count();
+        (emitted, removed)
+    }
+
     #[test]
     fn same_width_rmw_chain_retargets_the_producer_and_the_rmw() {
-        let asm = concat!(
-            "f:\n.cfi_startproc\n",
-            "    movl (%rdi), %eax\n",
-            "    addl $1, %eax\n",
-            "    movl %eax, %r10d\n",
+        // `%r9`/`%r10`, not `%rax`: `ret` implicitly reads the return
+        // register, so an `%eax` producer is never provably dead after the
+        // copy and the fold is (correctly) refused -- such a fixture would
+        // test nothing.
+        let (emitted, removed) = run(concat!(
+            "    movl (%rdi), %r9d\n",
+            "    addl $1, %r9d\n",
+            "    movl %r9d, %r10d\n",
             "    movl %r10d, (%rsi)\n",
-            "    ret\n.cfi_endproc\n",
+            "    ret",
+        ));
+        assert_eq!(
+            emitted,
+            vec![
+                ".text",
+                "f:",
+                ".cfi_startproc",
+                "movl (%rdi), %r10d",
+                "addl $1, %r10d",
+                "movl %r10d, (%rsi)",
+                "ret",
+                ".cfi_endproc",
+            ],
+            "the producer and its RMW must move to the copy destination and the copy must go"
         );
-        let out = crate::backend::x86::codegen::peephole::peephole_optimize(asm.to_string());
-        assert!(
-            out.contains("movl (%rdi), %r10d"),
-            "the load must be retargeted into the copy destination:\n{out}"
-        );
-        assert!(
-            out.contains("addl $1, %r10d"),
-            "the RMW must follow the retargeted producer:\n{out}"
-        );
-        assert!(
-            !out.contains("%eax"),
-            "the producer's original register must be gone:\n{out}"
-        );
+        assert_eq!(removed, 1, "exactly the copy must be removed");
     }
 
     #[test]
     fn mismatched_rmw_width_refuses_the_fold() {
-        // The second RMW writes 64 bits while the producer and the copy are
-        // 32-bit: retargeting would put the chain's intermediate state in a
-        // register whose upper half the RMW also defines, so the pass must
-        // leave the pair alone.
-        let asm = concat!(
-            "f:\n.cfi_startproc\n",
-            "    movl (%rdi), %eax\n",
-            "    addq $2, %rax\n",
-            "    movl %eax, %r10d\n",
+        // Identical to the positive control except for the RMW suffix: the
+        // width rule must be the ONLY difference between accept and refuse.
+        let (emitted, removed) = run(concat!(
+            "    movl (%rdi), %r9d\n",
+            "    addq $2, %r9\n",
+            "    movl %r9d, %r10d\n",
             "    movl %r10d, (%rsi)\n",
-            "    ret\n.cfi_endproc\n",
+            "    ret",
+        ));
+        assert_eq!(
+            emitted,
+            vec![
+                ".text",
+                "f:",
+                ".cfi_startproc",
+                "movl (%rdi), %r9d",
+                "addq $2, %r9",
+                "movl %r9d, %r10d",
+                "movl %r10d, (%rsi)",
+                "ret",
+                ".cfi_endproc",
+            ],
+            "a width-mismatched RMW chain must leave every line in place"
         );
-        let out = crate::backend::x86::codegen::peephole::peephole_optimize(asm.to_string());
-        assert!(
-            out.contains("movl (%rdi), %eax"),
-            "a width-mismatched RMW chain must keep the producer in place:\n{out}"
-        );
-        assert!(
-            !out.contains("(%rdi), %r10"),
-            "no retarget may happen across a width-mismatched RMW:\n{out}"
-        );
+        assert_eq!(removed, 0, "nothing may be removed when the rule refuses");
     }
 }
