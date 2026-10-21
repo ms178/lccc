@@ -75,6 +75,8 @@ class NamedCandidates(unittest.TestCase):
         # shrinks below the 46-row native floor it is benchmarked against.
         self.assertEqual(len(registry), len(bench.BENCHMARKS))
         self.assertGreaterEqual(len(registry), 46)
+        self.assertIn("llvm_word_counts", registry)
+        self.assertIn("llvm_scalar_facts", registry)
         for left, right in [('linux_find_bit', 'linux_find_bit_scaled'),
                             ('lz4_compress', 'lz4_match_extend')]:
             self.assertEqual(bench.source_for(registry[left]), bench.source_for(registry[right]))

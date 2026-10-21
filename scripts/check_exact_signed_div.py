@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch 4 exact signed division runtime/structure and strict-load legality."""
+"""ordered arithmetic exact signed division runtime/structure and strict-load legality."""
 
 import argparse
 import os

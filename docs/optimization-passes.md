@@ -30,6 +30,11 @@ The `-O` flags still set `__OPTIMIZE__` / `__OPTIMIZE_SIZE__` for kernel-style `
 passes; the backend peepholes are documented per backend
 (`src/backend/<arch>/codegen/`). Landed since this page was written:
 
+- **Aggregate-copy forwarding** (`sret_copy_elision.rs`) — forwards eligible
+  same-block, dominated aggregate copies into their loads, retaining copies
+  with escaping, ambiguous, volatile, or otherwise unowned uses. Set
+  `CCC_NO_SRET_COPY_ELISION` (presence-based, including an empty value) to
+  disable both pipeline invocations for diagnosis.
 - **DSE** (`dse.rs`) — same-block dead-store elimination with closed-alloca
   escape analysis and byte-range kills (`CCC_NO_DSE`).
 - **Backedge PRE** — integer recurrences default-on (1.14x measured);

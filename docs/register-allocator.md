@@ -66,7 +66,7 @@ to an ABI-preserved one and no reserved register is added to the pool.
 
 `CCC_NO_HOT_WEB_STEAL` disables the x86 phase; `CCC_HOT_WEB_STEAL=N` caps its
 successful promotions (default 3). See
-[`BATCH-006.md`](../engineering/llvm-missed/BATCH-006.md) for the safety boundaries,
+[`SCALAR-FACTS.md`](../engineering/llvm-missed/SCALAR-FACTS.md) for the safety boundaries,
 negative tests and measurement scope.
 
 ### Spill cost model

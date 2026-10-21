@@ -2526,7 +2526,7 @@ mod gas247_golden_word_tests {
             // form `fcvtzs h8, h4` used to sit here, but bare GAS default
             // arch (armv8-a) rejecting it is an arch artifact: on the
             // pinned matrix law (`.arch armv9.4-a+sme`) the scalar FP16
-            // conversion exists -- see the batch-4 accept rows below.)
+            // conversion exists -- see the encoding-grammar acceptance rows below.)
             "fcvtzs d8, s4",
             "fcvtzs s8, d4",
             // fbits range: 1..=32 for S, 1..=64 for D.
@@ -2599,13 +2599,13 @@ mod gas247_golden_word_tests {
         }
     }
 
-    // ── Batch 4: dispatcher-golden campaign (post-rebase).
+    // ── Dispatcher-golden encoding checks.
     //    Every word below is a verbatim GAS 2.47 measurement under the
     //    pinned matrix law (`.arch armv9.4-a+sme`) except where noted;
     //    rejects are GAS-rejected spellings. ──────────────────────────
 
     #[test]
-    fn batch4_scalar_fp16_conversions_follow_the_matrix_arch() {
+    fn scalar_fp16_conversions_follow_the_matrix_arch() {
         for (text, want) in [
             // GAS default arch (armv8-a) rejects the H form; the matrix
             // pins armv9.4-a+sme where it exists.  Bare-default verdicts
@@ -2622,7 +2622,7 @@ mod gas247_golden_word_tests {
     }
 
     #[test]
-    fn batch4_ld1r_post_index_imm_matches_the_measured_law() {
+    fn ld1r_post_index_imm_matches_the_measured_law() {
         // #imm iff imm == num_structs * (1 << size) -- the post-index
         // immediate is the TOTAL structure size in bytes (measured set;
         // `ld1r {v0.2d}, [x0], #16` stays rejected: total is 8, not 16).
@@ -2643,7 +2643,7 @@ mod gas247_golden_word_tests {
     }
 
     #[test]
-    fn batch4_widening_arrangement_law() {
+    fn widening_arrangement_law() {
         for (text, want) in [
             // arr_d == arr_n, elem_d == 2 * elem_m, count preserved (base).
             ("saddw v0.8h, v1.8h, v2.8b", 0x0e221020u32),
@@ -2661,7 +2661,7 @@ mod gas247_golden_word_tests {
     }
 
     #[test]
-    fn batch4_scalar_saturating_narrow_family_completes() {
+    fn scalar_saturating_narrow_family_completes() {
         for (text, want) in [
             // Scalar SQSHRUN/SQRSHRUN (0x7f class, ops 100001/100011) --
             // residual (c): these had no scalar route at all before.
@@ -2683,7 +2683,7 @@ mod gas247_golden_word_tests {
     }
 
     #[test]
-    fn batch4_fcmp_fcmpe_both_forms() {
+    fn fcmp_fcmpe_both_forms() {
         for (text, want) in [
             // Register form: Rt = 0b00000 (fcmpe adds bit 4 -> 0b01000).
             ("fcmp s8, s9", 0x1e292100u32),
@@ -2715,7 +2715,7 @@ mod gas247_golden_word_tests {
     }
 
     #[test]
-    fn batch4_fmov_immediate_grammar() {
+    fn fmov_immediate_grammar() {
         for (text, want) in [
             // D-form: word = 0x1e601000 | imm8 << 13 (imm8 values measured).
             ("fmov d0, #1.0", 0x1e6e1000u32),
@@ -3163,7 +3163,7 @@ mod gas247_golden_word_tests {
     /// bits 20:18 = 0b110 marker) plus the immediate grammar (`#-0`
     /// rejected; `#0`, `#0.0`, `#0e0`, `#+0.0` accepted).
     #[test]
-    fn batch4_fp_zero_cmp_and_vector_rounding_law() {
+    fn fp_zero_cmp_and_vector_rounding_law() {
         for (text, want) in [
             ("fcvtas v0.2s, v1.2s", 0x0e21c820u32),
             ("fcvtau v0.2s, v1.2s", 0x2e21c820u32),

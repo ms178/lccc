@@ -10,6 +10,7 @@ failure text is attached to the check run itself.
 
 Selection: every line matching the verdict pattern (``FAIL``, ``error``,
 ``Error``, ``mismatch``, ``panicked``, ``Traceback``, ``AssertionError``),
+APT refresh/resolver errors (``Err:``, ``E:``, failed-fetch warnings),
 plus the following ``--context`` lines (defaults to 3) which usually hold
 the ``cat``-ed compiler or program output. If nothing matches, the last
 ``--tail`` lines are used so a gate that dies without a verdict still
@@ -32,6 +33,7 @@ from pathlib import Path
 
 VERDICT = re.compile(
     r"\bFAIL\b|\berror\b|\bError\b|mismatch|panicked|Traceback|AssertionError"
+    r"|^Err:|^E:|^W:.*[Ff]ailed"
 )
 LIMIT = 4000
 

@@ -527,6 +527,31 @@ class ProvisioningTests(unittest.TestCase):
         self.assertIn("refusing an Ubuntu PPA", result.stderr)
         self.assertFalse(any(c[0] == "add-apt-repository" for c in commands))
 
+    def test_literal_gxx_diagnostics_do_not_report_clang(self):
+        apt = shutil.which("apt-cache")
+        if apt is None:
+            self.skipTest("APT policy reader unavailable")
+        # Read only an isolated synthetic status database: no system package
+        # state, writes, root privileges, apt update/install or network calls.
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            status = directory / "status"
+            status.write_text("Package: clang-16\nStatus: install ok installed\n"
+                              "Architecture: amd64\nVersion: 16.0.6-1\n"
+                              "Description: Isolated regex fixture\n\n")
+            lists = directory / "lists"
+            lists.mkdir()
+            command = [apt, "-o", f"Dir::State::status={status}",
+                       "-o", f"Dir::State::lists={lists}",
+                       "-o", "Dir::Cache::pkgcache=", "-o", "Dir::Cache::srcpkgcache=", "policy"]
+            broad = subprocess.run(command + ["g++-16"], capture_output=True, text=True, check=True)
+            exact = subprocess.run(command + ["?exact-name(g++-16)"], capture_output=True, text=True, check=True)
+            # Old APT releases expose Clang via the deprecated broad regex.
+            # New releases may remove that fallback; literal lookup must work
+            # in either case and must never select Clang.
+            self.assertEqual(broad.returncode, 0)
+            self.assertNotIn("clang-16:", exact.stdout)
+
     def test_c_and_cxx_versions_must_match(self):
         for version in ("15.3.0", "16.1.0", "", "garbage"):
             with self.subTest(gxx=version):

@@ -47,7 +47,7 @@ to `#0` is **not** copied.
 
 Closed this session with evidence:
 
-- **Dispatcher-golden campaign (batch 4) complete** on upstream/main
+- **Dispatcher-golden campaign (ordered arithmetic) complete** on upstream/main
   `6051e873` (HEAD chain rebased): `fcmp`/`fcmpe` both forms (register
   Rt=0 / 0b10000; `#0.0` Rt=0b01000 + E bit; positive-zero-only
   immediate with the raw-text sign check for `#-0`, shared by the

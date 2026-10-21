@@ -1,0 +1,77 @@
+{
+  "cohort": "word-counts",
+  "cases": [
+    {
+      "number": 173691,
+      "status": "covered-limited",
+      "scope": "Equal-width single-use scalar leading/trailing count minima become a count of an OR.",
+      "cohort": "word-counts",
+      "evidence": [
+        "engineering/llvm-missed/WORD-COUNTS.md",
+        "engineering/llvm-missed/word-counts-sources.json",
+        "tests/regression/llvm_word_counts.c",
+        "tests/regression/check_llvm_word_counts.py"
+      ]
+    },
+    {
+      "number": 90000,
+      "status": "covered-limited",
+      "scope": "Constant zero-count caps inject an in-range sentinel; leading offset is width-1-cap.",
+      "cohort": "word-counts",
+      "evidence": [
+        "engineering/llvm-missed/WORD-COUNTS.md",
+        "engineering/llvm-missed/word-counts-sources.json",
+        "tests/regression/llvm_word_counts.c",
+        "tests/regression/check_llvm_word_counts.py"
+      ]
+    },
+    {
+      "number": 49562,
+      "status": "reviewed-deferred",
+      "scope": "Split population counts remain; wide target-cost/32-bit legality policy is separate.",
+      "cohort": "word-counts",
+      "evidence": [
+        "engineering/llvm-missed/WORD-COUNTS.md",
+        "engineering/llvm-missed/word-counts-sources.json",
+        "tests/regression/llvm_word_counts.c",
+        "tests/regression/check_llvm_word_counts.py"
+      ]
+    },
+    {
+      "number": 45243,
+      "status": "reviewed-deferred",
+      "scope": "Conditional byte rotate remains a narrowing/select opportunity.",
+      "cohort": "word-counts",
+      "evidence": [
+        "engineering/llvm-missed/WORD-COUNTS.md",
+        "engineering/llvm-missed/word-counts-sources.json",
+        "tests/regression/llvm_word_counts.c",
+        "tests/regression/check_llvm_word_counts.py"
+      ]
+    },
+    {
+      "number": 51090,
+      "status": "reviewed-deferred",
+      "scope": "Original 32-bit form has no defined shift domain; defined masked 64-bit form remains a cast/count-normalization opportunity.",
+      "cohort": "word-counts",
+      "evidence": [
+        "engineering/llvm-missed/WORD-COUNTS.md",
+        "engineering/llvm-missed/word-counts-sources.json",
+        "tests/regression/llvm_word_counts.c",
+        "tests/regression/check_llvm_word_counts.py"
+      ]
+    },
+    {
+      "number": 150954,
+      "status": "reviewed-deferred",
+      "scope": "Narrow bit-length conjugation remains; defined nonzero semantic control added.",
+      "cohort": "word-counts",
+      "evidence": [
+        "engineering/llvm-missed/WORD-COUNTS.md",
+        "engineering/llvm-missed/word-counts-sources.json",
+        "tests/regression/llvm_word_counts.c",
+        "tests/regression/check_llvm_word_counts.py"
+      ]
+    }
+  ]
+}

@@ -40,7 +40,7 @@ def main():
     )
     parser.add_argument("--gcc", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--suite", choices=("batch2", "batch3"), default="batch2")
+    parser.add_argument("--suite", choices=("integer-observations", "bit-demand"), default="integer-observations")
     parser.add_argument("--rounds", type=int, default=8)
     parser.add_argument("--iterations", type=int, default=1500000)
     args = parser.parse_args()
@@ -54,7 +54,7 @@ def main():
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     stem = (
-        "llvm_missed_integer_batch" if args.suite == "batch2" else "llvm_missed_batch3"
+        "llvm_integer_observations" if args.suite == "integer-observations" else "llvm_bit_demand"
     )
     source_path = ROOT / "tests/regression" / (stem + ".c")
     cases = json.loads(source_path.with_suffix(".json").read_text())
@@ -63,9 +63,9 @@ def main():
         c["name"] for c in cases if c.get("nonzero_input", c.get("nonzero", False))
     }
     signature = (
-        "uint32_t,uint32_t,uint32_t" if args.suite == "batch2" else "uint32_t,uint32_t"
+        "uint32_t,uint32_t,uint32_t" if args.suite == "integer-observations" else "uint32_t,uint32_t"
     )
-    third = ",i&3" if args.suite == "batch2" else ""
+    third = ",i&3" if args.suite == "integer-observations" else ""
     declarations = "#include <stdint.h>\n#include <stdio.h>\n" + "".join(
         f"extern uint32_t {n}({signature});\n" for n in names
     )

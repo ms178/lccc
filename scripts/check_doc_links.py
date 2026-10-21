@@ -19,7 +19,10 @@ import os, re, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIR_SKIP = {".git", "target", "node_modules", ".venv", "__pycache__"}
-ROOT_SEGMENTS = {d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d)) and d not in DIR_SKIP}
+# Root-only generated/vendor scratch, not project documentation. Backtick
+# citations of ephemeral outputs are provenance, not permanent live links.
+ROOT_SKIP = {".cache", "work"}
+ROOT_SEGMENTS = {d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d)) and d not in DIR_SKIP | ROOT_SKIP}
 
 FENCE = re.compile(r"^\s*```")
 LINK = re.compile(r"\[[^\]]{0,200}\]\(([^)\s]{1,200})\)")
@@ -32,6 +35,19 @@ DISPOSITION = re.compile(
     r"pinned like its source|was\s+deleted")
 SRC_TAG = re.compile(r"^<!--\s*src:\s")
 TABLE_ROW = re.compile(r"\|\s*(?:`[^\n`]+`\s*)*(?:digested|wiped|deleted|subsumed|→)", re.I)
+
+
+def prune_dirs(base, dirs):
+    dirs[:] = [d for d in dirs if d not in DIR_SKIP
+               and not (os.path.abspath(base) == os.path.abspath(ROOT) and d in ROOT_SKIP)]
+
+
+def markdown_files():
+    for base, dirs, files in os.walk(ROOT):
+        prune_dirs(base, dirs)
+        for name in files:
+            if name.endswith(".md"):
+                yield os.path.join(base, name)
 
 
 def resolvable(rel, base):
@@ -49,7 +65,7 @@ def resolvable(rel, base):
     name = os.path.basename(rel)
     if "/" not in rel:  # bare filename: last-resort basename hunt
         for bp, dirs, files in os.walk(ROOT):
-            dirs[:] = [d for d in dirs if d not in DIR_SKIP]
+            prune_dirs(bp, dirs)
             if name in files:
                 return True
     return False
@@ -91,16 +107,11 @@ def check_file(path):
 
 def main():
     fails = 0
-    for bp, dirs, files in os.walk(ROOT):
-        dirs[:] = [d for d in dirs if d not in DIR_SKIP]
-        for fn in files:
-            if not fn.endswith(".md"):
-                continue
-            p = os.path.join(bp, fn)
-            for ln, ref in check_file(p):
-                fails += 1
-                print(f"{p.replace(ROOT + '/', '')}:{ln}: broken reference `{ref}`",
-                      file=sys.stderr)
+    for p in markdown_files():
+        for ln, ref in check_file(p):
+            fails += 1
+            print(f"{p.replace(ROOT + '/', '')}:{ln}: broken reference `{ref}`",
+                  file=sys.stderr)
     if fails:
         print(f"\ndoc-link gate FAILED: {fails} broken reference(s)", file=sys.stderr)
         sys.exit(1)

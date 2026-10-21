@@ -4630,7 +4630,7 @@ def _so_bound_ifunc_test(args, oracles):
                 if rel.count("R_X86_64_IRELATIVE") != want_irel:
                     return Result(name, "FAIL", f"{opt}{bs}: want {want_irel} IRELATIVE: {rel}")
                 for tag, bflag in (("gnu", []), ("lccc", ["-B" + shim])):
-                    r = sh([CC] + bflag + ["-O1", "main.c", "-L.", "-lif", "-o", "m"], cwd=td)
+                    r = sh([CC] + bflag + ["-O1", "-fPIE", "-pie", "main.c", "-L.", "-lif", "-o", "m"], cwd=td)
                     if r.returncode != 0:
                         return Result(name, "FAIL", f"{opt}{bs} {tag} exe: "
                                       f"{r.stderr.decode()[:300]}")
@@ -5039,7 +5039,7 @@ def _gotpcrelx_relax_test(args, oracles):
             shapes, glob = {}, {}
             for tag, bflag in (("lccc", ["-B" + shim]), ("gnu", [])):
                 exe = f"t{mode}.{tag}"
-                r = sh([CC] + bflag + ["-O1", mode, "f.s", "m.c", "-o", exe], cwd=td)
+                r = sh([CC] + bflag + ["-O1", "-fPIE", mode, "f.s", "m.c", "-o", exe], cwd=td)
                 if r.returncode != 0:
                     return Result(name, "FAIL", f"{mode}/{tag} link: {r.stderr.decode()[:300]}")
                 run = sh([os.path.join(td, exe)], cwd=td)
@@ -5360,7 +5360,7 @@ def _gotpcrel_edges_test(args, oracles):
                         return Result(name, "FAIL", f"{mode}/{tag}: {r.stderr.decode()[:300]}")
                     r = sh([CC, "m.c", lib, "-Wl,-rpath," + td, "-o", exe], cwd=td)
                 else:
-                    r = sh([CC] + bflag + [mode, "e.o", "m.c", "-o", exe], cwd=td)
+                    r = sh([CC] + bflag + ["-fPIE", mode, "e.o", "m.c", "-o", exe], cwd=td)
                 if r.returncode != 0:
                     return Result(name, "FAIL", f"{mode}/{tag} link: {r.stderr.decode()[:300]}")
                 run = sh([os.path.join(td, exe)] + ([] if tag == "lccc" else ["skip-rexb"]),
@@ -5507,7 +5507,7 @@ def _got64_spelling_matrix_test(args, oracles):
                     outs = {}
                     for tag, bflag in (("lccc", ["-B" + shim]), ("gnu", [])):
                         exe = f"a{pad}{mode}.{label}.{tag}"
-                        lr = sh([CC] + bflag + [mode, obj, "m.c", "-o", exe], cwd=td)
+                        lr = sh([CC] + bflag + ["-fPIE", mode, obj, "m.c", "-o", exe], cwd=td)
                         if lr.returncode != 0:
                             return Result(name, "FAIL",
                                           f"{label}@{pad} {mode}/{tag} link: "
@@ -5668,7 +5668,7 @@ def _absolute_symbols_pic_test(args, oracles):
                     r = sh([CC, "m.c", img, "-Wl,-rpath," + td, "-ldl", "-o", exe], cwd=td)
                 else:
                     img = exe
-                    r = sh([CC] + bflag + ["-pie", "-rdynamic", "a.s", "abs.s", "m.c", defs, "-ldl",
+                    r = sh([CC] + bflag + ["-fPIE", "-pie", "-rdynamic", "a.s", "abs.s", "m.c", defs, "-ldl",
                                            "-o", exe], cwd=td)
                 if r.returncode != 0:
                     return Result(name, "FAIL", f"{mode}/{tag} link: {r.stderr.decode()[:300]}")
@@ -5882,7 +5882,7 @@ def _ie_to_le_forms_test(args, oracles):
             if "movrs" in err or "no such instruction" in err:
                 return Result(name, "SKIP", f"assembler without APX/MOVRS: {err}")
             return Result(name, "FAIL", f"assemble: {err}")
-        r = sh([CC, "-O1", "-c", "m.c"], cwd=td)
+        r = sh([CC, "-O1", "-fPIE", "-c", "m.c"], cwd=td)
         if r.returncode != 0:
             return Result(name, "FAIL", f"compile: {r.stderr.decode()[:300]}")
         lccc_ld = os.path.join(os.path.dirname(os.path.abspath(args.lccc)), "lccc-ld")
@@ -6055,7 +6055,7 @@ def _movrs_relocations_test(args, oracles):
             if "movrs" in err:
                 return Result(name, "SKIP", f"assembler without MOVRS: {err}")
             return Result(name, "FAIL", f"assemble: {err}")
-        for argv in (["-O1", "-c", "m.c"], ["-O1", "-c", "ext.c"],
+        for argv in (["-O1", "-fPIE", "-c", "m.c"], ["-O1", "-c", "ext.c"],
                      ["-fPIC", "-shared", "ext.c", "-o", "libext.so"]):
             r = sh([CC] + argv, cwd=td)
             if r.returncode != 0:
@@ -6259,7 +6259,7 @@ def _plain_gotpcrel_test(args, oracles):
         r = sh(["as", "--64", "-mrelax-relocations=no", "sc.s", "-o", "sc.o"], cwd=td)
         if r.returncode != 0:
             return Result(name, "FAIL", f"assemble sc.s: {r.stderr.decode()[:300]}")
-        for argv in (["-O1", "-c", "m.c"],
+        for argv in (["-O1", "-fPIE", "-c", "m.c"],
                      ["-O1", "-c", "ext.c"], ["-fPIC", "-shared", "ext.c", "-o", "libext.so"]):
             r = sh([CC] + argv, cwd=td)
             if r.returncode != 0:
@@ -7983,7 +7983,7 @@ def _cxx_eh_local_type_test(args, oracles):
     with tempfile.TemporaryDirectory() as td:
         with open(os.path.join(td, "lt.cpp"), "w") as f:
             f.write(CXX_EH_LOCAL_TYPE_SRC)
-        r = sh([CXX, "-c", "-O1", "lt.cpp"], cwd=td)
+        r = sh([CXX, "-c", "-O1", "-fPIC", "lt.cpp"], cwd=td)
         if r.returncode != 0:
             return Result(name, "SKIP", "g++ compile failed")
         r = sh([args.lccc, "lt.o", "-lstdc++", "-o", "lt.lccc"], cwd=td)
@@ -9412,6 +9412,34 @@ int main(){ printf("%d %d\\n", guard_a(1), guard_b(1)); return 0; }
     lccc_only_flags=["-Wl,--icf=all"],
     expect_stdout="8 8\n",
     tags=("icf",))
+
+# Same text, DIFFERENT exception type tables. Text-only ICF folds these and
+# silently catches the wrong type. Preserve both semantics in safe/all modes.
+for _mode in ("safe", "all"):
+    case("icf_distinct_lsda_catch_types_" + _mode,
+        {"a.cpp": """
+#include <cstdio>
+volatile int pick;
+__attribute__((noinline)) void maythrow() { if (pick == 1) throw 7; if (pick == 2) throw 7L; }
+__attribute__((noinline)) int int_guard() { try { maythrow(); } catch (int) { return 7; } return 0; }
+__attribute__((noinline)) int long_guard() { try { maythrow(); } catch (long) { return 7; } return 0; }
+int main() {
+    pick = 1;
+    int a = int_guard(), b = 0;
+    try { b = long_guard(); } catch (int) { b = 99; }
+    pick = 2;
+    int c = 0;
+    try { c = int_guard(); } catch (long) { c = 88; }
+    int d = long_guard();
+    printf("%d %d %d %d\\n", a, b, c, d);
+    return 0;
+}
+"""},
+        compile_flags=["-O1", "-ffunction-sections"],
+        ldflags=["-lstdc++", "-lm"],
+        lccc_only_flags=["-Wl,--icf=" + _mode],
+        expect_stdout="7 99 88 7\n",
+        tags=("icf", "eh-frame"))
 
 # --icf= with an unrecognised value must disable folding, not fail the link
 # (gold and lld both accept --icf=none this way).
