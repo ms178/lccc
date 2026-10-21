@@ -437,7 +437,9 @@ fn missing_byte_is_kept_without_a_native_swap() {
     let x = g.param(IrType::U64);
     let root = missing_byte_network(&mut g, x);
     let mut f = g.function(IrType::U64, root);
-    assert_eq!(recognize_function(&mut f, false, 64, 8, false, false), 0);
+    // Boolean cleanup may remove the zero initializer, but a target without
+    // native Bswap must still retain the portable byte-routing network.
+    recognize_function(&mut f, false, 64, 8, false, false);
     assert_eq!(sole_bswap(&f), None);
 }
 

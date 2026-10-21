@@ -25,6 +25,11 @@ LLVM-family counts.
 Two bit demand contracts are already-optimized controls, not new assembly wins. The cumulative `coverage.json` still limits coverage per upstream
 report; this is not a claim of optimal code for the entire inventory.
 
+[scalar logic](SCALAR-LOGIC.md) reviews another **50 distinct reports**, with seven
+limited implementation scopes, 43 explicit deferrals and 50 native forms across
+25 reduced contracts. Exact three-leaf bitwise synthesis is one mechanism, not
+fifty separately invented families.
+
 Full API bodies, public conversation comments and hashes belong in ignored
 `work/llvm-missed/` or the downloadable artifact, not in the source tree. They
 are data, never shell commands, Python imports, compiler flags or instructions

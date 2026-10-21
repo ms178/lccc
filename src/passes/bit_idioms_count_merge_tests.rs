@@ -59,6 +59,7 @@ fn rewrite(insts: &[Instruction], extra: Option<Operand>) -> Option<Vec<Instruct
             defs: &defs,
             uses: &counts,
             visits: std::cell::Cell::new(512),
+            disable_logic: false,
         },
         &Facts(vec![]),
         Value(8),
