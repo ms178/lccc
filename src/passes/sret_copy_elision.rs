@@ -323,8 +323,9 @@ enum ObjectUse {
 enum Event {
     /// A whole-object copy into the object: every byte is redefined.
     Reinit(usize, usize),
-    /// A store into some of the object's bytes. It writes, it never reads.
-    Write(usize),
+    /// A store into some of the object's bytes, in `(block, instruction)`.
+    /// It writes, it never reads.
+    Write(usize, usize),
     /// Anything else that can touch the object and might read it as well: a
     /// call argument, an inline-asm operand, a pointer used as data.
     Clobber(usize, usize),
@@ -336,7 +337,7 @@ impl Event {
     fn block(&self) -> usize {
         match self {
             Event::Reinit(bi, _) | Event::Read(bi, _, _) | Event::Clobber(bi, _) => *bi,
-            Event::Write(bi) => *bi,
+            Event::Write(bi, _) => *bi,
         }
     }
 }
@@ -428,7 +429,7 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
                         } else if whole {
                             Event::Reinit(bi, ii)
                         } else {
-                            Event::Write(bi)
+                            Event::Write(bi, ii)
                         }
                     }
                     Instruction::Memcpy { .. } => Event::Read(bi, ii, ObjectUse::Pinned),
@@ -441,7 +442,7 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
                     // A store through a derived pointer only defines bytes;
                     // the value it stores is computed before it runs, so the
                     // store itself observes nothing.
-                    Instruction::Store { ptr, .. } if ptr.0 == v => Event::Write(bi),
+                    Instruction::Store { ptr, .. } if ptr.0 == v => Event::Write(bi, ii),
                     _ => Event::Clobber(bi, ii),
                 };
                 events.entry(*root).or_default().push(event);
@@ -457,7 +458,12 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
     // Replay each object's log. Every read must be attributable to the copy
     // that currently defines the object, and a clobber leaves it undefined, so
     // an object whose bytes are ever read while undefined is left alone.
-    let mut writes: FxHashMap<u32, Vec<(usize, usize)>> = FxHashMap::default();
+    // Every event that can change an object's bytes, in program order, with a
+    // flag for the whole-object copies among them (the only writes a snapshot
+    // can be checked against by position alone). The forwarding rule below
+    // needs the full list to prove that a copied source still holds the bytes
+    // each re-rooted read consumes.
+    let mut write_positions: FxHashMap<u32, Vec<(usize, usize, bool)>> = FxHashMap::default();
     let mut owned_by: FxHashMap<(usize, usize), Vec<(usize, ObjectUse)>> = FxHashMap::default();
     let mut attributable: FxHashSet<u32> = FxHashSet::default();
     // A root observed through anything but a whole-object copy may be written
@@ -479,17 +485,28 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
             }
             match event {
                 Event::Reinit(bi, ii) => {
-                    writes.entry(root).or_default().push((*bi, *ii));
+                    write_positions
+                        .entry(root)
+                        .or_default()
+                        .push((*bi, *ii, true));
                     current = Some((*bi, *ii));
                 }
-                Event::Write(_) => {
+                Event::Write(bi, ii) => {
+                    write_positions
+                        .entry(root)
+                        .or_default()
+                        .push((*bi, *ii, false));
                     // Only the bytes it names change; the rest still holds the
                     // copy's bytes, so the copy is not dead merely because a
                     // store follows it -- but no read is attributable to it
                     // any more.
                     current = None;
                 }
-                Event::Clobber(_, ii) => {
+                Event::Clobber(bi, ii) => {
+                    write_positions
+                        .entry(root)
+                        .or_default()
+                        .push((*bi, *ii, false));
                     // The object may be written here, and it may be read.
                     match current {
                         Some(owner) => {
@@ -525,7 +542,7 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
     }
 
     let mut sites: Vec<CopySite> = Vec::new();
-    for (&root, ws) in &writes {
+    for (&root, ws) in &write_positions {
         if rejected.contains(&root) || !attributable.contains(&root) {
             continue;
         }
@@ -535,7 +552,11 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
         if volat {
             continue;
         }
-        for &(bi, ii) in ws {
+        for &(bi, ii, whole) in ws {
+            // Only a whole-object copy can move the object elsewhere.
+            if !whole {
+                continue;
+            }
             let Instruction::Memcpy {
                 src, size: csize, ..
             } = &func.blocks[bi].instructions[ii]
@@ -566,14 +587,16 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
             }
             // Every write to the SOURCE precedes this copy on every path, so
             // the bytes it copies are still there when the copy runs.
-            let src_ok = writes.get(src_root).is_none_or(|sw| {
-                sw.iter().all(|&(wb, wi)| {
-                    if wb == bi {
-                        wi < ii
-                    } else {
-                        precedes(func, wb, bi)
-                    }
-                })
+            let src_ok = write_positions.get(src_root).is_none_or(|sw| {
+                sw.iter()
+                    .filter(|&&(_, _, whole)| whole)
+                    .all(|&(wb, wi, _)| {
+                        if wb == bi {
+                            wi < ii
+                        } else {
+                            precedes(func, wb, bi)
+                        }
+                    })
             });
             if !src_ok {
                 continue;
@@ -582,9 +605,13 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
                 .get(&(bi, ii))
                 .map(|v| v.iter().map(|(k, u)| (*k, u.clone())).collect())
                 .unwrap_or_default();
+            // Every read the copy feeds must be a load this pass can re-root,
+            // and the source must still hold the bytes it copied by the time
+            // the last of those loads runs.
             let deletable = owned
                 .iter()
-                .all(|(_, kind)| matches!(kind, ObjectUse::Readable(_)));
+                .all(|(_, kind)| matches!(kind, ObjectUse::Readable(_)))
+                && source_holds_copied_bytes(*src_root, bi, ii, &owned, &write_positions);
 
             sites.push(CopySite {
                 block: bi,
@@ -666,6 +693,41 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
         }
     }
     removed
+}
+
+/// Do the bytes the copy at `(block, copy)` took from `source` still hold when
+/// every read re-rooted at `source` runs?
+///
+/// The reads all lie in the copy's own block, after it (attribution is
+/// block-local), so only a write to the source inside that window can make a
+/// re-rooted read observe something the copy did not see. `positions` lists
+/// every event that can write the source, in program order, so the first one
+/// after the copy decides: it must not be in the copy's block (an unrelated
+/// block cannot run between two instructions of this one) or it must lie
+/// after the last forwarded read.
+///
+/// This is the rule the first version of the pass was missing: it compared the
+/// copy only against *whole-object* copies into the source, so a field store,
+/// a partial copy or an aliased store between the copy and the read was
+/// invisible and the read came back with the newer value.
+fn source_holds_copied_bytes(
+    source: u32,
+    block: usize,
+    copy: usize,
+    owned: &[(usize, ObjectUse)],
+    write_positions: &FxHashMap<u32, Vec<(usize, usize, bool)>>,
+) -> bool {
+    let Some(&last_read) = owned.iter().map(|(index, _)| index).max() else {
+        return true;
+    };
+    let Some(positions) = write_positions.get(&source) else {
+        return true;
+    };
+    let next = positions.partition_point(|&(b, i, _)| (b, i) <= (block, copy));
+    match positions.get(next) {
+        Some(&(b, i, _)) => b != block || i > last_read,
+        None => true,
+    }
 }
 
 /// Does block `a` necessarily execute before block `b` on every path to `b`?
@@ -848,6 +910,124 @@ mod tests {
             Instruction::Load { ptr, .. } => assert_eq!(ptr.0, 0),
             other => panic!("expected the forwarded load, got {other:?}"),
         }
+    }
+
+    fn load(v: u32, ptr: u32) -> Instruction {
+        Instruction::Load {
+            volatile: false,
+            dest: Value(v),
+            ptr: Value(ptr),
+            ty: IrType::U64,
+            seg_override: AddressSpace::Default,
+        }
+    }
+
+    fn store(ptr: u32) -> Instruction {
+        Instruction::Store {
+            val: Operand::Value(Value(90)),
+            ptr: Value(ptr),
+            ty: IrType::U64,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    #[test]
+    fn keeps_copy_when_a_store_writes_the_source_before_the_read() {
+        // `d = src; src.a = 5; use(d)` -- re-rooting `use(d)` at `src` would
+        // observe the store, so the copy has to stay.
+        let mut func = multi_block(vec![vec![
+            alloca(0, 16),
+            alloca(1, 16),
+            Instruction::Memcpy {
+                dest: Value(0),
+                src: Value(1),
+                size: 16,
+            },
+            store(1),
+            load(2, 0),
+        ]]);
+        assert_eq!(run(&mut func), 0);
+        let load = func.blocks[0]
+            .instructions
+            .iter()
+            .find(|i| matches!(i, Instruction::Load { .. }))
+            .expect("load survives");
+        match load {
+            Instruction::Load { ptr, .. } => assert_eq!(ptr.0, 0, "read stays on the copy"),
+            other => panic!("expected the load, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keeps_copy_when_a_partial_copy_writes_the_source_before_the_read() {
+        // The same window, closed by a partial Memcpy into the source instead
+        // of a store: only the whole-object case used to be modelled.
+        let mut func = multi_block(vec![vec![
+            alloca(0, 16),
+            alloca(1, 16),
+            alloca(3, 8),
+            Instruction::Memcpy {
+                dest: Value(0),
+                src: Value(1),
+                size: 16,
+            },
+            Instruction::Memcpy {
+                dest: Value(1),
+                src: Value(3),
+                size: 8,
+            },
+            load(2, 0),
+        ]]);
+        assert_eq!(run(&mut func), 0);
+    }
+
+    #[test]
+    fn forwards_copy_when_the_source_is_written_only_after_the_read() {
+        // `d = src; r = d.a; src.a = 5` -- the store cannot be observed
+        // through the re-rooted read, so refusing here would cost the copy
+        // for no reason.
+        let mut func = multi_block(vec![vec![
+            alloca(0, 16),
+            alloca(1, 16),
+            Instruction::Memcpy {
+                dest: Value(0),
+                src: Value(1),
+                size: 16,
+            },
+            load(2, 0),
+            store(1),
+        ]]);
+        assert_eq!(run(&mut func), 1);
+        let load = func.blocks[0]
+            .instructions
+            .iter()
+            .find(|i| matches!(i, Instruction::Load { .. }))
+            .expect("load survives");
+        match load {
+            Instruction::Load { ptr, .. } => assert_eq!(ptr.0, 1, "read re-rooted at the source"),
+            other => panic!("expected the forwarded load, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forwards_copy_when_the_source_is_written_in_another_block() {
+        // A store in block 1 cannot run between two instructions of block 0,
+        // so it does not invalidate the window the copy is read in.
+        let mut func = multi_block(vec![
+            vec![
+                alloca(0, 16),
+                alloca(1, 16),
+                Instruction::Memcpy {
+                    dest: Value(0),
+                    src: Value(1),
+                    size: 16,
+                },
+                load(2, 0),
+            ],
+            vec![store(1)],
+        ]);
+        assert_eq!(run(&mut func), 1);
     }
 
     #[test]
