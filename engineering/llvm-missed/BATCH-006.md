@@ -4,7 +4,9 @@
 
 This is the ten-report scalar cohort selected for batch 6, together with the
 requested x86-64 hot-loop callee-saved-register mechanism. The baseline is the
-merged batch-5 main head `b215478dbf1274bb0c1a3eac9bdbf6183f09f24d`.
+latest main after PR #887, `0c4f3929dd75354d80bae881b6d579e2426fe789`.
+The earlier batch-5 head `b215478` remains historical context, not the final
+comparison baseline.
 
 Bodies and comments were retrieved through the GitHub API. Exact upstream
 identities, timestamps and body/comment digests are in `batch-006-sources.json`.
@@ -58,7 +60,9 @@ its transitive operands already dominate. It does not globally replace a
 shared producer based on a condition that is only locally true. Select arm
 agreement requires canonical Boolean arms; two arbitrary nonzero integers are
 not equated merely because both are true. Integer casts are not generally
-transparent. The Boolean-OR rule may traverse casts only after finding a
+transparent. Non-Boolean select reduction is restricted to nested constant
+choices; it is not an unconditional constant folder and leaves count-idiom
+accumulator networks intact. The Boolean-OR rule may traverse casts only after finding a
 canonical comparison result, whose zero/one values survive those casts.
 
 ### Modular shift cancellation
@@ -89,6 +93,18 @@ mask equals clearing the low k bits throughout its whole possible range. Thus
 `q*(D*S) + ((r*S)&M)` becomes `(x*S)&~(2^k-1)`. Missing relevant mask bits,
 insufficient quotient alignment, mismatched inputs/divisors, signed division,
 zero divisors and overflowing remainder bounds decline.
+
+The `0x7000` mask control is distinct from the `0x7800` positive witness, but
+can legally simplify by clearing 12 rather than 11 low bits. It must not use
+the positive witness's mask. The unit suite checks both legal reductions and
+refuses a genuinely holey `0x6800` mask. Negative solver controls disprove a
+specific invalid replacement, not every possible optimization of a near miss.
+
+The shared-remainder witness removes the quotient-dependent multiply by 12,
+but currently ties its baseline at 13 instructions because of preservation
+moves. Its native gate checks that mechanism directly, while the other twelve
+new witnesses require fewer instructions. No code-size win is claimed for the
+tie.
 
 ## x86-64 callee-saved hot-web steals
 
@@ -125,6 +141,11 @@ values with rare-path reads, unsigned wraparound, zero/small/odd trips and a
 volatile memory-carried reference. The separate `hot_web_loop` benchmark times
 only the optimized recurrence, not that deliberately slow reference. It is a
 synthetic register-pressure witness, not an application-speed claim.
+The `llvm_batch6_scalar` benchmark separately calls the thirteen new scalar
+contracts with deterministic mixed boundary/random inputs and an observed
+checksum. It shares the exact native entry points rather than duplicating
+their implementations. Both new workloads have bounded instrumentation-size
+macros and entries in `callgrind_sizes.json`.
 
 ## Reproduction and evidence
 

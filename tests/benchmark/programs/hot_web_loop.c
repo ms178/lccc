@@ -30,7 +30,11 @@ __attribute__((noinline)) static uint64_t exercise(unsigned n, uint64_t seed) {
     return a ^ b ^ c ^ d ^ p ^ q ^ r ^ s ^ t ^ u;
 }
 
+#ifndef HOT_WEB_TRIPS
+#define HOT_WEB_TRIPS 40000000u
+#endif
+
 int main(void) {
-    printf("%016llx\n", (unsigned long long)exercise(40000000u, UINT64_C(0xffff000000000001)));
+    printf("%016llx\n", (unsigned long long)exercise(HOT_WEB_TRIPS, UINT64_C(0xffff000000000001)));
     return 0;
 }

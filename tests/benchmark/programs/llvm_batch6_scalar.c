@@ -4,9 +4,13 @@
 #include "../../regression/llvm_missed_batch6.c"
 #include <stdio.h>
 
+#ifndef BATCH6_SCALAR_TRIPS
+#define BATCH6_SCALAR_TRIPS 4000000u
+#endif
+
 int main(void) {
     uint64_t state = UINT64_C(0x123456789abcdef0), sum = 0;
-    for (unsigned i = 0; i < 4000000; ++i) {
+    for (unsigned i = 0; i < BATCH6_SCALAR_TRIPS; ++i) {
         state ^= state << 13; state ^= state >> 7; state ^= state << 17;
         unsigned x = i % 4 == 0 ? 0 : i % 4 == 1 ? 1 :
                      i % 4 == 2 ? UINT32_MAX : (unsigned)state;

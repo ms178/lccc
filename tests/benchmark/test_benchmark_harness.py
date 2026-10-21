@@ -29,6 +29,8 @@ class BenchmarkHarnessTests(unittest.TestCase):
         by_name = {b.name: b for b in bench.BENCHMARKS}
         self.assertEqual(set(sizes), set(by_name), "every registered workload needs bounded instrumentation sizes")
         self.assertEqual(sizes['volatile_reduce'], '-DVOLATILE_REDUCE_TRIPS=4096')
+        self.assertEqual(sizes['hot_web_loop'], '-DHOT_WEB_TRIPS=4096')
+        self.assertEqual(sizes['llvm_batch6_scalar'], '-DBATCH6_SCALAR_TRIPS=1024')
         self.assertEqual(corpus.workload_flags(by_name['linux_find_bit_scaled'], sizes['linux_find_bit_scaled']), ['-DPASSES=128'])
         flags = corpus.workload_flags(by_name['lz4_match_extend'], sizes['lz4_match_extend'])
         self.assertEqual(flags.count('-DMATCH_RICH=1'), 1)
