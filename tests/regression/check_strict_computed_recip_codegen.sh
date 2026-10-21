@@ -52,7 +52,7 @@ if "vcvtdq2pd" not in packed or "vdivpd" not in packed or "vmulpd" not in packed
 # The four i32 lanes are built entirely with VEX. Legacy movd/pinsrd
 # between VEX-256 instructions was correct but ~28x slower on the measured
 # Xeon VM; the optional final peephole is not an authority for this contract.
-for name, text in (("normal", v3), ("default V3 permission", default), ("no final VEX promotion", no_promote),
+for name, text in (("normal", v3), ("no final VEX promotion", no_promote),
                    ("no XMM register allocation", stack)):
     pack_body = body(text, "ordered_recip_sum")
     pack = re.search(r"(?s)\bvmovd %\w+, %xmm0\n(.*?)\bvcvtdq2pd %xmm0, %ymm0", pack_body)
@@ -65,7 +65,8 @@ if len(adds) < 4:
     raise SystemExit("v3 strict reciprocal loop lost ordered scalar lane adds")
 if "vaddpd" in packed:
     raise SystemExit("strict reciprocal loop formed a reassociated packed add")
-for name, text in (("baseline", baseline), ("AVX2 denial", no_avx2), ("AVX-only", avx_only), ("AVX2 without SSE4.1", no_sse41)):
+for name, text in (("baseline", baseline), ("default (plain x86-64)", default), ("AVX2 denial", no_avx2),
+                   ("AVX-only", avx_only), ("AVX2 without SSE4.1", no_sse41)):
     if any(op in text for op in ("vcvtdq2pd", "vdivpd", "vmulpd")):
         raise SystemExit(f"strict reciprocal lowering escaped its AVX2+SSE4.1 gate ({name})")
 
