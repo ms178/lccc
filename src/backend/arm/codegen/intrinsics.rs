@@ -156,24 +156,18 @@ impl ArmCodegen {
     ///
     /// A constant 0 offset keeps the fast path (base register used as-is).
     fn vec_addr_from_args(&mut self, base: &Operand, offset: Option<&Operand>) -> String {
-        use crate::ir::reexports::IrConst;
-        let zero_off = match offset {
-            None => true,
-            Some(Operand::Const(c)) => c.to_i64() == Some(0),
-            _ => false,
-        };
         let base_phys = self.operand_reg(base).filter(|r| !is_arm_fp_phys(*r));
-        if zero_off {
+        let Some(off) = offset.filter(|o| !matches!(o, Operand::Const(c) if c.to_i64() == Some(0)))
+        else {
             if let Some(r) = base_phys {
                 return callee_saved_name(r).to_string();
             }
             self.operand_to_x0(base);
             self.state.emit("    mov x10, x0");
             return "x10".to_string();
-        }
+        };
         // Non-zero offset: x10 = base + offset. x10 is the designated
         // scratch for address formation in this backend (never allocated).
-        let off = offset.expect("checked above");
         match (
             base_phys,
             self.operand_reg(off).filter(|r| !is_arm_fp_phys(*r)),
@@ -453,30 +447,18 @@ impl ArmCodegen {
                     self.store_float_reg(d, IrType::F32, "s0");
                 }
             }
-            IntrinsicOp::FmaScalarF64Signed(np, na) => {
+            IntrinsicOp::FmaScalarF64Signed(np, na) | IntrinsicOp::FmaScalarF32Signed(np, na) => {
                 // fma(-a, b, -c) & friends after the IR negation peel: the
                 // shared signed hook owns the AArch64 family table (note the
                 // ISA quirk: `sub` negates the PRODUCT, `n` the ADDEND).
-                self.emit_fused_fma_signed_impl(
-                    &args[0],
-                    &args[1],
-                    &args[2],
-                    &dest.unwrap(),
-                    IrType::F64,
-                    *np,
-                    *na,
-                );
-            }
-            IntrinsicOp::FmaScalarF32Signed(np, na) => {
-                self.emit_fused_fma_signed_impl(
-                    &args[0],
-                    &args[1],
-                    &args[2],
-                    &dest.unwrap(),
-                    IrType::F32,
-                    *np,
-                    *na,
-                );
+                if let Some(d) = dest {
+                    let ty = if matches!(op, IntrinsicOp::FmaScalarF64Signed(..)) {
+                        IrType::F64
+                    } else {
+                        IrType::F32
+                    };
+                    self.emit_fused_fma_signed_impl(&args[0], &args[1], &args[2], &d, ty, *np, *na);
+                }
             }
             IntrinsicOp::CopysignF64 => {
                 // result = |x| with y's sign bit: pure integer bit ops on
@@ -999,12 +981,11 @@ impl ArmCodegen {
             | IntrinsicOp::VecStoreI32x4
             | IntrinsicOp::VecStoreI64x2 => {
                 // Store one 128-bit vector to dest_ptr.
-                if dest_ptr.is_some() {
+                if let &Some(ptr) = dest_ptr {
                     let src = self.load_vector_value_128(&args[0], "q0");
                     let addr = if args.len() >= 3 {
                         self.vec_addr_from_args(&args[1], args.get(2))
                     } else {
-                        let ptr = dest_ptr.unwrap();
                         let base_phys = self
                             .operand_reg(&Operand::Value(ptr))
                             .filter(|r| !is_arm_fp_phys(*r));

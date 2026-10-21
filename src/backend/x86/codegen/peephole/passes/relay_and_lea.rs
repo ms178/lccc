@@ -7198,7 +7198,7 @@ mod tests {
 #[cfg(test)]
 mod rmw_window_tests {
     /// Run the pass alone over `body`; return the emitted program (every
-    /// non-NOP line, trimmed) and whether any line was removed.
+    /// non-NOP line, trimmed) and how many lines were removed.
     fn run(body: &str) -> (Vec<String>, usize) {
         let asm = format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
         let mut store = super::LineStore::new(asm);
@@ -7242,6 +7242,32 @@ mod rmw_window_tests {
             "the producer and its RMW must move to the copy destination and the copy must go"
         );
         assert_eq!(removed, 1, "exactly the copy must be removed");
+
+        // Two-RMW window (`MAX_RMWS = 2`) also retargets both RMWs and drops the copy.
+        let (emitted2, removed2) = run(concat!(
+            "    movl (%rdi), %r9d\n",
+            "    addl $1, %r9d\n",
+            "    xorl $3, %r9d\n",
+            "    movl %r9d, %r10d\n",
+            "    movl %r10d, (%rsi)\n",
+            "    ret",
+        ));
+        assert_eq!(
+            emitted2,
+            vec![
+                ".text",
+                "f:",
+                ".cfi_startproc",
+                "movl (%rdi), %r10d",
+                "addl $1, %r10d",
+                "xorl $3, %r10d",
+                "movl %r10d, (%rsi)",
+                "ret",
+                ".cfi_endproc",
+            ],
+            "both RMWs in the 2-RMW window must retarget onto %r10d"
+        );
+        assert_eq!(removed2, 1, "exactly the copy must be removed");
     }
 
     #[test]
@@ -7271,5 +7297,32 @@ mod rmw_window_tests {
             "a width-mismatched RMW chain must leave every line in place"
         );
         assert_eq!(removed, 0, "nothing may be removed when the rule refuses");
+
+        // RMW reading the copy destination family (`%r10d`) must also refuse,
+        // otherwise retargeting the load into `%r10d` would clobber `%r10d`
+        // before `addl %r10d, %r9d` reads it.
+        let (emitted_alias, removed_alias) = run(concat!(
+            "    movl (%rdi), %r9d\n",
+            "    addl %r10d, %r9d\n",
+            "    movl %r9d, %r10d\n",
+            "    movl %r10d, (%rsi)\n",
+            "    ret",
+        ));
+        assert_eq!(
+            emitted_alias,
+            vec![
+                ".text",
+                "f:",
+                ".cfi_startproc",
+                "movl (%rdi), %r9d",
+                "addl %r10d, %r9d",
+                "movl %r9d, %r10d",
+                "movl %r10d, (%rsi)",
+                "ret",
+                ".cfi_endproc",
+            ],
+            "an RMW reading the copy destination family must leave every line in place"
+        );
+        assert_eq!(removed_alias, 0);
     }
 }

@@ -1694,15 +1694,22 @@ fn find_derived_exprs(
                     };
                     if let Some(idx) = find_iv(v.0) {
                         (*dest, *ty, idx, 1i64 << shift, 0)
-                    } else if let Some((idx, k)) = find_affine(v.0, *ty) {
-                        // `x << k` and `x * 2^k` are the SAME value shape, so
-                        // the affine arm here must stay identical to the
-                        // Mul-by-constant arm above. Gating it on a
-                        // target-specific compare-recurrence knob silently
-                        // deleted affine-shift recognition on every non-x86
-                        // target (the knob defaults to false and is only
-                        // enabled for x86-64); a value-shape question must
-                        // never be answered by a codegen policy switch.
+                    } else if (shift > 3 || !gep_uses_by_index.contains_key(&dest.0))
+                        && let Some((idx, k)) = find_affine(v.0, *ty)
+                    {
+                        // Hardware scaled-index addressing folds `shift <= 3`
+                        // (`stride` in {1, 2, 4, 8}) directly into the memory
+                        // instruction (`[xB, xI, lsl #1..3]` on AArch64, SIB on
+                        // x86), matching the `Add(v, v)` (`stride == 2`) arm
+                        // below which likewise omits `find_affine`. Rewriting a
+                        // `shift <= 3` affine GEP offset such as `a[i + 1]` in
+                        // `tests/regression/decimal32_indexed_fold_arm.c` into
+                        // a constant-offset sibling GEP breaks indexed-store
+                        // folding across calls (`str w0, [x23, x19, lsl #2]`).
+                        // Shifts beyond hardware index scale (`shift > 3`,
+                        // `stride >= 16`) and non-GEP scalar shifts (such as
+                        // `((i + 1) << k) >= limit` in `search_scaled_bound_wrap.c`)
+                        // are recognized on every target.
                         (*dest, *ty, idx, 1i64 << shift, k)
                     } else {
                         continue;
@@ -5989,5 +5996,120 @@ mod dominance_snapshot_contract {
         f.blocks[0].terminator = Terminator::Return(None);
         f.blocks.push(f.blocks[1].clone());
         assert!(!ivsr_cfg_unchanged(&f, &cfg));
+    }
+
+    #[test]
+    fn affine_shift_recognizes_scalar_and_wide_gep_while_preserving_sib_gep() {
+        use crate::ir::reexports::IrCmpOp;
+        // Disable `compare_recurrence` to prove that `find_derived_exprs` does
+        // not depend on any target-specific compare-recurrence switch.
+        super::set_compare_recurrence_enabled(false);
+
+        let build_loop = |shift: i64, use_as_gep: bool| -> IrFunction {
+            let mut f = IrFunction::new("affine_shl".into(), IrType::U64, vec![], false);
+            // B0 preheader
+            f.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "arr".into(),
+                }],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: vec![],
+            });
+            // B1 header: i = phi(0, i_next); i_next = i + 1; off = i_next << shift
+            let consumer = if use_as_gep {
+                Instruction::GetElementPtr {
+                    dest: Value(4),
+                    base: Value(0),
+                    offset: Operand::Value(Value(3)),
+                    ty: IrType::I8,
+                }
+            } else {
+                Instruction::Cmp {
+                    dest: Value(4),
+                    op: IrCmpOp::Ult,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I64(1024)),
+                    ty: IrType::U64,
+                }
+            };
+            f.blocks.push(BasicBlock {
+                label: BlockId(1),
+                instructions: vec![
+                    Instruction::Phi {
+                        dest: Value(1),
+                        ty: IrType::U64,
+                        incoming: vec![
+                            (Operand::Const(IrConst::I64(0)), BlockId(0)),
+                            (Operand::Value(Value(2)), BlockId(1)),
+                        ],
+                    },
+                    Instruction::BinOp {
+                        dest: Value(2),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::I64(1)),
+                        ty: IrType::U64,
+                    },
+                    Instruction::BinOp {
+                        dest: Value(3),
+                        op: IrBinOp::Shl,
+                        lhs: Operand::Value(Value(2)),
+                        rhs: Operand::Const(IrConst::I64(shift)),
+                        ty: IrType::U64,
+                    },
+                    consumer,
+                    Instruction::Cmp {
+                        dest: Value(5),
+                        op: IrCmpOp::Ult,
+                        lhs: Operand::Value(Value(2)),
+                        rhs: Operand::Const(IrConst::I64(64)),
+                        ty: IrType::U64,
+                    },
+                ],
+                terminator: Terminator::CondBranch {
+                    cond: Operand::Value(Value(5)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+                source_spans: vec![],
+            });
+            f.blocks.push(BasicBlock {
+                label: BlockId(2),
+                instructions: vec![],
+                terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+                source_spans: vec![],
+            });
+            f.next_value_id = 6;
+            f
+        };
+
+        let inspect = |f: &IrFunction| -> Vec<(i64, i64)> {
+            let cfg = analysis::CfgAnalysis::build(f);
+            let loops = loop_analysis::find_natural_loops(
+                cfg.num_blocks,
+                &cfg.preds,
+                &cfg.succs,
+                &cfg.idom,
+            );
+            let lp = &loops[0];
+            let back = vec![1usize];
+            let ivs = find_basic_ivs(f, lp.header, &lp.body, 0, &back);
+            find_derived_exprs(f, &ivs, &lp.body, false, lp, &back)
+                .into_iter()
+                .map(|d| (d.stride, d.add_offset))
+                .collect()
+        };
+
+        // 1. Non-GEP scalar shift `(i + 1) << 2` is recognized at shift <= 3
+        //    even with `compare_recurrence` disabled.
+        assert_eq!(inspect(&build_loop(2, false)), vec![(4, 1)]);
+        // 2. Wide GEP shift `(i + 1) << 4` (stride 16, beyond hardware SIB/lsl
+        //    scale) is recognized for GEP uses across all targets.
+        assert_eq!(inspect(&build_loop(4, true)), vec![(16, 1)]);
+        // 3. Hardware scaled-index GEP shift `(i + 1) << 2` (stride 4) is left
+        //    for backend indexed folding (`[xB, xI, lsl #2]` / SIB).
+        assert!(inspect(&build_loop(2, true)).is_empty());
     }
 }

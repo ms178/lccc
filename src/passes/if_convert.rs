@@ -1717,13 +1717,9 @@ fn apply_shared_arm_dup(func: &mut IrFunction, plan: &SharedArmDup) -> bool {
 
     // Extend M's phis: the S'-edge carries the S-edge's value, with values
     // internal to S mapped to the clone's dests.
-    if let Terminator::Branch(m_label) = s_term {
-        let m_idx = func
-            .blocks
-            .iter()
-            .position(|b| b.label == m_label)
-            .expect("merge block exists");
-        let m_block = &mut func.blocks[m_idx];
+    if let Terminator::Branch(m_label) = s_term
+        && let Some(m_block) = func.blocks.iter_mut().find(|b| b.label == m_label)
+    {
         for inst in &mut m_block.instructions {
             if let Instruction::Phi { incoming, .. } = inst {
                 if let Some(pos) = incoming.iter().position(|(_, l)| *l == s_label) {

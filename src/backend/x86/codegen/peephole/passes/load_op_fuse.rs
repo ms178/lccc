@@ -878,123 +878,112 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
         }
 
         // ── copy-bridged commutative form: mov %T, %B ... OP %C, %B ────────
-        if let Some(span_end) = try_fuse_copy_bridged_load(
-            store, infos, &mut lv, i, j, len, &cons, mem, load_q, t_fam, addr,
-        ) {
-            changed = true;
-            i = span_end + 1;
+        let Some((copy_q, csrc, b_fam)) = parse_reg_copy(&cons) else {
+            i += 1;
+            continue;
+        };
+        // A movl copy of a movq load would truncate; a movq copy of a movl
+        // load is the zero-extension the load already performed.
+        if csrc != t_fam || b_fam == t_fam || (load_q && !copy_q) {
+            i += 1;
             continue;
         }
-        i += 1;
+        let b_bit = 1u16 << b_fam;
+        // Find the consumer of B: first line mentioning B after the copy.
+        let mut k = next_insn(store, infos, j + 1, len);
+        let mut op_line = None;
+        let mut gap2 = 0usize;
+        while k < len {
+            let info = &infos[k];
+            if !is_window_kind(info.kind) || info.pinned {
+                break;
+            }
+            if info.reg_refs & b_bit != 0 {
+                op_line = Some(k);
+                break;
+            }
+            if info.reg_refs & t_bit != 0 {
+                break;
+            }
+            let t = info.trimmed(store.get(k));
+            if accesses_memory(t, info) {
+                break;
+            }
+            let wr = may_write_families(t, info);
+            if wr == ALL_GPR || wr & (t_bit | b_bit | addr) != 0 {
+                break;
+            }
+            gap2 += 1;
+            if gap2 > MAX_GAP {
+                break;
+            }
+            k = next_insn(store, infos, k + 1, len);
+        }
+        let Some(k) = op_line else {
+            i += 1;
+            continue;
+        };
+        // The copy-bridged form moves the load's memory operand to a LATER
+        // line, so the same distance argument as the direct form applies (see
+        // the segmented-operand guard above): with any instruction between the
+        // copy and the op, that instruction could rebase the segment.  The
+        // copy itself is a validated register-to-register mov and cannot.
+        if gap2 != 0 && super::relay_and_lea::segment_prefix_len(mem).is_some() {
+            i += 1;
+            continue;
+        }
+        let op_text = infos[k].trimmed(store.get(k)).to_string();
+        let Some((op, op_q, c_fam, dst)) = parse_reg_reg_alu(&op_text) else {
+            i += 1;
+            continue;
+        };
+        if op_q != load_q
+            || dst != b_fam
+            || c_fam == b_fam
+            || c_fam == t_fam
+            || !COMMUTATIVE_OPS.contains(&op)
+            // The replacement is TWO instructions: `mov C, B` (at j) followed
+            // by `op mem, B` (at k), and the folded memory operand's address
+            // is evaluated at k. If B is one of the address families the copy
+            // writes an address input BEFORE the op reads it (e.g. an index
+            // `(base,%rdx,4)` with B=%rdx staged by `mov %r11d, %edx`) — a
+            // miscompile. Bail: the copy-bridged shape stays untouched.
+            || (b_bit & addr) != 0
+        {
+            i += 1;
+            continue;
+        }
+        // C must hold the same value at the copy as at the op (nothing in
+        // (j, k) writes it), and T must be dead once the copy is gone.
+        let Some(w2) = scan_window(store, infos, j, k) else {
+            i += 1;
+            continue;
+        };
+        let c_bit = 1u16 << c_fam;
+        if w2.written & (c_bit | b_bit | t_bit | addr) != 0 || w2.mentioned & (t_bit | b_bit) != 0 {
+            i += 1;
+            continue;
+        }
+        if lv.live_after(j, t_fam) != Some(false) {
+            i += 1;
+            continue;
+        }
+        let copy_line = format!(
+            "    mov{suffix} {}, {}",
+            REG_NAMES[width][c_fam as usize], REG_NAMES[width][b_fam as usize]
+        );
+        let op_new = format!(
+            "    {op}{suffix} {mem}, {}",
+            REG_NAMES[width][b_fam as usize]
+        );
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, copy_line);
+        replace_line(store, &mut infos[k], k, op_new);
+        lv.refresh_span(store, infos, i, k);
+        changed = true;
+        i = k + 1;
     }
     changed
-}
-
-/// Fuse copy-bridged commutative load `mov MEM, %T ... mov %T, %B ... OP %C, %B`
-/// into `mov %C, %B; OP MEM, %B`, returning `Some(k)` on rewrite.
-#[allow(clippy::too_many_arguments)]
-fn try_fuse_copy_bridged_load(
-    store: &mut LineStore,
-    infos: &mut [LineInfo],
-    lv: &mut FileLiveness,
-    i: usize,
-    j: usize,
-    len: usize,
-    cons: &str,
-    mem: &str,
-    load_q: bool,
-    t_fam: RegId,
-    addr: u16,
-) -> Option<usize> {
-    let (copy_q, csrc, b_fam) = parse_reg_copy(cons)?;
-    // A movl copy of a movq load would truncate; a movq copy of a movl
-    // load is the zero-extension the load already performed.
-    if csrc != t_fam || b_fam == t_fam || (load_q && !copy_q) {
-        return None;
-    }
-    let t_bit = 1u16 << t_fam;
-    let b_bit = 1u16 << b_fam;
-    // Find the consumer of B: first line mentioning B after the copy.
-    let mut k = next_insn(store, infos, j + 1, len);
-    let mut op_line = None;
-    let mut gap2 = 0usize;
-    while k < len {
-        let info = &infos[k];
-        if !is_window_kind(info.kind) || info.pinned {
-            break;
-        }
-        if info.reg_refs & b_bit != 0 {
-            op_line = Some(k);
-            break;
-        }
-        if info.reg_refs & t_bit != 0 {
-            break;
-        }
-        let t = info.trimmed(store.get(k));
-        if accesses_memory(t, info) {
-            break;
-        }
-        let wr = may_write_families(t, info);
-        if wr == ALL_GPR || wr & (t_bit | b_bit | addr) != 0 {
-            break;
-        }
-        gap2 += 1;
-        if gap2 > MAX_GAP {
-            break;
-        }
-        k = next_insn(store, infos, k + 1, len);
-    }
-    let k = op_line?;
-    // The copy-bridged form moves the load's memory operand to a LATER
-    // line, so the same distance argument as the direct form applies (see
-    // the segmented-operand guard above): with any instruction between the
-    // copy and the op, that instruction could rebase the segment.  The
-    // copy itself is a validated register-to-register mov and cannot.
-    if gap2 != 0 && super::relay_and_lea::segment_prefix_len(mem).is_some() {
-        return None;
-    }
-    let op_text = infos[k].trimmed(store.get(k)).to_string();
-    let (op, op_q, c_fam, dst) = parse_reg_reg_alu(&op_text)?;
-    if op_q != load_q
-        || dst != b_fam
-        || c_fam == b_fam
-        || c_fam == t_fam
-        || !COMMUTATIVE_OPS.contains(&op)
-        // The replacement is TWO instructions: `mov C, B` (at j) followed
-        // by `op mem, B` (at k), and the folded memory operand's address
-        // is evaluated at k. If B is one of the address families the copy
-        // writes an address input BEFORE the op reads it (e.g. an index
-        // `(base,%rdx,4)` with B=%rdx staged by `mov %r11d, %edx`) — a
-        // miscompile. Bail: the copy-bridged shape stays untouched.
-        || (b_bit & addr) != 0
-    {
-        return None;
-    }
-    // C must hold the same value at the copy as at the op (nothing in
-    // (j, k) writes it), and T must be dead once the copy is gone.
-    let w2 = scan_window(store, infos, j, k)?;
-    let c_bit = 1u16 << c_fam;
-    if w2.written & (c_bit | b_bit | t_bit | addr) != 0 || w2.mentioned & (t_bit | b_bit) != 0 {
-        return None;
-    }
-    if lv.live_after(j, t_fam) != Some(false) {
-        return None;
-    }
-    let suffix = if load_q { "q" } else { "l" };
-    let width = if load_q { 0 } else { 1 };
-    let copy_line = format!(
-        "    mov{suffix} {}, {}",
-        REG_NAMES[width][c_fam as usize], REG_NAMES[width][b_fam as usize]
-    );
-    let op_new = format!(
-        "    {op}{suffix} {mem}, {}",
-        REG_NAMES[width][b_fam as usize]
-    );
-    mark_nop(&mut infos[i]);
-    replace_line(store, &mut infos[j], j, copy_line);
-    replace_line(store, &mut infos[k], k, op_new);
-    lv.refresh_span(store, infos, i, k);
-    Some(k)
 }
 
 // ── in-place recurrence update ───────────────────────────────────────────────
