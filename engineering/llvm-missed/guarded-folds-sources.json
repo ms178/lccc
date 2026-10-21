@@ -1,0 +1,160 @@
+{
+  "retrieved_at_utc": "2026-10-21T11:55:50.189029+00:00",
+  "method": "GitHub REST API issue bodies and comments; saved byte hashes identify the reviewed records, not upstream correctness or closure",
+  "reports": [
+    {
+      "number": 1884,
+      "title": "sse code spiller suboptimality (only 2 registers used for 280 instructions)",
+      "url": "https://github.com/llvm/llvm-project/issues/1884",
+      "upstream_state": "open",
+      "updated_at": "2026-09-01T18:05:28Z",
+      "body_sha256": "a78b74738e50503bc0d72b9eff49dd7e1cfe1bad9c5cf0ba56ac0ed5d0de13d1",
+      "comments_sha256": "da0f7390c4bf6442bff25269463d51cf48aa09e788d6ca655696481995c27932",
+      "comment_count": 21,
+      "issue_json_sha256": "dc0d6254443db916cb9483407929d7ffd02af5c003d63520e7d03eca5dbe0370"
+    },
+    {
+      "number": 3007,
+      "title": "x86 codegen for long AddRec expansion could be improved",
+      "url": "https://github.com/llvm/llvm-project/issues/3007",
+      "upstream_state": "open",
+      "updated_at": "2026-07-09T06:50:34Z",
+      "body_sha256": "0be3abda5b7e96e447f4321811caa9ff3ae642c6642b1024f987f61c81b40833",
+      "comments_sha256": "e5ace447dfd2e1b99c86452f78644596417ff670ee36337cb79a3aedfd9e83a5",
+      "comment_count": 5,
+      "issue_json_sha256": "89be4f54f6a4ca7c4c734e3d1e460adc8422e81948c53e6ab487cf74cd088244"
+    },
+    {
+      "number": 6509,
+      "title": "unnecessary moves between XMM and general registers by x86 back end",
+      "url": "https://github.com/llvm/llvm-project/issues/6509",
+      "upstream_state": "closed",
+      "updated_at": "2026-09-02T13:01:55Z",
+      "body_sha256": "fe7f669ff33e61f7038cd68f6d87a1671243713ce53a20b5829eed09bd08e026",
+      "comments_sha256": "56257d95b1a6afe1b00d0238ba714b2e1b834e55d21b0f39abbf3282000c350a",
+      "comment_count": 12,
+      "issue_json_sha256": "00f7f2a08ddb181abe018f716850de595bdf3120c8d6ed7c6ee04c41fe9c41b2"
+    },
+    {
+      "number": 10156,
+      "title": "[x86 code size] Inefficient encoding of cmp/test with immediate argument and dead register",
+      "url": "https://github.com/llvm/llvm-project/issues/10156",
+      "upstream_state": "open",
+      "updated_at": "2022-11-05T09:03:44Z",
+      "body_sha256": "4fa2f6af84d4d545d2a74351b9f178c2c24e4176f70707910b3a8b3e85f24c4f",
+      "comments_sha256": "42addeac7f6d055a5716a547e03ebf4c1e0d90f8eb2565053e3a1a229e00b261",
+      "comment_count": 6,
+      "issue_json_sha256": "58d8b763588d93233dae36c034324f599f9ca2b6976685b2649bd892bba94474"
+    },
+    {
+      "number": 12193,
+      "title": "missed load widening opportunity",
+      "url": "https://github.com/llvm/llvm-project/issues/12193",
+      "upstream_state": "open",
+      "updated_at": "2025-09-21T07:56:54Z",
+      "body_sha256": "8094f713b741950052127a17df7c97d76aa0178f423aa4f830a56751944109e9",
+      "comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "comment_count": 0,
+      "issue_json_sha256": "afd23ab75bcffb49dc8f8949a6651ed6fcdc0a8cd91dafd1ec8f2fedc747cced"
+    },
+    {
+      "number": 13134,
+      "title": "missed bswap.",
+      "url": "https://github.com/llvm/llvm-project/issues/13134",
+      "upstream_state": "open",
+      "updated_at": "2022-11-05T09:11:57Z",
+      "body_sha256": "83cdcd515373b886d9ea5b13a6b0e24285e21e99013b8b8ba3029e2a9b2af358",
+      "comments_sha256": "d5769ed58e06204eec3c991970066c360bb31b69aff0b97dd344bc9e1c8a780d",
+      "comment_count": 2,
+      "issue_json_sha256": "5c6e16c15f1985bf4a89cd95fb415a05570e85bbfee9bd3b8ca2bb39d0e8e812"
+    },
+    {
+      "number": 13687,
+      "title": "gcc tail merges cases that llvm doesn't",
+      "url": "https://github.com/llvm/llvm-project/issues/13687",
+      "upstream_state": "open",
+      "updated_at": "2023-11-03T11:57:51Z",
+      "body_sha256": "960dc5fcf133be35702540e2bc912b62f0fcd198e3b05d06b46457aa7dc5293f",
+      "comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "comment_count": 0,
+      "issue_json_sha256": "1cfee16c0b9a3add98bf536168dac1506d6031149ef0d00c03d772431806e640"
+    },
+    {
+      "number": 7145,
+      "title": "[instcombine, sha] Add Instruction Fold for Masked Merge",
+      "url": "https://github.com/llvm/llvm-project/issues/7145",
+      "upstream_state": "open",
+      "updated_at": "2024-11-26T23:02:49Z",
+      "body_sha256": "4e6728d1f90d9e541a34078f84ba64dcbe168a25fcba227e95eae98e66eaeccd",
+      "comments_sha256": "0562b08ff37030782296a19f116a7e18dd6733e16b708b4a3c484d0e9aad7a88",
+      "comment_count": 25,
+      "issue_json_sha256": "6f7e8396013ae2be691d35893e95898077c72e29d92c2cbe47adcbf4723e6cb2"
+    },
+    {
+      "number": 212139,
+      "title": "[InstCombine] failed to recognize branchless conditional negate to abs",
+      "url": "https://github.com/llvm/llvm-project/issues/212139",
+      "upstream_state": "closed",
+      "updated_at": "2026-09-18T05:57:12Z",
+      "body_sha256": "4d5ea6fa5e139d76e5d34f0836cd5b2929d78714b1c21383b7f84dd325b7306d",
+      "comments_sha256": "1618bb64929c06a664bf9c651785fdb0407ed1230ba775eeaafb2b7d84d33f16",
+      "comment_count": 6,
+      "issue_json_sha256": "92fd480ccf8ef82f60941a7add267a2388ddb08f4f590190980f3618f009ba94"
+    },
+    {
+      "number": 33226,
+      "title": "[X86] Missed optimizations for comparison of shift against zero",
+      "url": "https://github.com/llvm/llvm-project/issues/33226",
+      "upstream_state": "open",
+      "updated_at": "2025-11-21T18:13:35Z",
+      "body_sha256": "acc4144911412101f7fcdd78b9c416a16978402b62be04a598e5d7fc08e0057e",
+      "comments_sha256": "6c8ea252c47e01351c690dab2ac524e85e2c04c629e48b7dc81e3ae4ad165623",
+      "comment_count": 11,
+      "issue_json_sha256": "57033e2394d6ed7cc10d80b9e44062f6c9b99ae172d344ca537d37a9ca60f38a"
+    },
+    {
+      "number": 46623,
+      "title": "Missed elimination of comparison with zero",
+      "url": "https://github.com/llvm/llvm-project/issues/46623",
+      "upstream_state": "closed",
+      "updated_at": "2026-07-16T15:16:53Z",
+      "body_sha256": "71a9dc57d935f5770c8aff6f431ef17b011580a4d174dc0c3361a8560c50937f",
+      "comments_sha256": "16b6efd524747af8b85e463a723520a1016fb81512330cf24855a56f7a4b598f",
+      "comment_count": 4,
+      "issue_json_sha256": "f77f6a53b297cba37f5ee5b77a3fd4c9f76e66938e133179c0a69a1cff4a4572"
+    },
+    {
+      "number": 233455,
+      "title": "[X86] Unnecessary `mov al, 123; movzx eax, al` for `123 / int8`",
+      "url": "https://github.com/llvm/llvm-project/issues/233455",
+      "upstream_state": "open",
+      "updated_at": "2026-10-19T18:02:27Z",
+      "body_sha256": "9c23c3d2d7e5460bc90588c19628ce688194014a36cfaeb473ff805436d5f3c4",
+      "comments_sha256": "578ae99581fe427eb1e7598384a75d3877c864af630d117e77578d9caf1b8674",
+      "comment_count": 2,
+      "issue_json_sha256": "eeb014ad6818bd13af59b0e36feff2800eaef35d5c81988baf75a87566651410"
+    },
+    {
+      "number": 233785,
+      "title": "[InstCombine] Missed simplification of comparisons of PHIs with conditional predecessors",
+      "url": "https://github.com/llvm/llvm-project/issues/233785",
+      "upstream_state": "open",
+      "updated_at": "2026-10-20T12:19:01Z",
+      "body_sha256": "f7099b2d36ac83e4f1c4df86b68d0501abe5dc7a79791d64d5983aeca20d1bde",
+      "comments_sha256": "50ace099c0ed3c8654185f3649dde9af327f4540146ffe3924f164e5c5f9c271",
+      "comment_count": 1,
+      "issue_json_sha256": "dc7854ce4da20836aafbdd15fdc8ab5bfb41374ef5ed53a8a77c88e26665ebbd"
+    },
+    {
+      "number": 230039,
+      "title": "[lld][ELF] --icf: fold functions whose exception tables are also identical",
+      "url": "https://github.com/llvm/llvm-project/issues/230039",
+      "upstream_state": "open",
+      "updated_at": "2026-10-08T09:12:47Z",
+      "body_sha256": "74d03b9fcc70c9df99da4208a741843c4c59ac129d7e811897d78568171668a2",
+      "comments_sha256": "8dab85a76fe54542930975507e9eef03d6f27769a7cb4c22017ad4fef2d6279c",
+      "comment_count": 1,
+      "issue_json_sha256": "e5cf24e62af7f76bde17717351873a290b3cf152858bdcbf7cdb7c5c221b0f87"
+    }
+  ]
+}

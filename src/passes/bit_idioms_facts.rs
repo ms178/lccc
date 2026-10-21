@@ -1,4 +1,4 @@
-//! Bounded scalar reductions distilled from the batch-six LLVM cohort.
+//! Bounded scalar reductions distilled from the scalar facts LLVM cohort.
 //! All edits replace a consumer with an equivalent pure expression. Producers,
 //! memory operations and shared users are untouched; no LLVM poison/no-wrap
 //! flags are assumed. This runs inside the existing bit_idioms policy.
@@ -347,6 +347,9 @@ fn fold(
     fresh: Value,
 ) -> Option<Vec<Instruction>> {
     cx.visits.set(512);
+    if let Some(replacement) = followups::fold(inst, cx, facts, fresh) {
+        return Some(replacement);
+    }
     let dest = inst.dest()?;
     if let Instruction::Select {
         cond,
@@ -834,9 +837,12 @@ pub(super) fn run(func: &mut IrFunction) -> usize {
         b.instructions.splice(ii..=ii, replacement);
     }
     func.next_value_id = next;
-    changes
+    changes + followups::cfg(func)
 }
 
 #[cfg(test)]
-#[path = "bit_idioms_batch6_tests.rs"]
+#[path = "bit_idioms_facts_tests.rs"]
 mod tests;
+
+#[path = "bit_idioms_guards.rs"]
+mod followups;

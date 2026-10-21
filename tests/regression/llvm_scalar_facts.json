@@ -1,89 +1,89 @@
 [
   {
-    "name": "b6_bits",
+    "name": "sf_bits",
     "upstream": 231586,
     "kind": "new-reduced-contract"
   },
   {
-    "name": "b6_sum",
+    "name": "sf_sum",
     "upstream": 231063,
     "kind": "new-reduced-contract"
   },
   {
-    "name": "b6_sub",
+    "name": "sf_sub",
     "upstream": 231063,
     "kind": "new-reduced-contract"
   },
   {
-    "name": "b6_range",
+    "name": "sf_range",
     "upstream": 230800,
     "kind": "new-reduced-contract"
   },
   {
-    "name": "b6_even",
+    "name": "sf_even",
     "upstream": 230800,
     "kind": "new-reduced-contract"
   },
   {
-    "name": "b6_shared",
+    "name": "sf_shared",
     "upstream": 230021,
     "kind": "new-reduced-contract"
   },
   {
-    "name": "b6_masked",
+    "name": "sf_masked",
     "upstream": 230021,
     "kind": "new-reduced-contract"
   },
   {
-    "name": "b6_select",
+    "name": "sf_select",
     "upstream": 229537,
     "kind": "new-reduced-contract"
   },
   {
-    "name": "b6_signed_select",
+    "name": "sf_signed_select",
     "upstream": 229537,
     "kind": "new-reduced-contract"
   },
   {
-    "name": "b6_inverse",
+    "name": "sf_inverse",
     "upstream": 229332,
     "kind": "already-handled"
   },
   {
-    "name": "b6_trip",
+    "name": "sf_trip",
     "upstream": 217230,
     "kind": "new-reduced-contract"
   },
   {
-    "name": "b6_guard",
+    "name": "sf_guard",
     "upstream": 214397,
     "kind": "new-reduced-contract"
   },
   {
-    "name": "b6_lowzero",
+    "name": "sf_lowzero",
     "upstream": 213708,
     "kind": "already-handled"
   },
   {
-    "name": "b6_lowone",
+    "name": "sf_lowone",
     "upstream": 213708,
     "kind": "new-reduced-contract"
   },
   {
-    "name": "b6_boolor",
+    "name": "sf_boolor",
     "upstream": 210131,
     "kind": "new-reduced-contract"
   },
   {
-    "name": "b6_trip_near",
+    "name": "sf_trip_near",
     "kind": "distinct-semantics-control"
   },
   {
-    "name": "b6_mask_near",
+    "name": "sf_mask_near",
     "kind": "distinct-semantics-control"
   },
   {
-    "name": "b6_select_near",
+    "name": "sf_select_near",
     "kind": "distinct-semantics-control"
   }
 ]

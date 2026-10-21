@@ -1,15 +1,15 @@
-# Batch 6: conditional scalar facts and x86-64 hot-web promotion
+# scalar facts: conditional scalar facts and x86-64 hot-web promotion
 
 ## Scope and sources
 
-This is the ten-report scalar cohort selected for batch 6, together with the
+This is the ten-report scalar cohort selected for scalar facts, together with the
 requested x86-64 hot-loop callee-saved-register mechanism. The baseline is the
 latest main after PR #887, `0c4f3929dd75354d80bae881b6d579e2426fe789`.
-The earlier batch-5 head `b215478` remains historical context, not the final
+The earlier hot kernels head `b215478` remains historical context, not the final
 comparison baseline.
 
 Bodies and comments were retrieved through the GitHub API. Exact upstream
-identities, timestamps and body/comment digests are in `batch-006-sources.json`.
+identities, timestamps and body/comment digests are in `scalar-facts-sources.json`.
 An upstream report is a source of a reduced contract, not an implementation
 specification or proof. None is marked globally solved by this batch.
 
@@ -33,7 +33,7 @@ controls and three distinct-semantics negative controls.
 
 ## Integration and proof boundaries
 
-`bit_idioms_batch6.rs` is a consumer-rewrite helper of the existing bit idiom
+`bit_idioms_facts.rs` is a consumer-rewrite helper of the existing bit idiom
 pass, not a new independently scheduled pass or environment authority. The
 existing `CCC_DISABLE_PASSES=bit_idioms` token covers both the pre-division and
 late entry points. No new environment reads are added.
@@ -141,7 +141,7 @@ values with rare-path reads, unsigned wraparound, zero/small/odd trips and a
 volatile memory-carried reference. The separate `hot_web_loop` benchmark times
 only the optimized recurrence, not that deliberately slow reference. It is a
 synthetic register-pressure witness, not an application-speed claim.
-The `llvm_batch6_scalar` benchmark separately calls the thirteen new scalar
+The `llvm_scalar_facts` benchmark separately calls the thirteen new scalar
 contracts with deterministic mixed boundary/random inputs and an observed
 checksum. It shares the exact native entry points rather than duplicating
 their implementations. Both new workloads have bounded instrumentation-size
@@ -161,9 +161,9 @@ RUSTFLAGS='-D warnings -C link-arg=-Wl,--no-keep-memory' \
   cargo test --profile fastbuild -j1
 RUSTFLAGS='-D warnings -C link-arg=-Wl,--no-keep-memory' \
   cargo clippy --profile fastbuild --all-targets -j1 -- -D warnings
-python3 tests/regression/check_llvm_missed_batch6.py \
+python3 tests/regression/check_llvm_scalar_facts.py \
   --gcc /path/to/gcc-16 --baseline /path/to/saved-b215478-lccc
-python3 scripts/prove_llvm_batch6.py --output proofs.json
+python3 scripts/prove_scalar_facts.py --output proofs.json
 CCC_VERIFY_IR=abort CCC_VERIFY_REGALLOC=1 \
   python3 tests/benchmark/run_benchmarks.py --compilers lccc,gcc \
   --gcc /path/to/gcc-16 --candidate before=/path/to/saved-b215478-lccc \
@@ -179,7 +179,7 @@ exhaustion. The native gate checks five optimization levels plus debug/wrapv,
 exact GCC16.2 output, disabled controls and per-function assembly mechanisms.
 It is wired to both hosted CI and the local gate mirror.
 
-`batch-006-proofs.json` contains **72 independent Z3 obligations: 58 algebraic
+`scalar-facts-proofs.json` contains **72 independent Z3 obligations: 58 algebraic
 laws and 14 expected counterexamples**, with no UNKNOWN accepted. Most laws use
 exact 8/16/32/64-bit vectors. The unsigned division law uses bounded mathematical
 integers with modular output instead of a divider circuit; this distinction is
@@ -187,7 +187,7 @@ recorded per row. This is not a proof of the Rust matcher or emitted machine
 code. Mutation/refusal tests and native differential execution remain separate.
 
 Final-source measurements and exact-source/binary provenance are in
-[BENCH-006.md](BENCH-006.md), with raw runtime, correctness and static-count
+[SCALAR-FACTS-BENCH.md](SCALAR-FACTS-BENCH.md), with raw runtime, correctness and static-count
 JSON companions. The 46 original workload binaries remain unchanged against
 latest main. The two synthetic witnesses improve by 7.60% and 4.50% in this VM;
 these are not application or EPYC results. Hosted status is recorded on PR #891;

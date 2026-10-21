@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch 3: native differential, IR verification, mechanism and exact disable token."""
+"""bit demand: native differential, IR verification, mechanism and exact disable token."""
 
 import argparse
 import json
@@ -10,7 +10,7 @@ import tempfile
 from check_llvm_missed_zero_choice import body, run
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "tests/regression/llvm_missed_batch3.c"
+SOURCE = ROOT / "tests/regression/llvm_bit_demand.c"
 
 
 def main():
@@ -33,7 +33,7 @@ def main():
         r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()
     ):
         raise ValueError("exact Clang 23.1.3 required")
-    for source in (SOURCE, SOURCE.with_name("llvm_missed_batch3_wide.c")):
+    for source in (SOURCE, SOURCE.with_name("llvm_bit_demand_wide.c")):
         check_source(args, source, cases)
 
 
@@ -147,7 +147,7 @@ def check_source(args, source, cases):
             if "old" in texts:
                 print(f"{opt} versus main: {counts}")
     print(
-        "PASS batch3: 60 witnesses, seven native modes, IR verification, exact policy controls"
+        "PASS bit-demand: 60 witnesses, seven native modes, IR verification, exact policy controls"
     )
 
 

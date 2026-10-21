@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch 1: native oracle + mechanism + disabled-policy + volatile condition."""
+"""zero-choice: native oracle + mechanism + disabled-policy + volatile condition."""
 
 import argparse
 import os

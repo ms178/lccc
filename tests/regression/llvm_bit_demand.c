@@ -123,4 +123,4 @@ if(pc_nor_plus_xor(x,y)!=(unsigned)(__builtin_popcount(~(x&y)))) {printf("FAIL p
 if(pc_partition_four(x,y)!=(unsigned)(32u)) {printf("FAIL pc_partition_four %u %u\n",x,y);return 1;}
 if(pc_partition_three(x,y)!=(unsigned)(__builtin_popcount(x|y))) {printf("FAIL pc_partition_three %u %u\n",x,y);return 1;}
 if(pc_absorption(x,y)!=(unsigned)(__builtin_popcount(x|y))) {printf("FAIL pc_absorption %u %u\n",x,y);return 1;}
-}puts("PASS batch3 integer demand and cardinality");return 0;}
+}puts("PASS bit-demand integer demand and cardinality");return 0;}

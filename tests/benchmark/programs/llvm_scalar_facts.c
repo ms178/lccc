@@ -1,7 +1,7 @@
 /* Synthetic throughput bundle, not a workload-speed claim. Keep the exact
  * noinline entry points shared with the native semantic/mechanism fixture. */
-#define BATCH6_BENCH 1
-#include "../../regression/llvm_missed_batch6.c"
+#define SCALAR_FACTS_BENCH 1
+#include "../../regression/llvm_scalar_facts.c"
 #include <stdio.h>
 
 #ifndef BATCH6_SCALAR_TRIPS
@@ -15,20 +15,20 @@ int main(void) {
         unsigned x = i % 4 == 0 ? 0 : i % 4 == 1 ? 1 :
                      i % 4 == 2 ? UINT32_MAX : (unsigned)state;
         unsigned y = (unsigned)(state >> 32), out;
-        sum += b6_bits(x,y);
-        sum += b6_sum(x,y,y);
-        sum += b6_sub(x,y);
-        sum += b6_range(x);
-        sum += b6_even(state);
-        sum += b6_shared(x,&out);
+        sum += sf_bits(x,y);
+        sum += sf_sum(x,y,y);
+        sum += sf_sub(x,y);
+        sum += sf_range(x);
+        sum += sf_even(state);
+        sum += sf_shared(x,&out);
         sum += out;
-        sum += b6_masked(x);
-        sum += b6_select(x,y);
-        sum += b6_signed_select((int)(x & 0x7fffffffu) - 0x40000000);
-        sum += b6_trip(state);
-        sum += b6_guard(x);
-        sum += b6_lowone(x);
-        sum += b6_boolor(state);
+        sum += sf_masked(x);
+        sum += sf_select(x,y);
+        sum += sf_signed_select((int)(x & 0x7fffffffu) - 0x40000000);
+        sum += sf_trip(state);
+        sum += sf_guard(x);
+        sum += sf_lowone(x);
+        sum += sf_boolor(state);
     }
     printf("%016llx\n", (unsigned long long)sum);
     return 0;

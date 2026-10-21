@@ -10,7 +10,7 @@ import tempfile
 from check_llvm_missed_zero_choice import run, body
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "tests/regression/llvm_missed_integer_batch.c"
+SOURCE = ROOT / "tests/regression/llvm_integer_observations.c"
 CASES = json.loads(SOURCE.with_suffix(".json").read_text())
 
 

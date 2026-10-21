@@ -1,4 +1,4 @@
-# Batch 5: cumulative PR #886 and recovered performance follow-ups
+# hot kernels: cumulative PR #886 and recovered performance follow-ups
 
 ## Find-bit and SHA follow-ups
 
@@ -95,13 +95,13 @@ GCC 16.2; Clang 23.1.3 and ICX 2026.2 are not installed locally. Standard
 harness commands use LCCC's default target and GCC's default ISA, so those
 GCC ratios **are not matched-ISA comparisons**. No aggregate speedup claim.
 
-All 46 workload outputs match GCC and batch 4 in the three-round broad screen.
+All 46 workload outputs match GCC and ordered arithmetic in the three-round broad screen.
 Only byte_load_reassembly, expat_siphash24, lz4_compress and lz4_match_extend
-executables differ from batch 4. Other 42 executables, including SHA, find-bit,
+executables differ from ordered arithmetic. Other 42 executables, including SHA, find-bit,
 switch and indirect dispatch, are byte-identical. Repeated 12-round screening
 rejects the initial apparent SipHash gain as noise:
 
-| Workload | Current / batch 4 paired median [bootstrap 95% CI] |
+| Workload | Current / ordered arithmetic paired median [bootstrap 95% CI] |
 |---|---|
 | byte_load_reassembly | 0.956 [0.941, 0.967] |
 | expat_siphash24 | 1.010 [0.940, 1.141] |
@@ -120,9 +120,9 @@ in shuffled order (Python Random seed 5), 12 rounds, discard the first two
 warmups, keep all remaining samples. All six outputs match. `byte-long.json`
 contains every retained wall-time sample and output; same-round paired ratios:
 
-| Configuration | Median seconds | Ratio to batch 4 [95% bootstrap CI] |
+| Configuration | Median seconds | Ratio to ordered arithmetic [95% bootstrap CI] |
 |---|---:|---:|
-| batch 4 | 0.39468 | 1.000 |
+| ordered arithmetic | 0.39468 | 1.000 |
 | both additions | 0.37006 | 0.935 [0.931, 0.945] |
 | address only | 0.39859 | 1.010 [1.004, 1.016] |
 | reduction only | 0.44516 | 1.128 [1.120, 1.137] |
@@ -140,7 +140,7 @@ Standard reproduction (pre-change compiler path supplied by the operator):
 
 ```sh
 python3 tests/benchmark/run_benchmarks.py --compilers lccc,gcc \
-  --gcc /path/to/gcc-16 --candidate batch4=/path/to/pre-change-lccc \
+  --gcc /path/to/gcc-16 --candidate ordered-arithmetic=/path/to/pre-change-lccc \
   --only byte_load_reassembly,expat_siphash24,lz4_compress,lz4_match_extend,linux_find_bit_scaled,sha256_transform,switch_dispatch \
   --reps 12 --warmup 2 --no-pmu-probe --strict --json focused-runtime.json
 ```

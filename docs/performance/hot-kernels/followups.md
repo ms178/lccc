@@ -121,3 +121,13 @@ python3 tests/benchmark/run_benchmarks.py --compilers lccc,gcc \
   --cflag=-march=x86-64-v3 --cflag=-fPIE --cflag=-pie \
   --reps 15 --warmup 3 --no-pmu-probe --strict --json focused-runtime.json
 ```
+
+## guarded folds continuation
+
+The current-main byte loop and switch dispatcher were reprobed rather than
+reusing the old long-ROUNDS experiment. guarded folds removes saved-GPR staging copies
+from the standard byte loop and a masked-index sign extension from dispatch.
+See `engineering/llvm-missed/GUARDED-FOLDS.md` and `GUARDED-FOLDS-BENCH.md` for scope, final
+paired evidence and residual limits. The SHA/find-bit gains above remain
+historical improvements, not newly claimed guarded folds wins. Their current-main
+executables are unchanged by this batch and retained as runtime controls.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reproduce the integer batch's static code-size table, never a timing claim."""
+"""Reproduce the integer observations' static code-size table, never a timing claim."""
 
 import argparse
 import json
@@ -19,10 +19,10 @@ from check_llvm_missed_zero_choice import run, body  # noqa: E402
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--suite", choices=("batch2", "batch3", "batch6"), default="batch2"
+        "--suite", choices=("integer-observations", "bit-demand", "scalar-facts"), default="integer-observations"
     )
     parser.add_argument(
-        "--wide", action="store_true", help="batch3 64-bit companion source"
+        "--wide", action="store_true", help="bit-demand 64-bit companion source"
     )
     parser.add_argument("--compiler", default=str(ROOT / "target/fastbuild/lccc"))
     parser.add_argument(
@@ -40,24 +40,24 @@ def main():
         r"\b23\.1\.3\b", versions["clang"]
     ):
         raise ValueError("requires GCC 16.2 and Clang 23.1.3")
-    if args.wide and args.suite != "batch3":
-        raise ValueError("--wide requires --suite=batch3")
+    if args.wide and args.suite != "bit-demand":
+        raise ValueError("--wide requires --suite=bit-demand")
     stem = {
-        "batch2": "llvm_missed_integer_batch",
-        "batch3": "llvm_missed_batch3",
-        "batch6": "llvm_missed_batch6",
+        "integer-observations": "llvm_integer_observations",
+        "bit-demand": "llvm_bit_demand",
+        "scalar-facts": "llvm_scalar_facts",
     }[args.suite]
     contracts = ROOT / "tests/regression" / (stem + ".json")
     source = ROOT / "tests/regression" / (stem + ("_wide" if args.wide else "") + ".c")
     rows = {c["name"]: {} for c in json.loads(contracts.read_text())}
     flags = ["-O3", "-march=x86-64-v3", "-S"]
     tools = (
-        ("pre_batch", args.baseline),
+        ("baseline", args.baseline),
         ("lccc", args.compiler),
         ("gcc", args.gcc),
         ("clang", args.clang),
     )
-    if args.suite == "batch6":
+    if args.suite == "scalar-facts":
         flags.insert(-1, "-fPIE")
     with tempfile.TemporaryDirectory() as directory:
         for name, tool in tools:
@@ -81,7 +81,7 @@ def main():
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
-    for compiler in ("pre_batch", "gcc", "clang"):
+    for compiler in ("baseline", "gcc", "clang"):
         print(
             compiler,
             {

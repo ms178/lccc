@@ -1,4 +1,4 @@
-# Batch 2: 25 implementation families, 45 native witnesses
+# integer observations: 25 implementation families, 45 native witnesses
 
 These are implemented transformations, not a list of proposals. Direction,
 operand-order, width and predicate variants are grouped conservatively below.
@@ -72,7 +72,7 @@ odd low-16-bit coefficients plus 64-bit boundaries.
 
 ## Same-ISA compiler comparison
 
-`batch-002-code-size.json` records all 45 bodies using the same
+`integer-observations-code-size.json` records all 45 bodies using the same
 `-O3 -march=x86-64-v3 -S` flags, exact GCC 16.2 and Clang 23.1.3, and includes
 the C-source hash. Counts include RET and exclude labels/directives/comments.
 
@@ -88,7 +88,7 @@ cleanup for the low-bit boolean, a high unsigned comparison immediate and
 selected-value register moves. The CLZ-zero boolean is materialized directly by
 logical sign-bit extraction, matching both oracles' three-instruction body.
 
-Reproduce with `scripts/compare_llvm_missed_batch.py --baseline <saved-compiler>
+Reproduce with `scripts/compare_integer_observations.py --baseline <saved-compiler>
 --gcc <gcc-16.2> --clang <clang-23.1.3> --output <report.json>`; the baseline
 is the saved first-batch compiler, not an inferred disabled-policy stand-in.
 All new correctness and mechanism checks also run with IR verification enabled.
@@ -110,7 +110,7 @@ All new correctness and mechanism checks also run with IR verification enabled.
   `c=0,x=1` must return zero. We do not transplant that proposal. Eliminating an
   equal *observation* is different from deleting a value-select condition.
 
-`coverage.json` is now the cumulative review ledger; `batch-001.json` remains
+`coverage.json` is now the cumulative review ledger; `zero-choice.json` remains
 an immutable record of the first batch. Use `--ledger .../coverage.json` when
 regenerating the index. The index still distinguishes limited coverage from
 unreviewed/deferred reports. Linker/unwind equivalence and the remaining bulk

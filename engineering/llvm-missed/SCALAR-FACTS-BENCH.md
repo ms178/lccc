@@ -1,10 +1,10 @@
-# Batch 6 measurements — 2026-10-21
+# scalar facts measurements — 2026-10-21
 
 ## Experiment
 
 Baseline: latest main after PR #887 (`0c4f3929dd75354d80bae881b6d579e2426fe789`).
 Candidate Rust sources are unchanged by this evidence-only publication; exact
-source-tree and compiler-binary digests are in `batch-006-correctness.json`.
+source-tree and compiler-binary digests are in `scalar-facts-correctness.json`.
 The archived baseline was compiled separately and retained immutably. A shared
 Cargo output-directory collision was detected by the mechanism gate, rejected
 before timing, and resolved by cleaning the compiler package and rebuilding.
@@ -21,7 +21,7 @@ ICX integration is a separate CI contract, not a replacement timing reference.
 
 21 randomized paired rounds per arm, three excluded warm-ups, bootstrap 95%
 confidence intervals, no removed outliers. Raw samples, commands, metadata,
-outputs and hashes: `batch-006-runtime.json`. The generic raw dashboard also
+outputs and hashes: `scalar-facts-runtime.json`. The generic raw dashboard also
 considers explicitly labelled control arms when selecting its “best reference”;
 the table below deliberately reports vendors and controls separately.
 
@@ -32,7 +32,7 @@ witnesses, not application speedups or a whole-corpus performance aggregate.
 
 | Workload | Latest-main baseline (95% CI) | Stealing disabled (95% CI) | GCC 16.2 (95% CI) | Clang 23.1.3 (95% CI) |
 |---|---|---|---|---|
-| llvm_batch6_scalar | 0.9240 [0.8927, 0.9671] | 1.0160 [0.9864, 1.0622] | 0.9362 [0.8714, 0.9668] | 0.9784 [0.9433, 1.0338] |
+| llvm_scalar_facts | 0.9240 [0.8927, 0.9671] | 1.0160 [0.9864, 1.0622] | 0.9362 [0.8714, 0.9668] | 0.9784 [0.9433, 1.0338] |
 | hot_web_loop | 0.9550 [0.9268, 0.9589] | 0.9568 [0.9485, 0.9673] | 1.7079 [1.6731, 1.7137] | 1.9565 [1.9070, 1.9665] |
 
 The scalar bundle reduces median elapsed time by **7.60%** versus main in
@@ -57,7 +57,7 @@ of the compiler-performance gap or proof that the cap of three is optimal.
   evidence of no generated-code regression for this configuration than noisy
   spot timings; it does not certify every flag, input or target.
 - Only the two new synthetic witnesses change. Full per-workload output and
-  binary hashes are in `batch-006-correctness.json`.
+  binary hashes are in `scalar-facts-correctness.json`.
 - Strict fastbuild units: **5,504 passed, 0 failed, 10 ignored**, plus one
   binary unit; three documentation examples remain intentionally ignored.
 - Strict all-target Clippy, both fastbuild binaries, formatting and diff
@@ -66,7 +66,7 @@ of the compiler-performance gap or proof that the cap of three is optimal.
   independent exact GCC/Clang oracles, real freestanding i686 execution, and
   per-function mechanisms pass. Hot-web pressure/reference comparisons also
   pass with the phase off/on and caps 0/1/2/3.
-- Earlier zero-choice, integer and batch-three native gates pass. Existing
+- Earlier zero-choice, integer and bit demand native gates pass. Existing
   i686 constant-divide/magic-number gate passes. Inventory tests pass in
   normal and optimized Python; nine benchmark-harness tests pass.
 - Independent Z3: **72/72** expected results (58 UNSAT laws, 14 SAT negative
@@ -111,14 +111,14 @@ Build both compilers with the fastbuild profile and strict warning flags,
 using separate Cargo target directories and a swap file of at least 3 GiB.
 Run the native gate with the saved baseline and exact reference executables.
 Create a labelled no-steal compiler wrapper using the command recorded in
-`batch-006-correctness.json`, then:
+`scalar-facts-correctness.json`, then:
 
 ```sh
 python3 tests/benchmark/run_benchmarks.py \
   --lccc /path/to/current --gcc /path/to/gcc-16 --clang /path/to/clang-23.1.3 \
   --compilers lccc,gcc,clang --candidate before=/path/to/saved-main \
   --candidate no_steal=/path/to/no-steal-wrapper \
-  --only llvm_batch6_scalar,hot_web_loop --reps 21 --warmup 3 \
+  --only llvm_scalar_facts,hot_web_loop --reps 21 --warmup 3 \
   --opt=-O2 --cflag=-march=x86-64-v3 --cflag=-fPIE --cflag=-pie \
   --strict --json runtime.json
 ```

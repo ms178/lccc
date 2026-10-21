@@ -360,7 +360,7 @@ fn check(mut f: IrFunction, expect: bool) {
         f.blocks[0].instructions.len()
     );
     let mut violations = vec![];
-    crate::passes::verify::verify_function(&f, "batch3", &mut violations);
+    crate::passes::verify::verify_function(&f, "bit-demand", &mut violations);
     assert!(violations.is_empty(), "{violations:?}");
     let ids = f.next_value_id;
     assert_eq!(run(&mut f), 0, "not idempotent: {before:#?}");

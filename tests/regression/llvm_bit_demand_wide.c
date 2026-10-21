@@ -123,4 +123,4 @@ if(pc_nor_plus_xor(x,y)!=(unsigned long long)(__builtin_popcountll(~(x&y)))) {pr
 if(pc_partition_four(x,y)!=(unsigned long long)(64u)) {printf("FAIL wide pc_partition_four %llu %llu\n",x,y);return 1;}
 if(pc_partition_three(x,y)!=(unsigned long long)(__builtin_popcountll(x|y))) {printf("FAIL wide pc_partition_three %llu %llu\n",x,y);return 1;}
 if(pc_absorption(x,y)!=(unsigned long long)(__builtin_popcountll(x|y))) {printf("FAIL wide pc_absorption %llu %llu\n",x,y);return 1;}
-}puts("PASS batch3 wide demand and cardinality");return 0;}
+}puts("PASS bit-demand wide demand and cardinality");return 0;}

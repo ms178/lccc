@@ -159,7 +159,7 @@ def main():
     contracts = json.loads(
         (
             Path(__file__).resolve().parents[1]
-            / "tests/regression/llvm_missed_batch3.json"
+            / "tests/regression/llvm_bit_demand.json"
         ).read_text()
     )
     for case in contracts[42:]:

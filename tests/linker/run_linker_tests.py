@@ -9413,6 +9413,34 @@ int main(){ printf("%d %d\\n", guard_a(1), guard_b(1)); return 0; }
     expect_stdout="8 8\n",
     tags=("icf",))
 
+# Same text, DIFFERENT exception type tables. Text-only ICF folds these and
+# silently catches the wrong type. Preserve both semantics in safe/all modes.
+for _mode in ("safe", "all"):
+    case("icf_distinct_lsda_catch_types_" + _mode,
+        {"a.cpp": """
+#include <cstdio>
+volatile int pick;
+__attribute__((noinline)) void maythrow() { if (pick == 1) throw 7; if (pick == 2) throw 7L; }
+__attribute__((noinline)) int int_guard() { try { maythrow(); } catch (int) { return 7; } return 0; }
+__attribute__((noinline)) int long_guard() { try { maythrow(); } catch (long) { return 7; } return 0; }
+int main() {
+    pick = 1;
+    int a = int_guard(), b = 0;
+    try { b = long_guard(); } catch (int) { b = 99; }
+    pick = 2;
+    int c = 0;
+    try { c = int_guard(); } catch (long) { c = 88; }
+    int d = long_guard();
+    printf("%d %d %d %d\\n", a, b, c, d);
+    return 0;
+}
+"""},
+        compile_flags=["-O1", "-ffunction-sections"],
+        ldflags=["-lstdc++", "-lm"],
+        lccc_only_flags=["-Wl,--icf=" + _mode],
+        expect_stdout="7 99 88 7\n",
+        tags=("icf", "eh-frame"))
+
 # --icf= with an unrecognised value must disable folding, not fail the link
 # (gold and lld both accept --icf=none this way).
 case("icf_none_is_accepted_and_disables",

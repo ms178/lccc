@@ -78,7 +78,7 @@ use super::helpers::{
     get_dest_reg, has_implicit_reg_usage, is_shift_or_rotate, writes_family, writes_family_full,
 };
 use super::liveness::FileLiveness;
-use super::relay_and_lea::is_full_write;
+use super::relay_and_lea::{is_full_write, rbp_is_gpr_in_function};
 
 /// High-byte names have no equivalent in the `%rsi`/`%rdi`/`%r8`+ families.
 const HIGH_BYTE: &[&str] = &["%ah", "%bh", "%ch", "%dh"];
@@ -363,6 +363,48 @@ fn parse_reg_to_reg_ext(trimmed: &str) -> Option<(usize, RegId, RegId)> {
     Some((sw, sfam, dfam))
 }
 
+/// A sign extension is a full-register identity only when ALL bits above
+/// bit 30 are already zero. Merely knowing zero upper 32 bits is insufficient:
+/// 0x80000000 must sign-extend to 0xffffffff80000000, not stay zero-extended.
+/// Inspect only the nearest write in a bounded straight-line window. Unknown
+/// writes, partial writes, labels, calls and opaque/pinned lines fail closed.
+fn sign_extend_is_identity(store: &LineStore, infos: &[LineInfo], at: usize, fam: RegId) -> bool {
+    for n in (at.saturating_sub(32)..at).rev() {
+        if infos[n].is_nop() {
+            continue;
+        }
+        if infos[n].is_barrier() || infos[n].pinned || infos[n].kind == LineKind::InlineAsm {
+            return false;
+        }
+        let t = infos[n].trimmed(store.get(n));
+        if !writes_family(&infos[n], t, fam) {
+            continue;
+        }
+        let Some((op, args)) = t.split_once(' ') else {
+            return false;
+        };
+        let Some((src, dst)) = args.rsplit_once(',') else {
+            return false;
+        };
+        let dst = dst.trim();
+        if !((op == "andl" || op == "movl") && dst == REG_NAMES[W32][fam as usize]
+            || (op == "andq" || op == "movq") && dst == REG_NAMES[W64][fam as usize])
+        {
+            return false;
+        }
+        let Some(imm) = src.trim().strip_prefix('$') else {
+            return false;
+        };
+        let value = if let Some(hex) = imm.strip_prefix("0x") {
+            u64::from_str_radix(hex, 16).ok()
+        } else {
+            imm.parse::<u64>().ok()
+        };
+        return value.is_some_and(|v| v <= i32::MAX as u64);
+    }
+    false
+}
+
 // ── B. copy folding ─────────────────────────────────────────────────────────
 
 pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
@@ -372,9 +414,10 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
     }
     let mut changed = eliminate_self_moves(store, infos);
     let mut lv = FileLiveness::new(store, infos);
+    let mut rbp_roles = std::collections::HashMap::new();
 
     for i in 0..len {
-        if infos[i].is_nop() || infos[i].is_barrier() {
+        if infos[i].is_nop() || infos[i].is_barrier() || infos[i].pinned {
             continue;
         }
         let trimmed = infos[i].trimmed(store.get(i));
@@ -396,13 +439,36 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
                 };
             (eff_width, sfam, dfam, false)
         } else if let Some((sw, sfam, dfam)) = parse_reg_to_reg_ext(trimmed) {
-            (sw, sfam, dfam, true)
+            let width = if trimmed.starts_with("movslq ")
+                && sign_extend_is_identity(store, infos, i, sfam)
+            {
+                W64
+            } else {
+                sw
+            };
+            (width, sfam, dfam, true)
         } else {
             continue;
         };
+        // RBP is allocatable in rsp-relative functions. Do not mistake its
+        // byte/word/dword aliases for a frame pointer and strand hot-loop
+        // copies. Reuse the frame/unwind/opaque-use proof, cached per function;
+        // the rewrite never creates frame setup or changes CFI. RSP stays out.
+        let rbp_gpr = if sfam == 5 || dfam == 5 {
+            lv.recorded_function(store, infos, i)
+                .is_some_and(|(start, end)| {
+                    *rbp_roles
+                        .entry((start, end))
+                        .or_insert_with(|| rbp_is_gpr_in_function(store, infos, start, end))
+                })
+        } else {
+            false
+        };
         if sfam == dfam
-            || (is_frame_family(sfam) && !(is_ext && sfam == 5))
-            || is_frame_family(dfam)
+            || sfam == 4
+            || dfam == 4
+            || (sfam == 5 && !rbp_gpr && !is_ext)
+            || (dfam == 5 && !rbp_gpr)
         {
             continue;
         }
@@ -419,7 +485,7 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
             if infos[j].is_nop() {
                 continue;
             }
-            if infos[j].is_barrier() {
+            if infos[j].is_barrier() || infos[j].pinned {
                 break;
             }
             // SOUNDNESS: user inline asm is opaque. A template line can name
@@ -1161,5 +1227,106 @@ mod inline_asm_tests {
             (0..store.len()).any(|i| store.get(i).trim() == "movq %rax, %rax"),
             "the placeholder must reach the assembler"
         );
+    }
+}
+
+#[cfg(test)]
+mod saved_gpr_tests {
+    use super::*;
+
+    fn apply(body: &str) -> (bool, String) {
+        let mut store =
+            LineStore::new(format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n"));
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        super::super::pin_inline_asm_regions(&store, &mut infos);
+        let changed = fold_register_copies(&mut store, &mut infos);
+        (changed, store.build_result(|i| infos[i].is_nop()))
+    }
+
+    #[test]
+    fn gpr_rbp_narrow_read_and_index_copy_fold() {
+        let (changed, out) = apply(
+            "pushq %rbp\nmovl %r9d, %ebp\nxorl %ebp, %r15d\nmovq %r12, %rbp\nmovl (%rdi,%rbp), %r14d\nmovl $7, %ebp\nmovl %r14d, %eax\npopq %rbp\nret",
+        );
+        assert!(changed, "{out}");
+        assert!(out.contains("xorl %r9d, %r15d"), "{out}");
+        assert!(out.contains("(%rdi,%r12)"), "{out}");
+        assert!(!out.contains("movl %r9d, %ebp"), "{out}");
+        assert!(!out.contains("movq %r12, %rbp"), "{out}");
+        assert!(
+            out.contains("pushq %rbp") && out.contains("popq %rbp"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn rbp_frame_contracts_block_destination_folding() {
+        for frame in [
+            "movq %rsp, %rbp",
+            ".cfi_def_cfa_register 6",
+            "movq 8(%rbp), %r11",
+            "enter $16, $0",
+        ] {
+            let (changed, out) = apply(&format!(
+                "{frame}\nmovl %r9d, %ebp\nxorl %ebp, %r15d\nmovl $7, %ebp\nret"
+            ));
+            assert!(!changed, "{frame}: {out}");
+            assert!(out.contains("movl %r9d, %ebp"), "{out}");
+        }
+    }
+
+    #[test]
+    fn rbp_partial_width_does_not_substitute_a_full_address() {
+        let (changed, out) =
+            apply("movq (%rdi), %r9\nmovl %r9d, %ebp\nmovl (%rdi,%rbp), %eax\nmovl $7, %ebp\nret");
+        assert!(!changed, "{out}");
+    }
+
+    #[test]
+    fn masked_nonnegative_index_sign_extension_is_a_full_identity() {
+        for op in [
+            "andq $15, %rdi",
+            "andl $2147483647, %edi",
+            "movq $0x7fffffff, %rdi",
+            "movl $123, %edi",
+        ] {
+            let (changed, out) = apply(&format!(
+                "{op}\nmovslq %edi, %r10\nmovl (%rsi,%r10,4), %eax\nret"
+            ));
+            assert!(changed, "{op}: {out}");
+            assert!(!out.contains("movslq"), "{out}");
+            assert!(out.contains("(%rsi,%rdi,4)"), "{out}");
+        }
+    }
+
+    #[test]
+    fn sign_extension_requires_both_zero_upper_and_clear_sign_bit() {
+        for op in [
+            "andq $2147483648, %rdi",
+            "andl $2147483648, %edi",
+            "andq $4294967295, %rdi",
+            "movl (%rsi), %edi",
+            "andq $15, %rdi\nmovb $128, %dil",
+            "andq $15, %rdi\naddl $2147483647, %edi",
+            "andw $15, %di",
+            "andq $15, %rdi\n.Lother:",
+            "andq $15, %rdi\ncall unknown",
+        ] {
+            let (changed, out) = apply(&format!(
+                "{op}\nmovslq %edi, %r10\nmovl (%rsi,%r10,4), %eax\nret"
+            ));
+            assert!(!changed, "{op}: {out}");
+            assert!(out.contains("movslq"), "{out}");
+        }
+    }
+
+    #[test]
+    fn known_index_origin_cannot_be_clobbered_before_rewritten_use() {
+        let (changed, out) = apply(
+            "andq $15, %rdi\nmovslq %edi, %r10\nmovl $9, %edi\nmovl (%rsi,%r10,4), %eax\nret",
+        );
+        assert!(!changed, "{out}");
     }
 }

@@ -119,6 +119,9 @@
 
 use std::hash::Hasher;
 
+#[path = "icf/unwind_identity.rs"]
+mod unwind_identity;
+
 use super::elf::{
     R_X86_64_32, R_X86_64_32S, R_X86_64_64, R_X86_64_NONE, R_X86_64_PC8, R_X86_64_PC16,
     R_X86_64_PC32, R_X86_64_PC64, R_X86_64_PLT32,
@@ -168,10 +171,10 @@ const NO_RELAS: [Elf64Rela; 0] = [];
 /// spelling costs nothing and removes the drift risk).
 #[inline]
 fn is_unwind_metadata_name(name: &str) -> bool {
-    matches!(
-        name.as_bytes(),
-        b".eh_frame" | b".eh_frame_hdr" | b".gcc_except_table"
-    )
+    matches!(name, ".eh_frame" | ".eh_frame_hdr" | ".gcc_except_table")
+        || name.starts_with(".eh_frame.")
+        || name.starts_with(".eh_frame_hdr.")
+        || name.starts_with(".gcc_except_table.")
 }
 
 /// Sentinel for "not in the ICF universe" in the position table.
@@ -211,6 +214,7 @@ const COMPARE_BUDGET_PER_MEMBER: u64 = 64;
 /// One member of the equivalence universe.
 struct Member {
     id: SecId,
+    unwind: unwind_identity::Identity,
     /// Foldable (`.text`/`.text.*`)? Data members only inform comparison —
     /// and so do resolver sections (`STT_GNU_IFUNC` lives in one): the IPLT
     /// slot allocator skips dead sections, so a folded resolver would lose
@@ -481,6 +485,7 @@ fn build_universe(
     dead: &FxHashSet<SecId>,
 ) -> (Vec<Member>, Vec<Vec<u32>>) {
     let mut members = Vec::new();
+    let mut unwind = unwind_identity::identities(objects);
     let mut pos_of: Vec<Vec<u32>> = objects
         .iter()
         .map(|o| vec![ABSENT; o.sections.len()])
@@ -520,8 +525,11 @@ fn build_universe(
             let pos = u32::try_from(members.len()).expect("ICF universe exceeds 2^32 sections");
             pos_of[oi][si] = pos;
             let is_text = is_foldable(&sec.name) && !ifunc_sec[oi][si];
+            let unwind = unwind.remove(&(oi, si)).unwrap_or_default();
+            let content = unwind.content_hash(data);
             members.push(Member {
                 id: (oi, si),
+                unwind,
                 is_text,
                 has_relocs: obj.relocations.get(si).is_some_and(|r| !r.is_empty()),
                 // The discriminant is a fold invariant — consumed only when
@@ -540,7 +548,7 @@ fn build_universe(
                     0xFF
                 },
                 size: sec.size,
-                content: hash_bytes(data),
+                content,
                 sketched: 0, // filled below: needs every member's content hash
             });
         }
@@ -752,7 +760,7 @@ fn members_equal(
     debug_assert_eq!(a.output, b.output, "same class implies same output section");
     let da = objects[a.id.0].section_data[a.id.1].as_slice();
     let db = objects[b.id.0].section_data[b.id.1].as_slice();
-    if da != db {
+    if da != db || a.unwind != b.unwind {
         return false;
     }
     let ra = objects[a.id.0]
@@ -1309,7 +1317,8 @@ fn refine_once(
         if hi - lo < 2 {
             continue;
         }
-        // Relocation-free groups compare by bytes alone, and byte equality
+        // Relocation-free groups compare by bytes and immutable unwind identity,
+        // and equality
         // is transitive: one full scan (which every earlier pass performed
         // before recording the id) proves all pairs, so the group can never
         // split in this or any later pass and re-scanning it would only burn
@@ -3188,9 +3197,9 @@ mod tests {
                 ],
                 vec![sym("", 0, 0, false), sym("f", 1, 0, false)],
             );
-            let p = plan(std::slice::from_ref(&o), true, &no_dead());
-            assert_eq!(
-                p.result.folded_sections, 1,
+            let taken = address_taken_sections(std::slice::from_ref(&o));
+            assert!(
+                !taken.contains(&(0, 1)),
                 "{eh_name} reference marked the target taken"
             );
         }
@@ -3238,5 +3247,135 @@ mod tests {
         assert!(!is_call_or_jump(&[0xe8], 0, 4));
         assert!(!is_call_or_jump(&[0xe8, 0], 1, 4));
         assert!(!is_call_or_jump(&[0xe8, 0, 0, 0, 0], 9, 4));
+    }
+
+    // A real zPLR-shaped CIE and one FDE, with separate LSDA/typeinfo edges.
+    // The byte skeleton is identical even when exception semantics differ.
+    fn eh_object(personality: &str, typeinfo: &str, tag: u8) -> Elf64Object {
+        let mut eh = vec![0u8; 8];
+        eh.extend_from_slice(&[1, b'z', b'P', b'L', b'R', 0, 1, 0x78, 16, 7, 0x1b]);
+        let personality_at = eh.len();
+        eh.extend_from_slice(&[0; 4]);
+        eh.extend_from_slice(&[0x1b, 0x1b, 0x0c, 7, 8, 0x90, 1]);
+        while !eh.len().is_multiple_of(8) {
+            eh.push(0);
+        }
+        let cie_len = (eh.len() - 4) as u32;
+        eh[..4].copy_from_slice(&cie_len.to_le_bytes());
+        let fde = eh.len();
+        eh.extend_from_slice(&[0; 4]);
+        eh.extend_from_slice(&((fde + 4) as u32).to_le_bytes());
+        let iloc = eh.len();
+        eh.extend_from_slice(&[0; 4]);
+        eh.extend_from_slice(&(CALL_RET.len() as u32).to_le_bytes());
+        eh.push(4);
+        let lsda_at = eh.len();
+        eh.extend_from_slice(&[0; 4]);
+        while !eh.len().is_multiple_of(8) {
+            eh.push(0);
+        }
+        let fde_len = (eh.len() - fde - 4) as u32;
+        eh[fde..fde + 4].copy_from_slice(&fde_len.to_le_bytes());
+        let mut lsda = vec![0; 8];
+        lsda[7] = tag;
+        mkobj(
+            vec![
+                nullpart(),
+                (sec(".text.f", CALL_RET, 16), CALL_RET.to_vec(), vec![]),
+                (
+                    sec_flags(".eh_frame", &eh, 8, SHF_ALLOC),
+                    eh,
+                    vec![
+                        rela(personality_at as u64, 3, R_X86_64_PC32, 0),
+                        rela(iloc as u64, 1, R_X86_64_PC32, 0),
+                        rela(lsda_at as u64, 2, R_X86_64_PC32, 0),
+                    ],
+                ),
+                (
+                    sec_flags(".gcc_except_table.f", &lsda, 4, SHF_ALLOC),
+                    lsda,
+                    vec![rela(0, 4, R_X86_64_PC32, 0)],
+                ),
+            ],
+            vec![
+                sym("", 0, 0, false),
+                sym("", 1, 0, false),
+                sym("", 3, 0, false),
+                sym(personality, 0, 0, true),
+                sym(typeinfo, 0, 0, true),
+            ],
+        )
+    }
+
+    #[test]
+    fn identical_cie_fde_lsda_and_imports_allow_cross_object_folding() {
+        let objects = [eh_object("pers", "type", 7), eh_object("pers", "type", 7)];
+        for safe in [false, true] {
+            let p = plan(&objects, safe, &no_dead());
+            assert_eq!(p.result.folded_sections, 1, "{p:?}");
+            assert_eq!(p.redirect.get(&(1, 1)), Some(&(0, 1)));
+        }
+    }
+
+    #[test]
+    fn different_lsda_personality_typeinfo_or_cfi_never_fold() {
+        for mut other in [
+            eh_object("other_pers", "type", 7),
+            eh_object("pers", "other_type", 7),
+            eh_object("pers", "type", 8),
+            eh_object("pers", "type", 7),
+        ] {
+            if other.section_data[2].as_slice()
+                == eh_object("pers", "type", 7).section_data[2].as_slice()
+                && other.symbols[3].name.as_str() == "pers"
+                && other.symbols[4].name.as_str() == "type"
+                && other.section_data[3].as_slice()[7] == 7
+            {
+                let mut bytes = other.section_data[2].as_slice().to_vec();
+                bytes[26] ^= 1; // CIE CFI program, not a relocated pointer.
+                other.section_data[2] = SectionData::owned(bytes);
+            }
+            for safe in [false, true] {
+                let p = plan(
+                    &[eh_object("pers", "type", 7), other.clone()],
+                    safe,
+                    &no_dead(),
+                );
+                assert_eq!(p.result.folded_sections, 0, "{p:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_unassociated_unwind_is_opaque_not_an_absent_identity() {
+        for kind in 0..5 {
+            let mut other = eh_object("pers", "type", 7);
+            match kind {
+                0 => {
+                    other.relocations[2].retain(|r| r.sym_idx != 1);
+                }
+                1 => {
+                    other.relocations[2].push(rela(0, 1, R_X86_64_PC32, 0));
+                }
+                2 => {
+                    let r = other.relocations[2][0].clone();
+                    other.relocations[2].push(r);
+                }
+                3 => {
+                    let mut bytes = other.section_data[2].as_slice().to_vec();
+                    bytes.push(1);
+                    other.section_data[2] = SectionData::owned(bytes);
+                }
+                _ => {
+                    other.relocations[2]
+                        .iter_mut()
+                        .find(|r| r.sym_idx == 1)
+                        .unwrap()
+                        .addend = 1;
+                }
+            }
+            let p = plan(&[eh_object("pers", "type", 7), other], false, &no_dead());
+            assert_eq!(p.result.folded_sections, 0, "{kind}: {p:?}");
+        }
     }
 }

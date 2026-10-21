@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Batch six: native/IR/RA checks, mechanism controls and an optional saved baseline."""
+"""scalar facts: native/IR/RA checks, mechanism controls and an optional saved baseline."""
 
 import argparse
 import os
@@ -9,21 +9,21 @@ import tempfile
 from check_llvm_missed_zero_choice import body, run
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = ROOT / "tests/regression/llvm_missed_batch6.c"
+SOURCE = ROOT / "tests/regression/llvm_scalar_facts.c"
 NEW = (
-    "b6_bits",
-    "b6_sum",
-    "b6_range",
-    "b6_shared",
-    "b6_masked",
-    "b6_select",
-    "b6_trip",
-    "b6_guard",
-    "b6_lowone",
-    "b6_boolor",
-    "b6_sub",
-    "b6_even",
-    "b6_signed_select",
+    "sf_bits",
+    "sf_sum",
+    "sf_range",
+    "sf_shared",
+    "sf_masked",
+    "sf_select",
+    "sf_trip",
+    "sf_guard",
+    "sf_lowone",
+    "sf_boolor",
+    "sf_sub",
+    "sf_even",
+    "sf_signed_select",
 )
 
 
@@ -110,18 +110,18 @@ def main():
         # Each check names the eliminated computation, not a register spelling
         # or a globally fixed instruction count.
         forbidden = {
-            "b6_bits": r"or[lq]?\b",
-            "b6_sum": r"(?:add|sub)[lq]?\b",
-            "b6_range": r"and[lq]?\b",
-            "b6_masked": r"shr[lq]?\b",
-            "b6_select": r"cmov\w*\b",
-            "b6_trip": r"add[lq]?\b",
-            "b6_guard": r"and[lq]?\b",
-            "b6_lowone": r"(?:neg|sub|blsi)[lq]?\b",
-            "b6_boolor": r"or[lq]?\b",
-            "b6_sub": r"(?:add|sub)[lq]?\b",
-            "b6_even": r"and[lq]?\b",
-            "b6_signed_select": r"cmov\w*\b",
+            "sf_bits": r"or[lq]?\b",
+            "sf_sum": r"(?:add|sub)[lq]?\b",
+            "sf_range": r"and[lq]?\b",
+            "sf_masked": r"shr[lq]?\b",
+            "sf_select": r"cmov\w*\b",
+            "sf_trip": r"add[lq]?\b",
+            "sf_guard": r"and[lq]?\b",
+            "sf_lowone": r"(?:neg|sub|blsi)[lq]?\b",
+            "sf_boolor": r"or[lq]?\b",
+            "sf_sub": r"(?:add|sub)[lq]?\b",
+            "sf_even": r"and[lq]?\b",
+            "sf_signed_select": r"cmov\w*\b",
         }
         for name, pattern in forbidden.items():
             if any(re.match(pattern, line) for line in body(on, name)):
@@ -132,7 +132,7 @@ def main():
             other = (p / f"{label}.s").read_text()
             for name in NEW:
                 yes, no = body(on, name), body(other, name)
-                if name == "b6_shared":
+                if name == "sf_shared":
                     # Keeping x live for the independent result can cost moves:
                     # total instruction count ties on the current allocator.
                     # Require elimination of the quotient-dependent multiply,
@@ -237,7 +237,7 @@ def main():
             raise ValueError(
                 "hot web: enable/disable does not change the pressure witness"
             )
-    print("batch6: PASS (native, disabled controls, IR/RA verification and mechanisms)")
+    print("scalar-facts: PASS (native, disabled controls, IR/RA verification and mechanisms)")
 
 
 if __name__ == "__main__":

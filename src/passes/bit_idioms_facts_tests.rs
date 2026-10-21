@@ -138,6 +138,12 @@ fn eval(i: &Instruction, values: &mut [u64]) {
             };
             u64::from(value)
         }
+        Instruction::UnaryOp {
+            op: IrUnaryOp::Neg,
+            src,
+            ty,
+            ..
+        } => get(*src).wrapping_neg() & mask(*ty),
         Instruction::Select {
             cond,
             true_val,
@@ -511,4 +517,130 @@ fn canonical_doubled_shared_remainder_is_not_lost_before_division_lowering() {
     let q = b.bin(IrBinOp::Mul, q, b.c(12));
     b.bin(IrBinOp::Add, q, r);
     b.verify(unary_samples(IrType::U32));
+}
+
+#[test]
+fn conditional_negate_boolean_mask_is_width_exact_and_commutative() {
+    for ty in [
+        IrType::I8,
+        IrType::U8,
+        IrType::I16,
+        IrType::U16,
+        IrType::I32,
+        IrType::U32,
+        IrType::I64,
+        IrType::U64,
+    ] {
+        for commuted in [false, true] {
+            let mut b = Builder::new(ty);
+            let boolean = b.bin(IrBinOp::And, v(1), b.c(1));
+            let neg = b.bin(IrBinOp::Sub, b.c(0), boolean);
+            let xor = if commuted {
+                b.bin(IrBinOp::Xor, neg, v(0))
+            } else {
+                b.bin(IrBinOp::Xor, v(0), neg)
+            };
+            if commuted {
+                b.bin(IrBinOp::Add, boolean, xor);
+            } else {
+                b.bin(IrBinOp::Add, xor, boolean);
+            }
+            let w = ty.size() * 8;
+            let mask = u64::MAX >> (64 - w);
+            b.verify(
+                (0..=255)
+                    .flat_map(|x| [x, x | 1u64 << (w - 1), mask - x])
+                    .flat_map(|x| [[x, 0, 0], [x, 1, 0], [x, 2, 0], [x, 3, 0]]),
+            );
+        }
+    }
+}
+
+#[test]
+fn conditional_negate_does_not_accept_truthiness_or_shared_masks() {
+    for ty in [IrType::U8, IrType::U16, IrType::U32, IrType::U64] {
+        let mut b = Builder::new(ty);
+        let neg = b.bin(IrBinOp::Sub, b.c(0), v(1));
+        let xor = b.bin(IrBinOp::Xor, v(0), neg);
+        b.bin(IrBinOp::Add, xor, v(1));
+        assert!(
+            b.fold().is_none(),
+            "arbitrary nonzero is not Boolean: {ty:?}"
+        );
+        let mut b = Builder::new(ty);
+        let boolean = b.bin(IrBinOp::And, v(1), b.c(1));
+        let neg = b.bin(IrBinOp::Sub, b.c(0), boolean);
+        let xor = b.bin(IrBinOp::Xor, v(0), neg);
+        b.bin(IrBinOp::Or, xor, v(2));
+        b.bin(IrBinOp::Add, xor, boolean);
+        assert!(
+            b.fold().is_none(),
+            "shared XOR must not be duplicated: {ty:?}"
+        );
+    }
+}
+
+#[test]
+fn nonnegative_upper_range_guard_reduces_to_unsigned_compare() {
+    for ty in [IrType::I8, IrType::I16, IrType::I32, IrType::I64] {
+        for inverted in [false, true] {
+            let mut b = Builder::new(ty);
+            let bound = b.bin(IrBinOp::And, v(1), b.c(15));
+            let lower = b.cmp(
+                if inverted { IrCmpOp::Slt } else { IrCmpOp::Sge },
+                v(0),
+                b.c(0),
+            );
+            let upper = b.cmp(IrCmpOp::Slt, v(0), bound);
+            let zero = Operand::Const(IrConst::I32(0));
+            b.push(|dest| Instruction::Select {
+                dest,
+                cond: lower,
+                true_val: if inverted { zero } else { upper },
+                false_val: if inverted { upper } else { zero },
+                ty: IrType::I32,
+            });
+            let w = ty.size() * 8;
+            let mask = u64::MAX >> (64 - w);
+            b.verify(
+                (0..=255)
+                    .flat_map(|x| [x, x | 1u64 << (w - 1), mask - x])
+                    .flat_map(|x| (0..=31).map(move |y| [x, y, 0])),
+            );
+            assert!(matches!(
+                b.fold().unwrap().first(),
+                Some(Instruction::Cmp {
+                    op: IrCmpOp::Ult,
+                    ..
+                })
+            ));
+        }
+    }
+}
+
+#[test]
+fn range_does_not_drop_sign_guard_for_unknown_or_negative_bounds() {
+    for ty in [IrType::I8, IrType::I16, IrType::I32, IrType::I64] {
+        for constant_bound in [false, true] {
+            let mut b = Builder::new(ty);
+            let lower = b.cmp(IrCmpOp::Sge, v(0), b.c(0));
+            let upper = b.cmp(
+                IrCmpOp::Slt,
+                v(0),
+                if constant_bound {
+                    b.c(1u64 << (ty.size() * 8 - 1))
+                } else {
+                    v(1)
+                },
+            );
+            b.push(|dest| Instruction::Select {
+                dest,
+                cond: lower,
+                true_val: upper,
+                false_val: Operand::Const(IrConst::I32(0)),
+                ty: IrType::I32,
+            });
+            assert!(b.fold().is_none(), "{ty:?}");
+        }
+    }
 }

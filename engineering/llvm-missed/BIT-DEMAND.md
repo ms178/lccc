@@ -1,4 +1,4 @@
-# Batch 3: demanded bits, cardinality synthesis, and boolean returns
+# bit demand: demanded bits, cardinality synthesis, and boolean returns
 
 This batch adds **60 reduced expression contracts with 32- and 64-bit native
 companions** (120 width-specific witnesses). Width, signedness, operand-order,
@@ -17,7 +17,7 @@ removing a population count even when instruction counts tie.
 | Shift and rotation demand | `d_shl`, `d_lshr`, `d_ashr`, `d_rotate` | AShr must demand the sign bit when any sign copy is observed. Invalid ordinary shifts fail closed. |
 | Unary and Boolean demand | `d_not`, `d_neg`, `d_and`; XOR/OR controls | Negation has carry dependencies; Boolean operations are bit-local. |
 | Permuted demand | `d_bswap`; IR bit-reversal tests | Apply the inverse bit permutation to the observation mask. |
-| Remainder demand through arithmetic | `d_rem_shl`, `d_rem_lshr`, `d_rem_add`, `d_rem_mul` | The constant divisor must be nonzero and divisible by the required low-bit modulus. This extends batch 2's direct remainder observation. |
+| Remainder demand through arithmetic | `d_rem_shl`, `d_rem_lshr`, `d_rem_add`, `d_rem_mul` | The constant divisor must be nonzero and divisible by the required low-bit modulus. This extends integer observations's direct remainder observation. |
 | Trailing-count invariants | `tz_odd`, `tz_variable_odd`, `tz_neg`, `tz_isolate`, `tz_or_neg` | Preserve the exact lowest set bit, including zero preservation for defined count forms. An even multiplier is not interchangeable. |
 | Triangular count invariants | `tz_{xor,or,add,sub}_shift`, `lz_{or,xor}_shift` | Positive, in-range shifts in the appropriate direction; no path-sensitive nonzero assumption. |
 | Count through AND-NOT shifts | `tz_andnot_shift`, `lz_andnot_shift` | The least/most significant set bit cannot be cleared by the corresponding shifted copy. |
@@ -103,14 +103,14 @@ implementation. Every UNKNOWN is explicit and fails the command.
 
 ```sh
 scripts/build_lccc_fast.sh
-python3 tests/regression/check_llvm_missed_batch3.py \
+python3 tests/regression/check_llvm_bit_demand.py \
   --compiler target/fastbuild/lccc --gcc /path/to/gcc-16 \
   --clang /path/to/clang-23.1.3 --baseline /path/to/saved-main-lccc
-python3 scripts/prove_llvm_batch3.py --output work/batch3-proofs.json
-python3 scripts/compare_llvm_missed_batch.py --suite batch3 \
+python3 scripts/prove_bit_demand.py --output work/bit-demand-proofs.json
+python3 scripts/compare_integer_observations.py --suite bit-demand \
   --compiler target/fastbuild/lccc --baseline /path/to/saved-main-lccc \
   --gcc /path/to/gcc-16 --clang /path/to/clang-23.1.3 \
-  --output work/batch3-code-size.json
+  --output work/bit-demand-code-size.json
 ```
 
 Add `--wide` to the size comparison for the 64-bit companion. Run the proof
@@ -126,7 +126,7 @@ seed-178 interleaving within adjacent layout blocks, two warmups, and configurab
 across every variant and mode. Compiler/source hashes, raw seconds, and machine
 information accompany the medians. `--reference` adds an older compiler at
 16-byte alignment; `--ablate-return-bool` isolates the return rewrite. Use
-`--suite batch3` for the new witness cohort.
+`--suite bit-demand` for the new witness cohort.
 
 The historical indirect regression's old raw artifacts are unavailable. Fresh
 controlled measurements, not the historical percentages, are the evidence for
@@ -159,7 +159,7 @@ not discarded in favor of a winning run.
 |---|---:|---:|---:|---:|
 | Existing 45, direct vs main | -0.30% | +0.45% | +0.46% | +0.11% |
 | Existing 45, indirect vs main | +1.00% | +1.09% | -0.50% | +0.53% |
-| Existing 45, indirect vs pre-batch-2 | -4.89% | +1.55% | -5.74% | -3.14% |
+| Existing 45, indirect vs pre-integer observations | -4.89% | +1.55% | -5.74% | -3.14% |
 | New 60, direct vs main | **+11.69%** | -4.07% | **+4.18%** | -2.25% |
 | New 60, indirect vs main | -0.67% | -7.92% | -4.73% | -5.39% |
 
@@ -171,10 +171,10 @@ is met. No blanket alignment change or benchmark-specific optimization disable
 has been used to conceal that result. This work must remain a draft until that
 performance question is resolved or the acceptance scope is explicitly revised.
 
-`batch-003-{code-size,wide-code-size}.json` holds per-function static counts;
-`batch-003-{dispatch,new-cohort}-{wall,cpu}.json` holds both timing protocols;
-`batch-003-runtime-summary.json` retains the compact default-alignment deltas;
-`batch-003-proofs.json` retains every stated proof/guard result.
+`bit-demand-{code-size,wide-code-size}.json` holds per-function static counts;
+`bit-demand-{dispatch,new-cohort}-{wall,cpu}.json` holds both timing protocols;
+`bit-demand-runtime-summary.json` retains the compact default-alignment deltas;
+`bit-demand-proofs.json` retains every stated proof/guard result.
 
 ## Upstream scope
 

@@ -13,16 +13,16 @@ LCCC. A title/label match is not proof of relevance either.
 `inventory.csv` is the compact, searchable index. It deliberately includes
 unsupported targets and uncertain cases so nothing disappears through an
 optimistic filter. The batch ledger records manually reviewed scope separately
-from automatic routing. The first batch covered one reduced pattern family. [Batch 2](BATCH-002.md)
+from automatic routing. The first batch covered one reduced pattern family. [integer observations](INTEGER-OBSERVATIONS.md)
 adds **25 conservatively grouped implementation families with 45 native
-witnesses**. [Batch 3](BATCH-003.md) adds bounded demand reconstruction and
+witnesses**. [bit demand](BIT-DEMAND.md) adds bounded demand reconstruction and
 Boolean-cardinality synthesis, with 60 reduced contracts and 120 width-specific
 native witnesses, plus a terminal boolean-return improvement for dispatch.
-[Batch 4](BATCH-004.md) adds exact signed power-of-two division analysis,
+[ordered arithmetic](ORDERED-ARITHMETIC.md) adds exact signed power-of-two division analysis,
 repairs the default-target ordered SIMD gate, and rejects unrelated loads in
 that prefix. It reports a measured spectral-norm win, not additional invented
 LLVM-family counts.
-Two batch 3 contracts are already-optimized controls, not new assembly wins. The cumulative `coverage.json` still limits coverage per upstream
+Two bit demand contracts are already-optimized controls, not new assembly wins. The cumulative `coverage.json` still limits coverage per upstream
 report; this is not a claim of optimal code for the entire inventory.
 
 Full API bodies, public conversation comments and hashes belong in ignored
@@ -121,7 +121,7 @@ fixtures, not declared irrelevant because its reproducer is C++.
    cases. Require hosted CI, then continue the next batch. An issue is not marked
    globally solved merely because one local reduction improves.
 
-## Batch 1: zero observations of conditional integer negation
+## zero-choice: zero observations of conditional integer negation
 
 Source: [LLVM #233753](https://github.com/llvm/llvm-project/issues/233753).
 For an N-bit integer ring, `-x == 0` iff `x == 0`. Therefore
@@ -152,17 +152,27 @@ nonzero comparison constants and casts, and check repeat-run idempotence and
 unchanged producers/SSA budget. The native witness uses unsigned arithmetic to
 avoid `abs(INT_MIN)`/signed-negation UB.
 
-`batch-001.json` also records six reviewed deferrals, including variable-shift
+`zero-choice.json` also records six reviewed deferrals, including variable-shift
 flags (zero count leaves flags unchanged), general boolean-mask negation, range
 comparisons, byte division, PHI/path-sensitive comparisons and linker ICF.
 They remain work, not successes. Future batches should expand that ledger rather
 than replace outstanding work with broad claims of optimality.
 
-## Batch 6
+## scalar facts
 
-See [BATCH-006.md](BATCH-006.md) for the selected ten-report scalar cohort,
+See [SCALAR-FACTS.md](SCALAR-FACTS.md) for the selected ten-report scalar cohort,
 proof/refusal boundaries, executable regressions and x86-64 whole-web
 callee-saved promotion. Existing coverage is not counted as new optimization.
 
 Final-source VM measurements, full-corpus binary-identity controls and exact
-reference limits are in [BENCH-006.md](BENCH-006.md).
+reference limits are in [SCALAR-FACTS-BENCH.md](SCALAR-FACTS-BENCH.md).
+
+## guarded folds
+
+See [GUARDED-FOLDS.md](GUARDED-FOLDS.md) for real-workload copy/dispatch tuning and the
+six deferred scalar/ELF topics from zero-choice. Paired measurements and all-eight
+changed-workload screening are in [GUARDED-FOLDS-BENCH.md](GUARDED-FOLDS-BENCH.md), with raw
+`guarded-folds-runtime.json` and `guarded-folds-correctness.json`. The review ledger distinguishes
+implemented reduced contracts, existing byte-division/CH controls, safety
+refusals, and still-open allocator/vector/layout work. ICF unwind identity is a
+correctness repair rather than a fictitious speedup over unsafe folding.
