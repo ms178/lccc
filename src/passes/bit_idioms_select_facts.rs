@@ -44,7 +44,6 @@ fn relation(a: Operand, b: Operand, cx: &Context<'_>) -> Option<bool> {
             IrCmpOp::Sle => IrCmpOp::Sge,
             IrCmpOp::Sgt => IrCmpOp::Slt,
             IrCmpOp::Sge => IrCmpOp::Sle,
-            _ => return None,
         }
     } else {
         return None;
@@ -63,7 +62,6 @@ fn relation(a: Operand, b: Operand, cx: &Context<'_>) -> Option<bool> {
         IrCmpOp::Sle => IrCmpOp::Sgt,
         IrCmpOp::Sgt => IrCmpOp::Sle,
         IrCmpOp::Sge => IrCmpOp::Slt,
-        _ => return None,
     };
     (inverse == y).then_some(false)
 }

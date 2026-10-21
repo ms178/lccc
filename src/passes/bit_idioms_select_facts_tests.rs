@@ -41,7 +41,8 @@ fn context(source: &[Instruction], test: impl FnOnce(&Context<'_>)) {
 fn rewrite(source: &[Instruction]) -> Option<Vec<Instruction>> {
     let mut result = None;
     context(source, |cx| {
-        result = fold(source.last().unwrap(), cx, &Facts(vec![]))
+        result = super::super::relational_guards::fold(source.last().unwrap(), cx)
+            .or_else(|| fold(source.last().unwrap(), cx, &Facts(vec![])))
     });
     result
 }
@@ -359,4 +360,82 @@ fn unrelated_conditions_noncommutative_ops_sparse_masks_and_floats_refuse() {
         .is_none()
     );
     assert!(rewrite(&[sel(3, v(0), v(1), v(2), IrType::F64)]).is_none());
+}
+
+#[test]
+fn guarded_increment_and_contiguous_bound_exhaust_all_byte_pairs() {
+    let ty = IrType::U8;
+    let source = vec![
+        bin(Value(3), IrBinOp::Add, v(0), constant(1, ty), ty),
+        cmp(4, IrCmpOp::Ne, v(0), constant(255, ty), ty),
+        cmp(5, IrCmpOp::Ule, v(3), v(1), ty),
+        bin(Value(6), IrBinOp::And, v(4), v(5), IrType::I32),
+    ];
+    for x in 0..256 {
+        for y in 0..256 {
+            check(&source, [x, y, 0]);
+        }
+    }
+    for bit in 1..8 {
+        let bound = 1u64 << bit;
+        for trailing in 0..bit {
+            let mask = bound - (1u64 << trailing);
+            let source = vec![
+                cmp(3, IrCmpOp::Ult, v(0), constant(bound, ty), ty),
+                bin(Value(4), IrBinOp::And, v(0), constant(mask, ty), ty),
+                cmp(5, IrCmpOp::Ne, v(4), constant(mask, ty), ty),
+                bin(Value(6), IrBinOp::And, v(3), v(5), IrType::I32),
+            ];
+            for x in 0..256 {
+                check(&source, [x, 0, 0]);
+            }
+        }
+    }
+}
+#[test]
+fn disjoint_constant_choices_and_boolean_cardinality_preserve_truth_values() {
+    let ty = IrType::U32;
+    let predicates = vec![
+        cmp(3, IrCmpOp::Ne, v(0), constant(0, ty), ty),
+        cmp(4, IrCmpOp::Ne, v(1), constant(0, ty), ty),
+    ];
+    let mut cardinality = predicates.clone();
+    cardinality.extend([
+        bin(Value(5), IrBinOp::Add, v(3), v(4), ty),
+        cmp(6, IrCmpOp::Eq, v(5), constant(1, ty), ty),
+    ]);
+    let mut choices = predicates;
+    choices.extend([
+        sel(5, v(3), constant(4, ty), constant(1, ty), ty),
+        sel(6, v(4), constant(4, ty), constant(1, ty), ty),
+        bin(Value(7), IrBinOp::And, v(5), v(6), ty),
+        cmp(8, IrCmpOp::Eq, v(7), constant(0, ty), ty),
+    ]);
+    for x in 0..16 {
+        for y in 0..16 {
+            check(&cardinality, [x, y, 0]);
+            check(&choices, [x, y, 0]);
+        }
+    }
+}
+#[test]
+fn or_shift_order_requires_an_explicit_count_bound() {
+    let ty = IrType::U8;
+    let source = vec![
+        bin(Value(3), IrBinOp::And, v(2), constant(7, ty), ty),
+        bin(Value(4), IrBinOp::LShr, v(0), v(3), ty),
+        bin(Value(5), IrBinOp::Or, v(0), v(1), ty),
+        cmp(6, IrCmpOp::Ult, v(5), v(4), ty),
+    ];
+    for x in 0..256 {
+        for count in 0..8 {
+            check(&source, [x, 255 - x, count]);
+        }
+    }
+    let unbounded = vec![
+        bin(Value(3), IrBinOp::LShr, v(0), v(2), ty),
+        bin(Value(4), IrBinOp::Or, v(0), v(1), ty),
+        cmp(5, IrCmpOp::Ult, v(4), v(3), ty),
+    ];
+    assert!(rewrite(&unbounded).is_none());
 }

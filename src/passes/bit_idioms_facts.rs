@@ -386,6 +386,9 @@ fn fold(
     if let Some(replacement) = shift_observe::fold(inst, cx) {
         return Some(replacement);
     }
+    if let Some(replacement) = relational_guards::fold(inst, cx) {
+        return Some(replacement);
+    }
     if let Some(replacement) = select_facts::fold(inst, cx, facts) {
         return Some(replacement);
     }
@@ -965,3 +968,6 @@ mod shift_observe;
 
 #[path = "bit_idioms_select_facts.rs"]
 mod select_facts;
+
+#[path = "bit_idioms_relational_guards.rs"]
+mod relational_guards;
