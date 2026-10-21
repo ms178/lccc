@@ -17,7 +17,9 @@ from check_llvm_missed_zero_choice import run, body  # noqa: E402
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=("batch2", "batch3"), default="batch2")
+    parser.add_argument(
+        "--suite", choices=("batch2", "batch3", "batch6"), default="batch2"
+    )
     parser.add_argument(
         "--wide", action="store_true", help="batch3 64-bit companion source"
     )
@@ -39,9 +41,11 @@ def main():
         raise ValueError("requires GCC 16.2 and Clang 23.1.3")
     if args.wide and args.suite != "batch3":
         raise ValueError("--wide requires --suite=batch3")
-    stem = (
-        "llvm_missed_integer_batch" if args.suite == "batch2" else "llvm_missed_batch3"
-    )
+    stem = {
+        "batch2": "llvm_missed_integer_batch",
+        "batch3": "llvm_missed_batch3",
+        "batch6": "llvm_missed_batch6",
+    }[args.suite]
     contracts = ROOT / "tests/regression" / (stem + ".json")
     source = ROOT / "tests/regression" / (stem + ("_wide" if args.wide else "") + ".c")
     rows = {c["name"]: {} for c in json.loads(contracts.read_text())}

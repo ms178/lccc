@@ -1561,6 +1561,7 @@ jobs:
         python3 tests/regression/check_llvm_missed_zero_choice.py
         python3 tests/regression/check_llvm_missed_integer_batch.py
         python3 tests/regression/check_llvm_missed_batch3.py
+        python3 tests/regression/check_llvm_missed_batch6.py
         bash tests/regression/check_tls_model_option.sh
         bash tests/regression/check_f128_sign_intrinsics_strict_fp.sh
         bash tests/regression/check_fma_builtin_strict_fp.sh

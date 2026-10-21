@@ -3004,7 +3004,7 @@ pub(crate) fn recognize_function(
             *definition = None;
         }
     }
-    changes + observe::run(func, &defs) + demand::run(func)
+    changes + observe::run(func, &defs) + demand::run(func) + batch6::run(func)
 }
 
 #[cfg(test)]
@@ -5331,8 +5331,11 @@ mod observe;
 
 /// Demand observations before div/rem strength reduction loses their structure.
 pub(crate) fn observe_before_division(func: &mut IrFunction) -> usize {
-    observe::early(func) + demand::early(func)
+    batch6::run(func) + observe::early(func) + demand::early(func)
 }
 
 #[path = "bit_idioms_demand.rs"]
 mod demand;
+
+#[path = "bit_idioms_batch6.rs"]
+mod batch6;

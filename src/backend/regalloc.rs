@@ -5,7 +5,7 @@
 //! filter); (3) leftover callee-saved for call-free overflow.
 //!
 //! Copy groups with pairwise-disjoint intervals share a home. Loop-carried
-//! phi dests may steal a cold callee-saved on the wide AArch64 pool only.
+//! phi dests may steal colder callee-saved homes on AArch64, i686 and x86-64.
 //! `detect_phi_coalesce_groups` is shared with stack-slot coalescing.
 
 use super::live_range::{self, LinearScanAllocator};
@@ -20,6 +20,8 @@ use crate::ir::analysis;
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator};
 use std::sync::Arc;
+
+mod hot_web;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PhysReg(pub u8);
@@ -92,9 +94,9 @@ pub(crate) struct RaConfig {
     pub(crate) no_loop_pin: bool,
     /// `CCC_LOOP_PIN`: maximum AArch64 loop-pin steals (default: 2).
     pub(crate) loop_pin: usize,
-    /// `CCC_NO_HOT_WEB_STEAL`: disable i686 hot-web steals (default: false).
+    /// `CCC_NO_HOT_WEB_STEAL`: disable i686/x86-64 hot-web steals (default: false).
     pub(crate) no_hot_web_steal: bool,
-    /// `CCC_HOT_WEB_STEAL`: maximum i686 hot-web steals (default: 3).
+    /// `CCC_HOT_WEB_STEAL`: maximum i686/x86-64 hot-web steals (default: 3).
     pub(crate) hot_web_steal: usize,
     /// `CCC_NO_ITERATED_HAZARD`: disable i686 iterated hazard refinement (default: false).
     pub(crate) no_iterated_hazard: bool,
@@ -2407,6 +2409,30 @@ fn propagate_coalesce_members(
     }
 }
 
+/// Price the exact set removed by `evict_group`, once per distinct member.
+/// Saturation makes overflow lose an optimization instead of wrapping a hot
+/// victim into a falsely cheap one. Kept separate for adversarial cost tests.
+fn hot_web_eviction_cost(
+    victims: &[u32],
+    member_of: &FxHashMap<u32, u32>,
+    groups: &FxHashMap<u32, Vec<u32>>,
+    use_count: &FxHashMap<u32, u64>,
+) -> u64 {
+    let mut seen = FxHashSet::default();
+    let mut total = 0u64;
+    for &victim in victims {
+        let owner = member_of.get(&victim).copied().unwrap_or(victim);
+        let solo = [victim];
+        let members = groups.get(&owner).map_or(solo.as_slice(), Vec::as_slice);
+        for &member in members {
+            if seen.insert(member) {
+                total = total.saturating_add(use_count.get(&member).copied().unwrap_or(0));
+            }
+        }
+    }
+    total
+}
+
 fn evict_group(
     assignments: &mut FxHashMap<u32, PhysReg>,
     holders_by_reg: &mut FxHashMap<u8, Vec<u32>>,
@@ -4481,7 +4507,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     }
 
     // AArch64-only: steal a callee-saved from a colder holder for a missed IV.
-    // x86 stays out — same eviction already lost gzip inside the scan.
+    // This is separate from the web-aware, globally priced x86 phase below.
+    // Local exchanges inside the scan previously lost gzip.
     if !config.ra_config.no_loop_pin && arm_fp_pool && !all_phi_pairs.is_empty() {
         let k = config.ra_config.loop_pin;
         let phi_pair_values: FxHashSet<u32> = phi_coalesce
@@ -4556,7 +4583,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
         propagate_coalesce_members(&mut assignments, &coalesce_member_of);
     }
-    // Phase 2g (i686): hot-web steal on the narrow 4-register pool.
+    // Phase 2g (i686/x86-64): globally priced hot-web steals.
     //
     // Phase 1's start-point scan order is decisive on a pool this small:
     // long-lived parameters (defined at the entry, spanning every helper
@@ -4588,98 +4615,30 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         .iter()
         .any(|r| matches!(r.0, 4 | 5))
         && config.available_regs.iter().all(|r| r.0 <= 3);
-    if !config.ra_config.no_hot_web_steal && i686_narrow_pool && !all_phi_pairs.is_empty() {
-        let k = config.ra_config.hot_web_steal;
-        // Web-aware use count: the leader's own count plus every coalesce
-        // member's (the state-machine webs the phi-coalesce machinery
-        // propagates homes through).
-        let web_use_count = |v: u32| -> u64 {
-            let mut uc = use_count.get(&v).copied().unwrap_or(0);
-            if let Some(members) = coalesce_groups.get(&v) {
-                uc = uc.max(summed_use_weight(members, &use_count));
-            }
-            uc
-        };
-        let phi_pair_values: FxHashSet<u32> = phi_coalesce
-            .iter()
-            .flat_map(|c| [c.phi_dest, c.backedge_src])
-            .collect();
-        let mut candidates: Vec<(u32, u64)> = all_phi_pairs
-            .iter()
-            .map(|c| c.phi_dest)
-            .filter(|v| eligible.contains(v))
-            .filter(|v| iv_map.get(v).is_some_and(|&(s, e)| e > s))
-            .map(|v| (v, web_use_count(v)))
-            .filter(|&(_, count)| count >= 10)
-            .collect();
-        candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        candidates.dedup_by_key(|&mut (v, _)| v);
-
-        let overlaps_vid = |a: u32, b: u32| -> bool {
-            match (
-                allocation_owner_bounds(a, &merged_of, &iv_map),
-                allocation_owner_bounds(b, &merged_of, &iv_map),
-            ) {
-                (Some(ia), Some(ib)) => intervals_overlap(ia, ib),
-                _ => false,
-            }
-        };
-        let mut holders_by_reg: FxHashMap<u8, Vec<u32>> = FxHashMap::default();
-        for (&v, &r) in &assignments {
-            holders_by_reg.entry(r.0).or_default().push(v);
-        }
-
-        let mut steals = 0;
-        for &(vid, hot_count) in &candidates {
-            if steals >= k || assignments.contains_key(&vid) {
-                continue;
-            }
-            let mut best: Option<(u8, Vec<u32>, u64)> = None;
-            for (&reg_id, holders) in &holders_by_reg {
-                if !config.available_regs.iter().any(|r| r.0 == reg_id) {
-                    continue;
-                }
-                if holders
-                    .iter()
-                    .any(|h| phi_pair_values.contains(h) || config.reg_hints.contains_key(h))
-                {
-                    continue;
-                }
-                let evict: Vec<u32> = holders
-                    .iter()
-                    .copied()
-                    .filter(|&h| overlaps_vid(h, vid))
-                    .collect();
-                if evict.is_empty() {
-                    continue;
-                }
-                let cost = summed_use_weight(&evict, &use_count);
-                if cost >= hot_count {
-                    continue;
-                }
-                if best
-                    .as_ref()
-                    .is_none_or(|&(best_reg, _, c)| (cost, reg_id) < (c, best_reg))
-                {
-                    best = Some((reg_id, evict, cost));
-                }
-            }
-            if let Some((reg_id, evict, _)) = best {
-                for &v in &evict {
-                    evict_group(
-                        &mut assignments,
-                        &mut holders_by_reg,
-                        v,
-                        &coalesce_member_of,
-                        &coalesce_groups,
-                    );
-                }
-                assignments.insert(vid, PhysReg(reg_id));
-                holders_by_reg.entry(reg_id).or_default().push(vid);
-                steals += 1;
-            }
-        }
-        propagate_coalesce_members(&mut assignments, &coalesce_member_of);
+    // Use the target and the actual post-clobber pool, not XMM availability:
+    // -mgeneral-regs-only still needs GPR promotion. Empty/disabled pools and
+    // reserved rbp never gain a register here. No caller-saved/APX home is
+    // promoted to an ABI-preserved register.
+    let x86_64_pool = crate::common::types::target_elf_machine() == 62
+        && !config.available_regs.is_empty()
+        && config.available_regs.iter().all(|r| (1..=6).contains(&r.0));
+    if !config.ra_config.no_hot_web_steal
+        && (i686_narrow_pool || x86_64_pool)
+        && !all_phi_pairs.is_empty()
+    {
+        hot_web::steal_hot_loop_webs(
+            &mut assignments,
+            &hot_web::HotWebSteal {
+                config,
+                phi_pairs: &all_phi_pairs,
+                eligible: &eligible,
+                iv_map: &iv_map,
+                merged_of: &merged_of,
+                coalesce_groups: &coalesce_groups,
+                coalesce_member_of: &coalesce_member_of,
+                use_count: &use_count,
+            },
+        );
     }
 
     // Phase 2h (i686): iterated hazard refinement.  Phase 2/2d treated every

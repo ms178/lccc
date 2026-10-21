@@ -74,6 +74,10 @@ BENCHMARKS: tuple[Benchmark, ...] = (
     # Required source semantics, not optional tuning: these signed recurrences
     # intentionally overflow. Keeping the requirement here covers every native
     # and static caller, including correctness-only/default invocations.
+    Benchmark("llvm_batch6_scalar", "batch-six scalar contracts / synthetic call bundle",
+              ("llvm_batch6_scalar.c",), ("synthetic", "scalar", "bit", "calls")),
+    Benchmark("hot_web_loop", "call-spanning hot webs versus cold callee-saved holders",
+              ("hot_web_loop.c",), ("synthetic", "regalloc", "calls", "integer")),
     Benchmark("arith_loop", "32-variable arithmetic loop / register pressure",
               ("arith_loop.c", "01_arith_loop.c"), ("synthetic", "regalloc", "integer"),
               extra_flags=("-fwrapv",)),

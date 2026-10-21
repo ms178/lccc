@@ -157,3 +157,9 @@ flags (zero count leaves flags unchanged), general boolean-mask negation, range
 comparisons, byte division, PHI/path-sensitive comparisons and linker ICF.
 They remain work, not successes. Future batches should expand that ledger rather
 than replace outstanding work with broad claims of optimality.
+
+## Batch 6
+
+See [BATCH-006.md](BATCH-006.md) for the selected ten-report scalar cohort,
+proof/refusal boundaries, executable regressions and x86-64 whole-web
+callee-saved promotion. Existing coverage is not counted as new optimization.
