@@ -132,6 +132,13 @@ elif name == 'uname':
 elif name == 'dpkg':
     if args[:2] == ['--add-architecture', 'i386']:
         path('.i386').touch()
+    elif '-i' in args:
+        # `dpkg -i <file>.deb` needs no index: the package name is the part of
+        # the filename before the version and the architecture.
+        names = {pathlib.Path(value).name.rsplit('_', 2)[0]
+                 for value in args if value.endswith('.deb')}
+        bump('.dpkg-installs')
+        mark_installed(names)
 elif name == 'dpkg-query':
     package = args[-1]
     print('installed' if os.environ.get('READY') == '1' or package in installed()
@@ -295,6 +302,15 @@ class ProvisioningTests(unittest.TestCase):
         last_update = max(commands.index(update) for update in self.updates(commands))
         self.assertLess(last_update, first_install)
 
+    def test_ppa_flap_beyond_the_original_window_is_still_survived(self):
+        # The 2026-10-21 incident outlived the original four-round window, so
+        # a live index must still be preferred -- and reached -- over the
+        # offline fallback after more than four failed refreshes.
+        result, commands, _ = self.invoke(PPA_INDEX_FAILURES="5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.installs(commands)), 1)
+        self.assertGreaterEqual(len(self.updates(commands)), 6)
+
     def test_unresolvable_index_fails_before_any_install_attempt(self):
         # The old script replayed `apt-get install` three times against an
         # index that never contained gcc-16: three guaranteed-to-fail
@@ -448,6 +464,56 @@ class ProvisioningTests(unittest.TestCase):
         result, commands, _ = self.invoke("--invalid")
         self.assertEqual(result.returncode, 2)
         self.assertEqual(commands, [])
+
+    @staticmethod
+    def write_cached_debs(archive, packages):
+        """Populate an archive directory the way a previous successful run does."""
+        archive.mkdir(parents=True, exist_ok=True)
+        for package in packages:
+            (archive / f"{package}_16.2.0-1_amd64.deb").write_bytes(b"deb")
+
+    def test_index_outage_installs_from_the_verified_deb_cache(self):
+        # 2026-10-21: the PPA index outlived the refresh window twice and took
+        # whole lanes down. The debs from a previous verified run are already
+        # on disk and dpkg needs no index, so the outage must cost a fetch,
+        # not the lane -- and the result still has to pass the version
+        # contract.
+        with tempfile.TemporaryDirectory() as outer:
+            archive = Path(outer) / "apt-archive"
+            self.write_cached_debs(archive, MULTILIB_PACKAGES)
+            result, commands, _ = self.invoke(
+                "--multilib", LCCC_CI_APT_ARCHIVE_DIR=str(archive),
+                PPA_INDEX_FAILURES="99", GITHUB_ACTIONS="true")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.installs(commands), [], "no index, no apt install")
+            self.assertTrue(any(c[0] == "dpkg" and "-i" in c for c in commands), commands)
+            self.assertIn("::warning title=GCC 16 provisioned from the deb cache",
+                          result.stdout)
+            self.assertNotIn("::error", result.stdout)
+
+    def test_deb_cache_that_does_not_cover_the_request_still_fails_closed(self):
+        # A cache missing one requested name proves nothing about that name;
+        # the lane must fail exactly as before instead of installing a
+        # partial toolchain.
+        with tempfile.TemporaryDirectory() as outer:
+            archive = Path(outer) / "apt-archive"
+            self.write_cached_debs(archive, MULTILIB_PACKAGES[:-1])
+            result, commands, _ = self.invoke(
+                "--multilib", LCCC_CI_APT_ARCHIVE_DIR=str(archive),
+                PPA_INDEX_FAILURES="99", GITHUB_ACTIONS="true")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(any(c[0] == "dpkg" and "-i" in c for c in commands), commands)
+            self.assertIn("not resolvable from the configured repositories", result.stderr)
+            self.assertIn("::error", result.stdout)
+
+    def test_deb_cache_is_untouched_while_the_index_resolves(self):
+        with tempfile.TemporaryDirectory() as outer:
+            archive = Path(outer) / "apt-archive"
+            self.write_cached_debs(archive, BASE_PACKAGES)
+            result, commands, _ = self.invoke(LCCC_CI_APT_ARCHIVE_DIR=str(archive))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(self.installs(commands)), 1)
+            self.assertFalse(any(c[0] == "dpkg" and "-i" in c for c in commands), commands)
 
     def test_non_numeric_retry_delay_is_rejected(self):
         result, commands, _ = self.invoke(LCCC_CI_APT_RETRY_DELAY="soon")
