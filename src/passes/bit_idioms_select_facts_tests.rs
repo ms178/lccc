@@ -516,3 +516,20 @@ fn relational_guards_refuse_missing_bounds_sparse_masks_and_word_truthiness() {
         assert!(rewrite(&source).is_none());
     }
 }
+
+#[test]
+fn predicate_parity_refuses_shared_choices_and_noncanonical_conditions() {
+    let ty = IrType::U32;
+    let mut prefix = vec![
+        cmp(3, IrCmpOp::Ne, v(0), constant(0, ty), ty),
+        cmp(4, IrCmpOp::Ne, v(1), constant(0, ty), ty),
+        sel(5, v(3), v(0), v(1), ty),
+        sel(6, v(3), v(1), v(0), ty),
+    ];
+    let mut shared = prefix.clone();
+    shared.push(bin(Value(8), IrBinOp::Add, v(5), v(0), ty));
+    shared.push(sel(7, v(4), v(5), v(6), ty));
+    assert!(rewrite(&shared).is_none());
+    prefix.push(sel(7, v(2), v(5), v(6), ty));
+    assert!(rewrite(&prefix).is_none());
+}

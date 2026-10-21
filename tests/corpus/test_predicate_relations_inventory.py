@@ -8,12 +8,34 @@ ROOT = Path(__file__).resolve().parents[2]
 DIRECTORY = ROOT / "engineering/llvm-missed"
 
 
+EXPECTED_NEW = {
+    33576, 45821, 51748, 57635, 58589, 59266, 59393, 60167,
+    61365, 63321, 63472, 63756, 64583, 64884, 66101, 69123,
+    71792, 72651, 73904, 75004, 75784, 79266, 81288, 82350,
+    83225, 85833, 86176, 88107, 88481, 95994, 96765, 97044,
+    98800, 102355, 104772, 110919, 118108, 167173, 172888, 174937,
+    180492, 183584, 186509, 186558, 192094, 202066, 202576, 205005,
+    223249, 232620,
+}
+EXPECTED_PRIOR_DEFERRALS = {
+    1884, 3007, 6509, 10156, 13134, 13687, 35970, 38139,
+    38926, 41333, 41757, 41801, 41908, 42219, 45243, 45478,
+    46405, 47868, 47946, 49562, 51090, 54856, 55016, 55468,
+    57666, 58624, 59555, 59773, 61671, 62514, 62898, 63749,
+    63848, 64238, 64859, 69333, 73417, 78038, 79696, 79823,
+    80100, 82075, 84038, 84656, 84763, 85823, 85939, 86874,
+    96455, 96690, 98848, 102946, 108559, 150954, 213877, 219334,
+}
+
+
 class PredicateRelationsInventory(unittest.TestCase):
     def test_identity_sets_followups_and_current_dispositions(self):
         source = json.loads((DIRECTORY / "predicate-relations-sources.json").read_text())
         reports = source["reports"]
         new = {r["number"] for r in reports if r["review_kind"] == "new"}
         old = {r["number"] for r in reports if r["review_kind"] == "prior-deferral"}
+        self.assertEqual(new, EXPECTED_NEW)
+        self.assertEqual(old, EXPECTED_PRIOR_DEFERRALS)
         self.assertEqual(len(new), 50)
         self.assertEqual(len(old), 56)
         self.assertFalse(new & old)
