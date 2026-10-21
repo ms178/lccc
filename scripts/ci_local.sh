@@ -1140,9 +1140,10 @@ gate "llvm-missed-inventory-tests" fast python3 scripts/test_llvm_missed_invento
 gate "llvm-missed-inventory-optimized-tests" fast python3 -O scripts/test_llvm_missed_inventory.py
 gate "llvm-missed-zero-choice" fast python3 tests/regression/check_llvm_missed_zero_choice.py
 gate "llvm-integer-observations" fast python3 tests/regression/check_llvm_integer_observations.py
-gate "llvm-missed-bit-demand" fast python3 tests/regression/check_llvm_bit_demand.py
-gate "llvm-missed-scalar-facts" fast python3 tests/regression/check_llvm_scalar_facts.py
-gate "llvm-missed-guarded-folds" fast python3 tests/regression/check_llvm_guarded_folds.py
+gate "llvm-bit-demand" fast python3 tests/regression/check_llvm_bit_demand.py
+gate "llvm-scalar-facts" fast python3 tests/regression/check_llvm_scalar_facts.py
+gate "llvm-guarded-folds" fast python3 tests/regression/check_llvm_guarded_folds.py
+gate "llvm-word-counts" fast python3 tests/regression/check_llvm_word_counts.py
 
 gate "tls-model-option" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_option.sh

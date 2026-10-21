@@ -1578,6 +1578,7 @@ jobs:
         python3 tests/regression/check_llvm_bit_demand.py
         python3 tests/regression/check_llvm_scalar_facts.py
         python3 tests/regression/check_llvm_guarded_folds.py
+        python3 tests/regression/check_llvm_word_counts.py
         bash tests/regression/check_tls_model_option.sh
         bash tests/regression/check_f128_sign_intrinsics_strict_fp.sh
         bash tests/regression/check_fma_builtin_strict_fp.sh

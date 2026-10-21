@@ -1,4 +1,4 @@
-# scalar facts: conditional scalar facts and x86-64 hot-web promotion
+# Conditional scalar facts and hot-web promotion
 
 ## Scope and sources
 

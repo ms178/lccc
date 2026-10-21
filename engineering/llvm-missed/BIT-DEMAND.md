@@ -1,4 +1,4 @@
-# bit demand: demanded bits, cardinality synthesis, and boolean returns
+# Bit demand and Boolean cardinality
 
 This batch adds **60 reduced expression contracts with 32- and 64-bit native
 companions** (120 width-specific witnesses). Width, signedness, operand-order,

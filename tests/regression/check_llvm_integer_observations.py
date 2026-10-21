@@ -102,6 +102,16 @@ def main():
                 if name == "lshr_full":
                     if len(yes) > len(no) or any(re.match(r"shr", x) for x in yes):
                         raise ValueError(f"{name}: threshold fold absent or regressed")
+                elif name == "not_mask":
+                    # Current main also shortened the disabled Boolean return.
+                    # A tie still proves complement elimination, but only with
+                    # the exact mask/equality shape and a NOT in the control.
+                    mask = r"(?:and|cmp)[lq]\s+\$23130,"
+                    if (len(yes) > len(no)
+                        or any(re.match(r"not[lq]\b", x) for x in yes)
+                        or not any(re.match(r"not[lq]\b", x) for x in no)
+                        or sum(bool(re.match(mask, x)) for x in yes) != 2):
+                        raise ValueError(f"{name}: complement/equality mechanism absent")
                 elif len(yes) >= len(no):
                     raise ValueError(
                         f"{name}: missing per-rule policy witness {yes} vs {no}"

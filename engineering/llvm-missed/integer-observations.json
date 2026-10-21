@@ -1,5 +1,4 @@
 {
-  "batch": 2,
   "implementation_families": [
     {
       "id": 1,
@@ -222,5 +221,6 @@
       "proof": "If 2^k divides d, low k bits of x%d equal those of x, even for non-power-of-two d."
     }
   ],
-  "policy": "Groups intentionally combine direction, operand-order, width and polarity variants; coverage remains limited per upstream report."
+  "policy": "Groups intentionally combine direction, operand-order, width and polarity variants; coverage remains limited per upstream report.",
+  "cohort": "integer-observations"
 }

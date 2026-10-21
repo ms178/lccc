@@ -1,4 +1,4 @@
-# guarded folds: hot-loop copy costs and the deferred scalar/ELF contracts
+# Guarded scalar folds and unwind identity
 
 Baseline: merged main `cfb2e0a822e2dba42a3d474f5970ab529e0e5e84`.
 The baseline compiler was built warning-denied with the fastbuild preset and

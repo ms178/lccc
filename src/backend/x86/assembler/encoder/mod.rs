@@ -6943,7 +6943,7 @@ mod encoding_opt_tests {
 
     #[test]
     fn vex_mem_source_forms() {
-        // Gap-sweep integer observations: every byte verified against GAS 2.47.
+        // Encoding gap sweep: every byte verified against GAS 2.47.
         // Dual-encoded VNNI rows (vpdpbusd/vpdpwssd) default to the EVEX
         // encoding like GAS 2.47 on BOTH x86-64 and i686 (byte-probed;
         // clang/gcc/icc agree); the {vex} hint forces the 6-byte VEX row.

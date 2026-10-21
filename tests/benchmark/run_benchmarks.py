@@ -74,7 +74,9 @@ BENCHMARKS: tuple[Benchmark, ...] = (
     # Required source semantics, not optional tuning: these signed recurrences
     # intentionally overflow. Keeping the requirement here covers every native
     # and static caller, including correctness-only/default invocations.
-    Benchmark("llvm_scalar_facts", "scalar facts scalar contracts / synthetic call bundle",
+    Benchmark("llvm_word_counts", "scalar zero-count unions and constant caps / synthetic call bundle",
+              ("llvm_word_counts.c",), ("synthetic", "count", "integer")),
+    Benchmark("llvm_scalar_facts", "conditional scalar facts / synthetic call bundle",
               ("llvm_scalar_facts.c",), ("synthetic", "scalar", "bit", "calls")),
     Benchmark("hot_web_loop", "call-spanning hot webs versus cold callee-saved holders",
               ("hot_web_loop.c",), ("synthetic", "regalloc", "calls", "integer")),

@@ -1,0 +1,2597 @@
+{
+  "baseline_commit": "2883e5e",
+  "main_base": "91bbcda81fbcb9750298f9869fb5b990d9d819f5",
+  "baseline_src_tree": "67d7ac31ca8729b2594787c589084a906ad6051e",
+  "source_tree_scope": "src/ subtree; recorded separately from semantic report/doc renames.",
+  "compiler_sha256": {
+    "lccc-before": "92335e3a61a1390cb5d0b2a4b224872b63ca1958e26d0e1cf19529a8c3522da2",
+    "lccc-after": "3c5f0999b1fd176fa81d416e15bdfffb5009ddb005026b559a83f5c740df16b1",
+    "lccc-ld-after": "ffca7ca8e5208f393491d8488aaa80a0235a9653c41f1fd1faf4b865568acde8"
+  },
+  "compiler_identity_after_comment_cleanup": "Final strict rebuild compiler and linker compare byte-identical with the artifacts used for the complete correctness sweep.",
+  "manifest_sha256": {
+    "Cargo.toml": "306b5fd557e407c61dc19fb0ddbeae6045ab2b5befc4aee768c7a4c28ffb9e38",
+    "Cargo.lock": "1dacbe0065a8a33fe766f075df07af00af743254c1cf89686ad4fb04a2ad9bf2"
+  },
+  "workloads": 49,
+  "complete": true,
+  "binary_changed": [
+    "llvm_word_counts"
+  ],
+  "correctness": [
+    {
+      "name": "volatile_reduce",
+      "source_sha256": "dbf85da35c2c821c6277c0fe7e3854afeb6c453116ef329ca6116744c7bb244a",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fa3d6d1c97aede87 c7513ddbe1e9c203\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fa3d6d1c97aede87 c7513ddbe1e9c203\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fa3d6d1c97aede87 c7513ddbe1e9c203\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fa3d6d1c97aede87 c7513ddbe1e9c203\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "494d883ba990899c41f2bd02f5bbc32918da19365cd2e391a88631d48ef19308",
+          "text_bytes": 1457,
+          "source_sha256": "dbf85da35c2c821c6277c0fe7e3854afeb6c453116ef329ca6116744c7bb244a"
+        },
+        "clang": {
+          "binary_sha256": "06ecb1766fa024df3644f35ccb52b12a266cb90678f3b13b316f54f2bcbe3421",
+          "text_bytes": 1922,
+          "source_sha256": "dbf85da35c2c821c6277c0fe7e3854afeb6c453116ef329ca6116744c7bb244a"
+        },
+        "gcc": {
+          "binary_sha256": "32425ce7095e9e78aae58cbf16acc928534b34871309a10c9908761668b9a928",
+          "text_bytes": 1506,
+          "source_sha256": "dbf85da35c2c821c6277c0fe7e3854afeb6c453116ef329ca6116744c7bb244a"
+        },
+        "lccc": {
+          "binary_sha256": "494d883ba990899c41f2bd02f5bbc32918da19365cd2e391a88631d48ef19308",
+          "text_bytes": 1457,
+          "source_sha256": "dbf85da35c2c821c6277c0fe7e3854afeb6c453116ef329ca6116744c7bb244a"
+        }
+      }
+    },
+    {
+      "name": "llvm_word_counts",
+      "source_sha256": "ca5e080cf86d475cfe4f604a3800b1f263022ceb8cd8998e5201602007803f5e",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0000000001930661\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0000000001930661\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0000000001930661\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0000000001930661\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "2ced1e080d3a17a15f0733d8095185bb71d8d3274e795fe0c5b51164d2e0da10",
+          "text_bytes": 2049,
+          "source_sha256": "ca5e080cf86d475cfe4f604a3800b1f263022ceb8cd8998e5201602007803f5e"
+        },
+        "clang": {
+          "binary_sha256": "df5ba9d0e0147e58b3ddea51f35e99e5f201f5e7ba967aafda9b4977dd2507df",
+          "text_bytes": 2088,
+          "source_sha256": "ca5e080cf86d475cfe4f604a3800b1f263022ceb8cd8998e5201602007803f5e"
+        },
+        "gcc": {
+          "binary_sha256": "e1671c952c54fc93d51d53c8766b7eb03012fc689b812753f1fce9cf1728e0ba",
+          "text_bytes": 1901,
+          "source_sha256": "ca5e080cf86d475cfe4f604a3800b1f263022ceb8cd8998e5201602007803f5e"
+        },
+        "lccc": {
+          "binary_sha256": "bd779583ec5463b506ad077efaf595534d2092bd1c46278941a92c68226b42b2",
+          "text_bytes": 1921,
+          "source_sha256": "ca5e080cf86d475cfe4f604a3800b1f263022ceb8cd8998e5201602007803f5e"
+        }
+      }
+    },
+    {
+      "name": "llvm_scalar_facts",
+      "source_sha256": "2954c1b985e9272bdf4a9a102367d250b209f567275da055f697d3207df1b386",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "002dc88fa187f4bd\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "002dc88fa187f4bd\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "002dc88fa187f4bd\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "002dc88fa187f4bd\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "8a3bdac04e7c85c36eb7a385b152f8d1e452f6b1aa058cee9c9b6713b2b32934",
+          "text_bytes": 2439,
+          "source_sha256": "2954c1b985e9272bdf4a9a102367d250b209f567275da055f697d3207df1b386"
+        },
+        "clang": {
+          "binary_sha256": "6463c336ebf153d1113f164d1f66fc9fdf99affab79f465e5f1a395f21e5d17b",
+          "text_bytes": 2690,
+          "source_sha256": "2954c1b985e9272bdf4a9a102367d250b209f567275da055f697d3207df1b386"
+        },
+        "gcc": {
+          "binary_sha256": "0c00569b3210f623d89d4092c3eeeebe0d5975cf8d13ea675a377a761b68e164",
+          "text_bytes": 2447,
+          "source_sha256": "2954c1b985e9272bdf4a9a102367d250b209f567275da055f697d3207df1b386"
+        },
+        "lccc": {
+          "binary_sha256": "8a3bdac04e7c85c36eb7a385b152f8d1e452f6b1aa058cee9c9b6713b2b32934",
+          "text_bytes": 2439,
+          "source_sha256": "2954c1b985e9272bdf4a9a102367d250b209f567275da055f697d3207df1b386"
+        }
+      }
+    },
+    {
+      "name": "hot_web_loop",
+      "source_sha256": "5076277f175bf47797ac2566c499e7239f058ad76b7d270b5e0089283b154790",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "b7ce7f4efe3694a5\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "b7ce7f4efe3694a5\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "b7ce7f4efe3694a5\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "b7ce7f4efe3694a5\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "424bf8c972e30964141faa24ed4d190269aae3628857f6b0aa836e5abe1fa729",
+          "text_bytes": 1422,
+          "source_sha256": "5076277f175bf47797ac2566c499e7239f058ad76b7d270b5e0089283b154790"
+        },
+        "clang": {
+          "binary_sha256": "d8e151bfdb1a059ebe074774deb6577e2ca3aeaba6955a0d6297068613046772",
+          "text_bytes": 1700,
+          "source_sha256": "5076277f175bf47797ac2566c499e7239f058ad76b7d270b5e0089283b154790"
+        },
+        "gcc": {
+          "binary_sha256": "2de069920e3eeb6e7ed4d0fdabca5fe6afc23dd81c8ab30a54d66109b787e421",
+          "text_bytes": 1329,
+          "source_sha256": "5076277f175bf47797ac2566c499e7239f058ad76b7d270b5e0089283b154790"
+        },
+        "lccc": {
+          "binary_sha256": "424bf8c972e30964141faa24ed4d190269aae3628857f6b0aa836e5abe1fa729",
+          "text_bytes": 1422,
+          "source_sha256": "5076277f175bf47797ac2566c499e7239f058ad76b7d270b5e0089283b154790"
+        }
+      }
+    },
+    {
+      "name": "arith_loop",
+      "source_sha256": "154a39b6e98cf506bf0d62ed4ab44dad88f7d75923a4eb797b4c41e9339f662c",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "arith_loop result: 1335433016\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "arith_loop result: 1335433016\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "arith_loop result: 1335433016\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "arith_loop result: 1335433016\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "155431399c4f33c96068b0b102f68057415147a59e68903bd46b49135bdce621",
+          "text_bytes": 2071,
+          "source_sha256": "154a39b6e98cf506bf0d62ed4ab44dad88f7d75923a4eb797b4c41e9339f662c"
+        },
+        "clang": {
+          "binary_sha256": "87ff0a2f3073de38f62e7110e57414e249b519ceb97e5c38c45dad8bd63a91a2",
+          "text_bytes": 2349,
+          "source_sha256": "154a39b6e98cf506bf0d62ed4ab44dad88f7d75923a4eb797b4c41e9339f662c"
+        },
+        "gcc": {
+          "binary_sha256": "466b89be20e9cb7a1f848e6e78cd267f8a7d20acad4b41804af41f1f4c65a0a5",
+          "text_bytes": 2043,
+          "source_sha256": "154a39b6e98cf506bf0d62ed4ab44dad88f7d75923a4eb797b4c41e9339f662c"
+        },
+        "lccc": {
+          "binary_sha256": "155431399c4f33c96068b0b102f68057415147a59e68903bd46b49135bdce621",
+          "text_bytes": 2071,
+          "source_sha256": "154a39b6e98cf506bf0d62ed4ab44dad88f7d75923a4eb797b4c41e9339f662c"
+        }
+      }
+    },
+    {
+      "name": "fib",
+      "source_sha256": "983660d7782bcce1d90c389a5869452a6b055a399654ad63f34491245ed41379",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fib(40) = 102334155\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fib(40) = 102334155\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fib(40) = 102334155\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "fib(40) = 102334155\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "bbee905a4e4aeed20490b9aded9a2bc5d42baa46772a349da83eee09b912f8f7",
+          "text_bytes": 1004,
+          "source_sha256": "983660d7782bcce1d90c389a5869452a6b055a399654ad63f34491245ed41379"
+        },
+        "clang": {
+          "binary_sha256": "74c01c338aec84c1b4d626d7b191ece37157d0eac4a92d9ac733dd98fd5fd3d7",
+          "text_bytes": 1410,
+          "source_sha256": "983660d7782bcce1d90c389a5869452a6b055a399654ad63f34491245ed41379"
+        },
+        "gcc": {
+          "binary_sha256": "b15da2abfbe2660fc56589424335df45002a3c28a6edbd673ad7ce9d75c87aa2",
+          "text_bytes": 1968,
+          "source_sha256": "983660d7782bcce1d90c389a5869452a6b055a399654ad63f34491245ed41379"
+        },
+        "lccc": {
+          "binary_sha256": "bbee905a4e4aeed20490b9aded9a2bc5d42baa46772a349da83eee09b912f8f7",
+          "text_bytes": 1004,
+          "source_sha256": "983660d7782bcce1d90c389a5869452a6b055a399654ad63f34491245ed41379"
+        }
+      }
+    },
+    {
+      "name": "matmul",
+      "source_sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "matmul C[128][128] = 19019.7480\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "matmul C[128][128] = 19019.7480\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "matmul C[128][128] = 19019.7480\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "matmul C[128][128] = 19019.7480\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "aded76542edd8b9ec1338cb5bf209754e2ff9109ade367eb1416e06612097aef",
+          "text_bytes": 1569,
+          "source_sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560"
+        },
+        "clang": {
+          "binary_sha256": "ec27c56f5979e59aaad08c79ef038961053f826b8c44b4a2e893d137108e0633",
+          "text_bytes": 2144,
+          "source_sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560"
+        },
+        "gcc": {
+          "binary_sha256": "dbb304ffe5cbc5e696dc0886cbb1c7747fa441104b2d6801a5a2991710e6f861",
+          "text_bytes": 1449,
+          "source_sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560"
+        },
+        "lccc": {
+          "binary_sha256": "aded76542edd8b9ec1338cb5bf209754e2ff9109ade367eb1416e06612097aef",
+          "text_bytes": 1569,
+          "source_sha256": "927478b18ee0aa0d118eea4d2a9d6bb1251fdf3c64c2619ab578463beba99560"
+        }
+      }
+    },
+    {
+      "name": "qsort",
+      "source_sha256": "4b7916c27962da3a9cf71ce75b09910467449ce727a1fb2d3dbf75f5f011641a",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "qsort: arr[500000] = 1071022847\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "qsort: arr[500000] = 1071022847\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "qsort: arr[500000] = 1071022847\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "qsort: arr[500000] = 1071022847\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "7641e1be71eaa1ae23821b1604fbca05831a4cfb68fdf838eeeb362db650bc87",
+          "text_bytes": 1130,
+          "source_sha256": "4b7916c27962da3a9cf71ce75b09910467449ce727a1fb2d3dbf75f5f011641a"
+        },
+        "clang": {
+          "binary_sha256": "943d4fe5d673443efb640308a4c3a530d0928c0fcc144e3bb0f264cabe9aebb5",
+          "text_bytes": 1515,
+          "source_sha256": "4b7916c27962da3a9cf71ce75b09910467449ce727a1fb2d3dbf75f5f011641a"
+        },
+        "gcc": {
+          "binary_sha256": "b302cb0187a0e9e4be3b324095f48462d35cd75cbe44ef5835b14a6a5ac9fdbc",
+          "text_bytes": 1256,
+          "source_sha256": "4b7916c27962da3a9cf71ce75b09910467449ce727a1fb2d3dbf75f5f011641a"
+        },
+        "lccc": {
+          "binary_sha256": "7641e1be71eaa1ae23821b1604fbca05831a4cfb68fdf838eeeb362db650bc87",
+          "text_bytes": 1130,
+          "source_sha256": "4b7916c27962da3a9cf71ce75b09910467449ce727a1fb2d3dbf75f5f011641a"
+        }
+      }
+    },
+    {
+      "name": "sieve",
+      "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "primes up to 10000000: 664579\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "primes up to 10000000: 664579\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "primes up to 10000000: 664579\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "primes up to 10000000: 664579\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "b49d4afa3ca31f1578c5a70614d397f698bfe5a6f08d592b0b478e1ce1ce6567",
+          "text_bytes": 1238,
+          "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b"
+        },
+        "clang": {
+          "binary_sha256": "4e3bd6059cbf42bdc671f58823857a3fd95e07f0dba2514ae5d92d16557d769c",
+          "text_bytes": 2327,
+          "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b"
+        },
+        "gcc": {
+          "binary_sha256": "46bd4e63c4cd3bdccdf9fe84cda7fcab835a36de68a08f512893a27a55106f19",
+          "text_bytes": 1290,
+          "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b"
+        },
+        "lccc": {
+          "binary_sha256": "b49d4afa3ca31f1578c5a70614d397f698bfe5a6f08d592b0b478e1ce1ce6567",
+          "text_bytes": 1238,
+          "source_sha256": "2fd99e297a95711800c1bf4b2facd7e5e09efa740b113c86837e3d0cd22f069b"
+        }
+      }
+    },
+    {
+      "name": "tce_sum",
+      "source_sha256": "ef59786bfefe89d89ac29f5aa23428938e6e8a013e5a80e5c17e1566ab86836b",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum(10000000) = 50000005000000\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum(10000000) = 50000005000000\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum(10000000) = 50000005000000\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum(10000000) = 50000005000000\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "50486d2440abd77847af48b77aae3c9f41f507fd32c8299fdf37543d4150e22f",
+          "text_bytes": 890,
+          "source_sha256": "ef59786bfefe89d89ac29f5aa23428938e6e8a013e5a80e5c17e1566ab86836b"
+        },
+        "clang": {
+          "binary_sha256": "000489ee76f9091cf157254fe51c78eda74008efa236c09915e7d9b6a24e0356",
+          "text_bytes": 1299,
+          "source_sha256": "ef59786bfefe89d89ac29f5aa23428938e6e8a013e5a80e5c17e1566ab86836b"
+        },
+        "gcc": {
+          "binary_sha256": "c83f822e1039a357d7b5167b3cbd443de1ef193b39363fc7a6ef6bfc20f7ead1",
+          "text_bytes": 1021,
+          "source_sha256": "ef59786bfefe89d89ac29f5aa23428938e6e8a013e5a80e5c17e1566ab86836b"
+        },
+        "lccc": {
+          "binary_sha256": "50486d2440abd77847af48b77aae3c9f41f507fd32c8299fdf37543d4150e22f",
+          "text_bytes": 890,
+          "source_sha256": "ef59786bfefe89d89ac29f5aa23428938e6e8a013e5a80e5c17e1566ab86836b"
+        }
+      }
+    },
+    {
+      "name": "nbody",
+      "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "-0.169075164\n-0.169083134\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "-0.169075164\n-0.169083134\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "-0.169075164\n-0.169083134\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "-0.169075164\n-0.169083134\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "80c4990e8b591817c6a396b5359e7699ecb2993b0bef6a02d90ffb79821a9ff4",
+          "text_bytes": 2670,
+          "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837"
+        },
+        "clang": {
+          "binary_sha256": "e42d934601672f6a025b9360311ac6b32a47dcd39ad9a2a4c13e88b421b63123",
+          "text_bytes": 2903,
+          "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837"
+        },
+        "gcc": {
+          "binary_sha256": "b98a56eea22ee9cb0b9fc323c20255094aafbbf801e61a4d9b1d476523e7cec7",
+          "text_bytes": 2455,
+          "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837"
+        },
+        "lccc": {
+          "binary_sha256": "80c4990e8b591817c6a396b5359e7699ecb2993b0bef6a02d90ffb79821a9ff4",
+          "text_bytes": 2670,
+          "source_sha256": "45db2f21add3645a945f1a6635d642f1aad5caecfa4c7b47da4943331a321837"
+        }
+      }
+    },
+    {
+      "name": "binary_trees",
+      "source_sha256": "0a19ef11ab58e32a6ef0ecb8703a856347ba295d2bca67bbe20dfa5243251dc0",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "stretch tree of depth 19\t check: 1048575\n262144\t trees of depth 4\t check: 8126464\n65536\t trees of depth 6\t check: 8323072\n16384\t trees of depth 8\t check: 8372224\n4096\t trees of depth 10\t check: 8384512\n1024\t trees of depth 12\t check: 8387584\n256\t trees of depth 14\t check: 8388352\n64\t trees of depth 16\t check: 8388544\n16\t trees of depth 18\t check: 8388592\nlong lived tree of depth 18\t check: 524287\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "stretch tree of depth 19\t check: 1048575\n262144\t trees of depth 4\t check: 8126464\n65536\t trees of depth 6\t check: 8323072\n16384\t trees of depth 8\t check: 8372224\n4096\t trees of depth 10\t check: 8384512\n1024\t trees of depth 12\t check: 8387584\n256\t trees of depth 14\t check: 8388352\n64\t trees of depth 16\t check: 8388544\n16\t trees of depth 18\t check: 8388592\nlong lived tree of depth 18\t check: 524287\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "stretch tree of depth 19\t check: 1048575\n262144\t trees of depth 4\t check: 8126464\n65536\t trees of depth 6\t check: 8323072\n16384\t trees of depth 8\t check: 8372224\n4096\t trees of depth 10\t check: 8384512\n1024\t trees of depth 12\t check: 8387584\n256\t trees of depth 14\t check: 8388352\n64\t trees of depth 16\t check: 8388544\n16\t trees of depth 18\t check: 8388592\nlong lived tree of depth 18\t check: 524287\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "stretch tree of depth 19\t check: 1048575\n262144\t trees of depth 4\t check: 8126464\n65536\t trees of depth 6\t check: 8323072\n16384\t trees of depth 8\t check: 8372224\n4096\t trees of depth 10\t check: 8384512\n1024\t trees of depth 12\t check: 8387584\n256\t trees of depth 14\t check: 8388352\n64\t trees of depth 16\t check: 8388544\n16\t trees of depth 18\t check: 8388592\nlong lived tree of depth 18\t check: 524287\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "2da230912e7cdd967d8db4e06d6860cd0f0aed9dcb981ad88f04a06556047ac3",
+          "text_bytes": 1788,
+          "source_sha256": "0a19ef11ab58e32a6ef0ecb8703a856347ba295d2bca67bbe20dfa5243251dc0"
+        },
+        "clang": {
+          "binary_sha256": "2ebdd7e3a8f17e8343df61f122e863681a137fddb3ec9665494cf9ef329c9359",
+          "text_bytes": 2231,
+          "source_sha256": "0a19ef11ab58e32a6ef0ecb8703a856347ba295d2bca67bbe20dfa5243251dc0"
+        },
+        "gcc": {
+          "binary_sha256": "18c92ddcc0187c09cc0e0095840be185188e7341a1c63751ccafe01a829f4335",
+          "text_bytes": 7441,
+          "source_sha256": "0a19ef11ab58e32a6ef0ecb8703a856347ba295d2bca67bbe20dfa5243251dc0"
+        },
+        "lccc": {
+          "binary_sha256": "2da230912e7cdd967d8db4e06d6860cd0f0aed9dcb981ad88f04a06556047ac3",
+          "text_bytes": 1788,
+          "source_sha256": "0a19ef11ab58e32a6ef0ecb8703a856347ba295d2bca67bbe20dfa5243251dc0"
+        }
+      }
+    },
+    {
+      "name": "spectral_norm",
+      "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "1.274224152\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "1.274224152\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "1.274224152\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "1.274224152\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "c320733395db1a9ece60dc7714422c98951cadd4e6a6906a6ab6c29962c77d0c",
+          "text_bytes": 1570,
+          "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a"
+        },
+        "clang": {
+          "binary_sha256": "812938533e1ad6612c5b4c89097d99a32754bfbab1298c21cfc2a4b4b65ee801",
+          "text_bytes": 2489,
+          "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a"
+        },
+        "gcc": {
+          "binary_sha256": "d1d9cb684a4c956013916066dab1c8a79394b8a5814015e5fcee83842561fbe9",
+          "text_bytes": 2078,
+          "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a"
+        },
+        "lccc": {
+          "binary_sha256": "c320733395db1a9ece60dc7714422c98951cadd4e6a6906a6ab6c29962c77d0c",
+          "text_bytes": 1570,
+          "source_sha256": "21a48dccebcbc3b9496263f62df260d278051c3cd1a528ed99c8b66bef481e6a"
+        }
+      }
+    },
+    {
+      "name": "mandelbrot",
+      "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "mandelbrot total iterations: 380863975\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "mandelbrot total iterations: 380863975\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "mandelbrot total iterations: 380863975\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "mandelbrot total iterations: 380863975\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "a9a5dfe19b391a6bac81bde4e9cd0a8ff8b41a29e115e3d6668d6f37b780a0f0",
+          "text_bytes": 1277,
+          "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c"
+        },
+        "clang": {
+          "binary_sha256": "e54577d4498e64c1358eb27f1ce2872ca6219c7a360a673799cca4b1266b1af1",
+          "text_bytes": 1667,
+          "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c"
+        },
+        "gcc": {
+          "binary_sha256": "4a12a76b42b89e78b82cf72fc700b859e502b30553596eb7f8e6f4c2854d235f",
+          "text_bytes": 1284,
+          "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c"
+        },
+        "lccc": {
+          "binary_sha256": "a9a5dfe19b391a6bac81bde4e9cd0a8ff8b41a29e115e3d6668d6f37b780a0f0",
+          "text_bytes": 1277,
+          "source_sha256": "3f9d3a3e0da962e5a1840790ebf46fa09f38cd5e758645c8c65625fa9882555c"
+        }
+      }
+    },
+    {
+      "name": "hash_table",
+      "source_sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "hash_table sum: 1999998000000\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "hash_table sum: 1999998000000\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "hash_table sum: 1999998000000\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "hash_table sum: 1999998000000\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "bd5a03e0b1371da0aea2fd6a22e140fd68b349cda4cd9ca85417f37fbe0caf50",
+          "text_bytes": 1603,
+          "source_sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a"
+        },
+        "clang": {
+          "binary_sha256": "a8a147706507d48d033d7c1630cd8c627521387622ee4359f15b17658456ed8b",
+          "text_bytes": 1893,
+          "source_sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a"
+        },
+        "gcc": {
+          "binary_sha256": "33474e3c5e01e2eae939f17324f58b7fd594092c809e87cfd89da7f247c9b1dc",
+          "text_bytes": 1596,
+          "source_sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a"
+        },
+        "lccc": {
+          "binary_sha256": "bd5a03e0b1371da0aea2fd6a22e140fd68b349cda4cd9ca85417f37fbe0caf50",
+          "text_bytes": 1603,
+          "source_sha256": "1c742684a0ea694fbeb95d249748488e89f9033c64d518cd1fafe27da24a2e5a"
+        }
+      }
+    },
+    {
+      "name": "strlen_bench",
+      "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "strlen total: 494896800, cmp_sum: 67, found: 2257, copy_sum: 544861400\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "strlen total: 494896800, cmp_sum: 67, found: 2257, copy_sum: 544861400\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "strlen total: 494896800, cmp_sum: 67, found: 2257, copy_sum: 544861400\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "strlen total: 494896800, cmp_sum: 67, found: 2257, copy_sum: 544861400\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "4b59a374981994ff1e3f628eb8cfdfb9ba2f83ab2bca97c9c54c633f57ec0f6b",
+          "text_bytes": 2025,
+          "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44"
+        },
+        "clang": {
+          "binary_sha256": "d9ad17801f0cf80173f2d7671c9a450e177b057e0f0f98dcbeaf92391a629043",
+          "text_bytes": 2353,
+          "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44"
+        },
+        "gcc": {
+          "binary_sha256": "587a3ea97e9bca54078cfa0c1cbfb82f156a5fd7764585bdadd51c3dd73ced50",
+          "text_bytes": 1954,
+          "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44"
+        },
+        "lccc": {
+          "binary_sha256": "4b59a374981994ff1e3f628eb8cfdfb9ba2f83ab2bca97c9c54c633f57ec0f6b",
+          "text_bytes": 2025,
+          "source_sha256": "175202f59218fa62a3120f9f5202a005f5e234f2cbabd453048d933082e0dd44"
+        }
+      }
+    },
+    {
+      "name": "switch_dispatch",
+      "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "switch_dispatch sum: 2023556049379541\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "switch_dispatch sum: 2023556049379541\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "switch_dispatch sum: 2023556049379541\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "switch_dispatch sum: 2023556049379541\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "e26806e140ce6062e923c4ffe7d008cbb5389820605cfab3fc51d6069da109a0",
+          "text_bytes": 1255,
+          "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a"
+        },
+        "clang": {
+          "binary_sha256": "630cc597222d7966732e027815fce2b1f6d5fe13348fba4ca8f89fad9e5175ff",
+          "text_bytes": 1580,
+          "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a"
+        },
+        "gcc": {
+          "binary_sha256": "91bc2987133f0461dd6afec0c44ac99c07e2ab83d9872405f7fa93a601982d15",
+          "text_bytes": 1480,
+          "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a"
+        },
+        "lccc": {
+          "binary_sha256": "e26806e140ce6062e923c4ffe7d008cbb5389820605cfab3fc51d6069da109a0",
+          "text_bytes": 1255,
+          "source_sha256": "6a044523272024b733f4af8e5101d5bf2d72ba9d6e9362798f6149cd9265117a"
+        }
+      }
+    },
+    {
+      "name": "struct_copy",
+      "source_sha256": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "struct_copy total: 5600000.00\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "struct_copy total: 5600000.00\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "struct_copy total: 5600000.00\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "struct_copy total: 5600000.00\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "29c37d4594e562cde26066c827d28265fd50c107cdf126eaeaa18e4199c206c5",
+          "text_bytes": 1567,
+          "source_sha256": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa"
+        },
+        "clang": {
+          "binary_sha256": "e3725680f5e1500d5ca3fc63bd863de90152ae2292ce39f2527666d60c10505e",
+          "text_bytes": 1844,
+          "source_sha256": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa"
+        },
+        "gcc": {
+          "binary_sha256": "4db1cdf8ca87561d3c2c82b4ffaba2cfee9419c99c08ec9f0ddfab87ab269302",
+          "text_bytes": 1660,
+          "source_sha256": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa"
+        },
+        "lccc": {
+          "binary_sha256": "29c37d4594e562cde26066c827d28265fd50c107cdf126eaeaa18e4199c206c5",
+          "text_bytes": 1567,
+          "source_sha256": "b0ca8943fcfed56f7ae9bbd49e7e52a98f9780b4be8151c494fc12b05dcb2bfa"
+        }
+      }
+    },
+    {
+      "name": "loop_patterns",
+      "source_sha256": "e56488201b8d9e8fc7ad17ec521f395232d4c66edcaf880876d2adccba28df88",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum=735339920561088 pos=3064670858719214 max=1147483487 scaled=-736921824307008 dot=3807954538875916160 prefix=492040\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum=735339920561088 pos=3064670858719214 max=1147483487 scaled=-736921824307008 dot=3807954538875916160 prefix=492040\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum=735339920561088 pos=3064670858719214 max=1147483487 scaled=-736921824307008 dot=3807954538875916160 prefix=492040\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "sum=735339920561088 pos=3064670858719214 max=1147483487 scaled=-736921824307008 dot=3807954538875916160 prefix=492040\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "7c18415ee04bbcb52bbbf518845fee6e5395c6701f275f6b1bb08e5d53d0dbac",
+          "text_bytes": 1767,
+          "source_sha256": "e56488201b8d9e8fc7ad17ec521f395232d4c66edcaf880876d2adccba28df88"
+        },
+        "clang": {
+          "binary_sha256": "c868cd938104b16bc5db5af27a029e09a1c71bd550f356667e431848194f0da0",
+          "text_bytes": 2518,
+          "source_sha256": "e56488201b8d9e8fc7ad17ec521f395232d4c66edcaf880876d2adccba28df88"
+        },
+        "gcc": {
+          "binary_sha256": "85b6ae76d5b212bd818fe75f705677544cdd96ba2eefefd4f084ab91e02fd689",
+          "text_bytes": 1865,
+          "source_sha256": "e56488201b8d9e8fc7ad17ec521f395232d4c66edcaf880876d2adccba28df88"
+        },
+        "lccc": {
+          "binary_sha256": "7c18415ee04bbcb52bbbf518845fee6e5395c6701f275f6b1bb08e5d53d0dbac",
+          "text_bytes": 1767,
+          "source_sha256": "e56488201b8d9e8fc7ad17ec521f395232d4c66edcaf880876d2adccba28df88"
+        }
+      }
+    },
+    {
+      "name": "fannkuch",
+      "source_sha256": "2a78d670ab985384a3008ac031e7a478fdc790b627d011177dd528b7282d11e5",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "556355\nPfannkuchen(11) = 51\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "556355\nPfannkuchen(11) = 51\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "556355\nPfannkuchen(11) = 51\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "556355\nPfannkuchen(11) = 51\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "3fe1412d32a8f5d3c9919b437822dd65343553a3e45b8a34fcc51dc364ea8a1e",
+          "text_bytes": 1619,
+          "source_sha256": "2a78d670ab985384a3008ac031e7a478fdc790b627d011177dd528b7282d11e5"
+        },
+        "clang": {
+          "binary_sha256": "bcb78f738ab31dc3a20dbb579e89e36d079e1b26c3c05d4768dc2d91f4d51996",
+          "text_bytes": 2191,
+          "source_sha256": "2a78d670ab985384a3008ac031e7a478fdc790b627d011177dd528b7282d11e5"
+        },
+        "gcc": {
+          "binary_sha256": "30dcbe7c4f9bc042cef2bb7a5b1147c4282ac64dfb96bb168f5fd3886915b694",
+          "text_bytes": 1657,
+          "source_sha256": "2a78d670ab985384a3008ac031e7a478fdc790b627d011177dd528b7282d11e5"
+        },
+        "lccc": {
+          "binary_sha256": "3fe1412d32a8f5d3c9919b437822dd65343553a3e45b8a34fcc51dc364ea8a1e",
+          "text_bytes": 1619,
+          "source_sha256": "2a78d670ab985384a3008ac031e7a478fdc790b627d011177dd528b7282d11e5"
+        }
+      }
+    },
+    {
+      "name": "ackermann",
+      "source_sha256": "8f4443c46516743ca68886d1e882b9431d42ea812df71bf58236013193b790b9",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ackermann(3,11) = 16381\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ackermann(3,11) = 16381\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ackermann(3,11) = 16381\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ackermann(3,11) = 16381\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "c0b3580774105f95667a9090ea658cce0179dce9a46d3fea603177dd0b7dd619",
+          "text_bytes": 878,
+          "source_sha256": "8f4443c46516743ca68886d1e882b9431d42ea812df71bf58236013193b790b9"
+        },
+        "clang": {
+          "binary_sha256": "46105669fc96ac18590428a55fde2bca6af3dee39e066311befc64a19b3e51bf",
+          "text_bytes": 1395,
+          "source_sha256": "8f4443c46516743ca68886d1e882b9431d42ea812df71bf58236013193b790b9"
+        },
+        "gcc": {
+          "binary_sha256": "0f85e6fe70c507e882b106f36dff27f95291d0a7256a49f8b15673cf708ff89e",
+          "text_bytes": 1508,
+          "source_sha256": "8f4443c46516743ca68886d1e882b9431d42ea812df71bf58236013193b790b9"
+        },
+        "lccc": {
+          "binary_sha256": "c0b3580774105f95667a9090ea658cce0179dce9a46d3fea603177dd0b7dd619",
+          "text_bytes": 878,
+          "source_sha256": "8f4443c46516743ca68886d1e882b9431d42ea812df71bf58236013193b790b9"
+        }
+      }
+    },
+    {
+      "name": "constant_recursion",
+      "source_sha256": "86d59c961c6c10e03a75dbb42b3c73f01d448bf6296c401bb960f6120dd985c9",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "constant ackermann: 16381\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "constant ackermann: 16381\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "constant ackermann: 16381\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "constant ackermann: 16381\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "d97191f7010042711f3c4634181b09e5df168cd9d0f82932061ae64bd6675c4a",
+          "text_bytes": 886,
+          "source_sha256": "86d59c961c6c10e03a75dbb42b3c73f01d448bf6296c401bb960f6120dd985c9"
+        },
+        "clang": {
+          "binary_sha256": "8bbcf10f272d9df26b694793f1df22f627d4d144d219dfdb0dcdd45a78892c04",
+          "text_bytes": 1397,
+          "source_sha256": "86d59c961c6c10e03a75dbb42b3c73f01d448bf6296c401bb960f6120dd985c9"
+        },
+        "gcc": {
+          "binary_sha256": "e4d7b7724a49801e229597a0c8a9e3d11be7fcd88bd8a9997e82a2b0dd0a460f",
+          "text_bytes": 1510,
+          "source_sha256": "86d59c961c6c10e03a75dbb42b3c73f01d448bf6296c401bb960f6120dd985c9"
+        },
+        "lccc": {
+          "binary_sha256": "d97191f7010042711f3c4634181b09e5df168cd9d0f82932061ae64bd6675c4a",
+          "text_bytes": 886,
+          "source_sha256": "86d59c961c6c10e03a75dbb42b3c73f01d448bf6296c401bb960f6120dd985c9"
+        }
+      }
+    },
+    {
+      "name": "bitops",
+      "source_sha256": "e1e97ac28dabf06df8859e6812a288f639c7f6f070478ebd6fe834a64ed9f7ea",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "pop=800020159 clz=49986357 rev=6375100514 pow2=2184481749767\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "pop=800020159 clz=49986357 rev=6375100514 pow2=2184481749767\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "pop=800020159 clz=49986357 rev=6375100514 pow2=2184481749767\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "pop=800020159 clz=49986357 rev=6375100514 pow2=2184481749767\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "824b7096ed5fb5084c71edfbf559c7634458237cbb245b3d11847673ef801ef4",
+          "text_bytes": 1216,
+          "source_sha256": "e1e97ac28dabf06df8859e6812a288f639c7f6f070478ebd6fe834a64ed9f7ea"
+        },
+        "clang": {
+          "binary_sha256": "00ee024d4edc5bee6aee877e93b9175627d886dadb2d760142e968099bd8f0f4",
+          "text_bytes": 1698,
+          "source_sha256": "e1e97ac28dabf06df8859e6812a288f639c7f6f070478ebd6fe834a64ed9f7ea"
+        },
+        "gcc": {
+          "binary_sha256": "bda4f908950a8b85207698551e3fc06a73ca22fce6cd76ff02544d83266b81e9",
+          "text_bytes": 1426,
+          "source_sha256": "e1e97ac28dabf06df8859e6812a288f639c7f6f070478ebd6fe834a64ed9f7ea"
+        },
+        "lccc": {
+          "binary_sha256": "824b7096ed5fb5084c71edfbf559c7634458237cbb245b3d11847673ef801ef4",
+          "text_bytes": 1216,
+          "source_sha256": "e1e97ac28dabf06df8859e6812a288f639c7f6f070478ebd6fe834a64ed9f7ea"
+        }
+      }
+    },
+    {
+      "name": "double_reduction",
+      "source_sha256": "20dbbc3b81001b48f846266227292710db14114fdf0522e7f85f78332915ff59",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "201415680\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "201415680\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "201415680\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "201415680\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "5d42c933ae33e0deeefabf56b7f0ab84438bc8088a33f155623666d5d482b54f",
+          "text_bytes": 1423,
+          "source_sha256": "20dbbc3b81001b48f846266227292710db14114fdf0522e7f85f78332915ff59"
+        },
+        "clang": {
+          "binary_sha256": "7126f0eecfbb42215b15e095e80d1e758ab03dd7cf923db49897c4e5e46f6687",
+          "text_bytes": 1843,
+          "source_sha256": "20dbbc3b81001b48f846266227292710db14114fdf0522e7f85f78332915ff59"
+        },
+        "gcc": {
+          "binary_sha256": "ba0ef66a2b939dedd0491038e86236dfe7286bd04b5bb9199c84c084d5817ad7",
+          "text_bytes": 1442,
+          "source_sha256": "20dbbc3b81001b48f846266227292710db14114fdf0522e7f85f78332915ff59"
+        },
+        "lccc": {
+          "binary_sha256": "5d42c933ae33e0deeefabf56b7f0ab84438bc8088a33f155623666d5d482b54f",
+          "text_bytes": 1423,
+          "source_sha256": "20dbbc3b81001b48f846266227292710db14114fdf0522e7f85f78332915ff59"
+        }
+      }
+    },
+    {
+      "name": "ascii_case_fold",
+      "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "e3f1e37e739944e77b8ce648edec175db1c3281cf6481a415308517402254043",
+          "text_bytes": 1187,
+          "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd"
+        },
+        "clang": {
+          "binary_sha256": "467f741ef731a183f102234afa227176944d938bf8520e0248e7422251a9e68b",
+          "text_bytes": 1890,
+          "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd"
+        },
+        "gcc": {
+          "binary_sha256": "bf438582a2299c59fa1f29c6dcf087e7337378cfb036b348f109479de2c1452b",
+          "text_bytes": 1935,
+          "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd"
+        },
+        "lccc": {
+          "binary_sha256": "e3f1e37e739944e77b8ce648edec175db1c3281cf6481a415308517402254043",
+          "text_bytes": 1187,
+          "source_sha256": "7a97d5091e4e166a63cb4d6dd80bb35014c4f9ccd77848b60bac357f3211a5dd"
+        }
+      }
+    },
+    {
+      "name": "binary_search",
+      "source_sha256": "e53295433fcba1e277011bd4ae6860e38a1dc27934c36dc9b2de9c6d3d533422",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "6e3f213a07ef36f95279ade190305f75de8f361b8d7536a3a7a02452abf143fa",
+          "text_bytes": 1077,
+          "source_sha256": "e53295433fcba1e277011bd4ae6860e38a1dc27934c36dc9b2de9c6d3d533422"
+        },
+        "clang": {
+          "binary_sha256": "027f97be9ac4c23c4470da50120863dfcc44886abd50eebfbe730047d3a8ae59",
+          "text_bytes": 1439,
+          "source_sha256": "e53295433fcba1e277011bd4ae6860e38a1dc27934c36dc9b2de9c6d3d533422"
+        },
+        "gcc": {
+          "binary_sha256": "30447a91da0f3e0c43ac23ede3b75f40e6dac61d035a7f6e65652fd39abbb173",
+          "text_bytes": 1023,
+          "source_sha256": "e53295433fcba1e277011bd4ae6860e38a1dc27934c36dc9b2de9c6d3d533422"
+        },
+        "lccc": {
+          "binary_sha256": "6e3f213a07ef36f95279ade190305f75de8f361b8d7536a3a7a02452abf143fa",
+          "text_bytes": 1077,
+          "source_sha256": "e53295433fcba1e277011bd4ae6860e38a1dc27934c36dc9b2de9c6d3d533422"
+        }
+      }
+    },
+    {
+      "name": "ring_fifo",
+      "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "e9cee06860b2bafa5766225120050074191aea95612a8f36bc16b27e69177ed9",
+          "text_bytes": 932,
+          "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03"
+        },
+        "clang": {
+          "binary_sha256": "c916450778fce65a062fc30b0515f1578190de7920c98e51da791e10a4fcec46",
+          "text_bytes": 1314,
+          "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03"
+        },
+        "gcc": {
+          "binary_sha256": "ed8ed204cf212468aed44a88b4638a4f9a10081e57619f3b7403ab9ca1c4f1c5",
+          "text_bytes": 835,
+          "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03"
+        },
+        "lccc": {
+          "binary_sha256": "e9cee06860b2bafa5766225120050074191aea95612a8f36bc16b27e69177ed9",
+          "text_bytes": 932,
+          "source_sha256": "e5c01f13f9472d27106f37b76e0076f2d3e4cb71109c38344688e4e8f6e6db03"
+        }
+      }
+    },
+    {
+      "name": "aarch64_select_patterns",
+      "source_sha256": "22b7e42c9de227a1b815878d95f3dc2e97630addaf6e3c19e77d2ce38c09c0b1",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "25000000 300737027\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "25000000 300737027\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "25000000 300737027\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "25000000 300737027\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "6b38470e4133acfa3c2ee60529af9013599ee2e010cf1dcfded1423bf83c5dbd",
+          "text_bytes": 1169,
+          "source_sha256": "22b7e42c9de227a1b815878d95f3dc2e97630addaf6e3c19e77d2ce38c09c0b1"
+        },
+        "clang": {
+          "binary_sha256": "f470dc89dbd7920f13ee77b5fa9a4a78a9fa6ca05b12dbff76e8995abfb18e0f",
+          "text_bytes": 1553,
+          "source_sha256": "22b7e42c9de227a1b815878d95f3dc2e97630addaf6e3c19e77d2ce38c09c0b1"
+        },
+        "gcc": {
+          "binary_sha256": "f9452ab39d19133cb9e4b4bb2bb02f01c4074d94cbd80f420b4ec09f5a5d58e4",
+          "text_bytes": 1244,
+          "source_sha256": "22b7e42c9de227a1b815878d95f3dc2e97630addaf6e3c19e77d2ce38c09c0b1"
+        },
+        "lccc": {
+          "binary_sha256": "6b38470e4133acfa3c2ee60529af9013599ee2e010cf1dcfded1423bf83c5dbd",
+          "text_bytes": 1169,
+          "source_sha256": "22b7e42c9de227a1b815878d95f3dc2e97630addaf6e3c19e77d2ce38c09c0b1"
+        }
+      }
+    },
+    {
+      "name": "histogram",
+      "source_sha256": "67bef36e96b93d37b36e85f02e991eda19cd759393ec104684edfde54c6a3806",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "4a2457ff706acae8fe0ec844aec776a2129b442f4ddced30979fc87f6cb589e4",
+          "text_bytes": 1019,
+          "source_sha256": "67bef36e96b93d37b36e85f02e991eda19cd759393ec104684edfde54c6a3806"
+        },
+        "clang": {
+          "binary_sha256": "c86e69a9689a38627648ff378a9d1bb9df65993588dee8bd478771266562b6d4",
+          "text_bytes": 1743,
+          "source_sha256": "67bef36e96b93d37b36e85f02e991eda19cd759393ec104684edfde54c6a3806"
+        },
+        "gcc": {
+          "binary_sha256": "90b34b6e00cad97ab8b12371db9b2cf2157ba039ffa9d1916022bf60da1a33b1",
+          "text_bytes": 1471,
+          "source_sha256": "67bef36e96b93d37b36e85f02e991eda19cd759393ec104684edfde54c6a3806"
+        },
+        "lccc": {
+          "binary_sha256": "4a2457ff706acae8fe0ec844aec776a2129b442f4ddced30979fc87f6cb589e4",
+          "text_bytes": 1019,
+          "source_sha256": "67bef36e96b93d37b36e85f02e991eda19cd759393ec104684edfde54c6a3806"
+        }
+      }
+    },
+    {
+      "name": "gzip_crc32",
+      "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "372e56ab\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "372e56ab\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "372e56ab\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "372e56ab\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "c9fcb7c21e70ac9cb55795fda4a6ca1f0ed7f3ee9d3452b7899757f4d3bba49f",
+          "text_bytes": 2301,
+          "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a"
+        },
+        "clang": {
+          "binary_sha256": "3b67dd995993dd98b198984de85e5953130ed4a93a886f4e781abf1f8de49875",
+          "text_bytes": 2519,
+          "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a"
+        },
+        "gcc": {
+          "binary_sha256": "1f301626ecca1431995ee4469949df49972864ad755dac6ab736e96892ddc605",
+          "text_bytes": 2312,
+          "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a"
+        },
+        "lccc": {
+          "binary_sha256": "c9fcb7c21e70ac9cb55795fda4a6ca1f0ed7f3ee9d3452b7899757f4d3bba49f",
+          "text_bytes": 2301,
+          "source_sha256": "9f9acac042ab580ce2137a9fb653a5b3db5e7015dbb49254944195ef5eb98f6a"
+        }
+      }
+    },
+    {
+      "name": "libm_round_family",
+      "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "libm-round-family: 18623110414.500000\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "libm-round-family: 18623110414.500000\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "libm-round-family: 18623110414.500000\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "libm-round-family: 18623110414.500000\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "f6534f993d5b130a1726d395b9707df964eb154926a6b30b0818491d5d1ea75f",
+          "text_bytes": 2745,
+          "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668"
+        },
+        "clang": {
+          "binary_sha256": "721ebb05c6ce12b19cc37333734d6ca39efe98ac0b6d68b7c6f707f8cc7d463d",
+          "text_bytes": 2929,
+          "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668"
+        },
+        "gcc": {
+          "binary_sha256": "bcbe1576c130fc7dbc6250fe1496806145939b751336579c58ba9f246e90ce5e",
+          "text_bytes": 2522,
+          "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668"
+        },
+        "lccc": {
+          "binary_sha256": "f6534f993d5b130a1726d395b9707df964eb154926a6b30b0818491d5d1ea75f",
+          "text_bytes": 2745,
+          "source_sha256": "b70c5bacd90081c28ea74dc1142f9eacc64278d539f258da5bd1614ebc503668"
+        }
+      }
+    },
+    {
+      "name": "tls_seg_access",
+      "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "tls-seg-access: 41596549849953\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "tls-seg-access: 41596549849953\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "tls-seg-access: 41596549849953\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "tls-seg-access: 41596549849953\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "5a0ecd8c80d8cc08c23568e291e41876aba5ae60f4273a7679291bbb47554392",
+          "text_bytes": 1124,
+          "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835"
+        },
+        "clang": {
+          "binary_sha256": "614bc352f47f97f003d3a1df9427ae349a5e090247e25c13185b95dfba08ffca",
+          "text_bytes": 1533,
+          "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835"
+        },
+        "gcc": {
+          "binary_sha256": "75cf3c2e4ffffdbe3ba94545e65dcac70f13bed6a1bbe88c3fff22726ea1736e",
+          "text_bytes": 1198,
+          "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835"
+        },
+        "lccc": {
+          "binary_sha256": "5a0ecd8c80d8cc08c23568e291e41876aba5ae60f4273a7679291bbb47554392",
+          "text_bytes": 1124,
+          "source_sha256": "02e6d2bcd07b2e1fc253b53d316d522e7b3d912ae634b6fad2c10dc93a1d4835"
+        }
+      }
+    },
+    {
+      "name": "percpu_ptr_walk",
+      "source_sha256": "8494442ce679590e5710d2f9594587190113d22a6ba5edb5414ba9e5eb85461c",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "percpu-ptr-walk: 158131200000\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "percpu-ptr-walk: 158131200000\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "percpu-ptr-walk: 158131200000\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "percpu-ptr-walk: 158131200000\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "1ed418df5eb4f5cd4af9e7955d04cfd711f50cc65cbd76919e6b3c37dd5abea9",
+          "text_bytes": 2053,
+          "source_sha256": "8494442ce679590e5710d2f9594587190113d22a6ba5edb5414ba9e5eb85461c"
+        },
+        "clang": {
+          "binary_sha256": "194caf60682c59864c542ec09e2131d1e04f36c8be778f8ec9b835043668e864",
+          "text_bytes": 1678,
+          "source_sha256": "8494442ce679590e5710d2f9594587190113d22a6ba5edb5414ba9e5eb85461c"
+        },
+        "gcc": {
+          "binary_sha256": "40062504b0f5e615a3787f3dd431637a12ce483cb1a7c252b1a32d017f0fe021",
+          "text_bytes": 1490,
+          "source_sha256": "8494442ce679590e5710d2f9594587190113d22a6ba5edb5414ba9e5eb85461c"
+        },
+        "lccc": {
+          "binary_sha256": "1ed418df5eb4f5cd4af9e7955d04cfd711f50cc65cbd76919e6b3c37dd5abea9",
+          "text_bytes": 2053,
+          "source_sha256": "8494442ce679590e5710d2f9594587190113d22a6ba5edb5414ba9e5eb85461c"
+        }
+      }
+    },
+    {
+      "name": "byte_load_reassembly",
+      "source_sha256": "d98d60eefd244df93fd9f4a828806ce2e32be56aad4872a2672d172b14dda562",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7ee1f2c0 3dcf60f284155e00\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7ee1f2c0 3dcf60f284155e00\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7ee1f2c0 3dcf60f284155e00\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7ee1f2c0 3dcf60f284155e00\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "c26afecbb719fbf004d9dbbbd6d7983cf70c57ba69707ae98b0cc9e2c23381f3",
+          "text_bytes": 1734,
+          "source_sha256": "d98d60eefd244df93fd9f4a828806ce2e32be56aad4872a2672d172b14dda562"
+        },
+        "clang": {
+          "binary_sha256": "b9849548648628b171c0185bdfe64334d247592a073dbbe98e69dde207facb84",
+          "text_bytes": 1987,
+          "source_sha256": "d98d60eefd244df93fd9f4a828806ce2e32be56aad4872a2672d172b14dda562"
+        },
+        "gcc": {
+          "binary_sha256": "03ad276f87f110816d7f1e958eba2dd58aeca6e5169e41557156735678267ba8",
+          "text_bytes": 1720,
+          "source_sha256": "d98d60eefd244df93fd9f4a828806ce2e32be56aad4872a2672d172b14dda562"
+        },
+        "lccc": {
+          "binary_sha256": "c26afecbb719fbf004d9dbbbd6d7983cf70c57ba69707ae98b0cc9e2c23381f3",
+          "text_bytes": 1734,
+          "source_sha256": "d98d60eefd244df93fd9f4a828806ce2e32be56aad4872a2672d172b14dda562"
+        }
+      }
+    },
+    {
+      "name": "zlib_ng_adler32",
+      "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "8c331ae0\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "8c331ae0\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "8c331ae0\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "8c331ae0\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "47b7c19be7e1b52127b05435a2737f4966c127823c28ada45c3d92852d44192f",
+          "text_bytes": 1842,
+          "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486"
+        },
+        "clang": {
+          "binary_sha256": "11fe7948cebd61f75265f3f5f16fde6167be3705264eefc14acade923d41aa58",
+          "text_bytes": 1861,
+          "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486"
+        },
+        "gcc": {
+          "binary_sha256": "c3a601a9dbe0486af3dbe770ac536ae35a3570bfaf7a8542aa3cae2ab04f82e5",
+          "text_bytes": 1602,
+          "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486"
+        },
+        "lccc": {
+          "binary_sha256": "47b7c19be7e1b52127b05435a2737f4966c127823c28ada45c3d92852d44192f",
+          "text_bytes": 1842,
+          "source_sha256": "bca7938ef542270a06d734bf814b3f1806ab1796e8f53d5c53d1b5ccd6b08486"
+        }
+      }
+    },
+    {
+      "name": "zlib_ng_adler32_combine",
+      "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "zlib_ng_adler32_combine: 35498ead\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "zlib_ng_adler32_combine: 35498ead\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "zlib_ng_adler32_combine: 35498ead\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "zlib_ng_adler32_combine: 35498ead\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "b6d389ce720a7574470285e933c84369c1ee883fde7a390ec1df55f0ddb46d14",
+          "text_bytes": 2261,
+          "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940"
+        },
+        "clang": {
+          "binary_sha256": "293890358c442f66497a6325e00838afc18289fb14bfe085f1c13acf643355ee",
+          "text_bytes": 3028,
+          "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940"
+        },
+        "gcc": {
+          "binary_sha256": "afeb8c6a10ba5ea84a8042ffeb6dc64af31ec74871d07bae06b7e9e0292eb8b5",
+          "text_bytes": 2500,
+          "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940"
+        },
+        "lccc": {
+          "binary_sha256": "b6d389ce720a7574470285e933c84369c1ee883fde7a390ec1df55f0ddb46d14",
+          "text_bytes": 2261,
+          "source_sha256": "5d9a2ade64019e993686dab352d67dbdc4a009e2e33dd8568beff5c9ac423940"
+        }
+      }
+    },
+    {
+      "name": "expat_xml_scan",
+      "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "626766774715194881\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "626766774715194881\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "626766774715194881\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "626766774715194881\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "eb35332e4589e654ebb0ce968f681c15e07003394c3025b953ae0ae0cb6defda",
+          "text_bytes": 1966,
+          "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35"
+        },
+        "clang": {
+          "binary_sha256": "d32d5ed97b8dc39aa3b3e63a5226fd937056036ab52644e55e823e295d21af17",
+          "text_bytes": 2393,
+          "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35"
+        },
+        "gcc": {
+          "binary_sha256": "f3733450b266d00c0a418f0439d0d765e3b496b69c12d1263f26765c7595510f",
+          "text_bytes": 1907,
+          "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35"
+        },
+        "lccc": {
+          "binary_sha256": "eb35332e4589e654ebb0ce968f681c15e07003394c3025b953ae0ae0cb6defda",
+          "text_bytes": 1966,
+          "source_sha256": "a076b1823869765011658d56ec090b22102e2ba7a5bbdf4cd0b6bdd0d774cf35"
+        }
+      }
+    },
+    {
+      "name": "expat_siphash24",
+      "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "455b2fe83db74581\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "455b2fe83db74581\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "455b2fe83db74581\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "455b2fe83db74581\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "dc08686d38cd250f0c436d833bca94a5072cbdb20a462da80a964cb6ddb4ee18",
+          "text_bytes": 4466,
+          "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663"
+        },
+        "clang": {
+          "binary_sha256": "fcec8bd86ad5652a38ba4cc73b648318ea8f344c280027e321f38df58ecb2678",
+          "text_bytes": 4062,
+          "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663"
+        },
+        "gcc": {
+          "binary_sha256": "fa770e5b200ba65f99f9bbd7cc8eeb32a1590c1934419944d952bf559715ace5",
+          "text_bytes": 3345,
+          "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663"
+        },
+        "lccc": {
+          "binary_sha256": "dc08686d38cd250f0c436d833bca94a5072cbdb20a462da80a964cb6ddb4ee18",
+          "text_bytes": 4466,
+          "source_sha256": "59c5dfbdf3f0d2e149a3681925c46b7b0aeb195f179c285f3b64a2daaf1fb663"
+        }
+      }
+    },
+    {
+      "name": "sqlite_varint",
+      "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "deedcdd4edc1c0f1\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "deedcdd4edc1c0f1\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "deedcdd4edc1c0f1\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "deedcdd4edc1c0f1\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "5683686d3ca5351f8344173439d74f016207e08e99e920b0e30c660bcb51fe57",
+          "text_bytes": 2765,
+          "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af"
+        },
+        "clang": {
+          "binary_sha256": "53d8a2740b1418883cc5653292aefab0fb9ea38f1ee8921b04f0ce8d4fc1b853",
+          "text_bytes": 2946,
+          "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af"
+        },
+        "gcc": {
+          "binary_sha256": "e0bb687d4fa39ba3008391c4d7e438712a8afa6b6cd59b9bb89c704ebf495852",
+          "text_bytes": 2627,
+          "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af"
+        },
+        "lccc": {
+          "binary_sha256": "5683686d3ca5351f8344173439d74f016207e08e99e920b0e30c660bcb51fe57",
+          "text_bytes": 2765,
+          "source_sha256": "11c7e09b1507659fe44e678848c5e489268e4dd4aa385d3a542453caa400e1af"
+        }
+      }
+    },
+    {
+      "name": "linux_find_bit",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "77f54abe5b62ccbbefdf21808572d02b1d62d82353021ff409d152a2c7940ded",
+          "text_bytes": 1727,
+          "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a"
+        },
+        "clang": {
+          "binary_sha256": "6df76cff531b4b21aa2a641a3eb4bed2d9ce0623e7c147af411b4adad1d62c50",
+          "text_bytes": 1754,
+          "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a"
+        },
+        "gcc": {
+          "binary_sha256": "df3b0ba410537dffa2288b7d82c61bd40a533a63bee421352d7795e017d28b5a",
+          "text_bytes": 1750,
+          "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a"
+        },
+        "lccc": {
+          "binary_sha256": "77f54abe5b62ccbbefdf21808572d02b1d62d82353021ff409d152a2c7940ded",
+          "text_bytes": 1727,
+          "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a"
+        }
+      }
+    },
+    {
+      "name": "linux_find_bit_scaled",
+      "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "0\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "cf710f3adb9d7e796c282f1aa6baca7c8f36b47e0f1d6b90262a0d587c536001",
+          "text_bytes": 1727,
+          "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a"
+        },
+        "clang": {
+          "binary_sha256": "5b74851ada700e6fbb82f3deb9eda3180146510584a8f092338e99b5c686a910",
+          "text_bytes": 1754,
+          "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a"
+        },
+        "gcc": {
+          "binary_sha256": "dc700347eb9432cbb3b6d5829cb71ec8113115670ec0d2f369c281cab5adb905",
+          "text_bytes": 1750,
+          "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a"
+        },
+        "lccc": {
+          "binary_sha256": "cf710f3adb9d7e796c282f1aa6baca7c8f36b47e0f1d6b90262a0d587c536001",
+          "text_bytes": 1727,
+          "source_sha256": "bdbeacb05f1c3857f47c7626c041a450ab0badc939ff86f32f67b202bcf4bd5a"
+        }
+      }
+    },
+    {
+      "name": "glibc_memcmp",
+      "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "2158787064\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "2158787064\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "2158787064\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "2158787064\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "09212ff6a4de01989392854549cb49287c6b67150c19fd22db3f88a26a32b37a",
+          "text_bytes": 1799,
+          "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870"
+        },
+        "clang": {
+          "binary_sha256": "6394e6adf6b3b293020c01f4a0a7b7e41ec045566dc3eed8028fb072bc03413b",
+          "text_bytes": 2181,
+          "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870"
+        },
+        "gcc": {
+          "binary_sha256": "73df4b9b3c356306e35814e1a7d88afa0317999e9dc7a000f3fd7124f8c37522",
+          "text_bytes": 1828,
+          "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870"
+        },
+        "lccc": {
+          "binary_sha256": "09212ff6a4de01989392854549cb49287c6b67150c19fd22db3f88a26a32b37a",
+          "text_bytes": 1799,
+          "source_sha256": "6fcec75ff20c60106d78db2013a646579ab4262750fe64eee99387f3c16b0870"
+        }
+      }
+    },
+    {
+      "name": "chacha20_block",
+      "source_sha256": "7f0b876dc4bbea778d85e2a30d55046207eb60abe8c5388857bb1207efdac85c",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ff1bc75f6884e79f\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ff1bc75f6884e79f\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ff1bc75f6884e79f\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "ff1bc75f6884e79f\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "c2e908c94f50315996c68324efb54427fef7f01da0388384e07f6b2e43d1cb03",
+          "text_bytes": 2127,
+          "source_sha256": "7f0b876dc4bbea778d85e2a30d55046207eb60abe8c5388857bb1207efdac85c"
+        },
+        "clang": {
+          "binary_sha256": "cceff62cb723b334a66a50d5056c36a23de3b7ea4e7f740143d9b4f66c3d3b55",
+          "text_bytes": 2410,
+          "source_sha256": "7f0b876dc4bbea778d85e2a30d55046207eb60abe8c5388857bb1207efdac85c"
+        },
+        "gcc": {
+          "binary_sha256": "f34a7fcac637ef05dc17a3ef8a75f946c79b0545f461fdceabf50b56452b5a89",
+          "text_bytes": 2237,
+          "source_sha256": "7f0b876dc4bbea778d85e2a30d55046207eb60abe8c5388857bb1207efdac85c"
+        },
+        "lccc": {
+          "binary_sha256": "c2e908c94f50315996c68324efb54427fef7f01da0388384e07f6b2e43d1cb03",
+          "text_bytes": 2127,
+          "source_sha256": "7f0b876dc4bbea778d85e2a30d55046207eb60abe8c5388857bb1207efdac85c"
+        }
+      }
+    },
+    {
+      "name": "sha256_transform",
+      "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "054db5f638d89d8b\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "054db5f638d89d8b\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "054db5f638d89d8b\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "054db5f638d89d8b\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "722c7c4e255ebc223b6cc47f3a776c0ea93e387bb0739be438fa9b1a4c317ec9",
+          "text_bytes": 2909,
+          "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e"
+        },
+        "clang": {
+          "binary_sha256": "3970e8467c53cda81c5d294afb489f5bbb42d859011c09d2545f34bfad8d1b43",
+          "text_bytes": 2760,
+          "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e"
+        },
+        "gcc": {
+          "binary_sha256": "0c7b6c8b21cb0ae1ca7f9be3d11d6fde9bebac395af43fe271fd66a1b2a01bae",
+          "text_bytes": 2522,
+          "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e"
+        },
+        "lccc": {
+          "binary_sha256": "722c7c4e255ebc223b6cc47f3a776c0ea93e387bb0739be438fa9b1a4c317ec9",
+          "text_bytes": 2909,
+          "source_sha256": "6f55a89cfd9d59eb9a8e115eef968295ec775fa63d0545dd33517c2fdf06bf5e"
+        }
+      }
+    },
+    {
+      "name": "linux_rbtree",
+      "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7f13e4413fff0000\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7f13e4413fff0000\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7f13e4413fff0000\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "7f13e4413fff0000\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "c5031570d029848a674efc458ea23f23c7eb2b77c4508d8ce8b51d75a658ce7c",
+          "text_bytes": 1854,
+          "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253"
+        },
+        "clang": {
+          "binary_sha256": "28f147f3d62ec7c05fe2eddd51f1c46296bb5946cbab6cbb746539fb2e37981a",
+          "text_bytes": 1899,
+          "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253"
+        },
+        "gcc": {
+          "binary_sha256": "50d5e672626a932b31c90e9b86fba8eb54c95a836c4405f1fecdf09adc311998",
+          "text_bytes": 1701,
+          "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253"
+        },
+        "lccc": {
+          "binary_sha256": "c5031570d029848a674efc458ea23f23c7eb2b77c4508d8ce8b51d75a658ce7c",
+          "text_bytes": 1854,
+          "source_sha256": "7c9c5ada20d8e32116ccbc1ca68690e92470ef7348b51842e49ffa2fa0480253"
+        }
+      }
+    },
+    {
+      "name": "zstd_count",
+      "source_sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "49750a013cea17bd\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "49750a013cea17bd\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "49750a013cea17bd\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "49750a013cea17bd\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "f6cddea836ccbbea541e27dce2d96369dbca660babdf0b0b8c452f7c3e27b7ad",
+          "text_bytes": 1428,
+          "source_sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6"
+        },
+        "clang": {
+          "binary_sha256": "38243dab85ec0ef0e72d06e023b18f3869b8e2f732d0230d291307a5a435894f",
+          "text_bytes": 1728,
+          "source_sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6"
+        },
+        "gcc": {
+          "binary_sha256": "e74af39a7a54f7ab79dd085ad3b378fe9c140e28dd4ae1d0fea64e11719a1749",
+          "text_bytes": 1333,
+          "source_sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6"
+        },
+        "lccc": {
+          "binary_sha256": "f6cddea836ccbbea541e27dce2d96369dbca660babdf0b0b8c452f7c3e27b7ad",
+          "text_bytes": 1428,
+          "source_sha256": "cf01953477eadbebe46b07ede170a62ff41b62cf947dd12222a04ad93c985be6"
+        }
+      }
+    },
+    {
+      "name": "lz4_compress",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "00c000180ca81680\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "00c000180ca81680\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "00c000180ca81680\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "00c000180ca81680\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "d78109918549b53364b547f2dd588851aec29cd4ccff5c694a2a5ea70679f437",
+          "text_bytes": 2709,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4"
+        },
+        "clang": {
+          "binary_sha256": "2b80376fca4fee3eeb6f7f0707b4d83b268430b1d2279a210309642a016ab2a1",
+          "text_bytes": 2893,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4"
+        },
+        "gcc": {
+          "binary_sha256": "d579983eb5eefc390d64850fa9683c10a1c192327187013b2089a5cc71d64a95",
+          "text_bytes": 2573,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4"
+        },
+        "lccc": {
+          "binary_sha256": "d78109918549b53364b547f2dd588851aec29cd4ccff5c694a2a5ea70679f437",
+          "text_bytes": 2709,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4"
+        }
+      }
+    },
+    {
+      "name": "lz4_match_extend",
+      "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "29f49acaab81f800\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "29f49acaab81f800\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "29f49acaab81f800\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "29f49acaab81f800\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "9cd813bb6c26ac3e2029c0fa17e8c20936c08ae6019e1d7ec058eaabc655ecbc",
+          "text_bytes": 2680,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4"
+        },
+        "clang": {
+          "binary_sha256": "14b784a52baefcf822939078b175c4c8e335acad224697b79d43f260c0d1e348",
+          "text_bytes": 2973,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4"
+        },
+        "gcc": {
+          "binary_sha256": "ed4ef1c94923621429c2ab4af243c570b18955f7d502e1ddb0b234f4388d43b3",
+          "text_bytes": 2641,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4"
+        },
+        "lccc": {
+          "binary_sha256": "9cd813bb6c26ac3e2029c0fa17e8c20936c08ae6019e1d7ec058eaabc655ecbc",
+          "text_bytes": 2680,
+          "source_sha256": "2c8e7054fa444f5a68405d8c25975534d736073cb842b3a3d6dec53dd1ecd4a4"
+        }
+      }
+    },
+    {
+      "name": "glibc_strstr",
+      "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344",
+      "correctness": {
+        "before": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "000084b751d11348\n",
+          "stable_within_compiler": true
+        },
+        "clang": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "000084b751d11348\n",
+          "stable_within_compiler": true
+        },
+        "gcc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "000084b751d11348\n",
+          "stable_within_compiler": true
+        },
+        "lccc": {
+          "all_runs_successful": true,
+          "matches_baseline": true,
+          "output": "000084b751d11348\n",
+          "stable_within_compiler": true
+        }
+      },
+      "compile": {
+        "before": {
+          "binary_sha256": "a88b787abc16594d8685b05884ad460b2c30b4ebac3a044a71fb1b7cef131cce",
+          "text_bytes": 1943,
+          "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344"
+        },
+        "clang": {
+          "binary_sha256": "e66a77efe8d1f3e71ab169454aed39bf036d765a5b74567ab6bf31c219d3cfca",
+          "text_bytes": 2351,
+          "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344"
+        },
+        "gcc": {
+          "binary_sha256": "7bff8ce6581307023e695f0f1b21040cf25d4db2d7a23cb7b79e897387995aaa",
+          "text_bytes": 1787,
+          "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344"
+        },
+        "lccc": {
+          "binary_sha256": "a88b787abc16594d8685b05884ad460b2c30b4ebac3a044a71fb1b7cef131cce",
+          "text_bytes": 1943,
+          "source_sha256": "17dcd48414c9eb254cc910905113b7ed8a3cedac3c0d41216305484a5a7cd344"
+        }
+      }
+    }
+  ],
+  "compiler_versions": {
+    "before": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0",
+    "clang": "clang version 23.1.3 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)",
+    "gcc": "gcc-16 (GCC) 16.2.0",
+    "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+  },
+  "gates": {
+    "library": {
+      "passed": 5578,
+      "failed": 0,
+      "ignored": 10
+    },
+    "strict_fastbuild": "PASS",
+    "all_target_clippy": "PASS; zero warnings",
+    "native_word_counts": "PASS including disabled/IR/RA/SSA/refusal controls",
+    "semantic_regression_suites": [
+      "zero-choice",
+      "integer-observations",
+      "bit-demand",
+      "scalar-facts",
+      "guarded-folds"
+    ],
+    "standalone_word_counts_corpus": "PASS",
+    "ci_local_parity_commands": 330
+  },
+  "candidate_src_tree": "63782a9f1d45cd333e97c01df08a189be313a54d"
+}

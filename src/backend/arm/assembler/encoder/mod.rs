@@ -2526,7 +2526,7 @@ mod gas247_golden_word_tests {
             // form `fcvtzs h8, h4` used to sit here, but bare GAS default
             // arch (armv8-a) rejecting it is an arch artifact: on the
             // pinned matrix law (`.arch armv9.4-a+sme`) the scalar FP16
-            // conversion exists -- see the ordered arithmetic accept rows below.)
+            // conversion exists -- see the encoding-grammar acceptance rows below.)
             "fcvtzs d8, s4",
             "fcvtzs s8, d4",
             // fbits range: 1..=32 for S, 1..=64 for D.
@@ -2599,7 +2599,7 @@ mod gas247_golden_word_tests {
         }
     }
 
-    // ── ordered arithmetic: dispatcher-golden campaign (post-rebase).
+    // ── Dispatcher-golden encoding checks.
     //    Every word below is a verbatim GAS 2.47 measurement under the
     //    pinned matrix law (`.arch armv9.4-a+sme`) except where noted;
     //    rejects are GAS-rejected spellings. ──────────────────────────

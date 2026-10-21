@@ -1,4 +1,4 @@
-# ordered arithmetic: workload-driven ordered SIMD and exact signed division
+# Ordered SIMD and exact division
 
 ## Scope
 

@@ -1,5 +1,4 @@
 {
-  "batch": 7,
   "policy": "Coverage is per reduced contract, not global closure of the upstream report. Existing coverage and correctness repairs are not counted as runtime wins.",
   "cases": [
     {
@@ -7,184 +6,185 @@
       "status": "reviewed-deferred",
       "scope": "Historical XMM spill-window/live-range splitting, distinct from the implemented saved-GPR copy fix.",
       "remaining": "General XMM splitting remains open.",
-      "batch": 7,
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
         "engineering/llvm-missed/guarded-folds-sources.json"
       ],
-      "disposition": "reviewed-deferred"
+      "disposition": "reviewed-deferred",
+      "cohort": "guarded-folds"
     },
     {
       "number": 3007,
       "status": "reviewed-deferred",
       "scope": "Long AddRec/reassociation report reviewed; no generic rematerialization implementation claimed.",
       "remaining": "Latest upstream comment reports no spills; needs a current LCCC witness.",
-      "batch": 7,
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
         "engineering/llvm-missed/guarded-folds-sources.json"
       ],
-      "disposition": "reviewed-deferred"
+      "disposition": "reviewed-deferred",
+      "cohort": "guarded-folds"
     },
     {
       "number": 6509,
       "status": "reviewed-deferred",
       "scope": "Integer/XMM transfer report; latest upstream form retains a real integer comparison.",
       "remaining": "No global removal of required domain transfers.",
-      "batch": 7,
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
         "engineering/llvm-missed/guarded-folds-sources.json"
       ],
-      "disposition": "reviewed-existing"
+      "disposition": "reviewed-existing",
+      "cohort": "guarded-folds"
     },
     {
       "number": 10156,
       "status": "reviewed-deferred",
       "scope": "Destructive size-only compare encodings are not a default speed policy.",
       "remaining": "Requires a separate size/tuning policy.",
-      "batch": 7,
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
         "engineering/llvm-missed/guarded-folds-sources.json"
       ],
-      "disposition": "reviewed-deferred"
+      "disposition": "reviewed-deferred",
+      "cohort": "guarded-folds"
     },
     {
       "number": 12193,
       "status": "covered-limited",
       "scope": "22-byte object boundary/offset-21 guard-page control; no unsafe eight-byte widening.",
       "remaining": "General safe load-combine ordering remains separate.",
-      "batch": 7,
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
         "engineering/llvm-missed/guarded-folds-sources.json",
         "tests/regression/llvm_guarded_folds.c",
         "tests/regression/check_llvm_guarded_folds.py"
       ],
-      "disposition": "control"
+      "disposition": "control",
+      "cohort": "guarded-folds"
     },
     {
       "number": 13134,
       "status": "reviewed-deferred",
       "scope": "In-place byte-swap loop, distinct from existing load+BSWAP/MOVBE folding.",
       "remaining": "General loop reversal/vectorization remains open.",
-      "batch": 7,
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
         "engineering/llvm-missed/guarded-folds-sources.json"
       ],
-      "disposition": "reviewed-deferred"
+      "disposition": "reviewed-deferred",
+      "cohort": "guarded-folds"
     },
     {
       "number": 13687,
       "status": "reviewed-deferred",
       "scope": "Late tail merging reviewed; existing block/epilogue merging not counted again.",
       "remaining": "General layout/unwind-tail policy remains open.",
-      "batch": 7,
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
         "engineering/llvm-missed/guarded-folds-sources.json"
       ],
-      "disposition": "reviewed-deferred"
+      "disposition": "reviewed-deferred",
+      "cohort": "guarded-folds"
     },
     {
       "number": 7145,
       "status": "covered-limited",
       "scope": "Current LCCC CH/MAJ and BMI1 ANDN; native CH control.",
       "remaining": "No generic constant/vector/undef masked-merge expansion claimed.",
-      "batch": 7,
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
         "engineering/llvm-missed/guarded-folds-sources.json",
         "tests/regression/llvm_guarded_folds.c",
         "tests/regression/check_llvm_guarded_folds.py"
       ],
-      "disposition": "already-handled"
+      "disposition": "already-handled",
+      "cohort": "guarded-folds"
     },
     {
       "number": 212139,
       "status": "covered-limited",
       "scope": "Boolean-mask conditional negate with exact SSA/width and single-use network; 8/16/32/64 scalar matcher tests and native 32/64 including signed MIN with Boolean zero.",
       "remaining": "Arbitrary nonzero masks, shared networks, vectors and floating point are not admitted.",
-      "batch": 7,
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
         "engineering/llvm-missed/guarded-folds-sources.json",
         "tests/regression/llvm_guarded_folds.c",
         "tests/regression/check_llvm_guarded_folds.py"
       ],
-      "disposition": "covered-limited"
+      "disposition": "covered-limited",
+      "cohort": "guarded-folds"
     },
     {
       "number": 33226,
       "status": "covered-limited",
       "scope": "32/64-bit terminal register CMOV commutation into the ABI result register, preserving flags and the necessary shift TEST.",
       "remaining": "Variable/effectively-zero shift flag reuse is not enabled; BMI2 does not set flags.",
-      "batch": 7,
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
         "engineering/llvm-missed/guarded-folds-sources.json",
         "tests/regression/llvm_guarded_folds.c",
         "tests/regression/check_llvm_guarded_folds.py"
       ],
-      "disposition": "covered-limited"
+      "disposition": "covered-limited",
+      "cohort": "guarded-folds"
     },
     {
       "number": 46623,
       "status": "covered-limited",
       "scope": "Signed lower guard plus same-width signed upper comparison with a proven nonnegative bound; bounded same-width cast sign-bit proof.",
       "remaining": "Arbitrary mixed-width comparisons and unknown/negative upper bounds are refused.",
-      "batch": 7,
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
         "engineering/llvm-missed/guarded-folds-sources.json",
         "tests/regression/llvm_guarded_folds.c",
         "tests/regression/check_llvm_guarded_folds.py"
       ],
-      "disposition": "covered-limited"
+      "disposition": "covered-limited",
+      "cohort": "guarded-folds"
     },
     {
       "number": 233455,
       "status": "covered-limited",
       "scope": "Promoted C byte division already initializes the numerator with MOVL; historical MOVB+MOVZX setup is not reproduced.",
       "remaining": "No new narrow division opcode policy or global division optimality claim.",
-      "batch": 7,
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
         "engineering/llvm-missed/guarded-folds-sources.json",
         "tests/regression/llvm_guarded_folds.c",
         "tests/regression/check_llvm_guarded_folds.py"
       ],
-      "disposition": "already-handled"
+      "disposition": "already-handled",
+      "cohort": "guarded-folds"
     },
     {
       "number": 233785,
       "status": "covered-limited",
       "scope": "Two-predecessor null-pointer/Boolean-PHI observation with exact edge labels, constant-one partner and dominating predecessor operand.",
       "remaining": "Not a general relational PHI solver; no speculative loads or call-effect assumptions.",
-      "batch": 7,
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
         "engineering/llvm-missed/guarded-folds-sources.json",
         "tests/regression/llvm_guarded_folds.c",
         "tests/regression/check_llvm_guarded_folds.py"
       ],
-      "disposition": "covered-limited"
+      "disposition": "covered-limited",
+      "cohort": "guarded-folds"
     },
     {
       "number": 230039,
       "status": "covered-limited",
       "scope": "Exact immutable CIE/FDE/LSDA/personality/typeinfo relocation identity for ICF; repair text-only folding of different catch types.",
       "remaining": "Unusual/multiple/interior FDEs, recursive LSDA graphs, unsupported relocation ranges and byte-budget exhaustion are opaque; not general LSDA class-graph equivalence.",
-      "batch": 7,
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
         "engineering/llvm-missed/guarded-folds-sources.json",
         "tests/regression/llvm_guarded_folds.c",
         "tests/regression/check_llvm_guarded_folds.py"
       ],
-      "disposition": "covered-limited"
+      "disposition": "covered-limited",
+      "cohort": "guarded-folds"
     }
-  ]
+  ],
+  "cohort": "guarded-folds"
 }

@@ -1,4 +1,4 @@
-# LLVM missed-optimization distillation: inventory and implementation batches
+# LLVM missed-optimization distillation: inventory and semantic cohorts
 
 ## What this is (and is not)
 
@@ -176,3 +176,9 @@ changed-workload screening are in [GUARDED-FOLDS-BENCH.md](GUARDED-FOLDS-BENCH.m
 implemented reduced contracts, existing byte-division/CH controls, safety
 refusals, and still-open allocator/vector/layout work. ICF unwind identity is a
 correctness repair rather than a fictitious speedup over unsafe folding.
+
+## Word counts
+
+[WORD-COUNTS.md](WORD-COUNTS.md) documents scalar count unions and constant
+caps, the six-report source audit, and explicit refusals/deferred work.
+[NAMING.md](NAMING.md) defines semantic pass, fixture and evidence names.

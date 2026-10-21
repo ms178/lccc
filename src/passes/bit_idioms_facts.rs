@@ -347,7 +347,10 @@ fn fold(
     fresh: Value,
 ) -> Option<Vec<Instruction>> {
     cx.visits.set(512);
-    if let Some(replacement) = followups::fold(inst, cx, facts, fresh) {
+    if let Some(replacement) = count_merge::fold(inst, cx, facts, fresh) {
+        return Some(replacement);
+    }
+    if let Some(replacement) = guards::fold(inst, cx, facts, fresh) {
         return Some(replacement);
     }
     let dest = inst.dest()?;
@@ -837,7 +840,7 @@ pub(super) fn run(func: &mut IrFunction) -> usize {
         b.instructions.splice(ii..=ii, replacement);
     }
     func.next_value_id = next;
-    changes + followups::cfg(func)
+    changes + guards::cfg(func)
 }
 
 #[cfg(test)]
@@ -845,4 +848,7 @@ pub(super) fn run(func: &mut IrFunction) -> usize {
 mod tests;
 
 #[path = "bit_idioms_guards.rs"]
-mod followups;
+mod guards;
+
+#[path = "bit_idioms_count_merge.rs"]
+mod count_merge;

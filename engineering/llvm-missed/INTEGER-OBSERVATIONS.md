@@ -1,4 +1,4 @@
-# integer observations: 25 implementation families, 45 native witnesses
+# Integer observations and scalar demand
 
 These are implemented transformations, not a list of proposals. Direction,
 operand-order, width and predicate variants are grouped conservatively below.
