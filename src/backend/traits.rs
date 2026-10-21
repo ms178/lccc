@@ -2415,6 +2415,17 @@ pub trait ArchCodegen {
         text
     }
 
+    /// Optimize both dual-layout candidates. Backends may override this to
+    /// evaluate the independent candidates concurrently; the default keeps
+    /// the historical serial behavior.
+    fn peephole_pair_for_metric(&self, first: String, second: String) -> (String, String) {
+        // Two statements, not a tuple literal: the shape that survives any
+        // rustfmt heuristic, since the calls are already at statement width.
+        let first = self.peephole_for_metric(first);
+        let second = self.peephole_for_metric(second);
+        (first, second)
+    }
+
     /// Emit a conditional select: dest = cond != 0 ? true_val : false_val.
     ///
     /// Default implementation uses a branch-based sequence. Backends can override
