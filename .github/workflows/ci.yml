@@ -1680,6 +1680,7 @@ jobs:
         # _Decimal32 AArch64 width: w-view indexed + plain traffic
         # assertions plus encodability teeth (no bare mov past imm16).
         bash tests/regression/check_decimal32_indexed_fold_arm.sh
+        python3 tests/regression/check_affine_scaled_index_matrix.py
         # FMA-negation peel deletion invariant, re-derived over the enumerated
         # shape space: a pure model check (no compiler, sub-second) so a
         # regression of the absorbability classification is caught even where
@@ -1821,7 +1822,7 @@ jobs:
         CCC: target/fastbuild/lccc
       run: |
         python3 scripts/test_local_oracles.py
-        for fixture in popcount_loop_idiom crc32_index_narrowing_variants; do
+        for fixture in popcount_loop_idiom crc32_index_narrowing_variants affine_scaled_index_matrix; do
           "$LCCC_ICX_BIN" -O2 -Wall -Wextra -Werror "tests/regression/$fixture.c" -o "intel-evidence/$fixture-icx"
           target/fastbuild/lccc -O2 -Wall -Wextra -Werror "tests/regression/$fixture.c" -o "intel-evidence/$fixture-lccc"
           "intel-evidence/$fixture-icx" > "intel-evidence/$fixture-icx.txt"

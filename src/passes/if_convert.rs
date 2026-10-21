@@ -1657,40 +1657,73 @@ fn plan_shared_arm_dup(
 
 /// Apply a planned shared-arm duplication (see `plan_shared_arm_dup`).
 fn apply_shared_arm_dup(func: &mut IrFunction, plan: &SharedArmDup) -> bool {
-    let s_label = func.blocks[plan.s_idx].label;
-    // Defensive re-validation: H still ends in the expected CondBranch.
-    let (t1, f1) = match &func.blocks[plan.h_idx].terminator {
-        Terminator::CondBranch {
-            true_label,
-            false_label,
-            ..
-        } => (*true_label, *false_label),
-        _ => return false,
+    // Validate the complete transaction before allocating IDs or mutating IR.
+    // Plans are private, but may be stale when this helper is reused.
+    let (Some(s_block), Some(h_block)) = (func.blocks.get(plan.s_idx), func.blocks.get(plan.h_idx))
+    else {
+        return false;
     };
-    let edge_is_true = if plan.h_edge_is_true {
-        t1 == s_label
+    let s_label = s_block.label;
+    let Terminator::CondBranch {
+        true_label,
+        false_label,
+        ..
+    } = h_block.terminator
+    else {
+        return false;
+    };
+    let edge = if plan.h_edge_is_true {
+        true_label
     } else {
-        f1 == s_label
+        false_label
     };
-    if !edge_is_true {
+    if edge != s_label || true_label == false_label || plan.h_idx == plan.s_idx {
         return false;
     }
-
-    // Clone S with fresh SSA dests; values internal to S are remapped,
-    // external operands are kept (dominance makes them valid on the
-    // H -> S' edge).  All reads are taken into owned locals first so no
-    // borrow of `func.blocks` spans the mutations below.
-    let (s_insts, s_term, s_spans) = {
-        let s_block = &func.blocks[plan.s_idx];
-        (
-            s_block.instructions.clone(),
-            s_block.terminator.clone(),
-            s_block.source_spans.clone(),
-        )
+    let Terminator::Branch(m_label) = s_block.terminator else {
+        return false;
     };
-    if !matches!(s_term, Terminator::Branch(_)) {
+    let Some(m_idx) = func.blocks.iter().position(|b| b.label == m_label) else {
+        return false;
+    };
+    if m_idx == plan.h_idx
+        || m_idx == plan.s_idx
+        || func.blocks.iter().any(|b| b.label.0 == func.next_label)
+    {
         return false;
     }
+    let mut phi_updates = Vec::new();
+    for (ii, inst) in func.blocks[m_idx].instructions.iter().enumerate() {
+        if let Instruction::Phi { incoming, .. } = inst {
+            let mut values = incoming.iter().filter(|(_, label)| *label == s_label);
+            let Some(&(value, _)) = values.next() else {
+                return false;
+            };
+            if values.next().is_some() {
+                return false;
+            }
+            phi_updates.push((ii, value));
+        }
+    }
+    let Some(next_label) = func.next_label.checked_add(1) else {
+        return false;
+    };
+    let dest_count = s_block
+        .instructions
+        .iter()
+        .filter(|inst| inst.dest().is_some())
+        .count();
+    let Some(next_value_id) = u32::try_from(dest_count)
+        .ok()
+        .and_then(|n| func.next_value_id.checked_add(n))
+    else {
+        return false;
+    };
+    let (s_insts, s_term, s_spans) = (
+        s_block.instructions.clone(),
+        s_block.terminator.clone(),
+        s_block.source_spans.clone(),
+    );
     let mut clone_map: crate::common::fx_hash::FxHashMap<u32, u32> =
         crate::common::fx_hash::FxHashMap::default();
     let mut cloned_insts: Vec<Instruction> = Vec::with_capacity(s_insts.len());
@@ -1707,7 +1740,8 @@ fn apply_shared_arm_dup(func: &mut IrFunction, plan: &SharedArmDup) -> bool {
     }
 
     let s_prime_label = BlockId(func.next_label);
-    func.next_label += 1;
+    func.next_label = next_label;
+    debug_assert_eq!(func.next_value_id, next_value_id);
     func.blocks.push(BasicBlock {
         label: s_prime_label,
         instructions: cloned_insts,
@@ -1715,31 +1749,17 @@ fn apply_shared_arm_dup(func: &mut IrFunction, plan: &SharedArmDup) -> bool {
         source_spans: s_spans,
     });
 
-    // Extend M's phis: the S'-edge carries the S-edge's value, with values
-    // internal to S mapped to the clone's dests.
-    if let Terminator::Branch(m_label) = s_term
-        && let Some(m_block) = func.blocks.iter_mut().find(|b| b.label == m_label)
-    {
-        for inst in &mut m_block.instructions {
-            if let Instruction::Phi { incoming, .. } = inst {
-                if let Some(pos) = incoming.iter().position(|(_, l)| *l == s_label) {
-                    let v = incoming[pos].0;
-                    let mapped = match v {
-                        Operand::Value(val) => match clone_map.get(&val.0) {
-                            Some(&nv) => Operand::Value(Value(nv)),
-                            None => v,
-                        },
-                        other => other,
-                    };
-                    incoming.push((mapped, s_prime_label));
-                } else {
-                    // Phi completeness was planned; a missing S-incoming
-                    // means the function mutated underneath us.
-                    return false;
-                }
-            } else {
-                break; // phis are a contiguous prefix
-            }
+    // All phi inputs were validated before mutation, so applying the repair
+    // has no failure path and cannot leave a partially transformed function.
+    for (ii, value) in phi_updates {
+        let mapped = match value {
+            Operand::Value(val) => clone_map
+                .get(&val.0)
+                .map_or(value, |&nv| Operand::Value(Value(nv))),
+            _ => value,
+        };
+        if let Instruction::Phi { incoming, .. } = &mut func.blocks[m_idx].instructions[ii] {
+            incoming.push((mapped, s_prime_label));
         }
     }
 
@@ -4184,5 +4204,129 @@ mod tests {
             violations.is_empty(),
             "sunk store left invalid IR: {violations:#?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_arm_transaction_tests {
+    use super::*;
+    use crate::ir::reexports::IrConst;
+
+    fn fixture() -> (IrFunction, SharedArmDup) {
+        let mut f = IrFunction::new("shared_arm_transaction".into(), IrType::I64, vec![], false);
+        let block = |label, instructions, terminator| BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: vec![],
+        };
+        f.blocks = vec![
+            block(
+                0,
+                vec![],
+                Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I64(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                1,
+                vec![Instruction::Copy {
+                    dest: Value(0),
+                    src: Operand::Const(IrConst::I64(42)),
+                }],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Const(IrConst::I64(7)),
+                }],
+                Terminator::Branch(BlockId(3)),
+            ),
+            block(
+                3,
+                (2..4)
+                    .map(|id| Instruction::Phi {
+                        dest: Value(id),
+                        ty: IrType::I64,
+                        incoming: vec![
+                            (Operand::Value(Value(0)), BlockId(1)),
+                            (Operand::Value(Value(1)), BlockId(2)),
+                        ],
+                    })
+                    .collect(),
+                Terminator::Return(Some(Operand::Value(Value(2)))),
+            ),
+        ];
+        f.next_value_id = 4;
+        f.next_label = 4;
+        (
+            f,
+            SharedArmDup {
+                h_idx: 0,
+                h_edge_is_true: true,
+                s_idx: 1,
+            },
+        )
+    }
+
+    #[test]
+    fn invalid_plans_and_capacity_failures_are_transactional() {
+        for case in 0..10 {
+            let (mut f, mut plan) = fixture();
+            match case {
+                0 => f.blocks[1].terminator = Terminator::Branch(BlockId(99)),
+                1 | 2 => {
+                    if let Instruction::Phi { incoming, .. } =
+                        &mut f.blocks[3].instructions[case - 1]
+                    {
+                        incoming.remove(0);
+                    }
+                }
+                3 => f.next_value_id = u32::MAX,
+                4 => f.next_label = u32::MAX,
+                5 => plan.h_idx = usize::MAX,
+                6 => plan.s_idx = usize::MAX,
+                7 => f.next_label = 3,
+                8 => {
+                    if let Instruction::Phi { incoming, .. } = &mut f.blocks[3].instructions[0] {
+                        incoming.push(incoming[0]);
+                    }
+                }
+                _ => plan.h_edge_is_true = false,
+            }
+            let before = format!("{f:?}");
+            assert!(!apply_shared_arm_dup(&mut f, &plan), "case={case}");
+            assert_eq!(format!("{f:?}"), before, "partial mutation in case={case}");
+        }
+    }
+
+    #[test]
+    fn success_repairs_all_phis_and_only_the_selected_head_edge() {
+        for true_edge in [false, true] {
+            let (mut f, mut plan) = fixture();
+            if !true_edge {
+                f.blocks[0].terminator = Terminator::CondBranch {
+                    cond: Operand::Const(IrConst::I64(1)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(1),
+                };
+                plan.h_edge_is_true = false;
+            }
+            assert!(apply_shared_arm_dup(&mut f, &plan));
+            assert_eq!((f.next_value_id, f.next_label, f.blocks.len()), (5, 5, 5));
+            for inst in &f.blocks[3].instructions {
+                let Instruction::Phi { incoming, .. } = inst else {
+                    panic!("expected phi")
+                };
+                assert!(incoming.contains(&(Operand::Value(Value(4)), BlockId(4))));
+            }
+            let mut violations = Vec::new();
+            crate::passes::verify::verify_function(&f, "shared_arm_transaction", &mut violations);
+            assert!(violations.is_empty(), "{violations:?}");
+        }
     }
 }

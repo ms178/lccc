@@ -1,6 +1,6 @@
 {
   "fns_over_1000": 27,
-  "fns_over_300": 230,
+  "fns_over_300": 229,
   "fns_over_500": 94,
   "ignored_tests": 10,
   "knob_literals": 511,

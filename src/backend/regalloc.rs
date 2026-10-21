@@ -6439,6 +6439,7 @@ fn synthetic_vec_intervals(
 ) -> Vec<LiveInterval> {
     use std::collections::VecDeque;
 
+    super::liveness::validate_program_point_capacity(func);
     let block_count = func.blocks.len();
     if block_count == 0 || candidates.is_empty() {
         return Vec::new();
@@ -6455,7 +6456,7 @@ fn synthetic_vec_intervals(
     for (block_index, block) in func.blocks.iter().enumerate() {
         let block_start = point;
         for inst in &block.instructions {
-            let end = point.saturating_add(1);
+            let end = point + 1;
             let mut read_values: FxHashSet<u32> = FxHashSet::default();
             let mut written_value: Option<u32> = None;
             match inst {
@@ -6512,7 +6513,7 @@ fn synthetic_vec_intervals(
             }
             point = end;
         }
-        let terminator_end = point.saturating_add(1);
+        let terminator_end = point + 1;
         for_each_operand_in_terminator(&block.terminator, |operand| {
             let Operand::Value(value) = operand else {
                 return;

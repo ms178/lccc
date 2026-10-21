@@ -8202,7 +8202,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_pointer_add_load_store_and_gep_base_widen_when_exact_and_refuse_when_inexact() {
+    fn exact_wide_pointer_consumers_widen_and_preserve_valid_ssa() {
         let header_cmp = || {
             Some(Instruction::Cmp {
                 dest: Value(2),
@@ -8266,11 +8266,27 @@ mod tests {
         );
         check(&mut func, 1);
 
+        assert!(
+            func.blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .any(|i| matches!(
+                    i,
+                    Instruction::Phi {
+                        ty: IrType::U64,
+                        ..
+                    }
+                ))
+        );
+    }
+
+    #[test]
+    fn inexact_wide_pointer_consumers_refuse_without_changing_ir() {
         // 2. IVW-RANGE-1 negative control: if a narrow wrapping Add precedes
         //    the U32->U64 cast under a runtime bound (so `intercept` is active
         //    and `cur_exact` is false), Load/Store/GEP-base on `Add(arr, w)`
         //    must refuse to widen.
-        let inexact_body = vec![
+        let inexact_body = [
             Instruction::BinOp {
                 dest: Value(9),
                 op: IrBinOp::Add,
@@ -8299,31 +8315,74 @@ mod tests {
                 seg_override: AddressSpace::Default,
             },
         ];
-        let mut inexact = counting_loop(
-            "wide_ptr_add_inexact",
-            IrType::U32,
-            IrBinOp::Add,
-            inexact_body,
-            None,
-        );
-        // Runtime bound in preheader (Value(60)) so range is full-domain and
-        // `intercept` is active.
-        inexact.blocks[0].instructions.push(Instruction::Copy {
-            dest: Value(60),
-            src: Operand::Const(IrConst::I32(64)),
-        });
-        inexact.blocks[1].instructions.push(Instruction::Cmp {
-            dest: Value(2),
-            op: IrCmpOp::Ult,
-            lhs: Operand::Value(Value(1)),
-            rhs: Operand::Value(Value(60)),
-            ty: IrType::U32,
-        });
-        inexact.blocks[1].terminator = Terminator::CondBranch {
-            cond: Operand::Value(Value(2)),
-            true_label: BlockId(2),
-            false_label: BlockId(4),
-        };
-        check(&mut inexact, 0);
+        for consumer in 0..4 {
+            let mut body = inexact_body[..3].to_vec();
+            match consumer {
+                0 => body.push(inexact_body[3].clone()),
+                1 => body.push(Instruction::Store {
+                    val: Operand::Const(IrConst::I8(7)),
+                    ptr: Value(11),
+                    ty: IrType::U8,
+                    volatile: false,
+                    seg_override: AddressSpace::Default,
+                }),
+                2 => {
+                    body.push(Instruction::GetElementPtr {
+                        dest: Value(12),
+                        base: Value(11),
+                        offset: Operand::Const(IrConst::I64(4)),
+                        ty: IrType::I8,
+                    });
+                    body.push(Instruction::Load {
+                        dest: Value(13),
+                        ptr: Value(12),
+                        ty: IrType::U8,
+                        volatile: false,
+                        seg_override: AddressSpace::Default,
+                    });
+                }
+                _ => body.push(Instruction::Store {
+                    val: Operand::Value(Value(10)),
+                    ptr: Value(50),
+                    ty: IrType::U64,
+                    volatile: false,
+                    seg_override: AddressSpace::Default,
+                }),
+            }
+            let mut inexact = counting_loop(
+                "wide_ptr_add_inexact",
+                IrType::U32,
+                IrBinOp::Add,
+                body,
+                None,
+            );
+            // Runtime bound in preheader (Value(60)) so range is full-domain and
+            // `intercept` is active.
+            inexact.blocks[0].instructions.push(Instruction::Copy {
+                dest: Value(60),
+                src: Operand::Const(IrConst::I32(64)),
+            });
+            inexact.blocks[1].instructions.push(Instruction::Cmp {
+                dest: Value(2),
+                op: IrCmpOp::Ult,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Value(Value(60)),
+                ty: IrType::U32,
+            });
+            inexact.blocks[1].terminator = Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(2),
+                false_label: BlockId(4),
+            };
+            let before = format!("{:?}", inexact.blocks);
+            let ids = (inexact.next_value_id, inexact.next_label);
+            check(&mut inexact, 0);
+            assert_eq!(
+                format!("{:?}", inexact.blocks),
+                before,
+                "consumer={consumer}"
+            );
+            assert_eq!((inexact.next_value_id, inexact.next_label), ids);
+        }
     }
 }
