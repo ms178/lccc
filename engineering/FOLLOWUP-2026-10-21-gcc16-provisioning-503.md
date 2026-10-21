@@ -187,8 +187,13 @@ index while the source points at the current CDN edge (republishing once the
 source is retargeted), and `LEGACY_HOST_DOWN` refuses the fallback, so the
 "both hosts down" failure path is exercised too.
 
-The previous revision of the script fails 9 of the 19 original tests (mutation
-check); the new one passes all 22. `tests/corpus/test_ci_failure_annotations.py` pins
+Two mutation checks pin the suite to the defects it was written for:
+
+* the original script (before this document) fails 9 of the first 19 tests;
+* dropping `"${index_opts[@]}"` from the presence probe -- the bug CI found in
+  the cached-index change -- fails 4 of the 23 tests.
+
+The current script passes all 23. `tests/corpus/test_ci_failure_annotations.py` pins
 the annotation contract: single line, percent-escaped, status preserved, no
 annotation outside Actions, and no lane reintroducing a capture wrapper.
 
