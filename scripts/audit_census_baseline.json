@@ -1,11 +1,11 @@
 {
   "fns_over_1000": 28,
-  "fns_over_300": 232,
+  "fns_over_300": 230,
   "fns_over_500": 94,
   "ignored_tests": 10,
-  "knob_literals": 513,
-  "knobs_undocumented": 289,
-  "panic_sites": 853,
+  "knob_literals": 511,
+  "knobs_undocumented": 280,
+  "panic_sites": 848,
   "panic_sites_hot": 105,
   "unsafe_sites": 25
 }

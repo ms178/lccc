@@ -3477,6 +3477,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // vanishes. A source read only by the latch copy stays home-less: the
     // apply phase either gives it the phi's register or the def spills, and
     // no other consumer can observe the difference.
+    //
+    // One CFG for the whole candidate loop: the caller-saved window check
+    // needs the predecessor sets, and deriving them inside the check turned
+    // a linear scan into O(candidates x (V+E)) on every function.
+    let mut cfg_preds: Option<analysis::FlatAdj> = None;
     for candidate in &phi_coalesce {
         let src_has_other_consumers = uses_excluding(
             func,
@@ -3484,7 +3489,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             candidate.block_idx,
             candidate.copy_idx,
         ) > 0;
-        if !phi_window_clobbers_caller_saved(func, candidate) && !src_has_other_consumers {
+        let preds = cfg_preds.get_or_insert_with(|| {
+            let labels = analysis::build_label_map(func);
+            analysis::build_cfg(func, &labels).0
+        });
+        if !phi_window_clobbers_caller_saved(func, candidate, preds) && !src_has_other_consumers {
             if config.ra_config.debug_phi_coalesce {
                 eprintln!(
                     "[PHI_COALESCE] fn={} HOMELESS src=v{} (dest=v{} block={} copy_idx={})",
@@ -10643,27 +10652,36 @@ fn terminator_targets_label(term: &Terminator, label: crate::ir::reexports::Bloc
     }
 }
 
-fn single_pred_chain_blocks(
+/// Longest single-predecessor chain (in intermediate blocks) that the phi
+/// coalescer will reason through. Both the liveness gate and the
+/// caller-saved-clobber window use this one bound: a longer reach on one
+/// side would let a window be proven safe over blocks the other side never
+/// looked at.
+const PHI_CHAIN_MAX_MIDS: usize = 4;
+
+/// The blocks strictly between `copy_block` and `source_block` on a
+/// single-predecessor chain, ordered from `source_block` to `copy_block`.
+///
+/// This is the ONE definition of the chain shape. It is deliberately pure
+/// shape analysis: whether a chain is *admissible* (loop depth, liveness,
+/// uses) is the caller's policy, so the liveness gate and the clobber
+/// window cannot drift apart and disagree about which blocks are in scope.
+///
+/// Returns `None` for the same-block case, for any block on the walk with
+/// more than one predecessor, when the walk revisits a block (multi-block
+/// cycle), and beyond [`PHI_CHAIN_MAX_MIDS`] hops.
+fn single_pred_chain(
     preds: &analysis::FlatAdj,
-    liveness: &LivenessResult,
     source_block: usize,
     copy_block: usize,
 ) -> Option<Vec<usize>> {
     if source_block == copy_block {
         return None;
     }
-    let min_depth = liveness
-        .block_loop_depth
-        .get(copy_block)
-        .copied()
-        .unwrap_or(0);
     let mut mids = Vec::new();
     let mut cur = copy_block;
-    while preds.len(cur) == 1 && mids.len() <= 4 {
+    while preds.len(cur) == 1 && mids.len() <= PHI_CHAIN_MAX_MIDS {
         let p = preds.row(cur)[0] as usize;
-        if liveness.block_loop_depth.get(p).copied().unwrap_or(0) < min_depth {
-            return None;
-        }
         if p == source_block {
             mids.reverse();
             return Some(mids);
@@ -10677,7 +10695,44 @@ fn single_pred_chain_blocks(
     None
 }
 
-fn phi_window_clobbers_caller_saved(func: &IrFunction, cand: &PhiCoalesceCandidate) -> bool {
+/// [`single_pred_chain`] plus the loop-depth admissibility policy: every
+/// intermediate block must sit at least as deep as the copy block, so the
+/// source is born on the same loop-carried path rather than in a preheader.
+fn single_pred_chain_blocks(
+    preds: &analysis::FlatAdj,
+    liveness: &LivenessResult,
+    source_block: usize,
+    copy_block: usize,
+) -> Option<Vec<usize>> {
+    let mids = single_pred_chain(preds, source_block, copy_block)?;
+    let min_depth = liveness
+        .block_loop_depth
+        .get(copy_block)
+        .copied()
+        .unwrap_or(0);
+    if mids
+        .iter()
+        .any(|&m| liveness.block_loop_depth.get(m).copied().unwrap_or(0) < min_depth)
+    {
+        return None;
+    }
+    Some(mids)
+}
+
+/// True iff a caller-saved instruction can execute between the source's
+/// definition and the latch copy on *every* path the coalescer reasons
+/// about: the source block's tail, the sole single-predecessor chain of
+/// intermediate blocks (`single_pred_chain`, the same shape the liveness
+/// gate admits), and the copy block's prefix.
+///
+/// `preds` is the CFG the caller already has. Rebuilding it per candidate
+/// here made this check O(candidates x (V+E)) on every function's register
+/// allocation; the caller now builds one CFG for the whole candidate loop.
+fn phi_window_clobbers_caller_saved(
+    func: &IrFunction,
+    cand: &PhiCoalesceCandidate,
+    preds: &analysis::FlatAdj,
+) -> bool {
     let Some(copy_block) = func.blocks.get(cand.block_idx) else {
         return false;
     };
@@ -10704,26 +10759,18 @@ fn phi_window_clobbers_caller_saved(func: &IrFunction, cand: &PhiCoalesceCandida
         {
             return true;
         }
-        if !terminator_targets_label(&src_block.terminator, copy_block.label) {
-            let label_to_idx = analysis::build_label_map(func);
-            let (preds, _) = analysis::build_cfg(func, &label_to_idx);
-            let mut cur = cand.block_idx;
-            let mut steps = 0usize;
-            while cur != cand.source_block_idx && preds.len(cur) == 1 && steps <= 4 {
-                let p = preds.row(cur)[0] as usize;
-                if p == cand.source_block_idx {
-                    break;
-                }
-                if func.blocks[p]
+        // The direct-edge case needs no walk: the source tail above already
+        // covers every instruction on that path. When the edge is absent,
+        // every intermediate block of the chain is in the window.
+        if !terminator_targets_label(&src_block.terminator, copy_block.label)
+            && let Some(mids) = single_pred_chain(preds, cand.source_block_idx, cand.block_idx)
+        {
+            return mids.iter().any(|&m| {
+                func.blocks[m]
                     .instructions
                     .iter()
                     .any(instruction_clobbers_caller_saved)
-                {
-                    return true;
-                }
-                cur = p;
-                steps += 1;
-            }
+            });
         }
         false
     }
@@ -10776,7 +10823,11 @@ fn apply_phi_coalesce_assignments_with_config(
     // Lazily-computed %rdx clobber points for the Phase-2x64 propagation
     // guard below (None until a %rdx-homed phi dest is actually considered).
     let mut rdx_clobbers: Option<Vec<u32>> = None;
-    let mut succs: Option<analysis::FlatAdj> = None;
+    // Lazily-built CFG for this function: predecessor sets feed the
+    // caller-saved window check, successor sets feed the source-home
+    // redefinition proof. One build per function -- deriving either inside
+    // the candidate loop made both checks O(candidates x (V+E)).
+    let mut cfg: Option<(analysis::FlatAdj, analysis::FlatAdj)> = None;
     for candidate in candidates {
         let phi_dest = candidate.phi_dest;
         let backedge_src = candidate.backedge_src;
@@ -10816,10 +10867,12 @@ fn apply_phi_coalesce_assignments_with_config(
             continue;
         }
 
-        let succs = succs.get_or_insert_with(|| {
-            let label_to_idx = analysis::build_label_map(func);
-            analysis::build_cfg(func, &label_to_idx).1
-        });
+        let succs = &cfg
+            .get_or_insert_with(|| {
+                let label_to_idx = analysis::build_label_map(func);
+                analysis::build_cfg(func, &label_to_idx)
+            })
+            .1;
         if !source_home_survives_dest_redefs(func, liveness, succs, candidate) {
             if ra_config.debug_phi_coalesce {
                 eprintln!(
@@ -10834,7 +10887,13 @@ fn apply_phi_coalesce_assignments_with_config(
             continue;
         };
 
-        if phi_window_clobbers_caller_saved(func, candidate)
+        let preds = &cfg
+            .get_or_insert_with(|| {
+                let label_to_idx = analysis::build_label_map(func);
+                analysis::build_cfg(func, &label_to_idx)
+            })
+            .0;
+        if phi_window_clobbers_caller_saved(func, candidate, preds)
             && !callee_saved.iter().any(|r| r.0 == reg.0)
         {
             if ra_config.debug_phi_coalesce {
@@ -13073,8 +13132,9 @@ mod phi_coalesce_tests {
             source_def_idx: 0,
             copy_idx: 2,
         };
+        let (preds, _) = analysis::build_cfg(&func, &analysis::build_label_map(&func));
         assert!(
-            phi_window_clobbers_caller_saved(&func, &cand),
+            phi_window_clobbers_caller_saved(&func, &cand, &preds),
             "strtol in the (def, copy) window must be a caller-saved clobber"
         );
 
@@ -13180,8 +13240,9 @@ mod phi_coalesce_tests {
             source_def_idx: 0,
             copy_idx: 0,
         };
+        let (preds, _) = analysis::build_cfg(&func, &analysis::build_label_map(&func));
         assert!(
-            !phi_window_clobbers_caller_saved(&func, &cand),
+            !phi_window_clobbers_caller_saved(&func, &cand, &preds),
             "precondition: the call sits in the exit block, outside the (def, copy) window"
         );
 
@@ -15726,5 +15787,129 @@ mod scalar_lane_class_tests {
                 .any(|c| c.phi_dest == 10 && c.backedge_src == 11),
             "expected (10, 11) phi coalesce across 2-hop latch chain, got {cands:?}"
         );
+    }
+}
+
+/// Tests for the single definition of the phi-coalescer's chain shape.
+///
+/// `single_pred_chain` is pure graph analysis, so every case here is decided
+/// by the predecessor sets alone — no liveness, no allocation, no codegen.
+/// The liveness gate and the caller-saved-clobber window both consume it,
+/// which is why the hop limit and the refusal cases are pinned here once.
+#[cfg(test)]
+mod phi_chain_shape_tests {
+    use super::*;
+
+    /// Straight-line function `0 -> 1 -> ... -> n-1`.
+    fn line(n: u32) -> IrFunction {
+        let mut f = IrFunction::new("line".into(), IrType::U64, vec![], false);
+        for i in 0..n {
+            let terminator = if i + 1 == n {
+                Terminator::Return(None)
+            } else {
+                Terminator::Branch(BlockId(i + 1))
+            };
+            f.blocks.push(BasicBlock {
+                label: BlockId(i),
+                instructions: vec![],
+                terminator,
+                source_spans: vec![],
+            });
+        }
+        f
+    }
+
+    fn preds_of(f: &IrFunction) -> analysis::FlatAdj {
+        analysis::build_cfg(f, &analysis::build_label_map(f)).0
+    }
+
+    #[test]
+    fn direct_edge_is_an_empty_chain() {
+        let f = line(3);
+        let preds = preds_of(&f);
+        assert_eq!(single_pred_chain(&preds, 0, 1), Some(Vec::new()));
+        assert_eq!(single_pred_chain(&preds, 1, 2), Some(Vec::new()));
+    }
+
+    #[test]
+    fn intermediate_blocks_are_ordered_source_to_copy() {
+        let f = line(6);
+        let preds = preds_of(&f);
+        assert_eq!(single_pred_chain(&preds, 1, 3), Some(vec![2]));
+        assert_eq!(single_pred_chain(&preds, 2, 5), Some(vec![3, 4]));
+        assert_eq!(single_pred_chain(&preds, 0, 5), Some(vec![1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn hop_limit_and_same_block_refuse() {
+        let f = line(7);
+        let preds = preds_of(&f);
+        // Four intermediates are the contract; a fifth is refused rather
+        // than silently truncated (a truncated window would let the clobber
+        // check inspect fewer blocks than the liveness gate admitted).
+        assert_eq!(single_pred_chain(&preds, 0, 5), Some(vec![1, 2, 3, 4]));
+        assert_eq!(single_pred_chain(&preds, 0, 6), None);
+        // Same block: not a chain at all.
+        assert_eq!(single_pred_chain(&preds, 3, 3), None);
+    }
+
+    #[test]
+    fn multi_predecessor_and_cycles_refuse() {
+        // Diamond: 0 -> {1, 2} -> 3. Block 3 has two predecessors, so no
+        // chain may reach it; block 1 is not the source of block 2.
+        let mut f = IrFunction::new("diamond".into(), IrType::U64, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Const(IrConst::I32(1)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: vec![],
+        });
+        for i in 1..3u32 {
+            f.blocks.push(BasicBlock {
+                label: BlockId(i),
+                instructions: vec![],
+                terminator: Terminator::Branch(BlockId(3)),
+                source_spans: vec![],
+            });
+        }
+        f.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        });
+        let preds = preds_of(&f);
+        assert_eq!(preds.len(3), 2, "precondition: block 3 is a join");
+        assert_eq!(single_pred_chain(&preds, 1, 3), None);
+        assert_eq!(single_pred_chain(&preds, 0, 2), None);
+
+        // Back edge: 0 -> 1 -> 2 -> 1. The walk stops at block 1 because the
+        // back edge gives it two predecessors (the `mids.contains` guard is
+        // the belt-and-braces for a shape where it would not).
+        let mut g = IrFunction::new("cycle".into(), IrType::U64, vec![], false);
+        g.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        g.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: vec![],
+        });
+        g.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: vec![],
+        });
+        let preds = preds_of(&g);
+        assert_eq!(single_pred_chain(&preds, 0, 2), None);
     }
 }

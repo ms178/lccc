@@ -801,3 +801,71 @@ fn a_copyback_fold_still_fires_when_every_use_is_rewritable() {
         out
     );
 }
+
+/// Parser-level tests for the producer shapes the copy-back fold accepts.
+///
+/// These are pure: `parse_copyback_producer` maps one trimmed line to a
+/// producer description, so each case below pins an exact decision with no
+/// dependence on the surrounding pipeline. The SIB cases exist because the
+/// operand split must happen at the LAST comma — splitting at the first one
+/// turns `leaq 8(%rax, %r9, 1), %r10` into a bogus displacement and silently
+/// drops the fold (or, worse, misreads the base).
+mod copyback_producer_tests {
+    use super::super::parse_copyback_producer;
+    use super::super::{plain_reg_family, CopybackProducer};
+
+    #[test]
+    fn sib_leaq_parses_as_lea_mem_and_keeps_the_full_operand() {
+        for (line, mem, dest) in [
+            ("leaq 8(%rax, %r9, 1), %r10", "8(%rax, %r9, 1)", "%r10"),
+            ("leaq (%rdx, %r9, 8), %rax", "(%rdx, %r9, 8)", "%rax"),
+        ] {
+            let (producer, fam) =
+                parse_copyback_producer(line).unwrap_or_else(|| panic!("{line} must parse"));
+            match producer {
+                CopybackProducer::LeaMem { mem: got } => assert_eq!(got, mem, "{line}"),
+                _ => panic!("{line} must parse as LeaMem, not a plain-base Lea"),
+            }
+            assert_eq!(Some(fam), plain_reg_family(dest), "{line}");
+        }
+    }
+
+    #[test]
+    fn plain_base_leaq_still_parses_as_lea() {
+        let (producer, fam) =
+            parse_copyback_producer("leaq 8(%rax), %r10").expect("plain-base leaq must parse");
+        match producer {
+            CopybackProducer::Lea { disp, base } => {
+                assert_eq!(disp, "8");
+                assert_eq!(Some(base), plain_reg_family("%rax"));
+            }
+            _ => panic!("a single-register operand must stay a plain-base Lea"),
+        }
+        assert_eq!(Some(fam), plain_reg_family("%r10"));
+    }
+
+    #[test]
+    fn memory_load_with_sib_source_splits_on_the_last_comma() {
+        let (producer, fam) = parse_copyback_producer("movq 16(%rsi, %rax, 8), %rax")
+            .expect("SIB load producer must parse");
+        match producer {
+            CopybackProducer::Load { is_q, mem } => {
+                assert!(is_q, "movq is a full-width load");
+                assert_eq!(mem, "16(%rsi, %rax, 8)");
+            }
+            _ => panic!("expected a Load producer"),
+        }
+        assert_eq!(Some(fam), plain_reg_family("%rax"));
+    }
+
+    #[test]
+    fn wrong_width_destination_refuses() {
+        // The load/store width and the destination spelling must agree; a
+        // narrowed destination is never a copy-back candidate.
+        assert!(parse_copyback_producer("leaq 8(%rax), %eax").is_none());
+        assert!(parse_copyback_producer("leaq 8(%rax, %r9, 1), %r10d").is_none());
+        assert!(parse_copyback_producer("movl 8(%rax), %rax").is_none());
+        // Register-to-register copies belong to fold_register_copies.
+        assert!(parse_copyback_producer("movq %rax, %r10").is_none());
+    }
+}

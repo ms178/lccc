@@ -7183,3 +7183,64 @@ mod tests {
         }
     }
 }
+
+/// Tests for the read-modify-write window of `retarget_producer_into_copy`.
+///
+/// The pass may retarget a *memory* producer straight into the copy's
+/// destination and redirect up to two same-width RMWs on the producer's
+/// register onto that destination, dropping the copy. Both cases below are
+/// decided by the width rule alone, so the expected text is fixed:
+/// the RMW chain is admissible only when every RMW matches BOTH the
+/// producer width and the copy width.
+#[cfg(test)]
+mod rmw_window_tests {
+    #[test]
+    fn same_width_rmw_chain_retargets_the_producer_and_the_rmw() {
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    movl (%rdi), %eax\n",
+            "    addl $1, %eax\n",
+            "    movl %eax, %r10d\n",
+            "    movl %r10d, (%rsi)\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let out = crate::backend::x86::codegen::peephole::peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("movl (%rdi), %r10d"),
+            "the load must be retargeted into the copy destination:\n{out}"
+        );
+        assert!(
+            out.contains("addl $1, %r10d"),
+            "the RMW must follow the retargeted producer:\n{out}"
+        );
+        assert!(
+            !out.contains("%eax"),
+            "the producer's original register must be gone:\n{out}"
+        );
+    }
+
+    #[test]
+    fn mismatched_rmw_width_refuses_the_fold() {
+        // The second RMW writes 64 bits while the producer and the copy are
+        // 32-bit: retargeting would put the chain's intermediate state in a
+        // register whose upper half the RMW also defines, so the pass must
+        // leave the pair alone.
+        let asm = concat!(
+            "f:\n.cfi_startproc\n",
+            "    movl (%rdi), %eax\n",
+            "    addq $2, %rax\n",
+            "    movl %eax, %r10d\n",
+            "    movl %r10d, (%rsi)\n",
+            "    ret\n.cfi_endproc\n",
+        );
+        let out = crate::backend::x86::codegen::peephole::peephole_optimize(asm.to_string());
+        assert!(
+            out.contains("movl (%rdi), %eax"),
+            "a width-mismatched RMW chain must keep the producer in place:\n{out}"
+        );
+        assert!(
+            !out.contains("(%rdi), %r10"),
+            "no retarget may happen across a width-mismatched RMW:\n{out}"
+        );
+    }
+}
