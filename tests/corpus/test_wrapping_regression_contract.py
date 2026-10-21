@@ -65,6 +65,46 @@ class WrappingContracts(unittest.TestCase):
                 self.assertEqual(result.status, 'fail')
                 self.assertIn('compare:fail', result.phases)
 
+    def test_oracle_gap_is_only_waived_when_the_fixture_declares_it(self):
+        # An oracle whose *binary* fails the fixture's assertions is a
+        # reference divergence and must stay a hard failure, unless the
+        # fixture states the toolchain gap in its own sidecar.  The rule is
+        # per test on purpose: a blanket "nonzero oracle means skip" would
+        # silently disable the comparison for every row a stale oracle
+        # touches, which is exactly the failure mode this test pins.
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Path(directory)
+            (corpus / 'declared.c').write_text('int main(void) { return 0; }\n')
+            (corpus / 'declared.env').write_text(
+                '# reference toolchain predates the pinned semantics\n'
+                'LCCC_ORACLE_SELFCHECK=skip\n')
+            (corpus / 'undeclared.c').write_text('int main(void) { return 0; }\n')
+            cases = {case.name: case for case in runner.discover([corpus])}
+            self.assertTrue(cases['declared'].oracle_selfcheck_skip)
+            self.assertFalse(cases['undeclared'].oracle_selfcheck_skip)
+            for verdict, name in (('skip-compare', 'declared'), ('fail', 'undeclared')):
+                with self.subTest(name=name), tempfile.TemporaryDirectory() as work_dir:
+                    work = Path(work_dir)
+                    (work / name).touch()
+                    with patch.object(runner, 'run_checked', side_effect=[
+                            (0, '', ''), (0, 'expected\n', ''), (0, '', ''), (1, '', '')]):
+                        result = runner.compile_one(Path('lccc'), 'gcc', cases[name], work)
+                    self.assertEqual(result.status, verdict, result.detail)
+                    self.assertIn('compare:oracle-skip' if verdict == 'skip-compare'
+                                  else 'compare:fail', result.phases)
+
+    def test_oracle_selfcheck_sidecar_rejects_unknown_values(self):
+        # Fail closed on a typo: silently treating `LCCC_ORACLE_SELFCHECK=yes`
+        # as "no waiver" would leave the fixture comparing against an oracle
+        # that cannot pass, and the operator would never learn why.
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Path(directory)
+            (corpus / 'typo.c').write_text('int main(void) { return 0; }\n')
+            (corpus / 'typo.env').write_text('LCCC_ORACLE_SELFCHECK=yes\n')
+            with self.assertRaises(SystemExit) as caught:
+                runner.discover([corpus])
+            self.assertIn('LCCC_ORACLE_SELFCHECK', str(caught.exception))
+
     def test_independent_signed_ring_expected_values(self):
         def signed(x): return ((x + (1 << 31)) % (1 << 32)) - (1 << 31)
         step = 1073741823

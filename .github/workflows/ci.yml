@@ -45,8 +45,19 @@ jobs:
         sudo apt-get install -y --no-install-recommends qemu-user
     - name: Install differential linker oracles
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends mold lld
+        # The pair comes from the runner's own archive, and two jobs on one
+        # commit have died here on a transient index window while a sibling
+        # installed the same packages seconds later.  Retry the pair as a
+        # unit; the third failure still exits non-zero with the log.
+        for attempt in 1 2 3; do
+          if sudo apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none &&
+             sudo apt-get install -y --no-install-recommends mold lld; then
+            exit 0
+          fi
+          echo "linker-oracle install failed (attempt $attempt/3); retrying" >&2
+          sleep $(( attempt * 20 ))
+        done
+        exit 1
     - name: Verify GCC 16 C23 oracle
       run: |
         test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16
@@ -178,8 +189,19 @@ jobs:
         sudo apt-get install -y --no-install-recommends qemu-user
     - name: Install differential linker oracles
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends mold lld
+        # The pair comes from the runner's own archive, and two jobs on one
+        # commit have died here on a transient index window while a sibling
+        # installed the same packages seconds later.  Retry the pair as a
+        # unit; the third failure still exits non-zero with the log.
+        for attempt in 1 2 3; do
+          if sudo apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none &&
+             sudo apt-get install -y --no-install-recommends mold lld; then
+            exit 0
+          fi
+          echo "linker-oracle install failed (attempt $attempt/3); retrying" >&2
+          sleep $(( attempt * 20 ))
+        done
+        exit 1
     - name: Verify GCC 16 C23 oracle
       run: |
         test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16
@@ -272,8 +294,19 @@ jobs:
         sudo apt-get install -y --no-install-recommends qemu-user
     - name: Install differential linker oracles
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends mold lld
+        # The pair comes from the runner's own archive, and two jobs on one
+        # commit have died here on a transient index window while a sibling
+        # installed the same packages seconds later.  Retry the pair as a
+        # unit; the third failure still exits non-zero with the log.
+        for attempt in 1 2 3; do
+          if sudo apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none &&
+             sudo apt-get install -y --no-install-recommends mold lld; then
+            exit 0
+          fi
+          echo "linker-oracle install failed (attempt $attempt/3); retrying" >&2
+          sleep $(( attempt * 20 ))
+        done
+        exit 1
     - name: Verify GCC 16 C23 oracle
       run: |
         test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16
@@ -423,8 +456,19 @@ jobs:
         sudo apt-get install -y --no-install-recommends qemu-user
     - name: Install differential linker oracles
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends mold lld
+        # The pair comes from the runner's own archive, and two jobs on one
+        # commit have died here on a transient index window while a sibling
+        # installed the same packages seconds later.  Retry the pair as a
+        # unit; the third failure still exits non-zero with the log.
+        for attempt in 1 2 3; do
+          if sudo apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none &&
+             sudo apt-get install -y --no-install-recommends mold lld; then
+            exit 0
+          fi
+          echo "linker-oracle install failed (attempt $attempt/3); retrying" >&2
+          sleep $(( attempt * 20 ))
+        done
+        exit 1
     # The ext_vector_type gates compare against Clang 23.1.3 EXACTLY
     # (tests/regression/lib/clang_oracle.sh): GCC has no ext_vector_type and
     # Clang's i386 convention for 8-byte vectors changed between releases,
@@ -546,6 +590,11 @@ jobs:
       run: env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_a9987_salvage.sh
     - name: ext_vector_type padded layout vs the compiler oracle
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_layout.sh
+    - name: ext_vector_type layout/lane matrix vs the pinned Clang 23.1.3 oracle
+      run: |
+        set -o pipefail
+        env LCCC_REQUIRE_I686=1 CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_layout_matrix.sh 2>&1 |
+          tee "$RUNNER_TEMP/ext-vector-layout-matrix.log"
 
     - name: Ext-vector rvalue subscript cross-ABI
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_ext_vector_rvalue_subscript.sh
@@ -782,8 +831,19 @@ jobs:
         sudo apt-get install -y --no-install-recommends qemu-user
     - name: Install differential linker oracles
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends mold lld
+        # The pair comes from the runner's own archive, and two jobs on one
+        # commit have died here on a transient index window while a sibling
+        # installed the same packages seconds later.  Retry the pair as a
+        # unit; the third failure still exits non-zero with the log.
+        for attempt in 1 2 3; do
+          if sudo apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none &&
+             sudo apt-get install -y --no-install-recommends mold lld; then
+            exit 0
+          fi
+          echo "linker-oracle install failed (attempt $attempt/3); retrying" >&2
+          sleep $(( attempt * 20 ))
+        done
+        exit 1
     - name: Verify GCC 16 C23 oracle
       run: |
         test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16
@@ -1072,8 +1132,19 @@ jobs:
         sudo apt-get install -y --no-install-recommends qemu-user
     - name: Install differential linker oracles
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends mold lld
+        # The pair comes from the runner's own archive, and two jobs on one
+        # commit have died here on a transient index window while a sibling
+        # installed the same packages seconds later.  Retry the pair as a
+        # unit; the third failure still exits non-zero with the log.
+        for attempt in 1 2 3; do
+          if sudo apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none &&
+             sudo apt-get install -y --no-install-recommends mold lld; then
+            exit 0
+          fi
+          echo "linker-oracle install failed (attempt $attempt/3); retrying" >&2
+          sleep $(( attempt * 20 ))
+        done
+        exit 1
     - name: Provision AArch64/RISC-V cross toolchains
       # check_tls_cross_models.sh links lccc objects against GCC-built TLS
       # definitions and executes them under qemu-user (installed above). With no

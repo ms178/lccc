@@ -81,6 +81,31 @@ forms diagnose; the full regression/differential battery passes. Do not round
 byte counts or alter `vector_size` semantics as a substitute for a representation
 model.
 
+**Progress 2026-10-21 (layout matrix receipts):** both historical layout
+mismatches are re-measured and closed on the current tree, and the i686 half
+now has a receipt that does not depend on multilib glibc headers.
+`_Bool ext_vector_type(4)` is 1/1 (`sizeof`/`_Alignof`) and the padded
+three-lane `unsigned long` vector is 32/32 on LP64 and 16/16 on i686 -- the
+same numbers Clang 23.1.3 produces, which is the contract compiler for this
+extension. The evidence is a new gate
+(`tests/regression/check_ext_vector_layout_matrix.sh`) over a freestanding
+fixture (`tests/regression/ext_vector_layout/layout_matrix.c`): 12 element
+types x 10 lane counts (1-8, 11, 16) printed as `sizeof`/`_Alignof` and
+compared byte-for-byte with Clang 23.1.3 for `-m64` and `-m32` at `-O0` and
+`-O2`, plus a hash over lane stores and lane loads of the 72 odd/prime-lane
+shapes, plus 240 compile-time layout laws (`_Static_assert`). Two controls
+keep it from passing vacuously: a perturbed size row must break the
+comparison, and a `_Static_assert` naming the LP64 answer for three `unsigned
+long` lanes must be accepted by `-m64` and rejected by `-m32` (a target that
+answered with the host's width model would accept it). The fixture includes
+no header, so the i686 leg runs wherever a 32-bit crt links; the older gates
+in this area (`check_ext_vector_layout.sh`, `check_ext_vector_abi_grid.sh`)
+still need the target's glibc development headers and therefore skip i686 in
+a minimal sandbox -- that limitation, not a compiler defect, is why the i686
+receipts were hosted-runner-only. Observed on this tree: 4 oracle legs +
+2 optimisation-invariance legs + 2 controls pass; the ext-vector size gate
+also passes on both targets.
+
 **Progress 2026-10-17 (PR #852 update):** sema now evaluates `_Static_assert`
 conditions with the full type context, which exposed an internally
 inconsistent `bool33` assertion in `ext_vector_layout.c` (sizeof 5 beside
@@ -199,6 +224,34 @@ its pilot (compression GM 1.017476, with an entirely slower JSON level-3
 interval and increased instruction/cache counts). The portable implementation
 is the baseline.
 
+**Progress 2026-10-21 (causal stack census; no runtime claim):** the
+question "why is lccc slower than GCC 16.2 on this library" was narrowed with
+the repository's own causal tools rather than with another knob sweep.
+`scripts/stack_census.py` over the three hottest compression/decompression
+translation units (`zstd_fast.c`, `zstd_lazy.c`,
+`zstd_decompress_block.c`, `-O2 -march=x86-64-v3`) attributes **60.8 % of all
+stack references to register spills** (13,578 of 22,331; coverage 99.89 %),
+against **7.0 % structurally required memory** (`alloca`/`address`/`wide`/
+`nongpr`). The busiest slots are not short-lived temporaries: in
+`ZSTD_compressBlock_lazy_generic`, offset `-64` is written **once** and read
+**204** times, and offset `-584` is written once and read 194 times -- a
+long-range value the global allocator spilled at its definition and reloads
+per region, where GCC keeps it in a callee-saved register. A per-translation-
+unit ablation (each hot unit rebuilt with GCC 16.2 inside an otherwise lccc
+library, interleaved min-of-N process-CPU runs on one pinned core) shows the
+deficit is **spread across units, not concentrated in one defect**:
+substituting `zstd_fast.c` recovers 5.1 % at level 1, substituting
+`zstd_double_fast.c` recovers 5.6 % at level 3, and substituting `zstd_lazy.c`
+recovers nothing measurable -- while the whole-library gap is much larger than
+any single unit. Two negative results are recorded so they are not retried:
+the global location allocator is a **no-op** on this library (its archive is
+byte-identical with `CCC_RA_GLOBAL_LOCATION=0`), and its per-function edit
+budget is not the limiter (`CCC_RA_GLOBAL_LOCATION_MAX=1024` produces a
+byte-identical archive too). Therefore no runtime claim is made here and no
+knob is shipped: the remaining gap is the base colourer's global decision to
+spill long-range hot values, which needs a residency/live-range-splitting
+change with its own A/B and corpus review, not a threshold tweak.
+
 **Next:** only continue with a causal, source-independent hypothesis. Profile
 bounded Callgrind regions and inspect exact hot instructions/register-stack
 traffic before considering general narrow-load forwarding, address recurrences,
@@ -242,6 +295,46 @@ separate from older S101–S106 evidence.
 Clippy; for code-generation edits, the `engineering/agent/RULES.md` test and
 oracle requirements. Full/slow CI is not authorized locally; rely on hosted CI.
 Never publish or open a PR as locally validated unless these gates actually pass.
+
+**Progress 2026-10-21 (local CI on the pinned caches):** the hosted runs for
+this PR never reached a compiler (two jobs died provisioning GCC 16 on a
+Launchpad window), so the whole gate set was run locally from the tag caches
+instead: all thirteen pinned assets verified against their `MANIFEST.sha256`,
+Rust 1.97.0 (the declared floor), the bookworm i686 sysroot, and the pinned
+`as`/`ld.bfd` 2.47, relocs, valgrind and A64 ISA XML oracles. `ci_local.sh
+--fast` first reported 51 failures; on the pre-rebase tree it then ran 366
+passed / 1 failed, and the linker suite went from 295 pass / 9 fail to 304
+pass / 0 fail / 0 warn / 0 skip once the pinned oracles were in place. Four of
+the 51 were repository defects fixed here: stale benchmark-registry counts in
+three corpus modules; the `not_mask` bit idiom, now implemented with an
+exhaustive-model unit test; the missing local mirror of the new layout-matrix
+gate; and the audit-census drift, which a pristine base export reproduced and
+which upstream's own rename pass has since brought back to the recorded
+baseline (no baseline edit ships in this branch). The remaining 47 were
+sandbox-toolchain gaps: the tag-cache GCC defaults to `-fno-pie` where distro
+compilers default to `-fPIE`, the tarball ships no sanitizer archives, and the
+32-bit glibc headers live under Debian's host-triplet directory — each
+reproduced explicitly so a gate measures the compiler, never the host. With
+`LCCC_I686_SYSROOT` pointing at the extracted sysroot the pre-rebase tree ran
+the differential suite to PASS=1026 FAIL=0 SKIP=3 (AB-diff 0), i.e. no `-m32`
+build failures remain. The maintainer directed that these local, pinned-cache runs are the
+evidence of record for this PR while GitHub's hosted runs are degraded, so
+`--fast` **and** `--slow` are both run here; the older "full/slow CI is not
+authorized locally" line above is superseded for this PR by that direction,
+not by a relaxation of any gate.
+
+**Progress 2026-10-21 (oracle-contract defect inherited from main):** the
+rebased tree failed one corpus test, and it fails identically on a pristine
+`git archive` of `origin/main` — `run_regression.py` (added in `8a4d424`)
+downgraded *any* oracle binary that exits non-zero to `SKIP-COMPARE`, while
+`test_wrapping_regression_contract` pins the same case as `FAIL`. A blanket
+waiver silently disables the differential comparison for every row an
+out-of-date oracle touches, so the waiver is now declared per fixture
+(`LCCC_ORACLE_SELFCHECK=skip` in the `.env` sidecar, with the reason) and a
+failed oracle self-check is otherwise a hard failure naming the declaration.
+The only fixture that needs it is `gnu_constant_builtins` (vector
+`__builtin_classify_type` is 19 on GCC 14+, -1 on GCC 12). Two tests cover the
+declared and undeclared paths plus the fail-closed key parse.
 
 ## Rejected/stale queue claims
 

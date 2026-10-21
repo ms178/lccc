@@ -25,10 +25,16 @@ Conventions (per test ``NAME.c``):
   gaps, ABI-peculiar tests).  The lccc self-check still must pass.
 * A test passes when its binary exits 0.  Compared tests additionally
   require byte-identical stdout between the LCCC and GCC binaries.  An
-  oracle binary that exits non-zero has failed the test's own assertions,
-  so it does not implement the semantics the test pins (typically an older
-  GCC than the corpus targets); that test is reported as ``SKIP-COMPARE``
-  rather than blamed on lccc.
+  oracle binary that exits non-zero has failed the test's own assertions:
+  that is a reference divergence, reported as ``FAIL`` so a broken or
+  stale oracle can never be silently ignored.
+* ``LCCC_ORACLE_SELFCHECK=skip`` in the env declares, per test, that the
+  reference toolchain genuinely predates the semantics the fixture pins
+  (GCC < 14 classifies a vector type as -1 where GCC 14+ and lccc agree on
+  19).  Only a test that states that reason in its own ``.env`` sidecar
+  downgrades a failed oracle self-check to ``SKIP-COMPARE``; the waiver is
+  therefore visible in review and countable, instead of being inferred
+  from an exit code for every fixture.
 * A successfully linked ``-m32`` test is reported as ``SKIP-RUN`` when the
   host image has no i386 ELF interpreter; this is not a compiler failure.
   The same applies when the host's own GCC cannot build the ``-m32`` test
@@ -119,6 +125,7 @@ class TestCase:
     flags: str
     env: dict[str, str]
     no_compare: bool
+    oracle_selfcheck_skip: bool = False
 
 
 @dataclass
@@ -231,9 +238,15 @@ def discover(base_dirs: list[Path]) -> list[TestCase]:
                 # later level in `-O2 <flags>` wins.
                 flags = f"{DEFAULT_FLAGS} {flags}"
             env = parse_env(source.with_suffix(".env"))
+            oracle_skip = env.get("LCCC_ORACLE_SELFCHECK", "").strip()
+            if oracle_skip and oracle_skip != "skip":
+                raise SystemExit(
+                    f"{source.with_suffix('.env')}: LCCC_ORACLE_SELFCHECK "
+                    f"must be 'skip' when present, got {oracle_skip!r}")
             tests.append(
                 TestCase(name=name, source=source, flags=flags, env=env,
-                         no_compare=env.get("LCCC_NO_COMPARE") == "1")
+                         no_compare=env.get("LCCC_NO_COMPARE") == "1",
+                         oracle_selfcheck_skip=oracle_skip == "skip")
             )
     return tests
 
@@ -487,14 +500,23 @@ def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path,
     rc, so_g, se_g = run_checked([str(gcc_out)], env=env, cwd=workdir)
     gcc_elapsed = time.monotonic() - gcc_start
     if rc != 0:
-        # The reference binary failed the test's own assertions, so it does
-        # not implement the semantics this test pins: GCC < 14 classifies a
-        # vector type as -1 where GCC 14+ (and lccc) agree on 19, and glibc
-        # or ABI details vary the same way.  Its stdout is not a reference;
-        # the lccc binary already passed the same assertions above.
+        # The reference binary failed the test's own assertions.  By default
+        # that is a reference divergence and must stay loud: an oracle that
+        # silently stopped matching would turn the comparison off for every
+        # row it touches.  Only a fixture that declares the version gap in
+        # its own sidecar may treat the oracle as invalid, so each waiver is
+        # documented, reviewable and countable.
+        if not test.oracle_selfcheck_skip:
+            return Result(test.name, "fail",
+                          f"oracle self-check failed (gcc rc={rc}) while the "
+                          f"lccc binary passed the same assertions; declare "
+                          f"LCCC_ORACLE_SELFCHECK=skip in "
+                          f"{test.source.with_suffix('.env').name} with the "
+                          f"toolchain gap, or fix the divergence",
+                          lccc_elapsed, gcc_elapsed, phases + ["compare:fail"])
         return Result(test.name, "skip-compare",
-                      f"oracle self-check failed (gcc rc={rc}); the reference "
-                      f"toolchain does not implement the asserted semantics",
+                      f"declared oracle self-check gap (gcc rc={rc}); the "
+                      f"reference toolchain predates the asserted semantics",
                       lccc_elapsed, gcc_elapsed, phases + ["compare:oracle-skip"])
     if so_g != so:
         return Result(test.name, "fail",
