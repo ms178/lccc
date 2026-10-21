@@ -14,6 +14,7 @@
 mod policy;
 use policy::fp_environment_blocks_reordering;
 
+mod address_form;
 pub(crate) mod aggregate_copy_forward;
 pub(crate) mod aggregate_sroa;
 pub(crate) mod alias;
@@ -65,6 +66,7 @@ pub(crate) mod loop_square;
 pub(crate) mod loop_unroll;
 pub(crate) mod narrow;
 pub(crate) mod outline_switch;
+mod pair_load_carry;
 pub(crate) mod quadratic_sr;
 pub(crate) mod range_check;
 pub(crate) mod reassoc_accum;
@@ -1421,6 +1423,12 @@ pub(crate) fn run_passes(
     });
     let mut disabled = std::env::var("CCC_DISABLE_PASSES").unwrap_or_default();
     apply_tree_vectorize_policy(&mut disabled, disable_tree_vectorize);
+    iv_strength_reduce::set_compare_recurrence_enabled(
+        target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "scalar_compare_iv"),
+    );
+    loop_unroll::set_reduction_enabled(
+        target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "reduction_unroll"),
+    );
     div_by_const::set_exact_enabled(!pass_disabled(&disabled, "exact_signed_div"));
     vectorize::set_strict_recip_pack_enabled(!pass_disabled(&disabled, "strict_recip_pack"));
     vectorize::set_byte_count_normalize_enabled(!pass_disabled(&disabled, "byte_count_normalize"));
@@ -2701,6 +2709,15 @@ pub(crate) fn run_passes(
             total_changes_excl_dce += n;
         }
 
+        if target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "address_form") {
+            let n = timed_pass!(
+                "address_form",
+                run_on_visited(module, &dirty, &mut changed, address_form::run)
+            );
+            total_changes += n;
+            total_changes_excl_dce += n;
+        }
+
         // Phases 5-6a: GVN + LICM + IVSR with shared CFG analysis.
         //
         // These three passes all need CFG + dominator + loop analysis. Since GVN
@@ -3585,6 +3602,10 @@ pub(crate) fn run_passes(
     // and after the unroller and vectorizers, whose matchers expect source
     // shape; before the FMA peel, which stays the last IR transform. Pass
     // name for CCC_DISABLE_PASSES: "reassoc_lat".
+    if target == crate::backend::Target::X86_64 && !pass_disabled(&disabled, "pair_load_carry") {
+        module.for_each_function(pair_load_carry::run);
+        verify::verify_after_pass(module, "pair_load_carry");
+    }
     if !pass_disabled(&disabled, "reassoc_lat") {
         module.for_each_function(reassoc_latency::run_function);
         verify::verify_after_pass(module, "reassoc_lat");

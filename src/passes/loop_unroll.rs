@@ -38,6 +38,10 @@ use crate::ir::reexports::{
     replace_values_in_terminator_map,
 };
 
+#[path = "loop_unroll_reduction.rs"]
+mod reduction;
+pub(crate) use reduction::set_enabled as set_reduction_enabled;
+
 thread_local! {
     /// Whether Pass B (two-block guard-free unrolling) runs at all — the
     /// documented `CCC_NO_TWO_BLOCK_UNROLL` kill switch that every A/B
@@ -3113,6 +3117,8 @@ fn try_partial_unroll_two_block(
         return false;
     }
 
+    let reduction = reduction::candidate(func, header, latch, iv_phi);
+
     // PROFITABILITY: the pass exists to make the k concatenated bodies
     // BB-SLP feedstock — `run_bb_slp` is STORE-SEEDED and its lane inputs
     // are LOAD packs, so a latch lacking either can never pack anything
@@ -3122,6 +3128,8 @@ fn try_partial_unroll_two_block(
     // +30% insns at neutral runtime; glibc_memcmp's compare loops +20.7%
     // at neutral runtime; crc32's inlined fill_data LCG loop (store, no
     // load — a serial dependence chain) +21 lines at neutral runtime.
+    // A private unsigned reduction is the exception: balancing its carried
+    // additions provides scalar ILP without store-seeded SLP.
     // Both must be plain non-volatile accesses through any pointer (the
     // seed rules vet the address shapes later); volatile accesses never
     // participate in packs.
@@ -3145,7 +3153,7 @@ fn try_partial_unroll_two_block(
                 }
             )
         });
-        if !has_store || !has_load {
+        if !has_load || (!has_store && reduction.is_none()) {
             return false;
         }
     }
@@ -3232,7 +3240,11 @@ fn try_partial_unroll_two_block(
     // not a reachable decline — "exactly two groups" is complete-unroll
     // territory by construction (pinned by
     // `two_block_small_trips_are_complete_unrolled_not_partial`).
-    let k_pref = choose_unroll_factor(work_len).min(4) as usize;
+    let k_pref = if reduction.is_some() {
+        4
+    } else {
+        choose_unroll_factor(work_len).min(4) as usize
+    };
     let mut k: usize = 1;
     let mut cand_k = k_pref;
     while cand_k >= 2 {
@@ -3259,11 +3271,7 @@ fn try_partial_unroll_two_block(
         next_val += 1;
         v
     };
-    let body_label = {
-        let l = BlockId(func.next_label);
-        func.next_label += 1;
-        l
-    };
+    let body_label = BlockId(func.next_label);
 
     // Per-clone rename maps for the latch work definitions.
     let mut vmaps: Vec<FxHashMap<u32, u32>> = Vec::with_capacity(k);
@@ -3469,6 +3477,15 @@ fn try_partial_unroll_two_block(
             body_insts.push(cloned);
         }
     }
+    if let Some(sum) = reduction {
+        let Some(Operand::Value(root)) = back_new.get(&sum.0) else {
+            return false;
+        };
+        if !reduction::balance(&mut body_insts, sum, *root, k) {
+            return false;
+        }
+    }
+    func.next_label += 1;
     func.next_value_id = next_val;
 
     // ── Rewire the CFG ────────────────────────────────────────────────────
@@ -5390,6 +5407,90 @@ mod tests {
             .iter()
             .find(|b| b.label == body_label)
             .expect("merged body block exists")
+    }
+
+    fn unsigned_reduction(trip: i32) -> IrFunction {
+        let mut f = make_two_block_feed_loop(trip, LatchFeed::LoadOnly);
+        for b in &mut f.blocks {
+            for i in &mut b.instructions {
+                match i {
+                    Instruction::Phi {
+                        dest: Value(2), ty, ..
+                    }
+                    | Instruction::BinOp {
+                        dest: Value(15),
+                        ty,
+                        ..
+                    }
+                    | Instruction::Load {
+                        dest: Value(14),
+                        ty,
+                        ..
+                    } => *ty = IrType::U32,
+                    _ => {}
+                }
+            }
+        }
+        f
+    }
+    #[test]
+    fn unsigned_load_reduction_uses_exact_groups_and_balanced_carry() {
+        set_reduction_enabled(true);
+        for (trip, k) in [(64, 4), (66, 2)] {
+            let mut f = unsigned_reduction(trip);
+            assert_eq!(unroll_loops(&mut f, UnrollPhase::PostVec), 1);
+            let b = merged_body_of(&f);
+            assert_eq!(
+                b.instructions
+                    .iter()
+                    .filter(|i| matches!(i, Instruction::Load { .. }))
+                    .count(),
+                k
+            );
+            let carried = b
+                .instructions
+                .iter()
+                .filter(|i| {
+                    matches!(
+                        i,
+                        Instruction::BinOp {
+                            op: IrBinOp::Add,
+                            lhs: Operand::Value(Value(2)),
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(carried, 1);
+        }
+        set_reduction_enabled(false);
+    }
+    #[test]
+    fn unsigned_load_reduction_rejects_odd_trip_volatile_shared_and_signed() {
+        set_reduction_enabled(true);
+        let signed = make_two_block_feed_loop(64, LatchFeed::LoadOnly);
+        let odd = unsigned_reduction(65);
+        let mut vol = unsigned_reduction(64);
+        for i in &mut vol.blocks[2].instructions {
+            if let Instruction::Load { volatile, .. } = i {
+                *volatile = true;
+            }
+        }
+        let mut shared = unsigned_reduction(64);
+        shared.blocks[2].instructions.insert(
+            0,
+            Instruction::Copy {
+                dest: Value(16),
+                src: Operand::Value(Value(15)),
+            },
+        );
+        shared.next_value_id = 17;
+        for mut f in [signed, odd, vol, shared] {
+            let before = format!("{f:?}");
+            assert_eq!(unroll_loops(&mut f, UnrollPhase::PostVec), 0);
+            assert_eq!(format!("{f:?}"), before);
+        }
+        set_reduction_enabled(false);
     }
 
     #[test]

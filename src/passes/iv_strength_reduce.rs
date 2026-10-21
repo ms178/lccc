@@ -26,6 +26,10 @@ use crate::common::types::IrType;
 use crate::ir::analysis;
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 
+#[path = "iv_strength_reduce_compare.rs"]
+mod compare_recurrence;
+pub(crate) use compare_recurrence::set_enabled as set_compare_recurrence_enabled;
+
 /// Maximum byte stride eligible for pointer induction. Matrix row strides are
 /// routinely several KiB (256 doubles = 2048 bytes), and are especially worth
 /// reducing because their multiply executes in an enclosing hot loop.
@@ -1069,7 +1073,7 @@ fn reduce_loop(
     // Mixed shapes (a multiply feeding BOTH a GEP offset and other uses)
     // are left alone here: the pointer path above already handled the GEP,
     // and the multiply stays for the scalar readers — always correct.
-    if scalar_derived {
+    if scalar_derived || compare_recurrence::enabled() {
         // Group by (iv, stride, add_offset, ty): several equivalent muls
         // (pre-GVN frontends) share ONE derived recurrence.
         let mut scalar_groups: Vec<(usize, i64, i64, IrType, Vec<Value>)> = Vec::new();
@@ -1078,6 +1082,9 @@ fn reduce_loop(
                 continue;
             }
             let iv = &basic_ivs[d.iv_index];
+            if !scalar_derived && !compare_recurrence::eligible(func, natural_loop, iv, d) {
+                continue;
+            }
             if iv.ty != d.mul_ty || !d.mul_ty.is_integer() {
                 continue;
             }
@@ -1130,16 +1137,36 @@ fn reduce_loop(
             {
                 Some(c) => Operand::Const(c),
                 None => {
-                    // Runtime init in the preheader.  Only the k == 0 shape
-                    // (plain iv * C) is built here: a non-constant init with
-                    // an affine offset is rare enough to keep the constructor
-                    // minimal — fail closed.
-                    if add_offset != 0 {
+                    // Runtime affine initialization is modulo the same unsigned
+                    // domain as the carried IV. Do not speculate signed adds.
+                    if add_offset != 0 && !group_ty.is_unsigned() {
                         continue;
                     }
-                    let Operand::Value(init_v) = iv.init else {
+                    let Operand::Value(mut init_v) = iv.init else {
                         continue;
                     };
+                    if add_offset != 0 {
+                        let Some(offset) = const_for_int_ty(group_ty, add_offset) else {
+                            continue;
+                        };
+                        let adjusted = Value(next_id);
+                        next_id += 1;
+                        func.blocks[preheader]
+                            .instructions
+                            .push(Instruction::BinOp {
+                                dest: adjusted,
+                                op: IrBinOp::Add,
+                                lhs: Operand::Value(init_v),
+                                rhs: Operand::Const(offset),
+                                ty: group_ty,
+                            });
+                        if !func.blocks[preheader].source_spans.is_empty() {
+                            func.blocks[preheader]
+                                .source_spans
+                                .push(crate::common::source::Span::dummy());
+                        }
+                        init_v = adjusted;
+                    }
                     let j_init_val = Value(next_id);
                     next_id += 1;
                     func.blocks[preheader]
@@ -1662,12 +1689,13 @@ fn find_derived_exprs(
                     rhs: Operand::Const(c),
                     ty,
                 } => {
-                    if let (Some(idx), Some(shift)) = (find_iv(v.0), c.to_i64()) {
-                        if (0..64).contains(&shift) {
-                            (*dest, *ty, idx, 1i64 << shift, 0)
-                        } else {
-                            continue;
-                        }
+                    let Some(shift) = c.to_i64().filter(|s| (0..64).contains(s)) else {
+                        continue;
+                    };
+                    if let Some(idx) = find_iv(v.0) {
+                        (*dest, *ty, idx, 1i64 << shift, 0)
+                    } else if let Some((idx, k)) = find_affine(v.0, *ty) {
+                        (*dest, *ty, idx, 1i64 << shift, k)
                     } else {
                         continue;
                     }
