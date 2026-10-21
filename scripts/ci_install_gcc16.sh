@@ -230,6 +230,36 @@ install_packages() {
     return "$rc"
 }
 
+# Offline fallback.  Every successful install keeps its downloaded debs in
+# LCCC_CI_APT_ARCHIVE_DIR (APT::Keep-Downloaded-Packages=true), so a previous
+# verified run already left the exact toolchain on disk, and dpkg needs no
+# index at all.  This is what lets a Launchpad index outage break the *fetch*
+# without failing the lane: the retry budget above still has to exhaust first,
+# and the fallback stays fail-closed by construction -- it runs only when the
+# cache holds a deb for every requested name, and the installed result must
+# still pass the same version contract (toolchain_ready) as an apt install.
+cached_debs_cover_request() {
+    local package
+    local -a matches
+    [[ -n ${LCCC_CI_APT_ARCHIVE_DIR:-} ]] || return 1
+    for package in "${packages[@]}"; do
+        matches=("${LCCC_CI_APT_ARCHIVE_DIR}/${package}"_*.deb)
+        [[ -e ${matches[0]} ]] || return 1
+    done
+}
+
+install_from_cached_debs() {
+    local -a debs
+    cached_debs_cover_request || return 1
+    debs=("${LCCC_CI_APT_ARCHIVE_DIR}"/*.deb)
+    (( ${#debs[@]} )) || return 1
+    echo "ci_install_gcc16: index unavailable; installing ${#debs[@]} cached deb(s)" >&2
+    # A dependency that is neither cached nor installed makes dpkg fail; the
+    # contract check below then fails closed exactly like a failed install.
+    as_root dpkg --force-confdef --force-confold -i "${debs[@]}" >/dev/null 2>&1 || true
+    toolchain_ready
+}
+
 # GitHub interprets `::error title=...::<message>` lines written to stdout as
 # check-run annotations. Emitting one here -- instead of duplicating a capture
 # wrapper in every workflow job -- makes a provisioning failure diagnosable
@@ -238,11 +268,11 @@ install_packages() {
 # disabled outside Actions so a developer's terminal stays clean.
 annotate() {
     [[ ${GITHUB_ACTIONS:-} == true ]] || return 0
-    local title=$1 message=$2
+    local level=$1 title=$2 message=$3
     message=${message//%/%25}
     message=${message//$'\r'/%0D}
     message=${message//$'\n'/%0A}
-    printf '::error title=%s::%s\n' "$title" "$message"
+    printf '::%s title=%s::%s\n' "$level" "$title" "$message"
 }
 
 # Bounded, high-signal failure report. The previous implementation dumped
@@ -277,7 +307,7 @@ report_provisioning_failure() {
     # keeps SIGPIPE from a deliberately short read out of `set -e`, which would
     # otherwise abort before the annotation is printed.
     context=$(printf '%s\n%s\n%s' "$missing" "$fetches" "$dry_run" | head -c 6000 || true)
-    annotate "GCC 16 provisioning failed (mode $MODE)" "$summary"$'\n'"$context"
+    annotate error "GCC 16 provisioning failed (mode $MODE)" "$summary"$'\n'"$context"
 }
 
 if ! toolchain_ready; then
@@ -287,21 +317,26 @@ if ! toolchain_ready; then
     # Distribution first: exactly one index refresh before considering the PPA.
     # Spending the PPA retry budget here would add a minute of sleeps to every
     # Ubuntu lane, where the distribution can never resolve gcc-16 anyway.
-    if ! ensure_packages_resolvable 1; then
-        if ! configure_ubuntu_ppa; then
-            report_provisioning_failure
-            exit 1
-        fi
+    resolvable=0
+    if ensure_packages_resolvable 1; then
+        resolvable=1
+    elif configure_ubuntu_ppa && ensure_packages_resolvable 6; then
         # The PPA edge flaps: probes a minute apart observed 503 and then a
-        # healthy InRelease. Four refresh rounds with linear backoff
-        # (25/50/75/100 s between rounds, three apt attempts per round) cover
-        # the observed outage window instead of surrendering to the first one.
-        if ! ensure_packages_resolvable 4; then
+        # healthy InRelease, and the 2026-10-21 incident outlived a four-round
+        # window. Six rounds with linear backoff (25/50/75/100/125 s between
+        # rounds, three apt attempts per round) ride out a multi-minute outage
+        # while staying inside the job timeout.
+        resolvable=1
+    fi
+    if (( resolvable )); then
+        if ! install_packages; then
             report_provisioning_failure
             exit 1
         fi
-    fi
-    if ! install_packages; then
+    elif install_from_cached_debs; then
+        annotate warning "GCC 16 provisioned from the deb cache" \
+            "the package index could not be refreshed; installed the debs cached by a previous verified run"
+    else
         report_provisioning_failure
         exit 1
     fi

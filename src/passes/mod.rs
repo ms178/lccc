@@ -1190,6 +1190,21 @@ fn target_rotate_bits(target: crate::backend::Target) -> u32 {
     }
 }
 
+/// Whether the target lowers `Bswap` to a single instruction at every width the
+/// bit-idiom pass matches (32 and 64 bits).  x86-64 (`bswapl`/`bswapq`), i686
+/// (`bswapl` pairs, plus a two-register helper for 64 bits) and AArch64 (`rev`)
+/// do; RISC-V has no `rev8` in this backend, so its `Bswap` expands into the
+/// very shift/mask sequence a portable network is already written in.  Partial
+/// byte swaps are therefore folded only where the swap is actually cheaper.
+fn target_native_bswap(target: crate::backend::Target) -> bool {
+    match target {
+        crate::backend::Target::X86_64
+        | crate::backend::Target::I686
+        | crate::backend::Target::Aarch64 => true,
+        crate::backend::Target::Riscv64 => false,
+    }
+}
+
 /// Narrowest rotate the target lowers natively.  x86 `rolb`/`rolw` rotate at
 /// the operand width — the hardware count is `(count & 31) mod width`, so the
 /// sub-word forms are exact — while AArch64 (`ror`/`extr`) and RISC-V
@@ -2554,6 +2569,7 @@ pub(crate) fn run_passes(
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
             let max_rotate_bits = target_rotate_bits(target);
             let min_rotate_bits = target_min_rotate_bits(target);
+            let native_bswap = target_native_bswap(target);
             // Scalar ANDN (BMI1) for the bool-mux algebra's CH fold: the
             // mux fold must defer to the backend's Not+And -> andn fusion
             // when the 3-operand form is selectable (emit_and_not_impl).
@@ -2573,6 +2589,7 @@ pub(crate) fn run_passes(
                             max_rotate_bits,
                             min_rotate_bits,
                             has_scalar_andn,
+                            native_bswap,
                         )
                     })
                 )
@@ -2835,6 +2852,7 @@ pub(crate) fn run_passes(
             let enable_bit_reverse = target == crate::backend::Target::Aarch64;
             let max_rotate_bits = target_rotate_bits(target);
             let min_rotate_bits = target_min_rotate_bits(target);
+            let native_bswap = target_native_bswap(target);
             // Same per-compilation `has_scalar_andn` snapshot as the first
             // bit_idioms call (resolved at the top of run_passes).
             let n = timed_pass!(
@@ -2846,6 +2864,7 @@ pub(crate) fn run_passes(
                         max_rotate_bits,
                         min_rotate_bits,
                         has_scalar_andn,
+                        native_bswap,
                     )
                 })
             );

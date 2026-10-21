@@ -24,9 +24,15 @@ Conventions (per test ``NAME.c``):
   reference is not a valid oracle (defective linker behaviour, feature
   gaps, ABI-peculiar tests).  The lccc self-check still must pass.
 * A test passes when its binary exits 0.  Compared tests additionally
-  require byte-identical stdout between the LCCC and GCC binaries.
+  require byte-identical stdout between the LCCC and GCC binaries.  An
+  oracle binary that exits non-zero has failed the test's own assertions,
+  so it does not implement the semantics the test pins (typically an older
+  GCC than the corpus targets); that test is reported as ``SKIP-COMPARE``
+  rather than blamed on lccc.
 * A successfully linked ``-m32`` test is reported as ``SKIP-RUN`` when the
   host image has no i386 ELF interpreter; this is not a compiler failure.
+  The same applies when the host's own GCC cannot build the ``-m32`` test
+  at all (missing multilib headers, or no 32-bit startup files/libgcc).
 
 Usage::
 
@@ -282,13 +288,22 @@ def _compile_fail_detail(src: str, stderr: str) -> str:
 
 
 def host_lacks_i386_headers(gcc: str, src: str, flags: str) -> bool:
-    """True when a `-m32` compile fails for want of 32-bit libc headers.
+    """True when the host's GCC cannot build this test in 32-bit mode.
 
     lccc is not blamed for a missing multilib, and the claim is not taken on
     the wording of lccc's own diagnostics: the oracle compiler is asked to
-    preprocess the same translation unit with the same `-m32`, and only an
-    identical missing-header failure downgrades the result. A `-m32` test
-    that the host's GCC compiles but lccc does not stays a hard failure.
+    do the same work, and only an identical host-side gap downgrades the
+    result.  Two gaps are recognised, because a host may have the headers
+    but no 32-bit startup files or libgcc:
+
+    * the translation unit does not preprocess in ``-m32`` mode (missing
+      ``bits/`` headers);
+    * a trivial ``-m32`` program does not link (missing ``Scrt1.o``/crti,
+      or a ``libgcc.a`` for the wrong target — the host's GCC fails the
+      same way for every ``-m32`` test, so none of them can be validated).
+
+    A ``-m32`` test that the host's GCC builds but lccc does not stays a
+    hard failure.
     """
     if "-m32" not in flags.split():
         return False
@@ -298,12 +313,37 @@ def host_lacks_i386_headers(gcc: str, src: str, flags: str) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     if probe.returncode == 0:
-        # The host can compile it in 32-bit mode, so the failure is lccc's.
-        return False
+        return not _host_links_i386(gcc)
     err = probe.stderr
     # Only a missing multilib header counts. Anything else — a real
     # preprocessor or parse error — must stay visible as a failure.
     return "No such file or directory" in err and "bits/" in err
+
+
+_I386_LINK_OK: dict[str, bool] = {}
+
+
+def _host_links_i386(gcc: str) -> bool:
+    """True when `gcc -m32` can link a trivial program on this host.
+
+    Cached: the answer is a property of the image, and the probe runs for
+    every failing ``-m32`` test otherwise.  A host without 32-bit startup
+    files or a 32-bit ``libgcc.a`` cannot validate *any* linked ``-m32``
+    test, so those results are environment gaps, not compiler defects.
+    """
+    cached = _I386_LINK_OK.get(gcc)
+    if cached is not None:
+        return cached
+    try:
+        probe = subprocess.run(
+            [gcc, "-m32", "-x", "c", "-o", os.devnull, "-"],
+            input="int main(void) { return 0; }\n",
+            capture_output=True, text=True, timeout=60)
+        ok = probe.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    _I386_LINK_OK[gcc] = ok
+    return ok
 
 
 def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path,
@@ -382,8 +422,8 @@ def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path,
             return Result(
                 test.name,
                 "skip-run",
-                "host image has no 32-bit libc headers; the host's own GCC "
-                "fails the same -m32 translation unit identically",
+                "host image cannot build 32-bit programs; the host's own GCC "
+                "fails the same -m32 test identically",
                 time.monotonic() - start,
                 0.0,
                 phases + ["compile:host-skip"],
@@ -446,9 +486,19 @@ def compile_one(lccc: Path, gcc: str, test: TestCase, workdir: Path,
                       lccc_elapsed, time.monotonic() - gcc_start, phases)
     rc, so_g, se_g = run_checked([str(gcc_out)], env=env, cwd=workdir)
     gcc_elapsed = time.monotonic() - gcc_start
-    if rc != 0 or so_g != so:
+    if rc != 0:
+        # The reference binary failed the test's own assertions, so it does
+        # not implement the semantics this test pins: GCC < 14 classifies a
+        # vector type as -1 where GCC 14+ (and lccc) agree on 19, and glibc
+        # or ABI details vary the same way.  Its stdout is not a reference;
+        # the lccc binary already passed the same assertions above.
+        return Result(test.name, "skip-compare",
+                      f"oracle self-check failed (gcc rc={rc}); the reference "
+                      f"toolchain does not implement the asserted semantics",
+                      lccc_elapsed, gcc_elapsed, phases + ["compare:oracle-skip"])
+    if so_g != so:
         return Result(test.name, "fail",
-                      f"output differs from gcc (gcc rc={rc}):\nlccc:{so[:600]!r}\ngcc:{so_g[:600]!r}",
+                      f"output differs from gcc:\nlccc:{so[:600]!r}\ngcc:{so_g[:600]!r}",
                       lccc_elapsed, gcc_elapsed, phases + ["compare:fail"])
     phases.append("compare:ok")
     return Result(test.name, "pass", "", lccc_elapsed, gcc_elapsed, phases)
