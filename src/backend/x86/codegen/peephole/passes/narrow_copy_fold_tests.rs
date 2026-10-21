@@ -812,7 +812,7 @@ fn a_copyback_fold_still_fires_when_every_use_is_rewritable() {
 /// drops the fold (or, worse, misreads the base).
 mod copyback_producer_tests {
     use super::super::parse_copyback_producer;
-    use super::super::{plain_reg_family, CopybackProducer};
+    use super::super::{CopybackProducer, plain_reg_family};
 
     #[test]
     fn sib_leaq_parses_as_lea_mem_and_keeps_the_full_operand() {

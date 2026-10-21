@@ -15799,6 +15799,7 @@ mod scalar_lane_class_tests {
 #[cfg(test)]
 mod phi_chain_shape_tests {
     use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId};
 
     /// Straight-line function `0 -> 1 -> ... -> n-1`.
     fn line(n: u32) -> IrFunction {
