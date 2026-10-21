@@ -95,9 +95,12 @@ apt_retry() {
     return "$rc"
 }
 
-# Exact package presence in the current index (see contract note 2).
+# Exact package presence in the index apt will actually install from (see
+# contract note 2). The probe MUST carry the same index options as the install
+# path: with a cached index, a probe that reads the default list directory
+# reports "unresolvable" for a package apt can install offline.
 package_known() {
-    apt-cache pkgnames "$1" 2>/dev/null | grep -Fxq -- "$1"
+    apt-cache "${index_opts[@]}" pkgnames "$1" 2>/dev/null | grep -Fxq -- "$1"
 }
 
 # Absent packages, one per line. DRY source of truth for both the boolean test

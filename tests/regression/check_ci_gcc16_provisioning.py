@@ -76,9 +76,40 @@ def budget(relative):
     return int(value) if value else 0
 
 
-def index():
+def option(arguments, key):
+    prefix = key + '='
+    for index_, value in enumerate(arguments):
+        if value == '-o' and index_ + 1 < len(arguments) and arguments[index_ + 1].startswith(prefix):
+            return arguments[index_ + 1][len(prefix):]
+        if value.startswith(prefix):
+            return value[len(prefix):]
+    return None
+
+
+def subcommand(arguments):
+    # Options may precede the subcommand (`apt-cache -o KEY=VALUE pkgnames`).
+    index_ = 0
+    while index_ < len(arguments):
+        value = arguments[index_]
+        if value == '-o':
+            index_ += 2
+            continue
+        if value.startswith('-'):
+            index_ += 1
+            continue
+        return value, arguments[index_ + 1:]
+    return None, []
+
+
+def lists_dir(arguments):
+    # apt keeps its package index in Dir::State::lists; the default (unused
+    # here) directory models a runner whose lists were never populated.
+    return pathlib.Path(option(arguments, 'Dir::State::lists') or (state / 'lists'))
+
+
+def index(arguments):
     names = set(distro)
-    if path('.ppa-index').exists():
+    if (lists_dir(arguments) / '.ppa-index').exists():
         names |= ppa
     return names
 
@@ -106,24 +137,28 @@ elif name == 'dpkg-query':
     print('installed' if os.environ.get('READY') == '1' or package in installed()
           else 'not-installed')
 elif name == 'apt-cache':
-    command, pattern = args[0], args[-1]
+    command, rest = subcommand(args)
+    pattern = rest[-1] if rest else ''
+    known = index(args)
     if command == 'pkgnames':
-        for candidate in sorted(index()):
+        for candidate in sorted(known):
             if candidate.startswith(pattern):
                 print(candidate)
     elif command == 'policy':
         # Real apt: exact name first, regex fallback for unknown names.
-        matches = [pattern] if pattern in index() else sorted(
-            candidate for candidate in index() if re.search(pattern, candidate))
+        matches = [pattern] if pattern in known else sorted(
+            candidate for candidate in known if re.search(pattern, candidate))
         for candidate in matches:
             print('%s:\n  Installed: (none)\n  Candidate: 16.2.0-1\n' % candidate)
 elif name == 'apt-get':
-    if args[:1] == ['update']:
+    verb, _ = subcommand(args)
+    if verb == 'update':
         attempt = bump('.updates')
         if attempt <= budget('UPDATE_EXIT_FAILURES'):
             print('E: Failed to fetch http://mirror/InRelease  503  Service Unavailable')
             sys.exit(100)
-        if path('.ppa').exists() and not path('.ppa-index').exists():
+        lists = lists_dir(args)
+        if path('.ppa').exists() and not (lists / '.ppa-index').exists():
             ppa_attempt = bump('.ppa-updates')
             if ppa_attempt <= budget('PPA_INDEX_FAILURES'):
                 # Observed on the runner: apt warns, then exits 0.
@@ -131,10 +166,12 @@ elif name == 'apt-get':
                       'ubuntu-toolchain-r/test/ubuntu/dists/noble/InRelease  '
                       '503  Service Unavailable')
                 sys.exit(0)
-            path('.ppa-index').touch()
+            lists = lists_dir(args)
+            lists.mkdir(parents=True, exist_ok=True)
+            (lists / '.ppa-index').touch()
         sys.exit(0)
-    if args[:1] == ['install']:
-        missing = [package for package in requested if package not in index()]
+    if verb == 'install':
+        missing = [package for package in requested if package not in index(args)]
         if budget('APT_INSTALL_FAILURES') and bump('.installs') <= budget('APT_INSTALL_FAILURES'):
             print('E: Failed to fetch http://ppa/pool/main/g/gcc-16/gcc-16.deb  '
                   '503  Service Unavailable')
@@ -271,16 +308,16 @@ class ProvisioningTests(unittest.TestCase):
             self.assertIn(package, result.stderr)
         # The regex flood that buried the diagnosis in unrelated packages is
         # gone: no per-package `apt-cache policy` probe at all.
-        self.assertFalse(any(c[0] == "apt-cache" and c[1] == "policy" for c in commands))
+        self.assertFalse(any(c[0] == "apt-cache" and "policy" in c for c in commands))
 
     def test_exact_presence_probe_ignores_the_regex_decoy(self):
         # Guard the model first: real apt reports clang-16's candidate when
         # asked about gcc-16. A script keyed on that answer skips the PPA.
         result, commands, _ = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
-        probes = [c for c in commands if c[:2] == ["apt-cache", "pkgnames"]]
+        probes = [c for c in commands if c[0] == "apt-cache" and "pkgnames" in c]
         self.assertTrue(probes, "presence must be probed with exact package names")
-        self.assertIn(["apt-cache", "pkgnames", "gcc-16"], probes)
+        self.assertTrue(any(c[-1] == "gcc-16" for c in probes))
 
     def test_hard_update_failure_is_retried_then_propagates(self):
         result, commands, _ = self.invoke(UPDATE_EXIT_FAILURES="99")
@@ -319,15 +356,34 @@ class ProvisioningTests(unittest.TestCase):
                 if command[:2] in (["apt-get", "update"], ["apt-get", "install"]):
                     self.assertIn(option, command, command)
 
-    def test_warm_index_skips_the_network_entirely(self):
-        # Second run against the same archive directory: nothing to fetch.
+    def test_warm_index_provisions_with_the_cdn_dead(self):
+        # The point of caching apt's index: once a run has populated it, a
+        # later run must resolve and install gcc-16 with the PPA CDN
+        # unreachable. The probe and the install must agree on which index
+        # they read -- a probe that reads the default directory reports
+        # "unresolvable" for a package apt can install offline.
         with tempfile.TemporaryDirectory() as outer:
             archive = Path(outer) / "apt-archive"
-            self.invoke(LCCC_CI_APT_ARCHIVE_DIR=str(archive))
+            first, _, _ = self.invoke(LCCC_CI_APT_ARCHIVE_DIR=str(archive))
+            self.assertEqual(first.returncode, 0, first.stderr)
             result, commands, _ = self.invoke(LCCC_CI_APT_ARCHIVE_DIR=str(archive),
-                                              DISTRO_HAS_GCC16="1")
+                                              PPA_INDEX_FAILURES="99")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(self.updates(commands), [])
+            self.assertEqual(self.updates(commands), [], "a warm index needs no network")
+            self.assertEqual(len(self.installs(commands)), 1)
+            self.assertIn(f"Dir::State::lists={archive}/lists", self.installs(commands)[0])
+
+    def test_presence_probe_uses_the_same_index_as_the_install(self):
+        with tempfile.TemporaryDirectory() as outer:
+            archive = Path(outer) / "apt-archive"
+            _, commands, _ = self.invoke(LCCC_CI_APT_ARCHIVE_DIR=str(archive),
+                                         DISTRO_HAS_GCC16="1")
+            probes = [c for c in commands if c[0] == 'apt-cache' and 'pkgnames' in c]
+            self.assertTrue(probes)
+            for probe in probes:
+                self.assertIn(f"Dir::State::lists={archive}/lists", probe, probe)
+            # -o pairs must precede the subcommand for apt-cache.
+            self.assertEqual(probes[0][1], '-o')
 
     def test_install_failure_with_resolvable_packages_reports_the_verdict(self):
         result, commands, _ = self.invoke("--multilib", APT_INSTALL_FAIL="1")

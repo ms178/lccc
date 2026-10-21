@@ -156,6 +156,20 @@ fallback retarget was available but not taken. The outage that motivated it
 lasted hours; the fallback exists for the next one and is covered by the
 model tests rather than by a live outage.
 
+### The bug the cache itself introduced
+
+Caching the index exposed a probe/install mismatch on the first CI run: apt
+installed the whole toolchain from the cached index (the log shows every
+`Conf gcc-16 ...` line) while `apt-cache pkgnames` -- still reading the
+default list directory -- reported the same packages as unknown, so the run
+failed with "not resolvable" *after* a successful install.
+
+The lesson is the contract, not the patch: the presence probe and the install
+must read the same index. `package_known` now carries `"${index_opts[@]}"`
+just like `apt-get`, and the stub models the index as living in
+`Dir::State::lists`, so a probe that forgets the option fails the suite
+(verified by re-running the tests with the option removed: four failures).
+
 ## Regression coverage
 
 `tests/regression/check_ci_gcc16_provisioning.py` models apt instead of
