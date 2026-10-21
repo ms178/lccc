@@ -9,6 +9,7 @@ import re
 import sys
 import tempfile
 import hashlib
+import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests/regression"))
@@ -17,7 +18,9 @@ from check_llvm_missed_zero_choice import run, body  # noqa: E402
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite", choices=("batch2", "batch3"), default="batch2")
+    parser.add_argument(
+        "--suite", choices=("batch2", "batch3", "batch6"), default="batch2"
+    )
     parser.add_argument(
         "--wide", action="store_true", help="batch3 64-bit companion source"
     )
@@ -39,20 +42,25 @@ def main():
         raise ValueError("requires GCC 16.2 and Clang 23.1.3")
     if args.wide and args.suite != "batch3":
         raise ValueError("--wide requires --suite=batch3")
-    stem = (
-        "llvm_missed_integer_batch" if args.suite == "batch2" else "llvm_missed_batch3"
-    )
+    stem = {
+        "batch2": "llvm_missed_integer_batch",
+        "batch3": "llvm_missed_batch3",
+        "batch6": "llvm_missed_batch6",
+    }[args.suite]
     contracts = ROOT / "tests/regression" / (stem + ".json")
     source = ROOT / "tests/regression" / (stem + ("_wide" if args.wide else "") + ".c")
     rows = {c["name"]: {} for c in json.loads(contracts.read_text())}
     flags = ["-O3", "-march=x86-64-v3", "-S"]
+    tools = (
+        ("pre_batch", args.baseline),
+        ("lccc", args.compiler),
+        ("gcc", args.gcc),
+        ("clang", args.clang),
+    )
+    if args.suite == "batch6":
+        flags.insert(-1, "-fPIE")
     with tempfile.TemporaryDirectory() as directory:
-        for name, tool in (
-            ("pre_batch", args.baseline),
-            ("lccc", args.compiler),
-            ("gcc", args.gcc),
-            ("clang", args.clang),
-        ):
+        for name, tool in tools:
             output = Path(directory) / (name + ".s")
             run([tool, *flags, str(source), "-o", str(output)])
             text = re.sub(r"#[^\n]*", "", output.read_text())
@@ -62,6 +70,12 @@ def main():
         "flags": flags,
         "measurement": "static instruction count including RET, no timing inference",
         "versions": versions,
+        "compiler_binary_sha256": {
+            name: hashlib.sha256(
+                Path(shutil.which(tool) or tool).read_bytes()
+            ).hexdigest()
+            for name, tool in tools
+        },
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "counts": rows,
     }

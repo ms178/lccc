@@ -84,6 +84,146 @@
       "status": "reviewed-deferred",
       "scope": "This batch implements related byte-swap conjugations and bit-reverse Eq observations, not all nested bitreverse graphs",
       "next": "Target-specific C/IR reproductions and costed nested-graph reconstruction remain necessary."
+    },
+    {
+      "number": 231586,
+      "status": "covered-limited",
+      "scope": "Boolean masked-equality implication over small scalar integer words; unrelated predicates and shared/effectful producers are retained",
+      "implementation": "src/passes/bit_idioms_batch6.rs",
+      "evidence": [
+        "engineering/llvm-missed/BATCH-006.md",
+        "src/passes/bit_idioms_batch6_tests.rs",
+        "tests/regression/llvm_missed_batch6.c",
+        "tests/regression/check_llvm_missed_batch6.py",
+        "engineering/llvm-missed/batch-006-proofs.json"
+      ],
+      "remaining": "Coverage is of the listed reduced contracts, not arbitrary CFG/path reasoning, mixed widths, poison flags, vectors or all upstream examples."
+    },
+    {
+      "number": 231063,
+      "status": "covered-limited",
+      "scope": "Under a local zero equality, substitute add/sub operands in the other conjunct without rewriting its shared producer",
+      "implementation": "src/passes/bit_idioms_batch6.rs",
+      "evidence": [
+        "engineering/llvm-missed/BATCH-006.md",
+        "src/passes/bit_idioms_batch6_tests.rs",
+        "tests/regression/llvm_missed_batch6.c",
+        "tests/regression/check_llvm_missed_batch6.py",
+        "engineering/llvm-missed/batch-006-proofs.json"
+      ],
+      "remaining": "Coverage is of the listed reduced contracts, not arbitrary CFG/path reasoning, mixed widths, poison flags, vectors or all upstream examples."
+    },
+    {
+      "number": 230800,
+      "status": "covered-limited",
+      "scope": "At-most-16-value unsigned modular range intersected with a masked equality; affine equality removes the redundant evenness test for two",
+      "implementation": "src/passes/bit_idioms_batch6.rs",
+      "evidence": [
+        "engineering/llvm-missed/BATCH-006.md",
+        "src/passes/bit_idioms_batch6_tests.rs",
+        "tests/regression/llvm_missed_batch6.c",
+        "tests/regression/check_llvm_missed_batch6.py",
+        "engineering/llvm-missed/batch-006-proofs.json"
+      ],
+      "remaining": "Coverage is of the listed reduced contracts, not arbitrary CFG/path reasoning, mixed widths, poison flags, vectors or all upstream examples."
+    },
+    {
+      "number": 230021,
+      "status": "covered-limited",
+      "scope": "U32/U64 constant scaled div/rem recombination, including shared remainder and a proven high-bit mask; doubled-add scaling included",
+      "implementation": "src/passes/bit_idioms_batch6.rs",
+      "evidence": [
+        "engineering/llvm-missed/BATCH-006.md",
+        "src/passes/bit_idioms_batch6_tests.rs",
+        "tests/regression/llvm_missed_batch6.c",
+        "tests/regression/check_llvm_missed_batch6.py",
+        "engineering/llvm-missed/batch-006-proofs.json"
+      ],
+      "remaining": "Coverage is of the listed reduced contracts, not arbitrary CFG/path reasoning, mixed widths, poison flags, vectors or all upstream examples."
+    },
+    {
+      "number": 229537,
+      "status": "covered-limited",
+      "scope": "Joint scalar equality facts prove Boolean select-arm agreement; signed-negative/zero select reduced without FP or arbitrary integer truth-equivalence",
+      "implementation": "src/passes/bit_idioms_batch6.rs",
+      "evidence": [
+        "engineering/llvm-missed/BATCH-006.md",
+        "src/passes/bit_idioms_batch6_tests.rs",
+        "tests/regression/llvm_missed_batch6.c",
+        "tests/regression/check_llvm_missed_batch6.py",
+        "engineering/llvm-missed/batch-006-proofs.json"
+      ],
+      "remaining": "Coverage is of the listed reduced contracts, not arbitrary CFG/path reasoning, mixed widths, poison flags, vectors or all upstream examples."
+    },
+    {
+      "number": 229332,
+      "status": "covered-limited",
+      "scope": "Confirmed already handled by the existing C optimization pipeline: available inverse comparison reused across calls in the reduced byte-input example",
+      "implementation": "existing simplify/GVN/copy pipeline",
+      "evidence": [
+        "engineering/llvm-missed/BATCH-006.md",
+        "src/passes/bit_idioms_batch6_tests.rs",
+        "tests/regression/llvm_missed_batch6.c",
+        "tests/regression/check_llvm_missed_batch6.py",
+        "engineering/llvm-missed/batch-006-proofs.json"
+      ],
+      "remaining": "Coverage is of the listed reduced contracts, not arbitrary CFG/path reasoning, mixed widths, poison flags, vectors or all upstream examples."
+    },
+    {
+      "number": 217230,
+      "status": "covered-limited",
+      "scope": "U32/U64 aligned-add/logical-shift/add/low-ones-mask cancellation with wrap hidden by the demanded bits",
+      "implementation": "src/passes/bit_idioms_batch6.rs",
+      "evidence": [
+        "engineering/llvm-missed/BATCH-006.md",
+        "src/passes/bit_idioms_batch6_tests.rs",
+        "tests/regression/llvm_missed_batch6.c",
+        "tests/regression/check_llvm_missed_batch6.py",
+        "engineering/llvm-missed/batch-006-proofs.json"
+      ],
+      "remaining": "Coverage is of the listed reduced contracts, not arbitrary CFG/path reasoning, mixed widths, poison flags, vectors or all upstream examples."
+    },
+    {
+      "number": 214397,
+      "status": "covered-limited",
+      "scope": "Unsigned range facts on a unique conditional predecessor and the local already-ifconverted nested-select form; joins supply no incoming assumptions",
+      "implementation": "src/passes/bit_idioms_batch6.rs",
+      "evidence": [
+        "engineering/llvm-missed/BATCH-006.md",
+        "src/passes/bit_idioms_batch6_tests.rs",
+        "tests/regression/llvm_missed_batch6.c",
+        "tests/regression/check_llvm_missed_batch6.py",
+        "engineering/llvm-missed/batch-006-proofs.json"
+      ],
+      "remaining": "Coverage is of the listed reduced contracts, not arbitrary CFG/path reasoning, mixed widths, poison flags, vectors or all upstream examples."
+    },
+    {
+      "number": 213708,
+      "status": "covered-limited",
+      "scope": "Scalar Eq/Ne observations of x & -x against zero and one; zero already handled, one newly reduced to the low input bit",
+      "implementation": "src/passes/bit_idioms_batch6.rs",
+      "evidence": [
+        "engineering/llvm-missed/BATCH-006.md",
+        "src/passes/bit_idioms_batch6_tests.rs",
+        "tests/regression/llvm_missed_batch6.c",
+        "tests/regression/check_llvm_missed_batch6.py",
+        "engineering/llvm-missed/batch-006-proofs.json"
+      ],
+      "remaining": "Coverage is of the listed reduced contracts, not arbitrary CFG/path reasoning, mixed widths, poison flags, vectors or all upstream examples."
+    },
+    {
+      "number": 210131,
+      "status": "covered-limited",
+      "scope": "Scalar Eq/Ne zero observations of OR(input, cast(canonical comparison of input against zero)); arbitrary noncanonical conditions declined",
+      "implementation": "src/passes/bit_idioms_batch6.rs",
+      "evidence": [
+        "engineering/llvm-missed/BATCH-006.md",
+        "src/passes/bit_idioms_batch6_tests.rs",
+        "tests/regression/llvm_missed_batch6.c",
+        "tests/regression/check_llvm_missed_batch6.py",
+        "engineering/llvm-missed/batch-006-proofs.json"
+      ],
+      "remaining": "Coverage is of the listed reduced contracts, not arbitrary CFG/path reasoning, mixed widths, poison flags, vectors or all upstream examples."
     }
   ],
   "latest_batch": 2

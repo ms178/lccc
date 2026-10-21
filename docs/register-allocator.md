@@ -53,6 +53,22 @@ Default eviction is **mode 3** (hotter incoming, victim next-use after
 incoming end). Mode 5 (exchange) regressed gzip as a default and stays
 opt-in.
 
+### Whole-web hot-loop promotion
+
+After the x86 allocation waves and before residual segment fill, missed
+loop-phi owners may take an already-held callee-saved register from colder
+non-loop holders. This is available on **i686 and x86-64**; the independent
+AArch64 loop-pin policy remains. Costs include every member removed by
+whole-copy-web eviction, even members outside the incoming interval, with
+saturating sums and deterministic tie breaks. Loop-pair and ABI-hinted holders
+are protected; unknown coverage declines. No caller-saved register is promoted
+to an ABI-preserved one and no reserved register is added to the pool.
+
+`CCC_NO_HOT_WEB_STEAL` disables the x86 phase; `CCC_HOT_WEB_STEAL=N` caps its
+successful promotions (default 3). See
+[`BATCH-006.md`](../engineering/llvm-missed/BATCH-006.md) for the safety boundaries,
+negative tests and measurement scope.
+
 ### Spill cost model
 
 Two distinct currencies coexist, and the difference is deliberate:

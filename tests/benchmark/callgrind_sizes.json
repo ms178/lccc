@@ -44,5 +44,7 @@
   "lz4_compress": "-DSRC_SIZE=16384 -DPASSES=2",
   "lz4_match_extend": "-DSRC_SIZE=16384 -DPASSES=2 -DMATCH_RICH=1",
   "glibc_strstr": "-DHAYSTACK_LEN=16384 -DQUERY_COUNT=32 -DPASSES=2",
-  "volatile_reduce": "-DVOLATILE_REDUCE_TRIPS=4096"
+  "volatile_reduce": "-DVOLATILE_REDUCE_TRIPS=4096",
+  "hot_web_loop": "-DHOT_WEB_TRIPS=4096",
+  "llvm_batch6_scalar": "-DBATCH6_SCALAR_TRIPS=1024"
 }
