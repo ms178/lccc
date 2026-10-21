@@ -100,25 +100,44 @@ Attempts that did **not** pay off, measured, and therefore not shipped:
 
 ## CLI standing (the number that matters for the acceptance bar)
 
-15 MB text slice, child CPU time, best of 5, identical frames:
+15 MB text slice, child CPU time, best of 5, identical frames, every level:
 
 | level | compress vs GCC | decompress vs GCC |
 |---|---|---|
-| 1 | 1.278 | 1.256 |
-| 3 | 1.239 | 1.325 |
-| 9 | 1.272 | 1.325 |
-| 12 | 1.357 | 1.432 |
-| 19 | 1.356 | 1.383 |
-| geo | **1.299** | **1.343** |
+| 1 | 1.302 | 1.208 |
+| 2 | 1.230 | 1.286 |
+| 3 | 1.194 | 1.367 |
+| 5 | 1.271 | 1.355 |
+| 7 | 1.241 | 1.412 |
+| 9 | 1.238 | 1.182 |
+| 12 | 1.337 | 1.622 |
+| 15 | 1.095 | 1.353 |
+| 19 | 1.344 | 1.389 |
+| geo | **1.248** | **1.348** |
+
+Clang 23.1.3 on the same harness: 0.972 compress, 0.956 decompress, i.e. no
+level is slower than GCC for a non-GCC compiler — the harness is neutral.
 
 1 MiB slice: compress geo 1.192 (worst 1.477 at L19), decompress geo 1.109
-(worst 1.144). Clang is at 0.99/0.97 on the same harness, i.e. the harness
-is not biased against a non-GCC compiler.
+(worst 1.144).
 
 So: the prefetch fix removes roughly a third of the original level-9
-regression, and the CLI is still ~30 % behind on large inputs. Closing that
-requires the allocator work described above (fewer register-to-register
-copies, fewer spill round-trips), not another idiom-level fix.
+regression, and the CLI is still ~25 % behind on compression and ~35 % on
+decompression. Closing that requires allocator work (fewer
+register-to-register copies, fewer spill round-trips), not another
+idiom-level fix.
+
+One concrete gap is now identified with a mechanism: x86-64 has no
+equivalent of the "steal a callee-saved register for a hot loop web" pass
+that this backend already implements for i686 (`CCC_HOT_WEB_STEAL`, 3 by
+default) and AArch64 (`CCC_LOOP_PIN`, 2 by default). The decode regression
+is precisely a hot loop web (the output pointer, a loop-carried phi) that
+loses its register to colder values; both other backends already decided
+that losing such a web is worse than displacing what holds the register.
+Porting the pass to x86-64 is the single best-attested next step, and it is
+deliberately not attempted here: a register-stealing pass needs its own
+A/B across the whole benchmark corpus, not a patch at the end of a
+different change.
 
 ## Reproducing
 
