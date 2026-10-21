@@ -92,7 +92,9 @@ def main():
         ]:
             assembly = Path(td) / (name + ".s")
             subprocess.run(
-                [args.lccc, "-O2", "-S", str(spectral), "-o", str(assembly)],
+                # The ablation below asserts on VEX mnemonics, so it needs the
+                # ISA named explicitly rather than taken from the default.
+                [args.lccc, "-O2", "-march=x86-64-v3", "-S", str(spectral), "-o", str(assembly)],
                 env=dict(os.environ, **extra),
                 check=True,
                 capture_output=True,
