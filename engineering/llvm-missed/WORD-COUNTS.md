@@ -79,3 +79,9 @@ commands and hashes; neither renaming nor rebasing fabricates a fresh speedup.
 [WORD-COUNTS-BENCH.md](WORD-COUNTS-BENCH.md) reports the fresh matched-ISA
 paired experiment, all retained controls (including a shifted identical-binary
 control), and the full-workload correctness outcomes.
+
+The live Callgrind registry supplies `-DROUNDS=1024` for the count bundle.
+Harness tests require an explicit bound for every registered workload and pin
+this entry, preventing an unbounded default or a missing-registry screen.
+The scalar-facts trip macro is semantic too; recompiling that naming-only
+change yields byte-identical executables in all four correctness arms.

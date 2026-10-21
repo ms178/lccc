@@ -46,5 +46,6 @@
   "glibc_strstr": "-DHAYSTACK_LEN=16384 -DQUERY_COUNT=32 -DPASSES=2",
   "volatile_reduce": "-DVOLATILE_REDUCE_TRIPS=4096",
   "hot_web_loop": "-DHOT_WEB_TRIPS=4096",
-  "llvm_scalar_facts": "-DBATCH6_SCALAR_TRIPS=1024"
+  "llvm_scalar_facts": "-DSCALAR_FACTS_TRIPS=1024",
+  "llvm_word_counts": "-DROUNDS=1024"
 }

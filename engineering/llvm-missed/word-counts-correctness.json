@@ -2593,5 +2593,37 @@
     "standalone_word_counts_corpus": "PASS",
     "ci_local_parity_commands": 330
   },
-  "candidate_src_tree": "63782a9f1d45cd333e97c01df08a189be313a54d"
+  "candidate_src_tree": "63782a9f1d45cd333e97c01df08a189be313a54d",
+  "post_naming_macro_check": {
+    "workload": "llvm_scalar_facts",
+    "change": "SCALAR_FACTS_TRIPS replaces the delivery-number macro; same default bound.",
+    "source_sha256": "d76fe84e802b9a9a9be2f43ad8956c93d35c5fba18929c227b4dd5cb02b9a730",
+    "all_four_executables_byte_identical_to_recorded_correctness": true,
+    "correctness": {
+      "before": {
+        "all_runs_successful": true,
+        "matches_baseline": true,
+        "output": "002dc88fa187f4bd\n",
+        "stable_within_compiler": true
+      },
+      "clang": {
+        "all_runs_successful": true,
+        "matches_baseline": true,
+        "output": "002dc88fa187f4bd\n",
+        "stable_within_compiler": true
+      },
+      "gcc": {
+        "all_runs_successful": true,
+        "matches_baseline": true,
+        "output": "002dc88fa187f4bd\n",
+        "stable_within_compiler": true
+      },
+      "lccc": {
+        "all_runs_successful": true,
+        "matches_baseline": true,
+        "output": "002dc88fa187f4bd\n",
+        "stable_within_compiler": true
+      }
+    }
+  }
 }
