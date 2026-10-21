@@ -72,7 +72,7 @@ Recorded successful checks:
 - Warning-denied `fastbuild` of all compiler binaries and `lccc-ld`.
 - All-target fastbuild tests: 5,538 library tests and one linker test passed;
   ten explicitly ignored library tests remain ignored.
-- Assertion-enabled all-target fastbuild tests: the same 5,538 library tests
+- Assertion-enabled all-target fastbuild tests: 5,552 library tests
   and one linker test passed; ten explicitly ignored tests remain ignored.
 - All-target Clippy with `-D warnings`; no lint suppressions added.
 - Independent-model matrix: 24 compiler/policy builds, 1,080 checked hashes,
