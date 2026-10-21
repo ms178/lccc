@@ -142,6 +142,82 @@ fn not_source(opnd: Operand, defs: &[Option<Instruction>]) -> Option<Operand> {
     }
 }
 
+/// Build an integer constant of `ty`'s width from a raw bit pattern.
+fn int_const(value: u64, ty: IrType) -> Operand {
+    let v = value as i128;
+    Operand::Const(match ty {
+        IrType::I8 | IrType::U8 => IrConst::I8(v as i8),
+        IrType::I16 | IrType::U16 => IrConst::I16(v as i16),
+        IrType::I32 | IrType::U32 => IrConst::I32(v as i32),
+        IrType::I128 | IrType::U128 => IrConst::I128(v),
+        _ => IrConst::I64(v as i64),
+    })
+}
+
+/// `(~x & C) == 0` and `(~x & C) != 0` are the same statements as
+/// `(x & C) == C` and `(x & C) != C`: a bit of C is set in `~x` exactly when
+/// it is clear in x, so "no mask bit survives the complement" means "every
+/// mask bit is set in x".  Both forms are pure integer identities, independent
+/// of signedness, poison or no-wrap flags, and of how the mask was formed.
+///
+/// Returns the And's destination, the un-complemented operand, the mask and
+/// the comparison type so the caller can retarget the And at `x` (dropping the
+/// Not) and compare against C.  That is only legal when this comparison is the
+/// And's ONLY reader (`and_uses`): the rewrite changes what the And computes,
+/// so a second reader of the old value would observe the wrong bits.
+fn match_not_mask_cmp(
+    inst: &Instruction,
+    defs: &[Option<Instruction>],
+    use_counts: &[u32],
+) -> Option<(u32, Operand, u64, IrType)> {
+    let Instruction::Cmp {
+        op, lhs, rhs, ty, ..
+    } = inst
+    else {
+        return None;
+    };
+    if !matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) || !ty.is_integer() {
+        return None;
+    }
+    // One side is the complement-and, the other is the literal zero.
+    let and_op = if const_u64(*rhs) == Some(0) {
+        *lhs
+    } else if const_u64(*lhs) == Some(0) {
+        *rhs
+    } else {
+        return None;
+    };
+    let Operand::Value(and_dest) = peel_copies(and_op, defs) else {
+        return None;
+    };
+    if use_counts.get(and_dest.0 as usize).copied().unwrap_or(0) != 1 {
+        return None;
+    }
+    let Instruction::BinOp {
+        op: IrBinOp::And,
+        lhs,
+        rhs,
+        ty: and_ty,
+        ..
+    } = defs.get(and_dest.0 as usize).and_then(Option::as_ref)?
+    else {
+        return None;
+    };
+    if and_ty != ty {
+        return None;
+    }
+    let width = ty.size() * 8;
+    let (x, mask) = match (not_source(*lhs, defs), const_in_ring(*rhs, width)) {
+        (Some(x), Some(mask)) => (x, mask),
+        _ => match (not_source(*rhs, defs), const_in_ring(*lhs, width)) {
+            (Some(x), Some(mask)) => (x, mask),
+            _ => return None,
+        },
+    };
+    // C == 0 is a constant comparison the folder already owns.
+    (mask != 0).then_some((and_dest.0, x, mask, *ty))
+}
+
 /// The value `opnd` names, after copy peeling — for single-use proofs the
 /// proof must cover every alias that reads the producer.
 fn peeled_value(
@@ -2481,6 +2557,11 @@ pub(crate) fn recognize_function(
     // instruction, consumer block, consumer index, new consumer
     // instruction).
     let mut pending_masks: Vec<(usize, usize, Instruction, usize, usize, Instruction)> = Vec::new();
+    // `(~x & C) == 0` -> `(x & C) == C` pairs. Same deferred two-sided
+    // rewrite as the mask pairs above and for the same borrow reason; the
+    // producer and the comparison may sit in different blocks.
+    let mut pending_not_mask: Vec<(usize, usize, Instruction, usize, usize, Instruction)> =
+        Vec::new();
     // No insertion is allowed during the scan: def_loc and pending mask
     // coordinates refer to the original layout. Boolean producer rewrites
     // remain immediate (with coherent defs/use_counts); every expanding
@@ -2555,6 +2636,39 @@ pub(crate) fn recognize_function(
                         note_use(&mut use_counts, start, false);
                         note_use(&mut use_counts, forwarded, true);
                         changes += 1;
+                    }
+                }
+            }
+
+            // Complement-mask comparison: `(~x & C) == 0` is `(x & C) == C`.
+            // x86 lowers the right form as a single `and` against an immediate
+            // plus `cmp`, while the complement form additionally materialises
+            // `not` and a zero test.  Deferred (see `pending_not_mask`).
+            if let Instruction::Cmp { dest, op, ty, .. } = block.instructions[index] {
+                if let Some((and_dest, x, mask, cmp_ty)) =
+                    match_not_mask_cmp(&block.instructions[index], &defs, &use_counts)
+                {
+                    if let Some((pbi, pii)) = def_loc.get(and_dest as usize).copied().flatten() {
+                        pending_not_mask.push((
+                            pbi,
+                            pii,
+                            Instruction::BinOp {
+                                dest: Value(and_dest),
+                                op: IrBinOp::And,
+                                lhs: x,
+                                rhs: int_const(mask, cmp_ty),
+                                ty: cmp_ty,
+                            },
+                            block_bi,
+                            index,
+                            Instruction::Cmp {
+                                dest,
+                                op,
+                                lhs: Operand::Value(Value(and_dest)),
+                                rhs: int_const(mask, cmp_ty),
+                                ty,
+                            },
+                        ));
                     }
                 }
             }
@@ -3134,6 +3248,30 @@ pub(crate) fn recognize_function(
         if valid(pbi, pii, x_dest) && valid(cbi, cii, c_dest) {
             func.blocks[pbi].instructions[pii] = new_prod;
             func.blocks[cbi].instructions[cii] = new_cons;
+        }
+    }
+    // Complement-mask pairs: validate BOTH destinations before writing either
+    // half, exactly like the mask pairs above, so a rejected pair can never
+    // leave the And and the comparison disagreeing about the mask.
+    for (pbi, pii, new_prod, cbi, cii, new_cons) in pending_not_mask {
+        let (Instruction::BinOp { dest: and_dest, .. }, Instruction::Cmp { dest: cmp_dest, .. }) =
+            (&new_prod, &new_cons)
+        else {
+            continue;
+        };
+        let (and_dest, cmp_dest) = (*and_dest, *cmp_dest);
+        let prod_ok = matches!(
+            func.blocks.get(pbi).and_then(|b| b.instructions.get(pii)),
+            Some(Instruction::BinOp { dest: d, op: IrBinOp::And, .. }) if *d == and_dest
+        );
+        let cons_ok = matches!(
+            func.blocks.get(cbi).and_then(|b| b.instructions.get(cii)),
+            Some(Instruction::Cmp { dest: d, .. }) if *d == cmp_dest
+        );
+        if prod_ok && cons_ok {
+            func.blocks[pbi].instructions[pii] = new_prod;
+            func.blocks[cbi].instructions[cii] = new_cons;
+            changes += 1;
         }
     }
     // Applications must run from the highest coordinate down: a splice inserts
@@ -3750,6 +3888,110 @@ mod tests {
             from_ty: IrType::U16,
             to_ty: IrType::I32,
         }
+    }
+
+    #[test]
+    fn not_mask_comparison_matches_the_boolean_identity() {
+        // Exhaustive over the whole 8-bit domain: the rewrite the pass
+        // performs is a theorem, not a heuristic.
+        for c in 0..=255u8 {
+            for x in 0..=255u8 {
+                assert_eq!(((!x) & c) == 0, (x & c) == c, "x={x} c={c}");
+                assert_eq!(((!x) & c) != 0, (x & c) != c, "x={x} c={c}");
+            }
+        }
+    }
+
+    #[test]
+    fn not_mask_comparison_is_recognized_and_bounded_by_its_reader() {
+        let ty = IrType::U32;
+        let defs = vec![
+            None,
+            Some(Instruction::UnaryOp {
+                dest: Value(1),
+                op: IrUnaryOp::Not,
+                src: v(0),
+                ty,
+            }),
+            Some(Instruction::BinOp {
+                dest: Value(2),
+                op: IrBinOp::And,
+                lhs: v(1),
+                rhs: Operand::Const(IrConst::I32(0x5a5a)),
+                ty,
+            }),
+            Some(Instruction::Cmp {
+                dest: Value(3),
+                op: IrCmpOp::Eq,
+                lhs: v(2),
+                rhs: Operand::Const(IrConst::I32(0)),
+                ty,
+            }),
+        ];
+        // The And's only reader is the comparison.
+        let (and_dest, x, mask, cmp_ty) =
+            match_not_mask_cmp(defs[3].as_ref().unwrap(), &defs, &[0, 1, 1, 0]).unwrap();
+        assert_eq!((and_dest, mask, cmp_ty), (2, 0x5a5a, ty));
+        assert!(matches!(x, Operand::Value(Value(0))));
+
+        // A second reader of the And would observe the retargeted bits.
+        assert!(match_not_mask_cmp(defs[3].as_ref().unwrap(), &defs, &[0, 1, 2, 0]).is_none());
+
+        // A comparison against a nonzero constant is a different statement.
+        let mut nonzero = defs.clone();
+        nonzero[3] = Some(Instruction::Cmp {
+            dest: Value(3),
+            op: IrCmpOp::Eq,
+            lhs: v(2),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty,
+        });
+        assert!(
+            match_not_mask_cmp(nonzero[3].as_ref().unwrap(), &nonzero, &[0, 1, 1, 0]).is_none()
+        );
+
+        // Without the complement there is nothing to undo.
+        let mut plain = defs.clone();
+        plain[2] = Some(Instruction::BinOp {
+            dest: Value(2),
+            op: IrBinOp::And,
+            lhs: v(0),
+            rhs: Operand::Const(IrConst::I32(0x5a5a)),
+            ty,
+        });
+        assert!(match_not_mask_cmp(plain[3].as_ref().unwrap(), &plain, &[0, 1, 1, 0]).is_none());
+    }
+
+    #[test]
+    fn not_mask_comparison_handles_the_not_on_either_and_side() {
+        let ty = IrType::U32;
+        let defs = vec![
+            None,
+            Some(Instruction::UnaryOp {
+                dest: Value(1),
+                op: IrUnaryOp::Not,
+                src: v(0),
+                ty,
+            }),
+            Some(Instruction::BinOp {
+                dest: Value(2),
+                op: IrBinOp::And,
+                lhs: Operand::Const(IrConst::I32(0x00ff)),
+                rhs: v(1),
+                ty,
+            }),
+            Some(Instruction::Cmp {
+                dest: Value(3),
+                op: IrCmpOp::Ne,
+                lhs: Operand::Const(IrConst::I32(0)),
+                rhs: v(2),
+                ty,
+            }),
+        ];
+        let (and_dest, x, mask, _) =
+            match_not_mask_cmp(defs[3].as_ref().unwrap(), &defs, &[0, 1, 1, 0]).unwrap();
+        assert_eq!((and_dest, mask), (2, 0xff));
+        assert!(matches!(x, Operand::Value(Value(0))));
     }
 
     #[test]

@@ -296,6 +296,23 @@ Clippy; for code-generation edits, the `engineering/agent/RULES.md` test and
 oracle requirements. Full/slow CI is not authorized locally; rely on hosted CI.
 Never publish or open a PR as locally validated unless these gates actually pass.
 
+**Progress 2026-10-21 (local CI on the pinned caches):** the hosted runs for
+this PR never reached a compiler (two jobs died provisioning GCC 16 on a
+Launchpad window), so the whole gate set was run locally from the tag caches
+instead: all thirteen pinned assets verified against their `MANIFEST.sha256`,
+Rust 1.97.0 (the declared floor), the bookworm i686 sysroot, and the pinned
+`as`/`ld.bfd` 2.47, relocs, valgrind and A64 ISA XML oracles. `ci_local.sh
+--fast` went from 51 failures to 0 and the linker suite from 295 pass / 9 fail
+to 304 pass / 0 fail / 0 warn / 0 skip. Four of the 51 were repository defects
+fixed here (stale benchmark-registry counts in three corpus modules; the
+`not_mask` bit idiom, now implemented with an exhaustive-model unit test; the
+stale audit-census baseline, re-baselined with the +1s it had accumulated; and
+the missing local mirror of the new layout-matrix gate). The remaining 47 were
+sandbox-toolchain gaps: the tag-cache GCC defaults to `-fno-pie` where distro
+compilers default to `-fPIE`, Debian has no single-tree
+`/usr/include/i386-linux-gnu`, and the tarball ships no sanitizer archives —
+each reproduced explicitly so a gate measures the compiler, never the host.
+
 ## Rejected/stale queue claims
 
 - The root backlog's dated A14/PR834/PR837 status is historical; its baseline

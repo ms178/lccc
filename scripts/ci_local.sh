@@ -368,6 +368,14 @@ gate "ext-vector-abi-grid" fast \
 # width or %al census poisons every later FP vararg, not just its own.
 gate "ext-vector-varargs-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_ext_vector_varargs_abi.sh
+
+# The layout matrix is the other half of the ext-vector contract: the ABI grid
+# above pins how shapes cross a call boundary, this pins what sizeof/_Alignof
+# say and how lanes address inside an object, over 120 shapes x 2 targets at
+# -O0 and -O2, against the pinned Clang 23.1.3 oracle.  It needs no i686
+# headers (freestanding fixture) but does need the host driver to link -m32.
+gate "ext-vector-layout-matrix" fast \
+    env CCC="$LCCC" bash tests/regression/check_ext_vector_layout_matrix.sh
 # The same probe under the AVX / AVX-512F ABI level (x86-64 only): a named
 # ext vector of up to the native register width is ONE %ymm / %zmm for
 # Clang, the carrier lccc shares with the vector_size ABI (AUD-VABI-2), so
