@@ -127,12 +127,21 @@ describe_missing() {
 # index first, so a stale cache only costs the delta download, never
 # correctness or the rolling-major version policy.
 archive_opts=()
+index_opts=()
 if [[ -n ${LCCC_CI_APT_ARCHIVE_DIR:-} ]]; then
-    mkdir -p "${LCCC_CI_APT_ARCHIVE_DIR}/partial"
+    mkdir -p "${LCCC_CI_APT_ARCHIVE_DIR}/partial" \
+             "${LCCC_CI_APT_ARCHIVE_DIR}/lists/partial"
     archive_opts=(
         -o "Dir::Cache::archives=${LCCC_CI_APT_ARCHIVE_DIR}"
         -o APT::Keep-Downloaded-Packages=true
     )
+    # Persisting the index next to the debs is what makes provisioning
+    # survive a PPA CDN outage: a warm runner resolves gcc-16 from the cached
+    # index and installs from the cached debs without fetching anything. It
+    # also removes the index download from the common path entirely. apt keeps
+    # the live index authoritative -- an update still refreshes this directory
+    # whenever the network is healthy.
+    index_opts=(-o "Dir::State::lists=${LCCC_CI_APT_ARCHIVE_DIR}/lists")
 fi
 
 # A single retryable index fetch.
@@ -142,7 +151,8 @@ fi
 #    per run that nothing in this repository reads, and the PPA's translation
 #    index is a recurring 503 source (observed in the failing lane).
 refresh_indexes() {
-    apt_retry 3 apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none
+    apt_retry 3 apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none \
+        "${index_opts[@]}"
 }
 
 # Refresh until every requested package is resolvable. The loop is keyed on
@@ -167,35 +177,16 @@ ensure_packages_resolvable() {
     return 1
 }
 
-# The Launchpad PPA is served by two hosts. `ppa.launchpadcontent.net` is the
-# current CDN edge; on 2026-10-21 it answered 503 for every index path
-# (InRelease and Packages.gz alike) for hours, which no amount of retrying can
-# fix, while the legacy `ppa.launchpad.net` host kept serving the same signed
-# archive. Retargeting the configured source is therefore the only way to keep
-# the lanes alive during such an outage. It is a *fallback*: it runs only after
-# the primary host has exhausted its retry budget and it announces itself, so
-# nobody mistakes a legacy-host build for a healthy one.
-retarget_ppa_to_legacy_host() {
-    local directory=${LCCC_CI_APT_SOURCES_DIR:-/etc/apt/sources.list.d}
-    local file retargeted=0
-    for file in "$directory"/*toolchain-r*test*.sources \
-                "$directory"/*toolchain-r*test*.list; do
-        [[ -f $file ]] || continue
-        grep -q 'ppa\.launchpadcontent\.net' "$file" 2>/dev/null || continue
-        as_root sed -i 's#ppa\.launchpadcontent\.net#ppa.launchpad.net#g' "$file"
-        retargeted=1
-        echo "ci_install_gcc16: retargeted $file to ppa.launchpad.net (primary CDN unusable)" >&2
-    done
-    if (( retargeted == 0 )); then
-        echo "ci_install_gcc16: no configured PPA source to retarget" >&2
-        return 1
-    fi
-    # Announce only what actually happened: a "degraded" annotation on a run
-    # that never retargeted would be a lie in the check run.
-    annotate "GCC 16 provisioning degraded" \
-        "the primary PPA host was unusable; retargeted the toolchain PPA to ppa.launchpad.net"
-    return 0
-}
+# Rejected alternative, recorded so nobody re-invents it: retargeting the PPA
+# to the legacy `ppa.launchpad.net` host. It looks equivalent (the hostname
+# serves the same archive over plain HTTP) but apt cannot use it: the alias
+# presents a certificate that does not cover the legacy name -- observed as
+# "Certificate verification failed: The certificate is NOT trusted. The name in
+# the certificate does not match the expected" -- and disabling peer
+# verification to work around it is not an option. The outage is instead
+# absorbed by retrying the real host over a longer, bounded window and by
+# keeping apt's index (see LCCC_CI_APT_ARCHIVE_DIR) so a warm runner resolves
+# the toolchain without touching the CDN at all.
 
 configure_ubuntu_ppa() {
     # shellcheck disable=SC1090
@@ -215,7 +206,8 @@ install_packages() {
     while (( attempt <= 3 )); do
         rc=0
         as_root apt-get install -y --no-install-recommends \
-            -o Acquire::Retries=3 "${archive_opts[@]}" "${packages[@]}" || rc=$?
+            -o Acquire::Retries=3 "${archive_opts[@]}" "${index_opts[@]}" \
+            "${packages[@]}" || rc=$?
         if (( rc == 0 )); then
             return 0
         fi
@@ -273,7 +265,7 @@ report_provisioning_failure() {
         printf '%s\n' "$fetches" >&2
     fi
     dry_run=$(as_root apt-get install -y --no-install-recommends --dry-run \
-        "${packages[@]}" 2>&1 | tail -n 20 || true)
+        "${index_opts[@]}" "${packages[@]}" 2>&1 | tail -n 20 || true)
     if [[ -n $dry_run ]]; then
         echo "ci_install_gcc16: resolver verdict follows" >&2
         printf '%s\n' "$dry_run" >&2
@@ -297,19 +289,13 @@ if ! toolchain_ready; then
             report_provisioning_failure
             exit 1
         fi
-        # Two rounds on the primary host, then the legacy host gets the same
-        # budget. Spending the whole budget on a CDN that is down for hours
-        # only makes the failure slower, and switching earlier makes it
-        # impossible to tell a transient hiccup from an outage.
-        if ! ensure_packages_resolvable 2; then
-            if ! retarget_ppa_to_legacy_host; then
-                report_provisioning_failure
-                exit 1
-            fi
-            if ! ensure_packages_resolvable 2; then
-                report_provisioning_failure
-                exit 1
-            fi
+        # The PPA edge flaps: probes a minute apart observed 503 and then a
+        # healthy InRelease. Four refresh rounds with linear backoff
+        # (25/50/75/100 s between rounds, three apt attempts per round) cover
+        # the observed outage window instead of surrendering to the first one.
+        if ! ensure_packages_resolvable 4; then
+            report_provisioning_failure
+            exit 1
         fi
     fi
     if ! install_packages; then

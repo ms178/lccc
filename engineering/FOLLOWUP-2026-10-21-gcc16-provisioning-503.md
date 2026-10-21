@@ -103,38 +103,49 @@ Two independent defects produced the confusion:
 ## Second outage, same day: the CDN edge itself
 
 While the fix above was being verified, `ppa.launchpadcontent.net` stopped
-serving the PPA altogether. Probed from two independent networks:
+serving the PPA altogether, and then started flapping: the `build` lane
+provisioned successfully at 15:42, the next lane's run at 15:48 got
 
 ```
-GET https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu/dists/noble/InRelease
-  -> 503 Service Unavailable   ("No server is available to handle this request.")
-GET https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu/dists/noble/main/binary-amd64/Packages.gz
-  -> 503 Service Unavailable
-GET https://ppa.launchpad.net/ubuntu-toolchain-r/test/ubuntu/dists/noble/InRelease
-  -> 200 OK, valid PGP-signed InRelease for suite noble
+Err:7 https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu noble InRelease
+W: Failed to fetch .../dists/noble/InRelease  503  Service Unavailable [IP: 185.125.189.188 443]
 ```
 
-No retry policy can recover from that: the host serving the index is down,
-and the runner has no other source of GCC 16 on noble. The helper therefore
-retries the primary host twice (each round is itself three `apt-get update`
-attempts with `Acquire::Retries=3`), and only then retargets the configured
-PPA source to the legacy host, which serves the same archive:
+No retry policy recovers from a host that is down, and noble has no other
+source of GCC 16. Two mitigations were considered.
 
-* `retarget_ppa_to_legacy_host` rewrites only files matching
-  `*toolchain-r*test*` in `LCCC_CI_APT_SOURCES_DIR` (default
-  `/etc/apt/sources.list.d`), and only when they actually reference the
-  primary host.
-* The downgrade is announced in the log *and* as a `::error`-titled
-  annotation ("GCC 16 provisioning degraded"), so a legacy-host build is never
-  mistaken for a healthy one.
-* The primary host stays the default: a healthy CDN is never retargeted, and
-  the fallback exists only for "the host is down", not for "the index is
-  slow".
-* Caveat that a reviewer must know: the legacy host can serve an older index
-  (the observed InRelease was generated 2026-03-22). That still satisfies the
-  rolling-major `16.x` policy, but when `LCCC_CI_GCC_VERSION` pins an exact
-  version, the post-install version check rejects a stale toolchain instead of
-  silently accepting it.
+### Adopted: cached index + bounded patience
+
+* apt's index lives in the cached archive directory
+  (`-o Dir::State::lists=$LCCC_CI_APT_ARCHIVE_DIR/lists`), so the existing
+  weekly `actions/cache` entry persists it next to the debs. A warm runner
+  resolves `gcc-16` from the cached index and installs from the cached debs
+  **without contacting the CDN at all** — that is both the outage mitigation
+  and a latency win on every lane.
+* The refresh budget after the PPA is configured is four rounds with linear
+  backoff (25/50/75/100 s between rounds, three apt attempts per round with
+  `Acquire::Retries=3` each). That covers the observed flap window without
+  turning a two-second hiccup into a 198 s failure and without retrying for
+  an unbounded time.
+* The rolling-major `16.x` policy tolerates a week-old index; when
+  `LCCC_CI_GCC_VERSION` pins an exact version the post-install check still
+  rejects a stale toolchain instead of silently accepting it.
+
+### Rejected: retargeting to the legacy `ppa.launchpad.net` host
+
+It looks equivalent — the legacy name serves the same archive over plain
+HTTP — and it was implemented first. CI proved it cannot work:
+
+```
+W: Failed to fetch https://ppa.launchpad.net/ubuntu-toolchain-r/test/ubuntu/dists/noble/InRelease
+   Certificate verification failed: The certificate is NOT trusted.
+   The name in the certificate does not match the expected.
+```
+
+The alias presents a certificate that does not cover the legacy name, so apt
+rejects the index. Disabling peer verification to work around it is not
+acceptable, and the retarget was removed. The rejection is recorded here so
+nobody re-invents it.
 
 ### What CI actually observed
 
