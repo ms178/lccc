@@ -1,6 +1,6 @@
 #include <stdint.h>
 #include <stdio.h>
-/* Total unsigned contracts; all shifts are fixed and in range. */
+/* Total unsigned contracts; all shifts are explicitly in range. */
 __attribute__((noinline)) uint32_t predicate_nested_same_32(uint32_t x, uint32_t y, uint32_t z) {
     unsigned c = z != 0; (void)c; (void)x; (void)y;
     return c ? (c ? x : y) : y;
@@ -200,6 +200,54 @@ __attribute__((noinline)) uint32_t predicate_nested_symmetric_32(uint32_t x, uin
 __attribute__((noinline)) uint32_t reference_nested_symmetric_32(uint32_t x, uint32_t y, uint32_t z) {
     unsigned c = z != 0; (void)c; (void)x; (void)y;
     return ((x != 0) ^ c) ? y : x;
+}
+__attribute__((noinline)) uint32_t predicate_guarded_increment_32(uint32_t x, uint32_t y, uint32_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return (x != (uint32_t)~(uint32_t)0) & ((uint32_t)(x + (uint32_t)1) <= y);
+}
+__attribute__((noinline)) uint32_t reference_guarded_increment_32(uint32_t x, uint32_t y, uint32_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return x < y;
+}
+__attribute__((noinline)) uint32_t predicate_contiguous_guard_32(uint32_t x, uint32_t y, uint32_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return (x < (uint32_t)16) & ((x & (uint32_t)12) != (uint32_t)12);
+}
+__attribute__((noinline)) uint32_t reference_contiguous_guard_32(uint32_t x, uint32_t y, uint32_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return x < (uint32_t)12;
+}
+__attribute__((noinline)) uint32_t predicate_boolean_cardinality_32(uint32_t x, uint32_t y, uint32_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return ((uint32_t)(x != 0) + (uint32_t)(y != 0)) == (uint32_t)1;
+}
+__attribute__((noinline)) uint32_t reference_boolean_cardinality_32(uint32_t x, uint32_t y, uint32_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return (x != 0) != (y != 0);
+}
+__attribute__((noinline)) uint32_t predicate_disjoint_choices_32(uint32_t x, uint32_t y, uint32_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return ((x != 0 ? (uint32_t)4 : (uint32_t)1) & (y != 0 ? (uint32_t)4 : (uint32_t)1)) == 0;
+}
+__attribute__((noinline)) uint32_t reference_disjoint_choices_32(uint32_t x, uint32_t y, uint32_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return (x != 0) != (y != 0);
+}
+__attribute__((noinline)) uint32_t predicate_bounded_or_shift_32(uint32_t x, uint32_t y, uint32_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return (x | y) < (x >> (z & (uint32_t)(32-1)));
+}
+__attribute__((noinline)) uint32_t reference_bounded_or_shift_32(uint32_t x, uint32_t y, uint32_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return (uint32_t)0;
+}
+__attribute__((noinline)) uint32_t predicate_constant_choice_add_32(uint32_t x, uint32_t y, uint32_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return (c ? (uint32_t)64 : (uint32_t)1) + (uint32_t)c;
+}
+__attribute__((noinline)) uint32_t reference_constant_choice_add_32(uint32_t x, uint32_t y, uint32_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return c ? (uint32_t)65 : (uint32_t)1;
 }
 __attribute__((noinline)) uint64_t predicate_nested_same_64(uint64_t x, uint64_t y, uint64_t z) {
     unsigned c = z != 0; (void)c; (void)x; (void)y;
@@ -401,6 +449,54 @@ __attribute__((noinline)) uint64_t reference_nested_symmetric_64(uint64_t x, uin
     unsigned c = z != 0; (void)c; (void)x; (void)y;
     return ((x != 0) ^ c) ? y : x;
 }
+__attribute__((noinline)) uint64_t predicate_guarded_increment_64(uint64_t x, uint64_t y, uint64_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return (x != (uint64_t)~(uint64_t)0) & ((uint64_t)(x + (uint64_t)1) <= y);
+}
+__attribute__((noinline)) uint64_t reference_guarded_increment_64(uint64_t x, uint64_t y, uint64_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return x < y;
+}
+__attribute__((noinline)) uint64_t predicate_contiguous_guard_64(uint64_t x, uint64_t y, uint64_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return (x < (uint64_t)16) & ((x & (uint64_t)12) != (uint64_t)12);
+}
+__attribute__((noinline)) uint64_t reference_contiguous_guard_64(uint64_t x, uint64_t y, uint64_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return x < (uint64_t)12;
+}
+__attribute__((noinline)) uint64_t predicate_boolean_cardinality_64(uint64_t x, uint64_t y, uint64_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return ((uint64_t)(x != 0) + (uint64_t)(y != 0)) == (uint64_t)1;
+}
+__attribute__((noinline)) uint64_t reference_boolean_cardinality_64(uint64_t x, uint64_t y, uint64_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return (x != 0) != (y != 0);
+}
+__attribute__((noinline)) uint64_t predicate_disjoint_choices_64(uint64_t x, uint64_t y, uint64_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return ((x != 0 ? (uint64_t)4 : (uint64_t)1) & (y != 0 ? (uint64_t)4 : (uint64_t)1)) == 0;
+}
+__attribute__((noinline)) uint64_t reference_disjoint_choices_64(uint64_t x, uint64_t y, uint64_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return (x != 0) != (y != 0);
+}
+__attribute__((noinline)) uint64_t predicate_bounded_or_shift_64(uint64_t x, uint64_t y, uint64_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return (x | y) < (x >> (z & (uint64_t)(64-1)));
+}
+__attribute__((noinline)) uint64_t reference_bounded_or_shift_64(uint64_t x, uint64_t y, uint64_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return (uint64_t)0;
+}
+__attribute__((noinline)) uint64_t predicate_constant_choice_add_64(uint64_t x, uint64_t y, uint64_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return (c ? (uint64_t)64 : (uint64_t)1) + (uint64_t)c;
+}
+__attribute__((noinline)) uint64_t reference_constant_choice_add_64(uint64_t x, uint64_t y, uint64_t z) {
+    unsigned c = z != 0; (void)c; (void)x; (void)y;
+    return c ? (uint64_t)65 : (uint64_t)1;
+}
 int main(void) {
     uint64_t seed = UINT64_C(0x243f6a8885a308d3), digest = 0;
     const uint64_t edges[] = {0,1,2,15,16,17,127,128,255,256,UINT32_MAX,UINT64_MAX,UINT64_C(0x8000000000000000)};
@@ -458,6 +554,18 @@ int main(void) {
         digest = digest * UINT64_C(0x100000001b3) ^ predicate_single_bit_fact_32(x,y,z);
         if (predicate_nested_symmetric_32(x,y,z) != reference_nested_symmetric_32(x,y,z)) { puts("mismatch: nested_symmetric/32"); return 1; }
         digest = digest * UINT64_C(0x100000001b3) ^ predicate_nested_symmetric_32(x,y,z);
+        if (predicate_guarded_increment_32(x,y,z) != reference_guarded_increment_32(x,y,z)) { puts("mismatch: guarded_increment/32"); return 1; }
+        digest = digest * UINT64_C(0x100000001b3) ^ predicate_guarded_increment_32(x,y,z);
+        if (predicate_contiguous_guard_32(x,y,z) != reference_contiguous_guard_32(x,y,z)) { puts("mismatch: contiguous_guard/32"); return 1; }
+        digest = digest * UINT64_C(0x100000001b3) ^ predicate_contiguous_guard_32(x,y,z);
+        if (predicate_boolean_cardinality_32(x,y,z) != reference_boolean_cardinality_32(x,y,z)) { puts("mismatch: boolean_cardinality/32"); return 1; }
+        digest = digest * UINT64_C(0x100000001b3) ^ predicate_boolean_cardinality_32(x,y,z);
+        if (predicate_disjoint_choices_32(x,y,z) != reference_disjoint_choices_32(x,y,z)) { puts("mismatch: disjoint_choices/32"); return 1; }
+        digest = digest * UINT64_C(0x100000001b3) ^ predicate_disjoint_choices_32(x,y,z);
+        if (predicate_bounded_or_shift_32(x,y,z) != reference_bounded_or_shift_32(x,y,z)) { puts("mismatch: bounded_or_shift/32"); return 1; }
+        digest = digest * UINT64_C(0x100000001b3) ^ predicate_bounded_or_shift_32(x,y,z);
+        if (predicate_constant_choice_add_32(x,y,z) != reference_constant_choice_add_32(x,y,z)) { puts("mismatch: constant_choice_add/32"); return 1; }
+        digest = digest * UINT64_C(0x100000001b3) ^ predicate_constant_choice_add_32(x,y,z);
         if (predicate_nested_same_64(x,y,z) != reference_nested_same_64(x,y,z)) { puts("mismatch: nested_same/64"); return 1; }
         digest = digest * UINT64_C(0x100000001b3) ^ predicate_nested_same_64(x,y,z);
         if (predicate_nested_inverse_64(x,y,z) != reference_nested_inverse_64(x,y,z)) { puts("mismatch: nested_inverse/64"); return 1; }
@@ -508,6 +616,18 @@ int main(void) {
         digest = digest * UINT64_C(0x100000001b3) ^ predicate_single_bit_fact_64(x,y,z);
         if (predicate_nested_symmetric_64(x,y,z) != reference_nested_symmetric_64(x,y,z)) { puts("mismatch: nested_symmetric/64"); return 1; }
         digest = digest * UINT64_C(0x100000001b3) ^ predicate_nested_symmetric_64(x,y,z);
+        if (predicate_guarded_increment_64(x,y,z) != reference_guarded_increment_64(x,y,z)) { puts("mismatch: guarded_increment/64"); return 1; }
+        digest = digest * UINT64_C(0x100000001b3) ^ predicate_guarded_increment_64(x,y,z);
+        if (predicate_contiguous_guard_64(x,y,z) != reference_contiguous_guard_64(x,y,z)) { puts("mismatch: contiguous_guard/64"); return 1; }
+        digest = digest * UINT64_C(0x100000001b3) ^ predicate_contiguous_guard_64(x,y,z);
+        if (predicate_boolean_cardinality_64(x,y,z) != reference_boolean_cardinality_64(x,y,z)) { puts("mismatch: boolean_cardinality/64"); return 1; }
+        digest = digest * UINT64_C(0x100000001b3) ^ predicate_boolean_cardinality_64(x,y,z);
+        if (predicate_disjoint_choices_64(x,y,z) != reference_disjoint_choices_64(x,y,z)) { puts("mismatch: disjoint_choices/64"); return 1; }
+        digest = digest * UINT64_C(0x100000001b3) ^ predicate_disjoint_choices_64(x,y,z);
+        if (predicate_bounded_or_shift_64(x,y,z) != reference_bounded_or_shift_64(x,y,z)) { puts("mismatch: bounded_or_shift/64"); return 1; }
+        digest = digest * UINT64_C(0x100000001b3) ^ predicate_bounded_or_shift_64(x,y,z);
+        if (predicate_constant_choice_add_64(x,y,z) != reference_constant_choice_add_64(x,y,z)) { puts("mismatch: constant_choice_add/64"); return 1; }
+        digest = digest * UINT64_C(0x100000001b3) ^ predicate_constant_choice_add_64(x,y,z);
     }
     printf("%llu\n", (unsigned long long)digest);
     return 0;

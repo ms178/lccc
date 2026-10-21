@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Predicate relations: fifty native forms and conditional substitution controls."""
+"""Predicate relations: sixty-two native forms and conditional substitution controls."""
 import argparse
 import json
 import os
@@ -53,8 +53,8 @@ def main():
             run([compiler, "-O2", "-S", str(SOURCE), "-o", str(path)], env=settings)
             assembly[label] = path.read_text()
         names = re.findall(r"uint(?:32|64)_t (predicate_\w+)\(", SOURCE.read_text())
-        if len(names) != 50 or len(set(names)) != 50:
-            raise ValueError("native contract inventory is not fifty distinct width-specific forms")
+        if len(names) != 62 or len(set(names)) != 62:
+            raise ValueError("native contract inventory is not sixty-two distinct width-specific forms")
         for name in names:
             counts = {label: len(body(text, name)) for label, text in assembly.items()}
             measurements.append({"name": name, "instructions": counts})
@@ -72,7 +72,7 @@ def main():
         if args.json:
             Path(args.json).write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report))
-    print("PASS predicate relations: fifty native forms, vendor agreement, IR/SSA/RA, m32 and disable controls")
+    print("PASS predicate relations: sixty-two native forms, vendor agreement, IR/SSA/RA, m32 and disable controls")
 
 
 if __name__ == "__main__":

@@ -6,6 +6,8 @@ This cohort reviews **50 distinct previously unreviewed LLVM reports** selected 
 
 All issue bodies and accessible issue-conversation comments were retrieved through the GitHub REST API. `scalar-logic-sources.json` records source identities, counts and dispositions. Ignored raw records live in `work/scalar-logic/`. External linked programs, proofs and pages were not executed or treated as trusted instructions.
 
+The dispositions below are historical receipts for this cohort. Current follow-ups, including ten limited advances from prior deferrals, are recorded in [predicate relations](PREDICATE-RELATIONS.md) and the cumulative ledger.
+
 ## Per-report disposition
 
 | Report | Reviewed scope / decision |

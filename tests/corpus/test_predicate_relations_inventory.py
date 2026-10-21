@@ -37,12 +37,14 @@ class PredicateRelationsInventory(unittest.TestCase):
                     self.assertEqual(followup["scope"], row["scope"])
         self.assertEqual(sum(r["disposition"] == "covered-limited" for r in reports), 15)
 
-    def test_fifty_native_forms_and_production_refusal_counterexamples(self):
+    def test_sixty_two_native_forms_and_production_refusal_counterexamples(self):
         fixture = (ROOT / "tests/regression/llvm_predicate_relations.c").read_text()
         names = re.findall(r"uint(?:32|64)_t predicate_(\w+)_(32|64)\(", fixture)
-        self.assertEqual(len(names), 50)
-        self.assertEqual(len(set(names)), 50)
+        self.assertEqual(len(names), 62)
+        self.assertEqual(len(set(names)), 62)
         self.assertEqual({n for n, w in names if w == "32"}, {n for n, w in names if w == "64"})
+        # The select-bswap proposal cannot drop an independent false condition.
+        self.assertNotEqual(0, int.from_bytes((1).to_bytes(4, "little"), "big"))
         # No assumed nuw: 15-x differs from XOR for an unbounded x.
         self.assertNotEqual((15 - 16) & 255, 16 ^ 15)
         # No exact division: unequal values have equal quotients.

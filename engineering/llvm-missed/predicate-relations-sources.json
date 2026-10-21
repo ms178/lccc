@@ -465,7 +465,7 @@
       "issue_json_sha256": "f6b4fcd49a2657fbcf909569b597bc92e676f5d4abdaa6f5a1d45d451f971c36",
       "comment_count": 4,
       "disposition": "covered-limited",
-      "scope": "Symmetric same-condition scalar selects with the same arm values are handled at commutative and Eq/Ne consumers; arbitrary decision-tree canonicalization is not included."
+      "scope": "A select of two private opposite same-condition scalar selects becomes XOR of canonical predicates and one select; shared choices and noncanonical predicate words refuse."
     },
     {
       "number": 102355,
@@ -1487,7 +1487,7 @@
       "issue_json_sha256": "bc06c040d05c48ee8055ec4f05fb7805e1b2995c74b263568d72559e08ede299",
       "comment_count": 4,
       "disposition": "reviewed-deferred",
-      "scope": "General bitreverse conjugation across arithmetic/counts needs width and overflow-specific identities; the source includes more than the elementary opposite-shift case."
+      "scope": "General bitreverse conjugation through shared bitwise DAGs needs a bounded graph-substitution and sharing-cost proof; matching one opposite shift does not cover the source networks."
     }
   ]
 }

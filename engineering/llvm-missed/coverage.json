@@ -169,7 +169,7 @@
           "cohort": "predicate-relations",
           "previous_status": "reviewed-deferred",
           "status": "reviewed-deferred",
-          "scope": "General bitreverse conjugation across arithmetic/counts needs width and overflow-specific identities; the source includes more than the elementary opposite-shift case.",
+          "scope": "General bitreverse conjugation through shared bitwise DAGs needs a bounded graph-substitution and sharing-cost proof; matching one opposite shift does not cover the source networks.",
           "evidence": [
             "engineering/llvm-missed/PREDICATE-RELATIONS.md",
             "engineering/llvm-missed/predicate-relations-sources.json",
@@ -179,7 +179,7 @@
           ]
         }
       ],
-      "remaining": "General bitreverse conjugation across arithmetic/counts needs width and overflow-specific identities; the source includes more than the elementary opposite-shift case."
+      "remaining": "General bitreverse conjugation through shared bitwise DAGs needs a bounded graph-substitution and sharing-cost proof; matching one opposite shift does not cover the source networks."
     },
     {
       "number": 231586,
@@ -2438,7 +2438,7 @@
       "cohort": "predicate-relations",
       "status": "covered-limited",
       "disposition": "covered-limited",
-      "scope": "Symmetric same-condition scalar selects with the same arm values are handled at commutative and Eq/Ne consumers; arbitrary decision-tree canonicalization is not included.",
+      "scope": "A select of two private opposite same-condition scalar selects becomes XOR of canonical predicates and one select; shared choices and noncanonical predicate words refuse.",
       "evidence": [
         "engineering/llvm-missed/PREDICATE-RELATIONS.md",
         "engineering/llvm-missed/predicate-relations-sources.json",
