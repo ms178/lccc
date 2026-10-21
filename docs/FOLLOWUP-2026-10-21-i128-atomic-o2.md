@@ -45,6 +45,26 @@ about the atomic instruction's memory effects, and reuses a stale value once
 the consumer is inlined and the intermediate results are no longer directly
 observable.
 
+A second, wider program (every op crossed with every legal ordering, hashed)
+splits by lowering strategy, which narrows it further. Against
+`gcc 16.2 -O2 -mcx16` (`hash=11d32f8da1731c3e`):
+
+| config | `-O1` | `-O2` |
+| --- | --- | --- |
+| `-mcx16` (inline `cmpxchg16b`) | match | match |
+| `-march=x86-64-v3` | match | match |
+| `-march=x86-64-v2` | match | match |
+| `-mno-cx16` (libatomic call) | match | **`62a84940b7697ee2`** |
+| default (libatomic call) | match | **`62a84940b7697ee2`** |
+
+Every config agrees with GCC at `-O1`, so the lowering is right for all of
+them; at `-O2` only the two configs whose compare-exchange is a *call* into
+libatomic diverge, while the inline `cmpxchg16b` configs stay correct. Note
+the first reproducer above diverges under `-mcx16` too, so the call form is
+not the only trigger — but that the defect tracks the call form here points
+hard at call-clobber modelling: a pass is not treating the libatomic call as
+clobbering the 16-byte object it mutates through a pointer.
+
 ## Minimal reproducer
 
 ```c
