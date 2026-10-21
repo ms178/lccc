@@ -1,7 +1,9 @@
 # Follow-up: i128 atomic results miscompiled by a `-O2` middle-end pass
 
 Date: 2026-10-21
-Status: open, not fixed here
+Status: **fixed** (2026-10-21, fourth investigation) -- see
+"Resolution" at the end. The three hypotheses below are retained because
+each one is a plausible reading of the evidence and each is wrong.
 Found by: differential runtime testing against GCC 16.2 while validating the
 16-byte atomic lowering.
 
@@ -221,3 +223,81 @@ instead of the expression `k + 1 + (u128)1`. The trigger therefore depends on
 the block/SSA structure the wrapper produces, not on the arithmetic, and it has
 not been isolated further. The failing cell is reproducible with
 `-DW=2 -DN=1` over the reduction source used to produce the table.
+
+## Resolution (2026-10-21, fourth investigation)
+
+Fixed. The cause is in `src/backend/liveness.rs`, not in `global_addr_cse`,
+not in DCE, and not in the 16-byte lowering.
+
+### Reduction
+
+The compare-exchange is not needed. This is the whole trigger, and it is
+wrong at `-O2`/`-O3` while `-O0`/`-O1` are correct (GCC 16.2 returns 0 at
+every level; lccc returned 219):
+
+```c
+typedef unsigned __int128 u128;
+static _Alignas(16) _Atomic u128 v;
+unsigned long long h;
+int main(void) {
+    u128 k = ((u128)0x0123456789ABCDEFULL << 64) | 0xFEDCBA9876543210ULL;
+    __atomic_store_n(&v, k + 1, __ATOMIC_RELAXED);
+    do { u128 t_ = (v);
+         h = h * 1000003ULL + (unsigned long long)t_
+             + (unsigned long long)(t_ >> 64); } while (0);
+    return (int)h;
+}
+```
+
+### Cause
+
+`instruction_is_call_point` decides which IR instructions destroy the
+caller-saved registers, so that `collect_call_spanning_owners` can keep such
+values out of caller-saved homes. It covered i128 division and the `F128`
+helpers -- calls for exactly this reason -- but had **no arm for atomic
+instructions**. On x86-64 a 16-byte atomic load, store or RMW lowers to a
+`__atomic_*_16` libatomic **call**, so the call was invisible to
+`call_points`, `call_spanning` came back empty for values living across it,
+and every caller-saved wave was free to home one in a register the call
+destroys.
+
+`gaddrcse` supplies the value: merging the two materialisations of `v`'s
+address stretches one live range past the atomic. The one-instruction diff
+between the pass being on and off:
+
+```
+gaddrcse off:   movdqu v(%rip), %xmm0     <- RIP-relative, correct
+gaddrcse on:    movdqu (%r11), %xmm0      <- %r11 occurs exactly once in the
+                                             whole .s file, as this operand
+```
+
+Nothing in the function ever wrote `%r11`; the load dereferenced whatever the
+PLT stub left behind. That is a memory-safety bug as well as a wrong value,
+and it explains every earlier observation: why `-O1` was correct, why
+disabling DCE changed nothing, and why the three hypotheses above all failed.
+
+### Fix
+
+`instruction_is_call_point` now returns true for `AtomicRmw`, `AtomicInc`,
+`AtomicCmpxchg`, `AtomicLoad` and `AtomicStore` on `I128`/`U128`. Narrower
+atomics stay excluded: they are inline on every supported target (`lock
+cmpxchg8b` on i386, plain `lock` forms on x86-64) and are not calls. The
+address is now homed in `%rbx`, which survives the call.
+
+### Verification
+
+* The reduction above matches GCC 16.2 at `-O0..-O3`.
+* The original two-block reproducer matches GCC 16.2 (220) at `-O0..-O3`
+  across five ISA configs: default, `-mcx16`, `-march=x86-64-v3`,
+  `-march=x86-64-v2`, `-mno-cx16` -- 20/20.
+* `tests/regression/check_i128_atomic_call_clobber.sh` (gate
+  `i128-atomic-call-clobber`) asserts both halves: structurally that no
+  memory operand in `main` is based on a register `main` never writes, and
+  behaviourally the GCC 16.2 differential above. Reverting only the liveness
+  change makes the gate fail with
+  `main dereferences register(s) it never writes: %r11`, so the gate is
+  verified to catch the defect rather than merely to pass.
+
+`check_atomic16_runtime.sh` can now build its runtime half at `-O2`; that is
+deliberately left alone here, since moving it changes what an existing gate
+covers and belongs in its own change.

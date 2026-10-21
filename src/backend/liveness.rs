@@ -935,6 +935,33 @@ fn instruction_is_call_point(inst: &Instruction) -> bool {
         Instruction::BinOp { ty, .. } if *ty == IrType::F128 => true,
         Instruction::UnaryOp { ty, .. } if *ty == IrType::F128 => true,
         Instruction::Cmp { ty, .. } if *ty == IrType::F128 => true,
+        // 16-byte atomics are not single instructions. On x86-64 the store,
+        // the load and every RMW lower to a `__atomic_*_16` libatomic call;
+        // only the compare-exchange has an inline `cmpxchg16b` form, and even
+        // that needs -mcx16. A libatomic call destroys every caller-saved
+        // register, so the atomic must be a call point for exactly the reason
+        // the i128 division and F128 helpers above are.
+        //
+        // Omitting it is a live miscompile, not a theoretical one. With the
+        // call missing from `call_points`, `collect_call_spanning_owners`
+        // finds nothing spanning it, and every caller-saved wave is then free
+        // to home a value that lives across the atomic in a register the call
+        // clobbers. gaddrcse supplies exactly such a value by merging the two
+        // materialisations of one global's address into a single live range
+        // that reaches past the atomic, and the 16-byte load on the far side
+        // is emitted as `movdqu (%r11),%xmm0` with no instruction in the
+        // function ever writing %r11 -- it dereferences whatever the PLT stub
+        // left behind. Left unmerged the operand stays RIP-relative, needs no
+        // register, and is correct, which is why this only shows at -O2.
+        //
+        // Restricted to 128-bit: every narrower atomic is inline on the
+        // supported targets (`lock cmpxchg8b` on i386, plain `lock` forms on
+        // x86-64), so those are not calls and must not pay for a call point.
+        Instruction::AtomicRmw { ty, .. }
+        | Instruction::AtomicInc { ty, .. }
+        | Instruction::AtomicCmpxchg { ty, .. }
+        | Instruction::AtomicLoad { ty, .. }
+        | Instruction::AtomicStore { ty, .. } => matches!(ty, IrType::I128 | IrType::U128),
         Instruction::Cast { from_ty, to_ty, .. } => {
             let i128_fp = (matches!(from_ty, IrType::I128 | IrType::U128) && to_ty.is_float())
                 || (from_ty.is_float() && matches!(to_ty, IrType::I128 | IrType::U128));

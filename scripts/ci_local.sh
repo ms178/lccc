@@ -200,6 +200,9 @@ gate "cas16-lowering" fast \
     env CCC="$LCCC" bash tests/regression/check_cas16_lowering.sh
 gate "atomic16-runtime" fast \
     env CCC="$LCCC" bash tests/regression/check_atomic16_runtime.sh
+gate "i128-atomic-call-clobber" fast \
+    env CCC="$LCCC" GCC16="${GCC16:-gcc-16}" \
+    bash tests/regression/check_i128_atomic_call_clobber.sh
 gate "fno-builtin-fold-contract" fast \
     env CCC="$LCCC" bash tests/regression/check_fno_builtin_folds.sh
 

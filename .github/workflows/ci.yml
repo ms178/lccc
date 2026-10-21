@@ -524,6 +524,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_cas16_lowering.sh
     - name: Check 16-byte atomic load/store/RMW semantics (full 128 bits, vs GCC oracle)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_atomic16_runtime.sh
+    - name: Check a value live across a 16-byte atomic survives the libatomic call
+      run: env CCC=target/fastbuild/lccc GCC16=gcc-16 bash tests/regression/check_i128_atomic_call_clobber.sh
     - name: Check -fno-builtin constant-fold withdrawal (F1)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_fno_builtin_folds.sh
     - name: Check the recursion-to-iteration pass
