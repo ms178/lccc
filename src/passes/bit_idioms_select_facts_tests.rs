@@ -42,7 +42,7 @@ fn rewrite(source: &[Instruction]) -> Option<Vec<Instruction>> {
     let mut result = None;
     context(source, |cx| {
         result = super::super::relational_guards::fold(source.last().unwrap(), cx)
-            .or_else(|| fold(source.last().unwrap(), cx, &Facts(vec![])))
+            .or_else(|| fold(source.last().unwrap(), cx, &Facts(vec![]), Value(80)))
     });
     result
 }
@@ -438,4 +438,42 @@ fn or_shift_order_requires_an_explicit_count_bound() {
         cmp(5, IrCmpOp::Ult, v(4), v(3), ty),
     ];
     assert!(rewrite(&unbounded).is_none());
+}
+
+#[test]
+fn constant_choice_binops_fold_both_arms_without_cloning_variables() {
+    let ty = IrType::U32;
+    for op in [
+        IrBinOp::Add,
+        IrBinOp::Mul,
+        IrBinOp::And,
+        IrBinOp::Or,
+        IrBinOp::Xor,
+    ] {
+        let source = vec![
+            cmp(3, IrCmpOp::Ne, v(0), constant(0, ty), ty),
+            sel(4, v(3), constant(7, ty), constant(0, ty), ty),
+            bin(Value(5), op, v(4), v(3), ty),
+        ];
+        for x in 0..256 {
+            check(&source, [x, 0, 0]);
+        }
+    }
+}
+
+#[test]
+fn select_of_private_symmetric_selects_uses_canonical_predicate_parity() {
+    let ty = IrType::U32;
+    let source = vec![
+        cmp(3, IrCmpOp::Ne, v(0), constant(0, ty), ty),
+        cmp(4, IrCmpOp::Ne, v(1), constant(0, ty), ty),
+        sel(5, v(3), v(0), v(1), ty),
+        sel(6, v(3), v(1), v(0), ty),
+        sel(7, v(4), v(5), v(6), ty),
+    ];
+    for x in 0..256 {
+        for y in [0, 1, 127, 255, u32::MAX as u64] {
+            check(&source, [x, y, 0]);
+        }
+    }
 }

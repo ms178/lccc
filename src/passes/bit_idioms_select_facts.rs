@@ -156,6 +156,7 @@ pub(super) fn fold(
     inst: &Instruction,
     cx: &Context<'_>,
     facts: &Facts,
+    fresh: Value,
 ) -> Option<Vec<Instruction>> {
     match inst {
         Instruction::Select {
@@ -165,6 +166,29 @@ pub(super) fn fold(
             false_val,
             ty,
         } if scalar(*ty) => {
+            // A select of opposite private selects is a Boolean parity
+            // choice. Normalize both predicates to proven I32 Booleans;
+            // arbitrary nonzero words cannot be XORed as truth values.
+            if let (Some((ca, a, b)), Some((cb, c, d))) =
+                (selected(*true_val, *ty, cx), selected(*false_val, *ty, cx))
+                && relation(ca, cb, cx) == Some(true)
+                && a == d
+                && b == c
+                && matches!(true_val,Operand::Value(v) if cx.uses.get(v.0 as usize)==Some(&1))
+                && matches!(false_val,Operand::Value(v) if cx.uses.get(v.0 as usize)==Some(&1))
+                && let (Some(ca), Some(outer)) = (cx.boolean(ca), cx.boolean(*cond))
+            {
+                return Some(vec![
+                    bin(fresh, IrBinOp::Xor, ca, outer, IrType::I32),
+                    Instruction::Select {
+                        dest: *dest,
+                        cond: Operand::Value(fresh),
+                        true_val: b,
+                        false_val: a,
+                        ty: *ty,
+                    },
+                ]);
+            }
             let mut yes = Facts(facts.0.clone());
             let mut no = Facts(facts.0.clone());
             cx.facts(*cond, true, &mut yes, 8);
@@ -209,6 +233,36 @@ pub(super) fn fold(
                 IrBinOp::Add | IrBinOp::Mul | IrBinOp::And | IrBinOp::Or | IrBinOp::Xor
             ) {
                 return None;
+            }
+            // Fold a binop into a constant-choice select only when BOTH
+            // outcomes are constants. No variable operation is cloned.
+            if let Some((cond, _, _)) = selected(*lhs, *ty, cx).or_else(|| selected(*rhs, *ty, cx))
+            {
+                let outcomes = [true, false].map(|yes| {
+                    let local = Facts(vec![]);
+                    let a = const_in_ring(arm(*lhs, *ty, cond, yes, &local, cx, 8), ty.size() * 8)?;
+                    let b = const_in_ring(arm(*rhs, *ty, cond, yes, &local, cx, 8), ty.size() * 8)?;
+                    Some(match op {
+                        IrBinOp::Add => a.wrapping_add(b),
+                        IrBinOp::Mul => a.wrapping_mul(b),
+                        IrBinOp::And => a & b,
+                        IrBinOp::Or => a | b,
+                        IrBinOp::Xor => a ^ b,
+                        _ => return None,
+                    })
+                });
+                if let [Some(a), Some(b)] = outcomes {
+                    if a == b {
+                        return Some(copy(*dest, constant(a, *ty)));
+                    }
+                    return Some(vec![Instruction::Select {
+                        dest: *dest,
+                        cond,
+                        true_val: constant(a, *ty),
+                        false_val: constant(b, *ty),
+                        ty: *ty,
+                    }]);
+                }
             }
             let (ca, a, b) = selected(*lhs, *ty, cx)?;
             let (cb, c, d) = selected(*rhs, *ty, cx)?;

@@ -25,7 +25,10 @@ class ScalarLogicInventory(unittest.TestCase):
         for row in reports:
             with self.subTest(number=row["number"]):
                 self.assertEqual(row["url"], f'https://github.com/llvm/llvm-project/issues/{row["number"]}')
-                self.assertEqual(index[row["number"]]["review_status"], row["disposition"])
+                current = next(case for case in ledger if case["number"] == row["number"])
+                self.assertEqual(index[row["number"]]["review_status"], current["status"])
+                if current["status"] != row["disposition"]:
+                    self.assertTrue(current.get("followups"), "historical dispositions require an explicit follow-up")
                 self.assertIn(row["disposition"], ("covered-limited", "reviewed-deferred"))
                 self.assertTrue(row["scope"])
                 self.assertGreaterEqual(row["comment_count"], 0)

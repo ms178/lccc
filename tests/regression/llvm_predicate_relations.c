@@ -193,13 +193,13 @@ __attribute__((noinline)) uint32_t reference_single_bit_fact_32(uint32_t x, uint
     unsigned c = z != 0; (void)c; (void)x; (void)y;
     return (x & (uint32_t)1) ? (uint32_t)0 : y;
 }
-__attribute__((noinline)) uint32_t predicate_inverse_nested_mul_32(uint32_t x, uint32_t y, uint32_t z) {
+__attribute__((noinline)) uint32_t predicate_nested_symmetric_32(uint32_t x, uint32_t y, uint32_t z) {
     unsigned c = z != 0; (void)c; (void)x; (void)y;
-    return (c ? x : y) * (!c ? x : y);
+    return c ? (x != 0 ? x : y) : (x != 0 ? y : x);
 }
-__attribute__((noinline)) uint32_t reference_inverse_nested_mul_32(uint32_t x, uint32_t y, uint32_t z) {
+__attribute__((noinline)) uint32_t reference_nested_symmetric_32(uint32_t x, uint32_t y, uint32_t z) {
     unsigned c = z != 0; (void)c; (void)x; (void)y;
-    return x * y;
+    return ((x != 0) ^ c) ? y : x;
 }
 __attribute__((noinline)) uint64_t predicate_nested_same_64(uint64_t x, uint64_t y, uint64_t z) {
     unsigned c = z != 0; (void)c; (void)x; (void)y;
@@ -393,13 +393,13 @@ __attribute__((noinline)) uint64_t reference_single_bit_fact_64(uint64_t x, uint
     unsigned c = z != 0; (void)c; (void)x; (void)y;
     return (x & (uint64_t)1) ? (uint64_t)0 : y;
 }
-__attribute__((noinline)) uint64_t predicate_inverse_nested_mul_64(uint64_t x, uint64_t y, uint64_t z) {
+__attribute__((noinline)) uint64_t predicate_nested_symmetric_64(uint64_t x, uint64_t y, uint64_t z) {
     unsigned c = z != 0; (void)c; (void)x; (void)y;
-    return (c ? x : y) * (!c ? x : y);
+    return c ? (x != 0 ? x : y) : (x != 0 ? y : x);
 }
-__attribute__((noinline)) uint64_t reference_inverse_nested_mul_64(uint64_t x, uint64_t y, uint64_t z) {
+__attribute__((noinline)) uint64_t reference_nested_symmetric_64(uint64_t x, uint64_t y, uint64_t z) {
     unsigned c = z != 0; (void)c; (void)x; (void)y;
-    return x * y;
+    return ((x != 0) ^ c) ? y : x;
 }
 int main(void) {
     uint64_t seed = UINT64_C(0x243f6a8885a308d3), digest = 0;
@@ -456,8 +456,8 @@ int main(void) {
         digest = digest * UINT64_C(0x100000001b3) ^ predicate_range_arm_32(x,y,z);
         if (predicate_single_bit_fact_32(x,y,z) != reference_single_bit_fact_32(x,y,z)) { puts("mismatch: single_bit_fact/32"); return 1; }
         digest = digest * UINT64_C(0x100000001b3) ^ predicate_single_bit_fact_32(x,y,z);
-        if (predicate_inverse_nested_mul_32(x,y,z) != reference_inverse_nested_mul_32(x,y,z)) { puts("mismatch: inverse_nested_mul/32"); return 1; }
-        digest = digest * UINT64_C(0x100000001b3) ^ predicate_inverse_nested_mul_32(x,y,z);
+        if (predicate_nested_symmetric_32(x,y,z) != reference_nested_symmetric_32(x,y,z)) { puts("mismatch: nested_symmetric/32"); return 1; }
+        digest = digest * UINT64_C(0x100000001b3) ^ predicate_nested_symmetric_32(x,y,z);
         if (predicate_nested_same_64(x,y,z) != reference_nested_same_64(x,y,z)) { puts("mismatch: nested_same/64"); return 1; }
         digest = digest * UINT64_C(0x100000001b3) ^ predicate_nested_same_64(x,y,z);
         if (predicate_nested_inverse_64(x,y,z) != reference_nested_inverse_64(x,y,z)) { puts("mismatch: nested_inverse/64"); return 1; }
@@ -506,8 +506,8 @@ int main(void) {
         digest = digest * UINT64_C(0x100000001b3) ^ predicate_range_arm_64(x,y,z);
         if (predicate_single_bit_fact_64(x,y,z) != reference_single_bit_fact_64(x,y,z)) { puts("mismatch: single_bit_fact/64"); return 1; }
         digest = digest * UINT64_C(0x100000001b3) ^ predicate_single_bit_fact_64(x,y,z);
-        if (predicate_inverse_nested_mul_64(x,y,z) != reference_inverse_nested_mul_64(x,y,z)) { puts("mismatch: inverse_nested_mul/64"); return 1; }
-        digest = digest * UINT64_C(0x100000001b3) ^ predicate_inverse_nested_mul_64(x,y,z);
+        if (predicate_nested_symmetric_64(x,y,z) != reference_nested_symmetric_64(x,y,z)) { puts("mismatch: nested_symmetric/64"); return 1; }
+        digest = digest * UINT64_C(0x100000001b3) ^ predicate_nested_symmetric_64(x,y,z);
     }
     printf("%llu\n", (unsigned long long)digest);
     return 0;

@@ -389,7 +389,7 @@ fn fold(
     if let Some(replacement) = relational_guards::fold(inst, cx) {
         return Some(replacement);
     }
-    if let Some(replacement) = select_facts::fold(inst, cx, facts) {
+    if let Some(replacement) = select_facts::fold(inst, cx, facts, fresh) {
         return Some(replacement);
     }
     if let Some(replacement) = logic::fold(inst, cx, fresh) {

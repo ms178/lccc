@@ -2079,7 +2079,7 @@ jobs:
     - name: Run strict Clippy
       env:
         CARGO_BUILD_JOBS: '2'
-      run: python3 scripts/check_clippy_policy.py
+      run: python3 scripts/ci_test_report.py -- python3 scripts/check_clippy_policy.py
   msrv:
     timeout-minutes: 30
     name: MSRV check (declared rust-version floor)
