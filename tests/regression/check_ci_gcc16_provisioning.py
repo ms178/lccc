@@ -76,6 +76,17 @@ def budget(relative):
     return int(value) if value else 0
 
 
+def sources_text():
+    directory = pathlib.Path(os.environ.get('LCCC_CI_APT_SOURCES_DIR') or state)
+    text = []
+    for candidate in sorted(directory.glob('*toolchain-r*test*')):
+        try:
+            text.append(candidate.read_text())
+        except OSError:
+            pass
+    return ''.join(text)
+
+
 def index():
     names = set(distro)
     if path('.ppa-index').exists():
@@ -125,11 +136,14 @@ elif name == 'apt-get':
             sys.exit(100)
         if path('.ppa').exists() and not path('.ppa-index').exists():
             ppa_attempt = bump('.ppa-updates')
-            if ppa_attempt <= budget('PPA_INDEX_FAILURES'):
+            legacy = 'ppa.launchpad.net' in sources_text()
+            primary_down = os.environ.get('PRIMARY_HOST_DOWN') == '1' and not legacy
+            legacy_down = os.environ.get('LEGACY_HOST_DOWN') == '1' and legacy
+            if ppa_attempt <= budget('PPA_INDEX_FAILURES') or primary_down or legacy_down:
                 # Observed on the runner: apt warns, then exits 0.
-                print('W: Failed to fetch https://ppa.launchpadcontent.net/'
-                      'ubuntu-toolchain-r/test/ubuntu/dists/noble/InRelease  '
-                      '503  Service Unavailable')
+                host = 'ppa.launchpad.net' if legacy else 'ppa.launchpadcontent.net'
+                print('W: Failed to fetch https://%s/ubuntu-toolchain-r/test/'
+                      'ubuntu/dists/noble/InRelease  503  Service Unavailable' % host)
                 sys.exit(0)
             path('.ppa-index').touch()
         sys.exit(0)
@@ -154,6 +168,12 @@ elif name == 'apt-get':
         sys.exit(0)
 elif name == 'add-apt-repository':
     path('.ppa').touch()
+    sources = pathlib.Path(os.environ.get('LCCC_CI_APT_SOURCES_DIR') or state)
+    sources.mkdir(parents=True, exist_ok=True)
+    (sources / 'ubuntu-toolchain-r-ubuntu-test-noble.sources').write_text(
+        'Types: deb\n'
+        'URIs: https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu/\n'
+        'Suites: noble\nComponents: main\n')
     print('Adding repository.')
 elif name in ('gcc-16', 'g++-16'):
     installed_now = path('.installed').exists()
@@ -209,6 +229,7 @@ class ProvisioningTests(unittest.TestCase):
                    "LCCC_CI_OS_RELEASE": str(release),
                    "LCCC_CI_GCC_VERSION": "16.2.0",
                    "LCCC_CI_APT_RETRY_DELAY": "0",
+                   "LCCC_CI_APT_SOURCES_DIR": str(directory / "sources.list.d"),
                    "REQUESTED": " ".join(requested),
                    **overrides}
             result = subprocess.run(["bash", str(script), mode],
@@ -294,6 +315,35 @@ class ProvisioningTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.installs(commands)), 1)
         self.assertGreaterEqual(len(self.updates(commands)), 3)
+
+    def test_primary_cdn_outage_falls_back_to_the_legacy_host(self):
+        # 2026-10-21: ppa.launchpadcontent.net answered 503 for every index
+        # path while ppa.launchpad.net kept serving the same signed archive.
+        result, commands, state = self.invoke(PRIMARY_HOST_DOWN="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("retargeted", result.stderr)
+        self.assertIn("ppa.launchpad.net", result.stderr)
+        sources = state.parent / "sources.list.d"
+        written = "".join(item.read_text() for item in sources.glob("*toolchain-r*"))
+        self.assertIn("ppa.launchpad.net", written)
+        self.assertNotIn("ppa.launchpadcontent.net", written)
+        self.assertEqual(len(self.installs(commands)), 1)
+
+    def test_healthy_primary_host_is_not_downgraded(self):
+        result, _, state = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("retargeted", result.stderr)
+        sources = state.parent / "sources.list.d"
+        written = "".join(item.read_text() for item in sources.glob("*toolchain-r*"))
+        self.assertIn("ppa.launchpadcontent.net", written)
+
+    def test_both_ppa_hosts_down_fails_with_host_evidence(self):
+        result, commands, _ = self.invoke(PRIMARY_HOST_DOWN="1", LEGACY_HOST_DOWN="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.installs(commands), [])
+        self.assertIn("retargeted", result.stderr)
+        self.assertIn("ppa.launchpad.net", result.stderr)
+        self.assertIn("not resolvable from the configured repositories", result.stderr)
 
     def test_install_failure_with_resolvable_packages_reports_the_verdict(self):
         result, commands, _ = self.invoke("--multilib", APT_INSTALL_FAIL="1")

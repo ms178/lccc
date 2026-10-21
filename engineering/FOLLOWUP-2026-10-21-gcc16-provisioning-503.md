@@ -100,6 +100,42 @@ Two independent defects produced the confusion:
   single bespoke capture wrapper that only the `frontend` job had. All six
   lanes are now diagnosable from the Checks API.
 
+## Second outage, same day: the CDN edge itself
+
+While the fix above was being verified, `ppa.launchpadcontent.net` stopped
+serving the PPA altogether. Probed from two independent networks:
+
+```
+GET https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu/dists/noble/InRelease
+  -> 503 Service Unavailable   ("No server is available to handle this request.")
+GET https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu/dists/noble/main/binary-amd64/Packages.gz
+  -> 503 Service Unavailable
+GET https://ppa.launchpad.net/ubuntu-toolchain-r/test/ubuntu/dists/noble/InRelease
+  -> 200 OK, valid PGP-signed InRelease for suite noble
+```
+
+No retry policy can recover from that: the host serving the index is down,
+and the runner has no other source of GCC 16 on noble. The helper therefore
+retries the primary host twice (each round is itself three `apt-get update`
+attempts with `Acquire::Retries=3`), and only then retargets the configured
+PPA source to the legacy host, which serves the same archive:
+
+* `retarget_ppa_to_legacy_host` rewrites only files matching
+  `*toolchain-r*test*` in `LCCC_CI_APT_SOURCES_DIR` (default
+  `/etc/apt/sources.list.d`), and only when they actually reference the
+  primary host.
+* The downgrade is announced in the log *and* as a `::error`-titled
+  annotation ("GCC 16 provisioning degraded"), so a legacy-host build is never
+  mistaken for a healthy one.
+* The primary host stays the default: a healthy CDN is never retargeted, and
+  the fallback exists only for "the host is down", not for "the index is
+  slow".
+* Caveat that a reviewer must know: the legacy host can serve an older index
+  (the observed InRelease was generated 2026-03-22). That still satisfies the
+  rolling-major `16.x` policy, but when `LCCC_CI_GCC_VERSION` pins an exact
+  version, the post-install version check rejects a stale toolchain instead of
+  silently accepting it.
+
 ## Regression coverage
 
 `tests/regression/check_ci_gcc16_provisioning.py` models apt instead of
@@ -112,8 +148,13 @@ mocking the script's assumptions:
 * `apt-get install` refuses any package that is not in the modelled index, so
   a script that installs from an unusable index fails the suite.
 
-The previous revision of the script fails 9 of the 19 tests (mutation check);
-the new one passes all 19. `tests/corpus/test_ci_failure_annotations.py` pins
+The stub also models the two PPA hosts: `PRIMARY_HOST_DOWN` refuses every
+index while the source points at the current CDN edge (republishing once the
+source is retargeted), and `LEGACY_HOST_DOWN` refuses the fallback, so the
+"both hosts down" failure path is exercised too.
+
+The previous revision of the script fails 9 of the 19 original tests (mutation
+check); the new one passes all 22. `tests/corpus/test_ci_failure_annotations.py` pins
 the annotation contract: single line, percent-escaped, status preserved, no
 annotation outside Actions, and no lane reintroducing a capture wrapper.
 

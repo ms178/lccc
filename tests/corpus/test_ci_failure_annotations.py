@@ -111,6 +111,8 @@ class FailureAnnotationContracts(unittest.TestCase):
         self.assertIn("%25", annotation)
         self.assertIn("%0A", annotation)
         self.assertNotIn("\r", annotation)
+        # A downgrade that never happened must never be announced.
+        self.assertNotIn("degraded", result.stdout)
 
     def test_no_annotation_outside_github_actions(self):
         result = self.run_provisioning(actions=False)

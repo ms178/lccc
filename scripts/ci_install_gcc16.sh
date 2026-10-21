@@ -167,6 +167,36 @@ ensure_packages_resolvable() {
     return 1
 }
 
+# The Launchpad PPA is served by two hosts. `ppa.launchpadcontent.net` is the
+# current CDN edge; on 2026-10-21 it answered 503 for every index path
+# (InRelease and Packages.gz alike) for hours, which no amount of retrying can
+# fix, while the legacy `ppa.launchpad.net` host kept serving the same signed
+# archive. Retargeting the configured source is therefore the only way to keep
+# the lanes alive during such an outage. It is a *fallback*: it runs only after
+# the primary host has exhausted its retry budget and it announces itself, so
+# nobody mistakes a legacy-host build for a healthy one.
+retarget_ppa_to_legacy_host() {
+    local directory=${LCCC_CI_APT_SOURCES_DIR:-/etc/apt/sources.list.d}
+    local file retargeted=0
+    for file in "$directory"/*toolchain-r*test*.sources \
+                "$directory"/*toolchain-r*test*.list; do
+        [[ -f $file ]] || continue
+        grep -q 'ppa\.launchpadcontent\.net' "$file" 2>/dev/null || continue
+        as_root sed -i 's#ppa\.launchpadcontent\.net#ppa.launchpad.net#g' "$file"
+        retargeted=1
+        echo "ci_install_gcc16: retargeted $file to ppa.launchpad.net (primary CDN unusable)" >&2
+    done
+    if (( retargeted == 0 )); then
+        echo "ci_install_gcc16: no configured PPA source to retarget" >&2
+        return 1
+    fi
+    # Announce only what actually happened: a "degraded" annotation on a run
+    # that never retargeted would be a lie in the check run.
+    annotate "GCC 16 provisioning degraded" \
+        "the primary PPA host was unusable; retargeted the toolchain PPA to ppa.launchpad.net"
+    return 0
+}
+
 configure_ubuntu_ppa() {
     # shellcheck disable=SC1090
     source "${LCCC_CI_OS_RELEASE:-/etc/os-release}"
@@ -267,9 +297,19 @@ if ! toolchain_ready; then
             report_provisioning_failure
             exit 1
         fi
-        if ! ensure_packages_resolvable 3; then
-            report_provisioning_failure
-            exit 1
+        # Two rounds on the primary host, then the legacy host gets the same
+        # budget. Spending the whole budget on a CDN that is down for hours
+        # only makes the failure slower, and switching earlier makes it
+        # impossible to tell a transient hiccup from an outage.
+        if ! ensure_packages_resolvable 2; then
+            if ! retarget_ppa_to_legacy_host; then
+                report_provisioning_failure
+                exit 1
+            fi
+            if ! ensure_packages_resolvable 2; then
+                report_provisioning_failure
+                exit 1
+            fi
         fi
     fi
     if ! install_packages; then
