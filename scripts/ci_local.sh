@@ -329,6 +329,9 @@ gate "benchmark-harness-contracts" fast \
 gate "gcc-provisioning-mocks" fast \
     python3 tests/regression/check_ci_gcc16_provisioning.py
 
+gate "link-oracle-provisioning-mocks" fast \
+    python3 tests/regression/check_ci_link_oracle_provisioning.py
+
 gate "swap-provisioning-mocks" fast \
     python3 tests/regression/check_ci_swap_provisioning.py
 
