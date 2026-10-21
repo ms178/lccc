@@ -8,6 +8,10 @@ instead of trusted:
 
 * interleaved A/B — every measured pair runs serial and heuristic-parallel
   back to back, so a drifting host penalises both arms equally;
+* randomised arm order — the arms of one iteration are shuffled from a seeded
+  RNG. A fixed order biased one arm: the same TU measured 1.021 in a batch and
+  0.871-0.912 alone, minutes apart, purely from frequency drift and page-cache
+  warming. The seed is recorded, so the run stays reproducible;
 * warm-up discarded, median over the samples, percentile-bootstrap interval
   (seeded, so the interval is reproducible);
 * every run's assembly is hashed: the split may not change output by one byte;
@@ -77,6 +81,8 @@ def main():
     )
     parser.add_argument("--source", action="append", help="repeatable; defaults to a mixed set")
     parser.add_argument("--iters", type=int, default=15)
+    parser.add_argument("--seed", type=int, default=20261022,
+                        help="seed for the per-iteration arm shuffle")
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument(
         "--arms", default="serial,auto",
@@ -97,7 +103,8 @@ def main():
         raise ValueError(f"compiler not found: {compiler}")
 
     report = {"compiler": str(compiler), "iters": args.iters, "warmups": args.warmups,
-              "arms": arms, "sources": {}}
+              "arms": arms, "arm_order": "seeded per-iteration shuffle",
+              "seed": args.seed, "sources": {}}
     overall_identity = True
     with tempfile.TemporaryDirectory() as temp:
         out = Path(temp) / "tu.s"
@@ -111,8 +118,16 @@ def main():
             times = {arm: [] for arm in arms}
             digests = set()
             per_arm_telemetry = {}
+            # Randomised arm order per iteration (seeded, so the record is
+            # reproducible). A fixed order lets CPU frequency drift and page
+            # cache warming bias one arm: measuring a single TU gave 1.021 in
+            # a fixed-order batch and 0.871-0.912 alone, a swing far larger
+            # than the effect under test.
+            rng = random.Random(args.seed)
             for _ in range(args.iters):
-                for arm in arms:
+                order = arms[:]
+                rng.shuffle(order)
+                for arm in order:
                     elapsed, digest, pairs = run_once(compiler, source, knobs[arm], out)
                     times[arm].append(elapsed)
                     digests.add(digest)
