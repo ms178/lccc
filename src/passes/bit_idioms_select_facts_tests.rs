@@ -140,10 +140,20 @@ fn check(source: &[Instruction], inputs: [u64; 3]) {
     let replacement = rewrite(source).expect("expected consumer rewrite");
     let mut rewritten = source[..source.len() - 1].to_vec();
     rewritten.extend(replacement);
-    let dest = source.last().unwrap().dest().unwrap().0;
+    let root = source.last().unwrap();
+    let dest = root.dest().unwrap().0;
+    let width = match root {
+        Instruction::Cmp { .. } => 32,
+        Instruction::BinOp { ty, .. } | Instruction::Select { ty, .. } => ty.size() * 8,
+        _ => panic!("unsupported root type"),
+    };
+    // Copy has no explicit type in IR; its destination inherits this root's
+    // carrier. The synthetic parameter slots contain wide boundary overlays,
+    // not pre-truncated ABI values. Observe both results in the actual carrier.
+    let mask = u64::MAX >> (64 - width);
     assert_eq!(
-        eval(source, inputs, dest),
-        eval(&rewritten, inputs, dest),
+        eval(source, inputs, dest) & mask,
+        eval(&rewritten, inputs, dest) & mask,
         "{source:?}, {inputs:?}"
     );
 }
