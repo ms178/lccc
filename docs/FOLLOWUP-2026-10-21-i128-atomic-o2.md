@@ -116,3 +116,44 @@ second gate should assert the reproducer above.
   memory-clobbering for CSE/GVN and for store-to-load forwarding of the
   16-byte slot; the 64-bit widths may be relying on an alias rule that does
   not generalise to a two-slot value.
+
+## Correction (2026-10-21, second investigation)
+
+The "call-clobber modelling for the libatomic call form" reading above is
+**wrong** and should not be trusted. Pass bisection with
+`CCC_DISABLE_PASSES` over all 73 kill switches identified `gaddrcse`
+(`src/passes/global_addr_cse.rs`) as the unique single pass whose removal
+restores the correct answer, and `CCC_NO_GADDR_CSE=1` agrees. But a guard that
+excludes every address reaching a 16-byte atomic from CSE — verified by IR dump
+to leave the four `GlobalAddr "v"` values distinct, exactly as with the pass
+disabled — **does not fix the miscompile**. So the atomic's address is not the
+trigger.
+
+Diffing the final IR with the pass on and off shows what actually still merges:
+the address of the *accumulator*, a plain `unsigned long long h` that the
+arithmetic consumer reads and writes. With `gaddrcse` on, every `GlobalAddr "h"`
+collapses to one value; with it off they stay distinct. Merging a plain
+global's address is what exposes the defect; the 16-byte atomics in the same
+block are what make it wrong.
+
+Ruled out by reading the code, both are default-closed and clear their state on
+every atomic including `AtomicInc`:
+
+* `src/passes/redundant_loads.rs` (lines ~246-260)
+* `src/passes/store_load_forward.rs` (lines ~399-405)
+
+Disabling either of those, or `slforward`, does not restore the answer — it
+turns the wrong value into a **SIGSEGV**, which is a second and independent
+defect, not a fix.
+
+Also measured: plain 64-bit load/store and 64-bit atomics with the same shape
+match GCC 16.2 exactly; only the 128-bit form diverges. Adding a `printf` of
+the intermediate values makes the 128-bit case correct under `gaddrcse`, so the
+bad transformation needs the values to be consumed only by arithmetic.
+
+Next step that follows from this: instrument the passes that key on address
+*value identity* rather than on proven aliasing, and find which one treats two
+accesses to the merged `h` as interchangeable across the intervening 16-byte
+atomic. The candidates that were individually disabled without effect (`gvn`,
+`globaldse`, `dse`, `copyprop`, `simplify`, `constfold`, `licm`, `cvp`, `sccp`)
+should be re-tested in combination, since no single one of them is sufficient.
