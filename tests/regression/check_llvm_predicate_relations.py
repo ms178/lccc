@@ -20,8 +20,8 @@ def main():
     parser.add_argument("--baseline")
     parser.add_argument("--json")
     args = parser.parse_args()
-    if not run([args.gcc, "-dumpfullversion"]).decode().strip().startswith("16."):
-        raise ValueError("GCC 16 oracle required")
+    if not re.fullmatch(r"16\.2(?:\.0)?", run([args.gcc, "-dumpfullversion"]).decode().strip()):
+        raise ValueError("GCC 16.2 oracle required")
     if args.clang and run([args.clang, "-dumpversion"]).decode().strip() != "23.1.3":
         raise ValueError("Clang 23.1.3 oracle required")
     env = os.environ | {"CCC_VERIFY_IR": "abort", "CCC_VERIFY_REGALLOC": "1", "CCC_VALIDATE_SSA": "1"}

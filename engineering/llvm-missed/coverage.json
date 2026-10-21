@@ -118,7 +118,7 @@
     {
       "number": 62514,
       "status": "reviewed-deferred",
-      "scope": "Upstream proposed deletion of arbitrary-condition bswap select is unsound: c=0,x=1 returns zero, not bswap(1)",
+      "scope": "The discussion reports a GCC correctness bug in collapsing a select/bswap shape; zero-handling and demanded-byte proofs are mandatory.",
       "next": "Do not implement that proposal without a proven condition/input relationship. Current batch folds equal observations, not arbitrary selected values.",
       "followups": [
         {
@@ -132,7 +132,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Upstream proposed deletion of arbitrary-condition bswap select is unsound: c=0,x=1 returns zero, not bswap(1)"
         }
       ],
       "remaining": "The discussion reports a GCC correctness bug in collapsing a select/bswap shape; zero-handling and demanded-byte proofs are mandatory."
@@ -140,7 +141,7 @@
     {
       "number": 213877,
       "status": "reviewed-deferred",
-      "scope": "Odd-multiplication zero preimages now supported; the upstream CTTZ nonzero-through-path example is not certified",
+      "scope": "Odd multiplication preserves CTZ/nonzero, but path nonzero facts for arbitrary words and scan legalization remain separate from bitwise known-one inference.",
       "next": "Add exact guarded CTZ/Select fixture and prove defined-zero vs nonzero intrinsic policy before claiming issue coverage.",
       "followups": [
         {
@@ -154,7 +155,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Odd-multiplication zero preimages now supported; the upstream CTTZ nonzero-through-path example is not certified"
         }
       ],
       "remaining": "Odd multiplication preserves CTZ/nonzero, but path nonzero facts for arbitrary words and scan legalization remain separate from bitwise known-one inference."
@@ -162,7 +164,7 @@
     {
       "number": 219334,
       "status": "reviewed-deferred",
-      "scope": "This batch implements related byte-swap conjugations and bit-reverse Eq observations, not all nested bitreverse graphs",
+      "scope": "General bitreverse conjugation through shared bitwise DAGs needs a bounded graph-substitution and sharing-cost proof; matching one opposite shift does not cover the source networks.",
       "next": "Target-specific C/IR reproductions and costed nested-graph reconstruction remain necessary.",
       "followups": [
         {
@@ -176,7 +178,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "This batch implements related byte-swap conjugations and bit-reverse Eq observations, not all nested bitreverse graphs"
         }
       ],
       "remaining": "General bitreverse conjugation through shared bitwise DAGs needs a bounded graph-substitution and sharing-cost proof; matching one opposite shift does not cover the source networks."
@@ -324,7 +327,7 @@
     {
       "number": 1884,
       "status": "reviewed-deferred",
-      "scope": "Historical XMM spill-window/live-range splitting, distinct from the implemented saved-GPR copy fix.",
+      "scope": "Allocator spill placement/register-pressure objective; requires executable reproduction of the old SSE graph and allocator evidence, not scalar identity rewriting.",
       "remaining": "Allocator spill placement/register-pressure objective; requires executable reproduction of the old SSE graph and allocator evidence, not scalar identity rewriting.",
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
@@ -344,14 +347,15 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Historical XMM spill-window/live-range splitting, distinct from the implemented saved-GPR copy fix."
         }
       ]
     },
     {
       "number": 3007,
       "status": "reviewed-deferred",
-      "scope": "Long AddRec/reassociation report reviewed; no generic rematerialization implementation claimed.",
+      "scope": "Loop AddRec strength reduction needs induction-variable legality, overflow and register-pressure costing; attached IL is not a local scalar contract.",
       "remaining": "Loop AddRec strength reduction needs induction-variable legality, overflow and register-pressure costing; attached IL is not a local scalar contract.",
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
@@ -371,14 +375,15 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Long AddRec/reassociation report reviewed; no generic rematerialization implementation claimed."
         }
       ]
     },
     {
       "number": 6509,
       "status": "reviewed-deferred",
-      "scope": "Integer/XMM transfer report; latest upstream form retains a real integer comparison.",
+      "scope": "Cross-register-file value placement is backend/ABI policy; bitcast identities alone do not prove eliminating XMM/GPR moves is profitable.",
       "remaining": "Cross-register-file value placement is backend/ABI policy; bitcast identities alone do not prove eliminating XMM/GPR moves is profitable.",
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
@@ -398,14 +403,15 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Integer/XMM transfer report; latest upstream form retains a real integer comparison."
         }
       ]
     },
     {
       "number": 10156,
       "status": "reviewed-deferred",
-      "scope": "Destructive size-only compare encodings are not a default speed policy.",
+      "scope": "Immediate-compare encoding alternatives require dead-register and exact flags liveness proofs; do not replace comparisons by flag-different INC/DEC globally.",
       "remaining": "Immediate-compare encoding alternatives require dead-register and exact flags liveness proofs; do not replace comparisons by flag-different INC/DEC globally.",
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
@@ -425,7 +431,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Destructive size-only compare encodings are not a default speed policy."
         }
       ]
     },
@@ -446,7 +453,7 @@
     {
       "number": 13134,
       "status": "reviewed-deferred",
-      "scope": "In-place byte-swap loop, distinct from existing load+BSWAP/MOVBE folding.",
+      "scope": "The original C++ byte-swapping loop requires memory/alias and loop recognition; the existing SSA byte network matcher does not close it.",
       "remaining": "The original C++ byte-swapping loop requires memory/alias and loop recognition; the existing SSA byte network matcher does not close it.",
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
@@ -466,14 +473,15 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "In-place byte-swap loop, distinct from existing load+BSWAP/MOVBE folding."
         }
       ]
     },
     {
       "number": 13687,
       "status": "reviewed-deferred",
-      "scope": "Late tail merging reviewed; existing block/epilogue merging not counted again.",
+      "scope": "Machine tail merging is CFG/exception/layout work, not a consumer-local equality; old attached testcase needs a dedicated backend experiment.",
       "remaining": "Machine tail merging is CFG/exception/layout work, not a consumer-local equality; old attached testcase needs a dedicated backend experiment.",
       "evidence": [
         "engineering/llvm-missed/GUARDED-FOLDS.md",
@@ -493,7 +501,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Late tail merging reviewed; existing block/epilogue merging not counted again."
         }
       ]
     },
@@ -538,7 +547,7 @@
     {
       "number": 49562,
       "status": "reviewed-deferred",
-      "scope": "Split population counts remain; wide target-cost/32-bit legality policy is separate.",
+      "scope": "Two narrow popcounts to one wide count is legalization/target-cost work; software POPCNT fallback and cross-width result casts need independent evidence.",
       "cohort": "word-counts",
       "evidence": [
         "engineering/llvm-missed/WORD-COUNTS.md",
@@ -558,7 +567,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Split population counts remain; wide target-cost/32-bit legality policy is separate."
         }
       ],
       "remaining": "Two narrow popcounts to one wide count is legalization/target-cost work; software POPCNT fallback and cross-width result casts need independent evidence."
@@ -566,7 +576,7 @@
     {
       "number": 45243,
       "status": "reviewed-deferred",
-      "scope": "Conditional byte rotate remains a narrowing/select opportunity.",
+      "scope": "Conditional rotate formation trades shared shifts against a rotate and select; existing target recognition is deliberately preserved, not replaced by generic select factoring.",
       "cohort": "word-counts",
       "evidence": [
         "engineering/llvm-missed/WORD-COUNTS.md",
@@ -586,7 +596,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Conditional byte rotate remains a narrowing/select opportunity."
         }
       ],
       "remaining": "Conditional rotate formation trades shared shifts against a rotate and select; existing target recognition is deliberately preserved, not replaced by generic select factoring."
@@ -594,7 +605,7 @@
     {
       "number": 51090,
       "status": "reviewed-deferred",
-      "scope": "Original 32-bit form has no defined shift domain; defined masked 64-bit form remains a cast/count-normalization opportunity.",
+      "scope": "The motivating 32-bit word with 64-y shift counts has no common fully defined C shift domain; do not use poison to infer modular rotate semantics.",
       "cohort": "word-counts",
       "evidence": [
         "engineering/llvm-missed/WORD-COUNTS.md",
@@ -614,7 +625,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Original 32-bit form has no defined shift domain; defined masked 64-bit form remains a cast/count-normalization opportunity."
         }
       ],
       "remaining": "The motivating 32-bit word with 64-y shift counts has no common fully defined C shift domain; do not use poison to infer modular rotate semantics."
@@ -622,7 +634,7 @@
     {
       "number": 150954,
       "status": "reviewed-deferred",
-      "scope": "Narrow bit-length conjugation remains; defined nonzero semantic control added.",
+      "scope": "CLZ XOR31 plus one crosses a narrowing cast and nonzero builtin contract; baseline BSR behavior at zero cannot be assumed defined.",
       "cohort": "word-counts",
       "evidence": [
         "engineering/llvm-missed/WORD-COUNTS.md",
@@ -642,7 +654,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Narrow bit-length conjugation remains; defined nonzero semantic control added."
         }
       ],
       "remaining": "CLZ XOR31 plus one crosses a narrowing cast and nonzero builtin contract; baseline BSR behavior at zero cannot be assumed defined."
@@ -651,7 +664,7 @@
       "number": 35970,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: the motivating cancellation crosses zext, shifts and two widths; opaque leaves intentionally do not move casts through shifts.",
+      "scope": "Mixed-width XOR cancellation requires cast-aware demanded-bit reconstruction; no cast/shift movement is added to this consumer-local change.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -671,7 +684,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: the motivating cancellation crosses zext, shifts and two widths; opaque leaves intentionally do not move casts through shifts."
         }
       ],
       "remaining": "Mixed-width XOR cancellation requires cast-aware demanded-bit reconstruction; no cast/shift movement is added to this consumer-local change."
@@ -680,13 +694,18 @@
       "number": 38139,
       "status": "covered-limited",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: OR-mask equality versus its source needs a range/comparison fold; per-bit synthesis does not reinterpret an integer comparison as bitwise logic.",
+      "scope": "Contiguous high OR-mask and low AND-mask equality against the original operand become a single unsigned bound; sparse masks refuse.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
         "engineering/llvm-missed/scalar-logic-sources.json",
         "tests/regression/llvm_scalar_logic.c",
-        "tests/regression/check_llvm_scalar_logic.py"
+        "tests/regression/check_llvm_scalar_logic.py",
+        "engineering/llvm-missed/PREDICATE-RELATIONS.md",
+        "engineering/llvm-missed/predicate-relations-sources.json",
+        "src/passes/bit_idioms_select_facts_tests.rs",
+        "tests/regression/llvm_predicate_relations.c",
+        "tests/corpus/test_predicate_relations_inventory.py"
       ],
       "followups": [
         {
@@ -700,7 +719,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: OR-mask equality versus its source needs a range/comparison fold; per-bit synthesis does not reinterpret an integer comparison as bitwise logic."
         }
       ],
       "remaining": "Limited to the stated reduced scalar contracts; other motivating target/CFG/metadata shapes are not closed."
@@ -709,7 +729,7 @@
       "number": 38926,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: reuse of a masked value across stores and truncation needs dominance-aware cross-width CSE, not producer-network synthesis.",
+      "scope": "Store/truncation commoning requires cross-width dominance-aware CSE; retain both stores and all observable memory accesses.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -729,7 +749,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: reuse of a masked value across stores and truncation needs dominance-aware cross-width CSE, not producer-network synthesis."
         }
       ],
       "remaining": "Store/truncation commoning requires cross-width dominance-aware CSE; retain both stores and all observable memory accesses."
@@ -738,7 +759,7 @@
       "number": 41333,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: total CLZ after shifting a constant saturates at the width. The discussion distinguishes nonzero, exact and no-wrap variants; no flag is invented.",
+      "scope": "Total CLZ of a shifted power-of-two must saturate at the width; an unconditional affine result is false after the bit shifts out.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -758,7 +779,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: total CLZ after shifting a constant saturates at the width. The discussion distinguishes nonzero, exact and no-wrap variants; no flag is invented."
         }
       ],
       "remaining": "Total CLZ of a shifted power-of-two must saturate at the width; an unconditional affine result is false after the bit shifts out."
@@ -767,7 +789,7 @@
       "number": 41757,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: variable-width conditional sign extension needs bounds on len and a separate sign-extension recognizer; signed C shifts also need defined witnesses.",
+      "scope": "Variable-width sign extension needs len bounds and exact signed shift semantics; len=0 and full-width lengths require separate cases.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -787,7 +809,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: variable-width conditional sign extension needs bounds on len and a separate sign-extension recognizer; signed C shifts also need defined witnesses."
         }
       ],
       "remaining": "Variable-width sign extension needs len bounds and exact signed shift semantics; len=0 and full-width lengths require separate cases."
@@ -796,7 +819,7 @@
       "number": 41801,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: removing a dynamic mask before arithmetic/right shift requires demanded-bit reasoning tied to the same count; shifts remain opaque here.",
+      "scope": "Dynamic mask elimination before a shift must relate its count and demanded bits; arbitrary mask/count independence is insufficient.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -816,7 +839,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: removing a dynamic mask before arithmetic/right shift requires demanded-bit reasoning tied to the same count; shifts remain opaque here."
         }
       ],
       "remaining": "Dynamic mask elimination before a shift must relate its count and demanded bits; arbitrary mask/count independence is insufficient."
@@ -825,7 +849,7 @@
       "number": 41908,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: the six upstream mask/shift forms include truncation and count-sum constraints; no blanket mask removal is admitted.",
+      "scope": "The original six forms include truncation and count-sum constraints; no common blanket mask-elimination rule is valid.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -845,7 +869,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: the six upstream mask/shift forms include truncation and count-sum constraints; no blanket mask removal is admitted."
         }
       ],
       "remaining": "The original six forms include truncation and count-sum constraints; no common blanket mask-elimination rule is valid."
@@ -854,7 +879,7 @@
       "number": 42219,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: multiply/rotate ordering is a pipeline and target-cost issue, not a bitwise-network identity; retain existing rotate recognition.",
+      "scope": "Multiply/rotate scheduling and target multiply-high selection need per-target costing; do not reassociate through truncation without proof.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -874,7 +899,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: multiply/rotate ordering is a pipeline and target-cost issue, not a bitwise-network identity; retain existing rotate recognition."
         }
       ],
       "remaining": "Multiply/rotate scheduling and target multiply-high selection need per-target costing; do not reassociate through truncation without proof."
@@ -896,7 +922,7 @@
       "number": 45478,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: narrowing a Boolean observation to bit zero and CFG range-set folding need distinct observation/control-flow proofs.",
+      "scope": "The source returns a canonical Boolean, whereas ~x is a word mask; converting through CFG/bit-zero demand needs its own observation proof.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -916,7 +942,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: narrowing a Boolean observation to bit zero and CFG range-set folding need distinct observation/control-flow proofs."
         }
       ],
       "remaining": "The source returns a canonical Boolean, whereas ~x is a word mask; converting through CFG/bit-zero demand needs its own observation proof."
@@ -938,7 +965,7 @@
       "number": 46405,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: the motivating short-circuit expression needs CFG/Boolean conversion reasoning; its bitwise analogue is not claimed as closure of the report.",
+      "scope": "Short-circuit Boolean CFG factoring cannot speculate calls or loads. The eager bitwise counterpart is not a whole-report resolution.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -958,7 +985,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: the motivating short-circuit expression needs CFG/Boolean conversion reasoning; its bitwise analogue is not claimed as closure of the report."
         }
       ],
       "remaining": "Short-circuit Boolean CFG factoring cannot speculate calls or loads. The eager bitwise counterpart is not a whole-report resolution."
@@ -967,7 +995,7 @@
       "number": 47868,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: signed max, subtraction and a mask require signed range/select reasoning, including negative inputs; not a pure Boolean identity.",
+      "scope": "Signed max/sub/mask reduction must preserve negative inputs and wrapping boundaries; unsigned modular-remainder recognition alone is insufficient.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -987,7 +1015,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: signed max, subtraction and a mask require signed range/select reasoning, including negative inputs; not a pure Boolean identity."
         }
       ],
       "remaining": "Signed max/sub/mask reduction must preserve negative inputs and wrapping boundaries; unsigned modular-remainder recognition alone is insufficient."
@@ -996,7 +1025,7 @@
       "number": 47946,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: common-destination switch and bitfield-mask simplification require switch-domain reasoning rather than a local bitwise root.",
+      "scope": "Switch-domain/complement case coverage requires CFG successor and bitfield-range reasoning; local select substitution does not rewrite switches.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1016,7 +1045,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: common-destination switch and bitfield-mask simplification require switch-domain reasoning rather than a local bitwise root."
         }
       ],
       "remaining": "Switch-domain/complement case coverage requires CFG successor and bitfield-range reasoning; local select substitution does not rewrite switches."
@@ -1025,13 +1055,18 @@
       "number": 54856,
       "status": "covered-limited",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: combining a power-of-two unsigned bound with a contiguous mask comparison needs range-interval proofs; sparse masks cannot be generalized.",
+      "scope": "Conjunction of x < 2^k and a contiguous top-aligned mask != mask becomes x < mask; sparse, misaligned and missing-bound variants refuse.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
         "engineering/llvm-missed/scalar-logic-sources.json",
         "tests/regression/llvm_scalar_logic.c",
-        "tests/regression/check_llvm_scalar_logic.py"
+        "tests/regression/check_llvm_scalar_logic.py",
+        "engineering/llvm-missed/PREDICATE-RELATIONS.md",
+        "engineering/llvm-missed/predicate-relations-sources.json",
+        "src/passes/bit_idioms_select_facts_tests.rs",
+        "tests/regression/llvm_predicate_relations.c",
+        "tests/corpus/test_predicate_relations_inventory.py"
       ],
       "followups": [
         {
@@ -1045,7 +1080,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: combining a power-of-two unsigned bound with a contiguous mask comparison needs range-interval proofs; sparse masks cannot be generalized."
         }
       ],
       "remaining": "Limited to the stated reduced scalar contracts; other motivating target/CFG/metadata shapes are not closed."
@@ -1054,7 +1090,7 @@
       "number": 55016,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: shifting a negative constant by an offset depends on exact-shift and count bounds. Those LLVM promises are absent from LCCC IR.",
+      "scope": "Offset-shift reassociation requires a no-wrap count bound and exact/signed-shift contracts that are not represented by the current scalar matcher.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1074,7 +1110,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: shifting a negative constant by an offset depends on exact-shift and count bounds. Those LLVM promises are absent from LCCC IR."
         }
       ],
       "remaining": "Offset-shift reassociation requires a no-wrap count bound and exact/signed-shift contracts that are not represented by the current scalar matcher."
@@ -1083,7 +1120,7 @@
       "number": 55468,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: never infer a global range backward from a C shift. The discussion warns that shifts can be speculated and yield LLVM poison.",
+      "scope": "Rejected backward inference from shift poison/undefined behavior: a speculated poison-producing shift is not an unconditional path assumption.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1103,7 +1140,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: never infer a global range backward from a C shift. The discussion warns that shifts can be speculated and yield LLVM poison."
         }
       ],
       "remaining": "Rejected backward inference from shift poison/undefined behavior: a speculated poison-producing shift is not an unconditional path assumption."
@@ -1138,13 +1176,18 @@
       "number": 57666,
       "status": "covered-limited",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: AND of two constant-choice selects observed as zero needs relational reasoning across selects; selects and comparisons stay opaque.",
+      "scope": "Zero observation of AND of identical disjoint nonzero constant-choice selects compares their canonical Boolean predicates; shared producers are retained.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
         "engineering/llvm-missed/scalar-logic-sources.json",
         "tests/regression/llvm_scalar_logic.c",
-        "tests/regression/check_llvm_scalar_logic.py"
+        "tests/regression/check_llvm_scalar_logic.py",
+        "engineering/llvm-missed/PREDICATE-RELATIONS.md",
+        "engineering/llvm-missed/predicate-relations-sources.json",
+        "src/passes/bit_idioms_select_facts_tests.rs",
+        "tests/regression/llvm_predicate_relations.c",
+        "tests/corpus/test_predicate_relations_inventory.py"
       ],
       "followups": [
         {
@@ -1158,7 +1201,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: AND of two constant-choice selects observed as zero needs relational reasoning across selects; selects and comparisons stay opaque."
         }
       ],
       "remaining": "Limited to the stated reduced scalar contracts; other motivating target/CFG/metadata shapes are not closed."
@@ -1180,7 +1224,7 @@
       "number": 58624,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: weakening XOR to OR is not an unconditional Boolean identity; it requires a dominating NAND assumption and relational facts.",
+      "scope": "XOR to OR requires a dominating disjointness/NAND relation; for x=y=1 XOR=0 but OR=1. Known-one bits do not express arbitrary disjointness.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1200,7 +1244,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: weakening XOR to OR is not an unconditional Boolean identity; it requires a dominating NAND assumption and relational facts."
         }
       ],
       "remaining": "XOR to OR requires a dominating disjointness/NAND relation; for x=y=1 XOR=0 but OR=1. Known-one bits do not express arbitrary disjointness."
@@ -1209,7 +1254,7 @@
       "number": 59555,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: NaN-tag range coalescing is integer interval reasoning across two comparisons, not FP arithmetic or a pure bitwise replacement.",
+      "scope": "NaN-tag interval coalescing needs an unsigned interval union solver. Treating tag bits as floating-point values would be unsound.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1229,7 +1274,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: NaN-tag range coalescing is integer interval reasoning across two comparisons, not FP arithmetic or a pure bitwise replacement."
         }
       ],
       "remaining": "NaN-tag interval coalescing needs an unsigned interval union solver. Treating tag bits as floating-point values would be unsound."
@@ -1238,7 +1284,7 @@
       "number": 59773,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: multiply-used sext/not to select depends on Boolean provenance and sharing costs. No cast or select is synthesized here.",
+      "scope": "LLVM sext(i1) is an all-ones mask, unlike LCCC zero/one Boolean casts. A mask-to-select rule needs explicit mask provenance and target costs.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1258,7 +1304,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: multiply-used sext/not to select depends on Boolean provenance and sharing costs. No cast or select is synthesized here."
         }
       ],
       "remaining": "LLVM sext(i1) is an all-ones mask, unlike LCCC zero/one Boolean casts. A mask-to-select rule needs explicit mask provenance and target costs."
@@ -1280,7 +1327,7 @@
       "number": 61671,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: the proposed total CLZ rewrite is invalid at zero, as the discussion corrects. A nonzero precondition must be proved separately.",
+      "scope": "Rejected unconditional CLZ/XOR rewrite at zero. The total count zero result differs from the nonzero contract.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1300,7 +1347,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: the proposed total CLZ rewrite is invalid at zero, as the discussion corrects. A nonzero precondition must be proved separately."
         }
       ],
       "remaining": "Rejected unconditional CLZ/XOR rewrite at zero. The total count zero result differs from the nonzero contract."
@@ -1309,7 +1357,7 @@
       "number": 62898,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: signed min/max sign observations and logical versus bitwise forms require select/CFG correlation. The source also repeats the smin body as smax.",
+      "scope": "Signed min/max sign observations require correlated order predicates; the source repeats the smin body as smax, so its spelling cannot be treated as an independent proof.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1329,7 +1377,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: signed min/max sign observations and logical versus bitwise forms require select/CFG correlation. The source also repeats the smin body as smax."
         }
       ],
       "remaining": "Signed min/max sign observations require correlated order predicates; the source repeats the smin body as smax, so its spelling cannot be treated as an independent proof."
@@ -1338,13 +1387,18 @@
       "number": 63749,
       "status": "covered-limited",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: folding the guarded x+1 bound needs relational carry/unsigned interval reasoning; no no-wrap condition is inferred from a Boolean graph.",
+      "scope": "Explicit x != MAX guard plus wrapping x+1 <=u y becomes x <u y; no unguarded increment reassociation.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
         "engineering/llvm-missed/scalar-logic-sources.json",
         "tests/regression/llvm_scalar_logic.c",
-        "tests/regression/check_llvm_scalar_logic.py"
+        "tests/regression/check_llvm_scalar_logic.py",
+        "engineering/llvm-missed/PREDICATE-RELATIONS.md",
+        "engineering/llvm-missed/predicate-relations-sources.json",
+        "src/passes/bit_idioms_select_facts_tests.rs",
+        "tests/regression/llvm_predicate_relations.c",
+        "tests/corpus/test_predicate_relations_inventory.py"
       ],
       "followups": [
         {
@@ -1358,7 +1412,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: folding the guarded x+1 bound needs relational carry/unsigned interval reasoning; no no-wrap condition is inferred from a Boolean graph."
         }
       ],
       "remaining": "Limited to the stated reduced scalar contracts; other motivating target/CFG/metadata shapes are not closed."
@@ -1367,7 +1422,7 @@
       "number": 63848,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: 64-to-32 shift splitting depends on target shift costs, count ranges and legalization; three-leaf scalar logic does not narrow shifts.",
+      "scope": "Splitting 64-bit variable shifts into 32-bit halves is target legalization and code-size/latency work; quarter-rate target costs are not generic scalar costs.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1387,7 +1442,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: 64-to-32 shift splitting depends on target shift costs, count ranges and legalization; three-leaf scalar logic does not narrow shifts."
         }
       ],
       "remaining": "Splitting 64-bit variable shifts into 32-bit halves is target legalization and code-size/latency work; quarter-rate target costs are not generic scalar costs."
@@ -1396,7 +1452,7 @@
       "number": 64238,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: proving a constant-table load range needs memory/constant-global analysis with a dominating index bound.",
+      "scope": "Constant-global table load bounds require alias-aware memory and index-domain analysis; no load is evaluated or moved here.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1416,7 +1472,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: proving a constant-table load range needs memory/constant-global analysis with a dominating index bound."
         }
       ],
       "remaining": "Constant-global table load bounds require alias-aware memory and index-domain analysis; no load is evaluated or moved here."
@@ -1425,13 +1482,18 @@
       "number": 64859,
       "status": "covered-limited",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: equal-to-one observations of added Boolean extensions require arithmetic Boolean-cardinality reasoning; new bitwise synthesis treats extensions as opaque.",
+      "scope": "Equality-to-one of the sum of two canonical zero/one Boolean extensions becomes XOR; negated/all-ones masks refuse.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
         "engineering/llvm-missed/scalar-logic-sources.json",
         "tests/regression/llvm_scalar_logic.c",
-        "tests/regression/check_llvm_scalar_logic.py"
+        "tests/regression/check_llvm_scalar_logic.py",
+        "engineering/llvm-missed/PREDICATE-RELATIONS.md",
+        "engineering/llvm-missed/predicate-relations-sources.json",
+        "src/passes/bit_idioms_select_facts_tests.rs",
+        "tests/regression/llvm_predicate_relations.c",
+        "tests/corpus/test_predicate_relations_inventory.py"
       ],
       "followups": [
         {
@@ -1445,7 +1507,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: equal-to-one observations of added Boolean extensions require arithmetic Boolean-cardinality reasoning; new bitwise synthesis treats extensions as opaque."
         }
       ],
       "remaining": "Limited to the stated reduced scalar contracts; other motivating target/CFG/metadata shapes are not closed."
@@ -1454,13 +1517,18 @@
       "number": 69333,
       "status": "covered-limited",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: comparing an OR against a logical shift needs cross-operation unsigned bounds. The issue discussion also corrects an initially over-reduced example.",
+      "scope": "Unsigned (x|z) < (x >> count) is false only with an explicitly proved valid count; unknown counts and signed predicates refuse.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
         "engineering/llvm-missed/scalar-logic-sources.json",
         "tests/regression/llvm_scalar_logic.c",
-        "tests/regression/check_llvm_scalar_logic.py"
+        "tests/regression/check_llvm_scalar_logic.py",
+        "engineering/llvm-missed/PREDICATE-RELATIONS.md",
+        "engineering/llvm-missed/predicate-relations-sources.json",
+        "src/passes/bit_idioms_select_facts_tests.rs",
+        "tests/regression/llvm_predicate_relations.c",
+        "tests/corpus/test_predicate_relations_inventory.py"
       ],
       "followups": [
         {
@@ -1474,7 +1542,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: comparing an OR against a logical shift needs cross-operation unsigned bounds. The issue discussion also corrects an initially over-reduced example."
         }
       ],
       "remaining": "Limited to the stated reduced scalar contracts; other motivating target/CFG/metadata shapes are not closed."
@@ -1483,7 +1552,7 @@
       "number": 73417,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: tuple ordering combines sext/zext arithmetic, comparisons and selects; the canonical Boolean comparison must be recovered before any bitwise synthesis.",
+      "scope": "The Rust tuple form relies on sext(i1)=-1 versus zext(i1)=1 and cross-width comparisons; zero/one Boolean cardinality is not a signed-mask solver.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1503,7 +1572,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: tuple ordering combines sext/zext arithmetic, comparisons and selects; the canonical Boolean comparison must be recovered before any bitwise synthesis."
         }
       ],
       "remaining": "The Rust tuple form relies on sext(i1)=-1 versus zext(i1)=1 and cross-width comparisons; zero/one Boolean cardinality is not a signed-mask solver."
@@ -1512,13 +1582,18 @@
       "number": 78038,
       "status": "covered-limited",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: equality of min/max or symmetric selects needs correlated select predicates, widths and signedness. This change does not assume independent selects are min/max.",
+      "scope": "Eq/Ne of symmetric same-condition scalar selects becomes Eq/Ne of their arms; intrinsic min/max and relational min/max predicates are not claimed.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
         "engineering/llvm-missed/scalar-logic-sources.json",
         "tests/regression/llvm_scalar_logic.c",
-        "tests/regression/check_llvm_scalar_logic.py"
+        "tests/regression/check_llvm_scalar_logic.py",
+        "engineering/llvm-missed/PREDICATE-RELATIONS.md",
+        "engineering/llvm-missed/predicate-relations-sources.json",
+        "src/passes/bit_idioms_select_facts_tests.rs",
+        "tests/regression/llvm_predicate_relations.c",
+        "tests/corpus/test_predicate_relations_inventory.py"
       ],
       "followups": [
         {
@@ -1532,7 +1607,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: equality of min/max or symmetric selects needs correlated select predicates, widths and signedness. This change does not assume independent selects are min/max."
         }
       ],
       "remaining": "Limited to the stated reduced scalar contracts; other motivating target/CFG/metadata shapes are not closed."
@@ -1541,7 +1617,7 @@
       "number": 79696,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: precise XOR constant ranges after CLZ need interval analysis beyond the existing known-bit representation.",
+      "scope": "CLZ/XOR value ranges need non-convex interval analysis, not independent per-bit facts. No accidental bounds are inferred from builtin C undefined zero.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1561,7 +1637,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: precise XOR constant ranges after CLZ need interval analysis beyond the existing known-bit representation."
         }
       ],
       "remaining": "CLZ/XOR value ranges need non-convex interval analysis, not independent per-bit facts. No accidental bounds are inferred from builtin C undefined zero."
@@ -1570,7 +1647,7 @@
       "number": 79823,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: narrow software popcount multiplication/mask formulas need per-target size/latency assessment against native POPCNT and the existing fallback.",
+      "scope": "Software narrow popcount multiplication needs a target fallback cost model and exact truncation proof; native POPCNT is not replaced blindly.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1590,7 +1667,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: narrow software popcount multiplication/mask formulas need per-target size/latency assessment against native POPCNT and the existing fallback."
         }
       ],
       "remaining": "Software narrow popcount multiplication needs a target fallback cost model and exact truncation proof; native POPCNT is not replaced blindly."
@@ -1599,7 +1677,7 @@
       "number": 80100,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: sparse-mask count lowering requires target-specific popcount/ctz cost and zero-policy handling; no hardware intrinsic is expanded into multiplication here.",
+      "scope": "Sparse-mask POPCNT/CTZ expansions require target latency and an explicit zero policy; hardware scan instructions are not globally expanded.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1619,7 +1697,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: sparse-mask count lowering requires target-specific popcount/ctz cost and zero-policy handling; no hardware intrinsic is expanded into multiplication here."
         }
       ],
       "remaining": "Sparse-mask POPCNT/CTZ expansions require target latency and an explicit zero policy; hardware scan instructions are not globally expanded."
@@ -1628,7 +1707,7 @@
       "number": 82075,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: nonzero narrow CLZ promotion belongs in target legalization; target-independent logic does not add shifts/casts around scans.",
+      "scope": "Narrow nonzero CLZ promotion is target legalization with load range metadata; this change does not invent metadata on arbitrary narrow loads.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1648,7 +1727,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: nonzero narrow CLZ promotion belongs in target legalization; target-independent logic does not add shifts/casts around scans."
         }
       ],
       "remaining": "Narrow nonzero CLZ promotion is target legalization with load range metadata; this change does not invent metadata on arbitrary narrow loads."
@@ -1670,7 +1750,7 @@
       "number": 84038,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: sign-conditioned logical shifts emulate AShr, but recovering that requires select, signed comparison and shared-count proofs.",
+      "scope": "Recovering AShr from sign-conditioned LShr/NOT requires common-count and signed-predicate correlation, beyond a same-condition leaf substitution.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1690,7 +1770,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: sign-conditioned logical shifts emulate AShr, but recovering that requires select, signed comparison and shared-count proofs."
         }
       ],
       "remaining": "Recovering AShr from sign-conditioned LShr/NOT requires common-count and signed-predicate correlation, beyond a same-condition leaf substitution."
@@ -1699,7 +1780,7 @@
       "number": 84656,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: replacing a scan loop by total CTZ needs loop-exit/PHI/zero-case reasoning; no loop or memory transformations are added.",
+      "scope": "Scan-loop recognition needs PHI/exit/zero-case and count-range proofs; consumer-only rewrites intentionally do not edit loops.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1719,7 +1800,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: replacing a scan loop by total CTZ needs loop-exit/PHI/zero-case reasoning; no loop or memory transformations are added."
         }
       ],
       "remaining": "Scan-loop recognition needs PHI/exit/zero-case and count-range proofs; consumer-only rewrites intentionally do not edit loops."
@@ -1728,7 +1810,7 @@
       "number": 84763,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: low-bit multiply versus CTZ/shift is target-cost sensitive and needs an explicit zero policy. Do not introduce a scan on software-scan targets.",
+      "scope": "Multiply-lowbit versus CTZ/shift is target dependent; y=0 forbids introducing a nonzero scan without an explicit guard.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1748,7 +1830,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: low-bit multiply versus CTZ/shift is target-cost sensitive and needs an explicit zero policy. Do not introduce a scan on software-scan targets."
         }
       ],
       "remaining": "Multiply-lowbit versus CTZ/shift is target dependent; y=0 forbids introducing a nonzero scan without an explicit guard."
@@ -1757,13 +1840,18 @@
       "number": 85823,
       "status": "covered-limited",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: the example needs a relational nonzero-mask fact across a branch/call. No new closure is claimed for the preexisting facts pass.",
+      "scope": "Nonzero observation of a power-of-two masked value supplies the known-one bit to the existing unique-predecessor facts engine; multi-bit masks do not imply individual known ones.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
         "engineering/llvm-missed/scalar-logic-sources.json",
         "tests/regression/llvm_scalar_logic.c",
-        "tests/regression/check_llvm_scalar_logic.py"
+        "tests/regression/check_llvm_scalar_logic.py",
+        "engineering/llvm-missed/PREDICATE-RELATIONS.md",
+        "engineering/llvm-missed/predicate-relations-sources.json",
+        "src/passes/bit_idioms_select_facts_tests.rs",
+        "tests/regression/llvm_predicate_relations.c",
+        "tests/corpus/test_predicate_relations_inventory.py"
       ],
       "followups": [
         {
@@ -1777,7 +1865,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: the example needs a relational nonzero-mask fact across a branch/call. No new closure is claimed for the preexisting facts pass."
         }
       ],
       "remaining": "Limited to the stated reduced scalar contracts; other motivating target/CFG/metadata shapes are not closed."
@@ -1786,7 +1875,7 @@
       "number": 85939,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: cross-width right shifts and casts need a count-range proof for both widths plus sign-extension preservation.",
+      "scope": "Cross-width right-shift comparison needs valid counts for both widths plus extension semantics; sign extension is not zero extension.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1806,7 +1895,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: cross-width right shifts and casts need a count-range proof for both widths plus sign-extension preservation."
         }
       ],
       "remaining": "Cross-width right-shift comparison needs valid counts for both widths plus extension semantics; sign extension is not zero extension."
@@ -1815,13 +1905,18 @@
       "number": 86874,
       "status": "covered-limited",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: 15-x to xor needs x<=15 or LLVM nuw. Generic wrapping subtraction is not the same identity; target instruction-selection costs also matter.",
+      "scope": "Low-contiguous-mask minus x becomes XOR only when existing known bits prove x fits that mask; unbounded x and implicit LLVM nuw refuse.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
         "engineering/llvm-missed/scalar-logic-sources.json",
         "tests/regression/llvm_scalar_logic.c",
-        "tests/regression/check_llvm_scalar_logic.py"
+        "tests/regression/check_llvm_scalar_logic.py",
+        "engineering/llvm-missed/PREDICATE-RELATIONS.md",
+        "engineering/llvm-missed/predicate-relations-sources.json",
+        "src/passes/bit_idioms_select_facts_tests.rs",
+        "tests/regression/llvm_predicate_relations.c",
+        "tests/corpus/test_predicate_relations_inventory.py"
       ],
       "followups": [
         {
@@ -1835,7 +1930,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: 15-x to xor needs x<=15 or LLVM nuw. Generic wrapping subtraction is not the same identity; target instruction-selection costs also matter."
         }
       ],
       "remaining": "Limited to the stated reduced scalar contracts; other motivating target/CFG/metadata shapes are not closed."
@@ -1844,7 +1940,7 @@
       "number": 96455,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: total narrow leading-ones promotion and BSR/LZCNT speculation differ by target and zero policy; preserve the current count lowering.",
+      "scope": "Narrow leading-ones promotion needs baseline BSR/LZCNT legality and zero behavior; preserve current scan selection until target-specific evidence exists.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1864,7 +1960,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: total narrow leading-ones promotion and BSR/LZCNT speculation differ by target and zero policy; preserve the current count lowering."
         }
       ],
       "remaining": "Narrow leading-ones promotion needs baseline BSR/LZCNT legality and zero behavior; preserve current scan selection until target-specific evidence exists."
@@ -1873,7 +1970,7 @@
       "number": 96690,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: Unicode range coalescing through XOR/subtract is not uniformly profitable (discussion identifies AArch64 conditional compare); requires a range cost model.",
+      "scope": "Unicode XOR/sub interval coalescing is target-cost sensitive, including AArch64 conditional compare; no architecture-independent speed claim.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1893,7 +1990,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: Unicode range coalescing through XOR/subtract is not uniformly profitable (discussion identifies AArch64 conditional compare); requires a range cost model."
         }
       ],
       "remaining": "Unicode XOR/sub interval coalescing is target-cost sensitive, including AArch64 conditional compare; no architecture-independent speed claim."
@@ -1902,13 +2000,18 @@
       "number": 98848,
       "status": "covered-limited",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: simplifying the ternary sign observation needs substituting condition facts into select arms, not eager bitwise evaluation of a control-flow graph.",
+      "scope": "Scalar select-arm substitution removes addition of an explicitly zero false-arm value; constant-shift known bits can prove a nonzero top-bit extraction equals one. Computed-goto restructuring is not included.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
         "engineering/llvm-missed/scalar-logic-sources.json",
         "tests/regression/llvm_scalar_logic.c",
-        "tests/regression/check_llvm_scalar_logic.py"
+        "tests/regression/check_llvm_scalar_logic.py",
+        "engineering/llvm-missed/PREDICATE-RELATIONS.md",
+        "engineering/llvm-missed/predicate-relations-sources.json",
+        "src/passes/bit_idioms_select_facts_tests.rs",
+        "tests/regression/llvm_predicate_relations.c",
+        "tests/corpus/test_predicate_relations_inventory.py"
       ],
       "followups": [
         {
@@ -1922,7 +2025,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: simplifying the ternary sign observation needs substituting condition facts into select arms, not eager bitwise evaluation of a control-flow graph."
         }
       ],
       "remaining": "Limited to the stated reduced scalar contracts; other motivating target/CFG/metadata shapes are not closed."
@@ -1931,7 +2035,7 @@
       "number": 102946,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: shift-offset folding must prove the adjusted count cannot wrap or reach the word width; do not assume Zig intCast/LLVM nuw facts exist in LCCC.",
+      "scope": "Pre-shifting a constant requires count+1 to stay below width without wrapping; masked k alone is not sufficient at k=width-1.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1951,7 +2055,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: shift-offset folding must prove the adjusted count cannot wrap or reach the word width; do not assume Zig intCast/LLVM nuw facts exist in LCCC."
         }
       ],
       "remaining": "Pre-shifting a constant requires count+1 to stay below width without wrapping; masked k alone is not sufficient at k=width-1."
@@ -1960,7 +2065,7 @@
       "number": 108559,
       "status": "reviewed-deferred",
       "disposition": "reviewed-deferred",
-      "scope": "Deferred: dropping paired divisions from comparisons requires exactness/divisibility, not just a common divisor. LCCC does not represent the reported exact flag.",
+      "scope": "Exact paired divisions cannot cancel for arbitrary wrapping integers: distinct numerators may have the same quotient. Exactness/divisibility metadata is absent.",
       "cohort": "scalar-logic",
       "evidence": [
         "engineering/llvm-missed/SCALAR-LOGIC.md",
@@ -1980,7 +2085,8 @@
             "src/passes/bit_idioms_select_facts_tests.rs",
             "tests/regression/llvm_predicate_relations.c",
             "tests/corpus/test_predicate_relations_inventory.py"
-          ]
+          ],
+          "previous_scope": "Deferred: dropping paired divisions from comparisons requires exactness/divisibility, not just a common divisor. LCCC does not represent the reported exact flag."
         }
       ],
       "remaining": "Exact paired divisions cannot cancel for arbitrary wrapping integers: distinct numerators may have the same quotient. Exactness/divisibility metadata is absent."
