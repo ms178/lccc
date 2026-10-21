@@ -187,3 +187,37 @@ int main(void) {
     return (int)h;
 }
 ```
+
+## Reduction matrix (2026-10-21, third investigation)
+
+Two further hypotheses were tested and **both disproved**:
+
+* *The merged atomic address.* A guard excluding every address reaching a
+  16-byte atomic from CSE was implemented and confirmed by IR dump to leave the
+  four `GlobalAddr "v"` values distinct — the state the disabled pass produces.
+  The miscompile was unchanged.
+* *Clobbered scratch registers.* The inline `cmpxchg16b` path uses `%rcx` and
+  `%r8` as unconditional scratch and `prepare_atomic_side_effect` only
+  invalidates the register cache, so both were saved and restored around the
+  sequence. The miscompile was unchanged. (Both changes were reverted.)
+
+Reducing the program by which of the three mixed values is consumed, all at
+`-O2 -mcx16` against GCC 16.2:
+
+| mixed value | 1 block | 2 blocks |
+| --- | --- | --- |
+| compare-exchange result | match | match |
+| `expected` after the CAS | match | match |
+| the object `v` itself | **fail** (gcc 1, lccc 219) | **fail** (gcc 69, lccc 30) |
+| all three | match | **fail** (gcc 220, lccc 181) |
+
+So the corrupted value is the one read back out of the 128-bit object, not the
+value the atomic returned and not the value written through `expected`. A
+single block is enough.
+
+Hand-flattening that same code out of its `do { … } while (0)` wrapper makes it
+**pass**, as does writing the CAS's desired operand as the literal `k + 2`
+instead of the expression `k + 1 + (u128)1`. The trigger therefore depends on
+the block/SSA structure the wrapper produces, not on the arithmetic, and it has
+not been isolated further. The failing cell is reproducible with
+`-DW=2 -DN=1` over the reduction source used to produce the table.
