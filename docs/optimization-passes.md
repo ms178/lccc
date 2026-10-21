@@ -116,11 +116,15 @@ passes; the backend peepholes are documented per backend
   pair, which is the only way to observe the split (both modes emit the same
   text). Identical candidates skip the second pass.
 
-  `tests/regression/check_peephole_pair_parallel.py` pins, per backend,
-  assembly identity across the three modes, the kill switch, the single-thread
-  fallback, pair liveness, **and reproducibility** (three compiles, one hash —
-  the RISC-V identical-block pass used to iterate a randomly seeded
-  `HashMap` and emit different labels on every run). `scripts/measure_peephole_pair.py`
+  `tests/regression/check_peephole_pair_parallel.py` pins, per backend and per
+  pair, assembly identity across the three modes, the kill switch, the
+  single-thread fallback, pair liveness, counter accounting
+  (`parallel + serial + deduped` = pairs reported), **and reproducibility**
+  (three compiles, one hash — the RISC-V identical-block pass used to iterate a
+  randomly seeded `HashMap` and emit different labels on every run). It uses a
+  header-free fixture that forces ten explorations per compile, so no cross
+  sysroot is needed and no backend's verdict rests on one lucky pair; x86-64
+  additionally compiles real benchmark TUs and repeats at `-O2`. `scripts/measure_peephole_pair.py`
   regenerates the timings. `CCC_DUMP_ASM` / `CCC_PEEPHOLE_TRACE` suffix their
   files `-chain`/`-orig` so an explored function keeps both candidates instead
   of one overwriting the other.
