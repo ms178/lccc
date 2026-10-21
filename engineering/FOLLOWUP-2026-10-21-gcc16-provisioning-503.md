@@ -136,6 +136,15 @@ PPA source to the legacy host, which serves the same archive:
   version, the post-install version check rejects a stale toolchain instead of
   silently accepting it.
 
+### What CI actually observed
+
+On the first run of this change the primary CDN edge was healthy again:
+`Install GCC 16 and i686 C runtime/development files` completed successfully
+in the `build` lane with **no** degraded-provisioning annotation, i.e. the
+fallback retarget was available but not taken. The outage that motivated it
+lasted hours; the fallback exists for the next one and is covered by the
+model tests rather than by a live outage.
+
 ## Regression coverage
 
 `tests/regression/check_ci_gcc16_provisioning.py` models apt instead of
