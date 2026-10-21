@@ -11,16 +11,16 @@
  * result is discarded, so nothing forces a callee-saved home, and the frame
  * stays at the 16-byte minimum. The gate asserts statically that any function
  * reading s0 also sets it up. */
-extern __thread unsigned long ext_tls;
+extern __thread unsigned long external_tls;
 
 __attribute__((noinline)) void *probe(void) {
-    unsigned long *p = &ext_tls;
+    unsigned long *p = &external_tls;
     __builtin_return_address(0);
     return p;
 }
 
 __attribute__((noinline)) void *frame_probe(void) {
-    unsigned long *p = &ext_tls;
+    unsigned long *p = &external_tls;
     __builtin_frame_address(0);
     return p;
 }

@@ -21,6 +21,27 @@ pub(super) struct PendingWiden {
     pub dest_phys: PhysReg,
 }
 
+/// Policy: does a value's home already hold its own zero-extended 64-bit
+/// image, so that widening it is a plain register copy?
+///
+/// True only when the source is an unsigned (or pointer) integer of at most
+/// 32 bits and the destination is a non-float integer that is neither
+/// narrower nor 128-bit. A 32-bit write clears bits 32..63 on x86-64, which
+/// is exactly why such a value needs no `movzbl`/`movzwl`/`movslq`.
+///
+/// This is the ONE definition of the rule. `try_emit_zext_loaded_cast`
+/// (direct register path) and `emit_int_widen_move` (deferred-widen flush,
+/// comparison/cast kernels) both consult it, so the two emitters cannot
+/// disagree about what "already zero-extended" means.
+fn zext_home_widen_ok(from_ty: IrType, to_ty: IrType) -> bool {
+    !from_ty.is_signed()
+        && !from_ty.is_float()
+        && from_ty.size() <= 4
+        && !to_ty.is_float()
+        && to_ty.size() >= from_ty.size()
+        && !is_i128_type(to_ty)
+}
+
 impl X86Codegen {
     /// Emit an int→float conversion of `src` into `dst`, with the cvtsi2sd
     /// family's FALSE DEPENDENCY ON THE DESTINATION broken and the
@@ -361,6 +382,9 @@ impl X86Codegen {
         if self.try_record_pending_widen(dest, src, from_ty, to_ty) {
             return;
         }
+        if self.try_emit_zext_loaded_cast(dest, src, from_ty, to_ty) {
+            return;
+        }
         // PF-16b: widening casts of Clz/Ctz/Popcount results (bit31
         // provably zero, upper bits zeroed by the 32-bit write itself)
         // take the UNSIGNED path: zero-extension equals the required
@@ -447,6 +471,53 @@ impl X86Codegen {
 
         // Fall through to default implementation for all other cases
         crate::backend::traits::emit_cast_default(self, dest, src, from_ty, to_ty);
+    }
+
+    /// Try to emit an integer widening cast of a value whose home register
+    /// is already known to hold its own zero-extended 64-bit image.
+    ///
+    /// Returns false (caller falls through) whenever the shared policy
+    /// [`zext_home_widen_ok`] refuses, the source or destination is
+    /// XMM-homed, or the source home is stale.
+    fn try_emit_zext_loaded_cast(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        from_ty: IrType,
+        to_ty: IrType,
+    ) -> bool {
+        let Operand::Value(v) = src else { return false };
+        if !self.zext_loaded_values.contains(&v.0) || !zext_home_widen_ok(from_ty, to_ty) {
+            return false;
+        }
+        let (Some(&d_reg), Some(&s_reg)) = (
+            self.reg_assignments.get(&dest.0),
+            self.reg_assignments.get(&v.0),
+        ) else {
+            return false;
+        };
+        if super::emit::is_xmm_reg(d_reg)
+            || super::emit::is_xmm_reg(s_reg)
+            || self.fresh_home_of(v.0) != Some(s_reg)
+        {
+            return false;
+        }
+        if d_reg != s_reg {
+            if to_ty.size() == 8 {
+                let s64 = super::emit::phys_reg_name(s_reg);
+                let d64 = super::emit::phys_reg_name(d_reg);
+                self.state
+                    .emit_fmt(format_args!("    movq %{}, %{}", s64, d64));
+            } else {
+                let s32 = phys_reg_name_32(s_reg);
+                let d32 = phys_reg_name_32(d_reg);
+                self.state
+                    .emit_fmt(format_args!("    movl %{}, %{}", s32, d32));
+            }
+        }
+        self.zext_loaded_values.insert(dest.0);
+        self.note_inplace_compute(d_reg, dest.0);
+        true
     }
 
     /// Try to emit a scalar F64/F32 cast keeping FP values in XMM registers
@@ -586,6 +657,17 @@ impl X86Codegen {
                     _ => {
                         self.operand_to_callee_reg(src, dest_phys);
                     }
+                }
+            } else if zext_home_widen_ok(ft, IrType::U64)
+                && matches!(src, Operand::Value(v) if self.zext_loaded_values.contains(&v.0))
+            {
+                // Widening to a 64-bit home: same policy as the direct cast
+                // path, so the deferred flush cannot emit an extension the
+                // immediate path would have elided (or vice versa).
+                if src_reg != dest_phys {
+                    let src_64 = phys_reg_name(src_reg);
+                    self.state
+                        .emit_fmt(format_args!("    movq %{}, %{}", src_64, dest_64));
                 }
             } else {
                 match ft.size() {
@@ -753,6 +835,12 @@ impl X86Codegen {
         for slot in 0..2 {
             if let Some(p) = self.pending_widen[slot].take() {
                 self.emit_int_widen_move(&p.src, p.from_ty, p.dest_phys);
+                if !p.from_ty.is_signed()
+                    && p.from_ty.size() <= 4
+                    && matches!(p.src, Operand::Value(v) if self.zext_loaded_values.contains(&v.0))
+                {
+                    self.zext_loaded_values.insert(p.dest);
+                }
                 // Definition-writes-home accounting: the deferred widening
                 // move IS the cast dest's definition into its home.
                 self.note_inplace_compute(p.dest_phys, p.dest);
@@ -1311,5 +1399,181 @@ mod widening_home_tests {
                 assert!(out.contains(mnemonic), "home={home}, ty={ty:?}: {out}");
             }
         }
+    }
+}
+
+/// Contract tests for the zero-extended-home widening policy and its two
+/// emitters. The policy is a pure function, so the matrix below is
+/// exhaustive over the decision boundaries: signedness, float domains,
+/// 4-byte source ceiling, narrowing destinations and 128-bit targets.
+#[cfg(test)]
+mod zext_home_policy_tests {
+    use super::*;
+
+    #[test]
+    fn policy_admits_only_unsigned_narrow_to_wide_integer() {
+        // (from, to, expected) — every boundary is represented at least once.
+        let cases: &[(IrType, IrType, bool)] = &[
+            // Admitted: unsigned/pointer source, 1..=4 bytes, widening.
+            (IrType::U8, IrType::U64, true),
+            (IrType::U8, IrType::U32, true),
+            (IrType::U16, IrType::U64, true),
+            (IrType::U16, IrType::I64, true),
+            (IrType::U32, IrType::U64, true),
+            (IrType::U32, IrType::I64, true),
+            (IrType::U32, IrType::Ptr, true),
+            // `IrType::Ptr` is TARGET-sized: a 4-byte pointer source is an
+            // ordinary zero-extending widen on ILP32 and is refused on LP64,
+            // where it is already 8 bytes. Pin the host-relative answer
+            // instead of a number that is only right on one ABI.
+            (IrType::Ptr, IrType::U64, IrType::Ptr.size() <= 4),
+            // Same width: a copy, not an extension — admitted (no extension
+            // instruction is needed either way).
+            (IrType::U32, IrType::U32, true),
+            // Refused: signed sources sign-extend, so bits 8..63 are not
+            // guaranteed zero.
+            (IrType::I8, IrType::U64, false),
+            (IrType::I16, IrType::U64, false),
+            (IrType::I32, IrType::U64, false),
+            // Refused: float domains are not zero-extended integers.
+            (IrType::F32, IrType::U64, false),
+            (IrType::U32, IrType::F32, false),
+            // Refused: wider than 32 bits is not a "32-bit write zeroed it".
+            (IrType::U64, IrType::U64, false),
+            // Refused: narrowing never zero-extends.
+            (IrType::U32, IrType::U16, false),
+            (IrType::U32, IrType::U8, false),
+            // Refused: a 128-bit destination needs a real wide extension.
+            (IrType::U32, IrType::I128, false),
+            (IrType::U32, IrType::U128, false),
+        ];
+        for &(from, to, expected) in cases {
+            assert_eq!(
+                zext_home_widen_ok(from, to),
+                expected,
+                "zext_home_widen_ok({from:?}, {to:?})"
+            );
+        }
+    }
+
+    /// Register homes for the emit tests: a caller-saved GPR pair and one
+    /// XMM home. The NUMBERS come from `PhysReg`'s allocator ids; the test
+    /// derives the expected spelling from `phys_reg_name`, so a change to
+    /// the id-to-name table cannot silently make these tests vacuous.
+    const SRC_REG: PhysReg = PhysReg(14); // %rdi
+    const DST_REG: PhysReg = PhysReg(15); // %rsi
+    const XMM_REG: PhysReg = PhysReg(20); // %xmm2
+
+    /// A value recorded by a 32-bit zero-extending load widens with ONE
+    /// register copy: no movzbl/movzwl/movslq re-extension.
+    fn zext_cg(from: IrType) -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.skip_i32_sext = true;
+        cg.value_types.insert(1, from);
+        cg.state.value_use_counts = vec![1; 10];
+        cg.reg_assignments.insert(1, SRC_REG);
+        cg.reg_assignments.insert(9, DST_REG);
+        cg.zext_loaded_values.insert(1);
+        cg
+    }
+
+    #[test]
+    fn zext_loaded_source_widens_without_an_extension_instruction() {
+        for (from, to) in [
+            (IrType::U8, IrType::U64),
+            (IrType::U16, IrType::U64),
+            (IrType::U32, IrType::U64),
+            (IrType::U32, IrType::I64),
+        ] {
+            let mut cg = zext_cg(from);
+            assert!(
+                cg.try_emit_zext_loaded_cast(&Value(9), &Operand::Value(Value(1)), from, to),
+                "{from:?}->{to:?} must take the plain-copy path"
+            );
+            let out = cg.state.out.buf.clone();
+            let expect = format!(
+                "movq %{}, %{}",
+                phys_reg_name(SRC_REG),
+                phys_reg_name(DST_REG)
+            );
+            assert!(
+                out.contains(&expect),
+                "{from:?}->{to:?} must be a single 64-bit copy ({expect}), got:\n{out}"
+            );
+            for ext in ["movzbl", "movzwl", "movslq"] {
+                assert!(
+                    !out.contains(ext),
+                    "{from:?}->{to:?} must not re-extend ({ext}), got:\n{out}"
+                );
+            }
+            // The destination inherits the property: its home now holds the
+            // same zero-extended image.
+            assert!(cg.zext_loaded_values.contains(&9));
+        }
+    }
+
+    #[test]
+    fn zext_loaded_source_still_extends_when_policy_refuses() {
+        // Signed source: the load's zero-extension is NOT the cast's
+        // semantics, so the plain-copy path must refuse and the caller must
+        // be free to emit movsbq/movswq/movslq.
+        for from in [IrType::I8, IrType::I16, IrType::I32] {
+            let mut cg = zext_cg(from);
+            assert!(
+                !cg.try_emit_zext_loaded_cast(
+                    &Value(9),
+                    &Operand::Value(Value(1)),
+                    from,
+                    IrType::I64
+                ),
+                "{from:?}->I64 must not take the zero-extended copy path"
+            );
+            assert!(
+                cg.state.out.buf.is_empty(),
+                "{from:?} refusal must not emit anything, got:\n{}",
+                cg.state.out.buf
+            );
+            assert!(!cg.zext_loaded_values.contains(&9));
+        }
+        // Untracked value: no proof of zero extension, no shortcut.
+        let mut cg = zext_cg(IrType::U16);
+        cg.zext_loaded_values.clear();
+        assert!(!cg.try_emit_zext_loaded_cast(
+            &Value(9),
+            &Operand::Value(Value(1)),
+            IrType::U16,
+            IrType::U64
+        ));
+        assert!(cg.state.out.buf.is_empty());
+    }
+
+    #[test]
+    fn zext_loaded_source_refuses_xmm_and_stale_homes() {
+        // An XMM-homed source is a bit-punned float word: the GP copy path
+        // must not claim it.
+        let mut cg = zext_cg(IrType::U32);
+        assert!(
+            super::super::emit::is_xmm_reg(XMM_REG),
+            "precondition: a real XMM id"
+        );
+        cg.reg_assignments.insert(1, XMM_REG);
+        assert!(!cg.try_emit_zext_loaded_cast(
+            &Value(9),
+            &Operand::Value(Value(1)),
+            IrType::U32,
+            IrType::U64
+        ));
+        // A clobbered home no longer holds the loaded value.
+        let mut cg = zext_cg(IrType::U32);
+        cg.home_clobbered.insert(1);
+        assert!(
+            !cg.try_emit_zext_loaded_cast(
+                &Value(9),
+                &Operand::Value(Value(1)),
+                IrType::U32,
+                IrType::U64
+            ),
+            "a stale home must fall back to the reload path"
+        );
     }
 }

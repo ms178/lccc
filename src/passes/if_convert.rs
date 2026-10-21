@@ -2845,7 +2845,24 @@ fn detect_triangle(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> 
 
     // Same tuning-model budget as the diamond form above.
     let max_arm_insts: usize = crate::backend::x86::cpu_model::active().if_convert_arm_budget();
-    if arm_block.instructions.len() > max_arm_insts {
+    let arm_insts = if arm_block.instructions.iter().all(|i| {
+        matches!(
+            i,
+            Instruction::Cmp { .. }
+                | Instruction::Select { .. }
+                | Instruction::Cast { .. }
+                | Instruction::Copy { .. }
+        )
+    }) {
+        arm_block
+            .instructions
+            .iter()
+            .filter(|i| matches!(i, Instruction::Cmp { .. }))
+            .count()
+    } else {
+        arm_block.instructions.len()
+    };
+    if arm_insts > max_arm_insts {
         return None;
     }
 

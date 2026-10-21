@@ -89,7 +89,9 @@ fn observe(
         return test;
     }
     *budget -= 1;
-    let all = full(ty).unwrap();
+    let Some(all) = full(ty) else {
+        return test;
+    };
     let width = ty.size() * 8;
     test.value = view(test.value, defs);
     let mut recurse = |value, mask, constant, op| {

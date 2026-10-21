@@ -235,6 +235,85 @@ impl<'a> Bounds<'a> {
                     max: input.max >> n,
                 })
             }
+            Instruction::BinOp {
+                op: IrBinOp::Add,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } => {
+                let width = bits(*ty)?;
+                let lb = self.operand(*lhs, width, depth)?;
+                let rb = self.operand(*rhs, width, depth)?;
+                let sum = lb.max.checked_add(rb.max)?;
+                (sum <= mask(width)).then_some(Bound {
+                    bits: width,
+                    max: sum,
+                })
+            }
+            Instruction::BinOp {
+                op: IrBinOp::Sub,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } => {
+                let width = bits(*ty)?;
+                let c = constant(*lhs, width)?;
+                let rb = self.operand(*rhs, width, depth)?;
+                (rb.max <= c).then_some(Bound {
+                    bits: width,
+                    max: c,
+                })
+            }
+            Instruction::BinOp {
+                op: IrBinOp::URem,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } => {
+                let width = bits(*ty)?;
+                let l = self.operand(*lhs, width, depth).map(|b| b.max);
+                let r = constant(*rhs, width).and_then(|c| c.checked_sub(1));
+                let max = match (l, r) {
+                    (Some(lm), Some(rm)) => lm.min(rm),
+                    (Some(m), None) | (None, Some(m)) => m,
+                    (None, None) => return None,
+                };
+                Some(Bound { bits: width, max })
+            }
+            Instruction::BinOp {
+                op: IrBinOp::UDiv,
+                lhs,
+                rhs,
+                ty,
+                ..
+            } => {
+                let width = bits(*ty)?;
+                let div = constant(*rhs, width).filter(|&c| c > 0)?;
+                let upper = self
+                    .operand(*lhs, width, depth)
+                    .map_or(mask(width), |b| b.max);
+                Some(Bound {
+                    bits: width,
+                    max: upper / div,
+                })
+            }
+            Instruction::Select {
+                true_val,
+                false_val,
+                ty,
+                ..
+            } => {
+                let width = bits(*ty)?;
+                let tb = self.operand(*true_val, width, depth)?;
+                let fb = self.operand(*false_val, width, depth)?;
+                Some(Bound {
+                    bits: width,
+                    max: tb.max.max(fb.max),
+                })
+            }
             _ => None,
         }
     }
@@ -493,6 +572,30 @@ pub(crate) fn switch_bounds(func: &IrFunction) -> FxHashMap<u32, (u32, u64)> {
             && let Some(b) = bounds.value(v, 64)
         {
             result.insert(v.0, (b.bits, b.max));
+        }
+    }
+    result
+}
+
+/// Values proven to lie in `0..=0x7fff_ffff` as 32-bit quantities.
+/// Used by backend `collect_bitop_nonneg_values` so bounded arithmetic
+/// on bit-count builtins (`__builtin_ffs`, `31 - __builtin_clz`, etc.)
+/// does not emit a redundant `movslq %e.., %r..` after 32-bit ops.
+pub(crate) fn nonneg_i32_values(func: &IrFunction) -> FxHashSet<u32> {
+    let mut result = FxHashSet::default();
+    let mut bounds = Bounds::new(func);
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let Some(dest) = inst.dest() else { continue };
+            if bounds.multi.contains(&dest.0) {
+                continue;
+            }
+            if let Some(b) = bounds.value(dest, 64)
+                && b.bits == 32
+                && b.max < (1u64 << 31)
+            {
+                result.insert(dest.0);
+            }
         }
     }
     result
@@ -951,6 +1054,72 @@ mod tests {
                 src: Operand::Value(Value(1)),
                 from_ty: IrType::U64,
                 to_ty: IrType::I64,
+            }
+        ));
+    }
+
+    #[test]
+    fn ffs_add_select_and_clz_sub_promote_sext_and_nonneg_i32() {
+        let mut f = fixture(vec![
+            Instruction::UnaryOp {
+                dest: Value(1),
+                op: IrUnaryOp::CtzNonZero,
+                src: Operand::Value(Value(0)),
+                ty: IrType::U32,
+            },
+            cast(2, 1, IrType::U32, IrType::I32),
+            Instruction::BinOp {
+                dest: Value(3),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Const(IrConst::I32(1)),
+                ty: IrType::I32,
+            },
+            Instruction::Cmp {
+                dest: Value(4),
+                op: crate::ir::reexports::IrCmpOp::Eq,
+                lhs: Operand::Value(Value(0)),
+                rhs: Operand::Const(IrConst::I32(0)),
+                ty: IrType::I32,
+            },
+            Instruction::Select {
+                dest: Value(5),
+                cond: Operand::Value(Value(4)),
+                true_val: Operand::Const(IrConst::I32(0)),
+                false_val: Operand::Value(Value(3)),
+                ty: IrType::I32,
+            },
+            cast(6, 5, IrType::I32, IrType::I64),
+            Instruction::BinOp {
+                dest: Value(7),
+                op: IrBinOp::Sub,
+                lhs: Operand::Const(IrConst::I32(32)),
+                rhs: Operand::Value(Value(2)),
+                ty: IrType::I32,
+            },
+            cast(8, 7, IrType::I32, IrType::I64),
+        ]);
+        let nonneg = nonneg_i32_values(&f);
+        assert!(nonneg.contains(&3));
+        assert!(nonneg.contains(&5));
+        assert!(nonneg.contains(&7));
+        assert!(run(&mut f) >= 2);
+        assert!(matches!(
+            f.blocks[0].instructions[6],
+            Instruction::Cast {
+                dest: Value(6),
+                from_ty: IrType::U32,
+                to_ty: IrType::I64,
+                ..
+            }
+        ));
+        assert!(matches!(
+            f.blocks[0].instructions[8],
+            Instruction::Cast {
+                dest: Value(8),
+                from_ty: IrType::U32,
+                to_ty: IrType::I64,
+                ..
             }
         ));
     }

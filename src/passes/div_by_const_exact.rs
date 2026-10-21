@@ -137,9 +137,30 @@ impl Facts<'_> {
                 _ => 0,
             };
         };
-        let Some(Instruction::BinOp {
+        let Some(inst) = self.defs.get(v.0 as usize).copied().flatten() else {
+            return 0;
+        };
+        match inst {
+            Instruction::UnaryOp {
+                op: crate::ir::ops::IrUnaryOp::Neg,
+                src,
+                ty,
+                ..
+            } if width(*ty) == Some(self.bits) => return self.zeros(*src),
+            Instruction::Select {
+                true_val,
+                false_val,
+                ty,
+                ..
+            } if width(*ty) == Some(self.bits) => {
+                let (tv, fv) = (*true_val, *false_val);
+                return self.zeros(tv).min(self.zeros(fv));
+            }
+            _ => {}
+        }
+        let Instruction::BinOp {
             op, lhs, rhs, ty, ..
-        }) = self.defs.get(v.0 as usize).copied().flatten()
+        } = inst
         else {
             return 0;
         };
@@ -227,7 +248,10 @@ pub(super) fn run(func: &mut IrFunction) -> usize {
             let Some((dest, op, lhs, ty, shift)) = candidate(i) else {
                 continue;
             };
-            facts.bits = width(ty).unwrap();
+            let Some(bits) = width(ty) else {
+                continue;
+            };
+            facts.bits = bits;
             facts.budget = 64;
             if facts.zeros(lhs) < shift {
                 continue;

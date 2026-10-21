@@ -27,12 +27,12 @@ cd "$ROOT"
 #   3. The same-block self-use unit test MUST exist: it is the fixture that
 #      keeps the verifier's strict def<use same-block rule detectable.
 HOOKS=$(grep -c 'verify::verify_after_pass(module,' src/passes/mod.rs || true)
-# 21 = the 19 hooks of the round-cap transplant + `vecssa` (whole-vector
+# 22 = the 19 hooks of the round-cap transplant + `vecssa` (whole-vector
 # alloca promotion: store-to-load forwarding and parameter-load hoisting,
 # i.e. new SSA defs and moved uses) + `vecfma` (packed FMA contraction,
 # which rewrites intrinsic consumers in place and drops the multiply /
-# sign-flip): exactly the def/use shapes the verifier exists for.
-WANT_HOOKS=21
+# sign-flip) + `pair_load_carry`: exactly the def/use shapes the verifier exists for.
+WANT_HOOKS=22
 if [ "$HOOKS" -ne "$WANT_HOOKS" ]; then
     echo "FAIL: $HOOKS verify::verify_after_pass hooks in src/passes/mod.rs, pinned at $WANT_HOOKS." >&2
     echo "      If a pass hook was added/removed on purpose, update WANT_HOOKS in this same change." >&2

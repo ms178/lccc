@@ -749,6 +749,27 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                 continue;
             }
         }
+        // --- Pattern: movl %EAX, %EAX when %rax is already upper-32-zero ---
+        // A U32 -> U64 zero-extension cast whose source and destination share
+        // a register emits `movl %r32, %r32`. When a preceding 32-bit write
+        // already cleared bits 32..63, the self-move is a pure no-op.
+        if t.starts_with("movl ") && !t.contains('(') {
+            if let Some((src, dst)) = split_two_operands(t) {
+                if src == dst && src.starts_with('%') {
+                    if let Some(sf) = family_of_reg(src) {
+                        let sfi = sf as usize;
+                        if sfi < GP_FAMILIES
+                            && upper32_zero[sfi]
+                            && reg32_name(sf) == Some(src.trim_start_matches('%'))
+                        {
+                            keep[i] = false;
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
         // --- Pattern: 64-bit copy of a known zero-extended value ---
         //
         // Register allocation often emits a type-erased `movq %src64, %dst64`

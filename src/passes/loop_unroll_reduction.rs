@@ -144,7 +144,9 @@ pub(super) fn balance(
     }
     dests.reverse();
     inputs.reverse();
-    let t = ty.unwrap();
+    let Some(t) = ty else {
+        return false;
+    };
     let add = |dest, lhs, rhs| Instruction::BinOp {
         dest,
         op: IrBinOp::Add,

@@ -625,7 +625,7 @@ pub fn run_function(func: &mut IrFunction) -> usize {
 ///
 /// The kill switch is the generic `CCC_DISABLE_PASSES=loop_preheader`, which
 /// `pass_disabled` matches as an exact token.  There is deliberately no
-/// dedicated `CCC_NO_LOOP_PREHEADER`: it would be a second name for the same
+/// dedicated `CCC_NO_*_PREHEADER`: it would be a second name for the same
 /// switch, and `tests/regression/check_env_test_hygiene.sh` ratchets the pass
 /// pipeline's environment reads downward (157 call sites, "never raise it"),
 /// so a redundant knob costs a real invariant rather than nothing.

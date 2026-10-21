@@ -212,6 +212,7 @@ pub(crate) fn classify_site_local_indexed(func: &IrFunction) -> FxHashSet<u32> {
                     parent.insert(dest.0, base.0);
                 }
                 Instruction::GetElementPtr {
+                    dest: _,
                     base,
                     offset: Operand::Value(idx),
                     ..

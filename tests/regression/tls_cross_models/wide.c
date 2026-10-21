@@ -12,19 +12,19 @@
  * discipline statically (the address must be parked in a callee-saved register
  * and the function must get a real s0 frame), so the contract holds even where
  * the runtime half has to skip. */
-extern __thread unsigned long ext_tls;
+extern __thread unsigned long external_tls;
 
 __int128 g_a = 0x123456789abcdef0LL;
 __int128 g_b = 3;
 
 __attribute__((noinline)) unsigned long combine(void) {
-    unsigned long *p = &ext_tls; /* dynamic TLS: hidden resolver call */
+    unsigned long *p = &external_tls; /* dynamic TLS: hidden resolver call */
     __int128 q = g_a / g_b;      /* hidden call __divti3: clobbers a0 */
     return (unsigned long)p + (unsigned long)q;
 }
 
 int main(void) {
-    unsigned long *p = &ext_tls;
+    unsigned long *p = &external_tls;
     __int128 q = g_a / g_b;
     if (combine() != (unsigned long)p + (unsigned long)q)
         return 1; /* the resolver's result was clobbered by the wide call */

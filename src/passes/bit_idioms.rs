@@ -2893,7 +2893,9 @@ pub(crate) fn recognize_function(
                     let src = *src;
                     let from_ty = *from_ty;
                     let to_ty = *to_ty;
-                    let narrow = narrow_width_bits(to_ty).unwrap();
+                    let Some(narrow) = narrow_width_bits(to_ty) else {
+                        continue;
+                    };
                     if let Some((value, amount, is_left)) = match_narrow_rotate(src, narrow, &defs)
                     {
                         // Trunc the shared source down to the rotate's own

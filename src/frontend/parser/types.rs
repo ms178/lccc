@@ -1153,6 +1153,11 @@ impl Parser {
                 break;
             }
             let pos_before = self.pos;
+            let (pre_spec_packed, pre_spec_align, _, _, _) = self.parse_gcc_attributes();
+            if let Some(a) = pre_spec_align {
+                self.attrs.parsed_alignas =
+                    Some(self.attrs.parsed_alignas.map_or(a, |prev| prev.max(a)));
+            }
             self.skip_gcc_extensions();
             // Per-field reset: an `address_space(__seg_gs)` attribute parsed
             // for one field must not leak into the next (fields without a
@@ -1196,12 +1201,12 @@ impl Parser {
                         derived: Vec::new(),
                         alignment,
                         alignas_type,
-                        is_packed: false,
+                        is_packed: pre_spec_packed,
                         base_volatile: false,
                         object_volatile: false,
                     });
                 } else {
-                    self.parse_struct_field_declarators(&type_spec, &mut fields);
+                    self.parse_struct_field_declarators(&type_spec, &mut fields, pre_spec_packed);
                 }
                 self.skip_gcc_extensions();
                 self.expect_after(&TokenKind::Semicolon, "after struct field declaration");
@@ -1274,13 +1279,15 @@ impl Parser {
         &mut self,
         type_spec: &TypeSpecifier,
         fields: &mut Vec<StructFieldDecl>,
+        pre_spec_packed: bool,
     ) {
         // Capture _Alignas value that was parsed during type specifier parsing
         let mut alignas_from_type = self.attrs.parsed_alignas.take();
+        let mut packed_from_type = pre_spec_packed;
 
         // Consume post-type qualifiers that may appear between type and declarator
         // in struct field declarations: e.g., "char _Alignas(32) c;"
-        self.consume_struct_field_qualifiers(&mut alignas_from_type);
+        self.consume_struct_field_qualifiers(&mut alignas_from_type, &mut packed_from_type);
         // A type-form `_Alignas` the parser could not size (in either
         // position) is resolved by the layout builders.
         let alignas_type = self.attrs.parsed_alignas_type.take();
@@ -1308,6 +1315,11 @@ impl Parser {
                 // Use parse_assignment_expr to avoid consuming comma as comma-operator.
                 // Bitfield width is a constant expression (no comma operator at top level).
                 let bit_width = Some(Box::new(self.parse_assignment_expr()));
+                let (extra_packed, extra_aligned, _, _, _) = self.parse_gcc_attributes();
+                let alignment = [extra_aligned, alignas_from_type]
+                    .into_iter()
+                    .flatten()
+                    .max();
                 let colon_span = self.peek_span();
                 self.check_struct_field_space(
                     field_addr_space,
@@ -1322,9 +1334,9 @@ impl Parser {
                     name: None,
                     bit_width,
                     derived: Vec::new(),
-                    alignment: alignas_from_type,
+                    alignment,
                     alignas_type: alignas_type.clone(),
-                    is_packed: false,
+                    is_packed: packed_from_type || extra_packed,
                     base_volatile: false,
                     object_volatile: false,
                 });
@@ -1367,7 +1379,7 @@ impl Parser {
                 .into_iter()
                 .flatten()
                 .max();
-            let is_packed = decl_packed || extra_packed;
+            let is_packed = packed_from_type || decl_packed || extra_packed;
 
             // For backward compatibility with downstream code that reads type_spec
             // directly, fold simple derived declarators (pointers, arrays) into
@@ -1414,7 +1426,11 @@ impl Parser {
 
     /// Consume qualifiers that may appear between type specifier and declarator
     /// in struct field declarations. Handles _Alignas, const, volatile, etc.
-    fn consume_struct_field_qualifiers(&mut self, alignas: &mut Option<usize>) {
+    fn consume_struct_field_qualifiers(
+        &mut self,
+        alignas: &mut Option<usize>,
+        is_packed: &mut bool,
+    ) {
         loop {
             match self.peek() {
                 TokenKind::Const
@@ -1438,9 +1454,10 @@ impl Parser {
                     }
                 }
                 TokenKind::Attribute => {
-                    let (_, attr_aligned, _, _, _) = self.parse_gcc_attributes();
-                    if attr_aligned.is_some() {
-                        *alignas = attr_aligned;
+                    let (attr_packed, attr_aligned, _, _, _) = self.parse_gcc_attributes();
+                    *is_packed = *is_packed || attr_packed;
+                    if let Some(a) = attr_aligned {
+                        *alignas = Some(alignas.map_or(a, |prev| prev.max(a)));
                     }
                 }
                 TokenKind::Extension => {

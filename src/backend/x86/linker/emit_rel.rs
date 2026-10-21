@@ -181,7 +181,10 @@ pub fn link_relocatable(objects: &[Elf64Object], output_path: &str) -> Result<()
     // First pass: locals.
     for (oi, obj) in objects.iter().enumerate() {
         let mut remap: FxHashMap<u32, (u32, i64)> = FxHashMap::default();
-        for (yi, sym) in obj.symbols.iter().enumerate() {
+        // ELF symbol index 0 (STN_UNDEF) is the mandatory null entry and maps
+        // to output symbol index 0; never duplicate it per input object.
+        remap.insert(0, (0, 0));
+        for (yi, sym) in obj.symbols.iter().enumerate().skip(1) {
             if !sym.is_local() {
                 continue;
             }
@@ -616,3 +619,84 @@ pub fn link_relocatable(objects: &[Elf64Object], output_path: &str) -> Result<()
 // STB_LOCAL/STB_GLOBAL imported for potential callers; silence unused warnings.
 #[allow(dead_code)]
 const _: (u8, u8) = (STB_LOCAL, STB_GLOBAL);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::linker_common::{
+        Elf64Section, Elf64Symbol, SectionData, parse_elf64_object,
+    };
+
+    #[test]
+    fn relocatable_link_does_not_duplicate_stn_undef_per_input_object() {
+        let make_obj = |sym_name: &str| Elf64Object {
+            sections: vec![
+                Elf64Section {
+                    name_idx: 0,
+                    name: String::new(),
+                    sh_type: SHT_NULL,
+                    flags: 0,
+                    addr: 0,
+                    offset: 0,
+                    size: 0,
+                    link: 0,
+                    info: 0,
+                    addralign: 0,
+                    entsize: 0,
+                },
+                Elf64Section {
+                    name_idx: 1,
+                    name: ".text".into(),
+                    sh_type: SHT_PROGBITS,
+                    flags: 0x6,
+                    addr: 0,
+                    offset: 0,
+                    size: 1,
+                    link: 0,
+                    info: 0,
+                    addralign: 1,
+                    entsize: 0,
+                },
+            ],
+            symbols: vec![
+                Elf64Symbol {
+                    name_idx: 0,
+                    name: String::new().into(),
+                    info: 0,
+                    other: 0,
+                    shndx: SHN_UNDEF,
+                    value: 0,
+                    size: 0,
+                },
+                Elf64Symbol {
+                    name_idx: 1,
+                    name: sym_name.to_string().into(),
+                    info: (STB_GLOBAL << 4) | 2,
+                    other: 0,
+                    shndx: 1,
+                    value: 0,
+                    size: 1,
+                },
+            ],
+            section_data: vec![SectionData::empty(), SectionData::owned(vec![0xc3])],
+            relocations: vec![Vec::new(), Vec::new()],
+            source_name: sym_name.into(),
+        };
+        let objs = vec![make_obj("f1"), make_obj("f2")];
+        let tmp = std::env::temp_dir().join(format!("lccc_lk20_{}.o", std::process::id()));
+        let path = tmp.to_string_lossy().into_owned();
+        link_relocatable(&objs, &path).expect("link_relocatable should succeed");
+        let bytes = std::fs::read(&tmp).expect("read output .o");
+        let _ = std::fs::remove_file(&tmp);
+        let parsed = parse_elf64_object(&bytes, "merged.o", EM_X86_64).expect("parse merged .o");
+        // Only symbol 0 may be a nameless local SHN_UNDEF entry.
+        let undef_locals = parsed
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_local() && s.shndx == SHN_UNDEF && s.name.is_empty())
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        assert_eq!(undef_locals, vec![0]);
+    }
+}

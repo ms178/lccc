@@ -116,7 +116,9 @@ fn demanded(
         return Plan::unchanged(v);
     }
     let width = ty.size() * 8;
-    let all = full(ty).unwrap();
+    let Some(all) = full(ty) else {
+        return Plan::unchanged(v);
+    };
     let Some(inst) = definition(root, defs) else {
         return Plan::unchanged(v);
     };
@@ -330,7 +332,7 @@ fn unary_of(
 fn complements(a: Operand, b: Operand, ty: IrType, defs: &[Option<Instruction>]) -> bool {
     const_in_ring(a, ty.size() * 8)
         .zip(const_in_ring(b, ty.size() * 8))
-        .is_some_and(|(x, y)| x ^ y == full(ty).unwrap())
+        .is_some_and(|(x, y)| full(ty).is_some_and(|f| x ^ y == f))
         || unary_of(a, b, IrUnaryOp::Not, ty, defs)
         || unary_of(b, a, IrUnaryOp::Not, ty, defs)
 }

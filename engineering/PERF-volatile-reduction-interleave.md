@@ -9,7 +9,9 @@ speculates the volatile accesses.
 
 The pass is x86-64-only, at O3, outside size optimization, after vectorization
 and before loop rotation. It respects both `CCC_DISABLE_PASSES=volatile_reduce`
-and `CCC_DISABLE_PASSES=unroll`. No new ISA or per-candidate environment read is
+and `CCC_DISABLE_PASSES=unroll` (plus TU-scoped compatibility controls
+`CCC_VOLATILE_REDUCE_LANES` and `CCC_VOLATILE_REDUCE_BUDGET`, alongside
+`CCC_PEEPHOLE_BUDGET`). No new ISA or per-candidate environment read is
 required. i686, AArch64 and RISC-V are excluded and have explicit nonapplication
 checks.
 

@@ -334,6 +334,7 @@ impl ArmCodegen {
                 self.used_callee_saved.clear();
             }
         }
+        self.rehome_adjacent_global_addr_ptrs(func, &mut reg_assigned);
 
         // Callee-saved FP registers (d8-d14, allocator IDs 32-38) assigned by
         // the FP scan must be preserved by the prologue/epilogue.
@@ -721,6 +722,63 @@ impl ArmCodegen {
             IrType::I32 => "ldrsw",
             IrType::U32 | IrType::F32 | IrType::D32 => "ldr32",
             _ => "ldr64",
+        }
+    }
+
+    fn rehome_adjacent_global_addr_ptrs(
+        &mut self,
+        func: &IrFunction,
+        reg_assigned: &mut crate::common::fx_hash::FxHashMap<
+            u32,
+            crate::backend::regalloc::PhysReg,
+        >,
+    ) {
+        use crate::backend::regalloc::PhysReg;
+        if func.uses_sret || func.is_variadic {
+            return;
+        }
+        let x8 = PhysReg(8);
+        if self.reg_assignments.values().any(|&r| r == x8) {
+            return;
+        }
+        let mut use_counts = crate::common::fx_hash::FxHashMap::<u32, u32>::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                inst.for_each_used_value(|id| *use_counts.entry(id).or_default() += 1);
+            }
+            block
+                .terminator
+                .for_each_used_value(|id| *use_counts.entry(id).or_default() += 1);
+        }
+        for block in &func.blocks {
+            for pair in block.instructions.windows(2) {
+                let Instruction::GlobalAddr { dest, .. } = &pair[0] else {
+                    continue;
+                };
+                if use_counts.get(&dest.0).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                let adjacent_ptr = match &pair[1] {
+                    Instruction::Load { ptr, .. } => ptr.0 == dest.0,
+                    Instruction::Store { val, ptr, .. } => {
+                        ptr.0 == dest.0 && !matches!(val, Operand::Value(v) if v.0 == dest.0)
+                    }
+                    _ => false,
+                };
+                if !adjacent_ptr {
+                    continue;
+                }
+                if let Some(&old) = self.reg_assignments.get(&dest.0)
+                    && (19..=28).contains(&old.0)
+                {
+                    self.reg_assignments.insert(dest.0, x8);
+                    reg_assigned.insert(dest.0, x8);
+                    if !self.reg_assignments.values().any(|&r| r == old) {
+                        self.used_callee_saved.retain(|&r| r != old);
+                    }
+                    break;
+                }
+            }
         }
     }
 }

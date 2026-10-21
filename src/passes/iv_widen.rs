@@ -1441,7 +1441,10 @@ fn analyze_iv(
                             }
                             Operand::Value(ov) => {
                                 let other_admitted = members.iter().any(|m| m.value.0 == ov.0);
-                                if other_admitted || ov.0 == cur.0 {
+                                if other_admitted
+                                    || ov.0 == cur.0
+                                    || (!narrow && *op == IrBinOp::Add)
+                                {
                                     queue.push((*dest, false, cur_exact));
                                     continue;
                                 }
@@ -1966,8 +1969,10 @@ fn analyze_iv(
                         }
                     }
                 }
-                Instruction::GetElementPtr { offset, .. } => {
-                    if matches!(offset, Operand::Value(v) if v.0 == cur.0) {
+                Instruction::GetElementPtr { base, offset, .. } => {
+                    if matches!(offset, Operand::Value(v) if v.0 == cur.0)
+                        || (!narrow && base.0 == cur.0)
+                    {
                         // Exposed-latch intercept: a wide address computed
                         // from a value the narrow program wrapped is a
                         // DIFFERENT address — the IVW-RANGE-1 miscompile
@@ -1980,6 +1985,33 @@ fn analyze_iv(
                         has_addressing = true;
                         continue;
                     }
+                }
+                Instruction::Load { ptr, .. } if !narrow && ptr.0 == cur.0 => {
+                    if intercept && !cur_exact {
+                        return None;
+                    }
+                    has_addressing = true;
+                    continue;
+                }
+                Instruction::Store { val, ptr, .. }
+                    if !narrow
+                        && ptr.0 == cur.0
+                        && !matches!(val, Operand::Value(v) if v.0 == cur.0) =>
+                {
+                    if intercept && !cur_exact {
+                        return None;
+                    }
+                    has_addressing = true;
+                    continue;
+                }
+                Instruction::Store { val, ty, .. }
+                    if !narrow
+                        && (!intercept || cur_exact)
+                        && ty.is_integer()
+                        && ty.size() >= 8
+                        && matches!(val, Operand::Value(v) if v.0 == cur.0) =>
+                {
+                    continue;
                 }
                 Instruction::Intrinsic { .. } => {
                     // An intrinsic index/offset slot is address arithmetic

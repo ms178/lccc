@@ -1695,6 +1695,14 @@ fn find_derived_exprs(
                     if let Some(idx) = find_iv(v.0) {
                         (*dest, *ty, idx, 1i64 << shift, 0)
                     } else if let Some((idx, k)) = find_affine(v.0, *ty) {
+                        // `x << k` and `x * 2^k` are the SAME value shape, so
+                        // the affine arm here must stay identical to the
+                        // Mul-by-constant arm above. Gating it on a
+                        // target-specific compare-recurrence knob silently
+                        // deleted affine-shift recognition on every non-x86
+                        // target (the knob defaults to false and is only
+                        // enabled for x86-64); a value-shape question must
+                        // never be answered by a codegen policy switch.
                         (*dest, *ty, idx, 1i64 << shift, k)
                     } else {
                         continue;

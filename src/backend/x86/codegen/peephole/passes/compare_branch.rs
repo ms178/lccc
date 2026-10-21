@@ -195,7 +195,11 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
 
     let mut i = 0;
     while i < len {
-        if infos[i].kind != LineKind::Cmp || infos[i].pinned {
+        let is_bt = !infos[i].is_nop() && {
+            let t = infos[i].trimmed(store.get(i));
+            t.starts_with("btl ") || t.starts_with("btq ")
+        };
+        if (infos[i].kind != LineKind::Cmp && !is_bt) || infos[i].pinned {
             i += 1;
             continue;
         }
@@ -229,8 +233,8 @@ pub(super) fn fuse_compare_and_branch(store: &mut LineStore, infos: &mut [LineIn
         };
         let set_line = infos[seq_indices[1]].trimmed(store.get(seq_indices[1]));
         let cc = match parse_setcc(set_line) {
-            Some(c) => c,
-            None => {
+            Some(c) if !is_bt || matches!(c, "b" | "c" | "ae" | "nc") => c,
+            _ => {
                 i += 1;
                 continue;
             }
@@ -1281,5 +1285,17 @@ mod flags_horizon_tests {
             out.contains("jl .Lx"),
             "control did not fuse, so the refusal above proves nothing: {out}"
         );
+    }
+
+    #[test]
+    fn fuses_bt_setc_movzbl_test_branch() {
+        let out = run(&f(
+            "    btq %rdi, %rsi\n    setc %dl\n    movzbl %dl, %edx\n    testq %rdx, %rdx\n    jne .Lx\n.Lx:\n    ret",
+        ));
+        assert!(
+            out.contains("jc .Lx"),
+            "btq + setc + movzbl + testq + jne did not fuse: {out}"
+        );
+        assert!(!out.contains("setc"), "setc remained: {out}");
     }
 }

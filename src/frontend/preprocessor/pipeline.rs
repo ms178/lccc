@@ -1309,15 +1309,13 @@ impl Preprocessor {
                 return self.handle_pragma(rest, line_num, col);
             }
             "error" => {
-                // Expand macros in error message
-                let expanded = self
-                    .macros
-                    .expand_line_reuse(rest, &mut self.directive_expanding);
+                // C11 6.10.5p1 / C23 6.10.6p1: preprocessing tokens in #error
+                // are not subject to macro expansion.
                 self.errors.push(PreprocessorDiagnostic {
                     file: self.current_file(),
                     line: line_num,
                     col,
-                    message: format!("#error {}", expanded),
+                    message: format!("#error {}", rest),
                 });
             }
             "warning" => {
@@ -1735,5 +1733,14 @@ mod define_macro_tests {
         pp.define_macro("EXPR", "(2*3)");
         let out = pp.preprocess("int a = FLAG, b = EXPR;\n");
         assert!(out.contains("int a = 1, b = (2*3);"), "got:\n{out}");
+    }
+
+    #[test]
+    fn error_directive_does_not_macro_expand_tokens() {
+        let mut pp = Preprocessor::new();
+        pp.set_filename("err.c");
+        let _ = pp.preprocess("#define FOO expanded_wrongly\n#error FOO must stay literal\n");
+        assert_eq!(pp.errors().len(), 1);
+        assert_eq!(pp.errors()[0].message, "#error FOO must stay literal");
     }
 }

@@ -2192,8 +2192,43 @@ fn retarget_producer_into_copy_impl(
             i += 1;
             continue;
         }
-        // Next real instruction must be the copy.
+        // Next real instruction(s): up to 2 same-width RMWs on `a_fam` when the
+        // producer is a memory load, then the copy.
+        let allow_rmws = prod_src.contains('(') && !op.starts_with("lea");
+        let mut rmws: Vec<(usize, &'static str, String, u8)> = Vec::new();
         let mut j = i + 1;
+        loop {
+            while j < len && debug_transparent(store, infos[j], j) {
+                j += 1;
+            }
+            if !allow_rmws
+                || j >= len
+                || infos[j].pinned
+                || infos[j].is_barrier()
+                || rmws.len() >= 2
+            {
+                break;
+            }
+            let tj = infos[j].trimmed(store.get(j));
+            if has_implicit_reg_usage(tj) {
+                break;
+            }
+            if let Some(rmw_op) = RMW_CONSUMER_OPS.iter().find(|p| tj.starts_with(**p)) {
+                if let Some((r_src, r_dst)) = split_two_operands(&tj[rmw_op.len()..]) {
+                    if plain_gp_operand(r_dst) == Some(a_fam)
+                        && !line_refs_family(r_src, a_fam)
+                        && (!r_src.starts_with('%') || r_src != "%cl")
+                    {
+                        if let Some(rw) = dest_width(r_dst) {
+                            rmws.push((j, *rmw_op, r_src.to_string(), rw));
+                            j += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            break;
+        }
         while j < len && debug_transparent(store, infos[j], j) {
             j += 1;
         }
@@ -2214,11 +2249,6 @@ fn retarget_producer_into_copy_impl(
             i += 1;
             continue;
         };
-        // The copy must read exactly the register the producer wrote. The
-        // NAMES may differ in width (`movzbl …, %eax` followed by
-        // `movq %rax, %r10`): a 32-bit write zero-extends, so the 64-bit read
-        // is the same value. A 64-bit producer under a narrow copy is rejected
-        // by the width rule below.
         if register_family_fast(copy_src) != a_fam || plain_gp_operand(copy_src).is_none() {
             i += 1;
             continue;
@@ -2247,13 +2277,26 @@ fn retarget_producer_into_copy_impl(
             i += 1;
             continue;
         }
-        // The strict form keeps the producer's sources off D (the aliasing
-        // form allows it; see `retarget_producer_into_copy_aliasing`).
-        if (!aliasing && line_refs_family(prod_src, d_fam)) || line_refs_family(copy_dst, a_fam) {
+        if !rmws.iter().all(|(_, _, r_src, rw)| {
+            *rw == prod_w && *rw == copy_w && !line_refs_family(r_src, d_fam)
+        }) {
             i += 1;
             continue;
         }
-        if !provably_dead_lv(&lv, store, infos, j, a_fam, &[i, j]) {
+        // The strict form keeps the producer's sources off D (the aliasing
+        // form allows it; see `retarget_producer_into_copy_aliasing`).
+        if (!aliasing && line_refs_family(prod_src, d_fam))
+            || (!rmws.is_empty() && line_refs_family(prod_src, d_fam))
+            || line_refs_family(copy_dst, a_fam)
+        {
+            i += 1;
+            continue;
+        }
+        let mut owned = vec![i, j];
+        for &(ri, _, _, _) in &rmws {
+            owned.push(ri);
+        }
+        if !provably_dead_lv(&lv, store, infos, j, a_fam, &owned) {
             i += 1;
             continue;
         }
@@ -2268,7 +2311,7 @@ fn retarget_producer_into_copy_impl(
             i += 1;
             continue;
         }
-        if op.trim_end() == "movq" && prod_src == new_dst {
+        if rmws.is_empty() && op.trim_end() == "movq" && prod_src == new_dst {
             // `movq %rax, %rdx; movq %rdx, %rax`: the pair is the identity.
             mark_nop(&mut infos[i]);
             mark_nop(&mut infos[j]);
@@ -2278,6 +2321,19 @@ fn retarget_producer_into_copy_impl(
             continue;
         }
         replace_line(store, &mut infos[i], i, new_line);
+        for &(ri, rmw_op, ref r_src, rw) in &rmws {
+            let r_dst = if rw == 64 {
+                REG_NAMES[0][d_fam as usize]
+            } else {
+                REG_NAMES[1][d_fam as usize]
+            };
+            replace_line(
+                store,
+                &mut infos[ri],
+                ri,
+                format!("    {}{}, {}", rmw_op, r_src, r_dst),
+            );
+        }
         mark_nop(&mut infos[j]);
         lv.refresh_span(store, infos, i, j);
         changed = true;
@@ -3384,7 +3440,12 @@ fn s_write_proves_upper_zero(t: &str, fam: RegId) -> bool {
 /// uniform stops (calls even for callee-saved S, implicit lines even for
 /// other families) are deliberate: the foregone shapes are unmeasured and
 /// the audit stays obviously sound.
-fn upper32_zero_at(store: &LineStore, infos: &[LineInfo], li: usize, s_fam: RegId) -> bool {
+pub(super) fn upper32_zero_at(
+    store: &LineStore,
+    infos: &[LineInfo],
+    li: usize,
+    s_fam: RegId,
+) -> bool {
     if li == 0 {
         return false;
     }
@@ -7120,5 +7181,95 @@ mod tests {
                 "stable-symbol positive control: {displacement}"
             );
         }
+    }
+}
+
+/// Tests for the read-modify-write window of `retarget_producer_into_copy`.
+///
+/// The pass is driven DIRECTLY rather than through `peephole_optimize`:
+/// the full pipeline relays the copy into its use before this phase runs,
+/// so a pipeline-level fixture can never reach the RMW window and would
+/// pass by observing a different transformation entirely.
+///
+/// `mark_nop` only sets line METADATA (`LineKind::Nop`); the peephole driver
+/// blanks the text afterwards. A direct-call test must therefore compare the
+/// program built from non-NOP lines, not the raw store text — otherwise a
+/// removed copy still reads like a live instruction.
+#[cfg(test)]
+mod rmw_window_tests {
+    /// Run the pass alone over `body`; return the emitted program (every
+    /// non-NOP line, trimmed) and whether any line was removed.
+    fn run(body: &str) -> (Vec<String>, usize) {
+        let asm = format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
+        let mut store = super::LineStore::new(asm);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| super::classify_line(store.get(i)))
+            .collect();
+        super::retarget_producer_into_copy(&mut store, &mut infos);
+        let emitted = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>();
+        let removed = (0..store.len()).filter(|&i| infos[i].is_nop()).count();
+        (emitted, removed)
+    }
+
+    #[test]
+    fn same_width_rmw_chain_retargets_the_producer_and_the_rmw() {
+        // `%r9`/`%r10`, not `%rax`: `ret` implicitly reads the return
+        // register, so an `%eax` producer is never provably dead after the
+        // copy and the fold is (correctly) refused -- such a fixture would
+        // test nothing.
+        let (emitted, removed) = run(concat!(
+            "    movl (%rdi), %r9d\n",
+            "    addl $1, %r9d\n",
+            "    movl %r9d, %r10d\n",
+            "    movl %r10d, (%rsi)\n",
+            "    ret",
+        ));
+        assert_eq!(
+            emitted,
+            vec![
+                ".text",
+                "f:",
+                ".cfi_startproc",
+                "movl (%rdi), %r10d",
+                "addl $1, %r10d",
+                "movl %r10d, (%rsi)",
+                "ret",
+                ".cfi_endproc",
+            ],
+            "the producer and its RMW must move to the copy destination and the copy must go"
+        );
+        assert_eq!(removed, 1, "exactly the copy must be removed");
+    }
+
+    #[test]
+    fn mismatched_rmw_width_refuses_the_fold() {
+        // Identical to the positive control except for the RMW suffix: the
+        // width rule must be the ONLY difference between accept and refuse.
+        let (emitted, removed) = run(concat!(
+            "    movl (%rdi), %r9d\n",
+            "    addq $2, %r9\n",
+            "    movl %r9d, %r10d\n",
+            "    movl %r10d, (%rsi)\n",
+            "    ret",
+        ));
+        assert_eq!(
+            emitted,
+            vec![
+                ".text",
+                "f:",
+                ".cfi_startproc",
+                "movl (%rdi), %r9d",
+                "addq $2, %r9",
+                "movl %r9d, %r10d",
+                "movl %r10d, (%rsi)",
+                "ret",
+                ".cfi_endproc",
+            ],
+            "a width-mismatched RMW chain must leave every line in place"
+        );
+        assert_eq!(removed, 0, "nothing may be removed when the rule refuses");
     }
 }

@@ -69,10 +69,33 @@ if sed -n '/^external_address:/,/^\.size external_address/p' "$TD/riscv64-ie.s" 
 fi
 grep -q 'call __tls_get_addr' "$TD/riscv64-dyn.s" || bad 'RISC-V GD resolver call missing'
 grep -q 'sd ra,' "$TD/riscv64-dyn.s" || bad 'RISC-V hidden TLS call failed to save ra'
+# Extract one function body. A NEGATIVE assertion over an empty extract passes
+# vacuously — a renamed or dropped symbol would silently retire the check — so
+# an empty extract is itself a failure.
+extract_fn() {
+    file=$1 symbol=$2 out=$3
+    sed -n "/^$symbol:/,/^\.size $symbol/p" "$file" >"$out"
+    [ -s "$out" ] || bad "missing function body for $symbol (the shape checks below would pass vacuously)"
+}
 rv_dyn_addr="$TD/riscv64-dyn-address.s"
-sed -n '/^external_address:/,/^\.size external_address/p' "$TD/riscv64-dyn.s" >"$rv_dyn_addr"
+extract_fn "$TD/riscv64-dyn.s" external_address "$rv_dyn_addr"
 if grep -Eq '\b(sd|ld) s0,|addi s0,' "$rv_dyn_addr"; then
     bad 'RISC-V one-resolver address path regressed to an unnecessary frame pointer'
+fi
+rv_dyn_load="$TD/riscv64-dyn-load.s"
+extract_fn "$TD/riscv64-dyn.s" external_load "$rv_dyn_load"
+if grep -Eq '\b(sd|ld) s[0-9]+,|addi s0,' "$rv_dyn_load"; then
+    bad 'RISC-V one-resolver load path regressed to an unnecessary frame pointer or callee-saved spill'
+fi
+arm_dyn_load="$TD/aarch64-dyn-load.s"
+extract_fn "$TD/aarch64-dyn.s" external_load "$arm_dyn_load"
+if grep -Eq '\b(str|ldr|stp|ldp) x19' "$arm_dyn_load"; then
+    bad 'AArch64 one-resolver load path saved an unused callee-saved register'
+fi
+arm_dyn_store="$TD/aarch64-dyn-store.s"
+extract_fn "$TD/aarch64-dyn.s" external_store "$arm_dyn_store"
+if grep -Eq '\bx20\b' "$arm_dyn_store"; then
+    bad 'AArch64 one-resolver store path saved an unused second callee-saved register'
 fi
 
 # --- Static register discipline: linker-free, so it always runs --------------

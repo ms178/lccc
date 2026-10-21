@@ -109,19 +109,20 @@ struct Member {
 fn norm_const(c: &IrConst, ty: IrType) -> Option<i64> {
     let raw = c.to_i64()?;
     Some(match ty {
-        IrType::U8 => raw as u8 as i64,
-        IrType::U16 => raw as u16 as i64,
+        IrType::I8 | IrType::U8 => raw as u8 as i64,
+        IrType::I16 | IrType::U16 => raw as u16 as i64,
         IrType::U32 => raw as u32 as i64,
         IrType::I32 => raw as i32 as i64,
         _ => return None,
     })
 }
 
-/// Root types the fold understands: unsigned narrow (zero-extension domain)
-/// or 32-bit. Signed narrow roots are excluded — their widening cast
-/// sign-extends and the rebase arithmetic would disagree with `norm_const`.
+/// Root types the fold understands: narrow (zero-extension domain) or 32-bit.
 fn root_ty_ok(ty: IrType) -> bool {
-    matches!(ty, IrType::U8 | IrType::U16 | IrType::I32 | IrType::U32)
+    matches!(
+        ty,
+        IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+    )
 }
 
 /// Shape check: does `insts` form a complete test (single Cmp, or the
@@ -252,7 +253,16 @@ fn parse_member(
         }
         start
     } else {
-        0
+        // range_fold runs immediately before set_membership in iter=0 and may
+        // leave dead leading Cmp instructions before its Sub+Cmp(Ule) rewrite.
+        let mut start = 0;
+        while start < insts.len() && matches!(insts[start], Instruction::Cmp { .. }) {
+            if suffix_parses(&insts[start..]) {
+                break;
+            }
+            start += 1;
+        }
+        start
     };
     let prelude_len = if is_head { suffix_start } else { 0 };
     let insts = &insts[suffix_start..];
@@ -318,9 +328,7 @@ fn parse_member(
         to_ty,
     } = &insts[idx]
     {
-        // Only ZERO-extending widenings keep the unsigned domain aligned
-        // with norm_const; a signed narrow source would sign-extend.
-        if matches!(from_ty, IrType::U8 | IrType::U16)
+        if matches!(from_ty, IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16)
             && to_ty.is_integer()
             && to_ty.size() >= from_ty.size()
         {
@@ -334,7 +342,7 @@ fn parse_member(
         op: IrBinOp::Sub,
         lhs,
         rhs,
-        ..
+        ty: sub_ty,
     }) = insts.get(idx)
     else {
         return None;
@@ -348,7 +356,12 @@ fn parse_member(
         Operand::Value(v) => match cast_dest {
             Some(cd) if cd == v.0 => {}
             None => {
-                root_val = Some((v.0, IrType::I32));
+                let rty = if root_ty_ok(*sub_ty) {
+                    *sub_ty
+                } else {
+                    IrType::I32
+                };
+                root_val = Some((v.0, rty));
             }
             _ => return None,
         },
@@ -394,6 +407,13 @@ fn parse_member(
     if !root_ty_ok(rt) {
         return None;
     }
+    let hi = lo.checked_add(span)?;
+    if matches!(rt, IrType::I8 | IrType::I16) {
+        let sign_bit = 1i64 << (rt.size() * 8 - 1);
+        if lo < 0 || hi >= sign_bit {
+            return None;
+        }
+    }
     // Root identity across member kinds: eq tests compare the NARROW value,
     // range tests go through their own zext of it. Match the value id; the
     // domain agreement is enforced by root_ty_ok + zext-only casts.
@@ -408,7 +428,7 @@ fn parse_member(
         Member {
             bi,
             label: block.label,
-            kind: Kind::Range(lo, lo.checked_add(span)?),
+            kind: Kind::Range(lo, hi),
             miss: Some(*false_label),
             is_tail: false,
             cond_val: cond_src,
@@ -543,31 +563,37 @@ fn fold_round(func: &mut IrFunction) -> usize {
             bi += 1;
             continue;
         };
-        // Exactly one Phi in the join so the edge retargeting below stays
-        // single-writer.
+        // At most one Phi in the join so the edge retargeting below stays
+        // single-writer (0 Phis when `join` is a control-flow side-effect block
+        // such as `c++` in `if (c == ':' || ...) c++;`).
         let phis: Vec<usize> = func.blocks[join_idx]
             .instructions
             .iter()
             .enumerate()
             .filter_map(|(i, inst)| matches!(inst, Instruction::Phi { .. }).then_some(i))
             .collect();
-        if phis.len() != 1 {
+        if phis.len() > 1 {
             bi += 1;
             continue;
         }
-        let phi_pos = phis[0];
-        let (phi_ty, phi_incoming) = match &func.blocks[join_idx].instructions[phi_pos] {
-            Instruction::Phi { ty, incoming, .. } => (*ty, incoming.clone()),
-            _ => unreachable!(),
+        let phi_pos: Option<usize> = phis.first().copied();
+        let (phi_ty, phi_incoming) = if let Some(pp) = phi_pos {
+            match &func.blocks[join_idx].instructions[pp] {
+                Instruction::Phi { ty, incoming, .. } => (*ty, incoming.clone()),
+                _ => unreachable!(),
+            }
+        } else {
+            (IrType::I32, Vec::new())
         };
         if !phi_ty.is_integer() {
             bi += 1;
             continue;
         }
         let const1_from = |label: BlockId| {
-            phi_incoming.iter().any(|(op, b)| {
-                *b == label && matches!(op, Operand::Const(c) if c.to_i64() == Some(1))
-            })
+            phi_pos.is_none()
+                || phi_incoming.iter().any(|(op, b)| {
+                    *b == label && matches!(op, Operand::Const(c) if c.to_i64() == Some(1))
+                })
         };
         if !const1_from(first.label) || !defs_local(func, first.bi, first.prelude_len, None) {
             bi += 1;
@@ -590,9 +616,10 @@ fn fold_round(func: &mut IrFunction) -> usize {
                 break;
             };
             if m.is_tail {
-                let phi_takes_value = phi_incoming.iter().any(|(op, b)| {
-                    *b == m.label && matches!(op, Operand::Value(v) if v.0 == m.cond_val)
-                });
+                let phi_takes_value = phi_pos.is_some()
+                    && phi_incoming.iter().any(|(op, b)| {
+                        *b == m.label && matches!(op, Operand::Value(v) if v.0 == m.cond_val)
+                    });
                 if phi_takes_value && defs_local(func, next_idx, 0, Some((m.cond_val, join_idx))) {
                     chain.push(m);
                 }
@@ -622,7 +649,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
                     };
                     if chain[j].is_tail {
                         continue;
-                    }
+                    };
                     let (lo_a, lo_b, hi_a, hi_b) = if a1 < a2 {
                         (a1, b1, a2, b2)
                     } else {
@@ -659,7 +686,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
                     insts.push(Instruction::Cast {
                         dest: c,
                         src: Operand::Value(Value(root)),
-                        from_ty: root_ty,
+                        from_ty: root_ty.to_unsigned(),
                         to_ty: IrType::I32,
                     });
                     c
@@ -720,12 +747,33 @@ fn fold_round(func: &mut IrFunction) -> usize {
                         *false_label = late_succ;
                     }
                 }
-                // Remove the absorbed member's phi entry.
-                if let Instruction::Phi { incoming, .. } =
-                    &mut func.blocks[join_idx].instructions[phi_pos]
-                {
+                // Update any Phis in `late_succ` whose incoming label was the
+                // absorbed `chain[late].label`.
+                if let Some(&succ_idx) = label_to_idx.get(&late_succ.0) {
                     let late_label = chain[late].label;
-                    incoming.retain(|(_, b)| *b != late_label);
+                    let new_pred_label = if late == early + 1 {
+                        chain[early].label
+                    } else {
+                        chain[late - 1].label
+                    };
+                    for inst in &mut func.blocks[succ_idx].instructions {
+                        if let Instruction::Phi { incoming, .. } = inst {
+                            for (_, b) in incoming.iter_mut() {
+                                if *b == late_label {
+                                    *b = new_pred_label;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Remove the absorbed member's phi entry.
+                if let Some(pp) = phi_pos {
+                    if let Instruction::Phi { incoming, .. } =
+                        &mut func.blocks[join_idx].instructions[pp]
+                    {
+                        let late_label = chain[late].label;
+                        incoming.retain(|(_, b)| *b != late_label);
+                    }
                 }
                 func.next_value_id = next_id;
                 changes += 1;
@@ -737,6 +785,14 @@ fn fold_round(func: &mut IrFunction) -> usize {
         }
 
         // ── Transform 2: best-window bit-mask cluster ──
+        // Signed narrow roots are only admitted for 0-Phi control-flow joins
+        // (`k_namechars.c`): value-producing Phi joins (`k_classify.c`) stay on
+        // the `if_convert` -> `loop_vectorize` SIMD path and preserve the
+        // signed-root negative control.
+        if matches!(root_ty, IrType::I8 | IrType::I16) && phi_pos.is_some() {
+            bi = chain[chain.len() - 1].bi + 1;
+            continue;
+        }
         // Collect maskable members and pick the window of width <= max_span
         // holding the most of them.
         let maskable: Vec<usize> = chain
@@ -862,12 +918,14 @@ fn fold_round(func: &mut IrFunction) -> usize {
                 // the 0/1 condition value.
                 let cond_val = chain[li].cond_val;
                 func.blocks[m_bi].terminator = Terminator::Branch(join);
-                if let Instruction::Phi { incoming, .. } =
-                    &mut func.blocks[join_idx].instructions[phi_pos]
-                {
-                    let lbl = chain[li].label;
-                    incoming.retain(|(_, b)| *b != lbl);
-                    incoming.push((Operand::Value(Value(cond_val)), lbl));
+                if let Some(pp) = phi_pos {
+                    if let Instruction::Phi { incoming, .. } =
+                        &mut func.blocks[join_idx].instructions[pp]
+                    {
+                        let lbl = chain[li].label;
+                        incoming.retain(|(_, b)| *b != lbl);
+                        incoming.push((Operand::Value(Value(cond_val)), lbl));
+                    }
                 }
             } else {
                 let new_miss = target
@@ -883,7 +941,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
 
         // Cluster miss target: first survivor after the head, else END.
         let cluster_next = next_target_after(head);
-        let mode_b = cluster_next.is_none() && tail_absorbed;
+        let mode_b = cluster_next.is_none() && tail_absorbed && phi_pos.is_some();
 
         // ── Build B1 (head block) and B2 (appended) ──
         let mut b1: Vec<Instruction> = Vec::with_capacity(4);
@@ -892,7 +950,7 @@ fn fold_round(func: &mut IrFunction) -> usize {
             b1.push(Instruction::Cast {
                 dest: c,
                 src: Operand::Value(Value(root)),
-                from_ty: root_ty,
+                from_ty: root_ty.to_unsigned(),
                 to_ty: IrType::I32,
             });
             c
@@ -943,9 +1001,10 @@ fn fold_round(func: &mut IrFunction) -> usize {
 
         // Remove ALL absorbed members' phi entries (head included — its hit
         // now comes from B2).
-        if let Instruction::Phi { incoming, .. } = &mut func.blocks[join_idx].instructions[phi_pos]
-        {
-            incoming.retain(|(_, b)| !absorbed.iter().any(|&i| chain[i].label == *b));
+        if let Some(pp) = phi_pos {
+            if let Instruction::Phi { incoming, .. } = &mut func.blocks[join_idx].instructions[pp] {
+                incoming.retain(|(_, b)| !absorbed.iter().any(|&i| chain[i].label == *b));
+            }
         }
 
         let (guard_miss, b2_term) = if mode_b {
@@ -962,21 +1021,58 @@ fn fold_round(func: &mut IrFunction) -> usize {
                 });
                 r
             };
-            if let Instruction::Phi { incoming, .. } =
-                &mut func.blocks[join_idx].instructions[phi_pos]
-            {
-                incoming.push((Operand::Const(IrConst::I64(0)), head_label));
-                incoming.push((Operand::Value(result), b2_label));
+            if let Some(pp) = phi_pos {
+                if let Instruction::Phi { incoming, .. } =
+                    &mut func.blocks[join_idx].instructions[pp]
+                {
+                    incoming.push((Operand::Const(IrConst::I64(0)), head_label));
+                    incoming.push((Operand::Value(result), b2_label));
+                }
             }
             (join, Terminator::Branch(join))
         } else {
             let miss = cluster_next
                 .or(chain_exit)
                 .expect("mode A cluster has a miss target");
-            if let Instruction::Phi { incoming, .. } =
-                &mut func.blocks[join_idx].instructions[phi_pos]
-            {
-                incoming.push((Operand::Const(IrConst::I64(1)), b2_label));
+            if let Some(pp) = phi_pos {
+                if let Instruction::Phi { incoming, .. } =
+                    &mut func.blocks[join_idx].instructions[pp]
+                {
+                    incoming.push((Operand::Const(IrConst::I64(1)), b2_label));
+                }
+            }
+            // If the last member of the chain was absorbed and `chain_exit`
+            // has Phis (e.g. a merge block after `if (...) c++;`), update its
+            // incoming labels for the redirected miss edge(s).
+            if !tail_absorbed && absorbed.contains(&(chain.len() - 1)) {
+                if let Some(exit_lbl) = chain_exit {
+                    if let Some(&exit_idx) = label_to_idx.get(&exit_lbl.0) {
+                        let old_last_lbl = chain[chain.len() - 1].label;
+                        for inst in &mut func.blocks[exit_idx].instructions {
+                            if let Instruction::Phi { incoming, .. } = inst {
+                                if cluster_next.is_none() {
+                                    // Both `head_label` (`guard_miss`) and `b2_label`
+                                    // (`b2_term` miss) now branch to `chain_exit`.
+                                    let mut extra = Vec::new();
+                                    for (op, b) in incoming.iter_mut() {
+                                        if *b == old_last_lbl {
+                                            *b = head_label;
+                                            extra.push((*op, b2_label));
+                                        }
+                                    }
+                                    incoming.extend(extra);
+                                } else if let Some(last_li) = last_live_pos {
+                                    let new_last_lbl = chain[last_li].label;
+                                    for (_, b) in incoming.iter_mut() {
+                                        if *b == old_last_lbl {
+                                            *b = new_last_lbl;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             (
                 miss,
@@ -1235,6 +1331,9 @@ mod tests {
             match &block.terminator {
                 Terminator::Return(Some(Operand::Value(v))) => {
                     return *vals.get(&v.0).unwrap();
+                }
+                Terminator::Return(Some(Operand::Const(c))) => {
+                    return c.to_i64().unwrap();
                 }
                 Terminator::Return(_) => return 0,
                 Terminator::Branch(t) => {
@@ -1599,6 +1698,39 @@ mod tests {
         assert_eq!(run_function(&mut f), 1);
         for x in 0..=255u8 {
             let want = (x == 194 || x == 195 || x == 224) as i64;
+            assert_eq!(eval(&f, x), want, "mismatch at byte {x}");
+        }
+    }
+
+    #[test]
+    fn zero_phi_join_folds_and_updates_exit_phi() {
+        let x = Value(1);
+        let mut f = IrFunction::new("f".into(), IrType::I64, vec![], false);
+        f.blocks = vec![
+            eq_block(0, x, 45, 90, 1, Value(70)),
+            eq_block(1, x, 46, 90, 2, Value(71)),
+            eq_block(2, x, 58, 90, 80, Value(72)),
+            BasicBlock {
+                label: BlockId(80),
+                instructions: vec![Instruction::Phi {
+                    dest: Value(60),
+                    ty: IrType::I64,
+                    incoming: vec![(Operand::Const(IrConst::I64(0)), BlockId(2))],
+                }],
+                terminator: Terminator::Return(Some(Operand::Value(Value(60)))),
+                source_spans: vec![],
+            },
+            BasicBlock {
+                label: BlockId(90),
+                instructions: vec![],
+                terminator: Terminator::Return(Some(Operand::Const(IrConst::I64(1)))),
+                source_spans: vec![],
+            },
+        ];
+        f.next_value_id = 100;
+        assert_eq!(run_function(&mut f), 1);
+        for x in 0..=255u8 {
+            let want = (x == 45 || x == 46 || x == 58) as i64;
             assert_eq!(eval(&f, x), want, "mismatch at byte {x}");
         }
     }
