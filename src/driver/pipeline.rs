@@ -189,9 +189,8 @@ pub struct Driver {
     /// the VEX encoding itself (every VEX form, 128-bit included).
     /// Distinct from `enable_avx` (which records what was explicitly
     /// *requested* and drives `__AVX__`): LCCC's x86-64 code-generation
-    /// baseline is x86-64-v3, so AVX (the VEX world) is legal by default and
-    /// only an explicit denial removes it. Without this distinction a
-    /// default-flag build would silently lose every VEX transform.
+    /// baseline is x86-64 (no VEX), so AVX is granted only by an explicit
+    /// flag or `-march=` profile; this denial also beats such a grant.
     /// `-mno-avx2` does NOT set this — AVX2 is the 256-bit integer class,
     /// a strict subset of what the VEX encoding buys: VEX.128 forms
     /// (`vmovsd`, `vaddsd`, `vfmadd231sd`, …) require only AVX, and
@@ -200,10 +199,8 @@ pub struct Driver {
     pub(super) avx_explicitly_disabled: bool,
     /// Set by `-mno-avx2`: the 256-bit class (AVX2 integer ops and every
     /// `ymm` use) is forbidden while the VEX.128 world stays legal. The
-    /// absent-`-march` ceiling is v3 (ymm on), so this — not
-    /// [`Self::avx_explicitly_disabled`] — is what removes 256-bit code
-    /// under the default baseline; an explicit `-march=` already folds the
-    /// denial into `enable_avx2`.
+    /// AVX2 class is off unless `-mavx2` or a `-march=` profile grants it;
+    /// this denial beats such a grant, and the VEX.128 world stays legal.
     pub(super) avx2_explicitly_disabled: bool,
     /// Set by `-mno-fma` (and by any AVX/SSE denial, since `vfmadd*` is
     /// VEX-encoded and requires AVX): `vfmadd*` must not be emitted.
@@ -215,9 +212,8 @@ pub struct Driver {
     /// (x86-64-v2 hardware).
     pub(super) sse41_explicitly_disabled: bool,
     /// Set by `-mno-bmi`: scalar ANDN / BEXTR-family encodings forbidden.
-    /// Distinct from `enable_bmi` for the same reason as the SIMD denials:
-    /// the absent-`-march` baseline is x86-64-v3, which GRANTS BMI1, so the
-    /// default permission cannot be represented by `enable_bmi` alone.
+    /// Kept distinct from `enable_bmi` so the denial stays sticky against a
+    /// later `-march=` profile that grants BMI1.
     pub(super) bmi_explicitly_disabled: bool,
     /// Set by `-mno-bmi2`: SHLX/SHRX/SARX/RORX/MULX/PEXT/PDEP forbidden.
     pub(super) bmi2_explicitly_disabled: bool,
@@ -229,10 +225,13 @@ pub struct Driver {
     pub(super) popcnt_explicitly_disabled: bool,
     /// Set by `-mno-movbe`: MOVBE forbidden.
     pub(super) movbe_explicitly_disabled: bool,
+    /// Set by `-mno-cx16`: CMPXCHG16B forbidden.
+    pub(super) cx16_explicitly_disabled: bool,
     /// An explicit x86 `-march=` was seen.  Under an explicit profile the
     /// requested feature set (`enable_*`) is the *ceiling* (GCC semantics);
-    /// without one the code-generation baseline is x86-64-v3 and only
-    /// explicit `-mno-*` denials remove subsets.  See `backend::x86::isa`.
+    /// without one the code-generation baseline is plain x86-64 (SSE2 only),
+    /// and every post-baseline class needs its explicit flag.  See
+    /// `backend::x86::isa`.
     pub(super) x86_march_explicit: bool,
     /// Explicit x86 ISA `-m`/`-mno-` flags in command-line order, for the
     /// `-march=` replace-and-replay contract (GCC-exact, measured on the
@@ -281,6 +280,8 @@ pub struct Driver {
     pub(super) enable_lzcnt: bool,
     pub(super) enable_popcnt: bool,
     pub(super) enable_movbe: bool,
+    /// `-mcx16` (or a v2+ profile): CMPXCHG16B granted.
+    pub(super) enable_cx16: bool,
     pub(super) enable_rdrnd: bool,
     // AVX-512 family (accepted for -march/-m flag completeness; the backend
     // lowers AVX-512 only where intrinsic coverage exists, and runtime
@@ -566,6 +567,7 @@ impl Driver {
             lzcnt_explicitly_disabled: false,
             popcnt_explicitly_disabled: false,
             movbe_explicitly_disabled: false,
+            cx16_explicitly_disabled: false,
             x86_march_explicit: false,
             x86_explicit_isa_args: Vec::new(),
             skip_rax_setup: false,
@@ -587,6 +589,7 @@ impl Driver {
             enable_lzcnt: false,
             enable_popcnt: false,
             enable_movbe: false,
+            enable_cx16: false,
             enable_rdrnd: false,
             enable_avx512f: false,
             enable_avx512cd: false,
@@ -1645,7 +1648,7 @@ impl Driver {
             !self.no_sse && self.enable_f16c,
             !self.no_sse && self.enable_fma,
             // INTEGER-ISA macros follow the RESOLVED codegen permission
-            // (default x86-64-v3 grant, explicit -march ceiling,
+            // (explicit -march grant or ceiling, default x86-64 baseline,
             // -mno-* denial), not the raw request flags: __BMI__ and
             // friends must exactly mirror what the backend may emit,
             // or an #ifdef-guarded intrinsic path could disagree with
@@ -2229,8 +2232,8 @@ impl Driver {
             // Scalar BMI1 (ANDN) for the middle end's CH-fold defer —
             // mirrors CodegenOptions::bmi1 for the x86-64 backend (the
             // i686 backend has no andn fusion, so it stays false there).
-            // Resolved permission: the default x86-64-v3 baseline grants
-            // BMI1, an explicit -march keeps its own set, -mno-bmi wins.
+            // Resolved permission: granted only by an explicit `-mbmi` or a
+            // `-march=` profile that includes it; `-mno-bmi` wins.
             // resolved_bmi1() is X86_64-locked, so the fold defers exactly
             // when the backend can fuse (i686 never defers — its backend
             // cannot emit ANDN).
@@ -3046,27 +3049,20 @@ impl Driver {
     /// x86-64 code-generation ISA permission for this translation unit.
     ///
     /// Policy (`backend::x86::isa`):
-    /// * no explicit `-march`: project baseline x86-64-v3, minus explicit
-    ///   `-mno-*` denials;
+    /// * no explicit `-march`: the x86-64 baseline (SSE2 only); post-baseline
+    ///   classes come from explicit `-m*` flags only;
     /// * explicit `-march=<level|cpu|native>`: the requested feature set is
     ///   the ceiling (GCC-exact), explicit denials still apply;
     /// * `-mno-sse` / `-mgeneral-regs-only`: nothing (the register file is
     ///   off-limits; the kernel runs with CR4.OSFXSR/OSXSAVE clear).
     ///
-    /// The INTEGER half of the documented default ISA, mirroring the SIMD
-    /// ceiling in `x86_isa()`: with no explicit `-march=` the project
-    /// baseline is x86-64-v3, so BMI1/BMI2/LZCNT/MOVBE (v3) and POPCNT
-    /// (v2 ⊂ v3) are legal by default.  Before this wiring the default
-    /// granted the SIMD half (AVX2 via `X86Isa::V3`) but left the integer
-    /// half off — a split-brain ISA that silently forfeited the ANDN/BMI2
-    /// instruction selection on every default-flag build (measured:
-    /// bitops −25.0% end-to-end once fixed (interleaved idle A/B),
-    /// zero regressions across the 5-workload ISA A/B;
-    /// PERF-PROVENANCE-S49 §2).  Under an explicit
-    /// `-march=` the requested set stays the ceiling (GCC semantics), and an
-    /// explicit `-mno-*` denial always wins over the default grant.
-    /// BMI/LZCNT/POPCNT/MOVBE are integer ISA: they stay legal under
-    /// `-mno-sse` (same contract as `enable_x86_v3_profile`).
+    /// The INTEGER half of the ISA, mirroring the SIMD ceiling in `x86_isa()`.
+    /// With no explicit `-march=` the baseline is x86-64 and none of
+    /// BMI1/BMI2/LZCNT/MOVBE/POPCNT is granted; each is granted only by its
+    /// explicit flag or a `-march=` profile that includes it, and an explicit
+    /// `-mno-*` denial always wins.  BMI/LZCNT/POPCNT/MOVBE are integer ISA:
+    /// they stay legal under `-mno-sse` (same contract as
+    /// `enable_x86_v3_profile`).
     ///
     /// GCC-exactness of the explicit-flag interaction, measured on the
     /// host oracle (gcc 14.2, `-dM -E` macro census — the Review-AI claim
@@ -3087,15 +3083,11 @@ impl Driver {
     /// replays the recorded explicit flags after applying the profile —
     /// see `reset_x86_arch_implied_isa` / `replay_x86_explicit_isa_flags`).
     pub(super) fn resolved_bmi1(&self) -> bool {
-        self.target == Target::X86_64
-            && !self.bmi_explicitly_disabled
-            && (self.enable_bmi || !self.x86_march_explicit)
+        self.target == Target::X86_64 && !self.bmi_explicitly_disabled && self.enable_bmi
     }
 
     pub(super) fn resolved_bmi2(&self) -> bool {
-        self.target == Target::X86_64
-            && !self.bmi2_explicitly_disabled
-            && (self.enable_bmi2 || !self.x86_march_explicit)
+        self.target == Target::X86_64 && !self.bmi2_explicitly_disabled && self.enable_bmi2
     }
 
     /// Soundness of the default grant: `tzcnt` is at least as correct as
@@ -3121,7 +3113,7 @@ impl Driver {
             return false;
         }
         match self.target {
-            Target::X86_64 => self.enable_lzcnt || !self.x86_march_explicit,
+            Target::X86_64 => self.enable_lzcnt,
             Target::I686 => self.enable_lzcnt,
             _ => false,
         }
@@ -3144,7 +3136,7 @@ impl Driver {
             return false;
         }
         match self.target {
-            Target::X86_64 => self.enable_popcnt || !self.x86_march_explicit,
+            Target::X86_64 => self.enable_popcnt,
             Target::I686 => self.enable_popcnt,
             _ => false,
         }
@@ -3182,10 +3174,12 @@ impl Driver {
         self.fp_contract
     }
 
+    pub(super) fn resolved_cx16(&self) -> bool {
+        self.target == Target::X86_64 && !self.cx16_explicitly_disabled && self.enable_cx16
+    }
+
     pub(super) fn resolved_movbe(&self) -> bool {
-        self.target == Target::X86_64
-            && !self.movbe_explicitly_disabled
-            && (self.enable_movbe || !self.x86_march_explicit)
+        self.target == Target::X86_64 && !self.movbe_explicitly_disabled && self.enable_movbe
     }
 
     /// Effective x86 feature set — the compile-time guarantees this invocation
@@ -3195,7 +3189,7 @@ impl Driver {
     /// line ask for" model the predefined macros (`__AVX2__`, `__BMI__`) use:
     ///
     /// * features the resolved ISA ceiling grants by default (project baseline
-    ///   x86-64-v3 when no `-march=` is given) are present, exactly like
+    ///   x86-64 when no `-march=` is given) are present, exactly like
     ///   [`Self::x86_isa`]'s default;
     /// * an explicit `-march=<level|cpu>` replaces the ceiling, so a v2 target
     ///   reports no AVX2;
@@ -3216,9 +3210,6 @@ impl Driver {
         let x86_64 = self.target == Target::X86_64;
         // xmm-level code is legal at all (mirrors `x86_isa()` / `set_sse_macros`).
         let simd = !self.no_sse && !self.general_regs_only;
-        // With no explicit `-march=`, the project baseline is x86-64-v3
-        // (backend::x86::isa policy): its features are granted unless denied.
-        let baseline = x86_64 && !self.x86_march_explicit;
 
         // Scalar features every supported x86 CPU has.
         set.insert_if(x86_64, F::Cmov);
@@ -3231,32 +3222,15 @@ impl Driver {
 
         // The SSE3..SSE4.2 ladder.  `x86_isa()` carries only the 128-bit
         // SSE4.1 class, so SSE3/SSSE3/SSE4.2 have no codegen bit of their
-        // own: the baseline half is guarded by the sticky denial that the CLI
-        // sets when it clears this rung (`-mno-sse3/-mno-ssse3/-mno-sse4.1`
-        // all set `sse41_explicitly_disabled`; `-mno-sse4.2` clears the
-        // SSE4.2-era AVX surface, which is the only denial signal SSE4.2
-        // has).  Without the guard the baseline grant would resurrect a rung
-        // the user explicitly removed — `-mno-sse4.1 -msse3` was measured
-        // reporting SSE4.1.
-        let sse41_denied = self.sse41_explicitly_disabled;
-        set.insert_if(
-            simd && (self.enable_sse3 || (baseline && !sse41_denied)),
-            F::Sse3,
-        );
-        set.insert_if(
-            simd && (self.enable_ssse3 || (baseline && !sse41_denied)),
-            F::Ssse3,
-        );
+        // own. Each rung is granted only by its explicit flag (or a `-march`
+        // profile that sets it): the default x86-64 baseline has none of them.
+        set.insert_if(simd && self.enable_sse3, F::Sse3);
+        set.insert_if(simd && self.enable_ssse3, F::Ssse3);
         set.insert_if(self.x86_isa().sse41, F::Sse41);
-        set.insert_if(
-            simd && (self.enable_sse4_2 || (baseline && !self.avx_explicitly_disabled)),
-            F::Sse42,
-        );
+        set.insert_if(simd && self.enable_sse4_2, F::Sse42);
         set.insert_if(self.resolved_popcnt(), F::Popcnt);
-        // CMPXCHG16B: x86-64-v2 requires it, and every default (-v3) target has
-        // it; the v1 baseline (`-march=x86-64`) does not mandate it, so it
-        // follows the SSE4.2-era request bit the `-march` profiles set.
-        set.insert_if(x86_64 && (baseline || self.enable_sse4_2), F::Cx16);
+        // CMPXCHG16B: granted only by `-mcx16` or a v2+ `-march` profile.
+        set.insert_if(self.resolved_cx16(), F::Cx16);
 
         // SIMD classes straight from the codegen ceiling.
         let isa = self.x86_isa();
@@ -3265,12 +3239,12 @@ impl Driver {
         set.insert_if(isa.fma, F::Fma);
         // F16C is VEX-encoded: `-mno-avx` removes it even when a `-march=`
         // profile asked for it (GCC undefines `__F16C__` for the same
-        // combination — measured), and it *is* part of x86-64-v3, so the
-        // project baseline grants it.
-        set.insert_if(simd && isa.avx && (self.enable_f16c || baseline), F::F16c);
+        // combination — measured). It is granted only by `-mf16c` or the
+        // `-march` profile that includes it, never by the default baseline.
+        set.insert_if(simd && isa.avx && self.enable_f16c, F::F16c);
         // AES-NI and PCLMUL are NOT part of any psABI microarchitecture level
         // (v2 has SSE4.2/POPCNT, v3 adds AVX2/BMI2/FMA/F16C). Granting them
-        // from the "v3 default" would promise an instruction class the target
+        // from a default baseline would promise an instruction class the target
         // level does not imply, so they follow the explicit request only —
         // and nothing in the backend emits them without `-maes`/`-mpclmul`
         // (or an `-march=<cpu>` profile), which is what makes the claim true.
@@ -3292,10 +3266,13 @@ impl Driver {
         //     `-mvpclmulqdq` request.
         // Folding `1` here promises the class, and the two halves of the
         // conjunction are the two ways the promise could be wrong: without
-        // `isa.ymm` the emitter cannot encode the instruction, and without the
+        // `isa.avx` the emitter cannot encode the instruction, and without the
         // request flag the backend was never asked for it.
-        set.insert_if(isa.ymm && self.enable_vaes, F::Vaes);
-        set.insert_if(isa.ymm && self.enable_vpclmulqdq, F::Vpclmulqdq);
+        // VAES/VPCLMULQDQ at 256 bits are VEX.256 forms that need AVX only, not
+        // AVX2 (measured: gcc 14 accepts `-mvaes -mno-avx2` and `-mvaes` alone;
+        // rejects `-mvaes -mno-avx`). So the class conjunct is `avx`, not `ymm`.
+        set.insert_if(isa.avx && self.enable_vaes, F::Vaes);
+        set.insert_if(isa.avx && self.enable_vpclmulqdq, F::Vpclmulqdq);
 
         // The three AVX-VNNI groups: `vpdpbusd`/`vpdpwssd` (AVX-VNNI),
         // `vpdpbssd`/`vpdpbsud`/`vpdpbuud` (AVX-VNNI-INT8) and
@@ -3369,13 +3346,20 @@ impl Driver {
     pub(crate) fn x86_isa(&self) -> crate::backend::x86::isa::X86Isa {
         use crate::backend::x86::isa::X86Isa;
         if self.target != Target::X86_64 || self.no_sse || self.general_regs_only {
-            return X86Isa::NONE;
+            return X86Isa {
+                cx16: self.resolved_cx16(),
+                ..X86Isa::NONE
+            };
         }
         // MOVBE is orthogonal to the SIMD ceiling: `resolved_movbe` owns its
         // permission (`-mno-movbe`, or an explicit `-march=` that does not
         // include it), so it is carried through both arms below.
         let movbe = self.resolved_movbe();
-        let ceiling = if self.x86_march_explicit {
+        let cx16 = self.resolved_cx16();
+        // One rule for every spelling: a class is granted only by its explicit
+        // flag (or a -march profile that sets it). The default x86-64 baseline
+        // is therefore SSE2 only: no post-x86-64 instruction is ever emitted.
+        let ceiling = {
             X86Isa {
                 simd: true,
                 sse41: self.enable_sse4_1,
@@ -3383,11 +3367,7 @@ impl Driver {
                 ymm: self.enable_avx2,
                 fma: self.enable_fma,
                 movbe,
-            }
-        } else {
-            X86Isa {
-                movbe,
-                ..X86Isa::V3
+                cx16: false,
             }
         };
         X86Isa {
@@ -3404,6 +3384,8 @@ impl Driver {
             // `simd`: MOVBE has no SSE dependency, and `-mno-sse` must leave
             // it intact.
             movbe: ceiling.movbe,
+            // CMPXCHG16B is integer ISA: `-mno-sse` does not remove it.
+            cx16,
         }
         .normalized()
     }

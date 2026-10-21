@@ -149,6 +149,20 @@ impl X86Codegen {
         _failure_ordering: AtomicOrdering,
         returns_bool: bool,
     ) {
+        // 16-byte compare-exchange: the 64-bit sequence below would compare and
+        // write only the low half, so route it through its own lowering.
+        if matches!(ty, IrType::I128 | IrType::U128) {
+            self.emit_atomic_cmpxchg16_impl(
+                dest,
+                ptr,
+                expected,
+                desired,
+                _success_ordering,
+                _failure_ordering,
+                returns_bool,
+            );
+            return;
+        }
         self.operand_to_rax(ptr);
         self.state.emit("    movq %rax, %rcx");
         self.operand_to_rax(desired);
@@ -170,6 +184,115 @@ impl X86Codegen {
             self.canonicalize_atomic_rax_result(ty);
         }
         self.store_rax_to(dest);
+    }
+
+    /// Run `f` with the rsp-relative slot addressing biased by `bias` bytes,
+    /// for code that has pushed `bias` bytes of temporaries.
+    fn with_rsp_bias(&mut self, bias: i64, f: impl FnOnce(&mut Self)) {
+        let saved = self.state.out.rsp_frame_size;
+        if self.state.out.use_rsp_addressing {
+            self.state.out.rsp_frame_size += bias;
+        }
+        f(self);
+        self.state.out.rsp_frame_size = saved;
+    }
+
+    /// Push a 16-byte operand: low half at the lower address, the stack
+    /// grows by 16 bytes.  `bias` is what has already been pushed.
+    fn push_16_operand(&mut self, op: &Operand, bias: i64) {
+        self.with_rsp_bias(bias, |s| s.operand_to_rax_rdx(op));
+        self.state.emit("    pushq %rdx");
+        self.state.emit("    pushq %rax");
+    }
+
+    /// libatomic's memory-order encoding (`__ATOMIC_*`).
+    fn libatomic_order(order: AtomicOrdering) -> u8 {
+        match order {
+            AtomicOrdering::Relaxed => 0,
+            AtomicOrdering::Acquire => 2,
+            AtomicOrdering::Release => 3,
+            AtomicOrdering::AcqRel => 4,
+            AtomicOrdering::SeqCst => 5,
+        }
+    }
+
+    /// 16-byte `__atomic_compare_exchange_n`.  With the CMPXCHG16B permission
+    /// (`-mcx16` or a v2+ profile) this is one `lock cmpxchg16b`; otherwise it
+    /// calls libatomic's `__atomic_compare_exchange_16`, as GCC does.  The
+    /// result is the bool (`returns_bool`) or the observed old value.
+    fn emit_atomic_cmpxchg16_impl(
+        &mut self,
+        dest: &Value,
+        ptr: &Operand,
+        expected: &Operand,
+        desired: &Operand,
+        success_ordering: AtomicOrdering,
+        failure_ordering: AtomicOrdering,
+        returns_bool: bool,
+    ) {
+        self.prepare_atomic_side_effect();
+        if super::super::isa::current().cx16 {
+            // rbx is callee-saved and cmpxchg16b needs it for the desired low
+            // half.  Stack after the pushes: [rsp] = expected (lo, hi),
+            // [rsp+16] = desired (lo, hi), [rsp+32] = saved rbx.
+            self.state.emit("    pushq %rbx");
+            self.push_16_operand(desired, 8);
+            self.push_16_operand(expected, 24);
+            self.with_rsp_bias(40, |s| s.operand_to_rax(ptr));
+            self.state.emit("    movq %rax, %r8");
+            self.state.emit("    movq (%rsp), %rax");
+            self.state.emit("    movq 8(%rsp), %rdx");
+            self.state.emit("    movq 16(%rsp), %rbx");
+            self.state.emit("    movq 24(%rsp), %rcx");
+            self.state.emit("    lock cmpxchg16b (%r8)");
+            if returns_bool {
+                self.state.emit("    sete %r11b");
+                self.state.emit("    movzbl %r11b, %r11d");
+            }
+            self.state.emit("    addq $32, %rsp");
+            self.state.emit("    popq %rbx");
+            if returns_bool {
+                self.state.emit("    movq %r11, %rax");
+                self.store_rax_to(dest);
+            } else {
+                self.store_rax_rdx_to(dest);
+            }
+        } else {
+            // libatomic's sized entry: bool __atomic_compare_exchange_16(
+            // ptr, expected*, desired (by value: rdx:rcx), success, failure).
+            // On failure it writes the observed value back into `expected`,
+            // which is the old value returned here.  Stack after the pushes:
+            // [rsp] = expected, [rsp+16] = ptr, [rsp+24] = pad (keeps the call
+            // 16-byte aligned).
+            self.state.emit("    subq $8, %rsp");
+            self.with_rsp_bias(8, |s| s.operand_to_rax(ptr));
+            self.state.emit("    pushq %rax");
+            self.push_16_operand(expected, 16);
+            self.with_rsp_bias(32, |s| s.operand_to_rax_rdx(desired));
+            self.state.emit("    movq %rdx, %rcx");
+            self.state.emit("    movq %rax, %rdx");
+            self.state.emit("    movq 16(%rsp), %rdi");
+            self.state.emit("    movq %rsp, %rsi");
+            self.state.emit_fmt(format_args!(
+                "    movl ${}, %r8d",
+                Self::libatomic_order(success_ordering)
+            ));
+            self.state.emit_fmt(format_args!(
+                "    movl ${}, %r9d",
+                Self::libatomic_order(failure_ordering)
+            ));
+            self.state.emit("    call __atomic_compare_exchange_16@PLT");
+            if returns_bool {
+                self.state.emit("    movzbl %al, %eax");
+                self.state.emit("    addq $32, %rsp");
+                self.store_rax_to(dest);
+            } else {
+                self.state.emit("    movq (%rsp), %rax");
+                self.state.emit("    movq 8(%rsp), %rdx");
+                self.state.emit("    addq $32, %rsp");
+                self.store_rax_rdx_to(dest);
+            }
+        }
     }
 
     pub(super) fn emit_atomic_load_impl(

@@ -535,6 +535,10 @@ jobs:
       run: bash tests/regression/check_linker_oracle_versions.sh
     - name: Check driver option contracts
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_driver_option_contract.sh
+    - name: Check default ISA policy (x86-64 default emits no post-baseline instruction)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_default_isa_policy.sh
+    - name: Check 16-byte CAS lowering (libatomic by default, cmpxchg16b under -mcx16)
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_cas16_lowering.sh
     - name: Check -fno-builtin constant-fold withdrawal (F1)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_fno_builtin_folds.sh
     - name: Check the recursion-to-iteration pass

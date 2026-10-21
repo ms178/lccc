@@ -69,11 +69,15 @@ region_andn_count() {
 "$CCC" $GCCINC -mbmi -O2 -S "$SRC" -o "$TMP/bmi.s" 2>/dev/null
 N=$(region_andn_count "$TMP/bmi.s")
 [ "$N" -eq 1 ] || bad "-mbmi: expected exactly 1 andn in sha256_transform (CH), got $N"
-# Default baseline: the project floor is x86-64-v3, so BMI1 (and the CH
-# andn) is granted without any -march/-mbmi.
+# Default build = x86-64 baseline: BMI1 is post-baseline and opt-in, so the
+# CH andn must NOT appear without an explicit grant.
 "$CCC" $GCCINC -O2 -S "$SRC" -o "$TMP/default.s" 2>/dev/null
 N=$(region_andn_count "$TMP/default.s")
-[ "$N" -eq 1 ] || bad "default (v3 baseline): expected exactly 1 andn in sha256_transform, got $N"
+[ "$N" -eq 0 ] || bad "default (x86-64 baseline): expected 0 andn in sha256_transform, got $N"
+# Explicit v3 profile grants BMI1: the CH andn is selected.
+"$CCC" $GCCINC -march=x86-64-v3 -O2 -S "$SRC" -o "$TMP/v3.s" 2>/dev/null
+N=$(region_andn_count "$TMP/v3.s")
+[ "$N" -eq 1 ] || bad "-march=x86-64-v3: expected exactly 1 andn in sha256_transform, got $N"
 # Explicit baseline profile: the v3 grant is denied — zero andn.
 "$CCC" $GCCINC -march=x86-64 -O2 -S "$SRC" -o "$TMP/base.s" 2>/dev/null
 N=$(region_andn_count "$TMP/base.s")

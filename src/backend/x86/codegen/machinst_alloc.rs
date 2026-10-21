@@ -327,7 +327,10 @@ impl<'a> Scan<'a> {
                 self.touch(dst, idx, RefKind::Rmw, true);
             }
             MachInst::Imul3 { src, dst, .. } => {
-                self.touch(src, idx, RefKind::Read, false);
+                // Register-only source: `resolve` rewrites it as a MachReg,
+                // never a memory operand, so a spilled source must be homed
+                // in a window register (else: replay fallback).
+                self.touch(src, idx, RefKind::Read, true);
                 self.touch(dst, idx, RefKind::PureWrite, false);
             }
             MachInst::Neg { dst, .. } | MachInst::Not { dst, .. } => {
@@ -347,12 +350,13 @@ impl<'a> Scan<'a> {
             MachInst::ShiftX {
                 count, src, dst, ..
             } => {
-                self.touch(count, idx, RefKind::Read, false);
-                self.touch(src, idx, RefKind::Read, false);
+                // BMI2 three-operand forms: register-only operands, as Imul3.
+                self.touch(count, idx, RefKind::Read, true);
+                self.touch(src, idx, RefKind::Read, true);
                 self.touch(dst, idx, RefKind::PureWrite, false);
             }
             MachInst::Rorx { src, dst, .. } => {
-                self.touch(src, idx, RefKind::Read, false);
+                self.touch(src, idx, RefKind::Read, true);
                 self.touch(dst, idx, RefKind::PureWrite, false);
             }
             MachInst::Lea {

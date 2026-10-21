@@ -80,7 +80,7 @@ accept() {
 reject crc.c -msse4.2 -march=x86-64
 accept crc.c crc32 -msse4.2
 accept crc.c crc32 -march=x86-64-v2
-accept crc.c crc32
+reject crc.c -msse4.2   # default x86-64 baseline has no SSE4.2 (GCC rejects too)
 
 reject aes.c -maes -march=x86-64
 accept aes.c aesenc -maes
@@ -96,7 +96,9 @@ reject vaes256.c -mvaes -march=x86-64-v3          # class yes, extension no
 reject vaes256.c -mvaes -march=x86-64-v3 -mno-avx2  # extension yes, class no
 reject vaes256.c -mvaes -march=x86-64-v3 -mno-avx   # no VEX at all
 reject vaes256.c -mvaes -march=alderlake -mno-vaes  # explicit denial of the profile's grant
-accept vaes256.c vaesenc -mvaes                   # project baseline is v3, so the class is granted
+accept vaes256.c vaesenc -mvaes                   # -mvaes implies AVX (VEX.256 class), not AVX2
+accept vaes256.c vaesenc -march=x86-64-v3 -mno-avx2 -mvaes   # GCC accepts: AVX class only
+reject vaes256.c -mvaes -mno-avx                  # AVX denial removes the class
 accept vaes256.c vaesenc -march=alderlake
 
 reject vpclmul256.c -mvpclmulqdq -march=x86-64
@@ -194,16 +196,16 @@ compare o_vpclmul256.c -march=x86-64-v3 -mvaes
 compare o_vpclmul256.c -march=x86-64-v3 -mvpclmulqdq
 compare o_vpclmul256.c -march=alderlake
 
-# Documented deviation, asserted rather than compared.  lccc ties ALL 256-bit
-# emission to the AVX2-class permission (`x86_isa().ymm`), so `-mno-avx2` also
-# removes the 256-bit VEX forms whose float half GCC keeps with AVX alone:
-# GCC accepts `_mm256_aesenc_epi128` under `-mvaes -mno-avx2` (measured), lccc
-# refuses.  Refusing is the safe direction -- lccc emits no 256-bit code at all
-# on that target -- and it keeps the promise the fold makes.
-ours=$(verdict "$ccc" o_vaes256.c -march=x86-64-v3 -mvaes -mno-avx2)
-[ "$ours" = reject ] ||
-    fail "o_vaes256.c -mvaes -mno-avx2: lccc $ours, expected reject (no 256-bit class on that target)"
-echo "ok: o_vaes256.c -mvaes -mno-avx2 -> reject (documented deviation: GCC accepts)"
+# VAES and VPCLMULQDQ at 256 bits are VEX.256 forms whose class is AVX, not
+# AVX2 (measured gcc 14: `-mvaes -mno-avx2` and bare `-mvaes` accept the
+# 256-bit intrinsic; `-mvaes -mno-avx` rejects). The extension flags also
+# imply AVX, as GCC defines __AVX__ for them. These are exact GCC comparisons.
+compare o_vaes256.c -march=x86-64-v3 -mvaes -mno-avx2
+compare o_vaes256.c -mvaes
+compare o_vaes256.c -march=x86-64 -mvaes
+compare o_vaes256.c -march=x86-64-v3 -mvaes -mno-avx
+compare o_vpclmul256.c -mvpclmulqdq
+compare o_vpclmul256.c -march=x86-64 -mvpclmulqdq
 
 # ---------------------------------------------------------------------------
 # AVX-VNNI, AVX-VNNI-INT8 and AVX-VNNI-INT16: three extensions, three bits,
@@ -289,15 +291,13 @@ compare o_vnni256.c -mavx512vnni -mavx512vl
 compare o_vnni128.c -march=alderlake
 compare o_vnni256.c -march=alderlake
 
-# Documented deviation, asserted rather than compared: GCC's `-mavxvnni` also
-# implies AVX2, so `-march=x86-64 -mavxvnni` is accepted there while lccc
-# refuses it -- the user asked for a v1 baseline and the 256-bit class is what
-# the backend would need to encode the instruction.  Refusing a request is the
-# safe direction; emitting an unrequested instruction is not.
+# `-mavxvnni` implies AVX2 (GCC 14 accepts the 256-bit form under
+# `-march=x86-64 -mavxvnni` and rejects it under `-mavxvnni -mno-avx2`), so the
+# 256-bit class is granted by the extension itself, not by the v1 baseline.
 ours=$(verdict "$ccc" o_vnni128.c -march=x86-64 -mavxvnni)
-[ "$ours" = reject ] ||
-    fail "o_vnni128.c -march=x86-64 -mavxvnni: lccc $ours, expected reject (no 256-bit class on a v1 target)"
-echo "ok: o_vnni128.c -march=x86-64 -mavxvnni -> reject (documented deviation: GCC accepts)"
+[ "$ours" = accept ] ||
+    fail "o_vnni128.c -march=x86-64 -mavxvnni: lccc $ours, expected accept (-mavxvnni implies AVX2, as GCC 14 accepts)"
+echo "ok: o_vnni128.c -march=x86-64 -mavxvnni -> accept (gcc agrees: -mavxvnni implies AVX2)"
 
 # Declared no-oracle region: GCC 12.2 neither knows `-mavxvnniint8` /
 # `-mavxvnniint16` (measured: "unrecognized command-line option") nor declares

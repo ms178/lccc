@@ -49,31 +49,34 @@ FMA_RE='(^|[[:space:]])(vfmadd|vfmsub|vfnmadd|vfnmsub|fmadd|fmsub)[a-z0-9]*[[:sp
 fail=0
 note() { printf 'FAIL: %s\n' "$1" >&2; fail=1; }
 
-# 1. level matrix on the emitted assembly.
+# 1. level matrix on the emitted assembly. FMA is post-x86-64 (opt-in), so the
+#    default build must contain none at any level; the positive controls use
+#    the explicit v3 profile.
 "$CCC" -O0 -S fma.c -o o0.s
 "$CCC" -O1 -S fma.c -o o1.s
 "$CCC" -O2 -S fma.c -o o2.s
+"$CCC" -O2 -march=x86-64-v3 -S fma.c -o o2v3.s
 grep -cE "$FMA_RE" o0.s >/dev/null && note "-O0 fused a*b+c into an FMA (GCC does not)"
 grep -cE "$FMA_RE" o1.s >/dev/null && note "-O1 fused a*b+c into an FMA (GCC does not)"
-grep -cE "$FMA_RE" o2.s >/dev/null || note "-O2 did NOT emit an FMA (positive control lost)"
+grep -cE "$FMA_RE" o2.s >/dev/null && note "default -O2 emitted an FMA (post-baseline ISA leaked)"
+grep -cE "$FMA_RE" o2v3.s >/dev/null || note "-march=x86-64-v3 -O2 did NOT emit an FMA (positive control lost)"
 
-# 2. explicit flags win at any level.
-"$CCC" -O0 -ffp-contract=fast -S fma.c -o o0fast.s
-"$CCC" -O2 -ffp-contract=off -S fma.c -o o2off.s
+# 2. explicit flags win at any level (under the v3 grant that makes FMA legal).
+"$CCC" -O0 -march=x86-64-v3 -ffp-contract=fast -S fma.c -o o0fast.s
+"$CCC" -O2 -march=x86-64-v3 -ffp-contract=off -S fma.c -o o2off.s
 grep -cE "$FMA_RE" o0fast.s >/dev/null || note "-O0 -ffp-contract=fast did not contract (flag ignored)"
 grep -cE "$FMA_RE" o2off.s >/dev/null && note "-O2 -ffp-contract=off still contracted (flag ignored)"
 
-# 3. numeric agreement, level by level (the ISA-matched GCC arm at -O2).
-for lvl in -O0 -O1 -O2; do
-    "$CCC" "$lvl" chain.c -o lccc.bin
-    if [ "$lvl" = "-O2" ]; then
-        "$GCC" "$lvl" -march=x86-64-v3 chain.c -o gcc.bin
-    else
-        "$GCC" "$lvl" chain.c -o gcc.bin
-    fi
+# 3. numeric agreement with matched flags on both sides: default -O0/-O1/-O2
+#    (no FMA anywhere), then -O2 under the v3 grant (both sides fuse).
+check_num() { # check_num <lccc-flags> <gcc-flags> <label>
+    "$CCC" $1 chain.c -o lccc.bin
+    "$GCC" $2 chain.c -o gcc.bin
     ours=$(./lccc.bin); theirs=$(./gcc.bin)
-    [ "$ours" = "$theirs" ] || note "$lvl numeric mismatch: lccc=$ours gcc=$theirs"
-done
+    [ "$ours" = "$theirs" ] || note "$3 numeric mismatch: lccc=$ours gcc=$theirs"
+}
+for lvl in -O0 -O1 -O2; do check_num "$lvl" "$lvl" "default $lvl"; done
+check_num "-O2 -march=x86-64-v3" "-O2 -march=x86-64-v3" "v3 -O2"
 
 [ "$fail" = 0 ] || { echo 'fp-contract parity: FAIL'; exit 1; }
-echo 'fp-contract parity: PASS (-O0/-O1 unfused like GCC, -O2 fused, flags honored, numbers agree)'
+echo 'fp-contract parity: PASS (default: no FMA at any -O level; v3 grant: -O2 fuses; flags honored; numbers agree)'

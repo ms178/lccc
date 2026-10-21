@@ -42,6 +42,7 @@ check_cfg() {
   CFG=$1
   WANT_CALLS=$2
   WHY=$3
+  TIER=$4   # bmi: explicit v3 (BMI1/ABM granted); base: x86-64 baseline
   "$CCC" $GCCINC $CFG -S "$SRC" -o "$TMP/fb.s" 2>/dev/null \
     || { bad "$CFG: lccc compile"; return; }
   # ANCHORED census (leading whitespace + `call` + whitespace + symbol):
@@ -51,11 +52,17 @@ check_cfg() {
   [ "$CALLS" -eq "$WANT_CALLS" ] \
     || bad "$CFG: $CALLS outlined calls (want $WANT_CALLS: $WHY)"
   TZ=$(grep -cE '^[[:space:]]*tzcnt[lq]' "$TMP/fb.s" || true)
-  [ "$TZ" -ge 1 ] \
-    || bad "$CFG: generic __ffs tree did not fold to tzcnt (got $TZ)"
   ANDN=$(grep -cE '^[[:space:]]*andn[lq]' "$TMP/fb.s" || true)
-  [ "$ANDN" -ge 1 ] \
-    || bad "$CFG: & ~addr2 arm did not fold to andn (got $ANDN)"
+  BSF=$(grep -cE '^[[:space:]]*bsf[lq]' "$TMP/fb.s" || true)
+  if [ "$TIER" = bmi ]; then
+    [ "$TZ" -ge 1 ] || bad "$CFG: generic __ffs tree did not fold to tzcnt (got $TZ)"
+    [ "$ANDN" -ge 1 ] || bad "$CFG: & ~addr2 arm did not fold to andn (got $ANDN)"
+  else
+    # Baseline: TZCNT/ANDN are post-x86-64; the __ffs tree lowers to bsf.
+    [ "$TZ" -eq 0 ] || bad "$CFG: baseline emitted $TZ tzcnt (post-baseline)"
+    [ "$ANDN" -eq 0 ] || bad "$CFG: baseline emitted $ANDN andn (post-baseline)"
+    [ "$BSF" -ge 1 ] || bad "$CFG: baseline __ffs did not lower to bsf (got $BSF)"
+  fi
 
   # Bit-exact runtime differential vs the host C compiler.
   "$CCC" $GCCINC $CFG "$SRC" -o "$TMP/l.x" 2>/dev/null \
@@ -73,8 +80,8 @@ check_cfg() {
   fi
 }
 
-check_cfg "-O2" 3 "historical 2-site cap holds: GCC outlines at -O2"
-check_cfg "-O3 -march=x86-64-v3" 3 "measured divergence: inline loses 3-8% at -O3"
+check_cfg "-O2" 3 "historical 2-site cap holds: GCC outlines at -O2" base
+check_cfg "-O3 -march=x86-64-v3" 3 "measured divergence: inline loses 3-8% at -O3" bmi
 
 if [ "$fails" -eq 0 ]; then
   note "findbit inline gate: PASS"

@@ -8,15 +8,15 @@
     "fma": 0
   },
   "zlib_ng_adler32": {
-    "insns": 256,
-    "stackmem": 14,
+    "insns": 201,
+    "stackmem": 6,
     "pushes": 6,
-    "moves": 51,
-    "ymm": 19,
+    "moves": 44,
+    "ymm": 0,
     "fma": 0
   },
   "expat_xml_scan": {
-    "insns": 182,
+    "insns": 183,
     "stackmem": 17,
     "pushes": 7,
     "moves": 27,
@@ -24,63 +24,63 @@
     "fma": 0
   },
   "sqlite_varint": {
-    "insns": 255,
+    "insns": 253,
     "stackmem": 11,
     "pushes": 7,
-    "moves": 34,
+    "moves": 33,
     "ymm": 0,
     "fma": 0
   },
   "glibc_memcmp": {
-    "insns": 177,
+    "insns": 171,
     "stackmem": 17,
-    "pushes": 11,
-    "moves": 35,
-    "ymm": 2,
+    "pushes": 10,
+    "moves": 31,
+    "ymm": 0,
     "fma": 0
   },
   "hash_table": {
-    "insns": 121,
+    "insns": 120,
     "stackmem": 0,
     "pushes": 8,
-    "moves": 26,
+    "moves": 25,
     "ymm": 0,
     "fma": 0
   },
   "zstd_count": {
-    "insns": 114,
+    "insns": 115,
     "stackmem": 8,
     "pushes": 6,
-    "moves": 23,
+    "moves": 24,
     "ymm": 0,
     "fma": 0
   },
   "stencil5": {
     "insns": 105,
     "stackmem": 6,
-    "pushes": 6,
-    "moves": 15,
-    "ymm": 6,
+    "pushes": 4,
+    "moves": 12,
+    "ymm": 0,
     "fma": 0
   },
   "chacha20_block": {
-    "insns": 172,
+    "insns": 192,
     "stackmem": 37,
     "pushes": 8,
     "moves": 9,
-    "ymm": 5,
+    "ymm": 0,
     "fma": 0
   },
   "portable_bit_counts": {
-    "insns": 226,
+    "insns": 231,
     "stackmem": 7,
     "pushes": 8,
-    "moves": 80,
+    "moves": 83,
     "ymm": 0,
     "fma": 0
   },
   "safe_count_guards": {
-    "insns": 166,
+    "insns": 174,
     "stackmem": 0,
     "pushes": 6,
     "moves": 57,

@@ -61,9 +61,13 @@ run_cfg() { # run_cfg <label> <flags...> ; asserts emission + execution
     check_eq "$label semantics" "$out" "fail=0"
 }
 
-# ---- 1. default: the x86-64-v3 baseline must survive ----------------------
+# ---- 1. default: the x86-64 baseline (SSE2, no post-baseline ISA) ---------
 run_cfg default
-check_gt0 "default AVX2 vectorization (ymm)" "$(count_ymm $tmp/default.s)"
+check_eq "default: no ymm (x86-64 baseline)" "$(count_ymm $tmp/default.s)" 0
+check_eq "default: no TZCNT (post-baseline)" "$(count_tzcnt $tmp/default.s)" 0
+check_eq "default: no LZCNT (post-baseline)" "$(count_lzcnt $tmp/default.s)" 0
+check_gt0 "default nonzero ctz uses BSF" "$(count_bsf $tmp/default.s)"
+check_gt0 "default nonzero clz uses BSR" "$(count_bsr $tmp/default.s)"
 # __builtin_clz/ctz have a nonzero source precondition.  The default
 # code-generation baseline is x86-64-v3, which GRANTS LZCNT (the integer
 # half of v3 rides with the AVX2 SIMD ceiling), so the optimal lowering is
@@ -72,12 +76,6 @@ check_gt0 "default AVX2 vectorization (ymm)" "$(count_ymm $tmp/default.s)"
 # for the BSR/BSF fallback and must never appear on the default path.
 check_eq "default nonzero clz/ctz zero-fixup guards" \
     "$(count_bitcount_zero_guards $tmp/default.s)" 0
-check_gt0 "default nonzero ctz uses TZCNT" "$(count_tzcnt $tmp/default.s)"
-check_gt0 "default nonzero clz uses LZCNT" "$(count_lzcnt $tmp/default.s)"
-check_eq "default nonzero ctz leaves no BSF behind" \
-    "$(count_bsf $tmp/default.s)" 0
-check_eq "default nonzero clz leaves no BSR behind" \
-    "$(count_bsr $tmp/default.s)" 0
 
 # A sticky -mno-lzcnt denial removes ABM from the v3 projection; the lowering
 # must fall back to the classical branchless BSR/BSF pair.
@@ -98,6 +96,8 @@ check_eq "baseline direct CTZ has no dead rdi-to-rax preload" \
 
 run_cfg march-v3 -march=x86-64-v3
 check_gt0 "-march=x86-64-v3 AVX2 vectorization (ymm)" "$(count_ymm $tmp/march-v3.s)"
+check_gt0 "-march=x86-64-v3 nonzero ctz uses TZCNT" "$(count_tzcnt $tmp/march-v3.s)"
+check_gt0 "-march=x86-64-v3 nonzero clz uses LZCNT" "$(count_lzcnt $tmp/march-v3.s)"
 
 # ---- 2. -mno-avx: downgrade to SSE2, keep vectorizing ---------------------
 for flag in -mno-avx -mno-avx2 -mno-sse4.1; do
@@ -136,7 +136,7 @@ check_eq "kernel ISA flags at -O3: ARX chacha20_block xmm refs" \
 
 # ---- 4. FMA3 gate ----------------------------------------------------------
 "$ccc" -O2 -S "$fmasrc" -o "$tmp/fma-default.s"
-check_gt0 "default fmaf folds to vfmadd" "$(count_vfmadd $tmp/fma-default.s)"
+check_eq "default fmaf: no vfmadd (FMA is opt-in)" "$(count_vfmadd $tmp/fma-default.s)" 0
 for flag in -mno-fma -mno-avx -march=x86-64-v2; do
     "$ccc" -O2 "$flag" -S "$fmasrc" -o "$tmp/fma.s"
     check_eq "$flag: vfmadd emission" "$(count_vfmadd $tmp/fma.s)" 0
@@ -152,7 +152,7 @@ done
 count_fma_family() {
     grep -cE '\bv(fm|fnm)(add|sub)[0-9]*p?s[sd]?\b|\bv(fm|fnm)(add|sub)' "$1" || true
 }
-for flag in "-mno-avx2" "-march=x86-64-v3 -mno-avx2"; do
+for flag in "-mavx -mfma" "-march=x86-64-v3 -mno-avx2"; do
     lbl=$(echo "$flag" | tr -d ' =-')
     "$ccc" -O2 $flag -S "$fmasrc" -o "$tmp/fma-$lbl.s"
     check_gt0 "$flag: scalar FMA families stay inline" \

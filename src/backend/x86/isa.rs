@@ -19,7 +19,9 @@
 //! # Policy
 //!
 //! * **No `-march`** — LCCC's documented code-generation baseline is
-//!   x86-64-v3 (SSE4.2 + AVX2 + FMA3 + BMI2 …).  Every measured benchmark
+//!   x86-64 (SSE2 + the x86-64 integer ISA, no POPCNT/BMI/AVX).  Post-x86-64
+//!   classes are opt-in: an explicit `-march=` (e.g. `-march=x86-64-v3`) or the
+//!   matching `-m*` flag grants them.  Every measured benchmark
 //!   number in `engineering/` depends on that, so a default-flag build keeps
 //!   every subset *unless the TU explicitly denied it* (`-mno-avx`,
 //!   `-mno-sse4.1`, `-mno-fma`, `-mno-sse`, `-mgeneral-regs-only`).
@@ -74,6 +76,10 @@ pub struct X86Isa {
     /// `x86-64` does not), mirroring `Driver::resolved_movbe`, which is also
     /// where `__builtin_cpu_supports("movbe")` gets its answer.
     pub movbe: bool,
+    /// CMPXCHG16B (`lock cmpxchg16b`) is legal.  Integer ISA like MOVBE and
+    /// granted only by `-mcx16` or a v2+ `-march` profile (GCC-exact).  When
+    /// it is off, 16-byte atomics call libatomic instead.
+    pub cx16: bool,
 }
 
 impl X86Isa {
@@ -85,6 +91,7 @@ impl X86Isa {
         ymm: false,
         fma: false,
         movbe: false,
+        cx16: false,
     };
 
     /// Plain x86-64 baseline: SSE2 only.
@@ -95,9 +102,11 @@ impl X86Isa {
         ymm: false,
         fma: false,
         movbe: false,
+        cx16: false,
     };
 
-    /// x86-64-v3: the project's code-generation baseline.
+    /// x86-64-v3: granted only by an explicit `-march=x86-64-v3` (or a
+    /// superset profile); never the default.
     pub const V3: X86Isa = X86Isa {
         simd: true,
         sse41: true,
@@ -105,6 +114,7 @@ impl X86Isa {
         ymm: true,
         fma: true,
         movbe: true,
+        cx16: true,
     };
 
     /// Enforce the implication chain (`ymm ⇒ avx ⇒ sse41 ⇒ simd`, `fma ⇒ avx`).
@@ -122,6 +132,7 @@ impl X86Isa {
             ymm,
             fma,
             movbe: self.movbe,
+            cx16: self.cx16,
         }
     }
 
@@ -131,6 +142,7 @@ impl X86Isa {
     const BIT_YMM: u8 = 1 << 3;
     const BIT_FMA: u8 = 1 << 4;
     const BIT_MOVBE: u8 = 1 << 5;
+    const BIT_CX16: u8 = 1 << 6;
 
     const fn to_bits(self) -> u8 {
         let n = self.normalized();
@@ -140,6 +152,7 @@ impl X86Isa {
             | (if n.ymm { Self::BIT_YMM } else { 0 })
             | (if n.fma { Self::BIT_FMA } else { 0 })
             | (if n.movbe { Self::BIT_MOVBE } else { 0 })
+            | (if n.cx16 { Self::BIT_CX16 } else { 0 })
     }
 
     const fn from_bits(b: u8) -> X86Isa {
@@ -150,22 +163,23 @@ impl X86Isa {
             ymm: b & Self::BIT_YMM != 0,
             fma: b & Self::BIT_FMA != 0,
             movbe: b & Self::BIT_MOVBE != 0,
+            cx16: b & Self::BIT_CX16 != 0,
         }
     }
 }
 
 impl Default for X86Isa {
-    /// The project baseline.  Unit tests and isolated emitters that never go
-    /// through the driver see v3, i.e. the historical unconditional-VEX
-    /// behaviour, so their expectations are unchanged.
+    /// The x86-64 baseline (SSE2, no VEX).  Unit tests and isolated emitters
+    /// that never go through the driver see this baseline; anything that needs
+    /// a post-x86-64 class must request it explicitly.
     fn default() -> Self {
-        X86Isa::V3
+        X86Isa::SSE2
     }
 }
 
 /// Process-global mirror of the current TU's permission for emitters that
 /// have no access to `X86Codegen` (MachInst emission, peephole passes).
-static CURRENT: AtomicU8 = AtomicU8::new(X86Isa::V3.to_bits());
+static CURRENT: AtomicU8 = AtomicU8::new(X86Isa::SSE2.to_bits());
 
 /// Publish `isa` for the code paths without `&self`.  Called by
 /// `X86Codegen::apply_options` once per translation unit.
@@ -173,7 +187,8 @@ pub fn set_current(isa: X86Isa) {
     CURRENT.store(isa.to_bits(), Ordering::Relaxed);
 }
 
-/// The permission published by the last [`set_current`] (v3 until then).
+/// The permission published by the last [`set_current`]; the x86-64 baseline
+/// (SSE2) until a driver publishes one.
 #[inline]
 pub fn current() -> X86Isa {
     X86Isa::from_bits(CURRENT.load(Ordering::Relaxed))
@@ -192,6 +207,7 @@ mod tests {
             ymm: true,
             fma: true,
             movbe: false,
+            cx16: false,
         };
         assert_eq!(bogus.normalized(), X86Isa::NONE);
         let no_vex_fma = X86Isa {
@@ -201,6 +217,7 @@ mod tests {
             ymm: true,
             fma: true,
             movbe: false,
+            cx16: false,
         };
         let n = no_vex_fma.normalized();
         assert!(n.simd && n.sse41 && !n.avx && !n.ymm && !n.fma);
@@ -208,7 +225,7 @@ mod tests {
 
     #[test]
     fn bits_round_trip() {
-        for bits in 0u8..64 {
+        for bits in 0u8..128 {
             let isa = X86Isa::from_bits(bits).normalized();
             assert_eq!(X86Isa::from_bits(isa.to_bits()), isa);
         }
@@ -223,6 +240,7 @@ mod tests {
         // for a plain x86-64 TU does not grant it.
         let no_simd_but_movbe = X86Isa {
             movbe: true,
+            cx16: false,
             ..X86Isa::NONE
         };
         assert!(no_simd_but_movbe.normalized().movbe);

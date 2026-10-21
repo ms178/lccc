@@ -43,11 +43,15 @@ check() { # check <desc> <actual> <expected>
     fi
 }
 
-# Default: the v3 grant — LZCNT/TZCNT and POPCNT are both on.
+# Default = x86-64 baseline: LZCNT/TZCNT/POPCNT are post-baseline, so off.
 emit default
 d=$tmp/default.s
-[[ "$(count $d)" -gt 0 ]] || { echo "FAIL: default did not enable lzcnt/tzcnt (v3 baseline)" >&2; fail=1; }
-[[ "$(countpop $d)" -gt 0 ]] || { echo "FAIL: default did not enable popcnt (v2 ⊂ v3)" >&2; fail=1; }
+check "default lzcnt/tzcnt emission" "$(count $d)" 0
+check "default popcnt emission" "$(countpop $d)" 0
+# Opt-in: -march=x86-64-v3 grants LZCNT/TZCNT and POPCNT.
+emit v3 -march=x86-64-v3
+[[ "$(count $tmp/v3.s)" -gt 0 ]] || { echo "FAIL: -march=x86-64-v3 did not enable lzcnt/tzcnt" >&2; fail=1; }
+[[ "$(countpop $tmp/v3.s)" -gt 0 ]] || { echo "FAIL: -march=x86-64-v3 did not enable popcnt" >&2; fail=1; }
 
 # Explicit-denial arm: the default grant must fold under -mno-lzcnt.
 emit nolzcnt -mno-lzcnt

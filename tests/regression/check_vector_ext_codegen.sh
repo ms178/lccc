@@ -28,7 +28,7 @@
 #   * the home-to-%ymm0 move of a register-valued vector return was deleted
 #     by the FP liveness oracle (`LCCC_RET_XMM` did not name bank 0).
 #
-# Part 2 -- code quality at -O2 -mavx2 (the host's level), lccc only, so
+# Part 2 -- code quality at -O2 -march=x86-64-v3 (opt-in AVX2 level), lccc only, so
 # the ceilings do not drift with the GCC version: instruction counts for
 # the shapes the whole-vector lowering owns.  Before this lowering `add8`
 # was 37 instructions (GCC: 2); the ceilings below are the measured counts
@@ -81,11 +81,9 @@ cpu_has avx512f && levels+=("-O2 -mavx512f")
 # all; there lccc runs with `-ffp-contract=off` so the differential compares
 # equal roundings (lccc's fusion at those levels is covered by Part 3).
 gcc_isa_flags() {
-    case " $1 " in
-        *" -mno-fma "* | *" -mno-avx "* | *" -mfma "* | *" -march="*) echo "$1" ;;
-        *" -mavx"*) echo "$1 -mfma" ;;
-        *) echo "$1" ;;
-    esac
+    # Identity: GCC does not imply -mfma from any -mavx* flag (measured,
+    # gcc 14/16), so the reference build contracts exactly where lccc does.
+    echo "$1"
 }
 lccc_isa_flags() {
     case " $1 " in
@@ -141,7 +139,7 @@ done
 [ "$runs" -gt 0 ] || fail "no runtime differential ran"
 
 # ---------------------------------------------------------------- Part 2
-"$ccc" -O2 -mavx2 -S "$src" -o "$tmp/m.s"
+"$ccc" -O2 -march=x86-64-v3 -S "$src" -o "$tmp/m.s"
 count() {
     # Instructions in function $1 (lines after its label up to .cfi_endproc,
     # excluding directives, labels, comments and blank lines).
@@ -159,7 +157,7 @@ ceiling() {
     local fn=$1 max=$2 n
     n=$(count "$fn")
     if [ "$n" -gt "$max" ]; then
-        fail "$fn: $n instructions at -O2 -mavx2 (ceiling $max)"
+        fail "$fn: $n instructions at -O2 -march=x86-64-v3 (ceiling $max)"
     fi
 }
 # Two-operand arithmetic: one packed op + ret (GCC: 2).
@@ -182,7 +180,7 @@ ceiling sh4_vs_sar 6
 for fn in sh_vs_shl sh_vs_sar sh_vs_shr sh_vs_shl_l sh_vs_shr_ul; do ceiling "$fn" 6; done
 if ! awk '$0 == "shr_v32i:" {on=1; next} on && /\.cfi_endproc/ {exit} on' "$tmp/m.s" |
     grep -q 'vpsravd'; then
-    fail "shr_v32i: expected a per-lane vpsravd at -O2 -mavx2"
+    fail "shr_v32i: expected a per-lane vpsravd at -O2 -march=x86-64-v3"
 fi
 # Compare masks (GCC: 2): every lane width at both register widths, the
 # 128-bit forms through the VEX.128 three-operand path.
@@ -273,7 +271,7 @@ if awk '$0 == "fma_acc:" {on=1; next} on && /\.cfi_endproc/ {exit} on' "$tmp/m.s
 fi
 if ! awk '$0 == "fma_f8:" {on=1; next} on && /\.cfi_endproc/ {exit} on' "$tmp/m.s" |
     grep -q 'vfmadd'; then
-    fail "fma_f8: expected a fused vfmadd at -O2 -mavx2 (default -ffp-contract=fast)"
+    fail "fma_f8: expected a fused vfmadd at -O2 -march=x86-64-v3 (default -ffp-contract=fast)"
 fi
 # Memory-object shapes must not realign per access.
 for fn in add_v32f cond_v32f loop_v32f sel_mask mix_sab; do
