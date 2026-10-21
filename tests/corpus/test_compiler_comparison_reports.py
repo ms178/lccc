@@ -48,7 +48,12 @@ def report():
 class ComparisonReport(unittest.TestCase):
     def test_full_correct_registry_is_required_and_never_deduplicated(self):
         data = report()
-        self.assertEqual(summary.summarize(data)['comparisons']['prior']['timing_eligible'], 46)
+        registry = len(summary.bench.BENCHMARKS)
+        # 46 is the documented floor of the native corpus; the exact number is
+        # derived so a new benchmark does not silently break the completeness
+        # contract that this test is actually about.
+        self.assertGreaterEqual(registry, 46)
+        self.assertEqual(summary.summarize(data)['comparisons']['prior']['timing_eligible'], registry)
         for mutate in [lambda rows: rows.pop(), lambda rows: rows.append(copy.deepcopy(rows[0])),
                        lambda rows: rows[0].update(name='unknown')]:
             bad = copy.deepcopy(data)
@@ -60,12 +65,14 @@ class ComparisonReport(unittest.TestCase):
         data = report()
         data['benchmarks'][0]['runtime']['lccc']['wall']['median'] = .001
         result = summary.summarize(data)
-        self.assertEqual(result['comparisons']['prior']['correct'], 46)
-        self.assertEqual(result['comparisons']['prior']['timing_eligible'], 45)
+        registry = len(summary.bench.BENCHMARKS)
+        self.assertEqual(result['comparisons']['prior']['correct'], registry)
+        self.assertEqual(result['comparisons']['prior']['timing_eligible'], registry - 1)
         self.assertFalse(result['rows'][0]['ratios']['prior']['eligible'])
 
     def test_wrong_failed_unstable_and_short_arms_are_not_performance_evidence(self):
-        for mutate in [
+        registry = len(summary.bench.BENCHMARKS)
+        mutations = [
             lambda row: row['correctness']['prior'].update(matches_baseline=False),
             lambda row: row['correctness']['prior'].update(stable_within_compiler=False),
             lambda row: row['runs']['prior'].append({'ok': False}),
@@ -73,10 +80,16 @@ class ComparisonReport(unittest.TestCase):
             lambda row: row['runs']['prior'].clear(),
             lambda row: row['runs']['prior'].pop(),
             lambda row: row['correctness']['gcc'].update(matches_baseline=False),
-        ]:
-            data = report()
-            mutate(data['benchmarks'][0])
-            self.assertEqual(summary.summarize(data)['comparisons']['prior']['timing_eligible'], 45)
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(case=index):
+                data = report()
+                mutate(data['benchmarks'][0])
+                # Exactly one of the registry's rows stops being timing
+                # evidence; every other row is unaffected.
+                self.assertEqual(
+                    summary.summarize(data)['comparisons']['prior']['timing_eligible'],
+                    registry - 1)
 
     def test_raw_warmups_and_samples_override_cached_success_flags(self):
         for location, arm, observation in [
@@ -91,7 +104,8 @@ class ComparisonReport(unittest.TestCase):
                 data = report()
                 data['benchmarks'][0].setdefault(location, {}).setdefault(arm, []).append(observation)
                 result = summary.summarize(data)
-                self.assertEqual(result['comparisons']['prior']['timing_eligible'], 45)
+                self.assertEqual(result['comparisons']['prior']['timing_eligible'],
+                                 len(summary.bench.BENCHMARKS) - 1)
                 self.assertFalse(result['rows'][0]['correct']['prior'])
 
     def test_codegen_counts_preserve_aliases_and_name_stack_references_truthfully(self):
