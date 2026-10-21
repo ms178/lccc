@@ -1,3 +1,4 @@
+// FLAGS: -mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi2 -mavx512vpopcntdq -mavx512bitalg -mgfni -mvaes -mvpclmulqdq
 /* 512-bit integer intrinsic differential test (AVX-512F/BW/VL/VNNI/VBMI2/BITALG/VPCLMULQDQ) */
 #include <immintrin.h>
 #include <stdio.h>

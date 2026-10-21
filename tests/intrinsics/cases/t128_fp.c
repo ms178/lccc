@@ -66,8 +66,14 @@ int main(void) {
     _mm_storeu_si128((__m128i_u *)iout, iv);
     printf("cvttps_epi32: %d %d %d %d\n", iout[0], iout[1], iout[2], iout[3]);
     dump128("cvtepi32_ps", _mm_cvtepi32_ps(_mm_set_epi32(4, 3, 2, 1)));
-    dump128("cvtps_pd", (__m128)_mm_cvtps_pd(a));
-    dump128d("cvtpd_ps", (__m128d)_mm_cvtpd_ps(ad));
+    /* Type-punning between the two members of the __m128 family must go
+     * through the cast intrinsics: C forbids a cast between distinct struct
+     * types, and this compiler defines __m128/__m128d as structs (GCC's are
+     * vector types, where the same cast happens to be a legal GCC extension).
+     * _mm_castpd_ps/_mm_castps_pd exist on GCC, Clang and this compiler, so
+     * the differential test stays valid for all three. */
+    dump128("cvtps_pd", _mm_castpd_ps(_mm_cvtps_pd(a)));
+    dump128d("cvtpd_ps", _mm_castps_pd(_mm_cvtpd_ps(ad)));
 
     /* round/blend/dp */
     dump128("round", _mm_round_ps(a, 0x8));
@@ -86,11 +92,11 @@ int main(void) {
     /* scalar movs + converts */
     dump128("movess", _mm_move_ss(a, b));
     dump128d("movesd", _mm_move_sd(ad, bd));
-    dump128("cvtss_sd", (__m128)_mm_cvtss_sd(ad, b));
+    dump128("cvtss_sd", _mm_castpd_ps(_mm_cvtss_sd(ad, b)));
     dump128("cvtsd_ss", _mm_cvtsd_ss(a, ad));
     dump128("cvtsi32_ss", _mm_cvtsi32_ss(a, 42));
     dump128("cvtsi64_ss", _mm_cvtsi64_ss(a, 4242424242LL));
-    dump128("cvtsi32_sd", (__m128)_mm_cvtsi32_sd(ad, 42));
+    dump128("cvtsi32_sd", _mm_castpd_ps(_mm_cvtsi32_sd(ad, 42)));
     printf("cvtss_si32=%d\n", _mm_cvtss_si32(a));
     printf("cvtsd_si32=%d\n", _mm_cvtsd_si32(ad));
     printf("cvttss_si32=%d\n", _mm_cvttss_si32(a));

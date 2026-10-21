@@ -29,6 +29,13 @@ impl RiscvCodegen {
                 // No RISC-V equivalent; emit fence as best approximation
                 self.state.emit("    fence iorw, iorw");
             }
+            IntrinsicOp::Prefetch(_) => {
+                // Zicbop's `prefetch.r` is an optional extension: emitting it
+                // unconditionally would fault on a core without it, so the
+                // hint is dropped here. Dropping a prefetch is always
+                // semantics-preserving — it only costs the latency the hint
+                // would have hidden.
+            }
             IntrinsicOp::Movnti => {
                 // Non-temporal 32-bit store: dest_ptr = target address, args[0] = value
                 if let Some(ptr) = dest_ptr {

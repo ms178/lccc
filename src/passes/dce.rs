@@ -660,6 +660,42 @@ mod tests {
         assert_eq!(func.blocks[0].instructions.len(), 3); // alloca, store, load
     }
 
+    /// A prefetch hint has no result value, so the ONLY thing that keeps it
+    /// alive is `has_side_effects`. If `IntrinsicOp::Prefetch` were ever
+    /// marked pure, every hint would vanish between the frontend and the
+    /// backend and the builtin would silently regress to the historical
+    /// no-op — with no test failure anywhere else.
+    #[test]
+    fn test_prefetch_hint_is_not_dead_code() {
+        use crate::ir::reexports::IntrinsicOp;
+        let mut func = IrFunction::new("test".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                alloca(0, IrType::I64, 8, 8),
+                Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::Prefetch(3),
+                    dest_ptr: None,
+                    args: vec![Operand::Value(Value(0))],
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        eliminate_dead_code(&mut func);
+        assert!(
+            func.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Intrinsic {
+                    op: IntrinsicOp::Prefetch(_),
+                    ..
+                }
+            )),
+            "prefetch hint was eliminated as dead code"
+        );
+    }
+
     #[test]
     fn test_side_effects_preserved() {
         // Calls should never be removed even if result is unused

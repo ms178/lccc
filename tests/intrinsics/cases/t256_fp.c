@@ -64,9 +64,21 @@ int main(void) {
     printf("cvttps_epi32: %d %d %d %d\n", iout[0], iout[1], iout[2], iout[3]);
     dump256("cvtepi32_ps", _mm256_cvtepi32_ps(_mm256_set_epi32(8, 7, 6, 5, 4, 3, 2, 1)));
     dump256d("cvtps_pd", _mm256_cvtps_pd(_mm256_castps256_ps128(a)));
+    /* The four width-changing converts below are 1:2 widening (xmm source,
+     * ymm destination) or 2:1 narrowing (ymm source, xmm destination). An
+     * emitter that treats them as plain ymm->ymm ops emits
+     * `vcvtps2pd %ymm0, %ymm0`, which does not assemble, so each one must be
+     * listed explicitly: only then does the case fail when one regresses. */
     __m128 cpd = _mm256_cvtpd_ps(ad);
     float cp[4]; _mm_storeu_ps(cp, cpd);
     printf("cvtpd_ps: %.6g %.6g %.6g %.6g\n", (double)cp[0], (double)cp[1], (double)cp[2], (double)cp[3]);
+    __m128i cpi = _mm256_cvtpd_epi32(ad);
+    int cpo[4]; _mm_storeu_si128((__m128i_u *)cpo, cpi);
+    printf("cvtpd_epi32: %d %d %d %d\n", cpo[0], cpo[1], cpo[2], cpo[3]);
+    __m128i cpti = _mm256_cvttpd_epi32(ad);
+    _mm_storeu_si128((__m128i_u *)cpo, cpti);
+    printf("cvttpd_epi32: %d %d %d %d\n", cpo[0], cpo[1], cpo[2], cpo[3]);
+    dump256d("cvtepi32_pd", _mm256_cvtepi32_pd(_mm256_castsi256_si128(_mm256_set_epi32(8, 7, 6, 5, 4, 3, 2, 1))));
 
     /* round/blend/permute */
     dump256("round", _mm256_round_ps(a, 0x8));

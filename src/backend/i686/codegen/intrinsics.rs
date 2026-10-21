@@ -41,6 +41,15 @@ impl I686Codegen {
                 self.operand_to_eax(&args[0]);
                 self.state.emit("    clflush (%eax)");
             }
+            IntrinsicOp::Prefetch(flavor) => {
+                // Same flavor table as x86-64 (IntrinsicOp::Prefetch). The
+                // i686 backend already assumes an SSE2 baseline elsewhere
+                // (`clflush` just above is SSE2), and every prefetch form
+                // below is SSE1, so they are always encodable here.
+                self.operand_to_eax(&args[0]);
+                self.state
+                    .emit_fmt(format_args!("    {} (%eax)", prefetch_mnemonic(*flavor)));
+            }
 
             // --- Non-temporal stores ---
             IntrinsicOp::Movnti
@@ -2730,5 +2739,33 @@ impl I686Codegen {
         }
         self.state.f128_direct_slots.insert(d.0);
         self.state.reg_cache.invalidate_all();
+    }
+}
+
+/// i686 mnemonic for an `IntrinsicOp::Prefetch` payload (mirrors the x86-64
+/// table; the flavor encoding is target-independent, the encodings are not).
+pub(super) fn prefetch_mnemonic(flavor: u8) -> &'static str {
+    match flavor {
+        0 => "prefetchnta",
+        1 => "prefetcht2",
+        2 => "prefetcht1",
+        _ => "prefetcht0",
+    }
+}
+
+#[cfg(test)]
+mod prefetch_mnemonic_tests {
+    use super::prefetch_mnemonic;
+
+    #[test]
+    fn every_payload_maps_to_a_real_prefetch_form() {
+        assert_eq!(prefetch_mnemonic(0), "prefetchnta");
+        assert_eq!(prefetch_mnemonic(1), "prefetcht2");
+        assert_eq!(prefetch_mnemonic(2), "prefetcht1");
+        assert_eq!(prefetch_mnemonic(3), "prefetcht0");
+        assert_eq!(prefetch_mnemonic(4), "prefetcht0");
+        for f in 5u8..=255 {
+            assert_eq!(prefetch_mnemonic(f), "prefetcht0");
+        }
     }
 }

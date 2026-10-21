@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import re
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).parent.parent.parent
@@ -26,6 +27,53 @@ CASES = Path(__file__).parent / "cases"
 COMPILE_TIMEOUT = 60
 RUN_TIMEOUT = 30
 
+# `-m` option -> the /proc/cpuinfo flag that must be present to RUN the result.
+# A differential test compares program output, so a case whose ISA the host
+# cannot execute is inconclusive, not failing.
+ISA_REQUIREMENTS = {
+    "-msse3": "pni",
+    "-mssse3": "ssse3",
+    "-msse4.1": "sse4_1",
+    "-msse4.2": "sse4_2",
+    "-mavx": "avx",
+    "-mavx2": "avx2",
+    "-mfma": "fma",
+    "-mgfni": "gfni",
+    "-mvaes": "vaes",
+    "-mvpclmulqdq": "vpclmulqdq",
+    "-mavx512f": "avx512f",
+    "-mavx512bw": "avx512bw",
+    "-mavx512vl": "avx512vl",
+    "-mavx512dq": "avx512dq",
+    "-mavx512vnni": "avx512_vnni",
+    "-mavx512vbmi2": "avx512_vbmi2",
+    "-mavx512vpopcntdq": "avx512_vpopcntdq",
+    "-mavx512bitalg": "avx512_bitalg",
+}
+
+
+def host_flags():
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("flags"):
+                return set(line.split(":", 1)[1].split())
+    except OSError:
+        pass
+    return None
+
+
+def missing_isa(flags):
+    """ISA features the case needs that this host cannot execute."""
+    have = host_flags()
+    if have is None:
+        return []
+    return [
+        ISA_REQUIREMENTS[f]
+        for f in flags
+        if f in ISA_REQUIREMENTS and ISA_REQUIREMENTS[f] not in have
+    ]
+
+
 def run(cmd, timeout=COMPILE_TIMEOUT):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -36,7 +84,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("filter", nargs="?", default="")
     ap.add_argument("--lccc-flags", default="-O2", help="optimization flags for lccc")
-    ap.add_argument("--gcc-flags", default="-O2 -mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512vnni -mavx512vbmi2 -mavx512vpopcntdq -mavx512bitalg -mgfni -mvaes -mvpclmulqdq",
+    # Identical optimization flags for both compilers, on purpose: the case's
+    # own `// FLAGS:` line supplies the ISA features it needs. Blanket AVX-512
+    # flags for the GCC leg made the comparison depend on the host (a runner
+    # without AVX-512 executes GCC's auto-vectorised prologue and faults while
+    # this compiler's narrower code does not) and changed GCC's codegen for
+    # cases that never asked for it.
+    ap.add_argument("--gcc-flags", default="-O2",
                     help="optimization flags for GCC")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
@@ -45,6 +99,15 @@ def main():
     if args.filter:
         files = [f for f in files if args.filter in f.name]
 
+    # Binaries go to a private temporary directory. A fixed path (this runner
+    # used to fall back to /home/user/work) is unwritable wherever the checkout
+    # runs as a different user, which failed the whole gate before it tested
+    # anything; a temp dir is also self-cleaning and safe to run concurrently.
+    with tempfile.TemporaryDirectory(prefix="lccc-intrin-") as tmpdir:
+        return run_cases(args, files, Path(tmpdir))
+
+
+def run_cases(args, files, workdir):
     npass = nfail = nskip = 0
     failures = []
     for src in files:
@@ -56,12 +119,17 @@ def main():
             if m:
                 extra = m.group(1).split()
                 break
+        lacking = missing_isa(extra)
+        if lacking:
+            print(f"SKIP {name} (host lacks {' '.join(lacking)})")
+            nskip += 1
+            continue
+
         lccc_flags = (args.lccc_flags + " " + " ".join(extra)).split()
         gcc_flags = (args.gcc_flags + " " + " ".join(extra)).split()
 
-        lbin = REPO / "work" / f"it_{name}_lccc" if (REPO / "work").exists() else Path(f"/home/user/work/it_{name}_lccc")
-        gbin = Path(str(lbin).replace("_lccc", "_gcc"))
-        lbin.parent.mkdir(parents=True, exist_ok=True)
+        lbin = workdir / f"it_{name}_lccc"
+        gbin = workdir / f"it_{name}_gcc"
 
         # GCC must also find lccc's headers for _mm* availability tests? No:
         # GCC uses its own headers; lccc uses lccc's. lccc needs gcc's std headers.
