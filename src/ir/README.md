@@ -497,13 +497,13 @@ Key methods on `IrConst`:
 
 ## Intrinsics
 
-`IntrinsicOp` defines **81 target-independent intrinsic operations**. Each
+`IntrinsicOp` defines **82 target-independent intrinsic operations**. Each
 backend emits the appropriate native instructions for its architecture. The
 variants are organized by ISA extension:
 
 | Category | Count | Examples |
 |----------|-------|---------|
-| Fences and barriers | 5 | `Lfence`, `Mfence`, `Sfence`, `Pause`, `Clflush` |
+| Fences and barriers | 6 | `Lfence`, `Mfence`, `Sfence`, `Pause`, `Clflush`, `Prefetch` |
 | Non-temporal stores | 4 | `Movnti`, `Movnti64`, `Movntdq`, `Movntpd` |
 | 128-bit load/store | 4 | `Loaddqu`, `Storedqu`, `Loadldi128`, `Storeldi128` |
 | SSE2 packed integer | 10 | `Pcmpeqb128`, `Pcmpeqd128`, `Psubusb128`, `Psubsb128`, `Por128`, `Pand128`, `Pxor128`, `Pmovmskb128`, `SetEpi8`, `SetEpi32` |

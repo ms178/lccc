@@ -694,6 +694,15 @@ jobs:
         set -euo pipefail
         python3 scripts/check_intrinsic_arity.py --self-test
         python3 scripts/check_intrinsic_arity.py --check
+    - name: Intrinsic differential corpus (lccc vs GCC)
+      run: |
+        set -euo pipefail
+        # Compiles and runs every case in tests/intrinsics/cases with lccc and
+        # with GCC, then compares stdout and exit code. Catches emitted-but-
+        # unassemblable vector forms (a 256-bit width-changing convert used to
+        # be spelled `vcvtps2pd %ymm0, %ymm0`) that a compile-only gate cannot.
+        env LCCC_BIN=target/fastbuild/lccc CC=gcc \
+          python3 tests/intrinsics/run_intrin_tests.py
     - name: Ill-typed builtin acceptance
       run: |
         set -euo pipefail
@@ -1591,6 +1600,7 @@ jobs:
         bash tests/regression/check_fma_gating.sh
         bash tests/regression/check_fma_dest_coalesce_codegen.sh
         bash tests/regression/check_vector_remainder_codegen.sh
+        bash tests/regression/check_vectorize_round_maps.sh
         bash tests/regression/check_fma_matcher_guards.sh
         bash tests/regression/check_redundant_test_elimination.sh
         # Escaped-local frame addresses stay direct operands, direct -c

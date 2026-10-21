@@ -1405,6 +1405,11 @@ gate "fma-dest-coalesce" fast \
 gate "vector-remainder-codegen" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_vector_remainder_codegen.sh
 
+# SSE4.1/AVX packed floor/ceil/trunc/nearbyint maps: every immediate mode,
+# 128/256-bit ISA leg, scalar-tail length and signed-zero/NaN arm is pinned.
+gate "vector-round-maps" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_vectorize_round_maps.sh
+
 # Escaped locals under register pressure: constant-offset frame addresses are
 # direct operands, never reloaded spilled pointers (zstd sequence-decoder shape).
 gate "frame-gep-direct" fast \

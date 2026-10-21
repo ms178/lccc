@@ -1909,6 +1909,25 @@ impl X86Codegen {
                 self.operand_to_reg(&args[0], "rax");
                 self.state.emit("    clflush (%rax)");
             }
+            IntrinsicOp::Prefetch(flavor) => {
+                // args[0] = address to prefetch; the payload selects one of
+                // the SSE prefetch flavors (see IntrinsicOp::Prefetch's table
+                // for why payload 4 — write intent — maps to `prefetcht0`
+                // here rather than to `prefetchw`). Every emitted form is
+                // architecturally a hint that cannot fault.
+                // A prefetch never faults, so no address-form guard is
+                // needed — including the constant-0 fallback for an argument
+                // that materialises as an immediate.
+                // CCC_NO_PREFETCH drops the hint entirely. Prefetching is a
+                // pure performance decision with no semantic content, so it
+                // needs a bisection switch of its own: an arm built with it
+                // must be byte-comparable against one without it.
+                if std::env::var_os("CCC_NO_PREFETCH").is_none() {
+                    self.operand_to_reg(&args[0], "rax");
+                    self.state
+                        .emit_fmt(format_args!("    {} (%rax)", prefetch_mnemonic(*flavor)));
+                }
+            }
             IntrinsicOp::Movnti
             | IntrinsicOp::Movnti64
             | IntrinsicOp::Movntdq
@@ -2159,10 +2178,27 @@ impl X86Codegen {
                 // vfmadd231 form: dest_reg preloaded with the addend, then
                 // dest = src2*src1 + dest — exactly emit_scalar_fma231's
                 // contract (shared with the mul+add fusion pass).
-                self.emit_scalar_fma231(&args[0], &args[1], &args[2], &dest.unwrap(), IrType::F64);
+                // Hardened: dest may be None only when DCE proves the
+                // result dead; silently skipping is correct, but we verify
+                // in debug that no live use was dropped.
+                let Some(d) = dest else {
+                    debug_assert!(
+                        false,
+                        "FmaScalarF64 with None dest: DCE should have removed the producer if dead"
+                    );
+                    return;
+                };
+                self.emit_scalar_fma231(&args[0], &args[1], &args[2], d, IrType::F64);
             }
             IntrinsicOp::FmaScalarF32 => {
-                self.emit_scalar_fma231(&args[0], &args[1], &args[2], &dest.unwrap(), IrType::F32);
+                let Some(d) = dest else {
+                    debug_assert!(
+                        false,
+                        "FmaScalarF32 with None dest: DCE should have removed the producer if dead"
+                    );
+                    return;
+                };
+                self.emit_scalar_fma231(&args[0], &args[1], &args[2], d, IrType::F32);
             }
             IntrinsicOp::FmaScalarF64Signed(np, na) => {
                 // fma(-a, b, -c) & friends after the IR negation peel: the
@@ -2170,26 +2206,18 @@ impl X86Codegen {
                 // vfnmsub), the operand movement is the plain family's.
                 // (np, na) == (false, false) is defensive — the peel emits
                 // the plain intrinsic when both flags cancel.
-                self.emit_scalar_fma_signed(
-                    &args[0],
-                    &args[1],
-                    &args[2],
-                    &dest.unwrap(),
-                    IrType::F64,
-                    *np,
-                    *na,
-                );
+                let Some(d) = dest else {
+                    debug_assert!(false, "FmaScalarF64Signed({},{}) with None dest", np, na);
+                    return;
+                };
+                self.emit_scalar_fma_signed(&args[0], &args[1], &args[2], d, IrType::F64, *np, *na);
             }
             IntrinsicOp::FmaScalarF32Signed(np, na) => {
-                self.emit_scalar_fma_signed(
-                    &args[0],
-                    &args[1],
-                    &args[2],
-                    &dest.unwrap(),
-                    IrType::F32,
-                    *np,
-                    *na,
-                );
+                let Some(d) = dest else {
+                    debug_assert!(false, "FmaScalarF32Signed({},{}) with None dest", np, na);
+                    return;
+                };
+                self.emit_scalar_fma_signed(&args[0], &args[1], &args[2], d, IrType::F32, *np, *na);
             }
             IntrinsicOp::RoundScalarF64(imm) => {
                 self.emit_fp_scalar_round(dest, &args[0], IrType::F64, *imm);
@@ -3065,8 +3093,8 @@ impl X86Codegen {
                     };
                     self.avx_load_arg(&args[0]);
                     if let Operand::Value(v) = &args[1] {
-                        if let crate::backend::state::SlotAddr::Direct(slot) =
-                            self.state.resolve_slot_addr(v.0).unwrap()
+                        if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
+                            self.state.resolve_slot_addr(v.0)
                         {
                             self.state.emit_fmt(format_args!(
                                 "    vmovdqu {}, %ymm1",
@@ -3089,8 +3117,8 @@ impl X86Codegen {
                 if let Some(dptr) = dest_ptr {
                     self.avx_load_arg(&args[0]);
                     if let Operand::Value(v) = &args[1] {
-                        if let crate::backend::state::SlotAddr::Direct(slot) =
-                            self.state.resolve_slot_addr(v.0).unwrap()
+                        if let Some(crate::backend::state::SlotAddr::Direct(slot)) =
+                            self.state.resolve_slot_addr(v.0)
                         {
                             self.state.emit_fmt(format_args!(
                                 "    vmovdqu {}, %ymm1",
@@ -6383,19 +6411,169 @@ impl X86Codegen {
             // blend would smear one mask bit across four bytes.  The
             // 128-bit form is the lane-agnostic bitwise select
             // `(t & m) | (f & ~m)` — exact for a byte mask at SSE2.
-            IntrinsicOp::VecSqrtF64x4 | IntrinsicOp::VecSqrtF32x8 => {
-                // Unary AVX: stream the operand through %ymm0.
-                if let Some(d) = dest {
-                    self.flush_pending_vec_store_impl();
-                    self.state.invalidate_vec_peephole();
+            IntrinsicOp::VecRoundF64x4 | IntrinsicOp::VecRoundF32x8 => {
+                assert!(
+                    matches!(args.len(), 2..=4),
+                    "packed round requires vector+imm or base+index[+disp]+imm: got {args:?}"
+                );
+                let Some(d) = dest else {
+                    debug_assert!(
+                        false,
+                        "VecRound 256b {op:?} with None dest — DCE should have removed it"
+                    );
+                    return;
+                };
+                // Godlike validation: mem-fold must be base+index (Value) + optional disp/imm (Const).
+                // Early typed assert gives a precise ICE rather than an opaque vec_mem_operand panic.
+                if args.len() >= 3 {
+                    assert!(
+                        matches!(args[0], Operand::Value(_))
+                            && matches!(args[1], Operand::Value(_)),
+                        "packed round mem-fold base/index must be Value: {args:?}"
+                    );
+                    if args.len() == 4 {
+                        assert!(
+                            matches!(args[2], Operand::Const(_)),
+                            "packed round disp must be Const: {args:?}"
+                        );
+                    }
+                    assert!(
+                        matches!(args.last().unwrap(), Operand::Const(_)),
+                        "packed round imm must be Const: {args:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(args[0], Operand::Value(_)),
+                        "packed round register source must be Value: {args:?}"
+                    );
+                }
+                let inst = if matches!(op, IntrinsicOp::VecRoundF64x4) {
+                    "vroundpd"
+                } else {
+                    "vroundps"
+                };
+                let imm = self.operand_to_imm_i64(args.last().unwrap_or(&args[0]));
+                if args.len() >= 3 {
+                    let disp = if args.len() == 4 {
+                        Self::vec_disp_arg(args, 2)
+                    } else {
+                        0
+                    };
+                    let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, {}, %ymm0", inst, imm, mem));
+                } else {
                     self.avx_load_arg_to(&args[0], "ymm0");
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, %ymm0, %ymm0", inst, imm));
+                }
+                self.state.vec_last_store_val = Some(d.0);
+                self.state.vec_last_store_reg = true;
+                self.state.vec_last_store_reg_name = Some("ymm0");
+                self.avx_store_dest(d);
+            }
+            IntrinsicOp::VecRoundF64x2 | IntrinsicOp::VecRoundF32x4 => {
+                assert!(
+                    matches!(args.len(), 2..=4),
+                    "packed round requires vector+imm or base+index[+disp]+imm: got {args:?}"
+                );
+                let Some(d) = dest else {
+                    debug_assert!(false, "VecRound 128b {op:?} with None dest");
+                    return;
+                };
+                if args.len() >= 3 {
+                    assert!(
+                        matches!(args[0], Operand::Value(_))
+                            && matches!(args[1], Operand::Value(_)),
+                        "packed round mem-fold base/index must be Value: {args:?}"
+                    );
+                    if args.len() == 4 {
+                        assert!(
+                            matches!(args[2], Operand::Const(_)),
+                            "packed round disp must be Const: {args:?}"
+                        );
+                    }
+                    assert!(
+                        matches!(args.last().unwrap(), Operand::Const(_)),
+                        "packed round imm must be Const: {args:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(args[0], Operand::Value(_)),
+                        "packed round register source must be Value: {args:?}"
+                    );
+                }
+                let inst = if matches!(op, IntrinsicOp::VecRoundF64x2) {
+                    "roundpd"
+                } else {
+                    "roundps"
+                };
+                let imm = self.operand_to_imm_i64(args.last().unwrap_or(&args[0]));
+                if args.len() >= 3 {
+                    let disp = if args.len() == 4 {
+                        Self::vec_disp_arg(args, 2)
+                    } else {
+                        0
+                    };
+                    let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, {}, %xmm0", inst, imm, mem));
+                } else {
+                    self.sse_load_arg(&args[0], "xmm0");
+                    self.state
+                        .emit_fmt(format_args!("    {} ${}, %xmm0, %xmm0", inst, imm));
+                }
+                self.sse_store_dest(d, "xmm0");
+            }
+            IntrinsicOp::VecSqrtF64x4 | IntrinsicOp::VecSqrtF32x8 => {
+                // Unary AVX; a direct map load stays in the instruction's
+                // legal r/m source slot instead of becoming a temporary.
+                assert!(
+                    matches!(args.len(), 1..=3),
+                    "packed sqrt requires a vector or base+index[+disp]: got {args:?}"
+                );
+                let Some(d) = dest else {
+                    debug_assert!(false, "VecSqrt 256b {op:?} with None dest");
+                    return;
+                };
+                if args.len() >= 2 {
+                    assert!(
+                        matches!(args[0], Operand::Value(_))
+                            && matches!(args[1], Operand::Value(_)),
+                        "packed sqrt mem-fold base/index must be Value: {args:?}"
+                    );
+                    if args.len() == 3 {
+                        assert!(
+                            matches!(args[2], Operand::Const(_)),
+                            "packed sqrt disp must be Const: {args:?}"
+                        );
+                    }
+                } else {
+                    assert!(
+                        matches!(args[0], Operand::Value(_)),
+                        "packed sqrt register source must be Value: {args:?}"
+                    );
+                }
+                {
                     let inst = if matches!(op, IntrinsicOp::VecSqrtF64x4) {
                         "vsqrtpd"
                     } else {
                         "vsqrtps"
                     };
-                    self.state
-                        .emit_fmt(format_args!("    {} %ymm0, %ymm0", inst));
+                    if args.len() >= 2 {
+                        let disp = if args.len() == 3 {
+                            Self::vec_disp_arg(args, 2)
+                        } else {
+                            0
+                        };
+                        let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, %ymm0", inst, mem));
+                    } else {
+                        self.avx_load_arg_to(&args[0], "ymm0");
+                        self.state
+                            .emit_fmt(format_args!("    {} %ymm0, %ymm0", inst));
+                    }
                     self.state.vec_last_store_val = Some(d.0);
                     self.state.vec_last_store_reg = true;
                     self.state.vec_last_store_reg_name = Some("ymm0");
@@ -6403,18 +6581,53 @@ impl X86Codegen {
                 }
             }
             IntrinsicOp::VecSqrtF64x2 | IntrinsicOp::VecSqrtF32x4 => {
-                // Unary SSE2: stream the operand through %xmm0.
-                if let Some(d) = dest {
-                    self.flush_pending_vec_store_impl();
-                    self.state.invalidate_vec_peephole();
-                    self.sse_load_arg(&args[0], "xmm0");
+                // Unary SSE2, including its memory-source encoding.
+                assert!(
+                    matches!(args.len(), 1..=3),
+                    "packed sqrt requires a vector or base+index[+disp]: got {args:?}"
+                );
+                let Some(d) = dest else {
+                    debug_assert!(false, "VecSqrt 128b {op:?} with None dest");
+                    return;
+                };
+                if args.len() >= 2 {
+                    assert!(
+                        matches!(args[0], Operand::Value(_))
+                            && matches!(args[1], Operand::Value(_)),
+                        "packed sqrt mem-fold base/index must be Value: {args:?}"
+                    );
+                    if args.len() == 3 {
+                        assert!(
+                            matches!(args[2], Operand::Const(_)),
+                            "packed sqrt disp must be Const: {args:?}"
+                        );
+                    }
+                } else {
+                    assert!(
+                        matches!(args[0], Operand::Value(_)),
+                        "packed sqrt register source must be Value: {args:?}"
+                    );
+                }
+                {
                     let inst = if matches!(op, IntrinsicOp::VecSqrtF64x2) {
                         "sqrtpd"
                     } else {
                         "sqrtps"
                     };
-                    self.state
-                        .emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
+                    if args.len() >= 2 {
+                        let disp = if args.len() == 3 {
+                            Self::vec_disp_arg(args, 2)
+                        } else {
+                            0
+                        };
+                        let mem = self.vec_mem_operand(&args[0], &args[1], disp);
+                        self.state
+                            .emit_fmt(format_args!("    {} {}, %xmm0", inst, mem));
+                    } else {
+                        self.sse_load_arg(&args[0], "xmm0");
+                        self.state
+                            .emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
+                    }
                     self.sse_store_dest(d, "xmm0");
                 }
             }
@@ -10882,11 +11095,63 @@ impl X86Codegen {
     }
 }
 
+/// x86 mnemonic for an `IntrinsicOp::Prefetch` payload.
+///
+/// Payload 3 (GCC's default locality) is the safe catch-all: an unknown
+/// payload must never turn into a missing instruction, because the hint is
+/// the whole point of the intrinsic.
+pub(super) fn prefetch_mnemonic(flavor: u8) -> &'static str {
+    match flavor {
+        0 => "prefetchnta",
+        1 => "prefetcht2",
+        2 => "prefetcht1",
+        // 4 (write intent) maps to `prefetcht0` deliberately — see the
+        // IntrinsicOp::Prefetch table for why `prefetchw` is not emitted.
+        _ => "prefetcht0",
+    }
+}
+
 /// The closed 132→{213,231} family table (`fma_form_reencode`): every
 /// mnemonic the map-FMA emitter can be dispatched with has both siblings,
 /// and the re-encode preserves lane width and sign family exactly. A
 /// mnemonic added to the dispatch tables without extending this match
 /// fails the exhaustive test below (and the emitter's `unreachable!`).
+#[cfg(test)]
+mod prefetch_mnemonic_tests {
+    use super::prefetch_mnemonic;
+
+    /// The payload → mnemonic table is the only thing standing between GCC's
+    /// `__builtin_prefetch` hints and the emitted instruction, so pin every
+    /// arm, including the catch-all.
+    #[test]
+    fn every_payload_maps_to_a_real_prefetch_form() {
+        assert_eq!(prefetch_mnemonic(0), "prefetchnta");
+        assert_eq!(prefetch_mnemonic(1), "prefetcht2");
+        assert_eq!(prefetch_mnemonic(2), "prefetcht1");
+        assert_eq!(prefetch_mnemonic(3), "prefetcht0");
+        // Write intent: prefetcht0 on purpose (compat), not prefetchw.
+        assert_eq!(prefetch_mnemonic(4), "prefetcht0");
+        // Unknown payloads fall back to the default locality, never to a
+        // no-op or a panic.
+        for f in 5u8..=255 {
+            assert_eq!(prefetch_mnemonic(f), "prefetcht0");
+        }
+    }
+
+    /// Every emitted mnemonic must be one the x86 assembler round-trips
+    /// (tests/asm-diff/misc.casefile covers the encodings themselves).
+    #[test]
+    fn mnemonics_are_the_four_sse_forms() {
+        let mut seen: Vec<&str> = (0u8..=4).map(prefetch_mnemonic).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen,
+            vec!["prefetchnta", "prefetcht0", "prefetcht1", "prefetcht2"]
+        );
+    }
+}
+
 #[cfg(test)]
 mod fma_form_reencode_tests {
     use super::X86Codegen;

@@ -301,10 +301,35 @@ impl Lowerer {
             return Some(result);
         }
 
-        // __builtin_prefetch(addr, [rw], [locality]) - no-op performance hint
+        // __builtin_prefetch(addr, [rw], [locality]) - architectural
+        // prefetch hint.
+        //
+        // GCC semantics: `rw` must be the constant 0 (read) or 1 (write) and
+        // `locality` the constant 0..=3 (0 = no reuse, streaming). Both
+        // default to 0 and 3 respectively. The frontend already diagnoses
+        // out-of-range or non-constant arguments, so anything else reaching
+        // lowering is evaluated for its side effects and the hint falls back
+        // to the default flavors.
+        //
+        // The hint is only a hint: dropping it (non-constant arguments, or a
+        // backend without prefetch support) can never change program
+        // semantics, and the instruction can never fault — every address is
+        // architecturally legal for a prefetch.
         if name == "__builtin_prefetch" {
-            for arg in args {
-                self.lower_expr(arg);
+            let addr = args.first().map(|arg| self.lower_expr(arg));
+            let hint = prefetch_flavor(args.get(1), args.get(2));
+            // Evaluate any arguments beyond the first for their side effects
+            // (GCC's frontend rejects >3 arguments, but lowering must stay
+            // total).
+            let extra: Vec<Operand> = args.iter().skip(1).map(|a| self.lower_expr(a)).collect();
+            let _ = extra;
+            if let Some(addr) = addr {
+                self.emit(Instruction::Intrinsic {
+                    dest: None,
+                    op: IntrinsicOp::Prefetch(hint),
+                    dest_ptr: None,
+                    args: vec![addr],
+                });
             }
             return Some(Operand::Const(IrConst::I64(0)));
         }
@@ -2913,6 +2938,47 @@ fn builtin_variadic_fixed_arity(libc_name: &str) -> Option<usize> {
     })
 }
 
+/// Map GCC's `__builtin_prefetch` hint arguments onto the target-independent
+/// `IntrinsicOp::Prefetch` payload (see that variant's table).
+///
+/// `rw` and `locality` must be integer constants in GCC; the frontend rejects
+/// anything else, and `int_const` returns `None` for them here, in which case
+/// the GCC default (read, locality 3) is used. A `rw = 1` (write) hint
+/// outranks the locality: x86 encodes write intent in a different opcode
+/// (`prefetchw`), not in the locality field.
+fn prefetch_flavor(rw: Option<&Expr>, locality: Option<&Expr>) -> u8 {
+    // Only GCC's documented domains select a hint: {0, 1} for `rw` and
+    // 0..=3 for `locality`. Anything else is a program the frontend has
+    // already diagnosed; mapping it onto the *default* is the one choice
+    // that cannot change the meaning of a valid program.
+    let rw = match rw.and_then(integer_literal) {
+        Some(1) => 1,
+        _ => 0,
+    };
+    let locality = match locality.and_then(integer_literal) {
+        Some(v @ 0..=3) => v as u8,
+        _ => 3,
+    };
+    if rw == 1 {
+        return 4;
+    }
+    locality
+}
+
+/// The value of an integer *literal* expression, without running the constant
+/// evaluator: hint arguments that are not literals fall back to the GCC
+/// defaults instead of triggering a second diagnostic (the frontend owns the
+/// "must be a constant integer" diagnostic).
+fn integer_literal(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::IntLiteral(n, _) | Expr::LongLiteral(n, _) | Expr::LongLongLiteral(n, _) => Some(*n),
+        Expr::UIntLiteral(n, _) | Expr::ULongLiteral(n, _) | Expr::ULongLongLiteral(n, _) => {
+            Some(*n as i64)
+        }
+        _ => None,
+    }
+}
+
 fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
     match intrinsic {
         BuiltinIntrinsic::X86Lfence
@@ -3511,4 +3577,51 @@ fn nan_library_function(name: &str) -> Option<&'static str> {
         "__builtin_nanf128" | "__builtin_nanq" => "nanf128",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod prefetch_flavor_tests {
+    //! `prefetch_flavor` is the whole of `__builtin_prefetch`'s hint
+    //! translation: the payload it returns is what each backend's mnemonic
+    //! table is indexed by, so the GCC (rw, locality) semantics have to be
+    //! pinned here or a future "simplification" can silently turn every
+    //! streaming hint into an L1 hint.
+    use super::prefetch_flavor;
+    use crate::common::source::Span;
+    use crate::frontend::parser::ast::Expr;
+
+    fn lit(v: i64) -> Expr {
+        Expr::IntLiteral(v, Span::dummy())
+    }
+
+    #[test]
+    fn defaults_are_read_with_high_locality() {
+        // __builtin_prefetch(p): read, locality 3 (GCC's defaults).
+        assert_eq!(prefetch_flavor(None, None), 3);
+    }
+
+    #[test]
+    fn locality_maps_onto_the_payload_verbatim() {
+        for loc in 0..=3i64 {
+            assert_eq!(prefetch_flavor(Some(&lit(0)), Some(&lit(loc))), loc as u8);
+        }
+    }
+
+    #[test]
+    fn write_intent_wins_over_locality() {
+        // GCC's `rw = 1`: the payload is the write flavor regardless of the
+        // locality argument.
+        assert_eq!(prefetch_flavor(Some(&lit(1)), Some(&lit(3))), 4);
+        assert_eq!(prefetch_flavor(Some(&lit(1)), None), 4);
+    }
+
+    #[test]
+    fn out_of_range_and_non_literal_arguments_fall_back_to_the_default() {
+        // The frontend diagnoses these; lowering must stay total and must not
+        // invent a different hint than GCC's default.
+        assert_eq!(prefetch_flavor(Some(&lit(7)), Some(&lit(9))), 3);
+        assert_eq!(prefetch_flavor(Some(&lit(-1)), Some(&lit(-1))), 3);
+        let non_literal = Expr::Identifier("x".to_string(), Span::dummy());
+        assert_eq!(prefetch_flavor(Some(&non_literal), Some(&non_literal)), 3);
+    }
 }
