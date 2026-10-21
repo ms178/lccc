@@ -135,8 +135,9 @@ thread_local! {
     // `set_x86_simd_isa` call fails closed instead of emitting illegal code.
     static X86_SIMD_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // AVX2 (256-bit ymm) availability, distinct from `X86_SIMD_AVAILABLE`:
-    // x86-64's project baseline is x86-64-v3, so plain `-mno-avx` must
-    // downgrade the vectorizer to 128-bit SSE2 forms rather than disable it.
+    // the 256-bit class is opt-in, so its absence must downgrade the
+    // vectorizer to 128-bit forms rather than disable it — `-mno-avx2` (or no
+    // AVX2 grant at all) still leaves the SSE2 register file legal.
     static X86_AVX2_AVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // SSE4.1 availability for the 128-bit lowerings that have no SSE2
     // spelling (`pmulld`).  `-mno-avx` alone keeps it (x86-64-v2 hardware);

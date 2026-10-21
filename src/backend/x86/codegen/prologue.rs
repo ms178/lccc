@@ -809,6 +809,25 @@ impl X86Codegen {
                         {
                         }
                     }
+                    Instruction::AtomicLoad { ty, .. }
+                    | Instruction::AtomicStore { ty, .. }
+                    | Instruction::AtomicRmw { ty, .. }
+                    | Instruction::AtomicCmpxchg { ty, .. } => {
+                        if matches!(ty, IrType::I128 | IrType::U128) {
+                            has_i128_ops = true;
+                            // Every 16-byte atomic lowering can call into
+                            // libatomic (store/load/RMW always; compare-
+                            // exchange without the CMPXCHG16B permission), so
+                            // the function is not a leaf and owes the 16-byte
+                            // call alignment: the frame-less path must take
+                            // its 8-byte pad, or the `call` runs with
+                            // RSP ≡ 8 (mod 16) and an aligned SSE spill inside
+                            // libatomic faults.  Marking it for the inline
+                            // cmpxchg16b case too costs at most 8 bytes of
+                            // stack in a rare leaf and cannot be wrong.
+                            has_calls = true;
+                        }
+                    }
                     Instruction::Cmp { ty, .. } | Instruction::Store { ty, .. } => {
                         if matches!(ty, IrType::I128 | IrType::U128) {
                             has_i128_ops = true;

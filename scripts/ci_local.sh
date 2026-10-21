@@ -198,6 +198,8 @@ gate "default-isa-policy" fast \
     env CCC="$LCCC" bash tests/regression/check_default_isa_policy.sh
 gate "cas16-lowering" fast \
     env CCC="$LCCC" bash tests/regression/check_cas16_lowering.sh
+gate "atomic16-runtime" fast \
+    env CCC="$LCCC" bash tests/regression/check_atomic16_runtime.sh
 gate "fno-builtin-fold-contract" fast \
     env CCC="$LCCC" bash tests/regression/check_fno_builtin_folds.sh
 

@@ -210,16 +210,6 @@ impl Driver {
         }
     }
 
-    /// Apply one explicit x86 ISA `-m`/`-mno-` flag.  Returns `true` when
-    /// `arg` is one of the flags owned here; the caller (the main argument
-    /// loop) then records it for [`Driver::replay_x86_explicit_isa_flags`].
-    /// This is the SINGLE implementation of every ISA flag's effect — the
-    /// immediate application and the post-`-march=` replay run the same
-    /// code, so they cannot drift.  Non-ISA `-m` flags (`-mcmodel=`,
-    /// `-mtune=`, `-mno-red-zone`, `-mno-80387`, `-mgeneral-regs-only`,
-    /// `-malign-data=`, `-mharden-sls=`, the AVX10 not-implemented errors,
-    /// ...) return `false` and stay with the main match: they have no
-    /// arch-set interaction.
     /// The AVX-512 subsets and AVX-VNNI (AVX-512 / AVX10 feature flags;
     /// backend coverage is partial and runtime dispatch must verify the host).
     /// Each implies AVX2 and, for the AVX-512 subsets, AVX-512F, as GCC 16.2
@@ -253,6 +243,16 @@ impl Driver {
         true
     }
 
+    /// Apply one explicit x86 ISA `-m`/`-mno-` flag.  Returns `true` when
+    /// `arg` is one of the flags owned here; the caller (the main argument
+    /// loop) then records it for [`Driver::replay_x86_explicit_isa_flags`].
+    /// This is the SINGLE implementation of every ISA flag's effect — the
+    /// immediate application and the post-`-march=` replay run the same
+    /// code, so they cannot drift.  Non-ISA `-m` flags (`-mcmodel=`,
+    /// `-mtune=`, `-mno-red-zone`, `-mno-80387`, `-mgeneral-regs-only`,
+    /// `-malign-data=`, `-mharden-sls=`, the AVX10 not-implemented errors,
+    /// ...) return `false` and stay with the main match: they have no
+    /// arch-set interaction.
     fn apply_x86_isa_mflag(&mut self, arg: &str) -> bool {
         if self.grant_avx512_family(arg) {
             return true;
@@ -1779,9 +1779,6 @@ impl Driver {
                         // Remembered for the tuning-row fallback
                         // (cpu_model::resolve: -mtune > -march > generic).
                         self.x86_march = Some(march.to_string());
-                        // An explicit profile is the code-generation ceiling
-                        // (GCC-exact); the absent-flag default is plain x86-64.
-                        self.x86_march_explicit = true;
                         // A later `-march=` REPLACES the arch-implied set
                         // (GCC: `-march=x86-64-v3 -march=x86-64` leaves
                         // `__BMI__`/`__MOVBE__`/`__AVX__` absent — measured,
@@ -3123,6 +3120,7 @@ pub fn std_version_macro(std_value: &str) -> Option<Option<&'static str>> {
 #[cfg(test)]
 mod cli_tests {
     use super::cmp_version;
+    use crate::backend::Target;
     use crate::common::fp_contract::FpContract;
     use crate::driver::pipeline::Driver;
 
@@ -4146,7 +4144,7 @@ mod cli_tests {
     /// default must not revive the class behind the user's back (GCC keeps
     /// the last-explicit ISA decision).
     #[test]
-    fn mno_bmi_sticky_denial_beats_default_baseline() {
+    fn mno_bmi_sticky_denial_beats_explicit_grant() {
         let mut d = Driver::new();
         let args: Vec<String> = ["ccc", "-march=x86-64-v3", "-mno-bmi", "x.c"]
             .iter()
@@ -4179,14 +4177,13 @@ mod cli_tests {
         assert!(d.resolved_bmi1());
     }
 
-    /// ABM (LZCNT/TZCNT) is an x86-64-v3 member: only an explicit grant
-    /// projects it, and then `tzcnt`/`lzcnt` supersede `bsf`/`bsr` (defined on
-    /// zero input).  The default build keeps `bsf`/`bsr`.
+    /// CMPXCHG16B gates the inline 16-byte compare-exchange: the default
+    /// baseline must not carry it (a default build's 16-byte CAS calls
+    /// libatomic), `-mcx16` and the v2+ profiles grant it, and a sticky
+    /// `-mno-cx16` denies it in either order.  It is integer ISA, so
+    /// `-mno-sse` leaves it alone.
     #[test]
     fn cx16_is_opt_in_not_default() {
-        // CMPXCHG16B gates the inline 16-byte CAS.  The default baseline must
-        // not carry it (its 16-byte CAS calls libatomic); `-mcx16` and the v2+
-        // profiles grant it; a sticky `-mno-cx16` denies it in any order.
         let parse = |flags: &[&str]| {
             let mut d = Driver::new();
             let mut args: Vec<String> = vec![String::from("ccc")];
@@ -4233,6 +4230,44 @@ mod cli_tests {
         );
     }
 
+    /// CMPXCHG16B is an x86-64 permission only: the 128-bit compare-exchange
+    /// lowering lives in the x86-64 backend, so no other target may report it
+    /// even with the flag set.  Reporting it elsewhere would promise an inline
+    /// `lock cmpxchg16b` that no emitter on that target can produce.
+    #[test]
+    fn cx16_is_x86_64_only() {
+        let mut d = Driver::new();
+        d.enable_cx16 = true;
+        for target in [
+            Target::X86_64,
+            Target::I686,
+            Target::Aarch64,
+            Target::Riscv64,
+        ] {
+            let want = target == Target::X86_64;
+            d.target = target;
+            let resolved = d.resolved_cx16();
+            assert!(
+                resolved == want,
+                "{target:?}: resolved_cx16() = {resolved}, expected {want}"
+            );
+            let perm = d.x86_isa().cx16;
+            assert!(
+                perm == want,
+                "{target:?}: x86_isa().cx16 = {perm}, expected {want}"
+            );
+        }
+        // The sticky denial still outranks the grant on the one target that
+        // has the permission.
+        d.target = Target::X86_64;
+        d.cx16_explicitly_disabled = true;
+        assert!(!d.resolved_cx16());
+        assert!(!d.x86_isa().cx16);
+    }
+
+    /// ABM (LZCNT/TZCNT) is an x86-64-v3 member: only an explicit grant
+    /// projects it, and then `tzcnt`/`lzcnt` supersede `bsf`/`bsr` (defined on
+    /// zero input).  The default build keeps `bsf`/`bsr`.
     #[test]
     fn lzcnt_is_opt_in_not_default() {
         let mut d = Driver::new();
@@ -4251,10 +4286,10 @@ mod cli_tests {
         assert!(v3.resolved_lzcnt(), "-march=x86-64-v3 must project ABM");
     }
 
-    /// Sticky `-mno-lzcnt` denial beats the v3 default baseline; the BMI
+    /// Sticky `-mno-lzcnt` denial beats an explicit v3 grant; the BMI
     /// classes are unaffected (independent ISA groups).
     #[test]
-    fn mno_lzcnt_sticky_denial_beats_default_baseline() {
+    fn mno_lzcnt_sticky_denial_beats_explicit_grant() {
         let mut d = Driver::new();
         let args: Vec<String> = ["ccc", "-march=x86-64-v3", "-mno-lzcnt", "x.c"]
             .iter()
@@ -4283,7 +4318,7 @@ mod cli_tests {
     /// profile projects it; sticky `-mno-popcnt` wins; a later `-mpopcnt` lifts
     /// the denial; an explicit v1 ceiling removes it.
     #[test]
-    fn popcnt_baseline_default_on_sticky_denial_and_ceiling() {
+    fn popcnt_opt_in_sticky_denial_and_ceiling() {
         let mut d = Driver::new();
         let args: Vec<String> = ["ccc", "x.c"].iter().map(|s| s.to_string()).collect();
         assert!(d.parse_cli_args(&args).is_ok());
@@ -4473,7 +4508,7 @@ mod cli_tests {
     /// BMI is an INTEGER class: `-mno-sse` denies the xmm world but leaves
     /// ANDN/RORX legal — an explicit `-march=x86-64-v3` baseline still applies.
     #[test]
-    fn bmi_baseline_survives_mno_sse() {
+    fn bmi_survives_mno_sse() {
         let mut d = Driver::new();
         let args: Vec<String> = ["ccc", "-march=x86-64-v3", "-mno-sse", "x.c"]
             .iter()

@@ -234,6 +234,57 @@ mod tests {
     }
 
     #[test]
+    fn default_is_the_plain_x86_64_baseline() {
+        // The policy lock.  Emitters and peepholes that never go through the
+        // driver see SSE2 and nothing newer, so no post-baseline instruction
+        // can be emitted by a default build.  A silent change here would
+        // re-arm the v3 default and emit BMI/AVX code for a plain `-O2`.
+        assert_eq!(X86Isa::default(), X86Isa::SSE2);
+        let d = X86Isa::default();
+        assert!(d.simd, "SSE2 is the x86-64 baseline and stays on");
+        assert!(!d.sse41 && !d.avx && !d.ymm && !d.fma);
+        assert!(!d.movbe && !d.cx16);
+        // The same lock at compile time: the level constants are `const`, so
+        // the compiler checks these while building the test binary.
+        const { assert!(!X86Isa::SSE2.movbe && !X86Isa::SSE2.cx16) };
+        const { assert!(X86Isa::V3.ymm && X86Isa::V3.cx16) };
+    }
+
+    #[test]
+    fn cx16_is_independent_of_the_simd_chain() {
+        // CMPXCHG16B is integer ISA: `-mno-sse` must not take it away, and
+        // granting it must not drag the SIMD world in.  A plain x86-64 TU
+        // does not get it; a v2+ profile does.
+        let no_simd_but_cx16 = X86Isa {
+            cx16: true,
+            ..X86Isa::NONE
+        };
+        let n = no_simd_but_cx16.normalized();
+        assert!(n.cx16 && !n.simd && !n.sse41 && !n.avx && !n.ymm && !n.fma);
+        // The bit is its own.  The process-global emitter mirror packs the
+        // whole permission set into one byte, so a collision with MOVBE or a
+        // SIMD bit would silently grant one class when the other is asked
+        // for.  Assert the packed forms are disjoint and independently
+        // recoverable.
+        let cx16_only = X86Isa {
+            cx16: true,
+            ..X86Isa::NONE
+        }
+        .to_bits();
+        let movbe_only = X86Isa {
+            movbe: true,
+            ..X86Isa::NONE
+        }
+        .to_bits();
+        assert_ne!(cx16_only, movbe_only);
+        assert_eq!(cx16_only & movbe_only, 0);
+        let both = X86Isa::from_bits(cx16_only | movbe_only);
+        assert!(both.cx16 && both.movbe);
+        const { assert!(!X86Isa::SSE2.cx16) };
+        const { assert!(X86Isa::V3.cx16) };
+    }
+
+    #[test]
     fn movbe_is_independent_of_the_simd_chain() {
         // `-mno-sse` must not take MOVBE away (it is an integer load), and
         // `-mno-movbe` must not take the SIMD world away.  The level constant

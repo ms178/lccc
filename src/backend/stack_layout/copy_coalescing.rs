@@ -2352,7 +2352,7 @@ pub(crate) fn is_cache_aware_3op(op: &crate::ir::intrinsics::IntrinsicOp) -> boo
 /// ISA NOTE — immediate shifts are deliberately absent from every fold
 /// table: the VEX immediate-shift encodings (66.0F 71/72/73 /digit ib)
 /// are REGISTER-ONLY. The r/m-as-memory form exists solely under EVEX
-/// (AVX-512), which the x86-64-v3 baseline does not provide; GNU as
+/// (AVX-512), which no profile below AVX-512 provides; GNU as
 /// assembles `vpslld $3,(%rdi),%xmm3` to an EVEX encoding, and hand-
 /// rolling the VEX-looking bytes encodes an INVALID instruction (SIGILL,
 /// verified on the v5 battery). The S49-era analysis admitted shift

@@ -227,12 +227,6 @@ pub struct Driver {
     pub(super) movbe_explicitly_disabled: bool,
     /// Set by `-mno-cx16`: CMPXCHG16B forbidden.
     pub(super) cx16_explicitly_disabled: bool,
-    /// An explicit x86 `-march=` was seen.  Under an explicit profile the
-    /// requested feature set (`enable_*`) is the *ceiling* (GCC semantics);
-    /// without one the code-generation baseline is plain x86-64 (SSE2 only),
-    /// and every post-baseline class needs its explicit flag.  See
-    /// `backend::x86::isa`.
-    pub(super) x86_march_explicit: bool,
     /// Explicit x86 ISA `-m`/`-mno-` flags in command-line order, for the
     /// `-march=` replace-and-replay contract (GCC-exact, measured on the
     /// host oracle, gcc 14.2 `-dM -E`):
@@ -568,7 +562,6 @@ impl Driver {
             popcnt_explicitly_disabled: false,
             movbe_explicitly_disabled: false,
             cx16_explicitly_disabled: false,
-            x86_march_explicit: false,
             x86_explicit_isa_args: Vec::new(),
             skip_rax_setup: false,
             no_x87: false,
@@ -3579,9 +3572,12 @@ mod loop_idiom_capability_tests {
     #[test]
     fn native_popcount_permission_obeys_every_target_and_explicit_veto() {
         let mut driver = Driver::new();
+        // No `-march=` state is set up here on purpose: an explicit profile
+        // reaches this predicate only through `enable_popcnt` (the profile
+        // sets it, `-mno-popcnt` clears it and marks the sticky denial), so
+        // driving the two flags directly covers every profile outcome.
         for target in [Target::X86_64, Target::I686] {
             driver.target = target;
-            driver.x86_march_explicit = true;
             driver.enable_popcnt = false;
             assert!(!driver.resolved_fast_popcount());
             driver.enable_popcnt = true;

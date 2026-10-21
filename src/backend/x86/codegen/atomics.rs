@@ -84,8 +84,20 @@ impl X86Codegen {
         ptr: &Operand,
         val: &Operand,
         ty: IrType,
-        _ordering: AtomicOrdering,
+        ordering: AtomicOrdering,
     ) {
+        // 16-byte read-modify-write: there is no 16-byte `XADD`/`XCHG` and no
+        // lock-prefixed 16-byte ALU form, so every op goes through libatomic's
+        // sized entry — GCC 16.2's choice too, for every ordering.  The
+        // previous value comes back in RDX:RAX.  Test-and-set is byte-wide by
+        // definition and keeps the fast path below, which is also what keeps
+        // `libatomic_fetch16_symbol`'s unreachable arm genuinely unreachable.
+        if matches!(ty, IrType::I128 | IrType::U128) && !matches!(op, AtomicRmwOp::TestAndSet) {
+            let sym = Self::libatomic_fetch16_symbol(op);
+            self.emit_libatomic_16_binary(sym, ptr, val, ordering);
+            self.store_rax_rdx_to(dest);
+            return;
+        }
         self.operand_to_rax(ptr);
         self.state.emit("    movq %rax, %rcx");
 
@@ -145,20 +157,23 @@ impl X86Codegen {
         expected: &Operand,
         desired: &Operand,
         ty: IrType,
-        _success_ordering: AtomicOrdering,
-        _failure_ordering: AtomicOrdering,
+        success_ordering: AtomicOrdering,
+        failure_ordering: AtomicOrdering,
         returns_bool: bool,
     ) {
         // 16-byte compare-exchange: the 64-bit sequence below would compare and
-        // write only the low half, so route it through its own lowering.
+        // write only the low half, so route it through its own lowering.  It is
+        // also the only width whose lowering consumes the orderings: at 64 bits
+        // and below the `lock` prefix alone supplies sequential consistency,
+        // which is at least as strong as any ordering the caller can ask for.
         if matches!(ty, IrType::I128 | IrType::U128) {
             self.emit_atomic_cmpxchg16_impl(
                 dest,
                 ptr,
                 expected,
                 desired,
-                _success_ordering,
-                _failure_ordering,
+                success_ordering,
+                failure_ordering,
                 returns_bool,
             );
             return;
@@ -205,7 +220,8 @@ impl X86Codegen {
         self.state.emit("    pushq %rax");
     }
 
-    /// libatomic's memory-order encoding (`__ATOMIC_*`).
+    /// libatomic's memory-order encoding (`__ATOMIC_*`).  Shared by every
+    /// sized entry point below, so the mapping cannot drift between them.
     fn libatomic_order(order: AtomicOrdering) -> u8 {
         match order {
             AtomicOrdering::Relaxed => 0,
@@ -214,6 +230,78 @@ impl X86Codegen {
             AtomicOrdering::AcqRel => 4,
             AtomicOrdering::SeqCst => 5,
         }
+    }
+
+    /// libatomic's sized 16-byte entry point for a read-modify-write.
+    ///
+    /// There is no 16-byte `XADD`/`XCHG` and no lock-prefixed 16-byte ALU form
+    /// on x86-64, so every 128-bit RMW goes through libatomic.  This is also
+    /// what GCC does — measured on gcc 16.2 and 12.2, `-O2`, with and without
+    /// `-mcx16`/`-mavx2`: `jmp __atomic_fetch_add_16` for every ordering.
+    fn libatomic_fetch16_symbol(op: AtomicRmwOp) -> &'static str {
+        match op {
+            AtomicRmwOp::Add => "__atomic_fetch_add_16",
+            AtomicRmwOp::Sub => "__atomic_fetch_sub_16",
+            AtomicRmwOp::And => "__atomic_fetch_and_16",
+            AtomicRmwOp::Or => "__atomic_fetch_or_16",
+            AtomicRmwOp::Xor => "__atomic_fetch_xor_16",
+            AtomicRmwOp::Nand => "__atomic_fetch_nand_16",
+            AtomicRmwOp::Xchg => "__atomic_exchange_16",
+            // Test-and-set is byte-wide and returns from the fast path above.
+            AtomicRmwOp::TestAndSet => unreachable!("test-and-set is byte-wide"),
+        }
+    }
+
+    /// Call one of libatomic's `(void *mem, __int128 val, int model)` 16-byte
+    /// entry points.  The fetch forms return the previous value in RDX:RAX;
+    /// `__atomic_store_16` has the same shape and returns nothing, so it uses
+    /// this too and simply leaves RAX/RDX undefined.
+    ///
+    /// ABI, measured on gcc 16.2 against the system libatomic.so.1: the
+    /// 128-bit value is the SECOND parameter, so it occupies RSI (low) and RDX
+    /// (high) — NOT the RDX:RCX pair, which only applies when the value is the
+    /// first parameter after a pointer-of-pointer (as in the CAS below); the
+    /// model is the third parameter, in ECX; and a 16-byte INTEGER return
+    /// comes back in RAX (low) / RDX (high).
+    ///
+    /// RSP is not moved, so the frame's existing 16-byte call alignment holds
+    /// at the `call`.  That depends on the function having been marked as one
+    /// that calls out: `calculate_stack_space` sets `func_has_calls` for any
+    /// 128-bit atomic, without which a leaf would take the frame-less path and
+    /// reach this call with RSP ≡ 8 (mod 16).
+    fn emit_libatomic_16_binary(
+        &mut self,
+        sym: &'static str,
+        ptr: &Operand,
+        val: &Operand,
+        order: AtomicOrdering,
+    ) {
+        self.prepare_atomic_side_effect();
+        self.operand_to_rax(ptr);
+        self.state.emit("    movq %rax, %rdi");
+        self.operand_to_rax_rdx(val);
+        self.state.emit("    movq %rax, %rsi");
+        // RDX already holds the high half exactly where the ABI wants it.
+        self.state.emit_fmt(format_args!(
+            "    movl ${}, %ecx",
+            Self::libatomic_order(order)
+        ));
+        self.state.emit_fmt(format_args!("    call {}@PLT", sym));
+    }
+
+    /// `__int128 __atomic_load_16(void *mem, int model)`: RDI = mem, ESI =
+    /// model, and the value returns in RAX (low) / RDX (high).  Measured on
+    /// gcc 16.2 — GCC uses this for every ordering, with and without `-mcx16`.
+    fn emit_libatomic_16_load(&mut self, dest: &Value, ptr: &Operand, order: AtomicOrdering) {
+        self.prepare_atomic_side_effect();
+        self.operand_to_rax(ptr);
+        self.state.emit("    movq %rax, %rdi");
+        self.state.emit_fmt(format_args!(
+            "    movl ${}, %esi",
+            Self::libatomic_order(order)
+        ));
+        self.state.emit("    call __atomic_load_16@PLT");
+        self.store_rax_rdx_to(dest);
     }
 
     /// 16-byte `__atomic_compare_exchange_n`.  With the CMPXCHG16B permission
@@ -235,6 +323,21 @@ impl X86Codegen {
             // rbx is callee-saved and cmpxchg16b needs it for the desired low
             // half.  Stack after the pushes: [rsp] = expected (lo, hi),
             // [rsp+16] = desired (lo, hi), [rsp+32] = saved rbx.
+            //
+            // Both operands are staged through the stack rather than loaded
+            // straight into RAX:RDX / RBX:RCX, which is deliberate.  The
+            // instruction's register set is fixed (it compares RDX:RAX with
+            // the memory operand and stores RCX:RBX on a match), so RBX and
+            // RCX must be written before the last operand read.  Were an
+            // operand ever homed in RBX or RCX, that read would see the value
+            // we had just written.  Today `regalloc::is_non_gpr_type` keeps
+            // every I128/U128 value in a slot, so the direct form would be
+            // safe -- but it would couple this emitter to that allocator
+            // predicate across two modules, and a future allocator change
+            // would turn the violation into a silent miscompile.  The pushes
+            // are L1-hot and store-forward, so they cost a few cycles against
+            // the ~20-40 cycle locked operation; unconditional correctness is
+            // worth more than that here.
             self.state.emit("    pushq %rbx");
             self.push_16_operand(desired, 8);
             self.push_16_operand(expected, 24);
@@ -246,13 +349,17 @@ impl X86Codegen {
             self.state.emit("    movq 24(%rsp), %rcx");
             self.state.emit("    lock cmpxchg16b (%r8)");
             if returns_bool {
-                self.state.emit("    sete %r11b");
-                self.state.emit("    movzbl %r11b, %r11d");
+                // Consume ZF here, before the stack cleanup: `addq` writes the
+                // flags.  %al is dead on this path -- the bool is the whole
+                // result -- so the flag lands straight in the result register
+                // and the observed pair in RAX:RDX is discarded.  This also
+                // keeps %r11 out of the clobber set.
+                self.state.emit("    sete %al");
             }
             self.state.emit("    addq $32, %rsp");
             self.state.emit("    popq %rbx");
             if returns_bool {
-                self.state.emit("    movq %r11, %rax");
+                self.state.emit("    movzbl %al, %eax");
                 self.store_rax_to(dest);
             } else {
                 self.store_rax_rdx_to(dest);
@@ -300,8 +407,17 @@ impl X86Codegen {
         dest: &Value,
         ptr: &Operand,
         ty: IrType,
-        _ordering: AtomicOrdering,
+        ordering: AtomicOrdering,
     ) {
+        // 16-byte atomic load: the `movq` form below reads only the low half,
+        // and no single 16-byte load is atomic by itself on x86-64 (an aligned
+        // SSE move is an implementation guarantee, not an architectural one,
+        // and is unavailable under `-mno-sse`).  Call libatomic, as GCC 16.2
+        // does for every ordering.
+        if matches!(ty, IrType::I128 | IrType::U128) {
+            self.emit_libatomic_16_load(dest, ptr, ordering);
+            return;
+        }
         self.operand_to_rax(ptr);
         self.prepare_atomic_side_effect();
         let load = Self::mov_load_for_type(ty);
@@ -318,6 +434,14 @@ impl X86Codegen {
         ty: IrType,
         ordering: AtomicOrdering,
     ) {
+        // 16-byte atomic store: there is no 16-byte `XCHG` on x86-64, and the
+        // `xchgq`/`movq` forms below would write only the low half — both
+        // half-wrong and non-atomic for the pair.  Call libatomic, as GCC 16.2
+        // does for every ordering, with and without `-mcx16`.
+        if matches!(ty, IrType::I128 | IrType::U128) {
+            self.emit_libatomic_16_binary("__atomic_store_16", ptr, val, ordering);
+            return;
+        }
         self.operand_to_rax(val);
         self.state.emit("    movq %rax, %rdx");
         self.operand_to_rax(ptr);
