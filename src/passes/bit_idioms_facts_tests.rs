@@ -59,6 +59,7 @@ impl Builder {
                 defs: &defs,
                 uses: &uses,
                 visits: std::cell::Cell::new(512),
+                disable_logic: false,
             },
             &Facts(vec![]),
             Value(self.next),

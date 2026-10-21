@@ -444,7 +444,658 @@
         "tests/regression/llvm_word_counts.c",
         "tests/regression/check_llvm_word_counts.py"
       ]
+    },
+    {
+      "number": 35970,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: the motivating cancellation crosses zext, shifts and two widths; opaque leaves intentionally do not move casts through shifts.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 38139,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: OR-mask equality versus its source needs a range/comparison fold; per-bit synthesis does not reinterpret an integer comparison as bitwise logic.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 38926,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: reuse of a masked value across stores and truncation needs dominance-aware cross-width CSE, not producer-network synthesis.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 41333,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: total CLZ after shifting a constant saturates at the width. The discussion distinguishes nonzero, exact and no-wrap variants; no flag is invented.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 41757,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: variable-width conditional sign extension needs bounds on len and a separate sign-extension recognizer; signed C shifts also need defined witnesses.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 41801,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: removing a dynamic mask before arithmetic/right shift requires demanded-bit reasoning tied to the same count; shifts remain opaque here.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 41908,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: the six upstream mask/shift forms include truncation and count-sum constraints; no blanket mask removal is admitted.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 42219,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: multiply/rotate ordering is a pipeline and target-cost issue, not a bitwise-network identity; retain existing rotate recognition.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 44992,
+      "status": "covered-limited",
+      "disposition": "covered-limited",
+      "scope": "Implemented limited: private same-width (x xor C)+1 combined with wrapping add/sub is replaced by the complemented-constant xor and opposite add/sub.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 45478,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: narrowing a Boolean observation to bit zero and CFG range-set folding need distinct observation/control-flow proofs.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 45820,
+      "status": "covered-limited",
+      "disposition": "covered-limited",
+      "scope": "Implemented limited: the closed bitwise DAG ((a&b)^b)|((a&b)^a) synthesizes XOR, accounting for the internally shared AND once. Outside users refuse.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 46405,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: the motivating short-circuit expression needs CFG/Boolean conversion reasoning; its bitwise analogue is not claimed as closure of the report.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 47868,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: signed max, subtraction and a mask require signed range/select reasoning, including negative inputs; not a pure Boolean identity.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 47946,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: common-destination switch and bitfield-mask simplification require switch-domain reasoning rather than a local bitwise root.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 54856,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: combining a power-of-two unsigned bound with a contiguous mask comparison needs range-interval proofs; sparse masks cannot be generalized.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 55016,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: shifting a negative constant by an offset depends on exact-shift and count bounds. Those LLVM promises are absent from LCCC IR.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 55468,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: never infer a global range backward from a C shift. The discussion warns that shifts can be speculated and yield LLVM poison.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 55739,
+      "status": "covered-limited",
+      "disposition": "covered-limited",
+      "scope": "Implemented limited: comparisons of a masked shifted power of two to zero reduce to count equality/inequality when an explicit scalar AND proves the count is in range. Bounded value-preserving count casts/copies retain the actual count operand/type.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 56124,
+      "status": "covered-limited",
+      "disposition": "covered-limited",
+      "scope": "Implemented limited: a left-shifted power of two observed through a low contiguous mask reduces to a count threshold under that explicit bound. Bounded value-preserving count casts/copies retain the actual count operand/type.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 57666,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: AND of two constant-choice selects observed as zero needs relational reasoning across selects; selects and comparisons stay opaque.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 58313,
+      "status": "covered-limited",
+      "disposition": "covered-limited",
+      "scope": "Implemented limited: the eager scalar bitwise XOR networks in the discussion are synthesized exactly. Short-circuit CFG restructuring is not included.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 58624,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: weakening XOR to OR is not an unconditional Boolean identity; it requires a dominating NAND assumption and relational facts.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 59555,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: NaN-tag range coalescing is integer interval reasoning across two comparisons, not FP arithmetic or a pure bitwise replacement.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 59773,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: multiply-used sext/not to select depends on Boolean provenance and sharing costs. No cast or select is synthesized here.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 61120,
+      "status": "covered-limited",
+      "disposition": "covered-limited",
+      "scope": "Implemented limited: comparisons of two private same-width bitwise NOT values reverse operand order, preserving the original signed/unsigned predicate.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 61671,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: the proposed total CLZ rewrite is invalid at zero, as the discussion corrects. A nonzero precondition must be proved separately.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 62898,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: signed min/max sign observations and logical versus bitwise forms require select/CFG correlation. The source also repeats the smin body as smax.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 63749,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: folding the guarded x+1 bound needs relational carry/unsigned interval reasoning; no no-wrap condition is inferred from a Boolean graph.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 63848,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: 64-to-32 shift splitting depends on target shift costs, count ranges and legalization; three-leaf scalar logic does not narrow shifts.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 64238,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: proving a constant-table load range needs memory/constant-global analysis with a dominating index bound.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 64859,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: equal-to-one observations of added Boolean extensions require arithmetic Boolean-cardinality reasoning; new bitwise synthesis treats extensions as opaque.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 69333,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: comparing an OR against a logical shift needs cross-operation unsigned bounds. The issue discussion also corrects an initially over-reduced example.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 73417,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: tuple ordering combines sext/zext arithmetic, comparisons and selects; the canonical Boolean comparison must be recovered before any bitwise synthesis.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 78038,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: equality of min/max or symmetric selects needs correlated select predicates, widths and signedness. This change does not assume independent selects are min/max.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 79696,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: precise XOR constant ranges after CLZ need interval analysis beyond the existing known-bit representation.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 79823,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: narrow software popcount multiplication/mask formulas need per-target size/latency assessment against native POPCNT and the existing fallback.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 80100,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: sparse-mask count lowering requires target-specific popcount/ctz cost and zero-policy handling; no hardware intrinsic is expanded into multiplication here.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 82075,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: nonzero narrow CLZ promotion belongs in target legalization; target-independent logic does not add shifts/casts around scans.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 83699,
+      "status": "covered-limited",
+      "disposition": "covered-limited",
+      "scope": "Implemented limited: closed mask-extract/update/reinsert DAGs synthesize shorter AND/OR/XOR forms, including complementary literal masks. Arbitrary externally shared graphs refuse.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 84038,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: sign-conditioned logical shifts emulate AShr, but recovering that requires select, signed comparison and shared-count proofs.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 84656,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: replacing a scan loop by total CTZ needs loop-exit/PHI/zero-case reasoning; no loop or memory transformations are added.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 84763,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: low-bit multiply versus CTZ/shift is target-cost sensitive and needs an explicit zero policy. Do not introduce a scan on software-scan targets.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 85823,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: the example needs a relational nonzero-mask fact across a branch/call. No new closure is claimed for the preexisting facts pass.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 85939,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: cross-width right shifts and casts need a count-range proof for both widths plus sign-extension preservation.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 86874,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: 15-x to xor needs x<=15 or LLVM nuw. Generic wrapping subtraction is not the same identity; target instruction-selection costs also matter.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 96455,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: total narrow leading-ones promotion and BSR/LZCNT speculation differ by target and zero policy; preserve the current count lowering.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 96690,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: Unicode range coalescing through XOR/subtract is not uniformly profitable (discussion identifies AArch64 conditional compare); requires a range cost model.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 98848,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: simplifying the ternary sign observation needs substituting condition facts into select arms, not eager bitwise evaluation of a control-flow graph.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 102946,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: shift-offset folding must prove the adjusted count cannot wrap or reach the word width; do not assume Zig intCast/LLVM nuw facts exist in LCCC.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
+    },
+    {
+      "number": 108559,
+      "status": "reviewed-deferred",
+      "disposition": "reviewed-deferred",
+      "scope": "Deferred: dropping paired divisions from comparisons requires exactness/divisibility, not just a common divisor. LCCC does not represent the reported exact flag.",
+      "cohort": "scalar-logic",
+      "evidence": [
+        "engineering/llvm-missed/SCALAR-LOGIC.md",
+        "engineering/llvm-missed/scalar-logic-sources.json",
+        "tests/regression/llvm_scalar_logic.c",
+        "tests/regression/check_llvm_scalar_logic.py"
+      ]
     }
   ],
-  "latest_batch": 2
+  "latest_batch": 2,
+  "latest_cohort": "scalar-logic"
 }

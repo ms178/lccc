@@ -1155,6 +1155,7 @@ gate "llvm-bit-demand" fast python3 tests/regression/check_llvm_bit_demand.py
 gate "llvm-scalar-facts" fast python3 tests/regression/check_llvm_scalar_facts.py
 gate "llvm-guarded-folds" fast python3 tests/regression/check_llvm_guarded_folds.py
 gate "llvm-word-counts" fast python3 tests/regression/check_llvm_word_counts.py
+gate "llvm-scalar-logic" fast python3 tests/regression/check_llvm_scalar_logic.py
 # Dual-layout metric pair: assembly identity across serial/auto/forced, kill
 # switch, host fallback and pair liveness. Mirrors the hosted step.
 gate "peephole-pair-parallel" fast python3 tests/regression/check_peephole_pair_parallel.py

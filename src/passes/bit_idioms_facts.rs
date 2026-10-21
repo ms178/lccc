@@ -9,6 +9,7 @@ struct Context<'a> {
     defs: &'a [Option<Instruction>],
     uses: &'a [u32],
     visits: std::cell::Cell<usize>,
+    disable_logic: bool,
 }
 impl Context<'_> {
     fn def(&self, op: Operand) -> Option<&Instruction> {
@@ -351,6 +352,15 @@ fn fold(
         return Some(replacement);
     }
     if let Some(replacement) = guards::fold(inst, cx, facts, fresh) {
+        return Some(replacement);
+    }
+    if let Some(replacement) = complements::fold(inst, cx, fresh) {
+        return Some(replacement);
+    }
+    if let Some(replacement) = shift_observe::fold(inst, cx) {
+        return Some(replacement);
+    }
+    if let Some(replacement) = logic::fold(inst, cx, fresh) {
         return Some(replacement);
     }
     let dest = inst.dest()?;
@@ -748,6 +758,50 @@ fn arithmetic(inst: &Instruction, cx: &Context<'_>, fresh: Value) -> Option<Vec<
     None
 }
 
+// A previous recognizer can leave its now-dead input network in place until
+// DCE. Do not synthesize those dead trees (or cycles) merely to change code
+// which will be discarded. This is a selection filter, not a deletion pass.
+fn live_values(func: &IrFunction, defs: &[Option<Instruction>]) -> Vec<bool> {
+    fn reads(inst: &Instruction, pending: &mut Vec<Value>) {
+        crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+            if let Operand::Value(v) = op {
+                pending.push(*v);
+            }
+        });
+        crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| pending.push(*v));
+    }
+    let mut live = vec![false; defs.len()];
+    let mut pending = Vec::new();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if inst.dest().is_none() || crate::passes::dce::has_side_effects(inst) {
+                reads(inst, &mut pending);
+                if let Some(dest) = inst.dest() {
+                    pending.push(dest);
+                }
+            }
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                pending.push(*v);
+            }
+        });
+    }
+    while let Some(value) = pending.pop() {
+        let Some(marked) = live.get_mut(value.0 as usize) else {
+            continue;
+        };
+        if *marked {
+            continue;
+        }
+        *marked = true;
+        if let Some(Some(inst)) = defs.get(value.0 as usize) {
+            reads(inst, &mut pending);
+        }
+    }
+    live
+}
+
 pub(super) fn run(func: &mut IrFunction) -> usize {
     use crate::ir::reexports::Terminator;
     if func
@@ -779,6 +833,9 @@ pub(super) fn run(func: &mut IrFunction) -> usize {
                     uses[v.0 as usize] = uses[v.0 as usize].saturating_add(1)
                 }
             });
+            crate::backend::liveness::for_each_value_use_in_instruction(i, |v| {
+                uses[v.0 as usize] = uses[v.0 as usize].saturating_add(1);
+            });
         }
         crate::backend::liveness::for_each_operand_in_terminator(&b.terminator, |o| {
             if let Operand::Value(v) = o {
@@ -786,10 +843,12 @@ pub(super) fn run(func: &mut IrFunction) -> usize {
             }
         });
     }
+    let live = live_values(func, &defs);
     let cx = Context {
         defs: &defs,
         uses: &uses,
         visits: std::cell::Cell::new(512),
+        disable_logic: std::env::var_os("CCC_NO_BOOL_ALGEBRA").is_some(),
     };
     let mut next = func
         .next_value_id
@@ -818,13 +877,26 @@ pub(super) fn run(func: &mut IrFunction) -> usize {
             }
         }
         for (ii, i) in b.instructions.iter().enumerate() {
+            if i.dest().is_some_and(|dest| !live[dest.0 as usize]) {
+                continue;
+            }
             let Some(after) = next.checked_add(1) else {
                 return 0;
             };
             if let Some(replacement) = fold(i, &cx, &facts, Value(next)) {
-                if replacement.len() > 1 {
-                    next = after;
-                }
+                // All but the final root definition are fresh temporaries.
+                // Boolean recipes can introduce two, not merely one.
+                let Ok(temporaries) = u32::try_from(replacement.len().saturating_sub(1)) else {
+                    return 0;
+                };
+                next = if temporaries == 0 {
+                    next
+                } else {
+                    let Some(end) = after.checked_add(temporaries - 1) else {
+                        return 0;
+                    };
+                    end
+                };
                 plans.push((bi, ii, replacement));
             }
         }
@@ -852,3 +924,12 @@ mod guards;
 
 #[path = "bit_idioms_count_merge.rs"]
 mod count_merge;
+
+#[path = "bit_idioms_logic.rs"]
+mod logic;
+
+#[path = "bit_idioms_complements.rs"]
+mod complements;
+
+#[path = "bit_idioms_shift_observe.rs"]
+mod shift_observe;

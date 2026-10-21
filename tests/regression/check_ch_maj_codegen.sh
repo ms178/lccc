@@ -28,7 +28,13 @@ GCCINC=$("$GCC" -print-file-name=include 2>/dev/null)
 [ -d "$GCCINC" ] && GCCINC="-I$GCCINC" || GCCINC=""
 fails=0
 note() { printf '%s\n' "$*"; }
-bad()  { note "FAIL: $*"; fails=$((fails+1)); }
+bad()  {
+  note "FAIL: $*"
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    note "::error title=CH/MAJ codegen contract::$*"
+  fi
+  fails=$((fails+1))
+}
 # Correctness gate: a broken reference build must FAIL, not silently skip
 # the differential (explicit opt-out only; CI never sets it).
 ALLOW_GCC_SKIP=${LCCC_ALLOW_GCC_SKIP:-0}

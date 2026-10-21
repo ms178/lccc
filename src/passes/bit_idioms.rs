@@ -3447,9 +3447,13 @@ mod tests {
         let mut insts = Vec::new();
         let mut next = 1;
         let input = Operand::Value(Value(0));
-        insts.push(Instruction::Copy {
+        // Keep the input unknown: with a literal zero the new Boolean
+        // synthesis can legitimately reduce the generated `0 | 1` guard.
+        // An unknown parameter requires both guards, including at runtime zero.
+        insts.push(Instruction::ParamRef {
             dest: Value(0),
-            src: Operand::Const(IrConst::I32(0)),
+            param_idx: 0,
+            ty: IrType::U32,
         });
         let mut outputs = Vec::new();
         for _ in 0..2 {
