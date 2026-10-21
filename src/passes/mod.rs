@@ -1898,7 +1898,9 @@ pub(crate) fn run_passes(
     // Pass name for CCC_DISABLE_PASSES: "gaddrcse".
     if !pass_disabled(&disabled, "gaddrcse") {
         global_addr_cse::run_module(module);
-        module.for_each_function(dce::eliminate_dead_code);
+        if !pass_disabled(&disabled, "dce") {
+            module.for_each_function(dce::eliminate_dead_code);
+        }
     }
 
     let iterations = 3;
