@@ -41,8 +41,20 @@ jobs:
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: |
-        bash scripts/ci_install_gcc16.sh --multilib
-        sudo apt-get install -y --no-install-recommends qemu-user
+        set +e
+        install_log="$RUNNER_TEMP/gcc16-multilib-install.log"
+        bash scripts/ci_install_gcc16.sh --multilib >"$install_log" 2>&1
+        install_status=$?
+        if (( install_status == 0 )); then
+          sudo apt-get install -y --no-install-recommends qemu-user >>"$install_log" 2>&1
+          install_status=$?
+        fi
+        set -e
+        cat "$install_log"
+        if (( install_status != 0 )); then
+          python3 scripts/ci_annotate_log.py --title "GCC 16 multilib provisioning" "$install_log" || true
+        fi
+        exit "$install_status"
     - name: Install differential linker oracles
       run: |
         sudo apt-get update
@@ -123,6 +135,7 @@ jobs:
       run: |
         set -euo pipefail
         export RUSTFLAGS="$(cat target/lccc-rustflags)"
+        python3 scripts/test_ci_oracle_diagnostics.py
         python3 scripts/ci_test_report.py --self-test
         python3 scripts/ci_test_report.py -- cargo test --profile fastbuild --all-targets --locked -j 2
         python3 tests/regression/check_avx512_scalar_witness.py --self-test
@@ -173,8 +186,20 @@ jobs:
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: |
-        bash scripts/ci_install_gcc16.sh --multilib
-        sudo apt-get install -y --no-install-recommends qemu-user
+        set +e
+        install_log="$RUNNER_TEMP/gcc16-multilib-install.log"
+        bash scripts/ci_install_gcc16.sh --multilib >"$install_log" 2>&1
+        install_status=$?
+        if (( install_status == 0 )); then
+          sudo apt-get install -y --no-install-recommends qemu-user >>"$install_log" 2>&1
+          install_status=$?
+        fi
+        set -e
+        cat "$install_log"
+        if (( install_status != 0 )); then
+          python3 scripts/ci_annotate_log.py --title "GCC 16 multilib provisioning" "$install_log" || true
+        fi
+        exit "$install_status"
     - name: Install differential linker oracles
       run: |
         sudo apt-get update
@@ -267,8 +292,20 @@ jobs:
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: |
-        bash scripts/ci_install_gcc16.sh --multilib
-        sudo apt-get install -y --no-install-recommends qemu-user
+        set +e
+        install_log="$RUNNER_TEMP/gcc16-multilib-install.log"
+        bash scripts/ci_install_gcc16.sh --multilib >"$install_log" 2>&1
+        install_status=$?
+        if (( install_status == 0 )); then
+          sudo apt-get install -y --no-install-recommends qemu-user >>"$install_log" 2>&1
+          install_status=$?
+        fi
+        set -e
+        cat "$install_log"
+        if (( install_status != 0 )); then
+          python3 scripts/ci_annotate_log.py --title "GCC 16 multilib provisioning" "$install_log" || true
+        fi
+        exit "$install_status"
     - name: Install differential linker oracles
       run: |
         sudo apt-get update
@@ -427,15 +464,7 @@ jobs:
         set -e
         cat "$install_log"
         if (( install_status != 0 )); then
-          python3 - "$install_log" <<'PY' || true
-        from pathlib import Path
-        import sys
-        lines = [line for line in Path(sys.argv[1]).read_text(errors="replace").splitlines() if line.strip()]
-        tail = "\n".join(lines[-30:])[-5000:] or "no install output recorded"
-        message = "GCC 16 / i686 provisioning failed: " + tail
-        message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-        print("::error title=GCC 16 multilib provisioning::" + message)
-        PY
+          python3 scripts/ci_annotate_log.py --title "GCC 16 multilib provisioning" "$install_log" || true
         fi
         exit "$install_status"
     - name: Install differential linker oracles
@@ -793,8 +822,20 @@ jobs:
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: |
-        bash scripts/ci_install_gcc16.sh --multilib
-        sudo apt-get install -y --no-install-recommends qemu-user
+        set +e
+        install_log="$RUNNER_TEMP/gcc16-multilib-install.log"
+        bash scripts/ci_install_gcc16.sh --multilib >"$install_log" 2>&1
+        install_status=$?
+        if (( install_status == 0 )); then
+          sudo apt-get install -y --no-install-recommends qemu-user >>"$install_log" 2>&1
+          install_status=$?
+        fi
+        set -e
+        cat "$install_log"
+        if (( install_status != 0 )); then
+          python3 scripts/ci_annotate_log.py --title "GCC 16 multilib provisioning" "$install_log" || true
+        fi
+        exit "$install_status"
     - name: Install differential linker oracles
       run: |
         sudo apt-get update
@@ -1083,8 +1124,20 @@ jobs:
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
       run: |
-        bash scripts/ci_install_gcc16.sh --multilib
-        sudo apt-get install -y --no-install-recommends qemu-user
+        set +e
+        install_log="$RUNNER_TEMP/gcc16-multilib-install.log"
+        bash scripts/ci_install_gcc16.sh --multilib >"$install_log" 2>&1
+        install_status=$?
+        if (( install_status == 0 )); then
+          sudo apt-get install -y --no-install-recommends qemu-user >>"$install_log" 2>&1
+          install_status=$?
+        fi
+        set -e
+        cat "$install_log"
+        if (( install_status != 0 )); then
+          python3 scripts/ci_annotate_log.py --title "GCC 16 multilib provisioning" "$install_log" || true
+        fi
+        exit "$install_status"
     - name: Install differential linker oracles
       run: |
         sudo apt-get update

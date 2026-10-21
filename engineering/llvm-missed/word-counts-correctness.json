@@ -2591,7 +2591,17 @@
       "guarded-folds"
     ],
     "standalone_word_counts_corpus": "PASS",
-    "ci_local_parity_commands": 330
+    "ci_local_parity_commands": 331,
+    "oracle_diagnostic_tests": {
+      "passed": 4,
+      "failed": 0,
+      "scope": "PATH-stubbed provisioning; real GCC/qemu failures preserve status even if reporting fails."
+    },
+    "gcc_provisioning_tests": {
+      "passed": 14,
+      "failed": 0,
+      "scope": "PATH-stubbed package policy, retries and partial refresh failure propagation"
+    }
   },
   "candidate_src_tree": "63782a9f1d45cd333e97c01df08a189be313a54d",
   "post_naming_macro_check": {

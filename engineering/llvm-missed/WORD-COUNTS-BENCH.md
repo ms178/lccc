@@ -62,7 +62,7 @@ Library units: **5578 passed, 0 failed, 10 ignored**. Strict fastbuild and
 all-target Clippy pass with zero warnings; the active swap file is 3 GiB.
 The dedicated native/IR/SSA/RA/debug/disable/refusal checks and all renamed
 semantic regression suites pass. The root count fixture passes the standalone
-corpus runner. Hosted/local invocation parity passes **330 commands**; both
+corpus runner. Hosted/local invocation parity passes **331 commands**; both
 normal and optimized inventory tests pass. Independent count proofs produce
 **24 expected outcomes, no UNKNOWN**, not a compiler/machine-code certificate.
 

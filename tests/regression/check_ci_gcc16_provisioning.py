@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Exercise GCC provisioning with PATH stubs: no root, apt or network effects."""
+"""Exercise provisioning without root, package writes or network effects."""
 from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -23,7 +24,9 @@ if name == 'sudo':
 elif name == 'uname': print('Linux')
 elif name == 'dpkg-query':
     print('installed' if os.environ.get('READY') == '1' else 'not-installed')
-elif name == 'apt-cache': print('  Candidate: ' + os.environ.get('CANDIDATE', '16.2.0-1'))
+elif name == 'apt-cache':
+    candidate = os.environ.get('CANDIDATE', '16.2.0-1')
+    print('  Candidate: ' + candidate)
 elif name in ('gcc-16', 'g++-16'):
     if args == ['-dumpfullversion']:
         upgraded = pathlib.Path(os.environ['MOCK_LOG'] + '.installed').exists()
@@ -33,6 +36,9 @@ elif name in ('gcc-16', 'g++-16'):
     else: print(name + ' (mock Debian) 16.2.0\nCopyright')
 elif name == 'apt-get':
     if os.environ.get('APT_FAIL') == '1': sys.exit(9)
+    if args[:1] == ['update'] and os.environ.get('APT_PARTIAL_FAIL') == '1':
+        print('W: Failed to fetch PPA index')
+        sys.exit(9 if 'APT::Update::Error-Mode=any' in args else 0)
     real_install = args[:1] == ['install'] and '--dry-run' not in args
     if real_install and os.environ.get('APT_INSTALL_FAIL') == '1': sys.exit(9)
     if real_install: pathlib.Path(os.environ['MOCK_LOG'] + '.installed').touch()
@@ -72,7 +78,7 @@ class ProvisioningTests(unittest.TestCase):
         result, commands = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([c for c in commands if c[0] == "apt-get"], [
-            ["apt-get", "update"],
+            ["apt-get", "update", "-o", "APT::Update::Error-Mode=any"],
             ["apt-get", "install", "-y", "--no-install-recommends",
              "-o", "Acquire::Retries=3", "gcc-16", "g++-16"],
         ])
@@ -104,11 +110,36 @@ class ProvisioningTests(unittest.TestCase):
         result, commands = self.invoke(distro="ubuntu", CANDIDATE="(none)")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sum(c[0] == "add-apt-repository" for c in commands), 1)
-        self.assertEqual(commands.count(["apt-get", "update"]), 2)
+        self.assertEqual(commands.count(["apt-get", "update", "-o", "APT::Update::Error-Mode=any"]), 2)
         result, commands = self.invoke(CANDIDATE="(none)")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("refusing an Ubuntu PPA", result.stderr)
         self.assertFalse(any(c[0] == "add-apt-repository" for c in commands))
+
+    def test_literal_gxx_diagnostics_do_not_report_clang(self):
+        apt = shutil.which("apt-cache")
+        if apt is None:
+            self.skipTest("APT policy reader unavailable")
+        # Read only an isolated synthetic status database: no system package
+        # state, writes, root privileges, apt update/install or network calls.
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            status = directory / "status"
+            status.write_text("Package: clang-16\nStatus: install ok installed\n"
+                              "Architecture: amd64\nVersion: 16.0.6-1\n"
+                              "Description: Isolated regex fixture\n\n")
+            lists = directory / "lists"
+            lists.mkdir()
+            command = [apt, "-o", f"Dir::State::status={status}",
+                       "-o", f"Dir::State::lists={lists}",
+                       "-o", "Dir::Cache::pkgcache=", "-o", "Dir::Cache::srcpkgcache=", "policy"]
+            broad = subprocess.run(command + ["g++-16"], capture_output=True, text=True, check=True)
+            exact = subprocess.run(command + ["?exact-name(g++-16)"], capture_output=True, text=True, check=True)
+            # Old APT releases expose Clang via the deprecated broad regex.
+            # New releases may remove that fallback; literal lookup must work
+            # in either case and must never select Clang.
+            self.assertEqual(broad.returncode, 0)
+            self.assertNotIn("clang-16:", exact.stdout)
 
     def test_ready_toolchain_does_not_reprovision(self):
         result, commands = self.invoke(READY="1")
@@ -135,8 +166,16 @@ class ProvisioningTests(unittest.TestCase):
         # exactly three times before the failure propagates.
         result, commands = self.invoke(APT_FAIL="1")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(commands.count(["apt-get", "update"]), 3)
+        self.assertEqual(commands.count(["apt-get", "update", "-o", "APT::Update::Error-Mode=any"]), 3)
         self.assertIn("attempt 3/3", result.stderr)
+
+    def test_partial_refresh_failures_are_retried_before_any_install(self):
+        result, commands = self.invoke(APT_PARTIAL_FAIL="1")
+        self.assertNotEqual(result.returncode, 0)
+        updates = [c for c in commands if c[:2] == ["apt-get", "update"]]
+        self.assertEqual(len(updates), 3)
+        self.assertTrue(all("APT::Update::Error-Mode=any" in c for c in updates))
+        self.assertFalse(any(c[:2] == ["apt-get", "install"] for c in commands))
 
     def test_install_failure_names_the_resolver_state(self):
         # PPA publication skew between gcc-16 and the lib32 binaries must
@@ -151,7 +190,7 @@ class ProvisioningTests(unittest.TestCase):
         for package in ("gcc-16", "g++-16", "gcc-16-multilib", "g++-16-multilib",
                         "gcc-multilib", "g++-multilib", "libc6-dev-i386",
                         "lib32gcc-16-dev"):
-            self.assertIn(["apt-cache", "policy", package], commands)
+            self.assertIn(["apt-cache", "policy", f"?exact-name({package})"], commands)
         self.assertTrue(any(c[:2] == ["apt-get", "install"] and "--dry-run" in c
                             for c in commands))
 

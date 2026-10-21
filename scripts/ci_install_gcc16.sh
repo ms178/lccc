@@ -85,8 +85,12 @@ if ! toolchain_ready; then
     if [[ $MODE == --multilib ]]; then
         as_root dpkg --add-architecture i386
     fi
-    apt_retry apt-get update
-    candidate=$(apt-cache policy gcc-16 | awk '/Candidate:/ { print $2; exit }')
+    # apt normally returns success after a failed repository refresh. Retry
+    # that failure instead of installing against missing/stale PPA indexes.
+    apt_retry apt-get update -o APT::Update::Error-Mode=any
+    # Use literal names consistently: g++ contains regex metacharacters and
+    # an absent g++-16 can otherwise report unrelated Clang packages.
+    candidate=$(apt-cache policy '?exact-name(gcc-16)' | awk '/Candidate:/ { print $2; exit }')
     if [[ -z $candidate || $candidate == '(none)' ]]; then
         # Override is useful for mock-only tests; normal callers use the host.
         # shellcheck disable=SC1090
@@ -99,13 +103,13 @@ if ! toolchain_ready; then
             as_root apt-get install -y --no-install-recommends software-properties-common
         fi
         as_root add-apt-repository -y ppa:ubuntu-toolchain-r/test
-        apt_retry apt-get update
+        apt_retry apt-get update -o APT::Update::Error-Mode=any
     fi
     if ! apt_retry apt-get install -y --no-install-recommends \
             -o Acquire::Retries=3 "${archive_opts[@]}" "${packages[@]}"; then
         echo "ci_install_gcc16: install failed; per-package resolver state follows" >&2
         for package in "${packages[@]}"; do
-            apt-cache policy "$package" >&2 || true
+            apt-cache policy "?exact-name($package)" >&2 || true
         done
         # Name the exact uninstallable dependency chain in the log.
         as_root apt-get install -y --no-install-recommends --dry-run \

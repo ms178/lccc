@@ -1144,6 +1144,7 @@ gate "llvm-bit-demand" fast python3 tests/regression/check_llvm_bit_demand.py
 gate "llvm-scalar-facts" fast python3 tests/regression/check_llvm_scalar_facts.py
 gate "llvm-guarded-folds" fast python3 tests/regression/check_llvm_guarded_folds.py
 gate "llvm-word-counts" fast python3 tests/regression/check_llvm_word_counts.py
+gate "oracle-diagnostics" fast python3 scripts/test_ci_oracle_diagnostics.py
 
 gate "tls-model-option" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_option.sh
