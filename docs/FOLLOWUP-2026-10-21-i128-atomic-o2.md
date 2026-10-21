@@ -1,7 +1,9 @@
 # Follow-up: i128 atomic results miscompiled by a `-O2` middle-end pass
 
 Date: 2026-10-21
-Status: open, not fixed here
+Status: **fixed** (2026-10-21, fourth investigation) -- see
+"Resolution" at the end. The three hypotheses below are retained because
+each one is a plausible reading of the evidence and each is wrong.
 Found by: differential runtime testing against GCC 16.2 while validating the
 16-byte atomic lowering.
 
@@ -116,3 +118,186 @@ second gate should assert the reproducer above.
   memory-clobbering for CSE/GVN and for store-to-load forwarding of the
   16-byte slot; the 64-bit widths may be relying on an alias rule that does
   not generalise to a two-slot value.
+
+## Correction (2026-10-21, second investigation)
+
+The "call-clobber modelling for the libatomic call form" reading above is
+**wrong** and should not be trusted. Pass bisection with
+`CCC_DISABLE_PASSES` over all 73 kill switches identified `gaddrcse`
+(`src/passes/global_addr_cse.rs`) as the unique single pass whose removal
+restores the correct answer, and `CCC_NO_GADDR_CSE=1` agrees. But a guard that
+excludes every address reaching a 16-byte atomic from CSE — verified by IR dump
+to leave the four `GlobalAddr "v"` values distinct, exactly as with the pass
+disabled — **does not fix the miscompile**. So the atomic's address is not the
+trigger.
+
+Diffing the final IR with the pass on and off shows what actually still merges:
+the address of the *accumulator*, a plain `unsigned long long h` that the
+arithmetic consumer reads and writes. With `gaddrcse` on, every `GlobalAddr "h"`
+collapses to one value; with it off they stay distinct. Merging a plain
+global's address is what exposes the defect; the 16-byte atomics in the same
+block are what make it wrong.
+
+Ruled out by reading the code, both are default-closed and clear their state on
+every atomic including `AtomicInc`:
+
+* `src/passes/redundant_loads.rs` (lines ~246-260)
+* `src/passes/store_load_forward.rs` (lines ~399-405)
+
+Disabling either of those, or `slforward`, does not restore the answer — it
+turns the wrong value into a **SIGSEGV**, which is a second and independent
+defect, not a fix.
+
+Also measured: plain 64-bit load/store and 64-bit atomics with the same shape
+match GCC 16.2 exactly; only the 128-bit form diverges. Adding a `printf` of
+the intermediate values makes the 128-bit case correct under `gaddrcse`, so the
+bad transformation needs the values to be consumed only by arithmetic.
+
+Next step that follows from this: instrument the passes that key on address
+*value identity* rather than on proven aliasing, and find which one treats two
+accesses to the merged `h` as interchangeable across the intervening 16-byte
+atomic. The candidates that were individually disabled without effect (`gvn`,
+`globaldse`, `dse`, `copyprop`, `simplify`, `constfold`, `licm`, `cvp`, `sccp`)
+should be re-tested in combination, since no single one of them is sufficient.
+
+### Narrowest reproducer found
+
+The merged address is the accumulator's, so the atomic object and the
+accumulator must both be file-scope. `gcc 16.2 -O2 -mcx16` returns 220; lccc
+`-O2` returns 181 with `gaddrcse` on and 220 with it off.
+
+```c
+typedef unsigned __int128 u128;
+static _Alignas(16) _Atomic u128 v;
+unsigned long long h;                 /* this is the address that gets merged */
+
+int main(void) {
+    u128 k = ((u128)0x0123456789ABCDEFULL << 64) | 0xFEDCBA9876543210ULL;
+#define MIX(x) do { u128 t_ = (x); \
+    h = h * 1000003ULL + (unsigned long long)t_ + (unsigned long long)(t_ >> 64); \
+} while (0)
+    {   __atomic_store_n(&v, k + 1, __ATOMIC_RELAXED);
+        u128 e = k + 1;
+        MIX((u128)__atomic_compare_exchange_n(&v, &e, k + 1 + (u128)1, 0,
+                                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+        MIX(e); MIX(v); }
+    {   __atomic_store_n(&v, k + 2, __ATOMIC_RELAXED);
+        u128 e = k + 2;
+        MIX((u128)__atomic_compare_exchange_n(&v, &e, k + 2 + (u128)1, 0,
+                                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+        MIX(e); MIX(v); }
+    return (int)h;
+}
+```
+
+## Reduction matrix (2026-10-21, third investigation)
+
+Two further hypotheses were tested and **both disproved**:
+
+* *The merged atomic address.* A guard excluding every address reaching a
+  16-byte atomic from CSE was implemented and confirmed by IR dump to leave the
+  four `GlobalAddr "v"` values distinct — the state the disabled pass produces.
+  The miscompile was unchanged.
+* *Clobbered scratch registers.* The inline `cmpxchg16b` path uses `%rcx` and
+  `%r8` as unconditional scratch and `prepare_atomic_side_effect` only
+  invalidates the register cache, so both were saved and restored around the
+  sequence. The miscompile was unchanged. (Both changes were reverted.)
+
+Reducing the program by which of the three mixed values is consumed, all at
+`-O2 -mcx16` against GCC 16.2:
+
+| mixed value | 1 block | 2 blocks |
+| --- | --- | --- |
+| compare-exchange result | match | match |
+| `expected` after the CAS | match | match |
+| the object `v` itself | **fail** (gcc 1, lccc 219) | **fail** (gcc 69, lccc 30) |
+| all three | match | **fail** (gcc 220, lccc 181) |
+
+So the corrupted value is the one read back out of the 128-bit object, not the
+value the atomic returned and not the value written through `expected`. A
+single block is enough.
+
+Hand-flattening that same code out of its `do { … } while (0)` wrapper makes it
+**pass**, as does writing the CAS's desired operand as the literal `k + 2`
+instead of the expression `k + 1 + (u128)1`. The trigger therefore depends on
+the block/SSA structure the wrapper produces, not on the arithmetic, and it has
+not been isolated further. The failing cell is reproducible with
+`-DW=2 -DN=1` over the reduction source used to produce the table.
+
+## Resolution (2026-10-21, fourth investigation)
+
+Fixed. The cause is in `src/backend/liveness.rs`, not in `global_addr_cse`,
+not in DCE, and not in the 16-byte lowering.
+
+### Reduction
+
+The compare-exchange is not needed. This is the whole trigger, and it is
+wrong at `-O2`/`-O3` while `-O0`/`-O1` are correct (GCC 16.2 returns 0 at
+every level; lccc returned 219):
+
+```c
+typedef unsigned __int128 u128;
+static _Alignas(16) _Atomic u128 v;
+unsigned long long h;
+int main(void) {
+    u128 k = ((u128)0x0123456789ABCDEFULL << 64) | 0xFEDCBA9876543210ULL;
+    __atomic_store_n(&v, k + 1, __ATOMIC_RELAXED);
+    do { u128 t_ = (v);
+         h = h * 1000003ULL + (unsigned long long)t_
+             + (unsigned long long)(t_ >> 64); } while (0);
+    return (int)h;
+}
+```
+
+### Cause
+
+`instruction_is_call_point` decides which IR instructions destroy the
+caller-saved registers, so that `collect_call_spanning_owners` can keep such
+values out of caller-saved homes. It covered i128 division and the `F128`
+helpers -- calls for exactly this reason -- but had **no arm for atomic
+instructions**. On x86-64 a 16-byte atomic load, store or RMW lowers to a
+`__atomic_*_16` libatomic **call**, so the call was invisible to
+`call_points`, `call_spanning` came back empty for values living across it,
+and every caller-saved wave was free to home one in a register the call
+destroys.
+
+`gaddrcse` supplies the value: merging the two materialisations of `v`'s
+address stretches one live range past the atomic. The one-instruction diff
+between the pass being on and off:
+
+```
+gaddrcse off:   movdqu v(%rip), %xmm0     <- RIP-relative, correct
+gaddrcse on:    movdqu (%r11), %xmm0      <- %r11 occurs exactly once in the
+                                             whole .s file, as this operand
+```
+
+Nothing in the function ever wrote `%r11`; the load dereferenced whatever the
+PLT stub left behind. That is a memory-safety bug as well as a wrong value,
+and it explains every earlier observation: why `-O1` was correct, why
+disabling DCE changed nothing, and why the three hypotheses above all failed.
+
+### Fix
+
+`instruction_is_call_point` now returns true for `AtomicRmw`, `AtomicInc`,
+`AtomicCmpxchg`, `AtomicLoad` and `AtomicStore` on `I128`/`U128`. Narrower
+atomics stay excluded: they are inline on every supported target (`lock
+cmpxchg8b` on i386, plain `lock` forms on x86-64) and are not calls. The
+address is now homed in `%rbx`, which survives the call.
+
+### Verification
+
+* The reduction above matches GCC 16.2 at `-O0..-O3`.
+* The original two-block reproducer matches GCC 16.2 (220) at `-O0..-O3`
+  across five ISA configs: default, `-mcx16`, `-march=x86-64-v3`,
+  `-march=x86-64-v2`, `-mno-cx16` -- 20/20.
+* `tests/regression/check_i128_atomic_call_clobber.sh` (gate
+  `i128-atomic-call-clobber`) asserts both halves: structurally that no
+  memory operand in `main` is based on a register `main` never writes, and
+  behaviourally the GCC 16.2 differential above. Reverting only the liveness
+  change makes the gate fail with
+  `main dereferences register(s) it never writes: %r11`, so the gate is
+  verified to catch the defect rather than merely to pass.
+
+`check_atomic16_runtime.sh` can now build its runtime half at `-O2`; that is
+deliberately left alone here, since moving it changes what an existing gate
+covers and belongs in its own change.
