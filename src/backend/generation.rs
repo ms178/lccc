@@ -4341,17 +4341,63 @@ fn emit_functions_and_sections(
                     let orig_raw = cg.state_ref().out.buf[mark..].to_string();
                     cg.state().out.buf.truncate(mark);
                     let (chain_peep, orig_peep) = cg.peephole_pair_for_metric(chain_raw, orig_raw);
-                    let chain_count =
-                        crate::passes::block_layout::count_instruction_lines(&chain_peep);
-                    let orig_count =
-                        crate::passes::block_layout::count_instruction_lines(&orig_peep);
+                    // Lines PLUS the static cost of the transitions the
+                    // layout leaves taken (`layout_branch_cost`): counting
+                    // lines alone is blind to what block placement controls.
+                    // Kill switch: `CCC_NO_LAYOUT_BRANCH_COST`.
+                    let branch_term: u64 =
+                        if std::env::var_os("CCC_NO_LAYOUT_BRANCH_COST").is_some() {
+                            0
+                        } else {
+                            1
+                        };
+                    let chain_lines =
+                        crate::passes::block_layout::count_instruction_lines(&chain_peep) as u64;
+                    let orig_lines =
+                        crate::passes::block_layout::count_instruction_lines(&orig_peep) as u64;
+                    let chain_branch =
+                        branch_term * crate::passes::block_layout::layout_branch_cost(func);
+                    let orig_branch =
+                        branch_term * crate::passes::block_layout::layout_branch_cost(&alt);
+                    let chain_count = chain_lines + chain_branch;
+                    let orig_count = orig_lines + orig_branch;
+                    let chain_stack =
+                        crate::passes::block_layout::count_stack_operands(&chain_peep);
+                    let orig_stack = crate::passes::block_layout::count_stack_operands(&orig_peep);
+                    if std::env::var_os("CCC_DEBUG_CHAIN").is_some() {
+                        eprintln!(
+                            "[LAYOUT] chain {} ins + {} br = {} (stack {}) | orig {} ins + {} br = {} (stack {})",
+                            chain_lines,
+                            chain_branch,
+                            chain_count,
+                            chain_stack,
+                            orig_lines,
+                            orig_branch,
+                            orig_count,
+                            orig_stack
+                        );
+                    }
                     crate::backend::state::EXPLORATORY_EMISSION
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     // Emit the measured winner for real: debug traces fire
                     // exactly once per site (count-based test assertions),
                     // and the shipped text comes from a non-exploratory
                     // emission in both arms.
-                    if chain_count < orig_count {
+                    // A layout may not add spill traffic: a stack operand is a
+                    // value a register could have held.  The band is calibrated
+                    // on the two measured disagreements, which sit far apart:
+                    // `linux_rbtree`'s chain order adds 11 instructions and 2
+                    // stack operands (+7 %) and is 13 % FASTER, while
+                    // `zstd_count`'s adds one instruction and 3 stack operands
+                    // (+37 %) and is 9 % slower because the moved block pushes
+                    // a loop counter into a slot reloaded every iteration.
+                    // +10 % separates them with margin on both sides, and it is
+                    // the same shape as the codegen gate's own tolerance bands.
+                    let spill_ok = chain_stack * 10 <= orig_stack * 11;
+                    // With the kill switch set the branch term is zero and the
+                    // rule is the historical one, `chain_lines < orig_lines`.
+                    let adopt_chain = spill_ok && chain_count < orig_count;
+                    if adopt_chain {
                         generate_function(cg, attr_align, func, source_mgr, file_table);
                     } else {
                         generate_function(cg, attr_align, &alt, source_mgr, file_table);
