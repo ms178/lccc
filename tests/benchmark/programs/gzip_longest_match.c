@@ -43,7 +43,9 @@
 #define MAX_MATCH 258
 #endif
 #ifndef PASSES
-#define PASSES 64U
+/* Keep default timing runs above the process-startup noise floor.
+ * Bounded Callgrind screens explicitly override PASSES=1. */
+#define PASSES 8192U
 #endif
 #ifndef HASH_BITS
 #define HASH_BITS 15

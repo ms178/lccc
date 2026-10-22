@@ -33,7 +33,9 @@
 #define ELEMENTS 20000
 #endif
 #ifndef PASSES
-#define PASSES 8U
+/* Keep default timing runs above the process-startup noise floor.
+ * Bounded Callgrind screens explicitly override PASSES=1. */
+#define PASSES 128U
 #endif
 #define MAX_LIST_LENGTH_BITS 20
 
