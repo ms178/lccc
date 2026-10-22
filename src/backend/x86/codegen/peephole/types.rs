@@ -1174,6 +1174,20 @@ pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
     if !store && !load {
         return None;
     }
+    // The packed mnemonics are width-polymorphic: the SAME spelling moves
+    // 16 bytes with an XMM register, 32 with YMM, 64 with ZMM.  `DQ` models
+    // exactly 16, so a wider register operand must be rejected here or every
+    // consumer of the classification (store forwarding, write-region
+    // liveness) will model a 32/64-byte slot access as 16 bytes -- the
+    // liveness half then proves the upper chunk-stores of a 32-byte
+    // parameter copy dead and deletes them, leaving the vector's upper
+    // lanes uninitialised.  Rejecting is not a workaround: YMM/ZMM slot
+    // moves keep the conservative `Other` classification they had before
+    // `DQ` existed.
+    let reg = if store { src } else { dst };
+    if body.1 == MoveSize::DQ && !reg.starts_with("%xmm") {
+        return None;
+    }
     let mem = if store { dst } else { src };
     if mem.ends_with("(%rbp)") {
         Some((store, &mem[..mem.len() - 6], body.1))
@@ -3297,6 +3311,60 @@ mod classify_directive_tests {
                 "{text}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fp_slot_move_width_tests {
+    use super::{parse_fp_slot_move, MoveSize};
+
+    #[test]
+    fn xmm_packed_slot_moves_are_dq() {
+        assert_eq!(
+            parse_fp_slot_move("movdqu %xmm6, 72(%rsp)"),
+            Some((true, "72", MoveSize::DQ))
+        );
+        assert_eq!(
+            parse_fp_slot_move("vmovups 136(%rsp), %xmm10"),
+            Some((false, "136", MoveSize::DQ))
+        );
+        assert_eq!(
+            parse_fp_slot_move("movapd %xmm0, -16(%rbp)"),
+            Some((true, "-16", MoveSize::DQ))
+        );
+    }
+
+    /// The packed mnemonics are width-polymorphic in the register operand:
+    /// YMM moves 32 bytes and ZMM 64, but `DQ` models exactly 16.  Letting a
+    /// YMM/ZMM slot move classify as DQ makes write-region liveness model a
+    /// 32/64-byte access as 16 bytes and prove the upper chunk-stores of a
+    /// wide parameter copy dead -- the miscompile behind the
+    /// `vector-abi-wide` failure (upper lanes of stack-passed `__m256`
+    /// arguments read back uninitialised).  Wide forms must keep the
+    /// conservative unclassified path.
+    #[test]
+    fn ymm_and_zmm_packed_slot_moves_are_not_dq() {
+        for line in [
+            "vmovups 136(%rsp), %ymm10",
+            "vmovups %ymm10, 136(%rsp)",
+            "vmovdqu %ymm0, -32(%rbp)",
+            "vmovaps 64(%rsp), %zmm3",
+            "vmovapd %zmm3, 64(%rsp)",
+        ] {
+            assert_eq!(parse_fp_slot_move(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn scalar_fp_slot_moves_keep_their_sizes() {
+        assert_eq!(
+            parse_fp_slot_move("vmovsd 96(%rsp), %xmm9"),
+            Some((false, "96", MoveSize::SD))
+        );
+        assert_eq!(
+            parse_fp_slot_move("movss %xmm1, 8(%rsp)"),
+            Some((true, "8", MoveSize::SS))
+        );
     }
 }
 
