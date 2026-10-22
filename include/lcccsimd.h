@@ -122,6 +122,8 @@ typedef unsigned char __v64qu __attribute__ ((__vector_size__ (64)));
 #define __CCC_M512_FROM_BUILTIN(e)  (*(__m512 *)(e))
 #define __CCC_M512D_FROM_BUILTIN(e) (*(__m512d *)(e))
 
+__m128d __lccc_simd128_pd_fpscalar128(long, __m128d __a, __m128d __b);
+__m128 __lccc_simd128_ps_fpscalar128(long, __m128 __a, __m128 __b);
 __m512i __lccc_simd512_i_vpaddd512(long, __m512i __a, __m512i __b);
 __m512i __lccc_simd512_i_vpaddq512(long, __m512i __a, __m512i __b);
 __m512i __lccc_simd512_i_vpsubd512(long, __m512i __a, __m512i __b);
@@ -154,14 +156,6 @@ __m512i __lccc_simd512_i_vpmaxsq512(long, __m512i __a, __m512i __b);
 __m512i __lccc_simd512_i_vpminsq512(long, __m512i __a, __m512i __b);
 __m512i __lccc_simd512_i_vpmaxuq512(long, __m512i __a, __m512i __b);
 __m512i __lccc_simd512_i_vpminuq512(long, __m512i __a, __m512i __b);
-__m512i __lccc_simd512_i_vpcmpeqb512(long, __m512i __a, __m512i __b);
-__m512i __lccc_simd512_i_vpcmpeqw512(long, __m512i __a, __m512i __b);
-__m512i __lccc_simd512_i_vpcmpeqd512(long, __m512i __a, __m512i __b);
-__m512i __lccc_simd512_i_vpcmpeqq512(long, __m512i __a, __m512i __b);
-__m512i __lccc_simd512_i_vpcmpgtb512(long, __m512i __a, __m512i __b);
-__m512i __lccc_simd512_i_vpcmpgtw512(long, __m512i __a, __m512i __b);
-__m512i __lccc_simd512_i_vpcmpgtd512(long, __m512i __a, __m512i __b);
-__m512i __lccc_simd512_i_vpcmpgtq512(long, __m512i __a, __m512i __b);
 __m512i __lccc_simd512_i_vpxorq512(long, __m512i __a, __m512i __b);
 __m512i __lccc_simd512_i_vporq512(long, __m512i __a, __m512i __b);
 __m512i __lccc_simd512_i_vpandq512(long, __m512i __a, __m512i __b);
@@ -286,30 +280,6 @@ static __inline__ __m512i _mm512_max_epu64(__m512i __a, __m512i __b) __attribute
 
 static __inline__ __m512i _mm512_min_epu64(__m512i __a, __m512i __b) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpminuq512(0, __a, __b)); }
-
-static __inline__ __m512i _mm512_cmpeq_epi8(__m512i __a, __m512i __b) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpcmpeqb512(0, __a, __b)); }
-
-static __inline__ __m512i _mm512_cmpeq_epi16(__m512i __a, __m512i __b) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpcmpeqw512(0, __a, __b)); }
-
-static __inline__ __m512i _mm512_cmpeq_epi32(__m512i __a, __m512i __b) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpcmpeqd512(0, __a, __b)); }
-
-static __inline__ __m512i _mm512_cmpeq_epi64(__m512i __a, __m512i __b) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpcmpeqq512(0, __a, __b)); }
-
-static __inline__ __m512i _mm512_cmpgt_epi8(__m512i __a, __m512i __b) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpcmpgtb512(0, __a, __b)); }
-
-static __inline__ __m512i _mm512_cmpgt_epi16(__m512i __a, __m512i __b) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpcmpgtw512(0, __a, __b)); }
-
-static __inline__ __m512i _mm512_cmpgt_epi32(__m512i __a, __m512i __b) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpcmpgtd512(0, __a, __b)); }
-
-static __inline__ __m512i _mm512_cmpgt_epi64(__m512i __a, __m512i __b) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpcmpgtq512(0, __a, __b)); }
 
 static __inline__ __m512i _mm512_xor_si512(__m512i __a, __m512i __b) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vpxorq512(0, __a, __b)); }
@@ -586,6 +556,10 @@ __m512i __lccc_simd512_i_vpcmpuq512(long, __m512i __a, __m512i __b);
 __m512i __lccc_simd512_i_vpcmpuq512(long, __m512i __a, __m512i __b);
 __m512i __lccc_simd512_i_vpcmpq512(long, __m512i __a, __m512i __b);
 __m512i __lccc_simd512_i_vpcmpq512(long, __m512i __a, __m512i __b);
+__m512i __lccc_simd512_i_vpcmpb512(long, __m512i __a, __m512i __b);
+__m512i __lccc_simd512_i_vpcmpw512(long, __m512i __a, __m512i __b);
+__m512i __lccc_simd512_i_vpcmpd512(long, __m512i __a, __m512i __b);
+__m512i __lccc_simd512_i_vpcmpq512(long, __m512i __a, __m512i __b);
 __m512i __lccc_simd512_i_vpcmpub256(long, __m512i __a, __m512i __b);
 __m512i __lccc_simd512_i_vpcmpub256(long, __m512i __a, __m512i __b);
 __m512i __lccc_simd512_i_vpcmpb256(long, __m512i __a, __m512i __b);
@@ -631,6 +605,18 @@ static __inline__ __mmask8 _mm512_cmpeq_epi64_mask(__m512i __a, __m512i __b) __a
 { return (__mmask8)__lccc_simd512_i_vpcmpq512(0, __a, __b); }
 
 #define _mm512_cmp_epi64_mask(__a, __b, __imm) (__mmask8)__lccc_simd512_i_vpcmpq512(__imm, __a, __b)
+
+static __inline__ __mmask64 _mm512_cmpgt_epi8_mask(__m512i __a, __m512i __b) __attribute__((__always_inline__, __artificial__))
+{ return (__mmask64)__lccc_simd512_i_vpcmpb512(6, __a, __b); }
+
+static __inline__ __mmask32 _mm512_cmpgt_epi16_mask(__m512i __a, __m512i __b) __attribute__((__always_inline__, __artificial__))
+{ return (__mmask32)__lccc_simd512_i_vpcmpw512(6, __a, __b); }
+
+static __inline__ __mmask16 _mm512_cmpgt_epi32_mask(__m512i __a, __m512i __b) __attribute__((__always_inline__, __artificial__))
+{ return (__mmask16)__lccc_simd512_i_vpcmpd512(6, __a, __b); }
+
+static __inline__ __mmask8 _mm512_cmpgt_epi64_mask(__m512i __a, __m512i __b) __attribute__((__always_inline__, __artificial__))
+{ return (__mmask8)__lccc_simd512_i_vpcmpq512(6, __a, __b); }
 
 static __inline__ __mmask32 _mm256_cmpeq_epu8_mask(__m256i __a, __m256i __b) __attribute__((__always_inline__, __artificial__))
 { return (__mmask32)__lccc_simd512_i_vpcmpub256(0, __a, __b); }

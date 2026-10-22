@@ -165,29 +165,25 @@ _mm_mul_ps(__m128 __a, __m128 __b)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_add_ss(__m128 __a, __m128 __b)
 {
-    __a.__val[0] += __b.__val[0];
-    return __a;
+    return __lccc_simd128_ps_fpscalar128(8, __a, __b);
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_sub_ss(__m128 __a, __m128 __b)
 {
-    __a.__val[0] -= __b.__val[0];
-    return __a;
+    return __lccc_simd128_ps_fpscalar128(9, __a, __b);
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_mul_ss(__m128 __a, __m128 __b)
 {
-    __a.__val[0] *= __b.__val[0];
-    return __a;
+    return __lccc_simd128_ps_fpscalar128(10, __a, __b);
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_div_ss(__m128 __a, __m128 __b)
 {
-    __a.__val[0] /= __b.__val[0];
-    return __a;
+    return __lccc_simd128_ps_fpscalar128(11, __a, __b);
 }
 
 /* === Bitwise (float domain) === */
@@ -252,8 +248,9 @@ _mm_xor_ps(__m128 __a, __m128 __b)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_sqrt_ss(__m128 __a)
 {
-    __a.__val[0] = __builtin_sqrtf(__a.__val[0]);
-    return __a;
+    /* sqrtss writes only the low lane; every upper lane comes from `a`, so
+     * passing `a` twice is the exact one-operand form. */
+    return __lccc_simd128_ps_fpscalar128(14, __a, __a);
 }
 
 
@@ -551,15 +548,13 @@ _MM_SET_FLUSH_ZERO_MODE(unsigned int __mode)
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_min_ss(__m128 __a, __m128 __b)
 {
-    __a.__val[0] = __a.__val[0] < __b.__val[0] ? __a.__val[0] : __b.__val[0];
-    return __a;
+    return __lccc_simd128_ps_fpscalar128(13, __a, __b);
 }
 
 static __inline__ __m128 __attribute__((__always_inline__))
 _mm_max_ss(__m128 __a, __m128 __b)
 {
-    __a.__val[0] = __a.__val[0] > __b.__val[0] ? __a.__val[0] : __b.__val[0];
-    return __a;
+    return __lccc_simd128_ps_fpscalar128(12, __a, __b);
 }
 
 /* === Move === */
@@ -714,10 +709,17 @@ _mm_ucomineq_ss(__m128 __a, __m128 __b)
 
 #define _mm_cvtsi64x_ss(a, b) _mm_cvtsi64_ss(a, b)
 
+/* _mm_cvtss_si64: convert low float to long long, rounding per MXCSR.RC.
+ * The plain cast truncated, which is `_mm_cvttss_si64`'s contract, not this
+ * one's. */
 static __inline__ long long __attribute__((__always_inline__))
 _mm_cvtss_si64(__m128 __a)
 {
+#if defined(__x86_64__)
+    return __builtin_ia32_cvtss2si64(__a);
+#else
     return (long long)__a.__val[0];
+#endif
 }
 
 #define _mm_cvtss_si64x(a) _mm_cvtss_si64(a)

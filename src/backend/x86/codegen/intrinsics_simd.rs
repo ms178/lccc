@@ -88,6 +88,51 @@ impl X86Codegen {
 
     /// 512-bit binary op: `inst src2, src1, dst` (AT&T), with memory-operand
     /// folding for args[0] (commutative) or args[1] (non-commutative).
+    /// `_mm_{add,sub,mul,div,max,min,sqrt}_s{d,s}` -> two instructions.
+    ///
+    /// The SSE scalar forms are "copy the destination, replace its low lane",
+    /// so the ideal lowering is a register move plus the scalar op with the
+    /// second operand read straight from memory:
+    ///
+    ///     movdqu a -> %xmm0
+    ///     addsd  b -> %xmm0       (or the register form when b is not a slot)
+    ///
+    /// `sqrtsd`/`sqrtss` take only the source, so they skip the second load.
+    /// The selector is the trailing immediate: 0..=6 double, 8..=14 single.
+    fn emit_scalar_fp_lane_128(&mut self, dest_ptr: &Value, args: &[Operand]) {
+        const DOUBLE: [&str; 7] = [
+            "addsd", "subsd", "mulsd", "divsd", "maxsd", "minsd", "sqrtsd",
+        ];
+        const SINGLE: [&str; 7] = [
+            "addss", "subss", "mulss", "divss", "maxss", "minss", "sqrtss",
+        ];
+        // The immediate is appended last by the lowering (uniform "imm is the
+        // last operand" rule), so read it from the tail.
+        let selector = args.last().map_or(0, |arg| self.simd_imm(arg));
+        let (table, index) = if selector >= 8 {
+            (&SINGLE, selector - 8)
+        } else {
+            (&DOUBLE, selector)
+        };
+        let Ok(index) = usize::try_from(index) else {
+            self.sse_load_arg(&args[0], "xmm0");
+            return;
+        };
+        let Some(inst) = table.get(index) else {
+            // Fail closed: an unknown selector must not silently emit the
+            // wrong arithmetic. Fall back to a plain copy of `a`.
+            self.sse_load_arg(&args[0], "xmm0");
+            self.sse_store_dest(dest_ptr, "xmm0");
+            return;
+        };
+        // `a` is the destination so its upper lanes survive; the low lane of
+        // `a` is overwritten for the binary forms and ignored by SQRTSD.
+        self.sse_load_arg(&args[0], "xmm0");
+        self.sse_load_arg(&args[1], "xmm1");
+        self.state.emit_fmt(format_args!("    {inst} %xmm1, %xmm0"));
+        self.sse_store_dest(dest_ptr, "xmm0");
+    }
+
     fn emit_evex_binary_512(
         &mut self,
         dest_ptr: &Value,
@@ -466,30 +511,6 @@ impl X86Codegen {
             }
             Pminuq512 => {
                 self.emit_evex_binary_512(dptr, args, "vpminuq", true);
-                true
-            }
-            Pcmpeqd512 => {
-                self.emit_evex_binary_512(dptr, args, "vpcmpeqd", true);
-                true
-            }
-            Pcmpeqq512 => {
-                self.emit_evex_binary_512(dptr, args, "vpcmpeqq", true);
-                true
-            }
-            Pcmpgtb512 => {
-                self.emit_evex_binary_512(dptr, args, "vpcmpgtb", false);
-                true
-            }
-            Pcmpgtw512 => {
-                self.emit_evex_binary_512(dptr, args, "vpcmpgtw", false);
-                true
-            }
-            Pcmpgtd512 => {
-                self.emit_evex_binary_512(dptr, args, "vpcmpgtd", false);
-                true
-            }
-            Pcmpgtq512 => {
-                self.emit_evex_binary_512(dptr, args, "vpcmpgtq", false);
                 true
             }
             Psadbw512 => {
@@ -1070,8 +1091,8 @@ impl X86Codegen {
                 self.emit_sse_fp_128(dptr, args, inst, is_ps);
                 true
             }
-            SqrtPs128 | RcpPs128 | RsqrtPs128 | SqrtPd128 => {
-                // unary: these belong to emit_sse_fp_128_op
+            SqrtPs128 | RcpPs128 | RsqrtPs128 | SqrtPd128 | ScalarFpLane128 => {
+                // unary/scalar-lane ops belong to emit_sse_fp_128_op
                 self.emit_sse_fp_128_op(dptr, op, args);
                 true
             }
@@ -1761,6 +1782,12 @@ impl X86Codegen {
                 self.state
                     .emit_fmt(format_args!("    insertps ${}, %xmm1, %xmm0", imm));
                 self.sse_store_dest(dest_ptr, "xmm0");
+            }
+            // Scalar FP lane ops: one arm, thirteen intrinsics. The selector
+            // arrives as the trailing immediate; `a` supplies the preserved
+            // upper lanes and the low lane of the result.
+            ScalarFpLane128 => {
+                self.emit_scalar_fp_lane_128(dest_ptr, args);
             }
             // movss/movsd (a, b): movss %xmm_b, %xmm_a
             Movss128 | Movsd128 => {

@@ -173,6 +173,14 @@ class ProvisionToolchain(unittest.TestCase):
             "#!/bin/sh\n"
             'printf "install-gcc16 %s\\n" "$*" >> "$MOCK_LOG"\n'
             'touch "$MOCK_INSTALLED"\n')
+        # The differential linker oracles are installed by their own script
+        # (retries, fail-closed, warm-runner-free), so provisioning delegates
+        # that pair instead of folding it into the apt transaction. The mock
+        # records the delegation; the contract that the pair MUST reach it is
+        # pinned by check_ci_link_oracle_provisioning.py.
+        (self.repo / "scripts" / "ci_install_link_oracles.sh").write_text(
+            "#!/bin/sh\n"
+            'printf "install-link-oracles %s\\n" "$*" >> "$MOCK_LOG"\n')
         self.bin = self.temp / "bin"
         self.bin.mkdir()
         # `sudo` records and then RUNS its command, because escalation is only
@@ -231,11 +239,18 @@ class ProvisionToolchain(unittest.TestCase):
         self.assertEqual(lines[0], "install-gcc16 --multilib")
         apt = [line for line in lines if line.startswith("apt-get")]
         self.assertEqual(len(apt), 1, lines)
-        # qemu-user is the i686 execution oracle; mold and lld are the linker
-        # oracles; python3-yaml is the gate parser.  All four in ONE call.
+        # The pair with its own retrying installer is delegated; the rest of
+        # the immutable set (qemu-user: the i686 execution oracle,
+        # python3-yaml: the gate parser) stays in ONE apt transaction, so a
+        # lane still pays one package transaction and not two.
         self.assertEqual(apt[0].split()[1:], [
             "install", "-y", "--no-install-recommends",
-            "qemu-user", "mold", "lld", "python3-yaml"])
+            "qemu-user", "python3-yaml"])
+        delegated = [line.strip() for line in lines
+                     if line.startswith("install-link-oracles")]
+        self.assertEqual(delegated, ["install-link-oracles"],
+                         "mold+lld must reach the retrying installer exactly "
+                         f"once, got: {lines}")
         exports = [line for line in lines if line.startswith("bundle export")]
         self.assertEqual(len(exports), 1, lines)
         # The exported package set is the dpkg-delta, never a hard-coded list.

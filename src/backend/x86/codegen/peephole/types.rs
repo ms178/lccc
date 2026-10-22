@@ -200,6 +200,32 @@ pub(super) enum MoveSize {
     SLQ, // movslq (sign-extend 32->64)
     SD,  // movsd (scalar double, 8 bytes)
     SS,  // movss (scalar single, 4 bytes)
+    /// A 16-byte vector move between an XMM register and a frame slot:
+    /// `movdqu`, `movups` or `movdqa` (and their VEX `v`-forms). Modeled
+    /// because a 16-byte slot store followed by a 16-byte slot load is the
+    /// dominant SSE round trip that codegen emits for an `__m128` that
+    /// briefly leaves its register, and forwarding it is the difference
+    /// between two instructions and five.
+    DQ,
+    /// The same slot moves at 256 bits (`%ymm` operand, 32 bytes) and at
+    /// 512 bits (`%zmm`, 64 bytes).
+    ///
+    /// The footprint is a property of the OPERANDS, not of the mnemonic:
+    /// `vmovdqu %ymm0, 40(%rsp)` and `vmovdqu %xmm0, 40(%rsp)` share a
+    /// mnemonic and differ by a factor of two in the bytes they touch.
+    /// Classifying both as `DQ` made every width consumer under-report a
+    /// 256-bit move by 16 bytes, and `eliminate_never_read_stores` then
+    /// believed the top half of a 32-byte slot was never read and deleted
+    /// the stores that fill it -- a GNU `vector_size(32)` value built lane by
+    /// lane in a frame slot returned with its upper half missing
+    /// (`v32c shl_v32c(a,b)` at `-O2 -mavx2`: lanes 16..31 silently
+    /// dropped, caught by the vector-extension runtime differential).
+    ///
+    /// Neither variant is forwardable: every XMM-home forwarding path spells
+    /// its replacement with `%xmmN` text and would truncate the value, so
+    /// `xmm_mnemonic` declines them and they only ever widen a memory extent.
+    DQ32,
+    DQ64,
 }
 
 impl MoveSize {
@@ -212,6 +238,7 @@ impl MoveSize {
             MoveSize::SLQ => "movslq",
             MoveSize::SD => "movsd",
             MoveSize::SS => "movss",
+            MoveSize::DQ | MoveSize::DQ32 | MoveSize::DQ64 => "movdqu",
         }
     }
 
@@ -222,6 +249,9 @@ impl MoveSize {
             MoveSize::L | MoveSize::SLQ | MoveSize::SS => 4,
             MoveSize::W => 2,
             MoveSize::B => 1,
+            MoveSize::DQ => 16,
+            MoveSize::DQ32 => 32,
+            MoveSize::DQ64 => 64,
         }
     }
 }
@@ -1117,7 +1147,41 @@ pub(super) fn strip_mov_prefix(s: &str, allow_slq: bool) -> Option<(&str, MoveSi
 /// rejected by construction (the slot operand, not `%ds:/%es:` or an XMM,
 /// must be one of the two ends).
 pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
-    let body = if let Some(r) = s.strip_prefix("vmovsd ") {
+    // EVEX width-tagged spellings (`vmovdqu8/16/32/64`, `vmovdqa32/64`) are the
+    // same slot moves with an explicit element width; they were invisible to
+    // this classifier, so an AVX-512 frame round trip fell through to the
+    // generic `Other` path and its extent was recovered (or not) elsewhere.
+    // The footprint still comes from the register operand below.
+    let body = if let Some(r) = s
+        .strip_prefix("vmovdqu64 ")
+        .or_else(|| s.strip_prefix("vmovdqu32 "))
+        .or_else(|| s.strip_prefix("vmovdqu16 "))
+        .or_else(|| s.strip_prefix("vmovdqu8 "))
+        .or_else(|| s.strip_prefix("vmovdqa64 "))
+        .or_else(|| s.strip_prefix("vmovdqa32 "))
+    {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovdqu ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovups ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovdqa ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movdqu ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movups ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movdqa ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movaps ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movapd ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovaps ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovapd ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovsd ") {
         (r, MoveSize::SD)
     } else if let Some(r) = s.strip_prefix("vmovss ") {
         (r, MoveSize::SS)
@@ -1140,6 +1204,19 @@ pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
     let (src, dst) = body.0.split_once(',')?;
     let src = src.trim();
     let dst = dst.trim();
+    // The footprint is the WIDTH OF THE REGISTER OPERAND, not the mnemonic's:
+    // `vmovdqu %ymm0, 40(%rsp)` writes 32 bytes where the `%xmm` form writes
+    // 16. `body.1` carries the 16-byte default; widen it from the register
+    // spelling so every extent consumer sees the true footprint. Reading the
+    // text is exact: `%ymm`/`%zmm` cannot appear in an `%xmm`-only encoding
+    // and vice versa, so no operand can be misread.
+    let width_sized = if src.contains("%zmm") || dst.contains("%zmm") {
+        MoveSize::DQ64
+    } else if src.contains("%ymm") || dst.contains("%ymm") {
+        MoveSize::DQ32
+    } else {
+        body.1
+    };
     let store = src.starts_with('%') && (dst.ends_with("(%rbp)") || dst.ends_with("(%rsp)"));
     let load = dst.starts_with('%') && (src.ends_with("(%rbp)") || src.ends_with("(%rsp)"));
     if !store && !load {
@@ -1147,9 +1224,9 @@ pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
     }
     let mem = if store { dst } else { src };
     if mem.ends_with("(%rbp)") {
-        Some((store, &mem[..mem.len() - 6], body.1))
+        Some((store, &mem[..mem.len() - 6], width_sized))
     } else if mem.ends_with("(%rsp)") {
-        Some((store, &mem[..mem.len() - 6], body.1))
+        Some((store, &mem[..mem.len() - 6], width_sized))
     } else {
         None
     }
@@ -2636,6 +2713,13 @@ pub(super) fn reg_id_to_name(id: RegId, size: MoveSize) -> &'static str {
         MoveSize::L | MoveSize::SS => 1,
         MoveSize::W => 2,
         MoveSize::B => 3,
+        // A `DQ`/`DQ32`/`DQ64` move is vector-only: it is produced by
+        // `parse_fp_slot_move` and consumed by the XMM forwarding paths, which
+        // name their operands with `%xmmN` text, and by the memory-extent
+        // consumers, which never call this. No caller can reach this row with
+        // a GP register, so the 64-bit row is inert here; the `id <= 15`
+        // assertion above still holds.
+        MoveSize::DQ | MoveSize::DQ32 | MoveSize::DQ64 => 0,
     };
     REG_NAMES[row][id as usize]
 }
@@ -3163,6 +3247,74 @@ mod register_spelling_oracle_tests {
             0,
             "rep movsq reads the %rcx count"
         );
+    }
+}
+
+#[cfg(test)]
+mod vector_slot_width_tests {
+    use super::{MoveSize, parse_fp_slot_move};
+
+    /// A vector slot move's footprint is the width of its REGISTER operand.
+    ///
+    /// This is a correctness property, not a code-quality one: the footprint
+    /// feeds the read ranges `eliminate_never_read_stores` reasons with, so
+    /// describing `vmovdqu %ymm0, 40(%rsp)` as 16 bytes told that pass the top
+    /// half of a 32-byte slot was never read. It deleted the stores filling
+    /// it, and a GNU `vector_size(32)` value built lane by lane in a frame
+    /// slot came back with lanes 16..31 missing (`v32c shl_v32c` at
+    /// `-O2 -mavx2`). The classification is the whole of the bug, so it is
+    /// what gets pinned here, for every width and both directions.
+    #[test]
+    fn the_footprint_follows_the_register_width() {
+        // (text, expected footprint, is the memory operand written)
+        let cases: [(&str, MoveSize, bool); 12] = [
+            ("vmovdqu %xmm0, 40(%rsp)", MoveSize::DQ, true),
+            ("vmovdqu 40(%rsp), %xmm0", MoveSize::DQ, false),
+            ("vmovdqu %ymm0, 40(%rsp)", MoveSize::DQ32, true),
+            ("vmovdqu 40(%rsp), %ymm0", MoveSize::DQ32, false),
+            ("vmovdqu %zmm0, 40(%rsp)", MoveSize::DQ64, true),
+            ("vmovdqu 40(%rsp), %zmm0", MoveSize::DQ64, false),
+            ("vmovups %ymm7, -32(%rbp)", MoveSize::DQ32, true),
+            ("vmovaps -32(%rbp), %ymm7", MoveSize::DQ32, false),
+            ("movdqa %xmm3, 16(%rsp)", MoveSize::DQ, true),
+            ("movaps 16(%rbp), %xmm3", MoveSize::DQ, false),
+            ("vmovdqu %ymm12, 8(%rsp)", MoveSize::DQ32, true),
+            ("vmovdqu64 %zmm20, 8(%rsp)", MoveSize::DQ64, true),
+        ];
+        for (text, want, writes_memory) in cases {
+            let (store, _offset, size) = parse_fp_slot_move(text)
+                .unwrap_or_else(|| panic!("{text}: not classified as a slot move"));
+            assert_eq!(size, want, "{text}: footprint");
+            assert_eq!(
+                size.byte_size(),
+                match want {
+                    MoveSize::DQ => 16,
+                    MoveSize::DQ32 => 32,
+                    MoveSize::DQ64 => 64,
+                    other => panic!("{other:?} is not a vector width"),
+                },
+                "{text}: byte_size must agree with the classification"
+            );
+            // A store writes to memory, a load reads from it: the direction
+            // decides which side of the extent proof the line lands on.
+            assert_eq!(store, writes_memory, "{text}: direction");
+        }
+    }
+
+    /// A scalar slot move keeps its own width: the widening above must not
+    /// leak into `movsd`/`movss`/`movd`, whose extent consumers count 8/4/4.
+    #[test]
+    fn scalar_widths_are_untouched() {
+        for (text, want, bytes) in [
+            ("movsd %xmm0, 8(%rsp)", MoveSize::SD, 8),
+            ("vmovsd 8(%rsp), %xmm0", MoveSize::SD, 8),
+            ("movss %xmm0, 8(%rsp)", MoveSize::SS, 4),
+            ("movd %xmm0, 8(%rsp)", MoveSize::L, 4),
+        ] {
+            let (_, _, size) = parse_fp_slot_move(text).expect(text);
+            assert_eq!(size, want, "{text}");
+            assert_eq!(size.byte_size(), bytes, "{text}");
+        }
     }
 }
 

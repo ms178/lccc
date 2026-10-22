@@ -3594,6 +3594,22 @@ impl X86Codegen {
                     self.store_rax_to(d);
                 }
             }
+            // 64-bit rounding conversions: `_mm_cvtsd_si64` / `_mm_cvtss_si64`.
+            // `cvtsd2si`/`cvtss2si` honour MXCSR.RC; the 64-bit destination is
+            // what makes the full range expressible in one instruction.
+            IntrinsicOp::Cvtsd2Si64 | IntrinsicOp::Cvtss2Si64 => {
+                let inst = if matches!(op, IntrinsicOp::Cvtsd2Si64) {
+                    "cvtsd2si"
+                } else {
+                    "cvtss2si"
+                };
+                self.sse_load_arg(&args[0], "xmm0");
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm0, %rax", inst));
+                if let Some(d) = dest {
+                    self.store_rax_to(d);
+                }
+            }
             IntrinsicOp::Pshuflw128 | IntrinsicOp::Pshufhw128 => {
                 if let Some(dptr) = dest_ptr {
                     let inst = match op {
@@ -3682,7 +3698,7 @@ impl X86Codegen {
                     self.state.reg_cache.invalidate_all();
                 }
             }
-            IntrinsicOp::FmaF64x2Hoisted => {
+            IntrinsicOp::FmaF64x2Hoisted | IntrinsicOp::MulAddF64x2Hoisted => {
                 // Two-wide hoisted FMA group: C[0..4] += broadcast * B[0..4].
                 // Primarily emitted by the AArch64 two-wide vectorizer (two
                 // NEON fmla per group); reachable on x86 via LCCC_FORCE_SSE2.
@@ -3695,6 +3711,12 @@ impl X86Codegen {
                 // identical to the AArch64 pair of fmla v.2d.
                 // args[0] = B pointer, dest_ptr = C pointer; the broadcast
                 // factor is already in ymm1 (BroadcastLoadF64).
+                //
+                // `MulAddF64x2Hoisted` is the same group with the two
+                // roundings kept separate, so it never takes the fused branch:
+                // it is what the baseline (SSE2, no FMA3) and
+                // `-ffp-contract=off` matmul lowering emits.
+                let fused = *op == IntrinsicOp::FmaF64x2Hoisted && self.isa.fma && self.isa.ymm;
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
                 if let Some(c_ptr) = dest_ptr {
@@ -3713,7 +3735,7 @@ impl X86Codegen {
                         self.value_to_reg(c_ptr, "rax");
                         "rax"
                     };
-                    if self.isa.fma && self.isa.ymm {
+                    if fused {
                         self.state
                             .emit_fmt(format_args!("    vmovupd (%{}), %ymm0", c_name));
                         self.state
@@ -3721,26 +3743,49 @@ impl X86Codegen {
                         self.state
                             .emit_fmt(format_args!("    vmovupd %ymm0, (%{})", c_name));
                     } else {
-                        // Legacy SSE2: two 2-lane mul+add pairs per group.
-                        // The broadcast factor {A, A} lives in %xmm1
-                        // (BroadcastLoadF64 legacy form) and must survive
-                        // both halves and every iteration, the product needs
-                        // a register (%xmm0) and so does the C addend: SSE2
-                        // has no unaligned memory-source arithmetic and
-                        // neither slice is provably 16-byte aligned.  The
-                        // third register is %xmm2, which the allocator
-                        // withholds from any function containing this
-                        // intrinsic (regalloc_helpers `clobbers_xmm2`, the
-                        // same contract as VecMulI64x2 / Pblendvb128).
+                        // Two-rounding form: two 2-lane mul+add pairs per
+                        // group.  The broadcast factor {A, A} lives in the
+                        // low half of %xmm1 (BroadcastLoadF64) and must
+                        // survive both halves and every iteration; the
+                        // product needs a register (%xmm0) and so does the C
+                        // addend, because no packed SSE2 arithmetic reads an
+                        // unaligned memory operand and neither slice is
+                        // provably 16-byte aligned.  The third register is
+                        // %xmm2, which the allocator withholds from any
+                        // function containing this intrinsic
+                        // (regalloc_helpers `clobbers_xmm2`, the same
+                        // contract as VecMulI64x2 / Pblendvb128).
+                        //
+                        // With AVX the same arithmetic is emitted in VEX.128,
+                        // exactly like the fused branch above: a legacy
+                        // instruction next to a dirty upper half costs an
+                        // AVX->SSE transition, and `-mavx`-without-AVX2
+                        // profiles reach this branch while still being able
+                        // to emit VEX.
+                        let v = if self.isa.avx { "v" } else { "" };
                         for half in [0u32, 16] {
-                            self.state
-                                .emit_fmt(format_args!("    movupd {}(%{}), %xmm0", half, b_name));
-                            self.state.emit("    mulpd %xmm1, %xmm0");
-                            self.state
-                                .emit_fmt(format_args!("    movupd {}(%{}), %xmm2", half, c_name));
-                            self.state.emit("    addpd %xmm2, %xmm0");
-                            self.state
-                                .emit_fmt(format_args!("    movupd %xmm0, {}(%{})", half, c_name));
+                            self.state.emit_fmt(format_args!(
+                                "    {v}movupd {}(%{}), %xmm0",
+                                half, b_name
+                            ));
+                            if self.isa.avx {
+                                self.state.emit("    vmulpd %xmm1, %xmm0, %xmm0");
+                            } else {
+                                self.state.emit("    mulpd %xmm1, %xmm0");
+                            }
+                            self.state.emit_fmt(format_args!(
+                                "    {v}movupd {}(%{}), %xmm2",
+                                half, c_name
+                            ));
+                            if self.isa.avx {
+                                self.state.emit("    vaddpd %xmm2, %xmm0, %xmm0");
+                            } else {
+                                self.state.emit("    addpd %xmm2, %xmm0");
+                            }
+                            self.state.emit_fmt(format_args!(
+                                "    {v}movupd %xmm0, {}(%{})",
+                                half, c_name
+                            ));
                         }
                     }
                     self.state.reg_cache.invalidate_all();
@@ -3844,15 +3889,27 @@ impl X86Codegen {
             IntrinsicOp::BroadcastLoadF64 => {
                 self.flush_pending_vec_store_impl();
                 self.state.invalidate_vec_peephole();
-                // Load scalar F64 from pointer and broadcast to ymm1.
-                // Placed before the vectorized j-loop.
+                // Load scalar F64 from pointer and broadcast it: four lanes
+                // of ymm1 when the target has 256-bit vectors, {A, A} in
+                // xmm1 otherwise.  Placed before the vectorized j-loop.
+                //
+                // The width is chosen from the register file, NOT from FMA3.
+                // `vbroadcastsd %xmm1, %ymm1` is an AVX (VEX.256) form and
+                // needs no FMA unit, while the 128-bit `unpcklpd` form only
+                // ever fills two lanes.  Gating the wide form on `isa.fma`
+                // made every non-FMA 256-bit consumer -- `-mno-fma`, and
+                // `-ffp-contract=off`, which takes the unfused
+                // `MulAddF64x4HoistedSIB` path -- multiply by whatever the
+                // upper half happened to hold (measured: zero, so half of
+                // every group was silently left unaccumulated; the LCCC
+                // matmul oracle at `-march=x86-64-v3 -mno-fma` lost every
+                // second pair of columns).  The 128-bit consumers read the
+                // low half, which both forms fill with the same {A, A}.
                 self.operand_to_reg(&args[0], "rcx");
-                if self.isa.fma && self.isa.ymm {
+                if self.isa.ymm {
                     self.state.emit("    vmovsd (%rcx), %xmm1");
                     self.state.emit("    vbroadcastsd %xmm1, %ymm1");
                 } else {
-                    // Legacy SSE2 consumer (FmaF64x2Hoisted) reads {A, A}
-                    // from %xmm1.
                     self.state.emit("    movsd (%rcx), %xmm1");
                     self.state.emit("    unpcklpd %xmm1, %xmm1");
                 }

@@ -653,50 +653,12 @@ fn vectorize_with_analysis_mode(
                 Operand::Const(c) => c.to_i64().is_some_and(|n| n < 2 * machine_step_width),
                 _ => false,
             };
-            // SEMANTIC + TARGET PRECONDITION.  This arm is an FMA transform --
-            // every packed step it emits is a fused multiply-add (`vfmadd231pd`
-            // / `fmla`), and THAT, not the memory layout, is what changes the
-            // program's numerics.  Two independent switches decide whether the
-            // user asked for fused arithmetic, and the arm honoured neither:
-            //
-            //   * `-ffp-contract=off` says the language's contraction licence is
-            //     withdrawn, so `a*b+c` must round twice.  The general
-            //     contraction path already checks `fp_contract` before choosing
-            //     a madd op; this arm did not, and `-O2 -ffp-contract=off` still
-            //     emitted `vfmadd231pd`.
-            //   * `-mno-fma` says the target has no FMA3 unit at all; emitting
-            //     the instruction is an illegal-instruction fault on that
-            //     machine.  `x86_fma_enabled()` is the resolved target answer.
-            //
-            // Both are checked here, before any IR is touched, so an unasked-for
-            // contraction uses a separately rounded AVX2 multiply/add where
-            // that lowering exists; other targets stay scalar. NEON's `fmla` is baseline
-            // on AArch64, so only the contract half applies there.
-            //
-            // THE LICENCE IS ONLY NEEDED IF THE CHOSEN LOWERING ACTUALLY FUSES.
-            // The 2-wide arm lowers `FmaF64x2Hoisted` as two `mulpd`/`addpd`
-            // pairs whenever the target has no FMA3 unit or no 256-bit vectors
-            // -- the legacy SSE2 path in `x86::codegen::intrinsics`, which
-            // rounds the product and the sum separately, exactly like the
-            // scalar expression. That is not a contraction, so `-ffp-contract`
-            // has nothing to withdraw and the x86-64 baseline (SSE2 only) is
-            // entitled to it: a dense `C[j] += A * B[j]` loop is one of the
-            // most common numeric shapes there is, and staying scalar on every
-            // pre-AVX2 machine costs 2.6x on a 256x256 f64 product (10.00 ms
-            // vs 3.86 ms vectorized, GCC -O2 6.96 ms on the same host).  The
-            // only x86 configuration whose 2-wide lowering really fuses is
-            // `LCCC_FORCE_SSE2` on an AVX2+FMA target, which the backend sends
-            // through its 4-lane `vfmadd231pd`; there the licence is still
-            // required.  The AVX2 arm needs no gate at all: it takes `fused`
-            // as an argument and emits `MulAddF64x4HoistedSIB` when denied.
-            let sse2_lowering_fuses = x86_fma_enabled() && x86_avx2_available();
-            let contraction_licence_needed = if neon {
-                true
-            } else if use_sse2 {
-                sse2_lowering_fuses
-            } else {
-                false
-            };
+            // Encoding and FP semantics are independent choices. Both the
+            // two-wide and four-wide transforms have explicit fused and
+            // separately-rounded ops; a denied contraction must select the
+            // latter, not silently disable vectorization or defer semantics
+            // to the backend's ISA-feature test.
+            let fused = fma_transform_allowed(neon, fp_contract);
             if skip_small {
                 if debug {
                     eprintln!(
@@ -712,14 +674,6 @@ fn vectorize_with_analysis_mode(
                 if debug {
                     eprintln!("[VEC] Skip matmul arm: SIMD disabled for this target");
                 }
-            } else if contraction_licence_needed && !fma_transform_allowed(neon, fp_contract) {
-                if debug {
-                    eprintln!(
-                        "[VEC] Skip matmul arm: fused arithmetic not requested/available \
-                         (fp_contract={fp_contract:?}, x86_fma={})",
-                        x86_fma_enabled()
-                    );
-                }
             } else if !use_sse2 && !x86_64_vector_intrinsics_available() {
                 if debug {
                     eprintln!("[VEC] Skip matmul arm: no 256-bit vector intrinsics on this target");
@@ -730,7 +684,7 @@ fn vectorize_with_analysis_mode(
                         "[VEC] Matmul pattern matched! Transforming to FmaF64x2 (SSE2, 2-wide)"
                     );
                 }
-                total_changes += transform_to_fma_f64x2(func, &mut pattern);
+                total_changes += transform_to_fma_f64x2(func, &mut pattern, fused);
             } else {
                 // Use AVX2 by default (or if LCCC_FORCE_AVX2 is set)
                 if debug {
@@ -21441,7 +21395,11 @@ fn insert_remainder_loop(
 }
 
 /// Transform the loop to use FmaF64x2 intrinsics.
-fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &mut VectorizablePattern) -> usize {
+fn transform_to_fma_f64x2(
+    func: &mut IrFunction,
+    pattern: &mut VectorizablePattern,
+    fused: bool,
+) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
 
@@ -22025,7 +21983,11 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &mut VectorizablePatte
         // Create FmaF64x2 intrinsic: writes directly to memory, no dest value.
         let intrinsic = Instruction::Intrinsic {
             dest: None,
-            op: IntrinsicOp::FmaF64x2Hoisted,
+            op: if fused {
+                IntrinsicOp::FmaF64x2Hoisted
+            } else {
+                IntrinsicOp::MulAddF64x2Hoisted
+            },
             dest_ptr: Some(pattern.c_gep),
             args: vec![Operand::Value(pattern.b_gep)],
         };
@@ -31733,7 +31695,7 @@ fn emit_map_scalar_tree(
 /// distance) rather than paying a horizontal-reduction loss or reading past
 /// the object boundary.
 fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
-    if func.blocks.len() != 1 || std::env::var("CCC_NO_FIXED_SLP").is_ok() {
+    if func.blocks.len() != 1 {
         return 0;
     }
     let block = &func.blocks[0];

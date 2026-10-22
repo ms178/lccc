@@ -1041,32 +1041,28 @@ _mm_mul_pd(__m128d __a, __m128d __b)
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_add_sd(__m128d __a, __m128d __b)
 {
-    __a.__val[0] += __b.__val[0];
-    return __a;
+    return __lccc_simd128_pd_fpscalar128(0, __a, __b);
 }
 
 /* _mm_sub_sd: scalar double subtract (low lane only) */
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_sub_sd(__m128d __a, __m128d __b)
 {
-    __a.__val[0] -= __b.__val[0];
-    return __a;
+    return __lccc_simd128_pd_fpscalar128(1, __a, __b);
 }
 
 /* _mm_mul_sd: scalar double multiply (low lane only) */
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_mul_sd(__m128d __a, __m128d __b)
 {
-    __a.__val[0] *= __b.__val[0];
-    return __a;
+    return __lccc_simd128_pd_fpscalar128(2, __a, __b);
 }
 
 /* _mm_div_sd: scalar double divide (low lane only) */
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_div_sd(__m128d __a, __m128d __b)
 {
-    __a.__val[0] /= __b.__val[0];
-    return __a;
+    return __lccc_simd128_pd_fpscalar128(3, __a, __b);
 }
 
 /* _mm_sqrt_pd: packed double square root */
@@ -1075,7 +1071,7 @@ _mm_div_sd(__m128d __a, __m128d __b)
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_sqrt_sd(__m128d __a, __m128d __b)
 {
-    return (__m128d){ { __builtin_sqrt(__b.__val[0]), __a.__val[1] } };
+    return __lccc_simd128_pd_fpscalar128(6, __a, __b);
 }
 
 /* _mm_min_pd: packed double minimum
@@ -1089,16 +1085,14 @@ _mm_sqrt_sd(__m128d __a, __m128d __b)
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_min_sd(__m128d __a, __m128d __b)
 {
-    __a.__val[0] = __a.__val[0] < __b.__val[0] ? __a.__val[0] : __b.__val[0];
-    return __a;
+    return __lccc_simd128_pd_fpscalar128(5, __a, __b);
 }
 
 /* _mm_max_sd: scalar double maximum */
 static __inline__ __m128d __attribute__((__always_inline__))
 _mm_max_sd(__m128d __a, __m128d __b)
 {
-    __a.__val[0] = __a.__val[0] > __b.__val[0] ? __a.__val[0] : __b.__val[0];
-    return __a;
+    return __lccc_simd128_pd_fpscalar128(4, __a, __b);
 }
 
 /* === Double Bitwise Operations === */
@@ -1301,12 +1295,23 @@ _mm_cvtsd_f64(__m128d __a)
 
 /* _mm_cvttsd_si32: convert low double to int (truncate) */
 
-/* _mm_cvtsd_si64: convert low double to long long (round to nearest) */
+/* _mm_cvtsd_si64: convert low double to long long, rounding per MXCSR.RC.
+ *
+ * This used to be `(long long)(d >= 0 ? d + 0.5 : d - 0.5)`, which is
+ * round-half-AWAY-FROM-ZERO (not the current rounding mode), loses the
+ * fraction entirely for |d| >= 2^52 (the 0.5 is absorbed), and costs four
+ * instructions where the hardware form costs one.  `cvtsd2si` with a 64-bit
+ * destination is the instruction the intrinsic names. */
 static __inline__ long long __attribute__((__always_inline__))
 _mm_cvtsd_si64(__m128d __a)
 {
-    double __d = __a.__val[0];
-    return (long long)(__d >= 0.0 ? __d + 0.5 : __d - 0.5);
+#if defined(__x86_64__)
+    return __builtin_ia32_cvtsd2si64(__a);
+#else
+    /* 32-bit x86 has no 64-bit `cvtsd2si`; keep a portable truncating
+       definition rather than silently rounding the wrong way. */
+    return (long long)__a.__val[0];
+#endif
 }
 
 #define _mm_cvtsd_si64x(a) _mm_cvtsd_si64(a)

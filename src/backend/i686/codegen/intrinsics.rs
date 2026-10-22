@@ -765,6 +765,39 @@ impl I686Codegen {
                 }
             }
 
+            // Scalar FP lane ops (13 intrinsics, immediate-selected). i686 has
+            // the same SSE2 instruction forms as x86-64, so the lowering is
+            // identical: copy `a`, then the scalar op onto its low lane.
+            IntrinsicOp::ScalarFpLane128 => {
+                if let Some(dptr) = dest_ptr {
+                    const DOUBLE: [&str; 7] = [
+                        "addsd", "subsd", "mulsd", "divsd", "maxsd", "minsd", "sqrtsd",
+                    ];
+                    const SINGLE: [&str; 7] = [
+                        "addss", "subss", "mulss", "divss", "maxss", "minss", "sqrtss",
+                    ];
+                    let selector = args.last().map_or(0, Self::operand_to_imm_i64);
+                    let (table, index) = if selector >= 8 {
+                        (&SINGLE, selector - 8)
+                    } else {
+                        (&DOUBLE, selector)
+                    };
+                    let inst = usize::try_from(index)
+                        .ok()
+                        .and_then(|i| table.get(i).copied());
+                    let Some(inst) = inst else {
+                        // Fail closed on an unknown selector: copy, never
+                        // guess at the arithmetic.
+                        self.operand_to_eax(&args[0]);
+                        self.state.emit("    movdqu (%eax), %xmm0");
+                        self.operand_to_eax(&Operand::Value(*dptr));
+                        self.state.emit("    movdqu %xmm0, (%eax)");
+                        return;
+                    };
+                    self.emit_sse_binary_128(dptr, args, inst);
+                }
+            }
+
             // 2-op with immediate: cmpps/cmppd/shufps/shufpd take (a, b, imm).
             IntrinsicOp::CmpPs128
             | IntrinsicOp::CmpPd128

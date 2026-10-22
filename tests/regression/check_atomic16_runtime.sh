@@ -13,9 +13,10 @@
 #   * Semantics hold for every ordering and for both the -mcx16 (inline
 #     cmpxchg16b) and default (libatomic) compare-exchange paths.
 #
-# The runtime half is built at -O1: see docs/FOLLOWUP-2026-10-21-i128-atomic-o2
-# for the separate, pre-existing middle-end issue that keeps the -O2 arithmetic
-# consumer of these results from being used as an oracle here.
+# Exercise the optimized arithmetic consumers too: a sized libatomic call can
+# be correct while later I128 arithmetic or call-clobber handling is not.
+# The independent check_i128_atomic_call_clobber.sh gate covers the live-value
+# reproducer at -O0 through -O3 and across five ISA configurations.
 set -euo pipefail
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -43,22 +44,24 @@ u128 fnnd(_Atomic u128 *p, u128 a) { return __atomic_fetch_nand(p, a, __ATOMIC_S
 u128 fxch(_Atomic u128 *p, u128 a) { return __atomic_exchange_n(p, a, __ATOMIC_SEQ_CST); }
 EOF
 
-for flags in "" "-mcx16"; do
-    lbl=${flags:-default}
-    "$ccc" -O1 $flags -c "$tmp/lower.c" -o "$tmp/lower.o" \
-        || fail "lccc $lbl build of lower.c"
-    dis=$(objdump -dr "$tmp/lower.o")
-    # Each sized entry point must be called...
-    for sym in __atomic_store_16 __atomic_load_16 __atomic_fetch_add_16 \
-        __atomic_fetch_sub_16 __atomic_fetch_and_16 __atomic_fetch_or_16 \
-        __atomic_fetch_xor_16 __atomic_fetch_nand_16 __atomic_exchange_16; do
-        grep -q "$sym" <<<"$dis" || fail "$lbl lowering does not call $sym"
+for opt in -O1 -O2 -O3; do
+    for flags in "" "-mcx16"; do
+        lbl="$opt ${flags:-default}"
+        "$ccc" "$opt" $flags -c "$tmp/lower.c" -o "$tmp/lower.o" \
+            || fail "lccc $lbl build of lower.c"
+        dis=$(objdump -dr "$tmp/lower.o")
+        # Each sized entry point must be called...
+        for sym in __atomic_store_16 __atomic_load_16 __atomic_fetch_add_16 \
+            __atomic_fetch_sub_16 __atomic_fetch_and_16 __atomic_fetch_or_16 \
+            __atomic_fetch_xor_16 __atomic_fetch_nand_16 __atomic_exchange_16; do
+            grep -q "$sym" <<<"$dis" || fail "$lbl lowering does not call $sym"
+        done
+        # ...and no 16-byte atomic may be lowered to a 64-bit locked op, which is
+        # how the truncation bug presented itself.
+        if grep -qE '\b(lock )?(xchgq|xaddq)\b' <<<"$dis"; then
+            fail "$lbl lowering uses a 64-bit xchg/xadd for a 16-byte atomic"
+        fi
     done
-    # ...and no 16-byte atomic may be lowered to a 64-bit locked op, which is
-    # how the truncation bug presented itself.
-    if grep -qE '\b(lock )?(xchgq|xaddq)\b' <<<"$dis"; then
-        fail "$lbl lowering uses a 64-bit xchg/xadd for a 16-byte atomic"
-    fi
 done
 echo "PASS: 16-byte load/store/RMW lower to libatomic's sized entries"
 
@@ -127,21 +130,23 @@ int main(void) {
 }
 EOF
 
-for flags in "" "-mcx16" "-march=x86-64-v3"; do
-    lbl=${flags:-default}
-    "$ccc" -O1 $flags "$tmp/run.c" -o "$tmp/run_lccc" -latomic \
-        || fail "lccc $lbl build of run.c"
-    out=$("$tmp/run_lccc") || fail "lccc $lbl runtime: $out"
-    grep -q 'bad=0' <<<"$out" || fail "lccc $lbl 16-byte atomic semantics: $out"
-    echo "PASS: 16-byte atomics are correct at runtime ($lbl): $out"
+for opt in -O1 -O2 -O3; do
+    for flags in "" "-mcx16" "-march=x86-64-v3"; do
+        lbl="$opt ${flags:-default}"
+        "$ccc" "$opt" $flags "$tmp/run.c" -o "$tmp/run_lccc" -latomic \
+            || fail "lccc $lbl build of run.c"
+        out=$("$tmp/run_lccc") || fail "lccc $lbl runtime: $out"
+        grep -q 'bad=0' <<<"$out" || fail "lccc $lbl 16-byte atomic semantics: $out"
+        echo "PASS: 16-byte atomics are correct at runtime ($lbl): $out"
+    done
 done
 
 # ---------------------------------------------------------- oracle parity ----
 if command -v "$gcc" >/dev/null 2>&1; then
     "$gcc" -O2 -mcx16 "$tmp/run.c" -o "$tmp/run_gcc" -latomic 2>/dev/null \
-        || { echo "SKIP: $gcc cannot build the oracle" >&2; exit 0; }
+        || fail "$gcc cannot build the requested oracle"
     gout=$("$tmp/run_gcc") || fail "oracle run failed: $gout"
-    "$ccc" -O1 -mcx16 "$tmp/run.c" -o "$tmp/run_l2" -latomic
+    "$ccc" -O2 -mcx16 "$tmp/run.c" -o "$tmp/run_l2" -latomic
     lout=$("$tmp/run_l2")
     # Compare the observable state, not the compiler's own prefix.
     [ "${gout#*: }" = "${lout#*: }" ] \

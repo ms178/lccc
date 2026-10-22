@@ -87,12 +87,6 @@ pub(super) fn lccc_simd_lookup(
         "vpminsq512" => b(Vec512, Pminsq512),
         "vpmaxuq512" => b(Vec512, Pmaxuq512),
         "vpminuq512" => b(Vec512, Pminuq512),
-        "vpcmpeqd512" => b(Vec512, Pcmpeqd512),
-        "vpcmpeqq512" => b(Vec512, Pcmpeqq512),
-        "vpcmpgtb512" => b(Vec512, Pcmpgtb512),
-        "vpcmpgtw512" => b(Vec512, Pcmpgtw512),
-        "vpcmpgtd512" => b(Vec512, Pcmpgtd512),
-        "vpcmpgtq512" => b(Vec512, Pcmpgtq512),
         "vpsadbw512" => b(Vec512, Psadbw512),
         "vpmaddubsw512" => b(Vec512, Pmaddubsw512),
         "vpmaddwd512" => b(Vec512, Pmaddwd512),
@@ -297,6 +291,8 @@ pub(super) fn lccc_simd_lookup(
         "cvtdq2pd128" => u(Vec128, CvtEp32ToPd128),
         "cvttpd2dq128" => u(Vec128, CvttPd2Ep32_128),
         "movss128" => b(Vec128, Movss128),
+        // One key, immediate-selected: see IntrinsicOp::ScalarFpLane128.
+        "fpscalar128" => t(Vec128, ScalarFpLane128),
         "movsd128" => b(Vec128, Movsd128),
         "cvtsi2ss128" => b(Vec128, CvtSi2Ss128),
         "cvtsi2sd128" => b(Vec128, CvtSi2Sd128),
@@ -486,5 +482,138 @@ fn _class_doc(c: LcccSimdClass) -> &'static str {
         LcccSimdClass::Vec512 => "64-byte vector result",
         LcccSimdClass::Scalar => "scalar GPR result",
         LcccSimdClass::PtrStore => "store through dest pointer",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every `__lccc_simd{128,256,512}_{class}_{mnemonic}` symbol declared in
+    /// the generated header must resolve through [`lccc_simd_lookup`], by
+    /// exactly the two key spellings `lower_lccc_simd` tries.
+    ///
+    /// This is the completeness gate for the mnemonic table. A symbol that the
+    /// header advertises but the table does not know cannot be lowered: the
+    /// call survives to the linker as an external reference and every
+    /// translation unit using that intrinsic fails to link. That is not
+    /// hypothetical -- it is exactly how `_mm_cvtsd_si32` broke, and unit
+    /// tests that only exercise emitted code could not see it, because the
+    /// failure is at link time and the table entry is one line among 317.
+    ///
+    /// The test is deliberately table-driven from the header rather than a
+    /// hand-maintained list: the header *is* the public contract, so deriving
+    /// the expected set from it means a newly declared symbol cannot be
+    /// forgotten, and a deleted table entry cannot hide.
+    #[test]
+    fn every_header_declared_lccc_simd_symbol_resolves() {
+        const HEADER: &str = include_str!("../../../include/lcccsimd.h");
+        let mut symbols = Vec::new();
+        for token in HEADER.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            let Some(rest) = token.strip_prefix("__lccc_simd") else {
+                continue;
+            };
+            if !matches!(rest.split('_').next(), Some("128" | "256" | "512")) {
+                continue;
+            }
+            symbols.push(token);
+        }
+        symbols.sort_unstable();
+        symbols.dedup();
+        assert!(
+            symbols.len() > 250,
+            "header parse found only {} symbols; the derivation is broken",
+            symbols.len()
+        );
+        let mut unresolved = Vec::new();
+        for symbol in &symbols {
+            let rest = symbol.trim_start_matches("__lccc_simd");
+            let Some((width, rest)) = rest.split_once('_') else {
+                unresolved.push((*symbol, "malformed name".to_string()));
+                continue;
+            };
+            let Some((_class, mnemonic)) = rest.split_once('_') else {
+                unresolved.push((*symbol, "malformed name".to_string()));
+                continue;
+            };
+            if lccc_simd_lookup(mnemonic)
+                .or_else(|| lccc_simd_lookup(&format!("{mnemonic}{width}")))
+                .is_none()
+            {
+                unresolved.push((
+                    *symbol,
+                    format!("tried '{mnemonic}' and '{mnemonic}{width}'"),
+                ));
+            }
+        }
+        assert!(
+            unresolved.is_empty(),
+            "{} header-declared intrinsic(s) cannot be lowered, so any user of \
+             them fails to link:\n{}",
+            unresolved.len(),
+            unresolved
+                .iter()
+                .map(|(symbol, how)| format!("  {symbol}: {how}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// The two key spellings must never disagree about an op.
+    ///
+    /// `lower_lccc_simd` prefers the bare mnemonic and falls back to
+    /// `mnemonic + width`. A symbol that resolves both ways to different ops
+    /// would lower differently depending on which spelling a wrapper happened
+    /// to use, which is the kind of latent divergence no output test catches
+    /// until the two spellings are exercised separately.
+    #[test]
+    fn width_suffixed_and_bare_spellings_agree() {
+        for width in ["128", "256", "512"] {
+            for key in [
+                "vpaddd",
+                "vpsubd",
+                "vpmaxsd",
+                "cvttss2si",
+                "cvtss2si",
+                "cvtsd2si",
+                "cvttsd2si",
+                "sqrtpd",
+                "maxsd",
+                "minsd",
+                "sqrtsd",
+            ] {
+                let bare = lccc_simd_lookup(key);
+                let suffixed = lccc_simd_lookup(&format!("{key}{width}"));
+                if let (Some(a), Some(b)) = (bare, suffixed) {
+                    assert_eq!(
+                        a.1, b.1,
+                        "'{key}' and '{key}{width}' resolve to different ops"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The scalar conversion quartet must be fully present.
+    ///
+    /// Named rather than derived because this is the exact group a merge
+    /// conflict damaged: the four `*si128` conversions are adjacent lines that
+    /// differ only by a `t` and an `s`/`d`, which is what made a mechanical
+    /// de-duplication delete the wrong pair.
+    #[test]
+    fn scalar_conversion_quartet_is_complete() {
+        use IntrinsicOp::*;
+        for (key, op) in [
+            ("cvtss2si128", CvtSs2Si128),
+            ("cvtsd2si128", CvtSd2Si128),
+            ("cvttss2si128", CvttSs2Si128),
+            ("cvttsd2si128", CvttSd2Si128),
+        ] {
+            let entry = lccc_simd_lookup(key)
+                .unwrap_or_else(|| panic!("{key} missing from the mnemonic table"));
+            assert_eq!(entry.1, op, "{key} lowers to the wrong op");
+            assert!(!entry.2, "{key} takes an immediate");
+            assert_eq!(entry.3, 1, "{key} takes one operand");
+        }
     }
 }

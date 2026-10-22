@@ -12,10 +12,21 @@ IR operand.
 
 Regenerate: python3 scripts/gen_lcccsimd.py
 """
+import sys
 from pathlib import Path
 
 REPO = Path(__file__).parent.parent
 OUT = REPO / "include" / "lcccsimd.h"
+
+# `--check` regenerates into memory and fails when the committed header differs
+# from what this script produces.  The header is machine output -- a hand edit
+# silently disappears the next time anyone regenerates, and a stale header
+# means the builtins the compiler dispatches on and the prototypes the headers
+# call have drifted apart.  `--out` supports the same comparison for other
+# targets; it does not change the default path.
+_CHECK_ONLY = "--check" in sys.argv
+if "--out" in sys.argv:
+    OUT = Path(sys.argv[sys.argv.index("--out") + 1])
 
 # (name, mnemonic)
 BIN3_512 = [
@@ -40,10 +51,10 @@ BIN512 = [
     ("max_epu32", "vpmaxud512"), ("min_epu32", "vpminud512"),
     ("max_epi64", "vpmaxsq512"), ("min_epi64", "vpminsq512"),
     ("max_epu64", "vpmaxuq512"), ("min_epu64", "vpminuq512"),
-    ("cmpeq_epi8", "vpcmpeqb512"), ("cmpeq_epi16", "vpcmpeqw512"),
-    ("cmpeq_epi32", "vpcmpeqd512"), ("cmpeq_epi64", "vpcmpeqq512"),
-    ("cmpgt_epi8", "vpcmpgtb512"), ("cmpgt_epi16", "vpcmpgtw512"),
-    ("cmpgt_epi32", "vpcmpgtd512"), ("cmpgt_epi64", "vpcmpgtq512"),
+    # _mm512_cmp{gt,eq}_epi{8,16,32,64} are deliberately absent: AVX-512
+    # encodes an integer compare only with a mask destination, so the
+    # mask-less form has no lowering, and GCC 10+/Clang removed it. Their
+    # _mask replacements are in CMP_MASK below.
     ("xor_si512", "vpxorq512"), ("or_si512", "vporq512"),
     ("and_si512", "vpandq512"), ("andnot_si512", "vpandnq512"),
     ("shuffle_epi8", "vpshufb512"),
@@ -121,6 +132,11 @@ CMP_MASK = [
     ("cmp_epu64_mask", "vpcmpuq512", "__mmask8", True),
     ("cmpeq_epi64_mask", "vpcmpq512", "__mmask8", False),
     ("cmp_epi64_mask", "vpcmpq512", "__mmask8", True),
+    # Signed greater-than: predicate immediate 6 (NLE) in every VPCMP family.
+    ("cmpgt_epi8_mask", "vpcmpb512", "__mmask64", "6"),
+    ("cmpgt_epi16_mask", "vpcmpw512", "__mmask32", "6"),
+    ("cmpgt_epi32_mask", "vpcmpd512", "__mmask16", "6"),
+    ("cmpgt_epi64_mask", "vpcmpq512", "__mmask8", "6"),
     ("cmpeq_epu8_mask", "vpcmpub256", "__mmask32", False),
     ("cmp_epu8_mask", "vpcmpub256", "__mmask32", True),
     ("cmp_epi8_mask", "vpcmpb256", "__mmask32", True),
@@ -414,6 +430,19 @@ def macro(name, body):
 def r(s):
     return s.replace("__lccc_simd512_i_", "lccc_simd512_i_") if False else s
 
+# ---- 128-bit scalar FP lane ops ----
+# _mm_{add,sub,mul,div,max,min,sqrt}_s{d,s}: the low lane takes the operation
+# and the upper lanes are copied from the first operand, which is exactly what
+# the SSE scalar forms do. Two builtins carry the whole family with the
+# operation in the immediate (0..=6 doubles, 8..=14 singles), so thirteen
+# intrinsics cost one entry in every dispatch table instead of thirteen -- the
+# duplication that let a table drift out of sync before.
+#
+# The wrappers live in emmintrin.h and xmmintrin.h next to the rest of the
+# scalar surface; only the prototypes are generated here.
+proto("128_pd_fpscalar128", "m128d", ["long", "__m128d __a", "__m128d __b"])
+proto("128_ps_fpscalar128", "m128", ["long", "__m128 __a", "__m128 __b"])
+
 # ---- 512-bit binary (2-arg) ----
 for name, mn in BIN512:
     proto(f"512_i_{mn}", "m512i", ["long", "__m512i __a", "__m512i __b"])
@@ -486,9 +515,16 @@ for name, mn, mty, has_imm in CMP_MASK:
 for name, mn, mty, has_imm in CMP_MASK:
     pfx, vty = ("_mm512_", "__m512i") if mn.endswith("512") else (
         ("_mm256_", "__m256i") if mn.endswith("256") else ("_mm_", "__m128i"))
-    if has_imm:
+    if has_imm is True:
         macro(f"{pfx}{name}(__a, __b, __imm)",
               f"({mty})__lccc_simd512_i_{mn}(__imm, __a, __b)")
+    elif has_imm:
+        # A fixed predicate (e.g. 6 = NLE = signed greater-than): the wrapper
+        # is an ordinary inline function because there is no immediate for the
+        # caller to supply, but the builtin still receives it as the leading
+        # argument.
+        wrap(f"{mty} {pfx}{name}({vty} __a, {vty} __b)",
+             f"{{ return ({mty})__lccc_simd512_i_{mn}({has_imm}, __a, __b); }}")
     else:
         wrap(f"{mty} {pfx}{name}({vty} __a, {vty} __b)",
              f"{{ return ({mty})__lccc_simd512_i_{mn}(0, __a, __b); }}")
@@ -731,5 +767,17 @@ macro("_mm256_cmp_pd(__a, __b, __imm)",
       "__CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vcmppd256(__imm, __a, __b))")
 
 w("#endif /* _LCCCSIMD_H_INCLUDED */")
-OUT.write_text("\n".join(L) + "\n")
-print(f"wrote {OUT} ({len(L)} lines)")
+generated = "\n".join(L) + "\n"
+if _CHECK_ONLY:
+    current = OUT.read_text() if OUT.exists() else ""
+    if current != generated:
+        print(
+            f"gen_lcccsimd: {OUT} does not match the generator "
+            f"(committed {len(current)} bytes, generated {len(generated)})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"gen_lcccsimd: {OUT} matches the generator ({len(L)} lines)")
+else:
+    OUT.write_text(generated)
+    print(f"wrote {OUT} ({len(L)} lines)")

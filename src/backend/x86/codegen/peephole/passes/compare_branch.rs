@@ -65,12 +65,10 @@ fn parse_self_test(t: &str) -> Option<&str> {
 /// more bytes than the carrier-source store wrote meaningfully (`movl` + a
 /// 64-bit reload reads 4 stale upper bytes and must refuse).
 fn move_size_bytes(size: MoveSize) -> u32 {
-    match size {
-        MoveSize::Q | MoveSize::SD => 8,
-        MoveSize::L | MoveSize::SLQ | MoveSize::SS => 4,
-        MoveSize::W => 2,
-        MoveSize::B => 1,
-    }
+    // One width table, not two. A second copy of these numbers is how a
+    // 256-bit slot move kept being described as 16 bytes when the enum grew a
+    // width: the question is asked of the type that owns the answer.
+    size.byte_size() as u32
 }
 
 /// Parse `movzbl/movzbq <setcc-text>, <dst>` where the source is EXACTLY the
