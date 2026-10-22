@@ -1118,9 +1118,15 @@ fi
 # emitted, and the count is honestly 104. This is the explicit budget
 # conversation the ratchet exists to force: the instruction was bought
 # with correctness, not lost to a regression.
+# Budget move, 2026-10-22 (layout branch cost): double_reduction 135 -> 140.
+# The layout rule now rejects this function's chain order because it adds one
+# stack operand on eight (+12.5 %); the rejected order is five instructions
+# larger, and the two are measurably identical at runtime (110.61 vs 110.52 ms,
+# ratio 1.0008, min of 9 interleaved samples). The count moved because a
+# placement decision was reconsidered, not because code quality regressed.
 declare -A BUDGET=(
     [chacha20_block]=258
-    [double_reduction]=135
+    [double_reduction]=140
     [libm_round_family]=207
     [matmul]=126
     [nbody]=312

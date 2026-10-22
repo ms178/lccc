@@ -4384,15 +4384,18 @@ fn emit_functions_and_sections(
                     // and the shipped text comes from a non-exploratory
                     // emission in both arms.
                     // A layout may not add spill traffic: a stack operand is a
-                    // value a register could have held.  The band is calibrated
-                    // on the two measured disagreements, which sit far apart:
-                    // `linux_rbtree`'s chain order adds 11 instructions and 2
-                    // stack operands (+7 %) and is 13 % FASTER, while
-                    // `zstd_count`'s adds one instruction and 3 stack operands
-                    // (+37 %) and is 9 % slower because the moved block pushes
-                    // a loop counter into a slot reloaded every iteration.
-                    // +10 % separates them with margin on both sides, and it is
-                    // the same shape as the codegen gate's own tolerance bands.
+                    // value a register could have held, and a layout that needs
+                    // one bought its fall-throughs by lengthening a live range.
+                    // The band is calibrated on the measured disagreements,
+                    // which bracket it: `linux_rbtree` (+2 operands on 28,
+                    // +7.1 %, 13.6 % faster) is admitted, `zstd_count` (+3 on 8,
+                    // +37.5 %, 8.7 % slower — the moved block spills a loop
+                    // counter that is reloaded every iteration) is not.  A
+                    // +1-on-8 case (`double_reduction`) is discussed in
+                    // docs/FOLLOWUP-2026-10-22-round2-layout-branch-cost.md.
+                    // The band is asymmetric because the errors are: a wrongly
+                    // accepted spill costs a few cycles, a wrongly rejected
+                    // layout costs the whole placement win.
                     let spill_ok = chain_stack * 10 <= orig_stack * 11;
                     // With the kill switch set the branch term is zero and the
                     // rule is the historical one, `chain_lines < orig_lines`.

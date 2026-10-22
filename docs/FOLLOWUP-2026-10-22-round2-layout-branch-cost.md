@@ -37,8 +37,12 @@ the placement decision and nothing else.
 
 Adoption rule (`src/backend/generation.rs`):
 
-    adopt the chain order  iff  spill_ok && chain_cost < orig_cost
+    adopt the chain order  iff  spill_ok && cost(chain) < cost(orig)
+    cost(order)            =    instruction lines + layout_branch_cost(order)
     spill_ok               =    stack(chain) * 10 <= stack(orig) * 11
+
+with `CCC_NO_LAYOUT_BRANCH_COST` zeroing the branch term, which reduces the
+rule to the historical `lines(chain) < lines(orig)`.
 
 ## The spill band is load-bearing, and it is calibrated, not guessed
 
@@ -103,6 +107,8 @@ harness defect recorded in round 1 and still open.
   within tolerance** with the baseline unchanged from `#916`. The metric no
   longer moves `portable_bit_counts` (it did before the spill band, stackmem
   6→7).
+* `check_vector_copy_elimination.sh` — **PASS 47, FAIL 0** after the explicit
+  budget move for `double_reduction` (135 → 140, measured at ratio 1.0008).
 * `check_hot_loop_register_homes.sh` — ok, 6 callee-saved registers, no
   recurrence demoted.
 * Differential correctness: all 67 corpus programs built both ways, output and
@@ -173,3 +179,27 @@ against gcc 12.2 at `-O2`; none is claimed as a measured win yet, and per
 The batch-2 rule: an item ships only with a `min`-of-N timing on the host core,
 a corpus sweep for collateral, and a gate run. Items 1 and 2 are the ones with
 both a witness and a known-positive prior.
+
+## Two rules that were tried and rejected on this round's own data
+
+Recorded so the next round does not re-derive them:
+
+* **No size guard.** Requiring `lines(chain) <= lines(orig)` rejects
+  `zstd_count`'s harmful order — but the spill band already does, and the guard
+  costs the four kernels whose good order is a few instructions longer:
+  `linux_rbtree` 0.839 → 1.013, `binary_trees` 0.933 → 0.976, `arith_loop`
+  0.942 → 0.995, `llvm_scalar_facts` 0.967 → 1.006, against `hash_table`
+  0.820 → 0.780. Net loss.
+* **Absolute slack (+1 operand, or `max(1, n/8)`).** It admits
+  `double_reduction` (+1 on 8) and `linux_rbtree` (+2 on 28) while rejecting
+  `zstd_count` (+3 on 8), but it also re-admits `portable_bit_counts`' order,
+  which the codegen gate rejects (`stackmem 6 -> 7`, +16.7 %). The percentage
+  band is the only shape that satisfies the gate, the ratchet and the sweep at
+  once.
+
+`double_reduction` is the one corpus member whose order the 10 % band rejects
+and whose instruction count therefore rises: 135 → 140, all five in cold paths.
+The `check_vector_copy_elimination.sh` ratchet was moved explicitly with the
+measurement that buys it — 110.61 vs 110.52 ms, ratio 1.0008, min of 9
+interleaved samples — because that gate's contract is that a budget moves in
+conversation with a measurement, not silently.
