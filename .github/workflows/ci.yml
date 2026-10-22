@@ -599,6 +599,8 @@ jobs:
       run: python3 tests/corpus/test_binary_equivalence.py
     - name: Verify benchmark harness oracle and timing contracts
       run: python3 tests/benchmark/test_benchmark_harness.py
+    - name: Verify benchmark ranking contracts
+      run: python3 -m unittest discover -s scripts -p test_bench_rank.py
     - name: Verify GCC provisioning contracts (mock only)
       run: python3 tests/regression/check_ci_gcc16_provisioning.py
     - name: Verify swap provisioning contracts (mock only)
@@ -1071,6 +1073,15 @@ jobs:
         python3 scripts/fuzz_diff.py --engine synthetic --count 4 \
           --lccc target/fastbuild/lccc --refs gcc --opts=-O0,-O2 \
           --seed 20260906
+    # Object identity / value survival: the address of a local must not be
+    # lowered to the local's contents, and an int<->FP conversion must not
+    # destroy its own source.  Both defects shipped once; this keeps the
+    # shapes under a differential oracle on every push.
+    - name: Differential fuzz smoke (address identity and value survival)
+      run: |
+        python3 scripts/fuzz_diff.py --engine addr_value --count 8 \
+          --lccc target/fastbuild/lccc --refs gcc --opts=-O0,-O1,-O2 \
+          --seed 20261022
     - name: Verify inline-asm UTF-8 assembly text
       run: |
         python3 scripts/check_inline_asm_utf8.py \
@@ -2063,6 +2074,8 @@ jobs:
         # say the fold actually fired (and stayed off when refused).
         bash tests/regression/check_rmw_sib_folds.sh
         bash tests/regression/check_select_from_compare.sh
+        bash tests/regression/check_sparse_mask_updates.sh
+        bash tests/regression/check_pointer_ring_indexing.sh
         bash tests/regression/check_affine_loop_fold.sh
         bash tests/regression/check_phi_acyclic_order.sh
         bash tests/regression/check_fma_dest_coalesce_codegen.sh
