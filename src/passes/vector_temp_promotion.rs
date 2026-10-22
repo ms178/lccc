@@ -2449,11 +2449,7 @@ mod tests {
             IntrinsicOp::Cvtss2Si64,
         ] {
             assert_eq!(pointer_vector_arg_width(op, 0), Some(16), "{op:?}");
-            assert_eq!(
-                intrinsic_arg_required_alignment(op, 0),
-                Some(0),
-                "{op:?}"
-            );
+            assert_eq!(intrinsic_arg_required_alignment(op, 0), Some(0), "{op:?}");
         }
         assert_eq!(
             pointer_vector_arg_width(IntrinsicOp::Pcmpeqb256, 0),

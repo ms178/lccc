@@ -403,8 +403,7 @@ fn resolve_lccc_simd(name: &str) -> Option<(LcccSimdClass, IntrinsicOp, bool, us
     let (_class_s, mnemonic) = rest.split_once('_')?;
     // Table keys are "<insn><width>" (e.g. vpaddd512); some special forms
     // carry their own suffix (e.g. vinserti32x4_512). Try both.
-    lccc_simd_lookup(mnemonic)
-        .or_else(|| lccc_simd_lookup(&format!("{}{}", mnemonic, width_s)))
+    lccc_simd_lookup(mnemonic).or_else(|| lccc_simd_lookup(&format!("{}{}", mnemonic, width_s)))
 }
 
 impl Lowerer {
@@ -519,11 +518,9 @@ mod header_table_completeness_tests {
     /// `resolve_lccc_simd`, the compiler's own code path.
     #[test]
     fn every_declared_generic_simd_symbol_resolves() {
-        let header = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/include/lcccsimd.h"
-        ))
-        .expect("include/lcccsimd.h must be readable from the crate root");
+        let header =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/include/lcccsimd.h"))
+                .expect("include/lcccsimd.h must be readable from the crate root");
 
         // Declared/callable generic-SIMD symbols: `__lccc_simd<ident>(`.
         let mut declared: BTreeSet<&str> = BTreeSet::new();
