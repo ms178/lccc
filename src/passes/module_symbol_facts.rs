@@ -2,9 +2,10 @@
 //!
 //! A pair of IR `GlobalAddr` roots is not enough to prove different objects:
 //! GNU aliases and `asm("label")` can give one linker object multiple source
-//! names, while declarations can be interposed or coalesced at link time. Only
-//! distinct strong internal-linkage definitions, with no alias-like symbol
-//! redirection or opaque top-level assembly, have stable disjoint identity.
+//! names, while two public declarations can be interposed or coalesced at link
+//! time. A strong internal-linkage definition with no alias-like redirection or
+//! opaque top-level assembly supplies a private-identity witness; a consumer
+//! may use it to distinguish that object from a separately named public root.
 
 use crate::common::fx_hash::FxHashSet;
 use crate::ir::module::IrModule;

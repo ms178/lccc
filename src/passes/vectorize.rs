@@ -6151,9 +6151,10 @@ fn proven_object_root(func: &IrFunction, start: Value) -> Option<ProvenObjectRoo
 }
 
 /// C object identity and restrict rules sufficient for vectorization legality.
-/// Distinct allocas cannot overlap; distinct globals are disjoint only when
-/// module facts prove stable private definitions with no alias-like redirect.
-/// Parameter pointers are only disjoint when at least one carries `restrict`;
+/// Distinct allocas cannot overlap; global roots are disjoint when module facts
+/// prove at least one is a stable private definition and neither has an
+/// alias-like redirect. Parameter pointers are only disjoint when at least one
+/// carries `restrict`;
 /// otherwise different SSA value numbers prove nothing (the old implementation
 /// made exactly that unsound inference and miscompiled shifted in-place maps).
 fn roots_proven_distinct(
@@ -6200,13 +6201,17 @@ fn roots_proven_distinct(
         | (ProvenObjectRoot::Alloca(_), ProvenObjectRoot::Param { .. }) => true,
         (ProvenObjectRoot::Param { noalias, .. }, _)
         | (_, ProvenObjectRoot::Param { noalias, .. }) => *noalias,
-        // Distinct linker names alone are not object identity: GNU aliases,
-        // asm labels, weak/common definitions, and interposable globals can
-        // redirect one name to the other. Only strong private definitions
-        // with no known redirection are a usable proof.
+        // Distinct linker names alone are not object identity: two public
+        // globals may be interposed or coalesced, and GNU aliases/asm labels
+        // can redirect either name. A strong, unredirected internal-linkage
+        // definition is different: its storage is private to this translation
+        // unit and cannot be the storage of a separately named public object.
+        // This matters for loop-invariant bounds loaded from an external global
+        // while the loop stores only to a private array. Opaque top-level asm,
+        // weak/common definitions, and known aliases are removed from
+        // `local_globals`/`aliased_names` before this proof is available.
         (ProvenObjectRoot::Global(a), ProvenObjectRoot::Global(b)) => {
-            symbol_facts.local_globals.contains(a)
-                && symbol_facts.local_globals.contains(b)
+            (symbol_facts.local_globals.contains(a) || symbol_facts.local_globals.contains(b))
                 && !symbol_facts.aliased_names.contains(a)
                 && !symbol_facts.aliased_names.contains(b)
         }
@@ -6302,7 +6307,7 @@ mod roots_proven_distinct_tests {
     }
 
     #[test]
-    fn only_proven_private_globals_stay_distinct() {
+    fn private_global_disambiguates_a_distinct_public_name() {
         let trusted = facts(&["a", "b"], &[]);
         assert!(roots_proven_distinct(
             &Global("a".into()),
@@ -6312,6 +6317,29 @@ mod roots_proven_distinct_tests {
         assert!(roots_proven_distinct(
             &Global("a".into()),
             &Alloca(1),
+            &ModuleSymbolFacts::default(),
+        ));
+
+        // A public bound may be loaded inside a loop that stores only to a
+        // private array. The private definition cannot be the public symbol's
+        // storage, so this is an exact loop-invariance proof.
+        let private_array = facts(&["a"], &[]);
+        assert!(roots_proven_distinct(
+            &Global("a".into()),
+            &Global("external_limit".into()),
+            &private_array,
+        ));
+        assert!(roots_proven_distinct(
+            &Global("external_limit".into()),
+            &Global("a".into()),
+            &private_array,
+        ));
+
+        // Two public names remain conservative: a linker alias or interposition
+        // may make them refer to the same storage.
+        assert!(!roots_proven_distinct(
+            &Global("external_a".into()),
+            &Global("external_b".into()),
             &ModuleSymbolFacts::default(),
         ));
 
