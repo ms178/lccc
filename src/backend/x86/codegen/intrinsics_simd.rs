@@ -1877,10 +1877,13 @@ impl X86Codegen {
             }
             this.avx_store_dest(dest_ptr);
         };
+        // Both VEX lengths narrow to XMM, so memory operands require the
+        // AT&T y suffix to select a 256-bit source rather than an ambiguous
+        // unsuffixed 128/256-bit tuple. Register sources encode their width.
         let narrow = |this: &mut Self, inst: &str| {
             if let Some(m) = this.evex_arg_mem(&args[0]) {
                 this.state
-                    .emit_fmt(format_args!("    {} {}, %xmm0", inst, m));
+                    .emit_fmt(format_args!("    {}y {}, %xmm0", inst, m));
             } else {
                 this.avx_load_arg(&args[0]);
                 this.state
