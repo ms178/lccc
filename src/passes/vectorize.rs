@@ -91,6 +91,30 @@ use crate::ir::instruction::{BasicBlock, BlockId, Instruction, Operand, Terminat
 use crate::ir::intrinsics::IntrinsicOp;
 use crate::ir::ops::{IrBinOp, IrCmpOp, IrUnaryOp};
 use crate::ir::reexports::{IrConst, IrFunction, replace_operand_value, replace_terminator_value};
+
+/// `LCCC_FORCE_SSE2`: presence-only override that pins map/loop vectorization
+/// to SSE2 lane widths.
+///
+/// This is an `LCCC_FORCE_*` switch, so *presence* is the contract — a value
+/// that is not valid UTF-8 still selects the override.  Reading it with
+/// `env::var(..)` made the answer depend on the value's encoding at some call
+/// sites and not at others (`mod.rs` already tested presence), and the pattern
+/// loops re-resolved the environment once per candidate.  One cached read per
+/// process settles both.
+pub(super) fn sse2_forced() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("LCCC_FORCE_SSE2").is_some());
+    *FLAG
+}
+
+/// `LCCC_FORCE_MAP_SSE`: presence-only override that keeps the map-vector
+/// family on XMM forms even where AVX2 is available.  Same presence contract
+/// and the same caching rationale as [`sse2_forced`].
+pub(super) fn map_sse_forced() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("LCCC_FORCE_MAP_SSE").is_some());
+    *FLAG
+}
 use crate::passes::loop_analysis;
 
 // Per-loop rejection reason for the "why was this not vectorized" diagnostic
@@ -538,7 +562,7 @@ fn vectorize_with_analysis_mode(
 
     let normalize_byte_count = BYTE_COUNT_NORMALIZE_ENABLED.with(std::cell::Cell::get);
     // One local snapshot replaces six reads/allocations inside candidate loops.
-    let force_sse2 = std::env::var("LCCC_FORCE_SSE2").is_ok();
+    let force_sse2 = sse2_forced();
 
     let mut total_changes = 0;
 
@@ -1044,10 +1068,7 @@ fn vectorize_with_analysis_mode(
             if let Some(map_pattern) = analyze_map_pattern(func, loop_info, neon) {
                 // AArch64 is always 128-bit; x86 uses 256-bit vectors unless
                 // the focused SSE diagnostic override requests 128-bit code.
-                let avx2 = !neon
-                    && !force_two_wide
-                    && std::env::var("LCCC_FORCE_MAP_SSE").is_err()
-                    && x86_avx2_available();
+                let avx2 = !neon && !force_two_wide && !map_sse_forced() && x86_avx2_available();
                 // I64/U64 map intrinsics are two-lane XMM operations even on
                 // AVX2 targets.  Advertising four lanes here advances the IV
                 // by 32 bytes but only loads/stores 16, silently dropping
@@ -1069,9 +1090,7 @@ fn vectorize_with_analysis_mode(
                 // intrinsics are not wired for the displacement form yet.
                 if let Some(stencil_pattern) = analyze_stencil_pattern(func, loop_info) {
                     if !neon {
-                        let avx2 = !force_two_wide
-                            && std::env::var("LCCC_FORCE_MAP_SSE").is_err()
-                            && x86_avx2_available();
+                        let avx2 = !force_two_wide && !map_sse_forced() && x86_avx2_available();
                         if debug {
                             eprintln!(
                                 "[VEC] Stencil pattern matched! taps={} {:?} ({}-bit)",
@@ -31975,9 +31994,7 @@ pub(crate) fn vectorize_const_trip_map_loops(
             {
                 continue;
             }
-            let avx2 = std::env::var("LCCC_FORCE_MAP_SSE").is_err()
-                && std::env::var("LCCC_FORCE_SSE2").is_err()
-                && x86_avx2_available();
+            let avx2 = !map_sse_forced() && !sse2_forced() && x86_avx2_available();
             // The I64/U64 intrinsic family has only two-lane XMM forms.
             let avx2 = avx2 && !matches!(pattern.elem_ty, IrType::I64 | IrType::U64);
             let n = transform_map_vector(func, &pattern, avx2, false, fp_contract);

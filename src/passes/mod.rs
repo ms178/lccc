@@ -1496,8 +1496,7 @@ pub(crate) fn run_passes(
     // Generator-map vectorizer (vectorize_generator_map.rs): kill switch and
     // the `[VEC-GEN]` trace, resolved here like the switches above.
     vectorize::set_generator_map_policy(
-        std::env::var_os("CCC_NO_GENERATOR_MAP").is_none()
-            && std::env::var_os("LCCC_FORCE_SSE2").is_none(),
+        std::env::var_os("CCC_NO_GENERATOR_MAP").is_none() && !vectorize::sse2_forced(),
         std::env::var_os("LCCC_DEBUG_VECTORIZE").is_some(),
     );
     // The inliner's extension kill switches (A/B and triage), same rule.
