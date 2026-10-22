@@ -5,7 +5,7 @@
   "ignored_tests": 10,
   "knob_literals": 515,
   "knobs_undocumented": 275,
-  "panic_sites": 836,
+  "panic_sites": 837,
   "panic_sites_hot": 105,
   "unsafe_sites": 25
 }
