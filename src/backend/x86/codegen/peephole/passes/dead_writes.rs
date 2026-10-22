@@ -1355,7 +1355,18 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
             continue;
         }
         let first = infos[i].trimmed(store.get(i)).to_string();
-        let Some(rest) = first.strip_prefix("movq ") else {
+        // Both widths.  The 32-bit form is the one a *value* takes when it has
+        // to transit %rax: every call result and every return value lives
+        // there, and the allocator cannot keep a general range in %rax, so
+        // `shr(call_result)` emitted `movl %eax,%r11d; sarl $1,%r11d;
+        // movl %r11d,%eax` -- two wasted moves on a two-instruction function.
+        // The matcher below was 64-bit only, so no 32-bit round trip could
+        // ever fold.
+        let (wide, rest) = if let Some(r) = first.strip_prefix("movq ") {
+            (true, r)
+        } else if let Some(r) = first.strip_prefix("movl ") {
+            (false, r)
+        } else {
             i += 1;
             continue;
         };
@@ -1390,6 +1401,15 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
             i += 1;
             continue;
         };
+        // Width agreement.  A 32-bit staging copy zero-extends into the
+        // scratch register, so a 64-bit op would read a value the in-place
+        // form does not produce from the accumulator's high half; a 64-bit
+        // staging copy followed by a 32-bit op is fine (the op truncates in
+        // both forms) and is left as the historical behaviour.
+        if !wide && !op.trim_end().ends_with('l') {
+            i += 1;
+            continue;
+        }
         let Some((op_src, op_dst)) = split_two_operands(&op_line[op.len()..]) else {
             i += 1;
             continue;
@@ -1445,7 +1465,15 @@ pub(super) fn fold_accumulator_roundtrip(store: &mut LineStore, infos: &mut [Lin
             i += 1;
             continue;
         }
-        let Some(brest) = back.strip_prefix("movq ") else {
+        // The copy-back must be the same width as the staging copy: `movl`
+        // into the scratch followed by `movq` back would publish the
+        // zero-extended value, which the in-place form does not compute.
+        let brest = if wide {
+            back.strip_prefix("movq ")
+        } else {
+            back.strip_prefix("movl ")
+        };
+        let Some(brest) = brest else {
             i += 1;
             continue;
         };
@@ -2407,6 +2435,43 @@ mod tests {
         ));
         assert!(out.contains("xorq %r10, %r8"), "{out}");
         assert!(!out.contains("movq %rax, %r8"), "{out}");
+    }
+
+    #[test]
+    fn thirty_two_bit_accumulator_roundtrip_is_applied_in_place() {
+        // `f(call_result) >> 1` reaching the return value in %eax: the 32-bit
+        // staging copy, the op and the copy-back are the same round trip at
+        // half width, and the matcher used to accept only `movq`.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB2:\n",
+            "    movl %eax, %r11d\n",
+            "    sarl $1, %r11d\n",
+            "    movl %r11d, %eax\n",
+            "    addq $8, %rsp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("sarl $1, %eax"), "{out}");
+        assert!(!out.contains("%r11"), "{out}");
+    }
+
+    #[test]
+    fn thirty_two_bit_staging_copy_never_folds_a_sixty_four_bit_op() {
+        // `movl` zero-extends into the scratch, so a following 64-bit op reads
+        // a value the in-place form does not compute from %rax's high half.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB2:\n",
+            "    movl %eax, %r11d\n",
+            "    sarq $1, %r11\n",
+            "    movl %r11d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("sarq $1, %r11"), "{out}");
     }
 
     #[test]
