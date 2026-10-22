@@ -177,3 +177,50 @@ class BenchmarkHarnessTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FlagValuedOptionParsing(unittest.TestCase):
+    """`--opt`/`--cflag` take a compiler flag, so every legal value begins with
+    a hyphen and argparse's default reading of the space-separated form is
+    always wrong.  Both spellings must reach the same parsed value."""
+
+    def test_space_separated_opt_flag_parses_like_the_attached_form(self):
+        spaced = bench.build_arg_parser().parse_args(
+            bench.normalize_flag_valued_options(["--opt", "-O2"])
+        )
+        attached = bench.build_arg_parser().parse_args(["--opt=-O2"])
+        self.assertEqual(spaced.opt, attached.opt)
+        self.assertEqual(spaced.opt, "-O2")
+
+    def test_every_optimization_spelling_survives_normalization(self):
+        for flag in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Oz", "-march=x86-64-v3"]:
+            args = bench.build_arg_parser().parse_args(
+                bench.normalize_flag_valued_options(["--opt", flag])
+            )
+            self.assertEqual(args.opt, flag)
+
+    def test_repeated_cflags_each_keep_their_own_value(self):
+        args = bench.build_arg_parser().parse_args(
+            bench.normalize_flag_valued_options(
+                ["--cflag", "-Wall", "--cflag", "-fno-strict-aliasing"]
+            )
+        )
+        self.assertEqual(args.cflag, ["-Wall", "-fno-strict-aliasing"])
+
+    def test_a_following_option_is_never_swallowed_as_a_value(self):
+        # `--opt --strict` must stay an error rather than silently consuming
+        # `--strict` as the optimization flag.
+        normalized = bench.normalize_flag_valued_options(["--opt", "--strict"])
+        self.assertEqual(normalized, ["--opt", "--strict"])
+        with self.assertRaises(SystemExit):
+            bench.build_arg_parser().parse_args(normalized)
+
+    def test_normalization_leaves_unrelated_arguments_untouched(self):
+        argv = ["--reps", "9", "--warmup", "2", "--strict", "--only", "sieve"]
+        self.assertEqual(bench.normalize_flag_valued_options(argv), argv)
+
+    def test_a_trailing_flag_without_a_value_still_reports_the_omission(self):
+        with self.assertRaises(SystemExit):
+            bench.build_arg_parser().parse_args(
+                bench.normalize_flag_valued_options(["--reps", "9", "--opt"])
+            )

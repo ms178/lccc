@@ -1111,7 +1111,45 @@ def list_benchmarks() -> None:
         print(f"  {benchmark.name:<20} {status:<54} {benchmark.description}")
 
 
-def main() -> int:
+# Flags whose value is itself a compiler flag and therefore always begins with
+# a hyphen: `-O2`, `-Os`, `-march=...`, `-fno-...`.
+_FLAG_VALUED_OPTIONS = ("--opt", "--cflag")
+
+
+def normalize_flag_valued_options(argv):
+    """Rewrite `--opt -O2` as `--opt=-O2` so both spellings parse.
+
+    argparse decides whether a token is an option or a value purely from its
+    leading hyphen, so a space-separated value that begins with `-` is always
+    read as the next option and the flag dies with "expected one argument".
+    Every legal value of `--opt`/`--cflag` begins with a hyphen, which makes
+    the natural spelling unusable rather than merely ambiguous.  Joining the
+    pair before parsing keeps it working without weakening any other flag: a
+    following token that starts with `--` is left alone, so `--opt --strict`
+    still reports the missing value instead of silently swallowing `--strict`.
+
+    Exactly one token is joined per occurrence, matching what argparse would
+    have consumed.
+    """
+    normalized = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if (
+            token in _FLAG_VALUED_OPTIONS
+            and index + 1 < len(argv)
+            and not argv[index + 1].startswith("--")
+        ):
+            normalized.append(f"{token}={argv[index + 1]}")
+            index += 2
+            continue
+        normalized.append(token)
+        index += 1
+    return normalized
+
+
+def build_arg_parser():
+    """The runner's command line, as a parser, so it can be tested directly."""
     parser = argparse.ArgumentParser(description="Paired, reproducible LCCC code-generation benchmark runner")
     parser.add_argument("--list", action="store_true", help="list benchmark IDs and exit")
     parser.add_argument("--only", action="append", help="comma-separated benchmark IDs; may be repeated")
@@ -1140,7 +1178,13 @@ def main() -> int:
     parser.add_argument("--no-pmu-probe", action="store_true", help="do not make the one perf availability probe")
     parser.add_argument("--strict", action="store_true",
                         help="non-zero exit on a compile/runtime failure, missing requested compiler, or non-match")
-    args = parser.parse_args()
+    return parser
+
+
+def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(normalize_flag_valued_options(argv))
 
     if args.list:
         list_benchmarks()
