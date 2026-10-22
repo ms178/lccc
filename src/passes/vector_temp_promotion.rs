@@ -85,11 +85,29 @@ fn collect_allocas(func: &IrFunction) -> FxHashMap<u32, AllocaInfo> {
     allocas
 }
 
+/// Explicit pointer-backed conversion/cast results omitted by the legacy
+/// register-value home table. Keep widths local to the audited temp contract;
+/// this is not a blanket purity or argument-access classification.
+fn temp_result_width(op: IntrinsicOp) -> Option<usize> {
+    use IntrinsicOp::*;
+    match op {
+        CvtPs2Ep32_128 | CvtEp32ToPs128 | CvttPs2Ep32_128 | CvtPs2Pd128 | CvtPd2Ps128
+        | CvtPd2Ep32_128 | CvtEp32ToPd128 | CvttPd2Ep32_128 | CvtPd2Ps256 | CvtPd2Ep32_256
+        | CvttPd2Ep32_256 => Some(16),
+        CvtPs2Ep32_256 | CvtEp32ToPs256 | CvttPs2Ep32_256 | CvtPs2Pd256 | CvtEp32ToPd256
+        | CvtPd2Ps512 | CvtPd2Ep32_512 | CvttPd2Ep32_512 | Cast512to256 | VpermilPd256 => Some(32),
+        Loadu512 | CvtPs2Pd512 | CvtEp32_2Ps512 | CvtPs2Ep32_512 | CvttPs2Ep32_512
+        | CvtEp32_2Pd512 | Zext128to512 | Cast128to512 | Cast256to512 => Some(64),
+        _ => op.vector_result_width().map(|width| width as usize),
+    }
+}
+
 /// Direct, full-width loads for which `args[0]` denotes exactly the bytes
 /// written to `dest_ptr`.  Offset, masked and partial loads are excluded.
 fn direct_vector_load_width(op: IntrinsicOp) -> Option<usize> {
     match op {
         IntrinsicOp::Loaddqu => Some(16),
+        IntrinsicOp::Loadu512 => Some(64),
         IntrinsicOp::Loadu256
         | IntrinsicOp::Load256
         | IntrinsicOp::LoaduPs256
@@ -119,6 +137,41 @@ fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
         return (index == 0).then_some(width);
     }
     match op {
+        // Exact source widths, deliberately independent of result widths.
+        O::CvtPs2Ep32_128
+        | O::CvtEp32ToPs128
+        | O::CvttPs2Ep32_128
+        | O::CvtPs2Pd128
+        | O::CvtPd2Ps128
+        | O::CvtPd2Ep32_128
+        | O::CvtEp32ToPd128
+        | O::CvttPd2Ep32_128
+        | O::CvtSs2Si128
+        | O::CvtSd2Si128
+        | O::CvttSs2Si128
+        | O::CvttSd2Si128
+        | O::CvtPs2Pd256
+        | O::CvtEp32ToPd256
+        | O::Zext128to512
+        | O::Cast128to512 => return (index == 0).then_some(16),
+        O::CvtPs2Ep32_256
+        | O::CvtEp32ToPs256
+        | O::CvttPs2Ep32_256
+        | O::CvtPd2Ps256
+        | O::CvtPd2Ep32_256
+        | O::CvttPd2Ep32_256
+        | O::CvtPs2Pd512
+        | O::CvtEp32_2Pd512
+        | O::Cast256to512
+        | O::VpermilPd256 => return (index == 0).then_some(32),
+        O::CvtPd2Ps512
+        | O::CvtEp32_2Ps512
+        | O::CvtPs2Ep32_512
+        | O::CvttPs2Ep32_512
+        | O::CvtPd2Ep32_512
+        | O::CvttPd2Ep32_512
+        | O::Cast512to256
+        | O::Storeu512 => return (index == 0).then_some(64),
         // Mixed-width AVX lane construction/casts.
         O::Broadcast128to256 | O::Zext128to256 => {
             return (index == 0).then_some(16);
@@ -472,7 +525,7 @@ fn intrinsic_dest_required_alignment(
     // Compiler-created vector result homes are emitted through unaligned-safe
     // stores.  Exact width also rejects partial/RMW operations accidentally
     // listed by a broad intrinsic family query.
-    if has_result && op.vector_result_width().map(|width| width as usize) == Some(alloca_size) {
+    if has_result && temp_result_width(op) == Some(alloca_size) {
         return Some(0);
     }
     // Whole-object unaligned vector store (the SIMD vector lowering's
@@ -484,6 +537,7 @@ fn intrinsic_dest_required_alignment(
     match op {
         O::Storedqu
         | O::Storeldi128
+        | O::Storeu512
         | O::Storeu256
         | O::StoreuPs256
         | O::StoreuPd256
@@ -901,7 +955,7 @@ fn promote_in_function(func: &mut IrFunction) -> usize {
                     let Some(info) = allocas.get(&tmp.0) else {
                         continue;
                     };
-                    if op.vector_result_width().map(|width| width as usize) == Some(info.size)
+                    if temp_result_width(*op) == Some(info.size)
                         && intrinsic_overwrites_full_result(*op)
                         && !info.volatile
                         && !info.semantic_volatile
@@ -1388,7 +1442,7 @@ fn local_alias_facts(
 ) -> LocalAliasFacts {
     let roots: Vec<u32> = allocas
         .iter()
-        .filter_map(|(&value, info)| (info.size == 16 || info.size == 32).then_some(value))
+        .filter_map(|(&value, info)| matches!(info.size, 16 | 32 | 64).then_some(value))
         .collect();
     let mut nonescaping: FxHashSet<u32> = roots.iter().copied().collect();
     let mut owners = FxHashMap::with_capacity_and_hasher(roots.len() * 2, Default::default());
@@ -2001,7 +2055,7 @@ fn downgrade_in_function(func: &mut IrFunction) -> usize {
                 ..
             } = inst
             {
-                if (*size == 16 || *size == 32) && *align > 16 && !*volatile && !*semantic_volatile
+                if matches!(*size, 16 | 32 | 64) && *align > 16 && !*volatile && !*semantic_volatile
                 {
                     sizes.insert(dest.0, *size);
                     required_align.insert(dest.0, 0usize);
@@ -2215,6 +2269,149 @@ mod tests {
             op,
             dest_ptr: dest_ptr.map(Value),
             args,
+        }
+    }
+
+    #[test]
+    fn conversions_use_exact_input_and_output_widths() {
+        use IntrinsicOp::*;
+        let contracts = [
+            (CvtPs2Ep32_128, 16, 16),
+            (CvttPs2Ep32_128, 16, 16),
+            (CvtEp32ToPs128, 16, 16),
+            (CvtPs2Pd128, 16, 16),
+            (CvtEp32ToPd128, 16, 16),
+            (CvtPd2Ps128, 16, 16),
+            (CvtPd2Ep32_128, 16, 16),
+            (CvttPd2Ep32_128, 16, 16),
+            (CvtPs2Ep32_256, 32, 32),
+            (CvttPs2Ep32_256, 32, 32),
+            (CvtEp32ToPs256, 32, 32),
+            (CvtPs2Pd256, 16, 32),
+            (CvtEp32ToPd256, 16, 32),
+            (CvtPd2Ps256, 32, 16),
+            (CvtPd2Ep32_256, 32, 16),
+            (CvttPd2Ep32_256, 32, 16),
+            (CvtPs2Ep32_512, 64, 64),
+            (CvttPs2Ep32_512, 64, 64),
+            (CvtEp32_2Ps512, 64, 64),
+            (CvtPs2Pd512, 32, 64),
+            (CvtEp32_2Pd512, 32, 64),
+            (CvtPd2Ps512, 64, 32),
+            (CvtPd2Ep32_512, 64, 32),
+            (CvttPd2Ep32_512, 64, 32),
+            (Zext128to512, 16, 64),
+            (Cast128to512, 16, 64),
+            (Cast256to512, 32, 64),
+            (Cast512to256, 64, 32),
+            (VpermilPd256, 32, 32),
+        ];
+        for (op, input, output) in contracts {
+            assert_eq!(pointer_vector_arg_width(op, 0), Some(input), "{op:?}");
+            assert_eq!(pointer_vector_arg_width(op, 1), None, "{op:?}");
+            assert_eq!(temp_result_width(op), Some(output), "{op:?}");
+            for wrong_size in [false, true] {
+                let mut f = function(
+                    "conversion_result",
+                    vec![block(
+                        0,
+                        vec![
+                            alloca(0, output, 64),
+                            alloca(1, output, 64),
+                            intrinsic(Some(2), op, Some(0), vec![Operand::Value(Value(10))]),
+                            Instruction::Memcpy {
+                                dest: Value(1),
+                                src: Value(0),
+                                size: output - usize::from(wrong_size),
+                            },
+                        ],
+                    )],
+                );
+                assert_eq!(
+                    promote_in_function(&mut f),
+                    usize::from(!wrong_size),
+                    "{op:?}"
+                );
+            }
+        }
+        assert_eq!(temp_result_width(Storeu512), None);
+        assert_eq!(pointer_vector_arg_width(MaskLoaduEpi8_512, 0), None);
+        assert_eq!(pointer_vector_arg_width(MaskLoaduEpi8_512, 1), None);
+    }
+
+    #[test]
+    fn wide_conversion_forwarding_rejects_clobbers_and_wrong_widths() {
+        for (op, output) in [
+            (IntrinsicOp::CvtPd2Ps512, 32),
+            (IntrinsicOp::CvttPd2Ep32_512, 32),
+            (IntrinsicOp::CvtEp32_2Ps512, 64),
+        ] {
+            for clobber in [false, true] {
+                for input in [32, 64] {
+                    let load = if input == 64 {
+                        IntrinsicOp::Loadu512
+                    } else {
+                        IntrinsicOp::Loadu256
+                    };
+                    let mut instructions = vec![
+                        alloca(0, input, input),
+                        alloca(1, output, output),
+                        intrinsic(Some(2), load, Some(0), vec![Operand::Value(Value(10))]),
+                    ];
+                    if clobber {
+                        instructions.push(Instruction::Store {
+                            ptr: Value(10),
+                            val: Operand::Const(IrConst::I32(7)),
+                            ty: IrType::I32,
+                            volatile: false,
+                            seg_override: Default::default(),
+                        });
+                    }
+                    instructions.push(intrinsic(
+                        Some(3),
+                        op,
+                        Some(1),
+                        vec![Operand::Value(Value(0))],
+                    ));
+                    let mut f = function("wide_forward", vec![block(0, instructions)]);
+                    assert_eq!(
+                        fuse_in_function(&mut f),
+                        usize::from(input == 64 && !clobber),
+                        "{op:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_unaligned_homes_relax_but_observable_addresses_do_not() {
+        for observable in [false, true] {
+            let mut instructions = vec![
+                alloca(0, 64, 64),
+                intrinsic(
+                    Some(1),
+                    IntrinsicOp::CvtEp32_2Pd512,
+                    Some(0),
+                    vec![Operand::Value(Value(10))],
+                ),
+                intrinsic(
+                    None,
+                    IntrinsicOp::Storeu512,
+                    Some(20),
+                    vec![Operand::Value(Value(0))],
+                ),
+            ];
+            if observable {
+                instructions.push(Instruction::Cast {
+                    dest: Value(3),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::Ptr,
+                    to_ty: IrType::I64,
+                });
+            }
+            let mut f = function("wide_alignment", vec![block(0, instructions)]);
+            assert_eq!(downgrade_in_function(&mut f), usize::from(!observable));
         }
     }
 

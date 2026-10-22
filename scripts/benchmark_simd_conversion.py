@@ -50,11 +50,12 @@ def main():
     source = ROOT / 'tests/bench/simd_conversion.c'
     compilers = {k: getattr(args, k).resolve() for k in ('before', 'after', 'gcc', 'clang')}
     receipt = dict(complete=False, cpu=cpu, flags=flags, rounds=args.rounds,
-                   source_sha256=digest(source), compilers={k: dict(path=str(p), sha256=digest(p),
+                   source_sha256=digest(source), header_sha256=digest(ROOT / 'include/lcccsimd.h'),
+                   before_header_sha256=digest(args.before_include / 'lcccsimd.h'), compilers={k: dict(path=str(p), sha256=digest(p),
                    version=subprocess.check_output([str(p), '--version'], text=True).splitlines()[0])
                    for k, p in compilers.items()}, rows=[])
     rng = random.Random(73921)
-    for kind, name in enumerate(('zero_extend', 'widen_integer', 'truncate_double', 'permute_double')):
+    for kind, name in enumerate(('zero_extend', 'widen_integer', 'truncate_double', 'permute_double', 'copy_full_width')):
         row = dict(name=name, artifacts={}, samples=[])
         valid = {}
         for k, compiler in compilers.items():

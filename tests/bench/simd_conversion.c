@@ -1,4 +1,4 @@
-/* Explicit-SIMD throughput probe. Compile KIND=0..3 with the same ISA flags.
+/* Explicit-SIMD throughput probe. Compile KIND=0..4 with the same ISA flags.
  * Every timed process independently checks all result lanes before reporting.
  * noinline keeps repeated writes observable across calls, without volatile
  * vector objects changing store lowering. No scalar overflow or FP UB. */
@@ -26,9 +26,11 @@ __attribute__((noinline)) static void kernel(void) {
         __m512d v; __builtin_memcpy(&v,doubles+i*8,64);
         __m256i result = _mm512_cvttpd_epi32(v);
         _mm256_storeu_si256((__m256i_u *)(output+i*32),result);
-#else
+#elif KIND == 3
         __m256d v = _mm256_loadu_pd(doubles+i*4);
         _mm256_storeu_pd((double *)(output+i*32),_mm256_permute_pd(v,5));
+#else
+        __builtin_memcpy(output+i*64,doubles+i*8,64);
 #endif
     }
 }
@@ -56,11 +58,14 @@ int main(int argc, char **argv) {
             int32_t v; __builtin_memcpy(&v,output+i*32+j*4,4);
             if (v!=(int32_t)doubles[i*8+j]) return 3;
         }
-#else
+#elif KIND == 3
         for (unsigned j=0;j<4;++j) {
             double v; __builtin_memcpy(&v,output+i*32+j*8,8);
             if (v!=doubles[i*4+(j^1)]) return 3;
         }
+#else
+        for (unsigned j=0;j<64;++j)
+            if (output[i*64+j]!=((unsigned char *)(doubles+i*8))[j]) return 3;
 #endif
     }
     uint64_t checksum=0;
