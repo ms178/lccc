@@ -2249,9 +2249,20 @@ pub trait ArchCodegen {
     }
 
     /// Inline a fixed-size memmove call. Must handle overlapping ranges:
-    /// copies forward when dest < src, backward when dest > src.
+    /// copies forward when dest < src, backward when dest > src, or buffers
+    /// every source chunk in a register before the first store.
     /// Only called when `supports_inline_memcpy_call()` is true.
-    fn emit_inline_memmove_call(&mut self, _dest: &Operand, _src: &Operand, _size: usize) {}
+    ///
+    /// `result` is the call's result value when it is used, with the same
+    /// contract as `emit_inline_memcpy_call` (`memmove` returns `dest`).
+    fn emit_inline_memmove_call(
+        &mut self,
+        _dest: &Operand,
+        _src: &Operand,
+        _size: usize,
+        _result: Option<&Value>,
+    ) {
+    }
 
     /// `Some(n)` when this backend will expand the fixed-size fill call
     /// `memset(dest, c, n)` / `__memset_chk(dest, c, n, destlen)` inline

@@ -9621,7 +9621,7 @@ impl ArchCodegen for X86Codegen {
         fn emit_memcpy_store_src_from_acc(&mut self) => emit_memcpy_store_src_from_acc_impl;
         fn emit_memcpy_impl(&mut self, size: usize) => emit_memcpy_impl_impl;
         fn emit_inline_memcpy_call(&mut self, dest: &Operand, src: &Operand, size: usize, result: Option<&Value>) => emit_inline_memcpy_call_impl;
-        fn emit_inline_memmove_call(&mut self, dest: &Operand, src: &Operand, size: usize) => emit_inline_memmove_call_impl;
+        fn emit_inline_memmove_call(&mut self, dest: &Operand, src: &Operand, size: usize, result: Option<&Value>) => emit_inline_memmove_call_impl;
         fn emit_inline_memset_call(&mut self, dest: &Operand, value: &Operand, size: usize, result: Option<&Value>) => emit_inline_memset_call_impl;
         fn emit_seg_load(&mut self, dest: &Value, ptr: &Value, ty: IrType, seg: AddressSpace) => emit_seg_load_impl;
         fn emit_seg_load_with_const_offset(&mut self, dest: &Value, base: &Value, offset: i64, ty: IrType, seg: AddressSpace) -> bool => emit_seg_load_with_const_offset_impl;

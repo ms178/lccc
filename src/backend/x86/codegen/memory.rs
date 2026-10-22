@@ -42,6 +42,13 @@ pub(super) fn direct_store_imm(imm: i64, ty: IrType) -> Option<i64> {
     }
 }
 
+/// Largest constant `memmove` size the overlap-safe buffered expansion
+/// covers.  Two scratch vectors (or, under `-mno-sse`, the two scalar scratch
+/// registers) buffer the whole copy, which is what makes it direction-free.
+/// Must stay <= `generation::INLINE_MEMMOVE_MAX`, the bound the call lowering
+/// asks for.
+pub(super) const MEMMOVE_BUFFERED_MAX: usize = 32;
+
 /// Source classification for the `%rdi`/`%rsi` parallel-copy staging of
 /// memcpy/memmove addresses (see `X86Codegen::stage_copy_operands`).
 #[derive(Clone, Copy, Debug)]
@@ -3249,33 +3256,188 @@ impl X86Codegen {
         dest: &Operand,
         src: &Operand,
         size: usize,
+        result: Option<&Value>,
     ) {
         // Source slot may still be a deferred vector result.
         self.flush_pending_vec_store_impl();
         self.stage_copy_operands(dest, src);
-        // memmove must handle overlapping ranges. With dst > src, a forward
-        // copy would read source bytes that were already overwritten, so the
-        // copy must run backward (DF=1). Direction flag is restored after.
+        if result.is_some() {
+            // %rdx survives both expansions (see store_inline_libc_result).
+            self.state.emit("    movq %rdi, %rdx");
+        }
+        // Small constant sizes take the branch-free expansion below: it is
+        // overlap-safe by construction (every chunk is loaded into a scratch
+        // register before the first store), which is what memmove needs and
+        // what a forward `movdqu` sequence does NOT provide.
+        if size <= MEMMOVE_BUFFERED_MAX && !(self.no_sse && size > 16) {
+            self.emit_memmove_buffered_impl(size);
+            self.store_inline_libc_result(result);
+            return;
+        }
+        // Larger sizes (or -mno-sse above 16 bytes, where no xmm register may
+        // be touched at all): rep-movsb fallback, which needs no scratch
+        // registers.  `inline_memcpy_len` asks for it only for the -mno-sse
+        // 17..32-byte window today.
+        //
+        // `rep movsb` always walks upward, so the backwards case must first
+        // move BOTH pointers to the end of their ranges; the previous form
+        // reloaded only the count and copied the wrong bytes (it never ran,
+        // because nothing expanded memmove at all).
         let lbl = self.state.next_label_id();
         let done = format!(".Lmmv_done_{}", lbl);
         let bwd = format!(".Lmmv_bwd_{}", lbl);
+        self.state
+            .out
+            .emit_instr_imm_reg("    movq", size as i64, "rcx");
         self.state.emit("    cmpq %rsi, %rdi");
         self.state.emit_fmt(format_args!("    je {}", done)); // same address: nothing to copy
         self.state.emit_fmt(format_args!("    ja {}", bwd)); // dst > src: backward
-        self.state
-            .out
-            .emit_instr_imm_reg("    movq", size as i64, "rcx");
         self.state.emit("    rep movsb");
         self.state.emit_fmt(format_args!("    jmp {}", done));
         self.state.emit_fmt(format_args!("{}:", bwd));
+        // DF=1 makes rep movsb walk downward, starting at the byte each
+        // pointer references: point both at the LAST byte of their range.
+        self.state.emit("    leaq -1(%rsi,%rcx), %rsi");
+        self.state.emit("    leaq -1(%rdi,%rcx), %rdi");
         self.state.emit("    std");
-        self.state
-            .out
-            .emit_instr_imm_reg("    movq", size as i64, "rcx");
-        // rep movsb with DF=1 copies from high to low: source end -> dest end.
         self.state.emit("    rep movsb");
         self.state.emit("    cld");
         self.state.emit_fmt(format_args!("{}:", done));
+        self.state.reg_cache.invalidate_all();
+        self.store_inline_libc_result(result);
+    }
+
+    /// Overlap-safe expansion of a small constant-size `memmove`.
+    ///
+    /// The classic forward copy is only correct when the ranges are disjoint
+    /// or dest < src; the classic backward copy needs DF toggling (a
+    /// serialising `std`/`cld` pair) plus a direction branch.  For a size
+    /// that fits in two scratch registers the whole copy can be *buffered*
+    /// instead: load every chunk into a register, then store them.  No
+    /// branch, no flag traffic, and correct for any overlap because no store
+    /// is visible to a later load.
+    ///
+    /// Scratch discipline: %rax and %rcx (scalar) or %xmm0 and %xmm1
+    /// (vector) — exactly the set `inline_memcpy_len`'s contract publishes to
+    /// the allocator, the frame scan and the MachInst gate.
+    ///
+    /// Chunking never rounds up: a 5-byte move composes from overlapping
+    /// in-bounds pieces (`movl 0` + `movl 1`), never from a wider load that
+    /// could read past the end of the object.
+    fn emit_memmove_buffered_impl(&mut self, size: usize) {
+        debug_assert!(size <= MEMMOVE_BUFFERED_MAX);
+        if size == 0 {
+            return;
+        }
+        // VEX-128 whenever AVX2 is enabled: `vmovdqu %xmm` zeroes the upper
+        // half of the register, so this can never trigger a legacy-SSE
+        // transition in a function that also used 256-bit ops.
+        let mv = if self.avx2_enabled && !self.no_sse {
+            "vmovdqu"
+        } else {
+            "movdqu"
+        };
+        // (width, offset) per piece; loads are all emitted before any store.
+        // At most two pieces ever, because only %rax/%rcx (or %xmm0/%xmm1)
+        // may be touched; the caller sends -mno-sse sizes above 16 bytes to
+        // the rep-movsb fallback for exactly that reason.
+        let mut pieces: Vec<(usize, usize)> = Vec::new();
+        if self.no_sse {
+            // No xmm/ymm may be touched (kernel boot runs with CR4.OSFXSR=0).
+            match size {
+                1 => pieces.push((1, 0)),
+                2 => pieces.push((2, 0)),
+                3 => {
+                    pieces.push((2, 0));
+                    pieces.push((1, 2));
+                }
+                4 => pieces.push((4, 0)),
+                5..=7 => {
+                    pieces.push((4, 0));
+                    pieces.push((4, size - 4));
+                }
+                8 => pieces.push((8, 0)),
+                _ => {
+                    pieces.push((8, 0));
+                    pieces.push((8, size - 8));
+                }
+            }
+        } else if size <= 16 {
+            if size == 16 {
+                pieces.push((16, 0));
+            } else {
+                // A 16-byte load would read past the end of a smaller object;
+                // combine exact-width scalar pieces instead.  They are all in
+                // bounds and overlap only each other.
+                match size {
+                    1 => pieces.push((1, 0)),
+                    2 => pieces.push((2, 0)),
+                    3 => {
+                        pieces.push((2, 0));
+                        pieces.push((1, 2));
+                    }
+                    4 => pieces.push((4, 0)),
+                    5..=7 => {
+                        pieces.push((4, 0));
+                        pieces.push((4, size - 4));
+                    }
+                    _ => {
+                        pieces.push((8, 0));
+                        pieces.push((8, size - 8));
+                    }
+                }
+            }
+        } else {
+            pieces.push((16, 0));
+            pieces.push((16, size - 16));
+        }
+        let gpr = |slot: usize, width: usize| -> String {
+            let base = if slot == 0 { "a" } else { "c" };
+            match width {
+                8 => format!("%r{}x", base),
+                4 => format!("%e{}x", base),
+                2 => format!("%{}x", base),
+                _ => format!("%{}l", base),
+            }
+        };
+        for (i, (width, off)) in pieces.iter().enumerate() {
+            if *width == 16 {
+                self.state
+                    .emit_fmt(format_args!("    {} {}(%rsi), %xmm{}", mv, off, i));
+            } else {
+                self.state.emit_fmt(format_args!(
+                    "    mov{} {}(%rsi), {}",
+                    match width {
+                        8 => "q",
+                        4 => "l",
+                        2 => "w",
+                        _ => "b",
+                    },
+                    off,
+                    gpr(i, *width)
+                ));
+            }
+        }
+        for (i, (width, off)) in pieces.iter().enumerate() {
+            if *width == 16 {
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm{}, {}(%rdi)", mv, i, off));
+            } else {
+                self.state.emit_fmt(format_args!(
+                    "    mov{} {}, {}(%rdi)",
+                    match width {
+                        8 => "q",
+                        4 => "l",
+                        2 => "w",
+                        _ => "b",
+                    },
+                    gpr(i, *width),
+                    off
+                ));
+            }
+        }
+        self.state.invalidate_vec_peephole();
+        self.state.reg_cache.invalidate_all();
     }
 
     // ------------------------------------------------------------------

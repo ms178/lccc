@@ -4522,25 +4522,61 @@ pub(crate) fn destlen_covers_n(destlen: &IrConst, n: i64) -> bool {
     }
 }
 
-/// `Some(n)` if this call is a fixed-size memcpy we may expand inline.
+/// Largest constant size for which a `memcpy`-family call is expanded
+/// inline instead of becoming a PLT call.
+///
+/// The bound is the emitter's, not a policy knob: `emit_memcpy_impl_impl`
+/// has a straight-line lowering for every size up to 64 bytes (one 16-byte
+/// vector chunk per 16 bytes, with a single `vmovdqu %ymm` pair for a full
+/// 64-byte copy), which is where the straight-line shape stops beating a
+/// call.  It used to be 32 — an artefact of the first implementation — so
+/// every 33..64-byte `memcpy` paid a libc call plus its callee-saved
+/// register spill while GCC and Clang inlined it (`ZSTD_copy`-style struct
+/// moves, 48-byte `Particle` copies, `stpncpy` tails).
+const INLINE_COPY_MAX: i64 = 64;
+
+/// Largest constant size for which `memmove` is expanded inline.
+///
+/// Smaller than `INLINE_COPY_MAX` because the memmove expansion must be
+/// overlap-safe *without* a direction-flag dance: it loads every chunk into
+/// a scratch register first and only then stores, which caps the size at
+/// the scratch the expansion is allowed to touch (%rax/%rcx/%xmm0/%xmm1 —
+/// the same set the memcpy expansion and the allocator's inline-libc model
+/// already assume).  Two 16-byte chunks cover 17..32 bytes; above that a
+/// libc call is both smaller and faster than rep movsb.
+const INLINE_MEMMOVE_MAX: i64 = 32;
+
+/// `Some(n)` if this call is a fixed-size memcpy/memmove we may expand
+/// inline.
 ///
 /// Expansion replaces the call with the library function's semantics, so
 /// it requires `CallInfo::assume_library`: the call is spelled
 /// `__builtin_memcpy`, was created by the compiler, or the builtin policy
 /// (`-fno-builtin`, `-ffreestanding`, a TU definition or redirect of
 /// `memcpy`) permits treating the plain name as the library function.
+///
+/// Every consumer of this predicate (the emitters, the allocator's
+/// parameter-home model, the frame-alignment scan and the MachInst
+/// typed-call gate) treats "Some" as "this call is replaced by straight-line
+/// code that touches only %rdi/%rsi/%rcx/%rax/%xmm0/%xmm1", so the two
+/// families must stay inside that contract.
 pub(crate) fn inline_memcpy_len(func: &str, info: &CallInfo) -> Option<usize> {
     let (args, is_variadic) = (&info.args, info.is_variadic);
     if !info.assume_library || is_variadic || args.len() < 3 {
         return None;
     }
+    let bound = if is_memmove_libcall(func) {
+        INLINE_MEMMOVE_MAX
+    } else {
+        INLINE_COPY_MAX
+    };
     let n = match args.get(2) {
-        Some(Operand::Const(c)) => c.to_i64().filter(|s| (0..=32).contains(s))?,
+        Some(Operand::Const(c)) => c.to_i64().filter(|s| (0..=bound).contains(s))?,
         _ => return None,
     };
     match func {
-        "memcpy" => Some(n as usize),
-        "__memcpy_chk" => {
+        "memcpy" | "memmove" => Some(n as usize),
+        "__memcpy_chk" | "__memmove_chk" => {
             if args.len() < 4 {
                 return None;
             }
@@ -4551,6 +4587,12 @@ pub(crate) fn inline_memcpy_len(func: &str, info: &CallInfo) -> Option<usize> {
         }
         _ => None,
     }
+}
+
+/// Whether the fixed-size expansion of this call must be overlap-safe
+/// (`memmove`/`__memmove_chk`) rather than a plain `memcpy` lowering.
+pub(crate) fn is_memmove_libcall(func: &str) -> bool {
+    matches!(func, "memmove" | "__memmove_chk")
 }
 
 /// `Some(n)` if this call is a fixed-size `memset` / `__memset_chk` whose
@@ -6735,21 +6777,37 @@ fn generate_instruction_body(
             clobber_after_call_like(cg);
         }
         Instruction::Call { func, info } => {
-            // Inline fixed-size memcpy only. memmove is NOT inlined (overlap).
+            // Inline fixed-size memcpy and memmove (the latter through the
+            // backend's overlap-safe expansion).  __memcpy_chk /
+            // __memmove_chk are inlined only when destlen covers n.
             // GATE ON BACKEND SUPPORT: the trait default of
             // emit_inline_memcpy_call is an EMPTY body.
-            // __memcpy_chk is inlined only when destlen covers n.
             let inline_len = if cg.supports_inline_memcpy_call() {
                 inline_memcpy_len(func.as_str(), info)
             } else {
                 None
             };
             if let Some(size) = inline_len {
-                // memcpy / __memcpy_chk return dest.  The backend stores it
-                // (it must be captured before the expansion clobbers the
-                // operand registers); an unused result is not materialised.
+                // memcpy / memmove (and their __*_chk spellings) return
+                // dest.  The backend stores it (it must be captured before
+                // the expansion clobbers the operand registers); an unused
+                // result is not materialised.
                 let result = info.dest.filter(|d| call_result_is_used(cg, d));
-                cg.emit_inline_memcpy_call(&info.args[0], &info.args[1], size, result.as_ref());
+                if is_memmove_libcall(func.as_str()) {
+                    cg.emit_inline_memmove_call(
+                        &info.args[0],
+                        &info.args[1],
+                        size,
+                        result.as_ref(),
+                    );
+                } else {
+                    cg.emit_inline_memcpy_call(
+                        &info.args[0],
+                        &info.args[1],
+                        size,
+                        result.as_ref(),
+                    );
+                }
                 clobber_after_call_like(cg);
                 if let Some(d) = defined_dest {
                     cg.note_dest_defined(&d);
