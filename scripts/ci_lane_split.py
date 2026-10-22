@@ -433,9 +433,18 @@ def join_lanes(args) -> int:
         out = [line.replace(f"  {shard}:", f"  {args.job}:", 1) for line in header]
         for index, line in enumerate(out):
             if line.startswith("    name: "):
-                out[index] = re.sub(r" \(shard [a-z]+ of \d+\)\s*$", "\n", line)
+                out[index] = re.sub(r" \(shard [a-z]+(?: of \d+)?\)\s*$", "\n", line)
                 break
         return out
+
+    # Shell-mode shards are ONE step each, and their gate list lives inside its
+    # run body: joining them step-wise would produce two steps that each claim
+    # to be the whole lane.  `--mode shell` already unions the bodies and
+    # rewrites the wrapper, so it is the tool for that shape.
+    if any(re.search(r"\(shard [a-z] of \d+\)", step_name(block))
+           for _h, _p, shard_gates, _t in parsed for block in shard_gates):
+        raise SystemExit(f"{args.job}: these are shell-mode shards; re-balance them "
+                         "with --mode shell, which unions the run bodies in place")
 
     head, preamble, gates, tail = parsed[0]
     joined = normalise(present[0], head)

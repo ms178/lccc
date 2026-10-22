@@ -2066,6 +2066,15 @@ gate "fma-peel-invariant" fast \
 gate "env-test-hygiene" fast \
     bash tests/regression/check_env_test_hygiene.sh
 
+# `LCCC_IFCONV_ARM_BUDGET` is an A/B lever, and its contract is what keeps the
+# numbers comparable: =1 tightens, off/full disable, an unparsable value is
+# inert.  The gate also pins that the switch is resolved at the pipeline
+# boundary (`src/passes/mod.rs`, which the env-read ratchet excludes) and not
+# in the pass body -- reading it there is what put the ratchet one over budget
+# when it landed.
+gate "ifconv-arm-budget-switch" fast \
+    env CCC="$LCCC" bash tests/regression/check_ifconv_arm_budget_switch.sh
+
 # The peephole used to change its mind about a line because of a trailing blank:
 # a padded load stopped forwarding the constant store above it (lccc's own
 # sha256 output), the %rcx address-copy fold was lost when the CONSUMER line was
