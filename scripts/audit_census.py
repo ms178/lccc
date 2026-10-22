@@ -563,6 +563,7 @@ def census() -> dict[str, object]:
         {
             "files": files,
             "knob_literals": len(knobs),
+            "knob_names": sorted(knobs),
             "knobs_undocumented": len(knobs - documented),
             "knob_undocumented_names": sorted(knobs - documented),
         }
@@ -631,6 +632,12 @@ def cmd_check(current: dict[str, object]) -> int:
         print("FAIL: audit census grew:", file=sys.stderr)
         for line in grown:
             print(f"  {line}", file=sys.stderr)
+        known = baseline.get("knob_names")
+        if known is not None and current.get("knob_names") is not None:
+            for name in sorted(set(current["knob_names"]) - set(known)):
+                print(f"  new knob: {name}", file=sys.stderr)
+            for name in sorted(set(known) - set(current["knob_names"])):
+                print(f"  knob gone: {name}", file=sys.stderr)
         print(
             "Lower the counts, or justify and re-baseline in the commit that adds them.",
             file=sys.stderr,
@@ -643,6 +650,9 @@ def cmd_check(current: dict[str, object]) -> int:
 def cmd_update(current: dict[str, object]) -> int:
     baseline = load_baseline()
     payload = {key: current[key] for key in RATCHETED}
+    # Diagnostic only (never ratcheted): when a later --check sees the knob
+    # count move, it can name the exact knobs instead of just the delta.
+    payload["knob_names"] = current["knob_names"]
     old = {key: baseline.get(key) for key in RATCHETED}
     increased = [k for k in RATCHETED if old.get(k) is not None and payload[k] > old[k]]
     BASELINE.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
