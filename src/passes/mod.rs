@@ -16,6 +16,8 @@ use policy::fp_environment_blocks_reordering;
 
 mod address_form;
 pub(crate) mod aggregate_copy_forward;
+pub(crate) mod aggregate_pair_roundtrip;
+
 pub(crate) mod aggregate_sroa;
 pub(crate) mod alias;
 pub(crate) mod arx_vectorize;
@@ -1249,7 +1251,10 @@ fn vectorize_entry(
     fp_contract: FpContract,
     x86_avx: bool,
 ) -> fn(&mut IrFunction) -> usize {
-    match (target, fp_reassoc, fp_contract, x86_avx) {
+    // Snapshot the fixed-SLP ablation at pipeline entry, alongside its ISA
+    // permission, instead of rereading process state inside each matcher.
+    let fixed_slp = x86_avx && std::env::var("CCC_NO_FIXED_SLP").is_err();
+    match (target, fp_reassoc, fp_contract, fixed_slp) {
         (crate::backend::Target::Aarch64, true, _, _) => {
             vectorize::vectorize_function_two_wide_fast_math
         }
@@ -3552,6 +3557,18 @@ pub(crate) fn run_passes(
         }
     }
 
+    // Phase 11a: 16-byte aggregate round-trip collapse (`aggcopy16`). An
+    // inlined SSE intrinsic returns its `__m128*` value in the SysV
+    // register-pair carrier (packed as I128), so every such copy lowers to a
+    // load/load/shl/or + shr/store/store sequence.  Collapsing it to the
+    // intrinsic 128-bit copy pair is what lets the existing `movdqu` lowering
+    // and memory-operand folding see the copy at all; see
+    // engineering/SSE2-CODEGEN-MATRIX.md.
+    if !pass_disabled(&disabled, "aggcopy16") {
+        module.for_each_function(aggregate_pair_roundtrip::run);
+        verify::verify_after_pass(module, "aggcopy16");
+    }
+
     // Phase 11a': Whole-vector SSA promotion. GNU-vector objects that the
     // SIMD lowering touches only through full-width VecLoad/VecStore pairs
     // leave memory here (mem2reg for register images); the cleanups below
@@ -4179,6 +4196,32 @@ mod signed_wrap_policy_tests {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fixed_slp_entry_policy_tests {
+    use super::*;
+    use crate::test_support::EnvGuard;
+
+    #[test]
+    fn fixed_slp_ablation_preserves_loop_policy_and_target_entry() {
+        for contract in [FpContract::Off, FpContract::Fast] {
+            let _guard = EnvGuard::unset("CCC_NO_FIXED_SLP");
+            let enabled = vectorize_entry(crate::backend::Target::X86_64, true, contract, true);
+            let no_avx = vectorize_entry(crate::backend::Target::X86_64, true, contract, false);
+            let arm = vectorize_entry(crate::backend::Target::Aarch64, true, contract, true);
+            assert!(!std::ptr::fn_addr_eq(enabled, no_avx));
+            let _disabled = EnvGuard::set("CCC_NO_FIXED_SLP", "1");
+            assert!(std::ptr::fn_addr_eq(
+                vectorize_entry(crate::backend::Target::X86_64, true, contract, true),
+                no_avx,
+            ));
+            assert!(std::ptr::fn_addr_eq(
+                vectorize_entry(crate::backend::Target::Aarch64, true, contract, true),
+                arm,
+            ));
         }
     }
 }

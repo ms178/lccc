@@ -1,0 +1,3297 @@
+{
+ "configs": [
+  "O2"
+ ],
+ "counts": {
+  "addpd": {
+   "O2": 31
+  },
+  "addps": {
+   "O2": 31
+  },
+  "addsd": {
+   "O2": 80
+  },
+  "addss": {
+   "O2": 59
+  },
+  "andnpd": {
+   "O2": 31
+  },
+  "andnps": {
+   "O2": 31
+  },
+  "andpd": {
+   "O2": 31
+  },
+  "andps": {
+   "O2": 31
+  },
+  "cmpeqpd": {
+   "O2": 33
+  },
+  "cmpeqps": {
+   "O2": 33
+  },
+  "cmpgtpd": {
+   "O2": 35
+  },
+  "cmpgtps": {
+   "O2": 35
+  },
+  "cmpltpd": {
+   "O2": 33
+  },
+  "cmpltps": {
+   "O2": 33
+  },
+  "cvtdq2pd": {
+   "O2": 24
+  },
+  "cvtdq2ps": {
+   "O2": 24
+  },
+  "cvtpd2dq": {
+   "O2": 25
+  },
+  "cvtps2dq": {
+   "O2": 25
+  },
+  "cvtsd2si": {
+   "O2": 29
+  },
+  "cvtsd2ss": {
+   "O2": 24
+  },
+  "cvtsi2sd": {
+   "O2": 21
+  },
+  "cvtsi2ss": {
+   "O2": 20
+  },
+  "cvtss2sd": {
+   "O2": 24
+  },
+  "cvttpd2dq": {
+   "O2": 25
+  },
+  "cvttps2dq": {
+   "O2": 25
+  },
+  "cvttsd2si": {
+   "O2": 29
+  },
+  "divpd": {
+   "O2": 37
+  },
+  "divps": {
+   "O2": 37
+  },
+  "divsd": {
+   "O2": 80
+  },
+  "divss": {
+   "O2": 59
+  },
+  "matmul_ikj": {
+   "O2": 65
+  },
+  "maxpd": {
+   "O2": 37
+  },
+  "maxps": {
+   "O2": 37
+  },
+  "maxsd": {
+   "O2": 84
+  },
+  "minpd": {
+   "O2": 37
+  },
+  "minps": {
+   "O2": 37
+  },
+  "minsd": {
+   "O2": 82
+  },
+  "movapd": {
+   "O2": 23
+  },
+  "movdqa": {
+   "O2": 13
+  },
+  "movmskpd": {
+   "O2": 39
+  },
+  "mulpd": {
+   "O2": 31
+  },
+  "mulps": {
+   "O2": 31
+  },
+  "mulsd": {
+   "O2": 80
+  },
+  "mulss": {
+   "O2": 59
+  },
+  "orpd": {
+   "O2": 31
+  },
+  "orps": {
+   "O2": 31
+  },
+  "packssdw": {
+   "O2": 14
+  },
+  "packsswb": {
+   "O2": 14
+  },
+  "packuswb": {
+   "O2": 14
+  },
+  "paddb": {
+   "O2": 14
+  },
+  "paddd": {
+   "O2": 14
+  },
+  "paddq": {
+   "O2": 14
+  },
+  "paddsb": {
+   "O2": 14
+  },
+  "paddsw": {
+   "O2": 14
+  },
+  "paddusb": {
+   "O2": 14
+  },
+  "paddusw": {
+   "O2": 14
+  },
+  "paddw": {
+   "O2": 14
+  },
+  "pand": {
+   "O2": 14
+  },
+  "pandn": {
+   "O2": 14
+  },
+  "pavgb": {
+   "O2": 14
+  },
+  "pavgw": {
+   "O2": 14
+  },
+  "pcmpeqb": {
+   "O2": 14
+  },
+  "pcmpeqd": {
+   "O2": 14
+  },
+  "pcmpeqw": {
+   "O2": 14
+  },
+  "pcmpgtb": {
+   "O2": 14
+  },
+  "pcmpgtd": {
+   "O2": 14
+  },
+  "pcmpgtw": {
+   "O2": 14
+  },
+  "pmaddwd": {
+   "O2": 14
+  },
+  "pmaxub": {
+   "O2": 14
+  },
+  "pminsw": {
+   "O2": 14
+  },
+  "pmulhuw": {
+   "O2": 14
+  },
+  "pmulhw": {
+   "O2": 14
+  },
+  "pmullw": {
+   "O2": 14
+  },
+  "pmuludq": {
+   "O2": 14
+  },
+  "por": {
+   "O2": 14
+  },
+  "psadbw": {
+   "O2": 14
+  },
+  "pshufd": {
+   "O2": 14
+  },
+  "pshufhw": {
+   "O2": 14
+  },
+  "pshuflw": {
+   "O2": 14
+  },
+  "pslld": {
+   "O2": 14
+  },
+  "pslldq": {
+   "O2": 14
+  },
+  "psllq": {
+   "O2": 14
+  },
+  "psllw": {
+   "O2": 14
+  },
+  "psrad": {
+   "O2": 14
+  },
+  "psraw": {
+   "O2": 14
+  },
+  "psrld": {
+   "O2": 14
+  },
+  "psrldq": {
+   "O2": 14
+  },
+  "psrlq": {
+   "O2": 14
+  },
+  "psrlw": {
+   "O2": 14
+  },
+  "psubb": {
+   "O2": 14
+  },
+  "psubd": {
+   "O2": 14
+  },
+  "psubq": {
+   "O2": 14
+  },
+  "psubsb": {
+   "O2": 14
+  },
+  "psubsw": {
+   "O2": 14
+  },
+  "psubusb": {
+   "O2": 14
+  },
+  "psubusw": {
+   "O2": 14
+  },
+  "psubw": {
+   "O2": 14
+  },
+  "punpckhbw": {
+   "O2": 14
+  },
+  "punpckhdq": {
+   "O2": 14
+  },
+  "punpckhqdq": {
+   "O2": 14
+  },
+  "punpckhwd": {
+   "O2": 14
+  },
+  "punpcklbw": {
+   "O2": 14
+  },
+  "punpckldq": {
+   "O2": 14
+  },
+  "punpcklqdq": {
+   "O2": 14
+  },
+  "punpcklwd": {
+   "O2": 14
+  },
+  "pxor": {
+   "O2": 14
+  },
+  "shufpd": {
+   "O2": 33
+  },
+  "shufps": {
+   "O2": 33
+  },
+  "sqrtpd": {
+   "O2": 24
+  },
+  "sqrtps": {
+   "O2": 24
+  },
+  "sqrtsd": {
+   "O2": 85
+  },
+  "sqrtss": {
+   "O2": 28
+  },
+  "subpd": {
+   "O2": 31
+  },
+  "subps": {
+   "O2": 31
+  },
+  "subsd": {
+   "O2": 80
+  },
+  "subss": {
+   "O2": 59
+  },
+  "unpckhpd": {
+   "O2": 37
+  },
+  "unpckhps": {
+   "O2": 37
+  },
+  "unpcklpd": {
+   "O2": 37
+  },
+  "unpcklps": {
+   "O2": 37
+  },
+  "xorpd": {
+   "O2": 31
+  },
+  "xorps": {
+   "O2": 31
+  }
+ },
+ "debt": {
+  "addpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 31
+   }
+  },
+  "addps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 31
+   }
+  },
+  "addsd": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 80
+   }
+  },
+  "addss": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 59
+   }
+  },
+  "andnpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 31
+   }
+  },
+  "andnps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 31
+   }
+  },
+  "andpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 31
+   }
+  },
+  "andps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 31
+   }
+  },
+  "cmpeqpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 33
+   }
+  },
+  "cmpeqps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 33
+   }
+  },
+  "cmpgtpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 35
+   }
+  },
+  "cmpgtps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 35
+   }
+  },
+  "cmpltpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 33
+   }
+  },
+  "cmpltps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 33
+   }
+  },
+  "cvtdq2pd": {
+   "O2": {
+    "best_oracle": 10,
+    "lccc": 24
+   }
+  },
+  "cvtdq2ps": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 24
+   }
+  },
+  "cvtpd2dq": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 25
+   }
+  },
+  "cvtps2dq": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 25
+   }
+  },
+  "cvtsd2si": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 29
+   }
+  },
+  "cvtsd2ss": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 24
+   }
+  },
+  "cvtsi2sd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 21
+   }
+  },
+  "cvtsi2ss": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 20
+   }
+  },
+  "cvtss2sd": {
+   "O2": {
+    "best_oracle": 10,
+    "lccc": 24
+   }
+  },
+  "cvttpd2dq": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 25
+   }
+  },
+  "cvttps2dq": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 25
+   }
+  },
+  "cvttsd2si": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 29
+   }
+  },
+  "divpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 37
+   }
+  },
+  "divps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 37
+   }
+  },
+  "divsd": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 80
+   }
+  },
+  "divss": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 59
+   }
+  },
+  "matmul_ikj": {
+   "O2": {
+    "best_oracle": 16,
+    "lccc": 65
+   }
+  },
+  "maxpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 37
+   }
+  },
+  "maxps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 37
+   }
+  },
+  "maxsd": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 84
+   }
+  },
+  "minpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 37
+   }
+  },
+  "minps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 37
+   }
+  },
+  "minsd": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 82
+   }
+  },
+  "movapd": {
+   "O2": {
+    "best_oracle": 8,
+    "lccc": 23
+   }
+  },
+  "movdqa": {
+   "O2": {
+    "best_oracle": 8,
+    "lccc": 13
+   }
+  },
+  "movmskpd": {
+   "O2": {
+    "best_oracle": 15,
+    "lccc": 39
+   }
+  },
+  "mulpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 31
+   }
+  },
+  "mulps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 31
+   }
+  },
+  "mulsd": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 80
+   }
+  },
+  "mulss": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 59
+   }
+  },
+  "orpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 31
+   }
+  },
+  "orps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 31
+   }
+  },
+  "packssdw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "packsswb": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "packuswb": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "paddb": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "paddd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "paddq": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "paddsb": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "paddsw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "paddusb": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "paddusw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "paddw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pand": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pandn": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pavgb": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pavgw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pcmpeqb": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pcmpeqd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pcmpeqw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pcmpgtb": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pcmpgtd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pcmpgtw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pmaddwd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pmaxub": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pminsw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pmulhuw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pmulhw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pmullw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pmuludq": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "por": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "psadbw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pshufd": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 14
+   }
+  },
+  "pshufhw": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 14
+   }
+  },
+  "pshuflw": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 14
+   }
+  },
+  "pslld": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 14
+   }
+  },
+  "pslldq": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 14
+   }
+  },
+  "psllq": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 14
+   }
+  },
+  "psllw": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 14
+   }
+  },
+  "psrad": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 14
+   }
+  },
+  "psraw": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 14
+   }
+  },
+  "psrld": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 14
+   }
+  },
+  "psrldq": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 14
+   }
+  },
+  "psrlq": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 14
+   }
+  },
+  "psrlw": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 14
+   }
+  },
+  "psubb": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "psubd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "psubq": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "psubsb": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "psubsw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "psubusb": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "psubusw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "psubw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "punpckhbw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "punpckhdq": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "punpckhqdq": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "punpckhwd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "punpcklbw": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "punpckldq": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "punpcklqdq": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "punpcklwd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "pxor": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 14
+   }
+  },
+  "shufpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 33
+   }
+  },
+  "shufps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 33
+   }
+  },
+  "sqrtpd": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 24
+   }
+  },
+  "sqrtps": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 24
+   }
+  },
+  "sqrtsd": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 85
+   }
+  },
+  "sqrtss": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 28
+   }
+  },
+  "subpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 31
+   }
+  },
+  "subps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 31
+   }
+  },
+  "subsd": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 80
+   }
+  },
+  "subss": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 59
+   }
+  },
+  "unpckhpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 37
+   }
+  },
+  "unpckhps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 37
+   }
+  },
+  "unpcklpd": {
+   "O2": {
+    "best_oracle": 11,
+    "lccc": 37
+   }
+  },
+  "unpcklps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 37
+   }
+  },
+  "xorpd": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 31
+   }
+  },
+  "xorps": {
+   "O2": {
+    "best_oracle": 12,
+    "lccc": 31
+   }
+  }
+ },
+ "mnemonics": {
+  "addpd": {
+   "O2": [
+    "addl",
+    "addpd",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "addps": {
+   "O2": [
+    "addl",
+    "addps",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "addsd": {
+   "O2": [
+    "addl",
+    "addq",
+    "addsd",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "movq",
+    "movslq",
+    "orq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "addss": {
+   "O2": [
+    "addl",
+    "addq",
+    "addss",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "movss",
+    "orq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "andnpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "pandn",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "andnps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "pandn",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "andpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "pand",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "andps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "pand",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cmpeqpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cmppd",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cmpeqps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cmpps",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cmpgtpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cmppd",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cmpgtps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cmpps",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cmpltpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cmppd",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cmpltps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cmpps",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cvtdq2pd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cvtdq2pd",
+    "leal",
+    "leaq",
+    "movdqu",
+    "movq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cvtdq2ps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cvtdq2ps",
+    "leal",
+    "leaq",
+    "movdqu",
+    "movq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cvtpd2dq": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cvtpd2dq",
+    "leal",
+    "leaq",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cvtps2dq": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cvtps2dq",
+    "leal",
+    "leaq",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cvtsd2si": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cvtsd2si",
+    "leal",
+    "leaq",
+    "movd",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pshufd",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cvtsd2ss": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cvtpd2ps",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cvtsi2sd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cvtsi2sd",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "pxor",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cvtsi2ss": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cvtsi2ss",
+    "leal",
+    "movdqu",
+    "movq",
+    "popq",
+    "pushq",
+    "pxor",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cvtss2sd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cvtps2pd",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cvttpd2dq": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cvttpd2dq",
+    "leal",
+    "leaq",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cvttps2dq": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cvttps2dq",
+    "leal",
+    "leaq",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "cvttsd2si": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cvttsd2si",
+    "leal",
+    "leaq",
+    "movd",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pshufd",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "divpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "divpd",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "divps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "divps",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "divsd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "divsd",
+    "leal",
+    "leaq",
+    "movdqu",
+    "movq",
+    "movslq",
+    "orq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "divss": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "divss",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "movss",
+    "orq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "matmul_ikj": {
+   "O2": [
+    "addpd",
+    "addq",
+    "addsd",
+    "cltq",
+    "cmpq",
+    "jmp",
+    "leal",
+    "leaq",
+    "movq",
+    "movsd",
+    "movslq",
+    "movupd",
+    "mulpd",
+    "mulsd",
+    "popq",
+    "pushq",
+    "ret",
+    "shlq",
+    "subq",
+    "unpcklpd",
+    "xorl"
+   ]
+  },
+  "maxpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "maxpd",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "maxps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "maxps",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "maxsd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmovaq",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "movq",
+    "movslq",
+    "orq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "ucomisd",
+    "xorl"
+   ]
+  },
+  "minpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "minpd",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "minps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "minps",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "minsd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmovaq",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "movq",
+    "movslq",
+    "orq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "ucomisd",
+    "xorl"
+   ]
+  },
+  "movapd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "movdqa": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "ret",
+    "xorl"
+   ]
+  },
+  "movmskpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "cmppd",
+    "leal",
+    "movd",
+    "movdqu",
+    "movmskpd",
+    "movq",
+    "movslq",
+    "popq",
+    "pshufd",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "mulpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "mulpd",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "mulps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "mulps",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "mulsd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "movq",
+    "movslq",
+    "mulsd",
+    "orq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "mulss": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "movss",
+    "mulss",
+    "orq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "orpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "por",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "orps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "por",
+    "pushq",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "packssdw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "packssdw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "packsswb": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "packsswb",
+    "ret",
+    "xorl"
+   ]
+  },
+  "packuswb": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "packuswb",
+    "ret",
+    "xorl"
+   ]
+  },
+  "paddb": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "paddb",
+    "ret",
+    "xorl"
+   ]
+  },
+  "paddd": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "paddd",
+    "ret",
+    "xorl"
+   ]
+  },
+  "paddq": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "paddq",
+    "ret",
+    "xorl"
+   ]
+  },
+  "paddsb": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "paddsb",
+    "ret",
+    "xorl"
+   ]
+  },
+  "paddsw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "paddsw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "paddusb": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "paddusb",
+    "ret",
+    "xorl"
+   ]
+  },
+  "paddusw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "paddusw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "paddw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "paddw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pand": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pand",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pandn": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pandn",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pavgb": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pavgb",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pavgw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pavgw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pcmpeqb": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pcmpeqb",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pcmpeqd": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pcmpeqd",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pcmpeqw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pcmpeqw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pcmpgtb": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pcmpgtb",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pcmpgtd": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pcmpgtd",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pcmpgtw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pcmpgtw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pmaddwd": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pmaddwd",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pmaxub": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pmaxub",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pminsw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pminsw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pmulhuw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pmulhuw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pmulhw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pmulhw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pmullw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pmullw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pmuludq": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pmuludq",
+    "ret",
+    "xorl"
+   ]
+  },
+  "por": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "por",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psadbw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psadbw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pshufd": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pshufd",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pshufhw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pshufhw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pshuflw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pshuflw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pslld": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pslld",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pslldq": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pslldq",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psllq": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psllq",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psllw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psllw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psrad": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psrad",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psraw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psraw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psrld": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psrld",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psrldq": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psrldq",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psrlq": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psrlq",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psrlw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psrlw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psubb": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psubb",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psubd": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psubd",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psubq": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psubq",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psubsb": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psubsb",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psubsw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psubsw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psubusb": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psubusb",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psubusw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psubusw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "psubw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "psubw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "punpckhbw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "punpckhbw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "punpckhdq": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "punpckhdq",
+    "ret",
+    "xorl"
+   ]
+  },
+  "punpckhqdq": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "punpckhqdq",
+    "ret",
+    "xorl"
+   ]
+  },
+  "punpckhwd": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "punpckhwd",
+    "ret",
+    "xorl"
+   ]
+  },
+  "punpcklbw": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "punpcklbw",
+    "ret",
+    "xorl"
+   ]
+  },
+  "punpckldq": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "punpckldq",
+    "ret",
+    "xorl"
+   ]
+  },
+  "punpcklqdq": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "punpcklqdq",
+    "ret",
+    "xorl"
+   ]
+  },
+  "punpcklwd": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "punpcklwd",
+    "ret",
+    "xorl"
+   ]
+  },
+  "pxor": {
+   "O2": [
+    "addl",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "pxor",
+    "ret",
+    "xorl"
+   ]
+  },
+  "shufpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "shufpd",
+    "subq",
+    "xorl"
+   ]
+  },
+  "shufps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "shufps",
+    "subq",
+    "xorl"
+   ]
+  },
+  "sqrtpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "sqrtpd",
+    "subq",
+    "xorl"
+   ]
+  },
+  "sqrtps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "sqrtps",
+    "subq",
+    "xorl"
+   ]
+  },
+  "sqrtsd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "movq",
+    "movsd",
+    "movslq",
+    "orq",
+    "popq",
+    "pushq",
+    "ret",
+    "sqrtsd",
+    "subq",
+    "xorl"
+   ]
+  },
+  "sqrtss": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "movss",
+    "popq",
+    "pushq",
+    "ret",
+    "sqrtss",
+    "subq",
+    "xorl"
+   ]
+  },
+  "subpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subpd",
+    "subq",
+    "xorl"
+   ]
+  },
+  "subps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subps",
+    "subq",
+    "xorl"
+   ]
+  },
+  "subsd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "leaq",
+    "movdqu",
+    "movq",
+    "movslq",
+    "orq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "subsd",
+    "xorl"
+   ]
+  },
+  "subss": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "movss",
+    "orq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "subss",
+    "xorl"
+   ]
+  },
+  "unpckhpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "unpckhpd",
+    "xorl"
+   ]
+  },
+  "unpckhps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "unpckhps",
+    "xorl"
+   ]
+  },
+  "unpcklpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "unpcklpd",
+    "xorl"
+   ]
+  },
+  "unpcklps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "ret",
+    "subq",
+    "unpcklps",
+    "xorl"
+   ]
+  },
+  "xorpd": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "pxor",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  },
+  "xorps": {
+   "O2": [
+    "addl",
+    "addq",
+    "cmpl",
+    "leal",
+    "movdqu",
+    "movq",
+    "movslq",
+    "popq",
+    "pushq",
+    "pxor",
+    "ret",
+    "subq",
+    "xorl"
+   ]
+  }
+ },
+ "toolchains": {
+  "clang": "clang version 23.1.3 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)",
+  "gcc": "gcc-16 (GCC) 16.2.0",
+  "lccc": "lccc (a high performance Claude's C Compiler fork, GCC-compatible) 14.2.0"
+ },
+ "verdicts": {
+  "addpd": {
+   "O2": "loss"
+  },
+  "addps": {
+   "O2": "loss"
+  },
+  "addsd": {
+   "O2": "loss"
+  },
+  "addss": {
+   "O2": "loss"
+  },
+  "andnpd": {
+   "O2": "loss"
+  },
+  "andnps": {
+   "O2": "loss"
+  },
+  "andpd": {
+   "O2": "loss"
+  },
+  "andps": {
+   "O2": "loss"
+  },
+  "cmpeqpd": {
+   "O2": "loss"
+  },
+  "cmpeqps": {
+   "O2": "loss"
+  },
+  "cmpgtpd": {
+   "O2": "loss"
+  },
+  "cmpgtps": {
+   "O2": "loss"
+  },
+  "cmpltpd": {
+   "O2": "loss"
+  },
+  "cmpltps": {
+   "O2": "loss"
+  },
+  "cvtdq2pd": {
+   "O2": "loss"
+  },
+  "cvtdq2ps": {
+   "O2": "loss"
+  },
+  "cvtpd2dq": {
+   "O2": "loss"
+  },
+  "cvtps2dq": {
+   "O2": "loss"
+  },
+  "cvtsd2si": {
+   "O2": "loss"
+  },
+  "cvtsd2ss": {
+   "O2": "loss"
+  },
+  "cvtsi2sd": {
+   "O2": "loss"
+  },
+  "cvtsi2ss": {
+   "O2": "loss"
+  },
+  "cvtss2sd": {
+   "O2": "loss"
+  },
+  "cvttpd2dq": {
+   "O2": "loss"
+  },
+  "cvttps2dq": {
+   "O2": "loss"
+  },
+  "cvttsd2si": {
+   "O2": "loss"
+  },
+  "divpd": {
+   "O2": "loss"
+  },
+  "divps": {
+   "O2": "loss"
+  },
+  "divsd": {
+   "O2": "loss"
+  },
+  "divss": {
+   "O2": "loss"
+  },
+  "matmul_ikj": {
+   "O2": "loss"
+  },
+  "maxpd": {
+   "O2": "loss"
+  },
+  "maxps": {
+   "O2": "loss"
+  },
+  "maxsd": {
+   "O2": "loss"
+  },
+  "minpd": {
+   "O2": "loss"
+  },
+  "minps": {
+   "O2": "loss"
+  },
+  "minsd": {
+   "O2": "loss"
+  },
+  "movapd": {
+   "O2": "loss"
+  },
+  "movdqa": {
+   "O2": "loss"
+  },
+  "movmskpd": {
+   "O2": "loss"
+  },
+  "mulpd": {
+   "O2": "loss"
+  },
+  "mulps": {
+   "O2": "loss"
+  },
+  "mulsd": {
+   "O2": "loss"
+  },
+  "mulss": {
+   "O2": "loss"
+  },
+  "orpd": {
+   "O2": "loss"
+  },
+  "orps": {
+   "O2": "loss"
+  },
+  "packssdw": {
+   "O2": "loss"
+  },
+  "packsswb": {
+   "O2": "loss"
+  },
+  "packuswb": {
+   "O2": "loss"
+  },
+  "paddb": {
+   "O2": "loss"
+  },
+  "paddd": {
+   "O2": "loss"
+  },
+  "paddq": {
+   "O2": "loss"
+  },
+  "paddsb": {
+   "O2": "loss"
+  },
+  "paddsw": {
+   "O2": "loss"
+  },
+  "paddusb": {
+   "O2": "loss"
+  },
+  "paddusw": {
+   "O2": "loss"
+  },
+  "paddw": {
+   "O2": "loss"
+  },
+  "pand": {
+   "O2": "loss"
+  },
+  "pandn": {
+   "O2": "loss"
+  },
+  "pavgb": {
+   "O2": "loss"
+  },
+  "pavgw": {
+   "O2": "loss"
+  },
+  "pcmpeqb": {
+   "O2": "loss"
+  },
+  "pcmpeqd": {
+   "O2": "loss"
+  },
+  "pcmpeqw": {
+   "O2": "loss"
+  },
+  "pcmpgtb": {
+   "O2": "loss"
+  },
+  "pcmpgtd": {
+   "O2": "loss"
+  },
+  "pcmpgtw": {
+   "O2": "loss"
+  },
+  "pmaddwd": {
+   "O2": "loss"
+  },
+  "pmaxub": {
+   "O2": "loss"
+  },
+  "pminsw": {
+   "O2": "loss"
+  },
+  "pmulhuw": {
+   "O2": "loss"
+  },
+  "pmulhw": {
+   "O2": "loss"
+  },
+  "pmullw": {
+   "O2": "loss"
+  },
+  "pmuludq": {
+   "O2": "loss"
+  },
+  "por": {
+   "O2": "loss"
+  },
+  "psadbw": {
+   "O2": "loss"
+  },
+  "pshufd": {
+   "O2": "loss"
+  },
+  "pshufhw": {
+   "O2": "loss"
+  },
+  "pshuflw": {
+   "O2": "loss"
+  },
+  "pslld": {
+   "O2": "loss"
+  },
+  "pslldq": {
+   "O2": "loss"
+  },
+  "psllq": {
+   "O2": "loss"
+  },
+  "psllw": {
+   "O2": "loss"
+  },
+  "psrad": {
+   "O2": "loss"
+  },
+  "psraw": {
+   "O2": "loss"
+  },
+  "psrld": {
+   "O2": "loss"
+  },
+  "psrldq": {
+   "O2": "loss"
+  },
+  "psrlq": {
+   "O2": "loss"
+  },
+  "psrlw": {
+   "O2": "loss"
+  },
+  "psubb": {
+   "O2": "loss"
+  },
+  "psubd": {
+   "O2": "loss"
+  },
+  "psubq": {
+   "O2": "loss"
+  },
+  "psubsb": {
+   "O2": "loss"
+  },
+  "psubsw": {
+   "O2": "loss"
+  },
+  "psubusb": {
+   "O2": "loss"
+  },
+  "psubusw": {
+   "O2": "loss"
+  },
+  "psubw": {
+   "O2": "loss"
+  },
+  "punpckhbw": {
+   "O2": "loss"
+  },
+  "punpckhdq": {
+   "O2": "loss"
+  },
+  "punpckhqdq": {
+   "O2": "loss"
+  },
+  "punpckhwd": {
+   "O2": "loss"
+  },
+  "punpcklbw": {
+   "O2": "loss"
+  },
+  "punpckldq": {
+   "O2": "loss"
+  },
+  "punpcklqdq": {
+   "O2": "loss"
+  },
+  "punpcklwd": {
+   "O2": "loss"
+  },
+  "pxor": {
+   "O2": "loss"
+  },
+  "shufpd": {
+   "O2": "loss"
+  },
+  "shufps": {
+   "O2": "loss"
+  },
+  "sqrtpd": {
+   "O2": "loss"
+  },
+  "sqrtps": {
+   "O2": "loss"
+  },
+  "sqrtsd": {
+   "O2": "loss"
+  },
+  "sqrtss": {
+   "O2": "loss"
+  },
+  "subpd": {
+   "O2": "loss"
+  },
+  "subps": {
+   "O2": "loss"
+  },
+  "subsd": {
+   "O2": "loss"
+  },
+  "subss": {
+   "O2": "loss"
+  },
+  "unpckhpd": {
+   "O2": "loss"
+  },
+  "unpckhps": {
+   "O2": "loss"
+  },
+  "unpcklpd": {
+   "O2": "loss"
+  },
+  "unpcklps": {
+   "O2": "loss"
+  },
+  "xorpd": {
+   "O2": "loss"
+  },
+  "xorps": {
+   "O2": "loss"
+  }
+ }
+}

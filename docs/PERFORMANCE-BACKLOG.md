@@ -47,3 +47,37 @@ Two items are recorded as **closed**, so they are not re-litigated:
 within noise of gcc in `i686_alu_chains` (`sdr7` 4.39 vs 4.43 ns); and the
 `byte_load_reassembly` hot loop *does* fold its byte loads — the residual 20 %
 is gcc's SSE2 vectorisation of the 32-byte block, not load reassembly.
+
+## 2026-10-22: workload timing-floor calibration
+
+The new match-search/list-sort workloads previously ran in approximately
+1.6 ms (`gzip_longest_match`), 7.1 ms (`linux_list_sort`), and 12–16 ms
+(`zstd_double_fast`) with the local GCC 16.2/Clang 23.1.3 builds. Those are
+process-wall measurements, not isolated kernel timings. Default `PASSES` is
+now 8192, 128, and 512 respectively; bounded Callgrind sizes still explicitly
+select `PASSES=1` and are unchanged.
+
+A pinned, randomized-order, 15-round run of the repository benchmark runner
+(with two excluded warmups per arm) produced:
+
+| workload | LCCC median | GCC 16.2 median | Clang 23.1.3 median |
+|---|---:|---:|---:|
+| gzip_longest_match | 103.91 ms | 87.88 ms | 79.98 ms |
+| linux_list_sort | 268.63 ms | 180.17 ms | 180.62 ms |
+| zstd_double_fast | 235.94 ms | 239.23 ms | 231.25 ms |
+
+All nine compiler/workload results agreed. The original startup-floor problem
+is removed on this host: even the fastest arm now exceeds 50 ms. **These are
+not performance-acceptance results:** compiler builds and CI shared this
+2-vCPU host, and per-arm coefficients of variation remained 11.6–25.6%.
+Retain every sample and rerun on a quiet host before making speedup claims.
+GCC ASan/UBSan runs also completed with the longer default workloads.
+
+Reproduce (no ICX substitution is implied when that compiler is unavailable):
+
+```sh
+python3 tests/benchmark/run_benchmarks.py \
+  --only gzip_longest_match,linux_list_sort,zstd_double_fast \
+  --compilers lccc,gcc,clang --gcc gcc-16 --clang clang-23 \
+  --reps 15 --strict --no-pmu-probe --json /tmp/workload-timings.json
+```

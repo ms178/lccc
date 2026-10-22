@@ -305,7 +305,6 @@ pub(super) fn lccc_simd_lookup(
         "cvttss2si128" => s1(Scalar, CvttSs2Si128),
         "cvttsd2si128" => s1(Scalar, CvttSd2Si128),
         "cvtss2si128" => s1(Scalar, CvtSs2Si128),
-        "cvtsd2si128" => s1(Scalar, CvtSd2Si128),
         "cvtss2sd128" => b(Vec128, CvtSs2Sd128),
         "cvtsd2ss128" => b(Vec128, CvtSd2Ss128),
         "haddps128" => b(Vec128, HaddPs128),

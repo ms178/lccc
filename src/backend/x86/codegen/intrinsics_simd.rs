@@ -1493,7 +1493,6 @@ impl X86Codegen {
             CvttSs2Si128 => ("cvttss2si", 0, true),
             CvttSd2Si128 => ("cvttsd2si", 0, true),
             CvtSs2Si128 => ("cvtss2si", 0, true),
-            CvtSd2Si128 => ("cvtsd2si", 0, true),
             TestzPs128 => ("vtestps", 0, true),
             TestzPs256 => ("vtestps", 0, true),
             ReduceAddEpu32_512 => ("__reduce_add_epu32", 0, false),

@@ -32,7 +32,15 @@ HOOKS=$(grep -c 'verify::verify_after_pass(module,' src/passes/mod.rs || true)
 # i.e. new SSA defs and moved uses) + `vecfma` (packed FMA contraction,
 # which rewrites intrinsic consumers in place and drops the multiply /
 # sign-flip) + `pair_load_carry`: exactly the def/use shapes the verifier exists for.
-WANT_HOOKS=22
+# 23 = the above + `aggcopy16` (16-byte aggregate round-trip collapse: it
+# rewrites loads, casts, shifts and stores into one 128-bit copy, so the
+# def/use graph changes wholesale on the paths it fires).
+# 24 = upstream's own addition since that pin plus `aggcopy16`: the count is a
+# PIN, not a ceiling, so a merge that brings in either side has to restate it.
+# The number is asserted against `main`'s tree as well, which is what makes an
+# accidental loss of a hook (a pass silently running unverified) as loud as an
+# accidental gain.
+WANT_HOOKS=24
 if [ "$HOOKS" -ne "$WANT_HOOKS" ]; then
     echo "FAIL: $HOOKS verify::verify_after_pass hooks in src/passes/mod.rs, pinned at $WANT_HOOKS." >&2
     echo "      If a pass hook was added/removed on purpose, update WANT_HOOKS in this same change." >&2

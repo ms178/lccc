@@ -1301,12 +1301,23 @@ _mm_cvtsd_f64(__m128d __a)
 
 /* _mm_cvttsd_si32: convert low double to int (truncate) */
 
-/* _mm_cvtsd_si64: convert low double to long long (round to nearest) */
+/* _mm_cvtsd_si64: convert low double to long long, rounding per MXCSR.RC.
+ *
+ * This used to be `(long long)(d >= 0 ? d + 0.5 : d - 0.5)`, which is
+ * round-half-AWAY-FROM-ZERO (not the current rounding mode), loses the
+ * fraction entirely for |d| >= 2^52 (the 0.5 is absorbed), and costs four
+ * instructions where the hardware form costs one.  `cvtsd2si` with a 64-bit
+ * destination is the instruction the intrinsic names. */
 static __inline__ long long __attribute__((__always_inline__))
 _mm_cvtsd_si64(__m128d __a)
 {
-    double __d = __a.__val[0];
-    return (long long)(__d >= 0.0 ? __d + 0.5 : __d - 0.5);
+#if defined(__x86_64__)
+    return __builtin_ia32_cvtsd2si64(__a);
+#else
+    /* 32-bit x86 has no 64-bit `cvtsd2si`; keep a portable truncating
+       definition rather than silently rounding the wrong way. */
+    return (long long)__a.__val[0];
+#endif
 }
 
 #define _mm_cvtsd_si64x(a) _mm_cvtsd_si64(a)

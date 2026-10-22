@@ -1135,6 +1135,8 @@ impl Lowerer {
             | BuiltinIntrinsic::X86Pextrw128
             | BuiltinIntrinsic::X86Cvtsi128Si32
             | BuiltinIntrinsic::X86Cvtsi128Si64
+            | BuiltinIntrinsic::X86Cvtsd2Si64
+            | BuiltinIntrinsic::X86Cvtss2Si64
             | BuiltinIntrinsic::X86Crc32_8
             | BuiltinIntrinsic::X86Crc32_16
             | BuiltinIntrinsic::X86Crc32_32
@@ -3004,6 +3006,8 @@ fn x86_intrinsic_kind(intrinsic: &BuiltinIntrinsic) -> X86IntrinsicKind {
         | BuiltinIntrinsic::X86Pextrw128
         | BuiltinIntrinsic::X86Cvtsi128Si32
         | BuiltinIntrinsic::X86Cvtsi128Si64
+        | BuiltinIntrinsic::X86Cvtsd2Si64
+        | BuiltinIntrinsic::X86Cvtss2Si64
         | BuiltinIntrinsic::X86Crc32_8
         | BuiltinIntrinsic::X86Crc32_16
         | BuiltinIntrinsic::X86Crc32_32
@@ -3379,6 +3383,8 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Pextrw128 => IntrinsicOp::Pextrw128,
         BuiltinIntrinsic::X86Cvtsi128Si32 => IntrinsicOp::Cvtsi128Si32,
         BuiltinIntrinsic::X86Cvtsi128Si64 => IntrinsicOp::Cvtsi128Si64,
+        BuiltinIntrinsic::X86Cvtsd2Si64 => IntrinsicOp::Cvtsd2Si64,
+        BuiltinIntrinsic::X86Cvtss2Si64 => IntrinsicOp::Cvtss2Si64,
         BuiltinIntrinsic::X86Crc32_8 => IntrinsicOp::Crc32_8,
         BuiltinIntrinsic::X86Crc32_16 => IntrinsicOp::Crc32_16,
         BuiltinIntrinsic::X86Crc32_32 => IntrinsicOp::Crc32_32,
