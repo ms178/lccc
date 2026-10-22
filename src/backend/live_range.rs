@@ -1152,12 +1152,46 @@ pub(crate) fn mark_loop_spanning(
             // recurrence, whether or not the source was coalesced into
             // it.
             if !recurrence {
+                // The dependency walk below is bounded: a recurrence is a
+                // CYCLE, and every cycle this pass can act on is short. Three
+                // hops is one more than the longest faithful chain measured
+                // (`if`-converted body: phi -> Select -> BinOp -> phi); the
+                // bound keeps a pathological acyclic fan-in from making the
+                // flag fire on work that never loops back.
+                const RECURRENCE_CHAIN_DEPTH: usize = 3;
+                // The visited set is per query, not shared across the pairs:
+                // the walk is breadth-first and stops at the depth bound, so
+                // a node first reached at the bound never explores its
+                // operands, and a single shared set would then let that
+                // truncated visit mask the same node reached deeper inside
+                // the budget by a later pair.
+                let depends_on_member = |start: u32| -> bool {
+                    let mut seen: FxHashSet<u32> = FxHashSet::default();
+                    let mut frontier: Vec<u32> = vec![start];
+                    for _ in 0..RECURRENCE_CHAIN_DEPTH {
+                        let mut next: Vec<u32> = Vec::new();
+                        for v in frontier {
+                            let Some(ops) = def_uses.get(&v) else {
+                                continue;
+                            };
+                            for &o in ops {
+                                if members.contains(&o) {
+                                    return true;
+                                }
+                                if !def_is_phi.contains(&o) && seen.insert(o) {
+                                    next.push(o);
+                                }
+                            }
+                        }
+                        if next.is_empty() {
+                            return false;
+                        }
+                        frontier = next;
+                    }
+                    false
+                };
                 for &(dest, src) in phi_backedges {
-                    if members.contains(&dest)
-                        && def_uses
-                            .get(&src)
-                            .is_some_and(|ops| ops.iter().any(|o| members.contains(o)))
-                    {
+                    if members.contains(&dest) && depends_on_member(src) {
                         recurrence = true;
                         break;
                     }
@@ -2545,7 +2579,17 @@ impl LinearScanAllocator {
             return None;
         }
         let pos = incoming.start;
-        let incoming_cost = incoming.spill_cost_at(pos);
+        // Every slot access the two sides pay per pass through the loop, not
+        // the remaining-use total: a recurrence is READ and WRITTEN on every
+        // iteration, and the write is mandatory -- the value must be in memory
+        // before each call inside the loop it spans.  A loop-invariant span is
+        // never written there; it pays a reload only where its block runs.
+        // Pricing the recurrence at one use per in-loop read therefore
+        // under-states it by exactly the store the co-tenant does not pay, and
+        // that is the difference between a chain of slot round-trips and a
+        // reload on the path that reads the invariant.  Counted here rather
+        // than in `spill_cost_at`, which is shared with ordinary eviction.
+        let incoming_cost = incoming.spill_cost_at(pos).saturating_mul(2);
         if incoming_cost == 0 {
             return None;
         }
