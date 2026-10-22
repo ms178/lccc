@@ -476,7 +476,7 @@ fn imm_fits_store(imm: i64, size: MoveSize) -> bool {
         // FP/SSE moves carry no immediate: an immediate-backed mapping can
         // never be created for them (parse_imm_slot_store only matches the
         // integer mov mnemonics).
-        MoveSize::SLQ | MoveSize::SD | MoveSize::SS => false,
+        MoveSize::SLQ | MoveSize::SD | MoveSize::SS | MoveSize::DQ => false,
     }
 }
 
@@ -487,8 +487,16 @@ fn mov_imm_store_mnemonic(size: MoveSize) -> &'static str {
         MoveSize::L => "movl",
         MoveSize::W => "movw",
         MoveSize::B => "movb",
-        MoveSize::SLQ | MoveSize::SD | MoveSize::SS => "movq",
+        MoveSize::SLQ | MoveSize::SD | MoveSize::SS | MoveSize::DQ => "movq",
     }
+}
+
+/// The mnemonic token of a trimmed instruction line (empty when the line has
+/// no token at all). Used where a rewrite must preserve the instruction's own
+/// encoding rather than impose one — an aligned move stays aligned and a VEX
+/// form stays VEX.
+fn line_mnemonic(text: &str) -> &str {
+    text.split_whitespace().next().unwrap_or("")
 }
 
 /// Parse the first `%xmmN` operand in `text` into its XMM family id
@@ -523,6 +531,7 @@ fn xmm_mnemonic(size: MoveSize) -> Option<&'static str> {
         MoveSize::SS => Some("movss"),
         MoveSize::Q => Some("movq"),
         MoveSize::L => Some("movd"),
+        MoveSize::DQ => Some("movdqu"),
         MoveSize::W | MoveSize::B | MoveSize::SLQ => None,
     }
 }
@@ -953,13 +962,27 @@ fn try_pair_fuse_xmm_relay(
     if !fp.deleted_write_regions_dead_after(store, infos, j, (load_xmm - 24) as u32, &[i, j]) {
         return false;
     }
+    // The rewrite keeps the STORE's own mnemonic: `movdqa`/`movapd` stay
+    // aligned (their encoding is a promise about the address, not about the
+    // source register, so the substitution is exact) and VEX forms are not
+    // demoted to their SSE encoding. For the scalar widths this is the same
+    // text the pass emitted before.
+    let store_text = infos[j].trimmed(store.get(j));
+    let store_mn = line_mnemonic(store_text);
+    // The scalar widths must be spelled exactly as the load was (a VEX store
+    // is deliberately left alone, as before). At 16 bytes the store's own
+    // classification already proves it is one of the six legal slot moves, so
+    // every spelling is accepted and preserved.
+    if size != MoveSize::DQ && store_mn != mnemonic {
+        return false;
+    }
     let load_name = format!("%xmm{}", load_xmm - 24);
     for base in ["%rbp", "%rsp"] {
-        let want = format!("{} {}, {}({})", mnemonic, load_name, st_off, base);
-        if infos[j].trimmed(store.get(j)) == want {
+        let want = format!("{} {}, {}({})", store_mn, load_name, st_off, base);
+        if store_text == want {
             let new_text = format!(
                 "    {} %xmm{}, {}({})",
-                mnemonic,
+                store_mn,
                 src_xmm - 24,
                 st_off,
                 base
@@ -1074,9 +1097,47 @@ fn gsf_handle_load_xmm(
         .map(|e| e.mapping);
     if let Some(mapping) = mapping {
         let bytes_match = mapping.size.byte_size() == load_size.byte_size();
-        if bytes_match && is_xmm_family(mapping.reg_id) {
+        // An XMM home can serve any load that reads AT MOST the bytes the
+        // store wrote (same start offset), because every form we can emit
+        // zeroes exactly the bits the memory form zeroes above the copied
+        // width:
+        //   * `movq %xmmS, %xmmD` copies bits 0..63 and clears 64..127 —
+        //     identical to `movsd mem, %xmmD` reading the low half of a
+        //     16-byte home, so an 8-byte reload of a 16-byte home forwards;
+        //   * `movdqu %xmmS, %xmmD` copies all 128 bits (`movdqu mem` does
+        //     too, and the VEX form clears 128..255 on both sides).
+        // The 4-byte forms are excluded: SSE2's only XMM-to-XMM register
+        // encoding for them merges bits 32..127 where the load zeroes them,
+        // and the VEX workaround (`vinsertps`) is handled below.
+        let xmm_serves =
+            is_xmm_family(mapping.reg_id) && mapping.size.byte_size() >= load_size.byte_size();
+        if xmm_serves {
             let src = mapping.reg_id;
-            if src != dst && try_pair_fuse_xmm_relay(store, infos, i, src, dst, load_size, fp) {
+            let vex_load = infos[i].trimmed(store.get(i)).starts_with('v');
+            let same_reg_dq = src == dst && load_size == MoveSize::DQ;
+            if same_reg_dq && (!vex_load || fp.upper_regions_dead_after(i, (dst - 24) as u32)) {
+                // A 16-byte home read back into the very register that wrote
+                // it rewrites all 128 low bits with the values they already
+                // hold. A LEGACY load is therefore a no-op. A VEX load is a
+                // no-op only when its architectural YMM/ZMM upper-zero effect
+                // is dead; otherwise leave it in place. This is valid ONLY
+                // at full width — a narrower reload still has to zero the
+                // bits above its own width (see
+                // `fp_store_fp_load_same_register_keeps_zeroing`). A
+                // frame-slot read has no other observable effect: volatile
+                // slots are reclassified as pinned `Other` lines before this
+                // pass runs.
+                mark_nop(&mut infos[i]);
+                changed = true;
+                load_still_writes_xmm = false;
+            } else if same_reg_dq {
+                // VEX.128 loads zero bits 128..MAXVL. The original load is
+                // the only operation in this relay that carries that write;
+                // retaining it is required when a later YMM/ZMM use observes
+                // the cleared upper lanes. Deleting it here would leave stale
+                // upper bits after a register-to-slot-to-same-register round
+                // trip.
+            } else if try_pair_fuse_xmm_relay(store, infos, i, src, dst, load_size, fp) {
                 mark_nop(&mut infos[i]);
                 changed = true;
                 load_still_writes_xmm = false;
@@ -1086,6 +1147,19 @@ fn gsf_handle_load_xmm(
                     (MoveSize::SD | MoveSize::Q, _) => Some(format!(
                         "    {}movq %xmm{}, %xmm{}",
                         if vex { "v" } else { "" },
+                        src - 24,
+                        dst - 24
+                    )),
+                    // 16-byte register-to-register moves carry no alignment
+                    // requirement, so the load's own mnemonic is always
+                    // emittable and always the faithful choice: an aligned
+                    // `movdqa`/`movapd` keeps its encoding and a VEX form is
+                    // not demoted to its SSE spelling. (`load_size == DQ`
+                    // implies the line was parsed as one of the six 16-byte
+                    // slot moves, every one of which has a register form.)
+                    (MoveSize::DQ, _) => Some(format!(
+                        "    {} %xmm{}, %xmm{}",
+                        line_mnemonic(infos[i].trimmed(store.get(i))),
                         src - 24,
                         dst - 24
                     )),
@@ -2410,5 +2484,267 @@ mod tests {
             (0..store.len()).any(|i| store.get(i).contains("movq %xmm6, %xmm0")),
             "the forward must fire across vzeroupper (low 128 preserved)"
         );
+    }
+    // ── 16-byte (`movdqu`-class) slot forwarding ───────────────────────────
+
+    /// Build the standard prologue-less fixture and run only the forwarding
+    /// pass. Returns the surviving text joined by newlines.
+    fn forward_only(asm: &str) -> (String, Vec<LineInfo>) {
+        let (mut store, mut infos) = build_pinned(asm);
+        global_store_forwarding(&mut store, &mut infos);
+        let out = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (out, infos)
+    }
+
+    #[test]
+    fn dq_store_load_forwards_through_the_register() {
+        // The dominant SSE round trip: an `__m128` leaves its register for a
+        // frame slot and comes straight back. Both moves are 16 bytes, so the
+        // reload is the register's own value.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movdqu %xmm6, 72(%rsp)\n",
+            "    movq %rcx, %r10\n",
+            "    movdqu 72(%rsp), %xmm0\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (out, _) = forward_only(asm);
+        assert!(
+            out.contains("movdqu %xmm6, %xmm0"),
+            "the 16-byte reload must forward: {out}"
+        );
+        assert!(
+            !out.contains("movdqu 72(%rsp), %xmm0"),
+            "the slot read must be gone: {out}"
+        );
+    }
+
+    #[test]
+    fn dq_full_width_self_reload_is_a_nop() {
+        // All 128 bits are rewritten with the values they already hold, so
+        // a legacy reload has no architectural effect. (At narrower widths it
+        // DOES: see `fp_store_fp_load_same_register_keeps_zeroing`.)
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movdqu %xmm6, 72(%rsp)\n",
+            "    movq %rcx, %r10\n",
+            "    movdqu 72(%rsp), %xmm6\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (out, _) = forward_only(asm);
+        assert!(
+            !out.contains("72(%rsp), %xmm6"),
+            "a full-width self reload is a no-op: {out}"
+        );
+    }
+
+    #[test]
+    fn vex_dq_self_reload_is_elided_when_upper_regions_are_dead() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    vmovdqu %xmm6, 72(%rsp)\n",
+            "    movq %rcx, %r10\n",
+            "    vmovdqu 72(%rsp), %xmm6\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (out, _) = forward_only(asm);
+        assert!(
+            !out.contains("72(%rsp), %xmm6"),
+            "the VEX self reload can be removed when its upper-zeroing effect is dead: {out}"
+        );
+    }
+
+    #[test]
+    fn vex_dq_self_reload_keeps_live_ymm_zmm_upper_zeroing() {
+        // `vmovdqu m128, %xmm6` has a register-level effect beyond the 16
+        // bytes read from the slot: VEX zeros bits 128..MAXVL. The low 128
+        // bits are already identical to the backing value, but a later ZMM
+        // store observes those upper lanes, so the load cannot be deleted.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    vmovdqu %xmm6, 72(%rsp)\n",
+            "    movq %rcx, %r10\n",
+            "    vmovdqu 72(%rsp), %xmm6\n",
+            "    vmovdqu64 %zmm6, 128(%rdi)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (out, _) = forward_only(asm);
+        assert!(
+            out.contains("vmovdqu 72(%rsp), %xmm6"),
+            "the VEX reload must survive for its upper-zeroing effect: {out}"
+        );
+    }
+
+    #[test]
+    fn dq_mapping_serves_a_narrower_reload() {
+        // `movq %xmm6, %xmm0` copies bits 0..63 and CLEARS 64..127 — exactly
+        // what `movsd slot, %xmm0` does when the slot holds `%xmm6`'s low
+        // half, so an 8-byte reload of a 16-byte home forwards.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movdqu %xmm6, 72(%rsp)\n",
+            "    movq %rcx, %r10\n",
+            "    movsd 72(%rsp), %xmm0\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (out, _) = forward_only(asm);
+        assert!(
+            out.contains("movq %xmm6, %xmm0"),
+            "an 8-byte reload of a 16-byte home must forward: {out}"
+        );
+    }
+
+    #[test]
+    fn dq_forwarding_refuses_a_clobbered_backing_register() {
+        // `%xmm6` no longer holds the stored value after the add.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movdqu %xmm6, 72(%rsp)\n",
+            "    addpd %xmm1, %xmm6\n",
+            "    movdqu 72(%rsp), %xmm0\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (out, _) = forward_only(asm);
+        assert!(
+            out.contains("movdqu 72(%rsp), %xmm0"),
+            "a clobbered backing register must block the forward: {out}"
+        );
+    }
+
+    #[test]
+    fn dq_forwarding_refuses_a_partially_overlapping_store() {
+        // The second store rewrites the home's upper 8 bytes, so the slot no
+        // longer holds `%xmm6`'s value as a whole.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movdqu %xmm6, 72(%rsp)\n",
+            "    movsd %xmm1, 80(%rsp)\n",
+            "    movdqu 72(%rsp), %xmm0\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (out, _) = forward_only(asm);
+        assert!(
+            out.contains("72(%rsp), %xmm0"),
+            "a partially overlapping store must block the forward: {out}"
+        );
+    }
+
+    #[test]
+    fn dq_forwarding_survives_an_adjacent_store() {
+        // A 16-byte store to a DISJOINT slot must not disturb the mapping.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movdqu %xmm6, 72(%rsp)\n",
+            "    movdqu %xmm1, 56(%rsp)\n",
+            "    movdqu 72(%rsp), %xmm0\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (out, _) = forward_only(asm);
+        assert!(
+            out.contains("movdqu %xmm6, %xmm0"),
+            "a disjoint store must not block the forward: {out}"
+        );
+    }
+
+    #[test]
+    fn dq_load_then_store_relays_straight_from_the_backing_register() {
+        // The relay shape: slot -> %xmm0 -> slot2. Both endpoints are 16-byte
+        // moves, so the relay collapses to a single `movdqu %xmm6, slot2`.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movdqu %xmm6, 72(%rsp)\n",
+            "    movdqu 72(%rsp), %xmm2\n",
+            "    movdqu %xmm2, 40(%rsp)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (out, _) = forward_only(asm);
+        assert!(
+            out.contains("movdqu %xmm6, 40(%rsp)"),
+            "the relay must be fused: {out}"
+        );
+        assert!(
+            !out.contains("72(%rsp), %xmm2") && !out.contains("%xmm2, 40(%rsp)"),
+            "both relay halves must be gone: {out}"
+        );
+    }
+
+    #[test]
+    fn dq_relay_keeps_the_aligned_encoding() {
+        // `movdqa` promises 16-byte alignment of the ADDRESS; the source
+        // register is free. The rewrite must not demote it to `movdqu`.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movdqa %xmm6, 72(%rsp)\n",
+            "    movdqa 72(%rsp), %xmm2\n",
+            "    movdqa %xmm2, 40(%rsp)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (out, _) = forward_only(asm);
+        assert!(
+            out.contains("movdqa %xmm6, 40(%rsp)"),
+            "the aligned relay must stay `movdqa`: {out}"
+        );
+        assert!(
+            !out.contains("movdqu"),
+            "no unaligned mnemonic may be invented: {out}"
+        );
+    }
+
+    #[test]
+    fn dq_slot_moves_are_classified_with_their_full_extent() {
+        // Range classification is what makes the 16-byte invalidate exact:
+        // `dead_code` and the alias model must see 16 bytes, not a point.
+        for (line, size) in [
+            ("movdqu %xmm0, 16(%rsp)", MoveSize::DQ),
+            ("movdqu 16(%rsp), %xmm0", MoveSize::DQ),
+            ("movups %xmm0, 16(%rbp)", MoveSize::DQ),
+            ("movaps 16(%rbp), %xmm0", MoveSize::DQ),
+            ("movapd %xmm0, 16(%rsp)", MoveSize::DQ),
+            ("movdqa 16(%rsp), %xmm0", MoveSize::DQ),
+            ("vmovdqu %xmm0, 16(%rsp)", MoveSize::DQ),
+            ("vmovaps 16(%rsp), %xmm0", MoveSize::DQ),
+        ] {
+            let kind = classify_line(&format!("    {line}")).kind;
+            let got = match kind {
+                LineKind::StoreXmmRbp { size, .. } | LineKind::LoadXmmRbp { size, .. } => size,
+                other => panic!("{line} classified as {other:?}"),
+            };
+            assert_eq!(got, size, "{line}");
+            assert_eq!(got.byte_size(), 16, "{line} must cover 16 bytes");
+        }
+        // The 8-byte halves must NOT be swept into the 16-byte class.
+        for line in ["movhps %xmm0, 16(%rsp)", "movlpd 16(%rsp), %xmm0"] {
+            assert!(
+                !matches!(
+                    classify_line(&format!("    {line}")).kind,
+                    LineKind::StoreXmmRbp { .. } | LineKind::LoadXmmRbp { .. }
+                ),
+                "{line} is a half-width move and must keep its old classification"
+            );
+        }
     }
 }

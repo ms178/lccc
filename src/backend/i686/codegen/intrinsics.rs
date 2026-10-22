@@ -474,6 +474,7 @@ impl I686Codegen {
             // FmaF64x2, FmaF64x4, and reduction intrinsics are x86-64 SSE2/AVX2 intrinsics; not implemented on i686.
             IntrinsicOp::FmaF64x2
             | IntrinsicOp::FmaF64x2Hoisted
+            | IntrinsicOp::MulAddF64x2Hoisted
             | IntrinsicOp::FmaF64x4
             | IntrinsicOp::FmaF64x4Hoisted
             | IntrinsicOp::BroadcastLoadF64
@@ -730,7 +731,20 @@ impl I686Codegen {
             | IntrinsicOp::Movss128
             | IntrinsicOp::Movsd128
             | IntrinsicOp::CvtSs2Sd128
-            | IntrinsicOp::CvtSd2Ss128 => {
+            | IntrinsicOp::CvtSd2Ss128
+            | IntrinsicOp::AddSd128
+            | IntrinsicOp::SubSd128
+            | IntrinsicOp::MulSd128
+            | IntrinsicOp::DivSd128
+            | IntrinsicOp::MinSd128
+            | IntrinsicOp::MaxSd128
+            | IntrinsicOp::SqrtSd128
+            | IntrinsicOp::AddSs128
+            | IntrinsicOp::SubSs128
+            | IntrinsicOp::MulSs128
+            | IntrinsicOp::DivSs128
+            | IntrinsicOp::MinSs128
+            | IntrinsicOp::MaxSs128 => {
                 if let Some(dptr) = dest_ptr {
                     let inst = match op {
                         IntrinsicOp::AddPs128 => "addps",
@@ -759,6 +773,19 @@ impl I686Codegen {
                         IntrinsicOp::Movsd128 => "movsd",
                         IntrinsicOp::CvtSs2Sd128 => "cvtss2sd",
                         IntrinsicOp::CvtSd2Ss128 => "cvtsd2ss",
+                        IntrinsicOp::AddSd128 => "addsd",
+                        IntrinsicOp::SubSd128 => "subsd",
+                        IntrinsicOp::MulSd128 => "mulsd",
+                        IntrinsicOp::DivSd128 => "divsd",
+                        IntrinsicOp::MinSd128 => "minsd",
+                        IntrinsicOp::MaxSd128 => "maxsd",
+                        IntrinsicOp::SqrtSd128 => "sqrtsd",
+                        IntrinsicOp::AddSs128 => "addss",
+                        IntrinsicOp::SubSs128 => "subss",
+                        IntrinsicOp::MulSs128 => "mulss",
+                        IntrinsicOp::DivSs128 => "divss",
+                        IntrinsicOp::MinSs128 => "minss",
+                        IntrinsicOp::MaxSs128 => "maxss",
                         _ => unreachable!("unexpected SSE float binary op: {:?}", op),
                     };
                     self.emit_sse_binary_128(dptr, args, inst);

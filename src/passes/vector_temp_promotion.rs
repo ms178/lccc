@@ -196,7 +196,22 @@ fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
         _ => {}
     }
 
+    pointer_vector_arg_width_consumer(op, index)
+}
+
+/// Width table for consumer operands, separate from the source-width cases above.
+fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<usize> {
+    use IntrinsicOp as O;
     let width = match op {
+        // 128-bit FP destructive two-operand consumers (add/sub/mul/div/min/max
+        // in ps/pd/sd/ss): both operands are 16-byte vector slots.  Shared
+        // predicate rather than a third copy of the op list.  Leaving them out
+        // kept the slot traffic their neighbours avoid: measured on the SSE2
+        // codegen matrix, `minpd`/`maxpd`/`divpd` needed 19-20 instructions
+        // against 14 for the identical `addpd` kernel, and `shufps`/`cmppd`
+        // 34 against 12.
+        _ if op.is_sse_fp_128_destructive_binary() => 16,
+
         // 128-bit stores and scalar extract/reduction consumers.
         O::Storedqu
         | O::Storeldi128
@@ -213,6 +228,19 @@ fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
         | O::Pmovzxbw128
         | O::Pmovzxwd128
         | O::Aesimc128 => {
+            return (index == 0).then_some(16);
+        }
+
+        // Unary FP forms: exactly one 16-byte vector slot, at index 0.  Kept
+        // out of the two-operand arm above so an operand index the op does not
+        // have can never be reported as a forwardable vector (that would let
+        // load forwarding forward an unrelated value).
+        O::SqrtSs128
+        | O::Movddup128
+        | O::Movsldup128
+        | O::Movshdup128
+        | O::CvtPs2Pd128
+        | O::CvtPd2Ps128 => {
             return (index == 0).then_some(16);
         }
 
@@ -251,12 +279,24 @@ fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
         | O::Por128
         | O::Pand128
         | O::Pxor128
-        | O::AddPs128
-        | O::SubPs128
-        | O::MulPs128
-        | O::AddPd128
-        | O::SubPd128
-        | O::MulPd128
+        | O::CmpPs128
+        | O::CmpPd128
+        | O::ShufPs128
+        | O::ShufPd128
+        | O::UnpcklPs128
+        | O::UnpckhPs128
+        | O::UnpcklPd128
+        | O::UnpckhPd128
+        | O::HaddPs128
+        | O::HsubPs128
+        | O::AddsubPs128
+        | O::HaddPd128
+        | O::HsubPd128
+        | O::AddsubPd128
+        | O::Movss128
+        | O::Movsd128
+        | O::CvtSs2Sd128
+        | O::CvtSd2Ss128
         | O::Pmuludq128
         | O::Pmuldq128
         | O::Pmulld128
@@ -412,7 +452,7 @@ fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
         // value; A is a scalar address and dest_ptr is the accumulator.
         O::FmaF64x2 => return (index == 1).then_some(16),
         O::FmaF64x4 => return (index == 1).then_some(32),
-        O::FmaF64x2Hoisted => return (index == 0).then_some(16),
+        O::FmaF64x2Hoisted | O::MulAddF64x2Hoisted => return (index == 0).then_some(16),
         O::FmaF64x4Hoisted => return (index == 0).then_some(32),
 
         _ => return None,
@@ -506,7 +546,7 @@ fn intrinsic_arg_required_alignment(op: IntrinsicOp, index: usize) -> Option<usi
 
         // All accesses in these vectorizer memory forms are scalar/unaligned.
         O::FmaF64x2 | O::FmaF64x4 => index < 2,
-        O::FmaF64x2Hoisted | O::FmaF64x4Hoisted => index == 0,
+        O::FmaF64x2Hoisted | O::MulAddF64x2Hoisted | O::FmaF64x4Hoisted => index == 0,
         O::FmaF64x4SIB => index < 3,
         O::FmaF64x4HoistedSIB | O::MulAddF64x4HoistedSIB => index < 2,
         O::BroadcastLoadF64 | O::Rdtscp | O::Clflush => index == 0,
@@ -545,6 +585,7 @@ fn intrinsic_dest_required_alignment(
         | O::Movnti64
         | O::FmaF64x2
         | O::FmaF64x2Hoisted
+        | O::MulAddF64x2Hoisted
         | O::FmaF64x4
         | O::FmaF64x4Hoisted
         | O::FmaF64x4SIB
@@ -570,6 +611,7 @@ fn intrinsic_overwrites_full_result(op: IntrinsicOp) -> bool {
         op,
         IntrinsicOp::FmaF64x2
             | IntrinsicOp::FmaF64x2Hoisted
+            | IntrinsicOp::MulAddF64x2Hoisted
             | IntrinsicOp::FmaF64x4
             | IntrinsicOp::FmaF64x4Hoisted
             | IntrinsicOp::FmaF64x4SIB
@@ -593,6 +635,7 @@ fn intrinsic_dest_reads_old_value(op: IntrinsicOp) -> bool {
         op,
         IntrinsicOp::FmaF64x2
             | IntrinsicOp::FmaF64x2Hoisted
+            | IntrinsicOp::MulAddF64x2Hoisted
             | IntrinsicOp::FmaF64x4
             | IntrinsicOp::FmaF64x4Hoisted
             | IntrinsicOp::FmaF64x4SIB
@@ -3700,6 +3743,41 @@ mod tests {
         let analysis = pointer_root_analysis(&function);
         assert!(!analysis.roots.contains_key(&1));
         assert!(!analysis.roots.contains_key(&2));
+    }
+
+    /// The two-rounding twin of the x86 two-wide group op must be classified
+    /// exactly like the fused one, in every table this pass consults.  The
+    /// tables are separate `match` arms, so a new member is silently
+    /// unclassified unless something forces the comparison: an unclassified
+    /// group op leaves the A pointer un-promoted (losing the hoisted
+    /// broadcast) or, worse, is treated as overwriting its full destination,
+    /// which is a read-modify-write accumulator, not a write-only result.
+    #[test]
+    fn the_two_rounding_twin_matches_the_fused_group_op() {
+        use crate::ir::intrinsics::IntrinsicOp as O;
+        for index in 0..4 {
+            assert_eq!(
+                pointer_vector_arg_width(O::FmaF64x2Hoisted, index),
+                pointer_vector_arg_width(O::MulAddF64x2Hoisted, index),
+                "pointer-vector arg width disagrees at arg {index}"
+            );
+            assert_eq!(
+                intrinsic_arg_required_alignment(O::FmaF64x2Hoisted, index),
+                intrinsic_arg_required_alignment(O::MulAddF64x2Hoisted, index),
+                "argument alignment disagrees at arg {index}"
+            );
+        }
+        for op in [O::FmaF64x2Hoisted, O::MulAddF64x2Hoisted] {
+            assert_eq!(intrinsic_arg_required_alignment(op, 0), Some(0));
+            assert_eq!(intrinsic_arg_required_alignment(op, 1), None);
+            assert_eq!(intrinsic_dest_required_alignment(op, false, 16), Some(0));
+            assert!(
+                !intrinsic_overwrites_full_result(op),
+                "{op:?} reads its destination"
+            );
+            assert!(intrinsic_dest_reads_old_value(op), "{op:?} accumulates");
+            assert_eq!(whole_vector_store_width(op), None, "{op:?}");
+        }
     }
 
     #[test]

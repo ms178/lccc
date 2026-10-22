@@ -16,6 +16,8 @@ use policy::fp_environment_blocks_reordering;
 
 mod address_form;
 pub(crate) mod aggregate_copy_forward;
+pub(crate) mod aggregate_pair_roundtrip;
+
 pub(crate) mod aggregate_sroa;
 pub(crate) mod alias;
 pub(crate) mod arx_vectorize;
@@ -64,6 +66,7 @@ pub(crate) mod loop_preheader;
 pub(crate) mod loop_rotate;
 pub(crate) mod loop_square;
 pub(crate) mod loop_unroll;
+mod module_symbol_facts;
 pub(crate) mod narrow;
 pub(crate) mod outline_switch;
 mod pair_load_carry;
@@ -156,33 +159,6 @@ pub(crate) fn debug_vec_avail() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("CCC_DEBUG_VEC_AVAIL").is_some());
     *ENABLED
-}
-
-/// `LCCC_IFCONV_ARM_BUDGET=<n|off>` — A/B lever and kill switch for the
-/// loop-resident arm budget of `if_convert`, resolved once per process.
-///
-/// A positive integer replaces the in-loop budget (so `=8` reproduces the
-/// pre-loop-aware behaviour of every diamond, in or out of a loop, while
-/// `=1`/`=2` measure a stricter prior).  `off`/`full`/`0` disables the
-/// loop-aware restriction entirely.  An unparsable value is ignored rather
-/// than aborting a build, matching `LCCC_PEEPHOLE_PAIR_PARALLEL`.
-///
-/// It lives here, beside `debug_vec_avail`, because a pipeline-wide switch is
-/// resolved once at the pipeline boundary -- the same rule the env-read
-/// ratchet in `tests/regression/check_env_test_hygiene.sh` states: a new
-/// switch belongs to `run_passes`, not to the pass body that consumes it.
-pub(crate) fn ifconv_arm_budget_override() -> Option<usize> {
-    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *OVERRIDE.get_or_init(|| {
-        let raw = std::env::var("LCCC_IFCONV_ARM_BUDGET").ok()?;
-        let raw = raw.trim();
-        if raw == "0" || raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("full") {
-            return Some(usize::MAX);
-        }
-        // A budget of 0 would mean "never if-convert", which is spelled `off`;
-        // treat it as the default rather than silently disabling the pass.
-        raw.parse::<usize>().ok().filter(|&n| n > 0)
-    })
 }
 
 /// `CCC_NO_PHI_COALESCE` — kill switch for the post-phi copy fold.
@@ -1304,26 +1280,32 @@ fn vectorize_entry(
     fp_reassoc: bool,
     fp_contract: FpContract,
     x86_avx: bool,
-) -> fn(&mut IrFunction) -> usize {
+) -> vectorize::VectorizeEntryMode {
+    use vectorize::VectorizeEntryMode::{Main, TwoWide};
     match (target, fp_reassoc, fp_contract, x86_avx) {
-        (crate::backend::Target::Aarch64, true, _, _) => {
-            vectorize::vectorize_function_two_wide_fast_math
-        }
-        (crate::backend::Target::Aarch64, false, _, _) => vectorize::vectorize_function_two_wide,
-        (_, true, FpContract::Fast, true) => vectorize::vectorize_function_fast_math,
-        (_, true, FpContract::Fast, false) => {
-            vectorize::vectorize_function_fast_math_without_fixed_slp
-        }
-        (_, true, FpContract::Off | FpContract::OnExpr, true) => {
-            vectorize::vectorize_function_reassoc
-        }
-        (_, true, FpContract::Off | FpContract::OnExpr, false) => {
-            vectorize::vectorize_function_reassoc_without_fixed_slp
-        }
+        (crate::backend::Target::Aarch64, fast_math, _, _) => TwoWide { fast_math },
+        (_, true, FpContract::Fast, enable_fixed_slp) => Main {
+            fp_reassoc: true,
+            fp_contract: FpContract::Fast,
+            enable_fixed_slp,
+        },
+        (_, true, FpContract::Off | FpContract::OnExpr, enable_fixed_slp) => Main {
+            fp_reassoc: true,
+            fp_contract: FpContract::default(),
+            enable_fixed_slp,
+        },
         // contract=fast without reassoc: reductions stay order-locked,
         // map trees may fuse (GCC-parity for -ffp-contract=fast).
-        (_, false, FpContract::Fast, _) => vectorize::vectorize_function_contract,
-        (_, false, _, _) => vectorize::vectorize_function,
+        (_, false, FpContract::Fast, _) => Main {
+            fp_reassoc: false,
+            fp_contract: FpContract::Fast,
+            enable_fixed_slp: false,
+        },
+        (_, false, _, _) => Main {
+            fp_reassoc: false,
+            fp_contract: FpContract::default(),
+            enable_fixed_slp: false,
+        },
     }
 }
 
@@ -1359,12 +1341,10 @@ fn late_vectorize_entry(
     fp_reassoc: bool,
     fp_contract: FpContract,
     x86_avx: bool,
-) -> fn(&mut IrFunction) -> usize {
+) -> vectorize::VectorizeEntryMode {
     if matches!(target, crate::backend::Target::Aarch64) {
-        // The pre-existing AArch64 late entry. `vectorize_function_two_wide`
-        // is argument-for-argument what the late rerun used before the
-        // dispatch table was shared.
-        return vectorize::vectorize_function_two_wide;
+        // Preserve the pre-existing non-reassociating AArch64 late entry.
+        return vectorize::VectorizeEntryMode::TwoWide { fast_math: false };
     }
     vectorize_entry(target, fp_reassoc, fp_contract, x86_avx)
 }
@@ -2174,6 +2154,7 @@ pub(crate) fn run_passes(
             && matches!(target, crate::backend::Target::X86_64)
             && !pass_disabled(&disabled, "vectorize")
         {
+            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module);
             let n = timed_pass!(
                 "vectorize_const_trip_maps",
                 run_on_visited(
@@ -2181,7 +2162,12 @@ pub(crate) fn run_passes(
                     &dirty,
                     &mut changed,
                     |f: &mut crate::ir::reexports::IrFunction| {
-                        vectorize::vectorize_const_trip_map_loops(f, fp_contract, no_map_vec)
+                        vectorize::vectorize_const_trip_map_loops(
+                            f,
+                            fp_contract,
+                            no_map_vec,
+                            &symbol_facts,
+                        )
                     }
                 )
             );
@@ -2239,42 +2225,17 @@ pub(crate) fn run_passes(
         // loop remains as the fallback when pointer overlap is possible.
         // Pass name for CCC_DISABLE_PASSES: "loop_idiom"
         if iter == 0 && opt_level >= 2 && !pass_disabled(&disabled, "loop_idiom") {
-            let mut aliased_names: crate::common::fx_hash::FxHashSet<String> = module
-                .aliases
-                .iter()
-                .flat_map(|(alias, target, _)| [alias.clone(), target.clone()])
-                .collect();
-            // asm labels may also give two C names the same linker symbol.
-            for (name, label) in &module.asm_labels {
-                aliased_names.insert(name.clone());
-                aliased_names.insert(label.clone());
-            }
-            // A TU's two extern declarations can be aliases in another TU;
-            // weak/common definitions can be coalesced or preempted. Only
-            // strong private definitions have stable distinct object identity
-            // in every link context (including shared libraries).
-            let mut local_globals: crate::common::fx_hash::FxHashSet<String> = module
-                .globals
-                .iter()
-                .filter(|g| g.is_static && !g.is_extern && !g.is_common && !g.is_weak)
-                .map(|g| g.name.clone())
-                .collect();
-            for (name, weak, _) in &module.symbol_attrs {
-                if *weak {
-                    local_globals.remove(name);
-                }
-            }
-            // Arbitrary top-level assembler may define untracked ELF aliases.
-            if !module.toplevel_asm.is_empty() {
-                local_globals.clear();
-            }
+            // Shared module facts keep aliases, assembler labels, weak
+            // definitions, and opaque top-level assembly out of disjointness
+            // proofs. Other memory transforms use this same contract.
+            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module);
             let n = timed_pass!(
                 "loop_idiom",
                 run_on_visited(module, &dirty, &mut changed, |func| {
                     loop_idiom::run_function(
                         func,
-                        &aliased_names,
-                        &local_globals,
+                        &symbol_facts.aliased_names,
+                        &symbol_facts.local_globals,
                         loop_idiom_capabilities,
                     )
                 })
@@ -2304,10 +2265,17 @@ pub(crate) fn run_passes(
             )
             && !pass_disabled(&disabled, "vectorize")
         {
-            let vectorize_fn = vectorize_entry(target, fp_reassoc, fp_contract, x86_avx);
+            let vectorize_mode = vectorize_entry(target, fp_reassoc, fp_contract, x86_avx);
+            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module);
             let n = timed_pass!(
                 "vectorize",
-                run_on_visited(module, &dirty, &mut changed, vectorize_fn)
+                run_on_visited(module, &dirty, &mut changed, |func| {
+                    vectorize::vectorize_function_with_symbol_facts(
+                        func,
+                        &symbol_facts,
+                        vectorize_mode,
+                    )
+                })
             );
             total_changes += n;
             total_changes_excl_dce += n;
@@ -3202,7 +3170,8 @@ pub(crate) fn run_passes(
         // insn/byte, matching gcc 16.2 and icx) is attributable to that
         // pre-conversion and to the admission fixes, NOT to "opening" a
         // rerun that was already open.
-        let late_fn = late_vectorize_entry(target, fp_reassoc, fp_contract, x86_avx);
+        let late_mode = late_vectorize_entry(target, fp_reassoc, fp_contract, x86_avx);
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module);
         // SCOPE: min/max reductions only. The unrestricted rerun also
         // transforms the guarded-sum reduction in `zlib_ng_adler32`, which
         // measured +1.05 % retired instructions (callgrind, whole program)
@@ -3217,7 +3186,9 @@ pub(crate) fn run_passes(
         // guard to exactly the calls it is meant to cover.
         let n = {
             let _scope = vectorize::LateMinMaxOnlyScope::enter();
-            module.for_each_function(late_fn)
+            module.for_each_function(|func| {
+                vectorize::vectorize_function_with_symbol_facts(func, &symbol_facts, late_mode)
+            })
         };
         if n > 0 {
             // The vectorizer's block surgery does not maintain source_spans;
@@ -3322,9 +3293,12 @@ pub(crate) fn run_passes(
         && !pass_disabled(&disabled, "latevec")
         && !pass_disabled(&disabled, "vectorize")
     {
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module);
         let n = {
             let _scope = vectorize::LateMinMaxOnlyScope::enter();
-            module.for_each_function(vectorize::vectorize_function_late)
+            module.for_each_function(|func| {
+                vectorize::vectorize_function_late_with_symbol_facts(func, &symbol_facts)
+            })
         };
         if n > 0 {
             for func in &mut module.functions {
@@ -3616,6 +3590,21 @@ pub(crate) fn run_passes(
         }
     }
 
+    // Phase 11a: 16-byte aggregate round-trip collapse (`aggcopy16`). An
+    // inlined SSE intrinsic returns its `__m128*` value in the SysV
+    // register-pair carrier (packed as I128), so every such copy lowers to a
+    // load/load/shl/or + shr/store/store sequence.  Collapsing it to the
+    // intrinsic 128-bit copy pair is what lets the existing `movdqu` lowering
+    // and memory-operand folding see the copy at all; see
+    // engineering/SSE2-CODEGEN-MATRIX.md.
+    if !pass_disabled(&disabled, "aggcopy16") {
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module);
+        module.for_each_function(|func| {
+            aggregate_pair_roundtrip::run_with_symbol_facts(func, &symbol_facts)
+        });
+        verify::verify_after_pass(module, "aggcopy16");
+    }
+
     // Phase 11a': Whole-vector SSA promotion. GNU-vector objects that the
     // SIMD lowering touches only through full-width VecLoad/VecStore pairs
     // leave memory here (mem2reg for register images); the cleanups below
@@ -3658,6 +3647,21 @@ pub(crate) fn run_passes(
     // >16-byte alignment completely unobservable.
     if !pass_disabled(&disabled, "vecpromote") {
         vector_temp_promotion::fuse_vector_loads(module);
+    }
+
+    // Phase 11c': dead 16-byte load-into-a-private-slot.  Both phases above
+    // leave these behind: `aggcopy16` inserted a `Loaddqu` for the aggregate
+    // round trip, and the load forwarder just rewrote its consumer to read the
+    // producing slot directly, so the load's result has no users and its
+    // destination slot has no readers — a stack store plus a reload per
+    // occurrence.  `dse` cannot help: it has already run for this round, and
+    // the shape did not exist then.  Measured on the SSE2 codegen matrix:
+    // `minpd`/`maxpd`/`divpd`/`sqrtpd` and every `shufps`/`cmppd` row carried
+    // this traffic (19-30 instructions against 11-14 for the same kernel
+    // written with `addpd`).
+    if !pass_disabled(&disabled, "deadslotload") {
+        module.for_each_function(dse::eliminate_dead_private_slot_loads);
+        verify::verify_after_pass(module, "deadslotload");
     }
 
     // Phase 11d: Relax only the alignment left unobservable by the final use

@@ -2074,6 +2074,28 @@ fn rare_masked_outcome(ctx: &IfConvCtx<'_>, cond: &Operand, fuel: usize) -> Opti
     }
 }
 
+/// `LCCC_IFCONV_ARM_BUDGET=<n|off>` — A/B lever and kill switch for the
+/// loop-resident arm budget, resolved once per process.
+///
+/// A positive integer replaces the in-loop budget (so `=8` reproduces the
+/// pre-loop-aware behaviour of every diamond, in or out of a loop, while
+/// `=1`/`=2` measure a stricter prior).  `off`/`full`/`0` disables the
+/// loop-aware restriction entirely.  An unparsable value is ignored rather
+/// than aborting a build, matching `LCCC_PEEPHOLE_PAIR_PARALLEL`.
+fn loop_budget_override() -> Option<usize> {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let raw = std::env::var("LCCC_IFCONV_ARM_BUDGET").ok()?;
+        let raw = raw.trim();
+        if raw == "0" || raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("full") {
+            return Some(usize::MAX);
+        }
+        // A budget of 0 would mean "never if-convert", which is spelled `off`;
+        // treat it as the default rather than silently disabling the pass.
+        raw.parse::<usize>().ok().filter(|&n| n > 0)
+    })
+}
+
 /// Effective-instruction budget for one arm of the diamond headed by
 /// `pred_idx`.
 ///
@@ -2099,7 +2121,7 @@ fn loop_arm_budget(depth: usize) -> usize {
     if depth == 0 {
         return once_per_call;
     }
-    match crate::passes::ifconv_arm_budget_override() {
+    match loop_budget_override() {
         Some(n) if n == usize::MAX => once_per_call,
         Some(n) => n,
         None => tune.if_convert_arm_budget_in_loop(),

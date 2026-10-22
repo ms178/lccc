@@ -209,6 +209,38 @@ impl ArmCodegen {
         "x10".to_string()
     }
 
+    /// Emit the non-fused two-wide accumulator operation with a hoisted factor.
+    /// The addressing and accumulator update are shared by both 128-bit halves.
+    fn emit_mul_add_f64x2_hoisted(&mut self, dest_ptr: &Option<Value>, args: &[Operand]) {
+        let Some(c_ptr) = dest_ptr else {
+            return;
+        };
+        let b_phys = self.operand_reg(&args[0]).filter(|r| !is_arm_fp_phys(*r));
+        let c_phys = self
+            .operand_reg(&Operand::Value(*c_ptr))
+            .filter(|r| !is_arm_fp_phys(*r));
+        let b_addr = b_phys.map(callee_saved_name).unwrap_or("x11");
+        let c_addr = c_phys.map(callee_saved_name).unwrap_or("x12");
+        if b_phys.is_none() {
+            self.operand_to_x0(&args[0]);
+            self.state.emit("    mov x11, x0");
+        }
+        if c_phys.is_none() {
+            self.operand_to_x0(&Operand::Value(*c_ptr));
+            self.state.emit("    mov x12, x0");
+        }
+        for disp in ["", ", #16"] {
+            self.state
+                .emit_fmt(format_args!("    ldr q1, [{}{}]", b_addr, disp));
+            self.state
+                .emit_fmt(format_args!("    ldr q2, [{}{}]", c_addr, disp));
+            self.state.emit("    fmul v3.2d, v1.2d, v15.2d");
+            self.state.emit("    fadd v2.2d, v3.2d, v2.2d");
+            self.state
+                .emit_fmt(format_args!("    str q2, [{}{}]", c_addr, disp));
+        }
+    }
+
     pub(super) fn emit_intrinsic_arm(
         &mut self,
         dest: &Option<Value>,
@@ -533,6 +565,8 @@ impl ArmCodegen {
             | IntrinsicOp::Cvtsi128Si32
             | IntrinsicOp::Cvtsi32Si128
             | IntrinsicOp::Cvtsi128Si64
+            | IntrinsicOp::Cvtsd2Si64
+            | IntrinsicOp::Cvtss2Si64
             | IntrinsicOp::Pshuflw128
             | IntrinsicOp::Pshufhw128
             | IntrinsicOp::Pinsrd128
@@ -639,6 +673,12 @@ impl ArmCodegen {
                     self.state
                         .emit_fmt(format_args!("    str q2, [{}, #16]", c_addr));
                 }
+            }
+
+            IntrinsicOp::MulAddF64x2Hoisted => {
+                // This arm keeps the non-contracted operation total; the
+                // AArch64 vectorizer currently emits the fused form.
+                self.emit_mul_add_f64x2_hoisted(dest_ptr, args);
             }
 
             IntrinsicOp::VecZeroI64x2 => {
