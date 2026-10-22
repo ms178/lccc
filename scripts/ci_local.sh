@@ -332,6 +332,19 @@ gate "gcc-provisioning-mocks" fast \
 gate "swap-provisioning-mocks" fast \
     python3 tests/regression/check_ci_swap_provisioning.py
 
+# The toolchain bundle is what replaced six 80-205 s apt transactions per
+# pipeline. Its failure modes are the dangerous kind (a stale archive that
+# restores anyway, a cache hit that skips a probe, an unescalated restore of
+# /), so the export/restore/verify contract and the provisioning sequence are
+# exercised here on every fast run -- unprivileged, against a temporary root.
+gate "ci-toolchain-bundle" fast \
+    python3 tests/regression/check_ci_toolchain_bundle.py
+
+# The 703 s fast-contract step is split across two jobs; a gate listed in both
+# halves is paid for twice and a gate dropped from both is silently unrun.
+gate "ci-shard-partition" fast \
+    python3 tests/regression/check_ci_shard_partition.py
+
 gate "rust-toolchain-selector" fast \
     bash tests/regression/check_rust_toolchain_selector.sh
 
