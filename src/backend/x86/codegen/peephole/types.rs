@@ -3316,7 +3316,7 @@ mod classify_directive_tests {
 
 #[cfg(test)]
 mod fp_slot_move_width_tests {
-    use super::{parse_fp_slot_move, MoveSize};
+    use super::{MoveSize, parse_fp_slot_move};
 
     #[test]
     fn xmm_packed_slot_moves_are_dq() {
