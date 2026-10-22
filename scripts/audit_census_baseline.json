@@ -3,7 +3,7 @@
   "fns_over_300": 230,
   "fns_over_500": 94,
   "ignored_tests": 10,
-  "knob_literals": 515,
+  "knob_literals": 516,
   "knobs_undocumented": 275,
   "panic_sites": 837,
   "panic_sites_hot": 105,
