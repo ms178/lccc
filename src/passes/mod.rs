@@ -1251,7 +1251,10 @@ fn vectorize_entry(
     fp_contract: FpContract,
     x86_avx: bool,
 ) -> fn(&mut IrFunction) -> usize {
-    match (target, fp_reassoc, fp_contract, x86_avx) {
+    // Snapshot the fixed-SLP ablation at pipeline entry, alongside its ISA
+    // permission, instead of rereading process state inside each matcher.
+    let fixed_slp = x86_avx && std::env::var("CCC_NO_FIXED_SLP").is_err();
+    match (target, fp_reassoc, fp_contract, fixed_slp) {
         (crate::backend::Target::Aarch64, true, _, _) => {
             vectorize::vectorize_function_two_wide_fast_math
         }
@@ -4194,6 +4197,32 @@ mod signed_wrap_policy_tests {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fixed_slp_entry_policy_tests {
+    use super::*;
+    use crate::test_support::EnvGuard;
+
+    #[test]
+    fn fixed_slp_ablation_preserves_loop_policy_and_target_entry() {
+        for contract in [FpContract::Off, FpContract::Fast] {
+            let _guard = EnvGuard::unset("CCC_NO_FIXED_SLP");
+            let enabled = vectorize_entry(crate::backend::Target::X86_64, true, contract, true);
+            let no_avx = vectorize_entry(crate::backend::Target::X86_64, true, contract, false);
+            let arm = vectorize_entry(crate::backend::Target::Aarch64, true, contract, true);
+            assert!(!std::ptr::fn_addr_eq(enabled, no_avx));
+            let _disabled = EnvGuard::set("CCC_NO_FIXED_SLP", "1");
+            assert!(std::ptr::fn_addr_eq(
+                vectorize_entry(crate::backend::Target::X86_64, true, contract, true),
+                no_avx,
+            ));
+            assert!(std::ptr::fn_addr_eq(
+                vectorize_entry(crate::backend::Target::Aarch64, true, contract, true),
+                arm,
+            ));
         }
     }
 }

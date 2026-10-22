@@ -31676,7 +31676,7 @@ fn emit_map_scalar_tree(
 /// distance) rather than paying a horizontal-reduction loss or reading past
 /// the object boundary.
 fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
-    if func.blocks.len() != 1 || std::env::var("CCC_NO_FIXED_SLP").is_ok() {
+    if func.blocks.len() != 1 {
         return 0;
     }
     let block = &func.blocks[0];
