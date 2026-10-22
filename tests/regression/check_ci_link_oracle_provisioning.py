@@ -188,6 +188,18 @@ class LinkOracleProvisioningTests(unittest.TestCase):
         bin_dir.mkdir()
         for command in ("sudo", "uname", "apt-get", "apt-cache"):
             (bin_dir / command).symlink_to(mock)
+
+        # Give the helper only the real utilities it needs, not the runner's
+        # /bin:/usr/bin. This test runs after CI provisions mold and lld, so
+        # os.defpath would leak those real binaries into the cold-path cases;
+        # command -v would then skip the mocked apt transaction.
+        support_bin = self.directory / "support-bin"
+        support_bin.mkdir()
+        for command in ("bash", "grep", "mkdir", "sleep"):
+            executable = shutil.which(command)
+            self.assertIsNotNone(executable, f"required test utility missing: {command}")
+            (support_bin / command).symlink_to(executable)
+
         # The oracles are deliberately ABSENT from PATH unless the case asks
         # for them: presence is the whole fast-path contract under test.
         if oracles_present:
@@ -204,7 +216,7 @@ class LinkOracleProvisioningTests(unittest.TestCase):
 
         log = self.directory / "log"
         env = {**os.environ,
-               "PATH": f"{bin_dir}:{os.defpath}",
+               "PATH": f"{bin_dir}:{support_bin}",
                "MOCK_LOG": str(log),
                "MOCK_STATE": str(self.directory / "state"),
                "MOCK_BIN": str(bin_dir),
