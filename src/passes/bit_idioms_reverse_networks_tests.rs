@@ -242,7 +242,60 @@ fn early_portable_ladder_recognition_preserves_exact_masks() {
         ));
         code.push(bin(Value(next + 2), IrBinOp::Or, v(next), v(next + 1), ty));
         let mut f = IrFunction::new("portable_reverse".into(), ty, vec![], false);
-        f.next_value_id = next + 3;
+        // A real inline helper retains its own parameter home. Two
+        // separate loads must be proved equal by the analysis projection,
+        // not by pretending arbitrary pointer loads have equal contents.
+        let home = Value(next + 3);
+        let load_a = Value(next + 4);
+        let load_b = Value(next + 5);
+        if let Instruction::BinOp { lhs, .. } = &mut code[0] {
+            *lhs = Operand::Value(load_a);
+        }
+        if let Instruction::BinOp { lhs, .. } = &mut code[2] {
+            *lhs = Operand::Value(load_b);
+        }
+        code.insert(
+            2,
+            Instruction::Load {
+                dest: load_b,
+                ptr: home,
+                ty,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+        );
+        code.insert(
+            0,
+            Instruction::Load {
+                dest: load_a,
+                ptr: home,
+                ty,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+        );
+        code.insert(
+            0,
+            Instruction::Store {
+                val: v(0),
+                ptr: home,
+                ty,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+        );
+        code.insert(
+            0,
+            Instruction::Alloca {
+                dest: home,
+                ty,
+                size: 4,
+                align: 4,
+                volatile: false,
+                semantic_volatile: false,
+            },
+        );
+        f.next_value_id = next + 6;
         f.blocks = vec![BasicBlock {
             label: BlockId(0),
             instructions: code,

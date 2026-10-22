@@ -1701,6 +1701,13 @@ fn match_bit_reverse32(result: Operand, defs: &[Option<Instruction>]) -> Option<
 /// a caller's shift. Called only for the native AArch64 target, under the
 /// existing bit_idioms policy; other targets retain their old scheduling.
 pub(crate) fn recognize_reverse_ladders(func: &mut IrFunction) -> usize {
+    // The inliner deliberately retains a callee's parameter-home bridge.
+    // Analyze a bounded single-block SSA projection instead of promoting
+    // those homes in the real function. Promotion creates no join PHIs here;
+    // existing scalar value IDs retain their original runtime bits.
+    if func.blocks.len() != 1 || func.blocks[0].instructions.len() > 512 {
+        return 0;
+    }
     if !func.blocks.iter().any(|b| {
         b.instructions.iter().any(|i| {
             matches!(
@@ -1715,8 +1722,10 @@ pub(crate) fn recognize_reverse_ladders(func: &mut IrFunction) -> usize {
     }) {
         return 0;
     }
-    let mut defs = vec![None; func.max_value_id() as usize + 1];
-    for block in &func.blocks {
+    let mut projected = func.clone();
+    crate::ir::mem2reg::promote::promote_function(&mut projected, true);
+    let mut defs = vec![None; projected.max_value_id() as usize + 1];
+    for block in &projected.blocks {
         for inst in &block.instructions {
             if let Some(dest) = inst.dest() {
                 defs[dest.0 as usize] = Some(inst.clone());
