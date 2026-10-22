@@ -219,6 +219,13 @@ gate "rec2iter" fast \
 gate "fp-contract-parity" fast \
     env CCC="$LCCC" bash tests/regression/check_fp_contract_parity.sh
 
+# Ten 32x32 compiles and runs: the only gate that pins the packed multiply-add
+# loop on the *default* x86-64 target, i.e. the configuration where a missing
+# SSE2 lowering silently costs 34% against GCC at -O2 (10.00 ms vs 6.63 ms on
+# the reference kernel) without any test going red.
+gate "sse2-matmul-vectorization" fast \
+    env CCC="$LCCC" bash tests/regression/check_sse2_matmul_vectorization.sh
+
 # ~97 compiles per arm plus the runs: seconds, not minutes -- and it is the
 # only gate that exercises the historical crash/miscompile corpus end to end.
 gate "cpu-supports-runtime" fast \
