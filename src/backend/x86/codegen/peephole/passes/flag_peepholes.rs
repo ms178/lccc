@@ -2584,6 +2584,39 @@ pub(super) fn narrow_dead_sign_extension(store: &mut LineStore, infos: &mut [Lin
 /// guess, the fold declines. The real-world case this targets is a compare
 /// against a register or an immediate, so nothing is lost, and a wrong fold
 /// here would be a miscompile rather than a missed optimisation.
+///
+/// # Measured limit of the block-local restriction
+///
+/// The obvious extension is to fold, across an edge, a compare that repeats the
+/// one a branch has just consumed. A three-way test (`if (a < b) … else if
+/// (a > b) … else`) lowers to one `Cmp` per arm on identical operands, and the
+/// later arms' compares sit at the top of the block the earlier branch jumps
+/// to, so one `cmpl` provably answers both:
+///
+/// ```text
+/// .LBB2:
+///     cmpl %esi, %r9d
+///     jge  .LBB5          ; the fallthrough arm is guarded by `jmp`
+///     …
+///     jmp  .LBB7          ; so .LBB5 has exactly one predecessor
+/// .LBB5:
+///     cmpl %esi, %r9d     ; the flags the branch above just consumed
+///     jle  .LBB8
+/// ```
+///
+/// This is foldable: when the label has exactly one predecessor (one jump names
+/// it *and* the line above cannot fall through into it), the label name appears
+/// in no `.long` jump-table entry, the compare is the first real instruction
+/// after the label, and the walk back to the surviving compare crosses nothing
+/// that writes the flags, either operand, or memory. Such a pass was written
+/// and measured, and is deliberately **not** kept. Over the 2121 programs of
+/// the regression and benchmark suites that compile cleanly at `-O2` it fired
+/// on exactly one — `linux_rbtree.c` — removing 2 of 379 625 instructions
+/// (0.0005 %), with 1.008 on that program and a geomean of 0.9980 across all 49
+/// benchmarks, i.e. inside the noise band, and 300/300 `phi_cfg` differential
+/// cases passing. A ~200-line pass plus a new skip knob is not worth 0.0005 %.
+/// Do not re-implement it without a workload that exercises the shape; if one
+/// appears, the guards above are the correct ones.
 pub(super) fn fold_redundant_flags_compare(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
