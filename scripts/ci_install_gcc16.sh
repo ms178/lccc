@@ -27,8 +27,9 @@
 #
 # The distribution is tried first; the Ubuntu toolchain PPA is added only when
 # a compiler package is missing, and a non-Ubuntu host never falls back to an
-# Ubuntu PPA. CI oracle extras (qemu, mold, lld, PyYAML) join the same exact-name
-# resolver and apt transaction, but a missing extra never triggers the GCC PPA.
+# Ubuntu PPA. CI oracle extras (qemu, mold, lld, PyYAML, Valgrind) join the same
+# exact-name resolver and apt transaction, but a missing extra never triggers
+# the GCC PPA.
 set -euo pipefail
 
 usage() {

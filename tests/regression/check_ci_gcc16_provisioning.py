@@ -38,7 +38,7 @@ MULTILIB_PACKAGES = BASE_PACKAGES + (
     "libc6-dev-i386",
     "lib32gcc-16-dev",
 )
-ORACLE_PACKAGES = ("qemu-user", "mold", "lld", "python3-yaml")
+ORACLE_PACKAGES = ("qemu-user", "mold", "lld", "python3-yaml", "valgrind")
 
 MOCK = r'''
 import json, os, pathlib, re, sys
@@ -53,7 +53,7 @@ with open(os.environ['MOCK_LOG'], 'a') as handle:
 distro = set(os.environ.get(
     'DISTRO_INDEX', 'gcc-multilib g++-multilib libc6-dev-i386 clang-16').split())
 distro |= set(os.environ.get(
-    'EXTRA_INDEX', 'qemu-user mold lld python3-yaml').split())
+    'EXTRA_INDEX', 'qemu-user mold lld python3-yaml valgrind').split())
 ppa = set(os.environ.get(
     'PPA_INDEX',
     'gcc-16 g++-16 gcc-16-multilib g++-16-multilib lib32gcc-16-dev').split())
@@ -329,7 +329,7 @@ class ProvisioningTests(unittest.TestCase):
         # as mold/lld or adding the GCC-specific PPA for unrelated oracles.
         result, commands, _ = self.invoke(
             "--multilib", extras=ORACLE_PACKAGES, DISTRO_HAS_GCC16="1",
-            EXTRA_INDEX="mold-tools lld-23 qemu-user python3-yaml")
+            EXTRA_INDEX="mold-tools lld-23 qemu-user python3-yaml valgrind")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("mold", result.stderr)
         self.assertIn("lld", result.stderr)

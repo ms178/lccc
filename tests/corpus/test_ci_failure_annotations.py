@@ -124,7 +124,7 @@ class FailureAnnotationContracts(unittest.TestCase):
         # A lane that pipes the helper through its own capture wrapper would
         # swallow the annotation; the helper is the single source of truth.
         # The helper is ci_provision_toolchain.sh, which owns the whole oracle
-        # set (GCC 16, i686 multilib, qemu, mold, lld, python3-yaml) and calls
+        # set (GCC 16, i686 multilib, qemu, mold, lld, PyYAML, Valgrind) and calls
         # ci_install_gcc16.sh internally on a bundle miss -- so no lane names
         # the installer directly any more, and a lane that did would be
         # provisioning around the shared cache entry.

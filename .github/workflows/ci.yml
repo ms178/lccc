@@ -43,8 +43,8 @@ jobs:
     # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
     # apt in six lanes and 125 s in a seventh for the identical package set;
     # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld,
+    # qemu-i386 and valgrind before a lane is allowed to use it.
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
@@ -250,8 +250,8 @@ jobs:
     # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
     # apt in six lanes and 125 s in a seventh for the identical package set;
     # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld,
+    # qemu-i386 and valgrind before a lane is allowed to use it.
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
@@ -343,8 +343,8 @@ jobs:
     # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
     # apt in six lanes and 125 s in a seventh for the identical package set;
     # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld,
+    # qemu-i386 and valgrind before a lane is allowed to use it.
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
@@ -491,8 +491,8 @@ jobs:
     # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
     # apt in six lanes and 125 s in a seventh for the identical package set;
     # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld,
+    # qemu-i386 and valgrind before a lane is allowed to use it.
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
@@ -767,8 +767,8 @@ jobs:
     # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
     # apt in six lanes and 125 s in a seventh for the identical package set;
     # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld,
+    # qemu-i386 and valgrind before a lane is allowed to use it.
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
@@ -1452,8 +1452,8 @@ jobs:
     # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
     # apt in six lanes and 125 s in a seventh for the identical package set;
     # restoring the bundle is a few seconds and it is byte-identical, because
-    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
-    # qemu-i386 before a lane is allowed to use it.
+    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld,
+    # qemu-i386 and valgrind before a lane is allowed to use it.
     - name: Cache the provisioned oracle toolchain
       uses: actions/cache@v6
       with:
