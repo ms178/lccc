@@ -358,7 +358,7 @@ MOCK
 
     # 1. A complete, correct tool set passes and reports every version.
     status=0
-    PATH="$work/tools:$work/clang23:$PATH" CASES_VERSION=16.2.0 \
+    PATH="$work/tools:$work/clang23:$PATH" CLANG=clang CASES_VERSION=16.2.0 \
         bash "$0" --gcc-version 16.2 --clang-version 23.1.3 >"$work/out" 2>"$work/err" || status=$?
     if (( status == 0 )) && grep -q 'gcc-16=16.2.0' "$work/out" \
             && grep -q 'clang=23.1.3' "$work/out" && grep -q 'valgrind=valgrind-3.19.0' "$work/out"; then
@@ -370,7 +370,7 @@ MOCK
 
     # 2. A minor-version drift is refused, and the message names both versions.
     status=0
-    PATH="$work/tools:$PATH" CASES_VERSION=16.3.0 \
+    PATH="$work/tools:$PATH" CLANG=clang CASES_VERSION=16.3.0 \
         bash "$0" --gcc-version 16.2 >"$work/out" 2>"$work/err" || status=$?
     if (( status != 0 )) && grep -q 'is 16.3.0; this lane pins 16.2' "$work/err"; then
         echo "  ok   gcc minor drift refused with both versions named"
@@ -382,7 +382,7 @@ MOCK
     # 3. A missing valgrind is a failure naming the tool, not a skip.
     mv "$work/tools/valgrind" "$work/tools/valgrind.off"
     status=0
-    PATH="$work/tools:/usr/bin:/bin" CASES_VERSION=16.2.0 \
+    PATH="$work/tools:/usr/bin:/bin" CLANG=clang CASES_VERSION=16.2.0 \
         bash "$0" --valgrind-tool valgrind-case3-absent >"$work/out" 2>"$work/err" || status=$?
     if (( status != 0 )) && grep -qi 'valgrind-case3-absent is not on PATH' "$work/err"; then
         echo "  ok   missing valgrind fails closed and names the tool"
@@ -395,7 +395,7 @@ MOCK
     # 4. A clang that is not the pinned release is refused when a version is
     #    requested, and tolerated when none is.
     status=0
-    PATH="$work/tools:$work/clang18:$PATH" CASES_VERSION=16.2.0 \
+    PATH="$work/tools:$work/clang18:$PATH" CLANG=clang CASES_VERSION=16.2.0 \
         bash "$0" --gcc-version 16.2 --clang-version 23.1.3 >"$work/out" 2>"$work/err" || status=$?
     if (( status != 0 )) && grep -q 'is 18.1.3; the oracles pin 23.1.3' "$work/err"; then
         echo "  ok   unpinned clang refused when the lane asks for the pinned oracle"
@@ -404,7 +404,7 @@ MOCK
         rm -rf "$work"; return 1
     fi
     status=0
-    PATH="$work/tools:$work/clang18:$PATH" CASES_VERSION=16.2.0 \
+    PATH="$work/tools:$work/clang18:$PATH" CLANG=clang CASES_VERSION=16.2.0 \
         bash "$0" --gcc-version 16.2 >"$work/out" 2>"$work/err" || status=$?
     if (( status == 0 )) && ! grep -q 'clang=' "$work/out"; then
         echo "  ok   a lane that does not compare against Clang does not require it"
@@ -417,7 +417,7 @@ MOCK
     #    UNPINNED lane was judged against 16.2.  The distribution's 16.0.1 is
     #    the rolling-major oracle those lanes ask for, so it must pass.
     status=0
-    PATH="$work/tools:$PATH" CASES_VERSION=16.0.1 \
+    PATH="$work/tools:$PATH" CLANG=clang CASES_VERSION=16.0.1 \
         bash "$0" >"$work/out" 2>"$work/err" || status=$?
     if (( status == 0 )) && grep -q 'gcc-16=16.0.1' "$work/out"; then
         echo "  ok   an unpinned lane is not judged against the 16.2 pin"
@@ -429,7 +429,7 @@ MOCK
     # 6. ...while a lane that DOES ask for 16.2 must refuse that same oracle,
     #    naming both versions so the annotation is the whole diagnosis.
     status=0
-    PATH="$work/tools:$PATH" CASES_VERSION=16.0.1 \
+    PATH="$work/tools:$PATH" CLANG=clang CASES_VERSION=16.0.1 \
         bash "$0" --gcc-version 16.2 >"$work/out" 2>"$work/err" || status=$?
     if (( status != 0 )) && grep -q 'gcc-16 is 16.0.1; this lane pins 16.2' "$work/err"; then
         echo "  ok   a pinned lane refuses 16.0.1 and names both versions"
@@ -443,7 +443,7 @@ MOCK
     #    a host that has none of them (the research box has mold and qemu but
     #    no lld; making the default require lld turned ci_local.sh red).
     status=0
-    PATH="$work/tools-min:/usr/bin:/bin" LCCC_LLD_TOOL=lld-case7-absent CASES_VERSION=16.2.0 \
+    PATH="$work/tools-min:/usr/bin:/bin" LCCC_LLD_TOOL=lld-case7-absent CLANG=clang CASES_VERSION=16.2.0 \
         bash "$0" --gcc-version 16.2 >"$work/out" 2>"$work/err" || status=$?
     if (( status == 0 )) && ! grep -q 'lld-case7-absent' "$work/err"; then
         echo "  ok   the default require set does not demand the presence probes"
@@ -454,7 +454,7 @@ MOCK
 
     # 8. ...and a lane that DOES ask for one gets a failure that names it.
     status=0
-    PATH="$work/tools-min:/usr/bin:/bin" LCCC_LLD_TOOL=lld-case8-absent CASES_VERSION=16.2.0 \
+    PATH="$work/tools-min:/usr/bin:/bin" LCCC_LLD_TOOL=lld-case8-absent CLANG=clang CASES_VERSION=16.2.0 \
         bash "$0" --require gcc,lld >"$work/out" 2>"$work/err" || status=$?
     if (( status != 0 )) && grep -q 'lld-case8-absent is not on PATH' "$work/err"; then
         echo "  ok   --require lld fails closed and names the tool"
@@ -464,7 +464,23 @@ MOCK
     fi
 
     notice 'Oracle self-test' '9/9 cases pass'
-    echo "  self-test: 9/9 cases pass"
+    # 9. The override itself is part of the contract: the clang installer
+    #    exports CLANG as an ABSOLUTE path, so every lane after it resolves
+    #    that binary.  A fixture that only ever looks at PATH cannot see the
+    #    real entry point, and a broken override would go unnoticed until a
+    #    lane silently compared against the runner's /usr/bin/clang.
+    status=0
+    PATH="$work/tools:$PATH" CLANG="$work/clang18/clang" CASES_VERSION=16.2.0 \
+        bash "$0" --gcc-version 16.2 --clang-version 23.1.3 >"$work/out" 2>"$work/err" || status=$?
+    if (( status != 0 )) && grep -q 'is 18.1.3; the oracles pin 23.1.3' "$work/err"; then
+        echo "  ok   the CLANG override is honoured, and the pin applies through it"
+    else
+        case_fail "  FAIL CLANG override: exit $status, err=$(sed -n '1,5p' "$work/err")"
+        rm -rf "$work"; return 1
+    fi
+
+    notice 'Oracle self-test' '10/10 cases pass'
+    echo "  self-test: 10/10 cases pass"
     rm -rf "$work"
     return 0
 }
