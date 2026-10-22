@@ -108,5 +108,22 @@ destination each end at a `PROT_NONE` page, so a single byte of over-read or
 over-store faults. `tests/regression/inline_memmove_const_sizes{,_nosse}.c`;
 GCC and Clang are the differential oracles.
 
+## Open lead (start here next time)
+
+`CCC_DEBUG_SROA=1` on that TU splits three 24-byte, two-field allocas in
+`ZSTD_decompressSequencesLong_body` / `_Long_default` and **nothing** in
+`ZSTD_decompressSequences_default`, yet the latter's assembly contains a
+24-byte stack-to-stack aggregate copy per sequence
+(`lea 0x128(%rsp),%rdi; lea 0x140(%rsp),%rsi; movdqu ... ; mov ...`) followed
+by immediate reloads of the copied fields. That is the `seq_t`/`ZSTD_SequenceState`
+pair surviving in memory after the inliner replaced
+`ZSTD_decodeSequence(&seq, ...)`: the alloca's address escaped to a call at the
+time the pre-inline SROA ran, and the post-inline SROA at
+`src/passes/mod.rs:1902` then declined it. GCC promotes the fields to SSA and
+keeps them in registers. Re-running the aggregate split (or teaching it to
+re-scan allocas whose only escaping uses disappeared with inlining) is the
+first thing to try; it is the concrete difference behind the field reloads in
+the hot loop, and it is not attempted here.
+
 The decode gap is diagnosed, not fixed. Do not re-run the knob sweep or the
 link-order experiment; both are negative above.
