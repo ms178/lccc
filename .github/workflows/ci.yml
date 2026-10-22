@@ -901,21 +901,36 @@ jobs:
     # green lanes with the wrong compiler. Compiler-free and ~1 s.
     - name: Verify toolchain bundle and shard-partition contracts (mock only)
       run: |
+        set -Eeuo pipefail
+        # One `::notice` per command, before it runs.  The hosted job log is not
+        # reachable from the Checks API (the results receiver is a blob host the
+        # review environment cannot read), so a step that dies on its generic
+        # "exit code 1" names nothing at all -- and a compound step that fails
+        # silently costs a whole CI round to bisect.  The last notice printed is
+        # the command that was running when the step died.
+        printf '::notice title=Mock gate 1/7::toolchain bundle export/restore/verify\n'
         python3 tests/regression/check_ci_toolchain_bundle.py
         # Both halves of a split lane are checked, and both checkers' own
         # rules are exercised: a partition audit that cannot fail is
         # decoration, so the self-test runs beside the audit in the same step.
+        printf '::notice title=Mock gate 2/7::shard-partition self-test\n'
         python3 tests/regression/check_ci_shard_partition.py --self-test
+        printf '::notice title=Mock gate 3/7::shard-partition audit\n'
         python3 tests/regression/check_ci_shard_partition.py
+        printf '::notice title=Mock gate 4/7::lane-plan self-test\n'
         python3 tests/regression/check_ci_lane_plan.py --self-test
+        printf '::notice title=Mock gate 5/7::lane-plan audit\n'
         python3 tests/regression/check_ci_lane_plan.py
         # The oracle verifier and the tag-cache installer are the two scripts
         # that decide whether a lane's toolchain is the one its gates pin.
         # Their fixture tables are compiler-free, so they run here too: a
         # verifier that cannot fail, or an installer that accepts a doctored
         # archive, must be caught before a lane spends nine minutes finding out.
+        printf '::notice title=Mock gate 6/7::oracle verifier self-test\n'
         bash scripts/ci_verify_oracles.sh --self-test
+        printf '::notice title=Mock gate 7/7::tag-cache installer self-test\n'
         bash scripts/ci_install_gcc_oracle.sh --self-test
+        printf '::notice title=Mock gates::all seven pass\n'
     - name: Check 16-byte CAS lowering (libatomic by default, cmpxchg16b under -mcx16)
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_cas16_lowering.sh
     - name: Check a value live across a 16-byte atomic survives the libatomic call
