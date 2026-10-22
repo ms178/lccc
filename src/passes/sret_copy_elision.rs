@@ -98,6 +98,13 @@ fn alloca_sizes(func: &IrFunction) -> FxHashMap<u32, usize> {
     sizes
 }
 
+/// Immediate dominators per block index (`usize::MAX` for unreachable).
+fn dominators(func: &IrFunction) -> Vec<usize> {
+    let label_map = crate::ir::analysis::build_label_map(func);
+    let (preds, succs) = crate::ir::analysis::build_cfg(func, &label_map);
+    crate::ir::analysis::compute_dominators(func.blocks.len(), &preds, &succs)
+}
+
 /// Every operand position of one instruction, memory destinations included.
 ///
 /// `Instruction::for_each_used_value` already reports the addresses an
@@ -190,10 +197,29 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
         return forward_dominated_copies(func);
     }
 
+    // Definition site of every alloca. Retargeting makes the call name the
+    // copy's destination, so that pointer must already be live at the call.
+    // Usually it is a function-entry alloca, but the inliner materialises a
+    // callee-local aggregate at the call site, which for an sret call puts the
+    // definition *after* the call in the same block; retargeting there would
+    // define the pointer after its own use.
+    let mut alloca_def: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::Alloca { dest, .. } = inst {
+                alloca_def.insert(dest.0, (bi, ii));
+            }
+        }
+    }
+    let mut idom: Option<Vec<usize>> = None;
+
     // Plan the edits: (block, index of the copy, index of the sret call,
     // destination alloca value).
     let mut removals: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     let mut retargets: Vec<(usize, usize, u32)> = Vec::new();
+    // Accepted retargets, so a second call aimed at the same destination can
+    // be checked against an earlier candidate's window.
+    let mut accepted: Vec<(usize, usize, u32)> = Vec::new();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             let Instruction::Memcpy { dest, src, size } = inst else {
@@ -221,6 +247,41 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             if cb != bi || ci >= ii {
                 continue;
             }
+            // The destination pointer must dominate the retargeted call.
+            let Some(&(db, di)) = alloca_def.get(&d) else {
+                continue;
+            };
+            if db == bi {
+                if di >= ci {
+                    continue;
+                }
+            } else {
+                let idom = idom.get_or_insert_with(|| dominators(func));
+                if !crate::ir::analysis::dominates_idom(idom, db, cb) {
+                    continue;
+                }
+            }
+            // Nothing between the call and the copy may touch the destination:
+            // the retarget moves the call's write earlier, so an intervening
+            // reader would observe the call's bytes and an intervening writer
+            // would survive the deleted copy.
+            let mut touched = false;
+            for inst in &func.blocks[bi].instructions[ci + 1..ii] {
+                inst.for_each_used_value(|v| touched |= v == d);
+            }
+            if touched {
+                continue;
+            }
+            // A second call retargeted at the same destination inside this
+            // window would write the object between the two points the copy
+            // covers, leaving the later write visible after the copy is gone.
+            if accepted
+                .iter()
+                .any(|&(ab, ai, ad)| ab == bi && ad == d && ai > ci && ai < ii)
+            {
+                continue;
+            }
+            accepted.push((bi, ci, d));
             retargets.push((cb, ci, d));
             removals.entry(bi).or_default().push(ii);
         }
@@ -811,6 +872,93 @@ mod tests {
             source_spans: vec![],
         });
         func
+    }
+
+    /// The inliner materialises a callee-local aggregate at the call site, so
+    /// an sret call can be followed by the destination alloca. Retargeting the
+    /// call there would define the pointer after its own use: the candidate is
+    /// declined and the copy is left for the read-forwarding phase.
+    #[test]
+    fn declines_retarget_when_the_destination_alloca_follows_the_call() {
+        let mut func = func_with(vec![
+            alloca(0, 24),
+            alloca(2, 8),
+            sret_call(3, 0, 2),
+            alloca(1, 24),
+            Instruction::Memcpy {
+                dest: Value(1),
+                src: Value(0),
+                size: 24,
+            },
+            Instruction::Load {
+                dest: Value(5),
+                ptr: Value(1),
+                ty: IrType::U64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+        ]);
+        run(&mut func);
+        match &func.blocks[0].instructions[2] {
+            Instruction::Call { info, .. } => assert_eq!(
+                info.args[0],
+                Operand::Value(Value(0)),
+                "the call must keep writing the hidden slot: its destination \
+                 alloca is defined later in the same block"
+            ),
+            other => panic!("expected the sret call, got {other:?}"),
+        }
+        // The definition still precedes every use of the destination.
+        let alloca_at = func.blocks[0]
+            .instructions
+            .iter()
+            .position(|inst| matches!(inst, Instruction::Alloca { dest, .. } if *dest == Value(1)))
+            .expect("destination alloca survives");
+        for (i, inst) in func.blocks[0].instructions.iter().enumerate() {
+            let mut uses_dest = false;
+            inst.for_each_used_value(|v| uses_dest |= v == 1);
+            assert!(
+                !uses_dest || i > alloca_at,
+                "instruction #{i} uses the destination before its alloca"
+            );
+        }
+    }
+
+    /// A retarget moves the call's write earlier: an instruction between the
+    /// call and the copy that writes the destination would otherwise leave its
+    /// own bytes visible once the copy is deleted.
+    #[test]
+    fn keeps_the_copy_when_a_store_writes_the_destination_between_call_and_copy() {
+        let mut func = func_with(vec![
+            alloca(0, 24),
+            alloca(1, 24),
+            alloca(2, 8),
+            sret_call(3, 0, 2),
+            Instruction::Store {
+                val: Operand::Value(Value(2)),
+                ptr: Value(1),
+                ty: IrType::U64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            },
+            Instruction::Memcpy {
+                dest: Value(1),
+                src: Value(0),
+                size: 24,
+            },
+        ]);
+        assert_eq!(run(&mut func), 0, "the copy must survive");
+        match &func.blocks[0].instructions[3] {
+            Instruction::Call { info, .. } => assert_eq!(info.args[0], Operand::Value(Value(0))),
+            other => panic!("expected the sret call, got {other:?}"),
+        }
+        assert!(
+            func.blocks[0]
+                .instructions
+                .iter()
+                .any(|inst| matches!(inst, Instruction::Memcpy { .. })),
+            "the copy must survive"
+        );
     }
 
     #[test]
