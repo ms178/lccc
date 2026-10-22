@@ -89,6 +89,7 @@ pub(crate) mod vec_arx;
 pub(crate) mod vec_fma_contract;
 pub(crate) mod vec_interleave;
 pub(crate) mod vec_load_sink;
+mod vec_relations;
 pub(crate) mod vec_ssa;
 pub(crate) mod vector_temp_promotion;
 pub(crate) mod vectorize;
@@ -3546,6 +3547,15 @@ pub(crate) fn run_passes(
     if !pass_disabled(&disabled, "vecssa") {
         vec_ssa::promote_vector_allocas(module);
         verify::verify_after_pass(module, "vecssa");
+    }
+
+    // Exact packed integer and register-image relations. Scalar-typed
+    // simplifiers must not inspect vector placeholder values after vecssa.
+    if !pass_disabled(&disabled, "vecrelations") {
+        if vec_relations::run(module) > 0 {
+            module.for_each_function(dce::eliminate_dead_code);
+        }
+        verify::verify_after_pass(module, "vecrelations");
     }
 
     // Phase 11a'': Packed FMA contraction over the register-valued vector
