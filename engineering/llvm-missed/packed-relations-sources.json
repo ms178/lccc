@@ -1,0 +1,59 @@
+{
+  "cohort": "packed-relations",
+  "retrieved_at_utc": "2026-10-22T01:27:42.834794+00:00",
+  "method": "Original issue bodies and paginated public conversation comments through GitHub REST API. External linked reductions/proofs were not fetched or executed; collection and hashes are not equivalence proofs.",
+  "reports": [
+    {
+      "number": 192094,
+      "url": "https://github.com/llvm/llvm-project/issues/192094",
+      "title": "[CVP] Missed vector select simplification for `select (icmp ult X, 1<<N), (and X, (1<<N)-1), K`",
+      "updated_at": "2026-04-24T01:00:46Z",
+      "body_sha256": "0c2775dab010cf00c362c35e65cdd151fe49145d0a42c683e5fdd84ef24d63ab",
+      "issue_json_sha256": "29177385d6e25744091bf526fa46ccde223271837539170d596bb9727ae72aae",
+      "comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "comment_count": 0,
+      "reported_comment_count": 0,
+      "disposition": "covered-limited",
+      "scope": "Packed unsigned < power-of-two / <= contiguous-low-mask compare supplies a bound to the true arm of a compatible same-or-finer-granularity blend or canonical bitwise selection. Remove only the matching AND mask. Eight integer lane/register shapes; signed/noncontiguous/mixed/coarser shapes refuse."
+    },
+    {
+      "number": 219334,
+      "url": "https://github.com/llvm/llvm-project/issues/219334",
+      "title": "[InstCombine] Generalise `bitreverse(bitreverse(x) << 1) => x >> 1` to more complex operations on `x`",
+      "updated_at": "2026-09-03T20:01:29Z",
+      "body_sha256": "c2e91a0b319cdc3d48cb589afd183a7919e23d03cfcccfe2ede9da843628b088",
+      "issue_json_sha256": "bc06c040d05c48ee8055ec4f05fb7805e1b2995c74b263568d72559e08ede299",
+      "comments_sha256": "fc9190a7b2f235e25a07f844893c33010e76f3d38ad18273594b3eba7cd96e51",
+      "comment_count": 4,
+      "reported_comment_count": 4,
+      "disposition": "covered-limited",
+      "scope": "Private same-width BitReverse networks over AND/OR/XOR/NOT and fixed valid logical shifts are conjugated by bit permutation; all six original shapes are covered at IR level. Shared internal operations, casts, arithmetic, AShr and invalid counts refuse; shared reversal leaves are retained when needed."
+    },
+    {
+      "number": 202576,
+      "url": "https://github.com/llvm/llvm-project/issues/202576",
+      "title": "[InstCombine] Fold `select (x == -1), y, umin(x, y)` to `umin(x, y)`",
+      "updated_at": "2026-06-17T08:29:47Z",
+      "body_sha256": "e99dba70e435b4a090267b4442eb7c2303fc8218ec2b41d66b9fa16094c102e4",
+      "issue_json_sha256": "994cc4d4e04179a2fdb834621206a0537af915b48ef9d62ee4f67044c41a5273",
+      "comments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "comment_count": 0,
+      "reported_comment_count": 0,
+      "disposition": "covered-limited",
+      "scope": "All-ones unsigned sentinel select around an already existing scalar min select reuses that min. Same bound SSA operand, width, Eq/Ne arm orientation and unsigned min provenance are mandatory. No general min/max intrinsic or arbitrary sentinel is claimed."
+    },
+    {
+      "number": 205005,
+      "url": "https://github.com/llvm/llvm-project/pull/205005",
+      "title": "[SE] Prove umin/umax comparisons before operand canonicalization",
+      "updated_at": "2026-07-08T14:56:06Z",
+      "body_sha256": "0d7344b7f543333afc2261920ff297771112a492f58dc28ef23fded6c491e88f",
+      "issue_json_sha256": "f4f88c19a0059b882ed13927f17898d5a426b65c140191e3e53d9dd189a1468c",
+      "comments_sha256": "06697685a3e938e1cdbfbe9f3652c3f5c601d085ce4a22a9d59361d4f705da35",
+      "comment_count": 10,
+      "reported_comment_count": 10,
+      "disposition": "covered-limited",
+      "scope": "Direct signed/unsigned <= and strict-opposite observations of existing scalar min/max selects against either operand fold before offset arithmetic obscures their structure. This does not implement the upstream memory-safety/ScalarEvolution/vectorizer constraint solver."
+    }
+  ]
+}

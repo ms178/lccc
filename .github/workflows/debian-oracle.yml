@@ -80,6 +80,12 @@ jobs:
           print('::notice title=Predicate relations exact GCC receipt::' + json.dumps(summary))
           PY
 
+      - name: Packed vector relations against exact Debian GCC 16.2
+        run: python3 tests/regression/check_packed_vector_relations.py --json debian-packed-vector-relations.json
+
+      - name: Integer order networks against exact Debian GCC 16.2
+        run: python3 tests/regression/check_integer_order_networks.py
+
       # The normal benchmark workflow supplies paired timing. This lane is
       # independent distribution/exact-toolchain correctness evidence, not a
       # second runtime ranking. No --only: the registry defines coverage.
@@ -175,6 +181,7 @@ jobs:
           path: |
             debian-results.json
             debian-predicate-relations.json
+            debian-packed-vector-relations.json
             debian-summary.md
             debian-artifacts/
             debian-callgrind/

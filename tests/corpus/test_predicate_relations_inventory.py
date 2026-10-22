@@ -77,8 +77,9 @@ class PredicateRelationsInventory(unittest.TestCase):
         for row in reports:
             with self.subTest(number=row["number"]):
                 number = row["number"]
-                self.assertEqual(row["disposition"], ledger[number]["status"])
-                self.assertEqual(row["disposition"], index[number]["review_status"])
+                self.assertEqual(ledger[number]["status"], index[number]["review_status"])
+                if row["disposition"] != ledger[number]["status"]:
+                    self.assertTrue(any(f["previous_status"] == row["disposition"] and f["status"] == ledger[number]["status"] for f in ledger[number].get("followups", [])), "historical cohort requires a distinct follow-up")
                 self.assertIn(f"[{number}]({row['url']})", doc)
                 self.assertTrue(row["scope"])
                 for field in ("body_sha256", "comments_sha256", "issue_json_sha256"):

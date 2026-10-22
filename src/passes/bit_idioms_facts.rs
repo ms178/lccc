@@ -381,6 +381,12 @@ fn fold(
     fresh: Value,
 ) -> Option<Vec<Instruction>> {
     cx.visits.set(512);
+    if let Some(replacement) = extrema::fold(inst, cx) {
+        return Some(replacement);
+    }
+    if let Some(replacement) = reverse_networks::fold(inst, cx, fresh) {
+        return Some(replacement);
+    }
     if let Some(replacement) = count_merge::fold(inst, cx, facts, fresh) {
         return Some(replacement);
     }
@@ -978,3 +984,9 @@ mod select_facts;
 
 #[path = "bit_idioms_relational_guards.rs"]
 mod relational_guards;
+
+#[path = "bit_idioms_reverse_networks.rs"]
+mod reverse_networks;
+
+#[path = "bit_idioms_extrema.rs"]
+mod extrema;
