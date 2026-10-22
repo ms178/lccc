@@ -1211,14 +1211,12 @@ pub(super) fn fold_entry_load_relay(store: &mut LineStore, infos: &mut [LineInfo
             let Some((mnemonic, rest)) = t.split_once(' ') else {
                 break;
             };
-            // Retargeting moves the original read to the relay point. Even a
-            // `mov*`/`xor*` line can be an aliasing load or store, so only
-            // cross register/immediate-only instructions; an unknown memory
-            // operand is a hard barrier rather than a reason to assume no
-            // alias.
-            if t.contains('(') || t.contains('[') {
-                break;
-            }
+            // This rewrite changes only the destination register of the
+            // entry load; it does not move the memory access. Memory operations
+            // in this window therefore keep their original order. The
+            // register-use scan below proves the new destination is neither
+            // read nor written before the relay point; liveness proves the
+            // old source is dead after the relay.
             if !matches!(mnemonic, "movl" | "movq" | "movslq" | "xorl") {
                 break;
             }
@@ -1273,8 +1271,10 @@ mod entry_load_relay_tests {
         (changed, store.build_result(|i| infos[i].is_nop()))
     }
     #[test]
-    fn entry_load_retargets_zero_extended_wide_relay() {
-        let (changed, out) = fold("    movl %edx, %r8d\n", "");
+    fn entry_load_retargets_zero_extended_wide_relay_across_memory_read() {
+        // The load itself stays in place, even when the intervening read is
+        // from the exact same address. Only register liveness matters here.
+        let (changed, out) = fold("    movl 8(%rdi), %edx\n", "");
         assert!(changed && out.contains("movl 8(%rdi), %r9d"), "{out}");
         assert!(!out.contains("movq %r12, %r9"), "{out}");
     }
@@ -1293,15 +1293,15 @@ mod entry_load_relay_tests {
     }
 
     #[test]
-    fn entry_load_relay_refuses_intervening_aliasing_memory_write() {
-        // Retargeting the entry load past this store would read 42 instead of
-        // the original memory value. The source load and clobber deliberately
-        // name the same address; unknown memory operands must remain barriers.
+    fn entry_load_retarget_preserves_order_with_aliasing_memory_write() {
+        // Even when this store aliases the entry load, the optimization only
+        // changes the load destination. It must retain the original load-before
+        // store ordering while eliminating the later register relay.
         let (changed, out) = fold("    movl $42, 8(%rdi)\n", "");
-        assert!(
-            !changed,
-            "the memory read must not cross an aliasing write: {out}"
-        );
-        assert!(out.contains("movl 8(%rdi), %r12d"), "{out}");
+        assert!(changed, "the register-only relay is still redundant: {out}");
+        let load = out.find("movl 8(%rdi), %r9d").expect(&out);
+        let store = out.find("movl $42, 8(%rdi)").expect(&out);
+        assert!(load < store, "the memory access order changed: {out}");
+        assert!(!out.contains("movq %r12, %r9"), "{out}");
     }
 }
