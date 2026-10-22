@@ -187,7 +187,12 @@ mod tests {{
     #[test]
     fn table_is_sorted_and_binary_search_reaches_every_row() {{
         for pair in ARITY_TABLE.windows(2) {{
-            assert!(pair[0].0 < pair[1].0, "unsorted: {{}} {{}}", pair[0].0, pair[1].0);
+            assert!(
+                pair[0].0 < pair[1].0,
+                "unsorted: {{}} {{}}",
+                pair[0].0,
+                pair[1].0
+            );
         }}
         for (name, arity) in ARITY_TABLE {{
             assert_eq!(
