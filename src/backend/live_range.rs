@@ -2886,6 +2886,15 @@ impl LinearScanAllocator {
         }
 
         let mut ranges = std::mem::take(&mut self.ranges);
+        // START ORDER IS AN INVARIANT, not a preference: the scan consults the
+        // ACTIVE set at the incoming range's start, so admitting a later range
+        // first parks a register on an interval that has not begun and the
+        // earlier range is slotted while the pool looks occupied by a range it
+        // does not overlap. Ranking an over-subscribed wave by the cost model
+        // instead was measured at 5 % on `hot_web_loop` and rejected for that
+        // reason (`tests/regression/check_hot_loop_register_homes.sh`). The
+        // cost model decides who keeps the last register in the victim
+        // selection below, which is order-independent.
         ranges.sort_by(|a, b| {
             a.start
                 .cmp(&b.start)

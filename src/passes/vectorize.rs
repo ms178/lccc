@@ -28007,16 +28007,18 @@ fn transform_reduction_sse2(
                 IntrinsicOp::VecHorizontalAddI64x2,
             ),
             IrType::I32 => {
-                // VecMulI32x4 lowers to `pmulld` (SSE4.1; the SSE2 `pmuludq`
-                // pair would need two extra shuffles per multiply, which
-                // loses to the scalar `imul` chain).  An I32 dot product on
-                // an SSE2-only TU therefore stays scalar.
-                if pattern.kind == ReductionKind::DotProduct && !neon && !x86_sse41_available() {
-                    if debug {
-                        eprintln!("[VEC-RED] I32 dot product needs SSE4.1 pmulld; ISA denies it");
-                    }
-                    return 0;
-                }
+                // `VecMulI32x4` is `pmulld` where SSE4.1 exists and a
+                // `pmuludq` pair (two shifts, two `pshufd`, one
+                // `punpckldq`) on the SSE2 baseline -- see
+                // `x86::codegen::intrinsics::emit_int_mul_i32x4`. That
+                // sequence is exact, not an approximation: a C int32 product
+                // keeps the low 32 bits, which are the same bits whether
+                // `pmuludq` reads the operands as signed or unsigned. Eight
+                // instructions therefore produce four products instead of
+                // four `imul`s on the port the loop's dependency chain
+                // already saturates, which is what the correlation loop in
+                // tests/benchmark/programs/double_reduction.c measures
+                // (268 ms -> 121 ms against gcc's 210 ms on this box).
                 (
                     4u64,
                     IntrinsicOp::LoadI32x4,

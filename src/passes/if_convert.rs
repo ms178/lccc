@@ -1269,7 +1269,17 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
 
     // Build CFG
     let label_to_idx = analysis::build_label_map(func);
-    let (preds, _succs) = analysis::build_cfg(func, &label_to_idx);
+    let (preds, succs) = analysis::build_cfg(func, &label_to_idx);
+
+    // Loop nesting for the shared-arm budget: the same dominator/loop run the
+    // detector context performs, but on the PRE-duplication CFG the plan is
+    // derived from.  `block_depth` is 0 for every block outside all loops.
+    let dup_loop_depth = {
+        let idom = analysis::compute_dominators(num_blocks, &preds, &succs);
+        let nested =
+            crate::passes::loop_analysis::find_natural_loops(num_blocks, &preds, &succs, &idom);
+        crate::passes::loop_analysis::LoopNest::analyze(num_blocks, &nested).block_depth
+    };
 
     // Eliminate arm-block reloads of addresses the branch pred already loads;
     // this both removes redundant memory traffic and unblocks diamond/triangle
@@ -1282,7 +1292,7 @@ fn if_convert_once(func: &mut IrFunction) -> usize {
     // Planned on the post-rewrite CFG (label_to_idx/preds are still current
     // — the covered-load rewrites are instruction-level); the detector
     // context is built AFTER the duplication so it sees the fresh CFG.
-    let dup = match plan_shared_arm_dup(func, &label_to_idx, &preds) {
+    let dup = match plan_shared_arm_dup(func, &label_to_idx, &preds, &dup_loop_depth) {
         Some(plan) => usize::from(apply_shared_arm_dup(func, &plan)),
         None => 0,
     };
@@ -1501,6 +1511,7 @@ fn plan_shared_arm_dup(
     func: &IrFunction,
     label_to_idx: &crate::common::fx_hash::FxHashMap<BlockId, usize>,
     preds: &analysis::FlatAdj,
+    loop_depth: &[usize],
 ) -> Option<SharedArmDup> {
     for h_idx in 0..func.blocks.len() {
         let (c1, t1, f1) = match &func.blocks[h_idx].terminator {
@@ -1589,8 +1600,9 @@ fn plan_shared_arm_dup(
             if !is_side_effect_free(s_block) || !is_side_effect_free(t_block) {
                 continue;
             }
-            let max_arm_insts: usize =
-                crate::backend::x86::cpu_model::active().if_convert_arm_budget();
+            // The INNER diamond (arms S and T, head H2) is the one whose
+            // arms are speculative, so its head owns the budget decision.
+            let max_arm_insts = loop_arm_budget(loop_depth.get(h2_idx).copied().unwrap_or(0));
             if effective_arm_len(s_block) > max_arm_insts
                 || effective_arm_len(t_block) > max_arm_insts
             {
@@ -1921,6 +1933,12 @@ struct IfConvCtx<'a> {
     func: &'a IrFunction,
     label_to_idx: FxHashMap<BlockId, usize>,
     preds: analysis::FlatAdj,
+    /// Loop nesting depth of every block (0 = outside every loop), from
+    /// `loop_analysis::LoopNest`.  The if-conversion budget is a function of
+    /// this: a diamond reached once per call and a diamond reached once per
+    /// loop iteration pay the same speculation cost for wildly different
+    /// frequencies (see [`arm_budget_for`]).
+    loop_depth: Vec<usize>,
     /// Dest -> defining instruction (cloned; stable across the pass).
     defs: FxHashMap<u32, Instruction>,
     /// Copy chains dest -> src.
@@ -1931,6 +1949,14 @@ impl<'a> IfConvCtx<'a> {
     fn build(func: &'a IrFunction) -> Self {
         let label_to_idx = analysis::build_label_map(func);
         let cfg = analysis::CfgAnalysis::build(func);
+        let nested = crate::passes::loop_analysis::find_natural_loops(
+            cfg.num_blocks,
+            &cfg.preds,
+            &cfg.succs,
+            &cfg.idom,
+        );
+        let loop_depth =
+            crate::passes::loop_analysis::LoopNest::analyze(cfg.num_blocks, &nested).block_depth;
         let defs = func
             .blocks
             .iter()
@@ -1953,6 +1979,7 @@ impl<'a> IfConvCtx<'a> {
             func,
             label_to_idx,
             preds: cfg.preds,
+            loop_depth,
             defs,
             copy_of,
         }
@@ -2047,8 +2074,75 @@ fn rare_masked_outcome(ctx: &IfConvCtx<'_>, cond: &Operand, fuel: usize) -> Opti
     }
 }
 
-fn speculative_arm_budget(ctx: &IfConvCtx<'_>, cond: &Operand, outcome: bool) -> usize {
-    let usual = crate::backend::x86::cpu_model::active().if_convert_arm_budget();
+/// `LCCC_IFCONV_ARM_BUDGET=<n|off>` — A/B lever and kill switch for the
+/// loop-resident arm budget, resolved once per process.
+///
+/// A positive integer replaces the in-loop budget (so `=8` reproduces the
+/// pre-loop-aware behaviour of every diamond, in or out of a loop, while
+/// `=1`/`=2` measure a stricter prior).  `off`/`full`/`0` disables the
+/// loop-aware restriction entirely.  An unparsable value is ignored rather
+/// than aborting a build, matching `LCCC_PEEPHOLE_PAIR_PARALLEL`.
+fn loop_budget_override() -> Option<usize> {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let raw = std::env::var("LCCC_IFCONV_ARM_BUDGET").ok()?;
+        let raw = raw.trim();
+        if raw == "0" || raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("full") {
+            return Some(usize::MAX);
+        }
+        // A budget of 0 would mean "never if-convert", which is spelled `off`;
+        // treat it as the default rather than silently disabling the pass.
+        raw.parse::<usize>().ok().filter(|&n| n > 0)
+    })
+}
+
+/// Effective-instruction budget for one arm of the diamond headed by
+/// `pred_idx`.
+///
+/// Two regimes, because the frequency of the speculation differs by orders of
+/// magnitude (see `cpu_model::if_convert_arm_budget{,_in_loop}` for the
+/// derivation):
+///
+///   * outside any loop — the diamond runs once per call, the branch costs at
+///     most one mispredict, so the coin-flip budget applies (8 on Generic);
+///   * inside a loop — the speculation executes every iteration, so the
+///     conservative loop prior applies (3), which still admits the scalar
+///     select and the conditional-reduction diamond.
+fn arm_budget_for(ctx: &IfConvCtx<'_>, pred_idx: usize) -> usize {
+    loop_arm_budget(ctx.loop_depth.get(pred_idx).copied().unwrap_or(0))
+}
+
+/// [`arm_budget_for`] keyed on the head's loop nesting depth, for callers that
+/// have the depth but no [`IfConvCtx`] (`plan_shared_arm_dup` runs before the
+/// context is built).
+fn loop_arm_budget(depth: usize) -> usize {
+    let tune = crate::backend::x86::cpu_model::active();
+    let once_per_call = tune.if_convert_arm_budget();
+    if depth == 0 {
+        return once_per_call;
+    }
+    match loop_budget_override() {
+        Some(n) if n == usize::MAX => once_per_call,
+        Some(n) => n,
+        None => tune.if_convert_arm_budget_in_loop(),
+    }
+}
+
+/// Arm budget for one OUTCOME of the diamond headed by `pred_idx`.
+///
+/// The two priors compose and the stricter one wins: the loop-resident
+/// regime is about how often the speculation executes, the masked-outcome
+/// prior is about whether the branch was predictable in the first place, and
+/// an arm that is both inside a loop and the rare outcome of a masked compare
+/// must satisfy both.  Taking the minimum is the only combination that
+/// cannot be gamed by one prior ignoring the other.
+fn speculative_arm_budget(
+    ctx: &IfConvCtx<'_>,
+    pred_idx: usize,
+    cond: &Operand,
+    outcome: bool,
+) -> usize {
+    let usual = arm_budget_for(ctx, pred_idx);
     if rare_masked_outcome(ctx, cond, 8) == Some(outcome) {
         usual.min(2)
     } else {
@@ -2737,8 +2831,8 @@ fn detect_diamond(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
     // system generates Load + Cast chains (parameter loads + sign
     // extensions) that inflate the count; a typical arm: Load, Cast, Load,
     // Cast, BinOp, Cast = 6 insts.  See docs/CPU_MODEL_AUDIT.md §4.
-    let true_budget = speculative_arm_budget(ctx, cond, true);
-    let false_budget = speculative_arm_budget(ctx, cond, false);
+    let true_budget = speculative_arm_budget(ctx, pred_idx, cond, true);
+    let false_budget = speculative_arm_budget(ctx, pred_idx, cond, false);
     // EFFECTIVE instruction count: address-materialization chains (IV Cast,
     // Shl scaling, base Copy, the GEP itself) are pure address math the
     // backend folds into one SIB operand — they add nothing speculative.
@@ -2945,8 +3039,9 @@ fn detect_triangle(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> 
         return None;
     }
 
-    // Same tuning-model budget as the diamond form above.
-    let max_arm_insts = speculative_arm_budget(ctx, cond, arm_is_true);
+    // Same tuning-model budget as the diamond form above, including the
+    // loop-resident split.
+    let max_arm_insts: usize = speculative_arm_budget(ctx, pred_idx, cond, arm_is_true);
     let arm_insts = if arm_block.instructions.iter().all(|i| {
         matches!(
             i,
@@ -3711,6 +3806,129 @@ mod tests {
         assert!(matches!(
             func.blocks[0].instructions[1],
             Instruction::Select { .. }
+        ));
+    }
+
+    /// Two functions carrying the IDENTICAL 4-effective-instruction diamond:
+    /// one straight-line, one loop-resident.
+    ///
+    ///   * straight-line: the diamond executes once per call, so the branch
+    ///     costs at most one mispredict and the coin-flip arm budget (>= 4 on
+    ///     every tuning row) admits the conversion;
+    ///   * loop-resident: the same speculation would execute on every
+    ///     iteration *and* keep the arm's operands live across the loop body,
+    ///     so the loop budget (3 on every row) keeps it a branch.
+    ///
+    /// This is the reduced form of `hot_web_loop`, where if-converting a
+    /// 6-instruction rare arm turned a 16-instruction loop into 45
+    /// instructions with four `cmov`s and six stack reloads per iteration.
+    /// The assertion on the straight-line twin is what proves the budget is
+    /// conditioned on loop nesting rather than merely lowered.
+    #[test]
+    fn loop_resident_diamond_uses_the_in_loop_arm_budget() {
+        // Four effective instructions: excluded classifications (GEP, Copy,
+        // GlobalAddr, Shl) do not apply, so the arm length is exactly 4.
+        fn four_inst_arm(base: Value) -> (Vec<Instruction>, Value) {
+            let ops = [IrBinOp::Add, IrBinOp::Sub, IrBinOp::Xor, IrBinOp::And];
+            let mut insts = Vec::new();
+            let mut cur = base;
+            for (i, op) in ops.into_iter().enumerate() {
+                let dest = Value(base.0 + 1 + i as u32);
+                insts.push(Instruction::BinOp {
+                    dest,
+                    op,
+                    lhs: Operand::Value(cur),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                });
+                cur = dest;
+            }
+            (insts, cur)
+        }
+        fn build(in_loop: bool) -> IrFunction {
+            let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+            let arm_len = 4u32;
+            // b0: entry
+            func.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![],
+                terminator: Terminator::Branch(BlockId(1)),
+                source_spans: Vec::new(),
+            });
+            // b1: diamond head (also the loop header when loop-resident)
+            func.blocks.push(BasicBlock {
+                label: BlockId(1),
+                instructions: vec![],
+                terminator: Terminator::CondBranch {
+                    cond: Operand::Value(Value(0)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+                source_spans: Vec::new(),
+            });
+            // b2: true arm
+            let (arm, arm_val) = four_inst_arm(Value(0));
+            func.blocks.push(BasicBlock {
+                label: BlockId(2),
+                instructions: arm,
+                terminator: Terminator::Branch(BlockId(4)),
+                source_spans: Vec::new(),
+            });
+            // b3: false arm
+            func.blocks.push(BasicBlock {
+                label: BlockId(3),
+                instructions: vec![],
+                terminator: Terminator::Branch(BlockId(4)),
+                source_spans: Vec::new(),
+            });
+            // b4: merge, then either back to the header (loop) or out.
+            func.blocks.push(BasicBlock {
+                label: BlockId(4),
+                instructions: vec![Instruction::Phi {
+                    dest: Value(arm_len + 1),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Value(arm_val), BlockId(2)),
+                        (Operand::Const(IrConst::I32(0)), BlockId(3)),
+                    ],
+                }],
+                terminator: if in_loop {
+                    Terminator::Branch(BlockId(1))
+                } else {
+                    Terminator::Return(Some(Operand::Value(Value(arm_len + 1))))
+                },
+                source_spans: Vec::new(),
+            });
+            func.next_value_id = arm_len + 2;
+            func
+        }
+
+        // Straight-line: converts.
+        let mut straight = build(false);
+        assert_eq!(if_convert_function(&mut straight), 1);
+        assert!(
+            straight.blocks[1]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Select { .. }))
+        );
+
+        // Loop-resident: refused, and the branch is still the terminator.
+        let mut looped = build(true);
+        assert_eq!(
+            if_convert_function(&mut looped),
+            0,
+            "loop-resident 4-instruction arm must not be if-converted"
+        );
+        assert!(
+            looped.blocks[1]
+                .instructions
+                .iter()
+                .all(|i| !matches!(i, Instruction::Select { .. }))
+        );
+        assert!(matches!(
+            looped.blocks[1].terminator,
+            Terminator::CondBranch { .. }
         ));
     }
 

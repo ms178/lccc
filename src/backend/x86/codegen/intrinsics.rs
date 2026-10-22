@@ -337,6 +337,76 @@ impl X86Codegen {
         self.state.sse_last_store_reg_name = Some(xmm);
     }
 
+    /// Four-lane `int32` product, sign- and wrap-agnostic.
+    ///
+    /// `pmulld` is SSE4.1, so on the x86-64 baseline (SSE2 only -- what a
+    /// plain `cc file.c` and CI both target) the whole `VecMulI32x4` family
+    /// used to be unavailable and the vectorizer had to decline I32 multiply
+    /// maps and dot products outright. SSE2 does have `pmuludq`
+    /// (32x32 -> 64, unsigned) on the even dwords, and a C int32 product only
+    /// keeps the low 32 bits of each product -- the same bits whether the
+    /// operands are read as signed or unsigned. Four lanes therefore cost two
+    /// `pmuludq` plus the shuffles that select the half of each 64-bit
+    /// product we want, and the result is bit-identical to `pmulld`:
+    ///
+    ///     lo = pmuludq(x, y)         ; dwords [x0*y0, hi, x2*y2, hi]
+    ///     xh = psrlq(x, 32)          ; x1, x3 in the low dwords
+    ///     yh = psrlq(y, 32)
+    ///     hi = pmuludq(xh, yh)       ; dwords [x1*y1, hi, x3*y3, hi]
+    ///     lo = pshufd(lo, 0x08)      ; [x0*y0, x2*y2, x0*y0, x2*y2]
+    ///     hi = pshufd(hi, 0x08)      ; [x1*y1, x3*y3, x1*y1, x3*y3]
+    ///     r  = punpckldq(hi, lo)     ; [x0*y0, x1*y1, x2*y2, x3*y3]
+    ///
+    /// The `pshufd` pair is not decoration: `pmuludq` writes a full 64-bit
+    /// product into each lane, so the ODD dword of every lane holds the HIGH
+    /// half of an even-lane product. Combining with `por` after a shift looks
+    /// like it selects the low halves and does not -- it ORs that garbage
+    /// into the odd lanes, which is exactly what a first cut of this
+    /// sequence did — arithmetically right, and wrong for every product
+    /// wider than 31 bits or negative; the corpus differential
+    /// (`double_reduction` and `sha256_transform`, both of which read every
+    /// lane's sign bit) rejected the checksum immediately.
+    /// `punpckldq` overwrites the odd dwords instead of OR-ing into them.
+    ///
+    /// Eight instructions against the scalar loop's two `imul` per element,
+    /// and they work on four lanes at once on the port that has nothing else
+    /// to do. Measured on tests/benchmark/programs/double_reduction.c (the
+    /// `s += a[i]*b[i]` correlation loop) this is what GCC emits and what the
+    /// benchmark was losing to.
+    ///
+    /// The third register is `%xmm2`, following the contract the other
+    /// multi-step 128-bit emitters use: `stack_layout::regalloc_helpers`
+    /// withholds it from the vector pool when this lowering can be reached
+    /// (see `clobbers_xmm2`), so it is never somebody's live home.
+    fn emit_int_mul_i32x4(&mut self, dest: &Value, args: &[Operand]) {
+        if self.isa.sse41 {
+            self.emit_sse_binary_128(dest, args, "pmulld");
+            return;
+        }
+        assert!(
+            args.len() >= 2,
+            "VecMulI32x4: malformed intrinsic ({} args)",
+            args.len()
+        );
+        // src2 FIRST, src1 second: `sse_load_arg` documents that args[1] may
+        // still be the pending deferred value living in %xmm0, and loading
+        // args[0] into %xmm0 would clobber it (the pending store is then
+        // discarded as "consumed", leaving the never-written slot to be read
+        // back). Same order as `emit_sse_binary_128` takes.
+        self.sse_load_arg(&args[1], "xmm1");
+        self.sse_load_arg(&args[0], "xmm0");
+        // xmm0 = lo, xmm2 = scratch; xmm1 is dead after its last use below.
+        self.state.emit("    movdqa %xmm0, %xmm2");
+        self.state.emit("    pmuludq %xmm1, %xmm0");
+        self.state.emit("    psrlq $32, %xmm2");
+        self.state.emit("    psrlq $32, %xmm1");
+        self.state.emit("    pmuludq %xmm1, %xmm2");
+        self.state.emit("    pshufd $0x08, %xmm0, %xmm0");
+        self.state.emit("    pshufd $0x08, %xmm2, %xmm2");
+        self.state.emit("    punpckldq %xmm2, %xmm0");
+        self.sse_store_dest(dest, "xmm0");
+    }
+
     /// Lazy-flush a pending deferred vector-result store: the producer
     /// kept its result in the holding register instead of storing it. Called
     /// whenever anything is about to clobber that register, read the slot, or
@@ -6912,7 +6982,7 @@ impl X86Codegen {
             }
             IntrinsicOp::VecMulI32x4 => {
                 if let Some(d) = dest {
-                    self.emit_sse_binary_128(d, args, "pmulld");
+                    self.emit_int_mul_i32x4(d, args);
                 }
             }
             // Integer map lane ops. Sub is `src1 - src2` and NON-commutative:

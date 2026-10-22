@@ -1587,6 +1587,45 @@ impl X86Tune {
         (self.mispredict_penalty as usize / 2).clamp(4, 12)
     }
 
+    /// Instruction budget per arm for branch → select conversion of a
+    /// **loop-resident** diamond, in effective instructions.
+    ///
+    /// The coin-flip prior behind [`Self::if_convert_arm_budget`] is the
+    /// correct prior exactly once: for a branch reached once per function
+    /// call, "it may go either way" is all a static compiler knows.  Inside a
+    /// loop the same prior is a systematic loser, because the transform's
+    /// cost is paid **every iteration** while the branch's cost is paid only
+    /// on the iterations where the prediction is wrong.  Loop-resident
+    /// branches are additionally the most predictable branches in ordinary
+    /// integer code (guards, monotone loop-carried state, rare bail-outs):
+    /// the histogram over real workloads is dominated by outcomes at 90 %+
+    /// and concentrated near 1.0, not near 0.5.
+    ///
+    /// A static model has no way to *prove* the bias, so it cannot use a 1/16
+    /// prior; it uses the mild 1/5 bias (`penalty / 5`, i.e. 3 instructions on
+    /// every row here), which is the smallest budget that still admits the two
+    /// shapes the pass exists for:
+    ///
+    ///   * the scalar select (`x >= n ? x - n : 0`, `min`/`max`/clamp) — 1-2
+    ///     effective instructions, and
+    ///   * the conditional reduction diamond `if (a[i] > 0) s += a[i]` — 3
+    ///     effective instructions (Load, Cast, Add) per the arm-length note in
+    ///     `if_convert::detect_diamond`; converting it is what lets the
+    ///     vectorizer recover a `Select`-masked reduction.
+    ///
+    /// Everything longer stays a branch, which keeps the cold arm out of the
+    /// hot path and — the reason this budget exists — keeps the arm's
+    /// operands from being live across the whole loop body, which is what
+    /// turned `hot_web_loop`'s 6-instruction rare arm into 4 `cmov`s, 6
+    /// stack reloads and a 45-instruction loop (gcc: 16).
+    ///
+    /// Clamped to [3, 4]: never below the conditional-reduction budget, never
+    /// so large that the in-loop prior stops being conservative.
+    #[inline]
+    pub fn if_convert_arm_budget_in_loop(&self) -> usize {
+        (self.mispredict_penalty as usize / 5).clamp(3, 4)
+    }
+
     /// Throughput bound used by cycle estimates (`ops / width`).
     #[inline]
     pub fn issue_width(&self) -> usize {
@@ -2747,6 +2786,35 @@ mod tests {
             let b = cpu.tune().if_convert_arm_budget();
             assert!((4..=12).contains(&b), "{:?} budget {}", cpu, b);
         }
+    }
+
+    /// The in-loop budget is the loop-resident prior (1/5 mispredict), and it
+    /// must stay inside [3, 4] on EVERY row: 3 is the conditional-reduction
+    /// arm length and therefore the floor the vectorizer depends on, and
+    /// anything above 4 stops being a conservative prior.  Keyed off
+    /// `mispredict_penalty` rather than hard-coded so a future row inherits
+    /// the model instead of a magic constant.
+    #[test]
+    fn in_loop_if_convert_budget_stays_conservative() {
+        for cpu in X86Cpu::ALL {
+            let t = cpu.tune();
+            let b = t.if_convert_arm_budget_in_loop();
+            assert!((3..=4).contains(&b), "{:?} in-loop budget {}", cpu, b);
+            assert!(
+                b <= t.if_convert_arm_budget(),
+                "{:?}: in-loop budget {} exceeds the once-per-call budget {}",
+                cpu,
+                b,
+                t.if_convert_arm_budget()
+            );
+            assert_eq!(
+                b,
+                (t.mispredict_penalty as usize / 5).clamp(3, 4),
+                "{:?}",
+                cpu
+            );
+        }
+        assert_eq!(X86Cpu::Generic.tune().if_convert_arm_budget_in_loop(), 3);
     }
 
     #[test]
