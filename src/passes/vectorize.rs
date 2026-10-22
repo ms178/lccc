@@ -648,6 +648,31 @@ fn vectorize_with_analysis_mode(
             // contraction uses a separately rounded AVX2 multiply/add where
             // that lowering exists; other targets stay scalar. NEON's `fmla` is baseline
             // on AArch64, so only the contract half applies there.
+            //
+            // THE LICENCE IS ONLY NEEDED IF THE CHOSEN LOWERING ACTUALLY FUSES.
+            // The 2-wide arm lowers `FmaF64x2Hoisted` as two `mulpd`/`addpd`
+            // pairs whenever the target has no FMA3 unit or no 256-bit vectors
+            // -- the legacy SSE2 path in `x86::codegen::intrinsics`, which
+            // rounds the product and the sum separately, exactly like the
+            // scalar expression. That is not a contraction, so `-ffp-contract`
+            // has nothing to withdraw and the x86-64 baseline (SSE2 only) is
+            // entitled to it: a dense `C[j] += A * B[j]` loop is one of the
+            // most common numeric shapes there is, and staying scalar on every
+            // pre-AVX2 machine costs 2.6x on a 256x256 f64 product (10.00 ms
+            // vs 3.86 ms vectorized, GCC -O2 6.96 ms on the same host).  The
+            // only x86 configuration whose 2-wide lowering really fuses is
+            // `LCCC_FORCE_SSE2` on an AVX2+FMA target, which the backend sends
+            // through its 4-lane `vfmadd231pd`; there the licence is still
+            // required.  The AVX2 arm needs no gate at all: it takes `fused`
+            // as an argument and emits `MulAddF64x4HoistedSIB` when denied.
+            let sse2_lowering_fuses = x86_fma_enabled() && x86_avx2_available();
+            let contraction_licence_needed = if neon {
+                true
+            } else if use_sse2 {
+                sse2_lowering_fuses
+            } else {
+                false
+            };
             if skip_small {
                 if debug {
                     eprintln!(
@@ -655,15 +680,25 @@ fn vectorize_with_analysis_mode(
                         machine_step_width
                     );
                 }
-            } else if !fma_transform_allowed(neon, fp_contract)
-                && (neon || use_sse2 || !x86_64_vector_intrinsics_available())
-            {
+            } else if !neon && !x86_simd_available() {
+                // No SIMD register file: there is nothing to pack into.  Only
+                // reachable with LCCC_DEBUG_VECTORIZE set (the entry gate
+                // returns before this arm otherwise), but the arm must not
+                // depend on a debugging variable for its legality.
+                if debug {
+                    eprintln!("[VEC] Skip matmul arm: SIMD disabled for this target");
+                }
+            } else if contraction_licence_needed && !fma_transform_allowed(neon, fp_contract) {
                 if debug {
                     eprintln!(
                         "[VEC] Skip matmul arm: fused arithmetic not requested/available \
                          (fp_contract={fp_contract:?}, x86_fma={})",
                         x86_fma_enabled()
                     );
+                }
+            } else if !use_sse2 && !x86_64_vector_intrinsics_available() {
+                if debug {
+                    eprintln!("[VEC] Skip matmul arm: no 256-bit vector intrinsics on this target");
                 }
             } else if use_sse2 {
                 if debug {

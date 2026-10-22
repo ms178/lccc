@@ -627,6 +627,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_rec2iter.sh
     - name: Check FP-contraction parity with GCC
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
+    - name: Check baseline-SSE2 packed multiply-add codegen
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_sse2_matmul_vectorization.sh
     - name: Check builtin_cpu_supports runtime semantics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_supports_runtime.sh
     - name: Check GOT-slot references to local symbols

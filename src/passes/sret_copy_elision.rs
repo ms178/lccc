@@ -541,6 +541,15 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
         }
     }
 
+    // Dominance queries for the candidate search, answered in O(1) each from
+    // one build: this phase rewrites instructions only and never touches a CFG
+    // edge, so the tree cannot change underneath the queries.  The cost that
+    // used to sit here was a `CfgAnalysis::build` per (write to the source,
+    // candidate copy) pair -- O(writes * copies * |CFG|) for a source object
+    // that several blocks refill, and the reason a long chain of refills made
+    // this pass the slowest thing in the pipeline.
+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+    let dom = crate::ir::analysis::DominanceChecker::new(cfg.num_blocks, &cfg.idom);
     let mut sites: Vec<CopySite> = Vec::new();
     for (&root, ws) in &write_positions {
         if rejected.contains(&root) || !attributable.contains(&root) {
@@ -594,7 +603,7 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
                         if wb == bi {
                             wi < ii
                         } else {
-                            precedes(func, wb, bi)
+                            dom.strictly_dominates(wb, bi)
                         }
                     })
             });
@@ -728,34 +737,6 @@ fn source_holds_copied_bytes(
         Some(&(b, i, _)) => b != block || i > last_read,
         None => true,
     }
-}
-
-/// Does block `a` necessarily execute before block `b` on every path to `b`?
-///
-/// True when `a` strictly dominates `b`. `CfgAnalysis::idom` uses `usize::MAX`
-/// for blocks unreachable from entry, so the walk reports false instead of
-/// indexing that sentinel — an unreachable block must never license a rewrite.
-fn precedes(func: &IrFunction, a: usize, b: usize) -> bool {
-    use crate::ir::analysis::CfgAnalysis;
-    if a == b || a >= func.blocks.len() || b >= func.blocks.len() {
-        return false;
-    }
-    let cfg = CfgAnalysis::build(func);
-    let mut cur = b;
-    for _ in 0..cfg.idom.len() {
-        if cur >= cfg.idom.len() {
-            return false;
-        }
-        let parent = cfg.idom[cur];
-        if parent == usize::MAX || parent == cur {
-            return false;
-        }
-        if parent == a {
-            return true;
-        }
-        cur = parent;
-    }
-    false
 }
 
 #[cfg(test)]
@@ -1028,6 +1009,131 @@ mod tests {
             vec![store(1)],
         ]);
         assert_eq!(run(&mut func), 1);
+    }
+
+    fn memcpy(dest: u32, src: u32, size: usize) -> Instruction {
+        Instruction::Memcpy {
+            dest: Value(dest),
+            src: Value(src),
+            size,
+        }
+    }
+
+    /// A function whose blocks are wired into a single chain: `0 -> 1 -> ...`.
+    fn chain(blocks: Vec<Vec<Instruction>>) -> IrFunction {
+        let last = blocks.len() - 1;
+        let mut func = IrFunction::new("g".into(), IrType::I64, vec![], false);
+        func.next_value_id = 1000;
+        for (i, instructions) in blocks.into_iter().enumerate() {
+            func.blocks.push(BasicBlock {
+                label: BlockId(i as u32),
+                instructions,
+                terminator: if i == last {
+                    Terminator::Return(None)
+                } else {
+                    Terminator::Branch(BlockId(i as u32 + 1))
+                },
+                source_spans: vec![],
+            });
+        }
+        func
+    }
+
+    fn blocks_with_instructions(func: &IrFunction, bi: usize) -> usize {
+        func.blocks[bi].instructions.len()
+    }
+
+    #[test]
+    fn forwards_a_copy_whose_source_is_refilled_several_blocks_above() {
+        // The source object is refilled (whole-object copy, size 24) in block 1
+        // and again in block 3, right before the copy under test.  Accepting
+        // the site needs the dominance question "does block 1 precede block 3?"
+        // answered yes, and that is a two-level walk up the dominator tree
+        // (3 -> 2 -> 1): the query this phase used to answer by rebuilding the
+        // CFG every time, once per (write, copy) pair.
+        let mut func = chain(vec![
+            vec![alloca(0, 24), alloca(1, 24), alloca(2, 24)],
+            vec![memcpy(0, 2, 24)],
+            vec![],
+            vec![memcpy(0, 2, 24), memcpy(1, 0, 24), load(3, 1)],
+        ]);
+        // Two instructions go: the copy into object 1 (forwarded) and the
+        // refill in block 1, which nothing reads before block 3 refills the
+        // object again.  The forwarded load is the one this test is about.
+        assert_eq!(run(&mut func), 2);
+        assert_eq!(blocks_with_instructions(&func, 3), 2);
+        match &func.blocks[3].instructions[1] {
+            Instruction::Load { ptr, .. } => assert_eq!(ptr.0, 0),
+            other => panic!("expected the forwarded load, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keeps_a_copy_whose_source_is_written_on_a_non_dominating_path() {
+        // Blocks 1 and 2 are the two arms of a diamond and both refill the
+        // source; only block 2 reaches the copy.  Answering "block 1 precedes
+        // block 2" yes here would forward block 2's load to bytes written on a
+        // path that need not have run, so the copy must survive.  (The refill
+        // in block 1 is still dead -- nothing reads the object between it and
+        // the refill in block 2 -- so exactly one instruction goes away, and it
+        // is not the copy.)
+        let mut func = IrFunction::new("g".into(), IrType::I64, vec![], false);
+        func.next_value_id = 1000;
+        let mut push = |instructions: Vec<Instruction>, terminator: Terminator, i: u32| {
+            func.blocks.push(BasicBlock {
+                label: BlockId(i),
+                instructions,
+                terminator,
+                source_spans: vec![],
+            });
+        };
+        push(
+            vec![alloca(0, 24), alloca(1, 24), alloca(2, 24)],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(99)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            0,
+        );
+        push(vec![memcpy(0, 2, 24)], Terminator::Branch(BlockId(3)), 1);
+        push(
+            vec![memcpy(0, 2, 24), memcpy(1, 0, 24), load(3, 1)],
+            Terminator::Branch(BlockId(3)),
+            2,
+        );
+        push(vec![], Terminator::Return(None), 3);
+        assert_eq!(run(&mut func), 1);
+        assert_eq!(blocks_with_instructions(&func, 2), 3);
+        match &func.blocks[2].instructions[2] {
+            Instruction::Load { ptr, .. } => assert_eq!(ptr.0, 1),
+            other => panic!("expected the load to keep reading the copy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scales_to_a_long_chain_of_refilled_sources() {
+        // Every block refills the one source object and copies out of it, so
+        // the candidate copy in block `c` has to be checked against all `c`
+        // refills that come before it -- two million dominance questions at
+        // this size.  Only the last copy is forwardable (every earlier one has
+        // a refill after it, and that refill may or may not run first), which
+        // is exactly the answer the pass must reach without paying a CFG build
+        // per question.  Measured on the code this replaced: 6.70 s at 256
+        // blocks, and the cost is O(n^3) (n^2 questions, each rebuilding an
+        // n-block CFG), so this size would have taken ~1 h.  It is 0.14 s now,
+        // most of which is the two million queries themselves.
+        let n = 2048;
+        let mut blocks = vec![vec![alloca(0, 24), alloca(1, 24), alloca(2, 24)]];
+        for _ in 1..n {
+            blocks.push(vec![memcpy(0, 2, 24), memcpy(1, 0, 24), load(3, 1)]);
+        }
+        let mut func = chain(blocks);
+        assert_eq!(run(&mut func), 1);
+        assert_eq!(blocks_with_instructions(&func, n - 1), 2);
+        for bi in 1..n - 1 {
+            assert_eq!(blocks_with_instructions(&func, bi), 3);
+        }
     }
 
     #[test]
