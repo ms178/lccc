@@ -1033,6 +1033,15 @@ jobs:
         python3 scripts/fuzz_diff.py --engine synthetic --count 4 \
           --lccc target/fastbuild/lccc --refs gcc --opts=-O0,-O2 \
           --seed 20260906
+    # Object identity / value survival: the address of a local must not be
+    # lowered to the local's contents, and an int<->FP conversion must not
+    # destroy its own source.  Both defects shipped once; this keeps the
+    # shapes under a differential oracle on every push.
+    - name: Differential fuzz smoke (address identity and value survival)
+      run: |
+        python3 scripts/fuzz_diff.py --engine addr_value --count 8 \
+          --lccc target/fastbuild/lccc --refs gcc --opts=-O0,-O1,-O2 \
+          --seed 20261022
     - name: Verify inline-asm UTF-8 assembly text
       run: |
         python3 scripts/check_inline_asm_utf8.py \

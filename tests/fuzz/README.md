@@ -48,6 +48,7 @@ unchanged and absorbs it through one of two mechanisms:
 | `alias_fuzz_m32.py` | `alias_m32` | forwarding engine (redundant-load/GVN shapes). |
 | `alu_torture_m32.py` | `alu_torture` | forwarding engine; the probe is fixed, so it runs once per level and `--count` has no effect. |
 | `aarch64_fuzz.py` | `aarch64` | forwarding engine to `lccc-arm` vs `aarch64-linux-gnu-gcc` under `qemu-aarch64`; SKIPs cleanly when the cross toolchain is absent (the harness defaults `--lccc` to `target/fastbuild/lccc-arm` for this engine). |
+| `addr_value_fuzz.py` | `addr_value` | forwarding engine (same mapping as `punning`, but the *reference compiler* is the oracle: every generated function checks an invariant of its own local and prints `OK`/`FAIL name`, so both compilers must print `OK`; no host gate). |
 | `punning_fuzz.py` | `punning` | forwarding engine (same `--ccc`/`--seeds`/`--levels` mapping, but no `--gcc`: the script's own byte model is the oracle, so no reference compiler is required); SKIPs off x86-64. |
 
 Each engine keeps its historical defaults (seed span, levels, gcc oracle);
@@ -92,6 +93,46 @@ Failures keep their source under `--out`. `test_punning_fuzz.py` runs in the
 `unittest discover` gate. Remaining scope gaps (overlapping `memcpy` between two
 objects, bit-fields that straddle a storage unit, arrays of padded structs) are
 tracked as T7 in `docs/VELLVM_VIR_TRANSPLANT_AUDIT.md`.
+
+## Object identity and value survival (`addr_value_fuzz.py`)
+
+`addr_value_fuzz.py` generates self-checking translation units for the two
+lowering defects of that family that shipped in this compiler:
+
+1. **The address of a local is its address.** A cast that wanted the *value* of
+   a local read the local's stack slot, so `(int)(uintptr_t)&s` returned `s`.
+   Generated shapes cast `&s` through a chain (`(unsigned)((uintptr_t)&s >> 3)`,
+   truncating, masking, negating, dividing forms), pass it through `noinline`
+   helpers, array bases, runtime indices, struct/union/`memcpy` round trips,
+   pointer differences inside the case's own byte buffer, a padded struct member
+   and a 16-byte vector local.  Every case also asserts `(uintptr_t)s != a`,
+   i.e. that the address is *not* the value it addresses — a check that a
+   compiler returning the pointee on both sides of an `==` cannot satisfy.
+2. **A conversion must not destroy its own source.** The U64→FP
+   shift-and-round path rewrote `%rax`; without invalidating the accumulator
+   cache a later use of the source read the mangled operand.  Generated shapes
+   convert the same value twice, compare two routes to the same conversion, and
+   take copies before/after, from sources on the big path
+   (`x ^ (1ULL << 63)`), the plain unsigned path, a negative signed route and
+   the two narrow routes.
+
+```bash
+python3 tests/fuzz/addr_value_fuzz.py --ccc ./target/fastbuild/lccc \
+  --seeds 0:200 --levels O0,O1,O2,O3,Os --out /tmp/av
+python3 tests/fuzz/addr_value_fuzz.py --emit-only 7     # print one case
+python3 scripts/fuzz_diff.py --engine addr_value --count 60 \
+  --lccc target/fastbuild/lccc --refs gcc
+```
+
+No absolute address ever crosses a compiler boundary: comparing a callee's
+address with a caller's local compares two different stack slots and proves
+nothing (`tests/fuzz/test_addr_value_fuzz.py` pins that and re-checks the
+generated cases against the host reference compiler, so a generator bug shows
+up as a test failure rather than as a phantom miscompile).  The corpus is
+undefined-behaviour free by construction and was verified as such: 60 seeds
+build and run clean under `-fsanitize=undefined,address
+-fno-sanitize-recover=all` (the sanitizer runtimes are not part of the pinned
+compiler caches, so this is a manual gate, not a CI one).
 
 ## C-level miscompile reduction (`c_reduce.py`)
 

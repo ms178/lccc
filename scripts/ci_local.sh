@@ -940,6 +940,12 @@ gate "differential-fuzz-smoke" fast \
     python3 scripts/fuzz_diff.py --engine synthetic --count 4 \
         --lccc "$LCCC" --refs gcc --opts=-O0,-O2 --seed 20260906
 
+# Object identity / value survival shapes (a local's address is not its
+# contents; a conversion must not destroy its own source).
+gate "addr-value-fuzz-smoke" fast \
+    python3 scripts/fuzz_diff.py --engine addr_value --count 8 \
+        --lccc "$LCCC" --refs gcc --opts=-O0,-O1,-O2 --seed 20261022
+
 # Missed-alarm pairs (scripts/mutpair.py): execution-filtered known-inequivalent
 # / known-equivalent near-miss pairs in one TU, plus the harness's own
 # negative control (a fake optimiser must be caught) in the unit tests.
