@@ -173,3 +173,75 @@ The json input remains at 0.68 of GCC; swapping only
 `lib/decompress/zstd_decompress_block.o` for GCC's recovers ~10 % of that, so the
 remaining gap is still in that TU, split between `seqState_t` scalar replacement
 and the unresolved vector-temporary forwarding above.
+
+## Verification sweep: three IR-contract violations
+
+Adding `verify_after_pass` checkpoints after `inline`, `sret_copy_elision` and
+`aggregate_sroa` and running `CCC_VERIFY_IR=abort` over every zstd 1.5.7
+translation unit turned up three passes that hand the next pass malformed IR.
+All three are pre-existing (none is caused by the by-value copy work above);
+the sweep is what made them visible, and all three are fixed.
+
+1. **`sret_copy_elision`: intra-block use-before-def.** The inliner
+   materialises a callee-local aggregate at the call site, so an sret call can
+   be *followed* by the alloca of the object it will be copied into:
+
+   ```text
+   call  ZSTD_decodeSequence(%seq)      # sret, fills %seq
+   %d    = alloca 24                    # materialised at the call site
+   memcpy %d <- %seq, 24
+   load  %d[8]
+   ```
+
+   The retarget rewrote the call's hidden pointer to `%d`, defining `%d`
+   after its only use (`ZSTD_decompressSequencesSplitLitBuffer_default`
+   block 106: `v5308` defined at #3, used at #2). The pass now requires the
+   destination alloca to dominate the call and declines otherwise, leaving the
+   copy to the read-forwarding phase, which removes it anyway.
+
+   The same audit found the retarget unsound when an instruction between the
+   call and the copy touches the destination: the retarget moves the call's
+   write *earlier*, so an intervening reader observes the callee's bytes (it
+   used to see the object's previous value) and an intervening writer's bytes
+   survive the deleted copy (they used to be overwritten). Candidates with such
+   an instruction — or with a second retargeted call inside the window — are
+   declined.
+
+2. **`vector_temp_promotion::hoist_block_allocas` moved allocas above phis.**
+   The hoist exists to keep an alloca above the producer that a promotion
+   retargets at it, but it hoisted to index 0 unconditionally, pushing the
+   block's phi prefix below an `Alloca`. Allocas now hoist to the end of the
+   phi prefix, which still places them above every non-phi instruction.
+
+3. **The inliner under-reserved label space.** `merge_block_id` was derived
+   from `callee.max_block_id`, and `caller.next_label` advanced only to
+   `merge_block_id + 1`. When nested inlining had pushed the callee's live
+   labels past that hint, cloned blocks landed above the merge block and above
+   the caller's counter, so the next pass minting a label from `next_label`
+   reused a live one (`next_label=3947494193`, live max `3947503941` in
+   `ZSTD_compressSequencesAndLiterals`). Both are now reserved past the maximum
+   label actually present — the discipline the value-id path already documents
+   ("always reserve past the actual maximum present in the IR").
+
+Two doc-comment pseudo-code blocks in the x86 backend that made
+`cargo test --doc` fail to compile its own examples were fenced as `text`.
+
+### Measured after the fixes
+
+`zstd -b1 -d` (one second of in-process decoding per run), best of nine
+interleaved runs, so scheduling noise biases every binary the same way:
+
+| input | gcc 16.2 | base | new | base/gcc | new/gcc |
+|-------|----------|------|-----|----------|---------|
+| 98 MB log | 1709 | 711 | 1567 | 0.416 | **0.917** |
+| 5.4 MB json | 2218 | 1445 | 1863 | 0.651 | **0.840** |
+| 4.7 MB csv | 717 | 516 | 613 | 0.719 | **0.855** |
+| source text | 1626 | 1024 | 1342 | 0.630 | **0.825** |
+
+The by-value coalescing plus these fixes are worth 1.41x–2.20x over the
+baseline compiler and close 55–95 % of each file's gap to GCC. What is left is
+not one shape: `ZSTD_decompressSequencesLong_default` (2517 instructions, 871
+frame-relative memory operands, against GCC's 1786/401) is the level-19
+hot path and its frame traffic is `seqState_t` plus the sequence ring, not the
+sequence object; `ZSTD_safecopy` still keeps its marching pointer in memory
+(211/58 against 152/0).
