@@ -96,6 +96,10 @@ pub(crate) struct RaConfig {
     pub(crate) loop_pin: usize,
     /// `CCC_NO_HOT_WEB_STEAL`: disable i686/x86-64 hot-web steals (default: false).
     pub(crate) no_hot_web_steal: bool,
+    /// `CCC_NO_P1_WAVES`: merge the two Phase-1 waves into the historical
+    /// single scan (default: false).  Bisection switch for the mandatory
+    /// (call-spanning) before optional (hot-loop) allocation order.
+    pub(crate) no_p1_waves: bool,
     /// `CCC_HOT_WEB_STEAL`: maximum i686/x86-64 hot-web steals (default: 3).
     pub(crate) hot_web_steal: usize,
     /// `CCC_NO_ITERATED_HAZARD`: disable i686 iterated hazard refinement (default: false).
@@ -336,6 +340,7 @@ impl RaConfig {
             no_loop_pin: present("CCC_NO_LOOP_PIN"),
             loop_pin: number("CCC_LOOP_PIN", 2),
             no_hot_web_steal: present("CCC_NO_HOT_WEB_STEAL"),
+            no_p1_waves: present("CCC_NO_P1_WAVES"),
             hot_web_steal: number("CCC_HOT_WEB_STEAL", 3),
             no_iterated_hazard: present("CCC_NO_ITERATED_HAZARD"),
             no_segment_fill: present("CCC_NO_SEGMENT_FILL"),
@@ -3820,30 +3825,112 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         // At least one use inside a loop block.
         use_loop_depth.get(&iv.value_id).copied().unwrap_or(0) >= 1
     };
+    // Phase 1 is two waves, in the order the module doc states: values that
+    // are live across a call *must* have a callee-saved home (they have no
+    // alternative), and the hot-loop promotion below is an optimisation that
+    // may only spend what the first wave leaves.  Merging the two into one
+    // scan let an optional candidate outrank a mandatory one in the shared
+    // `priority` order, and the mandatory one then paid a stack slot reloaded
+    // on every use inside its loop.  Measured on
+    // tests/benchmark/programs/hot_web_loop.c (one call inside a 40M-trip
+    // loop, six callee-saved registers): the four loop-carried accumulators
+    // lost their homes to four loop-invariant cold-path constants, so the hot
+    // body carried 4 stores + 6 reloads per iteration and ran 1.67x slower
+    // than gcc; with the waves separated the impossible-to-avoid values win
+    // and the cold constants reload only on the branch that reads them.
+    let waves = !config.ra_config.no_p1_waves;
     let phase1_intervals: Vec<LiveInterval> = scan_ivs
         .iter()
         .copied()
         .filter(|iv| call_spanning.contains(&iv.value_id) || hot_loop_home(iv))
         .collect();
+    // ONE build over the whole phase-1 worklist, then the split.  The
+    // per-range measurements (`mark_loop_spanning`: the loop's block-local
+    // reserve, its cost bar, the total span count the admission cap compares
+    // against) describe the FUNCTION, so they must be taken over the same set
+    // of ranges they were always taken over; building each wave separately
+    // would silently re-derive them from a subset.
     let mut phase1_ranges = build_gpr_ranges(&phase1_intervals);
+    if config.ra_config.debug_ra_phases {
+        let mut rows: Vec<(u32, u32, u32, u64, u32, bool, usize)> = phase1_ranges
+            .iter()
+            .map(|r| {
+                (
+                    r.value_id,
+                    r.start,
+                    r.end,
+                    r.priority,
+                    r.uses.len() as u32,
+                    r.spans_loop,
+                    r.segments.len(),
+                )
+            })
+            .collect();
+        rows.sort_by_key(|r| r.0);
+        for (id, start, end, prio, uses, spans, nseg) in rows {
+            let hint = if call_spanning.contains(&id) {
+                "spanning"
+            } else {
+                "optional"
+            };
+            eprintln!(
+                "[RA-P1C] fn={} v={} [{},{}) uses={} priority={} spans_loop={} segments={} {}",
+                func.name, id, start, end, uses, prio, spans, nseg, hint
+            );
+        }
+    }
     bump_coalesce_group_priority(&mut phase1_ranges, &coalesce_groups, &use_count);
     bump_gep_base_priority(&mut phase1_ranges, &liveness);
+    // Wave one: values a call point cuts through.  They have no alternative
+    // home, so they are allocated first, against the whole pool.
+    let (mandatory, optional): (Vec<_>, Vec<_>) = if waves {
+        phase1_ranges
+            .into_iter()
+            .partition(|r| call_spanning.contains(&r.value_id))
+    } else {
+        (phase1_ranges, Vec::new())
+    };
     let mut allocator = LinearScanAllocator::new_with_config(
-        phase1_ranges,
+        mandatory,
         config.available_regs.clone(),
         &config.ra_config,
     );
     allocator.run();
     let mut assignments = allocator.assignments;
+    // Wave two: the hot-loop promotion, which is an optimisation and may only
+    // spend what wave one left.  A register a mandatory value claimed stays
+    // out of reach even where the promotion would have fitted into one of its
+    // holes; that is the price of the strict order, and it costs nothing when
+    // the mandatory wave exhausts the pool -- the interesting case -- while a
+    // function whose loops contain no call keeps the whole pool, exactly as
+    // before.
+    let mut phase1_assigned_optional = 0usize;
+    if !optional.is_empty() {
+        let claimed: FxHashSet<PhysReg> = assignments.values().copied().collect();
+        let spare: Vec<PhysReg> = config
+            .available_regs
+            .iter()
+            .copied()
+            .filter(|r| !claimed.contains(r))
+            .collect();
+        if !spare.is_empty() {
+            let mut optional_allocator =
+                LinearScanAllocator::new_with_config(optional, spare, &config.ra_config);
+            optional_allocator.run();
+            phase1_assigned_optional = optional_allocator.assignments.len();
+            assignments.extend(optional_allocator.assignments);
+        }
+    }
     if config.ra_config.debug_ra_phases {
         let mut ids: Vec<u32> = assignments.keys().copied().collect();
         ids.sort_unstable();
         eprintln!(
-            "[RA-P1] fn={} pool={:?} candidates={} assigned={:?}",
+            "[RA-P1] fn={} pool={:?} candidates={} assigned={:?} (optional wave {})",
             func.name,
             config.available_regs,
             phase1_intervals.len(),
-            ids
+            ids,
+            phase1_assigned_optional
         );
     }
 
@@ -11872,6 +11959,7 @@ mod ra_config_tests {
         switch!(no_eax_alloc, "CCC_NO_EAX_ALLOC");
         switch!(no_loop_pin, "CCC_NO_LOOP_PIN");
         switch!(no_hot_web_steal, "CCC_NO_HOT_WEB_STEAL");
+        switch!(no_p1_waves, "CCC_NO_P1_WAVES");
         switch!(no_iterated_hazard, "CCC_NO_ITERATED_HAZARD");
         switch!(no_segment_fill, "CCC_NO_SEGMENT_FILL");
         switch!(no_reduction_vecreg, "CCC_NO_REDUCTION_VECREG");

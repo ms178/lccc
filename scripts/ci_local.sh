@@ -226,6 +226,13 @@ gate "fp-contract-parity" fast \
 gate "sse2-matmul-vectorization" fast \
     env CCC="$LCCC" bash tests/regression/check_sse2_matmul_vectorization.sh
 
+# Three compiles and two runs: pins that a loop-carried accumulator keeps its
+# callee-saved home when a call inside the loop forces the value to be
+# call-spanning, instead of being displaced by a loop-invariant constant that
+# is only read on the loop's rare path.
+gate "hot-loop-register-homes" fast \
+    env CCC="$LCCC" bash tests/regression/check_hot_loop_register_homes.sh
+
 # ~97 compiles per arm plus the runs: seconds, not minutes -- and it is the
 # only gate that exercises the historical crash/miscompile corpus end to end.
 gate "cpu-supports-runtime" fast \
