@@ -377,6 +377,21 @@ gate "ci-lane-plan-self-test" fast \
 gate "ci-lane-plan" fast \
     python3 tests/regression/check_ci_lane_plan.py
 
+# The lane's toolchain is an INPUT CONTRACT, so it is proven before any gate
+# spends minutes failing over a missing tool -- the same probe every hosted
+# lane runs, with the same pin.  Run 39809624659 lost a six-minute contract job
+# to "LCCC, GCC, Clang and Valgrind are all required" from the
+# hexadecimal-literal oracle, because nothing had installed valgrind; the
+# sibling shard lost one to a GCC 16.x that was not 16.2.  Both are two-second
+# probes here, and both name the tool instead of a downstream gate.  The
+# self-test is the fixture table for every failure mode the probe can report
+# (missing tool, version drift, unpinned Clang), so a verifier that cannot fail
+# fails this gate.
+gate "oracle-toolchain-self-test" fast \
+    bash scripts/ci_verify_oracles.sh --self-test
+gate "oracle-toolchain" fast \
+    bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.3
+
 gate "rust-toolchain-selector" fast \
     bash tests/regression/check_rust_toolchain_selector.sh
 

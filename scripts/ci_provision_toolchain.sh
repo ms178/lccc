@@ -41,6 +41,11 @@ REPO=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BUNDLE_TOOL=$REPO/scripts/ci_toolchain_bundle.sh
 
 BUNDLE_DIR=${LCCC_TOOLCHAIN_BUNDLE_DIR:-$HOME/.cache/lccc-toolchain}
+# How this lane got its toolchain, for scripts/ci_verify_oracles.sh to report.
+# "Which compiler did this run actually use, and did it come from the bundle or
+# from apt?" is unanswerable from the job log through the check-run API, and it
+# is the first question asked of a lane whose oracle gate failed.
+PROVENANCE=${LCCC_PROVENANCE_FILE:-$HOME/.cache/lccc-toolchain/last-provision.json}
 ROOT=/
 NO_BUNDLE=0
 FORCE_INSTALL=0
@@ -48,7 +53,20 @@ FORCE_INSTALL=0
 # same kind of provisioning: an apt transaction per lane for an immutable
 # package.  Folding it in here removes a network call from every lane that used
 # to run `apt-get install -y python3-yaml` on its own.
-EXTRAS="qemu-user mold lld python3-yaml"
+#
+# `valgrind` is a GATE dependency too, and it was the one missing: the FMA
+# contract gate's hexadecimal/FP oracles run the compiled probe under Memcheck
+# (scripts/check_hex_float_oracles.py, check_signed_mask_oracles.py), which
+# requires the tool -- and refuses to run without it rather than skipping the
+# check.  No lane installed it, so the contract that needed it could only pass
+# where the tool happened to be present.  `libc6-dbg` is part of the same
+# contract, not a debugging nicety: Memcheck redirects `strlen` and friends in
+# `/lib64/ld-linux-x86-64.so.2`, and the distribution ships that loader
+# stripped, so valgrind aborts at startup ("a function redirection which is
+# mandatory for this platform-tool combination cannot be set up") unless the
+# matching debug symbols are installed.  Both are immutable for a runner
+# image, so they belong in the same cached bundle as the compilers.
+EXTRAS="qemu-user mold lld python3-yaml valgrind libc6-dbg"
 
 usage() {
     cat >&2 <<'EOF'
@@ -62,7 +80,7 @@ usage: ci_provision_toolchain.sh [--bundle-dir DIR] [--root DIR]
   --bundle-dir    where the content-addressed toolchain bundle lives
   --root DIR      restore into DIR instead of / (bundle path only)
   --extras PKGS   oracle packages installed with the compiler, default:
-                  "qemu-user mold lld python3-yaml"
+                  "qemu-user mold lld python3-yaml valgrind libc6-dbg"
   --no-bundle     never read or write the bundle (pure installer path)
   --force-install ignore a cached bundle and reinstall from packages
 EOF
@@ -75,6 +93,15 @@ die() {
 
 say() {
     printf 'ci_provision_toolchain: %s\n' "$*"
+}
+
+# Best effort by construction: a lane must never fail because its provenance
+# note could not be written.
+record_provenance() {
+    local source=$1 seconds=$2
+    mkdir -p -- "$(dirname -- "$PROVENANCE")" 2>/dev/null || return 0
+    printf '{"source": "%s", "toolchain_seconds": "%s", "at": "%s"}\n' \
+        "$source" "$seconds" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"$PROVENANCE" 2>/dev/null || true
 }
 
 while (( $# )); do
@@ -123,7 +150,9 @@ if (( ! NO_BUNDLE && ! FORCE_INSTALL )) && [[ -r $BUNDLE_DIR/toolchain.tar.gz ]]
         if "${restore[@]}"; then ok=1; else ok=0; fi
     fi
     if (( ok )); then
-        say "toolchain ready from the cached bundle in $(elapsed "$started" "$(now)")"
+        took=$(elapsed "$started" "$(now)")
+        say "toolchain ready from the cached bundle in $took"
+        record_provenance bundle "$took"
         exit 0
     fi
     # A corrupt or incomplete archive is a cache miss, not a provisioning
@@ -175,7 +204,8 @@ if (( ! NO_BUNDLE )); then
     rm -f "$before" "$after"
 fi
 
-say "toolchain provisioned in $(elapsed "$started" "$(now)")"
+took=$(elapsed "$started" "$(now)")
+say "toolchain provisioned in $took"
 
 # ── Contract probes ────────────────────────────────────────────────────────
 # One owner of "what a provisioned lane must be able to do": the same probes
@@ -183,3 +213,4 @@ say "toolchain provisioned in $(elapsed "$started" "$(now)")"
 # --force-install) as trustworthy as a restored one, and it is why the install
 # path cannot silently degrade to a lane without a working i686 multilib.
 bash "$BUNDLE_TOOL" verify --bundle "$BUNDLE_DIR" --root "$ROOT"
+record_provenance packages "$took"

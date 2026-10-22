@@ -26,11 +26,14 @@ ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = ROOT / "scripts/ci_toolchain_bundle.sh"
 PROVISION = ROOT / "scripts/ci_provision_toolchain.sh"
 
-REQUIRED = ("gcc-16", "g++-16", "ld.lld", "qemu-i386", "mold")
+# `valgrind` is in the REQUIRED set for the same reason the compilers are: the
+# contract lanes run Memcheck oracles that REFUSE to run without it, so a bundle
+# that dropped it would restore a lane whose gates cannot pass.
+REQUIRED = ("gcc-16", "g++-16", "ld.lld", "qemu-i386", "mold", "valgrind")
 
 
 def build_tree(root: Path) -> list[str]:
-    """A miniature published toolchain: the five tools plus a compiler blob."""
+    """A miniature published toolchain: the six tools plus a compiler blob."""
     binaries = root / "usr/bin"
     binaries.mkdir(parents=True)
     for name in REQUIRED:
@@ -114,6 +117,24 @@ class ToolchainBundle(unittest.TestCase):
                      "--root", str(destination))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("/usr/bin/ld.lld", result.stderr)
+
+    def test_a_bundle_without_valgrind_is_refused_by_name(self):
+        """The failure that shipped: every compiler present, Memcheck missing.
+
+        A bundle restored without valgrind is indistinguishable from a good one
+        until a contract gate reaches its oracle, twelve minutes later, and
+        reports the oracle rather than the missing tool.  `verify` therefore
+        names the tool at restore time.
+        """
+        self.assertEqual(self.export().returncode, 0)
+        destination = self.temp / "restored"
+        self.assertEqual(run("bash", str(BUNDLE), "restore", "--bundle", str(self.bundle),
+                             "--root", str(destination)).returncode, 0)
+        (destination / "usr/bin/valgrind").unlink()
+        result = run("bash", str(BUNDLE), "verify", "--bundle", str(self.bundle),
+                     "--root", str(destination))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("/usr/bin/valgrind", result.stderr)
 
     def test_provision_uses_the_cached_bundle_when_it_verifies(self):
         self.assertEqual(self.export().returncode, 0)
@@ -232,10 +253,12 @@ class ProvisionToolchain(unittest.TestCase):
         apt = [line for line in lines if line.startswith("apt-get")]
         self.assertEqual(len(apt), 1, lines)
         # qemu-user is the i686 execution oracle; mold and lld are the linker
-        # oracles; python3-yaml is the gate parser.  All four in ONE call.
+        # oracles; python3-yaml is the gate parser; valgrind is the Memcheck
+        # oracle and libc6-dbg is what lets it relocate the loader's symbols
+        # (without it valgrind aborts at startup).  All in ONE call.
         self.assertEqual(apt[0].split()[1:], [
             "install", "-y", "--no-install-recommends",
-            "qemu-user", "mold", "lld", "python3-yaml"])
+            "qemu-user", "mold", "lld", "python3-yaml", "valgrind", "libc6-dbg"])
         exports = [line for line in lines if line.startswith("bundle export")]
         self.assertEqual(len(exports), 1, lines)
         # The exported package set is the dpkg-delta, never a hard-coded list.

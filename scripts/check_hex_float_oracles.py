@@ -61,8 +61,15 @@ def main():
     ap.add_argument('--abi', choices=['x64','x86'], default='x64')
     args = ap.parse_args()
     compilers = {k: shutil.which(getattr(args, k)) for k in ['lccc', 'gcc', 'clang']}
-    if not all(compilers.values()) or not shutil.which('valgrind'):
-        ap.error('LCCC, GCC, Clang and Valgrind are all required')
+    # Name the missing tool.  The combined message this replaced ("LCCC, GCC,
+    # Clang and Valgrind are all required") cost a CI job and a local
+    # reconstruction: the gate could not say WHICH dependency the lane lacked,
+    # so the red annotation pointed at the oracle rather than at provisioning.
+    missing = [f'--{name}={getattr(args, name)}' for name, path in compilers.items() if not path]
+    if not shutil.which('valgrind'):
+        missing.append('valgrind (Memcheck; on PATH)')
+    if missing:
+        ap.error('missing required tool(s): ' + ', '.join(missing))
     text, count = source()
     report = {'complete': False, 'literal_count': count, 'abi': args.abi,
               'source_sha256': hashlib.sha256(text.encode()).hexdigest(), 'commands': []}

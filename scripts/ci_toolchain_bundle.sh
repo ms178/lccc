@@ -191,6 +191,12 @@ REQUIRED_BINARIES=(
     usr/bin/g++-16
     usr/bin/ld.lld
     usr/bin/qemu-i386
+    # Memcheck is a contract, not a convenience: the FP/hexadecimal oracles in
+    # the contract lanes run their probe under valgrind and REFUSE to run when
+    # it is missing (a skipped cross-check would report a comparison that never
+    # happened).  A bundle that dropped it would restore a lane whose gates
+    # cannot pass, so it is part of what `verify` proves.
+    usr/bin/valgrind
 )
 # mold is either /usr/bin/mold or the /usr/bin/ld.mold alias, depending on how
 # the distribution split the package.
@@ -224,11 +230,22 @@ do_verify() {
             problem "gcc-16 -m32 cannot link: the i686 multilib is incomplete"
             return 1
         fi
+        mold --version >/dev/null 2>&1 || { rm -rf "$probe"; problem "mold does not run"; return 1; }
+        ld.lld --version >/dev/null 2>&1 || { rm -rf "$probe"; problem "ld.lld does not run"; return 1; }
+        qemu-i386 --version >/dev/null 2>&1 || { rm -rf "$probe"; problem "qemu-i386 does not run"; return 1; }
+        # Presence is not enough: valgrind aborts at startup when the loader's
+        # debug symbols are missing, which is the failure a bundle without
+        # libc6-dbg would restore.  `--version` alone does not touch them, so
+        # run one real Memcheck pass over a trivial program.
+        if ! printf 'int main(void) { return 0; }\n' \
+                | gcc-16 -x c - -o "$probe/vg" >/dev/null 2>&1 \
+                || ! valgrind --error-exitcode=99 --leak-check=full -q "$probe/vg" >/dev/null 2>&1; then
+            rm -rf "$probe"
+            problem "valgrind cannot run Memcheck (missing libc6-dbg for the loader, or a broken build)"
+            return 1
+        fi
         rm -rf "$probe"
-        mold --version >/dev/null 2>&1 || { problem "mold does not run"; return 1; }
-        ld.lld --version >/dev/null 2>&1 || { problem "ld.lld does not run"; return 1; }
-        qemu-i386 --version >/dev/null 2>&1 || { problem "qemu-i386 does not run"; return 1; }
-        say "verified live root: gcc-16 $version, $(mold --version | head -n 1)"
+        say "verified live root: gcc-16 $version, $(mold --version | sed -n '1p'), $(valgrind --version)"
     else
         say "verified layout under $ROOT (probes need a live root)"
     fi

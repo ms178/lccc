@@ -152,6 +152,198 @@ def preamble(step_list: list[dict], planned: set[str], mode: str) -> list[str]:
     return [json.dumps(step, sort_keys=True) for step in step_list[:cut]]
 
 
+
+# ── oracle provisioning ────────────────────────────────────────────────────
+# A lane's toolchain is an INPUT CONTRACT, and an input contract that is only
+# checked implicitly -- by the first gate that trips over a missing tool -- is
+# unverifiable: the failure names the consumer, not the dependency.
+#
+# That is not hypothetical.  Run 39809624659 spent a six-minute contract job to
+# report "LCCC, GCC, Clang and Valgrind are all required" from the
+# hexadecimal-literal oracle, because no lane installed valgrind (and the
+# contract lanes never installed the pinned Clang 23.1.3 oracle either); the
+# same run's sibling shard failed check_llvm_word_counts.py because the lane
+# could receive any GCC 16.x while the oracle family pins 16.2.  Both are
+# one-line provisioning facts that this audit can read from the workflow in
+# under a tenth of a second, with no compiler and no network.
+#
+# The rules, each derived from what the gates THEMSELVES say they need:
+#
+#   R1  a job whose gates need the pinned Clang oracle installs it
+#       (scripts/ci_install_clang_oracle.sh), instead of trusting whatever
+#       `clang` the runner image happens to ship;
+#   R2  a job whose gates run Memcheck provisions the toolchain, which is the
+#       only path that installs valgrind + libc6-dbg;
+#   R3  every job that provisions a toolchain VERIFIES it first
+#       (scripts/ci_verify_oracles.sh): the lane must fail at minute 1 naming
+#       the tool, not at minute 12 naming a gate;
+#   R4  a lane that installs the pinned oracle also asserts its version in that
+#       verification (--clang-version), so "the oracle" cannot silently be a
+#       different release;
+#   R5  the provisioning script's EXTRAS still carries valgrind and libc6-dbg.
+#
+# R1/R2 are derived from the gate scripts rather than from a hand-kept list: a
+# new gate that pins the Clang oracle or runs Memcheck pulls its lane into the
+# rule automatically, which is the property that keeps this audit honest.
+
+CLANG_ORACLE_INSTALL = "scripts/ci_install_clang_oracle.sh"
+TOOLCHAIN_PROVISION = "scripts/ci_provision_toolchain.sh"
+ORACLE_VERIFY = "scripts/ci_verify_oracles.sh"
+VERIFY_STEP = "Verify the lane's oracle toolchain"
+PROVISIONING_SCRIPT = ROOT / TOOLCHAIN_PROVISION
+REQUIRED_EXTRAS = ("valgrind", "libc6-dbg")
+GATE_CALL = re.compile(r"\b(?:bash|sh|python3?)\s+(\S+\.(?:sh|py))")
+
+# Files that DESCRIBE a tool requirement instead of consuming it: the
+# provisioning script names the oracles it installs, the verifier names what it
+# probes, and this audit names both.  Following the closure into them would
+# make every lane that provisions look like a lane that runs Memcheck -- the
+# false positive that turns a fail-closed audit into noise.
+INFRASTRUCTURE = frozenset({
+    "scripts/ci_provision_toolchain.sh",
+    "scripts/ci_toolchain_bundle.sh",
+    "scripts/ci_verify_oracles.sh",
+    "scripts/ci_install_clang_oracle.sh",
+    "tests/regression/check_ci_lane_plan.py",
+})
+
+# What a gate's own text says it needs.  A gate that refuses to run without the
+# pinned Clang oracle says so by sourcing the shared policy; a gate that runs
+# Memcheck says so by invoking the oracle scripts or by asking for the binary.
+CLANG_IDIOMS = ("require_clang_oracle",)
+VALGRIND_IDIOMS = ("which('valgrind')", 'which("valgrind")', "command -v valgrind",
+                   "check_hex_float_oracles", "check_signed_mask_oracles")
+# The hexadecimal oracle compares against Clang as well as GCC.
+CLANG_ALSO = ("check_hex_float_oracles", "check_signed_mask_oracles")
+
+_closure_cache: dict[str, frozenset[str]] = {}
+
+
+def _repo_relative(token: str) -> str:
+    """A repo-relative path from a shell token like `"$root/scripts/gate.py"`.
+
+    Gate scripts resolve their own directory and invoke siblings through it
+    (`python3 "$root/scripts/check_hex_float_oracles.py"`), so the token in the
+    text is neither plain nor repo-relative.  Anchoring on the first `scripts/`
+    or `tests/` component recovers the path the audit can open, which is what
+    makes the hexadecimal oracle's valgrind requirement visible from the FMA
+    contract gate that calls it.
+    """
+    token = token.strip("\"'")
+    for anchor in ("scripts/", "tests/", "tools/"):
+        index = token.find(anchor)
+        if index >= 0:
+            return token[index:]
+    return token
+
+
+def _gate_tools(relative: str, seen: frozenset[str] = frozenset()) -> frozenset[str]:
+    """Tools a gate needs, following the gate scripts it invokes (depth 4)."""
+    relative = _repo_relative(relative)
+    if relative in _closure_cache:
+        return _closure_cache[relative]
+    if relative in seen or len(seen) > 4 or relative in INFRASTRUCTURE:
+        return frozenset()
+    path = ROOT / relative
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return frozenset()
+    tools = set()
+    if any(idiom in text for idiom in CLANG_IDIOMS):
+        tools.add("clang")
+    if any(idiom in text for idiom in VALGRIND_IDIOMS):
+        tools.add("valgrind")
+    if any(idiom in text for idiom in CLANG_ALSO):
+        tools.add("clang")
+    if not tools:
+        for match in GATE_CALL.finditer(text):
+            tools |= set(_gate_tools(match.group(1), seen | {relative}))
+    _closure_cache[relative] = frozenset(tools)
+    return _closure_cache[relative]
+
+
+# A gate that asserts the minor version does so on the compiler's own banner
+# (`re.search(r"\b16\.2(?:\.0)?\b", gcc --version)`); the escaped form is
+# what appears in the source, so it distinguishes a real pin from a version
+# string in a comment.
+GCC_PIN_IDIOM = r"16\.2"
+
+
+def _pins_gcc_minor(relative: str) -> bool:
+    try:
+        return GCC_PIN_IDIOM in (ROOT / relative).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
+def oracle_provisioning(document: dict) -> list[str]:
+    """R1-R4: every lane provisions the oracles its own gates demand."""
+    problems: list[str] = []
+    for name, job in sorted((document.get("jobs") or {}).items()):
+        steps = job.get("steps") or []
+        if not steps:
+            continue  # reusable-workflow shard: its gates live elsewhere
+        runs = [step.get("run") or "" for step in steps]
+        joined = "\n".join(runs)
+        tools: set[str] = set()
+        for match in GATE_CALL.finditer(joined):
+            tools |= set(_gate_tools(match.group(1)))
+        installs_clang = CLANG_ORACLE_INSTALL in joined
+        provisions = TOOLCHAIN_PROVISION in joined
+        verifies = [run for step, run in zip(steps, runs)
+                    if (step.get("name") or "") == VERIFY_STEP]
+        if "clang" in tools and not installs_clang:
+            problems.append(
+                f"{name}: runs a gate that pins the Clang 23.1.3 oracle but no step "
+                f"installs it ({CLANG_ORACLE_INSTALL}): the runner image's `clang` is "
+                f"several releases older, so the gate would either fail or compare "
+                f"against the wrong reference")
+        if "valgrind" in tools and not provisions:
+            problems.append(
+                f"{name}: runs a Memcheck gate but no step provisions the toolchain "
+                f"({TOOLCHAIN_PROVISION}), which is the only path that installs "
+                f"valgrind + libc6-dbg")
+        if provisions and not verifies:
+            problems.append(
+                f"{name}: provisions a toolchain but never verifies it "
+                f"({VERIFY_STEP!r} running {ORACLE_VERIFY}): a missing or wrong tool "
+                f"then surfaces minutes later, naming a gate instead of the tool")
+        if installs_clang:
+            for run in verifies:
+                if "--clang-version" not in run:
+                    problems.append(
+                        f"{name}: installs the pinned Clang oracle but its "
+                        f"{VERIFY_STEP!r} step does not assert --clang-version: "
+                        f"'the oracle' must mean exactly 23.1.3")
+        # R6: the lane runs a gate that pins the GCC minor, so the lane's own
+        # probe must assert it too.  Without this, a lane can be provisioned
+        # with 16.3 and pass its probe, only for the first pinning gate to fail
+        # twelve minutes later with "GCC 16.2 required" and no version named.
+        pins = [match.group(1) for match in GATE_CALL.finditer(joined)
+                if _pins_gcc_minor(_repo_relative(match.group(1)))]
+        if pins and provisions:
+            for run in verifies:
+                if "--gcc-version" not in run:
+                    problems.append(
+                        f"{name}: runs {_repo_relative(pins[0])!r}, which pins GCC 16.2, "
+                        f"but its {VERIFY_STEP!r} step does not assert --gcc-version: "
+                        f"the lane would pass with 16.3 and fail in a later gate")
+    return problems
+
+
+def provisioning_extras_problems(text: str) -> list[str]:
+    """R5: the package set every bundle and every lane is built from."""
+    match = re.search(r'^EXTRAS="([^"]*)"', text, re.M)
+    if not match:
+        return ["scripts/ci_provision_toolchain.sh: no EXTRAS= declaration: the "
+                "audit cannot prove what a lane installs"]
+    packages = match.group(1).split()
+    return [f"scripts/ci_provision_toolchain.sh: EXTRAS lacks {package!r}: every "
+            f"lane bundles this package set, so a Memcheck gate would run only "
+            f"where the tool happened to be installed"
+            for package in REQUIRED_EXTRAS if package not in packages]
+
 def audit(document: dict, plan: dict) -> list[str]:
     problems: list[str] = []
     jobs = document.get("jobs") or {}
@@ -223,6 +415,9 @@ def audit(document: dict, plan: dict) -> list[str]:
             problems.append(f"{group}: shards are imbalanced: "
                             + ", ".join(f"{lane} {cost:.0f} s" for lane, cost in zip(lanes, costs))
                             + f" (mean {mean:.0f} s, tolerance {BALANCE_TOLERANCE:.0%})")
+    # The partition is only half of a lane's contract: the other half is that
+    # the lane can RUN what it was given.
+    problems.extend(oracle_provisioning(document))
     return problems
 
 
@@ -321,7 +516,70 @@ def self_test() -> None:
                for problem in problems), problems
     assert any("orphan-b" in problem and "does not name it" in problem
                for problem in problems), problems
-    print("check_ci_lane_plan: self-test PASS (8 rules, 11 fixtures)")
+    # ── oracle provisioning (R1-R5) ────────────────────────────────────────
+    # A lane that runs a Memcheck gate and the pinned-Clang gate but installs
+    # neither: exactly the shape run 39809624659 shipped.  All three rules must
+    # fire, and each must name the job and the missing piece.
+    bare = {"jobs": {"contracts": {"steps": [
+        step("Checkout"),
+        step("Run the contracts", "bash tests/regression/check_fma_gating.sh"),
+    ]}}}
+    problems = oracle_provisioning(bare)
+    assert any("pins the Clang 23.1.3 oracle" in p and "contracts" in p for p in problems), problems
+    assert any("Memcheck gate" in p and "contracts" in p for p in problems), problems
+
+    # A lane that provisions and never verifies: the tool is there, but nothing
+    # proves it is the pinned one until a gate fails twelve minutes later.
+    unverified = {"jobs": {"contracts": {"steps": [
+        step("Checkout"),
+        step("Provision", "bash scripts/ci_provision_toolchain.sh --multilib"),
+        step("Run the contracts", "bash tests/regression/check_fma_gating.sh"),
+    ]}}}
+    problems = oracle_provisioning(unverified)
+    assert any(VERIFY_STEP in p and "never verifies" in p for p in problems), problems
+
+    # Installing the oracle and verifying without asserting its version leaves
+    # "the oracle" undefined: any release would pass.
+    loose = {"jobs": {"contracts": {"steps": [
+        step("Checkout"),
+        step("Provision", "bash scripts/ci_provision_toolchain.sh --multilib"),
+        step("Clang", "bash scripts/ci_install_clang_oracle.sh"),
+        step(VERIFY_STEP, "bash scripts/ci_verify_oracles.sh --gcc-version 16.2"),
+        step("Run the contracts", "bash tests/regression/check_fma_gating.sh"),
+    ]}}}
+    problems = oracle_provisioning(loose)
+    assert any("--clang-version" in p for p in problems), problems
+
+    # The fully provisioned lane is clean, so the rule can pass as well as fail.
+    complete = {"jobs": {"contracts": {"steps": [
+        step("Checkout"),
+        step("Provision", "bash scripts/ci_provision_toolchain.sh --multilib"),
+        step("Clang", "bash scripts/ci_install_clang_oracle.sh"),
+        step(VERIFY_STEP, "bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.3"),
+        step("Run the contracts", "bash tests/regression/check_fma_gating.sh"),
+    ]}}}
+    assert oracle_provisioning(complete) == [], oracle_provisioning(complete)
+
+    # R6: the lane runs a gate that pins the GCC minor but its probe does not
+    # assert it -- the shape that made run 39809624659's shard a fail inside
+    # check_llvm_word_counts.py with no version in the message.
+    gcc_loose = {"jobs": {"contracts": {"steps": [
+        step("Checkout"),
+        step("Provision", "bash scripts/ci_provision_toolchain.sh --multilib"),
+        step("Clang", "bash scripts/ci_install_clang_oracle.sh"),
+        step(VERIFY_STEP, "bash scripts/ci_verify_oracles.sh --clang-version 23.1.3"),
+        step("Run the contracts", "bash tests/regression/check_llvm_word_counts.py"),
+    ]}}}
+    problems = oracle_provisioning(gcc_loose)
+    assert any("--gcc-version" in p and "16.2" in p for p in problems), problems
+    assert oracle_provisioning(complete) == [], oracle_provisioning(complete)
+
+    # R5: the package set is what every bundle is built from.
+    assert provisioning_extras_problems('EXTRAS="qemu-user mold lld"') != []
+    assert provisioning_extras_problems('EXTRAS="qemu-user valgrind libc6-dbg"') == []
+    assert provisioning_extras_problems("PACKAGES=qemu") != []
+
+    print("check_ci_lane_plan: self-test PASS (15 rules, 19 fixtures)")
 
 
 def main(argv: list[str] | None = None) -> int:
