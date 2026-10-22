@@ -90,6 +90,13 @@ clang_version_expected=""
 # installed (a verifier that cannot fail is decoration), and so a lane that
 # provisions it under another name can say so.
 valgrind_tool=${LCCC_VALGRIND_TOOL:-valgrind}
+# The presence probes resolve their binary by name; the names are parameters
+# for the same two reasons as valgrind's: the self-test has to exercise the
+# "required tool is absent" path on a host where the tool IS installed, and a
+# lane that provisions it under another name can say so.
+mold_tool=${LCCC_MOLD_TOOL:-mold}
+lld_tool=${LCCC_LLD_TOOL:-ld.lld}
+qemu_tool=${LCCC_QEMU_TOOL:-qemu-i386}
 # Capability probes are on by default; the presence probes are opt-in and the
 # union is checked against what the lane's gates actually consume by
 # tests/regression/check_ci_lane_plan.py.
@@ -184,7 +191,10 @@ require_gcc() {
     # -std=c23, and a gcc-16 that cannot parse it is not the oracle.
     local std
     for std in c17 c23; do
-        if ! printf 'int main(void) { return 0; }\n' | "$bin" -std="$std" -x c -fsyntax-only - >/dev/null 2>&1; then
+        # A here-string, not `printf | gcc`: a producer that loses the race to a
+        # consumer which exits early takes SIGPIPE (141) and, under
+        # `set -o pipefail`, reports a compiler failure that never happened.
+        if ! "$bin" -std="$std" -x c -fsyntax-only - >/dev/null 2>&1 <<<'int main(void) { return 0; }'; then
             failed "gcc-16 cannot compile -std=$std"
         fi
     done
@@ -195,8 +205,8 @@ require_multilib() {
     # qemu-i386 when the kernel refuses 32-bit processes.  Check both halves.
     local work rc=0 run=()
     work=$(mktemp -d)
-    if ! printf '#include <stdio.h>\nint main(void) { puts("ok"); return 0; }\n' \
-            | gcc-16 -m32 -x c - -o "$work/m32" >/dev/null 2>&1; then
+    if ! gcc-16 -m32 -x c - -o "$work/m32" >/dev/null 2>&1 \
+            <<<$'#include <stdio.h>\nint main(void) { puts("ok"); return 0; }'; then
         failed "gcc-16 -m32 cannot link: the i686 multilib is incomplete"
         rm -rf "$work"; return
     fi
@@ -219,8 +229,8 @@ require_multilib() {
     rm -rf "$work"
 }
 
-require_runner() {
-    local tool=$1 version
+require_runner() { # require_runner <label> <binary>
+    local label=$1 tool=$2 version
     if ! command -v "$tool" >/dev/null 2>&1; then
         failed "$tool is not on PATH"
         return
@@ -230,7 +240,7 @@ require_runner() {
         return
     fi
     version=${version%%$'\n'*}
-    report "$tool" "$version"
+    report "$label" "$version"
 }
 
 require_valgrind() {
@@ -246,7 +256,7 @@ require_valgrind() {
     # it can match a single symbol -- the exact state a bundle exported without
     # the debug package restores.
     work=$(mktemp -d)
-    if ! printf 'int main(void) { return 0; }\n' | gcc-16 -g -x c - -o "$work/vg" >/dev/null 2>&1; then
+    if ! gcc-16 -g -x c - -o "$work/vg" >/dev/null 2>&1 <<<'int main(void) { return 0; }'; then
         failed "the Memcheck smoke probe did not compile"
     elif ! "$bin" --error-exitcode=99 --leak-check=full -q "$work/vg" >"$work/log" 2>&1; then
         failed "valgrind cannot complete a Memcheck run (missing libc6-dbg for the loader?): $(sed -n '1,3p' "$work/log" | tr '\n' ' ')"
@@ -310,6 +320,7 @@ for a in "$@"; do
         -dumpfullversion) printf '%s\n' "${CASES_VERSION:-16.2.0}"; exit 0 ;;
     esac
 done
+cat >/dev/null 2>&1 || true
 out=""
 prev=""
 for a in "$@"; do
@@ -423,9 +434,9 @@ MOCK
     #    a host that has none of them (the research box has mold and qemu but
     #    no lld; making the default require lld turned ci_local.sh red).
     status=0
-    PATH="$work/tools-min:/usr/bin:/bin" CASES_VERSION=16.2.0 \
+    PATH="$work/tools-min:/usr/bin:/bin" LCCC_LLD_TOOL=lld-case7-absent CASES_VERSION=16.2.0 \
         bash "$0" --gcc-version 16.2 >"$work/out" 2>"$work/err" || status=$?
-    if (( status == 0 )) && ! grep -q 'ld.lld' "$work/err"; then
+    if (( status == 0 )) && ! grep -q 'lld-case7-absent' "$work/err"; then
         echo "  ok   the default require set does not demand the presence probes"
     else
         echo "  FAIL default require set: exit $status, err=$(sed -n '1,5p' "$work/err")" >&2
@@ -434,9 +445,9 @@ MOCK
 
     # 8. ...and a lane that DOES ask for one gets a failure that names it.
     status=0
-    PATH="$work/tools-min:/usr/bin:/bin" CASES_VERSION=16.2.0 \
+    PATH="$work/tools-min:/usr/bin:/bin" LCCC_LLD_TOOL=lld-case8-absent CASES_VERSION=16.2.0 \
         bash "$0" --require gcc,lld >"$work/out" 2>"$work/err" || status=$?
-    if (( status != 0 )) && grep -q 'ld.lld is not on PATH' "$work/err"; then
+    if (( status != 0 )) && grep -q 'lld-case8-absent is not on PATH' "$work/err"; then
         echo "  ok   --require lld fails closed and names the tool"
     else
         echo "  FAIL --require lld: exit $status, err=$(sed -n '1,5p' "$work/err")" >&2
@@ -460,9 +471,9 @@ for probe in "${probes[@]}"; do
         multilib) require_multilib ;;
         valgrind) require_valgrind ;;
         pyyaml) require_python_yaml ;;
-        mold) require_runner mold ;;
-        lld) require_runner ld.lld ;;
-        qemu) require_runner qemu-i386 ;;
+        mold) require_runner mold "$mold_tool" ;;
+        lld) require_runner ld.lld "$lld_tool" ;;
+        qemu) require_runner qemu-i386 "$qemu_tool" ;;
     esac
 done
 if [[ -n $clang_version_expected ]]; then require_clang "$clang_version_expected"; fi

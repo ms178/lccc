@@ -140,20 +140,23 @@ finish() {
     esac
     # A compiler that cannot parse the standard its own gates use, or that
     # cannot link its own 32-bit runtime, is not the oracle they pin.
-    if ! printf '#include <stddef.h>\nsize_t s;\nint main(void) { return 0; }\n' |
-        "$prefix/bin/gcc-16" -std=c23 -x c -fsyntax-only - >/dev/null 2>"$errlog_or_null"; then
+    # Here-strings throughout: a producer that loses the race to a consumer
+    # which exits early takes SIGPIPE, and under `set -o pipefail` that reads
+    # as a broken compiler.
+    if ! "$prefix/bin/gcc-16" -std=c23 -x c -fsyntax-only - >/dev/null 2>"$errlog_or_null" \
+        <<<$'#include <stddef.h>\nsize_t s;\nint main(void) { return 0; }'; then
         fail "$prefix/bin/gcc-16 cannot compile -std=c23"
     fi
     probe=$(mktemp -d "${TMPDIR:-/tmp}/gcc-oracle-probe.XXXXXX")
-    if ! printf '#include <stdio.h>\nint main(void) { puts("ok"); return 0; }\n' |
-        "$prefix/bin/gcc-16" -O1 -x c - -o "$probe/p64" >/dev/null 2>"$errlog_or_null"; then
+    if ! "$prefix/bin/gcc-16" -O1 -x c - -o "$probe/p64" >/dev/null 2>"$errlog_or_null" \
+        <<<$'#include <stdio.h>\nint main(void) { puts("ok"); return 0; }'; then
         fail "$prefix/bin/gcc-16 cannot link its 64-bit probe"
     fi
     if ! run_probe "$probe" "$probe/p64"; then
         fail "$prefix/bin/gcc-16's 64-bit probe did not print ok: $(sed -n '1,3p' "$probe/err" | tr '\n' ' ')"
     fi
-    if ! printf '#include <stdio.h>\nint main(void) { puts("ok"); return 0; }\n' |
-        "$prefix/bin/gcc-16" -m32 -x c - -o "$probe/p32" >/dev/null 2>"$errlog_or_null"; then
+    if ! "$prefix/bin/gcc-16" -m32 -x c - -o "$probe/p32" >/dev/null 2>"$errlog_or_null" \
+        <<<$'#include <stdio.h>\nint main(void) { puts("ok"); return 0; }'; then
         fail "$prefix/bin/gcc-16 cannot link -m32 (the archive ships 32/libgcc, so this is a broken prefix)"
     fi
     if ! run_probe "$probe" "$probe/p32"; then
@@ -183,6 +186,7 @@ self_test() {
 #!/bin/sh
 for a in "$@"; do [ "$a" = -dumpfullversion ] && { printf '%s\n' "${MOCK_VERSION:-16.2.0}"; exit 0; }; done
 prev=""; out=""
+cat >/dev/null 2>&1 || true
 for a in "$@"; do [ "$prev" = -o ] && out=$a; prev=$a; done
 [ -n "$out" ] && { printf '#!/bin/sh\necho ok\n' >"$out"; chmod +x "$out"; }
 exit 0
