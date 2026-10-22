@@ -290,3 +290,36 @@ CCC_DISABLE_PASSES=aggcopy16 CCC=target/fastbuild/lccc GCC=gcc-16 CLANG=clang \
 The last command is the gate's own regression test: with the pass disabled, 59
 rows grow, and `--check` reports exactly those 59 debts. It passes only with the
 pass on.
+
+## Addendum (rebase onto `dfa8830d`): the shard steps could not fail
+
+While rebasing this series, the full local sweep plus the first honest
+hosted runs exposed a pre-existing CI defect worth recording here
+because it is the reason several numbers in this document were
+"green" in CI while being wrong: the two `fast_contracts` shard steps
+invoked their gate body as `if ! fast_contracts 2>&1 | tee …`. Bash
+disables `-e` *and* the `ERR` trap inside a function whose exit status
+is being tested, so any gate failing mid-body neither stopped the body
+nor reddened the step — only the body's *last* command decided the
+outcome. Proven with a synthetic body, fixed by calling the function
+as a plain command with an EXIT-trap annotator, and pinned by
+executing failing/passing probes through the scaffolding in
+`check_ci_shard_partition.py`.
+
+Failures on main that were invisible until the scaffolding became
+honest, each paid down in this branch with its own commit:
+
+* census drift (`CCC_NO_P1_WAVES` undocumented; a panic site at 836 vs
+  the 835 baseline),
+* the verify-ir hook pin (22 vs an actual 25),
+* a stale llvm-scalar-facts witness and stale phi-acyclic pins,
+* seven oracle gates hard-requiring exact GCC 16.2 while CI
+  provisions the rolling-major GCC 16 its installer documents
+  (unified behind `gcc_oracle_identity` + `--allow-gcc16-snapshot`,
+  the idiom one gate already had),
+* `check_fma_gating.sh`'s hex-float sub-oracle requiring valgrind and
+  clang that the shard jobs never installed.
+
+The matrix totals on the rebased tree are unchanged (2069 / 1544 /
+1553) — the regalloc work that landed on main meanwhile does not move
+these 122 kernels.
