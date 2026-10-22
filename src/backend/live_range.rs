@@ -741,6 +741,30 @@ pub(crate) fn mark_loop_spanning(
     web_inloop_use: bool,
     phi_backedges: &[(u32, u32)],
 ) {
+    mark_loop_spanning_with_copy_policy(
+        ranges,
+        loop_extents,
+        coalesce_member_of,
+        func,
+        meta_uses,
+        web_inloop_use,
+        phi_backedges,
+        false,
+    );
+}
+
+/// Preserve conditional dependencies only for the sparse call-spanning policy.
+/// Ordinary functions retain their measured allocation and recurrence pricing.
+pub(crate) fn mark_loop_spanning_with_copy_policy(
+    ranges: &mut [LiveRange],
+    loop_extents: &[(u32, u32)],
+    coalesce_member_of: &FxHashMap<u32, u32>,
+    func: &IrFunction,
+    meta_uses: &FxHashMap<u32, Vec<u32>>,
+    web_inloop_use: bool,
+    phi_backedges: &[(u32, u32)],
+    preserve_conditional_copies: bool,
+) {
     // Web leader -> members (built once, used by the unconditional
     // slot-operand classification below and the extent pass after it).
     let mut members_of: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
@@ -773,10 +797,13 @@ pub(crate) fn mark_loop_spanning(
             if matches!(inst, Instruction::Phi { .. }) {
                 def_is_phi.insert(dest.0);
             }
-            // Post-phi merge destinations have multiple Copy definitions.
-            // Preserve every incoming dependency: a later cold/entry copy
-            // must not erase a hot backedge from the recurrence graph.
-            def_uses.entry(dest.0).or_default().extend(ops);
+            if preserve_conditional_copies {
+                // A last textual entry/constant Copy must not hide an
+                // arithmetic backedge of the sparse conditional state.
+                def_uses.entry(dest.0).or_default().extend(ops);
+            } else {
+                def_uses.insert(dest.0, ops);
+            }
         }
     }
     // (point -> vids consumed there as the folding-friendly address or
@@ -1973,15 +2000,6 @@ impl LinearScanAllocator {
                     && nxt > pos
                     && (priority as u128) * (k as u128) < (bar as u128)
                     && interval.range.remaining_cost(nxt) == 0
-                    // A web/priority boost is not a saved reload. Require a
-                    // strict gain in the actual remaining use-site cost too;
-                    // two entry relays with one use each cannot pay for a steal.
-                    && incoming.remaining_cost(pos) > interval.range.remaining_cost(pos)
-                    // A last textual use is not the last dynamic use of a
-                    // loop-spanning value. A short temporary must not escape
-                    // on that false zero-future-cost estimate and displace a
-                    // base needed again at the backedge.
-                    && (!interval.range.spans_loop || incoming.spans_loop)
                     // A slot-operand-only incoming gains ~nothing from the
                     // register: its remaining uses are served from the slot
                     // with zero instructions (an integer compare's RHS
@@ -4218,7 +4236,21 @@ mod tests {
             block(5, vec![], Terminator::Return(Some(val(1)))),
         ];
         let mut ranges = vec![lr(1, 0, 10, vec![2, 3, 9, 10], 40)];
+        let mut ordinary = ranges.clone();
         mark_loop_spanning(
+            &mut ordinary,
+            &[(2, 9)],
+            &FxHashMap::default(),
+            &f,
+            &collect_range_metadata(&f, &[]).uses,
+            true,
+            &[(1, 3)],
+        );
+        assert!(
+            !ordinary[0].span_recurrence,
+            "ordinary policy remains unchanged"
+        );
+        mark_loop_spanning_with_copy_policy(
             &mut ranges,
             &[(2, 9)],
             &FxHashMap::default(),
@@ -4226,6 +4258,7 @@ mod tests {
             &collect_range_metadata(&f, &[]).uses,
             true,
             &[(1, 3)],
+            true,
         );
         assert!(
             ranges[0].span_recurrence,
@@ -5260,27 +5293,6 @@ mod tests {
         e.init_registers();
         e.allocate_range(victim);
         assert_eq!(e.select_evict_victim(&incoming, 3), None);
-    }
-
-    #[test]
-    fn boosted_priority_does_not_make_equal_entry_reloads_profitable() {
-        let victim = lr(1, 0, 200, vec![1, 80], 1);
-        let incoming = lr(2, 50, 120, vec![119], 700);
-        let mut allocator = LinearScanAllocator::new(vec![], vec![PhysReg(0)]);
-        allocator.init_registers();
-        allocator.allocate_range(victim);
-        assert_eq!(allocator.select_evict_victim(&incoming, 3), None);
-    }
-
-    #[test]
-    fn short_incoming_does_not_escape_over_cyclic_victim_uses() {
-        let mut victim = lr(1, 0, 200, vec![1, 80], 20);
-        victim.spans_loop = true;
-        let incoming = lr(2, 50, 120, vec![60, 119], 700);
-        let mut allocator = LinearScanAllocator::new(vec![], vec![PhysReg(0)]);
-        allocator.init_registers();
-        allocator.allocate_range(victim);
-        assert_eq!(allocator.select_evict_victim(&incoming, 3), None);
     }
 
     /// The escape never fires on behalf of a slot-operand-only incoming

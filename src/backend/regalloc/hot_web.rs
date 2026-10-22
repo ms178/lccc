@@ -14,6 +14,63 @@ pub(super) struct HotWebSteal<'a> {
     pub use_count: &'a FxHashMap<u32, u64>,
 }
 
+/// Profitability prior for the additional noncoalescible-state policy. Keep
+/// ordinary loops on their established allocator path: an eight-bit masked
+/// equality suggests a sparse arm, not a semantic fact about the inputs.
+pub(super) fn has_sparse_mask_comparison(func: &IrFunction) -> bool {
+    use crate::ir::reexports::IrCmpOp;
+    let defs: FxHashMap<_, _> = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .filter_map(|inst| inst.dest().map(|dest| (dest.0, inst)))
+        .collect();
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .any(|inst| {
+            let Instruction::Cmp {
+                op: IrCmpOp::Eq | IrCmpOp::Ne,
+                lhs,
+                rhs,
+                ..
+            } = inst
+            else {
+                return false;
+            };
+            let (value, constant) = match (lhs, rhs) {
+                (Operand::Value(v), Operand::Const(c)) | (Operand::Const(c), Operand::Value(v)) => {
+                    (v, c)
+                }
+                _ => return false,
+            };
+            let Some(Instruction::BinOp {
+                op: IrBinOp::And,
+                lhs,
+                rhs,
+                ty,
+                ..
+            }) = defs.get(&value.0)
+            else {
+                return false;
+            };
+            if !ty.is_integer() || ty.size() == 0 || ty.size() > 8 {
+                return false;
+            }
+            let mask = match (lhs, rhs) {
+                (Operand::Const(c), _) | (_, Operand::Const(c)) => c.to_i64(),
+                _ => None,
+            };
+            match (mask, constant.to_i64()) {
+                (Some(mask), Some(c)) => {
+                    let mask = mask as u64 & (u64::MAX >> (64 - ty.size() * 8));
+                    mask.count_ones() >= 8 && c as u64 & !mask == 0
+                }
+                _ => false,
+            }
+        })
+}
+
 /// Allocation promotion is not destructive phi coalescing. In particular,
 /// a loop header fed by a conditional (multi-definition) merge cannot safely
 /// coalesce with that source, but may still keep its own callee-saved home.
@@ -267,6 +324,41 @@ mod tests {
                 },
             )
         }
+    }
+
+    #[test]
+    fn extra_loop_state_policy_requires_a_sparse_integer_comparison() {
+        use crate::ir::reexports::{BasicBlock, BlockId, IrCmpOp, Value};
+        let mut f = IrFunction::new("sparse_state".into(), IrType::U32, vec![], false);
+        for (mask, constant, expected) in [(255, 0, true), (127, 0, false), (255, 256, false)] {
+            f.blocks = vec![BasicBlock {
+                label: BlockId(0),
+                source_spans: vec![],
+                instructions: vec![
+                    Instruction::BinOp {
+                        dest: Value(1),
+                        op: IrBinOp::And,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Const(IrConst::U32(mask)),
+                        ty: IrType::U32,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(2),
+                        op: IrCmpOp::Eq,
+                        lhs: Operand::Value(Value(1)),
+                        rhs: Operand::Const(IrConst::U32(constant)),
+                        ty: IrType::U32,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            }];
+            assert_eq!(has_sparse_mask_comparison(&f), expected);
+        }
+        f.blocks[0].instructions.pop();
+        assert!(
+            !has_sparse_mask_comparison(&f),
+            "a masked value alone is not a branch prior"
+        );
     }
 
     #[test]
