@@ -2582,7 +2582,7 @@ pub(crate) fn recognize_function(
     let mut next_value_id = func.max_value_id().saturating_add(1);
     // Boolean mux/majority algebra kill switch (same authority contract as
     // the vectorizer's CCC_NO_* gates; A/B for the differential batteries).
-    let bool_algebra_disabled = std::env::var("CCC_NO_BOOL_ALGEBRA").is_ok();
+    let bool_algebra_disabled = facts::bool_algebra_disabled();
     // Deferred cross-block rewrites (mask distribution): the producer and
     // consumer may live in different blocks; both mutations are applied
     // after the scan ends so no &mut borrow of `func.blocks` overlaps the

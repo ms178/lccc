@@ -841,6 +841,26 @@ fn live_values(func: &IrFunction, defs: &[Option<Instruction>]) -> Vec<bool> {
     live
 }
 
+/// The single authority for the `CCC_NO_BOOL_ALGEBRA` kill switch.
+///
+/// This used to be read in two places, and the two spellings did not mean the
+/// same thing: `recognize_function` asked for the value as UTF-8, which fails
+/// for a value that is not valid UTF-8, while the fact pass asked for it as an
+/// `OsString`, which succeeds for any present value. A non-UTF-8 assignment
+/// therefore switched the boolean algebra off in one path and left it on in
+/// the other -- the same knob, two answers, inside one pipeline. Presence is
+/// the intended contract ("is it set"), matching every other `CCC_NO_*` gate,
+/// so the `OsString` spelling is the one kept.
+///
+/// It is also cached for the process lifetime, following `dce_debug_enabled`:
+/// re-reading the environment per function is a self-host compile-time tax
+/// (lock + hash lookup + `OsString` alloc) for a value that cannot change.
+pub(super) fn bool_algebra_disabled() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_BOOL_ALGEBRA").is_some());
+    *FLAG
+}
+
 pub(super) fn run(func: &mut IrFunction) -> usize {
     use crate::ir::reexports::Terminator;
     if func
@@ -887,7 +907,7 @@ pub(super) fn run(func: &mut IrFunction) -> usize {
         defs: &defs,
         uses: &uses,
         visits: std::cell::Cell::new(512),
-        disable_logic: std::env::var_os("CCC_NO_BOOL_ALGEBRA").is_some(),
+        disable_logic: bool_algebra_disabled(),
     };
     let mut next = func
         .next_value_id
