@@ -1169,7 +1169,9 @@ impl X86Codegen {
         let fused32 = matches!(narrow_to, Some(t) if t.size() <= 4)
             && self.state.alloca_over_align(v).is_none();
         if fused32 {
-            self.state.out.emit_instr_rbp_reg("    leal", slot.0, dest_32);
+            self.state
+                .out
+                .emit_instr_rbp_reg("    leal", slot.0, dest_32);
         } else {
             self.value_to_reg(&Value(v), dest_64);
         }
@@ -1298,7 +1300,8 @@ impl X86Codegen {
             // address to take and falls through.
             if from_ty.size() == 8 && self.state.is_alloca(v.0) {
                 if let Some(slot) = self.state.get_slot(v.0) {
-                    return self.emit_alloca_addr_cast(v.0, slot, kind, dest_phys, dest_32, dest_64);
+                    return self
+                        .emit_alloca_addr_cast(v.0, slot, kind, dest_phys, dest_32, dest_64);
                 }
             }
             return false;
