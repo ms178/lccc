@@ -359,8 +359,40 @@ gate "ci-toolchain-bundle" fast \
 
 # The 703 s fast-contract step is split across two jobs; a gate listed in both
 # halves is paid for twice and a gate dropped from both is silently unrun.
+gate "ci-shard-partition-self-test" fast \
+    python3 tests/regression/check_ci_shard_partition.py --self-test
 gate "ci-shard-partition" fast \
     python3 tests/regression/check_ci_shard_partition.py
+
+# The shard assignment itself is a reviewable record
+# (.github/ci-lane-plan.json).  The workflow is what runs, so this audit is
+# what keeps the record honest: a gate planned twice, planned but absent,
+# present but unplanned, a shard that lost part of its byte-identical
+# preamble, a drifted balance, or -- the failure that actually happened when
+# the plan was keyed by step name -- a sharded job the plan does not name at
+# all.  Compiler-free and under a second, so it runs with the same mock
+# contracts as the partition audit above.
+gate "ci-lane-plan-self-test" fast \
+    python3 tests/regression/check_ci_lane_plan.py --self-test
+gate "ci-lane-plan" fast \
+    python3 tests/regression/check_ci_lane_plan.py
+
+# The lane's toolchain is an INPUT CONTRACT, so it is proven before any gate
+# spends minutes failing over a missing tool -- the same probe every hosted
+# lane runs, with the same pin.  Run 39809624659 lost a six-minute contract job
+# to "LCCC, GCC, Clang and Valgrind are all required" from the
+# hexadecimal-literal oracle, because nothing had installed valgrind; the
+# sibling shard lost one to a GCC 16.x that was not 16.2.  Both are two-second
+# probes here, and both name the tool instead of a downstream gate.  The
+# self-test is the fixture table for every failure mode the probe can report
+# (missing tool, version drift, unpinned Clang), so a verifier that cannot fail
+# fails this gate.
+gate "oracle-toolchain-self-test" fast \
+    bash scripts/ci_verify_oracles.sh --self-test
+gate "gcc-oracle-installer-self-test" fast \
+    bash scripts/ci_install_gcc_oracle.sh --self-test
+gate "oracle-toolchain" fast \
+    bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.3
 
 gate "rust-toolchain-selector" fast \
     bash tests/regression/check_rust_toolchain_selector.sh
@@ -1592,6 +1624,11 @@ gate "ci-gate-parity" fast \
     python3 scripts/check_ci_gate_parity.py
 gate "ci-asm-diff-parity-self-test" fast \
     python3 scripts/test_ci_gate_parity.py
+# The splitter rewrites ci.yml.  A gate that lands in no shard silently stops
+# running, and a gate that lands in two is paid for twice in a green run, so
+# the transform itself is pinned (not just its output) on synthetic workflows.
+gate "ci-lane-split-self-test" fast \
+    python3 scripts/test_ci_lane_split.py
 
 # The encdiff semantic-validation and asmdiff semantic-validation suites
 # run AFTER the oracle provisioning below: their real-toolchain legs
@@ -2045,6 +2082,15 @@ gate "fma-peel-invariant" fast \
 # 157 sites from growing while they are migrated.
 gate "env-test-hygiene" fast \
     bash tests/regression/check_env_test_hygiene.sh
+
+# `LCCC_IFCONV_ARM_BUDGET` is an A/B lever, and its contract is what keeps the
+# numbers comparable: =1 tightens, off/full disable, an unparsable value is
+# inert.  The gate also pins that the switch is resolved at the pipeline
+# boundary (`src/passes/mod.rs`, which the env-read ratchet excludes) and not
+# in the pass body -- reading it there is what put the ratchet one over budget
+# when it landed.
+gate "ifconv-arm-budget-switch" fast \
+    env CCC="$LCCC" bash tests/regression/check_ifconv_arm_budget_switch.sh
 
 # The peephole used to change its mind about a line because of a trailing blank:
 # a padded load stopped forwarding the constant store above it (lccc's own

@@ -35,26 +35,43 @@ PROVISION_COMMAND = "bash scripts/ci_provision_toolchain.sh --multilib"
 
 
 class OracleDiagnostics(unittest.TestCase):
+    def jobs(self):
+        return yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())["jobs"]
+
     def provisioning_bodies(self):
-        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
-        return [step["run"] for job in workflow["jobs"].values()
+        return [step["run"] for job in self.jobs().values()
                 for step in job.get("steps", [])
                 if step.get("name") == PROVISION_STEP]
 
     def lanes_needing_oracles(self):
-        """Jobs whose steps run a compiler-16 gate, mapped to their steps."""
-        workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+        """Jobs whose steps call the `gcc-16` oracle, mapped to their steps.
+
+        `gcc-16` is the oracle binary itself; merely running the built
+        `target/fastbuild/lccc` (the ICX lane does -- it is the compiler under
+        test there) does not need the oracle packages.
+        """
         lanes = {}
-        for name, job in workflow["jobs"].items():
+        for name, job in self.jobs().items():
             bodies = [step.get("run") or "" for step in job.get("steps", [])]
-            if any("gcc-16" in body or "lccc" in body for body in bodies):
+            if any("gcc-16" in body for body in bodies):
                 lanes[name] = bodies
         return lanes
 
     def test_every_lane_provisions_through_the_same_step(self):
         bodies = self.provisioning_bodies()
-        self.assertEqual(len(bodies), 9, f"provisioning lanes changed: {len(bodies)}")
         self.assertEqual(set(bodies), {PROVISION_COMMAND})
+        # The COUNT is a consequence of the lane map, not an invariant: every
+        # lane that uses the oracle must carry the step, and the step must not
+        # exist where no oracle is used. Pinning a number turned every
+        # re-balance (which splits a lane in two) into a test edit, and would
+        # have hidden a lane that lost its provisioning while another gained a
+        # duplicate.
+        with_step = {name for name, job in self.jobs().items()
+                     if any(step.get("name") == PROVISION_STEP
+                            for step in job.get("steps", []))}
+        self.assertTrue(with_step, "no lane provisions the oracle toolchain")
+        self.assertEqual(with_step, set(self.lanes_needing_oracles()),
+                         "provisioning step presence must follow oracle use")
         # No lane may keep a private apt transaction: that is the duplicate this
         # consolidation removed, and it would silently come back as a step.
         for name, bodies in self.lanes_needing_oracles().items():

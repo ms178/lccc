@@ -47,14 +47,19 @@ def main() -> int:
         if "--markdown" not in args:
             args.extend(["--markdown", "bench-summary.md"])
 
-    if "--compilers" not in args:
-        args.extend(["--compilers", "lccc,gcc"])
-    if "--reps" not in args:
-        args.extend(["--reps", "9"])
-    if "--warmup" not in args:
-        args.extend(["--warmup", "1"])
-    if "--strict" not in args:
-        args.append("--strict")
+    # `--merge` is a DIFFERENT verb: it consumes reports the shards already
+    # produced and publishes one.  Injecting the corpus defaults there would
+    # describe a run that is not happening, and `--strict` would promise a gate
+    # the merge path does not perform (its own refusal rules replace it).
+    if "--merge" not in args:
+        if "--compilers" not in args:
+            args.extend(["--compilers", "lccc,gcc"])
+        if "--reps" not in args:
+            args.extend(["--reps", "9"])
+        if "--warmup" not in args:
+            args.extend(["--warmup", "1"])
+        if "--strict" not in args:
+            args.append("--strict")
 
     sys.argv = [sys.argv[0], *args]
     return canonical_main()

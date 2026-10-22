@@ -38,7 +38,18 @@
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+# The directory the gate was invoked from, captured before the `cd "$WORK"`
+# below: the relative-CCC self-test has to reproduce the caller's spelling.
+INVOKED_FROM=$PWD
 LCCC=${CCC:-$ROOT/target/fastbuild/lccc}
+# Resolve a RELATIVE $CCC before the `cd` below.  Dozens of workflow steps spell
+# the compiler `env: CCC=target/fastbuild/lccc`, and this gate changes directory:
+# the relative spelling then names a path inside the scratch tree, every probe
+# fails with "no such file", and the run reads like a codegen regression instead
+# of a path bug.  A bare command name stays a name, so a PATH lookup still works.
+if [[ $LCCC == */* && $LCCC != /* ]]; then
+    LCCC=$PWD/$LCCC
+fi
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
@@ -174,5 +185,35 @@ rm -f ./s1.d
 "$LCCC" -E -MD s1.S >/dev/null 2>&1
 step ".S -E -MD: derived s1.d"            'grep -q "^s1\.o: s1\.S" ./s1.d'
 
+# --- relative-CCC contract ----------------------------------------------------
+# Exercise the spelling the pipeline actually uses, from the directory it uses
+# it in.  This is the regression the replay of `Codegen and runtime contracts`
+# hit: with `CCC=target/fastbuild/lccc` the gate still passed on a developer box
+# only because nothing there exports CCC, and CI only passes because that one
+# step happens not to set it either -- the next person to add `env: CCC` to it
+# would have seen nine "codegen regressions" that were all one missing `$PWD`.
+if [[ -z ${DASH_OUTPUT_RELATIVE:-} && -z ${CCC:-} ]]; then
+    # Run from the repository root, which is how every workflow step and
+    # `scripts/ci_local.sh` invoke a gate; the relative spelling is then
+    # `./target/fastbuild/lccc`.
+    if [[ $ROOT == "$INVOKED_FROM" ]]; then
+        relative_ccc=./target/fastbuild/lccc
+    elif [[ $ROOT == "$INVOKED_FROM"/* ]]; then
+        relative_ccc=${ROOT#"$INVOKED_FROM"/}/target/fastbuild/lccc
+    else
+        relative_ccc=""
+    fi
+    # ...and from the directory the caller used, because that is what makes the
+    # spelling relative.
+    if [[ -n $relative_ccc ]] \
+            && ! ( cd "$INVOKED_FROM" && DASH_OUTPUT_RELATIVE=1 CCC=$relative_ccc \
+                   bash "$ROOT/tests/regression/check_dash_output.sh" ) >"$WORK/relative.log" 2>&1; then
+        printf 'FAIL self-test (a relative CCC breaks after cd): %s\n' \
+            "$(tail -3 "$WORK/relative.log" | tr '\n' ' ')"
+        fail=1
+    elif [[ -n $relative_ccc ]]; then
+        echo "PASS self-test (a relative CCC survives the workdir change)"
+    fi
+fi
 
 exit $fail

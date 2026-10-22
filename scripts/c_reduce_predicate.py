@@ -86,6 +86,26 @@ def reference_output(ref: str, src: Path, work: Path, timeout: float) -> bytes |
         return None  # nondeterministic: uninitialised read or similar
     return first.stdout
 
+# A reference oracle that cannot build the sanitized probe is a SETUP error,
+# not a verdict: without the runtimes every candidate fails the reference and
+# the predicate answers "not interesting" for all of them, so the reducer
+# silently minimises nothing (and a missing `--ccc` never gets diagnosed
+# either).  Probing once at startup turns that into exit 2, which the reducer
+# aborts on instead of reading as a verdict.
+PROBE_SOURCE = b"int main(void){int x=0;return x;}\n"
+
+
+def probe_reference(ref: str, timeout: float) -> str | None:
+    """None when `ref` builds and runs the sanitized probe, else the reason."""
+    with tempfile.TemporaryDirectory(prefix="c-reduce-ref-probe-") as tmp:
+        src = Path(tmp) / "probe.c"
+        src.write_bytes(PROBE_SOURCE)
+        out = reference_output(ref, src, Path(tmp), timeout)
+    if out is None:
+        return ("cannot build or run a program with -fsanitize=undefined,address "
+                "(sanitizer runtime missing or unused-result failure)")
+    return None
+
 
 def judge(args: argparse.Namespace, src: Path, work: Path) -> bool:
     ref_out = reference_output(args.ref, src, work, args.timeout)
@@ -126,6 +146,13 @@ def _main(argv: list[str] | None = None) -> int:
     ap.add_argument("--timeout", type=float, default=20.0)
     ap.add_argument("candidate", type=Path)
     args = ap.parse_args(argv)
+    reason = probe_reference(args.ref, args.timeout)
+    if reason is not None:
+        # Exit 2, never 0/1: the reducer must abort rather than read this as
+        # "the candidate is not interesting".
+        print(f"c_reduce_predicate: reference compiler {args.ref!r} {reason}",
+              file=sys.stderr)
+        return 2
     with tempfile.TemporaryDirectory(prefix="c-reduce-pred-") as tmp:
         return 0 if judge(args, args.candidate, Path(tmp)) else 1
 

@@ -158,6 +158,33 @@ pub(crate) fn debug_vec_avail() -> bool {
     *ENABLED
 }
 
+/// `LCCC_IFCONV_ARM_BUDGET=<n|off>` — A/B lever and kill switch for the
+/// loop-resident arm budget of `if_convert`, resolved once per process.
+///
+/// A positive integer replaces the in-loop budget (so `=8` reproduces the
+/// pre-loop-aware behaviour of every diamond, in or out of a loop, while
+/// `=1`/`=2` measure a stricter prior).  `off`/`full`/`0` disables the
+/// loop-aware restriction entirely.  An unparsable value is ignored rather
+/// than aborting a build, matching `LCCC_PEEPHOLE_PAIR_PARALLEL`.
+///
+/// It lives here, beside `debug_vec_avail`, because a pipeline-wide switch is
+/// resolved once at the pipeline boundary -- the same rule the env-read
+/// ratchet in `tests/regression/check_env_test_hygiene.sh` states: a new
+/// switch belongs to `run_passes`, not to the pass body that consumes it.
+pub(crate) fn ifconv_arm_budget_override() -> Option<usize> {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let raw = std::env::var("LCCC_IFCONV_ARM_BUDGET").ok()?;
+        let raw = raw.trim();
+        if raw == "0" || raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("full") {
+            return Some(usize::MAX);
+        }
+        // A budget of 0 would mean "never if-convert", which is spelled `off`;
+        // treat it as the default rather than silently disabling the pass.
+        raw.parse::<usize>().ok().filter(|&n| n > 0)
+    })
+}
+
 pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
     let strict = !tag.starts_with("backend:eliminate_phis")
         && !tag.starts_with("backend:post-phi")

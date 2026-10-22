@@ -791,6 +791,107 @@ _ACTIVE_IF = {"always()", "${{ always() }}", "success()", "${{ success() }}"}
 # too, which is a contract change, not a spelling change.
 _PR_PATH_EVENTS = frozenset({"push", "pull_request"})
 
+# A reusable workflow is a lane TEMPLATE: the same `run:` bodies execute with
+# different inputs, and whether a step runs may depend on one (`if:
+# inputs.gate_steps`).  Refusing callers that pass `with:` -- the old policy --
+# would have made every sharded lane unverifiable, and "unverifiable" in a
+# coverage checker turns into "assumed covered", which is the false-green
+# direction.  So inputs are RESOLVED per caller instead: the caller's value
+# (or the declared default) is substituted into step conditions and run bodies
+# before they are classified.  A condition that still cannot be resolved to a
+# boolean is treated as inactive, exactly like any other expression gate.
+_INPUT_EXPR = re.compile(r"\$\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*\}\}")
+
+
+def _input_value(spec: dict | None, supplied: dict) -> object:
+    """The value a `workflow_call` input takes for one caller."""
+    if spec is None:
+        return None
+    if "default" in spec:
+        return spec["default"]
+    if spec.get("required"):
+        raise _WorkflowError("required input has no value")
+    return None
+
+
+def _resolve_inputs(document: dict, supplied: dict) -> dict:
+    """Resolve `on.workflow_call.inputs` against what the caller passed.
+
+    A `with:` edge onto a workflow that declares NO inputs is refused rather
+    than silently ignored: GitHub rejects it ("Invalid input ... is not
+    defined in the referenced workflow"), so accepting it here would let the
+    walker believe a caller configured a callee when the run would not even
+    start. The empty-spec case is the one the recursion tests pin.
+    """
+    events = document.get("on", document.get(True))
+    spec = events.get("workflow_call") if isinstance(events, dict) else None
+    if spec is None:
+        if supplied:
+            raise _WorkflowError(
+                "with: supplied to a workflow that declares no workflow_call "
+                f"inputs: {sorted(supplied)}")
+        return {}
+    if not isinstance(spec, dict):
+        raise _WorkflowError("malformed workflow_call")
+    declared = spec.get("inputs") or {}
+    if not isinstance(declared, dict):
+        raise _WorkflowError("malformed workflow_call inputs")
+    unknown = set(supplied) - set(declared)
+    if unknown:
+        raise _WorkflowError(f"workflow_call got undeclared inputs: {sorted(unknown)}")
+    resolved = {}
+    for name, input_spec in declared.items():
+        if not isinstance(input_spec, dict):
+            raise _WorkflowError(f"malformed workflow_call input: {name}")
+        if name in supplied:
+            resolved[name] = supplied[name]
+        elif "default" in input_spec:
+            resolved[name] = input_spec["default"]
+        elif input_spec.get("required"):
+            raise _WorkflowError(f"required workflow_call input not supplied: {name}")
+        else:
+            resolved[name] = None
+    return resolved
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"true", "1", "yes"}
+
+
+def _resolve_condition(cond: object, inputs: dict) -> tuple[bool, str]:
+    """(runs on the green path, why not) for a step or job `if:`.
+
+    Resolution, in order: absent/`True` -> runs; a literal from _ACTIVE_IF ->
+    runs; `inputs.NAME` (optionally negated, optionally with `${{ }}`) ->
+    the input's truthiness.  Anything else keeps the old conservative verdict:
+    an expression gate is not green-path coverage.
+    """
+    if cond is None or cond is True:
+        return True, ""
+    text = str(cond).strip()
+    if text in _ACTIVE_IF:
+        return True, ""
+    match = _INPUT_REF_FULL.match(text)
+    if match:
+        negated, name = match.group(1), match.group(2)
+        if name not in inputs:
+            raise _WorkflowError(f"condition references unknown input: {name}")
+        value = _truthy(inputs[name])
+        if negated:
+            value = not value
+        if value:
+            return True, ""
+        return False, f"step `if: {cond}` is false for this caller"
+    return False, f"step `if: {cond}` keeps it off the green-path run"
+
+
+_INPUT_REF_FULL = re.compile(
+    r"^\$?\{?\{?\s*(!?)\s*inputs\.([A-Za-z0-9_-]+)\s*\}?\}?$")
+
 
 def _workflow_triggers(doc: dict) -> set[str]:
     """Event names a workflow's `on:` declares, all spellings.
@@ -1032,10 +1133,11 @@ def _job_reachability(jobs: dict) -> dict:
 
 def workflow_run_steps(path: Path):
     """Public walker; recursion state is private, never caller-provided."""
-    yield from _workflow_run_steps(path, called=None, inherited_soft=False, stack=())
+    yield from _workflow_run_steps(path, called=None, inherited_soft=False, stack=(),
+                                   inputs={}, caller="")
 
 
-def _workflow_run_steps(path: Path, *, called, inherited_soft, stack):
+def _workflow_run_steps(path: Path, *, called, inherited_soft, stack, inputs, caller):
     """Yield one _RunStep record for every `run:` step.
 
     `active` is False when the WORKFLOW's `on:` triggers never run it on
@@ -1057,9 +1159,16 @@ def _workflow_run_steps(path: Path, *, called, inherited_soft, stack):
     if called is not None:
         events = doc.get('on', doc.get(True))
         spec = events.get('workflow_call') if isinstance(events, dict) else None
-        if spec is not None:
-            if not isinstance(spec, dict) or spec.get('inputs') or spec.get('secrets'):
-                raise _WorkflowError(f"unsupported reusable inputs/secrets: {path.name}")
+        if spec is not None and isinstance(spec, dict) and spec.get("secrets"):
+            # Secrets are not inputs: a gate whose activation depends on a
+            # secret's presence is not coverage on a fork PR, where secrets are
+            # absent, so refusing is still the honest verdict here.
+            raise _WorkflowError(f"unsupported reusable secrets: {path.name}")
+    # Resolve ALWAYS, not only when called: a workflow that declares
+    # `workflow_call` inputs also runs on its own triggers, and its steps
+    # reference those inputs. With no caller, the declared defaults are the
+    # values -- which is exactly what a standalone `push` run would see.
+    inputs = _resolve_inputs(doc, inputs)
     jobs = doc.get("jobs") or {}
     if not isinstance(jobs, dict):
         raise _WorkflowError(f"malformed jobs mapping: {path.name}")
@@ -1086,8 +1195,13 @@ def _workflow_run_steps(path: Path, *, called, inherited_soft, stack):
         if uses:
             if not isinstance(uses, str) or not uses.startswith("./"):
                 raise _WorkflowError(f"unsupported external reusable workflow: {uses}")
-            if job.get('with') or job.get('secrets'):
-                raise _WorkflowError(f"unsupported reusable arguments/secrets: {uses}")
+            if job.get('secrets'):
+                raise _WorkflowError(f"unsupported reusable secrets: {uses}")
+            supplied = job.get('with') or {}
+            if not isinstance(supplied, dict):
+                raise _WorkflowError(f"malformed reusable arguments: {uses}")
+            if any(isinstance(value, (dict, list)) for value in supplied.values()):
+                raise _WorkflowError(f"structured reusable arguments: {uses}")
             if containers:
                 raise _WorkflowError(f"reusable job cannot also contain steps: {job_id}")
             if not re.fullmatch(r"\./\.github/workflows/[^/]+\.ya?ml", uses):
@@ -1096,12 +1210,13 @@ def _workflow_run_steps(path: Path, *, called, inherited_soft, stack):
             if not child.is_file() or child.resolve().parent != path.resolve().parent:
                 raise _WorkflowError(f"missing/escaping reusable workflow: {uses}")
             yield from _workflow_run_steps(child, called=on_pr_path and job_active,
-                                           inherited_soft=job_soft, stack=(*stack, resolved))
+                                           inherited_soft=job_soft, stack=(*stack, resolved),
+                                           inputs=supplied, caller=str(job_id))
         for steps in containers:
             for index, step in enumerate(steps):
                 if isinstance(step, dict) and isinstance(step.get("run"), str):
                     cond = step.get("if")
-                    active = cond is None or cond is True or str(cond).strip() in _ACTIVE_IF
+                    active, step_why = _resolve_condition(cond, inputs)
                     soft = _continue_on_error(step.get("continue-on-error"))
                     env = job_env | _env_names(step.get("env"))
                     why = ""
@@ -1112,7 +1227,7 @@ def _workflow_run_steps(path: Path, *, called, inherited_soft, stack):
                     elif not job_active:
                         why = job_why
                     elif not active:
-                        why = f"step `if: {cond}` keeps it off the green-path run"
+                        why = (f"{step_why} (caller {caller})" if caller else step_why)
                     elif job_soft:
                         why = "job-level continue-on-error swallows its red"
                     elif soft:
@@ -1126,9 +1241,30 @@ def _workflow_run_steps(path: Path, *, called, inherited_soft, stack):
                         active=active and job_active and on_pr_path,
                         soft=soft or job_soft,
                         env_names=frozenset(env),
-                        body=_strip_run_comments(step["run"]),
+                        body=_strip_run_comments(_substitute_inputs(step["run"], inputs)),
                         why=why,
                     )
+
+
+def _substitute_inputs(body: str, inputs: dict) -> str:
+    """Replace `${{ inputs.NAME }}` with the caller's value.
+
+    The bodies are what actually executes, and the invocation grammar matches
+    tokens: a body left as `--only "${{ inputs.only }}"` would hide the real
+    arguments from every contract. Substitution is textual and total for
+    declared inputs; an UNDECLARED reference stays literal, so it fails the
+    invocation grammar loudly instead of silently matching nothing.
+    """
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in inputs:
+            return match.group(0)
+        value = inputs[name]
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return "" if value is None else str(value)
+
+    return _INPUT_EXPR.sub(replace, body)
 
 
 def run_script_bodies(path: Path) -> str:

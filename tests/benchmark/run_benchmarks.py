@@ -1103,6 +1103,74 @@ def render_markdown(report: dict[str, Any]) -> str:
     ])
     return "\n".join(lines) + "\n"
 
+SCHEMA = "lccc-bench-v2"
+
+
+def merge_reports(paths: list[Path]) -> dict[str, Any]:
+    """Combine the shard reports of one run into the single canonical report.
+
+    The corpus is split across runners so its wall clock is not the sum of
+    every kernel, and the split must not change what the evidence IS: the
+    published report is still one `lccc-bench-v2` document with one row per
+    benchmark, the same aggregates, and the same rendering.  This function is
+    the single owner of that combination, so a shard cannot publish a partial
+    aggregate and a consumer cannot see a half corpus.
+
+    Refusals are deliberate: a shard that did not finish (`complete` false), a
+    duplicated benchmark, a schema from another version, or shards measured
+    with different settings are all errors.  Merging them would produce a
+    document that looks complete and is not.
+    """
+    reports = []
+    for path in paths:
+        report = json.loads(path.read_text())
+        if not isinstance(report, dict) or "benchmarks" not in report:
+            raise SystemExit(f"{path}: not a benchmark report")
+        if report.get("schema") != SCHEMA:
+            raise SystemExit(f"{path}: schema {report.get('schema')!r}, expected {SCHEMA!r}")
+        if not report.get("complete"):
+            raise SystemExit(f"{path}: shard did not complete; refusing to publish a "
+                             "partial corpus as complete")
+        reports.append((path, report))
+    if not reports:
+        raise SystemExit("no shard reports to merge")
+
+    base_path, base = reports[0]
+    settings = base.get("settings")
+    for path, report in reports[1:]:
+        if report.get("settings") != settings:
+            raise SystemExit(f"{path}: settings differ from {base_path}; shards must "
+                             "measure the same protocol")
+    compilers = base.get("compilers")
+    for path, report in reports[1:]:
+        if report.get("compilers") != compilers:
+            raise SystemExit(f"{path}: compiler identities differ from {base_path}")
+
+    entries: list[dict[str, Any]] = []
+    seen: dict[str, str] = {}
+    shards: list[dict[str, Any]] = []
+    for path, report in reports:
+        names: list[str] = []
+        for entry in report["benchmarks"]:
+            name = entry.get("name")
+            if name in seen:
+                raise SystemExit(f"{path}: benchmark {name!r} also appears in {seen[name]}")
+            seen[name] = path.name
+            names.append(name)
+            entries.append(entry)
+        shards.append({"report": path.name, "benchmarks": names,
+                       "settings": report["settings"]})
+
+    merged = json.loads(json.dumps(base))
+    merged["benchmarks"] = entries
+    merged["complete"] = True
+    merged["shards"] = shards
+    merged["metadata"] = dict(base["metadata"], merged_from=[p.name for p in paths])
+    merged["aggregate_lccc_vs_gcc"] = aggregate_lccc_vs_gcc(entries)
+    merged["aggregate_lccc_vs_best_reference"] = aggregate_lccc_vs_best_reference(entries)
+    return merged
+
+
 def list_benchmarks() -> None:
     print("Available benchmarks:")
     for benchmark in BENCHMARKS:
@@ -1178,6 +1246,9 @@ def build_arg_parser():
     parser.add_argument("--no-pmu-probe", action="store_true", help="do not make the one perf availability probe")
     parser.add_argument("--strict", action="store_true",
                         help="non-zero exit on a compile/runtime failure, missing requested compiler, or non-match")
+    parser.add_argument("--merge", type=Path, nargs="+", metavar="REPORT",
+                        help="combine the shard reports of one run into the canonical "
+                             "report and exit (used by the sharded benchmark lane)")
     return parser
 
 
@@ -1188,6 +1259,29 @@ def main(argv=None) -> int:
 
     if args.list:
         list_benchmarks()
+        return 0
+    if args.merge:
+        merged = merge_reports(args.merge)
+        terminal = render_terminal(merged)
+        print(terminal)
+        if args.markdown:
+            args.markdown.parent.mkdir(parents=True, exist_ok=True)
+            args.markdown.write_text(render_markdown(merged), encoding="utf-8")
+        if args.json:
+            args.json.parent.mkdir(parents=True, exist_ok=True)
+            args.json.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n")
+        # A shard that failed is refused by merge_reports, so a merged report
+        # is complete by construction; the exit status still reflects the
+        # per-entry failures the shards recorded.
+        failures = [(entry["name"], key)
+                    for entry in merged["benchmarks"]
+                    for key, result in entry.get("compile", {}).items()
+                    if not result.get("ok")]
+        if failures:
+            print("\nBenchmark failures:", file=sys.stderr)
+            for name, key in sorted(failures):
+                print(f"  - {name}: {key} compile failure", file=sys.stderr)
+            return 1
         return 0
     if args.reps < 1 or args.warmup < 0:
         parser.error("--reps must be >= 1 and --warmup must be >= 0")
@@ -1222,7 +1316,7 @@ def main(argv=None) -> int:
 
     report: dict[str, Any] = {
         "complete": False,
-        "schema": "lccc-bench-v2",
+        "schema": SCHEMA,
         "metadata": metadata,
         "settings": {
             "opt": args.opt,

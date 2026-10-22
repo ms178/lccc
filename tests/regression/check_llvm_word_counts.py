@@ -19,8 +19,13 @@ def main():
     ap.add_argument("--clang")
     ap.add_argument("--baseline")
     args = ap.parse_args()
-    if not re.search(r"\b16\.2(?:\.0)?\b", run([args.gcc, "--version"]).decode()):
-        raise ValueError("GCC 16.2 required")
+    banner = run([args.gcc, "--version"]).decode().splitlines()
+    banner = banner[0] if banner else "<no output>"
+    if not re.search(r"\b16\.2(?:\.0)?\b", banner):
+        # Name the version that IS installed: "GCC 16.2 required" alone cannot
+        # distinguish a lane provisioned with 16.3 from one whose `gcc-16` is
+        # not on PATH at all, and the two have different fixes.
+        raise ValueError(f"GCC 16.2 required, found: {banner!r} ({args.gcc})")
     if args.clang and not re.search(r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()):
         raise ValueError("Clang 23.1.3 required")
     env = os.environ | {"CCC_VERIFY_IR": "abort", "CCC_VERIFY_REGALLOC": "1", "CCC_VALIDATE_SSA": "1"}
