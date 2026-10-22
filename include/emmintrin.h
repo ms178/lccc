@@ -1308,19 +1308,22 @@ _mm_cvtsd_f64(__m128d __a)
  * fraction entirely for |d| >= 2^52 (the 0.5 is absorbed), and costs four
  * instructions where the hardware form costs one.  `cvtsd2si` with a 64-bit
  * destination is the instruction the intrinsic names. */
+#if defined(__x86_64__)
 static __inline__ long long __attribute__((__always_inline__))
 _mm_cvtsd_si64(__m128d __a)
 {
-#if defined(__x86_64__)
     return __builtin_ia32_cvtsd2si64(__a);
-#else
-    /* 32-bit x86 has no 64-bit `cvtsd2si`; keep a portable truncating
-       definition rather than silently rounding the wrong way. */
-    return (long long)__a.__val[0];
-#endif
 }
 
 #define _mm_cvtsd_si64x(a) _mm_cvtsd_si64(a)
+#endif
+/* Deliberately no non-x86-64 definition: GCC declares this intrinsic only
+ * under __x86_64__ (there is no 64-bit cvtsd2si on 32-bit x86), and a
+ * portable fallback cannot express MXCSR rounding plus the
+ * indefinite-on-overflow result -- a truncating cast would return the
+ * wrong answer for ordinary inputs (2.7 -> 2 in the default mode).
+ * Absent like GCC, not present and wrong. */
+
 
 /* _mm_cvttsd_si64: convert low double to long long (truncate) */
 static __inline__ long long __attribute__((__always_inline__))

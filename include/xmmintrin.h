@@ -717,17 +717,19 @@ _mm_ucomineq_ss(__m128 __a, __m128 __b)
 /* _mm_cvtss_si64: convert low float to long long, rounding per MXCSR.RC.
  * The plain cast truncated, which is `_mm_cvttss_si64`'s contract, not this
  * one's. */
+#if defined(__x86_64__)
 static __inline__ long long __attribute__((__always_inline__))
 _mm_cvtss_si64(__m128 __a)
 {
-#if defined(__x86_64__)
     return __builtin_ia32_cvtss2si64(__a);
-#else
-    return (long long)__a.__val[0];
-#endif
 }
 
 #define _mm_cvtss_si64x(a) _mm_cvtss_si64(a)
+#endif
+/* No non-x86-64 definition, exactly as in GCC's xmmintrin.h: see
+ * _mm_cvtsd_si64 in emmintrin.h for why a truncating fallback is a wrong
+ * answer rather than a portable one. */
+
 
 static __inline__ long long __attribute__((__always_inline__))
 _mm_cvttss_si64(__m128 __a)

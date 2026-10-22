@@ -51,10 +51,11 @@ BIN512 = [
     ("max_epu32", "vpmaxud512"), ("min_epu32", "vpminud512"),
     ("max_epi64", "vpmaxsq512"), ("min_epi64", "vpminsq512"),
     ("max_epu64", "vpmaxuq512"), ("min_epu64", "vpminuq512"),
-    ("cmpeq_epi8", "vpcmpeqb512"), ("cmpeq_epi16", "vpcmpeqw512"),
-    ("cmpeq_epi32", "vpcmpeqd512"), ("cmpeq_epi64", "vpcmpeqq512"),
-    ("cmpgt_epi8", "vpcmpgtb512"), ("cmpgt_epi16", "vpcmpgtw512"),
-    ("cmpgt_epi32", "vpcmpgtd512"), ("cmpgt_epi64", "vpcmpgtq512"),
+    # No cmpeq/cmpgt_epi* vector forms at 512 bits: EVEX integer compares
+    # write mask registers, and Intel's API exposes only the `_mask`
+    # spellings (generated from the MASK table below). Vector-returning
+    # wrappers for these names lowered to an encoding the assembler
+    # rejects (or to no lowering at all); they were removed, not kept.
     ("xor_si512", "vpxorq512"), ("or_si512", "vporq512"),
     ("and_si512", "vpandq512"), ("andnot_si512", "vpandnq512"),
     ("shuffle_epi8", "vpshufb512"),

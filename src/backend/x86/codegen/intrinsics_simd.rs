@@ -468,30 +468,6 @@ impl X86Codegen {
                 self.emit_evex_binary_512(dptr, args, "vpminuq", true);
                 true
             }
-            Pcmpeqd512 => {
-                self.emit_evex_binary_512(dptr, args, "vpcmpeqd", true);
-                true
-            }
-            Pcmpeqq512 => {
-                self.emit_evex_binary_512(dptr, args, "vpcmpeqq", true);
-                true
-            }
-            Pcmpgtb512 => {
-                self.emit_evex_binary_512(dptr, args, "vpcmpgtb", false);
-                true
-            }
-            Pcmpgtw512 => {
-                self.emit_evex_binary_512(dptr, args, "vpcmpgtw", false);
-                true
-            }
-            Pcmpgtd512 => {
-                self.emit_evex_binary_512(dptr, args, "vpcmpgtd", false);
-                true
-            }
-            Pcmpgtq512 => {
-                self.emit_evex_binary_512(dptr, args, "vpcmpgtq", false);
-                true
-            }
             Psadbw512 => {
                 self.emit_evex_binary_512(dptr, args, "vpsadbw", true);
                 true
@@ -1493,6 +1469,7 @@ impl X86Codegen {
             CvttSs2Si128 => ("cvttss2si", 0, true),
             CvttSd2Si128 => ("cvttsd2si", 0, true),
             CvtSs2Si128 => ("cvtss2si", 0, true),
+            CvtSd2Si128 => ("cvtsd2si", 0, true),
             TestzPs128 => ("vtestps", 0, true),
             TestzPs256 => ("vtestps", 0, true),
             ReduceAddEpu32_512 => ("__reduce_add_epu32", 0, false),

@@ -87,12 +87,14 @@ pub(super) fn lccc_simd_lookup(
         "vpminsq512" => b(Vec512, Pminsq512),
         "vpmaxuq512" => b(Vec512, Pmaxuq512),
         "vpminuq512" => b(Vec512, Pminuq512),
-        "vpcmpeqd512" => b(Vec512, Pcmpeqd512),
-        "vpcmpeqq512" => b(Vec512, Pcmpeqq512),
-        "vpcmpgtb512" => b(Vec512, Pcmpgtb512),
-        "vpcmpgtw512" => b(Vec512, Pcmpgtw512),
-        "vpcmpgtd512" => b(Vec512, Pcmpgtd512),
-        "vpcmpgtq512" => b(Vec512, Pcmpgtq512),
+        // No vector-destination `vpcmpeq*512`/`vpcmpgt*512` entries: in
+        // EVEX, 512-bit integer compares write mask registers, and Intel's
+        // API has only the `_mask` forms (`_mm512_cmpeq_epi32_mask`, routed
+        // via the `vpcmp*512` scalar ops below). Vector-returning wrappers
+        // were once generated for these names; the byte/word forms had no
+        // lowering at all and the dword/qword forms emitted a compare the
+        // assembler itself rejects ("512-bit compares require a mask
+        // destination"). The surface was removed rather than kept broken.
         "vpsadbw512" => b(Vec512, Psadbw512),
         "vpmaddubsw512" => b(Vec512, Pmaddubsw512),
         "vpmaddwd512" => b(Vec512, Pmaddwd512),
@@ -305,6 +307,7 @@ pub(super) fn lccc_simd_lookup(
         "cvttss2si128" => s1(Scalar, CvttSs2Si128),
         "cvttsd2si128" => s1(Scalar, CvttSd2Si128),
         "cvtss2si128" => s1(Scalar, CvtSs2Si128),
+        "cvtsd2si128" => s1(Scalar, CvtSd2Si128),
         "cvtss2sd128" => b(Vec128, CvtSs2Sd128),
         "cvtsd2ss128" => b(Vec128, CvtSd2Ss128),
         "haddps128" => b(Vec128, HaddPs128),
@@ -389,17 +392,26 @@ pub(super) fn lccc_simd_lookup(
     }
 }
 
+/// Resolve a full `__lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}` name to
+/// its lowering, exactly as [`Lowerer::lower_lccc_simd`] does at a call
+/// site. Factored out so the header↔table completeness test below resolves
+/// names through the *same* code the compiler runs — a test that re-implements
+/// the parse can drift into proving a different (passing) statement.
+fn resolve_lccc_simd(name: &str) -> Option<(LcccSimdClass, IntrinsicOp, bool, usize)> {
+    let rest = name.strip_prefix("__lccc_simd")?;
+    let (width_s, rest) = rest.split_once('_')?;
+    let (_class_s, mnemonic) = rest.split_once('_')?;
+    // Table keys are "<insn><width>" (e.g. vpaddd512); some special forms
+    // carry their own suffix (e.g. vinserti32x4_512). Try both.
+    lccc_simd_lookup(mnemonic)
+        .or_else(|| lccc_simd_lookup(&format!("{}{}", mnemonic, width_s)))
+}
+
 impl Lowerer {
     /// Lower a call to the generic SIMD family.
     /// Name format: `__lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}`.
     pub(super) fn lower_lccc_simd(&mut self, name: &str, args: &[Expr]) -> Option<Operand> {
-        let rest = name.strip_prefix("__lccc_simd")?;
-        let (width_s, rest) = rest.split_once('_')?;
-        let (_class_s, mnemonic) = rest.split_once('_')?;
-        // Table keys are "<insn><width>" (e.g. vpaddd512); some special forms
-        // carry their own suffix (e.g. vinserti32x4_512). Try both.
-        let (class, op, has_imm, nargs) = lccc_simd_lookup(mnemonic)
-            .or_else(|| lccc_simd_lookup(&format!("{}{}", mnemonic, width_s)))?;
+        let (class, op, has_imm, nargs) = resolve_lccc_simd(name)?;
         let width = match class {
             LcccSimdClass::Vec128 => 16usize,
             LcccSimdClass::Vec256 => 32,
@@ -485,5 +497,68 @@ fn _class_doc(c: LcccSimdClass) -> &'static str {
         LcccSimdClass::Vec512 => "64-byte vector result",
         LcccSimdClass::Scalar => "scalar GPR result",
         LcccSimdClass::PtrStore => "store through dest pointer",
+    }
+}
+
+#[cfg(test)]
+mod header_table_completeness_tests {
+    use super::resolve_lccc_simd;
+    use std::collections::BTreeSet;
+
+    /// Every `__lccc_simd*` symbol the generated header declares must
+    /// resolve through the lowering table.
+    ///
+    /// The defect this kills is silent by construction: a missing table
+    /// entry makes `lower_lccc_simd` return `None`, the call falls through
+    /// to the ordinary call path, and the failure surfaces — if at all —
+    /// as an undefined symbol at *link* time in user code (`_mm_cvtsd_si32`
+    /// shipped exactly that way when its entry was lost next to a new
+    /// 64-bit conversion). Table and header are two hand-maintained views
+    /// of one surface (the header is generated, the table is not), so the
+    /// equivalence is asserted, not assumed. Resolution goes through
+    /// `resolve_lccc_simd`, the compiler's own code path.
+    #[test]
+    fn every_declared_generic_simd_symbol_resolves() {
+        let header = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/include/lcccsimd.h"
+        ))
+        .expect("include/lcccsimd.h must be readable from the crate root");
+
+        // Declared/callable generic-SIMD symbols: `__lccc_simd<ident>(`.
+        let mut declared: BTreeSet<&str> = BTreeSet::new();
+        for (idx, _) in header.match_indices("__lccc_simd") {
+            let tail = &header[idx..];
+            let ident_len = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(tail.len());
+            if tail[ident_len..].starts_with('(') {
+                declared.insert(&tail[..ident_len]);
+            }
+        }
+
+        // Anti-vacuity: the scan must actually see the surface it claims to
+        // cover, including the conversion whose loss motivated this test.
+        assert!(
+            declared.len() >= 200,
+            "header scan found only {} generic-SIMD symbols; the scan is broken",
+            declared.len()
+        );
+        assert!(
+            declared.contains("__lccc_simd128_ps_cvtsd2si128"),
+            "scan must see __lccc_simd128_ps_cvtsd2si128 (_mm_cvtsd_si32)"
+        );
+
+        let unresolved: Vec<&str> = declared
+            .iter()
+            .copied()
+            .filter(|name| resolve_lccc_simd(name).is_none())
+            .collect();
+        assert!(
+            unresolved.is_empty(),
+            "{} declared generic-SIMD symbol(s) have no lowering (each is an \
+             undefined symbol at link time in user code): {unresolved:?}",
+            unresolved.len()
+        );
     }
 }
