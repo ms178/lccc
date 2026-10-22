@@ -191,7 +191,7 @@ fn classify(
         s_uses: Vec::new(),
         byval: Vec::new(),
     };
-    let dbg = std::env::var_os("CCC_AGG_BYVAL_DEBUG").is_some();
+    let dbg = crate::passes::debug_agg_byval();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             // A variable-offset derivation of `D` has no fixed root, so a use
@@ -489,7 +489,7 @@ pub(super) fn run_function(
     if func.blocks.is_empty() || scan.memcpy.is_empty() {
         return 0;
     }
-    let dbg = std::env::var_os("CCC_AGG_BYVAL_DEBUG").is_some();
+    let dbg = crate::passes::debug_agg_byval();
     let n = func.blocks.len();
     let label_map = crate::ir::analysis::build_label_map(func);
     let (preds, succs) = crate::ir::analysis::build_cfg(func, &label_map);

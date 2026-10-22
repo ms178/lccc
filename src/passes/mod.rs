@@ -185,6 +185,33 @@ pub(crate) fn ifconv_arm_budget_override() -> Option<usize> {
     })
 }
 
+/// `CCC_NO_PHI_COALESCE` — kill switch for the post-phi copy fold.
+///
+/// The switch is a *pipeline* knob (it also reaches `regalloc`'s own
+/// coalescing), so it is resolved here rather than inside `copy_prop`: an
+/// environment read in a pass body runs on every function, and the env-read
+/// ratchet in `tests/regression/check_env_test_hygiene.sh` counts exactly
+/// those reads.  The fold's diagnostics use the same two levers.
+pub(crate) fn phi_coalesce_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_NO_PHI_COALESCE").is_none());
+    *ENABLED
+}
+
+/// `CCC_DEBUG_EDGEFOLD` — per-candidate trace of the forwarding-phi fold.
+pub(crate) fn debug_edgefold() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_DEBUG_EDGEFOLD").is_some());
+    *ENABLED
+}
+
+/// `CCC_AGG_BYVAL_DEBUG` — trace of `aggregate_sroa`'s by-value copy form.
+pub(crate) fn debug_agg_byval() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_AGG_BYVAL_DEBUG").is_some());
+    *ENABLED
+}
+
 pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
     let strict = !tag.starts_with("backend:eliminate_phis")
         && !tag.starts_with("backend:post-phi")

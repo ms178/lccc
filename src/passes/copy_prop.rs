@@ -882,7 +882,7 @@ pub fn propagate_copies_post_phi(func: &mut IrFunction) -> usize {
         // Each folded hop can expose another one (three nested phis over the
         // same variable) and always leaves dead copies behind, so the fold is
         // part of the same fixpoint rather than a separate sweep.
-        if std::env::var_os("CCC_NO_PHI_COALESCE").is_none() {
+        if crate::passes::phi_coalesce_enabled() {
             removed += coalesce_forwarding_phi_copies(func);
         }
         total += removed;
