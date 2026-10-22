@@ -232,27 +232,80 @@ struct Candidate {
     insert_at: usize,
     dest_ptr: Value,
     src_ptr: Value,
+    /// (first, last) instruction indexes the clobber proof covers.
+    span: (usize, usize),
 }
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
+    // Cheap prescan: without a single `or` at I128 there is no packed pair to
+    // find, and most functions have none. Skip the facts build entirely.
+    let any_packed_or = func.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
+        matches!(
+            i,
+            Instruction::BinOp {
+                op: IrBinOp::Or,
+                ty: IrType::I128,
+                ..
+            }
+        )
+    });
+    if !any_packed_or {
+        return 0;
+    }
     let mut total = 0;
     // Each successful rewrite removes at least five instructions, so the loop
     // terminates; the bound is a belt-and-braces guard for a malformed IR.
+    // One sweep collects every non-overlapping candidate under a single
+    // `Facts` build and applies them per block, latest first, so earlier
+    // indexes stay valid. A TU dense in intrinsic wrappers otherwise pays a
+    // full-function facts rebuild plus full block rescans per rewrite --
+    // O(rewrites x function size) for what is one linear analysis.
     for _ in 0..4096 {
-        let Some(c) = find_one(func) else {
+        let candidates = find_all(func);
+        if candidates.is_empty() {
             break;
-        };
-        apply(func, &c);
-        total += 1;
+        }
+        total += candidates.len();
+        for c in &candidates {
+            apply(func, c);
+        }
+        if total >= 4096 {
+            break;
+        }
     }
     total
 }
 
-fn find_one(func: &IrFunction) -> Option<Candidate> {
+fn find_all(func: &IrFunction) -> Vec<Candidate> {
     let facts = Facts::new(func);
     let single_use = |v: u32| facts.uses.get(&v).copied().unwrap_or(0) == 1;
+    let mut found: Vec<Candidate> = Vec::new();
 
     for (bi, block) in func.blocks.iter().enumerate() {
+        // Same prescan per block: the def index below is only worth building
+        // for a block that can hold a candidate at all.
+        if !block.instructions.iter().any(|i| {
+            matches!(
+                i,
+                Instruction::BinOp {
+                    op: IrBinOp::Or,
+                    ty: IrType::I128,
+                    ..
+                }
+            )
+        }) {
+            continue;
+        }
+        // Dest -> instruction index within this block, built once. The half
+        // matchers resolve their chains through it instead of rescanning the
+        // block per candidate (which made `cast_of_load` quadratic in block
+        // size on intrinsic-dense code).
+        let mut def_at: FxHashMap<u32, usize> = FxHashMap::default();
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(dest) = inst.dest() {
+                def_at.insert(dest.0, ii);
+            }
+        }
         for (oi, inst) in block.instructions.iter().enumerate() {
             let Instruction::BinOp {
                 dest: agg,
@@ -268,7 +321,8 @@ fn find_one(func: &IrFunction) -> Option<Candidate> {
             let mut sides = [(lhs, rhs), (rhs, lhs)];
             let mut matched = None;
             for (a, b) in sides.iter_mut() {
-                let (Some(hi_src), Some(lo_src)) = (shl_source(block, a), lo_source(block, b))
+                let (Some(hi_src), Some(lo_src)) =
+                    (shl_source(block, &def_at, a), lo_source(block, &def_at, b))
                 else {
                     continue;
                 };
@@ -463,20 +517,34 @@ fn find_one(func: &IrFunction) -> Option<Candidate> {
                 store_lo_i,
                 store_hi_i,
             ];
-            drop.extend(lo_src.extra);
-            drop.extend(hi_src.extra);
             drop.sort_unstable();
             drop.dedup();
-            return Some(Candidate {
-                block: bi,
-                drop,
-                insert_at: last,
-                dest_ptr: q_lo,
-                src_ptr: lo_src.ptr,
-            });
+            // Two candidates in one block may only be batched when their
+            // pattern spans are disjoint: each was validated against an IR
+            // that still contains the other, so an overlap would invalidate
+            // the clobber-window proof. Overlapping candidates are left for
+            // the next sweep, which revalidates them from scratch.
+            let span = (first, last);
+            let overlaps = found
+                .iter()
+                .filter(|c| c.block == bi)
+                .any(|c| c.span.0 <= span.1 && span.0 <= c.span.1);
+            if !overlaps {
+                found.push(Candidate {
+                    block: bi,
+                    drop,
+                    insert_at: last,
+                    dest_ptr: q_lo,
+                    src_ptr: lo_src.ptr,
+                    span,
+                });
+            }
         }
     }
-    None
+    // Latest insertion first within each block, so applying one candidate
+    // never shifts the indexes of an earlier one in the same block.
+    found.sort_by(|a, b| a.block.cmp(&b.block).then(b.insert_at.cmp(&a.insert_at)));
+    found
 }
 
 /// The load side of one half: the `cast` of a load into `I128`.
@@ -489,44 +557,50 @@ struct HalfLoad {
     cast_dest: u32,
     shift_index: usize,
     shift_dest: u32,
-    extra: Vec<usize>,
 }
 
-/// `shl (cast %hi -> i128), 64`
-fn shl_source(block: &crate::ir::reexports::BasicBlock, op: &Operand) -> Option<HalfLoad> {
+/// `shl (cast %hi -> i128), 64`. The high half accepts a signed widening:
+/// every sign-extension bit is shifted out by the `<< 64`.
+fn shl_source(
+    block: &crate::ir::reexports::BasicBlock,
+    def_at: &FxHashMap<u32, usize>,
+    op: &Operand,
+) -> Option<HalfLoad> {
     let Operand::Value(sh) = op else { return None };
-    for (si, inst) in block.instructions.iter().enumerate() {
-        let Instruction::BinOp {
-            dest,
-            op: IrBinOp::Shl,
-            lhs,
-            rhs,
-            ty: IrType::I128,
-        } = inst
-        else {
-            continue;
-        };
-        if dest.0 != sh.0 || !is_cst(rhs, 64) {
-            continue;
-        }
-        let (ci, cd, ptr, ld, li) = cast_of_load(block, lhs)?;
-        return Some(HalfLoad {
-            ptr,
-            load_dest: ld,
-            load_index: li,
-            cast_index: ci,
-            cast_dest: cd,
-            shift_index: si,
-            shift_dest: dest.0,
-            extra: Vec::new(),
-        });
+    let si = *def_at.get(&sh.0)?;
+    let Instruction::BinOp {
+        dest,
+        op: IrBinOp::Shl,
+        lhs,
+        rhs,
+        ty: IrType::I128,
+    } = &block.instructions[si]
+    else {
+        return None;
+    };
+    if dest.0 != sh.0 || !is_cst(rhs, 64) {
+        return None;
     }
-    None
+    let (ci, cd, ptr, ld, li) = cast_of_load(block, def_at, lhs)?;
+    Some(HalfLoad {
+        ptr,
+        load_dest: ld,
+        load_index: li,
+        cast_index: ci,
+        cast_dest: cd,
+        shift_index: si,
+        shift_dest: dest.0,
+    })
 }
 
-/// `cast (load %lo) -> i128`
-fn lo_source(block: &crate::ir::reexports::BasicBlock, op: &Operand) -> Option<HalfLoad> {
-    let (ci, cd, ptr, ld, li) = cast_of_load(block, op)?;
+/// `cast (load %lo) -> i128`, unsigned only: a signed widening would fill the
+/// packed high half with ones whenever the low half's top bit is set.
+fn lo_source(
+    block: &crate::ir::reexports::BasicBlock,
+    def_at: &FxHashMap<u32, usize>,
+    op: &Operand,
+) -> Option<HalfLoad> {
+    let (ci, cd, ptr, ld, li) = cast_of_load(block, def_at, op)?;
     if !matches!(
         block.instructions[ci],
         Instruction::Cast {
@@ -544,47 +618,42 @@ fn lo_source(block: &crate::ir::reexports::BasicBlock, op: &Operand) -> Option<H
         cast_dest: cd,
         shift_index: usize::MAX,
         shift_dest: 0,
-        extra: Vec::new(),
     })
 }
 
 /// Resolve `cast (load %p) -> i128` to (cast index, cast dest, ptr, load dest,
-/// load index), plus any `gep` that only feeds the load.
+/// load index) through the block's def index.
 fn cast_of_load(
     block: &crate::ir::reexports::BasicBlock,
+    def_at: &FxHashMap<u32, usize>,
     op: &Operand,
 ) -> Option<(usize, u32, Value, Option<u32>, usize)> {
     let Operand::Value(cv) = op else { return None };
-    for (ci, inst) in block.instructions.iter().enumerate() {
-        let Instruction::Cast {
-            dest,
-            src: Operand::Value(s),
-            from_ty,
-            to_ty: IrType::I128,
-        } = inst
-        else {
-            continue;
-        };
-        if dest.0 != cv.0 || !matches!(from_ty, IrType::I64 | IrType::U64) {
-            continue;
-        }
-        for (li, other) in block.instructions.iter().enumerate() {
-            let Instruction::Load {
-                dest: ld,
-                ptr,
-                ty: IrType::I64,
-                seg_override: AddressSpace::Default,
-                volatile: false,
-            } = other
-            else {
-                continue;
-            };
-            if ld.0 == s.0 {
-                return Some((ci, cv.0, *ptr, Some(ld.0), li));
-            }
-        }
+    let ci = *def_at.get(&cv.0)?;
+    let Instruction::Cast {
+        dest,
+        src: Operand::Value(s),
+        from_ty,
+        to_ty: IrType::I128,
+    } = &block.instructions[ci]
+    else {
+        return None;
+    };
+    if dest.0 != cv.0 || !matches!(from_ty, IrType::I64 | IrType::U64) {
+        return None;
     }
-    None
+    let li = *def_at.get(&s.0)?;
+    let Instruction::Load {
+        dest: ld,
+        ptr,
+        ty: IrType::I64,
+        seg_override: AddressSpace::Default,
+        volatile: false,
+    } = &block.instructions[li]
+    else {
+        return None;
+    };
+    (ld.0 == s.0).then_some((ci, cv.0, *ptr, Some(ld.0), li))
 }
 
 fn apply(func: &mut IrFunction, c: &Candidate) {
@@ -864,6 +933,17 @@ mod tests {
             let mut f = func_with(insts);
             assert_eq!(run(&mut f), 0, "external reader of %{value}");
         }
+    }
+
+    #[test]
+    fn signed_high_half_extension_is_a_bitwise_pack() {
+        // The high half's widening is shifted left by 64, so every
+        // sign-extension bit leaves the value: a signed cast there is the
+        // same pack, and refusing it would only lose copies.
+        let mut insts = roundtrip(2, 3);
+        insts[4] = cast(13, 12, IrType::I64, IrType::I128);
+        let mut f = func_with(insts);
+        assert_eq!(run(&mut f), 1, "the << 64 discards the sign extension");
     }
 
     #[test]
