@@ -269,6 +269,8 @@ gate "sse2-slot-forwarding" fast \
 # version), and `--self-test` proves the ratchet still has teeth.
 # Every oracle-independent row still runs when GCC/Clang are absent, so the
 # gate never goes vacuous on a bare host.
+gate "sse2-matrix-contracts" fast \
+    python3 tests/regression/test_sse2_codegen_matrix.py
 gate "sse2-codegen-matrix" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" CLANG="${CLANG:-clang}" \
     python3 tests/regression/check_sse2_codegen_matrix.py --check --self-test

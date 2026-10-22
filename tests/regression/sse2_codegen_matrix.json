@@ -2,6 +2,374 @@
  "configs": [
   "O2"
  ],
+ "counts": {
+  "addpd": {
+   "O2": 31
+  },
+  "addps": {
+   "O2": 31
+  },
+  "addsd": {
+   "O2": 80
+  },
+  "addss": {
+   "O2": 59
+  },
+  "andnpd": {
+   "O2": 31
+  },
+  "andnps": {
+   "O2": 31
+  },
+  "andpd": {
+   "O2": 31
+  },
+  "andps": {
+   "O2": 31
+  },
+  "cmpeqpd": {
+   "O2": 33
+  },
+  "cmpeqps": {
+   "O2": 33
+  },
+  "cmpgtpd": {
+   "O2": 35
+  },
+  "cmpgtps": {
+   "O2": 35
+  },
+  "cmpltpd": {
+   "O2": 33
+  },
+  "cmpltps": {
+   "O2": 33
+  },
+  "cvtdq2pd": {
+   "O2": 24
+  },
+  "cvtdq2ps": {
+   "O2": 24
+  },
+  "cvtpd2dq": {
+   "O2": 25
+  },
+  "cvtps2dq": {
+   "O2": 25
+  },
+  "cvtsd2si": {
+   "O2": 29
+  },
+  "cvtsd2ss": {
+   "O2": 24
+  },
+  "cvtsi2sd": {
+   "O2": 21
+  },
+  "cvtsi2ss": {
+   "O2": 20
+  },
+  "cvtss2sd": {
+   "O2": 24
+  },
+  "cvttpd2dq": {
+   "O2": 25
+  },
+  "cvttps2dq": {
+   "O2": 25
+  },
+  "cvttsd2si": {
+   "O2": 29
+  },
+  "divpd": {
+   "O2": 37
+  },
+  "divps": {
+   "O2": 37
+  },
+  "divsd": {
+   "O2": 80
+  },
+  "divss": {
+   "O2": 59
+  },
+  "matmul_ikj": {
+   "O2": 65
+  },
+  "maxpd": {
+   "O2": 37
+  },
+  "maxps": {
+   "O2": 37
+  },
+  "maxsd": {
+   "O2": 84
+  },
+  "minpd": {
+   "O2": 37
+  },
+  "minps": {
+   "O2": 37
+  },
+  "minsd": {
+   "O2": 82
+  },
+  "movapd": {
+   "O2": 23
+  },
+  "movdqa": {
+   "O2": 13
+  },
+  "movmskpd": {
+   "O2": 39
+  },
+  "mulpd": {
+   "O2": 31
+  },
+  "mulps": {
+   "O2": 31
+  },
+  "mulsd": {
+   "O2": 80
+  },
+  "mulss": {
+   "O2": 59
+  },
+  "orpd": {
+   "O2": 31
+  },
+  "orps": {
+   "O2": 31
+  },
+  "packssdw": {
+   "O2": 14
+  },
+  "packsswb": {
+   "O2": 14
+  },
+  "packuswb": {
+   "O2": 14
+  },
+  "paddb": {
+   "O2": 14
+  },
+  "paddd": {
+   "O2": 14
+  },
+  "paddq": {
+   "O2": 14
+  },
+  "paddsb": {
+   "O2": 14
+  },
+  "paddsw": {
+   "O2": 14
+  },
+  "paddusb": {
+   "O2": 14
+  },
+  "paddusw": {
+   "O2": 14
+  },
+  "paddw": {
+   "O2": 14
+  },
+  "pand": {
+   "O2": 14
+  },
+  "pandn": {
+   "O2": 14
+  },
+  "pavgb": {
+   "O2": 14
+  },
+  "pavgw": {
+   "O2": 14
+  },
+  "pcmpeqb": {
+   "O2": 14
+  },
+  "pcmpeqd": {
+   "O2": 14
+  },
+  "pcmpeqw": {
+   "O2": 14
+  },
+  "pcmpgtb": {
+   "O2": 14
+  },
+  "pcmpgtd": {
+   "O2": 14
+  },
+  "pcmpgtw": {
+   "O2": 14
+  },
+  "pmaddwd": {
+   "O2": 14
+  },
+  "pmaxub": {
+   "O2": 14
+  },
+  "pminsw": {
+   "O2": 14
+  },
+  "pmulhuw": {
+   "O2": 14
+  },
+  "pmulhw": {
+   "O2": 14
+  },
+  "pmullw": {
+   "O2": 14
+  },
+  "pmuludq": {
+   "O2": 14
+  },
+  "por": {
+   "O2": 14
+  },
+  "psadbw": {
+   "O2": 14
+  },
+  "pshufd": {
+   "O2": 14
+  },
+  "pshufhw": {
+   "O2": 14
+  },
+  "pshuflw": {
+   "O2": 14
+  },
+  "pslld": {
+   "O2": 14
+  },
+  "pslldq": {
+   "O2": 14
+  },
+  "psllq": {
+   "O2": 14
+  },
+  "psllw": {
+   "O2": 14
+  },
+  "psrad": {
+   "O2": 14
+  },
+  "psraw": {
+   "O2": 14
+  },
+  "psrld": {
+   "O2": 14
+  },
+  "psrldq": {
+   "O2": 14
+  },
+  "psrlq": {
+   "O2": 14
+  },
+  "psrlw": {
+   "O2": 14
+  },
+  "psubb": {
+   "O2": 14
+  },
+  "psubd": {
+   "O2": 14
+  },
+  "psubq": {
+   "O2": 14
+  },
+  "psubsb": {
+   "O2": 14
+  },
+  "psubsw": {
+   "O2": 14
+  },
+  "psubusb": {
+   "O2": 14
+  },
+  "psubusw": {
+   "O2": 14
+  },
+  "psubw": {
+   "O2": 14
+  },
+  "punpckhbw": {
+   "O2": 14
+  },
+  "punpckhdq": {
+   "O2": 14
+  },
+  "punpckhqdq": {
+   "O2": 14
+  },
+  "punpckhwd": {
+   "O2": 14
+  },
+  "punpcklbw": {
+   "O2": 14
+  },
+  "punpckldq": {
+   "O2": 14
+  },
+  "punpcklqdq": {
+   "O2": 14
+  },
+  "punpcklwd": {
+   "O2": 14
+  },
+  "pxor": {
+   "O2": 14
+  },
+  "shufpd": {
+   "O2": 33
+  },
+  "shufps": {
+   "O2": 33
+  },
+  "sqrtpd": {
+   "O2": 24
+  },
+  "sqrtps": {
+   "O2": 24
+  },
+  "sqrtsd": {
+   "O2": 85
+  },
+  "sqrtss": {
+   "O2": 28
+  },
+  "subpd": {
+   "O2": 31
+  },
+  "subps": {
+   "O2": 31
+  },
+  "subsd": {
+   "O2": 80
+  },
+  "subss": {
+   "O2": 59
+  },
+  "unpckhpd": {
+   "O2": 37
+  },
+  "unpckhps": {
+   "O2": 37
+  },
+  "unpcklpd": {
+   "O2": 37
+  },
+  "unpcklps": {
+   "O2": 37
+  },
+  "xorpd": {
+   "O2": 31
+  },
+  "xorps": {
+   "O2": 31
+  }
+ },
  "debt": {
   "addpd": {
    "O2": {
