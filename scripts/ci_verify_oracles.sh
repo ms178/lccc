@@ -30,10 +30,25 @@
 # Every probe below is one a gate actually depends on, and every failure names
 # the tool, the expectation and what was found:
 #
-#   gcc-16 / g++-16     exist, report the pinned version, and compile C17+C23
+#   gcc-16 / g++-16     exist, compile C17+C23, and -- only when the lane
+#                       passes --gcc-version -- report that version exactly.
+#                       The pin is an EXPLICIT per-lane argument: provisioning
+#                       is rolling-major by policy, so a lane that does not ask
+#                       for 16.2 must not be judged against it.  The first
+#                       version of this script defaulted the expectation to
+#                       16.2 and turned every unpinned lane red in run
+#                       39822157492, where `Build and package compiler` and
+#                       `Assertion-enabled units and corpus` had installed the
+#                       distribution's 16.0.1 exactly as their gates expect.
 #   i686 multilib       links AND runs (qemu-i386 when the kernel refuses)
-#   mold, ld.lld        run (the assembler/linker lanes compare them)
-#   qemu-i386           runs (i686 regression rows execute through it)
+#   mold, ld.lld        run -- only when a lane asks with --require, because
+#   qemu-i386           presence is already provisioning's contract: every lane
+#                       runs ci_provision_toolchain.sh, whose ci_toolchain_bundle.sh
+#                       verify step refuses to return without /usr/bin/{ld.lld,
+#                       qemu-i386,mold}.  Re-probing them here bought nothing and
+#                       made the gate unpassable on a host the tag cache cannot
+#                       provision (no lld in the cache), which is how a
+#                       redundancy becomes a false red.
 #   valgrind            runs Memcheck end to end -- not just `--version`:
 #                       valgrind aborts at startup when libc6-dbg for the
 #                       loader is missing, and that is exactly the state a
@@ -51,7 +66,8 @@
 #
 # Usage:
 #   scripts/ci_verify_oracles.sh [--gcc-version 16.2] [--clang-version 23.1.3]
-#                                [--toolchain-since 0.5]
+#                                [--require gcc,multilib,valgrind,pyyaml]
+#                                [--valgrind-tool NAME]
 #   scripts/ci_verify_oracles.sh --self-test
 #
 # Exit status 0 means every requested probe passed.  A missing or wrong tool is
@@ -60,23 +76,31 @@
 # ============================================================================
 set -Eeuo pipefail
 
-# The version the LLVM oracle family was measured against.  Keep in step with
-# the `16.2` assertions in tests/regression/check_llvm_*.py; this is the one
-# place a lane's expectation is spelled out for the operator.
-GCC_VERSION_EXPECTED=${LCCC_ORACLE_GCC_VERSION:-16.2}
+# The version a *pinned* lane asks for.  Empty by default: the pin belongs to
+# the lane (and to the installer that delivers it), never to the verifier.  The
+# lanes that need 16.2 are exactly the ones running the LLVM oracle family
+# (tests/regression/check_llvm_*.py), and they install it with
+# scripts/ci_install_gcc_oracle.sh before calling this script.
 PROVENANCE=$HOME/.cache/lccc-toolchain/last-provision.json
 
-gcc_version_expected=$GCC_VERSION_EXPECTED
+gcc_version_expected=""
 clang_version_expected=""
 # The binary the Memcheck probe looks for.  It is a parameter so the self-test
 # can exercise the "absent tool" path on a host that happens to have valgrind
 # installed (a verifier that cannot fail is decoration), and so a lane that
 # provisions it under another name can say so.
 valgrind_tool=${LCCC_VALGRIND_TOOL:-valgrind}
+# Capability probes are on by default; the presence probes are opt-in and the
+# union is checked against what the lane's gates actually consume by
+# tests/regression/check_ci_lane_plan.py.
+required="gcc,multilib,valgrind,pyyaml"
 self_test=0
 
 usage() {
-    sed -n '2,60p' "$0" | sed -n '/^# Usage:/,$p' >&2
+    # Through the start of the code, not a fixed line count: this header grows
+    # whenever a probe is added, and a range that stops short silently prints
+    # nothing at all.
+    sed -n '2,/^set -Eeuo/p' "$0" | sed -n '/^# Usage:/,$p' >&2
     exit 2
 }
 
@@ -85,6 +109,7 @@ while (( $# )); do
         --gcc-version) gcc_version_expected=${2:?--gcc-version needs a value}; shift 2 ;;
         --clang-version) clang_version_expected=${2:?--clang-version needs a value}; shift 2 ;;
         --valgrind-tool) valgrind_tool=${2:?--valgrind-tool needs a value}; shift 2 ;;
+        --require) required=${2:?--require needs a comma-separated probe list}; shift 2 ;;
         --self-test) self_test=1; shift ;;
         -h|--help) usage ;;
         *) echo "ci_verify_oracles: unknown argument: $1" >&2; exit 2 ;;
@@ -114,6 +139,15 @@ failed() {
     failures=$((failures + 1))
 }
 
+probes=()
+IFS=, read -r -a probes <<<"$required"
+for probe in "${probes[@]}"; do
+    case $probe in
+        gcc|multilib|valgrind|pyyaml|mold|lld|qemu) ;;
+        *) printf 'ci_verify_oracles: --require: unknown probe %s (gcc,multilib,valgrind,pyyaml,mold,lld,qemu)\n' "$probe" >&2
+           exit 2 ;;
+    esac
+done
 # ── probes ──────────────────────────────────────────────────────────────────
 # report <label> <value>: collected in probe order and printed as one line.
 REPORT=()
@@ -129,14 +163,18 @@ require_gcc() {
         failed "gcc-16 at $bin does not report a version"
         return
     fi
-    report gcc-16 "$version"
+    # The path is part of the report: 16.2 can arrive as the distribution
+    # package or as the tag-cache prefix that shadows it, and the two are the
+    # same version only by coincidence.  One `::notice` answers which one a run
+    # actually used.
+    report gcc-16 "$version ($bin)"
     if [[ -n $gcc_version_expected ]]; then
         # A prefix match on the dotted components: the distribution appends its
         # own package revision ("16.2.0" vs "16.2"), and a *minor* movement is
         # what changes the oracle.  16.3 must not pass an expectation of 16.2.
         case $version in
             "$gcc_version_expected"|"$gcc_version_expected".*) ;;
-            *) failed "gcc-16 is $version; the gates pin $gcc_version_expected (set LCCC_ORACLE_GCC_VERSION to move the pin)" ;;
+            *) failed "gcc-16 is $version; this lane pins $gcc_version_expected (scripts/ci_install_gcc_oracle.sh --version $gcc_version_expected delivers it)" ;;
         esac
     fi
     if ! command -v g++-16 >/dev/null 2>&1; then
@@ -175,6 +213,8 @@ require_multilib() {
         failed "the -m32 probe does not run: $(sed -n '1p' "$work/err")"
     elif [[ $(sed -n '1p' "$work/out") != ok ]]; then
         failed "the -m32 probe printed '$(sed -n '1p' "$work/out")' instead of 'ok'"
+    else
+        report multilib "links and runs${run:+ via ${run[0]}}"
     fi
     rm -rf "$work"
 }
@@ -290,6 +330,11 @@ MOCK
     printf '#!/bin/sh\necho 18.1.3\n' >"$work/clang18/clang"
     printf '#!/bin/sh\necho 23.1.3\n' >"$work/clang23/clang"
     chmod +x "$work/tools"/* "$work/clang18/clang" "$work/clang23/clang"
+    # The dev host this gate also runs on: the tag cache ships no ld.lld, so a
+    # host can be fully able to run every gate and still have no linker oracle.
+    mkdir -p "$work/tools-min"
+    cp "$work/tools/gcc-16" "$work/tools/g++-16" "$work/tools/python3" \
+       "$work/tools/valgrind" "$work/tools-min/"
 
     # 1. A complete, correct tool set passes and reports every version.
     status=0
@@ -307,7 +352,7 @@ MOCK
     status=0
     PATH="$work/tools:$PATH" CASES_VERSION=16.3.0 \
         bash "$0" --gcc-version 16.2 >"$work/out" 2>"$work/err" || status=$?
-    if (( status != 0 )) && grep -q 'is 16.3.0; the gates pin 16.2' "$work/err"; then
+    if (( status != 0 )) && grep -q 'is 16.3.0; this lane pins 16.2' "$work/err"; then
         echo "  ok   gcc minor drift refused with both versions named"
     else
         echo "  FAIL gcc minor drift: exit $status, stderr=$(sed -n '1,5p' "$work/err")" >&2
@@ -348,7 +393,57 @@ MOCK
         rm -rf "$work"; return 1
     fi
 
-    echo "  self-test: 5/5 cases pass"
+    # 5. The regression this script caused, twice, in run 39822157492: an
+    #    UNPINNED lane was judged against 16.2.  The distribution's 16.0.1 is
+    #    the rolling-major oracle those lanes ask for, so it must pass.
+    status=0
+    PATH="$work/tools:$PATH" CASES_VERSION=16.0.1 \
+        bash "$0" >"$work/out" 2>"$work/err" || status=$?
+    if (( status == 0 )) && grep -q 'gcc-16=16.0.1' "$work/out"; then
+        echo "  ok   an unpinned lane is not judged against the 16.2 pin"
+    else
+        echo "  FAIL unpinned lane: exit $status, out=$(sed -n '1,3p' "$work/out") err=$(sed -n '1,5p' "$work/err")" >&2
+        rm -rf "$work"; return 1
+    fi
+
+    # 6. ...while a lane that DOES ask for 16.2 must refuse that same oracle,
+    #    naming both versions so the annotation is the whole diagnosis.
+    status=0
+    PATH="$work/tools:$PATH" CASES_VERSION=16.0.1 \
+        bash "$0" --gcc-version 16.2 >"$work/out" 2>"$work/err" || status=$?
+    if (( status != 0 )) && grep -q 'gcc-16 is 16.0.1; this lane pins 16.2' "$work/err"; then
+        echo "  ok   a pinned lane refuses 16.0.1 and names both versions"
+    else
+        echo "  FAIL pinned lane: exit $status, stderr=$(sed -n '1,5p' "$work/err")" >&2
+        rm -rf "$work"; return 1
+    fi
+
+    # 7. Presence probes are opt-in.  mold/ld.lld/qemu-i386 are proven by the
+    #    provisioning step's own bundle verify, so the default set must pass on
+    #    a host that has none of them (the research box has mold and qemu but
+    #    no lld; making the default require lld turned ci_local.sh red).
+    status=0
+    PATH="$work/tools-min:/usr/bin:/bin" CASES_VERSION=16.2.0 \
+        bash "$0" --gcc-version 16.2 >"$work/out" 2>"$work/err" || status=$?
+    if (( status == 0 )) && ! grep -q 'ld.lld' "$work/err"; then
+        echo "  ok   the default require set does not demand the presence probes"
+    else
+        echo "  FAIL default require set: exit $status, err=$(sed -n '1,5p' "$work/err")" >&2
+        rm -rf "$work"; return 1
+    fi
+
+    # 8. ...and a lane that DOES ask for one gets a failure that names it.
+    status=0
+    PATH="$work/tools-min:/usr/bin:/bin" CASES_VERSION=16.2.0 \
+        bash "$0" --require gcc,lld >"$work/out" 2>"$work/err" || status=$?
+    if (( status != 0 )) && grep -q 'ld.lld is not on PATH' "$work/err"; then
+        echo "  ok   --require lld fails closed and names the tool"
+    else
+        echo "  FAIL --require lld: exit $status, err=$(sed -n '1,5p' "$work/err")" >&2
+        rm -rf "$work"; return 1
+    fi
+
+    echo "  self-test: 9/9 cases pass"
     rm -rf "$work"
     return 0
 }
@@ -359,13 +454,17 @@ if (( self_test )); then
 fi
 
 # ── run ─────────────────────────────────────────────────────────────────────
-require_gcc
-require_multilib
-require_runner mold
-require_runner ld.lld
-require_runner qemu-i386
-require_valgrind
-require_python_yaml
+for probe in "${probes[@]}"; do
+    case $probe in
+        gcc) require_gcc ;;
+        multilib) require_multilib ;;
+        valgrind) require_valgrind ;;
+        pyyaml) require_python_yaml ;;
+        mold) require_runner mold ;;
+        lld) require_runner ld.lld ;;
+        qemu) require_runner qemu-i386 ;;
+    esac
+done
 if [[ -n $clang_version_expected ]]; then require_clang "$clang_version_expected"; fi
 
 provenance=unknown

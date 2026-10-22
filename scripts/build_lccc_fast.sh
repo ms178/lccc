@@ -34,41 +34,60 @@ export CARGO_BUILD_JOBS=2
 printf '%s\n' "Rust toolchain: $LCCC_SELECTED_RUST_TOOLCHAIN ($(rustc --version))"
 printf '%s\n' "Cargo jobs: $CARGO_BUILD_JOBS (fixed research policy)"
 
-# Honour the repo's clang+mold preference (.cargo/config.toml) when both are
-# on PATH. If only mold is available, drive it through the gcc driver
-# (gcc >= 12 resolves -fuse-ld=mold to ld.mold on PATH) so the fast-linker
-# preference survives with only mold installed (e.g. conda-forge mold next
-# to a system gcc).
-# `--config` overrides the *linker*, but it cannot CANCEL the committed
+# Link with mold when -- and only when -- a driver on this host can actually
+# link through it.  `.cargo/config.toml` deliberately leaves the default at
+# gcc + GNU ld, so this script is where the fast linker is opted into.
+#
+# `--config` overrides the *linker*, but it cannot CANCEL a committed
 # `target.<triple>.rustflags` entry that passes `-fuse-ld=mold`: cargo keeps
 # the config-file value for a key it also finds on the command line, so
-# `--config 'target...rustflags=[]'` leaves `-fuse-ld=mold` in every link and
-# the build dies with "collect2: fatal error: cannot find 'ld'" on hosts
-# without mold.  The RUSTFLAGS environment variable is the only override that
-# outranks every config file, so the linker mode is expressed through it.
+# `--config 'target...rustflags=[]'` would leave `-fuse-ld=mold` in every link
+# and the build would die on hosts without mold.  The RUSTFLAGS environment
+# variable is the only override that outranks every config file, so the linker
+# mode is expressed through it.
+#
+# A NAME CHECK IS NOT A CONTRACT: `command -v clang && command -v mold` was
+# true on a host whose mold had no `ld.mold` sibling; every link then died with
+# "collect2: fatal error: cannot find 'ld'" -- a message that names neither
+# mold nor the missing symlink -- and the real cause sat three screens up in a
+# linker line.  One 20 ms probe decides the mode instead of an inference about
+# how the package was laid out.
+mold_usable() {
+    local driver=$1 probe
+    probe=$(mktemp -d) || return 1
+    printf 'int main(void) { return 0; }\n' >"$probe/p.c"
+    if "$driver" -fuse-ld=mold "$probe/p.c" -o "$probe/p" >/dev/null 2>&1; then
+        rm -rf "$probe"
+        return 0
+    fi
+    rm -rf "$probe"
+    return 1
+}
+
+mold_driver=""
+for candidate in clang gcc; do
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if mold_usable "$candidate"; then mold_driver=$candidate; break; fi
+done
+
 cargo_config=()
 rustflags=""
-if command -v clang >/dev/null 2>&1 && command -v mold >/dev/null 2>&1; then
-    : # keep .cargo/config.toml (clang driver, -fuse-ld=mold)
-    # Reproduce the committed flags explicitly: RUSTFLAGS is authoritative in
-    # every mode, so it must not silently drop the mold preference.
-    rustflags="-C link-arg=-fuse-ld=mold"
-elif command -v ld.mold >/dev/null 2>&1; then
-    # mold without clang: gcc driver + mold backend. `-fuse-ld=mold` requires
-    # an `ld.mold` on PATH (the conda-forge/make-install symlink layout);
-    # `command -v ld.mold` guarantees that exact resolution.
+if [ -n "$mold_driver" ]; then
+    # Pin the linker through RUSTFLAGS' driver and the config override: the
+    # committed config says gcc/bfd, and `--config` alone cannot cancel a
+    # `target.<triple>.rustflags` entry that is also set on the command line.
     cargo_config+=(
-        --config 'target.x86_64-unknown-linux-gnu.linker="gcc"'
-        --config 'target.i686-unknown-linux-gnu.linker="gcc"'
+        --config "target.x86_64-unknown-linux-gnu.linker=\"$mold_driver\""
+        --config "target.i686-unknown-linux-gnu.linker=\"$mold_driver\""
     )
     rustflags="-C link-arg=-fuse-ld=mold"
-    printf '%s\n' "note: clang not found; linking with gcc driver + mold backend"
+    printf '%s\n' "note: linking with $mold_driver driver + mold backend"
 else
     cargo_config+=(
         --config 'target.x86_64-unknown-linux-gnu.linker="gcc"'
         --config 'target.i686-unknown-linux-gnu.linker="gcc"'
     )
-    printf '%s\n' "note: clang/mold not found; linking with gcc + GNU ld (bfd)"
+    printf '%s\n' "note: no driver can link through mold; linking with gcc + GNU ld (bfd)"
 fi
 
 printf '%s\n' "Building LCCC (fastbuild profile: -O1, no LTO, incremental)"

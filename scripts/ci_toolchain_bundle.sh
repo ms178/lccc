@@ -231,6 +231,16 @@ do_verify() {
             return 1
         fi
         mold --version >/dev/null 2>&1 || { rm -rf "$probe"; problem "mold does not run"; return 1; }
+        # `mold --version` is not the contract the BUILD needs: gcc/clang
+        # resolve `-fuse-ld=mold` through an `ld.mold` sibling, and a mold
+        # without it passes the version probe and then fails every link with
+        # "collect2: fatal error: cannot find 'ld'".  Probe the real pairing.
+        if ! printf 'int main(void) { return 0; }\n' \
+                | gcc-16 -fuse-ld=mold -x c - -o "$probe/mold-link" >/dev/null 2>&1; then
+            rm -rf "$probe"
+            problem "gcc-16 cannot link through mold: \`-fuse-ld=mold\` needs the \`ld.mold\` symlink beside \`mold\`"
+            return 1
+        fi
         ld.lld --version >/dev/null 2>&1 || { rm -rf "$probe"; problem "ld.lld does not run"; return 1; }
         qemu-i386 --version >/dev/null 2>&1 || { rm -rf "$probe"; problem "qemu-i386 does not run"; return 1; }
         # Presence is not enough: valgrind aborts at startup when the loader's
@@ -245,7 +255,7 @@ do_verify() {
             return 1
         fi
         rm -rf "$probe"
-        say "verified live root: gcc-16 $version, $(mold --version | sed -n '1p'), $(valgrind --version)"
+        say "verified live root: gcc-16 $version (mold + Memcheck probes), $(valgrind --version)"
     else
         say "verified layout under $ROOT (probes need a live root)"
     fi

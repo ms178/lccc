@@ -389,6 +389,8 @@ gate "ci-lane-plan" fast \
 # fails this gate.
 gate "oracle-toolchain-self-test" fast \
     bash scripts/ci_verify_oracles.sh --self-test
+gate "gcc-oracle-installer-self-test" fast \
+    bash scripts/ci_install_gcc_oracle.sh --self-test
 gate "oracle-toolchain" fast \
     bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.3
 

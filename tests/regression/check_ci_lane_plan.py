@@ -270,6 +270,38 @@ def _gate_tools(relative: str, seen: frozenset[str] = frozenset()) -> frozenset[
 GCC_PIN_IDIOM = r"16\.2"
 
 
+GCC_ORACLE_INSTALL = "scripts/ci_install_gcc_oracle.sh"
+GCC_ORACLE_CACHE = "~/.cache/lccc/gcc-oracle"
+# What the verifier probes unless a lane says otherwise (ci_verify_oracles.sh).
+DEFAULT_REQUIRE = {"gcc", "multilib", "valgrind", "pyyaml"}
+KNOWN_PROBES = DEFAULT_REQUIRE | {"mold", "lld", "qemu"}
+# Gate tool -> the probe that proves it.  `clang` is not here on purpose: it is
+# proven by the --clang-version assertion (R1/R4), which is an exact release.
+PROBE_FOR_TOOL = {"valgrind": "valgrind"}
+
+
+def gcc_oracle_installer_version() -> str:
+    """The release the tag-cache installer can actually deliver (its VERSION=).
+
+    R7 compares this with the version a lane's verifier asserts: a lane that
+    pins 16.2 while the installer ships 16.0.1 is red on the first run, and the
+    annotation names the verifier rather than the mismatch.
+    """
+    try:
+        text = (ROOT / GCC_ORACLE_INSTALL).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    match = re.search(r"^VERSION=(\S+)$", text, re.M)
+    return match.group(1).strip("\"'") if match else ""
+
+
+def _cache_path(step: dict) -> str:
+    """The `path:` an actions/cache step restores, or '' for any other step."""
+    if not str(step.get("uses") or "").startswith("actions/cache"):
+        return ""
+    return str((step.get("with") or {}).get("path") or "")
+
+
 def _pins_gcc_minor(relative: str) -> bool:
     try:
         return GCC_PIN_IDIOM in (ROOT / relative).read_text(encoding="utf-8", errors="replace")
@@ -329,6 +361,72 @@ def oracle_provisioning(document: dict) -> list[str]:
                         f"{name}: runs {_repo_relative(pins[0])!r}, which pins GCC 16.2, "
                         f"but its {VERIFY_STEP!r} step does not assert --gcc-version: "
                         f"the lane would pass with 16.3 and fail in a later gate")
+        # R7: a pin that is only ASSERTED is a lane that goes red on the first
+        # run -- `Build and package compiler` and `Assertion-enabled units and
+        # corpus` in run 39822157492, where the verifier demanded 16.2 from a
+        # distribution that ships 16.0.1.  A pin has to be delivered by the
+        # tag-cache installer, before the step that judges it, and that
+        # installer must actually ship the release the lane pins.
+        verify_at = next(((i, run) for i, (step, run) in enumerate(zip(steps, runs))
+                          if (step.get("name") or "") == VERIFY_STEP), None)
+        wanted = re.search(r"--gcc-version[ =]+(\S+)", verify_at[1]) if verify_at else None
+        if wanted:
+            version = wanted.group(1)
+            installs = [(i, step.get("run") or "") for i, step in enumerate(steps)
+                        if GCC_ORACLE_INSTALL in (step.get("run") or "")]
+            if not installs:
+                problems.append(
+                    f"{name}: its {VERIFY_STEP!r} step asserts --gcc-version {version}, but no "
+                    f"step installs that release ({GCC_ORACLE_INSTALL}): the distribution's "
+                    f"gcc-16 is a different version, so the lane is red by construction")
+            else:
+                installed = re.search(r"--version[ =]+(\S+)", installs[0][1])
+                if not installed or installed.group(1) != version:
+                    problems.append(
+                        f"{name}: verifies GCC {version} but installs "
+                        f"{installed.group(1) if installed else 'nothing'}: the pin and the "
+                        f"delivery disagree")
+                elif installs[0][0] > verify_at[0]:
+                    problems.append(
+                        f"{name}: installs the GCC {version} oracle after the step that "
+                        f"verifies it, so the verifier judges the distribution's compiler")
+                # R8: the archive is 65 MB; without the cache every run of every
+                # pinned lane pays for the download before any gate starts.
+                if not any(GCC_ORACLE_CACHE in _cache_path(step) for step in steps):
+                    problems.append(
+                        f"{name}: installs the GCC {version} oracle without caching "
+                        f"{GCC_ORACLE_CACHE}: every run re-downloads the tag-cache archive")
+            shipped = gcc_oracle_installer_version()
+            if shipped != version:
+                problem = (f"{GCC_ORACLE_INSTALL}: ships {shipped or 'no VERSION='}, but "
+                           f"{name} pins {version}: the verifier would pass only on a host "
+                           f"that already had the right compiler")
+                if problem not in problems:
+                    problems.append(problem)
+        # R9: a lane may NARROW the probe set (--require), and the narrowed set
+        # has to stay a superset of what its gates consume.  Without this, a
+        # lane can drop the valgrind probe and still run the Memcheck oracles,
+        # which is the same false red one layer down.
+        require = DEFAULT_REQUIRE
+        for run in verifies:
+            match = re.search(r"--require[ =]+(\S+)", run)
+            if match:
+                require = {probe for probe in match.group(1).split(",") if probe}
+        unknown = sorted(require - KNOWN_PROBES)
+        if unknown:
+            problems.append(
+                f"{name}: its {VERIFY_STEP!r} step asks for unknown probe(s) "
+                f"{', '.join(unknown)}: only {', '.join(sorted(KNOWN_PROBES))} exist")
+        for tool, probe in PROBE_FOR_TOOL.items():
+            if tool in tools and probe not in require:
+                problems.append(
+                    f"{name}: runs a {tool} gate but its {VERIFY_STEP!r} step does not "
+                    f"require the {probe!r} probe: the gate would fail on a lane that "
+                    f"never proved the tool works")
+        if provisions and "gcc" not in require:
+            problems.append(
+                f"{name}: provisions a GCC oracle but its {VERIFY_STEP!r} step does not "
+                f"require the 'gcc' probe")
     return problems
 
 
@@ -550,15 +648,64 @@ def self_test() -> None:
     problems = oracle_provisioning(loose)
     assert any("--clang-version" in p for p in problems), problems
 
-    # The fully provisioned lane is clean, so the rule can pass as well as fail.
-    complete = {"jobs": {"contracts": {"steps": [
+    def cache(path: str) -> dict:
+        return {"uses": "actions/cache@v6", "with": {"path": path, "key": "k"}}
+
+    pinned_preamble = [
         step("Checkout"),
         step("Provision", "bash scripts/ci_provision_toolchain.sh --multilib"),
         step("Clang", "bash scripts/ci_install_clang_oracle.sh"),
+        cache(GCC_ORACLE_CACHE),
+        step("GCC", f"bash {GCC_ORACLE_INSTALL} --version 16.2"),
+    ]
+    # The fully provisioned, pinned lane is clean: the rule can pass as well
+    # as fail, and it needs the cache step to do so.
+    complete = {"jobs": {"contracts": {"steps": pinned_preamble + [
         step(VERIFY_STEP, "bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.3"),
         step("Run the contracts", "bash tests/regression/check_fma_gating.sh"),
     ]}}}
     assert oracle_provisioning(complete) == [], oracle_provisioning(complete)
+
+    # R7: the pin is asserted but nothing delivers it -- run 39822157492.
+    undelivered = {"jobs": {"contracts": {"steps": pinned_preamble[:1] + pinned_preamble[1:4] + [
+        step(VERIFY_STEP, "bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.3"),
+    ]}}}
+    problems = oracle_provisioning(undelivered)
+    assert any("no step installs that release" in p for p in problems), problems
+
+    # R7: the installer ships a different release than the verifier pins.
+    mismatched = json.loads(json.dumps(complete))
+    mismatched["jobs"]["contracts"]["steps"][4]["run"] = f"bash {GCC_ORACLE_INSTALL} --version 16.3"
+    problems = oracle_provisioning(mismatched)
+    assert any("pin and the delivery disagree" in p for p in problems), problems
+
+    # R7: installed after the step that judges it.
+    late = json.loads(json.dumps(complete))
+    steps = late["jobs"]["contracts"]["steps"]
+    steps.insert(5, steps.pop(4))
+    problems = oracle_provisioning(late)
+    assert any("after the step that verifies it" in p for p in problems), problems
+
+    # R9: narrowing the probe set past what the lane's gates consume.
+    narrowed = json.loads(json.dumps(complete))
+    narrowed["jobs"]["contracts"]["steps"][-2]["run"] = (
+        "bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.3"
+        " --require gcc,pyyaml")
+    problems = oracle_provisioning(narrowed)
+    assert any("does not require the 'valgrind' probe" in p for p in problems), problems
+
+    # R9: a probe name the verifier does not implement.
+    typo = json.loads(json.dumps(complete))
+    typo["jobs"]["contracts"]["steps"][-2]["run"] += " --require gcc,lldd"
+    problems = oracle_provisioning(typo)
+    assert any("unknown probe(s) lldd" in p for p in problems), problems
+
+    # R8: the 65 MB archive is re-downloaded every run when the prefix is not
+    # cached.
+    uncached = json.loads(json.dumps(complete))
+    uncached["jobs"]["contracts"]["steps"][3] = step("No cache")
+    problems = oracle_provisioning(uncached)
+    assert any("without caching" in p for p in problems), problems
 
     # R6: the lane runs a gate that pins the GCC minor but its probe does not
     # assert it -- the shape that made run 39809624659's shard a fail inside
@@ -579,7 +726,7 @@ def self_test() -> None:
     assert provisioning_extras_problems('EXTRAS="qemu-user valgrind libc6-dbg"') == []
     assert provisioning_extras_problems("PACKAGES=qemu") != []
 
-    print("check_ci_lane_plan: self-test PASS (15 rules, 19 fixtures)")
+    print("check_ci_lane_plan: self-test PASS (18 rules, 25 fixtures)")
 
 
 def main(argv: list[str] | None = None) -> int:
