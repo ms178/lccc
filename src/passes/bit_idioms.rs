@@ -1696,6 +1696,61 @@ fn match_bit_reverse32(result: Operand, defs: &[Option<Instruction>]) -> Option<
     Some(peel_copies(value, defs))
 }
 
+/// Preserve the existing exact portable 32-bit reversal idiom before
+/// pre-inlining scalar reassociation can merge its first shift stage with
+/// a caller's shift. Called only for the native AArch64 target, under the
+/// existing bit_idioms policy; other targets retain their old scheduling.
+pub(crate) fn recognize_reverse_ladders(func: &mut IrFunction) -> usize {
+    if !func.blocks.iter().any(|b| {
+        b.instructions.iter().any(|i| {
+            matches!(
+                i,
+                Instruction::BinOp {
+                    op: IrBinOp::Or,
+                    ty: IrType::I32 | IrType::U32,
+                    ..
+                }
+            )
+        })
+    }) {
+        return 0;
+    }
+    let mut defs = vec![None; func.max_value_id() as usize + 1];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest() {
+                defs[dest.0 as usize] = Some(inst.clone());
+            }
+        }
+    }
+    let mut changes = 0;
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            let Instruction::BinOp {
+                dest,
+                op: IrBinOp::Or,
+                ty: IrType::I32 | IrType::U32,
+                ..
+            } = inst
+            else {
+                continue;
+            };
+            let dest = *dest;
+            if let Some(src) = match_bit_reverse32(Operand::Value(dest), &defs) {
+                *inst = Instruction::UnaryOp {
+                    dest,
+                    op: IrUnaryOp::BitReverse,
+                    src,
+                    ty: IrType::U32,
+                };
+                defs[dest.0 as usize] = Some(inst.clone());
+                changes += 1;
+            }
+        }
+    }
+    changes
+}
+
 /// `enable_bit_reverse` gates the idiom whose native lowering is target
 /// specific (AArch64 `rbit`).
 ///

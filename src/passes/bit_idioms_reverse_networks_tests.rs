@@ -203,3 +203,60 @@ fn reverse_networks_refuse_arithmetic_oversized_counts_casts_and_shared_internal
         assert!(fold(code.last().unwrap(), cx, Value(64)).is_none())
     });
 }
+
+#[test]
+fn early_portable_ladder_recognition_preserves_exact_masks() {
+    use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Terminator};
+    for wrong in [false, true] {
+        let ty = IrType::U32;
+        let mut code = Vec::new();
+        let mut input = v(0);
+        let mut next = 1;
+        for (amount, mask) in [
+            (1, 0x55555555u64),
+            (2, 0x33333333),
+            (4, 0x0f0f0f0f),
+            (8, 0x00ff00ff),
+        ] {
+            let mut emit = |op, a, b| {
+                let dest = Value(next);
+                next += 1;
+                code.push(bin(dest, op, a, b, ty));
+                Operand::Value(dest)
+            };
+            let count = constant(amount, ty);
+            let mask = constant(mask ^ u64::from(wrong && amount == 1), ty);
+            let right_shift = emit(IrBinOp::LShr, input, count);
+            let right = emit(IrBinOp::And, right_shift, mask);
+            let left_mask = emit(IrBinOp::And, input, mask);
+            let left = emit(IrBinOp::Shl, left_mask, count);
+            input = emit(IrBinOp::Or, right, left);
+        }
+        code.push(bin(Value(next), IrBinOp::LShr, input, constant(16, ty), ty));
+        code.push(bin(
+            Value(next + 1),
+            IrBinOp::Shl,
+            input,
+            constant(16, ty),
+            ty,
+        ));
+        code.push(bin(Value(next + 2), IrBinOp::Or, v(next), v(next + 1), ty));
+        let mut f = IrFunction::new("portable_reverse".into(), ty, vec![], false);
+        f.next_value_id = next + 3;
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: code,
+            source_spans: vec![],
+            terminator: Terminator::Return(Some(v(next + 2))),
+        }];
+        assert_eq!(
+            crate::passes::bit_idioms::recognize_reverse_ladders(&mut f),
+            usize::from(!wrong)
+        );
+        if !wrong {
+            assert!(
+                matches!(f.blocks[0].instructions.last(), Some(Instruction::UnaryOp { op: IrUnaryOp::BitReverse, src, .. }) if *src == v(0))
+            );
+        }
+    }
+}

@@ -49,7 +49,6 @@ fn evaluate(
                         Operand::Const(c) => {
                             vec![c.to_i128().unwrap() as u64 & full; input[0].len()]
                         }
-                        _ => panic!("bad vector operand"),
                     };
                     let a = get(0);
                     let b = get(1);
