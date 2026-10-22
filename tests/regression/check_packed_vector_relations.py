@@ -67,6 +67,12 @@ def main():
             raise ValueError(f"fewer than eight improvements against isolated vecrelations control: {improved}")
         for bits in (8, 16, 32, 64):
             for size in (16, 32):
+                name = f"packed_bounded_mask_u{bits}_{size}"
+                row = next(r for r in rows if r["name"] == name)
+                if row["enabled"] >= row["disabled"]:
+                    raise ValueError(f"bounded-mask mechanism did not improve: {row}")
+        for bits in (8, 16, 32, 64):
+            for size in (16, 32):
                 name = f"packed_xor_cancel_u{bits}_{size}"
                 if any(re.match(r"v?pxor\b|v?xorps\b|v?xorpd\b", line) for line in body(assembly["enabled"], name)):
                     raise ValueError(f"XOR cancellation did not fire: {name}")

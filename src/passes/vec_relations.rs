@@ -164,9 +164,34 @@ fn splat(value: Operand, f: Family, defs: &FxHashMap<Value, Instruction>) -> Opt
     };
     Some(c.to_i128()? as u64 & (u64::MAX >> (64 - f.bits)))
 }
-// Vector counterpart of the scalar contiguous-bound arm proof (#192094).
-// A byte blend may consume a wider compare mask because every compare lane
-// is uniformly all-ones/zero. A COARSER blend must never borrow that fact.
+// A canonical comparison masks every false lane to zero. Its true lane
+// proves the nested AND redundant, whether consumed by AND or a blend.
+fn bounded_arm(
+    mask: Operand,
+    value: Operand,
+    f: Family,
+    defs: &FxHashMap<Value, Instruction>,
+) -> Option<Operand> {
+    let cmp = args(mask, f.cmp, 3, defs)?;
+    let Operand::Const(predicate) = cmp[2] else {
+        return None;
+    };
+    let limit = splat(cmp[1], f, defs)?;
+    let low = match predicate.to_i128()? {
+        5 if limit.is_power_of_two() => limit - 1,
+        6 if limit & limit.wrapping_add(1) == 0 => limit,
+        _ => return None,
+    };
+    let masked = args(value, f.and, 2, defs)?;
+    for (base, bits) in [(masked[0], masked[1]), (masked[1], masked[0])] {
+        if base == cmp[0] && splat(bits, f, defs) == Some(low) {
+            return Some(base);
+        }
+    }
+    None
+}
+// A byte blend may consume wider canonical compare lanes. A COARSER blend
+// must never borrow that property from smaller lanes.
 fn bounded_blend(
     root: &[Operand],
     op: IntrinsicOp,
@@ -175,30 +200,11 @@ fn bounded_blend(
 ) -> Option<Vec<Operand>> {
     let (bytes, bits) = blend_shape(op)?;
     for &f in families {
-        if f.bytes != bytes || bits > f.bits {
-            continue;
-        }
-        let Some(cmp) = args(root[2], f.cmp, 3, defs) else {
-            continue;
-        };
-        let Operand::Const(predicate) = cmp[2] else {
-            continue;
-        };
-        let Some(limit) = splat(cmp[1], f, defs) else {
-            continue;
-        };
-        let low = match predicate.to_i128()? {
-            5 if limit.is_power_of_two() => limit - 1,
-            6 if limit & limit.wrapping_add(1) == 0 => limit,
-            _ => continue,
-        };
-        let Some(masked) = args(root[1], f.and, 2, defs) else {
-            continue;
-        };
-        for (base, mask) in [(masked[0], masked[1]), (masked[1], masked[0])] {
-            if base == cmp[0] && splat(mask, f, defs) == Some(low) {
-                return Some(vec![root[0], base, root[2]]);
-            }
+        if f.bytes == bytes
+            && bits <= f.bits
+            && let Some(base) = bounded_arm(root[2], root[1], f, defs)
+        {
+            return Some(vec![root[0], base, root[2]]);
         }
     }
     None
@@ -275,6 +281,13 @@ fn fold(
     for f in families {
         if ![f.and, f.or, f.xor, f.add, f.sub].contains(op) {
             continue;
+        }
+        if *op == f.and {
+            for (mask, value) in [(a, b), (b, a)] {
+                if let Some(base) = bounded_arm(mask, value, *f, defs) {
+                    return Some(vec![intrinsic(*dest, *op, vec![mask, base])]);
+                }
+            }
         }
         if a == b {
             if *op == f.and || *op == f.or {

@@ -494,3 +494,43 @@ fn observable_fp_environment_keeps_producers_and_register_image_consumers() {
         format!("{before:?}")
     );
 }
+
+#[test]
+fn unsigned_contiguous_range_proves_bitwise_selected_arms_too() {
+    for f in families() {
+        for (predicate, bound) in [(5, 8), (6, 7)] {
+            for swapped in [false, true] {
+                let mut source =
+                    bounded_source(f, IntrinsicOp::VecBlendvI8x16, predicate, bound, 7);
+                source[4] = intrinsic(
+                    Value(8),
+                    f.and,
+                    if swapped {
+                        vec![v(7), v(6)]
+                    } else {
+                        vec![v(6), v(7)]
+                    },
+                );
+                check(source, f, f.bits, f.bytes);
+            }
+        }
+        for (predicate, bound, mask) in [(1, 8, 7), (5, 9, 7), (5, 8, 5), (6, 8, 7)] {
+            let mut source = bounded_source(f, IntrinsicOp::VecBlendvI8x16, predicate, bound, mask);
+            source[4] = intrinsic(Value(8), f.and, vec![v(6), v(7)]);
+            let defs = source[..4]
+                .iter()
+                .map(|i| (i.dest().unwrap(), i.clone()))
+                .collect();
+            assert!(
+                fold(
+                    &source[4],
+                    &defs,
+                    &FxHashMap::default(),
+                    &families(),
+                    Value(64)
+                )
+                .is_none()
+            );
+        }
+    }
+}
