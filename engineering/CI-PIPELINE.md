@@ -118,24 +118,55 @@ lane, including the one on the critical path.
 | a `run:` body is shell, not YAML | `scripts/check_ci_workflow_shell.py` |
 | the compiler each lane tests is the compiler `build` produced | `target/ci-build.commit` + `sha256sum -c` in every consumer |
 
-## Where the wall clock goes now
+## Measured result
 
-Expected shape of a warm-cache run (provisioning restored from the bundle):
+First green run of this shape (run 39699821550, 14 jobs, 2026-10-22):
+**779 s wall clock** (12 m 59 s) and **3 584 s** of job time, against 1 593 s
+and 4 613 s before. Provisioning dropped from 80–205 s per lane to **7–11 s**
+in all nine lanes that provision.
 
-```
-build ........................ ~165 s  -> the wave every consumer waits on
-  unit ....................... ~225 s
-  debug ...................... ~430 s
-  corpus ..................... ~170 s
-  frontend ................... ~290 s
-  codegen .................... ~260 s   (output gate now four-wide)
-  backend .................... ~110 s
-  backend-contracts-a/b ...... ~400 s   (half of the old 703 s each)
-  benchmark .................. ~600 s   <- critical path
-```
+| lane | measured |
+| --- | --- |
+| Fast local contracts (shard b) | 527 s ← imbalanced, see below |
+| Frontend and ABI contracts | 519 s |
+| Complete benchmark corpus | 519 s |
+| Codegen and runtime contracts | 418 s |
+| Assertion-enabled units and corpus | 369 s |
+| Unit tests (release-profile flags) | 286 s |
+| Fast local contracts (shard a) | 234 s |
+| Assembler and linker contracts | 228 s |
+| Build and package compiler | 183 s |
+| SSA regression corpus | 137 s |
+| Clippy / MSRV / ICX / Test Suite | 70 / 49 / 41 / 4 s |
 
-The remaining lever is the benchmark corpus (~573 s of measurement). Splitting
-it requires a merge step that preserves per-shard provenance and re-renders the
-markdown summary from the union, plus a contract test that the union equals the
-registry. That is a change to the evidence format, so it belongs in its own PR
-with its own review, not in a pipeline restructure.
+### The split exposed a bad measurement, which is the point
+
+The first partition was 234 s / 527 s on the hosted runner, not the 191 s /
+191 s the local cost table predicted. The cause was one entry:
+`check_peephole_whitespace.sh` had been timed once in a workspace whose working
+directory had been removed under it, so it recorded 0.01 s instead of its real
+**337 s** — 48 % of the whole suite in a single gate, placed essentially at
+random. Re-timing it and re-running the LPT gives **359 s / 359 s** (the local
+total, 718 s, matches the hosted single-step 703 s to within 2 %, which is why
+the local table is a usable proxy at all).
+
+The lesson is recorded here rather than in a commit message: a cost table is
+evidence, and evidence taken from a broken environment is worse than no
+evidence. Every re-balance should re-time the whole set, not just the gates
+that look heavy.
+
+## Where the wall clock goes next
+
+Three lanes now sit within 8 s of each other at ~520 s: `frontend`, the
+benchmark corpus, and (before the re-balance above) shard b. With the shards at
+~360 s, the wall clock is `frontend` and the benchmark corpus, both ~520 s
+after a ~183 s build wave.
+
+* `frontend` is 112 steps of small ABI and diagnostic gates — no single gate
+  dominates, so it needs the same treatment the contract suite just got
+  (measure, then split), not a single fix.
+* The benchmark corpus (~573 s of measurement) is the other half. Splitting it
+  requires a merge step that preserves per-shard provenance and re-renders the
+  markdown summary from the union, plus a contract test that the union equals
+  the registry. That is a change to the evidence format, so it belongs in its
+  own PR with its own review.
