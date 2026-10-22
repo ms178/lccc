@@ -230,14 +230,26 @@ def main():
         #
         #   1. WITNESS: a shape where the steal does fire must change codegen
         #      when the knob is set -- the mechanism is wired, reachable and
-        #      disableable.  `cmp_replay_acc_nohome.c` steals 1 web at -O2
-        #      (vid 253 -> reg 1, cost 3 against a hot count of 20), measured
-        #      on the from-source fastbuild of dfa8830.
+        #      disableable.  `cmp_replay_far.c`'s `main` steals 1 web at -O2
+        #      (vid 217 -> reg 1, evicting vid 196, cost 12 against a hot
+        #      count of 310), measured on the from-source fastbuild of 5e7a31d2.
+        #
+        #      The previous witness, `cmp_replay_acc_nohome.c`, was retired
+        #      DELIBERATELY, and the reason matters: its web is still stolen
+        #      (vid 253 -> reg 1, evicting vid 9, cost 3 against a hot count of
+        #      20), so the mechanism has not stopped firing on it.  What
+        #      changed is the code: the allocator now reaches the same home
+        #      without the steal, so the knob no longer changes that file's
+        #      assembly.  A witness must change the CODE, not merely the
+        #      decision, so it was replaced rather than re-pinned as
+        #      "identical" (which would freeze an accident of the current
+        #      allocator).
         #   2. PROTECTED: the loop-web fixture must be byte-identical with the
         #      knob off and on -- the policy refuses to evict a register that
         #      co-holds loop state.  If that flips, the protection regressed
         #      and this pin must be re-baselined deliberately, not silently.
-        witness = ROOT / "tests/regression/cmp_replay_acc_nohome.c"
+        witness = ROOT / "tests/regression/cmp_replay_far.c"
+        witness_fn = "main"
         for disabled in [False, True]:
             settings = env | ({"CCC_NO_HOT_WEB_STEAL": "1"} if disabled else {})
             for source, stem in ((hot, "hot"), (witness, "witness")):
@@ -246,12 +258,14 @@ def main():
                      "-o", str(p / f"{stem}-{disabled}.s")],
                     env=settings,
                 )
-        if body((p / "witness-False.s").read_text(), "io_ring_buffers_peek") == body(
-            (p / "witness-True.s").read_text(), "io_ring_buffers_peek"
+        if body((p / "witness-False.s").read_text(), witness_fn) == body(
+            (p / "witness-True.s").read_text(), witness_fn
         ):
             raise ValueError(
-                "hot web: enable/disable does not change the witness "
-                "(cmp_replay_acc_nohome.ring_peek)"
+                f"hot web: enable/disable does not change the witness "
+                f"({witness.name}:{witness_fn}); the steal still needs a shape "
+                f"whose assembly it actually changes -- re-baseline this pin "
+                f"deliberately (see the comment above), do not delete it"
             )
         if (p / "hot-False.s").read_text() != (p / "hot-True.s").read_text():
             raise ValueError(
