@@ -987,29 +987,8 @@ fn coalesce_one_forwarding_phi_copy(func: &mut IrFunction) -> usize {
         return 0;
     }
     let cfg = crate::ir::analysis::CfgAnalysis::build(func);
-    let dominates = |a: usize, mut b: usize| -> bool {
-        if a >= n_blocks || b >= n_blocks {
-            return false;
-        }
-        // `idom` uses usize::MAX for CFG-dead blocks; never feed the sentinel
-        // back into the walk (a dead block has no executable path).
-        if cfg.idom.get(b).is_none_or(|&d| d == usize::MAX) && b != a {
-            return false;
-        }
-        loop {
-            if b == a {
-                return true;
-            }
-            match cfg.idom.get(b).copied() {
-                Some(d) if d != usize::MAX && d != b && d < n_blocks => b = d,
-                _ => return false,
-            }
-        }
-    };
     let mut defs_of: Vec<Vec<(usize, usize)>> = vec![Vec::new(); max_id + 1];
     let mut use_count = vec![0u32; max_id + 1];
-    let mut reads_in_block: Vec<crate::common::fx_hash::FxHashSet<u32>> =
-        vec![crate::common::fx_hash::FxHashSet::default(); n_blocks];
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             if let Some(d) = inst.dest()
@@ -1020,7 +999,6 @@ fn coalesce_one_forwarding_phi_copy(func: &mut IrFunction) -> usize {
             let mut note = |v: u32| {
                 if (v as usize) <= max_id {
                     use_count[v as usize] += 1;
-                    reads_in_block[bi].insert(v);
                 }
             };
             if let Instruction::Copy {
@@ -1045,7 +1023,6 @@ fn coalesce_one_forwarding_phi_copy(func: &mut IrFunction) -> usize {
                 && (v.0 as usize) <= max_id
             {
                 use_count[v.0 as usize] += 1;
-                reads_in_block[bi].insert(v.0);
             }
         });
     }
@@ -1088,26 +1065,6 @@ fn coalesce_one_forwarding_phi_copy(func: &mut IrFunction) -> usize {
             {
                 continue;
             }
-            if false {
-                eprintln!(
-                    "[EDGEFOLD] d=130 s={} J={} ii={} reads_d_in_J={:?} doms={:?} reads_in_def=[{:?}]",
-                    sid,
-                    ji,
-                    ii,
-                    block.instructions[..ii]
-                        .iter()
-                        .map(|i| format!("{:?}", i))
-                        .collect::<Vec<_>>(),
-                    s_defs
-                        .iter()
-                        .map(|&(sb, _)| (sb, dominates(ji, sb)))
-                        .collect::<Vec<_>>(),
-                    s_defs
-                        .iter()
-                        .map(|&(sb, _)| reads_in_block[sb].contains(&d))
-                        .collect::<Vec<_>>()
-                );
-            }
             let mut ok = true;
             for &(sb, si) in s_defs {
                 // `s`'s definition must be a copy in a predecessor of J that
@@ -1125,14 +1082,21 @@ fn coalesce_one_forwarding_phi_copy(func: &mut IrFunction) -> usize {
                     break;
                 }
             }
+            // Every predecessor of J must define `s`, exactly once.  The copy
+            // in J writes `d` on *every* path into J.  If some predecessor P
+            // does not define `s`, renaming leaves `d` holding its incoming
+            // value on the path through P, which is not what `d = Copy(s)`
+            // produced -- the fold would change the value J observes.  Each
+            // definition checked above is in a distinct predecessor of J with
+            // J as its only successor, so equal counts mean equal sets.
+            if ok {
+                let mut preds: Vec<u32> = cfg.preds.row(ji).iter().copied().collect();
+                preds.sort_unstable();
+                preds.dedup();
+                ok = s_defs.len() == preds.len();
+            }
             if !ok {
                 continue;
-            }
-            if std::env::var_os("CCC_DEBUG_EDGEFOLD").is_some() {
-                eprintln!(
-                    "[PHICOAL] fn={} J={} ii={} d={} s={} defs_s={:?}",
-                    func.name, ji, ii, d, sid, s_defs
-                );
             }
             plan.push((ji, ii, *dest, sid));
         }
@@ -1564,6 +1528,109 @@ mod tests {
                     Instruction::Copy { dest, .. } if dest.0 == 12
                 )),
             "the join home must be dead"
+        );
+    }
+
+    /// Negative control for the predecessor-coverage rule.
+    ///
+    /// The merge `J` here has **three** predecessors but only two of them
+    /// define `s`.  `d = Copy(s)` in `J` nevertheless writes `d` on *every*
+    /// path into `J`, including the one through block 5 that never defines
+    /// `s`.  Renaming `s`'s two definitions to `d` and deleting the copy would
+    /// leave `d` holding its incoming value on the 5 -> J path -- a different
+    /// program.  The fold must refuse.
+    ///
+    /// Without the `s_defs.len() == preds.len()` check this shape folded.
+    #[test]
+    fn forwarding_phi_fold_refuses_a_predecessor_that_does_not_define_the_join_home() {
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let cp = |d: u32, src: Operand| Instruction::Copy {
+            dest: Value(d),
+            src,
+        };
+        let blk = |n: u32, inst: Vec<Instruction>, term: Terminator| BasicBlock {
+            label: BlockId(n),
+            instructions: inst,
+            terminator: term,
+            source_spans: Vec::new(),
+        };
+        // 0: entry, d(10) <- 0 ; -> 1 or -> 5
+        func.blocks.push(blk(
+            0,
+            vec![
+                cp(10, Operand::Const(IrConst::I32(0))),
+                cp(13, Operand::Const(IrConst::I32(1))),
+            ],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(13)),
+                true_label: BlockId(1),
+                false_label: BlockId(5),
+            },
+        ));
+        // 1: header, branches to the two arms
+        func.blocks.push(blk(
+            1,
+            vec![cp(11, Operand::Const(IrConst::I32(1)))],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(11)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+        ));
+        // 2 / 3: the two arms, each defining the join home s(12)
+        func.blocks.push(blk(
+            2,
+            vec![cp(12, Operand::Const(IrConst::I32(7)))],
+            Terminator::Branch(BlockId(4)),
+        ));
+        func.blocks.push(blk(
+            3,
+            vec![cp(12, Operand::Const(IrConst::I32(9)))],
+            Terminator::Branch(BlockId(4)),
+        ));
+        // 4: merge J -- d(10) = Copy(s(12))
+        func.blocks.push(blk(
+            4,
+            vec![cp(10, Operand::Value(Value(12)))],
+            Terminator::Branch(BlockId(6)),
+        ));
+        // 5: a third predecessor of J that never defines s.
+        func.blocks
+            .push(blk(5, vec![], Terminator::Branch(BlockId(4))));
+        func.blocks.push(blk(
+            6,
+            vec![],
+            Terminator::Return(Some(Operand::Value(Value(10)))),
+        ));
+
+        // `Instruction` is not `PartialEq`, so compare a structural
+        // fingerprint: per block, the destination id of every instruction.
+        let shape = |f: &IrFunction| -> Vec<Vec<Option<u32>>> {
+            f.blocks
+                .iter()
+                .map(|b| {
+                    b.instructions
+                        .iter()
+                        .map(|i| i.dest().map(|v| v.0))
+                        .collect()
+                })
+                .collect()
+        };
+        let before = shape(&func);
+        let n = coalesce_forwarding_phi_copies(&mut func);
+        assert_eq!(n, 0, "the fold must refuse an uncovered predecessor");
+        assert_eq!(
+            before,
+            shape(&func),
+            "no instruction may be rewritten or removed"
+        );
+        // The join home must survive: renaming `s` here is the miscompile.
+        assert!(
+            func.blocks[2].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Copy { dest, .. } if dest.0 == 12
+            )),
+            "arm 2 must still define the join home s"
         );
     }
 
