@@ -5,11 +5,26 @@ No timings are compared. Every registered variant retains its own macro flags;
 reference failures, signals, timeouts and empty selections are failures, never
 skips. Only the recursion-only TCE witness is bounded at O0/O1: ten million
 unoptimized stack frames are not a meaningful correctness comparison.
+
+Concurrency
+-----------
+``--jobs N`` runs up to N ``(case, level)`` units at once.  Nothing in this
+gate is timed -- every unit compiles the oracle's binary and the candidate's,
+runs both, and compares bytes -- so the units are independent by construction
+and the verdict is bit-identical to a serial run.  It exists because the gate
+took 338 s of hosted CI on run 39686387347, all of it serial; the runner has
+four cores and each unit spends nearly all of its wall clock in a child
+process.  Diagnostics are ordered by case and level, never by completion, so
+two runs print the same log.  ``--list`` prints the complete case set without
+touching a compiler.
 """
 from __future__ import annotations
 
+import argparse
+import concurrent.futures
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import sys
@@ -54,14 +69,54 @@ def command(argv, *, timeout=60):
     return result.stdout
 
 
+def check_unit(item, level, source, binary_prefix, gcc, lccc, include):
+    """One (case, level): compile oracle and candidate, run both, compare bytes.
+
+    Returns None on agreement and a diagnostic string on any disagreement.
+    Every failure mode is a string, including a build failure or a signal, so
+    the caller counts them exactly like the serial implementation did.
+    """
+    outputs = []
+    try:
+        for name, compiler in (("oracle", gcc), ("candidate", lccc)):
+            binary = Path(f"{binary_prefix}-{name}")
+            binary.unlink(missing_ok=True)
+            flags = case_flags(item, level)
+            headers = ["-I" + include] if name == "candidate" else []
+            command([compiler, *flags, *headers, str(source), "-o", str(binary), "-lm"])
+            outputs.append(command([str(binary)], timeout=300))
+            binary.unlink(missing_ok=True)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return f"{item.name} {level}: {error}"
+    if outputs[0] != outputs[1]:
+        return (f"{item.name} {level}: stdout bytes differ: "
+                f"oracle={outputs[0][:200]!r}, candidate={outputs[1][:200]!r}")
+    return None
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if len(argv) > 1:
-        raise ValueError("usage: check_benchmark_outputs.sh [substring-filter]")
-    selection = argv[0] if argv else ""
-    cases = [item for item in all_cases() if selection in item.name]
+    parser = argparse.ArgumentParser(
+        description="byte-exact benchmark output gate",
+        epilog="positional FILTER is a substring of the case name")
+    parser.add_argument("filter", nargs="?", default="",
+                        help="substring filter on the benchmark name")
+    parser.add_argument("--jobs", type=int, default=1, metavar="N",
+                        help="run N cases concurrently (default %(default)s; "
+                             "the gate compares bytes, never timings)")
+    parser.add_argument("--list", action="store_true",
+                        help="print every case name and exit (no compiler)")
+    args = parser.parse_args(argv)
+    if args.jobs < 1:
+        raise ValueError(f"--jobs must be >= 1, got {args.jobs}")
+    if args.list:
+        for item in all_cases() if not args.filter else [
+                item for item in all_cases() if args.filter in item.name]:
+            print(item.name)
+        return 0
+    cases = [item for item in all_cases() if args.filter in item.name]
     if not cases:
-        raise ValueError(f"no benchmark cases matched filter {selection!r}")
+        raise ValueError(f"no benchmark cases matched filter {args.filter!r}")
     levels = shlex.split(os.environ.get("OPT", "-O0 -O1 -O2 -O3"))
     if not levels or any(level not in ("-O0", "-O1", "-O2", "-O3", "-Os", "-Oz") for level in levels):
         raise ValueError("OPT must contain explicit supported optimization levels")
@@ -70,30 +125,38 @@ def main(argv=None):
     include = command([gcc, "-print-file-name=include"]).decode().strip()
     if not include or not Path(include).is_dir():
         raise ValueError(f"invalid builtin header directory from {gcc}: {include!r}")
+    # Resolve every source BEFORE any work starts: a missing registered source
+    # is a registry defect, not a per-case failure, and must abort the gate.
+    sources = {}
+    for item in cases:
+        source = bench.source_for(item)
+        if source is None:
+            raise ValueError(f"missing registered benchmark source: {item.name}")
+        sources[item.name] = source
+    # Ordered (case, level) units: the same list a serial run walks, so the
+    # parallel and serial gates cover exactly the same pairs.
+    work = [(item, level) for item in cases for level in levels]
     passed = failed = 0
+    failures = []
     with tempfile.TemporaryDirectory(prefix="lccc-benchcheck-") as temporary:
         directory = Path(temporary)
-        for item in cases:
-            source = bench.source_for(item)
-            if source is None:
-                raise ValueError(f"missing registered benchmark source: {item.name}")
-            for level in levels:
-                try:
-                    outputs = []
-                    for name, cc in (("oracle", gcc), ("candidate", lccc)):
-                        binary = directory / name
-                        binary.unlink(missing_ok=True)
-                        flags = case_flags(item, level)
-                        headers = ["-I" + include] if name == "candidate" else []
-                        command([cc, *flags, *headers, str(source), "-o", str(binary), "-lm"])
-                        outputs.append(command([str(binary)], timeout=300))
-                    if outputs[0] != outputs[1]:
-                        raise ValueError(f"stdout bytes differ: oracle={outputs[0][:200]!r}, candidate={outputs[1][:200]!r}")
-                    passed += 1
-                except (OSError, ValueError, subprocess.TimeoutExpired) as error:
-                    failed += 1
-                    print(f"FAIL  {item.name} {level}: {error}", flush=True)
-    print(f"benchmark output gate: PASS={passed} FAIL={failed} SKIP=0")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futures = [
+                pool.submit(check_unit, item, level, sources[item.name],
+                            directory / f"unit-{index}", gcc, lccc, include)
+                for index, (item, level) in enumerate(work)
+            ]
+            results = [future.result() for future in futures]
+    for diagnostic in results:
+        if diagnostic is None:
+            passed += 1
+        else:
+            failed += 1
+            failures.append(diagnostic)
+    for diagnostic in failures:
+        print(f"FAIL  {diagnostic}", flush=True)
+    scope = f" jobs={args.jobs}" if args.jobs != 1 else ""
+    print(f"benchmark output gate: PASS={passed} FAIL={failed} SKIP=0{scope}")
     return int(bool(failed))
 
 

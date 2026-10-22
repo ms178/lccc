@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -15,36 +16,44 @@ gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
 
 
-class BenchmarkOutputGateTests(unittest.TestCase):
+class GateHarness(unittest.TestCase):
+    """Fixture helpers only: no test methods, so it adds no test cases."""
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="benchmark-gate-contract-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
 
-    def compiler(self, name, output=b"correct\n", status=0, build_status=0):
+    def compiler(self, name, output=b"correct\n", status=0, build_status=0, delay=0.0):
         executable = self.root / name
         program = ("#!/usr/bin/env python3\nimport os, resource, sys\n"
                    "resource.setrlimit(resource.RLIMIT_CORE, (0, 0))\n"
                    f"sys.stdout.buffer.write({output!r})\n"
                    + ("os.kill(os.getpid(), 11)\n" if status == -11 else f"sys.exit({status})\n"))
         executable.write_text(
-            "#!/usr/bin/env python3\nfrom pathlib import Path\nimport sys\n"
+            "#!/usr/bin/env python3\nfrom pathlib import Path\nimport sys, time\n"
             f"if '-print-file-name=include' in sys.argv: print({str(self.root)!r}); sys.exit(0)\n"
             f"if {build_status}: sys.exit({build_status})\n"
-            "out = Path(sys.argv[sys.argv.index('-o') + 1])\n"
+            + (f"time.sleep({delay})\n" if delay else "")
+            + "out = Path(sys.argv[sys.argv.index('-o') + 1])\n"
             f"out.write_text({program!r}); out.chmod(0o755)\n"
         )
         executable.chmod(0o755)
         return str(executable)
 
-    def check(self, gcc=None, lccc=None, selection="byte_load_reassembly", good=False, opt="-O2"):
+    def check(self, gcc=None, lccc=None, selection="byte_load_reassembly", good=False, opt="-O2",
+              jobs=None, extra=()):
+        argv = ["bash", str(ENTRY), selection, *extra]
+        if jobs is not None:
+            argv += ["--jobs", str(jobs)]
         env = dict(os.environ, GCC_BIN=gcc or self.compiler("gcc"),
                    LCCC_BIN=lccc or self.compiler("lccc"), OPT=opt, LCCC_REPO=str(ROOT))
-        result = subprocess.run(["bash", str(ENTRY), selection], env=env,
-                                capture_output=True, text=True, timeout=20)
+        result = subprocess.run(argv, env=env,
+                                capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode == 0, good, result.stdout + result.stderr)
         return result
 
+class BenchmarkOutputGateTests(GateHarness):
     def test_equal_successful_outputs_pass(self):
         self.check(good=True)
 
@@ -116,6 +125,80 @@ class BenchmarkOutputGateTests(unittest.TestCase):
         for level in ("-O0", "-O1"):
             self.assertIn("-DTCE_N=4096", gate.case_flags(item, level))
         self.assertNotIn("-DTCE_N=4096", gate.case_flags(item, "-O2"))
+
+
+class BenchmarkOutputGateConcurrencyTests(GateHarness):
+    """`--jobs` must change the schedule, never the verdict.
+
+    The gate compares bytes, so a parallel unit is independent by construction;
+    what has to be pinned is that the *verdict* and the diagnostic text do not
+    depend on the schedule, and that the pool is actually used (a `--jobs` flag
+    that quietly ran serially would be a 4x cost for nothing).
+    """
+
+    SLOW = ("tce_sum", "byte_load_reassembly", "lz4_match_extend")
+
+    def test_parallel_and_serial_agree_on_success(self):
+        serial = self.check(good=True, jobs=1)
+        parallel = self.check(good=True, jobs=4)
+        self.assertEqual(serial.stdout.strip().split(" jobs=")[0],
+                         parallel.stdout.strip().split(" jobs=")[0])
+        self.assertIn("jobs=4", parallel.stdout)
+
+    def test_parallel_and_serial_agree_on_failure(self):
+        broken = self.compiler("lccc", output=b"wrong\n")
+        serial = self.check(lccc=broken, jobs=1)
+        parallel = self.check(lccc=broken, jobs=4)
+        self.assertIn("FAIL", parallel.stdout)
+        self.assertEqual(serial.stdout.strip(), parallel.stdout.replace(" jobs=4", "").strip())
+        self.assertIn("byte_load_reassembly", parallel.stdout)
+
+    def test_failure_diagnostics_follow_the_requested_order_not_completion(self):
+        """Eight workers, four failures: the log must not depend on the schedule.
+
+        Diagnostics are emitted in `(case, level)` order -- case order from the
+        registry, level order from OPT -- which is exactly what a serial run
+        prints.  Completion order would make the same failure look different on
+        every run and break the annotation diffing downstream.
+        """
+        levels = ["-O3", "-O1", "-O2", "-O0"]
+        result = self.check(lccc=self.compiler("lccc", output=b"wrong\n"),
+                            opt=" ".join(levels), jobs=8)
+        lines = [line for line in result.stdout.splitlines() if line.startswith("FAIL")]
+        self.assertEqual(len(lines), len(levels), result.stdout)
+        self.assertEqual([line.split()[2].rstrip(":") for line in lines], levels)
+        self.assertEqual({line.split()[1] for line in lines}, {"byte_load_reassembly"})
+
+    def test_the_pool_overlaps_units(self):
+        """Six 0.3 s builds: serial >= 1.8 s, four-wide well under it."""
+        slow = self.compiler("gcc", delay=0.3)
+        slow_lccc = self.compiler("lccc", delay=0.3)
+        # Four optimisation levels of one case = four independent units, each
+        # building twice: 2.4 s of sleeping to schedule.
+        levels = "-O0 -O1 -O2 -O3"
+        started = time.monotonic()
+        self.check(gcc=slow, lccc=slow_lccc, good=True, jobs=4, opt=levels)
+        parallel = time.monotonic() - started
+        started = time.monotonic()
+        self.check(gcc=slow, lccc=slow_lccc, good=True, jobs=1, opt=levels)
+        serial = time.monotonic() - started
+        self.assertLess(parallel, serial * 0.75,
+                        f"parallel={parallel:.2f}s serial={serial:.2f}s")
+
+    def test_zero_or_negative_jobs_is_refused(self):
+        for jobs in (0, -1):
+            result = self.check(jobs=jobs)
+            self.assertIn("--jobs must be >= 1", result.stderr)
+
+    def test_list_needs_no_compiler_at_all(self):
+        env = dict(os.environ, GCC_BIN="/nonexistent/gcc", LCCC_BIN="/nonexistent/lccc",
+                   LCCC_REPO=str(ROOT))
+        result = subprocess.run(["bash", str(ENTRY), "--list"], env=env,
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        names = result.stdout.split()
+        self.assertEqual(len(names), len(gate.all_cases()))
+        self.assertIn("volatile_reduce", names)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,9 @@ concurrency:
   cancel-in-progress: true
 jobs:
   build:
-    name: Build once and unit tests
+    # The name no longer promises the unit tests: they moved to `unit` so this
+    # lane ends when the artifact is published, not 161 s later.
+    name: Build and package compiler
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -37,27 +39,21 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    - name: Install GCC 16 and i686 C runtime/development files
+    # One content-addressed bundle per (runner image, installer) pair, built by
+    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
+    # apt in six lanes and 125 s in a seventh for the identical package set;
+    # restoring the bundle is a few seconds and it is byte-identical, because
+    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
+    # qemu-i386 before a lane is allowed to use it.
+    - name: Cache the provisioned oracle toolchain
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-toolchain
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+    - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
-      run: |
-        bash scripts/ci_install_gcc16.sh --multilib
-        sudo apt-get install -y --no-install-recommends qemu-user
-    - name: Install differential linker oracles
-      run: |
-        # The pair comes from the runner's own archive, and two jobs on one
-        # commit have died here on a transient index window while a sibling
-        # installed the same packages seconds later.  Retry the pair as a
-        # unit; the third failure still exits non-zero with the log.
-        for attempt in 1 2 3; do
-          if sudo apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none &&
-             sudo apt-get install -y --no-install-recommends mold lld; then
-            exit 0
-          fi
-          echo "linker-oracle install failed (attempt $attempt/3); retrying" >&2
-          sleep $(( attempt * 20 ))
-        done
-        exit 1
+      run: bash scripts/ci_provision_toolchain.sh --multilib
     - name: Verify GCC 16 C23 oracle
       run: |
         test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16
@@ -82,8 +78,6 @@ jobs:
         key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
     - name: Verify retained evidence hashes
       run: python3 scripts/verify_evidence_hashes.py
-    - name: Install gate parsers
-      run: sudo apt-get install -y --no-install-recommends python3-yaml
     - name: Build
       run: |
         set +e
@@ -128,17 +122,6 @@ jobs:
         PY
         fi
         exit "$build_status"
-    - name: Run tests
-      env:
-        CARGO_BUILD_JOBS: '2'
-      run: |
-        set -euo pipefail
-        export RUSTFLAGS="$(cat target/lccc-rustflags)"
-        python3 scripts/test_ci_oracle_diagnostics.py
-        python3 scripts/ci_test_report.py --self-test
-        python3 scripts/ci_test_report.py -- cargo test --profile fastbuild --all-targets --locked -j 2
-        python3 tests/regression/check_avx512_scalar_witness.py --self-test
-        python3 tests/regression/check_avx512_scalar_witness.py
     - name: Package immutable compiler executables
       run: |
         set -euo pipefail
@@ -152,6 +135,88 @@ jobs:
         path: lccc-fast.tar.gz
         if-no-files-found: error
         retention-days: 3
+  # The test suite used to run inside `build`, which made every consumer lane
+  # wait for it: the artifact existed after 133 s of compiling, but nothing
+  # downstream could start until the 161 s test step finished.  Splitting the
+  # suite out costs one extra compile (~135 s of runner time) and returns
+  # ~160 s to each of the five lanes that wait on `build` -- and to the
+  # `benchmark` lane, which was the critical path.
+  unit:
+    name: Unit tests (release-profile flags)
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_FASTBUILD_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - name: Enable temporary CI swap file
+      run: bash scripts/ci_enable_swap.sh
+    - name: Compute weekly apt cache key
+      id: apt-epoch
+      run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+    - name: Cache GCC 16 package downloads
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-apt
+        key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
+        restore-keys: |
+          lccc-apt-debs-v1-${{ runner.os }}-
+    - name: Cache the provisioned oracle toolchain
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-toolchain
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+    - name: Provision oracle toolchain (cached bundle, else apt)
+      run: bash scripts/ci_provision_toolchain.sh --multilib
+    - name: Select GCC 16 for legacy oracle invocations
+      run: |
+        mkdir -p "$RUNNER_TEMP/lccc-oracles"
+        ln -s "$(command -v gcc-16)" "$RUNNER_TEMP/lccc-oracles/gcc"
+        ln -s "$(command -v g++-16)" "$RUNNER_TEMP/lccc-oracles/g++"
+        echo "$RUNNER_TEMP/lccc-oracles" >> "$GITHUB_PATH"
+    - name: Cache cargo registry
+      uses: actions/cache@v6
+      with:
+        path: ~/.cargo/registry
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+    - name: Cache cargo index
+      uses: actions/cache@v6
+      with:
+        path: ~/.cargo/git
+        key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+    - uses: actions/download-artifact@v8
+      with:
+        name: lccc-fast-${{ github.sha }}
+    - name: Verify exact compiler build
+      run: |
+        set -euo pipefail
+        tar -xzf lccc-fast.tar.gz
+        test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
+        sha256sum -c target/ci-build.sha256
+    - name: Run tests
+      env:
+        CARGO_BUILD_JOBS: '2'
+      run: |
+        set -euo pipefail
+        # The build lane's resolved rustc flags: RUSTFLAGS is part of cargo's
+        # fingerprint, so the test binaries get the same codegen as the shipped
+        # compiler instead of a second, subtly different configuration.
+        export RUSTFLAGS="$(cat target/lccc-rustflags)"
+        python3 scripts/test_ci_oracle_diagnostics.py
+        python3 scripts/ci_test_report.py --self-test
+        python3 scripts/ci_test_report.py -- cargo test --profile fastbuild --all-targets --locked -j 2
+        python3 tests/regression/check_avx512_scalar_witness.py --self-test
+        python3 tests/regression/check_avx512_scalar_witness.py
   debug:
     name: Assertion-enabled units and corpus
     runs-on: ubuntu-24.04
@@ -181,27 +246,21 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    - name: Install GCC 16 and i686 C runtime/development files
+    # One content-addressed bundle per (runner image, installer) pair, built by
+    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
+    # apt in six lanes and 125 s in a seventh for the identical package set;
+    # restoring the bundle is a few seconds and it is byte-identical, because
+    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
+    # qemu-i386 before a lane is allowed to use it.
+    - name: Cache the provisioned oracle toolchain
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-toolchain
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+    - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
-      run: |
-        bash scripts/ci_install_gcc16.sh --multilib
-        sudo apt-get install -y --no-install-recommends qemu-user
-    - name: Install differential linker oracles
-      run: |
-        # The pair comes from the runner's own archive, and two jobs on one
-        # commit have died here on a transient index window while a sibling
-        # installed the same packages seconds later.  Retry the pair as a
-        # unit; the third failure still exits non-zero with the log.
-        for attempt in 1 2 3; do
-          if sudo apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none &&
-             sudo apt-get install -y --no-install-recommends mold lld; then
-            exit 0
-          fi
-          echo "linker-oracle install failed (attempt $attempt/3); retrying" >&2
-          sleep $(( attempt * 20 ))
-        done
-        exit 1
+      run: bash scripts/ci_provision_toolchain.sh --multilib
     - name: Verify GCC 16 C23 oracle
       run: |
         test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16
@@ -224,8 +283,6 @@ jobs:
       with:
         path: ~/.cargo/git
         key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-    - name: Install gate parsers
-      run: sudo apt-get install -y --no-install-recommends python3-yaml
     - name: Run tests (debug-assertions on)
       env:
         CARGO_BUILD_JOBS: '2'
@@ -286,27 +343,21 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    - name: Install GCC 16 and i686 C runtime/development files
+    # One content-addressed bundle per (runner image, installer) pair, built by
+    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
+    # apt in six lanes and 125 s in a seventh for the identical package set;
+    # restoring the bundle is a few seconds and it is byte-identical, because
+    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
+    # qemu-i386 before a lane is allowed to use it.
+    - name: Cache the provisioned oracle toolchain
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-toolchain
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+    - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
-      run: |
-        bash scripts/ci_install_gcc16.sh --multilib
-        sudo apt-get install -y --no-install-recommends qemu-user
-    - name: Install differential linker oracles
-      run: |
-        # The pair comes from the runner's own archive, and two jobs on one
-        # commit have died here on a transient index window while a sibling
-        # installed the same packages seconds later.  Retry the pair as a
-        # unit; the third failure still exits non-zero with the log.
-        for attempt in 1 2 3; do
-          if sudo apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none &&
-             sudo apt-get install -y --no-install-recommends mold lld; then
-            exit 0
-          fi
-          echo "linker-oracle install failed (attempt $attempt/3); retrying" >&2
-          sleep $(( attempt * 20 ))
-        done
-        exit 1
+      run: bash scripts/ci_provision_toolchain.sh --multilib
     - name: Verify GCC 16 C23 oracle
       run: |
         test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16
@@ -329,8 +380,6 @@ jobs:
       with:
         path: ~/.cargo/git
         key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-    - name: Install gate parsers
-      run: sudo apt-get install -y --no-install-recommends python3-yaml
     - uses: actions/download-artifact@v8
       with:
         name: lccc-fast-${{ github.sha }}
@@ -446,29 +495,21 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    - name: Install GCC 16 and i686 C runtime/development files
+    # One content-addressed bundle per (runner image, installer) pair, built by
+    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
+    # apt in six lanes and 125 s in a seventh for the identical package set;
+    # restoring the bundle is a few seconds and it is byte-identical, because
+    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
+    # qemu-i386 before a lane is allowed to use it.
+    - name: Cache the provisioned oracle toolchain
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-toolchain
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+    - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
-      # The provisioning helper publishes its own bounded `::error` annotation
-      # on failure, so every lane gets the diagnosis without a capture wrapper.
-      run: |
-        bash scripts/ci_install_gcc16.sh --multilib
-        sudo apt-get install -y --no-install-recommends qemu-user
-    - name: Install differential linker oracles
-      run: |
-        # The pair comes from the runner's own archive, and two jobs on one
-        # commit have died here on a transient index window while a sibling
-        # installed the same packages seconds later.  Retry the pair as a
-        # unit; the third failure still exits non-zero with the log.
-        for attempt in 1 2 3; do
-          if sudo apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none &&
-             sudo apt-get install -y --no-install-recommends mold lld; then
-            exit 0
-          fi
-          echo "linker-oracle install failed (attempt $attempt/3); retrying" >&2
-          sleep $(( attempt * 20 ))
-        done
-        exit 1
+      run: bash scripts/ci_provision_toolchain.sh --multilib
     # The ext_vector_type gates compare against Clang 23.1.3 EXACTLY
     # (tests/regression/lib/clang_oracle.sh): GCC has no ext_vector_type and
     # Clang's i386 convention for 8-byte vectors changed between releases,
@@ -505,8 +546,6 @@ jobs:
       with:
         path: ~/.cargo/git
         key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-    - name: Install gate parsers
-      run: sudo apt-get install -y --no-install-recommends python3-yaml
     - uses: actions/download-artifact@v8
       with:
         name: lccc-fast-${{ github.sha }}
@@ -558,6 +597,14 @@ jobs:
       run: python3 tests/regression/check_ci_gcc16_provisioning.py
     - name: Verify swap provisioning contracts (mock only)
       run: python3 tests/regression/check_ci_swap_provisioning.py
+    # The oracle toolchain is a per-pipeline cache now, so its contract is
+    # load-bearing: a bundle that restores without verifying its digest, or a
+    # provisioning path that silently installs into a prefix, would turn into
+    # green lanes with the wrong compiler. Compiler-free and ~1 s.
+    - name: Verify toolchain bundle and shard-partition contracts (mock only)
+      run: |
+        python3 tests/regression/check_ci_toolchain_bundle.py
+        python3 tests/regression/check_ci_shard_partition.py
     - name: Verify manifest Rust-toolchain selection
       run: bash tests/regression/check_rust_toolchain_selector.sh
     - name: Verify restored linker oracle versions
@@ -825,27 +872,21 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    - name: Install GCC 16 and i686 C runtime/development files
+    # One content-addressed bundle per (runner image, installer) pair, built by
+    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
+    # apt in six lanes and 125 s in a seventh for the identical package set;
+    # restoring the bundle is a few seconds and it is byte-identical, because
+    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
+    # qemu-i386 before a lane is allowed to use it.
+    - name: Cache the provisioned oracle toolchain
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-toolchain
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+    - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
-      run: |
-        bash scripts/ci_install_gcc16.sh --multilib
-        sudo apt-get install -y --no-install-recommends qemu-user
-    - name: Install differential linker oracles
-      run: |
-        # The pair comes from the runner's own archive, and two jobs on one
-        # commit have died here on a transient index window while a sibling
-        # installed the same packages seconds later.  Retry the pair as a
-        # unit; the third failure still exits non-zero with the log.
-        for attempt in 1 2 3; do
-          if sudo apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none &&
-             sudo apt-get install -y --no-install-recommends mold lld; then
-            exit 0
-          fi
-          echo "linker-oracle install failed (attempt $attempt/3); retrying" >&2
-          sleep $(( attempt * 20 ))
-        done
-        exit 1
+      run: bash scripts/ci_provision_toolchain.sh --multilib
     - name: Verify GCC 16 C23 oracle
       run: |
         test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16
@@ -868,8 +909,6 @@ jobs:
       with:
         path: ~/.cargo/git
         key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-    - name: Install gate parsers
-      run: sudo apt-get install -y --no-install-recommends python3-yaml
     - uses: actions/download-artifact@v8
       with:
         name: lccc-fast-${{ github.sha }}
@@ -895,7 +934,14 @@ jobs:
     - name: Benchmark output gate (workload kernels vs GCC oracle)
       env:
         GCC_BIN: gcc-16
-      run: bash scripts/check_benchmark_outputs.sh
+      run: |
+        # 69 cases x 4 optimisation levels x (oracle build+run, candidate
+        # build+run) was 338 s of serial CI. Nothing here is timed -- every
+        # unit compiles two binaries and compares stdio bytes -- so four
+        # independent units run at once on the runner's four cores, and the
+        # verdict (PASS/FAIL counts, diagnostics ordered by case and level) is
+        # identical to the serial gate.
+        bash scripts/check_benchmark_outputs.sh --jobs 4
     - name: Differential correctness gate (lccc vs GCC 16 oracle)
       env:
         LCCC_BIN: target/fastbuild/lccc
@@ -1126,27 +1172,21 @@ jobs:
         key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
         restore-keys: |
           lccc-apt-debs-v1-${{ runner.os }}-
-    - name: Install GCC 16 and i686 C runtime/development files
+    # One content-addressed bundle per (runner image, installer) pair, built by
+    # whichever lane misses the cache first.  Run 39686387347 paid 80-205 s of
+    # apt in six lanes and 125 s in a seventh for the identical package set;
+    # restoring the bundle is a few seconds and it is byte-identical, because
+    # `ci_toolchain_bundle.sh verify` probes gcc-16 -m32, mold, ld.lld and
+    # qemu-i386 before a lane is allowed to use it.
+    - name: Cache the provisioned oracle toolchain
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-toolchain
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+    - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
-      run: |
-        bash scripts/ci_install_gcc16.sh --multilib
-        sudo apt-get install -y --no-install-recommends qemu-user
-    - name: Install differential linker oracles
-      run: |
-        # The pair comes from the runner's own archive, and two jobs on one
-        # commit have died here on a transient index window while a sibling
-        # installed the same packages seconds later.  Retry the pair as a
-        # unit; the third failure still exits non-zero with the log.
-        for attempt in 1 2 3; do
-          if sudo apt-get update -o Acquire::Retries=3 -o Acquire::Languages=none &&
-             sudo apt-get install -y --no-install-recommends mold lld; then
-            exit 0
-          fi
-          echo "linker-oracle install failed (attempt $attempt/3); retrying" >&2
-          sleep $(( attempt * 20 ))
-        done
-        exit 1
+      run: bash scripts/ci_provision_toolchain.sh --multilib
     - name: Provision AArch64/RISC-V cross toolchains
       # check_tls_cross_models.sh links lccc objects against GCC-built TLS
       # definitions and executes them under qemu-user (installed above). With no
@@ -1205,8 +1245,6 @@ jobs:
       with:
         path: ~/.cargo/git
         key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-    - name: Install gate parsers
-      run: sudo apt-get install -y --no-install-recommends python3-yaml
     - uses: actions/download-artifact@v8
       with:
         name: lccc-fast-${{ github.sha }}
@@ -1420,348 +1458,6 @@ jobs:
       run: |
         set -euo pipefail
         CCC_ARM=target/fastbuild/lccc-arm scripts/check_arm_codegen_assembles.sh
-    - name: Verify remaining fast local contracts
-      env:
-        CCC: target/fastbuild/lccc
-      run: |
-        set -Eeuo pipefail
-        # These independent gates share one shell step. The ERR trap
-        # preserves the failing command in Checks; the body runs as a
-        # function piped through tee so that, on failure, the gate's own
-        # diagnostic lines are attached to the check run as annotations
-        # (scripts/ci_annotate_log.py) rather than left in the raw log.
-        fast_contracts() {
-        trap 'rc=$?; printf "::error title=Fast contract failed::%s (exit %s)\n" "$BASH_COMMAND" "$rc"; exit "$rc"' ERR
-        python3 scripts/check_ci_gate_parity.py
-        # A `run: |` block is shell, not YAML. Step scaffolding pasted
-        # into one is valid YAML that dies with exit 127 on the runner
-        # and silently skips every gate sequenced after it.
-        python3 scripts/check_ci_workflow_shell.py
-        # The helper scripts are tools, not gates, so nothing in the
-        # suite ever imports them. Check their imports via the AST so a
-        # tool that cannot run cannot ship unnoticed.
-        python3 scripts/check_script_imports.py
-        python3 scripts/test_ci_gate_parity.py
-        ENCDIFF_TEST_OBJDUMP="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
-        LCCC_REQUIRE_PINNED_ORACLE=1 \
-          python3 scripts/test_encdiff.py
-        # The differential oracle's own contract suites, compiler-free
-        # like the encdiff one but anchored to the REAL pinned pair
-        # (provisioned above): asmdiff's parser/oracle unit tests
-        # (mocked failure modes plus a real-toolchain leg) and the
-        # binutils provisioner's 2.47 validation matrix (fake tool
-        # pairs). The pinned-tool env channels and the require-mode
-        # flag are part of the registered invocation contract
-        # (check_invocation_contracts): a leg that would silently skip,
-        # or run against the runner's distro binutils, is a contract
-        # violation — never a local convenience.
-        ASMDIFF_TEST_AS="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
-        ASMDIFF_TEST_OBJDUMP="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
-        LCCC_REQUIRE_PINNED_ORACLE=1 \
-          python3 scripts/test_asmdiff.py
-        bash scripts/ensure_gas_247.sh --self-test
-        # EDG/corpus compiler-free tooling contracts: the
-        # miner self-tests, the mocked corpus-runner verdict contracts,
-        # and the corpus-exclusion path tests gate the TEST
-        # INFRASTRUCTURE itself — no compiler needed.  Mirrored in
-        # scripts/ci_local.sh (parity-checked).
-        python3 scripts/edg_changes_mine.py selftest
-        python3 scripts/edg_corpus_mine.py selftest
-        python3 scripts/edg_corpus_mine.py verify-index
-        python3 scripts/edg_changes_mine.py verify-artifacts
-        python3 -m unittest discover -s tests/corpus -p 'test_*.py'
-        # Array-bound contract (E22): a bad bound is diagnosed (never
-        # wrapped), a byte size that cannot exist is rejected instead of
-        # wrapping into a bogus section, and a huge .bss object is emitted
-        # sparsely under a hard address-space limit rather than being
-        # materialised and OOM-killed. Mirrored in scripts/ci_local.sh.
-        python3 scripts/check_array_bound_contract.py
-        # Sparse NOBITS `.bss` (E22): the zeros are a size, not bytes, so a
-        # 4 GiB array compiles, links and runs from a ~5 KB executable, a
-        # label inside a sparse tail keeps its offset, and PROGBITS
-        # alignment follows GAS 2.47 exactly (no-padding `.p2align 40`
-        # accepted, unholdable padding diagnosed, never a signal).
-        # Mirrored in scripts/ci_local.sh (parity-checked).
-        CCC=target/fastbuild/lccc bash tests/regression/check_sparse_bss_nobits.sh
-        # The sparse-NOBITS equivalence proof: exit codes, stdout and .bss
-        # layout agree across the probe set; a 16 GB object compiles under
-        # a hard RSS ceiling. Mirrored in scripts/ci_local.sh.
-        python3 tests/regression/check_sparse_bss_equivalence.py --lccc target/fastbuild/lccc
-        # NOBITS / `.org` parity on all four targets against pinned GAS
-        # verdicts.  Mirrored in scripts/ci_local.sh (parity-checked).
-        python3 tests/regression/check_nobits_org_parity.py --lccc target/fastbuild/lccc
-        # UB-exploitation invariant (E22): `-fno-strict-aliasing`,
-        # `-fwrapv` and `-fno-strict-overflow` are tolerated only because
-        # this optimizer exploits no undefined behaviour (no TBAA, no
-        # poison-based overflow).  Landing either concept must move those
-        # spellings to the contract tier; the tripwire fails and says so.
-        # Mirrored in scripts/ci_local.sh (parity-checked).
-        python3 scripts/check_no_ub_exploitation.py --root src
-        bash tests/regression/check_frontend_diagnostic_recovery.sh
-        # E5 (EDG register): deep-nesting crash class -> clean bounded
-        # error; deep-but-legal inputs keep compiling; in-budget nesting
-        # evaluates correctly end to end.
-        python3 scripts/check_deep_nesting_robustness.py
-        python3 scripts/test_differential_corpus_paths.py
-        bash tests/regression/check_loop_memset.sh
-        # A13/A14: a pass may synthesise a libcall only when this TU does
-        # not define that symbol (per symbol, so an asm label, an alias or
-        # a static definition counts), and a constant-size memcpy/memset
-        # call may be expanded only while the callee still is the builtin.
-        # Refusals, positive controls, the -fno-builtin/-ffreestanding
-        # contract, the ungated __*_chk rows and three runtime programs.
-        bash tests/regression/check_libcall_synthesis_no_selfcall.sh
-        # Plain-`char` signedness must be one answer, not three: the type
-        # system, `__CHAR_UNSIGNED__`, lccc's predefined CHAR_MIN/CHAR_MAX and
-        # glibc's `<limits.h>` (which derives from that macro) all follow
-        # `char_is_unsigned()`, including the -fno-signed-char /
-        # -fno-unsigned-char spellings.
-        # `-funsigned-char` used to flip only the type, leaving CHAR_MIN at
-        # -128 on x86-64.  Behavioural rows against GCC, plus the AArch64 /
-        # RISC-V defaults via the binary-name target selector (preprocessing
-        # only).  Mirrored in scripts/ci_local.sh (parity-checked).
-        bash tests/regression/check_char_signedness.sh
-        # The inliner's __builtin_va_arg_pack_len() sentinel rewrite matched
-        # in the wrong value space, leaving a live call to the undefined
-        # __lccc_va_arg_pack_len whenever the cloned caller was offset (gzip
-        # 1.14's gnulib open-safer.c under glibc fortify failed to link).
-        # No sentinel at -O0..-O3, wrapper semantics, gcc as the reference.
-        bash tests/regression/check_va_arg_pack_len_folds.sh
-        # Register-offset symbol folds: `Add(symbol, register)` bases are
-        # consumed as `sym(%off,%idx)` memory operands when the derived
-        # pointer dies at the accesses; the RA-01 kernel must stay dormant
-        # where the fold cannot pay, PIC must stay refused, and every
-        # program's output must equal GCC's.  Mirrored in scripts/ci_local.sh
-        # (parity-checked).
-        bash tests/regression/check_reg_off_sym_fold.sh
-        bash tests/regression/check_loop_store_motion.sh
-        bash tests/regression/check_const_trip_loop_inline.sh
-        bash tests/regression/check_fp_recurrence.sh
-        python3 tests/regression/check_debug_code_parity.py
-        bash tests/regression/check_bool_pair_tail_jmp.sh
-        bash tests/regression/check_bool_pair_prune.sh
-        bash tests/regression/check_demorgan_branch_split.sh
-        bash tests/regression/check_gvn_xsign_load_cse.sh
-        bash tests/regression/check_gvn_cross_block_mul_dot.sh
-        bash tests/regression/check_call_secondary_cache.sh
-        # ZERO-REM-1: the map vectorizer's scalar remainder mirror must be
-        # omitted (not merely unreachable) when a constant trip count makes
-        # it dead, on every shape where that is provable and on none where
-        # it is not -- including the alias-guard fallback, where the mirror
-        # is live.
-        bash tests/regression/check_vec_dead_remainder.sh
-        # ZERO-REM-2 + chained exit phis: the hoisted FMA transform's A
-        # factor lives in a fixed register (%ymm1) with no SSA edge to its
-        # consumers, so every entry edge into a vectorized loop must
-        # re-establish it; a k-unrolled chain enters j-loop N+1 on a
-        # conditional arm of j-loop N's header.  Pins oracle parity, the
-        # one-broadcast-per-packed-loop ratio, and broadcast-or-refuse.
-        bash tests/regression/check_vec_chain_exit_phi.sh
-        # ZERO-ROT-AFFINE: loop_rotate's cloned exit compare folds its
-        # affine constant operand into the bound (signed only), giving a
-        # bare-IV compare the compare-branch fusion can fuse -- without the
-        # FileLiveness backward-edge fix the fusion refused the rotated
-        # setcc shape and the `leaq` temporary stayed per-iteration.
-        bash tests/regression/check_affine_exit_compare.sh
-        # AFFOLD-VB: value-bounded affine exit-compare fold -- GCC runtime
-        # parity at the underflow edges, fire count on the guarded shapes,
-        # refusals, and the CCC_NO_AFFINE_EXIT_FOLD kill switch.
-        bash tests/regression/check_affine_value_bound.sh
-        # MINMAX-1: integer min/max reductions lower to packed vpmin/vpmax
-        # on AVX2, and every shape the transform does not model (unsigned,
-        # 16-bit, float, guarded, multi-accumulator) stays scalar AND stays
-        # correct.
-        bash tests/regression/check_minmax_reduction.sh
-        # LICM must not hoist a volatile load out of its loop: N observable
-        # accesses must not become 1 (C11 5.1.2.3). The runtime cannot see
-        # this -- a hoisted volatile load computes the same answer -- so the
-        # gate asserts it structurally, with a non-volatile load in the same
-        # shape as the negative control. Complements the spin-loop and
-        # subscript gates above: this one covers the do-while shape.
-        bash tests/regression/check_volatile_licm.sh
-        # Dedicated-preheader transform, asserted on emitted assembly.
-        bash tests/regression/check_loop_preheader.sh
-        # Same unwired-gate fix as in ci_local.sh: these assert volatile
-        # access semantics that no runtime comparison can observe.
-        bash tests/regression/check_volatile_pointer_subscript.sh
-        bash tests/regression/check_volatile_access_semantics.sh
-        # One entry, one preheader: a loop with several entries must not get a
-        # speculative load hoisted into a preheader that only one entry passes.
-        bash tests/regression/check_multi_entry_loop.sh
-        # A function DEFINITION's own `aligned(N)`, and the rule that an
-        # attribute REPLACES `-falign-functions` instead of merging with it
-        # (`aligned(1)` suppresses the directive).  Parameterized spellings
-        # plus two unannotated controls.
-        bash tests/regression/check_function_alignment_definition.sh
-        # One comparison, one set of flags: cmov reads EFLAGS without
-        # writing it, so a cmov chain sharing a condition needs one cmp.
-        # Carries its own CCC_PEEPHOLE_SKIP negative control.
-        bash tests/regression/check_redundant_flags_compare.sh
-        # Downward counter loops: `subl $1, %R; testl %R, %R; jne` keeps one
-        # instruction of pure overhead unless the consumer walk proves ZF is
-        # the only flag read.  Pins both directions (folded for ZF-only
-        # consumers, kept for `while ((n -= 3) > 0)`) plus a matcher
-        # self-test, so it cannot pass vacuously.
-        bash tests/regression/check_self_test_after_arith.sh
-        # The loop-density metric decides which compiler wins on a kernel,
-        # so its loop identification is tested like a pass: dominator-based
-        # backedges, composite loops never measured, step recovery through
-        # index addressing.
-        python3 scripts/test_hot_loop_metric.py
-        python3 scripts/test_godbolt_cache.py
-        python3 scripts/test_glibc_check_triage.py
-        python3 scripts/test_oracle_delta_gate.py
-        # Live CE delta execution moved to scheduled/manual oracle-delta.yml:
-        # network outages must not masquerade as PR-time oracle coverage.
-        # Hermetic self-tests and local differential/output gates stay required.
-        python3 scripts/oracle_delta_gate.py --self-test
-        python3 scripts/glibc_check_triage.py --self-test
-        bash tests/workloads/glibc-2.44/test_build_guards.sh
-        bash tests/regression/check_copy_alias_sizes.sh
-        bash tests/regression/check_linker_notype_code.sh
-        bash tests/regression/check_got64_old_spelling.sh
-        bash tests/regression/check_tls_pie_preemptible.sh
-        bash tests/regression/check_tls_runtime_oracle.sh
-        bash tests/regression/check_tls_model_selection.sh
-        # Cross-architecture TLS model/relocation/runtime contract. Catches the
-        # formerly hard-coded LE lowering in PIC/shared AArch64 and RISC-V
-        # objects. Mirrors the ci_local.sh gate of the same name;
-        # check_ci_gate_parity.py fails if the two lists drift.
-        bash tests/regression/check_tls_cross_models.sh
-        bash tests/regression/check_volatile_reduction.sh
-        python3 scripts/test_llvm_missed_inventory.py
-        python3 -O scripts/test_llvm_missed_inventory.py
-        python3 tests/regression/check_llvm_missed_zero_choice.py
-        python3 tests/regression/check_llvm_integer_observations.py
-        python3 tests/regression/check_llvm_bit_demand.py
-        python3 tests/regression/check_llvm_scalar_facts.py
-        python3 tests/regression/check_llvm_guarded_folds.py
-        python3 tests/regression/check_llvm_word_counts.py
-        python3 tests/regression/check_llvm_scalar_logic.py
-        # Dual-layout metric pair contract: identical assembly across
-        # serial/heuristic/forced scheduling, kill switch honoured, no spawn
-        # on a single-thread host, and at least one pair actually measured.
-        python3 tests/regression/check_peephole_pair_parallel.py
-        bash tests/regression/check_tls_model_option.sh
-        bash tests/regression/check_f128_sign_intrinsics_strict_fp.sh
-        bash tests/regression/check_fma_builtin_strict_fp.sh
-        # T5 round-cap observability (engineering/FOLLOWUP-2026-10-18-vellvm-vir-transplant.md):
-        # the report must print under CCC_TIME_PASSES and nowhere else. Mirrors the
-        # ci_local.sh gate; check_ci_gate_parity.py fails if the two lists drift.
-        bash tests/regression/check_round_cap_observability.sh
-        # T6: IR verifier clean on the fixed gate subset (mirrors ci_local.sh).
-        bash tests/regression/check_verify_ir_clean.sh
-        # T4/T7: mutation self-tests for the C reducer and the punning model.
-        python3 -m unittest discover -s tests/fuzz -p test_c_reduce.py
-        python3 -m unittest discover -s tests/fuzz -p test_punning_fuzz.py
-        # The peephole folds and the affine exit-compare fold: oracle parity
-        # at every opt level times every kill switch, plus the asm pins that
-        # say the fold actually fired (and stayed off when refused).
-        bash tests/regression/check_rmw_sib_folds.sh
-        bash tests/regression/check_rmw_index_zext_codegen.sh
-        bash tests/regression/check_select_from_compare.sh
-        bash tests/regression/check_affine_loop_fold.sh
-        bash tests/regression/check_phi_acyclic_order.sh
-        # The FMA contract gate (packed arm exact at 4, zero under
-        # -ffp-contract=off / -mno-fma, unproven shapes refused) and the wide
-        # inclusive-bound envelope behind it.  A regression test that nothing
-        # runs is the defect these were written to fix, so they run here AND
-        # in ci_local.sh -- scripts/check_ci_gate_parity.py fails if the two
-        # lists drift, which is how this line came to exist.
-        bash tests/regression/check_fma_gating.sh
-        bash tests/regression/check_fma_dest_coalesce_codegen.sh
-        bash tests/regression/check_vector_remainder_codegen.sh
-        bash tests/regression/check_vectorize_round_maps.sh
-        bash tests/regression/check_fma_matcher_guards.sh
-        bash tests/regression/check_redundant_test_elimination.sh
-        # Escaped-local frame addresses stay direct operands, direct -c
-        # objects equal -S + GNU as, devirtualized hot leaves inline, and C
-        # masks that only feed hardware-masked x86-64 shift counts are dropped.
-        python3 tests/regression/check_frame_gep_direct.py
-        python3 tests/regression/check_direct_assembly_parity.py
-        python3 tests/regression/check_inline_devirt_hot_leaf.py
-        python3 tests/regression/check_shift_count_demand.py
-        # BMI2 _bzhi_u32/_u64 lower to one bzhi and match GCC's results.
-        python3 tests/regression/check_bmi2_bzhi.py
-        python3 tests/regression/verify_pr713_audit.py --quiet
-        python3 scripts/check_doc_links.py
-        # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
-        # only place the audit's site counts are measurable; the ratchet is
-        # what stops them growing back.  Runs in ci_local.sh too.
-        python3 scripts/audit_census.py --selftest
-        python3 scripts/audit_census.py --check
-        python3 scripts/check_peephole_directive_step.py
-        # The architectural implicit-operand table is the single source of
-        # truth for every pass that reasons about registers an instruction
-        # does not name; its fixture is reviewed independently of the code.
-        python3 scripts/check_implicit_operand_matrix.py
-        python3 scripts/check_pr_claim_fidelity.py
-        bash tests/regression/check_ra_web_inloop_use.sh
-        bash tests/regression/check_store_alu_cross_join.sh
-        bash tests/regression/check_gla_remat_policy.sh
-        bash tests/regression/check_gla_cross_reach_band.sh
-        bash tests/regression/check_gla_backedge_no_trampoline.sh
-        bash tests/regression/check_tight_loop_align.sh
-        bash tests/regression/check_i686_atomics.sh
-        bash tests/regression/check_i686_tls_ie_relax.sh
-        bash tests/regression/check_i686_integer_isa_parity.sh
-        bash tests/regression/check_map_i64_two_lane.sh
-        bash tests/regression/check_fortify_diagnose_as.sh
-        bash tests/regression/check_asm_case_insensitive.sh
-        bash tests/regression/check_debug_info_flags.sh
-        bash tests/regression/check_dep_files.sh
-        bash tests/regression/check_i686_boot_asm.sh
-        bash tests/regression/check_asm_goto_phi_edge.sh
-        bash tests/regression/check_i686_label_ref_safety.sh
-        bash tests/regression/check_narrow_cmp_flag_law.sh
-        bash tests/regression/check_zero_ext_cmp_fold.sh
-        bash tests/regression/check_boot_size_measurement.sh
-        bash tests/regression/check_env_test_hygiene.sh
-        bash tests/regression/check_peephole_whitespace.sh
-        # The wrapper's argument parsing is exercised separately: it once
-        # stored the literal `--phase` flag, selected nothing, ran no phase
-        # and still printed PASS.  The invariance gate above cannot see that,
-        # so the parser gets its own compiler-free case table.
-        bash tests/regression/check_peephole_whitespace.sh --selftest
-        bash tests/regression/check_peephole_trace_bisect.sh
-        # The trace-bisect tool is also exercised directly, so a broken
-        # operand parser fails CI even if the wrapper gate is skipped.
-          python3 scripts/peephole_trace_bisect.py --selftest
-          # The Clang-C corpus capability probe: an unimplemented option must
-          # never read as support, and a `-W`-spelled unknown option must not
-          # slip past a `--`-only negative control.  Synthetic compiler, no
-          # toolchain and no corpus needed.
-          python3 scripts/lccc_capability_probe.py --selftest
-        bash tests/regression/check_atomic_backends.sh
-        # Torture-corpus provisioning: stamp trust, integrity manifest,
-        # auto-repair and invalidate-before-replace (synthetic tarball).
-        bash tests/regression/check_ensure_gcc_torture.sh
-        # Indexed SIB fold with a scratch-homed index: the x86-64 fold
-        # decider must accept %rdx/%r11-homed SIB operands (S13
-        # sqlite_varint golden-gate regression pin).
-        bash tests/regression/check_indexed_fold_scratch_index.sh
-        # Constant-folded addresses must use the same emission-order gate.
-        bash tests/regression/check_late_const_gep.sh
-        env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_address_contract.py
-        env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_popcount_contract.py --run
-        python3 tests/regression/check_popcount_loop_contract.py --run
-        # _Decimal64 indexed fold: SIB-movsd load+store assertions
-        # plus an integer-checksum gcc differential.
-        bash tests/regression/check_decimal64_indexed_fold.sh
-        # _Decimal32 AArch64 width: w-view indexed + plain traffic
-        # assertions plus encodability teeth (no bare mov past imm16).
-        bash tests/regression/check_decimal32_indexed_fold_arm.sh
-        python3 tests/regression/check_affine_scaled_index_matrix.py
-        # FMA-negation peel deletion invariant, re-derived over the enumerated
-        # shape space: a pure model check (no compiler, sub-second) so a
-        # regression of the absorbability classification is caught even where
-        # the IR verifier is not wired after the pass.
-        python3 tools/ir_shape_check.py
-        }
-        if ! fast_contracts 2>&1 | tee "$RUNNER_TEMP/fast-contracts.log"; then
-          python3 scripts/ci_annotate_log.py --title "Fast contract output" "$RUNNER_TEMP/fast-contracts.log"
-          exit 1
-        fi
     - name: Verify kernel tool-identity invalidation
       run: bash tests/regression/check_kernel_tool_identity.sh
     - name: Relocation oracle-verdict logic
@@ -1814,6 +1510,547 @@ jobs:
       run: python3 tests/corpus/test_linker_note_runs.py
     needs:
     - build
+  backend-contracts-a:
+    name: Fast local contracts (shard a)
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_FASTBUILD_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - name: Enable temporary CI swap file
+      run: bash scripts/ci_enable_swap.sh
+    - name: Compute weekly apt cache key
+      id: apt-epoch
+      run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+    - name: Cache GCC 16 package downloads
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-apt
+        key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
+        restore-keys: |
+          lccc-apt-debs-v1-${{ runner.os }}-
+    - name: Cache the provisioned oracle toolchain
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-toolchain
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+    - name: Provision oracle toolchain (cached bundle, else apt)
+      run: bash scripts/ci_provision_toolchain.sh --multilib
+    - name: Verify GCC 16 C23 oracle
+      run: |
+        test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16
+        printf 'int main(void) { return 0; }\n' | gcc-16 -std=c17 -x c -fsyntax-only -
+        printf 'int main(void) { return 0; }\n' | gcc-16 -std=c23 -x c -fsyntax-only -
+        gcc-16 --version | head -n 1
+    - name: Select GCC 16 for legacy oracle invocations
+      run: |
+        mkdir -p "$RUNNER_TEMP/lccc-oracles"
+        ln -s "$(command -v gcc-16)" "$RUNNER_TEMP/lccc-oracles/gcc"
+        ln -s "$(command -v g++-16)" "$RUNNER_TEMP/lccc-oracles/g++"
+        echo "$RUNNER_TEMP/lccc-oracles" >> "$GITHUB_PATH"
+    - name: Cache GNU as 2.47 prefixes
+      uses: actions/cache@v6
+      with:
+        path: |-
+          ~/.cache/gas-2.47-x86_64-linux-gnu
+          ~/.cache/gas-2.47-aarch64-linux-gnu
+        key: ${{ runner.os }}-gas-2.47-${{ hashFiles('scripts/ensure_gas_247.sh') }}
+    - name: Install GNU as 2.47 for x86-64 differential
+      run: bash scripts/ensure_gas_247.sh x86_64-linux-gnu
+    # Only the cross-TLS gate needs these, and it is 13 s from cache: keeping
+    # the step in BOTH shards means the cost table can be re-balanced without
+    # silently turning that gate's runtime half into a SKIP.
+    - name: Provision AArch64/RISC-V cross toolchains
+      run: |
+        probe="$RUNNER_TEMP/m32-probe"
+        printf 'int main(void) { return 0; }\n' > "$probe.c"
+        m32_ok() { gcc -m32 -O1 -o "$probe" "$probe.c"; }
+        m32_ok || { echo "::error::i386 multilib is broken before cross provisioning"; exit 1; }
+        if ! bash scripts/ensure_cross_toolchains.sh all; then
+          echo "::warning::cross toolchain provisioning failed; the TLS runtime half will SKIP"
+        fi
+        m32_ok || { echo "::error::cross provisioning broke the i386 multilib"; exit 1; }
+        for t in aarch64 riscv64; do
+          command -v "$t-linux-gnu-gcc" >/dev/null 2>&1 \
+            && "$t-linux-gnu-gcc" --version | head -n 1 \
+            || echo "::warning::$t-linux-gnu-gcc unavailable"
+        done
+    - uses: actions/download-artifact@v8
+      with:
+        name: lccc-fast-${{ github.sha }}
+    - name: Verify exact compiler build
+      run: |
+        set -euo pipefail
+        tar -xzf lccc-fast.tar.gz
+        test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
+        sha256sum -c target/ci-build.sha256
+    # 69 of 140 independent gate invocations from the single
+    # step that used to run them all in sequence, assigned by longest
+    # processing time (LPT) over measured per-gate cost (shard a 191 s / shard b 191 s of 382 s measured here; the same suite was 703 s as one hosted step). The two
+    # steps are a partition: tests/regression/check_ci_shard_partition.py
+    # fails if a gate appears in both, disappears from both, or reappears in a
+    # third step.
+    - name: Verify remaining fast local contracts (shard a of 2)
+      env:
+        CCC: target/fastbuild/lccc
+      run: |
+        set -Eeuo pipefail
+        # Same scaffolding as the original single step: the ERR trap preserves
+        # the failing command in Checks, and the body runs as a function piped
+        # through tee so a failure attaches the gate's own diagnostics.
+        fast_contracts() {
+        trap 'rc=$?; printf "::error title=Fast contract failed::%s (exit %s)\n" "$BASH_COMMAND" "$rc"; exit "$rc"' ERR
+        # A `run: |` block is shell, not YAML. Step scaffolding pasted
+        # into one is valid YAML that dies with exit 127 on the runner
+        # and silently skips every gate sequenced after it.
+        python3 scripts/check_ci_workflow_shell.py
+        ENCDIFF_TEST_OBJDUMP="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
+        LCCC_REQUIRE_PINNED_ORACLE=1 \
+          python3 scripts/test_encdiff.py
+        # The differential oracle's own contract suites, compiler-free
+        # like the encdiff one but anchored to the REAL pinned pair
+        # (provisioned above): asmdiff's parser/oracle unit tests
+        # (mocked failure modes plus a real-toolchain leg) and the
+        # binutils provisioner's 2.47 validation matrix (fake tool
+        # pairs). The pinned-tool env channels and the require-mode
+        # flag are part of the registered invocation contract
+        # (check_invocation_contracts): a leg that would silently skip,
+        # or run against the runner's distro binutils, is a contract
+        # violation — never a local convenience.
+        ASMDIFF_TEST_AS="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        ASMDIFF_TEST_OBJDUMP="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
+        LCCC_REQUIRE_PINNED_ORACLE=1 \
+          python3 scripts/test_asmdiff.py
+        bash scripts/ensure_gas_247.sh --self-test
+        # EDG/corpus compiler-free tooling contracts: the
+        # miner self-tests, the mocked corpus-runner verdict contracts,
+        # and the corpus-exclusion path tests gate the TEST
+        # INFRASTRUCTURE itself — no compiler needed.  Mirrored in
+        # scripts/ci_local.sh (parity-checked).
+        python3 scripts/edg_changes_mine.py selftest
+        python3 scripts/edg_corpus_mine.py selftest
+        python3 scripts/edg_changes_mine.py verify-artifacts
+        python3 -m unittest discover -s tests/corpus -p 'test_*.py'
+        # Array-bound contract (E22): a bad bound is diagnosed (never
+        # wrapped), a byte size that cannot exist is rejected instead of
+        # wrapping into a bogus section, and a huge .bss object is emitted
+        # sparsely under a hard address-space limit rather than being
+        # materialised and OOM-killed. Mirrored in scripts/ci_local.sh.
+        python3 scripts/check_array_bound_contract.py
+        # The sparse-NOBITS equivalence proof: exit codes, stdout and .bss
+        # layout agree across the probe set; a 16 GB object compiles under
+        # a hard RSS ceiling. Mirrored in scripts/ci_local.sh.
+        python3 tests/regression/check_sparse_bss_equivalence.py --lccc target/fastbuild/lccc
+        # NOBITS / `.org` parity on all four targets against pinned GAS
+        # verdicts.  Mirrored in scripts/ci_local.sh (parity-checked).
+        python3 tests/regression/check_nobits_org_parity.py --lccc target/fastbuild/lccc
+        # UB-exploitation invariant (E22): `-fno-strict-aliasing`,
+        # `-fwrapv` and `-fno-strict-overflow` are tolerated only because
+        # this optimizer exploits no undefined behaviour (no TBAA, no
+        # poison-based overflow).  Landing either concept must move those
+        # spellings to the contract tier; the tripwire fails and says so.
+        # Mirrored in scripts/ci_local.sh (parity-checked).
+        python3 scripts/check_no_ub_exploitation.py --root src
+        # The inliner's __builtin_va_arg_pack_len() sentinel rewrite matched
+        # in the wrong value space, leaving a live call to the undefined
+        # __lccc_va_arg_pack_len whenever the cloned caller was offset (gzip
+        # 1.14's gnulib open-safer.c under glibc fortify failed to link).
+        # No sentinel at -O0..-O3, wrapper semantics, gcc as the reference.
+        bash tests/regression/check_va_arg_pack_len_folds.sh
+        bash tests/regression/check_gvn_xsign_load_cse.sh
+        bash tests/regression/check_call_secondary_cache.sh
+        # ZERO-REM-2 + chained exit phis: the hoisted FMA transform's A
+        # factor lives in a fixed register (%ymm1) with no SSA edge to its
+        # consumers, so every entry edge into a vectorized loop must
+        # re-establish it; a k-unrolled chain enters j-loop N+1 on a
+        # conditional arm of j-loop N's header.  Pins oracle parity, the
+        # one-broadcast-per-packed-loop ratio, and broadcast-or-refuse.
+        bash tests/regression/check_vec_chain_exit_phi.sh
+        # AFFOLD-VB: value-bounded affine exit-compare fold -- GCC runtime
+        # parity at the underflow edges, fire count on the guarded shapes,
+        # refusals, and the CCC_NO_AFFINE_EXIT_FOLD kill switch.
+        bash tests/regression/check_affine_value_bound.sh
+        bash tests/regression/check_volatile_access_semantics.sh
+        # One entry, one preheader: a loop with several entries must not get a
+        # speculative load hoisted into a preheader that only one entry passes.
+        bash tests/regression/check_multi_entry_loop.sh
+        # One comparison, one set of flags: cmov reads EFLAGS without
+        # writing it, so a cmov chain sharing a condition needs one cmp.
+        # Carries its own CCC_PEEPHOLE_SKIP negative control.
+        bash tests/regression/check_redundant_flags_compare.sh
+        # The loop-density metric decides which compiler wins on a kernel,
+        # so its loop identification is tested like a pass: dominator-based
+        # backedges, composite loops never measured, step recovery through
+        # index addressing.
+        python3 scripts/test_hot_loop_metric.py
+        python3 scripts/test_glibc_check_triage.py
+        bash tests/workloads/glibc-2.44/test_build_guards.sh
+        bash tests/regression/check_linker_notype_code.sh
+        bash tests/regression/check_got64_old_spelling.sh
+        bash tests/regression/check_tls_runtime_oracle.sh
+        bash tests/regression/check_tls_model_selection.sh
+        # Cross-architecture TLS model/relocation/runtime contract. Catches the
+        # formerly hard-coded LE lowering in PIC/shared AArch64 and RISC-V
+        # objects. Mirrors the ci_local.sh gate of the same name;
+        # check_ci_gate_parity.py fails if the two lists drift.
+        bash tests/regression/check_tls_cross_models.sh
+        python3 -O scripts/test_llvm_missed_inventory.py
+        python3 tests/regression/check_llvm_bit_demand.py
+        python3 tests/regression/check_llvm_scalar_facts.py
+        # check_llvm_scalar_logic.py is NOT repeated here: it already runs as
+        # its own step in the `frontend` lane, which is the lane that installs
+        # the pinned Clang 23.1.3 oracle its clang leg needs. Running it a
+        # second time in a shard with no clang would pay for a weaker copy of
+        # the same contract; check_ci_shard_partition.py rejects exactly that.
+        # Dual-layout metric pair contract: identical assembly across
+        # serial/heuristic/forced scheduling, kill switch honoured, no spawn
+        # on a single-thread host, and at least one pair actually measured.
+        python3 tests/regression/check_peephole_pair_parallel.py
+        bash tests/regression/check_fma_builtin_strict_fp.sh
+        # T5 round-cap observability (engineering/FOLLOWUP-2026-10-18-vellvm-vir-transplant.md):
+        # the report must print under CCC_TIME_PASSES and nowhere else. Mirrors the
+        # ci_local.sh gate; check_ci_gate_parity.py fails if the two lists drift.
+        bash tests/regression/check_round_cap_observability.sh
+        # T6: IR verifier clean on the fixed gate subset (mirrors ci_local.sh).
+        bash tests/regression/check_verify_ir_clean.sh
+        # T4/T7: mutation self-tests for the C reducer and the punning model.
+        python3 -m unittest discover -s tests/fuzz -p test_c_reduce.py
+        python3 -m unittest discover -s tests/fuzz -p test_punning_fuzz.py
+        bash tests/regression/check_rmw_index_zext_codegen.sh
+        # The FMA contract gate (packed arm exact at 4, zero under
+        # -ffp-contract=off / -mno-fma, unproven shapes refused) and the wide
+        # inclusive-bound envelope behind it.  A regression test that nothing
+        # runs is the defect these were written to fix, so they run here AND
+        # in ci_local.sh -- scripts/check_ci_gate_parity.py fails if the two
+        # lists drift, which is how this line came to exist.
+        bash tests/regression/check_fma_gating.sh
+        bash tests/regression/check_vectorize_round_maps.sh
+        python3 tests/regression/check_direct_assembly_parity.py
+        python3 tests/regression/check_inline_devirt_hot_leaf.py
+        python3 tests/regression/check_shift_count_demand.py
+        # BMI2 _bzhi_u32/_u64 lower to one bzhi and match GCC's results.
+        python3 tests/regression/check_bmi2_bzhi.py
+        python3 tests/regression/verify_pr713_audit.py --quiet
+        # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
+        # only place the audit's site counts are measurable; the ratchet is
+        # what stops them growing back.  Runs in ci_local.sh too.
+        python3 scripts/audit_census.py --selftest
+        python3 scripts/audit_census.py --check
+        python3 scripts/check_peephole_directive_step.py
+        python3 scripts/check_pr_claim_fidelity.py
+        bash tests/regression/check_gla_backedge_no_trampoline.sh
+        bash tests/regression/check_i686_atomics.sh
+        bash tests/regression/check_i686_tls_ie_relax.sh
+        bash tests/regression/check_i686_integer_isa_parity.sh
+        bash tests/regression/check_map_i64_two_lane.sh
+        bash tests/regression/check_i686_label_ref_safety.sh
+        bash tests/regression/check_zero_ext_cmp_fold.sh
+        bash tests/regression/check_boot_size_measurement.sh
+        bash tests/regression/check_env_test_hygiene.sh
+        # The trace-bisect tool is also exercised directly, so a broken
+        # operand parser fails CI even if the wrapper gate is skipped.
+          python3 scripts/peephole_trace_bisect.py --selftest
+          # The Clang-C corpus capability probe: an unimplemented option must
+          # never read as support, and a `-W`-spelled unknown option must not
+          # slip past a `--`-only negative control.  Synthetic compiler, no
+          # toolchain and no corpus needed.
+          python3 scripts/lccc_capability_probe.py --selftest
+        bash tests/regression/check_atomic_backends.sh
+        # Torture-corpus provisioning: stamp trust, integrity manifest,
+        # auto-repair and invalidate-before-replace (synthetic tarball).
+        bash tests/regression/check_ensure_gcc_torture.sh
+        # Indexed SIB fold with a scratch-homed index: the x86-64 fold
+        # decider must accept %rdx/%r11-homed SIB operands (S13
+        # sqlite_varint golden-gate regression pin).
+        bash tests/regression/check_indexed_fold_scratch_index.sh
+        # Constant-folded addresses must use the same emission-order gate.
+        bash tests/regression/check_late_const_gep.sh
+        env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_address_contract.py
+        env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_popcount_contract.py --run
+        python3 tests/regression/check_popcount_loop_contract.py --run
+        # _Decimal64 indexed fold: SIB-movsd load+store assertions
+        # plus an integer-checksum gcc differential.
+        bash tests/regression/check_decimal64_indexed_fold.sh
+        }
+        if ! fast_contracts 2>&1 | tee "$RUNNER_TEMP/fast-contracts-a.log"; then
+          python3 scripts/ci_annotate_log.py --title "Fast contract output (shard a)" "$RUNNER_TEMP/fast-contracts-a.log"
+          exit 1
+        fi
+  backend-contracts-b:
+    name: Fast local contracts (shard b)
+    needs: [build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_FASTBUILD_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+      with:
+        submodules: recursive
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - name: Enable temporary CI swap file
+      run: bash scripts/ci_enable_swap.sh
+    - name: Compute weekly apt cache key
+      id: apt-epoch
+      run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+    - name: Cache GCC 16 package downloads
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-apt
+        key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
+        restore-keys: |
+          lccc-apt-debs-v1-${{ runner.os }}-
+    - name: Cache the provisioned oracle toolchain
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/lccc-toolchain
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+    - name: Provision oracle toolchain (cached bundle, else apt)
+      run: bash scripts/ci_provision_toolchain.sh --multilib
+    - name: Verify GCC 16 C23 oracle
+      run: |
+        test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16
+        printf 'int main(void) { return 0; }\n' | gcc-16 -std=c17 -x c -fsyntax-only -
+        printf 'int main(void) { return 0; }\n' | gcc-16 -std=c23 -x c -fsyntax-only -
+        gcc-16 --version | head -n 1
+    - name: Select GCC 16 for legacy oracle invocations
+      run: |
+        mkdir -p "$RUNNER_TEMP/lccc-oracles"
+        ln -s "$(command -v gcc-16)" "$RUNNER_TEMP/lccc-oracles/gcc"
+        ln -s "$(command -v g++-16)" "$RUNNER_TEMP/lccc-oracles/g++"
+        echo "$RUNNER_TEMP/lccc-oracles" >> "$GITHUB_PATH"
+    - name: Cache GNU as 2.47 prefixes
+      uses: actions/cache@v6
+      with:
+        path: |-
+          ~/.cache/gas-2.47-x86_64-linux-gnu
+          ~/.cache/gas-2.47-aarch64-linux-gnu
+        key: ${{ runner.os }}-gas-2.47-${{ hashFiles('scripts/ensure_gas_247.sh') }}
+    - name: Install GNU as 2.47 for x86-64 differential
+      run: bash scripts/ensure_gas_247.sh x86_64-linux-gnu
+    # Only the cross-TLS gate needs these, and it is 13 s from cache: keeping
+    # the step in BOTH shards means the cost table can be re-balanced without
+    # silently turning that gate's runtime half into a SKIP.
+    - name: Provision AArch64/RISC-V cross toolchains
+      run: |
+        probe="$RUNNER_TEMP/m32-probe"
+        printf 'int main(void) { return 0; }\n' > "$probe.c"
+        m32_ok() { gcc -m32 -O1 -o "$probe" "$probe.c"; }
+        m32_ok || { echo "::error::i386 multilib is broken before cross provisioning"; exit 1; }
+        if ! bash scripts/ensure_cross_toolchains.sh all; then
+          echo "::warning::cross toolchain provisioning failed; the TLS runtime half will SKIP"
+        fi
+        m32_ok || { echo "::error::cross provisioning broke the i386 multilib"; exit 1; }
+        for t in aarch64 riscv64; do
+          command -v "$t-linux-gnu-gcc" >/dev/null 2>&1 \
+            && "$t-linux-gnu-gcc" --version | head -n 1 \
+            || echo "::warning::$t-linux-gnu-gcc unavailable"
+        done
+    - uses: actions/download-artifact@v8
+      with:
+        name: lccc-fast-${{ github.sha }}
+    - name: Verify exact compiler build
+      run: |
+        set -euo pipefail
+        tar -xzf lccc-fast.tar.gz
+        test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
+        sha256sum -c target/ci-build.sha256
+    # 71 of 140 independent gate invocations from the single
+    # step that used to run them all in sequence, assigned by longest
+    # processing time (LPT) over measured per-gate cost (shard a 191 s / shard b 191 s of 382 s measured here; the same suite was 703 s as one hosted step). The two
+    # steps are a partition: tests/regression/check_ci_shard_partition.py
+    # fails if a gate appears in both, disappears from both, or reappears in a
+    # third step.
+    - name: Verify remaining fast local contracts (shard b of 2)
+      env:
+        CCC: target/fastbuild/lccc
+      run: |
+        set -Eeuo pipefail
+        # Same scaffolding as the original single step: the ERR trap preserves
+        # the failing command in Checks, and the body runs as a function piped
+        # through tee so a failure attaches the gate's own diagnostics.
+        fast_contracts() {
+        trap 'rc=$?; printf "::error title=Fast contract failed::%s (exit %s)\n" "$BASH_COMMAND" "$rc"; exit "$rc"' ERR
+        python3 scripts/check_ci_gate_parity.py
+        # The helper scripts are tools, not gates, so nothing in the
+        # suite ever imports them. Check their imports via the AST so a
+        # tool that cannot run cannot ship unnoticed.
+        python3 scripts/check_script_imports.py
+        python3 scripts/test_ci_gate_parity.py
+        python3 scripts/edg_corpus_mine.py verify-index
+        # Sparse NOBITS `.bss` (E22): the zeros are a size, not bytes, so a
+        # 4 GiB array compiles, links and runs from a ~5 KB executable, a
+        # label inside a sparse tail keeps its offset, and PROGBITS
+        # alignment follows GAS 2.47 exactly (no-padding `.p2align 40`
+        # accepted, unholdable padding diagnosed, never a signal).
+        # Mirrored in scripts/ci_local.sh (parity-checked).
+        CCC=target/fastbuild/lccc bash tests/regression/check_sparse_bss_nobits.sh
+        bash tests/regression/check_frontend_diagnostic_recovery.sh
+        # E5 (EDG register): deep-nesting crash class -> clean bounded
+        # error; deep-but-legal inputs keep compiling; in-budget nesting
+        # evaluates correctly end to end.
+        python3 scripts/check_deep_nesting_robustness.py
+        python3 scripts/test_differential_corpus_paths.py
+        bash tests/regression/check_loop_memset.sh
+        # A13/A14: a pass may synthesise a libcall only when this TU does
+        # not define that symbol (per symbol, so an asm label, an alias or
+        # a static definition counts), and a constant-size memcpy/memset
+        # call may be expanded only while the callee still is the builtin.
+        # Refusals, positive controls, the -fno-builtin/-ffreestanding
+        # contract, the ungated __*_chk rows and three runtime programs.
+        bash tests/regression/check_libcall_synthesis_no_selfcall.sh
+        # Plain-`char` signedness must be one answer, not three: the type
+        # system, `__CHAR_UNSIGNED__`, lccc's predefined CHAR_MIN/CHAR_MAX and
+        # glibc's `<limits.h>` (which derives from that macro) all follow
+        # `char_is_unsigned()`, including the -fno-signed-char /
+        # -fno-unsigned-char spellings.
+        # `-funsigned-char` used to flip only the type, leaving CHAR_MIN at
+        # -128 on x86-64.  Behavioural rows against GCC, plus the AArch64 /
+        # RISC-V defaults via the binary-name target selector (preprocessing
+        # only).  Mirrored in scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_char_signedness.sh
+        # Register-offset symbol folds: `Add(symbol, register)` bases are
+        # consumed as `sym(%off,%idx)` memory operands when the derived
+        # pointer dies at the accesses; the RA-01 kernel must stay dormant
+        # where the fold cannot pay, PIC must stay refused, and every
+        # program's output must equal GCC's.  Mirrored in scripts/ci_local.sh
+        # (parity-checked).
+        bash tests/regression/check_reg_off_sym_fold.sh
+        bash tests/regression/check_loop_store_motion.sh
+        bash tests/regression/check_const_trip_loop_inline.sh
+        bash tests/regression/check_fp_recurrence.sh
+        python3 tests/regression/check_debug_code_parity.py
+        bash tests/regression/check_bool_pair_tail_jmp.sh
+        bash tests/regression/check_bool_pair_prune.sh
+        bash tests/regression/check_demorgan_branch_split.sh
+        bash tests/regression/check_gvn_cross_block_mul_dot.sh
+        # ZERO-REM-1: the map vectorizer's scalar remainder mirror must be
+        # omitted (not merely unreachable) when a constant trip count makes
+        # it dead, on every shape where that is provable and on none where
+        # it is not -- including the alias-guard fallback, where the mirror
+        # is live.
+        bash tests/regression/check_vec_dead_remainder.sh
+        # ZERO-ROT-AFFINE: loop_rotate's cloned exit compare folds its
+        # affine constant operand into the bound (signed only), giving a
+        # bare-IV compare the compare-branch fusion can fuse -- without the
+        # FileLiveness backward-edge fix the fusion refused the rotated
+        # setcc shape and the `leaq` temporary stayed per-iteration.
+        bash tests/regression/check_affine_exit_compare.sh
+        # MINMAX-1: integer min/max reductions lower to packed vpmin/vpmax
+        # on AVX2, and every shape the transform does not model (unsigned,
+        # 16-bit, float, guarded, multi-accumulator) stays scalar AND stays
+        # correct.
+        bash tests/regression/check_minmax_reduction.sh
+        # LICM must not hoist a volatile load out of its loop: N observable
+        # accesses must not become 1 (C11 5.1.2.3). The runtime cannot see
+        # this -- a hoisted volatile load computes the same answer -- so the
+        # gate asserts it structurally, with a non-volatile load in the same
+        # shape as the negative control. Complements the spin-loop and
+        # subscript gates above: this one covers the do-while shape.
+        bash tests/regression/check_volatile_licm.sh
+        # Dedicated-preheader transform, asserted on emitted assembly.
+        bash tests/regression/check_loop_preheader.sh
+        # Same unwired-gate fix as in ci_local.sh: these assert volatile
+        # access semantics that no runtime comparison can observe.
+        bash tests/regression/check_volatile_pointer_subscript.sh
+        # A function DEFINITION's own `aligned(N)`, and the rule that an
+        # attribute REPLACES `-falign-functions` instead of merging with it
+        # (`aligned(1)` suppresses the directive).  Parameterized spellings
+        # plus two unannotated controls.
+        bash tests/regression/check_function_alignment_definition.sh
+        # Downward counter loops: `subl $1, %R; testl %R, %R; jne` keeps one
+        # instruction of pure overhead unless the consumer walk proves ZF is
+        # the only flag read.  Pins both directions (folded for ZF-only
+        # consumers, kept for `while ((n -= 3) > 0)`) plus a matcher
+        # self-test, so it cannot pass vacuously.
+        bash tests/regression/check_self_test_after_arith.sh
+        python3 scripts/test_godbolt_cache.py
+        python3 scripts/test_oracle_delta_gate.py
+        # Live CE delta execution moved to scheduled/manual oracle-delta.yml:
+        # network outages must not masquerade as PR-time oracle coverage.
+        # Hermetic self-tests and local differential/output gates stay required.
+        python3 scripts/oracle_delta_gate.py --self-test
+        python3 scripts/glibc_check_triage.py --self-test
+        bash tests/regression/check_copy_alias_sizes.sh
+        bash tests/regression/check_tls_pie_preemptible.sh
+        bash tests/regression/check_volatile_reduction.sh
+        python3 scripts/test_llvm_missed_inventory.py
+        python3 tests/regression/check_llvm_missed_zero_choice.py
+        python3 tests/regression/check_llvm_integer_observations.py
+        python3 tests/regression/check_llvm_guarded_folds.py
+        python3 tests/regression/check_llvm_word_counts.py
+        bash tests/regression/check_tls_model_option.sh
+        bash tests/regression/check_f128_sign_intrinsics_strict_fp.sh
+        # The peephole folds and the affine exit-compare fold: oracle parity
+        # at every opt level times every kill switch, plus the asm pins that
+        # say the fold actually fired (and stayed off when refused).
+        bash tests/regression/check_rmw_sib_folds.sh
+        bash tests/regression/check_select_from_compare.sh
+        bash tests/regression/check_affine_loop_fold.sh
+        bash tests/regression/check_phi_acyclic_order.sh
+        bash tests/regression/check_fma_dest_coalesce_codegen.sh
+        bash tests/regression/check_vector_remainder_codegen.sh
+        bash tests/regression/check_fma_matcher_guards.sh
+        bash tests/regression/check_redundant_test_elimination.sh
+        # Escaped-local frame addresses stay direct operands, direct -c
+        # objects equal -S + GNU as, devirtualized hot leaves inline, and C
+        # masks that only feed hardware-masked x86-64 shift counts are dropped.
+        python3 tests/regression/check_frame_gep_direct.py
+        python3 scripts/check_doc_links.py
+        # The architectural implicit-operand table is the single source of
+        # truth for every pass that reasons about registers an instruction
+        # does not name; its fixture is reviewed independently of the code.
+        python3 scripts/check_implicit_operand_matrix.py
+        bash tests/regression/check_ra_web_inloop_use.sh
+        bash tests/regression/check_store_alu_cross_join.sh
+        bash tests/regression/check_gla_remat_policy.sh
+        bash tests/regression/check_gla_cross_reach_band.sh
+        bash tests/regression/check_tight_loop_align.sh
+        bash tests/regression/check_fortify_diagnose_as.sh
+        bash tests/regression/check_asm_case_insensitive.sh
+        bash tests/regression/check_debug_info_flags.sh
+        bash tests/regression/check_dep_files.sh
+        bash tests/regression/check_i686_boot_asm.sh
+        bash tests/regression/check_asm_goto_phi_edge.sh
+        bash tests/regression/check_narrow_cmp_flag_law.sh
+        bash tests/regression/check_peephole_whitespace.sh
+        # The wrapper's argument parsing is exercised separately: it once
+        # stored the literal `--phase` flag, selected nothing, ran no phase
+        # and still printed PASS.  The invariance gate above cannot see that,
+        # so the parser gets its own compiler-free case table.
+        bash tests/regression/check_peephole_whitespace.sh --selftest
+        bash tests/regression/check_peephole_trace_bisect.sh
+        # _Decimal32 AArch64 width: w-view indexed + plain traffic
+        # assertions plus encodability teeth (no bare mov past imm16).
+        bash tests/regression/check_decimal32_indexed_fold_arm.sh
+        python3 tests/regression/check_affine_scaled_index_matrix.py
+        # FMA-negation peel deletion invariant, re-derived over the enumerated
+        # shape space: a pure model check (no compiler, sub-second) so a
+        # regression of the absorbability classification is caught even where
+        # the IR verifier is not wired after the pass.
+        python3 tools/ir_shape_check.py
+        }
+        if ! fast_contracts 2>&1 | tee "$RUNNER_TEMP/fast-contracts-b.log"; then
+          python3 scripts/ci_annotate_log.py --title "Fast contract output (shard b)" "$RUNNER_TEMP/fast-contracts-b.log"
+          exit 1
+        fi
   clippy:
     timeout-minutes: 45
     name: Clippy
@@ -1948,11 +2185,14 @@ jobs:
     runs-on: ubuntu-24.04
     needs:
     - build
+    - unit
     - debug
     - corpus
     - frontend
     - codegen
     - backend
+    - backend-contracts-a
+    - backend-contracts-b
     - clippy
     - msrv
     - benchmark
