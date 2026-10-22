@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/ci_install_link_oracles.sh"
@@ -190,6 +191,13 @@ class LinkOracleProvisioningTests(unittest.TestCase):
         bin_dir.mkdir()
         for command in ("sudo", "uname", "apt-get", "apt-cache"):
             (bin_dir / command).symlink_to(mock)
+        # Only the script's non-mocked utilities may escape the sandbox. Never
+        # append /usr/bin or /bin: hosted runners already have mold/lld there,
+        # which otherwise makes absent-oracle cases take the warm fast path.
+        for command in ("grep", "mkdir", "sleep"):
+            resolved = shutil.which(command)
+            self.assertIsNotNone(resolved, f"required utility: {command}")
+            (bin_dir / command).symlink_to(resolved)
         # The oracles are deliberately ABSENT from PATH unless the case asks
         # for them: presence is the whole fast-path contract under test.
         if oracles_present:
@@ -206,7 +214,7 @@ class LinkOracleProvisioningTests(unittest.TestCase):
 
         log = self.directory / "log"
         env = {**os.environ,
-               "PATH": f"{bin_dir}:{os.defpath}",
+               "PATH": str(bin_dir),
                "MOCK_LOG": str(log),
                "MOCK_STATE": str(self.directory / "state"),
                "MOCK_BIN": str(bin_dir),
@@ -214,7 +222,7 @@ class LinkOracleProvisioningTests(unittest.TestCase):
                "MOCK_EUID": str(uid),
                "LCCC_CI_APT_RETRY_DELAY": "0",
                **overrides}
-        result = subprocess.run(["bash", str(script)], env=env, text=True,
+        result = subprocess.run([shutil.which("bash"), str(script)], env=env, text=True,
                                 capture_output=True, timeout=120)
         commands = ([json.loads(line) for line in log.read_text().splitlines()]
                     if log.exists() else [])
@@ -241,6 +249,20 @@ class LinkOracleProvisioningTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([c for c in commands if c[0] in ("apt-get", "apt-cache")],
                          [], "a warm runner must not re-provision")
+
+    def test_host_linkers_cannot_satisfy_the_mock_contract(self):
+        """A runner's real linkers must never turn a mock install into a pass."""
+        host = self.directory / "host"
+        host.mkdir()
+        for name in (*ORACLE_BINARIES, "lld"):
+            binary = host / name
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(0o755)
+        with mock.patch.object(os, "defpath", f"{host}:{os.defpath}"):
+            result, commands = self.invoke(INSTALL_LEAVES_BINARY_MISSING="1")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertTrue(self.installs(commands), "host tools bypassed the mock install")
+        self.assertIn("not on PATH", result.stderr)
 
     def test_transient_index_503_is_retried_until_it_resolves(self):
         """The exact failure this script exists to absorb."""
