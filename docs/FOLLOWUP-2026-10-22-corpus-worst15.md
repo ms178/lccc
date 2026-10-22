@@ -136,6 +136,17 @@ to be unfaithful to; the CFG-scored metric has none.
 
 ### `linux_find_bit` — the fold is worth 3.9 %, the layout is not the cost
 
+Round 2 re-measured this on the shipped assembly rather than on the C: folding
+the load by hand (`not %r10; and (%rdi,%r11,8),%r10`) removes the extra `mov`
+and brings the word loop to **nine instructions, exactly gcc's count**, but the
+program only moves 860.9 → 838 ms (−2.5 %), not the 22 % that separates it from
+gcc's 704 ms. Two other hypotheses are now excluded on the same build: loop
+alignment (`.p2align 5` on the back-edge target is 3 % *worse*, 885 ms) and the
+prologue/epilogue of the out-of-line callee (16.8 M calls, ≈3 % of the
+instruction stream). So the fold is worth shipping for its own sake but it is
+not the gap, and the round-1 conclusion stands unchanged: this kernel needs a
+PMU to attribute the remainder before any further change is justified.
+
 The scan loop's two-load-per-word body is one instruction longer than gcc's
 because `a[i] & ~b[i]` never folds the load into the `and`:
 

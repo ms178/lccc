@@ -130,7 +130,11 @@ against gcc 12.2 at `-O2`; none is claimed as a measured win yet, and per
    because selection assigned the destination first. Fix: when selecting a
    commutative ALU op with one register and one single-use load operand, prefer
    the register as destination so the load can fold. Witness:
-   `tests/benchmark/programs/linux_find_bit.c`, round-1 measured headroom 3.9 %.
+   `tests/benchmark/programs/linux_find_bit.c`. Round 2 measured the fold by hand
+   on the shipped assembly: −2.5 %, and it brings the word loop to nine
+   instructions, exactly gcc's count — the remaining 22 % is *not* this fold
+   (alignment and callee call overhead were excluded), so the item is worth
+   shipping for its own sake but must not be sold as the gap.
 2. **Switch lowering for constant results.** `switch(x)` returning a constant per
    case compiles to a jump table plus a frame (`pushq %rbx`, `movq %rdi,%rbx`,
    `.Ljt_0`) in lccc and to a plain value table in gcc (`xorl %eax,%eax / cmpl
