@@ -605,6 +605,12 @@ jobs:
       run: python3 tests/regression/check_ci_gcc16_provisioning.py
     - name: Verify linker-oracle provisioning contracts (mock only)
       run: python3 tests/regression/check_ci_link_oracle_provisioning.py
+    # The tag-transport restorer is the offline path to the same pinned
+    # oracles. Its refusals (manifest disagreement, digest mismatch, wrong
+    # version, missing member, split payload) are the contract; exercised
+    # against a mock repository with mock tags, compiler-free, ~1 s.
+    - name: Verify oracle tag-restore contracts (mock only)
+      run: python3 tests/regression/check_oracle_toolchains_from_tags.py
     - name: Verify swap provisioning contracts (mock only)
       run: python3 tests/regression/check_ci_swap_provisioning.py
     # The oracle toolchain is a per-pipeline cache now, so its contract is

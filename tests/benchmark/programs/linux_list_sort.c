@@ -2,7 +2,8 @@
  * Workload-derived kernel: Linux 6.18, lib/list_sort.c.
  *
  * The bottom-up merge sort below is extracted from the Linux kernel's
- * lib/list_sort.c (GPL-2.0-or-later). The kernel's `list_head`, locking,
+ * lib/list_sort.c (GPL-2.0-only; the file's SPDX header is `GPL-2.0`, not
+ * `-or-later`). The kernel's `list_head`, locking,
  * EXPORT_SYMBOL machinery and <linux/...> headers were replaced with a local
  * node type and a plain comparison callback; the merge and count-run structure
  * is the kernel's. Names are prefixed. Full source provenance is in

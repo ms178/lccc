@@ -142,16 +142,30 @@ verify_digest() {  # verify_digest <file> <expected> <label>
 }
 
 # The in-tree manifest must agree with the table above; see TAG payload table.
+# A member transported whole has a manifest digest to compare directly. A
+# member transported in `.partNN` chunks has only per-chunk digests there, none
+# of which can equal the whole-member pin -- comparing `.part00`'s chunk digest
+# against it (as an earlier version did) is a guaranteed false mismatch that
+# would make the split transport unusable. In the split case the manifest
+# crosscheck only proves the tag knows the member; the member itself is proved
+# by `verify_digest` after concatenation, against the in-script pin.
 manifest_crosscheck() {  # manifest_crosscheck <tag> <member> <sha>
-    local tag=$1 member=$2 expected=$3 from_tag
+    local tag=$1 member=$2 expected=$3 from_tag parts_listed
     from_tag=$(git show "$tag:MANIFEST.sha256" 2>/dev/null | awk -v m="$member" '
-        { sub(/^\.\//, "", $2); if ($2 == m || $2 == m ".part00") print $1 }' | head -n 1)
-    if [ -z "$from_tag" ]; then
-        die "$tag:MANIFEST.sha256 lists no digest for $member"
+        { sub(/^\.\//, "", $2); if ($2 == m) print $1 }' | head -n 1)
+    if [ -n "$from_tag" ]; then
+        if [ "$from_tag" != "$expected" ]; then
+            die "$tag:MANIFEST.sha256 disagrees with this script about $member"$'\n'"  manifest: $from_tag"$'\n'"  script  : $expected"$'\n'"  A re-issued payload needs both updated together."
+        fi
+        return 0
     fi
-    if [ "$from_tag" != "$expected" ]; then
-        die "$tag:MANIFEST.sha256 disagrees with this script about $member"$'\n'"  manifest: $from_tag"$'\n'"  script  : $expected"$'\n'"  A re-issued payload needs both updated together."
+    parts_listed=$(git show "$tag:MANIFEST.sha256" 2>/dev/null | awk -v m="$member" '
+        { sub(/^\.\//, "", $2); if ($2 ~ "^" m "\\.part[0-9]+$") n++ } END { print n + 0 }')
+    if [ "$parts_listed" -gt 0 ]; then
+        log "$member is split into $parts_listed parts in $tag; whole-member digest is verified after concatenation"
+        return 0
     fi
+    die "$tag:MANIFEST.sha256 lists no digest for $member"
 }
 
 # ---- install layout ---------------------------------------------------------
@@ -204,8 +218,17 @@ restore_toolchain() {  # restore_toolchain <tag> <member> <sha> <root> <label>
         verify_digest "$file" "$sha" "$label"
     fi
     log "extracting $label into $root"
-    mkdir -p "$root"
-    tar -xf "$file" -C "$root" --strip-components=1 || die "extraction of $label failed"
+    # Extract beside the target and rename into place: an interrupted tar must
+    # not leave a `$root` directory that the reuse check above then mistakes
+    # for a complete install on the next run.
+    local staging=$root.partial.$$
+    rm -rf "$staging"
+    mkdir -p "$staging"
+    if ! tar -xf "$file" -C "$staging" --strip-components=1; then
+        rm -rf "$staging"
+        die "extraction of $label failed"
+    fi
+    mv "$staging" "$root"
 }
 
 restore_toolchain "$TAG_GCC" "$GCC_MEMBER" "$GCC_SHA" "$GCC_ROOT" "gcc-$GCC_VERSION"
@@ -299,7 +322,7 @@ log "$mold_line"
 # research preference. Proving the driver can actually LINK (not just print a
 # version) catches a prefix whose headers or libgcc were not carried with it.
 probe_dir=$(mktemp -d)
-trap 'rm -rf "$probe_dir"' EXIT
+trap 'rm -rf "$probe_dir" "${src:-}"' EXIT
 printf 'int main(void){return 0;}\n' > "$probe_dir/t.c"
 "$gcc_bin" -O2 "$probe_dir/t.c" -o "$probe_dir/t16" -B"$GCC_ROOT/bin" 2>/dev/null \
     || die "gcc-16 cannot link a trivial program (incomplete prefix?)"

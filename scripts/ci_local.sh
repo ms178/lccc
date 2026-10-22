@@ -408,6 +408,9 @@ gate "builtin-float-aliases" fast \
 gate "link-oracle-provisioning-mocks" fast \
     python3 tests/regression/check_ci_link_oracle_provisioning.py
 
+gate "oracle-tag-restore-mocks" fast \
+    python3 tests/regression/check_oracle_toolchains_from_tags.py
+
 gate "swap-provisioning-mocks" fast \
     python3 tests/regression/check_ci_swap_provisioning.py
 

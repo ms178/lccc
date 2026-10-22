@@ -2,7 +2,7 @@
  * Workload-derived kernel: GNU gzip 1.14, deflate.c, longest_match().
  *
  * The match-finder loop below is extracted from GNU gzip's deflate.c
- * (LGPL-3.0-or-later). Configuration macros, the sliding-window/output
+ * (GPL-3.0-or-later; deflate.c is gzip proper, not a gnulib LGPL file). Configuration macros, the sliding-window/output
  * machinery, zlib's gz* interfaces and the hash-table *insertion* policy were
  * removed; the hash chain is built once by this harness and then searched
  * exactly as longest_match() does. Names are prefixed. Full source provenance
