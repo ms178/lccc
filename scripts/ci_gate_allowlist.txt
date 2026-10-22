@@ -6,7 +6,6 @@
 #
 # Entries marked "needs triage" / "env" were failing locally at audit time.
 tests/regression/check_abi_reg_hints.sh  # passes locally; not yet wired into ci_local.sh / a workflow
-tests/regression/check_affine_map_vectorization_codegen.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_alu_audit_fixes.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_andn_fusion.sh  # passes locally; not yet wired into ci_local.sh / a workflow
 tests/regression/check_arm_csinc_select.sh  # needs aarch64-linux-gnu-gcc cross-compiler (not on CI image)

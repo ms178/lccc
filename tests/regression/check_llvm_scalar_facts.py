@@ -219,59 +219,36 @@ def main():
                 env=env | {"CCC_HOT_WEB_STEAL": cap},
             )
             run([str(p / "hot")])
-        # Mechanism witness.  The steal only fires where a callee-saved home
-        # is held ENTIRELY by cold, non-loop values: since
-        # `37d6130` (protect loop-carried state from the values only read on a
-        # cold path) a register co-holding another loop web is refused, so the
-        # original witness (hot_web_callee_saved.c) no longer produces a steal
-        # -- its six homes are all loop webs, which is the *protected* shape.
-        # Asserting "asm differs" on it was therefore an assertion about a
-        # mechanism that cannot fire there.  Two contracts replace it:
-        #
-        #   1. WITNESS: a shape where the steal does fire must change codegen
-        #      when the knob is set -- the mechanism is wired, reachable and
-        #      disableable.  `cmp_replay_far.c`'s `main` steals 1 web at -O2
-        #      (vid 217 -> reg 1, evicting vid 196, cost 12 against a hot
-        #      count of 310), measured on the from-source fastbuild of 5e7a31d2.
-        #
-        #      The previous witness, `cmp_replay_acc_nohome.c`, was retired
-        #      DELIBERATELY, and the reason matters: its web is still stolen
-        #      (vid 253 -> reg 1, evicting vid 9, cost 3 against a hot count of
-        #      20), so the mechanism has not stopped firing on it.  What
-        #      changed is the code: the allocator now reaches the same home
-        #      without the steal, so the knob no longer changes that file's
-        #      assembly.  A witness must change the CODE, not merely the
-        #      decision, so it was replaced rather than re-pinned as
-        #      "identical" (which would freeze an accident of the current
-        #      allocator).
-        #   2. PROTECTED: the loop-web fixture must be byte-identical with the
-        #      knob off and on -- the policy refuses to evict a register that
-        #      co-holds loop state.  If that flips, the protection regressed
-        #      and this pin must be re-baselined deliberately, not silently.
-        witness = ROOT / "tests/regression/cmp_replay_far.c"
-        witness_fn = "main"
-        for disabled in [False, True]:
-            settings = env | ({"CCC_NO_HOT_WEB_STEAL": "1"} if disabled else {})
-            for source, stem in ((hot, "hot"), (witness, "witness")):
-                run(
-                    [args.compiler, "-O2", "-S", str(source),
-                     "-o", str(p / f"{stem}-{disabled}.s")],
-                    env=settings,
-                )
-        if body((p / "witness-False.s").read_text(), witness_fn) == body(
-            (p / "witness-True.s").read_text(), witness_fn
-        ):
-            raise ValueError(
-                f"hot web: enable/disable does not change the witness "
-                f"({witness.name}:{witness_fn}); the steal still needs a shape "
-                f"whose assembly it actually changes -- re-baseline this pin "
-                f"deliberately (see the comment above), do not delete it"
+        # Positive control: the benchmark-shaped witness must change when the
+        # register-steal knob is disabled; this proves the control still reaches
+        # a live mechanism rather than merely accepting an inert environment
+        # variable. The fixture is kept in the benchmark corpus so its shape is
+        # externally exercised as well.
+        witness = ROOT / "tests/benchmark/programs/zlib_ng_adler32_combine.c"
+        settings_by_state = {
+            disabled: env | ({"CCC_NO_HOT_WEB_STEAL": "1"} if disabled else {})
+            for disabled in (False, True)
+        }
+        for disabled, settings in settings_by_state.items():
+            run(
+                [args.compiler, "-O2", "-S", str(witness),
+                 "-o", str(p / f"witness-{disabled}.s")],
+                env=settings,
             )
-        if (p / "hot-False.s").read_text() != (p / "hot-True.s").read_text():
+            run(
+                [args.compiler, "-O2", "-S", str(hot),
+                 "-o", str(p / f"protected-{disabled}.s")],
+                env=settings,
+            )
+        if (p / "witness-False.s").read_text() == (p / "witness-True.s").read_text():
             raise ValueError(
-                "hot web: the loop-web protection fixture is no longer "
-                "invariant under the knob (hot_web_callee_saved.c): a "
-                "callee-saved home co-held by loop state was evicted"
+                f"hot web: enable/disable does not change the pressure witness ({witness})"
+            )
+        if (p / "protected-False.s").read_text() != (p / "protected-True.s").read_text():
+            raise ValueError(
+                "hot web: the loop-web protection fixture is no longer invariant "
+                "under the knob (hot_web_callee_saved.c): a callee-saved home "
+                "co-held by loop state was evicted"
             )
     print("scalar-facts: PASS (native, disabled controls, IR/RA verification and mechanisms)")
 

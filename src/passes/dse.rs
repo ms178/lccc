@@ -35,6 +35,18 @@
 //!   other pointer (including callees), so their pending entries survive
 //!   unresolvable loads and calls. Globals are always open (other
 //!   translation units can hold their address).
+//! * A 16-byte *load intrinsic* (`Loaddqu`, `Loadldi128`) whose loaded value
+//!   has no uses and whose destination slot is a **private** alloca —
+//!   mentioned exactly once in the whole function, by that instruction — is
+//!   removed outright. The generated SIMD wrappers read a builtin's result
+//!   back out of the slot it wrote (`__CCC_M128D_FROM_BUILTIN(p)` is
+//!   `*(__m128d *)p`), and when that value is immediately recycled as an
+//!   operand pointer by the next intrinsic — `_mm_storeu_pd(o,
+//!   _mm_min_pd(x, y))` — the dereference is a load into a fresh temp that
+//!   nothing reads. It costs a slot store and a reload per occurrence, and it
+//!   stops the value from being forwarded: measured on the SSE2 codegen
+//!   matrix, `minpd`/`maxpd`/`divpd`/`shufpd`/`cmppd` all carried 6-20
+//!   instructions of this traffic over the same kernel written with `addpd`.
 //! * Volatile stores are never eliminated but may overwrite (kill) earlier
 //!   stores; volatile loads read memory and kill like ordinary loads.
 //!   Segment-relative reads are opaque barriers: their offsets cannot be
@@ -549,13 +561,110 @@ fn dse_block(block: &crate::ir::reexports::BasicBlock, ctx: &DseContext) -> Vec<
     dead
 }
 
+/// Does this instruction only read memory into `dest_ptr`, with no other
+/// observable effect?  Exactly the 16-byte load intrinsic families; the list
+/// is explicit rather than derived from `is_pure()` because a load intrinsic
+/// is a *write* to its destination slot while `is_pure()` is about the absence
+/// of memory effects altogether.
+fn is_pure_slot_load(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
+    use crate::ir::intrinsics::IntrinsicOp as O;
+    matches!(op, O::Loaddqu | O::Loadldi128)
+}
+
+/// Remove 16-byte load intrinsics whose loaded value is dead and whose
+/// destination slot is private to them.
+///
+/// Fail-closed: the slot must be an alloca mentioned EXACTLY ONCE in the whole
+/// function (this instruction's `dest_ptr`), so nothing else can read what it
+/// writes; the loaded value must have no operand or terminator uses.  See the
+/// module header for why this shape is common enough to be worth a pass of its
+/// own.
+pub(crate) fn eliminate_dead_private_slot_loads(func: &mut IrFunction) -> usize {
+    // No environment read here on purpose: both call sites own their gate.
+    // `eliminate_dead_stores` has already checked `CCC_NO_DSE`, and the driver
+    // phase (`deadslotload`) goes through `pass_disabled`.  A third read would
+    // also grow the audited pass-pipeline environment-read budget for nothing.
+    if func.blocks.is_empty() {
+        return 0;
+    }
+    // Mention count per value: every operand of every instruction (which
+    // includes an intrinsic's `dest_ptr`) plus every terminator use.
+    let mut mentions: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut alloca_defs: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca { dest, .. } = inst {
+                alloca_defs.insert(dest.0);
+            }
+            // Two iterators, because they cover disjoint fields: the operand
+            // walk visits `Intrinsic.args`, and `dest_ptr` is only visible to
+            // the *use* walk.  Counting one and not the other counted a slot
+            // written by the instruction that the candidate also names as its
+            // destination as "mentioned once", which deleted a live load
+            // (`simd_movnt`: the `movntdq` destination slot disappeared).
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    *mentions.entry(v.0).or_insert(0) += 1;
+                }
+            });
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                *mentions.entry(v.0).or_insert(0) += 1;
+            });
+        }
+        block.terminator.for_each_used_value(|v: u32| {
+            *mentions.entry(v).or_insert(0) += 1;
+        });
+    }
+
+    // `mentions` counts operands only, so a value with no entry is unused.
+    let mut removed = 0usize;
+    for block in func.blocks.iter_mut() {
+        let before = block.instructions.len();
+        let span = std::mem::take(&mut block.source_spans);
+        let has_spans = span.len() == before && !span.is_empty();
+        let mut new_span: Vec<_> = Vec::with_capacity(before);
+        let mut keep: Vec<Instruction> = Vec::with_capacity(before);
+        for (i, inst) in block.instructions.drain(..).enumerate() {
+            let dead = match &inst {
+                Instruction::Intrinsic {
+                    dest: Some(d),
+                    op,
+                    dest_ptr: Some(slot),
+                    ..
+                } => {
+                    is_pure_slot_load(op)
+                        && alloca_defs.contains(&slot.0)
+                        && mentions.get(&slot.0).copied() == Some(1)
+                        && mentions.get(&d.0).copied().unwrap_or(0) == 0
+                }
+                _ => false,
+            };
+            if dead {
+                removed += 1;
+            } else {
+                if has_spans {
+                    new_span.push(span[i].clone());
+                }
+                keep.push(inst);
+            }
+        }
+        block.instructions = keep;
+        if has_spans {
+            block.source_spans = new_span;
+        } else {
+            block.source_spans = span;
+        }
+    }
+    removed
+}
+
 /// Run same-block dead store elimination on one function.
 pub(crate) fn eliminate_dead_stores(func: &mut IrFunction) -> usize {
     if func.blocks.is_empty() || std::env::var_os("CCC_NO_DSE").is_some() {
         return 0;
     }
+    let mut total = eliminate_dead_private_slot_loads(func);
     let ctx = DseContext::build(func);
-    let mut total = 0usize;
     for block in func.blocks.iter_mut() {
         let dead = dse_block(block, &ctx);
         if dead.is_empty() {

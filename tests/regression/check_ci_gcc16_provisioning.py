@@ -38,6 +38,7 @@ MULTILIB_PACKAGES = BASE_PACKAGES + (
     "libc6-dev-i386",
     "lib32gcc-16-dev",
 )
+ORACLE_PACKAGES = ("qemu-user", "mold", "lld", "python3-yaml")
 
 MOCK = r'''
 import json, os, pathlib, re, sys
@@ -51,6 +52,8 @@ with open(os.environ['MOCK_LOG'], 'a') as handle:
 
 distro = set(os.environ.get(
     'DISTRO_INDEX', 'gcc-multilib g++-multilib libc6-dev-i386 clang-16').split())
+distro |= set(os.environ.get(
+    'EXTRA_INDEX', 'qemu-user mold lld python3-yaml').split())
 ppa = set(os.environ.get(
     'PPA_INDEX',
     'gcc-16 g++-16 gcc-16-multilib g++-16-multilib lib32gcc-16-dev').split())
@@ -194,7 +197,8 @@ elif name == 'apt-get':
             sys.exit(100)
         if '--dry-run' not in args:
             bump('.installs')
-            mark_installed(requested)
+            omitted = os.environ.get('APT_OMIT_PACKAGE')
+            mark_installed([package for package in requested if package != omitted])
         sys.exit(0)
 elif name == 'add-apt-repository':
     path('.ppa').touch()
@@ -225,8 +229,11 @@ class ProvisioningTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
         return directory
 
-    def invoke(self, mode="--base", distro="ubuntu", uid=0, **overrides):
-        requested = BASE_PACKAGES if mode == "--base" else MULTILIB_PACKAGES
+    def invoke(self, mode="--base", distro="ubuntu", uid=0,
+               extras=None, print_packages=False, **overrides):
+        requested = tuple(BASE_PACKAGES if mode == "--base" else MULTILIB_PACKAGES)
+        if extras is not None:
+            requested += tuple(extras)
         directory = self.sandbox()
         if True:
             mock = directory / "mock"
@@ -255,8 +262,13 @@ class ProvisioningTests(unittest.TestCase):
                    "LCCC_CI_APT_RETRY_DELAY": "0",
                    "REQUESTED": " ".join(requested),
                    **overrides}
-            result = subprocess.run(["bash", str(script), mode],
-                                    env=env, text=True, capture_output=True, timeout=60)
+            command = ["bash", str(script), mode]
+            if extras is not None:
+                command.extend(("--extras", " ".join(extras)))
+            if print_packages:
+                command.append("--print-packages")
+            result = subprocess.run(command, env=env, text=True,
+                                    capture_output=True, timeout=60)
             commands = ([json.loads(line) for line in log.read_text().splitlines()]
                         if log.exists() else [])
             state = directory / "state"
@@ -279,6 +291,50 @@ class ProvisioningTests(unittest.TestCase):
         self.assertEqual(self.updates(commands), [])
         self.assertEqual(len(self.installs(commands)), 1)
         self.assertFalse(any(c[0] == "add-apt-repository" for c in commands))
+
+    def test_all_oracles_share_one_multilib_install_transaction(self):
+        requested = MULTILIB_PACKAGES + ORACLE_PACKAGES
+        result, commands, _ = self.invoke(
+            "--multilib", extras=ORACLE_PACKAGES, DISTRO_HAS_GCC16="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installs = self.installs(commands)
+        self.assertEqual(len(installs), 1, commands)
+        for package in requested:
+            self.assertIn(package, installs[0])
+        self.assertFalse(any(c[0] == "add-apt-repository" for c in commands))
+
+    def test_print_packages_reports_the_exact_multilib_request_without_installing(self):
+        result, commands, _ = self.invoke(
+            "--multilib", extras=ORACLE_PACKAGES, print_packages=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(), list(MULTILIB_PACKAGES + ORACLE_PACKAGES))
+        self.assertFalse(any(c[0] in {
+            "sudo", "dpkg", "apt-get", "apt-cache", "add-apt-repository",
+            "gcc-16", "g++-16",
+        } for c in commands), commands)
+
+    def test_zero_status_install_missing_an_oracle_package_fails_closed(self):
+        result, commands, _ = self.invoke(
+            "--multilib", extras=ORACLE_PACKAGES, DISTRO_HAS_GCC16="1",
+            APT_OMIT_PACKAGE="mold")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.installs(commands)), 1)
+        self.assertIn("the install itself failed or left packages uninstalled: mold",
+                      result.stderr)
+
+    def test_missing_oracle_names_are_exact_and_never_trigger_the_gcc_ppa(self):
+        # apt-cache pkgnames returns prefix matches too. The final exact-name
+        # filter must reject both near-miss packages instead of accepting them
+        # as mold/lld or adding the GCC-specific PPA for unrelated oracles.
+        result, commands, _ = self.invoke(
+            "--multilib", extras=ORACLE_PACKAGES, DISTRO_HAS_GCC16="1",
+            EXTRA_INDEX="mold-tools lld-23 qemu-user python3-yaml")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mold", result.stderr)
+        self.assertIn("lld", result.stderr)
+        self.assertFalse(any(c[0] == "add-apt-repository" for c in commands))
+        self.assertEqual(self.installs(commands), [])
 
     def test_ppa_fallback_only_when_needed(self):
         result, commands, _ = self.invoke()
@@ -480,9 +536,10 @@ class ProvisioningTests(unittest.TestCase):
         # contract.
         with tempfile.TemporaryDirectory() as outer:
             archive = Path(outer) / "apt-archive"
-            self.write_cached_debs(archive, MULTILIB_PACKAGES)
+            self.write_cached_debs(archive, MULTILIB_PACKAGES + ORACLE_PACKAGES)
             result, commands, _ = self.invoke(
-                "--multilib", LCCC_CI_APT_ARCHIVE_DIR=str(archive),
+                "--multilib", extras=ORACLE_PACKAGES,
+                LCCC_CI_APT_ARCHIVE_DIR=str(archive),
                 PPA_INDEX_FAILURES="99", GITHUB_ACTIONS="true")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(self.installs(commands), [], "no index, no apt install")
@@ -497,9 +554,10 @@ class ProvisioningTests(unittest.TestCase):
         # partial toolchain.
         with tempfile.TemporaryDirectory() as outer:
             archive = Path(outer) / "apt-archive"
-            self.write_cached_debs(archive, MULTILIB_PACKAGES[:-1])
+            self.write_cached_debs(archive, MULTILIB_PACKAGES + ORACLE_PACKAGES[:-1])
             result, commands, _ = self.invoke(
-                "--multilib", LCCC_CI_APT_ARCHIVE_DIR=str(archive),
+                "--multilib", extras=ORACLE_PACKAGES,
+                LCCC_CI_APT_ARCHIVE_DIR=str(archive),
                 PPA_INDEX_FAILURES="99", GITHUB_ACTIONS="true")
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(any(c[0] == "dpkg" and "-i" in c for c in commands), commands)

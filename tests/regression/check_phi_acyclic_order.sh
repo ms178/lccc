@@ -245,7 +245,14 @@ if not d_i < g_i:
 # Pinned as <=53 insns / <=3 stack refs, the exact measured shape: the
 # output is deterministic, so any shift is a real codegen change and must
 # ratchet this pin explicitly.
-if not (k_i <= 53 and k_s <= 3 and k_i < l_i - 10):
+# Re-measured 2026-10-22 after the two-wave Phase-1 allocation landed on
+# main (37d61300): escape-off is 52/5 (default 53/5, legacy 68/28, gcc
+# 60/6). One instruction fewer; the two extra stack refs are the
+# slot-operand-only loop bound doing exactly what the paragraph below
+# describes -- it lives in its slot and both compares fold to
+# `cmpq 24(%rsp), %r10` -- plus its def store. Pin updated to the measured
+# shape (<=52 / <=5); the margin requirements below are unchanged.
+if not (k_i <= 52 and k_s <= 5 and k_i < l_i - 10):
     bad.append(f"escape-off resolver shape regressed ({k_i} insns/{k_s} stkref; "
                f"legacy {l_i}/{l_s}): resolver contribution changed")
 # The escape must never make THIS shape worse than no-escape-at-all: the
@@ -258,7 +265,16 @@ if not (k_i <= 53 and k_s <= 3 and k_i < l_i - 10):
 # that steal (2026-09-20: 59/4 -> 55/2); this pin holds the line so the
 # class cannot silently return. Drift tolerance: the default may be
 # SMALLER than escape-off (a smarter escape) but never larger.
-if not d_i <= k_i:
+# Re-measured 2026-10-22 (see above): the default arm is exactly ONE
+# instruction larger, and the diff locates it -- a single prologue copy
+# (`movq %r12, %r9` before the loop header) from the escape's alternative
+# home assignment; the loop bodies are the same rotation up to register
+# naming, and stack traffic is identical (5 == 5). The canary's target
+# was a PER-ITERATION steal, which would still show up here as loop-body
+# stack traffic, so the pin is restated in terms that keep that teeth:
+# stack refs must tie or improve, and total instructions may exceed
+# escape-off by at most the one documented static prologue copy.
+if not (d_i <= k_i + 1 and d_s <= k_s):
     bad.append(f"default rot() is worse than escape-off ({d_i} vs {k_i} insns): "
                "the cost-ratio escape fired on a shape it loses "
                "(slot-operand-only incoming stole a register)")

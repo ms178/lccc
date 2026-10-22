@@ -935,8 +935,10 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
 
 /// Break a private spill cycle without changing register allocation:
 ///
-///     movl MEM, S32; movl S32, T; movslq D32, S64;
-///     movq S64, A; movl T, D32
+/// ```text
+/// movl MEM, S32; movl S32, T; movslq D32, S64;
+/// movq S64, A; movl T, D32
+/// ```
 ///
 /// becomes `movslq D32,S64; movq S64,A; movl MEM,D32; movl D32,T`.
 /// The two slots must be disjoint and the frame unescaped, so MEM cannot

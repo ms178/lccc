@@ -6,7 +6,8 @@ records the assignment in `.github/ci-lane-plan.json`.  The workflow, not the
 plan, is what runs, so this gate is what keeps them honest -- and every failure
 mode here is SILENT in a green run:
 
-* a gate listed in both shards runs twice and costs twice;
+* a gate listed in both shards runs twice and costs twice, or repeated within
+  one shard escapes the recorded cost;
 * a gate that fell out of both shards is lost coverage, and only an audit of
   the union notices;
 * a shard that lost a preamble step (the toolchain cache, the oracle probe)
@@ -30,6 +31,7 @@ import argparse
 import json
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -487,6 +489,11 @@ def audit(document: dict, plan: dict) -> list[str]:
                     present.append(gate)
                     if gate not in known:
                         unknown.append(gate)
+            for gate, count in Counter(present).items():
+                if gate in known and count > 1:
+                    problems.append(
+                        f"{lane}: planned gate {gate!r} runs {count} times; "
+                        f"every gate in its shard must run exactly once")
             for gate in unknown:
                 problems.append(f"{lane}: {gate!r} runs here but the plan does not "
                                 f"know it: a hand-added gate bypasses the balance "
@@ -557,6 +564,13 @@ def self_test() -> None:
     extra["jobs"]["lane-b"]["steps"] = setup + [step("gate 3"), step("gate smuggled")]
     assert any("does not" in p and "know it" in p for p in audit(extra, plan)), \
         audit(extra, plan)
+
+    # A planned gate repeated within one shard must not hide behind set-based
+    # membership checks or escape the recorded cost.
+    duplicate = json.loads(json.dumps(doc))
+    duplicate["jobs"]["lane-a"]["steps"].insert(3, step("gate 1"))
+    problems = audit(duplicate, plan)
+    assert any("gate 'gate 1' runs 2 times" in problem for problem in problems), problems
 
     # A shard that lost a preamble step (a cache, an oracle probe).
     drift = json.loads(json.dumps(doc))
@@ -726,7 +740,7 @@ def self_test() -> None:
     assert provisioning_extras_problems('EXTRAS="qemu-user valgrind libc6-dbg"') == []
     assert provisioning_extras_problems("PACKAGES=qemu") != []
 
-    print("check_ci_lane_plan: self-test PASS (18 rules, 25 fixtures)")
+    print("check_ci_lane_plan: self-test PASS (19 rules, 26 fixtures)")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1057,17 +1057,35 @@ impl X86Codegen {
                 true
             }
             // ---- 128/256-bit FP (via VEX, mirroring the 256-bit AVX pattern) ----
+            AddSd128 | SubSd128 | MulSd128 | DivSd128 | MinSd128 | MaxSd128 | SqrtSd128
+            | AddSs128 | SubSs128 | MulSs128 | DivSs128 | MinSs128 | MaxSs128 | SqrtSs128 => {
+                self.emit_sse_fp_128_op(dptr, op, args);
+                true
+            }
             DivPs128 | MinPs128 | MaxPs128 | DivPd128 | MinPd128 | MaxPd128 => {
-                let (inst, is_ps) = match op {
-                    DivPs128 => ("divps", true),
-                    MinPs128 => ("minps", true),
-                    MaxPs128 => ("maxps", true),
-                    DivPd128 => ("divpd", false),
-                    MinPd128 => ("minpd", false),
-                    MaxPd128 => ("maxpd", false),
+                let inst = match op {
+                    DivPs128 => "divps",
+                    MinPs128 => "minps",
+                    MaxPs128 => "maxps",
+                    DivPd128 => "divpd",
+                    MinPd128 => "minpd",
+                    MaxPd128 => "maxpd",
                     _ => unreachable!(),
                 };
-                self.emit_sse_fp_128(dptr, args, inst, is_ps);
+                // Same emitter as `addpd`/`mulpd`: it is where the elided-load
+                // fold, the in-place two-operand coalescing and the
+                // deferred-store protocol live, so the op consumes the loaded
+                // value in place.  The bare load-op-store form these six used
+                // to share staged BOTH operands through their 8-aligned slots
+                // and reloaded them, costing 20 instructions where the
+                // identical `addpd` kernel needed 14.
+                //
+                // These six mnemonics are exactly the legacy-SSE binary ops
+                // `sse128_mnemonic_commutative` does NOT list: FP min/max pick
+                // an operand by value (NaN and ±0 asymmetry) and div is
+                // ordered, so the fold must never swap them into the src1
+                // position.  `emit_sse_binary_128` reads that table.
+                self.emit_sse_binary_128(dptr, args, inst);
                 true
             }
             SqrtPs128 | RcpPs128 | RsqrtPs128 | SqrtPd128 => {
@@ -1494,6 +1512,8 @@ impl X86Codegen {
             CvttSd2Si128 => ("cvttsd2si", 0, true),
             CvtSs2Si128 => ("cvtss2si", 0, true),
             CvtSd2Si128 => ("cvtsd2si", 0, true),
+            CvttSs2Si128 => ("cvttss2si", 0, true),
+            CvttSd2Si128 => ("cvttsd2si", 0, true),
             TestzPs128 => ("vtestps", 0, true),
             TestzPs256 => ("vtestps", 0, true),
             ReduceAddEpu32_512 => ("__reduce_add_epu32", 0, false),
@@ -1630,20 +1650,6 @@ fn simd_value_id(op: &Operand) -> u32 {
 }
 
 impl X86Codegen {
-    /// 128-bit SSE FP binary (2-op AT&T): `inst %xmm1, %xmm0`.
-    fn emit_sse_fp_128(&mut self, dest_ptr: &Value, args: &[Operand], inst: &str, _is_ps: bool) {
-        // Legacy SSE arithmetic with a MEMORY operand requires 16-byte
-        // alignment (unlike VEX). Slots are only 8-aligned, so memory
-        // operands must NEVER be folded here — always load via movups.
-        self.flush_pending_vec_store_impl();
-        self.state.invalidate_vec_peephole();
-        self.sse_load_arg(&args[0], "xmm0");
-        self.sse_load_arg(&args[1], "xmm1");
-        self.state
-            .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
-        self.sse_store_dest(dest_ptr, "xmm0");
-    }
-
     /// 128-bit SSE FP op dispatch (all shapes).
     fn emit_sse_fp_128_op(&mut self, dest_ptr: &Value, op: &IntrinsicOp, args: &[Operand]) {
         use IntrinsicOp::*;
@@ -1656,6 +1662,28 @@ impl X86Codegen {
                 .emit_fmt(format_args!("    {} %xmm0, %xmm0", inst));
             this.sse_store_dest(dest_ptr, "xmm0");
         };
+        // Scalar (low-lane) float ops, straight from the op table.  Legacy SSE
+        // `addsd src, dst` computes `dst.lo = dst.lo op src.lo` and leaves every
+        // other bit of `dst` untouched, which is exactly the `_mm_*_sd`
+        // contract with args[0] in dst: one instruction, no lane shuffling.
+        // The destination supplies the preserved lanes, which is also what
+        // makes `sqrtsd %xmm1, %xmm0` (`_mm_sqrt_sd(a, b)`: a's high half,
+        // sqrt of b's low half) correct.  `_mm_sqrt_ss(a)` is the ONE-operand
+        // form — its preserved lanes come from `a` itself — so it uses the
+        // unary shape.  Nothing here can panic: an op outside the table simply
+        // falls through to the dispatch below.
+        if let Some(inst) = op.sse_scalar_fp_mnemonic() {
+            if matches!(op, SqrtSs128) {
+                unary(self, inst);
+            } else {
+                self.sse_load_arg(&args[0], "xmm0");
+                self.sse_load_arg(&args[1], "xmm1");
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm1, %xmm0", inst));
+                self.sse_store_dest(dest_ptr, "xmm0");
+            }
+            return;
+        }
         match op {
             SqrtPs128 => unary(self, "sqrtps"),
             RcpPs128 => unary(self, "rcpps"),

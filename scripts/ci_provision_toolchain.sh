@@ -16,9 +16,10 @@
 #   1. cached bundle    `ci_toolchain_bundle.sh restore` of a tarball built
 #                       once per (runner image, installer) pair.  Measured
 #                       restore: a few seconds for a 262 MB tree.
-#   2. apt              `ci_install_gcc16.sh` (which already falls back to a
-#                       local .deb archive when the package index is
-#                       unavailable), then the extras in one transaction.
+#   2. apt              one `ci_install_gcc16.sh --multilib --extras ...`
+#                       request for GCC and every oracle package. Exact-name
+#                       index checks, bounded retries and the cached-.deb
+#                       fallback all cover the complete request.
 #
 # Every lane provisions the SAME package set, i686 multilib included: a bundle
 # that cannot link `-m32` fails `verify`, so a 64-bit-only variant would poison
@@ -168,8 +169,11 @@ if [[ $ROOT != / ]]; then
     die "cannot install into $ROOT; --root is only supported for a restored bundle"
 fi
 
-# Package delta, so the exported bundle holds exactly the transaction's files
-# (the runner image already ships libc, binutils and friends).
+# Capture the package delta for newly installed/upgraded dependencies, then
+# union it with the installer's exact request. The requested packages must be
+# in the bundle even when the runner image already had them installed (notably
+# python3-yaml); otherwise restore would pass on the warm lane but fail the
+# bundle contract on the next runner.
 snapshot_packages() {
     dpkg-query -W -f='${Package} ${Version}\n' 2>/dev/null | LC_ALL=C sort
 }
@@ -182,24 +186,35 @@ if (( ! NO_BUNDLE )); then
     snapshot_packages > "$before"
 fi
 
-bash "$REPO/scripts/ci_install_gcc16.sh" --multilib
-if [[ -n $EXTRAS ]]; then
-    # shellcheck disable=SC2086 # intentional word splitting: a package list
-    as_root apt-get install -y --no-install-recommends $EXTRAS
-fi
+bash "$REPO/scripts/ci_install_gcc16.sh" --multilib --extras "$EXTRAS"
+# Keep PR #903's linker-oracle installer as a fail-closed postcondition. The
+# normal cold path has already installed mold/lld in the same retryable apt
+# transaction above, so this is a network-free PATH check. If a future package
+# set or installer regression leaves either driver absent, the dedicated
+# bounded-retry installer repairs it before the bundle snapshot/export. The
+# warm path reaches the equivalent checks through `ci_toolchain_bundle.sh
+# verify` and never needs a second provisioning step.
+bash "$REPO/scripts/ci_install_link_oracles.sh"
 
 if (( ! NO_BUNDLE )); then
     after=$BUNDLE_DIR/.packages.after
     snapshot_packages > "$after"
-    # Every package the transaction added OR changed version.  An upgrade of a
-    # preinstalled package (libc6 is the usual one) must be in the bundle for
-    # the restored tree to match what the installer just produced.
+    # Every package the transaction added OR changed version. An upgrade of a
+    # preinstalled dependency (libc6 is the usual one) must be bundled, as must
+    # the exact requested packages even when their versions did not change.
     mapfile -t delta < <(LC_ALL=C comm -13 "$before" "$after" | awk '{print $1}')
-    if (( ${#delta[@]} )); then
-        bash "$BUNDLE_TOOL" export --bundle "$BUNDLE_DIR" --packages "${delta[*]}"
+    package_spec=$(bash "$REPO/scripts/ci_install_gcc16.sh" \
+        --multilib --extras "$EXTRAS" --print-packages)
+    mapfile -t requested_packages <<< "$package_spec"
+    mapfile -t bundle_packages < <(
+        printf '%s\n' "${delta[@]}" "${requested_packages[@]}" \
+            | sed '/^$/d' | LC_ALL=C sort -u
+    )
+    if (( ${#bundle_packages[@]} )); then
+        bash "$BUNDLE_TOOL" export \
+            --bundle "$BUNDLE_DIR" --packages "${bundle_packages[*]}"
     else
-        say "no package delta after install; keeping the installer's own state"
-        NO_BUNDLE=1
+        die "installer returned an empty package list for the bundle"
     fi
     rm -f "$before" "$after"
 fi

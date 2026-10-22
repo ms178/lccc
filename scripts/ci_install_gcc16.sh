@@ -5,9 +5,11 @@
 #
 # Provisioning contract
 # ---------------------
-# Exit 0 means, and only means, that every requested package is installed and
-# the resulting GCC/G++ pair reports one consistent version. Two hosted-runner
-# failure modes decide the shape of this script:
+# A normal invocation exits 0 only when every requested package is installed
+# and the resulting GCC/G++ pair reports one consistent version. The read-only
+# --print-packages mode exposes that exact request to the bundle exporter so
+# preinstalled packages are included in the cache too. Two hosted-runner failure
+# modes decide the shape of this script:
 #
 #  1. `apt-get update` exits 0 even when an individual repository index fails
 #     to download: it prints `W: Some index files failed to download` and
@@ -24,19 +26,79 @@
 #     pkgnames`, which lists real names only.
 #
 # The distribution is tried first; the Ubuntu toolchain PPA is added only when
-# the distribution itself cannot resolve the packages, and a non-Ubuntu host
-# never falls back to an Ubuntu PPA.
+# a compiler package is missing, and a non-Ubuntu host never falls back to an
+# Ubuntu PPA. CI oracle extras (qemu, mold, lld, PyYAML) join the same exact-name
+# resolver and apt transaction, but a missing extra never triggers the GCC PPA.
 set -euo pipefail
 
-MODE=${1:---base}
-case "$MODE" in
-    --base|--multilib) ;;
-    *) echo "usage: $0 [--base|--multilib]" >&2; exit 2 ;;
-esac
+usage() {
+    echo "usage: $0 [--base|--multilib] [--extras \"pkg ...\"] [--print-packages]" >&2
+}
+
+MODE=""
+EXTRAS=""
+extras_seen=0
+PRINT_PACKAGES=0
+while (( $# )); do
+    case $1 in
+        --base|--multilib)
+            if [[ -n $MODE ]]; then
+                usage
+                exit 2
+            fi
+            MODE=$1
+            shift
+            ;;
+        --extras)
+            if (( extras_seen )) || (( $# < 2 )) || [[ $2 == --* ]]; then
+                usage
+                exit 2
+            fi
+            EXTRAS=$2
+            extras_seen=1
+            shift 2
+            ;;
+        --print-packages)
+            if (( PRINT_PACKAGES )); then
+                usage
+                exit 2
+            fi
+            PRINT_PACKAGES=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage
+            exit 2
+            ;;
+    esac
+done
+MODE=${MODE:---base}
 
 if [[ $(uname -s) != Linux ]]; then
     echo "ci_install_gcc16: Linux is required" >&2
     exit 2
+fi
+
+# Keep the compiler subset separate: only its missing names can justify adding
+# the Ubuntu toolchain PPA. The `packages` union below is what the resolver,
+# offline-deb coverage, installed-package check and single apt transaction use.
+compiler_packages=(gcc-16 g++-16)
+if [[ $MODE == --multilib ]]; then
+    # Older helpers still invoke unversioned gcc. Preserve BOTH multilib sets.
+    compiler_packages+=(gcc-16-multilib g++-16-multilib gcc-multilib g++-multilib libc6-dev-i386 lib32gcc-16-dev)
+fi
+extra_packages=()
+if [[ -n $EXTRAS ]]; then
+    read -r -a extra_packages <<< "$EXTRAS"
+fi
+packages=("${compiler_packages[@]}" "${extra_packages[@]}")
+if (( PRINT_PACKAGES )); then
+    printf '%s\n' "${packages[@]}"
+    exit 0
 fi
 
 if (( EUID == 0 )); then
@@ -47,12 +109,6 @@ else
         exit 1
     }
     as_root() { sudo -- "$@"; }
-fi
-
-packages=(gcc-16 g++-16)
-if [[ $MODE == --multilib ]]; then
-    # Older helpers still invoke unversioned gcc. Preserve BOTH multilib sets.
-    packages+=(gcc-16-multilib g++-16-multilib gcc-multilib g++-multilib libc6-dev-i386 lib32gcc-16-dev)
 fi
 
 # LCCC_CI_APT_RETRY_DELAY=0 keeps the mock-driven regression gate fast; CI
@@ -72,6 +128,15 @@ toolchain_ready() {
     [[ -z ${LCCC_CI_GCC_VERSION:-} || $version == "$LCCC_CI_GCC_VERSION" ]] || return 1
     for package in "${packages[@]}"; do
         [[ $(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null) == installed ]] || return 1
+    done
+}
+
+missing_installed_packages() {
+    local package
+    for package in "${packages[@]}"; do
+        if [[ $(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null) != installed ]]; then
+            printf '%s\n' "$package"
+        fi
     done
 }
 
@@ -108,6 +173,13 @@ package_known() {
 missing_packages() {
     local package
     for package in "${packages[@]}"; do
+        package_known "$package" || printf '%s\n' "$package"
+    done
+}
+
+missing_compiler_packages() {
+    local package
+    for package in "${compiler_packages[@]}"; do
         package_known "$package" || printf '%s\n' "$package"
     done
 }
@@ -281,11 +353,15 @@ annotate() {
 # that mattered. Only the exact missing set, the failed index fetches and the
 # resolver's own verdict are printed.
 report_provisioning_failure() {
-    local missing fetches dry_run summary context
+    local missing missing_installed fetches dry_run summary context
     missing=$(describe_missing)
-    echo "ci_install_gcc16: provisioning failed (mode $MODE)" >&2
+    missing_installed=$(missing_installed_packages)
+    echo "ci_install_gcc16: compiler/oracle provisioning failed (mode $MODE)" >&2
     if [[ -n $missing ]]; then
         summary="not resolvable from the configured repositories: ${missing// /, }"
+        echo "ci_install_gcc16: $summary" >&2
+    elif [[ -n $missing_installed ]]; then
+        summary="all requested packages are resolvable; the install itself failed or left packages uninstalled: ${missing_installed//$'\n'/, }"
         echo "ci_install_gcc16: $summary" >&2
     else
         summary="all requested packages are resolvable; the install itself failed"
@@ -306,8 +382,8 @@ report_provisioning_failure() {
     # head -c bounds the annotation below GitHub's 64 KiB limit; the `|| true`
     # keeps SIGPIPE from a deliberately short read out of `set -e`, which would
     # otherwise abort before the annotation is printed.
-    context=$(printf '%s\n%s\n%s' "$missing" "$fetches" "$dry_run" | head -c 6000 || true)
-    annotate error "GCC 16 provisioning failed (mode $MODE)" "$summary"$'\n'"$context"
+    context=$(printf '%s\n%s\n%s\n%s' "$missing" "$missing_installed" "$fetches" "$dry_run" | head -c 6000 || true)
+    annotate error "C oracle provisioning failed (mode $MODE)" "$summary"$'\n'"$context"
 }
 
 if ! toolchain_ready; then
@@ -320,6 +396,14 @@ if ! toolchain_ready; then
     resolvable=0
     if ensure_packages_resolvable 1; then
         resolvable=1
+    elif [[ -z $(missing_compiler_packages) ]]; then
+        # GCC is already resolvable; a missing oracle package is a mirror/index
+        # problem, not a reason to add the Ubuntu toolchain PPA. Retry the
+        # configured distribution repositories, then fail closed if the exact
+        # extra names still do not appear.
+        if ensure_packages_resolvable 3; then
+            resolvable=1
+        fi
     elif configure_ubuntu_ppa && ensure_packages_resolvable 6; then
         # The PPA edge flaps: probes a minute apart observed 503 and then a
         # healthy InRelease, and the 2026-10-21 incident outlived a four-round
@@ -330,6 +414,14 @@ if ! toolchain_ready; then
     fi
     if (( resolvable )); then
         if ! install_packages; then
+            report_provisioning_failure
+            exit 1
+        fi
+        # apt can complete the requested transaction without leaving every
+        # requested package installed (for example, a held/failed package).
+        # Certify package state immediately instead of letting the later CI
+        # command fail for a missing oracle after a seemingly green install.
+        if ! toolchain_ready; then
             report_provisioning_failure
             exit 1
         fi

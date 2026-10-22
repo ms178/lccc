@@ -49,7 +49,7 @@ jobs:
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_install_link_oracles.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -171,7 +171,7 @@ jobs:
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_install_link_oracles.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -256,7 +256,7 @@ jobs:
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_install_link_oracles.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -349,7 +349,7 @@ jobs:
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_install_link_oracles.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -497,7 +497,7 @@ jobs:
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_install_link_oracles.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -555,16 +555,11 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
-    # lane-split: 49 of 103 gate steps of the `frontend` lane, assigned
-    # lane-split: by longest-processing-time over measured cost (337 s of
-    # lane-split: 674 s). The preamble above is byte-identical in every
+    # lane-split: 57 of 111 gate steps of the `frontend` lane, assigned
+    # lane-split: by longest-processing-time over recorded cost (349 s of
+    # lane-split: 685 s). The preamble above is byte-identical in every
     # lane-split: shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # lane-split: is duplicated, or a shard drifts from this record.
-    # 49 of 101 gate steps of the `frontend` lane, assigned
-    # by longest-processing-time over measured cost (188 s of
-    # 376 s). The preamble above is byte-identical in every
-    # shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
-    # is duplicated, or a shard drifts from this record.
     - name: Scalar logic against GCC 16 and Clang 23.1.3
       run: python3 tests/regression/check_llvm_scalar_logic.py
     - name: Packed vector relations against GCC 16 and Clang 23.1.3
@@ -577,12 +572,51 @@ jobs:
         python3 scripts/slice_superopt.py --self-test
         python3 scripts/yarpgen_mutpair.py --self-test
         python3 -m unittest scripts.test_mutpair scripts.test_slice_superopt scripts.test_yarpgen_mutpair
+    - name: Verify linker-oracle provisioning contracts (mock only)
+      run: python3 tests/regression/check_ci_link_oracle_provisioning.py
     - name: Verify swap provisioning contracts (mock only)
       run: python3 tests/regression/check_ci_swap_provisioning.py
     - name: Check FP-contraction parity with GCC
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_fp_contract_parity.sh
+    - name: Check signed matmul bounds across AVX2 and two-wide paths
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_matmul_negative_bound.sh
+    - name: Check affine-map vectorization and GNU-alias dependence guard
+      run: env CCC=target/fastbuild/lccc bash tests/regression/check_affine_map_vectorization_codegen.sh
     - name: Check hot-loop register homes survive an in-loop call
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_hot_loop_register_homes.sh
+    - name: Verify the two-wide matmul lowering on the x86-64 baseline
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_matmul_sse2_fallback.sh
+    # Per-instruction SSE2 codegen matrix (tests/regression/
+    # check_sse2_codegen_matrix.py): 122 rows, one per SSE/SSE2 instruction,
+    # each compiled by LCCC and by both oracles, censused from the emitted
+    # assembly, and executed for a bit-exact differential hash. Runs here
+    # because both oracles are installed above (GCC 16 and the pinned Clang
+    # 23.1.3 that `ci_install_clang_oracle.sh` exports as $CLANG). The matrix is
+    # baseline-relative and monotone for LCCC's own instruction count; the
+    # oracle gap is reported and only enforced under --strict-oracle-debt.
+    # --self-test proves the ratchet still catches a tightened baseline.
+    - name: Verify per-instruction SSE2 codegen against GCC 16 and Clang 23.1.3
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+        CLANG: ${{ env.CLANG }}
+      run: python3 tests/regression/check_sse2_codegen_matrix.py --check --self-test
+    # The generic SIMD header is generated from scripts/gen_lcccsimd.py.
+    # Regenerate in place and require byte equality to catch stale hand edits.
+    - name: Verify include/lcccsimd.h is exactly what the generator emits
+      run: python3 scripts/gen_lcccsimd.py --check
+    - name: Verify truncating SSE2 conversions under every rounding mode
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+      run: bash tests/regression/check_sse2_truncating_convert.sh
+    - name: Verify 16-byte XMM slot forwarding end to end
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+      run: bash tests/regression/check_sse2_slot_forwarding.sh
     - name: Check builtin_cpu_supports runtime semantics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_supports_runtime.sh
     - name: a9987 salvage and SWAR cast soundness
@@ -610,11 +644,6 @@ jobs:
       run: python3 tests/linker/check_riscv_relocation_contract.py --lccc target/fastbuild/lccc-riscv
     - name: ISA-sensitive intrinsic feature gate
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_intrinsic_feature_gate.sh
-    # 52 of 101 gate steps of the `frontend` lane, assigned
-    # by longest-processing-time over measured cost (188 s of
-    # 376 s). The preamble above is byte-identical in every
-    # shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
-    # is duplicated, or a shard drifts from this record.
     - name: Integer order and bit-reversal networks
       run: python3 tests/regression/check_integer_order_networks.py --allow-gcc16-snapshot --arm target/fastbuild/lccc-arm
     - name: Archived bulk evidence stays archived
@@ -744,7 +773,7 @@ jobs:
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_install_link_oracles.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -802,9 +831,9 @@ jobs:
         tar -xzf lccc-fast.tar.gz
         test "$(cat target/ci-build.commit)" = "$(git rev-parse HEAD)"
         sha256sum -c target/ci-build.sha256
-    # lane-split: 54 of 103 gate steps of the `frontend` lane, assigned
-    # lane-split: by longest-processing-time over measured cost (337 s of
-    # lane-split: 674 s). The preamble above is byte-identical in every
+    # lane-split: 54 of 111 gate steps of the `frontend` lane, assigned
+    # lane-split: by longest-processing-time over recorded cost (337 s of
+    # lane-split: 685 s). The preamble above is byte-identical in every
     # lane-split: shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
     # lane-split: is duplicated, or a shard drifts from this record.
     - name: Verify benchmark ranking contracts
@@ -1041,7 +1070,7 @@ jobs:
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_install_link_oracles.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -1114,11 +1143,6 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_seg_cast_warning.sh
-    # 32 of 60 gate steps of the `codegen` lane, assigned
-    # by longest-processing-time over measured cost (246 s of
-    # 493 s). The preamble above is byte-identical in every
-    # shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
-    # is duplicated, or a shard drifts from this record.
     - name: Preserved synthesis and ordering contracts
       env:
         CCC: target/fastbuild/lccc
@@ -1238,7 +1262,7 @@ jobs:
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_install_link_oracles.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -1304,11 +1328,6 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_seg_pointee_chain_asm.sh
-    # 28 of 60 gate steps of the `codegen` lane, assigned
-    # by longest-processing-time over measured cost (246 s of
-    # 493 s). The preamble above is byte-identical in every
-    # shard; tests/regression/check_ci_lane_plan.py fails if a gate disappears,
-    # is duplicated, or a shard drifts from this record.
     - name: i386 small-struct regparm ABI debt gate
       run: bash tests/regression/check_i386_regparm_small_struct_abi.sh
     # AUD-SILENT-ZERO-1: x86-only intrinsics are a lowering-time diagnostic
@@ -1439,7 +1458,7 @@ jobs:
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_install_link_oracles.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -1802,7 +1821,7 @@ jobs:
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_install_link_oracles.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
@@ -2102,7 +2121,7 @@ jobs:
       uses: actions/cache@v6
       with:
         path: ~/.cache/lccc-toolchain
-        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+        key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_install_link_oracles.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
     - name: Provision oracle toolchain (cached bundle, else apt)
       env:
         LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt

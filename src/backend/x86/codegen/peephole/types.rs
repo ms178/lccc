@@ -200,6 +200,13 @@ pub(super) enum MoveSize {
     SLQ, // movslq (sign-extend 32->64)
     SD,  // movsd (scalar double, 8 bytes)
     SS,  // movss (scalar single, 4 bytes)
+    /// A 16-byte vector move between an XMM register and a frame slot:
+    /// `movdqu`, `movups` or `movdqa` (and their VEX `v`-forms). Modeled
+    /// because a 16-byte slot store followed by a 16-byte slot load is the
+    /// dominant SSE round trip that codegen emits for an `__m128` that
+    /// briefly leaves its register, and forwarding it is the difference
+    /// between two instructions and five.
+    DQ,
 }
 
 impl MoveSize {
@@ -212,6 +219,7 @@ impl MoveSize {
             MoveSize::SLQ => "movslq",
             MoveSize::SD => "movsd",
             MoveSize::SS => "movss",
+            MoveSize::DQ => "movdqu",
         }
     }
 
@@ -222,6 +230,7 @@ impl MoveSize {
             MoveSize::L | MoveSize::SLQ | MoveSize::SS => 4,
             MoveSize::W => 2,
             MoveSize::B => 1,
+            MoveSize::DQ => 16,
         }
     }
 }
@@ -1117,7 +1126,27 @@ pub(super) fn strip_mov_prefix(s: &str, allow_slq: bool) -> Option<(&str, MoveSi
 /// rejected by construction (the slot operand, not `%ds:/%es:` or an XMM,
 /// must be one of the two ends).
 pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
-    let body = if let Some(r) = s.strip_prefix("vmovsd ") {
+    let body = if let Some(r) = s.strip_prefix("vmovdqu ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovups ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovdqa ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movdqu ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movups ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movdqa ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movaps ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movapd ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovaps ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovapd ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovsd ") {
         (r, MoveSize::SD)
     } else if let Some(r) = s.strip_prefix("vmovss ") {
         (r, MoveSize::SS)
@@ -1143,6 +1172,20 @@ pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
     let store = src.starts_with('%') && (dst.ends_with("(%rbp)") || dst.ends_with("(%rsp)"));
     let load = dst.starts_with('%') && (src.ends_with("(%rbp)") || src.ends_with("(%rsp)"));
     if !store && !load {
+        return None;
+    }
+    // The packed mnemonics are width-polymorphic: the SAME spelling moves
+    // 16 bytes with an XMM register, 32 with YMM, 64 with ZMM.  `DQ` models
+    // exactly 16, so a wider register operand must be rejected here or every
+    // consumer of the classification (store forwarding, write-region
+    // liveness) will model a 32/64-byte slot access as 16 bytes -- the
+    // liveness half then proves the upper chunk-stores of a 32-byte
+    // parameter copy dead and deletes them, leaving the vector's upper
+    // lanes uninitialised.  Rejecting is not a workaround: YMM/ZMM slot
+    // moves keep the conservative `Other` classification they had before
+    // `DQ` existed.
+    let reg = if store { src } else { dst };
+    if body.1 == MoveSize::DQ && !reg.starts_with("%xmm") {
         return None;
     }
     let mem = if store { dst } else { src };
@@ -2636,6 +2679,12 @@ pub(super) fn reg_id_to_name(id: RegId, size: MoveSize) -> &'static str {
         MoveSize::L | MoveSize::SS => 1,
         MoveSize::W => 2,
         MoveSize::B => 3,
+        // A `DQ` move is XMM-only: it is produced by `parse_fp_slot_move`
+        // and consumed exclusively by the XMM forwarding paths, which name
+        // their operands with `%xmmN` text. No caller can reach this row
+        // with a GP register, so the 64-bit row is inert here; the
+        // `id <= 15` assertion above still holds.
+        MoveSize::DQ => 0,
     };
     REG_NAMES[row][id as usize]
 }
@@ -3262,6 +3311,60 @@ mod classify_directive_tests {
                 "{text}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod fp_slot_move_width_tests {
+    use super::{MoveSize, parse_fp_slot_move};
+
+    #[test]
+    fn xmm_packed_slot_moves_are_dq() {
+        assert_eq!(
+            parse_fp_slot_move("movdqu %xmm6, 72(%rsp)"),
+            Some((true, "72", MoveSize::DQ))
+        );
+        assert_eq!(
+            parse_fp_slot_move("vmovups 136(%rsp), %xmm10"),
+            Some((false, "136", MoveSize::DQ))
+        );
+        assert_eq!(
+            parse_fp_slot_move("movapd %xmm0, -16(%rbp)"),
+            Some((true, "-16", MoveSize::DQ))
+        );
+    }
+
+    /// The packed mnemonics are width-polymorphic in the register operand:
+    /// YMM moves 32 bytes and ZMM 64, but `DQ` models exactly 16.  Letting a
+    /// YMM/ZMM slot move classify as DQ makes write-region liveness model a
+    /// 32/64-byte access as 16 bytes and prove the upper chunk-stores of a
+    /// wide parameter copy dead -- the miscompile behind the
+    /// `vector-abi-wide` failure (upper lanes of stack-passed `__m256`
+    /// arguments read back uninitialised).  Wide forms must keep the
+    /// conservative unclassified path.
+    #[test]
+    fn ymm_and_zmm_packed_slot_moves_are_not_dq() {
+        for line in [
+            "vmovups 136(%rsp), %ymm10",
+            "vmovups %ymm10, 136(%rsp)",
+            "vmovdqu %ymm0, -32(%rbp)",
+            "vmovaps 64(%rsp), %zmm3",
+            "vmovapd %zmm3, 64(%rsp)",
+        ] {
+            assert_eq!(parse_fp_slot_move(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn scalar_fp_slot_moves_keep_their_sizes() {
+        assert_eq!(
+            parse_fp_slot_move("vmovsd 96(%rsp), %xmm9"),
+            Some((false, "96", MoveSize::SD))
+        );
+        assert_eq!(
+            parse_fp_slot_move("movss %xmm1, 8(%rsp)"),
+            Some((true, "8", MoveSize::SS))
+        );
     }
 }
 

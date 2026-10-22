@@ -24,6 +24,21 @@ This gate pins the partition structurally, from the workflow file itself:
    local mirror is the register of record; parity then guarantees the union
    covers the register, so the two checks together close both directions).
 
+5. the scaffolding that runs a shard body actually FAILS when a gate inside
+   it fails.  The bodies run as a shell function under `set -Eeuo pipefail`
+   with an ERR trap -- but bash switches both off inside a function whose
+   exit status is being tested, so the natural-looking
+   `if ! fast_contracts | tee log` form silently absorbs every failure
+   except the body's last command.  That shipped, and while it did, a real
+   census increase on main reported green here.  A partition check alone
+   cannot see that (the gates are all *listed*; they just cannot fail), so
+   this check additionally EXECUTES each shard's scaffolding with a
+   synthetic body -- a failing probe followed by a marker -- and requires a
+   non-zero exit with the marker never printed, plus a passing probe that
+   does reach the marker.  The scaffolding is taken from the workflow text
+   itself, so any future edit that re-tests the call is caught here, on the
+   first run, by construction.
+
 `--self-test` exercises each of those four rules against synthetic fixtures,
 including the near-miss shapes (a gate moved, a gate copied, a gate renamed),
 because a checker that cannot fail is decoration.
@@ -31,9 +46,13 @@ because a checker that cannot fail is decoration.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -180,6 +199,63 @@ def audit(document: dict, local_text: str) -> list[str]:
     return problems
 
 
+def scaffold_problems(document: dict) -> list[str]:
+    """Execute each shard step's scaffolding with a synthetic body (rule 5).
+
+    The shard body between the ERR trap and the closing brace is replaced by
+    a probe: a failing command followed by a marker echo must abort the body
+    (non-zero exit, marker never printed); a succeeding probe must reach its
+    marker with exit 0.  Everything else -- the `set` line, the function
+    wrapper, the trap, the tee/annotate tail -- is the workflow's own text,
+    so what is being tested is exactly what CI will run.
+    """
+    bash = shutil.which("bash")
+    if bash is None:
+        return ["bash is not available, so the shard scaffolding cannot be executed"]
+    problems: list[str] = []
+    for job in (document.get("jobs") or {}).values():
+        for step in job.get("steps") or []:
+            name = step.get("name") or ""
+            if not name.startswith(SHARD_PREFIX) or not isinstance(step.get("run"), str):
+                continue
+            commands = logical_commands(step["run"])
+            trap_at = next((i for i, c in enumerate(commands) if TRAP.match(c)), None)
+            brace_at = next((i for i in range((trap_at or 0) + 1, len(commands))
+                             if commands[i].strip() == "}"), None)
+            if trap_at is None or brace_at is None:
+                problems.append(f"{name}: shard scaffolding (ERR trap / closing brace) "
+                                f"not recognised, so its failure semantics are unpinned")
+                continue
+            head = commands[:trap_at + 1]
+            tail = commands[brace_at:]
+            for probe, want_fail in (("false", True), ("true", False)):
+                marker = "SCAFFOLD_PROBE_MARKER"
+                script = "\n".join(head + [probe, f"echo {marker}"] + tail) + "\n"
+                with tempfile.TemporaryDirectory() as tmp:
+                    env = dict(os.environ, RUNNER_TEMP=tmp)
+                    try:
+                        done = subprocess.run(
+                            [bash, "-c", script], cwd=ROOT, env=env,
+                            capture_output=True, text=True, timeout=60)
+                    except subprocess.TimeoutExpired:
+                        problems.append(f"{name}: synthetic `{probe}` body timed out")
+                        continue
+                if want_fail:
+                    if done.returncode == 0 or marker in done.stdout:
+                        problems.append(
+                            f"{name}: a failing gate inside the shard body does not "
+                            f"fail the step (exit {done.returncode}, marker "
+                            f"{'printed' if marker in done.stdout else 'not printed'}): "
+                            f"the body function must be called as a plain command, "
+                            f"never in a tested context (`if !`, `&&`, `||`), where "
+                            f"bash disables -e and the ERR trap inside it")
+                elif done.returncode != 0 or marker not in done.stdout:
+                    problems.append(
+                        f"{name}: a passing shard body does not run to completion "
+                        f"(exit {done.returncode}) under the step scaffolding")
+    return problems
+
+
 def self_test() -> None:
     def step(name: str, *commands: str) -> dict:
         return {"name": name, "run": "\n".join(commands)}
@@ -250,6 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     document = yaml.safe_load(args.workflow.read_text())
     problems = audit(document, args.local.read_text())
+    problems += scaffold_problems(document)
     shards = shard_steps(document)
     if problems:
         for problem in problems:
@@ -258,7 +335,8 @@ def main(argv: list[str] | None = None) -> int:
     sizes = ", ".join(f"{name.rsplit('(', 1)[1].rstrip(')')}={len(gates)}"
                       for name, gates in shards)
     print(f"fast contract shard partition: PASS ({sizes} gates, disjoint, "
-          f"each owned by one step, all registered in {args.local.name})")
+          f"each owned by one step, all registered in {args.local.name}; "
+          f"scaffolding executed with failing and passing probes)")
     return 0
 
 

@@ -31,9 +31,11 @@ cd "$ROOT"
 #   3. The same-block self-use unit test MUST exist: it is the fixture that
 #      keeps the verifier's strict def<use same-block rule detectable.
 HOOKS=$(grep -c 'verify::verify_after_pass(module,' src/passes/mod.rs || true)
-# Literal sites, "<count> <pass>", sorted by name.  Duplicates are real: the
-# pass is wired at two distinct points (pre-loop and in-loop / O1 and O2).
+# Literal sites are pinned by pass name; duplicate hooks are intentional when
+# a pass is wired at both pre-loop and in-loop / O1 and O2 positions.
 WANT_LITERAL=$(sort -k2 <<'EOF'
+1 aggcopy16
+1 deadslotload
 2 fmanegpeel
 1 fp_double
 1 intbounds
@@ -52,17 +54,15 @@ WANT_LITERAL=$(sort -k2 <<'EOF'
 1 vecssa
 EOF
 )
-GOT_LITERAL=$(grep -o 'verify::verify_after_pass(module, "[a-z_]*")' src/passes/mod.rs \
-    | sed 's/.*"\([a-z_]*\)".*/\1/' | sort | uniq -c | awk '{print $1, $2}' | sort -k2)
+GOT_LITERAL=$(grep -o 'verify::verify_after_pass(module, "[a-z0-9_]*")' src/passes/mod.rs \
+    | sed 's/.*"\([a-z0-9_]*\)".*/\1/' | sort | uniq -c | awk '{print $1, $2}' | sort -k2)
 if [ "$GOT_LITERAL" != "$WANT_LITERAL" ]; then
     echo "FAIL: literal verify_after_pass hook inventory drifted from the pin." >&2
     diff -u <(printf '%s\n' "$WANT_LITERAL") <(printf '%s\n' "$GOT_LITERAL") >&2 || true
     echo "      If a pass hook was added/removed on purpose, name it in WANT_LITERAL" >&2
-    echo "      in this same change (count first, then pass name)." >&2
     exit 1
 fi
-# Macro funnels: one source line each, but each expands once per pass it
-# wraps.  Pinned by macro name so a funnel cannot be deleted quietly.
+# Macro funnels have one source line each, but expand once per wrapped pass.
 WANT_MACRO_SITES=5
 MACRO_SITES=$(grep -c 'verify::verify_after_pass(module, \$name)' src/passes/mod.rs || true)
 if [ "$MACRO_SITES" -ne "$WANT_MACRO_SITES" ]; then
@@ -73,7 +73,9 @@ for funnel in iphase_dump o1_checkpoint preloop_dump timed_pass; do
     grep -q "macro_rules! $funnel" src/passes/mod.rs \
         || { echo "FAIL: hook funnel $funnel is gone from src/passes/mod.rs" >&2; exit 1; }
 done
-WANT_HOOKS=23
+# The inventory above lists 20 literal sites; the five macro call sites
+# below complete the total pinned here.
+WANT_HOOKS=25
 if [ "$HOOKS" -ne "$WANT_HOOKS" ]; then
     echo "FAIL: $HOOKS verify::verify_after_pass hooks in src/passes/mod.rs, pinned at $WANT_HOOKS." >&2
     echo "      If a pass hook was added/removed on purpose, update WANT_HOOKS in this same change." >&2

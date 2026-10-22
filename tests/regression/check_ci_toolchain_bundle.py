@@ -26,14 +26,19 @@ ROOT = Path(__file__).resolve().parents[2]
 BUNDLE = ROOT / "scripts/ci_toolchain_bundle.sh"
 PROVISION = ROOT / "scripts/ci_provision_toolchain.sh"
 
-# `valgrind` is in the REQUIRED set for the same reason the compilers are: the
-# contract lanes run Memcheck oracles that REFUSE to run without it, so a bundle
-# that dropped it would restore a lane whose gates cannot pass.
 REQUIRED = ("gcc-16", "g++-16", "ld.lld", "qemu-i386", "mold", "valgrind")
+MULTILIB_PACKAGES = (
+    "gcc-16", "g++-16", "gcc-16-multilib", "g++-16-multilib",
+    "gcc-multilib", "g++-multilib", "libc6-dev-i386", "lib32gcc-16-dev",
+)
+ORACLE_PACKAGES = (
+    "qemu-user", "mold", "lld", "python3-yaml", "valgrind", "libc6-dbg",
+)
+REQUIRED_FILES = ("usr/lib/python3/dist-packages/yaml/__init__.py",)
 
 
 def build_tree(root: Path) -> list[str]:
-    """A miniature published toolchain: the six tools plus a compiler blob."""
+    """A miniature toolchain: six executables, PyYAML and a compiler blob."""
     binaries = root / "usr/bin"
     binaries.mkdir(parents=True)
     for name in REQUIRED:
@@ -43,12 +48,15 @@ def build_tree(root: Path) -> list[str]:
     compiler = root / "usr/lib/gcc/16/cc1"
     compiler.parent.mkdir(parents=True)
     compiler.write_text("compiler\n")
+    yaml_module = root / REQUIRED_FILES[0]
+    yaml_module.parent.mkdir(parents=True)
+    yaml_module.write_text("# fixture PyYAML module\n")
     docs = root / "usr/share/doc/gcc-16/README"
     docs.parent.mkdir(parents=True)
     docs.write_text("documentation must not enter the bundle\n")
     listed = [f"/usr/bin/{name}" for name in REQUIRED]
-    listed += ["/usr/lib/gcc/16/cc1", "/usr/share/doc/gcc-16/README",
-               "/usr/bin/absent-from-the-tree"]
+    listed += ["/usr/lib/gcc/16/cc1", "/usr/lib/python3/dist-packages/yaml/__init__.py",
+               "/usr/share/doc/gcc-16/README", "/usr/bin/absent-from-the-tree"]
     listing = root.parent / "files.txt"
     listing.write_text("\n".join(listed) + "\n")
     return listed
@@ -78,8 +86,9 @@ class ToolchainBundle(unittest.TestCase):
         # Documentation and paths absent from the tree are not payload.
         self.assertNotIn("usr/share/doc/gcc-16/README", stored)
         self.assertNotIn("usr/bin/absent-from-the-tree", stored)
-        self.assertEqual(sorted(stored), sorted(
-            f"usr/bin/{name}" for name in REQUIRED) + ["usr/lib/gcc/16/cc1"])
+        expected = [f"usr/bin/{name}" for name in REQUIRED]
+        expected += ["usr/lib/gcc/16/cc1", *REQUIRED_FILES]
+        self.assertEqual(sorted(stored), sorted(expected))
         # The archive is accompanied by the digest restore checks against.
         self.assertTrue((self.bundle / "toolchain.sha256").is_file())
         self.assertIn("toolchain.tar.gz", (self.bundle / "toolchain.sha256").read_text())
@@ -94,6 +103,18 @@ class ToolchainBundle(unittest.TestCase):
             restored = destination / "usr/bin" / name
             self.assertTrue(restored.is_file(), name)
             self.assertTrue(os.access(restored, os.X_OK), name)
+        self.assertTrue((destination / REQUIRED_FILES[0]).is_file())
+
+    def test_a_bundle_missing_py_yaml_fails_verification(self):
+        self.assertEqual(self.export().returncode, 0)
+        destination = self.temp / "restored"
+        self.assertEqual(run("bash", str(BUNDLE), "restore", "--bundle", str(self.bundle),
+                             "--root", str(destination)).returncode, 0)
+        (destination / REQUIRED_FILES[0]).unlink()
+        result = run("bash", str(BUNDLE), "verify", "--bundle", str(self.bundle),
+                     "--root", str(destination))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("/usr/lib/python3/dist-packages/yaml/__init__.py", result.stderr)
 
     def test_a_stale_archive_is_refused_instead_of_restored(self):
         self.assertEqual(self.export().returncode, 0)
@@ -184,6 +205,7 @@ class ProvisionToolchain(unittest.TestCase):
             "#!/bin/sh\n"
             'printf "bundle %s\\n" "$*" >> "$MOCK_LOG"\n'
             'if [ "$1" = restore ] && [ "${MOCK_RESTORE_STATUS:-0}" != 0 ]; then exit 1; fi\n'
+            'if [ "$1" = verify ] && [ "${MOCK_VERIFY_STATUS:-0}" != 0 ]; then echo "mock tool contract failed" >&2; exit 1; fi\n'
             # `export` publishes the artifact the next run restores from; a mock
             # that did not would make every test look like a cold cache.
             'if [ "$1" = export ]; then\n'
@@ -193,7 +215,15 @@ class ProvisionToolchain(unittest.TestCase):
         (self.repo / "scripts" / "ci_install_gcc16.sh").write_text(
             "#!/bin/sh\n"
             'printf "install-gcc16 %s\\n" "$*" >> "$MOCK_LOG"\n'
+            'if [ "${4:-}" = --print-packages ]; then\n'
+            '  printf "%s\\n" gcc-16 g++-16 gcc-16-multilib g++-16-multilib gcc-multilib g++-multilib libc6-dev-i386 lib32gcc-16-dev\n'
+            '  for package in $3; do printf "%s\\n" "$package"; done\n'
+            '  exit 0\n'
+            'fi\n'
             'touch "$MOCK_INSTALLED"\n')
+        (self.repo / "scripts" / "ci_install_link_oracles.sh").write_text(
+            "#!/bin/sh\n"
+            'printf "install-link-oracles %s\n" "$*" >> "$MOCK_LOG"\n')
         self.bin = self.temp / "bin"
         self.bin.mkdir()
         # `sudo` records and then RUNS its command, because escalation is only
@@ -221,10 +251,13 @@ class ProvisionToolchain(unittest.TestCase):
         self.bundle = self.temp / "bundle"
         self.bundle.mkdir()
 
-    def provision(self, *args: str) -> subprocess.CompletedProcess:
+    def provision(self, *args: str,
+                  extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         env = dict(os.environ, MOCK_LOG=str(self.log),
                    MOCK_INSTALLED=str(self.temp / "installed"),
                    PATH=f"{self.bin}:{os.environ['PATH']}")
+        if extra_env:
+            env.update(extra_env)
         env.pop("LCCC_TOOLCHAIN_BUNDLE_DIR", None)
         return subprocess.run(
             ["bash", str(self.repo / "scripts" / PROVISION.name),
@@ -245,24 +278,29 @@ class ProvisionToolchain(unittest.TestCase):
     def escalated(self, verb: str) -> list[str]:
         return [line for line in self.invocations(verb) if line.startswith("sudo -- ")]
 
-    def test_install_path_runs_one_apt_transaction_and_exports_a_bundle(self):
+    def test_install_path_passes_all_oracles_to_the_single_package_installer(self):
         result = self.provision("--root", "/")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         lines = self.argv()
-        self.assertEqual(lines[0], "install-gcc16 --multilib")
-        apt = [line for line in lines if line.startswith("apt-get")]
-        self.assertEqual(len(apt), 1, lines)
-        # qemu-user is the i686 execution oracle; mold and lld are the linker
-        # oracles; python3-yaml is the gate parser; valgrind is the Memcheck
-        # oracle and libc6-dbg is what lets it relocate the loader's symbols
-        # (without it valgrind aborts at startup).  All in ONE call.
-        self.assertEqual(apt[0].split()[1:], [
-            "install", "-y", "--no-install-recommends",
-            "qemu-user", "mold", "lld", "python3-yaml", "valgrind", "libc6-dbg"])
+        self.assertEqual(
+            lines[0],
+            "install-gcc16 --multilib --extras qemu-user mold lld python3-yaml valgrind libc6-dbg")
+        self.assertEqual(lines[1], "install-link-oracles ", lines)
+        # The provisioner delegates the complete package request to the
+        # retryable installer; the dedicated linker-oracle helper is a
+        # postcondition check, not a second unguarded apt call.
+        self.assertFalse([line for line in lines if line.startswith("apt-get")])
         exports = [line for line in lines if line.startswith("bundle export")]
         self.assertEqual(len(exports), 1, lines)
-        # The exported package set is the dpkg-delta, never a hard-coded list.
-        self.assertIn("--packages gcc-16 qemu-user", exports[0])
+        # Changed dependencies plus the exact installer request are archived.
+        # Every oracle package must be explicit even if the current runner image
+        # already had some of them preinstalled.
+        exported = set(exports[0].split("--packages ", 1)[1].split())
+        self.assertEqual(exported, set(
+            MULTILIB_PACKAGES + ORACLE_PACKAGES))
+        self.assertIn("python3-yaml", exported)
+        self.assertIn("valgrind", exported)
+        self.assertIn("libc6-dbg", exported)
         self.assertEqual(self.calls("verify"),
                          ["bundle verify --bundle %s --root /" % self.bundle])
         # verify is a read-only probe: it must never be escalated, so a lane
@@ -312,13 +350,19 @@ class ProvisionToolchain(unittest.TestCase):
         self.assertIn("failed verification", result.stdout)
         self.assertEqual(len(self.escalated("restore")), 1, self.argv())
         self.assertIn(self.restore_tail("/"), self.escalated("restore")[0])
-        self.assertIn("install-gcc16 --multilib", self.argv())
+        self.assertIn(
+            "install-gcc16 --multilib --extras qemu-user mold lld python3-yaml valgrind libc6-dbg",
+            self.argv())
 
-    def test_extras_are_configurable_and_an_empty_list_skips_apt(self):
-        result = self.provision("--root", "/", "--extras", "")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    def test_an_empty_extra_list_is_forwarded_and_contract_failure_stays_red(self):
+        result = self.provision(
+            "--root", "/", "--extras", "",
+            extra_env={"MOCK_VERIFY_STATUS": "1"})
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("mock tool contract failed", result.stderr)
+        self.assertTrue(any(line.startswith("install-gcc16 --multilib --extras")
+                            for line in self.argv()))
         self.assertFalse([line for line in self.argv() if line.startswith("apt-get")])
-        self.assertTrue([line for line in self.argv() if line.startswith("install-gcc16")])
 
     def test_a_64_bit_only_mode_is_refused_rather_than_cached(self):
         """`--base` would build a bundle that cannot link -m32.
@@ -335,7 +379,9 @@ class ProvisionToolchain(unittest.TestCase):
 
     def test_the_bundle_carries_the_multilib_installer_contract(self):
         self.assertEqual(self.provision("--root", "/").returncode, 0)
-        self.assertEqual(self.argv()[0], "install-gcc16 --multilib")
+        self.assertEqual(
+            self.argv()[0],
+            "install-gcc16 --multilib --extras qemu-user mold lld python3-yaml valgrind libc6-dbg")
 
     def test_an_unknown_argument_is_refused_before_any_work(self):
         result = self.provision("--root", "/", "--frobnicate")

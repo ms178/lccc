@@ -225,6 +225,17 @@ gate "fp-contract-parity" fast \
 # the reference kernel) without any test going red.
 gate "sse2-matmul-vectorization" fast \
     env CCC="$LCCC" bash tests/regression/check_sse2_matmul_vectorization.sh
+# Signed dynamic limits can overflow while the FMA matmul vectorizer scales
+# grouped trips into byte offsets. Exercise the I32/I64 overflow boundaries in
+# both the AVX2 and two-wide paths, with packed-codegen positive controls.
+gate "matmul-negative-bound" fast \
+    env CCC="$LCCC" GCC_BIN="${GCC:-gcc}" \
+    bash tests/regression/check_matmul_negative_bound.sh
+# Pin packed map lowering, overlap versioning, and register-resident broadcasts;
+# the GNU-alias fixture checks the module-level global-identity facts as well
+# as the runtime dependence guard and retains a packed path for non-overlap.
+gate "affine-map-vectorization-codegen" fast \
+    env CCC="$LCCC" bash tests/regression/check_affine_map_vectorization_codegen.sh
 
 # Three compiles and two runs: pins that a loop-carried accumulator keeps its
 # callee-saved home when a call inside the loop forces the value to be
@@ -232,6 +243,53 @@ gate "sse2-matmul-vectorization" fast \
 # is only read on the loop's rare path.
 gate "hot-loop-register-homes" fast \
     env CCC="$LCCC" bash tests/regression/check_hot_loop_register_homes.sh
+# Two-wide matmul arm on the plain x86-64 baseline: the fused group op was its
+# only 2-wide lowering, so `fp_contract == fast && -mfma` also decided whether
+# the loop was vectorized -- and moving the default baseline to x86-64 v1
+# silently made every matmul stencil scalar at `-O2` (N=1024: 601 ms against
+# GCC 16.2's 361 ms).  Pins the packed/unfused lowering at both widths, the
+# fused v3 lowering, the `-mno-sse` refusal, and that both roundings execute
+# bit-exactly (the two-rounding result where no FMA3 exists).
+gate "matmul-sse2-fallback" fast \
+    env CCC="$LCCC" bash tests/regression/check_matmul_sse2_fallback.sh
+
+# `_mm_cvttsd_si32` / `_mm_cvttss_si32` must TRUNCATE under every MXCSR
+# rounding mode.  Both used to route through the rounding forms (`cvtsd2si` /
+# `cvtss2si`), which disagree with truncation the moment the rounding mode is
+# not nearest -- and, for non-integral inputs, they disagreed even at the
+# default.  The gate checks the encoding (`cvtt*2si` present) and runs the
+# conversion under all four rounding modes, against the GCC 16.2 oracle.
+gate "sse2-truncating-convert" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_sse2_truncating_convert.sh
+
+# End-to-end proof that a 16-byte XMM slot store forwards into its own reload.
+# The pass's unit tests prove the *rule*; this compiles real C, asserts on the
+# emitted assembly (no `movdqu slot, %xmmN` may survive its `movdqu %xmmN,
+# slot`), and executes every configuration against the GCC 16.2 oracle and
+# against `CCC_NO_XMM_SF=1` so the rewrite is proven to be a pure optimization.
+gate "sse2-slot-forwarding" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_sse2_slot_forwarding.sh
+
+# Per-instruction SSE2 codegen matrix: 122 rows (one per SSE/SSE2
+# instruction), each compiled by LCCC and by both oracles, censused from the
+# emitted assembly, and executed for a bit-exact differential hash.  The gate
+# is baseline-relative and monotone: LCCC's recorded instruction count may
+# shrink but never grow (the oracle gap is reported, and enforced only under
+# `--strict-oracle-debt`, because the oracle is a per-host BUILD, not a
+# version), and `--self-test` proves the ratchet still has teeth.
+# Every oracle-independent row still runs when GCC/Clang are absent, so the
+# gate never goes vacuous on a bare host.
+gate "sse2-codegen-matrix" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" CLANG="${CLANG:-clang}" \
+    python3 tests/regression/check_sse2_codegen_matrix.py --check --self-test
+
+# include/lcccsimd.h is machine output (scripts/gen_lcccsimd.py).  A hand edit
+# silently disappears on the next regeneration, and a stale header means the
+# builtin names the frontend dispatches on and the prototypes the intrinsics
+# headers call have drifted.  Regenerate into the same path and require a
+# byte-identical result.
+gate "lcccsimd-header-generated" fast \
+    python3 scripts/gen_lcccsimd.py --check
 
 # ~97 compiles per arm plus the runs: seconds, not minutes -- and it is the
 # only gate that exercises the historical crash/miscompile corpus end to end.
@@ -345,6 +403,9 @@ gate "benchmark-ranking-contracts" fast \
 
 gate "gcc-provisioning-mocks" fast \
     python3 tests/regression/check_ci_gcc16_provisioning.py
+
+gate "link-oracle-provisioning-mocks" fast \
+    python3 tests/regression/check_ci_link_oracle_provisioning.py
 
 gate "swap-provisioning-mocks" fast \
     python3 tests/regression/check_ci_swap_provisioning.py

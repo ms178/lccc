@@ -1681,6 +1681,12 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
 
 fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
     use crate::ir::intrinsics::IntrinsicOp as O;
+    // Destructive FP: the destination is also the first source, so a deferred
+    // value in %xmm0 folds into it. Shared predicate, not another copy of the
+    // op list (the duplicate lists previously lacked div/min/max).
+    if op.is_sse_fp_128_destructive_binary() {
+        return true;
+    }
     matches!(
         op,
         O::Pcmpeqb128
@@ -1752,12 +1758,6 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::Por128
             | O::Pand128
             | O::Pxor128
-            | O::AddPs128
-            | O::SubPs128
-            | O::MulPs128
-            | O::AddPd128
-            | O::SubPd128
-            | O::MulPd128
             | O::Paddw128
             | O::Psubw128
             | O::Pmulhw128

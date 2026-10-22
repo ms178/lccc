@@ -198,6 +198,9 @@ REQUIRED_BINARIES=(
     # cannot pass, so it is part of what `verify` proves.
     usr/bin/valgrind
 )
+# The CI gate parsers import PyYAML. Its Debian/Ubuntu package is pure Python
+# data, so it needs a path check for prefix restores and an import probe on /.
+REQUIRED_FILES=(usr/lib/python3/dist-packages/yaml/__init__.py)
 # mold is either /usr/bin/mold or the /usr/bin/ld.mold alias, depending on how
 # the distribution split the package.
 MOLD_CANDIDATES=(usr/bin/mold usr/bin/ld.mold)
@@ -206,6 +209,9 @@ do_verify() {
     local missing=() path
     for path in "${REQUIRED_BINARIES[@]}"; do
         [[ -x $(under_root "$path") ]] || missing+=("/$path")
+    done
+    for path in "${REQUIRED_FILES[@]}"; do
+        [[ -f $(under_root "$path") ]] || missing+=("/$path")
     done
     local mold_found=""
     for path in "${MOLD_CANDIDATES[@]}"; do
@@ -255,7 +261,10 @@ do_verify() {
             return 1
         fi
         rm -rf "$probe"
-        say "verified live root: gcc-16 $version (mold + Memcheck probes), $(valgrind --version)"
+        python3 -c 'import yaml' >/dev/null 2>&1 || {
+            problem "python3-yaml cannot be imported by python3"; return 1;
+        }
+        say "verified live root: gcc-16 $version (mold + Memcheck probes), $(valgrind --version), python3-yaml"
     else
         say "verified layout under $ROOT (probes need a live root)"
     fi
