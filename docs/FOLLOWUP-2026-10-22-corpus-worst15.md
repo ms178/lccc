@@ -66,16 +66,27 @@ registers across `helper()` via `-fipa-ra` (it knows a local function's
 clobber set). Closing the rest needs either cross-block copy coalescing for
 multi-phi webs or interprocedural register allocation, not a tuning knob.
 
-### Phase-1 register allocation — `hot_web_loop` 108.6 ms → 100.3 ms
+### Phase-1 register allocation — measured, then withdrawn
 
 A wave of call-spanning ranges that outnumbers the callee-saved pool hands one
 register to each winner and slots everyone else, so the only decision left is
-*who* wins. The linear scan answered it with source order, and six
-loop-invariant cold-path constants defined before the loop beat four
-accumulators read every iteration. The over-subscribed wave is now ranked by
-the cost model (`LinearScanAllocator::order_by_priority`); waves that fit the
-pool keep the positional scan, where start order is what lets a long range's
-holes be reused. Kill switch: `CCC_NO_P1_PRIORITY`.
+*who* wins. The linear scan answers it with source order, and six loop-invariant
+cold-path constants defined before the loop beat four accumulators read every
+iteration. Ranking that wave by the cost model is worth 5 % on `hot_web_loop`
+(108.7 -> 102.9 ms) — and it is not shippable, because it breaks the scan's
+ordering invariant. The scan consumes ranges in start order and consults the
+ACTIVE set at the incoming range's start; a worklist sorted by cost admits a
+range that starts later first, which parks a register on an interval that has
+not begun. The earlier range then finds the pool occupied by a range it does
+not overlap, `select_evict_victim` sees no legal victim, and it takes a slot.
+`tests/regression/check_hot_loop_register_homes.sh` catches exactly that:
+loop-spanning values with in-loop reads demoted in a six-register loop.
+
+Restricting the ranking to waves whose ranges all start at the same point is
+sound, and it fires on **zero** of the corpus's 67 programs, so the mechanism
+was removed rather than left in as a switch that never flips. The intent -- the
+cost model decides who keeps the last register -- has to be implemented in the
+victim selection, which is order-independent; that is the next step here.
 
 ## Corpus after this round
 
