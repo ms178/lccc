@@ -23,7 +23,7 @@
 //! ```
 //!
 //! The net effect of that sequence is a 16-byte copy from `%p` to `%q`, so the
-//! whole thing becomes one `Memcpy`.  This is the difference between the stock
+//! whole thing becomes one memory-backed `Loaddqu` intrinsic.  This is the difference between the stock
 //! lowering of `_mm_loadu_pd` and what GCC and Clang emit, and it is why every
 //! row of `tests/regression/check_sse2_codegen_matrix.py` used to cost nine
 //! more instructions than both oracles: the copy, not the SSE op, was the
@@ -42,9 +42,10 @@
 //!   a store, call, memcpy, atomic or fence in between could change what `p`
 //!   reads;
 //! * if `p` and `q` are the same base, the objects must not overlap by less
-//!   than 16 bytes (a same-object self copy is exact; a partial overlap is
-//!   what C leaves undefined and what the element-wise sequence "implemented"
-//!   one way);
+//!   than 16 bytes. A scalar load/store sequence can legally overlap; it is
+//!   not a memcpy call and no memcpy non-overlap contract can be assumed;
+//! * low-half widening must be unsigned: sign extension would corrupt the
+//!   packed high half whenever the low half's top bit is set;
 //! * multi-definition value ids (post-phi-coalescing webs) are refused
 //!   outright, the same guard `load_forward` and `gvn` use: their content is
 //!   position dependent, so a single-use count is not a proof.
@@ -55,93 +56,154 @@
 //! from the copy it implements by the call/return structure, and it appears in
 //! four different backend paths (SSE return, SSE argument, `va_arg`, union
 //! member forwarding).  Rewriting it once in the IR removes it for every
-//! target and lets the existing `Memcpy` lowering -- which already picks
-//! `movdqu`/`movupd`, folded memory operands and store-to-load forwarding --
-//! do the emit.
+//! target. A memory-backed `Loaddqu` exposes the copy to the existing vector
+//! forwarding machinery, which can fold it into a consumer's memory operand.
 
-use crate::common::fx_hash::FxHashMap;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
+use crate::ir::provenance::{self, ChainStep, RootLeaf};
 use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
 
 /// Bytes covered by the pattern: two 8-byte halves.
 const COPY_BYTES: usize = 16;
 const HALF: i64 = 8;
 
-/// A pointer's provenance: `(root, byte offset)` where `root` is the value the
-/// `gep` chain bottoms out at.  `None` means the chain contains a non-constant
-/// offset (a runtime index), which is still a *usable* root: only the offset is
-/// unknown.
-fn root_of(func: &IrFunction, v: Value) -> (u32, Option<i64>) {
-    let (mut cur, mut off) = (v.0, 0i64);
-    for _ in 0..32 {
-        let mut next = None;
-        for block in &func.blocks {
-            for inst in &block.instructions {
-                if let Instruction::GetElementPtr {
-                    dest, base, offset, ..
-                } = inst
-                {
-                    if dest.0 == cur {
-                        next = Some((
-                            base.0,
-                            match offset {
-                                Operand::Const(IrConst::I64(o)) => Some(*o),
-                                _ => None,
-                            },
-                        ));
-                    }
-                }
-            }
-            if next.is_some() {
-                break;
-            }
-        }
-        match next {
-            None => return (cur, Some(off)),
-            Some((base, None)) => return (base, None),
-            Some((base, Some(d))) => match off.checked_add(d) {
-                Some(next) => {
-                    off = next;
-                    cur = base;
-                }
-                None => return (base, None),
-            },
-        }
-    }
-    (cur, None)
+/// Immutable facts are indexed once per search, not rediscovered by scanning
+/// every block at each provenance hop. A rewritten function gets fresh facts.
+struct Facts<'a> {
+    defs: FxHashMap<u32, &'a Instruction>,
+    multi_def: FxHashSet<u32>,
+    uses: FxHashMap<u32, usize>,
 }
 
-/// `a - b` in bytes when it is provable: equal pointers are 0, a `gep` of the
-/// other is its constant offset, and two `gep`s off one root differ by their
-/// offsets.  `None` means "cannot prove" -- callers fail closed.
-fn offset_from(func: &IrFunction, a: Value, b: Value) -> Option<i64> {
-    if a.0 == b.0 {
-        return Some(0);
+impl<'a> Facts<'a> {
+    fn new(func: &'a IrFunction) -> Self {
+        let mut facts = Self {
+            defs: FxHashMap::default(),
+            multi_def: FxHashSet::default(),
+            uses: FxHashMap::default(),
+        };
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Some(dest) = inst.dest() {
+                    if facts.defs.insert(dest.0, inst).is_some() {
+                        facts.multi_def.insert(dest.0);
+                    }
+                }
+                inst.for_each_used_value(|id| *facts.uses.entry(id).or_default() += 1);
+            }
+            block.terminator.for_each_used_value(|id| {
+                *facts.uses.entry(id).or_default() += 1;
+            });
+        }
+        facts
     }
-    // A direct `gep b, k`.
-    for block in &func.blocks {
-        for inst in &block.instructions {
+
+    /// Resolve an immutable address chain. Unknown offsets keep their object
+    /// root but cannot establish a byte distance. Cycles, overflow, and mutable
+    /// copy webs fail closed rather than presenting a fabricated root.
+    fn root_of(&self, v: Value) -> Option<(u32, Option<i64>)> {
+        let (mut cur, mut offset) = (v.0, Some(0i64));
+        for _ in 0..32 {
+            if self.multi_def.contains(&cur) {
+                return None;
+            }
+            let Some(inst) = self.defs.get(&cur) else {
+                return Some((cur, offset));
+            };
             if let Instruction::GetElementPtr {
-                dest, base, offset, ..
+                base, offset: step, ..
             } = inst
             {
-                if dest.0 == a.0 && base.0 == b.0 {
-                    if let Operand::Const(IrConst::I64(k)) = offset {
-                        return Some(*k);
+                offset = match (offset, step) {
+                    (Some(sum), Operand::Const(IrConst::I64(delta))) => {
+                        Some(sum.checked_add(*delta)?)
                     }
+                    _ => None,
+                };
+                cur = base.0;
+            } else {
+                match provenance::chain_step(inst) {
+                    ChainStep::Follow(base) => cur = base.0,
+                    ChainStep::Stop => return Some((cur, offset)),
                 }
             }
         }
+        None
     }
-    let (ra, oa) = root_of(func, a);
-    let (rb, ob) = root_of(func, b);
-    if ra == rb {
-        return match (oa, ob) {
-            (Some(x), Some(y)) => Some(x - y),
-            _ => None,
+
+    /// Prove a relative displacement even when the shared base is itself a
+    /// dynamic GEP. Flattening both offsets to their object root would lose
+    /// this common case (`p + i`, then `(p + i) + 8`).
+    fn displacement_to(&self, mut a: Value, b: Value) -> Option<i64> {
+        let mut offset = 0i64;
+        for _ in 0..32 {
+            if a == b {
+                return Some(offset);
+            }
+            let inst = self.defs.get(&a.0)?;
+            if let Instruction::GetElementPtr {
+                base,
+                offset: Operand::Const(IrConst::I64(delta)),
+                ..
+            } = inst
+            {
+                offset = offset.checked_add(*delta)?;
+                a = *base;
+            } else if matches!(inst, Instruction::GetElementPtr { .. }) {
+                return None;
+            } else {
+                match provenance::chain_step(inst) {
+                    ChainStep::Follow(base) => a = base,
+                    ChainStep::Stop => return None,
+                }
+            }
+        }
+        None
+    }
+
+    fn offset_from(&self, a: Value, b: Value) -> Option<i64> {
+        // Validate both complete chains before accepting a shared interior
+        // node: that node may be an immutable GEP of a redefined address web.
+        let (ra, oa) = self.root_of(a)?;
+        let (rb, ob) = self.root_of(b)?;
+        if let Some(delta) = self.displacement_to(a, b) {
+            return Some(delta);
+        }
+        if let Some(delta) = self.displacement_to(b, a) {
+            return delta.checked_neg();
+        }
+        if ra == rb { oa?.checked_sub(ob?) } else { None }
+    }
+
+    /// Cross-root disjointness is a typed-leaf property, never an inequality
+    /// between SSA ids. Loaded/selected/integer-laundered addresses can point
+    /// into this frame; incoming pointer parameters and global objects cannot.
+    fn distinct_objects(&self, a: Value, b: Value) -> bool {
+        let (Some((ra, _)), Some((rb, _))) = (self.root_of(a), self.root_of(b)) else {
+            return false;
         };
+        if ra == rb {
+            return false;
+        }
+        let leaf = |id| self.defs.get(&id).map(|inst| provenance::root_leaf(inst));
+        matches!(
+            (leaf(ra), leaf(rb)),
+            (
+                Some(RootLeaf::Alloca(_)),
+                Some(RootLeaf::Alloca(_) | RootLeaf::Param(_) | RootLeaf::Global(_))
+            ) | (
+                Some(RootLeaf::Param(_) | RootLeaf::Global(_)),
+                Some(RootLeaf::Alloca(_))
+            )
+        )
     }
-    None
+
+    fn provably_disjoint(&self, src: Value, dst: Value) -> bool {
+        self.offset_from(dst, src)
+            .is_some_and(|d| d.unsigned_abs() >= COPY_BYTES as u64)
+            || self.distinct_objects(src, dst)
+    }
 }
 
 fn is_cst(v: &Operand, want: i64) -> bool {
@@ -153,23 +215,14 @@ fn is_cst(v: &Operand, want: i64) -> bool {
 }
 
 fn clobbers(inst: &Instruction) -> bool {
-    matches!(
-        inst,
-        Instruction::Store { .. }
-            | Instruction::Memcpy { .. }
-            | Instruction::Call { .. }
-            | Instruction::CallIndirect { .. }
-            | Instruction::AtomicStore { .. }
-            | Instruction::AtomicRmw { .. }
-            | Instruction::AtomicCmpxchg { .. }
-            | Instruction::Fence { .. }
-            | Instruction::VaArg { .. }
-            | Instruction::VaArgStruct { .. }
-            | Instruction::VaArgVector { .. }
-            | Instruction::VaStart { .. }
-            | Instruction::VaCopy { .. }
-            | Instruction::StackRestore { .. }
-    )
+    inst.may_write_memory()
+        || matches!(
+            inst,
+            Instruction::Fence { .. }
+                | Instruction::AtomicLoad { .. }
+                | Instruction::StackRestore { .. }
+                | Instruction::Load { volatile: true, .. }
+        )
 }
 
 /// Immutable facts about one candidate, resolved before any mutation.
@@ -179,43 +232,6 @@ struct Candidate {
     insert_at: usize,
     dest_ptr: Value,
     src_ptr: Value,
-}
-
-/// The alloca a store destination provably belongs to, when it is a stack
-/// home.  A store elsewhere is treated as an opaque clobber.
-fn store_root(func: &IrFunction, ptr: Value) -> Option<u32> {
-    let (root, _) = root_of(func, ptr);
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Instruction::Alloca { dest, .. } = inst {
-                if dest.0 == root {
-                    return Some(root);
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Whether a 16-byte copy from `src` to `dst` can be proven not to overlap
-/// partially.  Same pointer (an exact self copy) and same-root objects at
-/// least 16 bytes apart are fine, as are two distinct stack homes and a stack
-/// home against a pointer this frame cannot name: a pointer parameter can
-/// never point into the current invocation's frame, so a destination that is
-/// a non-escaping-by-construction stack home cannot alias it.
-fn provably_disjoint(func: &IrFunction, src: Value, dst: Value) -> bool {
-    if let Some(d) = offset_from(func, dst, src) {
-        return d.unsigned_abs() >= COPY_BYTES as u64;
-    }
-    let (sroot, _) = root_of(func, src);
-    let (droot, _) = root_of(func, dst);
-    if sroot == droot {
-        return false;
-    }
-    let s_home = store_root(func, src).is_some();
-    let d_home = store_root(func, dst).is_some();
-    // Distinct stack homes, or a stack home against an unnameable pointer.
-    s_home != d_home || (s_home && d_home)
 }
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
@@ -233,19 +249,8 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 }
 
 fn find_one(func: &IrFunction) -> Option<Candidate> {
-    let multi_def = super::gvn::find_multi_def_values(func);
-    // Use counts over the whole function, so a single-use proof also covers
-    // uses in other blocks.
-    let mut uses: FxHashMap<u32, usize> = FxHashMap::default();
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            inst.for_each_used_value(|id| *uses.entry(id).or_default() += 1);
-        }
-        block
-            .terminator
-            .for_each_used_value(|id| *uses.entry(id).or_default() += 1);
-    }
-    let single_use = |v: u32| uses.get(&v).copied().unwrap_or(0) == 1;
+    let facts = Facts::new(func);
+    let single_use = |v: u32| facts.uses.get(&v).copied().unwrap_or(0) == 1;
 
     for (bi, block) in func.blocks.iter().enumerate() {
         for (oi, inst) in block.instructions.iter().enumerate() {
@@ -299,7 +304,7 @@ fn find_one(func: &IrFunction) -> Option<Candidate> {
             else {
                 continue;
             };
-            if uses.get(&agg.0).copied().unwrap_or(0) != 2 {
+            if facts.uses.get(&agg.0).copied().unwrap_or(0) != 2 {
                 continue;
             }
 
@@ -371,10 +376,13 @@ fn find_one(func: &IrFunction) -> Option<Candidate> {
             ];
             hops.extend(lo_src.load_dest);
             hops.extend(hi_src.load_dest);
-            if hops.iter().any(|id| multi_def.contains(id)) {
+            if hops.iter().any(|id| facts.multi_def.contains(id)) {
                 continue;
             }
-            if !single_use(hi_src.shift_dest)
+            if !single_use(shift_dest)
+                || !lo_src.load_dest.is_some_and(single_use)
+                || !hi_src.load_dest.is_some_and(single_use)
+                || !single_use(hi_src.shift_dest)
                 || !single_use(trunc_dest)
                 || !single_use(hi_cast_dest)
                 || !single_use(lo_src.cast_dest)
@@ -384,50 +392,58 @@ fn find_one(func: &IrFunction) -> Option<Candidate> {
             }
 
             // The two halves must be exactly 8 bytes apart on both sides.
-            if offset_from(func, hi_src.ptr, lo_src.ptr) != Some(HALF)
-                || offset_from(func, q_hi, q_lo) != Some(HALF)
+            if facts.offset_from(hi_src.ptr, lo_src.ptr) != Some(HALF)
+                || facts.offset_from(q_hi, q_lo) != Some(HALF)
             {
                 continue;
             }
-            if !provably_disjoint(func, lo_src.ptr, q_lo) {
+            if !facts.provably_disjoint(lo_src.ptr, q_lo) {
                 continue;
             }
-            let (p_root, _) = root_of(func, lo_src.ptr);
-            let (q_root, _) = root_of(func, q_lo);
-
-            // The read of `p` moves later (to the store site), so an
-            // intervening memory write is only harmless when it provably
-            // cannot touch `p` or `q`.  A store into a stack home qualifies:
-            // its provenance base is the alloca, and `p`/`q` are either
-            // parameters or the same alloca -- both cases settle below.
-            // Anything unprovable (a call, an atomic, a fence, a memcpy, an
-            // escaping pointer) refuses.
+            // Both scalar stores move to the later store site. In addition
+            // to protecting the delayed source read, protect observers of the
+            // earlier destination write. Unknown effects are barriers.
             let first = lo_src.load_index.min(hi_src.load_index);
+            let first_store = store_lo_i.min(store_hi_i);
             let last = store_lo_i.max(store_hi_i);
-            let replaced = [store_lo_i, store_hi_i];
             let mut blocked = false;
-            for (ii, inst) in block.instructions.iter().enumerate() {
-                if ii < first || ii > last || replaced.contains(&ii) || !clobbers(inst) {
+            for (ii, inst) in block
+                .instructions
+                .iter()
+                .enumerate()
+                .take(last + 1)
+                .skip(first)
+            {
+                if ii == store_lo_i || ii == store_hi_i {
                     continue;
                 }
-                if let Instruction::Store {
-                    ptr,
-                    volatile: false,
-                    seg_override: AddressSpace::Default,
-                    ..
-                } = inst
-                {
-                    let store_root = store_root(func, *ptr);
-                    if store_root.is_none()
-                        || store_root == Some(p_root)
-                        || store_root == Some(q_root)
+                if clobbers(inst) {
+                    if let Instruction::Store {
+                        ptr,
+                        volatile: false,
+                        seg_override: AddressSpace::Default,
+                        ..
+                    } = inst
                     {
+                        if facts.distinct_objects(*ptr, lo_src.ptr)
+                            && facts.distinct_objects(*ptr, q_lo)
+                        {
+                            continue;
+                        }
+                    }
+                    blocked = true;
+                    break;
+                }
+                if ii > first_store {
+                    let observes_destination = match inst {
+                        Instruction::Load { ptr, .. } => !facts.distinct_objects(*ptr, q_lo),
+                        Instruction::Intrinsic { op, .. } => op.reads_pointer_arg(),
+                        _ => false,
+                    };
+                    if observes_destination {
                         blocked = true;
                         break;
                     }
-                } else {
-                    blocked = true;
-                    break;
                 }
             }
             if blocked {
@@ -511,6 +527,15 @@ fn shl_source(block: &crate::ir::reexports::BasicBlock, op: &Operand) -> Option<
 /// `cast (load %lo) -> i128`
 fn lo_source(block: &crate::ir::reexports::BasicBlock, op: &Operand) -> Option<HalfLoad> {
     let (ci, cd, ptr, ld, li) = cast_of_load(block, op)?;
+    if !matches!(
+        block.instructions[ci],
+        Instruction::Cast {
+            from_ty: IrType::U64,
+            ..
+        }
+    ) {
+        return None;
+    }
     Some(HalfLoad {
         ptr,
         load_dest: ld,
@@ -605,6 +630,16 @@ mod tests {
 
     fn func_with(insts: Vec<Instruction>) -> IrFunction {
         let mut f = IrFunction::new("t".to_string(), T::Void, Vec::new(), false);
+        f.next_value_id = 100;
+        let mut insts = insts;
+        insts.insert(
+            0,
+            Instruction::ParamRef {
+                dest: Value(2),
+                param_idx: 0,
+                ty: IrType::Ptr,
+            },
+        );
         f.blocks = vec![BasicBlock {
             label: BlockId(0),
             instructions: insts,
@@ -803,9 +838,9 @@ mod tests {
 
     #[test]
     fn overlapping_source_and_destination_keep_the_round_trip() {
-        // src = base + 8, dst = base: 16 bytes from base+8 into base overlaps.
-        let mut insts = vec![gep(4, 2, 8)];
-        insts.extend(roundtrip(4, 2));
+        // src = dst + 8: immutable addresses, but overlapping byte ranges.
+        let mut insts = roundtrip(4, 3);
+        insts.insert(1, gep(4, 3, 8));
         let mut f = func_with(insts);
         assert_eq!(run(&mut f), 0, "a partial overlap must refuse");
     }
@@ -813,15 +848,160 @@ mod tests {
     #[test]
     fn a_non_adjacent_pair_keeps_the_round_trip() {
         let mut insts = roundtrip(2, 3);
-        insts[1] = gep(11, 2, 16); // high half 16 bytes away, not 8
+        insts[2] = gep(11, 2, 16); // high half 16 bytes away, not 8
         let mut f = func_with(insts);
         assert_eq!(run(&mut f), 0);
     }
 
     #[test]
+    fn every_deleted_value_must_have_no_external_reader() {
+        for value in [10, 12, 18] {
+            let mut insts = roundtrip(2, 3);
+            insts.push(Instruction::Copy {
+                dest: Value(40),
+                src: Operand::Value(Value(value)),
+            });
+            let mut f = func_with(insts);
+            assert_eq!(run(&mut f), 0, "external reader of %{value}");
+        }
+    }
+
+    #[test]
+    fn signed_low_half_extension_is_not_a_bitwise_pack() {
+        let mut insts = roundtrip(2, 3);
+        insts[5] = cast(14, 10, IrType::I64, IrType::I128);
+        let mut f = func_with(insts);
+        assert_eq!(
+            run(&mut f),
+            0,
+            "a negative low half fills the high half with ones"
+        );
+    }
+
+    #[test]
+    fn a_destination_observer_between_stores_blocks_the_rewrite() {
+        let mut insts = roundtrip(2, 3);
+        insts.insert(10, load(40, 3));
+        let mut f = func_with(insts);
+        assert_eq!(run(&mut f), 0, "the observer must see the first store");
+    }
+
+    #[test]
+    fn a_memory_backed_simd_observer_blocks_store_relocation() {
+        let mut insts = roundtrip(2, 3);
+        insts.insert(
+            10,
+            Instruction::Intrinsic {
+                dest: Some(Value(40)),
+                op: crate::ir::intrinsics::IntrinsicOp::AddPd128,
+                dest_ptr: None,
+                args: vec![Operand::Value(Value(3)), Operand::Value(Value(50))],
+            },
+        );
+        let mut f = func_with(insts);
+        assert_eq!(run(&mut f), 0);
+    }
+
+    #[test]
+    fn an_intrinsic_write_is_a_memory_barrier() {
+        let mut insts = roundtrip(2, 3);
+        insts.insert(
+            8,
+            Instruction::Intrinsic {
+                dest: Some(Value(40)),
+                op: crate::ir::intrinsics::IntrinsicOp::Loaddqu,
+                dest_ptr: Some(Value(2)),
+                args: vec![Operand::Value(Value(50))],
+            },
+        );
+        let mut f = func_with(insts);
+        assert_eq!(run(&mut f), 0, "the source is changed before the stores");
+    }
+
+    #[test]
+    fn an_unknown_pointer_is_not_disjoint_from_a_stack_home() {
+        let mut insts = roundtrip(4, 3);
+        insts.insert(
+            1,
+            Instruction::Copy {
+                dest: Value(4),
+                src: Operand::Value(Value(3)),
+            },
+        );
+        insts.insert(2, gep(5, 4, 8));
+        // Two adjacent halves read from a partly overlapping alias of dst.
+        insts[3] = load(10, 5);
+        insts[4] = gep(11, 5, 8);
+        let mut f = func_with(insts);
+        assert_eq!(run(&mut f), 0, "Copy must not hide overlap with an alloca");
+    }
+
+    #[test]
+    fn a_redefined_address_blocks_the_rewrite() {
+        let mut insts = roundtrip(2, 3);
+        insts.insert(1, gep(2, 50, 0));
+        insts.insert(8, gep(2, 50, 16));
+        let mut f = func_with(insts);
+        assert_eq!(run(&mut f), 0, "address webs are not immutable SSA roots");
+    }
+
+    #[test]
+    fn adjacent_halves_of_a_dynamic_address_still_collapse() {
+        let mut insts = roundtrip(4, 3);
+        insts.insert(
+            1,
+            Instruction::GetElementPtr {
+                dest: Value(4),
+                base: Value(2),
+                offset: Operand::Value(Value(50)),
+                ty: IrType::I8,
+            },
+        );
+        let mut f = func_with(insts);
+        assert_eq!(run(&mut f), 1, "the shared dynamic offset cancels exactly");
+    }
+
+    #[test]
+    fn pointer_distance_overflow_fails_closed() {
+        let f = func_with(vec![gep(40, 2, i64::MAX), gep(41, 2, i64::MIN)]);
+        let facts = Facts::new(&f);
+        assert_eq!(facts.offset_from(Value(40), Value(41)), None);
+        assert_eq!(facts.offset_from(Value(41), Value(40)), None);
+    }
+
+    #[test]
+    fn integer_parameters_do_not_prove_stack_disjointness() {
+        let mut f = func_with(roundtrip(2, 3));
+        if let Instruction::ParamRef { ty, .. } = &mut f.blocks[0].instructions[0] {
+            *ty = IrType::U64;
+        }
+        assert_eq!(run(&mut f), 0, "an integer can name any live address");
+    }
+
+    #[test]
+    fn volatile_and_atomic_operations_are_relocation_barriers() {
+        let mut volatile = load(40, 50);
+        if let Instruction::Load { volatile, .. } = &mut volatile {
+            *volatile = true;
+        }
+        let atomic = Instruction::AtomicInc {
+            ptr: Operand::Value(Value(50)),
+            offset: 0,
+            ty: IrType::I64,
+            ordering: crate::ir::ops::AtomicOrdering::SeqCst,
+        };
+        for barrier in [volatile, atomic] {
+            let mut insts = roundtrip(2, 3);
+            insts.insert(8, barrier);
+            let mut f = func_with(insts);
+            assert_eq!(run(&mut f), 0);
+        }
+    }
+
+    #[test]
     fn a_32_bit_source_is_not_matched() {
         let mut insts = roundtrip(2, 3);
-        insts[3] = cast(13, 12, IrType::U32, IrType::I128);
+        insts[4] = cast(13, 12, IrType::U32, IrType::I128);
         let mut f = func_with(insts);
         assert_eq!(run(&mut f), 0);
     }

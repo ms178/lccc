@@ -150,6 +150,27 @@ if build v3_contract_off -march=x86-64-v3 -ffp-contract=off; then
         "$(count '\bvfmadd[0-9]*p[sd]\b' "$tmp/v3_contract_off.s")" 0
 fi
 
+# Force the two-wide IR path on FMA-capable hardware. This used to stay scalar
+# when contraction was denied, and the new non-fused op was never constructed.
+# Both AVX1+FMA and AVX2 exercise the distinction between encoding and semantics.
+for isa in avx_fma v3; do
+    if [ "$isa" = avx_fma ]; then
+        flags=(-mavx -mfma)
+    else
+        flags=(-march=x86-64-v3)
+    fi
+    if LCCC_FORCE_SSE2=1 build "${isa}_two_wide_off" "${flags[@]}" -ffp-contract=off; then
+        check_gt0 "$isa two-wide off: packed mul" \
+            "$(count '\bvmulpd\b' "$tmp/${isa}_two_wide_off.s")"
+        check_gt0 "$isa two-wide off: packed add" \
+            "$(count '\bvaddpd\b' "$tmp/${isa}_two_wide_off.s")"
+        check_eq "$isa two-wide off: no FMA" \
+            "$(count '\bvfmadd[0-9]*p[sd]\b' "$tmp/${isa}_two_wide_off.s")" 0
+        check_eq "$isa two-wide off: same separately-rounded result" \
+            "$(hash_of "${isa}_two_wide_off")" "$(hash_of baseline)"
+    fi
+done
+
 # ── the one direction that must not vectorize ──────────────────────────────
 # `-mno-sse` (the kernel's flag set) removes the xmm file, so no packed form is
 # legal.  FP has no x87 lowering here, so the TU must be refused outright --

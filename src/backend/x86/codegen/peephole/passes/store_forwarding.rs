@@ -1129,7 +1129,10 @@ fn gsf_handle_load_xmm(
             is_xmm_family(mapping.reg_id) && mapping.size.byte_size() >= load_size.byte_size();
         if xmm_serves {
             let src = mapping.reg_id;
-            if src == dst && load_size == MoveSize::DQ {
+            if src == dst
+                && load_size == MoveSize::DQ
+                && !infos[i].trimmed(store.get(i)).starts_with('v')
+            {
                 // A 16-byte home read back into the very register that wrote
                 // it rewrites all 128 bits with the values they already hold:
                 // the load is a no-op. This is valid ONLY at full width — a
@@ -2548,6 +2551,21 @@ mod tests {
             !out.contains("72(%rsp), %xmm6"),
             "a full-width self reload is a no-op: {out}"
         );
+    }
+
+    #[test]
+    fn vex_self_reload_must_still_clear_the_upper_vector() {
+        for mnemonic in ["vmovdqu", "vmovups", "vmovapd", "vmovdqa32"] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    vmovdqu %ymm6, 32(%rsp)\n    movdqu %xmm6, 72(%rsp)\n    {mnemonic} 72(%rsp), %xmm6\n    vmovdqu %ymm6, 96(%rsp)\n    ret\n.cfi_endproc\n"
+            );
+            let (out, _) = forward_only(&asm);
+            assert!(
+                out.contains(&format!("{mnemonic} %xmm6, %xmm6"))
+                    || out.contains(&format!("{mnemonic} 72(%rsp), %xmm6")),
+                "the VEX/EVEX write clears bits above 127, even for a self reload: {out}"
+            );
+        }
     }
 
     #[test]
