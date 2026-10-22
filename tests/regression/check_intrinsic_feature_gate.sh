@@ -133,23 +133,37 @@ EOF
 # The oracle is version-sensitive: `-mvaes` and `-mvpclmulqdq` only imply the
 # AVX (VEX) class from GCC 13 on.  A stock Debian `gcc` is 12 and rejects the
 # 256-bit intrinsic that GCC 16 accepts, so resolving a bare `gcc` here turned
-# a correct tree into a red gate.  The contract is GCC 16.2 (docs/toolchains),
-# so prefer the newest GCC on PATH and record the version that answered.
-gcc_bin=${GCC:-}
-if [ -z "$gcc_bin" ]; then
-    for candidate in gcc-17 gcc-16 gcc-15 gcc-14 gcc-13 gcc; do
-        if command -v "$candidate" >/dev/null 2>&1; then gcc_bin=$candidate; break; fi
-    done
+# a correct tree into a red gate.
+#
+# Resolution order, in the order the project's own provisioning implies it:
+#  1. `$GCC` — an operator's explicit choice is never second-guessed;
+#  2. `gcc` — CI prepends a directory whose `gcc` IS the provisioned GCC 16,
+#     so honouring the name keeps the pinned oracle pinned;
+#  3. only when that `gcc` is older than the implied-AVX change, the newest
+#     explicitly-versioned `gcc-N` on PATH (a dev box with gcc-13+ installed
+#     beside a GCC 12 `gcc`).
+# The version that answered is always printed, so a measurement records it.
+major_of() { "$1" -dumpversion 2>/dev/null | cut -d. -f1; }
+numeric() { case ${1:-0} in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
+
+if [ -n "${GCC:-}" ]; then
+    gcc_bin=$GCC
+elif command -v gcc >/dev/null 2>&1; then
+    gcc_bin=gcc
+    if [ "$(numeric "$(major_of gcc)")" -lt 13 ]; then
+        for candidate in gcc-17 gcc-16 gcc-15 gcc-14 gcc-13; do
+            if command -v "$candidate" >/dev/null 2>&1; then gcc_bin=$candidate; break; fi
+        done
+    fi
+else
+    gcc_bin=
 fi
 if [ -z "$gcc_bin" ] || ! command -v "$gcc_bin" >/dev/null 2>&1; then
     echo "SKIP: oracle unavailable (${gcc_bin:-gcc} not found); the contract above still ran" >&2
     echo "PASS: intrinsic feature gate (no oracle on this host)"
     exit 0
 fi
-gcc_major=$("$gcc_bin" -dumpversion 2>/dev/null | cut -d. -f1)
-case ${gcc_major:-0} in
-    ''|*[!0-9]*) gcc_major=0 ;;
-esac
+gcc_major=$(numeric "$(major_of "$gcc_bin")")
 echo "oracle: $gcc_bin (GCC $gcc_major)"
 
 cat >"$tmp/o_crc.c" <<'EOF'
