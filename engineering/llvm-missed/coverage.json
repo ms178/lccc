@@ -163,8 +163,8 @@
     },
     {
       "number": 219334,
-      "status": "reviewed-deferred",
-      "scope": "General bitreverse conjugation through shared bitwise DAGs needs a bounded graph-substitution and sharing-cost proof; matching one opposite shift does not cover the source networks.",
+      "status": "covered-limited",
+      "scope": "Private same-width BitReverse networks over AND/OR/XOR/NOT and fixed valid logical shifts are conjugated by bit permutation; all six original shapes are covered at IR level. Shared internal operations, casts, arithmetic, AShr and invalid counts refuse; shared reversal leaves are retained when needed.",
       "next": "Target-specific C/IR reproductions and costed nested-graph reconstruction remain necessary.",
       "followups": [
         {
@@ -180,9 +180,34 @@
             "tests/corpus/test_predicate_relations_inventory.py"
           ],
           "previous_scope": "This batch implements related byte-swap conjugations and bit-reverse Eq observations, not all nested bitreverse graphs"
+        },
+        {
+          "cohort": "packed-relations",
+          "previous_status": "reviewed-deferred",
+          "previous_scope": "General bitreverse conjugation through shared bitwise DAGs needs a bounded graph-substitution and sharing-cost proof; matching one opposite shift does not cover the source networks.",
+          "status": "covered-limited",
+          "scope": "Private same-width BitReverse networks over AND/OR/XOR/NOT and fixed valid logical shifts are conjugated by bit permutation; all six original shapes are covered at IR level. Shared internal operations, casts, arithmetic, AShr and invalid counts refuse; shared reversal leaves are retained when needed.",
+          "evidence": [
+            "engineering/llvm-missed/PACKED-RELATIONS.md",
+            "engineering/llvm-missed/packed-relations-sources.json",
+            "src/passes/vec_relations_tests.rs",
+            "src/passes/bit_idioms_extrema_tests.rs",
+            "src/passes/bit_idioms_reverse_networks_tests.rs",
+            "tests/regression/check_packed_vector_relations.py",
+            "tests/regression/check_integer_order_networks.py"
+          ]
         }
       ],
-      "remaining": "General bitreverse conjugation through shared bitwise DAGs needs a bounded graph-substitution and sharing-cost proof; matching one opposite shift does not cover the source networks."
+      "remaining": "Limited to this follow-up contract; broader vectorization, intrinsic forms, metadata/CFG/target cost scopes are not globally resolved.",
+      "evidence": [
+        "engineering/llvm-missed/PACKED-RELATIONS.md",
+        "engineering/llvm-missed/packed-relations-sources.json",
+        "src/passes/vec_relations_tests.rs",
+        "src/passes/bit_idioms_extrema_tests.rs",
+        "src/passes/bit_idioms_reverse_networks_tests.rs",
+        "tests/regression/check_packed_vector_relations.py",
+        "tests/regression/check_integer_order_networks.py"
+      ]
     },
     {
       "number": 231586,
@@ -2710,16 +2735,42 @@
     {
       "number": 192094,
       "cohort": "predicate-relations",
-      "status": "reviewed-deferred",
+      "status": "covered-limited",
       "disposition": "reviewed-deferred",
-      "scope": "The motivating report is vector correlated propagation. The scalar control is exercised, but scalar range-arm simplification is not vector issue closure.",
+      "scope": "Packed unsigned < power-of-two / <= contiguous-low-mask compare supplies a bound to the true arm of a compatible same-or-finer-granularity blend. Remove only the matching AND mask. Eight integer lane/register shapes; signed/noncontiguous/mixed/coarser shapes refuse.",
       "evidence": [
         "engineering/llvm-missed/PREDICATE-RELATIONS.md",
         "engineering/llvm-missed/predicate-relations-sources.json",
         "src/passes/bit_idioms_select_facts_tests.rs",
         "tests/regression/llvm_predicate_relations.c",
-        "tests/corpus/test_predicate_relations_inventory.py"
-      ]
+        "tests/corpus/test_predicate_relations_inventory.py",
+        "engineering/llvm-missed/PACKED-RELATIONS.md",
+        "engineering/llvm-missed/packed-relations-sources.json",
+        "src/passes/vec_relations_tests.rs",
+        "src/passes/bit_idioms_extrema_tests.rs",
+        "src/passes/bit_idioms_reverse_networks_tests.rs",
+        "tests/regression/check_packed_vector_relations.py",
+        "tests/regression/check_integer_order_networks.py"
+      ],
+      "followups": [
+        {
+          "cohort": "packed-relations",
+          "previous_status": "reviewed-deferred",
+          "previous_scope": "The motivating report is vector correlated propagation. The scalar control is exercised, but scalar range-arm simplification is not vector issue closure.",
+          "status": "covered-limited",
+          "scope": "Packed unsigned < power-of-two / <= contiguous-low-mask compare supplies a bound to the true arm of a compatible same-or-finer-granularity blend. Remove only the matching AND mask. Eight integer lane/register shapes; signed/noncontiguous/mixed/coarser shapes refuse.",
+          "evidence": [
+            "engineering/llvm-missed/PACKED-RELATIONS.md",
+            "engineering/llvm-missed/packed-relations-sources.json",
+            "src/passes/vec_relations_tests.rs",
+            "src/passes/bit_idioms_extrema_tests.rs",
+            "src/passes/bit_idioms_reverse_networks_tests.rs",
+            "tests/regression/check_packed_vector_relations.py",
+            "tests/regression/check_integer_order_networks.py"
+          ]
+        }
+      ],
+      "remaining": "Limited to this follow-up contract; broader vectorization, intrinsic forms, metadata/CFG/target cost scopes are not globally resolved."
     },
     {
       "number": 202066,
@@ -2738,30 +2789,82 @@
     {
       "number": 202576,
       "cohort": "predicate-relations",
-      "status": "reviewed-deferred",
+      "status": "covered-limited",
       "disposition": "reviewed-deferred",
-      "scope": "Unsigned min with all-ones sentinel needs a min/max-specific identity; signed min and non-sentinel constants are not generalized.",
+      "scope": "All-ones unsigned sentinel select around an already existing scalar min select reuses that min. Same bound SSA operand, width, Eq/Ne arm orientation and unsigned min provenance are mandatory. No general min/max intrinsic or arbitrary sentinel is claimed.",
       "evidence": [
         "engineering/llvm-missed/PREDICATE-RELATIONS.md",
         "engineering/llvm-missed/predicate-relations-sources.json",
         "src/passes/bit_idioms_select_facts_tests.rs",
         "tests/regression/llvm_predicate_relations.c",
-        "tests/corpus/test_predicate_relations_inventory.py"
-      ]
+        "tests/corpus/test_predicate_relations_inventory.py",
+        "engineering/llvm-missed/PACKED-RELATIONS.md",
+        "engineering/llvm-missed/packed-relations-sources.json",
+        "src/passes/vec_relations_tests.rs",
+        "src/passes/bit_idioms_extrema_tests.rs",
+        "src/passes/bit_idioms_reverse_networks_tests.rs",
+        "tests/regression/check_packed_vector_relations.py",
+        "tests/regression/check_integer_order_networks.py"
+      ],
+      "followups": [
+        {
+          "cohort": "packed-relations",
+          "previous_status": "reviewed-deferred",
+          "previous_scope": "Unsigned min with all-ones sentinel needs a min/max-specific identity; signed min and non-sentinel constants are not generalized.",
+          "status": "covered-limited",
+          "scope": "All-ones unsigned sentinel select around an already existing scalar min select reuses that min. Same bound SSA operand, width, Eq/Ne arm orientation and unsigned min provenance are mandatory. No general min/max intrinsic or arbitrary sentinel is claimed.",
+          "evidence": [
+            "engineering/llvm-missed/PACKED-RELATIONS.md",
+            "engineering/llvm-missed/packed-relations-sources.json",
+            "src/passes/vec_relations_tests.rs",
+            "src/passes/bit_idioms_extrema_tests.rs",
+            "src/passes/bit_idioms_reverse_networks_tests.rs",
+            "tests/regression/check_packed_vector_relations.py",
+            "tests/regression/check_integer_order_networks.py"
+          ]
+        }
+      ],
+      "remaining": "Limited to this follow-up contract; broader vectorization, intrinsic forms, metadata/CFG/target cost scopes are not globally resolved."
     },
     {
       "number": 205005,
       "cohort": "predicate-relations",
-      "status": "reviewed-deferred",
+      "status": "covered-limited",
       "disposition": "reviewed-deferred",
-      "scope": "Min/max predicate ordering in the constraint solver is a distinct mechanism and vectorization proof; no intrinsic min/max representation is added.",
+      "scope": "Direct signed/unsigned <= and strict-opposite observations of existing scalar min/max selects against either operand fold before offset arithmetic obscures their structure. This does not implement the upstream memory-safety/ScalarEvolution/vectorizer constraint solver.",
       "evidence": [
         "engineering/llvm-missed/PREDICATE-RELATIONS.md",
         "engineering/llvm-missed/predicate-relations-sources.json",
         "src/passes/bit_idioms_select_facts_tests.rs",
         "tests/regression/llvm_predicate_relations.c",
-        "tests/corpus/test_predicate_relations_inventory.py"
-      ]
+        "tests/corpus/test_predicate_relations_inventory.py",
+        "engineering/llvm-missed/PACKED-RELATIONS.md",
+        "engineering/llvm-missed/packed-relations-sources.json",
+        "src/passes/vec_relations_tests.rs",
+        "src/passes/bit_idioms_extrema_tests.rs",
+        "src/passes/bit_idioms_reverse_networks_tests.rs",
+        "tests/regression/check_packed_vector_relations.py",
+        "tests/regression/check_integer_order_networks.py"
+      ],
+      "followups": [
+        {
+          "cohort": "packed-relations",
+          "previous_status": "reviewed-deferred",
+          "previous_scope": "Min/max predicate ordering in the constraint solver is a distinct mechanism and vectorization proof; no intrinsic min/max representation is added.",
+          "status": "covered-limited",
+          "scope": "Direct signed/unsigned <= and strict-opposite observations of existing scalar min/max selects against either operand fold before offset arithmetic obscures their structure. This does not implement the upstream memory-safety/ScalarEvolution/vectorizer constraint solver.",
+          "evidence": [
+            "engineering/llvm-missed/PACKED-RELATIONS.md",
+            "engineering/llvm-missed/packed-relations-sources.json",
+            "src/passes/vec_relations_tests.rs",
+            "src/passes/bit_idioms_extrema_tests.rs",
+            "src/passes/bit_idioms_reverse_networks_tests.rs",
+            "tests/regression/check_packed_vector_relations.py",
+            "tests/regression/check_integer_order_networks.py"
+          ]
+        }
+      ],
+      "remaining": "Limited to this follow-up contract; broader vectorization, intrinsic forms, metadata/CFG/target cost scopes are not globally resolved."
     },
     {
       "number": 223249,
@@ -2793,5 +2896,5 @@
     }
   ],
   "latest_batch": 2,
-  "latest_cohort": "predicate-relations"
+  "latest_cohort": "packed-relations"
 }

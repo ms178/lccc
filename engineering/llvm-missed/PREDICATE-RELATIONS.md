@@ -1,5 +1,7 @@
 # Predicate relations and complete deferral follow-up
 
+Historical receipt: dispositions below describe this cohort at publication. Later limited advances are recorded separately in [packed relations](PACKED-RELATIONS.md) and the cumulative ledger.
+
 ## Actual scope
 
 Retrieve **50 previously unreviewed reports** and revisit **all 56 prior deferred inventory entries**, including the 43 from scalar logic and 13 older entries. The result is **5 new limited covered scopes and 10 prior deferrals advanced to limited coverage**. **91 of the 106 entries remain blocked or refused in the stated scope. This is not completion of all deferrals, 50 new optimization families, zero defects, or global optimality.**
