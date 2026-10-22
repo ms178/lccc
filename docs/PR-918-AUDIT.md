@@ -123,6 +123,11 @@ One claim above is corrected outright: "AArch64 currently still selects a
 conservative nonfused two-wide entry even with fast contraction" described
 a defect as a policy. The AArch64 dispatch discarded the FP-contract bit,
 so the fused `fmla` arm was unreachable under every flag. That is fixed on
-this branch (contract-aware two-wide entries, emission-verified across
-five flag combinations); QEMU runtime differentials for the newly fused
-shapes remain the one evidence gap this addendum flags rather than fills.
+this branch (contract-aware two-wide entries). Beyond emission
+(`fmla` vs `fmul`/`fadd` across five flag combinations), the fused shape
+is runtime-verified under qemu-aarch64: a 32x32 matmul over
+(1+2^-27)x(1-2^-27) data -- proven by exact arithmetic, and checked by an
+in-program vacuity guard, to distinguish the two roundings -- is
+bit-exact against the `__builtin_fma` recurrence at the C default
+contract, `-ffp-contract=fast` and `-ffast-math`, and bit-exact against
+the volatile two-rounding recurrence at `-ffp-contract=off`.
