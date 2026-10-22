@@ -2239,8 +2239,21 @@ gate "popcount-loop-contract" fast \
 # step of the same script; ci-gate-parity fails if the two drift apart).
 gate "decimal64-indexed-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_decimal64_indexed_fold.sh
-gate "affine-scaled-index-matrix" fast \
-    env CCC="$LCCC" python3 tests/regression/check_affine_scaled_index_matrix.py
+# The normative GCC 16.2 matrix runs in debian-oracle.yml. Keep the local
+# counterpart when that exact compiler is installed; a rolling snapshot is not
+# silently promoted to the normative oracle.
+if { [ -z "$ONLY" ] || [[ "affine-scaled-index-matrix" == *"$ONLY"* ]]; } &&
+    [ "$SLOW_ONLY" != "1" ]; then
+    affine_gcc_version=$(gcc-16 -dumpfullversion 2>/dev/null || true)
+    if [ "$affine_gcc_version" = "16.2.0" ]; then
+        gate "affine-scaled-index-matrix" fast \
+            env CCC="$LCCC" python3 tests/regression/check_affine_scaled_index_matrix.py --gcc gcc-16
+    else
+        printf 'SKIP  affine-scaled-index-matrix (requires GCC 16.2.0; found %s)\n' \
+            "${affine_gcc_version:-not installed}"
+        SKIPPED=$((SKIPPED + 1))
+    fi
+fi
 
 gate "decimal32-arm-width" fast \
     env CCC_ARM=target/fastbuild/lccc-arm bash tests/regression/check_decimal32_indexed_fold_arm.sh

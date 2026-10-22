@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 401.38,
+      "predicted_gate_seconds": 399.26,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -46,10 +46,6 @@
         {
           "measured_s": 353.25,
           "name": "bash tests/regression/check_peephole_whitespace.sh"
-        },
-        {
-          "measured_s": 2.12,
-          "name": "python3 tests/regression/check_affine_scaled_index_matrix.py"
         },
         {
           "measured_s": 1.71,
@@ -1314,7 +1310,7 @@
   "provenance": {
     "backend-contracts": {
       "costs": "/tmp/contract-costs.tsv",
-      "measured_seconds_total": 802.75,
+      "measured_seconds_total": 800.63,
       "source": "measured by scripts/ci_gate_costs.py"
     },
     "codegen": {

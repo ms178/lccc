@@ -64,6 +64,9 @@ jobs:
       - name: Build compiler from this checkout
         run: cargo build --profile fastbuild --locked --bin lccc -j 2
 
+      - name: Affine scaled-index matrix against exact Debian GCC 16.2
+        run: python3 tests/regression/check_affine_scaled_index_matrix.py --lccc target/fastbuild/lccc --gcc gcc-16
+
       - name: Predicate relations against exact Debian GCC 16.2
         run: |
           python3 tests/regression/check_llvm_predicate_relations.py --gcc gcc-16 --json debian-predicate-relations.json

@@ -1938,7 +1938,7 @@ jobs:
         bash tests/regression/check_ra_web_inloop_use.sh
         bash tests/regression/check_tight_loop_align.sh
         bash tests/regression/check_peephole_whitespace.sh
-        python3 tests/regression/check_affine_scaled_index_matrix.py
+        # Normative GCC 16.2 matrix runs in debian-oracle.yml.
         bash tests/regression/check_vectorize_round_maps.sh
         # BMI2 _bzhi_u32/_u64 lower to one bzhi and match GCC's results.
         python3 tests/regression/check_bmi2_bzhi.py
