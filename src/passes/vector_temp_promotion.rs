@@ -150,6 +150,8 @@ fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
         | O::CvtSd2Si128
         | O::CvttSs2Si128
         | O::CvttSd2Si128
+        | O::Cvtsd2Si64
+        | O::Cvtss2Si64
         | O::CvtPs2Pd256
         | O::CvtEp32ToPd256
         | O::Zext128to512
@@ -2434,6 +2436,25 @@ mod tests {
 
     #[test]
     fn intrinsic_signature_distinguishes_vector_and_scalar_arguments() {
+        // The scalar FP->int converts consume a 128-bit vector operand even
+        // though only its low lane is read: all six (si32 quartet + si64 pair)
+        // must classify identically, or one family's operands silently stop
+        // forwarding / lose the unaligned-safe alignment verdict.
+        for op in [
+            IntrinsicOp::CvtSs2Si128,
+            IntrinsicOp::CvtSd2Si128,
+            IntrinsicOp::CvttSs2Si128,
+            IntrinsicOp::CvttSd2Si128,
+            IntrinsicOp::Cvtsd2Si64,
+            IntrinsicOp::Cvtss2Si64,
+        ] {
+            assert_eq!(pointer_vector_arg_width(op, 0), Some(16), "{op:?}");
+            assert_eq!(
+                intrinsic_arg_required_alignment(op, 0),
+                Some(0),
+                "{op:?}"
+            );
+        }
         assert_eq!(
             pointer_vector_arg_width(IntrinsicOp::Pcmpeqb256, 0),
             Some(32)
