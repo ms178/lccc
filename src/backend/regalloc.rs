@@ -6120,6 +6120,15 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
     // no vecreg allocation until their sse_load_arg/sse_store_dest contract is
     // audited here.
     let compute_vec_arg_count = |op: &IntrinsicOp| -> Option<usize> {
+        // The destructive FP binary ops (add/sub/mul/div/min/max x ps/pd/sd/ss)
+        // take exactly two 16-byte vector operands and coalesce with the first.
+        // One shared predicate, not a fourth hand-maintained copy of the list:
+        // `divps/divpd/minps/minpd/maxps/maxpd` were missing from the copies
+        // here and in `copy_coalescing`, which kept both operands in stack
+        // slots (20 instructions against 14 for the identical `addpd` kernel).
+        if op.is_sse_fp_128_destructive_binary() {
+            return Some(2);
+        }
         use IntrinsicOp as O;
         match op {
             // Full-width constants do not read a vector operand.
@@ -6264,12 +6273,6 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             | O::Por128
             | O::Pand128
             | O::Pxor128
-            | O::AddPs128
-            | O::SubPs128
-            | O::MulPs128
-            | O::AddPd128
-            | O::SubPd128
-            | O::MulPd128
             | O::Paddw128
             | O::Psubw128
             | O::Pmulhw128

@@ -215,6 +215,20 @@ pub enum IntrinsicOp {
     /// Two-wide FMA using a broadcast previously loaded by BroadcastLoadF64.
     /// dest_ptr is C and args[0] is the B vector pointer.
     FmaF64x2Hoisted,
+    /// Same address/broadcast contract as [`FmaF64x2Hoisted`], but the
+    /// multiply and the add round separately, so no FMA3 unit is required and
+    /// no contraction licence is consumed.
+    ///
+    /// This is what the two-wide matmul arm emits whenever fused arithmetic is
+    /// unavailable or unasked-for: plain x86-64 (SSE2 baseline, no FMA3) and
+    /// `-ffp-contract=off`. Without it the arm had no non-FMA lowering at all
+    /// and silently stayed scalar on the whole baseline profile.
+    ///
+    /// Lowering is `movupd B; mulpd; movupd C; addpd; movupd C` twice per
+    /// four-element group, i.e. `xmm0` for the product, `xmm1` for the hoisted
+    /// broadcast, `xmm2` for the C addend (the allocator must quarantine xmm2
+    /// exactly as for [`FmaF64x2Hoisted`]'s legacy form).
+    MulAddF64x2Hoisted,
     /// Packed double FMA for AVX2 4-wide vectorized loops.
     /// Computes: *dest_ptr[0..4] += broadcast(*args[0]) * *args[1][0..4]
     /// dest_ptr: pointer to 4×F64 accumulator (read+write, 32 bytes)
@@ -1606,6 +1620,33 @@ pub enum IntrinsicOp {
     Vpdpbusd512,
     Vpdpbusds512,
     Vpclmulqdq512,
+    // === 128-bit SCALAR FP ops (SSE) ===
+    //
+    // `_mm_add_sd`, `_mm_mul_ss`, ... operate on ONE lane and preserve every
+    // other lane of the first operand — exactly what the hardware `addsd`
+    // family does (`ADDSD` writes the low lane and leaves the rest of the
+    // destination alone), so each is a single instruction.  They were the last
+    // group still written as plain C in the headers
+    // (`__a.__val[0] += __b.__val[0]; return __a;`), which costs a scalar
+    // extract, a scalar op, and a rebuild of the 16-byte struct: measured at
+    // 64 instructions per row in the SSE2 codegen matrix against 6 for the
+    // same kernel using `addpd`.  The result is still a 128-bit value (the
+    // untouched lanes are part of it), so these ops belong to the 128-bit
+    // home-width group like their packed siblings.
+    AddSd128,
+    SubSd128,
+    MulSd128,
+    DivSd128,
+    MinSd128,
+    MaxSd128,
+    SqrtSd128,
+    AddSs128,
+    SubSs128,
+    MulSs128,
+    DivSs128,
+    MinSs128,
+    MaxSs128,
+    SqrtSs128,
     // === 128-bit FP ops (SSE) — complements existing AddPs128/AddPd128 etc. ===
     DivPs128,
     MinPs128,
@@ -1643,6 +1684,19 @@ pub enum IntrinsicOp {
     CvtSi2Ss64_128,
     CvtSi2Sd64_128,
     CvtSd2Si128,
+    /// `_mm_cvttss_si32`: convert the low lane with TRUNCATION. Distinct from
+    /// [`Self::CvtSs2Si128`], which honours MXCSR's rounding mode — using the
+    /// rounding form here is a correctness bug under any non-nearest rounding
+    /// mode, not a code-size choice.
+    CvttSs2Si128,
+    /// `_mm_cvttsd_si32`: truncating counterpart of [`Self::CvtSd2Si128`].
+    CvttSd2Si128,
+    /// `cvtsd2si` with a 64-bit destination (`_mm_cvtsd_si64`): rounds the low
+    /// lane per MXCSR into a full GPR. Distinct from [`Self::CvtSd2Si128`],
+    /// which keeps only 32 bits.
+    Cvtsd2Si64,
+    /// `cvtss2si` with a 64-bit destination (`_mm_cvtss_si64`).
+    Cvtss2Si64,
     Movss128,
     Movsd128,
     // === 256-bit FP ops (AVX) ===
@@ -1783,6 +1837,81 @@ pub(crate) const VECTOR_STORES: [IntrinsicOp; 13] = [
 ];
 
 impl IntrinsicOp {
+    /// 128-bit FP ops with the *destructive* two-operand legacy-SSE encoding
+    /// `dst = args[0] op args[1]`: two 16-byte vector operands, one 16-byte
+    /// vector result, and — the property this predicate exists for — the
+    /// destination may share a register with `args[0]`, because that is
+    /// literally what the encoding computes.
+    ///
+    /// This is the single source of truth for the register allocator's
+    /// vector-input candidates (`collect_vecreg_candidates`) and for the
+    /// copy-coalescing two-operand test (`is_two_operand_binary`).  Three
+    /// hand-maintained copies of this list drifted, and `divps`, `divpd`,
+    /// `minps`, `minpd`, `maxps` and `maxpd` were missing from two of them:
+    /// those rows staged both operands through 8-aligned stack slots instead
+    /// of coalescing the destination with `args[0]`, costing 20 instructions
+    /// where the identical `addpd` kernel needed 14.
+    ///
+    /// min/max/div belong here. The flag is about the aliasing contract, not
+    /// about commutativity: emitter-side operand swapping is governed
+    /// separately by `sse128_mnemonic_commutative`, which must never list
+    /// `divps`/`divpd`/`minps`/`minpd`/`maxps`/`maxpd` (FP min/max pick an
+    /// operand by value — NaN and ±0 asymmetry — and division is ordered).
+    /// Non-destructive FP ops that merely read two vectors (`shufps`,
+    /// `unpcklpd`, `haddps`, `movss`, ...) are deliberately absent: for those
+    /// the destination must NOT alias either operand.
+    pub(crate) fn is_sse_fp_128_destructive_binary(self) -> bool {
+        use IntrinsicOp::*;
+        matches!(
+            self,
+            // Packed, float and double.
+            AddPs128 | SubPs128 | MulPs128 | DivPs128 | MinPs128 | MaxPs128
+            | AddPd128 | SubPd128 | MulPd128 | DivPd128 | MinPd128 | MaxPd128
+            // Scalar (low-lane) forms: same one-instruction destructive
+            // encoding, the untouched lanes come from `args[0]`.
+            | AddSd128 | SubSd128 | MulSd128 | DivSd128 | MinSd128 | MaxSd128
+            | AddSs128 | SubSs128 | MulSs128 | DivSs128 | MinSs128 | MaxSs128
+            // `_mm_sqrt_sd(a, b)` is the two-operand scalar form: the high half
+            // comes from `a` (the destination) and only the low half from `b`,
+            // exactly the destructive encoding.  `_mm_sqrt_ss(a)` is NOT here:
+            // it takes one operand and preserves the lanes of `a` itself.
+            | SqrtSd128
+        )
+    }
+
+    /// Mnemonic of the legacy-SSE *scalar* (low-lane) FP form: `addsd`/
+    /// `divss`/`sqrtsd`/..., or `None` for every other op.
+    ///
+    /// The emitter's dispatch arm enumerates exactly these variants and uses
+    /// this table instead of a `match ... _ => unreachable!()`: the census
+    /// counts a panic site per `unreachable!`, and a table that simply returns
+    /// `None` cannot turn a future op-list edit into a compiler panic.  A unit
+    /// test pins that the table covers the dispatch arm.
+    ///
+    /// `sqrtss`/`sqrtsd` are included: both are the one-operand destructive
+    /// form whose preserved lanes come from the destination, which is exactly
+    /// the `_mm_sqrt_ss`/`_mm_sqrt_sd` contract.
+    pub(crate) fn sse_scalar_fp_mnemonic(self) -> Option<&'static str> {
+        use IntrinsicOp::*;
+        Some(match self {
+            AddSd128 => "addsd",
+            SubSd128 => "subsd",
+            MulSd128 => "mulsd",
+            DivSd128 => "divsd",
+            MinSd128 => "minsd",
+            MaxSd128 => "maxsd",
+            SqrtSd128 => "sqrtsd",
+            AddSs128 => "addss",
+            SubSs128 => "subss",
+            MulSs128 => "mulss",
+            DivSs128 => "divss",
+            MinSs128 => "minss",
+            MaxSs128 => "maxss",
+            SqrtSs128 => "sqrtss",
+            _ => return None,
+        })
+    }
+
     /// Width of an actual SIMD result (including explicit-SIMD result homes).
     /// An opcode property, not a claim that an instruction has a live `dest`:
     /// callers must check the instruction's destination separately. Stores
@@ -1915,7 +2044,11 @@ impl IntrinsicOp {
             // ---- 128-bit SSE/SSE2/SSSE3/SSE4 results ----
             Loaddqu | Loadldi128 | Pcmpeqb128 | Pcmpeqd128 | Psubusb128
             | Psubsb128 | Por128 | Pand128 | Pxor128 | AddPs128 | SubPs128
-            | MulPs128 | AddPd128 | SubPd128 | MulPd128 | Pmuludq128
+            | MulPs128 | AddPd128 | SubPd128 | MulPd128
+            | AddSd128 | SubSd128 | MulSd128 | DivSd128 | MinSd128 | MaxSd128
+            | SqrtSd128 | AddSs128 | SubSs128 | MulSs128 | DivSs128 | MinSs128
+            | MaxSs128 | SqrtSs128
+            | Pmuludq128
             | Pmuldq128 | Pmulld128 | CastReinterpret128 | SetEpi8 | SetEpi16
             | SetEpi32 | Pslldqi128 | Psrldqi128 | Psllqi128 | Psrlqi128
             | Pshufd128 | Paddw128 | Psubw128 | Paddb128 | Psubb128
@@ -2176,6 +2309,7 @@ impl IntrinsicOp {
             self,
             IntrinsicOp::FmaF64x2
                 | IntrinsicOp::FmaF64x2Hoisted
+                | IntrinsicOp::MulAddF64x2Hoisted
                 | IntrinsicOp::FmaF64x4
                 | IntrinsicOp::FmaF64x4Hoisted
                 | IntrinsicOp::FmaF64x4SIB
@@ -2900,6 +3034,46 @@ mod memory_classification_tests {
         }
     }
 
+    /// The two-wide group ops write their accumulator through `dest_ptr`, so
+    /// they are read-modify-write, never pure, and never a `VecStore*`.  The
+    /// two-rounding twin exists for the non-FMA baseline; if it were
+    /// classified as pure, DCE could delete the accumulation outright.
+    #[test]
+    fn two_wide_group_updates_read_and_write_its_destination() {
+        use crate::ir::reexports::{Instruction, Operand, Value};
+        for op in [O::FmaF64x2Hoisted, O::MulAddF64x2Hoisted] {
+            let inst = Instruction::Intrinsic {
+                dest: None,
+                op,
+                dest_ptr: Some(Value(4)),
+                args: vec![Operand::Value(Value(3))],
+            };
+            assert!(op.may_read_memory(), "{op:?} reads B and C");
+            assert!(!op.writes_memory_via_args(), "{op:?} writes via dest_ptr");
+            assert!(inst.may_write_memory(), "{op:?} stores C");
+            assert!(!op.is_pure(), "{op:?} has a memory side effect");
+            assert!(!op.produces_vector_value(), "{op:?} produces no value");
+            assert_eq!(inst.result_type(), None);
+            // The pointer arguments ARE read (they name B and C), so the
+            // read-side allowlist must admit the family; the write side is
+            // `dest_ptr`-only, which `writes_memory_via_args` denies.
+            assert!(
+                op.reads_pointer_arg(),
+                "{op:?} reads B and C through its pointer arguments"
+            );
+            // `is_vector_op` describes a REGISTER-valued vector result, which
+            // these ops do not have: their result lives in the destination
+            // home.  Claiming one would let the register-homing scan try to
+            // colour a value that never exists.
+            assert!(!op.is_vector_op(), "{op:?} has no register result");
+            assert_eq!(
+                op.vector_home_width(),
+                None,
+                "{op:?} is a memory-backed group op"
+            );
+        }
+    }
+
     /// The memory-classification predicates the BB-SLP vectorizer's legality
     /// rules key on. A store misclassified as non-writing is a miscompile (a
     /// seed could reorder loads across it); a load misclassified as
@@ -2916,7 +3090,7 @@ mod memory_classification_tests {
                 !op.reads_pointer_arg(),
                 "{op:?} is not a read-only argument consumer"
             );
-            assert!(op.is_vector_op(), "{op:?} still consumes SIMD data");
+            assert!(op.is_vector_op(), "{op:?} is a SIMD store");
         }
     }
 

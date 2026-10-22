@@ -1,7 +1,10 @@
 //! AVX2/SSE2 vectorization pass for matmul-style loops.
 //!
 //! Recognizes innermost loops with stride-1 double-precision accumulation patterns
-//! and transforms them into FmaF64x4 (AVX2, default) or FmaF64x2 (SSE2) intrinsics.
+//! and transforms them into 256-bit (`FmaF64x4*` / `MulAddF64x4*`) or 128-bit
+//! (`FmaF64x2Hoisted` / `MulAddF64x2Hoisted`) grouped intrinsics.  Width follows
+//! the target's vector register file; fused vs two-rounding follows
+//! `-ffp-contract` and `-mfma`, and the two choices are independent.
 //!
 //! Target pattern (matmul j-loop):
 //! ```c
@@ -45,15 +48,22 @@
 //!    - `vaddpd`: packed add with C[i][j*4]
 //!    - `vmovupd`: store 4 results back
 //!
-//! ### SSE2 (2-wide, with LCCC_FORCE_SSE2=1):
-//! 1. **Loop Bound**: Modified from `j < N` to `j < N/2`
-//! 2. **Array Indexing**: Changed from `j` to `j*2` (stride-16)
-//! 3. **SSE2 Code Generation**:
-//!    - `movsd` + `unpcklpd`: broadcast A[i][k] scalar
-//!    - `movupd`: load 2 doubles from B[k][j*2]
-//!    - `mulpd`: packed multiply (2 doubles)
-//!    - `addpd`: packed add with C[i][j*2]
-//!    - `movupd`: store 2 results back
+//! ### Two-wide (128-bit): the plain-x86-64 baseline and `LCCC_FORCE_SSE2=1`
+//!
+//! Selected whenever the target has no 256-bit vectors -- which is the default
+//! x86-64 codegen baseline, so this is the shape a plain `-O2` build gets.
+//! One iteration covers four doubles as two 2-lane pairs:
+//!    - broadcast A[i][k]: `movsd` + `unpcklpd`, or `movsd` +
+//!      `vbroadcastsd %xmm1, %ymm1` when the target has 256-bit vectors (its
+//!      low half is the same {A, A} pair the 2-wide consumers read)
+//!    - `movupd` / `mulpd` / `movupd` / `addpd` / `movupd`, twice
+//!
+//! The arithmetic form is chosen by the same contract rule as the 4-wide arm,
+//! not by the width: a fused `vfmadd231pd xmm` pair needs `-mfma` AND
+//! `-ffp-contract=fast`, and everything else gets the separately rounded
+//! `mulpd` + `addpd` (`MulAddF64x2Hoisted`). Width and rounding are
+//! independent: the baseline has no FMA3 at all, so requiring FMA3 to pack
+//! this loop left every matmul stencil scalar on a default build.
 //!
 //! ## Remainder Loops
 //!
@@ -629,11 +639,11 @@ fn vectorize_with_analysis_mode(
                 Operand::Const(c) => c.to_i64().is_some_and(|n| n < 2 * machine_step_width),
                 _ => false,
             };
-            // SEMANTIC + TARGET PRECONDITION.  This arm is an FMA transform --
-            // every packed step it emits is a fused multiply-add (`vfmadd231pd`
-            // / `fmla`), and THAT, not the memory layout, is what changes the
-            // program's numerics.  Two independent switches decide whether the
-            // user asked for fused arithmetic, and the arm honoured neither:
+            // SEMANTIC + TARGET PRECONDITION.  The fused packed step
+            // (`vfmadd231pd` / `fmla`) is what changes the program's numerics,
+            // not the memory layout, so it may only be emitted when the user
+            // asked for contraction AND the target has the unit.  Two
+            // independent switches decide that, and the arm honours both:
             //
             //   * `-ffp-contract=off` says the language's contraction licence is
             //     withdrawn, so `a*b+c` must round twice.  The general
@@ -644,35 +654,16 @@ fn vectorize_with_analysis_mode(
             //     the instruction is an illegal-instruction fault on that
             //     machine.  `x86_fma_enabled()` is the resolved target answer.
             //
-            // Both are checked here, before any IR is touched, so an unasked-for
-            // contraction uses a separately rounded AVX2 multiply/add where
-            // that lowering exists; other targets stay scalar. NEON's `fmla` is baseline
-            // on AArch64, so only the contract half applies there.
-            //
-            // THE LICENCE IS ONLY NEEDED IF THE CHOSEN LOWERING ACTUALLY FUSES.
-            // The 2-wide arm lowers `FmaF64x2Hoisted` as two `mulpd`/`addpd`
-            // pairs whenever the target has no FMA3 unit or no 256-bit vectors
-            // -- the legacy SSE2 path in `x86::codegen::intrinsics`, which
-            // rounds the product and the sum separately, exactly like the
-            // scalar expression. That is not a contraction, so `-ffp-contract`
-            // has nothing to withdraw and the x86-64 baseline (SSE2 only) is
-            // entitled to it: a dense `C[j] += A * B[j]` loop is one of the
-            // most common numeric shapes there is, and staying scalar on every
-            // pre-AVX2 machine costs 2.6x on a 256x256 f64 product (10.00 ms
-            // vs 3.86 ms vectorized, GCC -O2 6.96 ms on the same host).  The
-            // only x86 configuration whose 2-wide lowering really fuses is
-            // `LCCC_FORCE_SSE2` on an AVX2+FMA target, which the backend sends
-            // through its 4-lane `vfmadd231pd`; there the licence is still
-            // required.  The AVX2 arm needs no gate at all: it takes `fused`
-            // as an argument and emits `MulAddF64x4HoistedSIB` when denied.
-            let sse2_lowering_fuses = x86_fma_enabled() && x86_avx2_available();
-            let contraction_licence_needed = if neon {
-                true
-            } else if use_sse2 {
-                sse2_lowering_fuses
-            } else {
-                false
-            };
+            // A refused contraction is NOT a refusal to vectorize: x86-64 has a
+            // separately rounded lowering at both widths (`mulpd`+`addpd` for
+            // the 2-wide group, `MulAddF64x4HoistedSIB` for the 4-wide one), so
+            // the arm still packs and only the rounding changes.  That matters
+            // most on the plain `-O2` baseline, where there is no FMA3 at all:
+            // skipping here left the matmul inner loop scalar (measured 601 ms
+            // vs 361 ms for GCC 16.2 at N=1024) purely because the target had
+            // no fused unit.  AArch64 stays scalar in that case because its
+            // only two-wide lowering is `fmla` and NEON is baseline ISA, so
+            // there is nothing for the contract half to fall back to.
             if skip_small {
                 if debug {
                     eprintln!(
@@ -688,7 +679,9 @@ fn vectorize_with_analysis_mode(
                 if debug {
                     eprintln!("[VEC] Skip matmul arm: SIMD disabled for this target");
                 }
-            } else if contraction_licence_needed && !fma_transform_allowed(neon, fp_contract) {
+            } else if !fma_transform_allowed(neon, fp_contract)
+                && (neon || !x86_64_vector_intrinsics_available())
+            {
                 if debug {
                     eprintln!(
                         "[VEC] Skip matmul arm: fused arithmetic not requested/available \
@@ -703,10 +696,19 @@ fn vectorize_with_analysis_mode(
             } else if use_sse2 {
                 if debug {
                     eprintln!(
-                        "[VEC] Matmul pattern matched! Transforming to FmaF64x2 (SSE2, 2-wide)"
+                        "[VEC] Matmul pattern matched! Transforming to {} (SSE2, 2-wide)",
+                        if fma_transform_allowed(neon, fp_contract) {
+                            "FmaF64x2"
+                        } else {
+                            "MulAddF64x2"
+                        }
                     );
                 }
-                total_changes += transform_to_fma_f64x2(func, &mut pattern);
+                total_changes += transform_to_fma_f64x2(
+                    func,
+                    &mut pattern,
+                    fma_transform_allowed(neon, fp_contract),
+                );
             } else {
                 // Use AVX2 by default (or if LCCC_FORCE_AVX2 is set)
                 if debug {
@@ -21421,8 +21423,20 @@ fn insert_remainder_loop(
     4 // 4 new blocks added
 }
 
-/// Transform the loop to use FmaF64x2 intrinsics.
-fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &mut VectorizablePattern) -> usize {
+/// Transform the loop to use the 2-wide (XMM) grouped matmul intrinsics.
+///
+/// `fused` decides which intrinsic the body gets and is the caller's
+/// resolved contract/target answer, never re-derived here:
+/// `FmaF64x2Hoisted` (one `vfmadd231pd`/`fmla` per group) or
+/// `MulAddF64x2Hoisted` (separately rounded `mulpd` + `addpd`, no FMA3
+/// required).  Everything else — bound normalization, the remainder loop, the
+/// hoisted broadcast, the group step of four doubles — is identical, which is
+/// why this is a parameter and not a second transform.
+fn transform_to_fma_f64x2(
+    func: &mut IrFunction,
+    pattern: &mut VectorizablePattern,
+    fused: bool,
+) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
 
@@ -22003,10 +22017,16 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &mut VectorizablePatte
     {
         let body = &mut func.blocks[pattern.body_idx];
 
-        // Create FmaF64x2 intrinsic: writes directly to memory, no dest value.
+        // Create the grouped accumulate intrinsic: writes directly to memory,
+        // no dest value. `fused` is the contract/target answer, not a guess:
+        // the unfused form keeps both roundings and needs no FMA3 unit.
         let intrinsic = Instruction::Intrinsic {
             dest: None,
-            op: IntrinsicOp::FmaF64x2Hoisted,
+            op: if fused {
+                IntrinsicOp::FmaF64x2Hoisted
+            } else {
+                IntrinsicOp::MulAddF64x2Hoisted
+            },
             dest_ptr: Some(pattern.c_gep),
             args: vec![Operand::Value(pattern.b_gep)],
         };

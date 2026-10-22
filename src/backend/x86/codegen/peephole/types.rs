@@ -200,6 +200,13 @@ pub(super) enum MoveSize {
     SLQ, // movslq (sign-extend 32->64)
     SD,  // movsd (scalar double, 8 bytes)
     SS,  // movss (scalar single, 4 bytes)
+    /// A 16-byte vector move between an XMM register and a frame slot:
+    /// `movdqu`, `movups` or `movdqa` (and their VEX `v`-forms). Modeled
+    /// because a 16-byte slot store followed by a 16-byte slot load is the
+    /// dominant SSE round trip that codegen emits for an `__m128` that
+    /// briefly leaves its register, and forwarding it is the difference
+    /// between two instructions and five.
+    DQ,
 }
 
 impl MoveSize {
@@ -212,6 +219,7 @@ impl MoveSize {
             MoveSize::SLQ => "movslq",
             MoveSize::SD => "movsd",
             MoveSize::SS => "movss",
+            MoveSize::DQ => "movdqu",
         }
     }
 
@@ -222,6 +230,7 @@ impl MoveSize {
             MoveSize::L | MoveSize::SLQ | MoveSize::SS => 4,
             MoveSize::W => 2,
             MoveSize::B => 1,
+            MoveSize::DQ => 16,
         }
     }
 }
@@ -1117,7 +1126,27 @@ pub(super) fn strip_mov_prefix(s: &str, allow_slq: bool) -> Option<(&str, MoveSi
 /// rejected by construction (the slot operand, not `%ds:/%es:` or an XMM,
 /// must be one of the two ends).
 pub(super) fn parse_fp_slot_move(s: &str) -> Option<(bool, &str, MoveSize)> {
-    let body = if let Some(r) = s.strip_prefix("vmovsd ") {
+    let body = if let Some(r) = s.strip_prefix("vmovdqu ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovups ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovdqa ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movdqu ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movups ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movdqa ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movaps ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("movapd ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovaps ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovapd ") {
+        (r, MoveSize::DQ)
+    } else if let Some(r) = s.strip_prefix("vmovsd ") {
         (r, MoveSize::SD)
     } else if let Some(r) = s.strip_prefix("vmovss ") {
         (r, MoveSize::SS)
@@ -2636,6 +2665,12 @@ pub(super) fn reg_id_to_name(id: RegId, size: MoveSize) -> &'static str {
         MoveSize::L | MoveSize::SS => 1,
         MoveSize::W => 2,
         MoveSize::B => 3,
+        // A `DQ` move is XMM-only: it is produced by `parse_fp_slot_move`
+        // and consumed exclusively by the XMM forwarding paths, which name
+        // their operands with `%xmmN` text. No caller can reach this row
+        // with a GP register, so the 64-bit row is inert here; the
+        // `id <= 15` assertion above still holds.
+        MoveSize::DQ => 0,
     };
     REG_NAMES[row][id as usize]
 }

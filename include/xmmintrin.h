@@ -714,10 +714,17 @@ _mm_ucomineq_ss(__m128 __a, __m128 __b)
 
 #define _mm_cvtsi64x_ss(a, b) _mm_cvtsi64_ss(a, b)
 
+/* _mm_cvtss_si64: convert low float to long long, rounding per MXCSR.RC.
+ * The plain cast truncated, which is `_mm_cvttss_si64`'s contract, not this
+ * one's. */
 static __inline__ long long __attribute__((__always_inline__))
 _mm_cvtss_si64(__m128 __a)
 {
+#if defined(__x86_64__)
+    return __builtin_ia32_cvtss2si64(__a);
+#else
     return (long long)__a.__val[0];
+#endif
 }
 
 #define _mm_cvtss_si64x(a) _mm_cvtss_si64(a)

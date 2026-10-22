@@ -441,7 +441,9 @@ impl Lowerer {
             | "_mm_cvtsi128_si64"
             | "_mm_cvtsi128_si64x"
             | "__builtin_ia32_pextrq128"
-            | "__builtin_ia32_cvtsi128si64" => Some(IrType::I64),
+            | "__builtin_ia32_cvtsi128si64"
+            | "__builtin_ia32_cvtsd2si64"
+            | "__builtin_ia32_cvtss2si64" => Some(IrType::I64),
             // BMI2 BZHI returns its operand type (unsigned int / unsigned long long).
             "__builtin_ia32_bzhi_si" => Some(IrType::U32),
             "__builtin_ia32_bzhi_di" => Some(IrType::U64),

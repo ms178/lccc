@@ -70,6 +70,7 @@ fn move_size_bytes(size: MoveSize) -> u32 {
         MoveSize::L | MoveSize::SLQ | MoveSize::SS => 4,
         MoveSize::W => 2,
         MoveSize::B => 1,
+        MoveSize::DQ => 16,
     }
 }
 

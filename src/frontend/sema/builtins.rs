@@ -1031,6 +1031,49 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         "_mm_store_si128",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Storedqu),
     );
+    // The packed SINGLE/DOUBLE load and store wrappers take the same route.
+    // Their header bodies are `return *(__m128d_u const *)__p;` and
+    // `*(__m128d_u *)__p = __a;` -- a 16-byte aggregate copy through a
+    // different (align-1) struct type.  Measured on the SSE2 codegen matrix,
+    // that copy is not free: the store lowers to `Memcpy` instead of a vector
+    // store, so the loop body keeps a stack slot, a spilled induction
+    // variable and a redundant reload (`_mm_and_pd` over a 16-byte buffer:
+    // 31 instructions against 14 for the identical integer-domain
+    // `_mm_and_si128`, and 23 against 11 for a pure load+store copy).  Naming
+    // them here makes them the same pointer-based intrinsics, with the same
+    // XMM-register caching and the same `movdqu` emission.
+    m.insert(
+        "_mm_loadu_ps",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Loaddqu),
+    );
+    m.insert(
+        "_mm_load_ps",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Loaddqu),
+    );
+    m.insert(
+        "_mm_storeu_ps",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Storedqu),
+    );
+    m.insert(
+        "_mm_store_ps",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Storedqu),
+    );
+    m.insert(
+        "_mm_loadu_pd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Loaddqu),
+    );
+    m.insert(
+        "_mm_load_pd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Loaddqu),
+    );
+    m.insert(
+        "_mm_storeu_pd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Storedqu),
+    );
+    m.insert(
+        "_mm_store_pd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Storedqu),
+    );
     m.insert(
         "_mm_set1_epi8",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Set1Epi8),
@@ -1111,6 +1154,68 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert(
         "_mm_mul_pd",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MulPd),
+    );
+    // Scalar (low-lane) float ops.  The header bodies mutate one lane of the
+    // struct and return it, which costs an extract, a scalar op and a rebuild
+    // of the 16-byte aggregate (64 instructions per row in the SSE2 matrix
+    // against 6 for the packed form).  Interception takes priority over the
+    // header definition for `_mm_*` names, so these map straight to the
+    // instruction.
+    m.insert(
+        "_mm_add_sd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AddSd),
+    );
+    m.insert(
+        "_mm_sub_sd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SubSd),
+    );
+    m.insert(
+        "_mm_mul_sd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MulSd),
+    );
+    m.insert(
+        "_mm_div_sd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86DivSd),
+    );
+    m.insert(
+        "_mm_min_sd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MinSd),
+    );
+    m.insert(
+        "_mm_max_sd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaxSd),
+    );
+    m.insert(
+        "_mm_sqrt_sd",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SqrtSd),
+    );
+    m.insert(
+        "_mm_add_ss",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AddSs),
+    );
+    m.insert(
+        "_mm_sub_ss",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SubSs),
+    );
+    m.insert(
+        "_mm_mul_ss",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MulSs),
+    );
+    m.insert(
+        "_mm_div_ss",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86DivSs),
+    );
+    m.insert(
+        "_mm_min_ss",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MinSs),
+    );
+    m.insert(
+        "_mm_max_ss",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86MaxSs),
+    );
+    m.insert(
+        "_mm_sqrt_ss",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86SqrtSs),
     );
     m.insert(
         "_mm_mul_epu32",
@@ -2445,6 +2550,14 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Cvtsi128Si64),
     );
     m.insert(
+        "__builtin_ia32_cvtsd2si64",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Cvtsd2Si64),
+    );
+    m.insert(
+        "__builtin_ia32_cvtss2si64",
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Cvtss2Si64),
+    );
+    m.insert(
         "__builtin_ia32_pshuflw128",
         BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pshuflw128),
     );
@@ -3059,6 +3172,8 @@ pub enum BuiltinIntrinsic {
     X86Cvtsi128Si32, // _mm_cvtsi128_si32 (MOVD extract)
     X86Cvtsi32Si128, // _mm_cvtsi32_si128 (MOVD insert)
     X86Cvtsi128Si64, // _mm_cvtsi128_si64
+    X86Cvtsd2Si64,   // _mm_cvtsd_si64 (cvtsd2si with a 64-bit destination)
+    X86Cvtss2Si64,   // _mm_cvtss_si64 (cvtss2si with a 64-bit destination)
     X86Pshuflw128,   // _mm_shufflelo_epi16 (PSHUFLW)
     X86Pshufhw128,   // _mm_shufflehi_epi16 (PSHUFHW)
     // SSE4.1 insert/extract operations
@@ -3149,6 +3264,22 @@ pub enum BuiltinIntrinsic {
     X86SubPs,
     X86MulPs,
     X86AddPd,
+    // Scalar (single-lane) SSE float ops.  Each is one hardware instruction
+    // that writes the low lane and preserves the rest of the destination.
+    X86AddSd,
+    X86SubSd,
+    X86MulSd,
+    X86DivSd,
+    X86MinSd,
+    X86MaxSd,
+    X86SqrtSd,
+    X86AddSs,
+    X86SubSs,
+    X86MulSs,
+    X86DivSs,
+    X86MinSs,
+    X86MaxSs,
+    X86SqrtSs,
     X86SubPd,
     X86MulPd,
     X86MulEpu32,

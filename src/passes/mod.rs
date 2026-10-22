@@ -16,6 +16,18 @@ use policy::fp_environment_blocks_reordering;
 
 mod address_form;
 pub(crate) mod aggregate_copy_forward;
+pub(crate) mod aggregate_pair_roundtrip;
+
+/// `LCCC_DEBUG_AGGCOPY=1` trace for the 16-byte aggregate round-trip pass.
+///
+/// Resolved ONCE per process and kept in `src/passes/mod.rs` because the
+/// pass-level environment-read budget (`tests/regression/
+/// check_env_test_hygiene.sh`) is a ratchet that may only fall: a debug trace
+/// is not a reason to raise it.
+pub(crate) fn aggcopy_debug_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("LCCC_DEBUG_AGGCOPY").is_some())
+}
 pub(crate) mod aggregate_sroa;
 pub(crate) mod alias;
 pub(crate) mod arx_vectorize;
@@ -3553,6 +3565,18 @@ pub(crate) fn run_passes(
         }
     }
 
+    // Phase 11a: 16-byte aggregate round-trip collapse (`aggcopy16`). An
+    // inlined SSE intrinsic returns its `__m128*` value in the SysV
+    // register-pair carrier (packed as I128), so every such copy lowers to a
+    // load/load/shl/or + shr/store/store sequence.  Collapsing it to the
+    // intrinsic 128-bit copy pair is what lets the existing `movdqu` lowering
+    // and memory-operand folding see the copy at all; see
+    // engineering/SSE2-CODEGEN-MATRIX.md.
+    if !pass_disabled(&disabled, "aggcopy16") {
+        module.for_each_function(aggregate_pair_roundtrip::run);
+        verify::verify_after_pass(module, "aggcopy16");
+    }
+
     // Phase 11a': Whole-vector SSA promotion. GNU-vector objects that the
     // SIMD lowering touches only through full-width VecLoad/VecStore pairs
     // leave memory here (mem2reg for register images); the cleanups below
@@ -3595,6 +3619,21 @@ pub(crate) fn run_passes(
     // >16-byte alignment completely unobservable.
     if !pass_disabled(&disabled, "vecpromote") {
         vector_temp_promotion::fuse_vector_loads(module);
+    }
+
+    // Phase 11c': dead 16-byte load-into-a-private-slot.  Both phases above
+    // leave these behind: `aggcopy16` inserted a `Loaddqu` for the aggregate
+    // round trip, and the load forwarder just rewrote its consumer to read the
+    // producing slot directly, so the load's result has no users and its
+    // destination slot has no readers — a stack store plus a reload per
+    // occurrence.  `dse` cannot help: it has already run for this round, and
+    // the shape did not exist then.  Measured on the SSE2 codegen matrix:
+    // `minpd`/`maxpd`/`divpd`/`sqrtpd` and every `shufps`/`cmppd` row carried
+    // this traffic (19-30 instructions against 11-14 for the same kernel
+    // written with `addpd`).
+    if !pass_disabled(&disabled, "deadslotload") {
+        module.for_each_function(dse::eliminate_dead_private_slot_loads);
+        verify::verify_after_pass(module, "deadslotload");
     }
 
     // Phase 11d: Relax only the alignment left unobservable by the final use

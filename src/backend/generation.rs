@@ -4852,6 +4852,7 @@ fn generate_function(
                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x4HoistedSIB | crate::ir::intrinsics::IntrinsicOp::MulAddF64x4HoistedSIB
                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x2
                 | crate::ir::intrinsics::IntrinsicOp::FmaF64x2Hoisted
+                | crate::ir::intrinsics::IntrinsicOp::MulAddF64x2Hoisted
                 // The `VecZero*` family was listed here too; its emitters
                 // write a register home or go through the mode-aware slot
                 // addressing (`emit_instr_rbp_reg` resolves %rsp-relative

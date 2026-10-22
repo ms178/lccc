@@ -12,10 +12,21 @@ IR operand.
 
 Regenerate: python3 scripts/gen_lcccsimd.py
 """
+import sys
 from pathlib import Path
 
 REPO = Path(__file__).parent.parent
 OUT = REPO / "include" / "lcccsimd.h"
+
+# `--check` regenerates into memory and fails when the committed header differs
+# from what this script produces.  The header is machine output -- a hand edit
+# silently disappears the next time anyone regenerates, and a stale header
+# means the builtins the compiler dispatches on and the prototypes the headers
+# call have drifted apart.  `--out` supports the same comparison for other
+# targets; it does not change the default path.
+_CHECK_ONLY = "--check" in sys.argv
+if "--out" in sys.argv:
+    OUT = Path(sys.argv[sys.argv.index("--out") + 1])
 
 # (name, mnemonic)
 BIN3_512 = [
@@ -204,8 +215,8 @@ FP128_SCALAR = [
     ("movemask_pd", "movmskpd128", "int", "M128D"),
     ("cvtss_si32", "cvtss2si128", "int", "M128"),
     ("cvtsd_si32", "cvtsd2si128", "int", "M128D"),
-    ("cvttss_si32", "cvtss2si128", "int", "M128"),
-    ("cvttsd_si32", "cvtsd2si128", "int", "M128D"),
+    ("cvttss_si32", "cvttss2si128", "int", "M128"),
+    ("cvttsd_si32", "cvttsd2si128", "int", "M128D"),
 ]
 FP128_UIMM = [
     ("round_ps", "roundps128", "__m128", "M128"),
@@ -695,5 +706,17 @@ macro("_mm256_cmp_pd(__a, __b, __imm)",
       "__CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vcmppd256(__imm, __a, __b))")
 
 w("#endif /* _LCCCSIMD_H_INCLUDED */")
-OUT.write_text("\n".join(L) + "\n")
-print(f"wrote {OUT} ({len(L)} lines)")
+generated = "\n".join(L) + "\n"
+if _CHECK_ONLY:
+    current = OUT.read_text() if OUT.exists() else ""
+    if current != generated:
+        print(
+            f"gen_lcccsimd: {OUT} does not match the generator "
+            f"(committed {len(current)} bytes, generated {len(generated)})",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    print(f"gen_lcccsimd: {OUT} matches the generator ({len(L)} lines)")
+else:
+    OUT.write_text(generated)
+    print(f"wrote {OUT} ({len(L)} lines)")

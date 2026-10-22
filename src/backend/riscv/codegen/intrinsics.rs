@@ -444,6 +444,8 @@ impl RiscvCodegen {
             | IntrinsicOp::Cvtsi128Si32
             | IntrinsicOp::Cvtsi32Si128
             | IntrinsicOp::Cvtsi128Si64
+            | IntrinsicOp::Cvtsd2Si64
+            | IntrinsicOp::Cvtss2Si64
             | IntrinsicOp::Pshuflw128
             | IntrinsicOp::Pshufhw128
             | IntrinsicOp::Pinsrd128
@@ -454,6 +456,7 @@ impl RiscvCodegen {
             | IntrinsicOp::Pextrq128
             | IntrinsicOp::FmaF64x2
             | IntrinsicOp::FmaF64x2Hoisted
+            | IntrinsicOp::MulAddF64x2Hoisted
             | IntrinsicOp::FmaF64x4
             | IntrinsicOp::FmaF64x4Hoisted
             | IntrinsicOp::BroadcastLoadF64
