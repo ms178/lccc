@@ -1167,17 +1167,17 @@ __m256d __lccc_simd256_ps_vpermilvarpd256(long, __m256d __a, __m256i __b);
 static __inline__ __m256d _mm256_permutevar_pd(__m256d __a, __m256i __b) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vpermilvarpd256(0, __a, __b)); }
 
-__m256 __lccc_simd256_ps_vmovmskps256(long, __m256 __a);
+int __lccc_simd256_ps_vmovmskps256(long, __m256 __a);
 static __inline__ int _mm256_movemask_ps(__m256 __a) __attribute__((__always_inline__, __artificial__))
-{ return (int)__lccc_simd256_ps_vmovmskps256(0, __a); }
+{ return __lccc_simd256_ps_vmovmskps256(0, __a); }
 
-__m256 __lccc_simd256_ps_vmovmskpd256(long, __m256 __a);
-static __inline__ int _mm256_movemask_pd(__m256 __a) __attribute__((__always_inline__, __artificial__))
-{ return (int)__lccc_simd256_ps_vmovmskpd256(0, __a); }
+int __lccc_simd256_ps_vmovmskpd256(long, __m256d __a);
+static __inline__ int _mm256_movemask_pd(__m256d __a) __attribute__((__always_inline__, __artificial__))
+{ return __lccc_simd256_ps_vmovmskpd256(0, __a); }
 
-__m256 __lccc_simd256_ps_vtestps256(long, __m256 __a);
-static __inline__ int _mm256_testz_ps(__m256 __a) __attribute__((__always_inline__, __artificial__))
-{ return (int)__lccc_simd256_ps_vtestps256(0, __a); }
+int __lccc_simd256_ps_vtestps256(long, __m256 __a, __m256 __b);
+static __inline__ int _mm256_testz_ps(__m256 __a, __m256 __b) __attribute__((__always_inline__, __artificial__))
+{ return __lccc_simd256_ps_vtestps256(0, __a, __b); }
 
 __m256 __lccc_simd256_ps_vroundps256(long, __m256 __a);
 #define _mm256_round_ps(__a, __imm) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vroundps256(__imm, __a))

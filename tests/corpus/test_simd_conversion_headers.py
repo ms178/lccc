@@ -40,6 +40,8 @@ class ConversionHeaders(unittest.TestCase):
             '__m128d _mm_cvtss_sd(__m128d __a, __m128 __b)',
             '__m128 _mm_cvtsd_ss(__m128 __a, __m128d __b)',
             '__m256i _mm512_castsi512_si256(__m512i __a)',
+            'int _mm256_testz_ps(__m256 __a, __m256 __b)',
+            'int _mm256_movemask_pd(__m256d __a)',
             '__lccc_simd128_ps_cvttss2si128(0, __a)',
             '__lccc_simd128_ps_cvttsd2si128(0, __a)',
             '__lccc_simd128_ps_cvtsi2sd64_128(long, __m128d __a, long long __i)',

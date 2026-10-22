@@ -23,5 +23,9 @@ int main(void) {
     dump(_mm256_permute_pd(v,10)); dump(_mm256_permute_pd(v,11));
     dump(_mm256_permute_pd(v,12)); dump(_mm256_permute_pd(v,13));
     dump(_mm256_permute_pd(v,14)); dump(_mm256_permute_pd(v,15));
+    __m256 neg = _mm256_set1_ps(-1.0f), pos = _mm256_set1_ps(1.0f);
+    printf("tests %d %d %d masks %d %d\n", _mm256_testz_ps(neg,pos),
+           _mm256_testz_ps(neg,neg), _mm256_testz_ps(pos,pos),
+           _mm256_movemask_ps(neg), _mm256_movemask_pd(v));
     return 0;
 }

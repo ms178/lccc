@@ -680,10 +680,12 @@ for name, mn in FP256_VAR:
     wrap(f"{vty} _mm256_{name}({vty} __a, __m256i __b)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(0, __a, __b)); }}")
 for name, mn, rty, m in FP256_SCALAR:
-    vty = "__m256"
-    proto(f"256_ps_{mn}", "m256", ["long", "__m256 __a"])
-    wrap(f"{rty} _mm256_{name}({vty} __a)",
-         f"{{ return ({rty})__lccc_simd256_ps_{mn}(0, __a); }}")
+    vty = "__" + m.lower()
+    params = f"{vty} __a" + (f", {vty} __b" if name == "testz_ps" else "")
+    operands = "__a, __b" if name == "testz_ps" else "__a"
+    w(f"{rty} __lccc_simd256_ps_{mn}(long, {params});")
+    wrap(f"{rty} _mm256_{name}({params})",
+         f"{{ return __lccc_simd256_ps_{mn}(0, {operands}); }}")
 for name, mn, rty, m in FP256_UIMM:
     proto(f"256_ps_{mn}", "m256", ["long", "__m256 __a"])
     macro(f"_mm256_{name}(__a, __imm)",
