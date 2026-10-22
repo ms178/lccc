@@ -142,3 +142,17 @@ Two items stay closed, so they are not re-litigated: `sdiv` by a constant
 already emits a 64-bit magic multiply (`sdr7` 4.39 vs 4.43 ns in
 `i686_alu_chains`), and `byte_load_reassembly`'s hot loop *does* fold its byte
 loads — the residual 20 % is gcc's SSE2 vectorisation of the 32-byte block.
+
+## Kill switches
+
+Every lever in this batch is reversible from the environment, so a bisection
+does not need a rebuild:
+
+| switch | effect when set |
+| --- | --- |
+| `CCC_NO_PHI_COALESCE` | disables the forwarding-phi copy fold |
+| `CCC_LAYOUT_TIE_ORIG` | breaks a dual-layout metric tie toward the pre-chain append order instead of the trace-built order |
+
+`CCC_LAYOUT_TIE_ORIG` is the A/B surface for the tie rule: with it set,
+`expat_xml_scan` reproduces the append-order placement that costs one extra
+taken branch per character in `expat_utf8_name_length`.
