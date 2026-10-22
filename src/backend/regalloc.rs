@@ -3694,10 +3694,32 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // `mark_loop_spanning`: the HOMELESS exclusion removes latch sources
     // from the coalesce webs precisely for the recurrence shapes whose
     // increment consumes the web, so the pairs must be fed directly.
-    let phi_backedges: Vec<(u32, u32)> = phi_coalesce
+    let call_loop_state = if crate::common::types::target_elf_machine() == 62
+        && config.available_regs.iter().all(|r| (1..=6).contains(&r.0))
+    {
+        hot_web::loop_carried_copy_dests(func, &liveness)
+            .into_iter()
+            .filter(|v| call_spanning.contains(v))
+            .collect::<FxHashSet<_>>()
+    } else {
+        FxHashSet::default()
+    };
+    let mut phi_backedges: Vec<(u32, u32)> = phi_coalesce
         .iter()
         .map(|c| (c.phi_dest, c.backedge_src))
         .collect();
+    // Recurrence sight is not a coalescing relation. Conditional backedges
+    // that cannot share a register still carry hot state across loop calls.
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Instruction::Copy {
+            dest,
+            src: Operand::Value(src),
+        } = inst
+            && call_loop_state.contains(&dest.0)
+        {
+            phi_backedges.push((dest.0, src.0));
+        }
+    }
     let build_gpr_ranges = |intervals: &[LiveInterval]| {
         let (mut ranges, range_meta) = live_range::build_live_ranges_with_config_and_meta(
             intervals,

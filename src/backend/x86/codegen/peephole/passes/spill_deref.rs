@@ -1158,3 +1158,127 @@ mod private_spill_cycle_tests {
         }
     }
 }
+
+/// Retarget an entry word load through its sole wide register relay. A word
+/// load zeroes the upper half, so a later MOVQ carries exactly that value.
+/// Keep the memory access in place; prove both register lifetimes rather than
+/// rescheduling IR or extending virtual ranges. At most one rewrite per
+/// function keeps the cached CFG oracle valid in every untouched function.
+pub(super) fn fold_entry_load_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let live = super::liveness::FileLiveness::new(store, infos);
+    let mut entry = false;
+    let mut changed = false;
+    for i in 0..store.len() {
+        let text = infos[i].trimmed(store.get(i));
+        if text == ".cfi_startproc" {
+            entry = true;
+            continue;
+        }
+        if text.ends_with(':') || text == ".cfi_endproc" {
+            entry = false;
+        }
+        if !entry || infos[i].is_nop() || infos[i].pinned {
+            continue;
+        }
+        let Some(args) = text.strip_prefix("movl ") else {
+            continue;
+        };
+        let Some(comma) = first_top_level_comma(args.as_bytes()) else {
+            continue;
+        };
+        let (mem, src) = (args[..comma].trim(), args[comma + 1..].trim());
+        let sf = register_family_fast(src);
+        if !mem.contains('(')
+            || !mem.ends_with(')')
+            || sf > REG_GP_MAX
+            || sf == 4
+            || src != REG_NAMES[1][sf as usize]
+        {
+            continue;
+        }
+        let mem = mem.to_owned();
+        let mut relay = None;
+        for j in i + 1..(i + 33).min(store.len()) {
+            if infos[j].is_nop() {
+                continue;
+            }
+            if infos[j].pinned {
+                break;
+            }
+            let t = infos[j].trimmed(store.get(j));
+            let Some((mnemonic, rest)) = t.split_once(' ') else {
+                break;
+            };
+            if !matches!(mnemonic, "movl" | "movq" | "movslq" | "xorl") {
+                break;
+            }
+            if infos[j].reg_refs & (1u16 << sf) == 0 {
+                continue;
+            }
+            if mnemonic == "movq" {
+                if let Some((s, d)) = rest.split_once(',') {
+                    let df = register_family_fast(d.trim());
+                    if s.trim() == REG_NAMES[0][sf as usize]
+                        && df <= REG_GP_MAX
+                        && df != sf
+                        && df != 4
+                        && d.trim() == REG_NAMES[0][df as usize]
+                        && (i + 1..j)
+                            .all(|k| infos[k].is_nop() || infos[k].reg_refs & (1u16 << df) == 0)
+                        && live.live_after(j, sf) == Some(false)
+                    {
+                        relay = Some((j, df));
+                    }
+                }
+            }
+            break;
+        }
+        if let Some((j, df)) = relay {
+            replace_line(
+                store,
+                &mut infos[i],
+                i,
+                format!("    movl {mem}, {}", REG_NAMES[1][df as usize]),
+            );
+            mark_nop(&mut infos[j]);
+            changed = true;
+            entry = false;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod entry_load_relay_tests {
+    use super::*;
+    fn fold(middle: &str, tail: &str) -> (bool, String) {
+        let text = format!(
+            "f:\n.cfi_startproc\n    pushq %r12\n    movl 8(%rdi), %r12d\n{middle}    movq %r12, %r9\n.Lloop:\n{tail}    movq %r9, %rax\n    popq %r12\n    ret\n.cfi_endproc\n.size f, .-f\n"
+        );
+        let mut store = LineStore::new(text);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = fold_entry_load_relay(&mut store, &mut infos);
+        (changed, store.build_result(|i| infos[i].is_nop()))
+    }
+    #[test]
+    fn entry_load_retargets_zero_extended_wide_relay() {
+        let (changed, out) = fold("    movl 12(%rdi), %edx\n", "");
+        assert!(changed && out.contains("movl 8(%rdi), %r9d"), "{out}");
+        assert!(!out.contains("movq %r12, %r9"), "{out}");
+    }
+    #[test]
+    fn entry_load_relay_refuses_observed_registers_and_barriers() {
+        for (middle, tail) in [
+            ("    movl %r9d, %edx\n", ""),
+            ("    movl %r12d, %edx\n", ""),
+            ("    call opaque\n", ""),
+            ("", "    movl %r12d, %edx\n"),
+            ("", "    testl %edi, %edi\n    jne .Lunknown\n"),
+        ] {
+            let (changed, out) = fold(middle, tail);
+            assert!(!changed, "{out}");
+        }
+    }
+}

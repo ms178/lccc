@@ -1603,6 +1603,9 @@ fn peephole_optimize_inner(
         if !sk("private_spill_cycle") {
             global_changed |= spill_deref::fold_private_spill_cycle(&mut store, &mut infos);
         }
+        if !sk("entry_load_relay") {
+            global_changed |= spill_deref::fold_entry_load_relay(&mut store, &mut infos);
+        }
         if !sk("copy_prop") {
             global_changed |= copy_propagation::propagate_register_copies(&mut store, &mut infos);
         }
