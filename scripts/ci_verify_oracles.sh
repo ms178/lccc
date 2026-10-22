@@ -146,6 +146,15 @@ failed() {
     failures=$((failures + 1))
 }
 
+# The self-test's diagnosis has to survive the run page, because the hosted job
+# log is not reachable from the review environment.  An assertion that only
+# writes to stderr leaves a red step that names nothing, which is how a
+# CI-only failure in this table cost a full pipeline round to bisect.
+case_fail() {
+    error 'Oracle self-test' "$@"
+    printf '%s\n' "$*" >&2
+}
+
 probes=()
 IFS=, read -r -a probes <<<"$required"
 for probe in "${probes[@]}"; do
@@ -355,7 +364,7 @@ MOCK
             && grep -q 'clang=23.1.3' "$work/out" && grep -q 'valgrind=valgrind-3.19.0' "$work/out"; then
         echo "  ok   complete tool set: exit 0 with every version reported"
     else
-        echo "  FAIL complete tool set: exit $status, out=$(sed -n '1,3p' "$work/out") err=$(sed -n '1,5p' "$work/err")" >&2
+        case_fail "  FAIL complete tool set: exit $status, out=$(sed -n '1,3p' "$work/out") err=$(sed -n '1,5p' "$work/err")"
         rm -rf "$work"; return 1
     fi
 
@@ -366,7 +375,7 @@ MOCK
     if (( status != 0 )) && grep -q 'is 16.3.0; this lane pins 16.2' "$work/err"; then
         echo "  ok   gcc minor drift refused with both versions named"
     else
-        echo "  FAIL gcc minor drift: exit $status, stderr=$(sed -n '1,5p' "$work/err")" >&2
+        case_fail "  FAIL gcc minor drift: exit $status, stderr=$(sed -n '1,5p' "$work/err")"
         rm -rf "$work"; return 1
     fi
 
@@ -378,7 +387,7 @@ MOCK
     if (( status != 0 )) && grep -qi 'valgrind-case3-absent is not on PATH' "$work/err"; then
         echo "  ok   missing valgrind fails closed and names the tool"
     else
-        echo "  FAIL missing valgrind: exit $status, stderr=$(sed -n '1,5p' "$work/err")" >&2
+        case_fail "  FAIL missing valgrind: exit $status, stderr=$(sed -n '1,5p' "$work/err")"
         rm -rf "$work"; return 1
     fi
     mv "$work/tools/valgrind.off" "$work/tools/valgrind"
@@ -391,7 +400,7 @@ MOCK
     if (( status != 0 )) && grep -q 'is 18.1.3; the oracles pin 23.1.3' "$work/err"; then
         echo "  ok   unpinned clang refused when the lane asks for the pinned oracle"
     else
-        echo "  FAIL pinned clang: exit $status, stderr=$(sed -n '1,5p' "$work/err")" >&2
+        case_fail "  FAIL pinned clang: exit $status, stderr=$(sed -n '1,5p' "$work/err")"
         rm -rf "$work"; return 1
     fi
     status=0
@@ -400,7 +409,7 @@ MOCK
     if (( status == 0 )) && ! grep -q 'clang=' "$work/out"; then
         echo "  ok   a lane that does not compare against Clang does not require it"
     else
-        echo "  FAIL clang-free lane: exit $status, out=$(sed -n '1,3p' "$work/out") err=$(sed -n '1,5p' "$work/err")" >&2
+        case_fail "  FAIL clang-free lane: exit $status, out=$(sed -n '1,3p' "$work/out") err=$(sed -n '1,5p' "$work/err")"
         rm -rf "$work"; return 1
     fi
 
@@ -413,7 +422,7 @@ MOCK
     if (( status == 0 )) && grep -q 'gcc-16=16.0.1' "$work/out"; then
         echo "  ok   an unpinned lane is not judged against the 16.2 pin"
     else
-        echo "  FAIL unpinned lane: exit $status, out=$(sed -n '1,3p' "$work/out") err=$(sed -n '1,5p' "$work/err")" >&2
+        case_fail "  FAIL unpinned lane: exit $status, out=$(sed -n '1,3p' "$work/out") err=$(sed -n '1,5p' "$work/err")"
         rm -rf "$work"; return 1
     fi
 
@@ -425,7 +434,7 @@ MOCK
     if (( status != 0 )) && grep -q 'gcc-16 is 16.0.1; this lane pins 16.2' "$work/err"; then
         echo "  ok   a pinned lane refuses 16.0.1 and names both versions"
     else
-        echo "  FAIL pinned lane: exit $status, stderr=$(sed -n '1,5p' "$work/err")" >&2
+        case_fail "  FAIL pinned lane: exit $status, stderr=$(sed -n '1,5p' "$work/err")"
         rm -rf "$work"; return 1
     fi
 
@@ -439,7 +448,7 @@ MOCK
     if (( status == 0 )) && ! grep -q 'lld-case7-absent' "$work/err"; then
         echo "  ok   the default require set does not demand the presence probes"
     else
-        echo "  FAIL default require set: exit $status, err=$(sed -n '1,5p' "$work/err")" >&2
+        case_fail "  FAIL default require set: exit $status, err=$(sed -n '1,5p' "$work/err")"
         rm -rf "$work"; return 1
     fi
 
@@ -450,10 +459,11 @@ MOCK
     if (( status != 0 )) && grep -q 'lld-case8-absent is not on PATH' "$work/err"; then
         echo "  ok   --require lld fails closed and names the tool"
     else
-        echo "  FAIL --require lld: exit $status, err=$(sed -n '1,5p' "$work/err")" >&2
+        case_fail "  FAIL --require lld: exit $status, err=$(sed -n '1,5p' "$work/err")"
         rm -rf "$work"; return 1
     fi
 
+    notice 'Oracle self-test' '9/9 cases pass'
     echo "  self-test: 9/9 cases pass"
     rm -rf "$work"
     return 0
@@ -483,7 +493,15 @@ if [[ -r $PROVENANCE ]]; then
     provenance=$(python3 - "$PROVENANCE" <<'EOF' 2>/dev/null || echo unknown
 import json, sys
 d = json.load(open(sys.argv[1]))
-print(f"{d.get('source', '?')} ({d.get('toolchain_seconds', '?')}s, {d.get('at', '?')})")
+secs = d.get('toolchain_seconds', '?')
+# The writer records a display string ("9.6s"), a number, or nothing; the
+# notice must not turn "9.6s" into "9.6ss", which is what the Checks page
+# showed for every lane.
+if isinstance(secs, (int, float)):
+    secs = f"{secs:.1f}s"
+elif not str(secs).rstrip().endswith("s"):
+    secs = f"{secs}s"
+print(f"{d.get('source', '?')} ({secs}, {d.get('at', '?')})")
 EOF
 )
 fi
