@@ -11,21 +11,23 @@ flags=(-O3 -march=x86-64-v3)
 CCC_NO_MAP_VEC=1 "$CCC" "${flags[@]}" -S \
     "$dir/affine_map_vectorization.c" -o "$tmp/disabled.s"
 CCC_NO_MAP_VECREG=1 "$CCC" "${flags[@]}" -S \
-    "$dir/affine_map_vectorization.c" -o "$tmp/stack-broadcast.s"
+    "$dir/affine_map_vectorization.c" -o "$tmp/no-map-vecreg.s"
 LCCC_FORCE_MAP_SSE=1 "$CCC" "${flags[@]}" -S \
     "$dir/affine_map_vectorization.c" -o "$tmp/sse.s"
 "$CCC" "${flags[@]}" -ffast-math -ffp-contract=fast -S \
     "$dir/affine_map_vectorization.c" -o "$tmp/fast.s"
 "$CCC" "${flags[@]}" -ffp-contract=off -S \
     "$dir/affine_map_vectorization.c" -o "$tmp/strict.s"
+"$CCC" "${flags[@]}" -S \
+    "$dir/vectorize_map_alias_global_overlap.c" -o "$tmp/global-alias.s"
 
-python3 - "$tmp/default.s" "$tmp/disabled.s" "$tmp/stack-broadcast.s" \
-    "$tmp/sse.s" "$tmp/fast.s" "$tmp/strict.s" <<'PY'
+python3 - "$tmp/default.s" "$tmp/disabled.s" "$tmp/no-map-vecreg.s" \
+    "$tmp/sse.s" "$tmp/fast.s" "$tmp/strict.s" "$tmp/global-alias.s" <<'PY'
 import re
 import sys
 
 texts = [open(path, encoding="utf-8").read() for path in sys.argv[1:]]
-default, disabled, stack_broadcast, sse, fast, strict = texts
+default, disabled, no_map_vecreg, sse, fast, strict, global_alias = texts
 
 
 def body(text, name):
@@ -77,6 +79,21 @@ if "%ymm" in body(default, "shifted_overlap_f64"):
             "shifted_overlap_f64: vector body lacks the runtime distance guard"
         )
 
+# A GNU `alias` can make two distinct GlobalAddr names the same object.
+# Keep the packed path for the disjoint case, but prove the one-element-ahead
+# overlap is versioned to the scalar recurrence. At x86-64-v3, eight I32 lanes
+# give a 32-byte window; after subtracting the 4-byte destination displacement,
+# the exact unsafe span is 25 bytes. This catches both an unsound global-root
+# proof (which removes the check and miscompiles) and a scalar-only workaround.
+alias_body = body(global_alias, "shift_add")
+if "%ymm" not in alias_body or not re.search(r"\bvpaddd\b", alias_body):
+    raise SystemExit("shift_add: expected an AVX2 packed map body")
+if not re.search(
+    r"subq\s+%r\w+,\s*%r\w+\n\s*subq\s+\$4,\s*%r\w+\n\s*cmpq\s+\$25,\s*%r\w+\n\s*jb\s",
+    alias_body,
+):
+    raise SystemExit("shift_add: missing GNU-alias runtime dependence guard")
+
 # Loop-invariant broadcasts stay in assigned YMM families and are consumed
 # directly by three-operand arithmetic.  No dead result-home spill may remain
 # on the packed backedge.  (The contracted body reads the scale as the FMA's
@@ -91,19 +108,37 @@ if re.search(r"vmovdqu\s+%ymm0,\s*-?\d+\(%(?:r|e)(?:sp|bp)\)", affine):
 if re.search(r"vmovup[ds]\s+-?\d+\(%(?:r|e)(?:sp|bp)\),\s*%ymm", affine):
     raise SystemExit("affine_f64: broadcast reloaded from a stack slot")
 
-# The scoped register-allocation kill switch must retain the mature stack-home
-# path, proving the direct-register assertion above is not a vacuous matcher.
-# (With the contraction on, the stack-homed scale is the FMA's memory source.)
-stack_affine = body(stack_broadcast, "affine_f64")
-if not re.search(r"vfmadd[0-9]*pd\s+-?\d+\(%(?:r|e)(?:sp|bp)\)", stack_affine):
-    raise SystemExit("affine_f64: CCC_NO_MAP_VECREG control lacks stack broadcast")
+# `CCC_NO_MAP_VECREG` disables the dedicated map-vector register homes; it
+# does not force broadcasts of constants into stack slots (the backend
+# rematerializes these from constant-pool memory). Use the dynamic I32 affine
+# chain as the positive control: normal allocation gives the live multiply and
+# add results distinct vector homes, while the kill switch reuses one scratch
+# YMM register. This proves the control actually changes the allocation path
+# without asserting a false stack-broadcast requirement.
+def i32_chain_regs(text):
+    code = body(text, "affine_i32")
+    mul = re.search(r"(?m)^\s*vpmulld\s+.*?,\s*%ymm\d+,\s*%ymm(\d+)\s*$", code)
+    add = re.search(r"(?m)^\s*vpaddd\s+%ymm\d+,\s*%ymm(\d+),\s*%ymm(\d+)\s*$", code)
+    if not mul or not add:
+        raise SystemExit("affine_i32: missing packed multiply-add chain")
+    return int(mul.group(1)), int(add.group(1)), int(add.group(2))
 
-# Width selection is type-aware: the diagnostic 128-bit path uses two doubles,
-# while preserving the same expression family.
+mul_home, add_input_home, add_result_home = i32_chain_regs(default)
+if mul_home != add_input_home or add_input_home == add_result_home:
+    raise SystemExit("affine_i32: normal path lacks distinct live vector homes")
+no_map_mul, no_map_input, no_map_result = i32_chain_regs(no_map_vecreg)
+if no_map_mul != no_map_input or no_map_input != no_map_result:
+    raise SystemExit("CCC_NO_MAP_VECREG: expected one reused scratch YMM home")
+
+# Width selection is type-aware: the diagnostic path uses two doubles. At
+# x86-64-v3, FMA is still legal for the 128-bit map, so accept either one packed
+# FMA or the unfused multiply+add pair; `-ffp-contract=off` is pinned below.
 sse_affine = body(sse, "affine_f64")
-for pattern in (r"movupd", r"mulpd", r"addpd"):
-    if not re.search(pattern, sse_affine):
-        raise SystemExit(f"affine_f64 SSE path: missing {pattern}")
+if not re.search(r"movupd", sse_affine):
+    raise SystemExit("affine_f64 SSE path: missing 128-bit packed load/store")
+if not (re.search(r"vfmadd[0-9]*pd", sse_affine)
+        or (re.search(r"mulpd", sse_affine) and re.search(r"addpd", sse_affine))):
+    raise SystemExit("affine_f64 SSE path: missing packed arithmetic")
 if "%ymm" in sse_affine:
     raise SystemExit("affine_f64 SSE path unexpectedly used YMM registers")
 

@@ -10,6 +10,7 @@ Usage:
     python3 tests/intrinsics/run_intrin_tests.py [filter]
 """
 import argparse
+import difflib
 import os
 import subprocess
 import sys
@@ -162,11 +163,19 @@ def run_cases(args, files, workdir):
             npass += 1
         else:
             print(f"MISMATCH {name}")
-            if args.verbose:
-                print(f"  lccc rc={lout.returncode} out={lout.stdout[:300]!r}")
-                print(f"  gcc  rc={gout.returncode} out={gout.stdout[:300]!r}")
             nfail += 1
             failures.append((name, "output mismatch"))
+            if args.verbose:
+                print(f"  lccc rc={lout.returncode}; gcc rc={gout.returncode}")
+                diff = list(difflib.unified_diff(
+                    gout.stdout.splitlines(), lout.stdout.splitlines(),
+                    fromfile="gcc stdout", tofile="lccc stdout", lineterm=""
+                ))
+                if diff:
+                    print("  output diff:")
+                    print("\n".join(f"  {line}" for line in diff))
+                else:
+                    print("  stdout is identical; the exit status differs")
 
     print(f"\n===== {npass} passed, {nfail} failed, {nskip} skipped =====")
     for name, why in failures:

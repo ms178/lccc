@@ -205,6 +205,18 @@ static int c_vector(void) {
     return t == (int)a && r[0] == 3 && r[1] == 0 && r[2] == 2 && r[3] == 1;
 }
 
+/* Over-aligned locals are realigned at runtime. Their address cast must use
+ * that adjusted address rather than a fixed frame-slot displacement. The
+ * volatile global keeps the truncated cast observable so this exercises the
+ * direct-cast emitter instead of only comparing two folded copies. */
+static volatile uint32_t overalign_low;
+static int c_overaligned(void) {
+    volatile int s __attribute__((aligned(64))) = 7;
+    uintptr_t a = (uintptr_t)&s;
+    overalign_low = (uint32_t)(uintptr_t)&s;
+    return overalign_low == (uint32_t)a && (a & 63u) == 0 && s == 7;
+}
+
 /* native int -> double / float conversions of the address (a different
  * lowering, pinned so it cannot regress into the same fold) */
 static int c_float(void) {
@@ -263,6 +275,7 @@ int main(void) {
         {"member", c_member},
         {"scalars", c_scalars},
         {"vector", c_vector},
+        {"overaligned", c_overaligned},
         {"float", c_float},
         {"volatile", c_volatile},
         {"nested", c_nested},
