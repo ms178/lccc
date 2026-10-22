@@ -1135,6 +1135,7 @@ impl X86Codegen {
     fn emit_alloca_addr_cast(
         &mut self,
         v: u32,
+        slot: i64,
         kind: crate::backend::cast::CastKind,
         dest_phys: PhysReg,
         dest_32: &str,
@@ -1163,11 +1164,6 @@ impl X86Codegen {
         let fused32 = matches!(narrow_to, Some(t) if t.size() <= 4)
             && self.state.alloca_over_align(v).is_none();
         if fused32 {
-            let slot = self
-                .state
-                .get_slot(v)
-                .expect("alloca with a slot was checked by the caller")
-                .0;
             self.state.out.emit_instr_rbp_reg("    leal", slot, dest_32);
         } else {
             self.value_to_reg(&Value(v), dest_64);
@@ -1295,11 +1291,11 @@ impl X86Codegen {
             // `data_home_slot`): the slot's location is the address we want.
             // An alloca with no slot at all (a dead parameter alloca) has no
             // address to take and falls through.
-            if from_ty.size() == 8
-                && self.state.is_alloca(v.0)
-                && self.state.get_slot(v.0).is_some()
-            {
-                return self.emit_alloca_addr_cast(v.0, kind, dest_phys, dest_32, dest_64);
+            if from_ty.size() == 8 && self.state.is_alloca(v.0) {
+                if let Some(slot) = self.state.get_slot(v.0) {
+                    return self
+                        .emit_alloca_addr_cast(v.0, slot.0, kind, dest_phys, dest_32, dest_64);
+                }
             }
             return false;
         }
