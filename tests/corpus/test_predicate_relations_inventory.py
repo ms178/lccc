@@ -31,6 +31,15 @@ EXPECTED_PRIOR_DEFERRALS = {
 
 
 class PredicateRelationsInventory(unittest.TestCase):
+    def test_exact_debian_gate_executes_the_fixture_and_retains_its_receipt(self):
+        workflow = (ROOT / ".github/workflows/debian-oracle.yml").read_text()
+        self.assertIn("python3 tests/regression/check_llvm_predicate_relations.py --gcc gcc-16 --json debian-predicate-relations.json", workflow)
+        self.assertNotIn("--allow-gcc16-snapshot", workflow)
+        self.assertIn("gcc-16-multilib", workflow)
+        self.assertIn("libc6-dev-i386", workflow)
+        self.assertIn("assert data['gcc_16_2_normative']", workflow)
+        self.assertGreaterEqual(workflow.count("debian-predicate-relations.json"), 3)
+
     def test_exact_and_supplemental_gcc_oracles_are_distinguished(self):
         directory = ROOT / "tests/regression"
         sys.path.insert(0, str(directory))
