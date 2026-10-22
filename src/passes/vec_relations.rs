@@ -89,6 +89,23 @@ fn intrinsic(dest: Value, op: IntrinsicOp, args: Vec<Operand>) -> Instruction {
 fn copy(dest: Value, src: Operand) -> Vec<Instruction> {
     vec![Instruction::Copy { dest, src }]
 }
+// A raw integer src2 constant denotes a lane splat, not a scalar register.
+fn packed_copy(dest: Value, src: Operand, f: Family) -> Vec<Instruction> {
+    if matches!(src, Operand::Const(_)) {
+        vec![intrinsic(dest, f.broadcast, vec![src])]
+    } else {
+        copy(dest, src)
+    }
+}
+// Packed integer immediates are supported in src2. Never introduce src1
+// constants (nor two constants) while factoring commutative operations.
+fn commutative(dest: Value, op: IntrinsicOp, a: Operand, b: Operand) -> Option<Instruction> {
+    match (a, b) {
+        (Operand::Const(_), Operand::Const(_)) => None,
+        (Operand::Const(_), _) => Some(intrinsic(dest, op, vec![b, a])),
+        _ => Some(intrinsic(dest, op, vec![a, b])),
+    }
+}
 fn def(value: Operand, defs: &FxHashMap<Value, Instruction>) -> Option<&Instruction> {
     let Operand::Value(mut value) = value else {
         return None;
@@ -159,8 +176,13 @@ fn blend_shape(op: IntrinsicOp) -> Option<(usize, usize)> {
     })
 }
 fn splat(value: Operand, f: Family, defs: &FxHashMap<Value, Instruction>) -> Option<u64> {
-    let [Operand::Const(c)] = args(value, f.broadcast, 1, defs)? else {
-        return None;
+    let c = if let Operand::Const(c) = value {
+        c
+    } else {
+        let [Operand::Const(c)] = args(value, f.broadcast, 1, defs)? else {
+            return None;
+        };
+        *c
     };
     Some(c.to_i128()? as u64 & (u64::MAX >> (64 - f.bits)))
 }
@@ -235,7 +257,7 @@ fn fold(
             | IntrinsicOp::VecBlendvF64x4
     ) || families.iter().any(|f| f.blend == Some(*op));
     if blend && root.len() == 3 {
-        if root[0] == root[1] {
+        if root[0] == root[1] && matches!(root[0], Operand::Value(_)) {
             return Some(copy(*dest, root[0]));
         }
         if let Some(replacement) = bounded_blend(root, *op, defs, families) {
@@ -270,7 +292,7 @@ fn fold(
             for (x, y) in [(a, b), (b, a)] {
                 if let Some(inner) = args(x, xor, 2, defs) {
                     for i in [0, 1] {
-                        if inner[i] == y {
+                        if inner[i] == y && matches!(inner[1 - i], Operand::Value(_)) {
                             return Some(copy(*dest, inner[1 - i]));
                         }
                     }
@@ -291,7 +313,7 @@ fn fold(
         }
         if a == b {
             if *op == f.and || *op == f.or {
-                return Some(copy(*dest, a));
+                return Some(packed_copy(*dest, a, *f));
             }
             if *op == f.xor || *op == f.sub {
                 return Some(vec![intrinsic(*dest, f.zero, vec![])]);
@@ -303,7 +325,7 @@ fn fold(
         {
             for i in [0, 1] {
                 if inner[i] == b {
-                    return Some(copy(*dest, inner[1 - i]));
+                    return Some(packed_copy(*dest, inner[1 - i], *f));
                 }
             }
         }
@@ -313,14 +335,14 @@ fn fold(
                     && let Some(inner) = args(x, f.sub, 2, defs)
                     && inner[1] == y
                 {
-                    return Some(copy(*dest, inner[0]));
+                    return Some(packed_copy(*dest, inner[0], *f));
                 }
                 if *op == f.xor
                     && let Some(inner) = args(x, f.xor, 2, defs)
                 {
                     for i in [0, 1] {
                         if inner[i] == y {
-                            return Some(copy(*dest, inner[1 - i]));
+                            return Some(packed_copy(*dest, inner[1 - i], *f));
                         }
                     }
                 }
@@ -335,7 +357,7 @@ fn fold(
                     && let Some(inner) = args(x, opposite, 2, defs)
                     && inner.contains(&y)
                 {
-                    return Some(copy(*dest, y));
+                    return Some(packed_copy(*dest, y, *f));
                 }
             }
             if let (Some(left), Some(right)) = (
@@ -346,7 +368,7 @@ fn fold(
                 && left[1] == right[0]
                 && (*op != f.add || canonical_mask(left[2], f.blend, defs))
             {
-                return Some(vec![intrinsic(*dest, *op, vec![left[0], left[1]])]);
+                return Some(vec![commutative(*dest, *op, left[0], left[1])?]);
             }
         }
         // Two private inner operations pay for the new intermediate.
@@ -368,16 +390,17 @@ fn fold(
                 for j in [0, 1] {
                     if left[i] == right[j] {
                         if *op == f.xor {
-                            return Some(vec![intrinsic(
+                            return Some(vec![commutative(
                                 *dest,
                                 f.xor,
-                                vec![left[1 - i], right[1 - j]],
-                            )]);
+                                left[1 - i],
+                                right[1 - j],
+                            )?]);
                         }
                         if fresh.0.checked_add(1).is_some() {
                             return Some(vec![
-                                intrinsic(fresh, *op, vec![left[1 - i], right[1 - j]]),
-                                intrinsic(*dest, inner, vec![left[i], Operand::Value(fresh)]),
+                                commutative(fresh, *op, left[1 - i], right[1 - j])?,
+                                commutative(*dest, inner, left[i], Operand::Value(fresh))?,
                             ]);
                         }
                     }
@@ -392,7 +415,8 @@ pub(crate) fn run(module: &mut IrModule) -> usize {
     module.for_each_function(|f| run_function(f, &families))
 }
 fn run_function(func: &mut IrFunction, families: &[Family]) -> usize {
-    if super::policy::fp_environment_blocks_reordering(func) {
+    if !func.blocks.iter().any(|block| block.instructions.iter().any(|inst| matches!(inst, Instruction::Intrinsic { op, .. } if op.vector_home_width().is_some())))
+        || super::policy::fp_environment_blocks_reordering(func) {
         return 0;
     }
     let mut uses = FxHashMap::default();

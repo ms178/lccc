@@ -73,9 +73,9 @@ def main():
                 if row["enabled"] >= row["disabled"]:
                     diagnostic = subprocess.run(
                         [args.compiler, "-O2", "-march=x86-64-v3", "-S", str(SOURCE), "-o", str(directory / "diagnostic.s")],
-                        env=env | {"CCC_DUMP_IR": "1", "CCC_DUMP_IR_FUNC": name},
+                        env=env | {"CCC_DUMP_EACH_PASS": "1", "CCC_DUMP_FUNC": name},
                         capture_output=True, timeout=60)
-                    raise ValueError(f"bounded-mask mechanism did not improve: {row}; enabled={body(assembly['enabled'], name)}; IR={diagnostic.stderr.decode(errors='replace')[:14000]}")
+                    raise ValueError(f"bounded-mask mechanism did not improve: {row}; enabled={body(assembly['enabled'], name)}; IR={diagnostic.stderr.decode(errors='replace')[-14000:]}")
         for bits in (8, 16, 32, 64):
             for size in (16, 32):
                 name = f"packed_xor_cancel_u{bits}_{size}"

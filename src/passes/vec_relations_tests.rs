@@ -46,6 +46,9 @@ fn evaluate(
                 } else {
                     let get = |index: usize| match args[index] {
                         Operand::Value(value) => values[&value].clone(),
+                        Operand::Const(c) => {
+                            vec![c.to_i128().unwrap() as u64 & full; input[0].len()]
+                        }
                         _ => panic!("bad vector operand"),
                     };
                     let a = get(0);
@@ -532,5 +535,77 @@ fn unsigned_contiguous_range_proves_bitwise_selected_arms_too() {
                 .is_none()
             );
         }
+    }
+}
+
+#[test]
+fn lane_immediates_are_splats_not_scalar_copies_or_src1_constants() {
+    for f in families() {
+        let seven = Operand::Const(IrConst::I64(7));
+        let mut source = bounded_source(f, IntrinsicOp::VecBlendvI8x16, 5, 8, 7);
+        source[3] = intrinsic(Value(7), f.and, vec![v(0), seven]);
+        source[4] = intrinsic(Value(8), f.and, vec![v(6), v(7)]);
+        check(source, f, f.bits, f.bytes);
+        for op in [f.xor, f.add] {
+            let cancel = if op == f.xor { f.xor } else { f.sub };
+            check(
+                vec![
+                    intrinsic(Value(4), op, vec![v(0), seven]),
+                    intrinsic(Value(5), cancel, vec![v(4), v(0)]),
+                ],
+                f,
+                f.bits,
+                f.bytes,
+            );
+        }
+        check(
+            vec![
+                intrinsic(Value(4), f.and, vec![v(0), seven]),
+                intrinsic(Value(5), f.and, vec![v(0), v(1)]),
+                intrinsic(Value(6), f.or, vec![v(4), v(5)]),
+            ],
+            f,
+            f.bits,
+            f.bytes,
+        );
+        check(
+            vec![
+                intrinsic(Value(4), f.and, vec![v(0), seven]),
+                intrinsic(Value(5), f.and, vec![v(1), seven]),
+                intrinsic(Value(6), f.or, vec![v(4), v(5)]),
+            ],
+            f,
+            f.bits,
+            f.bytes,
+        );
+    }
+}
+
+#[test]
+fn fp_literal_results_and_two_literal_factoring_remain_conservative() {
+    let mut f = function(vec![
+        intrinsic(
+            Value(4),
+            IntrinsicOp::VecXorF32x4,
+            vec![v(0), Operand::Const(IrConst::F32(-0.0))],
+        ),
+        intrinsic(Value(5), IntrinsicOp::VecXorF32x4, vec![v(4), v(0)]),
+    ]);
+    assert_eq!(run_function(&mut f, &families()), 0);
+    for family in families() {
+        let mut f = function(vec![
+            intrinsic(
+                Value(4),
+                family.and,
+                vec![v(0), Operand::Const(IrConst::I64(7))],
+            ),
+            intrinsic(
+                Value(5),
+                family.and,
+                vec![v(0), Operand::Const(IrConst::I64(3))],
+            ),
+            intrinsic(Value(6), family.or, vec![v(4), v(5)]),
+        ]);
+        assert_eq!(run_function(&mut f, &families()), 0);
     }
 }

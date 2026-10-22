@@ -20,6 +20,8 @@ Eight integer shapes: 8/16/32/64-bit lanes, in 128/256-bit registers.
 - Pure FP **bitwise XOR**, including NaN payloads and signed zeros, uses register-image identities. FP add/sub/mul/min/max never enter the algebra table. Observable-FP-environment functions retain the whole-function policy fence, including producers that could raise FP exceptions.
 - Unsigned `x < 2^k` / `x <= 2^k-1` compare masks remove `x & (2^k-1)` only in the selected true arm. The same proof applies to canonical bitwise selection (`cmp & (x & low)`), so GNU C mask webs need not already be normalized to blend opcodes. Compare/broadcast/AND opcodes and widths must agree. A byte blend may consume wider compare lanes because each such lane is uniformly all-ones/zero. A **coarser** blend cannot borrow that property from smaller lanes.
 
+Integer lane literals on packed src2 are recognized as splats as well as explicit broadcasts. Returning such a literal materializes a vector broadcast, never a scalar copy; commutative factoring retains the supported src2 immediate position and refuses two-literal rebuilding. FP literal-result cancellation remains conservative. Functions without vector intrinsics bypass use-map and snapshot construction.
+
 Only existing SSA values and bounded copy chains are followed. No loads, stores, calls, PHIs or casts are speculated or rebuilt. Matching is block-local, with fixed-size family tables and bounded copy walks; no decision-tree/BDD search. Shared producers are never mutated. Valid parallel source spans follow replacement instructions. Private factoring allocates checked fresh SSA IDs and preserves the destination of the original root.
 
 ## Scalar order and reversal contracts
