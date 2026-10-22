@@ -93,6 +93,9 @@ residual Briggs on spilled (RA-09).
 
 `CCC_NO_COALESCE`, `CCC_NO_PHI_COALESCE`, `CCC_NO_LEAF_PARAM_GPR`,
 `CCC_NO_EAX_ALLOC`, `CCC_NO_SEGMENT_FILL`, `CCC_NO_INDEX_HOME`,
+`CCC_NO_P1_WAVES` (merge the two Phase-1 waves back into the historical
+single scan; bisection switch for the mandatory call-spanning before
+optional hot-loop allocation order),
 `CCC_NO_ABI_REG_HINTS`, `CCC_NO_VECREG`, `CCC_EVICT_MODE`,
 `CCC_PGO_WEIGHT_MAX`, `CCC_NO_TIER2_GRAPH`, `CCC_RA_EXPLAIN`,
 `CCC_TRACE_ALLOCSTATS[=filter]`, `CCC_DEBUG_SEGMENT_FILL`,
