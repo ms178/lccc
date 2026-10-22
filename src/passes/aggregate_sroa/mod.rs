@@ -33,6 +33,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{Instruction, IrConst, IrFunction, IrModule, Operand, Value};
 
+mod byval;
 mod split;
 
 /// Size in bytes of a scalar IR type. Mirrors `mem2reg::promote::ir_type_size`.
@@ -125,6 +126,11 @@ struct Plan {
     load_ptr: Vec<(usize, usize, u32)>,
     store_ptr: Vec<(usize, usize, u32)>,
     memcpy_src: Vec<(usize, usize, u32)>,
+    /// In-place value substitution: every use of the first value becomes a use
+    /// of the second (operands, pointer fields and terminators alike).
+    replace: Vec<(u32, u32)>,
+    /// In-place call-argument substitution: (block, index, arg index, value).
+    call_arg: Vec<(usize, usize, usize, u32)>,
     // Indexed removals per block.
     remove: Vec<(usize, usize)>,
     // Insertions.
@@ -370,6 +376,8 @@ fn run_function(func: &mut IrFunction) -> usize {
         load_ptr: Vec::new(),
         store_ptr: Vec::new(),
         memcpy_src: Vec::new(),
+        replace: Vec::new(),
+        call_arg: Vec::new(),
         remove: Vec::new(),
         insert: Vec::new(),
         drop_allocas: FxHashSet::default(),
@@ -934,6 +942,14 @@ fn run_function(func: &mut IrFunction) -> usize {
         }
     }
 
+    // ── 5. Build a by-value aggregate argument at its call site ────────────
+    // Runs before the split because it *creates* the split opportunity: it
+    // retires the object a `Memcpy` named, which is the one shape form 4 has to
+    // refuse. Everything it plans is claimed for the whole iteration, so form 4
+    // sees the copy removed from `func` and both objects already accounted for;
+    // the field allocas it adds are consumed by mem2reg downstream.
+    changed += byval::run_function(func, &s, &mut plan, &mut next);
+
     // ── 4. Split constant-offset aggregates into per-field allocas ─────────
     // Runs last so forms 1-3 get first refusal on any object they can express
     // as a copy; `split::run_function` refuses everything they claimed, so no
@@ -954,6 +970,44 @@ fn run_function(func: &mut IrFunction) -> usize {
     for &(bi, ii, v) in &plan.memcpy_src {
         if let Instruction::Memcpy { src, .. } = &mut func.blocks[bi].instructions[ii] {
             *src = Value(v);
+        }
+    }
+    // Value substitution (object coalescing). Ordered before the block rebuild
+    // because it addresses original positions, and applied to terminators as
+    // well so a value that reaches control flow is not left dangling.
+    for &(from, to) in &plan.replace {
+        fn sub_op(op: &mut Operand, from: u32, to: u32) {
+            if let Operand::Value(v) = op {
+                if v.0 == from {
+                    *v = Value(to);
+                }
+            }
+        }
+        fn sub_val(v: &mut Value, from: u32, to: u32) {
+            if v.0 == from {
+                *v = Value(to);
+            }
+        }
+        let mut op = |op: &mut Operand| sub_op(op, from, to);
+        let mut val = |v: &mut Value| sub_val(v, from, to);
+        for block in func.blocks.iter_mut() {
+            block.terminator.for_each_operand_mut(&mut op);
+            for inst in block.instructions.iter_mut() {
+                inst.for_each_operand_mut(&mut op);
+                inst.for_each_value_use_mut(&mut val);
+            }
+        }
+    }
+    // Call-argument substitution (a by-value image fed from the coalesced
+    // object). Also positional, so it shares the pre-rebuild phase.
+    for &(bi, ii, ai, v) in &plan.call_arg {
+        if bi >= func.blocks.len() {
+            continue;
+        }
+        if let Some(Instruction::Call { info, .. }) = func.blocks[bi].instructions.get_mut(ii) {
+            if let Some(arg) = info.args.get_mut(ai) {
+                *arg = Operand::Value(Value(v));
+            }
         }
     }
     // Apply removals and insertions TOGETHER, in one rebuild per block.
