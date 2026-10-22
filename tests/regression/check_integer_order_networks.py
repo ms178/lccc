@@ -41,7 +41,7 @@ def main():
         if run([str(executable)])!=expected:raise ValueError('disabled control mismatch')
         if args.arm:
             path=directory/'arm.s'
-            run([args.arm,'-O2','-S',str(SOURCE),'-o',str(path)],env=env)
+            run([args.arm,'-O2','-DINTEGER_ORDER_ASSEMBLY','-S',str(SOURCE),'-o',str(path)],env=env)
             assembly=path.read_text()
             for name in ['reverse_left','reverse_right','reverse_not','reverse_or','reverse_and','reverse_andnot']:
                 instructions=body(assembly,name)

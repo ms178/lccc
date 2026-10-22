@@ -1,5 +1,16 @@
+#ifdef INTEGER_ORDER_ASSEMBLY
+/* Assembly-only cross-target check: no host libc/sysroot dependencies. */
+typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
+typedef int int32_t;
+typedef long long int64_t;
+#define UINT32_C(n) n##U
+#define UINT64_C(n) n##ULL
+_Static_assert(sizeof(uint32_t)==4 && sizeof(uint64_t)==8, "integer carriers");
+#else
 #include <stdint.h>
 #include <stdio.h>
+#endif
 static __attribute__((always_inline)) inline uint32_t reverse32(uint32_t x) {
     x=((x>>1)&UINT32_C(0x55555555))|((x&UINT32_C(0x55555555))<<1);
     x=((x>>2)&UINT32_C(0x33333333))|((x&UINT32_C(0x33333333))<<2);
@@ -22,6 +33,7 @@ EXTREMA(uint32_t,u32)
 EXTREMA(uint64_t,u64)
 NI unsigned signed_min_le(int32_t x,int32_t y) {int32_t m=x<y?x:y; return m<=x;}
 NI unsigned signed_max_lt(int64_t x,int64_t y) {int64_t m=x>y?x:y; return m<x;}
+#ifndef INTEGER_ORDER_ASSEMBLY
 int main(void) {
     uint64_t seed=UINT64_C(0x243f6a8885a308d3),digest=0;
     for(unsigned i=0;i<4096;++i) {
@@ -37,3 +49,5 @@ int main(void) {
     }
     printf("%llu\n",(unsigned long long)digest);return 0;
 }
+
+#endif
