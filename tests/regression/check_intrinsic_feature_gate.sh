@@ -256,8 +256,11 @@ fi
 macros_of() {
     local cc=$1
     shift
+    # An EMPTY set is a legitimate answer (`-mno-avx` removes __AVX__), so a
+    # no-match grep must not abort the gate under `set -e`.  Nothing here can
+    # take SIGPIPE: `sort` reads the whole stream.
     "$cc" "$@" -dM -E -x c /dev/null 2>/dev/null |
-        grep -E '^#define (__AVX__|__AVX2__|__VAES__|__VPCLMULQDQ__) ' | sort
+        grep -E '^#define (__AVX__|__AVX2__|__VAES__|__VPCLMULQDQ__) ' | sort || true
 }
 if [ "$gcc_major" -ge 13 ]; then
     for flags in -mvaes -mvpclmulqdq; do
@@ -266,17 +269,24 @@ if [ "$gcc_major" -ge 13 ]; then
                  "implies a VEX class the oracle does not"
     done
 else
+    # `grep -c ... >/dev/null`, not `... | grep -q`: this script runs under
+    # `set -o pipefail`, and `grep -q` exits at the first match, so the
+    # producer can take SIGPIPE and turn a MATCH into a failing pipeline.
+    # scripts/check_pipefail_sigpipe.py flags that shape, and it is right.
     for pair in "-mvaes __VAES__" "-mvpclmulqdq __VPCLMULQDQ__"; do
         set -- $pair
-        macros_of "$ccc" "$1" | grep -q '^#define __AVX__ 1$' ||
+        macros_of "$ccc" "$1" >"$tmp/macros.txt"
+        grep -c '^#define __AVX__ 1$' "$tmp/macros.txt" >/dev/null ||
             fail "$1 must imply __AVX__ (GCC 16 does; the 256-bit form needs" \
                  "the VEX class)"
-        macros_of "$ccc" "$1" | grep -q "^#define $2 1$" ||
+        grep -c "^#define $2 1$" "$tmp/macros.txt" >/dev/null ||
             fail "$1 must define $2"
     done
 fi
-macros_of "$ccc" -mvaes -mno-avx | grep -q '__AVX__' &&
+macros_of "$ccc" -mvaes -mno-avx >"$tmp/macros-noavx.txt"
+if grep -c '__AVX__' "$tmp/macros-noavx.txt" >/dev/null; then
     fail "-mno-avx must remove __AVX__ even when -mvaes is present"
+fi
 
 # ---------------------------------------------------------------------------
 # AVX-VNNI, AVX-VNNI-INT8 and AVX-VNNI-INT16: three extensions, three bits,
