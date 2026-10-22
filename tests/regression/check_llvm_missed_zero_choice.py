@@ -46,9 +46,15 @@ def main():
     args = parser.parse_args()
     version = run([args.gcc, "--version"]).decode()
     print(f"oracle: {args.gcc}: {version.splitlines()[0]}")
-    if not re.search(r"\b16\.2(?:\.0)?\b", version):
+    # The oracle only produces the expected program output; every mechanism
+    # assertion below compares this compiler against itself (pass on vs
+    # off), so the oracle's minor version cannot change any verdict.  Ask
+    # for CI's documented policy -- rolling-major GCC 16
+    # (scripts/ci_install_gcc16.sh) -- not an exact 16.2 a rolling package
+    # archive cannot guarantee.
+    if not re.search(r"\b16\.\d+", version):
         raise ValueError(
-            f"this contract requires exact GCC 16.2, found: {version.splitlines()[0]}"
+            f"this contract requires a GCC 16 oracle, found: {version.splitlines()[0]}"
         )
     source = str(ROOT / "tests/regression/llvm_missed_zero_choice.c")
     with tempfile.TemporaryDirectory() as tmp:

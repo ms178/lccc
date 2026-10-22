@@ -29,9 +29,15 @@ def main():
         raise ValueError("missing/duplicate contracts")
     gcc_version = run([args.gcc, "--version"]).decode()
     print(f"oracle: {args.gcc}: {gcc_version.splitlines()[0]}")
-    if not re.search(r"\b16\.2(?:\.0)?\b", gcc_version):
+    # The oracle only produces the expected program output; every mechanism
+    # assertion below compares this compiler against itself (pass on vs
+    # off), so the oracle's minor version cannot change any verdict.  Ask
+    # for CI's documented policy -- rolling-major GCC 16
+    # (scripts/ci_install_gcc16.sh) -- not an exact 16.2 a rolling package
+    # archive cannot guarantee.
+    if not re.search(r"\b16\.\d+", gcc_version):
         raise ValueError(
-            f"exact GCC 16.2 required, found: {gcc_version.splitlines()[0]}"
+            f"a GCC 16 oracle is required, found: {gcc_version.splitlines()[0]}"
         )
     if args.clang and not re.search(
         r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()
