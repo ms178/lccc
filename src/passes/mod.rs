@@ -839,19 +839,6 @@ fn run_inline_phase(
     iphase_dump!("canonicalize-fold");
     copy_prop::run(module);
     iphase_dump!("canonicalize-copyprop");
-    // Keep native reversal semantics explicit before inlining and shift
-    // reassociation obscure the portable ladder's first stage. The late
-    // bit_idioms pass then sees private reversal conjugation networks.
-    if target == crate::backend::Target::Aarch64 && !pass_disabled(disabled, "bit_idioms") {
-        module.for_each_function(|func| {
-            let n = bit_idioms::recognize_reverse_ladders(func);
-            if n > 0 {
-                dce::eliminate_dead_code(func);
-            }
-            n
-        });
-        iphase_dump!("bit_reverse_ladders");
-    }
     simplify::run(module);
     iphase_dump!("canonicalize-simplify");
     // Expose byte-decoding helpers' real cost before inlining and before GVN
@@ -889,6 +876,19 @@ fn run_inline_phase(
     }
     constant_fold::run(module);
     copy_prop::run(module);
+    // Keep native reversal semantics explicit before inlining and shift
+    // reassociation obscure the portable ladder's first stage. The late
+    // bit_idioms pass then sees private reversal conjugation networks.
+    if target == crate::backend::Target::Aarch64 && !pass_disabled(disabled, "bit_idioms") {
+        module.for_each_function(|func| {
+            let n = bit_idioms::recognize_reverse_ladders(func);
+            if n > 0 {
+                dce::eliminate_dead_code(func);
+            }
+            n
+        });
+        iphase_dump!("bit_reverse_ladders");
+    }
     // Early cleanup changes the inliner's cost input. A smaller emitted body
     // need not execute less work: the measured SipHash control shrank code but
     // increased dynamic Ir. Keep the established late cleanup unconditional on

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import re
+import subprocess
 from check_llvm_missed_zero_choice import run, body
 from check_llvm_predicate_relations import gcc_oracle_identity
 ROOT = Path(__file__).resolve().parents[2]
@@ -45,7 +46,11 @@ def main():
             assembly=path.read_text()
             for name in ['reverse_left','reverse_right','reverse_not','reverse_or','reverse_and','reverse_andnot']:
                 instructions=body(assembly,name)
-                if any(re.match(r'rbit\b',line) for line in instructions):raise ValueError(f'reversal survives in {name}: {instructions}')
+                if any(re.match(r'rbit\b',line) for line in instructions):
+                    diagnostic=subprocess.run([args.arm,'-O2','-DINTEGER_ORDER_ASSEMBLY','-S',str(SOURCE),'-o',str(path)],env=env|{'CCC_DUMP_EACH_PASS':'1','CCC_DUMP_FUNC':name+',reverse32'},capture_output=True,timeout=60)
+                    stages=re.findall(r'==== IR ([^=]+) ====\n(.*?)==== END IR \1 ====',diagnostic.stderr.decode(errors='replace'),re.S)
+                    selected='\n'.join(tag+'\n'+text for tag,text in stages if 'bit_reverse_ladders' in tag or 'bit_idioms' in tag)
+                    raise ValueError(f'reversal survives in {name}: {instructions}; IR={selected[-24000:]}')
         print(f'PASS integer order networks: GCC {version}, normative={normative}, native modes, i386, verifiers, whole-bit_idioms-disabled control, ARM mechanism={bool(args.arm)}')
 
 
