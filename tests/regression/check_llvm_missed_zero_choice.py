@@ -45,8 +45,11 @@ def main():
     parser.add_argument("--gcc", default=os.environ.get("GCC", "gcc-16"))
     args = parser.parse_args()
     version = run([args.gcc, "--version"]).decode()
+    print(f"oracle: {args.gcc}: {version.splitlines()[0]}")
     if not re.search(r"\b16\.2(?:\.0)?\b", version):
-        raise ValueError("this contract requires exact GCC 16.2")
+        raise ValueError(
+            f"this contract requires exact GCC 16.2, found: {version.splitlines()[0]}"
+        )
     source = str(ROOT / "tests/regression/llvm_missed_zero_choice.c")
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp)

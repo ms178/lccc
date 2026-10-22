@@ -27,8 +27,12 @@ def main():
     cases = json.loads(SOURCE.with_suffix(".json").read_text())
     if len(cases) != 60 or len({c["name"] for c in cases}) != 60:
         raise ValueError("missing/duplicate contracts")
-    if not re.search(r"\b16\.2(?:\.0)?\b", run([args.gcc, "--version"]).decode()):
-        raise ValueError("exact GCC 16.2 required")
+    gcc_version = run([args.gcc, "--version"]).decode()
+    print(f"oracle: {args.gcc}: {gcc_version.splitlines()[0]}")
+    if not re.search(r"\b16\.2(?:\.0)?\b", gcc_version):
+        raise ValueError(
+            f"exact GCC 16.2 required, found: {gcc_version.splitlines()[0]}"
+        )
     if args.clang and not re.search(
         r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()
     ):
