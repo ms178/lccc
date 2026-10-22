@@ -47,5 +47,8 @@
   "volatile_reduce": "-DVOLATILE_REDUCE_TRIPS=4096",
   "hot_web_loop": "-DHOT_WEB_TRIPS=4096",
   "llvm_scalar_facts": "-DSCALAR_FACTS_TRIPS=1024",
-  "llvm_word_counts": "-DROUNDS=1024"
+  "llvm_word_counts": "-DROUNDS=1024",
+  "gzip_longest_match": "-DWINDOW_SIZE=4096 -DPASSES=1",
+  "linux_list_sort": "-DELEMENTS=2000 -DPASSES=1",
+  "zstd_double_fast": "-DINPUT_SIZE=4096 -DPASSES=1"
 }

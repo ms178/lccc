@@ -16,6 +16,8 @@ use policy::fp_environment_blocks_reordering;
 
 mod address_form;
 pub(crate) mod aggregate_copy_forward;
+pub(crate) mod aggregate_pair_roundtrip;
+
 pub(crate) mod aggregate_sroa;
 pub(crate) mod alias;
 pub(crate) mod arx_vectorize;
@@ -3551,6 +3553,18 @@ pub(crate) fn run_passes(
                 removed
             });
         }
+    }
+
+    // Phase 11a: 16-byte aggregate round-trip collapse (`aggcopy16`). An
+    // inlined SSE intrinsic returns its `__m128*` value in the SysV
+    // register-pair carrier (packed as I128), so every such copy lowers to a
+    // load/load/shl/or + shr/store/store sequence.  Collapsing it to the
+    // intrinsic 128-bit copy pair is what lets the existing `movdqu` lowering
+    // and memory-operand folding see the copy at all; see
+    // engineering/SSE2-CODEGEN-MATRIX.md.
+    if !pass_disabled(&disabled, "aggcopy16") {
+        module.for_each_function(aggregate_pair_roundtrip::run);
+        verify::verify_after_pass(module, "aggcopy16");
     }
 
     // Phase 11a': Whole-vector SSA promotion. GNU-vector objects that the

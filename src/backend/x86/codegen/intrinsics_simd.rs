@@ -1476,6 +1476,8 @@ impl X86Codegen {
             ExtractPs128 => ("extractps", 0, true),
             CvtSs2Si128 => ("cvtss2si", 0, true),
             CvtSd2Si128 => ("cvtsd2si", 0, true),
+            CvttSs2Si128 => ("cvttss2si", 0, true),
+            CvttSd2Si128 => ("cvttsd2si", 0, true),
             TestzPs128 => ("vtestps", 0, true),
             TestzPs256 => ("vtestps", 0, true),
             ReduceAddEpu32_512 => ("__reduce_add_epu32", 0, false),
@@ -1543,7 +1545,7 @@ impl X86Codegen {
                 }
                 true
             }
-            CvtSs2Si128 | CvtSd2Si128 => {
+            CvtSs2Si128 | CvtSd2Si128 | CvttSs2Si128 | CvttSd2Si128 => {
                 self.sse_load_arg(&args[0], "xmm0");
                 self.state
                     .emit_fmt(format_args!("    {} %xmm0, %eax", inst));

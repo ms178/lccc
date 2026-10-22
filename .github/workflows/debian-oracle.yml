@@ -148,10 +148,34 @@ jobs:
                       'output_sha256': {key: digest(value['output']) for key, value in row['correctness'].items()},
                       'command_sha256': {key: digest(value['command']) for key, value in row['compile'].items()},
                   })
-              batch_size = max(1, (len(compact) + 6) // 7)
-              for start in range(0, len(compact), batch_size):
-                  group = compact[start:start + batch_size]
-                  notice(f'Debian workloads {start + 1}-{start + len(group)}', group)
+              # Pack the notices by SERIALISED SIZE, not by a fixed row count.
+              # A count-based split silently assumed a corpus of about fifty workloads: every
+              # row carries five 64-hex digests, so once the registry grew past that the
+              # ten-row groups crossed the 3900-byte budget and the publisher's own assertion
+              # failed the lane -- a corpus addition reddening CI through an unrelated limit.
+              # Digests are truncated to 16 hex characters here because a checks note is a
+              # pointer, not an archive: the full 256-bit values stay in debian-results.json,
+              # and every gate that compares them reads the artifact.
+              def short(value):
+                  return value[:16]
+              for row in compact:
+                  row['source_sha256'] = short(row['source_sha256'])
+                  row['output_sha256'] = {k: short(v) for k, v in row['output_sha256'].items()}
+                  row['command_sha256'] = {k: short(v) for k, v in row['command_sha256'].items()}
+              BUDGET = 3600  # headroom under the observed 3900-byte per-notice limit
+              groups, current, current_bytes = [], [], 2  # 2 = the enclosing '[', ']'
+              for row in compact:
+                  size = len(json.dumps(row, separators=(',', ':')).encode()) + 1
+                  if current and current_bytes + size > BUDGET:
+                      groups.append(current)
+                      current, current_bytes = [], 2
+                  current.append(row)
+                  current_bytes += size
+              if current:
+                  groups.append(current)
+              assert len(groups) <= 9, f'{len(groups)} workload groups exceed the nine-notice budget'
+              for index, group in enumerate(groups):
+                  notice(f'Debian workloads group {index + 1}/{len(groups)} ({len(group)} rows)', group)
               screen_path = Path('debian-callgrind/index.json')
               if screen_path.exists():
                   screen = json.loads(screen_path.read_text())

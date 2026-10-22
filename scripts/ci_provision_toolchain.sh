@@ -155,8 +155,37 @@ fi
 
 bash "$REPO/scripts/ci_install_gcc16.sh" --multilib
 if [[ -n $EXTRAS ]]; then
-    # shellcheck disable=SC2086 # intentional word splitting: a package list
-    as_root apt-get install -y --no-install-recommends $EXTRAS
+    # The differential *linker* oracles have their own installer, and it is not
+    # interchangeable with a bare apt line: it retries a transient mirror
+    # failure, keys resolution on `apt-cache pkgnames` rather than on apt's
+    # exit status, fails closed unless both binaries are on PATH, and costs
+    # nothing on a warm runner. This lane is the only place that installs
+    # packages for every job, so routing the pair through it is what keeps that
+    # discipline in force now that the six per-job copies are gone.
+    #
+    # The delegation is all-or-nothing on purpose: the installer's contract is
+    # "exit 0 means mold AND ld.lld are on PATH" -- the exact predicate
+    # tests/linker/run_linker_tests.py uses. A caller that asks for only one of
+    # them does not want that contract, so a partial request stays on apt.
+    extras_after=()
+    want_mold=0
+    want_lld=0
+    for pkg in $EXTRAS; do
+        case $pkg in
+            mold) want_mold=1 ;;
+            lld) want_lld=1 ;;
+            *) extras_after+=("$pkg") ;;
+        esac
+    done
+    if (( want_mold && want_lld )); then
+        bash "$REPO/scripts/ci_install_link_oracles.sh"
+    else
+        (( want_mold )) && extras_after+=(mold)
+        (( want_lld )) && extras_after+=(lld)
+    fi
+    if (( ${#extras_after[@]} )); then
+        as_root apt-get install -y --no-install-recommends "${extras_after[@]}"
+    fi
 fi
 
 if (( ! NO_BUNDLE )); then

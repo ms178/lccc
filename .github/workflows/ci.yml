@@ -603,6 +603,8 @@ jobs:
       run: python3 -m unittest discover -s scripts -p test_bench_rank.py
     - name: Verify GCC provisioning contracts (mock only)
       run: python3 tests/regression/check_ci_gcc16_provisioning.py
+    - name: Verify linker-oracle provisioning contracts (mock only)
+      run: python3 tests/regression/check_ci_link_oracle_provisioning.py
     - name: Verify swap provisioning contracts (mock only)
       run: python3 tests/regression/check_ci_swap_provisioning.py
     # The oracle toolchain is a per-pipeline cache now, so its contract is
@@ -637,6 +639,50 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_sse2_matmul_vectorization.sh
     - name: Check hot-loop register homes survive an in-loop call
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_hot_loop_register_homes.sh
+
+    - name: Verify the two-wide matmul lowering on the x86-64 baseline
+      env:
+        CCC: target/fastbuild/lccc
+      run: bash tests/regression/check_matmul_sse2_fallback.sh
+    # Per-instruction SSE2 codegen matrix (tests/regression/
+    # check_sse2_codegen_matrix.py): 122 rows, one per SSE/SSE2 instruction,
+    # each compiled by LCCC and by both oracles, censused from the emitted
+    # assembly, and executed for a bit-exact differential hash.  Runs here
+    # because both oracles are installed above (GCC 16 and the pinned Clang
+    # 23.1.3 that `ci_install_clang_oracle.sh` exports as $CLANG).  The gate
+    # is baseline-relative and monotone on the quantity this repository owns:
+    # LCCC's instruction count may shrink, never grow.  The oracle gap is
+    # reported and is enforced only under --strict-oracle-debt, because the
+    # oracle is a per-host build (a distribution's 16.2.0 and an upstream
+    # tarball's 16.2.0 differ by a few instructions).  --self-test proves the
+    # ratchet still catches a tightened baseline.
+    - name: Verify per-instruction SSE2 codegen against GCC 16 and Clang 23.1.3
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+        CLANG: ${{ env.CLANG }}
+      run: python3 tests/regression/check_sse2_codegen_matrix.py --check --self-test
+    # The generic SIMD header is generated from scripts/gen_lcccsimd.py; the
+    # builtin names the frontend dispatches on and the prototypes the SSE
+    # headers call must not drift apart, and a hand edit vanishes on the next
+    # regeneration.  Regenerate in place and require byte equality.
+    - name: Verify __builtin_<fn>f aliases against GCC 16
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+      run: python3 tests/regression/check_builtin_float_aliases.py
+    - name: Verify include/lcccsimd.h is exactly what the generator emits
+      run: python3 scripts/gen_lcccsimd.py --check
+    - name: Verify truncating SSE2 conversions under every rounding mode
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+      run: bash tests/regression/check_sse2_truncating_convert.sh
+    - name: Verify 16-byte XMM slot forwarding end to end
+      env:
+        CCC: target/fastbuild/lccc
+        GCC: gcc-16
+      run: bash tests/regression/check_sse2_slot_forwarding.sh
     - name: Check builtin_cpu_supports runtime semantics
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_cpu_supports_runtime.sh
     - name: Check GOT-slot references to local symbols

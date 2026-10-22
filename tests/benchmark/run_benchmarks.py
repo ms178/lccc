@@ -183,6 +183,20 @@ BENCHMARKS: tuple[Benchmark, ...] = (
               120, ("-DMATCH_RICH=1", "-DPASSES=2048")),
     Benchmark("glibc_strstr", "glibc two-way string search / needle shift table",
               ("glibc_strstr.c",), ("workload", "glibc", "string", "search")),
+    # Second extension round. Each of these is a *different* pressure profile
+    # from the kernels already present: gzip's match finder is a data-dependent
+    # chain walk with a widened unaligned load; list_sort is pointer chasing
+    # behind a non-devirtualizable comparison callback; double-fast is two
+    # independent hash probes per iteration whose results feed address
+    # arithmetic. All three self-check against a naive reference in the same
+    # binary, so a faster-but-wrong rewrite fails the output comparison rather
+    # than winning the timing column.
+    Benchmark("gzip_longest_match", "GNU gzip longest_match / hash-chain match finder",
+              ("gzip_longest_match.c",), ("workload", "gzip", "compression", "branch")),
+    Benchmark("linux_list_sort", "Linux kernel list_sort / pointer-chasing merge sort",
+              ("linux_list_sort.c",), ("workload", "linux", "sort", "memory", "calls")),
+    Benchmark("zstd_double_fast", "Zstandard double-fast match search / dual hash tables",
+              ("zstd_double_fast.c",), ("workload", "zstd", "compression", "memory")),
 )
 
 

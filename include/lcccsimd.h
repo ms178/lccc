@@ -898,13 +898,13 @@ __m128 __lccc_simd128_ps_cvtsd2si128(long, __m128 __a);
 static __inline__ int _mm_cvtsd_si32(__m128 __a) __attribute__((__always_inline__, __artificial__))
 { return (int)__lccc_simd128_ps_cvtsd2si128(0, __a); }
 
-__m128 __lccc_simd128_ps_cvtss2si128(long, __m128 __a);
+__m128 __lccc_simd128_ps_cvttss2si128(long, __m128 __a);
 static __inline__ int _mm_cvttss_si32(__m128 __a) __attribute__((__always_inline__, __artificial__))
-{ return (int)__lccc_simd128_ps_cvtss2si128(0, __a); }
+{ return (int)__lccc_simd128_ps_cvttss2si128(0, __a); }
 
-__m128 __lccc_simd128_ps_cvtsd2si128(long, __m128 __a);
+__m128 __lccc_simd128_ps_cvttsd2si128(long, __m128 __a);
 static __inline__ int _mm_cvttsd_si32(__m128 __a) __attribute__((__always_inline__, __artificial__))
-{ return (int)__lccc_simd128_ps_cvtsd2si128(0, __a); }
+{ return (int)__lccc_simd128_ps_cvttsd2si128(0, __a); }
 
 __m128 __lccc_simd128_ps_roundps128(long, __m128 __a);
 #define _mm_round_ps(__a, __imm) __CCC_M128_FROM_BUILTIN(__lccc_simd128_ps_roundps128(__imm, __a))

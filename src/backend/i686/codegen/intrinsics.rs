@@ -474,6 +474,7 @@ impl I686Codegen {
             // FmaF64x2, FmaF64x4, and reduction intrinsics are x86-64 SSE2/AVX2 intrinsics; not implemented on i686.
             IntrinsicOp::FmaF64x2
             | IntrinsicOp::FmaF64x2Hoisted
+            | IntrinsicOp::MulAddF64x2Hoisted
             | IntrinsicOp::FmaF64x4
             | IntrinsicOp::FmaF64x4Hoisted
             | IntrinsicOp::BroadcastLoadF64
@@ -1065,11 +1066,15 @@ impl I686Codegen {
                     self.store_eax_to(d);
                 }
             }
-            IntrinsicOp::CvtSs2Si128 | IntrinsicOp::CvtSd2Si128 => {
-                let inst = if matches!(op, IntrinsicOp::CvtSs2Si128) {
-                    "cvtss2si"
-                } else {
-                    "cvtsd2si"
+            IntrinsicOp::CvtSs2Si128
+            | IntrinsicOp::CvtSd2Si128
+            | IntrinsicOp::CvttSs2Si128
+            | IntrinsicOp::CvttSd2Si128 => {
+                let inst = match op {
+                    IntrinsicOp::CvtSs2Si128 => "cvtss2si",
+                    IntrinsicOp::CvtSd2Si128 => "cvtsd2si",
+                    IntrinsicOp::CvttSs2Si128 => "cvttss2si",
+                    _ => "cvttsd2si",
                 };
                 self.operand_to_eax(&args[0]);
                 self.state.emit("    movdqu (%eax), %xmm0");
