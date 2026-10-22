@@ -878,13 +878,251 @@ pub fn propagate_copies_post_phi(func: &mut IrFunction) -> usize {
     // Fixpoint: chains (Copy(a,b); Copy(b,c)) collapse one link per round, and
     // dead copies cascade. Chains are short; cap at 8 rounds.
     for _ in 0..8 {
-        let removed = one_round_post_phi(func);
+        let mut removed = one_round_post_phi(func);
+        // Each folded hop can expose another one (three nested phis over the
+        // same variable) and always leaves dead copies behind, so the fold is
+        // part of the same fixpoint rather than a separate sweep.
+        if std::env::var_os("CCC_NO_PHI_COALESCE").is_none() {
+            removed += coalesce_forwarding_phi_copies(func);
+        }
         total += removed;
         if removed == 0 {
             break;
         }
     }
     total
+}
+
+/// Does `inst` read `v` through any operand position -- value-typed fields
+/// (`Load.ptr`, `Store.ptr`, `GEP.base`, ...) included?
+fn reads_value(inst: &Instruction, v: u32) -> bool {
+    let mut reads = false;
+    crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+        if matches!(op, Operand::Value(x) if x.0 == v) {
+            reads = true;
+        }
+    });
+    crate::backend::liveness::for_each_value_use_in_instruction(inst, |x| {
+        if x.0 == v {
+            reads = true;
+        }
+    });
+    reads
+}
+
+/// Does `block` read `v` after instruction index `si` (terminator included)?
+fn reads_after(func: &IrFunction, block: usize, si: usize, v: u32) -> bool {
+    let b = &func.blocks[block];
+    if b.instructions[si + 1..].iter().any(|i| reads_value(i, v)) {
+        return true;
+    }
+    let mut reads = false;
+    crate::backend::liveness::for_each_operand_in_terminator(&b.terminator, |op| {
+        if matches!(op, Operand::Value(x) if x.0 == v) {
+            reads = true;
+        }
+    });
+    reads
+}
+
+/// Coalesce a phi home with a phi source it merely forwards.
+///
+/// A conditional update of a loop-carried C variable produces **two** phi
+/// levels for one variable: a join phi at the merge of the if-arms (whose home
+/// `s` exists only to carry the merged value to the loop header) and the loop
+/// header's own phi, whose home is `d`.  Phi elimination turns each level into
+/// copies, so every iteration pays a hop through `s`:
+///
+/// ```text
+///   arm A / latch:  s = Copy(v)     (one per incoming edge of the header)
+///   header J:       d = Copy(s)
+/// ```
+///
+/// `s` has no other reader, so renaming its definitions to `d` and deleting the
+/// `d = Copy(s)` instruction leaves the same value in `d` at every program
+/// point, one hop shorter.  The hop is not cosmetic: `s` stays live across the
+/// merge, which is what pushed all four loop-carried variables of
+/// `hot_web_loop.c` out of registers and into stack slots (40 instructions per
+/// iteration against gcc's 17).
+///
+/// Preconditions:
+///
+/// * `s` is read by exactly one instruction -- the copy being folded.
+/// * Every definition of `s` is a `Copy`, so renaming it cannot change what is
+///   computed.
+/// * Every definition of `s` sits in a predecessor of J, one per predecessor.
+///   Then the copy in J is a phi copy, and rewriting each predecessor's
+///   definition of `s` into a definition of `d` writes `d` on exactly the
+///   paths that reach J -- at the same point in the program where the phi
+///   copy's value is consumed.  No other definition of `d` can be observed
+///   through the clobber, because the copy in J kills `d` on every path into
+///   J anyway.
+/// * No block that defines `s` reads `d` *after* that definition.  The
+///   definition of `d` moves from J into the predecessor, i.e. earlier, so a
+///   later read in the same block would observe the new value where the
+///   original program still had the old one.
+/// * `d` is not defined in J other than by the folded copy.
+pub fn coalesce_forwarding_phi_copies(func: &mut IrFunction) -> usize {
+    // ONE fold per analysis.  Two folds from the same snapshot can chain
+    // (`d2 = s2` where `s2` is the `d1` of another entry) and the second then
+    // rewrites a definition the first already moved or deleted -- measured as
+    // an infinite loop in `expat_xml_scan`.  Re-deriving the uses after each
+    // fold makes the chain fold one link per iteration, which is what the
+    // fixpoint above already does for copies.
+    let mut total = 0usize;
+    for _ in 0..64 {
+        let n = coalesce_one_forwarding_phi_copy(func);
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    total
+}
+
+fn coalesce_one_forwarding_phi_copy(func: &mut IrFunction) -> usize {
+    let max_id = func.max_value_id() as usize;
+    let n_blocks = func.blocks.len();
+    if n_blocks < 2 {
+        return 0;
+    }
+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+    let mut defs_of: Vec<Vec<(usize, usize)>> = vec![Vec::new(); max_id + 1];
+    let mut use_count = vec![0u32; max_id + 1];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(d) = inst.dest()
+                && (d.0 as usize) <= max_id
+            {
+                defs_of[d.0 as usize].push((bi, ii));
+            }
+            let mut note = |v: u32| {
+                if (v as usize) <= max_id {
+                    use_count[v as usize] += 1;
+                }
+            };
+            if let Instruction::Copy {
+                src: Operand::Value(v),
+                ..
+            } = inst
+            {
+                note(v.0);
+            } else {
+                crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op {
+                        note(v.0);
+                    }
+                });
+                crate::backend::liveness::for_each_value_use_in_instruction(inst, |v| {
+                    note(v.0);
+                });
+            }
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op
+                && (v.0 as usize) <= max_id
+            {
+                use_count[v.0 as usize] += 1;
+            }
+        });
+    }
+
+    // (block, index, destination, source)
+    let mut plan: Vec<(usize, usize, Value, u32)> = Vec::new();
+    let mut claimed: crate::common::fx_hash::FxHashSet<u32> =
+        crate::common::fx_hash::FxHashSet::default();
+    for (ji, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let Instruction::Copy {
+                dest,
+                src: Operand::Value(s),
+            } = inst
+            else {
+                continue;
+            };
+            let (d, sid) = (dest.0, s.0);
+            if (d as usize) > max_id || (sid as usize) > max_id || d == sid {
+                continue;
+            }
+            if use_count[sid as usize] != 1 || !claimed.insert(sid) {
+                continue;
+            }
+            let s_defs = &defs_of[sid as usize];
+            if s_defs.is_empty() {
+                continue;
+            }
+            // `d` must not be defined in J besides this copy, and `d` must not
+            // be read earlier in J (the definition moves earlier).
+            if defs_of[d as usize]
+                .iter()
+                .any(|&(db, di)| db == ji && di != ii)
+            {
+                continue;
+            }
+            if block.instructions[..ii]
+                .iter()
+                .any(|prev| reads_value(prev, d))
+            {
+                continue;
+            }
+            let mut ok = true;
+            for &(sb, si) in s_defs {
+                // `s`'s definition must be a copy in a predecessor of J that
+                // falls through to J and nowhere else, must not read `d`, and
+                // must not define `d` by any other instruction: each of those
+                // is a way for the earlier write of `d` to be observed.
+                if !matches!(func.blocks[sb].instructions[si], Instruction::Copy { .. })
+                    || sb == ji
+                    || !cfg.preds.row(ji).contains(&(sb as u32))
+                    || cfg.succs.row(sb) != [ji as u32]
+                    || reads_after(func, sb, si, d)
+                    || defs_of[d as usize].iter().any(|&(db, _)| db == sb)
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            // Every predecessor of J must define `s`, exactly once.  The copy
+            // in J writes `d` on *every* path into J.  If some predecessor P
+            // does not define `s`, renaming leaves `d` holding its incoming
+            // value on the path through P, which is not what `d = Copy(s)`
+            // produced -- the fold would change the value J observes.  Each
+            // definition checked above is in a distinct predecessor of J with
+            // J as its only successor, so equal counts mean equal sets.
+            if ok {
+                let mut preds: Vec<u32> = cfg.preds.row(ji).iter().copied().collect();
+                preds.sort_unstable();
+                preds.dedup();
+                ok = s_defs.len() == preds.len();
+            }
+            if !ok {
+                continue;
+            }
+            plan.push((ji, ii, *dest, sid));
+        }
+    }
+    if plan.is_empty() {
+        return 0;
+    }
+    plan.truncate(1);
+    for &(ji, _, dest, sid) in &plan {
+        for &(sb, si) in &defs_of[sid as usize] {
+            if let Instruction::Copy { dest: sd, .. } = &mut func.blocks[sb].instructions[si] {
+                *sd = dest;
+            }
+        }
+        let _ = ji;
+    }
+    let mut doomed: Vec<(usize, usize)> = plan.iter().map(|&(ji, ii, _, _)| (ji, ii)).collect();
+    doomed.sort_unstable_by(|a, b| b.cmp(a));
+    for (ji, ii) in doomed {
+        debug_assert!(matches!(
+            func.blocks[ji].instructions[ii],
+            Instruction::Copy { .. }
+        ));
+        func.blocks[ji].instructions.remove(ii);
+    }
+    plan.len()
 }
 
 fn one_round_post_phi(func: &mut IrFunction) -> usize {
@@ -1163,6 +1401,296 @@ mod tests {
     use super::*;
     use crate::common::types::IrType;
     use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrConst};
+
+    /// A conditional update of a loop-carried variable leaves two phi levels:
+    /// a join phi (home `s`) and the loop header's phi (home `d`), so the loop
+    /// pays a hop through `s` every iteration.  The join is folded away by
+    /// renaming `s`'s definitions to `d`.
+    ///
+    ///     block 0 (entry)  : d = 0                 -> block 1
+    ///     block 1 (header) : d = s  (2 defs: entry?) no: see below
+    #[test]
+    fn forwarding_phi_copy_is_folded_into_the_merge() {
+        use crate::ir::reexports::IrCmpOp;
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let add = |d: u32, l: Value, r: Value| Instruction::BinOp {
+            dest: Value(d),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(l),
+            rhs: Operand::Value(r),
+            ty: IrType::I32,
+        };
+        // 0: d <- 0 ; -> 1
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Copy {
+                dest: Value(10),
+                src: Operand::Const(IrConst::I32(0)),
+            }],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // 1: header: reads d, branches to the two arms
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![add(11, Value(10), Value(20))],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(11)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+        // 2 / 3: arms, each writing the join home `s` (12) and branching to the merge
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                add(21, Value(10), Value(30)),
+                Instruction::Copy {
+                    dest: Value(12),
+                    src: Operand::Value(Value(21)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(4)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![
+                add(22, Value(10), Value(31)),
+                Instruction::Copy {
+                    dest: Value(12),
+                    src: Operand::Value(Value(22)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(4)),
+            source_spans: Vec::new(),
+        });
+        // 4: merge: d <- s (the hop), then the loop test
+        func.blocks.push(BasicBlock {
+            label: BlockId(4),
+            instructions: vec![
+                Instruction::Copy {
+                    dest: Value(10),
+                    src: Operand::Value(Value(12)),
+                },
+                Instruction::Cmp {
+                    dest: Value(13),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(10)),
+                    rhs: Operand::Const(IrConst::I32(100)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(13)),
+                true_label: BlockId(1),
+                false_label: BlockId(5),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(5),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(10)))),
+            source_spans: Vec::new(),
+        });
+
+        let folded = coalesce_forwarding_phi_copies(&mut func);
+        assert_eq!(folded, 1, "the join hop must fold exactly once");
+        // The merge block no longer copies into `d`; the arms write it.
+        let merge = &func.blocks[4];
+        assert!(
+            !merge.instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Copy { dest, .. } if dest.0 == 10
+            )),
+            "merge still carries the hop: {:?}",
+            merge.instructions
+        );
+        for arm in [2usize, 3] {
+            assert!(
+                func.blocks[arm].instructions.iter().any(|i| matches!(
+                    i,
+                    Instruction::Copy { dest, .. } if dest.0 == 10
+                )),
+                "arm {arm} must now write the loop home"
+            );
+        }
+        // `s` must be gone entirely.
+        assert!(
+            !func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instructions)
+                .any(|i| matches!(
+                    i,
+                    Instruction::Copy { dest, .. } if dest.0 == 12
+                )),
+            "the join home must be dead"
+        );
+    }
+
+    /// Negative control for the predecessor-coverage rule.
+    ///
+    /// The merge `J` here has **three** predecessors but only two of them
+    /// define `s`.  `d = Copy(s)` in `J` nevertheless writes `d` on *every*
+    /// path into `J`, including the one through block 5 that never defines
+    /// `s`.  Renaming `s`'s two definitions to `d` and deleting the copy would
+    /// leave `d` holding its incoming value on the 5 -> J path -- a different
+    /// program.  The fold must refuse.
+    ///
+    /// Without the `s_defs.len() == preds.len()` check this shape folded.
+    #[test]
+    fn forwarding_phi_fold_refuses_a_predecessor_that_does_not_define_the_join_home() {
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let cp = |d: u32, src: Operand| Instruction::Copy {
+            dest: Value(d),
+            src,
+        };
+        let blk = |n: u32, inst: Vec<Instruction>, term: Terminator| BasicBlock {
+            label: BlockId(n),
+            instructions: inst,
+            terminator: term,
+            source_spans: Vec::new(),
+        };
+        // 0: entry, d(10) <- 0 ; -> 1 or -> 5
+        func.blocks.push(blk(
+            0,
+            vec![
+                cp(10, Operand::Const(IrConst::I32(0))),
+                cp(13, Operand::Const(IrConst::I32(1))),
+            ],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(13)),
+                true_label: BlockId(1),
+                false_label: BlockId(5),
+            },
+        ));
+        // 1: header, branches to the two arms
+        func.blocks.push(blk(
+            1,
+            vec![cp(11, Operand::Const(IrConst::I32(1)))],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(11)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+        ));
+        // 2 / 3: the two arms, each defining the join home s(12)
+        func.blocks.push(blk(
+            2,
+            vec![cp(12, Operand::Const(IrConst::I32(7)))],
+            Terminator::Branch(BlockId(4)),
+        ));
+        func.blocks.push(blk(
+            3,
+            vec![cp(12, Operand::Const(IrConst::I32(9)))],
+            Terminator::Branch(BlockId(4)),
+        ));
+        // 4: merge J -- d(10) = Copy(s(12))
+        func.blocks.push(blk(
+            4,
+            vec![cp(10, Operand::Value(Value(12)))],
+            Terminator::Branch(BlockId(6)),
+        ));
+        // 5: a third predecessor of J that never defines s.
+        func.blocks
+            .push(blk(5, vec![], Terminator::Branch(BlockId(4))));
+        func.blocks.push(blk(
+            6,
+            vec![],
+            Terminator::Return(Some(Operand::Value(Value(10)))),
+        ));
+
+        // `Instruction` is not `PartialEq`, so compare a structural
+        // fingerprint: per block, the destination id of every instruction.
+        let shape = |f: &IrFunction| -> Vec<Vec<Option<u32>>> {
+            f.blocks
+                .iter()
+                .map(|b| {
+                    b.instructions
+                        .iter()
+                        .map(|i| i.dest().map(|v| v.0))
+                        .collect()
+                })
+                .collect()
+        };
+        let before = shape(&func);
+        let n = coalesce_forwarding_phi_copies(&mut func);
+        assert_eq!(n, 0, "the fold must refuse an uncovered predecessor");
+        assert_eq!(
+            before,
+            shape(&func),
+            "no instruction may be rewritten or removed"
+        );
+        // The join home must survive: renaming `s` here is the miscompile.
+        assert!(
+            func.blocks[2].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Copy { dest, .. } if dest.0 == 12
+            )),
+            "arm 2 must still define the join home s"
+        );
+    }
+
+    /// The fold must not fire when a predecessor also exits elsewhere: writing
+    /// `d` there would clobber it on the other path.
+    #[test]
+    fn forwarding_phi_copy_is_refused_on_a_critical_edge() {
+        use crate::ir::reexports::IrCmpOp;
+        let mut func = IrFunction::new("test".to_string(), IrType::I32, vec![], false);
+        let mut blk = |label: u32, insts: Vec<Instruction>, term: Terminator| {
+            func.blocks.push(BasicBlock {
+                label: BlockId(label),
+                instructions: insts,
+                terminator: term,
+                source_spans: Vec::new(),
+            });
+        };
+        blk(
+            0,
+            vec![Instruction::Copy {
+                dest: Value(10),
+                src: Operand::Const(IrConst::I32(0)),
+            }],
+            Terminator::Branch(BlockId(1)),
+        );
+        // 1: both a producer of `s` and a two-way branch (critical edge).
+        blk(
+            1,
+            vec![Instruction::Copy {
+                dest: Value(12),
+                src: Operand::Value(Value(10)),
+            }],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(10)),
+                true_label: BlockId(2),
+                false_label: BlockId(3),
+            },
+        );
+        blk(
+            2,
+            vec![Instruction::Copy {
+                dest: Value(10),
+                src: Operand::Value(Value(12)),
+            }],
+            Terminator::Branch(BlockId(4)),
+        );
+        blk(3, vec![], Terminator::Branch(BlockId(4)));
+        blk(
+            4,
+            vec![Instruction::Cmp {
+                dest: Value(13),
+                op: IrCmpOp::Slt,
+                lhs: Operand::Value(Value(10)),
+                rhs: Operand::Const(IrConst::I32(100)),
+                ty: IrType::I32,
+            }],
+            Terminator::Return(Some(Operand::Value(Value(13)))),
+        );
+        assert_eq!(coalesce_forwarding_phi_copies(&mut func), 0);
+    }
 
     /// Post-phi cleanup must resolve copy chains of ANY length exactly.  The
     /// old resolver capped the walk at 32 links; a longer chain resolved to
