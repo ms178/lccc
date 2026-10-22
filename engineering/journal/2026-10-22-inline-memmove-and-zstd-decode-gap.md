@@ -138,6 +138,10 @@ so form 4 splits it and mem2reg promotes the fields; a by-value call still needs
 a contiguous image, which is rebuilt at the call site from the (now scalar)
 fields, gap bytes included, so the callee sees the same padding as before.
 
+Diagnostics for the form: `CCC_AGG_BYVAL_DEBUG=1` reports every candidate it
+declines, with the copy's block/instruction position and the reason, plus the
+field count of each plan it applies.  It never changes codegen.
+
 Two defects found while landing it, both kept as regression tests:
 
 * Renaming onto a *parameter home* is not sound with this IR's storage model.

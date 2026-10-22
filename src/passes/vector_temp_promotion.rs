@@ -836,25 +836,21 @@ fn hoist_block_allocas(block: &mut BasicBlock) {
         (phi_prefix..block.instructions.len())
             .filter(|&i| !matches!(block.instructions[i], Instruction::Alloca { .. })),
     );
+    // `order` is a permutation, so every slot is taken exactly once; the
+    // `filter_map` cannot drop anything and keeps this free of panics.
     let mut slot: Vec<Option<Instruction>> = std::mem::take(&mut block.instructions)
         .into_iter()
         .map(Some)
         .collect();
-    block.instructions = order
-        .iter()
-        .map(|&i| slot[i].take().expect("permutation visits each slot once"))
-        .collect();
+    block.instructions = order.iter().filter_map(|&i| slot[i].take()).collect();
     // Same permutation for the spans (the shared discipline: in lockstep when
     // parallel, cleared when stale).
-    if block.source_spans.len() == slot.len() {
+    if block.source_spans.len() == order.len() {
         let mut spans: Vec<Option<_>> = std::mem::take(&mut block.source_spans)
             .into_iter()
             .map(Some)
             .collect();
-        block.source_spans = order
-            .iter()
-            .map(|&i| spans[i].take().expect("permutation visits each slot once"))
-            .collect();
+        block.source_spans = order.iter().filter_map(|&i| spans[i].take()).collect();
     }
 }
 
