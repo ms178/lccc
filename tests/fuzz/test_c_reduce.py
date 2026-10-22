@@ -43,8 +43,38 @@ int main(void) {
 """
 
 
-def have_gcc() -> bool:
-    return shutil.which(os.environ.get("REF_CC", "gcc")) is not None
+def sanitizer_capable(cc: str) -> bool:
+    """True when `cc` builds and runs the predicate's sanitized probe.
+
+    The pinned oracle compilers are compiler-only snapshots: they carry the
+    sanitizer headers but not `libasan`/`libubsan`, so `gcc` resolving to GCC
+    16 (the CI preamble shadows it) cannot link the reference oracle at all.
+    Picking by name alone therefore selected a reference that rejected EVERY
+    candidate -- and the reducer read that as "not interesting" and reduced
+    nothing.  Select by capability, and let the predicate's own probe (which
+    also guards the standalone CLI) be the single definition of "capable".
+    """
+    import c_reduce_predicate
+
+    return c_reduce_predicate.probe_reference(cc, 20.0) is None
+
+
+def reference_compiler() -> str | None:
+    """First reference compiler that can actually run the sanitized oracle."""
+    candidates = [os.environ["REF_CC"]] if os.environ.get("REF_CC") else []
+    candidates += ["gcc", "cc", "clang"]
+    seen: set[str] = set()
+    for candidate in candidates:
+        path = shutil.which(candidate)
+        if path is None or path in seen:
+            continue
+        seen.add(path)
+        if sanitizer_capable(path):
+            return path
+    return None
+
+
+REF = reference_compiler()
 
 
 class DdminUnit(unittest.TestCase):
@@ -85,7 +115,10 @@ class DdminUnit(unittest.TestCase):
             self.assertEqual(red.tests, 1)
 
 
-@unittest.skipUnless(have_gcc(), "needs a reference C compiler")
+@unittest.skipUnless(
+    REF is not None,
+    "needs a reference C compiler with a working -fsanitize=undefined,address runtime",
+)
 class EndToEnd(unittest.TestCase):
     def _run(self, env_extra, body=PROGRAM):
         tmp = tempfile.mkdtemp(prefix="c-reduce-e2e-")
@@ -96,7 +129,8 @@ class EndToEnd(unittest.TestCase):
         env = dict(os.environ, **env_extra)
         proc = subprocess.run(
             [sys.executable, str(CLI), str(src), "--out", str(out), "--",
-             sys.executable, str(PRED), "--ccc", str(FAKE), "--level=-O2"],
+             sys.executable, str(PRED), "--ccc", str(FAKE), "--ref", str(REF),
+             "--level=-O2"],
             env=env, capture_output=True, text=True, timeout=600, check=False)
         return proc, out
 
@@ -140,7 +174,10 @@ class ScratchPath(unittest.TestCase):
         self.assertEqual(seen, {"cand.c"})
 
 
-@unittest.skipUnless(have_gcc(), "needs a reference C compiler")
+@unittest.skipUnless(
+    REF is not None,
+    "needs a reference C compiler with a working -fsanitize=undefined,address runtime",
+)
 class LeakTolerance(unittest.TestCase):
     """The reference oracle must accept a defined-but-leaking candidate.
 
@@ -170,9 +207,8 @@ class LeakTolerance(unittest.TestCase):
                 src = Path(tmp) / "p.c"
                 exe = Path(tmp) / "p.exe"
                 src.write_text(cls.LEAK)
-                ref = os.environ.get("REF_CC", "gcc")
                 built = subprocess.run(
-                    [ref, "-fsanitize=undefined,address", "-fno-sanitize-recover=all",
+                    [str(REF), "-fsanitize=undefined,address", "-fno-sanitize-recover=all",
                      str(src), "-o", str(exe), "-lm"],
                     capture_output=True, timeout=120, check=False)
                 cls._asan_probe = built.returncode == 0
@@ -186,7 +222,7 @@ class LeakTolerance(unittest.TestCase):
             src.write_text(self.LEAK)
             env = dict(os.environ, FAKE_MISCOMPILE="1")
             proc = subprocess.run(
-                [sys.executable, str(PRED), "--ccc", str(FAKE),
+                [sys.executable, str(PRED), "--ccc", str(FAKE), "--ref", str(REF),
                  "--kind", "miscompile", str(src)],
                 env=env, capture_output=True, text=True, timeout=300, check=False)
             self.assertEqual(proc.returncode, 0,
@@ -201,9 +237,8 @@ class LeakTolerance(unittest.TestCase):
             src = Path(tmp) / "leak.c"
             exe = Path(tmp) / "leak.exe"
             src.write_text(self.LEAK)
-            ref = os.environ.get("REF_CC", "gcc")
             subprocess.run(
-                [ref, "-fsanitize=undefined,address", "-fno-sanitize-recover=all",
+                [str(REF), "-fsanitize=undefined,address", "-fno-sanitize-recover=all",
                  str(src), "-o", str(exe), "-lm"],
                 capture_output=True, timeout=120, check=True)
             default = subprocess.run([str(exe)], capture_output=True, timeout=60,
@@ -241,10 +276,55 @@ class PredicateContract(unittest.TestCase):
             src.write_text("int main(void){return 0;}\n")
             proc = subprocess.run(
                 [sys.executable, str(PRED), "--ccc", str(Path(tmp) / "no-such-cc"),
-                 "--kind", "crash", str(src)],
+                 "--ref", str(REF), "--kind", "crash", str(src)],
                 capture_output=True, text=True, timeout=120, check=False)
             self.assertEqual(proc.returncode, 2, proc.stderr)
             self.assertIn("cannot execute", proc.stderr)
+
+
+class ReferenceProbeContract(unittest.TestCase):
+    """Mutation: a reference without sanitizer support must be a SETUP error.
+
+    Before the probe existed, such a compiler made the predicate answer
+    "not interesting" (exit 1) for every candidate -- and a missing `--ccc`
+    was never reached, so the reducer reported a clean "nothing to minimise".
+    """
+
+    def test_unusable_reference_is_exit_2_not_a_verdict(self) -> None:
+        import c_reduce_predicate
+
+        tmp = tempfile.mkdtemp(prefix="c-reduce-probe-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        root = Path(tmp)
+        fake = root / "no-sanitizers"
+        fake.write_text("#!/bin/sh\nexit 1\n")
+        fake.chmod(0o755)
+        src = root / "c.c"
+        src.write_text("int main(void){return 0;}\n")
+        proc = subprocess.run(
+            [sys.executable, str(PRED), "--ccc", str(FAKE), "--ref", str(fake),
+             str(src)],
+            capture_output=True, text=True, timeout=120, check=False)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("reference compiler", proc.stderr)
+        self.assertIsNotNone(c_reduce_predicate.probe_reference(str(fake), 20.0))
+
+    def test_pinned_oracle_is_detected_as_unusable_when_it_lacks_runtimes(self) -> None:
+        """The compiler-only snapshots must be REJECTED, not silently accepted."""
+        import c_reduce_predicate
+
+        tmp = tempfile.mkdtemp(prefix="c-reduce-probe-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fake = Path(tmp) / "compiler-only"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "for arg in \"$@\"; do\n"
+            "  case \"$arg\" in -fsanitize=*) echo 'cannot find -lasan' >&2; exit 1;; esac\n"
+            "done\n"
+            "exit 1\n"
+        )
+        fake.chmod(0o755)
+        self.assertIsNotNone(c_reduce_predicate.probe_reference(str(fake), 20.0))
 
 
 if __name__ == "__main__":

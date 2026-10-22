@@ -2,15 +2,52 @@ name: Benchmarks
 
 # Reusable lane of ci.yml: consume the SAME compiler tested by the build lane.
 # The caller owns push/PR triggers and cancellation, avoiding duplicate runs.
+#
+# SHARDED. The complete corpus is ~49 kernels x 2 compilers x (warm-up + timed
+# rounds), which measured 466 s of wall clock in run 39752334266 and was, by a
+# wide margin, the longest lane in the pipeline. The kernels are independent,
+# so the corpus is split into balanced shards that run on separate runners and
+# a merge job publishes ONE report: `ci-bench.py --merge` refuses an incomplete
+# shard, a duplicated kernel, a foreign schema, mismatched settings or a
+# different compiler identity, so the published evidence has exactly the shape
+# a single job produced. tests/corpus/test_benchmark_merge.py pins those
+# refusals, and tests/corpus/test_benchmark_shard_plan.py pins that the shards
+# are a partition of the registry.
 on:
   workflow_call:
+    # Every input has a default so this workflow is walkable (and runnable)
+    # on its own: the parity checker resolves `workflow_call` inputs to prove a
+    # step runs on the green path, and an unresolvable input would make the
+    # lane's gates unverifiable rather than covered. The caller passes all four
+    # explicitly; the defaults describe a single, unsharded run of the corpus.
+    inputs:
+      shard:
+        description: shard label used in step names and artifact names (a, b, ...)
+        type: string
+        default: a
+      only:
+        description: comma-separated benchmark IDs this shard owns (empty = all)
+        type: string
+        default: ""
+      report:
+        description: shard report file name
+        type: string
+        default: bench-a.json
+      artifact:
+        description: artifact name for this shard's report and logs
+        type: string
+        default: benchmark-shard-a
+      gate_steps:
+        description: run the cheap static gates (fib, codegen baseline, self-test)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   benchmark:
-    name: LCCC vs GCC
+    name: LCCC vs GCC (shard ${{ inputs.shard }})
     # A hung compiler in the corpus step would otherwise burn the default six
     # hours before failing; the timed corpus is ~9 minutes on a good day.
     timeout-minutes: 45
@@ -65,6 +102,7 @@ jobs:
           gcc-16 --version | head -1
 
       - name: Verify Fibonacci rec2iter optimization
+        if: inputs.gate_steps
         env:
           GCC_INC: ${{ steps.gcc.outputs.inc }}
         run: |
@@ -91,9 +129,11 @@ jobs:
       # `if: always()`; they cannot rescue a skipped corpus. Baseline refreshes go through --update-baseline in
       # the PR that lands the improvement, per the gate's header contract.
       - name: Gate self-test (stackmem accounting)
+        if: inputs.gate_steps
         run: python3 .github/scripts/test_ci_codegen_gate.py
 
       - name: Codegen quality gate (golden workloads)
+        if: inputs.gate_steps
         env:
           GCC_INC: ${{ steps.gcc.outputs.inc }}
         run: |
@@ -102,7 +142,11 @@ jobs:
             --lccc target/fastbuild/lccc \
             --gcc-inc "$GCC_INC" 2>&1 | tee codegen-gate.txt
 
-      - name: Run complete benchmark corpus
+      - name: Run benchmark corpus shard
+        env:
+          SHARD: ${{ inputs.shard }}
+          ONLY: ${{ inputs.only }}
+          REPORT: ${{ inputs.report }}
         run: |
           # GitHub's default Linux shell for `run:` steps is `bash -e`
           # WITHOUT pipefail: a failing left-hand side of a pipeline is
@@ -121,23 +165,26 @@ jobs:
             --cflag=-std=gnu17 \
             --reps 9 \
             --warmup 1 \
-            --artifact-dir bench-artifacts \
-            --json bench-results.json \
-            --markdown bench-summary.md \
-            --strict | tee bench-terminal.txt
+            --only "$ONLY" \
+            --artifact-dir "bench-artifacts-$SHARD" \
+            --json "$REPORT" \
+            --markdown "bench-summary-$SHARD.md" \
+            --strict | tee "bench-terminal-$SHARD.txt"
 
-      - name: Post benchmark summary
+      - name: Post shard summary
         if: always()
-        run: cat bench-summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+        env:
+          SHARD: ${{ inputs.shard }}
+        run: cat "bench-summary-$SHARD.md" >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 
-      - name: Upload benchmark results
+      - name: Upload shard results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: benchmark-results
+          name: ${{ inputs.artifact }}
           path: |
-            bench-results.json
-            bench-summary.md
-            bench-terminal.txt
-            bench-artifacts/
+            ${{ inputs.report }}
+            bench-summary-${{ inputs.shard }}.md
+            bench-terminal-${{ inputs.shard }}.txt
+            bench-artifacts-${{ inputs.shard }}/
             codegen-gate.txt

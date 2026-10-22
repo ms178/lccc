@@ -33,11 +33,27 @@
 # `-L /usr/<triplet>` explicitly, or use scripts/run_cross.sh).
 #
 # Usage:  scripts/ensure_cross_toolchains.sh [aarch64|riscv64|all]
+#
+# CACHING
+# -------
+# `apt-get download` is the only network-bound step here, and it dominated the
+# hosted pipeline: run 39752334266 paid 331 s in the assembler/linker lane,
+# 165 s in contract shard b and 23 s in shard a for the identical 17-package
+# set, in three jobs that all start at the same moment. LCCC_CROSS_DEB_DIR
+# (default ~/.cache/lccc-cross-debs) keeps the downloaded archives, so a lane
+# that restores the cache only pays the unpack. The package filenames are
+# resolved through `apt-get download --print-uris`, which reports the exact
+# archive apt would fetch *without* fetching it -- a cached file is therefore
+# selected by the same key apt would use, not by a guessable name glob, and a
+# package upgrade simply misses and re-downloads. Anything unexpected (no
+# index, unparsable output) falls back to the unconditional download path, so
+# the cache can only ever be an optimization, never a new failure mode.
 # ============================================================================
 set -uo pipefail
 
 want=${1:-all}
 work=${LCCC_XROOT:-/var/tmp/lccc-xroot}
+deb_cache=${LCCC_CROSS_DEB_DIR:-$HOME/.cache/lccc-cross-debs}
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -121,11 +137,44 @@ rm -rf "$work"
 mkdir -p "$work"
 cd "$work" || exit 1
 
-echo "[cross] downloading ${#pkgs[@]} packages into $work"
+# The archive NAME apt would use for each package, resolved without a download.
+# `--print-uris` prints "<uri> <hash> <size> <filename>" per package; the
+# filename is the last field.
+archive_name() {  # archive_name <package> -> basename, or empty
+    apt-get download --print-uris "$1" 2>/dev/null \
+        | awk 'NR == 1 { print $NF }' \
+        | sed -e "s/^'//" -e "s/'$//" -e 's|.*/||'
+}
+
+echo "[cross] provisioning ${#pkgs[@]} packages into $work (cache: $deb_cache)"
 missing=()
+cached=0
+fetched=0
+[[ -n $deb_cache ]] && { mkdir -p "$deb_cache" 2>/dev/null || deb_cache=""; }
 for p in "${pkgs[@]}"; do
+    name=$(archive_name "$p")
+    if [[ -n $deb_cache ]]; then
+        if [[ -n $name && -s $deb_cache/$name ]]; then
+            cached=$((cached + 1))
+        elif [[ -n $name ]]; then
+            # Download straight into the cache, so the first lane to run
+            # populates the key for every later lane, then unpack from here.
+            ( cd "$deb_cache" && apt-get download "$p" >/dev/null 2>&1 )
+            [[ -s $deb_cache/$name ]] && fetched=$((fetched + 1))
+        fi
+        if [[ -n $name && -s $deb_cache/$name ]]; then
+            # Hardlink when possible: the cache and the work tree are usually
+            # on one filesystem, and a link costs nothing while copying
+            # ~300 MB would hand the saving straight back to the unpack.
+            ln "$deb_cache/$name" "$work/$name" 2>/dev/null \
+                || cp "$deb_cache/$name" "$work/$name" 2>/dev/null \
+                || missing+=("$p")
+            continue
+        fi
+    fi
     apt-get download "$p" >/dev/null 2>&1 || missing+=("$p")
 done
+echo "[cross] archives: $cached reused, $fetched fetched"
 if ((${#missing[@]})); then
     echo "[cross] WARNING: could not download: ${missing[*]}" >&2
 fi

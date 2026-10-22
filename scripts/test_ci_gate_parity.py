@@ -1265,5 +1265,102 @@ class AggregatedDiagnosticsTest(unittest.TestCase):
 # code in the very execution mode CI uses, and the suite reported 24/24
 # while they never ran. Discovery imports were unaffected; direct
 # execution was the blind spot.
+class ReusableInputSemanticsTest(unittest.TestCase):
+    """A reusable lane's inputs are resolved, not refused.
+
+    The pipeline splits a long lane by calling one workflow file several times
+    with different `with:` values (the benchmark corpus runs as shards). The
+    checker used to REFUSE any caller that passed `with:` -- which would have
+    turned every sharded lane into "unverifiable", and an unverifiable gate is
+    one the checker silently stops protecting. The replacement is stricter, not
+    looser: the caller's values are substituted into the step conditions and
+    the run bodies, so a step that an input disables is still not coverage, and
+    a body whose arguments come from an input is checked with its REAL
+    arguments.
+    """
+
+    CHILD = (
+        "name: Child\n"
+        "on:\n"
+        "  workflow_call:\n"
+        "    inputs:\n"
+        "      jobs_arg:\n"
+        "        type: string\n"
+        "        default: '2'\n"
+        "      run_it:\n"
+        "        type: boolean\n"
+        "        default: true\n"
+        "      hidden:\n"
+        "        type: boolean\n"
+        "        default: false\n"
+        "jobs:\n"
+        "  work:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - name: Verify assembly differential\n"
+        "        if: inputs.run_it\n"
+        "        run: python3 scripts/asmdiff.py --jobs ${{ inputs.jobs_arg }}"
+        " --as p --objdump q --lccc target/fastbuild/lccc-x86\n"
+        "      - name: Never on the green path\n"
+        "        if: inputs.hidden\n"
+        "        run: python3 scripts/asmdiff.py --jobs 2 --as p --objdump q"
+        " --lccc target/fastbuild/lccc-x86\n"
+    )
+
+    def setUp(self) -> None:
+        importlib.import_module("yaml")
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.root = Path(self._dir.name) / ".github" / "workflows"
+        self.root.mkdir(parents=True)
+        (self.root / "child.yml").write_text(self.CHILD)
+
+    def caller(self, with_block: str = "", secrets: str = "") -> Path:
+        path = self.root / "caller.yml"
+        path.write_text(
+            "name: Caller\non: [pull_request]\njobs:\n"
+            "  shard:\n"
+            "    uses: ./.github/workflows/child.yml\n"
+            + with_block + secrets)
+        return path
+
+    def test_input_defaults_apply_when_the_caller_passes_nothing(self) -> None:
+        # `if: inputs.run_it` defaults true -> coverage, with the default
+        # argument; `if: inputs.hidden` defaults false -> not coverage at all.
+        body = parity.run_script_bodies(self.caller())
+        self.assertIn("--jobs 2", body)
+        self.assertEqual(body.count("scripts/asmdiff.py"), 1,
+                         "a step disabled by an input default must not count as coverage")
+
+    def test_caller_values_are_substituted_into_the_body(self) -> None:
+        path = self.caller("    with:\n      jobs_arg: '7'\n")
+        body = parity.run_script_bodies(path)
+        self.assertIn("--jobs 7", body,
+                      "the caller's input must reach the invocation the checker parses")
+
+    def test_a_caller_that_disables_the_step_loses_the_coverage(self) -> None:
+        path = self.caller("    with:\n      run_it: false\n")
+        body = parity.run_script_bodies(path)
+        self.assertNotIn("scripts/asmdiff.py", body,
+                         "a step an input turns off is not green-path coverage")
+
+    def test_undeclared_inputs_and_secrets_are_still_refused(self) -> None:
+        with self.assertRaisesRegex(parity._WorkflowError, "undeclared inputs"):
+            parity.run_script_bodies(self.caller("    with:\n      typo_input: '1'\n"))
+        with self.assertRaisesRegex(parity._WorkflowError, "reusable secrets"):
+            parity.run_script_bodies(self.caller(secrets="    secrets:\n      token: x\n"))
+
+    def test_an_unresolvable_condition_stays_conservative(self) -> None:
+        (self.root / "child.yml").write_text(
+            "name: Child\non:\n  workflow_call:\n"
+            "jobs:\n  work:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - name: Expression gate\n"
+            "        if: github.event_name == 'push'\n"
+            "        run: python3 scripts/asmdiff.py --jobs 2 --as p --objdump q"
+            " --lccc target/fastbuild/lccc-x86\n")
+        self.assertNotIn("scripts/asmdiff.py",
+                         parity.run_script_bodies(self.caller()))
+
+
 if __name__ == "__main__":
     unittest.main()

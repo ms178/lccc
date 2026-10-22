@@ -61,6 +61,40 @@ def compile_checked(command):
                              + result.stdout + result.stderr)
 
 
+_SANITIZER_FLAGS: dict[str, list[str]] = {}
+
+
+def sanitizer_flags(cc: str) -> list[str]:
+    """`-fsanitize=undefined -fno-sanitize-recover=all` when `cc` can link it.
+
+    The pinned GCC 16.2 shipped by the tag cache is a compiler-only prefix: it
+    carries no libubsan, so `-fsanitize=undefined` fails at *link* time with
+    `cannot find -lubsan`.  That is a property of the distribution, not of the
+    harness, and it says nothing about the claim this case proves -- the
+    generated program prints the same value at every optimisation level.  The
+    campaign therefore runs either way and says which mode it used, instead of
+    dying on a runtime it does not control (which is how the lane went red with
+    an assertion about `gcc` rather than about the property under test).
+    """
+    cached = _SANITIZER_FLAGS.get(cc)
+    if cached is not None:
+        return cached
+    flags = ["-fsanitize=undefined", "-fno-sanitize-recover=all"]
+    with tempfile.TemporaryDirectory() as tmp:
+        probe = Path(tmp) / "probe.c"
+        probe.write_text("int main(void) { return 0; }\n")
+        result = subprocess.run([cc, *flags, str(probe), "-o", str(Path(tmp) / "probe")],
+                                capture_output=True, text=True, timeout=60)
+    if result.returncode:
+        detail = (result.stderr.strip().splitlines() or ["no diagnostics"])[-1]
+        print(f"pr826 redteam: {cc} cannot link -fsanitize=undefined ({detail}); "
+              "running the opt-level campaign without UB instrumentation",
+              file=sys.stderr)
+        flags = []
+    _SANITIZER_FLAGS[cc] = flags
+    return flags
+
+
 class RedTeam(unittest.TestCase):
     def test_profile_parser_resets_record_identity(self):
         text = "lccc-pgo-v1 1 2 3 4\nfunc f\nf 1\nlccc-pgo-v1 5 6 7 8\nf 1\n"
@@ -126,7 +160,7 @@ class RedTeam(unittest.TestCase):
                 src.write_text(PGO["source"](count))
                 for opt in ("-O0", "-O2", "-O3"):
                     exe = root / "source"
-                    compile_checked([CC, opt, "-fsanitize=undefined", "-fno-sanitize-recover=all",
+                    compile_checked([CC, opt, *sanitizer_flags(CC),
                                      str(src), "-o", str(exe)])
                     p = subprocess.run([str(exe)], capture_output=True, text=True, timeout=10)
                     self.assertEqual(p.returncode, 23)
