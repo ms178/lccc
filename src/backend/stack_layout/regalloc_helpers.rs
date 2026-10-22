@@ -299,6 +299,16 @@ pub fn run_regalloc_and_merge_clobbers_ex(
             block.instructions.iter().any(|inst| {
                 if let Instruction::Intrinsic { op, .. } = inst {
                     use crate::ir::intrinsics::IntrinsicOp as O;
+                    // Scalar-sequential rather than one alternation
+                    // because the last row is conditional: the SSE2
+                    // lowering of the 4-lane i32 product stages through a
+                    // third register, and it is only reachable when
+                    // SSE4.1 (`pmulld`) is absent -- so an SSE4.1+ target
+                    // keeps xmm2 in the pool. Every other row here has an
+                    // unconditional emitter and is therefore unconditional
+                    // too.
+                    let sse2_i32_mul_lowering =
+                        !crate::passes::vectorize::x86_sse41_available_pub();
                     matches!(
                         op,
                         O::Pblendvb128
@@ -325,7 +335,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
                             // hoisted factor, unaligned C addend).
                             | O::FmaF64x2Hoisted
                             | O::MulAddF64x4HoistedSIB
-                    )
+                    ) || (sse2_i32_mul_lowering && matches!(op, O::VecMulI32x4))
                 } else {
                     false
                 }

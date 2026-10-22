@@ -3915,6 +3915,16 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     } else {
         (phase1_ranges, Vec::new())
     };
+    // An over-subscribed mandatory wave has one register per winner to hand
+    // out and slots for the rest, so the only decision is WHO wins. Ranking
+    // that decision by the cost model (the cost model sorts the worklist
+    // instead of relying on source order) was tried, measured at 5 % on
+    // `hot_web_loop`, and removed: the scan consults the ACTIVE set at the
+    // incoming range's start, so a reordered worklist admits a later range
+    // first, parks a register on an interval that has not begun, and demotes
+    // an earlier range to a slot it does not have to share
+    // (`tests/regression/check_hot_loop_register_homes.sh`). The decision
+    // belongs in the victim selection, which is order-independent.
     let mut allocator = LinearScanAllocator::new_with_config(
         mandatory,
         config.available_regs.clone(),
