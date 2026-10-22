@@ -38,8 +38,19 @@ mnemonic appears), **differential correctness** (LCCC's output hash equals
 the better oracle). The committed `tests/regression/sse2_codegen_matrix.json`
 records the verdicts, the instruction-count debt and the mnemonic sets. The gate
 ratchets on the quantity this repository actually controls: **LCCC's own
-instruction count may shrink, never grow**, and a mnemonic that was emitted may
-not disappear. The *oracle gap* (and the win/tie/loss verdict it implies) is
+instruction count may shrink, never grow**. Mnemonic fidelity has two tiers: a
+row's *canonical* (expected) mnemonic, once emitted, may not disappear under
+any circumstances -- that is the **lowering fidelity** fact above, and it is
+checked unconditionally, not only under `--strict-expect`; an *incidental*
+spelling (spill/repack traffic recorded alongside) may vanish only when the row
+also shrank, which is the signature of the traffic being optimized away rather
+than the lowering changing. `--self-test` pins all three directions. Kernel
+inputs include FP edge bit-patterns spliced over the integer fill (signed
+zeroes, infinities, quiet-NaN payloads, denormals, rounding ties, conversion
+range edges): on whole-number inputs alone, a `cvt`/`cvtt` swap, NaN-semantics
+change or FTZ difference hashes identically to both oracles and the
+differential fact is vacuous (see the truncating-conversion defect below,
+which is exactly how it hid). The *oracle gap* (and the win/tie/loss verdict it implies) is
 reported but enforced only under `--strict-oracle-debt`, because the oracle is a
 per-host BUILD: a distribution's GCC 16.2.0 and the upstream tarball's 16.2.0
 differ by a few instructions, and once LCCC is near parity (the median row is
@@ -150,7 +161,9 @@ rest are open):
    `MXCSR.RC = round-up` it is wrong for every non-integral input. Nothing in
    the corpus exercised a non-integral conversion, so the row's hash check
    passed — the matrix recorded it as a *fidelity* finding until the
-   differential test below was written.
+   differential test below was written. (The systemic fix landed later: the
+   kernel fill now carries FP edge values, so this class of wrongness breaks
+   the hash instead of passing through it.)
 
    Fixed by giving truncation its own intrinsic ops (`CvttSs2Si128`,
    `CvttSd2Si128`), emitted as `cvttss2si`/`cvttsd2si` on x86-64 and i686, and

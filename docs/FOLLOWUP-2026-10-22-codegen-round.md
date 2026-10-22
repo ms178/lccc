@@ -514,8 +514,10 @@ count is enough, the metric is deterministic and takes one `-O2 -S`).
 failure ("enable/disable does not change the pressure witness"). The previous
 session's probe blamed the pass: a 310-use candidate apparently refused by the
 `phi_pair_values` guard. Re-measured on the current tree with temporary
-counters in `src/backend/regalloc/hot_web.rs` (since reverted; the file is
-untouched in this patch), that explanation no longer holds:
+counters in `src/backend/regalloc/hot_web.rs` (the counters were reverted;
+the evict-scoped protection described below is what ships in this patch --
+the file is *not* untouched; see the correction in section 12), that
+explanation no longer holds:
 
 ```text
 candidates=[(109, 3100), (107, 310), (102, 21)]   <- the hot ones, ranked
@@ -536,9 +538,15 @@ Three facts follow, each from data rather than inference:
 3. **The veto never blocks a valuable steal.** Instrumenting the
    `phi_pair_values` clause shows it fires only for 12-31-use candidates across
    three witnesses (the shipped one, and two synthetic high-pressure programs
-   with 16 recurrences). Narrowing it to the evicted set was implemented,
-   measured — assembly still byte-identical, no steal anywhere — and reverted:
-   it changes no code, so it is not an optimisation, only risk.
+   with 16 recurrences). Narrowing the protection to the evicted set (with a
+   whole-web veto when a protected value belongs to an evicted copy web) is
+   what ships in this patch, with dedicated unit tests; on these witnesses it
+   changes no emitted byte, because no steal it newly permits is profitable
+   there either. It is kept because the old clause protected unrelated
+   occupants of a register -- a correctness-shaped over-approximation in a
+   profitability guard -- not because it wins instructions today. An earlier
+   draft of this section said the narrowing was reverted; that is corrected
+   in section 12.
 
 The defect is the assertion. "Enabling a pass must change this C program's
 assembly" is an accidental property of the allocator's state: it held while
@@ -710,9 +718,12 @@ check_ci_link_oracle_provisioning.py                      14/14 (oracles install
 check_llvm_scalar_facts.py                                PASS
 ```
 
-No `phi_pair_values` narrowing is shipped: it was implemented, measured to
-change nothing, and reverted (`src/backend/regalloc/hot_web.rs` is byte-identical
-to the PR head).
+The counters from the 5c.2 investigation are not shipped. The evict-scoped
+`phi_pair_values`/ABI-hint protection *is* shipped, with unit tests for both
+directions (a disjoint protected holder no longer blocks an unrelated
+eviction; a protected member of an evicted copy web still vetoes it). An
+earlier version of this section claimed the file was byte-identical to the
+branch base; that was wrong and is corrected in section 12.
 
 ## 11. Session 13 — head-to-head review of the re-worked PR #918, and the merge
 
@@ -798,10 +809,15 @@ clang 23.1.3's builtin headers. It resolves the three worst matrix rows:
 
 ```text
 row        lccc   gcc   clang   icx   best
-maxsd        86    12      11    11     11
-minsd        84    12      11    11     11
-sqrtsd       87    12      11    39     11
+maxsd        84    12      11    11     11
+minsd        82    12      11    11     11
+sqrtsd       85    12      11    39     11
 ```
+
+(The lccc column originally printed 86/84/87, measured on a pre-final tree.
+The shipped baseline `sse2_codegen_matrix.json` records 84/82/85; the column
+above is corrected to it. The gcc/clang/icx columns stand as measured that
+session; `best_oracle` in the baseline confirms 11.)
 
 ICX confirms the target is attainable on two of the three rows and is itself
 worse on `sqrtsd`, so 11 is the bar. The cause is the memory-backed `__m128`
@@ -813,5 +829,87 @@ representation (section 5.2), not a missing instruction: the lowering reaches
 | id | item | evidence | first step |
 |---|---|---|---|
 | TODO-12 | AArch64 matmul grew 96/62 -> 128/101 on main | `CCC_DISABLE_PASSES=all` restores 96/95, so a pass adds 6 instructions and 32 bytes of frame | bisect main's pass list on `vectorize_matmul_n17.c`; recover or justify |
-| TODO-13 | Scalar `maxsd`/`minsd`/`sqrtsd` rows are 7.5x the oracle best, and ICX shows 11 is reachable | 86/84/87 vs 11/11/11 across four compilers | remove the aggregate slot round-trip for a scalar intrinsic result, then re-run the matrix |
+| TODO-13 | Scalar `maxsd`/`minsd`/`sqrtsd` rows are 7.5x the oracle best, and ICX shows 11 is reachable | 84/82/85 vs 11/11/11 across four compilers | remove the aggregate slot round-trip for a scalar intrinsic result, then re-run the matrix |
 | TODO-14 | Add ICX as a matrix oracle column | installed and verified above | extend `sse2_codegen_matrix.json` toolchains and regenerate |
+
+## 12. Post-audit corrections (final-tree review)
+
+A subsequent adversarial review of the shipped branch -- built and run, not
+only read -- found defects the sessions above did not. They are recorded here
+rather than edited silently into the earlier sections, because two of those
+sections' claims were false for the tree that actually shipped, and the
+record of *how* that happened is the useful part.
+
+### 12.1 `_mm_cvtsd_si32` did not link (regression introduced by this patch)
+
+The generic-SIMD table lost its `cvtsd2si128` entry and the backend its
+`CvtSd2Si128` arm, so any TU calling `_mm_cvtsd_si32` failed with
+`undefined reference to '__lccc_simd128_ps_cvtsd2si128'`. Section 9's
+"404 gates PASS, 2 FAIL" therefore cannot describe the shipped tree: that
+evidence predates the deletion. Restored, and the class is now closed by
+construction: `header_table_completeness_tests` extracts every
+`__lccc_simd*` symbol declared in `include/lcccsimd.h` and asserts the
+builtin resolver accepts it. The test was demonstrated failing on the
+missing entry before the restore and passing after.
+
+### 12.2 Eight AVX-512 wrappers named intrinsics that do not exist
+
+`include/lcccsimd.h` declared `_mm512_cmpeq_epi{32,64}` /
+`_mm512_cmpgt_epi{8,16,32,64}` *vector*-returning wrappers. No such Intel
+intrinsics exist (the real ones return mask registers, and those were
+already present), and the backend rejected the invented ops at emission.
+Removed end to end: generator tuples, generated header, IR ops, emitter
+arms, lookup entries.
+
+### 12.3 The fused AArch64 matmul arm was unreachable (pre-existing)
+
+Sections above describe AArch64 as selecting a "conservative nonfused"
+entry. It was not a policy: both AArch64 vectorizer entry points discarded
+the FP-contract bit (`FpContract::default()` unconditionally, dispatch
+routed on reassociation only), so `fmla` could not be emitted under any
+flags, including `-ffast-math` and the C default contract where x86-64
+fuses. The dispatch now enumerates the same (reassociation, contraction)
+matrix as x86; emission verified for five flag combinations
+(`fmla` at `-O2`, `-ffp-contract=fast`, `-ffast-math`, `-fassociative-math`;
+`fmul`/`fadd` only at `-ffp-contract=off`).
+
+### 12.4 Further corrections in this round
+
+* The matrix gate no longer excuses a vanished canonical mnemonic behind
+  an instruction shrink, isolates link failures per row instead of
+  blanking all 122 rows, and hashes FP edge values (NaN payloads, signed
+  zeroes, denormals, conversion range edges) instead of small integers
+  only. Section 5.4's confidence in the old hashes was overstated: on
+  whole-number inputs a `cvt`/`cvtt` swap or a NaN-semantics change is
+  invisible.
+* `_mm_cvtsd_si64` / `_mm_cvtss_si64` are now x86-64-only, matching GCC;
+  the previous state exposed them on i686 with a truncating fallback that
+  cannot express MXCSR rounding or the indefinite value on overflow.
+* `Cvtsd2Si64`/`Cvtss2Si64` joined their si32 siblings in the operand
+  width/alignment classification tables.
+* Benchmark licensing: `linux_list_sort` is GPL-2.0-only and
+  `gzip_longest_match` is GPL-3.0-or-later (not `-or-later` / LGPL as the
+  headers claimed); verified against the upstream files.
+* §10.4's test count (5724) is superseded: the current tree runs 5746
+  library tests green. §11.4's lccc column is corrected in place to the
+  shipped baseline (84/82/85).
+
+### 12.5 Dispositions left open, deliberately
+
+* **TODO-12** (AArch64 frame 96 -> 128 on main): the pin stands at the
+  measured 128 with the growth attributed to main's passes by bisection
+  evidence in the gate itself; recovering the 32 bytes / 6 instructions
+  remains future work. The reach-band contract the gate exists for is
+  unchanged and exact.
+* **Hot-web end-to-end witness**: no C program found in this round
+  (including two deliberately intensified variants of the shipped
+  witness, 8 and 14 recurrences against 12 and 16 cold holders) makes
+  `steal_hot_loop_webs` change emitted code; the base allocator homes the
+  hot values first. The mechanism is pinned by unit tests over synthetic
+  contexts (fire, refuse, pricing, protection). The steal stays as a
+  priced safety net; deleting a tested allocator mechanism because no
+  current witness fires is how the net disappears before the shape that
+  needs it arrives.
+* **TODO-2/3/4/5/13** (callback devirtualization, sibling calls, scalar
+  SD lowering, vector ABI): unchanged from section 6 -- separate changes
+  with their own differential evidence, not riders on this patch.

@@ -84,3 +84,45 @@ Ratings are engineering judgments, not measured probabilities:
 4. For runtime acceptance, compare identical compiler configurations and output on a quiet, pinned machine using randomized paired samples above 50 ms. Report dispersion and uncertainty. Preserve raw data. Obtain ICX only from an authorized stable/cache source if a three-vendor comparison is required.
 5. Prioritize callback devirtualization/clone specialization and direct min/max lowering using actual affected workloads. Treat sibling calls and public vector ABI as independent projects with interop and refusal tests. Preserve NaN, signed-zero, rounding, exceptions, and calling-convention semantics.
 6. Fetch/rebase current main on this session branch, regenerate the complete `ms178-1.patch`, and check exact application against that base. Keep descriptive recoverable snapshots after each validated repair, push this branch only, and update PR #918 without adding a validation section to its description.
+
+---
+
+## Addendum (final-tree review of the shipped branch)
+
+This audit's merge hold named three conditions. Their dispositions on the
+final tree, plus corrections to claims above that the shipped code does not
+support:
+
+1. **A genuine hot-web mechanism witness.** Not produced end-to-end, and
+   this addendum does not pretend otherwise: the shipped witness and two
+   intensified variants (8/14 call-spanning recurrences against 12/16 cold
+   holders) all compile byte-identically with the steal disabled, because
+   the base allocator now homes the hot values itself. What exists is a
+   unit-test witness set over synthetic allocation contexts (fire / refuse /
+   pricing / whole-web protection, including the two evict-scope tests this
+   branch adds) and a gate that asserts the structural contract without
+   demanding an assembly difference that correct allocation removes. The
+   mechanism is retained as a priced safety net on that evidence.
+
+2. **The AArch64 frame analysis.** Recorded in the gate itself
+   (`check_gla_cross_reach_band.sh`): the 96 -> 128 growth is main's
+   (96 at c8e9226bb, 128 at the branch base, 96 again with all passes
+   disabled), not this branch's; the pin was moved to the measured value
+   with the growth left as an open code-quality item (TODO-12), and the
+   reach-band identity the gate protects is untouched. The frame increase
+   is accepted for this patch on that attribution, not waived silently.
+
+3. **A complete frozen-tree fast run.** Required before merge; see the
+   final numbers recorded with this branch's last gate run. (The audit-era
+   "404 PASS / 2 FAIL" figure in the companion follow-up document predates
+   a regression that shipped in this patch -- `_mm_cvtsd_si32` failing to
+   link -- and must not be cited as final-tree evidence. It is corrected
+   there, in section 12.)
+
+One claim above is corrected outright: "AArch64 currently still selects a
+conservative nonfused two-wide entry even with fast contraction" described
+a defect as a policy. The AArch64 dispatch discarded the FP-contract bit,
+so the fused `fmla` arm was unreachable under every flag. That is fixed on
+this branch (contract-aware two-wide entries, emission-verified across
+five flag combinations); QEMU runtime differentials for the newly fused
+shapes remain the one evidence gap this addendum flags rather than fills.
