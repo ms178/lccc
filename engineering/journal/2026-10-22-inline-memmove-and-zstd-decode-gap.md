@@ -108,22 +108,144 @@ destination each end at a `PROT_NONE` page, so a single byte of over-read or
 over-store faults. `tests/regression/inline_memmove_const_sizes{,_nosse}.c`;
 GCC and Clang are the differential oracles.
 
-## Open lead (start here next time)
+## Resolved: the aggregate copy was the gap
 
-`CCC_DEBUG_SROA=1` on that TU splits three 24-byte, two-field allocas in
-`ZSTD_decompressSequencesLong_body` / `_Long_default` and **nothing** in
-`ZSTD_decompressSequences_default`, yet the latter's assembly contains a
-24-byte stack-to-stack aggregate copy per sequence
-(`lea 0x128(%rsp),%rdi; lea 0x140(%rsp),%rsi; movdqu ... ; mov ...`) followed
-by immediate reloads of the copied fields. That is the `seq_t`/`ZSTD_SequenceState`
-pair surviving in memory after the inliner replaced
-`ZSTD_decodeSequence(&seq, ...)`: the alloca's address escaped to a call at the
-time the pre-inline SROA ran, and the post-inline SROA at
-`src/passes/mod.rs:1902` then declined it. GCC promotes the fields to SSA and
-keeps them in registers. Re-running the aggregate split (or teaching it to
-re-scan allocas whose only escaping uses disappeared with inlining) is the
-first thing to try; it is the concrete difference behind the field reloads in
-the hot loop, and it is not attempted here.
+The lead below was correct and is now fixed. `aggregate_sroa` gained a fifth
+form (`src/passes/aggregate_sroa/byval.rs`) that coalesces a whole-object copy
+whose source dies at the copy: `tmp = s` becomes `tmp` *being* `s`.
 
-The decode gap is diagnosed, not fixed. Do not re-run the knob sweep or the
-link-order experiment; both are negative above.
+The two shapes in the IR are complementary, and neither existing form could
+express either:
+
+* the copy's destination is the inlined callee's by-value parameter, so it
+  escapes to a call — form 1 refuses an escaping destination, and form 4 must
+  refuse any object whose address reaches a call;
+* the copy's source is named by a `Memcpy`, which form 4 must refuse outright,
+  because a block copy is a byte-range operation that independent fields cannot
+  express.
+
+The proof that lets the copy disappear is a liveness statement about the
+*source*: `s` is a private, exact-size alloca, and no access to it can execute
+between the copy and any use of the destination. That has to be answered per
+program point, not per block, because the copy sits in a loop:
+`[body writes] -> copy -> use` is fine even though the body blocks are reachable
+from the copy through the back edge, since that path re-executes the copy first.
+`find_interference` does this with a forward walk from the copy and a backward
+walk from each use that stops at the copy's block.
+
+Once the copy is gone the object is named by no `Memcpy` and escapes to no call,
+so form 4 splits it and mem2reg promotes the fields; a by-value call still needs
+a contiguous image, which is rebuilt at the call site from the (now scalar)
+fields, gap bytes included, so the callee sees the same padding as before.
+
+Diagnostics for the form: `CCC_AGG_BYVAL_DEBUG=1` reports every candidate it
+declines, with the copy's block/instruction position and the reason, plus the
+field count of each plan it applies.  It never changes codegen.
+
+Two defects found while landing it, both kept as regression tests:
+
+* Renaming onto a *parameter home* is not sound with this IR's storage model.
+  A by-value aggregate parameter's home is the incoming argument area, filled by
+  backend ABI lowering rather than by an IR-visible store, and aliasing a local
+  onto it made `tests/regression/agg_copy_fwd_partial_rewrite.c` read the struct
+  at an 8-byte-wrong frame offset. Both sides now refuse parameter homes, which
+  is the same rule form 4 already applies (`func.param_alloca_values`).
+* A terminator naming the source object is an observer this pass cannot place
+  (`scan`'s escape set only walks instructions), so it refuses outright.
+
+### Measured
+
+`zstd -b2 -d`, same corpus, three binaries, best of two runs. `base` is the
+compiler without this change, `new` is with it:
+
+| input | gcc | base | new | base/gcc | new/gcc |
+|-------|-----|------|-----|----------|---------|
+| 98 MB log | 1801 | 649 | 1486 | 0.360 | **0.825** |
+| 5.4 MB json | 2044 | 1283 | 1398 | 0.628 | **0.684** |
+| 4.7 MB csv | 583 | 493 | 600 | 0.845 | **1.029** |
+| source text | 1540 | 1013 | 1309 | 0.657 | **0.850** |
+
+Wall-clock decode of the same files with the CLI is noisier on this host but
+shows the same direction (log 0.51 -> 0.83 of GCC). `ZSTD_decompressSequences_default`
+drops from 128 to 19 stack references in the repro shape and keeps all three
+sequence fields in registers; the remaining stack traffic in that function is
+`seqState_t` (a 112-byte object reached through variable-offset `GEP`s, which is
+a different problem) and twelve 16-byte `Loaddqu`/`Storedqu` vector temporaries
+that `vector_temp_promotion` leaves in place.
+
+The json input remains at 0.68 of GCC; swapping only
+`lib/decompress/zstd_decompress_block.o` for GCC's recovers ~10 % of that, so the
+remaining gap is still in that TU, split between `seqState_t` scalar replacement
+and the unresolved vector-temporary forwarding above.
+
+## Verification sweep: three IR-contract violations
+
+Adding `verify_after_pass` checkpoints after `inline`, `sret_copy_elision` and
+`aggregate_sroa` and running `CCC_VERIFY_IR=abort` over every zstd 1.5.7
+translation unit turned up three passes that hand the next pass malformed IR.
+All three are pre-existing (none is caused by the by-value copy work above);
+the sweep is what made them visible, and all three are fixed.
+
+1. **`sret_copy_elision`: intra-block use-before-def.** The inliner
+   materialises a callee-local aggregate at the call site, so an sret call can
+   be *followed* by the alloca of the object it will be copied into:
+
+   ```text
+   call  ZSTD_decodeSequence(%seq)      # sret, fills %seq
+   %d    = alloca 24                    # materialised at the call site
+   memcpy %d <- %seq, 24
+   load  %d[8]
+   ```
+
+   The retarget rewrote the call's hidden pointer to `%d`, defining `%d`
+   after its only use (`ZSTD_decompressSequencesSplitLitBuffer_default`
+   block 106: `v5308` defined at #3, used at #2). The pass now requires the
+   destination alloca to dominate the call and declines otherwise, leaving the
+   copy to the read-forwarding phase, which removes it anyway.
+
+   The same audit found the retarget unsound when an instruction between the
+   call and the copy touches the destination: the retarget moves the call's
+   write *earlier*, so an intervening reader observes the callee's bytes (it
+   used to see the object's previous value) and an intervening writer's bytes
+   survive the deleted copy (they used to be overwritten). Candidates with such
+   an instruction — or with a second retargeted call inside the window — are
+   declined.
+
+2. **`vector_temp_promotion::hoist_block_allocas` moved allocas above phis.**
+   The hoist exists to keep an alloca above the producer that a promotion
+   retargets at it, but it hoisted to index 0 unconditionally, pushing the
+   block's phi prefix below an `Alloca`. Allocas now hoist to the end of the
+   phi prefix, which still places them above every non-phi instruction.
+
+3. **The inliner under-reserved label space.** `merge_block_id` was derived
+   from `callee.max_block_id`, and `caller.next_label` advanced only to
+   `merge_block_id + 1`. When nested inlining had pushed the callee's live
+   labels past that hint, cloned blocks landed above the merge block and above
+   the caller's counter, so the next pass minting a label from `next_label`
+   reused a live one (`next_label=3947494193`, live max `3947503941` in
+   `ZSTD_compressSequencesAndLiterals`). Both are now reserved past the maximum
+   label actually present — the discipline the value-id path already documents
+   ("always reserve past the actual maximum present in the IR").
+
+Two doc-comment pseudo-code blocks in the x86 backend that made
+`cargo test --doc` fail to compile its own examples were fenced as `text`.
+
+### Measured after the fixes
+
+`zstd -b1 -d` (one second of in-process decoding per run), best of nine
+interleaved runs, so scheduling noise biases every binary the same way:
+
+| input | gcc 16.2 | base | new | base/gcc | new/gcc |
+|-------|----------|------|-----|----------|---------|
+| 98 MB log | 1709 | 711 | 1567 | 0.416 | **0.917** |
+| 5.4 MB json | 2218 | 1445 | 1863 | 0.651 | **0.840** |
+| 4.7 MB csv | 717 | 516 | 613 | 0.719 | **0.855** |
+| source text | 1626 | 1024 | 1342 | 0.630 | **0.825** |
+
+The by-value coalescing plus these fixes are worth 1.41x–2.20x over the
+baseline compiler and close 55–95 % of each file's gap to GCC. What is left is
+not one shape: `ZSTD_decompressSequencesLong_default` (2517 instructions, 871
+frame-relative memory operands, against GCC's 1786/401) is the level-19
+hot path and its frame traffic is `seqState_t` plus the sequence ring, not the
+sequence object; `ZSTD_safecopy` still keeps its marching pointer in memory
+(211/58 against 152/0).

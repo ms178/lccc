@@ -4694,8 +4694,22 @@ fn inline_call_site(
         }
     }
 
-    // Create a merge block that the callee's return statements will branch to
-    let merge_block_id = BlockId(block_offset + callee.max_block_id + 1);
+    // Create a merge block that the callee's return statements will branch to.
+    // `callee.max_block_id` is the same kind of hint that `next_value_id` is:
+    // structural transforms inside the callee (nested inlining included) can
+    // leave it below the labels actually live, so reserve past the maximum
+    // present in the IR. Otherwise a cloned block gets a label above the merge
+    // block — and above the caller's `next_label`, which is only advanced to
+    // `merge_block_id + 1` — so the next pass that mints a label from that
+    // counter collides with a live block.
+    let callee_max_label = callee
+        .blocks
+        .iter()
+        .map(|block| block.label.0)
+        .max()
+        .unwrap_or(0)
+        .max(callee.max_block_id);
+    let merge_block_id = BlockId(block_offset + callee_max_label + 1);
 
     // Collect return values from all return blocks to build a Phi node.
     // Each Return(Some(val)) becomes a branch to the merge block, and
@@ -5266,7 +5280,7 @@ fn inline_call_site(
 
     // Update the global max block ID so subsequent inlines use fresh IDs.
     // The merge block has the highest ID we assigned.
-    *global_max_block_id = merge_block_id.0;
+    *global_max_block_id = (*global_max_block_id).max(merge_block_id.0);
 
     // The caller's label namespace must be advanced past every block we just
     // cloned. Without this, a later pass that allocates fresh block labels
@@ -5274,7 +5288,16 @@ fn inline_call_site(
     // blocks' labels, corrupting CFG edges — observed as an infinite
     // self-loop / out-of-bounds read in the lea_sib_fold -O2 regression
     // (exit CondBranch retargeted onto the loop header).
-    caller.next_label = std::cmp::max(caller.next_label, merge_block_id.0 + 1);
+    let caller_max_label = caller
+        .blocks
+        .iter()
+        .map(|block| block.label.0)
+        .max()
+        .unwrap_or(0);
+    caller.next_label = caller
+        .next_label
+        .max(caller_max_label.saturating_add(1))
+        .max(merge_block_id.0.saturating_add(1));
 
     // The cloned body keeps the stricter builtin contract of either source
     // context. This matters for GNU extern-inline implementations of libc

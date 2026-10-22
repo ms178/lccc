@@ -949,6 +949,7 @@ fn run_inline_phase(
     {
         dump_ir_filtered(module, "pre-loop after inliner");
     }
+    verify::verify_after_pass(module, "inline");
 
     // After inlining, convert extern inline gnu_inline functions to declarations —
     // but ONLY when no calls remain. The bodies were only needed for inlining;
@@ -996,6 +997,7 @@ fn run_inline_phase(
     if std::env::var_os("CCC_NO_SRET_COPY_ELISION").is_none() {
         module.for_each_function(sret_copy_elision::run);
     }
+    verify::verify_after_pass(module, "sret_copy_elision");
     iphase_dump!("sret-copy-elision");
     // Copy forwarding can expose another temporary in a copy chain
     // (`object -> tmp1 -> tmp2 -> field load`), so run to a small fixed point.
@@ -1927,6 +1929,12 @@ pub(crate) fn run_passes(
         constant_fold::run(module);
         copy_prop::run(module);
         aggregate_sroa::run(module);
+        // The pass rewrites pointers in place, replaces values, deletes
+        // instructions and appends block-relative inserts, all in one plan
+        // applied against one snapshot. Charge it with its own verification
+        // point: nothing downstream should be the first thing to notice a
+        // malformed rebuild (`CCC_VERIFY_IR=abort`).
+        verify::verify_after_pass(module, "aggregate_sroa");
         crate::ir::mem2reg::promote_allocas_with_params(module);
         copy_prop::run(module);
         module.for_each_function(dce::eliminate_dead_code);
@@ -2189,6 +2197,7 @@ pub(crate) fn run_passes(
                 constant_fold::run(module);
                 copy_prop::run(module);
                 aggregate_sroa::run(module);
+                verify::verify_after_pass(module, "aggregate_sroa");
                 crate::ir::mem2reg::promote_allocas_with_params(module);
                 copy_prop::run(module);
                 module.for_each_function(dce::eliminate_dead_code);
@@ -3347,6 +3356,7 @@ pub(crate) fn run_passes(
     if std::env::var_os("CCC_NO_SRET_COPY_ELISION").is_none() {
         module.for_each_function(sret_copy_elision::run);
     }
+    verify::verify_after_pass(module, "sret_copy_elision");
     if !std::env::var("CCC_NO_AGG_COPY_FWD").is_ok() {
         for _ in 0..8 {
             if module.for_each_function(aggregate_copy_forward::run) == 0 {

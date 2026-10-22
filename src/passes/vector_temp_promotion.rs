@@ -805,51 +805,52 @@ fn destination_unobserved_between(
 /// reads no operand, so moving it earlier within its own block is always
 /// semantics-preserving; hoisting the whole class at once also covers any
 /// future producer shape instead of patching this one site.
+///
+/// The hoist target is the end of the block's *phi prefix*, not index 0:
+/// phis must remain a contiguous prefix (the IR contract this same rewrite
+/// exists to honour), so an alloca may only move above the non-phi body.
 fn hoist_block_allocas(block: &mut BasicBlock) {
+    let phi_prefix = block
+        .instructions
+        .iter()
+        .take_while(|inst| matches!(inst, Instruction::Phi { .. }))
+        .count();
     // Fast path: the lowering emits allocas clustered at the head, so most
     // blocks have nothing below the first non-alloca. `skip_while` eats the
     // head cluster; `any` then finds a late alloca iff one exists.
-    let late_alloca = block
-        .instructions
+    let late_alloca = block.instructions[phi_prefix..]
         .iter()
         .skip_while(|inst| matches!(inst, Instruction::Alloca { .. }))
         .any(|inst| matches!(inst, Instruction::Alloca { .. }));
     if !late_alloca {
         return;
     }
-    let is_alloca: Vec<bool> = block
-        .instructions
-        .iter()
-        .map(|inst| matches!(inst, Instruction::Alloca { .. }))
+    // Permutation: phi prefix, then every alloca from the body, then the rest.
+    let mut order: Vec<usize> = Vec::with_capacity(block.instructions.len());
+    order.extend(0..phi_prefix);
+    order.extend(
+        (phi_prefix..block.instructions.len())
+            .filter(|&i| matches!(block.instructions[i], Instruction::Alloca { .. })),
+    );
+    order.extend(
+        (phi_prefix..block.instructions.len())
+            .filter(|&i| !matches!(block.instructions[i], Instruction::Alloca { .. })),
+    );
+    // `order` is a permutation, so every slot is taken exactly once; the
+    // `filter_map` cannot drop anything and keeps this free of panics.
+    let mut slot: Vec<Option<Instruction>> = std::mem::take(&mut block.instructions)
+        .into_iter()
+        .map(Some)
         .collect();
-    let mut hoisted = Vec::with_capacity(block.instructions.len());
-    let mut rest = Vec::with_capacity(block.instructions.len());
-    for inst in std::mem::take(&mut block.instructions) {
-        if matches!(inst, Instruction::Alloca { .. }) {
-            hoisted.push(inst);
-        } else {
-            rest.push(inst);
-        }
-    }
-    block.instructions = hoisted;
-    block.instructions.extend(rest);
-    // Same positional filter for the spans (the shared discipline: in
-    // lockstep when parallel, cleared when stale).
-    if block.source_spans.len() == is_alloca.len() {
-        let mut hoisted_spans = Vec::with_capacity(is_alloca.len());
-        let mut rest_spans = Vec::with_capacity(is_alloca.len());
-        for (keep_alloca, span) in is_alloca
+    block.instructions = order.iter().filter_map(|&i| slot[i].take()).collect();
+    // Same permutation for the spans (the shared discipline: in lockstep when
+    // parallel, cleared when stale).
+    if block.source_spans.len() == order.len() {
+        let mut spans: Vec<Option<_>> = std::mem::take(&mut block.source_spans)
             .into_iter()
-            .zip(std::mem::take(&mut block.source_spans))
-        {
-            if keep_alloca {
-                hoisted_spans.push(span);
-            } else {
-                rest_spans.push(span);
-            }
-        }
-        block.source_spans = hoisted_spans;
-        block.source_spans.extend(rest_spans);
+            .map(Some)
+            .collect();
+        block.source_spans = order.iter().filter_map(|&i| spans[i].take()).collect();
     }
 }
 
@@ -2271,6 +2272,76 @@ mod tests {
             dest_ptr: dest_ptr.map(Value),
             args,
         }
+    }
+
+    /// `hoist_block_allocas` must not push an alloca above the block's phis:
+    /// phis are required to stay a contiguous prefix.
+    #[test]
+    fn alloca_hoist_stops_below_the_phi_prefix() {
+        let mut b = block(
+            0,
+            vec![
+                Instruction::Phi {
+                    dest: Value(1),
+                    ty: IrType::I32,
+                    incoming: vec![
+                        (Operand::Const(IrConst::I32(0)), BlockId(7)),
+                        (Operand::Const(IrConst::I32(1)), BlockId(8)),
+                    ],
+                },
+                Instruction::Store {
+                    val: Operand::Value(Value(1)),
+                    ptr: Value(9),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                alloca(5, 16, 16),
+            ],
+        );
+        hoist_block_allocas(&mut b);
+        assert!(
+            matches!(b.instructions[0], Instruction::Phi { .. }),
+            "the phi must stay first, got {:?}",
+            b.instructions[0]
+        );
+        assert!(
+            matches!(b.instructions[1], Instruction::Alloca { .. }),
+            "the alloca must sit right below the phi prefix, got {:?}",
+            b.instructions[1]
+        );
+        assert!(matches!(b.instructions[2], Instruction::Store { .. }));
+        assert_eq!(b.source_spans.len(), b.instructions.len());
+    }
+
+    #[test]
+    fn alloca_hoist_keeps_relative_order_and_spans() {
+        let mut b = block(
+            0,
+            vec![
+                Instruction::Store {
+                    val: Operand::Value(Value(9)),
+                    ptr: Value(8),
+                    ty: IrType::I32,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                alloca(1, 16, 16),
+                alloca(2, 32, 32),
+            ],
+        );
+        b.source_spans = vec![Span::dummy(); 3];
+        hoist_block_allocas(&mut b);
+        assert!(matches!(
+            b.instructions[0],
+            Instruction::Alloca { dest, .. } if dest == Value(1)
+        ));
+        assert!(matches!(
+            b.instructions[1],
+            Instruction::Alloca { dest, .. } if dest == Value(2)
+        ));
+        assert!(matches!(b.instructions[2], Instruction::Store { .. }));
+        assert_eq!(b.source_spans.len(), 3);
     }
 
     #[test]

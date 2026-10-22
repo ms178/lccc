@@ -34,8 +34,10 @@ HOOKS=$(grep -c 'verify::verify_after_pass(module,' src/passes/mod.rs || true)
 # Literal sites, "<count> <pass>", sorted by name.  Duplicates are real: the
 # pass is wired at two distinct points (pre-loop and in-loop / O1 and O2).
 WANT_LITERAL=$(sort -k2 <<'EOF'
+2 aggregate_sroa
 2 fmanegpeel
 1 fp_double
+1 inline
 1 intbounds
 1 load_forward
 2 loop_carried_forward
@@ -46,6 +48,7 @@ WANT_LITERAL=$(sort -k2 <<'EOF'
 1 reassoc_lat
 1 slp
 1 slp_late
+2 sret_copy_elision
 1 vecaddr
 1 vecfma
 1 vecrelations
@@ -73,7 +76,7 @@ for funnel in iphase_dump o1_checkpoint preloop_dump timed_pass; do
     grep -q "macro_rules! $funnel" src/passes/mod.rs \
         || { echo "FAIL: hook funnel $funnel is gone from src/passes/mod.rs" >&2; exit 1; }
 done
-WANT_HOOKS=23
+WANT_HOOKS=28
 if [ "$HOOKS" -ne "$WANT_HOOKS" ]; then
     echo "FAIL: $HOOKS verify::verify_after_pass hooks in src/passes/mod.rs, pinned at $WANT_HOOKS." >&2
     echo "      If a pass hook was added/removed on purpose, update WANT_HOOKS in this same change." >&2
