@@ -349,13 +349,15 @@ impl X86Codegen {
     /// `pmuludq` plus the shuffles that select the half of each 64-bit
     /// product we want, and the result is bit-identical to `pmulld`:
     ///
-    ///     lo = pmuludq(x, y)         ; dwords [x0*y0, hi, x2*y2, hi]
-    ///     xh = psrlq(x, 32)          ; x1, x3 in the low dwords
-    ///     yh = psrlq(y, 32)
-    ///     hi = pmuludq(xh, yh)       ; dwords [x1*y1, hi, x3*y3, hi]
-    ///     lo = pshufd(lo, 0x08)      ; [x0*y0, x2*y2, x0*y0, x2*y2]
-    ///     hi = pshufd(hi, 0x08)      ; [x1*y1, x3*y3, x1*y1, x3*y3]
-    ///     r  = punpckldq(hi, lo)     ; [x0*y0, x1*y1, x2*y2, x3*y3]
+    /// ```text
+    /// lo = pmuludq(x, y)         ; dwords [x0*y0, hi, x2*y2, hi]
+    /// xh = psrlq(x, 32)          ; x1, x3 in the low dwords
+    /// yh = psrlq(y, 32)
+    /// hi = pmuludq(xh, yh)       ; dwords [x1*y1, hi, x3*y3, hi]
+    /// lo = pshufd(lo, 0x08)      ; [x0*y0, x2*y2, x0*y0, x2*y2]
+    /// hi = pshufd(hi, 0x08)      ; [x1*y1, x3*y3, x1*y1, x3*y3]
+    /// r  = punpckldq(hi, lo)     ; [x0*y0, x1*y1, x2*y2, x3*y3]
+    /// ```
     ///
     /// The `pshufd` pair is not decoration: `pmuludq` writes a full 64-bit
     /// product into each lane, so the ODD dword of every lane holds the HIGH

@@ -30,7 +30,30 @@ def execute(binary, count):
     return r, elapsed
 
 
+def retain_correct_candidates(row, valid, expected):
+    """Keep only binaries whose one-shot output matches GCC's receipt.
+
+    The historical --before build is diagnostic, not a required oracle: an
+    old implementation may compile and return successfully while producing
+    the defect this probe is meant to measure. Record that mismatch and omit
+    it from timing. A mismatch from after/GCC/Clang invalidates the run.
+    """
+    for compiler in tuple(valid):
+        artifact = row['artifacts'][compiler]
+        matches = artifact['stdout'] == expected
+        artifact['output_matches_gcc'] = matches
+        if matches:
+            artifact['status'] = 'correct'
+        elif compiler == 'before':
+            artifact['status'] = 'correctness-mismatch'
+            del valid[compiler]
+        else:
+            artifact['status'] = 'correctness-mismatch'
+            raise RuntimeError(f"{row['name']}/{compiler}: vendor/candidate checksums differ")
+
+
 def main():
+
     ap = argparse.ArgumentParser(description=__doc__)
     for name in ('before', 'after', 'gcc', 'clang', 'before-include', 'output'):
         ap.add_argument('--' + name, required=True, type=Path)
@@ -69,6 +92,7 @@ def main():
             artifact = dict(command=cmd, compile_exit=r.returncode, diagnostics=r.stderr)
             row['artifacts'][k] = artifact
             if r.returncode:
+                artifact['status'] = 'compile-failure'
                 if k != 'before':
                     raise RuntimeError(f'{name}/{k} failed to compile: {r.stderr}')
                 continue
@@ -76,13 +100,13 @@ def main():
             artifact.update(binary_sha256=digest(binary), run_exit=result.returncode,
                             stdout=result.stdout.decode(), stderr=result.stderr.decode())
             if result.returncode:
+                artifact['status'] = 'runtime-failure'
                 if k != 'before':
                     raise RuntimeError(f'{name}/{k} failed independent lane checks')
                 continue
             valid[k] = binary
         expected = row['artifacts']['gcc']['stdout']
-        if not all(row['artifacts'][k]['stdout'] == expected for k in valid):
-            raise RuntimeError(f'{name}: vendor/candidate checksums differ')
+        retain_correct_candidates(row, valid, expected)
         count = 1
         while True:
             durations = [execute(b, count)[1] for b in valid.values()]

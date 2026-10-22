@@ -34,6 +34,39 @@ class ConversionHeaders(unittest.TestCase):
                 with self.subTest(width=width, name=name):
                     self.assertEqual(header.count(signature), 1)
 
+    def test_fp_builtin_prototypes_preserve_element_and_result_types(self):
+        header = (ROOT / 'include/lcccsimd.h').read_text()
+        contracts = [
+            (128, 'divpd128', '__m128d', ['__m128d __a', '__m128d __b']),
+            (128, 'minpd128', '__m128d', ['__m128d __a', '__m128d __b']),
+            (128, 'haddpd128', '__m128d', ['__m128d __a', '__m128d __b']),
+            (128, 'roundpd128', '__m128d', ['__m128d __a']),
+            (128, 'dppd128', '__m128d', ['__m128d __a', '__m128d __b']),
+            (128, 'cmppd128', '__m128d', ['__m128d __a', '__m128d __b']),
+            (128, 'shufpd128', '__m128d', ['__m128d __a', '__m128d __b']),
+            (128, 'blendvpd128', '__m128d', ['__m128d __mask', '__m128d __a', '__m128d __b']),
+            (128, 'fmadd132pd128', '__m128d', ['__m128d __a', '__m128d __b', '__m128d __c']),
+            (128, 'movsd128', '__m128d', ['__m128d __a', '__m128d __b']),
+            (128, 'extractps128', 'int', ['__m128 __a']),
+            (256, 'vdivpd256', '__m256d', ['__m256d __a', '__m256d __b']),
+            (256, 'vsqrtpd256', '__m256d', ['__m256d __a']),
+            (256, 'vroundpd256', '__m256d', ['__m256d __a']),
+            (256, 'vpermilpd256', '__m256d', ['__m256d __a']),
+            (256, 'vcmppd256', '__m256d', ['__m256d __a', '__m256d __b']),
+            (256, 'vblendvpd256', '__m256d', ['__m256d __mask', '__m256d __a', '__m256d __b']),
+            (256, 'vfmadd132pd256', '__m256d', ['__m256d __a', '__m256d __b', '__m256d __c']),
+            (256, 'vperm2f128pd', '__m256d', ['__m256d __a', '__m256d __b']),
+            (256, 'vinsertf128pd', '__m256d', ['__m256d __a', '__m128d __b']),
+            (256, 'vextractf128pd', '__m128d', ['__m256d __a']),
+        ]
+        for width, mnemonic, result, args in contracts:
+            signature = (
+                f'{result} __lccc_simd{width}_ps_{mnemonic}'
+                f'({", ".join(["long", *args])});'
+            )
+            with self.subTest(width=width, mnemonic=mnemonic):
+                self.assertIn(signature, header)
+
     def test_scalar_and_cast_signatures(self):
         header = (ROOT / 'include/lcccsimd.h').read_text()
         for fragment in (

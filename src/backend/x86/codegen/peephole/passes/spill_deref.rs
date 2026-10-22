@@ -1211,6 +1211,14 @@ pub(super) fn fold_entry_load_relay(store: &mut LineStore, infos: &mut [LineInfo
             let Some((mnemonic, rest)) = t.split_once(' ') else {
                 break;
             };
+            // Retargeting moves the original read to the relay point. Even a
+            // `mov*`/`xor*` line can be an aliasing load or store, so only
+            // cross register/immediate-only instructions; an unknown memory
+            // operand is a hard barrier rather than a reason to assume no
+            // alias.
+            if t.contains('(') || t.contains('[') {
+                break;
+            }
             if !matches!(mnemonic, "movl" | "movq" | "movslq" | "xorl") {
                 break;
             }
@@ -1266,7 +1274,7 @@ mod entry_load_relay_tests {
     }
     #[test]
     fn entry_load_retargets_zero_extended_wide_relay() {
-        let (changed, out) = fold("    movl 12(%rdi), %edx\n", "");
+        let (changed, out) = fold("    movl %edx, %r8d\n", "");
         assert!(changed && out.contains("movl 8(%rdi), %r9d"), "{out}");
         assert!(!out.contains("movq %r12, %r9"), "{out}");
     }
@@ -1282,5 +1290,18 @@ mod entry_load_relay_tests {
             let (changed, out) = fold(middle, tail);
             assert!(!changed, "{out}");
         }
+    }
+
+    #[test]
+    fn entry_load_relay_refuses_intervening_aliasing_memory_write() {
+        // Retargeting the entry load past this store would read 42 instead of
+        // the original memory value. The source load and clobber deliberately
+        // name the same address; unknown memory operands must remain barriers.
+        let (changed, out) = fold("    movl $42, 8(%rdi)\n", "");
+        assert!(
+            !changed,
+            "the memory read must not cross an aliasing write: {out}"
+        );
+        assert!(out.contains("movl 8(%rdi), %r12d"), "{out}");
     }
 }

@@ -320,12 +320,15 @@ FP256_FMA = [
     ("fmadd_pd", "vfmadd132pd256", "__m256d", "M256D"),
 ]
 FP256_MISC = [
-    ("permute2f128_ps", "vperm2f128", "__m256", "M256"),
-    ("permute2f128_pd", "vperm2f128", "__m256d", "M256D"),
-    ("insertf128_ps", "vinsertf128", "__m256", "M256"),
-    ("insertf128_pd", "vinsertf128", "__m256d", "M256D"),
-    ("extractf128_ps", "vextractf128", "__m128", "M128"),
-    ("extractf128_pd", "vextractf128", "__m128d", "M128D"),
+    # These encodings move raw 128-bit lanes, but their C wrapper types differ
+    # between ps and pd. Give the compiler builtins distinct names so each
+    # declaration remains type-correct instead of overloading one C symbol.
+    ("permute2f128_ps", "vperm2f128ps", "__m256", "M256"),
+    ("permute2f128_pd", "vperm2f128pd", "__m256d", "M256D"),
+    ("insertf128_ps", "vinsertf128ps", "__m256", "M256"),
+    ("insertf128_pd", "vinsertf128pd", "__m256d", "M256D"),
+    ("extractf128_ps", "vextractf128ps", "__m128", "M128"),
+    ("extractf128_pd", "vextractf128pd", "__m128d", "M128D"),
 ]
 
 # ------------------------------------------------------------- emit -------
@@ -573,7 +576,7 @@ for name, mn, rty in REDUCE:
 # ---- 128-bit FP ----
 for name, mn in FP128_BIN:
     vty, m = ("__m128", "M128") if name.endswith("_ps") else ("__m128d", "M128D")
-    proto(f"128_ps_{mn}", "m128", ["long", "__m128 __a", "__m128 __b"])
+    proto(f"128_ps_{mn}", vty[2:], ["long", vty + " __a", vty + " __b"])
     wrap(f"{vty} _mm_{name}({vty} __a, {vty} __b)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __a, __b)); }}")
 # Conversions have independent source/result element types and widths.
@@ -618,20 +621,20 @@ for name, mn, rty, m in FP128_SCALAR:
     wrap(f"{rty} _mm_{name}({vty} __a)",
          f"{{ return ({rty})__lccc_simd128_ps_{mn}(0, __a); }}")
 for name, mn, rty, m in FP128_UIMM:
-    proto(f"128_ps_{mn}", "m128", ["long", "__m128 __a"])
+    proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __a"])
     macro(f"_mm_{name}(__a, __imm)",
           f"__CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(__imm, __a))")
 for name, mn, rty, m in FP128_BIMM:
-    proto(f"128_ps_{mn}", "m128", ["long", "__m128 __a", "__m128 __b"])
+    proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b"])
     macro(f"_mm_{name}(__a, __b, __imm)",
           f"__CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(__imm, __a, __b))")
 # _mm_extract_ps(a, imm) -> int
-proto("128_ps_extractps128", "m128", ["long", "__m128 __a"])
+w("int __lccc_simd128_ps_extractps128(long, __m128 __a);")
 macro("_mm_extract_ps(__a, __imm)",
       "(int)__lccc_simd128_ps_extractps128(__imm, __a)")
 
 for name, mn, rty, m, imm in FP128_CMP:
-    proto(f"128_ps_{mn}", "m128", ["long", "__m128 __a", "__m128 __b"])
+    proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b"])
     macro(f"_mm_{name}(__a, __b)",
           f"__CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}({imm}, __a, __b))")
 # generic _mm_cmp_ps/_mm_cmp_pd(a, b, imm)
@@ -642,19 +645,19 @@ macro("_mm_cmp_pd(__a, __b, __imm)",
       "__CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cmppd128(__imm, __a, __b))")
 
 for name, mn, rty, m in FP128_SHUF:
-    proto(f"128_ps_{mn}", "m128", ["long", "__m128 __a", "__m128 __b"])
+    proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b"])
     macro(f"_mm_{name}(__a, __b, __imm)",
           f"__CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(__imm, __a, __b))")
 for name, mn, rty, m in FP128_BLENDV:
-    proto(f"128_ps_{mn}", "m128", ["long", "__m128 __mask", "__m128 __a", "__m128 __b"])
+    proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __mask", rty + " __a", rty + " __b"])
     wrap(f"{rty} _mm_{name}({rty} __a, {rty} __b, {rty} __mask)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __mask, __a, __b)); }}")
 for name, mn, rty, m in FP128_FMA:
-    proto(f"128_ps_{mn}", "m128", ["long", "__m128 __a", "__m128 __b", "__m128 __c"])
+    proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b", rty + " __c"])
     wrap(f"{rty} _mm_{name}({rty} __a, {rty} __b, {rty} __c)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __a, __b, __c)); }}")
 for name, mn, rty, m in FP128_MOV:
-    proto(f"128_ps_{mn}", "m128", ["long", "__m128 __a", "__m128 __b"])
+    proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b"])
     wrap(f"{rty} _mm_{name}({rty} __a, {rty} __b)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __a, __b)); }}")
 for name, mn, rty, m in FP128_CVT2:
@@ -672,7 +675,7 @@ for name, mn, rty, m in FP128_SI2FP:
 # ---- 256-bit FP ----
 for name, mn in FP256_BIN:
     vty, m = ("__m256", "M256") if name.endswith("_ps") else ("__m256d", "M256D")
-    proto(f"256_ps_{mn}", "m256", ["long", "__m256 __a", "__m256 __b"])
+    proto(f"256_ps_{mn}", vty[2:], ["long", vty + " __a", vty + " __b"])
     wrap(f"{vty} _mm256_{name}({vty} __a, {vty} __b)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(0, __a, __b)); }}")
 FP256_VAR = [x for x in FP256_UNI if x[0].startswith("permutevar")]
@@ -681,7 +684,7 @@ for name, mn in FP256_UNI:
     if name.startswith("cvt"):
         continue
     vty, m = ("__m256", "M256") if name.endswith("_ps") else ("__m256d", "M256D")
-    proto(f"256_ps_{mn}", "m256", ["long", "__m256 __a"])
+    proto(f"256_ps_{mn}", vty[2:], ["long", vty + " __a"])
     wrap(f"{vty} _mm256_{name}({vty} __a)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(0, __a)); }}")
 for name, mn in FP256_VAR:
@@ -698,40 +701,42 @@ for name, mn, rty, m in FP256_SCALAR:
     wrap(f"{rty} _mm256_{name}({params})",
          f"{{ return __lccc_simd256_ps_{mn}(0, {operands}); }}")
 for name, mn, rty, m in FP256_UIMM:
-    proto(f"256_ps_{mn}", "m256", ["long", "__m256 __a"])
+    proto(f"256_ps_{mn}", rty[2:], ["long", rty + " __a"])
     macro(f"_mm256_{name}(__a, __imm)",
           f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(__imm, __a))")
 for name, mn, rty, m in FP256_BIMM:
-    proto(f"256_ps_{mn}", "m256", ["long", "__m256 __a", "__m256 __b"])
+    proto(f"256_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b"])
     macro(f"_mm256_{name}(__a, __b, __imm)",
           f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(__imm, __a, __b))")
 for name, mn, rty, m, imm in FP256_CMP:
-    proto(f"256_ps_{mn}", "m256", ["long", "__m256 __a", "__m256 __b"])
+    proto(f"256_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b"])
     macro(f"_mm256_{name}(__a, __b)",
           f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}({imm}, __a, __b))")
 for name, mn, rty, m in FP256_SHUF:
-    proto(f"256_ps_{mn}", "m256", ["long", "__m256 __a", "__m256 __b"])
+    proto(f"256_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b"])
     macro(f"_mm256_{name}(__a, __b, __imm)",
           f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(__imm, __a, __b))")
 for name, mn, rty, m in FP256_BLENDV:
-    proto(f"256_ps_{mn}", "m256", ["long", "__m256 __mask", "__m256 __a", "__m256 __b"])
+    proto(f"256_ps_{mn}", rty[2:], ["long", rty + " __mask", rty + " __a", rty + " __b"])
     wrap(f"{rty} _mm256_{name}({rty} __a, {rty} __b, {rty} __mask)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(0, __mask, __a, __b)); }}")
 for name, mn, rty, m in FP256_FMA:
-    proto(f"256_ps_{mn}", "m256", ["long", "__m256 __a", "__m256 __b", "__m256 __c"])
+    proto(f"256_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b", rty + " __c"])
     wrap(f"{rty} _mm256_{name}({rty} __a, {rty} __b, {rty} __c)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(0, __a, __b, __c)); }}")
 for name, mn, rty, m in FP256_MISC:
     if name.startswith("extract"):
-        proto(f"256_ps_{mn}", "m256", ["long", "__m256 __a"])
+        src_ty = "__m256" if name.endswith("_ps") else "__m256d"
+        proto(f"256_ps_{mn}", rty[2:], ["long", src_ty + " __a"])
         macro(f"_mm256_{name}(__a, __imm)",
               f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(__imm, __a))")
     elif name.startswith("insert"):
-        proto(f"256_ps_{mn}", "m256", ["long", "__m256 __a", "__m128 __b"])
+        half_ty = "__m128" if name.endswith("_ps") else "__m128d"
+        proto(f"256_ps_{mn}", rty[2:], ["long", rty + " __a", half_ty + " __b"])
         macro(f"_mm256_{name}(__a, __b, __imm)",
               f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(__imm, __a, __b))")
     else:
-        proto(f"256_ps_{mn}", "m256", ["long", "__m256 __a", "__m256 __b"])
+        proto(f"256_ps_{mn}", rty[2:], ["long", rty + " __a", rty + " __b"])
         macro(f"_mm256_{name}(__a, __b, __imm)",
               f"__CCC_{m}_FROM_BUILTIN(__lccc_simd256_ps_{mn}(__imm, __a, __b))")
 # generic 256 cmp

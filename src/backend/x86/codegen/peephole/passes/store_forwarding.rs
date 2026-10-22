@@ -1113,18 +1113,30 @@ fn gsf_handle_load_xmm(
             is_xmm_family(mapping.reg_id) && mapping.size.byte_size() >= load_size.byte_size();
         if xmm_serves {
             let src = mapping.reg_id;
-            if src == dst && load_size == MoveSize::DQ {
+            let vex_load = infos[i].trimmed(store.get(i)).starts_with('v');
+            let same_reg_dq = src == dst && load_size == MoveSize::DQ;
+            if same_reg_dq && (!vex_load || fp.upper_regions_dead_after(i, (dst - 24) as u32)) {
                 // A 16-byte home read back into the very register that wrote
-                // it rewrites all 128 bits with the values they already hold:
-                // the load is a no-op. This is valid ONLY at full width — a
-                // narrower reload still has to zero the bits above its own
-                // width (see `fp_store_fp_load_same_register_keeps_zeroing`).
-                // A frame-slot read has no other observable effect: volatile
+                // it rewrites all 128 low bits with the values they already
+                // hold. A LEGACY load is therefore a no-op. A VEX load is a
+                // no-op only when its architectural YMM/ZMM upper-zero effect
+                // is dead; otherwise leave it in place. This is valid ONLY
+                // at full width — a narrower reload still has to zero the
+                // bits above its own width (see
+                // `fp_store_fp_load_same_register_keeps_zeroing`). A
+                // frame-slot read has no other observable effect: volatile
                 // slots are reclassified as pinned `Other` lines before this
                 // pass runs.
                 mark_nop(&mut infos[i]);
                 changed = true;
                 load_still_writes_xmm = false;
+            } else if same_reg_dq {
+                // VEX.128 loads zero bits 128..MAXVL. The original load is
+                // the only operation in this relay that carries that write;
+                // retaining it is required when a later YMM/ZMM use observes
+                // the cleared upper lanes. Deleting it here would leave stale
+                // upper bits after a register-to-slot-to-same-register round
+                // trip.
             } else if try_pair_fuse_xmm_relay(store, infos, i, src, dst, load_size, fp) {
                 mark_nop(&mut infos[i]);
                 changed = true;
@@ -2516,8 +2528,8 @@ mod tests {
     #[test]
     fn dq_full_width_self_reload_is_a_nop() {
         // All 128 bits are rewritten with the values they already hold, so
-        // the reload has no architectural effect. (At narrower widths it DOES:
-        // see `fp_store_fp_load_same_register_keeps_zeroing`.)
+        // a legacy reload has no architectural effect. (At narrower widths it
+        // DOES: see `fp_store_fp_load_same_register_keeps_zeroing`.)
         let asm = concat!(
             "f:\n",
             ".cfi_startproc\n",
@@ -2531,6 +2543,47 @@ mod tests {
         assert!(
             !out.contains("72(%rsp), %xmm6"),
             "a full-width self reload is a no-op: {out}"
+        );
+    }
+
+    #[test]
+    fn vex_dq_self_reload_is_elided_when_upper_regions_are_dead() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    vmovdqu %xmm6, 72(%rsp)\n",
+            "    movq %rcx, %r10\n",
+            "    vmovdqu 72(%rsp), %xmm6\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (out, _) = forward_only(asm);
+        assert!(
+            !out.contains("72(%rsp), %xmm6"),
+            "the VEX self reload can be removed when its upper-zeroing effect is dead: {out}"
+        );
+    }
+
+    #[test]
+    fn vex_dq_self_reload_keeps_live_ymm_zmm_upper_zeroing() {
+        // `vmovdqu m128, %xmm6` has a register-level effect beyond the 16
+        // bytes read from the slot: VEX zeros bits 128..MAXVL. The low 128
+        // bits are already identical to the backing value, but a later ZMM
+        // store observes those upper lanes, so the load cannot be deleted.
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    vmovdqu %xmm6, 72(%rsp)\n",
+            "    movq %rcx, %r10\n",
+            "    vmovdqu 72(%rsp), %xmm6\n",
+            "    vmovdqu64 %zmm6, 128(%rdi)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (out, _) = forward_only(asm);
+        assert!(
+            out.contains("vmovdqu 72(%rsp), %xmm6"),
+            "the VEX reload must survive for its upper-zeroing effect: {out}"
         );
     }
 
