@@ -156,7 +156,23 @@ pub(crate) struct RaConfig {
     /// default (noise; the knob engages — 313 asm lines differ — and the
     /// mov gap persists at 232 vs GCC's 90, so the cap optimizes the
     /// wrong pressure on this tree). Default stays off; the census must
-    /// re-measure from this tree, not from the S02 numbers. The knob also
+    /// re-measure from this tree, not from the S02 numbers. CENSUS
+    /// (2026-10-22, reserve=4 vs default, paired in one runner invocation,
+    /// 9 reps / 2 warmups, output-checked, 49 benchmarks): net geomean
+    /// 1.0004 over all 49 and 0.9970 over the 31 whose median runtime
+    /// clears 20 ms — still inside the noise band, so the default stays
+    /// off. The shape split is consistent and reproducible: wins on
+    /// pointer-chasing code (linux_rbtree 1.190x, lz4_match_extend 1.061x,
+    /// glibc_strstr 1.030x) against losses on recurrence/ARX code
+    /// (expat_siphash24 0.912x, hash_table 0.954x, sha256_transform 0.976x,
+    /// fannkuch 0.979x), the same split the arith_loop note describes. The
+    /// mechanism is real where it wins: on linux_rbtree the cap is what lets
+    /// the tree-descent phi keep a register instead of being materialized
+    /// through a stack slot (store in each arm, reload at the join, once per
+    /// descent step), taking main's stack references from 20 to 15 against
+    /// GCC's 0. So a blanket ceiling is the wrong instrument — the reserve
+    /// has to be conditioned on the loop's shape, not applied uniformly.
+    /// The knob also
     /// arms the GEP-base and coalesce-web cost corrections in the main
     /// waves, so cap-off is byte-identical to the pre-cap allocator.
     /// Rationale (RA-PRESSURE-1): a whole-range linear scan assigns
