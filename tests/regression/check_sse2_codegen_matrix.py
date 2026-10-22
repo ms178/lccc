@@ -396,6 +396,31 @@ int main(void)
         DA[i] = (double)(long long)((i * 37) % 251) - 125.0;
         DB[i] = (double)(long long)((i * 11) % 97) - 47.0;
     }
+    /* FP edge bit-patterns spliced over the small-integer fill: signed
+       zeroes, infinities, quiet NaNs with payloads, denormals, rounding
+       ties and int32-conversion range edges. Without these, a lowering
+       that differs from the oracles only in NaN propagation, signed-zero
+       handling, FTZ behaviour or convert range cases hashes identically
+       on integer-valued inputs and passes vacuously (cvt vs cvtt is
+       indistinguishable on whole numbers). Bit-identical by construction
+       on every compiler: the patterns enter through __builtin_memcpy. */
+    {
+        static const unsigned long long SP[] = {
+            0x0000000000000000ULL, 0x8000000000000000ULL,
+            0x7ff0000000000000ULL, 0xfff0000000000000ULL,
+            0x7ff8000000000000ULL, 0xfff8deadbeef0000ULL,
+            0x0000000000000001ULL, 0x000fffffffffffffULL,
+            0x0010000000000000ULL, 0x3fe0000000000000ULL,
+            0x4004000000000000ULL, 0xc004000000000000ULL,
+            0x41dfffffffc00000ULL, 0x41e0000000000000ULL,
+            0xc1e0000000200000ULL, 0x7e37e43c8800759bULL
+        };
+        const int nsp = (int)(sizeof SP / sizeof SP[0]);
+        for (int i = 0; i + 1 < NN; i += 13) {
+            __builtin_memcpy(&DA[i], &SP[(i / 13) % nsp], 8);
+            __builtin_memcpy(&DB[i], &SP[(i / 13 + 7) % nsp], 8);
+        }
+    }
 """
         + "\n".join(calls)
         + """
@@ -643,6 +668,21 @@ def main() -> int:
                 if args.mode == "timing" and exe_ok:
                     entry["time"] = time_exe(exe, args.timing_rounds)
                 result["rows"][r.mnemonic]["compilers"].setdefault(tc.name, {})[cfg] = entry
+            if not exe_ok or tc.name not in hashes:
+                # The batch artefact is unusable (link or run failure). Fall
+                # back to per-row TUs exactly as for a `-S` failure, so one
+                # broken row (e.g. an undefined generic-SIMD symbol) cannot
+                # blank all 122 measurements into identical `missing-hash`
+                # noise: the healthy rows keep a verdict and the report
+                # names the rows that are actually broken. The degradation
+                # itself stays recorded above and still fails hosted CI.
+                for r in rows:
+                    solo = solo_entry(tc, cfg, r, tmp)
+                    if args.mode == "timing" and solo.get("status") == "ok":
+                        solo_exe = tmp / "solo" / f"{r.sym}-{tc.name}-{cfg}.bin"
+                        if solo_exe.exists():
+                            solo["time"] = time_exe(solo_exe, args.timing_rounds)
+                    result["rows"][r.mnemonic]["compilers"].setdefault(tc.name, {})[cfg] = solo
         for r in rows:
             compilers = result["rows"][r.mnemonic]["compilers"]
             ref = compilers.get("lccc", {}).get(cfg, {}).get("hash")
@@ -806,8 +846,22 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+        # Third direction: losing the row's canonical mnemonic must fail even
+        # WITH a shrink -- the shrink exemption covers incidental traffic,
+        # never the instruction the row exists to pin.
+        if probe_rows and probe_rows[0].expect:
+            canonical = probe_rows[0].expect[0]
+            if _loss_case(recorded - 1, canonical) == 0:
+                print(
+                    "check_sse2_codegen_matrix: SELF-TEST FAILED -- an expected "
+                    "mnemonic that vanished behind an instruction shrink was "
+                    "not detected",
+                    file=sys.stderr,
+                )
+                return 1
         print(f"check_sse2_codegen_matrix: self-test ok ({row} tightened by 1 is caught; "
-              "a vanished mnemonic fails without a shrink and passes with one)")
+              "a vanished mnemonic fails without a shrink and passes with one; "
+              "a vanished expected mnemonic fails even with one)")
 
     rc = (
         check_baseline(
@@ -1025,6 +1079,26 @@ def check_baseline(
                 recorded = set(base.get("mnemonics", {}).get(r.mnemonic, {}).get(cfg, []))
                 now = set(mine.get("mnemonics", {}))
                 lost = sorted(m for m in recorded - now if m not in BOOKKEEPING_MNEMONICS)
+                # The row's canonical (expected) mnemonics are not incidental
+                # traffic: if one was emitted at baseline time and is emitted
+                # no longer, the lowering changed in kind, and no instruction
+                # shrink can excuse it. A shrink may only excuse losing the
+                # spill/repack spellings the recorded set also contains.
+                # (Expected mnemonics the baseline never recorded are the
+                # `missing_expect` finding, tracked separately.)
+                expected_lost = sorted(
+                    m for m in r.expect
+                    if any(k.startswith(m) for k in recorded)
+                    and not any(k.startswith(m) for k in now)
+                )
+                if expected_lost:
+                    failures.append(
+                        f"{r.mnemonic} [{cfg}]: expected mnemonic(s) {expected_lost} "
+                        f"no longer emitted ({count if count is not None else '?'} -> {mn}); "
+                        "a shrink does not excuse losing the instruction the row pins"
+                    )
+                lost = [m for m in lost
+                        if not any(m.startswith(e) for e in r.expect)]
                 # Why a disappearance is only a FAILURE when nothing shrank:
                 # a recorded mnemonic set is a *superset* of the row's lowering.
                 # It also holds whatever incidental traffic the shape happened
@@ -1035,9 +1109,11 @@ def check_baseline(
                 # while taking them 102 -> 84 and 103 -> 82 instructions.
                 # Failing there would force a choice between keeping the
                 # cheaper code and keeping the gate green. What the gate has to
-                # refuse is a *pure* loss: a mnemonic vanishing with nothing
-                # given back. Lowering fidelity itself is pinned by
-                # `missing_expect` above, against the row's expected set.
+                # refuse is a *pure* loss of an incidental spelling: a
+                # mnemonic vanishing with nothing given back. Expected
+                # (canonical) mnemonics never reach this rule -- they were
+                # handled unconditionally above, because `--strict-expect`'s
+                # `missing_expect` check is not part of the default gate.
                 if lost:
                     shrunk = count is not None and mn < count
                     if shrunk:

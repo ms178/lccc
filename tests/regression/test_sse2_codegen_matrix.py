@@ -61,5 +61,35 @@ class MatrixContractTests(unittest.TestCase):
                 self.assertNotEqual(self.check(base=base), 0)
 
 
+    def _with_mnemonics(self, recorded, current, instructions):
+        base = copy.deepcopy(self.base)
+        base["mnemonics"] = {self.row.mnemonic: {self.cfg: recorded}}
+        result = copy.deepcopy(self.result)
+        entry = result["rows"][self.row.mnemonic]["compilers"]["lccc"][self.cfg]
+        entry["mnemonics"] = {m: 1 for m in current}
+        entry["instructions"] = instructions
+        return result, base
+
+    def test_expected_mnemonic_loss_fails_even_with_a_shrink(self):
+        # The shrink exemption covers incidental spill/repack spellings,
+        # never the canonical instruction the row pins.
+        self.assertTrue(self.row.expect, "probe row must name an expected mnemonic")
+        canonical = self.row.expect[0]
+        result, base = self._with_mnemonics([canonical, "movaps"], ["movaps"], 11)
+        self.assertNotEqual(self.check(result, base), 0)
+
+    def test_incidental_mnemonic_loss_with_a_shrink_passes(self):
+        canonical = self.row.expect[0]
+        result, base = self._with_mnemonics(
+            [canonical, "movaps"], [canonical], 11)
+        self.assertEqual(self.check(result, base), 0)
+
+    def test_incidental_mnemonic_loss_without_a_shrink_fails(self):
+        canonical = self.row.expect[0]
+        result, base = self._with_mnemonics(
+            [canonical, "movaps"], [canonical], 12)
+        self.assertNotEqual(self.check(result, base), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
