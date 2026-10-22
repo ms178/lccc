@@ -1,5 +1,13 @@
 # Follow-up: 2026-10-22 codegen round — open PRs, oracle provisioning, new workload kernels
 
+> Follow-up audit: see [PR #918 audit](PR-918-AUDIT.md) for the current findings,
+> gate inventory, ratings, and handoff. The historical TODO-1 timing-floor work
+> and TODO-7 optimized atomic coverage below are now implemented. Timing noise
+> remains too high for runtime acceptance. The phi-acyclic gate now passes;
+> do not treat its historical diagnosis as a current failure. Hot-web stealing
+> still lacks a changing mechanism witness, and the AArch64 frame pin needs
+> investigation rather than an unproved rebaseline.
+
 Session scope (in the order it was executed): restore the sandbox to a working
 state, provision the reference compilers from the repository's own payloads,
 perfect the two open PRs, extend the workload corpus, and quantify the next
