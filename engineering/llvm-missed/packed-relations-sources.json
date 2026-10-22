@@ -14,7 +14,7 @@
       "comment_count": 0,
       "reported_comment_count": 0,
       "disposition": "covered-limited",
-      "scope": "Packed unsigned < power-of-two / <= contiguous-low-mask compare supplies a bound to the true arm of a compatible same-or-finer-granularity blend. Remove only the matching AND mask. Eight integer lane/register shapes; signed/noncontiguous/mixed/coarser shapes refuse."
+      "scope": "Packed unsigned < power-of-two / <= contiguous-low-mask compare supplies a bound to the true arm of a compatible same-or-finer-granularity blend or canonical bitwise selection. Remove only the matching AND mask. Eight integer lane/register shapes; signed/noncontiguous/mixed/coarser shapes refuse."
     },
     {
       "number": 219334,
