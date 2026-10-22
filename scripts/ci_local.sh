@@ -359,8 +359,23 @@ gate "ci-toolchain-bundle" fast \
 
 # The 703 s fast-contract step is split across two jobs; a gate listed in both
 # halves is paid for twice and a gate dropped from both is silently unrun.
+gate "ci-shard-partition-self-test" fast \
+    python3 tests/regression/check_ci_shard_partition.py --self-test
 gate "ci-shard-partition" fast \
     python3 tests/regression/check_ci_shard_partition.py
+
+# The shard assignment itself is a reviewable record
+# (.github/ci-lane-plan.json).  The workflow is what runs, so this audit is
+# what keeps the record honest: a gate planned twice, planned but absent,
+# present but unplanned, a shard that lost part of its byte-identical
+# preamble, a drifted balance, or -- the failure that actually happened when
+# the plan was keyed by step name -- a sharded job the plan does not name at
+# all.  Compiler-free and under a second, so it runs with the same mock
+# contracts as the partition audit above.
+gate "ci-lane-plan-self-test" fast \
+    python3 tests/regression/check_ci_lane_plan.py --self-test
+gate "ci-lane-plan" fast \
+    python3 tests/regression/check_ci_lane_plan.py
 
 gate "rust-toolchain-selector" fast \
     bash tests/regression/check_rust_toolchain_selector.sh
@@ -1592,6 +1607,11 @@ gate "ci-gate-parity" fast \
     python3 scripts/check_ci_gate_parity.py
 gate "ci-asm-diff-parity-self-test" fast \
     python3 scripts/test_ci_gate_parity.py
+# The splitter rewrites ci.yml.  A gate that lands in no shard silently stops
+# running, and a gate that lands in two is paid for twice in a green run, so
+# the transform itself is pinned (not just its output) on synthetic workflows.
+gate "ci-lane-split-self-test" fast \
+    python3 scripts/test_ci_lane_split.py
 
 # The encdiff semantic-validation and asmdiff semantic-validation suites
 # run AFTER the oracle provisioning below: their real-toolchain legs

@@ -144,9 +144,17 @@ class FailureAnnotationContracts(unittest.TestCase):
                                      f"{job}: capture wrapper duplicated")
                     self.assertNotIn("::error", script,
                                      f"{job}: annotation duplicated")
+        # Every lane that compiles or runs gates restores the shared oracle,
+        # and the list is exact on purpose: a lane that silently stops
+        # provisioning would measure whatever the runner image happens to
+        # ship, and a lane that starts provisioning without being recorded
+        # here is a second, unreviewed path to the same cache entry.  The
+        # sharded lanes are listed as shards, not as the lanes they were cut
+        # from: each shard runs on its own runner and pays its own restore.
         self.assertEqual(sorted(lanes), sorted([
-            "build", "debug", "corpus", "frontend", "codegen", "backend",
-            "backend-contracts-a", "backend-contracts-b", "unit"]))
+            "build", "debug", "corpus",
+            "frontend-a", "frontend-b", "codegen-a", "codegen-b",
+            "backend", "backend-contracts-a", "backend-contracts-b", "unit"]))
 
 
 if __name__ == "__main__":

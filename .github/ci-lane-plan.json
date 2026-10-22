@@ -1,0 +1,1295 @@
+{
+  "lanes": {
+    "backend-contracts-a": {
+      "group": "backend-contracts",
+      "mode": "shell",
+      "predicted_gate_seconds": 401.13,
+      "shards": 2,
+      "step": "Verify remaining fast local contracts (shard a of 2)",
+      "steps": [
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/check_array_bound_contract.py"
+        },
+        {
+          "measured_s": 0.38,
+          "name": "bash tests/regression/check_va_arg_pack_len_folds.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_got64_old_spelling.sh"
+        },
+        {
+          "measured_s": 0.48,
+          "name": "python3 -O scripts/test_llvm_missed_inventory.py"
+        },
+        {
+          "measured_s": 0.89,
+          "name": "python3 tests/regression/check_direct_assembly_parity.py"
+        },
+        {
+          "measured_s": 0.74,
+          "name": "python3 scripts/check_pr_claim_fidelity.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_i686_integer_isa_parity.sh"
+        },
+        {
+          "measured_s": 0.96,
+          "name": "python3 scripts/check_ci_gate_parity.py"
+        },
+        {
+          "measured_s": 0.84,
+          "name": "bash tests/regression/check_reg_off_sym_fold.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_gvn_cross_block_mul_dot.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/glibc_check_triage.py --self-test"
+        },
+        {
+          "measured_s": 1.49,
+          "name": "python3 tests/regression/check_llvm_word_counts.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_redundant_test_elimination.sh"
+        },
+        {
+          "measured_s": 1.13,
+          "name": "bash tests/regression/check_ra_web_inloop_use.sh"
+        },
+        {
+          "measured_s": 0.58,
+          "name": "bash tests/regression/check_tight_loop_align.sh"
+        },
+        {
+          "measured_s": 353.25,
+          "name": "bash tests/regression/check_peephole_whitespace.sh"
+        },
+        {
+          "measured_s": 2.12,
+          "name": "python3 tests/regression/check_affine_scaled_index_matrix.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_redundant_flags_compare.sh"
+        },
+        {
+          "measured_s": 1.71,
+          "name": "bash tests/regression/check_vectorize_round_maps.sh"
+        },
+        {
+          "measured_s": 1.01,
+          "name": "python3 tests/regression/check_bmi2_bzhi.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_i686_tls_ie_relax.sh"
+        },
+        {
+          "measured_s": 0.55,
+          "name": "bash tests/regression/check_zero_ext_cmp_fold.sh"
+        },
+        {
+          "measured_s": 2.46,
+          "name": "python3 scripts/lccc_capability_probe.py --selftest"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/test_ci_lane_split.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_function_alignment_definition.sh"
+        },
+        {
+          "measured_s": 2.73,
+          "name": "python3 tests/regression/check_llvm_guarded_folds.py"
+        },
+        {
+          "measured_s": 3.34,
+          "name": "bash tests/regression/check_rmw_sib_folds.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_debug_info_flags.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_decimal32_indexed_fold_arm.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/edg_changes_mine.py verify-artifacts"
+        },
+        {
+          "measured_s": 0.53,
+          "name": "python3 tests/regression/check_nobits_org_parity.py --lccc target/fastbuild/lccc"
+        },
+        {
+          "measured_s": 4.4,
+          "name": "python3 tests/regression/check_llvm_scalar_facts.py"
+        },
+        {
+          "measured_s": 0.33,
+          "name": "python3 tests/regression/check_shift_count_demand.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_i686_atomics.sh"
+        },
+        {
+          "measured_s": 0.51,
+          "name": "bash tests/regression/check_i686_label_ref_safety.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_frontend_diagnostic_recovery.sh"
+        },
+        {
+          "measured_s": 1.86,
+          "name": "bash tests/regression/check_affine_exit_compare.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_volatile_pointer_subscript.sh"
+        },
+        {
+          "measured_s": 0.3,
+          "name": "bash tests/regression/check_tls_pie_preemptible.sh"
+        },
+        {
+          "measured_s": 3.59,
+          "name": "python3 tests/regression/check_llvm_integer_observations.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_f128_sign_intrinsics_strict_fp.sh"
+        },
+        {
+          "measured_s": 0.94,
+          "name": "bash tests/regression/check_pointer_ring_indexing.sh"
+        },
+        {
+          "measured_s": 0.46,
+          "name": "bash tests/regression/check_vector_remainder_codegen.sh"
+        },
+        {
+          "measured_s": 0.39,
+          "name": "bash tests/regression/check_asm_goto_phi_edge.sh"
+        },
+        {
+          "measured_s": 0.34,
+          "name": "ENCDIFF_TEST_OBJDUMP=\"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump\" \\ LCCC_REQUIRE_PINNED_ORACLE=1 \\ python3 scripts/test_encdiff.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/edg_corpus_mine.py selftest"
+        },
+        {
+          "measured_s": 0.34,
+          "name": "bash tests/regression/check_volatile_access_semantics.sh"
+        },
+        {
+          "measured_s": 0.55,
+          "name": "python3 scripts/test_glibc_check_triage.py"
+        },
+        {
+          "measured_s": 0.28,
+          "name": "bash tests/regression/check_tls_runtime_oracle.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/audit_census.py --selftest"
+        },
+        {
+          "measured_s": 0.33,
+          "name": "bash tests/regression/check_gla_backedge_no_trampoline.sh"
+        },
+        {
+          "measured_s": 0.26,
+          "name": "bash tests/regression/check_env_test_hygiene.sh"
+        },
+        {
+          "measured_s": 1.08,
+          "name": "bash tests/regression/check_ensure_gcc_torture.sh"
+        },
+        {
+          "measured_s": 1.18,
+          "name": "python3 scripts/check_script_imports.py"
+        },
+        {
+          "measured_s": 0.32,
+          "name": "CCC=target/fastbuild/lccc bash tests/regression/check_sparse_bss_nobits.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_bool_pair_tail_jmp.sh"
+        },
+        {
+          "measured_s": 0.27,
+          "name": "bash tests/regression/check_copy_alias_sizes.sh"
+        },
+        {
+          "measured_s": 0.8,
+          "name": "bash tests/regression/check_sparse_mask_updates.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_fma_dest_coalesce_codegen.sh"
+        },
+        {
+          "measured_s": 1.61,
+          "name": "bash tests/regression/check_store_alu_cross_join.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_i686_boot_asm.sh"
+        },
+        {
+          "measured_s": 0.3,
+          "name": "python3 tools/ir_shape_check.py"
+        }
+      ]
+    },
+    "backend-contracts-b": {
+      "group": "backend-contracts",
+      "mode": "shell",
+      "predicted_gate_seconds": 401.37,
+      "shards": 2,
+      "step": "Verify remaining fast local contracts (shard b of 2)",
+      "steps": [
+        {
+          "measured_s": 0.26,
+          "name": "python3 scripts/check_ci_workflow_shell.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/edg_changes_mine.py selftest"
+        },
+        {
+          "measured_s": 0.54,
+          "name": "bash tests/regression/check_affine_value_bound.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/test_hot_loop_metric.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_fma_builtin_strict_fp.sh"
+        },
+        {
+          "measured_s": 1.81,
+          "name": "python3 -m unittest discover -s tests/fuzz -p test_punning_fuzz.py"
+        },
+        {
+          "measured_s": 1.92,
+          "name": "python3 tests/regression/verify_pr713_audit.py --quiet"
+        },
+        {
+          "measured_s": 0.33,
+          "name": "bash tests/regression/check_boot_size_measurement.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_atomic_backends.sh"
+        },
+        {
+          "measured_s": 0.52,
+          "name": "env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_address_contract.py"
+        },
+        {
+          "measured_s": 6.25,
+          "name": "python3 scripts/edg_corpus_mine.py verify-index"
+        },
+        {
+          "measured_s": 0.84,
+          "name": "python3 scripts/test_differential_corpus_paths.py"
+        },
+        {
+          "measured_s": 14.63,
+          "name": "python3 tests/regression/check_debug_code_parity.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_volatile_licm.sh"
+        },
+        {
+          "measured_s": 47.99,
+          "name": "bash tests/regression/check_self_test_after_arith.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/test_llvm_missed_inventory.py"
+        },
+        {
+          "measured_s": 0.82,
+          "name": "bash tests/regression/check_select_from_compare.sh"
+        },
+        {
+          "measured_s": 1.34,
+          "name": "bash tests/regression/check_phi_acyclic_order.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_dep_files.sh"
+        },
+        {
+          "measured_s": 0.37,
+          "name": "bash scripts/ensure_gas_247.sh --self-test"
+        },
+        {
+          "measured_s": 111.25,
+          "name": "python3 -m unittest discover -s tests/corpus -p 'test_*.py'"
+        },
+        {
+          "measured_s": 2.72,
+          "name": "python3 scripts/check_no_ub_exploitation.py --root src"
+        },
+        {
+          "measured_s": 6.64,
+          "name": "bash tests/regression/check_vec_chain_exit_phi.sh"
+        },
+        {
+          "measured_s": 0.71,
+          "name": "bash tests/regression/check_linker_notype_code.sh"
+        },
+        {
+          "measured_s": 0.32,
+          "name": "bash tests/regression/check_tls_cross_models.sh"
+        },
+        {
+          "measured_s": 9.82,
+          "name": "python3 tests/regression/check_peephole_pair_parallel.py"
+        },
+        {
+          "measured_s": 13.32,
+          "name": "python3 -m unittest discover -s tests/fuzz -p test_c_reduce.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/check_peephole_directive_step.py"
+        },
+        {
+          "measured_s": 1.16,
+          "name": "bash tests/regression/check_late_const_gep.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_decimal64_indexed_fold.sh"
+        },
+        {
+          "measured_s": 18.52,
+          "name": "python3 scripts/check_deep_nesting_robustness.py"
+        },
+        {
+          "measured_s": 0.56,
+          "name": "bash tests/regression/check_char_signedness.sh"
+        },
+        {
+          "measured_s": 9.94,
+          "name": "bash tests/regression/check_fp_recurrence.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_demorgan_branch_split.sh"
+        },
+        {
+          "measured_s": 5.99,
+          "name": "bash tests/regression/check_minmax_reduction.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/oracle_delta_gate.py --self-test"
+        },
+        {
+          "measured_s": 6.27,
+          "name": "bash tests/regression/check_volatile_reduction.sh"
+        },
+        {
+          "measured_s": 24.54,
+          "name": "bash tests/regression/check_affine_loop_fold.sh"
+        },
+        {
+          "measured_s": 1.68,
+          "name": "bash tests/regression/check_fma_matcher_guards.sh"
+        },
+        {
+          "measured_s": 0.96,
+          "name": "python3 scripts/check_implicit_operand_matrix.py"
+        },
+        {
+          "measured_s": 0.29,
+          "name": "bash tests/regression/check_gla_cross_reach_band.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_narrow_cmp_flag_law.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "ASMDIFF_TEST_AS=\"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as\" \\ ASMDIFF_TEST_OBJDUMP=\"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump\" \\ LCCC_REQUIRE_PINNED_ORACLE=1 \\ python3 scripts/test_asmdiff.py"
+        },
+        {
+          "measured_s": 0.99,
+          "name": "bash tests/regression/check_call_secondary_cache.sh"
+        },
+        {
+          "measured_s": 0.55,
+          "name": "bash tests/regression/check_multi_entry_loop.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/workloads/glibc-2.44/test_build_guards.sh"
+        },
+        {
+          "measured_s": 1.57,
+          "name": "bash tests/regression/check_tls_model_selection.sh"
+        },
+        {
+          "measured_s": 3.98,
+          "name": "bash tests/regression/check_verify_ir_clean.sh"
+        },
+        {
+          "measured_s": 2.14,
+          "name": "bash tests/regression/check_fma_gating.sh"
+        },
+        {
+          "measured_s": 8.74,
+          "name": "python3 scripts/audit_census.py --check"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/peephole_trace_bisect.py --selftest"
+        },
+        {
+          "measured_s": 0.31,
+          "name": "bash tests/regression/check_indexed_fold_scratch_index.sh"
+        },
+        {
+          "measured_s": 1.11,
+          "name": "python3 tests/regression/check_popcount_loop_contract.py --run"
+        },
+        {
+          "measured_s": 32.24,
+          "name": "python3 scripts/test_ci_gate_parity.py"
+        },
+        {
+          "measured_s": 1.05,
+          "name": "bash tests/regression/check_libcall_synthesis_no_selfcall.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_const_trip_loop_inline.sh"
+        },
+        {
+          "measured_s": 0.33,
+          "name": "bash tests/regression/check_bool_pair_prune.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/test_oracle_delta_gate.py"
+        },
+        {
+          "measured_s": 0.41,
+          "name": "python3 scripts/check_doc_links.py"
+        },
+        {
+          "measured_s": 4.89,
+          "name": "bash tests/regression/check_gla_remat_policy.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_asm_case_insensitive.sh"
+        },
+        {
+          "measured_s": 0.5,
+          "name": "bash tests/regression/check_peephole_trace_bisect.sh"
+        },
+        {
+          "measured_s": 0.28,
+          "name": "python3 tests/regression/check_sparse_bss_equivalence.py --lccc target/fastbuild/lccc"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_gvn_xsign_load_cse.sh"
+        },
+        {
+          "measured_s": 11.13,
+          "name": "python3 tests/regression/check_llvm_bit_demand.py"
+        },
+        {
+          "measured_s": 9.88,
+          "name": "bash tests/regression/check_round_cap_observability.sh"
+        },
+        {
+          "measured_s": 0.92,
+          "name": "bash tests/regression/check_rmw_index_zext_codegen.sh"
+        },
+        {
+          "measured_s": 7.97,
+          "name": "python3 tests/regression/check_inline_devirt_hot_leaf.py"
+        },
+        {
+          "measured_s": 3.44,
+          "name": "bash tests/regression/check_map_i64_two_lane.sh"
+        },
+        {
+          "measured_s": 3.05,
+          "name": "env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_popcount_contract.py --run"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_loop_memset.sh"
+        },
+        {
+          "measured_s": 0.31,
+          "name": "bash tests/regression/check_loop_store_motion.sh"
+        },
+        {
+          "measured_s": 5.61,
+          "name": "bash tests/regression/check_vec_dead_remainder.sh"
+        },
+        {
+          "measured_s": 0.27,
+          "name": "bash tests/regression/check_loop_preheader.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/test_godbolt_cache.py"
+        },
+        {
+          "measured_s": 0.78,
+          "name": "python3 tests/regression/check_llvm_missed_zero_choice.py"
+        },
+        {
+          "measured_s": 0.47,
+          "name": "bash tests/regression/check_tls_model_option.sh"
+        },
+        {
+          "measured_s": 0.39,
+          "name": "python3 tests/regression/check_frame_gep_direct.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_fortify_diagnose_as.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_peephole_whitespace.sh --selftest"
+        }
+      ]
+    },
+    "codegen-a": {
+      "group": "codegen",
+      "mode": "steps",
+      "predicted_gate_seconds": 402.48,
+      "shards": 2,
+      "steps": [
+        {
+          "measured_s": 1.32,
+          "name": "i386 call-staging assembly gate"
+        },
+        {
+          "measured_s": 0.31,
+          "name": "Enum layout semantics (widening, packed, struct inheritance, static asserts)"
+        },
+        {
+          "measured_s": 2.45,
+          "name": "One-lane FP vector ABI (AUD-VABI-4)"
+        },
+        {
+          "measured_s": 0.58,
+          "name": "Differential fuzz smoke (synthetic)"
+        },
+        {
+          "measured_s": 1.94,
+          "name": "Verify strict packed coefficient DAG and i686 rounding"
+        },
+        {
+          "measured_s": 316.32,
+          "name": "Verify synthesized CFI invariants (corpus, x86-64 + i686)"
+        },
+        {
+          "measured_s": 0.42,
+          "name": "Verify declaration-level __seg_gs qualifier codegen"
+        },
+        {
+          "measured_s": 0.37,
+          "name": "Verify statement-expression address-space declarations do not leak into typeof"
+        },
+        {
+          "measured_s": 8.68,
+          "name": "Verify ISA ceilings (no BMI/AVX escape at x86-64/v2)"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Run __seg_gs explicit-cast warning and abstract-declarator check"
+        },
+        {
+          "measured_s": 25.98,
+          "name": "Preserved synthesis and ordering contracts"
+        },
+        {
+          "measured_s": 15.29,
+          "name": "Differential correctness gate (lccc vs GCC 16 oracle)"
+        },
+        {
+          "measured_s": 1.82,
+          "name": "Loop-alignment contract gate (emitted assembly)"
+        },
+        {
+          "measured_s": 0.26,
+          "name": "AArch64 inline-asm provenance gate"
+        },
+        {
+          "measured_s": 6.57,
+          "name": "Loop-inversion census"
+        },
+        {
+          "measured_s": 1.27,
+          "name": "Record tag identity gate (nested same-tag structs)"
+        },
+        {
+          "measured_s": 11.73,
+          "name": "Volatile destructuring ratchet"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "AArch64 dispatcher region contract"
+        },
+        {
+          "measured_s": 3.73,
+          "name": "Exact signed division and strict volatile-load legality"
+        },
+        {
+          "measured_s": 0.36,
+          "name": "Verify MachInst narrow-slot window allocation"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "AArch64 shared visibility gate"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Run kernel-tree deletion-safety regression"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify inline-asm UTF-8 assembly text"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Enum type and alignas layout fixtures"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "AArch64 shared ADR contract gate"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify over-aligned alloca typed-census admission"
+        },
+        {
+          "measured_s": 0.33,
+          "name": "Run __seg_gs declarator-space placement check"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Static assertion semantics"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Enum tag scope compatibility"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify segment-qualified declarator codegen"
+        }
+      ]
+    },
+    "codegen-b": {
+      "group": "codegen",
+      "mode": "steps",
+      "predicted_gate_seconds": 402.54,
+      "shards": 2,
+      "steps": [
+        {
+          "measured_s": 0.25,
+          "name": "64-bit divide bypass assembly contract"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Embedded-NUL strlen contract"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify segment-override constant-displacement fold"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify differential-fuzz engine wiring"
+        },
+        {
+          "measured_s": 0.33,
+          "name": "Dash-output stdout gate"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Volatile spin-loop position gate"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify segment loads land in their home register"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Expat JUnit comparison contract"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Volatile bitfield lowering gate"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Run __seg_gs pointee-chain assembly contract"
+        },
+        {
+          "measured_s": 3.83,
+          "name": "i386 small-struct regparm ABI debt gate"
+        },
+        {
+          "measured_s": 13.81,
+          "name": "foreign-intrinsics rejected gate"
+        },
+        {
+          "measured_s": 1.65,
+          "name": "Strict packed reciprocal bitwise oracle"
+        },
+        {
+          "measured_s": 4.06,
+          "name": "Observable FP environment semantics and exception ordering"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify peephole parity with and without unwind tables"
+        },
+        {
+          "measured_s": 0.85,
+          "name": "Verify unwinding through lccc frames (.eh_frame)"
+        },
+        {
+          "measured_s": 2.46,
+          "name": "Verify latency-driven reassociation (reassoc_lat)"
+        },
+        {
+          "measured_s": 0.37,
+          "name": "Verify kernel boot-path ISA contract (patch + artifact scan)"
+        },
+        {
+          "measured_s": 17.63,
+          "name": "Run __seg_gs runtime regression"
+        },
+        {
+          "measured_s": 0.88,
+          "name": "Run __seg_gs conversion diagnostics check"
+        },
+        {
+          "measured_s": 0.42,
+          "name": "Reject named address spaces on unsupported targets without an ICE"
+        },
+        {
+          "measured_s": 302.12,
+          "name": "Benchmark output gate (workload kernels vs GCC oracle)"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "Scoped-noreturn diagnostic gate"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Pipefail/SIGPIPE detector"
+        },
+        {
+          "measured_s": 10.08,
+          "name": "Fuzz harness verdict tests"
+        },
+        {
+          "measured_s": 2.07,
+          "name": "Differential fuzz smoke (address identity and value survival)"
+        },
+        {
+          "measured_s": 0.32,
+          "name": "Verify strict computed-reciprocal codegen"
+        },
+        {
+          "measured_s": 1.89,
+          "name": "Verify ARX lane-frame latency (vec_arx + arx_vectorize)"
+        },
+        {
+          "measured_s": 0.27,
+          "name": "Verify COMDAT groups are identified by signature (x86-64 + i686 links)"
+        },
+        {
+          "measured_s": 34.5,
+          "name": "Run __seg_gs aggregate copy size sweep"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Run chroot bind regression"
+        }
+      ]
+    },
+    "frontend-a": {
+      "group": "frontend",
+      "mode": "steps",
+      "predicted_gate_seconds": 336.64,
+      "shards": 2,
+      "steps": [
+        {
+          "measured_s": 8.05,
+          "name": "Scalar logic against GCC 16 and Clang 23.1.3"
+        },
+        {
+          "measured_s": 127.92,
+          "name": "Packed vector relations against GCC 16 and Clang 23.1.3"
+        },
+        {
+          "measured_s": 0.27,
+          "name": "Verify benchmark codegen registry and evidence (mock only)"
+        },
+        {
+          "measured_s": 16.25,
+          "name": "Verify missed-alarm pair engines and slice superoptimiser"
+        },
+        {
+          "measured_s": 3.71,
+          "name": "Verify swap provisioning contracts (mock only)"
+        },
+        {
+          "measured_s": 0.39,
+          "name": "Check FP-contraction parity with GCC"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Check hot-loop register homes survive an in-loop call"
+        },
+        {
+          "measured_s": 1.74,
+          "name": "Check builtin_cpu_supports runtime semantics"
+        },
+        {
+          "measured_s": 4.99,
+          "name": "a9987 salvage and SWAR cast soundness"
+        },
+        {
+          "measured_s": 1.6,
+          "name": "ext_vector_type padded layout vs the compiler oracle"
+        },
+        {
+          "measured_s": 1.13,
+          "name": "IV-widen paired-counter mirror proof (gcc-16 parity and proof-firing assertion)"
+        },
+        {
+          "measured_s": 1.47,
+          "name": "Empty-aggregate cross-compiler ABI contracts"
+        },
+        {
+          "measured_s": 64.76,
+          "name": "SysV by-value aggregate and vector ABI against GCC 16"
+        },
+        {
+          "measured_s": 2.02,
+          "name": "LCCC vs GCC compatibility suite"
+        },
+        {
+          "measured_s": 1.89,
+          "name": "ext-vector swizzle diagnostics"
+        },
+        {
+          "measured_s": 2.41,
+          "name": "PGO buffered I/O lock lifetime and injected failures"
+        },
+        {
+          "measured_s": 4.13,
+          "name": "RISC-V relocation rejection and positive controls"
+        },
+        {
+          "measured_s": 6.88,
+          "name": "ISA-sensitive intrinsic feature gate"
+        },
+        {
+          "measured_s": 1.58,
+          "name": "Integer order and bit-reversal networks"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Archived bulk evidence stays archived"
+        },
+        {
+          "measured_s": 0.38,
+          "name": "Verify native VEX flag-read architectural controls"
+        },
+        {
+          "measured_s": 0.7,
+          "name": "Verify the YARPGen provisioner contract (offline, no network)"
+        },
+        {
+          "measured_s": 0.99,
+          "name": "ext_vector_type and vector_size varargs ABI (GCC cross oracle)"
+        },
+        {
+          "measured_s": 0.5,
+          "name": "Narrow one-lane ext_vector arithmetic and small-slot A/B"
+        },
+        {
+          "measured_s": 24.28,
+          "name": "Memory value forwarding and predicate effect contracts"
+        },
+        {
+          "measured_s": 18.62,
+          "name": "IVSR integer-domain contracts"
+        },
+        {
+          "measured_s": 11.4,
+          "name": "Signed affine-step and signed index home contracts"
+        },
+        {
+          "measured_s": 3.3,
+          "name": "IV-widen exposed-latch trajectory gates"
+        },
+        {
+          "measured_s": 0.74,
+          "name": "Vector arguments and returns at the compiler boundary"
+        },
+        {
+          "measured_s": 10.07,
+          "name": "Wide-vector (%ymm/%zmm) ABI at the compiler boundary"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Surface wide-vector ABI failures in annotations"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "vector scalar conversion diagnostics"
+        },
+        {
+          "measured_s": 2.37,
+          "name": "Intrinsic differential corpus (lccc vs GCC)"
+        },
+        {
+          "measured_s": 0.97,
+          "name": "File-scope constant initializers"
+        },
+        {
+          "measured_s": 2.85,
+          "name": "Named-space conversion parity"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify benchmark harness oracle and timing contracts"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Sema constraints (incl. lvalue constraints)"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Check GOT-slot references to local symbols"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Const-object read folding"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Check default ISA policy (x86-64 default emits no post-baseline instruction)"
+        },
+        {
+          "measured_s": 0.49,
+          "name": "Designated initializer validity"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Volatile member code generation"
+        },
+        {
+          "measured_s": 3.66,
+          "name": "Cargo gate resource isolation"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "One-lane ext_vector caller-side marshalling (-O0/-O1/-O2)"
+        },
+        {
+          "measured_s": 0.38,
+          "name": "RISC-V shared-binding mutation controls"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify W2 load->cast fold structure and runtime"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "ext_vector_type target widths and invalid element diagnostics"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify restored linker oracle versions"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Intrinsic arity table matches the headers"
+        }
+      ]
+    },
+    "frontend-b": {
+      "group": "frontend",
+      "mode": "steps",
+      "predicted_gate_seconds": 336.87,
+      "shards": 2,
+      "steps": [
+        {
+          "measured_s": 0.25,
+          "name": "Verify benchmark ranking contracts"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Diagnostic positions survive the preprocessor"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Check temporary-file symlink isolation"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Named-space brace-elided initializers"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Check -fno-builtin constant-fold withdrawal (F1)"
+        },
+        {
+          "measured_s": 0.49,
+          "name": "One-lane ext_vector FP/int carrier correctness"
+        },
+        {
+          "measured_s": 3.66,
+          "name": "Ill-typed builtin acceptance"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Named-space typedef code generation"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Standard-output contract for -o -"
+        },
+        {
+          "measured_s": 0.38,
+          "name": "Cross-target intrinsic trap"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify binary-equivalence attribution contracts"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Audit loop branch and must-execute contracts"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Check the recursion-to-iteration pass"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Vector initializers inside aggregates"
+        },
+        {
+          "measured_s": 11.46,
+          "name": "Predicate relations against supplemental GCC 16 snapshot and Clang 23.1.3"
+        },
+        {
+          "measured_s": 1.59,
+          "name": "No merge conflict markers"
+        },
+        {
+          "measured_s": 0.3,
+          "name": "Verify local oracle identity and ICX provisioning (offline, mock only)"
+        },
+        {
+          "measured_s": 38.48,
+          "name": "Verify GCC provisioning contracts (mock only)"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Verify manifest Rust-toolchain selection"
+        },
+        {
+          "measured_s": 1.34,
+          "name": "Check driver option contracts"
+        },
+        {
+          "measured_s": 0.52,
+          "name": "Check 16-byte atomic load/store/RMW semantics (full 128 bits, vs GCC oracle)"
+        },
+        {
+          "measured_s": 3.52,
+          "name": "ext_vector_type layout/lane matrix vs the pinned Clang 23.1.3 oracle"
+        },
+        {
+          "measured_s": 4.1,
+          "name": "IVSR vecaddr struct-walk shape and contracts"
+        },
+        {
+          "measured_s": 10.96,
+          "name": "Variadic pack count inlining contracts"
+        },
+        {
+          "measured_s": 32.9,
+          "name": "Aggregate-call byte boundaries and cross-compiler ABI"
+        },
+        {
+          "measured_s": 7.93,
+          "name": "Vector argument operand forms against GCC 16"
+        },
+        {
+          "measured_s": 0.62,
+          "name": "Shuffle builtin diagnostics"
+        },
+        {
+          "measured_s": 2.23,
+          "name": "RISC-V shared-binding relocation algebra"
+        },
+        {
+          "measured_s": 1.95,
+          "name": "Static-local constant initializers"
+        },
+        {
+          "measured_s": 1.4,
+          "name": "Void declarators and initializers"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Surface void-declarator failures in annotations"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Typedef-volatile code generation"
+        },
+        {
+          "measured_s": 1.1,
+          "name": "Verify generator-map vectorizer (fires, matches gcc-16, kill switch)"
+        },
+        {
+          "measured_s": 1.25,
+          "name": "Verify toolchain bundle and shard-partition contracts (mock only)"
+        },
+        {
+          "measured_s": 0.3,
+          "name": "Check 16-byte CAS lowering (libatomic by default, cmpxchg16b under -mcx16)"
+        },
+        {
+          "measured_s": 1.66,
+          "name": "Check a value live across a 16-byte atomic survives the libatomic call"
+        },
+        {
+          "measured_s": 0.47,
+          "name": "Check baseline-SSE2 packed multiply-add codegen"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "i686 execution capability policy"
+        },
+        {
+          "measured_s": 4.71,
+          "name": "Ext-vector rvalue subscript cross-ABI"
+        },
+        {
+          "measured_s": 3.07,
+          "name": "ext_vector_type cross-compiler by-value ABI"
+        },
+        {
+          "measured_s": 68.01,
+          "name": "ext_vector_type by-value ABI grid vs the Clang 23.1.3 oracle"
+        },
+        {
+          "measured_s": 12.72,
+          "name": "ext_vector_type by-value ABI under the AVX ABI level vs the Clang 23.1.3 oracle"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Surface ext-vector ABI failures in annotations"
+        },
+        {
+          "measured_s": 2.5,
+          "name": "zlib-ng complete Huffman table (late constant GEP)"
+        },
+        {
+          "measured_s": 9.72,
+          "name": "Scalar lane types, stack boundaries and opt-in homes"
+        },
+        {
+          "measured_s": 2.69,
+          "name": "GNU vector_size alignment model and MEMORY-class vector argument ABI against GCC 16"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Surface GNU vector alignment ABI failures in annotations"
+        },
+        {
+          "measured_s": 0.87,
+          "name": "IVSR/univsr loop-strength-reduction probe contracts"
+        },
+        {
+          "measured_s": 22.8,
+          "name": "Reproducer replay (pinned ISA, both legs)"
+        },
+        {
+          "measured_s": 0.74,
+          "name": "Subscript constraint diagnostics"
+        },
+        {
+          "measured_s": 2.04,
+          "name": "Relocation and PGO harness red-team tests"
+        },
+        {
+          "measured_s": 73.64,
+          "name": "GNU vector-extension whole-vector lowering (runtime vs GCC + ceilings)"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Surface vector-extension codegen failures in annotations"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "Const-volatile object reads are not folded"
+        }
+      ]
+    }
+  },
+  "provenance": {
+    "backend-contracts": {
+      "costs": "/tmp/contract-costs.tsv",
+      "measured_seconds_total": 802.5,
+      "source": "measured by scripts/ci_gate_costs.py"
+    },
+    "codegen": {
+      "costs": "/tmp/step-costs.tsv",
+      "measured_seconds_total": 805.02,
+      "source": "measured by scripts/ci_gate_costs.py"
+    },
+    "frontend": {
+      "costs": "/tmp/step-costs.tsv",
+      "measured_seconds_total": 673.51,
+      "source": "measured by scripts/ci_gate_costs.py"
+    }
+  }
+}

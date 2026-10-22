@@ -1,9 +1,9 @@
 {
   "fns_over_1000": 27,
-  "fns_over_300": 230,
+  "fns_over_300": 229,
   "fns_over_500": 94,
   "ignored_tests": 10,
-  "knob_literals": 513,
+  "knob_literals": 514,
   "knobs_undocumented": 277,
   "panic_sites": 835,
   "panic_sites_hot": 105,
