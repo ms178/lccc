@@ -5,7 +5,12 @@
 //! LLVM poison, and do not narrow or mask the count as part of this rewrite.
 use super::*;
 
-fn bounded_count(op: Operand, cx: &Context<'_>, width: usize, depth: u8) -> Option<IrType> {
+pub(super) fn bounded_count(
+    op: Operand,
+    cx: &Context<'_>,
+    width: usize,
+    depth: u8,
+) -> Option<IrType> {
     if depth == 0 {
         return None;
     }

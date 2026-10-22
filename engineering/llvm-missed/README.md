@@ -187,3 +187,5 @@ correctness repair rather than a fictitious speedup over unsafe folding.
 [WORD-COUNTS.md](WORD-COUNTS.md) documents scalar count unions and constant
 caps, the six-report source audit, and explicit refusals/deferred work.
 [NAMING.md](NAMING.md) defines semantic pass, fixture and evidence names.
+
+[predicate relations](PREDICATE-RELATIONS.md) adds a 50-report review and explicit follow-up on all 56 prior deferrals. Five new scopes and ten prior deferred scopes gain limited coverage; 91 of these 106 reviews remain blocked/refused, with reasons and controls. This is not a claim to close every deferral.

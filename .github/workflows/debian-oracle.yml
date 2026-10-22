@@ -30,7 +30,7 @@ jobs:
       - name: Install Debian toolchain and report package identity
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends gcc-16 g++-16 gcc binutils libc6-dev valgrind python3 ca-certificates curl git
+          apt-get install -y --no-install-recommends gcc-16 g++-16 gcc gcc-16-multilib binutils libc6-dev libc6-dev-i386 valgrind python3 ca-certificates curl git
           test "$(gcc-16 -dumpfullversion)" = 16.2.0
           dpkg-query -W gcc-16 g++-16 libc6-dev binutils
           gcc-16 --version
@@ -63,6 +63,22 @@ jobs:
 
       - name: Build compiler from this checkout
         run: cargo build --profile fastbuild --locked --bin lccc -j 2
+
+      - name: Predicate relations against exact Debian GCC 16.2
+        run: |
+          python3 tests/regression/check_llvm_predicate_relations.py --gcc gcc-16 --json debian-predicate-relations.json
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          path = Path('debian-predicate-relations.json')
+          data = json.loads(path.read_text())
+          assert data['gcc_16_2_normative'] and data['gcc_version'] == '16.2.0'
+          assert data['correct'] and data['native_forms'] == 62 and data['improved_vs_disabled'] > 0
+          summary = {key: data[key] for key in ('gcc_version', 'gcc_16_2_normative', 'native_forms', 'correct', 'timing_claim', 'improved_vs_disabled')}
+          summary['report_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+          print('::notice title=Predicate relations exact GCC receipt::' + json.dumps(summary))
+          PY
 
       # The normal benchmark workflow supplies paired timing. This lane is
       # independent distribution/exact-toolchain correctness evidence, not a
@@ -158,6 +174,7 @@ jobs:
           name: debian-exact-oracle
           path: |
             debian-results.json
+            debian-predicate-relations.json
             debian-summary.md
             debian-artifacts/
             debian-callgrind/

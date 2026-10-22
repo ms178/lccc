@@ -7,7 +7,7 @@ Tests use the same stem plus `_tests`. Fixture and checker stems match.
 
 Evidence cohorts use short kebab-case names: `zero-choice`,
 `integer-observations`, `bit-demand`, `ordered-arithmetic`, `hot-kernels`,
-`scalar-facts`, and `guarded-folds`. Reports use the cohort stem; measurements
+`scalar-facts`, `guarded-folds`, `scalar-logic`, and `predicate-relations`. Reports use the cohort stem; measurements
 append `-runtime`, `-correctness`, or `-sources`. New cohorts follow this rule.
 
 Historical measurement payloads retain their original commands, symbols,
