@@ -1255,8 +1255,17 @@ fn vectorize_entry(
     // permission, instead of rereading process state inside each matcher.
     let fixed_slp = x86_avx && std::env::var("CCC_NO_FIXED_SLP").is_err();
     match (target, fp_reassoc, fp_contract, fixed_slp) {
-        (crate::backend::Target::Aarch64, true, _, _) => {
+        // AArch64: the same (reassoc, contract) matrix as x86. Routing only
+        // on `fp_reassoc` discarded the contract bit, so no flag combination
+        // could ever license the fused matmul arm on this target.
+        (crate::backend::Target::Aarch64, true, FpContract::Fast, _) => {
             vectorize::vectorize_function_two_wide_fast_math
+        }
+        (crate::backend::Target::Aarch64, true, _, _) => {
+            vectorize::vectorize_function_two_wide_reassoc
+        }
+        (crate::backend::Target::Aarch64, false, FpContract::Fast, _) => {
+            vectorize::vectorize_function_two_wide_contract
         }
         (crate::backend::Target::Aarch64, false, _, _) => vectorize::vectorize_function_two_wide,
         (_, true, FpContract::Fast, true) => vectorize::vectorize_function_fast_math,

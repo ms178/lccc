@@ -610,47 +610,17 @@ impl ArmCodegen {
                 self.state.emit("    dup v15.2d, v15.d[0]");
             }
 
-            IntrinsicOp::FmaF64x2Hoisted => {
-                if let Some(c_ptr) = dest_ptr {
-                    let b_phys = self.operand_reg(&args[0]).filter(|r| !is_arm_fp_phys(*r));
-                    let c_phys = self
-                        .operand_reg(&Operand::Value(*c_ptr))
-                        .filter(|r| !is_arm_fp_phys(*r));
-                    let b_addr = b_phys.map(callee_saved_name).unwrap_or("x11");
-                    let c_addr = c_phys.map(callee_saved_name).unwrap_or("x12");
-                    if b_phys.is_none() {
-                        self.operand_to_x0(&args[0]);
-                        self.state.emit("    mov x11, x0");
-                    }
-                    if c_phys.is_none() {
-                        self.operand_to_x0(&Operand::Value(*c_ptr));
-                        self.state.emit("    mov x12, x0");
-                    }
-                    self.state
-                        .emit_fmt(format_args!("    ldr q1, [{}]", b_addr));
-                    self.state
-                        .emit_fmt(format_args!("    ldr q2, [{}]", c_addr));
-                    self.state.emit("    fmla v2.2d, v1.2d, v15.2d");
-                    self.state
-                        .emit_fmt(format_args!("    str q2, [{}]", c_addr));
-                    self.state
-                        .emit_fmt(format_args!("    ldr q1, [{}, #16]", b_addr));
-                    self.state
-                        .emit_fmt(format_args!("    ldr q2, [{}, #16]", c_addr));
-                    self.state.emit("    fmla v2.2d, v1.2d, v15.2d");
-                    self.state
-                        .emit_fmt(format_args!("    str q2, [{}, #16]", c_addr));
-                }
-            }
-
-            IntrinsicOp::MulAddF64x2Hoisted => {
-                // Two-wide group with separately rounded multiply and add, for
-                // a contract that forbids contraction. Same address scheme as
-                // the `fmla` form above; v3 carries the product so the hoisted
-                // factor in v15 survives both halves. AArch64's own vectorizer
-                // keeps using `fmla` (baseline ISA, `-ffp-contract=fast`), so
-                // this arm exists to keep the op total rather than to serve a
-                // path the middle end takes today.
+            IntrinsicOp::FmaF64x2Hoisted | IntrinsicOp::MulAddF64x2Hoisted => {
+                // One emitter for both rounding contracts, mirroring the x86
+                // backend: the ops share the address scheme, the hoisted
+                // broadcast in v15 and the 2x16-byte group shape; they differ
+                // only in whether the multiply-add fuses. Two copies of the
+                // address resolution are how such arms drift apart.
+                // `fused` selects `fmla`; otherwise v3 carries the product
+                // through a separately rounded `fmul`/`fadd` pair. AArch64's
+                // own vectorizer emits the unfused op whenever the FP
+                // contract denies contraction.
+                let fused = matches!(op, IntrinsicOp::FmaF64x2Hoisted);
                 if let Some(c_ptr) = dest_ptr {
                     let b_phys = self.operand_reg(&args[0]).filter(|r| !is_arm_fp_phys(*r));
                     let c_phys = self
@@ -671,8 +641,12 @@ impl ArmCodegen {
                             .emit_fmt(format_args!("    ldr q1, [{}{}]", b_addr, disp));
                         self.state
                             .emit_fmt(format_args!("    ldr q2, [{}{}]", c_addr, disp));
-                        self.state.emit("    fmul v3.2d, v1.2d, v15.2d");
-                        self.state.emit("    fadd v2.2d, v3.2d, v2.2d");
+                        if fused {
+                            self.state.emit("    fmla v2.2d, v1.2d, v15.2d");
+                        } else {
+                            self.state.emit("    fmul v3.2d, v1.2d, v15.2d");
+                            self.state.emit("    fadd v2.2d, v3.2d, v2.2d");
+                        }
                         self.state
                             .emit_fmt(format_args!("    str q2, [{}{}]", c_addr, disp));
                     }

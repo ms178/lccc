@@ -32216,12 +32216,41 @@ fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
     false
 }
 
-/// AArch64 NEON has 128-bit vectors, matching the two-wide F64 transform.
-/// Passes neon=true so AArch64-only widening forms (sadalp, smlal/smlal2)
-/// may be emitted; other backends reject those intrinsics.
-pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
+/// The AArch64 entry points, one per (reassociation, contraction) pair --
+/// the same matrix the x86 dispatch enumerates. The contract half was
+/// previously discarded for this target: every entry passed
+/// `FpContract::default()`, so `fma_transform_allowed` answered "no" under
+/// every flag and the fused `fmla` matmul arm was unreachable on AArch64 --
+/// even under `-ffast-math`, where the "fast_math" entry point silently
+/// contracted nothing. `neon = true` because NEON is baseline there and the
+/// widening forms (sadalp, smlal/smlal2) are AArch64-only emissions.
+fn vectorize_two_wide_mode(
+    func: &mut IrFunction,
+    fp_reassoc: bool,
+    fp_contract: FpContract,
+) -> usize {
     let cfg = CfgAnalysis::build(func);
-    vectorize_with_analysis_mode(func, &cfg, true, true, false, FpContract::default())
+    vectorize_with_analysis_mode(func, &cfg, true, true, fp_reassoc, fp_contract)
+}
+
+/// Strict contract, no reassociation (the AArch64 LATE rerun entry as well).
+pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
+    vectorize_two_wide_mode(func, false, FpContract::default())
+}
+
+/// `-ffp-contract=fast` without reassociation.
+pub(crate) fn vectorize_function_two_wide_contract(func: &mut IrFunction) -> usize {
+    vectorize_two_wide_mode(func, false, FpContract::Fast)
+}
+
+/// Reassociation without contraction (`-fassociative-math` alone).
+pub(crate) fn vectorize_function_two_wide_reassoc(func: &mut IrFunction) -> usize {
+    vectorize_two_wide_mode(func, true, FpContract::default())
+}
+
+/// Reassociation and contraction (`-ffast-math`).
+pub(crate) fn vectorize_function_two_wide_fast_math(func: &mut IrFunction) -> usize {
+    vectorize_two_wide_mode(func, true, FpContract::Fast)
 }
 
 /// x86 late rerun (post-if_convert): catches Select-shaped conditional
@@ -32230,11 +32259,6 @@ pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
 pub(crate) fn vectorize_function_late(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
     vectorize_with_analysis_mode(func, &cfg, false, false, false, FpContract::default())
-}
-
-pub(crate) fn vectorize_function_two_wide_fast_math(func: &mut IrFunction) -> usize {
-    let cfg = CfgAnalysis::build(func);
-    vectorize_with_analysis_mode(func, &cfg, true, true, true, FpContract::default())
 }
 
 #[cfg(test)]
