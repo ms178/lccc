@@ -888,6 +888,160 @@ pub(crate) fn clear_chain_candidates() {
     CHAIN_CANDIDATES.lock().unwrap().clear();
 }
 
+/// Count stack-frame memory operands in an emitted-text region: the spill
+/// proxy for the dual-layout selection.
+///
+/// Static size is a bad proxy for what a layout costs.  `linux_rbtree`'s chain
+/// order is eleven instructions LONGER and 13 % faster (16.65 vs 19.07 ms),
+/// while `zstd_count`'s is one instruction longer and 9 % slower
+/// (14.28 vs 13.08 ms) because the moved block pushes a loop counter into a
+/// slot that is reloaded every iteration.  What separates them is spill
+/// traffic, not size, and this counts it directly: a memory operand relative
+/// to the frame or stack pointer is a value that a register could have held.
+///
+/// Per-architecture spellings: x86-64/i686 `%rsp`/`%esp`/`%rbp`/`%ebp`,
+/// AArch64 `[sp,`/`[x29,`, RISC-V `(sp)`/`(s0)`.  A false positive can only
+/// make the selection more conservative (keep the pre-chain order), never
+/// change what the code computes.
+pub(crate) fn count_stack_operands(region: &str) -> usize {
+    const PATTERNS: [&str; 8] = [
+        "(%rsp", "(%rbp", "(%esp", "(%ebp", "[sp,", "[x29,", "(sp)", "(s0)",
+    ];
+    region
+        .lines()
+        .filter(|l| is_instruction_line(l))
+        .filter(|l| PATTERNS.iter().any(|p| l.contains(p)))
+        .count()
+}
+
+/// A line is an instruction when it is non-empty, is not a directive
+/// (leading `.`), not a comment (`#`), not a label (trailing `:`), and not a
+/// cfi marker — the same test [`count_instruction_lines`] uses.
+fn is_instruction_line(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty()
+        && !t.starts_with('.')
+        && !t.starts_with('#')
+        && !t.starts_with("//")
+        && !t.ends_with(':')
+        && !t.contains(".cfi_")
+}
+
+/// Static cost of the block transitions a LAYOUT leaves without a
+/// fall-through.
+///
+/// The dual-layout selection compares the chain order against the pre-chain
+/// order by counting emitted instruction lines, which is blind to the one
+/// thing block placement controls: a terminator whose target is the
+/// physically next block emits no branch at all, and a `CondBranch` whose
+/// preferred edge is next emits a NOT-taken `jcc` the front end runs straight
+/// through.  Every other transition is a fetch redirect on every execution of
+/// that block.
+///
+/// The unit is one instruction slot weighted by a static execution estimate:
+/// the chain builder's own `10^depth` model and its own edge weights, so the
+/// selection metric and the construction heuristic cannot disagree about
+/// which edge is hot.  A cold error path's `jmp` is therefore worth ~nothing
+/// and a loop-body transition is worth 10-1000 — the same proportions that
+/// make the chain builder's cost function meaningful.
+///
+/// Layout is a CFG-independent permutation, so the loop depths computed here
+/// are identical for every order of the same blocks: the metric prices only
+/// the *order*, never the code.
+pub(crate) fn layout_branch_cost(func: &IrFunction) -> u64 {
+    let n = func.blocks.len();
+    if n == 0 {
+        return 0;
+    }
+    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
+    let loops = crate::passes::loop_analysis::merge_loops_by_header(
+        crate::passes::loop_analysis::find_natural_loops(
+            cfg.num_blocks,
+            &cfg.preds,
+            &cfg.succs,
+            &cfg.idom,
+        ),
+    );
+    let mut depth = vec![0u32; n];
+    let mut innermost: Vec<Option<usize>> = vec![None; n];
+    for (li, lp) in loops.iter().enumerate() {
+        for &b in &lp.body {
+            if b >= n {
+                continue;
+            }
+            depth[b] += 1;
+            match innermost[b] {
+                None => innermost[b] = Some(li),
+                Some(prev) => {
+                    if lp.body.len() < loops[prev].body.len() {
+                        innermost[b] = Some(li);
+                    }
+                }
+            }
+        }
+    }
+    let pos_of: FxHashMap<u32, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label.0, i))
+        .collect();
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let mut labels: Vec<u32> = Vec::new();
+        collect_successor_labels(&block.terminator, &mut labels);
+        for l in labels {
+            if let Some(&t) = pos_of.get(&l) {
+                if !succs[bi].contains(&t) {
+                    succs[bi].push(t);
+                }
+            }
+        }
+    }
+    // The chain builder's structural edge weights, mirrored: 9 stays inside
+    // the loop, 8 enters a deeper nest, 5 the single successor of a
+    // straight-line block, 4 a branch in straight-line code, 1 leaves a loop.
+    let weight = |s: usize, t: usize| -> u32 {
+        if let Some(li) = innermost[s] {
+            if loops[li].body.contains(&t) {
+                9
+            } else if depth[t] > depth[s] {
+                8
+            } else {
+                1
+            }
+        } else if depth[t] > depth[s] {
+            8
+        } else if succs[s].len() == 1 {
+            5
+        } else {
+            4
+        }
+    };
+    let mut cost = 0u64;
+    for pos in 0..n {
+        // Nothing to place: a return ends the block and a jump table's cost is
+        // decided by the table, not by which case happens to be last.
+        if matches!(
+            func.blocks[pos].terminator,
+            Terminator::Return(_) | Terminator::Unreachable | Terminator::Switch { .. }
+        ) {
+            continue;
+        }
+        let best = succs[pos]
+            .iter()
+            .map(|&t| (weight(pos, t), t))
+            .max_by_key(|&(w, t)| (w, std::cmp::Reverse(t)));
+        let Some((_, t)) = best else { continue };
+        let falls_through =
+            func.blocks.get(pos + 1).map(|b| b.label.0) == Some(func.blocks[t].label.0);
+        if !falls_through {
+            cost = cost.saturating_add(10u64.saturating_pow(depth[pos].min(9)));
+        }
+    }
+    cost
+}
+
 /// Count instruction lines in an emitted-text region: the arch-neutral
 /// metric for the dual-layout selection. A line is an instruction when it
 /// is non-empty, is not a directive (leading `.`), not a comment (`#`),
@@ -971,6 +1125,62 @@ mod tests {
 
     fn labels(f: &IrFunction) -> Vec<u32> {
         f.blocks.iter().map(|b| b.label.0).collect()
+    }
+
+    /// The dual-layout metric must prefer the order whose hot block falls
+    /// through: same instructions either way, one order reaching the body by a
+    /// taken forward branch over a cold exit and the other by falling into it.
+    /// This is `hash_table`'s and `linux_rbtree`'s shape, and the metric is
+    /// worth 0.834 and 0.864 on them.
+    #[test]
+    fn branch_cost_prefers_the_fall_through_layout() {
+        //   0:        -> 1
+        //   1 header: cond(2, 4)       2 = body, 4 = exit
+        //   2 body  : cond(5, 1)       5 = cold return, else loop
+        //   4 exit  : ret
+        //   5 cold  : ret
+        let blocks = || {
+            vec![
+                blk(0, br(1)),
+                blk(1, cond(2, 4)),
+                blk(2, cond(5, 1)),
+                blk(4, ret()),
+                blk(5, ret()),
+            ]
+        };
+        let good = func_of(blocks());
+        let good_cost = layout_branch_cost(&good);
+        let mut bad_blocks = blocks();
+        bad_blocks.swap(2, 3); // the cold return wedges in before the body
+        let bad_cost = layout_branch_cost(&func_of(bad_blocks));
+        assert!(
+            good_cost < bad_cost,
+            "fall-through layout must be cheaper: good={} bad={}",
+            good_cost,
+            bad_cost
+        );
+    }
+
+    /// Straight-line code has nothing to place, so it costs nothing: the metric
+    /// must never justify moving a block in a function without loops.
+    #[test]
+    fn branch_cost_of_a_straight_line_chain_is_zero() {
+        let f = func_of(vec![blk(0, br(1)), blk(1, br(2)), blk(2, ret())]);
+        assert_eq!(layout_branch_cost(&f), 0);
+    }
+
+    /// The spill proxy counts frame-relative operands and nothing else, in
+    /// every backend's spelling.
+    #[test]
+    fn stack_operands_are_counted_across_backends() {
+        let text = "movq 8(%rsp), %rax\n\
+                    movq %rax, -16(%rbp)\n\
+                    ldr x0, [x29, #16]\n\
+                    ld a0, 8(sp)\n\
+                    movq %rax, %rbx\n\
+                    # a comment mentioning (%rsp) must not count\n\
+                    .directive (%rsp)\n";
+        assert_eq!(count_stack_operands(text), 4);
     }
 
     /// The defect this pass exists for: a search loop whose cold `return` sits

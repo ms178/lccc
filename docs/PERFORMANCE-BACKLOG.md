@@ -20,3 +20,30 @@ must distinguish code shape from measured runtime:
   `tests/benchmark/programs/crc32_nibble_hot.c`.
 - Keep the established exploratory block-layout policy at `-O1` unless a
   separately measured compile-time/code-size tradeoff justifies changing it.
+
+## Block placement and the LLVM missed-optimization campaign, batch 2
+
+`layout_branch_cost` now prices the block permutation from the CFG and is gated
+by a spill-traffic band; measured in
+[round 2](FOLLOWUP-2026-10-22-round2-layout-branch-cost.md) at −18.0 % on
+`hash_table`, −16.1 % on `linux_rbtree` and geomean 0.9947 over 67 programs.
+The remaining corpus work is inventoried there with per-item asm witnesses:
+
+1. Load-operand commutation in commutative ALU selection (`linux_find_bit`,
+   round-1 headroom 3.9 %). `load_op_fuse.rs` folds a load into an ALU only when
+   the load feeds the *source*; `a[i] & ~b[i]` selects `a[i]` as the destination,
+   so the fold never fires and the loop carries one extra `mov`. Swapping the
+   operands does not help — the destination register is already `a[i]`'s home, so
+   the fix has to be a destination hint or a `not`-into-destination pattern.
+2. Switch lowering for constant results: value table (gcc) instead of a jump
+   table plus callee-saves (`pushq %rbx`). `switch_dispatch.c` is 1.0000 today,
+   so this must be measured as *latency*, not throughput, before it is claimed.
+3. Affine loop-PRE for `IV + k` / `IV + k + 1` (`spectral_norm`, 13 %).
+4. Scalar loop unrolling before `spectral_norm`/`mandelbrot`/`fannkuch` are
+   worth touching at all.
+
+Two items are recorded as **closed**, so they are not re-litigated:
+`sdiv`-by-constant already emits a 64-bit magic multiply with a `sar` and is
+within noise of gcc in `i686_alu_chains` (`sdr7` 4.39 vs 4.43 ns); and the
+`byte_load_reassembly` hot loop *does* fold its byte loads — the residual 20 %
+is gcc's SSE2 vectorisation of the 32-byte block, not load reassembly.
