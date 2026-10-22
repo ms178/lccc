@@ -1600,6 +1600,9 @@ fn peephole_optimize_inner(
         if !sk("savreload") {
             global_changed |= spill_deref::fold_save_reload_roundtrip(&mut store, &mut infos);
         }
+        if !sk("private_spill_cycle") {
+            global_changed |= spill_deref::fold_private_spill_cycle(&mut store, &mut infos);
+        }
         if !sk("copy_prop") {
             global_changed |= copy_propagation::propagate_register_copies(&mut store, &mut infos);
         }

@@ -1170,7 +1170,10 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
             // A widening copy of the boolean is part of the idiom, whether it
             // lands back in the same family (`movzbl %bl, %ebx`) or in a fresh
             // register (`movsbq %bl, %r11`).  The copy's source must be the
-            // boolean; the destination becomes the register the `test` names.
+            // boolean, or the exact low byte of an already normalized 0/1
+            // copy. This includes chains through a different register family;
+            // reading a high byte would instead read zero, not the boolean.
+            // The destination becomes the register the `test` names.
             if test_idx.is_none() {
                 if let Some((src, dst)) = widen_copy_operands(&tn) {
                     let sfam = register_family_fast(src);
@@ -1184,8 +1187,10 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                     // condition.  Family equality is what makes the accepted
                     // 8-bit reads sound; text equality is what makes the wider
                     // ones impossible.
-                    if sfam == bool_fam
-                        && src == breg
+                    if sfam <= REG_GP_MAX
+                        && ((sfam == bool_fam && src == breg)
+                            || (widened_mask & (1u16 << sfam) != 0
+                                && src == REG_NAMES[3][sfam as usize]))
                         && dfam != REG_NONE
                         && dfam <= REG_GP_MAX
                         && dfam != 4
@@ -1347,7 +1352,18 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                 break;
             }
         }
-        if !bool_dead || !widened_dead {
+        // Across a backedge, partial setcc writes can make this sequence's
+        // OWN deleted byte reads look live. Ask about the rewritten program
+        // before refusing: every carrier reference in this straight-line span
+        // is owned above; intervening surviving lines and the cmov mention none.
+        // Neutralize both reads AND writes, so an external reader still vetoes.
+        let carriers = bool_mask | widened_mask;
+        let carriers_dead = (bool_dead && widened_dead)
+            || matches!(
+                lv.live_after_dropping_region(store, infos, cmov_i, i, cmov_i, carriers),
+                Some(live) if live & carriers == 0
+            );
+        if !carriers_dead {
             i += 1;
             continue;
         }
@@ -3252,6 +3268,52 @@ mod tests {
                 assert!(!out.contains("movzbl") && !out.contains(copy), "{out}");
             }
         }
+    }
+
+    #[test]
+    fn normalized_boolean_byte_extensions_feed_original_flags() {
+        for first in ["movzbl %r9b, %r10d", "movsbq %r9b, %r10"] {
+            for second in ["movsbl %r10b, %r11d", "movzbq %r10b, %r11"] {
+                let (changed, out) = fuse_boolean_only(&format!(
+                    "    cmpb $25, %dil\n    setbe %r9b\n    {first}\n    {second}\n    movsbq %r11b, %rcx\n    testq %rcx, %rcx\n    cmovnel %edx, %eax\n    ret\n"
+                ));
+                assert!(changed && out.contains("cmovbel"), "{out}");
+                assert!(!out.contains("setbe") && !out.contains("movsbq"), "{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn boolean_fusion_removes_only_self_supported_loop_liveness() {
+        for escape in ["", "    movb %r15b, (%rdi)\n"] {
+            let (changed, out) = fuse_boolean_only(&format!(
+                "    pushq %r15\n.Lloop:\n    cmpb $25, %dil\n    setbe %r15b\n    movzbl %r15b, %r15d\n    leal 32(%rdx), %ecx\n    testl %r15d, %r15d\n    movl %edx, %eax\n    cmovnel %ecx, %eax\n    addl $1, %esi\n    cmpl $16, %esi\n    jb .Lloop\n{escape}    popq %r15\n    ret\n"
+            ));
+            assert_eq!(changed, escape.is_empty(), "{out}");
+            assert_eq!(out.contains("setbe"), !escape.is_empty(), "{out}");
+            if changed {
+                assert!(out.contains("cmovbel"), "{out}");
+            }
+        }
+    }
+
+    #[test]
+    fn boolean_byte_extension_chains_preserve_intermediates() {
+        for (middle, tail) in [
+            ("", "    movl %r10d, (%rdi)\n    ret\n"),
+            ("    movb $2, %r10b\n", "    ret\n"),
+            ("    addl $1, %esi\n", "    ret\n"),
+            ("", "    jne .Lother\n    ret\n.Lother:\n    ret\n"),
+        ] {
+            let (changed, out) = fuse_boolean_only(&format!(
+                "    cmpb $25, %dil\n    setbe %r9b\n    movzbl %r9b, %r10d\n{middle}    movsbq %r10b, %rcx\n    testq %rcx, %rcx\n    cmovnel %edx, %eax\n{tail}"
+            ));
+            assert!(!changed, "must preserve live definitions and flags: {out}");
+        }
+        let (changed, out) = fuse_boolean_only(
+            "    cmpb $25, %dil\n    setbe %al\n    movzbl %al, %ecx\n    movsbq %ch, %rdx\n    testq %rdx, %rdx\n    cmovnel %esi, %eax\n    ret\n",
+        );
+        assert!(!changed, "high byte is not the boolean: {out}");
     }
 
     #[test]

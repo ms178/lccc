@@ -5,12 +5,60 @@ use super::*;
 pub(super) struct HotWebSteal<'a> {
     pub config: &'a RegAllocConfig,
     pub phi_pairs: &'a [PhiCoalesceCandidate],
+    pub loop_carried: &'a FxHashSet<u32>,
     pub eligible: &'a FxHashSet<u32>,
     pub iv_map: &'a FxHashMap<u32, (u32, u32)>,
     pub merged_of: &'a FxHashMap<u32, LiveInterval>,
     pub coalesce_groups: &'a FxHashMap<u32, Vec<u32>>,
     pub coalesce_member_of: &'a FxHashMap<u32, u32>,
     pub use_count: &'a FxHashMap<u32, u64>,
+}
+
+/// Allocation promotion is not destructive phi coalescing. In particular,
+/// a loop header fed by a conditional (multi-definition) merge cannot safely
+/// coalesce with that source, but may still keep its own callee-saved home.
+/// Admit only multiply defined copy destinations updated in a loop whose
+/// allocation interval covers a complete natural-loop extent. This adds no
+/// new register-sharing relation and never changes the coalescing legality gate.
+pub(super) fn loop_carried_copy_dests(
+    func: &IrFunction,
+    liveness: &LivenessResult,
+) -> FxHashSet<u32> {
+    let mut definitions = FxHashMap::<u32, usize>::default();
+    for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+        if let Some(dest) = inst.dest() {
+            *definitions.entry(dest.0).or_default() += 1;
+        }
+    }
+    let covering: FxHashSet<u32> = liveness
+        .intervals
+        .iter()
+        .filter(|iv| {
+            liveness
+                .loop_extents
+                .iter()
+                .any(|&(start, end)| iv.start <= start && iv.end >= end)
+        })
+        .map(|iv| iv.value_id)
+        .collect();
+    func.blocks
+        .iter()
+        .enumerate()
+        .filter(|(b, _)| liveness.block_loop_depth.get(*b).copied().unwrap_or(0) != 0)
+        .flat_map(|(_, b)| &b.instructions)
+        .filter_map(|inst| {
+            let Instruction::Copy {
+                dest,
+                src: Operand::Value(_),
+                ..
+            } = inst
+            else {
+                return None;
+            };
+            (definitions.get(&dest.0).copied().unwrap_or(0) > 1 && covering.contains(&dest.0))
+                .then_some(dest.0)
+        })
+        .collect()
 }
 
 pub(super) fn steal_hot_loop_webs(
@@ -20,6 +68,7 @@ pub(super) fn steal_hot_loop_webs(
     let HotWebSteal {
         config,
         phi_pairs,
+        loop_carried,
         eligible,
         iv_map,
         merged_of,
@@ -44,11 +93,13 @@ pub(super) fn steal_hot_loop_webs(
     let phi_pair_values: FxHashSet<u32> = phi_pairs
         .iter()
         .flat_map(|c| [c.phi_dest, c.backedge_src])
+        .chain(loop_carried.iter().copied())
         .collect();
     let mut candidates: Vec<(u32, u64)> = phi_pairs
         .iter()
         .map(|c| c.phi_dest)
-        .filter(|v| eligible.contains(v))
+        .chain(loop_carried.iter().copied())
+        .filter(|v| eligible.contains(v) && !config.reg_hints.contains_key(v))
         .filter(|v| !coalesce_member_of.contains_key(v))
         .filter(|v| iv_map.get(v).is_some_and(|&(s, e)| e > s))
         .map(|v| (v, web_use_count(v)))
@@ -139,6 +190,7 @@ mod tests {
         config: RegAllocConfig,
         assignments: FxHashMap<u32, PhysReg>,
         pairs: Vec<PhiCoalesceCandidate>,
+        loop_carried: FxHashSet<u32>,
         eligible: FxHashSet<u32>,
         bounds: FxHashMap<u32, (u32, u32)>,
         merged: FxHashMap<u32, LiveInterval>,
@@ -169,6 +221,7 @@ mod tests {
                 },
                 assignments: FxHashMap::default(),
                 pairs: vec![],
+                loop_carried: FxHashSet::default(),
                 eligible: FxHashSet::default(),
                 bounds: FxHashMap::default(),
                 merged: FxHashMap::default(),
@@ -204,6 +257,7 @@ mod tests {
                 &HotWebSteal {
                     config: &self.config,
                     phi_pairs: &self.pairs,
+                    loop_carried: &self.loop_carried,
                     eligible: &self.eligible,
                     iv_map: &self.bounds,
                     merged_of: &self.merged,
@@ -213,6 +267,121 @@ mod tests {
                 },
             )
         }
+    }
+
+    #[test]
+    fn hot_web_promotes_loop_state_without_destructive_coalescing() {
+        let mut f = Fixture::new();
+        f.holder(1, 1, (0, 100), 10);
+        f.candidate(10, (20, 80), 40);
+        f.pairs.clear(); // Its multi-definition backedge cannot be coalesced.
+        f.loop_carried.insert(10);
+        assert_eq!(f.run(), 1);
+        assert_eq!(f.assignments.get(&10), Some(&PhysReg(1)));
+        assert!(!f.assignments.contains_key(&1));
+        assert!(f.groups.is_empty() && f.members.is_empty());
+    }
+
+    #[test]
+    fn hot_web_does_not_promote_an_abi_hinted_candidate() {
+        let mut f = Fixture::new();
+        f.holder(1, 1, (0, 100), 1);
+        f.candidate(10, (20, 80), 40);
+        f.loop_carried.insert(10);
+        f.config.reg_hints.insert(10, PhysReg(10));
+        assert_eq!(f.run(), 0);
+    }
+
+    #[test]
+    fn hot_web_preserves_noncoalescible_loop_state_holders() {
+        let mut f = Fixture::new();
+        f.holder(1, 1, (0, 100), 1);
+        f.loop_carried.insert(1);
+        f.candidate(10, (20, 80), 40);
+        assert_eq!(f.run(), 0);
+        assert_eq!(f.assignments.get(&1), Some(&PhysReg(1)));
+    }
+
+    #[test]
+    fn loop_state_discovery_separates_header_state_from_conditional_merges() {
+        use crate::ir::reexports::{BasicBlock, BlockId, IrCmpOp, Value};
+        let copy = |dest, src| Instruction::Copy {
+            dest: Value(dest),
+            src,
+        };
+        let branch = |target| Terminator::Branch(BlockId(target));
+        let block = |label, instructions, terminator| BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: vec![],
+        };
+        let mut func = IrFunction::new("conditional_recurrence".into(), IrType::U64, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: IrType::U64,
+                    },
+                    copy(10, Operand::Const(IrConst::I64(0))),
+                ],
+                branch(1),
+            ),
+            block(
+                1,
+                vec![
+                    Instruction::BinOp {
+                        dest: Value(11),
+                        op: IrBinOp::Add,
+                        lhs: Operand::Value(Value(10)),
+                        rhs: Operand::Const(IrConst::I64(1)),
+                        ty: IrType::U64,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(12),
+                        op: IrCmpOp::Ult,
+                        lhs: Operand::Value(Value(11)),
+                        rhs: Operand::Value(Value(0)),
+                        ty: IrType::U64,
+                    },
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(12)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(2, vec![copy(20, Operand::Value(Value(11)))], branch(4)),
+            block(3, vec![copy(20, Operand::Value(Value(0)))], branch(4)),
+            block(
+                4,
+                vec![copy(10, Operand::Value(Value(20)))],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(12)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(5),
+                },
+            ),
+            block(
+                5,
+                vec![],
+                Terminator::Return(Some(Operand::Value(Value(10)))),
+            ),
+        ];
+        func.next_value_id = 21;
+        let live = compute_live_intervals(&func);
+        assert_eq!(
+            loop_carried_copy_dests(&func, &live),
+            FxHashSet::from_iter([10])
+        );
+        assert!(
+            !detect_phi_coalesce_groups_with_config(&func, &live, &RaConfig::default())
+                .iter()
+                .any(|pair| pair.phi_dest == 10)
+        );
     }
 
     #[test]

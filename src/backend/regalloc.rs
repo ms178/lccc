@@ -4788,15 +4788,20 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let x86_64_pool = crate::common::types::target_elf_machine() == 62
         && !config.available_regs.is_empty()
         && config.available_regs.iter().all(|r| (1..=6).contains(&r.0));
-    if !config.ra_config.no_hot_web_steal
-        && (i686_narrow_pool || x86_64_pool)
-        && !all_phi_pairs.is_empty()
-    {
+    if !config.ra_config.no_hot_web_steal && (i686_narrow_pool || x86_64_pool) {
+        // Broaden allocation promotion, not phi coalescing, on the measured
+        // x86-64 pool. Keep the established narrow-register i686 policy.
+        let loop_carried = if x86_64_pool {
+            hot_web::loop_carried_copy_dests(func, &liveness)
+        } else {
+            FxHashSet::default()
+        };
         hot_web::steal_hot_loop_webs(
             &mut assignments,
             &hot_web::HotWebSteal {
                 config,
                 phi_pairs: &all_phi_pairs,
+                loop_carried: &loop_carried,
                 eligible: &eligible,
                 iv_map: &iv_map,
                 merged_of: &merged_of,

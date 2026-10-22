@@ -1971,6 +1971,91 @@ impl<'a> IfConvCtx<'a> {
     }
 }
 
+/// Static profitability prior, not a fact about the program's input distribution.
+/// Equality with one pattern of at least eight masked bits is usually predictable;
+/// eagerly executing a large arm then costs more than keeping its branch. Never
+/// use this estimate to eliminate an edge or relax a speculation-safety check.
+fn rare_masked_outcome(ctx: &IfConvCtx<'_>, cond: &Operand, fuel: usize) -> Option<bool> {
+    if fuel == 0 {
+        return None;
+    }
+    let Operand::Value(v) = cond else { return None };
+    let inst = ctx.defs.get(&ctx.resolve(v).0)?;
+    let masked_bits = |value: &Operand| -> Option<u64> {
+        let Operand::Value(v) = value else {
+            return None;
+        };
+        let Instruction::BinOp {
+            op: IrBinOp::And,
+            lhs,
+            rhs,
+            ty,
+            ..
+        } = ctx.defs.get(&ctx.resolve(v).0)?
+        else {
+            return None;
+        };
+        if !ty.is_integer() || ty.size() > 8 {
+            return None;
+        }
+        let c = match (lhs, rhs) {
+            (Operand::Const(c), _) | (_, Operand::Const(c)) => c.to_i64()? as u64,
+            _ => return None,
+        };
+        let bits = ty.size() * 8;
+        let mask = c & (u64::MAX >> (64 - bits));
+        (mask.count_ones() >= 8).then_some(mask)
+    };
+    match inst {
+        Instruction::Cmp {
+            op: op @ (IrCmpOp::Eq | IrCmpOp::Ne),
+            lhs,
+            rhs,
+            ..
+        } => {
+            let (value, constant) = match (lhs, rhs) {
+                (Operand::Const(c), value) | (value, Operand::Const(c)) => {
+                    (value, c.to_i64()? as u64)
+                }
+                _ => return None,
+            };
+            if let Some(mask) = masked_bits(value) {
+                // An impossible pattern is left to constant folding, not priced
+                // as an ordinary rare branch.
+                return (constant & !mask == 0).then_some(*op == IrCmpOp::Eq);
+            }
+            // Frontend truth normalization can wrap a boolean compare in
+            // `!= 0` / `== 1`. Restrict recursion to 0/1-producing comparisons.
+            let Operand::Value(v) = value else {
+                return None;
+            };
+            if constant > 1
+                || !matches!(
+                    ctx.defs.get(&ctx.resolve(v).0),
+                    Some(Instruction::Cmp { .. })
+                )
+            {
+                return None;
+            }
+            let rare = rare_masked_outcome(ctx, value, fuel - 1)?;
+            Some((rare == (constant != 0)) == (*op == IrCmpOp::Eq))
+        }
+        Instruction::BinOp {
+            op: IrBinOp::And, ..
+        } => masked_bits(cond).map(|_| false),
+        _ => None,
+    }
+}
+
+fn speculative_arm_budget(ctx: &IfConvCtx<'_>, cond: &Operand, outcome: bool) -> usize {
+    let usual = crate::backend::x86::cpu_model::active().if_convert_arm_budget();
+    if rare_masked_outcome(ctx, cond, 8) == Some(outcome) {
+        usual.min(2)
+    } else {
+        usual
+    }
+}
+
 /// Whether a load in an arm block may be executed unconditionally (hoisted
 /// into the branch pred).  Loads trap on invalid addresses, so speculation
 /// changes observable behavior unless the address is touched on EVERY path
@@ -2652,7 +2737,8 @@ fn detect_diamond(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
     // system generates Load + Cast chains (parameter loads + sign
     // extensions) that inflate the count; a typical arm: Load, Cast, Load,
     // Cast, BinOp, Cast = 6 insts.  See docs/CPU_MODEL_AUDIT.md §4.
-    let max_arm_insts: usize = crate::backend::x86::cpu_model::active().if_convert_arm_budget();
+    let true_budget = speculative_arm_budget(ctx, cond, true);
+    let false_budget = speculative_arm_budget(ctx, cond, false);
     // EFFECTIVE instruction count: address-materialization chains (IV Cast,
     // Shl scaling, base Copy, the GEP itself) are pure address math the
     // backend folds into one SIB operand — they add nothing speculative.
@@ -2661,7 +2747,7 @@ fn detect_diamond(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> {
     // shape: each arm = {Cast,Shl,Copy,Shl,GEP,Load,Cast,Add} — 8 raw,
     // 3 effective (Load, Cast, Add).  For a multi-block region the budget
     // covers the WHOLE region — the speculation cost is the sum.
-    if true_arm.effective_len > max_arm_insts || false_arm.effective_len > max_arm_insts {
+    if true_arm.effective_len > true_budget || false_arm.effective_len > false_budget {
         return None;
     }
 
@@ -2860,7 +2946,7 @@ fn detect_triangle(ctx: &IfConvCtx<'_>, pred_idx: usize) -> Option<DiamondInfo> 
     }
 
     // Same tuning-model budget as the diamond form above.
-    let max_arm_insts: usize = crate::backend::x86::cpu_model::active().if_convert_arm_budget();
+    let max_arm_insts = speculative_arm_budget(ctx, cond, arm_is_true);
     let arm_insts = if arm_block.instructions.iter().all(|i| {
         matches!(
             i,
@@ -3157,6 +3243,149 @@ mod tests {
     use super::*;
     use crate::common::types::AddressSpace;
     use crate::ir::reexports::{IrBinOp, IrConst};
+
+    fn masked_triangle(
+        mask: i64,
+        pattern: i64,
+        op: IrCmpOp,
+        arm_true: bool,
+        cost: u32,
+    ) -> IrFunction {
+        let mut func = IrFunction::new("masked_update".into(), IrType::U64, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::U64,
+                },
+                Instruction::BinOp {
+                    dest: Value(1),
+                    op: IrBinOp::And,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I64(mask)),
+                    ty: IrType::U64,
+                },
+                Instruction::Cmp {
+                    dest: Value(2),
+                    op,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(pattern)),
+                    ty: IrType::U64,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(if arm_true { 1 } else { 2 }),
+                false_label: BlockId(if arm_true { 2 } else { 1 }),
+            },
+            source_spans: vec![],
+        });
+        let instructions = (0..cost)
+            .map(|i| Instruction::BinOp {
+                dest: Value(10 + i),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(if i == 0 { 0 } else { 9 + i })),
+                rhs: Operand::Value(Value(0)),
+                ty: IrType::U64,
+            })
+            .collect();
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions,
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: vec![],
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![Instruction::Phi {
+                dest: Value(30),
+                ty: IrType::U64,
+                incoming: vec![
+                    (Operand::Value(Value(0)), BlockId(0)),
+                    (Operand::Value(Value(9 + cost)), BlockId(1)),
+                ],
+            }],
+            terminator: Terminator::Return(Some(Operand::Value(Value(30)))),
+            source_spans: vec![],
+        });
+        func.next_value_id = 31;
+        func
+    }
+
+    #[test]
+    fn rare_masked_updates_keep_expensive_arms_but_not_cheap_selects() {
+        for (op, rare) in [(IrCmpOp::Eq, true), (IrCmpOp::Ne, false)] {
+            for mask in [255, 0x101010101010101, -1] {
+                for cost in [2, 3, 6] {
+                    let func = masked_triangle(mask, 0, op, rare, cost);
+                    let ctx = IfConvCtx::build(&func);
+                    assert_eq!(
+                        rare_masked_outcome(&ctx, &Operand::Value(Value(2)), 8),
+                        Some(rare)
+                    );
+                    assert_eq!(detect_triangle(&ctx, 0).is_some(), cost <= 2);
+                    // The opposite edge has the usual budget, not the rare-edge budget.
+                    let common = masked_triangle(mask, 0, op, !rare, cost);
+                    assert!(detect_triangle(&IfConvCtx::build(&common), 0).is_some());
+                }
+            }
+        }
+        for mask in [1, 127] {
+            let func = masked_triangle(mask, 0, IrCmpOp::Eq, true, 6);
+            assert!(detect_triangle(&IfConvCtx::build(&func), 0).is_some());
+        }
+    }
+
+    #[test]
+    fn rare_pattern_prior_handles_truth_normalization_and_impossible_patterns() {
+        let mut func = masked_triangle(255, 19, IrCmpOp::Eq, true, 6);
+        func.blocks[0].instructions.push(Instruction::Cmp {
+            dest: Value(3),
+            op: IrCmpOp::Eq,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Const(IrConst::I32(0)),
+            ty: IrType::I32,
+        });
+        let ctx = IfConvCtx::build(&func);
+        assert_eq!(
+            rare_masked_outcome(&ctx, &Operand::Value(Value(3)), 8),
+            Some(false)
+        );
+        assert_eq!(
+            rare_masked_outcome(&ctx, &Operand::Value(Value(3)), 0),
+            None
+        );
+        let impossible = masked_triangle(255, 256, IrCmpOp::Eq, true, 6);
+        assert_eq!(
+            rare_masked_outcome(&IfConvCtx::build(&impossible), &Operand::Value(Value(2)), 8),
+            None
+        );
+        let relational = masked_triangle(255, 0, IrCmpOp::Ult, true, 6);
+        assert_eq!(
+            rare_masked_outcome(&IfConvCtx::build(&relational), &Operand::Value(Value(2)), 8),
+            None
+        );
+    }
+
+    #[test]
+    fn diamond_rare_arm_uses_the_same_speculation_budget() {
+        let mut func = masked_triangle(255, 0, IrCmpOp::Eq, true, 6);
+        if let Terminator::CondBranch { false_label, .. } = &mut func.blocks[0].terminator {
+            *false_label = BlockId(3);
+        }
+        if let Instruction::Phi { incoming, .. } = &mut func.blocks[2].instructions[0] {
+            incoming[0].1 = BlockId(3);
+        }
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: vec![],
+        });
+        assert!(detect_diamond(&IfConvCtx::build(&func), 0).is_none());
+    }
 
     #[test]
     fn test_value_only_controls_branch() {

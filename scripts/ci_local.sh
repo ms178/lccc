@@ -340,6 +340,9 @@ gate "binary-equivalence-contracts" fast \
 gate "benchmark-harness-contracts" fast \
     python3 tests/benchmark/test_benchmark_harness.py
 
+gate "benchmark-ranking-contracts" fast \
+    python3 -m unittest discover -s scripts -p test_bench_rank.py
+
 gate "gcc-provisioning-mocks" fast \
     python3 tests/regression/check_ci_gcc16_provisioning.py
 
@@ -1428,6 +1431,12 @@ gate "rmw-index-zext" fast \
 
 gate "select-from-compare" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_select_from_compare.sh
+
+gate "sparse-mask-updates" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_sparse_mask_updates.sh
+
+gate "pointer-ring-indexing" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_pointer_ring_indexing.sh
 
 gate "affine-loop-fold" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_affine_loop_fold.sh

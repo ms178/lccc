@@ -46,7 +46,7 @@ def _median(stats: dict[str, Any] | None) -> float | None:
     if not stats:
         return None
     value = stats.get("median")
-    return float(value) if isinstance(value, (int, float)) else None
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
 
 
 def load_rows(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -115,7 +115,7 @@ def load_rows(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
 
 def geometric_mean(values: list[float]) -> float | None:
-    positive = [value for value in values if value and value > 0]
+    positive = [value for value in values if math.isfinite(value) and value > 0]
     if not positive:
         return None
     return math.exp(sum(math.log(value) for value in positive) / len(positive))
@@ -187,19 +187,27 @@ def render_table(rows: list[dict[str, Any]], *, show_size: bool, reference: str)
 
 
 def render_markdown(rows: list[dict[str, Any]], document: dict[str, Any],
-                    groups: dict[str, list[dict[str, Any]]], threshold: float) -> str:
-    aggregate = document.get("aggregate_lccc_vs_gcc") or {}
+                    groups: dict[str, list[dict[str, Any]]], threshold: float,
+                    limit: int | None = None) -> str:
+    # Derive the same eligible-pair aggregate as the text view, rather than
+    # assuming producer-specific aggregate field names (or reference compiler).
+    ratios = [row["ratio"] for row in rows if row.get("correct")
+              and row.get("ratio") and math.isfinite(row["ratio"]) and row["ratio"] > 0]
+    geo = geometric_mean(ratios)
     out = ["# LCCC benchmark ranking (worst first)", ""]
     out.append(f"- workloads: **{len(rows)}**")
-    if aggregate:
-        out.append(f"- geometric mean ratio: **{aggregate.get('geometric_mean', float('nan')):.4f}**")
-        out.append(f"- arithmetic mean ratio: **{aggregate.get('arithmetic_mean', float('nan')):.4f}**")
+    if geo is not None:
+        out.append(f"- geometric mean ratio: **{geo:.4f}**")
+        out.append(f"- arithmetic mean ratio: **{sum(ratios) / len(ratios):.4f}**")
+        out.append(f"- correct comparable pairs: **{len(ratios)}**")
+    if limit is not None:
+        out.append(f"- showing worst: **{min(limit, len(rows))}** (aggregates cover all eligible pairs)")
     out.append(f"- policy threshold: ±{threshold * 100:.0f}% (significant pairs only)")
     for key in ("regressed", "improved", "unchanged", "unknown"):
         out.append(f"- {key}: **{len(groups[key])}**")
     out += ["", "| # | workload | lccc | ref | ratio | significant | 95% CI |",
             "|---|----------|-----:|----:|------:|:-----------:|--------|"]
-    for index, row in enumerate(rows, 1):
+    for index, row in enumerate(rows if limit is None else rows[:limit], 1):
         ci = row.get("ci")
         ci_text = (f"[{ci[0]:.3f}, {ci[1]:.3f}]"
                    if isinstance(ci, (list, tuple)) and len(ci) == 2 else "—")
@@ -261,7 +269,7 @@ def main() -> int:
         return 0
 
     if args.markdown:
-        sys.stdout.write(render_markdown(rows, document, groups, args.threshold))
+        sys.stdout.write(render_markdown(rows, document, groups, args.threshold, None if args.all else args.worst))
         return 0
 
     selected = rows if args.all else rows[: args.worst]

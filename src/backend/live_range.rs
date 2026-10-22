@@ -1970,6 +1970,15 @@ impl LinearScanAllocator {
                     && nxt > pos
                     && (priority as u128) * (k as u128) < (bar as u128)
                     && interval.range.remaining_cost(nxt) == 0
+                    // A web/priority boost is not a saved reload. Require a
+                    // strict gain in the actual remaining use-site cost too;
+                    // two entry relays with one use each cannot pay for a steal.
+                    && incoming.remaining_cost(pos) > interval.range.remaining_cost(pos)
+                    // A last textual use is not the last dynamic use of a
+                    // loop-spanning value. A short temporary must not escape
+                    // on that false zero-future-cost estimate and displace a
+                    // base needed again at the backedge.
+                    && (!interval.range.spans_loop || incoming.spans_loop)
                     // A slot-operand-only incoming gains ~nothing from the
                     // register: its remaining uses are served from the slot
                     // with zero instructions (an integer compare's RHS
@@ -5184,6 +5193,27 @@ mod tests {
         e.init_registers();
         e.allocate_range(victim);
         assert_eq!(e.select_evict_victim(&incoming, 3), None);
+    }
+
+    #[test]
+    fn boosted_priority_does_not_make_equal_entry_reloads_profitable() {
+        let victim = lr(1, 0, 200, vec![1, 80], 1);
+        let incoming = lr(2, 50, 120, vec![119], 700);
+        let mut allocator = LinearScanAllocator::new(vec![], vec![PhysReg(0)]);
+        allocator.init_registers();
+        allocator.allocate_range(victim);
+        assert_eq!(allocator.select_evict_victim(&incoming, 3), None);
+    }
+
+    #[test]
+    fn short_incoming_does_not_escape_over_cyclic_victim_uses() {
+        let mut victim = lr(1, 0, 200, vec![1, 80], 20);
+        victim.spans_loop = true;
+        let incoming = lr(2, 50, 120, vec![60, 119], 700);
+        let mut allocator = LinearScanAllocator::new(vec![], vec![PhysReg(0)]);
+        allocator.init_registers();
+        allocator.allocate_range(victim);
+        assert_eq!(allocator.select_evict_victim(&incoming, 3), None);
     }
 
     /// The escape never fires on behalf of a slot-operand-only incoming
