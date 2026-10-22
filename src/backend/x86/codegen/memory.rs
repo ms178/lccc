@@ -3699,7 +3699,7 @@ impl X86Codegen {
             && !self.no_sse
             && std::env::var_os("CCC_NO_64B_YMM_COPY").is_none()
         {
-            if self.avx512_enabled {
+            if self.avx512_enabled && self.wide_simd_copies {
                 // Exact 64-byte copy. A single full-width store also avoids
                 // the two-YMM-store -> ZMM-load forwarding penalty when an
                 // EVEX intrinsic immediately consumes this aggregate.

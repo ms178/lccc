@@ -3,7 +3,7 @@
 
 Use immutable --before/--before-include snapshots. Before defects are retained
 as failures and never timed. After and vendor failures abort. Run only on an
-AVX-512F/DQ host, without concurrent compiler builds or other timing jobs.
+x86-64-v4 host, without concurrent compiler builds or other timing jobs.
 """
 import argparse
 import hashlib
@@ -40,8 +40,8 @@ def main():
     if args.rounds < 7 or not math.isfinite(args.minimum_seconds) or args.minimum_seconds < 0.2:
         ap.error('require at least seven rounds and 0.2 seconds per sample')
     flags_cpu = Path('/proc/cpuinfo').read_text().split('flags', 1)[1].splitlines()[0]
-    if not all(x in flags_cpu.split() for x in ('avx512f', 'avx512dq')):
-        ap.error('AVX-512F/DQ execution hardware is required')
+    if not all(x in flags_cpu.split() for x in ('avx2', 'avx512f', 'avx512dq', 'avx512cd', 'avx512bw', 'avx512vl')):
+        ap.error('complete x86-64-v4 execution hardware is required')
     cpu = min(os.sched_getaffinity(0))
     os.sched_setaffinity(0, {cpu})
     out = args.output.resolve()

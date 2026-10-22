@@ -945,6 +945,9 @@ pub struct X86Codegen {
     pub(super) isa: super::super::isa::X86Isa,
     /// True when the target has AVX-512F; enables EVEX GPR-source broadcasts.
     pub(super) avx512_enabled: bool,
+    /// Per-function measured copy policy: only audited wide conversion/cast
+    /// webs use ZMM aggregate copies. Plain memcpy loops retain YMM.
+    pub(super) wide_simd_copies: bool,
     /// AVX-512VL *with* the F base (see `CodegenOptions::avx512vl`): the
     /// 128/256-bit EVEX permission.  Gates the xmm/ymm `vprold` rotate —
     /// one µop where the AVX2 form needs vpslld+vpsrld+vpor.
@@ -1482,6 +1485,7 @@ impl X86Codegen {
             avx2_enabled: false,
             isa: super::super::isa::X86Isa::default(),
             avx512_enabled: false,
+            wide_simd_copies: false,
             avx512vl_enabled: false,
             optimize_for_size: false,
             skip_i32_sext: false,

@@ -2055,8 +2055,9 @@ fn downgrade_in_function(func: &mut IrFunction) -> usize {
                 ..
             } = inst
             {
-                if matches!(*size, 16 | 32 | 64) && *align > 16 && !*volatile && !*semantic_volatile
-                {
+                // Keep 64-byte homes cache-line aligned: a full-width store/reload
+                // crossing a line can lose store forwarding despite fewer LEAs.
+                if matches!(*size, 16 | 32) && *align > 16 && !*volatile && !*semantic_volatile {
                     sizes.insert(dest.0, *size);
                     required_align.insert(dest.0, 0usize);
                     safe.insert(dest.0);
@@ -2385,7 +2386,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_unaligned_homes_relax_but_observable_addresses_do_not() {
+    fn wide_vector_homes_preserve_cache_line_alignment() {
         for observable in [false, true] {
             let mut instructions = vec![
                 alloca(0, 64, 64),
@@ -2411,7 +2412,7 @@ mod tests {
                 });
             }
             let mut f = function("wide_alignment", vec![block(0, instructions)]);
-            assert_eq!(downgrade_in_function(&mut f), usize::from(!observable));
+            assert_eq!(downgrade_in_function(&mut f), 0);
         }
     }
 
