@@ -32,7 +32,9 @@ The remaining corpus work is inventoried there with per-item asm witnesses:
 1. Load-operand commutation in commutative ALU selection (`linux_find_bit`,
    round-1 headroom 3.9 %). `load_op_fuse.rs` folds a load into an ALU only when
    the load feeds the *source*; `a[i] & ~b[i]` selects `a[i]` as the destination,
-   so the fold never fires and the loop carries one extra `mov`.
+   so the fold never fires and the loop carries one extra `mov`. Swapping the
+   operands does not help — the destination register is already `a[i]`'s home, so
+   the fix has to be a destination hint or a `not`-into-destination pattern.
 2. Switch lowering for constant results: value table (gcc) instead of a jump
    table plus callee-saves (`pushq %rbx`). `switch_dispatch.c` is 1.0000 today,
    so this must be measured as *latency*, not throughput, before it is claimed.

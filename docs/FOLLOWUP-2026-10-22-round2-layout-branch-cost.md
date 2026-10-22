@@ -127,9 +127,14 @@ against gcc 12.2 at `-O2`; none is claimed as a measured win yet, and per
    and %rbx,%r10` — four instructions per word where gcc emits three
    (`mov / not / and (%rdi,…),%rdx`). The fold exists (`load_op_fuse.rs`) but
    only fires when the loaded value is the *source*; here it is the destination
-   because selection assigned the destination first. Fix: when selecting a
-   commutative ALU op with one register and one single-use load operand, prefer
-   the register as destination so the load can fold. Witness:
+   because selection assigned the destination first. Note what the fix is *not*:
+   swapping the two operands is not enough, because the destination physical
+   register is already committed to `a[i]`'s home, and moving `~b[i]` there is
+   another `mov`. What is needed is for the *destination* to be `~b[i]`'s home —
+   either a hint change in `live_range` (wide blast radius, needs a full sweep)
+   or a machine pattern that re-materialises the `not` into the destination and
+   folds `a[i]` as the memory operand (`mov MEM2,%d / not %d / and MEM1,%d`).
+   Witness:
    `tests/benchmark/programs/linux_find_bit.c`. Round 2 measured the fold by hand
    on the shipped assembly: −2.5 %, and it brings the word loop to nine
    instructions, exactly gcc's count — the remaining 22 % is *not* this fold
