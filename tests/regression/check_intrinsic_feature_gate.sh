@@ -130,12 +130,27 @@ EOF
 # 3. GCC oracle: where GCC ships the same intrinsic, its accept/reject verdict
 #    must match ours.  GCC's DEFAULT is x86-64 (v1) while this project's is
 #    x86-64-v3, so only the explicit cases are comparable.
-gcc_bin=${GCC:-gcc}
-if ! command -v "$gcc_bin" >/dev/null 2>&1; then
-    echo "SKIP: oracle unavailable ($gcc_bin not found); the contract above still ran" >&2
+# The oracle is version-sensitive: `-mvaes` and `-mvpclmulqdq` only imply the
+# AVX (VEX) class from GCC 13 on.  A stock Debian `gcc` is 12 and rejects the
+# 256-bit intrinsic that GCC 16 accepts, so resolving a bare `gcc` here turned
+# a correct tree into a red gate.  The contract is GCC 16.2 (docs/toolchains),
+# so prefer the newest GCC on PATH and record the version that answered.
+gcc_bin=${GCC:-}
+if [ -z "$gcc_bin" ]; then
+    for candidate in gcc-17 gcc-16 gcc-15 gcc-14 gcc-13 gcc; do
+        if command -v "$candidate" >/dev/null 2>&1; then gcc_bin=$candidate; break; fi
+    done
+fi
+if [ -z "$gcc_bin" ] || ! command -v "$gcc_bin" >/dev/null 2>&1; then
+    echo "SKIP: oracle unavailable (${gcc_bin:-gcc} not found); the contract above still ran" >&2
     echo "PASS: intrinsic feature gate (no oracle on this host)"
     exit 0
 fi
+gcc_major=$("$gcc_bin" -dumpversion 2>/dev/null | cut -d. -f1)
+case ${gcc_major:-0} in
+    ''|*[!0-9]*) gcc_major=0 ;;
+esac
+echo "oracle: $gcc_bin (GCC $gcc_major)"
 
 cat >"$tmp/o_crc.c" <<'EOF'
 #include <nmmintrin.h>
@@ -197,15 +212,57 @@ compare o_vpclmul256.c -march=x86-64-v3 -mvpclmulqdq
 compare o_vpclmul256.c -march=alderlake
 
 # VAES and VPCLMULQDQ at 256 bits are VEX.256 forms whose class is AVX, not
-# AVX2 (measured gcc 14: `-mvaes -mno-avx2` and bare `-mvaes` accept the
+# AVX2 (measured gcc 16: `-mvaes -mno-avx2` and bare `-mvaes` accept the
 # 256-bit intrinsic; `-mvaes -mno-avx` rejects). The extension flags also
 # imply AVX, as GCC defines __AVX__ for them. These are exact GCC comparisons.
 compare o_vaes256.c -march=x86-64-v3 -mvaes -mno-avx2
-compare o_vaes256.c -mvaes
-compare o_vaes256.c -march=x86-64 -mvaes
 compare o_vaes256.c -march=x86-64-v3 -mvaes -mno-avx
-compare o_vpclmul256.c -mvpclmulqdq
-compare o_vpclmul256.c -march=x86-64 -mvpclmulqdq
+
+# The bare-flag rows encode the GCC >= 13 implication, and an older oracle
+# answers the opposite verdict for CORRECT code: GCC 12 sets only __VAES__ for
+# `-mvaes`, so it cannot compile the 256-bit intrinsic at all.  Skipping them
+# on a pre-13 oracle keeps the gate honest about what it compared instead of
+# failing the tree for the host's default compiler; CI provisions GCC 16, so
+# the rows always run there.
+if [ "$gcc_major" -ge 13 ]; then
+    compare o_vaes256.c -mvaes
+    compare o_vaes256.c -march=x86-64 -mvaes
+    compare o_vpclmul256.c -mvpclmulqdq
+    compare o_vpclmul256.c -march=x86-64 -mvpclmulqdq
+else
+    echo "skip: $gcc_bin is GCC $gcc_major (< 13); the -mvaes/-mvpclmulqdq" \
+         "implied-AVX rows need an oracle that implements the implication"
+fi
+
+# The implication must be visible in the predefined macros as well, or code
+# guarded by `#ifdef __AVX__` disagrees with the code the compiler emits -- the
+# same class of latent ABI bug the intrinsics rows catch.  Pin it against the
+# oracle when it is modern enough to define it, and against the literal GCC 16
+# contract otherwise.
+macros_of() {
+    local cc=$1
+    shift
+    "$cc" "$@" -dM -E -x c /dev/null 2>/dev/null |
+        grep -E '^#define (__AVX__|__AVX2__|__VAES__|__VPCLMULQDQ__) ' | sort
+}
+if [ "$gcc_major" -ge 13 ]; then
+    for flags in -mvaes -mvpclmulqdq; do
+        [ "$(macros_of "$ccc" "$flags")" = "$(macros_of "$gcc_bin" "$flags")" ] ||
+            fail "predefined macros under $flags differ from $gcc_bin: the flag" \
+                 "implies a VEX class the oracle does not"
+    done
+else
+    for pair in "-mvaes __VAES__" "-mvpclmulqdq __VPCLMULQDQ__"; do
+        set -- $pair
+        macros_of "$ccc" "$1" | grep -q '^#define __AVX__ 1$' ||
+            fail "$1 must imply __AVX__ (GCC 16 does; the 256-bit form needs" \
+                 "the VEX class)"
+        macros_of "$ccc" "$1" | grep -q "^#define $2 1$" ||
+            fail "$1 must define $2"
+    done
+fi
+macros_of "$ccc" -mvaes -mno-avx | grep -q '__AVX__' &&
+    fail "-mno-avx must remove __AVX__ even when -mvaes is present"
 
 # ---------------------------------------------------------------------------
 # AVX-VNNI, AVX-VNNI-INT8 and AVX-VNNI-INT16: three extensions, three bits,
