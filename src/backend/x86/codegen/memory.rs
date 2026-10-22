@@ -3699,10 +3699,18 @@ impl X86Codegen {
             && !self.no_sse
             && std::env::var_os("CCC_NO_64B_YMM_COPY").is_none()
         {
-            self.state.emit("    vmovdqu (%rsi), %ymm0");
-            self.state.emit("    vmovdqu %ymm0, (%rdi)");
-            self.state.emit("    vmovdqu 32(%rsi), %ymm1");
-            self.state.emit("    vmovdqu %ymm1, 32(%rdi)");
+            if self.avx512_enabled && self.wide_simd_copies {
+                // Exact 64-byte copy. A single full-width store also avoids
+                // the two-YMM-store -> ZMM-load forwarding penalty when an
+                // EVEX intrinsic immediately consumes this aggregate.
+                self.state.emit("    vmovdqu64 (%rsi), %zmm0");
+                self.state.emit("    vmovdqu64 %zmm0, (%rdi)");
+            } else {
+                self.state.emit("    vmovdqu (%rsi), %ymm0");
+                self.state.emit("    vmovdqu %ymm0, (%rdi)");
+                self.state.emit("    vmovdqu 32(%rsi), %ymm1");
+                self.state.emit("    vmovdqu %ymm1, 32(%rdi)");
+            }
             self.state.emit("    vzeroupper");
             // The upper halves are clean again right here; any later 256-bit
             // op re-arms the epilogue vzeroupper via dirty_upper_ymm.

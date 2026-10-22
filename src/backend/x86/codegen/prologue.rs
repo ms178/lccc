@@ -459,6 +459,24 @@ impl X86Codegen {
         }
         // Store function pointer for indexed addressing detection
         self.current_func = Some(func as *const IrFunction);
+        self.wide_simd_copies = func.blocks.iter().any(|block| {
+            block.instructions.iter().any(|inst| {
+                matches!(
+                    inst,
+                    Instruction::Intrinsic {
+                        op: IntrinsicOp::CvtPs2Pd512
+                            | IntrinsicOp::CvtEp32_2Pd512
+                            | IntrinsicOp::CvtPd2Ps512
+                            | IntrinsicOp::CvtPd2Ep32_512
+                            | IntrinsicOp::CvttPd2Ep32_512
+                            | IntrinsicOp::Zext128to512
+                            | IntrinsicOp::Cast128to512
+                            | IntrinsicOp::Cast256to512,
+                        ..
+                    }
+                )
+            })
+        });
 
         // Same-block div/rem pair fusion table (one divq/divl serves a
         // URem+UDiv couple with identical operands). Constant-RHS pairs

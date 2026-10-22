@@ -1065,11 +1065,16 @@ impl I686Codegen {
                     self.store_eax_to(d);
                 }
             }
-            IntrinsicOp::CvtSs2Si128 | IntrinsicOp::CvtSd2Si128 => {
-                let inst = if matches!(op, IntrinsicOp::CvtSs2Si128) {
-                    "cvtss2si"
-                } else {
-                    "cvtsd2si"
+            IntrinsicOp::CvtSs2Si128
+            | IntrinsicOp::CvtSd2Si128
+            | IntrinsicOp::CvttSs2Si128
+            | IntrinsicOp::CvttSd2Si128 => {
+                let inst = match op {
+                    IntrinsicOp::CvtSs2Si128 => "cvtss2si",
+                    IntrinsicOp::CvtSd2Si128 => "cvtsd2si",
+                    IntrinsicOp::CvttSs2Si128 => "cvttss2si",
+                    IntrinsicOp::CvttSd2Si128 => "cvttsd2si",
+                    _ => unreachable!(),
                 };
                 self.operand_to_eax(&args[0]);
                 self.state.emit("    movdqu (%eax), %xmm0");
@@ -1542,12 +1547,16 @@ impl I686Codegen {
             }
 
             // 2-op with imm: vroundps/vroundpd/vpermilps imm (a, imm).
-            IntrinsicOp::RoundPs256 | IntrinsicOp::RoundPd256 | IntrinsicOp::VpermilPs256 => {
+            IntrinsicOp::RoundPs256
+            | IntrinsicOp::RoundPd256
+            | IntrinsicOp::VpermilPs256
+            | IntrinsicOp::VpermilPd256 => {
                 if let Some(dptr) = dest_ptr {
                     let inst = match op {
                         IntrinsicOp::RoundPs256 => "vroundps",
                         IntrinsicOp::RoundPd256 => "vroundpd",
                         IntrinsicOp::VpermilPs256 => "vpermilps",
+                        IntrinsicOp::VpermilPd256 => "vpermilpd",
                         _ => unreachable!("unexpected AVX round op: {:?}", op),
                     };
                     let imm = Self::operand_to_imm_i64(&args[1]);

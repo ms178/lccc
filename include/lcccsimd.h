@@ -71,39 +71,37 @@ typedef unsigned long long __mmask64;
 
 /* GCC-compatible vector extension types used by system headers */
 typedef float __v4sf __attribute__ ((__vector_size__ (16)));
-typedef double __v2df __attribute__ ((__vector_size__ (8)));
-typedef long long __v2di __attribute__ ((__vector_size__ (8)));
-typedef unsigned long long __v2du __attribute__ ((__vector_size__ (8)));
+typedef double __v2df __attribute__ ((__vector_size__ (16)));
+typedef long long __v2di __attribute__ ((__vector_size__ (16)));
+typedef unsigned long long __v2du __attribute__ ((__vector_size__ (16)));
 typedef int __v4si __attribute__ ((__vector_size__ (16)));
 typedef unsigned int __v4su __attribute__ ((__vector_size__ (16)));
-typedef short __v8hi __attribute__ ((__vector_size__ (32)));
-typedef unsigned short __v8hu __attribute__ ((__vector_size__ (32)));
-typedef char __v16qi __attribute__ ((__vector_size__ (64)));
-typedef signed char __v16qs __attribute__ ((__vector_size__ (64)));
-typedef unsigned char __v16qu __attribute__ ((__vector_size__ (64)));
+typedef short __v8hi __attribute__ ((__vector_size__ (16)));
+typedef unsigned short __v8hu __attribute__ ((__vector_size__ (16)));
+typedef char __v16qi __attribute__ ((__vector_size__ (16)));
+typedef signed char __v16qs __attribute__ ((__vector_size__ (16)));
+typedef unsigned char __v16qu __attribute__ ((__vector_size__ (16)));
 typedef float __v8sf __attribute__ ((__vector_size__ (32)));
-typedef double __v4df __attribute__ ((__vector_size__ (16)));
-typedef long long __v4di __attribute__ ((__vector_size__ (16)));
-typedef unsigned long long __v4du __attribute__ ((__vector_size__ (16)));
+typedef double __v4df __attribute__ ((__vector_size__ (32)));
+typedef long long __v4di __attribute__ ((__vector_size__ (32)));
+typedef unsigned long long __v4du __attribute__ ((__vector_size__ (32)));
 typedef int __v8si __attribute__ ((__vector_size__ (32)));
 typedef unsigned int __v8su __attribute__ ((__vector_size__ (32)));
-typedef short __v16hi __attribute__ ((__vector_size__ (64)));
-typedef unsigned short __v16hu __attribute__ ((__vector_size__ (64)));
-typedef char __v32qi __attribute__ ((__vector_size__ (128)));
-typedef unsigned char __v32qu __attribute__ ((__vector_size__ (128)));
+typedef short __v16hi __attribute__ ((__vector_size__ (32)));
+typedef unsigned short __v16hu __attribute__ ((__vector_size__ (32)));
+typedef char __v32qi __attribute__ ((__vector_size__ (32)));
+typedef unsigned char __v32qu __attribute__ ((__vector_size__ (32)));
 typedef float __v16sf __attribute__ ((__vector_size__ (64)));
-typedef double __v8df __attribute__ ((__vector_size__ (32)));
-typedef long long __v8di __attribute__ ((__vector_size__ (32)));
-typedef unsigned long long __v8du __attribute__ ((__vector_size__ (32)));
+typedef double __v8df __attribute__ ((__vector_size__ (64)));
+typedef long long __v8di __attribute__ ((__vector_size__ (64)));
+typedef unsigned long long __v8du __attribute__ ((__vector_size__ (64)));
 typedef int __v16si __attribute__ ((__vector_size__ (64)));
 typedef unsigned int __v16su __attribute__ ((__vector_size__ (64)));
-typedef short __v32hi __attribute__ ((__vector_size__ (128)));
-typedef unsigned short __v32hu __attribute__ ((__vector_size__ (128)));
-typedef char __v64qi __attribute__ ((__vector_size__ (256)));
-typedef unsigned char __v64qu __attribute__ ((__vector_size__ (256)));
+typedef short __v32hi __attribute__ ((__vector_size__ (64)));
+typedef unsigned short __v32hu __attribute__ ((__vector_size__ (64)));
+typedef char __v64qi __attribute__ ((__vector_size__ (64)));
+typedef unsigned char __v64qu __attribute__ ((__vector_size__ (64)));
 
-/*
- * Generic SIMD builtin family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}.
 /*
  * Generic SIMD builtin family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}.
  * First builtin argument = instruction immediate (0 for non-immediate ops);
@@ -728,19 +726,19 @@ static __inline__ __m512i _mm512_set1_epi64(long long __a) __attribute__((__alwa
 
 __m512i __lccc_simd512_i_vcastsi128_512(long, __m128i __a);
 __m512i __lccc_simd512_i_vzextsi128_512(long, __m128i __a);
-__m512i __lccc_simd512_i_vcastsi512_256(long, __m256i __a);
-__m512i __lccc_simd512_i_vcastsi128_512(long, __m256i __a);
+__m512i __lccc_simd512_i_vcastsi512_256(long, __m512i __a);
+__m512i __lccc_simd512_i_vcastsi256_512(long, __m256i __a);
 static __inline__ __m512i _mm512_castsi128_si512(__m128i __a) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vcastsi128_512(0, __a)); }
 
 static __inline__ __m512i _mm512_zextsi128_si512(__m128i __a) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vzextsi128_512(0, __a)); }
 
-static __inline__ __m512i _mm512_castsi512_si256(__m256i __a) __attribute__((__always_inline__, __artificial__))
+static __inline__ __m256i _mm512_castsi512_si256(__m512i __a) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M256I_FROM_BUILTIN(__lccc_simd512_i_vcastsi512_256(0, __a)); }
 
 static __inline__ __m512i _mm512_castsi256_si512(__m256i __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vcastsi128_512(0, __a)); }
+{ return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_i_vcastsi256_512(0, __a)); }
 
 __m512i __lccc_simd512_i_vreduce_add_epu32_512(long, __m512i __a);
 __m512i __lccc_simd512_i_vreduce_add_epu32_512(long, __m512i __a);
@@ -822,6 +820,102 @@ __m128 __lccc_simd128_ps_addsubpd128(long, __m128 __a, __m128 __b);
 static __inline__ __m128d _mm_addsub_pd(__m128d __a, __m128d __b) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_addsubpd128(0, __a, __b)); }
 
+__m128i __lccc_simd128_ps_cvtps2dq128(long, __m128 __a);
+static __inline__ __m128i _mm_cvtps_epi32(__m128 __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M128I_FROM_BUILTIN(__lccc_simd128_ps_cvtps2dq128(0, __a)); }
+
+__m128i __lccc_simd128_ps_cvttps2dq128(long, __m128 __a);
+static __inline__ __m128i _mm_cvttps_epi32(__m128 __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M128I_FROM_BUILTIN(__lccc_simd128_ps_cvttps2dq128(0, __a)); }
+
+__m128 __lccc_simd128_ps_cvtdq2ps128(long, __m128i __a);
+static __inline__ __m128 _mm_cvtepi32_ps(__m128i __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M128_FROM_BUILTIN(__lccc_simd128_ps_cvtdq2ps128(0, __a)); }
+
+__m128d __lccc_simd128_ps_cvtps2pd128(long, __m128 __a);
+static __inline__ __m128d _mm_cvtps_pd(__m128 __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cvtps2pd128(0, __a)); }
+
+__m128d __lccc_simd128_ps_cvtdq2pd128(long, __m128i __a);
+static __inline__ __m128d _mm_cvtepi32_pd(__m128i __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cvtdq2pd128(0, __a)); }
+
+__m128 __lccc_simd128_ps_cvtpd2ps128(long, __m128d __a);
+static __inline__ __m128 _mm_cvtpd_ps(__m128d __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M128_FROM_BUILTIN(__lccc_simd128_ps_cvtpd2ps128(0, __a)); }
+
+__m128i __lccc_simd128_ps_cvtpd2dq128(long, __m128d __a);
+static __inline__ __m128i _mm_cvtpd_epi32(__m128d __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M128I_FROM_BUILTIN(__lccc_simd128_ps_cvtpd2dq128(0, __a)); }
+
+__m128i __lccc_simd128_ps_cvttpd2dq128(long, __m128d __a);
+static __inline__ __m128i _mm_cvttpd_epi32(__m128d __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M128I_FROM_BUILTIN(__lccc_simd128_ps_cvttpd2dq128(0, __a)); }
+
+__m256i __lccc_simd256_ps_vcvtps2dq256(long, __m256 __a);
+static __inline__ __m256i _mm256_cvtps_epi32(__m256 __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M256I_FROM_BUILTIN(__lccc_simd256_ps_vcvtps2dq256(0, __a)); }
+
+__m256i __lccc_simd256_ps_vcvttps2dq256(long, __m256 __a);
+static __inline__ __m256i _mm256_cvttps_epi32(__m256 __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M256I_FROM_BUILTIN(__lccc_simd256_ps_vcvttps2dq256(0, __a)); }
+
+__m256 __lccc_simd256_ps_vcvtdq2ps256(long, __m256i __a);
+static __inline__ __m256 _mm256_cvtepi32_ps(__m256i __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vcvtdq2ps256(0, __a)); }
+
+__m256d __lccc_simd256_ps_vcvtps2pd256(long, __m128 __a);
+static __inline__ __m256d _mm256_cvtps_pd(__m128 __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vcvtps2pd256(0, __a)); }
+
+__m256d __lccc_simd256_ps_vcvtdq2pd256(long, __m128i __a);
+static __inline__ __m256d _mm256_cvtepi32_pd(__m128i __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vcvtdq2pd256(0, __a)); }
+
+__m128 __lccc_simd256_ps_vcvtpd2ps256(long, __m256d __a);
+static __inline__ __m128 _mm256_cvtpd_ps(__m256d __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M128_FROM_BUILTIN(__lccc_simd256_ps_vcvtpd2ps256(0, __a)); }
+
+__m128i __lccc_simd256_ps_vcvtpd2dq256(long, __m256d __a);
+static __inline__ __m128i _mm256_cvtpd_epi32(__m256d __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M128I_FROM_BUILTIN(__lccc_simd256_ps_vcvtpd2dq256(0, __a)); }
+
+__m128i __lccc_simd256_ps_vcvttpd2dq256(long, __m256d __a);
+static __inline__ __m128i _mm256_cvttpd_epi32(__m256d __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M128I_FROM_BUILTIN(__lccc_simd256_ps_vcvttpd2dq256(0, __a)); }
+
+__m512i __lccc_simd512_ps_vcvtps2dq512(long, __m512 __a);
+static __inline__ __m512i _mm512_cvtps_epi32(__m512 __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_ps_vcvtps2dq512(0, __a)); }
+
+__m512i __lccc_simd512_ps_vcvttps2dq512(long, __m512 __a);
+static __inline__ __m512i _mm512_cvttps_epi32(__m512 __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M512I_FROM_BUILTIN(__lccc_simd512_ps_vcvttps2dq512(0, __a)); }
+
+__m512 __lccc_simd512_ps_vcvtdq2ps512(long, __m512i __a);
+static __inline__ __m512 _mm512_cvtepi32_ps(__m512i __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M512_FROM_BUILTIN(__lccc_simd512_ps_vcvtdq2ps512(0, __a)); }
+
+__m512d __lccc_simd512_ps_vcvtps2pd512(long, __m256 __a);
+static __inline__ __m512d _mm512_cvtps_pd(__m256 __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M512D_FROM_BUILTIN(__lccc_simd512_ps_vcvtps2pd512(0, __a)); }
+
+__m512d __lccc_simd512_ps_vcvtdq2pd512(long, __m256i __a);
+static __inline__ __m512d _mm512_cvtepi32_pd(__m256i __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M512D_FROM_BUILTIN(__lccc_simd512_ps_vcvtdq2pd512(0, __a)); }
+
+__m256 __lccc_simd512_ps_vcvtpd2ps512(long, __m512d __a);
+static __inline__ __m256 _mm512_cvtpd_ps(__m512d __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M256_FROM_BUILTIN(__lccc_simd512_ps_vcvtpd2ps512(0, __a)); }
+
+__m256i __lccc_simd512_ps_vcvtpd2dq512(long, __m512d __a);
+static __inline__ __m256i _mm512_cvtpd_epi32(__m512d __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M256I_FROM_BUILTIN(__lccc_simd512_ps_vcvtpd2dq512(0, __a)); }
+
+__m256i __lccc_simd512_ps_vcvttpd2dq512(long, __m512d __a);
+static __inline__ __m256i _mm512_cvttpd_epi32(__m512d __a) __attribute__((__always_inline__, __artificial__))
+{ return __CCC_M256I_FROM_BUILTIN(__lccc_simd512_ps_vcvttpd2dq512(0, __a)); }
+
 __m128 __lccc_simd128_ps_sqrtps128(long, __m128 __a);
 static __inline__ __m128 _mm_sqrt_ps(__m128 __a) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M128_FROM_BUILTIN(__lccc_simd128_ps_sqrtps128(0, __a)); }
@@ -834,11 +928,11 @@ __m128 __lccc_simd128_ps_rsqrtps128(long, __m128 __a);
 static __inline__ __m128 _mm_rsqrt_ps(__m128 __a) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M128_FROM_BUILTIN(__lccc_simd128_ps_rsqrtps128(0, __a)); }
 
-__m128 __lccc_simd128_ps_sqrtpd128(long, __m128 __a);
+__m128d __lccc_simd128_ps_sqrtpd128(long, __m128d __a);
 static __inline__ __m128d _mm_sqrt_pd(__m128d __a) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_sqrtpd128(0, __a)); }
 
-__m128 __lccc_simd128_ps_movddup128(long, __m128 __a);
+__m128d __lccc_simd128_ps_movddup128(long, __m128d __a);
 static __inline__ __m128d _mm_movddup(__m128d __a) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_movddup128(0, __a)); }
 
@@ -850,61 +944,29 @@ __m128 __lccc_simd128_ps_movshdup128(long, __m128 __a);
 static __inline__ __m128 _mm_movehdup_ps(__m128 __a) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M128_FROM_BUILTIN(__lccc_simd128_ps_movshdup128(0, __a)); }
 
-__m128 __lccc_simd128_ps_cvtps2dq128(long, __m128 __a);
-static __inline__ __m128d _mm_cvtps_epi32(__m128d __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cvtps2dq128(0, __a)); }
-
-__m128 __lccc_simd128_ps_cvtdq2ps128(long, __m128 __a);
-static __inline__ __m128 _mm_cvtepi32_ps(__m128 __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M128_FROM_BUILTIN(__lccc_simd128_ps_cvtdq2ps128(0, __a)); }
-
-__m128 __lccc_simd128_ps_cvttps2dq128(long, __m128 __a);
-static __inline__ __m128d _mm_cvttps_epi32(__m128d __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cvttps2dq128(0, __a)); }
-
-__m128 __lccc_simd128_ps_cvtps2pd128(long, __m128 __a);
-static __inline__ __m128d _mm_cvtps_pd(__m128d __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cvtps2pd128(0, __a)); }
-
-__m128 __lccc_simd128_ps_cvtpd2ps128(long, __m128 __a);
-static __inline__ __m128 _mm_cvtpd_ps(__m128 __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M128_FROM_BUILTIN(__lccc_simd128_ps_cvtpd2ps128(0, __a)); }
-
-__m128 __lccc_simd128_ps_cvtpd2dq128(long, __m128 __a);
-static __inline__ __m128d _mm_cvtpd_epi32(__m128d __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cvtpd2dq128(0, __a)); }
-
-__m128 __lccc_simd128_ps_cvtdq2pd128(long, __m128 __a);
-static __inline__ __m128d _mm_cvtepi32_pd(__m128d __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cvtdq2pd128(0, __a)); }
-
-__m128 __lccc_simd128_ps_cvttpd2dq128(long, __m128 __a);
-static __inline__ __m128d _mm_cvttpd_epi32(__m128d __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cvttpd2dq128(0, __a)); }
-
-__m128 __lccc_simd128_ps_movmskps128(long, __m128 __a);
+int __lccc_simd128_ps_movmskps128(long, __m128 __a);
 static __inline__ int _mm_movemask_ps(__m128 __a) __attribute__((__always_inline__, __artificial__))
 { return (int)__lccc_simd128_ps_movmskps128(0, __a); }
 
-__m128 __lccc_simd128_ps_movmskpd128(long, __m128 __a);
-static __inline__ int _mm_movemask_pd(__m128 __a) __attribute__((__always_inline__, __artificial__))
+int __lccc_simd128_ps_movmskpd128(long, __m128d __a);
+static __inline__ int _mm_movemask_pd(__m128d __a) __attribute__((__always_inline__, __artificial__))
 { return (int)__lccc_simd128_ps_movmskpd128(0, __a); }
 
-__m128 __lccc_simd128_ps_cvtss2si128(long, __m128 __a);
+int __lccc_simd128_ps_cvtss2si128(long, __m128 __a);
 static __inline__ int _mm_cvtss_si32(__m128 __a) __attribute__((__always_inline__, __artificial__))
 { return (int)__lccc_simd128_ps_cvtss2si128(0, __a); }
 
-__m128 __lccc_simd128_ps_cvtsd2si128(long, __m128 __a);
-static __inline__ int _mm_cvtsd_si32(__m128 __a) __attribute__((__always_inline__, __artificial__))
+int __lccc_simd128_ps_cvtsd2si128(long, __m128d __a);
+static __inline__ int _mm_cvtsd_si32(__m128d __a) __attribute__((__always_inline__, __artificial__))
 { return (int)__lccc_simd128_ps_cvtsd2si128(0, __a); }
 
-__m128 __lccc_simd128_ps_cvtss2si128(long, __m128 __a);
+int __lccc_simd128_ps_cvttss2si128(long, __m128 __a);
 static __inline__ int _mm_cvttss_si32(__m128 __a) __attribute__((__always_inline__, __artificial__))
-{ return (int)__lccc_simd128_ps_cvtss2si128(0, __a); }
+{ return (int)__lccc_simd128_ps_cvttss2si128(0, __a); }
 
-__m128 __lccc_simd128_ps_cvtsd2si128(long, __m128 __a);
-static __inline__ int _mm_cvttsd_si32(__m128 __a) __attribute__((__always_inline__, __artificial__))
-{ return (int)__lccc_simd128_ps_cvtsd2si128(0, __a); }
+int __lccc_simd128_ps_cvttsd2si128(long, __m128d __a);
+static __inline__ int _mm_cvttsd_si32(__m128d __a) __attribute__((__always_inline__, __artificial__))
+{ return (int)__lccc_simd128_ps_cvttsd2si128(0, __a); }
 
 __m128 __lccc_simd128_ps_roundps128(long, __m128 __a);
 #define _mm_round_ps(__a, __imm) __CCC_M128_FROM_BUILTIN(__lccc_simd128_ps_roundps128(__imm, __a))
@@ -1013,27 +1075,27 @@ __m128 __lccc_simd128_ps_movsd128(long, __m128 __a, __m128 __b);
 static __inline__ __m128d _mm_move_sd(__m128d __a, __m128d __b) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_movsd128(0, __a, __b)); }
 
-__m128 __lccc_simd128_ps_cvtss2sd128(long, __m128 __a, __m128 __b);
-static __inline__ __m128d _mm_cvtss_sd(__m128 __a, __m128 __b) __attribute__((__always_inline__, __artificial__))
+__m128d __lccc_simd128_ps_cvtss2sd128(long, __m128d __a, __m128 __b);
+static __inline__ __m128d _mm_cvtss_sd(__m128d __a, __m128 __b) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cvtss2sd128(0, __a, __b)); }
 
-__m128 __lccc_simd128_ps_cvtsd2ss128(long, __m128d __a, __m128 __b);
-static __inline__ __m128 _mm_cvtsd_ss(__m128d __a, __m128 __b) __attribute__((__always_inline__, __artificial__))
+__m128 __lccc_simd128_ps_cvtsd2ss128(long, __m128 __a, __m128d __b);
+static __inline__ __m128 _mm_cvtsd_ss(__m128 __a, __m128d __b) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M128_FROM_BUILTIN(__lccc_simd128_ps_cvtsd2ss128(0, __a, __b)); }
 
 __m128 __lccc_simd128_ps_cvtsi2ss128(long, __m128 __a, int __i);
 static __inline__ __m128 _mm_cvtsi32_ss(__m128 __a, int __i) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M128_FROM_BUILTIN(__lccc_simd128_ps_cvtsi2ss128(0, __a, __i)); }
 
-__m128 __lccc_simd128_ps_cvtsi2ss64_128(long, __m128 __a, int __i);
+__m128 __lccc_simd128_ps_cvtsi2ss64_128(long, __m128 __a, long long __i);
 static __inline__ __m128 _mm_cvtsi64_ss(__m128 __a, long long __i) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M128_FROM_BUILTIN(__lccc_simd128_ps_cvtsi2ss64_128(0, __a, __i)); }
 
-__m128 __lccc_simd128_ps_cvtsi2sd128(long, __m128 __a, int __i);
+__m128d __lccc_simd128_ps_cvtsi2sd128(long, __m128d __a, int __i);
 static __inline__ __m128d _mm_cvtsi32_sd(__m128d __a, int __i) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cvtsi2sd128(0, __a, __i)); }
 
-__m128 __lccc_simd128_ps_cvtsi2sd64_128(long, __m128 __a, int __i);
+__m128d __lccc_simd128_ps_cvtsi2sd64_128(long, __m128d __a, long long __i);
 static __inline__ __m128d _mm_cvtsi64_sd(__m128d __a, long long __i) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M128D_FROM_BUILTIN(__lccc_simd128_ps_cvtsi2sd64_128(0, __a, __i)); }
 
@@ -1097,38 +1159,6 @@ __m256 __lccc_simd256_ps_vsqrtpd256(long, __m256 __a);
 static __inline__ __m256d _mm256_sqrt_pd(__m256d __a) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vsqrtpd256(0, __a)); }
 
-__m256 __lccc_simd256_ps_vcvtps2dq256(long, __m256 __a);
-static __inline__ __m256d _mm256_cvtps_epi32(__m256d __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vcvtps2dq256(0, __a)); }
-
-__m256 __lccc_simd256_ps_vcvtdq2ps256(long, __m256 __a);
-static __inline__ __m256 _mm256_cvtepi32_ps(__m256 __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vcvtdq2ps256(0, __a)); }
-
-__m256 __lccc_simd256_ps_vcvttps2dq256(long, __m256 __a);
-static __inline__ __m256d _mm256_cvttps_epi32(__m256d __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vcvttps2dq256(0, __a)); }
-
-__m256 __lccc_simd256_ps_vcvtps2pd256(long, __m256 __a);
-static __inline__ __m256d _mm256_cvtps_pd(__m256d __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vcvtps2pd256(0, __a)); }
-
-__m256 __lccc_simd256_ps_vcvtpd2ps256(long, __m256 __a);
-static __inline__ __m256 _mm256_cvtpd_ps(__m256 __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vcvtpd2ps256(0, __a)); }
-
-__m256 __lccc_simd256_ps_vcvtpd2dq256(long, __m256 __a);
-static __inline__ __m256d _mm256_cvtpd_epi32(__m256d __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vcvtpd2dq256(0, __a)); }
-
-__m256 __lccc_simd256_ps_vcvtdq2pd256(long, __m256 __a);
-static __inline__ __m256d _mm256_cvtepi32_pd(__m256d __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vcvtdq2pd256(0, __a)); }
-
-__m256 __lccc_simd256_ps_vcvttpd2dq256(long, __m256 __a);
-static __inline__ __m256d _mm256_cvttpd_epi32(__m256d __a) __attribute__((__always_inline__, __artificial__))
-{ return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vcvttpd2dq256(0, __a)); }
-
 __m256 __lccc_simd256_ps_vpermilvarps256(long, __m256 __a, __m256i __b);
 static __inline__ __m256 _mm256_permutevar_ps(__m256 __a, __m256i __b) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vpermilvarps256(0, __a, __b)); }
@@ -1137,17 +1167,17 @@ __m256d __lccc_simd256_ps_vpermilvarpd256(long, __m256d __a, __m256i __b);
 static __inline__ __m256d _mm256_permutevar_pd(__m256d __a, __m256i __b) __attribute__((__always_inline__, __artificial__))
 { return __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vpermilvarpd256(0, __a, __b)); }
 
-__m256 __lccc_simd256_ps_vmovmskps256(long, __m256 __a);
+int __lccc_simd256_ps_vmovmskps256(long, __m256 __a);
 static __inline__ int _mm256_movemask_ps(__m256 __a) __attribute__((__always_inline__, __artificial__))
-{ return (int)__lccc_simd256_ps_vmovmskps256(0, __a); }
+{ return __lccc_simd256_ps_vmovmskps256(0, __a); }
 
-__m256 __lccc_simd256_ps_vmovmskpd256(long, __m256 __a);
-static __inline__ int _mm256_movemask_pd(__m256 __a) __attribute__((__always_inline__, __artificial__))
-{ return (int)__lccc_simd256_ps_vmovmskpd256(0, __a); }
+int __lccc_simd256_ps_vmovmskpd256(long, __m256d __a);
+static __inline__ int _mm256_movemask_pd(__m256d __a) __attribute__((__always_inline__, __artificial__))
+{ return __lccc_simd256_ps_vmovmskpd256(0, __a); }
 
-__m256 __lccc_simd256_ps_vtestps256(long, __m256 __a);
-static __inline__ int _mm256_testz_ps(__m256 __a) __attribute__((__always_inline__, __artificial__))
-{ return (int)__lccc_simd256_ps_vtestps256(0, __a); }
+int __lccc_simd256_ps_vtestps256(long, __m256 __a, __m256 __b);
+static __inline__ int _mm256_testz_ps(__m256 __a, __m256 __b) __attribute__((__always_inline__, __artificial__))
+{ return __lccc_simd256_ps_vtestps256(0, __a, __b); }
 
 __m256 __lccc_simd256_ps_vroundps256(long, __m256 __a);
 #define _mm256_round_ps(__a, __imm) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vroundps256(__imm, __a))
@@ -1158,8 +1188,8 @@ __m256 __lccc_simd256_ps_vroundpd256(long, __m256 __a);
 __m256 __lccc_simd256_ps_vpermilps256(long, __m256 __a);
 #define _mm256_permute_ps(__a, __imm) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vpermilps256(__imm, __a))
 
-__m256 __lccc_simd256_ps_vpermilps256(long, __m256 __a);
-#define _mm256_permute_pd(__a, __imm) __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vpermilps256(__imm, __a))
+__m256 __lccc_simd256_ps_vpermilpd256(long, __m256 __a);
+#define _mm256_permute_pd(__a, __imm) __CCC_M256D_FROM_BUILTIN(__lccc_simd256_ps_vpermilpd256(__imm, __a))
 
 __m256 __lccc_simd256_ps_vblendps256(long, __m256 __a, __m256 __b);
 #define _mm256_blend_ps(__a, __b, __imm) __CCC_M256_FROM_BUILTIN(__lccc_simd256_ps_vblendps256(__imm, __a, __b))
