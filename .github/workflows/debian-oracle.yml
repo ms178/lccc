@@ -74,6 +74,7 @@ jobs:
           path = Path('debian-predicate-relations.json')
           data = json.loads(path.read_text())
           assert data['gcc_16_2_normative'] and data['gcc_version'] == '16.2.0'
+          assert data['correct'] and data['native_forms'] == 62 and data['improved_vs_disabled'] > 0
           summary = {key: data[key] for key in ('gcc_version', 'gcc_16_2_normative', 'native_forms', 'correct', 'timing_claim', 'improved_vs_disabled')}
           summary['report_sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
           print('::notice title=Predicate relations exact GCC receipt::' + json.dumps(summary))

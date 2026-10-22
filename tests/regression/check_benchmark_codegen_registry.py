@@ -109,7 +109,11 @@ class RegistryTests(unittest.TestCase):
 
     def test_workflow_annotations_fit_observed_api_limits(self):
         workflow = (ROOT / ".github/workflows/debian-oracle.yml").read_text()
-        code = textwrap.dedent(workflow.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
+        # Select the publisher by its semantic step, not the first Python
+        # heredoc: independent native gates can publish their own receipts.
+        publisher = workflow.split("- name: Surface per-workload evidence through the checks API", 1)[1]
+        publisher = publisher.split("\n      - name:", 1)[0]
+        code = textwrap.dedent(publisher.split("python3 - <<'PY'\n", 1)[1].split("\n          PY", 1)[0])
         rows = []
         for item in tool.bench.BENCHMARKS:
             rows.append({
