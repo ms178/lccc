@@ -1606,6 +1606,16 @@ jobs:
         key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
     - name: Provision oracle toolchain (cached bundle, else apt)
       run: bash scripts/ci_provision_toolchain.sh --multilib
+    # scripts/check_hex_float_oracles.py (inside check_fma_gating.sh) runs
+    # the LCCC-built witness under Memcheck and needs a clang reference;
+    # neither is on the base image.  Without this the gate dies at its
+    # tooling precondition (which the old shard scaffolding hid).
+    - name: Install valgrind and clang for the hex-float oracle
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends valgrind clang
+        valgrind --version
+        clang --version | head -n 1
     - name: Verify GCC 16 C23 oracle
       run: |
         test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16
@@ -1895,6 +1905,16 @@ jobs:
         key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
     - name: Provision oracle toolchain (cached bundle, else apt)
       run: bash scripts/ci_provision_toolchain.sh --multilib
+    # scripts/check_hex_float_oracles.py (inside check_fma_gating.sh) runs
+    # the LCCC-built witness under Memcheck and needs a clang reference;
+    # neither is on the base image.  Without this the gate dies at its
+    # tooling precondition (which the old shard scaffolding hid).
+    - name: Install valgrind and clang for the hex-float oracle
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends valgrind clang
+        valgrind --version
+        clang --version | head -n 1
     - name: Verify GCC 16 C23 oracle
       run: |
         test "$(gcc-16 -dumpfullversion | cut -d. -f1)" = 16

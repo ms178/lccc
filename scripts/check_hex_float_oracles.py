@@ -61,8 +61,12 @@ def main():
     ap.add_argument('--abi', choices=['x64','x86'], default='x64')
     args = ap.parse_args()
     compilers = {k: shutil.which(getattr(args, k)) for k in ['lccc', 'gcc', 'clang']}
-    if not all(compilers.values()) or not shutil.which('valgrind'):
-        ap.error('LCCC, GCC, Clang and Valgrind are all required')
+    missing = [k for k, v in compilers.items() if not v]
+    if not shutil.which('valgrind'):
+        missing.append('valgrind')
+    if missing:
+        ap.error('LCCC, GCC, Clang and Valgrind are all required; missing: '
+                 + ', '.join(missing))
     text, count = source()
     report = {'complete': False, 'literal_count': count, 'abi': args.abi,
               'source_sha256': hashlib.sha256(text.encode()).hexdigest(), 'commands': []}
