@@ -24,25 +24,30 @@ Engines Supported:
   7. intcmp_thread: tests/fuzz/fuzz_intcmp_thread.py generator absorbed as an
                     engine (merge-diamond int-phi compare shapes for the
                     bool_thread threading pass; default seed 20260829).
-  8. m32          : forwards to tests/fuzz/m32_differential_fuzz.py (i686
+  8. addr_value   : forwards to tests/fuzz/addr_value_fuzz.py (the address of
+                    a local IS its address, not the local's contents; a value
+                    survives its own int<->FP conversions). The cases are
+                    self-checking, so the reference compiler's `OK` is the
+                    oracle and the ELF32/int80 host probe does not apply.
+  9. m32          : forwards to tests/fuzz/m32_differential_fuzz.py (i686
                     -m32 vs gcc -m32, nostdlib int80 exit-fold oracle).
-  9. regparm      : forwards to tests/fuzz/regparm_differential.py
+ 10. regparm      : forwards to tests/fuzz/regparm_differential.py
                     (-mregparm=3 ABI variant of the m32 oracle).
- 10. slot_rmw     : forwards to tests/fuzz/slot_rmw_differential.py (i686
+ 11. slot_rmw     : forwards to tests/fuzz/slot_rmw_differential.py (i686
                     slot read-modify-write collapse hinge hammering).
- 11. alias_m32    : forwards to tests/fuzz/alias_fuzz_m32.py (adversarial
+ 12. alias_m32    : forwards to tests/fuzz/alias_fuzz_m32.py (adversarial
                     redundant-load elimination / GVN shapes, -m32).
- 12. alu_torture  : forwards to tests/fuzz/alu_torture_m32.py (fixed i686 ALU
+ 13. alu_torture  : forwards to tests/fuzz/alu_torture_m32.py (fixed i686 ALU
                     probe: clz/ctz/popcount/bswap, mul/div by constant, LEA;
                     runs once per level, `--count` has no effect).
- 13. aarch64      : forwards to tests/fuzz/aarch64_fuzz.py (lccc-arm vs
+ 14. aarch64      : forwards to tests/fuzz/aarch64_fuzz.py (lccc-arm vs
                     aarch64-linux-gnu-gcc under qemu-aarch64; SKIPs
                     gracefully when the cross toolchain is absent).
- 14. punning      : forwards to tests/fuzz/punning_fuzz.py (byte-exact union/
+ 15. punning      : forwards to tests/fuzz/punning_fuzz.py (byte-exact union/
                     memcpy type-punning). Its own Vellvm-style byte model is
                     the oracle, so it needs NO reference compiler; SKIPs on
                     non-x86-64 hosts (the model encodes little-endian x86-64).
- 15. mutpair      : scripts/mutpair.py missed-alarm pairs (Regehr/Livinskii
+ 16. mutpair      : scripts/mutpair.py missed-alarm pairs (Regehr/Livinskii
                     transplant): a UB-free function plus a one-edit mutant,
                     execution-filtered so the pair is *known* inequivalent
                     (or known equivalent); both result columns are printed
@@ -53,7 +58,7 @@ The tests/fuzz engines use two absorption mechanisms, both preserving the
 standalone scripts byte-for-byte: generator-config engines (5-7) import the
 historical generator and evaluate its cases through this harness's oracle
 (every reference compiler at every level, GEN-BUG tripwire, repro retention);
-forwarding engines (8-14) launch the standalone differential tester - which
+forwarding engines (8-15) launch the standalone differential tester - which
 owns its nostdlib/int80 or cross-compilation pipeline - and adopt its exit
 code as the verdict, exactly like the stress_suite's unroll_stress arm.  Each
 of them keeps its historical defaults (seed span, levels, gcc oracle); m32
@@ -915,6 +920,10 @@ def _evaluate_prebuilt(engine: str, units: list[CompileUnit], workers: int,
 # script, whether the CLI takes a --seeds LO:HI span, and the compile-only
 # fallback config (generator module + attribute + extra -m32 compile flags)
 # used on hosts where the ELF32/int80 execution oracle is unavailable.
+# `oracle` names the reference model: absent means the m32/int80 family
+# (gated by the host ELF32 probe), "self_model" means the script carries its
+# own model (no reference compiler), and "reference" means the forwarded
+# reference compiler is the oracle with no host gate.
 _STANDALONE_FUZZ_ENGINES: dict[str, dict[str, Any]] = {
     "m32": {"script": "m32_differential_fuzz.py", "seeds": True,
             "gen": ("m32_differential_fuzz", "gen_c", [])},
@@ -932,6 +941,13 @@ _STANDALONE_FUZZ_ENGINES: dict[str, dict[str, Any]] = {
     # compiler is forwarded and the m32/int80 host probe does not apply.
     "punning": {"script": "punning_fuzz.py", "seeds": True, "gen": None,
                 "oracle": "self_model"},
+    # Object identity: an address stays an address, and a value survives its
+    # own conversions. Every generated function checks an invariant of its own
+    # local, so the program is self-checking and the reference compiler's
+    # output (also `OK`) is the oracle -- no model, no `gen` compile-only
+    # fallback (that path is the -m32 flag matrix) and no host gate.
+    "addr_value": {"script": "addr_value_fuzz.py", "seeds": True,
+                   "oracle": "reference"},
 }
 
 
@@ -1049,7 +1065,8 @@ def run_standalone_engine(engine: str, lccc_path: str, ref_compilers: list[str],
     engines need a working ELF32 build+int80 oracle - when the oracle is
     blocked (common in containers) they fall back to compile-only
     validation instead of reporting vacuous passes; self-model engines
-    (punning) need only a host that can execute x86-64 binaries.
+    (punning) need only a host that can execute x86-64 binaries; engines
+    whose oracle is the reference compiler (addr_value) are ungated.
     """
     spec = _STANDALONE_FUZZ_ENGINES[engine]
     script = FUZZ_DIR / spec["script"]
@@ -1072,6 +1089,11 @@ def run_standalone_engine(engine: str, lccc_path: str, ref_compilers: list[str],
                 "cross toolchain unavailable on this host: " + ", ".join(missing)
                 + "; run on a cross-equipped host or invoke the script directly")]
         ref_cc = cross_gcc
+    elif spec.get("oracle") == "reference":
+        # Plain hosted comparison: the reference compiler IS the oracle and
+        # the script needs no ELF32/int80 pipeline, so the m32 host probe
+        # below must not gate (or degrade) this engine.
+        ref_cc = ref_compilers[0]
     elif spec.get("oracle") == "self_model":
         if platform.machine() not in ("x86_64", "AMD64"):
             return [DiffResult(
@@ -1136,6 +1158,8 @@ _LEGACY_ENGINE_DEFAULTS: dict[str, dict[str, Any]] = {
     "aarch64": {"count": 40, "seed": 0, "opts": "-O2,-Os", "refs": "gcc"},
     "punning": {"count": 200, "seed": 0, "opts": "-O0,-O1,-O2,-O3,-Os",
                 "refs": "gcc"},
+    "addr_value": {"count": 60, "seed": 0, "opts": "-O0,-O1,-O2,-O3,-Os",
+                   "refs": "gcc"},
 }
 
 
@@ -1156,6 +1180,7 @@ _ENGINE_RUNNERS = {
     "alu_torture": functools.partial(run_standalone_engine, "alu_torture"),
     "aarch64": functools.partial(run_standalone_engine, "aarch64"),
     "punning": functools.partial(run_standalone_engine, "punning"),
+    "addr_value": functools.partial(run_standalone_engine, "addr_value"),
     "mutpair": run_mutpair_pool,
 }
 
