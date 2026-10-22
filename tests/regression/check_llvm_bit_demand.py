@@ -37,10 +37,10 @@ def main():
     ):
         raise ValueError("exact Clang 23.1.3 required")
     for source in (SOURCE, SOURCE.with_name("llvm_bit_demand_wide.c")):
-        check_source(args, source, cases, normative, version)
+        check_source(args, source, cases, version, normative)
 
 
-def check_source(args, source, cases, normative, version):
+def check_source(args, source, cases, version, normative):
     env = os.environ | {"CCC_VERIFY_IR": "abort"}
     with tempfile.TemporaryDirectory() as directory:
         p = Path(directory)

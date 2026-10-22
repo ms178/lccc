@@ -38,7 +38,7 @@ if "vfmadd231pd" not in matmul_body:
     raise SystemExit("matmul_verify: AVX2 vector loop was not emitted")
 if re.search(r"\bidiv[lq]?\b", matmul_body):
     raise SystemExit("matmul_verify: signed division remains in the scalar-tail transition")
-if not re.search(r"\bshrl?\s+\$3", matmul_body):
+if not re.search(r"\bshr[bwlq]?\s+\$3", matmul_body):
     raise SystemExit("matmul_verify: missing byte-IV to F64-index shift")
 
 for name, shift, packed_op in (
@@ -52,6 +52,6 @@ for name, shift, packed_op in (
         raise SystemExit(f"{name}: vector reduction was not emitted")
     if re.search(r"\bidiv[lq]?\b", current):
         raise SystemExit(f"{name}: signed division remains in the scalar-tail transition")
-    if not re.search(rf"\bshrl?\s+\${shift}", current):
+    if not re.search(rf"\bshr[bwlq]?\s+\${shift}", current):
         raise SystemExit(f"{name}: missing byte-IV remainder shift by {shift}")
 PY
