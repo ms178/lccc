@@ -38,6 +38,11 @@ fn evaluate(
             Instruction::Intrinsic { op, args, .. } => {
                 if *op == f.zero {
                     vec![0; input[0].len()]
+                } else if *op == f.broadcast {
+                    let Operand::Const(value) = args[0] else {
+                        panic!("bad splat")
+                    };
+                    vec![value.to_i128().unwrap() as u64 & full; input[0].len()]
                 } else {
                     let get = |index: usize| match args[index] {
                         Operand::Value(value) => values[&value].clone(),
@@ -45,7 +50,7 @@ fn evaluate(
                     };
                     let a = get(0);
                     let b = get(1);
-                    if Some(*op) == f.blend {
+                    if blend_shape(*op).is_some() {
                         let mask = get(2);
                         a.iter()
                             .zip(&b)
@@ -62,9 +67,23 @@ fn evaluate(
                             .collect()
                     } else if ![f.and, f.or, f.xor, f.add, f.sub].contains(op) {
                         // The only other test instruction is an equality mask.
+                        assert_eq!(*op, f.cmp);
+                        let Operand::Const(predicate) = args[2] else {
+                            panic!("bad predicate")
+                        };
                         a.iter()
                             .zip(&b)
-                            .map(|(a, b)| if a == b { full } else { 0 })
+                            .map(|(a, b)| {
+                                if match predicate.to_i128().unwrap() {
+                                    5 => a < b,
+                                    6 => a <= b,
+                                    _ => a == b,
+                                } {
+                                    full
+                                } else {
+                                    0
+                                }
+                            })
                             .collect()
                     } else {
                         a.iter()
@@ -355,4 +374,123 @@ fn fp_bitwise_xor_preserves_every_payload_bit_without_float_arithmetic() {
             assert_eq!((payload ^ 0xa5a5a5a5a5a5a5a5) ^ payload, 0xa5a5a5a5a5a5a5a5);
         }
     }
+}
+
+fn bounded_source(
+    f: Family,
+    blend: IntrinsicOp,
+    predicate: i32,
+    bound: u64,
+    mask: u64,
+) -> Vec<Instruction> {
+    vec![
+        intrinsic(
+            Value(4),
+            f.broadcast,
+            vec![Operand::Const(IrConst::I64(bound as i64))],
+        ),
+        intrinsic(
+            Value(5),
+            f.broadcast,
+            vec![Operand::Const(IrConst::I64(mask as i64))],
+        ),
+        intrinsic(
+            Value(6),
+            f.cmp,
+            vec![v(0), v(4), Operand::Const(IrConst::I32(predicate))],
+        ),
+        intrinsic(Value(7), f.and, vec![v(0), v(5)]),
+        intrinsic(Value(8), blend, vec![v(1), v(7), v(6)]),
+    ]
+}
+#[test]
+fn unsigned_contiguous_range_removes_mask_only_in_selected_vector_arm() {
+    for f in families() {
+        let byte_blend = if f.bytes == 16 {
+            IntrinsicOp::VecBlendvI8x16
+        } else {
+            IntrinsicOp::VecBlendvI8x32
+        };
+        for (predicate, bound) in [(5, 8), (6, 7)] {
+            check(
+                bounded_source(f, byte_blend, predicate, bound, 7),
+                f,
+                f.bits,
+                f.bytes,
+            );
+            if let Some(blend) = f.blend {
+                check(
+                    bounded_source(f, blend, predicate, bound, 7),
+                    f,
+                    f.bits,
+                    f.bytes,
+                );
+            }
+        }
+        let mut source = bounded_source(f, byte_blend, 5, 8, 7);
+        source[3] = intrinsic(Value(7), f.and, vec![v(5), v(0)]);
+        check(source, f, f.bits, f.bytes);
+    }
+}
+#[test]
+fn vector_range_refuses_signed_bounds_noncontiguous_masks_and_coarser_blends() {
+    for f in families() {
+        let blend = if f.bytes == 16 {
+            IntrinsicOp::VecBlendvI8x16
+        } else {
+            IntrinsicOp::VecBlendvI8x32
+        };
+        for (predicate, bound, mask) in [(1, 8, 7), (5, 9, 7), (5, 8, 5), (6, 8, 7)] {
+            let source = bounded_source(f, blend, predicate, bound, mask);
+            let mut defs = FxHashMap::default();
+            for inst in &source[..4] {
+                defs.insert(inst.dest().unwrap(), inst.clone());
+            }
+            assert!(
+                fold(
+                    source.last().unwrap(),
+                    &defs,
+                    &FxHashMap::default(),
+                    &families(),
+                    Value(64)
+                )
+                .is_none()
+            );
+        }
+        if f.bits < 64 {
+            let coarse = if f.bytes == 16 {
+                IntrinsicOp::VecBlendvF64x2
+            } else {
+                IntrinsicOp::VecBlendvF64x4
+            };
+            let source = bounded_source(f, coarse, 5, 8, 7);
+            let defs = source[..4]
+                .iter()
+                .map(|i| (i.dest().unwrap(), i.clone()))
+                .collect();
+            assert!(
+                fold(
+                    source.last().unwrap(),
+                    &defs,
+                    &FxHashMap::default(),
+                    &families(),
+                    Value(64)
+                )
+                .is_none()
+            );
+        }
+    }
+}
+
+#[test]
+fn observable_fp_environment_keeps_producers_and_register_image_consumers() {
+    let f = families()[4];
+    let mut func = function(vec![intrinsic(Value(4), f.xor, vec![v(0), v(0)])]);
+    func.pass_policy.fp_environment_observable = true;
+    let before = func.blocks[0].instructions.clone();
+    assert_eq!(run_function(&mut func, &families()), 0);
+    assert_eq!(
+        format!("{:?}", func.blocks[0].instructions),
+        format!("{before:?}")
+    );
 }

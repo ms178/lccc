@@ -18,6 +18,10 @@ struct Family {
     sub: IntrinsicOp,
     zero: IntrinsicOp,
     blend: Option<IntrinsicOp>,
+    cmp: IntrinsicOp,
+    broadcast: IntrinsicOp,
+    bits: usize,
+    bytes: usize,
 }
 fn families() -> Vec<Family> {
     use IntrinsicOp::*;
@@ -32,6 +36,17 @@ fn families() -> Vec<Family> {
         (IrType::I64, 16, None),
         (IrType::I64, 32, None),
     ] {
+        let (cmp, broadcast) = match (ty, bytes) {
+            (IrType::I8, 16) => (VecCmpI8x16, VecBroadcastI8x16),
+            (IrType::I8, 32) => (VecCmpI8x32, VecBroadcastI8x32),
+            (IrType::I16, 16) => (VecCmpI16x8, VecBroadcastI16x8),
+            (IrType::I16, 32) => (VecCmpI16x16, VecBroadcastI16x16),
+            (IrType::I32, 16) => (VecCmpI32x4, VecBroadcastI32x4),
+            (IrType::I32, 32) => (VecCmpI32x8, VecBroadcastI32x8),
+            (IrType::I64, 16) => (VecCmpI64x2, VecBroadcastI64x2),
+            (IrType::I64, 32) => (VecCmpI64x4, VecBroadcastI64x4),
+            _ => unreachable!(),
+        };
         let lanes = bytes / ty.size();
         let ops = [
             IrBinOp::And,
@@ -54,6 +69,10 @@ fn families() -> Vec<Family> {
                     VecZeroI32x8
                 },
                 blend,
+                cmp,
+                broadcast,
+                bits: ty.size() * 8,
+                bytes,
             });
         }
     }
@@ -125,6 +144,65 @@ fn canonical_mask(
     };
     args(mask, cmp, 3, defs).is_some()
 }
+fn blend_shape(op: IntrinsicOp) -> Option<(usize, usize)> {
+    use IntrinsicOp::*;
+    Some(match op {
+        VecBlendvI8x16 => (16, 8),
+        VecBlendvI8x32 => (32, 8),
+        VecBlendvI16x8 => (16, 16),
+        VecBlendvI16x16 => (32, 16),
+        VecBlendvI32x4 | VecBlendvF32x4 => (16, 32),
+        VecBlendvI32x8 | VecBlendvF32x8 => (32, 32),
+        VecBlendvF64x2 => (16, 64),
+        VecBlendvF64x4 => (32, 64),
+        _ => return None,
+    })
+}
+fn splat(value: Operand, f: Family, defs: &FxHashMap<Value, Instruction>) -> Option<u64> {
+    let [Operand::Const(c)] = args(value, f.broadcast, 1, defs)? else {
+        return None;
+    };
+    Some(c.to_i128()? as u64 & (u64::MAX >> (64 - f.bits)))
+}
+// Vector counterpart of the scalar contiguous-bound arm proof (#192094).
+// A byte blend may consume a wider compare mask because every compare lane
+// is uniformly all-ones/zero. A COARSER blend must never borrow that fact.
+fn bounded_blend(
+    root: &[Operand],
+    op: IntrinsicOp,
+    defs: &FxHashMap<Value, Instruction>,
+    families: &[Family],
+) -> Option<Vec<Operand>> {
+    let (bytes, bits) = blend_shape(op)?;
+    for &f in families {
+        if f.bytes != bytes || bits > f.bits {
+            continue;
+        }
+        let Some(cmp) = args(root[2], f.cmp, 3, defs) else {
+            continue;
+        };
+        let Operand::Const(predicate) = cmp[2] else {
+            continue;
+        };
+        let Some(limit) = splat(cmp[1], f, defs) else {
+            continue;
+        };
+        let low = match predicate.to_i128()? {
+            5 if limit.is_power_of_two() => limit - 1,
+            6 if limit & limit.wrapping_add(1) == 0 => limit,
+            _ => continue,
+        };
+        let Some(masked) = args(root[1], f.and, 2, defs) else {
+            continue;
+        };
+        for (base, mask) in [(masked[0], masked[1]), (masked[1], masked[0])] {
+            if base == cmp[0] && splat(mask, f, defs) == Some(low) {
+                return Some(vec![root[0], base, root[2]]);
+            }
+        }
+    }
+    None
+}
 fn fold(
     inst: &Instruction,
     defs: &FxHashMap<Value, Instruction>,
@@ -153,6 +231,9 @@ fn fold(
     if blend && root.len() == 3 {
         if root[0] == root[1] {
             return Some(copy(*dest, root[0]));
+        }
+        if let Some(replacement) = bounded_blend(root, *op, defs, families) {
+            return Some(vec![intrinsic(*dest, *op, replacement)]);
         }
         for index in [0, 1] {
             if let Some(inner) = args(root[index], *op, 3, defs)
@@ -298,6 +379,9 @@ pub(crate) fn run(module: &mut IrModule) -> usize {
     module.for_each_function(|f| run_function(f, &families))
 }
 fn run_function(func: &mut IrFunction, families: &[Family]) -> usize {
+    if super::policy::fp_environment_blocks_reordering(func) {
+        return 0;
+    }
     let mut uses = FxHashMap::default();
     for block in &func.blocks {
         for inst in &block.instructions {

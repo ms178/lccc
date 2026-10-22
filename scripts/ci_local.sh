@@ -1177,6 +1177,9 @@ gate "llvm-guarded-folds" fast python3 tests/regression/check_llvm_guarded_folds
 gate "llvm-word-counts" fast python3 tests/regression/check_llvm_word_counts.py
 gate "llvm-scalar-logic" fast python3 tests/regression/check_llvm_scalar_logic.py
 gate "llvm-predicate-relations" fast python3 tests/regression/check_llvm_predicate_relations.py
+gate "packed-vector-relations" fast python3 tests/regression/check_packed_vector_relations.py
+gate "integer-order-networks" fast python3 tests/regression/check_integer_order_networks.py --arm target/fastbuild/lccc-arm
+
 # Dual-layout metric pair: assembly identity across serial/auto/forced, kill
 # switch, host fallback and pair liveness. Mirrors the hosted step.
 gate "peephole-pair-parallel" fast python3 tests/regression/check_peephole_pair_parallel.py
