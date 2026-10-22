@@ -932,3 +932,353 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
     }
     changed
 }
+
+/// Break a private spill cycle without changing register allocation:
+///
+///     movl MEM, S32; movl S32, T; movslq D32, S64;
+///     movq S64, A; movl T, D32
+///
+/// becomes `movslq D32,S64; movq S64,A; movl MEM,D32; movl D32,T`.
+/// The two slots must be disjoint and the frame unescaped, so MEM cannot
+/// alias either private write. Address registers must survive the extension.
+/// Keep T's store: ordinary dead-store analysis may delete it only when no
+/// later observer exists. Every register, both slots and EFLAGS retain their
+/// original final values; the original memory read still executes exactly once.
+/// Frame-pointer and inline-assembly functions are deliberately excluded: the
+/// existing RSP escape check alone cannot establish privacy for those frames.
+pub(super) fn fold_private_spill_cycle(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut functions = Vec::new();
+    let mut start = None;
+    for i in 0..store.len() {
+        let t = infos[i].trimmed(store.get(i));
+        if t == ".cfi_startproc" {
+            start = Some(i);
+        }
+        if t.starts_with(".size ") {
+            if let Some(s) = start.take() {
+                functions.push((s, i));
+            }
+        }
+    }
+    let mut changed = false;
+    for (start, end) in functions {
+        if frame_has_escape(store, infos, start, end)
+            || (start..end).any(|j| {
+                matches!(
+                    infos[j].trimmed(store.get(j)),
+                    "movq %rsp, %rbp" | "movl %esp, %ebp" | "#APP"
+                ) || matches!(infos[j].kind, LineKind::InlineAsm)
+            })
+        {
+            continue;
+        }
+        let mut i = start + 1;
+        while i < end {
+            if infos[i].is_nop() {
+                i += 1;
+                continue;
+            }
+            let indices: Vec<_> = (i..end).filter(|&j| !infos[j].is_nop()).take(5).collect();
+            if indices.len() != 5 || indices.iter().any(|&j| infos[j].pinned) {
+                i += 1;
+                continue;
+            }
+            let replacement = (|| {
+                let lines: Vec<_> = indices
+                    .iter()
+                    .map(|&j| infos[j].trimmed(store.get(j)))
+                    .collect();
+                let load = lines[0].strip_prefix("movl ")?;
+                let comma = first_top_level_comma(load.as_bytes())?;
+                let (mem, scratch) = (load[..comma].trim(), load[comma + 1..].trim());
+                if !mem.contains('(') || !mem.ends_with(')') || mem.contains(':') {
+                    return None;
+                }
+                let sf = register_family_fast(scratch);
+                if sf > REG_GP_MAX || sf == 4 || scratch != REG_NAMES[1][sf as usize] {
+                    return None;
+                }
+                for offset in reg_token_offsets(mem) {
+                    let fam = register_family_fast(&mem[offset..]);
+                    if fam == sf || fam == 4 || fam == 5 {
+                        return None;
+                    }
+                }
+                let (m, s, temp) = parse_2op_store(lines[1])?;
+                if m != "movl" || s != scratch {
+                    return None;
+                }
+                let (t, tb) = parse_slot(temp)?;
+                let ext = lines[2].strip_prefix("movslq ")?;
+                let comma = first_top_level_comma(ext.as_bytes())?;
+                let (dest, wide) = (ext[..comma].trim(), ext[comma + 1..].trim());
+                let df = register_family_fast(dest);
+                if df > REG_GP_MAX
+                    || df == 4
+                    || df == sf
+                    || dest != REG_NAMES[1][df as usize]
+                    || wide != REG_NAMES[0][sf as usize]
+                {
+                    return None;
+                }
+                let (m, s, bound) = parse_2op_store(lines[3])?;
+                if m != "movq" || s != wide {
+                    return None;
+                }
+                let (a, ab) = parse_slot(bound)?;
+                if tb != 4
+                    || ab != 4
+                    || t < 0
+                    || a < 0
+                    || !((t as i64 + 4 <= a as i64) || (a as i64 + 8 <= t as i64))
+                {
+                    return None;
+                }
+                let (m, slot, d) = parse_2op_load(lines[4])?;
+                if m != "movl" || slot != temp || d != dest {
+                    return None;
+                }
+                Some([
+                    format!("    {}", lines[2]),
+                    format!("    {}", lines[3]),
+                    format!("    movl {mem}, {dest}"),
+                    format!("    movl {dest}, {temp}"),
+                ])
+            })();
+            if let Some(lines) = replacement {
+                for (j, line) in indices[..4].iter().copied().zip(lines) {
+                    replace_line(store, &mut infos[j], j, line);
+                }
+                mark_nop(&mut infos[indices[4]]);
+                changed = true;
+                i = indices[4] + 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod private_spill_cycle_tests {
+    use super::*;
+
+    fn fold(case: (&str, &str, &str, &str, i32, i32, bool), tail: &str) -> (bool, String) {
+        let (prefix, mem, scratch, source, temp, bound, pin) = case;
+        let sf = register_family_fast(scratch) as usize;
+        let text = format!(
+            "f:\n.cfi_startproc\n{prefix}    movl {mem}, {scratch}\n    movl {scratch}, {temp}(%rsp)\n    movslq {source}, {}\n    movq {}, {bound}(%rsp)\n    movl {temp}(%rsp), {source}\n{tail}    ret\n.cfi_endproc\n.size f, .-f\n",
+            REG_NAMES[0][sf], REG_NAMES[0][sf]
+        );
+        let mut store = LineStore::new(text);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        if pin {
+            let load = (0..store.len())
+                .find(|&i| store.get(i).contains("movl "))
+                .unwrap();
+            infos[load].pinned = true;
+        }
+        let changed = fold_private_spill_cycle(&mut store, &mut infos);
+        (changed, store.build_result(|i| infos[i].is_nop()))
+    }
+
+    #[test]
+    fn private_spill_cycle_preserves_both_registers_and_both_slots() {
+        for (scratch, source, mem) in [
+            ("%eax", "%edx", "28(%rdi)"),
+            ("%r10d", "%r11d", "16(%rsi,%rcx,4)"),
+        ] {
+            let (changed, out) = fold(
+                ("", mem, scratch, source, 20, 24, false),
+                "    movl 20(%rsp), %ecx\n",
+            );
+            assert!(changed, "{out}");
+            assert!(out.contains(&format!("movl {mem}, {source}")), "{out}");
+            // This store cannot be unconditionally deleted: an external slot
+            // reader in the tail must still see the original loaded word.
+            assert!(out.contains(&format!("movl {source}, 20(%rsp)")), "{out}");
+            assert!(out.contains("movl 20(%rsp), %ecx"), "{out}");
+            assert!(!out.contains(&format!("movl 20(%rsp), {source}")), "{out}");
+        }
+    }
+
+    #[test]
+    fn private_spill_cycle_refuses_aliases_escapes_address_clobbers_and_volatile() {
+        for (prefix, mem, scratch, source, temp, bound, pin) in [
+            ("", "28(%rdi)", "%eax", "%edx", 20, 22, false),
+            ("", "28(%rdi)", "%eax", "%edx", 20, 16, false),
+            ("", "28(%rax)", "%eax", "%edx", 20, 24, false),
+            ("", "28(%rsp)", "%eax", "%edx", 20, 24, false),
+            ("", "%gs:28(%rdi)", "%eax", "%edx", 20, 24, false),
+            ("", "28(%rdi)", "%eax", "%eax", 20, 24, false),
+            ("", "28(%rdi)", "%eax", "%esp", 20, 24, false),
+            ("", "28(%rdi)", "%eax", "%edx", 20, 24, true),
+            (
+                "    leaq 24(%rsp), %r8\n",
+                "28(%rdi)",
+                "%eax",
+                "%edx",
+                20,
+                24,
+                false,
+            ),
+            (
+                "    movq %rsp, %r8\n",
+                "28(%rdi)",
+                "%eax",
+                "%edx",
+                20,
+                24,
+                false,
+            ),
+            (
+                "#APP\n.byte 0x90\n#NO_APP\n",
+                "28(%rdi)",
+                "%eax",
+                "%edx",
+                20,
+                24,
+                false,
+            ),
+            (
+                "    movq %rsp, %rbp\n",
+                "28(%rdi)",
+                "%eax",
+                "%edx",
+                20,
+                24,
+                false,
+            ),
+        ] {
+            let (changed, out) = fold((prefix, mem, scratch, source, temp, bound, pin), "");
+            assert!(!changed, "must refuse: {out}");
+        }
+    }
+}
+
+/// Retarget an entry word load through its sole wide register relay. A word
+/// load zeroes the upper half, so a later MOVQ carries exactly that value.
+/// Keep the memory access in place; prove both register lifetimes rather than
+/// rescheduling IR or extending virtual ranges. At most one rewrite per
+/// function keeps the cached CFG oracle valid in every untouched function.
+pub(super) fn fold_entry_load_relay(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let live = super::liveness::FileLiveness::new(store, infos);
+    let mut entry = false;
+    let mut changed = false;
+    for i in 0..store.len() {
+        let text = infos[i].trimmed(store.get(i));
+        if text == ".cfi_startproc" {
+            entry = true;
+            continue;
+        }
+        if text.ends_with(':') || text == ".cfi_endproc" {
+            entry = false;
+        }
+        if !entry || infos[i].is_nop() || infos[i].pinned {
+            continue;
+        }
+        let Some(args) = text.strip_prefix("movl ") else {
+            continue;
+        };
+        let Some(comma) = first_top_level_comma(args.as_bytes()) else {
+            continue;
+        };
+        let (mem, src) = (args[..comma].trim(), args[comma + 1..].trim());
+        let sf = register_family_fast(src);
+        if !mem.contains('(')
+            || !mem.ends_with(')')
+            || sf > REG_GP_MAX
+            || sf == 4
+            || src != REG_NAMES[1][sf as usize]
+        {
+            continue;
+        }
+        let mem = mem.to_owned();
+        let mut relay = None;
+        for j in i + 1..(i + 33).min(store.len()) {
+            if infos[j].is_nop() {
+                continue;
+            }
+            if infos[j].pinned {
+                break;
+            }
+            let t = infos[j].trimmed(store.get(j));
+            let Some((mnemonic, rest)) = t.split_once(' ') else {
+                break;
+            };
+            if !matches!(mnemonic, "movl" | "movq" | "movslq" | "xorl") {
+                break;
+            }
+            if infos[j].reg_refs & (1u16 << sf) == 0 {
+                continue;
+            }
+            if mnemonic == "movq" {
+                if let Some((s, d)) = rest.split_once(',') {
+                    let df = register_family_fast(d.trim());
+                    if s.trim() == REG_NAMES[0][sf as usize]
+                        && df <= REG_GP_MAX
+                        && df != sf
+                        && df != 4
+                        && d.trim() == REG_NAMES[0][df as usize]
+                        && (i + 1..j)
+                            .all(|k| infos[k].is_nop() || infos[k].reg_refs & (1u16 << df) == 0)
+                        && live.live_after(j, sf) == Some(false)
+                    {
+                        relay = Some((j, df));
+                    }
+                }
+            }
+            break;
+        }
+        if let Some((j, df)) = relay {
+            replace_line(
+                store,
+                &mut infos[i],
+                i,
+                format!("    movl {mem}, {}", REG_NAMES[1][df as usize]),
+            );
+            mark_nop(&mut infos[j]);
+            changed = true;
+            entry = false;
+        }
+    }
+    changed
+}
+
+#[cfg(test)]
+mod entry_load_relay_tests {
+    use super::*;
+    fn fold(middle: &str, tail: &str) -> (bool, String) {
+        let text = format!(
+            "f:\n.cfi_startproc\n    pushq %r12\n    movl 8(%rdi), %r12d\n{middle}    movq %r12, %r9\n.Lloop:\n{tail}    movq %r9, %rax\n    popq %r12\n    ret\n.cfi_endproc\n.size f, .-f\n"
+        );
+        let mut store = LineStore::new(text);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = fold_entry_load_relay(&mut store, &mut infos);
+        (changed, store.build_result(|i| infos[i].is_nop()))
+    }
+    #[test]
+    fn entry_load_retargets_zero_extended_wide_relay() {
+        let (changed, out) = fold("    movl 12(%rdi), %edx\n", "");
+        assert!(changed && out.contains("movl 8(%rdi), %r9d"), "{out}");
+        assert!(!out.contains("movq %r12, %r9"), "{out}");
+    }
+    #[test]
+    fn entry_load_relay_refuses_observed_registers_and_barriers() {
+        for (middle, tail) in [
+            ("    movl %r9d, %edx\n", ""),
+            ("    movl %r12d, %edx\n", ""),
+            ("    call opaque\n", ""),
+            ("", "    movl %r12d, %edx\n"),
+            ("", "    testl %edi, %edi\n    jne .Lunknown\n"),
+        ] {
+            let (changed, out) = fold(middle, tail);
+            assert!(!changed, "{out}");
+        }
+    }
+}

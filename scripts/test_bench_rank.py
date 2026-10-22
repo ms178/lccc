@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A low-sample screening result must not become a confident regression claim."""
 import json
+import math
+import subprocess
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -27,6 +30,42 @@ class QualityTests(unittest.TestCase):
             if n < 7:
                 self.assertIn("WARNING", rank.render_table(rows, show_size=False, reference="gcc"))
                 self.assertIn("fewer than seven", rank.render_markdown(rows, document, groups, 0.01))
+
+
+class MarkdownTests(unittest.TestCase):
+    def test_full_aggregate_with_limited_table_and_invalid_pairs(self):
+        rows = [dict(name=name, ratio=ratio, correct=correct, significant=True)
+                for name, ratio, correct in [("slow", 2.0, True), ("fast", 0.5, True),
+                                             ("failed", 100.0, False), ("invalid", math.nan, True)]]
+        out = rank.render_markdown(rows, {"aggregate_lccc_vs_gcc": {"geometric_mean_ratio": 99}},
+                                   rank.classify(rows, 0.01), 0.01, limit=1)
+        self.assertIn("geometric mean ratio: **1.0000**", out)
+        self.assertIn("arithmetic mean ratio: **1.2500**", out)
+        self.assertIn("correct comparable pairs: **2**", out)
+        self.assertIn("`slow`", out)
+        self.assertNotIn("`fast`", out)
+        self.assertNotIn("nan", out.lower())
+
+    def test_nonfinite_producer_samples_are_not_numbers(self):
+        for value in [math.nan, math.inf, -math.inf, True, "1.0"]:
+            self.assertIsNone(rank._median({"median": value}))
+        self.assertEqual(rank.geometric_mean([2.0, 0.5, math.nan, math.inf]), 1.0)
+
+    def test_markdown_cli_honors_worst_and_all(self):
+        rows = [{"name": name, "ratios_to_gcc": {"lccc": {"median": ratio}},
+                 "correctness": {"lccc": {"matches_baseline": True},
+                                 "gcc": {"matches_baseline": True}}}
+                for name, ratio in [("slow", 2.0), ("fast", 0.5)]]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "report.json"
+            path.write_text(json.dumps({"benchmarks": rows}))
+            cmd = [sys.executable, str(Path(rank.__file__)), str(path), "--markdown", "--worst", "1"]
+            limited = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
+            complete = subprocess.run(cmd + ["--all"], check=True, capture_output=True, text=True).stdout
+        self.assertIn("geometric mean ratio: **1.0000**", limited)
+        self.assertIn("`slow`", limited)
+        self.assertNotIn("`fast`", limited)
+        self.assertIn("`fast`", complete)
 
 
 if __name__ == "__main__":

@@ -741,6 +741,30 @@ pub(crate) fn mark_loop_spanning(
     web_inloop_use: bool,
     phi_backedges: &[(u32, u32)],
 ) {
+    mark_loop_spanning_with_copy_policy(
+        ranges,
+        loop_extents,
+        coalesce_member_of,
+        func,
+        meta_uses,
+        web_inloop_use,
+        phi_backedges,
+        false,
+    );
+}
+
+/// Preserve conditional dependencies only for the sparse call-spanning policy.
+/// Ordinary functions retain their measured allocation and recurrence pricing.
+pub(crate) fn mark_loop_spanning_with_copy_policy(
+    ranges: &mut [LiveRange],
+    loop_extents: &[(u32, u32)],
+    coalesce_member_of: &FxHashMap<u32, u32>,
+    func: &IrFunction,
+    meta_uses: &FxHashMap<u32, Vec<u32>>,
+    web_inloop_use: bool,
+    phi_backedges: &[(u32, u32)],
+    preserve_conditional_copies: bool,
+) {
     // Web leader -> members (built once, used by the unconditional
     // slot-operand classification below and the extent pass after it).
     let mut members_of: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
@@ -773,7 +797,13 @@ pub(crate) fn mark_loop_spanning(
             if matches!(inst, Instruction::Phi { .. }) {
                 def_is_phi.insert(dest.0);
             }
-            def_uses.insert(dest.0, ops);
+            if preserve_conditional_copies {
+                // A last textual entry/constant Copy must not hide an
+                // arithmetic backedge of the sparse conditional state.
+                def_uses.entry(dest.0).or_default().extend(ops);
+            } else {
+                def_uses.insert(dest.0, ops);
+            }
         }
     }
     // (point -> vids consumed there as the folding-friendly address or
@@ -4154,6 +4184,85 @@ mod tests {
         assert!(
             r.span_recurrence,
             "the backedge source v2 = v1 + 8 consumes the web member v1"
+        );
+    }
+
+    #[test]
+    fn conditional_merge_keeps_every_backedge_dependency() {
+        use crate::ir::constants::IrConst;
+        use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Value};
+        let copy = |dest, src| Instruction::Copy {
+            dest: Value(dest),
+            src,
+        };
+        let val = |v| Operand::Value(Value(v));
+        let zero = || Operand::Const(IrConst::I32(0));
+        let block = |label, instructions, terminator| BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: vec![],
+        };
+        let mut f = empty_fn();
+        f.blocks = vec![
+            block(0, vec![copy(1, zero())], Terminator::Branch(BlockId(1))),
+            block(
+                1,
+                vec![Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: val(1),
+                    rhs: Operand::Const(IrConst::I32(8)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: val(1),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(2, vec![copy(3, val(2))], Terminator::Branch(BlockId(4))),
+            // Last in textual order is the constant arm, not the cyclic arm.
+            block(3, vec![copy(3, zero())], Terminator::Branch(BlockId(4))),
+            block(
+                4,
+                vec![copy(1, val(3))],
+                Terminator::CondBranch {
+                    cond: val(1),
+                    true_label: BlockId(1),
+                    false_label: BlockId(5),
+                },
+            ),
+            block(5, vec![], Terminator::Return(Some(val(1)))),
+        ];
+        let mut ranges = vec![lr(1, 0, 10, vec![2, 3, 9, 10], 40)];
+        let mut ordinary = ranges.clone();
+        mark_loop_spanning(
+            &mut ordinary,
+            &[(2, 9)],
+            &FxHashMap::default(),
+            &f,
+            &collect_range_metadata(&f, &[]).uses,
+            true,
+            &[(1, 3)],
+        );
+        assert!(
+            !ordinary[0].span_recurrence,
+            "ordinary policy remains unchanged"
+        );
+        mark_loop_spanning_with_copy_policy(
+            &mut ranges,
+            &[(2, 9)],
+            &FxHashMap::default(),
+            &f,
+            &collect_range_metadata(&f, &[]).uses,
+            true,
+            &[(1, 3)],
+            true,
+        );
+        assert!(
+            ranges[0].span_recurrence,
+            "the constant arm must not erase 1 -> 2 -> 3 -> 1"
         );
     }
 

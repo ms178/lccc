@@ -1337,6 +1337,8 @@ fn build_indexed_gep_map(
     // behaviour). The later `iv_in_add = None` rewrite only dropped the
     // soundness gates and left the peeled `disp` in place — inverted.
     let pf06_add_peel_disabled = env_flag_set("CCC_NO_PF06_ADD_PEEL");
+    let pointer_ring_peel = crate::common::types::target_elf_machine() == 62 // EM_X86_64
+        && crate::common::types::target_ptr_size() == 8;
 
     // Resolve offset → (index, shift, displacement, iv_in_add, add_result).
     // Multi-def offsets are a plain index (shift 0, disp 0, no iv_in_add);
@@ -1416,36 +1418,21 @@ fn build_indexed_gep_map(
                 // source value's real type is a width lie the peel must not
                 // trust.
                 //
-                // PERF-9 (measured, deliberately NOT applied).  The pointer-ring
-                // arm `IrType::cast_preserves_offset_value` is sound here and
-                // pays for itself: `p[i + 1]` with a pointer-width index lowers
-                // as `Shl(Cast(Add(i, 1): U64 -> I64), k)`, and refusing that
-                // same-width reinterpretation stops the walk one link above the
-                // `Add`, so the affine displacement fold never sees it.  With
-                // the arm enabled: histogram Ir 1.06026 -> 0.95983,
-                // libm_round_family 0.97620, linux_rbtree 0.98800, and the
-                // 402-comparison matrix 98002 -> 97984 instructions with i686
-                // byte-identical (`w_s8` goes from `leaq 1(%rsi),%rsi` +
-                // `movq (%rdi,%rsi,8)` to `movq 8(%rdi,%rsi,8)`).  It is held
-                // back by a measured INTERACTION, not by soundness: freeing the
-                // three offset registers in `ascii_case_fold`'s byte-fold kernel
-                // changes the layout enough that the fourth lane loses its
-                // `cmovbe` fusion and materialises `setbe` + `movzbl` +
-                // `movsbq` + `testl` instead (+1 instruction, Ir 1.00740),
-                // which breaks contract 2 of
-                // tests/regression/check_select_from_compare.sh.  Land the arm
-                // together with a fusion/RA fix for that shape -- never over a
-                // weakened gate.  On ILP32 the arm is sound but unprofitable
-                // outright (+60 static instructions against -18 on x86-64):
-                // every fold extends the SIB index's live interval and ILP32 has
-                // six general registers.
+                // A pointer-width signedness reinterpretation preserves the
+                // address bits even when it changes the mathematical integer.
+                // Enable this extra peel on x86-64, where it exposes Add/Sub
+                // displacements to SIB addressing. Keep ILP32's old policy:
+                // extending index live ranges there was measured unprofitable.
+                // Normalized byte-copy chains in setcc/cmov fusion must stay
+                // recognized as freeing these offset registers changes RA.
                 } if (val_ty.get(&v.0) == Some(&from_ty)
                     || (val_ty.get(&v.0).is_none()
                         && from_ty.size() == 8
                         && to_ty.size() == 8
                         && !from_ty.is_float()
                         && !to_ty.is_float()))
-                    && from_ty.cast_preserves_integer_value(*to_ty) =>
+                    && (from_ty.cast_preserves_integer_value(*to_ty)
+                        || (pointer_ring_peel && from_ty.cast_preserves_offset_value(*to_ty))) =>
                 {
                     id = v.0;
                 }
