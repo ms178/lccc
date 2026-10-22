@@ -587,6 +587,17 @@ impl X86Codegen {
                     }
                     self.state.out.emit_named_label(&done_label);
                     self.state.reg_cache.invalidate_sec(); // clobbered %rcx
+                    // The big-value path REWRITES %rax (`shrq`, `orq`) and the
+                    // merge point is reached with either image, so a source
+                    // that operand_to_rax parked in the accumulator is no
+                    // longer what %rax holds. Without this, a second use of
+                    // the same value takes the accumulator fast path and reads
+                    // the mangled conversion operand: `x = ptr ^ (1<<63);
+                    // d = (double)x; e = (double)x;` produced d != e at -O1
+                    // (the first conversion's `orq` result fed the second's
+                    // `cvtsi2sdq`). Debug builds flag this as an epoch
+                    // violation; release builds silently miscompiled.
+                    self.state.reg_cache.invalidate_acc();
                     self.store_xmm_to(dest, "xmm0", to_ty);
                 } else {
                     // U8/U16/U32: already zero-extended in %rax by the load.
