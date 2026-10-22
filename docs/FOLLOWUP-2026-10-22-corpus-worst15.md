@@ -117,40 +117,22 @@ the ratio is not the useful number here; the lccc time is: 268 ms scalar
 (before) → 119 ms vectorized (after). `sha256_transform` is 0.984 and correct (it
 was a hard FAIL).
 
-### Block placement priced by branches — measured, and blocked
+### Block placement priced by branches — withdrawn here, shipped in round 2
 
-The dual-layout selection compares the chain order against the pre-chain order
-by counting emitted instruction lines, which is blind to the one thing block
-placement controls: a terminator whose target is the physically next block emits
-no branch at all, and a conditional whose preferred edge is next emits a
-NOT-taken `jcc`. `layout_branch_cost` prices the transitions a layout leaves
-taken, with the chain builder's own edge weights and its `10^depth` frequency
-model, and the two layouts compare on `lines + branch cost`.
+Round 1 built a branch-priced layout metric and withdrew it: it scored the
+**exploratory** emission, and the exploratory emission is not the shipped text
+(`glibc_memcmp_bytes` scored 23 lines for both layouts and shipped ~29 with
+three more stack operands), so every win was a coin flip.
 
-It works, and it is not shippable as it stands:
-
-    hash_table           13031 -> 10162 ms   0.780
-    byte_load_reassembly     6.01 -> 5.64     0.939
-    zstd_count               13.53 -> 13.48   0.996   (0.87 with no size guard)
-    geomean over ten kernels                  0.970
-
-The CI codegen gate rejected it on four golden workloads
-(`glibc_memcmp` insns +3.5 % and stackmem +17.6 %, `sqlite_varint` stackmem
-+9.1 %, `expat_xml_scan` moves +7.4 %, `portable_bit_counts` insns +2.2 %).
-The cause is structural: the winner is measured on an **exploratory**
-emission of the function, then the function is emitted a second time for
-shipping, and the two are not the same code. `glibc_memcmp_bytes` is the
-minimal witness — the metric scores both layouts at 23 lines and the branch
-term breaks the tie, and the shipped chain emission is then ~29 lines with
-three more stack operands. Every win above comes from exactly that kind of
-tie, so no tolerance or tie-break rule can separate the good ties from the
-bad ones.
-
-The fix is to make the exploratory emission faithful (or to ship the
-explored text instead of re-emitting it, which collides with the
-`EXPLORATORY_EMISSION` trace-counting contract), and only then to score
-layouts. Until then the historical rule stands and `hash_table` keeps its
-25 % gap.
+Round 2 replaced the text probe with a CFG-derived cost and shipped it:
+`layout_branch_cost` prices only the permutation, and a spill-traffic band
+(`+10 %` stack operands) decides the layout where size and cost disagree.
+`hash_table` 11.95 s → 9.80 s (−18.0 %), `linux_rbtree` 19.88 → 16.68 ms
+(−16.1 %), corpus geomean 0.9947 over 67 programs, codegen gate green with the
+baseline unchanged. Details, calibration and the full A/B are in
+[round 2](FOLLOWUP-2026-10-22-round2-layout-branch-cost.md). That withdrawal
+was specific to the **text-scored** variant, which had an exploratory emission
+to be unfaithful to; the CFG-scored metric has none.
 
 ### `linux_find_bit` — the fold is worth 3.9 %, the layout is not the cost
 
@@ -183,7 +165,7 @@ not chased again:
 | --- | ---: | --- |
 | `linux_find_bit_scaled` | 1.24 | Superseded by the measurement above: the block order is now the fall-through one and the time did not move, so the two-branch-per-word scan loop was **not** the cost. What is left is the un-folded load (3.9 %) and, beyond that, an unexplained gap that a hand-spliced build localises: with gcc's `linux_find_next_andnot_bit` inside lccc's `main` the program runs at 683 ms, i.e. faster than gcc's own 705 ms, so the caller and the whole program structure are fine and everything left is inside that one function. lccc still wins the tail: `bsfq` vs gcc's 12-instruction `__ffs` decision tree. |
 | `spectral_norm` | 1.13 | gcc carries `i+j` as an induction variable and derives `(i+j)*(i+j+1)` from it, so an iteration is 14 instructions; lccc recomputes `i+j` and `i+j+1` from `j`, 16. The loop is issue-bound (divsd + addsd chain), so 2 instructions ≈ the measured 13 %. Needs cross-iteration redundancy elimination over affine expressions (a loop-PRE for `affine(IV)+k`), which `backedge_pre` does not do today. |
-| `hash_table` | 1.25 (12.3 s, the most reliable number in the corpus) | 22 % of it is block placement (`0.780` with the branch-priced metric, see above) but that metric is blocked on exploratory-emission fidelity. The rest is unresolved. The generated code is instruction-for-instruction equivalent to gcc's in `insert`, `lookup` and all three `main` loops, the checksums agree, and the work is identical, yet lccc is 25 % slower on both the insert and the lookup phase (a phase-instrumented copy shows both). The lccc `.s` assembled and linked by gcc shows the same gap, so it is not the linker. Needs a real PMU (absent on this host: no `perf`), or `rdtsc`-based phase counters, before any change is justified. |
+| `hash_table` | 1.18 → **0.82 of its own pre-round-2 time** | Block placement was 22 % of it and is now fixed: `layout_branch_cost` (CFG-scored, round 2) takes 11.95 s to 9.80 s. What remains is unresolved. The generated code is instruction-for-instruction equivalent to gcc's in `insert`, `lookup` and all three `main` loops, the checksums agree, and the work is identical, yet lccc is 25 % slower on both the insert and the lookup phase (a phase-instrumented copy shows both). The lccc `.s` assembled and linked by gcc shows the same gap, so it is not the linker. Needs a real PMU (absent on this host: no `perf`), or `rdtsc`-based phase counters, before any change is justified. |
 | `percpu_ptr_walk`, `tls_seg_access`, `histogram`, `binary_search`, `ring_fifo`, `tce_sum`, `ascii_case_fold` | 0.95–1.05 | Not code at all. In this run they land between 0.95 and 1.05; the first run of the same binaries reported 1.68, 1.32 and 1.25 for three of them. Their medians are 2–16 ms of *wall* while the *child CPU* time is 2.0–2.3 ms for both compilers — the ratio is launch-time quantisation. `percpu_ptr_walk`'s inner loop is also instruction-for-instruction identical to gcc's (`addq %gs:8(%r8),%rdx` … 8 instructions), and its header's documented purpose (the segment-qualified ALU fold) is met. A harness fix — scale `PASSES` so each timed region is ≥ 0.5 s, as `linux_find_bit_scaled` already does — is worth more than any compiler change here. |
 | `fannkuch`, `binary_trees`, `strlen_bench`, `mandelbrot`, `loop_patterns`, `zstd_count`, `linux_rbtree` | 1.05–1.20 | Not yet analysed. All are long enough to rank; each needs the same asm-diff plus phase-measurement treatment. |
 
