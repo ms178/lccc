@@ -8,6 +8,8 @@ import re
 import subprocess
 import tempfile
 
+from gcc_oracle_identity import gcc_oracle_identity
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -43,10 +45,14 @@ def main():
         "--compiler", default=os.environ.get("CCC", str(ROOT / "target/fastbuild/lccc"))
     )
     parser.add_argument("--gcc", default=os.environ.get("GCC", "gcc-16"))
+    parser.add_argument(
+        "--allow-gcc16-snapshot",
+        action="store_true",
+        help="accept a supplemental rolling GCC 16 oracle; not normative GCC 16.2 evidence",
+    )
     args = parser.parse_args()
-    version = run([args.gcc, "--version"]).decode()
-    if not re.search(r"\b16\.2(?:\.0)?\b", version):
-        raise ValueError("this contract requires exact GCC 16.2")
+    version = run([args.gcc, "-dumpfullversion"]).decode().strip()
+    normative = gcc_oracle_identity(version, args.allow_gcc16_snapshot)
     source = str(ROOT / "tests/regression/llvm_missed_zero_choice.c")
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp)
@@ -99,7 +105,8 @@ def main():
             observed = body(on, "observed_condition")
             if not any(re.match(r"mov[lq]\s+.*\(%rsi\)", line) for line in observed):
                 raise ValueError(f"observable condition read lost: {observed}")
-    print("PASS LLVM #233753: runtime, mechanism, policy, observable condition")
+    identity = "normative GCC 16.2" if normative else f"supplemental GCC {version} snapshot"
+    print(f"PASS LLVM #233753 ({identity}): runtime, mechanism, policy, observable condition")
 
 
 if __name__ == "__main__":

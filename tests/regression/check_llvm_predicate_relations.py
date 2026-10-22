@@ -7,17 +7,10 @@ from pathlib import Path
 import re
 import tempfile
 from check_llvm_missed_zero_choice import body, run
+from gcc_oracle_identity import gcc_oracle_identity
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "tests/regression/llvm_predicate_relations.c"
-
-
-def gcc_oracle_identity(version, allow_snapshot=False):
-    """Only the Debian exact-version gate supplies normative GCC evidence."""
-    normative = bool(re.fullmatch(r"16\.2(?:\.0)?", version))
-    if not normative and not (allow_snapshot and version.startswith("16.")):
-        raise ValueError(f"GCC 16.2 oracle required, found {version!r}")
-    return normative
 
 
 def main():

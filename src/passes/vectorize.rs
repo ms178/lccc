@@ -22843,7 +22843,6 @@ mod matmul_f64x4_bound_tests {
     fn wide_bounds_saturate_before_byte_offset_overflow() {
         let limit = matmul_f64x4_byte_limit_for_bound(i64::MAX);
         assert_eq!(limit, i64::MAX - 127);
-        assert!(limit <= i64::MAX);
         assert_eq!(
             matmul_f64x4_byte_limit_for_bound(MATMUL_F64X4_MAX_SIGNED_ELEMENTS),
             limit

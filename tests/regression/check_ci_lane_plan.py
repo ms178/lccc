@@ -306,9 +306,22 @@ def _cache_path(step: dict) -> str:
 
 def _pins_gcc_minor(relative: str) -> bool:
     try:
-        return GCC_PIN_IDIOM in (ROOT / relative).read_text(encoding="utf-8", errors="replace")
+        text = (ROOT / relative).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return False
+    if GCC_PIN_IDIOM in text:
+        return True
+    # GCC 16.2 policy is centralized so a gate cannot drift from its siblings.
+    # Follow that exact import; checking only the caller stopped detecting the
+    # pin as soon as the version regex moved into gcc_oracle_identity.py.
+    if re.search(r"\bfrom\s+gcc_oracle_identity\s+import\s+gcc_oracle_identity\b", text):
+        helper = (ROOT / relative).with_name("gcc_oracle_identity.py")
+        try:
+            helper_text = helper.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        return GCC_PIN_IDIOM in helper_text
+    return False
 
 
 def oracle_provisioning(document: dict) -> list[str]:
@@ -350,12 +363,21 @@ def oracle_provisioning(document: dict) -> list[str]:
                         f"{name}: installs the pinned Clang oracle but its "
                         f"{VERIFY_STEP!r} step does not assert --clang-version: "
                         f"'the oracle' must mean exactly 23.1.3")
-        # R6: the lane runs a gate that pins the GCC minor, so the lane's own
-        # probe must assert it too.  Without this, a lane can be provisioned
-        # with 16.3 and pass its probe, only for the first pinning gate to fail
-        # twelve minutes later with "GCC 16.2 required" and no version named.
-        pins = [match.group(1) for match in GATE_CALL.finditer(joined)
-                if _pins_gcc_minor(_repo_relative(match.group(1)))]
+        # R6: a GCC 16.2 gate must be explicitly normative before its lane's
+        # probe can pass. A gate that opts into --allow-gcc16-snapshot is
+        # deliberately supplemental and does not require the lane to assert
+        # 16.2; all other callers do, including those importing the shared
+        # gcc_oracle_identity policy.
+        pins = []
+        for match in GATE_CALL.finditer(joined):
+            relative = _repo_relative(match.group(1))
+            if not _pins_gcc_minor(relative):
+                continue
+            line_start = joined.rfind("\n", 0, match.start()) + 1
+            line_end = joined.find("\n", match.end())
+            invocation = joined[line_start:line_end if line_end >= 0 else len(joined)]
+            if "--allow-gcc16-snapshot" not in invocation:
+                pins.append(match.group(1))
         if pins and provisions:
             for run in verifies:
                 if "--gcc-version" not in run:
@@ -733,6 +755,13 @@ def self_test() -> None:
     ]}}}
     problems = oracle_provisioning(gcc_loose)
     assert any("--gcc-version" in p and "16.2" in p for p in problems), problems
+
+    # The shared identity helper is strict by default, but an explicit snapshot
+    # allowance is supplemental evidence and must not force a normative probe.
+    gcc_snapshot = json.loads(json.dumps(gcc_loose))
+    gcc_snapshot["jobs"]["contracts"]["steps"][-1]["run"] += " --allow-gcc16-snapshot"
+    problems = oracle_provisioning(gcc_snapshot)
+    assert not any("does not assert --gcc-version" in p for p in problems), problems
     assert oracle_provisioning(complete) == [], oracle_provisioning(complete)
 
     # R5: the package set is what every bundle is built from.
@@ -740,7 +769,7 @@ def self_test() -> None:
     assert provisioning_extras_problems('EXTRAS="qemu-user valgrind libc6-dbg"') == []
     assert provisioning_extras_problems("PACKAGES=qemu") != []
 
-    print("check_ci_lane_plan: self-test PASS (19 rules, 26 fixtures)")
+    print("check_ci_lane_plan: self-test PASS (19 rules, 27 fixtures)")
 
 
 def main(argv: list[str] | None = None) -> int:

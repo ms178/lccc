@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import tempfile
 from check_llvm_missed_zero_choice import run, body
+from gcc_oracle_identity import gcc_oracle_identity
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "tests/regression/llvm_integer_observations.c"
@@ -20,6 +21,8 @@ def main():
         "--compiler", default=os.environ.get("CCC", str(ROOT / "target/fastbuild/lccc"))
     )
     parser.add_argument("--gcc", default=os.environ.get("GCC", "gcc-16"))
+    parser.add_argument("--allow-gcc16-snapshot", action="store_true",
+                        help="accept a supplemental rolling GCC 16 oracle; not normative GCC 16.2 evidence")
     parser.add_argument("--clang", help="optional exact Clang 23.1.3 comparison")
     parser.add_argument(
         "--baseline",
@@ -28,8 +31,8 @@ def main():
     args = parser.parse_args()
     if len(CASES) != 45 or len({c["name"] for c in CASES}) != 45:
         raise ValueError("missing or duplicate witness contracts")
-    if not re.search(r"\b16\.2(?:\.0)?\b", run([args.gcc, "--version"]).decode()):
-        raise ValueError("requires exact GCC 16.2")
+    version = run([args.gcc, "-dumpfullversion"]).decode().strip()
+    normative = gcc_oracle_identity(version, args.allow_gcc16_snapshot)
     if args.clang and not re.search(
         r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()
     ):
@@ -132,8 +135,9 @@ def main():
                 raise ValueError("volatile condition evaluation lost")
             if not any(re.match(r"call.*effect", x) for x in body(on, "effect_batch")):
                 raise ValueError("side-effecting condition call lost")
+        identity = "normative GCC 16.2" if normative else f"supplemental GCC {version} snapshot"
         print(
-            "PASS 45 individually guarded witnesses; runtime, IR, effects, shared uses and policy"
+            f"PASS {identity}: 45 individually guarded witnesses; runtime, IR, effects, shared uses and policy"
         )
 
 

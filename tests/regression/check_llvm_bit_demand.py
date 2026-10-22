@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import tempfile
 from check_llvm_missed_zero_choice import body, run
+from gcc_oracle_identity import gcc_oracle_identity
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "tests/regression/llvm_bit_demand.c"
@@ -19,6 +20,8 @@ def main():
         "--compiler", default=os.environ.get("CCC", str(ROOT / "target/fastbuild/lccc"))
     )
     parser.add_argument("--gcc", default=os.environ.get("GCC", "gcc-16"))
+    parser.add_argument("--allow-gcc16-snapshot", action="store_true",
+                        help="accept a supplemental rolling GCC 16 oracle; not normative GCC 16.2 evidence")
     parser.add_argument(
         "--baseline", help="optional saved main compiler; independent of disabling"
     )
@@ -27,17 +30,17 @@ def main():
     cases = json.loads(SOURCE.with_suffix(".json").read_text())
     if len(cases) != 60 or len({c["name"] for c in cases}) != 60:
         raise ValueError("missing/duplicate contracts")
-    if not re.search(r"\b16\.2(?:\.0)?\b", run([args.gcc, "--version"]).decode()):
-        raise ValueError("exact GCC 16.2 required")
+    version = run([args.gcc, "-dumpfullversion"]).decode().strip()
+    normative = gcc_oracle_identity(version, args.allow_gcc16_snapshot)
     if args.clang and not re.search(
         r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()
     ):
         raise ValueError("exact Clang 23.1.3 required")
     for source in (SOURCE, SOURCE.with_name("llvm_bit_demand_wide.c")):
-        check_source(args, source, cases)
+        check_source(args, source, cases, normative, version)
 
 
-def check_source(args, source, cases):
+def check_source(args, source, cases, normative, version):
     env = os.environ | {"CCC_VERIFY_IR": "abort"}
     with tempfile.TemporaryDirectory() as directory:
         p = Path(directory)
@@ -146,8 +149,9 @@ def check_source(args, source, cases):
                 )
             if "old" in texts:
                 print(f"{opt} versus main: {counts}")
+    identity = "normative GCC 16.2" if normative else f"supplemental GCC {version} snapshot"
     print(
-        "PASS bit-demand: 60 witnesses, seven native modes, IR verification, exact policy controls"
+        f"PASS bit-demand ({identity}): 60 witnesses, seven native modes, IR verification, exact policy controls"
     )
 
 

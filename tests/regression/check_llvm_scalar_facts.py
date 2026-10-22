@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import tempfile
 from check_llvm_missed_zero_choice import body, run
+from gcc_oracle_identity import gcc_oracle_identity
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "tests/regression/llvm_scalar_facts.c"
@@ -33,11 +34,13 @@ def main():
         "--compiler", default=os.environ.get("CCC", str(ROOT / "target/fastbuild/lccc"))
     )
     parser.add_argument("--gcc", default=os.environ.get("GCC", "gcc-16"))
+    parser.add_argument("--allow-gcc16-snapshot", action="store_true",
+                        help="accept a supplemental rolling GCC 16 oracle; not normative GCC 16.2 evidence")
     parser.add_argument("--baseline")
     parser.add_argument("--clang", help="optional exact Clang 23.1.3 oracle")
     args = parser.parse_args()
-    if not re.search(r"\b16\.2(?:\.0)?\b", run([args.gcc, "--version"]).decode()):
-        raise ValueError("GCC 16.2 required")
+    version = run([args.gcc, "-dumpfullversion"]).decode().strip()
+    normative = gcc_oracle_identity(version, args.allow_gcc16_snapshot)
     if args.clang and not re.search(
         r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()
     ):
@@ -250,7 +253,8 @@ def main():
                 "under the knob (hot_web_callee_saved.c): a callee-saved home "
                 "co-held by loop state was evicted"
             )
-    print("scalar-facts: PASS (native, disabled controls, IR/RA verification and mechanisms)")
+    identity = "normative GCC 16.2" if normative else f"supplemental GCC {version} snapshot"
+    print(f"scalar-facts ({identity}): PASS (native, disabled controls, IR/RA verification and mechanisms)")
 
 
 if __name__ == "__main__":

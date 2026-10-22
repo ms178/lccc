@@ -104,7 +104,7 @@ class FailureAnnotationContracts(unittest.TestCase):
                        if line.startswith("::error ")]
         self.assertEqual(len(annotations), 1, result.stdout + result.stderr)
         annotation = annotations[0]
-        self.assertIn("title=GCC 16 provisioning failed (mode --multilib)", annotation)
+        self.assertIn("title=C oracle provisioning failed (mode --multilib)", annotation)
         self.assertIn("gcc-16", annotation)
         self.assertIn("lib32gcc-16-dev", annotation)
         # GitHub command data must be single-line and percent-escaped.

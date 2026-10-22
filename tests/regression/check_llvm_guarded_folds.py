@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import tempfile
 from check_llvm_missed_zero_choice import body, run
+from gcc_oracle_identity import gcc_oracle_identity
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "tests/regression/llvm_guarded_folds/driver.c"
@@ -16,13 +17,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--compiler", default=os.environ.get("CCC", str(ROOT / "target/fastbuild/lccc")))
     ap.add_argument("--gcc", default=os.environ.get("GCC", "gcc-16"))
+    ap.add_argument("--allow-gcc16-snapshot", action="store_true",
+                    help="accept a supplemental rolling GCC 16 oracle; not normative GCC 16.2 evidence")
     ap.add_argument("--clang")
     ap.add_argument("--baseline")
     ap.add_argument("--linker")
     ap.add_argument("--baseline-linker")
     args = ap.parse_args()
-    if not re.search(r"\b16\.2(?:\.0)?\b", run([args.gcc, "--version"]).decode()):
-        raise ValueError("GCC 16.2 required")
+    version = run([args.gcc, "-dumpfullversion"]).decode().strip()
+    normative = gcc_oracle_identity(version, args.allow_gcc16_snapshot)
     if args.clang and not re.search(r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()):
         raise ValueError("Clang 23.1.3 required")
     env = os.environ | {"CCC_VERIFY_IR": "abort", "CCC_VERIFY_REGALLOC": "1"}
@@ -105,7 +108,8 @@ def main():
                 if symbols["guard_int"] != symbols["guard_long"]:
                     raise ValueError("text-only ICF baseline failure not reproduced")
     print("PASS ELF: identical unwind folds; different catch types remain distinct")
-    print("PASS guarded folds: native/i686/guard-page/disabled/IR/RA/mechanism controls")
+    identity = "normative GCC 16.2" if normative else f"supplemental GCC {version} snapshot"
+    print(f"PASS guarded folds ({identity}): native/i686/guard-page/disabled/IR/RA/mechanism controls")
 
 
 if __name__ == "__main__":

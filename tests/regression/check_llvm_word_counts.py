@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import tempfile
 from check_llvm_missed_zero_choice import body, run
+from gcc_oracle_identity import gcc_oracle_identity
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "tests/regression/llvm_word_counts.c"
@@ -16,16 +17,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--compiler", default=os.environ.get("CCC", str(ROOT / "target/fastbuild/lccc")))
     ap.add_argument("--gcc", default=os.environ.get("GCC", "gcc-16"))
+    ap.add_argument("--allow-gcc16-snapshot", action="store_true",
+                    help="accept a supplemental rolling GCC 16 oracle; not normative GCC 16.2 evidence")
     ap.add_argument("--clang")
     ap.add_argument("--baseline")
     args = ap.parse_args()
-    banner = run([args.gcc, "--version"]).decode().splitlines()
-    banner = banner[0] if banner else "<no output>"
-    if not re.search(r"\b16\.2(?:\.0)?\b", banner):
-        # Name the version that IS installed: "GCC 16.2 required" alone cannot
-        # distinguish a lane provisioned with 16.3 from one whose `gcc-16` is
-        # not on PATH at all, and the two have different fixes.
-        raise ValueError(f"GCC 16.2 required, found: {banner!r} ({args.gcc})")
+    version = run([args.gcc, "-dumpfullversion"]).decode().strip()
+    normative = gcc_oracle_identity(version, args.allow_gcc16_snapshot)
     if args.clang and not re.search(r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()):
         raise ValueError("Clang 23.1.3 required")
     env = os.environ | {"CCC_VERIFY_IR": "abort", "CCC_VERIFY_REGALLOC": "1", "CCC_VALIDATE_SSA": "1"}
@@ -62,7 +60,8 @@ def main():
             scans = sum(bool(re.match(r"(?:bsf|bsr|tzcnt|lzcnt)[lq]?\b", line)) for line in body(asm["on"], name))
             if scans < 2:
                 raise ValueError(f"refusal control lost its distinct scans: {name}")
-    print("PASS scalar count composition: native/IR/RA/disable/mechanism/refusal controls")
+    identity = "normative GCC 16.2" if normative else f"supplemental GCC {version} snapshot"
+    print(f"PASS scalar count composition ({identity}): native/IR/RA/disable/mechanism/refusal controls")
 
 
 if __name__ == "__main__":
