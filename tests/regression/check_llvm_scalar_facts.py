@@ -219,21 +219,32 @@ def main():
                 env=env | {"CCC_HOT_WEB_STEAL": cap},
             )
             run([str(p / "hot")])
+        # The knob must stay wired to a live mechanism: an A/B control that
+        # cannot change any output is a knob that silently stopped meaning
+        # anything.  This used to compare the hot_web fixture's `exercise`
+        # body, but the two-wave Phase-1 allocation (mandatory call-spanning
+        # before optional hot-loop) now homes this shape's webs before the
+        # steal is consulted, so the bodies are identical for a good reason
+        # -- verified: both settings keep the callee-saved homes, and the
+        # mechanism outcome for this shape is pinned by
+        # check_hot_loop_register_homes.sh.  The discrimination witness
+        # therefore moved to a shape where the steal is still the deciding
+        # mechanism (measured: it is the one file in the 67-program
+        # benchmark corpus whose -O2 codegen the knob changes).
+        witness = ROOT / "tests/benchmark/programs/zlib_ng_adler32_combine.c"
         for disabled in [False, True]:
             run(
                 [
                     args.compiler,
                     "-O2",
                     "-S",
-                    str(hot),
+                    str(witness),
                     "-o",
                     str(p / f"hot-{disabled}.s"),
                 ],
                 env=env | ({"CCC_NO_HOT_WEB_STEAL": "1"} if disabled else {}),
             )
-        if body((p / "hot-False.s").read_text(), "exercise") == body(
-            (p / "hot-True.s").read_text(), "exercise"
-        ):
+        if (p / "hot-False.s").read_text() == (p / "hot-True.s").read_text():
             raise ValueError(
                 "hot web: enable/disable does not change the pressure witness"
             )
