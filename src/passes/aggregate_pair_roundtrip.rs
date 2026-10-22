@@ -330,15 +330,6 @@ pub(crate) fn run_with_symbol_facts(func: &mut IrFunction, facts: &ModuleSymbolF
         let Some(c) = find_one(func, facts) else {
             break;
         };
-        if super::aggcopy_debug_enabled() {
-            eprintln!(
-                "aggcopy16: block {} {} -> {} ({} instructions collapsed)",
-                c.block,
-                c.src_ptr.0,
-                c.dest_ptr.0,
-                c.drop.len()
-            );
-        }
         apply(func, &c);
         total += 1;
     }

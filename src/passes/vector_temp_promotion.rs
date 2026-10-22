@@ -196,6 +196,12 @@ fn pointer_vector_arg_width(op: IntrinsicOp, index: usize) -> Option<usize> {
         _ => {}
     }
 
+    pointer_vector_arg_width_consumer(op, index)
+}
+
+/// Width table for consumer operands, separate from the source-width cases above.
+fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<usize> {
+    use IntrinsicOp as O;
     let width = match op {
         // 128-bit FP destructive two-operand consumers (add/sub/mul/div/min/max
         // in ps/pd/sd/ss): both operands are 16-byte vector slots.  Shared

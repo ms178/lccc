@@ -18,16 +18,6 @@ mod address_form;
 pub(crate) mod aggregate_copy_forward;
 pub(crate) mod aggregate_pair_roundtrip;
 
-/// `LCCC_DEBUG_AGGCOPY=1` trace for the 16-byte aggregate round-trip pass.
-///
-/// Resolved ONCE per process and kept in `src/passes/mod.rs` because the
-/// pass-level environment-read budget (`tests/regression/
-/// check_env_test_hygiene.sh`) is a ratchet that may only fall: a debug trace
-/// is not a reason to raise it.
-pub(crate) fn aggcopy_debug_enabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os("LCCC_DEBUG_AGGCOPY").is_some())
-}
 pub(crate) mod aggregate_sroa;
 pub(crate) mod alias;
 pub(crate) mod arx_vectorize;

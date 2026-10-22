@@ -73,7 +73,7 @@ The net effect is a 16-byte copy, and it cost eight integer instructions, two
 GPRs and two stack homes -- for *every* intrinsic, on top of the operation
 itself. `_mm_loadu_pd` alone compiled to 40 instructions against GCC's 5.
 
-## The fix: `aggregate_pair_roundtrip` (`CCC_DISABLE_PASSES=aggcopy16`; debug `LCCC_DEBUG_AGGCOPY=1`)
+## The fix: `aggregate_pair_roundtrip` (`CCC_DISABLE_PASSES=aggcopy16`)
 
 `src/passes/aggregate_pair_roundtrip.rs` recognises that exact shape in one
 basic block and replaces it with the **intrinsic 128-bit copy pair**
