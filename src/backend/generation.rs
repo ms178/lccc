@@ -6801,12 +6801,7 @@ fn generate_instruction_body(
                         result.as_ref(),
                     );
                 } else {
-                    cg.emit_inline_memcpy_call(
-                        &info.args[0],
-                        &info.args[1],
-                        size,
-                        result.as_ref(),
-                    );
+                    cg.emit_inline_memcpy_call(&info.args[0], &info.args[1], size, result.as_ref());
                 }
                 clobber_after_call_like(cg);
                 if let Some(d) = defined_dest {
