@@ -99,6 +99,9 @@ def main():
     if args.filter:
         files = [f for f in files if args.filter in f.name]
 
+    if not files:
+        ap.error("no intrinsic cases selected")
+
     # Binaries go to a private temporary directory. A fixed path (this runner
     # used to fall back to /home/user/work) is unwritable wherever the checkout
     # runs as a different user, which failed the whole gate before it tested
@@ -120,10 +123,6 @@ def run_cases(args, files, workdir):
                 extra = m.group(1).split()
                 break
         lacking = missing_isa(extra)
-        if lacking:
-            print(f"SKIP {name} (host lacks {' '.join(lacking)})")
-            nskip += 1
-            continue
 
         lccc_flags = (args.lccc_flags + " " + " ".join(extra)).split()
         gcc_flags = (args.gcc_flags + " " + " ".join(extra)).split()
@@ -145,13 +144,20 @@ def run_cases(args, files, workdir):
             print(f"COMPILE-FAIL-LCCC {name}: {err[-1] if err else '?'}")
             nfail += 1; failures.append((name, "lccc compile fail")); continue
         if gr.returncode != 0:
-            print(f"SKIP {name} (gcc compile fail)"); nskip += 1; continue
+            print(f"COMPILE-FAIL-GCC {name}: {gr.stderr.strip()}")
+            nfail += 1; failures.append((name, "gcc oracle compile fail")); continue
+
+        # Missing hardware prevents execution, not assembly/width checking.
+        if lacking:
+            print(f"SKIP-RUN {name} (host lacks {' '.join(lacking)}; both compilers assembled)")
+            nskip += 1
+            continue
 
         lout = run([str(lbin)], RUN_TIMEOUT)
         gout = run([str(gbin)], RUN_TIMEOUT)
         if lout is None or gout is None:
             print(f"TIMEOUT {name} (run)"); nfail += 1; failures.append((name, "run timeout")); continue
-        if lout.stdout == gout.stdout and lout.returncode == gout.returncode:
+        if lout.returncode == 0 and gout.returncode == 0 and lout.stdout == gout.stdout:
             print(f"PASS {name}")
             npass += 1
         else:

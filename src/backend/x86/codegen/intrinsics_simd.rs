@@ -829,7 +829,11 @@ impl X86Codegen {
                 true
             }
             Cast128to512 => {
-                self.emit_cast128_512(dptr, args);
+                self.emit_cast_to512(dptr, args, "xmm0");
+                true
+            }
+            Cast256to512 => {
+                self.emit_cast_to512(dptr, args, "ymm0");
                 true
             }
             // ---- loads/stores ----
@@ -997,11 +1001,11 @@ impl X86Codegen {
                 true
             }
             CvtPs2Pd512 => {
-                self.emit_evex_unary_512(dptr, args, "vcvtps2pd");
+                self.emit_evex_convert_512(dptr, args, "vcvtps2pd", "ymm0", "zmm0");
                 true
             }
             CvtPd2Ps512 => {
-                self.emit_evex_unary_512(dptr, args, "vcvtpd2ps");
+                self.emit_evex_convert_512(dptr, args, "vcvtpd2ps", "zmm0", "ymm0");
                 true
             }
             CvtEp32_2Ps512 => {
@@ -1017,15 +1021,15 @@ impl X86Codegen {
                 true
             }
             CvtEp32_2Pd512 => {
-                self.emit_evex_unary_512(dptr, args, "vcvtdq2pd");
+                self.emit_evex_convert_512(dptr, args, "vcvtdq2pd", "ymm0", "zmm0");
                 true
             }
             CvtPd2Ep32_512 => {
-                self.emit_evex_unary_512(dptr, args, "vcvtpd2dq");
+                self.emit_evex_convert_512(dptr, args, "vcvtpd2dq", "zmm0", "ymm0");
                 true
             }
             CvttPd2Ep32_512 => {
-                self.emit_evex_unary_512(dptr, args, "vcvttpd2dq");
+                self.emit_evex_convert_512(dptr, args, "vcvttpd2dq", "zmm0", "ymm0");
                 true
             }
             FmaPs132v512 => {
@@ -1087,11 +1091,11 @@ impl X86Codegen {
             | SqrtPd256 | CmpPs256 | CmpPd256 | ShufPs256 | ShufPd256 | UnpcklPs256
             | UnpckhPs256 | UnpcklPd256 | UnpckhPd256 | HaddPs256 | HsubPs256 | AddsubPs256
             | RoundPs256 | RoundPd256 | BlendPs256 | BlendPd256 | BlendvPs256 | BlendvPd256
-            | VpermilPs256 | Vperm2f128 | Vinsertf128 | Vextractf128 | Vbroadcastss
-            | Vbroadcastsd | CvtPs2Ep32_256 | CvtEp32ToPs256 | CvttPs2Ep32_256 | CvtPs2Pd256
-            | CvtPd2Ps256 | CvtPd2Ep32_256 | CvtEp32ToPd256 | CvttPd2Ep32_256 | VpermilvarPs256
-            | VpermilvarPd256 | FmaPs132v256 | FmaPs213v256 | FmaPs231v256 | FmaPd132v256
-            | FmaPd213v256 | FmaPd231v256 => {
+            | VpermilPs256 | VpermilPd256 | Vperm2f128 | Vinsertf128 | Vextractf128
+            | Vbroadcastss | Vbroadcastsd | CvtPs2Ep32_256 | CvtEp32ToPs256 | CvttPs2Ep32_256
+            | CvtPs2Pd256 | CvtPd2Ps256 | CvtPd2Ep32_256 | CvtEp32ToPd256 | CvttPd2Ep32_256
+            | VpermilvarPs256 | VpermilvarPd256 | FmaPs132v256 | FmaPs213v256 | FmaPs231v256
+            | FmaPd132v256 | FmaPd213v256 | FmaPd231v256 => {
                 self.emit_avx_fp_256_op(dptr, op, args);
                 true
             }
@@ -1154,23 +1158,12 @@ impl X86Codegen {
         self.evex_store_dest(dest_ptr);
     }
 
-    /// Zero-extend a 128-bit value into 512: vpxord + vinserti32x4 $0.
+    /// VEX.128 writes zero bits 128..MAXVL, including the upper ZMM lanes.
+    /// This is both a zero-extension and a legal implementation of the cast
+    /// whose upper lanes are unspecified. Never read 64 bytes from a 16-byte
+    /// source merely because the destination is 512 bits wide.
     fn emit_zext128_512(&mut self, dest_ptr: &Value, args: &[Operand]) {
-        self.flush_pending_vec_store_impl();
-        self.state.invalidate_vec_peephole();
-        self.state.emit("    vpxord %zmm0, %zmm0, %zmm0");
-        if let Some(&held) = self.state.vec_live_regs.get(&simd_value_id(&args[0])) {
-            self.state
-                .emit_fmt(format_args!("    vinserti32x4 $0, %{}, %zmm0, %zmm0", held));
-        } else if let Some(m) = self.evex_arg_mem(&args[0]) {
-            self.state
-                .emit_fmt(format_args!("    vinserti32x4 $0, {}, %zmm0, %zmm0", m));
-        } else {
-            self.operand_to_reg(&args[0], "rax");
-            self.state.emit("    vmovdqu (%rax), %xmm1");
-            self.state.emit("    vinserti32x4 $0, %xmm1, %zmm0, %zmm0");
-        }
-        self.evex_store_dest(dest_ptr);
+        self.emit_cast_to512(dest_ptr, args, "xmm0");
     }
 
     /// 512 -> 256 cast (keep low 256 bits).
@@ -1188,23 +1181,46 @@ impl X86Codegen {
         self.state.vec_claim_live_reg(dest_ptr.0, "ymm0");
     }
 
-    /// 128 -> 512 cast (register move; upper bits undefined like GCC).
-    fn emit_cast128_512(&mut self, dest_ptr: &Value, args: &[Operand]) {
+    /// Narrow -> 512 cast; zeroing the undefined upper lanes is legal.
+    fn emit_cast_to512(&mut self, dest_ptr: &Value, args: &[Operand], reg: &str) {
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
-        if let Some(&held) = self.state.vec_live_regs.get(&simd_value_id(&args[0])) {
-            if held != "zmm0" {
-                self.state
-                    .emit_fmt(format_args!("    vmovdqu64 %{}, %zmm0", held));
-            }
-        } else if let Some(m) = self.evex_arg_mem(&args[0]) {
+        if let Some(m) = self.evex_arg_mem(&args[0]) {
             self.state
-                .emit_fmt(format_args!("    vmovdqu64 {}, %zmm0", m));
+                .emit_fmt(format_args!("    vmovdqu {}, %{}", m, reg));
         } else {
             self.operand_to_reg(&args[0], "rax");
-            self.state.emit("    vmovdqu (%rax), %xmm0");
+            self.state
+                .emit_fmt(format_args!("    vmovdqu (%rax), %{}", reg));
         }
         self.evex_store_dest(dest_ptr);
+    }
+
+    /// EVEX widening reads 32 bytes and writes 64; narrowing does the reverse.
+    /// Fold the exact-width memory tuple, avoiding a separate source load.
+    fn emit_evex_convert_512(
+        &mut self,
+        dest_ptr: &Value,
+        args: &[Operand],
+        inst: &str,
+        src_reg: &'static str,
+        dst_reg: &'static str,
+    ) {
+        self.flush_pending_vec_store_impl();
+        self.state.invalidate_vec_peephole();
+        if let Some(mem) = self.evex_arg_mem(&args[0]) {
+            self.state
+                .emit_fmt(format_args!("    {} {}, %{}", inst, mem, dst_reg));
+        } else {
+            self.simd_load_arg_to(&args[0], src_reg);
+            self.state
+                .emit_fmt(format_args!("    {} %{}, %{}", inst, src_reg, dst_reg));
+        }
+        if dst_reg == "ymm0" {
+            self.avx_store_dest(dest_ptr);
+        } else {
+            self.evex_store_dest(dest_ptr);
+        }
     }
 
     /// Unaligned 512-bit load: vmovdqu64 (ptr), %zmm0.
@@ -1260,7 +1276,7 @@ impl X86Codegen {
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
         // args: (mask, ptr, old) — old provides the merge base.
-        self.evex_load_arg_to(&args[2], reg);
+        self.simd_load_arg_to(&args[2], reg);
         self.simd_gpr_to_k1(&args[0]);
         self.operand_to_reg(&args[1], "rax");
         self.state
@@ -1474,6 +1490,8 @@ impl X86Codegen {
             MovemaskPs256 => ("vmovmskps", 0, true),
             MovemaskPd256 => ("vmovmskpd", 0, true),
             ExtractPs128 => ("extractps", 0, true),
+            CvttSs2Si128 => ("cvttss2si", 0, true),
+            CvttSd2Si128 => ("cvttsd2si", 0, true),
             CvtSs2Si128 => ("cvtss2si", 0, true),
             CvtSd2Si128 => ("cvtsd2si", 0, true),
             TestzPs128 => ("vtestps", 0, true),
@@ -1543,7 +1561,7 @@ impl X86Codegen {
                 }
                 true
             }
-            CvtSs2Si128 | CvtSd2Si128 => {
+            CvtSs2Si128 | CvtSd2Si128 | CvttSs2Si128 | CvttSd2Si128 => {
                 self.sse_load_arg(&args[0], "xmm0");
                 self.state
                     .emit_fmt(format_args!("    {} %xmm0, %eax", inst));
@@ -1920,11 +1938,12 @@ impl X86Codegen {
                 self.avx_store_dest(dest_ptr);
             }
             // 2-op with imm: vroundps/vroundpd/vpermilps (a, imm)
-            RoundPs256 | RoundPd256 | VpermilPs256 => {
+            RoundPs256 | RoundPd256 | VpermilPs256 | VpermilPd256 => {
                 let inst = match op {
                     RoundPs256 => "vroundps",
                     RoundPd256 => "vroundpd",
                     VpermilPs256 => "vpermilps",
+                    VpermilPd256 => "vpermilpd",
                     _ => unreachable!(),
                 };
                 let imm = self.simd_imm(&args[1]);

@@ -1547,6 +1547,7 @@ pub enum IntrinsicOp {
     Zext128to512,
     Cast512to256,
     Cast128to512,
+    Cast256to512,
     // === AVX-512 mask ops (mask = scalar u64 in IR) ===
     CmpeqEpu8Mask128,
     CmpeqEpu8Mask256,
@@ -1636,6 +1637,7 @@ pub enum IntrinsicOp {
     CvtEp32ToPd128,
     CvttPd2Ep32_128,
     CvtSs2Si128,
+    CvttSs2Si128,
     CvtSi2Ss128,
     CvtSs2Sd128,
     CvtSd2Ss128,
@@ -1643,6 +1645,7 @@ pub enum IntrinsicOp {
     CvtSi2Ss64_128,
     CvtSi2Sd64_128,
     CvtSd2Si128,
+    CvttSd2Si128,
     Movss128,
     Movsd128,
     // === 256-bit FP ops (AVX) ===
@@ -1674,6 +1677,7 @@ pub enum IntrinsicOp {
     CvttPd2Ep32_256,
     VpermilPs128,
     VpermilPs256,
+    VpermilPd256,
     /// 256-bit variable-index permute: `vpermilps %idx, %src, %dst`.
     VpermilvarPs256,
     /// 256-bit variable-index permute (double): `vpermilpd %idx, %src, %dst`.

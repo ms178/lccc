@@ -171,8 +171,8 @@ SET1 = [
 CASTS = [
     ("castsi128_si512", "vcastsi128_512", "__m128i", "M512I"),
     ("zextsi128_si512", "vzextsi128_512", "__m128i", "M512I"),
-    ("castsi512_si256", "vcastsi512_256", "__m256i", "M256I"),
-    ("castsi256_si512", "vcastsi128_512", "__m256i", "M512I"),
+    ("castsi512_si256", "vcastsi512_256", "__m512i", "M256I"),
+    ("castsi256_si512", "vcastsi256_512", "__m256i", "M512I"),
 ]
 REDUCE = [
     ("reduce_add_epu32", "vreduce_add_epu32_512", "unsigned int"),
@@ -204,8 +204,8 @@ FP128_SCALAR = [
     ("movemask_pd", "movmskpd128", "int", "M128D"),
     ("cvtss_si32", "cvtss2si128", "int", "M128"),
     ("cvtsd_si32", "cvtsd2si128", "int", "M128D"),
-    ("cvttss_si32", "cvtss2si128", "int", "M128"),
-    ("cvttsd_si32", "cvtsd2si128", "int", "M128D"),
+    ("cvttss_si32", "cvttss2si128", "int", "M128"),
+    ("cvttsd_si32", "cvttsd2si128", "int", "M128D"),
 ]
 FP128_UIMM = [
     ("round_ps", "roundps128", "__m128", "M128"),
@@ -280,7 +280,7 @@ FP256_UIMM = [
     ("round_ps", "vroundps256", "__m256", "M256"),
     ("round_pd", "vroundpd256", "__m256d", "M256D"),
     ("permute_ps", "vpermilps256", "__m256", "M256"),
-    ("permute_pd", "vpermilps256", "__m256d", "M256D"),
+    ("permute_pd", "vpermilpd256", "__m256d", "M256D"),
 ]
 FP256_BIMM = [
     ("blend_ps", "vblendps256", "__m256", "M256"),
@@ -365,10 +365,11 @@ for elty, cnt, name in [
     ("short", 32, "__v32hi"), ("unsigned short", 32, "__v32hu"),
     ("char", 64, "__v64qi"), ("unsigned char", 64, "__v64qu"),
 ]:
-    w(f"typedef {elty} {name} __attribute__ ((__vector_size__ ({cnt * 4})));")
+    element_bytes = {"float": 4, "double": 8, "long long": 8, "unsigned long long": 8,
+                     "int": 4, "unsigned int": 4, "short": 2, "unsigned short": 2,
+                     "char": 1, "signed char": 1, "unsigned char": 1}[elty]
+    w(f"typedef {elty} {name} __attribute__ ((__vector_size__ ({cnt * element_bytes})));")
 w("")
-w("/*")
-w(" * Generic SIMD builtin family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}.")
 w("/*")
 w(" * Generic SIMD builtin family: __lccc_simd{128|256|512}_{i|ps|pd}_{mnemonic}.")
 w(" * First builtin argument = instruction immediate (0 for non-immediate ops);")
@@ -550,7 +551,7 @@ for name, mn, gty in SET1:
 for name, mn, srcty, m in CASTS:
     proto(f"512_i_{mn}", "m512i", ["long", srcty + " __a"])
 for name, mn, srcty, m in CASTS:
-    wrap(f"__m512i _mm512_{name}({srcty} __a)",
+    wrap(f"__{m.lower()} _mm512_{name}({srcty} __a)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd512_i_{mn}(0, __a)); }}")
 for name, mn, rty in REDUCE:
     proto(f"512_i_{mn}", "m512i", ["long", "__m512i __a"])
@@ -564,14 +565,45 @@ for name, mn in FP128_BIN:
     proto(f"128_ps_{mn}", "m128", ["long", "__m128 __a", "__m128 __b"])
     wrap(f"{vty} _mm_{name}({vty} __a, {vty} __b)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __a, __b)); }}")
+# Conversions have independent source/result element types and widths.
+# Suffix-based inference cannot describe either the integer carrier or a
+# widening/narrowing conversion. Keep one typed table for all three widths.
+PACKED_CONVERSIONS = [
+    ("cvtps_epi32", "cvtps2dq", "s", "i", False),
+    ("cvttps_epi32", "cvttps2dq", "s", "i", False),
+    ("cvtepi32_ps", "cvtdq2ps", "i", "s", False),
+    ("cvtps_pd", "cvtps2pd", "s", "d", True),
+    ("cvtepi32_pd", "cvtdq2pd", "i", "d", True),
+    ("cvtpd_ps", "cvtpd2ps", "d", "s", True),
+    ("cvtpd_epi32", "cvtpd2dq", "d", "i", True),
+    ("cvttpd_epi32", "cvttpd2dq", "d", "i", True),
+]
+
+def vector_type(width, kind):
+    return f"__m{width}" + {"s": "", "d": "d", "i": "i"}[kind]
+
+for width in (128, 256, 512):
+    for name, insn, src_kind, dst_kind, changes_width in PACKED_CONVERSIONS:
+        src_width = width // 2 if changes_width and dst_kind == "d" else width
+        dst_width = width // 2 if changes_width and src_kind == "d" else width
+        src_width, dst_width = max(128, src_width), max(128, dst_width)
+        src_ty, dst_ty = vector_type(src_width, src_kind), vector_type(dst_width, dst_kind)
+        mn = ("v" if width > 128 else "") + insn + str(width)
+        pfx = "_mm_" if width == 128 else f"_mm{width}_"
+        proto(f"{width}_ps_{mn}", dst_ty[2:], ["long", src_ty + " __a"])
+        wrap(f"{dst_ty} {pfx}{name}({src_ty} __a)",
+             f"{{ return __CCC_{dst_ty[2:].upper()}_FROM_BUILTIN(__lccc_simd{width}_ps_{mn}(0, __a)); }}")
+
 for name, mn in FP128_UNI:
+    if name.startswith("cvt"):
+        continue
     vty, m = ("__m128", "M128") if name.endswith("_ps") or name.startswith("rcp") or name.startswith("rsqrt") else ("__m128d", "M128D")
-    proto(f"128_ps_{mn}", "m128", ["long", "__m128 __a"])
+    proto(f"128_ps_{mn}", vty[2:], ["long", vty + " __a"])
     wrap(f"{vty} _mm_{name}({vty} __a)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __a)); }}")
 for name, mn, rty, m in FP128_SCALAR:
-    vty = "__m128"
-    proto(f"128_ps_{mn}", "m128", ["long", "__m128 __a"])
+    vty = "__" + m.lower()
+    w(f"{rty} __lccc_simd128_ps_{mn}(long, {vty} __a);")
     wrap(f"{rty} _mm_{name}({vty} __a)",
          f"{{ return ({rty})__lccc_simd128_ps_{mn}(0, __a); }}")
 for name, mn, rty, m in FP128_UIMM:
@@ -615,14 +647,14 @@ for name, mn, rty, m in FP128_MOV:
     wrap(f"{rty} _mm_{name}({rty} __a, {rty} __b)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __a, __b)); }}")
 for name, mn, rty, m in FP128_CVT2:
-    a_ty = "__m128" if name == "cvtss_sd" else "__m128d"
-    b_ty = "__m128" if name == "cvtsd_ss" else "__m128"
-    proto(f"128_ps_{mn}", "m128", ["long", a_ty + " __a", b_ty + " __b"])
+    a_ty = rty
+    b_ty = "__m128" if name == "cvtss_sd" else "__m128d"
+    proto(f"128_ps_{mn}", rty[2:], ["long", a_ty + " __a", b_ty + " __b"])
     wrap(f"{rty} _mm_{name}({a_ty} __a, {b_ty} __b)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __a, __b)); }}")
 for name, mn, rty, m in FP128_SI2FP:
     gty = "long long" if "64" in name else "int"
-    proto(f"128_ps_{mn}", "m128", ["long", "__m128 __a", "int __i"])
+    proto(f"128_ps_{mn}", rty[2:], ["long", rty + " __a", gty + " __i"])
     wrap(f"{rty} _mm_{name}({rty} __a, {gty} __i)",
          f"{{ return __CCC_{m}_FROM_BUILTIN(__lccc_simd128_ps_{mn}(0, __a, __i)); }}")
 
@@ -635,6 +667,8 @@ for name, mn in FP256_BIN:
 FP256_VAR = [x for x in FP256_UNI if x[0].startswith("permutevar")]
 FP256_UNI = [x for x in FP256_UNI if not x[0].startswith("permutevar")]
 for name, mn in FP256_UNI:
+    if name.startswith("cvt"):
+        continue
     vty, m = ("__m256", "M256") if name.endswith("_ps") else ("__m256d", "M256D")
     proto(f"256_ps_{mn}", "m256", ["long", "__m256 __a"])
     wrap(f"{vty} _mm256_{name}({vty} __a)",

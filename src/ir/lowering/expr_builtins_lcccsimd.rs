@@ -192,6 +192,7 @@ pub(super) fn lccc_simd_lookup(
         // ---- casts ----
         "vzextsi128_512" => u(Vec512, Zext128to512),
         "vcastsi512_256" => u(Vec256, Cast512to256),
+        "vcastsi256_512" => u(Vec512, Cast256to512),
         "vcastsi128_512" => u(Vec512, Cast128to512),
         // ---- loads/stores ----
         "vmovdqu64_load" => u(Vec512, Loadu512),
@@ -301,6 +302,8 @@ pub(super) fn lccc_simd_lookup(
         "cvtsi2sd128" => b(Vec128, CvtSi2Sd128),
         "cvtsi2ss64_128" => b(Vec128, CvtSi2Ss64_128),
         "cvtsi2sd64_128" => b(Vec128, CvtSi2Sd64_128),
+        "cvttss2si128" => s1(Scalar, CvttSs2Si128),
+        "cvttsd2si128" => s1(Scalar, CvttSd2Si128),
         "cvtss2si128" => s1(Scalar, CvtSs2Si128),
         "cvtsd2si128" => s1(Scalar, CvtSd2Si128),
         "cvtss2sd128" => b(Vec128, CvtSs2Sd128),
@@ -358,6 +361,7 @@ pub(super) fn lccc_simd_lookup(
         "vcvtpd2dq256" => u(Vec128, CvtPd2Ep32_256),
         "vcvtdq2pd256" => u(Vec256, CvtEp32ToPd256),
         "vcvttpd2dq256" => u(Vec128, CvttPd2Ep32_256),
+        "vpermilpd256" => ui(Vec256, VpermilPd256),
         "vpermilps256" => ui(Vec256, VpermilPs256),
         "vpermilvarps256" => b(Vec256, VpermilvarPs256),
         "vpermilvarpd256" => b(Vec256, VpermilvarPd256),
