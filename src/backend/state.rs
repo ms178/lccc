@@ -1219,6 +1219,28 @@ impl CodegenState {
         self.value_locations.get(&v).copied()
     }
 
+    /// The slot that holds this VALUE's own bits (its data home), or `None`
+    /// when the value's slot means something else.
+    ///
+    /// An alloca's slot is the STORAGE the alloca denotes, not a home for the
+    /// value: the value of an alloca is the slot's ADDRESS. Reading the slot
+    /// therefore yields the pointee's bytes. Any consumer that wants the value
+    /// itself (a cast, an arithmetic operand, a return) must materialize
+    /// `leaq slot` and must use this accessor instead of [`Self::get_slot`]
+    /// so a slot lookup cannot silently rewrite `(int)(uintptr_t)&local` into
+    /// a read of `local` — the exact miscompile the register-direct narrowing
+    /// cast emitted (`movl slot, %reg` instead of `leaq slot` + truncation).
+    ///
+    /// `get_slot` stays the right accessor for address consumers (Load/Store
+    /// bases, `AllocaAddr` resolution), where the slot IS what is wanted.
+    pub fn data_home_slot(&self, v: u32) -> Option<StackSlot> {
+        if self.alloca_values.contains(&v) {
+            None
+        } else {
+            self.get_slot(v)
+        }
+    }
+
     pub fn is_i128_value(&self, v: u32) -> bool {
         self.i128_values.contains(&v)
     }
@@ -1632,6 +1654,40 @@ fn vector_reg_bank(reg: &str) -> u32 {
 mod slot_addr_tests {
     use super::*;
     use crate::backend::regalloc::PhysReg;
+
+    /// `data_home_slot` must refuse an alloca's slot: for an alloca the slot
+    /// is the storage the alloca denotes, so a consumer that wants the VALUE
+    /// (the address) and reads the slot gets the pointee's bytes instead.
+    #[test]
+    fn data_home_slot_refuses_alloca_storage() {
+        let mut state = CodegenState::new();
+        state.value_locations.insert(4, StackSlot(-32));
+        state.value_locations.insert(9, StackSlot(-48));
+
+        // An ordinary value's slot holds the value itself.
+        assert_eq!(state.data_home_slot(4).map(|s| s.0), Some(-32));
+        assert_eq!(state.get_slot(4).map(|s| s.0), Some(-32));
+
+        // An alloca's slot holds what the alloca POINTS AT; its value is the
+        // slot's address, which no slot lookup can produce.
+        state.alloca_values.insert(9);
+        assert_eq!(state.get_slot(9).map(|s| s.0), Some(-48));
+        assert_eq!(
+            state.data_home_slot(9).map(|s| s.0),
+            None,
+            "an alloca's slot is its storage, never a home for its value"
+        );
+        // Address consumers still resolve it: SlotAddr::Direct is the slot
+        // whose ADDRESS is the value.
+        assert!(matches!(
+            state.resolve_slot_addr(9),
+            Some(SlotAddr::Direct(StackSlot(-48)))
+        ));
+
+        // A value with no slot at all stays `None` on both accessors.
+        assert_eq!(state.data_home_slot(11).map(|s| s.0), None);
+        assert_eq!(state.get_slot(11).map(|s| s.0), None);
+    }
 
     #[test]
     fn register_home_is_explicit_and_exact() {

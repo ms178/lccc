@@ -625,8 +625,11 @@ impl X86Codegen {
         let dest_64 = phys_reg_name(dest_phys);
         let dest_32 = phys_reg_name_32(dest_phys);
         let mut src_phys = self.operand_reg(src);
+        // Data home only: an alloca's slot holds its pointee, so an alloca
+        // source must be materialized as an address below and then extended
+        // from its own low lanes, never loaded from the slot.
         let src_slot = match src {
-            Operand::Value(v) => self.state.get_slot(v.0).map(|sl| sl.0),
+            Operand::Value(v) => self.state.data_home_slot(v.0).map(|sl| sl.0),
             _ => None,
         };
         // A generic move only transfers bits; it is not a widening cast.
@@ -781,7 +784,10 @@ impl X86Codegen {
             refuse!("xmm_dest");
         }
         let src_reg = self.operand_reg(src);
-        let src_slot = self.state.get_slot(src_val).map(|sl| sl.0);
+        // Data home only (see data_home_slot): an alloca source has none, so
+        // the record refuses below instead of deferring a compare against the
+        // pointee bytes.
+        let src_slot = self.state.data_home_slot(src_val).map(|sl| sl.0);
         if src_reg.is_none() && src_slot.is_none() {
             refuse!("no_src_home");
         }
@@ -1103,6 +1109,88 @@ impl X86Codegen {
         }
     }
 
+    /// Materialize an alloca's ADDRESS into the destination register and
+    /// apply the cast in place — the register-direct form of `(int)&local`.
+    ///
+    /// The source must be pointer-width, so the alloca's value really is the
+    /// address; anything else refuses before emitting. `value_to_reg` produces
+    /// the `leaq slot` (including the runtime realignment for an alloca that
+    /// asks for more than 16-byte alignment), and the truncation then runs
+    /// between the destination register and itself. The extension choices are
+    /// the ones every other register-direct narrow uses: a 32-bit write zeroes
+    /// the upper half for U32, a signed 32-bit result takes `movslq` so a
+    /// 64-bit reader sees a canonical signed home, and the sub-word forms take
+    /// the zero-extending `movz{w,b}l`.
+    fn emit_alloca_addr_cast(
+        &mut self,
+        v: u32,
+        kind: crate::backend::cast::CastKind,
+        dest_phys: PhysReg,
+        dest_32: &str,
+        dest_64: &str,
+    ) -> bool {
+        use super::emit::typed_phys_reg_name;
+        use crate::backend::cast::CastKind;
+        let narrow_to = match kind {
+            // Same width: the address IS the cast's result.
+            CastKind::Noop | CastKind::UnsignedToSignedSameSize { .. } => None,
+            CastKind::IntNarrow { to_ty } => Some(to_ty),
+            // A pointer-width integer source cannot widen, and an alloca source
+            // never carries a float or i128 type on this path; refuse without
+            // emitting so the caller's fallback still owns the instruction
+            // stream.
+            _ => return false,
+        };
+        // Fuse the address computation with the truncation when the cast's
+        // result is at most 32 bits: `leal slot, %r32` produces exactly what
+        // `leaq slot, %r64` followed by the 32-bit move produces — the low 32
+        // bits of the slot's address, zero-extended — because the 64-bit
+        // address exists ONLY to be truncated here, so its upper half is dead
+        // by construction. One instruction instead of two. An over-aligned
+        // alloca keeps the 64-bit form: its realignment is arithmetic on the
+        // full address.
+        let fused32 = matches!(narrow_to, Some(t) if t.size() <= 4)
+            && self.state.alloca_over_align(v).is_none();
+        if fused32 {
+            let slot = self
+                .state
+                .get_slot(v)
+                .expect("alloca with a slot was checked by the caller")
+                .0;
+            self.state.out.emit_instr_rbp_reg("    leal", slot, dest_32);
+        } else {
+            self.value_to_reg(&Value(v), dest_64);
+        }
+        if let Some(t) = narrow_to {
+            match (t.size(), t.is_unsigned()) {
+                (4, true) => {
+                    // The `leal` above already zero-extended the value; only
+                    // the 64-bit form still needs uppers cleared.
+                    if !fused32 {
+                        self.state
+                            .emit_fmt(format_args!("    movl %{}, %{}", dest_32, dest_32));
+                    }
+                }
+                (4, false) => self
+                    .state
+                    .emit_fmt(format_args!("    movslq %{}, %{}", dest_32, dest_64)),
+                (2, _) => {
+                    let src = typed_phys_reg_name(dest_phys, t);
+                    self.state
+                        .emit_fmt(format_args!("    movzwl %{}, %{}", src, dest_32))
+                }
+                (1, _) => {
+                    let src = typed_phys_reg_name(dest_phys, t);
+                    self.state
+                        .emit_fmt(format_args!("    movzbl %{}, %{}", src, dest_32))
+                }
+                // IntNarrow is only produced for a strictly narrower target.
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// Register-direct cast emission, wrapped so the
     /// definition-writes-home invariant is enforced at ONE boundary: every
     /// arm of the inner emitter writes `dest_phys` with the cast's result
@@ -1151,9 +1239,15 @@ impl X86Codegen {
         let kind = classify_cast(from_ty, to_ty);
 
         // Resolve source: either a physical register or a stack slot offset.
+        // An alloca's slot is its STORAGE, not a home for its value, so the
+        // data-home accessor refuses it: reading that slot would turn
+        // `(int)(uintptr_t)&local` into a load of `local` (`movl slot, %r`
+        // where `leaq slot` + truncation is required). With no data home the
+        // alloca falls through to the accumulator/default paths, which
+        // materialize the address.
         let src_phys = self.operand_reg(src);
         let src_slot = match src {
-            Operand::Value(v) => self.state.get_slot(v.0).map(|s| s.0),
+            Operand::Value(v) => self.state.data_home_slot(v.0).map(|s| s.0),
             _ => None,
         };
 
@@ -1176,10 +1270,27 @@ impl X86Codegen {
         // the generic path (which handles them today).
         if src_phys.is_none() && src_slot.is_none() {
             let Operand::Value(v) = src else { return false };
-            if !self.state.acc_has_verified(v.0, self.state.is_alloca(v.0)) {
-                return false;
+            if self.state.acc_has_verified(v.0, self.state.is_alloca(v.0)) {
+                return self.emit_cast_from_accumulator(kind, to_ty, dest_32, dest_64);
             }
-            return self.emit_cast_from_accumulator(kind, to_ty, dest_32, dest_64);
+            // An alloca's value is its slot's ADDRESS, and an address has no
+            // data home (`data_home_slot` above refuses one). Materialize the
+            // `leaq` straight into the cast destination and narrow in place:
+            // the generic path would stage the address through %rax and relay
+            // the result back into `dest_phys`, which is one instruction and
+            // one accumulator round trip more for exactly the shape this
+            // dispatch was built for.
+            // The slot lookup here is an ADDRESS lookup (`get_slot`, not
+            // `data_home_slot`): the slot's location is the address we want.
+            // An alloca with no slot at all (a dead parameter alloca) has no
+            // address to take and falls through.
+            if from_ty.size() == 8
+                && self.state.is_alloca(v.0)
+                && self.state.get_slot(v.0).is_some()
+            {
+                return self.emit_alloca_addr_cast(v.0, kind, dest_phys, dest_32, dest_64);
+            }
+            return false;
         }
         // An XMM-homed source is an integer bit-punned in the float domain
         // (fp-select/int-select blending keeps the value in the SSE domain).
