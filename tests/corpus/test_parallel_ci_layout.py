@@ -7,7 +7,15 @@ import unittest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
-CONSUMERS = {'corpus', 'frontend', 'codegen', 'backend'}
+# Every job that restores the build artifact instead of compiling its own.
+# The backend contracts are sharded and the unit tests run in their own lane,
+# but a shard is a consumer exactly like the lane it was split out of: it
+# `needs` the build, downloads the one artifact, and verifies the sha256 and
+# the commit before running anything. Leaving them out of this set would leave
+# the DAG's newest lanes outside the only test that pins how the artifact is
+# shared -- which is how they got here.
+CONSUMERS = {'corpus', 'frontend', 'codegen', 'backend',
+             'backend-contracts-a', 'backend-contracts-b', 'unit'}
 LANES = CONSUMERS | {'build', 'debug', 'clippy', 'msrv', 'benchmark', 'icx-oracle'}
 
 
@@ -25,7 +33,15 @@ def validate(workflow, benchmark):
     assert len(uploads) == 1
     name = uploads[0]['with']['name']
     assert '${{ github.sha }}' in name
-    test_run = next(s['run'] for s in producer if s.get('name') == 'Run tests')
+    # The unit tests do not run in the producing job: `build` compiles and
+    # packages, and the `unit` lane restores the artifact and runs them. What
+    # must hold across that split is that the tests execute under the RUSTFLAGS
+    # the build recorded, not under whatever the lane happens to inherit --
+    # otherwise the suite validates a different configuration than the one
+    # shipped in the artifact.
+    test_run = next((s['run'] for s in jobs['unit']['steps']
+                     if s.get('name') == 'Run tests'), None)
+    assert test_run is not None, "the unit lane lost its 'Run tests' step"
     assert 'export RUSTFLAGS="$(cat target/lccc-rustflags)"' in test_run
     reusable = jobs['benchmark']
     assert reusable['needs'] == ['build']

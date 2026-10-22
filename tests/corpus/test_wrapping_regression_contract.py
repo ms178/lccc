@@ -53,20 +53,39 @@ class WrappingContracts(unittest.TestCase):
         self.assertEqual([f for f in explicit if f.startswith('-O')], ['-O0'])
 
     def test_bad_oracle_exit_or_output_still_fails(self):
+        # `affine_control_proof` ships no `.env` sidecar, so it declares no
+        # oracle self-check waiver. Both a reference binary that fails the
+        # fixture's own assertions and one that merely disagrees must stay a
+        # hard failure; a blanket "nonzero oracle means skip" would turn the
+        # comparison off for every row a stale oracle touches. The per-fixture
+        # waiver path is pinned separately by
+        # test_oracle_gap_is_only_waived_when_the_fixture_declares_it.
         case = next(t for t in runner.discover([ROOT / 'tests/regression'])
                     if t.name == 'affine_control_proof')
-        for oracle, expected_status, expected_phase in [
-            ((1, 'expected\n', ''), 'skip-compare', 'compare:oracle-skip'),
-            ((0, 'wrong\n', ''), 'fail', 'compare:fail'),
-        ]:
+        self.assertFalse(case.oracle_selfcheck_skip,
+                         "this case pins the undeclared-waiver path; pick a "
+                         "fixture without an LCCC_ORACLE_SELFCHECK sidecar")
+        for oracle in [(1, 'expected\n', ''), (0, 'wrong\n', '')]:
             with self.subTest(oracle=oracle), tempfile.TemporaryDirectory() as directory:
                 work = Path(directory)
                 (work / case.name).touch()
                 with patch.object(runner, 'run_checked', side_effect=[
                         (0, '', ''), (0, 'expected\n', ''), (0, '', ''), oracle]):
                     result = runner.compile_one(Path('lccc'), 'gcc', case, work)
-                self.assertEqual(result.status, expected_status)
-                self.assertIn(expected_phase, result.phases)
+                self.assertEqual(result.status, 'fail')
+                self.assertIn('compare:fail', result.phases)
+                self.assertTrue(result.detail, "a failure must carry a reason")
+        # A failed oracle self-check must name the escape hatch, so the
+        # operator sees the divergence and the documented waiver together
+        # rather than a bare red row.
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / case.name).touch()
+            with patch.object(runner, 'run_checked', side_effect=[
+                    (0, '', ''), (0, 'expected\n', ''), (0, '', ''),
+                    (1, 'expected\n', '')]):
+                result = runner.compile_one(Path('lccc'), 'gcc', case, work)
+            self.assertIn('LCCC_ORACLE_SELFCHECK=skip', result.detail)
 
     def test_oracle_gap_is_only_waived_when_the_fixture_declares_it(self):
         # An oracle whose *binary* fails the fixture's assertions is a

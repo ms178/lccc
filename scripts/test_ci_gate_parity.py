@@ -110,17 +110,26 @@ class UniversalContractTest(unittest.TestCase):
         self.assertEqual(self.check(), 0)
 
     def test_every_contract_is_satisfied_on_each_declared_side(self) -> None:
-        # The coverage direction: removing a contract's one conforming
-        # invocation from EITHER side is a failure — the gate is gone.
+        # The coverage direction: removing a contract's conforming invocations
+        # from EITHER side is a failure — the gate is gone.
+        #
+        # Every occurrence, not just the first. Several jobs legitimately run
+        # the same provisioner, because each job is its own runner: the pinned
+        # GNU as is installed in `backend`, `backend-contracts-a` and
+        # `backend-contracts-b`. Mutating only the first occurrence left the
+        # other two in place, so the contract was still satisfied, the checker
+        # correctly reported nothing, and this test failed on a tree that was
+        # fine. The mutation has to remove the gate everywhere before its
+        # absence means anything.
         for i, contract in enumerate(parity.INVOCATION_CONTRACTS):
             for side in sorted(contract.sides):
                 with self.subTest(contract=contract.name, side=side):
                     if side == "local":
-                        local = self.local.replace(contract.program, "true", 1)
+                        local = self.local.replace(contract.program, "true")
                         self.assertNotEqual(local, self.local)
                         self.assertEqual(self.check(local=local), 1)
                     else:
-                        hosted = self.hosted.replace(contract.program, "true", 1)
+                        hosted = self.hosted.replace(contract.program, "true")
                         self.assertNotEqual(hosted, self.hosted)
                         self.assertEqual(self.check(hosted=hosted), 1)
 

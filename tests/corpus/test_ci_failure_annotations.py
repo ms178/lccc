@@ -123,21 +123,30 @@ class FailureAnnotationContracts(unittest.TestCase):
     def test_every_lane_invokes_the_helper_directly(self):
         # A lane that pipes the helper through its own capture wrapper would
         # swallow the annotation; the helper is the single source of truth.
+        # The helper is ci_provision_toolchain.sh, which owns the whole oracle
+        # set (GCC 16, i686 multilib, qemu, mold, lld, python3-yaml) and calls
+        # ci_install_gcc16.sh internally on a bundle miss -- so no lane names
+        # the installer directly any more, and a lane that did would be
+        # provisioning around the shared cache entry.
         workflow = yaml.load(WORKFLOW.read_text(), Loader=yaml.BaseLoader)
         lanes = []
         for job, definition in workflow["jobs"].items():
             for step in definition.get("steps", []):
                 script = step.get("run") or ""
-                if "ci_install_gcc16.sh" in script:
+                if "ci_provision_toolchain.sh" in script:
                     lanes.append(job)
-                    self.assertIn("bash scripts/ci_install_gcc16.sh --multilib", script,
+                    self.assertIn("bash scripts/ci_provision_toolchain.sh --multilib",
+                                  script,
                                   f"{job}: unexpected provisioning invocation")
+                    self.assertNotIn("ci_install_gcc16.sh", script,
+                                     f"{job}: bypasses the shared toolchain bundle")
                     self.assertNotIn("install_log", script,
                                      f"{job}: capture wrapper duplicated")
                     self.assertNotIn("::error", script,
                                      f"{job}: annotation duplicated")
         self.assertEqual(sorted(lanes), sorted([
-            "build", "debug", "corpus", "frontend", "codegen", "backend"]))
+            "build", "debug", "corpus", "frontend", "codegen", "backend",
+            "backend-contracts-a", "backend-contracts-b", "unit"]))
 
 
 if __name__ == "__main__":
