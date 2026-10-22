@@ -6,7 +6,8 @@ import os
 from pathlib import Path
 import re
 import tempfile
-from check_llvm_missed_zero_choice import body, run
+from check_llvm_missed_zero_choice import (body, gcc_oracle_identity,
+                                           report_gcc_oracle, run)
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "tests/regression/llvm_scalar_facts.c"
@@ -33,11 +34,18 @@ def main():
         "--compiler", default=os.environ.get("CCC", str(ROOT / "target/fastbuild/lccc"))
     )
     parser.add_argument("--gcc", default=os.environ.get("GCC", "gcc-16"))
+    parser.add_argument("--allow-gcc16-snapshot", action="store_true",
+                        help="explicit supplemental snapshot oracle; never normative GCC 16.2 evidence")
     parser.add_argument("--baseline")
     parser.add_argument("--clang", help="optional exact Clang 23.1.3 oracle")
     args = parser.parse_args()
-    if not re.search(r"\b16\.2(?:\.0)?\b", run([args.gcc, "--version"]).decode()):
-        raise ValueError("GCC 16.2 required")
+    # The oracle only produces the expected program output; every mechanism
+    # assertion below compares this compiler against itself (pass on vs
+    # off), so a snapshot oracle cannot change any verdict -- but the
+    # strict default stays, and CI opts in explicitly.
+    gcc_version = run([args.gcc, "-dumpfullversion"]).decode().strip()
+    report_gcc_oracle(args.gcc, gcc_version,
+                      gcc_oracle_identity(gcc_version, args.allow_gcc16_snapshot))
     if args.clang and not re.search(
         r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()
     ):

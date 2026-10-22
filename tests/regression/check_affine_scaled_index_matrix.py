@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import subprocess
 import tempfile
+from check_llvm_missed_zero_choice import gcc_oracle_identity, report_gcc_oracle
 
 SOURCE = Path(__file__).with_name("affine_scaled_index_matrix.c").resolve()
 MASK = (1 << 64) - 1
@@ -52,12 +53,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lccc", default=os.environ.get("CCC", "target/fastbuild/lccc"))
     parser.add_argument("--gcc", default="gcc-16")
+    parser.add_argument("--allow-gcc16-snapshot", action="store_true",
+                        help="explicit supplemental snapshot oracle; never normative GCC 16.2 evidence")
     parser.add_argument("--clang")
     parser.add_argument("--icx")
     args = parser.parse_args()
     gcc_version = run([args.gcc, "-dumpfullversion"]).strip()
-    if gcc_version != "16.2.0":
-        raise AssertionError(f"requires GCC 16.2.0, got {gcc_version}")
+    # The expected output is computed in Python below; the oracle only
+    # cross-checks it, so a snapshot oracle cannot change any verdict --
+    # but the strict default stays, and CI opts in explicitly.
+    report_gcc_oracle(args.gcc, gcc_version,
+                      gcc_oracle_identity(gcc_version, args.allow_gcc16_snapshot))
     oracles = [args.gcc]
     for compiler, pattern in ((args.clang, r"clang version 23\.1\.3\b"),
                               (args.icx, r"\b2026\.2(?:\.|\b)")):

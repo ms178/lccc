@@ -7,7 +7,8 @@ import os
 from pathlib import Path
 import re
 import tempfile
-from check_llvm_missed_zero_choice import run, body
+from check_llvm_missed_zero_choice import (body, gcc_oracle_identity,
+                                           report_gcc_oracle, run)
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "tests/regression/llvm_integer_observations.c"
@@ -20,6 +21,8 @@ def main():
         "--compiler", default=os.environ.get("CCC", str(ROOT / "target/fastbuild/lccc"))
     )
     parser.add_argument("--gcc", default=os.environ.get("GCC", "gcc-16"))
+    parser.add_argument("--allow-gcc16-snapshot", action="store_true",
+                        help="explicit supplemental snapshot oracle; never normative GCC 16.2 evidence")
     parser.add_argument("--clang", help="optional exact Clang 23.1.3 comparison")
     parser.add_argument(
         "--baseline",
@@ -28,18 +31,13 @@ def main():
     args = parser.parse_args()
     if len(CASES) != 45 or len({c["name"] for c in CASES}) != 45:
         raise ValueError("missing or duplicate witness contracts")
-    gcc_version = run([args.gcc, "--version"]).decode()
-    print(f"oracle: {args.gcc}: {gcc_version.splitlines()[0]}")
     # The oracle only produces the expected program output; every mechanism
     # assertion below compares this compiler against itself (pass on vs
-    # off), so the oracle's minor version cannot change any verdict.  Ask
-    # for CI's documented policy -- rolling-major GCC 16
-    # (scripts/ci_install_gcc16.sh) -- not an exact 16.2 a rolling package
-    # archive cannot guarantee.
-    if not re.search(r"\b16\.\d+", gcc_version):
-        raise ValueError(
-            f"requires a GCC 16 oracle, found: {gcc_version.splitlines()[0]}"
-        )
+    # off), so a snapshot oracle cannot change any verdict -- but the
+    # strict default stays, and CI opts in explicitly.
+    gcc_version = run([args.gcc, "-dumpfullversion"]).decode().strip()
+    report_gcc_oracle(args.gcc, gcc_version,
+                      gcc_oracle_identity(gcc_version, args.allow_gcc16_snapshot))
     if args.clang and not re.search(
         r"\b23\.1\.3\b", run([args.clang, "--version"]).decode()
     ):
