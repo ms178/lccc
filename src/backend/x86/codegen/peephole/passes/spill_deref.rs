@@ -65,12 +65,13 @@ fn rbp_is_frame_at(store: &LineStore, infos: &[LineInfo], idx: usize) -> bool {
     }
 }
 
-/// Which stack base a store/load line addresses: 4 = "(%rsp)", 5 = "(%rbp)".
+/// Which stack base a store/load line addresses: `REG_RSP` for "(%rsp)",
+/// `REG_RBP` for "(%rbp)".
 fn line_stack_base(trimmed: &str) -> Option<u8> {
     if trimmed.contains("(%rsp)") {
-        Some(4)
+        Some(REG_RSP)
     } else if trimmed.contains("(%rbp)") {
-        Some(5)
+        Some(REG_RBP)
     } else {
         None
     }
@@ -135,8 +136,8 @@ pub(super) fn fold_spill_deref_roundtrip(store: &mut LineStore, infos: &mut [Lin
                 let st_line = infos[i].trimmed(store.get(i));
                 let ld_line = infos[j].trimmed(store.get(j));
                 match (line_stack_base(st_line), line_stack_base(ld_line)) {
-                    (Some(4), Some(4)) => {}
-                    (Some(5), Some(5)) if rbp_is_frame_at(store, infos, i) => {}
+                    (Some(REG_RSP), Some(REG_RSP)) => {}
+                    (Some(REG_RBP), Some(REG_RBP)) if rbp_is_frame_at(store, infos, i) => {}
                     _ => {
                         dbg_stats[7] += 1;
                         i += 1;

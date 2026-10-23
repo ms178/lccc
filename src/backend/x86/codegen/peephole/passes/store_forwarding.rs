@@ -1305,7 +1305,7 @@ fn gsf_handle_other(
     // Other instruction is a pointer dereference / address computation that may
     // read or write arbitrary memory. Invalidate ALL mappings so a stack slot is
     // never forwarded across a potentially-aliasing pointer operation.
-    if !rbp_is_frame && infos[i].reg_refs & (1u16 << 5) != 0 {
+    if !rbp_is_frame && infos[i].reg_refs & (1u16 << REG_RBP) != 0 {
         invalidate_all_mappings(slot_entries, reg_offsets);
     }
 
@@ -1687,7 +1687,7 @@ pub(super) fn global_store_forwarding(store: &mut LineStore, infos: &mut [LineIn
             // forward — the FP counterpart of the GP store→load forwarding
             // this pass has always done.
             LineKind::StoreXmmRbp { offset, size } => {
-                if !rbp_is_frame && infos[i].reg_refs & (1u16 << 5) != 0 {
+                if !rbp_is_frame && infos[i].reg_refs & (1u16 << REG_RBP) != 0 {
                     invalidate_all_mappings(&mut slot_entries, &mut reg_offsets);
                 } else if xmm_forward_ok
                     && (rbp_is_frame || !line_base_is_rbp(infos[i].trimmed(store.get(i))))

@@ -1569,6 +1569,9 @@ pub(crate) fn run_passes(
     vectorize::set_no_map_i64_unroll(no_map_i64_unroll);
     vectorize::set_no_map_zero_rem(no_map_zero_rem);
     vectorize::set_no_bytecmp_vec(no_bytecmp_vec);
+    // Fixed-distance SLP kill switch, snapshotted here like the map
+    // switches above so the transform never reads the environment itself.
+    vectorize::set_no_fixed_slp(std::env::var_os("CCC_NO_FIXED_SLP").is_some());
     // Generator-map vectorizer (vectorize_generator_map.rs): kill switch and
     // the `[VEC-GEN]` trace, resolved here like the switches above.
     vectorize::set_generator_map_policy(

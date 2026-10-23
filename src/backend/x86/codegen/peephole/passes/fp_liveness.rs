@@ -258,7 +258,7 @@ impl FpLiveness {
     }
 
     /// Same question for the `size`-byte frame slot at `offset(%base)`
-    /// (`base` is the family id: 4 = `%rsp`, 5 = `%rbp`).  Any overlapping
+    /// (`base` is the family id: `REG_RSP` or `REG_RBP`).  Any overlapping
     /// tracked slot that is live makes the answer `Some(true)`; a slot that
     /// was never interned (no instruction of the function names it) is
     /// dead unless the function's slots are opaque.
@@ -1008,8 +1008,8 @@ fn frame_operand(op: &str) -> Result<Option<(u8, i32)>, ()> {
     };
     let inner = &inner[..close];
     let base = match inner {
-        "%rsp" => 4u8,
-        "%rbp" => 5u8,
+        "%rsp" => REG_RSP,
+        "%rbp" => REG_RBP,
         _ => {
             // `8(%rsp,%rax,8)` etc. — frame base with an index: opaque.
             if inner.starts_with("%rsp,") || inner.starts_with("%rbp,") {
@@ -1736,7 +1736,7 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
             && !is_frame_teardown
             && !matches!(
                 infos[n].kind,
-                LineKind::Push { reg: 5 } | LineKind::Pop { reg: 5 }
+                LineKind::Push { reg: REG_RBP } | LineKind::Pop { reg: REG_RBP }
             )
         {
             opaque = true;

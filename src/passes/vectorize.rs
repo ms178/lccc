@@ -85,6 +85,9 @@
 //! - `LCCC_FORCE_SSE2=1`: Force SSE2 2-wide vectorization instead of AVX2 4-wide
 //! - `LCCC_FORCE_AVX2=1`: Explicitly enable AVX2 (default behavior, provided for clarity)
 //! - `LCCC_DEBUG_VECTORIZE=1`: Enable debug output for vectorization pass
+//! - `CCC_NO_FIXED_SLP=1`: Disable the fixed-distance SLP transform
+//!   (resolved once per translation unit by the pipeline, like the other
+//!   `CCC_NO_*` switches)
 
 #[path = "vectorize_byte_count_normalize.rs"]
 mod byte_count_normalize;
@@ -207,6 +210,13 @@ thread_local! {
     // like the other policy bits, so the hot pattern scan reads a Cell and
     // not the process environment.
     static NO_MAP_ZERO_REM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Fixed-distance SLP kill switch (`CCC_NO_FIXED_SLP=1`), same contract:
+    // resolved once per translation unit by the pipeline.  The transform
+    // used to read the environment itself per call; when that read was
+    // removed for the env-hygiene ratchet the switch silently stopped
+    // working (its regression gate was allowlisted as unwired, so nothing
+    // noticed).  The Cell restores the switch without the per-call read.
+    static NO_FIXED_SLP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn set_x86_64_vector_intrinsics_available(available: bool) {
@@ -250,6 +260,14 @@ pub(crate) fn set_no_map_zero_rem(disabled: bool) {
 
 fn no_map_zero_rem() -> bool {
     NO_MAP_ZERO_REM.with(|cell| cell.get())
+}
+
+pub(crate) fn set_no_fixed_slp(disabled: bool) {
+    NO_FIXED_SLP.with(|cell| cell.set(disabled));
+}
+
+fn no_fixed_slp() -> bool {
+    NO_FIXED_SLP.with(|cell| cell.get())
 }
 
 /// Record the x86 SIMD ISA profile for the current translation unit.
@@ -32036,6 +32054,9 @@ fn emit_map_scalar_tree(
 /// distance) rather than paying a horizontal-reduction loss or reading past
 /// the object boundary.
 fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
+    if no_fixed_slp() {
+        return 0;
+    }
     if func.blocks.len() != 1 {
         return 0;
     }

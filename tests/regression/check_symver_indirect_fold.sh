@@ -14,8 +14,10 @@
 # pointer value (GOTPCREL load + call *%r10), which is correct for every
 # binding.
 #
-# Positive control: an unversioned local-pointer call DOES fold to a direct
-# call — proving the resolver still folds the ordinary shapes.
+# Positive control: an unversioned local-pointer call DOES fold — to a
+# direct call, or (current behaviour) all the way to an inlined body with
+# no call left. Either way it must not remain a value-based indirect call:
+# that proves the resolver still folds the ordinary shapes.
 set -euo pipefail
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -52,7 +54,11 @@ if ! grep -q 'call \*%r10' <<<"$ver_body"; then
     echo "FAIL  versioned indirect call does not go through the loaded pointer (r10)"
     fail=$((fail+1))
 fi
-if ! grep -qE 'call +plain_fn(@PLT)?$' <<<"$plain_body"; then
+# Folded means: not value-based any more. Accept a direct `call plain_fn`
+# or a fully inlined body (no call instruction at all); reject any
+# surviving indirect call or GOT load of the callee.
+if grep -qE 'call +\*%' <<<"$plain_body" \
+   || grep -q 'plain_fn@GOTPCREL' <<<"$plain_body"; then
     echo "FAIL  positive control: unversioned local-pointer call did not fold"
     fail=$((fail+1))
 fi

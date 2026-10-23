@@ -1756,6 +1756,35 @@ fn segment_sets_overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
     false
 }
 
+/// Phase 2f admission step: place one segment candidate into the first pooled
+/// register whose occupancy it does not interfere with, and record the
+/// placement. The interference test and the occupancy update both use the
+/// internal-hole-guarded form of the candidate's segments — the same guarded
+/// form the pre-existing holders were loaded with. Keeping the test and the
+/// insertion in one function makes the guarded spelling the only one: an
+/// earlier open-coded version tested the guarded segments but inserted the
+/// raw ones, so a later candidate could be admitted into the exact internal
+/// hole of an already-placed co-holder (touching both hole boundaries, which
+/// the guard exists to forbid) — admission depended on placement order,
+/// which a register interference relation must never do.
+fn try_fill_segment_candidate(
+    candidate_segments: &[(u32, u32)],
+    occupied_by_reg: &mut FxHashMap<u8, Vec<(u32, u32)>>,
+    pool: &[PhysReg],
+) -> Option<PhysReg> {
+    let guarded_candidate = guard_internal_hole_boundaries(candidate_segments);
+    let reg = pool.iter().copied().find(|reg| {
+        occupied_by_reg
+            .get(&reg.0)
+            .is_none_or(|occupied| !segment_sets_overlap(&guarded_candidate, occupied))
+    })?;
+    insert_segment_union(
+        occupied_by_reg.entry(reg.0).or_default(),
+        &guarded_candidate,
+    );
+    Some(reg)
+}
+
 /// Phase 2c tier 2 (RA-PHASE2C-SAVED-REUSE): a no-eviction fill of the free
 /// stretches of already-saved callee-saved registers. `candidates` are
 /// `(loop-weighted web pressure, envelope length, value, half-open span)`;
@@ -1881,7 +1910,7 @@ fn attach_scan_segments(
         // Hole-aware scanning exists to model real gaps. A single contiguous
         // segment adds no hole information and can shrink the historical fat
         // interval based on local block touches; keep envelope semantics there.
-        if inside {
+        if inside && segs.len() > 1 {
             range.set_segments(segs.clone());
         }
     }
@@ -6123,12 +6152,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             let Some(candidate_segments) = owned_segments.get(&value) else {
                 continue;
             };
-            let guarded_candidate = guard_internal_hole_boundaries(candidate_segments);
-            let Some(reg) = pool.iter().copied().find(|reg| {
-                occupied_by_reg
-                    .get(&reg.0)
-                    .is_none_or(|occupied| !segment_sets_overlap(&guarded_candidate, occupied))
-            }) else {
+            let Some(reg) =
+                try_fill_segment_candidate(candidate_segments, &mut occupied_by_reg, &pool)
+            else {
                 continue;
             };
             if config.ra_config.debug_segment_fill {
@@ -6143,10 +6169,6 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 );
             }
             assignments.insert(value, reg);
-            insert_segment_union(
-                occupied_by_reg.entry(reg.0).or_default(),
-                candidate_segments,
-            );
             added += 1;
         }
         if added != 0 {
@@ -13580,6 +13602,79 @@ mod phi_coalesce_tests {
         let mut occupied = vec![(1, 3), (8, 10)];
         insert_segment_union(&mut occupied, &[(3, 5), (6, 8), (12, 14)]);
         assert_eq!(occupied, vec![(1, 5), (6, 10), (12, 14)]);
+    }
+
+    #[test]
+    fn segment_fill_admission_is_order_independent_at_internal_holes() {
+        // A is live on [(1,3),(8,10)] with internal hole (3,8); B is exactly
+        // [(3,8)]. The guard law forbids B from touching both of A's hole
+        // boundaries, so whichever of the two is placed first, the other must
+        // be refused the same register. (The pre-fix Phase 2f inserted the
+        // accepted candidate's RAW segments into occupancy: A-then-B admitted
+        // both, B-then-A refused A — an order-dependent interference hole.)
+        let pool = [PhysReg(1)];
+        let a = [(1, 3), (8, 10)];
+        let b = [(3, 8)];
+
+        let mut occupied: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
+        assert_eq!(
+            try_fill_segment_candidate(&a, &mut occupied, &pool),
+            Some(PhysReg(1))
+        );
+        assert_eq!(try_fill_segment_candidate(&b, &mut occupied, &pool), None);
+
+        let mut occupied: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
+        assert_eq!(
+            try_fill_segment_candidate(&b, &mut occupied, &pool),
+            Some(PhysReg(1))
+        );
+        assert_eq!(try_fill_segment_candidate(&a, &mut occupied, &pool), None);
+
+        // The guard is exactly one point on each internal boundary, not a
+        // blanket ban on hole reuse: [(4,7)] sits strictly inside A's hole
+        // with the required clearance and must still be admitted.
+        let mut occupied: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
+        assert_eq!(
+            try_fill_segment_candidate(&a, &mut occupied, &pool),
+            Some(PhysReg(1))
+        );
+        assert_eq!(
+            try_fill_segment_candidate(&[(4, 7)], &mut occupied, &pool),
+            Some(PhysReg(1))
+        );
+    }
+
+    #[test]
+    fn attach_scan_segments_keeps_envelope_for_single_segment_values() {
+        // The hole-aware scan exists to model real gaps. A value whose
+        // coverage is ONE contiguous segment strictly inside its fat
+        // envelope keeps envelope semantics: shrinking to touch-based
+        // coverage would drop the envelope fringe other allocator phases
+        // deliberately widened (live-through pulls, hidden reads). A value
+        // with an actual hole gets its segments attached.
+        use crate::backend::live_range::LiveRange;
+        let iv = |value_id, start, end| LiveInterval {
+            value_id,
+            start,
+            end,
+        };
+        let mut func = IrFunction::new("attach_fixture".to_string(), IrType::Void, vec![], false);
+        func.blocks = vec![block(0, Vec::new(), Terminator::Return(None))];
+        let mut liveness = compute_live_intervals(&func);
+        liveness.intervals = vec![iv(1, 0, 20), iv(2, 0, 20)];
+        liveness.segments = vec![iv(1, 4, 16), iv(2, 2, 6), iv(2, 12, 18)];
+
+        let mut ranges = vec![
+            LiveRange::from_interval(iv(1, 0, 20), 0),
+            LiveRange::from_interval(iv(2, 0, 20), 0),
+        ];
+        attach_scan_segments(&mut ranges, &liveness, &FxHashMap::default());
+
+        assert!(
+            ranges[0].segments.is_empty(),
+            "single-segment value must keep fat envelope semantics"
+        );
+        assert_eq!(ranges[1].segments, vec![(2, 6), (12, 18)]);
     }
 
     fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {

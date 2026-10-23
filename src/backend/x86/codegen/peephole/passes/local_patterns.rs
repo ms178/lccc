@@ -2476,7 +2476,7 @@ fn compose_self_scaled_lea(
     disp_text: &str,
 ) -> Option<String> {
     let (b_u, t_u) = (base_fam as usize, t_fam as usize);
-    if b_u >= REG_NAMES[0].len() || t_u >= REG_NAMES[0].len() || base_fam == 4 {
+    if b_u >= REG_NAMES[0].len() || t_u >= REG_NAMES[0].len() || base_fam == REG_RSP {
         return None;
     }
     if REG_NAMES[0][b_u] != base {
@@ -8299,6 +8299,108 @@ pub(super) fn fold_rotate_idiom(store: &mut LineStore, infos: &mut [LineInfo]) -
 /// zero-extends-into-127:32 semantics would be wrong to delete anyway.  A
 /// deliberate zeroing self-move is code, not noise; if a producer of such a
 /// line ever shows up, it needs a liveness-gated cleanup, not this pass.
+/// Whole-file counts of wider-register mentions, per register number: how
+/// many non-NOP lines name `%ymmK` (resp. `%zmmK`) as a token. The barrier
+/// fallback in [`vex_self_move_zeroes_live_upper`] asks "does any line in
+/// the file mention the wider form"; answering that with a fresh file scan
+/// per candidate made the pass quadratic on barrier-dense vector code
+/// (measured 9 ms -> 612 ms over 1k -> 8k synthetic lines, a clean x4 per
+/// doubling). The counts are computed once per pass run and decremented
+/// when this pass NOPs a line, so the answer is identical to the rescan —
+/// including the subtlety that a `%ymmK` self-move deleted earlier in the
+/// same run no longer counts as a wider mention for `%xmmK`.
+struct WiderMentions {
+    ymm: [u32; 32],
+    zmm: [u32; 32],
+}
+
+impl WiderMentions {
+    fn scan(store: &LineStore, infos: &[LineInfo]) -> Self {
+        let mut mentions = WiderMentions {
+            ymm: [0; 32],
+            zmm: [0; 32],
+        };
+        for (i, info) in infos.iter().enumerate() {
+            if info.is_nop() {
+                continue;
+            }
+            let (ymm, zmm) = wider_tokens_in(info.trimmed(store.get(i)));
+            for k in ymm {
+                mentions.ymm[k as usize] += 1;
+            }
+            for k in zmm {
+                mentions.zmm[k as usize] += 1;
+            }
+        }
+        mentions
+    }
+
+    /// Would a whole-file rescan find a wider form of `reg` (`%xmmK` is
+    /// widened by `%ymmK`/`%zmmK`; `%ymmK` only by `%zmmK`)?
+    fn any_for(&self, reg: &str) -> bool {
+        if let Some(k) = reg_number(reg, "%xmm") {
+            self.ymm[k as usize] > 0 || self.zmm[k as usize] > 0
+        } else if let Some(k) = reg_number(reg, "%ymm") {
+            self.zmm[k as usize] > 0
+        } else {
+            false
+        }
+    }
+
+    /// A line naming exactly `reg` (a deleted self-move) stops counting.
+    fn note_deleted(&mut self, reg: &str) {
+        if let Some(k) = reg_number(reg, "%ymm") {
+            self.ymm[k as usize] = self.ymm[k as usize].saturating_sub(1);
+        } else if let Some(k) = reg_number(reg, "%zmm") {
+            self.zmm[k as usize] = self.zmm[k as usize].saturating_sub(1);
+        }
+    }
+}
+
+/// Register number of a full register token (`%xmm` + digits, nothing else).
+fn reg_number(reg: &str, prefix: &str) -> Option<u32> {
+    let num = reg.strip_prefix(prefix)?;
+    if num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    num.parse::<u32>().ok().filter(|&k| k < 32)
+}
+
+/// The distinct `%ymmK` and `%zmmK` register numbers named in `s`, under the
+/// same token rule the forward scan uses: the digit run must be the whole
+/// number, so `%ymm16` names 16, never 1.
+fn wider_tokens_in(s: &str) -> (Vec<u32>, Vec<u32>) {
+    let mut ymm = Vec::new();
+    let mut zmm = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 4 < bytes.len() {
+        if bytes[i] == b'%' && (bytes[i + 1] == b'y' || bytes[i + 1] == b'z') {
+            let is_ymm = bytes[i + 1] == b'y';
+            if &bytes[i + 2..i + 4] == b"mm" {
+                let mut j = i + 4;
+                let mut num: u32 = 0;
+                let mut digits = 0;
+                while j < bytes.len() && bytes[j].is_ascii_digit() {
+                    num = num.saturating_mul(10).saturating_add((bytes[j] - b'0') as u32);
+                    digits += 1;
+                    j += 1;
+                }
+                if digits > 0 && num < 32 {
+                    let list = if is_ymm { &mut ymm } else { &mut zmm };
+                    if !list.contains(&num) {
+                        list.push(num);
+                    }
+                }
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    (ymm, zmm)
+}
+
 /// Check whether deleting a VEX self-move `vmov* %xmmN, %xmmN` (or `%ymmN, %ymmN`)
 /// at line `idx` could expose dirty upper bits to a subsequent wider read
 /// (`%ymmN`/`%zmmN` for `%xmmN`, or `%zmmN` for `%ymmN`).
@@ -8307,6 +8409,7 @@ fn vex_self_move_zeroes_live_upper(
     infos: &[LineInfo],
     idx: usize,
     reg: &str,
+    wider_mentions: &WiderMentions,
 ) -> bool {
     let (wider1, wider2) = if let Some(num) = reg.strip_prefix("%xmm") {
         (format!("%ymm{num}"), Some(format!("%zmm{num}")))
@@ -8342,8 +8445,7 @@ fn vex_self_move_zeroes_live_upper(
             return false;
         }
         if infos[j].is_barrier() {
-            return (0..len)
-                .any(|k| !infos[k].is_nop() && mentions_wider(infos[k].trimmed(store.get(k))));
+            return wider_mentions.any_for(reg);
         }
         if tj.starts_with('v') {
             if let Some((_, dst)) = tj.rsplit_once(',') {
@@ -8359,6 +8461,7 @@ fn vex_self_move_zeroes_live_upper(
 
 pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
+    let mut wider_mentions = WiderMentions::scan(store, infos);
     let mut changed = false;
     for i in 0..len {
         if infos[i].is_nop() || infos[i].pinned {
@@ -8402,9 +8505,11 @@ pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [Li
         if is_vec
             && all_same
             && arity_ok
-            && !(t.starts_with('v') && vex_self_move_zeroes_live_upper(store, infos, i, first))
+            && !(t.starts_with('v')
+                && vex_self_move_zeroes_live_upper(store, infos, i, first, &wider_mentions))
         {
             mark_nop(&mut infos[i]);
+            wider_mentions.note_deleted(first);
             changed = true;
         }
     }
@@ -8669,7 +8774,7 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
         }
 
         // rbp destination knowledge: needed only when X or Y is family 5.
-        let need_rbp = x_fam == REG_RBP || y_fam == Some(5);
+        let need_rbp = x_fam == REG_RBP || y_fam == Some(REG_RBP);
         let rbp_gpr = if need_rbp {
             match function_range(store, infos, i) {
                 Some((fs, fe)) => rbp_is_gpr_in_function(store, infos, fs, fe),
@@ -13515,6 +13620,68 @@ mod broadcast_fold_tests {
                 "{line} must stay"
             );
         }
+    }
+
+    #[test]
+    fn vex_self_move_barrier_fallback_uses_whole_file_wider_mentions() {
+        use super::super::super::types::classify_line;
+        use crate::backend::peephole_common::LineStore;
+        let run = |asm: &str| -> Vec<String> {
+            let mut store = LineStore::new(asm.to_string());
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            super::eliminate_vector_self_moves(&mut store, &mut infos);
+            (0..store.len())
+                .filter(|&i| !infos[i].is_nop())
+                .map(|i| store.get(i).trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect()
+        };
+        // A wider use behind a call barrier keeps the zeroing self-move.
+        assert_eq!(
+            run("    vmovdqu %xmm5, %xmm5\n    call foo\n    vaddpd %ymm5, %ymm5, %ymm5\n"),
+            vec![
+                "vmovdqu %xmm5, %xmm5".to_string(),
+                "call foo".to_string(),
+                "vaddpd %ymm5, %ymm5, %ymm5".to_string()
+            ]
+        );
+        // The only wider mention is a %ymm5 self-move deleted earlier in the
+        // same run: it stops counting, so the %xmm5 self-move is deleted too.
+        assert_eq!(
+            run("    vmovdqu %ymm5, %ymm5\n    vmovdqu %xmm5, %xmm5\n    call foo\n"),
+            vec!["call foo".to_string()]
+        );
+        // With a real %zmm5 use present the %ymm5 self-move survives, and in
+        // turn keeps the %xmm5 self-move alive through the barrier fallback.
+        assert_eq!(
+            run("    vmovdqu %ymm5, %ymm5\n    vmovdqu %xmm5, %xmm5\n    call foo\n    vaddpd %zmm5, %zmm5, %zmm5\n"),
+            vec![
+                "vmovdqu %ymm5, %ymm5".to_string(),
+                "vmovdqu %xmm5, %xmm5".to_string(),
+                "call foo".to_string(),
+                "vaddpd %zmm5, %zmm5, %zmm5".to_string()
+            ]
+        );
+        // %ymm16 is not a wider mention of %xmm1 (whole-token rule).
+        assert_eq!(
+            run("    vmovdqu %xmm1, %xmm1\n    call foo\n    vaddpd %ymm16, %ymm16, %ymm16\n"),
+            vec!["call foo".to_string(), "vaddpd %ymm16, %ymm16, %ymm16".to_string()]
+        );
+        // Barrier-dense shape that used to make the pass quadratic (a fresh
+        // whole-file scan per candidate): every self-move is still deleted.
+        let mut dense = String::new();
+        for k in 0..2000usize {
+            dense.push_str(&format!(
+                "    vmovdqu %xmm{}, %xmm{}\n    addq %rax, %rbx\n    addq %rax, %rcx\n    call foo\n",
+                k % 16,
+                k % 16
+            ));
+        }
+        let out = run(&dense);
+        assert_eq!(out.len(), 6000);
+        assert!(out.iter().all(|l| !l.starts_with("vmovdqu")));
     }
 
     /// `vmovq`/`vmovd` register self-moves are NOT no-ops and must survive.

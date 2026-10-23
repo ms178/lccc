@@ -44,7 +44,7 @@ pub(super) fn compact_frame(store: &mut LineStore, infos: &mut [LineInfo]) {
             i += 1;
             continue;
         }
-        if !matches!(infos[i].kind, LineKind::Push { reg: 5 }) {
+        if !matches!(infos[i].kind, LineKind::Push { reg: REG_RBP }) {
             i += 1;
             continue;
         }

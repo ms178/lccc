@@ -1,7 +1,23 @@
 #!/usr/bin/env bash
 # Structural regression for width-aware register-resident vector reductions.
+#
+# Two generations of this contract are pinned:
+#  * every reduction kernel keeps its packed accumulators register-resident
+#    (in-place updates, no vector operand read from a stack slot, no vector
+#    store to a stack slot anywhere in the body);
+#  * for the dot/sum-squares family, CCC_NO_REDUCTION_VECREG still restores
+#    the old spill-backed accumulator web, proving the register homes come
+#    from the reduction-vecreg candidate collection on that family.
+# The plain-sum family used to have the same kill-switch differential, but
+# the general register allocator now homes those accumulators by itself —
+# with the switch on, only the epilogue combine round-trips to a slot — so
+# that family's differential leg is gone and only the positive (register-
+# resident) contract remains. Stack slots are matched as
+# `-?\d+\(%r(?:sp|bp)\)`: frames without a frame pointer address them
+# through %rsp, and a %rbp-only pattern silently vacated every negative
+# assertion when default codegen stopped setting up a frame pointer here.
 set -euo pipefail
-CCC=${CCC:-./target/release/lccc}
+CCC=${LCCC_BIN:-${CCC:-target/fastbuild/lccc}}
 dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source_file="$dir/../benchmark/patterns/simd_fp_oracle.c"
 out=$(mktemp "${TMPDIR:-/tmp}/lccc-reduction-vecreg.XXXXXX.s")
@@ -20,6 +36,7 @@ import sys
 
 new = open(sys.argv[1], encoding="utf-8").read()
 old = open(sys.argv[2], encoding="utf-8").read()
+STACK = r"-?\d+\(%r(?:sp|bp)\)"
 
 
 def body(text, name):
@@ -34,7 +51,6 @@ for name, mnemonic in {
     "p16_sum_f64": "vaddpd",
 }.items():
     current = body(new, name)
-    disabled = body(old, name)
     # In-place accumulator update: the accumulator register appears as
     # BOTH the last source and the destination. The streamed input is
     # memory-folded into the first operand since the VLFOLD work
@@ -45,10 +61,8 @@ for name, mnemonic in {
     )
     if not direct:
         raise SystemExit(f"{name}: vector accumulator is not updated in place")
-    if re.search(rf"{mnemonic} .*\(%rbp\)", current):
+    if re.search(rf"{mnemonic} .*{STACK}", current):
         raise SystemExit(f"{name}: vector accumulator still loads from its stack slot")
-    if not re.search(rf"{mnemonic} .*\(%rbp\)", disabled):
-        raise SystemExit(f"{name}: kill-switch control did not restore stack accumulator")
 
 for name, suffix in {
     "p17_dot_f32": "ps",
@@ -59,12 +73,12 @@ for name, suffix in {
     disabled = body(old, name)
     if not re.search(rf"vfmadd231{suffix} .*%ymm0, %ymm(?:[2-9]|1[0-5])", current):
         raise SystemExit(f"{name}: fused accumulator is not register-resident")
-    if re.search(r"vmov\w* %ymm\d+, -?\d+\(%rbp\)", current):
+    if re.search(rf"vmov\w* %ymm\d+, {STACK}", current):
         raise SystemExit(f"{name}: fused vector accumulator still spills")
-    if not re.search(r"vmovdqu %ymm0, -?\d+\(%rbp\)", disabled):
+    if not re.search(rf"vmovdqu %ymm0, {STACK}", disabled):
         raise SystemExit(f"{name}: kill-switch control did not restore stack accumulator")
 
 for name in ("p15_sum_f32", "p16_sum_f64"):
-    if re.search(r"vmov\w* %ymm\d+, -?\d+\(%rbp\)", body(new, name)):
+    if re.search(rf"vmov\w* %ymm\d+, {STACK}", body(new, name)):
         raise SystemExit(f"{name}: unexpected vector stack store")
 PY
