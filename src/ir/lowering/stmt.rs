@@ -109,7 +109,23 @@ impl Lowerer {
                 continue;
             }
             if self.try_lower_block_func_decl(decl, declarator) {
+                if declarator.attrs.tls_model.is_some() {
+                    self.record_tls_model_attr(
+                        String::new(),
+                        declarator,
+                        super::global_decl::TlsAttrSubject::Function,
+                    );
+                }
                 continue;
+            }
+            // An automatic object has no TLS model (static locals record theirs
+            // under the mangled name in lower_local_static_decl).
+            if !decl.is_static() && declarator.attrs.tls_model.is_some() {
+                self.record_tls_model_attr(
+                    String::new(),
+                    declarator,
+                    super::global_decl::TlsAttrSubject::Variable,
+                );
             }
 
             let mut da = self.analyze_declaration(type_spec, &declarator.derived);
@@ -614,6 +630,11 @@ impl Lowerer {
     ) {
         let static_id = self.next_static_local;
         let static_name = format!("{}.{}.{}", self.func_mut().name, declarator.name, static_id);
+        self.record_tls_model_attr(
+            static_name.clone(),
+            declarator,
+            super::global_decl::TlsAttrSubject::object(decl.is_thread_local()),
+        );
 
         // Register the bare name -> mangled name mapping before processing the initializer
         // so that &x in another static's initializer can resolve to the mangled name.
@@ -731,7 +752,6 @@ impl Lowerer {
             is_const: var_is_const,
             is_used: declarator.attrs.is_used(),
             is_thread_local: decl.is_thread_local(),
-            tls_model: super::global_decl::lower_tls_model(declarator.attrs.tls_model.as_deref()),
         });
 
         let type_align = self.typedef_alignment_for_type_spec(type_spec).copied();

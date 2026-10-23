@@ -948,7 +948,9 @@ fn latch_is_bit_iteration(func: &IrFunction, latch: usize) -> bool {
                     // would veto a complete unroll that is profitable.
                     AShr | LShr | Shl | BitTest | RotateLeft | RotateRight => saw_shift = true,
                     And | Or | Xor | Bzhi => saw_and = true,
-                    Add | Sub | Mul | SDiv | UDiv | SRem | URem => other_arith = true,
+                    Add | Sub | Mul | SDiv | UDiv | SRem | URem | UMulHigh | SMulHigh => {
+                        other_arith = true
+                    }
                 }
             }
             Instruction::Store { .. }
@@ -6505,6 +6507,7 @@ mod tests {
                 assume_library: false,
                 ret_eightbyte_classes: vec![],
                 ret_is_f128_sse: false,
+                cold: false,
             },
         });
         let n = unroll_loops(&mut func, UnrollPhase::Early);

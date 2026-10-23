@@ -541,22 +541,32 @@ pub fn encode_instruction(
         "add" => {
             if operands.len() >= 3 && matches!(operands[2], Operand::Imm(_)) {
                 encode_alu_imm(operands, 0b000) // -> addi
-            } else if let Some(Operand::Symbol(marker)) = operands.get(3)
-                && marker.starts_with("%tprel_add(")
-            {
-                let EncodeResult::Word(word) = encode_alu_reg(operands, 0b000, 0b0000000)? else {
-                    return Err(
-                        "register ADD unexpectedly expanded during %tprel_add encoding".into(),
-                    );
-                };
-                Ok(EncodeResult::WordWithReloc {
-                    word,
-                    reloc: Relocation {
-                        reloc_type: RelocType::TprelAdd,
-                        symbol: pseudo::extract_modifier_symbol(marker),
-                        addend: 0,
-                    },
-                })
+            } else if operands.len() == 4 {
+                // `add rd, rs1, tp, %tprel_add(sym)`: the Local-Exec TLS add,
+                // tagged R_RISCV_TPREL_ADD so the linker can relax the LE
+                // sequence (GAS 2.47). Any other 4th operand is an error,
+                // not silently dropped.
+                match &operands[3] {
+                    Operand::Symbol(s) if s.starts_with("%tprel_add(") => {
+                        let EncodeResult::Word(word) =
+                            encode_alu_reg(&operands[..3], 0b000, 0b0000000)?
+                        else {
+                            return Err(
+                                "register ADD unexpectedly expanded during %tprel_add encoding"
+                                    .into(),
+                            );
+                        };
+                        Ok(EncodeResult::WordWithReloc {
+                            word,
+                            reloc: Relocation {
+                                reloc_type: RelocType::TprelAdd,
+                                symbol: extract_modifier_symbol(s),
+                                addend: 0,
+                            },
+                        })
+                    }
+                    other => Err(format!("add: unexpected 4th operand {other:?}")),
+                }
             } else {
                 encode_alu_reg(operands, 0b000, 0b0000000)
             }

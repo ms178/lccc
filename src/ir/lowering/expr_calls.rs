@@ -831,12 +831,33 @@ impl Lowerer {
         Some((Operand::Value(dest), first_ty))
     }
 
+    /// Spill a 9..=16-byte aggregate returned in a register pair (RAX:RDX,
+    /// x0:x1, a0:a1; carried as `I128`) into a fresh object.
+    ///
+    /// The high eightbyte is stored at the object's exact remaining width
+    /// when that is a machine size (12-byte `{u32 x3}` -> one `U32` store at
+    /// offset 8), so the stores match the member loads that read them back
+    /// and stay inside the object. For the odd remainders (3, 5, 6, 7 bytes)
+    /// the object is rounded up to the 16-byte register image and the high
+    /// half is stored whole: storing a full I64 at offset 8 of a 12-byte
+    /// object, as this used to, writes past the allocation in IR terms.
     fn unpack_two_reg_return(&mut self, dest: Value, size: usize) -> Operand {
+        debug_assert!(
+            (9..=16).contains(&size),
+            "two-register aggregate of {size} bytes"
+        );
+        let (hi_ty, alloc_size) = match size.saturating_sub(8) {
+            1 => (IrType::U8, size),
+            2 => (IrType::U16, size),
+            4 => (IrType::U32, size),
+            8 => (IrType::I64, size),
+            _ => (IrType::I64, 16),
+        };
         let alloca = self.fresh_value();
         self.emit(Instruction::Alloca {
             dest: alloca,
             ty: IrType::Ptr,
-            size,
+            size: alloc_size,
             align: 0,
             volatile: false,
             semantic_volatile: false,
@@ -870,7 +891,7 @@ impl Lowerer {
             dest: hi,
             src: Operand::Value(shifted),
             from_ty: IrType::I128,
-            to_ty: IrType::I64,
+            to_ty: hi_ty,
         });
         let hi_ptr = self.fresh_value();
         self.emit(Instruction::GetElementPtr {
@@ -883,7 +904,7 @@ impl Lowerer {
             volatile: false,
             val: Operand::Value(hi),
             ptr: hi_ptr,
-            ty: IrType::I64,
+            ty: hi_ty,
             seg_override: AddressSpace::Default,
         });
         Operand::Value(alloca)
@@ -1984,6 +2005,7 @@ impl Lowerer {
                             assume_library: false,
                             ret_eightbyte_classes: ret_abi.classes.clone(),
                             ret_is_f128_sse: ret_abi.one_xmm,
+                            cold: false,
                         },
                     });
                     indirect_ret_ty
@@ -2040,6 +2062,7 @@ impl Lowerer {
                             assume_library: false,
                             ret_eightbyte_classes: ret_abi.classes.clone(),
                             ret_is_f128_sse: call_ret_is_f128_sse,
+                            cold: false,
                         },
                     });
                     ret_ty
@@ -2097,6 +2120,7 @@ impl Lowerer {
                         ret_eightbyte_classes: ret_abi.classes.clone(),
                         // From the callee's type: `indirect_aggregate_return`.
                         ret_is_f128_sse: ret_abi.one_xmm,
+                        cold: false,
                     },
                 });
                 indirect_ret_ty
@@ -2182,6 +2206,7 @@ impl Lowerer {
                             assume_library: false,
                             ret_eightbyte_classes: ret_abi.classes.clone(),
                             ret_is_f128_sse: call_ret_is_f128_sse,
+                            cold: false,
                         },
                     });
                     ret_ty
@@ -2209,6 +2234,7 @@ impl Lowerer {
                             ret_eightbyte_classes: ret_abi.classes.clone(),
                             // From the callee's type: `indirect_aggregate_return`.
                             ret_is_f128_sse: ret_abi.one_xmm,
+                            cold: false,
                         },
                     });
                     indirect_ret_ty

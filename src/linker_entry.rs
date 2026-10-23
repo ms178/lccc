@@ -232,7 +232,15 @@ pub fn link_shared_x86(
     user_args: &[String],
     search_dirs: &[&str],
 ) -> Result<(), String> {
-    crate::backend::x86::linker::link_shared(object_files, output, user_args, search_dirs, &[])
+    crate::backend::x86::linker::link_shared(
+        object_files,
+        output,
+        user_args,
+        search_dirs,
+        &[],
+        &[],
+        &[],
+    )
 }
 
 /// Standard ELF32/i386 userspace executable link for `lccc-ld -m elf_i386`.

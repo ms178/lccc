@@ -142,7 +142,11 @@ fn truncating_move(line: &str, t_fam: RegId) -> Option<RegId> {
 
 /// `leaq ADDR, %T` + (window) + `movl %Td, %Dd` → `leal ADDR, %Dd`.
 pub(super) fn narrow_lea_truncations(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
-    let mut lv = FileLiveness::new(store, infos);
+    // Built at the first Rule-5 query, not up front: the pass runs in every
+    // fixpoint round, and most rounds (and most files) reach no candidate
+    // that needs it.  A solution built later from the current text is the
+    // one the eager build would have reached through its per-fold refreshes.
+    let mut lv: Option<FileLiveness> = None;
     let mut changed = false;
     let mut i = 0;
     while i + 1 < store.len() {
@@ -226,7 +230,12 @@ pub(super) fn narrow_lea_truncations(store: &mut LineStore, infos: &mut [LineInf
             continue;
         }
         // Rule 5: the 64-bit result must be dead once the 32-bit one exists.
-        if t_fam != d_fam && lv.live_after(j, t_fam) != Some(false) {
+        if t_fam != d_fam
+            && lv
+                .get_or_insert_with(|| FileLiveness::new(store, infos))
+                .live_after(j, t_fam)
+                != Some(false)
+        {
             i += 1;
             continue;
         }
@@ -238,7 +247,11 @@ pub(super) fn narrow_lea_truncations(store: &mut LineStore, infos: &mut [LineInf
         let new_line = format!("    leal {}, {}", addr_text, REG_NAMES[1][d_fam as usize]);
         replace_line(store, &mut infos[i], i, new_line);
         mark_nop(&mut infos[j]);
-        lv.refresh_at(store, infos, i);
+        // Only `i` (rewritten) and `j` (deleted) changed; the window lines
+        // between them are untouched, which is `refresh_span`'s contract.
+        if let Some(lv) = lv.as_mut() {
+            lv.refresh_span(store, infos, i, j);
+        }
         changed = true;
         i = j + 1;
     }

@@ -74,16 +74,11 @@ DIVERGENCES = {
     ("i686", f".zero {16 * G}"): (None, "GAS wraps the ELF32 size mod 2^32 to a 5-byte .bss; "
                                        "lccc refuses (\"exceeds the ELF32 size limit\") instead of truncating"),
     ("i686", f".fill {4 * G},4,0"): (None, "same ELF32 wrap"),
-    ("aarch64", ".uleb128 0"): (None, "LEB128 is fail-closed on AArch64/RISC-V: real inputs are "
-                                     "forward label differences that need GAS's relaxation (FOLLOWUP)"),
-    ("aarch64", ".sleb128 0"): (None, "same LEB128 gap"),
-    ("riscv64", ".uleb128 0"): (None, "same LEB128 gap"),
-    ("riscv64", ".sleb128 0"): (None, "same LEB128 gap"),
     ("aarch64", ".uleb128 1"): (None, "fail-closed LEB128 (GAS also errors here)"),
     ("riscv64", ".uleb128 1"): (None, "fail-closed LEB128 (GAS also errors here)"),
     ("aarch64", ".zero 16\n.skip 2f-1f\n1: .zero 4\n2:"): (
         None, "a forward-referenced .skip size is refused on AArch64/RISC-V (immediate "
-              "evaluation; x86 defers it) -- same forward-reference gap as LEB128"),
+              "evaluation; x86 defers it)"),
     ("riscv64", ".zero 16\n.skip 2f-1f\n1: .zero 4\n2:"): (None, "same forward .skip gap"),
     ("x86_64", ".subsection 1\n.zero 8\n.subsection 0\n.zero 4"): (
         None, "x86 refuses .subsection: it used to be silently ignored, which is right for a "

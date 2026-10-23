@@ -4,7 +4,10 @@
 #
 # Differential tests pin SEMANTICS; this script pins compile-time decisions
 # AND executes the cross-translation-unit alias regression:
-#   1. provably-disjoint private globals lower to `call memcpy`;
+#   1. provably-disjoint globals lower to `call memcpy`: one side must be a
+#      strong, locally binding definition in this unit (static, hidden, or
+#      any definition in executable code; `ModuleSymbolFacts`), so -fPIC
+#      public definitions and pairs of extern declarations stay guarded;
 #      uncertain roots retain a scalar loop plus a guarded memmove fast path;
 #   2. near misses keep their loops (same-root, overlap smear, extra
 #      loop-carried state, same-parameter copy),
@@ -104,6 +107,53 @@ else
     echo "FAIL(extern_alias): cross-TU globals were treated as disjoint"
     fail=1
 fi
+
+# --- global identity witnesses (ModuleSymbolFacts::globals_distinct) ---
+# checkf: like check, but with extra compiler flags instead of env.
+checkf() { # name, want(1/0), ere-pattern, c-file, flags...
+    local name=$1 want=$2 pat=$3 src=$4; shift 4
+    local asm="$work/$name.s" got=0
+    if ! "$CCC" -O2 "$@" -S "$src" -o "$asm" 2>"$work/$name.err"; then
+        echo "FAIL($name): compile error"; head -5 "$work/$name.err"; fail=1; return 0
+    fi
+    grep -qE "$pat" "$asm" && got=1
+    if [[ $got != "$want" ]]; then
+        echo "FAIL($name): want='$pat'=$want got=$got"; fail=1
+    else
+        echo "ok($name)"
+    fi
+}
+cat > "$work/w_public.c" <<'EOF'
+unsigned char D[4096], S[4096];
+void f(unsigned n) { for (unsigned i = 0; i < n; i++) D[i] = S[i]; }
+EOF
+cat > "$work/w_hidden.c" <<'EOF'
+__attribute__((visibility("hidden"))) unsigned char D[4096], S[4096];
+void f(unsigned n) { for (unsigned i = 0; i < n; i++) D[i] = S[i]; }
+EOF
+cat > "$work/w_mixed.c" <<'EOF'
+extern unsigned char S[];
+unsigned char D[4096];
+void f(unsigned n) { for (unsigned i = 0; i < n; i++) D[i] = S[i]; }
+EOF
+cat > "$work/w_decls.c" <<'EOF'
+extern unsigned char D[], S[];
+void f(unsigned n) { for (unsigned i = 0; i < n; i++) D[i] = S[i]; }
+EOF
+# Executable code: a public definition binds to itself (GCC binds_local).
+checkf w_public_exec      1 'call memcpy'  "$work/w_public.c"
+# Shared-library code: a default-visibility definition can be interposed, so
+# no memcpy and the overlap-safe scalar copy survives.
+checkf w_public_pic_nocpy 0 'call memcpy'  "$work/w_public.c" -fPIC
+checkf w_public_pic_scal  1 'movzbl.*\(' "$work/w_public.c" -fPIC
+# Hidden visibility binds locally even in shared-library code.
+checkf w_hidden_pic       1 'call memcpy'  "$work/w_hidden.c" -fPIC
+# One witness suffices: no other name can reach the definition's storage.
+checkf w_mixed_exec       1 'call memcpy'  "$work/w_mixed.c"
+# Two declarations: another unit may define one as the other's alias.  The
+# overlap-safe scalar byte copy must survive (behind whichever runtime guard).
+checkf w_decls_nocpy      0 'call memcpy'  "$work/w_decls.c"
+checkf w_decls_scalar     1 'movzbl.*\(' "$work/w_decls.c"
 
 # --- must NOT rewrite ---
 cat > "$work/n_self.c" <<'EOF'

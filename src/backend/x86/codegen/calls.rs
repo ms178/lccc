@@ -1277,36 +1277,23 @@ impl X86Codegen {
                                     if super::emit::is_xmm_reg(home) {
                                         let name = super::emit::phys_reg_name(home);
                                         if name != xmm_regs[reg_idx] {
-                                            if self.isa.avx {
-                                                // D32 is a 4-byte datum like
-                                                // F32: the scalar 32-bit move
-                                                // is width-exact (vmovsd would
-                                                // copy 8 bytes - correct, but
-                                                // one byte wider and it reads
-                                                // garbage lanes the consumer
-                                                // can never observe).
-                                                let mv = if matches!(ty, IrType::F32 | IrType::D32)
-                                                {
-                                                    "vmovss"
-                                                } else {
-                                                    "vmovsd"
-                                                };
-                                                self.state.emit_fmt(format_args!(
-                                                    "    {} %{}, %{}, %{}",
-                                                    mv, name, name, xmm_regs[reg_idx]
-                                                ));
-                                            } else {
-                                                let mv = if matches!(ty, IrType::F32 | IrType::D32)
-                                                {
-                                                    "movaps"
-                                                } else {
-                                                    "movapd"
-                                                };
-                                                self.state.emit_fmt(format_args!(
-                                                    "    {} %{}, %{}",
-                                                    mv, name, xmm_regs[reg_idx]
-                                                ));
-                                            }
+                                            // Full-register packed copy:
+                                            // the same low-128 bits as the
+                                            // 3-operand `vmovsd %s,%s,%d`,
+                                            // but eliminated at rename
+                                            // instead of a port-5 shuffle.
+                                            // D32 is a 4-byte datum like F32.
+                                            let f32ish = matches!(ty, IrType::F32 | IrType::D32);
+                                            let mv = match (f32ish, self.isa.avx) {
+                                                (true, true) => "vmovaps",
+                                                (true, false) => "movaps",
+                                                (false, true) => "vmovapd",
+                                                (false, false) => "movapd",
+                                            };
+                                            self.state.emit_fmt(format_args!(
+                                                "    {} %{}, %{}",
+                                                mv, name, xmm_regs[reg_idx]
+                                            ));
                                         }
                                         staged = true;
                                     } else {

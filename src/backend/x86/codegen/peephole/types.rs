@@ -434,6 +434,39 @@ pub(super) fn xmm_slot_line_info(kind: LineKind, ts: u16, s: &str, sb: &[u8]) ->
     }
 }
 
+/// `lccc_tls_call x`: the call half of a TLS-descriptor access, an opaque
+/// pseudo that `lower_tls_call_markers` turns into `call *x@TLSCALL(%rax)`
+/// after the peephole. It is classified as a %rax-only `Other` (register
+/// effects), but it executes a real `call`, so every pass that reasons about
+/// the frame's call-site alignment must count it as a call (see
+/// `remove_dead_leaf_frame`).
+pub(super) fn is_tls_descriptor_call(text: &str) -> bool {
+    text.starts_with("lccc_tls_call ")
+}
+
+/// The base-register bit of a GP stack-slot move's memory operand.
+///
+/// `parse_store_to_rbp_str`/`parse_load_from_rbp_str` accept exactly two
+/// operand shapes, `disp(%rbp)` and `disp(%rsp)` (the frameless layout), so
+/// the base is whichever of the two the line spells. Hard-coding the rbp bit
+/// for both — the historical behaviour — made every `%rsp`-slot spill and
+/// reload "mention" `%rbp`: in a frameless function where `%rbp` is an
+/// allocated GPR, liveness then saw a phantom read of it at every spill,
+/// pinned the value live across whole loops, and blocked every fold and
+/// dead-write retirement on it (`zlib_ng_adler32_combine` kept a
+/// `movzbl %r15b, %ebp; movb %bpl, …` pair that the same code folds when
+/// the value lands in `%r13`). The over-approximation was never unsound,
+/// only blinding; the `%rsp` bit is what the generic scanner reports for
+/// the same operand (`leaq 8(%rsp), %rbp` → rsp|rbp).
+#[inline]
+fn slot_base_bit(s: &str) -> u16 {
+    if s.contains("(%rsp)") {
+        1u16 << 4
+    } else {
+        1u16 << 5
+    }
+}
+
 /// Helper to construct a LineInfo with default ext_kind but pre-scanned reg_refs.
 #[inline]
 pub(super) fn line_info_with_regs(kind: LineKind, ts: u16, reg_refs: u16) -> LineInfo {
@@ -520,6 +553,24 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
         return directive_line_info(s, ts);
     }
 
+    // `lccc_tls_call x`, the TLS-descriptor call of a dynamic TLS access
+    // (codegen globals.rs). By the TLSDESC ABI it reads and writes %rax
+    // (descriptor in, offset out) and preserves EVERY other register, so it
+    // must not be a `Call`: the passes model a call as clobbering the
+    // caller-saved set, and dead-write elimination once deleted
+    // `imull $10,%r10d,%r10d` whose result the codegen correctly kept in %r10
+    // across the descriptor call (static TLS `sl*10+gl` returned 11, not 56).
+    // Nor may it be an operand-less unknown: %rax must be visible as its
+    // input and output to every pass, not only inside the volatile region.
+    // Pinned: the linker relaxes only the exact `leaq x@tlsdesc(%rip),%rax` /
+    // `call *x@tlscall(%rax)` pair, and %rax is the ABI argument.
+    if first == b'l' && is_tls_descriptor_call(s) {
+        let mut info = line_info_with_regs(LineKind::Other { dest_reg: 0 }, ts, 1u16 << 0);
+        info.pinned = true;
+        info.has_indirect_mem = true;
+        return info;
+    }
+
     // Scalar-FP / SSE XMM stack moves: classified precisely (offset + byte
     // size) so eliminate_never_read_stores can delete unread FP slots and
     // the read census is exact instead of a conservative 32-byte block.
@@ -564,7 +615,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
             // bitmask, and the GP consumers must not see them as GP.
             if reg <= REG_GP_MAX {
                 let offset = fast_parse_i32(offset_str);
-                let rr = (1u16 << reg) | (1u16 << 5);
+                let rr = (1u16 << reg) | slot_base_bit(s);
                 return line_info_with_regs(LineKind::StoreRbp { reg, offset, size }, ts, rr);
             }
             if is_xmm_family(reg) {
@@ -585,7 +636,7 @@ pub(super) fn classify_line(raw: &str) -> LineInfo {
                 } else {
                     ExtKind::None
                 };
-                let rr = (1u16 << reg) | (1u16 << 5);
+                let rr = (1u16 << reg) | slot_base_bit(s);
                 let mut info = line_info_ext(LineKind::LoadRbp { reg, offset, size }, ext, ts);
                 info.reg_refs = rr;
                 return info;
@@ -770,7 +821,12 @@ fn classify_other_line_info(s: &str, sb: &[u8], first: u8, ts: u16) -> LineInfo 
         has_indirect_mem: has_indirect,
         rbp_offset: rbp_off,
         reg_refs,
-        pinned: false,
+        // The descriptor-address half of a TLSDESC pair (see the `call`
+        // branch above): its form and its %rax destination are what the
+        // linker's relaxation and the descriptor ABI require.
+        pinned: first == b'l'
+            && s.starts_with("leaq ")
+            && (s.contains("@TLSDESC") || s.contains("@tlsdesc")),
         inert_dir: false,
         volatile_access: false,
     }
@@ -3170,6 +3226,37 @@ mod register_spelling_oracle_tests {
         }
     }
 
+    /// GP stack-slot moves report the base register they actually use: an
+    /// `%rsp` slot reads `%rsp`, never `%rbp` (a phantom `%rbp` read kept an
+    /// allocated-`%rbp` value live across every spill of a frameless
+    /// function), while an `%rbp` slot still names `%rbp`.
+    #[test]
+    fn gp_slot_moves_name_their_real_base_register() {
+        use super::{LineKind, classify_line};
+        const RAX: u16 = 1;
+        const RSP: u16 = 1 << 4;
+        const RBP: u16 = 1 << 5;
+        for (text, want) in [
+            ("    movq %rax, 64(%rsp)", RAX | RSP),
+            ("    movl %eax, 68(%rsp)", RAX | RSP),
+            ("    movq 64(%rsp), %rax", RAX | RSP),
+            ("    movq 64(%rsp), %rbp", RBP | RSP),
+            ("    movq %rax, -8(%rbp)", RAX | RBP),
+            ("    movl -12(%rbp), %eax", RAX | RBP),
+        ] {
+            let info = classify_line(text);
+            assert!(
+                matches!(
+                    info.kind,
+                    LineKind::StoreRbp { .. } | LineKind::LoadRbp { .. }
+                ),
+                "{text:?} must classify as a slot move, got {:?}",
+                info.kind
+            );
+            assert_eq!(info.reg_refs, want, "reg_refs of {text:?}");
+        }
+    }
+
     #[test]
     fn golden_bitmasks_pin_the_helper_extraction() {
         // The refactor that produced `register_family_at` must not have moved a
@@ -3509,5 +3596,32 @@ mod combined_implicit_effect_tests {
         assert_eq!(implicit_r_w_full(b"cltq"), (1, 1, 1));
         assert_eq!(implicit_r_w_full(b"lahf").2, 0);
         assert_eq!(implicit_r_w_full(b"rep movsb"), (0xc2, 0xc2, 0xc2));
+    }
+}
+
+#[cfg(test)]
+mod tls_descriptor_tests {
+    use super::*;
+
+    /// The TLSDESC call reads/writes only %rax (every other register is
+    /// preserved by the descriptor ABI) and, like the descriptor-address
+    /// `leaq`, is pinned: no pass may treat it as a caller-saved clobber,
+    /// rewrite its operand or move it away from its pair.
+    #[test]
+    fn descriptor_pair_is_a_pinned_rax_only_access() {
+        let call = classify_line("    lccc_tls_call sl");
+        assert!(matches!(call.kind, LineKind::Other { dest_reg: 0 }));
+        assert_eq!(call.reg_refs, 1 << 0);
+        assert!(call.pinned && call.has_indirect_mem);
+        let lea = classify_line("    leaq sl@TLSDESC(%rip), %rax");
+        assert!(matches!(lea.kind, LineKind::Other { dest_reg: 0 }));
+        assert!(lea.pinned);
+        // Ordinary calls and leas keep their classification; the lowered
+        // call never reaches the peephole, and would be a full `Call`.
+        assert!(matches!(
+            classify_line("    call foo@PLT").kind,
+            LineKind::Call
+        ));
+        assert!(!classify_line("    leaq sl(%rip), %rax").pinned);
     }
 }

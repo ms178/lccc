@@ -791,6 +791,8 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
             }
         }
     }
+    let uses = value_use_counts(func, max);
+    let mut refined: Vec<Value> = Vec::new();
     let mut changes = 0;
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
@@ -840,16 +842,64 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
                     ) {
                         *inst = replacement;
                         changes += 1;
-                    } else if let Some(t) = clz_ctz_zero_guard_replacement(
+                    } else if let Some(src) = clz_ctz_zero_guard_replacement(
                         cond,
                         true_val,
                         false_val,
                         &cast_defs,
                         &unary_defs,
-                    ) {
-                        *inst = Instruction::Copy {
+                    )
+                    .or_else(|| {
+                        zero_value_replacement(
+                            cond,
+                            true_val,
+                            false_val,
+                            *ty,
+                            &cast_defs,
+                            &unary_defs,
+                            &binop_defs,
+                        )
+                    })
+                    .or_else(|| {
+                        let root = nonzero_guard_refinement(
+                            cond,
+                            true_val,
+                            false_val,
+                            &cast_defs,
+                            &unary_defs,
+                            &uses,
+                        )?;
+                        refined.push(root);
+                        Some(*true_val)
+                    }) {
+                        *inst = Instruction::Copy { dest: *dest, src };
+                        changes += 1;
+                    }
+                }
+                // `(W-1) - ClzNonZero(x)` is the index of the highest set bit
+                // (zstd's `ZSTD_highbit32`, `BIT_highbit32`, Linux `__fls`).
+                // The count lies in [0, W-1] and W-1 is all ones over those
+                // bits, so the subtraction never borrows and equals
+                // `count ^ (W-1)` in any carrier at least as wide; integer
+                // casts between them preserve a value <= 63. On baseline x86
+                // the count itself is `bsr ^ (W-1)`, so the two XORs cancel
+                // in the peephole and the idiom becomes one `bsr`, as with
+                // GCC; on LZCNT, AArch64 and RISC-V `eor` costs what `sub`
+                // did. Defined-zero `Clz` reaches W and is excluded.
+                Instruction::BinOp {
+                    dest,
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Const(k),
+                    rhs,
+                    ty,
+                } if ty.is_integer() => {
+                    if is_highbit_of_clz(k, *rhs, &cast_defs, &unary_defs) {
+                        *inst = Instruction::BinOp {
                             dest: *dest,
-                            src: t,
+                            op: IrBinOp::Xor,
+                            lhs: *rhs,
+                            rhs: Operand::Const(*k),
+                            ty: *ty,
                         };
                         changes += 1;
                     }
@@ -903,7 +953,65 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
             }
         }
     }
+    if !refined.is_empty() {
+        refine_nonzero_counts(func, &refined);
+    }
     changes
+}
+
+/// Readers of every value id below `max` (instructions and terminators).
+fn value_use_counts(func: &IrFunction, max: usize) -> Vec<u32> {
+    let mut uses = vec![0u32; max];
+    for block in &func.blocks {
+        let mut count = |v: u32| {
+            if let Some(n) = uses.get_mut(v as usize) {
+                *n += 1;
+            }
+        };
+        for inst in &block.instructions {
+            inst.for_each_used_value(&mut count);
+        }
+        block.terminator.for_each_used_value(&mut count);
+    }
+    uses
+}
+
+/// `k - rhs` is `(W-1) - ClzNonZero(x)` through integer casts: the index of
+/// the highest set bit, equal to `rhs ^ k` (see the caller).
+fn is_highbit_of_clz(
+    k: &IrConst,
+    rhs: Operand,
+    cast_defs: &[Option<CastDef>],
+    unary_defs: &[Option<UnaryDef>],
+) -> bool {
+    match peel_int_cast_chain(rhs, cast_defs, false) {
+        Operand::Value(rv) => matches!(
+            unary_defs.get(rv.0 as usize).and_then(|d| d.as_ref()),
+            Some(UnaryDef { op: IrUnaryOp::ClzNonZero, ty: cty, .. })
+                if cty.is_integer() && k.to_i128() == Some((cty.size() * 8) as i128 - 1)
+        ),
+        _ => false,
+    }
+}
+
+/// Turn the NonZero counts `nonzero_guard_refinement` selected into their
+/// defined-zero forms (a refinement: they agree wherever NonZero is defined).
+fn refine_nonzero_counts(func: &mut IrFunction, refined: &[Value]) {
+    for inst in func
+        .blocks
+        .iter_mut()
+        .flat_map(|b| b.instructions.iter_mut())
+    {
+        if let Instruction::UnaryOp { dest, op, .. } = inst
+            && refined.contains(dest)
+        {
+            *op = match *op {
+                IrUnaryOp::ClzNonZero => IrUnaryOp::Clz,
+                IrUnaryOp::CtzNonZero => IrUnaryOp::Ctz,
+                other => other,
+            };
+        }
+    }
 }
 
 fn eval_int_cmp_bool(op: IrCmpOp, lhs: IrConst, rhs: IrConst, ty: IrType) -> Option<bool> {
@@ -1280,6 +1388,70 @@ fn fold_cmp_of_select(
     }
 }
 
+/// `x ? count_nz(x) : W` whose count (and every cast between it and the
+/// select) has the select as its ONLY reader: the root to refine.
+///
+/// `__builtin_clz`/`__builtin_ctz` lower to the NonZero counts, so the
+/// guarded spelling `x ? __builtin_ctz(x) : 32` (and the bundled
+/// `_tzcnt_u32`/`_lzcnt_u32`) carries a NonZero arm, which
+/// `clz_ctz_zero_guard_replacement` must refuse to collapse onto. Replacing
+/// a NonZero count by the defined-zero one is a refinement, sound for every
+/// reader: it agrees wherever the NonZero count is defined. Once defined,
+/// `select(x, count(x), W) == count(x)` holds exactly (the IR's
+/// `Clz(0) == Ctz(0) == W`, preserved by every integer cast of a value
+/// <= 64). The sole-reader condition is a cost rule, not a soundness one:
+/// another reader would pay the zero fix-up on targets without
+/// LZCNT/TZCNT; with the guard as the only reader the fix-up replaces the
+/// guard, and LZCNT/BMI1 then emit a single `lzcnt`/`tzcnt`.
+fn nonzero_guard_refinement(
+    cond: &Operand,
+    true_val: &Operand,
+    false_val: &Operand,
+    cast_defs: &[Option<CastDef>],
+    unary_defs: &[Option<UnaryDef>],
+    uses: &[u32],
+) -> Option<Value> {
+    let Operand::Value(_) = cond else { return None };
+    let mut cur = *true_val;
+    let root = loop {
+        let Operand::Value(v) = cur else { return None };
+        if uses.get(v.0 as usize) != Some(&1) {
+            return None;
+        }
+        if let Some(Some(UnaryDef {
+            op: IrUnaryOp::ClzNonZero | IrUnaryOp::CtzNonZero,
+            ..
+        })) = unary_defs.get(v.0 as usize)
+        {
+            break v;
+        }
+        match cast_defs.get(v.0 as usize).and_then(|d| d.as_ref()) {
+            Some(CastDef {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            }) if from_ty.is_integer() && to_ty.is_integer() => cur = *src,
+            _ => return None,
+        }
+    };
+    let UnaryDef { src, ty, .. } = *unary_defs[root.0 as usize].as_ref()?;
+    if !ty.is_integer() {
+        return None;
+    }
+    let width = ty.size() as i128 * 8;
+    let Operand::Const(zero_case) = false_val else {
+        return None;
+    };
+    if zero_case.to_i128() != Some(width) {
+        return None;
+    }
+    if peel_int_cast_chain(*cond, cast_defs, true) != peel_int_cast_chain(src, cast_defs, true) {
+        return None;
+    }
+    Some(root)
+}
+
 /// Fold a guard around the *safe* portable CLZ, not a speculated bare
 /// NonZero intrinsic. At x=0 the OR arm produces W-1: fallback W-1 selects
 /// that existing arm, whereas fallback W requires a new DEFINED-zero Clz(x).
@@ -1427,6 +1599,156 @@ fn clz_ctz_zero_guard_replacement(
     }
 }
 
+/// Zero-value replacement (GCC phiopt's `value_replacement`, generalised to
+/// an expression arm): `select(x, T, C)` is `T` when `T` evaluated at
+/// `x == 0` is exactly `C`. The select picks `T` for every nonzero `x`, and
+/// for `x == 0` both arms agree. `select(x, 31 - clz(x), -1)` (zstd's and the
+/// kernel's highest-set-bit index with -1 for zero) collapses because the IR
+/// defines `Clz(0) == 32`; so does `x ? 32 - clz(x) : 0` (`fls`), while
+/// `x ? clz(x) ^ 31 : -1` does not (`32 ^ 31 == 63`) and keeps its select.
+/// The bare `x ? clz(x) : W` is the special case that
+/// `clz_ctz_zero_guard_replacement` already handles.
+///
+/// Nothing is speculated that was not already: a `Select` evaluates `T`
+/// unconditionally. The evaluation (`eval_at_zero`) follows the IR semantics
+/// width-exactly and refuses everything it does not model: the NonZero
+/// intrinsics (no value at zero — their guard is what makes them safe),
+/// shift amounts outside the type, division, any value other than `x` and
+/// its integer casts, and trees over a small node budget.
+fn zero_value_replacement(
+    cond: &Operand,
+    true_val: &Operand,
+    false_val: &Operand,
+    ty: IrType,
+    cast_defs: &[Option<CastDef>],
+    unary_defs: &[Option<UnaryDef>],
+    binop_defs: &[Option<BinOpDef>],
+) -> Option<Operand> {
+    let Operand::Value(_) = cond else { return None };
+    let Operand::Value(_) = true_val else {
+        return None;
+    };
+    let Operand::Const(c) = false_val else {
+        return None;
+    };
+    if !ty.is_integer() || ty.size() == 0 || ty.size() > 8 {
+        return None;
+    }
+    // Same-size casts only: a truncation could zero a nonzero condition.
+    let x = peel_int_cast_chain(*cond, cast_defs, true);
+    let Operand::Value(_) = x else { return None };
+    let mut budget = 16u32;
+    let at_zero = eval_at_zero(
+        *true_val,
+        ty,
+        x,
+        cast_defs,
+        unary_defs,
+        binop_defs,
+        &mut budget,
+    )?;
+    let mask = width_mask(ty.size() as u32 * 8);
+    let c = (c.to_i128()? as u128) & mask;
+    (at_zero == c).then_some(*true_val)
+}
+
+fn width_mask(bits: u32) -> u128 {
+    if bits >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    }
+}
+
+/// Value of `op` (an operand of IR type `ty`) when `x == 0`, as the low
+/// `ty`-width bits; see `zero_value_replacement`. `x` and every integer cast
+/// of it are 0 there, whatever the widths.
+fn eval_at_zero(
+    op: Operand,
+    ty: IrType,
+    x: Operand,
+    cast_defs: &[Option<CastDef>],
+    unary_defs: &[Option<UnaryDef>],
+    binop_defs: &[Option<BinOpDef>],
+    budget: &mut u32,
+) -> Option<u128> {
+    *budget = budget.checked_sub(1)?;
+    if !ty.is_integer() || ty.size() == 0 || ty.size() > 8 {
+        return None;
+    }
+    let bits = ty.size() as u32 * 8;
+    let mask = width_mask(bits);
+    let v = match op {
+        Operand::Const(c) => return Some((c.to_i128()? as u128) & mask),
+        Operand::Value(v) => v,
+    };
+    if peel_int_cast_chain(op, cast_defs, false) == x {
+        return Some(0);
+    }
+    let i = v.0 as usize;
+    if let Some(Some(u)) = unary_defs.get(i) {
+        let w = u.ty.size() as u32 * 8;
+        if !u.ty.is_integer() || w == 0 || w > 64 {
+            return None;
+        }
+        let a = eval_at_zero(u.src, u.ty, x, cast_defs, unary_defs, binop_defs, budget)?;
+        let a = a as u64 & (width_mask(w) as u64);
+        let r = match u.op {
+            IrUnaryOp::Clz if a == 0 => w,
+            IrUnaryOp::Clz => a.leading_zeros() - (64 - w),
+            IrUnaryOp::Ctz if a == 0 => w,
+            IrUnaryOp::Ctz => a.trailing_zeros(),
+            _ => return None,
+        };
+        return Some(u128::from(r) & mask);
+    }
+    if let Some(Some(cd)) = cast_defs.get(i) {
+        let (from, to) = (cd.from_ty, cd.to_ty);
+        if !from.is_integer() || !to.is_integer() || from.size() == 0 || from.size() > 8 {
+            return None;
+        }
+        let a = eval_at_zero(cd.src, from, x, cast_defs, unary_defs, binop_defs, budget)?;
+        let fbits = from.size() as u32 * 8;
+        let widened = if from.is_signed() && fbits < 128 && (a >> (fbits - 1)) & 1 == 1 {
+            a | !width_mask(fbits)
+        } else {
+            a
+        };
+        return Some(widened & width_mask(to.size() as u32 * 8) & mask);
+    }
+    if let Some(Some(b)) = binop_defs.get(i) {
+        let bty = b.ty;
+        let bbits = bty.size() as u32 * 8;
+        if !bty.is_integer() || bbits == 0 || bbits > 64 {
+            return None;
+        }
+        let bmask = width_mask(bbits);
+        let l = eval_at_zero(b.lhs, bty, x, cast_defs, unary_defs, binop_defs, budget)?;
+        let r = eval_at_zero(b.rhs, bty, x, cast_defs, unary_defs, binop_defs, budget)?;
+        let sext = |a: u128| -> i128 {
+            if (a >> (bbits - 1)) & 1 == 1 {
+                (a | !bmask) as i128
+            } else {
+                a as i128
+            }
+        };
+        let res = match b.op {
+            IrBinOp::Add => l.wrapping_add(r),
+            IrBinOp::Sub => l.wrapping_sub(r),
+            IrBinOp::Mul => l.wrapping_mul(r),
+            IrBinOp::And => l & r,
+            IrBinOp::Or => l | r,
+            IrBinOp::Xor => l ^ r,
+            IrBinOp::Shl if r < u128::from(bbits) => l << r,
+            IrBinOp::LShr if r < u128::from(bbits) => l >> r,
+            IrBinOp::AShr if r < u128::from(bbits) => (sext(l) >> r) as u128,
+            _ => return None,
+        };
+        return Some(res & bmask & mask);
+    }
+    None
+}
+
 /// Cached information about a BinOp instruction for constant reassociation.
 /// We only store BinOps where at least one operand is a constant, since
 /// reassociation requires folding two constants together.
@@ -1480,7 +1802,15 @@ fn try_simplify_with_types(
             src,
             from_ty,
             to_ty,
-        } => simplify_cast(*dest, src, *from_ty, *to_ty, cast_defs, value_types),
+        } => simplify_cast(
+            *dest,
+            src,
+            *from_ty,
+            *to_ty,
+            cast_defs,
+            binop_defs,
+            value_types,
+        ),
         Instruction::GetElementPtr {
             dest,
             base,
@@ -1678,11 +2008,30 @@ fn simplify_cast(
     from_ty: IrType,
     to_ty: IrType,
     def_map: &[Option<CastDef>],
+    binop_defs: &[Option<BinOpDef>],
     value_types: &[Option<IrType>],
 ) -> Option<Instruction> {
     // Identity cast: same type
     if from_ty == to_ty {
         return Some(Instruction::Copy { dest, src: *src });
+    }
+
+    // Two-register aggregate carrier: a half extracted from the I128 pack it
+    // was just built from is the narrow value that went in.
+    if !simplify_skip("pack_extract") {
+        if let Some((half, half_ty)) =
+            packed_range_source(src, from_ty, to_ty, def_map, binop_defs, value_types)
+        {
+            if half_ty == to_ty {
+                return Some(Instruction::Copy { dest, src: half });
+            }
+            return Some(Instruction::Cast {
+                dest,
+                src: half,
+                from_ty: half_ty,
+                to_ty,
+            });
+        }
     }
 
     // Some lowering paths conservatively annotate an integer expression as
@@ -1720,8 +2069,16 @@ fn simplify_cast(
             let inner_to = inner_cast.to_ty;
             let inner_src = inner_cast.src;
 
-            // Verify chain consistency: inner output type must match our input type
-            if inner_to == from_ty {
+            // Chain consistency: the inner cast must produce the bits this
+            // cast reads. Two integer types of one width are the same bits
+            // (`Cast(Cast(x, U32->I64), U64->I16)`: aggregate SROA's covering
+            // loads build U64 views of I64 values and vice versa), and every
+            // rule below is phrased in THIS cast's `from_ty` -- the only
+            // place B's signedness matters is a widening outer step, whose
+            // sext/zext choice is exactly `from_ty`'s.
+            let same_bits =
+                inner_to.is_integer() && from_ty.is_integer() && inner_to.size() == from_ty.size();
+            if inner_to == from_ty || same_bits {
                 // Widen then narrow back to exact same type.
                 //   Cast(Cast(x, A->B), B->A) => Copy of x
                 // ONLY for unsigned A. Signed I32/I16/I8 homes are frequently
@@ -1777,7 +2134,18 @@ fn simplify_cast(
                     // Safe because narrowing only keeps the low bits, so
                     // narrow(narrow(x, A->B), B->C) = narrow(x, A->C) regardless
                     // of signedness (both just truncate to C bits).
-                    if a > b && b > c && !simplify_skip("cast_narrow") {
+                    //
+                    // Not from a 128-bit A: no target has a single-register
+                    // home for one (x86-64 pairs/slots and the wide-hazard
+                    // points of `regalloc`, i686's 64-bit pair model, AArch64
+                    // and RISC-V register pairs), so composing moves a read
+                    // ONTO the I128 and stretches its web to this point, while
+                    // the intermediate B (<= 64 bits) it saves is a free
+                    // subregister read. Two-register carriers hit this on
+                    // every member narrower than its eightbyte: the low half
+                    // `trunc64(v)` already exists, and `trunc32(trunc64(v))`
+                    // must not become a second I128 reader.
+                    if a > b && b > c && a < 16 && !simplify_skip("cast_narrow") {
                         return Some(Instruction::Cast {
                             dest,
                             src: inner_src,
@@ -1817,6 +2185,295 @@ fn simplify_cast(
     }
 
     None
+}
+
+/// `trunc_T(x)` where the low `|T|` bits of `x` provably come from one
+/// narrower value: return that value and its type, so the truncation can read
+/// it directly (`cast_{A->T}(src)`).
+///
+/// The producers are bit packs that are taken apart again in the same
+/// function. The two-register aggregate carrier (`unpack_two_reg_return`: a
+/// 9..=16-byte struct returned in RAX:RDX, x0:x1 or a0:a1 travels as I128)
+/// leaves the callee's pack and the caller's unpack side by side once the
+/// callee is inlined; aggregate SROA's covering accesses (rule 3b, `I64` over
+/// `{u32, u32}`) build `or(zext(f_i) << 8*rel_i)` packs that the members'
+/// readers take apart. The pack is pure overhead either way, and an I128 one
+/// is worse: any I128 value makes the x86-64 backend withdraw
+/// r8/r9/rdi/rsi/rdx from the general caller-saved pool for the whole
+/// function (`x86_body_has_i128_ops`). In zstd's `ZSTD_compressBlock_opt2`
+/// six inlined `ZSTD_newRep` carriers left a 2,700-value function two
+/// caller-saved registers. Once every extract reads its source, DCE deletes
+/// the pack.
+///
+/// `BitDefs::range_source` walks the def chain of `x` for the bit range `[0, |T|)`
+/// (W-bit integers, W in 32/64/128, depth-bounded):
+///
+/// * `or(a, b)`: the range comes from `b` when `a` is provably zero there
+///   (`BitDefs::bits_known_zero`), and vice versa;
+/// * `shl(y, S)`: bits `[lo, lo+t)` are bits `[lo-S, lo-S+t)` of `y` when
+///   `lo >= S`;
+/// * `lshr`/`ashr(y, S)`: bits `[lo+S, lo+S+t)` of `y`, provided they lie
+///   inside `y` (so an arithmetic fill never enters the range);
+/// * `and(y, M)`: transparent when `M` is all ones on the range;
+/// * `ext_A(y)` (a widening cast): at `lo = 0`, `trunc_t(ext_A(y)) =
+///   cast_{A->T}(y)` for every `t <= W` (extension semantics stay A's); a
+///   narrowing cast is transparent for in-range bits, except out of a
+///   128-bit value (that would add an I128 reader, see `cast_narrow`);
+/// * any value at `lo = 0` is itself the answer (a plain truncation), unless
+///   it is 128 bits wide (no new I128 readers; see the end of
+///   `packed_range_source`).
+///
+/// The walk must start at a bit operation (plain `trunc(ext(x))` chains keep
+/// `simplify_cast`'s signed round-trip guard), so a rewrite always reads a
+/// different value than before. 128-bit packs need a
+/// 64-bit target: i686 models I128 as its low 64-bit pair, where shifts by
+/// 64 and bits above 64 do not mean what this algebra assumes.
+fn packed_range_source(
+    src: &Operand,
+    from_ty: IrType,
+    to_ty: IrType,
+    cast_defs: &[Option<CastDef>],
+    binop_defs: &[Option<BinOpDef>],
+    value_types: &[Option<IrType>],
+) -> Option<(Operand, IrType)> {
+    let w = bits_of(from_ty);
+    if !matches!(w, 32 | 64 | 128) || !from_ty.is_integer() || !to_ty.is_integer() {
+        return None;
+    }
+    if w == 128 && crate::common::types::target_is_32bit() {
+        return None;
+    }
+    let t = bits_of(to_ty);
+    if t >= w {
+        return None;
+    }
+    let defs = BitDefs {
+        cast_defs,
+        binop_defs,
+        value_types,
+    };
+    // Plain cast chains (`trunc(ext(x))`) stay with `simplify_cast`'s own
+    // rules, whose signed round-trip guard (`cast_same`) is deliberate: the
+    // walk only starts at a bit operation, i.e. at a pack.
+    defs.binop(src)?;
+    let (found, ty) = defs.range_source(src, from_ty, 0, t, 0)?;
+    // Never hand back a 128-bit value: that adds an I128 reader (the
+    // `cast_narrow` rule), and 128-bit SSA values include `__m128`-style
+    // vectors whose XMM homes leave the 16-byte slot an I128 read uses
+    // unwritten (`trunc64(and(v, m))` -> `trunc64(v)` read a stale slot in
+    // the SSE wrapper tests). Carrier members are at most 64 bits wide.
+    if bits_of(ty) >= 128 {
+        return None;
+    }
+    (found != *src).then_some((found, ty))
+}
+
+fn bits_of(ty: IrType) -> i64 {
+    (ty.size() * 8) as i64
+}
+
+/// Def lookups for the bit-range walk.
+struct BitDefs<'a> {
+    cast_defs: &'a [Option<CastDef>],
+    binop_defs: &'a [Option<BinOpDef>],
+    value_types: &'a [Option<IrType>],
+}
+
+/// Depth bound of the bit-range walk: a 16-byte carrier over byte fields
+/// nests eight `or`s; anything deeper is not a pack worth taking apart.
+const BIT_WALK_DEPTH: u32 = 12;
+
+impl BitDefs<'_> {
+    fn binop(&self, op: &Operand) -> Option<BinOpDef> {
+        let Operand::Value(v) = op else { return None };
+        self.binop_defs.get(v.0 as usize).copied().flatten()
+    }
+
+    fn cast(&self, op: &Operand) -> Option<CastDef> {
+        let Operand::Value(v) = op else { return None };
+        self.cast_defs.get(v.0 as usize).copied().flatten()
+    }
+
+    fn shift(op: &Operand, w: i64) -> Option<i64> {
+        let Operand::Const(c) = op else { return None };
+        c.to_i64().filter(|&k| 0 < k && k < w)
+    }
+
+    /// Whether bits `[lo, lo+t)` of `x` (a `w`-bit integer) are provably 0.
+    fn bits_known_zero(&self, x: &Operand, w: i64, lo: i64, t: i64, depth: u32) -> bool {
+        if depth > BIT_WALK_DEPTH || lo < 0 || t <= 0 {
+            return false;
+        }
+        if lo + t > w {
+            return false;
+        }
+        if let Operand::Const(c) = x {
+            return const_range_is(c, lo, t, false);
+        }
+        if let Some(b) = self.binop(x) {
+            if bits_of(b.ty) != w {
+                return false;
+            }
+            return match b.op {
+                IrBinOp::Shl => Self::shift(&b.rhs, w).is_some_and(|s| {
+                    lo + t <= s
+                        || (lo >= s && self.bits_known_zero(&b.lhs, w, lo - s, t, depth + 1))
+                }),
+                IrBinOp::LShr => Self::shift(&b.rhs, w).is_some_and(|s| {
+                    lo >= w - s
+                        || (lo + t <= w - s
+                            && self.bits_known_zero(&b.lhs, w, lo + s, t, depth + 1))
+                }),
+                IrBinOp::And => {
+                    let zero = |o: &Operand| matches!(o, Operand::Const(c) if const_range_is(c, lo, t, false));
+                    zero(&b.rhs)
+                        || zero(&b.lhs)
+                        || self.bits_known_zero(&b.lhs, w, lo, t, depth + 1)
+                        || self.bits_known_zero(&b.rhs, w, lo, t, depth + 1)
+                }
+                IrBinOp::Or => {
+                    self.bits_known_zero(&b.lhs, w, lo, t, depth + 1)
+                        && self.bits_known_zero(&b.rhs, w, lo, t, depth + 1)
+                }
+                _ => false,
+            };
+        }
+        if let Some(c) = self.cast(x) {
+            if bits_of(c.to_ty) != w || !c.from_ty.is_integer() {
+                return false;
+            }
+            let a = bits_of(c.from_ty);
+            if a < w {
+                // Zero extension: everything above the source is zero.
+                if c.from_ty.is_unsigned() && lo >= a {
+                    return true;
+                }
+                return lo + t <= a && self.bits_known_zero(&c.src, a, lo, t, depth + 1);
+            }
+            return self.bits_known_zero(&c.src, a, lo, t, depth + 1);
+        }
+        false
+    }
+
+    /// The value whose low `t` bits are bits `[lo, lo+t)` of `x` (a `ty`-typed
+    /// integer), reached only at `lo == 0`.
+    fn range_source(
+        &self,
+        x: &Operand,
+        ty: IrType,
+        lo: i64,
+        t: i64,
+        depth: u32,
+    ) -> Option<(Operand, IrType)> {
+        let w = bits_of(ty);
+        if depth > BIT_WALK_DEPTH || lo < 0 || lo + t > w || !ty.is_integer() {
+            return None;
+        }
+        if let Some(b) = self.binop(x) {
+            if bits_of(b.ty) != w {
+                return None;
+            }
+            let step = match b.op {
+                IrBinOp::Or => {
+                    if self.bits_known_zero(&b.lhs, w, lo, t, depth + 1) {
+                        self.range_source(&b.rhs, b.ty, lo, t, depth + 1)
+                    } else if self.bits_known_zero(&b.rhs, w, lo, t, depth + 1) {
+                        self.range_source(&b.lhs, b.ty, lo, t, depth + 1)
+                    } else {
+                        None
+                    }
+                }
+                IrBinOp::Shl => Self::shift(&b.rhs, w)
+                    .filter(|&s| lo >= s)
+                    .and_then(|s| self.range_source(&b.lhs, b.ty, lo - s, t, depth + 1)),
+                IrBinOp::LShr | IrBinOp::AShr => Self::shift(&b.rhs, w)
+                    .filter(|&s| lo + s + t <= w)
+                    .and_then(|s| self.range_source(&b.lhs, b.ty, lo + s, t, depth + 1)),
+                IrBinOp::And => {
+                    let ones = |o: &Operand| matches!(o, Operand::Const(c) if const_range_is(c, lo, t, true));
+                    if ones(&b.rhs) {
+                        self.range_source(&b.lhs, b.ty, lo, t, depth + 1)
+                    } else if ones(&b.lhs) {
+                        self.range_source(&b.rhs, b.ty, lo, t, depth + 1)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if step.is_some() {
+                return step;
+            }
+        }
+        if let Some(c) = self.cast(x) {
+            if bits_of(c.to_ty) == w && c.from_ty.is_integer() {
+                let a = bits_of(c.from_ty);
+                if a < w && lo == 0 {
+                    return Some((c.src, c.from_ty));
+                }
+                // A narrowing cast is transparent for in-range bits, but not
+                // out of a 128-bit value: that would add an I128 reader
+                // (see `cast_narrow` in `simplify_cast`).
+                if lo + t <= a && a < 128 {
+                    if let Some(r) = self.range_source(&c.src, c.from_ty, lo, t, depth + 1) {
+                        return Some(r);
+                    }
+                }
+            }
+        }
+        if lo == 0 {
+            let vty = match x {
+                Operand::Value(v) => self.value_types.get(v.0 as usize).copied().flatten(),
+                Operand::Const(_) => None,
+            };
+            if vty.is_some_and(|vt| vt.is_integer() && bits_of(vt) == w) {
+                return Some((*x, ty));
+            }
+        }
+        None
+    }
+}
+
+/// Whether bits `[lo, lo+t)` of an integer constant operand are all ones
+/// (`ones`) or all zeros, counting only bits every backend agrees on.
+///
+/// A constant narrower than its operation is extended by the backend, and
+/// not uniformly: x86-64 zero-extends a non-I128 constant into the high half
+/// of a 128-bit operand (`operand_to_rax_rdx`: `xorl %edx, %edx`), while a
+/// 64-bit `imm32` sign-extends. Bits above the constant's own width are
+/// therefore known only when both readings agree -- a non-negative constant
+/// (zeros either way). Reading `and(x, I64(-1))` in an I128 as an all-ones
+/// mask passed `x`'s high half through a mask that clears it (the SSE
+/// wrapper regressions `agg_fwd_param_home`, `simd_sse_float`,
+/// `builtin_ia32_vector_value`).
+fn const_range_is(c: &IrConst, lo: i64, t: i64, ones: bool) -> bool {
+    let (v, width): (i128, i64) = match *c {
+        IrConst::I8(v) => (v.into(), 8),
+        IrConst::I16(v) => (v.into(), 16),
+        IrConst::I32(v) => (v.into(), 32),
+        IrConst::I64(v) => (v.into(), 64),
+        IrConst::I128(v) => (v, 128),
+        IrConst::Zero => (0, 128),
+        _ => return false,
+    };
+    if lo + t > width && v < 0 {
+        return false;
+    }
+    let bits = (v as u128 >> lo) & range_mask(t);
+    if ones {
+        bits == range_mask(t)
+    } else {
+        bits == 0
+    }
+}
+
+/// `t` low bits set (`t <= 128`).
+fn range_mask(t: i64) -> u128 {
+    if t >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << t) - 1
+    }
 }
 
 /// Fold a cast of a constant at compile time.
@@ -2582,6 +3239,76 @@ fn normal_power_of_two_reciprocal(rhs: &Operand, ty: IrType) -> Option<IrConst> 
     }
 }
 
+/// High half of the 2W-bit product by a constant power of two 2^k is
+/// the operand shifted down by W - k: logically for the unsigned form,
+/// arithmetically for the signed one (2^k must then be positive, so
+/// k < W - 1). A zero operand gives zero, and 2^0 is the k = 0 case:
+/// zero (unsigned) or the sign fill `x >> (W - 1)` (signed).
+/// `None` keeps the operation.
+fn simplify_mul_high(
+    dest: Value,
+    op: IrBinOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    ty: IrType,
+    any_zero: bool,
+) -> Option<Instruction> {
+    if any_zero {
+        return Some(Instruction::Copy {
+            dest,
+            src: Operand::Const(IrConst::zero(ty)),
+        });
+    }
+    let bits = (ty.size() * 8) as i64;
+    let signed = op == IrBinOp::SMulHigh;
+    for (x, c) in [(lhs, rhs), (rhs, lhs)] {
+        let Operand::Const(c) = c else { continue };
+        let Some(v) = c.to_i64() else { continue };
+        // The operand's bit pattern at width W: 2^(W-1) is a power of
+        // two for the unsigned form (and negative for the signed one,
+        // which the k < W - 1 test below refuses).
+        let raw = if bits < 64 {
+            (v as u64) & ((1u64 << bits) - 1)
+        } else {
+            v as u64
+        };
+        if raw.count_ones() != 1 {
+            continue;
+        }
+        let k = i64::from(raw.trailing_zeros());
+        if signed && k >= bits - 1 {
+            continue;
+        }
+        if k == 0 && !signed {
+            return Some(Instruction::Copy {
+                dest,
+                src: Operand::Const(IrConst::zero(ty)),
+            });
+        }
+        return Some(Instruction::BinOp {
+            dest,
+            op: if signed { IrBinOp::AShr } else { IrBinOp::LShr },
+            lhs: *x,
+            // Signed k = 0 is the sign fill: shift by W - 1, not W.
+            rhs: Operand::Const(IrConst::I64(if k == 0 { bits - 1 } else { bits - k })),
+            ty,
+        });
+    }
+    None
+}
+
+/// `x /s -1 => -x`: exact for every defined input (`INT_MIN / -1`
+/// overflows, which C leaves undefined).  It reached the backend as
+/// `cqto; movq $-1, %rcx; idivq %rcx` (GCC: `negq`).
+fn sdiv_by_minus_one(dest: Value, lhs: &Operand, ty: IrType) -> Instruction {
+    Instruction::UnaryOp {
+        dest,
+        op: IrUnaryOp::Neg,
+        src: *lhs,
+        ty,
+    }
+}
+
 /// `Bzhi(0, n)` keeps bits of zero.  A constant index is a fixed mask: only
 /// its low eight bits count, `k >= W` is the identity and `k == 0` keeps
 /// nothing; anything else is the plain `and` every later pass (known bits,
@@ -2814,6 +3541,9 @@ fn simplify_binop(
                 // x / 1 => x (valid for both int and float)
                 return Some(Instruction::Copy { dest, src: *lhs });
             }
+            if op == IrBinOp::SDiv && !is_float && is_all_ones(rhs, ty) {
+                return Some(sdiv_by_minus_one(dest, lhs, ty));
+            }
             if !is_float && same_value {
                 // x / x => 1 (integers only; for floats, 0/0=NaN, Inf/Inf=NaN)
                 return Some(Instruction::Copy {
@@ -2838,7 +3568,10 @@ fn simplify_binop(
             }
         }
         IrBinOp::SRem | IrBinOp::URem => {
-            if rhs_one || same_value {
+            // x %s -1 => 0 for every defined input (INT_MIN % -1 overflows the
+            // quotient, undefined in C), like x % 1.
+            let signed_minus_one = op == IrBinOp::SRem && !is_float && is_all_ones(rhs, ty);
+            if rhs_one || same_value || signed_minus_one {
                 // x % 1 => 0, x % x => 0
                 return Some(Instruction::Copy {
                     dest,
@@ -3091,6 +3824,12 @@ fn simplify_binop(
         }
         IrBinOp::Bzhi => {
             if let Some(rewritten) = simplify_bzhi(dest, lhs, rhs, ty, lhs_zero) {
+                return Some(rewritten);
+            }
+        }
+        IrBinOp::UMulHigh | IrBinOp::SMulHigh => {
+            if let Some(rewritten) = simplify_mul_high(dest, op, lhs, rhs, ty, lhs_zero || rhs_zero)
+            {
                 return Some(rewritten);
             }
         }
@@ -3724,6 +4463,342 @@ const BINARY_INTRINSICS: &[(&str, IntrinsicOp)] = &[
     ("copysignf", IntrinsicOp::CopysignF32),
 ];
 
+thread_local! {
+    /// C's default `-fmath-errno` (GCC 16.2 and Clang 23.1.3 on glibc, whose
+    /// `math_errhandling` includes `MATH_ERRNO`): `sqrt` of a negative operand
+    /// must set `errno = EDOM`, which the bare instruction cannot do.  Cleared by
+    /// `-fno-math-errno` / `-ffast-math`; set once per compilation by
+    /// `run_passes` on the compiling thread (passes never leave it), so
+    /// concurrent compilations -- and unit tests -- cannot observe each other.
+    static MATH_ERRNO: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+pub(crate) fn set_math_errno(enabled: bool) {
+    MATH_ERRNO.with(|m| m.set(enabled));
+}
+
+fn math_errno() -> bool {
+    MATH_ERRNO.with(std::cell::Cell::get)
+}
+
+/// `sqrt`/`sqrtf` under `-fmath-errno` (O2+): keep the instruction for every
+/// operand that cannot raise a domain error and call the library only for
+/// the one that does -- GCC's and Clang's shape:
+///
+/// ```text
+///   B:  r_fast = SqrtF64 x ; neg = r_fast != r_fast ; br neg, S, J
+///   S:  r_slow = call sqrt(x)        ; assume_library = false: never refolded
+///   J:  r = phi [r_fast, B], [r_slow, S] ; rest of B ; B's terminator
+/// ```
+///
+/// The instruction returns the correctly rounded result (and FE_INVALID)
+/// for every operand, and NaN exactly for C17 7.12.7.5's domain error
+/// (`x < 0`; `-0` and `+inf` raise none) or a NaN operand, for which the
+/// library call is a harmless no-op on errno.  A constant operand folds
+/// the compare and the slow block dies.  The slow
+/// block is appended after the function body, off the fall-through path,
+/// and its call carries `CallInfo::cold`, so the x86-64 allocator keeps FP
+/// values live across it in XMM registers (saved around the call only).
+/// Operands proven never `< 0` (sum of squares, `fabs`, ...) skip the
+/// guard entirely: [`unguard_provably_nonnegative_sqrt`].
+pub fn guard_errno_sqrt_calls(module: &mut IrModule) {
+    if !math_errno() {
+        return;
+    }
+    for func in &mut module.functions {
+        unguard_provably_nonnegative_sqrt(func);
+        let mut bi = 0;
+        while bi < func.blocks.len() {
+            let found = func.blocks[bi].instructions.iter().position(|inst| {
+                matches!(inst, Instruction::Call { func: callee, info }
+                    if info.assume_library
+                        && info.dest.is_some()
+                        && info.args.len() == 1
+                        && matches!(callee.as_str(), "sqrt" | "sqrtf"))
+            });
+            match found {
+                Some(at) => split_errno_sqrt(func, bi, at),
+                None => bi += 1,
+            }
+        }
+    }
+}
+
+/// Fold `sqrt(x)` straight to the instruction when `x < 0` is impossible --
+/// no domain error, so no guard (GCC's frange proof; the dominant real-world
+/// operand, a sum of squares, then vectorizes like any arithmetic).
+fn unguard_provably_nonnegative_sqrt(func: &mut IrFunction) {
+    let mut defs: crate::common::fx_hash::FxHashMap<u32, Instruction> =
+        crate::common::fx_hash::FxHashMap::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                defs.insert(d.0, inst.clone());
+            }
+        }
+    }
+    for block in &mut func.blocks {
+        for inst in &mut block.instructions {
+            let Instruction::Call { func: callee, info } = inst else {
+                continue;
+            };
+            let op = match callee.as_str() {
+                "sqrt" => IntrinsicOp::SqrtF64,
+                "sqrtf" => IntrinsicOp::SqrtF32,
+                _ => continue,
+            };
+            if !info.assume_library || info.dest.is_none() || info.args.len() != 1 {
+                continue;
+            }
+            let mut visiting = Vec::new();
+            if never_below_zero(&defs, info.args[0], &mut visiting, 0) {
+                *inst = Instruction::Intrinsic {
+                    dest: info.dest,
+                    op,
+                    dest_ptr: None,
+                    args: vec![info.args[0]],
+                };
+            }
+        }
+    }
+}
+
+/// Conservative proof that the floating-point value `op` is never `< 0`
+/// (it may be `-0`, `+0`, positive, `+inf` or NaN).  IEEE 754 facts used:
+/// `a*a` is `+0`, positive, `+inf` or NaN; a sum or product of such values
+/// is again never `< 0` (`+0 * -0 = -0`, `-0 + -0 = -0`, `inf * 0 = NaN`);
+/// `fabs`/`sqrt` results, unsigned-integer conversions and FP width changes
+/// (rounding preserves the sign) keep the property.  Division is excluded:
+/// `1 / -0 = -inf`.  Phis need every incoming value; a cycle fails closed.
+fn never_below_zero(
+    defs: &crate::common::fx_hash::FxHashMap<u32, Instruction>,
+    op: Operand,
+    visiting: &mut Vec<u32>,
+    depth: u32,
+) -> bool {
+    const MAX_DEPTH: u32 = 16;
+    let v = match op {
+        Operand::Const(IrConst::F64(c)) => return c >= 0.0 || c.is_nan(),
+        Operand::Const(IrConst::F32(c)) => return c >= 0.0 || c.is_nan(),
+        Operand::Const(_) => return false,
+        Operand::Value(v) => v,
+    };
+    if depth > MAX_DEPTH || visiting.contains(&v.0) {
+        return false;
+    }
+    let Some(inst) = defs.get(&v.0) else {
+        return false;
+    };
+    let is_fp = |ty: &IrType| matches!(ty, IrType::F32 | IrType::F64);
+    visiting.push(v.0);
+    let mut sub = |o: Operand| never_below_zero(defs, o, visiting, depth + 1);
+    let proven = match inst {
+        Instruction::Copy { src, .. } => sub(*src),
+        Instruction::BinOp {
+            op: IrBinOp::Mul,
+            lhs,
+            rhs,
+            ty,
+            ..
+        } if is_fp(ty) => lhs == rhs || (sub(*lhs) && sub(*rhs)),
+        Instruction::BinOp {
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty,
+            ..
+        } if is_fp(ty) => sub(*lhs) && sub(*rhs),
+        Instruction::Intrinsic {
+            op:
+                IntrinsicOp::SqrtF64
+                | IntrinsicOp::SqrtF32
+                | IntrinsicOp::FabsF64
+                | IntrinsicOp::FabsF32,
+            ..
+        } => true,
+        Instruction::Call { func, info }
+            if info.assume_library && matches!(func.as_str(), "fabs" | "fabsf") =>
+        {
+            true
+        }
+        Instruction::Cast {
+            src,
+            from_ty,
+            to_ty,
+            ..
+        } if is_fp(to_ty) => {
+            if is_fp(from_ty) {
+                sub(*src)
+            } else {
+                matches!(
+                    from_ty,
+                    IrType::U8 | IrType::U16 | IrType::U32 | IrType::U64
+                )
+            }
+        }
+        Instruction::Select {
+            true_val,
+            false_val,
+            ..
+        } => sub(*true_val) && sub(*false_val),
+        Instruction::Phi { incoming, .. } => incoming.iter().all(|(o, _)| sub(*o)),
+        _ => false,
+    };
+    visiting.pop();
+    proven
+}
+
+fn split_errno_sqrt(func: &mut IrFunction, bi: usize, at: usize) {
+    use crate::ir::reexports::{BasicBlock, BlockId};
+    // The guard located a result-producing call at `at`; re-check here,
+    // BEFORE any mutation, so a stale index leaves the function untouched
+    // instead of aborting the compiler.
+    let Some(block) = func.blocks.get(bi) else {
+        return;
+    };
+    let call_at = matches!(
+        block.instructions.get(at),
+        Some(Instruction::Call { info, .. }) if info.dest.is_some() && !info.args.is_empty()
+    );
+    let spans_parallel =
+        block.source_spans.is_empty() || block.source_spans.len() == block.instructions.len();
+    if !call_at || !spans_parallel {
+        return;
+    }
+    let live_max = func.blocks.iter().map(|b| b.label.0).max().unwrap_or(0);
+    let base = func.next_label.max(live_max.saturating_add(1));
+    func.next_label = base.saturating_add(2);
+    let (slow_label, join_label) = (BlockId(base), BlockId(base.saturating_add(1)));
+    let mut fresh = || {
+        let v = Value(func.next_value_id);
+        func.next_value_id += 1;
+        v
+    };
+    let (r_fast, r_slow, neg) = (fresh(), fresh(), fresh());
+
+    let block = &mut func.blocks[bi];
+    let b_label = block.label;
+    let rest = block.instructions.split_off(at + 1);
+    // Both shapes were checked on entry; the `else` arms only keep this
+    // total (they restore the block exactly).
+    let (callee, mut info, dest) = match block.instructions.pop() {
+        Some(Instruction::Call {
+            func: callee,
+            mut info,
+        }) => match info.dest.replace(r_slow) {
+            Some(dest) => (callee, info, dest),
+            None => {
+                info.dest = None;
+                block
+                    .instructions
+                    .push(Instruction::Call { func: callee, info });
+                block.instructions.extend(rest);
+                return;
+            }
+        },
+        other => {
+            block.instructions.extend(other);
+            block.instructions.extend(rest);
+            return;
+        }
+    };
+    let spans = if block.source_spans.is_empty() {
+        None
+    } else {
+        let rest_spans = block.source_spans.split_off(at + 1);
+        block
+            .source_spans
+            .pop()
+            .map(|call_span| (call_span, rest_spans))
+    };
+    let (ty, op) = if callee == "sqrtf" {
+        (IrType::F32, IntrinsicOp::SqrtF32)
+    } else {
+        (IrType::F64, IntrinsicOp::SqrtF64)
+    };
+    let x = info.args[0];
+    info.assume_library = false;
+    info.cold = true;
+    block.instructions.push(Instruction::Intrinsic {
+        dest: Some(r_fast),
+        op,
+        dest_ptr: None,
+        args: vec![x],
+    });
+    // `r_fast` is NaN exactly when `x < 0` or `x` is NaN: testing the result
+    // needs no 0.0 constant in the loop (x86: `ucomis r,r; jp`).  A NaN
+    // operand then also takes the call, which returns the same NaN and
+    // leaves errno alone (Clang's condition; GCC tests `x < 0`).  GCC's
+    // operand test was built and measured (2026-10-20): x86-64 still copies
+    // `x` out of %xmm0 (the expression scratch) and the result still needs
+    // its own register, so it only adds the 0.0 materialisation
+    // (`xorpd`) to the hot path; its earlier branch resolution pays off
+    // only on a misprediction, which a domain error is not.
+    block.instructions.push(Instruction::Cmp {
+        dest: neg,
+        op: IrCmpOp::Ne,
+        lhs: Operand::Value(r_fast),
+        rhs: Operand::Value(r_fast),
+        ty,
+    });
+    let old_term = std::mem::replace(
+        &mut block.terminator,
+        Terminator::CondBranch {
+            cond: Operand::Value(neg),
+            true_label: slow_label,
+            false_label: join_label,
+        },
+    );
+    let mut join_insts = vec![Instruction::Phi {
+        dest,
+        ty,
+        incoming: vec![
+            (Operand::Value(r_fast), b_label),
+            (Operand::Value(r_slow), slow_label),
+        ],
+    }];
+    join_insts.extend(rest);
+    // Debug spans stay parallel to the instructions: every new instruction
+    // takes the call's span.
+    let (slow_spans, join_spans) = match spans {
+        Some((span, rest_spans)) => {
+            block.source_spans.extend([span, span]);
+            (
+                vec![span],
+                std::iter::once(span).chain(rest_spans).collect(),
+            )
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    // B's old successors now come from J.
+    for other in &mut func.blocks {
+        for inst in &mut other.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                for (_, label) in incoming.iter_mut() {
+                    if *label == b_label {
+                        *label = join_label;
+                    }
+                }
+            }
+        }
+    }
+    func.blocks.insert(
+        bi + 1,
+        BasicBlock {
+            label: join_label,
+            instructions: join_insts,
+            terminator: old_term,
+            source_spans: join_spans,
+        },
+    );
+    func.blocks.push(BasicBlock {
+        label: slow_label,
+        instructions: vec![Instruction::Call { func: callee, info }],
+        terminator: Terminator::Branch(join_label),
+        source_spans: slow_spans,
+    });
+}
+
 /// Whether the compilation target has FMA3 (set once by run_passes from the
 /// target + -mfma flags, same pattern as vectorize::set_x86_fma_enabled).
 /// The fma/fmaf libcall fold requires it: the fused form IS the C99
@@ -3793,6 +4868,12 @@ fn simplify_math_call(
     args: &[Operand],
     return_type: IrType,
 ) -> Option<Instruction> {
+    // Under -fmath-errno a bare instruction would lose `errno = EDOM`; the
+    // O2+ pipeline builds the guarded form instead (guard_errno_sqrt_calls),
+    // and the cheap tiers keep the call, as GCC and Clang do at -O0.
+    if math_errno() && matches!(func, "sqrt" | "sqrtf") {
+        return None;
+    }
     // Check unary intrinsic table first (sqrt, sqrtf, fabs, fabsf).
     for &(name, intrinsic_op) in UNARY_INTRINSICS {
         if func == name {
@@ -4066,6 +5147,7 @@ mod tests {
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
+                cold: false,
             },
         }
     }
@@ -4130,6 +5212,197 @@ mod tests {
             &unary_defs,
         );
         assert!(matches!(r3, Some(Operand::Value(v)) if v.0 == 4));
+    }
+
+    /// `v2 = Clz(v1); v3 = K op v2` over a U32 `v1`; zero-value replacement
+    /// of `select(cond, v3, c)`.
+    fn zero_value_case(
+        unary: IrUnaryOp,
+        op: IrBinOp,
+        k: i32,
+        cond: u32,
+        c: IrConst,
+        cast_defs: &[Option<CastDef>],
+    ) -> Option<Operand> {
+        let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; 8];
+        unary_defs[2] = Some(UnaryDef {
+            op: unary,
+            src: Operand::Value(Value(1)),
+            ty: IrType::U32,
+        });
+        let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; 8];
+        binop_defs[3] = Some(BinOpDef {
+            op,
+            lhs: Operand::Const(IrConst::I32(k)),
+            rhs: Operand::Value(Value(2)),
+            ty: IrType::I32,
+        });
+        zero_value_replacement(
+            &Operand::Value(Value(cond)),
+            &Operand::Value(Value(3)),
+            &Operand::Const(c),
+            IrType::I32,
+            cast_defs,
+            &unary_defs,
+            &binop_defs,
+        )
+    }
+
+    #[test]
+    fn test_zero_value_replacement_collapses_highbit_and_fls() {
+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 8];
+        // v5 = same-size cast of v1 (zero-ness preserved), v6 = truncation
+        // of a wider v7 (zero-ness NOT preserved).
+        cast_defs[5] = Some(CastDef {
+            src: Operand::Value(Value(1)),
+            from_ty: IrType::U32,
+            to_ty: IrType::I32,
+        });
+        cast_defs[6] = Some(CastDef {
+            src: Operand::Value(Value(7)),
+            from_ty: IrType::I64,
+            to_ty: IrType::U32,
+        });
+        let hit = Some(Operand::Value(Value(3)));
+        use IrBinOp::{Add, Sub, Xor};
+        use IrUnaryOp::{Clz, ClzNonZero, Ctz};
+        // x ? 31 - clz(x) : -1 — the -1 may be typed wider than the select.
+        assert_eq!(
+            zero_value_case(Clz, Sub, 31, 1, IrConst::I64(-1), &cast_defs),
+            hit
+        );
+        assert_eq!(
+            zero_value_case(Clz, Sub, 31, 1, IrConst::I32(-1), &cast_defs),
+            hit
+        );
+        assert_eq!(
+            zero_value_case(Clz, Sub, 31, 5, IrConst::I32(-1), &cast_defs),
+            hit
+        );
+        // x ? 32 - clz(x) : 0 (fls), x ? 1 + ctz(x) : 33.
+        assert_eq!(
+            zero_value_case(Clz, Sub, 32, 1, IrConst::I32(0), &cast_defs),
+            hit
+        );
+        // 31 ^ clz(0) is 31 ^ 32 = 63: collapses against 63, never -1.
+        assert_eq!(
+            zero_value_case(Clz, Xor, 31, 1, IrConst::I32(63), &cast_defs),
+            hit
+        );
+        assert_eq!(
+            zero_value_case(Clz, Xor, 31, 1, IrConst::I64(-1), &cast_defs),
+            None
+        );
+        assert_eq!(
+            zero_value_case(Ctz, Add, 1, 1, IrConst::I32(33), &cast_defs),
+            hit
+        );
+        // Wrong zero value, NonZero intrinsic, truncated condition, and a
+        // condition unrelated to the intrinsic's operand all refuse.
+        assert_eq!(
+            zero_value_case(Clz, Sub, 31, 1, IrConst::I32(0), &cast_defs),
+            None
+        );
+        // 31 - ctz(0) == -1 as well, but never 0.
+        assert_eq!(
+            zero_value_case(Ctz, Sub, 31, 1, IrConst::I32(-1), &cast_defs),
+            hit
+        );
+        assert_eq!(
+            zero_value_case(Ctz, Sub, 31, 1, IrConst::I32(0), &cast_defs),
+            None
+        );
+        assert_eq!(
+            zero_value_case(ClzNonZero, Sub, 31, 1, IrConst::I32(-1), &cast_defs),
+            None
+        );
+        assert_eq!(
+            zero_value_case(Clz, Sub, 31, 6, IrConst::I32(-1), &cast_defs),
+            None
+        );
+        assert_eq!(
+            zero_value_case(Clz, Sub, 31, 4, IrConst::I32(-1), &cast_defs),
+            None
+        );
+    }
+
+    #[test]
+    fn test_eval_at_zero_is_width_exact() {
+        // v1: U32 x; v2 = sext(i32 -1 const via binop) ... build directly:
+        // v3 = LShr(I32 v2, 1) where v2 = Sub(I32 0, 1) = 0xFFFF_FFFF.
+        let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; 8];
+        binop_defs[2] = Some(BinOpDef {
+            op: IrBinOp::Sub,
+            lhs: Operand::Value(Value(1)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        });
+        binop_defs[3] = Some(BinOpDef {
+            op: IrBinOp::LShr,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        });
+        binop_defs[4] = Some(BinOpDef {
+            op: IrBinOp::AShr,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Const(IrConst::I32(4)),
+            ty: IrType::I32,
+        });
+        binop_defs[5] = Some(BinOpDef {
+            op: IrBinOp::Shl,
+            lhs: Operand::Value(Value(2)),
+            rhs: Operand::Const(IrConst::I32(32)),
+            ty: IrType::I32,
+        });
+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 8];
+        cast_defs[6] = Some(CastDef {
+            src: Operand::Value(Value(2)),
+            from_ty: IrType::I32,
+            to_ty: IrType::I64,
+        });
+        cast_defs[7] = Some(CastDef {
+            src: Operand::Value(Value(2)),
+            from_ty: IrType::U32,
+            to_ty: IrType::I64,
+        });
+        let unary_defs: Vec<Option<UnaryDef>> = vec![None; 8];
+        let x = Operand::Value(Value(1));
+        let ev = |v: u32, ty: IrType| {
+            let mut budget = 16;
+            eval_at_zero(
+                Operand::Value(Value(v)),
+                ty,
+                x,
+                &cast_defs,
+                &unary_defs,
+                &binop_defs,
+                &mut budget,
+            )
+        };
+        assert_eq!(ev(2, IrType::I32), Some(0xFFFF_FFFF));
+        // A 64-bit container would give 0x7FFF_FFFF_FFFF_FFFF here.
+        assert_eq!(ev(3, IrType::I32), Some(0x7FFF_FFFF));
+        assert_eq!(ev(4, IrType::I32), Some(0xFFFF_FFFF));
+        // Shift by the full width is not modelled.
+        assert_eq!(ev(5, IrType::I32), None);
+        // Signed source sign-extends, unsigned zero-extends.
+        assert_eq!(ev(6, IrType::I64), Some(u64::MAX as u128));
+        assert_eq!(ev(7, IrType::I64), Some(0xFFFF_FFFF));
+        // Unknown values refuse.
+        let mut budget = 16;
+        assert_eq!(
+            eval_at_zero(
+                Operand::Value(Value(9)),
+                IrType::I32,
+                x,
+                &cast_defs,
+                &unary_defs,
+                &binop_defs,
+                &mut budget
+            ),
+            None
+        );
     }
 
     #[test]
@@ -4734,6 +6007,9 @@ mod tests {
     #[test]
     fn test_sqrt_to_intrinsic() {
         let inst = make_call("sqrt", vec![Operand::Value(Value(1))], IrType::F64);
+        // -fmath-errno (the default): the call stays for the errno guard.
+        assert!(simplify_default(&inst).is_none());
+        set_math_errno(false);
         let result = simplify_default(&inst).unwrap();
         match result {
             Instruction::Intrinsic {
@@ -4750,6 +6026,8 @@ mod tests {
     #[test]
     fn test_sqrtf_to_intrinsic() {
         let inst = make_call("sqrtf", vec![Operand::Value(Value(1))], IrType::F32);
+        assert!(simplify_default(&inst).is_none());
+        set_math_errno(false);
         let result = simplify_default(&inst).unwrap();
         match result {
             Instruction::Intrinsic {
@@ -4926,6 +6204,8 @@ mod tests {
     /// function has no known semantics and is never rewritten.
     #[test]
     fn withdrawn_math_calls_are_not_folded() {
+        // sqrt folds only without errno semantics (thread-local flag).
+        set_math_errno(false);
         for (name, args) in [
             ("sqrt", vec![Operand::Value(Value(1))]),
             ("fabs", vec![Operand::Value(Value(1))]),
@@ -6634,6 +7914,164 @@ mod tests {
         }
     }
 
+    /// `x /s -1` is `-x` and `x %s -1` is 0 at every integer width (the
+    /// INT_MIN quotient overflow is undefined); unsigned division by
+    /// all-ones is NOT a negation and must stay untouched here, and so must
+    /// float division.
+    #[test]
+    fn signed_div_rem_by_minus_one() {
+        for ty in [
+            IrType::I8,
+            IrType::I16,
+            IrType::I32,
+            IrType::I64,
+            IrType::I128,
+        ] {
+            let minus_one = if ty.is_128bit() {
+                IrConst::I128(-1)
+            } else {
+                IrConst::from_i64(-1, ty)
+            };
+            let run = |op| {
+                simplify_binop(
+                    Value(4),
+                    op,
+                    &Operand::Value(Value(1)),
+                    &Operand::Const(minus_one),
+                    ty,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )
+            };
+            assert!(
+                matches!(
+                    run(IrBinOp::SDiv),
+                    Some(Instruction::UnaryOp { op: IrUnaryOp::Neg, src: Operand::Value(Value(1)), ty: t, .. }) if t == ty
+                ),
+                "{ty:?}"
+            );
+            assert!(
+                matches!(run(IrBinOp::SRem), Some(Instruction::Copy { src: Operand::Const(ref z), .. }) if z.is_zero()),
+                "{ty:?}"
+            );
+            assert!(
+                !matches!(run(IrBinOp::UDiv), Some(Instruction::UnaryOp { .. })),
+                "{ty:?}"
+            );
+        }
+        let fdiv = simplify_binop(
+            Value(4),
+            IrBinOp::SDiv,
+            &Operand::Value(Value(1)),
+            &Operand::Const(IrConst::F64(-1.0)),
+            IrType::F64,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            !matches!(fdiv, Some(Instruction::UnaryOp { .. })),
+            "{fdiv:?}"
+        );
+    }
+
+    /// a shift or a constant; evaluating the rewrite must give the high half
+    /// of the 128-bit product for every source, signed and unsigned.  Signed
+    /// 2^63 is negative as an I64 operand, so it must NOT become a shift.
+    #[test]
+    fn mul_high_power_of_two_rewrites_are_exact() {
+        let sources = [
+            0i64,
+            1,
+            -1,
+            2,
+            7,
+            i64::MAX,
+            i64::MIN,
+            0x0123_4567_89AB_CDEF,
+            -12345,
+        ];
+        for (op, ty) in [
+            (IrBinOp::UMulHigh, IrType::U64),
+            (IrBinOp::SMulHigh, IrType::I64),
+        ] {
+            let signed = op == IrBinOp::SMulHigh;
+            for k in 0..64u32 {
+                let c = (1u64 << k) as i64;
+                for const_lhs in [false, true] {
+                    let (lhs, rhs) = if const_lhs {
+                        (Operand::Const(IrConst::I64(c)), Operand::Value(Value(1)))
+                    } else {
+                        (Operand::Value(Value(1)), Operand::Const(IrConst::I64(c)))
+                    };
+                    let got = simplify_binop(Value(4), op, &lhs, &rhs, ty, &[], &[], &[], &[]);
+                    if signed && k == 63 {
+                        assert!(got.is_none(), "SMulHigh by i64::MIN rewritten: {got:?}");
+                        continue;
+                    }
+                    let got = got.unwrap_or_else(|| panic!("{op:?} by 2^{k} not rewritten"));
+                    for x in sources {
+                        let value = match &got {
+                            Instruction::Copy {
+                                src: Operand::Const(z),
+                                ..
+                            } => z.to_i64().unwrap(),
+                            Instruction::BinOp {
+                                op: shift_op @ (IrBinOp::LShr | IrBinOp::AShr),
+                                lhs: Operand::Value(Value(1)),
+                                rhs: Operand::Const(n),
+                                ty: shift_ty,
+                                ..
+                            } if *shift_ty == ty => {
+                                assert_eq!(*shift_op == IrBinOp::AShr, signed);
+                                shift_op.eval_i64(x, n.to_i64().unwrap()).unwrap()
+                            }
+                            other => panic!("unexpected {op:?} rewrite {other:?}"),
+                        };
+                        assert_eq!(
+                            value,
+                            op.eval_i64(x, c).unwrap(),
+                            "{op:?}({x:#x}, 2^{k}) via {got:?}"
+                        );
+                    }
+                }
+            }
+            // Non-powers stay multiplies; a zero operand is zero.
+            assert!(
+                simplify_binop(
+                    Value(4),
+                    op,
+                    &Operand::Value(Value(1)),
+                    &Operand::Const(IrConst::I64(5)),
+                    ty,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                )
+                .is_none()
+            );
+            let zero = simplify_binop(
+                Value(4),
+                op,
+                &Operand::Value(Value(1)),
+                &Operand::Const(IrConst::zero(ty)),
+                ty,
+                &[],
+                &[],
+                &[],
+                &[],
+            );
+            assert!(
+                matches!(zero, Some(Instruction::Copy { src: Operand::Const(ref z), .. }) if z.is_zero()),
+                "{op:?} by zero: {zero:?}"
+            );
+        }
+    }
+
     /// A constant `Bzhi` index becomes a copy, a zero or an `and`; evaluating
     /// the rewrite must give the instruction's result (Intel SDM BZHI: index
     /// bits 7:0, the source unchanged from the width on) for every source.
@@ -7077,6 +8515,178 @@ mod tests {
             }
         }
     }
+
+    // === -fmath-errno sqrt guard ===
+
+    use crate::ir::reexports::{BasicBlock, BlockId};
+
+    fn errno_fn(pre: Vec<Instruction>, callee: &str, arg: Operand) -> IrModule {
+        let ty = if callee == "sqrtf" {
+            IrType::F32
+        } else {
+            IrType::F64
+        };
+        let mut call = make_call(callee, vec![arg], ty);
+        if let Instruction::Call { info, .. } = &mut call {
+            info.arg_types = vec![ty];
+            info.num_fixed_args = 1;
+        }
+        let mut instructions = pre;
+        instructions.push(call);
+        let spans = vec![crate::common::source::Span::dummy(); instructions.len()];
+        let mut func = IrFunction::new("f".to_string(), ty, vec![], false);
+        func.next_value_id = 64;
+        func.next_label = 1;
+        func.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(Some(Operand::Value(Value(10)))),
+            source_spans: spans,
+        }];
+        let mut module = IrModule::new();
+        module.functions.push(func);
+        module
+    }
+
+    fn fbin(dest: u32, op: IrBinOp, lhs: Operand, rhs: Operand) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op,
+            lhs,
+            rhs,
+            ty: IrType::F64,
+        }
+    }
+
+    fn v(id: u32) -> Operand {
+        Operand::Value(Value(id))
+    }
+
+    fn library_sqrt_calls(module: &IrModule) -> Vec<CallInfo> {
+        module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|inst| match inst {
+                Instruction::Call { func, info } if func.starts_with("sqrt") => Some(info.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An operand that may be negative keeps the library call on a cold
+    /// slow path: fast instruction + `r != r` (NaN) test + call + phi.
+    #[test]
+    fn errno_guard_splits_unprovable_sqrt() {
+        for callee in ["sqrt", "sqrtf"] {
+            let mut module = errno_fn(vec![], callee, v(1));
+            guard_errno_sqrt_calls(&mut module);
+            let func = &module.functions[0];
+            assert_eq!(func.blocks.len(), 3, "{callee}: B, J and the slow block S");
+            let calls = library_sqrt_calls(&module);
+            assert_eq!(calls.len(), 1, "{callee}");
+            assert!(!calls[0].assume_library, "slow call must never be refolded");
+            assert!(calls[0].cold, "slow call carries the cold-path hint");
+            let all: Vec<&Instruction> = func.blocks.iter().flat_map(|b| &b.instructions).collect();
+            assert!(all.iter().any(|i| matches!(
+                i,
+                Instruction::Intrinsic {
+                    op: IntrinsicOp::SqrtF64 | IntrinsicOp::SqrtF32,
+                    ..
+                }
+            )));
+            assert!(all.iter().any(|i| matches!(
+                i,
+                Instruction::Cmp { op: IrCmpOp::Ne, lhs, rhs, .. } if lhs == rhs
+            )));
+            assert!(all.iter().any(|i| matches!(i, Instruction::Phi { .. })));
+            for b in &func.blocks {
+                assert_eq!(
+                    b.instructions.len(),
+                    b.source_spans.len(),
+                    "spans stay parallel"
+                );
+            }
+        }
+    }
+
+    /// `-fno-math-errno`: no guard; the plain call is left for the O2 fold.
+    #[test]
+    fn errno_guard_is_inert_without_math_errno() {
+        set_math_errno(false);
+        let mut module = errno_fn(vec![], "sqrt", v(1));
+        guard_errno_sqrt_calls(&mut module);
+        assert_eq!(module.functions[0].blocks.len(), 1);
+        let calls = library_sqrt_calls(&module);
+        assert!(calls.len() == 1 && calls[0].assume_library && !calls[0].cold);
+    }
+
+    /// `x*x + y*y` (and `fabs`, unsigned conversions, widening) can never be
+    /// `< 0`: the call becomes the bare instruction with no CFG change.
+    #[test]
+    fn errno_guard_elides_provably_nonnegative_operands() {
+        let sum_of_squares = vec![
+            fbin(2, IrBinOp::Mul, v(1), v(1)),
+            fbin(3, IrBinOp::Mul, v(4), v(4)),
+            fbin(5, IrBinOp::Add, v(2), v(3)),
+            fbin(6, IrBinOp::Mul, v(5), Operand::Const(IrConst::F64(0.5))),
+        ];
+        let unsigned = vec![Instruction::Cast {
+            dest: Value(6),
+            src: v(1),
+            from_ty: IrType::U32,
+            to_ty: IrType::F64,
+        }];
+        for (pre, arg) in [(sum_of_squares, v(6)), (unsigned, v(6))] {
+            let mut module = errno_fn(pre, "sqrt", arg);
+            guard_errno_sqrt_calls(&mut module);
+            assert_eq!(module.functions[0].blocks.len(), 1);
+            assert!(library_sqrt_calls(&module).is_empty());
+            assert!(matches!(
+                module.functions[0].blocks[0].instructions.last(),
+                Some(Instruction::Intrinsic {
+                    op: IntrinsicOp::SqrtF64,
+                    ..
+                })
+            ));
+        }
+    }
+
+    /// Division (`1 / -0 = -inf`), subtraction, a negative constant factor
+    /// and a value-cycle phi are not proofs: the guard stays.
+    #[test]
+    fn errno_guard_keeps_unproven_operands() {
+        let cases = vec![
+            vec![
+                fbin(2, IrBinOp::Mul, v(1), v(1)),
+                fbin(6, IrBinOp::SDiv, v(2), v(2)),
+            ],
+            vec![
+                fbin(2, IrBinOp::Mul, v(1), v(1)),
+                fbin(6, IrBinOp::Sub, v(2), v(2)),
+            ],
+            vec![fbin(
+                6,
+                IrBinOp::Mul,
+                v(1),
+                Operand::Const(IrConst::F64(-1.0)),
+            )],
+            vec![Instruction::Phi {
+                dest: Value(6),
+                ty: IrType::F64,
+                incoming: vec![
+                    (v(6), BlockId(0)),
+                    (Operand::Const(IrConst::F64(1.0)), BlockId(0)),
+                ],
+            }],
+        ];
+        for pre in cases {
+            let mut module = errno_fn(pre, "sqrt", v(6));
+            guard_errno_sqrt_calls(&mut module);
+            assert_eq!(module.functions[0].blocks.len(), 3);
+            assert_eq!(library_sqrt_calls(&module).len(), 1);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7427,5 +9037,637 @@ mod exact_product_half_tests {
                 other => panic!("unexpected folded instruction: {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod highbit_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+
+    /// `ret K - (int)count(x)` with `count = op(x)` at `cty`.
+    fn highbit_fn(op: IrUnaryOp, cty: IrType, k: i64) -> IrFunction {
+        let mut f = IrFunction::new("f".into(), IrType::I32, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::UnaryOp {
+                    dest: Value(1),
+                    op,
+                    src: Operand::Value(Value(0)),
+                    ty: cty,
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: cty,
+                    to_ty: IrType::I32,
+                },
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Sub,
+                    lhs: Operand::Const(IrConst::I32(k as i32)),
+                    rhs: Operand::Value(Value(2)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        });
+        f.next_value_id = 4;
+        f
+    }
+
+    fn last_op(f: &IrFunction) -> Option<(IrBinOp, Operand, Operand)> {
+        match f.blocks[0].instructions.last() {
+            Some(Instruction::BinOp { op, lhs, rhs, .. }) => Some((*op, *lhs, *rhs)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn highest_set_bit_subtraction_becomes_xor() {
+        for (cty, k) in [(IrType::U32, 31), (IrType::U64, 63), (IrType::I32, 31)] {
+            let mut f = highbit_fn(IrUnaryOp::ClzNonZero, cty, k);
+            assert_eq!(remove_redundant_bitop_guards(&mut f), 1, "{cty:?}");
+            assert_eq!(
+                last_op(&f),
+                Some((
+                    IrBinOp::Xor,
+                    Operand::Value(Value(2)),
+                    Operand::Const(IrConst::I32(k as i32))
+                ))
+            );
+            // Exhaustive over the count's range: K - c == K ^ c.
+            for c in 0..=k {
+                assert_eq!(k - c, k ^ c);
+            }
+        }
+    }
+
+    #[test]
+    fn highbit_rewrite_requires_nonzero_clz_and_its_exact_width() {
+        // Defined-zero Clz reaches W: W-1 - W = -1 but (W-1) ^ W = 2W-1.
+        let mut f = highbit_fn(IrUnaryOp::Clz, IrType::U32, 31);
+        assert_eq!(remove_redundant_bitop_guards(&mut f), 0);
+        // 63 - clz32 equals 63 ^ c as well (any all-ones K covering the
+        // count's bits does), but only K == W-1 cancels against BSR's own
+        // XOR, so the rule stays on the idiom; 32 is not all ones.
+        let mut f = highbit_fn(IrUnaryOp::ClzNonZero, IrType::U32, 63);
+        assert_eq!(remove_redundant_bitop_guards(&mut f), 0);
+        let mut f = highbit_fn(IrUnaryOp::ClzNonZero, IrType::U32, 32);
+        assert_eq!(remove_redundant_bitop_guards(&mut f), 0);
+        let mut f = highbit_fn(IrUnaryOp::CtzNonZero, IrType::U32, 31);
+        assert_eq!(remove_redundant_bitop_guards(&mut f), 0);
+        assert_eq!(last_op(&f).map(|t| t.0), Some(IrBinOp::Sub));
+    }
+
+    /// `ret x ? count_nz(x) : zero_case`, optionally with a second reader.
+    fn guard_fn(op: IrUnaryOp, zero_case: i64, extra_reader: bool) -> IrFunction {
+        let mut f = IrFunction::new("g".into(), IrType::U32, vec![], false);
+        let mut instructions = vec![
+            Instruction::UnaryOp {
+                dest: Value(1),
+                op,
+                src: Operand::Value(Value(0)),
+                ty: IrType::U32,
+            },
+            Instruction::Select {
+                dest: Value(2),
+                cond: Operand::Value(Value(0)),
+                true_val: Operand::Value(Value(1)),
+                false_val: Operand::Const(IrConst::I32(zero_case as i32)),
+                ty: IrType::U32,
+            },
+        ];
+        if extra_reader {
+            instructions.push(Instruction::BinOp {
+                dest: Value(3),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(1)),
+                rhs: Operand::Value(Value(2)),
+                ty: IrType::U32,
+            });
+        }
+        let ret = if extra_reader { 3 } else { 2 };
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(Some(Operand::Value(Value(ret)))),
+            source_spans: Vec::new(),
+        });
+        f.next_value_id = 4;
+        f
+    }
+
+    fn count_op(f: &IrFunction) -> IrUnaryOp {
+        match &f.blocks[0].instructions[0] {
+            Instruction::UnaryOp { op, .. } => *op,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `x ? __builtin_ctz(x) : 32` (and `_tzcnt_u32`): the NonZero count is
+    /// refined to the defined one and the guard collapses onto it.
+    #[test]
+    fn sole_reader_guard_refines_the_nonzero_count() {
+        for (nz, defined) in [
+            (IrUnaryOp::CtzNonZero, IrUnaryOp::Ctz),
+            (IrUnaryOp::ClzNonZero, IrUnaryOp::Clz),
+        ] {
+            let mut f = guard_fn(nz, 32, false);
+            assert_eq!(remove_redundant_bitop_guards(&mut f), 1);
+            assert_eq!(count_op(&f), defined);
+            assert!(matches!(
+                f.blocks[0].instructions[1],
+                Instruction::Copy {
+                    src: Operand::Value(Value(1)),
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn guard_is_kept_with_another_reader_or_a_wrong_zero_case() {
+        let mut f = guard_fn(IrUnaryOp::CtzNonZero, 32, true);
+        assert_eq!(remove_redundant_bitop_guards(&mut f), 0);
+        assert_eq!(count_op(&f), IrUnaryOp::CtzNonZero);
+        assert!(matches!(
+            f.blocks[0].instructions[1],
+            Instruction::Select { .. }
+        ));
+        let mut f = guard_fn(IrUnaryOp::CtzNonZero, 31, false);
+        assert_eq!(remove_redundant_bitop_guards(&mut f), 0);
+        assert_eq!(count_op(&f), IrUnaryOp::CtzNonZero);
+    }
+}
+
+#[cfg(test)]
+mod pack_extract_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+
+    /// The two-register carrier the call-site unpack meets after inlining:
+    /// `v5 = or(shl(ext_hi(v1), 64), ext_lo(v0))` (operands swapped when
+    /// `swap`), then `v6 = trunc_T(v5)` and `v8 = trunc_T(shr(v5, 64))`.
+    fn carrier(lo_ty: IrType, hi_ty: IrType, t: IrType, shr: IrBinOp, swap: bool) -> IrFunction {
+        carrier_in(IrType::I128, 64, lo_ty, hi_ty, t, shr, swap)
+    }
+
+    /// `carrier` in a `wide`-typed pack with shift `sh`.
+    fn carrier_in(
+        wide: IrType,
+        sh: i64,
+        lo_ty: IrType,
+        hi_ty: IrType,
+        t: IrType,
+        shr: IrBinOp,
+        swap: bool,
+    ) -> IrFunction {
+        let mut f = IrFunction::new("f".into(), t, vec![], false);
+        let (or_l, or_r) = if swap {
+            (Operand::Value(Value(3)), Operand::Value(Value(4)))
+        } else {
+            (Operand::Value(Value(4)), Operand::Value(Value(3)))
+        };
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: hi_ty,
+                    to_ty: wide,
+                },
+                Instruction::Cast {
+                    dest: Value(3),
+                    src: Operand::Value(Value(0)),
+                    from_ty: lo_ty,
+                    to_ty: wide,
+                },
+                Instruction::BinOp {
+                    dest: Value(4),
+                    op: IrBinOp::Shl,
+                    lhs: Operand::Value(Value(2)),
+                    rhs: Operand::Const(IrConst::I64(sh)),
+                    ty: wide,
+                },
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Or,
+                    lhs: or_l,
+                    rhs: or_r,
+                    ty: wide,
+                },
+                Instruction::Cast {
+                    dest: Value(6),
+                    src: Operand::Value(Value(5)),
+                    from_ty: wide,
+                    to_ty: t,
+                },
+                Instruction::BinOp {
+                    dest: Value(7),
+                    op: shr,
+                    lhs: Operand::Value(Value(5)),
+                    rhs: Operand::Const(IrConst::I64(sh)),
+                    ty: wide,
+                },
+                Instruction::Cast {
+                    dest: Value(8),
+                    src: Operand::Value(Value(7)),
+                    from_ty: wide,
+                    to_ty: t,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(8)))),
+            source_spans: Vec::new(),
+        });
+        f.next_value_id = 9;
+        f
+    }
+
+    /// The narrow (source, from_ty) the extract at `idx` now reads, if it was
+    /// folded off the carrier.
+    fn reads(f: &IrFunction, idx: usize) -> Option<(Operand, Option<IrType>)> {
+        match &f.blocks[0].instructions[idx] {
+            Instruction::Copy { src, .. } => Some((*src, None)),
+            Instruction::Cast { src, from_ty, .. }
+                if !matches!(from_ty, IrType::I128 | IrType::U128) =>
+            {
+                Some((*src, Some(*from_ty)))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn both_halves_fold_to_the_packed_scalars() {
+        for swap in [false, true] {
+            for shr in [IrBinOp::LShr, IrBinOp::AShr] {
+                let mut f = carrier(IrType::U64, IrType::U64, IrType::I64, shr, swap);
+                simplify_function(&mut f);
+                assert_eq!(
+                    reads(&f, 4),
+                    Some((Operand::Value(Value(0)), Some(IrType::U64))),
+                    "low half, swap={swap}"
+                );
+                assert_eq!(
+                    reads(&f, 6),
+                    Some((Operand::Value(Value(1)), Some(IrType::U64))),
+                    "high half, {shr:?} swap={swap}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zstd_repcodes_shape_folds_with_the_exact_width_high_store() {
+        // 12-byte {u32 x3}: the high eightbyte is a U32 member, the unpack
+        // extracts it at U32 (exact-width store).
+        let mut f = carrier(IrType::U64, IrType::U32, IrType::U32, IrBinOp::LShr, false);
+        simplify_function(&mut f);
+        assert_eq!(
+            reads(&f, 6),
+            Some((Operand::Value(Value(1)), None)),
+            "U32 -> I128 -> U32 is the member itself"
+        );
+    }
+
+    #[test]
+    fn low_half_folds_for_a_sign_extended_low_but_high_half_does_not() {
+        // A sign-extended low part can set bits 64..128, so the shifted
+        // value is no longer the high scalar; the low extract is still exact.
+        let mut f = carrier(IrType::I64, IrType::U64, IrType::I64, IrBinOp::LShr, false);
+        simplify_function(&mut f);
+        assert_eq!(
+            reads(&f, 4),
+            Some((Operand::Value(Value(0)), None)),
+            "I64 -> I128 -> I64 low half"
+        );
+        assert_eq!(reads(&f, 6), None, "high half must keep the shift");
+    }
+
+    #[test]
+    fn wrong_shift_amount_or_wide_result_is_refused() {
+        let mut f = carrier(IrType::U64, IrType::U64, IrType::I64, IrBinOp::LShr, false);
+        if let Instruction::BinOp { rhs, .. } = &mut f.blocks[0].instructions[2] {
+            *rhs = Operand::Const(IrConst::I64(63));
+        }
+        simplify_function(&mut f);
+        // shl 63 is a pack whose low part is only 63 bits wide: a 64-bit
+        // low extract would see the high scalar's bit 0, and `shr 64` does
+        // not undo `shl 63`.
+        assert_eq!(reads(&f, 4), None, "shl 63 overlaps the low word");
+        assert_eq!(reads(&f, 6), None, "shr 64 of a shl-63 pack");
+
+        let mut f = carrier(IrType::U64, IrType::U64, IrType::U128, IrBinOp::LShr, false);
+        simplify_function(&mut f);
+        assert!(
+            matches!(
+                f.blocks[0].instructions[6],
+                Instruction::Cast {
+                    from_ty: IrType::I128,
+                    ..
+                }
+            ),
+            "a 128-bit result is not a half"
+        );
+    }
+
+    #[test]
+    fn i128_packs_are_left_alone_under_the_i686_low_pair_model() {
+        let saved = crate::common::types::target_ptr_size();
+        crate::common::types::set_target_ptr_size(4);
+        let mut f = carrier(IrType::U64, IrType::U64, IrType::I64, IrBinOp::LShr, false);
+        simplify_function(&mut f);
+        crate::common::types::set_target_ptr_size(saved);
+        assert_eq!(reads(&f, 4), None);
+        assert_eq!(reads(&f, 6), None);
+        // 64-bit packs are real on i686 (register pairs) and still fold.
+        crate::common::types::set_target_ptr_size(4);
+        let mut f = carrier_in(
+            IrType::U64,
+            32,
+            IrType::U32,
+            IrType::U32,
+            IrType::U32,
+            IrBinOp::LShr,
+            false,
+        );
+        simplify_function(&mut f);
+        crate::common::types::set_target_ptr_size(saved);
+        assert_eq!(reads(&f, 4), Some((Operand::Value(Value(0)), None)));
+        assert_eq!(reads(&f, 6), Some((Operand::Value(Value(1)), None)));
+    }
+
+    /// The pack aggregate SROA's covering load builds for a `U32` view over
+    /// `{i16 c; i8 d; i8 pad}`: signed parts are masked after their sign
+    /// extension, parts are shifted to their byte offsets and or-ed.
+    #[test]
+    fn signed_masked_three_part_pack_yields_each_member() {
+        let w = IrType::U32;
+        let v = |n| Operand::Value(Value(n));
+        let k = |n| Operand::Const(IrConst::from_i64(n, w));
+        let bin = |dest, op, lhs, rhs| Instruction::BinOp {
+            dest: Value(dest),
+            op,
+            lhs,
+            rhs,
+            ty: w,
+        };
+        let cast = |dest, src, from_ty, to_ty| Instruction::Cast {
+            dest: Value(dest),
+            src: v(src),
+            from_ty,
+            to_ty,
+        };
+        let mut f = IrFunction::new("f".into(), IrType::I8, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                cast(3, 0, IrType::I16, w),            // sext c
+                bin(4, IrBinOp::And, v(3), k(0xFFFF)), // masked
+                cast(5, 1, IrType::I8, w),             // sext d
+                bin(6, IrBinOp::And, v(5), k(0xFF)),   //
+                bin(7, IrBinOp::Shl, v(6), k(16)),     // at byte 2
+                bin(8, IrBinOp::Or, v(4), v(7)),       //
+                cast(9, 2, IrType::I8, w),             // carrier byte
+                bin(10, IrBinOp::And, v(9), k(0xFF)),  //
+                bin(11, IrBinOp::Shl, v(10), k(24)),   // at byte 3
+                bin(12, IrBinOp::Or, v(8), v(11)),     // the pack
+                cast(13, 12, w, IrType::I16),          // c
+                bin(14, IrBinOp::LShr, v(12), k(16)),  //
+                cast(15, 14, w, IrType::I8),           // d
+                bin(16, IrBinOp::AShr, v(12), k(8)),   //
+                cast(17, 16, w, IrType::I16),          // bits 8..24
+            ],
+            terminator: Terminator::Return(Some(v(15))),
+            source_spans: Vec::new(),
+        });
+        f.next_value_id = 18;
+        simplify_function(&mut f);
+        assert_eq!(reads(&f, 10), Some((v(0), None)), "c = low 16 bits");
+        assert_eq!(reads(&f, 12), Some((v(1), None)), "d = bits 16..24");
+        // Bits 8..24 straddle c's high byte and d: no single source.
+        assert!(
+            matches!(
+                f.blocks[0].instructions[14],
+                Instruction::Cast {
+                    src: Operand::Value(Value(16)),
+                    ..
+                }
+            ),
+            "straddling extract must keep the shift"
+        );
+    }
+
+    #[test]
+    fn double_narrow_does_not_add_an_i128_reader() {
+        // trunc32(trunc64(v: I128)) keeps the I64 step: composing would read
+        // the I128 a second time. From an I64 source the chain still folds.
+        for (wide, folds) in [(IrType::I128, false), (IrType::I64, true)] {
+            let mid = if wide == IrType::I128 {
+                IrType::I64
+            } else {
+                IrType::I32
+            };
+            let mut f = IrFunction::new("f".into(), IrType::I16, vec![], false);
+            f.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::Cast {
+                        dest: Value(1),
+                        src: Operand::Value(Value(0)),
+                        from_ty: wide,
+                        to_ty: mid,
+                    },
+                    Instruction::Cast {
+                        dest: Value(2),
+                        src: Operand::Value(Value(1)),
+                        from_ty: mid,
+                        to_ty: IrType::I16,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+                source_spans: Vec::new(),
+            });
+            f.next_value_id = 3;
+            simplify_function(&mut f);
+            let Instruction::Cast { src, from_ty, .. } = f.blocks[0].instructions[1] else {
+                panic!("cast expected");
+            };
+            assert_eq!(src == Operand::Value(Value(0)), folds, "{wide:?}");
+            assert_eq!(from_ty == wide, folds, "{wide:?}");
+        }
+    }
+
+    #[test]
+    fn sign_variant_chain_links_still_fold() {
+        // Cast(Cast(x: U32, U32->I64), U64->I16): I64 and U64 are the same
+        // bits, so the widen-then-narrow chain folds to Cast(x, U32->I16).
+        let mut f = IrFunction::new("f".into(), IrType::I16, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::I64,
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U64,
+                    to_ty: IrType::I16,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
+        });
+        f.next_value_id = 3;
+        simplify_function(&mut f);
+        assert!(matches!(
+            f.blocks[0].instructions[1],
+            Instruction::Cast {
+                src: Operand::Value(Value(0)),
+                from_ty: IrType::U32,
+                to_ty: IrType::I16,
+                ..
+            }
+        ));
+        // A widening outer step keeps its own signedness: I8 -> I16 (sext,
+        // 0xFF -> 0xFFFF) read as U16 and zero-extended is 65535, not
+        // sext(I8 -> I32) = -1, so this chain must stay.
+        let mut f = IrFunction::new("f".into(), IrType::I32, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::I8,
+                    to_ty: IrType::I16,
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U16,
+                    to_ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
+        });
+        f.next_value_id = 3;
+        simplify_function(&mut f);
+        assert!(matches!(
+            f.blocks[0].instructions[1],
+            Instruction::Cast {
+                src: Operand::Value(Value(1)),
+                from_ty: IrType::U16,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn narrow_constants_are_known_only_where_every_extension_agrees() {
+        // I64(-1) in an I128 op: low 64 bits are ones; the high half is
+        // zero on x86-64 (zero-extended pair) but ones if sign-extended.
+        let m = IrConst::I64(-1);
+        assert!(const_range_is(&m, 0, 64, true));
+        assert!(
+            !const_range_is(&m, 64, 64, true),
+            "high half is not a known all-ones mask"
+        );
+        assert!(!const_range_is(&m, 64, 64, false), "nor known zero");
+        // Non-negative: zeros above the width under either extension.
+        let k = IrConst::I64(0xFFFF);
+        assert!(const_range_is(&k, 0, 16, true));
+        assert!(const_range_is(&k, 16, 112, false));
+        assert!(const_range_is(&IrConst::I128(-1), 64, 64, true));
+        assert!(!const_range_is(&IrConst::F64(1.0), 0, 8, false));
+    }
+
+    #[test]
+    fn plain_cast_chains_are_left_to_the_cast_rules() {
+        // trunc(sext(x)) on a signed I32 is `cast_same`'s call (refused as a
+        // Copy there); the pack walk must not take it over.
+        let mut f = IrFunction::new("f".into(), IrType::I32, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Cast {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::I64,
+                    to_ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(2)))),
+            source_spans: Vec::new(),
+        });
+        f.next_value_id = 3;
+        simplify_function(&mut f);
+        assert!(matches!(
+            f.blocks[0].instructions[1],
+            Instruction::Cast {
+                from_ty: IrType::I64,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn u32_pair_in_a_u64_folds_both_halves() {
+        // The covering-access shape aggregate SROA builds: I64 over {U32, U32}.
+        let mut f = carrier_in(
+            IrType::I64,
+            32,
+            IrType::U32,
+            IrType::U32,
+            IrType::U32,
+            IrBinOp::LShr,
+            true,
+        );
+        simplify_function(&mut f);
+        assert_eq!(reads(&f, 4), Some((Operand::Value(Value(0)), None)));
+        assert_eq!(reads(&f, 6), Some((Operand::Value(Value(1)), None)));
+    }
+
+    #[test]
+    fn extracts_wider_than_their_half_are_refused() {
+        // Low: an I64 extract of a 32-bit-shifted pack includes hi's bits.
+        let mut f = carrier_in(
+            IrType::I128,
+            32,
+            IrType::U32,
+            IrType::U64,
+            IrType::I64,
+            IrBinOp::LShr,
+            false,
+        );
+        simplify_function(&mut f);
+        assert_eq!(reads(&f, 4), None, "|T| = 64 > S = 32");
+        // High: a U64 low part shifted by only 32 reaches the high field.
+        let mut f = carrier_in(
+            IrType::I128,
+            32,
+            IrType::U64,
+            IrType::U32,
+            IrType::U32,
+            IrBinOp::LShr,
+            false,
+        );
+        simplify_function(&mut f);
+        assert_eq!(reads(&f, 6), None, "|A| = 64 > S = 32");
     }
 }

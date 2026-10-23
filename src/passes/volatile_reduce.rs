@@ -457,36 +457,26 @@ fn rewrite(func: &mut IrFunction, c: Candidate) -> Option<()> {
     Some(())
 }
 
-/// Declaration attributes override TU policy; full PIC defaults to a dynamic
-/// model. Both dynamic models currently issue a resolver for each folded load,
-/// so interleaving adds register/setup cost without removing that bottleneck.
+/// TLS symbols whose FINAL access model is dynamic. Both dynamic models issue
+/// a resolver for each folded load, so interleaving adds register/setup cost
+/// without removing that bottleneck.
+///
+/// The model comes from `common::tls::model_table` — the single function the
+/// backend lowers with — never from a local re-derivation: the GCC 16.2 rule
+/// is that the binding default, the `-ftls-model=` floor and a `tls_model`
+/// attribute can only RAISE the model (executable code is never dynamic, a
+/// `static`/hidden symbol under `-fPIC` is Local-Dynamic), so a predicate that
+/// let the attribute or option override the default would refuse this pass
+/// for accesses the backend emits as Local-Exec.
 pub(crate) fn costly_tls_symbols(
     module: &crate::ir::reexports::IrModule,
-    pic: bool,
-    model: Option<crate::ir::reexports::TlsModel>,
+    policy: crate::common::tls::TlsPolicy,
 ) -> FxHashSet<String> {
-    module
-        .globals
-        .iter()
-        .filter(|g| g.is_thread_local && dynamic_tls(g.tls_model, model, pic))
-        .map(|g| g.name.clone())
+    crate::common::tls::model_table(module, policy)
+        .into_iter()
+        .filter(|(_, model)| model.is_dynamic())
+        .map(|(name, _)| name)
         .collect()
-}
-
-fn dynamic_tls(
-    declaration: Option<crate::ir::reexports::TlsModel>,
-    command_line: Option<crate::ir::reexports::TlsModel>,
-    pic: bool,
-) -> bool {
-    use crate::ir::reexports::TlsModel;
-    matches!(
-        declaration.or(command_line).unwrap_or(if pic {
-            TlsModel::GlobalDynamic
-        } else {
-            TlsModel::LocalExec
-        }),
-        TlsModel::LocalDynamic | TlsModel::GlobalDynamic
-    )
 }
 
 /// Build once per function, before rewriting. Original pointer definitions do

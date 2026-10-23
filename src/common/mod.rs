@@ -17,6 +17,7 @@ pub(crate) mod source;
 pub(crate) mod symbol_table;
 pub(crate) mod sysv_classify;
 pub(crate) mod temp_files;
+pub(crate) mod tls;
 pub(crate) mod type_builder;
 pub(crate) mod types;
 pub(crate) mod x86_features;

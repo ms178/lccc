@@ -9,6 +9,7 @@
 //! - `encoder.rs`    – Encode AArch64 instructions into 32-bit machine words
 //! - `elf_writer.rs` – Write ELF object files with sections, symbols, and relocations
 
+pub(crate) mod cfi;
 pub mod elf_writer;
 pub mod encoder;
 pub mod parser;
@@ -21,13 +22,21 @@ use parser::{AsmDirective, AsmStatement, DataValue, Operand, parse_asm};
 ///
 /// This is the default assembler (used when the `gcc_assembler` feature is disabled).
 pub fn assemble(asm_text: &str, output_path: &str) -> Result<(), String> {
-    let statements = parse_asm(asm_text)?;
-    let statements = expand_literal_pools(&statements);
-    let statements = resolve_numeric_labels(&statements);
+    let statements = prepare_statements(asm_text)?;
     let mut writer = ElfWriter::new();
     writer.process_statements(&statements)?;
     writer.write_elf(output_path)?;
     Ok(())
+}
+
+/// Parse and run the statement-level passes ahead of the ELF writer:
+/// literal-pool expansion, then numeric-label renaming (`1:`/`1f`).
+/// Shared with the writer's unit tests so they assemble exactly what
+/// [`assemble`] would.
+pub(super) fn prepare_statements(asm_text: &str) -> Result<Vec<AsmStatement>, String> {
+    let statements = parse_asm(asm_text)?;
+    let statements = expand_literal_pools(&statements);
+    Ok(resolve_numeric_labels(&statements))
 }
 
 /// Expand `LdrLiteralPool` pseudo-instructions into literal pool loads.
@@ -323,6 +332,12 @@ fn resolve_numeric_directive(
         AsmDirective::Short(v) => AsmDirective::Short(vals(v)),
         AsmDirective::Long(v) => AsmDirective::Long(vals(v)),
         AsmDirective::Quad(v) => AsmDirective::Quad(vals(v)),
+        // `.uleb128 2f-1f` (hand-written exception tables): the operands
+        // name numeric labels like any other data value.
+        AsmDirective::Leb128 { signed, values } => AsmDirective::Leb128 {
+            signed: *signed,
+            values: vals(values),
+        },
         AsmDirective::Org { expr: e, fill } => AsmDirective::Org {
             expr: expr(e),
             fill: *fill,

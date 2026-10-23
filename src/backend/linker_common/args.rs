@@ -607,6 +607,21 @@ impl LinkerArgs {
     }
 }
 
+/// The dynamic-section entry GNU ld writes for `-rpath`: ONE `DT_RUNPATH`
+/// (`DT_RPATH` under `--disable-new-dtags`) holding every entry, joined
+/// with ':' in command-line order. `None` without `-rpath`.
+pub fn rpath_dyn_entry(args: &LinkerArgs) -> Option<(i64, String)> {
+    use crate::backend::elf::{DT_RPATH, DT_RUNPATH};
+    (!args.rpath_entries.is_empty()).then(|| {
+        let tag = if args.use_runpath {
+            DT_RUNPATH
+        } else {
+            DT_RPATH
+        };
+        (tag, args.rpath_entries.join(":"))
+    })
+}
+
 pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
     let mut result = LinkerArgs::default();
     // DT_RUNPATH is the default, not DT_RPATH: bfd (as configured by every
@@ -985,6 +1000,22 @@ pub fn parse_linker_args(user_args: &[String]) -> LinkerArgs {
 #[cfg(test)]
 mod map_arg_tests {
     use super::*;
+
+    #[test]
+    fn rpath_is_one_colon_joined_runpath_unless_old_dtags() {
+        use crate::backend::elf::{DT_RPATH, DT_RUNPATH};
+        assert_eq!(
+            rpath_dyn_entry(&parse_linker_args(&args(&["-Wl,--as-needed"]))),
+            None
+        );
+        let a = parse_linker_args(&args(&["-Wl,-rpath,/opt/a", "-Wl,-rpath=$ORIGIN/../lib"]));
+        assert_eq!(
+            rpath_dyn_entry(&a),
+            Some((DT_RUNPATH, "/opt/a:$ORIGIN/../lib".to_string()))
+        );
+        let a = parse_linker_args(&args(&["-Wl,-rpath,/x", "-Wl,--disable-new-dtags"]));
+        assert_eq!(rpath_dyn_entry(&a), Some((DT_RPATH, "/x".to_string())));
+    }
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

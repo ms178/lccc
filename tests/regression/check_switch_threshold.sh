@@ -30,7 +30,7 @@ for f in sw4 sw5 sw8; do
 done
 
 # 4 cases: NO indirect jump.
-! grep -q 'jmp.*\*\|jmpq.*\*' "$tmp/sw4.s"
+! grep -q 'jmp.*\*\|jmpq.*\*' "$tmp/sw4.s" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 # 5 and 8 cases: jump table present.
 grep -q 'jmp.*\*\|jmpq.*\*' "$tmp/sw5.s"
 grep -q 'jmp.*\*\|jmpq.*\*' "$tmp/sw8.s"

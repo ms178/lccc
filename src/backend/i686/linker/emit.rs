@@ -7,7 +7,7 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
 
 use super::DynStrTab;
-use super::dynamic::{DynamicDesc, option_entries};
+use super::dynamic::{DynamicDesc, image_function_addr, option_entries};
 use super::gnu_hash::build_gnu_hash_32;
 use super::options::{DynValue, LinkOptions};
 use super::reloc::{self, RelocContext};
@@ -629,22 +629,15 @@ pub(super) fn emit_executable(
     let text_seg_vaddr_start = vaddr;
 
     // .init
-    let init_sec_idx = section_name_to_idx.get(".init").copied();
-    let init_vaddr;
-    let init_size;
-    if let Some(idx) = init_sec_idx {
+    if let Some(idx) = section_name_to_idx.get(".init").copied() {
         let a = output_sections[idx].align.max(4);
         file_offset = align_up(file_offset, a);
         vaddr = align_up(vaddr, a);
-        init_vaddr = vaddr;
-        init_size = output_sections[idx].data.len() as u32;
+        let size = output_sections[idx].data.len() as u32;
         output_sections[idx].addr = vaddr;
         output_sections[idx].file_offset = file_offset;
-        file_offset += init_size;
-        vaddr += init_size;
-    } else {
-        init_vaddr = vaddr;
-        init_size = 0;
+        file_offset += size;
+        vaddr += size;
     }
 
     // .plt
@@ -672,22 +665,15 @@ pub(super) fn emit_executable(
     }
 
     // .fini
-    let fini_sec_idx = section_name_to_idx.get(".fini").copied();
-    let fini_vaddr;
-    let fini_size;
-    if let Some(idx) = fini_sec_idx {
+    if let Some(idx) = section_name_to_idx.get(".fini").copied() {
         let a = output_sections[idx].align.max(4);
         file_offset = align_up(file_offset, a);
         vaddr = align_up(vaddr, a);
-        fini_vaddr = vaddr;
-        fini_size = output_sections[idx].data.len() as u32;
+        let size = output_sections[idx].data.len() as u32;
         output_sections[idx].addr = vaddr;
         output_sections[idx].file_offset = file_offset;
-        file_offset += fini_size;
-        vaddr += fini_size;
-    } else {
-        fini_vaddr = 0;
-        fini_size = 0;
+        file_offset += size;
+        vaddr += size;
     }
 
     // Layout custom executable sections (for __start_/__stop_ symbol auto-generation)
@@ -813,8 +799,9 @@ pub(super) fn emit_executable(
     let mut dyn_desc = DynamicDesc {
         needed: needed_offsets.clone(),
         strings: option_strings,
-        init: (init_vaddr != 0 && init_size > 0).then_some(init_vaddr),
-        fini: (fini_vaddr != 0 && fini_size > 0).then_some(fini_vaddr),
+        // Presence only; the addresses are filled with the array entries.
+        init: image_function_addr(global_symbols, output_sections, "_init").map(|_| 0),
+        fini: image_function_addr(global_symbols, output_sections, "_fini").map(|_| 0),
         preinit_array: (sec_len(".preinit_array") > 0).then_some((0, 0)),
         init_array: (sec_len(".init_array") > 0).then_some((0, 0)),
         fini_array: (sec_len(".fini_array") > 0).then_some((0, 0)),
@@ -1050,6 +1037,7 @@ pub(super) fn emit_executable(
         rel_iplt_size,
         pending_defsyms,
     )?;
+    super::link::tls_module_base_address(global_symbols, tls_addr, tls_mem_size, true);
 
     // Override IFUNC symbol addresses to point to IPLT entries
     let mut ifunc_resolver_addrs: Vec<u32> = Vec::new();
@@ -1121,12 +1109,15 @@ pub(super) fn emit_executable(
     let eh_frame_hdr_data = if eh_frame_hdr_size > 0 {
         if let Some(idx) = eh_frame_sec_idx {
             let sec = &output_sections[idx];
-            crate::backend::linker_common::build_eh_frame_hdr(
+            let mut hdr = vec![0u8; eh_frame_hdr_size as usize];
+            crate::backend::linker_common::write_eh_frame_hdr(
+                &mut hdr,
                 &sec.data,
                 sec.addr as u64,
                 eh_frame_hdr_vaddr as u64,
                 false, // 32-bit
-            )
+            );
+            hdr
         } else {
             Vec::new()
         }
@@ -1219,6 +1210,11 @@ pub(super) fn emit_executable(
     if !is_static {
         if let Some(v) = dyn_desc.preinit_array.as_mut() {
             *v = (preinit_array_vaddr, preinit_array_size);
+        }
+        for (slot, name) in [(&mut dyn_desc.init, "_init"), (&mut dyn_desc.fini, "_fini")] {
+            if let Some(v) = slot.as_mut() {
+                *v = image_function_addr(global_symbols, output_sections, name).unwrap_or(*v);
+            }
         }
         if let Some(v) = dyn_desc.init_array.as_mut() {
             *v = (init_array_vaddr, init_array_size);

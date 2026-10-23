@@ -93,6 +93,15 @@ pub fn cfg_fingerprint(name: &str, unit: &str, f: &IrFunction) -> u64 {
     h
 }
 
+/// The profile file a `-fprofile-generate=PATH` unit writes: `PATH` itself
+/// when it names a `.profraw` file, else `PATH/lccc-<unit hash>-<unit>.profraw`.
+///
+/// The name is a pure function of the unit, so the instrumented object is
+/// reproducible (identical bytes for identical input, as GCC's object-derived
+/// `.gcda` names are) and build caches can hit. Every training process of
+/// the unit appends to the one file under `flock`, and the loader merges
+/// records by function key and CFG hash, so nothing needs a per-compile
+/// suffix.
 pub fn resolve_output_path(path: &str, unit: &str) -> PathBuf {
     let p = if path.is_empty() {
         Path::new(".")
@@ -107,10 +116,9 @@ pub fn resolve_output_path(path: &str, unit: &str) -> PathBuf {
     }
     let _ = fs::create_dir_all(p);
     p.join(format!(
-        "lccc-{:016x}-{}-{}.profraw",
+        "lccc-{:016x}-{}.profraw",
         unit_hash(unit),
-        sanitize(unit),
-        std::process::id()
+        sanitize(unit)
     ))
 }
 fn sanitize(s: &str) -> String {
@@ -656,6 +664,32 @@ mod tests {
         BasicBlock, BlockId, Instruction, IrFunction, IrParam, Operand, Terminator,
     };
 
+    /// The directory-mode profile name is a pure function of the unit: two
+    /// compiles of the same source embed the same path (reproducible
+    /// objects), distinct units get distinct files, and an explicit
+    /// `.profraw` path is used verbatim.
+    #[test]
+    fn profile_output_path_is_a_pure_function_of_the_unit() {
+        let dir = std::env::temp_dir().join(format!("lccc-pgo-name-{:x}", unit_hash("t")));
+        let dir_s = dir.to_str().unwrap_or_default().to_string();
+        let a = resolve_output_path(&dir_s, "src/a.c");
+        assert_eq!(a, resolve_output_path(&dir_s, "src/a.c"));
+        assert_ne!(a, resolve_output_path(&dir_s, "src/b.c"));
+        assert_eq!(
+            a,
+            dir.join(format!(
+                "lccc-{:016x}-src_a_c.profraw",
+                unit_hash("src/a.c")
+            ))
+        );
+        let explicit = dir.join("x.profraw");
+        assert_eq!(
+            resolve_output_path(explicit.to_str().unwrap_or_default(), "src/a.c"),
+            explicit
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Build a minimal loop CFG:
     ///   b0 (entry) -> Branch b1
     ///   b1 (header) CondBranch b2 (latch) / b3 (exit)
@@ -706,6 +740,7 @@ mod tests {
             is_inline: false,
             is_always_inline: false,
             is_noinline: false,
+            target_features: Vec::new(),
             next_value_id: 0,
             fp_expr_tags: Default::default(),
             next_label: 0,

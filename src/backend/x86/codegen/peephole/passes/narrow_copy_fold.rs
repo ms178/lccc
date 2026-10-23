@@ -94,6 +94,23 @@ fn is_frame_family(fam: RegId) -> bool {
     fam == REG_RSP || fam == REG_RBP
 }
 
+/// Does `line` name `fam` inside a memory operand (any parenthesised
+/// base/index group)?
+fn family_in_memory_operand(line: &str, fam: RegId) -> bool {
+    let mut rest = line;
+    while let Some(open) = rest.find('(') {
+        let tail = &rest[open + 1..];
+        let Some(close) = tail.find(')') else {
+            return false;
+        };
+        if super::relay_and_lea::line_refs_family(&tail[..close], fam) {
+            return true;
+        }
+        rest = &tail[close + 1..];
+    }
+    false
+}
+
 #[inline]
 fn is_name_tail(byte: u8) -> bool {
     byte.is_ascii_alphanumeric()
@@ -191,8 +208,11 @@ fn rename_within(line: &str, old: RegId, new: RegId, max_width: usize) -> String
 // ── A. self-move elimination ────────────────────────────────────────────────
 
 /// `mov %X, %X`. A 64/16/8-bit self-move writes the same bits back and is
-/// unconditionally dead. A 32-bit one also zeroes bits 32..63, so it is dead
-/// only where those are already zero.
+/// unconditionally dead -- for every family, `%rsp`/`%rbp` included (no
+/// flags, no CFI effect). A 32-bit one also zeroes bits 32..63, so it is
+/// dead only where those are already zero; that fact is never trusted for
+/// `%rsp`/`%rbp`, which push/pop/call/leave redefine implicitly where
+/// `update_upper32_zero`'s explicit-destination scan cannot see it.
 fn eliminate_self_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
@@ -228,10 +248,10 @@ fn eliminate_self_moves(store: &LineStore, infos: &mut [LineInfo]) -> bool {
         }
 
         if let Some((width, sfam, dfam)) = parse_reg_to_reg_mov(t) {
-            if sfam == dfam && !is_frame_family(dfam) {
+            if sfam == dfam {
                 let dead = match width {
                     W64 | W16 | W8 => true,
-                    _ => upper32_zero[dfam as usize],
+                    _ => !is_frame_family(dfam) && upper32_zero[dfam as usize],
                 };
                 if dead {
                     mark_nop(&mut infos[i]);
@@ -543,6 +563,16 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
             // copy cannot cover it; `mentions_only_within` rejects that
             // automatically because the address spells the 64-bit name.
             if !mentions_only_within(line, dfam, rule_width) {
+                ok = false;
+                break;
+            }
+            // Never rename `%rbp` INTO a memory operand, even where it is a
+            // proven GPR (the rule `eliminate_move_relays` follows): every
+            // `(%rbp…)` spelling is parsed as frame-slot traffic and is the
+            // frame-pointer evidence `rbp_is_gpr_in_function` keys on, so the
+            // rewrite would invalidate the proof that admitted it. Pinned by
+            // `move_relay_never_creates_an_rbp_memory_operand`.
+            if sfam == REG_RBP && family_in_memory_operand(line, dfam) {
                 ok = false;
                 break;
             }

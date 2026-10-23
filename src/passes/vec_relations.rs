@@ -26,27 +26,54 @@ struct Family {
 fn families() -> Vec<Family> {
     use IntrinsicOp::*;
     let mut result = Vec::new();
-    for (ty, bytes, blend) in [
-        (IrType::I8, 16, Some(VecBlendvI8x16)),
-        (IrType::I8, 32, Some(VecBlendvI8x32)),
-        (IrType::I16, 16, Some(VecBlendvI16x8)),
-        (IrType::I16, 32, Some(VecBlendvI16x16)),
-        (IrType::I32, 16, Some(VecBlendvI32x4)),
-        (IrType::I32, 32, Some(VecBlendvI32x8)),
-        (IrType::I64, 16, None),
-        (IrType::I64, 32, None),
+    // One row per family: the compare and broadcast ops travel with their
+    // (type, width) instead of being re-derived by a second, partial match.
+    for (ty, bytes, blend, cmp, broadcast) in [
+        (
+            IrType::I8,
+            16,
+            Some(VecBlendvI8x16),
+            VecCmpI8x16,
+            VecBroadcastI8x16,
+        ),
+        (
+            IrType::I8,
+            32,
+            Some(VecBlendvI8x32),
+            VecCmpI8x32,
+            VecBroadcastI8x32,
+        ),
+        (
+            IrType::I16,
+            16,
+            Some(VecBlendvI16x8),
+            VecCmpI16x8,
+            VecBroadcastI16x8,
+        ),
+        (
+            IrType::I16,
+            32,
+            Some(VecBlendvI16x16),
+            VecCmpI16x16,
+            VecBroadcastI16x16,
+        ),
+        (
+            IrType::I32,
+            16,
+            Some(VecBlendvI32x4),
+            VecCmpI32x4,
+            VecBroadcastI32x4,
+        ),
+        (
+            IrType::I32,
+            32,
+            Some(VecBlendvI32x8),
+            VecCmpI32x8,
+            VecBroadcastI32x8,
+        ),
+        (IrType::I64, 16, None, VecCmpI64x2, VecBroadcastI64x2),
+        (IrType::I64, 32, None, VecCmpI64x4, VecBroadcastI64x4),
     ] {
-        let (cmp, broadcast) = match (ty, bytes) {
-            (IrType::I8, 16) => (VecCmpI8x16, VecBroadcastI8x16),
-            (IrType::I8, 32) => (VecCmpI8x32, VecBroadcastI8x32),
-            (IrType::I16, 16) => (VecCmpI16x8, VecBroadcastI16x8),
-            (IrType::I16, 32) => (VecCmpI16x16, VecBroadcastI16x16),
-            (IrType::I32, 16) => (VecCmpI32x4, VecBroadcastI32x4),
-            (IrType::I32, 32) => (VecCmpI32x8, VecBroadcastI32x8),
-            (IrType::I64, 16) => (VecCmpI64x2, VecBroadcastI64x2),
-            (IrType::I64, 32) => (VecCmpI64x4, VecBroadcastI64x4),
-            _ => continue,
-        };
         let lanes = bytes / ty.size();
         let ops = [
             IrBinOp::And,

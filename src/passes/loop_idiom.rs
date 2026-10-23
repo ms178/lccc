@@ -39,6 +39,7 @@
 //! logs matches, rewrites, and bail reasons. No byte-compare rewrite is
 //! implemented: widening comparison loads without a range proof can overread.
 
+use super::module_symbol_facts::ModuleSymbolFacts;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::IrType;
 use crate::ir::analysis::{self, CfgAnalysis};
@@ -57,16 +58,16 @@ pub(crate) struct Capabilities {
 }
 
 /// Per-function entry point for the dirty-tracking pipeline. Two globals
-/// prove disjoint only when *both* are strong private definitions and neither
-/// is an alias; extern declarations may resolve to the same storage in a
-/// different translation unit. Module-level symbol facts are built once.
+/// prove disjoint through `ModuleSymbolFacts::globals_distinct` (one locally
+/// binding strong definition, no alias); extern declarations may resolve to
+/// the same storage in a different translation unit. Module-level symbol facts
+/// are built once.
 pub(crate) fn run_function(
     func: &mut IrFunction,
-    aliased_names: &FxHashSet<String>,
-    local_globals: &FxHashSet<String>,
+    symbol_facts: &ModuleSymbolFacts,
     capabilities: Capabilities,
 ) -> usize {
-    recognize_idioms(func, aliased_names, local_globals, capabilities)
+    recognize_idioms(func, symbol_facts, capabilities)
 }
 
 /// Maximum loops rewritten per function per fixpoint run. Each rewrite
@@ -176,17 +177,10 @@ fn roots_proven_disjoint(
     func: &IrFunction,
     a: &ObjectRoot,
     b: &ObjectRoot,
-    aliased_names: &FxHashSet<String>,
-    local_globals: &FxHashSet<String>,
+    symbol_facts: &ModuleSymbolFacts,
 ) -> bool {
     match (a, b) {
-        (ObjectRoot::Global(a), ObjectRoot::Global(b)) => {
-            a != b
-                && local_globals.contains(a)
-                && local_globals.contains(b)
-                && !aliased_names.contains(a)
-                && !aliased_names.contains(b)
-        }
+        (ObjectRoot::Global(a), ObjectRoot::Global(b)) => symbol_facts.globals_distinct(a, b),
         (ObjectRoot::Alloca(a), ObjectRoot::Alloca(b)) => a != b,
         (ObjectRoot::Global(_), ObjectRoot::Alloca(_))
         | (ObjectRoot::Alloca(_), ObjectRoot::Global(_))
@@ -384,8 +378,7 @@ macro_rules! dlog {
 
 pub(crate) fn recognize_idioms(
     func: &mut IrFunction,
-    aliased_names: &FxHashSet<String>,
-    local_globals: &FxHashSet<String>,
+    symbol_facts: &ModuleSymbolFacts,
     capabilities: Capabilities,
 ) -> usize {
     if std::env::var("CCC_NO_LOOP_IDIOM").is_ok() {
@@ -420,8 +413,7 @@ pub(crate) fn recognize_idioms(
             if versioned_headers.contains(&header_label) {
                 continue;
             }
-            if let Some(matched) = try_match_copy_loop(func, lp, &cfg, aliased_names, local_globals)
-            {
+            if let Some(matched) = try_match_copy_loop(func, lp, &cfg, symbol_facts) {
                 dlog!(
                     "{} loop@{}: MATCH copy (header={} pre={} latch={} exit={} bound={:?} store_bump={} load_bump={} overlap_guard={} zero_guard={})",
                     func.name,
@@ -539,8 +531,7 @@ fn try_match_copy_loop(
     func: &IrFunction,
     lp: &crate::passes::loop_analysis::NaturalLoop,
     cfg: &CfgAnalysis,
-    aliased_names: &FxHashSet<String>,
-    local_globals: &FxHashSet<String>,
+    symbol_facts: &ModuleSymbolFacts,
 ) -> Option<CopyLoop> {
     let name = func.name.as_str();
     // Shape: 1–3 blocks (header + body/latch). Single-block self-loops
@@ -1251,8 +1242,7 @@ fn try_match_copy_loop(
         dlog!("{name} loop@{header}: bail (same root {store_root:?})");
         return None;
     }
-    let needs_overlap_guard =
-        !roots_proven_disjoint(func, &store_root, &load_root, aliased_names, local_globals);
+    let needs_overlap_guard = !roots_proven_disjoint(func, &store_root, &load_root, symbol_facts);
     let needs_zero_guard = !needs_overlap_guard
         && (matches!(store_root, ObjectRoot::Param(_))
             || matches!(load_root, ObjectRoot::Param(_)));
@@ -1298,8 +1288,8 @@ fn try_match_copy_loop(
         // independent of BOTH copy operands, not just a different SSA/name:
         // a parameter may point into the bound global; two global names can
         // be linker aliases. Failing this test retains the original loop.
-        if !roots_proven_disjoint(func, &bound_root, &store_root, aliased_names, local_globals)
-            || !roots_proven_disjoint(func, &bound_root, &load_root, aliased_names, local_globals)
+        if !roots_proven_disjoint(func, &bound_root, &store_root, symbol_facts)
+            || !roots_proven_disjoint(func, &bound_root, &load_root, symbol_facts)
         {
             dlog!("{name} loop@{header}: bail (bound load may alias copy)");
             return None;
@@ -1478,6 +1468,7 @@ fn make_copy_call(
             assume_library: true,
             ret_eightbyte_classes: Vec::new(),
             ret_is_f128_sse: false,
+            cold: false,
         },
     }
 }
@@ -3421,6 +3412,8 @@ struct PopcountLoop {
     r_phi: Value,
     r_ty: IrType,
     r_init: Operand,
+    /// Counter step per cleared bit: `1` or `-1`.
+    r_step: i64,
     r_out: Value,
     rotated: bool,
 }
@@ -3528,42 +3521,40 @@ fn popcnt_is_clear_lsb(
         || (b_unwrapped == x_phi && popcnt_is_minus_one(defs, *a, x_phi, min_bytes))
 }
 
-/// Match `r_next = r_phi + 1` (or `1 + r_phi` / `r_phi - (-1)`).
-fn popcnt_is_plus_one(
+/// Match the counter recurrence `r_phi + 1` / `r_phi - 1` (also spelled
+/// `r_phi - (-1)` / `r_phi + (-1)`, either operand order for `Add`) at width
+/// `>= r_ty`, returning the step.  Copies and casts that preserve the low
+/// `r_ty` bits are transparent: after `k` iterations the counter is
+/// `(init + step * k) mod 2^bits(r_ty)` whatever the intermediate width or
+/// signedness, so a promoted `unsigned char` counter `c = (u8)((int)c + 1)`
+/// matches exactly like a native-width one.  Only the literal values `1` and
+/// `-1` are accepted (they are +-1 modulo every width); anything else fails
+/// closed.
+fn popcnt_counter_step(
     defs: &FxHashMap<u32, &Instruction>,
     r_next: Value,
     r_phi: Value,
     r_ty: IrType,
-) -> bool {
+) -> Option<i64> {
     let min_bytes = r_ty.size();
     let v = popcnt_unwrap_cast_chain(defs, r_next, min_bytes);
     let Some(Instruction::BinOp {
         op, lhs, rhs, ty, ..
     }) = defs.get(&v.0)
     else {
-        return false;
+        return None;
     };
     if !is_int_type(*ty) || ty.size() < min_bytes || ty.size() > 8 {
-        return false;
+        return None;
     }
-    match op {
-        IrBinOp::Add => match (lhs, rhs) {
-            (Operand::Value(lv), r) if popcnt_unwrap_cast_chain(defs, *lv, min_bytes) == r_phi => {
-                operand_const_int(r) == Some(1)
-            }
-            (l, Operand::Value(rv)) if popcnt_unwrap_cast_chain(defs, *rv, min_bytes) == r_phi => {
-                operand_const_int(l) == Some(1)
-            }
-            _ => false,
-        },
-        IrBinOp::Sub => match lhs {
-            Operand::Value(lv) if popcnt_unwrap_cast_chain(defs, *lv, min_bytes) == r_phi => {
-                operand_const_int(rhs) == Some(-1)
-            }
-            _ => false,
-        },
-        _ => false,
-    }
+    let is_r = |op: &Operand| matches!(op, Operand::Value(v) if popcnt_unwrap_cast_chain(defs, *v, min_bytes) == r_phi);
+    let step = match op {
+        IrBinOp::Add if is_r(lhs) => operand_const_int(rhs)?,
+        IrBinOp::Add if is_r(rhs) => operand_const_int(lhs)?,
+        IrBinOp::Sub if is_r(lhs) => operand_const_int(rhs)?.checked_neg()?,
+        _ => return None,
+    };
+    matches!(step, 1 | -1).then_some(step)
 }
 
 /// Follow only integer conversions that preserve zero in both directions.
@@ -3846,22 +3837,16 @@ fn try_match_popcount_loop(
         .map(|(i, b)| (b.label, i))
         .collect();
 
-    let (x_idx, r_idx) = if popcnt_is_clear_lsb(&defs, phis[0].3, phis[0].0, phis[0].1)
-        && popcnt_is_plus_one(&defs, phis[1].3, phis[1].0, phis[1].1)
-    {
-        (0, 1)
-    } else if popcnt_is_clear_lsb(&defs, phis[1].3, phis[1].0, phis[1].1)
-        && popcnt_is_plus_one(&defs, phis[0].3, phis[0].0, phis[0].1)
-    {
-        (1, 0)
-    } else {
-        return None;
+    let pick = |x: usize, r: usize| {
+        if popcnt_is_clear_lsb(&defs, phis[x].3, phis[x].0, phis[x].1) {
+            popcnt_counter_step(&defs, phis[r].3, phis[r].0, phis[r].1).map(|s| (x, r, s))
+        } else {
+            None
+        }
     };
+    let (x_idx, r_idx, r_step) = pick(0, 1).or_else(|| pick(1, 0))?;
     let (x_phi, x_ty, x_init, x_next) = phis[x_idx];
     let (r_phi, r_ty, r_init, r_next) = phis[r_idx];
-    if !matches!(r_ty, IrType::I32 | IrType::U32 | IrType::I64 | IrType::U64) {
-        return None;
-    }
     if !popcnt_body_is_pure(func, &lp.body, header, x_phi, r_phi) {
         return None;
     }
@@ -3970,9 +3955,31 @@ fn try_match_popcount_loop(
         r_phi,
         r_ty,
         r_init,
+        r_step,
         r_out,
         rotated,
     })
+}
+
+/// Append `Cast src: from -> to` to `extra` unless the types already agree.
+fn popcnt_cast(
+    func: &mut IrFunction,
+    extra: &mut Vec<Instruction>,
+    src: Operand,
+    from_ty: IrType,
+    to_ty: IrType,
+) -> Operand {
+    if from_ty == to_ty {
+        return src;
+    }
+    let dest = alloc_value(func);
+    extra.push(Instruction::Cast {
+        dest,
+        src,
+        from_ty,
+        to_ty,
+    });
+    Operand::Value(dest)
 }
 
 fn rewrite_popcount_loop(func: &mut IrFunction, m: &PopcountLoop, body: &FxHashSet<usize>) -> bool {
@@ -4069,31 +4076,35 @@ fn rewrite_popcount_loop(func: &mut IrFunction, m: &PopcountLoop, body: &FxHashS
         ty: pop_ty,
     });
 
-    let v_pop_r = if pop_ty == m.r_ty {
-        v_pop
+    // `r_out = (r_init + r_step * popcount) mod 2^bits(r_ty)`.  Native-width
+    // counters compute in `r_ty`; a narrow counter computes in `I32` and
+    // truncates, the same promote/truncate shape C gives `c++` on a `char`.
+    let calc_ty = if m.r_ty.size() < 4 {
+        IrType::I32
     } else {
-        let vc = alloc_value(func);
-        extra.push(Instruction::Cast {
-            dest: vc,
-            src: Operand::Value(v_pop),
-            from_ty: pop_ty,
-            to_ty: m.r_ty,
-        });
-        vc
+        m.r_ty
     };
-
-    let v_res = if operand_const_int(&m.r_init) == Some(0) {
-        v_pop_r
+    let pop_c = popcnt_cast(func, &mut extra, Operand::Value(v_pop), pop_ty, calc_ty);
+    let res_c = if m.r_step == 1 && operand_const_int(&m.r_init) == Some(0) {
+        pop_c
     } else {
+        let init_c = popcnt_cast(func, &mut extra, m.r_init, m.r_ty, calc_ty);
         let vr = alloc_value(func);
         extra.push(Instruction::BinOp {
             dest: vr,
-            op: IrBinOp::Add,
-            lhs: m.r_init,
-            rhs: Operand::Value(v_pop_r),
-            ty: m.r_ty,
+            op: if m.r_step == 1 {
+                IrBinOp::Add
+            } else {
+                IrBinOp::Sub
+            },
+            lhs: init_c,
+            rhs: pop_c,
+            ty: calc_ty,
         });
-        vr
+        Operand::Value(vr)
+    };
+    let Operand::Value(v_res) = popcnt_cast(func, &mut extra, res_c, calc_ty, m.r_ty) else {
+        return false;
     };
 
     let sink_into_exit = matches!(
@@ -4221,13 +4232,15 @@ mod tests {
     use crate::ir::reexports::{BasicBlock, IrParam};
 
     fn run_function(func: &mut IrFunction) -> usize {
-        // Synthetic D/S GlobalAddr instructions represent private, strong
-        // definitions in these tests; G is intentionally unproven.
-        let local_globals = ["D".to_string(), "S".to_string()].into_iter().collect();
+        // Synthetic D/S GlobalAddr instructions represent strong, locally
+        // binding definitions in these tests; G is intentionally unproven.
+        let symbol_facts = ModuleSymbolFacts {
+            aliased_names: FxHashSet::default(),
+            identity_witnesses: ["D".to_string(), "S".to_string()].into_iter().collect(),
+        };
         super::run_function(
             func,
-            &FxHashSet::default(),
-            &local_globals,
+            &symbol_facts,
             Capabilities {
                 native_popcount: true,
             },
@@ -4388,9 +4401,12 @@ mod tests {
     fn global_names_that_alias_cannot_prove_disjoint() {
         let mut f = self_loop_copy_func(IrType::U8);
         let aliases: FxHashSet<String> = ["D".to_string(), "S".to_string()].into_iter().collect();
-        let local_globals = aliases.clone();
+        let symbol_facts = ModuleSymbolFacts {
+            identity_witnesses: aliases.clone(),
+            aliased_names: aliases,
+        };
         assert_eq!(
-            super::run_function(&mut f, &aliases, &local_globals, Capabilities::default()),
+            super::run_function(&mut f, &symbol_facts, Capabilities::default()),
             1
         );
         assert!(has_call(&f, "memmove"));
@@ -4404,8 +4420,7 @@ mod tests {
         assert_eq!(
             super::run_function(
                 &mut f,
-                &FxHashSet::default(),
-                &FxHashSet::default(),
+                &ModuleSymbolFacts::default(),
                 Capabilities::default()
             ),
             1
@@ -5311,8 +5326,7 @@ mod tests {
         assert_eq!(
             super::run_function(
                 &mut f,
-                &FxHashSet::default(),
-                &FxHashSet::default(),
+                &ModuleSymbolFacts::default(),
                 Capabilities::default()
             ),
             0

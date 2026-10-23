@@ -273,6 +273,45 @@ def main():
                 "invariant under the knob (hot_web_callee_saved.c): a "
                 "callee-saved home co-held by loop state was evicted"
             )
+        #   3. OUTCOME: on the protected fixture, with the knob off and on, no
+        #      callee-saved register is saved without a body use (a phantom
+        #      home) and no hot state is stepped through a stack slot by a
+        #      memory-destination ALU op (the slot-resident loop counter).
+        #      Byte-identity (2) alone would freeze a BAD allocation as
+        #      readily as a good one; this pins its quality.
+        alias = {"rbx": "rbx|ebx|bx|bl", "rbp": "rbp|ebp|bp|bpl"}
+        rmw = re.compile(
+            r"^(?:add|sub|xor|or|and|inc|dec|ro[lr]|sh[lr]|sar)q? "
+            r"(?:[^,]+, )?-?\d+\(%rsp\)$"
+        )
+        for disabled in (False, True):
+            text = (p / f"hot-{disabled}.s").read_text()
+            for fn in ("exercise", "nested_calls"):
+                lines = body(text, fn)
+                if not lines:
+                    raise ValueError(
+                        f"hot web: {fn} body missing (knob off={disabled})"
+                    )
+                pushed = re.findall(
+                    r"^pushq %(rbx|rbp|r1[2-5])$", "\n".join(lines), re.M
+                )
+                for reg in pushed:
+                    pat = re.compile(rf"%(?:{alias.get(reg, reg + '[dwb]?')})\b")
+                    if not any(
+                        pat.search(line)
+                        and not re.match(r"(?:pushq|popq|\.cfi_)", line)
+                        for line in lines
+                    ):
+                        raise ValueError(
+                            f"hot web: {fn} saves %{reg} but never uses it "
+                            f"(knob off={disabled})"
+                        )
+                bad = [line for line in lines if rmw.match(line)]
+                if bad:
+                    raise ValueError(
+                        f"hot web: {fn} steps state in a stack slot "
+                        f"(knob off={disabled}): {bad[0]}"
+                    )
     print("scalar-facts: PASS (native, disabled controls, IR/RA verification and mechanisms)")
 
 

@@ -106,7 +106,7 @@ impl RiscvCodegen {
         }
         // 3. Function address -> t1.
         if self.state.needs_got(func) {
-            self.state.emit_fmt(format_args!("    la t1, {}", func));
+            self.state.emit_fmt(format_args!("    lga t1, {}", func));
         } else {
             self.state.emit_fmt(format_args!("    lla t1, {}", func));
         }

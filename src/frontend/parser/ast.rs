@@ -46,6 +46,8 @@ pub struct FunctionAttributes {
     pub visibility: Option<String>,
     /// __attribute__((symver("name@@VERSION"))) - symbol version alias
     pub symver: Option<String>,
+    /// __attribute__((target("..."))) - comma-joined per-function ISA features
+    pub target: Option<String>,
     /// __attribute__((__diagnose_as(__builtin_NAME, ...))) - builtin alias
     /// (mirrored from DeclAttributes for definitions; see expr_calls.rs).
     pub diagnose_as: Option<String>,
@@ -155,6 +157,7 @@ impl FunctionAttributes {
         attrs.section = decl.section.clone();
         attrs.visibility = decl.visibility.clone();
         attrs.symver = decl.symver.clone();
+        attrs.target = decl.target.clone();
         attrs.diagnose_as = decl.diagnose_as.clone();
         attrs
     }
@@ -727,10 +730,10 @@ pub struct DeclAttributes {
     pub alias_target: Option<String>,
     /// __attribute__((visibility("hidden"))) etc.
     pub visibility: Option<String>,
+    /// __attribute__((tls_model("..."))) - requested TLS access model
+    pub tls_model: Option<crate::common::tls::TlsModel>,
     /// __attribute__((section("..."))) - place in specific ELF section
     pub section: Option<String>,
-    /// __attribute__((tls_model("..."))) - per-symbol ELF TLS policy.
-    pub tls_model: Option<String>,
     /// register var __asm__("regname") - pin to specific register for inline asm
     pub asm_register: Option<String>,
     /// __attribute__((cleanup(func))) - call func(&var) when var goes out of scope.
@@ -738,6 +741,8 @@ pub struct DeclAttributes {
     pub cleanup_fn: Option<String>,
     /// __attribute__((symver("name@@VERSION"))) - symbol version alias
     pub symver: Option<String>,
+    /// __attribute__((target("..."))) - comma-joined per-function ISA features
+    pub target: Option<String>,
     /// __attribute__((__diagnose_as(__builtin_NAME, ...))) - the declared
     /// function is an analyzer alias of builtin NAME; calls that survive
     /// inlining fold to the builtin (kernel fortify-string family).

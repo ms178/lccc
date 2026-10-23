@@ -93,6 +93,10 @@ pub struct Driver {
     /// fp_reassoc because GCC does not define __FAST_MATH__ for the individual
     /// -fassociative-math/-funsafe-math-optimizations options.
     pub(super) fast_math: bool,
+    /// `-fmath-errno`: library math functions report domain errors through
+    /// `errno` (C default; cleared by `-fno-math-errno` and `-ffast-math`,
+    /// restored by `-fmath-errno` / `-fno-fast-math`, last option wins).
+    pub(super) math_errno: bool,
     /// -fwrapv makes signed Add/Sub/Mul modular; never infer no-wrap from C UB.
     pub(super) wrap_signed_overflow: bool,
     /// `-ffreestanding` / `-fno-hosted`: a freestanding implementation, so
@@ -135,6 +139,10 @@ pub struct Driver {
     pub(super) shared_lib: bool,
     /// Whether to omit standard library linking (-nostdlib)
     pub(super) nostdlib: bool,
+    /// `-nostartfiles`: no crt1/crti/crtbegin/crtend/crtn, libraries kept
+    pub(super) nostartfiles: bool,
+    /// `-nodefaultlibs`: startup objects kept, every default library dropped
+    pub(super) nodefaultlibs: bool,
     /// Whether to produce a relocatable object file (-r / -relocatable)
     pub(super) relocatable: bool,
     /// Whether to generate fully interposable position-independent code
@@ -144,9 +152,10 @@ pub struct Driver {
     /// `-fpie`, the x86-64 Linux default). PIE permits direct references to
     /// ordinary executable data where full PIC requires the GOT.
     pub(super) pie: bool,
-    /// Explicit compilation-wide ELF TLS model. `None` keeps the psABI-safe
-    /// automatic choice based on linkage and PIC mode.
-    pub(super) tls_model: Option<crate::ir::reexports::TlsModel>,
+    /// `-ftls-model=` floor (GCC `flag_tls_default`); see common::tls.
+    pub(super) tls_model_floor: Option<crate::common::tls::TlsModel>,
+    /// Last `-mtls-dialect=` value, validated against the final target.
+    pub(super) tls_dialect: Option<String>,
     /// Files to force-include before the main source (-include flag)
     pub(super) force_includes: Vec<String>,
     /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern)
@@ -223,6 +232,18 @@ pub struct Driver {
     /// Set by `-mno-popcnt`: POPCNT (0F B8) forbidden; the bit-count
     /// lowering falls back to the shr/adc loop.
     pub(super) popcnt_explicitly_disabled: bool,
+    /// `-mprfchw` or a PRFCHW-implying `-march=` (see
+    /// `x86_march_implies_prfchw`): `prefetchw` is available. Arch-implied
+    /// like every `enable_*` bit; the explicit flags are replayed.
+    pub(super) enable_prfchw: bool,
+    /// Sticky `-mno-prfchw` (GCC: wins over a later PRFCHW `-march=`).
+    pub(super) prfchw_explicitly_disabled: bool,
+    /// Explicit `-msse`/`-msse2`. On x86-64 SSE is baseline and only `no_sse`
+    /// matters; on i686 SSE is NOT baseline (the default target is pre-SSE
+    /// silicon), so a positive grant is needed to know that SSE-only
+    /// instructions such as the `prefetcht*` family are legal. Every higher
+    /// SSE/AVX grant is visible through its own `enable_*` bit.
+    pub(super) enable_sse: bool,
     /// Set by `-mno-movbe`: MOVBE forbidden.
     pub(super) movbe_explicitly_disabled: bool,
     /// Set by `-mno-cx16`: CMPXCHG16B forbidden.
@@ -503,6 +524,7 @@ impl Driver {
             align_jumps: crate::passes::loop_align::AlignControl::Auto,
             align_functions: crate::passes::loop_align::AlignControl::Auto,
             fp_reassoc: false,
+            math_errno: true,
             // Contraction default for C: FAST, matching GCC's C default
             // (-ffp-contract=fast). The previous Off default claimed to match
             // "GCC 14 behavior in loops" -- refuted by the godbolt oracles:
@@ -534,13 +556,16 @@ impl Driver {
             static_link: false,
             shared_lib: false,
             nostdlib: false,
+            nostartfiles: false,
+            nodefaultlibs: false,
             relocatable: false,
             // Debian x86-64 defaults to PIE, not full PIC. Keeping these modes
             // distinct lets executable data use direct RIP-relative accesses
             // while explicit -fPIC/-shared remains interposition-safe.
             pic: false,
             pie: true,
-            tls_model: None,
+            tls_model_floor: None,
+            tls_dialect: None,
             force_includes: Vec::new(),
             function_return_thunk: false,
             indirect_branch_thunk: false,
@@ -560,6 +585,9 @@ impl Driver {
             bmi2_explicitly_disabled: false,
             lzcnt_explicitly_disabled: false,
             popcnt_explicitly_disabled: false,
+            enable_prfchw: false,
+            prfchw_explicitly_disabled: false,
+            enable_sse: false,
             movbe_explicitly_disabled: false,
             cx16_explicitly_disabled: false,
             x86_explicit_isa_args: Vec::new(),
@@ -1688,6 +1716,11 @@ impl Driver {
             !self.no_sse && self.enable_cmpccxadd,
             self.enable_apxf,
         );
+        // `__PRFCHW__` mirrors the codegen permission exactly (GCC defines
+        // it for `-mprfchw` and every PRFCHW `-march=`, independent of SSE).
+        if self.resolved_prfchw() {
+            preprocessor.define_macro("__PRFCHW__", "1");
+        }
         // Define _REENTRANT when -pthread is used.
         // GCC and Clang automatically define _REENTRANT=1 when -pthread is passed.
         // Many configure scripts (e.g., iperf3's ax_pthread.m4) check for this macro
@@ -2211,6 +2244,7 @@ impl Driver {
             fp_environment_observable,
             self.fp_reassoc,
             self.resolved_fp_contract(),
+            self.math_errno,
             // Code-generation ISA permission — one struct shared with the
             // backend (see backend::x86::isa for the policy). i686 has no
             // baseline SSE2 and its vector lowerings are x86-64 shapes, so it
@@ -2244,7 +2278,7 @@ impl Driver {
             // `-fPIC`/`-shared` units keep calls to their own external
             // definitions (semantic interposition, GCC -fPIC default).
             self.pic || self.shared_lib,
-            self.tls_model,
+            self.tls_model_floor,
         );
         if time_phases {
             eprintln!("[TIME] opt passes: {:.3}s", t6.elapsed().as_secs_f64());
@@ -2291,6 +2325,17 @@ impl Driver {
                 crate::backend::x86::shift_count::run(func);
             }
         }
+
+        // Dynamic-TLS addresses that are calls on this target (AArch64
+        // descriptors) must be call points to the splitters' liveness too;
+        // same policy as the backend's (`CodegenOptions::pic`, floor).
+        crate::common::tls::install_call_sequence_symbols(&crate::common::tls::model_table(
+            &module,
+            crate::common::tls::TlsPolicy {
+                shlib: self.pic || self.shared_lib,
+                floor: self.tls_model_floor,
+            },
+        ));
 
         // Live range splitting: split call-spanning values, then clean up
         if std::env::var("CCC_NO_SPLIT_RANGES").is_err() {
@@ -2814,7 +2859,8 @@ impl Driver {
                 );
             }
         }
-        // TEMP: full IR dump
+        // `LCCC_DUMP_IR`: the final IR, one instruction per line (documented
+        // debug knob, engineering/agent/RULES.md; read once per module).
         if std::env::var("LCCC_DUMP_IR").is_ok() {
             for func in &module.functions {
                 if func.is_declaration {
@@ -2870,7 +2916,7 @@ impl Driver {
             pic: self.pic || self.shared_lib,
             shared_lib: self.shared_lib,
             pie: self.pie && !self.pic && !self.shared_lib,
-            tls_model: self.tls_model,
+            tls_model_floor: self.tls_model_floor,
             function_return_thunk: self.function_return_thunk,
             indirect_branch_thunk: self.indirect_branch_thunk,
             indirect_branch_thunk_inline: self.indirect_branch_thunk_inline,
@@ -2902,12 +2948,17 @@ impl Driver {
             general_regs_only: self.general_regs_only,
             code_model_kernel: self.code_model_kernel,
             no_jump_tables: self.no_jump_tables,
-            bmi1: self.resolved_bmi1(),
+            bmi1: self.resolved_codegen_bmi1(),
             bmi2: self.resolved_bmi2(),
             apx: self.enable_apxf,
             tune,
             lzcnt: self.resolved_lzcnt(),
             popcnt: self.resolved_popcnt(),
+            no_prefetch: std::env::var_os("CCC_NO_PREFETCH").is_some(),
+            x86_prefetch: crate::backend::x86_common::X86PrefetchIsa {
+                sse: self.resolved_prefetch_sse(),
+                prfchw: self.resolved_prfchw(),
+            },
             avx512: self.enable_avx512f,
             avx512vl: self.enable_avx512f && self.enable_avx512vl,
             isa: self.x86_isa(),
@@ -3079,28 +3130,33 @@ impl Driver {
         self.target == Target::X86_64 && !self.bmi_explicitly_disabled && self.enable_bmi
     }
 
+    /// BMI1 permission for scalar CODEGEN (`CodegenOptions::bmi1`): the
+    /// `resolved_bmi1` grant, extended to i686, whose backend consumes it
+    /// only for TZCNT (Ctz). GCC emits `tzcnt` for `-m32 -mbmi` and BSF for
+    /// `-m32 -mlzcnt`; gating i686 TZCNT on LZCNT emitted it for LZCNT-only
+    /// CPUs (K10, Bobcat, Jaguar), where F3 0F BC is BSF and Ctz(0) is
+    /// undefined. `__BMI__` and the ANDN-dependent middle-end choices stay
+    /// on the X86_64-locked `resolved_bmi1`: i686 lowers no ANDN/BLSR.
+    pub(super) fn resolved_codegen_bmi1(&self) -> bool {
+        matches!(self.target, Target::X86_64 | Target::I686)
+            && !self.bmi_explicitly_disabled
+            && self.enable_bmi
+    }
+
     pub(super) fn resolved_bmi2(&self) -> bool {
         self.target == Target::X86_64 && !self.bmi2_explicitly_disabled && self.enable_bmi2
     }
 
-    /// Soundness of the default grant: `tzcnt` is at least as correct as
-    /// the `bsf` it replaces (defined on zero input) and `lzcnt` likewise
-    /// supersedes `bsr`, so defaulting ABM ON never changes a defined
-    /// program's results — it only removes the undefined-zero-input hole.
+    /// LZCNT/ABM permission (Clz only; TZCNT is BMI1, see
+    /// `resolved_codegen_bmi1`). Granted on x86-64 and i686 only by
+    /// `-mlzcnt` or an ABM-implying `-march=`, always under the
+    /// `-mno-lzcnt` veto -- the same explicit-only contract as GCC.
     ///
-    /// i686 parity (ISA-parity audit): the i686 backend's ctz/clkz emitters
-    /// are fully wired for the tzcnt forms (`lzcnt_enabled` consumers in
-    /// i686/codegen/alu.rs, `tzcntl` in the integrated assembler), and the
-    /// `F3 0F BC` encoding is hardware-universal — pre-ABM CPUs decode it
-    /// as plain BSF, identical for every nonzero input, and the emitters'
-    /// stop-bit/explicit-fixup sequences keep the narrow-width and
-    /// zero-input results defined on BOTH hardware classes. The grant is
-    /// EXPLICIT-FLAG-ONLY for i686: its baseline contract is broad
-    /// compatibility (a default-granted `tzcnt`/`lzcnt` would #UD on
-    /// pre-2008 silicon), so unlike x86-64 there is no implicit default
-    /// grant — only `-mlzcnt`/an ISA-implying `-march=` (which GCC's
-    /// `-m32 -mbmi/-march=...` behavior matches), always under the
-    /// `-mno-lzcnt` veto.
+    /// Why it must never be granted speculatively: the F3 0F BD encoding
+    /// does not fault on pre-ABM CPUs, it executes as BSR (the prefix is
+    /// ignored) and silently returns the MSB *index* instead of the
+    /// leading-zero *count*. Without the grant both backends lower Clz to
+    /// BSR with an explicit zero fixup, keeping the IR's Clz(0) == width.
     pub(super) fn resolved_lzcnt(&self) -> bool {
         if self.lzcnt_explicitly_disabled {
             return false;
@@ -3131,6 +3187,48 @@ impl Driver {
         match self.target {
             Target::X86_64 => self.enable_popcnt,
             Target::I686 => self.enable_popcnt,
+            _ => false,
+        }
+    }
+
+    /// PREFETCHW (`0F 0D /1`) permission: explicit `-mprfchw` or a
+    /// PRFCHW-implying `-march=`, under the sticky `-mno-prfchw` veto. Never
+    /// a default grant: the absent-march x86-64-v3 baseline does not include
+    /// it (GCC 16: `__PRFCHW__` is undefined for `-march=x86-64-v3`, and
+    /// Haswell — the v3 reference core — lacks it), and on a pre-Broadwell
+    /// Intel core the opcode is not part of any architectural extension.
+    pub(crate) fn resolved_prfchw(&self) -> bool {
+        matches!(self.target, Target::X86_64 | Target::I686)
+            && self.enable_prfchw
+            && !self.prfchw_explicitly_disabled
+    }
+
+    /// Whether the SSE prefetch family (`prefetchnta/t0/t1/t2`, `0F 18
+    /// /0-3`) may be emitted — GCC's `ix86_prefetch_sse`:
+    ///
+    /// * x86-64: always. The forms are part of the x86-64 baseline and touch
+    ///   no vector state, so GCC 16 emits them even under `-mno-sse` and
+    ///   `-mgeneral-regs-only` (measured).
+    /// * i686: SSE enabled, or PRFCHW enabled (GCC: `TARGET_SSE ||
+    ///   (TARGET_PRFCHW && !TARGET_3DNOW)`; `-m3dnow` is rejected here, so
+    ///   the 3DNow! clause is vacuous). The i686 default is pre-SSE silicon,
+    ///   where these opcodes are #UD, and GCC emits nothing for
+    ///   `-m32`/`-march=i686`/`-mno-sse` (measured).
+    pub(crate) fn resolved_prefetch_sse(&self) -> bool {
+        match self.target {
+            Target::X86_64 => true,
+            Target::I686 => {
+                let sse = !self.no_sse
+                    && (self.enable_sse
+                        || self.enable_sse3
+                        || self.enable_ssse3
+                        || self.enable_sse4_1
+                        || self.enable_sse4_2
+                        || self.enable_avx
+                        || self.enable_avx2
+                        || self.enable_avx512f);
+                sse || self.resolved_prfchw()
+            }
             _ => false,
         }
     }

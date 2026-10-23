@@ -138,15 +138,22 @@ pub struct I686Codegen {
     /// (magic-number division, multi-instruction LEA multiply chains).
     pub(super) optimize_for_size: bool,
     /// True when the target has LZCNT/ABM (-mlzcnt or an enabling -march).
-    /// LZCNT/TZCNT are NOT baseline i686 ISA: the F3-prefixed encodings
-    /// decode as BSR/BSF on CPUs without the feature and silently return
-    /// the bit index instead of a zero count. When false, Clz/Ctz lower to
-    /// BSR/BSF sequences with an explicit zero fixup preserving the IR's
-    /// defined Clz(0)/Ctz(0) == width semantics.
+    /// LZCNT is NOT baseline i686 ISA: the F3-prefixed encoding decodes as
+    /// BSR on CPUs without the feature and silently returns the bit index
+    /// instead of a zero count. When false, Clz lowers to a BSR sequence
+    /// with an explicit zero fixup preserving the IR's Clz(0) == width.
     pub(super) lzcnt_enabled: bool,
+    /// True when the target has BMI1 (-mbmi or an enabling -march): TZCNT
+    /// is a BMI1 instruction, distinct from LZCNT/ABM (GCC: `-m32 -mlzcnt`
+    /// keeps `rep bsf`). When false, Ctz lowers to BSF with a stop bit
+    /// (narrow) or an explicit zero fixup (32/64-bit).
+    pub(super) bmi1_enabled: bool,
     /// True when the target has POPCNT (-mpopcnt or an enabling -march).
     /// When false, Popcount lowers to an shr/adc bit loop.
     pub(super) popcnt_enabled: bool,
+    /// `IntrinsicOp::Prefetch` lowering permissions; `None` under
+    /// `CCC_NO_PREFETCH` (see `CodegenOptions::no_prefetch`).
+    pub(super) prefetch_isa: Option<crate::backend::x86_common::X86PrefetchIsa>,
     /// Same-block div/rem pair analysis (see backend::regalloc::
     /// compute_i686_divrem_pairs). Recomputed per function; the emitter uses
     /// tail_dests/head_partners to fuse URem+UDiv couples into one divl.
@@ -533,7 +540,9 @@ impl I686Codegen {
             esp_adjust: 0,
             optimize_for_size: false,
             lzcnt_enabled: false,
+            bmi1_enabled: false,
             popcnt_enabled: false,
+            prefetch_isa: None,
         }
     }
 
@@ -548,10 +557,9 @@ impl I686Codegen {
     /// Apply all relevant options from a `CodegenOptions` struct.
     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
         self.state.disable_regalloc = opts.disable_regalloc;
+        self.state.apply_tls_options(opts);
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
-        self.state.shared_lib = opts.shared_lib;
-        self.state.tls_model = opts.tls_model;
         self.set_no_jump_tables(opts.no_jump_tables);
         self.state.mcount = opts.mcount;
         self.base_regparm = opts.regparm;
@@ -569,7 +577,10 @@ impl I686Codegen {
         };
         self.optimize_for_size = opts.optimize_for_size;
         self.lzcnt_enabled = opts.lzcnt;
+        self.bmi1_enabled = opts.bmi1;
         self.popcnt_enabled = opts.popcnt;
+        // i686 is NOT SSE-baseline: the driver decides (SSE or PRFCHW).
+        self.prefetch_isa = (!opts.no_prefetch).then_some(opts.x86_prefetch);
     }
 
     // --- i686 helper methods ---
@@ -1911,7 +1922,7 @@ impl I686Codegen {
         self.state.emit("    testl %eax, %eax");
         emit!(self.state, "    je {}", lo_zero);
         // Low half is non-zero: result = tzcnt(eax)
-        if self.lzcnt_enabled {
+        if self.bmi1_enabled {
             self.state.emit("    tzcntl %eax, %eax");
         } else {
             self.emit_ctz32_baseline("eax", "eax");
@@ -1920,7 +1931,7 @@ impl I686Codegen {
         emit!(self.state, "    jmp {}", done);
         // Low half is zero: result = 32 + tzcnt(edx)
         emit!(self.state, "{}:", lo_zero);
-        if self.lzcnt_enabled {
+        if self.bmi1_enabled {
             self.state.emit("    tzcntl %edx, %eax");
         } else {
             self.emit_ctz32_baseline("edx", "eax");
@@ -2846,6 +2857,51 @@ impl ArchCodegen for I686Codegen {
         !self.state.pic_mode
     }
 
+    /// LE/IE loads of an omitted TLS root fold into one `%gs:` access (PIC
+    /// included: the IE offset comes from the GOT through `%ebx`).
+    fn supports_tls_direct_load_fold(&self) -> bool {
+        true
+    }
+
+    /// One 32-bit register: the 64-bit pair would need a second `%gs:` load
+    /// and the FP types the x87/SSE staging; those keep the materialized root.
+    fn tls_direct_load_type_ok(&self, ty: IrType) -> bool {
+        matches!(
+            ty,
+            IrType::I8
+                | IrType::U8
+                | IrType::I16
+                | IrType::U16
+                | IrType::I32
+                | IrType::U32
+                | IrType::Ptr
+        )
+    }
+
+    fn try_emit_tls_direct_load(
+        &mut self,
+        dest: &Value,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+    ) -> bool {
+        self.try_emit_tls_direct_load_impl(dest, base, offset, ty)
+    }
+
+    fn tls_direct_store_type_ok(&self, ty: IrType) -> bool {
+        self.tls_direct_load_type_ok(ty)
+    }
+
+    fn try_emit_tls_direct_store(
+        &mut self,
+        val: &Operand,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+    ) -> bool {
+        self.try_emit_tls_direct_store_impl(val, base, offset, ty)
+    }
+
     fn supports_fused_bit_test_branch(&self) -> bool {
         // btl + jc: CF-consuming branch, same as x86-64. 32-bit masks only
         // (the simplify/set_membership legality gates never build I64
@@ -2921,13 +2977,9 @@ impl ArchCodegen for I686Codegen {
         if self.state.ra_config.no_folded_index_liveness {
             return false;
         }
-        match self.reg_assignments.get(&base.0) {
-            // Safe homes: %ebx/%esi/%edi/%ebp — callee-saved, never touched
-            // by the %eax:%edx accumulator staging or the %ecx address
-            // scratch the fold paths use.
-            Some(&phys) => matches!(phys.0, 0 | 1 | 2 | 3),
-            None => false,
-        }
+        self.reg_assignments
+            .get(&base.0)
+            .is_some_and(|&phys| i686_const_fold_base_reg(phys))
     }
 
     fn callee_pops_bytes_for_sret(&self, is_sret: bool) -> usize {
@@ -4072,6 +4124,15 @@ impl I686Codegen {
         end_runtime_stub(s);
         s.emit(".size __lccc_moddi3, .-__lccc_moddi3");
     }
+}
+
+/// Homes in which an i686 register-base constant-offset fold is sound:
+/// %ebx/%esi/%edi/%ebp — callee-saved, never touched by the %eax:%edx
+/// accumulator staging or the %ecx address scratch the fold paths use.
+/// Shared by `const_offset_fold_reg_base_ok` and the allocator's
+/// fold-deferral pool.
+pub(crate) fn i686_const_fold_base_reg(phys: crate::backend::regalloc::PhysReg) -> bool {
+    matches!(phys.0, 0..=3)
 }
 
 #[cfg(test)]

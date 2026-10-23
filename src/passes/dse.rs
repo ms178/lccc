@@ -17,10 +17,10 @@
 //!   value (params, phis, computed pointers).
 //! * Scanning a block backwards, a "pending" set holds later stores that
 //!   have not yet been proven observable. When the scan reaches a store
-//!   whose cell is fully covered by a pending store (same root, the
-//!   pending byte range contains the store's) with **no intervening read
-//!   of that cell**, the earlier store is dead: any reader between the two
-//!   would have killed the pending entry first. Vector store intrinsics
+//!   whose cell is fully covered by pending stores (same root, the union of
+//!   their byte ranges contains the store's; see `covered`) with **no
+//!   intervening read of that cell**, the earlier store is dead: any reader
+//!   between the two would have killed the pending entries first. Vector store intrinsics
 //!   (`VecStore*`) are stores of their exact width here: they cover earlier
 //!   stores, die under later ones, and read nothing.
 //! * Read events (loads, calls, atomics, memcpy sources, inline asm,
@@ -376,18 +376,46 @@ fn kill_opaque(pending: &mut Vec<Pending>, ctx: &DseContext) {
     pending.retain(|p| matches!(&p.root, CellRoot::Alloca(a) if ctx.closed_allocas.contains(a)));
 }
 
-/// Does a pending later write to `root` definitely overwrite every byte of
-/// `[off, off + len)`? Containment, not offset equality: reads kill pending
-/// entries on any byte overlap, so a surviving entry that contains the
-/// range proves no read of it intervenes (one 32-byte vector store hides
-/// the four 8-byte stores under it).
+/// Do the pending later writes to `root` together definitely overwrite every
+/// byte of `[off, off + len)`? Reads kill pending entries on any byte
+/// overlap, so each surviving entry proves that no read of ITS bytes
+/// intervenes; when their union contains the range, every byte of the
+/// earlier store is overwritten before anything can observe it. One entry
+/// may contain the range (one 32-byte vector store hides the four 8-byte
+/// stores under it), or several may tile it: the zero fill of an aggregate
+/// initializer (`E e = {5, 6}` stores an 8-byte zero, then both 4-byte
+/// fields) is dead under its field stores.
 fn covered(pending: &[Pending], root: &CellRoot, off: i64, len: i64) -> bool {
     let Some(end) = off.checked_add(len) else {
         return false;
     };
-    pending.iter().any(|p| {
-        p.root == *root && p.offset <= off && p.offset.checked_add(p.size).is_some_and(|e| end <= e)
-    })
+    let mut parts: Vec<(i64, i64)> = Vec::new();
+    for p in pending.iter().filter(|p| p.root == *root) {
+        let Some(p_end) = p.offset.checked_add(p.size) else {
+            continue;
+        };
+        if p.offset <= off && end <= p_end {
+            return true;
+        }
+        if p.offset < end && off < p_end {
+            parts.push((p.offset, p_end));
+        }
+    }
+    if parts.len() < 2 {
+        return false;
+    }
+    parts.sort_unstable();
+    let mut reach = off;
+    for (start, stop) in parts {
+        if start > reach {
+            return false;
+        }
+        reach = reach.max(stop);
+        if reach >= end {
+            return true;
+        }
+    }
+    false
 }
 
 /// The `(root, constant byte offset)` a vector store writes at, when its
@@ -1635,5 +1663,86 @@ mod displaced_alias_tests {
             vec_store(O::VecStoreI64x4, 0, Operand::Value(Value(30))),
         ]);
         assert_eq!(eliminate_dead_stores(&mut f), 0);
+    }
+
+    fn store_ty(ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Store {
+            ptr: Value(ptr),
+            val: Operand::Const(IrConst::I64(0)),
+            ty,
+            volatile: false,
+            seg_override: AddressSpace::Default,
+        }
+    }
+
+    fn load_i32(dest: u32, ptr: u32) -> Instruction {
+        Instruction::Load {
+            volatile: false,
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+        }
+    }
+
+    /// `E e = {5, 6}`: an 8-byte zero fill followed by both 4-byte fields.
+    /// No single later store contains the fill, but together they do.
+    #[test]
+    fn field_stores_together_cover_an_aggregate_zero_fill() {
+        let mut f = function(vec![
+            alloca(0, 8),
+            gep(1, 0, 4),
+            store_ty(0, IrType::I64),
+            store(0),
+            store(1),
+        ]);
+        assert_eq!(eliminate_dead_stores(&mut f), 1);
+        assert!(
+            !f.blocks[0].instructions.iter().any(|i| matches!(
+                i,
+                Instruction::Store {
+                    ty: IrType::I64,
+                    ..
+                }
+            )),
+            "the zero fill is dead"
+        );
+    }
+
+    /// The tiling proof needs every byte: a read between the two field
+    /// stores observes the fill's upper half, and a gap leaves bytes of the
+    /// fill visible to a later reader. Overlapping later stores still tile.
+    #[test]
+    fn partial_tiling_keeps_the_earlier_store() {
+        // fill; field 0; read of field 1 (observes the fill); field 1.
+        let mut read_between = function(vec![
+            alloca(0, 8),
+            gep(1, 0, 4),
+            store_ty(0, IrType::I64),
+            store(0),
+            load_i32(9, 1),
+            store(1),
+        ]);
+        assert_eq!(eliminate_dead_stores(&mut read_between), 0);
+        // fill (8 bytes at 0); 4 bytes at 0 and 2 bytes at 4: bytes 6..8 open.
+        let mut gap = function(vec![
+            alloca(0, 8),
+            gep(1, 0, 4),
+            store_ty(0, IrType::I64),
+            store(0),
+            store_ty(1, IrType::I16),
+        ]);
+        assert_eq!(eliminate_dead_stores(&mut gap), 0);
+        // fill; 4 bytes at 0, 4 at 2 and 4 at 4: overlapping, but complete.
+        let mut overlapping = function(vec![
+            alloca(0, 8),
+            gep(1, 0, 4),
+            gep(2, 0, 2),
+            store_ty(0, IrType::I64),
+            store(0),
+            store(2),
+            store(1),
+        ]);
+        assert_eq!(eliminate_dead_stores(&mut overlapping), 1);
     }
 }

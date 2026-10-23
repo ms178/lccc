@@ -51,7 +51,10 @@ pub enum IrBinOp {
     AShr,
     LShr,
     /// Boolean bit test: `(lhs >> rhs) & 1`.  The result is I32 and lhs/rhs are
-    /// always integer.  Backends may lower this to a native BT-family
+    /// always integer.  The index is taken modulo the operand width W, as
+    /// every native form does (x86 BT, AArch64 LSRV, RISC-V SRL/SRLW): an
+    /// index of W or more comes from an undefined C shift, which may sit in
+    /// dead code and must still compile, and folding agrees with codegen.  Backends may lower this to a native BT-family
     /// instruction or to the portable shift/AND sequence.  This is the
     /// cross-target canonical form for classifier chains such as Expat name
     /// scanning, instead of leaving the pattern in text peepholes.
@@ -91,9 +94,61 @@ pub enum IrBinOp {
     /// larger k both forms return x.  Only the x86-64 frontend creates it,
     /// from the BMI2 builtins when BMI2 is enabled; no pass synthesizes it.
     Bzhi,
+    /// High half of the double-width product: `UMulHigh(a, b)` is
+    /// `(zext(a) * zext(b)) >> W` and `SMulHigh(a, b)` is
+    /// `(sext(a) * sext(b)) >> W` (arithmetic), W the width of the
+    /// operation's IR type -- GCC's `MULT_HIGHPART_EXPR`, LLVM's
+    /// `mulhu`/`mulhs`, x86 one-operand `mul`/`imul` (`%rdx`), AArch64
+    /// `umulh`/`smulh`, RISC-V `mulhu`/`mulh`.
+    ///
+    /// Typed I64/U64 only, and only on 64-bit targets: `div_by_const`
+    /// creates it for the magic-number expansion of 64-bit division, which
+    /// otherwise needs a 128-bit product.  Spelled that way the function
+    /// carries I128 values, and on x86-64 a function with any I128 value
+    /// loses `%r8`, `%r9`, `%rdi`, `%rsi` and `%rdx` from its register pool
+    /// for its whole body (the i128 emitters use them as scratch) -- one
+    /// `n / 5` in a loop preheader spilled the 20-symbol decode loop of zstd's
+    /// `HUF_decompress4X1_usingDTable_internal_fast_c_loop`.  Like the
+    /// rotates and `Bzhi` its value depends on W, so it cannot be evaluated
+    /// in a wider container and truncated: use [`mul_high_within_bits`].
+    UMulHigh,
+    SMulHigh,
+}
+
+/// High half of the `2 * bits`-wide product of the low `bits` bits of `lhs`
+/// and `rhs` (see [`IrBinOp::UMulHigh`]), sign- or zero-extended from `bits`
+/// according to `signed`, for `1 <= bits <= 64`.  Callers truncate the result
+/// to the operation's type.
+pub fn mul_high_within_bits(lhs: i64, rhs: i64, bits: u32, signed: bool) -> i64 {
+    debug_assert!((1..=64).contains(&bits));
+    let bits = bits.clamp(1, 64);
+    let shift = 64 - bits;
+    if signed {
+        let a = i128::from((lhs << shift) >> shift);
+        let b = i128::from((rhs << shift) >> shift);
+        ((a * b) >> bits) as i64
+    } else {
+        let a = u128::from(((lhs as u64) << shift) >> shift);
+        let b = u128::from(((rhs as u64) << shift) >> shift);
+        ((a * b) >> bits) as i64
+    }
+}
+
+/// The backend arm for an [`IrBinOp::UMulHigh`]/[`IrBinOp::SMulHigh`] it
+/// never receives: `div_by_const` creates them only I64/U64-typed and only
+/// for 64-bit targets, so i686 or a narrower type is a broken invariant, not
+/// an input error.  One shared site keeps the invariant and its message.
+#[cold]
+pub fn mul_high_unsupported_here() -> ! {
+    unreachable!("UMulHigh/SMulHigh are created only I64/U64-typed for 64-bit targets")
 }
 
 impl IrBinOp {
+    /// True for the multiply-high forms ([`IrBinOp::UMulHigh`]).
+    pub fn is_mul_high(self) -> bool {
+        matches!(self, IrBinOp::UMulHigh | IrBinOp::SMulHigh)
+    }
+
     /// True for the two rotate forms, whose semantics depend on the
     /// operation's *type width* rather than only on the operand values.
     pub fn is_rotate(self) -> bool {
@@ -199,7 +254,7 @@ impl IrBinOp {
             IrBinOp::BitTest => {
                 // The canonical operation is produced by an i32-typed recognizer
                 // after integer promotion; evaluate it as C's `(x >> i) & 1`.
-                (((lhs as u64) >> (rhs as u32)) & 1) as i64
+                ((lhs as u64).wrapping_shr(rhs as u32) & 1) as i64
             }
             // Container-width rotate.  A narrower IR type (I8/I16/I32) MUST
             // not be folded through here: rotating at 64 bits and truncating
@@ -213,6 +268,8 @@ impl IrBinOp {
                 rotate_within_bits(lhs as u64 as u128, rhs as u64 as u128, 64, false) as i64
             }
             IrBinOp::Bzhi => zero_high_bits_from(lhs as u64 as u128, rhs as u64 as u128, 64) as i64,
+            IrBinOp::UMulHigh => mul_high_within_bits(lhs, rhs, 64, false),
+            IrBinOp::SMulHigh => mul_high_within_bits(lhs, rhs, 64, true),
             IrBinOp::SDiv => {
                 if rhs == 0 {
                     return None;
@@ -255,7 +312,7 @@ impl IrBinOp {
             IrBinOp::Shl => lhs.wrapping_shl(rhs as u32),
             IrBinOp::AShr => lhs.wrapping_shr(rhs as u32),
             IrBinOp::LShr => (lhs as u128).wrapping_shr(rhs as u32) as i128,
-            IrBinOp::BitTest => (((lhs as u128) >> (rhs as u32)) & 1) as i128,
+            IrBinOp::BitTest => ((lhs as u128).wrapping_shr(rhs as u32) & 1) as i128,
             // Container-width (128-bit) rotate; see the note on the i64 arms —
             // narrower IR types are folded by `fold_binop` with their own
             // width, never through here.
@@ -264,6 +321,9 @@ impl IrBinOp {
                 rotate_within_bits(lhs as u128, rhs as u128, 128, false) as i128
             }
             IrBinOp::Bzhi => zero_high_bits_from(lhs as u128, rhs as u128, 128) as i128,
+            // No 128-bit form exists (I64/U64 only); refuse rather than
+            // evaluate at the wrong width.
+            IrBinOp::UMulHigh | IrBinOp::SMulHigh => return None,
             IrBinOp::SDiv => {
                 if rhs == 0 {
                     return None;
@@ -383,5 +443,75 @@ impl IrCmpOp {
             IrCmpOp::Sgt | IrCmpOp::Ugt => lhs > rhs,
             IrCmpOp::Sge | IrCmpOp::Uge => lhs >= rhs,
         }
+    }
+}
+
+#[cfg(test)]
+mod mul_high_tests {
+    use super::*;
+
+    /// Reference: the high `bits` of the `2 * bits`-wide product, computed
+    /// with full-width i128/u128 arithmetic on the extended operands.
+    fn reference(a: i64, b: i64, bits: u32, signed: bool) -> i64 {
+        let shift = 64 - bits;
+        if signed {
+            let a = i128::from((a << shift) >> shift);
+            let b = i128::from((b << shift) >> shift);
+            ((a * b) >> bits) as i64
+        } else {
+            let a = u128::from(((a as u64) << shift) >> shift);
+            let b = u128::from(((b as u64) << shift) >> shift);
+            ((a * b) >> bits) as i64
+        }
+    }
+
+    #[test]
+    fn mul_high_matches_x86_mul_and_imul() {
+        let edges = [
+            0i64,
+            1,
+            -1,
+            2,
+            3,
+            5,
+            7,
+            i64::MAX,
+            i64::MIN,
+            i64::MIN + 1,
+            0x5555_5555_5555_5556,
+            0xCCCC_CCCC_CCCC_CCCDu64 as i64,
+            0x0123_4567_89AB_CDEF,
+            u32::MAX as i64,
+        ];
+        for &a in &edges {
+            for &b in &edges {
+                let u = u128::from(a as u64) * u128::from(b as u64);
+                let s = i128::from(a) * i128::from(b);
+                assert_eq!(IrBinOp::UMulHigh.eval_i64(a, b), Some((u >> 64) as i64));
+                assert_eq!(IrBinOp::SMulHigh.eval_i64(a, b), Some((s >> 64) as i64));
+                // Multiplication is symmetric even though the op is not
+                // flagged commutative.
+                assert_eq!(
+                    IrBinOp::UMulHigh.eval_i64(a, b),
+                    IrBinOp::UMulHigh.eval_i64(b, a)
+                );
+                // No 128-bit form: refusing beats evaluating at the wrong W.
+                assert_eq!(IrBinOp::UMulHigh.eval_i128(a.into(), b.into()), None);
+                assert_eq!(IrBinOp::SMulHigh.eval_i128(a.into(), b.into()), None);
+                for bits in [8u32, 16, 32, 64] {
+                    for signed in [false, true] {
+                        assert_eq!(
+                            mul_high_within_bits(a, b, bits, signed),
+                            reference(a, b, bits, signed),
+                            "a={a:#x} b={b:#x} bits={bits} signed={signed}"
+                        );
+                    }
+                }
+            }
+        }
+        // A narrow width is NOT the 64-bit high half truncated.
+        assert_eq!(mul_high_within_bits(0xFF, 0xFF, 8, false), 0xFE);
+        assert_eq!(mul_high_within_bits(-1, -1, 8, true), 0);
+        assert!(IrBinOp::UMulHigh.is_mul_high() && !IrBinOp::Mul.is_mul_high());
     }
 }

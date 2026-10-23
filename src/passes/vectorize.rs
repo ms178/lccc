@@ -6184,19 +6184,14 @@ fn roots_proven_distinct(
         | (ProvenObjectRoot::Alloca(_), ProvenObjectRoot::Param { .. }) => true,
         (ProvenObjectRoot::Param { noalias, .. }, _)
         | (_, ProvenObjectRoot::Param { noalias, .. }) => *noalias,
-        // Distinct linker names alone are not object identity: two public
-        // globals may be interposed or coalesced, and GNU aliases/asm labels
-        // can redirect either name. A strong, unredirected internal-linkage
-        // definition is different: its storage is private to this translation
-        // unit and cannot be the storage of a separately named public object.
-        // This matters for loop-invariant bounds loaded from an external global
-        // while the loop stores only to a private array. Opaque top-level asm,
-        // weak/common definitions, and known aliases are removed from
-        // `local_globals`/`aliased_names` before this proof is available.
+        // Distinct linker names alone are not object identity: GNU aliases
+        // and asm labels can redirect either name, and two declarations may be
+        // aliases defined in another unit.  A strong, unredirected, locally
+        // binding definition in this unit is an identity witness (see
+        // `module_symbol_facts`): `float a[N], b[N];` in executable code, or a
+        // private array against a loop-invariant external bound.
         (ProvenObjectRoot::Global(a), ProvenObjectRoot::Global(b)) => {
-            (symbol_facts.local_globals.contains(a) || symbol_facts.local_globals.contains(b))
-                && !symbol_facts.aliased_names.contains(a)
-                && !symbol_facts.aliased_names.contains(b)
+            symbol_facts.globals_distinct(a, b)
         }
         _ => true,
     }
@@ -6217,7 +6212,7 @@ mod roots_proven_distinct_tests {
     fn facts(local: &[&str], aliased: &[&str]) -> ModuleSymbolFacts {
         ModuleSymbolFacts {
             aliased_names: aliased.iter().map(|name| (*name).to_owned()).collect(),
-            local_globals: local.iter().map(|name| (*name).to_owned()).collect(),
+            identity_witnesses: local.iter().map(|name| (*name).to_owned()).collect(),
         }
     }
 
@@ -6318,12 +6313,19 @@ mod roots_proven_distinct_tests {
             &private_array,
         ));
 
-        // Two public names remain conservative: a linker alias or interposition
-        // may make them refer to the same storage.
+        // Two names without a witness remain conservative: a linker alias
+        // defined elsewhere, or interposition, may make them one object.
         assert!(!roots_proven_distinct(
             &Global("external_a".into()),
             &Global("external_b".into()),
             &ModuleSymbolFacts::default(),
+        ));
+        // One witness suffices: nothing else can reach a locally binding
+        // definition's storage.
+        assert!(roots_proven_distinct(
+            &Global("external_a".into()),
+            &Global("a".into()),
+            &private_array,
         ));
 
         let aliased = facts(&["a", "alias_a", "b"], &["a", "alias_a"]);

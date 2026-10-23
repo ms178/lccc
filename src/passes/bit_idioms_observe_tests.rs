@@ -239,6 +239,12 @@ fn fixture(case: usize, ty: IrType, ne: bool) -> IrFunction {
             let r = p.bin(IrBinOp::And, r, m);
             return p.finish(r);
         }
+        45 => {
+            // Case 28 with the operands swapped: `x >= ctpop(x)` / `x < ctpop(x)`.
+            let n = p.unary(IrUnaryOp::Popcount, x);
+            let r = p.compare(x, n, if ne { IrCmpOp::Ult } else { IrCmpOp::Uge });
+            return p.finish(r);
+        }
         _ => unreachable!(),
     };
     let result = p.compare(a, b, if ne { IrCmpOp::Ne } else { IrCmpOp::Eq });
@@ -349,9 +355,9 @@ fn evaluate(f: &IrFunction, x: u64, y: u64, c: u64) -> u64 {
     values[v.0 as usize]
 }
 #[test]
-fn production_45_families_both_widths_polarities_and_high_bits() {
+fn production_46_families_both_widths_polarities_and_high_bits() {
     for ty in [IrType::U32, IrType::U64, IrType::I32, IrType::I64] {
-        for case in 0..45 {
+        for case in 0..46 {
             for ne in [false, true] {
                 let before = fixture(case, ty, ne);
                 let mut after = before.clone();
@@ -478,6 +484,161 @@ fn defined_count_width_boundaries_and_bit_reversal_observations() {
                     assert_eq!(evaluate(&before, x, y, 1), evaluate(&after, x, y, 1));
                 }
             }
+        }
+    }
+}
+
+// Cost rule: peeling a producer that outlives the compare must pay for itself.
+fn cmp_operands(f: &IrFunction) -> Vec<(IrCmpOp, Operand, Operand)> {
+    f.blocks[0]
+        .instructions
+        .iter()
+        .filter_map(|i| match i {
+            Instruction::Cmp { op, lhs, rhs, .. } => Some((*op, *lhs, *rhs)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn run_and_check(before: &IrFunction) -> (usize, IrFunction) {
+    let mut after = before.clone();
+    let defs = definitions(&after);
+    let n = run(&mut after, &defs);
+    for x in [
+        0,
+        1,
+        2,
+        3,
+        9,
+        31,
+        0x80000000,
+        u32::MAX as u64,
+        1u64 << 63,
+        u64::MAX,
+    ] {
+        for y in [0, 1, 5, x ^ 4] {
+            assert_eq!(
+                evaluate(before, x, y, 7),
+                evaluate(&after, x, y, 7),
+                "x={x:#x} y={y:#x}"
+            );
+        }
+    }
+    (n, after)
+}
+
+#[test]
+fn shared_single_cycle_producer_keeps_its_compare() {
+    // hb = x ^ 31 has a second user, so `hb == 0 -> x == 31` would keep the
+    // XOR, save nothing, and stretch x across the compare (the `31 - clz`
+    // highbit shape whose x86 XOR pair can then no longer cancel).
+    for ty in [IrType::U32, IrType::U64] {
+        let mut p = Program::new(ty);
+        let x = Operand::Value(Value(0));
+        let k = p.c(31);
+        let hb = p.bin(IrBinOp::Xor, x, k);
+        let zero = p.c(0);
+        let is_zero = p.compare(hb, zero, IrCmpOp::Eq);
+        let five = p.c(5);
+        let other = p.bin(IrBinOp::Add, hb, five);
+        let result = p.bin(IrBinOp::Add, is_zero, other);
+        let before = p.finish(result);
+        let (_, after) = run_and_check(&before);
+        assert_eq!(
+            cmp_operands(&after),
+            vec![(IrCmpOp::Eq, hb, zero)],
+            "{ty:?}"
+        );
+    }
+}
+
+#[test]
+fn dying_single_cycle_producer_still_peels() {
+    for ty in [IrType::U32, IrType::U64] {
+        let mut p = Program::new(ty);
+        let x = Operand::Value(Value(0));
+        let k = p.c(31);
+        let hb = p.bin(IrBinOp::Xor, x, k);
+        let zero = p.c(0);
+        let result = p.compare(hb, zero, IrCmpOp::Eq);
+        let before = p.finish(result);
+        let (n, after) = run_and_check(&before);
+        assert!(n > 0, "{ty:?}");
+        let cmps = cmp_operands(&after);
+        assert_eq!(cmps.len(), 1);
+        assert_eq!((cmps[0].0, cmps[0].1), (IrCmpOp::Eq, x), "{ty:?}");
+        assert_eq!(const_in_ring(cmps[0].2, ty.size() * 8), Some(31));
+    }
+}
+
+#[test]
+fn shared_multi_cycle_producer_still_peels() {
+    // An odd multiply keeps running for its other user, but the compare
+    // leaves its 3-cycle latency chain: the peel still pays.
+    for ty in [IrType::U32, IrType::U64] {
+        let mut p = Program::new(ty);
+        let x = Operand::Value(Value(0));
+        let three = p.c(3);
+        let m = p.bin(IrBinOp::Mul, x, three);
+        let nine = p.c(9);
+        let is_nine = p.compare(m, nine, IrCmpOp::Eq);
+        let result = p.bin(IrBinOp::Add, is_nine, m);
+        let before = p.finish(result);
+        let (n, after) = run_and_check(&before);
+        assert!(n > 0, "{ty:?}");
+        let cmps = cmp_operands(&after);
+        assert_eq!((cmps[0].0, cmps[0].1), (IrCmpOp::Eq, x), "{ty:?}");
+        assert_eq!(const_in_ring(cmps[0].2, ty.size() * 8), Some(3));
+    }
+}
+
+#[test]
+fn shared_producer_still_allows_direct_bit_materialization() {
+    // ctz(x ^ 2) == 0 observes bit 0 of x through a shared XOR. Replacing
+    // cmp+setcc+movzx by one AND is cheaper than the compare regardless.
+    let mut p = Program::new(IrType::U32);
+    let x = Operand::Value(Value(0));
+    let two = p.c(2);
+    let t = p.bin(IrBinOp::Xor, x, two);
+    let tz = p.unary(IrUnaryOp::Ctz, t);
+    let zero = p.c(0);
+    let odd = p.compare(tz, zero, IrCmpOp::Eq);
+    let result = p.bin(IrBinOp::Add, odd, t);
+    let before = p.finish(result);
+    let (n, after) = run_and_check(&before);
+    assert!(n > 0);
+    assert!(
+        cmp_operands(&after).is_empty(),
+        "{:?}",
+        after.blocks[0].instructions
+    );
+}
+
+#[test]
+fn cancel_requires_one_side_to_pay() {
+    // (x ^ 7) == (y ^ 7) -> x == y only if at least one XOR dies with it.
+    for shared_sides in 0..=2usize {
+        let mut p = Program::new(IrType::U64);
+        let (x, y) = (Operand::Value(Value(0)), Operand::Value(Value(1)));
+        let k = p.c(7);
+        let a = p.bin(IrBinOp::Xor, x, k);
+        let b = p.bin(IrBinOp::Xor, y, k);
+        let eq = p.compare(a, b, IrCmpOp::Eq);
+        let mut result = eq;
+        for side in [a, b].into_iter().take(shared_sides) {
+            result = p.bin(IrBinOp::Add, result, side);
+        }
+        let before = p.finish(result);
+        let (_, after) = run_and_check(&before);
+        let cmps = cmp_operands(&after);
+        if shared_sides == 2 {
+            assert_eq!(cmps, vec![(IrCmpOp::Eq, a, b)]);
+        } else {
+            assert_eq!(
+                cmps,
+                vec![(IrCmpOp::Eq, x, y)],
+                "shared_sides={shared_sides}"
+            );
         }
     }
 }

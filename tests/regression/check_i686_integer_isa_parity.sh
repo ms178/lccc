@@ -1,72 +1,125 @@
 #!/usr/bin/env bash
-# ISA-parity audit: i686 gains the legacy-encoding integer ISA forms
-# (tzcnt F3 0F BC — BSF-decoding on pre-ABM hardware; popcnt F3 0F B8)
-# under EXPLICIT flags only, with the -mno-* veto and the macro contract
-# (__LZCNT__/__POPCNT__ mirror exactly what codegen may emit).
-# movbe/bmi1 stay x86-64-only: the i686 backend has no consumers for
-# them yet (granting a capability without a serving emitter reopens the
-# middle-end deferral cliff PR #607 closed).
+# Integer-ISA parity for the legacy F3-prefixed counting forms, x86-64 and
+# i686, under EXPLICIT flags only (-march profiles or -m<feature>), with the
+# -mno-* veto and the macro contract.
+#
+# Feature ownership follows GCC exactly:
+#   TZCNT (F3 0F BC)  <- BMI1  (-mbmi)    ; without it: BSF (+ zero fixup)
+#   LZCNT (F3 0F BD)  <- ABM   (-mlzcnt)  ; without it: BSR (+ zero fixup)
+#   POPCNT            <- -mpopcnt         ; without it: bit loop
+# The F3 forms never fault on CPUs lacking the feature: they execute as
+# BSF/BSR and return wrong results (Ctz(0)/Clz(x) garbage). So TZCNT must not
+# follow LZCNT: LZCNT-only CPUs (AMD K10, Bobcat, Jaguar) exist.
+#
+# __BMI__ stays undefined on i686 by design: the i686 backend consumes BMI1
+# only for TZCNT (no ANDN/BLSR lowering, and the middle end's ANDN-dependent
+# choices are x86-64-locked), so the macro would promise more than codegen
+# serves. __LZCNT__/__POPCNT__ mirror codegen exactly.
 set -euo pipefail
 CCC=${CCC:-./target/fastbuild/lccc}
+GCC_ORACLE=${GCC_ORACLE:-$(command -v gcc-16 || true)}
 tmp=${TMPDIR:-/tmp}/lccc-i686isa.$$
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp"
+fail() { echo "FAIL: $* (${BASH_SOURCE[0]##*/}:${BASH_LINENO[0]})" >&2; exit 1; }
 cat >"$tmp/t.c" <<'C'
 typedef unsigned int u32;
 u32 ctz(u32 x) { return (u32)__builtin_ctz(x); }
+u32 clz(u32 x) { return (u32)__builtin_clz(x); }
 u32 pop(u32 x) { return (u32)__builtin_popcount(x); }
-int main(void) { return (int)(ctz(8u) + pop(7u)); }
+int main(void) { return (int)(ctz(8u) + clz(1u) + pop(7u)); }
 C
+# has <file.s> <regex>
+has() { grep -qE "$2" "$1"; }
+asm() { "$CCC" -O2 "$@" -S "$tmp/t.c" -o "$tmp/out.s"; }
 
-# 1. Explicit flags: the forms are used, and the program still runs.
-"$CCC" -O2 -m32 -mlzcnt -mpopcnt -S "$tmp/t.c" -o "$tmp/on.s"
-grep -q 'tzcntl' "$tmp/on.s"
-grep -q 'popcntl' "$tmp/on.s"
-"$CCC" -O2 -m32 -mlzcnt -mpopcnt "$tmp/t.c" -o "$tmp/on"
-# Some developer hosts can *build* a freestanding i686 ELF but cannot run it:
-# their 32-bit ELF interpreter is absent. Still check assembly, vetoes and
-# predefined macros below; skip only the unavailable runtime assertion. CI
-# with an installed interpreter continues to require the actual exit code.
+# 1. All three granted on i686: every form is used and computes correctly.
+asm -m32 -mbmi -mlzcnt -mpopcnt
+has "$tmp/out.s" 'tzcntl' || fail "-m32 -mbmi: no tzcntl"
+has "$tmp/out.s" 'lzcntl' || fail "-m32 -mlzcnt: no lzcntl"
+has "$tmp/out.s" 'popcntl' || fail "-m32 -mpopcnt: no popcntl"
+"$CCC" -O2 -m32 -mbmi -mlzcnt -mpopcnt "$tmp/t.c" -o "$tmp/on"
+# Some developer hosts can *build* an i686 ELF but cannot run it (no 32-bit
+# interpreter). Assembly, veto and macro checks continue; CI with an
+# interpreter still requires the exit code.
 interp=$(readelf -l "$tmp/on" | sed -n 's/.*Requesting program interpreter: \([^]]*\)].*/\1/p')
 if [[ -n "$interp" && ! -e "$interp" ]]; then
-    echo "SKIP-RUN: i686 integer ISA binary requires missing $interp; assembly/macro checks continue"
+    echo "SKIP-RUN: i686 binary requires missing $interp; assembly/macro checks continue"
 else
     set +e
     "$tmp/on"
     st=$?
     set -e
-    # ctz(8)+pop(7) == 6: the ABM/SSE4.2 forms compute correctly at runtime.
-    [ "$st" -eq 6 ]
+    # ctz(8) + clz(1) + pop(7) == 3 + 31 + 3
+    [ "$st" -eq 37 ] || fail "runtime result $st != 37"
 fi
 
-# 2. Baseline -m32: broad-compatibility contract — no ABM/SSE4.2 forms.
-"$CCC" -O2 -m32 -S "$tmp/t.c" -o "$tmp/base.s"
-! grep -qE 'tzcnt|popcnt' "$tmp/base.s"
+# 2. Ownership: LZCNT alone never grants TZCNT, BMI1 alone never grants LZCNT.
+for m in "-m32" ""; do
+    asm $m -mlzcnt
+    has "$tmp/out.s" 'tzcnt' && fail "$m -mlzcnt emitted tzcnt (TZCNT is BMI1)"
+    has "$tmp/out.s" 'lzcnt' || fail "$m -mlzcnt: no lzcnt"
+    asm $m -mbmi
+    has "$tmp/out.s" 'tzcnt' || fail "$m -mbmi: no tzcnt"
+    has "$tmp/out.s" 'lzcnt' && fail "$m -mbmi emitted lzcnt (LZCNT is ABM)"
+done
 
-# 3. The -mno-* veto wins over the explicit grant.
-"$CCC" -O2 -m32 -mlzcnt -mno-lzcnt -S "$tmp/t.c" -o "$tmp/veto.s"
-! grep -q 'tzcnt' "$tmp/veto.s"
-"$CCC" -O2 -m32 -mpopcnt -mno-popcnt -S "$tmp/t.c" -o "$tmp/veto2.s"
-! grep -q 'popcnt' "$tmp/veto2.s"
+# 3. Baselines: broad-compatibility contract, no post-baseline integer form.
+for m in "-m32" ""; do
+    asm $m
+    has "$tmp/out.s" 'tzcnt|lzcnt|popcnt' && fail "baseline ${m:-x86-64} emitted a post-baseline form"
+done
 
-# 4. Macro contract mirrors codegen exactly (GCC defines the same set).
-"$CCC" -O2 -m32 -mlzcnt -mpopcnt -E "$tmp/t.c" 2>/dev/null | sed -n '1,1p' >/dev/null
-"$CCC" -O2 -m32 -mlzcnt -mpopcnt -S -o "$tmp/m1.s" /dev/null 2>/dev/null || true
-printf '#ifdef __LZCNT__\nint lz_m;\n#endif\n#ifdef __POPCNT__\nint pc_m;\n#endif\nint main(void){return 0;}\n' > "$tmp/m.c"
-"$CCC" -O2 -m32 -mlzcnt -mpopcnt -S "$tmp/m.c" -o "$tmp/m1.s"
-grep -q 'lz_m' "$tmp/m1.s" && grep -q 'pc_m' "$tmp/m1.s"
+# 4. -mno-* vetoes win over explicit grants and -march profiles, and each
+#    veto removes only its own form.
+asm -m32 -mbmi -mno-bmi
+has "$tmp/out.s" 'tzcnt' && fail "-m32 -mbmi -mno-bmi emitted tzcnt"
+asm -m32 -mlzcnt -mno-lzcnt
+has "$tmp/out.s" 'lzcnt' && fail "-m32 -mlzcnt -mno-lzcnt emitted lzcnt"
+asm -m32 -mpopcnt -mno-popcnt
+has "$tmp/out.s" 'popcnt' && fail "-m32 -mpopcnt -mno-popcnt emitted popcnt"
+asm -march=x86-64-v3
+has "$tmp/out.s" 'tzcnt' && has "$tmp/out.s" 'lzcnt' && has "$tmp/out.s" 'popcnt' \
+    || fail "-march=x86-64-v3 lacks a counting form"
+asm -march=x86-64-v3 -mno-lzcnt
+has "$tmp/out.s" 'lzcnt' && fail "v3 -mno-lzcnt emitted lzcnt"
+has "$tmp/out.s" 'tzcnt' || fail "v3 -mno-lzcnt lost tzcnt (BMI1 is independent)"
+asm -march=x86-64-v3 -mno-bmi
+has "$tmp/out.s" 'tzcnt' && fail "v3 -mno-bmi emitted tzcnt"
+has "$tmp/out.s" 'lzcnt' || fail "v3 -mno-bmi lost lzcnt (ABM is independent)"
+
+# 5. Macro contract mirrors codegen.
+printf '#ifdef __LZCNT__\nint lz_m;\n#endif\n#ifdef __POPCNT__\nint pc_m;\n#endif\n#ifdef __BMI__\nint bmi_m;\n#endif\n' >"$tmp/m.c"
+"$CCC" -O2 -m32 -mbmi -mlzcnt -mpopcnt -S "$tmp/m.c" -o "$tmp/m1.s"
+has "$tmp/m1.s" 'lz_m' && has "$tmp/m1.s" 'pc_m' || fail "i686 __LZCNT__/__POPCNT__ missing"
+has "$tmp/m1.s" 'bmi_m' && fail "i686 __BMI__ defined without ANDN/BLSR codegen"
 "$CCC" -O2 -m32 -S "$tmp/m.c" -o "$tmp/m2.s"
-! grep -q 'lz_m' "$tmp/m2.s"
-! grep -q 'pc_m' "$tmp/m2.s"
+has "$tmp/m2.s" 'lz_m|pc_m|bmi_m' && fail "baseline -m32 defines an integer-ISA macro"
+"$CCC" -O2 -mbmi -S "$tmp/m.c" -o "$tmp/m3.s"
+has "$tmp/m3.s" 'bmi_m' || fail "x86-64 -mbmi lacks __BMI__"
 
-# 5. x86-64 policy: the default build has no post-baseline integer class
-#    (POPCNT/TZCNT are opt-in); an explicit v3 profile grants them, and a later
-#    -mno-lzcnt still vetoes TZCNT under that profile.
-"$CCC" -O2 -S "$tmp/t.c" -o "$tmp/x64.s"
-! grep -qE 'tzcnt|popcnt' "$tmp/x64.s"
-"$CCC" -O2 -march=x86-64-v3 -S "$tmp/t.c" -o "$tmp/x64v3.s"
-grep -qE 'tzcnt|popcnt' "$tmp/x64v3.s"
-"$CCC" -O2 -march=x86-64-v3 -mno-lzcnt -S "$tmp/t.c" -o "$tmp/x64v.s"
-! grep -q 'tzcnt' "$tmp/x64v.s"
+# 6. GCC oracle: the Ctz/Clz instruction CLASS per flag set must match GCC
+#    (GCC's `rep bsf` is the BSF class: F3 0F BC executes as BSF without BMI1).
+if [[ -n "$GCC_ORACLE" ]]; then
+    class() { # <asm> -> "tz|bsf lz|bsr"
+        local tz=bsf lz=bsr
+        grep -qE '^\s*tzcnt' "$1" && tz=tz
+        grep -qE '^\s*lzcnt' "$1" && lz=lz
+        echo "$tz $lz"
+    }
+    checked=0
+    for flags in "-m32 -mlzcnt" "-m32 -mbmi" "-m32 -mbmi -mlzcnt" "-mlzcnt" "-mbmi" \
+                 "-march=x86-64-v3 -mno-bmi" "-march=x86-64-v3 -mno-lzcnt" "-march=x86-64-v3"; do
+        # A host GCC without -m32 support cannot judge the i686 rows.
+        "$GCC_ORACLE" -O2 $flags -S "$tmp/t.c" -o "$tmp/g.s" 2>/dev/null || continue
+        asm $flags
+        [ "$(class "$tmp/g.s")" = "$(class "$tmp/out.s")" ] \
+            || fail "oracle: '$flags' GCC=$(class "$tmp/g.s") LCCC=$(class "$tmp/out.s")"
+        checked=$((checked + 1))
+    done
+    echo "oracle: $checked flag sets match $("$GCC_ORACLE" -dumpfullversion)"
+else
+    echo "SKIP-ORACLE: no gcc-16 (set GCC_ORACLE) for the instruction-class cross-check"
+fi
 
 echo "i686 integer-ISA parity gate: PASS"

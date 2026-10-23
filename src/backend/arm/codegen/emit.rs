@@ -222,6 +222,8 @@ pub struct ArmCodegen {
     pub(super) value_types: FxHashMap<u32, IrType>,
     /// FP contraction contract; gates fmadd fusion (see supports_fused_float_mul_add).
     pub(super) fp_contract: crate::common::fp_contract::FpContract,
+    /// `CCC_NO_PREFETCH` (see `CodegenOptions::no_prefetch`).
+    pub(super) no_prefetch: bool,
     /// Frame size for the current function (needed for epilogue in terminators).
     pub(super) current_frame_size: i64,
     pub(super) current_return_type: IrType,
@@ -300,6 +302,7 @@ impl ArmCodegen {
             state: CodegenState::new_with_ra_config(ra_config),
             value_types: FxHashMap::default(),
             fp_contract: crate::common::fp_contract::FpContract::default(),
+            no_prefetch: false,
             current_frame_size: 0,
             current_return_type: IrType::I64,
             func_ret_is_f128_sse: false,
@@ -346,12 +349,14 @@ impl ArmCodegen {
     /// Apply all relevant options from a `CodegenOptions` struct.
     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
         self.state.disable_regalloc = opts.disable_regalloc;
+        self.state.apply_tls_options(opts);
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
         self.set_no_jump_tables(opts.no_jump_tables);
         self.set_general_regs_only(opts.general_regs_only);
         self.state.emit_cfi = opts.emit_cfi;
         self.fp_contract = opts.fp_contract;
+        self.no_prefetch = opts.no_prefetch;
     }
 
     /// Get the physical register assigned to an operand (if it's a Value with a register).

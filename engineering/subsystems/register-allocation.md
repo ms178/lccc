@@ -103,3 +103,16 @@ optional hot-loop allocation order),
 reads — unsound, A/B only). Phase 2f bisection: `CCC_SEGMENT_FILL_LIMIT=N`
 admits only the first N fills (in `CCC_DEBUG_SEGMENT_FILL` order), confined
 to one function by `CCC_SEGMENT_FILL_FUNC=name`.
+
+A/B kill switches for the homing work (presence-based, default off; for
+bisection and measurement, not supported configurations):
+`CCC_NO_FOLD_ADDR_DEFER` keeps constant-offset addresses `GEP p, C` whose
+accesses all fold against the base as ordinary allocation candidates. By
+default they are deferred (`defer_const_fold_addresses`) and the base is
+credited with their uses, so one register for `p` serves every `C(%reg)`
+access; bases that still lose their register get their addresses
+re-admitted (`RegAllocConfig::fold_readmit`). `CCC_NO_RDX_PARAM_HOMES` restores the
+whole-function rule that any `%rdx`-clobbering instruction (division,
+multiply-high, switch tables) keeps every x86-64 parameter out of the
+caller-saved pool; by default the position-aware `%rdx` hazard wave decides
+per parameter (`x86_rdx_clobbers_allow_param_homes`).

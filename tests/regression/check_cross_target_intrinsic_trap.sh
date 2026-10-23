@@ -180,13 +180,30 @@ for opt in -O0 -O2; do
     # Each non-x86 target must still LOWER the portable builtin, not merely
     # accept the file: asserting the arch's own square-root instruction is what
     # separates "the target gate spared this builtin" from "it produced
-    # something".
-    body=$(function_body portable_sqrt "$tmp/portable-$(basename "$ccc_arm")$tag.s")
-    grep -qE '^[[:space:]]+fsqrt[[:space:]]' <<<"$body" ||
-        fail "AArch64 $opt: portable_sqrt no longer lowers to fsqrt"
-    body=$(function_body portable_sqrt "$tmp/portable-$(basename "$ccc_riscv")$tag.s")
-    grep -qE '^[[:space:]]+fsqrt' <<<"$body" ||
-        fail "RISC-V $opt: portable_sqrt no longer lowers to fsqrt"
+    # something". Under the default -fmath-errno, `sqrt` of a negative input
+    # must set errno, so a call to `sqrt` is part of every correct lowering:
+    # the whole function at -O0 (GCC 16.2 emits exactly `bl sqrt`), the
+    # never-taken slow path behind the instruction at -O2. With
+    # -fno-math-errno the instruction alone is the lowering at every level.
+    for spec in "AArch64:$ccc_arm:fsqrt:bl" "RISC-V:$ccc_riscv:fsqrt\\.d:call"; do
+        IFS=: read -r arch tool insn call <<<"$spec"
+        body=$(function_body portable_sqrt "$tmp/portable-$(basename "$tool")$tag.s")
+        grep -qE "^[[:space:]]+$call[[:space:]]+sqrt\$" <<<"$body" ||
+            fail "$arch $opt: portable_sqrt lost its errno path (no call to sqrt)"
+        if [ "$opt" = -O2 ]; then
+            grep -qE "^[[:space:]]+$insn[[:space:]]" <<<"$body" ||
+                fail "$arch $opt: portable_sqrt no longer lowers to $insn"
+        fi
+        out=$tmp/portable-nme-$(basename "$tool")$tag.s
+        "$tool" "$opt" -fno-math-errno -S "$repo/tests/regression/cross_target_intrinsics/portable_only.c" \
+            -o "$out" 2>"$out.err" ||
+            { cat "$out.err" >&2; fail "$arch $opt -fno-math-errno: rejected a portable builtin"; }
+        body=$(function_body portable_sqrt "$out")
+        grep -qE "^[[:space:]]+$insn[[:space:]]" <<<"$body" ||
+            fail "$arch $opt -fno-math-errno: portable_sqrt no longer lowers to $insn"
+        ! grep -qE "^[[:space:]]+$call[[:space:]]+sqrt\$" <<<"$body" ||
+            fail "$arch $opt -fno-math-errno: portable_sqrt still calls sqrt"
+    done
 done
 
 # 3. Positive controls: an x86 target that HAS the extension keeps lowering the

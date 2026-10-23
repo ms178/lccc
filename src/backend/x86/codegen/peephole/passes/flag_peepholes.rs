@@ -7,6 +7,8 @@
 //!    and `movl %A,%D; addl %R,%D` → `leal (%A,%R),%D`.
 //!    One instruction less, and — crucially — `lea` does not write flags, which
 //!    is what makes transform 2 applicable to the loop bodies the backend emits.
+//!    [`fold_lea_add_into_lea`] — `leal d(%B,%I,s),%D; addl $k,%D` →
+//!    `leal d+k(%B,%I,s),%D` (the add folded into the LEA displacement).
 //! 2. [`fold_setcc_test_cmov`] — the backend materialises a comparison as a
 //!    0/1 byte, widens it, tests it, and feeds the test to a `cmov`. When no
 //!    instruction between the `setCC` and the `cmov` writes flags, the `cmov`
@@ -26,7 +28,9 @@
 //! conditional branch elsewhere may consume flags that were set before a label.
 
 use super::super::types::*;
-use super::helpers::{get_dest_reg, writes_family, writes_family_full};
+use super::helpers::{
+    get_dest_reg, is_read_modify_write, src_mentions_family, writes_family, writes_family_full,
+};
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
     dead_in_block_after, family_private_to, function_range, line_refs_family, plain_gp_operand,
@@ -747,6 +751,148 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
     changed
 }
 
+// ── 1a. lea + add-immediate → lea ───────────────────────────────────────────
+
+/// `lea{l,q} d(%B,%I,s), %D` + `{add,sub}{l,q} $k, %D` →
+/// `lea d±k(%B,%I,s), %D` — the add folded into the displacement. The
+/// multiply-by-constant plans emit `leal (%r,%r,2), %r` and the IR's
+/// following `+ 1` becomes `addl $1, %r`; GCC emits the single
+/// `leal 1(%rax,%rax,2), %eax`.
+///
+/// Soundness (all checked):
+/// * *Value.* `D = d + B + I*s`, then `D += k` is `d + k + B + I*s` in
+///   wrapping arithmetic. The result takes the ADD's width: a `leaq` + `addl`
+///   pair is the low 32 bits of `(B + I*s + d) + k`, which `leal` computes
+///   exactly (low bits never depend on high bits). A `leal` + `addq` pair adds
+///   `k` to the ZERO-EXTENDED 32-bit sum — not a LEA — and refuses.
+/// * *Displacement.* Only numeric displacements (no `sym(%rip)`, no
+///   relocation operator); `d + k` must fit the signed 32-bit field.
+/// * *Operands.* The LEA reads `B`/`I` before writing `D`, and the merged
+///   LEA reads them at the same point, so `B == D` or `I == D` is fine.
+///   `%rsp`/`%rbp` destinations are left alone (frame idioms), as in
+///   [`fold_copy_add_into_lea`].
+/// * *Flags.* `lea` writes none, so the ADD's flags must be provably dead.
+/// * *Adjacency.* Only NOPs between the two lines; neither may be pinned.
+pub(super) fn fold_lea_add_into_lea(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let lea = infos[i].trimmed(store.get(i));
+        let (lea_wide, lrest) = if let Some(r) = lea.strip_prefix("leaq ") {
+            (true, r)
+        } else if let Some(r) = lea.strip_prefix("leal ") {
+            (false, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        let Some((mem, lea_dst)) = split_two_operands(lrest) else {
+            i += 1;
+            continue;
+        };
+        let Some(dst_fam) = plain_gp_operand(lea_dst) else {
+            i += 1;
+            continue;
+        };
+        if dst_fam == REG_RSP
+            || dst_fam == REG_RBP
+            || !names_family_at_width(lea_dst, dst_fam, lea_wide)
+        {
+            i += 1;
+            continue;
+        }
+        let Some(open) = mem.find('(') else {
+            i += 1;
+            continue;
+        };
+        let (disp_text, addr) = mem.split_at(open);
+        if addr.contains("%rip") || !addr.ends_with(')') {
+            i += 1;
+            continue;
+        }
+        let Some(disp) = super::local_patterns::parse_lea_disp(disp_text) else {
+            i += 1;
+            continue;
+        };
+        let Some(j) = next_real(infos, i, len) else {
+            i += 1;
+            continue;
+        };
+        if infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let add = infos[j].trimmed(store.get(j));
+        let (add_wide, neg, arest) = if let Some(r) = add.strip_prefix("addq ") {
+            (true, false, r)
+        } else if let Some(r) = add.strip_prefix("addl ") {
+            (false, false, r)
+        } else if let Some(r) = add.strip_prefix("subq ") {
+            (true, true, r)
+        } else if let Some(r) = add.strip_prefix("subl ") {
+            (false, true, r)
+        } else {
+            i += 1;
+            continue;
+        };
+        // `leal` zero-extends; a following 64-bit add is not a LEA of the
+        // original operands.
+        if !lea_wide && add_wide {
+            i += 1;
+            continue;
+        }
+        let Some((imm_text, add_dst)) = split_two_operands(arest) else {
+            i += 1;
+            continue;
+        };
+        if !names_family_at_width(add_dst, dst_fam, add_wide) {
+            i += 1;
+            continue;
+        }
+        let Some(k) = imm_value(imm_text) else {
+            i += 1;
+            continue;
+        };
+        let Some(new_disp) = (if neg {
+            disp.checked_sub(k)
+        } else {
+            disp.checked_add(k)
+        }) else {
+            i += 1;
+            continue;
+        };
+        if new_disp < i32::MIN as i64 || new_disp > i32::MAX as i64 {
+            i += 1;
+            continue;
+        }
+        if !flags_dead_after(store, infos, j + 1) {
+            i += 1;
+            continue;
+        }
+        let (mnemonic, dst_name) = if add_wide {
+            ("leaq", REG_NAMES[0][dst_fam as usize])
+        } else {
+            ("leal", REG_NAMES[1][dst_fam as usize])
+        };
+        let disp_out = if new_disp == 0 {
+            String::new()
+        } else {
+            new_disp.to_string()
+        };
+        let new_line = format!("    {} {}{}, {}", mnemonic, disp_out, addr, dst_name);
+        mark_nop(&mut infos[i]);
+        replace_line(store, &mut infos[j], j, new_line);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
 // ── 1b. in-place add-immediate + copy → lea (the mirrored order) ─────────────
 
 /// `addq $imm, %S` + `movq %S, %D` → `leaq imm(%S), %D` (same for `l`, and
@@ -1056,6 +1202,31 @@ fn widen_copy_operands(t: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// Which `live` idiom families does line `info`/`t` retire?  `Some(mask)` when
+/// every live family the line references is PURELY and FULLY redefined by it
+/// (a >=32-bit destination write that reads neither explicitly -- source or
+/// address operand -- nor implicitly, and is not read-modify-write), so the
+/// old boolean copy is unobservable afterwards; `Some(0)` when the line does
+/// not touch them at all; `None` (abort the fold) when it reads one, writes
+/// one partially, or would retire `keep` (the register the pending `test`
+/// still has to read).  Acceptance-grade: built only from the shared
+/// dest-only and full-write predicates the liveness analysis uses.
+fn retiring_families(info: &LineInfo, t: &str, live: u16, keep: RegId) -> Option<u16> {
+    let touched = info.reg_refs & live;
+    if touched == 0 {
+        return Some(0);
+    }
+    let fam = get_dest_reg(info);
+    if fam == REG_NONE || fam > REG_GP_MAX || fam == keep || touched != 1u16 << fam {
+        return None;
+    }
+    let pure = writes_family_full(info, t, fam)
+        && !is_read_modify_write(t)
+        && !src_mentions_family(t, fam)
+        && implicit_read_refs(t.as_bytes()) & touched == 0;
+    pure.then_some(touched)
+}
+
 /// Split `cmovneq %r8, %rbx` into (`"ne"`, `"q"`, `"%r8"`, `"%rbx"`).
 fn parse_cmov(t: &str) -> Option<(&'static str, char, &str, &str)> {
     let rest = t.strip_prefix("cmov")?;
@@ -1166,6 +1337,16 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
         // fires whenever all of them really are dead -- so this costs reach
         // only for shapes that were never sound.
         let mut widened_mask: u16 = 0;
+        // Families of the idiom that a later line REDEFINED (pure full-width
+        // write, no read) after their last idiom use.  The old boolean copy
+        // is unobservable from there on, so deleting its definition is
+        // invisible; the family leaves `bool_mask`/`widened_mask` and every
+        // later proof (cmov operands, deadness, the rewritten line) reasons
+        // about the NEW value.  Refusing these lines made the fold depend on
+        // register choice: `movl %r14d, %r11d; leal 32(%r9), %r14d; testl
+        // %r11d, %r11d; cmovnel` (the allocator reusing the dead setcc
+        // register) kept setbe+movzbl+test in the ASCII case-fold loop.
+        let mut retired_mask: u16 = 0;
         while let Some(n) = next_real(infos, k, len) {
             k = n;
             if infos[n].pinned || infos[n].is_barrier() {
@@ -1192,9 +1373,11 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                     // condition.  Family equality is what makes the accepted
                     // 8-bit reads sound; text equality is what makes the wider
                     // ones impossible.
+                    // Either arm reads a LIVE carrier: a family retired by a
+                    // later redefinition no longer holds the boolean.
                     if sfam <= REG_GP_MAX
-                        && ((sfam == bool_fam && src == breg)
-                            || (widened_mask & (1u16 << sfam) != 0
+                        && ((sfam == bool_fam && src == breg && retired_mask & bool_mask == 0)
+                            || (widened_mask & !retired_mask & (1u16 << sfam) != 0
                                 && src == REG_NAMES[3][sfam as usize]))
                         && dfam != REG_NONE
                         && dfam <= REG_GP_MAX
@@ -1202,6 +1385,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                     {
                         tested_fam = dfam;
                         widened_mask |= 1u16 << dfam;
+                        retired_mask &= !(1u16 << dfam);
                         owned.push(n);
                         continue;
                     }
@@ -1227,10 +1411,11 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                                 && dfam != REG_RSP
                                 && src == REG_NAMES[size][sfam as usize]
                                 && dst == REG_NAMES[size][dfam as usize]
-                                && widened_mask & (1u16 << sfam) != 0
+                                && widened_mask & !retired_mask & (1u16 << sfam) != 0
                             {
                                 tested_fam = dfam;
                                 widened_mask |= 1u16 << dfam;
+                                retired_mask &= !(1u16 << dfam);
                                 owned.push(n);
                                 continue;
                             }
@@ -1275,21 +1460,40 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                 // allocator is free to place it after the test.  Such lines
                 // stay in the output; they only have to avoid the flags and
                 // the registers we are about to delete.
-                if infos[n].reg_refs & (bool_mask | widened_mask) != 0
-                    || flags_effect(tn) != FlagsEffect::Neutral
-                {
+                if flags_effect(tn) != FlagsEffect::Neutral {
                     break;
                 }
+                // The test consumed the boolean: any idiom family may retire.
+                let Some(r) = retiring_families(
+                    &infos[n],
+                    &tn,
+                    (bool_mask | widened_mask) & !retired_mask,
+                    REG_NONE,
+                ) else {
+                    break;
+                };
+                retired_mask |= r;
                 continue;
             }
-            // Any other line: it must neither touch the boolean (or its
-            // widened copy) nor the flags.
-            if infos[n].reg_refs & (bool_mask | widened_mask) != 0
-                || flags_effect(tn) != FlagsEffect::Neutral
-            {
+            // Any other line: it must not touch the flags, and may touch the
+            // boolean (or a widened copy) only by retiring it -- except the
+            // family the pending `test` still has to read.
+            if flags_effect(tn) != FlagsEffect::Neutral {
                 break;
             }
+            let Some(r) = retiring_families(
+                &infos[n],
+                &tn,
+                (bool_mask | widened_mask) & !retired_mask,
+                tested_fam,
+            ) else {
+                break;
+            };
+            retired_mask |= r;
         }
+        let bool_retired = retired_mask & bool_mask != 0;
+        let widened_mask = widened_mask & !retired_mask;
+        let bool_mask = bool_mask & !retired_mask;
 
         let (Some(test_i), Some(cmov_i)) = (test_idx, cmov_idx) else {
             i += 1;
@@ -1339,41 +1543,21 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
         // widened copy the `test`/`cmov` were reading.  A widened copy that is
         // live elsewhere keeps its definition (the transform is not
         // applicable), and the boolean likewise.
-        let bool_dead = matches!(lv.live_after(cmov_i, bool_fam), Some(false))
-            || dead_in_block_after(store, infos, cmov_i + 1, bool_fam)
-            || family_private_to(store, infos, i, bool_fam, &owned);
-        // Every widened copy the rewrite deletes needs its own deadness proof:
-        // one live copy is enough to make the deletion observable.
-        let mut widened_dead = true;
-        for fam in 0..=REG_GP_MAX {
-            if widened_mask & (1u16 << fam) == 0 || fam == bool_fam {
-                continue;
-            }
-            let dead = matches!(lv.live_after(cmov_i, fam), Some(false))
-                || dead_in_block_after(store, infos, cmov_i + 1, fam)
-                || family_private_to(store, infos, i, fam, &owned);
-            if !dead {
-                widened_dead = false;
-                break;
-            }
-        }
-        // Across a backedge, partial setcc writes can make this sequence's
-        // OWN deleted byte reads look live. Ask about the rewritten program
-        // before refusing: every carrier reference in this straight-line span
-        // is owned above; intervening surviving lines and the cmov mention none.
-        // Neutralize both reads AND writes, so an external reader still vetoes.
-        let carriers = bool_mask | widened_mask;
-        let carriers_dead = (bool_dead && widened_dead)
-            || matches!(
-                lv.live_after_dropping_region(store, infos, cmov_i, i, cmov_i, carriers),
-                Some(live) if live & carriers == 0
-            );
-        if !carriers_dead {
+        let carriers = IdiomCarriers {
+            setcc_i: i,
+            cmov_i,
+            bool_fam,
+            bool_mask,
+            widened_mask,
+            bool_retired,
+        };
+        if !carriers.all_dead_after_cmov(store, infos, &lv, &owned) {
             i += 1;
             continue;
         }
         let new_line = format!("    cmov{}{} {}, {}", new_cc, width, src, dst);
-        if line_refs_family(&new_line, bool_fam) {
+        // A retired boolean family names the redefining line's value.
+        if !bool_retired && line_refs_family(&new_line, bool_fam) {
             i += 1;
             continue;
         }
@@ -1388,6 +1572,71 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
         i = test_i.max(cmov_i) + 1;
     }
     changed
+}
+
+/// The registers that carry `fold_setcc_test_cmov`'s boolean: the setcc
+/// family itself and every widened copy (masks already exclude families a
+/// later line retired).
+#[derive(Clone, Copy)]
+struct IdiomCarriers {
+    setcc_i: usize,
+    cmov_i: usize,
+    bool_fam: RegId,
+    bool_mask: u16,
+    widened_mask: u16,
+    bool_retired: bool,
+}
+
+impl IdiomCarriers {
+    /// Whether every carrier dies with the idiom, so deleting its
+    /// definitions is unobservable.  `owned` holds every line the rewrite
+    /// deletes plus the cmov.
+    fn all_dead_after_cmov(
+        &self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        lv: &FileLiveness,
+        owned: &[usize],
+    ) -> bool {
+        let Self {
+            setcc_i: i,
+            cmov_i,
+            bool_fam,
+            bool_mask,
+            widened_mask,
+            bool_retired,
+        } = *self;
+        let bool_dead = bool_retired
+            || matches!(lv.live_after(cmov_i, bool_fam), Some(false))
+            || dead_in_block_after(store, infos, cmov_i + 1, bool_fam)
+            || family_private_to(store, infos, i, bool_fam, owned);
+        // Every widened copy the rewrite deletes needs its own deadness proof:
+        // one live copy is enough to make the deletion observable.
+        let mut widened_dead = true;
+        for fam in 0..=REG_GP_MAX {
+            if widened_mask & (1u16 << fam) == 0 || fam == bool_fam {
+                continue;
+            }
+            let dead = matches!(lv.live_after(cmov_i, fam), Some(false))
+                || dead_in_block_after(store, infos, cmov_i + 1, fam)
+                || family_private_to(store, infos, i, fam, owned);
+            if !dead {
+                widened_dead = false;
+                break;
+            }
+        }
+        // Across a backedge, partial setcc writes can make this sequence's
+        // OWN deleted byte reads look live. Ask about the rewritten program
+        // before refusing: every carrier reference in this straight-line span
+        // is owned above; intervening surviving lines and the cmov mention none.
+        // Neutralize both reads AND writes, so an external reader still vetoes.
+        let carriers = bool_mask | widened_mask;
+        (bool_dead && widened_dead)
+            || matches!(
+                lv.live_after_dropping_region(store, infos, cmov_i, i, cmov_i, carriers),
+                Some(live) if live & carriers == 0
+            )
+    }
 }
 
 // ── 3. copy + mask → zero-extending move ─────────────────────────────────────
@@ -4437,6 +4686,40 @@ mod widened_copy_tracking_tests {
         );
     }
 
+    // The allocator may recycle the dead setcc register before the test.
+    const RECYCLED: &str = "    cmpb $25, %r11b\n    setbe %r14b\n    movzbl %r14b, %r14d\n    movl %r14d, %r11d\n    LINE\n    testl %r11d, %r11d\n    movl %r9d, %r15d\n    cmovnel %r14d, %r15d\n    movl %r15d, %eax\n    ret";
+
+    #[test]
+    fn fuses_past_a_pure_redefinition_of_the_dead_boolean_register() {
+        let out = run(&f(&RECYCLED.replace("LINE", "leal 32(%r9), %r14d")));
+        assert!(
+            !out.contains("setbe"),
+            "fold refused a recycled register: {out}"
+        );
+        assert!(out.contains("cmovbel %r14d, "), "{out}");
+        assert!(out.contains("leal 32(%r9), %r14d"), "{out}");
+    }
+
+    #[test]
+    fn refuses_when_the_redefinition_reads_the_boolean() {
+        let out = run(&f(&RECYCLED.replace("LINE", "leal 32(%r14), %r14d")));
+        assert!(
+            out.contains("setbe %r14b"),
+            "boolean read after deletion: {out}"
+        );
+    }
+
+    #[test]
+    fn refuses_when_the_tested_copy_is_redefined_before_the_test() {
+        let asm = "    cmpb $25, %r11b\n    setbe %r14b\n    movzbl %r14b, %r11d\n    movl $5, %r11d\n    testl %r11d, %r11d\n    movl %r9d, %r15d\n    cmovnel %r10d, %r15d\n    movl %r15d, %eax\n    ret";
+        let out = run(&f(asm));
+        assert!(
+            out.contains("testl %r11d, %r11d"),
+            "tested a stale copy: {out}"
+        );
+        assert!(!out.contains("cmovbe"), "{out}");
+    }
+
     #[test]
     fn still_fuses_the_single_widening_shape() {
         // Control for the test above: one widening copy, used by the `test`,
@@ -4851,5 +5134,83 @@ mod conditional_increment_tests {
             ".cfi_endproc\n",
         ));
         assert!(!fold_inplace_add_copy_into_lea(&mut store2, &mut infos2));
+    }
+}
+
+#[cfg(test)]
+mod lea_add_tests {
+    //! `fold_lea_add_into_lea`: the add folds into the LEA displacement only
+    //! when the value, width, displacement range and flags clauses hold.
+    use super::super::peephole_optimize;
+
+    fn run(asm: &str) -> String {
+        peephole_optimize(asm.to_string())
+    }
+
+    fn f(body: &str) -> String {
+        format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n")
+    }
+
+    #[test]
+    fn lea_add_folds_into_displacement() {
+        let out = run(&f(
+            "    leal (%rdi, %rdi, 2), %eax\n    addl $1, %eax\n    ret",
+        ));
+        assert!(out.contains("leal 1(%rdi, %rdi, 2), %eax"), "{out}");
+        assert!(!out.contains("addl"), "{out}");
+    }
+
+    #[test]
+    fn lea_sub_folds_with_negated_displacement() {
+        let out = run(&f(
+            "    leaq 8(%rdi, %rsi, 4), %rax\n    subq $3, %rax\n    ret",
+        ));
+        assert!(out.contains("leaq 5(%rdi, %rsi, 4), %rax"), "{out}");
+        assert!(!out.contains("subq"), "{out}");
+    }
+
+    #[test]
+    fn lea_add_cancelling_to_zero_drops_the_displacement() {
+        let out = run(&f(
+            "    leaq 4(%rdi, %rsi, 2), %rax\n    subq $4, %rax\n    ret",
+        ));
+        assert!(out.contains("leaq (%rdi, %rsi, 2), %rax"), "{out}");
+    }
+
+    /// `leaq` + `addl` is the low 32 bits of the 64-bit sum plus k: `leal`.
+    #[test]
+    fn leaq_then_addl_becomes_leal() {
+        let out = run(&f(
+            "    leaq 3(%rdi, %rsi, 4), %rax\n    addl $5, %eax\n    ret",
+        ));
+        assert!(out.contains("leal 8(%rdi, %rsi, 4), %eax"), "{out}");
+    }
+
+    /// `leal` zero-extends; `addq` then adds to the zero-extended value,
+    /// which no LEA of the original operands computes.
+    #[test]
+    fn leal_then_addq_refuses() {
+        let out = run(&f(
+            "    leal 4(%rdi, %rsi, 2), %eax\n    addq $1, %rax\n    ret",
+        ));
+        assert!(out.contains("addq $1, %rax"), "{out}");
+    }
+
+    /// The add's flags are read: `lea` would not produce them.
+    #[test]
+    fn lea_add_refuses_when_flags_are_live() {
+        let out = run(&f(
+            "    leal (%rdi, %rdi, 2), %eax\n    addl $1, %eax\n    sete %cl\n    movzbl %cl, %edx\n    addl %edx, %eax\n    ret",
+        ));
+        assert!(out.contains("addl $1, %eax"), "{out}");
+    }
+
+    /// The merged displacement must fit the signed 32-bit field.
+    #[test]
+    fn lea_add_refuses_displacement_overflow() {
+        let out = run(&f(
+            "    leaq 2147483647(%rdi), %rax\n    addq $1, %rax\n    ret",
+        ));
+        assert!(!out.contains("2147483648("), "{out}");
     }
 }

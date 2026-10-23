@@ -47,6 +47,15 @@ __attribute__((noinline)) unsigned wide_test(signed char x) {
     } while (wide);
     return n;
 }
+__attribute__((noinline)) int budget(unsigned x) {
+    int left = 40;
+    while (x) { x &= x - 1; --left; }
+    return left;
+}
+__attribute__((noinline)) unsigned char narrow(unsigned long long x, unsigned char n) {
+    while (x) { x &= x - 1; n++; }
+    return n;
+}
 static unsigned reference(unsigned long long x) {
     unsigned n = 0;
     for (unsigned bit = 0; bit < 64; ++bit) n += (unsigned)((x >> bit) & 1);
@@ -56,6 +65,7 @@ int test(void) {
     for (unsigned x = 0; x < 65536; ++x) {
         unsigned ref = reference(x);
         if (pc32(x, ~0u - 3) != ref + (~0u - 3) || guarded(x) != ref) return 1;
+        if (budget(x) != 40 - (int)ref || narrow(x, 250) != (unsigned char)(250 + ref)) return 5;
     }
     for (unsigned bit = 0; bit < 64; ++bit) {
         unsigned long long x = 1ULL << bit;
@@ -65,6 +75,7 @@ int test(void) {
         if (wide_test((signed char)x) != reference((unsigned char)x) + (unsigned)(x < 0)) return 3;
     }
     if (pc64(0) != 0 || pc64(~0ULL) != 64) return 4;
+    if (narrow(~0ULL, 255) != 63 || narrow(0, 7) != 7 || budget(~0u) != 8) return 6;
     return 0;
 }
 """
@@ -119,7 +130,7 @@ def main():
             if arch == "riscv":
                 assert not re.search(r"\bcpopw?\b", text)
             else:
-                for function in ("pc32", "pc64", "pc64acc", "guarded"):
+                for function in ("pc32", "pc64", "pc64acc", "guarded", "budget", "narrow"):
                     assert bool(re.search(pattern, body(text, function))) == native, (arch, flags, function, text)
                 assert not re.search(pattern, body(text, "wide_test")), (arch, flags, text)
             # Sensitivity control: disabling loop_idiom must remove the native

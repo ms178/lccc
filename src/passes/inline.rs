@@ -153,6 +153,12 @@ const MAX_CALLER_INSTRUCTIONS_AFTER_INLINE: usize = 200;
 /// instructions in zstd's encoder) fall just above that limit, while every
 /// such clone is still charged to MAX_INLINE_BUDGET_PER_CALLER.
 const MAX_HOT_LOOP_INLINE_LEAF_INSTRUCTIONS: usize = 2 * MAX_INLINE_INSTRUCTIONS;
+/// Shape cap for an SROA-unlocking helper (`is_sroa_unlockable_candidate`).
+/// Admission is decided by the per-aggregate cost model in
+/// `sroa_unlockable_aliases_of` (cloned instructions <= removed accesses, and
+/// within the remaining budget); this only keeps a helper larger than a whole
+/// per-caller budget, which that budget could never admit, out of the model.
+const MAX_SROA_UNLOCK_HELPER_INSTRUCTIONS: usize = MAX_INLINE_BUDGET_PER_CALLER;
 
 /// Size limits for a declared-`inline` internal callee WITH a loop whose call
 /// site is inside a caller loop (see `is_hot_loop_helper_candidate`): zstd's
@@ -180,6 +186,141 @@ const MAX_ALWAYS_INLINE_INSTRUCTIONS: usize = 500;
 /// control flow (multiple if/else chains, error handling). Set high
 /// enough to handle all real kernel always_inline functions.
 const MAX_ALWAYS_INLINE_BLOCKS: usize = 500;
+
+/// Resource guard for `__attribute__((always_inline))` callees: GCC inlines
+/// them regardless of size (a failed always_inline is a hard error there,
+/// never a silent out-of-line call). The MAX_ALWAYS_INLINE_* limits above
+/// stay the *relaxed* tier for ordinary statics of section-attributed
+/// callers; applying them to always_inline left zstd's FORCE_INLINE_TEMPLATE
+/// bodies (`ZSTD_compressBlock_opt_generic`: 803 IR instructions,
+/// `ZSTD_compressBlock_lazy_generic`, `HUF_compress1X_usingCTable_internal_body_loop`)
+/// out of line, so their constant template arguments (`optLevel`,
+/// `searchMethod`, `dictMode`, unroll flags) were never propagated: c-19 ran
+/// 1.95x GCC's instruction count. The guard only stops pathological inputs
+/// (generated code) from exhausting memory; it is >10x every real body seen.
+const ALWAYS_INLINE_GUARD_INSTRUCTIONS: usize = 16_384;
+const ALWAYS_INLINE_GUARD_BLOCKS: usize = 4_096;
+
+/// Phase 0 stops draining a caller once mandatory expansion has grown it
+/// past this many IR instructions: acyclic always_inline expansion is
+/// unmetered, and an adversarial diamond DAG could otherwise multiply.
+const PHASE0_CALLER_GUARD_INSTRUCTIONS: usize = 262_144;
+
+/// A callee whose inlining cannot grow a recursive caller's frame: one block,
+/// at most `MAX_SMALL_INLINE_INSTRUCTIONS`, no stack object (`Alloca`,
+/// `DynAlloca`, non-promotable aggregate bytes) and no call of its own. It
+/// contributes only a few short-lived SSA temporaries, while the call it
+/// replaces costs a return-address push plus caller-saved spills per
+/// recursion level, so per-level stack use does not grow. zstd's
+/// `ZSTD_fracWeight` (12-18 IR instructions) inside the self-recursive
+/// `ZSTD_litLengthPrice` is the motivating case: GCC inlines it there,
+/// while the 5-instruction "tiny" limit left a call in the pricing loop.
+fn is_frame_neutral_leaf(data: &CalleeData, inst_count: usize) -> bool {
+    data.blocks.len() == 1
+        && inst_count <= MAX_SMALL_INLINE_INSTRUCTIONS
+        && data.agg_frame_bytes == 0
+        && data.blocks[0].instructions.iter().all(|inst| {
+            !matches!(
+                inst,
+                Instruction::Alloca { .. }
+                    | Instruction::DynAlloca { .. }
+                    | Instruction::Call { .. }
+                    | Instruction::CallIndirect { .. }
+            )
+        })
+}
+
+/// Names of defined functions that lie on a cycle of the module's direct
+/// call graph (self-loops included), by iterative Tarjan SCC in O(V + E).
+///
+/// Computed over the FULL call graph, not just always_inline functions:
+/// later ordinary inlining composes edges (X -> Z -> Y becomes X -> Y), and
+/// any cycle such composition can create already exists here, so this set
+/// is a sound superset for every round of the run.
+fn functions_on_call_cycles(module: &IrModule) -> FxHashSet<String> {
+    let index: FxHashMap<&str, usize> = module
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| !f.is_declaration)
+        .map(|(i, f)| (f.name.as_str(), i))
+        .collect();
+    let succs: Vec<Vec<usize>> = module
+        .functions
+        .iter()
+        .map(|f| {
+            let mut out: Vec<usize> = f
+                .blocks
+                .iter()
+                .flat_map(|b| b.instructions.iter())
+                .filter_map(|inst| match inst {
+                    Instruction::Call { func: callee, .. } => index.get(callee.as_str()).copied(),
+                    _ => None,
+                })
+                .collect();
+            out.sort_unstable();
+            out.dedup();
+            out
+        })
+        .collect();
+    let n = succs.len();
+    let mut order = vec![usize::MAX; n];
+    let mut low = vec![0usize; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut next = 0usize;
+    let mut cyclic = FxHashSet::default();
+    for root in 0..n {
+        if order[root] != usize::MAX {
+            continue;
+        }
+        // (node, index of the next successor to visit)
+        let mut work: Vec<(usize, usize)> = vec![(root, 0)];
+        order[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&mut (v, ref mut i)) = work.last_mut() {
+            if let Some(&w) = succs[v].get(*i) {
+                *i += 1;
+                if order[w] == usize::MAX {
+                    order[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    work.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(order[w]);
+                }
+                continue;
+            }
+            work.pop();
+            if let Some(&(parent, _)) = work.last() {
+                low[parent] = low[parent].min(low[v]);
+            }
+            if low[v] == order[v] {
+                let mut members = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack[w] = false;
+                    members.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                if members.len() > 1 || succs[v].contains(&v) {
+                    cyclic.extend(
+                        members
+                            .into_iter()
+                            .map(|m| module.functions[m].name.clone()),
+                    );
+                }
+            }
+        }
+    }
+    cyclic
+}
 
 /// Maximum instructions for a callee to be considered "tiny" and always inlined
 /// regardless of caller size. Tiny functions like `static inline bool f(void) { return false; }`
@@ -413,21 +554,51 @@ fn is_hot_leaf_candidate(data: &CalleeData) -> bool {
         && data.blocks.len() <= MAX_INLINE_BLOCKS_NO_LOOPS
 }
 
-/// Acyclic `static inline` leaf whose call site passes a pointer to a caller-
-/// local aggregate alloca (e.g. `BIT_flushBits(&blockStream)` or
-/// `BIT_addBits(&blockStream, ...)`): inlining it is what removes the last
+/// Acyclic internal-linkage helper whose call site passes a pointer to a
+/// caller-local aggregate alloca (e.g. `BIT_flushBits(&blockStream)`, or
+/// zstd's plain-static `HUF_initCStream(&bitC, ...)` /
+/// `HUF_closeCStream(&bitC)`): inlining it is what removes the last
 /// address-escape of that alloca so `aggregate_sroa` can split and promote its
 /// fields to SSA registers across the loop.
+///
+/// Declared `inline` is deliberately not required: whether the escape goes
+/// away does not depend on the keyword, and GCC auto-inlines such plain
+/// statics at -O2 (`-finline-small-functions`). Whether a candidate is worth
+/// cloning is decided per aggregate by the cost model in
+/// [`sroa_unlockable_aliases_of`], not by this shape test; the
+/// [`MAX_SROA_UNLOCK_HELPER_INSTRUCTIONS`] cap only keeps a helper larger than
+/// a whole per-caller budget out of that model. `always_inline` helpers are
+/// excluded because Phase 0 already drains them; one left behind keeps its
+/// aggregate disqualified (conservative).
 fn is_sroa_unlockable_candidate(data: &CalleeData) -> bool {
-    data.is_static_inline && is_hot_leaf_candidate(data)
+    let instructions: usize = data.blocks.iter().map(|b| b.instructions.len()).sum();
+    (data.is_static_inline || data.is_plain_static)
+        && !data.is_always_inline
+        && !data.has_loops
+        && !data.is_recursive
+        && !data.const_trip_only
+        && instructions <= MAX_SROA_UNLOCK_HELPER_INSTRUCTIONS
+        && data.blocks.len() <= MAX_INLINE_BLOCKS_NO_LOOPS
 }
 
 /// Collect caller values that alias a non-parameter local aggregate alloca
-/// (`size <= 64`) whose address only escapes as arguments to acyclic
-/// `static inline` helpers.
+/// (`size <= 64`) whose address only escapes as arguments to
+/// [`is_sroa_unlockable_candidate`] helpers, and whose unlock pays for itself.
+///
+/// Cost model (all-or-nothing per aggregate root): the unlock clones every
+/// escaping helper call, `cost = sum of their instruction counts`. It is
+/// admitted only when `cost <= accesses`, the caller's loads and stores of
+/// the root, each of which SROA turns into a register operation or nothing,
+/// and `cost <= growth_allowance`, the caller's remaining inline budget. A
+/// partial unlock is pure growth (the alloca stays in memory), so the test
+/// is on the whole remaining escape set. It is monotone under the inliner's
+/// own progress: cloning one helper lowers `cost` and the allowance by the
+/// same amount and only adds accesses (the clone's own loads and stores now
+/// name the root), so an unlock that starts also completes.
 fn sroa_unlockable_aliases_of(
     func: &IrFunction,
     callee_map: &FxHashMap<String, CalleeData>,
+    growth_allowance: usize,
 ) -> FxHashSet<Value> {
     if func.blocks.is_empty() {
         return FxHashSet::default();
@@ -440,6 +611,7 @@ fn sroa_unlockable_aliases_of(
     // the definition or the inliner unlocks an alloca SROA then refuses.
     let param_homes: FxHashSet<Value> = func.param_alloca_values.iter().copied().collect();
     let mut candidate_roots: FxHashSet<Value> = FxHashSet::default();
+    let mut root_size: FxHashMap<Value, usize> = FxHashMap::default();
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::Alloca {
@@ -454,6 +626,7 @@ fn sroa_unlockable_aliases_of(
                 && !param_homes.contains(dest)
             {
                 candidate_roots.insert(*dest);
+                root_size.insert(*dest, *size);
             }
         }
     }
@@ -461,6 +634,9 @@ fn sroa_unlockable_aliases_of(
         return FxHashSet::default();
     }
     let mut root_of: FxHashMap<Value, Value> = candidate_roots.iter().map(|&v| (v, v)).collect();
+    // Aliases that address their root at offset 0 (copies and zero GEPs):
+    // the only pointers a whole-object memset may name (form 4's rule 5b).
+    let mut zero_offset: FxHashSet<Value> = candidate_roots.clone();
     // Monotone and bounded by the value count, so this terminates; the old
     // `0..4` bound silently stopped seeing aliases on a longer `gep`/`copy`
     // chain, which only ever *over*-reported escapes (a pessimisation, but a
@@ -481,6 +657,15 @@ fn sroa_unlockable_aliases_of(
                             && root_of.insert(*dest, r).is_none()
                         {
                             added = true;
+                            let zero_step = match inst {
+                                Instruction::GetElementPtr { offset, .. } => {
+                                    matches!(offset, Operand::Const(c) if c.to_i64() == Some(0))
+                                }
+                                _ => true,
+                            };
+                            if zero_step && zero_offset.contains(src) {
+                                zero_offset.insert(*dest);
+                            }
                         }
                     }
                     _ => {}
@@ -492,32 +677,89 @@ fn sroa_unlockable_aliases_of(
         }
     }
     let mut disqualified: FxHashSet<Value> = FxHashSet::default();
+    // Per root: memory accesses SROA would remove, and instructions the
+    // unlock would clone.
+    let mut accesses: FxHashMap<Value, usize> = FxHashMap::default();
+    let mut unlock_cost: FxHashMap<Value, usize> = FxHashMap::default();
+    // A memset's result must be unused for form 4 to delete the call. The
+    // use set costs a pass over the function, so it is built only when a
+    // memset-family call is present (this analysis runs every inline round).
+    let mut used_values: FxHashSet<u32> = FxHashSet::default();
+    let has_memset = func.blocks.iter().any(|b| {
+        b.instructions.iter().any(
+            |i| matches!(i, Instruction::Call { func, .. } if func == "memset" || func == "__memset_chk"),
+        )
+    });
+    for block in func.blocks.iter().filter(|_| has_memset) {
+        for inst in &block.instructions {
+            inst.for_each_used_value(|v| {
+                used_values.insert(v);
+            });
+        }
+        block.terminator.for_each_used_value(|v| {
+            used_values.insert(v);
+        });
+    }
     for block in &func.blocks {
         for inst in &block.instructions {
             match inst {
-                Instruction::Load { .. }
-                | Instruction::GetElementPtr { .. }
-                | Instruction::Copy { .. } => {}
-                Instruction::Store { val, .. } => {
+                Instruction::GetElementPtr { .. } | Instruction::Copy { .. } => {}
+                Instruction::Load { ptr, .. } => {
+                    if let Some(&r) = root_of.get(ptr) {
+                        *accesses.entry(r).or_default() += 1;
+                    }
+                }
+                Instruction::Store { val, ptr, .. } => {
                     if let Operand::Value(v) = val
                         && let Some(&r) = root_of.get(v)
                     {
                         disqualified.insert(r);
+                    }
+                    if let Some(&r) = root_of.get(ptr) {
+                        *accesses.entry(r).or_default() += 1;
+                    }
+                }
+                // A whole-object constant library memset is rewritten into
+                // per-field stores by `aggregate_sroa` form 4 (rule 5b, same
+                // `const_memset` predicate), so it neither escapes the root
+                // nor costs an inline. Any other memset of a local object is
+                // refused there and disqualifies the root here.
+                Instruction::Call {
+                    func: callee_name,
+                    info,
+                } if crate::passes::aggregate_sroa::const_memset(callee_name, info).is_some() => {
+                    if let Some((p, _, len)) =
+                        crate::passes::aggregate_sroa::const_memset(callee_name, info)
+                        && let Some(&r) = root_of.get(&p)
+                    {
+                        let whole = zero_offset.contains(&p)
+                            && root_size.get(&r).is_some_and(|&n| n as i64 == len)
+                            && info.dest.is_none_or(|d| !used_values.contains(&d.0));
+                        if !whole {
+                            disqualified.insert(r);
+                        }
                     }
                 }
                 Instruction::Call {
                     func: callee_name,
                     info,
                 } => {
-                    let sroa_helper = callee_map
+                    let helper = callee_map
                         .get(callee_name)
-                        .is_some_and(is_sroa_unlockable_candidate);
-                    if !sroa_helper {
-                        for arg in &info.args {
-                            if let Operand::Value(v) = arg
-                                && let Some(&r) = root_of.get(v)
-                            {
-                                disqualified.insert(r);
+                        .filter(|data| is_sroa_unlockable_candidate(data));
+                    for arg in &info.args {
+                        if let Operand::Value(v) = arg
+                            && let Some(&r) = root_of.get(v)
+                        {
+                            match helper {
+                                Some(data) => {
+                                    let size: usize =
+                                        data.blocks.iter().map(|b| b.instructions.len()).sum();
+                                    *unlock_cost.entry(r).or_default() += size;
+                                }
+                                None => {
+                                    disqualified.insert(r);
+                                }
                             }
                         }
                     }
@@ -540,6 +782,12 @@ fn sroa_unlockable_aliases_of(
                 disqualified.insert(r);
             }
         });
+    }
+    for (&root, &cost) in &unlock_cost {
+        let paid = accesses.get(&root).copied().unwrap_or(0);
+        if cost > paid || cost > growth_allowance {
+            disqualified.insert(root);
+        }
     }
     root_of
         .into_iter()
@@ -854,9 +1102,13 @@ fn select_inline_site(
         if callee_data.is_recursive && !callee_data.is_always_inline {
             continue;
         }
-        // For recursive callers, skip non-tiny, non-always_inline callees.
-        // (Tiny callees were handled in the first pass.)
-        if caller_is_recursive && !callee_data.is_always_inline {
+        // For recursive callers, skip non-tiny, non-always_inline callees
+        // (tiny callees were handled in the first pass) unless the callee
+        // cannot grow the frame that recursion multiplies.
+        if caller_is_recursive
+            && !callee_data.is_always_inline
+            && !is_frame_neutral_leaf(callee_data, callee_inst_count)
+        {
             continue;
         }
         // Devirtualized hot leaf. A function-pointer template parameter
@@ -886,9 +1138,13 @@ fn select_inline_site(
         // overhead (argument setup, a callee-saved frame, the return) is
         // paid on each. Same knob, budget and absolute caller cap, so the
         // 2.5k-instruction doubleFast loop above stays excluded.
+        // SROA-unlocking helper: the alias set already admits only an
+        // aggregate whose whole escape set is paid for by the memory
+        // accesses SROA removes and fits the remaining budget (see
+        // `sroa_unlockable_aliases_of`), so the caller-size caps do not
+        // apply. Those caps bound frame and code growth, and this clone
+        // shrinks the frame by the aggregate's slot.
         let sroa_unlocking_leaf = hot_direct
-            && !caller_at_absolute_cap
-            && callee_data.is_static_inline
             && is_sroa_unlockable_candidate(callee_data)
             && site
                 .args
@@ -1161,6 +1417,11 @@ fn inline_run_with(
         callee_map.retain(|_, data| data.is_always_inline);
     }
 
+    // Functions on a cycle of the direct call graph. Phase 0 meters only
+    // these: an always_inline callee off every cycle can expose only callees
+    // strictly below it, so draining it terminates without a work counter.
+    let recursive_callees = functions_on_call_cycles(module);
+
     if callee_map.is_empty() {
         return 0;
     }
@@ -1273,10 +1534,16 @@ fn inline_run_with(
         //     cloned blocks always take labels strictly above
         //     `global_max_block_id` — are drained before any clone-born
         //     site, so the contract never queues behind churn;
-        //   * termination: each entry site is consumed by its own inlining
-        //     (|entry sites| steps), and clone-born sites share one bounded
-        //     work counter (2x entry sites + 16), so a recursive dispatcher
-        //     chain cannot chase the phase forever;
+        //   * termination: only callees on a cycle of the direct call graph
+        //     (`functions_on_call_cycles`) spend the bounded work counter
+        //     (2x entry sites + 16), so a recursive dispatcher chain cannot
+        //     chase the phase forever. Acyclic expansion is unmetered: every
+        //     drained body exposes only callees strictly below it in the
+        //     call DAG, so it terminates on its own -- a flat counter starved
+        //     nested FORCE_INLINE templates (zstd's HUF body: 10 body_loop
+        //     sites, each exposing encodeSymbol/addBits/flushBits) and left
+        //     template calls out of line. `PHASE0_CALLER_GUARD_INSTRUCTIONS`
+        //     bounds pathological DAG fan-out (diamond chains);
         //   * no budget gate: a mandatory inline is not an allocation
         //     decision, and phase successes do not touch the economics
         //     budgets the ordinary passes then spend purely on profit.
@@ -1295,7 +1562,12 @@ fn inline_run_with(
         })
         .count();
         let mut phase0_budget = 2 * entry_always_inline_sites + 16;
-        while phase0_budget > 0 {
+        let mut phase0_caller_size: usize = module.functions[func_idx]
+            .blocks
+            .iter()
+            .map(|b| b.instructions.len())
+            .sum();
+        while phase0_budget > 0 && phase0_caller_size <= PHASE0_CALLER_GUARD_INSTRUCTIONS {
             let sites = find_inline_call_sites(
                 &module.functions[func_idx],
                 &callee_map,
@@ -1338,7 +1610,14 @@ fn inline_run_with(
             ) {
                 break;
             }
-            phase0_budget -= 1;
+            phase0_caller_size += callee_data
+                .blocks
+                .iter()
+                .map(|b| b.instructions.len())
+                .sum::<usize>();
+            if recursive_callees.contains(&site.callee_name) {
+                phase0_budget -= 1;
+            }
             total_inlined += 1;
             module.functions[func_idx].has_inlined_calls = true;
             if debug_inline {
@@ -1444,6 +1723,7 @@ fn inline_run_with(
                                             is_inline: false,
                                             is_always_inline: false,
                                             is_noinline: false,
+                                            target_features: Vec::new(),
                                             next_value_id: 0,
                                             fp_expr_tags: Default::default(),
                                             next_label: 0,
@@ -1538,7 +1818,11 @@ fn inline_run_with(
                     };
                 let caller_has_loops = !loop_blocks.is_empty();
                 let sroa_unlockable_aliases = if hot_direct_enabled && !size_optimized {
-                    sroa_unlockable_aliases_of(&module.functions[func_idx], &callee_map)
+                    sroa_unlockable_aliases_of(
+                        &module.functions[func_idx],
+                        &callee_map,
+                        budget_remaining.max(hot_leaf_budget_remaining.unwrap_or(0)),
+                    )
                 } else {
                     FxHashSet::default()
                 };
@@ -1773,6 +2057,7 @@ fn inline_run_with(
                                             is_inline: false,
                                             is_always_inline: false,
                                             is_noinline: false,
+                                            target_features: Vec::new(),
                                             next_value_id: 0,
                                             fp_expr_tags: Default::default(),
                                             next_label: 0,
@@ -2517,6 +2802,9 @@ fn analyze_va_arg_pack(func: &IrFunction) -> Option<VaArgPackPlan> {
 #[derive(Clone)]
 struct CalleeData {
     blocks: Vec<BasicBlock>,
+    /// The callee's normalized `target("...")` feature set; see
+    /// [`target_isa_allows_inline`].
+    target_features: Vec<String>,
     /// Builtin assumptions under which this body was formed. Cloning must
     /// conservatively merge these into the caller before later synthesis.
     builtin_policy: crate::common::pass_policy::BuiltinPolicy,
@@ -3349,7 +3637,9 @@ fn callee_data_for(
         // inlinable into ordinary callers (not just section-attributed ones).
         let exceeds_normal = !is_always_inline && !fits_normal && !fits_single_call_site_static;
         if is_always_inline {
-            if !fits_relaxed {
+            if inst_count > ALWAYS_INLINE_GUARD_INSTRUCTIONS
+                || func.blocks.len() > ALWAYS_INLINE_GUARD_BLOCKS
+            {
                 return None;
             }
         } else {
@@ -3427,6 +3717,7 @@ fn callee_data_for(
 
         Some(CalleeData {
             blocks: func.blocks.clone(),
+            target_features: func.target_features.clone(),
             builtin_policy: func.pass_policy.builtins,
             param_struct_sizes,
             return_type: func.return_type,
@@ -3960,6 +4251,28 @@ fn func_has_vector_intrinsics(func: &IrFunction) -> bool {
 /// When true, callees that exceed normal inline limits (but fit relaxed limits)
 /// are also eligible, since cross-section calls from section-attributed functions
 /// (e.g., .head.text, .noinstr.text) can cause boot/runtime failures.
+/// GCC's `can_inline_p` ISA rule over `__attribute__((target(...)))`: a
+/// callee may be cloned into a caller only when every feature the callee
+/// names is also named by the caller (both sets are normalized: sorted and
+/// deduplicated).
+///
+/// Every inline path selects sites through [`find_inline_call_sites`], so
+/// this one check covers ordinary, always_inline and PGO-forced inlining.
+/// Two failure modes motivate it, both seen on zstd's runtime dispatch
+/// (`ZSTD_encodeSequences` → `static BMI2_TARGET_ATTRIBUTE
+/// ZSTD_encodeSequences_bmi2`, single call site):
+/// * the BMI2 clone inlined into its plain dispatcher is emitted under
+///   the dispatcher's baseline ISA, silently discarding the clone;
+/// * conversely, a plain caller absorbing a `target("avx2")` body would
+///   execute AVX2 on the path that runs *before* the CPUID check.
+///
+/// Refusing is always correct: the callee stays an ordinary call. A plain
+/// callee (empty set) inlines anywhere and inherits the caller's ISA,
+/// matching GCC (`static inline` helpers inside a `_bmi2` clone).
+fn target_isa_allows_inline(caller: &[String], callee: &[String]) -> bool {
+    callee.iter().all(|f| caller.binary_search(f).is_ok())
+}
+
 fn find_inline_call_sites(
     func: &IrFunction,
     callee_map: &FxHashMap<String, CalleeData>,
@@ -3982,6 +4295,14 @@ fn find_inline_call_sites(
                         if skip_list.iter().any(|s| s == callee_name) {
                             continue;
                         }
+                        // ISA contract: never clone a body that may use
+                        // extensions its caller was not compiled for.
+                        if !target_isa_allows_inline(
+                            &func.target_features,
+                            &callee_data.target_features,
+                        ) {
+                            continue;
+                        }
                         // Skip callees that exceed normal limits unless the caller
                         // has a section (cross-section calls are dangerous) or
                         // the callee is dead after inlining (single call site,
@@ -3991,13 +4312,12 @@ fn find_inline_call_sites(
                         if callee_data.exceeds_normal_limits
                             && !caller_has_section
                             && !callee_data.is_single_call_site_static
-                            // `is_sroa_unlockable_candidate` is a strict
-                            // subset of `is_hot_leaf_candidate` (see its
-                            // definition), so the hot-leaf clause below
-                            // already offers those sites; the SROA
-                            // admission decision is made per site in
-                            // `select_inline_site` (`sroa_unlocking_leaf`).
+                            // Hot-leaf and SROA-unlock candidates are
+                            // offered here; whether such a site is
+                            // admitted is decided in `select_inline_site`
+                            // (`hot_inline_leaf` / `sroa_unlocking_leaf`).
                             && !is_hot_leaf_candidate(callee_data)
+                            && !is_sroa_unlockable_candidate(callee_data)
                             && !is_hot_loop_helper_candidate(callee_data)
                         {
                             continue;
@@ -4115,41 +4435,22 @@ fn param_substitutable(callee: &CalleeData, param_idx: usize, home: Value) -> bo
 /// copy itself costs, so eliding them would be a pessimisation.
 const ELIDE_MEMCPY_MAX_BYTES: usize = 16;
 
-/// Elide `Instruction::Memcpy { dest, src, size }` into a small (`<= 16` byte)
-/// read-only local `Alloca` inside a call-free inlined body by re-rooting its
-/// `GetElementPtr` and `Load` readers directly at `src`.
-///
-/// Hot inline leaves such as zstd's `FSE_encodeSymbol` copy an 8-byte table
-/// entry into a local struct and read two 32-bit fields from it. Leaving the
-/// `Memcpy` in place forces both a stack round-trip and a `call_spanning`
-/// barrier in liveness/regalloc across every inlined site.
-///
-/// # Soundness
-///
-/// The local must be provably read-only *through the copy*: every load that
-/// consumes it reads bytes the `memcpy` just copied, so re-rooting that load at
-/// `src` reads the identical bytes. Anything else touching the local is an
-/// escape and disqualifies it:
-///
-/// * a write through an alias (`Store`, `AtomicRmw`, ...), which would need a
-///   destination that no longer exists;
-/// * a volatile read (the access itself is observable, and its address changes);
-/// * a use of the address that is not a `GetElementPtr`/`Copy`/`Load` reader —
-///   storing it, returning it, passing it on, `Select`ing it, ...;
-/// * a second copy in or out of it, or a copy of a different width;
-/// * any call, indirect call or inline asm in the body, which could observe it.
-///
-/// The alias closure is computed to a fixpoint before any escape is judged,
-/// because `BasicBlock` order is not dominance order: after inlining, a block
-/// that *uses* a `GetElementPtr` can precede the block that defines it, and a
-/// single interleaved pass would then judge the use before knowing the alias.
-///
-/// `GetElementPtr` and `Copy` of an alias are the only forms that keep
-/// aliasing; both are rewritten, so a chain `g = gep a+8; c = copy g` stays
-/// coherent.
-fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
+/// `(candidates: local -> size, src_of: local -> copy source, disqualified,
+/// copy_at: local -> entry-block index of its copy)`.
+type ElideMemcpySets = (
+    FxHashMap<u32, usize>,
+    FxHashMap<u32, Value>,
+    FxHashSet<u32>,
+    FxHashMap<u32, usize>,
+);
+
+/// Phase 1 of [`elide_readonly_local_memcpys`]: the small non-volatile
+/// entry-block locals, each with exactly one full-width entry-block copy
+/// (`src_of`) at a known position (`copy_at`), in a call/asm-free body.
+/// `None` when nothing can be elided.
+fn elide_memcpy_candidates(blocks: &[BasicBlock]) -> Option<ElideMemcpySets> {
     let Some(entry) = blocks.first() else {
-        return;
+        return None;
     };
     // ── candidates: non-volatile entry-block locals the copy could replace ──
     let mut candidates: FxHashMap<u32, usize> = FxHashMap::default();
@@ -4168,7 +4469,7 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
         }
     }
     if candidates.is_empty() {
-        return;
+        return None;
     }
     // A call can read or write the local through a pointer this analysis
     // cannot see (`lccc` marks nothing `restrict` here), and inline asm can do
@@ -4183,7 +4484,7 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
             )
         })
     }) {
-        return;
+        return None;
     }
     // ── exactly one full-width copy per candidate, from the entry block ──
     let mut src_of: FxHashMap<u32, Value> = FxHashMap::default();
@@ -4203,29 +4504,80 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
         }
     }
     if src_of.is_empty() {
-        return;
+        return None;
     }
-    // ── alias closure to a fixpoint (order-independent) ──
-    let mut root_of: FxHashMap<u32, u32> = src_of.keys().map(|&k| (k, k)).collect();
+    // Entry-block position of each candidate's copy: the only copy into the
+    // local the rewrite may delete, and the point its snapshot is taken.
+    let mut copy_at: FxHashMap<u32, usize> = FxHashMap::default();
+    for (idx, inst) in entry.instructions.iter().enumerate() {
+        if let Instruction::Memcpy { dest, src, .. } = inst
+            && src_of.get(&dest.0) == Some(src)
+        {
+            copy_at.insert(dest.0, idx);
+        }
+    }
+    Some((candidates, src_of, disqualified, copy_at))
+}
+
+/// Phase 2 of [`elide_readonly_local_memcpys`]: the alias closure with
+/// constant offsets. A value reached from two roots disqualifies both.
+fn elide_memcpy_alias_closure(
+    blocks: &[BasicBlock],
+    src_of: &FxHashMap<u32, Value>,
+    disqualified: &mut FxHashSet<u32>,
+) -> FxHashMap<u32, (u32, Option<i64>)> {
+    // ── alias closure with constant offsets, to a fixpoint ──
+    //
+    // `alias[v] = (root, Some(off))` when `v` is the candidate `root` plus the
+    // constant byte offset `off` (through `GetElementPtr`s with constant
+    // offsets and `Copy`s), `(root, None)` when an offset on the way is not a
+    // constant. The walk is order-independent because block order is not
+    // dominance order after inlining. A value seen with two different
+    // derivations only ever loses information (`Some -> None`), so the loop
+    // terminates; one reached from two roots disqualifies both.
+    let mut alias: FxHashMap<u32, (u32, Option<i64>)> =
+        src_of.keys().map(|&k| (k, (k, Some(0)))).collect();
     loop {
         let mut grew = false;
         for block in blocks.iter() {
             for inst in &block.instructions {
-                match inst {
-                    Instruction::GetElementPtr { dest, base, .. } => {
-                        if let Some(&r) = root_of.get(&base.0) {
-                            grew |= root_of.insert(dest.0, r).is_none();
-                        }
-                    }
+                let derived = match inst {
+                    Instruction::GetElementPtr {
+                        dest, base, offset, ..
+                    } => alias.get(&base.0).map(|&(root, off)| {
+                        let next = match (off, offset) {
+                            (Some(o), Operand::Const(c)) => {
+                                c.to_i64().and_then(|k| o.checked_add(k))
+                            }
+                            _ => None,
+                        };
+                        (dest.0, (root, next))
+                    }),
                     Instruction::Copy {
                         dest,
                         src: Operand::Value(v),
-                    } => {
-                        if let Some(&r) = root_of.get(&v.0) {
-                            grew |= root_of.insert(dest.0, r).is_none();
+                    } => alias.get(&v.0).map(|&a| (dest.0, a)),
+                    _ => None,
+                };
+                let Some((v, a)) = derived else {
+                    continue;
+                };
+                match alias.get(&v).copied() {
+                    None => {
+                        alias.insert(v, a);
+                        grew = true;
+                    }
+                    Some(old) if old == a => {}
+                    Some((old_root, old_off)) => {
+                        if old_root != a.0 {
+                            disqualified.insert(old_root);
+                            disqualified.insert(a.0);
+                        }
+                        if old_off.is_some() {
+                            alias.insert(v, (old_root, None));
+                            grew = true;
                         }
                     }
-                    _ => {}
                 }
             }
         }
@@ -4233,192 +4585,272 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
             break;
         }
     }
+    alias
+}
+
+/// Elide `Instruction::Memcpy { dest, src, size }` into a small (`<= 16` byte)
+/// read-only local `Alloca` inside a call-free inlined body: the local's
+/// readers read `src` directly, at the point of the copy.
+///
+/// Hot inline leaves such as zstd's `FSE_encodeSymbol` copy an 8-byte table
+/// entry into a local struct and read two 32-bit fields from it. Leaving the
+/// `Memcpy` in place forces both a stack round-trip and a `call_spanning`
+/// barrier in liveness/regalloc across every inlined site.
+///
+/// # Soundness
+///
+/// A reader of the local sees the bytes the copy took from `src` *when the
+/// copy ran*. Re-rooting a reader at `src` where it stands would read the
+/// bytes `src` holds *later*, which differs as soon as anything writes the
+/// source in between (a field store, a store through an aliasing pointer, a
+/// loop-carried update, the caller's object behind a by-value parameter).
+/// So every reader (`GetElementPtr` and `Copy` of the local, and the loads
+/// through them) is MOVED to just after the copy and reads `src` there:
+/// the same bytes at the same instant, whatever happens afterwards. This is
+/// scalar replacement of the copy, as GCC's SRA does it.
+///
+/// That move is valid when:
+///
+/// * the copy is in the entry block, which dominates the whole body, and
+///   every operand of a moved instruction exists there: `GetElementPtr`
+///   offsets are constants, and no load of the local precedes the copy;
+/// * each load reads a constant, in-bounds sub-range of the copied bytes with
+///   no segment override: a moved load may run on a path where the original
+///   did not, which cannot fault only on bytes the copy itself dereferenced;
+/// * the local is touched by nothing but its readers and that one copy. A
+///   write through an alias, a volatile read, any other use of the address
+///   (stored, returned, passed, `Select`ed, ...) or a second copy into it
+///   (matched by position, even from the same source value) disqualifies it;
+/// * the body has no call, indirect call or inline asm.
+///
+/// Copy chains (`L2 <- L1 <- p`, the inliner's double buffer for by-value
+/// parameters) resolve to the ultimate source and are snapshotted at the
+/// chain's first copy; a copy that survives while reading an elided local
+/// keeps that local instead. The alias closure is computed to a fixpoint
+/// before anything is judged, because `BasicBlock` order is not dominance
+/// order after inlining.
+fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
+    let Some((candidates, src_of, mut disqualified, copy_at)) = elide_memcpy_candidates(blocks)
+    else {
+        return;
+    };
+    let alias = elide_memcpy_alias_closure(blocks, &src_of, &mut disqualified);
+    let root_of = |v: u32| alias.get(&v).map(|&(root, _)| root);
     // ── escape scan: the local must be touched by nothing but its readers ──
-    for block in blocks.iter() {
-        for inst in &block.instructions {
+    for (bi, block) in blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
             match inst {
-                // Definitions and alias producers: not escapes, unless a
-                // candidate local's address is used as the INDEX of a GEP.
+                // Definitions and alias producers. An alias producer is moved
+                // to the copy, so every operand it has must exist there: a
+                // `GetElementPtr` of an alias needs a constant offset.
                 Instruction::Alloca { .. }
                 | Instruction::Copy { .. }
                 | Instruction::Fence { .. } => {}
-                Instruction::GetElementPtr { offset, .. } => {
-                    if let Operand::Value(v) = offset
-                        && let Some(&r) = root_of.get(&v.0)
+                Instruction::GetElementPtr { base, offset, .. } => {
+                    if let Some(root) = root_of(base.0)
+                        && !matches!(offset, Operand::Const(_))
                     {
-                        disqualified.insert(r);
+                        disqualified.insert(root);
+                    }
+                    if let Operand::Value(v) = offset
+                        && let Some(root) = root_of(v.0)
+                    {
+                        disqualified.insert(root);
                     }
                 }
-                // A non-volatile read of the local: re-rooted at `src`.
+                // A non-volatile read of the local: moved to the copy and
+                // re-rooted at the source. It must read a constant, in-bounds
+                // sub-range of the copied bytes (the hoisted load may now run
+                // on a path the original did not take, which is only safe on
+                // bytes the copy itself dereferenced), with no segment
+                // override, and it must not precede the copy.
                 Instruction::Load {
-                    volatile: false, ..
-                } => {}
-                // The copy itself: elided.
-                Instruction::Memcpy { dest, src, .. } if src_of.get(&dest.0) == Some(src) => {}
+                    ptr,
+                    ty,
+                    seg_override,
+                    volatile: false,
+                    ..
+                } => {
+                    if let Some(&(root, off)) = alias.get(&ptr.0) {
+                        let size = candidates.get(&root).copied().unwrap_or(0) as i64;
+                        let in_bounds = off.is_some_and(|o| {
+                            o >= 0
+                                && ty.access_extent().is_some_and(|(_, hi)| {
+                                    o.checked_add(hi).is_some_and(|end| end <= size)
+                                })
+                        });
+                        let after_copy = bi != 0 || copy_at.get(&root).is_some_and(|&c| ii > c);
+                        if !in_bounds || *seg_override != AddressSpace::Default || !after_copy {
+                            disqualified.insert(root);
+                        }
+                    }
+                }
+                // The candidate's own copy, by position: a second copy into
+                // the local (even from the same source value) refills it with
+                // newer bytes and is an escape like any other write.
+                Instruction::Memcpy { dest, src, .. }
+                    if bi == 0 && copy_at.get(&dest.0) == Some(&ii) =>
+                {
+                    // Its source may be another candidate (a copy chain) or an
+                    // alias of one at an offset; only the former is modelled.
+                    if let Some(root) = root_of(src.0)
+                        && root != src.0
+                    {
+                        disqualified.insert(dest.0);
+                        disqualified.insert(root);
+                    }
+                }
                 // Everything else: an alias in any operand is an escape. This
                 // includes writes through an alias, whose destination vanishes.
                 _ => inst.for_each_used_value(|v| {
-                    if let Some(&r) = root_of.get(&v) {
-                        disqualified.insert(r);
+                    if let Some(root) = root_of(v) {
+                        disqualified.insert(root);
                     }
                 }),
             }
         }
         block.terminator.for_each_used_value(|v| {
-            if let Some(&r) = root_of.get(&v) {
-                disqualified.insert(r);
+            if let Some(root) = root_of(v) {
+                disqualified.insert(root);
             }
         });
     }
-    src_of.retain(|k, _| !disqualified.contains(k));
-    if src_of.is_empty() {
+    // ── settle the elided set: chains, ordering and surviving copies ──
+    //
+    // A candidate's source can itself be a candidate: `memcpy(a, b)` where `b`
+    // has its own copy `memcpy(b, p)`. The inliner builds exactly those
+    // double-buffer chains for by-value struct parameters (`L2 home <- L1 home
+    // <- param pointer`). Every chain resolves to its ultimate source and is
+    // snapshotted at its FIRST copy (the one reading that source): `a` holds
+    // the bytes `b` took from `p` then, whatever `p` holds later. A later link
+    // must follow the earlier one in the entry block. A cycle has no ultimate
+    // source and is left alone. A copy that survives (its destination is
+    // kept) but reads an elided local would have to read the source late, so
+    // that local is kept too; dropping a local can break other chains, hence
+    // the fixpoint.
+    let mut elide: FxHashSet<u32> = src_of
+        .keys()
+        .copied()
+        .filter(|k| !disqualified.contains(k))
+        .collect();
+    let mut plan: FxHashMap<u32, (Value, usize)> = FxHashMap::default();
+    loop {
+        plan.clear();
+        for &cand in &elide {
+            let mut cur = cand;
+            let mut seen: FxHashSet<u32> = FxHashSet::default();
+            let mut ok = true;
+            // Walk to the ultimate source; positions must decrease.
+            let (src, at) = loop {
+                let src = src_of[&cur];
+                let at = copy_at[&cur];
+                if !elide.contains(&src.0) {
+                    break (src, at);
+                }
+                if !seen.insert(cur) || src.0 == cand || copy_at[&src.0] >= at {
+                    ok = false;
+                    break (src, at);
+                }
+                cur = src.0;
+            };
+            if ok {
+                plan.insert(cand, (src, at));
+            }
+        }
+        let mut next: FxHashSet<u32> = plan.keys().copied().collect();
+        for (d, s) in &src_of {
+            if !next.contains(d)
+                && let Some(root) = root_of(s.0)
+            {
+                next.remove(&root);
+            }
+        }
+        if next == elide {
+            break;
+        }
+        elide = next;
+    }
+    plan.retain(|k, _| elide.contains(k));
+    if plan.is_empty() {
         return;
     }
-    // ── collapse copy chains to their ultimate source ──
+    // ── rewrite: move every reader to its snapshot point, re-rooted ──
     //
-    // A candidate's source can itself be a candidate: `memcpy(a, b, 8)` where
-    // `b` is another small local with its own full-width copy. The inliner
-    // builds exactly those double-buffer chains for by-value struct
-    // parameters (`L2 home <- L1 home <- param pointer`). With a one-step
-    // rewrite, `a`'s readers would be re-rooted at `b` while `b`'s own copy
-    // and alloca are removed too, leaving a value with no definition -- an
-    // internal codegen error, or worse if the value happened to be reused.
-    // Resolving each chain to its last element makes the rewrite single-step
-    // again by construction. A cycle (`memcpy(a, b); memcpy(b, a)`) has no
-    // ultimate source and is left alone entirely.
-    // Track general pointer base roots so a candidate whose ultimate source
-    // root is written in the body (via Store, Atomic*, or another Memcpy) is
-    // never elided across a mutation of its source object.
-    let mut general_parent: FxHashMap<u32, u32> = FxHashMap::default();
-    for block in blocks.iter() {
-        for inst in &block.instructions {
-            match inst {
-                Instruction::GetElementPtr { dest, base, .. } => {
-                    general_parent.insert(dest.0, base.0);
-                }
-                Instruction::Copy {
-                    dest,
-                    src: Operand::Value(v),
-                } => {
-                    general_parent.insert(dest.0, v.0);
-                }
-                _ => {}
-            }
-        }
-    }
-    let trace_general_root = |mut v: u32| -> u32 {
-        let mut hops = 0usize;
-        while let Some(&p) = general_parent.get(&v) {
-            if p == v || hops >= 64 {
-                break;
-            }
-            v = p;
-            hops += 1;
-        }
-        v
-    };
-    let mut written_roots: FxHashSet<u32> = FxHashSet::default();
-    for (bi, block) in blocks.iter().enumerate() {
-        for inst in &block.instructions {
-            match inst {
-                Instruction::Store { ptr, .. }
-                | Instruction::AtomicRmw {
-                    ptr: Operand::Value(ptr),
-                    ..
-                }
-                | Instruction::AtomicCmpxchg {
-                    ptr: Operand::Value(ptr),
-                    ..
-                }
-                | Instruction::AtomicStore {
-                    ptr: Operand::Value(ptr),
-                    ..
-                }
-                | Instruction::AtomicInc {
-                    ptr: Operand::Value(ptr),
-                    ..
-                } => {
-                    written_roots.insert(trace_general_root(ptr.0));
-                }
-                Instruction::Memcpy { dest, src, .. }
-                    if bi != 0 || src_of.get(&dest.0) != Some(src) =>
-                {
-                    written_roots.insert(trace_general_root(dest.0));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut resolved: FxHashMap<u32, Value> = FxHashMap::default();
-    for (&cand, &src) in &src_of {
-        let mut cur = src;
-        let mut seen: FxHashSet<u32> = FxHashSet::default();
-        let mut chainable = true;
-        while let Some(&next) = src_of.get(&cur.0) {
-            if cur.0 == cand || !seen.insert(cur.0) {
-                chainable = false;
-                break;
-            }
-            cur = next;
-        }
-        if chainable && !written_roots.contains(&trace_general_root(cur.0)) {
-            resolved.insert(cand, cur);
-        }
-    }
-    let src_of = resolved;
-    if src_of.is_empty() {
-        return;
-    }
-    // ── rewrite: drop the local and its copy, re-root every reader ──
-    //
-    // Readers are `GetElementPtr`, `Copy`, non-volatile `Load`, and one more
-    // form that is easy to miss: a *surviving* `Memcpy` can read an elided
-    // local. The escape scan decides to skip a copy using the pre-retain map
-    // (`dest -> src`), so a copy whose destination is refused later -- by an
-    // escape elsewhere, or by the cycle rule -- survives while still reading a
-    // source that *is* elided. Its bytes are the ultimate source's bytes, so
-    // it is re-rooted there; leaving it alone would name a value whose
-    // definition was just removed.
-    for block in blocks.iter_mut() {
+    // Readers are `GetElementPtr`, `Copy` and non-volatile `Load` of an alias.
+    // Each is removed from its block, its root operand (the local itself) is
+    // replaced by the ultimate source, and the group is re-inserted where the
+    // chain's first copy was, in dependency order. Every reader then reads the
+    // source at the instant the copy did, so no later write to the source -- a
+    // store, an aliasing pointer, a loop-carried update -- can reach it. The
+    // entry block dominates the whole body, and every operand of a moved
+    // instruction (the source, a constant, an earlier moved value) is defined
+    // at that point, so each moved value still dominates all of its uses.
+    let elided_root = |v: u32| root_of(v).filter(|r| plan.contains_key(r));
+    // Each moved reader keeps its own debug location when its block has a
+    // parallel span vector (the line that names the field is the useful one
+    // to step to); otherwise it takes the copy's.
+    let mut moved: FxHashMap<usize, Vec<(u32, Instruction, Option<crate::common::source::Span>)>> =
+        FxHashMap::default();
+    // The entry block is rebuilt last: groups pulled from later blocks are
+    // inserted into it. `None` marks a removed slot.
+    let mut entry_slots: Vec<Option<Instruction>> = Vec::new();
+    for (bi, block) in blocks.iter_mut().enumerate() {
         let parallel =
             !block.source_spans.is_empty() && block.source_spans.len() == block.instructions.len();
         let old_spans = std::mem::take(&mut block.source_spans);
         let mut kept: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
         let mut spans = Vec::with_capacity(old_spans.len());
         for (idx, mut inst) in block.instructions.drain(..).enumerate() {
-            match &mut inst {
-                Instruction::Alloca { dest, .. } if src_of.contains_key(&dest.0) => continue,
-                Instruction::Memcpy { dest, .. } if src_of.contains_key(&dest.0) => continue,
-                Instruction::GetElementPtr { base, .. } => {
-                    if let Some(&src) = src_of.get(&base.0) {
-                        *base = src;
-                    }
+            // Decide first, move afterwards: (drop, Some((root, used)) if moved).
+            let (drop, mv) = match &mut inst {
+                Instruction::Alloca { dest, .. } | Instruction::Memcpy { dest, .. }
+                    if plan.contains_key(&dest.0) =>
+                {
+                    (true, None)
                 }
-                Instruction::Load { ptr, .. } => {
-                    if let Some(&src) = src_of.get(&ptr.0) {
-                        *ptr = src;
-                    }
-                }
-                Instruction::Memcpy { src, .. } => {
-                    if let Some(&replacement) = src_of.get(&src.0) {
-                        *src = replacement;
-                    }
-                }
-                Instruction::Copy {
-                    src: Operand::Value(v),
+                Instruction::GetElementPtr { base: p, .. }
+                | Instruction::Load { ptr: p, .. }
+                | Instruction::Copy {
+                    src: Operand::Value(p),
                     ..
-                } => {
-                    if let Some(&src) = src_of.get(&v.0) {
-                        *v = src;
+                } => match elided_root(p.0) {
+                    Some(root) => {
+                        let used = p.0;
+                        if let Some(&(src, _)) = plan.get(&used) {
+                            *p = src;
+                        }
+                        (true, Some((root, used)))
                     }
+                    None => (false, None),
+                },
+                _ => (false, None),
+            };
+            if let Some((root, used)) = mv {
+                let span = parallel.then(|| old_spans[idx]);
+                moved
+                    .entry(plan[&root].1)
+                    .or_default()
+                    .push((used, inst, span));
+                if bi == 0 {
+                    entry_slots.push(None);
                 }
-                _ => {}
+                continue;
+            }
+            if bi == 0 {
+                entry_slots.push((!drop).then_some(inst));
+                continue;
+            }
+            if drop {
+                continue;
             }
             kept.push(inst);
             if parallel {
                 spans.push(old_spans[idx]);
             }
+        }
+        if bi == 0 {
+            block.source_spans = old_spans;
+            continue;
         }
         block.instructions = kept;
         // Never drop a span vector: a vector that does not parallel the
@@ -4426,6 +4858,33 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
         // debug locations beat none).
         block.source_spans = if parallel { spans } else { old_spans };
     }
+    let entry = &mut blocks[0];
+    let parallel = !entry.source_spans.is_empty() && entry.source_spans.len() == entry_slots.len();
+    let old_spans = std::mem::take(&mut entry.source_spans);
+    let mut insts: Vec<Instruction> = Vec::with_capacity(entry_slots.len());
+    let mut spans = Vec::with_capacity(old_spans.len());
+    for (idx, slot) in entry_slots.into_iter().enumerate() {
+        if let Some(inst) = slot {
+            insts.push(inst);
+            if parallel {
+                spans.push(old_spans[idx]);
+            }
+        }
+        if let Some(group) = moved.remove(&idx) {
+            for (inst, span) in order_moved_readers(group, &plan) {
+                insts.push(inst);
+                if parallel {
+                    spans.push(span.unwrap_or(old_spans[idx]));
+                }
+            }
+        }
+    }
+    debug_assert!(
+        moved.is_empty(),
+        "every snapshot point is an entry-block copy"
+    );
+    entry.instructions = insts;
+    entry.source_spans = if parallel { spans } else { old_spans };
     // Machine-checked post-condition: nothing may still reference a local or
     // copy that no longer exists. Debug builds pay one linear scan; the
     // invariant is exactly what a future edit to this function could break.
@@ -4433,16 +4892,47 @@ fn elide_readonly_local_memcpys(blocks: &mut [BasicBlock]) {
         blocks.iter().all(|b| {
             let insts_clean = b.instructions.iter().all(|i| {
                 let mut clean = true;
-                i.for_each_used_value(|v| clean &= !src_of.contains_key(&v));
+                i.for_each_used_value(|v| clean &= !plan.contains_key(&v));
                 clean
             });
             let mut term_clean = true;
             b.terminator
-                .for_each_used_value(|v| term_clean &= !src_of.contains_key(&v));
+                .for_each_used_value(|v| term_clean &= !plan.contains_key(&v));
             insts_clean && term_clean
         }),
         "elided memcpy local still referenced after rewrite"
     );
+}
+
+/// Order one snapshot group of moved readers so every value is defined before
+/// it is used. `used` is the alias operand each reader consumed: a root (the
+/// elided local, now replaced by its source) or another moved reader's value.
+/// SSA makes the alias graph a forest rooted at the elided locals, so every
+/// round emits at least one reader.
+fn order_moved_readers<S>(
+    group: Vec<(u32, Instruction, S)>,
+    roots: &FxHashMap<u32, (Value, usize)>,
+) -> Vec<(Instruction, S)> {
+    let mut defined: FxHashSet<u32> = FxHashSet::default();
+    let mut out = Vec::with_capacity(group.len());
+    let mut pending = group;
+    while !pending.is_empty() {
+        let before = pending.len();
+        let mut rest = Vec::new();
+        for (used, inst, extra) in pending {
+            if roots.contains_key(&used) || defined.contains(&used) {
+                if let Some(d) = inst.dest() {
+                    defined.insert(d.0);
+                }
+                out.push((inst, extra));
+            } else {
+                rest.push((used, inst, extra));
+            }
+        }
+        assert!(rest.len() < before, "moved readers form a cycle");
+        pending = rest;
+    }
+    out
 }
 
 /// IR type of a caller-side operand; needed to substitute call args at the
@@ -5300,6 +5790,7 @@ fn remap_call_info(info: &CallInfo, vo: u32) -> CallInfo {
         assume_library: info.assume_library,
         ret_eightbyte_classes: info.ret_eightbyte_classes.clone(),
         ret_is_f128_sse: info.ret_is_f128_sse,
+        cold: info.cold,
     }
 }
 
@@ -6029,6 +6520,7 @@ mod inline_limit_tests {
 
     fn wrapper_policy_data(block_count: usize) -> CalleeData {
         CalleeData {
+            target_features: Vec::new(),
             builtin_policy: Default::default(),
             blocks: (0..block_count)
                 .map(|index| BasicBlock {
@@ -6264,6 +6756,7 @@ mod value_reference_tests {
             is_inline: false,
             is_always_inline: false,
             is_noinline: false,
+            target_features: Vec::new(),
             next_value_id: 2,
             fp_expr_tags: Default::default(),
             next_label: 2,
@@ -6322,7 +6815,6 @@ mod value_reference_tests {
             is_const: false,
             is_used: false,
             is_thread_local: false,
-            tls_model: None,
         }];
         let (referenced, asm) = collect_value_referenced_functions(&module);
         assert!(function_referenced_as_value("callee", &referenced, &asm));
@@ -6757,6 +7249,7 @@ mod const_trip_tests {
             is_inline: false,
             is_always_inline: false,
             is_noinline: false,
+            target_features: Vec::new(),
             next_value_id: 16,
             fp_expr_tags: Default::default(),
             next_label: 8,
@@ -7279,20 +7772,27 @@ mod feature_switch_tests {
     /// first pass's always_inline budget admit, so the last `ai` clones are
     /// inserted by the second pass, after the ordinary rounds ended; each
     /// carries a call to the tiny `leaf`, which the ordinary policy accepts
-    /// at any caller size.
+    /// at any caller size. Phase 0 meters only callees on a call cycle, so
+    /// `ai` recurses through the never-inlined `rec`: acyclic templates are
+    /// drained completely and would never reach the second pass. `f` comes
+    /// first in module (processing) order, so it clones the raw `gen` rather
+    /// than `gen`'s processed snapshot, in which `gen`'s own drain left no
+    /// `ai` site.
     fn joint_fixpoint_module() -> IrModule {
         let mut leaf = function("leaf", 3, &[]);
         leaf.is_static = true;
         leaf.is_inline = true;
-        let mut ai = function("ai", 24, &["leaf"]);
+        let mut ai = function("ai", 24, &["leaf", "rec"]);
         ai.is_static = true;
         ai.is_always_inline = true;
+        let mut rec = function("rec", 0, &["ai"]);
+        rec.is_noinline = true;
         let mut generator = function("gen", 0, &["ai"; 40]);
         generator.is_static = true;
         generator.is_always_inline = true;
         let caller = function("f", 0, &["gen"]);
         let mut module = IrModule::new();
-        module.functions = vec![leaf, ai, generator, caller];
+        module.functions = vec![caller, leaf, ai, rec, generator];
         module
     }
 
@@ -7314,6 +7814,29 @@ mod feature_switch_tests {
             calls_to(&off, "f", "leaf") > 0,
             "negative control: without the joint fixpoint the exposed calls survive"
         );
+    }
+
+    /// zstd's HUF shape: one entry site whose always_inline body exposes many
+    /// acyclic template sites (`HUF_compress1X_usingCTable_internal_body`:
+    /// ten `body_loop` clones). A flat Phase 0 counter (2x entry + 16 steps)
+    /// drained 17 of them, and the instruction-metered first and second
+    /// passes (200 + 400) cannot absorb the remaining 23 x 30, so template
+    /// calls stayed out of line. Acyclic expansion must drain completely.
+    #[test]
+    fn phase0_drains_acyclic_template_fanout_completely() {
+        let mut template = function("template", 30, &[]);
+        template.is_static = true;
+        template.is_always_inline = true;
+        let mut body = function("body", 0, &["template"; 40]);
+        body.is_static = true;
+        body.is_always_inline = true;
+        let caller = function("f", 0, &["body"]);
+        let mut module = IrModule::new();
+        // `f` first: it clones the raw `body` (see joint_fixpoint_module).
+        module.functions = vec![caller, template, body];
+        let out = run(module, InlineFeatures::ALL);
+        assert_eq!(calls_to(&out, "f", "body"), 0);
+        assert_eq!(calls_to(&out, "f", "template"), 0, "always_inline contract");
     }
 
     /// A processed single-call-site static must be cloned as processed.
@@ -7826,10 +8349,10 @@ mod extern_admission_tests {
         };
         let callees: FxHashMap<String, CalleeData> = FxHashMap::default();
         assert!(
-            sroa_unlockable_aliases_of(&build(true), &callees).is_empty(),
+            sroa_unlockable_aliases_of(&build(true), &callees, usize::MAX).is_empty(),
             "a parameter home is never an SROA unlock candidate"
         );
-        let locals = sroa_unlockable_aliases_of(&build(false), &callees);
+        let locals = sroa_unlockable_aliases_of(&build(false), &callees, usize::MAX);
         assert!(
             locals.contains(&Value(1)) && locals.contains(&Value(2)),
             "a non-escaping local aggregate and its GEP alias are candidates: {locals:?}"
@@ -7895,12 +8418,12 @@ mod extern_admission_tests {
         );
     }
 
-    /// The escape scan skips a copy by consulting `dest -> src` *before* the
-    /// map is pruned, so a copy whose destination is refused later survives
-    /// while reading a source that is still elided. That surviving copy must be
-    /// re-rooted instead of naming a value with no definition left.
+    /// A copy whose destination is refused survives, and it reads its source
+    /// local when it runs. Re-rooting it at the ultimate source would read
+    /// that source LATE (after any write between the two copies), so the
+    /// local it reads is kept, with its own copy, instead.
     #[test]
-    fn surviving_copy_reading_an_elided_local_is_rerooted() {
+    fn surviving_copy_keeps_the_local_it_reads() {
         use crate::common::types::AddressSpace;
 
         let alloca = |dest: u32| Instruction::Alloca {
@@ -7949,23 +8472,216 @@ mod extern_admission_tests {
             "the written-through local must survive"
         );
         assert!(
-            !blocks[0]
+            blocks[0]
                 .instructions
                 .iter()
                 .any(|i| matches!(i, Instruction::Alloca { dest: Value(2), .. })),
-            "the read-only local is elided"
+            "the local a surviving copy reads must be kept"
         );
+        for (dest, src) in [(2, 10), (1, 2)] {
+            assert!(
+                blocks[0].instructions.iter().any(|i| matches!(
+                    i,
+                    Instruction::Memcpy { dest: Value(d), src: Value(s), .. } if *d == dest && *s == src
+                )),
+                "copy {dest} <- {src} must be unchanged"
+            );
+        }
+    }
+
+    // ── snapshot semantics: readers move to the copy ────────────────────────
+
+    fn elide_alloca(dest: u32, size: usize) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        }
+    }
+
+    fn elide_copy(dest: u32, src: u32, size: usize) -> Instruction {
+        Instruction::Memcpy {
+            dest: Value(dest),
+            src: Value(src),
+            size,
+        }
+    }
+
+    fn elide_gep(dest: u32, base: u32, offset: Operand) -> Instruction {
+        Instruction::GetElementPtr {
+            dest: Value(dest),
+            base: Value(base),
+            offset,
+            ty: IrType::I32,
+        }
+    }
+
+    fn elide_load(dest: u32, ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Load {
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    fn elide_store(ptr: u32) -> Instruction {
+        Instruction::Store {
+            val: Operand::Const(IrConst::I32(99)),
+            ptr: Value(ptr),
+            ty: IrType::I32,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    fn elide_block(id: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
+        BasicBlock {
+            label: BlockId(id),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        }
+    }
+
+    fn has_copy_into(blocks: &[BasicBlock], dest: u32) -> bool {
+        blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Memcpy { dest: Value(d), .. } if *d == dest))
+        })
+    }
+
+    /// `E e = *t; t->a = 99; return e.a;` -- the source is written after the
+    /// copy and the read sits in a later block. The read must move to the
+    /// copy (and read the source there), never stay behind the store.
+    #[test]
+    fn reader_moves_to_the_copy_ahead_of_a_source_write() {
+        let mut blocks = vec![
+            elide_block(
+                0,
+                vec![elide_alloca(1, 8), elide_copy(1, 10, 8), elide_store(10)],
+                Terminator::Branch(BlockId(1)),
+            ),
+            elide_block(
+                1,
+                vec![elide_load(3, 1, IrType::I32)],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            ),
+        ];
+        elide_readonly_local_memcpys(&mut blocks);
+        assert!(!has_copy_into(&blocks, 1), "the copy is elided");
+        let entry = &blocks[0].instructions;
+        let load = entry
+            .iter()
+            .position(|i| {
+                matches!(
+                    i,
+                    Instruction::Load {
+                        dest: Value(3),
+                        ptr: Value(10),
+                        ..
+                    }
+                )
+            })
+            .expect("the read moved to the entry block, re-rooted at the source");
+        let store = entry
+            .iter()
+            .position(|i| matches!(i, Instruction::Store { .. }))
+            .expect("the store stays");
         assert!(
-            blocks[0].instructions.iter().any(|i| matches!(
-                i,
-                Instruction::Memcpy {
-                    dest: Value(1),
-                    src: Value(10),
-                    ..
-                }
-            )),
-            "the surviving copy must read the ultimate source, not the removed local"
+            load < store,
+            "the read must precede the write to the source"
         );
+        assert!(blocks[1].instructions.is_empty(), "nothing left behind");
+    }
+
+    /// A second copy into the local refills it with newer bytes, even from
+    /// the same source value; the local is no longer a single snapshot.
+    #[test]
+    fn second_copy_from_the_same_source_refuses() {
+        let mut blocks = vec![
+            elide_block(
+                0,
+                vec![elide_alloca(1, 8), elide_copy(1, 10, 8), elide_store(10)],
+                Terminator::Branch(BlockId(1)),
+            ),
+            elide_block(
+                1,
+                vec![elide_copy(1, 10, 8), elide_load(3, 1, IrType::I32)],
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            ),
+        ];
+        elide_readonly_local_memcpys(&mut blocks);
+        assert!(has_copy_into(&blocks, 1), "both copies must stay");
+    }
+
+    /// Readers that cannot move to the copy keep the local: a runtime offset
+    /// (its operand may not exist at the copy), a load reaching past the
+    /// copied bytes (it would read memory the copy never dereferenced), and
+    /// the local's address used as an integer offset (an escape).
+    #[test]
+    fn unmovable_readers_refuse() {
+        let shapes: Vec<Vec<Instruction>> = vec![
+            vec![
+                elide_gep(2, 1, Operand::Value(Value(20))),
+                elide_load(3, 2, IrType::I32),
+            ],
+            vec![
+                elide_gep(2, 1, Operand::Const(IrConst::I64(6))),
+                elide_load(3, 2, IrType::I32),
+            ],
+            vec![
+                elide_gep(2, 30, Operand::Value(Value(1))),
+                elide_load(3, 2, IrType::I32),
+            ],
+        ];
+        for (n, tail) in shapes.into_iter().enumerate() {
+            let mut insts = vec![elide_alloca(1, 8), elide_copy(1, 10, 8)];
+            insts.extend(tail);
+            let mut blocks = vec![elide_block(
+                0,
+                insts,
+                Terminator::Return(Some(Operand::Value(Value(3)))),
+            )];
+            elide_readonly_local_memcpys(&mut blocks);
+            assert!(has_copy_into(&blocks, 1), "shape {n} must keep the copy");
+        }
+    }
+
+    /// `L2 <- L1 <- p` with `p` written between the two copies: `L2` holds
+    /// what `L1` took from `p` FIRST, so L2's reader is snapshotted at L1's
+    /// copy, ahead of the store.
+    #[test]
+    fn chain_is_snapshotted_at_its_first_copy() {
+        let mut blocks = vec![elide_block(
+            0,
+            vec![
+                elide_alloca(1, 8),
+                elide_alloca(2, 8),
+                elide_copy(1, 10, 8),
+                elide_store(10),
+                elide_copy(2, 1, 8),
+                elide_load(3, 2, IrType::I32),
+            ],
+            Terminator::Return(Some(Operand::Value(Value(3)))),
+        )];
+        elide_readonly_local_memcpys(&mut blocks);
+        let entry = &blocks[0].instructions;
+        assert!(!has_copy_into(&blocks, 1) && !has_copy_into(&blocks, 2));
+        let load = entry
+            .iter()
+            .position(|i| matches!(i, Instruction::Load { ptr: Value(10), .. }))
+            .expect("the read lands on the ultimate source");
+        let store = entry
+            .iter()
+            .position(|i| matches!(i, Instruction::Store { .. }))
+            .unwrap();
+        assert!(load < store, "snapshot at the first copy, before the store");
     }
 
     /// Debug locations must survive the rewrite: dropping the span vector
@@ -8464,5 +9180,421 @@ mod extern_admission_tests {
         module.functions.push(mid);
         let rewritten = devirtualize_constant_indirect_calls(&mut module);
         assert!(rewritten.contains(&("worker".to_string(), "cmp_fn".to_string())));
+    }
+}
+
+#[cfg(test)]
+mod target_isa_tests {
+    use super::target_isa_allows_inline;
+    use crate::ir::module::normalize_target_features;
+
+    fn set(raw: &str) -> Vec<String> {
+        normalize_target_features(raw)
+    }
+
+    #[test]
+    fn normalization_is_canonical() {
+        assert_eq!(set(" BMI2 ,lzcnt,,bmi, bmi2 "), ["bmi", "bmi2", "lzcnt"]);
+        assert!(set(" , ").is_empty());
+    }
+
+    #[test]
+    fn plain_callee_inlines_anywhere() {
+        assert!(target_isa_allows_inline(&[], &[]));
+        assert!(target_isa_allows_inline(&set("bmi2"), &[]));
+    }
+
+    #[test]
+    fn target_callee_needs_a_covering_caller() {
+        // zstd: plain dispatcher -> static BMI2 clone must stay a call.
+        assert!(!target_isa_allows_inline(&[], &set("lzcnt,bmi,bmi2")));
+        // Partial cover is not enough: one missing feature refuses.
+        assert!(!target_isa_allows_inline(
+            &set("bmi,bmi2"),
+            &set("lzcnt,bmi,bmi2")
+        ));
+        // Equal and superset callers accept, independent of spelling order.
+        assert!(target_isa_allows_inline(
+            &set("bmi2,bmi,lzcnt"),
+            &set("lzcnt,bmi,bmi2")
+        ));
+        assert!(target_isa_allows_inline(
+            &set("avx2,bmi,bmi2"),
+            &set("bmi2")
+        ));
+        // `arch=` and vector entries compare as opaque features.
+        assert!(!target_isa_allows_inline(
+            &set("bmi2"),
+            &set("arch=haswell")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod phase0_tests {
+    use super::*;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::{BasicBlock, IrConst, Operand, Terminator};
+
+    /// A defined function whose single block calls `callees` in order and
+    /// then pads to `extra` copies, so its IR size is controllable.
+    fn body(name: &str, callees: &[&str], extra: u32) -> IrFunction {
+        let mut f = IrFunction::new(name.into(), IrType::I32, vec![], false);
+        let mut instructions: Vec<Instruction> = callees
+            .iter()
+            .map(|c| Instruction::Call {
+                func: (*c).to_string(),
+                info: CallInfo::default(),
+            })
+            .collect();
+        instructions.extend((0..extra).map(|i| Instruction::Copy {
+            dest: Value(i + 1),
+            src: Operand::Const(IrConst::I32(i as i32)),
+        }));
+        f.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions,
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: Vec::new(),
+        });
+        f.next_value_id = extra + 2;
+        f.next_label = 2;
+        f
+    }
+
+    fn quiet_context() -> CalleeContext {
+        CalleeContext {
+            call_counts: Default::default(),
+            value_referenced: Default::default(),
+            asm_templates: Vec::new(),
+            call_site_counts: Default::default(),
+            sole_caller: Default::default(),
+            debug_callee: false,
+            semantic_interposition: false,
+        }
+    }
+
+    #[test]
+    fn call_cycles_cover_self_mutual_and_long_recursion_only() {
+        let mut module = IrModule::new();
+        for (name, callees) in [
+            ("a", &["b"][..]),
+            ("b", &["c", "ext"][..]),
+            ("c", &[][..]),
+            ("self_rec", &["self_rec"][..]),
+            ("even", &["odd"][..]),
+            ("odd", &["even"][..]),
+            ("x", &["y"][..]),
+            ("y", &["z"][..]),
+            ("z", &["x", "c"][..]),
+        ] {
+            module.functions.push(body(name, callees, 0));
+        }
+        let mut ext = IrFunction::new("ext".into(), IrType::I32, vec![], false);
+        ext.is_declaration = true;
+        module.functions.push(ext);
+        let mut cyclic: Vec<String> = functions_on_call_cycles(&module).into_iter().collect();
+        cyclic.sort();
+        assert_eq!(cyclic, ["even", "odd", "self_rec", "x", "y", "z"]);
+    }
+
+    /// GCC inlines always_inline regardless of size; the old 500-instruction
+    /// cap left zstd's FORCE_INLINE templates (803 IR instructions) out of
+    /// line. Only the resource guard may refuse.
+    #[test]
+    fn always_inline_admission_is_bounded_only_by_the_resource_guard() {
+        let module = IrModule::new();
+        let mut big = body("template", &[], 900);
+        big.is_static = true;
+        big.is_inline = true;
+        big.is_always_inline = true;
+        let data = callee_data_for(&big, &module, &quiet_context());
+        assert!(
+            data.is_some_and(|d| d.is_always_inline),
+            "900-instruction always_inline refused"
+        );
+
+        let guard = u32::try_from(ALWAYS_INLINE_GUARD_INSTRUCTIONS).unwrap();
+        let mut huge = body("generated", &[], guard + 1);
+        huge.is_static = true;
+        huge.is_inline = true;
+        huge.is_always_inline = true;
+        assert!(callee_data_for(&huge, &module, &quiet_context()).is_none());
+    }
+
+    fn static_leaf(name: &str, callees: &[&str], extra: u32) -> IrFunction {
+        let mut f = body(name, callees, extra);
+        f.is_static = true;
+        f
+    }
+
+    fn sites(module: &IrModule, caller: &str, callee: &str) -> usize {
+        module
+            .functions
+            .iter()
+            .filter(|f| f.name == caller)
+            .flat_map(|f| f.blocks.iter().flat_map(|b| b.instructions.iter()))
+            .filter(|i| matches!(i, Instruction::Call { func, .. } if func == callee))
+            .count()
+    }
+
+    /// Frame-neutral = one block, <= MAX_SMALL instructions, no stack
+    /// object, no call. Each excluded property is pinned separately.
+    #[test]
+    fn frame_neutral_leaf_excludes_frames_calls_and_control_flow() {
+        let module = IrModule::new();
+        let ctx = quiet_context();
+        let neutral = |f: &IrFunction| {
+            let d = callee_data_for(f, &module, &ctx).expect("eligible callee");
+            let count = d.blocks.iter().map(|b| b.instructions.len()).sum();
+            is_frame_neutral_leaf(&d, count)
+        };
+        assert!(neutral(&static_leaf("w", &[], 12)));
+        let small = u32::try_from(MAX_SMALL_INLINE_INSTRUCTIONS).unwrap();
+        assert!(!neutral(&static_leaf("big", &[], small + 1)));
+        assert!(!neutral(&static_leaf("calls", &["ext"], 12)));
+        let mut frame = static_leaf("frame", &[], 12);
+        frame.blocks[0].instructions.push(Instruction::Alloca {
+            dest: Value(40),
+            ty: IrType::I64,
+            size: 64,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        });
+        assert!(!neutral(&frame));
+        let mut branchy = static_leaf("branchy", &[], 12);
+        let mut tail = branchy.blocks[0].clone();
+        tail.label = BlockId(2);
+        tail.instructions.clear();
+        branchy.blocks[0].terminator = Terminator::Branch(BlockId(2));
+        branchy.blocks.push(tail);
+        assert!(!neutral(&branchy));
+    }
+
+    /// zstd's `ZSTD_litLengthPrice` shape: a self-recursive caller of a
+    /// 12-instruction leaf (above the 5-instruction tiny limit). The leaf is
+    /// inlined; recursion itself stays a call.
+    #[test]
+    fn recursive_caller_inlines_frame_neutral_leaf() {
+        let mut module = IrModule::new();
+        module.functions.push(body("rec", &["rec", "leaf"], 4));
+        module.functions.push(static_leaf("leaf", &[], 12));
+        run(&mut module);
+        assert_eq!(sites(&module, "rec", "leaf"), 0, "leaf left outlined");
+        assert_eq!(sites(&module, "rec", "rec"), 1, "recursion must stay");
+    }
+}
+
+/// The SROA-unlock cost model (`sroa_unlockable_aliases_of`): plain statics
+/// qualify, the clone must be paid for by the accesses SROA removes and fit
+/// the remaining budget, and a whole-object library memset mirrors
+/// `aggregate_sroa` form 4's rule 5b.
+#[cfg(test)]
+mod sroa_unlock_tests {
+    use super::*;
+
+    /// A straight-line internal helper of `instructions` instructions.
+    fn helper(instructions: usize, declared_inline: bool) -> CalleeData {
+        CalleeData {
+            target_features: Vec::new(),
+            builtin_policy: Default::default(),
+            blocks: vec![BasicBlock {
+                label: BlockId(0),
+                instructions: (0..instructions)
+                    .map(|i| Instruction::Copy {
+                        dest: Value(i as u32),
+                        src: Operand::Const(IrConst::I64(0)),
+                    })
+                    .collect(),
+                terminator: Terminator::Return(None),
+                source_spans: Vec::new(),
+            }],
+            param_struct_sizes: Vec::new(),
+            return_type: IrType::Void,
+            num_params: 1,
+            next_value_id: instructions as u32,
+            max_block_id: 0,
+            single_call_site: false,
+            agg_frame_bytes: 0,
+            is_always_inline: false,
+            exceeds_normal_limits: false,
+            is_static_inline: declared_inline,
+            is_gnu_inline_def: false,
+            is_plain_static: !declared_inline,
+            direct_call_count: 2,
+            loop_bound_params: 0,
+            const_trip_only: false,
+            has_inlineable_loop_descendant: false,
+            has_inlined_calls: false,
+            is_single_call_site_static: false,
+            has_loops: false,
+            is_recursive: false,
+            has_vector_intrinsics: false,
+            size_inline_cost: instructions,
+            va_arg_pack: None,
+        }
+    }
+
+    fn call(func: &str, result: Option<u32>, args: Vec<Operand>, lib: bool) -> Instruction {
+        Instruction::Call {
+            func: func.into(),
+            info: CallInfo {
+                dest: result.map(Value),
+                arg_types: vec![IrType::Ptr; args.len()],
+                args,
+                return_type: IrType::Ptr,
+                assume_library: lib,
+                ..CallInfo::default()
+            },
+        }
+    }
+
+    /// `alloca v1 (16 bytes)`, `prefix`, then `accesses` loads of `v1`, then
+    /// `suffix`; the function returns the last load.
+    fn caller(prefix: Vec<Instruction>, accesses: u32, suffix: Vec<Instruction>) -> IrFunction {
+        let mut insts = vec![Instruction::Alloca {
+            dest: Value(1),
+            ty: IrType::Ptr,
+            size: 16,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        }];
+        insts.extend(prefix);
+        for k in 0..accesses {
+            insts.push(Instruction::Load {
+                dest: Value(100 + k),
+                ptr: Value(1),
+                ty: IrType::I64,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            });
+        }
+        insts.extend(suffix);
+        let mut func = IrFunction::new("f".into(), IrType::I64, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(Some(Operand::Value(Value(100)))),
+            source_spans: Vec::new(),
+        });
+        func
+    }
+
+    fn map(entries: Vec<(&str, CalleeData)>) -> FxHashMap<String, CalleeData> {
+        entries
+            .into_iter()
+            .map(|(n, d)| (n.to_string(), d))
+            .collect()
+    }
+
+    fn helper_call() -> Instruction {
+        call("h", None, vec![Operand::Value(Value(1))], false)
+    }
+
+    /// zstd's `HUF_initCStream(&bitC, ...)` is a plain `static`: the escape
+    /// goes away by inlining whether or not the helper was declared `inline`.
+    #[test]
+    fn plain_static_helper_unlocks_when_paid_for() {
+        for declared_inline in [false, true] {
+            let callees = map(vec![("h", helper(10, declared_inline))]);
+            let func = caller(vec![helper_call()], 12, vec![]);
+            assert!(
+                sroa_unlockable_aliases_of(&func, &callees, usize::MAX).contains(&Value(1)),
+                "inline={declared_inline}"
+            );
+            assert!(is_sroa_unlockable_candidate(&callees["h"]));
+        }
+    }
+
+    /// Cloning 10 instructions to remove 3 memory accesses is growth.
+    #[test]
+    fn unpaid_unlock_is_refused() {
+        let callees = map(vec![("h", helper(10, false))]);
+        let func = caller(vec![helper_call()], 3, vec![]);
+        assert!(!sroa_unlockable_aliases_of(&func, &callees, usize::MAX).contains(&Value(1)));
+    }
+
+    /// The whole escape set is priced at once (a partial unlock leaves the
+    /// object in memory) and must fit the remaining budget.
+    #[test]
+    fn unlock_cost_is_summed_and_bounded_by_the_allowance() {
+        let callees = map(vec![("h", helper(10, false))]);
+        let func = caller(vec![helper_call()], 30, vec![helper_call()]);
+        assert!(!sroa_unlockable_aliases_of(&func, &callees, 19).contains(&Value(1)));
+        assert!(sroa_unlockable_aliases_of(&func, &callees, 20).contains(&Value(1)));
+        let cheap = caller(vec![helper_call()], 15, vec![helper_call()]);
+        assert!(
+            !sroa_unlockable_aliases_of(&cheap, &callees, usize::MAX).contains(&Value(1)),
+            "two clones (20) are not paid for by 15 accesses"
+        );
+    }
+
+    /// A helper larger than a whole per-caller budget is never a candidate,
+    /// and a looping or `always_inline` helper is not one either.
+    #[test]
+    fn candidate_shape_limits() {
+        assert!(!is_sroa_unlockable_candidate(&helper(
+            MAX_SROA_UNLOCK_HELPER_INSTRUCTIONS + 1,
+            false
+        )));
+        let mut looping = helper(10, false);
+        looping.has_loops = true;
+        assert!(!is_sroa_unlockable_candidate(&looping));
+        let mut forced = helper(10, false);
+        forced.is_always_inline = true;
+        assert!(!is_sroa_unlockable_candidate(&forced));
+    }
+
+    /// `memset(&local, 0, sizeof local)` (in `HUF_initCStream`) is expanded
+    /// by form 4, so it neither escapes the object nor costs a clone; a
+    /// partial, non-library or result-using memset disqualifies it, exactly
+    /// where form 4 refuses.
+    #[test]
+    fn memset_mirrors_the_splitter() {
+        let callees = map(vec![("h", helper(10, false))]);
+        let ms = |len: i64, lib: bool, result: Option<u32>| {
+            call(
+                "memset",
+                result,
+                vec![
+                    Operand::Value(Value(1)),
+                    Operand::Const(IrConst::I32(0)),
+                    Operand::Const(IrConst::I64(len)),
+                ],
+                lib,
+            )
+        };
+        let admitted = |func: &IrFunction| {
+            sroa_unlockable_aliases_of(func, &callees, usize::MAX).contains(&Value(1))
+        };
+        assert!(admitted(&caller(
+            vec![ms(16, true, None), helper_call()],
+            12,
+            vec![]
+        )));
+        assert!(!admitted(&caller(
+            vec![ms(8, true, None), helper_call()],
+            12,
+            vec![]
+        )));
+        assert!(!admitted(&caller(
+            vec![ms(16, false, None), helper_call()],
+            12,
+            vec![]
+        )));
+        let used = caller(
+            vec![ms(16, true, Some(50)), helper_call()],
+            12,
+            vec![Instruction::Store {
+                val: Operand::Value(Value(50)),
+                ptr: Value(100),
+                ty: IrType::Ptr,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            }],
+        );
+        assert!(!admitted(&used));
     }
 }

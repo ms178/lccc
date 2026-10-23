@@ -395,6 +395,12 @@ impl Driver {
         if self.nostdlib {
             args.push("-nostdlib".to_string());
         }
+        if self.nostartfiles {
+            args.push("-nostartfiles".to_string());
+        }
+        if self.nodefaultlibs {
+            args.push("-nodefaultlibs".to_string());
+        }
         for path in &self.linker_paths {
             args.push(format!("-L{}", path));
         }

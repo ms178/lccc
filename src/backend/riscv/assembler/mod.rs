@@ -10,6 +10,7 @@
 //! - `compress.rs`   – RV64C compressed instruction support (32-bit → 16-bit)
 //! - `elf_writer.rs` – Write ELF object files with sections, symbols, and relocations
 
+pub(crate) mod cfi;
 pub mod compress;
 pub mod elf_writer;
 pub mod encoder;

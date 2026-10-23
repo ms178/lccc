@@ -63,9 +63,18 @@ impl super::InstructionEncoder {
                 // Accumulator moffs shortform for bare absolute operands:
                 // `mov abs, %eax` == A1 <disp> (GAS, one byte shorter than
                 // the ModR/M form; `26 a1 ...` with a segment override).
+                // Except for a `@GOT` load: GAS 2.47 keeps it `8B/8A 05
+                // disp32` at every width (the 32-bit one R_386_GOT32X, which a
+                // linker may relax only from that `8B modrm` shape); stores
+                // (A3) and the other modifiers keep the shortform.
+                let got_load = matches!(
+                    &mem.displacement,
+                    Displacement::SymbolMod(_, m) | Displacement::SymbolModAddend(_, m, _)
+                        if m.eq_ignore_ascii_case("GOT")
+                );
                 let accumulator =
                     (dst.name == "eax" && size == 4) || (dst.name == "ax" && size == 2);
-                if accumulator && mem.base.is_none() && mem.index.is_none() {
+                if accumulator && !got_load && mem.base.is_none() && mem.index.is_none() {
                     self.sized_op = true;
                     if size == 2 {
                         self.bytes.push(0x66);
@@ -73,7 +82,12 @@ impl super::InstructionEncoder {
                     self.bytes.push(0xA1);
                     return self.encode_i686_moffs(&mem.displacement);
                 }
-                if dst.name == "al" && mem.base.is_none() && mem.index.is_none() && size == 1 {
+                if dst.name == "al"
+                    && !got_load
+                    && mem.base.is_none()
+                    && mem.index.is_none()
+                    && size == 1
+                {
                     self.sized_op = false;
                     self.bytes.push(0xA0);
                     return self.encode_i686_moffs(&mem.displacement);
@@ -116,7 +130,8 @@ impl super::InstructionEncoder {
                 // (word/dword) followed by the bare address -- one byte
                 // shorter than the ModRM form. Match it exactly (asm-diff
                 // oracle: `movl sym, %eax` == a1 <disp32>).
-                if dst_num == 0 {
+                // ...but not for a `@GOT` load (see the Memory arm above).
+                if dst_num == 0 && !label_is_got_slot(label) {
                     self.bytes.push(if size == 1 { 0xA0 } else { 0xA1 });
                     return self.encode_abs_addr_disp_only(label);
                 }
@@ -181,7 +196,7 @@ impl super::InstructionEncoder {
                         1 => self.bytes.push(*val as u8),
                         2 => self.bytes.extend_from_slice(&(*val as i16).to_le_bytes()),
                         4 => self.bytes.extend_from_slice(&(*val as i32).to_le_bytes()),
-                        _ => unreachable!(),
+                        _ => return Err(format!("mov: unsupported immediate store size {size}")),
                     },
                     // `movl $__inb, pio_ops` — a SYMBOL immediate stored to
                     // an absolute label address (function-pointer tables in
@@ -306,7 +321,7 @@ impl super::InstructionEncoder {
                 }
             }
             ImmediateValue::SymbolMod(sym, modifier) => {
-                // `$sym@GOT' / `$sym@GOTOFF' / `$sym@GOTPC' immediates
+                // `$sym@GOT' / `$sym@GOTOFF' / `$sym@GOTPC' / `$sym@NTPOFF' immediates
                 // (GAS 2.47: `mov $sym@GOT,%eax' = b8 00000000 with
                 // R_386_GOT32 on the field). 32-bit fields only; the
                 // GOTPC addend follows the same field-offset law as the
@@ -314,17 +329,9 @@ impl super::InstructionEncoder {
                 if size != 4 {
                     return Err("symbol immediate only supported for 32-bit mov".to_string());
                 }
-                let got_reloc = match modifier.as_str() {
-                    "GOT" => R_386_GOT32,
-                    "GOTOFF" => R_386_GOTOFF,
-                    "GOTPC" => R_386_GOTPC,
-                    other => {
-                        return Err(format!(
-                            "unsupported immediate modifier for mov: @{}",
-                            other
-                        ));
-                    }
-                };
+                // Same table as every other operand field (GAS 2.47:
+                // `movl $x@ntpoff,%eax` = b8 + R_386_TLS_LE).
+                let got_reloc = self.tls_reloc_type(modifier)?;
                 self.sized_op = true;
                 self.bytes.push(0xB8 + dst_num);
                 self.add_relocation(sym, got_reloc, 0);
@@ -733,6 +740,12 @@ impl super::InstructionEncoder {
                 self.bytes.push(0xFF);
                 self.encode_modrm_mem(6, mem)
             }
+            // A bare symbol is an absolute memory operand (GAS 2.47: `pushl
+            // sym` = ff 35 + R_386_32, `pushl x@GOT` = ff 35 + R_386_GOT32X).
+            Operand::Label(label) => {
+                self.bytes.push(0xFF);
+                self.encode_abs_addr_modrm(6, label)
+            }
             _ => Err("unsupported push operand".to_string()),
         }
     }
@@ -872,6 +885,11 @@ impl super::InstructionEncoder {
                 // pop m32: 0x8F /0
                 self.bytes.push(0x8F);
                 self.encode_modrm_mem(0, mem)
+            }
+            // `popl sym`: absolute memory operand, 8f 05 + R_386_32 (GAS 2.47).
+            Operand::Label(label) => {
+                self.bytes.push(0x8F);
+                self.encode_abs_addr_modrm(0, label)
             }
             _ => Err("unsupported pop operand".to_string()),
         }
@@ -1095,13 +1113,13 @@ impl super::InstructionEncoder {
                 Operand::Register(dst),
             ) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
+                let reloc_type = self.tls_reloc_type(modifier)?;
                 if size == 2 || size == 4 {
                     self.sized_op = true;
                 }
                 if size == 2 {
                     self.bytes.push(0x66);
                 }
-                let reloc_type = self.tls_reloc_type(modifier);
                 if dst_num == 0 {
                     self.bytes.push(0x05 + alu_op * 8);
                 } else {
@@ -1116,13 +1134,13 @@ impl super::InstructionEncoder {
                 Operand::Immediate(ImmediateValue::SymbolMod(sym, modifier)),
                 Operand::Memory(mem),
             ) => {
+                let reloc_type = self.tls_reloc_type(modifier)?;
                 if size == 2 || size == 4 {
                     self.sized_op = true;
                 }
                 if size == 2 {
                     self.bytes.push(0x66);
                 }
-                let reloc_type = self.tls_reloc_type(modifier);
                 self.bytes.push(0x81);
                 self.encode_modrm_mem(alu_op, mem)?;
                 self.add_relocation(sym, reloc_type, 0);
@@ -1355,6 +1373,39 @@ impl super::InstructionEncoder {
                     mnemonic,
                 )
             }
+            // `test` is commutative and GAS accepts both AT&T orders of the
+            // register/memory form; both encode `85 /r` (`84 /r` for bytes)
+            // with the register in ModR/M.reg (GAS 2.47: `testl %eax,
+            // 4(%ebx)` = `testl 4(%ebx), %eax` = 85 43 04).
+            (Operand::Register(r), Operand::Memory(mem))
+            | (Operand::Memory(mem), Operand::Register(r)) => {
+                let reg = reg_num(&r.name).ok_or("bad test register")?;
+                if size == 2 || size == 4 {
+                    self.sized_op = true;
+                }
+                if size == 2 {
+                    self.bytes.push(0x66);
+                }
+                self.bytes.push(if size == 1 { 0x84 } else { 0x85 });
+                self.encode_modrm_mem(reg, mem)
+            }
+            (Operand::Register(r), Operand::Label(label))
+            | (Operand::Label(label), Operand::Register(r)) => {
+                let mem = MemoryOperand {
+                    segment: None,
+                    displacement: Displacement::Symbol(label.clone()),
+                    base: None,
+                    index: None,
+                    scale: None,
+                    mask: None,
+                    zeroing: false,
+                    broadcast: None,
+                };
+                self.encode_test(
+                    &[Operand::Register(r.clone()), Operand::Memory(mem)],
+                    mnemonic,
+                )
+            }
             _ => Err("unsupported test operands".to_string()),
         }
     }
@@ -1488,6 +1539,12 @@ impl super::InstructionEncoder {
             Operand::Memory(mem) => {
                 self.bytes.push(if size == 1 { 0xF6 } else { 0xF7 });
                 self.encode_modrm_mem(op_ext, mem)
+            }
+            // `notl sym`: a bare symbol is an absolute memory operand
+            // (GAS 2.47: f7 15 + R_386_32).
+            Operand::Label(label) => {
+                self.bytes.push(if size == 1 { 0xF6 } else { 0xF7 });
+                self.encode_abs_addr_modrm(op_ext, label)
             }
             _ => Err("unsupported unary operand".to_string()),
         }
@@ -2345,38 +2402,34 @@ impl super::InstructionEncoder {
                         self.bytes.push(self.modrm(3, 2, num));
                         Ok(())
                     }
-                    Operand::Memory(mem) => {
-                        // GNU2 i386 TLS descriptor call: the TLSCALL symbol is
-                        // an annotation relocation at the FF /2 instruction,
-                        // not a displacement. GAS emits `ff 10` for
-                        // `call *x@TLSCALL(%eax)`.
-                        if let Displacement::SymbolMod(sym, modifier) = &mem.displacement
-                            && modifier.eq_ignore_ascii_case("tlscall")
-                        {
-                            if mem.index.is_some() {
-                                return Err(
-                                    "operand type mismatch for `call' after @tlscall".to_string()
-                                );
-                            }
-                            let Some(base) = mem.base.clone() else {
-                                return Err(
-                                    "operand type mismatch for `call' after @tlscall".to_string()
-                                );
-                            };
-                            let zero_mem = MemoryOperand {
-                                segment: mem.segment.clone(),
-                                displacement: Displacement::Integer(0),
-                                base: Some(base),
-                                index: None,
-                                scale: None,
-                                mask: None,
-                                zeroing: false,
-                                broadcast: None,
-                            };
-                            self.add_relocation(sym, R_386_TLS_DESC_CALL, 0);
-                            self.bytes.push(0xFF);
-                            return self.encode_modrm_mem(2, &zero_mem);
+                    // `call *sym@tlscall(%reg)`: the TLS-descriptor call. The
+                    // marker is NOT a displacement: GAS 2.47 `--32` emits
+                    // the plain register-indirect memory form `ff 10` (mod=00,
+                    // no disp) with R_386_TLS_DESC_CALL on the instruction's
+                    // first byte, so the linker can find and rewrite the
+                    // two-byte call when it relaxes the access to IE/LE.
+                    Operand::Memory(mem)
+                        if matches!(&mem.displacement,
+                            Displacement::SymbolMod(_, m) if m.eq_ignore_ascii_case("tlscall")) =>
+                    {
+                        let Displacement::SymbolMod(sym, _) = &mem.displacement else {
+                            unreachable!()
+                        };
+                        let base_ok = mem.base.as_ref().is_some_and(|b| reg_size(&b.name) == 4);
+                        if !base_ok || mem.index.is_some() || mem.segment.is_some() {
+                            return Err(
+                                "operand type mismatch for `call' after @tlscall".to_string()
+                            );
                         }
+                        let zero_mem = MemoryOperand {
+                            displacement: Displacement::Integer(0),
+                            ..mem.clone()
+                        };
+                        self.add_relocation(sym, R_386_TLS_DESC_CALL, 0);
+                        self.bytes.push(0xFF);
+                        self.encode_modrm_mem(2, &zero_mem)
+                    }
+                    Operand::Memory(mem) => {
                         self.bytes.push(0xFF);
                         self.encode_modrm_mem(2, mem)
                     }
@@ -2560,4 +2613,13 @@ impl super::InstructionEncoder {
             _ => Err("int requires immediate operand".to_string()),
         }
     }
+}
+
+/// True for a bare `sym@GOT` / `sym@GOT+addend` operand (case-insensitive;
+/// not `@GOTOFF`, `@GOTPC`, `@GOTNTPOFF`).
+fn label_is_got_slot(label: &str) -> bool {
+    label.split_once('@').is_some_and(|(_, m)| {
+        let end = m.find(['+', '-']).unwrap_or(m.len());
+        m[..end].trim().eq_ignore_ascii_case("GOT")
+    })
 }

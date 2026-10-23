@@ -27,8 +27,8 @@ C
 "$CCC" -O2 -march=x86-64-v3 "$t/t.c" -o "$t/run"; "$t/run"
 "$CCC" -O2 -march=x86-64-v3 -S "$t/t.c" -o "$t/x64.s"
 grep -Eq '12\(%r(di|si|dx|cx|8|9|1[0-5])\)' "$t/x64.s"
-! grep -Eq '(mov|fld|fst).*[[:space:]]0\(%rbp\)' "$t/x64.s"
-! grep -R -q 'SlotAddr::Indirect(StackSlot(0))' "$root/src/backend"
+! grep -Eq '(mov|fld|fst).*[[:space:]]0\(%rbp\)' "$t/x64.s" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
+! grep -R -q 'SlotAddr::Indirect(StackSlot(0))' "$root/src/backend" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 
 bindir=$(dirname "$CCC")
 for target in arm riscv i686; do

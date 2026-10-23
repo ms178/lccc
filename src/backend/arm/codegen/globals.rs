@@ -25,8 +25,20 @@ impl ArmCodegen {
         self.store_x0_to(dest);
     }
 
+    /// The address of TLS symbol `name`, in the model `common::tls` chose —
+    /// GCC 16.2's sequences (`-mtls-dialect=desc`, its AArch64 default):
+    ///
+    /// * Local-Exec: `mrs; add :tprel_hi12:; add :tprel_lo12_nc:`.
+    /// * Initial-Exec: the TP offset from the GOT (`:gottprel:`), plus TP.
+    /// * Global/Local-Dynamic: a TLS descriptor call. `.tlsdesccall` tags the
+    ///   `blr` (R_AARCH64_TLSDESC_CALL) so the linker can relax the four
+    ///   instructions to IE/LE. The descriptor returns the TP offset in x0 and
+    ///   clobbers only x0/x1/x30/flags; x1 is in no allocation pool, x30 is
+    ///   saved by every framed prologue, and the access is a call point to
+    ///   the allocator (`common::tls::install_call_sequence_symbols`) because
+    ///   the text peephole models the `blr` as an ordinary call.
     pub(super) fn emit_tls_global_addr_impl(&mut self, dest: &Value, name: &str) {
-        match self.state.tls_model_for_symbol(name) {
+        match self.state.tls_model(name) {
             TlsModel::LocalExec => {
                 self.state.emit("    mrs x0, tpidr_el0");
                 self.state
@@ -63,7 +75,13 @@ impl ArmCodegen {
                 // x1 carries both the resolver target and the thread pointer: x1
                 // is dead once `blr x1` has dispatched, and unlike clang's x8 it
                 // is not an allocator home here (ARM_CALLER_SAVED is x4-x8 plus
-                // x13/x14), so no live value can be displaced.
+                // x13/x14), so no live value can be displaced. The access is
+                // nevertheless a call point to the allocator
+                // (`common::tls::install_call_sequence_symbols`): the text
+                // peephole classifies `blr` as an ordinary call that clobbers
+                // x0-x17, so a pool value homed in x13/x14 across the access
+                // would have its home `mov` retired as a dead call-staging
+                // move.
                 self.state
                     .emit_fmt(format_args!("    adrp x0, :tlsdesc:{}", name));
                 self.state
@@ -74,7 +92,7 @@ impl ArmCodegen {
                     .emit_fmt(format_args!("    .tlsdesccall {}", name));
                 self.state.emit("    blr x1");
                 self.state.emit("    mrs x1, tpidr_el0");
-                self.state.emit("    add x0, x0, x1");
+                self.state.emit("    add x0, x1, x0");
             }
         }
         self.store_x0_to(dest);

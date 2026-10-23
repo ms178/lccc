@@ -196,6 +196,7 @@ pub fn link_builtin(
     // (GOT load) needs a GOT slot; created after the scan it never gets one
     // and the link silently emits a load from an unallocated slot.
     let pending_defsyms = apply_defsyms(&mut global_symbols, &args.defsym_defs)?;
+    define_tls_module_base(&mut global_symbols, &output_sections);
 
     // Phase 7: Mark PLT/GOT needs and check undefined
     mark_plt_got_needs(&inputs, &mut global_symbols, is_static);
@@ -452,6 +453,7 @@ pub fn link_shared(
     // path: aliases/constants take effect here, expressions are evaluated
     // after the layout in `emit_shared_library_32`).
     let pending_defsyms = apply_defsyms(&mut global_symbols, &args.defsym_defs)?;
+    define_tls_module_base(&mut global_symbols, &output_sections);
 
     // Undefined non-local references of the output, and which linked shared
     // object (first in command-line order) satisfies each.
@@ -557,5 +559,63 @@ pub(super) fn register_copy_aliases(
             // another library: not an alias of this copy.
             Some(_) => {}
         }
+    }
+}
+
+/// The gnu2 Local-Dynamic anchor: `leal _TLS_MODULE_BASE_@tlsdesc(%ebx)`
+/// yields the base of this module's TLS block once, and every local variable
+/// is then addressed as `%gs:v@dtpoff(%eax)`.  GCC emits it for
+/// `-m32 -mtls-dialect=gnu2 -fPIC`; no object defines it -- the linker does.
+pub(super) const TLS_MODULE_BASE: &str = "_TLS_MODULE_BASE_";
+
+/// Define a referenced `_TLS_MODULE_BASE_` as GNU ld and lld do: a HIDDEN
+/// `STT_TLS` symbol -- never imported, exported or preempted, so its
+/// descriptor is resolved against symbol 0 (this module) with the block
+/// offset in the slot.  `output_section == usize::MAX` keeps the generic
+/// address pass off it; the emitters place it with
+/// [`tls_module_base_address`].  Without TLS output there is nothing to
+/// anchor and the reference stays undefined (and is reported as such).
+fn define_tls_module_base(
+    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
+    output_sections: &[OutputSection],
+) {
+    let Some(g) = global_symbols.get_mut(TLS_MODULE_BASE) else {
+        return;
+    };
+    if g.is_defined || g.is_dynamic {
+        return;
+    }
+    if !output_sections.iter().any(|s| s.flags & SHF_TLS != 0) {
+        return;
+    }
+    g.is_defined = true;
+    g.sym_type = STT_TLS;
+    g.visibility = STV_HIDDEN;
+    g.output_section = usize::MAX;
+    g.section_offset = 0;
+    g.address = 0;
+}
+
+/// Final address of a linker-defined `_TLS_MODULE_BASE_`: the start of the
+/// TLS block in a shared object (`v@dtpoff` is the offset in the block); in
+/// an executable the descriptor is relaxed to `movl $ntpoff,%eax` and
+/// `v@dtpoff` resolves TP-relative, so the anchor is the END of the block
+/// (the thread pointer, ntpoff 0), as GNU ld and lld place it.
+pub(super) fn tls_module_base_address(
+    global_symbols: &mut FxHashMap<String, LinkerSymbol>,
+    tls_addr: u32,
+    tls_mem_size: u32,
+    executable: bool,
+) {
+    if let Some(g) = global_symbols.get_mut(TLS_MODULE_BASE)
+        && g.is_defined
+        && g.sym_type == STT_TLS
+        && g.output_section == usize::MAX
+    {
+        g.address = if executable {
+            tls_addr + tls_mem_size
+        } else {
+            tls_addr
+        };
     }
 }

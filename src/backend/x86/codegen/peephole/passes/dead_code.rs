@@ -1106,6 +1106,10 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
         // deletable; this is what distinguishes the home-slot spills at
         // 16/32(%rsp) from a frame buffer based at 40(%rsp).
         let mut read_floors: Vec<(u8, i32)> = Vec::new();
+        // Stores proven to be the ONLY writers a plain slot load observes
+        // (see `locally_covering_stores`): such a load is attributed to them
+        // instead of being published as a function-wide read range.
+        let mut locally_read: Vec<usize> = Vec::new();
         for k in body_start..func_end {
             if infos[k].is_nop() {
                 continue;
@@ -1197,7 +1201,10 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                         break;
                     }
                 }
-                LineKind::LoadRbp { offset, .. } => {
+                // GP and XMM slot loads read the same way: the exact extent
+                // the instruction reads, attributed to the stores that cover
+                // it earlier in the body when there are such stores.
+                LineKind::LoadRbp { offset, .. } | LineKind::LoadXmmRbp { offset, .. } => {
                     let line = infos[k].trimmed(store.get(k));
                     if !rbp_is_frame && uses_rbp_mem_operand(line) {
                         has_unparseable_indirect = true;
@@ -1208,20 +1215,11 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                         has_unparseable_indirect = true;
                         break;
                     };
-                    read_ranges.push((base, offset, width));
-                }
-                LineKind::LoadXmmRbp { offset, .. } => {
-                    let line = infos[k].trimmed(store.get(k));
-                    if !rbp_is_frame && uses_rbp_mem_operand(line) {
-                        has_unparseable_indirect = true;
-                        break;
+                    match locally_covering_stores(store, infos, k, body_start, base, offset, width)
+                    {
+                        Some(writers) => locally_read.extend(writers),
+                        None => read_ranges.push((base, offset, width)),
                     }
-                    let base = frame_base(line, b's');
-                    let Some(width) = frame_read_extent(line) else {
-                        has_unparseable_indirect = true;
-                        break;
-                    };
-                    read_ranges.push((base, offset, width));
                 }
                 LineKind::Other { .. } => {
                     let rbp_off = infos[k].rbp_offset;
@@ -1328,8 +1326,9 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
         }
 
         // Phase 2: Eliminate stores to unread slots
+        locally_read.sort_unstable();
         for k in body_start..func_end {
-            if infos[k].is_nop() {
+            if infos[k].is_nop() || locally_read.binary_search(&k).is_ok() {
                 continue;
             }
             if let LineKind::StoreRbp { offset, size, .. } = infos[k].kind {
@@ -1386,6 +1385,120 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
 
         i = func_end;
     }
+}
+
+/// The stores a plain frame-slot load at `load` observes, when they can be
+/// proven to be ALL of them: walking backward through the load's straight-line
+/// run, every byte of `[offset, offset + bytes)` is written by a slot store on
+/// the same base before any point where an unseen writer could intervene.
+///
+/// Returning `Some(writers)` lets the caller attribute the load to exactly
+/// those stores (they stay alive) instead of publishing it as a function-wide
+/// read range — the classic upward-exposed-use refinement. Without it, any
+/// load overlapping a slot pinned EVERY store to that slot anywhere in the
+/// function: `zlib_ng_adler32_combine` kept a never-read
+/// `movl %eax, 68(%rsp)` inside its hot loop because an unrelated block did
+/// `movq %rax, 64(%rsp); …; movq 64(%rsp), %rdi` with the 8-byte reuse of the
+/// slot overlapping `[68, 72)`.
+///
+/// The walk answers `None` (the caller then keeps the old, conservative
+/// whole-range read) at anything that could make the backward view
+/// incomplete or the offsets incomparable:
+/// * a label (another predecessor may reach the load), any jump, `ret`,
+///   `call`, or the body start;
+/// * inline or pinned assembly, or a data-emitting directive
+///   ([`steps_over_line`] refuses those);
+/// * any `%rsp` shift (push/pop/`subq`/`addq`), which moves every slot;
+/// * any other line with a frame memory operand — an immediate store, a
+///   read-modify-write, a string op on a slot — that may write the bytes;
+/// * a slot store on the other frame base (comparable only through the
+///   frame layout, which this walk does not model).
+///
+/// Indirect stores through non-frame registers are stepped over: the caller
+/// runs only after its escape pre-scan proved no frame address reached a
+/// register, so they cannot alias a slot. A load wider than 64 bytes (never
+/// emitted for a slot) is refused rather than tracked.
+fn locally_covering_stores(
+    store: &LineStore,
+    infos: &[LineInfo],
+    load: usize,
+    body_start: usize,
+    base: u8,
+    offset: i32,
+    bytes: i32,
+) -> Option<Vec<usize>> {
+    if !(1..=64).contains(&bytes) {
+        return None;
+    }
+    let lo = i64::from(offset);
+    let hi = lo + i64::from(bytes);
+    let mut uncovered: u64 = if bytes == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bytes) - 1
+    };
+    let mut writers = Vec::new();
+    let mut n = load;
+    while n > body_start {
+        n -= 1;
+        let t = infos[n].trimmed(store.get(n));
+        if steps_over_line(&infos[n], t) {
+            continue;
+        }
+        if infos[n].pinned {
+            return None;
+        }
+        let (s_off, s_size) = match infos[n].kind {
+            LineKind::StoreRbp { offset, size, .. } | LineKind::StoreXmmRbp { offset, size } => {
+                (offset, size.byte_size())
+            }
+            LineKind::Label
+            | LineKind::Jmp
+            | LineKind::CondJmp
+            | LineKind::JmpIndirect
+            | LineKind::Ret
+            | LineKind::Call
+            | LineKind::InlineAsm
+            | LineKind::Push { .. }
+            | LineKind::Pop { .. }
+            | LineKind::Directive => return None,
+            _ => {
+                if is_rsp_shift_line(t)
+                    || infos[n].rbp_offset != RBP_OFFSET_NONE
+                    || parse_frame_mem(t).is_some()
+                    || t.contains("(%rsp")
+                    || t.contains("(%rbp")
+                {
+                    return None;
+                }
+                continue;
+            }
+        };
+        if frame_base(t, b's') != base {
+            return None;
+        }
+        let s_lo = i64::from(s_off);
+        let s_hi = s_lo + i64::from(s_size);
+        let (o_lo, o_hi) = (lo.max(s_lo), hi.min(s_hi));
+        if o_lo >= o_hi {
+            continue;
+        }
+        let width = o_hi - o_lo;
+        let run = if width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << width) - 1
+        };
+        let mask = run << (o_lo - lo);
+        if uncovered & mask != 0 {
+            writers.push(n);
+            uncovered &= !mask;
+            if uncovered == 0 {
+                return Some(writers);
+            }
+        }
+    }
+    None
 }
 
 /// Whether the next executable instruction consumes the current stack top.
@@ -1769,5 +1882,83 @@ mod tests {
                 .unwrap()
         };
         assert!(infos[at("vmovsd")].is_nop(), "dead merge copy must go");
+    }
+
+    /// Upward-exposed slot reads: a load fully covered by an earlier store
+    /// in its own straight-line run observes only that store, so it no
+    /// longer pins every other store overlapping the slot (the never-read
+    /// `movl %eax, 68(%rsp)` in `zlib_ng_adler32_combine`'s hot loop). Each
+    /// negative is one condition under which the backward view is
+    /// incomplete; the probe store must then survive exactly as before.
+    #[test]
+    fn never_read_dse_attributes_locally_covered_loads() {
+        let probe = "movl %eax, 68(%rsp)";
+        for (name, reuse, deleted) in [
+            (
+                "full cover",
+                "    movq %rax, 64(%rsp)\n    movl %r14d, %r10d\n    movq 64(%rsp), %rdi\n",
+                true,
+            ),
+            (
+                "two writers cover",
+                "    movl %eax, 64(%rsp)\n    movl %ecx, 68(%rsp)\n    movq 64(%rsp), %rdi\n",
+                true,
+            ),
+            (
+                "indirect non-frame store is stepped over",
+                "    movq %rax, 64(%rsp)\n    movq %rcx, (%rdx)\n    movq 64(%rsp), %rdi\n",
+                true,
+            ),
+            (
+                "partial cover",
+                "    movl %eax, 64(%rsp)\n    movq 64(%rsp), %rdi\n",
+                false,
+            ),
+            (
+                "label splits the run",
+                "    movq %rax, 64(%rsp)\n.Ljoin:\n    movq 64(%rsp), %rdi\n",
+                false,
+            ),
+            (
+                "call splits the run",
+                "    movq %rax, 64(%rsp)\n    call g\n    movq 64(%rsp), %rdi\n",
+                false,
+            ),
+            (
+                "unmodelled frame writer",
+                "    movq %rax, 64(%rsp)\n    movl $7, 68(%rsp)\n    movq 64(%rsp), %rdi\n",
+                false,
+            ),
+            ("no covering store", "    movq 64(%rsp), %rdi\n", false),
+        ] {
+            let asm = format!(
+                "f:\n.cfi_startproc\n    subq $128, %rsp\n.Lloop:\n    imull $65521, %eax, %eax\n    {probe}\n    subl %eax, %r15d\n    jne .Lloop\n.Lnext:\n{reuse}    addq $128, %rsp\n    ret\n.cfi_endproc\n.size f, .-f\n"
+            );
+            let (store, mut infos) = build(&asm);
+            let at = |needle: &str| {
+                (0..store.len())
+                    .find(|&i| store.get(i).contains(needle))
+                    .unwrap()
+            };
+            let p = at(probe);
+            eliminate_never_read_stores(&store, &mut infos);
+            assert_eq!(infos[p].is_nop(), deleted, "{name}: probe store");
+            // The store a covered load reads is never deleted.
+            if let Some(c) =
+                (0..store.len()).find(|&i| store.get(i).contains("movq %rax, 64(%rsp)"))
+            {
+                assert!(!infos[c].is_nop(), "{name}: the covering store is read");
+            }
+            if name == "two writers cover" {
+                assert!(
+                    !infos[at("movl %eax, 64(%rsp)")].is_nop(),
+                    "{name}: low writer read"
+                );
+                assert!(
+                    !infos[at("movl %ecx, 68(%rsp)")].is_nop(),
+                    "{name}: high writer read"
+                );
+            }
+        }
     }
 }

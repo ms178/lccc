@@ -250,7 +250,9 @@ The encoder maps AT&T `@MODIFIER` syntax to i386 relocation types:
 | `@PLT`           | `R_386_PLT32`        | PLT-relative call                  |
 | `@GOTPC`         | `R_386_GOTPC`        | PC-relative to GOT base            |
 | `@GOTNTPOFF`     | `R_386_TLS_GOTIE`    | IE model via GOT                   |
-| `@INDNTPOFF`     | `R_386_TLS_GOTIE`    | IE model via GOT (alias)           |
+| `@INDNTPOFF`     | `R_386_TLS_IE`       | IE model, absolute GOT-slot address|
+| `@TLSDESC`       | `R_386_TLS_GOTDESC`  | TLS descriptor GOT offset (GNU2)   |
+| `@TLSCALL`       | `R_386_TLS_DESC_CALL`| `call *x@tlscall(%eax)`, no field  |
 
 ### Stage 3: ELF Object File Emission
 

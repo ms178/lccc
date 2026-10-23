@@ -675,6 +675,15 @@ impl LiveSpans {
     }
 }
 
+/// One liveness-gated eviction of a value that is dead after `point`
+/// ([`X86Codegen::note_reg_clobbered`]).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TransientEviction {
+    value: u32,
+    point: u32,
+    was_fresh: bool,
+}
+
 /// Stabbing index over the live spans of every value homed in one register:
 /// `stab(p)` lists the sharers live at `p` in O((1 + answers) log spans)
 /// instead of testing every sharer (a register can home thousands of
@@ -730,6 +739,43 @@ impl SharerLiveIndex {
             stack.push((2 * node + 1, mid, hi));
             stack.push((2 * node, lo, mid));
         }
+    }
+}
+
+/// `X86Codegen::def_index`: the function the index was built for, and the
+/// def matcher's answer per value id (`Some((block, inst))` = the unique
+/// definition, `None` = defined more than once).
+pub(super) type DefIndex = (*const IrFunction, FxHashMap<u32, Option<(usize, usize)>>);
+
+/// Home-freshness-filtered view of `reg_assignments` for the MachInst
+/// lowering (isel). isel pre-colors any value present in this view to its
+/// `MachReg::Phys` home -- including as a SOURCE operand, which is only
+/// sound while the register provably still holds that value. The
+/// accumulator emitter reuses destination registers in place for derived
+/// values, so a stale home must NOT be pre-colored: passing it as a Vreg
+/// lets the MachInst allocator reload it from its slot (kernel 6.18.50
+/// free_area_init_node zone-pointer-as-index panic). Values not yet noted
+/// fresh fall back to the classic path or to a MachInst-local reload --
+/// both sound.
+///
+/// Answers per lookup what the former per-instruction filtered COPY of the
+/// map answered per entry: the emitter is borrowed for the whole lowering,
+/// so no home can change between the two.
+pub(super) struct FreshHomes<'a>(pub(super) &'a X86Codegen);
+
+impl super::isel::HomeMap for FreshHomes<'_> {
+    fn get(&self, id: &u32) -> Option<&PhysReg> {
+        let cg = self.0;
+        cg.reg_assignments
+            .get(id)
+            .filter(|_| !cg.home_clobbered.contains(id) || cg.home_readable_via_alias(*id))
+    }
+
+    fn any_home(&self, pred: &dyn Fn(PhysReg) -> bool) -> bool {
+        self.0
+            .reg_assignments
+            .iter()
+            .any(|(id, &r)| pred(r) && self.get(id).is_some())
     }
 }
 
@@ -878,6 +924,17 @@ pub struct X86Codegen {
     /// `value_live_segments` ([`Self::index_home_liveness`]); the clobber
     /// eviction's liveness gate reads it.
     pub(super) home_live_index: FxHashMap<u8, SharerLiveIndex>,
+    /// Liveness-gated evictions whose value is dead AFTER the clobbering
+    /// point, pending settlement ([`Self::settle_transient_home_evictions`]).
+    pub(super) home_transient_evictions: Vec<TransientEviction>,
+    /// Sorted terminator program points (liveness `block_ends`): a value
+    /// live out across a non-contiguous edge also ends its segment there,
+    /// so an eviction at one of these points is never transient.
+    pub(super) home_block_end_points: Vec<u32>,
+    /// Every value in a same-value class (`phi_chain` keys and
+    /// representatives). A member's clobber mark is evidence for its
+    /// siblings' alias reads, so it is never settled.
+    pub(super) home_class_members: FxHashSet<u32>,
     /// Inverse of `reg_assignments`: physical register id -> value IDs homed
     /// there. Lets `note_dest_defined` evict every OTHER sharer of a
     /// destination's home in O(sharers) instead of scanning the whole map.
@@ -920,16 +977,25 @@ pub struct X86Codegen {
     /// legacy-SSE consumers require). Shares the label counter and the
     /// .rodata flush with `vec_const_labels`.
     pub(super) lane_const_labels: crate::common::fx_hash::FxHashMap<(u64, u8, u8), String>,
-    /// True when the target has BMI1; enables scalar ANDN fusion.
+    /// True when the target has BMI1; enables scalar ANDN fusion and TZCNT
+    /// (Ctz). Without it Ctz lowers to BSF with an explicit zero fixup.
     pub(super) bmi1_enabled: bool,
+    /// The TU's scalar integer ISA (`-mbmi`/`-mbmi2`/`-mlzcnt`/`-mpopcnt`
+    /// after `-march` resolution), captured by `apply_options`. Per-function
+    /// `target("...")` features are OR-ed onto this and the live
+    /// `*_enabled` bits are restored from it after every function.
+    module_scalar_isa: ScalarIsa,
     /// True when the target has LZCNT/ABM (-mlzcnt or an enabling -march).
-    /// When false, Clz/Ctz lower to BSR/BSF sequences with an explicit zero
-    /// fixup: F3-prefixed LZCNT/TZCNT decode as BSR/BSF on CPUs without the
-    /// feature and silently return wrong counts.
+    /// When false, Clz lowers to a BSR sequence with an explicit zero fixup:
+    /// F3-prefixed LZCNT decodes as BSR on CPUs without the feature and
+    /// silently returns a wrong count. (Ctz/TZCNT is BMI1: `bmi1_enabled`.)
     pub(super) lzcnt_enabled: bool,
     /// True when the target has POPCNT (-mpopcnt or an enabling -march).
     /// When false, Popcount lowers to an shr/adc bit loop.
     pub(super) popcnt_enabled: bool,
+    /// `IntrinsicOp::Prefetch` lowering permissions; `None` under
+    /// `CCC_NO_PREFETCH` (see `CodegenOptions::no_prefetch`).
+    pub(super) prefetch_isa: Option<crate::backend::x86_common::X86PrefetchIsa>,
     /// True when the target has BMI2 (`-mbmi2` or an enabling -march).
     pub(super) bmi2_enabled: bool,
     /// True when the target has APX Foundation (`-mapx` / `-mapxf`).
@@ -957,6 +1023,10 @@ pub struct X86Codegen {
     pub(super) optimize_for_size: bool,
     /// Current function being generated (needed for indexed addressing detection).
     pub(super) current_func: Option<*const IrFunction>,
+    /// `find_defining_instruction`'s answers for `current_func`, built on the
+    /// first `get_defining_instruction` of the function (see there) and reset
+    /// wherever `current_func` changes.
+    pub(super) def_index: std::cell::OnceCell<DefIndex>,
     /// When true, skip movslq sign-extension after 32-bit ALU ops on registers
     /// for values NOT in needs_sext_values. Set when no GEPs and no widening casts.
     pub(super) skip_i32_sext: bool,
@@ -1464,6 +1534,9 @@ impl X86Codegen {
             phi_chain: FxHashMap::default(),
             value_live_segments: FxHashMap::default(),
             home_live_index: FxHashMap::default(),
+            home_transient_evictions: Vec::new(),
+            home_block_end_points: Vec::new(),
+            home_class_members: FxHashSet::default(),
             home_sharers: FxHashMap::default(),
             call_fresh_snapshot: Vec::new(),
             used_callee_saved: Vec::new(),
@@ -1477,8 +1550,10 @@ impl X86Codegen {
             vec_const_counter: 0,
             lane_const_labels: crate::common::fx_hash::FxHashMap::default(),
             bmi1_enabled: false,
+            module_scalar_isa: ScalarIsa::default(),
             lzcnt_enabled: false,
             popcnt_enabled: false,
+            prefetch_isa: None,
             bmi2_enabled: false,
             apx_enabled: false,
             tune: crate::backend::x86::cpu_model::X86Tune::GENERIC,
@@ -1513,6 +1588,7 @@ impl X86Codegen {
             pending_widen: [None, None],
             pending_fp_cmp: None,
             current_func: None,
+            def_index: std::cell::OnceCell::new(),
             ivsr_pointers: FxHashMap::default(),
             pointer_to_counter: FxHashMap::default(),
             param_source_regs: FxHashMap::default(),
@@ -1593,8 +1669,7 @@ impl X86Codegen {
     /// Apply all relevant options from a `CodegenOptions` struct.
     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
         self.state.disable_regalloc = opts.disable_regalloc;
-        self.state.shared_lib = opts.shared_lib;
-        self.state.tls_model = opts.tls_model;
+        self.state.apply_tls_options(opts);
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
         self.set_function_return_thunk(opts.function_return_thunk);
@@ -1611,17 +1686,24 @@ impl X86Codegen {
         self.bmi1_enabled = opts.bmi1;
         self.lzcnt_enabled = opts.lzcnt;
         self.popcnt_enabled = opts.popcnt;
+        // The SSE prefetch family is x86-64 baseline (GCC emits it even
+        // under `-mno-sse`), so only PRFCHW is a per-target decision here.
+        self.prefetch_isa =
+            (!opts.no_prefetch).then_some(crate::backend::x86_common::X86PrefetchIsa {
+                sse: true,
+                prfchw: opts.x86_prefetch.prfchw,
+            });
         self.bmi2_enabled = opts.bmi2;
         self.apx_enabled = opts.apx;
         super::isel::set_apx_enabled(opts.apx);
         self.tune = opts.tune;
-        super::isel::set_shlx_mode(if opts.tune.prefer_shlx(opts.bmi2) {
-            super::isel::ShlxMode::Always
-        } else if opts.tune.shlx_saves_move(opts.bmi2) {
-            super::isel::ShlxMode::WhenItSavesAMove
-        } else {
-            super::isel::ShlxMode::Never
-        });
+        self.module_scalar_isa = ScalarIsa {
+            bmi1: opts.bmi1,
+            bmi2: opts.bmi2,
+            lzcnt: opts.lzcnt,
+            popcnt: opts.popcnt,
+        };
+        self.publish_shlx_mode();
         // VEX.256 / VEX.128 permission follows the NORMALIZED ISA, not the
         // raw request bit — the `fma_enabled` discipline two lines below.
         // The project's default -march is x86-64-v3, which grants AVX2 in
@@ -2024,24 +2106,6 @@ impl X86Codegen {
         self.home_indirect_seen = true;
     }
 
-    /// Home-freshness-filtered view of `reg_assignments` for the MachInst
-    /// lowering (isel). isel pre-colors any value present in this map to its
-    /// `MachReg::Phys` home — including as a SOURCE operand, which is only
-    /// sound while the register provably still holds that value. The
-    /// accumulator emitter reuses destination registers in place for
-    /// derived values, so a stale home must NOT be pre-colored: passing it
-    /// as a Vreg lets the MachInst allocator reload it from its slot
-    /// (kernel 6.18.50 free_area_init_node zone-pointer-as-index panic).
-    /// Values not yet noted fresh fall back to the classic path or to a
-    /// MachInst-local reload — both sound.
-    fn fresh_ra_for_isel(&self) -> FxHashMap<u32, PhysReg> {
-        self.reg_assignments
-            .iter()
-            .filter(|(k, _)| !self.home_clobbered.contains(*k) || self.home_readable_via_alias(**k))
-            .map(|(k, v)| (*k, *v))
-            .collect()
-    }
-
     /// Record that `dest_id` was just defined into its home register: the
     /// emitters' standing invariant is "a homed value's definition writes its
     /// home" (store_rax_to's register arm, register-direct loads, in-place
@@ -2117,6 +2181,18 @@ impl X86Codegen {
             // irrelevant until its own redefinition re-marks it.
             let mut stale: Vec<u32> = Vec::new();
             index.stab(point, &mut stale);
+            // The stab is closed: a sharer whose LAST use is the clobbering
+            // instruction itself (an in-place `addq %off, %home` deriving
+            // a new value from it) is live at `point` and must be evicted
+            // for any read later in this same instruction. Past `point` the
+            // mark is vacuous — every path out of `point` runs through
+            // `point + 1`, where it is dead — yet the sticky set would carry
+            // it into blocks reached from paths where its home is intact,
+            // and a homed-only value then has no recovery (zstd_fast,
+            // zstd_lazy, zstdmt: "stale home with no slot/remat/acc
+            // recovery"). Such evictions are recorded and settled once
+            // emission leaves `point`.
+            let terminator_point = self.home_block_end_points.binary_search(&point).is_ok();
             // Cheap test first: the eviction list is empty for the vast
             // majority of clobbers, and only a non-empty one can trace.
             if !stale.is_empty() && trace_notes_enabled() {
@@ -2126,10 +2202,50 @@ impl X86Codegen {
                 );
             }
             for v in stale {
+                if !terminator_point
+                    && !self.home_clobbered.contains(&v)
+                    && !self.home_class_members.contains(&v)
+                    && self
+                        .value_live_segments
+                        .get(&v)
+                        .is_some_and(|live| !live.contains(point.saturating_add(1)))
+                {
+                    self.home_transient_evictions.push(TransientEviction {
+                        value: v,
+                        point,
+                        was_fresh: self.home_fresh.contains(&v),
+                    });
+                }
                 self.home_fresh.remove(&v);
                 self.home_clobbered.insert(v);
             }
         }
+    }
+
+    /// Settle the transient evictions recorded at an earlier program point:
+    /// restore each value's exact pre-eviction state. Sound because such a
+    /// value is dead after its eviction point (no read past it can observe
+    /// the write) and is in no same-value class (its mark answers only for
+    /// its own reads). Evictions at the current point stay: a read later in
+    /// the same instruction must still see them. A missed settlement only
+    /// leaves the conservative sticky mark.
+    pub(super) fn settle_transient_home_evictions(&mut self) {
+        if self.home_transient_evictions.is_empty() {
+            return;
+        }
+        let point = self.state.current_program_point;
+        let mut pending = std::mem::take(&mut self.home_transient_evictions);
+        pending.retain(|e| {
+            if e.point == point {
+                return true;
+            }
+            self.home_clobbered.remove(&e.value);
+            if e.was_fresh {
+                self.home_fresh.insert(e.value);
+            }
+            false
+        });
+        self.home_transient_evictions = pending;
     }
 
     /// Staging-write accounting for [`Self::operand_to_callee_reg`]/register
@@ -3563,13 +3679,62 @@ impl X86Codegen {
 
     /// Helper function to get the instruction that defines a value.
     /// Returns None if the value isn't defined by an instruction in the current function.
+    ///
+    /// Answered from a per-function index: the matcher must scan the whole
+    /// function (a second definition voids the first), and its consumers ask
+    /// per access -- the TLS resolver for every load and store, remat and
+    /// the call-argument chains per use -- which made emission quadratic in
+    /// the function size.  The index is built on the first question of a
+    /// function (functions that never ask pay nothing) and records exactly
+    /// the matcher's answer per value.  It remembers the function it was
+    /// built for; were `current_func` ever re-pointed without the prologue's
+    /// reset, the question falls back to the scan instead of answering for
+    /// another function.
     pub(super) fn get_defining_instruction(
         &self,
         val_id: u32,
     ) -> Option<&crate::ir::reexports::Instruction> {
         let func_ptr = self.current_func?;
         let func = unsafe { &*func_ptr };
-        Self::find_defining_instruction(func, val_id)
+        let (built_for, index) = self
+            .def_index
+            .get_or_init(|| (func_ptr, Self::build_def_index(func)));
+        if !std::ptr::eq(*built_for, func_ptr) {
+            return Self::find_defining_instruction(func, val_id);
+        }
+        Self::indexed_definition(func, index, val_id)
+    }
+
+    /// Every value's `find_defining_instruction` answer for `func`, as block
+    /// and instruction positions: `Some` for a unique definition, `None` for
+    /// a value defined more than once (the AMBIGUITY LAW below).  Values
+    /// absent from the map have no definition.
+    pub(super) fn build_def_index(
+        func: &crate::ir::reexports::IrFunction,
+    ) -> FxHashMap<u32, Option<(usize, usize)>> {
+        let mut index: FxHashMap<u32, Option<(usize, usize)>> = FxHashMap::default();
+        for (b, block) in func.blocks.iter().enumerate() {
+            for (i, inst) in block.instructions.iter().enumerate() {
+                if let Some(v) = Self::matched_definition(inst) {
+                    index
+                        .entry(v)
+                        .and_modify(|slot| *slot = None)
+                        .or_insert(Some((b, i)));
+                }
+            }
+        }
+        index
+    }
+
+    /// The instruction `index` (from [`X86Codegen::build_def_index`] of
+    /// `func`) records as `val_id`'s unique definition.
+    pub(super) fn indexed_definition<'f>(
+        func: &'f crate::ir::reexports::IrFunction,
+        index: &FxHashMap<u32, Option<(usize, usize)>>,
+        val_id: u32,
+    ) -> Option<&'f crate::ir::reexports::Instruction> {
+        let (b, i) = (*index.get(&val_id)?)?;
+        func.blocks.get(b)?.instructions.get(i)
     }
 
     /// The def-matcher walk, factored out of the emitter so the unit test can
@@ -3597,46 +3762,7 @@ impl X86Codegen {
         let mut found: Option<&crate::ir::reexports::Instruction> = None;
         for block in &func.blocks {
             for inst in &block.instructions {
-                use crate::ir::reexports::Instruction;
-                let dest_id = match inst {
-                    Instruction::BinOp { dest, .. } => Some(dest.0),
-                    Instruction::UnaryOp { dest, .. } => Some(dest.0),
-                    Instruction::Cast { dest, .. } => Some(dest.0),
-                    Instruction::GetElementPtr { dest, .. } => Some(dest.0),
-                    Instruction::Load { dest, .. } => Some(dest.0),
-                    Instruction::Cmp { dest, .. } => Some(dest.0),
-                    Instruction::Phi { dest, .. } => Some(dest.0),
-                    // GlobalAddr dests must be found: rematerialisable
-                    // addresses have deliberately no home, so every
-                    // consumer-side rebuild (value_to_reg / operand_to_rax)
-                    // depends on this lookup locating the definition.  The
-                    // missing arm made the documented rebuild contract dead
-                    // code and forced slot assignment for every spliced
-                    // GlobalAddr (fortify_fold's stripped puts literals in
-                    // variadic frames hit exactly that wall).
-                    Instruction::GlobalAddr { dest, .. } => Some(dest.0),
-                    // Copy dests must be found for the same reason: Copy is
-                    // the identity, so a Copy-defined value is recoverable
-                    // from its source exactly as it was recoverable at the
-                    // definition — rematerialize_stale_into_rax re-derives
-                    // the source with the ordinary freshness/slot discipline
-                    // at the CONSUMPTION point (no history assumption, no
-                    // re-execution hazard: the "re-executed" Copy is a mov
-                    // from an operand proven materialisable *now*).  The arm
-                    // had been missing since the matcher was written, which
-                    // left the Copy branch of the stale-home recovery dead
-                    // and iced kernel arp_create (v=1408: Copy-defined, home
-                    // clobbered by call-arg staging, no slot, recovery
-                    // chain severed before it started).  The other Copy-
-                    // following consumers (calls.rs const-chain and
-                    // global-addr-chain resolvers) carry explicit Copy arms
-                    // that were equally dead; GlobalAddr-only classifiers
-                    // see the same None they saw before.
-                    Instruction::Copy { dest, .. } => Some(dest.0),
-                    _ => None,
-                };
-
-                if dest_id == Some(val_id) {
+                if Self::matched_definition(inst) == Some(val_id) {
                     if found.is_some() {
                         // Second definition: ambiguous, NOT re-derivable.
                         return None;
@@ -3646,6 +3772,50 @@ impl X86Codegen {
             }
         }
         found
+    }
+
+    /// The value `inst` defines, as far as the def matcher is concerned.
+    /// The dest-classification list IS the contract (see
+    /// `find_defining_instruction`); the index and the scan share it.
+    fn matched_definition(inst: &crate::ir::reexports::Instruction) -> Option<u32> {
+        use crate::ir::reexports::Instruction;
+        match inst {
+            Instruction::BinOp { dest, .. } => Some(dest.0),
+            Instruction::UnaryOp { dest, .. } => Some(dest.0),
+            Instruction::Cast { dest, .. } => Some(dest.0),
+            Instruction::GetElementPtr { dest, .. } => Some(dest.0),
+            Instruction::Load { dest, .. } => Some(dest.0),
+            Instruction::Cmp { dest, .. } => Some(dest.0),
+            Instruction::Phi { dest, .. } => Some(dest.0),
+            // GlobalAddr dests must be found: rematerialisable
+            // addresses have deliberately no home, so every
+            // consumer-side rebuild (value_to_reg / operand_to_rax)
+            // depends on this lookup locating the definition.  The
+            // missing arm made the documented rebuild contract dead
+            // code and forced slot assignment for every spliced
+            // GlobalAddr (fortify_fold's stripped puts literals in
+            // variadic frames hit exactly that wall).
+            Instruction::GlobalAddr { dest, .. } => Some(dest.0),
+            // Copy dests must be found for the same reason: Copy is
+            // the identity, so a Copy-defined value is recoverable
+            // from its source exactly as it was recoverable at the
+            // definition — rematerialize_stale_into_rax re-derives
+            // the source with the ordinary freshness/slot discipline
+            // at the CONSUMPTION point (no history assumption, no
+            // re-execution hazard: the "re-executed" Copy is a mov
+            // from an operand proven materialisable *now*).  The arm
+            // had been missing since the matcher was written, which
+            // left the Copy branch of the stale-home recovery dead
+            // and iced kernel arp_create (v=1408: Copy-defined, home
+            // clobbered by call-arg staging, no slot, recovery
+            // chain severed before it started).  The other Copy-
+            // following consumers (calls.rs const-chain and
+            // global-addr-chain resolvers) carry explicit Copy arms
+            // that were equally dead; GlobalAddr-only classifiers
+            // see the same None they saw before.
+            Instruction::Copy { dest, .. } => Some(dest.0),
+            _ => None,
+        }
     }
 
     /// Analyze function to detect IVSR pointer patterns.
@@ -4522,7 +4692,7 @@ impl X86Codegen {
                         self.state.emit("    xorl %edx, %edx");
                     } else if self.state.is_i128_value(v.0) {
                         // 128-bit value in 16-byte stack slot
-                        if std::env::var("CCC_TRACE_I128").is_ok() {
+                        if crate::backend::traits::trace_i128_enabled() {
                             eprintln!(
                                 "[I128] load_acc_pair value {} slot {} rsp_frame_size={}",
                                 v.0, slot.0, self.state.out.rsp_frame_size
@@ -4612,7 +4782,7 @@ impl X86Codegen {
     /// Store %rax:%rdx (128-bit) to a value's 16-byte stack slot.
     pub(super) fn store_rax_rdx_to(&mut self, dest: &Value) {
         if let Some(slot) = self.state.get_slot(dest.0) {
-            if std::env::var("CCC_TRACE_I128").is_ok() {
+            if crate::backend::traits::trace_i128_enabled() {
                 eprintln!(
                     "[I128] store_rax_rdx_to: value {} -> slot {}",
                     dest.0, slot.0
@@ -4622,7 +4792,7 @@ impl X86Codegen {
             self.state
                 .out
                 .emit_instr_reg_rbp("    movq", "rdx", slot.0 + 8);
-        } else if std::env::var("CCC_TRACE_I128").is_ok() {
+        } else if crate::backend::traits::trace_i128_enabled() {
             eprintln!(
                 "[I128] store_rax_rdx_to: value {} has NO slot — pair left in rax:rdx (may be clobbered)",
                 dest.0
@@ -4735,14 +4905,18 @@ impl X86Codegen {
     }
 
     /// Emit a CMPXCHG loop for atomic AND/OR/XOR/NAND.
-    /// Expects RAX = operand and RCX = address; returns the old value in RAX.
-    pub(super) fn emit_x86_atomic_op_loop(&mut self, ty: IrType, op: &str) {
-        self.state.emit("    movq %rax, %rdi");
-
+    /// `addr` names the address register and `src` the operand as an ALU
+    /// source; neither is %rax or %rdx (`src` is an imm32, a register, or
+    /// `(%rsp)`).  Returns the old value in RAX; clobbers only %rax and %rdx.
+    pub(super) fn emit_x86_atomic_op_loop(&mut self, ty: IrType, op: &str, src: &str, addr: &str) {
+        debug_assert!(
+            !matches!(src, "%rax" | "%rdx") && !matches!(addr, "rax" | "rdx"),
+            "loop register as operand: {src} / {addr}"
+        );
         let load = Self::mov_load_for_type(ty);
         let load_dest = Self::load_dest_reg(ty);
         self.state
-            .emit_fmt(format_args!("    {} (%rcx), {}", load, load_dest));
+            .emit_fmt(format_args!("    {load} (%{addr}), {load_dest}"));
 
         let loop_label = format!(".Latomic_loop_{}", self.state.next_label_id());
         self.state.out.emit_named_label(&loop_label);
@@ -4752,11 +4926,11 @@ impl X86Codegen {
         // registers to avoid partial-register writes and operand-size prefixes;
         // only CMPXCHG accesses the user's object at its declared width.
         match op {
-            "and" => self.state.emit("    andq %rdi, %rdx"),
-            "or" => self.state.emit("    orq %rdi, %rdx"),
-            "xor" => self.state.emit("    xorq %rdi, %rdx"),
+            "and" => self.state.emit_fmt(format_args!("    andq {src}, %rdx")),
+            "or" => self.state.emit_fmt(format_args!("    orq {src}, %rdx")),
+            "xor" => self.state.emit_fmt(format_args!("    xorq {src}, %rdx")),
             "nand" => {
-                self.state.emit("    andq %rdi, %rdx");
+                self.state.emit_fmt(format_args!("    andq {src}, %rdx"));
                 self.state.emit("    notq %rdx");
             }
             _ => unreachable!("unsupported x86 atomic loop operation: {op}"),
@@ -4765,8 +4939,7 @@ impl X86Codegen {
         let suffix = Self::type_suffix(ty);
         let candidate = Self::reg_for_type("rdx", ty);
         self.state.emit_fmt(format_args!(
-            "    lock cmpxchg{} %{}, (%rcx)",
-            suffix, candidate
+            "    lock cmpxchg{suffix} %{candidate}, (%{addr})"
         ));
         self.state.out.emit_jcc_label("    jne", &loop_label);
     }
@@ -5693,7 +5866,7 @@ impl X86Codegen {
         if op == IrBinOp::Mul {
             if let Some(imm) = Self::const_as_imm32_typed(rhs, use_32bit) {
                 // Register-homed non-scratch lhs: emit straight from the
-                // home register (`leal (%r11d,%r11d,2), %eax` /
+                // home register (`leal (%r11,%r11,2), %eax` /
                 // `imull $7, %r11d, %eax`) instead of staging into the
                 // accumulator first — the staging copy was pure overhead
                 // (csv main: `movq %r11,%rax; leal (%eax,%eax,2), %eax`
@@ -5711,22 +5884,26 @@ impl X86Codegen {
                             !is_xmm_reg(r) && name != "rax" && name != "rcx" && name != "rdx"
                         })
                         .map(|r| {
-                            if use_32bit {
-                                phys_reg_name_32(r).to_string()
+                            let op = if use_32bit {
+                                phys_reg_name_32(r)
                             } else {
-                                phys_reg_name(r).to_string()
-                            }
+                                phys_reg_name(r)
+                            };
+                            (op.to_string(), phys_reg_name(r))
                         }),
                     _ => None,
                 };
-                if let Some(src) = src_home {
+                if let Some((src, src64)) = src_home {
                     let scale = Self::lea_scale_for_mul(imm);
                     if let Some(scale) = scale {
                         if use_32bit {
+                            // 64-bit address registers: `leal` reads only the
+                            // low 32 bits of the sum either way, and 32-bit
+                            // address registers cost an addr32 (0x67) prefix.
                             self.state.emit_fmt(format_args!(
-                                "    leal (%{s},%{s},{}), %eax",
+                                "    leal (%{a},%{a},{}), %eax",
                                 scale,
-                                s = src
+                                a = src64
                             ));
                         } else {
                             self.state.emit_fmt(format_args!(
@@ -5761,7 +5938,7 @@ impl X86Codegen {
                 if let Some(scale) = Self::lea_scale_for_mul(imm) {
                     if use_32bit {
                         self.state
-                            .emit_fmt(format_args!("    leal (%eax, %eax, {}), %eax", scale));
+                            .emit_fmt(format_args!("    leal (%rax, %rax, {}), %eax", scale));
                         if !is_unsigned {
                             self.emit_sext32_for_value("eax", "rax", is_unsigned, dest.0);
                         }
@@ -6979,6 +7156,13 @@ impl X86Codegen {
                 }
             }
         }
+        // `MachInst::CallTyped` renders its saves as GPR `movq`s; a cold-
+        // call XMM save (regalloc `add_cold_call_xmm_saves`) takes the
+        // mature path, whose name-based `movq %xmmN, slot` is exact.
+        if caller_saves.iter().any(|&(reg, _)| is_xmm_reg(reg)) {
+            super::isel::stats::note_reject_named("CallTyped(xmm-caller-save)");
+            return false;
+        }
 
         // Split alloca-address arguments into pre-moves. The pre-move
         // writes the ABI register BEFORE the caller-save spills run, so a
@@ -7394,7 +7578,75 @@ impl X86Codegen {
     }
 }
 
+/// The scalar integer extensions that only change instruction selection
+/// (no new register classes, types, ABI or `vzeroupper` obligations), and
+/// therefore can be switched per function by `target("...")`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ScalarIsa {
+    pub(super) bmi1: bool,
+    pub(super) bmi2: bool,
+    pub(super) lzcnt: bool,
+    pub(super) popcnt: bool,
+}
+
+impl ScalarIsa {
+    /// `self` plus every scalar extension `features` (normalized
+    /// `target("...")` names) enables. GCC spellings: `abm` = LZCNT+POPCNT.
+    /// Enable-only by design: a `no-*` entry or a vector/`arch=` feature
+    /// leaves the TU's selection untouched (the TU already requires any
+    /// extension it enables, so keeping it is never unsafe), and vector ISA
+    /// would additionally need type legality and RA-class changes.
+    pub(super) fn with_target_features(mut self, features: &[String]) -> Self {
+        for feature in features {
+            match feature.as_str() {
+                "bmi" => self.bmi1 = true,
+                "bmi2" => self.bmi2 = true,
+                "lzcnt" => self.lzcnt = true,
+                "popcnt" => self.popcnt = true,
+                "abm" => {
+                    self.lzcnt = true;
+                    self.popcnt = true;
+                }
+                _ => {}
+            }
+        }
+        self
+    }
+}
+
+impl X86Codegen {
+    /// Recompute isel's BMI2 shift policy from the live `bmi2_enabled`.
+    fn publish_shlx_mode(&self) {
+        let bmi2 = self.bmi2_enabled;
+        super::isel::set_shlx_mode(if self.tune.prefer_shlx(bmi2) {
+            super::isel::ShlxMode::Always
+        } else if self.tune.shlx_saves_move(bmi2) {
+            super::isel::ShlxMode::WhenItSavesAMove
+        } else {
+            super::isel::ShlxMode::Never
+        });
+    }
+}
+
 impl ArchCodegen for X86Codegen {
+    fn set_function_target_features(&mut self, features: &[String]) {
+        let isa = self.module_scalar_isa.with_target_features(features);
+        let live = ScalarIsa {
+            bmi1: self.bmi1_enabled,
+            bmi2: self.bmi2_enabled,
+            lzcnt: self.lzcnt_enabled,
+            popcnt: self.popcnt_enabled,
+        };
+        if isa == live {
+            return;
+        }
+        self.bmi1_enabled = isa.bmi1;
+        self.bmi2_enabled = isa.bmi2;
+        self.lzcnt_enabled = isa.lzcnt;
+        self.popcnt_enabled = isa.popcnt;
+        self.publish_shlx_mode();
+    }
+
     /// Provenance markers for user inline-asm bodies: `#APP`/`#NO_APP`.
     /// `#` starts a comment in this target's GAS syntax, so the markers are
     /// invisible to the assembler, to objdump, and to this backend's text
@@ -7958,14 +8210,16 @@ impl ArchCodegen for X86Codegen {
                 }
                 _ => {}
             }
+            let mut buf = std::mem::take(&mut self.machinst_buf);
             let lowered = super::isel::lower_instruction_typed_ss(
                 inst,
-                &self.fresh_ra_for_isel(),
+                &FreshHomes(self),
                 &float_alloca_slots,
                 Some(&self.value_types),
                 Some(&self.state.small_slot_values),
-                &mut self.machinst_buf,
+                &mut buf,
             );
+            self.machinst_buf = buf;
             if lowered {
                 self.machinst_buf_ir.push(inst.clone());
             }
@@ -8005,14 +8259,16 @@ impl ArchCodegen for X86Codegen {
                 }
                 _ => {}
             }
+            let mut buf = std::mem::take(&mut self.machinst_buf);
             let lowered = super::isel::lower_instruction_typed_ss(
                 inst,
-                &self.fresh_ra_for_isel(),
+                &FreshHomes(self),
                 &i128_slots,
                 Some(&self.value_types),
                 Some(&self.state.small_slot_values),
-                &mut self.machinst_buf,
+                &mut buf,
             );
+            self.machinst_buf = buf;
             if lowered {
                 self.machinst_buf_ir.push(inst.clone());
             }
@@ -8204,15 +8460,16 @@ impl ArchCodegen for X86Codegen {
             _ => {}
         }
 
-        let ra_fresh = self.fresh_ra_for_isel();
+        let mut buf = std::mem::take(&mut self.machinst_buf);
         let lowered = super::isel::lower_instruction_typed_ss(
             inst,
-            &ra_fresh,
+            &FreshHomes(self),
             &alloca_slots,
             Some(&self.value_types),
             Some(&self.state.small_slot_values),
-            &mut self.machinst_buf,
+            &mut buf,
         );
+        self.machinst_buf = buf;
         if lowered {
             // Typed S32 ALU/load/select writes zero the upper register half.
             // The IR permits implicit wide consumers (notably pointer-index
@@ -8248,8 +8505,9 @@ impl ArchCodegen for X86Codegen {
                 && self.implicit_sext_values.contains(&dest.0)
             {
                 use super::machinst::{MachInst, MachOperand, MachReg, OpSize};
-                let dst = ra_fresh
-                    .get(&dest.0)
+                // Nothing but `machinst_buf` changed since the lowering: the
+                // view answers exactly what the lowering saw.
+                let dst = super::isel::HomeMap::get(&FreshHomes(self), &dest.0)
                     .copied()
                     .map(MachReg::Phys)
                     .unwrap_or(MachReg::Vreg(dest.0));
@@ -8975,6 +9233,18 @@ impl ArchCodegen for X86Codegen {
         true
     }
 
+    fn supports_tls_direct_load_fold(&self) -> bool {
+        true
+    }
+
+    fn tls_direct_load_type_ok(&self, ty: IrType) -> bool {
+        Self::tls_direct_type_ok(ty)
+    }
+
+    fn tls_direct_store_type_ok(&self, ty: IrType) -> bool {
+        Self::tls_direct_type_ok(ty)
+    }
+
     fn supports_tls_dynamic_load_fold(&self) -> bool {
         true
     }
@@ -9105,18 +9375,9 @@ impl ArchCodegen for X86Codegen {
         if self.state.ra_config.no_folded_index_liveness {
             return false;
         }
-        match self.reg_assignments.get(&base.0) {
-            Some(&phys) if !is_xmm_reg(phys) => {
-                // Exclude the emitter's private scratch set for the fold
-                // paths: %rdx (PhysReg 16, emit_save_acc staging) and %r11
-                // (PhysReg 10, operand_to_rax staging / indirect-target
-                // scratch).  %rax/%rcx are not allocatable homes to begin
-                // with.  Every other GPR home is safe: the operand staging
-                // (operand_to_rax, xmm staging) only touches that set.
-                !matches!(phys.0, 10 | 16)
-            }
-            _ => false,
-        }
+        self.reg_assignments
+            .get(&base.0)
+            .is_some_and(|&phys| x86_const_fold_base_reg(phys))
     }
 
     fn seg_const_offset_fold_base_ok(&self, base: &Value) -> bool {
@@ -9654,6 +9915,7 @@ impl ArchCodegen for X86Codegen {
         fn emit_fused_bit_test_branch_blocks(&mut self, base: &Operand, index: &Operand, ty: IrType, true_block: BlockId, false_block: BlockId) => emit_fused_bit_test_branch_blocks_impl;
         fn emit_cond_branch_blocks(&mut self, cond: &Operand, true_block: BlockId, false_block: BlockId) => emit_cond_branch_blocks_impl;
         fn begin_home_write_block(&mut self, label: BlockId) => begin_home_write_block_impl;
+        fn begin_ir_point(&mut self) => settle_transient_home_evictions;
         fn record_branch_edge(&mut self, label: BlockId) => record_branch_edge_impl;
         fn set_home_fallthrough(&mut self, falls_through: bool) => set_home_fallthrough_impl;
         fn poison_home_write_state(&mut self) => poison_home_write_state_impl;
@@ -9764,6 +10026,17 @@ impl Default for X86Codegen {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// GPR homes in which a register-base constant-offset fold (`C(%base)`) is
+/// sound on x86-64: every GPR except the emitter's private fold-path scratch
+/// set — %rdx (PhysReg 16, emit_save_acc staging) and %r11 (PhysReg 10,
+/// operand_to_rax staging / indirect-target scratch). %rax/%rcx are never
+/// allocatable homes. The operand staging (operand_to_rax, xmm staging) only
+/// touches that set. Shared by `const_offset_fold_reg_base_ok` and the
+/// allocator's fold-deferral pool so the two cannot drift apart.
+pub(crate) fn x86_const_fold_base_reg(phys: PhysReg) -> bool {
+    !is_xmm_reg(phys) && !matches!(phys.0, 10 | 16)
 }
 
 #[cfg(test)]
@@ -9947,6 +10220,94 @@ mod alias_freshness_tests {
             None,
             "the clobber event poisons the register: no dead-sibling blessing"
         );
+    }
+
+    // ── transient evictions: a sharer dead after the clobbering point ───────
+
+    /// r12 homes v200 (live [0, 20], and [50, 60] on another path) and v201,
+    /// derived from v200 in place at v200's last use on the first path.
+    fn transient_codegen() -> X86Codegen {
+        let mut cg = X86Codegen::new();
+        cg.reg_assignments.insert(200, PhysReg(4));
+        cg.reg_assignments.insert(201, PhysReg(4));
+        cg.home_sharers.insert(4, vec![200, 201]);
+        cg.value_live_segments
+            .insert(200, LiveSpans::from_ranges(vec![(0, 20), (50, 60)]));
+        cg.value_live_segments
+            .insert(201, LiveSpans::from_ranges(vec![(20, 40)]));
+        cg.home_block_end_points = vec![30, 45, 70];
+        cg.index_home_liveness();
+        cg.state.current_program_point = 5;
+        cg.note_home_written(200);
+        cg
+    }
+
+    /// zstd_fast's `v4635 = GEP v553, off` computed in place in v553's home
+    /// at v553's last use: the eviction binds the rest of that instruction,
+    /// then the other path's read of v553 sees its intact home.
+    #[test]
+    fn last_use_eviction_holds_within_the_point_and_settles_after() {
+        let mut cg = transient_codegen();
+        cg.state.current_program_point = 20;
+        cg.note_reg_clobbered(4);
+        assert_eq!(
+            cg.fresh_home_of(200),
+            None,
+            "a read later in this instruction reloads"
+        );
+        cg.settle_transient_home_evictions();
+        assert_eq!(
+            cg.fresh_home_of(200),
+            None,
+            "settling at the same point keeps it"
+        );
+        cg.note_home_written(201);
+        cg.state.current_program_point = 50;
+        cg.settle_transient_home_evictions();
+        assert_eq!(cg.fresh_home_of(200), Some(PhysReg(4)));
+        assert!(
+            cg.home_fresh.contains(&200),
+            "the pre-eviction freshness is restored"
+        );
+        assert!(cg.home_transient_evictions.is_empty());
+    }
+
+    #[test]
+    fn eviction_of_a_value_live_after_the_point_is_permanent() {
+        let mut cg = transient_codegen();
+        cg.state.current_program_point = 10;
+        cg.note_reg_clobbered(4);
+        cg.state.current_program_point = 50;
+        cg.settle_transient_home_evictions();
+        assert_eq!(cg.fresh_home_of(200), None);
+    }
+
+    /// A value live out of its block ends its segment at the terminator point
+    /// when the successor is not laid out next: no transient treatment there.
+    #[test]
+    fn eviction_at_a_terminator_point_is_permanent() {
+        let mut cg = transient_codegen();
+        cg.value_live_segments
+            .insert(200, LiveSpans::from_ranges(vec![(0, 30), (50, 60)]));
+        cg.index_home_liveness();
+        cg.state.current_program_point = 30;
+        cg.note_reg_clobbered(4);
+        cg.state.current_program_point = 50;
+        cg.settle_transient_home_evictions();
+        assert_eq!(cg.fresh_home_of(200), None);
+    }
+
+    /// A same-value class member's mark is evidence for its siblings' alias
+    /// reads, so it is never settled.
+    #[test]
+    fn eviction_of_a_class_member_is_permanent() {
+        let mut cg = transient_codegen();
+        cg.home_class_members.insert(200);
+        cg.state.current_program_point = 20;
+        cg.note_reg_clobbered(4);
+        cg.state.current_program_point = 50;
+        cg.settle_transient_home_evictions();
+        assert!(cg.home_clobbered.contains(&200));
     }
 
     #[test]
@@ -10192,7 +10553,8 @@ mod alias_freshness_tests {
         assert_eq!(cg.fresh_home_of(103), None);
         assert_eq!(cg.fresh_home_of(104), None);
         // isel pre-coloring follows the same law.
-        let pre = cg.fresh_ra_for_isel();
+        use super::super::isel::HomeMap;
+        let pre = FreshHomes(&cg);
         assert!(!pre.contains_key(&103) && !pre.contains_key(&104));
     }
 
@@ -10657,6 +11019,7 @@ mod machinst_window_tests {
                     index: Some((vreg(21), 2)),
                     offset: 0,
                     dst: vreg(22),
+                    size: OpSize::S64,
                 },
                 22,
             ),
@@ -10706,6 +11069,7 @@ mod machinst_window_tests {
             index: Some((vreg(21), 2)),
             offset: 0,
             dst: vreg(22),
+            size: OpSize::S64,
         };
         assert!(machinst_window_defs(std::slice::from_ref(&lea)).contains(&21));
         // Mov's SOURCE is deliberately in the set as well: the conservative
@@ -10745,6 +11109,7 @@ mod machinst_window_tests {
                 index: Some((vreg(111), 4)),
                 offset: 0,
                 dst: vreg(112),
+                size: OpSize::S64,
             },
         ];
         let defs = machinst_window_defs(&window);
@@ -10805,7 +11170,7 @@ mod machinst_window_tests {
 #[cfg(test)]
 mod def_matcher_tests {
     use super::*;
-    use crate::common::types::IrType;
+    use crate::common::types::{AddressSpace, IrType};
     use crate::ir::reexports::{
         BasicBlock, BlockId, Instruction, IrBinOp, IrConst, IrFunction, Operand, Terminator, Value,
     };
@@ -10914,6 +11279,69 @@ mod def_matcher_tests {
         // Single-def values (the global, the latch increment) stay visible.
         assert!(X86Codegen::find_defining_instruction(&func, 0).is_some());
         assert!(X86Codegen::find_defining_instruction(&func, 2).is_some());
+        assert_index_matches_scan(&func, 4);
+    }
+
+    /// The per-function def index answers exactly what the scan answers --
+    /// the same instruction (by identity), the same refusals -- for every
+    /// value id up to `max_vid`, defined, multiply defined or undefined.
+    fn assert_index_matches_scan(func: &IrFunction, max_vid: u32) {
+        let index = X86Codegen::build_def_index(func);
+        for vid in 0..=max_vid {
+            let scanned = X86Codegen::find_defining_instruction(func, vid);
+            let indexed = X86Codegen::indexed_definition(func, &index, vid);
+            assert!(
+                match (scanned, indexed) {
+                    (Some(a), Some(b)) => std::ptr::eq(a, b),
+                    (None, None) => true,
+                    _ => false,
+                },
+                "value {vid}: the index must answer like the scan"
+            );
+        }
+    }
+
+    /// The index on the classification fixture: every matcher arm, a
+    /// non-defining instruction kind (`Store`), and undefined ids.
+    #[test]
+    fn def_index_matches_the_scan_on_every_def_shape() {
+        let mut func = IrFunction::new("shapes".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "g".to_string(),
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+                Instruction::Cast {
+                    dest: Value(2),
+                    src: Operand::Value(Value(1)),
+                    from_ty: IrType::U32,
+                    to_ty: IrType::U64,
+                },
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::U64,
+                },
+                Instruction::Store {
+                    val: Operand::Value(Value(3)),
+                    ptr: Value(0),
+                    ty: IrType::U64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        assert_index_matches_scan(&func, 9);
     }
 }
 

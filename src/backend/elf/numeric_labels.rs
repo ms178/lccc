@@ -184,12 +184,22 @@ fn resolve_numeric_operand(
                 resolve_numeric_name(rhs, current_idx, defs).unwrap_or_else(|| rhs.clone());
             Operand::Immediate(ImmediateValue::SymbolDiff(new_lhs, new_rhs))
         }
+        // A bare reference, or one inside an expression the operand parser
+        // kept as text (`$_GLOBAL_OFFSET_TABLE_+[.-1b]`, musl's i386 PIC
+        // idiom): the definitions are renamed, so a raw `1b` left in the
+        // text would never resolve.
         Operand::Immediate(ImmediateValue::Symbol(name)) => {
-            if let Some(resolved) = resolve_numeric_name(name, current_idx, defs) {
-                Operand::Immediate(ImmediateValue::Symbol(resolved))
-            } else {
-                op.clone()
-            }
+            Operand::Immediate(ImmediateValue::Symbol(
+                resolve_numeric_name(name, current_idx, defs)
+                    .unwrap_or_else(|| resolve_numeric_refs_in_expr(name, current_idx, defs)),
+            ))
+        }
+        Operand::Immediate(ImmediateValue::SymbolPlusOffset(name, off)) => {
+            Operand::Immediate(ImmediateValue::SymbolPlusOffset(
+                resolve_numeric_name(name, current_idx, defs)
+                    .unwrap_or_else(|| resolve_numeric_refs_in_expr(name, current_idx, defs)),
+                *off,
+            ))
         }
         Operand::Indirect(inner) => {
             let resolved_inner = resolve_numeric_operand(inner, current_idx, defs);
@@ -381,6 +391,34 @@ mod tests {
             vec![(1, ".Lnum_7_0".to_string()), (5, ".Lnum_7_1".to_string())],
         );
         d
+    }
+
+    #[test]
+    fn references_inside_expression_immediates_resolve() {
+        // `$_GLOBAL_OFFSET_TABLE_+[.-1b]` stays one text symbol in the
+        // operand parser; its `1b` must follow the definition's rename (a
+        // raw `1b` left behind escaped as an undefined symbol of that name).
+        let d = defs();
+        let op = Operand::Immediate(ImmediateValue::Symbol(
+            "_GLOBAL_OFFSET_TABLE_+[.Ldotpos_0_7-1b]".to_string(),
+        ));
+        match resolve_numeric_operand(&op, 3, &d) {
+            Operand::Immediate(ImmediateValue::Symbol(s)) => {
+                assert_eq!(s, "_GLOBAL_OFFSET_TABLE_+[.Ldotpos_0_7-.Lnum_1_0]")
+            }
+            other => panic!("unexpected operand {other:?}"),
+        }
+        // Digits inside identifiers and hex literals are not references.
+        let op = Operand::Immediate(ImmediateValue::SymbolPlusOffset(
+            "sym1b+0x1b".to_string(),
+            4,
+        ));
+        match resolve_numeric_operand(&op, 3, &d) {
+            Operand::Immediate(ImmediateValue::SymbolPlusOffset(s, 4)) => {
+                assert_eq!(s, "sym1b+0x1b")
+            }
+            other => panic!("unexpected operand {other:?}"),
+        }
     }
 
     #[test]

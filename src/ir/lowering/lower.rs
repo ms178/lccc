@@ -557,6 +557,7 @@ impl Lowerer {
                     assume_library: false,
                     ret_eightbyte_classes: Vec::new(),
                     ret_is_f128_sse: false,
+                    cold: false,
                 },
             });
         }
@@ -2249,6 +2250,7 @@ impl Lowerer {
                     is_const: false,
                     assume_library: false,
                     is_pure: false,
+                    cold: false,
                 },
             });
             self.emit(Instruction::Load {
@@ -2302,6 +2304,7 @@ impl Lowerer {
                 assume_library: false,
                 ret_eightbyte_classes: ret_classes,
                 ret_is_f128_sse: ret_is_f128,
+                cold: false,
             },
         });
         dest
@@ -2745,6 +2748,7 @@ impl Lowerer {
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
+                cold: false,
             },
         });
         ret
@@ -2786,6 +2790,7 @@ impl Lowerer {
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
+                cold: false,
             },
         });
         ret
@@ -3236,7 +3241,7 @@ impl Lowerer {
     /// Zero-initialize a region of memory within an alloca at the given byte offset.
     ///
     /// Regions up to `ZERO_INIT_STORE_LADDER_MAX` bytes are lowered as a
-    /// ladder of 8-byte (then 1-byte) stores: the IR-level passes (SROA,
+    /// ladder of 8-byte (then 4/2/1-byte tail) stores: the IR-level passes (SROA,
     /// store→load forwarding, DSE of fields that are immediately
     /// overwritten) see every store.  Larger regions become one
     /// `memset(p, 0, n)` call.  Before this cut-over a 4096-byte
@@ -3283,22 +3288,37 @@ impl Lowerer {
             });
             offset += 8;
         }
+        // The sub-8-byte tail: the widest naturally aligned store that fits
+        // (4, 2, then 1 bytes), never less aligned than the 8-byte stores
+        // above. One store per byte made every 9..=15-byte object carry
+        // byte-granular zero stores under its I16/I32 members, and aggregate
+        // SROA then had to treat each such member as a covering store over
+        // single bytes (`{int a, b; short c; char d;}`: `c` rebuilt from two
+        // bytes). DSE kills the tail store under the members' later writes
+        // together (`dse::covered` takes the union of pending stores).
         while offset < end {
+            let (ty, val, w) = [
+                (IrType::I32, IrConst::I32(0), 4),
+                (IrType::I16, IrConst::I16(0), 2),
+            ]
+            .into_iter()
+            .find(|&(_, _, w)| offset % w == 0 && offset + w <= end)
+            .unwrap_or((IrType::I8, IrConst::I8(0), 1));
             let addr = self.fresh_value();
             self.emit(Instruction::GetElementPtr {
                 dest: addr,
                 base: alloca,
                 offset: Operand::Const(IrConst::ptr_int(offset as i64)),
-                ty: IrType::I8,
+                ty,
             });
             self.emit(Instruction::Store {
                 volatile: false,
-                val: Operand::Const(IrConst::I8(0)),
+                val: Operand::Const(val),
                 ptr: addr,
-                ty: IrType::I8,
+                ty,
                 seg_override: AddressSpace::Default,
             });
-            offset += 1;
+            offset += w;
         }
     }
 

@@ -4,7 +4,7 @@
 //! shared across x86 and ARM 64-bit linkers. Also defines the set of
 //! linker-provided symbols and `__start_`/`__stop_` resolution logic.
 
-use super::types::{DynSymbol, Elf64Symbol};
+use super::types::{DynSymbol, Elf64Object, Elf64Symbol};
 
 /// Reference to one input section placed within an output section.
 pub struct InputSection {
@@ -322,4 +322,44 @@ pub fn is_dynamic_visibility(vis: u8) -> bool {
         vis & 0x3,
         crate::backend::elf::STV_HIDDEN | crate::backend::elf::STV_INTERNAL
     )
+}
+
+/// Whether `DT_INIT` / `DT_FINI` exist, decided as GNU ld decides it: iff the
+/// image itself defines `_init` / `_fini` (crti.o's frame around the
+/// `.init`/`.fini` fragments); the tag then records that symbol.  A `.init`
+/// section with no `_init` (a `-nostartfiles` fragment with no prologue and
+/// no `ret`) gets no tag, since the loader would run off its end.
+///
+/// Decided from definedness alone, so it can size `.dynamic` before layout:
+/// symbol VALUES are not final until after it, and a value-dependent test
+/// would reserve fewer entries than emission writes.
+pub fn image_init_fini<G: GlobalSymbolOps>(
+    globals: &crate::common::fx_hash::FxHashMap<String, G>,
+) -> (bool, bool) {
+    let defined = |name: &str| {
+        globals
+            .get(name)
+            .is_some_and(|g| g.is_defined() && !g.is_dynamic())
+    };
+    (defined("_init"), defined("_fini"))
+}
+
+/// For every name the objects reference as an undefined global: whether ANY
+/// of those references is strong.  An import's `.dynsym` binding is
+/// `STB_WEAK` iff every reference is weak (`Some(false)`), exactly as in GNU
+/// ld -- it describes this output's references, never the provider's
+/// definition: glibc defines e.g. `puts`-family aliases weak, and copying
+/// that would let ld.so silently bind an ordinary call to 0 on a library
+/// lacking it; conversely crtbeginS.o's weak-only `__cxa_finalize` must stay
+/// weak although libc defines it `STB_GLOBAL`.
+pub fn import_strong_refs(
+    objects: &[Elf64Object],
+) -> crate::common::fx_hash::FxHashMap<&str, bool> {
+    let mut strong: crate::common::fx_hash::FxHashMap<&str, bool> = Default::default();
+    for sym in objects.iter().flat_map(|o| o.symbols.iter()) {
+        if sym.is_undefined() && !sym.is_local() && !sym.name.is_empty() {
+            *strong.entry(sym.name.as_str()).or_insert(false) |= !sym.is_weak();
+        }
+    }
+    strong
 }

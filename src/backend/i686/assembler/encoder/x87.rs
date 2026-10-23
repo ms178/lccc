@@ -306,27 +306,11 @@ impl super::InstructionEncoder {
         }
     }
 
-    /// Map TLS modifier string to relocation type.
-    pub(super) fn tls_reloc_type(&self, modifier: &str) -> u32 {
-        match modifier {
-            "NTPOFF" => R_386_TLS_LE,
-            "TPOFF" => R_386_TLS_LE_32,
-            "TLSGD" => R_386_TLS_GD,
-            "TLSLDM" => R_386_TLS_LDM,
-            "TLSDESC" => R_386_TLS_GOTDESC,
-            "TLSCALL" => R_386_TLS_DESC_CALL,
-            "DTPOFF" => R_386_TLS_LDO_32,
-            "GOT" => R_386_GOT32,
-            "GOTOFF" => R_386_GOTOFF,
-            "PLT" => R_386_PLT32,
-            "GOTPC" => R_386_GOTPC,
-            // GAS emits R_386_TLS_GOTIE for the GOT-slot initial-exec
-            // forms; R_386_TLS_IE in a shared object forces DT_TEXTREL
-            // because the linker cannot relax it without the GOT-slot
-            // marking.
-            "GOTNTPOFF" | "INDNTPOFF" => R_386_TLS_GOTIE,
-            _ => R_386_32,
-        }
+    /// Map a `sym@MOD` modifier to its relocation type (`i686_modifier_reloc`);
+    /// an unknown modifier is the GNU as error, never a silent `R_386_32`.
+    pub(super) fn tls_reloc_type(&self, modifier: &str) -> Result<u32, String> {
+        super::core::i686_modifier_reloc(modifier)
+            .ok_or_else(|| format!("unknown i686 relocation modifier: @{}", modifier))
     }
 
     /// Encode x87 register-register arithmetic (fadd/fmul/fsub/fdiv with st(i) operands).

@@ -135,13 +135,6 @@ impl X86Codegen {
         true
     }
 
-    /// Select the psABI model when the command line did not force one.
-    /// Full PIC must preserve dlopen/interposition semantics, while an
-    /// executable can use the cheaper static models.
-    fn tls_model_for_symbol(&self, name: &str) -> TlsModel {
-        self.state.tls_model_for_symbol(name)
-    }
-
     /// Emit the GNU2 TLS-descriptor sequence. Its resolver ABI preserves all
     /// allocatable registers except `%rax`, which is deliberately not a value
     /// home in this backend. This avoids hidden ordinary-call clobbers and is
@@ -169,17 +162,30 @@ impl X86Codegen {
         self.state.emit("    # LCCC_VOLATILE_END");
     }
 
+    /// The calling thread's address of TLS symbol `name`, with the model
+    /// `common::tls` chose for the symbol (GCC 16.2 sequences):
+    ///
+    /// * Local-Exec: `movq %fs:0,%rax; leaq x@tpoff(%rax),%rax` — the offset
+    ///   is a link-time constant of the executable's own TLS block;
+    /// * Initial-Exec: `movq x@gottpoff(%rip),%rax; addq %fs:0,%rax` — the
+    ///   offset is a load-time constant read from the GOT;
+    /// * Global-/Local-Dynamic: the TLS-descriptor sequence (`gnu2` dialect)
+    ///   `leaq x@tlsdesc(%rip),%rax; call *x@tlscall(%rax); addq %fs:0,%rax`,
+    ///   see `emit_tls_dynamic_offset`. The descriptor function returns the
+    ///   offset in %rax and preserves every other register, so the access is
+    ///   NOT a call point for the register allocator. It IS a `call` for the
+    ///   frame: the prologue scan marks such functions as calling (16-byte
+    ///   call-site alignment, no red zone), like GCC's
+    ///   `ix86_current_function_calls_tls_descriptor`. glibc before 2.40
+    ///   (BZ #31372, fixed and backported) did not preserve the vector
+    ///   registers on the first access to a dlopen'ed module's TLS; GCC's and
+    ///   Clang's `gnu2` code has the same dependency. lccc-ld, ld.bfd, lld and
+    ///   mold relax the sequence to Initial-/Local-Exec in an executable.
+    ///
+    /// The dynamic result lands directly in the destination's register when
+    /// it has one, skipping the `store_rax_to` relay.
     pub(super) fn emit_tls_global_addr_impl(&mut self, dest: &Value, name: &str) {
-        // TLS requires %rax for the fs:0 base — can't fully avoid accumulator.
-        // But when dest has a register, we can skip the final store_rax_to relay.
-        // Automatic selection is linkage- and output-sensitive: executable
-        // code uses LE for local symbols and IE for preemptible ones; full PIC
-        // uses LD/GD semantics through TLS descriptors. An explicit command-
-        // line or declaration model overrides that policy. In particular, a
-        // shared object must never silently use LE/IE merely because a symbol
-        // is defined in the current translation unit: that breaks dlopen after
-        // threads exist and, for LE, produces an illegal TPOFF32 relocation.
-        match self.tls_model_for_symbol(name) {
+        match self.state.tls_model(name) {
             TlsModel::LocalExec => {
                 self.state.emit("    movq %fs:0, %rax");
                 self.state
@@ -217,11 +223,14 @@ impl X86Codegen {
     /// `&buf[k]` pointer arithmetic (torture execute/20000412-6.c: `buf+3`
     /// decoded as `6`, not `&buf[3]`). Credit: Agent C torture triage.
     ///
-    /// TLS model selection exactly mirrors `emit_tls_global_addr_impl`,
-    /// including per-symbol overrides and dynamic full-PIC defaults.
+    /// TLS symbols use the same per-symbol model as emit_tls_global_addr_impl.
     pub(super) fn emit_global_addr_into_reg(&mut self, name: &str, reg: &str) {
         if self.state.tls_symbols.contains(name) {
-            match self.tls_model_for_symbol(name) {
+            // Rematerialisation never covers TLS symbols: the remat set is
+            // seeded from `build_global_addr_map`, which excludes them, so
+            // every TLS address has a real home. Stay correct regardless.
+            debug_assert!(false, "TLS address `{name}` reached rematerialisation");
+            match self.state.tls_model(name) {
                 TlsModel::LocalExec => {
                     self.state
                         .emit_fmt(format_args!("    movq %fs:0, %{}", reg));
@@ -234,8 +243,17 @@ impl X86Codegen {
                     self.state
                         .emit_fmt(format_args!("    addq %fs:0, %{}", reg));
                 }
-                TlsModel::LocalDynamic | TlsModel::GlobalDynamic => {
-                    self.emit_tls_dynamic_addr(name, reg);
+                // The descriptor returns in %rax: park %rax in the target
+                // register (about to be overwritten anyway) and swap, so no
+                // other register and no stack slot is touched.
+                TlsModel::GlobalDynamic | TlsModel::LocalDynamic if reg != "rax" => {
+                    self.state.emit_fmt(format_args!("    movq %rax, %{}", reg));
+                    self.emit_tls_dynamic_addr(name, "rax");
+                    self.state
+                        .emit_fmt(format_args!("    xchgq %rax, %{}", reg));
+                }
+                TlsModel::GlobalDynamic | TlsModel::LocalDynamic => {
+                    self.emit_tls_dynamic_addr(name, "rax");
                 }
             }
         } else if self.state.needs_got_for_addr(name) {

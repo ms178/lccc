@@ -122,6 +122,7 @@ DEFAULT_SCALE: dict[str, str] = {
 SKIP = {
     "tls_seg_access.c": "thread-local storage needs a target libc TLS layout",
     "vecreg_new_ops.c": "x86 SIMD intrinsics (immintrin.h) — x86-only program",
+    "percpu_ptr_walk.c": "__seg_gs named address space — x86-only program",
 }
 
 
@@ -377,7 +378,13 @@ def main(argv: list[str] | None = None) -> int:
 
     programs = sorted(args.corpus.glob("*.c"))
     if args.programs:
-        wanted = {p.strip() for p in args.programs.split(",") if p.strip()}
+        # Stems, with an optional `.c` (the file name is the obvious spelling).
+        wanted = {p.strip().removesuffix(".c") for p in args.programs.split(",") if p.strip()}
+        unknown = sorted(wanted - {p.stem for p in programs})
+        if unknown:
+            # A typo must not turn into "ALL BACKENDS AGREE" over zero programs.
+            print(f"FATAL: unknown program(s) in --programs: {', '.join(unknown)}")
+            return 2
         programs = [p for p in programs if p.stem in wanted]
 
     defines: list[str] = []
@@ -407,6 +414,9 @@ def main(argv: list[str] | None = None) -> int:
 
     tasks = [(p, o) for p in programs if p.name not in SKIP
              for o in (x.strip() for x in opts.split(",") if x.strip())]
+    if not tasks:
+        print("FATAL: nothing to run (every selected program is in SKIP, or no --opts)")
+        return 2
 
     names = [n for n, *_ in usable]
     print(f"{'program':<28} {'opt':<4} " + " ".join(f"{n:<11}" for n in names))

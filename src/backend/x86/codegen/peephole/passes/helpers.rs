@@ -763,7 +763,11 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
     //   leaq 8(%rcx), %rax   -- does NOT read %rax, only writes it
     if b[0] == b'l' && b[1] == b'e' && b[2] == b'a' {
         // Check if dest register appears in the source (memory) operand.
-        // Source operand is everything before the last comma.
+        // Source operand is everything before the last comma. This is an
+        // exact-SPELLING test: `leal 4(%rax), %eax` reads %rax yet is not
+        // caught. Family-level reads are the job of `src_mentions_family`,
+        // which every caller treating a dest-only line as a fresh overwrite
+        // must consult as well (see its contract).
         if let Some(comma) = trimmed.rfind(',') {
             let dest_part = trimmed[comma + 1..].trim();
             let src_part = &trimmed[..comma];
@@ -814,6 +818,34 @@ pub(super) fn is_read_modify_write(trimmed: &str) -> bool {
         _ => false,
     } {
         return false;
+    }
+
+    // Vector/FP -> GPR transfers write their whole general-purpose destination
+    // and never read it: `vmovq %xmm0, %rax`, `vmovd %xmm0, %eax`,
+    // `vpextrd $1, %xmm0, %eax`, `vpmovmskb %ymm0, %eax`,
+    // `vmovmskpd %xmm0, %eax`, `cvttsd2si %xmm0, %rax` (the r32 forms
+    // zero-extend; none has an 8/16-bit register form, and `pextrb`/`pextrw`
+    // into r32 zero-extend too). The `mov` arm above covers only the legacy
+    // `movq`/`movd`; every `v`-prefixed or `cvt*2si` spelling fell into the
+    // read-modify-write default — a PHANTOM READ that liveness propagates
+    // backwards through whole regions. zlib_ng_adler32: the horizontal-sum
+    // tail `vmovq %xmm0, %rax; movq %rax, 24(%rsp)` kept %rax live from the
+    // vector epilogue back across the entire checksum loop nest into the
+    // buffer-fill loop, so a dead `movq %rdx, %rax` (and the in-place
+    // `movzbl` feeding it) ran 2M times. Callers consult this only for GPR
+    // destinations; a GPR -> vector or memory destination never reaches it.
+    {
+        let mnemonic = trimmed.split([' ', '\t']).next().unwrap_or("");
+        let m = mnemonic.strip_prefix('v').unwrap_or(mnemonic);
+        if matches!(m, "movq" | "movd" | "pmovmskb" | "movmskps" | "movmskpd")
+            || m.starts_with("pextr")
+            || m.starts_with("cvttsd2si")
+            || m.starts_with("cvtsd2si")
+            || m.starts_with("cvttss2si")
+            || m.starts_with("cvtss2si")
+        {
+            return false;
+        }
     }
 
     // ── non-destructive operand forms of the read-modify-write set ─────────

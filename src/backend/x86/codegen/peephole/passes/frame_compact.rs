@@ -470,7 +470,12 @@ pub(super) fn remove_dead_leaf_frame(store: &mut LineStore, infos: &mut [LineInf
                 j += 1;
                 continue;
             }
-            if body.starts_with("lccc_tls_call ") {
+            // A TLS-descriptor call is classified `Other` for its register
+            // effects (%rax only) but is a real call for alignment: deleting
+            // the frame left `%rsp ≡ 8 (mod 16)` at `call *x@TLSCALL(%rax)`,
+            // and glibc's descriptor slow path calls `__tls_get_addr` assuming
+            // an ABI-aligned stack (GCC aligns for it, too).
+            if is_tls_descriptor_call(body) {
                 has_call = true;
                 j += 1;
                 continue;

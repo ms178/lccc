@@ -27,7 +27,7 @@ b=$(body add fentry.s)
 grep -q 'call __fentry__' <<<"$b"
 first_insn=$(grep -m1 -E '^[[:space:]]*(call|pushq?|nop|\.byte)' <<<"$b")
 grep -q 'call __fentry__' <<<"$first_insn"
-! grep -q 'call __fentry__\|call mcount' <<<"$(body noinst fentry.s)"
+! grep -q 'call __fentry__\|call mcount' <<<"$(body noinst fentry.s)" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 
 # 2. + -mrecord-mcount: __mcount_loc entry for every instrumented function
 #    (add + main; noinst is excluded).
@@ -39,7 +39,7 @@ n=$(grep -c '\.section __mcount_loc' "$tmp/rec.s")
 # 3. + -mnop-mcount: the kernel's canonical 5-byte NOP, not `call`.
 "$CCC" -O2 -pg -mfentry -mrecord-mcount -mnop-mcount -S "$tmp/t.c" -o "$tmp/nop.s"
 grep -q '\.byte 0x0f, 0x1f, 0x44, 0x00, 0x00' "$tmp/nop.s"
-! grep -q 'call __fentry__' "$tmp/nop.s"
+! grep -q 'call __fentry__' "$tmp/nop.s" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 grep -q '\.section __mcount_loc' "$tmp/nop.s"
 
 # 4. Classic -pg: frame is established BEFORE `call mcount`.
@@ -53,4 +53,4 @@ awk '/pushq %rbp/{push=1} /call mcount/{exit push ? 0 : 1}' <<<"$b"
 
 # 5. Sub-modes without -pg stay inert (VDSO CFLAGS_REMOVE contract).
 "$CCC" -O2 -mfentry -mrecord-mcount -mnop-mcount -S "$tmp/t.c" -o "$tmp/inert.s"
-! grep -q '__fentry__\|__mcount_loc\|call mcount' "$tmp/inert.s"
+! grep -q '__fentry__\|__mcount_loc\|call mcount' "$tmp/inert.s" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }

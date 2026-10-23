@@ -197,6 +197,139 @@ pub(crate) fn apply(module: &mut IrModule, cli: &BuiltinFlags) {
     }
 }
 
+/// Largest constant `memcpy` length [`canonicalize_library_memcpy`] turns
+/// into the native `Memcpy` instruction.  64 bytes is the x86-64 emitter's
+/// straight-line window (`emit_memcpy_impl_impl`: one `movdqu`/`movq` pair
+/// per chunk; above it the emitter switches to a copy loop, which a tuned
+/// libc `memcpy` beats) and lies inside AArch64's 256-byte `ldp`/`stp`
+/// window.  Everything the copy-aware passes model (aggregate SROA, the
+/// store/load and memcpy-chain forwards, DSE) is far below it.
+const LIBRARY_MEMCPY_INLINE_MAX: i64 = 64;
+
+/// Give a plain `memcpy(d, s, n)` with a small constant `n` the same IR as
+/// `__builtin_memcpy(d, s, n)`: the native `Memcpy` instruction.
+///
+/// Lowering keeps every plain spelling a `Call`, because whether the name
+/// reaches the C library is known only once [`apply`] has seen the whole
+/// TU.  After it, `CallInfo::assume_library` is that answer (false under
+/// `-fno-builtin[-memcpy]`, `-ffreestanding`, or when the TU defines,
+/// relabels or aliases `memcpy`), so a call carrying it has exactly the C
+/// contract `Instruction::Memcpy` assumes: `n` bytes copied, no overlap
+/// (overlap is UB for `memcpy`), destination returned.  GCC 16.2 and Clang
+/// 23.1 make the same identification for `memcpy` under the same flags.
+/// Without it a user-written `memcpy(&tmp, p, sizeof tmp)` stays opaque to
+/// every pass that models copies -- the struct round-trip through a local
+/// (`memcpy(&s, src, 16); s.f++; memcpy(dst, &s, 16)`) was left as two
+/// copies plus a stack reload, while the `__builtin_` spelling of the same
+/// code is split into registers.
+///
+/// The result, when the call has one, becomes a `Copy` of the destination
+/// operand; copy propagation removes it.  `n` is accepted as a literal or as
+/// a `Copy`/`Cast` of one (the size_t promotion of an `int` literal), and
+/// only when it is in `1..=LIBRARY_MEMCPY_INLINE_MAX` -- a positive value
+/// that small is unchanged by any integer cast of at least 32 bits, so the
+/// cast's direction never matters.  Targets whose `Memcpy` expansion is
+/// slower than the library call are left alone: RISC-V expands it as a
+/// byte loop and i686 as `rep movsb`.
+pub(crate) fn canonicalize_library_memcpy(module: &mut IrModule, target: crate::backend::Target) {
+    use crate::backend::Target;
+    use crate::ir::reexports::{IrConst, Operand, Value};
+    if !matches!(target, Target::X86_64 | Target::Aarch64) {
+        return;
+    }
+    fn small_len(c: &IrConst) -> Option<usize> {
+        let v = match *c {
+            IrConst::I128(v) => i64::try_from(v).ok()?,
+            other => other.to_i64()?,
+        };
+        (1..=LIBRARY_MEMCPY_INLINE_MAX)
+            .contains(&v)
+            .then_some(v as usize)
+    }
+    fn is_candidate(func: &str, info: &crate::ir::instruction::CallInfo) -> bool {
+        func == "memcpy"
+            && info.assume_library
+            && !info.is_variadic
+            && info.args.len() == 3
+            && matches!(info.args[0], Operand::Value(_))
+            && matches!(info.args[1], Operand::Value(_))
+    }
+    for func in &mut module.functions {
+        if func.is_declaration {
+            continue;
+        }
+        let any = func.blocks.iter().any(|b| {
+            b.instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Call { func: f, info } if is_candidate(f, info)))
+        });
+        if !any {
+            continue;
+        }
+        // Constant definitions a size operand may name (SSA: one def each).
+        let mut const_of: FxHashMap<Value, usize> = FxHashMap::default();
+        for inst in func.blocks.iter().flat_map(|b| b.instructions.iter()) {
+            let (dest, c) = match inst {
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Const(c),
+                } => (*dest, c),
+                Instruction::Cast {
+                    dest,
+                    src: Operand::Const(c),
+                    from_ty,
+                    to_ty,
+                } if from_ty.is_integer() && to_ty.is_integer() && to_ty.size() >= 4 => (*dest, c),
+                _ => continue,
+            };
+            if let Some(n) = small_len(c) {
+                const_of.insert(dest, n);
+            }
+        }
+        for block in &mut func.blocks {
+            let has_spans = block.source_spans.len() == block.instructions.len();
+            let mut i = 0;
+            while i < block.instructions.len() {
+                let rewrite = match &block.instructions[i] {
+                    Instruction::Call { func: f, info } if is_candidate(f, info) => {
+                        let size = match &info.args[2] {
+                            Operand::Const(c) => small_len(c),
+                            Operand::Value(v) => const_of.get(v).copied(),
+                        };
+                        match (size, &info.args[0], &info.args[1]) {
+                            (Some(size), Operand::Value(d), Operand::Value(s)) => {
+                                Some((*d, *s, size, info.dest))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                let Some((dest, src, size, result)) = rewrite else {
+                    i += 1;
+                    continue;
+                };
+                block.instructions[i] = Instruction::Memcpy { dest, src, size };
+                i += 1;
+                if let Some(r) = result {
+                    block.instructions.insert(
+                        i,
+                        Instruction::Copy {
+                            dest: r,
+                            src: Operand::Value(dest),
+                        },
+                    );
+                    if has_spans {
+                        let span = block.source_spans[i - 1];
+                        block.source_spans.insert(i, span);
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +615,146 @@ mod tests {
             pairs(&[("memset", false), ("memset", true)])
         );
         assert!(!may_synthesize(&m, "main", Libcall::Memset));
+    }
+}
+
+#[cfg(test)]
+mod library_memcpy_tests {
+    use super::*;
+    use crate::backend::Target;
+    use crate::common::source::Span;
+    use crate::common::types::IrType;
+    use crate::ir::instruction::{BasicBlock, CallInfo, Terminator};
+    use crate::ir::module::IrFunction;
+    use crate::ir::reexports::{BlockId, IrConst, Operand, Value};
+
+    /// `memcpy(v1, v2, len)` with result `v9`, after an optional size def.
+    fn copy_fn(size_def: Option<Instruction>, len: Operand, assume: bool) -> IrModule {
+        let mut f = IrFunction::new("f".to_string(), IrType::Void, vec![], false);
+        let mut insts: Vec<Instruction> = size_def.into_iter().collect();
+        insts.push(Instruction::Call {
+            func: "memcpy".to_string(),
+            info: CallInfo {
+                dest: Some(Value(9)),
+                args: vec![Operand::Value(Value(1)), Operand::Value(Value(2)), len],
+                arg_types: vec![IrType::Ptr, IrType::Ptr, IrType::U64],
+                return_type: IrType::Ptr,
+                assume_library: assume,
+                ..CallInfo::default()
+            },
+        });
+        let spans = (0..insts.len() as u32)
+            .map(|i| Span::new(i, i + 1, 0))
+            .collect();
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(None),
+            source_spans: spans,
+        });
+        let mut m = IrModule::new();
+        m.functions = vec![f];
+        m
+    }
+
+    fn body(m: &IrModule) -> &BasicBlock {
+        &m.functions[0].blocks[0]
+    }
+
+    fn rewritten(m: &IrModule, size: usize) -> bool {
+        let b = body(m);
+        let n = b.instructions.len();
+        n >= 2
+            && matches!(b.instructions[n - 2],
+                Instruction::Memcpy { dest: Value(1), src: Value(2), size: s } if s == size)
+            && matches!(
+                b.instructions[n - 1],
+                Instruction::Copy {
+                    dest: Value(9),
+                    src: Operand::Value(Value(1))
+                }
+            )
+            && b.source_spans.len() == n
+            && b.source_spans[n - 1] == b.source_spans[n - 2]
+    }
+
+    fn untouched(m: &IrModule) -> bool {
+        matches!(body(m).instructions.last(), Some(Instruction::Call { .. }))
+    }
+
+    #[test]
+    fn literal_length_becomes_native_memcpy_and_result_copy() {
+        let mut m = copy_fn(None, Operand::Const(IrConst::I64(16)), true);
+        canonicalize_library_memcpy(&mut m, Target::X86_64);
+        assert!(rewritten(&m, 16));
+        let mut m = copy_fn(None, Operand::Const(IrConst::I64(64)), true);
+        canonicalize_library_memcpy(&mut m, Target::Aarch64);
+        assert!(rewritten(&m, 64));
+    }
+
+    /// The size_t promotion of an `int` literal reaches the call as a Cast.
+    #[test]
+    fn promoted_literal_length_is_seen_through_the_cast() {
+        let cast = Instruction::Cast {
+            dest: Value(5),
+            src: Operand::Const(IrConst::I32(24)),
+            from_ty: IrType::I32,
+            to_ty: IrType::U64,
+        };
+        let mut m = copy_fn(Some(cast), Operand::Value(Value(5)), true);
+        canonicalize_library_memcpy(&mut m, Target::X86_64);
+        assert!(rewritten(&m, 24));
+        assert_eq!(body(&m).instructions.len(), 3);
+    }
+
+    /// `-fno-builtin`, `-ffreestanding` or a TU-defined `memcpy` leave
+    /// `assume_library` false: the call may not be the C function.
+    #[test]
+    fn a_call_not_known_to_reach_the_library_stays_a_call() {
+        let mut m = copy_fn(None, Operand::Const(IrConst::I64(16)), false);
+        canonicalize_library_memcpy(&mut m, Target::X86_64);
+        assert!(untouched(&m));
+    }
+
+    #[test]
+    fn a_tu_defined_memcpy_blocks_the_rewrite_end_to_end() {
+        let mut m = copy_fn(None, Operand::Const(IrConst::I64(16)), false);
+        let mut def = IrFunction::new("memcpy".to_string(), IrType::Ptr, vec![], false);
+        def.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        m.functions.push(def);
+        apply(&mut m, &BuiltinFlags::default());
+        canonicalize_library_memcpy(&mut m, Target::X86_64);
+        assert!(untouched(&m));
+    }
+
+    #[test]
+    fn zero_oversized_and_runtime_lengths_stay_calls() {
+        for len in [
+            Operand::Const(IrConst::I64(0)),
+            Operand::Const(IrConst::I64(65)),
+            Operand::Const(IrConst::I64(-1)),
+            Operand::Const(IrConst::I128(1 << 64 | 16)),
+            Operand::Value(Value(7)),
+        ] {
+            let mut m = copy_fn(None, len, true);
+            canonicalize_library_memcpy(&mut m, Target::X86_64);
+            assert!(untouched(&m));
+        }
+    }
+
+    /// RISC-V expands `Memcpy` as a byte loop and i686 as `rep movsb`; both
+    /// lose to the library call, so neither target is rewritten.
+    #[test]
+    fn targets_with_a_slow_memcpy_expansion_keep_the_call() {
+        for t in [Target::Riscv64, Target::I686] {
+            let mut m = copy_fn(None, Operand::Const(IrConst::I64(16)), true);
+            canonicalize_library_memcpy(&mut m, t);
+            assert!(untouched(&m));
+        }
     }
 }

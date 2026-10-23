@@ -205,6 +205,7 @@ impl RiscvCodegen {
     /// Apply all relevant options from a `CodegenOptions` struct.
     pub fn apply_options(&mut self, opts: &crate::backend::CodegenOptions) {
         self.state.disable_regalloc = opts.disable_regalloc;
+        self.state.apply_tls_options(opts);
         self.set_pic(opts.pic || opts.pie);
         self.state.pie_mode = opts.pie;
         self.set_no_jump_tables(opts.no_jump_tables);
@@ -486,7 +487,7 @@ impl RiscvCodegen {
                         });
                     if let Some(name) = global_addr_name {
                         if self.state.needs_got(&name) {
-                            self.state.emit_fmt(format_args!("    la t0, {}", name));
+                            self.state.emit_fmt(format_args!("    lga t0, {}", name));
                         } else {
                             self.state.emit_fmt(format_args!("    lla t0, {}", name));
                         }
@@ -1213,6 +1214,7 @@ impl ArchCodegen for RiscvCodegen {
         fn emit_i128_store_result(&mut self, dest: &Value) => emit_i128_store_result_impl;
         fn emit_i128_to_float_call(&mut self, src: &Operand, from_signed: bool, to_ty: IrType) => emit_i128_to_float_call_impl;
         fn emit_float_to_i128_call(&mut self, src: &Operand, to_signed: bool, from_ty: IrType) => emit_float_to_i128_call_impl;
+        fn emit_store_f128_xmm0(&mut self, dest: &Value) => emit_store_f128_a0_a1_result;
         fn emit_i128_cmp_eq(&mut self, is_ne: bool) => emit_i128_cmp_eq_impl;
         fn emit_i128_cmp_ordered(&mut self, op: IrCmpOp) => emit_i128_cmp_ordered_impl;
         fn emit_i128_cmp_store_result(&mut self, dest: &Value) => emit_i128_cmp_store_result_impl;

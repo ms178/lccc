@@ -17,9 +17,9 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use crate::backend::elf::{
     DT_FINI_ARRAY, DT_FINI_ARRAYSZ, DT_GNU_HASH, DT_INIT_ARRAY, DT_INIT_ARRAYSZ, DT_NEEDED,
-    DT_NULL, DT_RELA, DT_RELAENT, DT_RELASZ, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB,
-    EM_RISCV as EM_RISCV_ELF, ET_DYN, PF_R, PF_W, PF_X, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK,
-    PT_LOAD, PT_TLS,
+    DT_NULL, DT_RELA, DT_RELAENT, DT_RELASZ, DT_STRSZ, DT_STRTAB, DT_SYMENT, DT_SYMTAB, DT_VERNEED,
+    DT_VERNEEDNUM, DT_VERSYM, EM_RISCV as EM_RISCV_ELF, ET_DYN, PF_R, PF_W, PF_X, PT_DYNAMIC,
+    PT_GNU_EH_FRAME, PT_GNU_RELRO, PT_GNU_STACK, PT_LOAD, PT_TLS, SHT_GNU_VERNEED, SHT_GNU_VERSYM,
 };
 
 const R_RISCV_RELATIVE: u64 = 3;
@@ -43,15 +43,17 @@ const ELFDATA2LSB: u8 = 1;
 /// have been prepared by the orchestration in `link.rs::link_shared`.
 pub fn emit_shared_library(
     input_objs: &[(String, ElfObject)],
-    merged_sections: &mut [MergedSection],
-    _merged_map: &mut FxHashMap<String, usize>,
+    merged_sections: &mut Vec<MergedSection>,
+    merged_map: &mut FxHashMap<String, usize>,
     sec_mapping: &FxHashMap<(usize, usize), (usize, u64)>,
     global_syms: &mut FxHashMap<String, GlobalSym>,
     got_symbols: &[String],
     _tls_got_symbols: &FxHashSet<String>,
     local_got_sym_info: &FxHashMap<String, (usize, usize, i64)>,
     needed_sonames: &[String],
+    shared_lib_syms: &super::input::SharedLibSyms,
     soname: Option<String>,
+    rpath: Option<&(i64, String)>,
     output_path: &str,
 ) -> Result<(), String> {
     // ── Phase 3c: Identify PLT entries needed for external function calls ──
@@ -97,6 +99,31 @@ pub fn emit_shared_library(
     let got_plt_size: u64 = got_plt_entries * 8;
     let rela_plt_size: u64 = plt_symbols.len() as u64 * 24;
 
+    // .eh_frame_hdr + PT_GNU_EH_FRAME. Not optional for a shared library:
+    // libgcc's unwinder finds the FDEs of a loaded object only through
+    // `dl_iterate_phdr` -> PT_GNU_EH_FRAME, so without it no unwind
+    // (pthread_cancel, C++ exceptions, backtrace()) passes a frame of this
+    // library. Laid out with the other read-only sections (section_order
+    // puts it right before `.eh_frame`); filled once `.eh_frame` is
+    // relocated.
+    let eh_frame_fde_count = merged_map
+        .get(".eh_frame")
+        .map(|&i| linker_common::count_eh_frame_fdes(&merged_sections[i].data))
+        .unwrap_or(0);
+    let eh_frame_hdr_idx = (eh_frame_fde_count > 0).then(|| {
+        let idx = merged_sections.len();
+        merged_map.insert(".eh_frame_hdr".into(), idx);
+        merged_sections.push(MergedSection {
+            name: ".eh_frame_hdr".into(),
+            sh_type: SHT_PROGBITS,
+            sh_flags: SHF_ALLOC,
+            data: vec![0u8; 12 + 8 * eh_frame_fde_count],
+            vaddr: 0,
+            align: 4,
+        });
+        idx
+    });
+
     // ── Phase 4: Layout sections ────────────────────────────────────
     let mut sec_indices: Vec<usize> = (0..merged_sections.len()).collect();
     sec_indices.sort_by_key(|&i| {
@@ -132,8 +159,24 @@ pub fn emit_shared_library(
         .any(|ms| ms.name == ".fini_array" && !ms.data.is_empty());
     let has_tls = merged_sections.iter().any(|ms| ms.sh_flags & SHF_TLS != 0);
 
+    // Version requirements of the imports: exactly the undefined
+    // default-visibility names that become undefined `.dynsym` entries below.
+    let verneed_plan = linker_common::symver::VerneedPlan::new(
+        global_syms
+            .iter()
+            .filter(|(_, g)| !g.defined && g.visibility == STV_DEFAULT)
+            .filter_map(|(n, _)| shared_lib_syms.import_version(n)),
+        needed_sonames,
+        2,
+    )?;
     let mut dyn_count: u64 = needed_sonames.len() as u64 + 10;
+    if !verneed_plan.is_empty() {
+        dyn_count += 3; // DT_VERSYM, DT_VERNEED, DT_VERNEEDNUM
+    }
     if soname.is_some() {
+        dyn_count += 1;
+    }
+    if rpath.is_some() {
         dyn_count += 1;
     }
     if has_init_array {
@@ -151,6 +194,9 @@ pub fn emit_shared_library(
         .iter()
         .any(|ms| ms.name == ".riscv.attributes");
     let mut phdr_count: u64 = 8;
+    if eh_frame_hdr_idx.is_some() {
+        phdr_count += 1;
+    }
     if has_tls {
         phdr_count += 1;
     }
@@ -200,11 +246,17 @@ pub fn emit_shared_library(
     for lib in needed_sonames {
         dynstr.add(lib);
     }
+    if let Some((_, path)) = rpath {
+        dynstr.add(path);
+    }
     if let Some(ref sn) = soname {
         dynstr.add(sn);
     }
     for name in &dyn_sym_names {
         dynstr.add(name);
+    }
+    for s in verneed_plan.strings() {
+        dynstr.add(s);
     }
 
     let dynsym_count = 1 + dyn_sym_names.len();
@@ -279,6 +331,18 @@ pub fn emit_shared_library(
     let dynstr_offset = offset;
     let dynstr_addr = base_addr + offset;
     offset += dynstr_size;
+    let verneed_data = verneed_plan.encode(|s| dynstr.get_offset(s) as u32);
+    let versym_size = if verneed_plan.is_empty() {
+        0
+    } else {
+        2 * dynsym_count as u64
+    };
+    offset = align_up(offset, 2);
+    let versym_offset = offset;
+    offset += versym_size;
+    offset = align_up(offset, 4);
+    let verneed_offset = offset;
+    offset += verneed_data.len() as u64;
     let rela_plt_offset = if rela_plt_size > 0 {
         offset = align_up(offset, 8);
         let o = offset;
@@ -660,6 +724,26 @@ pub fn emit_shared_library(
     // PT_GNU_STACK
     write_phdr_at(&mut elf, ph, PT_GNU_STACK, PF_R | PF_W, 0, 0, 0, 0, 0, 0x10);
     ph += 56;
+    // PT_GNU_EH_FRAME (when there is unwind info)
+    if let Some(hi) = eh_frame_hdr_idx {
+        let (vaddr, size) = (
+            merged_sections[hi].vaddr,
+            merged_sections[hi].data.len() as u64,
+        );
+        write_phdr_at(
+            &mut elf,
+            ph,
+            PT_GNU_EH_FRAME,
+            PF_R,
+            vaddr - base_addr,
+            vaddr,
+            vaddr,
+            size,
+            size,
+            4,
+        );
+        ph += 56;
+    }
     // PT_TLS (optional)
     if has_tls {
         write_phdr_at(
@@ -769,6 +853,25 @@ pub fn emit_shared_library(
         if start + db.len() <= elf.len() {
             elf[start..start + db.len()].copy_from_slice(db);
         }
+    }
+
+    // Write .gnu.version (final, hash-sorted dynsym order) and .gnu.version_r.
+    if !verneed_plan.is_empty() {
+        let mut vs = versym_offset as usize + 2; // null symbol: VER_NDX_LOCAL
+        for name in &dyn_sym_names {
+            let idx = match global_syms.get(name) {
+                Some(g) if g.defined => linker_common::symver::VER_NDX_GLOBAL,
+                _ => match shared_lib_syms.provider_of(name) {
+                    Some(lib) => verneed_plan
+                        .index_of(lib, shared_lib_syms.import_version(name).map(|v| v.1)),
+                    None => 0, // unresolved weak reference: VER_NDX_LOCAL, as bfd
+                },
+            };
+            elf[vs..vs + 2].copy_from_slice(&idx.to_le_bytes());
+            vs += 2;
+        }
+        let vo = verneed_offset as usize;
+        elf[vo..vo + verneed_data.len()].copy_from_slice(&verneed_data);
     }
 
     // Write section data
@@ -890,6 +993,19 @@ pub fn emit_shared_library(
     rela_dyn_entries.extend(reloc_result.relative_entries);
     glob_dat_entries.extend(reloc_result.symbol_entries);
 
+    // The binary-search table over the relocated `.eh_frame`.
+    if let (Some(hi), Some(&ef)) = (eh_frame_hdr_idx, merged_map.get(".eh_frame")) {
+        let mut slot = std::mem::take(&mut merged_sections[hi].data);
+        linker_common::write_eh_frame_hdr(
+            &mut slot,
+            &merged_sections[ef].data,
+            merged_sections[ef].vaddr,
+            merged_sections[hi].vaddr,
+            true,
+        );
+        merged_sections[hi].data = slot;
+    }
+
     // Write updated section data back to elf buffer
     for ms in merged_sections.iter() {
         if ms.sh_type == SHT_NOBITS || ms.data.is_empty() || ms.vaddr == 0 {
@@ -1007,6 +1123,12 @@ pub fn emit_shared_library(
             elf[dd + 8..dd + 16].copy_from_slice(&so.to_le_bytes());
             dd += 16;
         }
+        if let Some((tag, path)) = rpath {
+            let off = dynstr.get_offset(path) as u64;
+            elf[dd..dd + 8].copy_from_slice(&tag.to_le_bytes());
+            elf[dd + 8..dd + 16].copy_from_slice(&off.to_le_bytes());
+            dd += 16;
+        }
         let dyn_entries: Vec<(u64, u64)> = vec![
             (DT_STRTAB as u64, dynstr_addr),
             (DT_SYMTAB as u64, dynsym_addr),
@@ -1018,6 +1140,12 @@ pub fn emit_shared_library(
             (DT_RELACOUNT, relative_count as u64),
             (DT_GNU_HASH as u64, gnu_hash_addr),
         ];
+        let mut dyn_entries = dyn_entries;
+        if !verneed_plan.is_empty() {
+            dyn_entries.push((DT_VERSYM as u64, base_addr + versym_offset));
+            dyn_entries.push((DT_VERNEED as u64, base_addr + verneed_offset));
+            dyn_entries.push((DT_VERNEEDNUM as u64, verneed_plan.file_count()));
+        }
         for (tag, val) in dyn_entries {
             elf[dd..dd + 8].copy_from_slice(&tag.to_le_bytes());
             elf[dd + 8..dd + 16].copy_from_slice(&val.to_le_bytes());
@@ -1274,6 +1402,35 @@ pub fn emit_shared_library(
             0,
             0,
             1,
+            0,
+        ));
+    }
+
+    if !verneed_plan.is_empty() {
+        add_shstrtab_name(".gnu.version", &mut shstrtab_data);
+        section_headers.push((
+            ".gnu.version".into(),
+            SHT_GNU_VERSYM,
+            SHF_ALLOC,
+            base_addr + versym_offset,
+            versym_offset,
+            versym_size,
+            2, // .dynsym
+            0,
+            2,
+            2,
+        ));
+        add_shstrtab_name(".gnu.version_r", &mut shstrtab_data);
+        section_headers.push((
+            ".gnu.version_r".into(),
+            SHT_GNU_VERNEED,
+            SHF_ALLOC,
+            base_addr + verneed_offset,
+            verneed_offset,
+            verneed_data.len() as u64,
+            3, // .dynstr
+            verneed_plan.file_count() as u32,
+            4,
             0,
         ));
     }

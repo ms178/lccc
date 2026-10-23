@@ -353,20 +353,13 @@ fn r_reg_width(n: &str) -> u8 {
 
 /// Eliminate redundant zero-extension moves. Returns true if any changed.
 pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
-    // Compile-time guardrail for YARPGen mega-TUs: seed 101 is 63k asm lines
-    // (580s at -O1, 486s peephole). If the function is huge, the per-line
-    // LineStore + implicit-operand churn dominates and no win justifies it.
-    // Skip with a clear marker so the budget is observable, not silent.
-    if asm.len() > 512 * 1024 || asm.lines().count() > 20_000 {
-        if std::env::var("CCC_PEEPHOLE_BUDGET").as_deref() != Ok("0") {
-            eprintln!(
-                "peephole: skipping huge asm ({} bytes, {} lines) — set CCC_PEEPHOLE_BUDGET=0 to force",
-                asm.len(),
-                asm.lines().count()
-            );
-            return false;
-        }
-    }
+    // No size budget: the pass is one forward scan with O(line) work per line
+    // (the only lookahead, the profitability check of the `movq` -> `movl`
+    // narrowing, stops at the next instruction), so its cost is linear in the
+    // text. A 512 KiB / 20k-line cutoff used to skip it, which disabled it in
+    // exactly the hottest real TUs (zstd_lazy, zstd_opt, zstd_compress,
+    // huf_decompress) for no measurable compile-time gain.
+    // CCC_NO_REDUNDANT_EXT=1 still disables it for bisection.
     let mut lines: Vec<String> = asm.lines().map(|s| s.to_string()).collect();
     let mut keep = vec![true; lines.len()];
     let mut changed = false;
@@ -432,6 +425,10 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
     let sext_enabled = sext_enabled();
     let mut sext8 = vec![false; GP_FAMILIES];
     let mut sext16 = vec![false; GP_FAMILIES];
+    // wide_preload[f] = family f's most recent write was an immediate move
+    // of a value outside 0..=127 (see `wide_scan_preload`). It guards the
+    // BSF/BSR bit-count fact: a zero-capable scan returns its preload.
+    let mut wide_preload = vec![false; GP_FAMILIES];
 
     // Inline-asm regions (`#APP` .. `#NO_APP`) are user-authored text that
     // must reach the assembler byte-for-byte (kernel ALTERNATIVE() length
@@ -461,6 +458,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
             sext32 = vec![false; GP_FAMILIES];
             sext8 = vec![false; GP_FAMILIES];
             sext16 = vec![false; GP_FAMILIES];
+            wide_preload = vec![false; GP_FAMILIES];
             continue;
         }
         if t == "#NO_APP" {
@@ -471,6 +469,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
             sext32 = vec![false; GP_FAMILIES];
             sext8 = vec![false; GP_FAMILIES];
             sext16 = vec![false; GP_FAMILIES];
+            wide_preload = vec![false; GP_FAMILIES];
             continue;
         }
         if in_asm {
@@ -500,6 +499,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
             sext32 = vec![false; GP_FAMILIES];
             sext8 = vec![false; GP_FAMILIES];
             sext16 = vec![false; GP_FAMILIES];
+            wide_preload = vec![false; GP_FAMILIES];
             continue;
         }
 
@@ -571,6 +571,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                         &mut sext32,
                         &mut sext8,
                         &mut sext16,
+                        &mut wide_preload,
                     );
                     continue;
                 }
@@ -667,6 +668,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                         &mut sext32,
                         &mut sext8,
                         &mut sext16,
+                        &mut wide_preload,
                     );
                     continue;
                 }
@@ -739,6 +741,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
                 sext32: &mut sext32,
                 sext8: &mut sext8,
                 sext16: &mut sext16,
+                wide_preload: &mut wide_preload,
             };
             if let Some(action) = rewrite_sign_reextension(t, &mut facts) {
                 match action {
@@ -870,6 +873,7 @@ pub(super) fn eliminate_redundant_zero_extend(asm: &mut String) -> bool {
             &mut sext32,
             &mut sext8,
             &mut sext16,
+            &mut wide_preload,
         );
     }
 
@@ -976,6 +980,7 @@ struct ExtFacts<'a> {
     sext32: &'a mut Vec<bool>,
     sext8: &'a mut Vec<bool>,
     sext16: &'a mut Vec<bool>,
+    wide_preload: &'a mut Vec<bool>,
 }
 
 impl ExtFacts<'_> {
@@ -990,6 +995,7 @@ impl ExtFacts<'_> {
             self.sext32[i] = false;
             self.sext8[i] = false;
             self.sext16[i] = false;
+            self.wide_preload[i] = false;
         }
     }
 
@@ -1044,6 +1050,20 @@ impl ExtFacts<'_> {
             self.upper32_zero[i] = true;
             self.is_byte[i] = width == 8;
             self.is_16[i] = allow16 && width <= 16;
+        }
+    }
+
+    /// Record that `fam` holds a bit count in `0..=64`: it is upper-32-zero,
+    /// fits in a byte (and so in 16 bits), and equals the sign-extension of
+    /// its low 8, 16 and 32 bits, because bit 7 and everything above are 0.
+    #[inline]
+    fn set_bit_count(&mut self, fam: u8, allow16: bool) {
+        self.set_zero_extended(fam, 8, allow16);
+        let i = fam as usize;
+        if i < self.upper32_zero.len() {
+            self.sext32[i] = true;
+            self.sext16[i] = true;
+            self.sext8[i] = true;
         }
     }
 
@@ -1212,26 +1232,42 @@ fn update_facts_for_movq(t: &str, op: &str, facts: &mut ExtFacts<'_>) {
     }
     return;
 }
-/// cmov* writes its destination ONLY when the condition holds.  It must
-/// never ESTABLISH a fact: if the move does not execute, the old value
-/// (with arbitrary upper bits) survives.  Treating a 32-bit cmov as an
-/// unconditional zero-extending write (its former home in
-/// is_32bit_zero_extend_write) set upper32_zero for a register that may
-/// still hold a full 64-bit value, licensing the movq->movl narrowing to
-/// drop the upper half.  The only sound preservation: a 32-bit cmov
-/// keeps a PRE-EXISTING upper32_zero fact (taken: the write zero-extends;
-/// not taken: the already-proven value is kept).  Every other fact for
-/// the destination becomes unprovable either way and is cleared; 16- and
-/// 64-bit forms clear upper32_zero too (a taken 64-bit cmov imports the
-/// source's arbitrary upper half).
-fn update_facts_for_cmov(t: &str, op: &str, facts: &mut ExtFacts<'_>) {
+/// cmov* — the destination's LOW part is written only when the condition
+/// holds, but the zero-extension of a 32-bit form is unconditional: in 64-bit
+/// mode `cmovcc r32, r32` clears bits 63:32 of the destination even when the
+/// condition is false (Intel SDM Vol. 2A, CMOVcc; verified on hardware:
+/// `cmpq $1,%rs; cmovel %es,%ed` turns 0xdeadbeef_cafebabe into
+/// 0x00000000_cafebabe). Hence, per destination width (read from the
+/// register SPELLING — an AT&T `cmovl` is "cmov if less" with an implicit
+/// size, so the mnemonic's last letter is not a width):
+///   * 32-bit: `upper32_zero` is ESTABLISHED whatever the outcome;
+///   * 16-bit: bits 63:16 are untouched either way — a prior `upper32_zero`
+///     is preserved;
+///   * 64-bit: taken imports the source's upper half, not taken keeps the
+///     destination's — the fact survives only if BOTH hold it (a memory
+///     source carries none).
+/// Every other fact (byte/word value range, sign-extension) depends on which
+/// value was selected and is cleared.
+fn update_facts_for_cmov(t: &str, facts: &mut ExtFacts<'_>) {
     match classify_dst(t) {
         DstKind::Reg(df) => {
             let dfi = df as usize;
             if dfi < facts.upper32_zero.len() {
-                if !op.ends_with('l') {
-                    facts.upper32_zero[dfi] = false;
-                }
+                let (src, dst) = split_two_operands(t).unwrap_or(("", ""));
+                let dst = dst.trim_start_matches('%');
+                facts.upper32_zero[dfi] = if reg32_name(df) == Some(dst) {
+                    true
+                } else if reg16_name(df) == Some(dst) {
+                    facts.upper32_zero[dfi]
+                } else if reg64_name(df) == Some(dst) {
+                    facts.upper32_zero[dfi]
+                        && family_of_reg(src).is_some_and(|sf| {
+                            reg64_name(sf) == Some(src.trim_start_matches('%'))
+                                && facts.upper32_zero.get(sf as usize) == Some(&true)
+                        })
+                } else {
+                    false
+                };
                 facts.is_byte[dfi] = false;
                 facts.is_16[dfi] = false;
                 facts.sext32[dfi] = false;
@@ -1244,6 +1280,40 @@ fn update_facts_for_cmov(t: &str, op: &str, facts: &mut ExtFacts<'_>) {
     }
 }
 
+/// The destination family of an immediate move whose value is outside
+/// `0..=127` — a preload that a zero-source BSF/BSR would return, making the
+/// scan's bit-count fact false. `movl $K` zero-extends `K` as a dword; `movq`
+/// sign-extends imm32; `movabsq` is exact. A symbolic or unparsable immediate
+/// counts as wide. Partial-width moves (`movb`/`movw`) are not preloads: the
+/// 16-bit scans establish no fact and the 32/64-bit ones never follow them.
+fn wide_scan_preload(t: &str) -> Option<u8> {
+    let (op, rest) = t.split_once(char::is_whitespace)?;
+    if !matches!(op, "movl" | "movq" | "movabsq") {
+        return None;
+    }
+    let imm = rest.trim_start().strip_prefix('$')?;
+    let DstKind::Reg(df) = classify_dst(t) else {
+        return None;
+    };
+    let imm = imm.split(',').next()?.trim();
+    let (neg, mag) = match imm.strip_prefix('-') {
+        Some(m) => (true, m),
+        None => (false, imm),
+    };
+    let mag = match mag.strip_prefix("0x").or_else(|| mag.strip_prefix("0X")) {
+        Some(h) => u64::from_str_radix(h, 16).ok(),
+        None => mag.parse::<u64>().ok(),
+    };
+    let value: Option<i128> = mag.map(|m| if neg { -(m as i128) } else { m as i128 });
+    let in_range = match (op, value) {
+        // The dword is zero-extended: -1 becomes 0xFFFF_FFFF.
+        ("movl", Some(v)) => (v as u32) <= 127,
+        (_, Some(v)) => (0..=127).contains(&v),
+        (_, None) => false,
+    };
+    (!in_range).then_some(df)
+}
+
 fn self_update(
     t: &str,
     upper32_zero: &mut Vec<bool>,
@@ -1252,6 +1322,7 @@ fn self_update(
     sext32: &mut Vec<bool>,
     sext8: &mut Vec<bool>,
     sext16: &mut Vec<bool>,
+    wide_preload: &mut Vec<bool>,
 ) {
     let mut facts = ExtFacts {
         upper32_zero,
@@ -1260,7 +1331,20 @@ fn self_update(
         sext32,
         sext8,
         sext16,
+        wide_preload,
     };
+    update_facts(t, &mut facts);
+    // After the write itself (which cleared the family): remember a wide
+    // immediate preload for the BSF/BSR rule in `update_facts`.
+    if let Some(f) = wide_scan_preload(t) {
+        if (f as usize) < facts.wide_preload.len() {
+            facts.wide_preload[f as usize] = true;
+        }
+    }
+}
+
+/// The producer half of the walk: update `facts` for the write(s) of `t`.
+fn update_facts(t: &str, facts: &mut ExtFacts<'_>) {
     let Some(op) = t.split_whitespace().next() else {
         return;
     };
@@ -1294,7 +1378,7 @@ fn self_update(
     }
 
     if op == "movq" && t.contains('%') {
-        update_facts_for_movq(t, op, &mut facts);
+        update_facts_for_movq(t, op, facts);
         return;
     }
     // Byte zero-extension into a register sets upper32_zero, is_byte AND
@@ -1309,7 +1393,7 @@ fn self_update(
         match classify_dst(t) {
             DstKind::Reg(df) => facts.set_zero_extended(df, 8, ext16_enabled()),
             DstKind::Store => {}
-            DstKind::Unknown => clear_mentioned_families(t, &mut facts),
+            DstKind::Unknown => clear_mentioned_families(t, facts),
         }
         return;
     }
@@ -1325,7 +1409,7 @@ fn self_update(
         match classify_dst(t) {
             DstKind::Reg(df) => facts.set_zero_extended(df, 16, ext16_enabled()),
             DstKind::Store => {}
-            DstKind::Unknown => clear_mentioned_families(t, &mut facts),
+            DstKind::Unknown => clear_mentioned_families(t, facts),
         }
         return;
     }
@@ -1335,13 +1419,54 @@ fn self_update(
         match classify_dst(t) {
             DstKind::Reg(df) => facts.set_zero_extended(df, 32, ext16_enabled()),
             DstKind::Store => {}
-            DstKind::Unknown => clear_mentioned_families(t, &mut facts),
+            DstKind::Unknown => clear_mentioned_families(t, facts),
         }
         return;
     }
-    // Conditional moves: see update_facts_for_cmov (never establish).
+    // Bit counts at 32/64-bit width write the whole destination with a value
+    // in 0..=64. POPCNT/LZCNT/TZCNT are defined for every input. BSF/BSR
+    // leave the destination UNCHANGED for a zero source (AMD; Intel SDM
+    // since the LLVM #123623 documentation fix), so the fact needs both
+    // outcomes in 0..=127. This emitter produces a scan only where the source
+    // is nonzero (a proven NonZero count, the taken arm of a zero guard, a
+    // `btsq $32` stop bit) or with its destination preloaded by an immediate
+    // move: the zero-defined passthrough (`movl $63/$127/$32/$64`, all in
+    // range) and the highbit fold (`mov $-1`, out of range). A destination
+    // whose latest write was an out-of-range immediate (`wide_preload`) is
+    // therefore cleared instead (a 32-bit scan with a zero source may also
+    // clear bits 32..63 on older Intel parts, so not even upper32_zero is
+    // kept). User inline asm never reaches this rule (opaque, above). The
+    // 16-bit forms write only %ax-sized halves and stay on the conservative
+    // path.
+    if matches!(
+        op,
+        "popcntl"
+            | "popcntq"
+            | "lzcntl"
+            | "lzcntq"
+            | "tzcntl"
+            | "tzcntq"
+            | "bsfl"
+            | "bsfq"
+            | "bsrl"
+            | "bsrq"
+    ) {
+        match classify_dst(t) {
+            DstKind::Reg(df)
+                if op.starts_with("bs")
+                    && facts.wide_preload.get(df as usize).copied().unwrap_or(true) =>
+            {
+                facts.clear_family(df)
+            }
+            DstKind::Reg(df) => facts.set_bit_count(df, ext16_enabled()),
+            DstKind::Store => {}
+            DstKind::Unknown => clear_mentioned_families(t, facts),
+        }
+        return;
+    }
+    // Conditional moves: see update_facts_for_cmov (exact per-width facts).
     if op.starts_with("cmov") {
-        update_facts_for_cmov(t, op, &mut facts);
+        update_facts_for_cmov(t, facts);
         return;
     }
     // Any other 32-bit ALU write (addl, subl, andl, orl, leal, imull, shifts)
@@ -1354,7 +1479,7 @@ fn self_update(
         match classify_dst(t) {
             DstKind::Reg(df) => facts.set_zero_extended(df, 32, ext16_enabled()),
             DstKind::Store => {}
-            DstKind::Unknown => clear_mentioned_families(t, &mut facts),
+            DstKind::Unknown => clear_mentioned_families(t, facts),
         }
         return;
     }
@@ -1367,7 +1492,7 @@ fn self_update(
         match classify_dst(t) {
             DstKind::Reg(df) => facts.set_sign_extended(df, 32),
             DstKind::Store => {}
-            DstKind::Unknown => clear_mentioned_families(t, &mut facts),
+            DstKind::Unknown => clear_mentioned_families(t, facts),
         }
         return;
     }
@@ -1382,7 +1507,7 @@ fn self_update(
         match classify_dst(t) {
             DstKind::Reg(df) => facts.set_sign_extended(df, width),
             DstKind::Store => {}
-            DstKind::Unknown => clear_mentioned_families(t, &mut facts),
+            DstKind::Unknown => clear_mentioned_families(t, facts),
         }
         return;
     }
@@ -1396,7 +1521,7 @@ fn self_update(
         match classify_dst(t) {
             DstKind::Reg(df) => facts.set_zero_extended(df, 32, ext16_enabled()),
             DstKind::Store => {}
-            DstKind::Unknown => clear_mentioned_families(t, &mut facts),
+            DstKind::Unknown => clear_mentioned_families(t, facts),
         }
         return;
     }
@@ -1436,13 +1561,14 @@ fn self_update(
     // `imulq %r13, %r14`, shifts, etc. A stale upper-32-zero/is_byte flag on
     // such a line could wrongly eliminate a real re-extension (miscompile).
     // Clearing extra families is always safe (only loses optimizations).
-    clear_mentioned_families(t, &mut facts);
+    clear_mentioned_families(t, facts);
 }
 
 #[cfg(test)]
 mod tests {
     use super::eliminate_redundant_zero_extend;
     use super::self_update;
+    use super::wide_scan_preload;
     use crate::backend::x86::codegen::peephole::types::implicit_r_w_full;
 
     /// Run the fact ledger over one instruction from a chosen starting
@@ -1454,7 +1580,10 @@ mod tests {
         let mut s32 = vec![start; 16];
         let mut s8 = vec![start; 16];
         let mut sx16 = vec![start; 16];
-        self_update(asm, &mut u, &mut b, &mut s16, &mut s32, &mut s8, &mut sx16);
+        let mut wide = vec![false; 16];
+        self_update(
+            asm, &mut u, &mut b, &mut s16, &mut s32, &mut s8, &mut sx16, &mut wide,
+        );
         let mut out = [[start; 16]; 6];
         out[0].copy_from_slice(&u[..16]);
         out[1].copy_from_slice(&b[..16]);
@@ -2113,15 +2242,14 @@ mod tests {
         assert!(i_load < i_fused, "memory lines reordered:\n{out}");
     }
 
+    /// Per-width cmov facts (see `update_facts_for_cmov`). The movq->movl
+    /// narrowing of `movq %r15, %rcx` is legal exactly when %r15's upper half
+    /// is provably zero, so it is the observable for each case.
     #[test]
-    fn cmov_does_not_establish_upper32_zero() {
-        // cmov writes its destination only when the condition holds, so a
-        // 32-bit cmov must NOT establish upper32_zero for the destination:
-        // if the move does not happen, the old (arbitrary) upper 32 bits
-        // survive.  Establishing the fact lets the movq->movl narrowing
-        // below drop those bits.  (%r15 arrives with a full 64-bit value;
-        // the cmov may or may not overwrite its low half.)
-        let out = run_maybe(concat!(
+    fn cmov_upper32_zero_facts_follow_the_architecture() {
+        // 32-bit cmov zero-extends even when NOT taken: the fact is
+        // established although %r15 arrived with a full 64-bit value.
+        let out = run(concat!(
             "foo:\n",
             "    movq %rdi, %r15\n",
             "    cmovel %eax, %r15d\n",
@@ -2129,22 +2257,58 @@ mod tests {
             "    addl %ecx, %edx\n",
         ));
         assert!(
-            out.contains("movq %r15, %rcx"),
-            "cmov-established fact wrongly narrowed the copy:\n{out}"
+            out.contains("movl %r15d, %ecx"),
+            "32-bit cmov establishes:\n{out}"
         );
-        // A fact that held BEFORE a 32-bit cmov still holds after it (taken:
-        // zero-extending write; not taken: proven value kept), so the
-        // narrowing remains available and must still fire.
+        // A taken 64-bit cmov imports the source's arbitrary upper half: the
+        // destination's prior fact must die.
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    movl %edi, %r15d\n",
+            "    cmoveq %rax, %r15\n",
+            "    movq %r15, %rcx\n",
+            "    addl %ecx, %edx\n",
+        ));
+        assert!(
+            out.contains("movq %r15, %rcx"),
+            "64-bit cmov from unknown:\n{out}"
+        );
+        // ...unless the source holds the fact too.
         let out = run(concat!(
             "foo:\n",
             "    movl %edi, %r15d\n",
-            "    cmovel %eax, %r15d\n",
+            "    movl %esi, %eax\n",
+            "    cmoveq %rax, %r15\n",
             "    movq %r15, %rcx\n",
             "    addl %ecx, %edx\n",
         ));
         assert!(
             out.contains("movl %r15d, %ecx"),
-            "pre-existing fact must survive a 32-bit cmov:\n{out}"
+            "64-bit cmov, both zero:\n{out}"
+        );
+        // A 16-bit cmov leaves bits 63:16 alone: a prior fact survives...
+        let out = run(concat!(
+            "foo:\n",
+            "    movl %edi, %r15d\n",
+            "    cmovew %ax, %r15w\n",
+            "    movq %r15, %rcx\n",
+            "    addl %ecx, %edx\n",
+        ));
+        assert!(
+            out.contains("movl %r15d, %ecx"),
+            "16-bit cmov preserves:\n{out}"
+        );
+        // ...but it never creates one.
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    movq %rdi, %r15\n",
+            "    cmovew %ax, %r15w\n",
+            "    movq %r15, %rcx\n",
+            "    addl %ecx, %edx\n",
+        ));
+        assert!(
+            out.contains("movq %r15, %rcx"),
+            "16-bit cmov from unknown:\n{out}"
         );
     }
 
@@ -2227,5 +2391,124 @@ mod tests {
         ));
         assert!(out.contains("movq %rax, %rcx"), "asm was:\n{out}");
         assert!(!out.contains("movl %eax, %ecx"), "asm was:\n{out}");
+    }
+
+    #[test]
+    fn bit_count_results_need_no_reextension() {
+        // `(long)__builtin_ctz(x)` on baseline x86: the stop-bit BSF already
+        // leaves a value in 0..=32 with the upper half clear.
+        let out = run(concat!(
+            "foo:\n",
+            "    btsq $32, %rax\n",
+            "    bsfq %rax, %rax\n",
+            "    movl %eax, %eax\n",
+            "    ret\n",
+        ));
+        assert!(!out.contains("movl %eax, %eax"), "asm was:\n{out}");
+        // Every narrow re-extension of a count is a no-op too.
+        let out = run(concat!(
+            "foo:\n",
+            "    popcntq %rdi, %rcx\n",
+            "    movzbl %cl, %ecx\n",
+            "    movsbq %cl, %rcx\n",
+            "    movslq %ecx, %rcx\n",
+            "    ret\n",
+        ));
+        assert!(!out.contains("movzbl"), "asm was:\n{out}");
+        assert!(!out.contains("movsbq"), "asm was:\n{out}");
+        assert!(!out.contains("movslq"), "asm was:\n{out}");
+    }
+
+    #[test]
+    fn zero_source_scan_keeps_out_of_range_preload_extensions() {
+        // The highbit fold emits `mov $-1, %D; bsr %S, %D`: for S == 0 the
+        // scan leaves -1 in place, so the re-extension is NOT a no-op
+        // (`(long)hb(0)` must be -1, not 4294967295).
+        for asm in [
+            "    movl $-1, %eax\n    bsrl %edi, %eax\n    movslq %eax, %rax\n",
+            "    movq $-1, %rax\n    bsrq %rdi, %rax\n    movslq %eax, %rax\n",
+            "    movl $0xffffffff, %eax\n    bsfl %edi, %eax\n    movsbq %al, %rax\n",
+            "    movl $128, %eax\n    bsrl %edi, %eax\n    movzbl %al, %eax\n",
+            // Not adjacent: the flag lives until the family is rewritten.
+            "    movl $-1, %eax\n    movl %esi, %ecx\n    bsrl %edi, %eax\n    movslq %eax, %rax\n",
+            // A symbolic immediate is not known to be in range.
+            "    movl $sym, %eax\n    bsrl %edi, %eax\n    movslq %eax, %rax\n",
+        ] {
+            let out = run_maybe(&format!("foo:\n{asm}    ret\n"));
+            let ext = asm.lines().last().unwrap();
+            assert!(out.contains(ext), "{ext} deleted; asm was:\n{out}");
+        }
+        // The zero-defined passthrough preloads (32/63/64/127) are in range,
+        // so either outcome is a bit count and the re-extension goes.
+        for (pre, scan) in [
+            ("movl $63, %eax", "bsrl %edi, %eax"),
+            ("movl $127, %eax", "bsrq %rdi, %rax"),
+            ("movl $32, %eax", "bsfl %edi, %eax"),
+            ("movq $64, %rax", "bsfq %rdi, %rax"),
+        ] {
+            let out = run(&format!(
+                "foo:\n    {pre}\n    {scan}\n    movslq %eax, %rax\n    ret\n"
+            ));
+            assert!(!out.contains("movslq"), "asm was:\n{out}");
+        }
+        // Any later write of the family retires the preload; a guarded
+        // (nonzero-source) scan establishes the fact as before.
+        let out = run(concat!(
+            "foo:\n",
+            "    movl $-1, %eax\n",
+            "    movl %esi, %eax\n",
+            "    bsrl %edi, %eax\n",
+            "    movslq %eax, %rax\n",
+            "    ret\n",
+        ));
+        assert!(!out.contains("movslq"), "asm was:\n{out}");
+    }
+
+    #[test]
+    fn wide_scan_preload_classifies_immediates_by_effective_value() {
+        let wide = |t: &str| wide_scan_preload(t).is_some();
+        assert!(wide("movl $-1, %eax")); // 0xFFFF_FFFF
+        assert!(wide("movl $128, %eax"));
+        assert!(wide("movl $0xFFFFFFFF, %ecx"));
+        assert!(wide("movq $-1, %rax"));
+        assert!(wide("movq $-127, %rdx"));
+        assert!(wide("movabsq $0x100000000, %r9"));
+        assert!(wide("movl $sym, %eax"));
+        assert!(!wide("movl $127, %eax"));
+        assert!(!wide("movl $0, %r10d"));
+        assert!(!wide("movq $0x3f, %rax"));
+        assert!(!wide("movw $-1, %ax")); // partial write: not a preload
+        assert!(!wide("movl $-1, 8(%rsp)")); // store
+        assert!(!wide("movl %ecx, %eax")); // not an immediate
+    }
+
+    #[test]
+    fn narrow_bit_counts_and_joins_establish_nothing() {
+        // A 16-bit count writes only %ax: bits 16..63 are stale.
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    tzcntw %di, %ax\n",
+            "    movl %eax, %eax\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("movl %eax, %eax"), "asm was:\n{out}");
+        // A label forgets the fact: another predecessor may reach it.
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    lzcntq %rdi, %rax\n",
+            ".LBB1:\n",
+            "    movl %eax, %eax\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("movl %eax, %eax"), "asm was:\n{out}");
+        // A later full-width write replaces the count.
+        let out = run_maybe(concat!(
+            "foo:\n",
+            "    popcntl %edi, %eax\n",
+            "    movq %rsi, %rax\n",
+            "    movzbl %al, %eax\n",
+            "    ret\n",
+        ));
+        assert!(out.contains("movzbl %al, %eax"), "asm was:\n{out}");
     }
 }

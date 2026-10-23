@@ -296,13 +296,8 @@ pub fn apply_one_reloc(
             let val = (s as i64).wrapping_add(a) as u64;
             w64(out, fp, val);
         }
-        R_AARCH64_ABS32 => {
-            let val = (s as i64).wrapping_add(a) as u64;
-            w32(out, fp, val as u32);
-        }
-        R_AARCH64_ABS16 => {
-            let val = (s as i64).wrapping_add(a) as u64;
-            w16(out, fp, val as u16);
+        R_AARCH64_ABS32 | R_AARCH64_ABS16 => {
+            write_checked_data(out, fp, rtype, (s as i64).wrapping_add(a), sym_name)?;
         }
 
         // ── PC-relative relocations ──
@@ -310,13 +305,9 @@ pub fn apply_one_reloc(
             let val = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
             w64(out, fp, val as u64);
         }
-        R_AARCH64_PREL32 => {
+        R_AARCH64_PREL32 | R_AARCH64_PREL16 => {
             let val = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
-            w32(out, fp, val as u32);
-        }
-        R_AARCH64_PREL16 => {
-            let val = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
-            w16(out, fp, val as u16);
+            write_checked_data(out, fp, rtype, val, sym_name)?;
         }
 
         // ── ADRP: Page-relative high 21 bits ──
@@ -365,77 +356,37 @@ pub fn apply_one_reloc(
 
         // ── Branch instructions ──
         R_AARCH64_CALL26 | R_AARCH64_JUMP26 => {
-            if fp + 4 > out.len() {
-                return Ok(());
-            }
             let sa = (s as i64).wrapping_add(a) as u64;
             if sa == 0 {
-                // Undefined/weak symbol resolved to 0: replace with NOP
+                // Undefined weak symbol resolved to 0: the call becomes a NOP
+                // (bfd's and lld's rule for a branch to an undefined weak).
+                if fp + 4 > out.len() {
+                    return Err(site_past_end(rtype, fp, out.len()));
+                }
                 w32(out, fp, 0xd503201f);
             } else {
-                let offset = (sa as i64).wrapping_sub(p as i64);
-                let mut insn = read_u32(out, fp);
-                let imm26 = ((offset >> 2) as u32) & 0x3ffffff;
-                insn = (insn & 0xfc000000) | imm26;
-                w32(out, fp, insn);
+                encode_branch(out, fp, rtype, (sa as i64).wrapping_sub(p as i64), sym_name)?;
             }
         }
 
-        // ── Conditional branch (19-bit offset) ──
-        R_AARCH64_CONDBR19 => {
-            let offset = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
-            if fp + 4 > out.len() {
-                return Ok(());
-            }
-            let mut insn = read_u32(out, fp);
-            let imm19 = ((offset >> 2) as u32) & 0x7ffff;
-            insn = (insn & 0xff00001f) | (imm19 << 5);
-            w32(out, fp, insn);
+        // ── B.cond/CBZ/CBNZ, LDR (literal), TBZ/TBNZ ──
+        R_AARCH64_CONDBR19 | R_AARCH64_LD_PREL_LO19 | R_AARCH64_TSTBR14 => {
+            let disp = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
+            encode_branch(out, fp, rtype, disp, sym_name)?;
         }
 
-        // ── LDR literal (19-bit offset, e.g. FP constant pool loads) ──
-        R_AARCH64_LD_PREL_LO19 => {
-            let offset = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
-            if fp + 4 > out.len() {
-                return Ok(());
-            }
-            let mut insn = read_u32(out, fp);
-            let imm19 = ((offset >> 2) as u32) & 0x7ffff;
-            insn = (insn & 0xff00001f) | (imm19 << 5);
-            w32(out, fp, insn);
-        }
-
-        // ── Test and branch (14-bit offset) ──
-        R_AARCH64_TSTBR14 => {
-            let offset = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
-            if fp + 4 > out.len() {
-                return Ok(());
-            }
-            let mut insn = read_u32(out, fp);
-            let imm14 = ((offset >> 2) as u32) & 0x3fff;
-            insn = (insn & 0xfff8001f) | (imm14 << 5);
-            w32(out, fp, insn);
-        }
-
-        // ── MOVW relocations ──
-        // All forms take the field bits ((S + A) >> shift) & 0xffff. For the
-        // signed variants the bit pattern of the two's-complement value is
-        // used, so the same extraction serves them.
-        R_AARCH64_MOVW_UABS_G0 | R_AARCH64_MOVW_UABS_G0_NC | R_AARCH64_MOVW_SABS_G0 => {
-            let sa = (s as i64).wrapping_add(a) as u64;
-            encode_movw(out, fp, (sa & 0xffff) as u32);
-        }
-        R_AARCH64_MOVW_UABS_G1 | R_AARCH64_MOVW_UABS_G1_NC | R_AARCH64_MOVW_SABS_G1 => {
-            let sa = (s as i64).wrapping_add(a) as u64;
-            encode_movw(out, fp, ((sa >> 16) & 0xffff) as u32);
-        }
-        R_AARCH64_MOVW_UABS_G2 | R_AARCH64_MOVW_UABS_G2_NC | R_AARCH64_MOVW_SABS_G2 => {
-            let sa = (s as i64).wrapping_add(a) as u64;
-            encode_movw(out, fp, ((sa >> 32) & 0xffff) as u32);
-        }
-        R_AARCH64_MOVW_UABS_G3 => {
-            let sa = (s as i64).wrapping_add(a) as u64;
-            encode_movw(out, fp, ((sa >> 48) & 0xffff) as u32);
+        // ── MOVW relocations (group relocations, see encode_movw_group) ──
+        R_AARCH64_MOVW_UABS_G0
+        | R_AARCH64_MOVW_UABS_G0_NC
+        | R_AARCH64_MOVW_UABS_G1
+        | R_AARCH64_MOVW_UABS_G1_NC
+        | R_AARCH64_MOVW_UABS_G2
+        | R_AARCH64_MOVW_UABS_G2_NC
+        | R_AARCH64_MOVW_UABS_G3
+        | R_AARCH64_MOVW_SABS_G0
+        | R_AARCH64_MOVW_SABS_G1
+        | R_AARCH64_MOVW_SABS_G2 => {
+            encode_movw_group(out, fp, rtype, (s as i64).wrapping_add(a), sym_name)?;
         }
 
         // ── GOT relocations ──
@@ -657,6 +608,167 @@ pub(super) fn validate_address_site(
 }
 
 // ── Instruction encoding helpers ───────────────────────────────────────
+
+/// The ELF name of a relocation type these encoders check, for diagnostics.
+fn reloc_name(rtype: u32) -> String {
+    let name = match rtype {
+        R_AARCH64_ABS32 => "R_AARCH64_ABS32",
+        R_AARCH64_ABS16 => "R_AARCH64_ABS16",
+        R_AARCH64_PREL32 => "R_AARCH64_PREL32",
+        R_AARCH64_PREL16 => "R_AARCH64_PREL16",
+        R_AARCH64_CALL26 => "R_AARCH64_CALL26",
+        R_AARCH64_JUMP26 => "R_AARCH64_JUMP26",
+        R_AARCH64_CONDBR19 => "R_AARCH64_CONDBR19",
+        R_AARCH64_LD_PREL_LO19 => "R_AARCH64_LD_PREL_LO19",
+        R_AARCH64_TSTBR14 => "R_AARCH64_TSTBR14",
+        R_AARCH64_MOVW_UABS_G0 => "R_AARCH64_MOVW_UABS_G0",
+        R_AARCH64_MOVW_UABS_G1 => "R_AARCH64_MOVW_UABS_G1",
+        R_AARCH64_MOVW_UABS_G2 => "R_AARCH64_MOVW_UABS_G2",
+        R_AARCH64_MOVW_SABS_G0 => "R_AARCH64_MOVW_SABS_G0",
+        R_AARCH64_MOVW_SABS_G1 => "R_AARCH64_MOVW_SABS_G1",
+        R_AARCH64_MOVW_SABS_G2 => "R_AARCH64_MOVW_SABS_G2",
+        _ => return format!("relocation type {rtype}"),
+    };
+    name.to_string()
+}
+
+/// GNU ld's overflow diagnostic: the value does not fit the relocated field.
+pub(super) fn truncated(rtype: u32, sym: &str) -> String {
+    let sym = if sym.is_empty() {
+        "a section symbol"
+    } else {
+        sym
+    };
+    format!(
+        "relocation truncated to fit: {} against `{sym}'",
+        reloc_name(rtype)
+    )
+}
+
+fn site_past_end(rtype: u32, fp: usize, len: usize) -> String {
+    format!(
+        "{} site {fp:#x} exceeds output size {len:#x}",
+        reloc_name(rtype)
+    )
+}
+
+/// Encode the displacement of a B/BL (imm26 at bit 0), B.cond/CBZ/CBNZ/LDR
+/// literal (imm19 at bit 5) or TBZ/TBNZ (imm14 at bit 5): word-aligned and
+/// within the signed field, else `relocation truncated to fit` -- never the
+/// masked low bits, which branch or load somewhere else.
+pub(super) fn encode_branch(
+    out: &mut [u8],
+    fp: usize,
+    rtype: u32,
+    disp: i64,
+    sym: &str,
+) -> Result<(), String> {
+    let (bits, lsb) = match rtype {
+        R_AARCH64_CALL26 | R_AARCH64_JUMP26 => (26, 0),
+        R_AARCH64_CONDBR19 | R_AARCH64_LD_PREL_LO19 => (19, 5),
+        R_AARCH64_TSTBR14 => (14, 5),
+        _ => return Err(format!("{} is not a branch relocation", reloc_name(rtype))),
+    };
+    // imm is a signed word count: bytes in [-2^(bits+1), 2^(bits+1)).
+    let span = 1i64 << (bits + 1);
+    if disp & 3 != 0 || !(-span..span).contains(&disp) {
+        return Err(truncated(rtype, sym));
+    }
+    if fp.checked_add(4).is_none_or(|end| end > out.len()) {
+        return Err(site_past_end(rtype, fp, out.len()));
+    }
+    let mask = ((1u32 << bits) - 1) << lsb;
+    let insn = (read_u32(out, fp) & !mask) | ((((disp >> 2) as u32) << lsb) & mask);
+    w32(out, fp, insn);
+    Ok(())
+}
+
+/// Write an ABS16/ABS32/PREL16/PREL32 value with the AArch64 ELF overflow
+/// check `-2^(n-1) <= X < 2^n` (either signedness fits).
+pub(super) fn write_checked_data(
+    out: &mut [u8],
+    fp: usize,
+    rtype: u32,
+    val: i64,
+    sym: &str,
+) -> Result<(), String> {
+    let n: u32 = if matches!(rtype, R_AARCH64_ABS32 | R_AARCH64_PREL32) {
+        32
+    } else {
+        16
+    };
+    if !(-(1i64 << (n - 1))..(1i64 << n)).contains(&val) {
+        return Err(truncated(rtype, sym));
+    }
+    if fp
+        .checked_add(n as usize / 8)
+        .is_none_or(|end| end > out.len())
+    {
+        return Err(site_past_end(rtype, fp, out.len()));
+    }
+    if n == 32 {
+        w32(out, fp, val as u32);
+    } else {
+        w16(out, fp, val as u16);
+    }
+    Ok(())
+}
+
+/// MOVZ/MOVK/MOVN group relocations: the field is bits [16g, 16g+16) of X.
+/// The checked forms require X to fit in 16(g+1) bits -- unsigned for
+/// UABS_Gg, signed for SABS_Gg, whose instruction becomes MOVZ for X >= 0
+/// and MOVN with field ~X for X < 0 (AArch64 ELF ABI; pre-fix the raw
+/// two's-complement bits went into a MOVZ, so a negative X yielded a large
+/// positive value). The _NC forms and G3 do not check.
+pub(super) fn encode_movw_group(
+    out: &mut [u8],
+    fp: usize,
+    rtype: u32,
+    x: i64,
+    sym: &str,
+) -> Result<(), String> {
+    let (group, check, signed) = match rtype {
+        R_AARCH64_MOVW_UABS_G0 => (0, true, false),
+        R_AARCH64_MOVW_UABS_G0_NC => (0, false, false),
+        R_AARCH64_MOVW_UABS_G1 => (1, true, false),
+        R_AARCH64_MOVW_UABS_G1_NC => (1, false, false),
+        R_AARCH64_MOVW_UABS_G2 => (2, true, false),
+        R_AARCH64_MOVW_UABS_G2_NC => (2, false, false),
+        R_AARCH64_MOVW_UABS_G3 => (3, false, false),
+        R_AARCH64_MOVW_SABS_G0 => (0, true, true),
+        R_AARCH64_MOVW_SABS_G1 => (1, true, true),
+        R_AARCH64_MOVW_SABS_G2 => (2, true, true),
+        _ => return Err(format!("{} is not a MOVW relocation", reloc_name(rtype))),
+    };
+    let width = 16 * (group + 1);
+    if check {
+        let fits = if signed {
+            (-(1i64 << width)..(1i64 << width)).contains(&x)
+        } else {
+            (x as u64) < (1u64 << width)
+        };
+        if !fits {
+            return Err(truncated(rtype, sym));
+        }
+    }
+    if fp.checked_add(4).is_none_or(|end| end > out.len()) {
+        return Err(site_past_end(rtype, fp, out.len()));
+    }
+    let mut insn = read_u32(out, fp);
+    let mut v = x as u64;
+    if signed {
+        // opc (bits 30:29): 10 = MOVZ, 00 = MOVN.
+        if x < 0 {
+            v = !v;
+            insn &= !(1 << 30);
+        } else {
+            insn |= 1 << 30;
+        }
+    }
+    let imm16 = ((v >> (16 * group)) & 0xffff) as u32;
+    w32(out, fp, (insn & 0xffe0001f) | (imm16 << 5));
+    Ok(())
+}
 
 pub(super) fn encode_adrp(out: &mut [u8], fp: usize, imm: i64) -> Result<(), String> {
     encode_adr(out, fp, imm)

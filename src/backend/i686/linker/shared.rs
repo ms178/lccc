@@ -46,7 +46,7 @@
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 use super::DynStrTab;
-use super::dynamic::{DynamicDesc, option_entries};
+use super::dynamic::{DynamicDesc, image_function_addr, option_entries};
 use super::emit::{
     PltAddressing, build_plt, check_sections_placed, inputs_want_exec_stack,
     layout_custom_sections, layout_section, layout_tls,
@@ -774,7 +774,7 @@ pub(super) fn emit_shared_library_32(
     vaddr = (vaddr & !0xfff) | (file_offset & 0xfff);
     let text_seg_file_start = file_offset;
     let text_seg_vaddr_start = vaddr;
-    let (init_vaddr, init_size) = layout_section(
+    let _ = layout_section(
         ".init",
         section_name_to_idx,
         output_sections,
@@ -799,7 +799,7 @@ pub(super) fn emit_shared_library_32(
         &mut vaddr,
         16,
     );
-    let (fini_vaddr, fini_size) = layout_section(
+    let _ = layout_section(
         ".fini",
         section_name_to_idx,
         output_sections,
@@ -880,8 +880,9 @@ pub(super) fn emit_shared_library_32(
             .map(|l| dynstr.get_offset(l))
             .collect(),
         strings: option_strings,
-        init: (init_vaddr != 0 && init_size > 0).then_some(init_vaddr),
-        fini: (fini_vaddr != 0 && fini_size > 0).then_some(fini_vaddr),
+        // Presence only; the addresses are filled with the array entries.
+        init: image_function_addr(global_symbols, output_sections, "_init").map(|_| 0),
+        fini: image_function_addr(global_symbols, output_sections, "_fini").map(|_| 0),
         preinit_array: None,
         init_array: (sec_len(".init_array") > 0).then_some((0, 0)),
         fini_array: (sec_len(".fini_array") > 0).then_some((0, 0)),
@@ -1067,6 +1068,7 @@ pub(super) fn emit_shared_library_32(
             }
         }
     }
+    super::link::tls_module_base_address(global_symbols, tls_addr, tls_mem_size, false);
     let linker_addrs = LinkerSymbolAddresses {
         base_addr: 0,
         got_addr: got_base as u64,
@@ -1349,6 +1351,11 @@ pub(super) fn emit_shared_library_32(
     }
 
     // ── .dynamic ─────────────────────────────────────────────────────────
+    for (slot, name) in [(&mut dyn_desc.init, "_init"), (&mut dyn_desc.fini, "_fini")] {
+        if let Some(v) = slot.as_mut() {
+            *v = image_function_addr(global_symbols, output_sections, name).unwrap_or(*v);
+        }
+    }
     if let Some(v) = dyn_desc.init_array.as_mut() {
         *v = (init_array_vaddr, init_array_size);
     }
@@ -1644,12 +1651,15 @@ pub(super) fn emit_shared_library_32(
     let eh_frame_hdr_data = match (eh_frame_sec_idx, eh_frame_hdr_size) {
         (Some(idx), sz) if sz > 0 => {
             let sec = &output_sections[idx];
-            linker_common::build_eh_frame_hdr(
+            let mut hdr = vec![0u8; sz as usize];
+            linker_common::write_eh_frame_hdr(
+                &mut hdr,
                 &sec.data,
                 sec.addr as u64,
                 eh_frame_hdr_vaddr as u64,
                 false,
-            )
+            );
+            hdr
         }
         _ => Vec::new(),
     };

@@ -2,7 +2,7 @@
 
 Tiers: `-O0` skip except asm resolve; `-O1` mem2reg/fold/copy/DCE; `-O2` full; `-O3` +unroll; `-Os`/`-Oz` size. Authoritative: `src/passes/README.md`; pipeline and pass inventory: [`../../docs/optimization-passes.md`](../../docs/optimization-passes.md).
 
-Notable modules: `vectorize.rs`, `inline.rs`, `aggregate_sroa.rs` (copy-out off), `dse.rs` (same-block, `CCC_NO_DSE`), `backedge_pre.rs` (integer recurrences default-on; FP gated, `CCC_BEPRE_FP`), `global_value_numbering.rs` (extended-GVN on scalar + vector/widen families). Cost host: `cost.rs` (IR size/throughput estimates), `func_stats.rs` (function metrics gates), `opt_pipeline.rs` (schedule assembly).
+Notable modules: `vectorize.rs`, `inline.rs`, `aggregate_sroa/` (copy-out off), `dse.rs` (same-block, `CCC_NO_DSE`), `backedge_pre.rs` (integer recurrences default-on; FP gated, `CCC_BEPRE_FP`), `global_value_numbering.rs` (extended-GVN on scalar + vector/widen families). Cost host: `cost.rs` (IR size/throughput estimates), `func_stats.rs` (function metrics gates), `opt_pipeline.rs` (schedule assembly).
 
 ## Written-in semantics (additions must respect)
 
@@ -22,6 +22,10 @@ Notable modules: `vectorize.rs`, `inline.rs`, `aggregate_sroa.rs` (copy-out off)
 ## `vec_interleave.rs` (reduction accumulator interleaving)
 
 Splits canonical 2-block vector reductions into interleaved accumulator chains. Measured: dot F64 0.16 ns/elem vs GCC 0.30 L1-resident (1.9×); L2/L3 parity (2.6–3.5× vs kill-switch arm). Knobs: `CCC_NO_VEC_INTERLEAVE=1`, factor override `CCC_VEC_INTERLEAVE=2|4|8`, `CCC_DISABLE_PASSES=vec_interleave`. Open: relax the max/multi-acc rejection (seed-reuse correctness proven upstream, needs a workload); `vhaddpd` combine tree; the two `movslq` IV sign-extensions; AArch64 NEON needs emitter-disp support before un-gating.
+
+## `aggregate_sroa/` (scalar replacement of aggregates)
+
+`mod.rs` drives up to six rounds per function: forwarding through single-writer copies, `split.rs` (an alloca accessed only at constant offsets becomes one scalar per field) and `byval.rs` (by-value aggregate copies coalesced into their source object). Diagnostics, all stderr-only, read once per `run_passes` (`CCC_AGG_BYVAL_DEBUG` once per process): `CCC_DEBUG_SROA=1` (per-function change count, `[SROA]`, and every split, `[SROA-split]`), `CCC_AGG_SPLIT_DEBUG=1` (`split.rs` candidate rejections and the writer-predicate cross-check), `CCC_AGG_BYVAL_DEBUG=1` (every by-value copy it declines, with the reason).
 
 ## Do-not / measured notes
 

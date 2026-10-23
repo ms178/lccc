@@ -8,7 +8,7 @@ use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
 use super::reloc;
-use super::types::{BASE_ADDR, GlobalSymbol, INTERP, PAGE_SIZE};
+use super::types::{BASE_ADDR, EhFrameHdr, GlobalSymbol, INTERP, PAGE_SIZE, init_fini_entries};
 use crate::backend::linker_common;
 use linker_common::{DynStrTab, OutputSection};
 
@@ -25,11 +25,15 @@ pub(super) fn emit_dynamic_executable(
     needed_sonames: &[String],
     output_path: &str,
     export_dynamic: bool,
+    rpath: Option<&(i64, String)>,
     pending_defsyms: &[(String, String, usize)],
 ) -> Result<(), String> {
     let mut dynstr = DynStrTab::new();
     for lib in needed_sonames {
         dynstr.add(lib);
+    }
+    if let Some((_, path)) = rpath {
+        dynstr.add(path);
     }
 
     // Build dynamic symbol name list
@@ -174,20 +178,27 @@ pub(super) fn emit_dynamic_executable(
     let has_fini_array = output_sections
         .iter()
         .any(|s| s.name == ".fini_array" && s.mem_size > 0);
-    let mut dyn_count = needed_sonames.len() as u64 + 16; // fixed entries + DT_FLAGS + DT_FLAGS_1 + NULL
+    // fixed entries + DT_FLAGS + DT_FLAGS_1 + NULL, [DT_RUNPATH]
+    let mut dyn_count = needed_sonames.len() as u64 + 16 + u64::from(rpath.is_some());
     if has_init_array {
         dyn_count += 2;
     }
     if has_fini_array {
         dyn_count += 2;
     }
+    // DT_INIT / DT_FINI: whether the tags exist is known before layout
+    // (symbol definedness); their values are read after it, at emission.
+    let init_fini = linker_common::image_init_fini(globals);
+    dyn_count += u64::from(init_fini.0) + u64::from(init_fini.1);
     let dynamic_size = dyn_count * 16;
 
     let has_tls_sections = output_sections
         .iter()
         .any(|s| s.flags & SHF_TLS != 0 && s.flags & SHF_ALLOC != 0);
-    // phdrs: PHDR, INTERP, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), DYNAMIC, GNU_STACK, GNU_RELRO, [TLS]
-    let phdr_count: u64 = if has_tls_sections { 10 } else { 9 };
+    // phdrs: PHDR, INTERP, LOAD(ro), LOAD(text), LOAD(rodata), LOAD(rw), DYNAMIC, GNU_STACK,
+    // GNU_RELRO, [GNU_EH_FRAME], [TLS]
+    let phdr_count: u64 =
+        9 + u64::from(EhFrameHdr::wanted(output_sections)) + u64::from(has_tls_sections);
     let phdr_total_size = phdr_count * 56;
 
     // === Layout ===
@@ -259,6 +270,7 @@ pub(super) fn emit_dynamic_executable(
             offset += sec.mem_size;
         }
     }
+    let eh_frame_hdr = EhFrameHdr::reserve(objects, output_sections, &mut offset, BASE_ADDR);
     let rodata_total_size = offset - rodata_page_offset;
 
     // RW segment
@@ -692,6 +704,22 @@ pub(super) fn emit_dynamic_executable(
         0x10,
     );
     ph += 56;
+    // PT_GNU_EH_FRAME: libgcc's unwinder reaches this object's FDEs only
+    // through it (dl_iterate_phdr).
+    if let Some(h) = &eh_frame_hdr {
+        wphdr(
+            &mut out,
+            ph,
+            PT_GNU_EH_FRAME,
+            PF_R,
+            h.offset,
+            h.vaddr,
+            h.size,
+            h.size,
+            4,
+        );
+        ph += 56;
+    }
     if has_tls {
         wphdr(
             &mut out,
@@ -917,6 +945,17 @@ pub(super) fn emit_dynamic_executable(
         w64(&mut out, dd + 8, so as u64);
         dd += 16;
     }
+    if let Some((tag, path)) = rpath {
+        w64(&mut out, dd, *tag as u64);
+        w64(&mut out, dd + 8, dynstr.get_offset(path) as u64);
+        dd += 16;
+    }
+    // Right after NEEDED/RUNPATH, as GNU ld places them.
+    for (tag, a) in init_fini_entries(globals, init_fini) {
+        w64(&mut out, dd, tag as u64);
+        w64(&mut out, dd + 8, a);
+        dd += 16;
+    }
     for &(tag, val) in &[
         (DT_STRTAB, dynstr_addr),
         (DT_SYMTAB, dynsym_addr),
@@ -1072,20 +1111,16 @@ pub(super) fn emit_dynamic_executable(
                         };
                         w64(&mut out, fp, (t as i64 + a) as u64);
                     }
-                    R_AARCH64_ABS32 => {
-                        w32(&mut out, fp, (s as i64 + a) as u32);
-                    }
-                    R_AARCH64_ABS16 => {
-                        w16(&mut out, fp, (s as i64 + a) as u16);
+                    R_AARCH64_ABS32 | R_AARCH64_ABS16 => {
+                        let v = (s as i64).wrapping_add(a);
+                        reloc::write_checked_data(&mut out, fp, rela.rela_type, v, &sym.name)?;
                     }
                     R_AARCH64_PREL64 => {
                         w64(&mut out, fp, (s as i64 + a - p as i64) as u64);
                     }
-                    R_AARCH64_PREL32 => {
-                        w32(&mut out, fp, (s as i64 + a - p as i64) as u32);
-                    }
-                    R_AARCH64_PREL16 => {
-                        w16(&mut out, fp, (s as i64 + a - p as i64) as u16);
+                    R_AARCH64_PREL32 | R_AARCH64_PREL16 => {
+                        let v = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
+                        reloc::write_checked_data(&mut out, fp, rela.rela_type, v, &sym.name)?;
                     }
                     R_AARCH64_ADR_PREL_PG_HI21 => {
                         let sa_val = (s as i64).wrapping_add(a) as u64;
@@ -1122,69 +1157,39 @@ pub(super) fn emit_dynamic_executable(
                         let sa_val = (s as i64).wrapping_add(a) as u64;
                         reloc::encode_ldst_imm12(&mut out, fp, (sa_val & 0xFFF) as u32, 4);
                     }
-                    R_AARCH64_CALL26 | R_AARCH64_JUMP26 => {
-                        if fp + 4 > out.len() {
-                            continue;
-                        }
-                        let t = if !sym.name.is_empty() {
-                            if let Some(g) = globals_snap.get(sym.name.as_str()) {
-                                if let Some(pi) = g.plt_idx {
-                                    plt_addr + 32 + pi as u64 * 16
-                                } else {
-                                    s
-                                }
-                            } else {
-                                s
+                    R_AARCH64_CALL26 | R_AARCH64_JUMP26 | R_AARCH64_CONDBR19
+                    | R_AARCH64_TSTBR14 => {
+                        // A branch to a function with a PLT entry goes
+                        // through it, whichever branch form reaches it.
+                        let t = globals_snap
+                            .get(sym.name.as_str())
+                            .filter(|_| !sym.name.is_empty())
+                            .and_then(|g| g.plt_idx)
+                            .map_or(s, |pi| plt_addr + 32 + pi as u64 * 16);
+                        let sa_val = (t as i64).wrapping_add(a) as u64;
+                        let is_call = matches!(rela.rela_type, R_AARCH64_CALL26 | R_AARCH64_JUMP26);
+                        if sa_val == 0 && is_call {
+                            if fp + 4 > out.len() {
+                                return Err(format!("branch site {fp:#x} exceeds output"));
                             }
-                        } else {
-                            s
-                        };
-                        let sa_val = (t as i64 + a) as u64;
-                        if sa_val == 0 {
                             w32(&mut out, fp, 0xd503201f); // NOP for weak undef
                         } else {
-                            let offset_val = (sa_val as i64) - (p as i64);
-                            let mut insn = read_u32(&out, fp);
-                            let imm26 = ((offset_val >> 2) as u32) & 0x3ffffff;
-                            insn = (insn & 0xfc000000) | imm26;
-                            w32(&mut out, fp, insn);
+                            let disp = (sa_val as i64).wrapping_sub(p as i64);
+                            reloc::encode_branch(&mut out, fp, rela.rela_type, disp, &sym.name)?;
                         }
                     }
-                    R_AARCH64_CONDBR19 => {
-                        let offset_val = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
-                        if fp + 4 > out.len() {
-                            continue;
-                        }
-                        let mut insn = read_u32(&out, fp);
-                        let imm19 = ((offset_val >> 2) as u32) & 0x7ffff;
-                        insn = (insn & 0xff00001f) | (imm19 << 5);
-                        w32(&mut out, fp, insn);
-                    }
-                    R_AARCH64_TSTBR14 => {
-                        let offset_val = (s as i64).wrapping_add(a).wrapping_sub(p as i64);
-                        if fp + 4 > out.len() {
-                            continue;
-                        }
-                        let mut insn = read_u32(&out, fp);
-                        let imm14 = ((offset_val >> 2) as u32) & 0x3fff;
-                        insn = (insn & 0xfff8001f) | (imm14 << 5);
-                        w32(&mut out, fp, insn);
-                    }
-                    R_AARCH64_MOVW_UABS_G0 | R_AARCH64_MOVW_UABS_G0_NC => {
-                        let sa_val = (s as i64).wrapping_add(a) as u64;
-                        reloc::encode_movw(&mut out, fp, (sa_val & 0xffff) as u32);
-                    }
-                    R_AARCH64_MOVW_UABS_G1_NC => {
-                        let sa_val = (s as i64).wrapping_add(a) as u64;
-                        reloc::encode_movw(&mut out, fp, ((sa_val >> 16) & 0xffff) as u32);
-                    }
-                    R_AARCH64_MOVW_UABS_G2_NC => {
-                        let sa_val = (s as i64).wrapping_add(a) as u64;
-                        reloc::encode_movw(&mut out, fp, ((sa_val >> 32) & 0xffff) as u32);
-                    }
-                    R_AARCH64_MOVW_UABS_G3 => {
-                        let sa_val = (s as i64).wrapping_add(a) as u64;
-                        reloc::encode_movw(&mut out, fp, ((sa_val >> 48) & 0xffff) as u32);
+                    R_AARCH64_MOVW_UABS_G0
+                    | R_AARCH64_MOVW_UABS_G0_NC
+                    | R_AARCH64_MOVW_UABS_G1
+                    | R_AARCH64_MOVW_UABS_G1_NC
+                    | R_AARCH64_MOVW_UABS_G2
+                    | R_AARCH64_MOVW_UABS_G2_NC
+                    | R_AARCH64_MOVW_UABS_G3
+                    | R_AARCH64_MOVW_SABS_G0
+                    | R_AARCH64_MOVW_SABS_G1
+                    | R_AARCH64_MOVW_SABS_G2 => {
+                        let v = (s as i64).wrapping_add(a);
+                        reloc::encode_movw_group(&mut out, fp, rela.rela_type, v, &sym.name)?;
                     }
                     R_AARCH64_ADR_GOT_PAGE | R_AARCH64_LD64_GOT_LO12_NC => {
                         // Use GOT entry address for symbols with GOT-only entries
@@ -1231,6 +1236,11 @@ pub(super) fn emit_dynamic_executable(
                 }
             }
         }
+    }
+
+    // .eh_frame_hdr from the relocated .eh_frame
+    if let Some(h) = &eh_frame_hdr {
+        h.write(&mut out)?;
     }
 
     // Write output

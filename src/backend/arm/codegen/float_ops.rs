@@ -45,9 +45,16 @@ impl ArmCodegen {
                 }
             }
         }
-        // FP constants load straight from the .rodata constant pool via a
-        // PC-relative literal load (1 instruction vs. a 5-instruction
-        // movz/movk + fmov sequence).
+        // FP constants load from the .rodata constant pool by page address
+        // plus low-12 offset, GCC's `-mcmodel=small` sequence (2
+        // instructions vs. a 5-instruction movz/movk + fmov sequence). A
+        // one-instruction literal load (`ldr dN, label`, LD_PREL_LO19) only
+        // reaches +-1 MiB, and the pool is another section: everything
+        // linked between this function and .rodata counts against that, so
+        // past ~1 MiB of code GNU ld refuses the link ("relocation truncated
+        // to fit") and the target wraps. x17 (IP1) is outside both
+        // allocation pools and every other codegen use of it is a
+        // self-contained set-then-use sequence; nothing can intervene here.
         if let Operand::Const(c) = op {
             let bits = match (c, ty) {
                 (IrConst::F64(v), IrType::F64) => Some(v.to_bits()),
@@ -61,8 +68,9 @@ impl ArmCodegen {
                         .emit_fmt(format_args!("    fmov {}, {}", target, zero));
                 } else {
                     let label = self.state.get_fp_const_label(bits);
+                    self.state.emit_fmt(format_args!("    adrp x17, {label}"));
                     self.state
-                        .emit_fmt(format_args!("    ldr {}, {}", target, label));
+                        .emit_fmt(format_args!("    ldr {target}, [x17, :lo12:{label}]"));
                 }
                 return;
             }
