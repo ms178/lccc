@@ -37,6 +37,7 @@ mod frame_compact;
 mod helpers;
 mod identical_blocks;
 mod jump_thread;
+mod lea_narrow;
 mod liveness;
 mod load_bswap_movbe;
 mod load_op_fuse;
@@ -1634,6 +1635,9 @@ fn peephole_optimize_inner(
             global_changed |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
             global_changed |= self_zext::eliminate_redundant_self_zext(&store, &mut infos);
         }
+        if !sk("lea_narrow") {
+            global_changed |= lea_narrow::narrow_lea_truncations(&mut store, &mut infos);
+        }
         if !sk("dead_stores") {
             global_changed |= dead_code::eliminate_dead_stores(&store, &mut infos);
         }
@@ -1756,6 +1760,9 @@ fn peephole_optimize_inner(
                 changed2 |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
                 changed2 |= self_zext::eliminate_redundant_self_zext(&store, &mut infos);
             }
+            if !sk("lea_narrow") {
+                changed2 |= lea_narrow::narrow_lea_truncations(&mut store, &mut infos);
+            }
             // A redundant self-zext deleted above can be the only line
             // separating a `mov MEM,%d; <inc %d>; mov %d,MEM` trio (the
             // emitter re-zero-extends a 32-bit index before each access),
@@ -1836,6 +1843,9 @@ fn peephole_optimize_inner(
     {
         self_zext::eliminate_redundant_self_zext(&store, &mut infos);
         dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+        if !sk("lea_narrow") {
+            lea_narrow::narrow_lea_truncations(&mut store, &mut infos);
+        }
     }
 
     // Phase 4: Eliminate loop backedge trampoline blocks.
@@ -1867,6 +1877,9 @@ fn peephole_optimize_inner(
                 changed3 |= dead_code::eliminate_dead_reg_moves(&store, &mut infos);
                 changed3 |= dead_code::eliminate_dead_fp_moves(&store, &mut infos);
                 changed3 |= self_zext::eliminate_redundant_self_zext(&store, &mut infos);
+            }
+            if !sk("lea_narrow") {
+                changed3 |= lea_narrow::narrow_lea_truncations(&mut store, &mut infos);
             }
             // A redundant self-zext deleted above can be the only line
             // separating a `mov MEM,%d; <inc %d>; mov %d,MEM` trio (the

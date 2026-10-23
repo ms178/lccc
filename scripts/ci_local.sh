@@ -1879,6 +1879,14 @@ gate "encdiff-corpus" fast \
 gate "zero-ext-cmp-fold" fast \
     bash tests/regression/check_zero_ext_cmp_fold.sh
 
+# `narrow_lea_truncations` (`lea_narrow`): `leaq ADDR,%T` + `movl %Td,%Dd`
+# becomes one `leal ADDR,%Dd`. Fires on 2 of the 49 benchmark programs and
+# removes two of sixteen instructions in byte_load_reassembly's decode loop;
+# the failure direction is a silent miscompile (an early write moving past a
+# reader), so both the shape pin and the gcc execution differential run here.
+gate "lea-truncation-narrowing" fast \
+    bash tests/regression/check_lea_truncation_narrowing.sh
+
 # The 64-bit division width bypass (`X86Tune::bypass_div64`): the guard must be
 # emitted on bypass rows only, `CCC_NO_DIV64_BYPASS=1` must restore the off-row
 # text exactly, and the guarded form must compute what GCC computes.  The corpus
