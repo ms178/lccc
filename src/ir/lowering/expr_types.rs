@@ -500,7 +500,21 @@ impl Lowerer {
             | "__builtin_ceilf"
             | "__builtin_roundf"
             | "__builtin_copysignf"
-            | "__builtin_nextafterf" => Some(IrType::F32),
+            | "__builtin_nextafterf"
+            // The float twins of `fmax`/`fmin`/`log2`. Their absence here was
+            // a silent miscompile, not a missing symbol: the libc-alias
+            // lowering asks THIS table for the call's result type, so an
+            // unlisted name fell through to I64 and the caller converted the
+            // callee's %xmm0 return with `cvtsi2ssq` -- `__builtin_fmaxf(1.5f,
+            // 2.5f)` evaluated to 1.08842e+09 (the raw low word reinterpreted as
+            // an integer) where GCC 16.2 answers 2.5.  This table and
+            // `builtins.rs`'s alias map are two halves of one contract, which is
+            // exactly why `tests/regression/check_builtin_float_aliases.py`
+            // derives the class from GCC and checks the RESULT rather than the
+            // tables: drift in either half fails there.
+            | "__builtin_fmaxf"
+            | "__builtin_fminf"
+            | "__builtin_log2f" => Some(IrType::F32),
             "__builtin_fabsl" | "__builtin_sqrtl" | "__builtin_nextafterl" => Some(IrType::F128),
             // __builtin_* variants: the LibcAlias lowering asks for the
             // BUILTIN name (e.g. "__builtin_copysignl"), not the libc name.

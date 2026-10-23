@@ -1293,19 +1293,17 @@ fn extend_gep_base_liveness(
                             def_points,
                             &(block_start_points[bi], block_end_points[bi]),
                             copy_src,
-                            // STAGED CONSERVATISM — deliberate, not an
-                            // oversight. The operand/index sites moved to
-                            // the precise contract on their own measured
-                            // evidence (varint +1 push, expat/stencil5
-                            // spills); the base is the loop-carried pointer
-                            // in the hottest kernels — the single riskiest
-                            // value to un-pin — and flipping it here would
-                            // conflate two variables in any future
-                            // bisection. Flip this to
-                            // hidden_read_copy_chain_enabled() only behind
-                            // the same corpus A/B measurement, never
-                            // "for symmetry".
-                            true,
+                            // Precise read contract for GEP bases as well as
+                            // operand/index sites: the folded access re-reads
+                            // `base_id`'s own register, while its Copy-chain
+                            // sources (preheader ParamRefs, latch loads) are
+                            // read at their respective Copy instructions.
+                            // Following the Copy chain here pinned preheader
+                            // ParamRefs and latch loads through the entire loop
+                            // (e.g. linux_list_sort's merge_and_count: v8/v10
+                            // and v43/v49 spanned [0..35], costing 3 callee-saved
+                            // pushes and blocking in-place pointer updates).
+                            hidden_read_copy_chain_enabled(),
                             last_use_points,
                             block_gen,
                             folded_read_points,
@@ -3492,6 +3490,111 @@ mod tests {
             .filter(|iv| iv.value_id == 0)
             .count();
         assert_eq!(n, 1, "{:?}", result.intervals);
+    }
+
+    #[test]
+    fn const_gep_base_does_not_pin_phi_elim_entry_pred_through_the_loop() {
+        use crate::common::types::AddressSpace;
+        use crate::ir::reexports::BasicBlock;
+
+        let mut func = IrFunction::new("list_walk".to_string(), IrType::U64, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::Ptr,
+                },
+                Instruction::Load {
+                    dest: Value(3),
+                    ptr: Value(2),
+                    ty: IrType::U64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Load {
+                    dest: Value(4),
+                    ptr: Value(1),
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(4)),
+                },
+                Instruction::Cmp {
+                    dest: Value(5),
+                    op: crate::ir::reexports::IrCmpOp::Ne,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::Ptr,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(5)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(3)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 6;
+
+        let covers = |r: &LivenessResult, v: u32, p: u32| {
+            r.segments
+                .iter()
+                .any(|s| s.value_id == v && s.start <= p && p <= s.end)
+        };
+        {
+            let _pin =
+                crate::test_support::TriStateFlagWindow::new(&HIDDEN_READ_COPY_CHAIN_OVERRIDE, 0);
+            let r = compute_live_intervals(&func);
+            assert!(
+                covers(&r, 1, 4),
+                "loop-carried base v1 must cover the folded load"
+            );
+            assert!(
+                !covers(&r, 0, 4),
+                "entry ParamRef v0 must die at the preheader Copy, not span the loop"
+            );
+            assert!(
+                !covers(&r, 4, 4),
+                "latch load v4 must die at the latch Copy, not wrap to the top of the loop"
+            );
+        }
+        {
+            let _conservative =
+                crate::test_support::TriStateFlagWindow::new(&HIDDEN_READ_COPY_CHAIN_OVERRIDE, 1);
+            let r = compute_live_intervals(&func);
+            assert!(
+                covers(&r, 0, 4),
+                "conservative chain walk pins the entry pred to the folded GEP load"
+            );
+        }
     }
 }
 

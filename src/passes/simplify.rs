@@ -101,9 +101,22 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
     // Build def maps for chain optimizations: Value -> defining instruction
     // We use flat Vecs indexed by Value ID for O(1) lookup.
     let max_id = func.max_value_id() as usize;
+    let mut def_counts = vec![0u8; max_id + 1];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                let idx = d.0 as usize;
+                if idx < def_counts.len() {
+                    def_counts[idx] = def_counts[idx].saturating_add(1);
+                }
+            }
+        }
+    }
     let mut cast_defs: Vec<Option<CastDef>> = vec![None; max_id + 1];
     let mut gep_defs: Vec<Option<GepDef>> = vec![None; max_id + 1];
     let mut cmp_defs: Vec<Option<CmpDef>> = vec![None; max_id + 1];
+    let mut select_defs: Vec<Option<SelectDef>> = vec![None; max_id + 1];
+    let mut const_defs: Vec<Option<IrConst>> = vec![None; max_id + 1];
     let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; max_id + 1];
     let mut neg_defs: Vec<Option<NegDef>> = vec![None; max_id + 1];
     let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; max_id + 1];
@@ -277,6 +290,18 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                 Instruction::UnaryOp { dest, op, src, ty } => match op {
                     IrUnaryOp::Neg => {
                         set_def(&mut neg_defs, dest.0, NegDef { src: *src });
+                        if def_counts.get(dest.0 as usize).copied() == Some(1) {
+                            if let Operand::Const(c) = src {
+                                if let Some(folded) = super::constant_fold::eval_unaryop_const(
+                                    IrUnaryOp::Neg,
+                                    *c,
+                                    None,
+                                    *ty,
+                                ) {
+                                    set_def(&mut const_defs, dest.0, folded);
+                                }
+                            }
+                        }
                     }
                     IrUnaryOp::Clz
                     | IrUnaryOp::ClzNonZero
@@ -294,6 +319,34 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                     }
                     _ => {}
                 },
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Const(c),
+                } => {
+                    if def_counts.get(dest.0 as usize).copied() == Some(1) {
+                        set_def(&mut const_defs, dest.0, *c);
+                    }
+                }
+                Instruction::Select {
+                    dest,
+                    cond,
+                    true_val,
+                    false_val,
+                    ty,
+                } => {
+                    if def_counts.get(dest.0 as usize).copied() == Some(1) {
+                        set_def(
+                            &mut select_defs,
+                            dest.0,
+                            SelectDef {
+                                cond: *cond,
+                                true_val: *true_val,
+                                false_val: *false_val,
+                                ty: *ty,
+                            },
+                        );
+                    }
+                }
                 Instruction::Call { func, info } if info.assume_library => {
                     if matches!(
                         func.as_str(),
@@ -425,6 +478,7 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                     continue;
                 }
             }
+            let mut simplified_here = false;
             if let Some(simplified) = try_simplify_with_types(
                 inst,
                 &cast_defs,
@@ -440,6 +494,36 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
             ) {
                 *inst = simplified;
                 total += 1;
+                simplified_here = true;
+            }
+            if !simplify_skip("cmp") {
+                if let Instruction::Cmp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } = inst
+                {
+                    if let Some(folded) = fold_cmp_of_select(
+                        *dest,
+                        *op,
+                        lhs,
+                        rhs,
+                        *ty,
+                        &select_defs,
+                        &cmp_defs,
+                        &cast_defs,
+                        &const_defs,
+                        &is_boolean,
+                        &def_counts,
+                    ) {
+                        *inst = folded;
+                        if !simplified_here {
+                            total += 1;
+                        }
+                    }
+                }
             }
         }
     }
@@ -509,6 +593,15 @@ struct CmpDef {
     ty: IrType,
 }
 
+/// Cached information about a Select instruction for comparison-of-select folding.
+#[derive(Clone, Copy)]
+struct SelectDef {
+    cond: Operand,
+    true_val: Operand,
+    false_val: Operand,
+    ty: IrType,
+}
+
 /// Cached information about a UnaryOp::Neg instruction.
 /// Used to simplify `x - (neg y)` => `x + y`.
 #[derive(Clone, Copy)]
@@ -569,7 +662,22 @@ fn peel_int_cast_chain(
 /// generic simplify sweep has already run in the same pipeline iteration).
 pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
     let max = func.max_value_id() as usize + 1;
+    let mut def_counts = vec![0u8; max];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                let idx = d.0 as usize;
+                if idx < def_counts.len() {
+                    def_counts[idx] = def_counts[idx].saturating_add(1);
+                }
+            }
+        }
+    }
     let mut cast_defs: Vec<Option<CastDef>> = vec![None; max];
+    let mut cmp_defs: Vec<Option<CmpDef>> = vec![None; max];
+    let mut select_defs: Vec<Option<SelectDef>> = vec![None; max];
+    let mut const_defs: Vec<Option<IrConst>> = vec![None; max];
+    let mut is_boolean = vec![false; max];
     let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; max];
     let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; max];
     for block in &func.blocks {
@@ -589,6 +697,50 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
                         });
                     }
                 }
+                Instruction::Cmp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } => {
+                    let idx = dest.0 as usize;
+                    if idx < cmp_defs.len() {
+                        cmp_defs[idx] = Some(CmpDef {
+                            op: *op,
+                            lhs: *lhs,
+                            rhs: *rhs,
+                            ty: *ty,
+                        });
+                        is_boolean[idx] = true;
+                    }
+                }
+                Instruction::Select {
+                    dest,
+                    cond,
+                    true_val,
+                    false_val,
+                    ty,
+                } => {
+                    let idx = dest.0 as usize;
+                    if idx < select_defs.len() && def_counts.get(idx).copied() == Some(1) {
+                        select_defs[idx] = Some(SelectDef {
+                            cond: *cond,
+                            true_val: *true_val,
+                            false_val: *false_val,
+                            ty: *ty,
+                        });
+                    }
+                }
+                Instruction::Copy {
+                    dest,
+                    src: Operand::Const(c),
+                } => {
+                    let idx = dest.0 as usize;
+                    if idx < const_defs.len() && def_counts.get(idx).copied() == Some(1) {
+                        const_defs[idx] = Some(*c);
+                    }
+                }
                 Instruction::BinOp {
                     dest,
                     op,
@@ -603,23 +755,36 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
                         ty: *ty,
                     });
                 }
-                Instruction::UnaryOp { dest, op, src, ty }
-                    if matches!(
-                        op,
-                        IrUnaryOp::Clz
-                            | IrUnaryOp::ClzNonZero
-                            | IrUnaryOp::Ctz
-                            | IrUnaryOp::CtzNonZero
-                    ) =>
-                {
-                    if (dest.0 as usize) < unary_defs.len() {
-                        unary_defs[dest.0 as usize] = Some(UnaryDef {
-                            op: *op,
-                            src: *src,
-                            ty: *ty,
-                        });
+                Instruction::UnaryOp { dest, op, src, ty } => match op {
+                    IrUnaryOp::Neg => {
+                        let idx = dest.0 as usize;
+                        if idx < const_defs.len() && def_counts.get(idx).copied() == Some(1) {
+                            if let Operand::Const(c) = src {
+                                if let Some(folded) = super::constant_fold::eval_unaryop_const(
+                                    IrUnaryOp::Neg,
+                                    *c,
+                                    None,
+                                    *ty,
+                                ) {
+                                    const_defs[idx] = Some(folded);
+                                }
+                            }
+                        }
                     }
-                }
+                    IrUnaryOp::Clz
+                    | IrUnaryOp::ClzNonZero
+                    | IrUnaryOp::Ctz
+                    | IrUnaryOp::CtzNonZero => {
+                        if (dest.0 as usize) < unary_defs.len() {
+                            unary_defs[dest.0 as usize] = Some(UnaryDef {
+                                op: *op,
+                                src: *src,
+                                ty: *ty,
+                            });
+                        }
+                    }
+                    _ => {}
+                },
                 _ => {}
             }
         }
@@ -628,6 +793,30 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
     for block in &mut func.blocks {
         for inst in &mut block.instructions {
             match inst {
+                Instruction::Cmp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } if !simplify_skip("cmp") => {
+                    if let Some(folded) = fold_cmp_of_select(
+                        *dest,
+                        *op,
+                        lhs,
+                        rhs,
+                        *ty,
+                        &select_defs,
+                        &cmp_defs,
+                        &cast_defs,
+                        &const_defs,
+                        &is_boolean,
+                        &def_counts,
+                    ) {
+                        *inst = folded;
+                        changes += 1;
+                    }
+                }
                 Instruction::Select {
                     dest,
                     cond,
@@ -711,6 +900,350 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
         }
     }
     changes
+}
+
+fn eval_int_cmp_bool(op: IrCmpOp, lhs: IrConst, rhs: IrConst, ty: IrType) -> Option<bool> {
+    if !ty.is_integer() {
+        return None;
+    }
+    match super::constant_fold::eval_cmp_const(op, lhs, rhs, ty)? {
+        IrConst::I32(v) => Some(v != 0),
+        IrConst::I8(v) => Some(v != 0),
+        _ => None,
+    }
+}
+
+fn resolve_select_const(
+    op: Operand,
+    const_defs: &[Option<IrConst>],
+    cast_defs: &[Option<CastDef>],
+    def_counts: &[u8],
+) -> Option<IrConst> {
+    resolve_select_const_bounded(op, const_defs, cast_defs, def_counts, 0)
+}
+
+fn resolve_select_const_bounded(
+    op: Operand,
+    const_defs: &[Option<IrConst>],
+    cast_defs: &[Option<CastDef>],
+    def_counts: &[u8],
+    depth: u8,
+) -> Option<IrConst> {
+    if depth > 8 {
+        return None;
+    }
+    match op {
+        Operand::Const(c) => Some(c),
+        Operand::Value(v) => {
+            let idx = v.0 as usize;
+            if def_counts.get(idx).copied() != Some(1) {
+                return None;
+            }
+            if let Some(Some(c)) = const_defs.get(idx) {
+                return Some(*c);
+            }
+            if let Some(Some(cdef)) = cast_defs.get(idx) {
+                if cdef.from_ty.is_integer() && cdef.to_ty.is_integer() {
+                    let inner = resolve_select_const_bounded(
+                        cdef.src,
+                        const_defs,
+                        cast_defs,
+                        def_counts,
+                        depth + 1,
+                    )?;
+                    return super::constant_fold::eval_cast_const(inner, cdef.from_ty, cdef.to_ty);
+                }
+            }
+            None
+        }
+    }
+}
+
+fn peel_bool_cond(
+    op: Operand,
+    cast_defs: &[Option<CastDef>],
+    is_boolean: &[bool],
+    cmp_defs: &[Option<CmpDef>],
+    def_counts: &[u8],
+) -> Operand {
+    let mut candidate = op;
+    let mut saw_narrowing = false;
+    for _ in 0..16 {
+        let Operand::Value(v) = candidate else { break };
+        let idx = v.0 as usize;
+        if def_counts.get(idx).copied() != Some(1) {
+            break;
+        }
+        if let Some(Some(cdef)) = cast_defs.get(idx) {
+            if cdef.from_ty.is_integer() && cdef.to_ty.is_integer() {
+                if cdef.to_ty.size() < cdef.from_ty.size() {
+                    saw_narrowing = true;
+                }
+                candidate = cdef.src;
+                continue;
+            }
+        }
+        break;
+    }
+    if !saw_narrowing {
+        return candidate;
+    }
+    if let Operand::Value(v) = candidate {
+        let idx = v.0 as usize;
+        let is_bool = def_counts.get(idx).copied() == Some(1)
+            && (is_boolean.get(idx).copied().unwrap_or(false)
+                || cmp_defs.get(idx).and_then(|d| *d).is_some());
+        if is_bool {
+            return candidate;
+        }
+    }
+    op
+}
+
+fn fold_bool_select_arms(
+    dest: Value,
+    cond: Operand,
+    true_branch: bool,
+    false_branch: bool,
+    is_boolean: &[bool],
+    cmp_defs: &[Option<CmpDef>],
+    def_counts: &[u8],
+) -> Option<Instruction> {
+    if true_branch == false_branch {
+        return Some(Instruction::Copy {
+            dest,
+            src: Operand::Const(IrConst::I8(i8::from(true_branch))),
+        });
+    }
+    let Operand::Value(cv) = cond else {
+        return None;
+    };
+    let idx = cv.0 as usize;
+    if def_counts.get(idx).copied() != Some(1) {
+        return None;
+    }
+    if true_branch && !false_branch {
+        if is_boolean.get(idx).copied().unwrap_or(false)
+            || cmp_defs.get(idx).and_then(|d| *d).is_some()
+        {
+            return Some(Instruction::Copy {
+                dest,
+                src: Operand::Value(cv),
+            });
+        }
+        None
+    } else {
+        let ic = (*cmp_defs.get(idx)?)?;
+        if ic.ty.is_float() && !matches!(ic.op, IrCmpOp::Eq | IrCmpOp::Ne) {
+            return None;
+        }
+        Some(Instruction::Cmp {
+            dest,
+            op: invert_cmp_op(ic.op),
+            lhs: ic.lhs,
+            rhs: ic.rhs,
+            ty: ic.ty,
+        })
+    }
+}
+
+fn int_cmp_trichotomy_mask(op: IrCmpOp) -> u8 {
+    match op {
+        IrCmpOp::Eq => 0b010,
+        IrCmpOp::Ne => 0b101,
+        IrCmpOp::Slt | IrCmpOp::Ult => 0b001,
+        IrCmpOp::Sle | IrCmpOp::Ule => 0b011,
+        IrCmpOp::Sgt | IrCmpOp::Ugt => 0b100,
+        IrCmpOp::Sge | IrCmpOp::Uge => 0b110,
+    }
+}
+
+fn int_cmp_from_trichotomy_mask(mask: u8, unsigned: bool) -> Option<IrCmpOp> {
+    Some(match (mask & 0b111, unsigned) {
+        (0b001, true) => IrCmpOp::Ult,
+        (0b001, false) => IrCmpOp::Slt,
+        (0b010, _) => IrCmpOp::Eq,
+        (0b011, true) => IrCmpOp::Ule,
+        (0b011, false) => IrCmpOp::Sle,
+        (0b100, true) => IrCmpOp::Ugt,
+        (0b100, false) => IrCmpOp::Sgt,
+        (0b101, _) => IrCmpOp::Ne,
+        (0b110, true) => IrCmpOp::Uge,
+        (0b110, false) => IrCmpOp::Sge,
+        _ => return None,
+    })
+}
+
+/// Fold comparisons of 1-level and 2-level constant-leaf `Select` trees against
+/// an integer constant. Inlined 3-way comparators (`(a < b) ? -1 : ((a > b) ? 1 : 0)`)
+/// compared against `0` after `if_convert` collapse to a single `Cmp(a, b)`.
+#[allow(clippy::too_many_arguments)]
+fn fold_cmp_of_select(
+    dest: Value,
+    op: IrCmpOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    ty: IrType,
+    select_defs: &[Option<SelectDef>],
+    cmp_defs: &[Option<CmpDef>],
+    cast_defs: &[Option<CastDef>],
+    const_defs: &[Option<IrConst>],
+    is_boolean: &[bool],
+    def_counts: &[u8],
+) -> Option<Instruction> {
+    if !ty.is_integer() {
+        return None;
+    }
+    let (val, cval, effective_op) = match (lhs, rhs) {
+        (Operand::Value(v), Operand::Const(c)) => (*v, *c, op),
+        (Operand::Const(c), Operand::Value(v)) => (*v, *c, swap_cmp_op(op)),
+        (Operand::Value(v), Operand::Value(cv)) => {
+            if let Some(c) =
+                resolve_select_const(Operand::Value(*cv), const_defs, cast_defs, def_counts)
+            {
+                (*v, c, op)
+            } else if let Some(c) =
+                resolve_select_const(Operand::Value(*v), const_defs, cast_defs, def_counts)
+            {
+                (*cv, c, swap_cmp_op(op))
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    let val_idx = val.0 as usize;
+    if def_counts.get(val_idx).copied() != Some(1) {
+        return None;
+    }
+    let sdef = (*select_defs.get(val_idx)?)?;
+    if !sdef.ty.is_integer() || sdef.ty.size() != ty.size() {
+        return None;
+    }
+    let c1 = peel_bool_cond(sdef.cond, cast_defs, is_boolean, cmp_defs, def_counts);
+    let true_const = resolve_select_const(sdef.true_val, const_defs, cast_defs, def_counts);
+    let false_const = resolve_select_const(sdef.false_val, const_defs, cast_defs, def_counts);
+
+    // 1-level Select(c1, k1, k2) compared against cval.
+    if let (Some(k1), Some(k2)) = (true_const, false_const) {
+        let p1 = eval_int_cmp_bool(effective_op, k1, cval, ty)?;
+        let p2 = eval_int_cmp_bool(effective_op, k2, cval, ty)?;
+        return fold_bool_select_arms(dest, c1, p1, p2, is_boolean, cmp_defs, def_counts);
+    }
+
+    // 2-level Select(c1, k1, Select(c2, k2, k3)) or Select(c1, Select(c2, k2, k3), k1).
+    let (k1, inner_op, inner_on_false) = match (true_const, false_const) {
+        (Some(k1), None) => (k1, sdef.false_val, true),
+        (None, Some(k1)) => (k1, sdef.true_val, false),
+        _ => return None,
+    };
+    let Operand::Value(inner_v) = peel_int_cast_chain(inner_op, cast_defs, true) else {
+        return None;
+    };
+    let inner_idx = inner_v.0 as usize;
+    if def_counts.get(inner_idx).copied() != Some(1) {
+        return None;
+    }
+    let sdef2 = (*select_defs.get(inner_idx)?)?;
+    if !sdef2.ty.is_integer() || sdef2.ty.size() != ty.size() {
+        return None;
+    }
+    let k2 = resolve_select_const(sdef2.true_val, const_defs, cast_defs, def_counts)?;
+    let k3 = resolve_select_const(sdef2.false_val, const_defs, cast_defs, def_counts)?;
+    let p1 = eval_int_cmp_bool(effective_op, k1, cval, ty)?;
+    let p2 = eval_int_cmp_bool(effective_op, k2, cval, ty)?;
+    let p3 = eval_int_cmp_bool(effective_op, k3, cval, ty)?;
+
+    // Unconditional reduction when both arms of the inner select compare identically.
+    if p2 == p3 {
+        let (tb, fb) = if inner_on_false { (p1, p2) } else { (p2, p1) };
+        return fold_bool_select_arms(dest, c1, tb, fb, is_boolean, cmp_defs, def_counts);
+    }
+
+    // Trichotomy truth-table reduction when c1 and c2 compare the same integer operands.
+    let c2 = peel_bool_cond(sdef2.cond, cast_defs, is_boolean, cmp_defs, def_counts);
+    let (Operand::Value(cv1), Operand::Value(cv2)) = (c1, c2) else {
+        return None;
+    };
+    let (idx1, idx2) = (cv1.0 as usize, cv2.0 as usize);
+    if def_counts.get(idx1).copied() != Some(1) || def_counts.get(idx2).copied() != Some(1) {
+        return None;
+    }
+    let ic1 = (*cmp_defs.get(idx1)?)?;
+    let ic2 = (*cmp_defs.get(idx2)?)?;
+    if !ic1.ty.is_integer() || ic1.ty != ic2.ty {
+        return None;
+    }
+    let op2_norm = if same_operand(&ic1.lhs, &ic2.lhs) && same_operand(&ic1.rhs, &ic2.rhs) {
+        ic2.op
+    } else if same_operand(&ic1.lhs, &ic2.rhs) && same_operand(&ic1.rhs, &ic2.lhs) {
+        swap_cmp_op(ic2.op)
+    } else {
+        return None;
+    };
+    let is_unsigned_rel =
+        |o: IrCmpOp| matches!(o, IrCmpOp::Ult | IrCmpOp::Ule | IrCmpOp::Ugt | IrCmpOp::Uge);
+    let is_signed_rel =
+        |o: IrCmpOp| matches!(o, IrCmpOp::Slt | IrCmpOp::Sle | IrCmpOp::Sgt | IrCmpOp::Sge);
+    if (is_unsigned_rel(ic1.op) && is_signed_rel(op2_norm))
+        || (is_signed_rel(ic1.op) && is_unsigned_rel(op2_norm))
+    {
+        return None;
+    }
+    let use_unsigned = is_unsigned_rel(ic1.op) || is_unsigned_rel(op2_norm);
+    let m1 = int_cmp_trichotomy_mask(ic1.op);
+    let m2 = int_cmp_trichotomy_mask(op2_norm);
+    let mut result_mask = 0u8;
+    for s_bit in [1u8, 2u8, 4u8] {
+        let b1 = (m1 & s_bit) != 0;
+        let b2 = (m2 & s_bit) != 0;
+        let inner_p = if b2 { p2 } else { p3 };
+        let outer_p = if inner_on_false {
+            if b1 { p1 } else { inner_p }
+        } else if b1 {
+            inner_p
+        } else {
+            p1
+        };
+        if outer_p {
+            result_mask |= s_bit;
+        }
+    }
+    match result_mask {
+        0b000 => Some(Instruction::Copy {
+            dest,
+            src: Operand::Const(IrConst::I8(0)),
+        }),
+        0b111 => Some(Instruction::Copy {
+            dest,
+            src: Operand::Const(IrConst::I8(1)),
+        }),
+        _ => {
+            let merged_op = int_cmp_from_trichotomy_mask(result_mask, use_unsigned)?;
+            if merged_op == ic1.op {
+                Some(Instruction::Copy {
+                    dest,
+                    src: Operand::Value(cv1),
+                })
+            } else if same_operand(&ic1.lhs, &ic2.lhs)
+                && same_operand(&ic1.rhs, &ic2.rhs)
+                && merged_op == ic2.op
+            {
+                Some(Instruction::Copy {
+                    dest,
+                    src: Operand::Value(cv2),
+                })
+            } else {
+                Some(Instruction::Cmp {
+                    dest,
+                    op: merged_op,
+                    lhs: ic1.lhs,
+                    rhs: ic1.rhs,
+                    ty: ic1.ty,
+                })
+            }
+        }
+    }
 }
 
 /// Fold a guard around the *safe* portable CLZ, not a speculated bare
@@ -4990,6 +5523,51 @@ mod tests {
         assert_copy_value(&result, 1);
     }
 
+    #[test]
+    fn select_constant_cast_walk_is_bounded_and_folds_valid_chains() {
+        let mut const_defs = vec![None; 10];
+        const_defs[0] = Some(IrConst::I32(7));
+        let mut cast_defs = vec![None; 10];
+        let mut def_counts = vec![1; 10];
+        for i in 1..=9 {
+            cast_defs[i] = Some(CastDef {
+                src: Operand::Value(Value((i - 1) as u32)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I32,
+            });
+        }
+        // Eight casts are within the analysis budget; a longer chain fails
+        // closed rather than recursing without a bound.
+        assert_eq!(
+            resolve_select_const(
+                Operand::Value(Value(8)),
+                &const_defs,
+                &cast_defs,
+                &def_counts,
+            ),
+            Some(IrConst::I32(7))
+        );
+        assert_eq!(
+            resolve_select_const(
+                Operand::Value(Value(9)),
+                &const_defs,
+                &cast_defs,
+                &def_counts,
+            ),
+            None
+        );
+        def_counts[1] = 2;
+        assert_eq!(
+            resolve_select_const(
+                Operand::Value(Value(1)),
+                &const_defs,
+                &cast_defs,
+                &def_counts,
+            ),
+            None
+        );
+    }
+
     // === Constant reassociation tests ===
 
     #[test]
@@ -6574,5 +7152,146 @@ mod exact_product_half_tests {
             }
         }
         assert_ne!(-1i64 / 2, -1i64 >> 1); // odd negative near-miss
+    }
+
+    #[test]
+    fn three_way_comparator_select_tree_folds_to_single_cmp() {
+        use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Terminator};
+
+        for (cmp_ty, lt_op, gt_op, outer_op, expected_op) in [
+            (
+                IrType::U64,
+                IrCmpOp::Ult,
+                IrCmpOp::Ugt,
+                IrCmpOp::Sle,
+                IrCmpOp::Ule,
+            ),
+            (
+                IrType::U64,
+                IrCmpOp::Ult,
+                IrCmpOp::Ugt,
+                IrCmpOp::Slt,
+                IrCmpOp::Ult,
+            ),
+            (
+                IrType::U64,
+                IrCmpOp::Ult,
+                IrCmpOp::Ugt,
+                IrCmpOp::Sgt,
+                IrCmpOp::Ugt,
+            ),
+            (
+                IrType::U64,
+                IrCmpOp::Ult,
+                IrCmpOp::Ugt,
+                IrCmpOp::Eq,
+                IrCmpOp::Eq,
+            ),
+            (
+                IrType::I64,
+                IrCmpOp::Slt,
+                IrCmpOp::Sgt,
+                IrCmpOp::Sle,
+                IrCmpOp::Sle,
+            ),
+            (
+                IrType::I64,
+                IrCmpOp::Slt,
+                IrCmpOp::Sgt,
+                IrCmpOp::Sge,
+                IrCmpOp::Sge,
+            ),
+        ] {
+            let mut func = IrFunction::new("cmp3".to_string(), IrType::I32, vec![], false);
+            func.blocks.push(BasicBlock {
+                label: BlockId(0),
+                instructions: vec![
+                    Instruction::ParamRef {
+                        dest: Value(0),
+                        param_idx: 0,
+                        ty: cmp_ty,
+                    },
+                    Instruction::ParamRef {
+                        dest: Value(1),
+                        param_idx: 1,
+                        ty: cmp_ty,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(2),
+                        op: lt_op,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Value(Value(1)),
+                        ty: cmp_ty,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(3),
+                        op: gt_op,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Value(Value(1)),
+                        ty: cmp_ty,
+                    },
+                    Instruction::Select {
+                        dest: Value(4),
+                        cond: Operand::Value(Value(3)),
+                        true_val: Operand::Const(IrConst::I32(1)),
+                        false_val: Operand::Const(IrConst::I32(0)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Select {
+                        dest: Value(5),
+                        cond: Operand::Value(Value(2)),
+                        true_val: Operand::Const(IrConst::I32(-1)),
+                        false_val: Operand::Value(Value(4)),
+                        ty: IrType::I32,
+                    },
+                    Instruction::Cmp {
+                        dest: Value(6),
+                        op: outer_op,
+                        lhs: Operand::Value(Value(5)),
+                        rhs: Operand::Const(IrConst::I32(0)),
+                        ty: IrType::I32,
+                    },
+                ],
+                terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
+                source_spans: Vec::new(),
+            });
+            func.next_value_id = 7;
+
+            assert!(simplify_function(&mut func) > 0);
+            let last = func.blocks[0].instructions.last().unwrap();
+            match last {
+                Instruction::Cmp {
+                    dest: Value(6),
+                    op,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Value(Value(1)),
+                    ty,
+                } => {
+                    assert_eq!(*op, expected_op);
+                    assert_eq!(*ty, cmp_ty);
+                }
+                Instruction::Copy {
+                    dest: Value(6),
+                    src: Operand::Value(src),
+                } => {
+                    let def = func.blocks[0]
+                        .instructions
+                        .iter()
+                        .find(|i| i.dest() == Some(*src))
+                        .unwrap();
+                    assert!(matches!(
+                        def,
+                        Instruction::Cmp {
+                            op,
+                            lhs: Operand::Value(Value(0)),
+                            rhs: Operand::Value(Value(1)),
+                            ty,
+                            ..
+                        } if *op == expected_op && *ty == cmp_ty
+                    ));
+                }
+                other => panic!("unexpected folded instruction: {other:?}"),
+            }
+        }
     }
 }

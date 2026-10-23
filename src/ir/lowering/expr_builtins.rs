@@ -1341,6 +1341,11 @@ impl Lowerer {
             | BuiltinIntrinsic::X86XorPs
             | BuiltinIntrinsic::X86AndPs
             | BuiltinIntrinsic::X86OrPs
+            | BuiltinIntrinsic::X86AndnPs
+            | BuiltinIntrinsic::X86XorPd
+            | BuiltinIntrinsic::X86AndPd
+            | BuiltinIntrinsic::X86OrPd
+            | BuiltinIntrinsic::X86AndnPd
             | BuiltinIntrinsic::X86AddPs
             | BuiltinIntrinsic::X86SubPs
             | BuiltinIntrinsic::X86MulPs
@@ -3334,12 +3339,15 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Por128 => IntrinsicOp::Por128,
         BuiltinIntrinsic::X86Pand128 => IntrinsicOp::Pand128,
         BuiltinIntrinsic::X86Pxor128 => IntrinsicOp::Pxor128,
-        // Float SSE ops map to the equivalent bitwise/arithmetic 128-bit ops.
-        // xorps/andps/orps are pure bitwise: pxor/pand/por is identical.
-        // addps/subps/mulps are true float ops.
-        BuiltinIntrinsic::X86XorPs => IntrinsicOp::Pxor128,
-        BuiltinIntrinsic::X86AndPs => IntrinsicOp::Pand128,
-        BuiltinIntrinsic::X86OrPs => IntrinsicOp::Por128,
+        // SSE float mappings: logical forms match pand/por/pxor bit-for-bit; add/sub/mul stay FP.
+        BuiltinIntrinsic::X86XorPs => IntrinsicOp::XorPs128,
+        BuiltinIntrinsic::X86AndPs => IntrinsicOp::AndPs128,
+        BuiltinIntrinsic::X86OrPs => IntrinsicOp::OrPs128,
+        BuiltinIntrinsic::X86AndnPs => IntrinsicOp::AndnPs128,
+        BuiltinIntrinsic::X86XorPd => IntrinsicOp::XorPd128,
+        BuiltinIntrinsic::X86AndPd => IntrinsicOp::AndPd128,
+        BuiltinIntrinsic::X86OrPd => IntrinsicOp::OrPd128,
+        BuiltinIntrinsic::X86AndnPd => IntrinsicOp::AndnPd128,
         BuiltinIntrinsic::X86AddPs => IntrinsicOp::AddPs128,
         BuiltinIntrinsic::X86SubPs => IntrinsicOp::SubPs128,
         BuiltinIntrinsic::X86MulPs => IntrinsicOp::MulPs128,
@@ -3417,8 +3425,7 @@ fn x86_intrinsic_op(intrinsic: &BuiltinIntrinsic) -> IntrinsicOp {
         BuiltinIntrinsic::X86Crc32_16 => IntrinsicOp::Crc32_16,
         BuiltinIntrinsic::X86Crc32_32 => IntrinsicOp::Crc32_32,
         BuiltinIntrinsic::X86Crc32_64 => IntrinsicOp::Crc32_64,
-        // SSE4.1 insert/extract
-        BuiltinIntrinsic::X86Pinsrd128 => IntrinsicOp::Pinsrd128,
+        BuiltinIntrinsic::X86Pinsrd128 => IntrinsicOp::Pinsrd128, // SSE4.1 insert/extract
         BuiltinIntrinsic::X86Pextrd128 => IntrinsicOp::Pextrd128,
         BuiltinIntrinsic::X86Pinsrb128 => IntrinsicOp::Pinsrb128,
         BuiltinIntrinsic::X86Pextrb128 => IntrinsicOp::Pextrb128,

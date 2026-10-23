@@ -609,7 +609,7 @@ pub(super) fn next_insn(store: &LineStore, infos: &[LineInfo], mut j: usize, len
     j
 }
 
-/// Try the adjacent commuted form `mov MEM, %T; OP %S, %T` by writing the
+/// Try the adjacent commuted form `mov MEM, %T; ...; OP %S, %T` by writing the
 /// product into `%S` and safely renaming its live range from `%T`.
 fn try_fuse_commuted_adjacent_load(
     store: &mut LineStore,
@@ -624,15 +624,11 @@ fn try_fuse_commuted_adjacent_load(
     scratch: RegId,
     source: RegId,
     dest: RegId,
-    gap: usize,
+    _gap: usize,
 ) -> Option<usize> {
-    // This is legal only for an adjacent, same-width commutative RMW whose
-    // old source value dies there. The result-family rename is fail-closed:
-    // it rejects stale reads, unsafe writes, barriers, and high-byte aliases.
     if op_q != load_q
         || dest != scratch
         || source == scratch
-        || gap != 0
         || source == 4
         || dest == 4
         || !COMMUTATIVE_OPS.contains(&op)
@@ -649,6 +645,235 @@ fn try_fuse_commuted_adjacent_load(
     );
     mark_nop(&mut infos[load_idx]);
     replace_line(store, &mut infos[consumer_idx], consumer_idx, new_line);
+    lv.refresh_span(store, infos, load_idx, span_end);
+    Some(span_end)
+}
+
+/// Parse 3-operand BMI1 `andn{l,q} %src2, %src1, %dst` -> `(is_64bit, src2_rm_fam, src1_fam, dst_fam)`.
+fn parse_andn_reg_reg_reg(trimmed: &str) -> Option<(bool, RegId, RegId, RegId)> {
+    let (is_q, rest) = if let Some(r) = trimmed.strip_prefix("andnq ") {
+        (true, r)
+    } else if let Some(r) = trimmed.strip_prefix("andnl ") {
+        (false, r)
+    } else {
+        return None;
+    };
+    let mut parts = rest.split(',');
+    let op1 = parts.next()?.trim();
+    let op2 = parts.next()?.trim();
+    let op3 = parts.next()?.trim();
+    if parts.next().is_some() {
+        return None;
+    }
+    let r1 = plain_gp_operand(op1)?;
+    let r2 = plain_gp_operand(op2)?;
+    let r3 = plain_gp_operand(op3)?;
+    let width = if is_q { 0 } else { 1 };
+    if op1 != REG_NAMES[width][r1 as usize]
+        || op2 != REG_NAMES[width][r2 as usize]
+        || op3 != REG_NAMES[width][r3 as usize]
+    {
+        return None;
+    }
+    Some((is_q, r1, r2, r3))
+}
+
+/// Fuse `mov MEM1, %T; mov MEM2, %S; <unary %S>+; [mov %T, %D;] OP %S, %D`
+/// (or BMI1 `mov MEM1, %T; mov MEM2, %S; andn %T, %S, %D`) into a memory-operand
+/// ALU instruction when `%T` / `%S` die there.
+fn try_fuse_commuted_unary_load_pair(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+    lv: &mut FileLiveness,
+    load_idx: usize,
+    k0: usize,
+    len: usize,
+    mem: &str,
+    load_q: bool,
+    t_fam: RegId,
+) -> Option<usize> {
+    if t_fam == 4
+        || super::relay_and_lea::segment_prefix_len(mem).is_some()
+        || memory_operand_families(mem) & (1u16 << t_fam) != 0
+    {
+        return None;
+    }
+    if k0 >= len || infos[k0].pinned || infos[k0].volatile_access || !is_window_kind(infos[k0].kind)
+    {
+        return None;
+    }
+    let k0_text = infos[k0].trimmed(store.get(k0)).to_string();
+    let (ld2_q, mem2, s_fam) = parse_memory_load(&k0_text)?;
+    if ld2_q != load_q
+        || s_fam == t_fam
+        || s_fam == 4
+        || super::relay_and_lea::segment_prefix_len(mem2).is_some()
+        || (!k0_text.starts_with("movq ") && !k0_text.starts_with("movl "))
+        || memory_operand_families(mem) & (1u16 << s_fam) != 0
+        || memory_operand_families(mem2) & ((1u16 << s_fam) | (1u16 << t_fam)) != 0
+    {
+        return None;
+    }
+    let width = if load_q { 0usize } else { 1usize };
+    let suffix = if load_q { "q" } else { "l" };
+    let mut unary_indices: Vec<(usize, String)> = Vec::new();
+    let mut k = next_insn(store, infos, k0 + 1, len);
+    while k < len && unary_indices.len() < MAX_GAP {
+        if infos[k].pinned || infos[k].volatile_access || !is_window_kind(infos[k].kind) {
+            return None;
+        }
+        let tk = infos[k].trimmed(store.get(k));
+        if let Some((u_q, u_dst, _, true)) = parse_inplace_op(tk) {
+            if u_q != load_q || u_dst != s_fam {
+                return None;
+            }
+            let u_mn = tk.split_whitespace().next()?;
+            unary_indices.push((k, u_mn.to_string()));
+            k = next_insn(store, infos, k + 1, len);
+            continue;
+        }
+        break;
+    }
+    if k >= len || infos[k].pinned || infos[k].volatile_access {
+        return None;
+    }
+    if unary_indices.is_empty() {
+        let cons_text = infos[k].trimmed(store.get(k)).to_string();
+        let (andn_q, rm_fam, vvvv_fam, dst_fam) = parse_andn_reg_reg_reg(&cons_text)?;
+        if andn_q != load_q
+            || rm_fam != t_fam
+            || vvvv_fam != s_fam
+            || dst_fam == 4
+            || (dst_fam != t_fam && lv.live_after(k, t_fam) != Some(false))
+        {
+            return None;
+        }
+        let mut trail_copy_idx: Option<usize> = None;
+        let mut out_fam = dst_fam;
+        let mut scan = next_insn(store, infos, k + 1, len);
+        let mut steps = 0usize;
+        let mut intervening_refs: u16 = 0;
+        while scan < len && steps < 2 {
+            if infos[scan].pinned
+                || infos[scan].volatile_access
+                || !is_window_kind(infos[scan].kind)
+            {
+                break;
+            }
+            let st = infos[scan].trimmed(store.get(scan));
+            if let Some((tc_q, tc_src, tc_dst)) = parse_reg_copy(st) {
+                if tc_q == load_q
+                    && tc_src == dst_fam
+                    && tc_dst != dst_fam
+                    && tc_dst != 4
+                    && (intervening_refs & (1u16 << tc_dst)) == 0
+                    && lv.live_after(scan, dst_fam) == Some(false)
+                {
+                    trail_copy_idx = Some(scan);
+                    out_fam = tc_dst;
+                }
+                break;
+            }
+            if infos[scan].reg_refs & (1u16 << dst_fam) != 0 {
+                break;
+            }
+            intervening_refs |= infos[scan].reg_refs;
+            scan = next_insn(store, infos, scan + 1, len);
+            steps += 1;
+        }
+        let s_reg = REG_NAMES[width][s_fam as usize];
+        let out_reg = REG_NAMES[width][out_fam as usize];
+        let cons_new = format!("    andn{suffix} {mem}, {s_reg}, {out_reg}");
+        mark_nop(&mut infos[load_idx]);
+        if let Some(ti) = trail_copy_idx {
+            mark_nop(&mut infos[ti]);
+        }
+        replace_line(store, &mut infos[k], k, cons_new);
+        let span_end = trail_copy_idx.unwrap_or(k);
+        lv.refresh_span(store, infos, load_idx, span_end);
+        return Some(span_end);
+    }
+    // Optional copy `mov{l,q} %T, %D` right before `OP %S, %D`.
+    let mut opt_copy_idx: Option<usize> = None;
+    let mut d_fam = t_fam;
+    if let Some((cp_q, cp_src, cp_dst)) = parse_reg_copy(infos[k].trimmed(store.get(k))) {
+        if cp_q == load_q
+            && cp_src == t_fam
+            && cp_dst != t_fam
+            && cp_dst != s_fam
+            && cp_dst != 4
+            && memory_operand_families(mem) & (1u16 << cp_dst) == 0
+            && memory_operand_families(mem2) & (1u16 << cp_dst) == 0
+            && lv.live_after(k, t_fam) == Some(false)
+        {
+            opt_copy_idx = Some(k);
+            d_fam = cp_dst;
+            k = next_insn(store, infos, k + 1, len);
+            if k >= len || infos[k].pinned || infos[k].volatile_access {
+                return None;
+            }
+        }
+    }
+    let cons_text = infos[k].trimmed(store.get(k)).to_string();
+    let (op, op_q, src, dst) = parse_reg_reg_alu(&cons_text)?;
+    if op_q != load_q || src != s_fam || dst != d_fam || !COMMUTATIVE_OPS.contains(&op) {
+        return None;
+    }
+    // Check for an optional trailing copy `mov{l,q} %D, %R` within a couple of
+    // non-interfering instructions after `OP %S, %D` where `%D` dies at the copy
+    // (e.g. `andq %r10, %rbx; leaq 1(%r11), %r12; movq %rbx, %r10`).
+    let mut trail_copy_idx: Option<usize> = None;
+    let mut out_fam = d_fam;
+    let mut scan = next_insn(store, infos, k + 1, len);
+    let mut steps = 0usize;
+    let mut intervening_refs: u16 = 0;
+    while scan < len && steps < 2 {
+        if infos[scan].pinned || infos[scan].volatile_access || !is_window_kind(infos[scan].kind) {
+            break;
+        }
+        let st = infos[scan].trimmed(store.get(scan));
+        if let Some((tc_q, tc_src, tc_dst)) = parse_reg_copy(st) {
+            if tc_q == load_q
+                && tc_src == d_fam
+                && tc_dst != d_fam
+                && tc_dst != 4
+                && (intervening_refs & (1u16 << tc_dst)) == 0
+                && memory_operand_families(mem) & (1u16 << tc_dst) == 0
+                && memory_operand_families(mem2) & (1u16 << tc_dst) == 0
+                && lv.live_after(scan, d_fam) == Some(false)
+                && (tc_dst == s_fam || lv.live_after(k, s_fam) == Some(false))
+            {
+                trail_copy_idx = Some(scan);
+                out_fam = tc_dst;
+            }
+            break;
+        }
+        if infos[scan].reg_refs & ((1u16 << d_fam) | (1u16 << s_fam)) != 0 {
+            break;
+        }
+        intervening_refs |= infos[scan].reg_refs;
+        scan = next_insn(store, infos, scan + 1, len);
+        steps += 1;
+    }
+    if trail_copy_idx.is_none() && lv.live_after(k, s_fam) != Some(false) {
+        return None;
+    }
+    let out_reg = REG_NAMES[width][out_fam as usize];
+    let k0_new = format!("    mov{suffix} {mem2}, {out_reg}");
+    let cons_new = format!("    {op}{suffix} {mem}, {out_reg}");
+    mark_nop(&mut infos[load_idx]);
+    if let Some(ci) = opt_copy_idx {
+        mark_nop(&mut infos[ci]);
+    }
+    if let Some(ti) = trail_copy_idx {
+        mark_nop(&mut infos[ti]);
+    }
+    replace_line(store, &mut infos[k0], k0, k0_new);
+    for (uk, u_mn) in unary_indices {
+        replace_line(store, &mut infos[uk], uk, format!("    {u_mn} {out_reg}"));
+    }
+    replace_line(store, &mut infos[k], k, cons_new);
+    let span_end = trail_copy_idx.unwrap_or(k);
     lv.refresh_span(store, infos, load_idx, span_end);
     Some(span_end)
 }
@@ -752,6 +977,15 @@ pub(super) fn fuse_load_into_alu(store: &mut LineStore, infos: &mut [LineInfo]) 
             j = next_insn(store, infos, j + 1, len);
         }
         let Some(j) = consumer else {
+            if !load_volatile && gap == 0 {
+                if let Some(span_end) = try_fuse_commuted_unary_load_pair(
+                    store, infos, &mut lv, i, j, len, mem, load_q, t_fam,
+                ) {
+                    changed = true;
+                    i = span_end + 1;
+                    continue;
+                }
+            }
             i += 1;
             continue;
         };
@@ -2809,6 +3043,18 @@ mod tests {
         );
         let out = body(&run(&asm, fuse_load_into_alu));
         assert!(has(&out, "movl (%rdi), %ecx"), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_commuted_unary_load_pair_in_place() {
+        let asm = format!(
+            "{PRO}    movq (%rdi, %r11, 8), %r10\n    movq (%rsi, %r11, 8), %rcx\n    notq %rcx\n    andq %rcx, %r10\n    movq %r10, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%rsi, %r11, 8), %rax"), "{out:?}");
+        assert!(has(&out, "notq %rax"), "{out:?}");
+        assert!(has(&out, "andq (%rdi, %r11, 8), %rax"), "{out:?}");
+        assert!(!out.iter().any(|l| l.contains("%rcx")), "{out:?}");
     }
 
     #[test]

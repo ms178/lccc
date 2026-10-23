@@ -493,11 +493,16 @@ impl LiveRange {
                 // later) keeps its value in this register across the hole
                 // and must not be clobbered.
                 if ea == sb {
-                    if !self.last_use_is_at(ea) {
+                    // A handoff is valid only at the dying owner's global
+                    // death and the arriving owner's global birth. At an
+                    // internal hole boundary, keep the register reserved:
+                    // SharerLiveIndex must not evict a value that becomes
+                    // live again after the hole.
+                    if ai + 1 != a.len() || bi != 0 || !self.last_use_is_at(ea) {
                         return true;
                     }
                 } else if eb == sa {
-                    if !other.last_use_is_at(eb) {
+                    if bi + 1 != b.len() || ai != 0 || !other.last_use_is_at(eb) {
                         return true;
                     }
                 } else {

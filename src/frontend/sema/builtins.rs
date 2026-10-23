@@ -67,6 +67,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("__builtin_log", BuiltinInfo::simple("log"));
     m.insert("__builtin_logf", BuiltinInfo::simple("logf"));
     m.insert("__builtin_log2", BuiltinInfo::simple("log2"));
+    m.insert("__builtin_log2f", BuiltinInfo::simple("log2f"));
     m.insert("__builtin_exp", BuiltinInfo::simple("exp"));
     m.insert("__builtin_expf", BuiltinInfo::simple("expf"));
     m.insert("__builtin_pow", BuiltinInfo::simple("pow"));
@@ -85,6 +86,20 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     m.insert("__builtin_roundevenf", BuiltinInfo::simple("roundevenf"));
     m.insert("__builtin_round", BuiltinInfo::simple("round"));
     m.insert("__builtin_roundf", BuiltinInfo::simple("roundf"));
+    // The float variants of every mapped double builtin are part of the same
+    // contract: GCC accepts `__builtin_<fn>f` wherever it accepts
+    // `__builtin_<fn>`, so a program written against GCC may name the `f`
+    // spelling in a translation unit that never included <math.h>. When the
+    // spelling is absent from this table the identifier is an *implicit
+    // function declaration*, which lccc emits as a call to the literal symbol
+    // `__builtin_fmaxf` -- an unresolved symbol at link time, with only a
+    // warning to explain it. Audited against GCC 16.2 (`scripts/
+    // check_builtin_float_aliases.py` derives the class and proves it is
+    // empty): fmaxf, fminf and log2f were the only three gaps, which is exactly
+    // the drift this comment exists to prevent -- the long-double variants
+    // (fmaxl, fminl) had been added without their float siblings.
+    m.insert("__builtin_fminf", BuiltinInfo::simple("fminf"));
+    m.insert("__builtin_fmaxf", BuiltinInfo::simple("fmaxf"));
     m.insert("__builtin_fmin", BuiltinInfo::simple("fmin"));
     m.insert("__builtin_fmax", BuiltinInfo::simple("fmax"));
     m.insert("__builtin_copysign", BuiltinInfo::simple("copysign"));
@@ -1121,7 +1136,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     );
     m.insert(
         "_mm_xor_pd",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86XorPs),
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86XorPd),
     );
     m.insert(
         "_mm_and_ps",
@@ -1129,7 +1144,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     );
     m.insert(
         "_mm_and_pd",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AndPs),
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AndPd),
     );
     m.insert(
         "_mm_or_ps",
@@ -1137,7 +1152,7 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     );
     m.insert(
         "_mm_or_pd",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86OrPs),
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86OrPd),
     );
     m.insert(
         "_mm_add_ps",
@@ -2619,11 +2634,11 @@ static BUILTIN_MAP: LazyLock<FxHashMap<&'static str, BuiltinInfo>> = LazyLock::n
     );
     m.insert(
         "_mm_andnot_ps",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn128),
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AndnPs),
     );
     m.insert(
         "_mm_andnot_pd",
-        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86Pandn128),
+        BuiltinInfo::intrinsic(BuiltinIntrinsic::X86AndnPd),
     );
     m.insert(
         "_mm_cmpeq_epi16",
@@ -3260,6 +3275,11 @@ pub enum BuiltinIntrinsic {
     X86XorPs,
     X86AndPs,
     X86OrPs,
+    X86AndnPs,
+    X86XorPd,
+    X86AndPd,
+    X86OrPd,
+    X86AndnPd,
     X86AddPs,
     X86SubPs,
     X86MulPs,

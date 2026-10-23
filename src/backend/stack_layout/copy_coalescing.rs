@@ -1764,6 +1764,33 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::AddPd128
             | O::SubPd128
             | O::MulPd128
+            | O::AndPs128
+            | O::AndnPs128
+            | O::OrPs128
+            | O::XorPs128
+            | O::AndPd128
+            | O::AndnPd128
+            | O::OrPd128
+            | O::XorPd128
+            | O::DivPs128
+            | O::MinPs128
+            | O::MaxPs128
+            | O::DivPd128
+            | O::MinPd128
+            | O::MaxPd128
+            | O::AddSs128
+            | O::SubSs128
+            | O::MulSs128
+            | O::DivSs128
+            | O::MinSs128
+            | O::MaxSs128
+            | O::AddSd128
+            | O::SubSd128
+            | O::MulSd128
+            | O::DivSd128
+            | O::MinSd128
+            | O::MaxSd128
+            | O::SqrtSd128
             | O::Paddw128
             | O::Psubw128
             | O::Pmulhw128
@@ -1793,6 +1820,36 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::Punpckhbw128
             | O::Punpcklwd128
             | O::Punpckhwd128
+            | O::Punpckldq128
+            | O::Punpckhdq128
+            | O::Punpcklqdq128
+            | O::Punpckhqdq128
+            | O::Pavgb128
+            | O::Pavgw128
+            | O::Pmaxsw128
+            | O::Pminsw128
+            | O::Paddsb128
+            | O::Paddsw128
+            | O::Paddusb128
+            | O::Paddusw128
+            | O::Psubsw128
+            | O::Pandn128
+            | O::Pcmpeqw128
+            | O::Pcmpgtd128
+            | O::Paddq128
+            | O::Psubq128
+            | O::HaddPs128
+            | O::HsubPs128
+            | O::AddsubPs128
+            | O::HaddPd128
+            | O::HsubPd128
+            | O::AddsubPd128
+            | O::UnpcklPs128
+            | O::UnpckhPs128
+            | O::UnpcklPd128
+            | O::UnpckhPd128
+            | O::CvtSs2Sd128
+            | O::CvtSd2Ss128
             | O::Aesenc128
             | O::Aesenclast128
             | O::Aesdec128

@@ -712,6 +712,27 @@ impl I686Codegen {
             | IntrinsicOp::AddPd128
             | IntrinsicOp::SubPd128
             | IntrinsicOp::MulPd128
+            | IntrinsicOp::AndPs128
+            | IntrinsicOp::AndnPs128
+            | IntrinsicOp::OrPs128
+            | IntrinsicOp::XorPs128
+            | IntrinsicOp::AndPd128
+            | IntrinsicOp::AndnPd128
+            | IntrinsicOp::OrPd128
+            | IntrinsicOp::XorPd128
+            | IntrinsicOp::AddSs128
+            | IntrinsicOp::SubSs128
+            | IntrinsicOp::MulSs128
+            | IntrinsicOp::DivSs128
+            | IntrinsicOp::MinSs128
+            | IntrinsicOp::MaxSs128
+            | IntrinsicOp::AddSd128
+            | IntrinsicOp::SubSd128
+            | IntrinsicOp::MulSd128
+            | IntrinsicOp::DivSd128
+            | IntrinsicOp::MinSd128
+            | IntrinsicOp::MaxSd128
+            | IntrinsicOp::SqrtSd128
             | IntrinsicOp::DivPs128
             | IntrinsicOp::DivPd128
             | IntrinsicOp::MinPs128
@@ -731,20 +752,7 @@ impl I686Codegen {
             | IntrinsicOp::Movss128
             | IntrinsicOp::Movsd128
             | IntrinsicOp::CvtSs2Sd128
-            | IntrinsicOp::CvtSd2Ss128
-            | IntrinsicOp::AddSd128
-            | IntrinsicOp::SubSd128
-            | IntrinsicOp::MulSd128
-            | IntrinsicOp::DivSd128
-            | IntrinsicOp::MinSd128
-            | IntrinsicOp::MaxSd128
-            | IntrinsicOp::SqrtSd128
-            | IntrinsicOp::AddSs128
-            | IntrinsicOp::SubSs128
-            | IntrinsicOp::MulSs128
-            | IntrinsicOp::DivSs128
-            | IntrinsicOp::MinSs128
-            | IntrinsicOp::MaxSs128 => {
+            | IntrinsicOp::CvtSd2Ss128 => {
                 if let Some(dptr) = dest_ptr {
                     let inst = match op {
                         IntrinsicOp::AddPs128 => "addps",
@@ -753,6 +761,27 @@ impl I686Codegen {
                         IntrinsicOp::AddPd128 => "addpd",
                         IntrinsicOp::SubPd128 => "subpd",
                         IntrinsicOp::MulPd128 => "mulpd",
+                        IntrinsicOp::AndPs128 => "andps",
+                        IntrinsicOp::AndnPs128 => "andnps",
+                        IntrinsicOp::OrPs128 => "orps",
+                        IntrinsicOp::XorPs128 => "xorps",
+                        IntrinsicOp::AndPd128 => "andpd",
+                        IntrinsicOp::AndnPd128 => "andnpd",
+                        IntrinsicOp::OrPd128 => "orpd",
+                        IntrinsicOp::XorPd128 => "xorpd",
+                        IntrinsicOp::AddSs128 => "addss",
+                        IntrinsicOp::SubSs128 => "subss",
+                        IntrinsicOp::MulSs128 => "mulss",
+                        IntrinsicOp::DivSs128 => "divss",
+                        IntrinsicOp::MinSs128 => "minss",
+                        IntrinsicOp::MaxSs128 => "maxss",
+                        IntrinsicOp::AddSd128 => "addsd",
+                        IntrinsicOp::SubSd128 => "subsd",
+                        IntrinsicOp::MulSd128 => "mulsd",
+                        IntrinsicOp::DivSd128 => "divsd",
+                        IntrinsicOp::MinSd128 => "minsd",
+                        IntrinsicOp::MaxSd128 => "maxsd",
+                        IntrinsicOp::SqrtSd128 => "sqrtsd",
                         IntrinsicOp::DivPs128 => "divps",
                         IntrinsicOp::DivPd128 => "divpd",
                         IntrinsicOp::MinPs128 => "minps",
@@ -773,19 +802,6 @@ impl I686Codegen {
                         IntrinsicOp::Movsd128 => "movsd",
                         IntrinsicOp::CvtSs2Sd128 => "cvtss2sd",
                         IntrinsicOp::CvtSd2Ss128 => "cvtsd2ss",
-                        IntrinsicOp::AddSd128 => "addsd",
-                        IntrinsicOp::SubSd128 => "subsd",
-                        IntrinsicOp::MulSd128 => "mulsd",
-                        IntrinsicOp::DivSd128 => "divsd",
-                        IntrinsicOp::MinSd128 => "minsd",
-                        IntrinsicOp::MaxSd128 => "maxsd",
-                        IntrinsicOp::SqrtSd128 => "sqrtsd",
-                        IntrinsicOp::AddSs128 => "addss",
-                        IntrinsicOp::SubSs128 => "subss",
-                        IntrinsicOp::MulSs128 => "mulss",
-                        IntrinsicOp::DivSs128 => "divss",
-                        IntrinsicOp::MinSs128 => "minss",
-                        IntrinsicOp::MaxSs128 => "maxss",
                         _ => unreachable!("unexpected SSE float binary op: {:?}", op),
                     };
                     self.emit_sse_binary_128(dptr, args, inst);
@@ -915,6 +931,9 @@ impl I686Codegen {
             | IntrinsicOp::SqrtPd128
             | IntrinsicOp::RcpPs128
             | IntrinsicOp::RsqrtPs128
+            | IntrinsicOp::SqrtSs128
+            | IntrinsicOp::RcpSs128
+            | IntrinsicOp::RsqrtSs128
             | IntrinsicOp::Movddup128
             | IntrinsicOp::Movsldup128
             | IntrinsicOp::Movshdup128
@@ -932,6 +951,9 @@ impl I686Codegen {
                         IntrinsicOp::SqrtPd128 => "sqrtpd",
                         IntrinsicOp::RcpPs128 => "rcpps",
                         IntrinsicOp::RsqrtPs128 => "rsqrtps",
+                        IntrinsicOp::SqrtSs128 => "sqrtss",
+                        IntrinsicOp::RcpSs128 => "rcpss",
+                        IntrinsicOp::RsqrtSs128 => "rsqrtss",
                         IntrinsicOp::Movddup128 => "movddup",
                         IntrinsicOp::Movsldup128 => "movsldup",
                         IntrinsicOp::Movshdup128 => "movshdup",
@@ -1100,8 +1122,7 @@ impl I686Codegen {
                     IntrinsicOp::CvtSs2Si128 => "cvtss2si",
                     IntrinsicOp::CvtSd2Si128 => "cvtsd2si",
                     IntrinsicOp::CvttSs2Si128 => "cvttss2si",
-                    IntrinsicOp::CvttSd2Si128 => "cvttsd2si",
-                    _ => unreachable!(),
+                    _ => "cvttsd2si",
                 };
                 self.operand_to_eax(&args[0]);
                 self.state.emit("    movdqu (%eax), %xmm0");

@@ -135,7 +135,8 @@ pub(super) fn function_makes_calls(func: &IrFunction) -> bool {
             Instruction::AtomicLoad { ty, .. }
             | Instruction::AtomicStore { ty, .. }
             | Instruction::AtomicRmw { ty, .. }
-            | Instruction::AtomicCmpxchg { ty, .. } => {
+            | Instruction::AtomicCmpxchg { ty, .. }
+            | Instruction::AtomicInc { ty, .. } => {
                 matches!(
                     ty,
                     crate::common::types::IrType::I128 | crate::common::types::IrType::U128

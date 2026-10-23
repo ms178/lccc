@@ -231,6 +231,25 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
             return (index == 0).then_some(16);
         }
 
+        // Scalar conversions and unary SSE forms read one 128-bit vector.
+        // Keep the scalar/immediate positions out of this width contract.
+        O::CvtSi2Ss128
+        | O::CvtSi2Sd128
+        | O::CvtSi2Ss64_128
+        | O::CvtSi2Sd64_128
+        | O::Cvtsd2Si64
+        | O::Cvtss2Si64
+        | O::MovemaskPs128
+        | O::MovemaskPd128
+        | O::SqrtPs128
+        | O::RcpPs128
+        | O::RsqrtPs128
+        | O::RcpSs128
+        | O::RsqrtSs128
+        | O::SqrtPd128 => {
+            return (index == 0).then_some(16);
+        }
+
         // Unary FP forms: exactly one 16-byte vector slot, at index 0.  Kept
         // out of the two-operand arm above so an operand index the op does not
         // have can never be reported as a forwardable vector (that would let
@@ -279,6 +298,14 @@ fn pointer_vector_arg_width_consumer(op: IntrinsicOp, index: usize) -> Option<us
         | O::Por128
         | O::Pand128
         | O::Pxor128
+        | O::AndPs128
+        | O::AndnPs128
+        | O::OrPs128
+        | O::XorPs128
+        | O::AndPd128
+        | O::AndnPd128
+        | O::OrPd128
+        | O::XorPd128
         | O::CmpPs128
         | O::CmpPd128
         | O::ShufPs128

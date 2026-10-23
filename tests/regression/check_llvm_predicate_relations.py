@@ -6,18 +6,11 @@ import os
 from pathlib import Path
 import re
 import tempfile
-from check_llvm_missed_zero_choice import body, run
+from check_llvm_missed_zero_choice import (body, gcc_oracle_identity,
+                                           report_gcc_oracle, run)
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "tests/regression/llvm_predicate_relations.c"
-
-
-def gcc_oracle_identity(version, allow_snapshot=False):
-    """Only the Debian exact-version gate supplies normative GCC evidence."""
-    normative = bool(re.fullmatch(r"16\.2(?:\.0)?", version))
-    if not normative and not (allow_snapshot and version.startswith("16.")):
-        raise ValueError(f"GCC 16.2 oracle required, found {version!r}")
-    return normative
 
 
 def main():
@@ -32,6 +25,7 @@ def main():
     args = parser.parse_args()
     gcc_version = run([args.gcc, "-dumpfullversion"]).decode().strip()
     gcc_normative = gcc_oracle_identity(gcc_version, args.allow_gcc16_snapshot)
+    report_gcc_oracle(args.gcc, gcc_version, gcc_normative)
     if args.clang and run([args.clang, "-dumpversion"]).decode().strip() != "23.1.3":
         raise ValueError("Clang 23.1.3 oracle required")
     env = os.environ | {"CCC_VERIFY_IR": "abort", "CCC_VERIFY_REGALLOC": "1", "CCC_VALIDATE_SSA": "1"}

@@ -1648,7 +1648,17 @@ pub enum IntrinsicOp {
     MinSs128,
     MaxSs128,
     SqrtSs128,
+    RcpSs128,
+    RsqrtSs128,
     // === 128-bit FP ops (SSE) — complements existing AddPs128/AddPd128 etc. ===
+    AndPs128,
+    AndnPs128,
+    OrPs128,
+    XorPs128,
+    AndPd128,
+    AndnPd128,
+    OrPd128,
+    XorPd128,
     DivPs128,
     MinPs128,
     MaxPs128,
@@ -1866,9 +1876,14 @@ impl IntrinsicOp {
         use IntrinsicOp::*;
         matches!(
             self,
-            // Packed, float and double.
+            // Packed, float and double arithmetic.
             AddPs128 | SubPs128 | MulPs128 | DivPs128 | MinPs128 | MaxPs128
             | AddPd128 | SubPd128 | MulPd128 | DivPd128 | MinPd128 | MaxPd128
+            // Packed FP-domain logical operations use the same destructive
+            // dst=args[0] encoding. ANDN is intentionally not commutative;
+            // the emitter's separate mnemonic table governs operand swaps.
+            | AndPs128 | AndnPs128 | OrPs128 | XorPs128
+            | AndPd128 | AndnPd128 | OrPd128 | XorPd128
             // Scalar (low-lane) forms: same one-instruction destructive
             // encoding, the untouched lanes come from `args[0]`.
             | AddSd128 | SubSd128 | MulSd128 | DivSd128 | MinSd128 | MaxSd128
@@ -2047,6 +2062,17 @@ impl IntrinsicOp {
             Loaddqu | Loadldi128 | Pcmpeqb128 | Pcmpeqd128 | Psubusb128
             | Psubsb128 | Por128 | Pand128 | Pxor128 | AddPs128 | SubPs128
             | MulPs128 | AddPd128 | SubPd128 | MulPd128
+            | DivPs128 | MinPs128 | MaxPs128 | SqrtPs128 | RcpPs128 | RsqrtPs128
+            | AndPs128 | AndnPs128 | OrPs128 | XorPs128
+            | AndPd128 | AndnPd128 | OrPd128 | XorPd128
+            | DivPd128 | MinPd128 | MaxPd128 | SqrtPd128
+            | RcpSs128 | RsqrtSs128
+            | CmpPs128 | ShufPs128 | UnpcklPs128 | UnpckhPs128
+            | CvtPs2Ep32_128 | CvtEp32ToPs128 | CvttPs2Ep32_128 | CvtPs2Pd128 | CvtPd2Ps128
+            | CmpPd128 | ShufPd128 | UnpcklPd128 | UnpckhPd128
+            | CvtPd2Ep32_128 | CvtEp32ToPd128 | CvttPd2Ep32_128
+            | CvtSs2Sd128 | CvtSd2Ss128 | CvtSi2Ss128 | CvtSi2Sd128
+            | CvtSi2Ss64_128 | CvtSi2Sd64_128 | Movss128 | Movsd128
             | AddSd128 | SubSd128 | MulSd128 | DivSd128 | MinSd128 | MaxSd128
             | SqrtSd128 | AddSs128 | SubSs128 | MulSs128 | DivSs128 | MinSs128
             | MaxSs128 | SqrtSs128
@@ -2168,6 +2194,10 @@ impl IntrinsicOp {
             IntrinsicOp::SetEpi16 | IntrinsicOp::Pinsrw128 |
             IntrinsicOp::Pextrw128 | IntrinsicOp::Cvtsi128Si32 |
             IntrinsicOp::Cvtsi32Si128 | IntrinsicOp::Cvtsi128Si64 |
+            IntrinsicOp::CvtSs2Si128 | IntrinsicOp::CvtSd2Si128 |
+            IntrinsicOp::CvttSs2Si128 | IntrinsicOp::CvttSd2Si128 |
+            IntrinsicOp::Cvtsd2Si64 | IntrinsicOp::Cvtss2Si64 |
+            IntrinsicOp::MovemaskPs128 | IntrinsicOp::MovemaskPd128 |
             IntrinsicOp::Pshuflw128 | IntrinsicOp::Pshufhw128 |
             // SSE4.1 insert/extract are pure
             IntrinsicOp::Pinsrd128 | IntrinsicOp::Pextrd128 |
@@ -2597,6 +2627,111 @@ mod vector_width_tests {
         ] {
             assert_eq!(op.vector_home_width(), Some(width), "{op:?} home");
             assert_eq!(op.vector_result_width(), Some(width), "{op:?} result");
+        }
+    }
+
+    /// The x86 SIMD code generator and the IR enum must stay in sync across
+    /// the rebase boundary. In particular, newly wired SSE logical and scalar
+    /// reciprocal operations are real 128-bit values, not side effects or
+    /// unhomed temporaries. Pin their result/purity contract and destructive
+    /// encoding metadata here so a future enum/classification conflict fails
+    /// in a focused test rather than at the compiler backend.
+    #[test]
+    fn restored_sse_intrinsics_have_128_bit_value_contracts() {
+        let vector_values = [
+            IntrinsicOp::AndPs128,
+            IntrinsicOp::AndnPs128,
+            IntrinsicOp::OrPs128,
+            IntrinsicOp::XorPs128,
+            IntrinsicOp::AndPd128,
+            IntrinsicOp::AndnPd128,
+            IntrinsicOp::OrPd128,
+            IntrinsicOp::XorPd128,
+            IntrinsicOp::RcpSs128,
+            IntrinsicOp::RsqrtSs128,
+        ];
+        for op in vector_values {
+            assert_eq!(op.vector_home_width(), Some(16), "{op:?} home");
+            assert_eq!(op.vector_result_width(), Some(16), "{op:?} result");
+        }
+
+        for op in [
+            IntrinsicOp::AndPs128,
+            IntrinsicOp::AndnPs128,
+            IntrinsicOp::OrPs128,
+            IntrinsicOp::XorPs128,
+            IntrinsicOp::AndPd128,
+            IntrinsicOp::AndnPd128,
+            IntrinsicOp::OrPd128,
+            IntrinsicOp::XorPd128,
+        ] {
+            assert!(op.is_sse_fp_128_destructive_binary(), "{op:?}");
+        }
+        assert!(!IntrinsicOp::RcpSs128.is_sse_fp_128_destructive_binary());
+    }
+
+    /// SSE operations that already had enum/dispatcher entries but were
+    /// omitted from home/result-width metadata must all retain a full XMM
+    /// result home. Omitting one can route a value through a scalar slot or
+    /// truncate copies without a compile-time exhaustiveness error.
+    #[test]
+    fn restored_sse_result_families_have_16_byte_width() {
+        let vector_results = [
+            IntrinsicOp::DivPs128,
+            IntrinsicOp::MinPs128,
+            IntrinsicOp::MaxPs128,
+            IntrinsicOp::SqrtPs128,
+            IntrinsicOp::RcpPs128,
+            IntrinsicOp::RsqrtPs128,
+            IntrinsicOp::CmpPs128,
+            IntrinsicOp::ShufPs128,
+            IntrinsicOp::UnpcklPs128,
+            IntrinsicOp::UnpckhPs128,
+            IntrinsicOp::CvtPs2Ep32_128,
+            IntrinsicOp::CvtEp32ToPs128,
+            IntrinsicOp::CvttPs2Ep32_128,
+            IntrinsicOp::CvtPs2Pd128,
+            IntrinsicOp::CvtPd2Ps128,
+            IntrinsicOp::DivPd128,
+            IntrinsicOp::MinPd128,
+            IntrinsicOp::MaxPd128,
+            IntrinsicOp::SqrtPd128,
+            IntrinsicOp::CmpPd128,
+            IntrinsicOp::ShufPd128,
+            IntrinsicOp::UnpcklPd128,
+            IntrinsicOp::UnpckhPd128,
+            IntrinsicOp::CvtPd2Ep32_128,
+            IntrinsicOp::CvtEp32ToPd128,
+            IntrinsicOp::CvttPd2Ep32_128,
+            IntrinsicOp::CvtSs2Sd128,
+            IntrinsicOp::CvtSd2Ss128,
+            IntrinsicOp::CvtSi2Ss128,
+            IntrinsicOp::CvtSi2Sd128,
+            IntrinsicOp::CvtSi2Ss64_128,
+            IntrinsicOp::CvtSi2Sd64_128,
+            IntrinsicOp::Movss128,
+            IntrinsicOp::Movsd128,
+        ];
+        for op in vector_results {
+            assert_eq!(op.vector_home_width(), Some(16), "{op:?} home");
+            assert_eq!(op.vector_result_width(), Some(16), "{op:?} result");
+        }
+    }
+
+    #[test]
+    fn scalar_sse_conversions_and_movemasks_are_pure() {
+        for op in [
+            IntrinsicOp::CvtSs2Si128,
+            IntrinsicOp::CvtSd2Si128,
+            IntrinsicOp::CvttSs2Si128,
+            IntrinsicOp::CvttSd2Si128,
+            IntrinsicOp::Cvtsd2Si64,
+            IntrinsicOp::Cvtss2Si64,
+            IntrinsicOp::MovemaskPs128,
+            IntrinsicOp::MovemaskPd128,
+        ] {
+            assert!(op.is_pure(), "{op:?} has no observable side effect");
+            assert_eq!(op.vector_result_width(), None, "{op:?} is scalar");
         }
     }
 

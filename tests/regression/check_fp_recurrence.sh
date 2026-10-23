@@ -69,19 +69,16 @@ printf '%s\n' 'double twice(double x) { return 2.0*x; }' > "$work/i686.c"
 "$CCC" -m32 -O2 -S "$work/i686.c" -o "$work/i686-on.s"
 CCC_DISABLE_PASSES=loop_square,fp_double "$CCC" -m32 -O2 -S "$work/i686.c" -o "$work/i686-off.s"
 cmp "$work/i686-on.s" "$work/i686-off.s"
-# Use a shipped, branch-heavy workload to pin the post-allocation opportunity.
-# fannkuch's register allocation leaves an eligible empty branch-only trampoline
-# block: with the peephole jump_thread sub-pass enabled (jump-on) every
-# conditional jump into such a relay is retargeted past it (0 redundant edges),
-# with the sub-pass disabled (jump-off) one survives (the negative control).
-# expat_xml_scan used to host this pattern, but the IR-level cfg_simplify
-# threader rework reshaped its main loop so the pattern no longer forms there
-# under any kill-switch combination, which made the old control vacuous.
+# Use a shipped workload to pin the post-allocation opportunity. In the
+# current fastbuild corpus, lz4_compress has one conditional edge into an empty
+# branch-only trampoline when jump_thread is disabled and zero when enabled.
+# Measure both sides at the assembly level below; if later CFG work removes
+# this shape, the negative control fails rather than silently going vacuous.
 for mode in on off; do
     skip=""
     [[ $mode != off ]] || skip=jump_thread
     CCC_PEEPHOLE_SKIP="$skip" "$CCC" -O2 -march=x86-64-v3 -S \
-        "$root/tests/benchmark/programs/fannkuch.c" -o "$work/jump-$mode.s"
+        "$root/tests/benchmark/programs/lz4_compress.c" -o "$work/jump-$mode.s"
 done
 python3 - "$work" <<'PY'
 import re, sys

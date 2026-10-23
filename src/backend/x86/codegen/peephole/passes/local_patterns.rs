@@ -6845,6 +6845,64 @@ pub(super) fn fold_rotate_idiom(store: &mut LineStore, infos: &mut [LineInfo]) -
 /// zero-extends-into-127:32 semantics would be wrong to delete anyway.  A
 /// deliberate zeroing self-move is code, not noise; if a producer of such a
 /// line ever shows up, it needs a liveness-gated cleanup, not this pass.
+/// Check whether deleting a VEX self-move `vmov* %xmmN, %xmmN` (or `%ymmN, %ymmN`)
+/// at line `idx` could expose dirty upper bits to a subsequent wider read
+/// (`%ymmN`/`%zmmN` for `%xmmN`, or `%zmmN` for `%ymmN`).
+fn vex_self_move_zeroes_live_upper(
+    store: &LineStore,
+    infos: &[LineInfo],
+    idx: usize,
+    reg: &str,
+) -> bool {
+    let (wider1, wider2) = if let Some(num) = reg.strip_prefix("%xmm") {
+        (format!("%ymm{num}"), Some(format!("%zmm{num}")))
+    } else if let Some(num) = reg.strip_prefix("%ymm") {
+        (format!("%zmm{num}"), None)
+    } else {
+        return false;
+    };
+    let mentions_wider = |s: &str| -> bool {
+        let has_token = |tok: &str| -> bool {
+            let mut rest = s;
+            while let Some(pos) = rest.find(tok) {
+                let after = &rest[pos + tok.len()..];
+                if !after.starts_with(|c: char| c.is_ascii_digit()) {
+                    return true;
+                }
+                rest = after;
+            }
+            false
+        };
+        has_token(&wider1) || wider2.as_deref().is_some_and(has_token)
+    };
+    let len = store.len();
+    for j in idx + 1..len {
+        if infos[j].is_nop() || infos[j].is_steppable() {
+            continue;
+        }
+        let tj = infos[j].trimmed(store.get(j));
+        if mentions_wider(tj) {
+            return true;
+        }
+        if tj == "vzeroupper" || infos[j].kind == LineKind::Ret {
+            return false;
+        }
+        if infos[j].is_barrier() {
+            return (0..len)
+                .any(|k| !infos[k].is_nop() && mentions_wider(infos[k].trimmed(store.get(k))));
+        }
+        if tj.starts_with('v') {
+            if let Some((_, dst)) = tj.rsplit_once(',') {
+                let dst = dst.split('{').next().unwrap_or(dst).trim();
+                if dst == reg {
+                    return false;
+                }
+            }
+        }
+    }
+    false
+}
+
 pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
@@ -6887,7 +6945,11 @@ pub(super) fn eliminate_vector_self_moves(store: &mut LineStore, infos: &mut [Li
             3 => t.starts_with("vmovsd ") || t.starts_with("vmovss "),
             _ => false,
         };
-        if is_vec && all_same && arity_ok {
+        if is_vec
+            && all_same
+            && arity_ok
+            && !(t.starts_with('v') && vex_self_move_zeroes_live_upper(store, infos, i, first))
+        {
             mark_nop(&mut infos[i]);
             changed = true;
         }

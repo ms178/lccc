@@ -274,6 +274,19 @@ pub(super) fn lccc_simd_lookup(
         "sqrtps128" => u(Vec128, SqrtPs128),
         "rcpps128" => u(Vec128, RcpPs128),
         "rsqrtps128" => u(Vec128, RsqrtPs128),
+        "andps128" => b(Vec128, AndPs128),
+        "andnps128" => b(Vec128, AndnPs128),
+        "orps128" => b(Vec128, OrPs128),
+        "xorps128" => b(Vec128, XorPs128),
+        "addss128" => b(Vec128, AddSs128),
+        "subss128" => b(Vec128, SubSs128),
+        "mulss128" => b(Vec128, MulSs128),
+        "divss128" => b(Vec128, DivSs128),
+        "minss128" => b(Vec128, MinSs128),
+        "maxss128" => b(Vec128, MaxSs128),
+        "sqrtss128" => u(Vec128, SqrtSs128),
+        "rcpss128" => u(Vec128, RcpSs128),
+        "rsqrtss128" => u(Vec128, RsqrtSs128),
         "cmpps128" => s2(Vec128, CmpPs128),
         "shufps128" => s2(Vec128, ShufPs128),
         "unpcklps128" => b(Vec128, UnpcklPs128),
@@ -288,6 +301,17 @@ pub(super) fn lccc_simd_lookup(
         "minpd128" => b(Vec128, MinPd128),
         "maxpd128" => b(Vec128, MaxPd128),
         "sqrtpd128" => u(Vec128, SqrtPd128),
+        "andpd128" => b(Vec128, AndPd128),
+        "andnpd128" => b(Vec128, AndnPd128),
+        "orpd128" => b(Vec128, OrPd128),
+        "xorpd128" => b(Vec128, XorPd128),
+        "addsd128" => b(Vec128, AddSd128),
+        "subsd128" => b(Vec128, SubSd128),
+        "mulsd128" => b(Vec128, MulSd128),
+        "divsd128" => b(Vec128, DivSd128),
+        "minsd128" => b(Vec128, MinSd128),
+        "maxsd128" => b(Vec128, MaxSd128),
+        "sqrtsd128" => b(Vec128, SqrtSd128),
         "cmppd128" => s2(Vec128, CmpPd128),
         "shufpd128" => s2(Vec128, ShufPd128),
         "unpcklpd128" => b(Vec128, UnpcklPd128),
@@ -302,10 +326,10 @@ pub(super) fn lccc_simd_lookup(
         "cvtsi2sd128" => b(Vec128, CvtSi2Sd128),
         "cvtsi2ss64_128" => b(Vec128, CvtSi2Ss64_128),
         "cvtsi2sd64_128" => b(Vec128, CvtSi2Sd64_128),
-        "cvttss2si128" => s1(Scalar, CvttSs2Si128),
-        "cvttsd2si128" => s1(Scalar, CvttSd2Si128),
         "cvtss2si128" => s1(Scalar, CvtSs2Si128),
         "cvtsd2si128" => s1(Scalar, CvtSd2Si128),
+        "cvttss2si128" => s1(Scalar, CvttSs2Si128),
+        "cvttsd2si128" => s1(Scalar, CvttSd2Si128),
         "cvtss2sd128" => b(Vec128, CvtSs2Sd128),
         "cvtsd2ss128" => b(Vec128, CvtSd2Ss128),
         "haddps128" => b(Vec128, HaddPs128),
@@ -419,9 +443,6 @@ impl Lowerer {
             if let Some(imm_expr) = args.first() {
                 arg_ops.push(self.lower_expr(imm_expr));
             }
-        }
-        if std::env::var("LCCC_DEBUG_SIMD").is_ok() {
-            eprintln!("[SIMD] {} -> {:?}: {:?}", name, op, arg_ops);
         }
         match class {
             LcccSimdClass::Vec128 | LcccSimdClass::Vec256 | LcccSimdClass::Vec512 => {

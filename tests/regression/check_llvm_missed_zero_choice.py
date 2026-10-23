@@ -10,6 +10,25 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 
+def gcc_oracle_identity(version, allow_snapshot=False):
+    """Only the Debian exact-version gate supplies normative GCC evidence.
+
+    `version` is a -dumpfullversion token.  Exact 16.2(.0) is normative;
+    with allow_snapshot any other GCC 16 token is accepted as a
+    supplemental oracle (hosted CI provisions the rolling-major package,
+    scripts/ci_install_gcc16.sh).  Returns True when normative.
+    """
+    normative = bool(re.fullmatch(r"16\.2(?:\.0)?", version))
+    if not normative and not (allow_snapshot and version.startswith("16.")):
+        raise ValueError(f"GCC 16.2 oracle required, found {version!r}")
+    return normative
+
+
+def report_gcc_oracle(name, version, normative):
+    kind = "normative" if normative else "supplemental snapshot"
+    print(f"oracle: {name}: GCC {version} ({kind})")
+
+
 
 def run(command, env=None):
     result = subprocess.run(command, env=env, capture_output=True, timeout=60)
@@ -43,10 +62,16 @@ def main():
         "--compiler", default=os.environ.get("CCC", str(ROOT / "target/fastbuild/lccc"))
     )
     parser.add_argument("--gcc", default=os.environ.get("GCC", "gcc-16"))
+    parser.add_argument("--allow-gcc16-snapshot", action="store_true",
+                        help="explicit supplemental snapshot oracle; never normative GCC 16.2 evidence")
     args = parser.parse_args()
-    version = run([args.gcc, "--version"]).decode()
-    if not re.search(r"\b16\.2(?:\.0)?\b", version):
-        raise ValueError("this contract requires exact GCC 16.2")
+    # The oracle only produces the expected program output; every mechanism
+    # assertion below compares this compiler against itself (pass on vs
+    # off), so a snapshot oracle cannot change any verdict -- but the
+    # strict default stays, and CI opts in explicitly.
+    version = run([args.gcc, "-dumpfullversion"]).decode().strip()
+    report_gcc_oracle(args.gcc, version,
+                      gcc_oracle_identity(version, args.allow_gcc16_snapshot))
     source = str(ROOT / "tests/regression/llvm_missed_zero_choice.c")
     with tempfile.TemporaryDirectory() as tmp:
         p = Path(tmp)

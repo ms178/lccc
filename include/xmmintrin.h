@@ -160,117 +160,7 @@ _mm_mul_ps(__m128 __a, __m128 __b)
 
 
 
-/* Scalar operations (lowest element only, rest pass through __a) */
 
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_add_ss(__m128 __a, __m128 __b)
-{
-    __a.__val[0] += __b.__val[0];
-    return __a;
-}
-
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_sub_ss(__m128 __a, __m128 __b)
-{
-    __a.__val[0] -= __b.__val[0];
-    return __a;
-}
-
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_mul_ss(__m128 __a, __m128 __b)
-{
-    __a.__val[0] *= __b.__val[0];
-    return __a;
-}
-
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_div_ss(__m128 __a, __m128 __b)
-{
-    __a.__val[0] /= __b.__val[0];
-    return __a;
-}
-
-/* === Bitwise (float domain) === */
-/* These operate on the bitwise representation of float values,
-   using memcpy to type-pun between float and unsigned int. */
-
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_and_ps(__m128 __a, __m128 __b)
-{
-    unsigned int __ai[4], __bi[4];
-    __builtin_memcpy(__ai, &__a, 16);
-    __builtin_memcpy(__bi, &__b, 16);
-    __ai[0] &= __bi[0]; __ai[1] &= __bi[1];
-    __ai[2] &= __bi[2]; __ai[3] &= __bi[3];
-    __m128 __r;
-    __builtin_memcpy(&__r, __ai, 16);
-    return __r;
-}
-
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_andnot_ps(__m128 __a, __m128 __b)
-{
-    unsigned int __ai[4], __bi[4];
-    __builtin_memcpy(__ai, &__a, 16);
-    __builtin_memcpy(__bi, &__b, 16);
-    __ai[0] = ~__ai[0] & __bi[0]; __ai[1] = ~__ai[1] & __bi[1];
-    __ai[2] = ~__ai[2] & __bi[2]; __ai[3] = ~__ai[3] & __bi[3];
-    __m128 __r;
-    __builtin_memcpy(&__r, __ai, 16);
-    return __r;
-}
-
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_or_ps(__m128 __a, __m128 __b)
-{
-    unsigned int __ai[4], __bi[4];
-    __builtin_memcpy(__ai, &__a, 16);
-    __builtin_memcpy(__bi, &__b, 16);
-    __ai[0] |= __bi[0]; __ai[1] |= __bi[1];
-    __ai[2] |= __bi[2]; __ai[3] |= __bi[3];
-    __m128 __r;
-    __builtin_memcpy(&__r, __ai, 16);
-    return __r;
-}
-
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_xor_ps(__m128 __a, __m128 __b)
-{
-    unsigned int __ai[4], __bi[4];
-    __builtin_memcpy(__ai, &__a, 16);
-    __builtin_memcpy(__bi, &__b, 16);
-    __ai[0] ^= __bi[0]; __ai[1] ^= __bi[1];
-    __ai[2] ^= __bi[2]; __ai[3] ^= __bi[3];
-    __m128 __r;
-    __builtin_memcpy(&__r, __ai, 16);
-    return __r;
-}
-
-/* === Square root, Reciprocal, Reciprocal square root === */
-
-
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_sqrt_ss(__m128 __a)
-{
-    __a.__val[0] = __builtin_sqrtf(__a.__val[0]);
-    return __a;
-}
-
-
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_rcp_ss(__m128 __a)
-{
-    __a.__val[0] = 1.0f / __a.__val[0];
-    return __a;
-}
-
-
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_rsqrt_ss(__m128 __a)
-{
-    __a.__val[0] = 1.0f / __builtin_sqrtf(__a.__val[0]);
-    return __a;
-}
 
 /* === Comparison (packed) - return all-ones or all-zeros per lane === */
 
@@ -546,21 +436,7 @@ _MM_SET_FLUSH_ZERO_MODE(unsigned int __mode)
     _mm_setcsr((_mm_getcsr() & ~_MM_FLUSH_ZERO_MASK) | __mode);
 }
 
-/* === Scalar min/max === */
 
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_min_ss(__m128 __a, __m128 __b)
-{
-    __a.__val[0] = __a.__val[0] < __b.__val[0] ? __a.__val[0] : __b.__val[0];
-    return __a;
-}
-
-static __inline__ __m128 __attribute__((__always_inline__))
-_mm_max_ss(__m128 __a, __m128 __b)
-{
-    __a.__val[0] = __a.__val[0] > __b.__val[0] ? __a.__val[0] : __b.__val[0];
-    return __a;
-}
 
 /* === Move === */
 

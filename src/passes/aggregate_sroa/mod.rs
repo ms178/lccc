@@ -98,7 +98,8 @@ pub(crate) fn run(module: &mut IrModule) -> usize {
         if f.is_declaration || f.blocks.is_empty() {
             continue;
         }
-        let mut fn_changes = 0;
+        let mut fn_changes = lower_non_alloca_scalar_memcpy(f);
+        total += fn_changes;
         for _ in 0..6 {
             let n = run_function(f);
             if n == 0 {
@@ -112,6 +113,161 @@ pub(crate) fn run(module: &mut IrModule) -> usize {
         }
     }
     total
+}
+
+/// Resolve the allocation root of a pointer expression used by a small
+/// scalar memcpy. This is intentionally narrower than general alias analysis:
+/// it follows only the pointer-preserving/value-offset forms emitted by the
+/// frontend, and fails closed for merges or opaque producers.
+fn scalar_memcpy_root(
+    value: u32,
+    defs: &FxHashMap<u32, Instruction>,
+    allocas: &FxHashSet<u32>,
+    visiting: &mut FxHashSet<u32>,
+) -> Option<u32> {
+    if allocas.contains(&value) {
+        return Some(value);
+    }
+    if visiting.len() >= 128 || !visiting.insert(value) {
+        return None;
+    }
+    let Some(def) = defs.get(&value) else {
+        visiting.remove(&value);
+        return None;
+    };
+    let result = match def {
+        Instruction::GetElementPtr { base, .. } => {
+            scalar_memcpy_root(base.0, defs, allocas, visiting)
+        }
+        Instruction::Copy {
+            src: Operand::Value(src),
+            ..
+        }
+        | Instruction::Cast {
+            src: Operand::Value(src),
+            ..
+        } => scalar_memcpy_root(src.0, defs, allocas, visiting),
+        Instruction::BinOp { op, lhs, rhs, .. }
+            if matches!(
+                op,
+                crate::ir::reexports::IrBinOp::Add | crate::ir::reexports::IrBinOp::Sub
+            ) =>
+        {
+            let left = match lhs {
+                Operand::Value(v) => scalar_memcpy_root(v.0, defs, allocas, visiting),
+                Operand::Const(_) => None,
+            };
+            // A repeated value is not a cycle once the left walk has returned.
+            visiting.remove(&value);
+            let right = match rhs {
+                Operand::Value(v) => scalar_memcpy_root(v.0, defs, allocas, visiting),
+                Operand::Const(_) => None,
+            };
+            match (left, right) {
+                (Some(a), Some(b)) if a == b => Some(a),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                _ => None,
+            }
+        }
+        // These are genuine pointer roots rather than derived aliases.
+        Instruction::ParamRef { .. } | Instruction::GlobalAddr { .. } => Some(value),
+        _ => None,
+    };
+    visiting.remove(&value);
+    result
+}
+
+/// Replace small non-alloca memcpy operations with one scalar load and store.
+/// This avoids materializing tiny copies as calls/spill-backed temporaries,
+/// while deliberately leaving alloca-backed copies to the richer SROA forms.
+fn lower_non_alloca_scalar_memcpy(func: &mut IrFunction) -> usize {
+    let mut allocas = FxHashSet::default();
+    let mut defs = FxHashMap::default();
+    let mut next = scan_max_value_id(func).saturating_add(1);
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Instruction::Alloca { dest, .. } = inst {
+                allocas.insert(dest.0);
+            }
+            if let Some(dest) = inst.dest() {
+                defs.insert(dest.0, inst.clone());
+            }
+        }
+    }
+    let mut changed = 0;
+    for block in &mut func.blocks {
+        let old = std::mem::take(&mut block.instructions);
+        let old_spans = std::mem::take(&mut block.source_spans);
+        let has_spans = old_spans.len() == old.len() && !old_spans.is_empty();
+        let mut out = Vec::with_capacity(old.len());
+        let mut spans = Vec::with_capacity(old.len());
+        for (index, inst) in old.into_iter().enumerate() {
+            let Some((dest, src, ty)) = (match &inst {
+                Instruction::Memcpy { dest, src, size } => {
+                    let ty = match size {
+                        1 => Some(IrType::I8),
+                        2 => Some(IrType::I16),
+                        4 => Some(IrType::I32),
+                        8 => Some(IrType::I64),
+                        _ => None,
+                    };
+                    ty.and_then(|ty| {
+                        let d =
+                            scalar_memcpy_root(dest.0, &defs, &allocas, &mut FxHashSet::default())?;
+                        let s =
+                            scalar_memcpy_root(src.0, &defs, &allocas, &mut FxHashSet::default())?;
+                        (!allocas.contains(&d) && !allocas.contains(&s))
+                            .then_some((*dest, *src, ty))
+                    })
+                }
+                _ => None,
+            }) else {
+                out.push(inst);
+                if has_spans {
+                    spans.push(old_spans[index]);
+                }
+                continue;
+            };
+            // `next_value_id` is a u32 namespace. Refuse the rewrite rather
+            // than wrap or reuse an existing SSA id at the boundary.
+            if next == u32::MAX {
+                out.push(inst);
+                if has_spans {
+                    spans.push(old_spans[index]);
+                }
+                continue;
+            }
+            let load = Value(next);
+            next += 1;
+            out.push(Instruction::Load {
+                dest: load,
+                ptr: src,
+                ty,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            });
+            out.push(Instruction::Store {
+                val: Operand::Value(load),
+                ptr: dest,
+                ty,
+                seg_override: AddressSpace::Default,
+                volatile: false,
+            });
+            if has_spans {
+                spans.push(old_spans[index]);
+                spans.push(old_spans[index]);
+            }
+            changed += 1;
+        }
+        block.instructions = out;
+        if has_spans {
+            block.source_spans = spans;
+        }
+    }
+    if changed > 0 {
+        func.next_value_id = next;
+    }
+    changed
 }
 
 /// A single transformation step: insert an instruction before index `at` in
@@ -1211,5 +1367,95 @@ mod intrinsic_write_contract {
             dest_ptr: None,
             args: vec![Operand::Value(Value(0))],
         }));
+    }
+}
+
+#[cfg(test)]
+mod scalar_memcpy_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Terminator};
+
+    #[test]
+    fn lowers_small_memcpy_through_integer_typed_pointer_arithmetic() {
+        let mut func = IrFunction::new("small_copy".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "src".to_string(),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "dst".to_string(),
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I64(4)),
+                    ty: IrType::I64,
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(2),
+                    size: 4,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        assert_eq!(lower_non_alloca_scalar_memcpy(&mut func), 1);
+        let instructions = &func.blocks[0].instructions;
+        assert!(matches!(
+            instructions[3],
+            Instruction::Load {
+                ptr: Value(2),
+                ty: IrType::I32,
+                ..
+            }
+        ));
+        assert!(matches!(
+            instructions[4],
+            Instruction::Store {
+                ptr: Value(1),
+                ty: IrType::I32,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn leaves_alloca_backed_memcpy_for_aggregate_sroa() {
+        let mut func = IrFunction::new("alloca_copy".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::I32,
+                    size: 4,
+                    align: 4,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "src".to_string(),
+                },
+                Instruction::Memcpy {
+                    dest: Value(0),
+                    src: Value(1),
+                    size: 4,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        assert_eq!(lower_non_alloca_scalar_memcpy(&mut func), 0);
+        assert!(matches!(
+            func.blocks[0].instructions[2],
+            Instruction::Memcpy { .. }
+        ));
     }
 }

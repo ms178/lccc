@@ -814,6 +814,10 @@ impl ArmCodegen {
     fn value_reg_name(&self, v: &Value) -> Option<(&'static str, &'static str)> {
         self.reg_assignments
             .get(&v.0)
+            // Integer bit-pattern comparisons can consume an FP-homed value
+            // after a bitcast. It has no x/w register alias: use the existing
+            // operand materialization fallback (FMOV), never index the GP table.
+            .filter(|&&reg| !is_arm_fp_phys(reg))
             .map(|&reg| (callee_saved_name(reg), callee_saved_name_32(reg)))
     }
 
@@ -3930,5 +3934,43 @@ mod operand_const_materialization_tests {
                 && !buf.contains("movn"),
             "D32(0xFFFF0000) must be one shifted movz, got: {buf:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod integer_compare_register_class_tests {
+    use super::*;
+
+    #[test]
+    fn fp_homes_have_no_gp_alias_and_compare_via_bit_transfer() {
+        for reg in [PhysReg(32), PhysReg(38), PhysReg(40), PhysReg(55)] {
+            let mut cg = ArmCodegen::new();
+            cg.reg_assignments.insert(1, reg);
+            assert_eq!(cg.value_reg_name(&Value(1)), None);
+            cg.emit_int_cmp_insn(
+                &Operand::Value(Value(1)),
+                &Operand::Const(IrConst::I64(0)),
+                IrType::I64,
+            );
+            assert!(
+                cg.state.out.buf.contains("fmov x0, d"),
+                "{}",
+                cg.state.out.buf
+            );
+            assert!(cg.state.out.buf.contains("cmp x0, #0"));
+        }
+    }
+
+    #[test]
+    fn gp_homes_keep_the_one_instruction_compare_path() {
+        let mut cg = ArmCodegen::new();
+        cg.reg_assignments.insert(1, PhysReg(19));
+        assert_eq!(cg.value_reg_name(&Value(1)), Some(("x19", "w19")));
+        cg.emit_int_cmp_insn(
+            &Operand::Value(Value(1)),
+            &Operand::Const(IrConst::I64(0)),
+            IrType::I64,
+        );
+        assert_eq!(cg.state.out.buf.trim(), "cmp x19, #0");
     }
 }

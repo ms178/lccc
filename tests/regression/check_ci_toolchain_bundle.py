@@ -180,6 +180,12 @@ class ProvisionToolchain(unittest.TestCase):
         self.repo = self.temp / "repo"
         (self.repo / "scripts").mkdir(parents=True)
         shutil.copy(PROVISION, self.repo / "scripts" / PROVISION.name)
+        # The real provisioner delegates mold+lld to this retrying installer;
+        # keep that boundary in the fixture instead of falling through to an
+        # absent script and masking the provisioning contract with exit 127.
+        (self.repo / "scripts" / "ci_install_link_oracles.sh").write_text(
+            "#!/bin/sh\n"
+            'printf "install-link-oracles\\n" >> "$MOCK_LOG"\n')
         (self.repo / "scripts" / "ci_toolchain_bundle.sh").write_text(
             "#!/bin/sh\n"
             'printf "bundle %s\\n" "$*" >> "$MOCK_LOG"\n'
@@ -252,13 +258,16 @@ class ProvisionToolchain(unittest.TestCase):
         self.assertEqual(lines[0], "install-gcc16 --multilib")
         apt = [line for line in lines if line.startswith("apt-get")]
         self.assertEqual(len(apt), 1, lines)
-        # qemu-user is the i686 execution oracle; mold and lld are the linker
-        # oracles; python3-yaml is the gate parser; valgrind is the Memcheck
-        # oracle and libc6-dbg is what lets it relocate the loader's symbols
-        # (without it valgrind aborts at startup).  All in ONE call.
+        # qemu-user is the i686 execution oracle; python3-yaml is the gate
+        # parser; valgrind is the Memcheck oracle and libc6-dbg lets it
+        # relocate loader symbols. The linker pair has its own retrying,
+        # fail-closed installer and must not be folded back into this apt call.
         self.assertEqual(apt[0].split()[1:], [
             "install", "-y", "--no-install-recommends",
-            "qemu-user", "mold", "lld", "python3-yaml", "valgrind", "libc6-dbg"])
+            "qemu-user", "python3-yaml", "valgrind", "libc6-dbg"])
+        delegated = [line for line in lines if line == "install-link-oracles"]
+        self.assertEqual(delegated, ["install-link-oracles"],
+                         f"mold+lld must use the dedicated installer: {lines}")
         exports = [line for line in lines if line.startswith("bundle export")]
         self.assertEqual(len(exports), 1, lines)
         # The exported package set is the dpkg-delta, never a hard-coded list.
