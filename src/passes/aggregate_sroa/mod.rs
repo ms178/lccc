@@ -34,7 +34,9 @@ use crate::common::types::{AddressSpace, IrType};
 use crate::ir::reexports::{Instruction, IrConst, IrFunction, IrModule, Operand, Value};
 
 mod byval;
-mod split;
+// `split`'s switches are resolved by `run_passes` (see `SplitEnv`), so the
+// module has to be reachable from `crate::passes`.
+pub(crate) mod split;
 
 /// Size in bytes of a scalar IR type. Mirrors `mem2reg::promote::ir_type_size`.
 fn ty_size(ty: IrType) -> i64 {

@@ -92,19 +92,59 @@ use super::{Insert, Plan, Scan, any_escape, const_i64, resolve, ty_size};
 /// Largest object we are willing to fan out into fields.
 const SPLIT_MAX_BYTES: i64 = 512;
 
-/// Field-count cap. Generous by design — the point of the form is that a
-/// 16-word state array becomes 16 registers — but a hard bound, because the
-/// frame allocator's behaviour under large liveness is a separate problem
-/// (see artifacts/repros/rot16-arx-O2-miscompile.md).
-fn max_fields() -> usize {
-    match std::env::var("CCC_AGG_SPLIT_MAX_FIELDS") {
-        Ok(s) => s.trim().parse::<usize>().unwrap_or(64),
-        Err(_) => 64,
-    }
+/// The form's configuration, resolved ONCE per `run_passes` from the process
+/// environment and then read from thread-local state.
+///
+/// WHY NOT `std::env::var` HERE. This form runs per function, so reading the
+/// environment in it was an `environ` scan (plus a `String` allocation for the
+/// numeric knob) for every function in the translation unit -- and, because the
+/// environment is process-global, each kill-switch test had to mutate it
+/// underneath every sibling test on cargo's thread pool. The house rule is in
+/// `src/passes/mod.rs` ("Every remaining pass switch, resolved here for the
+/// same reason"): the pipeline resolves the switches once and the pass reads
+/// per-thread state, which is also what keeps `check_env_test_hygiene.sh`'s
+/// ratchet meaningful. Unit tests that never go through `run_passes` see
+/// `SPLIT_ENV_DEFAULT`, i.e. the all-unset configuration.
+#[derive(Clone, Copy)]
+pub(crate) struct SplitEnv {
+    /// Whether the form runs at all: `CCC_NO_AGGREGATE_SPLIT` unset.
+    pub(crate) enabled: bool,
+    /// Whether refusals and decisions are explained: `CCC_AGG_SPLIT_DEBUG`.
+    pub(crate) debug: bool,
+    /// Field-count cap. Generous by design -- the point of the form is that a
+    /// 16-word state array becomes 16 registers -- but a hard bound, because
+    /// the frame allocator's behaviour under large liveness is a separate
+    /// problem (see artifacts/repros/rot16-arx-O2-miscompile.md). Zero means
+    /// "refuse everything", matching the historical `CCC_AGG_SPLIT_MAX_FIELDS=0`
+    /// spelling.
+    pub(crate) max_fields: usize,
 }
 
+/// The environment-unset configuration, which is also what an entry point that
+/// never went through `run_passes` (unit tests) observes.
+pub(crate) const SPLIT_ENV_DEFAULT_MAX_FIELDS: usize = 64;
+const SPLIT_ENV_DEFAULT: SplitEnv = SplitEnv {
+    enabled: true,
+    debug: false,
+    max_fields: SPLIT_ENV_DEFAULT_MAX_FIELDS,
+};
+
+thread_local! {
+    static SPLIT_ENV: std::cell::Cell<SplitEnv> = const { std::cell::Cell::new(SPLIT_ENV_DEFAULT) };
+}
+
+pub(crate) fn set_split_env(env: SplitEnv) {
+    SPLIT_ENV.with(|cell| cell.set(env));
+}
+
+#[inline]
+fn split_env() -> SplitEnv {
+    SPLIT_ENV.with(std::cell::Cell::get)
+}
+
+#[inline]
 fn dbg_on() -> bool {
-    std::env::var_os("CCC_AGG_SPLIT_DEBUG").is_some()
+    split_env().debug
 }
 
 /// One scalar access of a candidate object.
@@ -201,7 +241,7 @@ pub(super) fn run_function(
     plan: &mut Plan,
     next: &mut u32,
 ) -> usize {
-    if std::env::var_os("CCC_NO_AGGREGATE_SPLIT").is_some() {
+    if !split_env().enabled {
         return 0;
     }
     // Default on since the back-end defect this shape used to expose was fixed
@@ -210,7 +250,7 @@ pub(super) fn run_function(
     // precondition for the ChaCha/ARX class, not a general win by itself: those
     // kernels are still refused by the copy-loop rule below until the small
     // constant-trip loops are unrolled first (P0-2).
-    let max_fields = max_fields();
+    let max_fields = split_env().max_fields;
     if max_fields == 0 {
         return 0;
     }

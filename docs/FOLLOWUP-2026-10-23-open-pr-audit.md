@@ -184,6 +184,24 @@ claim (does not reproduce on this tree); #932's census bump (its +1 was for a
 knob its own commit added, which this commit re-does against the current
 baseline).
 
+## One pre-existing defect this audit had to fix
+
+`check_env_test_hygiene.sh` fails on `main` at `44abd1b`: 148 pass-pipeline
+environment reads against a budget of 147. The merge that crossed the line did
+so without a new *behavioural* switch — `aggregate_sroa/split.rs` consulted
+three variables (`CCC_NO_AGGREGATE_SPLIT`, `CCC_AGG_SPLIT_DEBUG`,
+`CCC_AGG_SPLIT_MAX_FIELDS`) per function, i.e. an `environ` scan plus a `String`
+allocation for every function in the translation unit, which is exactly what the
+house rule in `src/passes/mod.rs` forbids ("Every remaining pass switch,
+resolved here for the same reason").
+
+The fix follows that rule instead of raising the ratchet: the three switches are
+resolved once in `run_passes` into a `SplitEnv`, published through thread-local
+state, and the form reads the resolved copy. Net effect: three `environ` scans
+and one allocation per function removed, and the count drops 148 → 145, two
+under the budget, so the next patch has the slack the ratchet is supposed to
+preserve rather than the deficit it was carrying.
+
 ## The last twenty closed PRs
 
 #908–#931 are merged into `main` except #918, #928, #904 and #903, whose content
