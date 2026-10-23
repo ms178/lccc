@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 401.38,
+      "predicted_gate_seconds": 403.38,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -258,6 +258,10 @@
         {
           "measured_s": 0.25,
           "name": "bash tests/regression/check_ifconv_arm_budget_switch.sh"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "bash tests/regression/check_lea_truncation_narrowing.sh"
         }
       ]
     },

@@ -67,10 +67,11 @@ use super::liveness::FileLiveness;
 use super::relay_and_lea::{plain_gp_operand, split_two_operands};
 
 /// How far after the `leaq` the truncating `movl` may sit.  The emitter keeps
-/// the cast adjacent, but register assignment and scheduling interleave
-/// independent work — `byte_load_reassembly`'s decode step puts five lines
-/// between the two.  Every line the scan crosses is checked (rule 2/3), so the
-/// width trades compile time, not soundness.
+/// the cast adjacent, but intervening independent work interleaves it:
+/// `byte_load_reassembly`'s decode step puts five emitted lines between the
+/// two, so a narrower window silently disables the fold on the very loop it
+/// was written for.  Every line the scan crosses is checked (rules 2 and 3),
+/// so the width trades compile time, not soundness.
 const WINDOW: usize = 8;
 
 /// True when a line inside the window neither transfers control nor hides
@@ -248,8 +249,15 @@ pub(super) fn narrow_lea_truncations(store: &mut LineStore, infos: &mut [LineInf
 mod tests {
     use super::*;
 
-    fn run(asm: &str) -> Vec<String> {
-        let mut store = LineStore::new(asm.to_string());
+    /// Run the pass over one function body.
+    ///
+    /// The `.cfi_startproc`/`.cfi_endproc` pair is not decoration: `FileLiveness`
+    /// only solves functions it can delimit (see its `new`), so a snippet
+    /// without them has no liveness answer at all and every query would be
+    /// `None` -- which is exactly the refusal path, not the fold.
+    fn run(body: &str) -> Vec<String> {
+        let asm = format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
+        let mut store = LineStore::new(asm);
         let mut infos: Vec<_> = (0..store.len())
             .map(|i| classify_line(store.get(i)))
             .collect();
@@ -260,13 +268,13 @@ mod tests {
             .collect()
     }
 
-    fn joined(asm: &str) -> String {
-        run(asm).join("\n")
+    fn joined(body: &str) -> String {
+        run(body).join("\n")
     }
 
     #[test]
     fn truncation_of_a_fresh_lea_narrows() {
-        let out = joined("f:\n    leaq 8(%rdi), %rdx\n    movl %edx, %r13d\n    ret\n");
+        let out = joined("    leaq 8(%rdi), %rdx\n    movl %edx, %r13d\n    ret");
         assert!(out.contains("leal 8(%rdi), %r13d"), "{out}");
         assert!(!out.contains("movl %edx"), "{out}");
     }
@@ -276,7 +284,7 @@ mod tests {
         // The unrolled `(uint32_t)(i + 16)` case: the allocator put the lea and
         // the truncation in the same register, which is a no-op movl.
         let out = joined(
-            "f:\n    leaq 16(%rdi), %r9\n    movl %r9d, %r9d\n    xorl (%r8,%rdi), %r9d\n    ret\n",
+            "    leaq 16(%rdi), %r9\n    movl %r9d, %r9d\n    xorl (%r8,%rdi), %r9d\n    ret",
         );
         assert!(out.contains("leal 16(%rdi), %r9d"), "{out}");
         assert!(!out.contains("movl %r9d, %r9d"), "{out}");
@@ -285,11 +293,11 @@ mod tests {
 
     #[test]
     fn independent_work_in_the_window_does_not_block_the_fold() {
-        // byte_load_reassembly's decode step: two unrelated instructions sit
+        // `byte_load_reassembly`'s decode step: unrelated instructions sit
         // between the `leaq` and the truncation.
         let out = joined(
-            "f:\n    leaq 8(%rdi), %rdx\n    movl (%r8,%rdi), %r15d\n    xorl %edi, %r15d\n    \
-             movl %edx, %r13d\n    xorl 8(%r8,%rdi), %r13d\n    ret\n",
+            "    leaq 8(%rdi), %rdx\n    movl (%r8,%rdi), %r15d\n    xorl %edi, %r15d\n    \
+             movl %edx, %r13d\n    xorl 8(%r8,%rdi), %r13d\n    ret",
         );
         assert!(out.contains("leal 8(%rdi), %r13d"), "{out}");
         assert!(!out.contains("movl %edx"), "{out}");
@@ -300,9 +308,8 @@ mod tests {
     fn a_live_wide_result_is_preserved() {
         // %rdx is read after the truncation, so the 64-bit value is still
         // needed and the pair must stay exactly as emitted.
-        let out = joined(
-            "f:\n    leaq 8(%rdi), %rdx\n    movl %edx, %r13d\n    addq %rdx, %rax\n    ret\n",
-        );
+        let out =
+            joined("    leaq 8(%rdi), %rdx\n    movl %edx, %r13d\n    addq %rdx, %rax\n    ret");
         assert!(out.contains("leaq 8(%rdi), %rdx"), "{out}");
         assert!(out.contains("movl %edx, %r13d"), "{out}");
     }
@@ -311,32 +318,30 @@ mod tests {
     fn a_label_between_the_pair_blocks_the_fold() {
         // Deleting a jump target's instruction would change what the branch
         // executes.
-        let out = joined("f:\n    leaq 8(%rdi), %rdx\n.L3:\n    movl %edx, %r13d\n    ret\n");
+        let out = joined("    leaq 8(%rdi), %rdx\n.L3:\n    movl %edx, %r13d\n    ret");
         assert!(out.contains("movl %edx, %r13d"), "{out}");
         assert!(!out.contains("leal 8(%rdi), %r13d"), "{out}");
     }
 
     #[test]
     fn a_call_in_the_window_blocks_the_fold() {
-        let out = joined("f:\n    leaq 8(%rdi), %rdx\n    call g\n    movl %edx, %r13d\n    ret\n");
+        let out = joined("    leaq 8(%rdi), %rdx\n    call g\n    movl %edx, %r13d\n    ret");
         assert!(out.contains("movl %edx, %r13d"), "{out}");
     }
 
     #[test]
     fn an_earlier_read_of_the_destination_blocks_the_fold() {
         // %r13 is read before the `movl` moves its definition up.
-        let out = joined(
-            "f:\n    leaq 8(%rdi), %rdx\n    addq %r13, %rax\n    movl %edx, %r13d\n    ret\n",
-        );
+        let out =
+            joined("    leaq 8(%rdi), %rdx\n    addq %r13, %rax\n    movl %edx, %r13d\n    ret");
         assert!(out.contains("movl %edx, %r13d"), "{out}");
     }
 
     #[test]
     fn a_second_use_of_the_wide_value_blocks_the_fold() {
         // The first mention of %rdx is a use, not the truncating move.
-        let out = joined(
-            "f:\n    leaq 8(%rdi), %rdx\n    addq %rdx, %rax\n    movl %edx, %r13d\n    ret\n",
-        );
+        let out =
+            joined("    leaq 8(%rdi), %rdx\n    addq %rdx, %rax\n    movl %edx, %r13d\n    ret");
         assert!(out.contains("leaq 8(%rdi), %rdx"), "{out}");
         assert!(out.contains("movl %edx, %r13d"), "{out}");
     }
@@ -349,11 +354,26 @@ mod tests {
             "table(%rax)",
             "%fs:0(%rax)",
         ] {
-            let out = joined(&format!(
-                "f:\n    leaq {addr}, %rdx\n    movl %edx, %r13d\n    ret\n"
-            ));
+            let body = format!("    leaq {addr}, %rdx\n    movl %edx, %r13d\n    ret");
+            let out = joined(&body);
             assert!(out.contains(&format!("leaq {addr}, %rdx")), "{addr}: {out}");
         }
+        assert!(!plain_address("buf(%rip)"));
+        assert!(!plain_address("tls_slots@TPOFF(%rax)"));
+        assert!(!plain_address("table(%rax)"));
+        assert!(!plain_address("%fs:0(%rax)"));
+    }
+
+    #[test]
+    fn frame_registers_are_never_narrowed() {
+        let out = joined("    leaq 8(%rdi), %rdx\n    movl %edx, %ebp\n    ret");
+        assert!(out.contains("movl %edx, %ebp"), "{out}");
+    }
+
+    #[test]
+    fn a_64_bit_move_is_not_this_pattern() {
+        let out = joined("    leaq 8(%rdi), %rdx\n    movq %rdx, %r13\n    ret");
+        assert!(out.contains("leaq 8(%rdi), %rdx"), "{out}");
     }
 
     #[test]
@@ -366,25 +386,14 @@ mod tests {
             "-8(%rdx)",
         ] {
             assert!(plain_address(addr), "{addr}");
-            let out = joined(&format!(
-                "f:\n    leaq {addr}, %rdx\n    movl %edx, %r13d\n    ret\n"
-            ));
+            // The address parser alone is not the fold: every accepted address
+            // must also survive the pass's own refusal list.
+            let body = format!("    leaq {addr}, %rdx\n    movl %edx, %r13d\n    ret");
+            let out = joined(&body);
             assert!(
                 out.contains(&format!("leal {addr}, %r13d")),
                 "{addr}: {out}"
             );
         }
-    }
-
-    #[test]
-    fn frame_registers_are_never_narrowed() {
-        let out = joined("f:\n    leaq 8(%rdi), %rdx\n    movl %edx, %ebp\n    ret\n");
-        assert!(out.contains("movl %edx, %ebp"), "{out}");
-    }
-
-    #[test]
-    fn a_64_bit_move_is_not_this_pattern() {
-        let out = joined("f:\n    leaq 8(%rdi), %rdx\n    movq %rdx, %r13\n    ret\n");
-        assert!(out.contains("leaq 8(%rdi), %rdx"), "{out}");
     }
 }
