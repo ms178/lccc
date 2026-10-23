@@ -1915,10 +1915,10 @@ jobs:
     # steps are a partition: tests/regression/check_ci_shard_partition.py
     # fails if a gate appears in both, disappears from both, or reappears in a
     # third step.
-    # lane-split: 63 of 143 independent gate invocations from the
+    # lane-split: 65 of 147 independent gate invocations from the
     # lane-split: single step that used to run them all in sequence, assigned by
-    # lane-split: longest-processing-time over measured per-gate cost (401 s of
-    # lane-split: 803 s). The shards are a partition:
+    # lane-split: longest-processing-time over measured per-gate cost (405 s of
+    # lane-split: 809 s). The shards are a partition:
     # lane-split: tests/regression/check_ci_shard_partition.py fails if a gate appears in
     # lane-split: both, disappears from both, or reappears in a third step, and
     # lane-split: tests/regression/check_ci_lane_plan.py fails if a shard drifts from
@@ -1939,30 +1939,19 @@ jobs:
         # 1.14's gnulib open-safer.c under glibc fortify failed to link).
         # No sentinel at -O0..-O3, wrapper semantics, gcc as the reference.
         bash tests/regression/check_va_arg_pack_len_folds.sh
-        python3 -O scripts/test_llvm_missed_inventory.py
-        python3 tests/regression/check_direct_assembly_parity.py
-        python3 scripts/check_pr_claim_fidelity.py
-        python3 scripts/check_ci_gate_parity.py
+        # The differential linker oracles (mold, lld) must install with
+        # retries and version pinning, never as bare apt lines whose transient
+        # mirror failure red-fails the whole job; this gate drives the
+        # installer against a mock apt and proves the failure modes are loud.
+        python3 tests/regression/check_ci_link_oracle_provisioning.py
         bash tests/regression/check_gvn_cross_block_mul_dot.sh
         python3 tests/regression/check_llvm_word_counts.py
-        bash tests/regression/check_ra_web_inloop_use.sh
-        bash tests/regression/check_tight_loop_align.sh
         bash tests/regression/check_peephole_whitespace.sh
-        python3 tests/regression/check_affine_scaled_index_matrix.py
         bash tests/regression/check_vectorize_round_maps.sh
-        # BMI2 _bzhi_u32/_u64 lower to one bzhi and match GCC's results.
-        python3 tests/regression/check_bmi2_bzhi.py
-        bash tests/regression/check_i686_tls_ie_relax.sh
-        bash tests/regression/check_zero_ext_cmp_fold.sh
         # A 64-bit address computation that is only observed at 32-bit width
         # narrows to one `leal` (`lea_narrow`); relocation-carrying addresses
         # keep their 64-bit form.
         bash tests/regression/check_lea_truncation_narrowing.sh
-          # The Clang-C corpus capability probe: an unimplemented option must
-          # never read as support, and a `-W`-spelled unknown option must not
-          # slip past a `--`-only negative control.  Synthetic compiler, no
-          # toolchain and no corpus needed.
-          python3 scripts/lccc_capability_probe.py --selftest
         python3 tests/regression/check_llvm_guarded_folds.py
         # The peephole folds and the affine exit-compare fold: oracle parity
         # at every opt level times every kill switch, plus the asm pins that
@@ -1971,56 +1960,25 @@ jobs:
         # _Decimal32 AArch64 width: w-view indexed + plain traffic
         # assertions plus encodability teeth (no bare mov past imm16).
         bash tests/regression/check_decimal32_indexed_fold_arm.sh
-        # NOBITS / `.org` parity on all four targets against pinned GAS
-        # verdicts.  Mirrored in scripts/ci_local.sh (parity-checked).
-        python3 tests/regression/check_nobits_org_parity.py --lccc target/fastbuild/lccc
         python3 tests/regression/check_llvm_scalar_facts.py
-        bash tests/regression/check_i686_label_ref_safety.sh
         # ZERO-ROT-AFFINE: loop_rotate's cloned exit compare folds its
         # affine constant operand into the bound (signed only), giving a
         # bare-IV compare the compare-branch fusion can fuse -- without the
         # FileLiveness backward-edge fix the fusion refused the rotated
         # setcc shape and the `leaq` temporary stayed per-iteration.
         bash tests/regression/check_affine_exit_compare.sh
-        # Same unwired-gate fix as in ci_local.sh: these assert volatile
-        # access semantics that no runtime comparison can observe.
-        bash tests/regression/check_volatile_pointer_subscript.sh
-        bash tests/regression/check_tls_pie_preemptible.sh
         python3 tests/regression/check_llvm_integer_observations.py
-        bash tests/regression/check_pointer_ring_indexing.sh
         bash tests/regression/check_vector_remainder_codegen.sh
         bash tests/regression/check_asm_goto_phi_edge.sh
         ENCDIFF_TEST_OBJDUMP="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
         LCCC_REQUIRE_PINNED_ORACLE=1 \
           python3 scripts/test_encdiff.py
-        bash tests/regression/check_volatile_access_semantics.sh
-        # Torture-corpus provisioning: stamp trust, integrity manifest,
-        # auto-repair and invalidate-before-replace (synthetic tarball).
-        bash tests/regression/check_ensure_gcc_torture.sh
-        # The helper scripts are tools, not gates, so nothing in the
-        # suite ever imports them. Check their imports via the AST so a
-        # tool that cannot run cannot ship unnoticed.
-        python3 scripts/check_script_imports.py
         bash tests/regression/check_bool_pair_tail_jmp.sh
-        bash tests/regression/check_sparse_mask_updates.sh
         bash tests/regression/check_store_alu_cross_join.sh
-        # FMA-negation peel deletion invariant, re-derived over the enumerated
-        # shape space: a pure model check (no compiler, sub-second) so a
-        # regression of the absorbability classification is caught even where
-        # the IR verifier is not wired after the pass.
-        python3 tools/ir_shape_check.py
-        # The loop-density metric decides which compiler wins on a kernel,
-        # so its loop identification is tested like a pass: dominator-based
-        # backedges, composite loops never measured, step recovery through
-        # index addressing.
-        python3 scripts/test_hot_loop_metric.py
         python3 scripts/test_llvm_missed_inventory.py
-        bash tests/regression/check_demorgan_branch_split.sh
         bash tests/workloads/glibc-2.44/test_build_guards.sh
         bash tests/regression/check_bool_pair_prune.sh
-        bash tests/regression/check_asm_case_insensitive.sh
         bash tests/regression/check_fortify_diagnose_as.sh
-        bash tests/regression/check_i686_integer_isa_parity.sh
         # Register-offset symbol folds: `Add(symbol, register)` bases are
         # consumed as `sym(%off,%idx)` memory operands when the derived
         # pointer dies at the accesses; the RA-01 kernel must stay dormant
@@ -2032,22 +1990,10 @@ jobs:
         # writing it, so a cmov chain sharing a condition needs one cmp.
         # Carries its own CCC_PEEPHOLE_SKIP negative control.
         bash tests/regression/check_redundant_flags_compare.sh
-        bash tests/regression/check_debug_info_flags.sh
         bash tests/regression/check_frontend_diagnostic_recovery.sh
         python3 scripts/test_glibc_check_triage.py
         bash tests/regression/check_tls_runtime_oracle.sh
-        # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
-        # only place the audit's site counts are measurable; the ratchet is
-        # what stops them growing back.  Runs in ci_local.sh too.
-        python3 scripts/audit_census.py --selftest
         bash tests/regression/check_env_test_hygiene.sh
-        # Sparse NOBITS `.bss` (E22): the zeros are a size, not bytes, so a
-        # 4 GiB array compiles, links and runs from a ~5 KB executable, a
-        # label inside a sparse tail keeps its offset, and PROGBITS
-        # alignment follows GAS 2.47 exactly (no-padding `.p2align 40`
-        # accepted, unholdable padding diagnosed, never a signal).
-        # Mirrored in scripts/ci_local.sh (parity-checked).
-        CCC=target/fastbuild/lccc bash tests/regression/check_sparse_bss_nobits.sh
         bash tests/regression/check_copy_alias_sizes.sh
         # EDG/corpus compiler-free tooling contracts: the
         # miner self-tests, the mocked corpus-runner verdict contracts,
@@ -2056,38 +2002,90 @@ jobs:
         # scripts/ci_local.sh (parity-checked).
         python3 scripts/edg_changes_mine.py selftest
         bash tests/regression/check_boot_size_measurement.sh
-        # LICM must not hoist a volatile load out of its loop: N observable
-        # accesses must not become 1 (C11 5.1.2.3). The runtime cannot see
-        # this -- a hoisted volatile load computes the same answer -- so the
-        # gate asserts it structurally, with a non-volatile load in the same
-        # shape as the negative control. Complements the spin-loop and
-        # subscript gates above: this one covers the do-while shape.
-        bash tests/regression/check_volatile_licm.sh
         # _Decimal64 indexed fold: SIB-movsd load+store assertions
         # plus an integer-checksum gcc differential.
         bash tests/regression/check_decimal64_indexed_fold.sh
-        # The differential oracle's own contract suites, compiler-free
-        # like the encdiff one but anchored to the REAL pinned pair
-        # (provisioned above): asmdiff's parser/oracle unit tests
-        # (mocked failure modes plus a real-toolchain leg) and the
-        # binutils provisioner's 2.47 validation matrix (fake tool
-        # pairs). The pinned-tool env channels and the require-mode
-        # flag are part of the registered invocation contract
-        # (check_invocation_contracts): a leg that would silently skip,
-        # or run against the runner's distro binutils, is a contract
-        # violation — never a local convenience.
-        ASMDIFF_TEST_AS="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
-        ASMDIFF_TEST_OBJDUMP="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
-        LCCC_REQUIRE_PINNED_ORACLE=1 \
-          python3 scripts/test_asmdiff.py
         python3 scripts/test_oracle_delta_gate.py
-        python3 scripts/test_godbolt_cache.py
         # `LCCC_IFCONV_ARM_BUDGET` is an A/B lever, and its contract is what
         # keeps the numbers comparable: =1 tightens, off/full disable, an
         # unparsable value is inert.  It also pins that the switch resolves at
         # the pipeline boundary, not in the pass body, which is where it put
         # the env-read ratchet one over budget when it landed.
         bash tests/regression/check_ifconv_arm_budget_switch.sh
+        bash tests/regression/check_redundant_test_elimination.sh
+        bash tests/regression/check_i686_atomics.sh
+        bash tests/regression/check_i686_boot_asm.sh
+        python3 scripts/check_peephole_directive_step.py
+        bash tests/regression/check_const_trip_loop_inline.sh
+        # Array-bound contract (E22): a bad bound is diagnosed (never
+        # wrapped), a byte size that cannot exist is rejected instead of
+        # wrapping into a bogus section, and a huge .bss object is emitted
+        # sparsely under a hard address-space limit rather than being
+        # materialised and OOM-killed. Mirrored in scripts/ci_local.sh.
+        python3 scripts/check_array_bound_contract.py
+        # The lane splitter rewrites the workflow that runs. Its failure modes
+        # are silent (a gate in no shard stops running, a gate in two is paid
+        # twice), so the transform is pinned on synthetic workflows where the
+        # expected bytes are the assertion.
+        python3 scripts/test_ci_lane_split.py
+        python3 tests/regression/check_shift_count_demand.py
+        bash tests/regression/check_f128_sign_intrinsics_strict_fp.sh
+        # AFFOLD-VB: value-bounded affine exit-compare fold -- GCC runtime
+        # parity at the underflow edges, fire count on the guarded shapes,
+        # refusals, and the CCC_NO_AFFINE_EXIT_FOLD kill switch.
+        bash tests/regression/check_affine_value_bound.sh
+        bash tests/regression/check_fma_builtin_strict_fp.sh
+        env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_address_contract.py
+        bash tests/regression/check_select_from_compare.sh
+        bash tests/regression/check_phi_acyclic_order.sh
+        bash tests/regression/check_linker_notype_code.sh
+        # Constant-folded addresses must use the same emission-order gate.
+        bash tests/regression/check_late_const_gep.sh
+        # Plain-`char` signedness must be one answer, not three: the type
+        # system, `__CHAR_UNSIGNED__`, lccc's predefined CHAR_MIN/CHAR_MAX and
+        # glibc's `<limits.h>` (which derives from that macro) all follow
+        # `char_is_unsigned()`, including the -fno-signed-char /
+        # -fno-unsigned-char spellings.
+        # `-funsigned-char` used to flip only the type, leaving CHAR_MIN at
+        # -128 on x86-64.  Behavioural rows against GCC, plus the AArch64 /
+        # RISC-V defaults via the binary-name target selector (preprocessing
+        # only).  Mirrored in scripts/ci_local.sh (parity-checked).
+        bash tests/regression/check_char_signedness.sh
+        # Live CE delta execution moved to scheduled/manual oracle-delta.yml:
+        # network outages must not masquerade as PR-time oracle coverage.
+        # Hermetic self-tests and local differential/output gates stay required.
+        python3 scripts/oracle_delta_gate.py --self-test
+        # The architectural implicit-operand table is the single source of
+        # truth for every pass that reasons about registers an instruction
+        # does not name; its fixture is reviewed independently of the code.
+        python3 scripts/check_implicit_operand_matrix.py
+        bash tests/regression/check_gla_cross_reach_band.sh
+        bash tests/regression/check_call_secondary_cache.sh
+        # The FMA contract gate (packed arm exact at 4, zero under
+        # -ffp-contract=off / -mno-fma, unproven shapes refused) and the wide
+        # inclusive-bound envelope behind it.  A regression test that nothing
+        # runs is the defect these were written to fix, so they run here AND
+        # in ci_local.sh -- scripts/check_ci_gate_parity.py fails if the two
+        # lists drift, which is how this line came to exist.
+        bash tests/regression/check_fma_gating.sh
+        # Indexed SIB fold with a scratch-homed index: the x86-64 fold
+        # decider must accept %rdx/%r11-homed SIB operands (S13
+        # sqlite_varint golden-gate regression pin).
+        bash tests/regression/check_indexed_fold_scratch_index.sh
+        python3 tests/regression/check_popcount_loop_contract.py --run
+        # A13/A14: a pass may synthesise a libcall only when this TU does
+        # not define that symbol (per symbol, so an asm label, an alias or
+        # a static definition counts), and a constant-size memcpy/memset
+        # call may be expanded only while the callee still is the builtin.
+        # Refusals, positive controls, the -fno-builtin/-ffreestanding
+        # contract, the ungated __*_chk rows and three runtime programs.
+        bash tests/regression/check_libcall_synthesis_no_selfcall.sh
+        bash tests/regression/check_peephole_trace_bisect.sh
+        bash tests/regression/check_gvn_xsign_load_cse.sh
+        bash tests/regression/check_rmw_index_zext_codegen.sh
+        bash tests/regression/check_loop_store_motion.sh
+        python3 tests/regression/check_llvm_missed_zero_choice.py
+        bash tests/regression/check_tls_model_option.sh
         }
         # The body MUST NOT be invoked from a conditional context
         # (`if ! ...`, `||`, `&&`): bash ignores errexit AND the ERR trap
@@ -2219,10 +2217,10 @@ jobs:
     # steps are a partition: tests/regression/check_ci_shard_partition.py
     # fails if a gate appears in both, disappears from both, or reappears in a
     # third step.
-    # lane-split: 80 of 143 independent gate invocations from the
+    # lane-split: 82 of 147 independent gate invocations from the
     # lane-split: single step that used to run them all in sequence, assigned by
-    # lane-split: longest-processing-time over measured per-gate cost (401 s of
-    # lane-split: 803 s). The shards are a partition:
+    # lane-split: longest-processing-time over measured per-gate cost (405 s of
+    # lane-split: 809 s). The shards are a partition:
     # lane-split: tests/regression/check_ci_shard_partition.py fails if a gate appears in
     # lane-split: both, disappears from both, or reappears in a third step, and
     # lane-split: tests/regression/check_ci_lane_plan.py fails if a shard drifts from
@@ -2237,17 +2235,107 @@ jobs:
         # through tee so a failure attaches the gate's own diagnostics.
         fast_contracts() {
         trap 'rc=$?; printf "::error title=Fast contract failed::%s (exit %s)\n" "$BASH_COMMAND" "$rc"; exit "$rc"' ERR
+        python3 -O scripts/test_llvm_missed_inventory.py
+        python3 tests/regression/check_direct_assembly_parity.py
+        python3 scripts/check_pr_claim_fidelity.py
+        python3 scripts/check_ci_gate_parity.py
+        # `_mm_max_sd` / `_mm_min_sd` must be the single hardware `maxsd` /
+        # `minsd` with Intel's second-operand-wins tie/NaN semantics bit-exact
+        # (signed zeros and the preserved high lane included), differentially
+        # against gcc-16 -- they were an 84-instruction compare+select
+        # expansion for far too long. Step env supplies CCC; GCC defaults to
+        # gcc-16 inside the gate.
+        bash tests/regression/check_sse2_scalar_minmax.sh
+        # Every `__builtin_<libc>f` float alias GCC accepts must resolve in
+        # lccc to the same operation with bit-identical results (arity probed
+        # against gcc-16, then a runtime differential) -- the failure mode
+        # otherwise is a quiet call to a symbol that does not exist.
+        python3 tests/regression/check_builtin_float_aliases.py --lccc target/fastbuild/lccc --gcc gcc-16
+        bash tests/regression/check_ra_web_inloop_use.sh
+        bash tests/regression/check_tight_loop_align.sh
+        python3 tests/regression/check_affine_scaled_index_matrix.py
+        # BMI2 _bzhi_u32/_u64 lower to one bzhi and match GCC's results.
+        python3 tests/regression/check_bmi2_bzhi.py
+        bash tests/regression/check_i686_tls_ie_relax.sh
+        bash tests/regression/check_zero_ext_cmp_fold.sh
+          # The Clang-C corpus capability probe: an unimplemented option must
+          # never read as support, and a `-W`-spelled unknown option must not
+          # slip past a `--`-only negative control.  Synthetic compiler, no
+          # toolchain and no corpus needed.
+          python3 scripts/lccc_capability_probe.py --selftest
+        # NOBITS / `.org` parity on all four targets against pinned GAS
+        # verdicts.  Mirrored in scripts/ci_local.sh (parity-checked).
+        python3 tests/regression/check_nobits_org_parity.py --lccc target/fastbuild/lccc
+        bash tests/regression/check_i686_label_ref_safety.sh
+        # Same unwired-gate fix as in ci_local.sh: these assert volatile
+        # access semantics that no runtime comparison can observe.
+        bash tests/regression/check_volatile_pointer_subscript.sh
+        bash tests/regression/check_tls_pie_preemptible.sh
+        bash tests/regression/check_pointer_ring_indexing.sh
+        bash tests/regression/check_volatile_access_semantics.sh
+        # Torture-corpus provisioning: stamp trust, integrity manifest,
+        # auto-repair and invalidate-before-replace (synthetic tarball).
+        bash tests/regression/check_ensure_gcc_torture.sh
+        # The helper scripts are tools, not gates, so nothing in the
+        # suite ever imports them. Check their imports via the AST so a
+        # tool that cannot run cannot ship unnoticed.
+        python3 scripts/check_script_imports.py
+        bash tests/regression/check_sparse_mask_updates.sh
+        # FMA-negation peel deletion invariant, re-derived over the enumerated
+        # shape space: a pure model check (no compiler, sub-second) so a
+        # regression of the absorbability classification is caught even where
+        # the IR verifier is not wired after the pass.
+        python3 tools/ir_shape_check.py
+        # The loop-density metric decides which compiler wins on a kernel,
+        # so its loop identification is tested like a pass: dominator-based
+        # backedges, composite loops never measured, step recovery through
+        # index addressing.
+        python3 scripts/test_hot_loop_metric.py
+        bash tests/regression/check_demorgan_branch_split.sh
+        bash tests/regression/check_asm_case_insensitive.sh
+        bash tests/regression/check_i686_integer_isa_parity.sh
+        bash tests/regression/check_debug_info_flags.sh
+        # AUD-RATCHET-1: the audit census (scripts/audit_census.py) is the
+        # only place the audit's site counts are measurable; the ratchet is
+        # what stops them growing back.  Runs in ci_local.sh too.
+        python3 scripts/audit_census.py --selftest
+        # Sparse NOBITS `.bss` (E22): the zeros are a size, not bytes, so a
+        # 4 GiB array compiles, links and runs from a ~5 KB executable, a
+        # label inside a sparse tail keeps its offset, and PROGBITS
+        # alignment follows GAS 2.47 exactly (no-padding `.p2align 40`
+        # accepted, unholdable padding diagnosed, never a signal).
+        # Mirrored in scripts/ci_local.sh (parity-checked).
+        CCC=target/fastbuild/lccc bash tests/regression/check_sparse_bss_nobits.sh
+        # LICM must not hoist a volatile load out of its loop: N observable
+        # accesses must not become 1 (C11 5.1.2.3). The runtime cannot see
+        # this -- a hoisted volatile load computes the same answer -- so the
+        # gate asserts it structurally, with a non-volatile load in the same
+        # shape as the negative control. Complements the spin-loop and
+        # subscript gates above: this one covers the do-while shape.
+        bash tests/regression/check_volatile_licm.sh
+        # The differential oracle's own contract suites, compiler-free
+        # like the encdiff one but anchored to the REAL pinned pair
+        # (provisioned above): asmdiff's parser/oracle unit tests
+        # (mocked failure modes plus a real-toolchain leg) and the
+        # binutils provisioner's 2.47 validation matrix (fake tool
+        # pairs). The pinned-tool env channels and the require-mode
+        # flag are part of the registered invocation contract
+        # (check_invocation_contracts): a leg that would silently skip,
+        # or run against the runner's distro binutils, is a contract
+        # violation — never a local convenience.
+        ASMDIFF_TEST_AS="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" \
+        ASMDIFF_TEST_OBJDUMP="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump" \
+        LCCC_REQUIRE_PINNED_ORACLE=1 \
+          python3 scripts/test_asmdiff.py
+        python3 scripts/test_godbolt_cache.py
         bash tests/regression/check_got64_old_spelling.sh
-        bash tests/regression/check_redundant_test_elimination.sh
         # A function DEFINITION's own `aligned(N)`, and the rule that an
         # attribute REPLACES `-falign-functions` instead of merging with it
         # (`aligned(1)` suppresses the directive).  Parameterized spellings
         # plus two unannotated controls.
         bash tests/regression/check_function_alignment_definition.sh
-        bash tests/regression/check_i686_atomics.sh
         python3 scripts/edg_corpus_mine.py selftest
         bash tests/regression/check_gla_backedge_no_trampoline.sh
-        bash tests/regression/check_i686_boot_asm.sh
         # A `run: |` block is shell, not YAML. Step scaffolding pasted
         # into one is valid YAML that dies with exit 127 on the runner
         # and silently skips every gate sequenced after it.
@@ -2259,12 +2347,10 @@ jobs:
         # objects. Mirrors the ci_local.sh gate of the same name;
         # check_ci_gate_parity.py fails if the two lists drift.
         bash tests/regression/check_tls_cross_models.sh
-        python3 scripts/check_peephole_directive_step.py
         bash tests/regression/check_narrow_cmp_flag_law.sh
         # One entry, one preheader: a loop with several entries must not get a
         # speculative load hoisted into a preheader that only one entry passes.
         bash tests/regression/check_multi_entry_loop.sh
-        bash tests/regression/check_const_trip_loop_inline.sh
         # The sparse-NOBITS equivalence proof: exit codes, stdout and .bss
         # layout agree across the probe set; a 16 GB object compiles under
         # a hard RSS ceiling. Mirrored in scripts/ci_local.sh.
@@ -2272,30 +2358,11 @@ jobs:
         bash tests/regression/check_loop_memset.sh
         # Dedicated-preheader transform, asserted on emitted assembly.
         bash tests/regression/check_loop_preheader.sh
-        # Array-bound contract (E22): a bad bound is diagnosed (never
-        # wrapped), a byte size that cannot exist is rejected instead of
-        # wrapping into a bogus section, and a huge .bss object is emitted
-        # sparsely under a hard address-space limit rather than being
-        # materialised and OOM-killed. Mirrored in scripts/ci_local.sh.
-        python3 scripts/check_array_bound_contract.py
         python3 scripts/glibc_check_triage.py --self-test
-        # The lane splitter rewrites the workflow that runs. Its failure modes
-        # are silent (a gate in no shard stops running, a gate in two is paid
-        # twice), so the transform is pinned on synthetic workflows where the
-        # expected bytes are the assertion.
-        python3 scripts/test_ci_lane_split.py
         python3 scripts/edg_changes_mine.py verify-artifacts
-        python3 tests/regression/check_shift_count_demand.py
-        bash tests/regression/check_f128_sign_intrinsics_strict_fp.sh
         bash tests/regression/check_fma_dest_coalesce_codegen.sh
-        # AFFOLD-VB: value-bounded affine exit-compare fold -- GCC runtime
-        # parity at the underflow edges, fire count on the guarded shapes,
-        # refusals, and the CCC_NO_AFFINE_EXIT_FOLD kill switch.
-        bash tests/regression/check_affine_value_bound.sh
-        bash tests/regression/check_fma_builtin_strict_fp.sh
         python3 -m unittest discover -s tests/fuzz -p test_punning_fuzz.py
         python3 tests/regression/verify_pr713_audit.py --quiet
-        env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_address_contract.py
         python3 scripts/edg_corpus_mine.py verify-index
         python3 tests/regression/check_debug_code_parity.py
         # Downward counter loops: `subl $1, %R; testl %R, %R; jne` keeps one
@@ -2304,8 +2371,6 @@ jobs:
         # consumers, kept for `while ((n -= 3) > 0)`) plus a matcher
         # self-test, so it cannot pass vacuously.
         bash tests/regression/check_self_test_after_arith.sh
-        bash tests/regression/check_select_from_compare.sh
-        bash tests/regression/check_phi_acyclic_order.sh
         bash tests/regression/check_dep_files.sh
         bash scripts/ensure_gas_247.sh --self-test
         python3 -m unittest discover -s tests/corpus -p 'test_*.py'
@@ -2323,7 +2388,6 @@ jobs:
         # conditional arm of j-loop N's header.  Pins oracle parity, the
         # one-broadcast-per-packed-loop ratio, and broadcast-or-refuse.
         bash tests/regression/check_vec_chain_exit_phi.sh
-        bash tests/regression/check_linker_notype_code.sh
         # check_llvm_scalar_logic.py is NOT repeated here: it already runs as
         # its own step in the `frontend` lane, which is the lane that installs
         # the pinned Clang 23.1.3 oracle its clang leg needs. Running it a
@@ -2335,90 +2399,43 @@ jobs:
         python3 tests/regression/check_peephole_pair_parallel.py
         # T4/T7: mutation self-tests for the C reducer and the punning model.
         python3 -m unittest discover -s tests/fuzz -p test_c_reduce.py
-        # Constant-folded addresses must use the same emission-order gate.
-        bash tests/regression/check_late_const_gep.sh
         # E5 (EDG register): deep-nesting crash class -> clean bounded
         # error; deep-but-legal inputs keep compiling; in-budget nesting
         # evaluates correctly end to end.
         python3 scripts/check_deep_nesting_robustness.py
-        # Plain-`char` signedness must be one answer, not three: the type
-        # system, `__CHAR_UNSIGNED__`, lccc's predefined CHAR_MIN/CHAR_MAX and
-        # glibc's `<limits.h>` (which derives from that macro) all follow
-        # `char_is_unsigned()`, including the -fno-signed-char /
-        # -fno-unsigned-char spellings.
-        # `-funsigned-char` used to flip only the type, leaving CHAR_MIN at
-        # -128 on x86-64.  Behavioural rows against GCC, plus the AArch64 /
-        # RISC-V defaults via the binary-name target selector (preprocessing
-        # only).  Mirrored in scripts/ci_local.sh (parity-checked).
-        bash tests/regression/check_char_signedness.sh
         bash tests/regression/check_fp_recurrence.sh
         # MINMAX-1: integer min/max reductions lower to packed vpmin/vpmax
         # on AVX2, and every shape the transform does not model (unsigned,
         # 16-bit, float, guarded, multi-accumulator) stays scalar AND stays
         # correct.
         bash tests/regression/check_minmax_reduction.sh
-        # Live CE delta execution moved to scheduled/manual oracle-delta.yml:
-        # network outages must not masquerade as PR-time oracle coverage.
-        # Hermetic self-tests and local differential/output gates stay required.
-        python3 scripts/oracle_delta_gate.py --self-test
         bash tests/regression/check_volatile_reduction.sh
         bash tests/regression/check_affine_loop_fold.sh
         bash tests/regression/check_fma_matcher_guards.sh
-        # The architectural implicit-operand table is the single source of
-        # truth for every pass that reasons about registers an instruction
-        # does not name; its fixture is reviewed independently of the code.
-        python3 scripts/check_implicit_operand_matrix.py
-        bash tests/regression/check_gla_cross_reach_band.sh
-        bash tests/regression/check_call_secondary_cache.sh
         bash tests/regression/check_tls_model_selection.sh
         # T6: IR verifier clean on the fixed gate subset (mirrors ci_local.sh).
         bash tests/regression/check_verify_ir_clean.sh
-        # The FMA contract gate (packed arm exact at 4, zero under
-        # -ffp-contract=off / -mno-fma, unproven shapes refused) and the wide
-        # inclusive-bound envelope behind it.  A regression test that nothing
-        # runs is the defect these were written to fix, so they run here AND
-        # in ci_local.sh -- scripts/check_ci_gate_parity.py fails if the two
-        # lists drift, which is how this line came to exist.
-        bash tests/regression/check_fma_gating.sh
         python3 scripts/audit_census.py --check
         # The trace-bisect tool is also exercised directly, so a broken
         # operand parser fails CI even if the wrapper gate is skipped.
           python3 scripts/peephole_trace_bisect.py --selftest
-        # Indexed SIB fold with a scratch-homed index: the x86-64 fold
-        # decider must accept %rdx/%r11-homed SIB operands (S13
-        # sqlite_varint golden-gate regression pin).
-        bash tests/regression/check_indexed_fold_scratch_index.sh
-        python3 tests/regression/check_popcount_loop_contract.py --run
         python3 scripts/test_ci_gate_parity.py
-        # A13/A14: a pass may synthesise a libcall only when this TU does
-        # not define that symbol (per symbol, so an asm label, an alias or
-        # a static definition counts), and a constant-size memcpy/memset
-        # call may be expanded only while the callee still is the builtin.
-        # Refusals, positive controls, the -fno-builtin/-ffreestanding
-        # contract, the ungated __*_chk rows and three runtime programs.
-        bash tests/regression/check_libcall_synthesis_no_selfcall.sh
         python3 scripts/check_doc_links.py
         bash tests/regression/check_gla_remat_policy.sh
-        bash tests/regression/check_peephole_trace_bisect.sh
-        bash tests/regression/check_gvn_xsign_load_cse.sh
         python3 tests/regression/check_llvm_bit_demand.py
         # T5 round-cap observability (engineering/FOLLOWUP-2026-10-18-vellvm-vir-transplant.md):
         # the report must print under CCC_TIME_PASSES and nowhere else. Mirrors the
         # ci_local.sh gate; check_ci_gate_parity.py fails if the two lists drift.
         bash tests/regression/check_round_cap_observability.sh
-        bash tests/regression/check_rmw_index_zext_codegen.sh
         python3 tests/regression/check_inline_devirt_hot_leaf.py
         bash tests/regression/check_map_i64_two_lane.sh
         env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_popcount_contract.py --run
-        bash tests/regression/check_loop_store_motion.sh
         # ZERO-REM-1: the map vectorizer's scalar remainder mirror must be
         # omitted (not merely unreachable) when a constant trip count makes
         # it dead, on every shape where that is provable and on none where
         # it is not -- including the alias-guard fallback, where the mirror
         # is live.
         bash tests/regression/check_vec_dead_remainder.sh
-        python3 tests/regression/check_llvm_missed_zero_choice.py
-        bash tests/regression/check_tls_model_option.sh
         # Escaped-local frame addresses stay direct operands, direct -c
         # objects equal -S + GNU as, devirtualized hot leaves inline, and C
         # masks that only feed hardware-masked x86-64 shift counts are dropped.

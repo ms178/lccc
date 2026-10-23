@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 403.38,
+      "predicted_gate_seconds": 404.52,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -11,6 +11,271 @@
           "measured_s": 0.38,
           "name": "bash tests/regression/check_va_arg_pack_len_folds.sh"
         },
+        {
+          "measured_s": 2.55,
+          "name": "python3 tests/regression/check_ci_link_oracle_provisioning.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_gvn_cross_block_mul_dot.sh"
+        },
+        {
+          "measured_s": 1.49,
+          "name": "python3 tests/regression/check_llvm_word_counts.py"
+        },
+        {
+          "measured_s": 353.25,
+          "name": "bash tests/regression/check_peephole_whitespace.sh"
+        },
+        {
+          "measured_s": 1.71,
+          "name": "bash tests/regression/check_vectorize_round_maps.sh"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "bash tests/regression/check_lea_truncation_narrowing.sh"
+        },
+        {
+          "measured_s": 2.73,
+          "name": "python3 tests/regression/check_llvm_guarded_folds.py"
+        },
+        {
+          "measured_s": 3.34,
+          "name": "bash tests/regression/check_rmw_sib_folds.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_decimal32_indexed_fold_arm.sh"
+        },
+        {
+          "measured_s": 4.4,
+          "name": "python3 tests/regression/check_llvm_scalar_facts.py"
+        },
+        {
+          "measured_s": 1.86,
+          "name": "bash tests/regression/check_affine_exit_compare.sh"
+        },
+        {
+          "measured_s": 3.59,
+          "name": "python3 tests/regression/check_llvm_integer_observations.py"
+        },
+        {
+          "measured_s": 0.46,
+          "name": "bash tests/regression/check_vector_remainder_codegen.sh"
+        },
+        {
+          "measured_s": 0.39,
+          "name": "bash tests/regression/check_asm_goto_phi_edge.sh"
+        },
+        {
+          "measured_s": 0.34,
+          "name": "ENCDIFF_TEST_OBJDUMP=\"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump\" \\ LCCC_REQUIRE_PINNED_ORACLE=1 \\ python3 scripts/test_encdiff.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_bool_pair_tail_jmp.sh"
+        },
+        {
+          "measured_s": 1.61,
+          "name": "bash tests/regression/check_store_alu_cross_join.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/test_llvm_missed_inventory.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/workloads/glibc-2.44/test_build_guards.sh"
+        },
+        {
+          "measured_s": 0.33,
+          "name": "bash tests/regression/check_bool_pair_prune.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_fortify_diagnose_as.sh"
+        },
+        {
+          "measured_s": 0.84,
+          "name": "bash tests/regression/check_reg_off_sym_fold.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_redundant_flags_compare.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_frontend_diagnostic_recovery.sh"
+        },
+        {
+          "measured_s": 0.55,
+          "name": "python3 scripts/test_glibc_check_triage.py"
+        },
+        {
+          "measured_s": 0.28,
+          "name": "bash tests/regression/check_tls_runtime_oracle.sh"
+        },
+        {
+          "measured_s": 0.26,
+          "name": "bash tests/regression/check_env_test_hygiene.sh"
+        },
+        {
+          "measured_s": 0.27,
+          "name": "bash tests/regression/check_copy_alias_sizes.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/edg_changes_mine.py selftest"
+        },
+        {
+          "measured_s": 0.33,
+          "name": "bash tests/regression/check_boot_size_measurement.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_decimal64_indexed_fold.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/test_oracle_delta_gate.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_ifconv_arm_budget_switch.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_redundant_test_elimination.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_i686_atomics.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_i686_boot_asm.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/check_peephole_directive_step.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_const_trip_loop_inline.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/check_array_bound_contract.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/test_ci_lane_split.py"
+        },
+        {
+          "measured_s": 0.33,
+          "name": "python3 tests/regression/check_shift_count_demand.py"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_f128_sign_intrinsics_strict_fp.sh"
+        },
+        {
+          "measured_s": 0.54,
+          "name": "bash tests/regression/check_affine_value_bound.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_fma_builtin_strict_fp.sh"
+        },
+        {
+          "measured_s": 0.52,
+          "name": "env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_address_contract.py"
+        },
+        {
+          "measured_s": 0.82,
+          "name": "bash tests/regression/check_select_from_compare.sh"
+        },
+        {
+          "measured_s": 1.34,
+          "name": "bash tests/regression/check_phi_acyclic_order.sh"
+        },
+        {
+          "measured_s": 0.71,
+          "name": "bash tests/regression/check_linker_notype_code.sh"
+        },
+        {
+          "measured_s": 1.16,
+          "name": "bash tests/regression/check_late_const_gep.sh"
+        },
+        {
+          "measured_s": 0.56,
+          "name": "bash tests/regression/check_char_signedness.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "python3 scripts/oracle_delta_gate.py --self-test"
+        },
+        {
+          "measured_s": 0.96,
+          "name": "python3 scripts/check_implicit_operand_matrix.py"
+        },
+        {
+          "measured_s": 0.29,
+          "name": "bash tests/regression/check_gla_cross_reach_band.sh"
+        },
+        {
+          "measured_s": 0.99,
+          "name": "bash tests/regression/check_call_secondary_cache.sh"
+        },
+        {
+          "measured_s": 2.14,
+          "name": "bash tests/regression/check_fma_gating.sh"
+        },
+        {
+          "measured_s": 0.31,
+          "name": "bash tests/regression/check_indexed_fold_scratch_index.sh"
+        },
+        {
+          "measured_s": 1.11,
+          "name": "python3 tests/regression/check_popcount_loop_contract.py --run"
+        },
+        {
+          "measured_s": 1.05,
+          "name": "bash tests/regression/check_libcall_synthesis_no_selfcall.sh"
+        },
+        {
+          "measured_s": 0.5,
+          "name": "bash tests/regression/check_peephole_trace_bisect.sh"
+        },
+        {
+          "measured_s": 0.25,
+          "name": "bash tests/regression/check_gvn_xsign_load_cse.sh"
+        },
+        {
+          "measured_s": 0.92,
+          "name": "bash tests/regression/check_rmw_index_zext_codegen.sh"
+        },
+        {
+          "measured_s": 0.31,
+          "name": "bash tests/regression/check_loop_store_motion.sh"
+        },
+        {
+          "measured_s": 0.78,
+          "name": "python3 tests/regression/check_llvm_missed_zero_choice.py"
+        },
+        {
+          "measured_s": 0.47,
+          "name": "bash tests/regression/check_tls_model_option.sh"
+        }
+      ]
+    },
+    "backend-contracts-b": {
+      "group": "backend-contracts",
+      "mode": "shell",
+      "predicted_gate_seconds": 404.52,
+      "shards": 2,
+      "step": "Verify remaining fast local contracts (shard b of 2)",
+      "steps": [
         {
           "measured_s": 0.48,
           "name": "python3 -O scripts/test_llvm_missed_inventory.py"
@@ -28,12 +293,12 @@
           "name": "python3 scripts/check_ci_gate_parity.py"
         },
         {
-          "measured_s": 0.25,
-          "name": "bash tests/regression/check_gvn_cross_block_mul_dot.sh"
+          "measured_s": 0.39,
+          "name": "bash tests/regression/check_sse2_scalar_minmax.sh"
         },
         {
-          "measured_s": 1.49,
-          "name": "python3 tests/regression/check_llvm_word_counts.py"
+          "measured_s": 1.35,
+          "name": "python3 tests/regression/check_builtin_float_aliases.py --lccc target/fastbuild/lccc --gcc gcc-16"
         },
         {
           "measured_s": 1.13,
@@ -44,16 +309,8 @@
           "name": "bash tests/regression/check_tight_loop_align.sh"
         },
         {
-          "measured_s": 353.25,
-          "name": "bash tests/regression/check_peephole_whitespace.sh"
-        },
-        {
           "measured_s": 2.12,
           "name": "python3 tests/regression/check_affine_scaled_index_matrix.py"
-        },
-        {
-          "measured_s": 1.71,
-          "name": "bash tests/regression/check_vectorize_round_maps.sh"
         },
         {
           "measured_s": 1.01,
@@ -72,32 +329,12 @@
           "name": "python3 scripts/lccc_capability_probe.py --selftest"
         },
         {
-          "measured_s": 2.73,
-          "name": "python3 tests/regression/check_llvm_guarded_folds.py"
-        },
-        {
-          "measured_s": 3.34,
-          "name": "bash tests/regression/check_rmw_sib_folds.sh"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "bash tests/regression/check_decimal32_indexed_fold_arm.sh"
-        },
-        {
           "measured_s": 0.53,
           "name": "python3 tests/regression/check_nobits_org_parity.py --lccc target/fastbuild/lccc"
         },
         {
-          "measured_s": 4.4,
-          "name": "python3 tests/regression/check_llvm_scalar_facts.py"
-        },
-        {
           "measured_s": 0.51,
           "name": "bash tests/regression/check_i686_label_ref_safety.sh"
-        },
-        {
-          "measured_s": 1.86,
-          "name": "bash tests/regression/check_affine_exit_compare.sh"
         },
         {
           "measured_s": 0.25,
@@ -108,24 +345,8 @@
           "name": "bash tests/regression/check_tls_pie_preemptible.sh"
         },
         {
-          "measured_s": 3.59,
-          "name": "python3 tests/regression/check_llvm_integer_observations.py"
-        },
-        {
           "measured_s": 0.94,
           "name": "bash tests/regression/check_pointer_ring_indexing.sh"
-        },
-        {
-          "measured_s": 0.46,
-          "name": "bash tests/regression/check_vector_remainder_codegen.sh"
-        },
-        {
-          "measured_s": 0.39,
-          "name": "bash tests/regression/check_asm_goto_phi_edge.sh"
-        },
-        {
-          "measured_s": 0.34,
-          "name": "ENCDIFF_TEST_OBJDUMP=\"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump\" \\ LCCC_REQUIRE_PINNED_ORACLE=1 \\ python3 scripts/test_encdiff.py"
         },
         {
           "measured_s": 0.34,
@@ -140,16 +361,8 @@
           "name": "python3 scripts/check_script_imports.py"
         },
         {
-          "measured_s": 0.25,
-          "name": "bash tests/regression/check_bool_pair_tail_jmp.sh"
-        },
-        {
           "measured_s": 0.8,
           "name": "bash tests/regression/check_sparse_mask_updates.sh"
-        },
-        {
-          "measured_s": 1.61,
-          "name": "bash tests/regression/check_store_alu_cross_join.sh"
         },
         {
           "measured_s": 0.3,
@@ -161,19 +374,7 @@
         },
         {
           "measured_s": 0.25,
-          "name": "python3 scripts/test_llvm_missed_inventory.py"
-        },
-        {
-          "measured_s": 0.25,
           "name": "bash tests/regression/check_demorgan_branch_split.sh"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "bash tests/workloads/glibc-2.44/test_build_guards.sh"
-        },
-        {
-          "measured_s": 0.33,
-          "name": "bash tests/regression/check_bool_pair_prune.sh"
         },
         {
           "measured_s": 0.25,
@@ -181,19 +382,7 @@
         },
         {
           "measured_s": 0.25,
-          "name": "bash tests/regression/check_fortify_diagnose_as.sh"
-        },
-        {
-          "measured_s": 0.25,
           "name": "bash tests/regression/check_i686_integer_isa_parity.sh"
-        },
-        {
-          "measured_s": 0.84,
-          "name": "bash tests/regression/check_reg_off_sym_fold.sh"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "bash tests/regression/check_redundant_flags_compare.sh"
         },
         {
           "measured_s": 0.25,
@@ -201,39 +390,11 @@
         },
         {
           "measured_s": 0.25,
-          "name": "bash tests/regression/check_frontend_diagnostic_recovery.sh"
-        },
-        {
-          "measured_s": 0.55,
-          "name": "python3 scripts/test_glibc_check_triage.py"
-        },
-        {
-          "measured_s": 0.28,
-          "name": "bash tests/regression/check_tls_runtime_oracle.sh"
-        },
-        {
-          "measured_s": 0.25,
           "name": "python3 scripts/audit_census.py --selftest"
-        },
-        {
-          "measured_s": 0.26,
-          "name": "bash tests/regression/check_env_test_hygiene.sh"
         },
         {
           "measured_s": 0.32,
           "name": "CCC=target/fastbuild/lccc bash tests/regression/check_sparse_bss_nobits.sh"
-        },
-        {
-          "measured_s": 0.27,
-          "name": "bash tests/regression/check_copy_alias_sizes.sh"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "python3 scripts/edg_changes_mine.py selftest"
-        },
-        {
-          "measured_s": 0.33,
-          "name": "bash tests/regression/check_boot_size_measurement.sh"
         },
         {
           "measured_s": 0.25,
@@ -241,15 +402,7 @@
         },
         {
           "measured_s": 0.25,
-          "name": "bash tests/regression/check_decimal64_indexed_fold.sh"
-        },
-        {
-          "measured_s": 0.25,
           "name": "ASMDIFF_TEST_AS=\"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as\" \\ ASMDIFF_TEST_OBJDUMP=\"$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/objdump\" \\ LCCC_REQUIRE_PINNED_ORACLE=1 \\ python3 scripts/test_asmdiff.py"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "python3 scripts/test_oracle_delta_gate.py"
         },
         {
           "measured_s": 0.25,
@@ -257,36 +410,11 @@
         },
         {
           "measured_s": 0.25,
-          "name": "bash tests/regression/check_ifconv_arm_budget_switch.sh"
-        },
-        {
-          "measured_s": 2.0,
-          "name": "bash tests/regression/check_lea_truncation_narrowing.sh"
-        }
-      ]
-    },
-    "backend-contracts-b": {
-      "group": "backend-contracts",
-      "mode": "shell",
-      "predicted_gate_seconds": 401.37,
-      "shards": 2,
-      "step": "Verify remaining fast local contracts (shard b of 2)",
-      "steps": [
-        {
-          "measured_s": 0.25,
           "name": "bash tests/regression/check_got64_old_spelling.sh"
         },
         {
           "measured_s": 0.25,
-          "name": "bash tests/regression/check_redundant_test_elimination.sh"
-        },
-        {
-          "measured_s": 0.25,
           "name": "bash tests/regression/check_function_alignment_definition.sh"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "bash tests/regression/check_i686_atomics.sh"
         },
         {
           "measured_s": 0.25,
@@ -295,10 +423,6 @@
         {
           "measured_s": 0.33,
           "name": "bash tests/regression/check_gla_backedge_no_trampoline.sh"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "bash tests/regression/check_i686_boot_asm.sh"
         },
         {
           "measured_s": 0.26,
@@ -318,19 +442,11 @@
         },
         {
           "measured_s": 0.25,
-          "name": "python3 scripts/check_peephole_directive_step.py"
-        },
-        {
-          "measured_s": 0.25,
           "name": "bash tests/regression/check_narrow_cmp_flag_law.sh"
         },
         {
           "measured_s": 0.55,
           "name": "bash tests/regression/check_multi_entry_loop.sh"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "bash tests/regression/check_const_trip_loop_inline.sh"
         },
         {
           "measured_s": 0.28,
@@ -346,39 +462,15 @@
         },
         {
           "measured_s": 0.25,
-          "name": "python3 scripts/check_array_bound_contract.py"
-        },
-        {
-          "measured_s": 0.25,
           "name": "python3 scripts/glibc_check_triage.py --self-test"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "python3 scripts/test_ci_lane_split.py"
         },
         {
           "measured_s": 0.25,
           "name": "python3 scripts/edg_changes_mine.py verify-artifacts"
         },
         {
-          "measured_s": 0.33,
-          "name": "python3 tests/regression/check_shift_count_demand.py"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "bash tests/regression/check_f128_sign_intrinsics_strict_fp.sh"
-        },
-        {
           "measured_s": 0.25,
           "name": "bash tests/regression/check_fma_dest_coalesce_codegen.sh"
-        },
-        {
-          "measured_s": 0.54,
-          "name": "bash tests/regression/check_affine_value_bound.sh"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "bash tests/regression/check_fma_builtin_strict_fp.sh"
         },
         {
           "measured_s": 1.81,
@@ -387,10 +479,6 @@
         {
           "measured_s": 1.92,
           "name": "python3 tests/regression/verify_pr713_audit.py --quiet"
-        },
-        {
-          "measured_s": 0.52,
-          "name": "env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_address_contract.py"
         },
         {
           "measured_s": 6.25,
@@ -403,14 +491,6 @@
         {
           "measured_s": 47.99,
           "name": "bash tests/regression/check_self_test_after_arith.sh"
-        },
-        {
-          "measured_s": 0.82,
-          "name": "bash tests/regression/check_select_from_compare.sh"
-        },
-        {
-          "measured_s": 1.34,
-          "name": "bash tests/regression/check_phi_acyclic_order.sh"
         },
         {
           "measured_s": 0.25,
@@ -433,10 +513,6 @@
           "name": "bash tests/regression/check_vec_chain_exit_phi.sh"
         },
         {
-          "measured_s": 0.71,
-          "name": "bash tests/regression/check_linker_notype_code.sh"
-        },
-        {
           "measured_s": 9.82,
           "name": "python3 tests/regression/check_peephole_pair_parallel.py"
         },
@@ -445,16 +521,8 @@
           "name": "python3 -m unittest discover -s tests/fuzz -p test_c_reduce.py"
         },
         {
-          "measured_s": 1.16,
-          "name": "bash tests/regression/check_late_const_gep.sh"
-        },
-        {
           "measured_s": 18.52,
           "name": "python3 scripts/check_deep_nesting_robustness.py"
-        },
-        {
-          "measured_s": 0.56,
-          "name": "bash tests/regression/check_char_signedness.sh"
         },
         {
           "measured_s": 9.94,
@@ -463,10 +531,6 @@
         {
           "measured_s": 5.99,
           "name": "bash tests/regression/check_minmax_reduction.sh"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "python3 scripts/oracle_delta_gate.py --self-test"
         },
         {
           "measured_s": 6.27,
@@ -481,28 +545,12 @@
           "name": "bash tests/regression/check_fma_matcher_guards.sh"
         },
         {
-          "measured_s": 0.96,
-          "name": "python3 scripts/check_implicit_operand_matrix.py"
-        },
-        {
-          "measured_s": 0.29,
-          "name": "bash tests/regression/check_gla_cross_reach_band.sh"
-        },
-        {
-          "measured_s": 0.99,
-          "name": "bash tests/regression/check_call_secondary_cache.sh"
-        },
-        {
           "measured_s": 1.57,
           "name": "bash tests/regression/check_tls_model_selection.sh"
         },
         {
           "measured_s": 3.98,
           "name": "bash tests/regression/check_verify_ir_clean.sh"
-        },
-        {
-          "measured_s": 2.14,
-          "name": "bash tests/regression/check_fma_gating.sh"
         },
         {
           "measured_s": 8.74,
@@ -513,20 +561,8 @@
           "name": "python3 scripts/peephole_trace_bisect.py --selftest"
         },
         {
-          "measured_s": 0.31,
-          "name": "bash tests/regression/check_indexed_fold_scratch_index.sh"
-        },
-        {
-          "measured_s": 1.11,
-          "name": "python3 tests/regression/check_popcount_loop_contract.py --run"
-        },
-        {
           "measured_s": 32.24,
           "name": "python3 scripts/test_ci_gate_parity.py"
-        },
-        {
-          "measured_s": 1.05,
-          "name": "bash tests/regression/check_libcall_synthesis_no_selfcall.sh"
         },
         {
           "measured_s": 0.41,
@@ -537,24 +573,12 @@
           "name": "bash tests/regression/check_gla_remat_policy.sh"
         },
         {
-          "measured_s": 0.5,
-          "name": "bash tests/regression/check_peephole_trace_bisect.sh"
-        },
-        {
-          "measured_s": 0.25,
-          "name": "bash tests/regression/check_gvn_xsign_load_cse.sh"
-        },
-        {
           "measured_s": 11.13,
           "name": "python3 tests/regression/check_llvm_bit_demand.py"
         },
         {
           "measured_s": 9.88,
           "name": "bash tests/regression/check_round_cap_observability.sh"
-        },
-        {
-          "measured_s": 0.92,
-          "name": "bash tests/regression/check_rmw_index_zext_codegen.sh"
         },
         {
           "measured_s": 7.97,
@@ -569,20 +593,8 @@
           "name": "env CCC_ARM=target/fastbuild/lccc-arm python3 tests/regression/check_arm_popcount_contract.py --run"
         },
         {
-          "measured_s": 0.31,
-          "name": "bash tests/regression/check_loop_store_motion.sh"
-        },
-        {
           "measured_s": 5.61,
           "name": "bash tests/regression/check_vec_dead_remainder.sh"
-        },
-        {
-          "measured_s": 0.78,
-          "name": "python3 tests/regression/check_llvm_missed_zero_choice.py"
-        },
-        {
-          "measured_s": 0.47,
-          "name": "bash tests/regression/check_tls_model_option.sh"
         },
         {
           "measured_s": 0.39,
@@ -1301,9 +1313,9 @@
   },
   "provenance": {
     "backend-contracts": {
-      "costs": "/tmp/contract-costs.tsv",
-      "measured_seconds_total": 802.75,
-      "source": "measured by scripts/ci_gate_costs.py"
+      "costs": "/tmp/lane_costs.tsv",
+      "measured_seconds_total": 809.04,
+      "source": "existing gate costs carried from CI-measured ci-lane-plan.json; three new gates (sse2_scalar_minmax 0.39s, builtin_float_aliases 1.35s, ci_link_oracle_provisioning 2.55s) measured locally, median of 3, 2-core research host, fastbuild lccc + gcc-16 oracle"
     },
     "codegen": {
       "costs": "/tmp/step-costs.tsv",

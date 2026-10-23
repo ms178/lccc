@@ -184,6 +184,14 @@ gate "volatile-destructuring-selftest" fast \
 gate "volatile-destructuring" fast \
     python3 scripts/check_volatile_destructuring.py
 
+# The SIMD intrinsic surface has exactly one source of truth -- the
+# generator. A hand-edited header drifting from it would silently fork the
+# intrinsic contracts the frontend believes in, so byte-compare them; like
+# the scans above it needs no compiler and runs before `build`. Mirrors the
+# hosted Clippy-lane step (gate parity).
+gate "generated-simd-header-sync" fast \
+    python3 scripts/gen_lcccsimd.py --check
+
 # ---------------------------------------------------------------- build ----
 gate "build" fast ./scripts/build_lccc_fast.sh
 

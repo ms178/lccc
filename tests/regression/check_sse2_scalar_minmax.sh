@@ -130,8 +130,8 @@ else
         set -- $spec
         body=$(awk "/^$1:/{f=1} f{print} f&&/\\.size/{exit}" "$tmp/minmax.s")
         [ -n "$body" ] || { fail "function $1 not found in assembly"; continue; }
-        printf '%s\n' "$body" | grep -q "$2" || fail "$1 body has no $2 instruction"
-        printf '%s\n' "$body" | grep -q "call" && fail "$1 body contains a call"
+        grep -q "$2" <<<"$body" || fail "$1 body has no $2 instruction"
+        grep -q "call" <<<"$body" && fail "$1 body contains a call"
     done
 fi
 
