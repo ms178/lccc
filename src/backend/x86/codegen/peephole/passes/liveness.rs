@@ -65,8 +65,7 @@ const CALL_READS: u16 = RAX | RCX | RDX | (1 << 6) | (1 << 7) | (1 << 8) | (1 <<
 const CALLER_SAVED: u16 =
     RAX | RCX | RDX | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
 /// Live at `ret`: integer return value plus everything the callee must restore.
-const RET_LIVE: u16 =
-    RAX | RDX | RBX | RBP | RSP | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
+const RET_LIVE: u16 = RAX | RDX | RBX | RBP | RSP | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
 /// Same, for a function that demonstrably returns a single value in `%rax`
 /// (its epilogue writes the accumulator and never touches `%rdx`). Keeping
 /// `%rdx` artificially live there hides every dead `movq %rax, %rdx` the

@@ -8382,7 +8382,9 @@ fn wider_tokens_in(s: &str) -> (Vec<u32>, Vec<u32>) {
                 let mut num: u32 = 0;
                 let mut digits = 0;
                 while j < bytes.len() && bytes[j].is_ascii_digit() {
-                    num = num.saturating_mul(10).saturating_add((bytes[j] - b'0') as u32);
+                    num = num
+                        .saturating_mul(10)
+                        .saturating_add((bytes[j] - b'0') as u32);
                     digits += 1;
                     j += 1;
                 }
@@ -13656,7 +13658,9 @@ mod broadcast_fold_tests {
         // With a real %zmm5 use present the %ymm5 self-move survives, and in
         // turn keeps the %xmm5 self-move alive through the barrier fallback.
         assert_eq!(
-            run("    vmovdqu %ymm5, %ymm5\n    vmovdqu %xmm5, %xmm5\n    call foo\n    vaddpd %zmm5, %zmm5, %zmm5\n"),
+            run(
+                "    vmovdqu %ymm5, %ymm5\n    vmovdqu %xmm5, %xmm5\n    call foo\n    vaddpd %zmm5, %zmm5, %zmm5\n"
+            ),
             vec![
                 "vmovdqu %ymm5, %ymm5".to_string(),
                 "vmovdqu %xmm5, %xmm5".to_string(),
@@ -13667,7 +13671,10 @@ mod broadcast_fold_tests {
         // %ymm16 is not a wider mention of %xmm1 (whole-token rule).
         assert_eq!(
             run("    vmovdqu %xmm1, %xmm1\n    call foo\n    vaddpd %ymm16, %ymm16, %ymm16\n"),
-            vec!["call foo".to_string(), "vaddpd %ymm16, %ymm16, %ymm16".to_string()]
+            vec![
+                "call foo".to_string(),
+                "vaddpd %ymm16, %ymm16, %ymm16".to_string()
+            ]
         );
         // Barrier-dense shape that used to make the pass quadratic (a fresh
         // whole-file scan per candidate): every self-move is still deleted.
