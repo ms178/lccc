@@ -1057,7 +1057,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 336.87,
+      "predicted_gate_seconds": 340.09,
       "shards": 2,
       "steps": [
         {
@@ -1209,6 +1209,22 @@
           "name": "Check baseline-SSE2 packed multiply-add codegen"
         },
         {
+          "measured_s": 0.75,
+          "name": "Check signed matmul bounds across AVX2 and two-wide paths"
+        },
+        {
+          "measured_s": 1.36,
+          "name": "Verify the two-wide matmul lowering on the x86-64 baseline"
+        },
+        {
+          "measured_s": 0.68,
+          "name": "Verify _mm_cvtts*_si32 truncation under every MXCSR rounding mode"
+        },
+        {
+          "measured_s": 0.43,
+          "name": "Verify 16-byte XMM slot forwarding end to end"
+        },
+        {
           "measured_s": 0.25,
           "name": "i686 execution capability policy"
         },
@@ -1292,7 +1308,7 @@
     },
     "frontend": {
       "costs": "/tmp/step-costs.tsv",
-      "measured_seconds_total": 673.51,
+      "measured_seconds_total": 676.73,
       "source": "measured by scripts/ci_gate_costs.py"
     }
   }
