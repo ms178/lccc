@@ -3056,6 +3056,79 @@ mod tests {
         assert!(!out.iter().any(|l| l.contains("%rcx")), "{out:?}");
     }
 
+    // ---- commuted-unary load-pair fusion: the refusal space ----
+    // Positive control: `fuses_commuted_unary_load_pair_in_place` above.
+    // Each case below breaks exactly one legality condition of the new
+    // shape; the first load must survive verbatim in every one.
+
+    #[test]
+    fn commuted_unary_refuses_when_unary_chain_register_stays_live() {
+        // %rcx is read after the consumer, so its load may not be
+        // retargeted into the product register.
+        let asm = format!(
+            "{PRO}    movq (%rdi, %r11, 8), %r10\n    movq (%rsi, %r11, 8), %rcx\n    notq %rcx\n    andq %rcx, %r10\n    movq %r10, %rax\n    addq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%rsi, %r11, 8), %rcx"), "{out:?}");
+        assert!(has(&out, "movq (%rdi, %r11, 8), %r10"), "{out:?}");
+    }
+
+    #[test]
+    fn commuted_unary_refuses_non_commutative_consumer() {
+        // sub is not commutative: MEM1 may not change places with the
+        // unary-chain operand.
+        let asm = format!(
+            "{PRO}    movq (%rdi, %r11, 8), %r10\n    movq (%rsi, %r11, 8), %rcx\n    notq %rcx\n    subq %rcx, %r10\n    movq %r10, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%rdi, %r11, 8), %r10"), "{out:?}");
+    }
+
+    #[test]
+    fn commuted_unary_refuses_segment_overridden_operand() {
+        let asm = format!(
+            "{PRO}    movq %gs:(%r11), %r10\n    movq (%rsi, %r11, 8), %rcx\n    notq %rcx\n    andq %rcx, %r10\n    movq %r10, %rax\n{EPI}"
+        );
+        assert_eq!(run(&asm, fuse_load_into_alu), asm);
+    }
+
+    #[test]
+    fn commuted_unary_refuses_memory_addressed_by_product() {
+        // MEM1 is addressed through %r10 itself: the load rewrites its own
+        // address base, so the memory text must not be carried past the
+        // intervening instructions into the consumer.
+        let asm = format!(
+            "{PRO}    movq (%r10, %r11, 8), %r10\n    movq (%rsi, %r11, 8), %rcx\n    notq %rcx\n    andq %rcx, %r10\n    movq %r10, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%r10, %r11, 8), %r10"), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_andn_load_pair_with_trailing_copy() {
+        // BMI1 three-operand shape: andn's r/m operand comes from MEM1,
+        // MEM2 stays as the (non-inverted) VEX.vvvv operand, and the
+        // trailing copy to %rax is absorbed into the destination.
+        let asm = format!(
+            "{PRO}    movq (%rdi), %r10\n    movq (%rsi), %rcx\n    andnq %r10, %rcx, %r10\n    movq %r10, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "andnq (%rdi), %rcx, %rax"), "{out:?}");
+        assert!(has(&out, "movq (%rsi), %rcx"), "{out:?}");
+        assert!(!out.iter().any(|l| l == "movq (%rdi), %r10"), "{out:?}");
+    }
+
+    #[test]
+    fn andn_refuses_when_inverted_operand_stays_live() {
+        // %r10 is read after the andn with a different destination, so
+        // MEM1's load into %r10 is load-bearing and must stay.
+        let asm = format!(
+            "{PRO}    movq (%rdi), %r10\n    movq (%rsi), %rcx\n    andnq %r10, %rcx, %rax\n    addq %r10, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%rdi), %r10"), "{out:?}");
+    }
+
     #[test]
     fn copy_bridged_commutative_crc_shape() {
         let asm = format!(

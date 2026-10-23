@@ -1435,6 +1435,106 @@ mod scalar_memcpy_tests {
     }
 
     #[test]
+    fn lowers_unaligned_eight_byte_memcpy_to_scalar_pair() {
+        // memcpy at odd offsets from both roots: the scalar pair must
+        // carry the full 8-byte width (backend scalar accesses are
+        // misalignment-tolerant; see the contract on
+        // `lower_non_alloca_scalar_memcpy`).
+        let mut func = IrFunction::new("unaligned_copy".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "src".to_string(),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "dst".to_string(),
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(3)),
+                    ty: IrType::I64,
+                },
+                Instruction::Memcpy {
+                    dest: Value(3),
+                    src: Value(2),
+                    size: 8,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        assert_eq!(lower_non_alloca_scalar_memcpy(&mut func), 1);
+        let instructions = &func.blocks[0].instructions;
+        assert!(matches!(
+            instructions[4],
+            Instruction::Load {
+                ptr: Value(2),
+                ty: IrType::I64,
+                ..
+            }
+        ));
+        assert!(matches!(
+            instructions[5],
+            Instruction::Store {
+                ptr: Value(3),
+                ty: IrType::I64,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn refuses_memcpy_with_opaque_pointer_root() {
+        // Destination loaded from memory: its allocation root is not
+        // provable by the narrow walk, so the copy stays a memcpy.
+        let mut func = IrFunction::new("opaque_copy".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "slot".to_string(),
+                },
+                Instruction::Load {
+                    dest: Value(1),
+                    ptr: Value(0),
+                    ty: IrType::Ptr,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(2),
+                    name: "src".to_string(),
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(2),
+                    size: 8,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        assert_eq!(lower_non_alloca_scalar_memcpy(&mut func), 0);
+        assert!(matches!(
+            func.blocks[0].instructions[3],
+            Instruction::Memcpy { .. }
+        ));
+    }
+
+    #[test]
     fn leaves_alloca_backed_memcpy_for_aggregate_sroa() {
         let mut func = IrFunction::new("alloca_copy".to_string(), IrType::Void, vec![], false);
         func.blocks.push(BasicBlock {

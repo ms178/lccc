@@ -8560,4 +8560,299 @@ mod extern_admission_tests {
             Instruction::Call { func, .. } if func == "cmp_fn"
         ));
     }
+
+    // ---- invariant-callback devirtualization: the refusal space ----
+    //
+    // `propagate_invariant_fn_ptr_params` is sound only because every one
+    // of its guards refuses.  Each test below builds the proven-positive
+    // module and then breaks exactly one guard; deleting or weakening that
+    // guard must turn exactly its test red.  Positive control:
+    // `devirtualizes_entry_alloca_and_recursive_invariant_fn_ptr_param`.
+
+    fn devirt_ptr_param() -> crate::ir::reexports::IrParam {
+        crate::ir::reexports::IrParam {
+            ty: IrType::Ptr,
+            struct_size: None,
+            struct_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            riscv_float_class: None,
+            is_f128_sse: false,
+            noalias: false,
+            param_align: None,
+        }
+    }
+
+    fn devirt_call_info(
+        dest: Value,
+        args: Vec<Operand>,
+        arg_types: Vec<IrType>,
+    ) -> crate::ir::reexports::CallInfo {
+        use crate::ir::reexports::CallInfo;
+        let n = arg_types.len();
+        CallInfo {
+            dest: Some(dest),
+            args,
+            arg_types,
+            return_type: IrType::I32,
+            is_variadic: false,
+            num_fixed_args: n,
+            struct_arg_sizes: vec![None; n],
+            struct_arg_aligns: vec![None; n],
+            struct_arg_classes: vec![Vec::new(); n],
+            struct_arg_riscv_float_classes: vec![None; n],
+            is_sret: false,
+            is_fastcall: false,
+            ret_eightbyte_classes: Vec::new(),
+            ..CallInfo::default()
+        }
+    }
+
+    /// The positive fixture: `caller` passes `cmp_fn` to static `worker`,
+    /// which loads it through an unescaped entry alloca, recurses with it,
+    /// and calls it indirectly.  Function order: [cmp_fn, worker, caller].
+    fn invariant_callback_module() -> crate::ir::reexports::IrModule {
+        use crate::common::types::AddressSpace;
+        use crate::ir::reexports::IrModule;
+
+        let mut target = IrFunction::new("cmp_fn".to_string(), IrType::I32, vec![], false);
+        target.is_static = true;
+        target.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: Vec::new(),
+        });
+
+        let mut worker = IrFunction::new(
+            "worker".to_string(),
+            IrType::I32,
+            vec![devirt_ptr_param()],
+            false,
+        );
+        worker.is_static = true;
+        worker.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::Ptr,
+                    size: 8,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::Store {
+                    val: Operand::Value(Value(1)),
+                    ptr: Value(0),
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Load {
+                    dest: Value(2),
+                    ptr: Value(0),
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Call {
+                    func: "worker".to_string(),
+                    info: devirt_call_info(Value(3), vec![Operand::Value(Value(2))], vec![IrType::Ptr]),
+                },
+                Instruction::CallIndirect {
+                    func_ptr: Operand::Value(Value(2)),
+                    info: devirt_call_info(Value(4), vec![], vec![]),
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
+            source_spans: Vec::new(),
+        });
+
+        let mut caller = IrFunction::new("caller".to_string(), IrType::I32, vec![], false);
+        caller.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "cmp_fn".to_string(),
+                },
+                Instruction::Call {
+                    func: "worker".to_string(),
+                    info: devirt_call_info(Value(1), vec![Operand::Value(Value(0))], vec![IrType::Ptr]),
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
+        });
+
+        let mut module = IrModule::new();
+        module.functions = vec![target, worker, caller];
+        module
+    }
+
+    fn assert_not_devirtualized(module: &mut crate::ir::reexports::IrModule) {
+        assert!(devirtualize_constant_indirect_calls(module).is_empty());
+        assert!(
+            module.functions[1].blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::CallIndirect { .. })),
+            "indirect call must survive"
+        );
+    }
+
+    #[test]
+    fn devirt_refuses_disagreeing_second_caller() {
+        let mut module = invariant_callback_module();
+        let mut other = IrFunction::new("other_fn".to_string(), IrType::I32, vec![], false);
+        other.is_static = true;
+        other.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(1)))),
+            source_spans: Vec::new(),
+        });
+        let mut caller2 = IrFunction::new("caller2".to_string(), IrType::I32, vec![], false);
+        caller2.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "other_fn".to_string(),
+                },
+                Instruction::Call {
+                    func: "worker".to_string(),
+                    info: devirt_call_info(Value(1), vec![Operand::Value(Value(0))], vec![IrType::Ptr]),
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
+        });
+        module.functions.push(other);
+        module.functions.push(caller2);
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_weak_callee() {
+        let mut module = invariant_callback_module();
+        module.functions[1].is_weak = true;
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_variadic_callee() {
+        let mut module = invariant_callback_module();
+        module.functions[1].is_variadic = true;
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_external_linkage_callee() {
+        let mut module = invariant_callback_module();
+        module.functions[1].is_static = false;
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_asm_labelled_callee() {
+        let mut module = invariant_callback_module();
+        module
+            .asm_labels
+            .insert("worker".to_string(), "worker_asm".to_string());
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_arity_mismatched_call_site() {
+        let mut module = invariant_callback_module();
+        match &mut module.functions[2].blocks[0].instructions[1] {
+            Instruction::Call { info, .. } => {
+                info.args.push(Operand::Const(IrConst::I64(0)));
+                info.arg_types.push(IrType::I64);
+            }
+            _ => panic!("fixture shape changed"),
+        }
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_twice_stored_entry_alloca() {
+        let mut module = invariant_callback_module();
+        let store = module.functions[1].blocks[0].instructions[2].clone();
+        module.functions[1].blocks[0].instructions.insert(3, store);
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_load_before_store_entry_alloca() {
+        let mut module = invariant_callback_module();
+        module.functions[1].blocks[0].instructions.swap(2, 3);
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_entry_block_back_edge() {
+        let mut module = invariant_callback_module();
+        module.functions[1].blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(0)),
+            source_spans: Vec::new(),
+        });
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_unresolved_parameter_origin() {
+        let mut module = invariant_callback_module();
+        module.functions[2].params.push(devirt_ptr_param());
+        module.functions[2].blocks[0].instructions[0] = Instruction::ParamRef {
+            dest: Value(0),
+            param_idx: 0,
+            ty: IrType::Ptr,
+        };
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_composes_through_passthrough_caller() {
+        let mut module = invariant_callback_module();
+        // caller -> mid(cmp_fn); mid forwards its parameter to worker.
+        match &mut module.functions[2].blocks[0].instructions[1] {
+            Instruction::Call { func, .. } => *func = "mid".to_string(),
+            _ => panic!("fixture shape changed"),
+        }
+        let mut mid = IrFunction::new(
+            "mid".to_string(),
+            IrType::I32,
+            vec![devirt_ptr_param()],
+            false,
+        );
+        mid.is_static = true;
+        mid.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::Call {
+                    func: "worker".to_string(),
+                    info: devirt_call_info(Value(1), vec![Operand::Value(Value(0))], vec![IrType::Ptr]),
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
+        });
+        module.functions.push(mid);
+        let rewritten = devirtualize_constant_indirect_calls(&mut module);
+        assert!(rewritten.contains(&("worker".to_string(), "cmp_fn".to_string())));
+    }
 }

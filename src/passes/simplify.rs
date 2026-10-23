@@ -5602,6 +5602,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn trichotomy_masks_round_trip_every_integer_compare() {
+        // The mask algebra is only sound if the mapping is total and
+        // invertible on exactly the six non-trivial trichotomies; the
+        // all-false and all-true masks must refuse (they are constants,
+        // not compares).
+        for (op, unsigned) in [
+            (IrCmpOp::Eq, false),
+            (IrCmpOp::Ne, false),
+            (IrCmpOp::Slt, false),
+            (IrCmpOp::Sle, false),
+            (IrCmpOp::Sgt, false),
+            (IrCmpOp::Sge, false),
+            (IrCmpOp::Ult, true),
+            (IrCmpOp::Ule, true),
+            (IrCmpOp::Ugt, true),
+            (IrCmpOp::Uge, true),
+        ] {
+            let mask = int_cmp_trichotomy_mask(op);
+            assert_eq!(
+                int_cmp_from_trichotomy_mask(mask, unsigned),
+                Some(op),
+                "{op:?} via mask {mask:#05b}"
+            );
+        }
+        for unsigned in [false, true] {
+            assert_eq!(int_cmp_from_trichotomy_mask(0b000, unsigned), None);
+            assert_eq!(int_cmp_from_trichotomy_mask(0b111, unsigned), None);
+        }
+    }
+
+    #[test]
+    fn peel_bool_cond_is_bounded_and_narrowing_needs_a_proven_boolean() {
+        // Seventeen widening casts over Value(0): a 16-step peel budget
+        // reaches Value(0) from Value(16) and stops at Value(1) from
+        // Value(17) instead of walking unbounded chains.
+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 18];
+        for i in 1..=17usize {
+            cast_defs[i] = Some(CastDef {
+                src: Operand::Value(Value((i - 1) as u32)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            });
+        }
+        let is_boolean = vec![false; 18];
+        let cmp_defs: Vec<Option<CmpDef>> = vec![None; 18];
+        let def_counts = vec![1u8; 18];
+        assert!(matches!(
+            peel_bool_cond(
+                Operand::Value(Value(16)),
+                &cast_defs,
+                &is_boolean,
+                &cmp_defs,
+                &def_counts
+            ),
+            Operand::Value(Value(0))
+        ));
+        assert!(matches!(
+            peel_bool_cond(
+                Operand::Value(Value(17)),
+                &cast_defs,
+                &is_boolean,
+                &cmp_defs,
+                &def_counts
+            ),
+            Operand::Value(Value(1))
+        ));
+        // One narrowing cast over a non-boolean base: 0x100 truncates to
+        // zero, so the peel must refuse and return the operand unchanged.
+        cast_defs[1] = Some(CastDef {
+            src: Operand::Value(Value(0)),
+            from_ty: IrType::I64,
+            to_ty: IrType::I8,
+        });
+        assert!(matches!(
+            peel_bool_cond(
+                Operand::Value(Value(1)),
+                &cast_defs,
+                &is_boolean,
+                &cmp_defs,
+                &def_counts
+            ),
+            Operand::Value(Value(1))
+        ));
+        // The same narrowing cast over a proven boolean (0/1 survives any
+        // truncation) peels to the base.
+        let mut is_boolean = vec![false; 18];
+        is_boolean[0] = true;
+        assert!(matches!(
+            peel_bool_cond(
+                Operand::Value(Value(1)),
+                &cast_defs,
+                &is_boolean,
+                &cmp_defs,
+                &def_counts
+            ),
+            Operand::Value(Value(0))
+        ));
+    }
+
     // === Constant reassociation tests ===
 
     #[test]
