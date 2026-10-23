@@ -1401,6 +1401,17 @@ fn peephole_optimize_inner(
         }
         if !sk("self_test") {
             {
+                let c = flag_peepholes::fold_arithmetic_test_sign_cmov(&mut store, &mut infos);
+                trace(
+                    "fold_arithmetic_test_sign_cmov",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+            {
                 let c = flag_peepholes::eliminate_redundant_self_test(&mut store, &mut infos);
                 trace(
                     "eliminate_redundant_self_test",

@@ -1,9 +1,13 @@
 # LCCC engineering backlog
 
 **Live, evidence-qualified open work only.** This roadmap is reconciled against
-`main` at `a88fb736bfe253c91018b32ea0ba5d4b7dc6057e` (PR #844 merge, after
-PR #846), 2026-10-17. It is not a compiler-quality certificate or a record of every
-historical experiment. The previous 3,302-line queue is preserved verbatim at
+`main` at `4ba567022b7d358837aa13be4eb999621871c9f9` (PR #941 merge),
+2026-10-23. The audit reviewed the 100 most recent upstream commits and
+inventoried 60 distinct engineering/docs Markdown paths they touched; statuses
+below are revalidated only where the referenced gate or evidence was rerun,
+not inferred from commit presence. This is not a compiler-quality certificate
+or a record of every historical experiment. The previous 3,302-line queue is
+preserved verbatim at
 [`engineering/archive/ROOT-BACKLOG-2026-10-17.md`](engineering/archive/ROOT-BACKLOG-2026-10-17.md);
 its dated status text must not be read as current without revalidation.
 
@@ -29,33 +33,58 @@ its dated status text must not be read as current without revalidation.
   missing evidence, not a pass. A moving Compiler Explorer channel is not a
   binary pin; record its resolved metadata.
 
-## Current evidence boundary
+## Current evidence boundary (2026-10-23)
 
-- The current upstream base is `a88fb736bfe253c91018b32ea0ba5d4b7dc6057e`
-  (PR #844 merged atop #846). `gh pr checks 844` reported 14/14 checks passing,
-  including build/unit, Clippy, MSRV, codegen/runtime, assembler/linker,
-  relocation, corpus, and GCC 16/Rust 1.99 contracts. This is hosted evidence;
-  the candidate-specific audit/performance job was skipped, so it is not a
-  fresh performance acceptance receipt.
-- The upstream PR #844 S05 follow-up records a 377-case corpus result of 248
-  pass, 128 fail, and 1 error, plus an identified compile-time profiling
-  concern (MS-20) and active FE-26/FE-27/LK-31 work. Preserve these as open
-  engineering items; they are not closed by green CI. See
-  [`engineering/FOLLOWUP-2026-10-17-s05-rebase-backlog.md`](engineering/FOLLOWUP-2026-10-17-s05-rebase-backlog.md)
-  and [`engineering/agent/BACKLOG.md`](engineering/agent/BACKLOG.md).
-- This workspace lacks Rust/Cargo, Valgrind/Callgrind, GCC 16, and AArch64
-  cross tools; available host GCC is 12.2. Python checks passed where run, but
-  PyYAML was missing from system Python; after installing it in a temporary
-  virtual environment, CI gate-parity and the previously blocked selected tests
-  passed. The final `ci_local.sh --fast` attempt under system Python therefore
-  still failed its workflow-shell parser gate, then stopped at build because
-  Rust/Cargo are absent. No post-merge FAST pass, rustfmt, Clippy, LCCC build,
-  compiler regression, or performance measurement is established here. Hosted
-  checks and local evidence are intentionally kept separate.
-- The offline oracle-tool failure suite passed **40 tests**. In particular,
-  `oracle_asm.py` and `tune_oracle.py` already fail closed on missing local or
-  remote output; the older backlog's proposed fixes for these behaviors are
-  stale and are not reopened.
+- Current upstream identity: `4ba567022b7d358837aa13be4eb999621871c9f9`
+  (PR #941 merge). The prior 2026-10-17 base and hosted receipts remain useful
+  history only; they are not current-main test or performance claims.
+- The last 100 main commits touched 60 distinct Markdown paths under `docs/`
+  and `engineering/`. The highest-impact current findings are recorded in
+  [`docs/FOLLOWUP-2026-10-23-open-pr-audit.md`](docs/FOLLOWUP-2026-10-23-open-pr-audit.md),
+  [`docs/FOLLOWUP-2026-10-23-remaining-codegen-gap.md`](docs/FOLLOWUP-2026-10-23-remaining-codegen-gap.md),
+  [`docs/FOLLOWUP-2026-10-22-ipa-ra-callee-clobbers.md`](docs/FOLLOWUP-2026-10-22-ipa-ra-callee-clobbers.md),
+  [`engineering/journal/2026-10-22-inline-memmove-and-zstd-decode-gap.md`](engineering/journal/2026-10-22-inline-memmove-and-zstd-decode-gap.md),
+  and [`engineering/FINDINGS-2026-10-21-s93.md`](engineering/FINDINGS-2026-10-21-s93.md).
+  These reports invalidate several rows in the older 2026-10-22 codegen TODO
+  table; current-tree rechecks below take precedence over those earlier statuses.
+- Revalidated on the current main compiler before this follow-up: the phi
+  acyclic-order gate passes (`rot()` default 50 instructions / 3 stack refs;
+  GCC 16.2 60 / 6; both policy arms match on 65 trip counts); the LLVM scalar
+  facts gate passes with GCC 16.2 and Clang; the 16-byte atomic runtime
+  checks pass at `-O1`, `-O2`, and `-O3`. The first standalone atomic run
+  lacked GCC 16 on `PATH`, so its oracle-parity leg was skipped there; the
+  final fast-CI rerun below is the oracle receipt. Thus the old TODO-7 and
+  TODO-10 claims are stale on current main. TODO-11's old witness is also superseded:
+  the current scalar-facts gate uses a different mechanism witness and passes;
+  do not revive the old guard diagnosis without a new failing control.
+- The open-PR audit did **not** adopt the 10k-line SIMD stack: the current
+  49-program corpus has no matching 16-byte XMM stack operands, so those PRs
+  remain unvalidated, not accepted. The layout-tie result is tree-specific and
+  already landed; the original #932 benchmark number is not portable across a
+  rebase. Keep the `CCC_LAYOUT_TIE_ORIG=1` rollback and the strict stack rule.
+- The remaining broad codegen/runtime gaps are not closed by those green gates:
+  `hot_web_loop` still has an IPA-RA/callee-clobber hypothesis; Zstandard's
+  recent memmove/byval fixes improved specific workloads, while
+  `ZSTD_decompressSequencesLong_default` (2517 instructions / 871 frame
+  references vs GCC's 1786 / 401) and `ZSTD_safecopy` (211 / 58 vs 152 / 0)
+  remain separate allocator gaps. These are evidence for follow-up, not runtime
+  wins attributed to the present peephole.
+- Local tool provisioning for this task: Rust stable 1.99.1, GCC 16.2.0,
+  Clang 23.1.3, ICX 2026.2.0, Valgrind 3.24, AArch64 and RISC-V cross GCCs,
+  QEMU user, and an active 8 GiB swapfile. `gcc-16 -m32` links. The Debian
+  `gcc-14-multilib` component and i386 development libraries remain installed;
+  Debian's `gcc-multilib` meta-package was removed when the cross compiler
+  packages were installed because of their package conflict. The pinned GAS
+  2.47 x86-64 and AArch64 toolchains are present. The final fast-CI result for
+  the final fast-CI run after refresh/rebase is the publication gate; prior
+  incomplete attempts are not promoted to a pass. The delivery receipt reports
+  its exact result with rustfmt and strict Clippy. Full/slow CI is not run.
+- Compiler Explorer metadata is not silently equated with local pins: its
+  `clang` channel resolved to 23.1.0 in this run. Exact Clang 23.1.3 comparison
+  for the current change is local and recorded in the regression receipt. The
+  offline oracle-tool self-tests remain separate from vendor comparison data.
+  The historical 2026-10-21 authorization to run slow CI was scoped to that
+  prior PR; this follow-up runs `--fast` only, as directed.
 
 ## P0 — semantic correctness and capability honesty
 
@@ -197,11 +226,14 @@ expression semantics.
 
 ### P1.1 — Fannkuch runtime regression: explain before changing code
 
-**Evidence:** S101/S102 reported about **25% slower than main** in paired native
-screens; the later bounded record shows full-default Callgrind Ir
-17,131,993,449 versus 16,054,326,746. These are separate metrics: Ir is not
-cycles. A `-fno-wrapv` ablation is diagnostic only and is explicitly not
-permission to remove `-fwrapv`.
+**Evidence:** S101/S102's approximately **25% slower than main** result and
+full-default Callgrind Ir totals (17,131,993,449 vs 16,054,326,746) are
+historical, not a current Fannkuch receipt; Ir is not cycles. The latest
+49-program paired report records corpus geomean `lccc/GCC16.2` 0.7897 on the
+synthesized main, but does not establish Fannkuch's current per-program ratio.
+Remeasure the exact program before carrying forward the old slowdown. A
+`-fno-wrapv` ablation is diagnostic only and is explicitly not permission to
+remove `-fwrapv`.
 
 **Next:** freeze the exact current source, flags, executable and input; attribute
 hot-loop instruction/value-flow changes using Godbolt assembly, the existing
@@ -251,6 +283,17 @@ byte-identical archive too). Therefore no runtime claim is made here and no
 knob is shipped: the remaining gap is the base colourer's global decision to
 spill long-range hot values, which needs a residency/live-range-splitting
 change with its own A/B and corpus review, not a threshold tweak.
+
+**Progress 2026-10-23 (current gap attribution):** the latest 49-program
+paired report shows `zstd_count` at +21.2% Callgrind Ir vs GCC 16.2, with
+`mov*` accounting for 76% of the Ir delta. This is static instruction-count
+attribution, not an application runtime result. The broader move census points
+toward allocator-side zero-extension copies, symbol-plus-register address
+composition, a loop-carried spill, and fixed-register shift chains; the report
+explicitly rejects another peephole-only campaign. The exact current remaining
+workloads are recorded above (`ZSTD_decompressSequencesLong_default` and
+`ZSTD_safecopy`), and no global win or regression is inferred from the single
+kernel.
 
 **Next:** only continue with a causal, source-independent hypothesis. Profile
 bounded Callgrind regions and inspect exact hot instructions/register-stack
@@ -335,6 +378,53 @@ failed oracle self-check is otherwise a hard failure naming the declaration.
 The only fixture that needs it is `gnu_constant_builtins` (vector
 `__builtin_classify_type` is 19 on GCC 14+, -1 on GCC 12). Two tests cover the
 declared and undeclared paths plus the fail-closed key parse.
+
+### P1.5 — Continue scalar min/max/abs lowering from the sign-only witness
+
+**Evidence:** the recent codegen-round reports identify scalar min/max/abs as a
+remaining family. This follow-up implements one exact x86 case:
+`max(0, a - b)` represented as arithmetic → same-width TEST → sign-only CMOV.
+The witness changes 6 to 5 actual instructions in LCCC; GCC 16.2 uses 4, while
+local Clang 23.1.3 and ICX 2026.2 use 5. Runtime output matches GCC/Clang/ICX
+for `-O0`, `-O1`, `-O2`, `-O3`, and `-Os`, including wrapping edges. The
+comparison is static code shape only; no runtime-speed claim follows.
+See [`engineering/journal/2026-10-23-sign-test-cmov.md`](engineering/journal/2026-10-23-sign-test-cmov.md)
+and the artifact directory
+[`engineering/evidence/sign-test-cmov-2026-10-23/`](engineering/evidence/sign-test-cmov-2026-10-23/).
+
+**Next:** enumerate the remaining min/max/abs shapes and determine which are
+legally reducible from their exact flag semantics; retain strict-positive and
+other ZF-dependent controls. Add a minimal witness and negative control for each
+accepted generalization. Keep same-width and all intervening-flag-use barriers;
+never rewrite from source-level algebra alone.
+
+**Accept:** exact compiler differential over the supported arithmetic domain,
+optimization modes, and existing overflow flags; mutation-sensitive runtime and
+codegen gates; final fast CI, rustfmt, strict Clippy, and exact-version oracle
+receipts. Any runtime claim requires the matched output-checked paired runner
+on a workload with useful duration; instruction count is not a substitute.
+
+### P1.6 — IPA-RA: known-callee clobber sets for `hot_web_loop`
+
+**Evidence:** `docs/FOLLOWUP-2026-10-22-ipa-ra-callee-clobbers.md` measures
+`hot_web_loop` at 1.549× GCC 16.2 runtime on a 99.8 ms median and finds 18
+stack references in LCCC versus none in GCC. The specific mechanism is that
+four hot loop-carried values are copied into callee-saved homes around a
+`static noinline` helper because the allocator assumes every call clobbers all
+caller-saved registers. This is a measured, bounded workload result, not a
+universal compiler ranking.
+
+**Next:** prototype post-allocation per-callee written-register summaries in
+reverse topological order. Preserve conservative caller-saved clobbers for
+recursive cycles, indirect/unknown calls, escaped functions, and external ABI
+calls; inspect the full report's fallback design before coding. A per-callee
+summary that is not proven safe must not affect allocation.
+
+**Accept:** exact helper/call-graph, recursion, indirect-call, escaped-function,
+and external-ABI controls; no allocator miscompile; reproducible assembly and
+runtime evidence on `hot_web_loop`, the complete 49-program corpus, and callback
+kernels. Use a matched paired runner and retain all regressions. Do not adopt
+from static counts alone.
 
 ## Rejected/stale queue claims
 

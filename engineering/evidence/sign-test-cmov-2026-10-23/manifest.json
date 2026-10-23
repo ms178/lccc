@@ -1,0 +1,100 @@
+{
+  "schema": 1,
+  "source": "tests/regression/sign_test_cmov.c",
+  "source_sha256": "fbda99fcb63d108bcceec726d591e851ee5748b3368e652ff3d3b1c57c227eac",
+  "function": "nonnegative_difference",
+  "remote_flags": "-O2 -fwrapv",
+  "local_flags": "-O2 -fwrapv",
+  "oracles": [
+    {
+      "key": "lccc",
+      "id": "target/fastbuild/lccc",
+      "name": "local LCCC",
+      "flags": "-O2 -fwrapv",
+      "instructions": 5
+    },
+    {
+      "key": "gcc16.2",
+      "id": "cg162",
+      "name": "x86-64 gcc 16.2",
+      "semver": "16.2",
+      "compilerType": "",
+      "flags": "-O2 -fwrapv",
+      "instructions": 4
+    },
+    {
+      "key": "clang",
+      "id": "cclang2310",
+      "name": "x86-64 clang 23.1.0",
+      "semver": "23.1.0",
+      "compilerType": "clang",
+      "flags": "-O2 -fwrapv",
+      "instructions": 5
+    },
+    {
+      "key": "icx2026.2",
+      "id": "icx2026.2",
+      "name": "Intel oneAPI DPC++/C++ 2026.2.x (local)",
+      "semver": "2026.2.0",
+      "compilerType": "local-icx",
+      "binary": "/home/user/.cache/intel-icx-2026.2/opt/intel/oneapi/compiler/2026.2/bin/icx",
+      "binary_sha256": "59eaaf55744c7290fb870cd12049ec11877b5224e333cba33270b433bdb73213",
+      "probe": "__INTEL_LLVM_COMPILER=20260200",
+      "target": "x86_64",
+      "pointer_bits": 64,
+      "provisioning": {
+        "release_line": "2026.2",
+        "semver": "2026.2.0",
+        "repository": "https://apt.repos.intel.com/oneapi",
+        "key_url": "https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB",
+        "key_sha256": "db932ba032a71f732dc415eef5f4f185fc7ae768487d7a357bc2772746b6c48c",
+        "packages": [
+          {
+            "Package": "intel-oneapi-dpcpp-cpp-2026.2",
+            "Version": "2026.2.0-863",
+            "Architecture": "amd64",
+            "Filename": "pool/main/intel-oneapi-dpcpp-cpp-2026.2-2026.2.0-863_amd64.deb",
+            "SHA256": "fb4f0b9d380000d7cd62c44751f7326c10458ee28868a3fcb7bddc1919fbff61"
+          },
+          {
+            "Package": "intel-oneapi-compiler-shared-runtime-2026.2",
+            "Version": "2026.2.0-863",
+            "Architecture": "amd64",
+            "Filename": "pool/main/intel-oneapi-compiler-shared-runtime-2026.2-2026.2.0-863_amd64.deb",
+            "SHA256": "fdb13eb410afec2214b20bc8b9296ec4e9e61c41d5aeda268de40e9b37354b87"
+          },
+          {
+            "Package": "intel-oneapi-compiler-shared-2026.2",
+            "Version": "2026.2.0-863",
+            "Architecture": "amd64",
+            "Filename": "pool/main/intel-oneapi-compiler-shared-2026.2-2026.2.0-863_amd64.deb",
+            "SHA256": "6d8b93fd075bb0956862d0a52620c8b08bb32179aac85225a3078399c94a41ca"
+          },
+          {
+            "Package": "intel-oneapi-compiler-dpcpp-cpp-common-2026.2",
+            "Version": "2026.2.0-863",
+            "Architecture": "all",
+            "Filename": "pool/main/intel-oneapi-compiler-dpcpp-cpp-common-2026.2-2026.2.0-863_all.deb",
+            "SHA256": "316a28082f9f3f5553c8810db7084fffd704f7ec39b8208c601b434cddef1767"
+          },
+          {
+            "Package": "intel-oneapi-compiler-shared-common-2026.2",
+            "Version": "2026.2.0-863",
+            "Architecture": "all",
+            "Filename": "pool/main/intel-oneapi-compiler-shared-common-2026.2-2026.2.0-863_all.deb",
+            "SHA256": "cbc2f1282f03ae7b991698ce33035b496af085b1fee5e9a95d0a40720f838a79"
+          }
+        ],
+        "apt_metadata_sha256": {
+          "apt.repos.intel.com_oneapi_dists_all_InRelease": "46951f6f0fefb1ee368fa3342663780dd6e5f3de735effedab8fbbbf1b4cd712",
+          "apt.repos.intel.com_oneapi_dists_all_main_binary-amd64_Packages": "6319f05a071a555785971d9da86cd1379f2fa0a24d2de61eff219952729df617",
+          "apt.repos.intel.com_oneapi_dists_all_main_binary-all_Packages": "cb802fc7a286f928b243168a894b27eebe8c86e59628c9300ea2f89dfa952831"
+        },
+        "binary": "opt/intel/oneapi/compiler/2026.2/bin/icx",
+        "binary_sha256": "59eaaf55744c7290fb870cd12049ec11877b5224e333cba33270b433bdb73213"
+      },
+      "flags": "-O2 -fwrapv",
+      "instructions": 5
+    }
+  ]
+}

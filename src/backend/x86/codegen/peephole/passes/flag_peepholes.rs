@@ -29,7 +29,8 @@
 
 use super::super::types::*;
 use super::helpers::{
-    get_dest_reg, is_read_modify_write, src_mentions_family, writes_family, writes_family_full,
+    get_dest_reg, has_implicit_reg_usage, is_read_modify_write, src_mentions_family, writes_family,
+    writes_family_full,
 };
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
@@ -2023,6 +2024,163 @@ fn is_pure_reg_bump(t: &str, info: &LineInfo) -> bool {
         return plain_gp_operand(rest.trim()) == Some(dst);
     }
     false
+}
+
+/// Replace a self-test of an arithmetic result with the equivalent sign-only
+/// condition when the result itself came from that arithmetic operation.
+///
+/// `sub %esi, %edi; test %edi, %edi; cmovge %edi, %eax` tests whether the
+/// *wrapped result* is non-negative. `test` clears OF, so `ge` here is exactly
+/// `ns`; the arithmetic producer has the same SF as the test at the same
+/// width. Rewriting to `sub; cmovns` removes the redundant test without
+/// relying on signed-overflow assumptions (including under `-fwrapv`). The
+/// mirrored `l` -> `s` case is the negative-result predicate. All other
+/// conditions are refused: e.g. `g` after TEST is `!ZF && !SF`, which cannot
+/// be expressed by the arithmetic flags when OF is nonzero.
+///
+/// The consumer walk after the `cmov` must prove that no later instruction
+/// observes any of the flags changed by deleting TEST before a complete flag
+/// writer. This is deliberately narrower than the general self-test fold.
+pub(super) fn fold_arithmetic_test_sign_cmov(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut changed = false;
+    let mut test_idx = 0;
+    while test_idx < len {
+        if infos[test_idx].is_nop() || infos[test_idx].pinned {
+            test_idx += 1;
+            continue;
+        }
+        let test = infos[test_idx].trimmed(store.get(test_idx));
+        let (test_width, args) = if let Some(args) = test.strip_prefix("testq ") {
+            ('q', args)
+        } else if let Some(args) = test.strip_prefix("testl ") {
+            ('l', args)
+        } else {
+            test_idx += 1;
+            continue;
+        };
+        let Some((lhs, rhs)) = split_two_operands(args) else {
+            test_idx += 1;
+            continue;
+        };
+        if lhs != rhs {
+            test_idx += 1;
+            continue;
+        }
+        let Some(fam) = plain_gp_operand(lhs) else {
+            test_idx += 1;
+            continue;
+        };
+        if fam > REG_GP_MAX || fam == REG_RSP {
+            test_idx += 1;
+            continue;
+        }
+        let mask = 1u16 << fam;
+
+        // Find the nearest flag writer. It must define the tested register,
+        // and arithmetic/test widths must match so SF denotes the same bit.
+        let mut producer = None;
+        let mut p = test_idx;
+        while p > 0 {
+            p -= 1;
+            if infos[p].is_nop() || infos[p].kind == LineKind::Empty {
+                continue;
+            }
+            if infos[p].pinned
+                || infos[p].is_barrier()
+                || matches!(infos[p].kind, LineKind::Label | LineKind::Directive)
+            {
+                break;
+            }
+            let pt = infos[p].trimmed(store.get(p));
+            match flags_effect(pt) {
+                FlagsEffect::Writes => {
+                    let Some((wide, TestFlagAgreement::ZeroOnly)) = test_flag_agreement(pt) else {
+                        break;
+                    };
+                    if wide == (test_width == 'q') && get_dest_reg(&infos[p]) == fam {
+                        producer = Some(p);
+                    }
+                    break;
+                }
+                FlagsEffect::Reads => break,
+                FlagsEffect::Neutral => {
+                    if infos[p].reg_refs & mask != 0 || has_implicit_reg_usage(pt) {
+                        break;
+                    }
+                }
+            }
+        }
+        let Some(_producer) = producer else {
+            test_idx += 1;
+            continue;
+        };
+
+        // The first reader must be a sign-only conditional move. Neutral
+        // staging may read the tested value but must not redefine it. Any
+        // other flag consumer/writer or control-flow boundary fails closed.
+        let mut cmov_idx = None;
+        let mut n = test_idx + 1;
+        while n < len {
+            if infos[n].is_nop() || infos[n].kind == LineKind::Empty {
+                n += 1;
+                continue;
+            }
+            if infos[n].pinned
+                || infos[n].is_barrier()
+                || matches!(infos[n].kind, LineKind::Label | LineKind::Directive)
+            {
+                break;
+            }
+            let nt = infos[n].trimmed(store.get(n));
+            match flags_effect(nt) {
+                FlagsEffect::Neutral => {
+                    if get_dest_reg(&infos[n]) == fam || has_implicit_reg_usage(nt) {
+                        break;
+                    }
+                }
+                FlagsEffect::Writes => break,
+                FlagsEffect::Reads => {
+                    let Some((cc, width, src, dst)) = parse_cmov(nt) else {
+                        break;
+                    };
+                    if width != test_width {
+                        break;
+                    }
+                    let replacement = match cc {
+                        "ge" => "ns",
+                        "l" => "s",
+                        _ => break,
+                    };
+                    // After this consumer, the deleted TEST and the arithmetic
+                    // producer differ in CF/OF/AF. Refuse if any later path can
+                    // read flags before a complete writer or return.
+                    let later = walk_flag_consumers(store, infos, n + 1, F_ZF | F_SF | F_PF);
+                    if !later.proved || later.saw_consumer {
+                        break;
+                    }
+                    let new_line = format!("    cmov{replacement}{width} {src}, {}", dst.trim());
+                    replace_line(store, &mut infos[n], n, new_line);
+                    mark_nop(&mut infos[test_idx]);
+                    cmov_idx = Some(n);
+                    changed = true;
+                }
+            }
+            if cmov_idx.is_some() {
+                break;
+            }
+            n += 1;
+        }
+        if let Some(cmov_idx) = cmov_idx {
+            test_idx = cmov_idx + 1;
+        } else {
+            test_idx += 1;
+        }
+    }
+    changed
 }
 
 #[expect(clippy::needless_range_loop)]
@@ -5212,5 +5370,68 @@ mod lea_add_tests {
             "    leaq 2147483647(%rdi), %rax\n    addq $1, %rax\n    ret",
         ));
         assert!(!out.contains("2147483648("), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod arithmetic_test_sign_cmov_tests {
+    use super::super::peephole_optimize;
+
+    fn run(body: &str) -> String {
+        peephole_optimize(format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n"))
+    }
+
+    #[test]
+    fn nonnegative_result_uses_sign_flag_without_test() {
+        let out = run(
+            "    subl %esi, %edi\n    testl %edi, %edi\n    movl $0, %ecx\n    movl %ecx, %eax\n    cmovgel %edi, %eax\n    ret",
+        );
+        assert!(!out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("cmovnsl %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn negative_result_uses_sign_flag_without_test() {
+        let out = run(
+            "    subq %rsi, %rdi\n    testq %rdi, %rdi\n    movq $0, %rax\n    cmovlq %rdi, %rax\n    ret",
+        );
+        assert!(!out.contains("testq %rdi, %rdi"), "{out}");
+        assert!(out.contains("cmovsq %rdi, %rax"), "{out}");
+    }
+
+    #[test]
+    fn sign_test_fold_allows_read_only_staging_of_the_result() {
+        let out = run(
+            "    subl %esi, %edi\n    testl %edi, %edi\n    movl $0, %ecx\n    movq %rdi, %rsi\n    cmovll %ecx, %edi\n    movl %edi, %eax\n    ret",
+        );
+        assert!(!out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("cmovnsl %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn strict_positive_predicate_keeps_test_and_cmov() {
+        let out = run(
+            "    subl %esi, %edi\n    testl %edi, %edi\n    movl $0, %eax\n    cmovgl %edi, %eax\n    ret",
+        );
+        assert!(out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("cmovgl %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn mismatched_test_width_keeps_test() {
+        let out = run(
+            "    subl %esi, %edi\n    testq %rdi, %rdi\n    movl $0, %eax\n    cmovgeq %edi, %eax\n    ret",
+        );
+        assert!(out.contains("testq %rdi, %rdi"), "{out}");
+        assert!(out.contains("cmovgeq %edi, %eax"), "{out}");
+    }
+
+    #[test]
+    fn later_flag_reader_vetoes_fold() {
+        let out = run(
+            "    subl %esi, %edi\n    testl %edi, %edi\n    movl $0, %eax\n    cmovgel %edi, %eax\n    pushfq\n    popq %rdx\n    ret",
+        );
+        assert!(out.contains("testl %edi, %edi"), "{out}");
+        assert!(out.contains("cmovgel %edi, %eax"), "{out}");
     }
 }
