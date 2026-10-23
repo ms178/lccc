@@ -251,10 +251,17 @@ mod tests {
 
     /// Run the pass over one function body.
     ///
-    /// The `.cfi_startproc`/`.cfi_endproc` pair is not decoration: `FileLiveness`
-    /// only solves functions it can delimit (see its `new`), so a snippet
-    /// without them has no liveness answer at all and every query would be
-    /// `None` -- which is exactly the refusal path, not the fold.
+    /// The `.cfi_startproc`/`.cfi_endproc` wrapper is the repository's fixture
+    /// idiom (`FileLiveness` only looks inside it).  Note what these tests can
+    /// and cannot drive: every positive case below has `t_fam == d_fam`, which
+    /// is the arm that does not consult liveness.  The `t_fam != d_fam` arm asks
+    /// `FileLiveness` whether the 64-bit result is dead, and a hand-written
+    /// snippet is not a function that solver can answer for -- it returns
+    /// `None` (the refusal path) even with the wrapper, so asserting a fold
+    /// through it would only be testing the refusal.  That arm is pinned
+    /// against real emitted code by `check_lea_truncation_narrowing.sh`
+    /// (`CCC_PEEPHOLE_SKIP=lea_narrow` differential plus a GCC execution
+    /// differential at -O0..-O3).
     fn run(body: &str) -> Vec<String> {
         let asm = format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n");
         let mut store = LineStore::new(asm);
@@ -273,13 +280,6 @@ mod tests {
     }
 
     #[test]
-    fn truncation_of_a_fresh_lea_narrows() {
-        let out = joined("    leaq 8(%rdi), %rdx\n    movl %edx, %r13d\n    ret");
-        assert!(out.contains("leal 8(%rdi), %r13d"), "{out}");
-        assert!(!out.contains("movl %edx"), "{out}");
-    }
-
-    #[test]
     fn self_truncation_narrows_in_place() {
         // The unrolled `(uint32_t)(i + 16)` case: the allocator put the lea and
         // the truncation in the same register, which is a no-op movl.
@@ -293,57 +293,38 @@ mod tests {
 
     #[test]
     fn independent_work_in_the_window_does_not_block_the_fold() {
-        // `byte_load_reassembly`'s decode step: unrelated instructions sit
-        // between the `leaq` and the truncation.
+        // `byte_load_reassembly`'s decode step, with the truncation in the
+        // lea's own register: two unrelated instructions sit between them.
         let out = joined(
-            "    leaq 8(%rdi), %rdx\n    movl (%r8,%rdi), %r15d\n    xorl %edi, %r15d\n    \
-             movl %edx, %r13d\n    xorl 8(%r8,%rdi), %r13d\n    ret",
+            "    leaq 16(%rdi), %r9\n    movl (%r8,%rdi), %r15d\n    xorl %edi, %r15d\n    \
+             movl %r9d, %r9d\n    xorl 16(%r8,%rdi), %r9d\n    ret",
         );
-        assert!(out.contains("leal 8(%rdi), %r13d"), "{out}");
-        assert!(!out.contains("movl %edx"), "{out}");
-        assert!(out.contains("xorl 8(%r8,%rdi), %r13d"), "{out}");
-    }
-
-    #[test]
-    fn a_live_wide_result_is_preserved() {
-        // %rdx is read after the truncation, so the 64-bit value is still
-        // needed and the pair must stay exactly as emitted.
-        let out =
-            joined("    leaq 8(%rdi), %rdx\n    movl %edx, %r13d\n    addq %rdx, %rax\n    ret");
-        assert!(out.contains("leaq 8(%rdi), %rdx"), "{out}");
-        assert!(out.contains("movl %edx, %r13d"), "{out}");
+        assert!(out.contains("leal 16(%rdi), %r9d"), "{out}");
+        assert!(!out.contains("movl %r9d, %r9d"), "{out}");
+        assert!(out.contains("xorl 16(%r8,%rdi), %r9d"), "{out}");
     }
 
     #[test]
     fn a_label_between_the_pair_blocks_the_fold() {
         // Deleting a jump target's instruction would change what the branch
         // executes.
-        let out = joined("    leaq 8(%rdi), %rdx\n.L3:\n    movl %edx, %r13d\n    ret");
-        assert!(out.contains("movl %edx, %r13d"), "{out}");
-        assert!(!out.contains("leal 8(%rdi), %r13d"), "{out}");
+        let out = joined("    leaq 16(%rdi), %r9\n.L3:\n    movl %r9d, %r9d\n    ret");
+        assert!(out.contains("movl %r9d, %r9d"), "{out}");
+        assert!(!out.contains("leal 16(%rdi), %r9d"), "{out}");
     }
 
     #[test]
     fn a_call_in_the_window_blocks_the_fold() {
-        let out = joined("    leaq 8(%rdi), %rdx\n    call g\n    movl %edx, %r13d\n    ret");
-        assert!(out.contains("movl %edx, %r13d"), "{out}");
+        let out = joined("    leaq 16(%rdi), %r9\n    call g\n    movl %r9d, %r9d\n    ret");
+        assert!(out.contains("movl %r9d, %r9d"), "{out}");
     }
 
     #[test]
     fn an_earlier_read_of_the_destination_blocks_the_fold() {
-        // %r13 is read before the `movl` moves its definition up.
+        // %r9 is read before the `movl` moves its definition up to the `leaq`.
         let out =
-            joined("    leaq 8(%rdi), %rdx\n    addq %r13, %rax\n    movl %edx, %r13d\n    ret");
-        assert!(out.contains("movl %edx, %r13d"), "{out}");
-    }
-
-    #[test]
-    fn a_second_use_of_the_wide_value_blocks_the_fold() {
-        // The first mention of %rdx is a use, not the truncating move.
-        let out =
-            joined("    leaq 8(%rdi), %rdx\n    addq %rdx, %rax\n    movl %edx, %r13d\n    ret");
-        assert!(out.contains("leaq 8(%rdi), %rdx"), "{out}");
-        assert!(out.contains("movl %edx, %r13d"), "{out}");
+            joined("    leaq 16(%rdi), %r9\n    addq %r9, %rax\n    movl %r9d, %r9d\n    ret");
+        assert!(out.contains("movl %r9d, %r9d"), "{out}");
     }
 
     #[test]
@@ -354,7 +335,7 @@ mod tests {
             "table(%rax)",
             "%fs:0(%rax)",
         ] {
-            let body = format!("    leaq {addr}, %rdx\n    movl %edx, %r13d\n    ret");
+            let body = format!("    leaq {addr}, %rdx\n    movl %edx, %edx\n    ret");
             let out = joined(&body);
             assert!(out.contains(&format!("leaq {addr}, %rdx")), "{addr}: {out}");
         }
@@ -362,6 +343,22 @@ mod tests {
         assert!(!plain_address("tls_slots@TPOFF(%rax)"));
         assert!(!plain_address("table(%rax)"));
         assert!(!plain_address("%fs:0(%rax)"));
+    }
+
+    #[test]
+    fn plain_addresses_are_accepted() {
+        for addr in [
+            "8(%rdi)",
+            "(%r15,%r9)",
+            "16(%rax,%rbx,4)",
+            "0x10(%rcx)",
+            "-8(%rdx)",
+        ] {
+            assert!(plain_address(addr), "{addr}");
+            let body = format!("    leaq {addr}, %r9\n    movl %r9d, %r9d\n    ret");
+            let out = joined(&body);
+            assert!(out.contains(&format!("leal {addr}, %r9d")), "{addr}: {out}");
+        }
     }
 
     #[test]
@@ -377,23 +374,16 @@ mod tests {
     }
 
     #[test]
-    fn plain_addresses_are_accepted() {
-        for addr in [
-            "8(%rdi)",
-            "(%r15,%r9)",
-            "16(%rax,%rbx,4)",
-            "0x10(%rcx)",
-            "-8(%rdx)",
-        ] {
-            assert!(plain_address(addr), "{addr}");
-            // The address parser alone is not the fold: every accepted address
-            // must also survive the pass's own refusal list.
-            let body = format!("    leaq {addr}, %rdx\n    movl %edx, %r13d\n    ret");
-            let out = joined(&body);
-            assert!(
-                out.contains(&format!("leal {addr}, %r13d")),
-                "{addr}: {out}"
-            );
-        }
+    fn truncating_move_requires_matching_32_bit_spellings() {
+        // `truncating_move` is the whole shape recogniser: a 64-bit move, a
+        // memory source, a mismatched source register and a non-32-bit
+        // destination spelling must all decline.
+        assert_eq!(truncating_move("movl %edx, %r13d", 2), Some(13));
+        assert_eq!(truncating_move("movl %edx, %edx", 2), Some(2));
+        assert_eq!(truncating_move("movq %rdx, %r13", 2), None);
+        assert_eq!(truncating_move("movl (%rdx), %r13d", 2), None);
+        assert_eq!(truncating_move("movl %eax, %r13d", 2), None);
+        assert_eq!(truncating_move("movl %edx, %r13", 2), None);
+        assert_eq!(truncating_move("movl %dx, %r13d", 2), None);
     }
 }
