@@ -1944,6 +1944,10 @@ jobs:
         python3 tests/regression/check_bmi2_bzhi.py
         bash tests/regression/check_i686_tls_ie_relax.sh
         bash tests/regression/check_zero_ext_cmp_fold.sh
+        # A 64-bit address computation that is only observed at 32-bit width
+        # narrows to one `leal` (`lea_narrow`); relocation-carrying addresses
+        # keep their 64-bit form.
+        bash tests/regression/check_lea_truncation_narrowing.sh
           # The Clang-C corpus capability probe: an unimplemented option must
           # never read as support, and a `-W`-spelled unknown option must not
           # slip past a `--`-only negative control.  Synthetic compiler, no
