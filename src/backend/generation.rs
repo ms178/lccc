@@ -4399,7 +4399,26 @@ fn emit_functions_and_sections(
                     let spill_ok = chain_stack * 10 <= orig_stack * 11;
                     // With the kill switch set the branch term is zero and the
                     // rule is the historical one, `chain_lines < orig_lines`.
-                    let adopt_chain = spill_ok && chain_count < orig_count;
+                    //
+                    // Ties go to the chain layout.  Every term in the model is
+                    // a static count of what the placement leaves *taken*,
+                    // weighted by the chain builder's own `10^depth` execution
+                    // estimate, so a tie means the model genuinely cannot
+                    // separate the two orders.  When it cannot, the trace-built
+                    // order is the better-founded default: its fall-throughs
+                    // were chosen by a greedy walk over the same structural
+                    // weights, while the pre-chain order is whatever the passes
+                    // happened to append.  `expat_xml_scan` is the measured
+                    // case -- the forwarding-phi fold shrank both layouts onto
+                    // exactly 68 ins + 60 br, the tie fell back to the append
+                    // order, and the append order needs a `jmp` to reach the
+                    // shared loop latch from the name-character arm where the
+                    // chain order falls into it, i.e. three taken branches per
+                    // character instead of two.  `CCC_LAYOUT_TIE_ORIG=1` keeps
+                    // the append order on ties (A/B bisection surface).
+                    let tie_ok = std::env::var_os("CCC_LAYOUT_TIE_ORIG").is_none();
+                    let adopt_chain = spill_ok
+                        && (chain_count < orig_count || (tie_ok && chain_count == orig_count));
                     if adopt_chain {
                         generate_function(cg, attr_align, func, source_mgr, file_table);
                     } else {
