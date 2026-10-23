@@ -1758,6 +1758,12 @@ fn is_two_operand_binary(op: &crate::ir::intrinsics::IntrinsicOp) -> bool {
             | O::Por128
             | O::Pand128
             | O::Pxor128
+            | O::AddPs128
+            | O::SubPs128
+            | O::MulPs128
+            | O::AddPd128
+            | O::SubPd128
+            | O::MulPd128
             | O::Paddw128
             | O::Psubw128
             | O::Pmulhw128

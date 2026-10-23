@@ -6299,6 +6299,12 @@ fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
             | O::Por128
             | O::Pand128
             | O::Pxor128
+            | O::AddPs128
+            | O::SubPs128
+            | O::MulPs128
+            | O::AddPd128
+            | O::SubPd128
+            | O::MulPd128
             | O::Paddw128
             | O::Psubw128
             | O::Pmulhw128

@@ -174,18 +174,38 @@ pub(crate) fn phi_coalesce_enabled() -> bool {
     *ENABLED
 }
 
-/// `CCC_DEBUG_EDGEFOLD` — per-candidate trace of the forwarding-phi fold.
-pub(crate) fn debug_edgefold() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("CCC_DEBUG_EDGEFOLD").is_some());
-    *ENABLED
-}
-
 /// `CCC_AGG_BYVAL_DEBUG` — trace of `aggregate_sroa`'s by-value copy form.
 pub(crate) fn debug_agg_byval() -> bool {
     static ENABLED: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| std::env::var_os("CCC_AGG_BYVAL_DEBUG").is_some());
     *ENABLED
+}
+
+/// `LCCC_IFCONV_ARM_BUDGET=<n|off>` — A/B lever and kill switch for the
+/// loop-resident arm budget of `if_convert`, resolved once per process.
+///
+/// A positive integer replaces the in-loop budget (so `=8` reproduces the
+/// pre-loop-aware behaviour of every diamond, in or out of a loop, while
+/// `=1`/`=2` measure a stricter prior).  `off`/`full`/`0` disables the
+/// loop-aware restriction entirely.  An unparsable value is ignored rather
+/// than aborting a build, matching `LCCC_PEEPHOLE_PAIR_PARALLEL`.
+///
+/// It lives here, beside `debug_vec_avail`, because a pipeline-wide switch is
+/// resolved once at the pipeline boundary -- the same rule the env-read
+/// ratchet in `tests/regression/check_env_test_hygiene.sh` states: a new
+/// switch belongs to `run_passes`, not to the pass body that consumes it.
+pub(crate) fn ifconv_arm_budget_override() -> Option<usize> {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let raw = std::env::var("LCCC_IFCONV_ARM_BUDGET").ok()?;
+        let raw = raw.trim();
+        if raw == "0" || raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("full") {
+            return Some(usize::MAX);
+        }
+        // A budget of 0 would mean "never if-convert", which is spelled `off`;
+        // treat it as the default rather than silently disabling the pass.
+        raw.parse::<usize>().ok().filter(|&n| n > 0)
+    })
 }
 
 pub(crate) fn validate_unique_defs(module: &IrModule, tag: &str) {
