@@ -97,6 +97,9 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
         return 0;
     }
     let mut total = 0;
+    // Captured before the block loops borrow the function; the iabs
+    // compare folds consult it per `Cmp` site (see `SelectFoldCtx`).
+    let wrap_signed_overflow = func.pass_policy.wrap_signed_overflow;
 
     // Build def maps for chain optimizations: Value -> defining instruction
     // We use flat Vecs indexed by Value ID for O(1) lookup.
@@ -505,19 +508,19 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                     ty,
                 } = inst
                 {
-                    if let Some(folded) = fold_cmp_of_select(
-                        *dest,
-                        *op,
-                        lhs,
-                        rhs,
-                        *ty,
-                        &select_defs,
-                        &cmp_defs,
-                        &cast_defs,
-                        &const_defs,
-                        &is_boolean,
-                        &def_counts,
-                    ) {
+                    let fold_ctx = SelectFoldCtx {
+                        select_defs: &select_defs,
+                        cmp_defs: &cmp_defs,
+                        cast_defs: &cast_defs,
+                        const_defs: &const_defs,
+                        neg_defs: &neg_defs,
+                        is_boolean: &is_boolean,
+                        def_counts: &def_counts,
+                        wrap_signed_overflow,
+                    };
+                    if let Some(folded) = fold_cmp_of_select(*dest, *op, lhs, rhs, *ty, &fold_ctx)
+                        .or_else(|| fold_cmp_of_iabs(*dest, *op, lhs, rhs, *ty, &fold_ctx))
+                    {
                         *inst = folded;
                         if !simplified_here {
                             total += 1;
@@ -526,6 +529,15 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                 }
             }
         }
+    }
+
+    // The `k > 0` half of the iabs compare folds: a separate phase
+    // because it inserts the biasing add (see `rewrite_iabs_range_cmps`).
+    // Runs after the in-place sweep so it rebuilds its def facts from the
+    // post-sweep function rather than trusting the entry snapshot across
+    // in-place replacements.
+    if !simplify_skip("cmp") {
+        total += rewrite_iabs_range_cmps(func);
     }
 
     // A widening integer conversion preserves exactly the zero/nonzero
@@ -677,7 +689,11 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
     let mut cmp_defs: Vec<Option<CmpDef>> = vec![None; max];
     let mut select_defs: Vec<Option<SelectDef>> = vec![None; max];
     let mut const_defs: Vec<Option<IrConst>> = vec![None; max];
+    let mut neg_defs: Vec<Option<NegDef>> = vec![None; max];
     let mut is_boolean = vec![false; max];
+    // Captured before the block loops borrow the function; consumed by
+    // the iabs compare folds (see `SelectFoldCtx`).
+    let wrap_signed_overflow = func.pass_policy.wrap_signed_overflow;
     let mut binop_defs: Vec<Option<BinOpDef>> = vec![None; max];
     let mut unary_defs: Vec<Option<UnaryDef>> = vec![None; max];
     for block in &func.blocks {
@@ -757,6 +773,7 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
                 }
                 Instruction::UnaryOp { dest, op, src, ty } => match op {
                     IrUnaryOp::Neg => {
+                        set_def(&mut neg_defs, dest.0, NegDef { src: *src });
                         let idx = dest.0 as usize;
                         if idx < const_defs.len() && def_counts.get(idx).copied() == Some(1) {
                             if let Operand::Const(c) = src {
@@ -802,19 +819,19 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
                     rhs,
                     ty,
                 } if !simplify_skip("cmp") => {
-                    if let Some(folded) = fold_cmp_of_select(
-                        *dest,
-                        *op,
-                        lhs,
-                        rhs,
-                        *ty,
-                        &select_defs,
-                        &cmp_defs,
-                        &cast_defs,
-                        &const_defs,
-                        &is_boolean,
-                        &def_counts,
-                    ) {
+                    let fold_ctx = SelectFoldCtx {
+                        select_defs: &select_defs,
+                        cmp_defs: &cmp_defs,
+                        cast_defs: &cast_defs,
+                        const_defs: &const_defs,
+                        neg_defs: &neg_defs,
+                        is_boolean: &is_boolean,
+                        def_counts: &def_counts,
+                        wrap_signed_overflow,
+                    };
+                    if let Some(folded) = fold_cmp_of_select(*dest, *op, lhs, rhs, *ty, &fold_ctx)
+                        .or_else(|| fold_cmp_of_iabs(*dest, *op, lhs, rhs, *ty, &fold_ctx))
+                    {
                         *inst = folded;
                         changes += 1;
                     }
@@ -952,6 +969,11 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
     if !refined.is_empty() {
         refine_nonzero_counts(func, &refined);
     }
+    // If-conversion creates the Select-form abs this late in the pipeline,
+    // so the `k > 0` range rewrite runs here as well as in the main sweep.
+    if !simplify_skip("cmp") {
+        changes += rewrite_iabs_range_cmps(func);
+    }
     changes
 }
 
@@ -1021,6 +1043,40 @@ fn eval_int_cmp_bool(op: IrCmpOp, lhs: IrConst, rhs: IrConst, ty: IrType) -> Opt
     }
 }
 
+/// Hard bound on the single-definition cast chain `resolve_select_const`
+/// will follow.  Real frontend output nests two or three casts; the bound
+/// exists so pathological or adversarial IR costs O(1) per operand instead
+/// of O(chain), and failing means "missed fold", never "wrong fold".  The
+/// boundary is pinned by `select_constant_cast_walk_is_bounded_and_folds_valid_chains`.
+const MAX_SELECT_CONST_DEPTH: u8 = 8;
+
+/// Hard bound on the cast layers `peel_bool_cond` will strip while looking
+/// for a provably-boolean condition.  Same fail-closed rationale as
+/// [`MAX_SELECT_CONST_DEPTH`]: beyond the bound the original operand is
+/// returned unchanged.
+const MAX_BOOL_CAST_PEEL: usize = 16;
+
+/// The single-def facts the select/compare folds consult, bundled so the
+/// folds take one evidence parameter instead of seven parallel slices that
+/// could be transposed at a call site without any type error (five of the
+/// seven share an element type shape).  Constructed once per `Cmp` site
+/// from the per-function fact tables; the table fields are shared borrows,
+/// so the bundle is `Copy`-sized (seven fat pointers and a `bool`) and
+/// free to pass.  `wrap_signed_overflow` rides along because the integer
+/// absolute-value folds are valid only when signed overflow is undefined
+/// behavior the fold may exploit (under `-fwrapv`, `abs(INT_MIN)` is the
+/// representable, negative `INT_MIN`, which inverts the folded answers).
+struct SelectFoldCtx<'a> {
+    select_defs: &'a [Option<SelectDef>],
+    cmp_defs: &'a [Option<CmpDef>],
+    cast_defs: &'a [Option<CastDef>],
+    const_defs: &'a [Option<IrConst>],
+    neg_defs: &'a [Option<NegDef>],
+    is_boolean: &'a [bool],
+    def_counts: &'a [u8],
+    wrap_signed_overflow: bool,
+}
+
 fn resolve_select_const(
     op: Operand,
     const_defs: &[Option<IrConst>],
@@ -1037,7 +1093,7 @@ fn resolve_select_const_bounded(
     def_counts: &[u8],
     depth: u8,
 ) -> Option<IrConst> {
-    if depth > 8 {
+    if depth > MAX_SELECT_CONST_DEPTH {
         return None;
     }
     match op {
@@ -1076,7 +1132,7 @@ fn peel_bool_cond(
 ) -> Operand {
     let mut candidate = op;
     let mut saw_narrowing = false;
-    for _ in 0..16 {
+    for _ in 0..MAX_BOOL_CAST_PEEL {
         let Operand::Value(v) = candidate else { break };
         let idx = v.0 as usize;
         if def_counts.get(idx).copied() != Some(1) {
@@ -1182,44 +1238,72 @@ fn int_cmp_from_trichotomy_mask(mask: u8, unsigned: bool) -> Option<IrCmpOp> {
     })
 }
 
+/// Normalize `Cmp(op, lhs, rhs)` to `(value, constant, effective_op)` with
+/// the constant moved to the right (swapping the predicate when it started
+/// on the left), resolving a constant-valued `Value` operand through
+/// single-def const/cast chains when neither side is a literal constant.
+fn normalize_cmp_value_const(
+    op: IrCmpOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    const_defs: &[Option<IrConst>],
+    cast_defs: &[Option<CastDef>],
+    def_counts: &[u8],
+) -> Option<(Value, IrConst, IrCmpOp)> {
+    match (lhs, rhs) {
+        (Operand::Value(v), Operand::Const(c)) => Some((*v, *c, op)),
+        (Operand::Const(c), Operand::Value(v)) => Some((*v, *c, swap_cmp_op(op))),
+        (Operand::Value(v), Operand::Value(cv)) => {
+            if let Some(c) =
+                resolve_select_const(Operand::Value(*cv), const_defs, cast_defs, def_counts)
+            {
+                Some((*v, c, op))
+            } else {
+                resolve_select_const(Operand::Value(*v), const_defs, cast_defs, def_counts)
+                    .map(|c| (*cv, c, swap_cmp_op(op)))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The signed mathematical value of an integer comparison constant at
+/// `ty`, or `None` when the constant is not an integer. Sub-64-bit values
+/// are sign-extended from the type's width (so an `I8` constant `0xFF`
+/// reads as -1); 128-bit constants keep their full range.
+fn signed_cmp_const_value(c: IrConst, ty: IrType) -> Option<i128> {
+    if ty.is_128bit() {
+        c.to_i128()
+    } else {
+        Some(ty.truncate_i64(c.to_i64()?) as i128)
+    }
+}
+
 /// Fold comparisons of 1-level and 2-level constant-leaf `Select` trees against
 /// an integer constant. Inlined 3-way comparators (`(a < b) ? -1 : ((a > b) ? 1 : 0)`)
 /// compared against `0` after `if_convert` collapse to a single `Cmp(a, b)`.
-#[allow(clippy::too_many_arguments)]
 fn fold_cmp_of_select(
     dest: Value,
     op: IrCmpOp,
     lhs: &Operand,
     rhs: &Operand,
     ty: IrType,
-    select_defs: &[Option<SelectDef>],
-    cmp_defs: &[Option<CmpDef>],
-    cast_defs: &[Option<CastDef>],
-    const_defs: &[Option<IrConst>],
-    is_boolean: &[bool],
-    def_counts: &[u8],
+    ctx: &SelectFoldCtx<'_>,
 ) -> Option<Instruction> {
+    let SelectFoldCtx {
+        select_defs,
+        cmp_defs,
+        cast_defs,
+        const_defs,
+        is_boolean,
+        def_counts,
+        ..
+    } = *ctx;
     if !ty.is_integer() {
         return None;
     }
-    let (val, cval, effective_op) = match (lhs, rhs) {
-        (Operand::Value(v), Operand::Const(c)) => (*v, *c, op),
-        (Operand::Const(c), Operand::Value(v)) => (*v, *c, swap_cmp_op(op)),
-        (Operand::Value(v), Operand::Value(cv)) => {
-            if let Some(c) =
-                resolve_select_const(Operand::Value(*cv), const_defs, cast_defs, def_counts)
-            {
-                (*v, c, op)
-            } else if let Some(c) =
-                resolve_select_const(Operand::Value(*v), const_defs, cast_defs, def_counts)
-            {
-                (*cv, c, swap_cmp_op(op))
-            } else {
-                return None;
-            }
-        }
-        _ => return None,
-    };
+    let (val, cval, effective_op) =
+        normalize_cmp_value_const(op, lhs, rhs, const_defs, cast_defs, def_counts)?;
     let val_idx = val.0 as usize;
     if def_counts.get(val_idx).copied() != Some(1) {
         return None;
@@ -1352,6 +1436,330 @@ fn fold_cmp_of_select(
             }
         }
     }
+}
+
+/// Recognize the integer absolute-value idiom `a < 0 ? -a : a` (and the
+/// `a >= 0 ? a : -a` spelling) in a `Select` definition, returning `a`.
+///
+/// `cond` is the select's condition operand (callers with cast tables pass
+/// it through `peel_bool_cond` first). The condition must be a single-def
+/// signed comparison of `a` against literal zero at the select's own type,
+/// the arm on the negative side must be a single-def `Neg(a)`, and the
+/// other arm must be `a` itself. Anything else is a miss, never a guess.
+fn recognize_iabs_select(
+    sdef: &SelectDef,
+    cond: Operand,
+    cmp_defs: &[Option<CmpDef>],
+    neg_defs: &[Option<NegDef>],
+    def_counts: &[u8],
+) -> Option<Operand> {
+    if !sdef.ty.is_signed() {
+        return None;
+    }
+    let Operand::Value(cond_v) = cond else {
+        return None;
+    };
+    let cond_idx = cond_v.0 as usize;
+    if def_counts.get(cond_idx).copied() != Some(1) {
+        return None;
+    }
+    let ic = (*cmp_defs.get(cond_idx)?)?;
+    if ic.ty != sdef.ty {
+        return None;
+    }
+    let is_zero_op = |o: &Operand| matches!(o, Operand::Const(c) if c.is_zero());
+    let (a, neg_on_true) = match ic.op {
+        IrCmpOp::Slt if is_zero_op(&ic.rhs) => (ic.lhs, true),
+        IrCmpOp::Sgt if is_zero_op(&ic.lhs) => (ic.rhs, true),
+        IrCmpOp::Sge if is_zero_op(&ic.rhs) => (ic.lhs, false),
+        IrCmpOp::Sle if is_zero_op(&ic.lhs) => (ic.rhs, false),
+        _ => return None,
+    };
+    let (neg_arm, plain_arm) = if neg_on_true {
+        (sdef.true_val, sdef.false_val)
+    } else {
+        (sdef.false_val, sdef.true_val)
+    };
+    if !same_operand(&plain_arm, &a) {
+        return None;
+    }
+    let Operand::Value(neg_v) = neg_arm else {
+        return None;
+    };
+    let neg_idx = neg_v.0 as usize;
+    if def_counts.get(neg_idx).copied() != Some(1) {
+        return None;
+    }
+    let ndef = (*neg_defs.get(neg_idx)?)?;
+    if !same_operand(&ndef.src, &a) {
+        return None;
+    }
+    Some(a)
+}
+
+/// Fold `abs(a) <cmp> k` for `k <= 0`, where `abs(a)` is the recognized
+/// select idiom. With signed overflow undefined (`-fwrapv` off), `abs(a)`
+/// ranges over `[0, MAX]`, so `abs(a) <= 0` is `a == 0`, `abs(a) < 0` is
+/// false, and so on — the same reductions GCC and Clang apply through
+/// value-range propagation on their abs expressions. Under `-fwrapv` the
+/// premise fails (`abs(INT_MIN)` wraps to `INT_MIN`), so the fold is
+/// suppressed and the wrapping computation stands. The `k > 0` forms need
+/// a new value for the biased addend and live in
+/// `rewrite_iabs_range_cmps` instead.
+fn fold_cmp_of_iabs(
+    dest: Value,
+    op: IrCmpOp,
+    lhs: &Operand,
+    rhs: &Operand,
+    ty: IrType,
+    ctx: &SelectFoldCtx<'_>,
+) -> Option<Instruction> {
+    let SelectFoldCtx {
+        select_defs,
+        cmp_defs,
+        cast_defs,
+        const_defs,
+        neg_defs,
+        is_boolean,
+        def_counts,
+        wrap_signed_overflow,
+    } = *ctx;
+    if wrap_signed_overflow || !ty.is_signed() {
+        return None;
+    }
+    let (val, cval, effective_op) =
+        normalize_cmp_value_const(op, lhs, rhs, const_defs, cast_defs, def_counts)?;
+    let k = signed_cmp_const_value(cval, ty)?;
+    let val_idx = val.0 as usize;
+    if def_counts.get(val_idx).copied() != Some(1) {
+        return None;
+    }
+    let sdef = (*select_defs.get(val_idx)?)?;
+    if sdef.ty != ty {
+        return None;
+    }
+    let cond = peel_bool_cond(sdef.cond, cast_defs, is_boolean, cmp_defs, def_counts);
+    let a = recognize_iabs_select(&sdef, cond, cmp_defs, neg_defs, def_counts)?;
+    let const_bool = |b: bool| Instruction::Copy {
+        dest,
+        src: Operand::Const(IrConst::I8(i8::from(b))),
+    };
+    let cmp_zero = |op: IrCmpOp| Instruction::Cmp {
+        dest,
+        op,
+        lhs: a,
+        rhs: Operand::Const(IrConst::from_i64(0, ty)),
+        ty,
+    };
+    Some(match (effective_op, k) {
+        (IrCmpOp::Slt, _) if k <= 0 => const_bool(false),
+        (IrCmpOp::Sge, _) if k <= 0 => const_bool(true),
+        (IrCmpOp::Eq, _) if k < 0 => const_bool(false),
+        (IrCmpOp::Ne, _) if k < 0 => const_bool(true),
+        (IrCmpOp::Sle, 0) | (IrCmpOp::Eq, 0) => cmp_zero(IrCmpOp::Eq),
+        (IrCmpOp::Sgt, 0) | (IrCmpOp::Ne, 0) => cmp_zero(IrCmpOp::Ne),
+        (IrCmpOp::Sle, _) if k < 0 => const_bool(false),
+        (IrCmpOp::Sgt, _) if k < 0 => const_bool(true),
+        _ => return None,
+    })
+}
+
+/// `|a| < k` / `|a| <= k` range-test constants: the addend that biases `a`
+/// so the two-sided range starts at zero, and the inclusive unsigned bound
+/// of the biased range (`2k - 2` for strict, `2k` for inclusive).
+fn iabs_addend_const(v: i128, ty: IrType) -> IrConst {
+    if ty.is_128bit() {
+        IrConst::I128(v)
+    } else {
+        IrConst::from_i64(v as i64, ty)
+    }
+}
+
+fn iabs_bound_const(bound: u128, ty: IrType) -> IrConst {
+    if ty.is_128bit() {
+        IrConst::I128(bound as i128)
+    } else {
+        IrConst::from_i64(bound as u64 as i64, ty.to_unsigned())
+    }
+}
+
+/// Rewrite `abs(a) <cmp> k` for `k > 0` into the single unsigned range
+/// test both GCC and Clang emit: `|a| < k` is `(unsigned)(a + k - 1) <=
+/// 2k - 2`, `|a| <= k` is `(unsigned)(a + k) <= 2k`, and the `>`/`>=`
+/// forms are the same tests inverted. The biased add wraps in two's
+/// complement exactly over the accepted range, so one add and one
+/// unsigned compare replace the negate, the select, and the signed
+/// compare. Runs as its own phase because it mints a fresh value and
+/// inserts the add ahead of the comparison, which the in-place simplify
+/// sweep cannot do; it rebuilds the minimal def facts it consults from
+/// the current function state. Suppressed under `-fwrapv` for the same
+/// reason as `fold_cmp_of_iabs`.
+fn rewrite_iabs_range_cmps(func: &mut IrFunction) -> usize {
+    if func.pass_policy.wrap_signed_overflow {
+        return 0;
+    }
+    let max = func.max_value_id() as usize + 1;
+    let mut def_counts = vec![0u8; max];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if let Some(d) = inst.dest() {
+                let idx = d.0 as usize;
+                if idx < def_counts.len() {
+                    def_counts[idx] = def_counts[idx].saturating_add(1);
+                }
+            }
+        }
+    }
+    let mut select_defs: Vec<Option<SelectDef>> = vec![None; max];
+    let mut cmp_defs: Vec<Option<CmpDef>> = vec![None; max];
+    let mut neg_defs: Vec<Option<NegDef>> = vec![None; max];
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Select {
+                    dest,
+                    cond,
+                    true_val,
+                    false_val,
+                    ty,
+                } => {
+                    if def_counts.get(dest.0 as usize).copied() == Some(1) {
+                        set_def(
+                            &mut select_defs,
+                            dest.0,
+                            SelectDef {
+                                cond: *cond,
+                                true_val: *true_val,
+                                false_val: *false_val,
+                                ty: *ty,
+                            },
+                        );
+                    }
+                }
+                Instruction::Cmp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } => {
+                    set_def(
+                        &mut cmp_defs,
+                        dest.0,
+                        CmpDef {
+                            op: *op,
+                            lhs: *lhs,
+                            rhs: *rhs,
+                            ty: *ty,
+                        },
+                    );
+                }
+                Instruction::UnaryOp {
+                    dest,
+                    op: IrUnaryOp::Neg,
+                    src,
+                    ..
+                } => {
+                    set_def(&mut neg_defs, dest.0, NegDef { src: *src });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut changes = 0;
+    // Disjoint field borrows: the rewrite mints fresh value IDs while
+    // holding each block mutably.
+    let IrFunction {
+        blocks,
+        next_value_id,
+        ..
+    } = func;
+    for block in blocks.iter_mut() {
+        // Inserting an instruction must keep `source_spans` parallel; when
+        // it is neither empty nor parallel the block's bookkeeping is not
+        // in a state this phase can extend safely (same fail-closed guard
+        // as `split_errno_sqrt`).
+        if !(block.source_spans.is_empty() || block.source_spans.len() == block.instructions.len())
+        {
+            continue;
+        }
+        let mut i = 0;
+        while i < block.instructions.len() {
+            let rewritten = (|| {
+                let Instruction::Cmp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } = block.instructions[i]
+                else {
+                    return None;
+                };
+                if !ty.is_signed() {
+                    return None;
+                }
+                let (val, cval, effective_op) = match (lhs, rhs) {
+                    (Operand::Value(v), Operand::Const(c)) => (v, c, op),
+                    (Operand::Const(c), Operand::Value(v)) => (v, c, swap_cmp_op(op)),
+                    _ => return None,
+                };
+                let k = signed_cmp_const_value(cval, ty)?;
+                if k <= 0 {
+                    return None;
+                }
+                let (addend, bound, new_op) = match effective_op {
+                    IrCmpOp::Slt => (k - 1, 2 * (k as u128) - 2, IrCmpOp::Ule),
+                    IrCmpOp::Sle => (k, 2 * (k as u128), IrCmpOp::Ule),
+                    IrCmpOp::Sgt => (k, 2 * (k as u128), IrCmpOp::Ugt),
+                    IrCmpOp::Sge => (k - 1, 2 * (k as u128) - 2, IrCmpOp::Ugt),
+                    _ => return None,
+                };
+                let val_idx = val.0 as usize;
+                if def_counts.get(val_idx).copied() != Some(1) {
+                    return None;
+                }
+                let sdef = (*select_defs.get(val_idx)?)?;
+                if sdef.ty != ty {
+                    return None;
+                }
+                let a = recognize_iabs_select(&sdef, sdef.cond, &cmp_defs, &neg_defs, &def_counts)?;
+                Some((dest, ty, a, addend, bound, new_op))
+            })();
+            match rewritten {
+                Some((dest, ty, a, addend, bound, new_op)) => {
+                    let biased = Value(*next_value_id);
+                    *next_value_id += 1;
+                    block.instructions.insert(
+                        i,
+                        Instruction::BinOp {
+                            dest: biased,
+                            op: IrBinOp::Add,
+                            lhs: a,
+                            rhs: Operand::Const(iabs_addend_const(addend, ty)),
+                            ty,
+                        },
+                    );
+                    if !block.source_spans.is_empty() {
+                        let span = block.source_spans[i].clone();
+                        block.source_spans.insert(i, span);
+                    }
+                    block.instructions[i + 1] = Instruction::Cmp {
+                        dest,
+                        op: new_op,
+                        lhs: Operand::Value(biased),
+                        rhs: Operand::Const(iabs_bound_const(bound, ty)),
+                        ty,
+                    };
+                    changes += 1;
+                    i += 2;
+                }
+                None => i += 1,
+            }
+        }
+    }
+    changes
 }
 
 /// `x ? count_nz(x) : W` whose count (and every cast between it and the
@@ -6848,6 +7256,106 @@ mod tests {
         );
     }
 
+    #[test]
+    fn trichotomy_masks_round_trip_every_integer_compare() {
+        // The mask algebra is only sound if the mapping is total and
+        // invertible on exactly the six non-trivial trichotomies; the
+        // all-false and all-true masks must refuse (they are constants,
+        // not compares).
+        for (op, unsigned) in [
+            (IrCmpOp::Eq, false),
+            (IrCmpOp::Ne, false),
+            (IrCmpOp::Slt, false),
+            (IrCmpOp::Sle, false),
+            (IrCmpOp::Sgt, false),
+            (IrCmpOp::Sge, false),
+            (IrCmpOp::Ult, true),
+            (IrCmpOp::Ule, true),
+            (IrCmpOp::Ugt, true),
+            (IrCmpOp::Uge, true),
+        ] {
+            let mask = int_cmp_trichotomy_mask(op);
+            assert_eq!(
+                int_cmp_from_trichotomy_mask(mask, unsigned),
+                Some(op),
+                "{op:?} via mask {mask:#05b}"
+            );
+        }
+        for unsigned in [false, true] {
+            assert_eq!(int_cmp_from_trichotomy_mask(0b000, unsigned), None);
+            assert_eq!(int_cmp_from_trichotomy_mask(0b111, unsigned), None);
+        }
+    }
+
+    #[test]
+    fn peel_bool_cond_is_bounded_and_narrowing_needs_a_proven_boolean() {
+        // Seventeen widening casts over Value(0): a 16-step peel budget
+        // reaches Value(0) from Value(16) and stops at Value(1) from
+        // Value(17) instead of walking unbounded chains.
+        let mut cast_defs: Vec<Option<CastDef>> = vec![None; 18];
+        for i in 1..=17usize {
+            cast_defs[i] = Some(CastDef {
+                src: Operand::Value(Value((i - 1) as u32)),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            });
+        }
+        let is_boolean = vec![false; 18];
+        let cmp_defs: Vec<Option<CmpDef>> = vec![None; 18];
+        let def_counts = vec![1u8; 18];
+        assert!(matches!(
+            peel_bool_cond(
+                Operand::Value(Value(16)),
+                &cast_defs,
+                &is_boolean,
+                &cmp_defs,
+                &def_counts
+            ),
+            Operand::Value(Value(0))
+        ));
+        assert!(matches!(
+            peel_bool_cond(
+                Operand::Value(Value(17)),
+                &cast_defs,
+                &is_boolean,
+                &cmp_defs,
+                &def_counts
+            ),
+            Operand::Value(Value(1))
+        ));
+        // One narrowing cast over a non-boolean base: 0x100 truncates to
+        // zero, so the peel must refuse and return the operand unchanged.
+        cast_defs[1] = Some(CastDef {
+            src: Operand::Value(Value(0)),
+            from_ty: IrType::I64,
+            to_ty: IrType::I8,
+        });
+        assert!(matches!(
+            peel_bool_cond(
+                Operand::Value(Value(1)),
+                &cast_defs,
+                &is_boolean,
+                &cmp_defs,
+                &def_counts
+            ),
+            Operand::Value(Value(1))
+        ));
+        // The same narrowing cast over a proven boolean (0/1 survives any
+        // truncation) peels to the base.
+        let mut is_boolean = vec![false; 18];
+        is_boolean[0] = true;
+        assert!(matches!(
+            peel_bool_cond(
+                Operand::Value(Value(1)),
+                &cast_defs,
+                &is_boolean,
+                &cmp_defs,
+                &def_counts
+            ),
+            Operand::Value(Value(0))
+        ));
+    }
+
     // === Constant reassociation tests ===
 
     #[test]
@@ -8903,6 +9411,236 @@ mod exact_product_half_tests {
                 other => panic!("unexpected folded instruction: {other:?}"),
             }
         }
+    }
+
+    /// `fn(a: i32) -> (a < 0 ? -a : a) <op> k`, the frontend's `abs(a)`
+    /// shape with a constant comparison against it.
+    fn iabs_cmp_func(op: IrCmpOp, k: i32, wrap: bool) -> IrFunction {
+        use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Terminator};
+        let mut func = IrFunction::new("iabs_cmp".to_string(), IrType::I32, vec![], false);
+        func.pass_policy.wrap_signed_overflow = wrap;
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
+                Instruction::Cmp {
+                    dest: Value(1),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::UnaryOp {
+                    dest: Value(2),
+                    op: IrUnaryOp::Neg,
+                    src: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::Select {
+                    dest: Value(3),
+                    cond: Operand::Value(Value(1)),
+                    true_val: Operand::Value(Value(2)),
+                    false_val: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::Cmp {
+                    dest: Value(4),
+                    op,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Const(IrConst::I32(k)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 5;
+        func
+    }
+
+    #[test]
+    fn iabs_cmp_nonpositive_bound_folds() {
+        // (outer op, k, expected): expected is either a `a == 0` / `a != 0`
+        // comparison or a constant boolean.
+        enum Expect {
+            CmpZero(IrCmpOp),
+            Const(bool),
+        }
+        for (op, k, expect) in [
+            (IrCmpOp::Sle, 0, Expect::CmpZero(IrCmpOp::Eq)),
+            (IrCmpOp::Eq, 0, Expect::CmpZero(IrCmpOp::Eq)),
+            (IrCmpOp::Sgt, 0, Expect::CmpZero(IrCmpOp::Ne)),
+            (IrCmpOp::Ne, 0, Expect::CmpZero(IrCmpOp::Ne)),
+            (IrCmpOp::Slt, 0, Expect::Const(false)),
+            (IrCmpOp::Sge, 0, Expect::Const(true)),
+            (IrCmpOp::Sle, -3, Expect::Const(false)),
+            (IrCmpOp::Sgt, -3, Expect::Const(true)),
+            (IrCmpOp::Eq, -1, Expect::Const(false)),
+            (IrCmpOp::Ne, -1, Expect::Const(true)),
+        ] {
+            let mut func = iabs_cmp_func(op, k, false);
+            assert!(simplify_function(&mut func) > 0, "{op:?} {k}");
+            match (func.blocks[0].instructions.last().unwrap(), &expect) {
+                (
+                    Instruction::Cmp {
+                        dest: Value(4),
+                        op: got,
+                        lhs: Operand::Value(Value(0)),
+                        rhs: Operand::Const(c),
+                        ty,
+                    },
+                    Expect::CmpZero(want),
+                ) => {
+                    assert_eq!(*got, *want, "{op:?} {k}");
+                    assert_eq!(*ty, IrType::I32);
+                    assert!(c.is_zero());
+                }
+                (
+                    Instruction::Copy {
+                        dest: Value(4),
+                        src: Operand::Const(c),
+                    },
+                    Expect::Const(want),
+                ) => {
+                    assert_eq!(c.to_i64(), Some(i64::from(*want)), "{op:?} {k}");
+                }
+                (other, _) => panic!("unexpected fold for {op:?} {k}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn iabs_cmp_positive_bound_rewrites_to_unsigned_range_test() {
+        // (outer op, k, addend, bound, unsigned op)
+        for (op, k, addend, bound, uop) in [
+            (IrCmpOp::Slt, 5, 4i64, 8i64, IrCmpOp::Ule),
+            (IrCmpOp::Sle, 3, 3, 6, IrCmpOp::Ule),
+            (IrCmpOp::Sgt, 3, 3, 6, IrCmpOp::Ugt),
+            (IrCmpOp::Sge, 5, 4, 8, IrCmpOp::Ugt),
+            (IrCmpOp::Slt, 1, 0, 0, IrCmpOp::Ule),
+        ] {
+            let mut func = iabs_cmp_func(op, k, false);
+            assert!(simplify_function(&mut func) > 0, "{op:?} {k}");
+            let insts = &func.blocks[0].instructions;
+            assert_eq!(insts.len(), 6, "{op:?} {k}");
+            match &insts[4] {
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(c),
+                    ty,
+                } => {
+                    assert_eq!(c.to_i64(), Some(addend), "{op:?} {k}");
+                    assert_eq!(*ty, IrType::I32);
+                }
+                other => panic!("unexpected bias add for {op:?} {k}: {other:?}"),
+            }
+            match &insts[5] {
+                Instruction::Cmp {
+                    dest: Value(4),
+                    op: got,
+                    lhs: Operand::Value(Value(5)),
+                    rhs: Operand::Const(c),
+                    ty,
+                } => {
+                    assert_eq!(*got, uop, "{op:?} {k}");
+                    assert_eq!(c.to_i64(), Some(bound), "{op:?} {k}");
+                    assert_eq!(*ty, IrType::I32);
+                }
+                other => panic!("unexpected range cmp for {op:?} {k}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn iabs_cmp_folds_suppressed_under_wrapv() {
+        // With wrapping signed overflow, abs(INT_MIN) == INT_MIN is
+        // negative, so both fold families must leave the select in place.
+        for (op, k) in [(IrCmpOp::Sle, 0), (IrCmpOp::Slt, 5), (IrCmpOp::Sge, 0)] {
+            let mut func = iabs_cmp_func(op, k, true);
+            simplify_function(&mut func);
+            let insts = &func.blocks[0].instructions;
+            assert_eq!(insts.len(), 5, "{op:?} {k}");
+            assert!(
+                matches!(
+                    insts.last().unwrap(),
+                    Instruction::Cmp {
+                        dest: Value(4),
+                        op: got,
+                        lhs: Operand::Value(Value(3)),
+                        ..
+                    } if *got == op
+                ),
+                "{op:?} {k}: {:?}",
+                insts.last().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn iabs_recognition_requires_the_abs_shape() {
+        use crate::ir::reexports::{BasicBlock, BlockId, IrFunction, Terminator};
+        // `a < 0 ? -b : a` with `b` a different value: not an abs, no fold.
+        let mut func = IrFunction::new("not_abs".to_string(), IrType::I32, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::I32,
+                },
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 1,
+                    ty: IrType::I32,
+                },
+                Instruction::Cmp {
+                    dest: Value(2),
+                    op: IrCmpOp::Slt,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::UnaryOp {
+                    dest: Value(3),
+                    op: IrUnaryOp::Neg,
+                    src: Operand::Value(Value(1)),
+                    ty: IrType::I32,
+                },
+                Instruction::Select {
+                    dest: Value(4),
+                    cond: Operand::Value(Value(2)),
+                    true_val: Operand::Value(Value(3)),
+                    false_val: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                },
+                Instruction::Cmp {
+                    dest: Value(5),
+                    op: IrCmpOp::Sle,
+                    lhs: Operand::Value(Value(4)),
+                    rhs: Operand::Const(IrConst::I32(0)),
+                    ty: IrType::I32,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 6;
+        simplify_function(&mut func);
+        assert!(matches!(
+            func.blocks[0].instructions.last().unwrap(),
+            Instruction::Cmp {
+                op: IrCmpOp::Sle,
+                lhs: Operand::Value(Value(4)),
+                ..
+            }
+        ));
     }
 }
 

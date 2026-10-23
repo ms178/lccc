@@ -41,7 +41,7 @@ pub(super) fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [
             i += 1;
             continue;
         }
-        if !matches!(infos[i].kind, LineKind::Push { reg: 5 }) {
+        if !matches!(infos[i].kind, LineKind::Push { reg: REG_RBP }) {
             i += 1;
             continue;
         }
@@ -391,7 +391,7 @@ pub(super) fn eliminate_unused_callee_saves_fpo(store: &mut LineStore, infos: &m
                     saves.push((reg, j));
                     j += 1;
                 }
-                LineKind::Push { reg: 5 } => {
+                LineKind::Push { reg: REG_RBP } => {
                     let mut next = j + 1;
                     while next < func_end
                         && super::helpers::steps_over_line(

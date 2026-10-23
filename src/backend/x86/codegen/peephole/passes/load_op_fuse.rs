@@ -629,8 +629,8 @@ fn try_fuse_commuted_adjacent_load(
     if op_q != load_q
         || dest != scratch
         || source == scratch
-        || source == 4
-        || dest == 4
+        || source == REG_RSP
+        || dest == REG_RSP
         || !COMMUTATIVE_OPS.contains(&op)
         || lv.live_after(consumer_idx, source) != Some(false)
     {
@@ -692,7 +692,7 @@ fn try_fuse_commuted_unary_load_pair(
     load_q: bool,
     t_fam: RegId,
 ) -> Option<usize> {
-    if t_fam == 4
+    if t_fam == REG_RSP
         || super::relay_and_lea::segment_prefix_len(mem).is_some()
         || memory_operand_families(mem) & (1u16 << t_fam) != 0
     {
@@ -706,7 +706,7 @@ fn try_fuse_commuted_unary_load_pair(
     let (ld2_q, mem2, s_fam) = parse_memory_load(&k0_text)?;
     if ld2_q != load_q
         || s_fam == t_fam
-        || s_fam == 4
+        || s_fam == REG_RSP
         || super::relay_and_lea::segment_prefix_len(mem2).is_some()
         || (!k0_text.starts_with("movq ") && !k0_text.starts_with("movl "))
         || memory_operand_families(mem) & (1u16 << s_fam) != 0
@@ -743,7 +743,7 @@ fn try_fuse_commuted_unary_load_pair(
         if andn_q != load_q
             || rm_fam != t_fam
             || vvvv_fam != s_fam
-            || dst_fam == 4
+            || dst_fam == REG_RSP
             || (dst_fam != t_fam && lv.live_after(k, t_fam) != Some(false))
         {
             return None;
@@ -765,7 +765,7 @@ fn try_fuse_commuted_unary_load_pair(
                 if tc_q == load_q
                     && tc_src == dst_fam
                     && tc_dst != dst_fam
-                    && tc_dst != 4
+                    && tc_dst != REG_RSP
                     && (intervening_refs & (1u16 << tc_dst)) == 0
                     && lv.live_after(scan, dst_fam) == Some(false)
                 {
@@ -801,7 +801,7 @@ fn try_fuse_commuted_unary_load_pair(
             && cp_src == t_fam
             && cp_dst != t_fam
             && cp_dst != s_fam
-            && cp_dst != 4
+            && cp_dst != REG_RSP
             && memory_operand_families(mem) & (1u16 << cp_dst) == 0
             && memory_operand_families(mem2) & (1u16 << cp_dst) == 0
             && lv.live_after(k, t_fam) == Some(false)
@@ -836,7 +836,7 @@ fn try_fuse_commuted_unary_load_pair(
             if tc_q == load_q
                 && tc_src == d_fam
                 && tc_dst != d_fam
-                && tc_dst != 4
+                && tc_dst != REG_RSP
                 && (intervening_refs & (1u16 << tc_dst)) == 0
                 && memory_operand_families(mem) & (1u16 << tc_dst) == 0
                 && memory_operand_families(mem2) & (1u16 << tc_dst) == 0
@@ -1610,7 +1610,7 @@ pub(super) fn fuse_load_into_lea_add(store: &mut LineStore, infos: &mut [LineInf
         // pointer is omitted, so it is refused whenever this file contains a
         // frame setup (`movq %rsp, %rbp`); the check is per file and costs one
         // store scan, and refusing only loses the fold in the mixed case.
-        if base_fam == 4 || (base_fam == 5 && frame_pointer_in_use) {
+        if base_fam == REG_RSP || (base_fam == REG_RBP && frame_pointer_in_use) {
             i += 1;
             continue;
         }
@@ -1709,7 +1709,7 @@ fn rename_family(text: &str, from: RegId, to: RegId) -> Option<String> {
         return None;
     }
     let families = (1u16 << from) | (1u16 << to);
-    if from == RSP_FAM || to == RSP_FAM || implicit_reg_refs(trimmed.as_bytes()) & families != 0 {
+    if from == REG_RSP || to == REG_RSP || implicit_reg_refs(trimmed.as_bytes()) & families != 0 {
         return None;
     }
     let mn = trimmed.split_whitespace().next().unwrap_or("");
@@ -1765,7 +1765,6 @@ fn rename_family(text: &str, from: RegId, to: RegId) -> Option<String> {
 }
 
 /// `%rsp`'s family id (REG_NAMES[0] index 4): renaming it is never sane.
-const RSP_FAM: RegId = 4;
 
 /// True when `t`'s mentions of `fam` include a partial-width spelling
 /// (16-bit, 8-bit or a high-byte alias) — those do not kill the family.
@@ -2027,7 +2026,7 @@ fn rename_product_range(
     to: RegId,
     lv: &FileLiveness,
 ) -> Option<usize> {
-    if from == RSP_FAM || to == RSP_FAM {
+    if from == REG_RSP || to == REG_RSP {
         return None;
     }
     let len = store.len();
@@ -2427,7 +2426,7 @@ mod tests {
         ] {
             assert_eq!(rename_family(text, from, to).as_deref(), Some(expected));
         }
-        assert!(rename_family("movq %rax, %rdx", 0, RSP_FAM).is_none());
+        assert!(rename_family("movq %rax, %rdx", 0, REG_RSP).is_none());
         assert!(rename_family("shlq %cl, %r8", 8, 1).is_none());
         for (from, to) in [(REG_NONE, 0), (0, REG_NONE), (16, 1), (1, 24)] {
             assert!(rename_family("movq %rax, %rcx", from, to).is_none());
@@ -3110,6 +3109,79 @@ mod tests {
         assert!(has(&out, "notq %rax"), "{out:?}");
         assert!(has(&out, "andq (%rdi, %r11, 8), %rax"), "{out:?}");
         assert!(!out.iter().any(|l| l.contains("%rcx")), "{out:?}");
+    }
+
+    // ---- commuted-unary load-pair fusion: the refusal space ----
+    // Positive control: `fuses_commuted_unary_load_pair_in_place` above.
+    // Each case below breaks exactly one legality condition of the new
+    // shape; the first load must survive verbatim in every one.
+
+    #[test]
+    fn commuted_unary_refuses_when_unary_chain_register_stays_live() {
+        // %rcx is read after the consumer, so its load may not be
+        // retargeted into the product register.
+        let asm = format!(
+            "{PRO}    movq (%rdi, %r11, 8), %r10\n    movq (%rsi, %r11, 8), %rcx\n    notq %rcx\n    andq %rcx, %r10\n    movq %r10, %rax\n    addq %rcx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%rsi, %r11, 8), %rcx"), "{out:?}");
+        assert!(has(&out, "movq (%rdi, %r11, 8), %r10"), "{out:?}");
+    }
+
+    #[test]
+    fn commuted_unary_refuses_non_commutative_consumer() {
+        // sub is not commutative: MEM1 may not change places with the
+        // unary-chain operand.
+        let asm = format!(
+            "{PRO}    movq (%rdi, %r11, 8), %r10\n    movq (%rsi, %r11, 8), %rcx\n    notq %rcx\n    subq %rcx, %r10\n    movq %r10, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%rdi, %r11, 8), %r10"), "{out:?}");
+    }
+
+    #[test]
+    fn commuted_unary_refuses_segment_overridden_operand() {
+        let asm = format!(
+            "{PRO}    movq %gs:(%r11), %r10\n    movq (%rsi, %r11, 8), %rcx\n    notq %rcx\n    andq %rcx, %r10\n    movq %r10, %rax\n{EPI}"
+        );
+        assert_eq!(run(&asm, fuse_load_into_alu), asm);
+    }
+
+    #[test]
+    fn commuted_unary_refuses_memory_addressed_by_product() {
+        // MEM1 is addressed through %r10 itself: the load rewrites its own
+        // address base, so the memory text must not be carried past the
+        // intervening instructions into the consumer.
+        let asm = format!(
+            "{PRO}    movq (%r10, %r11, 8), %r10\n    movq (%rsi, %r11, 8), %rcx\n    notq %rcx\n    andq %rcx, %r10\n    movq %r10, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%r10, %r11, 8), %r10"), "{out:?}");
+    }
+
+    #[test]
+    fn fuses_andn_load_pair_with_trailing_copy() {
+        // BMI1 three-operand shape: andn's r/m operand comes from MEM1,
+        // MEM2 stays as the (non-inverted) VEX.vvvv operand, and the
+        // trailing copy to %rax is absorbed into the destination.
+        let asm = format!(
+            "{PRO}    movq (%rdi), %r10\n    movq (%rsi), %rcx\n    andnq %r10, %rcx, %r10\n    movq %r10, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "andnq (%rdi), %rcx, %rax"), "{out:?}");
+        assert!(has(&out, "movq (%rsi), %rcx"), "{out:?}");
+        assert!(!out.iter().any(|l| l == "movq (%rdi), %r10"), "{out:?}");
+    }
+
+    #[test]
+    fn andn_refuses_when_inverted_operand_stays_live() {
+        // %r10 is read after the andn with a different destination, so
+        // MEM1's load into %r10 is load-bearing and must stay.
+        let asm = format!(
+            "{PRO}    movq (%rdi), %r10\n    movq (%rsi), %rcx\n    andnq %r10, %rcx, %rax\n    addq %r10, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movq (%rdi), %r10"), "{out:?}");
     }
 
     #[test]

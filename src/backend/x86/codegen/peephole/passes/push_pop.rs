@@ -243,7 +243,7 @@ pub(super) fn eliminate_dead_scratch_saves(store: &LineStore, infos: &mut [LineI
     let mut changed = false;
     for i in 0..len {
         let r = match infos[i].kind {
-            LineKind::Push { reg } if reg <= REG_GP_MAX && reg != 4 && reg != 5 => reg,
+            LineKind::Push { reg } if reg <= REG_GP_MAX && reg != REG_RSP && reg != REG_RBP => reg,
             _ => continue,
         };
         if infos[i].is_nop() || infos[i].pinned {

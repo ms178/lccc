@@ -1008,7 +1008,7 @@ pub(super) fn frame_slot_stable_in_range(
             return false;
         }
         // Push/pop move %rsp implicitly (invisible to `writes_family`).
-        if base == 4
+        if base == REG_RSP
             && matches!(
                 infos[chk].kind,
                 LineKind::Push { .. } | LineKind::Pop { .. }
@@ -1021,7 +1021,7 @@ pub(super) fn frame_slot_stable_in_range(
         }
         // The callee owns the red zone; ordinary frame slots are call-safe
         // (escaped pointers are the caller's contract — see above).
-        if base == 4
+        if base == REG_RSP
             && matches!(infos[chk].kind, LineKind::Call)
             && slot.map_or(true, |s| s.disp < 0)
         {

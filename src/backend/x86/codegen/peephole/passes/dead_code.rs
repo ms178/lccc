@@ -94,7 +94,7 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
             continue;
         }
         // Don't eliminate moves to %rsp or %rbp.
-        if dst_reg == 4 || dst_reg == 5 {
+        if dst_reg == REG_RSP || dst_reg == REG_RBP {
             i += 1;
             continue;
         }
@@ -920,7 +920,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
         // data register and `(%rbp)` is a pointer dereference, never a stack slot).
         let rbp_is_frame;
 
-        if matches!(infos[i].kind, LineKind::Push { reg: 5 }) {
+        if matches!(infos[i].kind, LineKind::Push { reg: REG_RBP }) {
             rbp_is_frame = true;
             // Form 1: frame pointer prologue
             let mut j = next_non_nop(infos, i + 1, len);
@@ -1137,7 +1137,7 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                     && t != "movq %rsp, %rbp"
                     && !matches!(
                         infos[k].kind,
-                        LineKind::Push { reg: 5 } | LineKind::Pop { reg: 5 }
+                        LineKind::Push { reg: REG_RBP } | LineKind::Pop { reg: REG_RBP }
                     )
                 {
                     has_unparseable_indirect = true;

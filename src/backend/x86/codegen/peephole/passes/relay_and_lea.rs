@@ -76,7 +76,7 @@ const RELAY_OPS: &[&str] = &[
 /// implicitly by push/pop/leave, and are never worth a relay.
 #[inline]
 pub(super) fn is_relayable_family(fam: RegId) -> bool {
-    fam <= REG_GP_MAX && fam != 4 && fam != 5
+    fam <= REG_GP_MAX && fam != REG_RSP && fam != REG_RBP
 }
 
 /// Is `fam` safe to *receive* a retargeted value, given per-function `%rbp`
@@ -92,7 +92,7 @@ pub(super) fn is_relayable_family(fam: RegId) -> bool {
 /// anywhere proves the frame-pointer build.
 #[inline]
 pub(super) fn is_writable_family_gpr(fam: RegId, rbp_gpr: bool) -> bool {
-    fam <= REG_GP_MAX && fam != 4 && (fam != 5 || rbp_gpr)
+    fam <= REG_GP_MAX && fam != REG_RSP && (fam != REG_RBP || rbp_gpr)
 }
 
 /// Scan the whole `[fstart, fend]` function range and decide whether `%rbp`
@@ -1022,7 +1022,8 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
         // addq %r14, %r10` kept a zero-extension copy per iteration that the
         // identical `%r12` shape folds. The range scan runs lazily, so copies
         // that do not name rbp never pay for it.
-        let rbp_gpr = (src_fam == 5 || dst_fam == 5) && rbp_roles.is_gpr(&lv, store, infos, i);
+        let rbp_gpr =
+            (src_fam == REG_RBP || dst_fam == REG_RBP) && rbp_roles.is_gpr(&lv, store, infos, i);
         if src_fam == dst_fam
             || !is_writable_family_gpr(src_fam, rbp_gpr)
             || !is_writable_family_gpr(dst_fam, rbp_gpr)
@@ -1151,7 +1152,10 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
                     // elimination) and is itself the frame-pointer evidence
                     // `rbp_is_gpr_in_function` keys on — the rewrite would
                     // invalidate the very proof that admitted it.
-                    if src_fam != 5 && t.contains('(') && (!writes_dst_as_reg || write_only_dst) {
+                    if src_fam != REG_RBP
+                        && t.contains('(')
+                        && (!writes_dst_as_reg || write_only_dst)
+                    {
                         // The high-byte trap (pinned by
                         // `test_rcx_address_copy_high_byte_use_is_not_a_kill`):
                         // `%ch` reads bits 8..15 of the copied value at a
@@ -2139,7 +2143,7 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
                     let stack_op = ["push", "pop", "call", "ret", "leave", "enter"]
                         .iter()
                         .any(|m| t.starts_with(m));
-                    if !is_consumer || self_base || w == 4 || stack_op {
+                    if !is_consumer || self_base || w == REG_RSP || stack_op {
                         break;
                     }
                 }
@@ -2296,7 +2300,7 @@ fn parse_rip_symbol_lea(t: &str) -> Option<(String, RegId)> {
         return None;
     }
     let fam = plain_gp_operand(dst)?;
-    if fam == 4 || fam == 5 || dst != REG_NAMES[0][fam as usize] {
+    if fam == REG_RSP || fam == REG_RBP || dst != REG_NAMES[0][fam as usize] {
         return None;
     }
     Some((addr.to_string(), fam))
@@ -2478,7 +2482,7 @@ fn retarget_producer_into_copy_impl(
         // (see `rbp_is_gpr_in_function`); the frame-pointer build keeps the
         // conservative `is_relayable_family` refusal. The function-range scan
         // runs lazily: candidates without an rbp operand never pay for it.
-        let rbp_gpr = if a_fam == 5 {
+        let rbp_gpr = if a_fam == REG_RBP {
             rbp_roles.is_gpr(&lv, store, infos, i)
         } else {
             false
@@ -2556,7 +2560,7 @@ fn retarget_producer_into_copy_impl(
             i += 1;
             continue;
         }
-        let rbp_gpr = rbp_gpr || (d_fam == 5 && rbp_roles.is_gpr(&lv, store, infos, i));
+        let rbp_gpr = rbp_gpr || (d_fam == REG_RBP && rbp_roles.is_gpr(&lv, store, infos, i));
         if !is_writable_family_gpr(d_fam, rbp_gpr) {
             i += 1;
             continue;

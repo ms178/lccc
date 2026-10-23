@@ -158,12 +158,14 @@ else
     gcc_bin=${GCC:-gcc-16}
     if command -v "$gcc_bin" >/dev/null 2>&1; then
         if "$gcc_bin" -O2 -fno-tree-vectorize -o "$tmp/gcc.exe" "$tmp/relay.c" 2>"$tmp/err"; then
-            want=$("$tmp/gcc.exe")
+            want=$("$tmp/gcc.exe") || fail "oracle binary failed to run"
             if [ "$got" != "$want" ]; then
                 fail "differential mismatch against $gcc_bin -O2 (scalar):
   lccc: $got
   $gcc_bin: $want"
             fi
+        else
+            fail "oracle compile failed: $(cat "$tmp/err")"
         fi
     fi
     # The forwarding-off configuration must produce the same bits too: the
@@ -175,6 +177,8 @@ else
   with: $got
   CCC_NO_XMM_SF=1: $nosf"
         fi
+    else
+        fail "forwarding-disabled compile failed: $(cat "$tmp/err")"
     fi
 fi
 

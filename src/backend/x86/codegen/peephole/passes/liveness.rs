@@ -41,7 +41,9 @@ const ALL: u16 = 0xFFFF;
 const RAX: u16 = 1 << 0;
 const RCX: u16 = 1 << 1;
 const RDX: u16 = 1 << 2;
+const RBX: u16 = 1 << 3;
 const RSP: u16 = 1 << 4;
+const RBP: u16 = 1 << 5;
 /// Values an ABI-visible transfer reads without naming them: the six SysV
 /// argument registers and `%rax` (variadic vector count). `%r10` (the
 /// static chain) is NOT here: chain calls carry `# LCCC_CHAIN_CALL`
@@ -63,8 +65,7 @@ const CALL_READS: u16 = RAX | RCX | RDX | (1 << 6) | (1 << 7) | (1 << 8) | (1 <<
 const CALLER_SAVED: u16 =
     RAX | RCX | RDX | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
 /// Live at `ret`: integer return value plus everything the callee must restore.
-const RET_LIVE: u16 =
-    RAX | RDX | (1 << 3) | (1 << 5) | RSP | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
+const RET_LIVE: u16 = RAX | RDX | RBX | RBP | RSP | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
 /// Same, for a function that demonstrably returns a single value in `%rax`
 /// (its epilogue writes the accumulator and never touches `%rdx`). Keeping
 /// `%rdx` artificially live there hides every dead `movq %rax, %rdx` the

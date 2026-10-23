@@ -131,9 +131,4 @@ fi
 if [ "$fail" -ne 0 ]; then
     exit 1
 fi
-CCC="$CCC" bash "$HERE/run_matmul_sse2_fallback.sh"
-CCC="$CCC" bash "$HERE/run_sse2_slot_forwarding.sh"
-CCC="$CCC" bash "$HERE/run_sse2_truncating_convert.sh"
-LCCC_BIN="$CCC" python3 "$HERE/check_builtin_float_aliases.py"
-python3 "$HERE/check_ci_link_oracle_provisioning.py"
 printf 'sse2 matmul vectorization: ok\n'

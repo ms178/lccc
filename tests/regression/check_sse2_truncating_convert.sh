@@ -9,8 +9,8 @@
 #     _mm_cvttsd_si32(a)  ->  cvtsd2si   (rounds per MXCSR.RC)
 #     _mm_cvttss_si32(a)  ->  cvtss2si   (rounds per MXCSR.RC)
 #
-# Under the default round-to-nearest MXCSR the two agree, so a naive test sees
-# nothing wrong.  Under any other rounding mode they disagree in the low bit:
+# Even round-to-nearest distinguishes them for fractional inputs (2.7 -> 3
+# versus 2). Other rounding modes and negative inputs exercise both directions:
 #
 #     MXCSR.RC = 1 (round down),   2.7 -> cvtt* gives 2, cvt* gives 2
 #     MXCSR.RC = 2 (round up),     2.7 -> cvtt* gives 2, cvt* gives 3   <-- bug
@@ -41,36 +41,51 @@ static unsigned set_rc(unsigned mode)
     unsigned old;
     __asm__ volatile("stmxcsr %0" : "=m"(old));
     unsigned updated = (old & ~(3u << 13)) | ((mode & 3u) << 13);
-    __asm__ volatile("ldmxcsr %0" : : "m"(updated));
+    __asm__ volatile("ldmxcsr %0" : : "m"(updated) : "memory");
     return old;
 }
 
 static void restore(unsigned v)
 {
-    __asm__ volatile("ldmxcsr %0" : : "m"(v));
+    __asm__ volatile("ldmxcsr %0" : : "m"(v) : "memory");
 }
 
 int main(void)
 {
     const double dv[4] = {2.7, -2.7, 0.9, -0.9};
     const float fv[4] = {2.7f, -2.7f, 0.9f, -0.9f};
+    const int rounded_values[4][4] = {
+        {3, -3, 1, -1}, {2, -3, 0, -1},
+        {3, -2, 1, 0}, {2, -2, 0, 0}
+    };
     int bad = 0;
     for (unsigned mode = 0; mode < 4; mode++) {
         unsigned old = set_rc(mode);
         for (int i = 0; i < 4; i++) {
-            __m128d d = _mm_setzero_pd();
-            d = _mm_loadu_pd(&dv[i & 1 ? i - 1 : i]);
+            __m128d d = _mm_set_sd(dv[i]);
             int got = _mm_cvttsd_si32(d);
-            int want = (int)dv[i & 1 ? i - 1 : i];
+            int want = (int)dv[i];
             if (got != want) {
-                printf("FAIL sd rc=%u %g -> %d (want %d)\n", mode, dv[i & 1 ? i - 1 : i], got, want);
+                printf("FAIL sd rc=%u %g -> %d (want %d)\n", mode, dv[i], got, want);
                 bad = 1;
             }
-            __m128 f = _mm_loadu_ps(&fv[i & 1 ? i - 1 : i]);
+            __m128 f = _mm_set_ss(fv[i]);
             got = _mm_cvttss_si32(f);
-            want = (int)fv[i & 1 ? i - 1 : i];
+            want = (int)fv[i];
             if (got != want) {
-                printf("FAIL ss rc=%u %g -> %d (want %d)\n", mode, (double)fv[i & 1 ? i - 1 : i], got, want);
+                printf("FAIL ss rc=%u %g -> %d (want %d)\n", mode, (double)fv[i], got, want);
+                bad = 1;
+            }
+            if (_mm_cvttsd_si64(d) != (long long)dv[i]
+                || _mm_cvttss_si64(f) != (long long)fv[i]) {
+                printf("FAIL 64-bit truncation rc=%u index=%d\n", mode, i);
+                bad = 1;
+            }
+            if (_mm_cvtsd_si32(d) != rounded_values[mode][i]
+                || _mm_cvtss_si32(f) != rounded_values[mode][i]
+                || _mm_cvtsd_si64(d) != rounded_values[mode][i]
+                || _mm_cvtss_si64(f) != rounded_values[mode][i]) {
+                printf("FAIL rounded conversion rc=%u index=%d\n", mode, i);
                 bad = 1;
             }
         }
@@ -152,9 +167,11 @@ $out" ;;
     esac
     gcc_bin=${GCC:-gcc-16}
     if command -v "$gcc_bin" >/dev/null 2>&1; then
-        "$gcc_bin" -O2 -o "$tmp/gcc.exe" "$tmp/trunc.c" 2>"$tmp/err" &&
-            want=$("$tmp/gcc.exe") || want=""
-        if [ -n "$want" ] && [ "$want" != "$out" ]; then
+        if ! "$gcc_bin" -O2 -o "$tmp/gcc.exe" "$tmp/trunc.c" 2>"$tmp/err"; then
+            fail "oracle compile failed: $(cat "$tmp/err")"
+        elif ! want=$("$tmp/gcc.exe"); then
+            fail "oracle execution failed: $want"
+        elif [ "$want" != "$out" ]; then
             fail "differential mismatch against $gcc_bin:
   lccc:  $out
   $gcc_bin: $want"

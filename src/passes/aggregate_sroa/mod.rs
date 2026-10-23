@@ -119,48 +119,58 @@ pub(crate) fn run(module: &mut IrModule) -> usize {
 /// scalar memcpy. This is intentionally narrower than general alias analysis:
 /// it follows only the pointer-preserving/value-offset forms emitted by the
 /// frontend, and fails closed for merges or opaque producers.
+///
+/// Results are memoized per value in `memo` (one map per function walk; `defs`
+/// and `allocas` are fixed snapshots for its lifetime). The Add/Sub arm walks
+/// BOTH operands, and a shared subexpression DAG `a(i+1) = a(i) + a(i)` under
+/// the pointer — reachable through an inttoptr arithmetic chain — otherwise
+/// re-walks every shared node: measured 2 s at depth 25 and 52 s at depth 30
+/// on a 32-line source, i.e. clean 2^n. The memo is sound because the
+/// traversed def graph is the non-phi SSA graph (the walk stops at `Phi`),
+/// which is acyclic; `visiting` remains as the depth/cycle fail-closed guard
+/// for malformed input, and a truncated walk memoizes `None` (fail closed).
 fn scalar_memcpy_root(
     value: u32,
     defs: &FxHashMap<u32, Instruction>,
     allocas: &FxHashSet<u32>,
     visiting: &mut FxHashSet<u32>,
+    memo: &mut FxHashMap<u32, Option<u32>>,
 ) -> Option<u32> {
     if allocas.contains(&value) {
         return Some(value);
     }
+    if let Some(&cached) = memo.get(&value) {
+        return cached;
+    }
     if visiting.len() >= 128 || !visiting.insert(value) {
         return None;
     }
-    let Some(def) = defs.get(&value) else {
-        visiting.remove(&value);
-        return None;
-    };
-    let result = match def {
-        Instruction::GetElementPtr { base, .. } => {
-            scalar_memcpy_root(base.0, defs, allocas, visiting)
+    let result = match defs.get(&value) {
+        Some(Instruction::GetElementPtr { base, .. }) => {
+            scalar_memcpy_root(base.0, defs, allocas, visiting, memo)
         }
-        Instruction::Copy {
-            src: Operand::Value(src),
-            ..
-        }
-        | Instruction::Cast {
-            src: Operand::Value(src),
-            ..
-        } => scalar_memcpy_root(src.0, defs, allocas, visiting),
-        Instruction::BinOp { op, lhs, rhs, .. }
+        Some(
+            Instruction::Copy {
+                src: Operand::Value(src),
+                ..
+            }
+            | Instruction::Cast {
+                src: Operand::Value(src),
+                ..
+            },
+        ) => scalar_memcpy_root(src.0, defs, allocas, visiting, memo),
+        Some(Instruction::BinOp { op, lhs, rhs, .. })
             if matches!(
                 op,
                 crate::ir::reexports::IrBinOp::Add | crate::ir::reexports::IrBinOp::Sub
             ) =>
         {
             let left = match lhs {
-                Operand::Value(v) => scalar_memcpy_root(v.0, defs, allocas, visiting),
+                Operand::Value(v) => scalar_memcpy_root(v.0, defs, allocas, visiting, memo),
                 Operand::Const(_) => None,
             };
-            // A repeated value is not a cycle once the left walk has returned.
-            visiting.remove(&value);
             let right = match rhs {
-                Operand::Value(v) => scalar_memcpy_root(v.0, defs, allocas, visiting),
+                Operand::Value(v) => scalar_memcpy_root(v.0, defs, allocas, visiting, memo),
                 Operand::Const(_) => None,
             };
             match (left, right) {
@@ -170,16 +180,26 @@ fn scalar_memcpy_root(
             }
         }
         // These are genuine pointer roots rather than derived aliases.
-        Instruction::ParamRef { .. } | Instruction::GlobalAddr { .. } => Some(value),
+        Some(Instruction::ParamRef { .. } | Instruction::GlobalAddr { .. }) => Some(value),
         _ => None,
     };
     visiting.remove(&value);
+    memo.insert(value, result);
     result
 }
 
 /// Replace small non-alloca memcpy operations with one scalar load and store.
 /// This avoids materializing tiny copies as calls/spill-backed temporaries,
 /// while deliberately leaving alloca-backed copies to the richer SROA forms.
+///
+/// Alignment: `memcpy` permits arbitrarily aligned operands, and the typed
+/// scalar `Load`/`Store` pair emitted here preserves exactly that contract
+/// on every backend this tree ships: x86 lowers scalar loads/stores to
+/// misalignment-tolerant `mov`, AArch64 to `ldr`/`str` (tolerant for Normal
+/// memory), and the RISC-V backend likewise treats unaligned accesses
+/// identically to aligned ones (see its codegen README).  Overlap is not a
+/// concern: overlapping `memcpy` objects are undefined behaviour in C, so
+/// the load-then-store order is as sound as the call it replaces.
 fn lower_non_alloca_scalar_memcpy(func: &mut IrFunction) -> usize {
     let mut allocas = FxHashSet::default();
     let mut defs = FxHashMap::default();
@@ -194,6 +214,10 @@ fn lower_non_alloca_scalar_memcpy(func: &mut IrFunction) -> usize {
             }
         }
     }
+    // Shared by every memcpy root query in this function: `defs`/`allocas`
+    // are immutable snapshots here, and the fresh load ids minted below are
+    // never queried, so one memo serves the whole rewrite.
+    let mut root_memo: FxHashMap<u32, Option<u32>> = FxHashMap::default();
     let mut changed = 0;
     for block in &mut func.blocks {
         let old = std::mem::take(&mut block.instructions);
@@ -212,10 +236,20 @@ fn lower_non_alloca_scalar_memcpy(func: &mut IrFunction) -> usize {
                         _ => None,
                     };
                     ty.and_then(|ty| {
-                        let d =
-                            scalar_memcpy_root(dest.0, &defs, &allocas, &mut FxHashSet::default())?;
-                        let s =
-                            scalar_memcpy_root(src.0, &defs, &allocas, &mut FxHashSet::default())?;
+                        let d = scalar_memcpy_root(
+                            dest.0,
+                            &defs,
+                            &allocas,
+                            &mut FxHashSet::default(),
+                            &mut root_memo,
+                        )?;
+                        let s = scalar_memcpy_root(
+                            src.0,
+                            &defs,
+                            &allocas,
+                            &mut FxHashSet::default(),
+                            &mut root_memo,
+                        )?;
                         (!allocas.contains(&d) && !allocas.contains(&s))
                             .then_some((*dest, *src, ty))
                     })
@@ -1543,6 +1577,153 @@ mod scalar_memcpy_tests {
                 ty: IrType::I32,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn root_walk_is_linear_on_shared_add_dags() {
+        // `a(i+1) = a(i) + a(i)` under an inttoptr cast: the root walk
+        // recurses into both Add operands, so without memoization this
+        // 64-deep DAG costs 2^64 node visits (measured on the equivalent
+        // C source: depth 25 = 2 s, depth 30 = 52 s). With the per-value
+        // memo it is one visit per value and the memcpy still lowers.
+        const DEPTH: u32 = 64;
+        let mut instructions = vec![Instruction::ParamRef {
+            dest: Value(0),
+            param_idx: 0,
+            ty: IrType::I64,
+        }];
+        for i in 1..=DEPTH {
+            instructions.push(Instruction::BinOp {
+                dest: Value(i),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(i - 1)),
+                rhs: Operand::Value(Value(i - 1)),
+                ty: IrType::I64,
+            });
+        }
+        instructions.push(Instruction::Cast {
+            dest: Value(DEPTH + 1),
+            src: Operand::Value(Value(DEPTH)),
+            from_ty: IrType::I64,
+            to_ty: IrType::Ptr,
+        });
+        instructions.push(Instruction::GlobalAddr {
+            dest: Value(DEPTH + 2),
+            name: "src".to_string(),
+        });
+        instructions.push(Instruction::Memcpy {
+            dest: Value(DEPTH + 1),
+            src: Value(DEPTH + 2),
+            size: 4,
+        });
+        let mut func = IrFunction::new("dag_copy".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        assert_eq!(lower_non_alloca_scalar_memcpy(&mut func), 1);
+    }
+
+    #[test]
+    fn lowers_unaligned_eight_byte_memcpy_to_scalar_pair() {
+        // memcpy at odd offsets from both roots: the scalar pair must
+        // carry the full 8-byte width (backend scalar accesses are
+        // misalignment-tolerant; see the contract on
+        // `lower_non_alloca_scalar_memcpy`).
+        let mut func = IrFunction::new("unaligned_copy".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "src".to_string(),
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(1),
+                    name: "dst".to_string(),
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I64(1)),
+                    ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(3),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(3)),
+                    ty: IrType::I64,
+                },
+                Instruction::Memcpy {
+                    dest: Value(3),
+                    src: Value(2),
+                    size: 8,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        assert_eq!(lower_non_alloca_scalar_memcpy(&mut func), 1);
+        let instructions = &func.blocks[0].instructions;
+        assert!(matches!(
+            instructions[4],
+            Instruction::Load {
+                ptr: Value(2),
+                ty: IrType::I64,
+                ..
+            }
+        ));
+        assert!(matches!(
+            instructions[5],
+            Instruction::Store {
+                ptr: Value(3),
+                ty: IrType::I64,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn refuses_memcpy_with_opaque_pointer_root() {
+        // Destination loaded from memory: its allocation root is not
+        // provable by the narrow walk, so the copy stays a memcpy.
+        let mut func = IrFunction::new("opaque_copy".to_string(), IrType::Void, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "slot".to_string(),
+                },
+                Instruction::Load {
+                    dest: Value(1),
+                    ptr: Value(0),
+                    ty: IrType::Ptr,
+                    seg_override: crate::common::types::AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::GlobalAddr {
+                    dest: Value(2),
+                    name: "src".to_string(),
+                },
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(2),
+                    size: 8,
+                },
+            ],
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        });
+        assert_eq!(lower_non_alloca_scalar_memcpy(&mut func), 0);
+        assert!(matches!(
+            func.blocks[0].instructions[3],
+            Instruction::Memcpy { .. }
         ));
     }
 

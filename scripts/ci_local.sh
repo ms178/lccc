@@ -184,6 +184,14 @@ gate "volatile-destructuring-selftest" fast \
 gate "volatile-destructuring" fast \
     python3 scripts/check_volatile_destructuring.py
 
+# The SIMD intrinsic surface has exactly one source of truth -- the
+# generator. A hand-edited header drifting from it would silently fork the
+# intrinsic contracts the frontend believes in, so byte-compare them; like
+# the scans above it needs no compiler and runs before `build`. Mirrors the
+# hosted Clippy-lane step (gate parity).
+gate "generated-simd-header-sync" fast \
+    python3 scripts/gen_lcccsimd.py --check
+
 # ---------------------------------------------------------------- build ----
 gate "build" fast ./scripts/build_lccc_fast.sh
 
@@ -229,6 +237,14 @@ gate "fp-contract-parity" fast \
 # the reference kernel) without any test going red.
 gate "sse2-matmul-vectorization" fast \
     env CCC="$LCCC" bash tests/regression/check_sse2_matmul_vectorization.sh
+# Fixed-distance SLP: complete 256-bit F32x8/F64x4 distance expressions pack
+# under fast FP semantics; strict FP, partial widths, an intervening call,
+# and the no-AVX baseline all keep scalar code. The CCC_NO_FIXED_SLP leg is
+# why this gate must stay wired: the kill switch once silently died when its
+# per-call environment read was removed, and nothing noticed while the gate
+# sat in the orphan allowlist.
+gate "fixed-slp-distances" fast \
+    env CCC="$LCCC" bash tests/regression/check_fixed_slp_distances_codegen.sh
 # Signed dynamic limits can overflow while the FMA matmul vectorizer scales
 # grouped trips into byte offsets. Exercise the I32/I64 overflow boundaries in
 # both the AVX2 and two-wide paths, with packed-codegen positive controls.
@@ -262,6 +278,27 @@ gate "sse2-truncating-convert" fast \
 # against `CCC_NO_XMM_SF=1` so the rewrite is proven to be a pure optimization.
 gate "sse2-slot-forwarding" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_sse2_slot_forwarding.sh
+
+# Every `__builtin_<libc>f` float alias GCC accepts must resolve in lccc to the
+# same operation with bit-identical results (arity probed against gcc-16, then
+# a runtime differential) -- the failure mode otherwise is a quiet call to a
+# symbol that does not exist.
+# `_mm_max_sd` / `_mm_min_sd` must be the single hardware `maxsd` / `minsd`
+# with Intel's second-operand-wins tie/NaN semantics bit-exact (incl. signed
+# zeros and the preserved high lane) -- they were an 84-instruction
+# compare+select expansion for far too long.
+gate "sse2-scalar-minmax" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_sse2_scalar_minmax.sh
+
+gate "builtin-float-aliases" fast \
+    python3 tests/regression/check_builtin_float_aliases.py --lccc "$LCCC" --gcc "${GCC:-gcc-16}"
+
+# The differential linker oracles (mold, lld) must install with retries and
+# version pinning, never as bare apt lines whose transient mirror failure
+# red-fails the whole job; this gate drives the installer against a mock
+# apt and proves the failure modes are the loud ones.
+gate "ci-link-oracle-provisioning" fast \
+    python3 tests/regression/check_ci_link_oracle_provisioning.py
 
 # Three compiles and two runs: pins that a loop-carried accumulator keeps its
 # callee-saved home when a call inside the loop forces the value to be
@@ -1091,6 +1128,13 @@ gate "strict-packed-dag" fast \
 gate "machinst-window-alloc" fast \
     bash tests/regression/check_machinst_window_alloc_wide_copy.sh
 
+# The MachInst emitter's unresolvable-vreg fallback must replay the buffered
+# IR through the default path at the original program points. The trigger
+# shape ages out as the allocator improves (varargs_abi no longer trips it),
+# so the gate pairs a live trigger with the varargs runtime proof.
+gate "machinst-fallback-replay" fast \
+    env CCC="$LCCC" bash tests/regression/check_machinst_fallback_replay.sh
+
 gate "overalign-typed-census" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_overalign_typed_census.sh
 
@@ -1333,6 +1377,24 @@ gate "affine-value-bound" fast \
 
 gate "minmax-reduction" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_minmax_reduction.sh
+
+# Width-aware register-resident FP reduction accumulators (in-place packed
+# updates, zero stack traffic), with the surviving CCC_NO_REDUCTION_VECREG
+# differential on the dot/sum-squares family.
+gate "reduction-vecreg" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_reduction_vecreg_codegen.sh
+
+# The integer twin: I32/I64 AVX2 and forced-SSE2 reduction accumulators in
+# width-aware SIMD homes, spill-traffic differential on the AVX2 leg.
+gate "integer-reduction-vecreg" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_integer_reduction_vecreg_codegen.sh
+
+# Integer abs comparison folds in simplify: abs(a) <= 0 -> a == 0 and
+# abs(a) < k -> the biased unsigned range test, with the
+# CCC_SIMPLIFY_SKIP=cmp differential ownership and the -fwrapv
+# INT_MIN/LONG_MIN contract (folds suppressed; wrapping answers kept).
+gate "iabs-cmp-fold" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_iabs_cmp_fold.sh
 
 # Observable-access gates.  Three instruments, because each catches a
 # different way the `volatile` contract gets broken and each was proved to do
@@ -1876,6 +1938,17 @@ gate "i686-asm-diff" fast \
         --lccc target/fastbuild/lccc-i686
 gate "i686-tls-ie-relax" fast \
     bash tests/regression/check_i686_tls_ie_relax.sh
+
+# 64-bit symbol-difference mov immediate (the mem_encrypt_boot.S idiom):
+# the folded length must equal the label distance under either legal
+# encoding fixpoint (imm32 or movabs).
+gate "movabs-symdiff" fast \
+    env CCC="$LCCC" bash tests/regression/check_movabs_symdiff.sh
+
+# A `.symver`-bound indirect call must never fold to a direct/memory form
+# (it would re-bind to the default version); the unversioned twin must fold.
+gate "symver-indirect-fold" fast \
+    env CCC_X64="$LCCC" bash tests/regression/check_symver_indirect_fold.sh
 gate "i686-got32x-relax" fast \
     bash tests/regression/check_i686_got32x_relax.sh
 

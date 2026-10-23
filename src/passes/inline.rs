@@ -3102,400 +3102,8 @@ fn const_trip_site_arg(
     })
 }
 
-/// Rewrite an indirect call whose target is provably one local function into
-/// the equivalent direct call, so ordinary inlining can see it.
-///
-/// Template specialization often reaches the inliner as `call *%f` where `%f`
-/// is a constant-folded `GlobalAddr`; the backend already emits that as a
-/// direct `call f`, but the IR call graph still hides the callee. Rules:
-/// * the pointer must resolve through uniquely-defined `Copy` values to one
-///   `GlobalAddr`; reassigned or phi-joined values are not constants;
-/// * the target must be a non-weak, non-variadic definition without an asm
-///   label, so the direct name binds exactly where the address bound;
-/// * the call-site ABI must be exactly the definition's scalar ABI. Struct,
-///   sret, binary128-in-SSE and fastcall/regparm mismatches stay indirect.
-///
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum FnPtrOrigin {
-    Global(String),
-    Param(usize),
-}
-
-type ValueDefTable = FxHashMap<Value, (u32, Option<(usize, usize)>)>;
-
-fn build_value_def_table(func: &IrFunction) -> ValueDefTable {
-    let mut defs: ValueDefTable = FxHashMap::default();
-    for (bi, block) in func.blocks.iter().enumerate() {
-        for (ii, inst) in block.instructions.iter().enumerate() {
-            if let Some(dest) = inst.dest() {
-                let entry = defs.entry(dest).or_insert((0, None));
-                entry.0 += 1;
-                entry.1 = Some((bi, ii));
-            }
-        }
-    }
-    defs
-}
-
-fn terminator_targets_block(term: &Terminator, target: BlockId) -> bool {
-    match term {
-        Terminator::Branch(t) => *t == target,
-        Terminator::CondBranch {
-            true_label,
-            false_label,
-            ..
-        } => *true_label == target || *false_label == target,
-        Terminator::Switch { default, cases, .. } => {
-            *default == target || cases.iter().any(|(_, l)| *l == target)
-        }
-        Terminator::IndirectBranch {
-            possible_targets, ..
-        } => possible_targets.contains(&target),
-        Terminator::Return(_) | Terminator::Unreachable => false,
-    }
-}
-
-/// Entry-block allocas that are initialized by a single non-volatile `Store`
-/// before any `Load` and never escape or get overwritten anywhere in `func`.
-fn unescaped_entry_alloca_inits(func: &IrFunction) -> FxHashMap<Value, Value> {
-    let Some(entry_block) = func.blocks.first() else {
-        return FxHashMap::default();
-    };
-    let entry_label = entry_block.label;
-    if func
-        .blocks
-        .iter()
-        .any(|b| terminator_targets_block(&b.terminator, entry_label))
-    {
-        return FxHashMap::default();
-    }
-    let mut states: FxHashMap<Value, Option<Option<Value>>> = FxHashMap::default();
-    for inst in &entry_block.instructions {
-        if let Instruction::Alloca {
-            dest,
-            volatile: false,
-            ..
-        } = inst
-        {
-            states.entry(*dest).or_insert(Some(None));
-        }
-    }
-    if states.is_empty() {
-        return FxHashMap::default();
-    }
-    for (bi, block) in func.blocks.iter().enumerate() {
-        block.terminator.for_each_used_value(|v| {
-            if let Some(slot) = states.get_mut(&Value(v)) {
-                *slot = None;
-            }
-        });
-        for inst in &block.instructions {
-            match inst {
-                Instruction::Store {
-                    volatile: false,
-                    val: Operand::Value(init_val),
-                    ptr,
-                    ..
-                } if bi == 0 && states.contains_key(ptr) && init_val != ptr => {
-                    if let Some(slot) = states.get_mut(init_val) {
-                        *slot = None;
-                    }
-                    if let Some(slot) = states.get_mut(ptr) {
-                        *slot = match *slot {
-                            Some(None) => Some(Some(*init_val)),
-                            _ => None,
-                        };
-                    }
-                }
-                Instruction::Load {
-                    volatile: false,
-                    ptr,
-                    ..
-                } if states.contains_key(ptr) => {
-                    if bi == 0 && matches!(states.get(ptr), Some(Some(None))) {
-                        states.insert(*ptr, None);
-                    }
-                }
-                _ => {
-                    inst.for_each_used_value(|v| {
-                        if let Some(slot) = states.get_mut(&Value(v)) {
-                            *slot = None;
-                        }
-                    });
-                }
-            }
-        }
-    }
-    states
-        .into_iter()
-        .filter_map(|(k, v)| Some((k, v??)))
-        .collect()
-}
-
-fn resolve_fn_ptr_origin(
-    func: &IrFunction,
-    defs: &ValueDefTable,
-    alloca_inits: &FxHashMap<Value, Value>,
-    mut value: Value,
-) -> Option<FnPtrOrigin> {
-    for _ in 0..16 {
-        let &(count, Some((bi, ii))) = defs.get(&value)? else {
-            return None;
-        };
-        if count != 1 {
-            return None;
-        }
-        match &func.blocks[bi].instructions[ii] {
-            Instruction::GlobalAddr { name, .. } => return Some(FnPtrOrigin::Global(name.clone())),
-            Instruction::ParamRef { param_idx, .. } => return Some(FnPtrOrigin::Param(*param_idx)),
-            Instruction::Copy {
-                src: Operand::Value(src),
-                ..
-            } => value = *src,
-            Instruction::Load {
-                ptr,
-                volatile: false,
-                ..
-            } => value = *alloca_inits.get(ptr)?,
-            _ => return None,
-        }
-    }
-    None
-}
-
-/// Propagate function-pointer arguments across internal-linkage functions whose
-/// address is never taken and whose callers all pass the same target symbol.
-fn propagate_invariant_fn_ptr_params(
-    module: &IrModule,
-    eligible_targets: &FxHashSet<String>,
-    func_tables: &[(ValueDefTable, FxHashMap<Value, Value>)],
-) -> FxHashMap<(String, usize), String> {
-    let (value_referenced, asm_templates) = collect_value_referenced_functions(module);
-    let mut eligible_callees: FxHashMap<String, Vec<bool>> = module
-        .functions
-        .iter()
-        .filter(|f| {
-            f.is_static
-                && !f.is_declaration
-                && !f.is_weak
-                && !f.is_variadic
-                && !module.asm_labels.contains_key(&f.name)
-                && !function_referenced_as_value(&f.name, &value_referenced, &asm_templates)
-        })
-        .map(|f| {
-            let scalar_params = f
-                .params
-                .iter()
-                .map(|p| p.struct_size.is_none() && !p.is_f128_sse)
-                .collect();
-            (f.name.clone(), scalar_params)
-        })
-        .collect();
-    if eligible_callees.is_empty() {
-        return FxHashMap::default();
-    }
-    let mut call_sites: FxHashMap<(String, usize), Vec<(String, Option<FnPtrOrigin>)>> =
-        FxHashMap::default();
-    for (fi, caller) in module.functions.iter().enumerate() {
-        if caller.is_declaration {
-            continue;
-        }
-        let (defs, alloca_inits) = &func_tables[fi];
-        for block in &caller.blocks {
-            for inst in &block.instructions {
-                let Instruction::Call {
-                    func: callee_name,
-                    info,
-                } = inst
-                else {
-                    continue;
-                };
-                let Some(param_mask) = eligible_callees.get(callee_name) else {
-                    continue;
-                };
-                if info.is_variadic || info.args.len() != param_mask.len() {
-                    eligible_callees.remove(callee_name);
-                    continue;
-                }
-                for (pi, &is_scalar) in param_mask.iter().enumerate() {
-                    if !is_scalar {
-                        continue;
-                    }
-                    let origin = match &info.args[pi] {
-                        Operand::Value(v) => resolve_fn_ptr_origin(caller, defs, alloca_inits, *v),
-                        Operand::Const(_) => None,
-                    };
-                    call_sites
-                        .entry((callee_name.clone(), pi))
-                        .or_default()
-                        .push((caller.name.clone(), origin));
-                }
-            }
-        }
-    }
-    call_sites
-        .retain(|(callee, _), sites| eligible_callees.contains_key(callee) && !sites.is_empty());
-    let mut known: FxHashMap<(String, usize), String> = FxHashMap::default();
-    for _ in 0..8 {
-        let mut progressed = false;
-        for ((callee, pi), sites) in &call_sites {
-            if known.contains_key(&(callee.clone(), *pi)) {
-                continue;
-            }
-            let mut agreed: Option<&str> = None;
-            let mut all_ok = true;
-            for (caller_name, origin_opt) in sites {
-                let Some(origin) = origin_opt else {
-                    all_ok = false;
-                    break;
-                };
-                if caller_name == callee && *origin == FnPtrOrigin::Param(*pi) {
-                    continue;
-                }
-                let target = match origin {
-                    FnPtrOrigin::Global(sym) => sym.as_str(),
-                    FnPtrOrigin::Param(caller_pi) => {
-                        let Some(sym) = known.get(&(caller_name.clone(), *caller_pi)) else {
-                            all_ok = false;
-                            break;
-                        };
-                        sym.as_str()
-                    }
-                };
-                match agreed {
-                    None => agreed = Some(target),
-                    Some(prev) if prev == target => {}
-                    Some(_) => {
-                        all_ok = false;
-                        break;
-                    }
-                }
-            }
-            if all_ok
-                && let Some(target) = agreed
-                && eligible_targets.contains(target)
-            {
-                known.insert((callee.clone(), *pi), target.to_string());
-                progressed = true;
-            }
-        }
-        if !progressed {
-            break;
-        }
-    }
-    known
-}
-
-/// A call through a mismatched prototype is undefined in C, but rewriting it
-/// would turn that into inliner parameter-type confusion. Refusing is cheap.
-fn devirtualize_constant_indirect_calls(module: &mut IrModule) -> FxHashSet<(String, String)> {
-    struct Target {
-        params: Vec<IrType>,
-        return_type: IrType,
-        is_fastcall: bool,
-        regparm: Option<u8>,
-    }
-    let targets: FxHashMap<String, Target> = module
-        .functions
-        .iter()
-        .filter(|f| {
-            !f.is_declaration
-                && !f.is_weak
-                && !f.is_variadic
-                && !f.uses_sret
-                && !f.ret_is_f128_sse
-                && f.ret_eightbyte_classes.is_empty()
-                && f.params
-                    .iter()
-                    .all(|p| p.struct_size.is_none() && !p.is_f128_sse)
-                && !module.asm_labels.contains_key(&f.name)
-        })
-        .map(|f| {
-            (
-                f.name.clone(),
-                Target {
-                    params: f.params.iter().map(|p| p.ty).collect(),
-                    return_type: f.return_type,
-                    is_fastcall: f.is_fastcall,
-                    regparm: f.regparm,
-                },
-            )
-        })
-        .collect();
-    let mut rewritten: FxHashSet<(String, String)> = FxHashSet::default();
-    if targets.is_empty() {
-        return rewritten;
-    }
-    let eligible_target_names: FxHashSet<String> = targets.keys().cloned().collect();
-    let func_tables: Vec<(ValueDefTable, FxHashMap<Value, Value>)> = module
-        .functions
-        .iter()
-        .map(|f| {
-            if f.is_declaration {
-                (FxHashMap::default(), FxHashMap::default())
-            } else {
-                (build_value_def_table(f), unescaped_entry_alloca_inits(f))
-            }
-        })
-        .collect();
-    let known_params =
-        propagate_invariant_fn_ptr_params(module, &eligible_target_names, &func_tables);
-    for (fi, func) in module.functions.iter_mut().enumerate() {
-        if func.is_declaration {
-            continue;
-        }
-        let (defs, alloca_inits) = &func_tables[fi];
-        let mut rewrites: Vec<(usize, usize, String)> = Vec::new();
-        for (bi, block) in func.blocks.iter().enumerate() {
-            for (ii, inst) in block.instructions.iter().enumerate() {
-                let Instruction::CallIndirect {
-                    func_ptr: Operand::Value(ptr),
-                    info,
-                } = inst
-                else {
-                    continue;
-                };
-                let name = match resolve_fn_ptr_origin(func, defs, alloca_inits, *ptr) {
-                    Some(FnPtrOrigin::Global(sym)) => Some(sym),
-                    Some(FnPtrOrigin::Param(pi)) => {
-                        known_params.get(&(func.name.clone(), pi)).cloned()
-                    }
-                    None => None,
-                };
-                let Some(name) = name else {
-                    continue;
-                };
-                let Some(target) = targets.get(&name) else {
-                    continue;
-                };
-                let scalar_abi = !info.is_variadic
-                    && !info.is_sret
-                    && !info.ret_is_f128_sse
-                    && info.ret_eightbyte_classes.is_empty()
-                    && info.struct_arg_sizes.iter().all(Option::is_none)
-                    && info.struct_arg_is_f128_sse.iter().all(|f| !f)
-                    && info.args.len() == target.params.len()
-                    && info.arg_types == target.params
-                    && info.num_fixed_args == target.params.len()
-                    && info.return_type == target.return_type
-                    && info.is_fastcall == target.is_fastcall
-                    && info.regparm == target.regparm;
-                if scalar_abi {
-                    rewrites.push((bi, ii, name));
-                }
-            }
-        }
-        for (bi, ii, name) in rewrites {
-            let inst = &mut func.blocks[bi].instructions[ii];
-            if let Instruction::CallIndirect { info, .. } = inst {
-                let info = info.clone();
-                rewritten.insert((func.name.clone(), name.clone()));
-                *inst = Instruction::Call { func: name, info };
-            }
-        }
-    }
-    rewritten
-}
+mod devirt;
+use devirt::devirtualize_constant_indirect_calls;
 
 fn direct_call_counts(module: &IrModule) -> FxHashMap<String, usize> {
     let mut counts = FxHashMap::default();
@@ -9261,6 +8869,317 @@ mod extern_admission_tests {
             &module.functions[1].blocks[0].instructions[5],
             Instruction::Call { func, .. } if func == "cmp_fn"
         ));
+    }
+
+    // ---- invariant-callback devirtualization: the refusal space ----
+    //
+    // `propagate_invariant_fn_ptr_params` is sound only because every one
+    // of its guards refuses.  Each test below builds the proven-positive
+    // module and then breaks exactly one guard; deleting or weakening that
+    // guard must turn exactly its test red.  Positive control:
+    // `devirtualizes_entry_alloca_and_recursive_invariant_fn_ptr_param`.
+
+    fn devirt_ptr_param() -> crate::ir::reexports::IrParam {
+        crate::ir::reexports::IrParam {
+            ty: IrType::Ptr,
+            struct_size: None,
+            struct_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            riscv_float_class: None,
+            is_f128_sse: false,
+            noalias: false,
+            param_align: None,
+        }
+    }
+
+    fn devirt_call_info(
+        dest: Value,
+        args: Vec<Operand>,
+        arg_types: Vec<IrType>,
+    ) -> crate::ir::reexports::CallInfo {
+        use crate::ir::reexports::CallInfo;
+        let n = arg_types.len();
+        CallInfo {
+            dest: Some(dest),
+            args,
+            arg_types,
+            return_type: IrType::I32,
+            is_variadic: false,
+            num_fixed_args: n,
+            struct_arg_sizes: vec![None; n],
+            struct_arg_aligns: vec![None; n],
+            struct_arg_classes: vec![Vec::new(); n],
+            struct_arg_riscv_float_classes: vec![None; n],
+            is_sret: false,
+            is_fastcall: false,
+            ret_eightbyte_classes: Vec::new(),
+            ..CallInfo::default()
+        }
+    }
+
+    /// The positive fixture: `caller` passes `cmp_fn` to static `worker`,
+    /// which loads it through an unescaped entry alloca, recurses with it,
+    /// and calls it indirectly.  Function order: [cmp_fn, worker, caller].
+    fn invariant_callback_module() -> crate::ir::reexports::IrModule {
+        use crate::common::types::AddressSpace;
+        use crate::ir::reexports::IrModule;
+
+        let mut target = IrFunction::new("cmp_fn".to_string(), IrType::I32, vec![], false);
+        target.is_static = true;
+        target.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: Vec::new(),
+        });
+
+        let mut worker = IrFunction::new(
+            "worker".to_string(),
+            IrType::I32,
+            vec![devirt_ptr_param()],
+            false,
+        );
+        worker.is_static = true;
+        worker.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(0),
+                    ty: IrType::Ptr,
+                    size: 8,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::Store {
+                    val: Operand::Value(Value(1)),
+                    ptr: Value(0),
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Load {
+                    dest: Value(2),
+                    ptr: Value(0),
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Call {
+                    func: "worker".to_string(),
+                    info: devirt_call_info(
+                        Value(3),
+                        vec![Operand::Value(Value(2))],
+                        vec![IrType::Ptr],
+                    ),
+                },
+                Instruction::CallIndirect {
+                    func_ptr: Operand::Value(Value(2)),
+                    info: devirt_call_info(Value(4), vec![], vec![]),
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(4)))),
+            source_spans: Vec::new(),
+        });
+
+        let mut caller = IrFunction::new("caller".to_string(), IrType::I32, vec![], false);
+        caller.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "cmp_fn".to_string(),
+                },
+                Instruction::Call {
+                    func: "worker".to_string(),
+                    info: devirt_call_info(
+                        Value(1),
+                        vec![Operand::Value(Value(0))],
+                        vec![IrType::Ptr],
+                    ),
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
+        });
+
+        let mut module = IrModule::new();
+        module.functions = vec![target, worker, caller];
+        module
+    }
+
+    fn assert_not_devirtualized(module: &mut crate::ir::reexports::IrModule) {
+        assert!(devirtualize_constant_indirect_calls(module).is_empty());
+        assert!(
+            module.functions[1].blocks[0]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::CallIndirect { .. })),
+            "indirect call must survive"
+        );
+    }
+
+    #[test]
+    fn devirt_refuses_disagreeing_second_caller() {
+        let mut module = invariant_callback_module();
+        let mut other = IrFunction::new("other_fn".to_string(), IrType::I32, vec![], false);
+        other.is_static = true;
+        other.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(1)))),
+            source_spans: Vec::new(),
+        });
+        let mut caller2 = IrFunction::new("caller2".to_string(), IrType::I32, vec![], false);
+        caller2.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::GlobalAddr {
+                    dest: Value(0),
+                    name: "other_fn".to_string(),
+                },
+                Instruction::Call {
+                    func: "worker".to_string(),
+                    info: devirt_call_info(
+                        Value(1),
+                        vec![Operand::Value(Value(0))],
+                        vec![IrType::Ptr],
+                    ),
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
+        });
+        module.functions.push(other);
+        module.functions.push(caller2);
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_weak_callee() {
+        let mut module = invariant_callback_module();
+        module.functions[1].is_weak = true;
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_variadic_callee() {
+        let mut module = invariant_callback_module();
+        module.functions[1].is_variadic = true;
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_external_linkage_callee() {
+        let mut module = invariant_callback_module();
+        module.functions[1].is_static = false;
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_asm_labelled_callee() {
+        let mut module = invariant_callback_module();
+        module
+            .asm_labels
+            .insert("worker".to_string(), "worker_asm".to_string());
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_arity_mismatched_call_site() {
+        let mut module = invariant_callback_module();
+        match &mut module.functions[2].blocks[0].instructions[1] {
+            Instruction::Call { info, .. } => {
+                info.args.push(Operand::Const(IrConst::I64(0)));
+                info.arg_types.push(IrType::I64);
+            }
+            _ => panic!("fixture shape changed"),
+        }
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_twice_stored_entry_alloca() {
+        let mut module = invariant_callback_module();
+        let store = module.functions[1].blocks[0].instructions[2].clone();
+        module.functions[1].blocks[0].instructions.insert(3, store);
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_load_before_store_entry_alloca() {
+        let mut module = invariant_callback_module();
+        module.functions[1].blocks[0].instructions.swap(2, 3);
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_entry_block_back_edge() {
+        let mut module = invariant_callback_module();
+        module.functions[1].blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![],
+            terminator: Terminator::Branch(BlockId(0)),
+            source_spans: Vec::new(),
+        });
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_refuses_unresolved_parameter_origin() {
+        let mut module = invariant_callback_module();
+        module.functions[2].params.push(devirt_ptr_param());
+        module.functions[2].blocks[0].instructions[0] = Instruction::ParamRef {
+            dest: Value(0),
+            param_idx: 0,
+            ty: IrType::Ptr,
+        };
+        assert_not_devirtualized(&mut module);
+    }
+
+    #[test]
+    fn devirt_composes_through_passthrough_caller() {
+        let mut module = invariant_callback_module();
+        // caller -> mid(cmp_fn); mid forwards its parameter to worker.
+        match &mut module.functions[2].blocks[0].instructions[1] {
+            Instruction::Call { func, .. } => *func = "mid".to_string(),
+            _ => panic!("fixture shape changed"),
+        }
+        let mut mid = IrFunction::new(
+            "mid".to_string(),
+            IrType::I32,
+            vec![devirt_ptr_param()],
+            false,
+        );
+        mid.is_static = true;
+        mid.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                Instruction::Call {
+                    func: "worker".to_string(),
+                    info: devirt_call_info(
+                        Value(1),
+                        vec![Operand::Value(Value(0))],
+                        vec![IrType::Ptr],
+                    ),
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
+            source_spans: Vec::new(),
+        });
+        module.functions.push(mid);
+        let rewritten = devirtualize_constant_indirect_calls(&mut module);
+        assert!(rewritten.contains(&("worker".to_string(), "cmp_fn".to_string())));
     }
 }
 

@@ -65,12 +65,13 @@ fn rbp_is_frame_at(store: &LineStore, infos: &[LineInfo], idx: usize) -> bool {
     }
 }
 
-/// Which stack base a store/load line addresses: 4 = "(%rsp)", 5 = "(%rbp)".
+/// Which stack base a store/load line addresses: `REG_RSP` for "(%rsp)",
+/// `REG_RBP` for "(%rbp)".
 fn line_stack_base(trimmed: &str) -> Option<u8> {
     if trimmed.contains("(%rsp)") {
-        Some(4)
+        Some(REG_RSP)
     } else if trimmed.contains("(%rbp)") {
-        Some(5)
+        Some(REG_RBP)
     } else {
         None
     }
@@ -135,8 +136,8 @@ pub(super) fn fold_spill_deref_roundtrip(store: &mut LineStore, infos: &mut [Lin
                 let st_line = infos[i].trimmed(store.get(i));
                 let ld_line = infos[j].trimmed(store.get(j));
                 match (line_stack_base(st_line), line_stack_base(ld_line)) {
-                    (Some(4), Some(4)) => {}
-                    (Some(5), Some(5)) if rbp_is_frame_at(store, infos, i) => {}
+                    (Some(REG_RSP), Some(REG_RSP)) => {}
+                    (Some(REG_RBP), Some(REG_RBP)) if rbp_is_frame_at(store, infos, i) => {}
                     _ => {
                         dbg_stats[7] += 1;
                         i += 1;
@@ -754,7 +755,7 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
                 i += 1;
                 continue;
             };
-            if base == 5 && !rbp_frame {
+            if base == REG_RBP && !rbp_frame {
                 i += 1;
                 continue;
             }
@@ -997,12 +998,12 @@ pub(super) fn fold_private_spill_cycle(store: &mut LineStore, infos: &mut [LineI
                     return None;
                 }
                 let sf = register_family_fast(scratch);
-                if sf > REG_GP_MAX || sf == 4 || scratch != REG_NAMES[1][sf as usize] {
+                if sf > REG_GP_MAX || sf == REG_RSP || scratch != REG_NAMES[1][sf as usize] {
                     return None;
                 }
                 for offset in reg_token_offsets(mem) {
                     let fam = register_family_fast(&mem[offset..]);
-                    if fam == sf || fam == 4 || fam == 5 {
+                    if fam == sf || fam == REG_RSP || fam == REG_RBP {
                         return None;
                     }
                 }
@@ -1016,7 +1017,7 @@ pub(super) fn fold_private_spill_cycle(store: &mut LineStore, infos: &mut [LineI
                 let (dest, wide) = (ext[..comma].trim(), ext[comma + 1..].trim());
                 let df = register_family_fast(dest);
                 if df > REG_GP_MAX
-                    || df == 4
+                    || df == REG_RSP
                     || df == sf
                     || dest != REG_NAMES[1][df as usize]
                     || wide != REG_NAMES[0][sf as usize]
@@ -1028,8 +1029,8 @@ pub(super) fn fold_private_spill_cycle(store: &mut LineStore, infos: &mut [LineI
                     return None;
                 }
                 let (a, ab) = parse_slot(bound)?;
-                if tb != 4
-                    || ab != 4
+                if tb != REG_RSP
+                    || ab != REG_RSP
                     || t < 0
                     || a < 0
                     || !((t as i64 + 4 <= a as i64) || (a as i64 + 8 <= t as i64))
@@ -1193,7 +1194,7 @@ pub(super) fn fold_entry_load_relay(store: &mut LineStore, infos: &mut [LineInfo
         if !mem.contains('(')
             || !mem.ends_with(')')
             || sf > REG_GP_MAX
-            || sf == 4
+            || sf == REG_RSP
             || src != REG_NAMES[1][sf as usize]
         {
             continue;
@@ -1229,7 +1230,7 @@ pub(super) fn fold_entry_load_relay(store: &mut LineStore, infos: &mut [LineInfo
                     if s.trim() == REG_NAMES[0][sf as usize]
                         && df <= REG_GP_MAX
                         && df != sf
-                        && df != 4
+                        && df != REG_RSP
                         && d.trim() == REG_NAMES[0][df as usize]
                         && (i + 1..j)
                             .all(|k| infos[k].is_nop() || infos[k].reg_refs & (1u16 << df) == 0)

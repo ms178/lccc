@@ -634,7 +634,7 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
             continue;
         };
         // A self-copy is not this pattern, and %rsp is never a destination.
-        if src_fam == dst_fam || dst_fam == 4 {
+        if src_fam == dst_fam || dst_fam == REG_RSP {
             i += 1;
             continue;
         }
@@ -690,11 +690,11 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
             };
             // `movq %rsp, %rbp` is the frame setup, whatever follows it.
             if neg
-                || (dst_fam == 5 && src_fam == 4)
+                || (dst_fam == REG_RBP && src_fam == REG_RSP)
                 || r_fam == dst_fam
-                || r_fam == 4
+                || r_fam == REG_RSP
                 || !names_family_at_width(imm_text, r_fam, add_wide)
-                || (dst_fam == 5 && !rbp_is_gpr_at(store, infos, i, &mut rbp_memo))
+                || (dst_fam == REG_RBP && !rbp_is_gpr_at(store, infos, i, &mut rbp_memo))
                 || !flags_dead_after(store, infos, j + 1)
             {
                 i += 1;
@@ -715,7 +715,9 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
         // `%rbp` as destination participates only when the copy is not from
         // `%rsp` and `rbp_is_gpr_in_function` proves the function never
         // establishes a frame pointer — matching the register-addend arm above.
-        if dst_fam == 5 && (src_fam == 4 || !rbp_is_gpr_at(store, infos, i, &mut rbp_memo)) {
+        if dst_fam == REG_RBP
+            && (src_fam == REG_RSP || !rbp_is_gpr_at(store, infos, i, &mut rbp_memo))
+        {
             i += 1;
             continue;
         }
@@ -797,7 +799,10 @@ pub(super) fn fold_lea_add_into_lea(store: &mut LineStore, infos: &mut [LineInfo
             i += 1;
             continue;
         };
-        if dst_fam == 4 || dst_fam == 5 || !names_family_at_width(lea_dst, dst_fam, lea_wide) {
+        if dst_fam == REG_RSP
+            || dst_fam == REG_RBP
+            || !names_family_at_width(lea_dst, dst_fam, lea_wide)
+        {
             i += 1;
             continue;
         }
@@ -938,7 +943,7 @@ pub(super) fn fold_inplace_add_copy_into_lea(
             i += 1;
             continue;
         };
-        if src_fam == 4 || src_fam == 5 {
+        if src_fam == REG_RSP || src_fam == REG_RBP {
             i += 1;
             continue;
         }
@@ -987,7 +992,7 @@ pub(super) fn fold_inplace_add_copy_into_lea(
             i += 1;
             continue;
         };
-        if m_src_fam != src_fam || dst_fam == src_fam || dst_fam == 4 || dst_fam == 5 {
+        if m_src_fam != src_fam || dst_fam == src_fam || dst_fam == REG_RSP || dst_fam == REG_RBP {
             i += 1;
             continue;
         }
@@ -1068,7 +1073,7 @@ pub(super) fn fold_copy_shift_into_lea(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         };
-        if src_fam == dst_fam || dst_fam == 4 || dst_fam == 5 {
+        if src_fam == dst_fam || dst_fam == REG_RSP || dst_fam == REG_RBP {
             i += 1;
             continue;
         }
@@ -1299,7 +1304,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
         // overwrite AH itself, invalidating a subsequent read of that byte.
         if bool_fam == REG_NONE
             || bool_fam > REG_GP_MAX
-            || bool_fam == 4
+            || bool_fam == REG_RSP
             || breg != REG_NAMES[3][bool_fam as usize]
         {
             i += 1;
@@ -1376,7 +1381,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                                 && src == REG_NAMES[3][sfam as usize]))
                         && dfam != REG_NONE
                         && dfam <= REG_GP_MAX
-                        && dfam != 4
+                        && dfam != REG_RSP
                     {
                         tested_fam = dfam;
                         widened_mask |= 1u16 << dfam;
@@ -1403,7 +1408,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
                         {
                             if sfam <= REG_GP_MAX
                                 && dfam <= REG_GP_MAX
-                                && dfam != 4
+                                && dfam != REG_RSP
                                 && src == REG_NAMES[size][sfam as usize]
                                 && dst == REG_NAMES[size][dfam as usize]
                                 && widened_mask & !retired_mask & (1u16 << sfam) != 0
@@ -1669,7 +1674,7 @@ pub(super) fn fold_copy_and_mask_into_movz(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         };
-        if src_fam == dst_fam || dst_fam == 4 || dst_fam == 5 {
+        if src_fam == dst_fam || dst_fam == REG_RSP || dst_fam == REG_RBP {
             i += 1;
             continue;
         }
@@ -1780,7 +1785,7 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         };
-        if src_fam == dst_fam || dst_fam == 4 || dst_fam == 5 {
+        if src_fam == dst_fam || dst_fam == REG_RSP || dst_fam == REG_RBP {
             i += 1;
             continue;
         }
@@ -1888,8 +1893,8 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
         // edge of a conditional jump, or a `pushf` that captures SF as data --
         // refuses the narrow form and keeps the wide one.
         let byte_form = (0..=255).contains(&imm)
-            && src_fam != 4
-            && src_fam != 5
+            && src_fam != REG_RSP
+            && src_fam != REG_RBP
             && (imm & 0x80 == 0 || !flags_reach_an_sf_consumer(store, infos, j + 1));
         let new_line = if byte_form {
             format!("    testb ${}, {}", imm, REG_NAMES[3][src_fam as usize])
@@ -1995,7 +2000,7 @@ fn is_pure_reg_bump(t: &str, info: &LineInfo) -> bool {
         return false;
     }
     let dst = get_dest_reg(info);
-    if dst == REG_NONE || dst > REG_GP_MAX || dst == 4 {
+    if dst == REG_NONE || dst > REG_GP_MAX || dst == REG_RSP {
         return false;
     }
     if let Some(rest) = t
@@ -2048,7 +2053,7 @@ pub(super) fn eliminate_redundant_self_test(store: &mut LineStore, infos: &mut [
             continue;
         }
         let fam = register_family_fast(a);
-        if fam == REG_NONE || fam > REG_GP_MAX || fam == 4 {
+        if fam == REG_NONE || fam > REG_GP_MAX || fam == REG_RSP {
             j += 1;
             continue;
         }

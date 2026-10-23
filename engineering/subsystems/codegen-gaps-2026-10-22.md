@@ -1,222 +1,14 @@
-# Follow-up: 2026-10-22 codegen round — open PRs, oracle provisioning, new workload kernels
+# Codegen gaps: root causes from the 2026-10-22 round, with status
 
-Session scope (in the order it was executed): restore the sandbox to a working
-state, provision the reference compilers from the repository's own payloads,
-perfect the two open PRs, extend the workload corpus, and quantify the next
-performance gap. Every claim below is tied to a command in this document or to
-a committed gate; where something is a measurement from this host, that is
-stated and the per-host caveat is given.
-
-Host for every number here: 2 vCPU KVM guest (`Intel Xeon Processor @
-2.60GHz`, model 106), 1.9 GiB RAM, **no usable PMU** — so no counter claims are
-made; instruction counts come from Valgrind's callgrind (deterministic) and from
-static assembly censuses, and wall time comes from `run_benchmarks.py`'s paired,
-randomised-order, bootstrap-interval protocol.
-
----
-
-## 1. Session infrastructure (prerequisite for everything else)
-
-The harness wipes `/home/user` between sessions and drops `/opt`, `/swapfile`
-and `target/`. The recovery path is `scripts/arena_session_restore.sh`, and it
-worked unchanged — but it has one hole that cost real time in this session and
-is worth fixing:
-
-* **The oracle compilers are not part of the restore.** Every gate that names
-  `gcc-16` or `clang-23` resolves it on `PATH`, so a host whose distribution
-  does not ship GCC 16 can either skip the gate or build an oracle by hand.
-  Both are wrong when the payloads are already in the repository.
-
-### 1.1 `scripts/oracle_toolchains_from_tags.sh` (new)
-
-Restores, verifies and installs the pinned oracles with no vendor network
-access, from the transport tags that already exist for exactly this purpose:
-
-| payload | tag | version | digest-checked |
-|---|---|---|---|
-| `gcc-16-bookworm-x86_64.tar.xz` | `harness-cache-1` | 16.2.0 | yes |
-| `clang-23.1.3-linux-x64.tar.xz` | `harness-cache-4` | 23.1.3 | yes |
-| `mold-2.42.1-x86_64` | `harness-cache-1` | 2.42.1 | yes |
-| `binutils-2.47.tar.xz` | `harness-cache-1` | 2.47 | verified always, built only with `--with-binutils` |
-
-Two design points that matter more than the code:
-
-* **The digest is not taken from the tag alone.** The script carries its own
-  table *and* cross-checks it against the tag's `MANIFEST.sha256`, so a
-  re-issued payload fails loudly (printing both digests) instead of a rewritten
-  tag vouching for itself.
-* **Exit 0 is earned by running the tools**, not by writing files with the right
-  names: `--version` must contain the pinned version *and* each driver must link
-  a trivial program (gcc-16 through its own prefix; clang-23 with `-fuse-ld=mold`
-  through the installed mold), which is what catches a prefix extracted without
-  its crt files.
-
-ICX 2026.2 comes from the existing `scripts/ensure_icx_2026.sh` (authenticated
-Intel APT repo, rootless prefix). The full competition set is therefore real and
-local: lccc, GCC 16.2.0, Clang 23.1.3, ICX 2026.2.0, mold 2.42.1.
-
-### 1.2 Swap
-
-`/swapfile` (6 GiB) is still mandatory: the compiler build peaks above the
-guest's 1.9 GiB and the link step is OOM-killed without it. `scripts/
-ensure_swap.sh` and `build_lccc_fast.sh` both handle it; the restore script
-creates it first thing.
-
----
-
-## 2. Open PRs — audit, rebase, and what was rejected
-
-Both open PRs (`#903`, `#904`) were written against an older `main` and neither
-was an ancestor of `main`. Both were rebased here, and in both cases **one half
-of the PR was stale and would have regressed `main`**. That is the audit result,
-not an implementation detail.
-
-### 2.1 PR #903 — retrying linker-oracle provisioning
-
-| the PR's part | verdict |
-|---|---|
-| `scripts/ci_install_link_oracles.sh` (retries, `apt-cache pkgnames` resolution, fail-closed on both binaries, free on a warm runner) | **kept** — strictly better than the bare apt line it replaced |
-| the PR's seventh per-job workflow step | **rejected** — `main` has since collapsed the six per-job package steps onto one entry point (`ci_provision_toolchain.sh` + the content-addressed bundle). Adding the PR's step back would re-create the per-job path the bundle exists to remove |
-| relaxing `test_bad_oracle_exit_or_output_still_fails` to expect `skip-compare` for a non-zero oracle | **rejected as stale** — `main` replaced the blanket skip with a per-fixture `LCCC_ORACLE_SELFCHECK` waiver, which is strictly narrower: a stale oracle is skipped only where the fixture says why, and the skip names the escape hatch |
-
-Resolution: the pair (`mold`+`lld`) is now **delegated from the single
-provisioning entry point** to the retrying installer, and the non-oracle extras
-still ride one apt transaction. The PR's 14-case mock gate was kept and
-strengthened: its workflow pin asserted "the Install differential linker
-oracles step still exists", which stopped describing anything once the steps
-were collapsed. It now asserts what matters — no lane executes a private
-installer, and provisioning really does reach the retrying script for the pair
-(behaviourally, under `PATH` stubs), while a single-oracle request stays on apt
-because it is not that contract.
-
-`check_ci_toolchain_bundle.py` was updated for the same reason: it pinned the
-old sequence (one apt transaction carrying all four extras). It now pins the new
-one and asserts the delegation happens exactly once.
-
-### 2.2 PR #904 — SSE2 codegen matrix + 16-byte aggregate round-trip collapse
-
-The substantive half is real and measured: `src/passes/aggregate_pair_roundtrip.rs`
-plus a 122-row per-instruction matrix gate. Three conflicts, resolved as:
-
-| conflict | resolution |
-|---|---|
-| `src/passes/vectorize.rs` | **`main` wins.** `main`'s SSE2-baseline matmul arm is newer (it carries the `LCCC_FORCE_SSE2` / `sse2_lowering_fuses` reasoning and a "no SIMD register file" legality arm the branch predates). The branch's semantic intent — a refused FP contraction is not a refusal to vectorize on the x86-64 baseline — is already in `main`, expanded |
-| `ci.yml`, `ci_local.sh` | **union** — both sides added gates |
-
-Measured effect of the merge on the committed matrix, same host and same
-oracles: **3295 → 3230 LCCC instructions over the 122 rows, 11 rows improved, 0
-regressed** (top: `minsd` 103→82, `maxsd` 102→84, `sqrtps` 30→24, `sqrtss`
-34→28).
-
-#### 2.2.1 A real defect in the matrix gate itself
-
-The gate is monotone on two quantities that are not the same invariant:
-instruction count (may shrink) and "no recorded mnemonic may disappear". The
-recorded mnemonic set is a *superset* of the row's lowering — it also holds
-incidental spill/repack traffic — so the aggregate round-trip collapse removed
-the scalar `movsd` from `maxsd`/`minsd` **while taking them 102→84 and
-103→82**. The gate as written forced a choice between keeping the cheaper code
-and keeping CI green.
-
-Fix: a disappearance is now a failure **only when the row did not shrink**, i.e.
-only when it is a pure loss; lowering fidelity itself stays pinned by
-`missing_expect` against the row's expected set. The `--self-test` pins *both*
-directions (vanished with no shrink must fail, vanished with a shrink must
-pass), so the rule cannot be quietly weakened into never failing. Baseline
-re-recorded.
-
----
-
-## 3. Defect found by auditing a table instead of trusting it
-
-While looking for the next codegen win, `__builtin_fmaxf` turned out not to be a
-builtin at all in lccc, while `__builtin_fmax`, `__builtin_fmaxl` and every
-other libm sibling were. That is a **table drift** defect, and the audit was
-made systematic rather than case-by-case: for every `BuiltinInfo::simple("X")`
-mapping, probe `gcc-16 -fsyntax-only` for `__builtin_Xf` and ask whether lccc
-maps it too. Answer: exactly three gaps — `fmaxf`, `fminf`, `log2f`.
-
-Adding the aliases was **not enough**, which is the interesting part:
-
-* the alias table resolves the *name*;
-* a second table (`src/ir/lowering/expr_types.rs`) supplies the *result type*;
-* that second table did not know the three names either, so the call was typed
-  `I64` and the caller converted the callee's float `%xmm0` through an integer.
-
-Measured before the fix (GCC 16.2 in brackets):
-
-```
-__builtin_fmaxf(1.5f, 2.5f)  = 1.08842e+09        [2.5]
-__builtin_fmaxf(NaN, 7.0f)   = 1.08842e+09        [7]
-__builtin_log2f(3.0f)        = 4.6098e+18         [1.5849624872207642]
-```
-
-Those are the raw float bit patterns reinterpreted as integers — a *wrong
-number*, not a missing symbol, which is why no existing gate could see it.
-
-Gate: `tests/regression/check_builtin_float_aliases.py` (`builtin-float-aliases`,
-wired into `ci_local.sh --fast` and `ci.yml`). It **derives** the class from the
-alias table plus `gcc-16` probing (arity included), requires `-Werror` on the
-implicit declaration, requires the builtin name not to survive into the assembly,
-and compares every float spelling against the libc function it names **through a
-function pointer** so no compiler can fold the reference. A bogus control name
-must fail with an implicit-declaration diagnostic, so the gate proves it can
-detect an absence. Verified by reverting only the `expr_types.rs` entry: the gate
-fails with `nan-f-b: lccc builtin 1065353216.0 != libc 1.0`, then passes again
-with it restored.
-
-Two behaviours are **adjudicated, not asserted equal to GCC**:
-
-* **Signed zero.** glibc's `fmax`/`fmin` are comparison-based, so
-  `fmax(-0,+0)` is `-0`; an Annex F inline expansion answers `+0`. GCC 16.2
-  inlines and answers `+0`/`-0`; lccc calls glibc and answers `-0`/`+0`. The
-  gate pins each compiler to the library it binds to and does not demand that a
-  call and an inline expansion agree on a zero sign.
-* **"Inlined" vs "called"** is reported, not failed — the assertion is about the
-  mapping, not about how it is lowered.
-
----
-
-## 4. Workload corpus — second extension round
-
-The corpus already carried 68 kernels with pinned provenance (gzip CRC,
-zlib-ng Adler-32, Expat scan/SipHash, SQLite varint, Linux `find_bit`/rbtree,
-glibc `memcmp`/`strstr`, ChaCha20, SHA-256, ZSTD count, LZ4). Three new kernels
-were added for **pressure profiles the corpus could not express**, each with a
-provenance row (`tests/benchmark/WORKLOAD_PROVENANCE.md`), a registry entry in
-`run_benchmarks.py`, and an in-binary self-check against a naive reference:
-
-| kernel | upstream | why this shape |
-|---|---|---|
-| `gzip_longest_match` | gzip 1.14 `deflate.c`, `longest_match()` | hash-chain walk with a data-dependent trip count, a widened unaligned load masked to `MIN_MATCH` bytes, and a `ctz`-based first-difference; loop-carried best-length update |
-| `linux_list_sort` | Linux 6.18 `lib/list_sort.c` | pointer-chasing merge sort behind a **non-devirtualizable comparison callback**; 64-bin bottom-up scheme selected by `ctz` of the element index |
-| `zstd_double_fast` | zstd 1.5.7 `lib/compress/zstd_double_fast.c` | two independent hash probes per iteration feeding address arithmetic; unaligned `read32`/`read64`; `ZSTD_count`'s XOR+`ctzll` extension |
-
-All three produce byte-identical output under lccc, GCC 16.2, Clang 23.1.3 and
-ICX 2026.2 — the self-checks are what make that a meaningful statement (a fast
-but wrong matcher fails the reference comparison rather than winning the timing
-column).
-
-Two authoring bugs were found and fixed *while writing them*, both by the
-self-checks doing their job, and both worth remembering: comparing four bytes in
-gzip's `MIN_MATCH`=3 pre-check rejects a legitimate 3-byte match, and a
-stability check must be derived from the list's actual initial order (nodes
-pushed onto the front is a descending original order).
-
-### 4.1 First measurement (paired, randomised order, 9 rounds, `-O2`)
-
-| kernel | lccc | best reference | lccc / best | verdict |
-|---|---|---|---|---|
-| `gzip_longest_match` | — | ICX | **1.042×** slower | close |
-| `zstd_double_fast` | 14.00 ms | GCC 12.84 ms | **1.097×** slower | gap |
-| `linux_list_sort` | — | ICX | **1.448×** slower | **largest gap** |
-
-Aggregate over the three: geomean **1.18×** slower than GCC, **1.18×** slower
-than the fastest available reference. Every arm was flagged for being under
-20 ms with 5–9 % CV, so these are *screening* numbers: the direction and the
-ranking are solid, the magnitudes need the `PASSES` scaled up (see TODO-1).
-
----
+Distilled from the session record of the 2026-10-22 codegen round. Only
+the durable engineering content lives here -- root-cause analyses, the
+miscompile postmortem, the sibling-call design record, two pre-existing
+red gates, and the prioritised backlog. Session logistics (sandbox
+restore, per-PR archaeology, reproduce-this-session scripts) were
+deliberately dropped: they rot, root causes do not. Section numbering
+(§5, §5a, §5b, §5c, §6) is preserved from the original record so existing
+cross-references keep resolving. Resolved items are annotated in the
+status appendix rather than silently rewritten.
 
 ## 5. Root causes identified this session (evidence, no guesses)
 
@@ -554,76 +346,65 @@ project policy requires. Each item names its evidence and its first experiment.
 | **TODO-11** | Decide which eviction guard in `hot_web::steal_hot_loop_webs` is over-broad, so `CCC_NO_HOT_WEB_STEAL` stops being a no-op (5c.2) | gate red on `main` too; probe shows a 310-use candidate refused by every register | recovers a documented loop-residency optimisation | M | narrow the `phi_pair_values` guard, measure on gzip + corpus |
 | **TODO-9** | Callgrind A/B on the benchmark corpus after the slot-width fix, to confirm the widened extents cost nothing and to re-baseline `PERFORMANCE-BACKLOG.md` | 5a.3: the fix preserves stores that were previously deleted, so it can only be neutral or positive — but that must be measured, not assumed | none if neutral (it is a correctness fix) | XS | `scripts/callgrind_ab.py` over the fast corpus, both binaries, identical stdout |
 
-## 7. Reproduce this session
 
-```sh
-# 1. sandbox
-sudo fallocate -l 6G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
-git clone https://github.com/ms178/lccc && cd lccc
-LCCC_ALLOW_COMPILER_BUILD=1 bash scripts/arena_session_restore.sh     # toolchain + fastbuild
-sudo scripts/oracle_toolchains_from_tags.sh --bin-dir /usr/local/bin  # gcc-16, clang-23, mold
-bash scripts/ensure_icx_2026.sh                                      # ICX 2026.2
+## Appendix: status after the 2026-10-23 perfection round
 
-# 2. the gates this session added or changed
-python3 tests/regression/check_builtin_float_aliases.py --verbose
-python3 tests/regression/check_ci_link_oracle_provisioning.py
-python3 tests/regression/check_ci_toolchain_bundle.py
-python3 tests/regression/check_sse2_codegen_matrix.py --check --self-test
+Measured on the 2-core Intel Xeon 2.60 GHz research host, Rust 1.97
+fastbuild binaries, `main` built side-by-side in a clean worktree for
+every A/B below. Numbers are reported with their method so they can be
+reproduced or refuted, not trusted.
 
-# 3. the new kernels
-for k in gzip_longest_match linux_list_sort zstd_double_fast; do
-  target/fastbuild/lccc -O2 tests/benchmark/programs/$k.c -o /tmp/$k && /tmp/$k
-done
-python3 tests/benchmark/run_benchmarks.py --only gzip_longest_match,linux_list_sort,zstd_double_fast \
-    --gcc gcc-16 --clang clang-23 --icx "$(bash scripts/ensure_icx_2026.sh)" \
-    --reps 9 --json /tmp/new.json --markdown /tmp/new.md
-
-# 4. the 5.1 root cause
-target/fastbuild/lccc -O2 -DPASSES=1 tests/benchmark/programs/linux_list_sort.c -o /tmp/ls1.lccc
-gcc-16 -O2 -DPASSES=1 tests/benchmark/programs/linux_list_sort.c -o /tmp/ls1.gcc
-valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.lccc /tmp/ls1.lccc
-callgrind_annotate /tmp/cg.lccc | head -20      # key_cmp is 24 % of lccc's Ir, absent for GCC
-```
-
-## 8. Honest limits of this session
-
-* **No PMU.** Top-down metrics, cycle counts and cache-miss attribution are
-  unavailable in this guest. Everything above is dynamic instruction counts
-  (Valgrind, deterministic), static censuses, and paired wall-clock medians with
-  bootstrap intervals on a shared 2-vCPU host. The instruction-count statements
-  are exact; the wall-clock ratios are screening evidence and are labelled as
-  such.
-* **The reference compilers are host builds** — GCC 16.2.0 from the repository's
-  cache, Clang 23.1.3 from the same, ICX 2026.2.0 from Intel's repository. The
-  SSE2 matrix deliberately ratchets on *lccc's own* count for that reason.
-* **TODO-5 is an ABI change** and was deliberately not attempted in this
-  session: it needs a differential corpus of its own (the existing gates would
-  not catch a subtly wrong eightbyte classification), and a wrong ABI change is
-  worse than a slow one.
-
----
-
-## 9. State of the tree at the end of this round
-
-`scripts/ci_local.sh --fast`, fully provisioned host: **404 gates PASS, 2 gates
-FAIL**, and both failures are demonstrated on the base commit (section 5c).
-Everything this round touches is green, including the gate that caught its
-regression.
-
-The gates that looked like code failures and were not: `memory-value-contracts`,
-`byte-accessor-inline`, `ivsr-integer-domains`, `ivwiden-exposed-latch`,
-`fp-extract-homes`, `empty-aggregate-abi` (32-bit C runtime), `pr824-boundaries`
-(`qemu-aarch64`), `linker-suite`'s `i386_dso_emit_semantics` (32-bit libstdc++),
-and `cargo-test` (disk: `elf_writer_common`'s scratch assembly, which the test
-itself guards against but cannot fix for a full disk). Provisioning them is part
-of a usable environment, so the list belongs here:
-
-```bash
-scripts/oracle_toolchains_from_tags.sh --prefix /home/user/oracles   # gcc-16, clang-23, mold
-sudo apt-get install -y gcc-multilib libc6-dev-i386 lib32gcc-s1 \
-                        g++-multilib lib32stdc++-14-dev valgrind qemu-user-static
-swapon /swapfile                                                     # 6 GiB, mandatory
-```
-
-Re-run with those in place and the 404/2 split is reproducible; the remaining
-two are TODO-10 and TODO-11.
+* **TODO-1 (kernel scale) -- done.** All three workload kernels scaled
+  4x (gzip 8192->32768, list_sort 128->512, zstd 512->2048 passes).
+  Before: 49.6/159.7/120.0 ms (lccc -O2, median of 5). After:
+  192/636/468 ms, CV <= 2.5%, outputs byte-identical to GCC reference
+  builds. Host-relative standing vs GCC 12.2 at the new scale:
+  gzip 1.41x, list_sort 1.38x, zstd 1.12x (lccc slower); re-measure
+  against the pinned GCC 16.2 oracle in CI lanes.
+* **TODO-2 / §5.1 (invariant-callback IPA) -- mechanism landed.**
+  `propagate_invariant_fn_ptr_params` devirtualizes internal-linkage
+  callees whose function-pointer parameter is unanimous across all
+  call sites, composing through passthrough callers. The refusal space
+  is pinned by ten dedicated unit tests (disagreement, weak, variadic,
+  external linkage, asm label, arity mismatch, twice-stored and
+  load-before-store allocas, entry back-edge, unresolved origin). The
+  `linux_list_sort` kernel deliberately keeps its exported shape, so
+  its remaining gap is callee-save/allocation quality, not IPA.
+* **TODO-4 / §5.4 (max_sd/min_sd) -- resolved, and the claim was stale.**
+  The native intrinsic path already lowers both to single `maxsd` /
+  `minsd` instructions (`intrinsics_simd.rs`); verified end-to-end and
+  pinned by `tests/regression/check_sse2_scalar_minmax.sh` (assembly
+  assertion plus bit-exact Intel tie/NaN semantics, differential
+  against GCC). What remains expensive around them is the
+  struct-of-two marshalling -- that is TODO-5, not instruction
+  selection.
+* **zlib_ng_adler32 baseline (`moves` 45 -> 49) -- attributed, kept.**
+  A/B with peephole disabled decomposes the delta: +1 move exists in
+  pre-peephole output (allocation-home change in the liveness/
+  coalescing work), +2 more after peepholes locally (+4 total on CI's
+  toolchain), while pre-peephole instruction count grows +6 and
+  returns to parity (203) after peepholes. Mnemonic census: new code
+  trades -3 jumps / -3 ALU for +3 moves / +4 LEA, all in the
+  modulo-reduction and harness paths; the hot loop body is
+  register-renamed but shape-identical. Runtime A/B (15 randomised
+  reps, identical stdout `8c331ae0`): median ratio 0.999.
+  Re-baselining a static whole-function metric against a proven
+  runtime-neutral, jump-reducing change is correct; chasing the
+  metric back would be metric-gaming.
+* **TODO-5 (128-bit ABI) -- still open, now with a reproducer and a
+  bill of materials.** Cross-compiler interop is broken today in both
+  directions for by-value `__m128d`: GCC caller -> lccc callee returns
+  the low lane and a zeroed high lane; lccc caller -> GCC callee
+  misreads the second argument (11.50/224.00 where 3.75 is correct,
+  GCC 12.2 / pinned GCC 16.2 callers respectively) for the
+  two-line `abi_add_lo(a,b) = _mm_add_sd(a,b)` probe. The
+  struct-representation surface is 176 `__val` references across the
+  three public headers (15 in the generated `lcccsimd.h`, 161 in the
+  handwritten wrappers); the frontend already parses
+  `__attribute__((vector_size(N)))`. Migration plan, in order: typedef
+  switch behind the generated header, SysV eightbyte classification
+  audit per backend, the interop probe above as a required-green
+  gate, full SSE matrix re-run. Do not half-land this: it is the kind
+  of change whose failure mode is silent corruption at someone
+  else's link step.
+* TODO-3, TODO-6..TODO-11 remain as written in §6.

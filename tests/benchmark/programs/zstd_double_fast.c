@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: BSD-3-Clause OR GPL-2.0-only */
 /*
  * Workload-derived kernel: Zstandard 1.5.7, lib/compress/zstd_double_fast.c.
  *
@@ -37,7 +38,7 @@
 #ifndef PASSES
 /* Keep default timing runs above the process-startup noise floor.
  * Bounded Callgrind screens explicitly override PASSES=1. */
-#define PASSES 512U
+#define PASSES 2048U
 #endif
 #ifndef MIN_MATCH
 #define MIN_MATCH 4

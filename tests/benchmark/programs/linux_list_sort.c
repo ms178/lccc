@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Workload-derived kernel: Linux 6.18, lib/list_sort.c.
  *
@@ -35,7 +36,7 @@
 #ifndef PASSES
 /* Keep default timing runs above the process-startup noise floor.
  * Bounded Callgrind screens explicitly override PASSES=1. */
-#define PASSES 128U
+#define PASSES 512U
 #endif
 #define MAX_LIST_LENGTH_BITS 20
 
