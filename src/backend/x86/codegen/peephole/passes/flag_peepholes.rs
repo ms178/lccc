@@ -711,7 +711,9 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
         // `%rbp` as destination participates only when the copy is not from
         // `%rsp` and `rbp_is_gpr_in_function` proves the function never
         // establishes a frame pointer — matching the register-addend arm above.
-        if dst_fam == REG_RBP && (src_fam == REG_RSP || !rbp_is_gpr_at(store, infos, i, &mut rbp_memo)) {
+        if dst_fam == REG_RBP
+            && (src_fam == REG_RSP || !rbp_is_gpr_at(store, infos, i, &mut rbp_memo))
+        {
             i += 1;
             continue;
         }

@@ -895,7 +895,10 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             size: ss,
         } = infos[i].kind
         {
-            if matches!(ss, MoveSize::Q | MoveSize::L) && is_valid_gp_reg(sr) && sr != REG_RSP && sr != REG_RBP
+            if matches!(ss, MoveSize::Q | MoveSize::L)
+                && is_valid_gp_reg(sr)
+                && sr != REG_RSP
+                && sr != REG_RBP
             {
                 let m = next_non_debug(store, infos, i + 1, len);
                 if m < len && !infos[m].is_barrier() {
@@ -3323,7 +3326,11 @@ pub(super) fn promote_loop_invariant_fp_load(
             // kills slot liveness and is invisible to it.)
             let numeric_offset_end = offset_str.find('(').unwrap_or(offset_str.len());
             let numeric_offset: i32 = offset_str[..numeric_offset_end].parse().unwrap_or(0);
-            let slot_base: RegId = if src.ends_with("(%rsp)") { REG_RSP } else { REG_RBP };
+            let slot_base: RegId = if src.ends_with("(%rsp)") {
+                REG_RSP
+            } else {
+                REG_RBP
+            };
             // The preheader store below only matches `StoreRbp` (an rbp
             // base): an rsp-relative load must not pair with an
             // rbp-relative store that merely shares the numeric offset —

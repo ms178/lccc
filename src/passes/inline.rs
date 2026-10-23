@@ -8256,7 +8256,11 @@ mod extern_admission_tests {
                 },
                 Instruction::Call {
                     func: "worker".to_string(),
-                    info: devirt_call_info(Value(3), vec![Operand::Value(Value(2))], vec![IrType::Ptr]),
+                    info: devirt_call_info(
+                        Value(3),
+                        vec![Operand::Value(Value(2))],
+                        vec![IrType::Ptr],
+                    ),
                 },
                 Instruction::CallIndirect {
                     func_ptr: Operand::Value(Value(2)),
@@ -8277,7 +8281,11 @@ mod extern_admission_tests {
                 },
                 Instruction::Call {
                     func: "worker".to_string(),
-                    info: devirt_call_info(Value(1), vec![Operand::Value(Value(0))], vec![IrType::Ptr]),
+                    info: devirt_call_info(
+                        Value(1),
+                        vec![Operand::Value(Value(0))],
+                        vec![IrType::Ptr],
+                    ),
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
@@ -8321,7 +8329,11 @@ mod extern_admission_tests {
                 },
                 Instruction::Call {
                     func: "worker".to_string(),
-                    info: devirt_call_info(Value(1), vec![Operand::Value(Value(0))], vec![IrType::Ptr]),
+                    info: devirt_call_info(
+                        Value(1),
+                        vec![Operand::Value(Value(0))],
+                        vec![IrType::Ptr],
+                    ),
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),
@@ -8439,7 +8451,11 @@ mod extern_admission_tests {
                 },
                 Instruction::Call {
                     func: "worker".to_string(),
-                    info: devirt_call_info(Value(1), vec![Operand::Value(Value(0))], vec![IrType::Ptr]),
+                    info: devirt_call_info(
+                        Value(1),
+                        vec![Operand::Value(Value(0))],
+                        vec![IrType::Ptr],
+                    ),
                 },
             ],
             terminator: Terminator::Return(Some(Operand::Value(Value(1)))),

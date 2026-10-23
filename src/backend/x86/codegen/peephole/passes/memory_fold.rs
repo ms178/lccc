@@ -1685,7 +1685,11 @@ pub(super) fn fold_store_alu_memop(store: &mut LineStore, infos: &mut [LineInfo]
             i += 1;
             continue;
         };
-        let slot_text = format!("{}(%r{})", offset, if base == REG_RSP { "sp" } else { "bp" });
+        let slot_text = format!(
+            "{}(%r{})",
+            offset,
+            if base == REG_RSP { "sp" } else { "bp" }
+        );
 
         // Scan forward over lines that provably do not touch `reg`, the frame
         // base, or the slot, looking for the ALU that reads the slot.  A Label

@@ -319,7 +319,9 @@ fn propagate_invariant_fn_ptr_params(
 
 /// A call through a mismatched prototype is undefined in C, but rewriting it
 /// would turn that into inliner parameter-type confusion. Refusing is cheap.
-pub(super) fn devirtualize_constant_indirect_calls(module: &mut IrModule) -> FxHashSet<(String, String)> {
+pub(super) fn devirtualize_constant_indirect_calls(
+    module: &mut IrModule,
+) -> FxHashSet<(String, String)> {
     struct Target {
         params: Vec<IrType>,
         return_type: IrType,
@@ -427,4 +429,3 @@ pub(super) fn devirtualize_constant_indirect_calls(module: &mut IrModule) -> FxH
     }
     rewritten
 }
-

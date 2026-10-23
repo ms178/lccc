@@ -395,7 +395,8 @@ reproduced or refuted, not trusted.
   bill of materials.** Cross-compiler interop is broken today in both
   directions for by-value `__m128d`: GCC caller -> lccc callee returns
   the low lane and a zeroed high lane; lccc caller -> GCC callee
-  misreads the second argument (11.50 where 3.75 is correct) for the
+  misreads the second argument (11.50/224.00 where 3.75 is correct,
+  GCC 12.2 / pinned GCC 16.2 callers respectively) for the
   two-line `abi_add_lo(a,b) = _mm_add_sd(a,b)` probe. The
   struct-representation surface is 176 `__val` references across the
   three public headers (15 in the generated `lcccsimd.h`, 161 in the

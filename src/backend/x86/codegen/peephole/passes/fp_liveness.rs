@@ -1892,7 +1892,8 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
                             }
                             Ok(None) => {}
                             Ok(Some((base, off))) => {
-                                if base == REG_RBP && !rbp_is_frame || base == REG_RSP && !track_rsp {
+                                if base == REG_RBP && !rbp_is_frame || base == REG_RSP && !track_rsp
+                                {
                                     opaque = true;
                                     break;
                                 }
@@ -1941,7 +1942,8 @@ fn analyse(store: &LineStore, infos: &[LineInfo], start: usize, end: usize) -> F
     // Without a proven frame delta, RBP and RSP coordinates are not disjoint
     // address spaces. Keep register precision but refuse slot deletion when
     // both bases are used: e.g. -8(%rbp) aliases 8(%rsp) after subq $16,%rsp.
-    opaque |= facts.slots.iter().any(|s| s.0 == REG_RSP) && facts.slots.iter().any(|s| s.0 == REG_RBP);
+    opaque |=
+        facts.slots.iter().any(|s| s.0 == REG_RSP) && facts.slots.iter().any(|s| s.0 == REG_RBP);
     facts.slots_opaque = opaque;
 
     // Fold slot ops into effects now that every slot is interned (needed so
