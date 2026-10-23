@@ -38,7 +38,7 @@
 #ifndef PASSES
 /* Keep default timing runs above the process-startup noise floor.
  * Bounded Callgrind screens explicitly override PASSES=1. */
-#define PASSES 512U
+#define PASSES 2048U
 #endif
 #ifndef MIN_MATCH
 #define MIN_MATCH 4

@@ -46,7 +46,7 @@
 #ifndef PASSES
 /* Keep default timing runs above the process-startup noise floor.
  * Bounded Callgrind screens explicitly override PASSES=1. */
-#define PASSES 8192U
+#define PASSES 32768U
 #endif
 #ifndef HASH_BITS
 #define HASH_BITS 15

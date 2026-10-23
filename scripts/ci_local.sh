@@ -263,6 +263,13 @@ gate "sse2-slot-forwarding" fast \
 # same operation with bit-identical results (arity probed against gcc-16, then
 # a runtime differential) -- the failure mode otherwise is a quiet call to a
 # symbol that does not exist.
+# `_mm_max_sd` / `_mm_min_sd` must be the single hardware `maxsd` / `minsd`
+# with Intel's second-operand-wins tie/NaN semantics bit-exact (incl. signed
+# zeros and the preserved high lane) -- they were an 84-instruction
+# compare+select expansion for far too long.
+gate "sse2-scalar-minmax" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_sse2_scalar_minmax.sh
+
 gate "builtin-float-aliases" fast \
     python3 tests/regression/check_builtin_float_aliases.py --lccc "$LCCC" --gcc "${GCC:-gcc-16}"
 
