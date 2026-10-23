@@ -286,11 +286,19 @@ impl Lowerer {
         }
 
         // __builtin_expect(exp, c) - branch prediction hint.
-        // Returns exp unchanged, but must evaluate c for side effects.
+        // Returns exp (converted to long, per GCC's prototype
+        // `long __builtin_expect(long, long)`), but must evaluate c for
+        // side effects.
         // __builtin_expect_with_probability(exp, c, prob) - same with probability.
         if name == "__builtin_expect" || name == "__builtin_expect_with_probability" {
             let result = if let Some(first) = args.first() {
-                self.lower_expr(first)
+                let raw = self.lower_expr(first);
+                // The prototype's return type is long, so an int argument
+                // sign-extends on the way in; handing the raw I32 value
+                // back under the declared long type made the next
+                // conversion (int->unsigned long) zero-extend instead.
+                let long_ty = IrType::from_ctype(&CType::Long);
+                self.emit_implicit_cast(raw, self.value_ir_type(first), long_ty)
             } else {
                 Operand::Const(IrConst::I64(0))
             };

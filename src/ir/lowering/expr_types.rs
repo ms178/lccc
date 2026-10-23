@@ -806,6 +806,29 @@ impl Lowerer {
     /// zero-extended instead of sign-extending). Mirrors the exact type
     /// computation of lower_arithmetic_binop.
     pub(super) fn value_ir_type(&self, expr: &Expr) -> IrType {
+        // Transparent wrappers: lower_expr produces exactly the inner
+        // expression's value for these, so the value type is the inner
+        // expression's. Without the unwrap the get_expr_type fallback at
+        // the bottom answers with the inner expression's *storage* type
+        // (I64 for an int-producing shift on LP64), and an int->u64
+        // conversion at the boundary loses the sign extension:
+        // `(0, 1 << 31)`, `_Generic(1, int: 1 << 31)` and
+        // `__builtin_choose_expr(1, 1 << 31, 0)` all zero-extended into
+        // unsigned long.
+        if let Some(chosen) = self.choose_expr_selected(expr) {
+            return self.value_ir_type(chosen);
+        }
+        match expr {
+            Expr::Comma(_, rhs, _) => return self.value_ir_type(rhs),
+            Expr::GenericSelection(controlling, associations, _) => {
+                if let Some(matched) =
+                    self.resolve_generic_selection_expr(controlling, associations)
+                {
+                    return self.value_ir_type(matched);
+                }
+            }
+            _ => {}
+        }
         // Comparisons and logical operators materialise a C `int` boolean:
         // the Cmp/select that defines the value is I32-wide (setcc + movzbl,
         // spilled to a 4-byte slot). get_expr_type reports the widened

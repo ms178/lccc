@@ -749,6 +749,24 @@ impl IrConst {
         }
         // Convert integer types via from_i64, with unsigned-aware paths
         if let Some(int_val) = self.to_i64() {
+            // 128-bit targets widen by *value*: an unsigned source
+            // zero-extends from its own width, a signed one sign-extends.
+            // `from_i64` cannot carry this — its U128 arm treats the i64
+            // as an already-64-bit pattern to zero-extend, so widening a
+            // negative value through it (`unsigned __int128 x = -1;` as a
+            // global initializer) yielded 2^64-1 instead of 2^128-1.
+            if matches!(target_ty, IrType::I128 | IrType::U128) {
+                let v128 = match src_ty {
+                    Some(src) if src.is_unsigned() => match src.size() {
+                        1 => i128::from(int_val as u8),
+                        2 => i128::from(int_val as u16),
+                        4 => i128::from(int_val as u32),
+                        _ => (int_val as u64) as u128 as i128,
+                    },
+                    _ => int_val as i128,
+                };
+                return IrConst::I128(v128);
+            }
             // When the source type is unsigned, we need to zero-extend (not sign-extend)
             // when widening to a larger type. Mask to the source width to get the correct
             // unsigned value (e.g., U32 0xFFFFFFF8 = 4294967288, not -8).
@@ -1175,6 +1193,31 @@ mod float_narrow_tests {
         let c2 = IrConst::I64(42);
         let coerced2 = c2.coerce_to(IrType::F32);
         assert!(matches!(coerced2, IrConst::F32(v) if v == 42.0f32));
+    }
+
+    #[test]
+    fn coerce_to_128_widens_by_value() {
+        // Signed sources sign-extend all the way to 128 bits:
+        // `unsigned __int128 x = -1;` must be 2^128-1, not 2^64-1.
+        assert_eq!(
+            IrConst::I64(-1).coerce_to_with_src(IrType::U128, Some(IrType::I64)),
+            IrConst::I128(-1)
+        );
+        assert_eq!(
+            IrConst::I32(i32::MIN).coerce_to_with_src(IrType::U128, Some(IrType::I32)),
+            IrConst::I128(i32::MIN as i128)
+        );
+        // Unsigned sources zero-extend from their own width.
+        assert_eq!(
+            IrConst::I64(-1).coerce_to_with_src(IrType::U128, Some(IrType::U64)),
+            IrConst::I128(u64::MAX as i128)
+        );
+        // (U32 constants are stored as zero-extended I64, so the U32
+        // value 0x8000_0000 arrives as I64(2147483648), not I64::MIN.)
+        assert_eq!(
+            IrConst::I64(1 << 31).coerce_to_with_src(IrType::I128, Some(IrType::U32)),
+            IrConst::I128(1i128 << 31)
+        );
     }
 }
 

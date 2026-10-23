@@ -1068,25 +1068,23 @@ impl Lowerer {
         // dead branches bloat the IR beyond inlining limits and cause linker
         // errors when always_inline functions can't be inlined.
         if let Some(const_val) = self.eval_const_expr(cond) {
-            let is_true = self.const_truth(&const_val, cond);
-            if is_true {
+            // Arm types follow C semantics (ternary_arm_type), exactly as
+            // in the branchy path below: the cast's from_ty must describe
+            // the bits the arm actually produced. Typing the arms with
+            // get_expr_type storage semantics reports I64 for an arm like
+            // `1 << s` (literal-born storage type) even though the shift
+            // computed at I32, so `1 ? (1 << s) : ulong_arm` cast I64->U64
+            // and lost the sign extension int->unsigned long requires.
+            let then_ty = self.ternary_arm_type(then_expr);
+            let else_ty = self.ternary_arm_type(else_expr);
+            let common_ty = Self::common_type(then_ty, else_ty);
+            if self.const_truth(&const_val, cond) {
                 let then_val = self.lower_aggregate_rvalue(then_expr);
                 if result_is_complex {
                     // Convert to the common complex type if the branch types differ
                     let common_ct = self.common_complex_type(&then_ct, &else_ct);
                     return self.convert_to_complex(then_val, &then_ct, &common_ct);
                 }
-                let then_ty = if self.expr_is_pointer(then_expr) {
-                    IrType::Ptr
-                } else {
-                    self.get_expr_type(then_expr)
-                };
-                let else_ty = if self.expr_is_pointer(else_expr) {
-                    IrType::Ptr
-                } else {
-                    self.get_expr_type(else_expr)
-                };
-                let common_ty = Self::common_type(then_ty, else_ty);
                 return self.emit_implicit_cast(then_val, then_ty, common_ty);
             } else {
                 let else_val = self.lower_aggregate_rvalue(else_expr);
@@ -1095,17 +1093,6 @@ impl Lowerer {
                     let common_ct = self.common_complex_type(&then_ct, &else_ct);
                     return self.convert_to_complex(else_val, &else_ct, &common_ct);
                 }
-                let then_ty = if self.expr_is_pointer(then_expr) {
-                    IrType::Ptr
-                } else {
-                    self.get_expr_type(then_expr)
-                };
-                let else_ty = if self.expr_is_pointer(else_expr) {
-                    IrType::Ptr
-                } else {
-                    self.get_expr_type(else_expr)
-                };
-                let common_ty = Self::common_type(then_ty, else_ty);
                 return self.emit_implicit_cast(else_val, else_ty, common_ty);
             }
         }
