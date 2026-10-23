@@ -1389,6 +1389,13 @@ gate "reduction-vecreg" fast \
 gate "integer-reduction-vecreg" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_integer_reduction_vecreg_codegen.sh
 
+# Integer abs comparison folds in simplify: abs(a) <= 0 -> a == 0 and
+# abs(a) < k -> the biased unsigned range test, with the
+# CCC_SIMPLIFY_SKIP=cmp differential ownership and the -fwrapv
+# INT_MIN/LONG_MIN contract (folds suppressed; wrapping answers kept).
+gate "iabs-cmp-fold" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_iabs_cmp_fold.sh
+
 # Observable-access gates.  Three instruments, because each catches a
 # different way the `volatile` contract gets broken and each was proved to do
 # so by mutation (reintroducing the guard deletion in licm.rs):
