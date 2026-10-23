@@ -2636,6 +2636,61 @@ mod tests {
     }
 
     #[test]
+    fn fuses_local_exec_tls_operand_like_gcc() {
+        // `return a + tls;` — the LE fold's load, then the add (GCC 16.2:
+        // `addl %fs:s@tpoff, %eax`). Addends and the i386 spelling travel.
+        for mem in [
+            "%fs:s@TPOFF",
+            "%fs:arr@TPOFF+8",
+            "%fs:arr@tpoff-4",
+            "%gs:s@NTPOFF",
+        ] {
+            let asm = format!(
+                "{PRO}    movl {mem}, %eax\n    addl %eax, %edi\n    movl %edi, %eax\n{EPI}"
+            );
+            let out = body(&run(&asm, fuse_load_into_alu));
+            assert!(has(&out, &format!("addl {mem}, %edi")), "{mem}: {out:?}");
+        }
+        // An intervening store to the same variable must block the fusion
+        // (the reloaded value would differ): any `:` line is memory.
+        let asm = format!(
+            "{PRO}    movl %fs:s@TPOFF, %eax\n    movl $5, %fs:s@TPOFF\n    addl %eax, %edi\n    movl %edi, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fuse_load_into_alu));
+        assert!(has(&out, "movl %fs:s@TPOFF, %eax"), "{out:?}");
+        assert!(!has(&out, "addl %fs:s@TPOFF, %edi"), "{out:?}");
+    }
+
+    /// The base-less Local-Exec operand is a plain memory operand: every
+    /// spelling the TLS fold emits (both modifier cases, signed addends, the
+    /// i386 `%gs:`/`@NTPOFF` form) fuses through the one predicate.  Shapes
+    /// that are not a single memory operand stay refused.  (The predicate
+    /// may accept any validated segment and symbol -- `%fs:s`, `%es:s@TPOFF`
+    /// -- because every fusion re-emits the operand verbatim and the window
+    /// counts every `:`-bearing line as a memory access.)
+    #[test]
+    fn local_exec_tls_operands_are_plain_memory() {
+        for ok in [
+            "%fs:s@TPOFF",
+            "%FS:_x.1@tpoff+16",
+            "%gs:v@NTPOFF-8",
+            "%fs:arr@tpoff-4",
+        ] {
+            assert!(is_plain_memory_operand(ok), "{ok}");
+        }
+        for bad in [
+            "s@TPOFF",          // no segment: an absolute DS address
+            "%fs:s@TPOFF+",     // malformed addend
+            "%fs:s@TPOFF+%rax", // register in the displacement
+            "*%fs:s@TPOFF",     // indirection marker
+            "%fs:",             // no operand at all
+            "$s@TPOFF",         // an immediate
+        ] {
+            assert!(!is_plain_memory_operand(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn fuses_segment_qualified_cmp_mirror_and_case_insensitive_prefix() {
         // Direct form: the loaded scratch is the cmp SOURCE (`cmpl %ecx, %esi`
         // computes `%esi - %ecx`), and the folded `cmpl {mem}, %esi` keeps the

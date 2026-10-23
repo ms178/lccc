@@ -48,6 +48,7 @@ pub fn run_regalloc_and_merge_clobbers(
         Vec::new(),
         Vec::new(),
         crate::common::fx_hash::FxHashMap::default(),
+        Vec::new(),
         &Arc::new(RaConfig::from_process_env()),
         &mut FxHashMap::default(),
     )
@@ -159,6 +160,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     call_arg_regs: Vec<PhysReg>,
     indirect_target_regs: Vec<PhysReg>,
     folded_index_uses: crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
+    fold_base_regs: Vec<PhysReg>,
     ra_config: &Arc<RaConfig>,
     phi_chain_out: &mut FxHashMap<u32, u32>,
 ) -> (
@@ -445,7 +447,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     let leaf_caller_saved_homes = !crate::common::types::target_is_32bit()
         && indirect_target_regs.iter().any(|r| r.0 == 11)
         && caller_saved_regs.len() >= 4;
-    let config = super::super::regalloc::RegAllocConfig {
+    let mut config = super::super::regalloc::RegAllocConfig {
         available_regs,
         accumulator_policy,
         caller_saved_regs,
@@ -456,6 +458,8 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         xmm_regs,
         never_materialized: never_materialized.unwrap_or_default(),
         folded_index_uses,
+        fold_base_regs,
+        fold_readmit: FxHashSet::default(),
         reg_hints,
         ra_config: Arc::clone(ra_config),
     };
@@ -484,9 +488,10 @@ pub fn run_regalloc_and_merge_clobbers_ex(
             liveness: None,
             phi_chain: FxHashMap::default(),
             eligible: FxHashSet::default(),
+            fold_deferred: FxHashMap::default(),
         }
     } else {
-        super::super::regalloc::allocate_registers(func, &config)
+        super::super::regalloc::allocate_registers_with_fold_rounds(func, &mut config)
     };
     *reg_assignments = alloc_result.assignments;
     *used_callee_saved = alloc_result.used_regs;

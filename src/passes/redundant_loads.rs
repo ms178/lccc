@@ -390,6 +390,7 @@ mod tests {
             is_inline: false,
             is_always_inline: false,
             is_noinline: false,
+            target_features: Vec::new(),
             next_value_id: 4,
             fp_expr_tags: Default::default(),
             next_label: 2,

@@ -99,8 +99,19 @@ impl X86Codegen {
                 if is_xmm_reg(reg) {
                     let name = phys_reg_name(reg);
                     if name != "xmm0" {
+                        // Full-register copy (as `store_xmm_to`): the
+                        // reg-reg `movsd`/`movss` merge into %xmm0's old
+                        // upper bits, a false dependency move elimination
+                        // cannot remove; the scalar's upper lanes are dead.
+                        let copy = if mov_instr == "movsd" {
+                            "movapd"
+                        } else {
+                            "movaps"
+                        };
+                        // VEX spelling under AVX: no legacy-SSE write in VEX code.
+                        let v = if self.isa.avx { "v" } else { "" };
                         self.state
-                            .emit_fmt(format_args!("    {} %{}, %xmm0", mov_instr, name));
+                            .emit_fmt(format_args!("    {v}{copy} %{name}, %xmm0"));
                     }
                     return;
                 }
@@ -176,8 +187,17 @@ impl X86Codegen {
             if is_xmm_reg(reg) {
                 let name = phys_reg_name(reg);
                 if name != "xmm0" {
+                    // Full-register copy: a merging `movsd %xmm0, %home`
+                    // would read the home's previous value -- in a loop the
+                    // previous iteration's -- serialising iterations.
+                    let copy = if mov_instr == "movsd" {
+                        "movapd"
+                    } else {
+                        "movaps"
+                    };
+                    let v = if self.isa.avx { "v" } else { "" };
                     self.state
-                        .emit_fmt(format_args!("    {} %xmm0, %{}", mov_instr, name));
+                        .emit_fmt(format_args!("    {v}{copy} %xmm0, %{name}"));
                 }
                 self.state.reg_cache.invalidate_acc();
                 // Definition-writes-home accounting: the store wrote the
@@ -217,8 +237,8 @@ impl X86Codegen {
                 if is_xmm_reg(r) {
                     let name = phys_reg_name(r);
                     if name != reg {
-                        // Register-to-register scalar FP copies use the VEX
-                        // 3-operand form (`vmovsd %src, %src, %dst`): the
+                        // Register-to-register scalar FP copies use the
+                        // full-register packed move (`vmovapd`/`vmovaps`): the
                         // legacy `movsd %src, %dst` is a MERGING move that
                         // preserves the destination's upper 64 bits, i.e. it
                         // READS the destination's previous content. That false
@@ -230,25 +250,20 @@ impl X86Codegen {
                         // reads only the source. Scalar consumers only read
                         // the low lane, so the upper-bit difference is
                         // unobservable; the vectorizer's packed pairs never
-                        // route through this scalar helper.
-                        // Without AVX the full-width `movaps`/`movapd`
-                        // (GCC's spelling) gives the same dependency-free
-                        // copy: it writes all of `reg` and reads only the
-                        // source; scalar consumers ignore the upper lanes.
-                        if self.isa.avx {
-                            self.state.emit_fmt(format_args!(
-                                "    v{} %{}, %{}, %{}",
-                                mov_instr, name, name, reg
-                            ));
+                        // route through this scalar helper. The 3-operand
+                        // `vmovsd %src, %src, %dst` also reads only the
+                        // source, but cores do not reliably eliminate it at
+                        // rename (the 2026-09-06 mandelbrot A/B recorded at
+                        // `MachInst::FMov`: ~7% in the float loop), while
+                        // `vmovapd` is GCC's spelling and is eliminated.
+                        let movap = if ty == IrType::F64 {
+                            "movapd"
                         } else {
-                            let movap = if ty == IrType::F64 {
-                                "movapd"
-                            } else {
-                                "movaps"
-                            };
-                            self.state
-                                .emit_fmt(format_args!("    {} %{}, %{}", movap, name, reg));
-                        }
+                            "movaps"
+                        };
+                        let v = if self.isa.avx { "v" } else { "" };
+                        self.state
+                            .emit_fmt(format_args!("    {v}{movap} %{name}, %{reg}"));
                     }
                     return;
                 }
@@ -1215,6 +1230,74 @@ impl X86Codegen {
         true
     }
 
+    /// Zero-defined CLZ/CTZ without LZCNT/TZCNT and without a branch.
+    ///
+    /// BSR/BSF leave their destination unmodified when the source is zero:
+    /// AMD has always documented this and Intel's SDM now does too (LLVM
+    /// relies on it for x86-64 codegen since llvm/llvm-project#123623). So
+    /// the zero result is PRELOADED and the scan keeps it: CTZ preloads the
+    /// width; CLZ preloads `2*width - 1`, which the closing `xor width-1`
+    /// turns into the width exactly like it turns an MSB index into a count.
+    /// The IR's `Clz(0) == Ctz(0) == width` contract is preserved without the
+    /// `test; jnz; mov $w; jmp` fix-up (3 executed instructions and a branch
+    /// per count in zstd's `ZSTD_highbit32` price loops).
+    ///
+    /// The preload is a 32-bit `movl`, so the whole 64-bit destination holds
+    /// the preload; the SDM's footnote that some older CPUs clear bits 63:32
+    /// on a 32-bit zero-source scan is therefore moot. The source must be a
+    /// GPR home distinct from the destination (the preload writes the
+    /// destination before the scan reads the source); otherwise the caller
+    /// keeps the accumulator forms. x86-64 only: i686 output may run on
+    /// pre-x86-64 processors, where the passthrough is not guaranteed.
+    fn emit_zero_defined_scan_direct(
+        &mut self,
+        dest: &Value,
+        src: &Operand,
+        ty: IrType,
+        leading: bool,
+    ) -> bool {
+        let use_32bit = matches!(ty, IrType::I32 | IrType::U32);
+        if !use_32bit && !matches!(ty, IrType::I64 | IrType::U64) {
+            return false;
+        }
+        let Some(s_reg) = self.operand_reg(src).filter(|r| !is_xmm_reg(*r)) else {
+            return false;
+        };
+        let dest_gpr = self
+            .dest_reg(dest)
+            .filter(|r| !is_xmm_reg(*r) && *r != s_reg);
+        let bits: u32 = if use_32bit { 32 } else { 64 };
+        let preload = if leading { 2 * bits - 1 } else { bits };
+        let d32 = dest_gpr.map(phys_reg_name_32).unwrap_or("eax");
+        let (s_name, d_name, suffix) = if use_32bit {
+            (phys_reg_name_32(s_reg), d32, "l")
+        } else {
+            (
+                phys_reg_name(s_reg),
+                dest_gpr.map(phys_reg_name).unwrap_or("rax"),
+                "q",
+            )
+        };
+        self.state
+            .emit_fmt(format_args!("    movl ${}, %{}", preload, d32));
+        self.state.emit_fmt(format_args!(
+            "    {}{} %{}, %{}",
+            if leading { "bsr" } else { "bsf" },
+            suffix,
+            s_name,
+            d_name
+        ));
+        if leading {
+            self.state
+                .emit_fmt(format_args!("    xor{} ${}, %{}", suffix, bits - 1, d_name));
+        }
+        self.state.reg_cache.invalidate_acc();
+        if dest_gpr.is_none() {
+            self.store_rax_to(dest);
+        }
+        true
+    }
+
     pub(super) fn emit_unaryop_impl(
         &mut self,
         dest: &Value,
@@ -1256,17 +1339,27 @@ impl X86Codegen {
                 return;
             }
         }
-        if !self.lzcnt_enabled {
-            let leading = match op {
-                IrUnaryOp::ClzNonZero => Some(true),
-                IrUnaryOp::CtzNonZero => Some(false),
-                _ => None,
-            };
-            if let Some(leading) = leading
-                && self.emit_nonzero_bitcount_direct(dest, src, ty, leading)
-            {
-                return;
-            }
+        // Without the counting instruction (LZCNT for Clz, BMI1 TZCNT for
+        // Ctz) a proven-nonzero count is a bare BSR/BSF.
+        let leading = match op {
+            IrUnaryOp::ClzNonZero if !self.lzcnt_enabled => Some(true),
+            IrUnaryOp::CtzNonZero if !self.bmi1_enabled => Some(false),
+            _ => None,
+        };
+        if let Some(leading) = leading
+            && self.emit_nonzero_bitcount_direct(dest, src, ty, leading)
+        {
+            return;
+        }
+        let zero_defined = match op {
+            IrUnaryOp::Clz if !self.lzcnt_enabled => Some(true),
+            IrUnaryOp::Ctz if !self.bmi1_enabled => Some(false),
+            _ => None,
+        };
+        if let Some(leading) = zero_defined
+            && self.emit_zero_defined_scan_direct(dest, src, ty, leading)
+        {
+            return;
         }
 
         // Integer dest-only two-operand ABM/BMI: popcnt/lzcnt/tzcnt write dest
@@ -1281,7 +1374,7 @@ impl X86Codegen {
                     IrUnaryOp::Clz | IrUnaryOp::ClzNonZero if self.lzcnt_enabled => {
                         Some(BitCountMnem::Lzcnt)
                     }
-                    IrUnaryOp::Ctz | IrUnaryOp::CtzNonZero if self.lzcnt_enabled => {
+                    IrUnaryOp::Ctz | IrUnaryOp::CtzNonZero if self.bmi1_enabled => {
                         Some(BitCountMnem::Tzcnt)
                     }
                     _ => None,
@@ -1338,7 +1431,7 @@ impl X86Codegen {
                             self.state.reg_cache.invalidate_acc();
                             return;
                         }
-                        _ => {} // Popcount without -mpopcnt / Clz/Ctz without -mlzcnt
+                        _ => {} // Popcount without -mpopcnt / Clz without -mlzcnt / Ctz without -mbmi
                                 // fall through to the baseline sequences.
                     }
                 }
@@ -1476,40 +1569,27 @@ impl X86Codegen {
                     if is_xmm_reg(reg) {
                         let name = phys_reg_name(reg);
                         if name != xmm {
-                            // VEX 3-operand scalar move (`vmovsd %src, %src,
-                            // %dst`): writes the destination from the SOURCE
-                            // alone. The legacy 2-operand `movsd %src, %dst`
-                            // only zero-extends when the source is MEMORY;
-                            // register-to-register it MERGES, preserving the
-                            // destination's upper bits and therefore reading
-                            // the destination's previous content — a false
-                            // dependence on whatever last wrote the register
-                            // (previous loop iteration's FP result), which
-                            // serialises independent iterations at FP latency.
-                            // `movaps` was rejected here for full-register
-                            // partial-dependency reasons; the VEX scalar form
-                            // has neither defect: it reads only the source.
-                            if self.isa.avx {
-                                let mv = if ty == IrType::F32 {
-                                    "vmovss"
-                                } else {
-                                    "vmovsd"
-                                };
-                                self.state.emit_fmt(format_args!(
-                                    "    {} %{}, %{}, %{}",
-                                    mv, name, name, xmm
-                                ));
-                            } else {
-                                // Legacy: full-width movaps/movapd reads only
-                                // the source (no merge), same as GCC -mno-avx.
-                                let mv = if ty == IrType::F32 {
-                                    "movaps"
-                                } else {
-                                    "movapd"
-                                };
-                                self.state
-                                    .emit_fmt(format_args!("    {} %{}, %{}", mv, name, xmm));
-                            }
+                            // Full-register packed move (`vmovapd`/`movapd`;
+                            // `movaps` for F32): writes the destination from
+                            // the SOURCE alone. The legacy 2-operand `movsd
+                            // %src, %dst` only zero-extends from MEMORY;
+                            // register-to-register it MERGES, reading the
+                            // destination's previous content -- a false
+                            // dependence on whatever last wrote it (in loops,
+                            // the previous iteration's FP result). The VEX
+                            // `vmovsd %src, %src, %dst` has the same low-128
+                            // result bit for bit but is a port-5 shuffle uop,
+                            // while the packed move is eliminated at rename
+                            // (Intel since Ivy Bridge, AMD Zen) -- GCC's
+                            // choice. Scalar consumers ignore the upper lanes.
+                            let mv = match (ty == IrType::F32, self.isa.avx) {
+                                (true, true) => "vmovaps",
+                                (true, false) => "movaps",
+                                (false, true) => "vmovapd",
+                                (false, false) => "movapd",
+                            };
+                            self.state
+                                .emit_fmt(format_args!("    {mv} %{name}, %{xmm}"));
                         }
                     } else {
                         let gpr = phys_reg_name(reg);

@@ -19,5 +19,5 @@ for key in eligible scan assigned spilled segments holes callee-homes caller-hom
 done
 # A nonmatching filter must be quiet and must not alter assembly.
 CCC_TRACE_ALLOCSTATS=not_pressure "$CCC" -O2 -S "$t/t.c" -o "$t/t2.s" 2>"$t/log2"
-! grep -q '^\[RA-STATS\]' "$t/log2"
+! grep -q '^\[RA-STATS\]' "$t/log2" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 cmp "$t/t.s" "$t/t2.s"

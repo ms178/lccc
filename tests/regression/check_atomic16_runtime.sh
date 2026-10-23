@@ -13,9 +13,11 @@
 #   * Semantics hold for every ordering and for both the -mcx16 (inline
 #     cmpxchg16b) and default (libatomic) compare-exchange paths.
 #
-# The runtime half is built at -O1: see docs/FOLLOWUP-2026-10-21-i128-atomic-o2
-# for the separate, pre-existing middle-end issue that keeps the -O2 arithmetic
-# consumer of these results from being used as an oracle here.
+#   * No caller-saved register home spans a 16-byte atomic: every libatomic
+#     entry is a real call (and the inline cmpxchg16b sequence stages through
+#     the stack), so liveness models them as call points.  Before that, -O2
+#     homed values in %r10/%r11 across `call __atomic_*_16@PLT` and the
+#     peephole deleted their definitions (wrong hashes at -O2 only).
 set -euo pipefail
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
@@ -127,14 +129,92 @@ int main(void) {
 }
 EOF
 
-for flags in "" "-mcx16" "-march=x86-64-v3"; do
-    lbl=${flags:-default}
-    "$ccc" -O1 $flags "$tmp/run.c" -o "$tmp/run_lccc" -latomic \
-        || fail "lccc $lbl build of run.c"
-    out=$("$tmp/run_lccc") || fail "lccc $lbl runtime: $out"
-    grep -q 'bad=0' <<<"$out" || fail "lccc $lbl 16-byte atomic semantics: $out"
-    echo "PASS: 16-byte atomics are correct at runtime ($lbl): $out"
+for opt in -O1 -O2; do
+    for flags in "" "-mcx16" "-march=x86-64-v3"; do
+        lbl="$opt ${flags:-default}"
+        "$ccc" $opt $flags "$tmp/run.c" -o "$tmp/run_lccc" -latomic \
+            || fail "lccc $lbl build of run.c"
+        out=$("$tmp/run_lccc") || fail "lccc $lbl runtime: $out"
+        grep -q 'bad=0' <<<"$out" || fail "lccc $lbl 16-byte atomic semantics: $out"
+        echo "PASS: 16-byte atomics are correct at runtime ($lbl): $out"
+    done
 done
+
+# ------------------------------------------------- caller-saved clobbers -----
+# Values live across each kind of 16-byte atomic, at -O2 where the allocator
+# hands out %r10/%r11 and xmm homes.  Expected output measured with gcc 16.2.
+cat >"$tmp/clob.c" <<'EOF'
+#include <stdio.h>
+__int128 g = ((__int128)5 << 64) | 6;
+__attribute__((noinline)) long f(long a, long b, long c) {
+  long x = a * b + c, y = a ^ c, z = b - a;
+  __int128 v = __atomic_load_n(&g, __ATOMIC_SEQ_CST);
+  return x + y * 3 + z * 7 + (long)v + (long)(v >> 64);
+}
+__attribute__((noinline)) double fd(double a, double b, long n) {
+  double x = a * b + 1.5, y = a - b;
+  __atomic_store_n(&g, (__int128)n, __ATOMIC_SEQ_CST);
+  return x * 2.0 + y;
+}
+__attribute__((noinline)) long fr(long a, long b) {
+  long x = a * 7 + b, y = a ^ b;
+  __int128 old = __atomic_fetch_add(&g, (__int128)1, __ATOMIC_SEQ_CST);
+  return x + y * 5 + (long)old;
+}
+__attribute__((noinline)) long fc(long a, long b) {
+  long x = a * 9 + b, y = b - a;
+  __int128 e = (__int128)0, d = (__int128)a;
+  int ok = __atomic_compare_exchange_n(&g, &e, d, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+  return x + y * 11 + ok + (long)e;
+}
+int main(void) {
+  long r1 = f(3, 4, 5);
+  double r2 = fd(2.0, 0.5, 0);
+  long r3 = fr(6, 2);
+  long r4 = fc(2, 9);
+  printf("%ld %.2f %ld %ld\n", r1, r2, r3, r4);
+  return 0;
+}
+EOF
+# Two blocks of store + compare-exchange whose results feed inlined i128
+# arithmetic (the reproducer that used to diverge at -O2 in both the
+# libatomic and the inline cmpxchg16b configurations).
+cat >"$tmp/mix.c" <<'EOF'
+#include <stdio.h>
+typedef unsigned __int128 u128;
+static _Alignas(16) _Atomic u128 v;
+static unsigned long long h;
+int main(void) {
+    u128 k = ((u128)0x0123456789ABCDEFULL << 64) | 0xFEDCBA9876543210ULL;
+#define MIX(x) do { u128 t_ = (x); \
+    h = h * 1000003ULL + (unsigned long long)t_ + (unsigned long long)(t_ >> 64); \
+} while (0)
+    {   __atomic_store_n(&v, k + 1, __ATOMIC_RELAXED);
+        u128 e = k + 1;
+        MIX((u128)__atomic_compare_exchange_n(&v, &e, k + 1 + (u128)1, 0,
+                                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+        MIX(e); MIX(__atomic_load_n(&v, __ATOMIC_SEQ_CST)); }
+    {   __atomic_store_n(&v, k + 2, __ATOMIC_RELAXED);
+        u128 e = k + 2;
+        MIX((u128)__atomic_compare_exchange_n(&v, &e, k + 2 + (u128)1, 0,
+                                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+        MIX(e); MIX(__atomic_load_n(&v, __ATOMIC_SEQ_CST)); }
+    printf("%016llx\n", h);
+    return 0;
+}
+EOF
+for opt in -O1 -O2 -O3; do
+    for flags in "" "-mcx16"; do
+        lbl="$opt ${flags:-default}"
+        "$ccc" $opt $flags "$tmp/clob.c" -o "$tmp/clob" -latomic || fail "lccc $lbl build of clob.c"
+        out=$("$tmp/clob") || fail "lccc $lbl clob runtime"
+        [ "$out" = "53 6.50 64 105" ] || fail "lccc $lbl: value clobbered across a 16-byte atomic: '$out'"
+        "$ccc" $opt $flags "$tmp/mix.c" -o "$tmp/mix" -latomic || fail "lccc $lbl build of mix.c"
+        out=$("$tmp/mix") || fail "lccc $lbl mix runtime"
+        [ "$out" = "d674e05bde401cdc" ] || fail "lccc $lbl: i128 atomic results miscombined: '$out'"
+    done
+done
+echo "PASS: no caller-saved home spans a 16-byte atomic (-O1/-O2/-O3, libatomic and cmpxchg16b)"
 
 # ---------------------------------------------------------- oracle parity ----
 if command -v "$gcc" >/dev/null 2>&1; then

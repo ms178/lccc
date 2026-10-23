@@ -78,12 +78,116 @@ fn negated(x: Operand, root: Operand, ty: IrType, defs: &[Option<Instruction>]) 
         || matches!(definition(x,defs),Some(Instruction::BinOp { op:IrBinOp::Sub,lhs,rhs,ty:t,.. }) if compatible(*t,ty) && const_in_ring(*lhs,ty.size()*8)==Some(0) && same_bits(*rhs,root,defs))
 }
 
+/// Use counts over operands and terminators (the cost model of [`observe`]).
+fn use_counts(func: &IrFunction) -> Vec<u32> {
+    let mut uses = vec![0u32; func.max_value_id() as usize + 1];
+    let mut count = |v: &Value| {
+        if let Some(n) = uses.get_mut(v.0 as usize) {
+            *n += 1;
+        }
+    };
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            crate::backend::liveness::for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    count(v);
+                }
+            });
+            crate::backend::liveness::for_each_value_use_in_instruction(inst, &mut count);
+        }
+        crate::backend::liveness::for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                count(v);
+            }
+        });
+    }
+    uses
+}
+
+/// True when `value` and every copy/compatible cast [`view`] peels on the
+/// way to its producer have exactly one use: the producer dies with the test.
+fn dies_with_test(mut value: Operand, defs: &[Option<Instruction>], uses: &[u32]) -> bool {
+    for _ in 0..32 {
+        let Operand::Value(v) = value else {
+            return true;
+        };
+        if uses.get(v.0 as usize).copied() != Some(1) {
+            return false;
+        }
+        match defs.get(v.0 as usize).and_then(Option::as_ref) {
+            Some(Instruction::Copy { src, .. }) => value = *src,
+            Some(Instruction::Cast {
+                src,
+                from_ty,
+                to_ty,
+                ..
+            }) if compatible(*from_ty, *to_ty) => value = *src,
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// Producers whose surviving copy makes a peel worth at most one cycle of
+/// latency: walking through such a SHARED producer saves no instruction (it
+/// still executes for its other users) but extends its root's live range.
+/// Multi-cycle producers (Mul, UDiv, counts, byte/bit reversal) still pay
+/// for the peel by taking the compare off their latency chain.
+fn single_cycle_producer(inst: Option<&Instruction>) -> bool {
+    match inst {
+        Some(Instruction::BinOp { op, .. }) => matches!(
+            op,
+            IrBinOp::Add
+                | IrBinOp::Sub
+                | IrBinOp::And
+                | IrBinOp::Or
+                | IrBinOp::Xor
+                | IrBinOp::Shl
+                | IrBinOp::LShr
+                | IrBinOp::AShr
+                | IrBinOp::RotateLeft
+                | IrBinOp::RotateRight
+        ),
+        Some(Instruction::UnaryOp { op, .. }) => matches!(op, IrUnaryOp::Not | IrUnaryOp::Neg),
+        Some(Instruction::Select { .. }) => true,
+        _ => false,
+    }
+}
+
+/// Walk `test` back through invertible producers. `shared` is raised when
+/// the returned test was obtained by peeling a single-cycle producer that
+/// outlives the test (see [`single_cycle_producer`]); the caller then keeps
+/// only rewrites that are cheaper than the compare itself. A level counts
+/// as peeled only if its result names a different root, so an abandoned
+/// sub-walk (a Select whose arms disagree) cannot veto anything.
 fn observe(
+    test: Test,
+    ty: IrType,
+    defs: &[Option<Instruction>],
+    uses: &[u32],
+    depth: u8,
+    budget: &mut u8,
+    shared: &mut bool,
+) -> Test {
+    let root = view(test.value, defs);
+    let crossing_shared =
+        !dies_with_test(test.value, defs, uses) && single_cycle_producer(definition(root, defs));
+    let mut below = false;
+    let result = observe_level(test, ty, defs, uses, depth, budget, &mut below);
+    if result.value != root {
+        *shared |= crossing_shared || below;
+    }
+    result
+}
+
+fn observe_level(
     mut test: Test,
     ty: IrType,
     defs: &[Option<Instruction>],
+    uses: &[u32],
     depth: u8,
     budget: &mut u8,
+    shared: &mut bool,
 ) -> Test {
     if depth == 0 || *budget == 0 {
         return test;
@@ -104,8 +208,10 @@ fn observe(
             },
             ty,
             defs,
+            uses,
             depth - 1,
             budget,
+            shared,
         )
     };
     match definition(test.value, defs) {
@@ -451,6 +557,9 @@ fn conjugate(inst: &Instruction, defs: &[Option<Instruction>]) -> Option<Instruc
 
 pub(super) fn run(func: &mut IrFunction, defs: &[Option<Instruction>]) -> usize {
     let mut changes = 0;
+    // Snapshot, like `defs`: consumers are rewritten in place below, which
+    // never changes any producer's use count before it is consulted.
+    let uses = use_counts(func);
     let mut next = func
         .max_value_id()
         .saturating_add(1)
@@ -475,7 +584,16 @@ pub(super) fn run(func: &mut IrFunction, defs: &[Option<Instruction>]) -> usize 
             {
                 if let Some(all) = full(*ty) {
                     if matches!(op, IrCmpOp::Eq | IrCmpOp::Ne) {
-                        if let Some((a, b)) = cancel(*lhs, *rhs, *ty, defs) {
+                        // Cancelling two producers that both outlive the
+                        // compare and cost a cycle each saves nothing and
+                        // extends both roots' live ranges.
+                        let pays = |o: Operand| {
+                            dies_with_test(o, defs, &uses)
+                                || !single_cycle_producer(definition(o, defs))
+                        };
+                        if let Some((a, b)) =
+                            cancel(*lhs, *rhs, *ty, defs).filter(|_| pays(*lhs) || pays(*rhs))
+                        {
                             replacement = Some(Instruction::Cmp {
                                 dest: *dest,
                                 op: *op,
@@ -494,7 +612,9 @@ pub(super) fn run(func: &mut IrFunction, defs: &[Option<Instruction>]) -> usize 
                                 constant,
                                 op: *op,
                             };
-                            let mut test = observe(original, *ty, defs, 12, &mut 64);
+                            let mut shared = false;
+                            let mut test =
+                                observe(original, *ty, defs, &uses, 12, &mut 64, &mut shared);
                             // Materialize already-normalized single-bit booleans
                             // directly. At 32 bits this preserves Cmp's I32 result
                             // width and avoids SETcc plus a zero-extension. Do
@@ -551,7 +671,11 @@ pub(super) fn run(func: &mut IrFunction, defs: &[Option<Instruction>]) -> usize 
                                     };
                                 }
                             }
-                            if test != original
+                            // Past the direct materialization above, a test
+                            // reached through a shared single-cycle producer
+                            // is no cheaper than the original compare.
+                            if !shared
+                                && test != original
                                 && !(test.mask == original.mask
                                     && test.constant == original.constant
                                     && test.op == original.op
@@ -614,23 +738,30 @@ pub(super) fn run(func: &mut IrFunction, defs: &[Option<Instruction>]) -> usize 
                             }
                         }
                     }
-                    // ctpop(x) <= x for unsigned x, without a range guess.
-                    if matches!(op, IrCmpOp::Ule | IrCmpOp::Ugt) {
-                        if let Some(Instruction::UnaryOp {
+                    // ctpop(x) <= x for unsigned x, without a range guess, in
+                    // either operand order (`x >= ctpop(x)` is the same fact).
+                    let oriented = match op {
+                        IrCmpOp::Ule | IrCmpOp::Ugt => Some((*lhs, *rhs, *op == IrCmpOp::Ule)),
+                        IrCmpOp::Uge | IrCmpOp::Ult => Some((*rhs, *lhs, *op == IrCmpOp::Uge)),
+                        _ => None,
+                    };
+                    if let Some((
+                        Instruction::UnaryOp {
                             op: IrUnaryOp::Popcount,
                             src,
                             ty: t,
                             ..
-                        }) = definition(*lhs, defs)
-                        {
-                            if compatible(*t, *ty) && same_bits(*src, *rhs, defs) {
-                                replacement = Some(Instruction::Copy {
-                                    dest: *dest,
-                                    src: Operand::Const(IrConst::I32(i32::from(
-                                        *op == IrCmpOp::Ule,
-                                    ))),
-                                });
-                            }
+                        },
+                        other,
+                        holds,
+                    )) = oriented.and_then(|(pop, other, holds)| {
+                        Some((definition(pop, defs)?, other, holds))
+                    }) {
+                        if compatible(*t, *ty) && same_bits(*src, other, defs) {
+                            replacement = Some(Instruction::Copy {
+                                dest: *dest,
+                                src: Operand::Const(IrConst::I32(i32::from(holds))),
+                            });
                         }
                     }
                 }

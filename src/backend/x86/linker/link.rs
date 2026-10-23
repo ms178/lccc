@@ -155,6 +155,66 @@ pub(crate) fn placed_value(
     }
 }
 
+/// The gnu2 Local-Dynamic anchor: `leaq _TLS_MODULE_BASE_@TLSDESC(%rip)`
+/// yields the base of this module's TLS block once, and every local variable
+/// is then addressed as `%fs:v@dtpoff(%rax)`.  GCC emits it for
+/// `-mtls-dialect=gnu2 -fPIC`; no object defines it -- the linker does.
+pub(crate) const TLS_MODULE_BASE: &str = "_TLS_MODULE_BASE_";
+
+/// Define a referenced `_TLS_MODULE_BASE_` the way GNU ld and lld do
+/// (`_bfd_x86_elf_always_size_sections`): a HIDDEN `STT_TLS` symbol, so it is
+/// never imported, exported, or preempted, and its TLSDESC slot is resolved
+/// against symbol 0 (this module) with the block offset as addend.  Its value
+/// is layout-dependent; the emitters finish it with
+/// [`tls_module_base_value`].  Without TLS input there is nothing to anchor
+/// and the reference stays undefined (and is reported as such).
+pub(crate) fn define_tls_module_base(
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    objects: &[ElfObject],
+) {
+    let Some(g) = globals.get_mut(TLS_MODULE_BASE) else {
+        return;
+    };
+    if g.defined_in.is_some() || g.is_dynamic {
+        return;
+    }
+    let has_tls = objects
+        .iter()
+        .any(|o| o.sections.iter().any(|s| s.flags & SHF_TLS != 0));
+    if !has_tls {
+        return;
+    }
+    g.info = (g.info & 0xf0) | STT_TLS;
+    g.visibility = crate::backend::elf::STV_HIDDEN;
+    g.defined_in = Some(usize::MAX); // sentinel: linker-defined
+    g.section_idx = SHN_ABS;
+    g.value = 0;
+}
+
+/// Final address of a linker-defined `_TLS_MODULE_BASE_`.  In a shared
+/// object it is the start of the TLS block (`v@dtpoff` = offset of `v` in the
+/// block).  In an executable the descriptor sequence is relaxed to
+/// `mov $tpoff,%rax` and `v@dtpoff` in code is resolved TP-relative, so the
+/// anchor sits at the END of the block -- the thread pointer -- making its
+/// tpoff 0, as GNU ld and lld do.
+pub(crate) fn tls_module_base_value(
+    globals: &mut FxHashMap<String, GlobalSymbol>,
+    tls_addr: u64,
+    tls_mem_size: u64,
+    executable: bool,
+) {
+    if let Some(g) = globals.get_mut(TLS_MODULE_BASE)
+        && g.defined_in == Some(usize::MAX)
+        && (g.info & 0xf) == STT_TLS
+    {
+        g.value = if executable {
+            tls_addr + tls_mem_size
+        } else {
+            tls_addr
+        };
+    }
+}
+
 /// Compute the `--defsym` values against the finalised global symbol table.
 ///
 /// Must run inside the emitter, after (1) section addresses are assigned to
@@ -454,8 +514,14 @@ pub fn link_builtin(
     // in, handling circular dependencies between archives and ensuring shared libraries
     // can resolve symbols introduced by archive member extraction.
     {
-        let mut all_lib_names: Vec<String> = needed_libs.iter().map(|s| s.to_string()).collect();
-        all_lib_names.extend(libs_to_load.iter().cloned());
+        // gcc's order: the user's `-l` libraries, then the driver's. Loading
+        // order is DT_NEEDED order and with it the loader's symbol search
+        // order, so a user library interposing a libc function must come
+        // first. (Pre-fix the driver's libraries led: `lccc m.o -lfoo` gave
+        // NEEDED libc.so.6, libfoo.so -- libc's definition won.)
+        let user_lib_count = libs_to_load.len();
+        let mut all_lib_names: Vec<String> = libs_to_load.clone();
+        all_lib_names.extend(needed_libs.iter().map(|s| s.to_string()));
 
         let mut lib_paths_resolved: Vec<String> = Vec::new();
         // Include deferred .a and .so files first (preserving command-line order)
@@ -464,26 +530,21 @@ pub fn link_builtin(
                 lib_paths_resolved.push(lib_path.clone());
             }
         }
-        let needed_lib_count = needed_libs.len();
         for (idx, lib_name) in all_lib_names.iter().enumerate() {
             // Driver-supplied libraries follow the link mode; a user `-l`
             // follows the `-Bstatic`/`-Bdynamic` state at its position.
-            let static_only = is_static
-                || idx
-                    .checked_sub(needed_lib_count)
-                    .is_some_and(|k| lib_static_search.get(k).copied().unwrap_or(false));
+            let is_user = idx < user_lib_count;
+            let static_only =
+                is_static || (is_user && lib_static_search.get(idx).copied().unwrap_or(false));
             if let Some(lib_path) =
                 linker_common::resolve_lib_positional(lib_name, &all_lib_paths, static_only)
             {
                 if !lib_paths_resolved.contains(&lib_path) {
                     lib_paths_resolved.push(lib_path);
                 }
-            } else if idx >= needed_lib_count {
+            } else if is_user {
                 // User-specified -l library not found: error (matching ld behavior)
-                return Err(format!(
-                    "cannot find -l{}: No such file or directory",
-                    lib_name
-                ));
+                return Err(linker_common::cannot_find_lib(lib_name));
             }
         }
 
@@ -539,9 +600,17 @@ pub fn link_builtin(
         objects.push(linker_common::build_id::synthetic_note_object());
     }
 
+    define_tls_module_base(&mut globals, &objects);
+
     // Resolve remaining undefined symbols from default system libraries
-    // (only when dynamically linking)
-    if !is_static {
+    // (only when dynamically linking).
+    // Only when gcc's default libraries were requested: the driver passes
+    // none under `-nostdlib`/`-nodefaultlibs`, and the standalone lccc-ld
+    // none at all (its caller lists `-lc` etc.).  GNU ld never resolves
+    // against a library absent from the command line, so without this
+    // guard `-nostdlib` code calling `puts` linked against libc.so.6
+    // instead of failing as it does with GCC (i686/RISC-V already failed).
+    if !is_static && !needed_libs.is_empty() {
         let default_libs = [
             "libc.so.6",
             "libm.so.6",
@@ -920,11 +989,18 @@ pub fn link_builtin(
 /// Produces an ELF `ET_DYN` file with position-independent base address (0),
 /// exporting all defined global symbols. Used when the compiler is invoked
 /// with `-shared`.
+///
+/// `crt_objects_before`/`crt_objects_after` and `needed_libs` are gcc's
+/// `-shared` spec as the lccc driver resolves it (`crti.o crtbeginS.o ...
+/// crtendS.o crtn.o`, `-lgcc -lgcc_s -lc`); lccc-ld behind a gcc driver gets
+/// them as ordinary inputs instead and passes none here.
 pub fn link_shared(
     object_files: &[&str],
     output_path: &str,
     user_args: &[String],
     lib_paths: &[&str],
+    crt_objects_before: &[&str],
+    crt_objects_after: &[&str],
     needed_libs: &[&str],
 ) -> Result<(), String> {
     let mut objects = linker_common::ObjectSet::new();
@@ -988,8 +1064,9 @@ pub fn link_shared(
         })
         .collect();
 
-    // Load user object files (from the compiler driver, before user_args)
-    for path in object_files {
+    // Load the leading startup objects and the user object files (from the
+    // compiler driver, before user_args)
+    for path in crt_objects_before.iter().chain(object_files) {
         load_file(
             path,
             &mut objects,
@@ -1032,10 +1109,7 @@ pub fn link_shared(
                     lib_paths_resolved.push((lib_path, *wa, *an));
                 }
             } else {
-                return Err(format!(
-                    "cannot find -l{}: No such file or directory",
-                    lib_name
-                ));
+                return Err(linker_common::cannot_find_lib(lib_name));
             }
         }
         // Track which whole-archive libraries have been fully loaded to avoid
@@ -1098,21 +1172,44 @@ pub fn link_shared(
             }
         }
     }
+    // crtendS.o/crtn.o close the link after every library member (gcc's
+    // spec): crtend's zero terminator ends `.eh_frame`, crtn's epilogue
+    // ends `.init`/`.fini`.
+    for path in crt_objects_after {
+        load_file(
+            path,
+            &mut objects,
+            &mut globals,
+            &mut needed_sonames,
+            &lib_path_strings,
+            false,
+        )?;
+    }
+
+    define_tls_module_base(&mut globals, &objects);
 
     // Resolve remaining undefined symbols against system libraries (libc, libm,
     // libgcc_s) and add DT_NEEDED entries for any that provide matched symbols.
-    let default_libs = [
-        "libc.so.6",
-        "libm.so.6",
-        "libgcc_s.so.1",
-        "ld-linux-x86-64.so.2",
-    ];
-    linker_common::resolve_dynamic_symbols_elf64(
-        &mut globals,
-        &mut needed_sonames,
-        &all_lib_paths,
-        &default_libs,
-    )?;
+    // Only when gcc's default libraries were requested: the driver passes
+    // none under `-nostdlib`/`-nodefaultlibs`, and the standalone lccc-ld
+    // none at all (its caller lists `-lc` etc.).  GNU ld never resolves
+    // against a library absent from the command line, so without this
+    // guard `-nostdlib` code calling `puts` linked against libc.so.6
+    // instead of failing as it does with GCC (i686/RISC-V already failed).
+    if !needed_libs.is_empty() {
+        let default_libs = [
+            "libc.so.6",
+            "libm.so.6",
+            "libgcc_s.so.1",
+            "ld-linux-x86-64.so.2",
+        ];
+        linker_common::resolve_dynamic_symbols_elf64(
+            &mut globals,
+            &mut needed_sonames,
+            &all_lib_paths,
+            &default_libs,
+        )?;
+    }
 
     // -z defs / --no-undefined: shared libraries normally tolerate
     // undefined symbols (resolved at load time), but with this flag every

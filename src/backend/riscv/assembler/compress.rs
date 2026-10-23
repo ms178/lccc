@@ -107,6 +107,10 @@ pub fn try_compress_rv64(word: u32) -> Option<u16> {
                     ((bits5_4 << 11) | (bits9_6 << 7) | (bit2 << 6) | (bit3 << 5) | (rd_prime << 2))
                         as u16,
                 )
+            } else if rs1 != 0 && rd != 0 && imm == 0 {
+                // C.MV: `mv rd, rs` is `addi rd, rs, 0`; GAS compresses it to
+                // the same C.MV as `add rd, x0, rs` (both copy rs to rd).
+                Some((0b100_0_00000_00000_10 | (rd << 7) | (rs1 << 2)) as u16)
             } else if rs1 == 0 && rd != 0 {
                 // C.LI: addi rd, x0, imm  (li rd, imm)
                 if !(-32..=31).contains(&imm) {
@@ -786,12 +790,14 @@ mod tests {
 
     #[test]
     fn test_compress_mv_t1_t0() {
-        // mv t1, t0 is now encoded as add t1, x0, t0 (0x00500333) for C.MV compatibility.
-        // C.MV t1, t0: 100_0_00110_00101_10 = 0x8316
-        // add x6, x0, x5 = 0x00500333
-        let result = try_compress_rv64(0x00500333);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap(), 0x8316, "c.mv t1, t0 should be 0x8316");
+        // C.MV t1, t0: 100_0_00110_00101_10 = 0x8316, from either copy form
+        // (GAS 2.47 -march=rv64gc compresses both): `mv t1, t0` is
+        // `addi t1, t0, 0` = 0x00028313, and `add t1, x0, t0` = 0x00500333.
+        assert_eq!(try_compress_rv64(0x00028313), Some(0x8316));
+        assert_eq!(try_compress_rv64(0x00500333), Some(0x8316));
+        // `addi x0, t0, 0` writes x0 (a HINT): not C.MV. `li t1, 0` is C.LI.
+        assert_eq!(try_compress_rv64(0x00028013), None);
+        assert_eq!(try_compress_rv64(0x00000313), Some(0x4301), "c.li t1, 0");
     }
 
     #[test]

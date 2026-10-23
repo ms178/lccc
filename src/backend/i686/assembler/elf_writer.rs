@@ -132,6 +132,10 @@ impl X86Arch for I686Arch {
             22 | 23 => 1,
             // R_386_16 / R_386_PC16: 2-byte fields (real-mode disp16/rel16).
             20 | 21 => 2,
+            // R_386_TLS_DESC_CALL marks `call *x@tlscall(%eax)` (`ff 10`)
+            // and owns no field: a 4-byte addend patch at the instruction's
+            // first byte would cover the call and the next instruction.
+            R_386_TLS_DESC_CALL => 0,
             _ => 4,
         }
     }
@@ -166,6 +170,10 @@ impl X86Arch for I686Arch {
         // reproduces, so GAS folds them (`leal .bss@GOTOFF(%ebx)` carries a
         // section symbol; measured) and so does this writer.
         matches!(reloc_type, R_386_GOT32 | R_386_GOT32X)
+    }
+
+    fn is_got_pc_reloc(reloc_type: u32) -> bool {
+        reloc_type == R_386_GOTPC
     }
 
     fn needs_got_base_symbol(reloc_type: u32) -> bool {

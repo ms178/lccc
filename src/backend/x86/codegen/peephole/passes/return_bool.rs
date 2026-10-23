@@ -4,11 +4,42 @@
 //! temporary and then copies it. Clear eax BEFORE the flag producer and set al
 //! directly. This removes the extension and often two REX prefixes without
 //! changing function alignment. The comparison must not read any rax alias.
+//!
+//! The rewrite drops the write of `tmp8`, so `tmp8` must be dead at `ret`.
+//! That holds for every caller-saved non-return family, but `%rdx` carries
+//! the high half of `__int128` and two-INTEGER-eightbyte returns: `%dl` is
+//! admitted only when the enclosing function's prologue publishes
+//! `# LCCC_RET_RDX 0` (absent or legible-live markers fail closed).
 use super::super::types::*;
+use super::liveness::FileLiveness;
 
 pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
+    // Whether the current `.cfi_startproc` function provably does not
+    // return in `%rdx` (same function boundaries as `FileLiveness`).
+    let mut rdx_dead_at_ret = false;
     for a in 0..infos.len() {
+        if !infos[a].is_nop() {
+            let t = infos[a].trimmed(store.get(a));
+            if t.starts_with(".cfi_startproc") {
+                // Bound the marker scan by this function's `.cfi_endproc`
+                // (as `FileLiveness` does). Defence in depth: the scan also
+                // stops at the first `ret`, which any matching function has.
+                let end = (a + 1..infos.len())
+                    .find(|&n| {
+                        !infos[n].is_nop()
+                            && infos[n].trimmed(store.get(n)).starts_with(".cfi_endproc")
+                    })
+                    .unwrap_or(infos.len());
+                rdx_dead_at_ret =
+                    FileLiveness::ret_rdx_marker(store, infos, a + 1, end) == Some(false);
+                continue;
+            }
+            if t.starts_with(".cfi_endproc") {
+                rdx_dead_at_ret = false;
+                continue;
+            }
+        }
         if infos[a].is_nop() || infos[a].pinned || infos[a].reg_refs & 1 != 0 {
             continue;
         }
@@ -39,7 +70,9 @@ pub(super) fn run(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
             continue;
         };
         // Do not change an ABI-preserved register's observable low byte.
-        if !matches!(family, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10 | 11) {
+        if !matches!(family, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10 | 11)
+            || (family == 2 && !rdx_dead_at_ret)
+        {
             continue;
         }
         let ext = infos[c].trimmed(store.get(c));
@@ -242,8 +275,9 @@ mod tests {
                 for byte in [
                     "%al", "%cl", "%dl", "%sil", "%dil", "%r8b", "%r9b", "%r10b", "%r11b",
                 ] {
-                    let (changed, out) =
-                        apply(&format!("{op}\nset{cc} {byte}\nmovzbl {byte}, %eax\nret\n"));
+                    let (changed, out) = apply(&format!(
+                        ".cfi_startproc\n# LCCC_RET_RDX 0\n{op}\nset{cc} {byte}\nmovzbl {byte}, %eax\nret\n.cfi_endproc\n"
+                    ));
                     assert!(changed, "{op} {cc} {byte}");
                     assert!(out.contains("xorl %eax, %eax"));
                     assert!(out.contains(&format!("set{cc} %al")));
@@ -278,6 +312,27 @@ mod tests {
             infos[pinned].pinned = true;
             assert!(!run(&mut store, &mut infos));
         }
+    }
+    /// `%rdx` is a return register for 128-bit and `[INTEGER, INTEGER]`
+    /// returns: dropping `setcc %dl` would change the returned high half.
+    #[test]
+    fn dl_requires_proof_that_rdx_is_not_returned() {
+        let body = "testl %edi, %edi\nsete %dl\nmovzbl %dl, %eax\nret\n";
+        for (prefix, expect) in [
+            (".cfi_startproc\n# LCCC_RET_RDX 0\n", true),
+            (".cfi_startproc\n# LCCC_RET_RDX 1\n", false),
+            (".cfi_startproc\n", false),
+            ("", false),
+            // The proof does not leak into the next function.
+            (
+                ".cfi_startproc\n# LCCC_RET_RDX 0\nret\n.cfi_endproc\n",
+                false,
+            ),
+        ] {
+            assert_eq!(apply(&format!("{prefix}{body}")).0, expect, "{prefix:?}");
+        }
+        // A non-return caller-saved byte needs no marker.
+        assert!(apply("testl %edi, %edi\nsete %cl\nmovzbl %cl, %eax\nret\n").0);
     }
     #[test]
     fn survives_whole_pipeline() {

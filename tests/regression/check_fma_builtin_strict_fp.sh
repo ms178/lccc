@@ -24,5 +24,16 @@ objdump -d "$tmp/test" >"$tmp/dis"
 grep -Eq 'vfmadd[0-9]+sd' "$tmp/dis"
 grep -Eq 'vfmadd[0-9]+ss' "$tmp/dis"
 grep -Eq 'vsqrtsd|sqrtsd' "$tmp/dis"
-! sed -n '/<fma_wrap>:/,/^$/p' "$tmp/dis" | grep -E 'call.*fma' >/dev/null
-! sed -n '/<sqrt_wrap>:/,/^$/p' "$tmp/dis" | grep -E 'call.*sqrt' >/dev/null
+! sed -n '/<fma_wrap>:/,/^$/p' "$tmp/dis" | grep -E 'call.*fma' >/dev/null || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
+# sqrt: the instruction must be inline in sqrt_wrap itself. Under the
+# default -fmath-errno a `sqrt` call stays behind it as the errno path for
+# x < 0 (GCC 16.2 emits the same guard + `jmp sqrt`); it is the only call.
+sed -n '/<sqrt_wrap>:/,/^$/p' "$tmp/dis" >"$tmp/sqrt_wrap"
+grep -Eq 'v?sqrtsd' "$tmp/sqrt_wrap"
+[ "$(grep -Ec '(call|jmp)[[:space:]]+[0-9a-f]+ <sqrt(@plt)?>' "$tmp/sqrt_wrap")" -le 1 ]
+# -fno-math-errno: the instruction alone, no library call at all.
+"$LCCC" -O2 -march=x86-64-v3 -frounding-math -ftrapping-math -fno-math-errno "$tmp/test.c" -o "$tmp/test-nme"
+"$tmp/test-nme"
+objdump -d "$tmp/test-nme" | sed -n '/<sqrt_wrap>:/,/^$/p' >"$tmp/sqrt_wrap_nme"
+grep -Eq 'v?sqrtsd' "$tmp/sqrt_wrap_nme"
+! grep -E '(call|jmp)[[:space:]]+[0-9a-f]+ <sqrt(@plt)?>' "$tmp/sqrt_wrap_nme" >/dev/null || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }

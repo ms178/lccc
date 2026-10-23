@@ -228,14 +228,16 @@ pub(super) struct ParsedDeclAttrs {
     pub parsing_alias_target: Option<String>,
     /// `__attribute__((visibility("...")))` visibility string.
     pub parsing_visibility: Option<String>,
+    /// `__attribute__((tls_model("...")))`, validated at the attribute.
+    pub parsing_tls_model: Option<crate::common::tls::TlsModel>,
     /// `__attribute__((section("...")))` section name.
     pub parsing_section: Option<String>,
-    /// `__attribute__((tls_model("...")))` per-symbol ELF TLS model.
-    pub parsing_tls_model: Option<String>,
     /// `__attribute__((cleanup(func)))` cleanup function name.
     pub parsing_cleanup_fn: Option<String>,
     /// `__attribute__((symver("name@@VERSION")))` symbol version string.
     pub parsing_symver: Option<String>,
+    /// `__attribute__((target("...")))` feature list, comma-joined.
+    pub parsing_target: Option<String>,
     /// `__attribute__((__diagnose_as(__builtin_NAME, ...)))` — the builtin
     /// the declared function is an alias of (the kernel's fortify-string
     /// family).  Calls that survive inlining must fold to the builtin, or
@@ -594,6 +596,7 @@ impl std::fmt::Debug for ParsedDeclAttrs {
             .field("parsing_cold", &self.parsing_cold())
             .field("parsing_alias_target", &self.parsing_alias_target)
             .field("parsing_visibility", &self.parsing_visibility)
+            .field("parsing_tls_model", &self.parsing_tls_model)
             .field("parsing_section", &self.parsing_section)
             .field("parsing_cleanup_fn", &self.parsing_cleanup_fn)
             .field("parsing_vector_size", &self.parsing_vector_size)
@@ -1711,23 +1714,26 @@ impl Parser {
                 self.advance();
                 self.attrs.parsing_visibility = self.parse_string_attr_arg();
             }
-            "section" | "__section__" => {
-                self.advance();
-                self.attrs.parsing_section = self.parse_string_attr_arg();
-            }
+            // GCC's diagnostics, verbatim (GCC 16.2 c-attribs.cc
+            // handle_tls_model_attribute). Applying it to a non-TLS object is
+            // diagnosed by lowering, which knows the storage class.
             "tls_model" | "__tls_model__" => {
                 let span = self.peek_span();
                 self.advance();
-                let model = self.parse_string_attr_arg();
-                if let Some(ref value) = model
-                    && !matches!(
-                        value.as_str(),
-                        "local-exec" | "initial-exec" | "local-dynamic" | "global-dynamic"
-                    )
-                {
-                    self.emit_error(format!("unknown TLS model '{value}'"), span);
+                match self.parse_string_attr_arg() {
+                    Some(arg) => match crate::common::tls::TlsModel::parse(&arg) {
+                        Some(model) => self.attrs.parsing_tls_model = Some(model),
+                        None => self.emit_error(
+                            "'tls_model' argument must be one of 'local-exec', 'initial-exec', 'local-dynamic', or 'global-dynamic'",
+                            span,
+                        ),
+                    },
+                    None => self.emit_error("'tls_model' argument not a string", span),
                 }
-                self.attrs.parsing_tls_model = model;
+            }
+            "section" | "__section__" => {
+                self.advance();
+                self.attrs.parsing_section = self.parse_string_attr_arg();
             }
             "__diagnose_as"
             | "diagnose_as"
@@ -1736,6 +1742,14 @@ impl Parser {
             | "diagnose_as_builtin" => {
                 self.advance();
                 self.parse_diagnose_as_attr();
+            }
+            // __attribute__((target("bmi2,lzcnt"))) / target("bmi", "bmi2"):
+            // per-function ISA for runtime-dispatched clones (zstd's `_bmi2`
+            // bodies, xxHash/simdjson kernels). Consumed by the inliner's
+            // ISA-subset rule and the x86-64 emitter's per-function ISA.
+            "target" | "__target__" => {
+                self.advance();
+                self.attrs.parsing_target = self.parse_target_attr_arg();
             }
             "symver" | "__symver__" => {
                 self.advance();
@@ -1892,6 +1906,58 @@ impl Parser {
         } else {
             Some(result)
         }
+    }
+
+    /// Parse `("a,b" "c", "d")`: adjacent literals concatenate (C string
+    /// pasting), commas separate arguments; the result is comma-joined so
+    /// `target("bmi", "bmi2")` and `target("bmi,bmi2")` are identical.
+    /// Malformed contents are skipped to the matching paren.
+    fn parse_target_attr_arg(&mut self) -> Option<String> {
+        if !matches!(self.peek(), TokenKind::LParen) {
+            return None;
+        }
+        self.advance(); // consume (
+        let mut parts: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        loop {
+            match self.peek() {
+                TokenKind::StringLiteral(s) => {
+                    cur.push_str(s);
+                    self.advance();
+                }
+                TokenKind::Comma => {
+                    parts.push(std::mem::take(&mut cur));
+                    self.advance();
+                }
+                TokenKind::RParen => {
+                    self.advance();
+                    break;
+                }
+                TokenKind::Eof => break,
+                _ => {
+                    // Not a string list: recover by skipping to the `)`
+                    // that closes this argument list.
+                    let mut depth = 1usize;
+                    while depth > 0 && !matches!(self.peek(), TokenKind::Eof) {
+                        match self.peek() {
+                            TokenKind::LParen => depth += 1,
+                            TokenKind::RParen => depth -= 1,
+                            _ => {}
+                        }
+                        self.advance();
+                    }
+                    return None;
+                }
+            }
+        }
+        parts.push(cur);
+        let joined = parts
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        (!joined.is_empty()).then_some(joined)
     }
 
     /// Skip an optional parenthesized argument (consuming everything inside).

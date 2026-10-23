@@ -152,6 +152,11 @@ pub enum Directive {
     Long(Vec<DataValue>),
     /// `.quad val, ...` / `.8byte` / `.xword` / `.dword`
     Quad(Vec<DataValue>),
+    /// `.uleb128 val, ...` (`signed: false`) / `.sleb128 val, ...`
+    Leb128 {
+        signed: bool,
+        values: Vec<DataValue>,
+    },
     /// `.zero N[, fill]` / `.space N[, fill]`
     Zero { size: usize, fill: u8 },
     /// `.fill` with a non-zero value — see the ARM `AsmDirective::Fill`
@@ -179,8 +184,15 @@ pub enum Directive {
     ArchOption(String),
     /// `.attribute ...` — RISC-V attribute
     Attribute(String),
-    /// CFI directives — silently ignored
-    Cfi,
+    /// A `.cfi_*` directive: name and operand text. `cfi_lower::lower_cfi`
+    /// replaces it by a location label and the `.eh_frame` data it implies.
+    Cfi(String, String),
+    /// DWARF location advance between two code labels, produced by the CFI
+    /// lowering only; sized and relocated by the ELF writer.
+    CfaAdvance { from: String, to: String },
+    /// 4-byte PC-relative reference (`R_RISCV_32_PCREL`), produced by the
+    /// CFI lowering only (FDE initial location, pc-relative personality).
+    Pcrel32(String),
     /// Other ignorable directives: .file, .loc, .ident, etc.
     Ignored,
     /// `.org new-lc [, fill]` -- resolved by `ElfWriterBase::emit_org`.
@@ -480,6 +492,10 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
             let values = parse_data_values(args)?;
             Directive::Quad(values)
         }
+        ".uleb128" | ".sleb128" => Directive::Leb128 {
+            signed: name == ".sleb128",
+            values: parse_data_values(args)?,
+        },
 
         ".zero" | ".space" | ".skip" => {
             let parts: Vec<&str> = args.trim().split(',').collect();
@@ -611,26 +627,9 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
         ".insn" => Directive::Insn(args.to_string()),
 
         // CFI directives
-        ".cfi_startproc"
-        | ".cfi_endproc"
-        | ".cfi_def_cfa_offset"
-        | ".cfi_offset"
-        | ".cfi_def_cfa_register"
-        | ".cfi_restore"
-        | ".cfi_remember_state"
-        | ".cfi_restore_state"
-        | ".cfi_adjust_cfa_offset"
-        | ".cfi_def_cfa"
-        | ".cfi_sections"
-        | ".cfi_personality"
-        | ".cfi_lsda"
-        | ".cfi_rel_offset"
-        | ".cfi_register"
-        | ".cfi_return_column"
-        | ".cfi_undefined"
-        | ".cfi_same_value"
-        | ".cfi_escape"
-        | ".cfi_signal_frame" => Directive::Cfi,
+        name if name.starts_with(".cfi_") => {
+            Directive::Cfi(name.to_string(), args.trim().to_string())
+        }
 
         ".pushsection" => Directive::PushSection(parse_section_args(args)),
         ".popsection" => Directive::PopSection,
@@ -833,7 +832,7 @@ fn symbol_operand_mask(mnemonic: &str) -> u8 {
         // call <symbol> — operand 0 is always a symbol
         "call" | "tail" => 0b0000_0001,
         // la/lla rd, <symbol> — operand 1 is always a symbol
-        "la" | "lla" => 0b0000_0010,
+        "la" | "lla" | "lga" | "la.tls.ie" | "la.tls.gd" => 0b0000_0010,
         // jump <label>, <temp_reg> — operand 0 is always a symbol
         "jump" => 0b0000_0001,
         _ => 0,

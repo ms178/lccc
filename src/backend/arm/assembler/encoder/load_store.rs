@@ -489,18 +489,22 @@ pub(crate) fn encode_ldr_str_checked(
                             }
                         }
                     }
-                    "got_lo12" => RelocType::Ld64GotLo12,
-                    "gottprel_lo12" => {
-                        if !is_load || is_128bit || actual_size != 0b11 {
-                            return Err(":gottprel_lo12: requires `ldr Xt, [Xn, ...]`".into());
+                    // The GOT-slot forms name an 8-byte LP64 entry and their
+                    // relocations scale the slot offset by 8. GAS 2.47 also
+                    // accepts them on `ldr wN`/`str`, where the field scales
+                    // by 4 or the GOT is written: a silently wrong access
+                    // (ILP32's 4-byte slots use other relocations, and LCCC
+                    // has no ILP32). Refused here, like every other
+                    // meaningless operand form.
+                    "got_lo12" | "gottprel_lo12" | "tlsdesc_lo12" => {
+                        if !is_load || is_signed || v != 0 || is_128bit || actual_size != 0b11 {
+                            return Err(format!(":{kind}: needs a 64-bit integer ldr (xN)"));
                         }
-                        RelocType::TlsIeLd64GotTprelLo12
-                    }
-                    "tlsdesc_lo12" => {
-                        if !is_load || is_128bit || actual_size != 0b11 {
-                            return Err(":tlsdesc_lo12: requires `ldr Xt, [Xn, ...]`".into());
+                        match kind {
+                            "got_lo12" => RelocType::Ld64GotLo12,
+                            "gottprel_lo12" => RelocType::TlsIeLd64GotTprelLo12,
+                            _ => RelocType::TlsDescLd64Lo12,
                         }
-                        RelocType::TlsDescLd64Lo12
                     }
                     _ => return Err(format!("unsupported modifier in load/store: {}", kind)),
                 };
@@ -1498,12 +1502,11 @@ pub(crate) fn encode_adrp(operands: &[Operand]) -> Result<EncodeResult, String> 
         Some(Operand::Modifier { kind, symbol })
             if matches!(kind.as_str(), "got" | "gottprel" | "tlsdesc") =>
         {
-            let reloc_type = if kind == "got" {
-                RelocType::AdrGotPage21
-            } else if kind == "gottprel" {
-                RelocType::TlsIeAdrGotTprelPage21
-            } else {
-                RelocType::TlsDescAdrPage21
+            // adrp xN, :got:sym / :gottprel:sym (TLS IE) / :tlsdesc:sym
+            let reloc_type = match kind.as_str() {
+                "got" => RelocType::AdrGotPage21,
+                "gottprel" => RelocType::TlsIeAdrGotTprelPage21,
+                _ => RelocType::TlsDescAdrPage21,
             };
             let word = (1u32 << 31) | (0b10000 << 24) | rd;
             return Ok(EncodeResult::WordWithReloc {

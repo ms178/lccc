@@ -982,6 +982,7 @@ mod tests {
                 is_const: false,
                 assume_library: false,
                 ret_eightbyte_classes: Vec::new(),
+                cold: false,
             },
         });
         // Post-call consumer chain.

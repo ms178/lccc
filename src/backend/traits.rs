@@ -404,6 +404,28 @@ pub trait ArchCodegen {
         false
     }
 
+    /// Whether [`CodegenBackend::try_emit_tls_direct_load`] folds every
+    /// Local-/Initial-Exec root load it is handed. Only then may the generic
+    /// emitter omit a TLS `GlobalAddr` whose uses are all loads: without the
+    /// hook nothing would compute the address (i686 -O2 loaded through an
+    /// unwritten register when this was keyed on `supports_global_addr_fold`).
+    fn supports_tls_direct_load_fold(&self) -> bool {
+        false
+    }
+
+    /// The load types [`CodegenBackend::try_emit_tls_direct_load`] folds; a
+    /// TLS root is omitted only when every use is a load of such a type.
+    fn tls_direct_load_type_ok(&self, _ty: IrType) -> bool {
+        false
+    }
+
+    /// The store types [`CodegenBackend::try_emit_tls_direct_store`] folds
+    /// for a Local-Exec root, without fail (a root whose stores qualify is
+    /// omitted, so the hook is then the only way to reach the variable).
+    fn tls_direct_store_type_ok(&self, _ty: IrType) -> bool {
+        false
+    }
+
     /// Whether the backend can reconstruct an omitted GlobalAddr at audited
     /// Add/Sub/GEP uses. x86-64 opts in; all other targets default off.
     fn supports_global_addr_remat(&self) -> bool {
@@ -2392,6 +2414,12 @@ pub trait ArchCodegen {
     /// (and the fallthrough state, when the previous block falls through).
     fn begin_home_write_block(&mut self, _label: BlockId) {}
 
+    /// Announce that emission is about to generate the IR instruction or
+    /// terminator at `state().current_program_point` (also on MachInst
+    /// replay, which revisits earlier points). Targets that keep
+    /// per-point home bookkeeping settle it here.
+    fn begin_ir_point(&mut self) {}
+
     /// Announce a terminator control edge to `label`.  Called AFTER the
     /// branch's register effects were emitted, so the snapshot reflects
     /// the state on that edge exactly.
@@ -2870,6 +2898,13 @@ pub trait ArchCodegen {
         "@function"
     }
 
+    /// Switch the emitter to the ISA of the function about to be generated:
+    /// the TU's options plus the normalized `__attribute__((target(...)))`
+    /// features in `features`; an empty slice restores the TU's ISA.
+    /// Called around every function by `generate_function`. Default: the
+    /// attribute does not change code generation on this backend.
+    fn set_function_target_features(&mut self, _features: &[String]) {}
+
     /// Emit dynamic stack allocation.
     ///
     /// When alignment > 16, we must allocate `size + (align - 1)` bytes
@@ -3290,6 +3325,17 @@ pub fn emit_load_default(
     }
 }
 
+/// The `CCC_TRACE_I128` gate, cached once: it is consulted on every 128-bit
+/// operand load, pair store and integer->I128 cast, where a per-call
+/// `std::env::var` scanned the environment each time. The environment cannot
+/// change mid-process in the driver, so caching is exact (same convention as
+/// `x86::codegen::emit::trace_notes_enabled`).
+pub(crate) fn trace_i128_enabled() -> bool {
+    static FLAG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("CCC_TRACE_I128").is_some());
+    *FLAG
+}
+
 /// Default cast implementation: handles i128 widening/narrowing/copy,
 /// and delegates non-i128 casts to emit_cast_instrs.
 /// Backends that override `emit_cast` should call this for types they don't handle specially.
@@ -3347,7 +3393,7 @@ pub fn emit_cast_default(
     }
     // integer -> i128/u128: widen to 64-bit then sign/zero extend high half
     if is_i128_type(to_ty) && !is_i128_type(from_ty) {
-        if std::env::var("CCC_TRACE_I128").is_ok() {
+        if trace_i128_enabled() {
             eprintln!("[I128] cast {:?} -> {:?} dest={:?}", from_ty, to_ty, dest.0);
         }
         cg.emit_load_operand(src);

@@ -15,6 +15,22 @@ struct G { int x; int y; } g_struct = {10, 20};
 int g_partial[8] = {1, 2};       /* partial init -> rest zero */
 static int g_uninit;
 
+/* TLS declaration forms the lowering must resolve to the one object:
+ * a block-scope `extern __thread` seen before the only definition (it was
+ * once lowered as plain data: the write landed in the .tdata template), an
+ * asm-labelled TLS declaration whose later definition inherits the label,
+ * and a per-variable tls_model. */
+static int block_extern_tls(void) {
+    extern __thread int g_tls_late;
+    g_tls_late = 7;
+    return g_tls_late;
+}
+__thread int g_tls_late = 41;
+extern __thread int g_tls_asm __asm__("g_tls_asm_sym");
+static int read_asm_tls(void) { return g_tls_asm; }
+__thread int g_tls_asm = 5;   /* inherits the asm label: one object */
+static __thread int g_tls_ie __attribute__((tls_model("initial-exec"))) = 3;
+
 static int counter(void) {
     static int c = 0;            /* static local persists */
     return ++c;
@@ -50,6 +66,13 @@ int main(void) {
     const char *s1 = "same-literal";
     const char *s2 = "same-literal";
     if (s1 != s2) return 17;   /* GCC merges; LCCC's dedup should too */
+
+    if (block_extern_tls() != 7 || g_tls_late != 7) return 18;
+    if (read_asm_tls() != 5) return 19;
+    g_tls_asm = 9;
+    if (read_asm_tls() != 9) return 19;
+    g_tls_ie += 4;
+    if (g_tls_ie != 7) return 20;
 
     printf("OK globals_tls\n");
     return 0;

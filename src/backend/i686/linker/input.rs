@@ -379,7 +379,7 @@ impl Resolver<'_> {
                     if item.optional {
                         return Ok(());
                     }
-                    return Err(format!("cannot find -l{}", name));
+                    return Err(crate::backend::linker_common::cannot_find_lib(name));
                 };
                 let direct_shared = classify(&data) == FileKind::SharedObject;
                 // GNU records a soname-less library found by `-l` under its

@@ -30,18 +30,19 @@
 //!
 //! ## Implementation
 //!
-//! 64-bit magic numbers require 128-bit intermediate products. We use the
-//! compiler's existing I128/U128 types: cast both operands to 128-bit,
-//! multiply, shift right by 64, and truncate back to 64-bit. All backends
-//! (x86, i686, ARM64, RISC-V) have I128 multiply support that maps to efficient
-//! hardware instructions (mulq/imulq on x86, umulh/smulh on ARM64,
-//! mulhu/mulh on RISC-V).
+//! 64-bit magic numbers need the high half of a 128-bit product: one
+//! `IrBinOp::UMulHigh`/`SMulHigh` (x86-64 `mulq`/`imulq`, AArch64
+//! `umulh`/`smulh`, RISC-V `mulhu`/`mulh`).  Spelling it as an I128 multiply
+//! instead put I128 values in the function, and on x86-64 any I128 value costs
+//! the whole function five registers of its allocation pool.  Unsigned
+//! divisors >= 2^63 become `x >= d`.  The pass runs only on 64-bit targets
+//! (`passes::mod` gates it off for i686).
 //!
 //! - Negative divisors are handled via identity: `x / -C == -(x / C)` and
 //!   `x % -C == x % C` (in C, the sign of the remainder follows the dividend).
 
 use crate::common::types::IrType;
-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, IrFunction, Operand, Value};
+use crate::ir::reexports::{Instruction, IrBinOp, IrCmpOp, IrConst, IrFunction, Operand, Value};
 
 #[path = "div_by_const_exact.rs"]
 mod exact;
@@ -906,6 +907,30 @@ fn expand_udiv64(
         }]);
     }
 
+    // d >= 2^63: the quotient is 0 or 1, i.e. `x >= d` -- one compare and a
+    // setcc (GCC and LLVM emit the same), cheaper than any magic sequence,
+    // and the only expansion for the ~0.5% of these divisors whose magic
+    // needs a 65th shift bit (`compute_unsigned_magic_64` gives up on them,
+    // e.g. u64::MAX - 1, which then kept a `divq`).
+    if d > i64::MAX as u64 {
+        let ge = fresh_value(next_id);
+        return Some(vec![
+            Instruction::Cmp {
+                dest: ge,
+                op: IrCmpOp::Uge,
+                lhs: *x,
+                rhs: Operand::Const(IrConst::I64(d as i64)),
+                ty,
+            },
+            Instruction::Cast {
+                dest,
+                src: Operand::Value(ge),
+                from_ty: IrType::I8,
+                to_ty: ty,
+            },
+        ]);
+    }
+
     let (magic, shift, needs_add) = compute_unsigned_magic_64(d)?;
     let mut insts = Vec::with_capacity(16);
 
@@ -922,39 +947,10 @@ fn expand_udiv64(
         Operand::Value(v)
     };
 
-    let x128 = fresh_value(next_id);
-    insts.push(Instruction::Cast {
-        dest: x128,
-        src: x_u64,
-        from_ty: IrType::U64,
-        to_ty: IrType::U128,
-    });
-
-    let product = fresh_value(next_id);
-    insts.push(Instruction::BinOp {
-        dest: product,
-        op: IrBinOp::Mul,
-        lhs: Operand::Value(x128),
-        rhs: Operand::Const(IrConst::I128(magic as i128)),
-        ty: IrType::U128,
-    });
-
-    let hi128 = fresh_value(next_id);
-    insts.push(Instruction::BinOp {
-        dest: hi128,
-        op: IrBinOp::LShr,
-        lhs: Operand::Value(product),
-        rhs: Operand::Const(IrConst::I128(64)),
-        ty: IrType::U128,
-    });
-
-    let hi_u64 = fresh_value(next_id);
-    insts.push(Instruction::Cast {
-        dest: hi_u64,
-        src: Operand::Value(hi128),
-        from_ty: IrType::U128,
-        to_ty: IrType::U64,
-    });
+    // `compute_unsigned_magic_64` returns magic <= u64::MAX (the 65-bit
+    // case comes back reduced, with `needs_add`), so the 64-bit high
+    // multiply is exact.
+    let hi_u64 = mul_high_64(x_u64, magic as u64 as i64, false, &mut insts, next_id);
 
     let hi = if ty == IrType::U64 {
         hi_u64
@@ -1029,6 +1025,34 @@ fn expand_udiv64(
     }
 
     Some(insts)
+}
+
+/// `(x * magic) >> 64` -- high half of the 128-bit product, unsigned or
+/// signed -- as one `UMulHigh` (typed U64) or `SMulHigh` (typed I64),
+/// appended to `insts`.  The pass runs only on 64-bit targets (the
+/// `!target.is_32bit()` gate in `passes::mod`), where every backend has the
+/// instruction.
+fn mul_high_64(
+    x: Operand,
+    magic: i64,
+    signed: bool,
+    insts: &mut Vec<Instruction>,
+    next_id: &mut u32,
+) -> Value {
+    debug_assert!(!crate::common::types::target_is_32bit());
+    let hi = fresh_value(next_id);
+    insts.push(Instruction::BinOp {
+        dest: hi,
+        op: if signed {
+            IrBinOp::SMulHigh
+        } else {
+            IrBinOp::UMulHigh
+        },
+        lhs: x,
+        rhs: Operand::Const(IrConst::I64(magic)),
+        ty: if signed { IrType::I64 } else { IrType::U64 },
+    });
+    hi
 }
 
 // ─── Signed division by constant (64-bit) ──────────────────────────────────
@@ -1122,39 +1146,9 @@ fn expand_sdiv64(dest: Value, x: &Operand, d: i64, next_id: &mut u32) -> Option<
     let (magic, shift) = compute_signed_magic_64(d);
     let mut insts = Vec::with_capacity(16);
 
-    let x128 = fresh_value(next_id);
-    insts.push(Instruction::Cast {
-        dest: x128,
-        src: *x,
-        from_ty: IrType::I64,
-        to_ty: IrType::I128,
-    });
-
-    let product = fresh_value(next_id);
-    insts.push(Instruction::BinOp {
-        dest: product,
-        op: IrBinOp::Mul,
-        lhs: Operand::Value(x128),
-        rhs: Operand::Const(IrConst::I128(magic)),
-        ty: IrType::I128,
-    });
-
-    let hi128 = fresh_value(next_id);
-    insts.push(Instruction::BinOp {
-        dest: hi128,
-        op: IrBinOp::AShr,
-        lhs: Operand::Value(product),
-        rhs: Operand::Const(IrConst::I128(64)),
-        ty: IrType::I128,
-    });
-
-    let hi = fresh_value(next_id);
-    insts.push(Instruction::Cast {
-        dest: hi,
-        src: Operand::Value(hi128),
-        from_ty: IrType::I128,
-        to_ty: IrType::I64,
-    });
+    // `magic` is the sign extension of the 64-bit magic, so `magic as i64`
+    // is exact and the signed high multiply sees the same operand.
+    let hi = mul_high_64(*x, magic as i64, true, &mut insts, next_id);
 
     // Hacker's Delight: If M < 0 (bit 63 set), add the dividend to the high part
     let adjusted_hi = if magic < 0 {
@@ -1216,6 +1210,36 @@ fn expand_urem64(
 ) -> Option<Vec<Instruction>> {
     if d < 2 || d.is_power_of_two() {
         return None;
+    }
+
+    // d >= 2^63: the quotient is 0 or 1, so the remainder is
+    // `x >= d ? x - d : x` -- a compare and a cmov, not `(x >= d) * d`.
+    if d > i64::MAX as u64 {
+        let ge = fresh_value(next_id);
+        let diff = fresh_value(next_id);
+        return Some(vec![
+            Instruction::Cmp {
+                dest: ge,
+                op: IrCmpOp::Uge,
+                lhs: *x,
+                rhs: Operand::Const(IrConst::I64(d as i64)),
+                ty,
+            },
+            Instruction::BinOp {
+                dest: diff,
+                op: IrBinOp::Sub,
+                lhs: *x,
+                rhs: Operand::Const(IrConst::I64(d as i64)),
+                ty,
+            },
+            Instruction::Select {
+                dest,
+                cond: Operand::Value(ge),
+                true_val: Operand::Value(diff),
+                false_val: *x,
+                ty,
+            },
+        ]);
     }
 
     let quotient = fresh_value(next_id);
@@ -1631,6 +1655,7 @@ fn expand_srem32_in_i64(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::fx_hash::FxHashMap;
 
     #[inline]
     fn c_div_i32(a: i32, b: i32) -> i32 {
@@ -1640,6 +1665,214 @@ mod tests {
     #[inline]
     fn c_div_i64(a: i64, b: i64) -> i64 {
         a / b
+    }
+
+    /// Evaluate an expansion: BinOp through `IrBinOp::eval_i64`, Cmp through
+    /// `IrCmpOp::eval_i64`, Cast as two's-complement extend/truncate, Copy.
+    /// Values are held as i128 so a U64 is visibly zero- and an I64
+    /// sign-extended.
+    fn run_expansion(insts: &[Instruction], x: (Value, i64), dest: Value) -> i64 {
+        let fit = |v: i128, ty: IrType| -> i128 {
+            match ty {
+                IrType::U64 => i128::from(v as u64),
+                IrType::I8 => i128::from(v as i8),
+                _ => i128::from(v as i64),
+            }
+        };
+        let mut env: FxHashMap<u32, i128> = FxHashMap::default();
+        env.insert(x.0.0, i128::from(x.1));
+        let read = |env: &FxHashMap<u32, i128>, op: &Operand| match op {
+            Operand::Value(v) => env[&v.0],
+            Operand::Const(c) => c.to_i128().unwrap(),
+        };
+        for inst in insts {
+            let (dest, value) = match inst {
+                Instruction::BinOp {
+                    dest,
+                    op,
+                    lhs,
+                    rhs,
+                    ty,
+                } => {
+                    assert!(
+                        matches!(ty, IrType::I64 | IrType::U64),
+                        "wide op in {insts:?}"
+                    );
+                    let r = op.eval_i64(read(&env, lhs) as i64, read(&env, rhs) as i64);
+                    (dest, fit(i128::from(r.unwrap()), *ty))
+                }
+                Instruction::Cmp {
+                    dest, op, lhs, rhs, ..
+                } => {
+                    let r = op.eval_i64(read(&env, lhs) as i64, read(&env, rhs) as i64);
+                    (dest, i128::from(r))
+                }
+                Instruction::Cast {
+                    dest,
+                    src,
+                    from_ty,
+                    to_ty,
+                } => (dest, fit(fit(read(&env, src), *from_ty), *to_ty)),
+                Instruction::Copy { dest, src } => (dest, read(&env, src)),
+                Instruction::Select {
+                    dest,
+                    cond,
+                    true_val,
+                    false_val,
+                    ..
+                } => {
+                    let pick = if read(&env, cond) != 0 {
+                        true_val
+                    } else {
+                        false_val
+                    };
+                    (dest, read(&env, pick))
+                }
+                other => panic!("unexpected expansion instruction {other:?}"),
+            };
+            env.insert(dest.0, value);
+        }
+        env[&dest.0] as i64
+    }
+
+    /// The 64-bit expansions are exact for every divisor class -- plain
+    /// magic, 65-bit magic with the add fixup, negative signed magic, and
+    /// unsigned divisors >= 2^63 (the `x >= d` compare; u64::MAX - 1 is one
+    /// whose magic would need a 65th shift bit) -- and the magic forms use
+    /// one `UMulHigh`/`SMulHigh` with no I128 value anywhere, which is what
+    /// keeps the x86-64 register pool whole.
+    #[test]
+    fn div64_expansions_exact_with_mul_high() {
+        let udivs = [
+            3u64,
+            5,
+            7,
+            10,
+            11,
+            25,
+            641,
+            1_000_000_007,
+            1_000_000_000,
+            i64::MAX as u64,
+            1 << 63,
+            1 << 63 | 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let sdivs = [
+            3i64,
+            5,
+            6,
+            7,
+            10,
+            11,
+            125,
+            1_000_000_000,
+            i64::MAX,
+            i64::MAX - 1,
+        ];
+        let uxs = [
+            0u64,
+            1,
+            2,
+            4,
+            5,
+            6,
+            9,
+            99,
+            1000,
+            1 << 32,
+            (1 << 63) - 1,
+            1 << 63,
+            u64::MAX - 1,
+            u64::MAX,
+            0xDEAD_BEEF_CAFE_F00D,
+        ];
+        let sxs = [
+            0i64,
+            1,
+            -1,
+            2,
+            -2,
+            6,
+            -6,
+            7,
+            -7,
+            1000,
+            -1000,
+            i64::MAX,
+            i64::MIN,
+            i64::MIN + 1,
+            -0x1234_5678_9ABC_DEF0,
+        ];
+        let (x, q) = (Value(1), Value(2));
+        let has_op = |insts: &[Instruction], want: IrBinOp| {
+            insts
+                .iter()
+                .any(|i| matches!(i, Instruction::BinOp { op, .. } if *op == want))
+        };
+        for &d in &udivs {
+            let mut next = 10;
+            let div = expand_udiv64(q, &Operand::Value(x), d, IrType::U64, &mut next).unwrap();
+            let compare = d > i64::MAX as u64;
+            let pow2 = d.is_power_of_two();
+            assert_eq!(
+                matches!(
+                    div[0],
+                    Instruction::Cmp {
+                        op: IrCmpOp::Uge,
+                        ..
+                    }
+                ),
+                compare && !pow2,
+                "udiv {d}: {div:?}"
+            );
+            assert_eq!(
+                has_op(&div, IrBinOp::UMulHigh),
+                !compare && !pow2,
+                "udiv {d}: {div:?}"
+            );
+            for &v in &uxs {
+                assert_eq!(
+                    run_expansion(&div, (x, v as i64), q) as u64,
+                    v / d,
+                    "{v} / {d}"
+                );
+            }
+            if pow2 {
+                continue;
+            }
+            let mut next = 10;
+            let rem = expand_urem64(q, &Operand::Value(x), d, IrType::U64, &mut next).unwrap();
+            for &v in &uxs {
+                assert_eq!(
+                    run_expansion(&rem, (x, v as i64), q) as u64,
+                    v % d,
+                    "{v} % {d}"
+                );
+            }
+        }
+        for &d in &sdivs {
+            let mut next = 10;
+            let div = expand_sdiv64(q, &Operand::Value(x), d, &mut next).unwrap();
+            assert!(has_op(&div, IrBinOp::SMulHigh), "sdiv {d}: {div:?}");
+            for &v in &sxs {
+                assert_eq!(
+                    run_expansion(&div, (x, v), q),
+                    v.wrapping_div(d),
+                    "{v} / {d}"
+                );
+            }
+            let mut next = 10;
+            let rem = expand_srem64(q, &Operand::Value(x), d, &mut next).unwrap();
+            for &v in &sxs {
+                assert_eq!(
+                    run_expansion(&rem, (x, v), q),
+                    v.wrapping_rem(d),
+                    "{v} % {d}"
+                );
+            }
+        }
     }
 
     #[test]

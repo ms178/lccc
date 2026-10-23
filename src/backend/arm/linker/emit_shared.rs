@@ -8,7 +8,7 @@ use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
 use super::reloc;
-use super::types::{GlobalSymbol, PAGE_SIZE};
+use super::types::{EhFrameHdr, GlobalSymbol, PAGE_SIZE, init_fini_entries};
 use crate::backend::linker_common;
 use linker_common::{DynStrTab, OutputSection};
 
@@ -21,6 +21,7 @@ pub(super) fn emit_shared_library(
     needed_sonames: &[String],
     output_path: &str,
     soname: Option<String>,
+    rpath: Option<&(i64, String)>,
     pending_defsyms: &[(String, String, usize)],
 ) -> Result<(), String> {
     let base_addr: u64 = 0;
@@ -44,6 +45,9 @@ pub(super) fn emit_shared_library(
     }
     if let Some(ref sn) = soname {
         dynstr.add(sn);
+    }
+    if let Some((_, path)) = rpath {
+        dynstr.add(path);
     }
 
     // Export all defined global symbols
@@ -262,6 +266,9 @@ pub(super) fn emit_shared_library(
     if soname.is_some() {
         dyn_count += 1;
     }
+    if rpath.is_some() {
+        dyn_count += 1;
+    }
     if has_init_array {
         dyn_count += 2;
     }
@@ -271,6 +278,10 @@ pub(super) fn emit_shared_library(
     if !so_plt_names.is_empty() {
         dyn_count += 4;
     } // PLTGOT, PLTRELSZ, PLTREL, JMPREL
+    // DT_INIT / DT_FINI: existence from symbol definedness before layout,
+    // values read at emission once addresses are final.
+    let init_fini = linker_common::image_init_fini(globals);
+    dyn_count += u64::from(init_fini.0) + u64::from(init_fini.1);
     let dynamic_size = dyn_count * 16;
 
     let has_tls_sections = output_sections
@@ -327,6 +338,9 @@ pub(super) fn emit_shared_library(
         phdr_count += 1;
     }
     if is_exec_dyn {
+        phdr_count += 1;
+    }
+    if EhFrameHdr::wanted(output_sections) {
         phdr_count += 1;
     }
     let phdr_total_size = phdr_count * 56;
@@ -401,6 +415,7 @@ pub(super) fn emit_shared_library(
             offset += sec.mem_size;
         }
     }
+    let eh_frame_hdr = EhFrameHdr::reserve(objects, output_sections, &mut offset, base_addr);
     let rodata_total_size = offset - rodata_page_offset;
 
     // RW segment
@@ -977,6 +992,22 @@ pub(super) fn emit_shared_library(
         0x10,
     );
     ph += 56;
+    // PT_GNU_EH_FRAME: libgcc's unwinder reaches this object's FDEs only
+    // through it (dl_iterate_phdr).
+    if let Some(h) = &eh_frame_hdr {
+        wphdr(
+            &mut out,
+            ph,
+            PT_GNU_EH_FRAME,
+            PF_R,
+            h.offset,
+            h.vaddr,
+            h.size,
+            h.size,
+            4,
+        );
+        ph += 56;
+    }
     if has_tls {
         wphdr(
             &mut out,
@@ -1010,6 +1041,7 @@ pub(super) fn emit_shared_library(
     }
 
     // .dynsym
+    let import_has_strong_ref = linker_common::import_strong_refs(objects);
     let mut ds = dynsym_offset as usize + 24;
     for name in &dyn_sym_names {
         let no = dynstr.get_offset(name) as u32;
@@ -1037,8 +1069,16 @@ pub(super) fn emit_shared_library(
                 w64(&mut out, ds + 8, gsym.value);
                 w64(&mut out, ds + 16, gsym.size);
             } else {
-                // Undefined/dynamic: preserve original binding (STB_WEAK vs STB_GLOBAL)
-                let bind = gsym.info >> 4;
+                // Import: WEAK iff every reference is weak (see
+                // `import_strong_refs`), never the provider's binding --
+                // libc's GLOBAL `__cxa_finalize` used to turn crtbeginS's
+                // weak-only reference strong, and a weak libc alias would
+                // have turned an ordinary call weak.
+                let bind = match import_has_strong_ref.get(name.as_str()) {
+                    Some(false) => STB_WEAK,
+                    Some(true) => STB_GLOBAL,
+                    None => gsym.info >> 4,
+                };
                 let orig_type = gsym.info & 0xf;
                 let stype = if so_plt_names.contains(name) {
                     STT_FUNC
@@ -1530,6 +1570,17 @@ pub(super) fn emit_shared_library(
         w64(&mut out, dd + 8, so as u64);
         dd += 16;
     }
+    if let Some((tag, path)) = rpath {
+        w64(&mut out, dd, *tag as u64);
+        w64(&mut out, dd + 8, dynstr.get_offset(path) as u64);
+        dd += 16;
+    }
+    // Right after NEEDED/SONAME/RUNPATH, as GNU ld places them.
+    for (tag, a) in init_fini_entries(globals, init_fini) {
+        w64(&mut out, dd, tag as u64);
+        w64(&mut out, dd + 8, a);
+        dd += 16;
+    }
     for &(tag, val) in &[
         (DT_STRTAB, dynstr_addr),
         (DT_SYMTAB, dynsym_addr),
@@ -1662,6 +1713,11 @@ pub(super) fn emit_shared_library(
     w64(&mut out, sh + 24, shstrtab_offset);
     w64(&mut out, sh + 32, shstrtab_size);
     w64(&mut out, sh + 48, 1);
+
+    // .eh_frame_hdr from the relocated .eh_frame
+    if let Some(h) = &eh_frame_hdr {
+        h.write(&mut out)?;
+    }
 
     std::fs::write(output_path, &out)
         .map_err(|e| format!("failed to write '{}': {}", output_path, e))?;

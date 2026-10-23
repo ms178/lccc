@@ -1,41 +1,13 @@
-//! Lowering of `.cfi_*` directives into a DWARF `.eh_frame` section.
-//!
-//! GNU as turns the CFI directives of a translation unit into call frame
-//! information: one CIE per distinct set of frame conventions and one FDE per
-//! `.cfi_startproc` ... `.cfi_endproc` region. Without it no unwinder can walk
-//! through the object's code: forced unwinding (`pthread_exit`,
-//! `pthread_cancel`) stops at the first such frame so the cleanup handlers of
-//! every caller are skipped, C++ exceptions through C callbacks call
-//! `std::terminate`, and `backtrace()`/gdb/perf lose the call chain.
-//!
-//! The lowering runs on the parsed item stream, before layout:
-//!
-//! * every CFI directive is replaced by a local label marking its location
-//!   (consecutive directives with no bytes in between share one label), and
-//!   the directive is recorded as a DWARF call frame instruction;
-//! * after the last item the CIEs and FDEs are appended as ordinary data
-//!   directives in `.eh_frame`. Every location-dependent field is a label
-//!   difference (`.long end - start`, `.long start - .`), so the ELF writer
-//!   resolves it after branch relaxation exactly like hand-written
-//!   `.eh_frame` data (glibc's signal trampolines), emitting the one
-//!   `R_X86_64_PC32`/`R_386_PC32` per FDE that GNU as emits.
-//!
-//! Encoding choices match GNU as: version 1 CIE, augmentation `zR` plus `P`,
-//! `L`, `S` when requested, `DW_EH_PE_pcrel|sdata4` FDE pointers, CIE/FDE
-//! padded with `DW_CFA_nop` to the pointer size, and each location advance
-//! in its smallest form (`DW_CFA_advance_loc`, `_loc1`, `_loc2`, `_loc4`).
-//! The distance between two code labels is only known after relaxation, so
-//! an advance is an `AsmItem::CfaAdvance` that the ELF writer sizes once the
-//! code layout is final.
-//!
-//! `.cfi_sections` selecting only `.debug_frame` (the Linux kernel outside
-//! the vDSO) suppresses the output, as with GNU as when `.debug_frame` is
-//! not requested; `.debug_frame` itself is not generated.
+//! x86-64 / i386 side of the `.cfi_*` lowering into `.eh_frame`
+//! ([`crate::backend::cfi_lower`] holds the target-neutral part): register
+//! numbering, frame conventions (`call` pushes the return address, so the
+//! CIE says `CFA = sp + slot`, return address at `CFA - slot`; CIE version
+//! 1) and the item adapter. A location advance is an `AsmItem::CfaAdvance`
+//! that the ELF writer sizes after branch relaxation, in its smallest form
+//! (`DW_CFA_advance_loc`, `_loc1`, `_loc2`, `_loc4`) like GNU as.
 
 use super::parser::{AsmItem, CfiDirective, SectionDirective, parse_asm};
-use crate::backend::asm_expr;
-use crate::common::fx_hash::FxHashMap;
-use std::fmt::Write as _;
+use crate::backend::cfi_lower::{self, CfiItemKind, CfiStream, CfiTarget, SectionKey};
 
 /// Frame conventions of the target the object is assembled for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -174,66 +146,58 @@ impl CfiArch {
     }
 }
 
-/// Personality / LSDA pointer: DW_EH_PE encoding plus symbol.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-struct EncodedPtr {
-    enc: u8,
-    sym: String,
+impl CfiArch {
+    /// The frame conventions GNU as encodes for this target.
+    pub(crate) fn target(self) -> CfiTarget {
+        CfiTarget {
+            ptr_size: self.ptr_size(),
+            code_align: 1,
+            data_align: self.data_align(),
+            default_ra_column: self.default_ra_column(),
+            sp_column: self.sp_column(),
+            entry_cfa_offset: self.slot(),
+            ra_saved_at_entry: true,
+            cie_version: None,
+            pcrel_item: false,
+            dwarf_reg: match self {
+                CfiArch::X86_64 => |r| CfiArch::X86_64.dwarf_reg(r).ok(),
+                CfiArch::I386 => |r| CfiArch::I386.dwarf_reg(r).ok(),
+            },
+        }
+    }
 }
-
-/// Everything that decides which CIE an FDE refers to.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-struct CieKey {
-    simple: bool,
-    signal_frame: bool,
-    ra_column: u64,
-    personality: Option<EncodedPtr>,
-    lsda_enc: Option<u8>,
-}
-
-struct Fde {
-    start: String,
-    end: String,
-    cie: CieKey,
-    lsda: Option<EncodedPtr>,
-    /// (location label, encoded instruction bytes as `.byte` operands)
-    insns: Vec<(String, Vec<InsnPart>)>,
-}
-
-/// One piece of an encoded call frame instruction.
-#[derive(Clone, Debug)]
-enum InsnPart {
-    Byte(u8),
-    Uleb(u64),
-    Sleb(i64),
-}
-
-struct OpenFde {
-    start: String,
-    section: SectionKey,
-    simple: bool,
-    signal_frame: bool,
-    ra_column: u64,
-    personality: Option<EncodedPtr>,
-    lsda: Option<EncodedPtr>,
-    insns: Vec<(String, Vec<InsnPart>)>,
-    /// Tracked CFA offset (for `.cfi_adjust_cfa_offset`/`.cfi_rel_offset`).
-    cfa_offset: i64,
-    saved_cfa_offsets: Vec<i64>,
-}
-
-type SectionKey = (String, Option<String>);
 
 fn section_key(dir: &SectionDirective) -> SectionKey {
     (dir.name.clone(), dir.comdat_group.clone())
 }
 
-/// Items that never emit bytes: a CFI location label placed before them
-/// still marks the same address as one placed after them.
-fn emits_no_bytes(item: &AsmItem) -> bool {
-    matches!(
-        item,
-        AsmItem::Label(_)
+impl CfiStream for AsmItem {
+    fn cfi_kind(&self) -> CfiItemKind {
+        match self {
+            AsmItem::Section(dir) => CfiItemKind::Section(section_key(dir)),
+            AsmItem::PushSection(dir) => CfiItemKind::PushSection(section_key(dir)),
+            AsmItem::PopSection => CfiItemKind::PopSection,
+            AsmItem::Previous => CfiItemKind::Previous,
+            AsmItem::Cfi(dir) => {
+                let (name, args): (&str, String) = match dir {
+                    CfiDirective::StartProc => (".cfi_startproc", String::new()),
+                    CfiDirective::EndProc => (".cfi_endproc", String::new()),
+                    CfiDirective::DefCfaOffset(v) => (".cfi_def_cfa_offset", v.to_string()),
+                    CfiDirective::DefCfaRegister(r) => (".cfi_def_cfa_register", r.clone()),
+                    CfiDirective::Offset(r, v) => (".cfi_offset", format!("{}, {}", r, v)),
+                    CfiDirective::Other(line) => {
+                        let t = line.trim();
+                        match t.find(char::is_whitespace) {
+                            Some(i) => (&t[..i], t[i..].trim().to_string()),
+                            None => (t, String::new()),
+                        }
+                    }
+                };
+                CfiItemKind::Cfi(name.to_string(), args)
+            }
+            // Items that never emit bytes: a CFI location label placed
+            // before them still marks the same address as one after them.
+            AsmItem::Label(_)
             | AsmItem::Global(_)
             | AsmItem::Weak(_)
             | AsmItem::Hidden(_)
@@ -241,586 +205,44 @@ fn emits_no_bytes(item: &AsmItem) -> bool {
             | AsmItem::Internal(_)
             | AsmItem::SymbolType(_, _)
             | AsmItem::Size(_, _)
-            | AsmItem::Cfi(_)
             | AsmItem::File(_, _)
             | AsmItem::Loc(_, _, _)
             | AsmItem::OptionDirective(_)
             | AsmItem::Symver(_, _, _)
             | AsmItem::Set(_, _)
-            | AsmItem::Empty
-    )
-}
-
-fn parse_int(s: &str) -> Result<i64, String> {
-    asm_expr::parse_integer_expr(s.trim())
-        .map_err(|_| format!("bad expression `{}` in CFI directive", s.trim()))
-}
-
-fn split_args(args: &str) -> Vec<&str> {
-    if args.trim().is_empty() {
-        Vec::new()
-    } else {
-        args.split(',').map(str::trim).collect()
+            | AsmItem::Empty => CfiItemKind::NoBytes,
+            _ => CfiItemKind::Bytes,
+        }
     }
-}
-
-fn factored(off: i64, align: i64, what: &str) -> Result<i64, String> {
-    if off % align != 0 {
-        return Err(format!(
-            "{} offset {} is not a multiple of the data alignment {}",
-            what, off, align
-        ));
+    fn as_label(&self) -> Option<&str> {
+        match self {
+            AsmItem::Label(l) => Some(l),
+            _ => None,
+        }
     }
-    Ok(off / align)
-}
-
-fn encode_offset(reg: u64, off: i64, arch: CfiArch) -> Result<Vec<InsnPart>, String> {
-    let f = factored(off, arch.data_align(), ".cfi_offset")?;
-    Ok(if f >= 0 && reg < 64 {
-        vec![InsnPart::Byte(0x80 | reg as u8), InsnPart::Uleb(f as u64)]
-    } else if f >= 0 {
-        // DW_CFA_offset_extended
-        vec![
-            InsnPart::Byte(0x05),
-            InsnPart::Uleb(reg),
-            InsnPart::Uleb(f as u64),
-        ]
-    } else {
-        // DW_CFA_offset_extended_sf
-        vec![InsnPart::Byte(0x11), InsnPart::Uleb(reg), InsnPart::Sleb(f)]
-    })
-}
-
-fn encode_def_cfa_offset(off: i64, arch: CfiArch) -> Result<Vec<InsnPart>, String> {
-    Ok(if off >= 0 {
-        vec![InsnPart::Byte(0x0e), InsnPart::Uleb(off as u64)]
-    } else {
-        // DW_CFA_def_cfa_offset_sf takes a factored operand.
-        let f = factored(off, arch.data_align(), ".cfi_def_cfa_offset")?;
-        vec![InsnPart::Byte(0x13), InsnPart::Sleb(f)]
-    })
-}
-
-fn parse_encoded_ptr(args: &str, what: &str) -> Result<Option<EncodedPtr>, String> {
-    let parts = split_args(args);
-    let enc = parts
-        .first()
-        .ok_or_else(|| format!("{} requires an encoding", what))
-        .and_then(|e| parse_int(e))?;
-    if enc == 0xff {
-        return Ok(None); // DW_EH_PE_omit
+    fn label(name: String) -> Self {
+        AsmItem::Label(name)
     }
-    let enc = u8::try_from(enc).map_err(|_| format!("invalid {} encoding {}", what, enc))?;
-    // Only the pointer forms an unwinder decodes without extra context:
-    // absptr/udata/sdata (2/4/8 bytes), absolute or pc-relative, optionally
-    // indirect. GNU as rejects the same set it cannot express.
-    let format_ok = matches!(enc & 0x0f, 0x00 | 0x02 | 0x03 | 0x04 | 0x0a | 0x0b | 0x0c);
-    let app_ok = matches!(enc & 0x70, 0x00 | 0x10);
-    if !format_ok || !app_ok {
-        return Err(format!("unsupported {} encoding {:#x}", what, enc));
+    fn parse(text: &str) -> Result<Vec<Self>, String> {
+        parse_asm(text)
     }
-    let sym = parts
-        .get(1)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| format!("{} requires a symbol", what))?;
-    Ok(Some(EncodedPtr {
-        enc,
-        sym: sym.to_string(),
-    }))
-}
-
-fn encoded_ptr_size(enc: u8, arch: CfiArch) -> i64 {
-    match enc & 0x0f {
-        0x00 => arch.ptr_size(),
-        0x02 | 0x0a => 2,
-        0x03 | 0x0b => 4,
-        _ => 8,
+    /// The distance between two code labels is only known after branch
+    /// relaxation; the ELF writer sizes the advance once the layout is final.
+    fn advance(from: String, to: String) -> Self {
+        AsmItem::CfaAdvance { from, to }
     }
-}
-
-/// Emit one encoded pointer as a data directive.
-fn write_encoded_ptr(out: &mut String, p: &EncodedPtr, arch: CfiArch) {
-    let dir = match encoded_ptr_size(p.enc, arch) {
-        2 => ".short",
-        4 => ".long",
-        _ => ".quad",
-    };
-    if p.enc & 0x70 == 0x10 {
-        let _ = writeln!(out, "{} {} - .", dir, p.sym);
-    } else {
-        let _ = writeln!(out, "{} {}", dir, p.sym);
-    }
-}
-
-fn write_insn(out: &mut String, parts: &[InsnPart]) {
-    for p in parts {
-        let _ = match p {
-            InsnPart::Byte(b) => writeln!(out, ".byte {:#x}", b),
-            InsnPart::Uleb(v) => writeln!(out, ".uleb128 {}", v),
-            InsnPart::Sleb(v) => writeln!(out, ".sleb128 {}", v),
-        };
+    fn pcrel32(sym: String) -> Result<Self, String> {
+        Err(format!(
+            "internal .eh_frame lowering: x86 references `{}` as `.long {} - .`",
+            sym, sym
+        ))
     }
 }
 
 /// Replace the CFI directives of `items` by location labels and append the
-/// `.eh_frame` data they describe.
+/// `.eh_frame` data they describe (see [`crate::backend::cfi_lower`]).
 pub fn lower_cfi(items: Vec<AsmItem>, arch: CfiArch) -> Result<Vec<AsmItem>, String> {
-    if !items.iter().any(|i| matches!(i, AsmItem::Cfi(_))) {
-        return Ok(items);
-    }
-    let mut out: Vec<AsmItem> = Vec::with_capacity(items.len() + 16);
-    let mut fdes: Vec<Fde> = Vec::new();
-    let mut open: Option<OpenFde> = None;
-    let mut emit_eh_frame = true;
-    let mut label_seq = 0usize;
-    // Label naming the current location, valid while no byte-emitting item
-    // has been seen since it was placed.
-    let mut here: Option<String> = None;
-    let mut cur_section: Option<SectionKey> = Some((".text".to_string(), None));
-    let mut prev_section: Option<SectionKey> = None;
-    let mut section_stack: Vec<(Option<SectionKey>, Option<SectionKey>)> = Vec::new();
-
-    let new_label = |label_seq: &mut usize| {
-        let l = format!(".L__lccc_cfi{}", *label_seq);
-        *label_seq += 1;
-        l
-    };
-
-    for item in items {
-        match &item {
-            AsmItem::Section(dir) => {
-                prev_section = cur_section.take();
-                cur_section = Some(section_key(dir));
-            }
-            AsmItem::PushSection(dir) => {
-                section_stack.push((cur_section.clone(), prev_section.clone()));
-                prev_section = cur_section.take();
-                cur_section = Some(section_key(dir));
-            }
-            AsmItem::PopSection => {
-                if let Some((c, p)) = section_stack.pop() {
-                    cur_section = c;
-                    prev_section = p;
-                }
-            }
-            AsmItem::Previous => std::mem::swap(&mut cur_section, &mut prev_section),
-            _ => {}
-        }
-        let AsmItem::Cfi(dir) = item else {
-            if !emits_no_bytes(&item) {
-                here = None;
-            }
-            out.push(item);
-            continue;
-        };
-
-        // Location label for this directive.
-        let loc = match &here {
-            Some(l) => l.clone(),
-            None => {
-                let l = new_label(&mut label_seq);
-                out.push(AsmItem::Label(l.clone()));
-                here = Some(l.clone());
-                l
-            }
-        };
-
-        let (name, args): (String, String) = match &dir {
-            CfiDirective::StartProc => (".cfi_startproc".into(), String::new()),
-            CfiDirective::EndProc => (".cfi_endproc".into(), String::new()),
-            CfiDirective::DefCfaOffset(v) => (".cfi_def_cfa_offset".into(), v.to_string()),
-            CfiDirective::DefCfaRegister(r) => (".cfi_def_cfa_register".into(), r.clone()),
-            CfiDirective::Offset(r, v) => (".cfi_offset".into(), format!("{}, {}", r, v)),
-            CfiDirective::Other(line) => {
-                let t = line.trim();
-                match t.find(char::is_whitespace) {
-                    Some(i) => (t[..i].to_string(), t[i..].trim().to_string()),
-                    None => (t.to_string(), String::new()),
-                }
-            }
-        };
-        let name = name.as_str();
-
-        match name {
-            ".cfi_sections" => {
-                emit_eh_frame = split_args(&args).iter().any(|s| *s == ".eh_frame");
-                continue;
-            }
-            ".cfi_startproc" => {
-                if open.is_some() {
-                    return Err(".cfi_startproc without matching .cfi_endproc".to_string());
-                }
-                let simple = match args.trim() {
-                    "" => false,
-                    "simple" => true,
-                    other => return Err(format!("junk at end of .cfi_startproc: `{}`", other)),
-                };
-                let section = cur_section
-                    .clone()
-                    .ok_or_else(|| ".cfi_startproc outside any section".to_string())?;
-                open = Some(OpenFde {
-                    start: loc,
-                    section,
-                    simple,
-                    signal_frame: false,
-                    ra_column: arch.default_ra_column(),
-                    personality: None,
-                    lsda: None,
-                    insns: Vec::new(),
-                    cfa_offset: if simple { 0 } else { arch.ptr_size() },
-                    saved_cfa_offsets: Vec::new(),
-                });
-                continue;
-            }
-            _ => {}
-        }
-
-        let Some(f) = open.as_mut() else {
-            return Err(format!(
-                "CFI instruction used without previous .cfi_startproc: {}",
-                name
-            ));
-        };
-        if cur_section.as_ref() != Some(&f.section) {
-            return Err(format!(
-                "{} in section {} but the enclosing .cfi_startproc is in {}",
-                name,
-                cur_section.as_ref().map_or("<none>", |s| s.0.as_str()),
-                f.section.0
-            ));
-        }
-        if name == ".cfi_endproc" {
-            if !args.trim().is_empty() {
-                return Err(format!("junk at end of .cfi_endproc: `{}`", args.trim()));
-            }
-            let f = open.take().expect("checked above");
-            fdes.push(Fde {
-                start: f.start,
-                end: loc,
-                cie: CieKey {
-                    simple: f.simple,
-                    signal_frame: f.signal_frame,
-                    ra_column: f.ra_column,
-                    lsda_enc: f.lsda.as_ref().map(|l| l.enc),
-                    personality: f.personality,
-                },
-                lsda: f.lsda,
-                insns: f.insns,
-            });
-            continue;
-        }
-        let a = split_args(&args);
-        let need = |n: usize| -> Result<(), String> {
-            if a.len() == n {
-                Ok(())
-            } else {
-                Err(format!("{} expects {} operand(s), got `{}`", name, n, args))
-            }
-        };
-        let insn: Vec<InsnPart> = match name {
-            ".cfi_def_cfa" => {
-                need(2)?;
-                let reg = arch.dwarf_reg(a[0])?;
-                let off = parse_int(a[1])?;
-                f.cfa_offset = off;
-                if off >= 0 {
-                    vec![
-                        InsnPart::Byte(0x0c),
-                        InsnPart::Uleb(reg),
-                        InsnPart::Uleb(off as u64),
-                    ]
-                } else {
-                    let fo = factored(off, arch.data_align(), name)?;
-                    vec![
-                        InsnPart::Byte(0x12),
-                        InsnPart::Uleb(reg),
-                        InsnPart::Sleb(fo),
-                    ]
-                }
-            }
-            ".cfi_def_cfa_offset" => {
-                need(1)?;
-                let off = parse_int(a[0])?;
-                f.cfa_offset = off;
-                encode_def_cfa_offset(off, arch)?
-            }
-            ".cfi_adjust_cfa_offset" => {
-                need(1)?;
-                f.cfa_offset += parse_int(a[0])?;
-                encode_def_cfa_offset(f.cfa_offset, arch)?
-            }
-            ".cfi_def_cfa_register" => {
-                need(1)?;
-                vec![InsnPart::Byte(0x0d), InsnPart::Uleb(arch.dwarf_reg(a[0])?)]
-            }
-            ".cfi_offset" => {
-                need(2)?;
-                encode_offset(arch.dwarf_reg(a[0])?, parse_int(a[1])?, arch)?
-            }
-            ".cfi_rel_offset" => {
-                // Offset relative to the CFA register's current value, which
-                // sits `cfa_offset` bytes below the CFA.
-                need(2)?;
-                let off = parse_int(a[1])? - f.cfa_offset;
-                encode_offset(arch.dwarf_reg(a[0])?, off, arch)?
-            }
-            ".cfi_val_offset" => {
-                need(2)?;
-                let reg = arch.dwarf_reg(a[0])?;
-                let fo = factored(parse_int(a[1])?, arch.data_align(), name)?;
-                if fo >= 0 {
-                    vec![
-                        InsnPart::Byte(0x14),
-                        InsnPart::Uleb(reg),
-                        InsnPart::Uleb(fo as u64),
-                    ]
-                } else {
-                    vec![
-                        InsnPart::Byte(0x15),
-                        InsnPart::Uleb(reg),
-                        InsnPart::Sleb(fo),
-                    ]
-                }
-            }
-            ".cfi_register" => {
-                need(2)?;
-                vec![
-                    InsnPart::Byte(0x09),
-                    InsnPart::Uleb(arch.dwarf_reg(a[0])?),
-                    InsnPart::Uleb(arch.dwarf_reg(a[1])?),
-                ]
-            }
-            ".cfi_restore" => {
-                if a.is_empty() {
-                    return Err(".cfi_restore expects register operand(s)".to_string());
-                }
-                let mut v = Vec::new();
-                for r in &a {
-                    let reg = arch.dwarf_reg(r)?;
-                    if reg < 64 {
-                        v.push(InsnPart::Byte(0xc0 | reg as u8));
-                    } else {
-                        v.extend([InsnPart::Byte(0x06), InsnPart::Uleb(reg)]);
-                    }
-                }
-                v
-            }
-            ".cfi_undefined" | ".cfi_same_value" => {
-                if a.is_empty() {
-                    return Err(format!("{} expects register operand(s)", name));
-                }
-                let op = if name == ".cfi_undefined" { 0x07 } else { 0x08 };
-                let mut v = Vec::new();
-                for r in &a {
-                    v.extend([InsnPart::Byte(op), InsnPart::Uleb(arch.dwarf_reg(r)?)]);
-                }
-                v
-            }
-            ".cfi_remember_state" => {
-                need(0)?;
-                f.saved_cfa_offsets.push(f.cfa_offset);
-                vec![InsnPart::Byte(0x0a)]
-            }
-            ".cfi_restore_state" => {
-                need(0)?;
-                f.cfa_offset = f
-                    .saved_cfa_offsets
-                    .pop()
-                    .ok_or_else(|| ".cfi_restore_state without .cfi_remember_state".to_string())?;
-                vec![InsnPart::Byte(0x0b)]
-            }
-            ".cfi_escape" => {
-                if a.is_empty() {
-                    return Err(".cfi_escape expects byte operand(s)".to_string());
-                }
-                let mut v = Vec::new();
-                for b in &a {
-                    let x = parse_int(b)?;
-                    let byte = u8::try_from(x & 0xff)
-                        .map_err(|_| format!("bad .cfi_escape byte `{}`", b))?;
-                    v.push(InsnPart::Byte(byte));
-                }
-                v
-            }
-            ".cfi_signal_frame" => {
-                need(0)?;
-                f.signal_frame = true;
-                continue;
-            }
-            ".cfi_return_column" => {
-                need(1)?;
-                f.ra_column = arch.dwarf_reg(a[0])?;
-                continue;
-            }
-            ".cfi_personality" => {
-                f.personality = parse_encoded_ptr(&args, name)?;
-                continue;
-            }
-            ".cfi_lsda" => {
-                f.lsda = parse_encoded_ptr(&args, name)?;
-                continue;
-            }
-            ".cfi_label" => {
-                need(1)?;
-                out.push(AsmItem::Label(a[0].to_string()));
-                continue;
-            }
-            other => {
-                // Non-x86 or never-emitted forms (.cfi_window_save,
-                // .cfi_val_encoded_addr, .cfi_personality_id, ...): refuse
-                // loudly instead of writing unwind info that lies.
-                return Err(format!("unsupported CFI directive {}", other));
-            }
-        };
-        f.insns.push((loc, insn));
-    }
-
-    if open.is_some() {
-        return Err("open CFI at the end of file; missing .cfi_endproc directive".to_string());
-    }
-    if !emit_eh_frame || fdes.is_empty() {
-        return Ok(out);
-    }
-    let (text, advances) = render_eh_frame(&fdes, arch);
-    let parsed = parse_asm(&text).map_err(|e| format!("internal .eh_frame lowering: {}", e))?;
-    for item in parsed {
-        match item {
-            AsmItem::Label(l) if l.starts_with(ADVANCE_MARK) => {
-                let (from, to) = advances[l[ADVANCE_MARK.len()..]
-                    .parse::<usize>()
-                    .map_err(|_| format!("internal .eh_frame lowering: bad marker {}", l))?]
-                .clone();
-                out.push(AsmItem::CfaAdvance { from, to });
-            }
-            other => out.push(other),
-        }
-    }
-    Ok(out)
-}
-
-/// Stands for the location advance with the given index in the rendered
-/// `.eh_frame` text; replaced by `AsmItem::CfaAdvance` after parsing. In the
-/// lowering's own reserved `.L__lccc_cfi*` label namespace.
-const ADVANCE_MARK: &str = ".L__lccc_cfi_adv";
-
-/// Render the `.eh_frame` section as assembler text, with each location
-/// advance as an `ADVANCE_MARK<n>:` label; `n` indexes the returned
-/// `(from, to)` label pairs.
-///
-/// Layout as GNU as's `cfi_finish`: each CIE right before the first FDE
-/// that uses it, CIEs and FDEs padded with `DW_CFA_nop` to 4 bytes (the
-/// size of every field they hold), and only the last FDE to the pointer
-/// size, which also gives the section its alignment. Nothing is padded in
-/// front of the first entry: hand-written `.eh_frame` data earlier in the
-/// file (glibc's signal-restorer asm) must not be followed by zero bytes,
-/// which an unwinder reads as the terminator.
-fn render_eh_frame(fdes: &[Fde], arch: CfiArch) -> (String, Vec<(String, String)>) {
-    let mut advances: Vec<(String, String)> = Vec::new();
-    let last_align_log2 = if arch == CfiArch::X86_64 { 3 } else { 2 };
-    let mut s = String::new();
-    let _ = writeln!(s, ".section .eh_frame,\"a\",@progbits");
-
-    let mut cies: FxHashMap<CieKey, String> = FxHashMap::default();
-    for (i, f) in fdes.iter().enumerate() {
-        if !cies.contains_key(&f.cie) {
-            let l = format!(".L__lccc_cie{}", cies.len());
-            write_cie(&mut s, &l, &f.cie, arch);
-            cies.insert(f.cie.clone(), l);
-        }
-        let l = format!(".L__lccc_fde{}", i);
-        let _ = writeln!(s, "{}:", l);
-        let _ = writeln!(s, ".long {}_end - {}_body", l, l);
-        let _ = writeln!(s, "{}_body:", l);
-        // CIE pointer: distance from this field back to the CIE's start.
-        let _ = writeln!(s, ".long {}_body - {}", l, cies[&f.cie]);
-        let _ = writeln!(s, ".long {} - .", f.start);
-        let _ = writeln!(s, ".long {} - {}", f.end, f.start);
-        match &f.lsda {
-            Some(p) => {
-                let _ = writeln!(s, ".uleb128 {}", encoded_ptr_size(p.enc, arch));
-                write_encoded_ptr(&mut s, p, arch);
-            }
-            None => {
-                let _ = writeln!(s, ".uleb128 0");
-            }
-        }
-        let mut prev = f.start.as_str();
-        for (loc, parts) in &f.insns {
-            if loc != prev {
-                let _ = writeln!(s, "{}{}:", ADVANCE_MARK, advances.len());
-                advances.push((prev.to_string(), loc.clone()));
-                prev = loc;
-            }
-            write_insn(&mut s, parts);
-        }
-        let align_log2 = if i + 1 == fdes.len() {
-            last_align_log2
-        } else {
-            2
-        };
-        let _ = writeln!(s, ".p2align {}", align_log2);
-        let _ = writeln!(s, "{}_end:", l);
-    }
-    (s, advances)
-}
-
-fn write_cie(s: &mut String, l: &str, key: &CieKey, arch: CfiArch) {
-    let mut aug = String::from("z");
-    let mut aug_len = 0i64;
-    if let Some(p) = &key.personality {
-        aug.push('P');
-        aug_len += 1 + encoded_ptr_size(p.enc, arch);
-    }
-    if key.lsda_enc.is_some() {
-        aug.push('L');
-        aug_len += 1;
-    }
-    aug.push('R');
-    aug_len += 1;
-    if key.signal_frame {
-        aug.push('S');
-    }
-    let _ = writeln!(s, "{}:", l);
-    let _ = writeln!(s, ".long {}_end - {}_body", l, l);
-    let _ = writeln!(s, "{}_body:", l);
-    let _ = writeln!(s, ".long 0");
-    // Version 1 stores the return column in one byte; version 3 (GNU as
-    // behaviour for columns > 255) uses ULEB128.
-    let version = if key.ra_column > 255 { 3 } else { 1 };
-    let _ = writeln!(s, ".byte {}", version);
-    let _ = writeln!(s, ".asciz \"{}\"", aug);
-    let _ = writeln!(s, ".uleb128 1");
-    let _ = writeln!(s, ".sleb128 {}", arch.data_align());
-    if version == 1 {
-        let _ = writeln!(s, ".byte {}", key.ra_column);
-    } else {
-        let _ = writeln!(s, ".uleb128 {}", key.ra_column);
-    }
-    let _ = writeln!(s, ".uleb128 {}", aug_len);
-    if let Some(p) = &key.personality {
-        let _ = writeln!(s, ".byte {:#x}", p.enc);
-        write_encoded_ptr(s, p, arch);
-    }
-    if let Some(enc) = key.lsda_enc {
-        let _ = writeln!(s, ".byte {:#x}", enc);
-    }
-    let _ = writeln!(s, ".byte 0x1b"); // FDE pointers: pcrel | sdata4
-    if !key.simple {
-        // CFA = sp + ptr_size; return address saved at CFA - ptr_size.
-        write_insn(
-            s,
-            &[
-                InsnPart::Byte(0x0c),
-                InsnPart::Uleb(arch.sp_column()),
-                InsnPart::Uleb(arch.ptr_size() as u64),
-            ],
-        );
-        if let Ok(parts) = encode_offset(key.ra_column, arch.data_align(), arch) {
-            write_insn(s, &parts);
-        }
-    }
-    let _ = writeln!(s, ".p2align 2");
-    let _ = writeln!(s, "{}_end:", l);
+    cfi_lower::lower_cfi(items, &arch.target())
 }
 
 #[cfg(test)]

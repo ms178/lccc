@@ -25,7 +25,8 @@ use crate::common::fx_hash::{FxHashMap, FxHashSet};
 /// `output_path`: path for the output executable
 /// `user_args`: additional linker flags from the user
 /// `lib_paths`: pre-resolved library search paths (user -L first, then system)
-/// `needed_libs`: pre-resolved default libraries (e.g., ["gcc", "gcc_s", "c", "m"])
+/// `needed_libs_default`: the driver's default libraries (e.g., ["gcc", "gcc_s", "c", "m"]),
+///   searched after the user's `-l` libraries
 /// `crt_objects_before`: CRT objects to link before user objects (e.g., crt1.o, crti.o, crtbegin.o)
 /// `crt_objects_after`: CRT objects to link after user objects (e.g., crtend.o, crtn.o)
 pub fn link_builtin(
@@ -33,12 +34,13 @@ pub fn link_builtin(
     output_path: &str,
     user_args: &[String],
     lib_paths: &[&str],
-    needed_libs: &[&str],
+    needed_libs_default: &[&str],
     crt_objects_before: &[&str],
     crt_objects_after: &[&str],
 ) -> Result<(), String> {
     // Parse user arguments using shared infrastructure
     let parsed_args = linker_common::parse_linker_args(user_args);
+    let rpath = linker_common::rpath_dyn_entry(&parsed_args);
     let is_static = parsed_args.is_static;
     let defsym_defs = parsed_args.defsym_defs;
 
@@ -51,19 +53,23 @@ pub fn link_builtin(
         all_inputs.push(obj.to_string());
     }
     all_inputs.extend(parsed_args.extra_object_files);
-    for crt in crt_objects_after {
-        all_inputs.push(crt.to_string());
-    }
 
-    // Merge pre-resolved library search paths with any extra -L paths from args
-    let mut lib_search_paths: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
-    for p in parsed_args.extra_lib_paths {
-        if !lib_search_paths.contains(&p) {
-            lib_search_paths.push(p);
+    // The user's -L directories, then the driver's: GNU ld searches -L first
+    // (pre-fix the driver's came first, so a library the user supplied with
+    // -L lost to a system copy of the same name).
+    let mut lib_search_paths: Vec<String> = parsed_args.extra_lib_paths;
+    for p in lib_paths {
+        if !lib_search_paths.iter().any(|q| q == p) {
+            lib_search_paths.push(p.to_string());
         }
     }
-    let mut needed_libs: Vec<String> = needed_libs.iter().map(|s| s.to_string()).collect();
-    needed_libs.extend(parsed_args.libs_to_load);
+    // gcc's order: the user's `-l` libraries, then the defaults. DT_NEEDED
+    // follows it, and with it the loader's symbol search order -- a user
+    // library interposing a libc function must come first.
+    let mut needed_libs: Vec<String> = parsed_args.libs_to_load;
+    linker_common::require_libs(&needed_libs, &lib_search_paths, is_static)?;
+    let implicit_from = needed_libs.len();
+    needed_libs.extend(needed_libs_default.iter().map(|s| s.to_string()));
 
     // ── Phase 1: Load inputs, discover shared libs, resolve archives ────
 
@@ -81,22 +87,26 @@ pub fn link_builtin(
     let mut undefined_syms: FxHashSet<String> = FxHashSet::default();
     input::collect_initial_symbols(&input_objs, &mut defined_syms, &mut undefined_syms);
 
-    let mut shared_lib_syms: FxHashMap<String, DynSymbol> = FxHashMap::default();
+    let mut shared_lib_syms = input::SharedLibSyms::default();
     let mut actual_needed_libs: Vec<String> = Vec::new();
     if !is_static {
+        // Positionally-named .so inputs (./libfoo.so on the command line):
+        // same NEEDED/symbol treatment as -l-discovered libraries.  They
+        // precede the driver's implicit `-lc` on every command line, so they
+        // are registered first: the first provider of a name binds it and
+        // DT_NEEDED follows link order, as with GNU ld.
+        input::register_positional_shared_libs(
+            &positional_shared_libs,
+            &mut shared_lib_syms,
+            &mut actual_needed_libs,
+        );
         input::discover_shared_lib_symbols(
             &needed_libs,
+            implicit_from,
             &lib_search_paths,
             &mut input_objs,
             &mut defined_syms,
             &mut undefined_syms,
-            &mut shared_lib_syms,
-            &mut actual_needed_libs,
-        );
-        // Positionally-named .so inputs (./libfoo.so on the command line):
-        // same NEEDED/symbol treatment as -l-discovered libraries.
-        input::register_positional_shared_libs(
-            &positional_shared_libs,
             &mut shared_lib_syms,
             &mut actual_needed_libs,
         );
@@ -115,6 +125,7 @@ pub fn link_builtin(
     input::resolve_archives(
         &inline_archive_paths,
         &needed_libs,
+        is_static,
         &lib_search_paths,
         &mut input_objs,
         &mut defined_syms,
@@ -128,6 +139,10 @@ pub fn link_builtin(
             undefined_syms.insert(s);
         }
     }
+    // crtend*.o/crtn.o close the link after every library member, as in
+    // gcc's spec: crtend's zero terminator ends `.eh_frame` (libgcc's linear
+    // FDE search stops there) and crtn's epilogue ends `.init`/`.fini`.
+    load_trailing_crt_objects(crt_objects_after, &mut input_objs)?;
 
     // ── Phase 2: Merge sections ─────────────────────────────────────────
 
@@ -152,15 +167,28 @@ pub fn link_builtin(
         &mut merged_map,
     );
 
+    // `--defsym ALIAS=TARGET` with an object-defined TARGET makes ALIAS a
+    // local definition BEFORE dynamic classification, as GNU ld resolves it:
+    // a reference to ALIAS must bind to TARGET, never to a same-named
+    // shared-library import (`--defsym=sqrt=test_sqrt` used to keep a
+    // `sqrt@GLIBC` JUMP_SLOT -- a crash without -lm, the wrong function
+    // with it).
+    for (alias, target) in &defsym_defs {
+        if let Some(target_sym) = global_syms.get(target).filter(|s| s.defined).cloned() {
+            global_syms.insert(alias.clone(), target_sym);
+        }
+    }
+
     let (plt_symbols, copy_symbols) = if !is_static {
         symbols::mark_plt_and_copy_symbols(&mut global_syms, &shared_lib_syms)
     } else {
         (Vec::new(), Vec::new())
     };
 
-    // Apply --defsym definitions: alias one symbol to another
+    // An alias of a shared-library symbol takes the classified import (its
+    // PLT/copy slot), so it is applied after classification.
     for (alias, target) in &defsym_defs {
-        if let Some(target_sym) = global_syms.get(target).cloned() {
+        if let Some(target_sym) = global_syms.get(target).filter(|s| !s.defined).cloned() {
             global_syms.insert(alias.clone(), target_sym);
         }
     }
@@ -196,6 +224,8 @@ pub fn link_builtin(
         &copy_symbols,
         &sec_indices,
         &actual_needed_libs,
+        &shared_lib_syms,
+        rpath.as_ref(),
         is_static,
         output_path,
     )
@@ -207,91 +237,106 @@ pub fn link_builtin(
 ///
 /// Produces an ET_DYN ELF with base address 0 (position-independent).
 /// All defined global symbols are exported to .dynsym.
+///
+/// `crt_objects_before`/`crt_objects_after` and `implicit_libs` are gcc's
+/// `-shared` spec as resolved by the driver (`crti.o crtbeginS.o ...
+/// crtendS.o crtn.o`, `-lgcc --as-needed -lgcc_s -lc`); inputs go through
+/// the same loading, archive-member extraction, linker-script and
+/// DT_NEEDED logic as executables. (Pre-fix the shared path linked no
+/// startup objects -- no `__dso_handle`, so `atexit` from libc_nonshared.a
+/// was unresolvable -- recorded DT_NEEDED only for user `-l` ELF objects
+/// (`-lc`, a linker script, recorded nothing, and `_Unwind_*` from
+/// libgcc_s.so.1 never: "undefined symbol: _Unwind_Backtrace" at load
+/// time), pulled every member of an archive, and dropped `-rpath`.)
 pub fn link_shared(
     object_files: &[&str],
     output_path: &str,
     user_args: &[String],
     lib_paths: &[&str],
+    crt_objects_before: &[&str],
+    crt_objects_after: &[&str],
+    implicit_libs: &[&str],
 ) -> Result<(), String> {
-    let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
+    let parsed_args = linker_common::parse_linker_args(user_args);
+    let rpath = linker_common::rpath_dyn_entry(&parsed_args);
 
-    // Parse user args for -L, -l, -Wl,-soname=, bare .o/.a files
-    let mut extra_lib_paths: Vec<String> = Vec::new();
-    let mut libs_to_load: Vec<String> = Vec::new();
-    let mut extra_object_files: Vec<String> = Vec::new();
-    let mut soname: Option<String> = None;
-    let mut i = 0;
-    let args: Vec<&str> = user_args.iter().map(|s| s.as_str()).collect();
-    while i < args.len() {
-        let arg = args[i];
-        if let Some(path) = arg.strip_prefix("-L") {
-            let p = if path.is_empty() && i + 1 < args.len() {
-                i += 1;
-                args[i]
-            } else {
-                path
-            };
-            extra_lib_paths.push(p.to_string());
-        } else if let Some(lib) = arg.strip_prefix("-l") {
-            let l = if lib.is_empty() && i + 1 < args.len() {
-                i += 1;
-                args[i]
-            } else {
-                lib
-            };
-            libs_to_load.push(l.to_string());
-        } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
-            let parts: Vec<&str> = wl_arg.split(',').collect();
-            for j in 0..parts.len() {
-                if let Some(sn) = parts[j].strip_prefix("-soname=") {
-                    soname = Some(sn.to_string());
-                } else if parts[j] == "-soname" && j + 1 < parts.len() {
-                    soname = Some(parts[j + 1].to_string());
-                } else if let Some(lpath) = parts[j].strip_prefix("-L") {
-                    extra_lib_paths.push(lpath.to_string());
-                } else if let Some(lib) = parts[j].strip_prefix("-l") {
-                    libs_to_load.push(lib.to_string());
-                }
-            }
-        } else if arg == "-shared" || arg == "-nostdlib" || arg == "-o" {
-            if arg == "-o" {
-                i += 1;
-            }
-        } else if !arg.starts_with('-') && std::path::Path::new(arg).exists() {
-            extra_object_files.push(arg.to_string());
+    let mut all_inputs: Vec<String> = Vec::new();
+    all_inputs.extend(crt_objects_before.iter().map(|s| s.to_string()));
+    all_inputs.extend(object_files.iter().map(|s| s.to_string()));
+    all_inputs.extend(parsed_args.extra_object_files);
+
+    let mut lib_search_paths: Vec<String> = parsed_args.extra_lib_paths;
+    for p in lib_paths {
+        if !lib_search_paths.iter().any(|q| q == p) {
+            lib_search_paths.push(p.to_string());
         }
-        i += 1;
     }
+    let mut needed_libs: Vec<String> = parsed_args.libs_to_load;
+    linker_common::require_libs(&needed_libs, &lib_search_paths, false)?;
+    let implicit_from = needed_libs.len();
+    needed_libs.extend(implicit_libs.iter().map(|s| s.to_string()));
 
-    // ── Phase 1: Load input objects ──────────────────────────────────
+    // ── Phase 1: Load inputs, discover shared libs, resolve archives ──
 
     let mut input_objs: Vec<(String, ElfObject)> = Vec::new();
-    let mut defined_syms: FxHashSet<String> = FxHashSet::default();
-    let mut undefined_syms: FxHashSet<String> = FxHashSet::default();
-    let mut needed_sonames: Vec<String> = Vec::new();
-
-    let mut all_lib_paths: Vec<String> = extra_lib_paths;
-    all_lib_paths.extend(lib_path_strings.iter().cloned());
-
-    input::load_shared_lib_inputs(
-        object_files,
-        &extra_object_files,
+    let mut inline_archive_paths: Vec<String> = Vec::new();
+    let mut positional_shared_libs: Vec<String> = Vec::new();
+    input::load_input_files(
+        &all_inputs,
         &mut input_objs,
-        &mut defined_syms,
-        &mut undefined_syms,
+        &mut inline_archive_paths,
+        &mut positional_shared_libs,
     )?;
-    input::resolve_shared_lib_deps(
-        &libs_to_load,
-        &all_lib_paths,
-        &mut input_objs,
-        &mut defined_syms,
-        &mut undefined_syms,
-        &mut needed_sonames,
-    )?;
-
-    if input_objs.is_empty() {
+    if input_objs.is_empty() && inline_archive_paths.is_empty() {
         return Err("No input files for shared library".to_string());
     }
+
+    let mut defined_syms: FxHashSet<String> = FxHashSet::default();
+    let mut undefined_syms: FxHashSet<String> = FxHashSet::default();
+    input::collect_initial_symbols(&input_objs, &mut defined_syms, &mut undefined_syms);
+
+    let mut shared_lib_syms = input::SharedLibSyms::default();
+    let mut needed_sonames: Vec<String> = Vec::new();
+    // Positional .so inputs first: link order (see `link_builtin`).
+    input::register_positional_shared_libs(
+        &positional_shared_libs,
+        &mut shared_lib_syms,
+        &mut needed_sonames,
+    );
+    input::discover_shared_lib_symbols(
+        &needed_libs,
+        implicit_from,
+        &lib_search_paths,
+        &mut input_objs,
+        &mut defined_syms,
+        &mut undefined_syms,
+        &mut shared_lib_syms,
+        &mut needed_sonames,
+    );
+    // Symbols a shared library provides must not pull archive members.
+    let shared_defined: Vec<String> = shared_lib_syms
+        .keys()
+        .filter(|s| undefined_syms.contains(*s))
+        .cloned()
+        .collect();
+    for s in &shared_defined {
+        undefined_syms.remove(s);
+    }
+    input::resolve_archives(
+        &inline_archive_paths,
+        &needed_libs,
+        false,
+        &lib_search_paths,
+        &mut input_objs,
+        &mut defined_syms,
+        &mut undefined_syms,
+        &shared_lib_syms,
+    );
+    // crtend*.o/crtn.o close the link after every library member, as in
+    // gcc's spec: crtend's zero terminator ends `.eh_frame` (libgcc's linear
+    // FDE search stops there) and crtn's epilogue ends `.init`/`.fini`.
+    load_trailing_crt_objects(crt_objects_after, &mut input_objs)?;
+    let soname = parsed_args.soname;
 
     // ── Phase 2: Merge sections ─────────────────────────────────────
 
@@ -332,7 +377,25 @@ pub fn link_shared(
         &tls_got_symbols,
         &local_got_sym_info,
         &needed_sonames,
+        &shared_lib_syms,
         soname,
+        rpath.as_ref(),
         output_path,
     )
+}
+
+/// Append the trailing startup objects (`crtend*.o`, `crtn.o`) once archive
+/// members are resolved. They define and reference nothing a library
+/// member could need, so loading them last changes no symbol resolution.
+fn load_trailing_crt_objects(
+    crt_objects_after: &[&str],
+    input_objs: &mut Vec<(String, ElfObject)>,
+) -> Result<(), String> {
+    let paths: Vec<String> = crt_objects_after.iter().map(|s| s.to_string()).collect();
+    let (mut archives, mut shared) = (Vec::new(), Vec::new());
+    input::load_input_files(&paths, input_objs, &mut archives, &mut shared)?;
+    if let Some(p) = archives.first().or(shared.first()) {
+        return Err(format!("{p}: trailing startup file is not an object"));
+    }
+    Ok(())
 }

@@ -4605,20 +4605,17 @@ impl X86Codegen {
     //            leaq a@TPOFF(%rax), %rax      GCC:  movq %rdi, %fs:a@tpoff
     //            movq %rdi, (%rax)
     //
-    // The fold is only legal when the offset really is a link-time constant:
-    //   * NOT for shared-object output — the linker rejects
-    //     `R_X86_64_TPOFF32` for `ET_DYN` (GCC switches to the GD/IE
-    //     sequences there for exactly this reason). A PIE executable is
-    //     fine, which is why the gate is the dedicated `shared_lib` flag and
-    //     not `pic_mode`: lccc codegen defaults to PIC and links PIE.
-    //   * only for a symbol this module owns (a `static`/hidden `__thread`)
-    //     under an effective Local-Exec policy. Full PIC defaults local symbols
-    //     to Local-Dynamic, and preemptible symbols never have a link-time-
-    //     constant block offset;
-    //   * only at optimized levels — `-O0` keeps non-SSA value identities
-    //     after phi elimination, so `get_defining_instruction` may name a
-    //     definition that does not reach this access (the same restriction
-    //     the accumulator-address fast path carries).
+    // The Local-Exec fold is legal exactly when the symbol's model is
+    // Local-Exec (`common::tls`): executable code (`-fPIE`/non-PIC; never
+    // `-fPIC`/`-shared`, where the linker rejects `R_X86_64_TPOFF32` for
+    // `ET_DYN`) and a symbol that binds to this executable's definition, or an
+    // explicit `-ftls-model=`/`tls_model` request, which GCC honours the same
+    // way. Initial-Exec and descriptor accesses fold their GOT/descriptor
+    // offset into a `%fs:(%rax)` operand instead (`try_emit_tls_direct_load_impl`).
+    // Only at optimized levels — `-O0` keeps non-SSA value identities after
+    // phi elimination, so `get_defining_instruction` may name a definition
+    // that does not reach this access (the same restriction the
+    // accumulator-address fast path carries).
 
     /// Resolve `ptr` (+ `extra`) to a TLS symbol, effective model and addend,
     /// walking the bounded constant-offset GEP/Copy chain.
@@ -4627,7 +4624,10 @@ impl X86Codegen {
         ptr: u32,
         extra: i64,
     ) -> Option<(String, i64, crate::ir::reexports::TlsModel)> {
-        if self.state.disable_regalloc {
+        // Only a GlobalAddr naming a TLS symbol ends the walk with an answer,
+        // so a TU without one has no answer to find: this runs for every
+        // load and store, and most TUs never declare `_Thread_local`.
+        if self.state.disable_regalloc || self.state.tls_symbols.is_empty() {
             return None;
         }
         let mut cur = ptr;
@@ -4643,7 +4643,7 @@ impl X86Codegen {
                         if !self.state.tls_symbols.contains(name) {
                             return None;
                         }
-                        return Some((name.clone(), total, self.state.tls_model_for_symbol(name)));
+                        return Some((name.clone(), total, self.state.tls_model(name)));
                     }
                     crate::ir::reexports::Instruction::GetElementPtr { base, offset, .. } => {
                         match offset {
@@ -4671,20 +4671,11 @@ impl X86Codegen {
         None
     }
 
-    /// Resolve a legal Local-Exec direct access. Shared objects cannot carry
-    /// TPOFF32, and only definitions owned by this output have a fixed offset.
+    /// Resolve `ptr` (+ `extra`) to `(symbol, total_offset)` for a legal
+    /// Local-Exec direct access (the model alone decides, see above).
     pub(super) fn tls_local_exec_access(&self, ptr: u32, extra: i64) -> Option<(String, i64)> {
-        if self.state.shared_lib {
-            return None;
-        }
         let (name, offset, model) = self.tls_symbol_access(ptr, extra)?;
-        if model != crate::ir::reexports::TlsModel::LocalExec
-            || !(self.state.local_symbols.contains(&name)
-                || self.state.tls_definitions.contains(&name))
-        {
-            return None;
-        }
-        Some((name, offset))
+        (model == crate::ir::reexports::TlsModel::LocalExec).then_some((name, offset))
     }
 
     /// The GAS/objdump spelling of the operand: `%fs:sym@TPOFF` or

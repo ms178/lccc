@@ -1131,8 +1131,12 @@ fn gp_operands(line: &str, kind: LineKind, ret_value: bool) -> (u64, u64) {
     // the result), while a rename that merely asks "is this source dead?"
     // must not, or every copy whose source is an argument register looks live
     // at the `ret` and is rejected for no reason.
+    // A return also hands x19-x28 back to the caller (AAPCS64): the caller
+    // reads them after the `ret` as surely as it reads the result, so a
+    // rename that would leave a callee-saved register holding anything but
+    // the caller's value must see that read too.
     if ret_value && line.trim().starts_with("ret") {
-        uses |= 0xff; // x0-x7
+        uses |= 0xff | A64_CALLEE_SAVED_GP; // x0-x7, x19-x28
     }
     (uses, defs)
 }
@@ -1276,6 +1280,94 @@ impl Liveness {
     }
 }
 
+/// AAPCS64 callee-saved general registers x19-x28.
+const A64_CALLEE_SAVED_GP: u64 = 0x1ff8_0000;
+
+/// General registers `line` MAY write: an over-approximation for clobber
+/// checks.
+///
+/// `gp_operands`' definition set is a must-def -- the kill set liveness needs
+/// -- and names only the sole-mention destination of a classified move, ALU or
+/// `[sp]` load. Every other load (`ldr x0, [x1]`, both `ldp` destinations), a
+/// pre/post-index base and a store-exclusive status register are missing from
+/// it, so a transformation whose safety rests on "nothing writes this
+/// register" must ask this question instead.
+fn may_write_gp(line: &str) -> u64 {
+    fn gp(tok: &str) -> Option<u8> {
+        let r = tok
+            .strip_prefix('x')
+            .or_else(|| tok.strip_prefix('w'))?
+            .parse::<u8>()
+            .ok()?;
+        (r <= 30).then_some(r)
+    }
+    let t = line.trim();
+    let Some((m, ops)) = t.split_once(|c: char| c.is_ascii_whitespace()) else {
+        // `ret`, `nop`, barriers. A bare `svc #0` has an operand.
+        return 0;
+    };
+    if m.starts_with('.') {
+        return 0; // directive
+    }
+    let operand = |k: usize| {
+        ops.split(',')
+            .nth(k)
+            .and_then(|o| gp(o.trim()))
+            .map_or(0u64, |r| 1u64 << r)
+    };
+    let mentioned = ops
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter_map(gp)
+        .fold(0u64, |acc, r| acc | 1u64 << r);
+    // Pre-index `[xN, #i]!` and post-index `[xN], #i` write the base.
+    let mut writeback = 0u64;
+    if let Some(open) = ops.find('[') {
+        let inner = &ops[open + 1..];
+        let base = inner
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .next()
+            .and_then(gp);
+        if let (Some(b), Some(close)) = (base, inner.find(']')) {
+            let rest = inner[close + 1..].trim_start();
+            if rest.starts_with('!') || rest.starts_with(',') {
+                writeback = 1u64 << b;
+            }
+        }
+    }
+    const LSE_LOADS: [&str; 8] = [
+        "ldadd", "ldclr", "ldeor", "ldset", "ldsmax", "ldsmin", "ldumax", "ldumin",
+    ];
+    if m.starts_with("cas") || m.starts_with("swp") || LSE_LOADS.iter().any(|p| m.starts_with(p)) {
+        return mentioned; // compare/old-value registers: name them all
+    }
+    if m == "svc" {
+        return 1; // the kernel's result
+    }
+    if ["stxr", "stlxr", "stxp", "stlxp"]
+        .iter()
+        .any(|p| m.starts_with(p))
+    {
+        return operand(0) | writeback; // status register
+    }
+    if m.starts_with("st") {
+        return writeback; // plain and LSE stores write memory only
+    }
+    if ["ldp", "ldnp", "ldxp", "ldaxp"]
+        .iter()
+        .any(|p| m.starts_with(p))
+    {
+        return operand(0) | operand(1) | writeback;
+    }
+    const NO_GP_DEST: [&str; 21] = [
+        "cmp", "cmn", "tst", "ccmp", "ccmn", "fcmp", "fcmpe", "fccmp", "fccmpe", "cbz", "cbnz",
+        "tbz", "tbnz", "b", "br", "bl", "blr", "prfm", "prfum", "msr", "hint",
+    ];
+    if NO_GP_DEST.contains(&m) || m.starts_with("b.") {
+        return 0;
+    }
+    operand(0) | writeback
+}
+
 fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     fn mentions(line: &str, reg: u8) -> bool {
         line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
@@ -1340,10 +1432,29 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                 continue;
             };
             let mut ok = lv.live_after(i, src) == Some(false);
+            // Rule 4: the rename rewrites every later mention of `dst` --
+            // including the epilogue restore of a callee-saved `dst` -- so
+            // `dst` is never written again and the caller gets back whatever
+            // it held just before the copy. That is the caller's own value
+            // exactly when nothing in the entry run wrote it first (the run is
+            // straight-line from the entry, so the textual scan is exact):
+            // `mov x21, x0 ... mov x21, x22` would otherwise return the
+            // parameter in x21.
+            if ok && A64_CALLEE_SAVED_GP & (1u64 << dst) != 0 {
+                ok = !(fstart + 1..i).any(|k| {
+                    !matches!(
+                        kinds[k],
+                        LineKind::Nop | LineKind::Directive | LineKind::Label
+                    ) && (gp_operands(&lines[k], kinds[k], false).1 | may_write_gp(&lines[k]))
+                        & (1u64 << dst)
+                        != 0
+                });
+            }
             if ok {
                 for k in i + 1..fend {
                     match kinds[k] {
-                        LineKind::Nop | LineKind::Directive | LineKind::Label => {}
+                        // Deleted lines keep their text: they must not vote.
+                        LineKind::Nop | LineKind::Directive | LineKind::Label => continue,
                         // `MemOther` names every register it touches (a
                         // pre/post-indexed base is written explicitly), so the
                         // rename covers it. `Other` is an unrecognised
@@ -1405,7 +1516,19 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                         ok = false;
                         break;
                     }
-                    let defs_k = gp_operands(&lines[k], kinds[k], false).1;
+                    // May-write, not the liveness kill set: a load or an
+                    // `ldp` restore writes registers `gp_operands` does not
+                    // define.
+                    let defs_k =
+                        gp_operands(&lines[k], kinds[k], false).1 | may_write_gp(&lines[k]);
+                    // A line writing both would write `src` twice after the
+                    // rename -- `ldp x21, x22` becoming `ldp x21, x21` is
+                    // CONSTRAINED UNPREDICTABLE -- and one of the two values
+                    // is lost either way.
+                    if defs_k & (1u64 << dst) != 0 && defs_k & (1u64 << src) != 0 {
+                        ok = false;
+                        break;
+                    }
                     // Rule 2: an explicit WRITE to `src` clobbers the value
                     // that now lives there -- harmless exactly when `dst` is
                     // dead immediately afterwards. A later read of `src` is
@@ -1453,7 +1576,11 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                 if kinds[k] == LineKind::Nop {
                     continue;
                 }
-                let new = replace_whole_word(&replace_whole_word(&lines[k], &dx, &sx), &dw, &sw);
+                let new = rename_register_operand(
+                    &rename_register_operand(&lines[k], &dx, &sx),
+                    &dw,
+                    &sw,
+                );
                 if new != lines[k] {
                     lines[k] = new;
                     kinds[k] = classify_line(&lines[k]);
@@ -1973,7 +2100,7 @@ fn propagate_address_aliases(lines: &mut [String], kinds: &mut [LineKind], n: us
         if valid && provably_dead && (!uses.is_empty() || dead_by_redef) {
             for use_idx in uses {
                 lines[use_idx] =
-                    replace_whole_word(&lines[use_idx], xreg_name(dst), xreg_name(src));
+                    rename_register_operand(&lines[use_idx], xreg_name(dst), xreg_name(src));
                 kinds[use_idx] = classify_line(&lines[use_idx]);
             }
             kinds[i] = LineKind::Nop;
@@ -4455,7 +4582,9 @@ fn propagate_register_copies(lines: &mut [String], kinds: &mut [LineKind], n: us
 }
 
 // Shared peephole string utilities -- see backend/peephole_common.rs
-use crate::backend::peephole_common::{replace_source_reg_in_instruction, replace_whole_word};
+use crate::backend::peephole_common::{
+    rename_register_operand, replace_source_reg_in_instruction, replace_whole_word,
+};
 
 // ── Global dead store elimination ────────────────────────────────────────────
 //
@@ -6459,6 +6588,178 @@ fn hoist_loop_invariant_remats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run `coalesce_entry_copies` to a fixpoint and return the live text.
+    fn coalesce_to_fixpoint(asm: &str) -> Vec<String> {
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        let mut rounds = 0;
+        while coalesce_entry_copies(&mut lines, &mut kinds, n) {
+            rounds += 1;
+            assert!(rounds < 64, "coalescing does not converge");
+        }
+        lines
+            .into_iter()
+            .zip(kinds)
+            .filter(|(_, k)| *k != LineKind::Nop)
+            .map(|(l, _)| l)
+            .collect()
+    }
+
+    /// AAPCS64 check for one single-exit function: every callee-saved
+    /// register the function writes must finally be reloaded from its own
+    /// prologue slot, and no `ldp` may name one destination twice.
+    fn callee_saved_contract(lines: &[String]) -> Result<(), String> {
+        let slot_of = |l: &str| -> Option<i64> {
+            let inner = l.split_once("[sp")?.1;
+            let off = inner.split(']').next()?.trim_start_matches(',').trim();
+            if off.is_empty() {
+                return Some(0);
+            }
+            off.trim_start_matches('#').parse().ok()
+        };
+        let regs_of = |l: &str| -> Vec<u8> {
+            l.split('[')
+                .next()
+                .unwrap_or("")
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter_map(|t| t.strip_prefix('x').and_then(|r| r.parse::<u8>().ok()))
+                .collect()
+        };
+        let mut home = std::collections::HashMap::new();
+        let mut body_start = 0;
+        for (k, l) in lines.iter().enumerate() {
+            let t = l.trim();
+            if t.starts_with("stp x") || t.starts_with("str x") {
+                if let Some(o) = slot_of(t) {
+                    for (j, r) in regs_of(t).into_iter().enumerate() {
+                        home.insert(r, o + 8 * j as i64);
+                    }
+                    body_start = k + 1;
+                    continue;
+                }
+            }
+            if t.starts_with("mov x29, sp") {
+                continue;
+            }
+            if k > 0 && !t.ends_with(':') {
+                break;
+            }
+        }
+        let ret = lines
+            .iter()
+            .rposition(|l| l.trim() == "ret")
+            .ok_or("no ret")?;
+        let mut epi = ret;
+        while epi > body_start {
+            let t = lines[epi - 1].trim();
+            if (t.starts_with("ldp x") || t.starts_with("ldr x")) && t.contains("[sp") {
+                epi -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut finals: std::collections::HashMap<u8, Option<i64>> = Default::default();
+        for l in &lines[epi..ret] {
+            let t = l.trim();
+            let rs = regs_of(t);
+            if rs.len() == 2 && rs[0] == rs[1] {
+                return Err(format!("duplicate ldp destination: {t}"));
+            }
+            let o = slot_of(t).filter(|_| !t.contains("], #"));
+            for (j, r) in rs.into_iter().enumerate() {
+                finals.insert(r, o.map(|o| o + 8 * j as i64));
+            }
+        }
+        for l in &lines[body_start..ret] {
+            let w = may_write_gp(l) | gp_operands(l, classify_line(l), false).1;
+            for r in 19u8..=28 {
+                if w & (1u64 << r) == 0 {
+                    continue;
+                }
+                let want = home.get(&r).copied();
+                let got = finals.get(&r).copied().flatten();
+                if want.is_none() || got != want {
+                    return Err(format!(
+                        "x{r} written but finally restored from {got:?}, saved at {want:?}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    const MIX_ENTRY: &str = "mix:\n    stp x29, x30, [sp, #-64]!\n    mov x29, sp\n    stp x19, x20, [sp, #16]\n    stp x21, x22, [sp, #32]\n    str x23, [sp, #48]\n    mov x21, x0\n    mov x22, x1\n    mov x23, x2\n    mov x4, #0\n    mov x0, #0\n    mov x19, #0\n    mov x20, x21\n    mov x21, x22\n    mov x22, x23\n.LBB1:\n    cmp x19, #128\n    b.lt .LBB2\n    b .LBB3\n.LBB2:\n    ldrsw x0, [x20]\n    mov x6, x0\n    ldrsw x0, [x21]\n    mov x7, x0\n    add w6, w6, w7\n    ldrsw x0, [x22]\n    mov x8, x0\n    add w6, w6, w8\n    add w4, w4, w6\n    mov x0, x4\n    str w0, [x20]\n    add x19, x19, #1\n    add x20, x20, #4\n    add x21, x21, #4\n    add x22, x22, #4\n    cmp x19, #128\n    b.lt .LBB2\n.LBB3:\n    mov x0, x4\n    ldp x19, x20, [sp, #16]\n    ldp x21, x22, [sp, #32]\n    ldr x23, [sp, #48]\n    ldp x29, x30, [sp], #64\n    ret\n";
+
+    /// global_addr_pressure.c `mix` at -O2 once the generic Phase 2 homed the
+    /// accumulator in x4: the entry run rewrites x21/x22 before copying into
+    /// them, and composed renames returned x20's saved value in x21.
+    #[test]
+    fn entry_coalescing_keeps_every_callee_saved_restore() {
+        let input: Vec<String> = MIX_ENTRY.lines().map(str::to_owned).collect();
+        assert_eq!(callee_saved_contract(&input), Ok(()), "fixture premise");
+        let miscompiled = MIX_ENTRY
+            .replace("    mov x21, x0\n    mov x22, x1\n", "    mov x21, x0\n")
+            .replace("ldp x19, x20, [sp, #16]", "ldp x19, x21, [sp, #16]")
+            .replace("ldp x21, x22, [sp, #32]", "ldp x1, x23, [sp, #32]");
+        let miscompiled: Vec<String> = miscompiled.lines().map(str::to_owned).collect();
+        assert!(
+            callee_saved_contract(&miscompiled).is_err(),
+            "checker premise: the emitted miscompile must be rejected"
+        );
+        let out = coalesce_to_fixpoint(MIX_ENTRY);
+        assert_eq!(callee_saved_contract(&out), Ok(()), "{}", out.join("\n"));
+    }
+
+    /// A renamed restore of `dst` must not overwrite a callee-saved `src`
+    /// after that register's own restore: `ret` reads x19-x28.
+    #[test]
+    fn entry_coalescing_respects_the_return_read_of_callee_saved_sources() {
+        let asm = "f:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str x19, [sp, #16]\n    str x20, [sp, #24]\n    mov x20, x19\n    add x0, x20, #1\n    ldr x19, [sp, #16]\n    ldr x20, [sp, #24]\n    ldp x29, x30, [sp], #32\n    ret\n";
+        let out = coalesce_to_fixpoint(asm);
+        assert_eq!(callee_saved_contract(&out), Ok(()), "{}", out.join("\n"));
+    }
+
+    /// A callee-saved `dst` already written in the entry run loses the
+    /// caller's value when its restore is renamed, even into a dead scratch
+    /// register that no liveness question can protect. The earlier write is a
+    /// computation on purpose: an earlier *copy* would itself be coalesced
+    /// away on the next round and hide the defect.
+    #[test]
+    fn entry_coalescing_rejects_a_callee_saved_dst_written_before_the_copy() {
+        let asm = "f:\n    stp x29, x30, [sp, #-32]!\n    mov x29, sp\n    str x21, [sp, #16]\n    add x21, x0, #5\n    add x9, x21, #3\n    mov x21, x9\n    add x0, x21, #1\n    ldr x21, [sp, #16]\n    ldp x29, x30, [sp], #32\n    ret\n";
+        let out = coalesce_to_fixpoint(asm);
+        assert_eq!(callee_saved_contract(&out), Ok(()), "{}", out.join("\n"));
+    }
+
+    /// Coalescing an argument copy into a caller-saved home stays available.
+    #[test]
+    fn entry_coalescing_still_folds_a_plain_argument_copy() {
+        let asm = "f:\n    mov x9, x1\n    add x0, x9, #1\n    ret\n";
+        let out = coalesce_to_fixpoint(asm);
+        assert!(
+            out.iter().any(|l| l.trim() == "add x0, x1, #1"),
+            "{}",
+            out.join("\n")
+        );
+    }
+
+    #[test]
+    fn may_write_gp_covers_loads_pairs_writeback_and_exclusives() {
+        let x = |r: u8| 1u64 << r;
+        assert_eq!(may_write_gp("    ldp x21, x22, [sp, #32]"), x(21) | x(22));
+        assert_eq!(may_write_gp("    ldrsw x0, [x20]"), x(0));
+        assert_eq!(may_write_gp("    ldr x0, [x1], #8"), x(0) | x(1));
+        assert_eq!(may_write_gp("    str x3, [x2, #16]!"), x(2));
+        assert_eq!(may_write_gp("    str w0, [x20]"), 0);
+        assert_eq!(may_write_gp("    stlxr w4, x5, [x6]"), x(4));
+        assert_eq!(may_write_gp("    ldaddal x1, x2, [x3]"), x(1) | x(2) | x(3));
+        assert_eq!(may_write_gp("    cmp x19, #128"), 0);
+        assert_eq!(may_write_gp("    ldp q0, q1, [x0]"), 0);
+        assert_eq!(may_write_gp("    fmov x2, d0"), x(2));
+        assert_eq!(may_write_gp("    .cfi_offset x19, -48"), 0);
+    }
 
     #[test]
     fn identical_blocks_with_different_fallthroughs_do_not_merge() {

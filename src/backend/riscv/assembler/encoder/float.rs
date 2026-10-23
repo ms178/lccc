@@ -18,11 +18,7 @@ pub(crate) fn encode_float_load(operands: &[Operand], funct3: u32) -> Result<Enc
         Some(Operand::MemSymbol { base, symbol, .. }) => {
             let rs1 = reg_num(base).ok_or("invalid base register")?;
             let (reloc_type, sym) = parse_reloc_modifier(symbol);
-            let reloc_type = match reloc_type {
-                RelocType::PcrelHi20 => RelocType::PcrelLo12I,
-                RelocType::Hi20 => RelocType::Lo12I,
-                other => other,
-            };
+            let reloc_type = lo12_itype(reloc_type);
             Ok(EncodeResult::WordWithReloc {
                 word: encode_i(OP_LOAD_FP, rd, funct3, rs1, 0),
                 reloc: Relocation {
@@ -55,11 +51,7 @@ pub(crate) fn encode_float_store(
         Some(Operand::MemSymbol { base, symbol, .. }) => {
             let rs1 = reg_num(base).ok_or("invalid base register")?;
             let (reloc_type, sym) = parse_reloc_modifier(symbol);
-            let reloc_type = match reloc_type {
-                RelocType::PcrelHi20 => RelocType::PcrelLo12S,
-                RelocType::Hi20 => RelocType::Lo12S,
-                other => other,
-            };
+            let reloc_type = lo12_stype(reloc_type);
             Ok(EncodeResult::WordWithReloc {
                 word: encode_s(OP_STORE_FP, funct3, rs1, rs2, 0),
                 reloc: Relocation {

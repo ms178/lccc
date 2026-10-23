@@ -751,6 +751,12 @@ fn peephole_optimize_inner(
         .split(',')
         .map(|s| s.trim().to_string())
         .collect();
+    #[cfg(test)]
+    let skip_set = {
+        let mut set = skip_set;
+        test_skips::extend(&mut set);
+        set
+    };
     let sk = |name: &str| -> bool { skip_set.contains(name) };
 
     // CCC_PEEPHOLE_RELAY is read ONCE, here, rather than at its two use sites:
@@ -817,6 +823,17 @@ fn peephole_optimize_inner(
                 trace("fold_lea_into_memory_op", pass_count, c, &store, &infos);
                 changed |= c;
             }
+        }
+        if !sk("scaled_index_temp") {
+            let c = relay_and_lea::fold_scaled_index_temp_into_mem(&mut store, &mut infos);
+            trace(
+                "fold_scaled_index_temp_into_mem",
+                pass_count,
+                c,
+                &store,
+                &infos,
+            );
+            changed |= c;
         }
         if !sk("lea_all_uses") {
             {
@@ -1197,6 +1214,13 @@ fn peephole_optimize_inner(
                 changed |= c;
             }
         }
+        if !sk("lea_add_lea") {
+            {
+                let c = flag_peepholes::fold_lea_add_into_lea(&mut store, &mut infos);
+                trace("fold_lea_add_into_lea", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+        }
         if !sk("inplace_add_copy_lea") {
             {
                 let c = flag_peepholes::fold_inplace_add_copy_into_lea(&mut store, &mut infos);
@@ -1455,6 +1479,25 @@ fn peephole_optimize_inner(
                 changed |= c;
             }
         }
+        if !sk("ext_chain") {
+            // `ext S,%X; ext %X_w,%Y` -> `ext S,%Y`; runs first so the
+            // narrowing below sees the collapsed form.
+            let c = local_patterns::collapse_extension_chains(&mut store, &mut infos);
+            trace("collapse_extension_chains", pass_count, c, &store, &infos);
+            changed |= c;
+        }
+        if !sk("signext_narrow") {
+            // `movsbq SRC,%rA; movl %eA,%eB` -> `movsbl SRC,%eB` (%rA dead).
+            let c = local_patterns::narrow_signext_into_32bit_copy(&mut store, &mut infos);
+            trace(
+                "narrow_signext_into_32bit_copy",
+                pass_count,
+                c,
+                &store,
+                &infos,
+            );
+            changed |= c;
+        }
         if !sk("inc_chain") {
             {
                 let c = local_patterns::collapse_increment_chain(&mut store, &mut infos);
@@ -1547,6 +1590,38 @@ fn peephole_optimize_inner(
                     trace("eliminate_push_pop_pairs", pass_count, c, &store, &infos);
                     changed |= c;
                 }
+            }
+            if !sk("highbit_sub") {
+                let c = local_patterns::fold_highbit_subs(&mut store, &mut infos);
+                trace("fold_highbit_subs", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+            if !sk("guarded_scan") {
+                let c = local_patterns::fold_guarded_scan_selects(&mut store, &mut infos);
+                trace("fold_guarded_scan_selects", pass_count, c, &store, &infos);
+                changed |= c;
+            }
+            if !sk("scan_copy") {
+                let c = local_patterns::retarget_preloaded_scan_copies(&mut store, &mut infos);
+                trace(
+                    "retarget_preloaded_scan_copies",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+            if !sk("dead_scratch_saves") {
+                let c = push_pop::eliminate_dead_scratch_saves(&store, &mut infos);
+                trace(
+                    "eliminate_dead_scratch_saves",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
             }
             if !sk("binop_push_pop") {
                 {
@@ -1727,6 +1802,11 @@ fn peephole_optimize_inner(
             if !sk("lea_window") {
                 changed2 |= relay_and_lea::fold_lea_into_load(&mut store, &mut infos);
             }
+            // Phase 2's copy propagation can expose the same scaled-index
+            // temporaries (see `fold_scaled_index_temp_into_mem`).
+            if !sk("scaled_index_temp") {
+                changed2 |= relay_and_lea::fold_scaled_index_temp_into_mem(&mut store, &mut infos);
+            }
             changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
             changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
             changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);
@@ -1806,6 +1886,12 @@ fn peephole_optimize_inner(
             if !sk("signext_move") {
                 changed2 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
             }
+            if !sk("ext_chain") {
+                changed2 |= local_patterns::collapse_extension_chains(&mut store, &mut infos);
+            }
+            if !sk("signext_narrow") {
+                changed2 |= local_patterns::narrow_signext_into_32bit_copy(&mut store, &mut infos);
+            }
             changed2 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
             if !sk("copy_shift_back") {
                 changed2 |= local_patterns::fold_copy_shift_copyback(&mut store, &mut infos);
@@ -1836,16 +1922,46 @@ fn peephole_optimize_inner(
     // Phase 3c: the producer retarget whose sources may name either register,
     // once the local fixpoints have converged (see
     // `retarget_producer_into_copy_aliasing` for why not inside them).
+    // A late rename can make an identity adjacent that the converged local
+    // fixpoint never saw (`xor $K,%a; mov %a,%b; xor $K,%b` renamed into
+    // `%b`); the highbit XOR pair is the one such identity cancelled here.
+    let mut renamed_late = false;
     if !skip_phase1
         && !sk("producer_retarget")
         && relay_and_lea::retarget_producer_into_copy_aliasing(&mut store, &mut infos)
-        && !sk("dead_regs")
     {
-        self_zext::eliminate_redundant_self_zext(&store, &mut infos);
-        dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+        renamed_late = true;
+        if !sk("dead_regs") {
+            self_zext::eliminate_redundant_self_zext(&store, &mut infos);
+            dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+        }
         if !sk("lea_narrow") {
             lea_narrow::narrow_lea_truncations(&mut store, &mut infos);
         }
+    }
+    // Phase 3d: the windowed chain rename (`leal …, %T; addl …, %T; movl %T,
+    // %eax` -> computed in %eax), same phase discipline as 3c.
+    if !skip_phase1
+        && !sk("chain_retarget")
+        && relay_and_lea::rename_chain_into_copy(&mut store, &mut infos)
+    {
+        renamed_late = true;
+        if !sk("dead_regs") {
+            self_zext::eliminate_redundant_self_zext(&store, &mut infos);
+            dead_code::eliminate_dead_reg_moves(&store, &mut infos);
+        }
+    }
+    if renamed_late && !sk("combined") {
+        local_patterns::cancel_highbit_double_xors(&store, &mut infos);
+    }
+    if renamed_late && !sk("highbit_sub") {
+        local_patterns::fold_highbit_subs(&mut store, &mut infos);
+    }
+    if renamed_late && !sk("guarded_scan") {
+        local_patterns::fold_guarded_scan_selects(&mut store, &mut infos);
+    }
+    if renamed_late && !sk("scan_copy") {
+        local_patterns::retarget_preloaded_scan_copies(&mut store, &mut infos);
     }
 
     // Phase 4: Eliminate loop backedge trampoline blocks.
@@ -1912,6 +2028,12 @@ fn peephole_optimize_inner(
             changed3 |= local_patterns::coalesce_phi_register_copies(&mut store, &mut infos);
             if !sk("signext_move") {
                 changed3 |= local_patterns::fuse_signext_and_move(&mut store, &mut infos);
+            }
+            if !sk("ext_chain") {
+                changed3 |= local_patterns::collapse_extension_chains(&mut store, &mut infos);
+            }
+            if !sk("signext_narrow") {
+                changed3 |= local_patterns::narrow_signext_into_32bit_copy(&mut store, &mut infos);
             }
             changed3 |= local_patterns::collapse_increment_chain(&mut store, &mut infos);
             // Orphan retirement inside the fixpoint (see phase 3).
@@ -5574,3 +5696,40 @@ mod debug_adjacency_tests;
 
 #[cfg(test)]
 mod scalar_transfer_tests;
+
+/// Test-only, per-thread counterpart of `CCC_PEEPHOLE_SKIP` (the env var is
+/// process-global and races between parallel tests). Pipeline tests that pin
+/// one pass's refusal use it to keep a LATER pass from rewriting the shape
+/// they assert on; the later pass gets its own tests on the same shapes.
+#[cfg(test)]
+pub(crate) mod test_skips {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SKIPS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Restores the thread's skip set on drop (panics included).
+    pub(crate) struct SkipGuard(usize);
+
+    impl Drop for SkipGuard {
+        fn drop(&mut self) {
+            SKIPS.with(|s| s.borrow_mut().truncate(self.0));
+        }
+    }
+
+    /// Disable the named `sk()` passes on this thread until the guard drops.
+    #[must_use]
+    pub(crate) fn skip_passes(names: &[&'static str]) -> SkipGuard {
+        SKIPS.with(|s| {
+            let mut v = s.borrow_mut();
+            let mark = v.len();
+            v.extend_from_slice(names);
+            SkipGuard(mark)
+        })
+    }
+
+    pub(super) fn extend(set: &mut crate::common::fx_hash::FxHashSet<String>) {
+        SKIPS.with(|s| set.extend(s.borrow().iter().map(|n| (*n).to_string())));
+    }
+}

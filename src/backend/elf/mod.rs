@@ -78,5 +78,6 @@ pub use symbol_table::{ObjSymbol, SymbolTableInput, build_elf_symbol_table};
 // writer_base
 pub use writer_base::{
     DataFixup, ElfWriterBase, MAX_DIRECTIVE_FILL, MAX_TOTAL_DIRECTIVE_FILL, SetValue,
-    default_comm_align, lcomm_align, parse_base64_args, parse_comm_args, parse_org_args,
+    SubsectionRemap, default_comm_align, lcomm_align, parse_base64_args, parse_comm_args,
+    parse_org_args,
 };

@@ -648,6 +648,14 @@ impl X86Cpu {
         unsafe { std::arch::x86_64::__cpuid_count(leaf, subleaf) }
     }
 
+    /// Whether the host implements PREFETCHW (CPUID 0x8000_0001 ECX bit 8,
+    /// "PRFCHW"/"3DNowPrefetch" — the same bit `common::cpu_probe` answers
+    /// `__builtin_cpu_supports("prfchw")` with). Used by `-march=native`.
+    #[cfg(target_arch = "x86_64")]
+    pub fn host_has_prfchw() -> bool {
+        Self::cpuid(0x8000_0000).eax >= 0x8000_0001 && Self::cpuid(0x8000_0001).ecx & (1 << 8) != 0
+    }
+
     /// Identify the host core from CPUID family/model (leaf 1) for
     /// `-march=native` / `-mtune=native`.
     #[cfg(target_arch = "x86_64")]

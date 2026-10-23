@@ -968,6 +968,7 @@ fn instruction_corpus() -> Vec<MachInst> {
                 index: Some((MachReg::Phys(r), scale)),
                 offset: 16,
                 dst: MachReg::Phys(PhysReg(0)),
+                size: OpSize::S64,
             });
         }
     }
@@ -1370,6 +1371,7 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
                 index: Some((MachReg::Phys(b), *rng.pick(&scales))),
                 offset: *rng.pick(&offsets),
                 dst: MachReg::Phys(*rng.pick(&regs)),
+                size: OpSize::S64,
             },
             8 => MachInst::LeaSym {
                 sym: "machinst_probe_sym".into(),
@@ -1434,6 +1436,7 @@ fn random_corpus(n: usize) -> Vec<MachInst> {
                 index: Some((MachReg::Phys(b), *rng.pick(&scales))),
                 offset: *rng.pick(&offsets),
                 dst: MachReg::Phys(*rng.pick(&regs)),
+                size: OpSize::S64,
             },
             // 14: Cmov across every condition code (no immediate form).
             14 => MachInst::Cmov {
@@ -1991,6 +1994,7 @@ fn lea_computes_base_plus_index_scale_plus_offset_when_executed() {
         index: Some((MachReg::Phys(src), 4)),
         offset: 7,
         dst: MachReg::Phys(dst),
+        size: OpSize::S64,
     };
     let model = |b: i64, i: i64| b.wrapping_add(i.wrapping_mul(4)).wrapping_add(7);
     let Some(got) = run_emitted(&probe_body(dst, src, &inst), EXEC_INPUTS) else {
@@ -2328,6 +2332,42 @@ fn falu_computes_the_right_answer_when_executed() {
             );
         }
     }
+}
+
+/// `MachInst::Lea` golden shapes at both widths: address registers stay
+/// 64-bit, the destination and mnemonic carry the operation width, and the
+/// degenerate `lea (%b), %d` is the matching-width (zero-extending) move.
+#[test]
+fn lea_golden_shapes_by_width() {
+    let b = MachReg::Phys(PhysReg(1)); // rbx
+    let emit = |inst: MachInst| {
+        let mut out = AsmOutput::new();
+        emit_machinst(&inst, &mut out);
+        out.buf.trim().to_string()
+    };
+    let lea = |index, offset, size| MachInst::Lea {
+        base: b,
+        index,
+        offset,
+        dst: b,
+        size,
+    };
+    assert_eq!(
+        emit(lea(Some((b, 2)), 0, OpSize::S32)),
+        "leal (%rbx, %rbx, 2), %ebx"
+    );
+    assert_eq!(
+        emit(lea(Some((b, 2)), 0, OpSize::S64)),
+        "leaq (%rbx, %rbx, 2), %rbx"
+    );
+    assert_eq!(
+        emit(lea(Some((b, 4)), 7, OpSize::S32)),
+        "leal 7(%rbx, %rbx, 4), %ebx"
+    );
+    assert_eq!(emit(lea(None, -3, OpSize::S32)), "leal -3(%rbx), %ebx");
+    assert_eq!(emit(lea(None, -3, OpSize::S64)), "leaq -3(%rbx), %rbx");
+    assert_eq!(emit(lea(None, 0, OpSize::S32)), "movl %ebx, %ebx");
+    assert_eq!(emit(lea(None, 0, OpSize::S64)), "movq %rbx, %rbx");
 }
 
 #[test]
@@ -3296,7 +3336,7 @@ fn float_binops_lower_with_exact_operand_order() {
         &binop(3, IrBinOp::Add, 1, 2, IrType::I64),
         &[(1u32, PhysReg(0)), (2, PhysReg(7)), (3, PhysReg(11))]
             .into_iter()
-            .collect(),
+            .collect::<FxHashMap<_, _>>(),
         &slots,
         None,
         &mut out,
@@ -4266,6 +4306,7 @@ mod float_const_stores {
                 index: None,
                 offset: -40,
                 dst: MachReg::Phys(PhysReg(15)),
+                size: OpSize::S64,
             },
             &mut out,
         );
@@ -4608,6 +4649,7 @@ mod typed_indirect_calls {
                 is_const: false,
                 assume_library: false,
                 ret_eightbyte_classes: vec![],
+                cold: false,
             },
         };
         // The standalone isel does NOT route calls (the emit-side gate

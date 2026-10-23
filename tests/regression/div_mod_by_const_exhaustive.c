@@ -112,11 +112,13 @@ static void check_s32(int n, int d)
 	X(1) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(9) X(10) X(11) X(12) \
 	X(1000) X(4095) X(4096) X(4097) X(65535) X(65536) X(65537) \
 	X(4294967295) X(4294967296) X(4294967297) \
-	X(9223372036854775807) X(18446744073709551557)
+	X(1000000000) X(9223372036854775807) X(9223372036854775809) \
+	X(18446744073709551557) X(18446744073709551614)
 
 #define S64_LIST(X) \
 	X(1) X(2) X(3) X(5) X(6) X(7) X(10) X(1000) X(4096) X(4097) \
-	X(65536) X(65537) X(2147483647) X(4294967296) X(9223372036854775783)
+	X(65536) X(65537) X(1000000000) X(2147483647) X(4294967296) \
+	X(9223372036854775783)
 
 #define U32_LIST(X) \
 	X(1) X(2) X(3) X(7) X(10) X(1000) X(4095) X(4096) X(4097) \
@@ -245,12 +247,68 @@ S32_LIST(GEN_S32NEG)
 		}                                                            \
 	} while (0);
 
+/* Parameter homes across %rdx clobbers. A division, remainder or
+ * multiply-high clobbers %rdx -- the third SysV argument register -- so a
+ * parameter live across one must leave %rdx first, while the others may
+ * stay in caller-saved registers. Mixed with a switch dispatch (which also
+ * writes %rdx) and a parameter read only after the clobber. */
+__attribute__((noinline)) static long long h3(long long a, long long b, long long c)
+{
+	return a / b + c;
+}
+
+__attribute__((noinline)) static unsigned h3c(long long a, long long b, long long c)
+{
+	return (unsigned char)c + (unsigned char)(a % b);
+}
+
+__attribute__((noinline)) static unsigned long long
+h4(unsigned long long a, unsigned long long b, unsigned long long c, unsigned long long d)
+{
+	return a / 1000000000ULL + b % 10 + c / b + d;
+}
+
+__attribute__((noinline)) static long long hsw(long long a, long long b, long long c, int k)
+{
+	switch (k) {
+	case 0: return a / b + c;
+	case 1: return a % b - c;
+	case 2: return c / 7 + a;
+	case 3: return a * b + c;
+	case 4: return (long long)((unsigned long long)c / 18446744073709551614ULL) + b;
+	default: return c;
+	}
+}
+
+static unsigned long long homing_checksum(void)
+{
+	static const long long v[] = { 1, -1, 7, -7, 1000000007, -999999999999LL,
+					LLONG_MAX, LLONG_MIN + 1, 255, 0x1234567890abLL };
+	unsigned long long h = 0;
+	unsigned i, j, k;
+
+	for (i = 0; i < sizeof v / sizeof v[0]; i++)
+		for (j = 0; j < sizeof v / sizeof v[0]; j++) {
+			long long a = v[i], b = v[j], c = v[(i + j) % 10];
+
+			h = h * 31 + (unsigned long long)h3(a, b, c);
+			h = h * 31 + h3c(a, b, c);
+			h = h * 31 + h4((unsigned long long)a, (unsigned long long)b,
+					(unsigned long long)c, (unsigned long long)i);
+			for (k = 0; k < 6; k++)
+				h = h * 31 + (unsigned long long)hsw(a, b, c, (int)k);
+		}
+	return h;
+}
+
 int main(void)
 {
 	U64_LIST(SWEEP_U64);
 	S64_LIST(SWEEP_S64);
 	U32_LIST(SWEEP_U32);
-	S32_LIST(SWEEP_S32);
+		S32_LIST(SWEEP_S32);
+	printf("homing %llx\n", homing_checksum());
+
 
 	if (fails)
 		printf("FAIL %s %llu / %llu: q=%llu r=%llu, q*d+r=%llu\n",

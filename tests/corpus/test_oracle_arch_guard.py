@@ -23,7 +23,7 @@ import codegen_oracle as oracle  # noqa: E402
 import godbolt  # noqa: E402
 
 X86_GCC = {"id": "cg162", "name": "x86-64 gcc 16.2"}
-X86_CLANG = {"id": "cclang1910", "name": "x86-64 clang 19.1.0"}
+X86_CLANG = {"id": "cclang2310", "name": "x86-64 clang 23.1.0"}
 AARCH64_GCC = {"id": "carm64g1610", "name": "aarch64 gcc 16.1"}
 RISCV_GCC = {"id": "crv64g1610", "name": "riscv64 gcc 16.1"}
 

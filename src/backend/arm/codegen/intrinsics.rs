@@ -263,12 +263,14 @@ impl ArmCodegen {
                 self.operand_to_x0(&args[0]);
                 self.state.emit("    dc civac, x0");
             }
-            IntrinsicOp::Prefetch(flavor) => {
-                // PRFM with the GCC locality mapping: 0 = streaming, 1-2 =
-                // L2, 3 = L1, 4 = store intent (see IntrinsicOp::Prefetch).
-                self.operand_to_x0(&args[0]);
-                self.state
-                    .emit_fmt(format_args!("    prfm {}, [x0]", prefetch_prfop(*flavor)));
+            IntrinsicOp::Prefetch(payload) => {
+                // PRFM with GCC's `pftype[write][locality]` table (see
+                // `prefetch_prfop`). Dropped only under CCC_NO_PREFETCH.
+                if !self.no_prefetch {
+                    self.operand_to_x0(&args[0]);
+                    self.state
+                        .emit_fmt(format_args!("    prfm {}, [x0]", prefetch_prfop(*payload)));
+                }
             }
             IntrinsicOp::Movnti => {
                 self.emit_nontemporal_store(dest_ptr, args, "w9", "w0");
@@ -1231,31 +1233,45 @@ impl ArmCodegen {
     // ABI: f128 passed/returned in Q registers (q0, q1). Int result in w0/x0.
 }
 
-/// AArch64 PRFM operation for an `IntrinsicOp::Prefetch` payload. The
-/// prefetch operation field is a hint selector, so every arm of this table
-/// is architecturally legal and cannot fault.
-pub(super) fn prefetch_prfop(flavor: u8) -> &'static str {
-    match flavor {
-        0 => "pldl1strm",
-        1 | 2 => "pldl2keep",
-        4 => "pstl1keep",
-        _ => "pldl1keep",
-    }
+/// AArch64 PRFM operation for an `IntrinsicOp::Prefetch` payload: GCC's
+/// `pftype[rw & 1][locality]` table from `aarch64.md` verbatim. Locality 1
+/// is `L3KEEP` (not `L2KEEP`), and write intent keeps its locality
+/// (`pst*` has the same four levels as `pld*`). The prefetch operation field
+/// is a hint selector, so every arm is architecturally legal and cannot
+/// fault.
+pub(super) fn prefetch_prfop(payload: u8) -> &'static str {
+    const PFTYPE: [[&str; 4]; 2] = [
+        ["pldl1strm", "pldl3keep", "pldl2keep", "pldl1keep"],
+        ["pstl1strm", "pstl3keep", "pstl2keep", "pstl1keep"],
+    ];
+    let hint = crate::ir::reexports::PrefetchHint::decode(payload);
+    PFTYPE[usize::from(hint.write)][usize::from(hint.locality)]
 }
 
 #[cfg(test)]
 mod prefetch_prfop_tests {
     use super::prefetch_prfop;
+    use crate::ir::reexports::PrefetchHint;
 
+    /// GCC 16 / aarch64-linux-gnu-gcc 14, measured for all eight forms.
     #[test]
-    fn every_payload_maps_to_a_real_prfm_operation() {
-        assert_eq!(prefetch_prfop(0), "pldl1strm");
-        assert_eq!(prefetch_prfop(1), "pldl2keep");
-        assert_eq!(prefetch_prfop(2), "pldl2keep");
-        assert_eq!(prefetch_prfop(3), "pldl1keep");
-        assert_eq!(prefetch_prfop(4), "pstl1keep");
-        for f in 5u8..=255 {
-            assert_eq!(prefetch_prfop(f), "pldl1keep");
+    fn every_hint_maps_to_gccs_prfm_operation() {
+        let expect = [
+            ((false, 0), "pldl1strm"),
+            ((false, 1), "pldl3keep"),
+            ((false, 2), "pldl2keep"),
+            ((false, 3), "pldl1keep"),
+            ((true, 0), "pstl1strm"),
+            ((true, 1), "pstl3keep"),
+            ((true, 2), "pstl2keep"),
+            ((true, 3), "pstl1keep"),
+        ];
+        for ((write, loc), op) in expect {
+            assert_eq!(prefetch_prfop(PrefetchHint::new(write, loc).encode()), op);
+        }
+        // Every byte decodes to one of the eight (no panic, no fallback).
+        for p in 0u8..=255 {
+            assert_eq!(prefetch_prfop(p), prefetch_prfop(p & 7));
         }
     }
 }

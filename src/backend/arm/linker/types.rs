@@ -5,7 +5,9 @@
 
 use super::elf::SHN_COMMON;
 use super::elf::SHN_UNDEF;
+use super::elf::{DT_FINI, DT_INIT};
 use crate::backend::linker_common;
+use crate::common::fx_hash::FxHashMap;
 use linker_common::{Elf64Symbol, GlobalSymbolOps};
 
 /// Dynamic linker path for AArch64
@@ -153,6 +155,103 @@ impl GlobalSymbolOps for GlobalSymbol {
 }
 
 /// ARM-specific replacement policy: also replace dynamic symbols with local definitions.
+/// The `DT_INIT`/`DT_FINI` entries to emit for a presence decision made by
+/// [`linker_common::image_init_fini`], read once addresses are final.  The entry count always
+/// equals the number of `true` flags, which is what `.dynamic` was sized for.
+pub(super) fn init_fini_entries(
+    globals: &FxHashMap<String, GlobalSymbol>,
+    present: (bool, bool),
+) -> impl Iterator<Item = (i64, u64)> + '_ {
+    [(present.0, "_init", DT_INIT), (present.1, "_fini", DT_FINI)]
+        .into_iter()
+        .filter(|&(p, _, _)| p)
+        .map(|(_, name, tag)| (tag, globals.get(name).map_or(0, |g| g.value)))
+}
+
 pub fn arm_should_replace_extra(existing: &GlobalSymbol) -> bool {
     existing.is_dynamic
+}
+
+/// The `.eh_frame_hdr` slot of an AArch64 output, shared by the static,
+/// dynamic and shared-library emitters: reserved right after the read-only
+/// sections are laid out (so the read-only PT_LOAD covers it), filled from
+/// the relocated `.eh_frame` once every relocation is applied, and pointed
+/// at by PT_GNU_EH_FRAME -- the only way libgcc's unwinder finds the FDEs of
+/// a dynamically linked object (`dl_iterate_phdr`).
+pub(super) struct EhFrameHdr {
+    pub offset: u64,
+    pub vaddr: u64,
+    pub size: u64,
+    pub fde_count: usize,
+    eh_frame_offset: u64,
+    eh_frame_vaddr: u64,
+    eh_frame_size: u64,
+}
+
+impl EhFrameHdr {
+    /// Whether the output gets a header: a non-empty `.eh_frame`. Known
+    /// before layout, so emitters can size their program headers with it.
+    pub(super) fn wanted(output_sections: &[linker_common::OutputSection]) -> bool {
+        output_sections
+            .iter()
+            .any(|s| s.name == ".eh_frame" && s.mem_size > 0)
+    }
+
+    /// Reserve `12 + 8 * FDEs` bytes, 4-aligned, at `*offset` (file offset;
+    /// the address is `base_addr + offset`). `.eh_frame` must be laid out.
+    pub(super) fn reserve(
+        objects: &[linker_common::Elf64Object],
+        output_sections: &[linker_common::OutputSection],
+        offset: &mut u64,
+        base_addr: u64,
+    ) -> Option<Self> {
+        let ef = output_sections
+            .iter()
+            .find(|s| s.name == ".eh_frame" && s.mem_size > 0)?;
+        // Counted per input: the section data is not merged yet.
+        let fde_count = ef
+            .inputs
+            .iter()
+            .map(|i| {
+                linker_common::count_eh_frame_fdes(
+                    &objects[i.object_idx].section_data[i.section_idx],
+                )
+            })
+            .sum::<usize>();
+        *offset = (*offset + 3) & !3;
+        let hdr = Self {
+            offset: *offset,
+            vaddr: base_addr + *offset,
+            size: (12 + 8 * fde_count) as u64,
+            fde_count,
+            eh_frame_offset: ef.file_offset,
+            eh_frame_vaddr: ef.addr,
+            eh_frame_size: ef.mem_size,
+        };
+        *offset += hdr.size;
+        Some(hdr)
+    }
+
+    /// Fill the slot from the relocated `.eh_frame` bytes in `out`.
+    pub(super) fn write(&self, out: &mut [u8]) -> Result<(), String> {
+        let ef =
+            self.eh_frame_offset as usize..(self.eh_frame_offset + self.eh_frame_size) as usize;
+        let at = self.offset as usize..(self.offset + self.size) as usize;
+        if ef.end > out.len() || at.end > out.len() {
+            return Err(format!(
+                "internal: .eh_frame ({ef:?}) or .eh_frame_hdr ({at:?}) beyond the {}-byte output",
+                out.len()
+            ));
+        }
+        let mut slot = vec![0u8; at.len()];
+        linker_common::write_eh_frame_hdr(
+            &mut slot,
+            &out[ef],
+            self.eh_frame_vaddr,
+            self.vaddr,
+            true,
+        );
+        out[at].copy_from_slice(&slot);
+        Ok(())
+    }
 }

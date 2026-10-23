@@ -2386,6 +2386,7 @@ mod tests {
             is_inline: false,
             is_always_inline: false,
             is_noinline: false,
+            target_features: Vec::new(),
             is_declaration: false,
             next_value_id: 4,
             fp_expr_tags: Default::default(),
@@ -2419,6 +2420,7 @@ mod tests {
             char16_string_literals: vec![],
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
+            tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -2475,6 +2477,7 @@ mod tests {
             is_inline: false,
             is_always_inline: false,
             is_noinline: false,
+            target_features: Vec::new(),
             is_declaration: false,
             next_value_id: 4,
             fp_expr_tags: Default::default(),
@@ -2508,6 +2511,7 @@ mod tests {
             char16_string_literals: vec![],
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
+            tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -2552,6 +2556,7 @@ mod tests {
             is_inline: false,
             is_always_inline: false,
             is_noinline: false,
+            target_features: Vec::new(),
             is_declaration: false,
             next_value_id: 2,
             fp_expr_tags: Default::default(),
@@ -2585,6 +2590,7 @@ mod tests {
             char16_string_literals: vec![],
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
+            tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -2635,6 +2641,7 @@ mod tests {
             is_inline: false,
             is_always_inline: false,
             is_noinline: false,
+            target_features: Vec::new(),
             is_declaration: false,
             next_value_id: 3,
             fp_expr_tags: Default::default(),
@@ -2668,6 +2675,7 @@ mod tests {
             char16_string_literals: vec![],
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
+            tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -2722,6 +2730,7 @@ mod tests {
             is_inline: false,
             is_always_inline: false,
             is_noinline: false,
+            target_features: Vec::new(),
             is_declaration: false,
             next_value_id: 4,
             fp_expr_tags: Default::default(),
@@ -2755,6 +2764,7 @@ mod tests {
             char16_string_literals: vec![],
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
+            tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -2822,6 +2832,7 @@ mod tests {
             is_inline: false,
             is_always_inline: false,
             is_noinline: false,
+            target_features: Vec::new(),
             is_declaration: false,
             next_value_id: 4,
             fp_expr_tags: Default::default(),
@@ -2855,6 +2866,7 @@ mod tests {
             char16_string_literals: vec![],
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
+            tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -2895,6 +2907,7 @@ mod tests {
             is_inline: false,
             is_always_inline: false,
             is_noinline: false,
+            target_features: Vec::new(),
             is_declaration: false,
             next_value_id,
             fp_expr_tags: Default::default(),
@@ -2930,6 +2943,7 @@ mod tests {
             char16_string_literals: vec![],
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
+            tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
         }
     }
 
@@ -3682,6 +3696,7 @@ mod tests {
             is_inline: false,
             is_always_inline: false,
             is_noinline: false,
+            target_features: Vec::new(),
             is_declaration: false,
             next_value_id: 4,
             fp_expr_tags: Default::default(),
@@ -3715,6 +3730,7 @@ mod tests {
             char16_string_literals: vec![],
             symver_directives: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
+            tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
         };
 
         let eliminated = module.for_each_function(run_gvn_function);
@@ -3756,6 +3772,7 @@ mod tests {
             is_inline: false,
             is_always_inline: false,
             is_noinline: false,
+            target_features: Vec::new(),
             is_declaration: false,
             next_value_id,
             next_label: 0,
@@ -3788,6 +3805,7 @@ mod tests {
             toplevel_asm: vec![],
             symbol_attrs: vec![],
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
+            tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
             char16_string_literals: vec![],
             symver_directives: vec![],
         }
@@ -3916,6 +3934,7 @@ mod tests {
                             assume_library: false,
                             ret_eightbyte_classes: Vec::new(),
                             ret_is_f128_sse: false,
+                            cold: false,
                         },
                     },
                     Instruction::Load {
@@ -4181,6 +4200,7 @@ mod tests {
                             assume_library: false,
                             ret_eightbyte_classes: Vec::new(),
                             ret_is_f128_sse: false,
+                            cold: false,
                         },
                     },
                     Instruction::Load {
@@ -4380,6 +4400,7 @@ mod tests {
                             assume_library: false,
                             ret_eightbyte_classes: vec![],
                             ret_is_f128_sse: false,
+                            cold: false,
                         },
                     },
                 ],

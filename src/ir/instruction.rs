@@ -124,6 +124,13 @@ pub struct CallInfo {
     /// passes that synthesize library calls.  `false` (the default) means
     /// "call it as written": never folded, never expanded.
     pub assume_library: bool,
+    /// The call sits on a rarely executed path (e.g. the errno slow path of
+    /// an inlined `sqrt`).  The x86-64 register allocator may then keep
+    /// scalar FP values live across it in caller-saved XMM homes and save/
+    /// restore them around this call only, instead of demoting them to a
+    /// stack home on the hot path.  A pure placement hint: `false` is always
+    /// correct.
+    pub cold: bool,
 }
 
 /// An IR instruction.

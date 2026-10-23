@@ -132,60 +132,41 @@ impl I686Codegen {
         }
     }
 
+    /// Ctz with the IR's defined-zero semantics (`Ctz(0)` = width). TZCNT
+    /// is BMI1 (`bmi1_enabled`); without it F3 0F BC decodes as BSF, equal
+    /// for every nonzero input. Narrow widths OR a stop bit just above the
+    /// operand, so the scanned value is never zero: a zero operand yields
+    /// 8 / 16 on both forms without a branch, and bits above the stop bit
+    /// can never be the lowest set bit (no zero-extension needed).
     pub(super) fn emit_int_ctz_impl(&mut self, ty: IrType) {
-        if self.lzcnt_enabled {
-            match ty {
-                IrType::I8 | IrType::U8 => {
-                    // Force a stop bit above the value so tzcnt(0) yields 8, not 32.
-                    self.state.emit("    orl $0x100, %eax");
-                    self.state.emit("    tzcntl %eax, %eax");
-                }
-                IrType::I16 | IrType::U16 => {
-                    self.state.emit("    orl $0x10000, %eax");
-                    self.state.emit("    tzcntl %eax, %eax");
-                }
-                _ => {
-                    self.state.emit("    tzcntl %eax, %eax");
-                }
-            }
-            return;
-        }
-        // TZCNT (F3 0F BC) decodes as plain BSF on CPUs without the feature;
-        // BSF == TZCNT for every nonzero input. The stop-bit trick keeps the
-        // narrow types' defined zero results (8 / 16) without a branch; the
-        // 32-bit case needs the explicit fixup for Ctz(0) == 32.
+        let tz = if self.bmi1_enabled {
+            "    tzcntl %eax, %eax"
+        } else {
+            "    bsfl %eax, %eax"
+        };
         match ty {
             IrType::I8 | IrType::U8 => {
                 self.state.emit("    orl $0x100, %eax");
-                self.state.emit("    bsfl %eax, %eax");
+                self.state.emit(tz);
             }
             IrType::I16 | IrType::U16 => {
                 self.state.emit("    orl $0x10000, %eax");
-                self.state.emit("    bsfl %eax, %eax");
+                self.state.emit(tz);
             }
-            _ => {
-                self.emit_ctz32_baseline("eax", "eax");
-            }
+            _ if self.bmi1_enabled => self.state.emit(tz),
+            _ => self.emit_ctz32_baseline("eax", "eax"),
         }
     }
 
-    /// CTZ for a value whose nonzero precondition is explicit in IR.
-    pub(super) fn emit_int_ctz_nonzero_impl(&mut self, ty: IrType) {
-        if self.lzcnt_enabled {
-            self.emit_int_ctz_impl(ty);
-            return;
-        }
-        match ty {
-            IrType::I8 | IrType::U8 => {
-                self.state.emit("    andl $0xff, %eax");
-                self.state.emit("    bsfl %eax, %eax");
-            }
-            IrType::I16 | IrType::U16 => {
-                self.state.emit("    movzwl %ax, %eax");
-                self.state.emit("    bsfl %eax, %eax");
-            }
-            _ => self.state.emit("    bsfl %eax, %eax"),
-        }
+    /// CTZ for a value whose nonzero precondition is explicit in IR. A
+    /// narrow operand's lowest set bit lies in its low lane, so the bits
+    /// above it never matter and no zero-extension is emitted.
+    pub(super) fn emit_int_ctz_nonzero_impl(&mut self, _ty: IrType) {
+        self.state.emit(if self.bmi1_enabled {
+            "    tzcntl %eax, %eax"
+        } else {
+            "    bsfl %eax, %eax"
+        });
     }
 
     pub(super) fn emit_int_bswap_impl(&mut self, ty: IrType) {
@@ -1080,6 +1061,7 @@ impl I686Codegen {
                 }
             }
             IrBinOp::Bzhi => crate::ir::ops::bzhi_outside_x86_64(),
+            IrBinOp::UMulHigh | IrBinOp::SMulHigh => crate::ir::ops::mul_high_unsupported_here(),
             IrBinOp::BitTest => {
                 // i686 BT stores the selected bit directly in CF and masks the
                 // index modulo 32, exactly matching `(base >> index) & 1` on

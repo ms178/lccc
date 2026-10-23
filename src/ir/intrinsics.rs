@@ -31,27 +31,32 @@ pub enum IntrinsicOp {
     /// of the builtin is the latency it hides, so the instruction must
     /// survive DCE (it is deliberately NOT in `is_pure`).
     ///
-    /// The payload is the target-independent encoding of GCC's hint pair,
-    /// chosen once in the frontend lowering so every backend only has to map
-    /// one small enum onto its own prefetch flavors:
+    /// The payload is a [`PrefetchHint`] encoding of GCC's hint pair, chosen
+    /// once in the frontend lowering: bits 0-1 hold `locality` (0..=3) and
+    /// bit 2 holds write intent (`rw == 1`). Both facts are kept because
+    /// every target that distinguishes write intent ALSO keeps the locality
+    /// (AArch64 `pst*` has the same four levels as `pld*`), and every target
+    /// that cannot express write intent falls back to the locality table —
+    /// collapsing the pair loses information some backend needs. GCC 15+'s
+    /// `rw == 2` (instruction-fetch intent) is encoded as a read: GCC 16
+    /// lowers it with the read table on both x86 and AArch64
+    /// (`pftype[rw & 1][locality]`).
     ///
-    /// | payload | GCC `(rw, locality)` | x86-64        | arm64          |
-    /// |---------|----------------------|---------------|----------------|
-    /// | 0       | any, `locality = 0`  | `prefetchnta` | `pldl1strm`    |
-    /// | 1       | any, `locality = 1`  | `prefetcht2`  | `pldl2keep`    |
-    /// | 2       | any, `locality = 2`  | `prefetcht1`  | `pldl2keep`    |
-    /// | 3       | any, `locality = 3`  | `prefetcht0`  | `pldl1keep`    |
+    /// Backend mapping (GCC 16.2 parity, measured per form):
     ///
-    /// [^w]: `prefetchw` (0F 0D /1) is AMD's 3DNow!-era write hint. Every
-    ///       AMD part and every Intel part since Broadwell executes it, but
-    ///       the encoding is not in any Intel baseline ISA extension, so a
-    ///       pre-2014 Intel core would see an reserved-NOP at best. GCC emits
-    ///       `prefetcht0` for `rw = 1` unless `-mprfchw` is given, and a
-    ///       missed write hint costs a cycle while a SIGILL costs the build.
-    ///       x86 backends therefore map payload 4 to `prefetcht0`; AArch64's
-    ///       `pstl1keep` is an architecturally-defined hint and is used
-    ///       directly.
-    /// | 4       | `rw = 1`             | `prefetcht0`[^w] | `pstl1keep` |
+    /// | locality | x86 read / write without PRFCHW | x86 write with PRFCHW | arm64 read | arm64 write |
+    /// |----------|---------------------------------|-----------------------|------------|-------------|
+    /// | 0        | `prefetchnta`                   | `prefetchw`           | `pldl1strm`| `pstl1strm` |
+    /// | 1        | `prefetcht2`                    | `prefetchw`           | `pldl3keep`| `pstl3keep` |
+    /// | 2        | `prefetcht1`                    | `prefetchw`           | `pldl2keep`| `pstl2keep` |
+    /// | 3        | `prefetcht0`                    | `prefetchw`           | `pldl1keep`| `pstl1keep` |
+    ///
+    /// x86-64 always has the SSE prefetch forms (GCC emits them even under
+    /// `-mno-sse`/`-mgeneral-regs-only`: `0F 18` touches no vector state).
+    /// i686 has them only when SSE or PRFCHW is enabled (GCC's
+    /// `ix86_prefetch_sse`); otherwise the hint is dropped, because the
+    /// i686 baseline is pre-SSE silicon where `0F 18 /0-3` is #UD. RISC-V
+    /// emits nothing without Zicbop (GCC parity for `rv64gc`).
     Prefetch(u8),
     /// Non-temporal stores: movnti (32-bit), movnti64 (64-bit), movntdq (128-bit), movntpd (128-bit double)
     Movnti,
@@ -1821,6 +1826,40 @@ pub enum IntrinsicOp {
 /// Independent test matrix: do not derive this from the predicates under test.
 /// test_intrinsic_store_inventory.py checks completeness against the enum and
 /// write-effect classification, including variants without a lane-shape suffix.
+/// Decoder/encoder for the [`IntrinsicOp::Prefetch`] payload (see that
+/// variant for the encoding and the per-target mapping). Every `u8` decodes
+/// to a valid hint — out-of-range bits are ignored — so a backend can never
+/// turn a payload into a missing or malformed instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefetchHint {
+    /// GCC's temporal-locality level, 0 (none) ..= 3 (keep in all levels).
+    pub locality: u8,
+    /// GCC `rw == 1`: the line is about to be written.
+    pub write: bool,
+}
+
+impl PrefetchHint {
+    /// The payload for a validated GCC hint pair (`locality` is masked to
+    /// its two-bit domain).
+    pub const fn new(write: bool, locality: u8) -> Self {
+        PrefetchHint {
+            locality: locality & 3,
+            write,
+        }
+    }
+
+    pub const fn encode(self) -> u8 {
+        (self.locality & 3) | ((self.write as u8) << 2)
+    }
+
+    pub const fn decode(payload: u8) -> Self {
+        PrefetchHint {
+            locality: payload & 3,
+            write: payload & 4 != 0,
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) const VECTOR_STORES: [IntrinsicOp; 13] = [
     IntrinsicOp::VecStoreI32x4Pair,

@@ -231,6 +231,7 @@ fn mk_call(name: &str, args: Vec<Operand>, arg_types: Vec<IrType>) -> Instructio
             // Created only when every target passes `BuiltinPolicy::may_synthesize`.
             assume_library: true,
             ret_eightbyte_classes: Vec::new(),
+            cold: false,
         },
     }
 }
@@ -787,6 +788,7 @@ mod tests {
                 // A call to the library function (what lowering + policy produce).
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
+                cold: false,
             },
         }
     }

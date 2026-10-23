@@ -67,11 +67,12 @@ class Result:
     detail: str = ""
 
 
-# PGO generate mode intentionally gives its .profraw helper a process-ID
-# suffix.  It appears both as an emitted string and as a hidden helper symbol.
-# Restrict canonicalization to these two generated forms and only when the
-# source was compiled with -fprofile-generate, so an ordinary numeric codegen
-# difference is never hidden by this identity gate.
+# PGO generate mode used to give its .profraw file and its dump helper a
+# compiler process-ID suffix (current compilers emit neither; the output is
+# reproducible).  Canonicalize those two generated forms so a comparison
+# against a baseline compiler from before that change still works, and only
+# when the source was compiled with -fprofile-generate, so an ordinary
+# numeric codegen difference is never hidden by this identity gate.
 _PGO_DUMP_PID = re.compile(rb"(__lccc_pgo_dump_[0-9a-f]+_)[0-9]+")
 _PGO_RAW_PID = re.compile(rb"(lccc-(?:[A-Za-z0-9_]+-)+)[0-9]+(\.profraw)")
 # The x86 emitter materializes PGO paths as decimal .byte values rather than

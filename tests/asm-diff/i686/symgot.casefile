@@ -23,3 +23,81 @@ mov _GLOBAL_OFFSET_TABLE_, %eax
 mov %fs:_GLOBAL_OFFSET_TABLE_(%eax), %eax
 addl $_GLOBAL_OFFSET_TABLE_, %esi
 addl $_GLOBAL_OFFSET_TABLE_, %ebx
+# GOT32X selection (GAS -mrelax-relocations=yes, the 2.47 default): 32-bit
+# mov loads, test, the reg<-mem ALU ops, call/jmp * and push take
+# R_386_GOT32X with or without base/index (push measured on 2.47; 2.44 kept
+# R_386_GOT32); stores, memory-destination ALU, test $imm, 16/8-bit,
+# 0F-map (movzbl, imul) and lea keep R_386_GOT32.
+;;; got32x_relaxable_forms
+.text
+movl x@GOT(%ebx), %eax
+movl x@GOT(%ecx), %edx
+movl x@GOT(%ebx,%esi), %eax
+call *x@GOT(%ebx)
+jmp *x@GOT(%ebx)
+call *x@GOT
+testl %eax, x@GOT(%ebx)
+testl x@GOT(%ebx), %eax
+addl x@GOT(%ebx), %eax
+adcl x@GOT(%ebx), %eax
+sbbl x@GOT(%ebx), %eax
+andl x@GOT(%ebx), %eax
+orl x@GOT(%ebx), %eax
+subl x@GOT(%ebx), %eax
+xorl x@GOT(%ebx), %ecx
+cmpl x@GOT(%ebx), %eax
+pushl x@GOT(%ebx)
+pushl x@GOT
+;;; got32_non_relaxable_forms
+.text
+movl %eax, x@GOT(%ebx)
+addl %eax, x@GOT(%ebx)
+testl $1, x@GOT(%ebx)
+movw x@GOT(%ebx), %ax
+movb x@GOT(%ebx), %al
+movzbl x@GOT(%ebx), %eax
+imull x@GOT(%ebx), %eax
+leal x@GOT(%ebx), %eax
+movl $x@GOT, %eax
+# A base-less @GOT load keeps the ModR/M form at every width (only the
+# 32-bit one relaxable); stores and the other modifiers keep moffs.
+;;; got_load_no_moffs
+.text
+movl x@GOT, %eax
+movw x@GOT, %ax
+movb x@GOT, %al
+movl %eax, x@GOT
+movl x@GOTOFF, %eax
+movl x@INDNTPOFF, %eax
+# musl's PIC idiom: GAS folds `. - 1b` into the GOTPC addend.
+;;; gotpc_dot_difference
+.text
+call 1f
+1:
+pop %ebx
+addl $_GLOBAL_OFFSET_TABLE_+[.-1b], %ebx
+addl $_GLOBAL_OFFSET_TABLE_+(.-1b), %ebx
+addl $_GLOBAL_OFFSET_TABLE_+[.-1b]+4, (%esp)
+movl $_GLOBAL_OFFSET_TABLE_+(.-1b)-2, %eax
+;;; test_reg_mem
+.text
+testl %eax, 4(%ebx)
+testl 4(%ebx), %eax
+testw %cx, (%esi)
+testb %dl, -8(%ebp,%ecx,2)
+testb (%eax), %bh
+testl %eax, sym
+# Bare-symbol (absolute) memory operands of push/pop.
+;;; push_pop_absolute
+.text
+pushl sym
+pushl sym+8
+popl sym
+popl sym+4
+;;; unary_absolute
+.text
+notl sym
+negl sym+4
+mull sym
+divb sym
+incl sym

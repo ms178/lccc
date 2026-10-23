@@ -136,6 +136,41 @@ pub fn build_eh_frame_hdr(
     data
 }
 
+/// Fill the `.eh_frame_hdr` slot reserved at layout time (`12 + 8 *
+/// count_eh_frame_fdes(..)` bytes at `eh_frame_hdr_vaddr`) from the
+/// relocated `.eh_frame`. Every linker emitting PT_GNU_EH_FRAME goes through
+/// here so the failure mode is uniform.
+///
+/// When no binary-search table can be built (an FDE encoding the parser does
+/// not support, a displacement beyond sdata4), GNU ld writes a table-less
+/// header -- `eh_frame_ptr` with fde_count/table encodings DW_EH_PE_omit --
+/// and warns "no .eh_frame_hdr table will be created"; libgcc then finds the
+/// FDEs by a linear walk of `.eh_frame`. Leaving the zero-filled slot instead
+/// (version 0) makes libgcc's `dl_iterate_phdr` callback skip the object, so
+/// no unwind passes through it. Returns false when only the table-less
+/// header (or, if even `eh_frame_ptr` overflows, nothing) was written.
+pub fn write_eh_frame_hdr(
+    slot: &mut [u8],
+    eh_frame_data: &[u8],
+    eh_frame_vaddr: u64,
+    eh_frame_hdr_vaddr: u64,
+    is_64bit: bool,
+) -> bool {
+    const DW_EH_PE_OMIT: u8 = 0xff;
+    let hdr = build_eh_frame_hdr(eh_frame_data, eh_frame_vaddr, eh_frame_hdr_vaddr, is_64bit);
+    slot.fill(0);
+    if !hdr.is_empty() && hdr.len() <= slot.len() {
+        slot[..hdr.len()].copy_from_slice(&hdr);
+        return true;
+    }
+    let ptr = i128::from(eh_frame_vaddr) - (i128::from(eh_frame_hdr_vaddr) + 4);
+    if let (Ok(ptr), true) = (i32::try_from(ptr), slot.len() >= 8) {
+        slot[..4].copy_from_slice(&[1, 0x1b, DW_EH_PE_OMIT, DW_EH_PE_OMIT]);
+        write_i32_le(slot, 4, ptr);
+    }
+    false
+}
+
 /// An FDE entry parsed from .eh_frame
 struct EhFrameFde {
     initial_location: u64,
@@ -2305,5 +2340,46 @@ mod tests {
         let c = compact_eh_frame(&data, &recs, &prune);
         assert_eq!(c.data.len(), data.len() - (recs[2].end - recs[2].start));
         assert_eq!(scan_eh_frame_records(&c.data).len(), 3);
+    }
+
+    #[test]
+    fn eh_frame_hdr_slot_gets_table_or_gnu_tableless_header() {
+        // One CIE (zR, FDE encoding pcrel|sdata4) and one FDE.
+        let mut ef = Vec::new();
+        // length 16 | id 0 | v1 "zR" | code 1, data -8, RA 16 | aug 0x1b | pad
+        ef.extend_from_slice(&[16, 0, 0, 0, 0, 0, 0, 0, 1, b'z', b'R', 0, 1, 0x78, 16, 1]);
+        ef.extend_from_slice(&[0x1b, 0, 0, 0]);
+        let fde_pos = ef.len() as u32;
+        ef.extend_from_slice(&16u32.to_le_bytes());
+        ef.extend_from_slice(&(fde_pos + 4).to_le_bytes()); // CIE pointer
+        ef.extend_from_slice(&0x100i32.to_le_bytes()); // pc_begin (pcrel)
+        ef.extend_from_slice(&8u32.to_le_bytes()); // pc_range
+        ef.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(count_eh_frame_fdes(&ef), 1);
+        let (ef_va, hdr_va) = (0x2000u64, 0x1f00u64);
+        let mut slot = vec![0xaau8; 12 + 8];
+        assert!(write_eh_frame_hdr(&mut slot, &ef, ef_va, hdr_va, true));
+        assert_eq!(&slot[..4], &[1, 0x1b, 0x03, 0x3b]);
+        assert_eq!(u32::from_le_bytes(slot[8..12].try_into().unwrap()), 1);
+        // pc_begin = &pc_begin + 0x100 = ef_va + fde_pos + 8 + 0x100.
+        let loc = (ef_va + u64::from(fde_pos) + 8 + 0x100 - hdr_va) as i32;
+        assert_eq!(i32::from_le_bytes(slot[12..16].try_into().unwrap()), loc);
+
+        // A pc_begin beyond sdata4 from the header: no table can be built,
+        // so GNU's table-less header (never the version-0 zero fill).
+        let mut far = ef.clone();
+        let pb = fde_pos as usize + 8;
+        far[pb..pb + 4].copy_from_slice(&0x7fff_ff00i32.to_le_bytes());
+        let mut slot = vec![0xaau8; 12 + 8];
+        assert!(!write_eh_frame_hdr(&mut slot, &far, ef_va, hdr_va, true));
+        assert_eq!(&slot[..4], &[1, 0x1b, 0xff, 0xff]);
+        let ptr = i32::from_le_bytes(slot[4..8].try_into().unwrap());
+        assert_eq!(i64::from(ptr), ef_va as i64 - (hdr_va as i64 + 4));
+        assert!(slot[8..].iter().all(|&b| b == 0));
+
+        // Even eh_frame_ptr overflows: nothing is written.
+        let mut slot = vec![0xaau8; 12];
+        assert!(!write_eh_frame_hdr(&mut slot, &[], 1 << 40, 0, true));
+        assert!(slot.iter().all(|&b| b == 0));
     }
 }

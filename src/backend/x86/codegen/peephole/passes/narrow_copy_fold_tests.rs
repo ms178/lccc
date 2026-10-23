@@ -59,14 +59,24 @@ fn a_32_bit_self_move_survives_when_the_upper_half_is_unknown() {
     // SOUNDNESS: `movl %ebx,%ebx` is the idiomatic 64->32 truncation. With a
     // 64-bit value in %rbx it is load-bearing, and the following 64-bit read
     // must see the truncated value.
+    // The late chain rename may compute the chain in %rax directly; either
+    // way the truncating self-move must survive, and nothing else may change.
     let out = run(&f(
         "    movq (%rdi), %rbx\n    movl %ebx, %ebx\n    movq %rbx, %rax\n    ret",
     ));
-    assert_eq!(
-        count(&out, "movl %ebx, %ebx"),
-        1,
-        "must not be removed:\n{}",
-        out
+    let body: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('.') && !l.ends_with(':'))
+        .collect();
+    assert!(
+        body == [
+            "movq (%rdi), %rbx",
+            "movl %ebx, %ebx",
+            "movq %rbx, %rax",
+            "ret"
+        ] || body == ["movq (%rdi), %rax", "movl %eax, %eax", "ret"],
+        "the truncation must survive:\n{out}"
     );
 }
 
@@ -901,4 +911,143 @@ mod copyback_producer_tests {
             "copyback with intermediate base read must collapse at the copy site:\n{out}"
         );
     }
+}
+
+// ── frame-register evidence gate (direct pass calls) ────────────────────────
+//
+// These call `fold_register_copies` alone: the full pipeline also runs
+// `relay_and_lea`, whose own rbp retarget would fold the same copies and
+// mask a broken gate here.
+
+mod frame_register_gate {
+    use super::super::*;
+    use crate::backend::peephole_common::LineStore;
+
+    fn fold(body: &str) -> String {
+        let asm = super::f(body);
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        fold_register_copies(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// In a frameless function `%rbp` is an allocator GPR (callee-save
+    /// push/pop only), so a copy out of it folds like any other.
+    #[test]
+    fn a_copy_out_of_a_gpr_rbp_folds() {
+        let out = fold(concat!(
+            "    pushq %rbp\n",
+            "    leaq 8(%rdi), %rbp\n",
+            "    movq %rbp, %r11\n",
+            "    addq %r11, %rax\n",
+            "    popq %rbp\n",
+            "    ret"
+        ));
+        assert_eq!(
+            super::count(&out, "movq %rbp, %r11"),
+            0,
+            "copy must go:\n{out}"
+        );
+        assert!(out.contains("addq %rbp, %rax"), "use must read rbp:\n{out}");
+    }
+
+    /// And a copy INTO a GPR `%rbp` whose only reader follows folds onto
+    /// the source (`popq %rbp` ends rbp's value).
+    #[test]
+    fn a_copy_into_a_gpr_rbp_folds() {
+        let out = fold(concat!(
+            "    pushq %rbp\n",
+            "    movq %rdi, %rbp\n",
+            "    addq %rbp, %rax\n",
+            "    popq %rbp\n",
+            "    ret"
+        ));
+        assert_eq!(
+            super::count(&out, "movq %rdi, %rbp"),
+            0,
+            "copy must go:\n{out}"
+        );
+        assert!(out.contains("addq %rdi, %rax"), "use must read rdi:\n{out}");
+    }
+
+    /// The same copy in a frame-pointer function stays: there `%rbp` anchors
+    /// the CFA and `leave`/`popq` redefine it implicitly.
+    #[test]
+    fn a_copy_out_of_a_frame_pointer_rbp_is_kept() {
+        let out = fold(concat!(
+            "    pushq %rbp\n",
+            "    movq %rsp, %rbp\n",
+            "    movq %rbp, %r11\n",
+            "    addq %r11, %rax\n",
+            "    popq %rbp\n",
+            "    ret"
+        ));
+        assert_eq!(super::count(&out, "movq %rbp, %r11"), 1, "{out}");
+        assert!(out.contains("addq %r11, %rax"), "{out}");
+    }
+
+    /// `%rsp` is never a copy source or destination, frameless or not:
+    /// push/pop/call move it implicitly.
+    #[test]
+    fn a_copy_out_of_rsp_is_never_folded() {
+        let out = fold(concat!(
+            "    movq %rsp, %r11\n",
+            "    addq %r11, %rax\n",
+            "    ret"
+        ));
+        assert_eq!(super::count(&out, "movq %rsp, %r11"), 1, "{out}");
+    }
+
+    /// A 64-bit self-move writes the same bits back: dead for every family,
+    /// the frame registers included. The 32-bit form zeroes bits 32..63 and
+    /// stays for `%rsp`/`%rbp` even after a zero-extending write, because
+    /// their implicit redefinitions (push/pop/call/leave) are invisible to
+    /// the upper-32 tracker.
+    #[test]
+    fn frame_family_self_moves_follow_the_width_rule() {
+        let out = fold("    movq %rbp, %rbp\n    movq %rsp, %rsp\n    movw %bp, %bp\n    ret");
+        assert_eq!(super::count(&out, "movq %rbp, %rbp"), 0, "{out}");
+        assert_eq!(super::count(&out, "movq %rsp, %rsp"), 0, "{out}");
+        assert_eq!(super::count(&out, "movw %bp, %bp"), 0, "{out}");
+        let out = fold(
+            "    movl %edi, %ebp\n    pushq %rax\n    movl %ebp, %ebp\n    movl %esp, %esp\n    ret",
+        );
+        assert_eq!(super::count(&out, "movl %ebp, %ebp"), 1, "{out}");
+        assert_eq!(super::count(&out, "movl %esp, %esp"), 1, "{out}");
+    }
+}
+
+/// The extension-before-narrow-store fold must work when the register
+/// allocator homed the byte value in a frameless function's `%rbp`, even with
+/// `%rsp`-slot spill traffic in the loop: a spill is not a read of `%rbp`.
+/// Pre-fix, `classify_line` tagged every slot move with the rbp bit, liveness
+/// kept `%ebp` live past the store, and the pair survived to final assembly
+/// (`zlib_ng_adler32_combine` main, 7 vs 6 instructions per iteration).
+#[test]
+fn ext_into_allocated_rbp_folds_across_rsp_slot_spills() {
+    let out = run(&f(concat!(
+        "    pushq %rbp\n",
+        "    subq $16, %rsp\n",
+        ".LBB1:\n",
+        "    movzbl %r15b, %ebp\n",
+        "    movb %bpl, (%r12, %r14)\n",
+        "    movq %r14, 8(%rsp)\n",
+        "    addq $1, %r14\n",
+        "    cmpq $1024, %r14\n",
+        "    jb .LBB1\n",
+        "    movl $3, %ebp\n",
+        "    movq 8(%rsp), %rax\n",
+        "    addq %rbp, %rax\n",
+        "    addq $16, %rsp\n",
+        "    popq %rbp\n",
+        "    ret",
+    )));
+    assert_eq!(count(&out, "movzbl %r15b, %ebp"), 0, "{}", out);
+    assert_eq!(count(&out, "movb %r15b, (%r12, %r14)"), 1, "{}", out);
 }

@@ -37,6 +37,11 @@ _bzhi_u64(unsigned long long __src, unsigned long long __index)
 static __inline__ unsigned int __attribute__((__always_inline__))
 _pdep_u32(unsigned int __src, unsigned int __mask)
 {
+#ifdef __BMI2__
+    unsigned int __r;
+    __asm__("pdepl %2, %1, %0" : "=r"(__r) : "r"(__src), "rm"(__mask));
+    return __r;
+#else
     unsigned int __result = 0;
     unsigned int __k = 0;
     for (unsigned int __i = 0; __i < 32; __i++) {
@@ -47,12 +52,18 @@ _pdep_u32(unsigned int __src, unsigned int __mask)
         }
     }
     return __result;
+#endif
 }
 
 /* _pext_u32: parallel bit extract */
 static __inline__ unsigned int __attribute__((__always_inline__))
 _pext_u32(unsigned int __src, unsigned int __mask)
 {
+#ifdef __BMI2__
+    unsigned int __r;
+    __asm__("pextl %2, %1, %0" : "=r"(__r) : "r"(__src), "rm"(__mask));
+    return __r;
+#else
     unsigned int __result = 0;
     unsigned int __k = 0;
     for (unsigned int __i = 0; __i < 32; __i++) {
@@ -63,6 +74,7 @@ _pext_u32(unsigned int __src, unsigned int __mask)
         }
     }
     return __result;
+#endif
 }
 
 #ifdef __x86_64__
@@ -70,6 +82,11 @@ _pext_u32(unsigned int __src, unsigned int __mask)
 static __inline__ unsigned long long __attribute__((__always_inline__))
 _pdep_u64(unsigned long long __src, unsigned long long __mask)
 {
+#ifdef __BMI2__
+    unsigned long long __r;
+    __asm__("pdepq %2, %1, %0" : "=r"(__r) : "r"(__src), "rm"(__mask));
+    return __r;
+#else
     unsigned long long __result = 0;
     unsigned long long __k = 0;
     for (unsigned long long __i = 0; __i < 64; __i++) {
@@ -80,12 +97,18 @@ _pdep_u64(unsigned long long __src, unsigned long long __mask)
         }
     }
     return __result;
+#endif
 }
 
 /* _pext_u64: parallel bit extract (64-bit) */
 static __inline__ unsigned long long __attribute__((__always_inline__))
 _pext_u64(unsigned long long __src, unsigned long long __mask)
 {
+#ifdef __BMI2__
+    unsigned long long __r;
+    __asm__("pextq %2, %1, %0" : "=r"(__r) : "r"(__src), "rm"(__mask));
+    return __r;
+#else
     unsigned long long __result = 0;
     unsigned long long __k = 0;
     for (unsigned long long __i = 0; __i < 64; __i++) {
@@ -96,6 +119,7 @@ _pext_u64(unsigned long long __src, unsigned long long __mask)
         }
     }
     return __result;
+#endif
 }
 #endif
 

@@ -292,17 +292,28 @@ impl RiscvCodegen {
         let func_name = match (from_signed, to_ty) {
             (true, IrType::F64) => "__floattidf",
             (true, IrType::F32) => "__floattisf",
+            (true, IrType::F128) => "__floattitf",
             (false, IrType::F64) => "__floatuntidf",
             (false, IrType::F32) => "__floatuntisf",
+            (false, IrType::F128) => "__floatuntitf",
             _ => panic!("unsupported i128-to-float conversion: {:?}", to_ty),
         };
         self.state.emit_fmt(format_args!("    call {}", func_name));
         self.state.reg_cache.invalidate_all();
-        if to_ty == IrType::F32 {
-            self.state.emit("    fmv.x.w t0, fa0");
-        } else {
-            self.state.emit("    fmv.x.d t0, fa0");
+        match to_ty {
+            IrType::F32 => self.state.emit("    fmv.x.w t0, fa0"),
+            // binary128 comes back in a0:a1 (LP64D passes long double in an
+            // integer pair); `emit_store_f128_a0_a1_result` stores it.
+            IrType::F128 => {}
+            _ => self.state.emit("    fmv.x.d t0, fa0"),
         }
+    }
+
+    /// Store the binary128 result of an i128 -> long double conversion
+    /// (a0:a1) the way every other F128-producing cast does: the full value
+    /// in the slot plus the F64 working copy (`f128_store_result_and_truncate`).
+    pub(super) fn emit_store_f128_a0_a1_result(&mut self, dest: &Value) {
+        crate::backend::f128_softfloat::F128SoftFloat::f128_store_result_and_truncate(self, dest);
     }
 
     pub(super) fn emit_float_to_i128_call_impl(
@@ -311,17 +322,26 @@ impl RiscvCodegen {
         to_signed: bool,
         from_ty: IrType,
     ) {
-        self.operand_to_t0(src);
-        if from_ty == IrType::F32 {
-            self.state.emit("    fmv.w.x fa0, t0");
-        } else {
-            self.state.emit("    fmv.d.x fa0, t0");
+        match from_ty {
+            // Full precision: the slot's binary128, not the F64 working copy
+            // (which would round every value above 2^53).
+            IrType::F128 => self.emit_f128_operand_to_a0_a1(src),
+            IrType::F32 => {
+                self.operand_to_t0(src);
+                self.state.emit("    fmv.w.x fa0, t0");
+            }
+            _ => {
+                self.operand_to_t0(src);
+                self.state.emit("    fmv.d.x fa0, t0");
+            }
         }
         let func_name = match (to_signed, from_ty) {
             (true, IrType::F64) => "__fixdfti",
             (true, IrType::F32) => "__fixsfti",
+            (true, IrType::F128) => "__fixtfti",
             (false, IrType::F64) => "__fixunsdfti",
             (false, IrType::F32) => "__fixunssfti",
+            (false, IrType::F128) => "__fixunstfti",
             _ => panic!("unsupported float-to-i128 conversion: {:?}", from_ty),
         };
         self.state.emit_fmt(format_args!("    call {}", func_name));

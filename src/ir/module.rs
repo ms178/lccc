@@ -44,18 +44,16 @@ pub struct IrModule {
     /// Symbol version directives: (function_name, symver_string)
     /// From __attribute__((symver("name@@VERSION"))) - emitted as .symver directives
     pub symver_directives: Vec<(String, String)>,
+    /// `__attribute__((tls_model("...")))` per TLS symbol (IR name): the
+    /// attribute of the symbol's LAST declaration, absent when that one is
+    /// plain (GCC 16.2; see `record_tls_model_attr`). Consumed only through
+    /// `common::tls::model_table`.
+    pub tls_model_attrs: crate::common::fx_hash::FxHashMap<String, crate::common::tls::TlsModel>,
 }
 
-/// ELF thread-local storage access model requested by the source or driver.
-/// `None` at both levels means the backend selects the fastest model that
-/// preserves preemption and dynamic-loading semantics.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TlsModel {
-    LocalExec,
-    InitialExec,
-    LocalDynamic,
-    GlobalDynamic,
-}
+/// The ELF TLS access model (one enum for the whole compiler; the policy that
+/// picks a symbol's model lives with it in `common::tls`).
+pub use crate::common::tls::TlsModel;
 
 /// A global variable.
 #[derive(Debug, Clone)]
@@ -90,9 +88,6 @@ pub struct IrGlobal {
     /// Whether this global has _Thread_local or __thread storage class.
     /// Thread-local globals are placed in .tdata/.tbss and accessed via TLS mechanisms.
     pub is_thread_local: bool,
-    /// Per-declaration `__attribute__((tls_model("...")))`, which overrides
-    /// the compilation-wide command-line policy for references to this symbol.
-    pub tls_model: Option<TlsModel>,
 }
 
 /// Initializer for a global variable.
@@ -187,6 +182,21 @@ impl GlobalInit {
     }
 }
 
+/// Normalize a `target("...")` attribute string into the canonical
+/// feature set stored in [`IrFunction::target_features`]: split on commas,
+/// trim, lower-case, drop empties, sort, deduplicate. Canonical order lets
+/// the inliner compare sets with a plain subset test.
+pub fn normalize_target_features(raw: &str) -> Vec<String> {
+    let mut features: Vec<String> = raw
+        .split(',')
+        .map(|f| f.trim().to_ascii_lowercase())
+        .filter(|f| !f.is_empty())
+        .collect();
+    features.sort_unstable();
+    features.dedup();
+    features
+}
+
 /// An IR function.
 #[derive(Debug, Clone)]
 pub struct IrFunction {
@@ -224,6 +234,13 @@ pub struct IrFunction {
     pub next_label: u32,
     /// __attribute__((section("..."))) - place in specific ELF section.
     pub section: Option<String>,
+    /// Normalized `__attribute__((target("...")))` features: lower-case,
+    /// trimmed, sorted, deduplicated (see [`normalize_target_features`]).
+    /// Empty for functions without the attribute. The inliner refuses to
+    /// clone a callee whose set is not a subset of its caller's (GCC's
+    /// `can_inline_p` ISA rule); the x86-64 emitter enables the scalar
+    /// integer extensions it names while emitting this function.
+    pub target_features: Vec<String>,
     /// __attribute__((visibility("hidden"|"default"|...)))
     pub visibility: Option<String>,
     /// __attribute__((weak)) - emit as a weak symbol (STB_WEAK).
@@ -335,6 +352,7 @@ impl IrModule {
             symbol_attrs: Vec::new(),
             asm_labels: crate::common::fx_hash::FxHashMap::default(),
             symver_directives: Vec::new(),
+            tls_model_attrs: crate::common::fx_hash::FxHashMap::default(),
         }
     }
 
@@ -375,6 +393,7 @@ impl IrFunction {
             is_inline: false,
             is_always_inline: false,
             is_noinline: false,
+            target_features: Vec::new(),
             next_value_id: 0,
             fp_expr_tags: Default::default(),
             next_label: 0,

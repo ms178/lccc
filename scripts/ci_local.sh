@@ -198,6 +198,10 @@ gate "default-isa-policy" fast \
     env CCC="$LCCC" bash tests/regression/check_default_isa_policy.sh
 gate "cas16-lowering" fast \
     env CCC="$LCCC" bash tests/regression/check_cas16_lowering.sh
+gate "target-attribute-isa" fast \
+    env CCC="$LCCC" bash tests/regression/check_target_attribute_isa.sh
+gate "x86-scalar-intrinsics" fast \
+    env CCC="$LCCC" GCC="${GCC16:-gcc-16}" sh tests/regression/check_x86_scalar_intrinsics.sh
 gate "atomic16-runtime" fast \
     env CCC="$LCCC" bash tests/regression/check_atomic16_runtime.sh
 gate "i128-atomic-call-clobber" fast \
@@ -731,6 +735,11 @@ gate "riscv-shared-binding" fast \
 # A14-17: shared linking must not silently consume unknown relocation kinds.
 gate "riscv-relocation-contract" fast \
     python3 tests/linker/check_riscv_relocation_contract.py --lccc target/fastbuild/lccc-riscv
+
+# Linker relaxation vs. assembler alignment/difference fixups: the same
+# object linked by lccc-ld, ld.lld and GNU ld must pass its run-time checks.
+gate "riscv-relax-layout" fast \
+    env CCC_RISCV=target/fastbuild/lccc-riscv bash tests/regression/check_riscv_relax_layout.sh
 
 gate "pr824-boundaries" fast \
     python3 tests/regression/check_pr824_boundaries.py --lccc target/fastbuild/lccc --cross --json target/redteam/boundaries.json
@@ -1269,6 +1278,22 @@ gate "oracle-diagnostics" fast python3 scripts/test_ci_oracle_diagnostics.py
 gate "tls-model-option" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_tls_model_option.sh
 
+# Run-time witness of the dynamic TLS models (x86-64 bfd/lccc-ld/mold/lld,
+# i686, and AArch64/RISC-V under qemu when the cross toolchain is installed).
+gate "tls-dynamic-witness" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_tls_dynamic_witness.sh
+
+# libgcc's unwinder through lccc-assembled frames (.cfi_* lowering on every
+# target) in executables and shared libraries -- bfd, lccc-ld, mold, lld --
+# which it reaches only through PT_GNU_EH_FRAME.
+gate "cfi-unwind" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_cfi_unwind.sh
+
+# The builtin linkers against gcc's link semantics: -shared startup files and
+# default libraries, user -l before the defaults, -rpath, as-needed libm.
+gate "builtin-dso-link" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_builtin_dso_link.sh
+
 gate "f128-sign-intrinsics-strict-fp" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_f128_sign_intrinsics_strict_fp.sh
 
@@ -1411,6 +1436,14 @@ gate "pipefail-sigpipe-selftest" fast \
     python3 scripts/check_pipefail_sigpipe.py --self-test
 gate "pipefail-sigpipe" fast \
     python3 scripts/check_pipefail_sigpipe.py
+
+# The inverse trap: errexit ignores a pipeline inverted with `!`, so a bare
+# `! grep -q FORBIDDEN out.s` never fails its gate.  43 such assertions were
+# dead when this landed, two of them over wrong premises.
+gate "errexit-negation-selftest" fast \
+    python3 scripts/check_errexit_negation.py --self-test
+gate "errexit-negation" fast \
+    python3 scripts/check_errexit_negation.py
 
 gate "hot-loop-metric" fast \
     python3 scripts/test_hot_loop_metric.py
@@ -1843,6 +1876,8 @@ gate "i686-asm-diff" fast \
         --lccc target/fastbuild/lccc-i686
 gate "i686-tls-ie-relax" fast \
     bash tests/regression/check_i686_tls_ie_relax.sh
+gate "i686-got32x-relax" fast \
+    bash tests/regression/check_i686_got32x_relax.sh
 
 gate "i686-narrow-cmp-flag-law" fast \
     bash tests/regression/check_narrow_cmp_flag_law.sh

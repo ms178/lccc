@@ -34,8 +34,18 @@ mem_subs = re.findall(r"^\s*vsubsd\s+\d*\(%rsi\),\s*%xmm\d+,\s*%xmm\d+", distanc
 if len(mem_subs) != 3:
     raise SystemExit("distance3 must fold all three single-use RHS loads into vsubsd")
 # Only the ABI return copy should remain; the old path had seven XMM relays.
-if len(re.findall(r"^\s*movsd\s+%xmm\d+,\s*%xmm\d+\s*$", distance, re.M)) != 1:
-    raise SystemExit("distance3 contains unexpected register-to-register movsd relays")
+# Count every register-to-register XMM move spelling: the full-register
+# `(v)movapd` (dependency-free, eliminated at rename) replaced the merging
+# `movsd %src, %dst`, and a relay must not hide behind either name.
+relays = re.findall(
+    r"^\s*v?mov(?:s[sd]|ap[sd])\s+%xmm\d+,\s*%xmm(\d+)\s*$", distance, re.M
+)
+if len(relays) != 1 or relays[0] != "0":
+    raise SystemExit(
+        f"distance3 contains unexpected register-to-register XMM relays: {relays}"
+    )
+if re.search(r"^\s*movs[sd]\s+%xmm\d+,\s*%xmm\d+\s*$", distance, re.M):
+    raise SystemExit("distance3 return copy is a merging movsd (false dependency)")
 
 # When an accumulator shares a home with a multiplicand, the destructive FMA
 # must not clobber a multiplicand before every read of it. A single VEX FMA

@@ -164,6 +164,67 @@ fn conditional_increment_leaf_plan(
 impl ArmCodegen {
     // ---- calculate_stack_space ----
 
+    /// The `ARM_CALLER_SAVED` registers some emitter in `func` uses as
+    /// unmodelled scratch, so no value may be homed there. An ALLOWLIST: an
+    /// instruction proven to scratch nothing in the pool contributes nothing,
+    /// the audited scratch users contribute their registers, and anything
+    /// else (intrinsics, inline asm, dynamic stack, non-local control, PGO
+    /// and libcall-backed helpers) closes the whole pool -- a future lowering
+    /// that grabs a pool register then fails closed instead of clobbering a
+    /// live home. Audited emitters:
+    ///   * atomics (`atomics.rs`): `w4` is the `stxr` status register;
+    ///   * variadics (`variadic.rs`): `x4`-`x6` address/copy temporaries;
+    ///   * `Memcpy` (`memory.rs`): `ldp x12, x13` block-copy pair.
+    /// Call staging (x4-x8 argument writes, x13/x14 temporaries) is modelled
+    /// by `call_arg_regs` and the call points themselves; I128/F128 functions
+    /// clear the pool before this is consulted.
+    fn arm_pool_scratch(func: &IrFunction) -> &'static [u8] {
+        use crate::ir::reexports::Instruction as I;
+        const ALL: &[u8] = &[4, 5, 6, 7, 8, 13, 14];
+        let (mut atomics, mut varargs, mut memcpy) = (false, false, false);
+        for inst in func.blocks.iter().flat_map(|b| &b.instructions) {
+            match inst {
+                I::Alloca { .. }
+                | I::Store { .. }
+                | I::Load { .. }
+                | I::BinOp { .. }
+                | I::UnaryOp { .. }
+                | I::Cmp { .. }
+                | I::Call { .. }
+                | I::CallIndirect { .. }
+                | I::GetElementPtr { .. }
+                | I::Cast { .. }
+                | I::Copy { .. }
+                | I::GlobalAddr { .. }
+                | I::Phi { .. }
+                | I::LabelAddr { .. }
+                | I::Select { .. }
+                | I::ParamRef { .. }
+                | I::AtomicLoad { .. }
+                | I::AtomicStore { .. }
+                | I::Fence { .. }
+                // `intrinsics.rs`: x0/x1/x9-x12 only, no branch-and-link.
+                | I::Intrinsic { .. } => {}
+                I::AtomicRmw { .. } | I::AtomicCmpxchg { .. } => atomics = true,
+                I::VaArg { .. }
+                | I::VaArgStruct { .. }
+                | I::VaArgVector { .. }
+                | I::VaStart { .. }
+                | I::VaCopy { .. } => varargs = true,
+                I::Memcpy { .. } => memcpy = true,
+                _ => return ALL,
+            }
+        }
+        match (atomics, varargs, memcpy) {
+            (false, false, false) => &[],
+            (true, false, false) => &[4],
+            (false, true, false) | (true, true, false) => &[4, 5, 6],
+            (false, false, true) => &[13],
+            (true, false, true) => &[4, 13],
+            (_, true, true) => &[4, 5, 6, 13],
+        }
+    }
+
     pub(super) fn calculate_stack_space_impl(&mut self, func: &IrFunction) -> i64 {
         use crate::backend::regalloc::PhysReg;
         use crate::ir::reexports::Instruction;
@@ -251,6 +312,8 @@ impl ArmCodegen {
         if has_f128_ops || has_i128_ops {
             caller_saved_regs.clear();
         } else {
+            // Emitter scratch the pool must never hold a value across.
+            caller_saved_regs.retain(|r| !Self::arm_pool_scratch(func).contains(&r.0));
             // Pure scalar-ALU functions never invoke the address, memcpy,
             // call-staging, intrinsic, or inline-assembly scratch paths. Make
             // the otherwise-reserved caller-saved registers available to
@@ -291,12 +354,21 @@ impl ArmCodegen {
         // result register; all are in the caller-saved pool. A value consumed
         // as a call argument must not be homed there (the staging writes them
         // in order before reading the value).
+        //
+        // x13/x14 belong here too: `emit_call_gp_to_temps` stages GP argument
+        // k into `ARM_TMP_REGS[k]` (x9, x10, ...) in argument order, so the
+        // fifth argument's staging overwrites x13 before a later argument
+        // homed there is read (and likewise x14 for the sixth). The generic
+        // Phase 2 routes argument-consumed values to the pool minus these
+        // registers -- which, without x13/x14, is exactly {x13, x14}.
         let call_arg_regs = vec![
             crate::backend::regalloc::PhysReg(4),
             crate::backend::regalloc::PhysReg(5),
             crate::backend::regalloc::PhysReg(6),
             crate::backend::regalloc::PhysReg(7),
             crate::backend::regalloc::PhysReg(8),
+            crate::backend::regalloc::PhysReg(13),
+            crate::backend::regalloc::PhysReg(14),
         ];
         let (
             mut reg_assigned,
@@ -320,6 +392,8 @@ impl ArmCodegen {
             // allocator must keep the index live to the consumer's end.
             // AArch64 has no segment indexed emitters (ArchCodegen default: false).
             crate::backend::generation::collect_folded_index_links(func, false),
+            // AArch64 folds constant offsets against allocas only.
+            Vec::new(),
             &self.state.ra_config,
             // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
             &mut crate::common::fx_hash::FxHashMap::default(),
@@ -780,5 +854,55 @@ impl ArmCodegen {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pool_scratch_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, Instruction, Terminator, Value};
+
+    fn func(insts: Vec<Instruction>) -> IrFunction {
+        let mut f = IrFunction::new("pool".to_string(), IrType::Void, vec![], false);
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(None),
+            source_spans: Vec::new(),
+        }];
+        f
+    }
+
+    /// Each audited scratch user removes exactly its registers; anything not
+    /// on the allowlist closes the whole pool.
+    #[test]
+    fn scratch_users_remove_their_registers_and_unknowns_fail_closed() {
+        let memcpy = || Instruction::Memcpy {
+            dest: Value(1),
+            src: Value(2),
+            size: 64,
+        };
+        let va = || Instruction::VaStart {
+            va_list_ptr: Value(3),
+        };
+        let fence = || Instruction::Fence {
+            ordering: crate::ir::reexports::AtomicOrdering::SeqCst,
+        };
+        assert_eq!(ArmCodegen::arm_pool_scratch(&func(vec![])), &[] as &[u8]);
+        assert_eq!(
+            ArmCodegen::arm_pool_scratch(&func(vec![fence()])),
+            &[] as &[u8]
+        );
+        assert_eq!(ArmCodegen::arm_pool_scratch(&func(vec![memcpy()])), &[13]);
+        assert_eq!(ArmCodegen::arm_pool_scratch(&func(vec![va()])), &[4, 5, 6]);
+        assert_eq!(
+            ArmCodegen::arm_pool_scratch(&func(vec![va(), memcpy()])),
+            &[4, 5, 6, 13]
+        );
+        let unknown = Instruction::StackSave { dest: Value(4) };
+        assert_eq!(
+            ArmCodegen::arm_pool_scratch(&func(vec![memcpy(), unknown])),
+            &[4, 5, 6, 7, 8, 13, 14]
+        );
     }
 }

@@ -107,7 +107,7 @@ impl RiscvCodegen {
                         if !allow_dynamic_tls
                             && self.state.tls_symbols.contains(name)
                             && matches!(
-                                self.state.tls_model_for_symbol(name),
+                                self.state.tls_model(name),
                                 crate::ir::reexports::TlsModel::GlobalDynamic
                                     | crate::ir::reexports::TlsModel::LocalDynamic
                             )
@@ -243,6 +243,8 @@ impl RiscvCodegen {
             call_arg_regs,
             Vec::new(),
             crate::common::fx_hash::FxHashMap::default(),
+            // RISC-V folds constant offsets against allocas only.
+            Vec::new(),
             &self.state.ra_config,
             // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
             &mut crate::common::fx_hash::FxHashMap::default(),
@@ -270,7 +272,7 @@ impl RiscvCodegen {
                 crate::ir::reexports::Instruction::GlobalAddr { dest, name }
                     if self.state.tls_symbols.contains(name)
                         && matches!(
-                            self.state.tls_model_for_symbol(name),
+                            self.state.tls_model(name),
                             crate::ir::reexports::TlsModel::GlobalDynamic
                                 | crate::ir::reexports::TlsModel::LocalDynamic
                         ) =>

@@ -3,11 +3,29 @@
 //! A pair of IR `GlobalAddr` roots is not enough to prove different objects:
 //! GNU aliases and `asm("label")` can give one linker object multiple source
 //! names, while two public declarations can be interposed or coalesced at link
-//! time. A strong internal-linkage definition with no alias-like redirection or
-//! opaque top-level assembly supplies a private-identity witness; a consumer
-//! may use it to distinguish that object from a separately named public root.
+//! time.
+//!
+//! The identity witness is GCC's `symtab_node::equal_address_to` rule without
+//! its alias-oracle shortcut (which assumes *any* two variables differ): a
+//! name is a witness when this unit holds its strong (not weak, not common)
+//! definition, that definition binds locally, and no alias or assembler label
+//! here redirects it.  Such a name cannot share storage with a differently
+//! named object:
+//!
+//! * GNU C requires an alias to be defined in the same unit as its target, so
+//!   every alias of a definition made here is visible in `aliased_names`;
+//! * the only remaining way another name could reach this storage is symbol
+//!   interposition, which a locally binding definition excludes (`static`,
+//!   hidden/internal/protected visibility, or any definition in executable
+//!   code — see [`crate::common::tls::binds_locally`]).
+//!
+//! A declaration (`extern`) is never a witness: another unit may define it as
+//! an alias of something else (`tests/regression/check_loop_idiom.sh` runs
+//! exactly that cross-unit case).  Two names are distinct objects when neither
+//! is redirected and at least one is a witness ([`ModuleSymbolFacts::globals_distinct`]),
+//! the single answer every memory transform asks.
 
-use crate::common::fx_hash::FxHashSet;
+use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::ir::module::IrModule;
 
 #[derive(Debug, Default)]
@@ -15,12 +33,23 @@ pub(crate) struct ModuleSymbolFacts {
     /// Names that participate in an alias or assembler-label redirection.
     /// Neither side of a redirection is safe as a distinct-global proof.
     pub(crate) aliased_names: FxHashSet<String>,
-    /// Strong file-local definitions with stable, private object identity.
-    pub(crate) local_globals: FxHashSet<String>,
+    /// Strong, unredirected, locally binding definitions in this unit: object
+    /// identities no other name can reach (see the module documentation).
+    pub(crate) identity_witnesses: FxHashSet<String>,
 }
 
 impl ModuleSymbolFacts {
-    pub(crate) fn from_module(module: &IrModule) -> Self {
+    /// Whether two global roots name provably different objects.
+    pub(crate) fn globals_distinct(&self, a: &str, b: &str) -> bool {
+        a != b
+            && (self.identity_witnesses.contains(a) || self.identity_witnesses.contains(b))
+            && !self.aliased_names.contains(a)
+            && !self.aliased_names.contains(b)
+    }
+
+    /// `shlib` is GCC's `flag_shlib` (`-fPIC`/`-fpic`/`-shared`): only there
+    /// can a public definition be interposed.
+    pub(crate) fn from_module(module: &IrModule, shlib: bool) -> Self {
         let mut aliased_names = module
             .aliases
             .iter()
@@ -32,32 +61,54 @@ impl ModuleSymbolFacts {
             aliased_names.insert(label.clone());
         }
 
-        let mut local_globals = module
-            .globals
-            .iter()
-            .filter(|global| {
-                global.is_static && !global.is_extern && !global.is_common && !global.is_weak
-            })
-            .map(|global| global.name.clone())
-            .collect::<FxHashSet<_>>();
-        // Weak symbol attributes can be kept separately from the global's
-        // declaration record; either representation must remove the proof.
-        for (name, is_weak, _) in &module.symbol_attrs {
-            if *is_weak {
-                local_globals.remove(name);
+        // Redeclarations are merged per name the way `tls::model_table` merges
+        // them (defined if any record defines it, `static` if any record is,
+        // first explicit visibility wins); a weak or common mark on *any*
+        // record, or in a separate attribute record, removes the witness.
+        #[derive(Default)]
+        struct Decl<'a> {
+            is_static: bool,
+            defined: bool,
+            weak_or_common: bool,
+            visibility: Option<&'a str>,
+        }
+        let mut decls: FxHashMap<&str, Decl<'_>> = FxHashMap::default();
+        for g in &module.globals {
+            let d = decls.entry(g.name.as_str()).or_default();
+            d.is_static |= g.is_static;
+            d.defined |= !g.is_extern;
+            d.weak_or_common |= g.is_weak || g.is_common;
+            if d.visibility.is_none() {
+                d.visibility = g.visibility.as_deref();
             }
         }
-        // A global name on either side of an alias/asm-label mapping is not a
-        // distinct-object witness, even if its definition has internal linkage.
-        local_globals.retain(|name| !aliased_names.contains(name));
-        // Arbitrary assembler may define aliases the IR cannot enumerate.
-        if !module.toplevel_asm.is_empty() {
-            local_globals.clear();
+        for (name, is_weak, vis) in &module.symbol_attrs {
+            if let Some(d) = decls.get_mut(name.as_str()) {
+                d.weak_or_common |= *is_weak;
+                if d.visibility.is_none() {
+                    d.visibility = vis.as_deref();
+                }
+            }
         }
+        // Arbitrary assembler may define aliases the IR cannot enumerate.
+        let identity_witnesses = if module.toplevel_asm.is_empty() {
+            decls
+                .into_iter()
+                .filter(|(name, d)| {
+                    d.defined
+                        && !d.weak_or_common
+                        && !aliased_names.contains(*name)
+                        && crate::common::tls::binds_locally(shlib, d.is_static, true, d.visibility)
+                })
+                .map(|(name, _)| name.to_string())
+                .collect()
+        } else {
+            FxHashSet::default()
+        };
 
         Self {
             aliased_names,
-            local_globals,
+            identity_witnesses,
         }
     }
 }
@@ -85,12 +136,20 @@ mod tests {
             is_const: false,
             is_used: false,
             is_thread_local: false,
-            tls_model: None,
         }
     }
 
+    fn witnesses(module: &IrModule, shlib: bool) -> Vec<String> {
+        let mut v: Vec<String> = ModuleSymbolFacts::from_module(module, shlib)
+            .identity_witnesses
+            .into_iter()
+            .collect();
+        v.sort();
+        v
+    }
+
     #[test]
-    fn only_unredirected_strong_private_globals_keep_distinct_identity() {
+    fn only_unredirected_strong_local_definitions_are_identity_witnesses() {
         let mut module = IrModule::new();
         module.globals = ["a", "b", "c", "weak", "alias_a", "asm_b"]
             .map(local_global)
@@ -103,35 +162,108 @@ mod tests {
         external.is_extern = true;
         let mut public = local_global("public");
         public.is_static = false;
+        let mut hidden = local_global("hidden");
+        hidden.is_static = false;
+        hidden.visibility = Some("hidden".into());
+        let mut hidden_decl = local_global("hidden_decl");
+        hidden_decl.is_static = false;
+        hidden_decl.is_extern = true;
+        hidden_decl.visibility = Some("hidden".into());
         module
             .globals
-            .extend([weak_record, common, external, public]);
+            .extend([weak_record, common, external, public, hidden, hidden_decl]);
         module.aliases.push(("alias_a".into(), "a".into(), false));
         module.asm_labels.insert("b".into(), "asm_b".into());
         module.symbol_attrs.push(("weak".into(), true, None));
 
-        let facts = ModuleSymbolFacts::from_module(&module);
-        assert!(facts.aliased_names.contains("a"));
-        assert!(facts.aliased_names.contains("alias_a"));
-        assert!(facts.aliased_names.contains("b"));
-        assert!(facts.aliased_names.contains("asm_b"));
-        assert!(facts.local_globals.contains("c"));
-        assert!(!facts.local_globals.contains("a"));
-        assert!(!facts.local_globals.contains("b"));
-        assert!(!facts.local_globals.contains("weak"));
-        assert!(!facts.local_globals.contains("weak_record"));
-        assert!(!facts.local_globals.contains("common"));
-        assert!(!facts.local_globals.contains("external"));
-        assert!(!facts.local_globals.contains("public"));
-        assert!(!facts.local_globals.contains("alias_a"));
-        assert!(!facts.local_globals.contains("asm_b"));
+        let facts = ModuleSymbolFacts::from_module(&module, false);
+        for redirected in ["a", "alias_a", "b", "asm_b"] {
+            assert!(facts.aliased_names.contains(redirected), "{redirected}");
+        }
+        // Executable code: every strong definition binds to itself, public or
+        // not; declarations, weak/common definitions and redirected names
+        // never witness.
+        assert_eq!(witnesses(&module, false), ["c", "hidden", "public"]);
+        // Shared-library code: a default-visibility public definition can be
+        // interposed, so only `static` and hidden definitions remain.  A hidden
+        // *declaration* binds locally but may be another unit's alias.
+        assert_eq!(witnesses(&module, true), ["c", "hidden"]);
 
         module.toplevel_asm.push(".globl hidden_alias".into());
         assert!(
-            ModuleSymbolFacts::from_module(&module)
-                .local_globals
-                .is_empty(),
+            witnesses(&module, false).is_empty(),
             "opaque top-level assembler may redirect any global name"
         );
+    }
+
+    #[test]
+    fn a_weak_or_common_redeclaration_removes_the_witness() {
+        // `int x; extern int x __attribute__((weak));` and the common form
+        // arrive as separate records of one name: any record's mark counts.
+        let mut module = IrModule::new();
+        let mut weak_redecl = local_global("x");
+        weak_redecl.is_extern = true;
+        weak_redecl.is_weak = true;
+        let mut common_redecl = local_global("y");
+        common_redecl.is_common = true;
+        module.globals = vec![
+            local_global("x"),
+            weak_redecl,
+            common_redecl,
+            local_global("y"),
+        ];
+        assert!(witnesses(&module, false).is_empty());
+    }
+
+    #[test]
+    fn redeclarations_merge_definition_static_and_visibility() {
+        // `extern int p; int p = 1;` is a definition; `extern int h
+        // __attribute__((visibility("hidden"))); int h;` binds locally in a
+        // shared library through the first explicit visibility.
+        let mut module = IrModule::new();
+        let mut p_decl = local_global("p");
+        p_decl.is_static = false;
+        p_decl.is_extern = true;
+        let mut p_def = local_global("p");
+        p_def.is_static = false;
+        let mut h_decl = local_global("h");
+        h_decl.is_static = false;
+        h_decl.is_extern = true;
+        h_decl.visibility = Some("hidden".into());
+        let mut h_def = local_global("h");
+        h_def.is_static = false;
+        module.globals = vec![p_decl, p_def, h_decl, h_def];
+        assert_eq!(witnesses(&module, false), ["h", "p"]);
+        assert_eq!(witnesses(&module, true), ["h"]);
+        // A visibility written only in an attribute record counts as well.
+        module.globals.retain(|g| g.name == "p");
+        module
+            .symbol_attrs
+            .push(("p".into(), false, Some("hidden".into())));
+        assert_eq!(witnesses(&module, true), ["p"]);
+        // Protected *data* does not bind locally in shared-library code: the
+        // executable may copy-relocate it (GCC's `extern_protected_data` on
+        // x86, `tls::binds_locally`), so it is not a witness there.
+        module.symbol_attrs.clear();
+        module.globals[0].visibility = Some("protected".into());
+        assert_eq!(witnesses(&module, false), ["p"]);
+        assert!(witnesses(&module, true).is_empty());
+    }
+
+    #[test]
+    fn distinct_needs_one_witness_and_no_redirection() {
+        let facts = ModuleSymbolFacts {
+            aliased_names: ["w_alias", "w2"].map(str::to_owned).into_iter().collect(),
+            identity_witnesses: ["w", "w2"].map(str::to_owned).into_iter().collect(),
+        };
+        assert!(facts.globals_distinct("w", "decl"));
+        assert!(facts.globals_distinct("decl", "w"));
+        assert!(!facts.globals_distinct("w", "w"));
+        // Two declarations: another unit may define one as the other's alias.
+        assert!(!facts.globals_distinct("decl_a", "decl_b"));
+        // The witness's own alias reaches its storage.
+        assert!(!facts.globals_distinct("w", "w_alias"));
+        // A redirected name never witnesses, whatever the set says.
+        assert!(!facts.globals_distinct("w2", "decl"));
     }
 }

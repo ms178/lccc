@@ -1,5 +1,6 @@
 // Direct IR contracts: these exercise the matcher independently of frontend
 // simplification, and verify CFG/SSA and debug-span invariants after rewriting.
+use crate::passes::module_symbol_facts::ModuleSymbolFacts;
 use super::*;
 
 fn rotated(narrow_condition: bool, compare: Option<IrCmpOp>) -> IrFunction {
@@ -213,8 +214,7 @@ fn native_permission_is_explicit_and_does_not_leak_between_invocations() {
         assert_eq!(
             super::super::run_function(
                 &mut f,
-                &FxHashSet::default(),
-                &FxHashSet::default(),
+                &ModuleSymbolFacts::default(),
                 Capabilities {
                     native_popcount: enabled
                 }

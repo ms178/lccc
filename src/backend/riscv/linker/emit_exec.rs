@@ -58,6 +58,8 @@ pub fn emit_executable(
     copy_symbols: &[(String, u64)],
     sec_indices: &[usize],
     actual_needed_libs: &[String],
+    shared_lib_syms: &super::input::SharedLibSyms,
+    rpath: Option<&(i64, String)>,
     is_static: bool,
     output_path: &str,
 ) -> Result<(), String> {
@@ -79,7 +81,7 @@ pub fn emit_executable(
     let dynamic_size = if is_static {
         0
     } else {
-        let dyn_entry_count = 30 + actual_needed_libs.len();
+        let dyn_entry_count = 30 + actual_needed_libs.len() + usize::from(rpath.is_some());
         dyn_entry_count as u64 * 16
     };
 
@@ -99,6 +101,11 @@ pub fn emit_executable(
         .get(".eh_frame")
         .map(|&i| linker_common::count_eh_frame_fdes(&merged_sections[i].data))
         .unwrap_or(0);
+    // The layout order was computed before this section existed: place it
+    // right before `.eh_frame`, where GNU ld puts it (section_order 250 <
+    // 260). (Pre-fix it was never laid out, so PT_GNU_EH_FRAME pointed at
+    // address 0 and the unwinder found no FDE in any lccc-ld executable.)
+    let mut layout_order: Vec<usize> = sec_indices.to_vec();
     if eh_frame_hdr_fde_count > 0 {
         let hdr_size = 12 + 8 * eh_frame_hdr_fde_count;
         let idx = merged_sections.len();
@@ -111,7 +118,14 @@ pub fn emit_executable(
             vaddr: 0,
             align: 4,
         });
+        let ef_idx = merged_map.get(".eh_frame").copied();
+        let at = layout_order
+            .iter()
+            .position(|&i| Some(i) == ef_idx)
+            .unwrap_or(layout_order.len());
+        layout_order.insert(at, idx);
     }
+    let sec_indices: &[usize] = &layout_order;
 
     // Check for TLS sections
     let has_tls = merged_sections.iter().any(|ms| ms.sh_flags & SHF_TLS != 0);
@@ -155,9 +169,11 @@ pub fn emit_executable(
     let mut dynstr_data = vec![0u8]; // Leading null
     let mut dynsym_data = vec![0u8; 24]; // null entry
     let mut gnu_hash_data = Vec::new();
-    let versym_data: Vec<u8> = Vec::new();
-    let verneed_data: Vec<u8> = Vec::new();
+    let mut versym_data: Vec<u8> = Vec::new();
+    let mut verneed_data: Vec<u8> = Vec::new();
+    let mut verneed_count = 0u64;
     let mut needed_lib_offsets: Vec<u32> = Vec::new();
+    let mut rpath_offset = 0u32;
     let mut dynsym_names: Vec<String> = Vec::new();
     let copy_sym_names: Vec<String> = copy_symbols.iter().map(|(n, _)| n.clone()).collect();
 
@@ -201,6 +217,48 @@ pub fn emit_executable(
             needed_lib_offsets.push(off);
             dynstr_data.extend_from_slice(lib.as_bytes());
             dynstr_data.push(0);
+        }
+        if let Some((_, path)) = rpath {
+            rpath_offset = dynstr_data.len() as u32;
+            dynstr_data.extend_from_slice(path.as_bytes());
+            dynstr_data.push(0);
+        }
+
+        // Version requirements of the imports (PLT and COPY symbols alike
+        // carry the provider's version, as with GNU ld).
+        let plan = linker_common::symver::VerneedPlan::new(
+            dynsym_names
+                .iter()
+                .filter_map(|n| shared_lib_syms.import_version(n)),
+            actual_needed_libs,
+            2,
+        )?;
+        let mut str_offs: FxHashMap<&str, u32> = actual_needed_libs
+            .iter()
+            .map(String::as_str)
+            .zip(needed_lib_offsets.iter().copied())
+            .collect();
+        for s in plan.strings() {
+            str_offs.entry(s).or_insert_with(|| {
+                let off = dynstr_data.len() as u32;
+                dynstr_data.extend_from_slice(s.as_bytes());
+                dynstr_data.push(0);
+                off
+            });
+        }
+        if !plan.is_empty() {
+            verneed_data = plan.encode(|s| str_offs[s]);
+            verneed_count = plan.file_count();
+            versym_data = vec![0u8; 2]; // null symbol: VER_NDX_LOCAL
+            for name in &dynsym_names {
+                let idx = match shared_lib_syms.provider_of(name) {
+                    Some(lib) => {
+                        plan.index_of(lib, shared_lib_syms.import_version(name).map(|v| v.1))
+                    }
+                    None => 0, // unresolved (weak) reference: VER_NDX_LOCAL, as bfd
+                };
+                versym_data.extend_from_slice(&idx.to_le_bytes());
+            }
         }
 
         // Build dynsym (in hash-sorted order)
@@ -941,6 +999,9 @@ pub fn emit_executable(
             let _ = lib;
             add_dyn(DT_NEEDED, needed_lib_offsets[i] as u64);
         }
+        if let Some(&(tag, _)) = rpath {
+            add_dyn(tag, u64::from(rpath_offset));
+        }
         if let Some(&(va, sz)) = init_array_vaddrs.get(".preinit_array") {
             if sz > 0 {
                 add_dyn(DT_PREINIT_ARRAY, va);
@@ -980,7 +1041,7 @@ pub fn emit_executable(
         add_dyn(DT_RELAENT, 24);
         if !verneed_data.is_empty() {
             add_dyn(DT_VERNEED, verneed_vaddr);
-            add_dyn(DT_VERNEEDNUM, 1);
+            add_dyn(DT_VERNEEDNUM, verneed_count);
             add_dyn(DT_VERSYM, versym_vaddr);
         }
         add_dyn(DT_NULL, 0);
@@ -994,15 +1055,15 @@ pub fn emit_executable(
     {
         let eh_frame_vaddr = section_vaddrs[ef_idx];
         let eh_frame_hdr_vaddr = section_vaddrs[hdr_idx];
-        let hdr_data = linker_common::build_eh_frame_hdr(
+        let mut slot = std::mem::take(&mut merged_sections[hdr_idx].data);
+        linker_common::write_eh_frame_hdr(
+            &mut slot,
             &merged_sections[ef_idx].data,
             eh_frame_vaddr,
             eh_frame_hdr_vaddr,
             true,
         );
-        if !hdr_data.is_empty() {
-            merged_sections[hdr_idx].data = hdr_data;
-        }
+        merged_sections[hdr_idx].data = slot;
     }
 
     // ── Phase 12: Find entry point ──────────────────────────────────────
@@ -1420,7 +1481,7 @@ pub fn emit_executable(
             verneed_offset,
             verneed_data.len() as u64,
             section_count - 2,
-            1,
+            verneed_count as u32,
             8,
             0,
         );

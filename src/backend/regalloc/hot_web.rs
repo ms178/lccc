@@ -286,6 +286,8 @@ mod tests {
                     xmm_regs: vec![],
                     never_materialized: FxHashSet::default(),
                     folded_index_uses: FxHashMap::default(),
+                    fold_base_regs: Vec::new(),
+                    fold_readmit: FxHashSet::default(),
                     reg_hints: FxHashMap::default(),
                     ra_config: Arc::new(RaConfig::default()),
                     leaf_caller_saved_homes: false,

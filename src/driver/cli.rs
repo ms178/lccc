@@ -56,14 +56,42 @@
 //! Two spellings with an implementation in another layer are recognised here
 //! so they cannot reach the fallback at all: `--sysroot[=]`/`-isysroot[=]`
 //! (resolved by the link layer and the include search) and the GNU link-file
-//! switches `-nostartfiles`/`-nodefaultlibs` (resolved by `backend::common`
-//! from the raw command line, like `-nostdlib`).
+//! switches `-nostartfiles`/`-nodefaultlibs` (recorded on the driver and
+//! forwarded by `build_linker_args` to `backend::common`, like `-nostdlib`).
 
 use super::pipeline::{CliDefine, CompileMode, Driver};
 use crate::backend::Target;
 use crate::common::error::ColorMode;
 use crate::common::fp_contract::FpContract;
 use crate::passes::loop_align::AlignControl;
+
+/// Validate `-mtls-dialect=` for the final target. GCC's value sets are
+/// target-specific (x86: gnu|gnu2, AArch64: trad|desc, RISC-V: trad|desc); a
+/// value outside the set gets GCC 16.2's "unrecognized argument" error (with
+/// its list of valid arguments), a valid value other than
+/// the dialect LCCC emits is refused like every other unimplemented
+/// target-affecting `-m` option rather than silently producing the other one.
+fn check_tls_dialect(target: &Target, dialect: &str) -> Result<(), String> {
+    let (valid, native): (&[&str], &str) = match target {
+        Target::X86_64 | Target::I686 => (&["gnu", "gnu2"], "gnu2"),
+        Target::Aarch64 => (&["trad", "desc"], "desc"),
+        Target::Riscv64 => (&["trad", "desc"], "trad"),
+    };
+    if dialect == native {
+        Ok(())
+    } else if valid.contains(&dialect) {
+        Err(format!(
+            "unsupported machine option -mtls-dialect={dialect}; LCCC emits the dynamic \
+             TLS models only as -mtls-dialect={native} on this target"
+        ))
+    } else {
+        Err(format!(
+            "unrecognized argument in option '-mtls-dialect={dialect}'; valid arguments to \
+             '-mtls-dialect=' are: {}",
+            valid.join(" ")
+        ))
+    }
+}
 
 /// Compare dotted version strings numerically ("16.1.1" > "9.5.0").
 ///
@@ -98,6 +126,52 @@ fn profile_path_arg(arg: &str, prefix: &str) -> Result<String, String> {
         "" => Err(format!("missing argument to '{prefix}'")),
         path => Ok(path.to_string()),
     }
+}
+
+/// Whether `-march=<march>` implies PRFCHW (`prefetchw`). The table is GCC's
+/// measured `__PRFCHW__` set for every x86 `-march=` this driver accepts
+/// (`gcc-16 -march=X -dM -E`; `knl`/`knm` from GCC 14, which still accepts
+/// them): Broadwell and later big cores, Silvermont and later Atoms, every
+/// Zen. Notably absent: Nehalem..Haswell and the `x86-64-v2/v3/v4` levels
+/// (the ISA levels do not include PRFCHW). `native` is probed separately.
+fn x86_march_implies_prfchw(march: &str) -> bool {
+    matches!(
+        march,
+        "silvermont"
+            | "goldmont"
+            | "broadwell"
+            | "skylake"
+            | "znver1"
+            | "znver2"
+            | "znver3"
+            | "znver4"
+            | "znver5"
+            | "alderlake"
+            | "raptorlake"
+            | "raptor-lake"
+            | "meteorlake"
+            | "gracemont"
+            | "alderlake-n"
+            | "arrowlake"
+            | "sierraforest"
+            | "grandridge"
+            | "arrowlake-s"
+            | "lunarlake"
+            | "wildcatlake"
+            | "clearwaterforest"
+            | "skylake-avx512"
+            | "cascadelake"
+            | "cooperlake"
+            | "icelake-client"
+            | "icelake-server"
+            | "tigerlake"
+            | "rocketlake"
+            | "sapphirerapids"
+            | "graniterapids"
+            | "graniterapids-d"
+            | "knl"
+            | "knm"
+    )
 }
 
 impl Driver {
@@ -141,6 +215,11 @@ impl Driver {
     /// replayed after the profile lands (see
     /// [`Driver::replay_x86_explicit_isa_flags`]).
     fn reset_x86_arch_implied_isa(&mut self) {
+        // `enable_sse` is only ever set by the explicit `-msse`/`-msse2`
+        // flags, which are replayed after the profile like every other
+        // explicit decision; `enable_prfchw` is arch-implied or explicit.
+        self.enable_sse = false;
+        self.enable_prfchw = false;
         self.enable_sse3 = false;
         self.enable_ssse3 = false;
         self.enable_sse4_1 = false;
@@ -264,6 +343,7 @@ impl Driver {
                 // (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
                 self.no_sse = true;
                 self.sse_explicitly_disabled = true;
+                self.enable_sse = false;
                 // No xmm state at all, so every VEX form is forbidden too.
                 self.avx_explicitly_disabled = true;
                 self.fma_explicitly_disabled = true;
@@ -522,6 +602,20 @@ impl Driver {
             "-msse2" | "-msse" => {
                 self.no_sse = false;
                 self.sse_explicitly_disabled = false;
+                self.enable_sse = true;
+            }
+            "-mprfchw" => {
+                // Last explicit decision wins (GCC): lifts an earlier
+                // `-mno-prfchw`.
+                self.enable_prfchw = true;
+                self.prfchw_explicitly_disabled = false;
+            }
+            "-mno-prfchw" => {
+                // Sticky against a later PRFCHW `-march=` (GCC 16, measured:
+                // `-mno-prfchw -march=raptorlake` keeps `prefetcht0` for
+                // write hints).
+                self.enable_prfchw = false;
+                self.prfchw_explicitly_disabled = true;
             }
             _ => return false,
         }
@@ -743,25 +837,6 @@ impl Driver {
     /// Parse GCC-compatible command-line arguments and populate driver fields.
     /// Returns `Ok(true)` if early exit was handled (query flags like -dumpmachine),
     /// `Ok(false)` if normal compilation should proceed, or `Err` for invalid args.
-    fn validate_target_tls_model(&self) -> Result<(), String> {
-        if matches!(self.target, Target::Aarch64 | Target::Riscv64)
-            && !matches!(
-                self.tls_model,
-                None | Some(crate::ir::reexports::TlsModel::LocalExec)
-            )
-        {
-            let arch = if self.target == Target::Aarch64 {
-                "aarch64"
-            } else {
-                "riscv64"
-            };
-            return Err(format!(
-                "{arch} currently supports only the local-exec TLS model"
-            ));
-        }
-        Ok(())
-    }
-
     pub fn parse_cli_args(&mut self, args: &[String]) -> Result<bool, String> {
         // Detect target from binary name (argv[0])
         let binary_name = std::path::Path::new(&args[0])
@@ -800,7 +875,6 @@ impl Driver {
         // command line would exceed OS limits.
         let expanded_args = Self::expand_response_files(&args[1..]);
         self.parse_main_args(&expanded_args)?;
-        self.validate_target_tls_model()?;
 
         // Store raw args for GCC -m16 passthrough. We keep everything except
         // argv[0], -o <output>, -c/-S/-E (we set mode ourselves), and input files.
@@ -1499,13 +1573,17 @@ impl Driver {
 
                 arg if arg.starts_with("-W") => {
                     let flag = &arg[2..];
-                    // A `-Wno-<name>` request is honoured by construction
-                    // (there is no such warning, so "off" is the state) and
-                    // gets no diagnostic, exactly as the GNU convention has
-                    // it; every other unknown name is diagnosed by name.
+                    // Every flag reaches the warning configuration first
+                    // (`-Wno-return-type`, `-Wno-error=cpp` are real
+                    // requests: short-circuiting on the `no-` prefix once
+                    // dropped all of them). An UNKNOWN `-Wno-<name>` is then
+                    // honoured by construction (there is no such warning, so
+                    // "off" is the state) and gets no diagnostic, exactly as
+                    // the GNU convention has it; every other unknown name is
+                    // diagnosed by name.
                     if !flag.is_empty()
-                        && !flag.starts_with("no-")
                         && !self.warning_config.process_flag(flag)
+                        && !flag.starts_with("no-")
                     {
                         unknown_option_tolerated(arg, strict_options)?;
                     }
@@ -1916,6 +1994,11 @@ impl Driver {
                                     if std::arch::is_x86_feature_detected!("cmpxchg16b") {
                                         self.enable_cx16 = true;
                                     }
+                                    // Integer-side hint ISA (no xmm state),
+                                    // so it is not gated on `-mno-sse`.
+                                    if crate::backend::x86::cpu_model::X86Cpu::host_has_prfchw() {
+                                        self.enable_prfchw = true;
+                                    }
                                     if !self.sse_explicitly_disabled {
                                         if std::arch::is_x86_feature_detected!("aes") {
                                             self.enable_aes = true;
@@ -1964,6 +2047,9 @@ impl Driver {
                     // `-mno-bmi -march=x86-64-v3` → `__BMI__` absent;
                     // `-mbmi -march=x86-64` → `__BMI__` defined.
                     if matches!(self.target, Target::X86_64 | Target::I686) {
+                        if x86_march_implies_prfchw(march) {
+                            self.enable_prfchw = true;
+                        }
                         self.replay_x86_explicit_isa_flags();
                     }
                 }
@@ -2067,6 +2153,24 @@ impl Driver {
                 "-mnop-mcount" => {
                     self.mcount_submode.nop = true;
                 }
+                // The dynamic TLS models are emitted in ONE dialect per target:
+                // TLS descriptors on x86 (`gnu2`, preserves every register but
+                // the result, so the access is not a call to the register
+                // allocator) and AArch64 (`desc`, GCC's default there), the
+                // traditional `__tls_get_addr` sequence on RISC-V (`trad`,
+                // GCC's default there). Validated after the loop because `-m32`
+                // may still change the target. Must precede the `-m` catch-all
+                // below (guarded arms are not checked for reachability).
+                arg if arg.starts_with("-mtls-dialect=") => {
+                    self.tls_dialect = Some(arg["-mtls-dialect=".len()..].to_string());
+                }
+                arg if arg.starts_with("-mstack-protector-guard") => {
+                    return Err(format!(
+                        "{}: LCCC does not implement stack-protector canaries; \
+                         build with -fno-stack-protector",
+                        arg
+                    ));
+                }
                 // `-mno-<feature>` for an ISA extension LCCC never emits.
                 //
                 // Rejecting these is wrong in principle: the flag asks the
@@ -2162,25 +2266,26 @@ impl Driver {
                     self.pic = false;
                     self.pie = false;
                 }
-                // Compilation-wide GNU TLS policy. The x86 backends lower
-                // dynamic models through ABI TLS descriptors, whose resolver
-                // preserves every allocatable home and permits linker relaxation.
-                "-ftls-model=local-exec" => {
-                    self.tls_model = Some(crate::ir::reexports::TlsModel::LocalExec)
-                }
-                "-ftls-model=initial-exec" => {
-                    self.tls_model = Some(crate::ir::reexports::TlsModel::InitialExec)
-                }
-                "-ftls-model=local-dynamic" => {
-                    self.tls_model = Some(crate::ir::reexports::TlsModel::LocalDynamic)
-                }
-                "-ftls-model=global-dynamic" => {
-                    self.tls_model = Some(crate::ir::reexports::TlsModel::GlobalDynamic)
-                }
+                // GCC's `flag_tls_default`: a FLOOR every TLS symbol's model is
+                // raised to (common::tls::select_model); per-declaration
+                // `tls_model` attributes raise it further. The last one wins.
+                // Under `-m16` GCC delegation the option passes through to GCC
+                // unvalidated, as every other option does.
                 arg if arg.starts_with("-ftls-model=") => {
-                    if !gcc_m16_passthrough {
-                        let model = &arg["-ftls-model=".len()..];
-                        return Err(format!("unknown TLS model '{model}'"));
+                    let model = &arg["-ftls-model=".len()..];
+                    match crate::common::tls::TlsModel::parse(model) {
+                        Some(m) => self.tls_model_floor = Some(m),
+                        None if gcc_m16_passthrough => {}
+                        // GCC 16.2's wording, measured (error + note).
+                        None if model.is_empty() => {
+                            return Err("missing argument to '-ftls-model='".to_string());
+                        }
+                        None => {
+                            return Err(format!(
+                                "unknown TLS model '{model}'; valid arguments to '-ftls-model=' \
+                                 are: global-dynamic initial-exec local-dynamic local-exec"
+                            ));
+                        }
                     }
                 }
                 "-fcf-protection=branch" => {
@@ -2327,6 +2432,7 @@ impl Driver {
                     self.fp_rounding_math = false;
                     self.fast_math = true;
                     self.fp_reassoc = true;
+                    self.math_errno = false;
                     // GCC: fast-math implies contract=fast only when no
                     // explicit -ffp-contract was given (opts_set semantics).
                     if !self.fp_contract_explicit {
@@ -2336,6 +2442,7 @@ impl Driver {
                 "-fno-fast-math" => {
                     self.fast_math = false;
                     self.fp_reassoc = false;
+                    self.math_errno = true;
                     // Restore the language default. In GCC, -ffp-contract is
                     // orthogonal to -fno-fast-math: the C default (fast)
                     // stands. Explicit -ffp-contract={on,off,fast} wins.
@@ -2343,6 +2450,8 @@ impl Driver {
                         self.fp_contract = FpContract::c_language_default();
                     }
                 }
+                "-fmath-errno" => self.math_errno = true,
+                "-fno-math-errno" => self.math_errno = false,
                 "-funsafe-math-optimizations" | "-fassociative-math" => {
                     self.fp_reassoc = true;
                 }
@@ -2436,13 +2545,6 @@ impl Driver {
                         arg
                     ));
                 }
-                arg if arg.starts_with("-mstack-protector-guard") => {
-                    return Err(format!(
-                        "{}: LCCC does not implement stack-protector canaries; \
-                         build with -fno-stack-protector",
-                        arg
-                    ));
-                }
                 // NOTE: there used to be a blanket `arg if arg.starts_with("-f") => {}`
                 // here. It made every unimplemented `-f` option -- including
                 // `-ftrapv` and `-fsanitize=*`, whose explicit refusal arms
@@ -2492,22 +2594,21 @@ impl Driver {
                 "-no-pie" | "--no-pie" | "--no-pic-executable" => {
                     self.linker_ordered_items.push("-no-pie".to_string());
                 }
-                // The three GNU link-file switches are recognised here and
-                // *acted on* in `backend::common`, which resolves them from
-                // `raw_args` exactly as it already does for `-nostdlib`.
-                // Recognising them is the point: the link layer reads the raw
-                // command line, so an arm-less spelling used to reach the
-                // unknown-option fallback — harmless while that was a warning,
-                // a broken cross build now that it is an error, even though
-                // the implementation was there all along.
+                // The three GNU link-file switches are recorded here and
+                // forwarded by `build_linker_args` to `backend::common`, which
+                // acts on them.  (Recognising `-nostartfiles`/`-nodefaultlibs`
+                // without forwarding them made both silent no-ops: crt1/crti
+                // were still linked, so a freestanding `_start` collided with
+                // crt1's and a `-shared -nostartfiles` object got crtbeginS.)
                 //
-                // Semantics, measured on GCC 14.2 and honoured as measured:
+                // Semantics, measured on GCC 14.2 and 16.2 and honoured as measured:
                 //   -nostartfiles  -> no crt1/crti/crtbegin/crtend/crtn, libc kept
-                //   -nodefaultlibs -> crt files kept, libc/libm dropped, libgcc kept
+                //   -nodefaultlibs -> crt files kept, libc/libm AND libgcc dropped
                 //   -nostdlib      -> crt files and all default libraries dropped
                 "-nostdlib" => self.nostdlib = true,
                 "-nostdinc" => self.nostdinc = true,
-                "-nostartfiles" | "-nodefaultlibs" => {}
+                "-nostartfiles" => self.nostartfiles = true,
+                "-nodefaultlibs" => self.nodefaultlibs = true,
 
                 // Language selection
                 "-x" => {
@@ -2705,6 +2806,9 @@ impl Driver {
                 }
             }
             i += 1;
+        }
+        if let Some(dialect) = self.tls_dialect.as_deref() {
+            check_tls_dialect(&self.target, dialect)?;
         }
 
         Ok(())
@@ -3171,6 +3275,61 @@ mod cli_tests {
         );
     }
 
+    /// `-Wno-<kind>` disables and `-Wno-error=<kind>` demotes a known
+    /// warning (GCC 16.2: `-Wall -Wno-return-type -Wno-cpp` prints nothing;
+    /// `-Werror -Wno-error=cpp` keeps `#warning` a warning). Both used to be
+    /// dropped before reaching the configuration.
+    #[test]
+    fn wno_flags_reach_the_warning_configuration() {
+        use crate::common::error::WarningKind;
+        let d = parse_flags(&["-Wall", "-Wno-return-type", "-Wno-cpp", "-Wno-attributes"])
+            .expect("must parse");
+        for kind in [
+            WarningKind::ReturnType,
+            WarningKind::Cpp,
+            WarningKind::Attributes,
+        ] {
+            assert!(
+                !d.warning_config.is_enabled(kind),
+                "{kind:?} must be disabled"
+            );
+        }
+        assert!(
+            d.warning_config
+                .is_enabled(WarningKind::IncompatiblePointerTypes)
+        );
+        // Error state, GCC 16.2 measured: the per-kind request overrides the
+        // global -Werror in either order; between the two per-kind requests
+        // the last one wins; -Werror=X re-enables a disabled X.
+        for (flags, cpp_is_error) in [
+            (&["-Werror", "-Wno-error=cpp"][..], false),
+            (&["-Wno-error=cpp", "-Werror"][..], false),
+            (&["-Werror=cpp", "-Wno-error=cpp"][..], false),
+            (&["-Wno-error=cpp", "-Werror=cpp"][..], true),
+            (&["-Werror"][..], true),
+        ] {
+            let d = parse_flags(flags).expect("must parse");
+            assert_eq!(
+                d.warning_config.is_error(WarningKind::Cpp),
+                cpp_is_error,
+                "{flags:?}"
+            );
+            assert!(d.warning_config.is_enabled(WarningKind::Cpp), "{flags:?}");
+            // The demotion is per kind: a global -Werror still covers others.
+            if flags.contains(&"-Werror") {
+                assert!(
+                    d.warning_config.is_error(WarningKind::ReturnType),
+                    "{flags:?}"
+                );
+            }
+        }
+        let d = parse_flags(&["-Wno-cpp", "-Werror=cpp"]).expect("must parse");
+        assert!(d.warning_config.is_enabled(WarningKind::Cpp));
+        assert!(d.warning_config.is_error(WarningKind::Cpp));
+        // Unknown `-Wno-` names stay silently accepted.
+        parse_flags(&["-Wno-bogus-name"]).expect("unknown -Wno- is tolerated");
+    }
+
     fn parse_flags(flags: &[&str]) -> Result<Driver, String> {
         let mut d = Driver::new();
         let mut args = vec!["ccc".to_string()];
@@ -3189,7 +3348,8 @@ mod cli_tests {
             ("global-dynamic", TlsModel::GlobalDynamic),
         ] {
             assert_eq!(
-                parse_flags(&[&format!("-ftls-model={spelling}")]).map(|driver| driver.tls_model),
+                parse_flags(&[&format!("-ftls-model={spelling}")])
+                    .map(|driver| driver.tls_model_floor),
                 Ok(Some(expected))
             );
         }
@@ -3199,15 +3359,22 @@ mod cli_tests {
                 "-ftls-model=local-exec",
                 "-ftls-model=initial-exec",
             ])
-            .map(|driver| driver.tls_model),
+            .map(|driver| driver.tls_model_floor),
             Ok(Some(TlsModel::InitialExec))
         );
-        for model in ["bogus", ""] {
-            assert_eq!(
-                parse_flags(&[&format!("-ftls-model={model}")]).map(|_| ()),
-                Err(format!("unknown TLS model '{model}'"))
-            );
-        }
+        // GCC 16.2's diagnostics, measured.
+        assert_eq!(
+            parse_flags(&["-ftls-model=bogus"]).map(|_| ()),
+            Err(
+                "unknown TLS model 'bogus'; valid arguments to '-ftls-model=' are: \
+                 global-dynamic initial-exec local-dynamic local-exec"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            parse_flags(&["-ftls-model="]).map(|_| ()),
+            Err("missing argument to '-ftls-model='".to_string())
+        );
     }
 
     #[cfg(feature = "gcc_m16")]
@@ -3412,14 +3579,54 @@ mod cli_tests {
             "-mstack-protector-guard-reg=gs",
             "-mstack-protector-guard-symbol=__ref_stack_chk_guard",
         ] {
+            // The specific diagnostic, not merely an error: the `-m` forms
+            // used to fall into the generic `-m` catch-all ("refuses to
+            // silently ignore target-affecting -m flags"), which also errors,
+            // so an `is_err()` check could not see their arm was dead.
+            let err = try_flag(f).expect_err(f);
             assert!(
-                try_flag(f).is_err(),
-                "{} must be refused, not silently ignored",
-                f
+                err.contains("does not implement stack-protector canaries"),
+                "{f}: wrong diagnostic: {err}"
             );
         }
         // The opposite request is exactly what LCCC already does.
         assert!(try_flag("-fno-stack-protector").is_ok());
+    }
+
+    /// `-ftls-model=` / `-mtls-dialect=` diagnostics follow GCC 16.2's
+    /// measured wording (error + valid-argument note folded into one line),
+    /// and the dialect is validated against the FINAL target (`-m32` given
+    /// after it still counts). The dialect arm must precede the generic `-m`
+    /// refusal; the native-dialect `Ok` cases pin that ordering.
+    #[test]
+    fn tls_option_diagnostics_match_gcc() {
+        let err = |flags: &[&str]| parse_flags(flags).err().unwrap_or_default();
+        assert!(parse_flags(&["-ftls-model=initial-exec"]).is_ok());
+        assert!(parse_flags(&["-ftls-model=local-exec", "-ftls-model=global-dynamic"]).is_ok());
+        assert_eq!(err(&["-ftls-model="]), "missing argument to '-ftls-model='");
+        assert_eq!(
+            err(&["-ftls-model=bogus"]),
+            "unknown TLS model 'bogus'; valid arguments to '-ftls-model=' are: \
+             global-dynamic initial-exec local-dynamic local-exec"
+        );
+        for ok in [&["-mtls-dialect=gnu2"][..], &["-mtls-dialect=gnu2", "-m32"]] {
+            assert!(parse_flags(ok).is_ok(), "{ok:?}: {}", err(ok));
+        }
+        assert_eq!(
+            err(&["-mtls-dialect=foo"]),
+            "unrecognized argument in option '-mtls-dialect=foo'; valid arguments to \
+             '-mtls-dialect=' are: gnu gnu2"
+        );
+        // Cross targets come from argv[0], whose parse also flips the
+        // process-global char signedness under concurrently running tests;
+        // the validator itself is target-parametric, so test it directly.
+        assert!(super::check_tls_dialect(&crate::backend::Target::Aarch64, "desc").is_ok());
+        assert!(super::check_tls_dialect(&crate::backend::Target::Riscv64, "trad").is_ok());
+        assert_eq!(
+            super::check_tls_dialect(&crate::backend::Target::Aarch64, "gnu2").unwrap_err(),
+            "unrecognized argument in option '-mtls-dialect=gnu2'; valid arguments to \
+             '-mtls-dialect=' are: trad desc"
+        );
     }
 
     /// The GCC mcount flag family (kernel CONFIG_FUNCTION_TRACER) must parse.
@@ -3781,6 +3988,31 @@ mod cli_tests {
                 .collect::<Vec<_>>();
             driver.parse_cli_args(&args).unwrap();
             assert_eq!(driver.wrap_signed_overflow, expected, "{args:?}");
+        }
+    }
+
+    /// `-fmath-errno` is the C default; the umbrella and the explicit flags
+    /// are plain last-option-wins, exactly as measured on GCC 16.2 (sqrt of a
+    /// negative volatile operand setting `errno`).
+    #[test]
+    fn math_errno_defaults_on_and_last_option_wins() {
+        for (flags, expected) in [
+            (&[][..], true),
+            (&["-fno-math-errno"][..], false),
+            (&["-ffast-math"][..], false),
+            (&["-ffast-math", "-fmath-errno"][..], true),
+            (&["-fmath-errno", "-ffast-math"][..], false),
+            (&["-fno-math-errno", "-fno-fast-math"][..], true),
+            (&["-ffast-math", "-fno-fast-math"][..], true),
+        ] {
+            let mut driver = Driver::new();
+            let args = std::iter::once("lccc")
+                .chain(flags.iter().copied())
+                .chain(["x.c"])
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            driver.parse_cli_args(&args).unwrap();
+            assert_eq!(driver.math_errno, expected, "{flags:?}");
         }
     }
 
@@ -4625,7 +4857,6 @@ mod cli_tests {
             "-fno-strict-overflow",
             "-fno-plt",
             "-fno-semantic-interposition",
-            "-fno-math-errno",
             "-fmerge-all-constants",
             "-fno-ident",
             "-fshort-enums", // contract tier, checked below
@@ -4817,12 +5048,12 @@ mod cli_tests {
     /// Spellings whose implementation lives in another layer must be
     /// *recognised* here.
     ///
-    /// `--sysroot=`, `-isysroot`, `-nostartfiles` and `-nodefaultlibs` are
-    /// resolved from the raw command line by the link layer (and by the
-    /// include search), so they never needed a CLI arm while the fallback only
-    /// warned — and an arm-less spelling is a broken build (a cross build for
-    /// `--sysroot=`, a freestanding link for `-nostartfiles`) as soon as the
-    /// link layer cannot see it for the operand it consumed.
+    /// `--sysroot=`/`-isysroot` are resolved by the link layer and the
+    /// include search; `-nostartfiles`/`-nodefaultlibs` are acted on by the
+    /// link layer once forwarded (see
+    /// `nostartfiles_and_nodefaultlibs_reach_the_linker`).  An arm-less
+    /// spelling is a broken build (a cross build for `--sysroot=`, a
+    /// freestanding link for `-nostartfiles`).
     #[test]
     fn options_implemented_in_other_layers_are_recognised() {
         for arg in [
@@ -4850,6 +5081,30 @@ mod cli_tests {
         let mut d = Driver::new();
         let args = vec!["ccc".to_string(), "-isysroot".to_string()];
         assert!(d.parse_cli_args(&args).is_err());
+    }
+
+    /// Recognising the GNU link-file switches is not enough: the link layer
+    /// only sees `build_linker_args`.  Before they were forwarded both were
+    /// silent no-ops (crt1.o/crti.o still linked, so a freestanding `_start`
+    /// collided with crt1's and `-shared -nostartfiles` still got crtbeginS).
+    #[test]
+    fn nostartfiles_and_nodefaultlibs_reach_the_linker() {
+        for (flags, want_start, want_libs) in [
+            (&["-nostartfiles"][..], true, false),
+            (&["-nodefaultlibs"][..], false, true),
+            (&["-nostartfiles", "-nodefaultlibs"][..], true, true),
+            (&[][..], false, false),
+        ] {
+            let mut d = Driver::new();
+            let mut args = vec!["ccc".to_string()];
+            args.extend(flags.iter().map(|f| f.to_string()));
+            args.push("x.c".to_string());
+            d.parse_cli_args(&args).expect("link-file switches parse");
+            let link = d.build_linker_args();
+            let has = |f: &str| link.iter().any(|a| a == f);
+            assert_eq!(has("-nostartfiles"), want_start, "{flags:?} -> {link:?}");
+            assert_eq!(has("-nodefaultlibs"), want_libs, "{flags:?} -> {link:?}");
+        }
     }
 
     /// The `-g` family, pinned against the measured GNU boundary.
@@ -5096,5 +5351,137 @@ mod cli_tests {
         assert_eq!(super::common_prefix_len("c17x", "c1x"), 2);
         assert_eq!(super::common_prefix_len("abc", "abd"), 2);
         assert_eq!(super::common_prefix_len("", "abc"), 0);
+    }
+}
+
+#[cfg(test)]
+mod prefetch_isa_tests {
+    //! Prefetch-ISA resolution (defect 14 and PRFCHW). Every expectation is
+    //! GCC 16.2's measured behaviour for the same command line (`gcc-16 -O2
+    //! -S` over all eight `__builtin_prefetch(p, rw, loc)` forms).
+    use crate::driver::Driver;
+
+    fn parse(flags: &[&str]) -> Driver {
+        let mut d = Driver::new();
+        let args: Vec<String> = std::iter::once("ccc")
+            .chain(flags.iter().copied())
+            .chain(std::iter::once("x.c"))
+            .map(str::to_string)
+            .collect();
+        assert!(d.parse_cli_args(&args).is_ok(), "{flags:?}");
+        d
+    }
+
+    #[test]
+    fn i686_sse_prefetch_needs_sse_or_prfchw() {
+        // GCC emits nothing for these (pre-SSE i686 baseline).
+        for flags in [
+            &["-m32"][..],
+            &["-m32", "-march=i686"],
+            &["-m32", "-march=pentiumpro"],
+            &["-m32", "-msse", "-mno-sse"],
+            &["-m32", "-march=raptorlake", "-mno-sse", "-mno-prfchw"],
+        ] {
+            assert!(!parse(flags).resolved_prefetch_sse(), "{flags:?}");
+        }
+        // GCC emits the prefetcht*/nta family for these.
+        for flags in [
+            &["-m32", "-msse"][..],
+            &["-m32", "-msse2"],
+            &["-m32", "-msse", "-march=i686"],
+            &["-m32", "-march=i686", "-msse"],
+            &["-m32", "-msse4.1"],
+            &["-m32", "-march=nehalem"],
+            &["-m32", "-march=raptorlake"],
+            &["-m32", "-mprfchw"],
+            &["-m32", "-mno-sse", "-mprfchw"],
+        ] {
+            assert!(parse(flags).resolved_prefetch_sse(), "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn x86_64_sse_prefetch_is_baseline() {
+        // GCC 16 emits prefetcht* even without xmm state on x86-64.
+        for flags in [
+            &[][..],
+            &["-mno-sse"],
+            &["-mno-sse2"],
+            &["-mgeneral-regs-only"],
+        ] {
+            assert!(parse(flags).resolved_prefetch_sse(), "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn prfchw_follows_march_and_explicit_flags() {
+        for flags in [
+            &[][..],
+            &["-march=x86-64-v3"],
+            &["-march=x86-64-v4"],
+            &["-march=haswell"],
+            &["-march=nehalem"],
+            &["-march=raptorlake", "-mno-prfchw"],
+            &["-mno-prfchw", "-march=raptorlake"],
+            &["-mprfchw", "-mno-prfchw"],
+            &["-mprfchw", "-march=raptorlake", "-mno-prfchw"],
+            &["-march=raptorlake", "-march=haswell"],
+        ] {
+            assert!(!parse(flags).resolved_prfchw(), "{flags:?}");
+        }
+        for flags in [
+            &["-mprfchw"][..],
+            &["-mno-prfchw", "-mprfchw"],
+            &["-mprfchw", "-march=haswell"],
+            &["-march=haswell", "-mprfchw"],
+            &["-march=broadwell"],
+            &["-march=raptorlake"],
+            &["-march=znver4"],
+            &["-march=silvermont"],
+            &["-march=sapphirerapids"],
+            &["-m32", "-march=raptorlake"],
+        ] {
+            assert!(parse(flags).resolved_prfchw(), "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn march_table_matches_gcc_prfchw_set() {
+        // `gcc-16 -march=X -dM -E | grep -c __PRFCHW__`, measured.
+        for m in [
+            "nehalem",
+            "westmere",
+            "sandybridge",
+            "ivybridge",
+            "haswell",
+            "x86-64",
+            "x86-64-v2",
+            "x86-64-v3",
+            "x86-64-v4",
+            "generic",
+            "i686",
+        ] {
+            assert!(!super::x86_march_implies_prfchw(m), "{m}");
+        }
+        for m in [
+            "silvermont",
+            "goldmont",
+            "broadwell",
+            "skylake",
+            "znver1",
+            "znver5",
+            "alderlake",
+            "raptorlake",
+            "meteorlake",
+            "arrowlake-s",
+            "lunarlake",
+            "skylake-avx512",
+            "icelake-server",
+            "sapphirerapids",
+            "graniterapids-d",
+            "clearwaterforest",
+        ] {
+            assert!(super::x86_march_implies_prfchw(m), "{m}");
+        }
     }
 }

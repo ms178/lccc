@@ -156,7 +156,6 @@ mod tests {
             is_const: false,
             is_used: false,
             is_thread_local: false,
-            tls_model: None,
         });
         let mut function = IrFunction::new("vector_user".into(), IrType::Void, vec![], false);
         function.blocks.push(BasicBlock {

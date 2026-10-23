@@ -1358,6 +1358,15 @@ pub struct LinearScanAllocator {
     /// Rotation cursor: consecutive unhinted assignments start at different
     /// registers to expose ILP on Raptor Lake's extra integer ports.
     pub next_reg_idx: usize,
+    /// The pool charges a register's FIRST use (callee-saved: a prologue
+    /// push/pop pair per call). Unhinted picks then prefer a free register
+    /// this scan already touched (an earlier assignment or a seed) and
+    /// rotate only to open a fresh one. Rotation buys nothing for such a
+    /// pool -- register renaming removes the false dependencies it spreads
+    /// -- while every extra register is saved and restored on each call
+    /// (linux_find_bit: a 4-point load temp opened %r15 in a 261K-call leaf
+    /// while rbx/r12/r13 sat dead). Set by the callee-saved phases.
+    pub prefer_touched: bool,
     /// Loop-spanning ranges in the original worklist (see the admission
     /// cap in [`LinearScanAllocator::allocate_range`]).
     pub total_spans: usize,
@@ -1405,6 +1414,7 @@ impl LinearScanAllocator {
             next_spill_slot: 0,
             enable_splitting: false,
             next_reg_idx: 0,
+            prefer_touched: false,
             total_spans,
             free_slot_victims: false,
         }
@@ -1494,6 +1504,28 @@ impl LinearScanAllocator {
         let n = self.available_regs.len();
         if n == 0 {
             return None;
+        }
+        if self.prefer_touched && !self.ra_config.no_callee_sticky {
+            // `occupy_register` stores `end + 1 >= 1` and `init_registers`
+            // zeroes the pool, so a non-zero entry means touched. The scan
+            // still rotates (among touched registers): packing every value
+            // into the lowest free one crowds a loop phi's register with
+            // short holders and its backedge copy stops coalescing.
+            let start = self.next_reg_idx % n;
+            for offset in 0..n {
+                let idx = (start + offset) % n;
+                let reg = self.available_regs[idx];
+                let touched = self.reg_free_until.get(&reg).is_some_and(|&u| u > 0);
+                let free = if self.segment_mode {
+                    self.register_free_for_segments(reg, range)
+                } else {
+                    self.reg_free_until.get(&reg).copied().unwrap_or(0) <= range.start
+                };
+                if touched && free {
+                    self.next_reg_idx = idx + 1;
+                    return Some(reg);
+                }
+            }
         }
         let start = self.next_reg_idx % n;
         for offset in 0..n {
@@ -3069,7 +3101,7 @@ pub(crate) fn build_live_ranges_with_config(
     func: &IrFunction,
     ra_config: &Arc<RaConfig>,
 ) -> Vec<LiveRange> {
-    build_live_ranges_with_config_and_meta(intervals, loop_depth, func, ra_config).0
+    build_live_ranges_with_config_and_meta(intervals, loop_depth, func, ra_config, None).0
 }
 
 /// As [`build_live_ranges_with_config`], but also hands back the
@@ -3083,10 +3115,14 @@ pub(crate) fn build_live_ranges_with_config_and_meta(
     loop_depth: &[u32],
     func: &IrFunction,
     ra_config: &Arc<RaConfig>,
+    use_transfer: Option<&FxHashMap<u32, Vec<u32>>>,
 ) -> (Vec<LiveRange>, RangeMetadata) {
-    let meta = collect_range_metadata(func, loop_depth);
-    let pgo_point_weights = pgo_point_weights(func, ra_config);
+    let mut meta = collect_range_metadata(func, loop_depth);
     let point_depths = point_loop_depths(func, loop_depth);
+    if let Some(transfer) = use_transfer {
+        meta.transfer_uses(func, transfer, &point_depths);
+    }
+    let pgo_point_weights = pgo_point_weights(func, ra_config);
 
     let mut ranges: Vec<LiveRange> = intervals
         .iter()
@@ -3180,6 +3216,78 @@ pub(crate) struct RangeMetadata {
     /// occurrence), in the same dense numbering as `loop_extents`.
     pub(crate) uses: FxHashMap<u32, Vec<u32>>,
     hints: FxHashMap<u32, u32>,
+}
+
+impl RangeMetadata {
+    /// Move the base reads of deferred constant-offset fold addresses
+    /// (`transfer[base]`; see `RegAllocConfig::fold_base_regs`) from each
+    /// address's GEP to its accesses. A folded GEP emits nothing: the
+    /// backend reads `base`'s register at every access instead, so the
+    /// GEP's own use of `base` (one point, the GEP's) is replaced by the
+    /// address's use points. Adding them instead double-counts each
+    /// adjacent `GEP p, C` + load pair and inflates cold bases.
+    ///
+    /// `max_use_depth[base]` is recomputed exactly from the final points
+    /// (`point_depths` is the same dense numbering), so a GEP in a deeper
+    /// block than all of its accesses no longer props up the base's depth.
+    /// An address with no use point is left alone (nothing reads it).
+    fn transfer_uses(
+        &mut self,
+        func: &IrFunction,
+        transfer: &FxHashMap<u32, Vec<u32>>,
+        point_depths: &[u32],
+    ) {
+        let moved: FxHashSet<u32> = transfer.values().flatten().copied().collect();
+        let mut def_point: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut point = 0u32;
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Some(dest) = inst.dest()
+                    && moved.contains(&dest.0)
+                {
+                    def_point.insert(dest.0, point);
+                }
+                point = point.saturating_add(1);
+            }
+            point = point.saturating_add(1);
+        }
+        for (&base, addrs) in transfer {
+            let mut gained: Vec<u32> = Vec::new();
+            let mut retired: Vec<u32> = Vec::new();
+            for v in addrs {
+                let Some(points) = self.uses.get(v).filter(|p| !p.is_empty()) else {
+                    continue;
+                };
+                gained.extend_from_slice(points);
+                if let Some(&g) = def_point.get(v) {
+                    retired.push(g);
+                }
+            }
+            if gained.is_empty() {
+                continue;
+            }
+            let entry = self.uses.entry(base).or_default();
+            for g in retired {
+                // One occurrence per GEP: a constant-offset GEP reads its
+                // base exactly once. Points are sorted ascending.
+                if let Ok(idx) = entry.binary_search(&g) {
+                    entry.remove(idx);
+                }
+            }
+            entry.extend(gained);
+            entry.sort_unstable();
+            let depth = entry
+                .iter()
+                .map(|&p| point_depths.get(p as usize).copied().unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            if depth == 0 {
+                self.max_use_depth.remove(&base);
+            } else {
+                self.max_use_depth.insert(base, depth);
+            }
+        }
+    }
 }
 
 /// Single walk: def sites, use points, hottest use-site loop depth, hints.
@@ -5521,5 +5629,44 @@ mod tests {
                 "mode 3 decision must not depend on the cost table (weighted={weighted})"
             );
         }
+    }
+
+    // ── prefer_touched (RA-CALLEE-STICKY) ───────────────────────────────────
+
+    fn sticky_run(no_sticky: bool, prefer: bool) -> FxHashMap<u32, PhysReg> {
+        // v1 [0,5] and v2 [2,8] need two registers; v3 [10,12] starts after
+        // both died. Rotation hands v3 the untouched third register.
+        let ranges = vec![
+            lr(1, 0, 5, vec![5], 10),
+            lr(2, 2, 8, vec![8], 10),
+            lr(3, 10, 12, vec![12], 10),
+        ];
+        let mut cfg = RaConfig::default();
+        cfg.no_callee_sticky = no_sticky;
+        let mut alloc = LinearScanAllocator::new_with_config(
+            ranges,
+            vec![PhysReg(1), PhysReg(2), PhysReg(3)],
+            &std::sync::Arc::new(cfg),
+        );
+        alloc.prefer_touched = prefer;
+        alloc.run();
+        alloc.assignments
+    }
+
+    #[test]
+    fn prefer_touched_reuses_a_dead_touched_register_before_a_fresh_one() {
+        let a = sticky_run(false, true);
+        assert_eq!(a[&1], PhysReg(1));
+        assert_eq!(a[&2], PhysReg(2));
+        assert!(
+            a[&3] == PhysReg(1) || a[&3] == PhysReg(2),
+            "a third callee-saved register was opened: {a:?}"
+        );
+    }
+
+    #[test]
+    fn rotation_is_kept_without_the_flag_or_under_the_knob() {
+        assert_eq!(sticky_run(false, false)[&3], PhysReg(3));
+        assert_eq!(sticky_run(true, true)[&3], PhysReg(3));
     }
 }

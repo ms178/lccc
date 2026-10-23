@@ -46,6 +46,7 @@ pub fn link_builtin(
 
     let all_lib_paths: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
+    let rpath = linker_common::rpath_dyn_entry(&linker_common::parse_linker_args(user_args));
     // Parse user args for export-dynamic flag
     let mut export_dynamic = false;
     for arg in user_args {
@@ -117,16 +118,16 @@ pub fn link_builtin(
             };
             let mut combined = extra_lib_paths.clone();
             combined.extend(all_lib_paths.iter().cloned());
-            if let Some(lib_path) = resolver(l, &combined) {
-                load_file(
-                    &lib_path,
-                    &mut objects,
-                    &mut globals,
-                    &mut needed_sonames,
-                    &combined,
-                    is_static,
-                )?;
-            }
+            let lib_path =
+                resolver(l, &combined).ok_or_else(|| linker_common::cannot_find_lib(l))?;
+            load_file(
+                &lib_path,
+                &mut objects,
+                &mut globals,
+                &mut needed_sonames,
+                &combined,
+                is_static,
+            )?;
         } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
             let parts: Vec<&str> = wl_arg.split(',').collect();
             let mut j = 0;
@@ -142,16 +143,16 @@ pub fn link_builtin(
                     };
                     let mut combined = extra_lib_paths.clone();
                     combined.extend(all_lib_paths.iter().cloned());
-                    if let Some(lib_path) = resolver(lib, &combined) {
-                        load_file(
-                            &lib_path,
-                            &mut objects,
-                            &mut globals,
-                            &mut needed_sonames,
-                            &combined,
-                            is_static,
-                        )?;
-                    }
+                    let lib_path = resolver(lib, &combined)
+                        .ok_or_else(|| linker_common::cannot_find_lib(lib))?;
+                    load_file(
+                        &lib_path,
+                        &mut objects,
+                        &mut globals,
+                        &mut needed_sonames,
+                        &combined,
+                        is_static,
+                    )?;
                 } else if let Some(defsym_arg) = part.strip_prefix("--defsym=") {
                     // --defsym=SYMBOL=EXPR: define a symbol alias
                     // TODO: only supports symbol-to-symbol aliasing, not arbitrary expressions
@@ -189,20 +190,6 @@ pub fn link_builtin(
             )?;
         }
         arg_i += 1;
-    }
-
-    // Load CRT objects after user objects
-    for path in crt_objects_after {
-        if Path::new(path).exists() {
-            load_file(
-                path,
-                &mut objects,
-                &mut globals,
-                &mut needed_sonames,
-                &all_lib_paths,
-                is_static,
-            )?;
-        }
     }
 
     // Build combined library search paths: user -L first, then system paths
@@ -244,8 +231,30 @@ pub fn link_builtin(
         }
     }
 
-    // For dynamic linking, resolve remaining undefined symbols against system libs
-    if !is_static {
+    // crtend.o/crtn.o close the link after every library member, as in
+    // gcc's spec: crtend's zero terminator ends `.eh_frame` (libgcc's linear
+    // FDE search stops there) and crtn's epilogue ends `.init`/`.fini`.
+    for path in crt_objects_after {
+        if Path::new(path).exists() {
+            load_file(
+                path,
+                &mut objects,
+                &mut globals,
+                &mut needed_sonames,
+                &all_lib_paths,
+                is_static,
+            )?;
+        }
+    }
+
+    // For dynamic linking, resolve remaining undefined symbols against system libs.
+    // Only when gcc's default libraries were requested: the driver passes
+    // none under `-nostdlib`/`-nodefaultlibs`, and the standalone lccc-ld
+    // none at all (its caller lists `-lc` etc.).  GNU ld never resolves
+    // against a library absent from the command line, so without this
+    // guard `-nostdlib` code calling `puts` linked against libc.so.6
+    // instead of failing as it does with GCC (i686/RISC-V already failed).
+    if !is_static && !needed_libs.is_empty() {
         let default_libs = [
             "libc.so.6",
             "libm.so.6",
@@ -358,6 +367,7 @@ pub fn link_builtin(
             &needed_sonames,
             output_path,
             export_dynamic,
+            rpath.as_ref(),
             &pending_defsyms,
         )
     } else {
@@ -376,94 +386,38 @@ pub fn link_builtin(
 // ── Shared library output ────────────────────────────────────────────
 
 /// Create a shared library (.so) from object files.
+///
+/// `crt_objects_before`/`crt_objects_after` and `implicit_libs` are gcc's
+/// `-shared` spec as resolved by the driver (`crti.o crtbeginS.o ...
+/// crtendS.o crtn.o`, `-lgcc -lgcc_s -lc`, shared objects as-needed).
+/// (Pre-fix none were linked: no `__dso_handle`, and `_Unwind_*` from
+/// libgcc_s.so.1 got no DT_NEEDED -- "undefined symbol:
+/// _Unwind_GetRegionStart" when the library was loaded.)
 pub fn link_shared(
     object_files: &[&str],
     output_path: &str,
     user_args: &[String],
     lib_paths: &[&str],
+    crt_objects_before: &[&str],
+    crt_objects_after: &[&str],
+    implicit_libs: &[&str],
 ) -> Result<(), String> {
     let mut objects = linker_common::ObjectSet::new();
     let mut globals: FxHashMap<String, GlobalSymbol> = FxHashMap::default();
     let mut needed_sonames: Vec<String> = Vec::new();
     let lib_path_strings: Vec<String> = lib_paths.iter().map(|s| s.to_string()).collect();
 
-    // Parse user args
-    let mut extra_lib_paths: Vec<String> = Vec::new();
-    let mut libs_to_load: Vec<String> = Vec::new();
-    let mut extra_object_files: Vec<String> = Vec::new();
-    let mut soname: Option<String> = None;
-    let mut defsym_defs: Vec<(String, String)> = Vec::new();
-    let mut i = 0;
-    let args: Vec<&str> = user_args.iter().map(|s| s.as_str()).collect();
-    while i < args.len() {
-        let arg = args[i];
-        if let Some(path) = arg.strip_prefix("-L") {
-            let p = if path.is_empty() && i + 1 < args.len() {
-                i += 1;
-                args[i]
-            } else {
-                path
-            };
-            extra_lib_paths.push(p.to_string());
-        } else if let Some(lib) = arg.strip_prefix("-l") {
-            let l = if lib.is_empty() && i + 1 < args.len() {
-                i += 1;
-                args[i]
-            } else {
-                lib
-            };
-            libs_to_load.push(l.to_string());
-        } else if let Some(wl_arg) = arg.strip_prefix("-Wl,") {
-            let parts: Vec<&str> = wl_arg.split(',').collect();
-            for j in 0..parts.len() {
-                let part = parts[j];
-                if let Some(sn) = part.strip_prefix("-soname=") {
-                    soname = Some(sn.to_string());
-                } else if part == "-soname" && j + 1 < parts.len() {
-                    soname = Some(parts[j + 1].to_string());
-                } else if let Some(defsym_arg) = part.strip_prefix("--defsym=") {
-                    if let Some(eq_pos) = defsym_arg.find('=') {
-                        defsym_defs.push((
-                            defsym_arg[..eq_pos].to_string(),
-                            defsym_arg[eq_pos + 1..].to_string(),
-                        ));
-                    }
-                } else if part == "--defsym" && j + 1 < parts.len() {
-                    // Two-argument form: --defsym SYM=VAL
-                    let defsym_arg = parts[j + 1];
-                    if let Some(eq_pos) = defsym_arg.find('=') {
-                        defsym_defs.push((
-                            defsym_arg[..eq_pos].to_string(),
-                            defsym_arg[eq_pos + 1..].to_string(),
-                        ));
-                    }
-                } else if let Some(lpath) = part.strip_prefix("-L") {
-                    extra_lib_paths.push(lpath.to_string());
-                } else if let Some(lib) = part.strip_prefix("-l") {
-                    libs_to_load.push(lib.to_string());
-                }
-            }
-        } else if arg == "-shared" || arg == "-nostdlib" || arg == "-o" {
-            if arg == "-o" {
-                i += 1;
-            }
-        } else if !arg.starts_with('-') && Path::new(arg).exists() {
-            extra_object_files.push(arg.to_string());
-        }
-        i += 1;
-    }
+    let parsed_args = linker_common::parse_linker_args(user_args);
+    let rpath = linker_common::rpath_dyn_entry(&parsed_args);
+    let soname = parsed_args.soname.clone();
+    let defsym_defs = parsed_args.defsym_defs.clone();
 
-    for path in object_files {
-        load_file(
-            path,
-            &mut objects,
-            &mut globals,
-            &mut needed_sonames,
-            &lib_path_strings,
-            false,
-        )?;
-    }
-    for path in &extra_object_files {
+    for path in crt_objects_before
+        .iter()
+        .copied()
+        .chain(object_files.iter().copied())
+        .chain(parsed_args.extra_object_files.iter().map(String::as_str))
+    {
         load_file(
             path,
             &mut objects,
@@ -474,36 +428,50 @@ pub fn link_shared(
         )?;
     }
 
-    let mut all_lib_paths: Vec<String> = extra_lib_paths;
+    let mut all_lib_paths: Vec<String> = parsed_args.extra_lib_paths.clone();
     all_lib_paths.extend(lib_path_strings.iter().cloned());
 
-    if !libs_to_load.is_empty() {
-        let mut lib_paths_resolved: Vec<String> = Vec::new();
-        for lib_name in &libs_to_load {
-            if let Some(lib_path) = resolve_lib_prefer_shared(lib_name, &all_lib_paths) {
-                if !lib_paths_resolved.contains(&lib_path) {
-                    lib_paths_resolved.push(lib_path);
-                }
-            }
+    // User libraries first, then gcc's (`... -lfoo -lgcc -lgcc_s -lc`), as
+    // one group re-scanned until no archive member is added. A missing user
+    // library is an error; a missing default is not.
+    linker_common::require_libs(&parsed_args.libs_to_load, &all_lib_paths, false)?;
+    let mut lib_paths_resolved: Vec<String> = Vec::new();
+    for lib_name in parsed_args
+        .libs_to_load
+        .iter()
+        .map(String::as_str)
+        .chain(implicit_libs.iter().copied())
+    {
+        if let Some(lib_path) = resolve_lib_prefer_shared(lib_name, &all_lib_paths)
+            && !lib_paths_resolved.contains(&lib_path)
+        {
+            lib_paths_resolved.push(lib_path);
         }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            let prev_count = objects.len();
-            for lib_path in &lib_paths_resolved {
-                load_file(
-                    lib_path,
-                    &mut objects,
-                    &mut globals,
-                    &mut needed_sonames,
-                    &all_lib_paths,
-                    false,
-                )?;
-            }
-            if objects.len() != prev_count {
-                changed = true;
-            }
+    }
+    let mut changed = !lib_paths_resolved.is_empty();
+    while changed {
+        let prev_count = objects.len();
+        for lib_path in &lib_paths_resolved {
+            load_file(
+                lib_path,
+                &mut objects,
+                &mut globals,
+                &mut needed_sonames,
+                &all_lib_paths,
+                false,
+            )?;
         }
+        changed = objects.len() != prev_count;
+    }
+    for path in crt_objects_after {
+        load_file(
+            path,
+            &mut objects,
+            &mut globals,
+            &mut needed_sonames,
+            &lib_path_strings,
+            false,
+        )?;
     }
 
     // Merge sections (no gc-sections for shared libraries)
@@ -517,7 +485,15 @@ pub fn link_shared(
     // NEEDED dependencies. Without this, the shared library would be missing
     // DT_NEEDED entries for libc.so.6 etc., causing the dynamic linker to
     // fail to resolve PLT symbols at runtime.
-    resolve_dynamic_symbols_for_shared(&objects, &globals, &mut needed_sonames, &all_lib_paths);
+    // Only when gcc's default libraries were requested: the driver passes
+    // no implicit libs under `-nostdlib`/`-nodefaultlibs`, and the standalone lccc-ld
+    // none at all (its caller lists `-lc` etc.).  GNU ld never resolves
+    // against a library absent from the command line, so without this
+    // guard `-nostdlib` code calling `puts` linked against libc.so.6
+    // instead of failing as it does with GCC (i686/RISC-V already failed).
+    if !implicit_libs.is_empty() {
+        resolve_dynamic_symbols_for_shared(&objects, &globals, &mut needed_sonames, &all_lib_paths);
+    }
 
     // gABI visibility merge (PR #821 F2): the most constraining STV_* of
     // every reference AND the definition applies to the output symbol, so a
@@ -544,6 +520,7 @@ pub fn link_shared(
         &needed_sonames,
         output_path,
         soname,
+        rpath.as_ref(),
         &pending_defsyms,
     )
 }

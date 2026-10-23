@@ -54,6 +54,9 @@ pub(crate) struct RaConfig {
     pub(crate) no_index_home: bool,
     /// `CCC_NO_FOLDED_INDEX_LIVENESS`: disable folded-index interval extension (default: false).
     pub(crate) no_folded_index_liveness: bool,
+    /// `CCC_NO_FOLD_ADDR_DEFER`: keep constant-offset fold addresses as
+    /// ordinary allocation candidates (default: false).
+    pub(crate) no_fold_addr_defer: bool,
     /// `CCC_NO_VECREG`: disable vector-register allocation (default: false).
     pub(crate) no_vecreg: bool,
     /// `CCC_NO_PHI_COALESCE`: disable phi-copy coalescing (default: false).
@@ -126,11 +129,34 @@ pub(crate) struct RaConfig {
     pub(crate) fp_extract_homes: bool,
     /// `CCC_CALLER_SAVE_SPANNING`: enable caller-save spans (default: false).
     pub(crate) caller_save_spanning: bool,
+    /// `CCC_NO_COLD_CALL_SPLIT`: keep scalar FP values live across cold calls
+    /// out of the x86-64 XMM pool (default: false).
+    pub(crate) no_cold_call_split: bool,
+    /// `CCC_NO_PHI_BLOCKER_REHOME`: never move the values blocking a loop
+    /// phi coalesce into a free callee-saved home (default: false).
+    pub(crate) no_phi_blocker_rehome: bool,
+    /// `CCC_NO_PHASE2C_REUSE`: skip Phase 2c's second tier, which homes what
+    /// the fresh callee-saved scan left over in the free stretches of
+    /// already-saved callee-saved registers (default: false).
+    pub(crate) no_phase2c_reuse: bool,
+    /// `CCC_NO_CALLEE_STICKY`: the Phase 1 callee-saved scan rotates through
+    /// fresh registers instead of reusing touched ones (default: false).
+    pub(crate) no_callee_sticky: bool,
+    /// `CCC_NO_SAVE_SET_COMPACT`: keep every callee-saved register the
+    /// phases chose instead of folding a register's whole holder set into
+    /// another already-saved one (default: false).
+    pub(crate) no_save_set_compact: bool,
     /// `CCC_NO_RDX_HAZARD`: disable position-aware %rdx admission on x86-64
     /// (the Phase-2 hazard-filtered %rdx wave) and fall back to the
     /// whole-function exclusion whenever any body instruction clobbers %rdx
     /// (default: false — the wave is on).
     pub(crate) no_rdx_hazard: bool,
+    /// `CCC_NO_RDX_PARAM_HOMES`: restore the whole-function rule that any
+    /// %rdx-clobbering instruction keeps every x86-64 parameter out of the
+    /// caller-saved pool (default: false -- division/multiply-high/switch
+    /// bodies grant parameters caller-saved homes, see
+    /// [`x86_rdx_clobbers_allow_param_homes`]).
+    pub(crate) no_rdx_param_homes: bool,
     /// `CCC_NO_SEGMENT_SCAN`: disable hole-aware scanning (default: false).
     pub(crate) no_segment_scan: bool,
     /// `CCC_EVICT_MODE`: eviction mode (default: 3; malformed values use 3).
@@ -342,6 +368,7 @@ impl RaConfig {
             no_mulacc: present("CCC_NO_MULACC"),
             no_index_home: present("CCC_NO_INDEX_HOME"),
             no_folded_index_liveness: present("CCC_NO_FOLDED_INDEX_LIVENESS"),
+            no_fold_addr_defer: present("CCC_NO_FOLD_ADDR_DEFER"),
             no_vecreg: present("CCC_NO_VECREG"),
             no_phi_coalesce: present("CCC_NO_PHI_COALESCE"),
             no_coalesce: present("CCC_NO_COALESCE"),
@@ -368,7 +395,13 @@ impl RaConfig {
             no_fp_copy_web: present("CCC_NO_FP_COPY_WEB"),
             fp_extract_homes: present("CCC_FP_EXTRACT_HOMES"),
             caller_save_spanning: present("CCC_CALLER_SAVE_SPANNING"),
+            no_cold_call_split: present("CCC_NO_COLD_CALL_SPLIT"),
+            no_phi_blocker_rehome: present("CCC_NO_PHI_BLOCKER_REHOME"),
+            no_phase2c_reuse: present("CCC_NO_PHASE2C_REUSE"),
+            no_callee_sticky: present("CCC_NO_CALLEE_STICKY"),
+            no_save_set_compact: present("CCC_NO_SAVE_SET_COMPACT"),
             no_rdx_hazard: present("CCC_NO_RDX_HAZARD"),
+            no_rdx_param_homes: present("CCC_NO_RDX_PARAM_HOMES"),
             no_segment_scan: present("CCC_NO_SEGMENT_SCAN"),
             evict_mode: text("CCC_EVICT_MODE")
                 .and_then(|value| value.parse::<i32>().ok())
@@ -671,6 +704,10 @@ pub struct RegAllocResult {
     /// (`CCC_SLOT_CENSUS=1`, `scripts/stack_census.py`) instead of every
     /// consumer re-deriving eligibility and drifting from it.
     pub eligible: FxHashSet<u32>,
+    /// Base -> constant-offset fold addresses deferred in this round (see
+    /// `defer_const_fold_addresses`); the caller re-admits the addresses of
+    /// every base that did not end in `RegAllocConfig::fold_base_regs`.
+    pub fold_deferred: FxHashMap<u32, Vec<u32>>,
 }
 
 /// Whether x86 can preserve incoming parameters directly in caller-saved homes.
@@ -746,10 +783,12 @@ pub(crate) fn riscv_param_caller_homes_safe_with_config(
 ///
 /// `rdx`: the instruction's emitter writes `%rdx` behind the allocator's
 /// back (division `cqto`/`idiv`, i128 `rax:rdx` pairs, `rdtsc(p)`,
-/// jump-table dispatch, the cmpxchg-loop RMWs, cmpxchg's `desired`
-/// operand, atomic stores, fixed-scratch vector intrinsics).
-/// `rdi`: the cmpxchg-loop RMWs park the operand value in `%rdi`
-/// (`emit_x86_atomic_op_loop`), `rdtscp` writes `%rdi` too.
+/// jump-table dispatch, the cmpxchg-loop RMWs' candidate, cmpxchg's
+/// `desired` operand, atomic stores, fixed-scratch vector intrinsics).
+/// `rdi`: `rdtscp`, and the 128-bit atomics' libatomic argument staging.
+/// The narrow cmpxchg-loop RMWs read their operand in place
+/// (`emit_x86_atomic_op_loop`; stack-staged when it has no usable home), so
+/// they no longer touch `%rdi`.
 ///
 /// Values homed in a clobbered register across such an instruction read
 /// garbage afterwards (at1: `__atomic_fetch_and` loop destroyed the `%rdx`
@@ -796,7 +835,12 @@ pub fn x86_inst_fixed_scratch(inst: &Instruction) -> X86FixedScratch {
         Instruction::BinOp { op, ty, .. } => {
             if matches!(
                 op,
-                IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem
+                IrBinOp::SDiv
+                    | IrBinOp::UDiv
+                    | IrBinOp::SRem
+                    | IrBinOp::URem
+                    | IrBinOp::UMulHigh
+                    | IrBinOp::SMulHigh
             ) || wide(ty)
             {
                 RDX
@@ -832,9 +876,10 @@ pub fn x86_inst_fixed_scratch(inst: &Instruction) -> X86FixedScratch {
             }
         }
         // `lock xadd` / `xchg` / test-and-set run on rax+rcx only; bitwise
-        // RMWs use a cmpxchg loop with old in rax, new in rdx and the operand
-        // value in rdi. 128-bit atomics stage arguments in rdi/rsi/rdx/rcx
-        // (and rbx for cmpxchg16b).
+        // RMWs use a cmpxchg loop with old in rax, the candidate in rdx and
+        // the operand read in place (an imm32, its register home, or a
+        // stack-staged copy). 128-bit atomics stage arguments in
+        // rdi/rsi/rdx/rcx (and rbx for cmpxchg16b).
         Instruction::AtomicRmw { op, ty, .. } => {
             if matches!(ty, IrType::I128 | IrType::U128) {
                 RDX_RDI
@@ -844,7 +889,9 @@ pub fn x86_inst_fixed_scratch(inst: &Instruction) -> X86FixedScratch {
                     | AtomicRmwOp::Sub
                     | AtomicRmwOp::Xchg
                     | AtomicRmwOp::TestAndSet => NONE,
-                    _ => RDX_RDI,
+                    AtomicRmwOp::And | AtomicRmwOp::Or | AtomicRmwOp::Xor | AtomicRmwOp::Nand => {
+                        RDX
+                    }
                 }
             }
         }
@@ -1034,6 +1081,170 @@ pub fn x86_body_has_wide_ops(func: &IrFunction) -> bool {
     false
 }
 
+/// Whether the x86-64 body contains an instruction whose 128-bit emitter
+/// uses `%r8`/`%r9`/`%rdi`/`%rsi` as scratch (`i128_ops.rs`: the binop RHS
+/// high half in `%rsi`, `mul` in `%r8`/`%r9`/`%rdi`/`%rsi`, compares in
+/// `%r8b`, the divrem/float helper staging in `%rdi`/`%rsi`, and the wide
+/// atomics' libatomic staging). The prologue withdraws those four registers
+/// from the general caller-saved pool for such bodies; the shared predicate
+/// keeps the pool gate and the allocator's hazard wave
+/// ([`collect_x64_wide_hazard_points`]) from ever disagreeing about which
+/// bodies are "wide".
+pub fn x86_body_has_i128_ops(func: &IrFunction) -> bool {
+    let wide = |ty: &IrType| matches!(ty, IrType::I128 | IrType::U128);
+    func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| match inst {
+            Instruction::BinOp { ty, .. }
+            | Instruction::UnaryOp { ty, .. }
+            | Instruction::Cmp { ty, .. }
+            | Instruction::Store { ty, .. }
+            | Instruction::AtomicLoad { ty, .. }
+            | Instruction::AtomicStore { ty, .. }
+            | Instruction::AtomicRmw { ty, .. }
+            | Instruction::AtomicCmpxchg { ty, .. } => wide(ty),
+            Instruction::Cast { from_ty, to_ty, .. } => wide(from_ty) || wide(to_ty),
+            _ => false,
+        })
+    })
+}
+
+/// x86-64 program points (flat liveness numbering: one per instruction plus
+/// one per terminator, as in [`collect_x64_rdx_clobber_points`]) at which a
+/// 128-bit emitter may write `%r8`/`%r9`/`%rdi`/`%rsi`.
+///
+/// Bodies with [`x86_body_has_i128_ops`] lose those registers for the whole
+/// function, yet the clobbers are point-local: every wide emitter stages
+/// through fixed scratch within its own instruction and keeps no state in
+/// them across points (the only cross-point wide state is the `%rax:%rdx`
+/// accumulator pair, which this wave never hands out). A value whose live
+/// range avoids every point below is exactly as safe in those registers as
+/// in a narrow body.  The set is deliberately a superset of the real
+/// clobbers:
+///
+/// * every instruction that is wide-typed, defines or reads a wide VALUE
+///   (fixpoint through `Copy`, since phi elimination materialises wide
+///   copies that `emit_copy_i128_impl` stages), or carries an `I128`
+///   constant, and every terminator that reads one;
+/// * the FUSION WINDOW of every wide `Cmp`: the backend may emit a compare
+///   at a later consumer in the same block (`detect_cmp_branch_fusion`,
+///   fused selects), so every point from the `Cmp` to its block's
+///   terminator counts.
+///
+/// The one exception is an integer `Cast` into or out of a wide type: its
+/// emitter stages through `%rax:%rdx` only (the carrier unpack
+/// `trunc(v >> 64)` and the pack's `zext` were the commonest "hazards" in
+/// practice, and each one split every wave candidate's range around it).
+///
+/// Callers must apply the hazards inclusively at both ends
+/// (`overlaps_inclusive`, no birth exemption): a wide emitter's dest store is not guaranteed to follow its
+/// last scratch use for every shape.
+pub fn collect_x64_wide_hazard_points(func: &IrFunction) -> Vec<u32> {
+    let wide = |ty: &IrType| matches!(ty, IrType::I128 | IrType::U128);
+    let typed_wide = |inst: &Instruction| match inst {
+        Instruction::BinOp { ty, .. }
+        | Instruction::UnaryOp { ty, .. }
+        | Instruction::Cmp { ty, .. }
+        | Instruction::Load { ty, .. }
+        | Instruction::Store { ty, .. }
+        | Instruction::ParamRef { ty, .. }
+        | Instruction::Select { ty, .. }
+        | Instruction::AtomicLoad { ty, .. }
+        | Instruction::AtomicStore { ty, .. }
+        | Instruction::AtomicRmw { ty, .. }
+        | Instruction::AtomicCmpxchg { ty, .. }
+        | Instruction::Phi { ty, .. } => wide(ty),
+        Instruction::Cast { from_ty, to_ty, .. } => wide(from_ty) || wide(to_ty),
+        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+            wide(&info.return_type) || info.arg_types.iter().any(wide)
+        }
+        _ => false,
+    };
+    // Wide values: typed wide defs, then Copy chains to a fixpoint.
+    let mut wide_vals: FxHashSet<u32> = FxHashSet::default();
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            let defines_wide = match inst {
+                Instruction::Cast { to_ty, .. } => wide(to_ty),
+                Instruction::Cmp { .. } | Instruction::Store { .. } => false,
+                Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                    wide(&info.return_type)
+                }
+                _ => typed_wide(inst),
+            };
+            if defines_wide {
+                if let Some(d) = inst.dest() {
+                    wide_vals.insert(d.0);
+                }
+            }
+        }
+    }
+    loop {
+        let before = wide_vals.len();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Instruction::Copy {
+                    dest,
+                    src: Operand::Value(v),
+                } = inst
+                {
+                    if wide_vals.contains(&v.0) {
+                        wide_vals.insert(dest.0);
+                    }
+                }
+            }
+        }
+        if wide_vals.len() == before {
+            break;
+        }
+    }
+    let has_wide_const = |inst: &Instruction| {
+        let mut found = false;
+        for_each_operand_in_instruction(inst, |operand| {
+            found |= matches!(operand, Operand::Const(IrConst::I128(_)));
+        });
+        found
+    };
+    let mut points: Vec<u32> = Vec::new();
+    let mut point: u32 = 0;
+    for block in &func.blocks {
+        let mut window_open = false;
+        for inst in &block.instructions {
+            if matches!(inst, Instruction::Cmp { ty, .. } if wide(ty)) {
+                window_open = true;
+            }
+            // Integer casts into or out of a wide value stage only through
+            // the `%rax:%rdx` pair (`emit_cast_default`: `operand_to_rax_rdx`
+            // / `store_rax_rdx_to`, a narrow `emit_store_result`); the
+            // float<->I128 casts are libcalls and already call points
+            // (`liveness::instruction_is_call_point`), which no Phase-2
+            // candidate spans.
+            let int_cast = matches!(inst, Instruction::Cast { from_ty, to_ty, .. }
+                if from_ty.is_integer() && to_ty.is_integer());
+            let mut touches = !int_cast && (typed_wide(inst) || has_wide_const(inst));
+            if !touches && !int_cast {
+                inst.for_each_used_value(|v| touches |= wide_vals.contains(&v));
+                touches |= inst.dest().is_some_and(|d| wide_vals.contains(&d.0));
+            }
+            if touches || window_open {
+                points.push(point);
+            }
+            point += 1;
+        }
+        let mut term_touches = window_open;
+        block
+            .terminator
+            .for_each_used_value(|v| term_touches |= wide_vals.contains(&v));
+        for_each_operand_in_terminator(&block.terminator, |operand| {
+            term_touches |= matches!(operand, Operand::Const(IrConst::I128(_)));
+        });
+        if term_touches {
+            points.push(point);
+        }
+        point += 1;
+    }
+    points
+}
+
 /// Companion of [`x86_param_caller_homes_safe`]: with parameters parked in
 /// their incoming registers for the whole body, an inline-expanded
 /// `memcpy`/`memset` (which clobbers %rdi/%rsi/%rcx/%rax/%xmm0/%xmm1) is
@@ -1099,6 +1310,75 @@ fn x86_params_dead_after_inline_libc_calls(
     true
 }
 
+/// Whether a body's `%rdx` clobbers still let x86-64 parameters take
+/// caller-saved homes ([`x86_param_caller_homes_safe_with_config`]).
+///
+/// The `idivq` defect that gate records was a parameter HOMED in `%rdx`
+/// across the clobber. That hazard is now owned where it arises: the prologue
+/// drops `%rdx` from the pool of any clobbering body
+/// ([`x86_body_fixed_scratch`]), hints are honoured only inside the pool
+/// (`LinearScanAllocator::find_free_register`), and the Phase-2x64 wave
+/// admits `%rdx` only for intervals that miss every clobber point
+/// ([`collect_x64_rdx_clobber_points`]). A parameter WITHOUT a home is read
+/// from its ABI register at its `ParamRef`, which the gate already confines
+/// to the entry prefix -- before the first clobber can execute.  Keeping
+/// every parameter out of the caller-saved pool for the whole function was
+/// therefore pure cost: `x / y` pushed %rbx and %r12 and copied both
+/// arguments into them (GCC: `movq %rdi,%rax; xorl %edx,%edx; divq %rsi`).
+///
+/// The admitted clobber classes are those whose only `%rdx` write is the
+/// instruction itself, at its own program point: non-wide division,
+/// remainder and multiply-high, non-wide atomics (cmpxchg, atomic store,
+/// the bitwise RMW loop), and `Switch` jump-table dispatch.  Excluded:
+/// wide (I128/U128) bodies -- `emit_copy_i128_impl` and the wide ParamRef
+/// and store paths stage through `%rax:%rdx`, which the entry prefix itself
+/// may execute ahead of a later parameter's ABI read (the 128-bit atomics
+/// also stage arguments in %rdi/%rsi); F128 stores; and the
+/// `__builtin_apply`/`__builtin_longjmp` intrinsics, whose emitters perform
+/// an unmodelled `call *%r11`.  Without the wave (`CCC_NO_RDX_HAZARD`) the
+/// relaxation buys nothing, so that switch restores the old gate too.
+fn x86_rdx_clobbers_allow_param_homes(func: &IrFunction, ra_config: &RaConfig) -> bool {
+    if ra_config.no_rdx_param_homes || ra_config.no_rdx_hazard {
+        return false;
+    }
+    let narrow_divlike = |inst: &Instruction| {
+        matches!(
+            inst,
+            Instruction::BinOp { op, ty, .. }
+                if !matches!(ty, IrType::I128 | IrType::U128)
+                    && matches!(
+                        op,
+                        IrBinOp::SDiv
+                            | IrBinOp::UDiv
+                            | IrBinOp::SRem
+                            | IrBinOp::URem
+                            | IrBinOp::UMulHigh
+                            | IrBinOp::SMulHigh
+                    )
+        )
+    };
+    // Narrow atomics write %rdx only inside their own sequence (cmpxchg's
+    // `desired`, an atomic store's value, the RMW loop's candidate), after
+    // which none of their operands is read again -- and the wave refuses any
+    // value live INTO the point, so no operand is %rdx-homed.  128-bit forms
+    // are wide and excluded below.
+    let narrow_atomic = |inst: &Instruction| {
+        matches!(
+            inst,
+            Instruction::AtomicRmw { ty, .. }
+                | Instruction::AtomicCmpxchg { ty, .. }
+                | Instruction::AtomicStore { ty, .. }
+                if !matches!(ty, IrType::I128 | IrType::U128)
+        ) && !x86_inst_fixed_scratch(inst).rdi
+    };
+    let all_admitted = func.blocks.iter().all(|block| {
+        block.instructions.iter().all(|inst| {
+            !x86_inst_fixed_scratch(inst).rdx || narrow_divlike(inst) || narrow_atomic(inst)
+        })
+    });
+    all_admitted && !x86_body_has_wide_ops(func)
+}
+
 /// Compatibility query for isolated callers. Production code must use the
 /// explicit invocation policy variant below.
 pub fn x86_param_caller_homes_safe(func: &IrFunction) -> bool {
@@ -1161,16 +1441,19 @@ pub(crate) fn x86_param_caller_homes_safe_with_config(
     // `idivq`'s cqto zeroed it — every truncation of the param silently
     // wrong (stress intexpr seed 1, O1 rt+cf, got 65533 expected 65532).
     // Mirror the prologue's allocation exclusions (see
-    // x86_body_fixed_scratch): when the body can clobber %rdx OR %rdi,
-    // params fall back to the ordinary spill-home path.  The %rdi half
-    // matters for future-proofing: today every rdi clobberer
-    // (cmpxchg-loop RMWs, rdtscp) is an RDX_RDI pair, so the historical
-    // rdx-only gate happened to catch them transitively — but the prologue
-    // already removes %rdi from the pool independently, and a future
-    // rdi-only scratch would otherwise silently destroy a param parked in
-    // %rdi.  The gate now consumes the full model the prologue consumes.
+    // x86_body_fixed_scratch): when the body can clobber %rdi, or %rdx in a
+    // way the position-aware model does not cover
+    // ([`x86_rdx_clobbers_allow_param_homes`]), params fall back to the
+    // ordinary spill-home path.  The %rdi half matters for
+    // future-proofing: today every rdi clobberer (rdtscp, the 128-bit
+    // atomics) is an RDX_RDI pair, so the historical rdx-only gate happened
+    // to catch them transitively — but the prologue already removes %rdi
+    // from the pool independently, and a future rdi-only scratch would
+    // otherwise silently destroy a param parked in %rdi.
     let caller_home_scratch = x86_body_fixed_scratch(func);
-    if caller_home_scratch.rdx || caller_home_scratch.rdi {
+    if caller_home_scratch.rdi
+        || (caller_home_scratch.rdx && !x86_rdx_clobbers_allow_param_homes(func, ra_config))
+    {
         return false;
     }
     for (bi, block) in func.blocks.iter().enumerate() {
@@ -1231,6 +1514,17 @@ pub struct RegAllocConfig {
     /// fa[i] stores landing on fa[seed] on aarch64 -O0/-O2; sqlite
     /// `wherePathSolver` indexing `aLoop[]` with a pointer on x86-64).
     pub folded_index_uses: FxHashMap<u32, Vec<u32>>,
+    /// Registers in which the backend accepts a constant-offset fold base:
+    /// a `GEP base, C` / `base ± C` whose every use is a Load/Store address
+    /// is then emitted as `C(%base)` at each access and never materialised
+    /// (`const_offset_fold_reg_base_ok`; x86-64 and i686). Such an address
+    /// needs no register of its own once its base holds one of these, so the
+    /// allocator DEFERS it (see `defer_const_fold_addresses`). Empty: off.
+    pub fold_base_regs: Vec<PhysReg>,
+    /// Fold addresses whose deferral already failed in an earlier round (the
+    /// base ended without a register in `fold_base_regs`): they stay ordinary
+    /// candidates. Filled by `run_regalloc_and_merge_clobbers_ex`.
+    pub fold_readmit: FxHashSet<u32>,
     /// ABI-preferred homes (e.g. an incoming ParamRef already in `%rdi`).
     /// Hints never override `follow_value` and are honored only when the
     /// physical register belongs to the current allocation wave.
@@ -1442,6 +1736,35 @@ fn segment_sets_overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
     false
 }
 
+/// Phase 2c tier 2 (RA-PHASE2C-SAVED-REUSE): a no-eviction fill of the free
+/// stretches of already-saved callee-saved registers. `candidates` are
+/// `(loop-weighted web pressure, envelope length, value, half-open span)`;
+/// they are placed hottest first, then shorter envelope, then value id (Phase
+/// 2f's ranking), each into the first register in `regs` order whose
+/// normalized occupancy union in `occupied` it does not overlap. `occupied`
+/// is updated in place. Returns the placements in placement order.
+fn fill_saved_callee_stretches(
+    mut candidates: Vec<(u64, u32, u32, (u32, u32))>,
+    occupied: &mut FxHashMap<u8, Vec<(u32, u32)>>,
+    regs: &[PhysReg],
+) -> Vec<(u32, PhysReg)> {
+    candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let mut placed = Vec::new();
+    for (_, _, value, span) in candidates {
+        let piece = [span];
+        let Some(reg) = regs.iter().copied().find(|reg| {
+            occupied
+                .get(&reg.0)
+                .is_none_or(|spans| !segment_sets_overlap(&piece, spans))
+        }) else {
+            continue;
+        };
+        insert_segment_union(occupied.entry(reg.0).or_default(), &piece);
+        placed.push((value, reg));
+    }
+    placed
+}
+
 /// Merge two sorted segment sets into a normalized union. Adjacent pieces are
 /// combined: no candidate can use the zero-width boundary between them.
 fn insert_segment_union(into: &mut Vec<(u32, u32)>, added: &[(u32, u32)]) {
@@ -1541,6 +1864,21 @@ fn attach_scan_segments(
     }
 }
 
+/// Whether `config` is the i686 `{%ecx, %edx}` caller-saved pool that the
+/// i686-only phases (Phase 2's scratch-hazard split, 2d, 2e, 2g, 2h) model.
+/// PhysReg 4/5 are `%ecx`/`%edx` only on i686: AArch64 numbers x4/x5 the
+/// same, and keying on the pool alone ran AArch64 through the i686 hazard
+/// model (so its Phase 2 only ever offered x4/x5, and Phase 2e's "%eax"
+/// home was x6) from 335fcf88c until this target check.
+fn i686_scratch_pool(config: &RegAllocConfig) -> bool {
+    const EM_386: u16 = 3;
+    crate::common::types::target_elf_machine() == EM_386
+        && config
+            .caller_saved_regs
+            .iter()
+            .any(|r| matches!(r.0, 4 | 5))
+}
+
 /// Live *across* a clobber: defined before it, used after it.
 /// Born at a call (retval) or dying at a call (arg) may use caller-saved.
 #[inline]
@@ -1592,6 +1930,198 @@ fn collect_call_spanning_owners(
         }
     }
     set
+}
+
+/// Call points a segment is live ACROSS: defined before the call and live
+/// after it (`def < cp`, `seg.start <= cp < seg.end`) -- the predicate of
+/// [`collect_call_spanning_owners`].
+fn segment_spanned_calls<'a>(
+    seg: &LiveInterval,
+    def: u32,
+    call_points: &'a [u32],
+) -> impl Iterator<Item = u32> + 'a {
+    let lo = call_points.partition_point(|&cp| cp < seg.start || cp <= def);
+    let (start, end) = (seg.start, seg.end);
+    call_points[lo..]
+        .iter()
+        .copied()
+        .take_while(move |&cp| cp < end && cp >= start)
+}
+
+/// Derive the COLD-CALL XMM SPLIT save set from the FINAL assignments: an
+/// XMM register is saved and restored around a cold call point exactly when
+/// some value homed in it is live across that call.  Deriving it from the
+/// final homes (not from the scan that admitted the value) keeps it exact
+/// for copy-web members that inherit a leader's register and after every
+/// repair/drop phase.  The point spans `(cp, cp)` reuse the Phase-2b
+/// emission (`start <= point <= end`).
+/// Save-set compaction (RA-SAVE-SET-COMPACT): fold the WHOLE holder set of a
+/// callee-saved register into another callee-saved register that is already
+/// saved, when no holder of one overlaps a holder of the other. Each folded
+/// register drops a push/pop pair (and its CFI) from the prologue.
+///
+/// The phases place values with independent occupancy models (Phase 1, the
+/// Phase 2c tiers, phi propagation, rehoming), so the final map can name a
+/// register whose holders would all fit beside another's -- find_bit's
+/// Phase 2c scan homed v53 [34,35] in a fresh %r14 while %rbx (v28 [15,16])
+/// was long dead. Placement heuristics cannot fix that without perturbing
+/// spill choices (see RA-CALLEE-STICKY); a post-pass changes register names
+/// only.
+///
+/// Soundness: holders of one register already coexist legally (coalesce
+/// classes, death-point sharing, segment fills), and moving ALL of them
+/// keeps every such relation; the new co-tenants are judged by FAT intervals
+/// with INCLUSIVE overlap, stricter than any phase (no touching, no hole
+/// sharing), so no two values of different classes can meet. Both registers
+/// come from `pool` (the asm-filtered callee-saved list), so call and asm
+/// survival are unchanged. A holder without an interval pins its register
+/// (neither source nor target). Returns the `(from, to)` folds in order.
+fn compact_callee_saved_homes(
+    assignments: &mut FxHashMap<u32, PhysReg>,
+    iv_map: &FxHashMap<u32, (u32, u32)>,
+    pool: &[PhysReg],
+) -> Vec<(PhysReg, PhysReg)> {
+    let mut regs: Vec<PhysReg> = pool.to_vec();
+    regs.sort_unstable_by_key(|r| r.0);
+    regs.dedup_by_key(|r| r.0);
+    let mut holders: Vec<Vec<(u32, u32, u32)>> = vec![Vec::new(); regs.len()];
+    let mut pinned = vec![false; regs.len()];
+    for (&v, &r) in assignments.iter() {
+        let Some(i) = regs.iter().position(|p| p.0 == r.0) else {
+            continue;
+        };
+        match iv_map.get(&v) {
+            Some(&(s, e)) => holders[i].push((v, s, e)),
+            None => pinned[i] = true,
+        }
+    }
+    for h in &mut holders {
+        h.sort_unstable();
+    }
+    let span = |h: &[(u32, u32, u32)]| -> u64 {
+        h.iter()
+            .map(|&(_, s, e)| u64::from(e.saturating_sub(s)) + 1)
+            .sum()
+    };
+    // Cheapest registers first: few, short holders fit beside others best.
+    let mut order: Vec<usize> = (0..regs.len())
+        .filter(|&i| !pinned[i] && !holders[i].is_empty())
+        .collect();
+    order.sort_by_key(|&i| (holders[i].len(), span(&holders[i]), regs[i].0));
+    let mut moves = Vec::new();
+    for src in order {
+        if holders[src].is_empty() {
+            continue;
+        }
+        let fits = |dst: usize| {
+            holders[src]
+                .iter()
+                .all(|&(_, s1, e1)| holders[dst].iter().all(|&(_, s2, e2)| e1 < s2 || e2 < s1))
+        };
+        let Some(dst) =
+            (0..regs.len()).find(|&d| d != src && !pinned[d] && !holders[d].is_empty() && fits(d))
+        else {
+            continue;
+        };
+        let moved = std::mem::take(&mut holders[src]);
+        for &(v, _, _) in &moved {
+            assignments.insert(v, regs[dst]);
+        }
+        holders[dst].extend(moved);
+        moves.push((regs[src], regs[dst]));
+    }
+    moves
+}
+
+/// Turn every cold call an x86-64 XMM home is live across into a
+/// caller-save span `(cp, cp)`: the value keeps its register on the hot
+/// path and pays a spill/reload only around the cold call, instead of
+/// living on the stack for its whole range.  The call's own result
+/// register is never restored over.  Disabled by `CCC_NO_COLD_CALL_SPLIT`.
+fn add_cold_call_xmm_saves(
+    assignments: &FxHashMap<u32, PhysReg>,
+    liveness: &LivenessResult,
+    iv_map: &FxHashMap<u32, (u32, u32)>,
+    enabled: bool,
+    caller_save_spans: &mut FxHashMap<u8, Vec<(u32, u32)>>,
+) {
+    if !enabled || liveness.cold_call_points.is_empty() {
+        return;
+    }
+    let mut points: FxHashSet<(u8, u32)> = FxHashSet::default();
+    for seg in &liveness.segments {
+        let Some(&reg) = assignments.get(&seg.value_id) else {
+            continue;
+        };
+        if !(20..=33).contains(&reg.0) {
+            continue;
+        }
+        let def = iv_map.get(&seg.value_id).map_or(seg.start, |&(s, _)| s);
+        for cp in segment_spanned_calls(seg, def, &liveness.call_points) {
+            // XMM homes span only cold calls
+            // (`collect_cold_only_call_spanning_owners`). Should that ever
+            // break, saving around the call is still sound, so fail closed
+            // to a save with an unknown result rather than abort.
+            let cold = liveness.cold_call_points.binary_search(&cp);
+            debug_assert!(cold.is_ok(), "XMM home live across a non-cold call");
+            // Never restore over the call's result: its home receives the
+            // return value (a merged copy web may also count a member live
+            // into the call block), and any value genuinely live across the
+            // call in that register would interfere with the result.
+            let result = cold
+                .ok()
+                .and_then(|k| liveness.cold_call_results.get(k).copied().flatten());
+            if result == Some(seg.value_id)
+                || result
+                    .and_then(|r| assignments.get(&r))
+                    .is_some_and(|r| r.0 == reg.0)
+            {
+                continue;
+            }
+            points.insert((reg.0, cp));
+        }
+    }
+    let mut points: Vec<(u8, u32)> = points.into_iter().collect();
+    points.sort_unstable();
+    for (reg, cp) in points {
+        caller_save_spans.entry(reg).or_default().push((cp, cp));
+    }
+}
+
+/// Coalesce owners whose every spanned call point is a cold call
+/// (`LivenessResult::cold_call_points`).  Only hole-aware (segmented)
+/// values qualify: the fat-interval fallback cannot tell which calls a
+/// value is really live across.
+fn collect_cold_only_call_spanning_owners(
+    liveness: &LivenessResult,
+    iv_map: &FxHashMap<u32, (u32, u32)>,
+    coalesce_member_of: &FxHashMap<u32, u32>,
+) -> FxHashSet<u32> {
+    let owner_of = |value: u32| coalesce_member_of.get(&value).copied().unwrap_or(value);
+    let mut cold: FxHashSet<u32> = FxHashSet::default();
+    let mut hot: FxHashSet<u32> = FxHashSet::default();
+    if liveness.cold_call_points.is_empty() {
+        return cold;
+    }
+    let mut segmented: FxHashSet<u32> = FxHashSet::default();
+    for seg in &liveness.segments {
+        segmented.insert(seg.value_id);
+        let def = iv_map.get(&seg.value_id).map_or(seg.start, |&(s, _)| s);
+        for cp in segment_spanned_calls(seg, def, &liveness.call_points) {
+            if liveness.cold_call_points.binary_search(&cp).is_ok() {
+                cold.insert(owner_of(seg.value_id));
+            } else {
+                hot.insert(owner_of(seg.value_id));
+            }
+        }
+    }
+    for interval in &liveness.intervals {
+        if !segmented.contains(&interval.value_id) {
+            hot.insert(owner_of(interval.value_id));
+        }
+    }
+    cold.retain(|v| !hot.contains(v));
+    cold
 }
 
 /// Inclusive — i686 scratch may clobber while the insn still reads the value.
@@ -2444,6 +2974,22 @@ pub(crate) fn is_non_gpr_type(ty: &IrType, is_32bit: bool) -> bool {
         || (is_32bit && matches!(ty, IrType::I64 | IrType::U64))
 }
 
+/// Whether a `Cast`'s result can live in a general-purpose register: both
+/// sides are GPR types, or it is an integer truncation OUT of a 128-bit
+/// value. The truncation's result is an ordinary narrow scalar: every backend
+/// routes it through `emit_cast_default` (x86-64 and AArch64 after their
+/// narrow/FP fast paths, RISC-V and i686 directly), which loads the pair,
+/// narrows the low half and writes the result with the register-aware
+/// `emit_store_result`. Refusing it parked every member a two-register
+/// struct return carries (`trunc(v)`, `trunc(v >> 64)`) in a stack slot.
+/// The single source of truth for both `eligible` and
+/// `collect_non_gpr_values`.
+fn cast_result_is_gpr(from_ty: IrType, to_ty: IrType, is_32bit: bool) -> bool {
+    let wide = |t: IrType| matches!(t, IrType::I128 | IrType::U128);
+    let wide_int_trunc = wide(from_ty) && to_ty.is_integer() && !wide(to_ty);
+    !is_non_gpr_type(&to_ty, is_32bit) && (wide_int_trunc || !is_non_gpr_type(&from_ty, is_32bit))
+}
+
 fn propagate_coalesce_members(
     assignments: &mut FxHashMap<u32, PhysReg>,
     member_of: &FxHashMap<u32, u32>,
@@ -2628,6 +3174,201 @@ fn collect_safe_folded_index_homes(
                 }
             }
         }
+    }
+    result
+}
+
+/// Loop weight of the block defining each deferred fold address: the weight
+/// at which that GEP's read of its base entered `use_count`.
+fn fold_def_block_weights(
+    func: &IrFunction,
+    transfer: &FxHashMap<u32, Vec<u32>>,
+    block_loop_weight: &[u64],
+) -> FxHashMap<u32, u64> {
+    let moved: FxHashSet<u32> = transfer.values().flatten().copied().collect();
+    let mut out = FxHashMap::default();
+    for (block_idx, block) in func.blocks.iter().enumerate() {
+        let weight = block_loop_weight.get(block_idx).copied().unwrap_or(1);
+        for inst in &block.instructions {
+            if let Some(dest) = inst.dest()
+                && moved.contains(&dest.0)
+            {
+                out.insert(dest.0, weight);
+            }
+        }
+    }
+    out
+}
+
+/// FOLD-DEFER: drop constant-offset fold addresses from the candidate set
+/// while their base is a candidate (see `RegAllocConfig::fold_base_regs`).
+///
+/// LICM hoists a loop-invariant `GEP p, C` (`&p->field`) into the preheader.
+/// Each such address then became a loop-spanning interval carrying the
+/// loop-weighted uses of its accesses, while the base `p` — whose register is
+/// what the emitter actually reads at a folded access — was weighted only by
+/// the preheader GEPs. Five `&optPtr->field` addresses in zstd's
+/// `ZSTD_compressBlock_opt2` match-length loop out-ranked `optPtr` itself:
+/// the base and all five addresses were spilled, and every price lookup became
+/// `movq slot,%rcx; op (%rcx)` where GCC emits `op C(%r12)`. One register for
+/// the base replaces every address register; the addresses are phantom
+/// pressure whenever the base is homed.
+///
+/// Deferral is a preference, not a verdict: a base can still lose its
+/// register (a call-spanning base competes for the six callee-saved homes,
+/// while its addresses may live in a call-free stretch with a caller-saved
+/// register to spare). `run_regalloc_and_merge_clobbers_ex` therefore checks
+/// every deferred base's final home and re-allocates with the addresses of
+/// the bases that failed re-admitted (`RegAllocConfig::fold_readmit`).
+///
+/// Sound by construction: deferral only removes a candidate. A deferred value
+/// is not `never_materialized`, so it keeps a stack home; the emitter folds the
+/// access against the base register (the producer emits nothing) or, when the
+/// base has no foldable home, materialises the address into that stack home
+/// and reads it back — the path every spilled address already takes. The
+/// base's interval already reaches every folded access through the
+/// `folded_index_uses` hidden reads.
+///
+/// Returns base -> deferred addresses: the allocator credits the base with
+/// their uses (`RangeMetadata::transfer_uses`), since every one of those
+/// accesses reads the base's home.
+fn defer_const_fold_addresses(
+    func: &IrFunction,
+    eligible: &mut FxHashSet<u32>,
+    readmit: &FxHashSet<u32>,
+) -> FxHashMap<u32, Vec<u32>> {
+    let mut transfer: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
+    let links = crate::backend::generation::collect_gep_fold_base_links(func);
+    if links.is_empty() {
+        return transfer;
+    }
+    let transient = transient_fold_addresses(func, &links);
+    for (base, dests) in links {
+        if !eligible.contains(&base) {
+            continue;
+        }
+        let moved: Vec<u32> = dests
+            .into_iter()
+            .filter(|d| !transient.contains(d) && !readmit.contains(d) && eligible.remove(d))
+            .collect();
+        if !moved.is_empty() {
+            transfer.insert(base, moved);
+        }
+    }
+    transfer
+}
+
+/// Fold addresses whose deferral relieves no register pressure: every use
+/// sits in the GEP's own block and no instruction between the GEP and its
+/// last use defines a value (`GEP p, C; load`). Such an address dies exactly
+/// where the next value is born, so its candidacy never denies anyone a
+/// register, and the emitter folds the access against the base whether or
+/// not the address is homed. Deferring it would only reorder the linear
+/// scan's arrivals — measured on sha256_transform: the state-word loads'
+/// `&state[k]` deferral flipped which loop span won a free register at loop
+/// entry and cost a store/reload of the MAJ temporary in the 64-round loop
+/// (GCC: zero stack memops there). Deferral keeps its purpose: addresses that
+/// live across other definitions or blocks (LICM-hoisted `&p->field`).
+fn transient_fold_addresses(func: &IrFunction, links: &FxHashMap<u32, Vec<u32>>) -> FxHashSet<u32> {
+    let candidates: FxHashSet<u32> = links.values().flatten().copied().collect();
+    // value -> (def block, def index); block-local scan state per candidate.
+    let mut def_at: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(dest) = inst.dest()
+                && candidates.contains(&dest.0)
+            {
+                def_at.insert(dest.0, (bi, ii));
+            }
+        }
+    }
+    // Last in-block use index (terminator = len) per candidate; any use in
+    // another block disqualifies it.
+    let mut last_use: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut escapes: FxHashSet<u32> = FxHashSet::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let mut note = |v: u32, at: usize| {
+            if let Some(&(db, di)) = def_at.get(&v) {
+                // A same-block use at or before the def is a phi operand fed
+                // around a single-block loop's backedge: live across the loop.
+                if db == bi && at > di {
+                    let e = last_use.entry(v).or_insert(at);
+                    *e = (*e).max(at);
+                } else {
+                    escapes.insert(v);
+                }
+            }
+        };
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            for_each_operand_in_instruction(inst, |op| {
+                if let Operand::Value(v) = op {
+                    note(v.0, ii);
+                }
+            });
+            for_each_value_use_in_instruction(inst, |v| note(v.0, ii));
+        }
+        let end = block.instructions.len();
+        for_each_operand_in_terminator(&block.terminator, |op| {
+            if let Operand::Value(v) = op {
+                note(v.0, end);
+            }
+        });
+    }
+    let mut out = FxHashSet::default();
+    for (&v, &(bi, di)) in &def_at {
+        if escapes.contains(&v) {
+            continue;
+        }
+        let Some(&lu) = last_use.get(&v) else {
+            continue;
+        };
+        let insts = &func.blocks[bi].instructions;
+        let between = insts.get(di + 1..lu).unwrap_or(&[]);
+        if between.iter().all(|inst| inst.dest().is_none()) {
+            out.insert(v);
+        }
+    }
+    out
+}
+
+/// Extra allocation rounds for FOLD-DEFER re-admission (see
+/// `defer_const_fold_addresses`). One round settles nearly every function: a
+/// re-admitted address changes the pressure its base sees, so a second
+/// re-admission round is allowed and the rest is left to the stack homes.
+const FOLD_READMIT_ROUNDS: usize = 2;
+
+/// `allocate_registers` plus FOLD-DEFER re-admission: a deferred address only
+/// pays off when its base ends in a register of `config.fold_base_regs`.
+/// Re-admit the addresses of every base that did not and allocate again.
+///
+/// Terminates: deferral skips `fold_readmit`, so every failed address is new
+/// to the set and each extra round strictly grows it (at most one round per
+/// deferred address, capped at `FOLD_READMIT_ROUNDS`). Whatever still fails
+/// after the cap is sound — the address is materialised in its stack home,
+/// the path every spilled address takes — merely unoptimised. A function
+/// whose deferred bases all get foldable homes costs exactly one allocation.
+pub(crate) fn allocate_registers_with_fold_rounds(
+    func: &IrFunction,
+    config: &mut RegAllocConfig,
+) -> RegAllocResult {
+    let mut result = allocate_registers(func, config);
+    for _ in 0..FOLD_READMIT_ROUNDS {
+        let failed: Vec<u32> = result
+            .fold_deferred
+            .iter()
+            .filter(|(base, _)| {
+                !result
+                    .assignments
+                    .get(base)
+                    .is_some_and(|r| config.fold_base_regs.contains(r))
+            })
+            .flat_map(|(_, moved)| moved.iter().copied())
+            .collect();
+        if failed.is_empty() {
+            break;
+        }
+        config.fold_readmit.extend(failed);
+        result = allocate_registers(func, config);
     }
     result
 }
@@ -3309,6 +4050,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     {
         return RegAllocResult {
             eligible: FxHashSet::default(),
+            fold_deferred: FxHashMap::default(),
             assignments: FxHashMap::default(),
             accumulator_assignments: if has_builtin_setjmp {
                 Vec::new()
@@ -3413,7 +4155,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     from_ty,
                     ..
                 } => {
-                    if !is_non_gpr_type(to_ty, is_32bit) && !is_non_gpr_type(from_ty, is_32bit) {
+                    if cast_result_is_gpr(*from_ty, *to_ty, is_32bit) {
                         eligible.insert(dest.0);
                     }
                 }
@@ -3686,6 +4428,38 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // vector intervals keep the fat `spans_any_call` check.
     let call_spanning: FxHashSet<u32> =
         collect_call_spanning_owners(&liveness, &iv_map, &coalesce_member_of, call_points);
+    // The same two facts with hidden call SEQUENCES (dynamic TLS on AArch64/
+    // RISC-V, `LivenessResult::sequence_call_points`) removed. `call_spanning`
+    // stays the ELIGIBILITY fact: every caller-saved filter below keeps it, so
+    // no caller-saved home spans a TLS `blr`/`call`. The `real_*` facts drive
+    // only the spill-PRIORITY decisions (Phase 1 promotion, leaf detection,
+    // Phase 2c admission), which then see the function exactly as when the
+    // sequence is not a call: values spanning only a TLS access compete with
+    // the hot parameters for the callee-saved pool instead of preempting it.
+    // Identical (borrowed) on every target without call sequences.
+    let real_call_points: std::borrow::Cow<'_, [u32]> = if liveness.sequence_call_points.is_empty()
+    {
+        std::borrow::Cow::Borrowed(call_points.as_slice())
+    } else {
+        std::borrow::Cow::Owned(
+            call_points
+                .iter()
+                .copied()
+                .filter(|p| liveness.sequence_call_points.binary_search(p).is_err())
+                .collect(),
+        )
+    };
+    let real_spanning: std::borrow::Cow<'_, FxHashSet<u32>> =
+        if liveness.sequence_call_points.is_empty() {
+            std::borrow::Cow::Borrowed(&call_spanning)
+        } else {
+            std::borrow::Cow::Owned(collect_call_spanning_owners(
+                &liveness,
+                &iv_map,
+                &coalesce_member_of,
+                &real_call_points,
+            ))
+        };
 
     let has_nonlocal_control = func.blocks.iter().any(|b| {
         b.instructions.iter().any(|inst| {
@@ -3704,6 +4478,41 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
+    let fold_use_transfer = if !config.fold_base_regs.is_empty()
+        && !config.ra_config.no_fold_addr_defer
+        && !config.ra_config.no_folded_index_liveness
+    {
+        defer_const_fold_addresses(func, &mut eligible, &config.fold_readmit)
+    } else {
+        FxHashMap::default()
+    };
+    // The deferred addresses' accesses read the base's register: they are
+    // the base's uses for Phase-1 candidacy (`hot_loop_home`) too. The use
+    // MOVES rather than adds: a folded GEP emits nothing, so its own read of
+    // the base (already in `use_count`, at the GEP block's weight) is
+    // replaced by the accesses' reads. Adding instead double-counted every
+    // adjacent `GEP p, C` + access pair and inflated cold bases.
+    if !fold_use_transfer.is_empty() {
+        let def_weight = fold_def_block_weights(func, &fold_use_transfer, &block_loop_weight);
+        for (base, moved) in &fold_use_transfer {
+            let mut count = 0u64;
+            let mut gep_reads = 0u64;
+            let mut depth = 0;
+            for v in moved {
+                let uses = use_count.get(v).copied().unwrap_or(0);
+                if uses == 0 {
+                    continue;
+                }
+                count = count.saturating_add(uses);
+                gep_reads = gep_reads.saturating_add(def_weight.get(v).copied().unwrap_or(0));
+                depth = depth.max(use_loop_depth.get(v).copied().unwrap_or(0));
+            }
+            let c = use_count.entry(*base).or_insert(0);
+            *c = c.saturating_sub(gep_reads).saturating_add(count);
+            let d = use_loop_depth.entry(*base).or_insert(0);
+            *d = (*d).max(depth);
+        }
+    }
     let scan_ivs =
         collect_gpr_scan_intervals(&liveness, &eligible, &merged_of, &coalesce_member_of);
     // (phi_dest, backedge_src) pairs for the recurrence sight in
@@ -3744,6 +4553,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             &liveness.block_loop_depth,
             func,
             &config.ra_config,
+            Some(&fold_use_transfer),
         );
         apply_physical_reg_hints(&mut ranges, &config.reg_hints);
         bump_folded_index_priority(
@@ -3825,9 +4635,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // corpus behaviour (cmdline_find_option: the state machine wants a
     // dedicated home because the in-loop call fragments the volatile pool).
     // A/B: `CCC_LEAF_STRICT_CALL_FREE=1` restores the call-free-only rule.
-    let calls_only_outside_loops = !call_points.is_empty()
+    let calls_only_outside_loops = !real_call_points.is_empty()
         && !config.ra_config.leaf_strict_call_free
-        && call_points.iter().all(|&p| {
+        && real_call_points.iter().all(|&p| {
             liveness
                 .block_starts
                 .iter()
@@ -3836,13 +4646,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 .is_some_and(|b| liveness.block_loop_depth.get(b).copied().unwrap_or(1) == 0)
         });
     let leaf_prefers_caller_saved = config.leaf_caller_saved_homes
-        && (call_points.is_empty() || calls_only_outside_loops)
+        && (real_call_points.is_empty() || calls_only_outside_loops)
         && !config.ra_config.no_leaf_caller_home;
     let hot_loop_home = |iv: &LiveInterval| -> bool {
         if config.ra_config.no_hot_loop || leaf_prefers_caller_saved {
             return false;
         }
-        if call_spanning.contains(&iv.value_id) {
+        if real_spanning.contains(&iv.value_id) {
             return false;
         }
         if iv.end.saturating_sub(iv.start) < 10 {
@@ -3883,7 +4693,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     let phase1_intervals: Vec<LiveInterval> = scan_ivs
         .iter()
         .copied()
-        .filter(|iv| call_spanning.contains(&iv.value_id) || hot_loop_home(iv))
+        .filter(|iv| real_spanning.contains(&iv.value_id) || hot_loop_home(iv))
         .collect();
     // ONE build over the whole phase-1 worklist, then the split.  The
     // per-range measurements (`mark_loop_spanning`: the loop's block-local
@@ -3946,6 +4756,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         config.available_regs.clone(),
         &config.ra_config,
     );
+    // Reuse an already-touched register before opening a fresh one: on this
+    // pool each fresh callee-saved register costs a push/pop pair per call,
+    // while rotation's false-dependency avoidance is moot under renaming
+    // (benchmark programs: 333 -> 320 pushes at -O2, Ir neutral).
+    allocator.prefer_touched = true;
     allocator.run();
     let mut assignments = allocator.assignments;
     // Wave two: the hot-loop promotion, which is an optimisation and may only
@@ -3993,10 +4808,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
 
     // Phase 2: caller-saved for non-spanning leftovers (remats welcome here).
     if !config.caller_saved_regs.is_empty() {
-        let i686_pool = config
-            .caller_saved_regs
-            .iter()
-            .any(|r| matches!(r.0, 4 | 5));
+        let i686_pool = i686_scratch_pool(config);
         let hazards: Option<(Vec<u32>, Vec<u32>)> = if i686_pool {
             Some(collect_i686_scratch_hazard_points(
                 func,
@@ -4388,15 +5200,82 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
-    // Phase 2c: leftover callee-saved for call-free overflow.
+    // Phase 2-x64w (position-aware r8/r9/rdi/rsi admission for wide bodies).
+    // The prologue withdraws these four from the pool for the WHOLE function
+    // as soon as one 128-bit instruction exists, because the wide emitters
+    // use them as scratch. Those clobbers are point-local (see
+    // `collect_x64_wide_hazard_points`), so values whose live ranges avoid
+    // every wide point get them back. A function returning a 9..=16-byte
+    // aggregate packs it as I128 at its return, and an un-inlined helper of
+    // that kind used to run its whole body on r10/r11 plus callee-saved
+    // pushes. Same candidacy as the general Phase-2 waves (no home yet, not
+    // call-spanning, param guards, `later_arg_values` kept off the argument
+    // registers), plus fused div/rem tails, whose value is physically
+    // resident from the head on (the `%rdx` wave's reason). Overflow-only
+    // like the `%rdx` wave: it runs after the general waves, so it cannot
+    // displace a fold-eligible r10/r11 home.
+    if crate::common::types::target_elf_machine() == crate::backend::elf::EM_X86_64
+        && !config
+            .caller_saved_regs
+            .iter()
+            .any(|r| matches!(r.0, 12 | 13 | 14 | 15))
+        && x86_body_has_i128_ops(func)
     {
-        let phase2c_intervals: Vec<LiveInterval> = scan_ivs
+        let mut pool = vec![PhysReg(12), PhysReg(13), PhysReg(15)];
+        if !x86_body_fixed_scratch(func).rdi {
+            pool.push(PhysReg(14));
+        }
+        let hazards = collect_x64_wide_hazard_points(func);
+        let divrem_tail_dests: FxHashSet<u32> = match divrem_target_for_current_arch() {
+            Some(t) => compute_i686_divrem_pairs_with_config(func, t, &config.ra_config).tail_dests,
+            None => FxHashSet::default(),
+        };
+        let intervals: Vec<LiveInterval> = scan_ivs
             .iter()
             .copied()
             .filter(|iv| {
-                !assignments.contains_key(&iv.value_id) && !call_spanning.contains(&iv.value_id)
+                !assignments.contains_key(&iv.value_id)
+                    && !call_spanning.contains(&iv.value_id)
+                    && (ordered_param_homes || !param_restricted.contains(&iv.value_id))
+                    && !riscv_entry_guard.contains(&iv.value_id)
+                    && !later_arg_values.contains(&iv.value_id)
+                    && !divrem_tail_dests.contains(&iv.value_id)
+                    && !overlaps_inclusive(iv, &hazards)
             })
             .collect();
+        if config.ra_config.debug_ra_intervals {
+            let cands: Vec<u32> = intervals.iter().map(|iv| iv.value_id).collect();
+            eprintln!(
+                "[RA-P2W] fn={} wide-hazard points={} candidates={:?}",
+                func.name,
+                hazards.len(),
+                cands
+            );
+        }
+        if !intervals.is_empty() {
+            let ranges = build_gpr_ranges(&intervals);
+            let mut alloc = LinearScanAllocator::new_with_config(ranges, pool, &config.ra_config);
+            alloc.run();
+            for (vid, r) in alloc.assignments {
+                assignments.insert(vid, r);
+                caller_used_regs_set.insert(r.0);
+            }
+        }
+    }
+
+    // Phase 2c: leftover callee-saved for call-free overflow. Callee-saved
+    // homes survive a call sequence, so a value spanning only TLS sequences
+    // (`real_spanning` excludes it from Phase 1) competes here.
+    {
+        let mut phase2c_intervals: Vec<LiveInterval> = scan_ivs
+            .iter()
+            .copied()
+            .filter(|iv| {
+                !assignments.contains_key(&iv.value_id) && !real_spanning.contains(&iv.value_id)
+            })
+            .collect();
+        // Tier 1: overflow takes the callee-saved registers no earlier phase
+        // used (each costs a push/pop pair), ranked by the full cost model.
         if !phase2c_intervals.is_empty() {
             let free_callee: Vec<PhysReg> = config
                 .available_regs
@@ -4428,10 +5307,98 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                     free_callee,
                     &config.ra_config,
                 );
+                // No `prefer_touched` here (measured, RA-CALLEE-STICKY):
+                // this scan cannot evict, so which overflow interval spills
+                // follows placement order; sticky placement spilled zstd's
+                // hot v26 where rotation spilled the cold v158 (+4% Ir).
                 spill_allocator.run();
                 for (vid, reg) in spill_allocator.assignments {
                     assignments.insert(vid, reg);
                     used_regs_set.insert(reg.0);
+                }
+            }
+        }
+        phase2c_intervals.retain(|iv| !assignments.contains_key(&iv.value_id));
+        // Tier 2 (RA-PHASE2C-SAVED-REUSE): what the fresh scan left
+        // unhomed competes for the free stretches of every callee-saved
+        // register the prologue now saves anyway. The tier only ADDS homes,
+        // so no value the fresh scan homed loses its register.
+        //
+        // Ranking is load-bearing: the tier is a no-eviction fill, so
+        // whoever is placed first keeps the stretch. A start-ordered linear
+        // scan here (S81) was sticky placement in another form
+        // (RA-CALLEE-STICKY): saved-register stretches went to whichever
+        // overflow interval started first, regardless of loop weight.
+        // zstd's ZSTD_decompressSequences_bmi2 spilled its three
+        // per-sequence nbBits bytes and materialized two table-entry
+        // addresses into a stack slot: +3.0% Ir in that function at every
+        // decompression level (d-3: 23.53M vs 22.86M with the tier off).
+        // Candidates are therefore ranked like Phase 2f's segment fill,
+        // hottest web first. The tier stays because 2f skips Copy webs:
+        // without it strlen_bench's outer loop counter (a copy-coalesced
+        // loop web) round-trips the stack every iteration (+675K Ir).
+        // Interference uses fat group-merged envelopes. Phase 2f's
+        // hole-aware segments were measured and rejected here: they pack
+        // more webs into early holes and lost on zstd (c-19 +1.4%, c-1
+        // +0.9% Ir vs fat).
+        // The case that motivated the tier -- linux_find_bit paying a fresh
+        // %r15 save per call for a 4-point temp while rbx/r12/r13 sat idle
+        // -- is a register-NAME problem, which save-set compaction
+        // (`compact_callee_saved_homes`, after all phases) folds without
+        // touching any spill choice.
+        if !phase2c_intervals.is_empty() && !config.ra_config.no_phase2c_reuse {
+            let saved_callee: Vec<PhysReg> = config
+                .available_regs
+                .iter()
+                .filter(|r| used_regs_set.contains(&r.0))
+                .copied()
+                .collect();
+            if !saved_callee.is_empty() {
+                // Normalized occupancy union per saved register, from every
+                // current holder's group-merged fat bounds read half-open,
+                // `[def, last use)` -- Phase 2f's convention
+                // (`segment_sets_overlap`): a value born where another dies
+                // may take its register; an empty `[p, p)` still overlaps
+                // any holder live strictly across `p`. A holder without
+                // bounds blocks its register for the whole function.
+                let mut occupied: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
+                for (&vid, &reg) in &assignments {
+                    if !saved_callee.contains(&reg) {
+                        continue;
+                    }
+                    let span =
+                        allocation_owner_bounds(vid, &merged_of, &iv_map).unwrap_or((0, u32::MAX));
+                    occupied.entry(reg.0).or_default().push(span);
+                }
+                for spans in occupied.values_mut() {
+                    spans.sort_unstable();
+                    let source = std::mem::take(spans);
+                    insert_segment_union(spans, &source);
+                }
+                // Phase 2f's ranking: the whole web's loop-weighted uses,
+                // then the shorter envelope (fewer holes consumed, more
+                // followers admitted), then the value id for determinism.
+                let candidates: Vec<(u64, u32, u32, (u32, u32))> = phase2c_intervals
+                    .iter()
+                    .filter_map(|iv| {
+                        let (start, end) =
+                            allocation_owner_bounds(iv.value_id, &merged_of, &iv_map)?;
+                        let own = use_count.get(&iv.value_id).copied().unwrap_or(0);
+                        let group = coalesce_groups
+                            .get(&iv.value_id)
+                            .map_or(0, |members| summed_use_weight(members, &use_count));
+                        Some((
+                            own.max(group),
+                            end.saturating_sub(start),
+                            iv.value_id,
+                            (start, end),
+                        ))
+                    })
+                    .collect();
+                for (vid, reg) in
+                    fill_saved_callee_stretches(candidates, &mut occupied, &saved_callee)
+                {
+                    assignments.insert(vid, reg);
                 }
             }
         }
@@ -4463,12 +5430,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // and never touch %ecx.  Now that assignments exist, recompute the hazard
     // set with the real pointer homes and hand the newly hazard-free
     // caller-saved registers to the values Phase 2 had to refuse.
-    if !config.ra_config.no_load_hazard_refine
-        && config
-            .caller_saved_regs
-            .iter()
-            .any(|r| matches!(r.0, 4 | 5))
-    {
+    if !config.ra_config.no_load_hazard_refine && i686_scratch_pool(config) {
         let mut ecx_clean_ptrs: FxHashSet<u32> = FxHashSet::default();
         {
             // Alloca destinations resolve through slot/alignment machinery
@@ -4597,12 +5559,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     //    accumulator (m32 fuzz seed 0).  `acc_first_uses` records exactly
     //    the values whose EVERY use is such a position.
     //  * any hazard strictly between def and last use destroys the value.
-    if !config.ra_config.no_eax_alloc
-        && config
-            .caller_saved_regs
-            .iter()
-            .any(|r| matches!(r.0, 4 | 5))
-    {
+    if !config.ra_config.no_eax_alloc && i686_scratch_pool(config) {
         let eax_hazards = collect_i686_eax_hazard_points(func);
 
         // Values whose every operand occurrence is consumed
@@ -4827,11 +5784,8 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     //   * phi-web holders and ABI-hinted holders are never displaced;
     //   * the pass runs once, ranked, before Phase 2f's segment fill (the
     //     segment fill must not see co-holders the steal reasons about).
-    let i686_narrow_pool = config
-        .caller_saved_regs
-        .iter()
-        .any(|r| matches!(r.0, 4 | 5))
-        && config.available_regs.iter().all(|r| r.0 <= 3);
+    let i686_narrow_pool =
+        i686_scratch_pool(config) && config.available_regs.iter().all(|r| r.0 <= 3);
     // Use the target and the actual post-clobber pool, not XMM availability:
     // -mgeneral-regs-only still needs GPR promotion. Empty/disabled pools and
     // reserved rbp never gain a register here. No caller-saved/APX home is
@@ -4879,12 +5833,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // born in %edx at the fused div, survives the digits GEP (edx-clean) and
     // the indexed load (refined edx-clean), so it keeps %edx and the load
     // folds to `movsbl digits(,%edx),%eax` — GCC's shape, −5 insns/iter.
-    if !config.ra_config.no_iterated_hazard
-        && config
-            .caller_saved_regs
-            .iter()
-            .any(|r| matches!(r.0, 4 | 5))
-    {
+    if !config.ra_config.no_iterated_hazard && i686_scratch_pool(config) {
         // Phase 2d's pointer-cleanliness set (loads whose pointers stage no
         // %ecx) — recomputed here for the refined hazard collection.
         let ecx_clean_ptrs_2h: FxHashSet<u32> = {
@@ -5226,6 +6175,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         &phi_coalesce,
         &mut assignments,
         &config.available_regs,
+        Some((&coalesce_member_of, &config.caller_saved_regs)),
         &config.ra_config,
     );
 
@@ -5291,6 +6241,29 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 }
             }
         }
+        // COLD-CALL XMM SPLIT: SysV x86-64 has no callee-saved XMM, so a
+        // scalar FP value live across ANY call used to lose the pool and
+        // round-trip the stack at every def and use -- including a loop
+        // accumulator whose only crossing call is a never-taken slow path
+        // (the inlined `sqrt` errno call: nbody-style loops ran ~2x the
+        // instructions).  Values whose every crossing call is cold may take
+        // a caller-saved XMM home; the save/restore pair is emitted around
+        // those cold calls only (`caller_save_spans`, derived from the final
+        // assignments below).  Scalars only: the save slot is 8 bytes.
+        // x86-64 only: the i686 emitter does not implement the spans, and
+        // a returns-twice call forbids caller-save homes outright.
+        let cold_fp_spanning: FxHashSet<u32> = if x86_fp_pool
+            && !is_32bit
+            && !has_nonlocal_control
+            && !config.ra_config.no_cold_call_split
+        {
+            let mut set =
+                collect_cold_only_call_spanning_owners(&liveness, &iv_map, &coalesce_member_of);
+            set.retain(|v| f64_value_set.contains(v) && !vector_values.contains(v));
+            set
+        } else {
+            FxHashSet::default()
+        };
         let mut real_use: FxHashSet<u32> = FxHashSet::default();
         if arm_fp_pool || x86_fp_pool {
             for block in &func.blocks {
@@ -5345,7 +6318,9 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             .filter(|iv| non_gpr_values.contains(&iv.value_id))
             .filter(|iv| iv.end > iv.start)
             .filter(|iv| !assignments.contains_key(&iv.value_id))
-            .filter(|iv| !call_spanning.contains(&iv.value_id))
+            .filter(|iv| {
+                !call_spanning.contains(&iv.value_id) || cold_fp_spanning.contains(&iv.value_id)
+            })
             // The destructive-form pre-allocation above already homed the
             // SSE-128 chain values; never double-book them.
             .filter(|iv| !(x86_fp_pool && sse_chain_alloc.contains(&iv.value_id)))
@@ -5428,6 +6403,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 &liveness.block_loop_depth,
                 func,
                 &config.ra_config,
+                None,
             );
             // Slot-operand classification for the XMM pool, so a hoisted FP
             // constant whose every use folds its slot as a memory operand is
@@ -5676,6 +6652,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     // used_regs_set is the running "already-saved" pool for later phases
     // (segment fill, spanning). The prologue save-set is rebuilt AFTER
     // repair and CCC_RA_DROP from the homes that actually survive.
+
+    if !config.ra_config.no_save_set_compact {
+        let moves = compact_callee_saved_homes(&mut assignments, &iv_map, &config.available_regs);
+        if config.ra_config.debug_ra && !moves.is_empty() {
+            eprintln!("[RA-COMPACT] fn={} folded {:?}", func.name, moves);
+        }
+    }
 
     // ── Post-RA overlap repair (soundness backstop) ────────────────────────
     // The allocator is a federation: linear-scan phases, wave seeds, phi
@@ -5971,6 +6954,13 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
     used_regs.sort_unstable_by_key(|reg| reg.0);
     used_regs.dedup();
     caller_save_spans.retain(|reg, spans| final_reg_ids.contains(reg) && !spans.is_empty());
+    add_cold_call_xmm_saves(
+        &assignments,
+        &liveness,
+        &iv_map,
+        x86_fp_pool && !is_32bit,
+        &mut caller_save_spans,
+    );
 
     let mut accumulator_assignments = analyze_accumulator_assignments_with_config(
         func,
@@ -6018,6 +7008,18 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
+    if config.ra_config.debug_ra_phases {
+        // Value -> register after EVERY phase (steal, hazard refinement,
+        // segment fill): which value bought a callee-saved register, which
+        // share one. `[RA-FINAL]` above is the main scan's state only.
+        let mut ids: Vec<u32> = assignments.keys().copied().collect();
+        ids.sort_unstable();
+        let homes: Vec<String> = ids
+            .iter()
+            .map(|v| format!("v{v}=r{}", assignments[v].0))
+            .collect();
+        eprintln!("[RA-HOMES] fn={} {}", func.name, homes.join(" "));
+    }
     RegAllocResult {
         eligible,
         assignments,
@@ -6026,6 +7028,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         caller_save_spans,
         liveness: Some(liveness),
         phi_chain,
+        fold_deferred: fold_use_transfer,
     }
 }
 
@@ -7591,7 +8594,7 @@ fn collect_non_gpr_values(func: &IrFunction, is_32bit: bool) -> FxHashSet<u32> {
                     from_ty,
                     ..
                 } => {
-                    if is_non_gpr_type(to_ty, is_32bit) || is_non_gpr_type(from_ty, is_32bit) {
+                    if !cast_result_is_gpr(*from_ty, *to_ty, is_32bit) {
                         non_gpr_values.insert(dest.0);
                     }
                 }
@@ -9556,25 +10559,46 @@ fn remove_ineligible_operands(
                 }
                 Instruction::AtomicRmw {
                     ptr: Operand::Value(v),
+                    ty,
                     ..
                 }
                 | Instruction::AtomicInc {
                     ptr: Operand::Value(v),
+                    ty,
                     ..
                 }
                 | Instruction::AtomicCmpxchg {
                     ptr: Operand::Value(v),
+                    ty,
                     ..
                 }
                 | Instruction::AtomicLoad {
                     ptr: Operand::Value(v),
+                    ty,
                     ..
                 }
                 | Instruction::AtomicStore {
                     ptr: Operand::Value(v),
+                    ty,
                     ..
                 } => {
-                    eligible.remove(&v.0);
+                    // x86-64's narrow atomic emitters read the address
+                    // register-aware (`atomic_address_reg`: in place from its
+                    // home, else via %rax/%rcx), and their only fixed scratch
+                    // is modelled (`x86_inst_fixed_scratch`; %rdx refuses any
+                    // value live into the point).  Excluding the pointer used
+                    // to force it through a slot or the accumulator -- a
+                    // reload per access for an atomic counter in a loop.
+                    // 128-bit forms stage libatomic arguments in
+                    // %rdi/%rsi/%rdx/%rcx before reading the pointer, and the
+                    // other backends' sequences are not audited for it: both
+                    // keep the exclusion.
+                    let x86_narrow = crate::common::types::target_elf_machine()
+                        == crate::backend::elf::EM_X86_64
+                        && !matches!(ty, IrType::I128 | IrType::U128);
+                    if !x86_narrow {
+                        eligible.remove(&v.0);
+                    }
                 }
                 Instruction::StackRestore { ptr } => {
                     eligible.remove(&ptr.0);
@@ -10622,11 +11646,63 @@ fn homeless_merge_profitable(segments: &[LiveInterval], dest: u32, src: u32) -> 
     overlap >= incr_fill
 }
 
+/// Function-wide facts [`source_home_survives_dest_redefs_in`] consults.
+/// Each is a pure function of `func`, and both callers hold `func` immutably
+/// across their whole candidate loop, so one build serves every candidate
+/// (rebuilding the four O(func) maps per candidate was ~0.94 G Ir of a
+/// 19.2 G Ir compile of zstd's `huf_compress.c`). `web_find` path-compresses
+/// `web_parent` in place, which moves no root, so sharing it changes no answer.
+struct SourceHomeFacts<'f> {
+    fold_base_of: FxHashMap<u32, u32>,
+    web_parent: FxHashMap<u32, u32>,
+    def_of: FxHashMap<u32, &'f Instruction>,
+    def_count: FxHashMap<u32, u32>,
+}
+
+impl<'f> SourceHomeFacts<'f> {
+    fn new(func: &'f IrFunction) -> Self {
+        let mut def_of: FxHashMap<u32, &'f Instruction> = FxHashMap::default();
+        let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let Some(dest) = inst.dest() {
+                    *def_count.entry(dest.0).or_insert(0) += 1;
+                    def_of.entry(dest.0).or_insert(inst);
+                }
+            }
+        }
+        Self {
+            fold_base_of: const_address_link_bases(func),
+            web_parent: coalesce_web_parent(func),
+            def_of,
+            def_count,
+        }
+    }
+}
+
+/// [`source_home_survives_dest_redefs_in`] with facts built for this one query.
+#[cfg(test)]
 fn source_home_survives_dest_redefs(
     func: &IrFunction,
     liveness: &LivenessResult,
     succs: &analysis::FlatAdj,
     candidate: &PhiCoalesceCandidate,
+) -> bool {
+    source_home_survives_dest_redefs_in(
+        func,
+        liveness,
+        succs,
+        candidate,
+        &mut SourceHomeFacts::new(func),
+    )
+}
+
+fn source_home_survives_dest_redefs_in(
+    func: &IrFunction,
+    liveness: &LivenessResult,
+    succs: &analysis::FlatAdj,
+    candidate: &PhiCoalesceCandidate,
+    facts: &mut SourceHomeFacts<'_>,
 ) -> bool {
     let src = candidate.backedge_src;
     let dest = candidate.phi_dest;
@@ -10661,7 +11737,6 @@ fn source_home_survives_dest_redefs(
     // shared home holds exactly the value the access needs. Reads precede
     // the definition of the same instruction, so a dirty read is checked
     // before a later write in that instruction can rescue it.
-    let fold_base_of = const_address_link_bases(func);
     let hidden_use_at = |point: u32| {
         liveness
             .folded_read_points
@@ -10679,19 +11754,8 @@ fn source_home_survives_dest_redefs(
     };
 
     // Potential-sharing components + def maps for the disjoint-web hidden-read
-    // exemption below (a few O(func) passes, negligible next to the CFG walk).
-    let mut web_parent = coalesce_web_parent(func);
-    let mut def_of: FxHashMap<u32, &Instruction> = FxHashMap::default();
-    let mut path_def_count: FxHashMap<u32, u32> = FxHashMap::default();
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Some(dest) = inst.dest() {
-                *path_def_count.entry(dest.0).or_insert(0) += 1;
-                def_of.entry(dest.0).or_insert(inst);
-            }
-        }
-    }
-    let src_web = web_find(&mut web_parent, src);
+    // exemption below come from the caller's shared `SourceHomeFacts`.
+    let src_web = web_find(&mut facts.web_parent, src);
     let mut work = vec![(
         candidate.source_block_idx,
         candidate.source_def_idx.saturating_add(1),
@@ -10728,13 +11792,13 @@ fn source_home_survives_dest_redefs(
             }
             if dirty
                 && hidden_use_at(point)
-                && !folded_consumer_reads_dest_home(inst, dest, &fold_base_of)
+                && !folded_consumer_reads_dest_home(inst, dest, &facts.fold_base_of)
                 && !hidden_read_in_disjoint_web(
                     inst,
                     src_web,
-                    &mut web_parent,
-                    &def_of,
-                    &path_def_count,
+                    &mut facts.web_parent,
+                    &facts.def_of,
+                    &facts.def_count,
                 )
             {
                 return false;
@@ -10940,6 +12004,7 @@ fn apply_phi_coalesce_assignments(
         candidates,
         assignments,
         callee_saved,
+        None,
         &RaConfig::default(),
     )
 }
@@ -10951,8 +12016,23 @@ fn apply_phi_coalesce_assignments_with_config(
     candidates: &[PhiCoalesceCandidate],
     assignments: &mut FxHashMap<u32, PhysReg>,
     callee_saved: &[PhysReg],
+    rehome: Option<(&FxHashMap<u32, u32>, &[PhysReg])>,
     ra_config: &RaConfig,
 ) -> Vec<PhiCoalesceCandidate> {
+    // Blocker re-homing (see `rehome_phi_blockers`) needs the copy-web
+    // membership to keep groups intact and the body-safe caller-saved pool;
+    // callers without them opt out.
+    let rehome: Option<PhiBlockerRehome<'_>> = rehome
+        .filter(|_| {
+            !ra_config.no_phi_blocker_rehome
+                && crate::common::types::target_elf_machine() == crate::backend::elf::EM_X86_64
+        })
+        .map(|(member_of, caller_saved)| PhiBlockerRehome {
+            groups: member_of.iter().flat_map(|(&a, &b)| [a, b]).collect(),
+            callee_saved,
+            caller_saved,
+            call_points: &liveness.call_points,
+        });
     // Applied destructive updates. The post-RA repair and the verifier must
     // union exactly this set: candidates are proofs of eligibility, but only
     // applied pairs share a register at repair time. Unioning rejected
@@ -10961,11 +12041,16 @@ fn apply_phi_coalesce_assignments_with_config(
     // Lazily-computed %rdx clobber points for the Phase-2x64 propagation
     // guard below (None until a %rdx-homed phi dest is actually considered).
     let mut rdx_clobbers: Option<Vec<u32>> = None;
+    // Built at the first candidate that reaches the source-home walk.
+    let mut source_home_facts: Option<SourceHomeFacts<'_>> = None;
     // Lazily-built CFG for this function: predecessor sets feed the
     // caller-saved window check, successor sets feed the source-home
     // redefinition proof. One build per function -- deriving either inside
     // the candidate loop made both checks O(candidates x (V+E)).
     let mut cfg: Option<(analysis::FlatAdj, analysis::FlatAdj)> = None;
+    // Per-value segment coverage for the home-conflict test, built on first
+    // use (no web map: each holder's OWN pieces, as in the FP phi move).
+    let mut seg_cov: Option<FxHashMap<u32, Vec<(u32, u32)>>> = None;
     for candidate in candidates {
         let phi_dest = candidate.phi_dest;
         let backedge_src = candidate.backedge_src;
@@ -11011,7 +12096,13 @@ fn apply_phi_coalesce_assignments_with_config(
                 analysis::build_cfg(func, &label_to_idx)
             })
             .1;
-        if !source_home_survives_dest_redefs(func, liveness, succs, candidate) {
+        if !source_home_survives_dest_redefs_in(
+            func,
+            liveness,
+            succs,
+            candidate,
+            source_home_facts.get_or_insert_with(|| SourceHomeFacts::new(func)),
+        ) {
             if ra_config.debug_phi_coalesce {
                 eprintln!(
                     "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{}: source home does not survive dest redefs",
@@ -11126,19 +12217,72 @@ fn apply_phi_coalesce_assignments_with_config(
                     }
                 }
             }
-            let has_conflict = liveness.intervals.iter().any(|iv| {
-                if same_home.contains(&iv.value_id) {
-                    return false;
-                }
-                assignments.get(&iv.value_id).is_some_and(|other_reg| {
-                    other_reg.0 == reg.0 && intervals_overlap((iv.start, iv.end), src_iv)
+            // A holder of `reg` blocks only where its SEGMENTS meet the
+            // source's: a segment-filled co-tenant living around the loop
+            // (zlib_ng_adler32's outer-loop v789 [68,152], whose hole spans
+            // the inner loop the phi lives in) is no conflict. Fat overlap
+            // stays the cheap prefilter. Same soundness basis as
+            // `fp_phi_move_conflicts`: segments cover every live point and
+            // the post-RA repair reasons about exactly them; a value with
+            // no segment data falls back to its fat interval.
+            let mut blockers: Vec<u32> = liveness
+                .intervals
+                .iter()
+                .filter(|iv| {
+                    !same_home.contains(&iv.value_id)
+                        && assignments.get(&iv.value_id).is_some_and(|other_reg| {
+                            other_reg.0 == reg.0 && intervals_overlap((iv.start, iv.end), src_iv)
+                        })
                 })
-            });
+                .map(|iv| iv.value_id)
+                .collect();
+            blockers.sort_unstable();
+            blockers.dedup();
+            if !blockers.is_empty() {
+                let cov = seg_cov
+                    .get_or_insert_with(|| owned_live_segments(liveness, &FxHashMap::default()));
+                let src_cov: &[(u32, u32)] = cov
+                    .get(&backedge_src)
+                    .map_or(std::slice::from_ref(&src_iv), Vec::as_slice);
+                blockers.retain(|b| {
+                    let fat = iv_map.get(b).copied().unwrap_or((0, u32::MAX));
+                    let held: &[(u32, u32)] =
+                        cov.get(b).map_or(std::slice::from_ref(&fat), Vec::as_slice);
+                    src_cov.is_empty()
+                        || held
+                            .iter()
+                            .any(|&h| src_cov.iter().any(|&s| intervals_overlap(h, s)))
+                });
+            }
+            let has_conflict = !blockers.is_empty()
+                && !rehome.as_ref().is_some_and(|ctx| {
+                    rehome_phi_blockers(
+                        ctx,
+                        &blockers,
+                        iv_map,
+                        assignments,
+                        &applied,
+                        reg,
+                        ra_config.debug_phi_coalesce.then_some(func.name.as_str()),
+                    )
+                });
             if has_conflict {
                 if ra_config.debug_phi_coalesce {
+                    let held: Vec<String> = blockers
+                        .iter()
+                        .map(|b| {
+                            let iv = iv_map.get(b).copied().unwrap_or((0, 0));
+                            format!("v{b}[{},{}]", iv.0, iv.1)
+                        })
+                        .collect();
                     eprintln!(
-                        "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{}: home conflict with another value",
-                        phi_dest, backedge_src, reg.0
+                        "[PHI_COALESCE] BLOCKED assign dest=v{} src=v{} r{} src_iv=[{},{}]: home conflict with {}",
+                        phi_dest,
+                        backedge_src,
+                        reg.0,
+                        src_iv.0,
+                        src_iv.1,
+                        held.join(" ")
                     );
                 }
                 continue;
@@ -11166,6 +12310,126 @@ fn apply_phi_coalesce_assignments_with_config(
         applied.push(*candidate);
     }
     applied
+}
+
+/// Inputs of [`rehome_phi_blockers`].
+struct PhiBlockerRehome<'a> {
+    /// Every leader and member of a copy-coalesce group.
+    groups: FxHashSet<u32>,
+    /// The function's callee-saved pool (inline-asm clobbers filtered out,
+    /// empty for functions with non-local exits).
+    callee_saved: &'a [PhysReg],
+    /// The body-safe caller-saved pool Phase 2 hands to any value that is
+    /// not call-spanning (the prologue already dropped %rdi/%rdx when the
+    /// body has fixed-scratch clobbers; a hazard-admitted %rdx is absent).
+    caller_saved: &'a [PhysReg],
+    call_points: &'a [u32],
+}
+
+/// PHI-COALESCE-HOME-CONFLICT: move every value that blocks a loop phi
+/// coalesce (it holds the phi dest's register while the backedge source is
+/// live) into another register that is free over its whole interval, so the
+/// latch copy disappears from the loop. zlib_ng_adler32's checksum loop kept
+/// three latch copies per iteration: one-point post-loop temporaries had
+/// been handed the phi dest's home after the backedge source -- live out of
+/// the loop -- was allocated elsewhere.
+///
+/// All-or-nothing, and every condition fails closed:
+/// * a blocker in a copy-coalesce group (membership is re-propagated from
+///   the leader later) or in an applied phi pair (its partner shares the
+///   home) never moves;
+/// * a target must be free over the blocker's whole fat interval with
+///   INCLUSIVE endpoints (stricter than the allocator's death-point
+///   sharing); a holder without an interval rejects the target;
+/// * callee-saved targets come first, and only ones some value already
+///   holds, so the move never adds a prologue save/restore pair; the pool
+///   is call-safe by construction;
+/// * a caller-saved target additionally needs a blocker that ALREADY holds
+///   a caller-saved home (it passed Phase 2's admission: not call-spanning,
+///   not an ordered/restricted parameter) and whose interval touches no
+///   call point, inclusive -- argument staging and indirect-target homes
+///   are constraints AT a call point, so none of Phase 2's call-argument
+///   waves can apply to it.
+///
+/// x86-64 only (the caller gates it): the i686 callee-saved %esi/%edi have
+/// no byte forms, and no other target's allocator was measured with it.
+/// Returns true after committing the moves.
+fn rehome_phi_blockers(
+    ctx: &PhiBlockerRehome<'_>,
+    blockers: &[u32],
+    iv_map: &FxHashMap<u32, (u32, u32)>,
+    assignments: &mut FxHashMap<u32, PhysReg>,
+    applied: &[PhiCoalesceCandidate],
+    phi_reg: PhysReg,
+    debug_fn: Option<&str>,
+) -> bool {
+    let overlaps = |a: (u32, u32), b: (u32, u32)| a.0 <= b.1 && b.0 <= a.1;
+    let mut moves: Vec<(u32, PhysReg)> = Vec::with_capacity(blockers.len());
+    for &b in blockers {
+        let pinned = ctx.groups.contains(&b)
+            || applied
+                .iter()
+                .any(|p| p.phi_dest == b || p.backedge_src == b);
+        let Some(&b_iv) = iv_map.get(&b).filter(|_| !pinned) else {
+            return false;
+        };
+        let Some(&home) = assignments.get(&b) else {
+            return false;
+        };
+        // (used by someone, free over b_iv). Blockers already moved to `r`
+        // count as users but never as conflicts: every blocker co-resides in
+        // the phi's register today, so any two of them are proven compatible
+        // there (a two-address chain touching at its death points, or
+        // segment-disjoint fills) and keep exactly that relation together
+        // in `r`. Judging them inclusively split adler32's post-loop
+        // `v816[127,128] v817[128,129] v819[129,130]` chain into three
+        // registers and the move failed.
+        let occupancy = |r: PhysReg, moves: &[(u32, PhysReg)]| {
+            let mut used = moves.iter().any(|&(_, h)| h.0 == r.0);
+            for (&v, &h) in assignments.iter() {
+                if h.0 != r.0 || v == b {
+                    continue;
+                }
+                used = true;
+                if iv_map.get(&v).is_none_or(|&iv| overlaps(iv, b_iv)) {
+                    return (true, false);
+                }
+            }
+            (used, true)
+        };
+        let callee_target =
+            ctx.callee_saved.iter().copied().find(|&r| {
+                r.0 != phi_reg.0 && r.0 != home.0 && occupancy(r, &moves) == (true, true)
+            });
+        let caller_ok = ctx.caller_saved.iter().any(|r| r.0 == home.0) && {
+            let idx = ctx.call_points.partition_point(|&cp| cp < b_iv.0);
+            ctx.call_points.get(idx).is_none_or(|&cp| cp > b_iv.1)
+        };
+        let target = callee_target.or_else(|| {
+            caller_ok
+                .then(|| {
+                    ctx.caller_saved
+                        .iter()
+                        .copied()
+                        .find(|&r| r.0 != phi_reg.0 && r.0 != home.0 && occupancy(r, &moves).1)
+                })
+                .flatten()
+        });
+        let Some(target) = target else {
+            return false;
+        };
+        moves.push((b, target));
+    }
+    for &(b, target) in &moves {
+        if let Some(name) = debug_fn {
+            eprintln!(
+                "[PHI_COALESCE] fn={} REHOME blocker v{} r{} -> r{}",
+                name, b, phi_reg.0, target.0
+            );
+        }
+        assignments.insert(b, target);
+    }
+    true
 }
 
 /// `CCC_PHI_COALESCE_SKIP` / `CCC_PHI_COALESCE_FUNC` bisect helper (see
@@ -11479,6 +12743,8 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
 
     let debug = ra_config.debug_phi_coalesce;
     let mut candidates = Vec::new();
+    // Built at the first candidate that reaches the source-home walk.
+    let mut source_home_facts: Option<SourceHomeFacts<'_>> = None;
 
     // Pre-def dataflow closure of `phi` inside `block[..def_idx]`: every value
     // computed from the OLD phi before the destructive update.  A folded GEP
@@ -11777,8 +13043,13 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
                 source_def_idx: cand_def_idx,
                 copy_idx,
             };
-            let source_home_killed =
-                !source_home_survives_dest_redefs(func, liveness, &succs, &source_home_probe);
+            let source_home_killed = !source_home_survives_dest_redefs_in(
+                func,
+                liveness,
+                &succs,
+                &source_home_probe,
+                source_home_facts.get_or_insert_with(|| SourceHomeFacts::new(func)),
+            );
             // Liveness-model veto: the source's definition overwrites the
             // phi's home, so the phi's OLD value may not be read at ANY
             // program point strictly inside the update window (after the
@@ -12011,6 +13282,7 @@ mod ra_config_tests {
         switch!(no_mulacc, "CCC_NO_MULACC");
         switch!(no_index_home, "CCC_NO_INDEX_HOME");
         switch!(no_folded_index_liveness, "CCC_NO_FOLDED_INDEX_LIVENESS");
+        switch!(no_fold_addr_defer, "CCC_NO_FOLD_ADDR_DEFER");
         switch!(no_vecreg, "CCC_NO_VECREG");
         switch!(no_phi_coalesce, "CCC_NO_PHI_COALESCE");
         switch!(no_coalesce, "CCC_NO_COALESCE");
@@ -12032,7 +13304,13 @@ mod ra_config_tests {
         switch!(no_fp_copy_web, "CCC_NO_FP_COPY_WEB");
         switch!(fp_extract_homes, "CCC_FP_EXTRACT_HOMES");
         switch!(caller_save_spanning, "CCC_CALLER_SAVE_SPANNING");
+        switch!(no_cold_call_split, "CCC_NO_COLD_CALL_SPLIT");
+        switch!(no_phi_blocker_rehome, "CCC_NO_PHI_BLOCKER_REHOME");
+        switch!(no_phase2c_reuse, "CCC_NO_PHASE2C_REUSE");
+        switch!(no_callee_sticky, "CCC_NO_CALLEE_STICKY");
+        switch!(no_save_set_compact, "CCC_NO_SAVE_SET_COMPACT");
         switch!(no_rdx_hazard, "CCC_NO_RDX_HAZARD");
+        switch!(no_rdx_param_homes, "CCC_NO_RDX_PARAM_HOMES");
         switch!(no_segment_scan, "CCC_NO_SEGMENT_SCAN");
         switch!(debug_coalesce, "CCC_DEBUG_COALESCE");
         switch!(debug_coalesce_members, "CCC_DEBUG_COALESCE_MEMBERS");
@@ -13311,6 +14589,310 @@ mod phi_coalesce_tests {
         );
     }
 
+    /// PHI-COALESCE-HOME-CONFLICT fixture (zlib_ng_adler32's checksum loop):
+    /// `v1` is the loop phi, `v2 = v1 + 1` its backedge source, live out of
+    /// the loop into B3, where the post-loop temporary `v5` was handed the
+    /// phi's home. `exit_call` puts a call between `v5`'s def and its last
+    /// use (after `v2` died) so the blocker meets a call point.
+    fn rehome_fixture(exit_call: bool) -> (IrFunction, PhiCoalesceCandidate) {
+        let mut func = IrFunction::new("rehome".to_string(), IrType::I32, vec![], false);
+        let mut exit = vec![
+            Instruction::BinOp {
+                dest: Value(5),
+                op: IrBinOp::Add,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Const(IrConst::I32(7)),
+                ty: IrType::I32,
+            },
+            Instruction::Cmp {
+                dest: Value(4),
+                op: IrCmpOp::Ne,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Const(IrConst::I32(36)),
+                ty: IrType::I32,
+            },
+        ];
+        // `v7` keeps the call strictly after `v2`'s last use, so only the
+        // blocker -- not the backedge source -- meets the call point.
+        exit.push(Instruction::BinOp {
+            dest: Value(7),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(4)),
+            rhs: Operand::Const(IrConst::I32(1)),
+            ty: IrType::I32,
+        });
+        if exit_call {
+            exit.push(empty_call(None));
+        }
+        exit.push(Instruction::BinOp {
+            dest: Value(8),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(5)),
+            rhs: Operand::Value(Value(7)),
+            ty: IrType::I32,
+        });
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::Copy {
+                        dest: Value(6),
+                        src: Operand::Const(IrConst::I32(0)),
+                    },
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Value(Value(6)),
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I32(1)),
+                    ty: IrType::I32,
+                }],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(
+                2,
+                vec![Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(2)),
+                }],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(3, exit, Terminator::Return(Some(Operand::Value(Value(8))))),
+        ];
+        func.next_value_id = 9;
+        let cand = PhiCoalesceCandidate {
+            phi_dest: 1,
+            backedge_src: 2,
+            block_idx: 2,
+            source_block_idx: 1,
+            source_def_idx: 0,
+            copy_idx: 0,
+        };
+        (func, cand)
+    }
+
+    /// Runs the production apply path (blocker re-homing enabled) on x86-64.
+    fn apply_with_rehome(
+        func: &IrFunction,
+        cand: PhiCoalesceCandidate,
+        assignments: &mut FxHashMap<u32, PhysReg>,
+        callee_saved: &[PhysReg],
+        member_of: &FxHashMap<u32, u32>,
+    ) -> usize {
+        use crate::common::types::{set_target_elf_machine, target_elf_machine};
+        let liveness = compute_live_intervals(func);
+        let iv_map = interval_map(&liveness);
+        let before = assignments.clone();
+        let saved = target_elf_machine();
+        set_target_elf_machine(crate::backend::elf::EM_X86_64);
+        // r11, r10, r8, r9, rdi, rsi
+        let caller_saved = [10, 11, 12, 13, 14, 15].map(PhysReg);
+        let applied = apply_phi_coalesce_assignments_with_config(
+            func,
+            &liveness,
+            &iv_map,
+            &[cand],
+            assignments,
+            callee_saved,
+            Some((member_of, &caller_saved)),
+            &RaConfig::default(),
+        );
+        set_target_elf_machine(saved);
+        // Whatever moved, no two distinct homes may overlap (inclusive),
+        // except the applied pair itself and co-tenants the input already
+        // had (a two-address chain touching at its death point keeps that
+        // relation wherever it moves together).
+        for (&a, &ra) in assignments.iter() {
+            for (&b, &rb) in assignments.iter() {
+                let pair = applied.iter().any(|p| {
+                    [p.phi_dest, p.backedge_src] == [a, b] || [p.backedge_src, p.phi_dest] == [a, b]
+                });
+                let co_tenants = before.get(&a).is_some_and(|r| before.get(&b) == Some(r));
+                if a < b && ra == rb && !pair && !co_tenants {
+                    let (ia, ib) = (iv_map[&a], iv_map[&b]);
+                    assert!(
+                        ia.1 < ib.0 || ib.1 < ia.0,
+                        "v{a} {ia:?} and v{b} {ib:?} share r{}: {assignments:?}",
+                        ra.0
+                    );
+                }
+            }
+        }
+        applied.len()
+    }
+
+    #[test]
+    fn phi_blocker_rehome_moves_a_post_loop_temp_out_of_the_phi_home() {
+        let (func, cand) = rehome_fixture(false);
+        let initial: FxHashMap<u32, PhysReg> = [
+            (6, PhysReg(1)),  // rbx: the preheader constant
+            (1, PhysReg(14)), // phi: %rdi
+            (2, PhysReg(10)), // backedge source: %r11 -> latch copy
+            (5, PhysReg(14)), // post-loop temp in the phi's home: blocker
+            (4, PhysReg(12)),
+            (7, PhysReg(15)),
+            (8, PhysReg(13)),
+        ]
+        .into_iter()
+        .collect();
+
+        // The opt-out wrapper keeps the historical veto (and a real blocker
+        // still blocks: the conflict test is not inverted).
+        let mut legacy = initial.clone();
+        let liveness = compute_live_intervals(&func);
+        apply_phi_coalesce_assignments(
+            &func,
+            &liveness,
+            &interval_map(&liveness),
+            &[cand],
+            &mut legacy,
+            &[PhysReg(1)],
+        );
+        assert_eq!(legacy, initial, "no re-homing without the context");
+
+        let mut moved = initial.clone();
+        let n = apply_with_rehome(
+            &func,
+            cand,
+            &mut moved,
+            &[PhysReg(1)],
+            &FxHashMap::default(),
+        );
+        assert_eq!(n, 1, "the pair coalesces once the blocker moves: {moved:?}");
+        assert_eq!(moved[&2], PhysReg(14), "source inherits the phi home");
+        // rbx holds v6 [0, 1] only: free over v5, and already saved.
+        assert_eq!(moved[&5], PhysReg(1), "callee-saved tier first: {moved:?}");
+
+        // Without a used callee-saved register the caller-saved tier serves
+        // (r11 still holds v2 at decision time and overlaps; r10 is free).
+        let mut caller = initial.clone();
+        caller.remove(&6);
+        let n = apply_with_rehome(
+            &func,
+            cand,
+            &mut caller,
+            &[PhysReg(1)],
+            &FxHashMap::default(),
+        );
+        assert_eq!(n, 1, "{caller:?}");
+        assert_eq!(
+            caller[&5],
+            PhysReg(11),
+            "unused rbx is never chosen: {caller:?}"
+        );
+    }
+
+    /// adler32's post-loop chain: `v5 = v2 + 7; v9 = v5 + 1` touch at v5's
+    /// death point and BOTH sit in the phi home while v2 is live. They are
+    /// already proven compatible there, so they must be able to move into
+    /// one target together; judging them against each other (inclusive)
+    /// split the chain and the pair stayed blocked.
+    fn rehome_chain_fixture() -> (IrFunction, PhiCoalesceCandidate) {
+        let (mut func, cand) = rehome_fixture(false);
+        let bin = |dest: u32, lhs: Operand, rhs: Operand| Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs,
+            rhs,
+            ty: IrType::I32,
+        };
+        func.blocks[3].instructions = vec![
+            bin(5, Operand::Value(Value(2)), Operand::Const(IrConst::I32(7))),
+            bin(9, Operand::Value(Value(5)), Operand::Const(IrConst::I32(1))),
+            Instruction::Cmp {
+                dest: Value(4),
+                op: IrCmpOp::Ne,
+                lhs: Operand::Value(Value(2)),
+                rhs: Operand::Const(IrConst::I32(36)),
+                ty: IrType::I32,
+            },
+            bin(8, Operand::Value(Value(9)), Operand::Value(Value(4))),
+        ];
+        func.next_value_id = 10;
+        (func, cand)
+    }
+
+    #[test]
+    fn phi_blocker_rehome_moves_a_touching_chain_together() {
+        let (func, cand) = rehome_chain_fixture();
+        let initial: FxHashMap<u32, PhysReg> = [
+            (6, PhysReg(1)),  // rbx: preheader constant, already saved
+            (1, PhysReg(14)), // phi: %rdi
+            (2, PhysReg(10)), // backedge source
+            (5, PhysReg(14)), // chain head  } both block the pair
+            (9, PhysReg(14)), // chain tail  }
+            (4, PhysReg(12)),
+            (8, PhysReg(13)),
+        ]
+        .into_iter()
+        .collect();
+        let mut moved = initial.clone();
+        let n = apply_with_rehome(
+            &func,
+            cand,
+            &mut moved,
+            &[PhysReg(1)],
+            &FxHashMap::default(),
+        );
+        assert_eq!(n, 1, "{moved:?}");
+        assert_eq!(moved[&2], PhysReg(14), "source inherits the phi home");
+        assert_eq!(moved[&5], PhysReg(1), "{moved:?}");
+        assert_eq!(moved[&9], PhysReg(1), "the chain was split: {moved:?}");
+    }
+
+    #[test]
+    fn phi_blocker_rehome_fails_closed() {
+        let (func, cand) = rehome_fixture(false);
+        let initial: FxHashMap<u32, PhysReg> = [
+            (1, PhysReg(14)),
+            (2, PhysReg(10)),
+            (5, PhysReg(14)),
+            (4, PhysReg(12)),
+            (7, PhysReg(15)),
+            (8, PhysReg(13)),
+        ]
+        .into_iter()
+        .collect();
+        // A copy-coalesce member/leader is re-propagated from its leader
+        // later: it never moves, so the pair stays blocked.
+        let mut grouped = initial.clone();
+        let member_of: FxHashMap<u32, u32> = [(5, 8)].into_iter().collect();
+        assert_eq!(
+            apply_with_rehome(&func, cand, &mut grouped, &[], &member_of),
+            0
+        );
+        assert_eq!(grouped, initial);
+
+        // A blocker meeting a call point never takes a caller-saved home
+        // (argument staging / call clobbers live there), and with no used
+        // callee-saved register there is no other tier.
+        let (func, cand) = rehome_fixture(true);
+        let mut at_call = initial.clone();
+        assert_eq!(
+            apply_with_rehome(
+                &func,
+                cand,
+                &mut at_call,
+                &[PhysReg(1)],
+                &FxHashMap::default()
+            ),
+            0
+        );
+        assert_eq!(at_call, initial);
+    }
+
     /// loop_rotate_seq_loops shape: the rotated loop's backedge source `s`
     /// is LIVE ACROSS the exit block's printf call, but the (def, copy)
     /// window itself contains no call.  Re-homing `s` into the phi's
@@ -13617,6 +15199,8 @@ mod phi_coalesce_tests {
             xmm_regs: Vec::new(),
             never_materialized: FxHashSet::default(),
             folded_index_uses: folded,
+            fold_base_regs: Vec::new(),
+            fold_readmit: FxHashSet::default(),
             reg_hints: FxHashMap::default(),
             ra_config: Arc::new(RaConfig::default()),
         };
@@ -14262,6 +15846,65 @@ mod allocation_kernel_tests {
         liveness
     }
 
+    /// COLD-CALL XMM SPLIT save set: an XMM home is saved around a cold
+    /// call exactly when a value in it is live ACROSS the call -- never the
+    /// register receiving the call's result, even when a merged copy web
+    /// counts a member live into the call block (the nbody/`norm` shape:
+    /// restoring there overwrote the slow-path `sqrt` result).
+    #[test]
+    fn cold_call_xmm_saves_skip_the_result_register() {
+        let iv = |value_id, start, end| LiveInterval {
+            value_id,
+            start,
+            end,
+        };
+        // v23: loop accumulator live across the call at 24 (xmm2 = id 20).
+        // v17: phi web member counted live into the slow block from its
+        //      start (= the call point); the call result v26 shares xmm4.
+        let mut liveness = liveness_fixture(
+            vec![
+                iv(23, 5, 27),
+                iv(17, 16, 26),
+                iv(26, 24, 25),
+                iv(30, 24, 29),
+            ],
+            vec![
+                iv(23, 5, 27),
+                iv(17, 24, 26),
+                iv(26, 24, 25),
+                iv(30, 24, 29),
+            ],
+        );
+        liveness.call_points = vec![24];
+        liveness.cold_call_points = vec![24];
+        liveness.cold_call_results = vec![Some(26)];
+        let iv_map = interval_map(&liveness);
+        let mut assignments: FxHashMap<u32, PhysReg> = FxHashMap::default();
+        assignments.insert(23, PhysReg(20));
+        assignments.insert(17, PhysReg(22));
+        assignments.insert(26, PhysReg(22));
+        let mut spans: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
+        add_cold_call_xmm_saves(&assignments, &liveness, &iv_map, true, &mut spans);
+        assert_eq!(spans.get(&20), Some(&vec![(24, 24)]), "accumulator saved");
+        assert!(
+            !spans.contains_key(&22),
+            "result register never restored over"
+        );
+
+        // v30: a result live after the call in its own register is born there.
+        liveness.cold_call_results = vec![Some(30)];
+        assignments.clear();
+        assignments.insert(30, PhysReg(25));
+        spans.clear();
+        add_cold_call_xmm_saves(&assignments, &liveness, &iv_map, true, &mut spans);
+        assert!(spans.is_empty());
+
+        // Disabled (i686 / CCC_NO_COLD_CALL_SPLIT): nothing recorded.
+        assignments.insert(23, PhysReg(20));
+        add_cold_call_xmm_saves(&assignments, &liveness, &iv_map, false, &mut spans);
+        assert!(spans.is_empty());
+    }
+
     fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
         BasicBlock {
             label: BlockId(label),
@@ -14358,6 +16001,8 @@ mod allocation_kernel_tests {
             xmm_regs: Vec::new(),
             never_materialized: FxHashSet::default(),
             folded_index_uses: FxHashMap::default(),
+            fold_base_regs: Vec::new(),
+            fold_readmit: FxHashSet::default(),
             reg_hints: FxHashMap::default(),
             ra_config: Arc::new(RaConfig::default()),
         };
@@ -14698,6 +16343,87 @@ mod allocation_kernel_tests {
             "setjmp between div and rem must not pair: {:?}",
             pairs.tail_dests
         );
+    }
+
+    /// Parameters may take caller-saved homes in an %rdx-clobbering body only
+    /// when every clobber is a narrow division/remainder/multiply-high (or a
+    /// switch dispatch) and the body holds no wide value; both kill switches
+    /// restore the whole-function exclusion.
+    #[test]
+    fn rdx_clobber_classes_admitted_for_param_homes() {
+        let narrow = |op| {
+            binop(
+                2,
+                op,
+                IrType::I64,
+                Operand::Value(Value(1)),
+                Operand::Const(IrConst::I64(3)),
+            )
+        };
+        let cfg = RaConfig::default();
+        for op in [
+            IrBinOp::UDiv,
+            IrBinOp::SDiv,
+            IrBinOp::URem,
+            IrBinOp::SRem,
+            IrBinOp::UMulHigh,
+            IrBinOp::SMulHigh,
+        ] {
+            assert!(
+                x86_rdx_clobbers_allow_param_homes(&divrem_func(vec![narrow(op)]), &cfg),
+                "{op:?}"
+            );
+        }
+        let mut switch_body = divrem_func(vec![narrow(IrBinOp::UDiv)]);
+        switch_body.blocks[0].terminator = Terminator::Switch {
+            val: Operand::Value(Value(2)),
+            cases: vec![(0, BlockId(0))],
+            default: BlockId(0),
+            ty: IrType::I64,
+        };
+        assert!(x86_rdx_clobbers_allow_param_homes(&switch_body, &cfg));
+        let wide_div = binop(
+            2,
+            IrBinOp::UDiv,
+            IrType::U128,
+            Operand::Value(Value(1)),
+            Operand::Const(IrConst::I128(3)),
+        );
+        assert!(!x86_rdx_clobbers_allow_param_homes(
+            &divrem_func(vec![wide_div]),
+            &cfg
+        ));
+        let wide_copy = Instruction::Copy {
+            dest: Value(3),
+            src: Operand::Const(IrConst::I128(1)),
+        };
+        assert!(!x86_rdx_clobbers_allow_param_homes(
+            &divrem_func(vec![narrow(IrBinOp::UDiv), wide_copy]),
+            &cfg
+        ));
+        let rdtsc = Instruction::Intrinsic {
+            dest: Some(Value(3)),
+            op: IntrinsicOp::Rdtsc,
+            dest_ptr: None,
+            args: vec![],
+        };
+        assert!(!x86_rdx_clobbers_allow_param_homes(
+            &divrem_func(vec![narrow(IrBinOp::UDiv), rdtsc]),
+            &cfg
+        ));
+        let body = divrem_func(vec![narrow(IrBinOp::UDiv)]);
+        for off in [
+            RaConfig {
+                no_rdx_param_homes: true,
+                ..RaConfig::default()
+            },
+            RaConfig {
+                no_rdx_hazard: true,
+                ..RaConfig::default()
+            },
+        ] {
+            assert!(!x86_rdx_clobbers_allow_param_homes(&body, &off));
+        }
     }
 
     #[test]
@@ -15044,6 +16770,70 @@ mod allocation_kernel_tests {
     }
 
     #[test]
+    fn saved_callee_fill_places_the_hottest_web_first() {
+        // zstd's decode loop: an early-starting single-use load (pressure 10)
+        // and a later per-sequence byte read three times in the loop
+        // (pressure 30) both fit only the one free stretch of %rbx. A
+        // start-ordered fill gave it to the early value; the hot one wins.
+        let mut occupied: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
+        occupied.insert(1, vec![(0, 10), (40, 50)]);
+        let candidates = vec![(10, 20, 7, (11, 31)), (30, 5, 9, (25, 30))];
+        let placed = fill_saved_callee_stretches(candidates, &mut occupied, &[PhysReg(1)]);
+        assert_eq!(placed, vec![(9, PhysReg(1))]);
+        assert_eq!(
+            occupied.get(&1).cloned().unwrap_or_default(),
+            vec![(0, 10), (25, 30), (40, 50)]
+        );
+    }
+
+    #[test]
+    fn saved_callee_fill_judges_the_fat_envelope() {
+        // A web whose envelope [5, 40) covers a holder [12, 20) is refused
+        // even if it is dead across the holder: the tier deliberately uses
+        // fat envelopes (hole-aware segments measured worse on zstd).
+        let mut occupied: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
+        occupied.insert(1, vec![(12, 20)]);
+        let placed =
+            fill_saved_callee_stretches(vec![(30, 35, 3, (5, 40))], &mut occupied, &[PhysReg(1)]);
+        assert!(placed.is_empty());
+        assert_eq!(
+            occupied.get(&1).cloned().unwrap_or_default(),
+            vec![(12, 20)]
+        );
+    }
+
+    #[test]
+    fn saved_callee_fill_breaks_ties_by_envelope_then_id_and_tries_each_register() {
+        // Equal pressure: the shorter envelope goes first, then the lower id;
+        // a candidate overlapping the first register's union falls through
+        // to the next; a candidate born exactly where a holder dies takes
+        // the register (half-open hand-off) and the union merges.
+        let mut occupied: FxHashMap<u8, Vec<(u32, u32)>> = FxHashMap::default();
+        occupied.insert(1, vec![(0, 10)]);
+        let candidates = vec![
+            (5, 9, 4, (18, 27)),
+            (5, 3, 6, (12, 16)),
+            (5, 3, 2, (14, 18)),
+            (5, 9, 8, (12, 26)),
+        ];
+        let placed =
+            fill_saved_callee_stretches(candidates, &mut occupied, &[PhysReg(1), PhysReg(2)]);
+        assert_eq!(
+            placed,
+            vec![(2, PhysReg(1)), (6, PhysReg(2)), (4, PhysReg(1))]
+        );
+        assert_eq!(
+            occupied.get(&1).cloned().unwrap_or_default(),
+            vec![(0, 10), (14, 27)]
+        );
+        // v8 [12,26) overlaps both unions and there is no third register.
+        assert_eq!(
+            occupied.get(&2).cloned().unwrap_or_default(),
+            vec![(12, 16)]
+        );
+    }
+
+    #[test]
     fn summed_use_weight_saturates_instead_of_wrapping() {
         let use_count: FxHashMap<u32, u64> = [(1, u64::MAX), (2, 1)].into_iter().collect();
         assert_eq!(summed_use_weight(&[1, 2], &use_count), u64::MAX);
@@ -15117,6 +16907,23 @@ mod allocation_kernel_tests {
             source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
             "clean window without folded reads must survive"
         );
+
+        // One `SourceHomeFacts` shared across queries (and path-compressed by
+        // the hidden-read web lookups of the vetoed ones) answers exactly as
+        // facts built per query: the facts depend only on `func`.
+        let mut shared = SourceHomeFacts::new(&func);
+        for folded in [true, false, true, false] {
+            if folded {
+                liveness.folded_read_points.insert(5, vec![base + 2]);
+            } else {
+                liveness.folded_read_points.remove(&5);
+            }
+            assert_eq!(
+                source_home_survives_dest_redefs_in(&func, &liveness, &succs, &cand, &mut shared),
+                source_home_survives_dest_redefs(&func, &liveness, &succs, &cand),
+                "shared facts diverged (folded={folded})"
+            );
+        }
     }
 
     #[test]
@@ -16057,5 +17864,518 @@ mod phi_chain_shape_tests {
         });
         let preds = preds_of(&g);
         assert_eq!(single_pred_chain(&preds, 0, 2), None);
+    }
+}
+
+#[cfg(test)]
+mod save_set_compact_tests {
+    //! RA-SAVE-SET-COMPACT: a callee-saved register's whole holder set folds
+    //! into another saved register only when no holder pair meets.
+    use super::{FxHashMap, PhysReg, compact_callee_saved_homes};
+
+    fn run(
+        homes: &[(u32, u8, Option<(u32, u32)>)],
+    ) -> (FxHashMap<u32, PhysReg>, Vec<(PhysReg, PhysReg)>) {
+        let mut assignments = FxHashMap::default();
+        let mut iv_map = FxHashMap::default();
+        for &(v, r, iv) in homes {
+            assignments.insert(v, PhysReg(r));
+            if let Some(iv) = iv {
+                iv_map.insert(v, iv);
+            }
+        }
+        let pool = [PhysReg(1), PhysReg(2), PhysReg(3)];
+        let moves = compact_callee_saved_homes(&mut assignments, &iv_map, &pool);
+        (assignments, moves)
+    }
+
+    #[test]
+    fn folds_a_register_whose_holders_all_died() {
+        // find_bit shape: r14's v53 [34,35] fits beside rbx's v28 [15,16].
+        let (a, moves) = run(&[(28, 1, Some((15, 16))), (53, 2, Some((34, 35)))]);
+        assert_eq!(moves.len(), 1, "{moves:?}");
+        assert_eq!(a[&28], a[&53], "{a:?}");
+    }
+
+    #[test]
+    fn overlap_and_touching_holders_block_the_fold() {
+        let (_, moves) = run(&[(1, 1, Some((0, 10))), (2, 2, Some((5, 15)))]);
+        assert!(moves.is_empty(), "overlap folded: {moves:?}");
+        // Inclusive: a death point shared with a new co-tenant is refused.
+        let (_, moves) = run(&[(1, 1, Some((0, 5))), (2, 2, Some((5, 9)))]);
+        assert!(moves.is_empty(), "touching folded: {moves:?}");
+    }
+
+    #[test]
+    fn the_whole_holder_set_moves_or_nothing_does() {
+        // r2's v3 overlaps r1's v1, so r2 cannot fold even though v2 fits;
+        // r1 cannot fold into r2 either. Nobody may move alone.
+        let (a, moves) = run(&[
+            (1, 1, Some((1, 3))),
+            (2, 2, Some((10, 12))),
+            (3, 2, Some((0, 2))),
+        ]);
+        assert!(moves.is_empty(), "{moves:?}");
+        assert_eq!(a[&2], PhysReg(2));
+        assert_eq!(a[&1], PhysReg(1));
+    }
+
+    #[test]
+    fn a_holder_without_an_interval_pins_its_register() {
+        let (a, moves) = run(&[(1, 1, None), (2, 2, Some((10, 12)))]);
+        assert!(moves.is_empty(), "{moves:?}");
+        assert_eq!(a[&2], PhysReg(2));
+    }
+}
+
+/// Hidden call SEQUENCES (dynamic TLS on AArch64/RISC-V) and the i686 pool
+/// predicate: what each may and may not change in the allocation.
+#[cfg(test)]
+mod call_sequence_policy_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, IrConst, Value};
+
+    const SPANNING: std::ops::Range<u32> = 20..26;
+
+    /// `a`, `b` feed six products that are all live across `&tv` and summed
+    /// after it; `a`/`b` themselves die before the TLS access. The shape that
+    /// spilled both parameters when the TLS sequence drove Phase 1.
+    fn tls_pressure_func() -> IrFunction {
+        let v = |n: u32| Operand::Value(Value(n));
+        let mut insts = vec![
+            Instruction::ParamRef {
+                dest: Value(1),
+                param_idx: 0,
+                ty: IrType::I64,
+            },
+            Instruction::ParamRef {
+                dest: Value(2),
+                param_idx: 1,
+                ty: IrType::I64,
+            },
+        ];
+        for (k, d) in SPANNING.enumerate() {
+            insts.push(Instruction::BinOp {
+                dest: Value(d - 10),
+                op: IrBinOp::Mul,
+                lhs: v(1),
+                rhs: Operand::Const(IrConst::I64(k as i64 + 3)),
+                ty: IrType::I64,
+            });
+            insts.push(Instruction::BinOp {
+                dest: Value(d),
+                op: IrBinOp::Add,
+                lhs: v(d - 10),
+                rhs: v(2),
+                ty: IrType::I64,
+            });
+        }
+        insts.push(Instruction::GlobalAddr {
+            dest: Value(30),
+            name: "tv".to_string(),
+        });
+        insts.push(Instruction::Load {
+            dest: Value(31),
+            ptr: Value(30),
+            ty: IrType::I64,
+            seg_override: crate::common::types::AddressSpace::Default,
+            volatile: false,
+        });
+        let mut acc = 31;
+        for (k, d) in SPANNING.enumerate() {
+            let dest = 40 + k as u32;
+            insts.push(Instruction::BinOp {
+                dest: Value(dest),
+                op: IrBinOp::Add,
+                lhs: v(acc),
+                rhs: v(d),
+                ty: IrType::I64,
+            });
+            acc = dest;
+        }
+        let mut f = IrFunction::new("tls_pressure".to_string(), IrType::I64, vec![], false);
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: insts,
+            terminator: Terminator::Return(Some(v(acc))),
+            source_spans: Vec::new(),
+        }];
+        f.next_value_id = 50;
+        f
+    }
+
+    fn config(caller_saved_regs: Vec<PhysReg>) -> RegAllocConfig {
+        RegAllocConfig {
+            available_regs: vec![PhysReg(1), PhysReg(2), PhysReg(3)],
+            accumulator_policy: AccumulatorPolicy {
+                operand_order: AccumulatorOperandOrder::LhsFirst,
+                return_consumes_accumulator: false,
+            },
+            caller_saved_regs,
+            call_arg_regs: vec![],
+            indirect_target_regs: vec![],
+            allow_inline_asm_regalloc: false,
+            leaf_caller_saved_homes: false,
+            xmm_regs: Vec::new(),
+            never_materialized: FxHashSet::default(),
+            folded_index_uses: FxHashMap::default(),
+            fold_base_regs: Vec::new(),
+            fold_readmit: FxHashSet::default(),
+            reg_hints: FxHashMap::default(),
+            ra_config: Arc::new(RaConfig::default()),
+        }
+    }
+
+    /// Allocate with `tv` installed as a call sequence (`seq`) or not.
+    fn allocate(f: &IrFunction, cfg: &RegAllocConfig, seq: bool) -> FxHashMap<u32, PhysReg> {
+        let names: FxHashSet<String> = if seq {
+            std::iter::once("tv".to_string()).collect()
+        } else {
+            FxHashSet::default()
+        };
+        crate::common::tls::set_call_sequence_symbols(names);
+        let result = allocate_registers(f, cfg);
+        crate::common::tls::set_call_sequence_symbols(FxHashSet::default());
+        result.assignments
+    }
+
+    #[test]
+    fn sequences_are_recorded_as_a_subset_of_call_points() {
+        let f = tls_pressure_func();
+        crate::common::tls::set_call_sequence_symbols(std::iter::once("tv".into()).collect());
+        let live = crate::backend::liveness::compute_live_intervals(&f);
+        crate::common::tls::set_call_sequence_symbols(FxHashSet::default());
+        assert_eq!(live.sequence_call_points.len(), 1);
+        assert_eq!(live.call_points, live.sequence_call_points);
+        let plain = crate::backend::liveness::compute_live_intervals(&f);
+        assert!(plain.call_points.is_empty() && plain.sequence_call_points.is_empty());
+    }
+
+    /// With only callee-saved registers on offer, a call sequence has nothing
+    /// to protect, so it must not change a single home. It used to promote the
+    /// six spanning products into Phase 1 ahead of the parameters.
+    #[test]
+    fn sequences_do_not_reorder_callee_saved_priority() {
+        let f = tls_pressure_func();
+        let cfg = config(vec![]);
+        let plain = allocate(&f, &cfg, false);
+        let with_seq = allocate(&f, &cfg, true);
+        assert!(
+            plain.contains_key(&1) && plain.contains_key(&2),
+            "fixture premise: the parameters keep homes ({plain:?})"
+        );
+        let sorted = |m: &FxHashMap<u32, PhysReg>| {
+            let mut v: Vec<(u32, u8)> = m.iter().map(|(&k, r)| (k, r.0)).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(sorted(&with_seq), sorted(&plain));
+    }
+
+    /// Eligibility is unchanged: no caller-saved home spans a call sequence.
+    #[test]
+    fn no_caller_saved_home_spans_a_sequence() {
+        let f = tls_pressure_func();
+        let pool = vec![PhysReg(13), PhysReg(14)];
+        let cfg = config(pool.clone());
+        let plain = allocate(&f, &cfg, false);
+        assert!(
+            SPANNING
+                .clone()
+                .any(|d| plain.get(&d).is_some_and(|r| pool.contains(r))),
+            "fixture premise: without the sequence a spanning value takes the pool ({plain:?})"
+        );
+        let with_seq = allocate(&f, &cfg, true);
+        for d in SPANNING {
+            assert!(
+                !with_seq.get(&d).is_some_and(|r| pool.contains(r)),
+                "v{d} spans the TLS sequence in a caller-saved home: {with_seq:?}"
+            );
+        }
+    }
+
+    /// PhysReg 4/5 are %ecx/%edx only on i686; AArch64's x4/x5 share the
+    /// numbers and must take the generic Phase 2.
+    #[test]
+    fn i686_phases_key_on_the_target_not_the_register_numbers() {
+        let saved = crate::common::types::target_elf_machine();
+        let arm_pool = [4u8, 5, 6, 7, 8, 13, 14].map(PhysReg).to_vec();
+        for (machine, pool, expected) in [
+            (3u16, vec![PhysReg(5), PhysReg(4)], true),
+            (183, arm_pool.clone(), false),
+            (62, arm_pool, false),
+            (3, vec![], false),
+        ] {
+            crate::common::types::set_target_elf_machine(machine);
+            assert_eq!(
+                i686_scratch_pool(&config(pool)),
+                expected,
+                "e_machine {machine}"
+            );
+        }
+        crate::common::types::set_target_elf_machine(saved);
+    }
+}
+
+#[cfg(test)]
+mod fold_defer_tests {
+    use super::*;
+    use crate::common::types::AddressSpace;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrParam, Value};
+
+    /// `p = param; a = p+8; b = p+16; return *a + *b` — both GEPs are
+    /// constant-offset fold addresses of base `p` (value 0).
+    fn two_field_loads() -> IrFunction {
+        let ld = |dest, ptr| Instruction::Load {
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty: IrType::I64,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        };
+        let gep = |dest, off| Instruction::GetElementPtr {
+            dest: Value(dest),
+            base: Value(0),
+            offset: Operand::Const(IrConst::I64(off)),
+            ty: IrType::Ptr,
+        };
+        let mut f = IrFunction::new(
+            "fold_defer".to_string(),
+            IrType::I64,
+            vec![IrParam {
+                ty: IrType::Ptr,
+                noalias: false,
+                struct_size: None,
+                struct_align: None,
+                param_align: None,
+                struct_eightbyte_classes: Vec::new(),
+                is_f128_sse: false,
+                riscv_float_class: None,
+            }],
+            false,
+        );
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                gep(1, 8),
+                gep(2, 16),
+                ld(3, 1),
+                ld(4, 2),
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(3)),
+                    rhs: Operand::Value(Value(4)),
+                    ty: IrType::I64,
+                },
+            ],
+            terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
+            source_spans: Vec::new(),
+        }];
+        f.next_value_id = 6;
+        f
+    }
+
+    fn config(fold_base_regs: Vec<PhysReg>) -> RegAllocConfig {
+        RegAllocConfig {
+            available_regs: vec![PhysReg(1), PhysReg(2), PhysReg(3)],
+            accumulator_policy: AccumulatorPolicy {
+                operand_order: AccumulatorOperandOrder::LhsFirst,
+                return_consumes_accumulator: false,
+            },
+            caller_saved_regs: Vec::new(),
+            call_arg_regs: vec![],
+            indirect_target_regs: vec![],
+            allow_inline_asm_regalloc: false,
+            leaf_caller_saved_homes: false,
+            xmm_regs: Vec::new(),
+            never_materialized: FxHashSet::default(),
+            folded_index_uses: FxHashMap::default(),
+            fold_base_regs,
+            fold_readmit: FxHashSet::default(),
+            reg_hints: FxHashMap::default(),
+            ra_config: Arc::new(RaConfig::default()),
+        }
+    }
+
+    fn sorted(mut v: Vec<u32>) -> Vec<u32> {
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn deferral_skips_readmitted_addresses_and_ineligible_bases() {
+        let f = two_field_loads();
+        let all: FxHashSet<u32> = (0..6).collect();
+
+        let mut eligible = all.clone();
+        let t = defer_const_fold_addresses(&f, &mut eligible, &FxHashSet::default());
+        assert_eq!(sorted(t[&0].clone()), vec![1, 2]);
+        assert!(!eligible.contains(&1) && !eligible.contains(&2));
+        assert!(eligible.contains(&0));
+
+        let mut eligible = all.clone();
+        let readmit: FxHashSet<u32> = std::iter::once(1).collect();
+        let t = defer_const_fold_addresses(&f, &mut eligible, &readmit);
+        assert_eq!(t[&0], vec![2]);
+        assert!(eligible.contains(&1) && !eligible.contains(&2));
+
+        // Every address re-admitted: no entry at all (not an empty list).
+        let mut eligible = all.clone();
+        let readmit: FxHashSet<u32> = [1, 2].into_iter().collect();
+        assert!(defer_const_fold_addresses(&f, &mut eligible, &readmit).is_empty());
+        assert_eq!(eligible, all);
+
+        // A base that is no candidate cannot carry its addresses.
+        let mut eligible: FxHashSet<u32> = all.iter().copied().filter(|&v| v != 0).collect();
+        let before = eligible.clone();
+        assert!(defer_const_fold_addresses(&f, &mut eligible, &FxHashSet::default()).is_empty());
+        assert_eq!(eligible, before);
+    }
+
+    #[test]
+    fn homed_base_keeps_its_addresses_deferred_in_one_round() {
+        let f = two_field_loads();
+        let mut cfg = config(vec![PhysReg(1), PhysReg(2), PhysReg(3)]);
+        let r = allocate_registers_with_fold_rounds(&f, &mut cfg);
+        let base = r.assignments.get(&0).copied();
+        assert!(
+            base.is_some_and(|p| cfg.fold_base_regs.contains(&p)),
+            "{base:?}"
+        );
+        assert!(cfg.fold_readmit.is_empty());
+        assert_eq!(sorted(r.fold_deferred[&0].clone()), vec![1, 2]);
+        assert!(!r.assignments.contains_key(&1) && !r.assignments.contains_key(&2));
+    }
+
+    #[test]
+    fn failed_base_readmits_its_addresses_and_reaches_a_fixpoint() {
+        let f = two_field_loads();
+        // No allocatable register is foldable: every deferral must fail and
+        // be undone, after which nothing is deferred and the loop stops.
+        let mut cfg = config(vec![PhysReg(200)]);
+        let r = allocate_registers_with_fold_rounds(&f, &mut cfg);
+        assert_eq!(cfg.fold_readmit, [1, 2].into_iter().collect());
+        assert!(r.fold_deferred.is_empty());
+        assert!(r.eligible.contains(&1) && r.eligible.contains(&2));
+    }
+
+    #[test]
+    fn empty_fold_pool_disables_deferral() {
+        let f = two_field_loads();
+        let mut cfg = config(Vec::new());
+        let r = allocate_registers_with_fold_rounds(&f, &mut cfg);
+        assert!(r.fold_deferred.is_empty() && cfg.fold_readmit.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod wide_hazard_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrCmpOp, Value};
+
+    fn v(n: u32) -> Operand {
+        Operand::Value(Value(n))
+    }
+
+    fn cast(dest: u32, src: u32, from_ty: IrType, to_ty: IrType) -> Instruction {
+        Instruction::Cast {
+            dest: Value(dest),
+            src: v(src),
+            from_ty,
+            to_ty,
+        }
+    }
+
+    #[test]
+    fn integer_truncation_out_of_i128_has_a_gpr_result() {
+        use IrType::*;
+        for (from, to, is_32bit, gpr) in [
+            (I128, U32, false, true),
+            (U128, I64, false, true),
+            (I128, I8, true, true),
+            // On i686 an I64 is a register pair, not one GPR.
+            (I128, I64, true, false),
+            // Into or across wide types, or out to a float: not a GPR result.
+            (I64, I128, false, false),
+            (I128, U128, false, false),
+            (I128, F64, false, false),
+            (I32, I64, false, true),
+        ] {
+            assert_eq!(
+                cast_result_is_gpr(from, to, is_32bit),
+                gpr,
+                "{from:?} -> {to:?} 32bit={is_32bit}"
+            );
+        }
+    }
+
+    /// Points: 0 ParamRef I128, 1 ParamRef I64, 2 lshr I128, 3 trunc I128->U32,
+    /// 4 trunc U32->I16, 5 add I64, 6 zext I64->I128, 7 I128 -> F64 (libcall),
+    /// 8 cmp I128 (opens the fusion window), 9 add I64, 10 terminator.
+    #[test]
+    fn integer_casts_across_the_wide_boundary_are_not_scratch_hazards() {
+        let mut f = IrFunction::new("f".into(), IrType::I64, vec![], false);
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::ParamRef {
+                    dest: Value(1),
+                    param_idx: 0,
+                    ty: IrType::I128,
+                },
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 1,
+                    ty: IrType::I64,
+                },
+                Instruction::BinOp {
+                    dest: Value(2),
+                    op: IrBinOp::LShr,
+                    lhs: v(1),
+                    rhs: Operand::Const(IrConst::I64(64)),
+                    ty: IrType::I128,
+                },
+                cast(3, 2, IrType::I128, IrType::U32),
+                cast(4, 3, IrType::U32, IrType::I16),
+                Instruction::BinOp {
+                    dest: Value(5),
+                    op: IrBinOp::Add,
+                    lhs: v(0),
+                    rhs: v(0),
+                    ty: IrType::I64,
+                },
+                cast(6, 0, IrType::I64, IrType::I128),
+                cast(7, 1, IrType::I128, IrType::F64),
+                Instruction::Cmp {
+                    dest: Value(8),
+                    op: IrCmpOp::Ult,
+                    lhs: v(6),
+                    rhs: v(1),
+                    ty: IrType::I128,
+                },
+                Instruction::BinOp {
+                    dest: Value(9),
+                    op: IrBinOp::Add,
+                    lhs: v(5),
+                    rhs: v(0),
+                    ty: IrType::I64,
+                },
+            ],
+            terminator: Terminator::Return(Some(v(9))),
+            source_spans: Vec::new(),
+        });
+        f.next_value_id = 10;
+        assert_eq!(
+            collect_x64_wide_hazard_points(&f),
+            vec![0, 2, 7, 8, 9, 10],
+            "integer casts 3 and 6 stage through rax:rdx only; the F64 cast \
+             is a libcall; the I128 cmp's fusion window runs to the terminator"
+        );
     }
 }

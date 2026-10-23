@@ -7,7 +7,7 @@ use crate::common::fx_hash::FxHashMap;
 
 use super::elf::*;
 use super::reloc;
-use super::types::{BASE_ADDR, GlobalSymbol, PAGE_SIZE};
+use super::types::{BASE_ADDR, EhFrameHdr, GlobalSymbol, PAGE_SIZE};
 use crate::backend::linker_common;
 use linker_common::OutputSection;
 
@@ -76,45 +76,16 @@ pub(super) fn emit_executable(
         }
     }
 
-    // Build .eh_frame_hdr: find .eh_frame, count FDEs, reserve space
-    let mut eh_frame_hdr_vaddr = 0u64;
-    let mut eh_frame_hdr_offset = 0u64;
-    let mut eh_frame_hdr_size = 0u64;
-    let mut eh_frame_vaddr = 0u64;
-    let mut eh_frame_file_offset = 0u64;
-    let mut eh_frame_size = 0u64;
-    for sec in output_sections.iter() {
-        if sec.name == ".eh_frame" && sec.mem_size > 0 {
-            eh_frame_vaddr = sec.addr;
-            eh_frame_file_offset = sec.file_offset;
-            eh_frame_size = sec.mem_size;
-            break;
-        }
-    }
-    if eh_frame_size > 0 {
-        // Count FDEs from individual input .eh_frame sections (data not merged yet)
-        let mut fde_count = 0usize;
-        if let Some(ef_sec) = output_sections
-            .iter()
-            .find(|s| s.name == ".eh_frame" && s.mem_size > 0)
-        {
-            for input in &ef_sec.inputs {
-                let sd = &objects[input.object_idx].section_data[input.section_idx];
-                fde_count += crate::backend::linker_common::count_eh_frame_fdes(sd);
-            }
-        }
-        eh_frame_hdr_size = (12 + 8 * fde_count) as u64;
-        // Align to 4 bytes
-        offset = (offset + 3) & !3;
-        eh_frame_hdr_offset = offset;
-        eh_frame_hdr_vaddr = BASE_ADDR + offset;
-        offset += eh_frame_hdr_size;
-        if debug_layout {
-            eprintln!(
-                "  LAYOUT EH_FRAME_HDR: addr=0x{:x} foff=0x{:x} sz=0x{:x} fde_count={}",
-                eh_frame_hdr_vaddr, eh_frame_hdr_offset, eh_frame_hdr_size, fde_count
-            );
-        }
+    // .eh_frame_hdr: reserved after the read-only sections (RX segment).
+    let eh_frame_hdr = EhFrameHdr::reserve(objects, output_sections, &mut offset, BASE_ADDR);
+    let (eh_frame_hdr_offset, eh_frame_hdr_vaddr, eh_frame_hdr_size) = eh_frame_hdr
+        .as_ref()
+        .map_or((0, 0, 0), |h| (h.offset, h.vaddr, h.size));
+    if debug_layout && let Some(h) = &eh_frame_hdr {
+        eprintln!(
+            "  LAYOUT EH_FRAME_HDR: addr=0x{:x} foff=0x{:x} sz=0x{:x} fde_count={}",
+            h.vaddr, h.offset, h.size, h.fde_count
+        );
     }
 
     let rx_filesz = offset; // RX segment: [0, rx_filesz)
@@ -746,22 +717,8 @@ pub(super) fn emit_executable(
     )?;
 
     // Build .eh_frame_hdr from relocated .eh_frame data and write it
-    if eh_frame_hdr_size > 0 && eh_frame_size > 0 {
-        let ef_start = eh_frame_file_offset as usize;
-        let ef_end = ef_start + eh_frame_size as usize;
-        if ef_end <= out.len() {
-            let eh_frame_relocated = out[ef_start..ef_end].to_vec();
-            let hdr_data = crate::backend::linker_common::build_eh_frame_hdr(
-                &eh_frame_relocated,
-                eh_frame_vaddr,
-                eh_frame_hdr_vaddr,
-                true, // 64-bit
-            );
-            let hdr_off = eh_frame_hdr_offset as usize;
-            if !hdr_data.is_empty() && hdr_off + hdr_data.len() <= out.len() {
-                write_bytes(&mut out, hdr_off, &hdr_data);
-            }
-        }
+    if let Some(h) = &eh_frame_hdr {
+        h.write(&mut out)?;
     }
 
     // === ELF header ===
