@@ -94,7 +94,7 @@ pub(super) fn eliminate_dead_reg_moves(store: &LineStore, infos: &mut [LineInfo]
             continue;
         }
         // Don't eliminate moves to %rsp or %rbp.
-        if dst_reg == 4 || dst_reg == 5 {
+        if dst_reg == REG_RSP || dst_reg == REG_RBP {
             i += 1;
             continue;
         }

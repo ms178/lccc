@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * Workload-derived kernel: Linux 6.18, lib/list_sort.c.
  *

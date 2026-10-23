@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later */
 /*
  * Workload-derived kernel: GNU gzip 1.14, deflate.c, longest_match().
  *

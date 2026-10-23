@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: BSD-3-Clause OR GPL-2.0-only */
 /*
  * Workload-derived kernel: Zstandard 1.5.7, lib/compress/zstd_double_fast.c.
  *

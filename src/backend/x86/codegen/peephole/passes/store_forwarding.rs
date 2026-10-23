@@ -1244,7 +1244,7 @@ fn gsf_handle_other(
     let mut writes = super::load_op_fuse::may_write_families(text, &infos[i]);
     while writes != 0 {
         let reg = writes.trailing_zeros() as RegId;
-        if reg == 4 {
+        if reg == REG_RSP {
             invalidate_all_mappings(slot_entries, reg_offsets);
             break;
         }
@@ -1281,7 +1281,7 @@ fn gsf_handle_other(
     // (the `movq %rsp, %rbp` above already cleared them via the rbp arm),
     // and past a mid-function adjust the next push/call/label clears them
     // anyway, so no live forwarding window is lost.
-    if dest_reg == 4 {
+    if dest_reg == REG_RSP {
         invalidate_all_mappings(slot_entries, reg_offsets);
     }
 

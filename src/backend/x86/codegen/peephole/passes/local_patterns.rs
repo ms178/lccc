@@ -895,7 +895,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             size: ss,
         } = infos[i].kind
         {
-            if matches!(ss, MoveSize::Q | MoveSize::L) && is_valid_gp_reg(sr) && sr != 4 && sr != 5
+            if matches!(ss, MoveSize::Q | MoveSize::L) && is_valid_gp_reg(sr) && sr != REG_RSP && sr != REG_RBP
             {
                 let m = next_non_debug(store, infos, i + 1, len);
                 if m < len && !infos[m].is_barrier() {
@@ -914,8 +914,8 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                 && store_base.is_some()
                                 && store_base == load_base
                                 && is_valid_gp_reg(lr)
-                                && lr != 4
-                                && lr != 5
+                                && lr != REG_RSP
+                                && lr != REG_RBP
                                 && lr != sr
                             {
                                 // Middle line: FULLY redefines %S (explicitly
@@ -3323,12 +3323,12 @@ pub(super) fn promote_loop_invariant_fp_load(
             // kills slot liveness and is invisible to it.)
             let numeric_offset_end = offset_str.find('(').unwrap_or(offset_str.len());
             let numeric_offset: i32 = offset_str[..numeric_offset_end].parse().unwrap_or(0);
-            let slot_base: RegId = if src.ends_with("(%rsp)") { 4 } else { 5 };
+            let slot_base: RegId = if src.ends_with("(%rsp)") { REG_RSP } else { REG_RBP };
             // The preheader store below only matches `StoreRbp` (an rbp
             // base): an rsp-relative load must not pair with an
             // rbp-relative store that merely shares the numeric offset —
             // the promoted %xmm2 would carry the wrong slot's value.
-            if slot_base != 5 {
+            if slot_base != REG_RBP {
                 continue;
             }
             let slot = parse_frame_slot(src, 8);
@@ -5231,8 +5231,8 @@ pub(super) fn hoist_loop_invariant_gpr_load(
                 let dst_family = register_family_fast(dst_part);
                 if dst_family == REG_NONE
                     || dst_family > REG_GP_MAX
-                    || dst_family == 4
-                    || dst_family == 5
+                    || dst_family == REG_RSP
+                    || dst_family == REG_RBP
                     || dst_family == 0
                 {
                     continue;
@@ -5315,12 +5315,12 @@ pub(super) fn hoist_loop_invariant_gpr_load(
             // -fomit-frame-pointer it is an ordinary callee-saved register,
             // and with a frame pointer the allocator never deals it.)
             let dst_family = register_family_fast(dst_part);
-            if dst_family == REG_NONE || dst_family > REG_GP_MAX || dst_family == 4 {
+            if dst_family == REG_NONE || dst_family > REG_GP_MAX || dst_family == REG_RSP {
                 continue;
             }
             // Don't hoist into rax/rcx (accumulator) or rsp/rbp
             // Skip rax (primary accumulator), rsp, rbp (frame registers)
-            if dst_family == 0 || dst_family == 4 || dst_family == 5 {
+            if dst_family == 0 || dst_family == REG_RSP || dst_family == REG_RBP {
                 continue;
             }
 
@@ -7106,7 +7106,7 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
             // The addend becomes the LEA's SIB index; %rsp is not
             // representable there (SIB index 100 encodes "no index"), and
             // emitting `(%A, %rsp)` would be rejected by the assembler.
-            if fam == 4 {
+            if fam == REG_RSP {
                 i += 1;
                 continue;
             }
@@ -7215,7 +7215,7 @@ pub(super) fn fuse_staged_add_and_relay(store: &mut LineStore, infos: &mut [Line
         }
 
         // rbp destination knowledge: needed only when X or Y is family 5.
-        let need_rbp = x_fam == 5 || y_fam == Some(5);
+        let need_rbp = x_fam == REG_RBP || y_fam == Some(5);
         let rbp_gpr = if need_rbp {
             match function_range(store, infos, i) {
                 Some((fs, fe)) => rbp_is_gpr_in_function(store, infos, fs, fe),
@@ -7491,7 +7491,7 @@ pub(super) fn fuse_load_lea_add(store: &mut LineStore, infos: &mut [LineInfo]) -
         }
         let addend = if let Some(fam) = plain_gp_operand(c_text) {
             // C becomes the LEA's SIB index; %rsp is not representable there.
-            if fam == 4 {
+            if fam == REG_RSP {
                 i += 1;
                 continue;
             }
@@ -7563,7 +7563,7 @@ pub(super) fn fuse_load_lea_add(store: &mut LineStore, infos: &mut [LineInfo]) -
             // (which takes MEM verbatim) and the LEA alias the stack pointer
             // with a dying staged value. Leave stack-relative addressing to
             // the passes that prove rsp's role.
-            if b == 4 {
+            if b == REG_RSP {
                 i += 1;
                 continue;
             }
@@ -7834,7 +7834,7 @@ pub(super) fn fuse_load_lea_into_base(store: &mut LineStore, infos: &mut [LineIn
         // rewrite hands %B an RMW write, and FileLiveness should never
         // call the stack pointer dead — refuse explicitly so a future
         // oracle slip cannot emit `addl MEM, %rsp`.
-        if x_fam == 4 || b_fam == 4 || d_fam == 4 {
+        if x_fam == REG_RSP || b_fam == REG_RSP || d_fam == REG_RSP {
             i += 1;
             continue;
         }
@@ -10671,7 +10671,7 @@ mod load_lea_base_tests {
 
     /// An rsp-involving triple never folds. Today the refusal comes from
     /// the liveness oracle (the stack pointer is never dead); the explicit
-    /// `fam == 4` guard beside it is defense in depth, so this test pins
+    /// `fam == REG_RSP` guard beside it is defense in depth, so this test pins
     /// the observable CONTRACT — no `add MEM, %rsp`-shaped rewrite may
     /// ever appear — rather than which guard fires.
     #[test]

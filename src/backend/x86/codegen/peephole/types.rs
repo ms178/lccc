@@ -15,6 +15,14 @@ pub(super) const REG_NONE: RegId = 255;
 /// but are not tracked by the global store forwarding pass (which only handles GP
 /// register-to-register moves via reg_id_to_name).
 pub(super) const REG_GP_MAX: RegId = 15;
+/// Family id of `%rsp`.  Peephole rewrites must never rename, fuse into, or
+/// otherwise repurpose the stack pointer, so every such refusal names this
+/// constant instead of spelling the literal `4`.
+pub(super) const REG_RSP: RegId = 4;
+/// Family id of `%rbp`.  Whether it is a frame pointer or a free GPR is a
+/// per-function fact (see `rbp_is_gpr_*`); passes that must refuse it outright
+/// name this constant instead of the literal `5`.
+pub(super) const REG_RBP: RegId = 5;
 
 /// Family id of `%xmm0`/`%ymm0`/`%zmm0`.  Vector register N of any width is
 /// family `VEC_FAMILY_BASE + N`, so the sixteen tracked vector registers occupy

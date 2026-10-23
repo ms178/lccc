@@ -388,12 +388,12 @@ pub(super) fn parse_reg_to_reg_movq(info: &LineInfo, trimmed: &str) -> Option<(R
                 let dfam = register_family_fast(dst);
                 if sfam == REG_NONE
                     || sfam > REG_GP_MAX
-                    || sfam == 4
-                    || sfam == 5
+                    || sfam == REG_RSP
+                    || sfam == REG_RBP
                     || dfam == REG_NONE
                     || dfam > REG_GP_MAX
-                    || dfam == 4
-                    || dfam == 5
+                    || dfam == REG_RSP
+                    || dfam == REG_RBP
                     || sfam == dfam
                 {
                     return None;
@@ -433,11 +433,11 @@ pub(super) fn parse_reg_to_reg_movl(info: &LineInfo, trimmed: &str) -> Option<(R
                 let dfam = register_family_fast(dst);
                 if sfam == REG_NONE
                     || sfam > REG_GP_MAX
-                    || sfam == 4
+                    || sfam == REG_RSP
                     || dfam == REG_NONE
                     || dfam > REG_GP_MAX
-                    || dfam == 4
-                    || dfam == 5
+                    || dfam == REG_RSP
+                    || dfam == REG_RBP
                     || sfam == dfam
                 {
                     return None;
@@ -1351,7 +1351,7 @@ mod writes_family_tests {
         for t in ["popfq", "popfl"] {
             let info = classify_line(&format!("    {t}"));
             for fam in 0..=REG_GP_MAX {
-                if fam == 4 {
+                if fam == REG_RSP {
                     assert!(writes_family_full(&info, t, fam), "{t} must retire %rsp");
                 } else {
                     assert!(!writes_family_full(&info, t, fam), "{t} fam={fam}");

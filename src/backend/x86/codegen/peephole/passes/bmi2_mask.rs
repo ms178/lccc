@@ -38,7 +38,7 @@ fn immediate(s: &str, expected: u64) -> bool {
 fn register(s: &str, size: MoveSize) -> Option<RegId> {
     let family = register_family_fast(s);
     // Stack/frame pointers are deliberately outside the admission set.
-    (family <= REG_GP_MAX && family != 4 && family != 5 && s == reg_id_to_name(family, size))
+    (family <= REG_GP_MAX && family != REG_RSP && family != REG_RBP && s == reg_id_to_name(family, size))
         .then_some(family)
 }
 

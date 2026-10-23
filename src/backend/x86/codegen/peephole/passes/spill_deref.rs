@@ -754,7 +754,7 @@ pub(super) fn fold_save_reload_roundtrip(store: &mut LineStore, infos: &mut [Lin
                 i += 1;
                 continue;
             };
-            if base == 5 && !rbp_frame {
+            if base == REG_RBP && !rbp_frame {
                 i += 1;
                 continue;
             }
@@ -997,12 +997,12 @@ pub(super) fn fold_private_spill_cycle(store: &mut LineStore, infos: &mut [LineI
                     return None;
                 }
                 let sf = register_family_fast(scratch);
-                if sf > REG_GP_MAX || sf == 4 || scratch != REG_NAMES[1][sf as usize] {
+                if sf > REG_GP_MAX || sf == REG_RSP || scratch != REG_NAMES[1][sf as usize] {
                     return None;
                 }
                 for offset in reg_token_offsets(mem) {
                     let fam = register_family_fast(&mem[offset..]);
-                    if fam == sf || fam == 4 || fam == 5 {
+                    if fam == sf || fam == REG_RSP || fam == REG_RBP {
                         return None;
                     }
                 }
@@ -1016,7 +1016,7 @@ pub(super) fn fold_private_spill_cycle(store: &mut LineStore, infos: &mut [LineI
                 let (dest, wide) = (ext[..comma].trim(), ext[comma + 1..].trim());
                 let df = register_family_fast(dest);
                 if df > REG_GP_MAX
-                    || df == 4
+                    || df == REG_RSP
                     || df == sf
                     || dest != REG_NAMES[1][df as usize]
                     || wide != REG_NAMES[0][sf as usize]
@@ -1028,8 +1028,8 @@ pub(super) fn fold_private_spill_cycle(store: &mut LineStore, infos: &mut [LineI
                     return None;
                 }
                 let (a, ab) = parse_slot(bound)?;
-                if tb != 4
-                    || ab != 4
+                if tb != REG_RSP
+                    || ab != REG_RSP
                     || t < 0
                     || a < 0
                     || !((t as i64 + 4 <= a as i64) || (a as i64 + 8 <= t as i64))
@@ -1193,7 +1193,7 @@ pub(super) fn fold_entry_load_relay(store: &mut LineStore, infos: &mut [LineInfo
         if !mem.contains('(')
             || !mem.ends_with(')')
             || sf > REG_GP_MAX
-            || sf == 4
+            || sf == REG_RSP
             || src != REG_NAMES[1][sf as usize]
         {
             continue;
@@ -1229,7 +1229,7 @@ pub(super) fn fold_entry_load_relay(store: &mut LineStore, infos: &mut [LineInfo
                     if s.trim() == REG_NAMES[0][sf as usize]
                         && df <= REG_GP_MAX
                         && df != sf
-                        && df != 4
+                        && df != REG_RSP
                         && d.trim() == REG_NAMES[0][df as usize]
                         && (i + 1..j)
                             .all(|k| infos[k].is_nop() || infos[k].reg_refs & (1u16 << df) == 0)

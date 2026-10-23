@@ -180,6 +180,15 @@ fn scalar_memcpy_root(
 /// Replace small non-alloca memcpy operations with one scalar load and store.
 /// This avoids materializing tiny copies as calls/spill-backed temporaries,
 /// while deliberately leaving alloca-backed copies to the richer SROA forms.
+///
+/// Alignment: `memcpy` permits arbitrarily aligned operands, and the typed
+/// scalar `Load`/`Store` pair emitted here preserves exactly that contract
+/// on every backend this tree ships: x86 lowers scalar loads/stores to
+/// misalignment-tolerant `mov`, AArch64 to `ldr`/`str` (tolerant for Normal
+/// memory), and the RISC-V backend likewise treats unaligned accesses
+/// identically to aligned ones (see its codegen README).  Overlap is not a
+/// concern: overlapping `memcpy` objects are undefined behaviour in C, so
+/// the load-then-store order is as sound as the call it replaces.
 fn lower_non_alloca_scalar_memcpy(func: &mut IrFunction) -> usize {
     let mut allocas = FxHashSet::default();
     let mut defs = FxHashMap::default();

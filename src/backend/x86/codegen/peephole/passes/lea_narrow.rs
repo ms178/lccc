@@ -168,7 +168,7 @@ pub(super) fn narrow_lea_truncations(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-        if t_fam == 4 || t_fam == 5 {
+        if t_fam == REG_RSP || t_fam == REG_RBP {
             i += 1;
             continue;
         }
@@ -201,7 +201,7 @@ pub(super) fn narrow_lea_truncations(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         };
-        if d_fam == 4 || d_fam == 5 {
+        if d_fam == REG_RSP || d_fam == REG_RBP {
             i += 1;
             continue;
         }

@@ -91,7 +91,7 @@ const W8: usize = 3;
 
 #[inline]
 fn is_frame_family(fam: RegId) -> bool {
-    fam == 4 || fam == 5
+    fam == REG_RSP || fam == REG_RBP
 }
 
 #[inline]
@@ -454,7 +454,7 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
         // byte/word/dword aliases for a frame pointer and strand hot-loop
         // copies. Reuse the frame/unwind/opaque-use proof, cached per function;
         // the rewrite never creates frame setup or changes CFI. RSP stays out.
-        let rbp_gpr = if sfam == 5 || dfam == 5 {
+        let rbp_gpr = if sfam == REG_RBP || dfam == REG_RBP {
             lv.recorded_function(store, infos, i)
                 .is_some_and(|(start, end)| {
                     *rbp_roles
@@ -465,10 +465,10 @@ pub(super) fn fold_register_copies(store: &mut LineStore, infos: &mut [LineInfo]
             false
         };
         if sfam == dfam
-            || sfam == 4
-            || dfam == 4
-            || (sfam == 5 && !rbp_gpr && !is_ext)
-            || (dfam == 5 && !rbp_gpr)
+            || sfam == REG_RSP
+            || dfam == REG_RSP
+            || (sfam == REG_RBP && !rbp_gpr && !is_ext)
+            || (dfam == REG_RBP && !rbp_gpr)
         {
             continue;
         }

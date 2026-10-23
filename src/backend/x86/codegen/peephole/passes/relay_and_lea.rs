@@ -76,7 +76,7 @@ const RELAY_OPS: &[&str] = &[
 /// implicitly by push/pop/leave, and are never worth a relay.
 #[inline]
 pub(super) fn is_relayable_family(fam: RegId) -> bool {
-    fam <= REG_GP_MAX && fam != 4 && fam != 5
+    fam <= REG_GP_MAX && fam != REG_RSP && fam != REG_RBP
 }
 
 /// Is `fam` safe to *receive* a retargeted value, given per-function `%rbp`
@@ -92,7 +92,7 @@ pub(super) fn is_relayable_family(fam: RegId) -> bool {
 /// anywhere proves the frame-pointer build.
 #[inline]
 pub(super) fn is_writable_family_gpr(fam: RegId, rbp_gpr: bool) -> bool {
-    fam <= REG_GP_MAX && fam != 4 && (fam != 5 || rbp_gpr)
+    fam <= REG_GP_MAX && fam != REG_RSP && (fam != REG_RBP || rbp_gpr)
 }
 
 /// Scan the whole `[fstart, fend]` function range and decide whether `%rbp`
@@ -2015,7 +2015,7 @@ fn parse_rip_symbol_lea(t: &str) -> Option<(String, RegId)> {
         return None;
     }
     let fam = plain_gp_operand(dst)?;
-    if fam == 4 || fam == 5 || dst != REG_NAMES[0][fam as usize] {
+    if fam == REG_RSP || fam == REG_RBP || dst != REG_NAMES[0][fam as usize] {
         return None;
     }
     Some((addr.to_string(), fam))
@@ -2196,7 +2196,7 @@ fn retarget_producer_into_copy_impl(
         // (see `rbp_is_gpr_in_function`); the frame-pointer build keeps the
         // conservative `is_relayable_family` refusal. The function-range scan
         // runs lazily: candidates without an rbp operand never pay for it.
-        let rbp_gpr = if a_fam == 5 {
+        let rbp_gpr = if a_fam == REG_RBP {
             match function_range(store, infos, i) {
                 Some((fs, fe)) => rbp_is_gpr_in_function(store, infos, fs, fe),
                 None => false,
@@ -2278,7 +2278,7 @@ fn retarget_producer_into_copy_impl(
             continue;
         }
         let rbp_gpr = rbp_gpr
-            || (d_fam == 5 && {
+            || (d_fam == REG_RBP && {
                 match function_range(store, infos, i) {
                     Some((fs, fe)) => rbp_is_gpr_in_function(store, infos, fs, fe),
                     None => false,

@@ -511,12 +511,14 @@ fn simplify_function_with_config(func: &mut IrFunction, fill_use_counts: bool) -
                         lhs,
                         rhs,
                         *ty,
-                        &select_defs,
-                        &cmp_defs,
-                        &cast_defs,
-                        &const_defs,
-                        &is_boolean,
-                        &def_counts,
+                        &SelectFoldCtx {
+                            select_defs: &select_defs,
+                            cmp_defs: &cmp_defs,
+                            cast_defs: &cast_defs,
+                            const_defs: &const_defs,
+                            is_boolean: &is_boolean,
+                            def_counts: &def_counts,
+                        },
                     ) {
                         *inst = folded;
                         if !simplified_here {
@@ -806,12 +808,14 @@ pub(crate) fn remove_redundant_bitop_guards(func: &mut IrFunction) -> usize {
                         lhs,
                         rhs,
                         *ty,
-                        &select_defs,
-                        &cmp_defs,
-                        &cast_defs,
-                        &const_defs,
-                        &is_boolean,
-                        &def_counts,
+                        &SelectFoldCtx {
+                            select_defs: &select_defs,
+                            cmp_defs: &cmp_defs,
+                            cast_defs: &cast_defs,
+                            const_defs: &const_defs,
+                            is_boolean: &is_boolean,
+                            def_counts: &def_counts,
+                        },
                     ) {
                         *inst = folded;
                         changes += 1;
@@ -913,6 +917,34 @@ fn eval_int_cmp_bool(op: IrCmpOp, lhs: IrConst, rhs: IrConst, ty: IrType) -> Opt
     }
 }
 
+/// Hard bound on the single-definition cast chain `resolve_select_const`
+/// will follow.  Real frontend output nests two or three casts; the bound
+/// exists so pathological or adversarial IR costs O(1) per operand instead
+/// of O(chain), and failing means "missed fold", never "wrong fold".  The
+/// boundary is pinned by `select_constant_cast_walk_is_bounded_and_folds_valid_chains`.
+const MAX_SELECT_CONST_DEPTH: u8 = 8;
+
+/// Hard bound on the cast layers `peel_bool_cond` will strip while looking
+/// for a provably-boolean condition.  Same fail-closed rationale as
+/// [`MAX_SELECT_CONST_DEPTH`]: beyond the bound the original operand is
+/// returned unchanged.
+const MAX_BOOL_CAST_PEEL: usize = 16;
+
+/// The single-def facts the select/compare folds consult, bundled so the
+/// folds take one evidence parameter instead of six parallel slices that
+/// could be transposed at a call site without any type error (four of the
+/// six share an element type shape).  Constructed once per `Cmp` site from
+/// the per-function fact tables; all fields are shared borrows, so the
+/// bundle is `Copy`-sized (six fat pointers) and free to pass.
+struct SelectFoldCtx<'a> {
+    select_defs: &'a [Option<SelectDef>],
+    cmp_defs: &'a [Option<CmpDef>],
+    cast_defs: &'a [Option<CastDef>],
+    const_defs: &'a [Option<IrConst>],
+    is_boolean: &'a [bool],
+    def_counts: &'a [u8],
+}
+
 fn resolve_select_const(
     op: Operand,
     const_defs: &[Option<IrConst>],
@@ -929,7 +961,7 @@ fn resolve_select_const_bounded(
     def_counts: &[u8],
     depth: u8,
 ) -> Option<IrConst> {
-    if depth > 8 {
+    if depth > MAX_SELECT_CONST_DEPTH {
         return None;
     }
     match op {
@@ -968,7 +1000,7 @@ fn peel_bool_cond(
 ) -> Operand {
     let mut candidate = op;
     let mut saw_narrowing = false;
-    for _ in 0..16 {
+    for _ in 0..MAX_BOOL_CAST_PEEL {
         let Operand::Value(v) = candidate else { break };
         let idx = v.0 as usize;
         if def_counts.get(idx).copied() != Some(1) {
@@ -1077,20 +1109,22 @@ fn int_cmp_from_trichotomy_mask(mask: u8, unsigned: bool) -> Option<IrCmpOp> {
 /// Fold comparisons of 1-level and 2-level constant-leaf `Select` trees against
 /// an integer constant. Inlined 3-way comparators (`(a < b) ? -1 : ((a > b) ? 1 : 0)`)
 /// compared against `0` after `if_convert` collapse to a single `Cmp(a, b)`.
-#[allow(clippy::too_many_arguments)]
 fn fold_cmp_of_select(
     dest: Value,
     op: IrCmpOp,
     lhs: &Operand,
     rhs: &Operand,
     ty: IrType,
-    select_defs: &[Option<SelectDef>],
-    cmp_defs: &[Option<CmpDef>],
-    cast_defs: &[Option<CastDef>],
-    const_defs: &[Option<IrConst>],
-    is_boolean: &[bool],
-    def_counts: &[u8],
+    ctx: &SelectFoldCtx<'_>,
 ) -> Option<Instruction> {
+    let SelectFoldCtx {
+        select_defs,
+        cmp_defs,
+        cast_defs,
+        const_defs,
+        is_boolean,
+        def_counts,
+    } = *ctx;
     if !ty.is_integer() {
         return None;
     }

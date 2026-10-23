@@ -2944,13 +2944,27 @@ fn unescaped_entry_alloca_inits(func: &IrFunction) -> FxHashMap<Value, Value> {
         .collect()
 }
 
+/// Hard bound on the provenance links `resolve_fn_ptr_origin` will follow
+/// (copy/load hops between a call argument and its origin).  Real chains
+/// are one to three links; beyond the bound the answer is "unknown", which
+/// the caller treats as a refusal -- a missed devirtualization, never a
+/// wrong one.
+const MAX_FN_PTR_ORIGIN_STEPS: usize = 16;
+
+/// Hard bound on the agreement-propagation rounds in
+/// `propagate_invariant_fn_ptr_params`.  Each round resolves one more
+/// level of call-chain indirection, so the bound caps chain depth, not
+/// program size; exhausting it leaves the deepest parameters unknown
+/// (again: refusal, not unsoundness).
+const MAX_INVARIANT_FIXPOINT_ROUNDS: usize = 8;
+
 fn resolve_fn_ptr_origin(
     func: &IrFunction,
     defs: &ValueDefTable,
     alloca_inits: &FxHashMap<Value, Value>,
     mut value: Value,
 ) -> Option<FnPtrOrigin> {
-    for _ in 0..16 {
+    for _ in 0..MAX_FN_PTR_ORIGIN_STEPS {
         let &(count, Some((bi, ii))) = defs.get(&value)? else {
             return None;
         };
@@ -3048,7 +3062,7 @@ fn propagate_invariant_fn_ptr_params(
     call_sites
         .retain(|(callee, _), sites| eligible_callees.contains_key(callee) && !sites.is_empty());
     let mut known: FxHashMap<(String, usize), String> = FxHashMap::default();
-    for _ in 0..8 {
+    for _ in 0..MAX_INVARIANT_FIXPOINT_ROUNDS {
         let mut progressed = false;
         for ((callee, pi), sites) in &call_sites {
             if known.contains_key(&(callee.clone(), *pi)) {

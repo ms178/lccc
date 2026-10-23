@@ -259,6 +259,20 @@ gate "sse2-truncating-convert" fast \
 gate "sse2-slot-forwarding" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_sse2_slot_forwarding.sh
 
+# Every `__builtin_<libc>f` float alias GCC accepts must resolve in lccc to the
+# same operation with bit-identical results (arity probed against gcc-16, then
+# a runtime differential) -- the failure mode otherwise is a quiet call to a
+# symbol that does not exist.
+gate "builtin-float-aliases" fast \
+    python3 tests/regression/check_builtin_float_aliases.py --lccc "$LCCC" --gcc "${GCC:-gcc-16}"
+
+# The differential linker oracles (mold, lld) must install with retries and
+# version pinning, never as bare apt lines whose transient mirror failure
+# red-fails the whole job; this gate drives the installer against a mock
+# apt and proves the failure modes are the loud ones.
+gate "ci-link-oracle-provisioning" fast \
+    python3 tests/regression/check_ci_link_oracle_provisioning.py
+
 # Three compiles and two runs: pins that a loop-carried accumulator keeps its
 # callee-saved home when a call inside the loop forces the value to be
 # call-spanning, instead of being displaced by a loop-invariant constant that

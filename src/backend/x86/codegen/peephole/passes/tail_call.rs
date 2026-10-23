@@ -329,8 +329,7 @@ fn is_tail_call_candidate(
             }
             LineKind::Pop { reg } => {
                 // popq %rbp is part of the epilogue
-                if reg == 5 {
-                    // rbp = register family 5
+                if reg == REG_RBP {
                     found_pop_rbp = true;
                     j += 1;
                     continue;

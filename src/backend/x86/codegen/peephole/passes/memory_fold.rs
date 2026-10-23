@@ -1321,14 +1321,14 @@ fn scratch_dead_after_relaxed(
         }
         match infos[scan].kind {
             LineKind::Push { reg: r } => {
-                if r == reg || reg == 4 {
+                if r == reg || reg == REG_RSP {
                     return false;
                 }
                 scan += 1;
                 continue;
             }
             LineKind::Pop { reg: r } => {
-                if reg == 4 {
+                if reg == REG_RSP {
                     return false;
                 }
                 if r == reg {
@@ -1403,7 +1403,7 @@ fn is_dst_establishing_move(
     let LineKind::Other { dest_reg: dst_fam } = infos[k].kind else {
         return None;
     };
-    if dst_fam > 15 || dst_fam == load_reg || dst_fam == 4 || dst_fam == 5 {
+    if dst_fam > 15 || dst_fam == load_reg || dst_fam == REG_RSP || dst_fam == REG_RBP {
         return None;
     }
     let t = infos[k].trimmed(store.get(k));
@@ -1685,7 +1685,7 @@ pub(super) fn fold_store_alu_memop(store: &mut LineStore, infos: &mut [LineInfo]
             i += 1;
             continue;
         };
-        let slot_text = format!("{}(%r{})", offset, if base == 4 { "sp" } else { "bp" });
+        let slot_text = format!("{}(%r{})", offset, if base == REG_RSP { "sp" } else { "bp" });
 
         // Scan forward over lines that provably do not touch `reg`, the frame
         // base, or the slot, looking for the ALU that reads the slot.  A Label
