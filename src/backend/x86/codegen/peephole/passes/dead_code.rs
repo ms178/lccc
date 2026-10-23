@@ -1197,23 +1197,31 @@ pub(super) fn eliminate_never_read_stores(store: &LineStore, infos: &mut [LineIn
                         break;
                     }
                 }
-                LineKind::LoadRbp { offset, size, .. } => {
+                LineKind::LoadRbp { offset, .. } => {
                     let line = infos[k].trimmed(store.get(k));
                     if !rbp_is_frame && uses_rbp_mem_operand(line) {
                         has_unparseable_indirect = true;
                         break;
                     }
                     let base = frame_base(line, b's');
-                    read_ranges.push((base, offset, size.byte_size()));
+                    let Some(width) = frame_read_extent(line) else {
+                        has_unparseable_indirect = true;
+                        break;
+                    };
+                    read_ranges.push((base, offset, width));
                 }
-                LineKind::LoadXmmRbp { offset, size } => {
+                LineKind::LoadXmmRbp { offset, .. } => {
                     let line = infos[k].trimmed(store.get(k));
                     if !rbp_is_frame && uses_rbp_mem_operand(line) {
                         has_unparseable_indirect = true;
                         break;
                     }
                     let base = frame_base(line, b's');
-                    read_ranges.push((base, offset, size.byte_size()));
+                    let Some(width) = frame_read_extent(line) else {
+                        has_unparseable_indirect = true;
+                        break;
+                    };
+                    read_ranges.push((base, offset, width));
                 }
                 LineKind::Other { .. } => {
                     let rbp_off = infos[k].rbp_offset;

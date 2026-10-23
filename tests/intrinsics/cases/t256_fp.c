@@ -97,6 +97,11 @@ int main(void) {
     __m128 ex = _mm256_extractf128_ps(a, 1);
     float eo[4]; _mm_storeu_ps(eo, ex);
     printf("extractf128: %.0f %.0f %.0f %.0f\n", (double)eo[0], (double)eo[1], (double)eo[2], (double)eo[3]);
+    dump256d("perm2f128pd", _mm256_permute2f128_pd(ad, bd, 0x20));
+    dump256d("insertf128pd", _mm256_insertf128_pd(ad, _mm_set_pd(9.0, 8.0), 1));
+    __m128d exd = _mm256_extractf128_pd(ad, 1);
+    double edo[2]; _mm_storeu_pd(edo, exd);
+    printf("extractf128pd: %.0f %.0f\n", edo[0], edo[1]);
 
     /* FMA */
     dump256("fmadd", _mm256_fmadd_ps(a, b, _mm256_set1_ps(1.0f)));

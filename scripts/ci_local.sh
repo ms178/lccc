@@ -225,6 +225,39 @@ gate "fp-contract-parity" fast \
 # the reference kernel) without any test going red.
 gate "sse2-matmul-vectorization" fast \
     env CCC="$LCCC" bash tests/regression/check_sse2_matmul_vectorization.sh
+# Signed dynamic limits can overflow while the FMA matmul vectorizer scales
+# grouped trips into byte offsets. Exercise the I32/I64 overflow boundaries in
+# both the AVX2 and two-wide paths, with packed-codegen positive controls.
+gate "matmul-negative-bound" fast \
+    env CCC="$LCCC" GCC_BIN="${GCC:-gcc}" \
+    bash tests/regression/check_matmul_negative_bound.sh
+
+# Two-wide matmul arm on the plain x86-64 baseline: the fused group op was its
+# only 2-wide lowering, so `fp_contract == fast && -mfma` also decided whether
+# the loop was vectorized -- and moving the default baseline to x86-64 v1
+# silently made every matmul stencil scalar at `-O2` (N=1024: 601 ms against
+# GCC 16.2's 361 ms).  Pins the packed/unfused lowering at both widths, the
+# fused v3 lowering, the `-mno-sse` refusal, and that both roundings execute
+# bit-exactly (the two-rounding result where no FMA3 exists).
+gate "matmul-sse2-fallback" fast \
+    env CCC="$LCCC" bash tests/regression/check_matmul_sse2_fallback.sh
+
+# `_mm_cvttsd_si32` / `_mm_cvttss_si32` must TRUNCATE under every MXCSR
+# rounding mode.  Both used to route through the rounding forms (`cvtsd2si` /
+# `cvtss2si`), which disagree with truncation the moment the rounding mode is
+# not nearest -- and, for non-integral inputs, they disagreed even at the
+# default.  The gate checks the encoding (`cvtt*2si` present) and runs the
+# conversion under all four rounding modes, against the GCC 16.2 oracle.
+gate "sse2-truncating-convert" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_sse2_truncating_convert.sh
+
+# End-to-end proof that a 16-byte XMM slot store forwards into its own reload.
+# The pass's unit tests prove the *rule*; this compiles real C, asserts on the
+# emitted assembly (no `movdqu slot, %xmmN` may survive its `movdqu %xmmN,
+# slot`), and executes every configuration against the GCC 16.2 oracle and
+# against `CCC_NO_XMM_SF=1` so the rewrite is proven to be a pure optimization.
+gate "sse2-slot-forwarding" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_sse2_slot_forwarding.sh
 
 # Three compiles and two runs: pins that a loop-carried accumulator keeps its
 # callee-saved home when a call inside the loop forces the value to be

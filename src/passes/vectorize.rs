@@ -1,7 +1,10 @@
 //! AVX2/SSE2 vectorization pass for matmul-style loops.
 //!
 //! Recognizes innermost loops with stride-1 double-precision accumulation patterns
-//! and transforms them into FmaF64x4 (AVX2, default) or FmaF64x2 (SSE2) intrinsics.
+//! and transforms them into 256-bit (`FmaF64x4*` / `MulAddF64x4*`) or 128-bit
+//! (`FmaF64x2Hoisted` / `MulAddF64x2Hoisted`) grouped intrinsics.  Width follows
+//! the target's vector register file; fused vs two-rounding follows
+//! `-ffp-contract` and `-mfma`, and the two choices are independent.
 //!
 //! Target pattern (matmul j-loop):
 //! ```c
@@ -45,15 +48,22 @@
 //!    - `vaddpd`: packed add with C[i][j*4]
 //!    - `vmovupd`: store 4 results back
 //!
-//! ### SSE2 (2-wide, with LCCC_FORCE_SSE2=1):
-//! 1. **Loop Bound**: Modified from `j < N` to `j < N/2`
-//! 2. **Array Indexing**: Changed from `j` to `j*2` (stride-16)
-//! 3. **SSE2 Code Generation**:
-//!    - `movsd` + `unpcklpd`: broadcast A[i][k] scalar
-//!    - `movupd`: load 2 doubles from B[k][j*2]
-//!    - `mulpd`: packed multiply (2 doubles)
-//!    - `addpd`: packed add with C[i][j*2]
-//!    - `movupd`: store 2 results back
+//! ### Two-wide (128-bit): the plain-x86-64 baseline and `LCCC_FORCE_SSE2=1`
+//!
+//! Selected whenever the target has no 256-bit vectors -- which is the default
+//! x86-64 codegen baseline, so this is the shape a plain `-O2` build gets.
+//! One iteration covers four doubles as two 2-lane pairs:
+//!    - broadcast A[i][k]: `movsd` + `unpcklpd`, or `movsd` +
+//!      `vbroadcastsd %xmm1, %ymm1` when the target has 256-bit vectors (its
+//!      low half is the same {A, A} pair the 2-wide consumers read)
+//!    - `movupd` / `mulpd` / `movupd` / `addpd` / `movupd`, twice
+//!
+//! The arithmetic form is chosen by the same contract rule as the 4-wide arm,
+//! not by the width: a fused `vfmadd231pd xmm` pair needs `-mfma` AND
+//! `-ffp-contract=fast`, and everything else gets the separately rounded
+//! `mulpd` + `addpd` (`MulAddF64x2Hoisted`). Width and rounding are
+//! independent: the baseline has no FMA3 at all, so requiring FMA3 to pack
+//! this loop left every matmul stencil scalar on a default build.
 //!
 //! ## Remainder Loops
 //!
@@ -83,6 +93,7 @@ mod generator_map;
 #[path = "vectorize_strict_recip.rs"]
 mod strict_recip;
 
+use super::module_symbol_facts::ModuleSymbolFacts;
 use crate::common::fp_contract::FpContract;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, IrType};
@@ -473,7 +484,15 @@ fn report_simd_disabled(func_name: &str) {
 
 /// Run SSE2 vectorization on a function with precomputed CFG analysis.
 pub(crate) fn vectorize_with_analysis(func: &mut IrFunction, cfg: &CfgAnalysis) -> usize {
-    vectorize_with_analysis_mode(func, cfg, false, false, false, FpContract::default())
+    vectorize_with_analysis_mode(
+        func,
+        cfg,
+        false,
+        false,
+        false,
+        FpContract::default(),
+        &ModuleSymbolFacts::default(),
+    )
 }
 
 /// True when some block of the loop accesses memory through a named address
@@ -500,6 +519,7 @@ fn vectorize_with_analysis_mode(
     neon: bool,
     fp_reassoc: bool,
     fp_contract: crate::common::fp_contract::FpContract,
+    symbol_facts: &ModuleSymbolFacts,
 ) -> usize {
     if super::fp_environment_blocks_reordering(func) {
         return 0;
@@ -630,7 +650,7 @@ fn vectorize_with_analysis_mode(
         let matmul_pattern = if late_minmax_only() {
             None
         } else {
-            analyze_loop_pattern(func, loop_info, cfg)
+            analyze_loop_pattern(func, loop_info, cfg, symbol_facts)
         };
         if let Some(mut pattern) = matmul_pattern {
             // Select vector width: default to AVX2 (4-wide) unless explicitly disabled
@@ -653,11 +673,11 @@ fn vectorize_with_analysis_mode(
                 Operand::Const(c) => c.to_i64().is_some_and(|n| n < 2 * machine_step_width),
                 _ => false,
             };
-            // SEMANTIC + TARGET PRECONDITION.  This arm is an FMA transform --
-            // every packed step it emits is a fused multiply-add (`vfmadd231pd`
-            // / `fmla`), and THAT, not the memory layout, is what changes the
-            // program's numerics.  Two independent switches decide whether the
-            // user asked for fused arithmetic, and the arm honoured neither:
+            // SEMANTIC + TARGET PRECONDITION.  The fused packed step
+            // (`vfmadd231pd` / `fmla`) is what changes the program's numerics,
+            // not the memory layout, so it may only be emitted when the user
+            // asked for contraction AND the target has the unit.  Two
+            // independent switches decide that, and the arm honours both:
             //
             //   * `-ffp-contract=off` says the language's contraction licence is
             //     withdrawn, so `a*b+c` must round twice.  The general
@@ -727,10 +747,19 @@ fn vectorize_with_analysis_mode(
             } else if use_sse2 {
                 if debug {
                     eprintln!(
-                        "[VEC] Matmul pattern matched! Transforming to FmaF64x2 (SSE2, 2-wide)"
+                        "[VEC] Matmul pattern matched! Transforming to {} (SSE2, 2-wide)",
+                        if fma_transform_allowed(neon, fp_contract) {
+                            "FmaF64x2"
+                        } else {
+                            "MulAddF64x2"
+                        }
                     );
                 }
-                total_changes += transform_to_fma_f64x2(func, &mut pattern);
+                total_changes += transform_to_fma_f64x2(
+                    func,
+                    &mut pattern,
+                    fma_transform_allowed(neon, fp_contract),
+                );
             } else {
                 // Use AVX2 by default (or if LCCC_FORCE_AVX2 is set)
                 if debug {
@@ -1065,7 +1094,7 @@ fn vectorize_with_analysis_mode(
             {
                 total_changes += 1;
             }
-            if let Some(map_pattern) = analyze_map_pattern(func, loop_info, neon) {
+            if let Some(map_pattern) = analyze_map_pattern(func, loop_info, neon, symbol_facts) {
                 // AArch64 is always 128-bit; x86 uses 256-bit vectors unless
                 // the focused SSE diagnostic override requests 128-bit code.
                 let avx2 = !neon && !force_two_wide && !map_sse_forced() && x86_avx2_available();
@@ -1088,7 +1117,9 @@ fn vectorize_with_analysis_mode(
                 // OP-05a: generalized non-reduction FP loops (stencils and
                 // multi-load maps with constant tap offsets). AArch64's NEON
                 // intrinsics are not wired for the displacement form yet.
-                if let Some(stencil_pattern) = analyze_stencil_pattern(func, loop_info) {
+                if let Some(stencil_pattern) =
+                    analyze_stencil_pattern(func, loop_info, symbol_facts)
+                {
                     if !neon {
                         let avx2 = !force_two_wide && !map_sse_forced() && x86_avx2_available();
                         if debug {
@@ -1295,6 +1326,7 @@ fn analyze_loop_pattern(
     func: &IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
     _cfg: &CfgAnalysis,
+    symbol_facts: &ModuleSymbolFacts,
 ) -> Option<VectorizablePattern> {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
 
@@ -1549,7 +1581,7 @@ fn analyze_loop_pattern(
                 }
             }
         }
-        if !limit_is_loop_invariant(func, &loop_info.body, &limit, 0) {
+        if !limit_is_loop_invariant(func, &loop_info.body, &limit, 0, symbol_facts) {
             set_reject("matmul loop bound is not proven loop-invariant");
             return None;
         }
@@ -1959,7 +1991,9 @@ fn analyze_loop_pattern(
     let c_root = proven_object_root(func, c_gep)?;
     let b_root = proven_object_root(func, b_gep)?;
     let a_root = proven_object_root(func, a_ptr)?;
-    if !roots_proven_distinct(&c_root, &b_root) || !roots_proven_distinct(&c_root, &a_root) {
+    if !roots_proven_distinct(&c_root, &b_root, symbol_facts)
+        || !roots_proven_distinct(&c_root, &a_root, symbol_facts)
+    {
         if debug {
             eprintln!(
                 "[VEC]   Rejecting matmul: C may alias source (C={:?}, B={:?}, A={:?})",
@@ -6117,11 +6151,17 @@ fn proven_object_root(func: &IrFunction, start: Value) -> Option<ProvenObjectRoo
 }
 
 /// C object identity and restrict rules sufficient for vectorization legality.
-/// Distinct globals/allocas cannot overlap. Parameter pointers are only
-/// disjoint when at least one carries `restrict`; otherwise different SSA
-/// value numbers prove nothing (the old implementation made exactly that
-/// unsound inference and miscompiled shifted in-place maps/matmuls).
-fn roots_proven_distinct(a: &ProvenObjectRoot, b: &ProvenObjectRoot) -> bool {
+/// Distinct allocas cannot overlap; global roots are disjoint when module facts
+/// prove at least one is a stable private definition and neither has an
+/// alias-like redirect. Parameter pointers are only disjoint when at least one
+/// carries `restrict`;
+/// otherwise different SSA value numbers prove nothing (the old implementation
+/// made exactly that unsound inference and miscompiled shifted in-place maps).
+fn roots_proven_distinct(
+    a: &ProvenObjectRoot,
+    b: &ProvenObjectRoot,
+    symbol_facts: &ModuleSymbolFacts,
+) -> bool {
     if a == b {
         return false;
     }
@@ -6161,6 +6201,20 @@ fn roots_proven_distinct(a: &ProvenObjectRoot, b: &ProvenObjectRoot) -> bool {
         | (ProvenObjectRoot::Alloca(_), ProvenObjectRoot::Param { .. }) => true,
         (ProvenObjectRoot::Param { noalias, .. }, _)
         | (_, ProvenObjectRoot::Param { noalias, .. }) => *noalias,
+        // Distinct linker names alone are not object identity: two public
+        // globals may be interposed or coalesced, and GNU aliases/asm labels
+        // can redirect either name. A strong, unredirected internal-linkage
+        // definition is different: its storage is private to this translation
+        // unit and cannot be the storage of a separately named public object.
+        // This matters for loop-invariant bounds loaded from an external global
+        // while the loop stores only to a private array. Opaque top-level asm,
+        // weak/common definitions, and known aliases are removed from
+        // `local_globals`/`aliased_names` before this proof is available.
+        (ProvenObjectRoot::Global(a), ProvenObjectRoot::Global(b)) => {
+            (symbol_facts.local_globals.contains(a) || symbol_facts.local_globals.contains(b))
+                && !symbol_facts.aliased_names.contains(a)
+                && !symbol_facts.aliased_names.contains(b)
+        }
         _ => true,
     }
 }
@@ -6168,7 +6222,7 @@ fn roots_proven_distinct(a: &ProvenObjectRoot, b: &ProvenObjectRoot) -> bool {
 #[cfg(test)]
 mod roots_proven_distinct_tests {
     use super::ProvenObjectRoot::*;
-    use super::roots_proven_distinct;
+    use super::{ModuleSymbolFacts, roots_proven_distinct};
 
     fn param(idx: usize, noalias: bool) -> super::ProvenObjectRoot {
         Param {
@@ -6177,55 +6231,134 @@ mod roots_proven_distinct_tests {
         }
     }
 
+    fn facts(local: &[&str], aliased: &[&str]) -> ModuleSymbolFacts {
+        ModuleSymbolFacts {
+            aliased_names: aliased.iter().map(|name| (*name).to_owned()).collect(),
+            local_globals: local.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    }
+
     #[test]
     fn param_alloca_disjoint_without_restrict() {
+        let facts = ModuleSymbolFacts::default();
         // Fresh-object rule: the alloca postdates the param value, so no
         // aliasing `restrict` is needed to skip runtime versioning.
-        assert!(roots_proven_distinct(&param(0, false), &Alloca(7)));
-        assert!(roots_proven_distinct(&Alloca(7), &param(0, false)));
+        assert!(roots_proven_distinct(&param(0, false), &Alloca(7), &facts));
+        assert!(roots_proven_distinct(&Alloca(7), &param(0, false), &facts));
     }
 
     #[test]
     fn param_global_still_needs_noalias() {
+        let facts = ModuleSymbolFacts::default();
         // A caller may legally pass `&global+k` for a plain `T *p`.
         assert!(!roots_proven_distinct(
             &param(0, false),
-            &Global("g".into())
+            &Global("g".into()),
+            &facts,
         ));
         assert!(!roots_proven_distinct(
             &Global("g".into()),
-            &param(0, false)
+            &param(0, false),
+            &facts,
         ));
-        assert!(roots_proven_distinct(&param(0, true), &Global("g".into())));
+        assert!(roots_proven_distinct(
+            &param(0, true),
+            &Global("g".into()),
+            &facts,
+        ));
     }
 
     #[test]
     fn param_param_needs_restrict() {
+        let facts = ModuleSymbolFacts::default();
         // Distinct SSA values prove nothing (the old unsound inference
         // miscompiled shifted in-place maps).
-        assert!(!roots_proven_distinct(&param(0, false), &param(1, false)));
-        assert!(roots_proven_distinct(&param(0, true), &param(1, false)));
-        assert!(roots_proven_distinct(&param(0, false), &param(1, true)));
+        assert!(!roots_proven_distinct(
+            &param(0, false),
+            &param(1, false),
+            &facts
+        ));
+        assert!(roots_proven_distinct(
+            &param(0, true),
+            &param(1, false),
+            &facts
+        ));
+        assert!(roots_proven_distinct(
+            &param(0, false),
+            &param(1, true),
+            &facts
+        ));
     }
 
     #[test]
     fn same_root_never_distinct() {
-        assert!(!roots_proven_distinct(&Alloca(3), &Alloca(3)));
-        assert!(!roots_proven_distinct(&param(0, true), &param(0, true)));
+        let facts = facts(&["g"], &[]);
+        assert!(!roots_proven_distinct(&Alloca(3), &Alloca(3), &facts));
+        assert!(!roots_proven_distinct(
+            &param(0, true),
+            &param(0, true),
+            &facts
+        ));
         assert!(!roots_proven_distinct(
             &Global("g".into()),
-            &Global("g".into())
+            &Global("g".into()),
+            &facts,
         ));
     }
 
     #[test]
-    fn static_pairs_stay_distinct() {
-        assert!(roots_proven_distinct(&Alloca(1), &Alloca(2)));
+    fn private_global_disambiguates_a_distinct_public_name() {
+        let trusted = facts(&["a", "b"], &[]);
         assert!(roots_proven_distinct(
             &Global("a".into()),
-            &Global("b".into())
+            &Global("b".into()),
+            &trusted,
         ));
-        assert!(roots_proven_distinct(&Global("a".into()), &Alloca(1)));
+        assert!(roots_proven_distinct(
+            &Global("a".into()),
+            &Alloca(1),
+            &ModuleSymbolFacts::default(),
+        ));
+
+        // A public bound may be loaded inside a loop that stores only to a
+        // private array. The private definition cannot be the public symbol's
+        // storage, so this is an exact loop-invariance proof.
+        let private_array = facts(&["a"], &[]);
+        assert!(roots_proven_distinct(
+            &Global("a".into()),
+            &Global("external_limit".into()),
+            &private_array,
+        ));
+        assert!(roots_proven_distinct(
+            &Global("external_limit".into()),
+            &Global("a".into()),
+            &private_array,
+        ));
+
+        // Two public names remain conservative: a linker alias or interposition
+        // may make them refer to the same storage.
+        assert!(!roots_proven_distinct(
+            &Global("external_a".into()),
+            &Global("external_b".into()),
+            &ModuleSymbolFacts::default(),
+        ));
+
+        let aliased = facts(&["a", "alias_a", "b"], &["a", "alias_a"]);
+        assert!(!roots_proven_distinct(
+            &Global("a".into()),
+            &Global("b".into()),
+            &aliased,
+        ));
+        assert!(!roots_proven_distinct(
+            &Global("alias_a".into()),
+            &Global("b".into()),
+            &aliased,
+        ));
+        assert!(!roots_proven_distinct(
+            &Global("a".into()),
+            &Global("external".into()),
+            &ModuleSymbolFacts::default(),
+        ));
     }
 }
 
@@ -8406,6 +8539,7 @@ fn analyze_map_pattern(
     func: &IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
     neon: bool,
+    symbol_facts: &ModuleSymbolFacts,
 ) -> Option<MapPattern> {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let header_idx = loop_info.header;
@@ -8972,7 +9106,7 @@ fn analyze_map_pattern(
         }
         let src_root = proven_object_root(func, src_gep);
         let distinct = matches!((&dst_root, &src_root),
-            (Some(d), Some(s)) if roots_proven_distinct(d, s));
+            (Some(d), Some(s)) if roots_proven_distinct(d, s, symbol_facts));
         if !distinct {
             if debug {
                 eprintln!(
@@ -15971,6 +16105,7 @@ fn affine_operand(
 fn analyze_stencil_pattern(
     func: &IrFunction,
     loop_info: &loop_analysis::NaturalLoop,
+    symbol_facts: &ModuleSymbolFacts,
 ) -> Option<StencilPattern> {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let header_idx = loop_info.header;
@@ -16330,7 +16465,7 @@ fn analyze_stencil_pattern(
         let dst_root = proven_object_root(func, dst_base);
         let src_root = proven_object_root(func, src_base);
         !matches!((&dst_root, &src_root),
-            (Some(d), Some(s)) if roots_proven_distinct(d, s))
+            (Some(d), Some(s)) if roots_proven_distinct(d, s, symbol_facts))
     };
 
     // Constant trip counts of 4 or fewer are better left scalar (mirrors
@@ -21254,35 +21389,59 @@ fn insert_remainder_loop(
         }
     }
 
-    let rem_start_inst = match vec_width {
-        2 => Instruction::BinOp {
+    let rem_start_insts = match vec_width {
+        2 => vec![Instruction::BinOp {
             dest: j_rem_start,
             op: IrBinOp::Mul,
             lhs: Operand::Value(pattern.iv), // Final element index
             rhs: Operand::Const(idx_const(iv_ty, 2)),
             ty: iv_ty,
-        },
-        4 => Instruction::BinOp {
+        }],
+        4 => vec![Instruction::BinOp {
             dest: j_rem_start,
             op: IrBinOp::Mul,
             lhs: Operand::Value(pattern.iv), // Final 4-element group index
             rhs: Operand::Const(idx_const(iv_ty, 4)),
             ty: iv_ty,
-        },
-        _ => Instruction::BinOp {
+        }],
+        _ if iv_ty == IrType::I32 => {
+            // The AVX2 transform promotes an I32 source IV to I64 because it
+            // now counts byte offsets. Shift in that widened domain first;
+            // shifting the low 32 bits silently wrapped the scalar-remainder
+            // start once the packed prefix crossed 2^32 bytes. The resulting
+            // element index is <= the original I32 bound and fits I32.
+            let wide_start = Value(*next_val_id);
+            *next_val_id += 1;
+            vec![
+                Instruction::BinOp {
+                    dest: wide_start,
+                    op: IrBinOp::LShr,
+                    lhs: Operand::Value(pattern.iv), // Final I64 byte offset
+                    rhs: Operand::Const(IrConst::I64(3)), // log2(sizeof(double))
+                    ty: IrType::I64,
+                },
+                Instruction::Cast {
+                    dest: j_rem_start,
+                    src: Operand::Value(wide_start),
+                    from_ty: IrType::I64,
+                    to_ty: IrType::I32,
+                },
+            ]
+        }
+        _ => vec![Instruction::BinOp {
             dest: j_rem_start,
             op: IrBinOp::LShr,
             lhs: Operand::Value(pattern.iv), // Final non-negative byte offset
             rhs: Operand::Const(idx_const(iv_ty, 3)), // log2(sizeof(double))
             ty: iv_ty,
-        },
+        }],
     };
 
     let vec_exit_block = BasicBlock {
         label: vec_exit_label,
         instructions: {
             let mut insts = vec_exit_prefix;
-            insts.push(rem_start_inst);
+            insts.extend(rem_start_insts);
             insts
         },
         terminator: Terminator::Branch(remainder_header_label),
@@ -21440,8 +21599,20 @@ fn insert_remainder_loop(
     4 // 4 new blocks added
 }
 
-/// Transform the loop to use FmaF64x2 intrinsics.
-fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &mut VectorizablePattern) -> usize {
+/// Transform the loop to use the 2-wide (XMM) grouped matmul intrinsics.
+///
+/// `fused` decides which intrinsic the body gets and is the caller's
+/// resolved contract/target answer, never re-derived here:
+/// `FmaF64x2Hoisted` (one `vfmadd231pd`/`fmla` per group) or
+/// `MulAddF64x2Hoisted` (separately rounded `mulpd` + `addpd`, no FMA3
+/// required).  Everything else — bound normalization, the remainder loop, the
+/// hoisted broadcast, the group step of four doubles — is identical, which is
+/// why this is a parameter and not a second transform.
+fn transform_to_fma_f64x2(
+    func: &mut IrFunction,
+    pattern: &mut VectorizablePattern,
+    fused: bool,
+) -> usize {
     let debug = std::env::var("LCCC_DEBUG_VECTORIZE").is_ok();
     let mut changes = 0;
 
@@ -21647,9 +21818,13 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &mut VectorizablePatte
                     _ => IrType::I64,
                 };
 
+                // `normalize_iv_exit_comparison` admits only signed ascending
+                // counted loops. Preserve truncation-toward-zero for a negative
+                // dynamic bound: UDiv turns `n < 0` into a huge trip count and
+                // the packed body touches memory even though `i < n` is false.
                 let div_inst = Instruction::BinOp {
                     dest: div_dest,
-                    op: IrBinOp::UDiv,
+                    op: IrBinOp::SDiv,
                     lhs: Operand::Value(*limit_val),
                     rhs: Operand::Const(match limit_ty {
                         IrType::I32 => IrConst::I32(4),
@@ -22022,10 +22197,16 @@ fn transform_to_fma_f64x2(func: &mut IrFunction, pattern: &mut VectorizablePatte
     {
         let body = &mut func.blocks[pattern.body_idx];
 
-        // Create FmaF64x2 intrinsic: writes directly to memory, no dest value.
+        // Create the grouped accumulate intrinsic: writes directly to memory,
+        // no dest value. `fused` is the contract/target answer, not a guess:
+        // the unfused form keeps both roundings and needs no FMA3 unit.
         let intrinsic = Instruction::Intrinsic {
             dest: None,
-            op: IntrinsicOp::FmaF64x2Hoisted,
+            op: if fused {
+                IntrinsicOp::FmaF64x2Hoisted
+            } else {
+                IntrinsicOp::MulAddF64x2Hoisted
+            },
             dest_ptr: Some(pattern.c_gep),
             args: vec![Operand::Value(pattern.b_gep)],
         };
@@ -22412,6 +22593,7 @@ fn limit_is_loop_invariant(
     loop_blocks: &FxHashSet<usize>,
     limit: &Operand,
     depth: usize,
+    symbol_facts: &ModuleSymbolFacts,
 ) -> bool {
     // Bounded recursion: a value graph deeper than this is not a bound we can
     // describe, and "cannot describe" must mean "not vectorized".
@@ -22437,21 +22619,26 @@ fn limit_is_loop_invariant(
         Instruction::Phi { .. } => false,
         // A pure computation of invariant inputs is invariant.
         Instruction::Cast { src, .. } | Instruction::Copy { src, .. } => {
-            limit_is_loop_invariant(func, loop_blocks, src, depth + 1)
+            limit_is_loop_invariant(func, loop_blocks, src, depth + 1, symbol_facts)
         }
         Instruction::UnaryOp { src, .. } => {
-            limit_is_loop_invariant(func, loop_blocks, src, depth + 1)
+            limit_is_loop_invariant(func, loop_blocks, src, depth + 1, symbol_facts)
         }
         Instruction::BinOp { lhs, rhs, .. } | Instruction::Cmp { lhs, rhs, .. } => {
-            limit_is_loop_invariant(func, loop_blocks, lhs, depth + 1)
-                && limit_is_loop_invariant(func, loop_blocks, rhs, depth + 1)
+            limit_is_loop_invariant(func, loop_blocks, lhs, depth + 1, symbol_facts)
+                && limit_is_loop_invariant(func, loop_blocks, rhs, depth + 1, symbol_facts)
         }
         Instruction::GetElementPtr { base, offset, .. } => {
             // Address arithmetic moves no memory, so invariance is about the
             // pointee: recurse into the base (a Phi base is loop-carried and
             // refused above) and require the offset to be invariant too.
-            limit_is_loop_invariant(func, loop_blocks, &Operand::Value(*base), depth + 1)
-                && limit_is_loop_invariant(func, loop_blocks, offset, depth + 1)
+            limit_is_loop_invariant(
+                func,
+                loop_blocks,
+                &Operand::Value(*base),
+                depth + 1,
+                symbol_facts,
+            ) && limit_is_loop_invariant(func, loop_blocks, offset, depth + 1, symbol_facts)
         }
         // A load is invariant iff nothing in the loop stores to it.
         Instruction::Load {
@@ -22471,7 +22658,7 @@ fn limit_is_loop_invariant(
                         let Some(store_root) = proven_object_root(func, *store_ptr) else {
                             return false;
                         };
-                        if !roots_proven_distinct(&load_root, &store_root) {
+                        if !roots_proven_distinct(&load_root, &store_root, symbol_facts) {
                             return false;
                         }
                     }
@@ -22505,6 +22692,193 @@ fn fma_body_instruction_is_legal(inst: &Instruction) -> bool {
         // A new IR instruction that IS per-element safe has to be added here
         // deliberately, with the argument for why.
         _ => false,
+    }
+}
+
+/// Largest element count whose byte offset fits in the signed I64 IV used by
+/// the AVX2 FMA loop. Larger source bounds are still handled by the scalar
+/// remainder after this vector prefix.
+const MATMUL_F64X4_MAX_SIGNED_ELEMENTS: i64 = i64::MAX / 8;
+const MATMUL_F64X4_GROUP_ELEMENTS: i64 = 16;
+const MATMUL_F64X4_GROUP_BYTES: i64 = 128;
+
+/// Compute a representable byte limit for the packed prefix of a signed loop.
+/// Negative and zero bounds are zero-trip; clamp them BEFORE grouping because
+/// even signed division followed by a narrow multiply can wrap a large
+/// negative bound back into a positive byte limit.
+fn matmul_f64x4_byte_limit_for_bound(limit: i64) -> i64 {
+    let positive = limit.clamp(0, MATMUL_F64X4_MAX_SIGNED_ELEMENTS);
+    (positive / MATMUL_F64X4_GROUP_ELEMENTS) * MATMUL_F64X4_GROUP_BYTES
+}
+
+/// Build the AVX2 FMA loop's byte bound in I64, inserting dynamic arithmetic
+/// before the loop comparison. The source loop's exit comparison is signed;
+/// first clamp its trip count to [0, max_signed_elements], then use unsigned
+/// division (equivalent on this proven-nonnegative value) and widen the
+/// multiplication. This prevents negative bounds from becoming enormous
+/// unsigned counts and prevents I32 byte-limit overflow for large positive
+/// bounds. Any tail past the largest representable byte offset remains for the
+/// original-width scalar remainder.
+fn matmul_f64x4_byte_limit_operand(
+    func: &mut IrFunction,
+    pattern: &VectorizablePattern,
+    next_val_id: &mut u32,
+    debug: bool,
+) -> Option<Operand> {
+    match &pattern.limit {
+        Operand::Const(IrConst::I32(limit)) => Some(Operand::Const(IrConst::I64(
+            matmul_f64x4_byte_limit_for_bound(i64::from(*limit)),
+        ))),
+        Operand::Const(IrConst::I64(limit)) => Some(Operand::Const(IrConst::I64(
+            matmul_f64x4_byte_limit_for_bound(*limit),
+        ))),
+        Operand::Value(limit) => {
+            let limit_ty = match func
+                .blocks
+                .get(pattern.header_idx)?
+                .instructions
+                .get(pattern.exit_cmp_inst_idx)?
+            {
+                Instruction::Cmp { ty, .. } => *ty,
+                _ => return None,
+            };
+            if !matches!(limit_ty, IrType::I32 | IrType::I64) {
+                return None;
+            }
+
+            let mut emitted = Vec::with_capacity(7);
+            let wide_limit = if limit_ty == IrType::I32 {
+                let widened = Value(*next_val_id);
+                *next_val_id += 1;
+                emitted.push(Instruction::Cast {
+                    dest: widened,
+                    src: Operand::Value(*limit),
+                    from_ty: IrType::I32,
+                    to_ty: IrType::I64,
+                });
+                widened
+            } else {
+                *limit
+            };
+
+            let positive_cond = Value(*next_val_id);
+            *next_val_id += 1;
+            emitted.push(Instruction::Cmp {
+                dest: positive_cond,
+                op: IrCmpOp::Sgt,
+                lhs: Operand::Value(wide_limit),
+                rhs: Operand::Const(IrConst::I64(0)),
+                ty: IrType::I64,
+            });
+            let nonnegative_limit = Value(*next_val_id);
+            *next_val_id += 1;
+            emitted.push(Instruction::Select {
+                dest: nonnegative_limit,
+                cond: Operand::Value(positive_cond),
+                true_val: Operand::Value(wide_limit),
+                false_val: Operand::Const(IrConst::I64(0)),
+                ty: IrType::I64,
+            });
+
+            let safe_limit = if limit_ty == IrType::I64 {
+                // A positive I64 element count can exceed the byte-offset
+                // domain. Saturating here keeps the packed prefix representable;
+                // the remainder retains the original full-width source bound.
+                let too_large_cond = Value(*next_val_id);
+                *next_val_id += 1;
+                emitted.push(Instruction::Cmp {
+                    dest: too_large_cond,
+                    op: IrCmpOp::Sgt,
+                    lhs: Operand::Value(nonnegative_limit),
+                    rhs: Operand::Const(IrConst::I64(MATMUL_F64X4_MAX_SIGNED_ELEMENTS)),
+                    ty: IrType::I64,
+                });
+                let capped_limit = Value(*next_val_id);
+                *next_val_id += 1;
+                emitted.push(Instruction::Select {
+                    dest: capped_limit,
+                    cond: Operand::Value(too_large_cond),
+                    true_val: Operand::Const(IrConst::I64(MATMUL_F64X4_MAX_SIGNED_ELEMENTS)),
+                    false_val: Operand::Value(nonnegative_limit),
+                    ty: IrType::I64,
+                });
+                capped_limit
+            } else {
+                nonnegative_limit
+            };
+
+            let groups = Value(*next_val_id);
+            *next_val_id += 1;
+            emitted.push(Instruction::BinOp {
+                dest: groups,
+                op: IrBinOp::UDiv,
+                lhs: Operand::Value(safe_limit),
+                rhs: Operand::Const(IrConst::I64(MATMUL_F64X4_GROUP_ELEMENTS)),
+                ty: IrType::I64,
+            });
+            let byte_limit = Value(*next_val_id);
+            *next_val_id += 1;
+            emitted.push(Instruction::BinOp {
+                dest: byte_limit,
+                op: IrBinOp::Mul,
+                lhs: Operand::Value(groups),
+                rhs: Operand::Const(IrConst::I64(MATMUL_F64X4_GROUP_BYTES)),
+                ty: IrType::I64,
+            });
+
+            let insertion = pattern.exit_cmp_inst_idx;
+            let block = func.blocks.get_mut(pattern.header_idx)?;
+            if insertion > block.instructions.len() {
+                return None;
+            }
+            for (offset, instruction) in emitted.into_iter().enumerate() {
+                block.instructions.insert(insertion + offset, instruction);
+            }
+            if debug {
+                eprintln!(
+                    "[VEC]   Inserted clamped I64 byte limit: Value({})",
+                    byte_limit.0
+                );
+            }
+            Some(Operand::Value(byte_limit))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod matmul_f64x4_bound_tests {
+    use super::{MATMUL_F64X4_MAX_SIGNED_ELEMENTS, matmul_f64x4_byte_limit_for_bound};
+
+    #[test]
+    fn signed_negative_and_zero_bounds_have_no_packed_prefix() {
+        for bound in [i64::MIN, -(1_i64 << 60) - 1, -(1_i64 << 28) - 1, -17, -1, 0] {
+            assert_eq!(matmul_f64x4_byte_limit_for_bound(bound), 0, "bound={bound}");
+        }
+    }
+
+    #[test]
+    fn packed_prefix_rounds_down_and_scales_in_i64() {
+        assert_eq!(matmul_f64x4_byte_limit_for_bound(15), 0);
+        assert_eq!(matmul_f64x4_byte_limit_for_bound(16), 128);
+        assert_eq!(matmul_f64x4_byte_limit_for_bound(31), 128);
+        assert_eq!(matmul_f64x4_byte_limit_for_bound(32), 256);
+        // I32 byte scaling used to wrap at this threshold.
+        assert_eq!(matmul_f64x4_byte_limit_for_bound(1_i64 << 28), 1_i64 << 31);
+    }
+
+    #[test]
+    fn wide_bounds_saturate_before_byte_offset_overflow() {
+        let limit = matmul_f64x4_byte_limit_for_bound(i64::MAX);
+        assert_eq!(limit, i64::MAX - 127);
+        assert_eq!(
+            matmul_f64x4_byte_limit_for_bound(MATMUL_F64X4_MAX_SIGNED_ELEMENTS),
+            limit
+        );
+        assert_eq!(
+            matmul_f64x4_byte_limit_for_bound(i64::MAX),
+            matmul_f64x4_byte_limit_for_bound(i64::MAX - 1)
+        );
     }
 }
 
@@ -22711,78 +23085,22 @@ fn transform_to_fma_f64x4(
     //   - IV increment: +1 → +32 (bytes per AVX2 iteration = 4 doubles × 8 bytes)
     //   - GEP offset multiply: eliminated (IV IS the byte offset)
     {
-        // First, create the byte limit. The vector loop steps by 32 bytes
-        // (4 doubles) per iteration, so it must run exactly floor(N/4)
-        // iterations: byte_limit = (N/16)*128 = (N & ~3)*8. Using N*8 here
-        // instead runs ceil(N/4) iterations — the final iteration reads and
-        // writes up to 3 doubles past the end of the array (OOB), and the
-        // scalar remainder loop then never fires, silently skipping the tail
-        // (reproducer: N=255 matmul clobbered element 255 and skipped
-        // elements 252..254, producing a wrong sum).
-        let byte_limit = match &pattern.limit {
-            Operand::Const(IrConst::I32(n)) => Operand::Const(IrConst::I32((*n / 16) * 128)),
-            Operand::Const(IrConst::I64(n)) => Operand::Const(IrConst::I64((*n / 16) * 128)),
-            Operand::Value(limit_val) => {
-                // Dynamic limit: byte_limit = (N/16)*128, hoisted into the header.
-                let limit_ty = match &func.blocks[pattern.header_idx].instructions
-                    [pattern.exit_cmp_inst_idx]
-                {
-                    Instruction::Cmp { ty, .. } => *ty,
-                    _ => IrType::I64,
-                };
-
-                // N / 16 (quad FMA width)
-                let div_dest = Value(next_val_id);
-                next_val_id += 1;
-                let div_inst = Instruction::BinOp {
-                    dest: div_dest,
-                    op: IrBinOp::UDiv,
-                    lhs: Operand::Value(*limit_val),
-                    rhs: Operand::Const(match limit_ty {
-                        IrType::I32 => IrConst::I32(16),
-                        IrType::I64 => IrConst::I64(16),
-                        _ => IrConst::I64(16),
-                    }),
-                    ty: limit_ty,
-                };
-                func.blocks[pattern.header_idx]
-                    .instructions
-                    .insert(pattern.exit_cmp_inst_idx, div_inst);
-
-                // (N/16) * 128
-                let mul_dest = Value(next_val_id);
-                next_val_id += 1;
-                let mul_inst = Instruction::BinOp {
-                    dest: mul_dest,
-                    op: IrBinOp::Mul,
-                    lhs: Operand::Value(div_dest),
-                    rhs: Operand::Const(match limit_ty {
-                        IrType::I32 => IrConst::I32(128),
-                        IrType::I64 => IrConst::I64(128),
-                        _ => IrConst::I64(128),
-                    }),
-                    ty: limit_ty,
-                };
-                func.blocks[pattern.header_idx]
-                    .instructions
-                    .insert(pattern.exit_cmp_inst_idx + 1, mul_inst);
-
-                if debug {
-                    eprintln!(
-                        "[VEC]   Inserted (N/16)*128 dynamic byte limit: Value({})",
-                        mul_dest.0
-                    );
+        // The packed loop steps through 16 doubles per 128-byte group, so
+        // byte_limit = floor(max(N, 0) / 16) * 128. The bound is widened to
+        // I64 before scaling: computing the byte count in an I32 wraps for
+        // large positive limits, while dividing an unclamped negative limit
+        // as unsigned can create an enormous packed trip count. The original
+        // signed limit remains intact for the scalar remainder.
+        let byte_limit =
+            match matmul_f64x4_byte_limit_operand(func, pattern, &mut next_val_id, debug) {
+                Some(limit) => limit,
+                None => {
+                    if debug {
+                        eprintln!("[VEC]   Unsupported signed matmul limit type");
+                    }
+                    return 0;
                 }
-
-                Operand::Value(mul_dest)
-            }
-            _ => {
-                if debug {
-                    eprintln!("[VEC]   Unsupported limit type");
-                }
-                return 0;
-            }
-        };
+            };
 
         // Modify the exit comparison in the header block only (not outer loop comparisons)
         for block_idx in [pattern.header_idx] {
@@ -31910,7 +32228,77 @@ fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
 
 /// Run x86 vectorization under strict floating-point semantics.
 pub(crate) fn vectorize_function(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, false, FpContract::default(), false)
+    vectorize_function_mode(
+        func,
+        &ModuleSymbolFacts::default(),
+        false,
+        FpContract::default(),
+        false,
+    )
+}
+
+/// Pipeline-selected vectorizer policy. Storing policy as data lets the pass
+/// pipeline supply sound module-level alias facts without thread-local state.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum VectorizeEntryMode {
+    Main {
+        fp_reassoc: bool,
+        fp_contract: FpContract,
+        enable_fixed_slp: bool,
+    },
+    TwoWide {
+        fast_math: bool,
+    },
+}
+
+/// Run the selected vectorizer policy with module-level object-identity facts.
+pub(crate) fn vectorize_function_with_symbol_facts(
+    func: &mut IrFunction,
+    symbol_facts: &ModuleSymbolFacts,
+    mode: VectorizeEntryMode,
+) -> usize {
+    match mode {
+        VectorizeEntryMode::Main {
+            fp_reassoc,
+            fp_contract,
+            enable_fixed_slp,
+        } => vectorize_function_mode(
+            func,
+            symbol_facts,
+            fp_reassoc,
+            fp_contract,
+            enable_fixed_slp,
+        ),
+        VectorizeEntryMode::TwoWide { fast_math } => {
+            let cfg = CfgAnalysis::build(func);
+            vectorize_with_analysis_mode(
+                func,
+                &cfg,
+                true,
+                true,
+                fast_math,
+                FpContract::default(),
+                symbol_facts,
+            )
+        }
+    }
+}
+
+/// The x86 late rerun (post-if_convert) uses the strict-FP AVX-shaped policy.
+pub(crate) fn vectorize_function_late_with_symbol_facts(
+    func: &mut IrFunction,
+    symbol_facts: &ModuleSymbolFacts,
+) -> usize {
+    let cfg = CfgAnalysis::build(func);
+    vectorize_with_analysis_mode(
+        func,
+        &cfg,
+        false,
+        false,
+        false,
+        FpContract::default(),
+        symbol_facts,
+    )
 }
 
 /// Pre-unroll CONST-TRIP map vectorization.
@@ -31927,6 +32315,7 @@ pub(crate) fn vectorize_const_trip_map_loops(
     func: &mut IrFunction,
     fp_contract: FpContract,
     no_map_vec: bool,
+    symbol_facts: &ModuleSymbolFacts,
 ) -> usize {
     if super::fp_environment_blocks_reordering(func) {
         return 0;
@@ -31986,7 +32375,7 @@ pub(crate) fn vectorize_const_trip_map_loops(
             if lp.body.len() > 4 {
                 continue; // the unroller's tiny/general 2-3-block window
             }
-            let Some(pattern) = analyze_map_pattern(func, lp, false) else {
+            let Some(pattern) = analyze_map_pattern(func, lp, false, symbol_facts) else {
                 continue;
             };
             if !matches!(&pattern.limit, Operand::Const(c)
@@ -32027,32 +32416,63 @@ pub(crate) fn vectorize_const_trip_map_loops(
 /// distinction GCC makes (`-ffp-contract=fast` alone contracts loops;
 /// reduction reassociation needs `-fassociative-math`).
 pub(crate) fn vectorize_function_contract(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, false, FpContract::Fast, false)
+    vectorize_function_mode(
+        func,
+        &ModuleSymbolFacts::default(),
+        false,
+        FpContract::Fast,
+        false,
+    )
 }
 
 /// Run x86 vectorization with reassociation but without FMA contraction.
 pub(crate) fn vectorize_function_reassoc(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, true, FpContract::default(), true)
+    vectorize_function_mode(
+        func,
+        &ModuleSymbolFacts::default(),
+        true,
+        FpContract::default(),
+        true,
+    )
 }
 
 /// Preserve the established loop-vectorization policy while withholding the
 /// fixed-width 256-bit SLP fold when the requested ISA has no AVX.
 pub(crate) fn vectorize_function_reassoc_without_fixed_slp(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, true, FpContract::default(), false)
+    vectorize_function_mode(
+        func,
+        &ModuleSymbolFacts::default(),
+        true,
+        FpContract::default(),
+        false,
+    )
 }
 
 /// Run x86 vectorization with explicit reassociation and fast contraction.
 pub(crate) fn vectorize_function_fast_math(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, true, FpContract::Fast, true)
+    vectorize_function_mode(
+        func,
+        &ModuleSymbolFacts::default(),
+        true,
+        FpContract::Fast,
+        true,
+    )
 }
 
 /// Fast-math counterpart used for baseline x86-64 targets without AVX.
 pub(crate) fn vectorize_function_fast_math_without_fixed_slp(func: &mut IrFunction) -> usize {
-    vectorize_function_mode(func, true, FpContract::Fast, false)
+    vectorize_function_mode(
+        func,
+        &ModuleSymbolFacts::default(),
+        true,
+        FpContract::Fast,
+        false,
+    )
 }
 
 fn vectorize_function_mode(
     func: &mut IrFunction,
+    symbol_facts: &ModuleSymbolFacts,
     fp_reassoc: bool,
     fp_contract: FpContract,
     enable_fixed_slp: bool,
@@ -32140,8 +32560,15 @@ fn vectorize_function_mode(
     };
 
     let cfg = CfgAnalysis::build(func);
-    let loop_changes =
-        vectorize_with_analysis_mode(func, &cfg, false, false, fp_reassoc, fp_contract);
+    let loop_changes = vectorize_with_analysis_mode(
+        func,
+        &cfg,
+        false,
+        false,
+        fp_reassoc,
+        fp_contract,
+        symbol_facts,
+    );
     let changes = preconv + slp_changes + gen_changes + loop_changes;
 
     // The transforms replace the scalar accumulation with vector intrinsics but
@@ -32259,7 +32686,15 @@ fn func_has_volatile_loop_access(func: &IrFunction) -> bool {
 /// may be emitted; other backends reject those intrinsics.
 pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
-    vectorize_with_analysis_mode(func, &cfg, true, true, false, FpContract::default())
+    vectorize_with_analysis_mode(
+        func,
+        &cfg,
+        true,
+        true,
+        false,
+        FpContract::default(),
+        &ModuleSymbolFacts::default(),
+    )
 }
 
 /// x86 late rerun (post-if_convert): catches Select-shaped conditional
@@ -32267,12 +32702,28 @@ pub(crate) fn vectorize_function_two_wide(func: &mut IrFunction) -> usize {
 /// contract (integer reductions need no contract).
 pub(crate) fn vectorize_function_late(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
-    vectorize_with_analysis_mode(func, &cfg, false, false, false, FpContract::default())
+    vectorize_with_analysis_mode(
+        func,
+        &cfg,
+        false,
+        false,
+        false,
+        FpContract::default(),
+        &ModuleSymbolFacts::default(),
+    )
 }
 
 pub(crate) fn vectorize_function_two_wide_fast_math(func: &mut IrFunction) -> usize {
     let cfg = CfgAnalysis::build(func);
-    vectorize_with_analysis_mode(func, &cfg, true, true, true, FpContract::default())
+    vectorize_with_analysis_mode(
+        func,
+        &cfg,
+        true,
+        true,
+        true,
+        FpContract::default(),
+        &ModuleSymbolFacts::default(),
+    )
 }
 
 #[cfg(test)]
@@ -32999,12 +33450,13 @@ mod map_fp_select_tests {
             loop_analysis::find_natural_loops(func.blocks.len(), &cfg.preds, &cfg.succs, &cfg.idom);
         let loop_info = &loops[0];
         take_reject();
-        let pattern = analyze_map_pattern(func, loop_info, false).unwrap_or_else(|| {
-            panic!(
-                "canonical select loop must parse: {}",
-                take_reject().unwrap_or("no rejection reason recorded")
-            )
-        });
+        let pattern = analyze_map_pattern(func, loop_info, false, &ModuleSymbolFacts::default())
+            .unwrap_or_else(|| {
+                panic!(
+                    "canonical select loop must parse: {}",
+                    take_reject().unwrap_or("no rejection reason recorded")
+                )
+            });
         pattern.expr
     }
 

@@ -189,11 +189,10 @@ pub(super) fn steal_hot_loop_webs(
             if !config.available_regs.iter().any(|r| r.0 == reg_id) {
                 continue;
             }
-            if holders.iter().any(|h| {
-                phi_pair_values.contains(h)
-                    || config.reg_hints.contains_key(h)
-                    || allocation_owner_bounds(*h, merged_of, iv_map).is_none()
-            }) {
+            if holders
+                .iter()
+                .any(|h| allocation_owner_bounds(*h, merged_of, iv_map).is_none())
+            {
                 continue;
             }
             let evict: Vec<u32> = holders
@@ -202,6 +201,21 @@ pub(super) fn steal_hot_loop_webs(
                 .filter(|&h| overlaps_vid(h, vid))
                 .collect();
             if evict.is_empty() {
+                continue;
+            }
+            // Protect the exact mutation, not every past/future occupant of
+            // this register. A disjoint loop/ABI holder stays assigned. But
+            // evict_group removes whole copy webs, so a protected disjoint
+            // member of an overlapping victim must still veto the eviction.
+            if evict.iter().any(|v| {
+                let owner = coalesce_member_of.get(v).copied().unwrap_or(*v);
+                let solo = [*v];
+                coalesce_groups
+                    .get(&owner)
+                    .map_or(solo.as_slice(), Vec::as_slice)
+                    .iter()
+                    .any(|h| phi_pair_values.contains(h) || config.reg_hints.contains_key(h))
+            }) {
                 continue;
             }
             // evict_group removes WHOLE copy webs, including members
@@ -392,6 +406,45 @@ mod tests {
         f.candidate(10, (20, 80), 40);
         assert_eq!(f.run(), 0);
         assert_eq!(f.assignments.get(&1), Some(&PhysReg(1)));
+    }
+
+    #[test]
+    fn disjoint_protected_holder_does_not_block_an_unrelated_eviction() {
+        for abi_hint in [false, true] {
+            let mut f = Fixture::new();
+            f.holder(1, 1, (0, 10), 100);
+            f.holder(2, 1, (20, 80), 1);
+            if abi_hint {
+                f.config.reg_hints.insert(1, PhysReg(1));
+            } else {
+                f.loop_carried.insert(1);
+            }
+            f.candidate(10, (20, 80), 40);
+            assert_eq!(f.run(), 1);
+            assert_eq!(f.assignments.get(&1), Some(&PhysReg(1)));
+            assert_eq!(f.assignments.get(&10), Some(&PhysReg(1)));
+            assert!(!f.assignments.contains_key(&2));
+        }
+    }
+
+    #[test]
+    fn protected_disjoint_copy_member_vetoes_whole_web_eviction() {
+        for abi_hint in [false, true] {
+            let mut f = Fixture::new();
+            f.holder(1, 1, (0, 10), 1);
+            f.holder(2, 1, (20, 80), 1);
+            f.groups.insert(1, vec![1, 2]);
+            f.members.insert(2, 1);
+            if abi_hint {
+                f.config.reg_hints.insert(1, PhysReg(1));
+            } else {
+                f.loop_carried.insert(1);
+            }
+            f.candidate(10, (20, 80), 40);
+            assert_eq!(f.run(), 0);
+            assert_eq!(f.assignments.get(&1), Some(&PhysReg(1)));
+            assert_eq!(f.assignments.get(&2), Some(&PhysReg(1)));
+        }
     }
 
     #[test]

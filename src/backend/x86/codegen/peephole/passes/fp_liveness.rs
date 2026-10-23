@@ -239,6 +239,24 @@ impl FpLiveness {
         f.live_out[idx - f.start] & (low | upper_regions(low)) == 0
     }
 
+    /// An XMM-width VEX load into `%xmm<n>` also zeros the architectural
+    /// YMM/ZMM upper regions. When forwarding a same-register 16-byte load,
+    /// the low 128 bits already have the same value, but that upper-zeroing
+    /// side effect is observable if either upper region is live. This query
+    /// deliberately ignores low-XMM liveness and fails closed on unknown
+    /// control flow, so callers can remove the load only when its *only*
+    /// effect (zeroing the upper regions) is dead.
+    pub(super) fn upper_regions_dead_after(&self, idx: usize, n: u32) -> bool {
+        if n >= 16 {
+            return false;
+        }
+        let Some(f) = self.func_of(idx).filter(|f| f.known) else {
+            return false;
+        };
+        let low = 1u128 << n;
+        f.live_out[idx - f.start] & upper_regions(low) == 0
+    }
+
     /// Same question for the `size`-byte frame slot at `offset(%base)`
     /// (`base` is the family id: 4 = `%rsp`, 5 = `%rbp`).  Any overlapping
     /// tracked slot that is live makes the answer `Some(true)`; a slot that
