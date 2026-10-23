@@ -2340,6 +2340,10 @@ jobs:
         bash tests/regression/check_tls_model_selection.sh
         # T6: IR verifier clean on the fixed gate subset (mirrors ci_local.sh).
         bash tests/regression/check_verify_ir_clean.sh
+        # The dual-layout tie rule is wired, still ties on the fixture, buys a
+        # conditional branch, and does not change the program's output
+        # (mirrors ci_local.sh: layout-tie-rule).
+        bash tests/regression/check_layout_tie_rule.sh
         # The FMA contract gate (packed arm exact at 4, zero under
         # -ffp-contract=off / -mno-fma, unproven shapes refused) and the wide
         # inclusive-bound envelope behind it.  A regression test that nothing
