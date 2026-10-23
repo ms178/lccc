@@ -1473,6 +1473,19 @@ pub(crate) fn run_passes(
         enabled: std::env::var_os("CCC_NO_VEC_LOAD_SINK").is_none(),
         trace: std::env::var_os("CCC_DEBUG_VEC_LOAD_SINK").is_some(),
     });
+    // Form 4 of `aggregate_sroa` runs per function and used to scan the
+    // environment per call (three switches, one of them allocating); it reads
+    // the resolved copy instead, like every other pass here.
+    aggregate_sroa::split::set_split_env(aggregate_sroa::split::SplitEnv {
+        enabled: std::env::var_os("CCC_NO_AGGREGATE_SPLIT").is_none(),
+        debug: std::env::var_os("CCC_AGG_SPLIT_DEBUG").is_some(),
+        // A malformed cap keeps the default rather than silently refusing every
+        // candidate: the knob is a debugging aid, not a contract.
+        max_fields: std::env::var("CCC_AGG_SPLIT_MAX_FIELDS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(aggregate_sroa::split::SPLIT_ENV_DEFAULT_MAX_FIELDS),
+    });
     backedge_pre::set_backedge_pre_env(backedge_pre::EnvConfig::from_env());
     loop_align::set_tight_loop_mode(loop_align::TightLoopMode::from_env());
     // Scalar ANDN (BMI1) capability for the bool-mux algebra's CH fold.

@@ -4223,6 +4223,68 @@ fn emit_extern_visibility_directives(
     }
 }
 
+/// Decide whether the dual-layout emission keeps the static-chain order.
+///
+/// The metric is `lines + branch_term * branch_cost` plus a stack-traffic veto,
+/// all of it a *static count* of what a placement leaves taken. When the two
+/// orders tie on that count the model has no opinion, and the historical rule
+/// (`chain_count < orig_count`) handed the decision back to whichever order the
+/// middle-end passes happened to append. That is not a corner case: over the 49
+/// benchmark programs, 32 of the 44 functions that reach this comparison are
+/// exact ties (`CCC_DEBUG_CHAIN=1`), so the tie rule governs the layout of most
+/// functions the dual-layout machinery touches at all.
+///
+/// On a tie the chain order is the better-founded default: its fall-throughs
+/// were chosen by a greedy walk over the *same* structural weights the metric
+/// sums, while the pre-chain order is an artefact of pass order. Measured, the
+/// tie rule is worth -7.4 % to -8.7 % on `expat_xml_scan` (31 interleaved
+/// paired rounds, two independent runs) and is inside the noise band on every
+/// other benchmark of the set -- the tie is the only case where the append
+/// order is demonstrably the wrong one.
+///
+/// The stack term is what keeps a tie from being a free choice, and it is
+/// applied differently on each side of the tie:
+///
+/// * **Tie**: there is no placement win left to protect, so the only remaining
+///   evidence is memory traffic, and the comparison is strict
+///   (`chain_stack <= orig_stack`). A layout that buys fall-throughs by
+///   lengthening a live range loses here -- this is what keeps a tie whose
+///   chain order spills a loop counter on the append order.
+/// * **No tie**: the historical 10 % band is kept exactly as measured. It is
+///   asymmetric on purpose -- a wrongly accepted spill costs a few cycles, a
+///   wrongly rejected layout costs the whole placement win -- and tightening it
+///   would change decisions that were never the subject of this rule. The band
+///   is calibrated on the measured disagreements that bracket it:
+///   `linux_rbtree` (+2 operands on 28, +7.1 %, 13.6 % faster) is admitted,
+///   `zstd_count` (+3 on 8, +37.5 %, 8.7 % slower -- the moved block spills a
+///   loop counter that is reloaded every iteration) is not, and the +1-on-8
+///   case (`double_reduction`) is discussed in
+///   `docs/FOLLOWUP-2026-10-22-round2-layout-branch-cost.md`.
+///
+/// `tie_to_chain` is false when `CCC_LAYOUT_TIE_ORIG=1` is set, which restores
+/// the historical `chain_count < orig_count` rule exactly (A/B bisection
+/// surface, not a behaviour knob).
+fn adopt_chain_layout(
+    chain_count: u64,
+    orig_count: u64,
+    chain_stack: usize,
+    orig_stack: usize,
+    tie_to_chain: bool,
+) -> bool {
+    let tie = tie_to_chain && chain_count == orig_count;
+    // The 10 % band exists because "a wrongly rejected layout costs the whole
+    // placement win". On a tie there is no placement win left to protect -- the
+    // metric has already declined to separate the orders -- so the only
+    // evidence that remains is the stack term, and there the honest comparison
+    // is strict: no measured win means no extra memory traffic.
+    let stack_ok = if tie {
+        chain_stack <= orig_stack
+    } else {
+        chain_stack * 10 <= orig_stack * 11
+    };
+    stack_ok && (chain_count < orig_count || tie)
+}
+
 /// Always re-selects the function's section immediately before emission so a
 /// previous function's `.rodata` constant pool or PFE section cannot leak.
 fn emit_functions_and_sections(
@@ -4383,24 +4445,17 @@ fn emit_functions_and_sections(
                     // exactly once per site (count-based test assertions),
                     // and the shipped text comes from a non-exploratory
                     // emission in both arms.
-                    // A layout may not add spill traffic: a stack operand is a
-                    // value a register could have held, and a layout that needs
-                    // one bought its fall-throughs by lengthening a live range.
-                    // The band is calibrated on the measured disagreements,
-                    // which bracket it: `linux_rbtree` (+2 operands on 28,
-                    // +7.1 %, 13.6 % faster) is admitted, `zstd_count` (+3 on 8,
-                    // +37.5 %, 8.7 % slower — the moved block spills a loop
-                    // counter that is reloaded every iteration) is not.  A
-                    // +1-on-8 case (`double_reduction`) is discussed in
-                    // docs/FOLLOWUP-2026-10-22-round2-layout-branch-cost.md.
-                    // The band is asymmetric because the errors are: a wrongly
-                    // accepted spill costs a few cycles, a wrongly rejected
-                    // layout costs the whole placement win.
-                    let spill_ok = chain_stack * 10 <= orig_stack * 11;
-                    // With the kill switch set the branch term is zero and the
-                    // rule is the historical one, `chain_lines < orig_lines`.
-                    let adopt_chain = spill_ok && chain_count < orig_count;
-                    if adopt_chain {
+                    // The winner is chosen by `adopt_chain_layout`, which
+                    // carries the rule, its stack-traffic veto and the measured
+                    // calibration cases.
+                    let tie_to_chain = std::env::var_os("CCC_LAYOUT_TIE_ORIG").is_none();
+                    if adopt_chain_layout(
+                        chain_count,
+                        orig_count,
+                        chain_stack,
+                        orig_stack,
+                        tie_to_chain,
+                    ) {
                         generate_function(cg, attr_align, func, source_mgr, file_table);
                     } else {
                         generate_function(cg, attr_align, &alt, source_mgr, file_table);
@@ -8512,3 +8567,54 @@ mod seg_fold_displacement_tests {
 #[cfg(test)]
 #[path = "nonneg_value_tests.rs"]
 mod nonneg_value_tests;
+
+#[cfg(test)]
+mod adopt_chain_layout_tests {
+    use super::adopt_chain_layout;
+
+    /// (chain_count, orig_count, chain_stack, orig_stack, tie_to_chain)
+    const NO_TIE: u64 = 128;
+
+    #[test]
+    fn a_strict_win_keeps_the_chain_order() {
+        // 67 < 68: the historical rule and the tie rule agree, and the stack
+        // band is the historical one.
+        assert!(adopt_chain_layout(67, 68, 28, 28, true));
+        assert!(adopt_chain_layout(67, 68, 28, 28, false));
+    }
+
+    #[test]
+    fn a_strict_loss_keeps_the_append_order() {
+        assert!(!adopt_chain_layout(68, 67, 28, 28, true));
+        assert!(!adopt_chain_layout(68, 67, 28, 28, false));
+    }
+
+    #[test]
+    fn a_tie_keeps_the_chain_order_when_it_costs_no_stack_traffic() {
+        assert!(adopt_chain_layout(NO_TIE, NO_TIE, 28, 28, true));
+        assert!(adopt_chain_layout(NO_TIE, NO_TIE, 27, 28, true));
+    }
+
+    #[test]
+    fn a_tie_that_adds_a_single_stack_operand_is_refused() {
+        // Strict on a tie: there is no placement win to trade the spill
+        // against, so one extra stack operand is already too many.
+        assert!(!adopt_chain_layout(NO_TIE, NO_TIE, 29, 28, true));
+    }
+
+    #[test]
+    fn a_non_tie_win_keeps_the_historical_ten_percent_band() {
+        // +2 stack operands on 28 is inside the band and is still adopted.
+        assert!(adopt_chain_layout(67, 68, 30, 28, true));
+        // +3 on 28 is outside it and is not.
+        assert!(!adopt_chain_layout(67, 68, 31, 28, true));
+    }
+
+    #[test]
+    fn the_kill_switch_restores_the_historical_tie_rule() {
+        // With the switch, a tie is a loss whatever the stack term says, and
+        // the historical band decides instead.
+        assert!(!adopt_chain_layout(NO_TIE, NO_TIE, 28, 28, false));
+        assert!(adopt_chain_layout(67, 68, 30, 28, false));
+    }
+}

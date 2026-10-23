@@ -1487,6 +1487,12 @@ gate "round-cap-observability" fast \
 gate "verify-ir-clean" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_verify_ir_clean.sh
 
+# The dual-layout tie rule: the fixture still ties, the two arms differ, the
+# default arm emits one fewer conditional branch, and both agree with the
+# oracle on the program's output.
+gate "layout-tie-rule" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_layout_tie_rule.sh
+
 # T4/T7: mutation self-tests for the C reducer and the punning fuzzer's model.
 gate "c-reduce-selftest" fast \
     python3 -m unittest discover -s tests/fuzz -p test_c_reduce.py

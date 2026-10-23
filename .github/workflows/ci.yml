@@ -1617,6 +1617,16 @@ jobs:
       env:
         CCC: target/fastbuild/lccc
       run: bash tests/regression/check_cross_pr_redteam.sh
+    - name: Verify the dual-layout tie rule end to end
+      # The rule itself is unit-tested; this step is what proves it is wired,
+      # that the fixture still reaches the tie path, that the default arm buys
+      # a conditional branch, and that neither arm changes the program's
+      # output.  Mirrors ci_local.sh's `layout-tie-rule` gate, which
+      # scripts/check_ci_gate_parity.py checks.
+      run: |
+        set -Eeuo pipefail
+        bash tests/regression/check_layout_tie_rule.sh
+
     - name: Verify peephole phi-hoist safety contracts
       env:
         CCC: target/fastbuild/lccc
