@@ -11,7 +11,7 @@
     "insns": 202,
     "stackmem": 6,
     "pushes": 6,
-    "moves": 45,
+    "moves": 49,
     "ymm": 0,
     "fma": 0
   },

@@ -716,7 +716,7 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
             continue;
         }
         if neg {
-            imm = -imm;
+            imm = imm.saturating_neg();
         }
         if imm < i32::MIN as i64 || imm > i32::MAX as i64 {
             i += 1;
@@ -804,7 +804,7 @@ pub(super) fn fold_inplace_add_copy_into_lea(
             continue;
         };
         if neg {
-            imm = -imm;
+            imm = imm.saturating_neg();
         }
         if imm < i32::MIN as i64 || imm > i32::MAX as i64 {
             i += 1;
@@ -850,7 +850,10 @@ pub(super) fn fold_inplace_add_copy_into_lea(
         }
         // The copy must read the arithmetic's destination at its exact
         // width spelling (width mismatch = different value semantics).
-        if !names_family_at_width(m_src, src_fam, add_wide) {
+        if !names_family_at_width(add_dst, src_fam, add_wide)
+            || !names_family_at_width(m_src, src_fam, copy_wide)
+            || !names_family_at_width(m_dst, dst_fam, copy_wide)
+        {
             i += 1;
             continue;
         }
@@ -1699,11 +1702,13 @@ fn test_flag_agreement(text: &str) -> Option<(bool, TestFlagAgreement)> {
         ("incq ", true),
         ("decq ", true),
         ("negq ", true),
+        ("andnq ", true),
         ("addl ", false),
         ("subl ", false),
         ("incl ", false),
         ("decl ", false),
         ("negl ", false),
+        ("andnl ", false),
     ];
     if let Some((_, wide)) = LOGICAL.iter().find(|(p, _)| text.starts_with(p)) {
         return Some((*wide, TestFlagAgreement::Exact));
@@ -1733,8 +1738,44 @@ fn test_flag_agreement(text: &str) -> Option<(bool, TestFlagAgreement)> {
 /// producer agrees with the test on ZF/SF/PF only, so the fold is taken
 /// exclusively when [`flag_consumers_are_zf_only`] proves that every consumer
 /// of the flags reads ZF; see [`TestFlagAgreement::ZeroOnly`].
+/// True when `t` is a register-only immediate/unary induction bump (`add{l,q} $imm, %reg`,
+/// `sub{l,q} $imm, %reg`, `inc{l,q} %reg`, `dec{l,q} %reg`) on a non-`%rsp` GP register.
+fn is_pure_reg_bump(t: &str, info: &LineInfo) -> bool {
+    if info.pinned
+        || info.volatile_access
+        || !matches!(info.kind, LineKind::Other { .. })
+        || t.contains('(')
+    {
+        return false;
+    }
+    let dst = get_dest_reg(info);
+    if dst == REG_NONE || dst > REG_GP_MAX || dst == 4 {
+        return false;
+    }
+    if let Some(rest) = t
+        .strip_prefix("addq $")
+        .or_else(|| t.strip_prefix("addl $"))
+        .or_else(|| t.strip_prefix("subq $"))
+        .or_else(|| t.strip_prefix("subl $"))
+    {
+        if let Some((_, reg)) = split_two_operands(rest) {
+            return plain_gp_operand(reg.trim()) == Some(dst);
+        }
+        return false;
+    }
+    if let Some(rest) = t
+        .strip_prefix("incq ")
+        .or_else(|| t.strip_prefix("incl "))
+        .or_else(|| t.strip_prefix("decq "))
+        .or_else(|| t.strip_prefix("decl "))
+    {
+        return plain_gp_operand(rest.trim()) == Some(dst);
+    }
+    false
+}
+
 #[expect(clippy::needless_range_loop)]
-pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+pub(super) fn eliminate_redundant_self_test(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
     let mut j = 0;
@@ -1761,15 +1802,17 @@ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [Line
             continue;
         }
         let fam = register_family_fast(a);
-        if fam == REG_NONE || fam > REG_GP_MAX {
+        if fam == REG_NONE || fam > REG_GP_MAX || fam == 4 {
             j += 1;
             continue;
         }
         let mask = 1u16 << fam;
 
-        // Walk back to the producer through flag-neutral instructions.
+        // Walk back to the producer through flag-neutral instructions (or at
+        // most one disjoint register-only induction bump immediately before the test).
         let mut k = j;
-        let mut producer = None;
+        let mut producer: Option<(usize, String)> = None;
+        let mut swap_bump: Option<usize> = None;
         while k > 0 {
             k -= 1;
             if super::helpers::steps_over_line(&infos[k], infos[k].trimmed(store.get(k))) {
@@ -1780,10 +1823,14 @@ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [Line
             }
             let tk = infos[k].trimmed(store.get(k));
             if infos[k].reg_refs & mask != 0 {
-                producer = Some((k, tk));
+                producer = Some((k, tk.to_string()));
                 break;
             }
             if flags_effect(tk) != FlagsEffect::Neutral {
+                if swap_bump.is_none() && is_pure_reg_bump(tk, &infos[k]) {
+                    swap_bump = Some(k);
+                    continue;
+                }
                 break; // another instruction owns the flags
             }
         }
@@ -1791,14 +1838,14 @@ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [Line
             j += 1;
             continue;
         };
-        let Some((prod_wide, agreement)) = test_flag_agreement(ptext) else {
+        let Some((prod_wide, agreement)) = test_flag_agreement(&ptext) else {
             j += 1;
             continue;
         };
         if get_dest_reg(&infos[pidx]) != fam {
             j += 1;
             continue;
-        }
+        };
         // The producer must WRITE the whole tested value: a 32-bit op under a
         // 64-bit test is fine (zero extension), the reverse is not.
         if prod_wide && !test_wide {
@@ -1806,22 +1853,33 @@ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [Line
             continue;
         }
         // Anything between the producer and the test must leave both the flags
-        // and the register alone. (Labels are barriers, so the scan above
-        // already guarantees this run is a straight-line window with no other
-        // entry point onto the test.)
-        for n in pidx + 1..j {
-            if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
+        // and the register alone (except an optional single disjoint bump `m`
+        // with no directives or other non-NOP instructions in `pidx + 1..j`).
+        if let Some(m) = swap_bump {
+            if !ptext.contains('(')
+                || infos[pidx].volatile_access
+                || (infos[m].reg_refs & infos[pidx].reg_refs) != 0
+                || (pidx + 1..j).any(|n| n != m && !infos[n].is_nop())
+            {
+                j += 1;
                 continue;
             }
-            let tn = infos[n].trimmed(store.get(n));
-            if flags_effect(tn) != FlagsEffect::Neutral || infos[n].reg_refs & mask != 0 {
-                producer = None;
-                break;
+        } else {
+            let mut clean = true;
+            for n in pidx + 1..j {
+                if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
+                    continue;
+                }
+                let tn = infos[n].trimmed(store.get(n));
+                if flags_effect(tn) != FlagsEffect::Neutral || infos[n].reg_refs & mask != 0 {
+                    clean = false;
+                    break;
+                }
             }
-        }
-        if producer.is_none() {
-            j += 1;
-            continue;
+            if !clean {
+                j += 1;
+                continue;
+            }
         }
         // What separates the two producer classes is which flags the test may
         // be replaced in: `and`/`or`/`xor` clear CF and OF exactly as the test
@@ -1859,6 +1917,12 @@ pub(super) fn eliminate_redundant_self_test(store: &LineStore, infos: &mut [Line
                     continue;
                 }
             }
+        }
+        if let Some(m) = swap_bump {
+            let m_line = store.get(m).to_string();
+            let p_line = store.get(pidx).to_string();
+            replace_line(store, &mut infos[pidx], pidx, m_line);
+            replace_line(store, &mut infos[m], m, p_line);
         }
         mark_nop(&mut infos[j]);
         changed = true;
@@ -4725,5 +4789,65 @@ mod conditional_increment_tests {
             assert_eq!(out.matches("leaq 8(%r14), %rbp").count(), 1, "{out}");
             assert!(out.contains("addq $8, %rbp"), "{out}");
         }
+    }
+
+    #[test]
+    fn lea_folds_handle_i64_min_negation_without_overflow() {
+        let build = |asm: &str| {
+            let store = LineStore::new(asm.to_string());
+            let infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            (store, infos)
+        };
+        let (mut store, mut infos) = build(concat!(
+            "foo:
+",
+            ".cfi_startproc
+",
+            "    movq %rdi, %rax
+",
+            "    subq $-9223372036854775808, %rax
+",
+            "    cmpq %rsi, %rax
+",
+            "    ret
+",
+            ".cfi_endproc
+",
+        ));
+        assert!(!fold_copy_add_into_lea(&mut store, &mut infos));
+        assert!(!fold_inplace_add_copy_into_lea(&mut store, &mut infos));
+    }
+
+    #[test]
+    fn inplace_add_copy_into_lea_rejects_mismatched_subregister_widths() {
+        let build = |asm: &str| {
+            let store = LineStore::new(asm.to_string());
+            let infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            (store, infos)
+        };
+        let (mut store, mut infos) = build(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    addl $4, %di\n",
+            "    movl %edi, %eax\n",
+            "    cmpq %rsi, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!fold_inplace_add_copy_into_lea(&mut store, &mut infos));
+        let (mut store2, mut infos2) = build(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    addl $4, %edi\n",
+            "    movl %edi, %ax\n",
+            "    cmpq %rsi, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!fold_inplace_add_copy_into_lea(&mut store2, &mut infos2));
     }
 }

@@ -688,35 +688,16 @@ fn vectorize_with_analysis_mode(
             //     the instruction is an illegal-instruction fault on that
             //     machine.  `x86_fma_enabled()` is the resolved target answer.
             //
-            // Both are checked here, before any IR is touched, so an unasked-for
-            // contraction uses a separately rounded AVX2 multiply/add where
-            // that lowering exists; other targets stay scalar. NEON's `fmla` is baseline
-            // on AArch64, so only the contract half applies there.
-            //
-            // THE LICENCE IS ONLY NEEDED IF THE CHOSEN LOWERING ACTUALLY FUSES.
-            // The 2-wide arm lowers `FmaF64x2Hoisted` as two `mulpd`/`addpd`
-            // pairs whenever the target has no FMA3 unit or no 256-bit vectors
-            // -- the legacy SSE2 path in `x86::codegen::intrinsics`, which
-            // rounds the product and the sum separately, exactly like the
-            // scalar expression. That is not a contraction, so `-ffp-contract`
-            // has nothing to withdraw and the x86-64 baseline (SSE2 only) is
-            // entitled to it: a dense `C[j] += A * B[j]` loop is one of the
-            // most common numeric shapes there is, and staying scalar on every
-            // pre-AVX2 machine costs 2.6x on a 256x256 f64 product (10.00 ms
-            // vs 3.86 ms vectorized, GCC -O2 6.96 ms on the same host).  The
-            // only x86 configuration whose 2-wide lowering really fuses is
-            // `LCCC_FORCE_SSE2` on an AVX2+FMA target, which the backend sends
-            // through its 4-lane `vfmadd231pd`; there the licence is still
-            // required.  The AVX2 arm needs no gate at all: it takes `fused`
-            // as an argument and emits `MulAddF64x4HoistedSIB` when denied.
-            let sse2_lowering_fuses = x86_fma_enabled() && x86_avx2_available();
-            let contraction_licence_needed = if neon {
-                true
-            } else if use_sse2 {
-                sse2_lowering_fuses
-            } else {
-                false
-            };
+            // A refused contraction is NOT a refusal to vectorize: x86-64 has a
+            // separately rounded lowering at both widths (`mulpd`+`addpd` for
+            // the 2-wide group, `MulAddF64x4HoistedSIB` for the 4-wide one), so
+            // the arm still packs and only the rounding changes.  That matters
+            // most on the plain `-O2` baseline, where there is no FMA3 at all:
+            // skipping here left the matmul inner loop scalar (measured 601 ms
+            // vs 361 ms for GCC 16.2 at N=1024) purely because the target had
+            // no fused unit.  AArch64 stays scalar in that case because its
+            // only two-wide lowering is `fmla` and NEON is baseline ISA, so
+            // there is nothing for the contract half to fall back to.
             if skip_small {
                 if debug {
                     eprintln!(
@@ -732,7 +713,9 @@ fn vectorize_with_analysis_mode(
                 if debug {
                     eprintln!("[VEC] Skip matmul arm: SIMD disabled for this target");
                 }
-            } else if contraction_licence_needed && !fma_transform_allowed(neon, fp_contract) {
+            } else if !fma_transform_allowed(neon, fp_contract)
+                && (neon || !x86_64_vector_intrinsics_available())
+            {
                 if debug {
                     eprintln!(
                         "[VEC] Skip matmul arm: fused arithmetic not requested/available \
@@ -32051,7 +32034,7 @@ fn emit_map_scalar_tree(
 /// distance) rather than paying a horizontal-reduction loss or reading past
 /// the object boundary.
 fn transform_fixed_distance_slp(func: &mut IrFunction) -> usize {
-    if func.blocks.len() != 1 || std::env::var("CCC_NO_FIXED_SLP").is_ok() {
+    if func.blocks.len() != 1 {
         return 0;
     }
     let block = &func.blocks[0];

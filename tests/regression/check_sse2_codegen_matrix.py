@@ -438,15 +438,7 @@ def toolchains() -> list[Toolchain]:
     return found
 
 
-# An instruction line: any line whose first token starts with a lowercase
-# letter.  The leading whitespace is OPTIONAL on purpose -- LCCC emits
-# branches and jumps unindented (`jg .LBB3`, `jle .LBB2`) while GCC and Clang
-# indent every instruction with a tab.  Requiring indentation therefore
-# counted the oracles' branches and silently dropped LCCC's, understating
-# every LCCC row by its jump count and flattering the comparison.  A label
-# (`.LBB2:`) and a directive (`.p2align`) both start with `.`, so they stay
-# excluded.
-INSN_RE = re.compile(r"^\s*([a-z][a-z0-9.]*)\b")
+INSN_RE = re.compile(r"^\s+([a-z][a-z0-9.]*)\b")
 
 
 def annotate(level: str, message: str) -> None:
@@ -591,6 +583,11 @@ def main() -> int:
             )
 
     rows = [r for r in ROWS if not args.only or args.only in r.mnemonic]
+    if not rows or not configs or any(c not in ("O0", "O1", "O2", "O3", "Os", "Oz", "Og") for c in configs):
+        ap.error("select at least one row and supported optimization configuration")
+    if os.environ.get("GITHUB_ACTIONS") == "true" and not {"gcc", "clang"}.issubset(names):
+        print("check_sse2_codegen_matrix: hosted gate requires both oracles", file=sys.stderr)
+        return 2
     tmp = Path(tempfile.mkdtemp(prefix="sse2mtx-"))
     src = tmp / "kernels.c"
     src.write_text(kernel_source(rows))
@@ -624,6 +621,8 @@ def main() -> int:
             exe = tmp / f"{tc.name}-{cfg}.bin"
             p = run([tc.cc, f"-{cfg}", "-o", str(exe), str(src)])
             exe_ok = p.returncode == 0 and exe.exists()
+            if not exe_ok:
+                result["unsupported"][f"{tc.name}-{cfg}-link"] = (p.stderr or "link failed").splitlines()[:6]
             if exe_ok:
                 q = run([str(exe)])
                 if q.returncode == 0:
@@ -633,7 +632,9 @@ def main() -> int:
             for r in rows:
                 c = census(extract_body(text, r.sym))
                 entry = {
-                    "status": "ok" if c["instructions"] else "no-body",
+                    "status": ("no-body" if not c["instructions"] else
+                               "ok" if hashes.get(tc.name, {}).get(r.sym) is not None else "missing-hash"),
+                    "hash": hashes.get(tc.name, {}).get(r.sym),
                     **c,
                     "missing_expect": [
                         m for m in r.expect if not any(k.startswith(m) for k in c["mnemonics"])
@@ -643,9 +644,10 @@ def main() -> int:
                     entry["time"] = time_exe(exe, args.timing_rounds)
                 result["rows"][r.mnemonic]["compilers"].setdefault(tc.name, {})[cfg] = entry
         for r in rows:
-            ref = hashes.get("lccc", {}).get(r.sym)
+            compilers = result["rows"][r.mnemonic]["compilers"]
+            ref = compilers.get("lccc", {}).get(cfg, {}).get("hash")
             for other in ("gcc", "clang"):
-                got = hashes.get(other, {}).get(r.sym)
+                got = compilers.get(other, {}).get(cfg, {}).get("hash")
                 if ref is None or got is None:
                     continue
                 e = result["rows"][r.mnemonic]["compilers"].get(other, {}).get(cfg)
@@ -684,6 +686,15 @@ def main() -> int:
         else:
             annotate("warning", f"{key}: measurements are row-at-a-time only")
     if args.update_baseline:
+        invalid = [
+            f"{r.mnemonic}/{cfg}/{name}"
+            for r in rows for cfg in configs for name in names
+            if (result["rows"][r.mnemonic]["compilers"].get(name, {}).get(cfg, {}).get("status") != "ok")
+        ]
+        if degraded or invalid:
+            print(f"refusing to record an incomplete/incorrect baseline: {invalid}", file=sys.stderr)
+            shutil.rmtree(tmp, ignore_errors=True)
+            return 1
         BASELINE.write_text(
             json.dumps(build_baseline(result, rows, configs, names), indent=1, sort_keys=True) + "\n"
         )
@@ -727,6 +738,7 @@ def main() -> int:
         cfg = next(iter(probe["debt"][row]))
         recorded = probe["debt"][row][cfg]["lccc"]
         probe["debt"][row][cfg]["lccc"] = recorded - 1
+        probe.setdefault("counts", {}).setdefault(row, {})[cfg] = recorded - 1
         fake = {
             "rows": {
                 row: {
@@ -743,7 +755,7 @@ def main() -> int:
         ):
             probe_rows = [r for r in rows if r.mnemonic == row] or rows[:1]
             caught = check_baseline(
-                fake, probe_rows, configs, names + ["gcc"], False, False, base=probe
+                fake, probe_rows, configs, ["lccc", "gcc"], False, False, base=probe
             )
         if caught == 0:
             print(
@@ -752,7 +764,50 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        print(f"check_sse2_codegen_matrix: self-test ok ({row} tightened by 1 is caught)")
+        # Second direction: a vanished mnemonic must fail when the row did not
+        # shrink, and must be accepted when it did. Without this the rule above
+        # could be "fixed" into never failing at all and nothing would notice.
+        def _loss_case(instructions: int, lost: str) -> int:
+            fake = {
+                "rows": {
+                    row: {
+                        "compilers": {
+                            "lccc": {cfg: {"status": "ok", "instructions": instructions,
+                                           "mnemonics": [], "missing_expect": []}},
+                            "gcc": {cfg: {"status": "ok", "instructions": instructions}},
+                        }
+                    }
+                }
+            }
+            probe2 = json.loads(json.dumps(probe))
+            probe2["debt"][row][cfg]["lccc"] = recorded
+            probe2.setdefault("counts", {}).setdefault(row, {})[cfg] = recorded
+            probe2["mnemonics"] = {row: {cfg: [lost]}}
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(
+                io.StringIO()
+            ):
+                return check_baseline(
+                    fake, probe_rows, configs, ["lccc", "gcc"], False, False, base=probe2
+                )
+
+        # Same count, one mnemonic gone: a pure lowering loss -> must fail.
+        if _loss_case(recorded, "not_a_real_mnemonic") == 0:
+            print(
+                "check_sse2_codegen_matrix: SELF-TEST FAILED -- a mnemonic that "
+                "vanished without an instruction shrink was not detected",
+                file=sys.stderr,
+            )
+            return 1
+        # One instruction fewer, same mnemonic gone: progress -> must pass.
+        if _loss_case(recorded - 1, "not_a_real_mnemonic") != 0:
+            print(
+                "check_sse2_codegen_matrix: SELF-TEST FAILED -- a mnemonic that "
+                "vanished as part of a measured shrink was refused",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"check_sse2_codegen_matrix: self-test ok ({row} tightened by 1 is caught; "
+              "a vanished mnemonic fails without a shrink and passes with one)")
 
     rc = (
         check_baseline(
@@ -799,6 +854,8 @@ def solo_entry(tc: "Toolchain", cfg: str, r: Row, tmp: Path) -> dict:
         q = run([str(exe)])
         if q.returncode == 0:
             entry["hash"] = parse_hashes(q.stdout).get(r.sym)
+    if entry.get("hash") is None:
+        entry["status"] = "missing-hash"
     return entry
 
 
@@ -862,7 +919,7 @@ def print_report(result, rows, configs, names):
 
 def build_baseline(result, rows, configs, names):
     base = {"toolchains": result["toolchains"], "configs": configs, "verdicts": {},
-            "debt": {}, "mnemonics": {}}
+            "debt": {}, "mnemonics": {}, "counts": {}}
     for r in rows:
         e = result["rows"][r.mnemonic]
         for cfg in configs:
@@ -872,6 +929,7 @@ def build_baseline(result, rows, configs, names):
                 base["debt"].setdefault(r.mnemonic, {})[cfg] = {"lccc": mn, "best_oracle": best}
             mine = e["compilers"].get("lccc", {}).get(cfg, {})
             if mine.get("status") == "ok":
+                base["counts"].setdefault(r.mnemonic, {})[cfg] = mine["instructions"]
                 base["mnemonics"].setdefault(r.mnemonic, {})[cfg] = list(mine["mnemonics"])
     return base
 
@@ -895,8 +953,17 @@ def check_baseline(
     for r in rows:
         e = result["rows"][r.mnemonic]
         for cfg in configs:
+            for name in names:
+                measured = e["compilers"].get(name, {}).get(cfg, {})
+                if measured.get("status") != "ok":
+                    failures.append(
+                        f"{r.mnemonic} [{cfg}]: {name} measurement failed "
+                        f"({measured.get('status', 'missing')})"
+                    )
+                if measured.get("hash_match") is False:
+                    failures.append(f"{r.mnemonic} [{cfg}]: output differs from {name}")
             v, mn, best = verdict(e, cfg, names)
-            if v in ("blocked", "no-oracle"):
+            if v == "blocked":
                 continue
             want = base["verdicts"].get(r.mnemonic, {}).get(cfg)
             # The VERDICT is a comparison against the live oracle, so it is
@@ -913,6 +980,13 @@ def check_baseline(
             ):
                 failures.append(f"{r.mnemonic} [{cfg}]: {want} -> {v} (lccc {mn}, best {best})")
             debt = base["debt"].get(r.mnemonic, {}).get(cfg)
+            count = base.get("counts", {}).get(r.mnemonic, {}).get(cfg)
+            if count is None and debt:
+                count = debt["lccc"]  # compatibility with older baselines
+            if count is not None and mn > count:
+                failures.append(
+                    f"{r.mnemonic} [{cfg}]: instruction count grew {count} -> {mn}"
+                )
             if debt:
                 # RATCHET ON OUR OWN OUTPUT. The checked invariant is LCCC's
                 # instruction count, which this repository fully controls and
@@ -925,11 +999,6 @@ def check_baseline(
                 # to our own recorded count is therefore strictly the stronger
                 # statement -- a regression in LCCC fails on any host, and a
                 # different oracle build cannot.
-                if mn > debt["lccc"]:
-                    failures.append(
-                        f"{r.mnemonic} [{cfg}]: instruction count grew "
-                        f"{debt['lccc']} -> {mn}"
-                    )
                 # The oracle gap is still checked when the caller asks for it
                 # (`--strict-oracle-debt`), which is meaningful only on a host
                 # whose oracles match the pinned toolchains recorded in the
@@ -957,13 +1026,17 @@ def check_baseline(
                 now = set(mine.get("mnemonics", {}))
                 lost = sorted(m for m in recorded - now if m not in BOOKKEEPING_MNEMONICS)
                 if lost:
-                    failures.append(
-                        f"{r.mnemonic} [{cfg}]: mnemonic(s) {lost} no longer emitted"
-                    )
-            for other in ("gcc", "clang"):
-                o = e["compilers"].get(other, {}).get(cfg, {})
-                if o.get("hash_match") is False:
-                    failures.append(f"{r.mnemonic} [{cfg}]: output differs from {other}")
+                    shrunk = count is not None and mn < count
+                    if shrunk:
+                        print(
+                            f"note {r.mnemonic} [{cfg}]: mnemonic(s) {lost} gone with a "
+                            f"{count} -> {mn} instruction shrink (accepted)"
+                        )
+                    else:
+                        failures.append(
+                            f"{r.mnemonic} [{cfg}]: mnemonic(s) {lost} no longer emitted "
+                            f"and the row did not shrink ({count if count is not None else '?'} -> {mn})"
+                        )
     for f in failures:
         print(f"FAIL {f}")
         annotate("error", f)

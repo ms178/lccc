@@ -1193,16 +1193,25 @@ impl FileLiveness {
         /// against the code this replaces, which held the same 256 and then
         /// threw the whole table away.
         const FN_CACHE_CAP: usize = 256;
+        type FnCacheMap = FxHashMap<(u64, u64), CachedFnLiveness>;
         thread_local! {
-            static FN_CACHE: std::cell::RefCell<FxHashMap<(u64, u64), CachedFnLiveness>> =
-                std::cell::RefCell::new(FxHashMap::default());
+            static FN_CACHE: std::cell::RefCell<(FnCacheMap, FnCacheMap)> =
+                std::cell::RefCell::new((FxHashMap::default(), FxHashMap::default()));
         }
         let fn_len = end.saturating_sub(start);
         let cache_key = if neutralise.is_none() && fn_len >= 16 {
             let key = Self::hash_function(store, infos, start, end);
             let hit = FN_CACHE.with(|c| {
-                let map = c.borrow();
-                if let Some((lo, li, kn, st, ef, tret)) = map.get(&key)
+                let mut banks = c.borrow_mut();
+                if !banks.0.contains_key(&key)
+                    && let Some(promoted) = banks.1.remove(&key)
+                {
+                    if banks.0.len() >= FN_CACHE_CAP {
+                        banks.1 = std::mem::take(&mut banks.0);
+                    }
+                    banks.0.insert(key, promoted);
+                }
+                if let Some((lo, li, kn, st, ef, tret)) = banks.0.get(&key)
                     && lo.len() == fn_len
                 {
                     self.live_out[start..end].copy_from_slice(lo);
@@ -1390,25 +1399,26 @@ impl FileLiveness {
         }
         if let Some(key) = cache_key {
             FN_CACHE.with(|c| {
-                let mut map = c.borrow_mut();
-                // Bounded memory, and no clear-the-world cliff: once the
-                // table is full the cache degrades to the pre-memo baseline
-                // for *new* functions while every cached one keeps hitting.
-                // Clearing here would discard precisely the entries the next
-                // pass re-asks for, forcing a full re-solve of the file.
-                if map.len() < FN_CACHE_CAP {
-                    map.insert(
-                        key,
-                        (
-                            self.live_out[start..end].to_vec(),
-                            self.live_in[start..end].to_vec(),
-                            self.known[start..end].to_vec(),
-                            self.structural[start..end].to_vec(),
-                            self.effect[start..end].to_vec(),
-                            self.textual_ret.contains(&start),
-                        ),
-                    );
+                let mut banks = c.borrow_mut();
+                // Two-generation bounded cache (`curr`, `prev`): when `curr`
+                // fills, rotate `curr` into `prev` so hot entries from the
+                // immediately preceding pass are promoted on hit while new
+                // functions continue to be cached (neither a clear-the-world
+                // cliff nor a permanent freeze after FN_CACHE_CAP functions).
+                if banks.0.len() >= FN_CACHE_CAP {
+                    banks.1 = std::mem::take(&mut banks.0);
                 }
+                banks.0.insert(
+                    key,
+                    (
+                        self.live_out[start..end].to_vec(),
+                        self.live_in[start..end].to_vec(),
+                        self.known[start..end].to_vec(),
+                        self.structural[start..end].to_vec(),
+                        self.effect[start..end].to_vec(),
+                        self.textual_ret.contains(&start),
+                    ),
+                );
             });
         }
     }

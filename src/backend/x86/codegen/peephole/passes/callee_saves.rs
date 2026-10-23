@@ -376,6 +376,9 @@ pub(super) fn eliminate_unused_callee_saves_fpo(store: &mut LineStore, infos: &m
             }
         }
         // Leading callee-saved pushes (directives interleaved are allowed).
+        // In FPO prologues (`omit_fp`), `%rbp` (reg 5) is also pushed as an
+        // ordinary callee-saved register when NOT immediately followed by
+        // `movq %rsp, %rbp`.
         let mut saves: Vec<(RegId, usize)> = Vec::new();
         let mut j = i + 1;
         while j < func_end {
@@ -386,6 +389,23 @@ pub(super) fn eliminate_unused_callee_saves_fpo(store: &mut LineStore, infos: &m
             match infos[j].kind {
                 LineKind::Push { reg } if is_callee_saved_reg(reg) => {
                     saves.push((reg, j));
+                    j += 1;
+                }
+                LineKind::Push { reg: 5 } => {
+                    let mut next = j + 1;
+                    while next < func_end
+                        && super::helpers::steps_over_line(
+                            &infos[next],
+                            infos[next].trimmed(store.get(next)),
+                        )
+                    {
+                        next += 1;
+                    }
+                    if next < func_end && infos[next].trimmed(store.get(next)) == "movq %rsp, %rbp"
+                    {
+                        break;
+                    }
+                    saves.push((5, j));
                     j += 1;
                 }
                 _ => break,

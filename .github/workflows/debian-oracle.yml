@@ -148,7 +148,9 @@ jobs:
                       'output_sha256': {key: digest(value['output']) for key, value in row['correctness'].items()},
                       'command_sha256': {key: digest(value['command']) for key, value in row['compile'].items()},
                   })
-              batch_size = max(1, (len(compact) + 6) // 7)
+              # Keep the identity notice plus workload batches within the
+              # ten-annotation checks-API ceiling, even as the registry grows.
+              batch_size = max(1, (len(compact) + 8) // 9)
               for start in range(0, len(compact), batch_size):
                   group = compact[start:start + batch_size]
                   notice(f'Debian workloads {start + 1}-{start + len(group)}', group)

@@ -868,7 +868,7 @@ impl Instruction {
                 // neighbouring slot and every 64-bit consumer read a
                 // sign-extended low dword (simd_insert_extract pextrq0/
                 // pextrq1).
-                IntrinsicOp::Pextrq128 | IntrinsicOp::Cvtsi128Si64 => Some(IrType::I64),
+                IntrinsicOp::Pextrq128 | IntrinsicOp::Cvtsi128Si64 | IntrinsicOp::Cvtsd2Si64 | IntrinsicOp::Cvtss2Si64 => Some(IrType::I64),
                 _ => None,
             },
             Instruction::GetReturnF128Second { .. } => Some(IrType::F128),

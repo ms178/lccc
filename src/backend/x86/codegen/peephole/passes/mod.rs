@@ -1377,7 +1377,7 @@ fn peephole_optimize_inner(
         }
         if !sk("self_test") {
             {
-                let c = flag_peepholes::eliminate_redundant_self_test(&store, &mut infos);
+                let c = flag_peepholes::eliminate_redundant_self_test(&mut store, &mut infos);
                 trace(
                     "eliminate_redundant_self_test",
                     pass_count,
@@ -5377,6 +5377,24 @@ mod regression_tests {
         assert!(
             !out.contains("vmovdqu %ymm0, %ymm0"),
             "self-move must be removed: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn test_vex_xmm_self_move_kept_when_wider_zmm_read_follows() {
+        let asm = [
+            "    movdqu 80(%rsp), %xmm0",
+            "    vmovdqu %xmm0, %xmm0",
+            "    vmovdqu64 %zmm0, (%rax)",
+            "    ret",
+        ]
+        .join("\n")
+            + "\n";
+        let out = peephole_optimize(asm);
+        assert!(
+            out.contains("vmovdqu %xmm0, %xmm0") || out.contains("vmovdqu 80(%rsp), %xmm0"),
+            "upper-zeroing VEX write before %zmm0 read must survive: {}",
             out
         );
     }

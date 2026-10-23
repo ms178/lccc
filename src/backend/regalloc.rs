@@ -999,8 +999,10 @@ pub fn x86_body_has_wide_ops(func: &IrFunction) -> bool {
                 | Instruction::ParamRef { ty, .. }
                 | Instruction::Select { ty, .. }
                 | Instruction::AtomicLoad { ty, .. }
+                | Instruction::AtomicStore { ty, .. }
                 | Instruction::AtomicRmw { ty, .. }
                 | Instruction::AtomicCmpxchg { ty, .. }
+                | Instruction::AtomicInc { ty, .. }
                 | Instruction::Phi { ty, .. } => wide(ty),
                 Instruction::Cast { from_ty, to_ty, .. } => wide(from_ty) || wide(to_ty),
                 Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
@@ -1427,6 +1429,24 @@ fn owned_live_segments(
 /// Linear merge-style interference test for sorted hole-aware segment sets.
 /// Uses the allocator's half-open boundary convention: one value dying at the
 /// exact point another is born may hand the register directly to it.
+fn guard_internal_hole_boundaries(segments: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let last = segments.len().saturating_sub(1);
+    segments
+        .iter()
+        .enumerate()
+        .map(|(i, &(start, end))| {
+            (
+                if i > 0 {
+                    start.saturating_sub(1)
+                } else {
+                    start
+                },
+                if i < last { end.saturating_add(1) } else { end },
+            )
+        })
+        .collect()
+}
+
 fn segment_sets_overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
     let (mut ai, mut bi) = (0usize, 0usize);
     while ai < a.len() && bi < b.len() {
@@ -1535,6 +1555,9 @@ fn attach_scan_segments(
         // range keeps conservative fat semantics.
         let inside = segs.first().is_some_and(|&(s, _)| s >= range.start)
             && segs.last().is_some_and(|&(_, e)| e <= range.end);
+        // Hole-aware scanning exists to model real gaps. A single contiguous
+        // segment adds no hole information and can shrink the historical fat
+        // interval based on local block touches; keep envelope semantics there.
         if inside {
             range.set_segments(segs.clone());
         }
@@ -5078,7 +5101,10 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             let owner = owner_of(value);
             if seen_holders.insert((reg.0, owner)) {
                 if let Some(segments) = owned_segments.get(&owner) {
-                    occupied_by_reg.entry(reg.0).or_default().extend(segments);
+                    occupied_by_reg
+                        .entry(reg.0)
+                        .or_default()
+                        .extend(guard_internal_hole_boundaries(segments));
                 }
             }
         }
@@ -5148,10 +5174,11 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
             let Some(candidate_segments) = owned_segments.get(&value) else {
                 continue;
             };
+            let guarded_candidate = guard_internal_hole_boundaries(candidate_segments);
             let Some(reg) = pool.iter().copied().find(|reg| {
                 occupied_by_reg
                     .get(&reg.0)
-                    .is_none_or(|occupied| !segment_sets_overlap(candidate_segments, occupied))
+                    .is_none_or(|occupied| !segment_sets_overlap(&guarded_candidate, occupied))
             }) else {
                 continue;
             };
@@ -6102,6 +6129,16 @@ fn verify_no_overlap(
 ///    the compute whitelist or it silently refuses — never miscompiles.
 /// 5. Never used by a non-Intrinsic instruction or a terminator.
 /// 6. Non-call-spanning — enforced by the caller via `spans_any_call`.
+// Compute producers: dest_ptr is a 16-byte slot and the first N args
+// are vector slots loaded via sse_load_arg.  Return the exact VECTOR
+// prefix length rather than an op-level bool: several instructions carry
+// trailing scalar/immediate operands.  Treating every Value operand as a
+// vector pointer can admit an alloca used as an immediate/scalar and make
+// codegen reinterpret its XMM contents as an address.
+//
+// Keep this fail-closed and tied to lowering shapes.  New intrinsics get
+// no vecreg allocation until their sse_load_arg/sse_store_dest contract is
+// audited here.
 fn collect_vecreg_candidates(func: &IrFunction) -> FxHashSet<u32> {
     use crate::ir::intrinsics::IntrinsicOp;
 
@@ -10094,7 +10131,8 @@ fn instruction_clobbers_caller_saved(inst: &Instruction) -> bool {
         Instruction::AtomicLoad { ty, .. }
         | Instruction::AtomicStore { ty, .. }
         | Instruction::AtomicRmw { ty, .. }
-        | Instruction::AtomicCmpxchg { ty, .. } => matches!(ty, IrType::I128 | IrType::U128),
+        | Instruction::AtomicCmpxchg { ty, .. }
+        | Instruction::AtomicInc { ty, .. } => matches!(ty, IrType::I128 | IrType::U128),
         _ => false,
     }
 }
@@ -12229,6 +12267,11 @@ mod phi_coalesce_tests {
     #[test]
     fn segment_interference_preserves_holes_and_half_open_handoffs() {
         assert!(!segment_sets_overlap(&[(1, 3), (8, 10)], &[(3, 8)]));
+        let guarded = guard_internal_hole_boundaries(&[(1, 3), (8, 10)]);
+        assert_eq!(guarded, vec![(1, 4), (7, 10)]);
+        assert!(segment_sets_overlap(&guarded, &[(3, 5)]));
+        assert!(segment_sets_overlap(&guarded, &[(6, 8)]));
+        assert!(!segment_sets_overlap(&[(1, 3)], &[(3, 8)]));
         assert!(!segment_sets_overlap(&[(1, 5)], &[(5, 9)]));
         assert!(segment_sets_overlap(&[(1, 5), (9, 12)], &[(4, 7)]));
         assert!(segment_sets_overlap(&[(1, 2), (6, 9)], &[(3, 7)]));

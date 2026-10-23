@@ -42,11 +42,22 @@ class BenchmarkShardPlan(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.document = yaml.safe_load(CI.read_text())
         cls.shards = shard_inputs(cls.document)
-        cls.registry = [benchmark.name for benchmark in BENCHMARKS]
+        # The CI workflow intentionally shards the bounded canonical set.
+        # Larger newly-added workloads remain in the full local/artefact
+        # registry but opt out explicitly rather than silently disappearing.
+        cls.registry = [benchmark.name for benchmark in BENCHMARKS if benchmark.ci_sharded]
+        cls.local_only = [benchmark.name for benchmark in BENCHMARKS if not benchmark.ci_sharded]
 
     def test_the_lane_is_sharded(self) -> None:
         self.assertGreaterEqual(len(self.shards), 2,
                                 "the benchmark lane is no longer sharded")
+
+    def test_local_only_workloads_are_an_explicit_fixed_set(self) -> None:
+        self.assertEqual(
+            self.local_only,
+            ["gzip_longest_match", "linux_list_sort", "zstd_double_fast"],
+            "changing CI shard membership requires an explicit workflow review",
+        )
 
     def test_shards_partition_the_registry(self) -> None:
         owned: dict[str, str] = {}

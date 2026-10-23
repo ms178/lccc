@@ -45,7 +45,7 @@ fn families() -> Vec<Family> {
             (IrType::I32, 32) => (VecCmpI32x8, VecBroadcastI32x8),
             (IrType::I64, 16) => (VecCmpI64x2, VecBroadcastI64x2),
             (IrType::I64, 32) => (VecCmpI64x4, VecBroadcastI64x4),
-            _ => unreachable!(),
+            _ => continue,
         };
         let lanes = bytes / ty.size();
         let ops = [

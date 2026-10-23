@@ -2396,6 +2396,12 @@ fn retarget_producer_into_copy_impl(
 ///    included. If the proof fails, every rewrite is rolled back textually
 ///    and the original pair stays.
 ///
+/// A bounded same-block gap between the LEA and copy is allowed only when
+/// every intervening instruction is independent of both the LEA result and
+/// the destination/base family. This lets loops retarget `lea step(base), tmp`
+/// even when unrelated accumulator work sits between it and `mov tmp, base`,
+/// without changing the order of any observable read/write.
+///
 /// Only copies whose destination family is referenced by the LEA's source
 /// are handled here; the unaliased producer+copy case belongs to
 /// `retarget_producer_into_copy`.
@@ -2458,10 +2464,40 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
         if !is_relayable_family(b_fam) {
             continue;
         }
-        // The adjacent (NOPs apart) copy of the LEA result.
+        // The copy of the LEA result may be separated by independent
+        // instructions. Retargeting the LEA changes the base family before
+        // the copy and stops defining the temporary, so every skipped line
+        // must be free of both families (including implicit register uses),
+        // and the bounded window must stay within one basic block.
+        const MAX_RELAY_GAP: usize = 8;
+        let b_mask = 1u16 << b_fam;
         let mut j = li + 1;
-        while j < len && infos[j].is_nop() {
-            j += 1;
+        let mut gap = 0usize;
+        let mut independent_gap = Vec::new();
+        loop {
+            while j < len && infos[j].is_nop() {
+                j += 1;
+            }
+            if j >= len || infos[j].pinned || infos[j].is_barrier() {
+                break;
+            }
+            let tj = infos[j].trimmed(store.get(j));
+            let is_copy_from_lea = ["movq ", "movl "]
+                .iter()
+                .filter_map(|prefix| tj.strip_prefix(prefix))
+                .filter_map(split_two_operands)
+                .any(|(src, _)| register_family_fast(src) == b_fam);
+            if is_copy_from_lea {
+                break;
+            }
+            if gap < MAX_RELAY_GAP && infos[j].reg_refs & b_mask == 0 && !has_implicit_reg_usage(tj)
+            {
+                independent_gap.push(j);
+                gap += 1;
+                j += 1;
+                continue;
+            }
+            break;
         }
         if j >= len || infos[j].pinned || infos[j].is_barrier() {
             continue;
@@ -2487,6 +2523,13 @@ pub(super) fn fold_copy_into_lea_base(store: &mut LineStore, infos: &mut [LineIn
             continue;
         };
         if a_fam == b_fam || !is_relayable_family(a_fam) {
+            continue;
+        }
+        let a_mask = 1u16 << a_fam;
+        if independent_gap
+            .iter()
+            .any(|&idx| infos[idx].reg_refs & a_mask != 0)
+        {
             continue;
         }
         // A 64-bit LEA under a 32-bit copy would drop the copy's truncation:
@@ -4242,6 +4285,20 @@ mod tests {
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())
+    }
+
+    fn run_lea_base_fold(asm: &str) -> (String, bool) {
+        let mut store = super::LineStore::new(asm.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| super::classify_line(store.get(i)))
+            .collect();
+        let changed = super::fold_copy_into_lea_base(&mut store, &mut infos);
+        let out = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\\n");
+        (out, changed)
     }
 
     /// A `movl` load whose value is relayed once into the register the loop
@@ -6296,6 +6353,58 @@ mod tests {
         assert!(out.contains("cmpq %rdx, %rbx"), "{out}");
         // The shift copy legitimately keeps %r11 (shr is destructive).
         assert!(out.contains("movq %rbx, %r11"), "{out}");
+    }
+
+    #[test]
+    fn lea_base_fold_crosses_independent_same_block_work() {
+        // A small scalar loop can compute its next induction value, do
+        // independent accumulation work, then commit the value to the base.
+        // The LEA can write the base directly because neither the base nor
+        // its temporary is touched in the intervening instructions.
+        let (out, changed) = run_lea_base_fold(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB1:\n",
+            "    leaq -1(%r9), %rax\n",
+            "    movzbl (%rdi), %esi\n",
+            "    leal (%r14, %rsi), %r10d\n",
+            "    addl %r10d, %r12d\n",
+            "    movq %rax, %r9\n",
+            "    testq %r9, %r9\n",
+            "    jne .LBB1\n",
+            "    movl $1, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(changed, "the safe gap should be folded:\n{out}");
+        assert!(out.contains("leaq -1(%r9), %r9"), "{out}");
+        assert!(!out.contains("movq %rax, %r9"), "{out}");
+    }
+
+    #[test]
+    fn lea_base_fold_does_not_cross_intervening_base_read() {
+        // Retargeting the LEA early would change this intervening read, so
+        // only instructions independent of both register families may be
+        // crossed.
+        let (out, changed) = run_lea_base_fold(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            ".LBB1:\n",
+            "    leaq -1(%r9), %rax\n",
+            "    movq %r9, %r10\n",
+            "    movq %rax, %r9\n",
+            "    testq %r9, %r9\n",
+            "    jne .LBB1\n",
+            "    movq %r10, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            !changed,
+            "a base read in the gap must block the fold:\n{out}"
+        );
+        assert!(out.contains("leaq -1(%r9), %rax"), "{out}");
+        assert!(out.contains("movq %rax, %r9"), "{out}");
     }
 
     /// 32-bit latch: same fold at `leal`/`movl` width.

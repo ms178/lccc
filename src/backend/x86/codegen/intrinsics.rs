@@ -947,6 +947,13 @@ impl X86Codegen {
             }
         }
 
+        if args[0] == args[1] {
+            self.sse_load_arg(&args[0], "xmm0");
+            self.state
+                .emit_fmt(format_args!("    {} %xmm0, %xmm0", sse_inst));
+            self.sse_store_dest(dest_ptr, "xmm0");
+            return;
+        }
         let a1_last = matches!(&args[1], Operand::Value(v)
             if self.state.sse_last_store_reg && self.state.sse_last_store_val == Some(v.0));
         if a1_last {
@@ -7041,7 +7048,7 @@ impl X86Codegen {
             }
             IntrinsicOp::VecMulI32x4 => {
                 if let Some(d) = dest {
-                    self.emit_int_mul_i32x4(d, args);
+                    self.emit_sse_binary_128(d, args, "pmulld");
                 }
             }
             // Integer map lane ops. Sub is `src1 - src2` and NON-commutative:
