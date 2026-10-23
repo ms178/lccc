@@ -67,6 +67,26 @@ pub fn resolve_lib_positional(name: &str, paths: &[String], static_only: bool) -
     })
 }
 
+/// GNU ld's diagnostic for an `-lNAME` no search directory satisfies.
+pub fn cannot_find_lib(name: &str) -> String {
+    format!("cannot find -l{name}: No such file or directory")
+}
+
+/// Fail, as GNU ld does, on the first of the user's `-l` libraries that no
+/// directory of `paths` satisfies (`resolve_lib_positional` with
+/// `static_only`). Linkers that resolve libraries leniently -- the driver's
+/// default libraries may legitimately be absent -- call this for the user's
+/// libraries, which must never be dropped silently.
+pub fn require_libs(names: &[String], paths: &[String], static_only: bool) -> Result<(), String> {
+    match names
+        .iter()
+        .find(|name| resolve_lib_positional(name, paths, static_only).is_none())
+    {
+        Some(name) => Err(cannot_find_lib(name)),
+        None => Ok(()),
+    }
+}
+
 /// Resolve a file named inside a linker script (`GROUP` / `INPUT`).
 ///
 /// GNU ld semantics: an absolute name is looked up under `LCCC_SYSROOT`
@@ -170,7 +190,7 @@ pub fn expand_file_mode_libs(
             continue;
         }
         let path = resolve_lib_positional(&item.name, &dirs, item.static_search)
-            .ok_or_else(|| format!("cannot find -l{}", item.name))?;
+            .ok_or_else(|| cannot_find_lib(&item.name))?;
         let mut head = [0u8; 18];
         let n = std::fs::File::open(&path)
             .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
@@ -433,7 +453,7 @@ mod tests {
         let err = expand_file_mode_libs(&shared, &[], &[], "-T").unwrap_err();
         assert!(err.contains("libc1.so") && err.contains("-T"), "{err}");
         let err = expand_file_mode_libs(&["-lnope".to_string()], &[], &[], "-r").unwrap_err();
-        assert_eq!(err, "cannot find -lnope");
+        assert_eq!(err, "cannot find -lnope: No such file or directory");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

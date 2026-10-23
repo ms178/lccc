@@ -310,12 +310,20 @@ pub enum MachInst {
     },
 
     /// LEA: dst = base + index*scale + offset (3-address add).
-    /// x86 form: `leaq offset(%base, %index, scale), %dst`
+    /// x86 form: `lea{l,q} offset(%base, %index, scale), %dst`.
+    /// `size` is the OPERATION width: S64 for address/64-bit arithmetic,
+    /// S32 for 32-bit arithmetic (the multiply-by-constant plans). The
+    /// address registers are always 64-bit; `leal` writes the low 32 bits
+    /// of the sum and zero-extends, exactly the i32 result. A 64-bit `leaq`
+    /// for a 32-bit operation would READ the inputs' upper halves, which
+    /// blocks every relay/rename peephole after a zero-extending `movl`
+    /// copy and costs a REX.W prefix.
     Lea {
         base: MachReg,
         index: Option<(MachReg, u8)>,
         offset: i64,
         dst: MachReg,
+        size: OpSize,
     },
 
     /// `leaq sym(%rip), dst` — the address of a global.

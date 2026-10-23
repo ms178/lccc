@@ -393,8 +393,8 @@ fn link_with_gcc(
         cmd.arg(arg);
     }
 
-    // `-nodefaultlibs` drops the C and math libraries here as well; libgcc
-    // stays, and the driver's own `-lgcc` (added below, if any) is untouched.
+    // `-nodefaultlibs` (forwarded to gcc above, which then drops libgcc as
+    // well) also suppresses the C and math libraries added here.
     let is_nodefaultlibs = user_args.iter().any(|a| a == "-nodefaultlibs");
     if !is_nostdlib && !is_nodefaultlibs && !is_shared {
         cmd.arg("-lc");
@@ -943,13 +943,15 @@ fn resolve_builtin_link_setup(
     }
 
     // `-nostartfiles` and `-nodefaultlibs` are the other two GNU link-file
-    // switches and they are complementary (measured on GCC 14.2): with
-    // `-nostartfiles` the startup objects go and libc stays; with
-    // `-nodefaultlibs` the startup objects stay and libc/libm go -- while
-    // libgcc STAYS, because it is what resolves the runtime calls this
-    // backend itself emits (`__divti3` links under `-nodefaultlibs` and fails
-    // under `-nostdlib`; both measured).  Derived from `user_args`, the same
-    // single source `is_nostdlib` already uses.
+    // switches and they are complementary: with `-nostartfiles` the startup
+    // objects go and the libraries stay; with `-nodefaultlibs` the startup
+    // objects stay and EVERY default library goes, libgcc included -- gcc's
+    // spec is `%{!nostdlib:%{!nodefaultlibs:%(link_gcc_c_sequence)}}`, and
+    // `__udivti3` is an undefined reference under `-nodefaultlibs` with
+    // GCC 14.2 and 16.2 alike (measured; collect2 gets no `-l` at all).
+    // Code that wants libgcc there says `-lgcc`, as kernels and firmware
+    // do. Derived from `user_args`, the same single source `is_nostdlib`
+    // already uses.
     let is_nostartfiles = user_args.iter().any(|a| a == "-nostartfiles");
     let is_nodefaultlibs = user_args.iter().any(|a| a == "-nodefaultlibs");
 
@@ -996,12 +998,9 @@ fn resolve_builtin_link_setup(
         }
     }
 
-    // Default libraries.  `-nodefaultlibs` keeps libgcc (see above) and drops
-    // the C and math libraries, which is exactly GCC's split.
-    let needed_libs: Vec<String> = if is_nostdlib {
+    // Default libraries: none under `-nostdlib`/`-nodefaultlibs` (see above).
+    let needed_libs: Vec<String> = if is_nostdlib || is_nodefaultlibs {
         vec![]
-    } else if is_nodefaultlibs {
-        vec!["gcc".to_string()]
     } else {
         vec!["gcc".to_string(), "c".to_string(), "m".to_string()]
     };
@@ -1120,7 +1119,7 @@ fn pic_crt_objects(objs: &[String], start: Option<&str>) -> Vec<String> {
 /// the `arch.elf_machine` value.
 ///
 /// For shared library output (-shared), delegates to the per-arch `link_shared`
-/// entry point with library paths only (no CRT objects).
+/// entry point with gcc's `-shared` startup objects and default libraries.
 #[cfg(not(feature = "gcc_linker"))]
 fn link_builtin_native(
     arch: &DirectLdArchConfig,
@@ -1134,56 +1133,65 @@ fn link_builtin_native(
     use crate::backend::{arm, i686, riscv, x86};
 
     if is_shared {
-        // Shared libraries: no CRT objects, lib paths only
         let setup = resolve_builtin_link_setup(arch, user_args, true, false);
         let refs = setup.as_refs();
+        // gcc's -shared spec (measured, riscv64/aarch64/i686 alike):
+        // crti.o crtbeginS.o ... -lgcc --as-needed -lgcc_s -lc ... crtendS.o
+        // crtn.o; `-nostartfiles` drops the objects, `-nodefaultlibs` every
+        // library (the backends apply the per-library linking mode).
+        // Without crtbeginS.o the object has no `__dso_handle`, so
+        // `atexit`/`__cxa_atexit` registrations in it cannot be tied to its
+        // unloading (and libc_nonshared.a's `atexit` does not link).
+        let has = |f: &str| user_args.iter().any(|a| a == f);
+        let no_start_files = is_nostdlib || has("-nostartfiles");
+        let no_default_libs = is_nostdlib || has("-nodefaultlibs");
+        let crt = resolve_builtin_link_setup(arch, user_args, no_start_files, false);
+        let before = pic_crt_objects(&crt.crt_before, None);
+        let after = pic_crt_objects(&crt.crt_after, None);
+        let before: Vec<&str> = before.iter().map(String::as_str).collect();
+        let after: Vec<&str> = after.iter().map(String::as_str).collect();
+        let libs: &[&str] = if no_default_libs {
+            &[]
+        } else {
+            &["gcc", "gcc_s", "c"]
+        };
         return match arch.elf_machine {
-            EM_X86_64 => {
-                // x86-64 shared linker also takes implicit libs (gcc for runtime helpers)
-                let implicit_libs: Vec<&str> = if is_nostdlib { vec![] } else { vec!["gcc"] };
-                x86::linker::link_shared(
-                    object_files,
-                    output_path,
-                    user_args,
-                    &refs.lib_paths,
-                    &implicit_libs,
-                )
-            }
-            EM_AARCH64 => {
-                arm::linker::link_shared(object_files, output_path, user_args, &refs.lib_paths)
-            }
-            EM_RISCV => {
-                riscv::linker::link_shared(object_files, output_path, user_args, &refs.lib_paths)
-            }
-            EM_386 => {
-                // gcc's -shared spec: crti.o crtbeginS.o ... crtendS.o crtn.o
-                // with -lgcc, as-needed -lgcc_s and -lc (the backend applies
-                // the per-library linking mode).  Without crtbeginS.o the
-                // object has no `__dso_handle`, so `atexit`/`__cxa_atexit`
-                // registrations in it cannot be tied to its unloading.
-                let has = |f: &str| user_args.iter().any(|a| a == f);
-                let no_start_files = is_nostdlib || has("-nostartfiles");
-                let no_default_libs = is_nostdlib || has("-nodefaultlibs");
-                let crt = resolve_builtin_link_setup(arch, user_args, no_start_files, false);
-                let before = pic_crt_objects(&crt.crt_before, None);
-                let after = pic_crt_objects(&crt.crt_after, None);
-                let before: Vec<&str> = before.iter().map(String::as_str).collect();
-                let after: Vec<&str> = after.iter().map(String::as_str).collect();
-                let libs: &[&str] = if no_default_libs {
-                    &[]
-                } else {
-                    &["gcc", "gcc_s", "c"]
-                };
-                i686::linker::link_shared(
-                    object_files,
-                    output_path,
-                    user_args,
-                    &refs.lib_paths,
-                    &before,
-                    &after,
-                    libs,
-                )
-            }
+            EM_X86_64 => x86::linker::link_shared(
+                object_files,
+                output_path,
+                user_args,
+                &refs.lib_paths,
+                &before,
+                &after,
+                libs,
+            ),
+            EM_AARCH64 => arm::linker::link_shared(
+                object_files,
+                output_path,
+                user_args,
+                &refs.lib_paths,
+                &before,
+                &after,
+                libs,
+            ),
+            EM_RISCV => riscv::linker::link_shared(
+                object_files,
+                output_path,
+                user_args,
+                &refs.lib_paths,
+                &before,
+                &after,
+                libs,
+            ),
+            EM_386 => i686::linker::link_shared(
+                object_files,
+                output_path,
+                user_args,
+                &refs.lib_paths,
+                &before,
+                &after,
+                libs,
+            ),
             _ => Err(format!(
                 "No shared library linker for {} (elf_machine={})",
                 arch.arch_name, arch.elf_machine
@@ -4042,6 +4050,7 @@ mod value_type_map_tests {
                 is_const: false,
                 assume_library: false,
                 ret_eightbyte_classes: vec![],
+                cold: false,
             },
         }
     }

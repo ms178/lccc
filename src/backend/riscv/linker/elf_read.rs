@@ -27,8 +27,12 @@ pub type DynSymbol = linker_common::DynSymbol;
 // ── Parsing functions ────────────────────────────────────────────────────
 // Delegate to shared implementations.
 
+/// Every input object (command line or archive member) comes through here,
+/// so `R_RISCV_ALIGN` runs are trimmed before anything else looks at it.
 pub fn parse_object(data: &[u8], source_name: &str) -> Result<ElfObject, String> {
-    linker_common::parse_elf64_object(data, source_name, EM_RISCV)
+    let mut obj = linker_common::parse_elf64_object(data, source_name, EM_RISCV)?;
+    super::align::relax_align(&mut obj)?;
+    Ok(obj)
 }
 
 /// Parse a .a static archive and return all ELF .o members.
@@ -39,7 +43,12 @@ pub fn parse_archive(data: &[u8]) -> Result<Vec<(String, ElfObject)>, String> {
         let member_data = &data[offset..offset + size];
         if member_data.len() >= 4 && &member_data[0..4] == b"\x7fELF" {
             let full_name = format!("archive({})", name);
-            if let Ok(obj) = parse_object(member_data, &full_name) {
+            // A member that is not a RISC-V object is skipped; one that is
+            // but cannot be aligned is an error, not a silent omission.
+            if let Ok(mut obj) =
+                linker_common::parse_elf64_object(member_data, &full_name, EM_RISCV)
+            {
+                super::align::relax_align(&mut obj)?;
                 results.push((name, obj));
             }
         }
@@ -70,7 +79,10 @@ pub fn parse_thin_archive(
         })?;
         if member_data.len() >= 4 && &member_data[0..4] == b"\x7fELF" {
             let full_name = format!("archive({})", name);
-            if let Ok(obj) = parse_object(&member_data, &full_name) {
+            if let Ok(mut obj) =
+                linker_common::parse_elf64_object(&member_data, &full_name, EM_RISCV)
+            {
+                super::align::relax_align(&mut obj)?;
                 results.push((name, obj));
             }
         }

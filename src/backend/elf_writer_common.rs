@@ -105,6 +105,15 @@ pub trait X86Arch {
         false
     }
 
+    /// True for the GOT-base PC-relative type (R_386_GOTPC /
+    /// R_X86_64_GOTPC32): `GOT + A - P`. A difference `_GLOBAL_OFFSET_TABLE_
+    /// - label` resolved by the `external - local label` rule keeps it,
+    /// where a plain absolute field becomes PC-relative.
+    fn is_got_pc_reloc(reloc_type: u32) -> bool {
+        let _ = reloc_type;
+        false
+    }
+
     /// True for TLS relocation types (R_386_TLS_* / R_X86_64_*TLS*).
     ///
     /// TLS relocs are excluded from local-label folding: the fold rewrites a
@@ -3937,7 +3946,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         let existing = i16::from_le_bytes([data[off], data[off + 1]]);
                         let patched = existing.wrapping_add(addend as i16);
                         data[off..off + 2].copy_from_slice(&patched.to_le_bytes());
-                    } else if !patch1 && !patch16 && off + 4 <= data.len() {
+                    } else if !patch1 && !patch16 && reloc.patch_size != 0 && off + 4 <= data.len()
+                    {
                         let existing = i32::from_le_bytes([
                             data[off],
                             data[off + 1],
@@ -5568,6 +5578,8 @@ impl<A: X86Arch> ElfWriterCore<A> {
                         let off = reloc.offset as usize;
                         let data = &mut self.sections[sec_idx].data;
                         match reloc.patch_size {
+                            // A field-less marker (R_386_TLS_DESC_CALL).
+                            0 => {}
                             1 => {
                                 data[off] = v as u8;
                             }
@@ -5837,7 +5849,9 @@ impl<A: X86Arch> ElfWriterCore<A> {
                                     );
                                 };
                                 let mut conv = reloc.clone();
-                                conv.reloc_type = pc;
+                                if !A::is_got_pc_reloc(reloc.reloc_type) {
+                                    conv.reloc_type = pc;
+                                }
                                 conv.addend += reloc.offset as i64 - b_off as i64;
                                 conv.diff_symbol = None;
                                 unresolved.push(conv);
@@ -5999,6 +6013,57 @@ pub(crate) fn encode_sleb128(out: &mut Vec<u8>, mut val: i64) {
     }
 }
 
+/// `v` as an unsigned LEB128 of exactly `width` bytes (continuation bits on
+/// all but the last, the form a linker's in-place rewrite keeps), or `None`
+/// when it needs more. A deferred `.uleb128` reserves its width before its
+/// value is known; at convergence the width is the canonical length.
+pub(crate) fn uleb128_fixed(mut v: u64, width: usize) -> Option<Vec<u8>> {
+    if width == 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(width);
+    for i in 0..width {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        out.push(if i + 1 < width { byte | 0x80 } else { byte });
+    }
+    (v == 0).then_some(out)
+}
+
+/// Bytes in the canonical unsigned LEB128 of `v`.
+pub(crate) fn uleb128_len(v: u64) -> usize {
+    (64 - v.leading_zeros() as usize).div_ceil(7).max(1)
+}
+
+/// Signed twin of [`uleb128_fixed`]: `v` as a signed LEB128 of exactly
+/// `width` bytes, the padding bytes carrying the sign (`0x80`/`0xff` with
+/// continuation, so a decoder sign-extends from the final byte as usual),
+/// or `None` when it needs more.
+pub(crate) fn sleb128_fixed(mut v: i64, width: usize) -> Option<Vec<u8>> {
+    if width == 0 || sleb128_len(v) > width {
+        return None;
+    }
+    let mut out = Vec::with_capacity(width);
+    for i in 0..width {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        out.push(if i + 1 < width { byte | 0x80 } else { byte });
+    }
+    Some(out)
+}
+
+/// Bytes in the canonical signed LEB128 of `v`.
+pub(crate) fn sleb128_len(v: i64) -> usize {
+    // Significant bits plus the sign bit, seven per byte.
+    let bits = 65
+        - if v < 0 {
+            v.leading_ones()
+        } else {
+            v.leading_zeros()
+        } as usize;
+    bits.div_ceil(7).max(1)
+}
+
 /// Cheap gate for the `.`-rewrite in `encode_instruction`: true when any
 /// operand expression string contains a STANDALONE '.' (the location
 /// counter — bordered by non-identifier characters). Label names like
@@ -6104,6 +6169,64 @@ mod pad_queue_tests {
 #[cfg(test)]
 mod tests {
     use crate::backend::x86::assembler::assemble;
+
+    #[test]
+    fn fixed_width_leb128_round_trips_and_canonical_lengths() {
+        use super::{
+            encode_sleb128, encode_uleb128, sleb128_fixed, sleb128_len, uleb128_fixed, uleb128_len,
+        };
+        fn uleb_decode(b: &[u8]) -> u64 {
+            b.iter()
+                .enumerate()
+                .fold(0, |a, (i, &x)| a | (u64::from(x & 0x7f) << (7 * i)))
+        }
+        fn sleb_decode(b: &[u8]) -> i64 {
+            let mut v: i64 = 0;
+            for (i, &x) in b.iter().enumerate() {
+                v |= i64::from(x & 0x7f) << (7 * i);
+            }
+            let bits = 7 * b.len();
+            if bits < 64 && b[b.len() - 1] & 0x40 != 0 {
+                v |= -1i64 << bits;
+            }
+            v
+        }
+        for v in [0u64, 1, 63, 64, 127, 128, 16383, 16384, 1 << 35, u64::MAX] {
+            let mut canon = Vec::new();
+            encode_uleb128(&mut canon, v);
+            assert_eq!(uleb128_len(v), canon.len(), "{v}");
+            assert_eq!(uleb128_fixed(v, canon.len()), Some(canon.clone()), "{v}");
+            assert_eq!(uleb128_fixed(v, canon.len() - 1), None, "{v}");
+            if canon.len() < 10 {
+                let padded = uleb128_fixed(v, canon.len() + 1).unwrap();
+                assert_eq!(uleb_decode(&padded), v, "{v}");
+            }
+        }
+        for v in [
+            0i64,
+            1,
+            -1,
+            63,
+            64,
+            -64,
+            -65,
+            8191,
+            -8192,
+            8192,
+            i64::MAX,
+            i64::MIN,
+        ] {
+            let mut canon = Vec::new();
+            encode_sleb128(&mut canon, v);
+            assert_eq!(sleb128_len(v), canon.len(), "{v}");
+            assert_eq!(sleb128_fixed(v, canon.len()), Some(canon.clone()), "{v}");
+            assert_eq!(sleb128_fixed(v, canon.len() - 1), None, "{v}");
+            if canon.len() < 10 {
+                let padded = sleb128_fixed(v, canon.len() + 1).unwrap();
+                assert_eq!(sleb_decode(&padded), v, "{v}");
+            }
+        }
+    }
 
     fn sec_type_of(obj: &[u8], name: &str) -> Option<u32> {
         // Minimal ELF64 section-header walk (test-only).

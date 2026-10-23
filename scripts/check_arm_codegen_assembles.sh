@@ -41,7 +41,15 @@ for src in "${files[@]}"; do
     if ! "$cc" -O2 -I"$inc" -S "$src" -o "$tmp/$base.s" 2>"$tmp/$base.pp.err"; then
         # Host preprocessor / missing headers: skip this file, do not fail
         # the gate.  The encoder bugs this gate exists for only show up
-        # after a successful compile.
+        # after a successful compile.  Any OTHER compile failure (a backend
+        # refusal or crash on an arm_*.c regression) is a FAIL: counting it
+        # as a skip would hide exactly the AArch64 codegen bugs these files
+        # pin.
+        if ! grep -Eq 'preprocessor error' "$tmp/$base.pp.err"; then
+            echo "FAIL: $base.c did not compile for AArch64" >&2
+            cat "$tmp/$base.pp.err" >&2
+            exit 1
+        fi
         skipped_pp=$((skipped_pp + 1))
         continue
     fi

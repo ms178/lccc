@@ -501,3 +501,104 @@ pub(crate) fn fma231_mnemonic(
         (true, true, false) => "vfnmsub231ss",
     }
 }
+
+/// x86/i686 prefetch-ISA permissions resolved by the driver
+/// (`Driver::resolved_prefetch_sse` / `Driver::resolved_prfchw`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct X86PrefetchIsa {
+    /// `prefetchnta/t0/t1/t2` (`0F 18 /0-3`) are legal.
+    pub(crate) sse: bool,
+    /// `prefetchw` (`0F 0D /1`) is legal.
+    pub(crate) prfchw: bool,
+}
+
+/// The x86/i686 instruction for an `IntrinsicOp::Prefetch` payload, or
+/// `None` when the target has no legal prefetch form for it (the hint is
+/// then dropped — always semantics-preserving).
+///
+/// GCC 16.2 parity, measured for all eight `(rw, locality)` pairs:
+/// write intent becomes `prefetchw` exactly when PRFCHW is enabled (for
+/// every locality); otherwise read and write hints share the locality
+/// table (0 → `nta`, 1 → `t2`, 2 → `t1`, 3 → `t0`).
+pub(crate) fn prefetch_mnemonic(payload: u8, isa: X86PrefetchIsa) -> Option<&'static str> {
+    let hint = crate::ir::reexports::PrefetchHint::decode(payload);
+    if hint.write && isa.prfchw {
+        return Some("prefetchw");
+    }
+    if !isa.sse {
+        return None;
+    }
+    Some(match hint.locality {
+        0 => "prefetchnta",
+        1 => "prefetcht2",
+        2 => "prefetcht1",
+        _ => "prefetcht0",
+    })
+}
+
+#[cfg(test)]
+mod prefetch_mnemonic_tests {
+    use super::{X86PrefetchIsa, prefetch_mnemonic};
+    use crate::ir::reexports::PrefetchHint;
+
+    const LOCALITY: [&str; 4] = ["prefetchnta", "prefetcht2", "prefetcht1", "prefetcht0"];
+
+    fn p(write: bool, loc: u8) -> u8 {
+        PrefetchHint::new(write, loc).encode()
+    }
+
+    /// GCC 16.2, x86-64 baseline and `-m32 -msse`: read and write share the
+    /// locality table (defect 15: write used to collapse onto `prefetcht0`).
+    #[test]
+    fn without_prfchw_write_hints_keep_their_locality() {
+        let isa = X86PrefetchIsa {
+            sse: true,
+            prfchw: false,
+        };
+        for loc in 0..4u8 {
+            assert_eq!(
+                prefetch_mnemonic(p(false, loc), isa),
+                Some(LOCALITY[loc as usize])
+            );
+            assert_eq!(
+                prefetch_mnemonic(p(true, loc), isa),
+                Some(LOCALITY[loc as usize])
+            );
+        }
+    }
+
+    /// GCC 16.2 `-mprfchw` / `-march=raptorlake`: every write hint is
+    /// `prefetchw`, read hints are unchanged.
+    #[test]
+    fn with_prfchw_write_hints_are_prefetchw() {
+        for sse in [true, false] {
+            let isa = X86PrefetchIsa { sse, prfchw: true };
+            for loc in 0..4u8 {
+                assert_eq!(prefetch_mnemonic(p(true, loc), isa), Some("prefetchw"));
+            }
+        }
+    }
+
+    /// Defect 14: GCC emits nothing for `-m32` without SSE/PRFCHW.
+    #[test]
+    fn without_any_prefetch_isa_nothing_is_emitted() {
+        let isa = X86PrefetchIsa::default();
+        for payload in 0u8..=255 {
+            assert_eq!(prefetch_mnemonic(payload, isa), None);
+        }
+    }
+
+    #[test]
+    fn every_payload_has_a_defined_mnemonic() {
+        let isa = X86PrefetchIsa {
+            sse: true,
+            prfchw: false,
+        };
+        for payload in 0u8..=255 {
+            assert_eq!(
+                prefetch_mnemonic(payload, isa),
+                prefetch_mnemonic(payload & 7, isa)
+            );
+        }
+    }
+}

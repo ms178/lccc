@@ -47,22 +47,22 @@ fences=$(function_body fence_all)
 
 grep -q 'negl %edx' <<<"$sub"
 grep -q 'lock xaddb %dl' <<<"$sub"
-! grep -q 'cmpxchg' <<<"$sub"
+! grep -q 'cmpxchg' <<<"$sub" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 
 grep -q 'andl (%esp), %edx' <<<"$and"
 grep -q 'lock cmpxchgw %dx' <<<"$and"
-! grep -qE 'andw|andb' <<<"$and"
+! grep -qE 'andw|andb' <<<"$and" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 
 grep -q 'lock cmpxchgb %dl' <<<"$cas"
 grep -q 'movzbl %al, %eax' <<<"$cas"
 
 grep -q 'xchgb %dl' <<<"$store"
-! grep -q 'mfence' <<<"$store"
+! grep -q 'mfence' <<<"$store" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 
 # Three non-relaxed source fences, each using the generic-i686 locked stack
 # operation used by GCC and Clang. No SSE2-only MFENCE or scratch-register
 # sequence may leak in.
 [ "$(grep -c 'lock orl \$0, (%esp)' <<<"$fences")" -eq 3 ]
-! grep -qE 'mfence|xchgl|pushfl|popfl' <<<"$fences"
+! grep -qE 'mfence|xchgl|pushfl|popfl' <<<"$fences" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 
 echo 'i686 atomic code-generation contract: PASS'

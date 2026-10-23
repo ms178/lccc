@@ -77,6 +77,21 @@ pub struct LivenessResult {
     pub segments: Vec<LiveInterval>,
     /// Sorted program points that clobber the caller-saved set.
     pub call_points: Vec<u32>,
+    /// Sorted subset of `call_points`: hidden call SEQUENCES that are not
+    /// source-level calls -- a dynamic-model TLS address the backend emits as
+    /// a branch-and-link (`common::tls::address_is_call_sequence`). They
+    /// clobber exactly like a call for home ELIGIBILITY (no caller-saved home
+    /// may span one: the text peephole models the `blr` as a full call), but
+    /// the allocator's spill-PRIORITY heuristics (Phase 1 promotion, leaf
+    /// detection, Phase 2c admission) must not treat them as calls: doing so
+    /// handed every value spanning one TLS access the callee-saved pool ahead
+    /// of the function's hot parameters, which then spilled.
+    pub sequence_call_points: Vec<u32>,
+    /// Sorted subset of `call_points`: calls whose `CallInfo::cold` hint is
+    /// set, i.e. calls on rarely executed paths.
+    pub cold_call_points: Vec<u32>,
+    /// Result value of each cold call, parallel to `cold_call_points`.
+    pub cold_call_results: Vec<Option<u32>>,
     /// Loop nesting depth per block. Length is always `func.blocks.len()`.
     pub block_loop_depth: Vec<u32>,
     /// Linearized `[header_start, latch_end]` extent of every natural loop
@@ -397,6 +412,9 @@ struct ProgramPointState {
     /// SSA / phi-elim copy edges `dest → [src, …]`.
     copy_src: FxHashMap<u32, Vec<u32>>,
     call_points: Vec<u32>,
+    sequence_call_points: Vec<u32>,
+    cold_call_points: Vec<u32>,
+    cold_call_results: Vec<Option<u32>>,
     num_points: u32,
     /// Per-value, per-block def/use footprints (see [`BlockTouches`]).
     touches: BlockTouches,
@@ -439,6 +457,9 @@ pub fn compute_live_intervals_with_hidden_reads(
             intervals: Vec::new(),
             segments: Vec::new(),
             call_points: Vec::new(),
+            sequence_call_points: Vec::new(),
+            cold_call_points: Vec::new(),
+            cold_call_results: Vec::new(),
             block_loop_depth: Vec::new(),
             loop_extents: Vec::new(),
             block_starts: Vec::new(),
@@ -463,9 +484,6 @@ pub fn compute_live_intervals_with_hidden_reads(
         &alloca_set,
         &id_to_dense,
         &ps.copy_src,
-        &ps.def_points,
-        &ps.block_start_points,
-        &ps.block_end_points,
         &mut ps.last_use_points,
         &mut ps.block_gen,
         &mut folded_read_points,
@@ -478,9 +496,6 @@ pub fn compute_live_intervals_with_hidden_reads(
         &alloca_set,
         &id_to_dense,
         &ps.copy_src,
-        &ps.def_points,
-        &ps.block_start_points,
-        &ps.block_end_points,
         &mut ps.last_use_points,
         &mut ps.block_gen,
         &mut folded_read_points,
@@ -538,6 +553,7 @@ pub fn compute_live_intervals_with_hidden_reads(
         num_blocks,
         &live_in,
         &live_out,
+        &ps.touches,
         &ps.block_start_points,
         &ps.block_end_points,
         &mut ps.def_points,
@@ -599,6 +615,9 @@ pub fn compute_live_intervals_with_hidden_reads(
         intervals,
         segments,
         call_points: ps.call_points,
+        sequence_call_points: ps.sequence_call_points,
+        cold_call_points: ps.cold_call_points,
+        cold_call_results: ps.cold_call_results,
         block_loop_depth,
         loop_extents,
         block_starts: ps.block_start_points,
@@ -721,6 +740,9 @@ fn assign_program_points(
     let mut f128_loads: Vec<(u32, u32)> = Vec::new();
     let mut copy_src: FxHashMap<u32, Vec<u32>> = FxHashMap::default();
     let mut call_points: Vec<u32> = Vec::new();
+    let mut sequence_call_points: Vec<u32> = Vec::new();
+    let mut cold_call_points: Vec<u32> = Vec::new();
+    let mut cold_call_results: Vec<Option<u32>> = Vec::new();
     let mut touches = BlockTouches::new(num_values);
 
     for (block_idx, block) in func.blocks.iter().enumerate() {
@@ -735,6 +757,17 @@ fn assign_program_points(
             }
             if instruction_is_call_point(inst) {
                 call_points.push(point);
+                if matches!(inst, Instruction::GlobalAddr { .. }) {
+                    sequence_call_points.push(point);
+                }
+                if let Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } =
+                    inst
+                {
+                    if info.cold {
+                        cold_call_points.push(point);
+                        cold_call_results.push(info.dest.map(|d| d.0));
+                    }
+                }
             }
             if let Instruction::Copy {
                 dest,
@@ -895,6 +928,9 @@ fn assign_program_points(
         f128_loads,
         copy_src,
         call_points,
+        sequence_call_points,
+        cold_call_points,
+        cold_call_results,
         num_points: point,
         touches,
     }
@@ -905,6 +941,9 @@ fn instruction_is_call_point(inst: &Instruction) -> bool {
     let is_32bit = crate::common::types::target_is_32bit();
     match inst {
         Instruction::Call { .. } | Instruction::CallIndirect { .. } => true,
+        // A dynamic-model TLS address that the backend emits as a real call
+        // (`common::tls::set_call_sequence_symbols`).
+        Instruction::GlobalAddr { name, .. } => crate::common::tls::address_is_call_sequence(name),
         Instruction::InlineAsm {
             outputs,
             inputs,
@@ -1017,9 +1056,6 @@ fn extend_gep_base_liveness(
     alloca_set: &FxHashSet<u32>,
     id_to_dense: &FxHashMap<u32, usize>,
     copy_src: &FxHashMap<u32, Vec<u32>>,
-    def_points: &[u32],
-    block_start_points: &[u32],
-    block_end_points: &[u32],
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
     folded_read_points: &mut FxHashMap<u32, Vec<u32>>,
@@ -1266,8 +1302,6 @@ fn extend_gep_base_liveness(
                                 bi,
                                 alloca_set,
                                 id_to_dense,
-                                def_points,
-                                &(block_start_points[bi], block_end_points[bi]),
                                 copy_src,
                                 hidden_read_copy_chain_enabled(),
                                 last_use_points,
@@ -1290,8 +1324,6 @@ fn extend_gep_base_liveness(
                             bi,
                             alloca_set,
                             id_to_dense,
-                            def_points,
-                            &(block_start_points[bi], block_end_points[bi]),
                             copy_src,
                             // Precise read contract for GEP bases as well as
                             // operand/index sites: the folded access re-reads
@@ -1338,9 +1370,6 @@ fn extend_hidden_operand_reads(
     alloca_set: &FxHashSet<u32>,
     id_to_dense: &FxHashMap<u32, usize>,
     copy_src: &FxHashMap<u32, Vec<u32>>,
-    def_points: &[u32],
-    block_start_points: &[u32],
-    block_end_points: &[u32],
     last_use_points: &mut [u32],
     block_gen: &mut [BitSet],
     read_points: &mut FxHashMap<u32, Vec<u32>>,
@@ -1361,7 +1390,6 @@ fn extend_hidden_operand_reads(
     let mut point: u32 = 0;
     let mut hits: Vec<u32> = Vec::new();
     for (bi, block) in func.blocks.iter().enumerate() {
-        let range = (block_start_points[bi], block_end_points[bi]);
         let mut read_at = |hits: &mut Vec<u32>, point: u32| {
             hits.sort_unstable();
             hits.dedup();
@@ -1376,8 +1404,6 @@ fn extend_hidden_operand_reads(
                         bi,
                         alloca_set,
                         id_to_dense,
-                        def_points,
-                        &range,
                         copy_src,
                         // Precise read contract: a folded access re-reads
                         // the operand's own register, not its Copy-chain
@@ -1495,8 +1521,6 @@ fn extend_use_following_copies(
     block_idx: usize,
     alloca_set: &FxHashSet<u32>,
     id_to_dense: &FxHashMap<u32, usize>,
-    def_points: &[u32],
-    block_range: &(u32, u32),
     copy_src: &FxHashMap<u32, Vec<u32>>,
     follow_copies: bool,
     last_use_points: &mut [u32],
@@ -1514,6 +1538,19 @@ fn extend_use_following_copies(
             continue;
         }
         if let Some(&dense) = id_to_dense.get(&id) {
+            // Upward exposed unless a LOCAL def strictly precedes the read.
+            // Asked of the block footprint, not of the global first def:
+            // a phi-eliminated value is defined in several blocks, so its
+            // first def says nothing about this block (a later local def
+            // was missed and the read made the value live back to the
+            // entry, pinning linux_rbtree's search pointer through the
+            // whole function; a first def laid out AFTER the read in this
+            // block would have hidden a real upward-exposed read). The
+            // footprint is complete here: both callers run after the
+            // main walk. Query it before recording this read.
+            let local_def_before = touches
+                .get(dense, block_idx)
+                .is_some_and(|t| t.first_is_def && t.first < point);
             let entry = &mut last_use_points[dense];
             if *entry == u32::MAX || point > *entry {
                 *entry = point;
@@ -1523,13 +1560,7 @@ fn extend_use_following_copies(
             // with no IR operand — record the exact point for the
             // phi-coalesce destructive-update veto (phi_live_in_window).
             read_points.entry(id).or_default().push(point);
-            // Only values whose def is NOT inside the consuming block are
-            // live at its entry. SSA dominance guarantees a same-block def
-            // precedes the use, so the fat interval already covers it.
-            let def_in_block = def_points[dense] != u32::MAX
-                && def_points[dense] >= block_range.0
-                && def_points[dense] <= block_range.1;
-            if !def_in_block {
+            if !local_def_before {
                 block_gen[block_idx].insert(dense);
             }
         }
@@ -1949,19 +1980,34 @@ fn run_backward_dataflow(
 
 /// Fat-interval live-through pull.
 ///
-/// Live-*in* to B covers `[B.start, B.end]` (may pull `def` earlier — needed
-/// for loop-carried values whose def is later in layout).
+/// Live-*in* to B pulls `def` back to `B.start` (needed for loop-carried
+/// values whose def is later in layout). It extends `last_use` to `B.end`
+/// only when the value is also live-*out*; a value that dies in B
+/// (`live_in && !live_out`) is covered to its LAST LOCAL EVENT -- def or
+/// use, from the same per-block footprint the segments are built from.
+/// The block-end pull made every value read in an exit block look live to
+/// that block's end: zlib_ng_adler32's loop-carried sum, read once after
+/// the loop, "conflicted" with every post-loop temporary (the phi coalesce
+/// kept three latch copies per iteration) and any later call counted as
+/// spanned. The footprint includes defs because a dead redefinition still
+/// writes the home register; a live-in block with no recorded footprint
+/// (impossible by the dataflow equations) keeps the block end.
+/// `CCC_LIVE_IN_BLOCK_END=1` restores the historical pull for bisection.
+///
 /// Live-*out* of B only extends `last_use` to `B.end`. Pulling `def` back to
 /// `B.start` for a value *defined in B* invented a live range before the def.
+#[expect(clippy::too_many_arguments)]
 fn extend_intervals_from_liveness(
     num_blocks: usize,
     live_in: &[BitSet],
     live_out: &[BitSet],
+    touches: &BlockTouches,
     block_start_points: &[u32],
     block_end_points: &[u32],
     def_points: &mut [u32],
     last_use_points: &mut [u32],
 ) {
+    let block_end_pull = live_in_block_end_pull();
     for idx in 0..num_blocks {
         let start = block_start_points[idx];
         let end = block_end_points[idx];
@@ -1971,9 +2017,14 @@ fn extend_intervals_from_liveness(
             if *def_entry == u32::MAX || start < *def_entry {
                 *def_entry = start;
             }
+            let reach = if block_end_pull || live_out[idx].contains(dense_idx) {
+                end
+            } else {
+                touches.get(dense_idx, idx).map_or(end, |t| t.last)
+            };
             let entry = &mut last_use_points[dense_idx];
-            if *entry == u32::MAX || end > *entry {
-                *entry = end;
+            if *entry == u32::MAX || reach > *entry {
+                *entry = reach;
             }
         });
 
@@ -1987,6 +2038,14 @@ fn extend_intervals_from_liveness(
             }
         });
     }
+}
+
+/// `CCC_LIVE_IN_BLOCK_END=1`: the historical block-end pull for values that
+/// die inside a block they are live-in to (fat intervals and the segment
+/// envelope), see [`extend_intervals_from_liveness`]. Cached per process.
+fn live_in_block_end_pull() -> bool {
+    static PULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PULL.get_or_init(|| std::env::var_os("CCC_LIVE_IN_BLOCK_END").is_some())
 }
 
 /// Hole-aware segments from per-block def/use footprints + block
@@ -2005,10 +2064,18 @@ fn extend_intervals_from_liveness(
 /// * on top of that the historical envelope derived from the global
 ///   `raw_def` / `raw_last` points is kept as a floor in every block the
 ///   value is live-in to or live-out of, so no coverage this builder
-///   produced before the per-block footprints existed is ever removed
-///   (a `live_in && !live_out` block stays covered to its end where the
-///   last local read would do; tightening that is a separate, measurable
-///   change — see engineering notes).
+///   produced before the per-block footprints existed is ever removed --
+///   except in a `live_in && !live_out` block holding neither global
+///   point, whose floor ends at the last local event exactly like the fat
+///   interval (see [`extend_intervals_from_liveness`]; segments must never
+///   outgrow the interval). The other exception is the start of a
+///   `!live_in` block whose first local event is a def while the global
+///   first def lies in another block (phi-eliminated multi-def values):
+///   the value is provably dead before that def (an upward-exposed read
+///   would make it live-in), and the old block-start floor made a call
+///   between the block start and the def count as spanned — e.g. the cold
+///   `sqrt` call whose result is copied into the errno-guard phi got a
+///   dead XMM save/restore around it.
 ///
 /// The per-block footprints are what make multi-def (phi-eliminated) values
 /// correct: without them a latch block that re-defines and reads the value
@@ -2034,6 +2101,7 @@ fn build_segments(
     let mut seen = vec![false; nvals];
     let mut touched: Vec<usize> = Vec::new();
     let touched_by_block = touches.by_block(num_blocks);
+    let block_end_pull = live_in_block_end_pull();
 
     for b in 0..num_blocks {
         let bs = block_starts[b];
@@ -2064,6 +2132,12 @@ fn build_segments(
                     bs
                 } else if def_in {
                     def
+                } else if let Some(t) = touch.filter(|t| t.first_is_def) {
+                    // Not live-in and born by a LOCAL def while the global
+                    // first def is in another block (a phi-eliminated
+                    // multi-def value): dead from the block start up to
+                    // that def, so the floor must not start earlier.
+                    t.first
                 } else {
                     bs
                 };
@@ -2073,6 +2147,8 @@ fn build_segments(
                     last
                 } else if def_in {
                     def
+                } else if let Some(t) = touch.filter(|_| li && !block_end_pull) {
+                    t.last
                 } else {
                     be
                 };
@@ -2502,7 +2578,323 @@ mod tests {
             is_const: false,
             assume_library: false,
             ret_eightbyte_classes: Vec::new(),
+            cold: false,
         }
+    }
+
+    /// 16-byte atomics lower to libatomic calls (or a stack-staging
+    /// `lock cmpxchg16b`), so every kind clobbers the caller-saved set
+    /// (a 16-byte test-and-set is `__atomic_exchange_16`); narrower atomics
+    /// are inline and do not.
+    #[test]
+    fn sixteen_byte_atomics_are_call_points() {
+        use crate::ir::ops::{AtomicOrdering, AtomicRmwOp};
+        let p = Operand::Value(Value(1));
+        let v = Operand::Value(Value(2));
+        let sc = AtomicOrdering::SeqCst;
+        for (ty, expect) in [
+            (IrType::I128, true),
+            (IrType::U128, true),
+            (IrType::I64, false),
+            (IrType::U32, false),
+        ] {
+            let insts = [
+                Instruction::AtomicLoad {
+                    dest: Value(3),
+                    ptr: p,
+                    ty,
+                    ordering: sc,
+                },
+                Instruction::AtomicStore {
+                    ptr: p,
+                    val: v,
+                    ty,
+                    ordering: sc,
+                },
+                Instruction::AtomicRmw {
+                    dest: Value(3),
+                    op: AtomicRmwOp::Add,
+                    ptr: p,
+                    val: v,
+                    ty,
+                    ordering: sc,
+                },
+                Instruction::AtomicCmpxchg {
+                    dest: Value(3),
+                    ptr: p,
+                    expected: v,
+                    desired: v,
+                    ty,
+                    success_ordering: sc,
+                    failure_ordering: sc,
+                    returns_bool: true,
+                },
+                Instruction::AtomicRmw {
+                    dest: Value(3),
+                    op: AtomicRmwOp::TestAndSet,
+                    ptr: p,
+                    val: v,
+                    ty,
+                    ordering: sc,
+                },
+            ];
+            for inst in &insts {
+                assert_eq!(instruction_is_call_point(inst), expect, "{ty:?} {inst:?}");
+            }
+        }
+    }
+
+    /// A phi-eliminated multi-def value (`v5`) born by a LOCAL Copy after a
+    /// call in a block it is not live-in to must not be live at that call:
+    /// the historical block-start floor made the call count as spanned
+    /// (dead XMM save/restore around the cold errno `sqrt` call).
+    #[test]
+    fn multi_def_value_is_not_live_before_its_local_def() {
+        let mut func = IrFunction::new("guard".to_string(), IrType::I64, vec![], false);
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(0),
+                op: IrBinOp::Add,
+                lhs: Operand::Const(IrConst::I64(40)),
+                rhs: Operand::Const(IrConst::I64(2)),
+                ty: IrType::I64,
+            }],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(1),
+                false_label: BlockId(3),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![Instruction::Copy {
+                dest: Value(5),
+                src: Operand::Value(Value(0)),
+            }],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
+            source_spans: Vec::new(),
+        });
+        let mut info = empty_call_info(Some(Value(6)));
+        info.args = vec![Operand::Value(Value(0))];
+        info.arg_types = vec![IrType::I64];
+        info.return_type = IrType::I64;
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![
+                Instruction::Call {
+                    func: "slow".to_string(),
+                    info,
+                },
+                Instruction::Copy {
+                    dest: Value(5),
+                    src: Operand::Value(Value(6)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(2)),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 7;
+
+        let r = compute_live_intervals(&func);
+        let covers = |v: u32, p: u32| {
+            r.segments
+                .iter()
+                .any(|s| s.value_id == v && s.start <= p && p <= s.end)
+        };
+        let &call = r.call_points.last().expect("the call in block 3");
+        // The block-3 copy is the point right after the call.
+        assert!(covers(5, call + 1), "v5 is live from its local def");
+        assert!(
+            !covers(5, call),
+            "v5 must not be live at the call preceding its local def"
+        );
+        // Control: the argument is still read at the call.
+        assert!(covers(0, call), "the call argument is read at the call");
+    }
+
+    /// LIVE-GEP-BASE-COPY-CHAIN (linux_rbtree's search loop): the base of a
+    /// folded `GEP(p, +8)` is read at the access, and NOTHING behind it. `p`
+    /// is loop-carried (entry `v1 = Copy(v0)`, latch `v1 = Copy(load)`); the
+    /// former base walk followed the copy chain, making the entry source `v0`
+    /// an upward-exposed read at the access — live around the backedge for
+    /// the whole loop, which spilled the search pointer every iteration.
+    #[test]
+    fn folded_gep_base_does_not_pin_its_copy_source_through_the_loop() {
+        use crate::common::types::AddressSpace;
+        let mut func = IrFunction::new("search".to_string(), IrType::I32, vec![], false);
+        // B0 points: v0 = 0, entry copy = 1, term = 2.
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(0),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Const(IrConst::I64(4096)),
+                    rhs: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::I64,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(0)),
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(1)),
+            source_spans: Vec::new(),
+        });
+        // B1 points: GEP = 3, Load (the access) = 4, latch copy = 5,
+        // Cmp = 6, term = 7.
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![
+                Instruction::GetElementPtr {
+                    dest: Value(2),
+                    base: Value(1),
+                    offset: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::Ptr,
+                },
+                Instruction::Load {
+                    dest: Value(3),
+                    ptr: Value(2),
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                Instruction::Copy {
+                    dest: Value(1),
+                    src: Operand::Value(Value(3)),
+                },
+                Instruction::Cmp {
+                    dest: Value(4),
+                    op: crate::ir::reexports::IrCmpOp::Ne,
+                    lhs: Operand::Value(Value(1)),
+                    rhs: Operand::Const(IrConst::I64(0)),
+                    ty: IrType::I64,
+                },
+            ],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(4)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Const(IrConst::I32(0)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 5;
+        // Forced precise: the assertion is the contract, independent of the
+        // bisection knob (and serialized on the shared flag lock).
+        let _pin =
+            crate::test_support::TriStateFlagWindow::new(&HIDDEN_READ_COPY_CHAIN_OVERRIDE, 0);
+        let r = compute_live_intervals_with_hidden_reads(&func, &FxHashMap::default());
+        let covers = |v: u32, p: u32| {
+            r.segments
+                .iter()
+                .any(|s| s.value_id == v && s.start <= p && p <= s.end)
+        };
+        assert!(covers(1, 4), "the folded base itself is read at the access");
+        for p in 3..=7 {
+            assert!(!covers(0, p), "v0 must die at the entry copy, live at {p}");
+        }
+    }
+
+    /// LIVE-FOLDED-READ-FIRST-DEF: a folded read of a multi-def value defined
+    /// LOCALLY before the read is not upward exposed. `v5`'s global first def
+    /// is laid out in B1, so the former first-def test called B2's read
+    /// upward exposed and made v5 live-in to B2 — and live back to the entry
+    /// through B0, where it is not even defined yet.
+    #[test]
+    fn folded_read_after_a_local_def_of_a_multi_def_value_is_not_live_in() {
+        use crate::common::types::AddressSpace;
+        let mut func = IrFunction::new("merge".to_string(), IrType::I64, vec![], false);
+        // B0 points: v0 = 0, term = 1.
+        func.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::BinOp {
+                dest: Value(0),
+                op: IrBinOp::Add,
+                lhs: Operand::Const(IrConst::I64(4096)),
+                rhs: Operand::Const(IrConst::I64(0)),
+                ty: IrType::I64,
+            }],
+            terminator: Terminator::CondBranch {
+                cond: Operand::Value(Value(0)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+            source_spans: Vec::new(),
+        });
+        // B1 points: the first def of v5 = 2, term = 3.
+        func.blocks.push(BasicBlock {
+            label: BlockId(1),
+            instructions: vec![Instruction::Copy {
+                dest: Value(5),
+                src: Operand::Value(Value(0)),
+            }],
+            terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
+        });
+        // B2 points: v6 = 4, local def of v5 = 5, GEP = 6, Load = 7, term = 8.
+        func.blocks.push(BasicBlock {
+            label: BlockId(2),
+            instructions: vec![
+                Instruction::BinOp {
+                    dest: Value(6),
+                    op: IrBinOp::Add,
+                    lhs: Operand::Value(Value(0)),
+                    rhs: Operand::Const(IrConst::I64(64)),
+                    ty: IrType::I64,
+                },
+                Instruction::Copy {
+                    dest: Value(5),
+                    src: Operand::Value(Value(6)),
+                },
+                Instruction::GetElementPtr {
+                    dest: Value(7),
+                    base: Value(5),
+                    offset: Operand::Const(IrConst::I64(8)),
+                    ty: IrType::Ptr,
+                },
+                Instruction::Load {
+                    dest: Value(8),
+                    ptr: Value(7),
+                    ty: IrType::I64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+            terminator: Terminator::Branch(BlockId(3)),
+            source_spans: Vec::new(),
+        });
+        func.blocks.push(BasicBlock {
+            label: BlockId(3),
+            instructions: vec![],
+            terminator: Terminator::Return(Some(Operand::Value(Value(5)))),
+            source_spans: Vec::new(),
+        });
+        func.next_value_id = 9;
+        let _pin =
+            crate::test_support::TriStateFlagWindow::new(&HIDDEN_READ_COPY_CHAIN_OVERRIDE, 0);
+        let r = compute_live_intervals_with_hidden_reads(&func, &FxHashMap::default());
+        let covers = |v: u32, p: u32| {
+            r.segments
+                .iter()
+                .any(|s| s.value_id == v && s.start <= p && p <= s.end)
+        };
+        assert!(covers(5, 7), "the folded base is read at the access");
+        assert!(!covers(5, 4), "v5 is dead in B2 before its local def");
+        assert!(!covers(5, 1), "v5 must not be live at the end of B0");
     }
 
     /// The precise Copy-web contract (sqlite_varint's reversal loop): a

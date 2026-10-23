@@ -32,6 +32,9 @@ for arch in aarch64 riscv64; do
     "$cc" -O2 -fPIC -shared -S "$FIX/wide.c" -o "$TD/$arch-wide.s"
     "$cc" -O2 -fPIC -shared -c "$FIX/wide.c" -o "$TD/$arch-wide.o"
     "$cc" -O2 -fPIC -shared -S "$FIX/fp.c" -o "$TD/$arch-fp.s"
+    # Scratch-register discipline across the resolver call itself (gd_acc.c).
+    "$cc" -O2 -fPIC -shared -S "$FIX/gd_acc.c" -o "$TD/$arch-gdacc.s"
+    "$cc" -O2 -fPIC -shared -c "$FIX/gd_acc.c" -o "$TD/$arch-gdacc.o"
 done
 
 # Static executable defaults: preemptible external is IE, definition is LE.
@@ -152,6 +155,52 @@ for f in "$TD"/aarch64-*.s; do
     [ -z "$offenders" ] || bad "AArch64 $(basename "$f") reads x29 without establishing it: $offenders"
 done
 
+# RISC-V: `call __tls_get_addr` clobbers t0, the codegen accumulator. Any read
+# of t0 after the call that no write precedes is a stale register-cache hit
+# (gd_acc.c `w2` stored the resolver's leftover t0 instead of `v`). Operand 1
+# is the destination except for stores and branches, which only read.
+riscv_stale_t0() {
+    awk '
+        /^[A-Za-z_][A-Za-z_0-9$.]*:/ { fn = $1; armed = 0; next }
+        /call[ \t]+__tls_get_addr/ { armed = 1; next }
+        armed && /^[ \t]*[a-z]/ {
+            line = $0; sub(/^[ \t]+/, "", line); n = split(line, p, /[ \t,()]+/)
+            first = (p[1] ~ /^(s[bhwd]|beq|bne|blt|bge|bltu|bgeu|beqz|bnez)$/) ? 2 : 3
+            for (i = first; i <= n; i++) if (p[i] == "t0") { print fn " " line; armed = 0; next }
+            if (p[2] == "t0" || p[1] ~ /^(ret|call|tail|j|jr)$/) armed = 0
+        }
+    ' "$1"
+}
+# AArch64: the TLSDESC `blr` is a full call to the text peephole, so the
+# allocator must keep every caller-saved pool register (x4-x8, x13, x14) out
+# of homes that span it. A pool register read after the `blr` that no write
+# precedes is such a home.
+aarch64_pool_across_tlsdesc() {
+    awk '
+        /^[A-Za-z_][A-Za-z_0-9$.]*:/ { fn = $1; armed = 0; td = 0; next }
+        /\.tlsdesccall/ { td = 1; next }
+        td && /blr[ \t]+x1/ { armed = 1; td = 0; split("", w); next }
+        armed && /^[ \t]*[a-z]/ {
+            line = $0; sub(/^[ \t]+/, "", line); n = split(line, p, /[ \t,\[\]!]+/)
+            ro = (p[1] ~ /^(str|strb|strh|stp|cmp|cmn|tst|cbz|cbnz)$/)
+            for (i = ro ? 2 : 3; i <= n; i++) {
+                r = p[i]; sub(/^[xw]/, "", r)
+                if (p[i] ~ /^[xw]([4-8]|13|14)$/ && !(r in w)) { print fn " " line; armed = 0; next }
+            }
+            if (!ro && p[2] ~ /^[xw][0-9]+$/) { r = p[2]; sub(/^[xw]/, "", r); w[r] = 1 }
+            if (p[1] ~ /^(b|bl|blr|br|ret)$/) armed = 0
+        }
+    ' "$1"
+}
+for f in "$TD"/riscv64-*.s; do
+    stale=$(riscv_stale_t0 "$f")
+    [ -z "$stale" ] || bad "RISC-V $(basename "$f") reads a resolver-clobbered t0: $stale"
+done
+for f in "$TD"/aarch64-*.s; do
+    held=$(aarch64_pool_across_tlsdesc "$f")
+    [ -z "$held" ] || bad "AArch64 $(basename "$f") keeps a caller-saved home across a TLSDESC call: $held"
+done
+
 # wide.c pins the discipline the hidden i128 libcall requires: __divti3 clobbers
 # a0-a7, so the resolver's result must be parked in a callee-saved register
 # rather than left in a0, and the function must get a real s0 frame instead of
@@ -194,7 +243,15 @@ for arch in aarch64 riscv64; do
     # executable form of the register-discipline assertion above.
     "$gcc" -no-pie "$TD/$arch-wide.o" -L"$TD" -Wl,-rpath,"$TD" -l"$arch-tls" -o "$TD/$arch-wide"
     LD_LIBRARY_PATH="$TD" "$qemu" -L "$sysroot" "$TD/$arch-wide" || bad "$arch wide-type TLS runtime"
-    note "$arch IE/dynamic/wide runtime interoperability"
+
+    # gd_acc.c against a GCC host that defines ext_tls. LD_BIND_NOT=1 keeps
+    # every resolver call on the lazy PLT path, whose stub clobbers t0: the
+    # bound fast path happens to preserve it and hid the stale-cache read.
+    "$gcc" -shared "$TD/$arch-gdacc.o" -o "$TD/lib$arch-gdacc.so"
+    "$gcc" -O2 "$FIX/gd_acc_main.c" -L"$TD" -Wl,-rpath,"$TD" -l"$arch-gdacc" -o "$TD/$arch-gdacc"
+    "$qemu" -L "$sysroot" -E LD_BIND_NOT=1 -E LD_LIBRARY_PATH="$TD" "$TD/$arch-gdacc" \
+        || bad "$arch scratch register across the TLS resolver (LD_BIND_NOT=1)"
+    note "$arch IE/dynamic/wide/resolver-scratch runtime interoperability"
 done
 
 [ "$fail" -eq 0 ] || exit 1

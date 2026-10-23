@@ -298,17 +298,7 @@ impl Lowerer {
         // stays a no-op only for pointer/pointer-width-integer sources; a
         // float -> Ptr cast is a C constraint violation that GCC rejects, and
         // we leave that historical behaviour untouched here.
-        if to_ty == from_ty
-            || (to_ty == IrType::Ptr
-                && !super::expr::pointer_integer_cast_changes_width(
-                    from_ty,
-                    to_ty,
-                    crate::common::types::target_ptr_size(),
-                ))
-            || (from_ty == IrType::Ptr
-                && to_ty.is_integer()
-                && to_ty.size() == crate::common::types::target_ptr_size())
-        {
+        if cast_is_operand_identity(from_ty, to_ty) {
             return src;
         }
 
@@ -2021,4 +2011,26 @@ impl Lowerer {
         let ctype = self.type_spec_to_ctype(type_spec);
         IrType::from_ctype(&ctype)
     }
+}
+
+/// Whether an explicit cast `from_ty -> to_ty` lowers to its operand
+/// unchanged: same type, or a same-width integer/pointer -> pointer cast.
+///
+/// An explicit pointer -> integer cast is NOT an identity even at the same
+/// width: it is emitted as a no-op `Cast { Ptr -> int }` because it is where
+/// the address leaves pointer provenance (C's PNVI-ae model "exposes" the
+/// object). Pointer arithmetic (`a + i`) is lowered as an integer `Add` on
+/// the pointer value, so without the marker `(char *)((uintptr_t)a + d)` is
+/// the same IR as `a + d`, and GVN's base tracking -- which follows only
+/// `Ptr -> Ptr` casts -- rooted it in `a` and kept a cached load of an
+/// unrelated object across the store through it (GCC, Clang and ICX all
+/// reload). The backends lower the same-width cast as a move.
+fn cast_is_operand_identity(from_ty: IrType, to_ty: IrType) -> bool {
+    to_ty == from_ty
+        || (to_ty == IrType::Ptr
+            && !super::expr::pointer_integer_cast_changes_width(
+                from_ty,
+                to_ty,
+                crate::common::types::target_ptr_size(),
+            ))
 }

@@ -380,39 +380,83 @@ fn tls_global_memory_access(inst: &Instruction, tls_global_addrs: &FxHashSet<u32
     }
 }
 
-/// TLS roots whose every use is an integer/pointer load can be omitted: the
-/// x86-64 load hook reconstructs LE directly or loads the IE GOT offset. Keep
-/// stores and FP/wide loads out until their staging rules have dedicated folds.
-fn foldable_tls_load_roots(func: &IrFunction, tls_global_addrs: &FxHashSet<u32>) -> FxHashSet<u32> {
-    let mut foldable = tls_global_addrs.clone();
+/// TLS `GlobalAddr` roots the emitter never materializes (value id ->
+/// symbol), computed ONCE per function before the prologue so that register
+/// allocation, slot assignment and instruction emission agree by construction
+/// (`CodegenState::omitted_tls_roots`).
+///
+/// A root qualifies when every use is an access the backend's direct hooks
+/// fold, in the default address space:
+/// * a `Load` through it of a `tls_direct_load_type_ok` type (LE/IE, plus the
+///   dynamic models where `supports_tls_dynamic_load_fold`);
+/// * a Local-Exec `Store` through it of a `tls_direct_store_type_ok` type
+///   (storing the root ITSELF is a use of the address and disqualifies it).
+///
+/// A `__seg_fs`/`__seg_gs` access through the root takes the segment path,
+/// which reads the root's register: it must keep the root (an omitted root
+/// there read an unwritten register, `movslq %fs:(%rdi)`).
+fn compute_omitted_tls_roots(cg: &dyn ArchCodegen, func: &IrFunction) -> FxHashMap<u32, String> {
+    let st = cg.state_ref();
+    if !cg.supports_tls_direct_load_fold() || st.disable_regalloc {
+        return FxHashMap::default();
+    }
+    let mut roots: FxHashMap<u32, String> = func
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::GlobalAddr { dest, name }
+                if st.tls_symbols.contains(name)
+                    && (cg.supports_tls_dynamic_load_fold()
+                        || matches!(
+                            st.tls_model(name),
+                            crate::ir::reexports::TlsModel::LocalExec
+                                | crate::ir::reexports::TlsModel::InitialExec
+                        )) =>
+            {
+                Some((dest.0, name.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    if roots.is_empty() {
+        return roots;
+    }
     for block in &func.blocks {
         for inst in &block.instructions {
-            if let Instruction::Load { ptr, ty, .. } = inst
-                && foldable.contains(&ptr.0)
-                && matches!(
+            match inst {
+                Instruction::Load {
+                    ptr,
                     ty,
-                    IrType::I8
-                        | IrType::U8
-                        | IrType::I16
-                        | IrType::U16
-                        | IrType::I32
-                        | IrType::U32
-                        | IrType::I64
-                        | IrType::U64
-                        | IrType::Ptr
-                )
-            {
-                continue;
+                    seg_override: AddressSpace::Default,
+                    ..
+                } if roots.contains_key(&ptr.0) && cg.tls_direct_load_type_ok(*ty) => continue,
+                Instruction::Store {
+                    val,
+                    ptr,
+                    ty,
+                    seg_override: AddressSpace::Default,
+                    ..
+                } if roots.get(&ptr.0).is_some_and(|name| {
+                    st.tls_model(name) == crate::ir::reexports::TlsModel::LocalExec
+                }) && cg.tls_direct_store_type_ok(*ty) =>
+                {
+                    if let Operand::Value(v) = val {
+                        roots.remove(&v.0);
+                    }
+                    continue;
+                }
+                _ => {}
             }
             for used in inst.used_values() {
-                foldable.remove(&used);
+                roots.remove(&used);
             }
         }
         for used in block.terminator.used_values() {
-            foldable.remove(&used);
+            roots.remove(&used);
         }
     }
-    foldable
+    roots
 }
 
 fn can_indexed_addr_fold(
@@ -1136,6 +1180,169 @@ pub(crate) fn collect_gep_fold_base_links(func: &IrFunction) -> FxHashMap<u32, V
         out.entry(info.base.0).or_default().push(*dest);
     }
     out
+}
+
+/// Constant-offset frame addresses (`alloca + c`, including composed
+/// `GEP(GEP(alloca, c1), c2)` chains) that the emitter provably never
+/// materialises, so the allocator must not give them a home.
+///
+/// The emitter skips every `gep_fold_map` producer that passes
+/// `can_const_addr_fold`, and an alloca root with a 32-bit displacement
+/// always passes; the property is decided from the IR alone (every IR
+/// `Alloca` enters `alloca_values` in `classify_alloca`), never from register
+/// assignments. A skipped producer is rebuilt into its home only when an
+/// access refuses the fold: a wide-integer or segment-qualified Load/Store,
+/// or a consumer that is not a memory access at all. A candidate therefore
+/// survives only when EVERY use is a plain Load/Store pointer of a foldable
+/// type, or the base of another surviving candidate (fixpoint: dropping an
+/// outer producer re-exposes its base). Phi, call, compare, atomic, inline
+/// asm and terminator uses all drop it, failing closed.
+///
+/// Without this, a frame address defined in the entry block and folded into
+/// accesses inside a loop with calls looks like a long call-spanning
+/// interval: it won a callee-saved register that was never written, cost a
+/// dead push/pop pair and displaced real loop state into a stack slot.
+pub(crate) fn collect_never_materialized_frame_addrs(func: &IrFunction) -> FxHashSet<u32> {
+    let use_counts = count_value_uses(func);
+    let stab = analyze_base_stability(func);
+    let map = build_gep_fold_map(func, &use_counts, &stab);
+    if map.is_empty() {
+        return FxHashSet::default();
+    }
+    let allocas: FxHashSet<u32> = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::Alloca { dest, .. } => Some(dest.0),
+            _ => None,
+        })
+        .collect();
+    let mut cand: FxHashSet<u32> = map
+        .iter()
+        .filter(|(_, info)| allocas.contains(&info.base.0) && is_i32_disp(info.offset))
+        .map(|(&dest, _)| dest)
+        .collect();
+    let plain =
+        |ty: IrType, seg: AddressSpace| is_foldable_mem_ty(ty) && seg == AddressSpace::Default;
+    let mut here: Vec<u32> = Vec::new();
+    loop {
+        let mut total: FxHashMap<u32, u32> = FxHashMap::default();
+        let mut folded: FxHashMap<u32, u32> = FxHashMap::default();
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                here.clear();
+                // The two walkers are disjoint (Operand fields vs. bare
+                // Value fields), so `total` counts every use exactly once.
+                for_each_operand_in_instruction(inst, |op| {
+                    if let Operand::Value(v) = op
+                        && cand.contains(&v.0)
+                    {
+                        here.push(v.0);
+                    }
+                });
+                for_each_value_use_in_instruction(inst, |v| {
+                    if cand.contains(&v.0) {
+                        here.push(v.0);
+                    }
+                });
+                if here.is_empty() {
+                    continue;
+                }
+                for &v in &here {
+                    *total.entry(v).or_insert(0) += 1;
+                }
+                match inst {
+                    Instruction::Load {
+                        ptr,
+                        ty,
+                        seg_override,
+                        ..
+                    }
+                    | Instruction::Store {
+                        ptr,
+                        ty,
+                        seg_override,
+                        ..
+                    } if cand.contains(&ptr.0) && plain(*ty, *seg_override) => {
+                        *folded.entry(ptr.0).or_insert(0) += 1;
+                    }
+                    // A surviving candidate's only Value operand is its base
+                    // (`map` holds constant-offset GEP/Add producers only).
+                    _ if inst.dest().is_some_and(|d| cand.contains(&d.0)) => {
+                        for &v in &here {
+                            *folded.entry(v).or_insert(0) += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for_each_operand_in_terminator(&block.terminator, |op| {
+                if let Operand::Value(v) = op
+                    && cand.contains(&v.0)
+                {
+                    *total.entry(v.0).or_insert(0) += 1;
+                }
+            });
+        }
+        let before = cand.len();
+        cand.retain(|v| total.get(v) == folded.get(v));
+        if cand.len() == before {
+            return cand;
+        }
+    }
+}
+
+/// Frame-rooted INDEXED folds (`disp(%rsp,%idx,scale)`) that the emitter
+/// takes whenever the index receives a register: the plain-slot alloca arm of
+/// `can_indexed_addr_fold`, the backend's access-profile hook and the
+/// cmp-mem priority guard are all decided from the IR; only the index home
+/// is not. These producers must hold no register of their own: when the
+/// fold happens the home is never written (a phantom callee-saved holder in
+/// any loop with calls), and when it does not -- the index spilled -- the
+/// producer is materialised into its stack slot, which is always sound.
+/// Callers must therefore keep the slot (RA-side exclusion only, never
+/// `state.never_materialized_values`). A miss here only costs the former
+/// phantom home, never correctness.
+pub(crate) fn collect_frame_indexed_fold_dests(
+    cg: &dyn ArchCodegen,
+    func: &IrFunction,
+) -> FxHashSet<u32> {
+    if !cg.supports_indexed_addr() || env_flag_set("CCC_NO_FOLDED_INDEX_LIVENESS") {
+        return FxHashSet::default();
+    }
+    let use_counts = count_value_uses(func);
+    let stab = analyze_base_stability(func);
+    let map = build_indexed_gep_map(func, &use_counts, &stab, cg.supports_seg_indexed_fold());
+    if map.is_empty() {
+        return FxHashSet::default();
+    }
+    // `classify_alloca` gives every alignment up to 16 a plain Direct slot.
+    let direct_allocas: FxHashSet<u32> = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::Alloca { dest, align, .. } if *align <= 16 => Some(dest.0),
+            _ => None,
+        })
+        .collect();
+    let mut load_cmp: FxHashSet<u32> = FxHashSet::default();
+    if cg.supports_load_cmp_mem_fold() {
+        for block in &func.blocks {
+            for (_dest, (ptr, _ty, _imm)) in detect_load_cmp_mem_fold(block, &use_counts) {
+                load_cmp.insert(ptr);
+            }
+        }
+    }
+    map.iter()
+        .filter(|(dest, info)| {
+            direct_allocas.contains(&info.base.0)
+                && !load_cmp.contains(dest)
+                && cg.indexed_fold_ok(info)
+        })
+        .map(|(&dest, _)| dest)
+        .collect()
 }
 
 /// Dest values of INDEXED-fold GEPs (the `base + index*scale` SIB shape),
@@ -4054,12 +4261,6 @@ fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
         }
         if global.is_thread_local {
             state.tls_symbols.insert(global.name.clone());
-            if !global.is_extern {
-                state.tls_definitions.insert(global.name.clone());
-            }
-            if let Some(model) = global.tls_model {
-                state.tls_models.insert(global.name.clone(), model);
-            }
         }
         if global.is_weak && global.is_extern {
             state.weak_extern_symbols.insert(global.name.clone());
@@ -4076,6 +4277,10 @@ fn collect_symbol_sets(cg: &mut dyn ArchCodegen, module: &IrModule) {
             state.weak_extern_symbols.insert(name.clone());
         }
     }
+    // One model per TLS symbol, decided once for the whole module so every
+    // access of the symbol (and every backend) agrees.
+    state.tls_models = crate::common::tls::model_table(module, state.tls_policy);
+    crate::common::tls::install_call_sequence_symbols(&state.tls_models);
     for (label, _) in &module.string_literals {
         state.local_symbols.insert(label.clone());
     }
@@ -4728,7 +4933,23 @@ fn fn_entry_align_log2(cg: &dyn ArchCodegen, attr: Option<Option<u32>>) -> Optio
     }
 }
 
+/// Emit one function under its own ISA: `target("...")` features apply
+/// for exactly this function (register allocation included, since isel's
+/// BMI2 shift policy shapes the `%cl` constraint) and the TU's ISA is
+/// restored on every exit path of the body.
 fn generate_function(
+    cg: &mut dyn ArchCodegen,
+    attr_align: Option<Option<u32>>,
+    func: &IrFunction,
+    source_mgr: Option<&SourceManager>,
+    file_table: &FxHashMap<String, u32>,
+) {
+    cg.set_function_target_features(&func.target_features);
+    generate_function_body(cg, attr_align, func, source_mgr, file_table);
+    cg.set_function_target_features(&[]);
+}
+
+fn generate_function_body(
     cg: &mut dyn ArchCodegen,
     attr_align: Option<Option<u32>>,
     func: &IrFunction,
@@ -5046,6 +5267,8 @@ fn generate_function(
         && cg.state().pending_classic_mcount_label.is_none();
 
     cg.state().current_func_name = func.name.clone();
+    let omitted_tls_roots = compute_omitted_tls_roots(&*cg, func);
+    cg.state().omitted_tls_roots = omitted_tls_roots;
     let raw_space = cg.calculate_stack_space(func);
     let frame_size = cg.aligned_frame_size(raw_space);
     cg.state().frame_size = frame_size;
@@ -5218,25 +5441,6 @@ fn generate_function(
             _ => None,
         })
         .collect();
-    let tls_load_addrs: FxHashSet<u32> = func
-        .blocks
-        .iter()
-        .flat_map(|block| &block.instructions)
-        .filter_map(|inst| match inst {
-            Instruction::GlobalAddr { dest, name }
-                if cg.state_ref().tls_symbols.contains(name)
-                    && (cg.supports_tls_dynamic_load_fold()
-                        || matches!(
-                            cg.state_ref().tls_model_for_symbol(name),
-                            crate::ir::reexports::TlsModel::LocalExec
-                                | crate::ir::reexports::TlsModel::InitialExec
-                        )) =>
-            {
-                Some(dest.0)
-            }
-            _ => None,
-        })
-        .collect();
     let mut global_addr_map = build_global_addr_map(
         func,
         &cg.state_ref().tls_symbols,
@@ -5277,13 +5481,14 @@ fn generate_function(
         FxHashSet::default()
     };
     dead_global_addrs.extend(remat_global_addrs.iter().copied());
-    if cg.supports_global_addr_fold() && !cg.state_ref().disable_regalloc {
-        dead_global_addrs.extend(foldable_tls_load_roots(func, &tls_load_addrs));
-    }
+    // Omitted TLS roots (decided before the prologue): the direct hooks fold
+    // every access through them; nothing else computes the address.
+    dead_global_addrs.extend(cg.state_ref().omitted_tls_roots.keys().copied());
     // PF-07: the prologue promoted PIC indexed-symbol bases (defined at a
     // shallower loop depth than their consumers) out of the
     // never-materialized set so RA homes them. Honour that here: skipping
     // emission would leave the SIB base register unwritten.
+    // (PF-07 promotes non-TLS bases only, so the omitted TLS roots stand.)
     for v in &cg.state_ref().promoted_global_addr_homes {
         dead_global_addrs.remove(v);
     }
@@ -6436,6 +6641,7 @@ pub(super) fn generate_instruction(
     remat_global_addrs: &FxHashSet<u32>,
     const_addr_vals: &FxHashMap<u32, i64>,
 ) {
+    cg.begin_ir_point();
     // A volatile access must survive the text peepholes (they cannot see the
     // IR's volatility). Its emitted lines are bracketed by markers that the
     // peephole pins; the buffered MachInst path is flushed first so earlier
@@ -7538,6 +7744,7 @@ fn generate_terminator(
     frame_size: i64,
     block_label: u32,
 ) {
+    cg.begin_ir_point();
     // PF-15: a terminator ends the compare's adjacency window — flush any
     // deferred widening moves before control flow leaves the block.
     cg.flush_pending_widen();
@@ -8465,6 +8672,197 @@ mod remat_call_arg_tests {
         function.next_value_id = 8;
         let set = build_rematerializable_global_addr_set_for(&function, &global_addr_map());
         assert!(!set.contains(&0));
+    }
+}
+
+#[cfg(test)]
+mod frame_addr_nohome_tests {
+    use super::*;
+    use crate::ir::reexports::BlockId;
+
+    fn alloca(dest: u32) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(dest),
+            ty: IrType::Ptr,
+            size: 64,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        }
+    }
+
+    fn gep(dest: u32, base: u32, off: i64) -> Instruction {
+        Instruction::GetElementPtr {
+            dest: Value(dest),
+            base: Value(base),
+            offset: Operand::Const(IrConst::I64(off)),
+            ty: IrType::Ptr,
+        }
+    }
+
+    fn load(dest: u32, ptr: u32, ty: IrType, seg: AddressSpace) -> Instruction {
+        Instruction::Load {
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty,
+            seg_override: seg,
+            volatile: false,
+        }
+    }
+
+    fn store(val: Operand, ptr: u32) -> Instruction {
+        Instruction::Store {
+            val,
+            ptr: Value(ptr),
+            ty: IrType::U64,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    fn func(instructions: Vec<Instruction>, terminator: Terminator) -> IrFunction {
+        let mut f = IrFunction::new("frame_addrs".to_string(), IrType::U64, vec![], false);
+        let next = instructions
+            .iter()
+            .filter_map(|i| i.dest())
+            .map(|d| d.0 + 1)
+            .max()
+            .unwrap_or(0);
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator,
+            source_spans: Vec::new(),
+        }];
+        f.next_value_id = next;
+        f
+    }
+
+    fn ret0() -> Terminator {
+        Terminator::Return(Some(Operand::Const(IrConst::I64(0))))
+    }
+
+    fn set(f: &IrFunction) -> Vec<u32> {
+        let mut v: Vec<u32> = collect_never_materialized_frame_addrs(f)
+            .into_iter()
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Plain loads/stores through `alloca + c` and a composed
+    /// `GEP(GEP(alloca, 8), 8)` fold to `disp(%rsp)`: no home, no slot.
+    #[test]
+    fn plain_and_composed_frame_addresses_need_no_home() {
+        let f = func(
+            vec![
+                alloca(0),
+                gep(1, 0, 8),
+                gep(2, 1, 8),
+                store(Operand::Const(IrConst::I64(7)), 1),
+                load(3, 1, IrType::U64, AddressSpace::Default),
+                load(4, 2, IrType::U32, AddressSpace::Default),
+            ],
+            ret0(),
+        );
+        assert_eq!(set(&f), vec![1, 2]);
+    }
+
+    /// Every access shape that makes the emitter rebuild the address into the
+    /// value's home keeps the home: wide integer, segment-qualified, stored
+    /// as data, returned, or not frame-rooted at all.
+    #[test]
+    fn refusing_or_escaping_uses_keep_the_home() {
+        let wide = func(
+            vec![
+                alloca(0),
+                gep(1, 0, 16),
+                load(2, 1, IrType::I128, AddressSpace::Default),
+            ],
+            ret0(),
+        );
+        assert!(set(&wide).is_empty(), "i128 access refuses the fold");
+        let seg = func(
+            vec![
+                alloca(0),
+                gep(1, 0, 8),
+                load(2, 1, IrType::U64, AddressSpace::SegGs),
+            ],
+            ret0(),
+        );
+        assert!(
+            set(&seg).is_empty(),
+            "segment access may rebuild the address"
+        );
+        let as_data = func(
+            vec![
+                alloca(0),
+                gep(1, 0, 8),
+                gep(2, 0, 16),
+                store(Operand::Value(Value(1)), 2),
+            ],
+            ret0(),
+        );
+        assert_eq!(
+            set(&as_data),
+            vec![2],
+            "a stored address is data, not a fold"
+        );
+        let returned = func(
+            vec![
+                alloca(0),
+                gep(1, 0, 8),
+                load(2, 1, IrType::U64, AddressSpace::Default),
+            ],
+            Terminator::Return(Some(Operand::Value(Value(1)))),
+        );
+        assert!(set(&returned).is_empty(), "terminator use materialises it");
+        let not_frame = func(
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                gep(1, 0, 8),
+                load(2, 1, IrType::U64, AddressSpace::Default),
+            ],
+            ret0(),
+        );
+        assert!(
+            set(&not_frame).is_empty(),
+            "register bases are RA-dependent"
+        );
+    }
+
+    /// Dropping an outer producer re-exposes its base: the inner frame
+    /// address is then a real operand of an emitted GEP and keeps its home.
+    #[test]
+    fn an_escaping_outer_producer_keeps_its_inner_base_home() {
+        let f = func(
+            vec![
+                alloca(0),
+                gep(1, 0, 8),
+                gep(2, 1, 8),
+                load(3, 1, IrType::U64, AddressSpace::Default),
+            ],
+            Terminator::Return(Some(Operand::Value(Value(2)))),
+        );
+        assert!(set(&f).is_empty());
+    }
+
+    /// Displacements outside a sign-extended imm32 are never folded.
+    #[test]
+    fn displacement_beyond_imm32_keeps_the_home() {
+        let f = func(
+            vec![
+                alloca(0),
+                gep(1, 0, i64::from(i32::MAX) + 1),
+                load(2, 1, IrType::U64, AddressSpace::Default),
+            ],
+            ret0(),
+        );
+        assert!(set(&f).is_empty());
     }
 }
 

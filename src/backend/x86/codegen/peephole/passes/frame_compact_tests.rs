@@ -218,3 +218,44 @@ fn an_alignment_frame_with_a_mid_body_addq_declines_too() {
     assert_eq!(count(&out, "subq $8, %rsp"), 0, "{}", out);
     assert_eq!(count(&out, "addq $8, %rsp"), 0, "{}", out);
 }
+
+// ── TLS descriptors: register-wise not a call, stack-wise a call ───────────
+
+#[test]
+fn a_tls_descriptor_call_keeps_the_alignment_frame_and_its_live_values() {
+    // The shape lccc -O2 -fPIC emits for `return sl * 10 + gl;` with two
+    // dynamic-TLS variables, minus the volatile-region markers, so the
+    // classification alone must protect it. Two independent bugs were found:
+    //  * the descriptor call was classified as a full call, so the
+    //    dead-write pass deleted `imull` (r10 "clobbered" by the call) —
+    //    yet the descriptor ABI preserves every register except %rax;
+    //  * once it was classified `Other`, the leaf-frame pass deleted the
+    //    `subq $8` alignment frame, leaving %rsp ≡ 8 (mod 16) at the call.
+    let out = run(&f(concat!(
+        "    subq $8, %rsp\n",
+        "    .cfi_def_cfa_offset 16\n",
+        "    leaq sl@TLSDESC(%rip), %rax\n",
+        "    lccc_tls_call sl\n",
+        "    addq %fs:0, %rax\n",
+        "    movl (%rax), %r10d\n",
+        "    imull $10, %r10d, %r10d\n",
+        "    leaq gl@TLSDESC(%rip), %rax\n",
+        "    lccc_tls_call gl\n",
+        "    addq %fs:0, %rax\n",
+        "    addl (%rax), %r10d\n",
+        "    movl %r10d, %eax\n",
+        "    addq $8, %rsp\n",
+        "    ret",
+    )));
+    assert_eq!(count(&out, "subq $8, %rsp"), 1, "{}", out);
+    assert_eq!(count(&out, "addq $8, %rsp"), 1, "{}", out);
+    assert_eq!(count(&out, "imull $10, %r10d, %r10d"), 1, "{}", out);
+    for line in [
+        "leaq sl@TLSDESC(%rip), %rax",
+        "lccc_tls_call sl",
+        "leaq gl@TLSDESC(%rip), %rax",
+        "lccc_tls_call gl",
+    ] {
+        assert_eq!(count(&out, line), 1, "{line}\n{out}");
+    }
+}

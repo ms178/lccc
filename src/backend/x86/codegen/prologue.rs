@@ -459,6 +459,9 @@ impl X86Codegen {
         }
         // Store function pointer for indexed addressing detection
         self.current_func = Some(func as *const IrFunction);
+        // The def index answers for one function; the next question builds
+        // this one's (see `get_defining_instruction`).
+        self.def_index = std::cell::OnceCell::new();
         self.wide_simd_copies = func.blocks.iter().any(|block| {
             block.instructions.iter().any(|inst| {
                 matches!(
@@ -766,7 +769,9 @@ impl X86Codegen {
             caller_saved_regs.extend_from_slice(&X86_APX_EGPRS);
         }
         let mut has_calls = false;
-        let mut has_i128_ops = false;
+        // Shared with the allocator's wide-hazard wave so the two can never
+        // disagree about which bodies withdraw r8/r9/rdi/rsi.
+        let has_i128_ops = crate::backend::regalloc::x86_body_has_i128_ops(func);
         // has_gep / has_select were historically consumed here to steer
         // %rdx scratch selection; `emit_save_acc_impl` now switches to %r11
         // dynamically (checking actual %rdx homes) and the Select emitter
@@ -793,46 +798,22 @@ impl X86Codegen {
                     Instruction::CallIndirect { .. } => {
                         has_calls = true;
                     }
+                    // A dynamic-model TLS access executes a real `call` to its
+                    // TLS descriptor (globals.rs): the call site needs the
+                    // 16-byte alignment and the pushed return address would
+                    // land in a red zone. Registers are preserved, so this is
+                    // a frame fact only, not a register-allocation call point.
                     Instruction::GlobalAddr { name, .. }
-                        if self.state.tls_symbols.contains(name) =>
+                        if self.state.tls_symbols.contains(name)
+                            && self.state.tls_model(name).is_dynamic() =>
                     {
-                        let model = self.state.tls_model_for_symbol(name);
-                        if matches!(
-                            model,
-                            crate::ir::reexports::TlsModel::LocalDynamic
-                                | crate::ir::reexports::TlsModel::GlobalDynamic
-                        ) {
-                            has_calls = true;
-                        }
-                    }
-                    Instruction::BinOp { ty, .. } => {
-                        if matches!(ty, IrType::I128 | IrType::U128) {
-                            has_i128_ops = true;
-                        }
-                    }
-                    Instruction::UnaryOp { ty, .. } => {
-                        if matches!(ty, IrType::I128 | IrType::U128) {
-                            has_i128_ops = true;
-                        }
-                    }
-                    Instruction::Cast { from_ty, to_ty, .. } => {
-                        if matches!(from_ty, IrType::I128 | IrType::U128)
-                            || matches!(to_ty, IrType::I128 | IrType::U128)
-                        {
-                            has_i128_ops = true;
-                        }
-                        // Detect I32/U32 widening to 64-bit: requires sign-extension.
-                        if matches!(from_ty, IrType::I32 | IrType::U32)
-                            && matches!(to_ty, IrType::I64 | IrType::U64 | IrType::Ptr)
-                        {
-                        }
+                        has_calls = true;
                     }
                     Instruction::AtomicLoad { ty, .. }
                     | Instruction::AtomicStore { ty, .. }
                     | Instruction::AtomicRmw { ty, .. }
                     | Instruction::AtomicCmpxchg { ty, .. } => {
                         if matches!(ty, IrType::I128 | IrType::U128) {
-                            has_i128_ops = true;
                             // Every 16-byte atomic lowering can call into
                             // libatomic (store/load/RMW always; compare-
                             // exchange without the CMPXCHG16B permission), so
@@ -844,11 +825,6 @@ impl X86Codegen {
                             // cmpxchg16b case too costs at most 8 bytes of
                             // stack in a rare leaf and cannot be wrong.
                             has_calls = true;
-                        }
-                    }
-                    Instruction::Cmp { ty, .. } | Instruction::Store { ty, .. } => {
-                        if matches!(ty, IrType::I128 | IrType::U128) {
-                            has_i128_ops = true;
                         }
                     }
                     _ => {}
@@ -872,8 +848,8 @@ impl X86Codegen {
         // (rdx as dispatch), cmpxchg-loop RMWs / cmpxchg / atomic stores,
         // F128 stores, fixed-scratch intrinsics (rdtsc/rdtscp, the
         // __builtin_apply family, __builtin_longjmp). rdi (PhysReg 14)
-        // leaves the pool when a cmpxchg-loop RMW or rdtscp is present
-        // (operand parked in %rdi). For clobber-CONTAINING (non-wide)
+        // leaves the pool when rdtscp or a 128-bit atomic is present
+        // (libatomic argument staging). For clobber-CONTAINING (non-wide)
         // bodies the RA's Phase-2x64 wave additionally admits rdx per-value
         // at clobber-free live ranges (regalloc.rs; CCC_NO_RDX_HAZARD
         // restores this whole-function exclusion for A/B). GEP indirect
@@ -1026,7 +1002,17 @@ impl X86Codegen {
                                     | crate::ir::reexports::IrCmpOp::Ult
                                     | crate::ir::reexports::IrCmpOp::Ule
                             );
-                            if !relational {
+                            // Eq/Ne fuse too (CondBranch only, like every FP
+                            // fusion): a SELF-compare needs PF alone (`r != r`
+                            // is `jp`), any other pair branches on PF then ZF
+                            // (`jp; jne` / `jp; je`) -- GCC/Clang's shape, no
+                            // setp/setne/or/movzbl/test chain.
+                            let eq_ne = matches!(
+                                op,
+                                crate::ir::reexports::IrCmpOp::Eq
+                                    | crate::ir::reexports::IrCmpOp::Ne
+                            );
+                            if !relational && !eq_ne {
                                 continue;
                             }
                         } else if !ty.is_integer() {
@@ -1377,6 +1363,9 @@ impl X86Codegen {
             }
 
             self.state.promoted_global_addr_homes = promoted;
+            // Omitted TLS roots: the direct TLS hooks fold every access, the
+            // emitter never writes them; a home would only cost a register.
+            set.extend(self.state.omitted_tls_roots.keys().copied());
             self.state.never_materialized_values = set.clone();
             set
         };
@@ -1561,6 +1550,12 @@ impl X86Codegen {
         // Certified never-written values may hold no home at all. Replay
         // Cmps and materialized booleans keep their homes (they are not in
         // `fused_cmp_dests`/`fused_forward_dests` by construction).
+        // Folded frame addresses are the same phantom class: the emitter
+        // skips the producer and folds `disp(%rsp)` into every access, so a
+        // home is never written (see collect_never_materialized_frame_addrs
+        // for why the skip cannot be refused). Entry-block frame addresses
+        // used inside a loop with calls otherwise took callee-saved registers
+        // from real loop state and left a dead push/pop pair behind.
         let never_materialized = {
             let mut set = never_materialized;
             set.extend(
@@ -1570,6 +1565,16 @@ impl X86Codegen {
                     .copied()
                     .chain(self.fused_forward_dests.iter().copied()),
             );
+            let frame_addrs =
+                crate::backend::generation::collect_never_materialized_frame_addrs(func);
+            self.state
+                .never_materialized_values
+                .extend(frame_addrs.iter().copied());
+            set.extend(frame_addrs);
+            // Frame-rooted indexed folds depend on the index home, so they
+            // stay out of the slot-free set: RA-side exclusion only, and a
+            // spilled index materialises the address into the kept slot.
+            set.extend(crate::backend::generation::collect_frame_indexed_fold_dests(self, func));
             set
         };
 
@@ -1596,6 +1601,12 @@ impl X86Codegen {
         // the literal "%r10", i.e. PhysReg(11).
         let indirect_target_regs = vec![crate::backend::regalloc::PhysReg(11)];
         let seg_indexed_fold = crate::backend::traits::ArchCodegen::supports_seg_indexed_fold(self);
+        let fold_base_regs: Vec<crate::backend::regalloc::PhysReg> = available_regs
+            .iter()
+            .chain(caller_saved_regs.iter())
+            .copied()
+            .filter(|&r| super::emit::x86_const_fold_base_reg(r))
+            .collect();
         let (
             reg_assigned,
             cached_liveness,
@@ -1651,6 +1662,9 @@ impl X86Codegen {
                 }
                 links
             },
+            // const_offset_fold_reg_base_ok folds `C(%base)` for every GPR
+            // home outside the emitter scratch set: defer the producers.
+            fold_base_regs,
             &self.state.ra_config,
             &mut self.phi_chain,
         );
@@ -1664,6 +1678,13 @@ impl X86Codegen {
         self.home_clobbered.clear();
         self.home_sharers.clear();
         self.value_live_segments.clear();
+        self.home_transient_evictions.clear();
+        self.home_block_end_points.clear();
+        self.home_class_members = self
+            .phi_chain
+            .iter()
+            .flat_map(|(&member, &rep)| [member, rep])
+            .collect();
         self.home_write_state.clear();
         self.home_branch_snapshots.clear();
         self.home_branch_edge_srcs.clear();
@@ -1685,6 +1706,8 @@ impl X86Codegen {
                 .into_iter()
                 .map(|(v, ranges)| (v, super::emit::LiveSpans::from_ranges(ranges)))
                 .collect();
+            self.home_block_end_points = liv.block_ends.clone();
+            self.home_block_end_points.sort_unstable();
         }
         self.index_home_liveness();
         self.call_fresh_snapshot.clear();
@@ -2277,14 +2300,21 @@ impl X86Codegen {
         // For non-variadic RBP functions, no reserve is needed because the subq frame
         // starts below the push area. For variadic functions, the register save area
         // is added to `space` separately.
-        // Reserve space for callee-saved register saves PLUS 8 bytes of padding.
-        // The saves occupy offsets -8, -16, ..., -(N*8) from the virtual rbp.
-        // Without the +8 padding, block-local slot reuse (Tier 3) can assign
-        // a variable to offset -(N*8) which COLLIDES with the last callee-save
-        // (typically %rbp). Adding 8 bytes ensures the reuse pool starts at
-        // -(N*8 + 8), safely below the callee-save area.
+        // Reserve exactly the callee-save area: the saves occupy offsets
+        // -8 .. -(N*8) from the virtual rbp, i.e. bytes [-(N*8), 0).
+        // Every slot address is produced by the `assign_slot` closure below
+        // as `-new_space` with `new_space >= space + alloc`, so a slot covers
+        // [-new_space, -space). All address-producing callers pass
+        // `space >= initial_offset` (non_local_space starts there and only
+        // grows; the deferred Tier 3 mapping uses `aligned_nls + offset` with
+        // aligned_nls >= non_local_space; Phase 2b / varargs / vector-ret
+        // bump `space` before taking `-space`). Hence no slot can reach
+        // [-(N*8), 0) and no padding is needed. The former `+ 8` pad dated
+        // from a Tier 3 mapping that no longer exists; it cost 8-16 bytes of
+        // stack and a `subq` in every calling function with callee saves
+        // (GCC: `pushq %rbx; ...; call; ...; popq %rbx`, no `subq`).
         let n_callee = self.used_callee_saved.len() as i64;
-        let callee_save_reserve = if n_callee > 0 { n_callee * 8 + 8 } else { 0 };
+        let callee_save_reserve = n_callee * 8;
         // Capture before `self.state` is mutably borrowed by the layout closure.
         let fpo = self.state.omit_frame_pointer;
         self.state.ra_accumulator_values =
@@ -2802,10 +2832,11 @@ impl X86Codegen {
         }
 
         // Callee-saved registers in a call-free leaf are already represented
-        // by push/pop. If layout consumed no bytes beyond the conservative
-        // collision reserve, there are no local slots and no call-alignment
-        // obligation, so a second local frame is pure overhead. Keep the reserve
-        // for calls, varargs, and whenever any real slot was allocated.
+        // by push/pop. If layout consumed no bytes beyond the callee-save
+        // reserve, there are no local slots and no call-alignment obligation,
+        // so a local frame is pure overhead. Functions with calls keep the
+        // reserve: the frame-size rounding then adds exactly the bytes the
+        // call-site 16-byte alignment needs (0 or 8), nothing more.
         if !func.is_variadic
             && !self.func_has_calls
             && space == callee_save_reserve
@@ -2824,19 +2855,7 @@ impl X86Codegen {
             // so that RSP is 16-byte aligned at subsequent CALL instructions.
             // At function entry: RSP ≡ 8 (mod 16) due to the caller's CALL.
             // subq $(8 mod 16), %rsp → RSP ≡ 8 - 8 = 0 (mod 16) ✓
-            if raw_space <= 0 {
-                // Frame-less function: without any pushes the %rsp stays ≡ 8
-                // (mod 16). A call from such a function would push a misaligned
-                // %rsp (movaps in the callee faults — float_special/main segv).
-                // Emit an 8-byte pad iff the function actually calls out.
-                return if self.func_has_calls { 8 } else { 0 };
-            }
-            let aligned = (raw_space + 15) & !15;
-            if aligned % 16 == 0 {
-                aligned + 8
-            } else {
-                aligned
-            }
+            fpo_frame_size(raw_space, self.func_has_calls)
         } else {
             if raw_space <= 0 {
                 // Frame-pointer path: `push %rbp` already realigns entry
@@ -3104,6 +3123,18 @@ impl X86Codegen {
         };
         self.state
             .emit_fmt(format_args!("    # LCCC_RET_XMM {}", ret_xmm_mask));
+        // How many low bits of those registers a `ret` reads: the late
+        // peephole may change bits above an element only where nothing reads
+        // them, and `ret` names no register in its text.
+        let ret_xmm_bits = ret_xmm_bits(
+            func.return_type,
+            &func.ret_eightbyte_classes,
+            func.ret_is_f128_sse,
+            ret_xmm_mask & 2 != 0,
+            vector_ret_in_xmm0,
+        );
+        self.state
+            .emit_fmt(format_args!("    # LCCC_RET_XMM_BITS {}", ret_xmm_bits));
 
         self.emit_gp_return_liveness_markers(func, vector_ret_in_xmm0);
 
@@ -4419,6 +4450,94 @@ pub(super) fn ret_xmm_mask(
     mask
 }
 
+/// The `# LCCC_RET_XMM_BITS` value for a return the width cannot bound.
+pub(super) const RET_XMM_BITS_UNKNOWN: u32 = 512;
+
+/// The widest read, in bits from bit 0, a `ret` makes of each register in
+/// [`ret_xmm_mask`]: a one-register vector (SSE + SSEUPs) reads its 128, 256
+/// or 512 bits; a `__float128` reads 128; a scalar `float` reads 32; a
+/// `double`, an SSE eightbyte (`_Complex float`, two-`float` aggregates,
+/// 8-byte vectors) and either half of a two-register return read 64.
+/// Anything this cannot bound -- a vector return without a vector
+/// classification -- reads [`RET_XMM_BITS_UNKNOWN`].
+pub(super) fn ret_xmm_bits(
+    return_type: IrType,
+    ret_eightbyte_classes: &[EightbyteClass],
+    ret_is_f128_sse: bool,
+    two_registers: bool,
+    vector_return: bool,
+) -> u32 {
+    if let Some(bytes) = crate::common::sysv_classify::vector_reg_bytes_of(ret_eightbyte_classes) {
+        return u32::try_from(bytes * 8).unwrap_or(RET_XMM_BITS_UNKNOWN);
+    }
+    if vector_return {
+        return RET_XMM_BITS_UNKNOWN;
+    }
+    if ret_is_f128_sse {
+        return 128;
+    }
+    if !ret_eightbyte_classes.is_empty() || two_registers {
+        return 64;
+    }
+    match return_type {
+        IrType::F32 | IrType::D32 => 32,
+        IrType::F64 | IrType::D64 => 64,
+        _ => RET_XMM_BITS_UNKNOWN,
+    }
+}
+
+#[cfg(test)]
+mod ret_xmm_bits_tests {
+    use super::*;
+    use EightbyteClass::{Integer, Sse, SseUp};
+
+    #[test]
+    fn every_return_shape_reports_the_bits_its_ret_reads() {
+        let w = |ty, cls: &[EightbyteClass], f128, two, vec| ret_xmm_bits(ty, cls, f128, two, vec);
+        assert_eq!(w(IrType::F32, &[], false, false, false), 32, "float");
+        assert_eq!(w(IrType::F64, &[], false, false, false), 64, "double");
+        assert_eq!(
+            w(IrType::I64, &[Sse], false, false, false),
+            64,
+            "two-float aggregate"
+        );
+        assert_eq!(
+            w(IrType::F64, &[], false, true, false),
+            64,
+            "_Complex double halves"
+        );
+        assert_eq!(
+            w(IrType::I128, &[Sse, Integer], false, false, false),
+            64,
+            "mixed pair"
+        );
+        assert_eq!(w(IrType::F128, &[], true, false, false), 128, "__float128");
+        assert_eq!(
+            w(IrType::I128, &[Sse, SseUp], false, false, true),
+            128,
+            "__m128d"
+        );
+        assert_eq!(
+            w(IrType::Ptr, &[Sse, SseUp, SseUp, SseUp], false, false, true),
+            256,
+            "__m256d"
+        );
+        let zmm = [Sse, SseUp, SseUp, SseUp, SseUp, SseUp, SseUp, SseUp];
+        assert_eq!(w(IrType::Ptr, &zmm, false, false, true), 512, "__m512d");
+        // A __m128d whose value takes the scalar path still reads all 128.
+        assert_eq!(
+            w(IrType::I128, &[Sse, SseUp], false, false, false),
+            128,
+            "__m128d, non-SSA"
+        );
+        assert_eq!(
+            w(IrType::Ptr, &[], false, false, true),
+            RET_XMM_BITS_UNKNOWN,
+            "unclassified vector"
+        );
+    }
+}
+
 #[cfg(test)]
 mod signed_home_demand_tests {
     use super::*;
@@ -4529,8 +4648,11 @@ impl X86Codegen {
         dst: &'static str,
     ) {
         match kind {
-            FpPrestoreKind::F32 => self.state.out.emit_instr_reg_reg("    movss", src, dst),
-            FpPrestoreKind::F64 => self.state.out.emit_instr_reg_reg("    movsd", src, dst),
+            // Full-register copies: the home is fresh, so its old upper
+            // lanes are dead, and the reg-reg `movss`/`movsd` merge forms
+            // would make the copy depend on them (no move elimination).
+            FpPrestoreKind::F32 => self.state.out.emit_instr_reg_reg("    movaps", src, dst),
+            FpPrestoreKind::F64 => self.state.out.emit_instr_reg_reg("    movapd", src, dst),
             FpPrestoreKind::V128 => self.state.out.emit_instr_reg_reg("    movaps", src, dst),
             FpPrestoreKind::V256 => {
                 self.state.dirty_upper_ymm = true;
@@ -4538,5 +4660,51 @@ impl X86Codegen {
                     .emit_fmt(format_args!("    vmovaps %y{}, %y{}", &src[1..], &dst[1..]));
             }
         }
+    }
+}
+
+/// Frame size (callee-save pushes included) of a frame-pointer-less x86-64
+/// function whose locals and save area need `raw_space` bytes.
+///
+/// There is no `push %rbp` to absorb the return address, so the frame must be
+/// ≡ 8 (mod 16) for %rsp to be 16-byte aligned at every call: entry %rsp ≡ 8,
+/// and `8 + frame ≡ 0`. The result is the SMALLEST such size ≥ `raw_space`
+/// (`roundup16(raw_space) + 8` wasted 16 bytes, and with them a `subq`/`addq`
+/// pair around one-push frames, whenever `raw_space mod 16` was in 1..=8).
+/// Slot alignment mod 16 is unchanged (every candidate is ≡ 8); larger
+/// alignments never came from the frame size (entry %rsp mod 32 is the
+/// caller's).
+///
+/// A frame-less function stays at 0 — %rsp ≡ 8 is harmless without calls —
+/// and pads 8 when it calls out (a misaligned call faults in callee `movaps`:
+/// float_special/main segv).
+fn fpo_frame_size(raw_space: i64, has_calls: bool) -> i64 {
+    if raw_space <= 0 {
+        return if has_calls { 8 } else { 0 };
+    }
+    ((raw_space + 7) & !15) + 8
+}
+
+#[cfg(test)]
+mod fpo_frame_size_tests {
+    use super::fpo_frame_size;
+
+    #[test]
+    fn smallest_call_aligned_frame_covering_the_need() {
+        for raw in 1..=4096i64 {
+            for calls in [false, true] {
+                let f = fpo_frame_size(raw, calls);
+                assert_eq!(f % 16, 8, "raw {raw}: {f} misaligns calls");
+                assert!(f >= raw, "raw {raw}: {f} too small");
+                assert!(f - 16 < raw, "raw {raw}: {f} not minimal");
+            }
+        }
+        assert_eq!(fpo_frame_size(0, false), 0);
+        assert_eq!(fpo_frame_size(0, true), 8);
+        assert_eq!(fpo_frame_size(-8, true), 8);
+        // One push, no locals: the push alone aligns the calls.
+        assert_eq!(fpo_frame_size(8, true), 8);
+        assert_eq!(fpo_frame_size(9, true), 24);
+        assert_eq!(fpo_frame_size(24, true), 24);
     }
 }

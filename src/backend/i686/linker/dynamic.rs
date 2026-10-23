@@ -8,6 +8,25 @@
 //! construction; [`DynamicDesc::serialize`] still checks it.
 
 use super::types::*;
+use crate::common::fx_hash::FxHashMap;
+
+/// The address `DT_INIT`/`DT_FINI` record, chosen as GNU ld chooses it:
+/// the entry exists iff the image itself defines `_init`/`_fini` (crti.o's
+/// frame around the `.init`/`.fini` fragments) and holds that symbol.  A
+/// `.init` section with no `_init` -- a `-nostartfiles` fragment with no
+/// prologue and no `ret` -- gets no entry, since entering it runs off its
+/// end.  Computed from the symbol's output section like the final symbol
+/// pass, so it is usable as soon as layout has placed that section (and its
+/// presence, which never depends on layout, as soon as sections exist).
+pub(super) fn image_function_addr(
+    global_symbols: &FxHashMap<String, LinkerSymbol>,
+    output_sections: &[OutputSection],
+    name: &str,
+) -> Option<u32> {
+    let sym = global_symbols.get(name)?;
+    let sec = output_sections.get(sym.output_section)?;
+    (sym.is_defined && !sym.is_dynamic).then(|| sec.addr + sym.section_offset)
+}
 
 /// Contents of `.dynamic`.  `Some` = the entry (group) is present.
 #[derive(Clone, Debug, Default)]

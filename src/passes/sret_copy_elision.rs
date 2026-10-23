@@ -1,4 +1,4 @@
-//! Retarget a structure-returning call at the aggregate copy it feeds.
+//! Retarget structure-returning calls and forward whole-object copies.
 //!
 //! A C statement whose initializer is a structure-returning call lowers to a
 //! hidden (sret) temporary that the call fills in, followed by an aggregate
@@ -9,294 +9,351 @@
 //! %obj  = alloca 24                 # the C object
 //! call  f(%tmp)                     # writes the struct into %tmp
 //! memcpy %obj <- %tmp, 24           # the C assignment
-//! call  g(..., %obj, ...)           # %obj passed by value
 //! ```
 //!
-//! When the hidden slot is written exactly once and read exactly once — by the
-//! copy itself — the copy moves bytes that the call could have written into
-//! their final home directly.  Retargeting the sret argument at the destination
-//! and deleting the copy leaves the destination holding the same bytes at the
-//! same point in the program, and the hidden slot unread.
+//! # Phase 1: return-slot retargeting
 //!
-//! This is not a micro-optimisation in the corpus that motivated it: zstd's
-//! sequence decoder runs it once per decoded sequence, and the 24-byte
-//! store/reload pair dominated the hot loop (~15 % of L9 decode samples in
-//! `ZSTD_decompressSequences_default`; the caller then passed the copied
-//! struct by value to the inlined `ZSTD_execSequence`).
+//! When the hidden slot is written only by the call and read only by the copy,
+//! the call can write `%obj` directly and the copy disappears. This is GCC's
+//! return-slot optimisation, and it carries GCC's side condition
+//! (`dest_safe_for_nrv_p`): in the original program the callee runs while
+//! `%obj` still holds its OLD bytes, so the retarget must be invisible to
+//! everything that can run before the copy. For `memcpy %D <- %S, n` and the
+//! sret call `call f(%S)` at `(B, c)`:
 //!
-//! # Why forwarding here is not the same as forwarding a copy to its source
+//! 1. `%S` and `%D` are allocas of exactly `n` bytes, `%D` is at least as
+//!    aligned as `%S` (the callee may use aligned vector stores for an
+//!    over-aligned return type), `%D` is not volatile, and `%D`'s alloca
+//!    dominates the call (the inliner materialises a callee-local aggregate
+//!    at the call site, so for an sret call its alloca can FOLLOW the call in
+//!    the same block; naming it at the call would be a use before its
+//!    definition);
+//! 2. `%S` is mentioned exactly twice — the call's hidden pointer argument and
+//!    this copy's source — and the call's own result (the returned slot
+//!    address) is unused;
+//! 3. the call precedes the copy in the same block `B`;
+//! 4. nothing mentions `%D` (through any derived pointer) strictly between
+//!    the call and the copy;
+//! 5. no escape of `%D` can execute before the call: `%D`'s address reaches a
+//!    call argument, a stored value, inline asm, a terminator or any other
+//!    non-derivation use only after the copy in `B`, or in blocks that cannot
+//!    reach `B` (when `B` is on a cycle, `B` reaches itself, so an escape
+//!    later in `B` is declined too) — so the callee can neither read nor
+//!    write `%D` except through the sret pointer (`d = f(&d)` and
+//!    `p = &d; d = f();` are declined, `d = f(); use(&d);` is not);
+//! 6. the function contains no returns-twice call: a `longjmp` out of the
+//!    callee would leave `%D` partially written where the original left it
+//!    intact.
 //!
-//! `aggregate_copy_forward` forwards *reads* of a copy to the source, which is
-//! illegal once the source is written again.  This pass never lets a reader see
-//! the source: it moves the *writer*, so every later access still goes through
-//! the destination object.  The callee consequently writes the caller's object
-//! exactly as it previously wrote the hidden slot, which is why no escape
-//! analysis is needed — only the proof that the hidden slot is dead after the
-//! copy.
+//! # Phase 2: forwarding a whole-object copy into its reads
 //!
-//! # Soundness conditions
+//! A by-value struct the inliner kept as a local copy has the shape
+//! `memcpy %copy <- %obj; load %copy[k] ...`. Every access to an object is
+//! logged in program order, and attribution is block-local: a whole-object
+//! copy *owns* the uses of `%copy` that follow it in its block, up to the
+//! next write of `%copy` there. A copy is deleted, and its owned loads
+//! re-rooted at `%obj`, when:
 //!
-//! For `memcpy %D <- %S, n` with `%S` written by an sret call in the same block:
+//! * every use it owns is a non-volatile load through a constant offset path
+//!   (a volatile access must keep accessing the object it names);
+//! * every use of `%copy` anywhere is owned by some whole-object copy in its
+//!   own block, so no read sees bytes another block left behind, and `%copy`
+//!   reaches no terminator;
+//! * `%obj` is a non-volatile alloca of the same size and alignment that is
+//!   never observed opaquely: an escape (call argument, stored pointer value,
+//!   inline asm) or an unenumerable read makes every call a potential writer,
+//!   so such an object never serves as a source;
+//! * every whole-object copy into `%obj` precedes the copy (in its block, or
+//!   in a block that precedes it on every path);
+//! * no write of `%obj` (store, partial copy, clobber) lies in the copy's
+//!   block between the copy and the last re-rooted read. A write in another
+//!   block cannot run between two instructions of this one.
 //!
-//! 1. both objects are allocas of exactly `n` bytes, so the copy covers the
-//!    whole destination and the whole source (no partial-object aliasing);
-//! 2. `%S` is mentioned exactly twice in the function: as the call's hidden
-//!    pointer argument and as this copy's source.  Anything else — a load, a
-//!    second copy, a nested sret call, an inline-asm operand, a return — keeps
-//!    the value alive and the transform is declined;
-//! 3. the call precedes the copy in the same block, so the bytes being copied
-//!    are the bytes the call wrote (a call in another block would need a
-//!    dominance argument, and this pass deliberately does not make one).
+//! The per-copy ownership rule also handles a temporary that is re-filled by
+//! several copies (a per-iteration or per-call-site buffer), which
+//! `aggregate_copy_forward` and `aggregate_sroa` (single writer) decline.
 //!
-//! Nothing is required of the destination: it may be read, written, passed by
-//! pointer or left untouched afterwards, because its contents after the copy
-//! are bit-identical either way.
-//!
-//! # Second phase: forwarding a copy whose reads span blocks
-//!
-//! A by-value struct argument that the inliner kept as a parameter copy has a
-//! different shape — the copy is followed by reads in many blocks:
-//!
-//! ```text
-//! %copy = alloca 24
-//! memcpy %copy <- %obj, 24
-//! ... load %copy[0] in block B1, load %copy[8] in block B2, ...
-//! ```
-//!
-//! `aggregate_copy_forward` forwards these to `%obj` only when every read is
-//! in the copy's own block, because it proves the source unmodified with a
-//! block-local scan. A dominance argument extends that to the general case,
-//! and it needs no aliasing or reachability analysis:
-//!
-//! * **every write to the source dominates the copy.** Then a write can only
-//!   re-execute by passing through the copy again, so each read in the copy's
-//!   dominance region sees the value that was copied — the same value the
-//!   forwarding read now sees.
-//! * **every read of the copy is dominated by the copy** (or follows it in
-//!   the copy's block), so no read can precede the initialization.
-//! * the copy is the destination object's **only** write, so nothing else can
-//!   make a read observe a different value than the source's.
-//!
-//! Under those conditions every load through the copied object can read the
-//! source instead and the copy disappears. This is the shape zstd's decoder
-//! produces for `ZSTD_execSequence(sequence)` after inlining, where the copy
-//! was 15 % of all L9 decode samples.
+//! Kill switch: `CCC_NO_SRET_COPY_ELISION=1`.
 
+use crate::backend::liveness::is_returns_twice_call;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
-use crate::ir::reexports::{Instruction, IrFunction, Operand};
+use crate::ir::analysis::{CfgAnalysis, dominates_idom};
+use crate::ir::intrinsics::IntrinsicOp;
+use crate::ir::reexports::{Instruction, IrFunction, Operand, Value};
 
-/// Bytes of a single `alloca`, keyed by the alloca's value id.
-fn alloca_sizes(func: &IrFunction) -> FxHashMap<u32, usize> {
-    let mut sizes = FxHashMap::default();
-    for block in &func.blocks {
-        for inst in &block.instructions {
-            if let Instruction::Alloca { dest, size, .. } = inst {
-                sizes.insert(dest.0, *size);
-            }
-        }
-    }
-    sizes
-}
-
-/// Immediate dominators per block index (`usize::MAX` for unreachable).
-fn dominators(func: &IrFunction) -> Vec<usize> {
-    let label_map = crate::ir::analysis::build_label_map(func);
-    let (preds, succs) = crate::ir::analysis::build_cfg(func, &label_map);
-    crate::ir::analysis::compute_dominators(func.blocks.len(), &preds, &succs)
-}
-
-/// Every operand position of one instruction, memory destinations included.
-///
-/// `Instruction::for_each_used_value` already reports the addresses an
-/// instruction reads or writes (`Memcpy` destination, `Store` pointer,
-/// `Call` arguments); the extra match arm below records which of those
-/// positions *write* through the pointer, because a written hidden slot has a
-/// different lifetime than a read one.
-fn note_writes(inst: &Instruction, writes: &mut FxHashMap<u32, usize>) {
-    match inst {
-        Instruction::Store { ptr, .. } => *writes.entry(ptr.0).or_insert(0) += 1,
-        Instruction::Memcpy { dest, .. } => *writes.entry(dest.0).or_insert(0) += 1,
-        Instruction::Call { info, .. } => {
-            if info.is_sret {
-                if let Some(OperandValue(v)) = info.args.first().map(operand_value) {
-                    *writes.entry(v).or_insert(0) += 1;
-                }
-            }
-        }
-        Instruction::InlineAsm { .. }
-        | Instruction::Intrinsic { .. }
-        | Instruction::AtomicRmw { .. } => {
-            // An opaque transfer whose memory effects this pass does not
-            // model: any value it mentions is treated as both read and
-            // written, so a hidden slot that reaches one is never forwarded.
-            let mut mark = |v: u32| {
-                *writes.entry(v).or_insert(0) += 1;
-            };
-            inst.for_each_used_value(&mut mark);
-        }
-        _ => {}
-    }
-}
-
-/// A copy of `Operand::Value(..)`, so the match above can be written inline.
+/// What phase 1 needs to know about one alloca.
 #[derive(Clone, Copy)]
-struct OperandValue(u32);
+struct AllocaFact {
+    size: usize,
+    align: usize,
+    volatile: bool,
+    /// (block, instruction index) of the `Alloca` itself.
+    def: (usize, usize),
+}
 
-fn operand_value(op: &crate::ir::reexports::Operand) -> OperandValue {
-    match op {
-        crate::ir::reexports::Operand::Value(v) => OperandValue(v.0),
-        _ => OperandValue(u32::MAX),
+/// Alloca facts keyed by the alloca's value id.
+fn alloca_facts(func: &IrFunction) -> FxHashMap<u32, AllocaFact> {
+    let mut facts = FxHashMap::default();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Instruction::Alloca {
+                dest,
+                size,
+                align,
+                volatile,
+                semantic_volatile,
+                ..
+            } = inst
+            {
+                facts.insert(
+                    dest.0,
+                    AllocaFact {
+                        size: *size,
+                        align: *align,
+                        volatile: *volatile || *semantic_volatile,
+                        def: (bi, ii),
+                    },
+                );
+            }
+        }
+    }
+    facts
+}
+
+/// Non-local control flow that can re-enter the function after a callee has
+/// partially executed (`setjmp` family, `__builtin_setjmp`, GNU nonlocal goto).
+fn is_returns_twice(inst: &Instruction) -> bool {
+    is_returns_twice_call(inst)
+        || matches!(inst, Instruction::NonlocalGotoSave { .. })
+        || matches!(
+            inst,
+            Instruction::Intrinsic {
+                op: IntrinsicOp::BuiltinSetjmp,
+                ..
+            }
+        )
+}
+
+/// Does `inst` use the derived pointer `v` only to read or write the object
+/// it points into (or to derive another pointer)? Anything else lets the
+/// address leave the function's view: a call argument, a stored VALUE, inline
+/// asm, pointer arithmetic, a phi or select.
+fn is_non_escaping_use(inst: &Instruction, v: u32) -> bool {
+    match inst {
+        Instruction::GetElementPtr { base, .. } => base.0 == v,
+        Instruction::Copy {
+            src: Operand::Value(src),
+            ..
+        } => src.0 == v,
+        Instruction::Load { ptr, .. } => ptr.0 == v,
+        Instruction::Store { ptr, val, .. } => {
+            ptr.0 == v && !matches!(val, Operand::Value(x) if x.0 == v)
+        }
+        Instruction::Memcpy { .. } => true,
+        _ => false,
     }
 }
 
-/// Forward sret calls into the aggregate destination they are copied to.
+/// Lazily built CFG facts shared by both phases.
+struct Cfg {
+    analysis: CfgAnalysis,
+}
+
+impl Cfg {
+    fn build(func: &IrFunction) -> Self {
+        Self {
+            analysis: CfgAnalysis::build(func),
+        }
+    }
+
+    /// Blocks from which `target` is reachable (excluding `target` itself
+    /// unless it lies on a cycle).
+    fn reaching(&self, target: usize) -> FxHashSet<usize> {
+        let mut seen: FxHashSet<usize> = FxHashSet::default();
+        let mut work: Vec<usize> = self
+            .analysis
+            .preds
+            .row(target)
+            .iter()
+            .map(|&p| p as usize)
+            .collect();
+        while let Some(b) = work.pop() {
+            if seen.insert(b) {
+                work.extend(self.analysis.preds.row(b).iter().map(|&p| p as usize));
+            }
+        }
+        seen
+    }
+}
+
+/// Rule 4 and 5 of phase 1 for destination root `d`, call `(bi, ci)` and copy
+/// `(bi, ii)`.
+fn dest_unobservable_by_callee(
+    func: &IrFunction,
+    deriv: &FxHashMap<u32, (u32, Option<Vec<i64>>)>,
+    cfg: &Cfg,
+    d: u32,
+    bi: usize,
+    ci: usize,
+    ii: usize,
+) -> bool {
+    let derived_from_d = |v: u32| deriv.get(&v).is_some_and(|(root, _)| *root == d);
+    // Rule 4: no mention at all between the call and the copy. This also
+    // rules out a second call retargeted at `%D` inside the window: two
+    // candidates for the same `%D` in one block with nested or overlapping
+    // windows always have one copy (a write of `%D`) inside the other's
+    // window, so at most one of them is accepted.
+    for inst in &func.blocks[bi].instructions[ci + 1..ii] {
+        let mut hit = false;
+        inst.for_each_used_value(|v| hit |= derived_from_d(v));
+        if hit {
+            return false;
+        }
+    }
+    // Rule 5: every escaping use runs only after the copy, on paths that
+    // never return to the call. `reaching` contains `B` itself exactly when
+    // `B` is on a cycle, which covers a later escape in `B` feeding the next
+    // iteration's call; an escape in a block that cannot reach `B` (a loop
+    // exit) runs after every instance of the call. SSA makes this complete
+    // for indirect escapes too: a phi, select or stored copy of `&D` is only
+    // used at points reachable from its definition.
+    let reaching = cfg.reaching(bi);
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (k, inst) in block.instructions.iter().enumerate() {
+            let mut escapes = false;
+            inst.for_each_used_value(|v| {
+                escapes |= derived_from_d(v) && !is_non_escaping_use(inst, v);
+            });
+            if escapes && (reaching.contains(&b) || (b == bi && k < ii)) {
+                return false;
+            }
+        }
+        let mut in_term = false;
+        block
+            .terminator
+            .for_each_used_value(|v| in_term |= derived_from_d(v));
+        // A terminator runs after every instruction of its block, so in `B`
+        // it follows the copy: the same reachability rule applies.
+        if in_term && reaching.contains(&b) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Forward sret calls into the aggregate destination they are copied to,
+/// then forward whole-object copies into their reads.
 ///
-/// Returns the number of copies removed.  The function is rewritten in place;
-/// every edit is index-stable per block.
+/// Returns the number of copies removed. The function is rewritten in place.
 pub(crate) fn run(func: &mut IrFunction) -> usize {
     if func.blocks.is_empty() {
         return 0;
     }
-    let sizes = alloca_sizes(func);
-    if sizes.is_empty() {
+    let facts = alloca_facts(func);
+    if facts.is_empty() {
         return 0;
     }
+    // Phase 1 only deletes copies; phase 2 recomputes every fact itself.
+    retarget_sret_calls(func, &facts) + forward_dominated_copies(func)
+}
 
-    // Mentions and writes per value. A mention is any operand position; the
-    // hidden slot must have exactly one mention that reads it (the copy) and
-    // one that writes it (the sret call), which the rules below pin down.
+fn retarget_sret_calls(func: &mut IrFunction, facts: &FxHashMap<u32, AllocaFact>) -> usize {
+    // (block, instruction index) of the sret call that fills each hidden slot.
+    let mut sret_sites: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
+    let mut has_returns_twice = false;
     let mut mentions: FxHashMap<u32, usize> = FxHashMap::default();
-    let mut writes: FxHashMap<u32, usize> = FxHashMap::default();
-    for block in &func.blocks {
-        for inst in &block.instructions {
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            has_returns_twice |= is_returns_twice(inst);
             inst.for_each_used_value(|v| *mentions.entry(v).or_insert(0) += 1);
-            note_writes(inst, &mut writes);
+            if let Instruction::Call { info, .. } = inst
+                && info.is_sret
+                && let Some(Operand::Value(v)) = info.args.first()
+            {
+                sret_sites.insert(v.0, (bi, ii));
+            }
         }
         // A value returned from the function or named by a terminator is
         // live even though it appears in no instruction.
-        block.terminator.for_each_used_value(|v| {
-            *mentions.entry(v).or_insert(0) += 1;
-            *writes.entry(v).or_insert(0) += 1;
-        });
+        block
+            .terminator
+            .for_each_used_value(|v| *mentions.entry(v).or_insert(0) += 1);
+    }
+    // Rule 6.
+    if sret_sites.is_empty() || has_returns_twice {
+        return 0;
     }
 
-    // (block, instruction index) of the sret call that fills each hidden slot.
-    let mut sret_sites: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
-    for (bi, block) in func.blocks.iter().enumerate() {
-        for (ii, inst) in block.instructions.iter().enumerate() {
-            if let Instruction::Call { info, .. } = inst {
-                if info.is_sret {
-                    if let Some(OperandValue(v)) = info.args.first().map(operand_value) {
-                        sret_sites.insert(v, (bi, ii));
-                    }
-                }
-            }
-        }
-    }
-    if sret_sites.is_empty() {
-        return forward_dominated_copies(func);
-    }
-
-    // Definition site of every alloca. Retargeting makes the call name the
-    // copy's destination, so that pointer must already be live at the call.
-    // Usually it is a function-entry alloca, but the inliner materialises a
-    // callee-local aggregate at the call site, which for an sret call puts the
-    // definition *after* the call in the same block; retargeting there would
-    // define the pointer after its own use.
-    let mut alloca_def: FxHashMap<u32, (usize, usize)> = FxHashMap::default();
-    for (bi, block) in func.blocks.iter().enumerate() {
-        for (ii, inst) in block.instructions.iter().enumerate() {
-            if let Instruction::Alloca { dest, .. } = inst {
-                alloca_def.insert(dest.0, (bi, ii));
-            }
-        }
-    }
-    let mut idom: Option<Vec<usize>> = None;
-
-    // Plan the edits: (block, index of the copy, index of the sret call,
-    // destination alloca value).
+    let deriv = deriv_map(func);
+    let mut cfg: Option<Cfg> = None;
     let mut removals: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     let mut retargets: Vec<(usize, usize, u32)> = Vec::new();
-    // Accepted retargets, so a second call aimed at the same destination can
-    // be checked against an earlier candidate's window.
-    let mut accepted: Vec<(usize, usize, u32)> = Vec::new();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             let Instruction::Memcpy { dest, src, size } = inst else {
                 continue;
             };
             let (d, s) = (dest.0, src.0);
-
             if d == s {
                 continue;
             }
-            if sizes.get(&d) != Some(size) || sizes.get(&s) != Some(size) {
+            // Rule 1.
+            let (Some(&df), Some(&sf)) = (facts.get(&d), facts.get(&s)) else {
+                continue;
+            };
+            if df.size != *size || sf.size != *size || df.align < sf.align || df.volatile {
                 continue;
             }
-            // The hidden slot is mentioned exactly twice — the call's pointer
-            // argument and this copy's source — and written only by the call.
+            // Rule 2: the hidden slot is mentioned exactly twice. One mention
+            // is this copy's source, so once rule 3 finds the sret call the
+            // call's hidden argument is the only other use: nothing else can
+            // read or write the slot. The call's returned slot address must
+            // be unused.
             if mentions.get(&s).copied().unwrap_or(0) != 2 {
                 continue;
             }
-            if writes.get(&s).copied().unwrap_or(0) != 1 {
-                continue;
-            }
+            // Rule 3.
             let Some(&(cb, ci)) = sret_sites.get(&s) else {
                 continue;
             };
             if cb != bi || ci >= ii {
                 continue;
             }
-            // The destination pointer must dominate the retargeted call.
-            let Some(&(db, di)) = alloca_def.get(&d) else {
-                continue;
-            };
-            if db == bi {
-                if di >= ci {
-                    continue;
-                }
-            } else {
-                let idom = idom.get_or_insert_with(|| dominators(func));
-                if !crate::ir::analysis::dominates_idom(idom, db, cb) {
-                    continue;
-                }
-            }
-            // Nothing between the call and the copy may touch the destination:
-            // the retarget moves the call's write earlier, so an intervening
-            // reader would observe the call's bytes and an intervening writer
-            // would survive the deleted copy.
-            let mut touched = false;
-            for inst in &func.blocks[bi].instructions[ci + 1..ii] {
-                inst.for_each_used_value(|v| touched |= v == d);
-            }
-            if touched {
-                continue;
-            }
-            // A second call retargeted at the same destination inside this
-            // window would write the object between the two points the copy
-            // covers, leaving the later write visible after the copy is gone.
-            if accepted
-                .iter()
-                .any(|&(ab, ai, ad)| ab == bi && ad == d && ai > ci && ai < ii)
+            if let Instruction::Call { info, .. } = &block.instructions[ci]
+                && info
+                    .dest
+                    .is_some_and(|r| mentions.get(&r.0).copied().unwrap_or(0) != 0)
             {
                 continue;
             }
-            accepted.push((bi, ci, d));
+            // Rule 1, dominance: the call will name `%D`, so `%D`'s alloca
+            // must precede it. Same block: by index (the shape the inliner
+            // produces, decided before any CFG is built). Another block: by
+            // the dominator tree, which also refuses unreachable code.
+            let (db, di) = df.def;
+            if db == bi && di >= ci {
+                continue;
+            }
+            let cfg = cfg.get_or_insert_with(|| Cfg::build(func));
+            if db != bi && !dominates_idom(&cfg.analysis.idom, db, bi) {
+                continue;
+            }
+            // Rules 4 and 5.
+            if !dest_unobservable_by_callee(func, &deriv, cfg, d, bi, ci, ii) {
+                continue;
+            }
             retargets.push((cb, ci, d));
             removals.entry(bi).or_default().push(ii);
         }
     }
-    if retargets.is_empty() {
-        return forward_dominated_copies(func);
-    }
-
-    for (bi, ci, d) in retargets {
+    for &(bi, ci, d) in &retargets {
         if let Instruction::Call { info, .. } = &mut func.blocks[bi].instructions[ci] {
-            info.args[0] = crate::ir::reexports::Operand::Value(crate::ir::reexports::Value(d));
+            info.args[0] = Operand::Value(Value(d));
         }
     }
     let mut removed = 0;
-    for (bi, indices) in removals {
+    for (bi, mut indices) in removals {
+        indices.sort_unstable();
         let block = &mut func.blocks[bi];
         let spans_parallel = block.source_spans.len() == block.instructions.len();
         for ii in indices.into_iter().rev() {
@@ -307,7 +364,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
             removed += 1;
         }
     }
-    removed + forward_dominated_copies(func)
+    removed
 }
 
 /// Pointer derivation map: value -> (alloca root, constant offset path).
@@ -424,7 +481,7 @@ struct CopySite {
 ///
 /// Returns the number of copies removed.
 fn forward_dominated_copies(func: &mut IrFunction) -> usize {
-    use crate::ir::reexports::{IrConst, Value};
+    use crate::ir::reexports::IrConst;
 
     let mut allocas: FxHashMap<u32, (usize, usize, bool)> = FxHashMap::default();
     for block in &func.blocks {
@@ -496,9 +553,13 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
                     Instruction::Memcpy { .. } => Event::Read(bi, ii, ObjectUse::Pinned),
                     // A load the pass cannot re-root reads the object just as
                     // much as one it can: it must be owned by the copy too.
-                    Instruction::Load { ptr, .. } if ptr.0 == v => match path {
-                        Some(p) => Event::Read(bi, ii, ObjectUse::Readable(p.clone())),
-                        None => Event::Read(bi, ii, ObjectUse::Opaque),
+                    // A volatile load must keep reading the object it names,
+                    // so it is a use no copy can be deleted under.
+                    Instruction::Load { ptr, volatile, .. } if ptr.0 == v => match path {
+                        Some(p) if !*volatile => {
+                            Event::Read(bi, ii, ObjectUse::Readable(p.clone()))
+                        }
+                        _ => Event::Read(bi, ii, ObjectUse::Opaque),
                     },
                     // A store through a derived pointer only defines bytes;
                     // the value it stores is computed before it runs, so the
@@ -608,9 +669,11 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
     // used to sit here was a `CfgAnalysis::build` per (write to the source,
     // candidate copy) pair -- O(writes * copies * |CFG|) for a source object
     // that several blocks refill, and the reason a long chain of refills made
-    // this pass the slowest thing in the pipeline.
-    let cfg = crate::ir::analysis::CfgAnalysis::build(func);
-    let dom = crate::ir::analysis::DominanceChecker::new(cfg.num_blocks, &cfg.idom);
+    // this pass the slowest thing in the pipeline.  Built on the first
+    // cross-block query: most functions never ask one.  An unreachable block
+    // is a singleton root of the checker's forest, so it neither dominates nor
+    // is dominated by a reachable block and never licenses a rewrite.
+    let mut dom: Option<crate::ir::analysis::DominanceChecker> = None;
     let mut sites: Vec<CopySite> = Vec::new();
     for (&root, ws) in &write_positions {
         if rejected.contains(&root) || !attributable.contains(&root) {
@@ -649,9 +712,11 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
                 continue;
             }
             // The source must stay byte-identical for as long as any forwarded
-            // read can run. Whole-object copies are checked below by program
-            // order; everything else that can write through a derived pointer
-            // marks the source opaque, and an opaque source is never used.
+            // read can run. An opaque use (escape, clobber, unenumerable read)
+            // makes every instruction a potential writer, so such a source is
+            // never used. Whole-object copies into it are checked below by
+            // program order, and stores and partial copies by
+            // `source_holds_copied_bytes`.
             if opaque_roots.contains(src_root) || rejected.contains(src_root) {
                 continue;
             }
@@ -664,7 +729,14 @@ fn forward_dominated_copies(func: &mut IrFunction) -> usize {
                         if wb == bi {
                             wi < ii
                         } else {
-                            dom.strictly_dominates(wb, bi)
+                            dom.get_or_insert_with(|| {
+                                let cfg = CfgAnalysis::build(func);
+                                crate::ir::analysis::DominanceChecker::new(
+                                    cfg.num_blocks,
+                                    &cfg.idom,
+                                )
+                            })
+                            .strictly_dominates(wb, bi)
                         }
                     })
             });
@@ -841,6 +913,7 @@ mod tests {
                 is_const: false,
                 ret_eightbyte_classes: vec![],
                 assume_library: false,
+                cold: false,
             },
         }
     }
@@ -921,6 +994,94 @@ mod tests {
                 !uses_dest || i > alloca_at,
                 "instruction #{i} uses the destination before its alloca"
             );
+        }
+    }
+
+    /// The dominance rule across blocks, positive side: the destination's
+    /// alloca in the entry block dominates a call in its successor, so the
+    /// call is retargeted and the copy deleted. (Swapping the dominator query's
+    /// arguments would decline this; every other retarget test is one block.)
+    #[test]
+    fn retargets_across_blocks_when_the_destination_alloca_dominates() {
+        let mut func = chain(vec![
+            vec![alloca(0, 24), alloca(1, 24), alloca(2, 8)],
+            vec![
+                sret_call(3, 0, 2),
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 24,
+                },
+                Instruction::Load {
+                    dest: Value(5),
+                    ptr: Value(1),
+                    ty: IrType::U64,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+            ],
+        ]);
+        let facts = alloca_facts(&func);
+        assert_eq!(retarget_sret_calls(&mut func, &facts), 1);
+        match &func.blocks[1].instructions[0] {
+            Instruction::Call { info, .. } => assert_eq!(info.args[0], Operand::Value(Value(1))),
+            other => panic!("expected the sret call, got {other:?}"),
+        }
+        assert!(
+            !func.blocks[1]
+                .instructions
+                .iter()
+                .any(|i| matches!(i, Instruction::Memcpy { .. })),
+            "the copy is deleted"
+        );
+    }
+
+    /// The dominance rule across blocks, negative side: a destination alloca
+    /// on one arm of a diamond does not dominate the join, so a call there may
+    /// not name it, however the rest of the candidate looks.
+    #[test]
+    fn declines_retarget_when_the_destination_alloca_does_not_dominate() {
+        let mut func = IrFunction::new("g".into(), IrType::I64, vec![], false);
+        func.next_value_id = 1000;
+        let block = |label: u32, instructions: Vec<Instruction>, terminator| BasicBlock {
+            label: BlockId(label),
+            instructions,
+            terminator,
+            source_spans: vec![],
+        };
+        func.blocks.push(block(
+            0,
+            vec![alloca(0, 24), alloca(2, 8)],
+            Terminator::CondBranch {
+                cond: Operand::Value(Value(2)),
+                true_label: BlockId(1),
+                false_label: BlockId(2),
+            },
+        ));
+        func.blocks.push(block(
+            1,
+            vec![alloca(1, 24)],
+            Terminator::Branch(BlockId(3)),
+        ));
+        func.blocks
+            .push(block(2, vec![], Terminator::Branch(BlockId(3))));
+        func.blocks.push(block(
+            3,
+            vec![
+                sret_call(3, 0, 2),
+                Instruction::Memcpy {
+                    dest: Value(1),
+                    src: Value(0),
+                    size: 24,
+                },
+            ],
+            Terminator::Return(None),
+        ));
+        let facts = alloca_facts(&func);
+        assert_eq!(retarget_sret_calls(&mut func, &facts), 0);
+        match &func.blocks[3].instructions[0] {
+            Instruction::Call { info, .. } => assert_eq!(info.args[0], Operand::Value(Value(0))),
+            other => panic!("expected the sret call, got {other:?}"),
         }
     }
 
@@ -1598,6 +1759,242 @@ mod tests {
             },
             plain_call(4, 1),
         ]);
+        assert_eq!(run(&mut func), 0);
+    }
+
+    // ── Phase 1 side conditions (GCC `dest_safe_for_nrv_p`) ─────────────────
+
+    fn load_v(dest: u32, ptr: u32, volatile: bool) -> Instruction {
+        Instruction::Load {
+            volatile,
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty: IrType::U64,
+            seg_override: AddressSpace::Default,
+        }
+    }
+
+    fn sret_arg(func: &IrFunction, at: usize) -> u32 {
+        match &func.blocks[0].instructions[at] {
+            Instruction::Call { info, .. } => match info.args[0] {
+                Operand::Value(v) => v.0,
+                _ => u32::MAX,
+            },
+            other => panic!("expected the sret call, got {other:?}"),
+        }
+    }
+
+    /// `p = &d; d = f();` — the callee may read `d` through `p` and must see
+    /// its OLD bytes (sret_alias.c: 1011220 instead of 1110220).
+    #[test]
+    fn retarget_declines_when_the_destination_escapes_before_the_call() {
+        let mut func = func_with(vec![
+            alloca(0, 24),
+            alloca(1, 24),
+            alloca(2, 8),
+            Instruction::GlobalAddr {
+                dest: Value(6),
+                name: "gp".into(),
+            },
+            Instruction::Store {
+                volatile: false,
+                val: Operand::Value(Value(1)),
+                ptr: Value(6),
+                ty: IrType::Ptr,
+                seg_override: AddressSpace::Default,
+            },
+            sret_call(3, 0, 2),
+            memcpy(1, 0, 24),
+        ]);
+        assert_eq!(run(&mut func), 0);
+        assert_eq!(sret_arg(&func, 5), 0, "the call must keep its hidden slot");
+    }
+
+    /// `d = h(&d);` — the destination is the call's own argument.
+    #[test]
+    fn retarget_declines_when_the_destination_is_a_call_argument() {
+        let mut func = func_with(vec![
+            alloca(0, 24),
+            alloca(1, 24),
+            sret_call(3, 0, 1),
+            memcpy(1, 0, 24),
+        ]);
+        assert_eq!(run(&mut func), 0);
+        assert_eq!(sret_arg(&func, 2), 0);
+    }
+
+    /// A read of the destination between the call and the copy observes the
+    /// old bytes in the original program.
+    #[test]
+    fn retarget_declines_when_the_destination_is_read_before_the_copy() {
+        let mut func = func_with(vec![
+            alloca(0, 24),
+            alloca(1, 24),
+            alloca(2, 8),
+            sret_call(3, 0, 2),
+            load_v(5, 1, false),
+            memcpy(1, 0, 24),
+        ]);
+        assert_eq!(run(&mut func), 0);
+        assert_eq!(sret_arg(&func, 3), 0);
+    }
+
+    /// On a cycle, an escape after the copy is visible to the NEXT
+    /// iteration's call; the same body without the back edge retargets
+    /// (`retargets_single_use_hidden_slot`).
+    #[test]
+    fn retarget_declines_on_a_cycle_when_the_destination_escapes_later() {
+        let mut func = func_with(vec![
+            alloca(0, 24),
+            alloca(1, 24),
+            alloca(2, 8),
+            sret_call(3, 0, 2),
+            memcpy(1, 0, 24),
+            plain_call(4, 1),
+        ]);
+        func.blocks[0].terminator = Terminator::Branch(BlockId(0));
+        assert_eq!(run(&mut func), 0);
+        assert_eq!(sret_arg(&func, 3), 0);
+    }
+
+    /// `use(&d)` in a predecessor, then `d = f();`: the callee may observe
+    /// `d` through the escaped address.
+    #[test]
+    fn retarget_declines_when_the_destination_escapes_in_a_predecessor() {
+        let mut func = multi_block(vec![
+            vec![alloca(0, 24), alloca(1, 24), alloca(2, 8), plain_call(4, 1)],
+            vec![sret_call(3, 0, 2), memcpy(1, 0, 24)],
+        ]);
+        func.blocks[0].terminator = Terminator::Branch(BlockId(1));
+        assert_eq!(run(&mut func), 0);
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Call { info, .. } if info.args[0] == Operand::Value(Value(0))
+        ));
+    }
+
+    /// `d = f(); use(&d);` with the escape in a later block that cannot
+    /// reach the call: the callee cannot observe `d`, so the retarget holds.
+    #[test]
+    fn retargets_when_the_destination_escapes_only_in_a_later_block() {
+        let mut func = multi_block(vec![
+            vec![
+                alloca(0, 24),
+                alloca(1, 24),
+                alloca(2, 8),
+                sret_call(3, 0, 2),
+                memcpy(1, 0, 24),
+            ],
+            vec![plain_call(4, 1)],
+        ]);
+        func.blocks[0].terminator = Terminator::Branch(BlockId(1));
+        assert_eq!(run(&mut func), 1);
+        assert_eq!(sret_arg(&func, 3), 1);
+    }
+
+    /// A destination address named by a terminator that can run before the
+    /// call is treated as an escape.
+    #[test]
+    fn retarget_declines_when_a_reaching_terminator_names_the_destination() {
+        let mut func = multi_block(vec![
+            vec![alloca(0, 24), alloca(1, 24), alloca(2, 8)],
+            vec![sret_call(3, 0, 2), memcpy(1, 0, 24)],
+        ]);
+        func.blocks[0].terminator = Terminator::CondBranch {
+            cond: Operand::Value(Value(1)),
+            true_label: BlockId(1),
+            false_label: BlockId(1),
+        };
+        assert_eq!(run(&mut func), 0);
+        assert!(matches!(
+            &func.blocks[1].instructions[0],
+            Instruction::Call { info, .. } if info.args[0] == Operand::Value(Value(0))
+        ));
+    }
+
+    /// Every access to a volatile destination is observable: the copy's
+    /// write must stay.
+    #[test]
+    fn retarget_declines_for_a_volatile_destination() {
+        let mut func = func_with(vec![
+            alloca(0, 24),
+            alloca(1, 24),
+            alloca(2, 8),
+            sret_call(3, 0, 2),
+            memcpy(1, 0, 24),
+        ]);
+        if let Instruction::Alloca { volatile, .. } = &mut func.blocks[0].instructions[1] {
+            *volatile = true;
+        }
+        assert_eq!(run(&mut func), 0);
+        assert_eq!(sret_arg(&func, 3), 0);
+    }
+
+    /// The callee may store an over-aligned return type with aligned vector
+    /// moves; a less-aligned destination cannot take them.
+    #[test]
+    fn retarget_declines_for_a_less_aligned_destination() {
+        let mut func = func_with(vec![
+            alloca(0, 32),
+            alloca(1, 32),
+            alloca(2, 8),
+            sret_call(3, 0, 2),
+            memcpy(1, 0, 32),
+        ]);
+        if let Instruction::Alloca { align, .. } = &mut func.blocks[0].instructions[0] {
+            *align = 32;
+        }
+        assert_eq!(run(&mut func), 0);
+        assert_eq!(sret_arg(&func, 3), 0);
+    }
+
+    /// A `longjmp` out of the callee must leave the destination intact.
+    #[test]
+    fn retarget_declines_when_the_function_calls_setjmp() {
+        let mut setjmp = plain_call(7, 2);
+        if let Instruction::Call { func, .. } = &mut setjmp {
+            *func = "setjmp".into();
+        }
+        let mut func = func_with(vec![
+            alloca(0, 24),
+            alloca(1, 24),
+            alloca(2, 8),
+            setjmp,
+            sret_call(3, 0, 2),
+            memcpy(1, 0, 24),
+        ]);
+        assert_eq!(run(&mut func), 0);
+        assert_eq!(sret_arg(&func, 4), 0);
+    }
+
+    /// The call returns the slot address; a use of it reads the hidden slot.
+    #[test]
+    fn retarget_declines_when_the_returned_slot_address_is_used() {
+        let mut func = func_with(vec![
+            alloca(0, 24),
+            alloca(1, 24),
+            alloca(2, 8),
+            sret_call(3, 0, 2),
+            memcpy(1, 0, 24),
+            load_v(5, 3, false),
+        ]);
+        assert_eq!(run(&mut func), 0);
+        assert_eq!(sret_arg(&func, 3), 0);
+    }
+
+    // ── Phase 2: partial writes and volatile reads ──────────────────────────
+
+    /// A volatile read must keep reading the object it names.
+    #[test]
+    fn forwarding_keeps_a_copy_read_by_a_volatile_load() {
+        let mut func = multi_block(vec![vec![
+            alloca(0, 24),
+            alloca(1, 24),
+            alloca(2, 24),
+            memcpy(0, 2, 24),
+            memcpy(1, 0, 24),
+            load_v(3, 1, true),
+        ]]);
         assert_eq!(run(&mut func), 0);
     }
 }

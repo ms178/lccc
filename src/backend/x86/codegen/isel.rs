@@ -18,7 +18,39 @@ use crate::ir::reexports::{
 
 /// Convert an IR Value to a MachReg, using its physical register if already
 /// allocated by the main register allocator.
-fn value_to_reg(v: &Value, reg_assignments: &FxHashMap<u32, PhysReg>) -> MachReg {
+/// The register homes isel may pre-color: `value id -> PhysReg`.
+///
+/// A trait rather than a concrete map so the emitter can hand isel a VIEW of
+/// its homes filtered by freshness (`X86Codegen`'s `FreshHomes`) instead of
+/// copying every fresh entry of the function's assignment map into a new map
+/// per lowered instruction -- that copy was O(function) per instruction
+/// (7,852 lowerings x thousands of homes on zstd `huf_compress.c`: 2.15 G
+/// instructions, 9% of the compile) while a lowering reads a handful of
+/// entries.  Plain maps (tests, callers without a freshness filter)
+/// implement it directly.
+pub trait HomeMap {
+    /// The home of value `id`, if isel may use it.
+    fn get(&self, id: &u32) -> Option<&PhysReg>;
+
+    fn contains_key(&self, id: &u32) -> bool {
+        self.get(id).is_some()
+    }
+
+    /// Does any usable home satisfy `pred`?
+    fn any_home(&self, pred: &dyn Fn(PhysReg) -> bool) -> bool;
+}
+
+impl HomeMap for FxHashMap<u32, PhysReg> {
+    fn get(&self, id: &u32) -> Option<&PhysReg> {
+        std::collections::HashMap::get(self, id)
+    }
+
+    fn any_home(&self, pred: &dyn Fn(PhysReg) -> bool) -> bool {
+        self.values().any(|&r| pred(r))
+    }
+}
+
+fn value_to_reg(v: &Value, reg_assignments: &dyn HomeMap) -> MachReg {
     if let Some(&phys) = reg_assignments.get(&v.0) {
         // XMM registers (20-25) are for floats — shouldn't appear in integer MachInst.
         // Treat them as vregs so they get spilled to stack (safe fallback).
@@ -43,8 +75,8 @@ fn is_xmm_phys(reg: PhysReg) -> bool {
 /// registers (xmm0 = PhysReg 18, xmm1 = PhysReg 19), below the allocator's
 /// xmm pool (20..=33). The allocator itself never assigns 18/19, so any
 /// entry there is a live incoming parameter home.
-fn xmm_scratch_unsafe(ra: &FxHashMap<u32, PhysReg>) -> bool {
-    !sse_integer_moves() || ra.values().any(|r| r.0 == 18 || r.0 == 19)
+fn xmm_scratch_unsafe(ra: &dyn HomeMap) -> bool {
+    !sse_integer_moves() || ra.any_home(&|r| r.0 == 18 || r.0 == 19)
 }
 
 /// Whether the typed route may stage 16-byte integer moves through the
@@ -68,7 +100,7 @@ pub fn sse_integer_moves() -> bool {
 
 /// Convert an IR Operand to a MachOperand, using physical registers for
 /// values that already have register assignments from the main allocator.
-fn lower_operand_with_regs(op: &Operand, reg_assignments: &FxHashMap<u32, PhysReg>) -> MachOperand {
+fn lower_operand_with_regs(op: &Operand, reg_assignments: &dyn HomeMap) -> MachOperand {
     match op {
         Operand::Value(v) => MachOperand::Reg(value_to_reg(v, reg_assignments)),
         Operand::Const(c) => MachOperand::Imm(const_to_i64(c)),
@@ -132,7 +164,7 @@ fn emit_mov_operand_r(
     op: &Operand,
     dst: MachReg,
     size: OpSize,
-    ra: &FxHashMap<u32, PhysReg>,
+    ra: &dyn HomeMap,
     out: &mut Vec<MachInst>,
 ) {
     // v12 Fix E: narrow (S8/S16) Copies to a REGISTER must use the
@@ -198,7 +230,7 @@ fn emit_alu_operand_r(
     src: &Operand,
     dst: MachReg,
     size: OpSize,
-    ra: &FxHashMap<u32, PhysReg>,
+    ra: &dyn HomeMap,
     out: &mut Vec<MachInst>,
 ) {
     let src_op = lower_operand_with_regs(src, ra);
@@ -268,6 +300,20 @@ fn binop_to_shift(op: IrBinOp) -> Option<ShiftOp> {
     }
 }
 
+/// Width of a LEA that implements a `size`-wide integer operation. S64 stays
+/// `leaq`; S32 becomes `leal` (the i32 result zero-extended, no REX.W, and
+/// no read of the inputs' upper halves). S8/S16 also use `leal`: the narrow
+/// result's upper bits are don't-care, while `leaw` would add a 66h prefix
+/// byte and a 16-bit partial-register write that merges with (and so
+/// falsely depends on) the destination's previous value.
+fn lea_size(size: OpSize) -> OpSize {
+    if size == OpSize::S64 {
+        OpSize::S64
+    } else {
+        OpSize::S32
+    }
+}
+
 /// Check if an immediate is a LEA scale factor (3, 5, or 9).
 /// Returns the scale (2, 4, or 8) for the LEA index.
 fn lea_scale_for_mul(imm: i64) -> Option<u8> {
@@ -293,7 +339,7 @@ pub fn lower_binop(
     lhs: &Operand,
     rhs: &Operand,
     ty: IrType,
-    ra: &FxHashMap<u32, PhysReg>,
+    ra: &dyn HomeMap,
     out: &mut Vec<MachInst>,
 ) -> bool {
     let size = OpSize::from_ir_type(ty);
@@ -332,6 +378,7 @@ pub fn lower_binop(
                     index: Some((value_to_reg(index, ra), 1)),
                     offset: 0,
                     dst,
+                    size: OpSize::S64,
                 });
                 return true;
             }
@@ -354,6 +401,7 @@ pub fn lower_binop(
                         index: None,
                         offset,
                         dst,
+                        size: OpSize::S64,
                     });
                     return true;
                 }
@@ -375,6 +423,7 @@ pub fn lower_binop(
                         index: None,
                         offset,
                         dst,
+                        size: OpSize::S64,
                     });
                     return true;
                 }
@@ -439,6 +488,7 @@ pub fn lower_binop(
                         index: Some((dst, scale)),
                         offset: 0,
                         dst,
+                        size: lea_size(size),
                     });
                     return true;
                 }
@@ -487,6 +537,7 @@ pub fn lower_binop(
                                         index: Some((dst, sc)),
                                         offset: 0,
                                         dst,
+                                        size: lea_size(size),
                                     }),
                                     // `add r,r` for ×2: same latency and
                                     // length as `shl $1`, but 4 ports
@@ -763,7 +814,7 @@ pub fn lower_load(
     dest: &Value,
     ptr: &Value,
     ty: IrType,
-    ra: &FxHashMap<u32, PhysReg>,
+    ra: &dyn HomeMap,
     out: &mut Vec<MachInst>,
 ) {
     let size = OpSize::from_ir_type(ty);
@@ -781,7 +832,7 @@ pub fn lower_store(
     val: &Operand,
     ptr: &Value,
     ty: IrType,
-    ra: &FxHashMap<u32, PhysReg>,
+    ra: &dyn HomeMap,
     out: &mut Vec<MachInst>,
 ) {
     let size = OpSize::from_ir_type(ty);
@@ -801,7 +852,7 @@ pub fn lower_copy(
     dest: &Value,
     src: &Operand,
     size: crate::backend::x86::codegen::machinst::OpSize,
-    ra: &FxHashMap<u32, PhysReg>,
+    ra: &dyn HomeMap,
     out: &mut Vec<MachInst>,
 ) {
     let dst = value_to_reg(dest, ra);
@@ -833,7 +884,7 @@ pub fn lower_cmp(
     lhs: &Operand,
     rhs: &Operand,
     ty: IrType,
-    ra: &FxHashMap<u32, PhysReg>,
+    ra: &dyn HomeMap,
     out: &mut Vec<MachInst>,
 ) {
     let size = OpSize::from_ir_type(ty);
@@ -985,7 +1036,7 @@ pub fn lower_cast(
     src: &Operand,
     from_ty: IrType,
     to_ty: IrType,
-    ra: &FxHashMap<u32, PhysReg>,
+    ra: &dyn HomeMap,
     out: &mut Vec<MachInst>,
 ) {
     let dst = value_to_reg(dest, ra);
@@ -1118,7 +1169,7 @@ pub fn lower_unaryop(
     op: IrUnaryOp,
     src: &Operand,
     ty: IrType,
-    ra: &FxHashMap<u32, PhysReg>,
+    ra: &dyn HomeMap,
     out: &mut Vec<MachInst>,
 ) -> bool {
     let size = OpSize::from_ir_type(ty);
@@ -1148,7 +1199,7 @@ pub fn lower_select(
     true_val: &Operand,
     false_val: &Operand,
     ty: IrType,
-    ra: &FxHashMap<u32, PhysReg>,
+    ra: &dyn HomeMap,
     out: &mut Vec<MachInst>,
 ) {
     let size = OpSize::from_ir_type(ty);
@@ -1176,7 +1227,7 @@ pub fn lower_gep(
     dest: &Value,
     base: &Value,
     offset: &Operand,
-    ra: &FxHashMap<u32, PhysReg>,
+    ra: &dyn HomeMap,
     out: &mut Vec<MachInst>,
 ) {
     let dst = value_to_reg(dest, ra);
@@ -1197,6 +1248,7 @@ pub fn lower_gep(
                 index: None,
                 offset: imm,
                 dst,
+                size: OpSize::S64,
             });
         }
         return;
@@ -1212,6 +1264,7 @@ pub fn lower_gep(
             index: Some((value_to_reg(index, ra), 1)),
             offset: 0,
             dst,
+            size: OpSize::S64,
         });
         return;
     }
@@ -1270,7 +1323,7 @@ pub fn lower_cond_branch(
 /// most obvious one.
 /// How eagerly isel selects the BMI2 three-operand shifts.  Set once per
 /// codegen run from `CodegenOptions` (tune row × `-mbmi2`); read by
-/// `lower_binop`.  A process-wide cell because isel is a set of pure free
+/// `lower_binop`.  A thread-local cell because isel is a set of pure free
 /// functions without a target context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShlxMode {
@@ -1283,18 +1336,20 @@ pub enum ShlxMode {
     Always,
 }
 
-static SHLX_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+thread_local! {
+    // Thread-local for the same reason as `APX_ENABLED`: the mode now
+    // changes per function (`__attribute__((target("bmi2")))`), and a
+    // process-global let concurrently running emitters (parallel unit
+    // tests, embedders) observe another function's BMI2 permission.
+    static SHLX_MODE: std::cell::Cell<ShlxMode> = const { std::cell::Cell::new(ShlxMode::Never) };
+}
 
 pub fn set_shlx_mode(m: ShlxMode) {
-    SHLX_MODE.store(m as u8, std::sync::atomic::Ordering::Relaxed);
+    SHLX_MODE.with(|c| c.set(m));
 }
 
 pub fn shlx_mode() -> ShlxMode {
-    match SHLX_MODE.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => ShlxMode::WhenItSavesAMove,
-        2 => ShlxMode::Always,
-        _ => ShlxMode::Never,
-    }
+    SHLX_MODE.with(|c| c.get())
 }
 
 /// Independent RORX kill switch: any `CCC_NO_RORX` value disables all
@@ -1334,7 +1389,7 @@ fn try_lower_shiftx(
     rhs: &Operand,
     dst: MachReg,
     size: OpSize,
-    ra: &FxHashMap<u32, PhysReg>,
+    ra: &dyn HomeMap,
     out: &mut Vec<MachInst>,
 ) -> bool {
     // BMI2's three-operand forms cover only the three shifts: there is no
@@ -1816,7 +1871,7 @@ pub fn build_typed_call_ex(
 
 /// Context for ISel: provides slot information for alloca-aware lowering.
 pub struct ISelContext<'a> {
-    pub reg_assignments: &'a FxHashMap<u32, PhysReg>,
+    pub reg_assignments: &'a dyn HomeMap,
     /// Maps alloca value IDs to their stack slot offsets.
     /// Used for Load/Store from allocas (direct slot access).
     pub alloca_slots: &'a FxHashMap<u32, i64>,
@@ -1826,7 +1881,7 @@ pub struct ISelContext<'a> {
 /// Returns true if lowered, false if it should use Raw passthrough.
 pub fn lower_instruction(
     inst: &Instruction,
-    reg_assignments: &FxHashMap<u32, PhysReg>,
+    reg_assignments: &dyn HomeMap,
     out: &mut Vec<MachInst>,
 ) -> bool {
     lower_instruction_ctx(inst, reg_assignments, &FxHashMap::default(), out)
@@ -1835,7 +1890,7 @@ pub fn lower_instruction(
 /// Lower with full context (alloca slots for Load/Store).
 pub fn lower_instruction_ctx(
     inst: &Instruction,
-    reg_assignments: &FxHashMap<u32, PhysReg>,
+    reg_assignments: &dyn HomeMap,
     alloca_slots: &FxHashMap<u32, i64>,
     out: &mut Vec<MachInst>,
 ) -> bool {
@@ -1893,7 +1948,7 @@ fn narrow_defined_load(ty: IrType, size: OpSize, src: MachOperand, dst: MachReg)
 /// historical 64-bit width.
 pub fn lower_instruction_typed(
     inst: &Instruction,
-    reg_assignments: &FxHashMap<u32, PhysReg>,
+    reg_assignments: &dyn HomeMap,
     alloca_slots: &FxHashMap<u32, i64>,
     value_types: Option<&FxHashMap<u32, crate::common::types::IrType>>,
     out: &mut Vec<MachInst>,
@@ -1907,7 +1962,7 @@ pub fn lower_instruction_typed(
 /// ctx entry go through `lower_instruction_typed` with `None`.
 pub fn lower_instruction_typed_ss(
     inst: &Instruction,
-    reg_assignments: &FxHashMap<u32, PhysReg>,
+    reg_assignments: &dyn HomeMap,
     alloca_slots: &FxHashMap<u32, i64>,
     value_types: Option<&FxHashMap<u32, crate::common::types::IrType>>,
     small_slots: Option<&FxHashSet<u32>>,
@@ -1933,7 +1988,7 @@ pub fn lower_instruction_typed_ss(
 
 fn lower_instruction_typed_inner(
     inst: &Instruction,
-    reg_assignments: &FxHashMap<u32, PhysReg>,
+    reg_assignments: &dyn HomeMap,
     alloca_slots: &FxHashMap<u32, i64>,
     value_types: Option<&FxHashMap<u32, crate::common::types::IrType>>,
     small_slots: Option<&FxHashSet<u32>>,
@@ -2022,8 +2077,9 @@ fn lower_instruction_typed_inner(
                 return false;
             }
             // Bzhi likewise: MachInst has no BZHI opcode; the text path
-            // emits the register-direct VEX form.
-            if *op == IrBinOp::Bzhi {
+            // emits the register-direct VEX form.  Multiply-high too: no
+            // one-operand MUL opcode (its %rax/%rdx pair is text-path only).
+            if *op == IrBinOp::Bzhi || op.is_mul_high() {
                 return false;
             }
             // Only handle I32/U32/I64/U64/Ptr — sub-32-bit types have complex
@@ -3050,6 +3106,7 @@ mod tests {
                 index: Some((MachReg::Phys(PhysReg(2)), 1)),
                 offset: 0,
                 dst: MachReg::Phys(PhysReg(3)),
+                size: OpSize::S64,
             }]
         ));
     }
@@ -3089,6 +3146,45 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// A LEA implementing an i32 multiply is 32-bit (`leal`): it must not
+    /// read the multiplicand's upper half (undefined for an i32 value, and a
+    /// read that blocks every relay/rename peephole after a zero-extending
+    /// `movl` copy — `use(a) * 3` used to keep `movl %eax,%r11d; leaq
+    /// (%r11,%r11,2),%r11; movl %r11d,%eax`). An i64 multiply stays `leaq`.
+    #[test]
+    fn mul_by_lea_scale_carries_operation_width() {
+        for (ty, want) in [
+            (IrType::I32, OpSize::S32),
+            (IrType::U32, OpSize::S32),
+            (IrType::I64, OpSize::S64),
+        ] {
+            for k in [3i64, 5, 9] {
+                let mut assignments = FxHashMap::default();
+                assignments.insert(1, PhysReg(14));
+                assignments.insert(2, PhysReg(1));
+                let mut out = Vec::new();
+                lower_binop(
+                    &Value(2),
+                    IrBinOp::Mul,
+                    &Operand::Value(Value(1)),
+                    &Operand::Const(IrConst::I64(k)),
+                    ty,
+                    &assignments,
+                    &mut out,
+                );
+                let leas: Vec<OpSize> = out
+                    .iter()
+                    .filter_map(|i| match i {
+                        MachInst::Lea { size, .. } => Some(*size),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(!leas.is_empty(), "{ty:?} x{k}: expected a LEA: {out:?}");
+                assert!(leas.iter().all(|s| *s == want), "{ty:?} x{k}: {out:?}");
+            }
+        }
     }
 
     #[test]
@@ -3139,6 +3235,7 @@ mod tests {
                 index: Some((MachReg::Phys(PhysReg(2)), 1)),
                 offset: 0,
                 dst: MachReg::Phys(PhysReg(3)),
+                size: OpSize::S64,
             }]
         ));
     }

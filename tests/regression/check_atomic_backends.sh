@@ -57,19 +57,29 @@ cas=$(body "$td/x86.s" cas8)
 store=$(body "$td/x86.s" storeu32)
 fence=$(body "$td/x86.s" fence_sc)
 grep -q 'lock xaddq' <<<"$add"
-! grep -q 'lock inc' <<<"$add"
+! grep -q 'lock inc' <<<"$add" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 grep -q 'negq %rax' <<<"$sub"
 grep -q 'lock xaddb %al' <<<"$sub"
-grep -q 'movsbq %al, %rax' <<<"$sub"
-! grep -q 'cmpxchg' <<<"$sub"
-grep -q 'andq %rdi, %rdx' <<<"$and"
-grep -q 'lock cmpxchgb %dl' <<<"$and"
-grep -q 'movsbq %al, %rax' <<<"$and"
-grep -q 'movsbq %al, %rax' <<<"$cas"
+# need/deny: report the failing pin instead of a silent `set -e` exit.
+need() { grep -qE -- "$2" <<<"$3" || { echo "FAIL: $1 lacks /$2/" >&2; printf '%s\n' "$3" >&2; exit 1; }; }
+deny() { ! grep -qE -- "$2" <<<"$3" || { echo "FAIL: $1 has /$2/" >&2; printf '%s\n' "$3" >&2; exit 1; }; }
+# An i8 result is sign-extended once: `movsbl %al, %eax` (3 bytes) is the
+# whole canonicalisation; `movsbq` + `movl %eax, %eax` was two instructions.
+need sub8 '^[[:space:]]*movsb[lq] %al, %[er]ax$' "$sub"
+deny sub8 'cmpxchg' "$sub"
+# The bitwise CMPXCHG loop reads its operand in place: `v` stays in its ABI
+# register (%rsi), nothing is parked in %rdi, and no callee-saved register
+# or frame is bought (GCC 16.2: 8 instructions, no stack).
+need and8 '^[[:space:]]*andq %rsi, %rdx$' "$and"
+need and8 'lock cmpxchgb %dl' "$and"
+need and8 '^[[:space:]]*movsb[lq] %al, %[er]ax$' "$and"
+deny and8 '(pushq|subq \$[0-9]+, %rsp|, %rdi$|, %edi$)' "$and"
+need cas8 '^[[:space:]]*movsb[lq] %al, %[er]ax$' "$cas"
+deny cas8 '(pushq|subq \$[0-9]+, %rsp)' "$cas"
 grep -q 'xchgl %edx' <<<"$store"
-! grep -q 'mfence' <<<"$store"
+! grep -q 'mfence' <<<"$store" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 grep -q 'lock orq \$0, (%rsp)' <<<"$fence"
-! grep -q 'mfence' <<<"$fence"
+! grep -q 'mfence' <<<"$fence" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 
 if [ -x "$arm" ]; then
     "$arm" -O2 -S "$td/probe.c" -o "$td/arm.s"
@@ -80,7 +90,7 @@ if [ -x "$arm" ]; then
     grep -q 'and w2, w2, #0xff' <<<"$cas"
     grep -q 'sxtb x0, w0' <<<"$cas"
     grep -q 'dmb ish' <<<"$release"
-    ! grep -q 'dmb ishst' <<<"$release"
+    ! grep -q 'dmb ishst' <<<"$release" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
     if command -v aarch64-linux-gnu-gcc >/dev/null; then
         aarch64-linux-gnu-gcc -c "$td/arm.s" -o "$td/arm.o"
     fi
@@ -95,9 +105,9 @@ if [ -x "$riscv" ]; then
     grep -q 'slli t0, t0, 32' <<<"$casu"
     grep -q 'srli t0, t0, 32' <<<"$casu"
     grep -q 'lwu t0, 0(t0)' <<<"$load"
-    ! grep -q 'lr.w' <<<"$load"
+    ! grep -q 'lr.w' <<<"$load" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
     grep -q 'sw t1, 0(t0)' <<<"$store"
-    ! grep -q 'amoswap' <<<"$store"
+    ! grep -q 'amoswap' <<<"$store" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
     [ "$(grep -c 'fence rw' <<<"$store")" -eq 2 ]
     if command -v riscv64-linux-gnu-gcc >/dev/null; then
         riscv64-linux-gnu-gcc -c "$td/riscv.s" -o "$td/riscv.o"

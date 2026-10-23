@@ -1481,6 +1481,39 @@ fn ret_xmm_reads(store: &LineStore, infos: &[LineInfo], start: usize, end: usize
     if saw_ret { union } else { RET_READS }
 }
 
+/// The widest read, in bits from bit 0, that any `ret` in `start..end` makes
+/// of `%xmm<reg>`: 0 when no `ret` reads it (no `ret`, or not a return
+/// register per [`ret_xmm_reads`]); otherwise the prologue's
+/// `# LCCC_RET_XMM_BITS` width, or 512 without that marker (a `__m512d`
+/// return reads it all). `ret` names no register in its text, so a rewrite
+/// that may change bits above an element must ask this as well as scanning
+/// the lines.
+pub(super) fn ret_xmm_read_bits(
+    store: &LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    end: usize,
+    reg: u8,
+) -> u16 {
+    let has_ret = (start..end).any(|n| !infos[n].is_nop() && infos[n].kind == LineKind::Ret);
+    if !has_ret || reg >= 2 || ret_xmm_reads(store, infos, start, end) & (1 << reg) == 0 {
+        return 0;
+    }
+    for n in start..end {
+        if infos[n].is_nop() {
+            continue;
+        }
+        let t = infos[n].trimmed(store.get(n));
+        if let Some(bits) = t.strip_prefix("# LCCC_RET_XMM_BITS ") {
+            return bits.trim().parse::<u16>().unwrap_or(512);
+        }
+        if infos[n].kind == LineKind::Ret {
+            break;
+        }
+    }
+    512
+}
+
 /// `CCC_DEBUG_FP_LIVENESS=1`: report why a function stayed unanalysable.
 fn debug_unknown(store: &LineStore, n: usize, why: &str) {
     if std::env::var_os("CCC_DEBUG_FP_LIVENESS").is_some() {

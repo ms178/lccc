@@ -1658,6 +1658,19 @@ pub(crate) fn is_raw_reader_intrinsic(op: &crate::ir::intrinsics::IntrinsicOp) -
             | O::VecLoadI16x16
             | O::VecLoadF32x4
             | O::VecLoadF32x8
+            // Every `VecLoad*` family reads its pointer's bytes raw. The six
+            // below were missing: a `VecLoadI64x2` (BB-SLP's 2×I64 copy) of
+            // the `dest_ptr` an SSE binary op had just DEFERRED its store to
+            // counted as the cache-aware consumer, skipped the flush, and
+            // read the slot's stale bytes (`movdqu 176(%rsp)` emitted before
+            // `movdqu %xmm0, 176(%rsp)` — `_mm_div_ps` printed garbage in
+            // agg_fwd_param_home / simd_sse_float / builtin_ia32_vector_value).
+            | O::VecLoadI64x2
+            | O::VecLoadI64x4
+            | O::VecLoadI16x8
+            | O::VecLoadI8x16
+            | O::VecLoadI32x4Pair
+            | O::VecLoadWidenI32ToI64x2
             | O::VecHorizontalAddF64x2
             | O::VecHorizontalAddF64x4
             | O::VecHorizontalAddI32x4
@@ -3214,6 +3227,41 @@ pub(super) fn compute_vector_defer_values(
 mod cfg_copy_coalesce_tests {
     use super::*;
     use crate::ir::reexports::{BasicBlock, BlockId, IrBinOp, Value};
+
+    /// Every register-resident `VecLoad*` family reads its pointer's bytes
+    /// raw, so a deferred SSE/AVX result store into that slot must be
+    /// flushed first. Pinned against the IR's own read classification:
+    /// six families (I64x2, I64x4, I16x8, I8x16, I32x4Pair, WidenI32ToI64x2)
+    /// were missing, and BB-SLP's 2×I64 copy read a stale `dest_ptr` slot.
+    #[test]
+    fn every_vec_load_family_is_a_raw_reader() {
+        use crate::ir::intrinsics::IntrinsicOp as O;
+        for op in [
+            O::VecLoadF64x2,
+            O::VecLoadF64x4,
+            O::VecLoadI32x4,
+            O::VecLoadI32x8,
+            O::VecLoadF32x4,
+            O::VecLoadF32x8,
+            O::VecLoadI8x32,
+            O::VecLoadI16x16,
+            O::VecLoadI64x2,
+            O::VecLoadI64x4,
+            O::VecLoadI16x8,
+            O::VecLoadI8x16,
+            O::VecLoadI32x4Pair,
+            O::VecLoadWidenI32ToI64x2,
+        ] {
+            assert!(
+                op.may_read_memory(),
+                "{op:?}: premise — the IR classifies it as a read"
+            );
+            assert!(
+                is_raw_reader_intrinsic(&op),
+                "{op:?} must flush a deferred store first"
+            );
+        }
+    }
 
     fn block(label: u32, instructions: Vec<Instruction>, terminator: Terminator) -> BasicBlock {
         BasicBlock {

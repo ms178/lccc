@@ -194,6 +194,13 @@ fn line_info(kind: LineKind, ts: u16) -> LineInfo {
     }
 }
 
+/// `lccc_tls_call32 x`: the call half of a GNU2 TLS-descriptor access, an
+/// opaque pseudo that `lower_tls_call_markers` turns into
+/// `call *x@TLSCALL(%eax)` after the peephole (see `classify_line`).
+fn is_tls_descriptor_call(text: &str) -> bool {
+    text.starts_with("lccc_tls_call32 ")
+}
+
 /// A directive line, with the shared steppability verdict cached. Unknown
 /// directives are opaque (fail closed): a missed fold costs bytes, a wrong one
 /// miscompiles the object.
@@ -860,6 +867,26 @@ fn classify_line(raw: &str) -> LineInfo {
     // Comment
     if first == b'#' {
         return line_info(LineKind::Directive, ts);
+    }
+
+    // `lccc_tls_call32 x`, the call half of a TLS-descriptor access (codegen
+    // globals.rs), is NOT an ordinary call: the descriptor ABI preserves every
+    // register except %eax. As `Call` it would "clobber" %ecx/%edx, and a
+    // forward next-touch scan would delete a live pre-call write to them (the
+    // x86-64 dead-write pass deleted a live `imull` exactly this way). It is
+    // still a real call for stack alignment and frame elision: glibc's
+    // `_dl_tlsdesc_dynamic` slow path calls `___tls_get_addr` on the psABI's
+    // 16-byte-aligned stack. The opaque class covers both: no pass rewrites
+    // or reasons through it, it fences every window, and the frame passes
+    // count it as a call. (As an unknown mnemonic it was none of these.)
+    if first == b'l' && is_tls_descriptor_call(s) {
+        return LineInfo {
+            kind: LineKind::InlineAsm,
+            trim_start: ts,
+            has_indirect_mem: true,
+            ebp_offset: EBP_OFFSET_NONE,
+            inert_dir: false,
+        };
     }
 
     // mov instructions - check store/load/self-move/reg-reg
@@ -12770,10 +12797,15 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
         //             with it every N(%esp) slot — is unchanged.
         //  FRAMELESS: no subl/addl at all AND no (%esp) reference anywhere
         //             (no slots exist, so shifting body ESP by 4k is
-        //             unobservable; i386 needs no 16-byte call alignment
-        //             here). bcmp under tail-call conversion is the
-        //             canonical case: 4 dead push/pop pairs guarding a
-        //             2-instruction body.
+        //             unobservable to the body itself). bcmp under
+        //             tail-call conversion is the canonical case: 4 dead
+        //             push/pop pairs guarding a 2-instruction body. A CALL
+        //             does observe the shift: the codegen sizes the push run
+        //             so %esp ≡ 0 (mod 16) at every call site, the alignment
+        //             GCC-built i386 callees assume (-mincoming-stack-boundary=4;
+        //             `movaps` to a stack slot faults otherwise). With such a
+        //             call present only multiples of four pairs may go, see
+        //             the truncation below.
         enum Shape {
             Framed,
             Frameless,
@@ -12843,8 +12875,15 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
                 (start..end).any(|i| !infos[i].is_nop() && infos[i].kind == LineKind::JmpIndirect);
             // Opaque user asm may compute slot addresses, call, or depend on
             // the exact %esp geometry — never renumber a frame it can see.
-            let has_inline_asm =
-                (start..end).any(|i| !infos[i].is_nop() && infos[i].kind == LineKind::InlineAsm);
+            // The TLS-descriptor call (`lccc_tls_call32 x`) is classified
+            // opaque for its register effects but is compiler-generated: it
+            // observes only the ABI stack alignment, which this transform
+            // keeps (the body %esp is unchanged), so it does not pin the frame.
+            let has_inline_asm = (start..end).any(|i| {
+                !infos[i].is_nop()
+                    && infos[i].kind == LineKind::InlineAsm
+                    && !is_tls_descriptor_call(trimmed(store, &infos[i], i))
+            });
             if has_inline_asm {
                 start = end.saturating_add(1);
                 continue;
@@ -13064,6 +13103,59 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
             removals.push((push_idx, pops));
         }
 
+        // Direct calls that become tail calls once the pairs go: (call, ret).
+        let mut tail_calls: Vec<(usize, usize)> = Vec::new();
+        if let Shape::Frameless = shape {
+            // Removing k pairs moves every body %esp by 4k bytes. Calls that
+            // observe the ABI alignment (everything but the PC thunk, which
+            // only reads its return address; the TLS-descriptor call is
+            // aligned by GCC and Clang too) keep their residue mod 16 only
+            // when 4k ≡ 0 (mod 16). Tail jumps run after the pops.
+            //
+            // A direct call that every removed pop separates from a plain
+            // `ret` is the exception: with ALL pairs gone it is `call X; ret`
+            // at the entry %esp (frameless: nothing else moves %esp), which
+            // is exactly `jmp X` -- the callee then starts with the caller's
+            // alignment, as at our own entry. It is converted right here, so
+            // whether the later tail-call pass would fire never matters and
+            // no misaligned `call` can survive.
+            let removed_pops: Vec<usize> = removals
+                .iter()
+                .flat_map(|(_, pops)| pops.iter().copied())
+                .collect();
+            let mut aligned_call = false;
+            for i in start..end {
+                if infos[i].is_nop() {
+                    continue;
+                }
+                let t = trimmed(store, &infos[i], i);
+                match infos[i].kind {
+                    LineKind::Call if !t.contains("__x86.get_pc_thunk.") => {
+                        let direct = t
+                            .strip_prefix("call")
+                            .map(str::trim_start)
+                            .is_some_and(|target| !target.is_empty() && !target.starts_with('*'));
+                        let ret = (i + 1..end)
+                            .find(|&j| !infos[j].is_nop() && !removed_pops.contains(&j))
+                            .filter(|&j| infos[j].kind == LineKind::Ret);
+                        match ret {
+                            Some(r) if direct => tail_calls.push((i, r)),
+                            _ => aligned_call = true,
+                        }
+                    }
+                    LineKind::InlineAsm if is_tls_descriptor_call(t) => aligned_call = true,
+                    _ => {}
+                }
+            }
+            if aligned_call {
+                // Truncating keeps the pops in front of the tail calls (they
+                // stay ordinary, still aligned, calls) or removes all with a
+                // 16k shift, which keeps them aligned too: no conversion.
+                removals.truncate(removals.len() / 4 * 4);
+                tail_calls.clear();
+            }
+        }
+
         if !removals.is_empty() {
             let bytes = 4 * removals.len() as u32;
             if let Shape::Framed = shape {
@@ -13096,6 +13188,14 @@ fn eliminate_unused_callee_saves(store: &mut LineStore, infos: &mut [LineInfo]) 
                 for p in pops {
                     infos[p].kind = LineKind::Nop;
                 }
+            }
+            for (call, ret) in tail_calls {
+                let target = trimmed(store, &infos[call], call)["call".len()..]
+                    .trim()
+                    .to_string();
+                store.replace(call, format!("    jmp {target}"));
+                infos[call] = classify_line(store.get(call));
+                infos[ret].kind = LineKind::Nop;
             }
         }
 
@@ -23425,6 +23525,156 @@ mod classify_law_tests {
             LineKind::Directive,
             "a quoted '#' is not a comment"
         );
+    }
+}
+
+#[cfg(test)]
+mod frameless_call_alignment_tests {
+    use super::*;
+
+    fn f(body: &str) -> String {
+        format!(".text\nf:\n.cfi_startproc\n{body}.cfi_endproc\n.size f, .-f\n")
+    }
+
+    #[test]
+    fn unused_callee_saves_around_a_call_keep_the_call_site_aligned() {
+        // Entry %esp ≡ 12 (mod 16); three pushes realign it for both calls.
+        // Removing the unused %esi/%edi pairs used to leave %esp ≡ 8 there.
+        let out = peephole_optimize(f(concat!(
+            "    pushl %ebx\n",
+            "    pushl %esi\n",
+            "    pushl %edi\n",
+            "    call foo\n",
+            "    movl %eax, %ebx\n",
+            "    call foo\n",
+            "    addl %ebx, %eax\n",
+            "    popl %edi\n",
+            "    popl %esi\n",
+            "    popl %ebx\n",
+            "    ret\n",
+        )));
+        for reg in ["%ebx", "%esi", "%edi"] {
+            assert_eq!(out.matches(&format!("pushl {reg}")).count(), 1, "{out}");
+            assert_eq!(out.matches(&format!("popl {reg}")).count(), 1, "{out}");
+        }
+    }
+
+    #[test]
+    fn a_tail_call_is_converted_with_the_pairs_it_frees() {
+        // Removing the pairs leaves `call foo; ret` at the entry %esp; it
+        // must leave this pass as `jmp foo`, never as a misaligned call.
+        // A second, non-tail call keeps the 3 pairs (not a multiple of 4).
+        let out = peephole_optimize(f(concat!(
+            "    pushl %ebx\n",
+            "    pushl %esi\n",
+            "    pushl %edi\n",
+            "    call foo\n",
+            "    popl %edi\n",
+            "    popl %esi\n",
+            "    popl %ebx\n",
+            "    ret\n",
+        )));
+        assert!(
+            out.contains("jmp foo") && !out.contains("call foo"),
+            "{out}"
+        );
+        assert!(!out.contains("pushl"), "{out}");
+        let out = peephole_optimize(f(concat!(
+            "    pushl %ebx\n",
+            "    pushl %esi\n",
+            "    pushl %edi\n",
+            "    call bar\n",
+            "    call foo\n",
+            "    popl %edi\n",
+            "    popl %esi\n",
+            "    popl %ebx\n",
+            "    ret\n",
+        )));
+        assert_eq!(out.matches("pushl").count(), 3, "{out}");
+    }
+
+    #[test]
+    fn a_call_free_body_still_drops_every_unused_pair() {
+        let out = peephole_optimize(f(concat!(
+            "    pushl %esi\n",
+            "    pushl %edi\n",
+            "    movl 4(%ecx), %eax\n",
+            "    popl %edi\n",
+            "    popl %esi\n",
+            "    ret\n",
+        )));
+        assert!(!out.contains("%esi") && !out.contains("%edi"), "{out}");
+    }
+
+    #[test]
+    fn four_unused_pairs_may_go_around_a_call() {
+        // 16 bytes: the call site keeps its residue.
+        let out = peephole_optimize(f(concat!(
+            "    pushl %ebp\n",
+            "    pushl %ebx\n",
+            "    pushl %esi\n",
+            "    pushl %edi\n",
+            "    call foo\n",
+            "    popl %edi\n",
+            "    popl %esi\n",
+            "    popl %ebx\n",
+            "    popl %ebp\n",
+            "    ret\n",
+        )));
+        assert!(!out.contains("pushl") && !out.contains("popl"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod tls_descriptor_tests {
+    use super::*;
+
+    #[test]
+    fn the_descriptor_call_is_opaque_and_keeps_live_caller_saved_values() {
+        let info = classify_line("    lccc_tls_call32 sl");
+        assert_eq!(info.kind, LineKind::InlineAsm);
+        assert!(info.has_indirect_mem && info.is_barrier());
+        assert_eq!(classify_line("    call foo@PLT").kind, LineKind::Call);
+        // The optimizer sees the pseudo (no volatile markers here, so the
+        // classification alone must protect the sequence); the lowered
+        // `call *x@TLSCALL(%eax)` appears only after the peephole.
+        // `sl * 10 + gl` with two dynamic-TLS variables at -O2 -fPIC: the
+        // product lives in %ecx across the second descriptor call.
+        let asm = concat!(
+            ".text\nget:\n.cfi_startproc\n",
+            "    pushl %ebx\n",
+            "    pushl %esi\n",
+            "    call __x86.get_pc_thunk.bx\n",
+            "    addl $_GLOBAL_OFFSET_TABLE_, %ebx\n",
+            "    leal sl@TLSDESC(%ebx), %eax\n",
+            "    lccc_tls_call32 sl\n",
+            "    addl %gs:0, %eax\n",
+            "    movl (%eax), %ecx\n",
+            "    imull $10, %ecx, %ecx\n",
+            "    leal gl@TLSDESC(%ebx), %eax\n",
+            "    lccc_tls_call32 gl\n",
+            "    addl %gs:0, %eax\n",
+            "    addl (%eax), %ecx\n",
+            "    movl %ecx, %eax\n",
+            "    popl %esi\n",
+            "    popl %ebx\n",
+            "    ret\n",
+            ".cfi_endproc\n.size get, .-get\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        for line in [
+            "imull $10, %ecx, %ecx",
+            "leal sl@TLSDESC(%ebx), %eax",
+            "lccc_tls_call32 sl",
+            "leal gl@TLSDESC(%ebx), %eax",
+            "lccc_tls_call32 gl",
+        ] {
+            assert_eq!(out.matches(line).count(), 1, "{line}\n{out}");
+        }
+        // Frameless with a descriptor call: removing the one unused %esi
+        // pair would misalign the call (GCC and Clang align for it), so it
+        // stays; the FRAMED shape (body %esp unchanged) may drop it.
+        assert_eq!(out.matches("pushl %esi").count(), 1, "{out}");
     }
 }
 

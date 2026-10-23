@@ -13,6 +13,7 @@ pub(crate) mod peephole_common; // Shared peephole optimizer utilities (word mat
 // Shared codegen framework, split into focused modules:
 pub(crate) mod call_abi; // Unified ABI classification: call args + callee params, stack computation
 pub(crate) mod cast; // Cast and float operation classification
+pub(crate) mod cfi_lower; // Shared .cfi_* -> .eh_frame lowering (x86, i686, AArch64, RISC-V)
 pub(crate) mod cfi_synth; // Unwind info derived from final x86/i686 code
 pub(crate) mod f128_softfloat; // Shared F128 soft-float orchestration (ARM + RISC-V)
 pub(crate) mod generation; // Module/function/instruction dispatch
@@ -97,9 +98,10 @@ pub(crate) struct CodegenOptions {
     /// `R_X86_64_TPOFF32` when producing a shared object. Codegen needs to
     /// tell those two apart; `pic` alone cannot.
     pub(crate) shared_lib: bool,
-    /// Explicit compilation-wide ELF TLS model. `None` selects the fastest
-    /// model that preserves interposition and dynamic-loading semantics.
-    pub(crate) tls_model: Option<TlsModel>,
+    /// `-ftls-model=` floor (GCC `flag_tls_default`). Together with `pic`
+    /// (GCC's `flag_shlib`) it is the compilation-wide input of
+    /// `common::tls::select_model`.
+    pub(crate) tls_model_floor: Option<crate::common::tls::TlsModel>,
     /// Whether to replace `ret` with `jmp __x86_return_thunk` (-mfunction-return=thunk-extern)
     pub(crate) function_return_thunk: bool,
     /// Whether to replace indirect calls/jumps with retpoline thunks (-mindirect-branch=thunk-extern)
@@ -183,6 +185,15 @@ pub(crate) struct CodegenOptions {
     /// Gates the Popcount lowering; the fallback is an shr/adc bit loop
     /// in %rax/%rcx.
     pub(crate) popcnt: bool,
+    /// `CCC_NO_PREFETCH`: drop every `__builtin_prefetch` hint. A pure
+    /// performance bisection switch (prefetching has no semantic content),
+    /// read once by the driver so every backend honours the same decision
+    /// and an arm built with it is byte-comparable against one without.
+    pub(crate) no_prefetch: bool,
+    /// x86/i686 prefetch forms the target may use (see
+    /// `x86_common::prefetch_mnemonic`). The x86-64 backend forces `sse`
+    /// on: the SSE prefetch family is x86-64 baseline.
+    pub(crate) x86_prefetch: x86_common::X86PrefetchIsa,
     /// Whether the target has AVX-512F (from -mavx512f / -march=*avx512*).
     /// Enables the 1-uop EVEX GPR-source vpbroadcast for scalar->vector splats.
     pub(crate) avx512: bool,

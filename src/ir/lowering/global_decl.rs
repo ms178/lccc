@@ -16,13 +16,24 @@ use crate::frontend::parser::ast::{
 use crate::ir::lowering::const_object_images::{ConstObjectImage, const_object_bytes};
 use crate::ir::reexports::{GlobalInit, IrGlobal, TlsModel};
 
-pub(super) fn lower_tls_model(model: Option<&str>) -> Option<TlsModel> {
-    match model {
-        Some("local-exec") => Some(TlsModel::LocalExec),
-        Some("initial-exec") => Some(TlsModel::InitialExec),
-        Some("local-dynamic") => Some(TlsModel::LocalDynamic),
-        Some("global-dynamic") => Some(TlsModel::GlobalDynamic),
-        _ => None,
+/// What a `tls_model` attribute is attached to (`record_tls_model_attr`).
+#[derive(Clone, Copy)]
+pub(super) enum TlsAttrSubject {
+    /// A `_Thread_local`/`__thread` object: the attribute applies.
+    ThreadLocal,
+    /// An object without thread storage duration.
+    Variable,
+    /// A function declaration.
+    Function,
+}
+
+impl TlsAttrSubject {
+    pub(super) fn object(thread_local: bool) -> Self {
+        if thread_local {
+            Self::ThreadLocal
+        } else {
+            Self::Variable
+        }
     }
 }
 
@@ -73,6 +84,16 @@ impl Lowerer {
                         .and_modify(|old| *old = (*old).max(align))
                         .or_insert(align);
                 }
+            }
+            if declarator.attrs.tls_model.is_some() || (decl.is_thread_local() && !is_function_decl)
+            {
+                let ir_name = self.global_object_ir_name(declarator);
+                let subject = if is_function_decl {
+                    TlsAttrSubject::Function
+                } else {
+                    TlsAttrSubject::object(decl.is_thread_local())
+                };
+                self.record_tls_model_attr(ir_name, declarator, subject);
             }
             if self.should_skip_global_declarator(decl, declarator) {
                 continue;
@@ -305,22 +326,6 @@ impl Lowerer {
         if !decl.is_extern() || declarator.init.is_some() {
             return false;
         }
-        // GCC applies an explicit tls_model on the latest redeclaration. Keep
-        // the single canonical IrGlobal, but refresh its policy rather than
-        // silently freezing the first declaration's attribute. An unannotated
-        // redeclaration deliberately leaves the inherited policy unchanged.
-        if decl.is_thread_local() {
-            if let Some(model) = lower_tls_model(declarator.attrs.tls_model.as_deref()) {
-                if let Some(global) = self
-                    .module
-                    .globals
-                    .iter_mut()
-                    .find(|global| global.name == declarator.name)
-                {
-                    global.tls_model = Some(model);
-                }
-            }
-        }
         // `int x[]; extern int x[300];` -- the extern declaration completes
         // the composite type of the earlier tentative definition (C11
         // 6.2.7p3), whose storage therefore has 300 elements, not one.
@@ -360,31 +365,98 @@ impl Lowerer {
             }
             self.globals.insert(declarator.name.clone(), ginfo);
         }
-        // For extern TLS variables, emit an IrGlobal so codegen uses TLS access patterns.
-        if decl.is_thread_local() && !self.emitted_global_names.contains(&declarator.name) {
-            let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
-            da.apply_decl_vector_type(decl);
-            self.module.globals.push(IrGlobal {
-                name: declarator.name.clone(),
-                ty: da.var_ty,
-                size: da.actual_alloc_size,
-                align: da.var_ty.align(),
-                init: GlobalInit::Zero,
-                is_static: false,
-                is_extern: true,
-                is_common: false,
-                section: None,
-                is_weak: declarator.attrs.is_weak(),
-                visibility: declarator.attrs.visibility.clone(),
-                has_explicit_align: false,
-                is_const: false,
-                is_used: false,
-                is_thread_local: true,
-                tls_model: lower_tls_model(declarator.attrs.tls_model.as_deref()),
-            });
-            self.emitted_global_names.insert(declarator.name.clone());
-        }
+        self.emit_extern_tls_global(decl, declarator);
         true
+    }
+
+    /// Emit the `extern` IrGlobal of a TLS object this unit declares but does
+    /// not define, so every reference to it is lowered with a TLS access
+    /// sequence. Shared by the file-scope and the block-scope `extern` paths:
+    /// without it a block-scope `extern __thread int z;` was addressed as
+    /// ordinary data (`z(%rip)`), which reads and WRITES the `.tdata`
+    /// initialisation template instead of the thread's copy (measured: a
+    /// store of 7 through it left the thread's `z` at its initialiser 41).
+    /// A later definition replaces the entry (`handle_global_redeclaration`).
+    pub(super) fn emit_extern_tls_global(
+        &mut self,
+        decl: &Declaration,
+        declarator: &InitDeclarator,
+    ) {
+        if !decl.is_thread_local() || self.emitted_global_names.contains(&declarator.name) {
+            return;
+        }
+        let mut da = self.analyze_declaration(&decl.type_spec, &declarator.derived);
+        da.apply_decl_vector_type(decl);
+        self.module.globals.push(IrGlobal {
+            name: declarator.name.clone(),
+            ty: da.var_ty,
+            size: da.actual_alloc_size,
+            align: da.var_ty.align(),
+            init: GlobalInit::Zero,
+            is_static: false,
+            is_extern: true,
+            is_common: false,
+            section: None,
+            is_weak: declarator.attrs.is_weak(),
+            visibility: declarator.attrs.visibility.clone(),
+            has_explicit_align: false,
+            is_const: false,
+            is_used: false,
+            is_thread_local: true,
+        });
+        self.emitted_global_names.insert(declarator.name.clone());
+    }
+
+    /// The IR (= assembly) name of a file-scope object: its asm label, taken
+    /// from this declarator or an earlier declaration of the same symbol,
+    /// unless the label names a register (which pins, never renames).
+    pub(super) fn global_object_ir_name(&self, declarator: &InitDeclarator) -> String {
+        self.asm_label_map
+            .get(&declarator.name)
+            .cloned()
+            .or_else(|| declarator.attrs.asm_register.clone())
+            .filter(|n| !crate::ir::lowering::lower::is_x86_register_name(n))
+            .unwrap_or_else(|| declarator.name.clone())
+    }
+
+    /// Record the `__attribute__((tls_model))` of one declaration of the
+    /// object `ir_name`, or warn with GCC 16.2's `-Wattributes` text when the
+    /// attribute does not apply. GCC 16.2 (measured, file and block scope
+    /// alike) gives a TLS symbol the model of its LAST declaration in source
+    /// order, for every access in the translation unit: a later explicit
+    /// model replaces an earlier one, and a later plain declaration (or
+    /// definition) drops it back to the default
+    /// (`extern __thread int x __attribute__((tls_model("initial-exec")));
+    /// __thread int x;` is global-dynamic under -fPIC). So every declaration
+    /// of a thread-local object must come through here, annotated or not.
+    pub(super) fn record_tls_model_attr(
+        &mut self,
+        ir_name: String,
+        declarator: &InitDeclarator,
+        subject: TlsAttrSubject,
+    ) {
+        let why = match subject {
+            TlsAttrSubject::ThreadLocal => {
+                match declarator.attrs.tls_model {
+                    Some(model) => self.module.tls_model_attrs.insert(ir_name, model),
+                    None => self.module.tls_model_attrs.remove(&ir_name),
+                };
+                return;
+            }
+            TlsAttrSubject::Variable => "does not have thread storage duration",
+            TlsAttrSubject::Function => "is not a variable",
+        };
+        if declarator.attrs.tls_model.is_none() {
+            return;
+        }
+        self.diagnostics.borrow_mut().warning_with_kind(
+            format!(
+                "'tls_model' attribute ignored because '{}' {why}",
+                declarator.name
+            ),
+            declarator.span,
+            crate::common::error::WarningKind::Attributes,
+        );
     }
 
     /// Handle tentative definitions and re-declarations. Returns whether to skip
@@ -677,13 +749,7 @@ impl Lowerer {
         // declaration of the same symbol (collected in asm_label_map), or
         // directly on this declarator; real register names pin globals and
         // are never used as rename targets.
-        let emit_name = self
-            .asm_label_map
-            .get(&declarator.name)
-            .cloned()
-            .or_else(|| declarator.attrs.asm_register.clone())
-            .filter(|n| !crate::ir::lowering::lower::is_x86_register_name(n))
-            .unwrap_or_else(|| declarator.name.clone());
+        let emit_name = self.global_object_ir_name(declarator);
         // Keep a byte image of a CONST object whose initializer is constant
         // and relocation-free: a later read of one of its elements or members
         // (`static const int t[2] = {1, 2}; static int v = t[1];`) folds to the
@@ -737,7 +803,6 @@ impl Lowerer {
             is_const: var_is_const,
             is_used: declarator.attrs.is_used(),
             is_thread_local: decl.is_thread_local(),
-            tls_model: lower_tls_model(declarator.attrs.tls_model.as_deref()),
         });
     }
 

@@ -1113,11 +1113,13 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
                 (lhs as u64).wrapping_shr(rhs as u32) as i64
             }
         }
+        // Index modulo the operand width (`IrBinOp::BitTest`): `wrapping_shr`
+        // states it, instead of relying on the build profile's shift masking.
         IrBinOp::BitTest => {
             if is_32bit {
-                (((lhs as u32) >> (rhs as u32)) & 1) as i64
+                ((lhs as u32).wrapping_shr(rhs as u32) & 1) as i64
             } else {
-                (((lhs as u64) >> (rhs as u32)) & 1) as i64
+                ((lhs as u64).wrapping_shr(rhs as u32) & 1) as i64
             }
         }
         // Width-typed rotate.  `is_32bit` is deliberately NOT the discriminator
@@ -1144,6 +1146,17 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
                 crate::ir::ops::zero_high_bits_from(lhs as u64 as u128, rhs as u64 as u128, bits);
             return Some(ty.truncate_i64(kept as i64));
         }
+        // Width-typed: the high half of the 2W-bit product (I64/U64 in
+        // practice; any W up to 64 evaluates exactly).
+        IrBinOp::UMulHigh | IrBinOp::SMulHigh => {
+            let bits = (ty.size() * 8) as u32;
+            if !(1..=64).contains(&bits) {
+                return None;
+            }
+            let high =
+                crate::ir::ops::mul_high_within_bits(lhs, rhs, bits, op == IrBinOp::SMulHigh);
+            return Some(ty.truncate_i64(high));
+        }
     })
 }
 
@@ -1152,63 +1165,42 @@ fn fold_binop(op: IrBinOp, lhs: i64, rhs: i64, ty: IrType) -> Option<i64> {
 /// whether to operate on 32 or 64 bits, matching the runtime semantics of
 /// __builtin_clz vs __builtin_clzll, etc.
 fn fold_unaryop(op: IrUnaryOp, src: i64, ty: IrType) -> Option<i64> {
-    let is_32bit = ty == IrType::I32
-        || ty == IrType::U32
-        || ty == IrType::I16
-        || ty == IrType::U16
-        || ty == IrType::I8
-        || ty == IrType::U8;
+    // Every count/permutation is evaluated at the operand's EXACT width, the
+    // IR contract (`src/ir/ops.rs`: Clz/Ctz of zero return the operand bit
+    // width) that the backends (x86 `lzcnt32(zext) - 24`, the Ctz stop bit)
+    // and the bit-idiom observation/demand analyses (`Ctz(x) == width` ->
+    // `x == 0`, `reverse_bits() >> (64 - width)`) already implement. The
+    // previous 32-bit evaluation of sub-32-bit types folded Clz(u8 1) to 31,
+    // Ctz(u8 0) to 32 and Popcount(i8 -1) to 32 (a sign-extended operand),
+    // and byte-swapped an i8 as 64 bits: constant results that disagreed
+    // with the same operation executed at run time.
+    let bits: u32 = match ty {
+        IrType::I8 | IrType::U8 => 8,
+        IrType::I16 | IrType::U16 => 16,
+        IrType::I32 | IrType::U32 => 32,
+        _ => 64,
+    };
+    let unused = 64 - bits;
+    // The operand's bit pattern, zero-extended from its width.
+    let v = ((src as u64) << unused) >> unused;
     Some(match op {
         IrUnaryOp::Neg => src.wrapping_neg(),
         IrUnaryOp::Not => !src,
         IrUnaryOp::Clz | IrUnaryOp::ClzNonZero => {
-            if src == 0 && op == IrUnaryOp::ClzNonZero {
+            if v == 0 && op == IrUnaryOp::ClzNonZero {
                 return None;
             }
-            if is_32bit {
-                (src as u32).leading_zeros() as i64
-            } else {
-                (src as u64).leading_zeros() as i64
-            }
+            i64::from(v.leading_zeros() - unused)
         }
         IrUnaryOp::Ctz | IrUnaryOp::CtzNonZero => {
-            if src == 0 {
-                if op == IrUnaryOp::CtzNonZero {
-                    return None;
-                }
-                if is_32bit { 32 } else { 64 }
-            } else if is_32bit {
-                (src as u32).trailing_zeros() as i64
-            } else {
-                (src as u64).trailing_zeros() as i64
+            if v == 0 && op == IrUnaryOp::CtzNonZero {
+                return None;
             }
+            i64::from(if v == 0 { bits } else { v.trailing_zeros() })
         }
-        IrUnaryOp::Bswap => {
-            // Bswap is width-sensitive: swapping 2 bytes vs 4 vs 8 produces
-            // different results, unlike CLZ/CTZ/Popcount where sub-32-bit
-            // values are implicitly zero-extended into 32 bits.
-            if ty == IrType::I16 || ty == IrType::U16 {
-                (src as u16).swap_bytes() as i64
-            } else if ty == IrType::I32 || ty == IrType::U32 {
-                (src as u32).swap_bytes() as i64
-            } else {
-                (src as u64).swap_bytes() as i64
-            }
-        }
-        IrUnaryOp::BitReverse => {
-            if is_32bit {
-                (src as u32).reverse_bits() as i64
-            } else {
-                (src as u64).reverse_bits() as i64
-            }
-        }
-        IrUnaryOp::Popcount => {
-            if is_32bit {
-                (src as u32).count_ones() as i64
-            } else {
-                (src as u64).count_ones() as i64
-            }
-        }
+        IrUnaryOp::Bswap => (v.swap_bytes() >> unused) as i64,
+        IrUnaryOp::BitReverse => (v.reverse_bits() >> unused) as i64,
+        IrUnaryOp::Popcount => i64::from(v.count_ones()),
         IrUnaryOp::IsConstant => {
             // If we got here, the operand was already constant
             1
@@ -1234,6 +1226,66 @@ fn fold_cast(
 mod tests {
     use super::*;
     use crate::common::types::IrType;
+
+    /// `BitTest`'s index is taken modulo the operand width, as every backend
+    /// lowers it (x86 BT, AArch64 UBFX/LSRV, RISC-V SRL/SRLW). An index of W
+    /// or more must fold, not overflow the host shift, and must agree with
+    /// the code the backends emit for the same constant.
+    #[test]
+    fn bit_test_index_is_taken_modulo_the_width() {
+        let x = 0x0123_4567_89AB_CDEFu64 as i64;
+        for idx in [0i64, 7, 31, 32, 40, 63, 64, 70, 127] {
+            let want32 = i64::from((x as u32 >> (idx % 32)) & 1);
+            let want64 = ((x as u64 >> (idx % 64)) & 1) as i64;
+            assert_eq!(
+                fold_binop(IrBinOp::BitTest, x, idx, IrType::I32),
+                Some(want32),
+                "i32 bit {idx}"
+            );
+            assert_eq!(
+                fold_binop(IrBinOp::BitTest, x, idx, IrType::I64),
+                Some(want64),
+                "i64 bit {idx}"
+            );
+            assert_eq!(
+                IrBinOp::BitTest.eval_i64(x, idx),
+                Some(want64),
+                "eval_i64 bit {idx}"
+            );
+        }
+        // 0x1234567: bit 40 mod 32 = 8 is set; 0x7777: bit 70 mod 64 = 6 is set.
+        assert_eq!(
+            fold_binop(IrBinOp::BitTest, 0x1234567, 40, IrType::I32),
+            Some(1)
+        );
+        assert_eq!(
+            fold_binop(IrBinOp::BitTest, 0x7777, 70, IrType::I64),
+            Some(1)
+        );
+    }
+
+    /// Multiply-high folds at the operation's own width: at I64/U64 the
+    /// 128-bit product's high half, at a narrower type the high half of THAT
+    /// width's double product (never the 64-bit result truncated).
+    #[test]
+    fn mul_high_folds_at_the_operation_width() {
+        let m5 = 0xCCCC_CCCC_CCCC_CCCDu64 as i64;
+        assert_eq!(
+            fold_binop(IrBinOp::UMulHigh, 1000, m5, IrType::U64),
+            Some(((1000u128 * 0xCCCC_CCCC_CCCC_CCCDu128) >> 64) as i64)
+        );
+        assert_eq!(
+            fold_binop(IrBinOp::SMulHigh, -7, i64::MAX, IrType::I64),
+            Some(((-7i128 * i64::MAX as i128) >> 64) as i64)
+        );
+        assert_eq!(
+            fold_binop(IrBinOp::UMulHigh, 0xFF, 0xFF, IrType::U8),
+            Some(0xFE)
+        );
+        assert_eq!(fold_binop(IrBinOp::SMulHigh, -1, -1, IrType::I8), Some(0));
+        assert_eq!(fold_binop(IrBinOp::UMulHigh, -1, -1, IrType::U64), Some(-2));
+        assert_eq!(fold_binop(IrBinOp::UMulHigh, 1, 1, IrType::U128), None);
+    }
 
     /// `Bzhi` folds to the instruction's result (Intel SDM BZHI: index bits
     /// 7:0, the source unchanged from the width on) at every legal width, and
@@ -1781,5 +1833,99 @@ mod observable_fp_oracle_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod narrow_bit_op_tests {
+    use super::fold_unaryop;
+    use crate::common::types::IrType;
+    use crate::ir::reexports::IrUnaryOp;
+
+    /// The IR contract is width-exact: Clz/Ctz(0) == width, and every count
+    /// or permutation sees only the operand's own bits. Checked exhaustively
+    /// against Rust's native narrow integer operations, for both the
+    /// zero-extended (unsigned) and sign-extended (signed) operand forms.
+    #[test]
+    fn narrow_counts_and_permutations_are_width_exact() {
+        for x in 0..=u8::MAX {
+            for (src, ty) in [(i64::from(x), IrType::U8), (i64::from(x as i8), IrType::I8)] {
+                let f = |op| fold_unaryop(op, src, ty);
+                assert_eq!(
+                    f(IrUnaryOp::Clz),
+                    Some(i64::from(x.leading_zeros())),
+                    "{ty:?} {x}"
+                );
+                assert_eq!(
+                    f(IrUnaryOp::Ctz),
+                    Some(i64::from(x.trailing_zeros())),
+                    "{ty:?} {x}"
+                );
+                assert_eq!(
+                    f(IrUnaryOp::Popcount),
+                    Some(i64::from(x.count_ones())),
+                    "{ty:?} {x}"
+                );
+                assert_eq!(f(IrUnaryOp::Bswap), Some(i64::from(x)), "{ty:?} {x}");
+                assert_eq!(
+                    f(IrUnaryOp::BitReverse),
+                    Some(i64::from(x.reverse_bits())),
+                    "{ty:?} {x}"
+                );
+                let nz = (x != 0).then_some(i64::from(x.trailing_zeros()));
+                assert_eq!(f(IrUnaryOp::CtzNonZero), nz, "{ty:?} {x}");
+            }
+        }
+        for x in 0..=u16::MAX {
+            for (src, ty) in [
+                (i64::from(x), IrType::U16),
+                (i64::from(x as i16), IrType::I16),
+            ] {
+                let f = |op| fold_unaryop(op, src, ty);
+                assert_eq!(
+                    f(IrUnaryOp::Clz),
+                    Some(i64::from(x.leading_zeros())),
+                    "{ty:?} {x}"
+                );
+                assert_eq!(
+                    f(IrUnaryOp::Ctz),
+                    Some(i64::from(x.trailing_zeros())),
+                    "{ty:?} {x}"
+                );
+                assert_eq!(
+                    f(IrUnaryOp::Popcount),
+                    Some(i64::from(x.count_ones())),
+                    "{ty:?} {x}"
+                );
+                assert_eq!(
+                    f(IrUnaryOp::Bswap),
+                    Some(i64::from(x.swap_bytes())),
+                    "{ty:?} {x}"
+                );
+                assert_eq!(
+                    f(IrUnaryOp::BitReverse),
+                    Some(i64::from(x.reverse_bits())),
+                    "{ty:?} {x}"
+                );
+                let nz = (x != 0).then_some(i64::from(x.leading_zeros()));
+                assert_eq!(f(IrUnaryOp::ClzNonZero), nz, "{ty:?} {x}");
+            }
+        }
+    }
+
+    /// A sign-extended i32 operand must not leak its upper 32 bits.
+    #[test]
+    fn signed_i32_operands_are_counted_in_32_bits() {
+        assert_eq!(fold_unaryop(IrUnaryOp::Popcount, -1, IrType::I32), Some(32));
+        assert_eq!(fold_unaryop(IrUnaryOp::Clz, -1, IrType::I32), Some(0));
+        assert_eq!(fold_unaryop(IrUnaryOp::Ctz, 0, IrType::I32), Some(32));
+        assert_eq!(
+            fold_unaryop(
+                IrUnaryOp::Bswap,
+                i64::from(0x8000_00ffu32 as i32),
+                IrType::I32
+            ),
+            Some(0xff00_0080)
+        );
     }
 }

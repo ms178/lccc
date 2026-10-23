@@ -195,7 +195,12 @@ pub const R_386_TLS_GD: u32 = 18;
 pub const R_386_TLS_LDM: u32 = 19;
 pub const R_386_TLS_LDO_32: u32 = 32;
 pub const R_386_TLS_GOTIE: u32 = 16;
+/// `leal x@tlsdesc(%ebx), %eax`: GOT offset of the symbol's TLS descriptor
+/// (GAS 2.47 `--32`: `8d 83` + R_386_TLS_GOTDESC on the disp32).
 pub const R_386_TLS_GOTDESC: u32 = 39;
+/// `call *x@tlscall(%eax)`: marks the descriptor call for linker relaxation.
+/// It owns no field: GAS emits plain `ff 10` with the relocation on the
+/// instruction's first byte.
 pub const R_386_TLS_DESC_CALL: u32 = 40;
 // There is no R_386_32S in the i386 ABI -- that is an x86-64 type. This constant
 // held 38, which <elf.h> defines as R_386_SIZE32 (a symbol-size relocation), and
@@ -290,6 +295,9 @@ impl InstructionEncoder {
         let s_flip = self.s_flip;
         let sized_op_callw = self.sized_op_callw;
         let result = self.encode_checked(instr);
+        if result.is_ok() {
+            self.relax_got32(bytes, relocations);
+        }
         if result.is_err() {
             self.bytes.truncate(bytes);
             self.relocations.truncate(relocations);
@@ -302,6 +310,43 @@ impl InstructionEncoder {
             self.sized_op_callw = sized_op_callw;
         }
         result
+    }
+
+    /// GAS's `-mrelax-relocations=yes` (the default) spelling of `@GOT`:
+    /// R_386_GOT32X when the instruction is one a linker may rewrite once
+    /// the symbol is known local — a 32-bit `mov` load (8B), `test` (85),
+    /// a reg<-mem ALU op (03/0B/13/1B/23/2B/33/3B) or `call`/`jmp`/`push`
+    /// (FF /2, /4, /6); R_386_GOT32 otherwise (stores, memory-destination
+    /// ALU, `test $imm`, 16/8-bit and 0F-map forms, `lea`, immediates).
+    /// Measured form by form against the pinned GAS 2.47 `--32` (tc-i386.c
+    /// keys on the same opcode/ModR/M facts; GAS 2.44 still gave `push`
+    /// R_386_GOT32, 2.47 matches ld 2.47's `push $x` conversion). Without it no linker relaxes a GOT load in
+    /// an lccc-assembled object (GNU ld and lccc-ld: `movl $x, %r` in an
+    /// executable, GNU ld `leal x@GOTOFF(%b), %r` in a PIE or DSO).
+    fn relax_got32(&mut self, start: usize, reloc_start: usize) {
+        if self.relocations.len() != reloc_start + 1
+            || self.relocations[reloc_start].reloc_type != R_386_GOT32
+        {
+            return;
+        }
+        let mut i = start;
+        while let Some(&b) = self.bytes.get(i) {
+            match b {
+                0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 => i += 1,
+                0x66 | 0x67 => return,
+                _ => break,
+            }
+        }
+        let (Some(&op), Some(&modrm)) = (self.bytes.get(i), self.bytes.get(i + 1)) else {
+            return;
+        };
+        let relaxable = matches!(
+            op,
+            0x8B | 0x85 | 0x03 | 0x0B | 0x13 | 0x1B | 0x23 | 0x2B | 0x33 | 0x3B
+        ) || (op == 0xFF && matches!((modrm >> 3) & 7, 2 | 4 | 6));
+        if relaxable && modrm >> 6 != 3 {
+            self.relocations[reloc_start].reloc_type = R_386_GOT32X;
+        }
     }
 
     fn encode_checked(&mut self, instr: &Instruction) -> Result<(), String> {
@@ -709,11 +754,54 @@ impl InstructionEncoder {
         // shifted the offsets) covers all forms uniformly; reloc offsets
         // are stream-absolute and start_len is this instruction's stream
         // position.
+        // `$_GLOBAL_OFFSET_TABLE_+[.-1b]` (musl's i386 PIC idiom, also
+        // spelled with parentheses): GAS folds the assemble-time constant
+        // `. - 1b` into the R_386_GOTPC addend, `(. - 1b) + FIELD_OFFSET`
+        // = `P - 1b` (GAS 2.47: `call 1f; 1: pop %ebx; addl
+        // $_GLOBAL_OFFSET_TABLE_+[.-1b],%ebx` = 81 c3 03000000). That is
+        // the object writer's `external - local label` rule (addend +=
+        // P - addr(1b), relaxation-exact), so the relocation becomes a
+        // GOTPC difference against the label and takes no field offset
+        // here. The parser has already turned `.` into this instruction's
+        // `.Ldotpos_` label; any other `_GLOBAL_OFFSET_TABLE_` expression is
+        // rejected instead of becoming an undefined symbol of that name.
+        if result.is_ok() {
+            for relocation in &mut self.relocations[reloc_base..] {
+                let Some(rest) = relocation.symbol.strip_prefix("_GLOBAL_OFFSET_TABLE_") else {
+                    continue;
+                };
+                if rest.is_empty() || relocation.diff_symbol.is_some() {
+                    continue;
+                }
+                if !matches!(relocation.reloc_type, R_386_32 | R_386_GOTPC) {
+                    continue;
+                }
+                match gotpc_dot_difference(rest) {
+                    Some((label, extra)) => {
+                        relocation.diff_symbol = Some(label.to_string());
+                        relocation.symbol = "_GLOBAL_OFFSET_TABLE_".to_string();
+                        relocation.reloc_type = R_386_GOTPC;
+                        relocation.addend += extra;
+                    }
+                    None => {
+                        result = Err(format!(
+                            "unsupported _GLOBAL_OFFSET_TABLE_ expression `{}' (GOTPC takes \
+                             `_GLOBAL_OFFSET_TABLE_[+N]' or `_GLOBAL_OFFSET_TABLE_+[.-label][+N]')",
+                            relocation.symbol
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
         if result.is_ok() {
             for relocation in &mut self.relocations[reloc_base..] {
                 // The `_GLOBAL_OFFSET_TABLE_` name is special in GAS: any
                 // bare use in an immediate or displacement position takes
                 // R_386_GOTPC (not R_386_32), whatever the operand shape.
+                if relocation.diff_symbol.is_some() {
+                    continue;
+                }
                 if relocation.reloc_type == R_386_GOTPC
                     || (relocation.reloc_type == R_386_32
                         && relocation.symbol == "_GLOBAL_OFFSET_TABLE_"
@@ -3392,6 +3480,55 @@ fn is_gp_reg_name(name: &str) -> bool {
     )
 }
 
+/// Split the tail of a `_GLOBAL_OFFSET_TABLE_` operand of the form
+/// `+[.Ldotpos_*-LABEL]` / `+(.Ldotpos_*-LABEL)` with an optional integer
+/// `+N`/`-N` after the group into `(LABEL, N)`. `.Ldotpos_*` is the parser's
+/// spelling of `.` (this instruction's start, which is what GAS's `.`
+/// denotes in an operand); anything else is not a GOTPC expression GAS
+/// folds to one relocation.
+fn gotpc_dot_difference(rest: &str) -> Option<(&str, i64)> {
+    let rest = rest.trim_start().strip_prefix('+')?.trim_start();
+    let (open, close) = match rest.chars().next()? {
+        '[' => ('[', ']'),
+        '(' => ('(', ')'),
+        _ => return None,
+    };
+    let body_end = rest.find(close)?;
+    let body = &rest[open.len_utf8()..body_end];
+    let (dot, label) = body.split_once('-')?;
+    let (dot, label) = (dot.trim(), label.trim());
+    if !dot.starts_with(".Ldotpos_")
+        || label.is_empty()
+        || label.contains(|c: char| c.is_whitespace() || "+-()[]".contains(c))
+    {
+        return None;
+    }
+    let tail: String = rest[body_end + 1..]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let extra = match tail.as_str() {
+        "" => 0,
+        t => {
+            let (neg, digits) = match t.as_bytes()[0] {
+                b'+' => (false, &t[1..]),
+                b'-' => (true, &t[1..]),
+                _ => return None,
+            };
+            let v = if let Some(h) = digits
+                .strip_prefix("0x")
+                .or_else(|| digits.strip_prefix("0X"))
+            {
+                i64::from_str_radix(h, 16).ok()?
+            } else {
+                digits.parse::<i64>().ok()?
+            };
+            if neg { -v } else { v }
+        }
+    };
+    Some((label, extra))
+}
+
 #[cfg(test)]
 mod stack_width_tests {
     use super::*;
@@ -3773,5 +3910,43 @@ mod merged_pr629_followup_tests {
             assemble("{rex2} {vex} vpaddd %xmm1,%xmm2,%xmm3").unwrap_err(),
             "`{rex2}' is only supported in 64-bit mode"
         );
+    }
+}
+
+#[cfg(test)]
+mod gotpc_expression_tests {
+    use super::gotpc_dot_difference;
+
+    #[test]
+    fn dot_minus_label_with_optional_integer_tail() {
+        assert_eq!(
+            gotpc_dot_difference("+[.Ldotpos_0_7-.Lnum_1_0]"),
+            Some((".Lnum_1_0", 0))
+        );
+        assert_eq!(
+            gotpc_dot_difference("+(.Ldotpos_0_7 - .Lx)"),
+            Some((".Lx", 0))
+        );
+        assert_eq!(
+            gotpc_dot_difference("+[.Ldotpos_0_7-.Lx]+4"),
+            Some((".Lx", 4))
+        );
+        assert_eq!(
+            gotpc_dot_difference("+(.Ldotpos_0_7-.Lx)-0x10"),
+            Some((".Lx", -16))
+        );
+    }
+
+    #[test]
+    fn other_expressions_are_not_gotpc_differences() {
+        // Not `.` on the left, a compound right side, a symbolic tail, or a
+        // subtraction of the whole group: GAS does not fold these into one
+        // GOTPC relocation, so the encoder must reject them.
+        assert_eq!(gotpc_dot_difference("+[a-.Lx]"), None);
+        assert_eq!(gotpc_dot_difference("+[.Ldotpos_0_7-.Lx+4]"), None);
+        assert_eq!(gotpc_dot_difference("+[.Ldotpos_0_7-.Lx]+y"), None);
+        assert_eq!(gotpc_dot_difference("-[.Ldotpos_0_7-.Lx]"), None);
+        assert_eq!(gotpc_dot_difference("+[.Ldotpos_0_7-.Lx"), None);
+        assert_eq!(gotpc_dot_difference("+4"), None);
     }
 }

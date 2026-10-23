@@ -98,7 +98,7 @@ pub(super) fn apply_relocations(
 fn apply_one_reloc(
     obj_idx: usize,
     obj: &InputObject,
-    _sec: &InputSection,
+    sec: &InputSection,
     out_sec_idx: usize,
     sec_base_offset: u32,
     rel_offset: u32,
@@ -126,7 +126,7 @@ fn apply_one_reloc(
             .map(|gs| gs.is_dynamic && gs.needs_plt)
             .unwrap_or(false);
 
-    let mut relax_got32x = false;
+    let mut got32x_conv: Option<Got32xConversion> = None;
 
     let value: u32 = match rel_type {
         R_386_NONE => return Ok(()),
@@ -155,7 +155,37 @@ fn apply_one_reloc(
                 // GD/LDM sequence: the call no longer exists.
                 return Ok(());
             }
-            resolve_got_reloc(sym, sym_addr, addend, rel_type, ctx, &mut relax_got32x)
+            let off = rel_offset as usize;
+            let conversion = got32x_conversion(&sec.data, off);
+            let baseless = got_field_baseless(&sec.data, off);
+            let (value, conv) = resolve_got_reloc(
+                obj, sym, sym_addr, addend, rel_type, conversion, baseless, patch_addr, ctx,
+            )?;
+            got32x_conv = conv;
+            value
+        }
+        R_386_TLS_TPOFF | R_386_TLS_LE | R_386_TLS_LE_32 | R_386_TLS_TPOFF32
+            if !sym.name.is_empty()
+                && sym.binding != STB_LOCAL
+                && ctx
+                    .global_symbols
+                    .get(sym.name.as_str())
+                    .is_some_and(|gs| gs.is_dynamic) =>
+        {
+            // Local-Exec offsets exist only for the executable's own TLS
+            // block (GNU ld: "unresolvable R_386_TLS_LE relocation").
+            return Err(format!(
+                "{}: unresolvable {} relocation against shared-library TLS symbol `{}': \
+                 a Local-Exec access needs a definition in the executable \
+                 (drop -ftls-model=local-exec)",
+                obj.filename,
+                if matches!(rel_type, R_386_TLS_LE | R_386_TLS_TPOFF) {
+                    "R_386_TLS_LE"
+                } else {
+                    "R_386_TLS_LE_32"
+                },
+                sym.name
+            ));
         }
         R_386_TLS_TPOFF | R_386_TLS_LE => {
             // Negative offset from TP
@@ -202,9 +232,27 @@ fn apply_one_reloc(
     let out_sec = &mut ctx.output_sections[out_sec_idx];
     let off = patch_offset as usize;
     if off + 4 <= out_sec.data.len() {
-        // For GOT32X relaxation, rewrite mov (0x8b) → lea (0x8d)
-        if relax_got32x && off >= 2 && out_sec.data[off - 2] == 0x8b {
-            out_sec.data[off - 2] = 0x8d;
+        // `got32x_conversion` decoded these bytes (see it for the forms);
+        // lccc-ld executables are never PIE (options.rs), so the symbol's
+        // address is a link-time constant.
+        if let Some(conv) = got32x_conv {
+            let reg = (out_sec.data[off - 1] >> 3) & 7;
+            let (op, modrm) = match conv {
+                Got32xConversion::MovImm => (0xc7, 0xc0 | reg),
+                Got32xConversion::AluImm(alu) => (0x81, 0xc0 | (alu << 3) | reg),
+                Got32xConversion::TestImm => (0xf7, 0xc0 | reg),
+                // `68 imm32` behind a meaningless `%cs:` keeps the length.
+                Got32xConversion::Push => (0x2e, 0x68),
+                Got32xConversion::Call => (0x67, 0xe8),
+                Got32xConversion::Jmp => {
+                    out_sec.data[off - 2] = 0xe9;
+                    out_sec.data[off - 1..off + 3].copy_from_slice(&value.to_le_bytes());
+                    out_sec.data[off + 3] = 0x90;
+                    return Ok(());
+                }
+            };
+            out_sec.data[off - 2] = op;
+            out_sec.data[off - 1] = modrm;
         }
         out_sec.data[off..off + 4].copy_from_slice(&value.to_le_bytes());
     }
@@ -404,17 +452,118 @@ fn resolve_via_section_map(obj_idx: usize, sym: &InputSymbol, ctx: &RelocContext
     }
 }
 
-/// Resolve R_386_GOT32 or R_386_GOT32X relocations.
+/// GNU ld's i386 GOT32X conversions for a symbol defined in a non-PIC
+/// executable (`elf_i386_convert_load_reloc`), each the same length as the
+/// GOT access it replaces and none of them loading from the GOT:
+///   `movl x@GOT(%b), %r`   -> `movl $x, %r`      (C7 /0)
+///   `OPl  x@GOT(%b), %r`   -> `OPl $x, %r`       (81 /op, the 8 ALU ops)
+///   `testl x@GOT(%b), %r`  -> `testl $x, %r`     (F7 /0)
+///   `pushl x@GOT(%b)`      -> `%cs: pushl $x`    (2E 68 imm32)
+///   `call *x@GOT(%b)`      -> `addr32 call x`    (67 E8 rel32)
+///   `jmp *x@GOT(%b)`       -> `jmp x; nop`       (E9 rel32 90)
+/// with or without the base register (ModR/M mod=10 rm!=100, or the
+/// base-less mod=00 rm=101), and only with a zero in-place addend: the
+/// GOT32X addend offsets the GOT slot, not the symbol, so `x@GOT+4` has no
+/// equivalent immediate (ld 2.47 refuses it too). Decoding backwards from
+/// the field is unambiguous: in a SIB form the byte two before the field is
+/// a ModR/M whose rm is 100, which no opcode below ends in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Got32xConversion {
+    MovImm,
+    AluImm(u8),
+    TestImm,
+    Push,
+    Call,
+    Jmp,
+}
+
+pub(super) fn got32x_conversion(data: &[u8], off: usize) -> Option<Got32xConversion> {
+    let op = *data.get(off.checked_sub(2)?)?;
+    let m = *data.get(off - 1)?;
+    if !((m >> 6 == 2 && m & 7 != 4) || m & 0xc7 == 0x05) {
+        return None;
+    }
+    if data.get(off..off + 4)? != [0; 4] {
+        return None;
+    }
+    Some(match op {
+        0x8b => Got32xConversion::MovImm,
+        0x85 => Got32xConversion::TestImm,
+        0x03 | 0x0b | 0x13 | 0x1b | 0x23 | 0x2b | 0x33 | 0x3b => Got32xConversion::AluImm(op >> 3),
+        0xff if (m >> 3) & 7 == 2 => Got32xConversion::Call,
+        0xff if (m >> 3) & 7 == 4 => Got32xConversion::Jmp,
+        0xff if (m >> 3) & 7 == 6 => Got32xConversion::Push,
+        _ => return None,
+    })
+}
+
+/// A GOT reference without a base register (`movl x@GOT, %r`, GCC's
+/// `-fno-pic -fno-plt` `call *f@GOT`): ModR/M mod=00 rm=101, GNU ld's test.
+/// The i386 psABI value is then the slot's absolute address `G + A`, not the
+/// GOT-relative `G + A - GOT` of the based form.
+pub(super) fn got_field_baseless(data: &[u8], off: usize) -> bool {
+    off >= 1 && data.get(off - 1).is_some_and(|&m| m & 0xc7 == 0x05)
+}
+
+/// Whether the target of a GOT reference may be addressed GOT-relatively
+/// instead (the executable's own non-IFUNC definition; the executable is
+/// never PIE, see options.rs, so even an SHN_ABS value is a link-time
+/// constant). `gs` is the global entry of `sym`'s name, which for an
+/// STB_LOCAL `sym` may belong to another object, so locals answer from
+/// their own symbol.
+pub(super) fn got_target_relaxable(sym: &InputSymbol, gs: Option<&LinkerSymbol>) -> bool {
+    // ld.so may read `_DYNAMIC`'s link-time value from its GOT slot (ld
+    // 2.47 never converts it either).
+    if sym.sym_type == STT_GNU_IFUNC || sym.name == "_DYNAMIC" {
+        return false;
+    }
+    if sym.binding == STB_LOCAL || sym.sym_type == STT_SECTION {
+        return sym.section_index != SHN_UNDEF;
+    }
+    gs.is_some_and(|g| g.is_defined && !g.is_dynamic && g.sym_type != STT_GNU_IFUNC)
+}
+
+/// Resolve R_386_GOT32 or R_386_GOT32X: the GOT-relative offset of the
+/// symbol's slot (the slot's absolute address for a base-less field), or --
+/// for a relaxable `GOT32X` load site of a symbol defined here -- the
+/// symbol's address, with `true` telling the caller to turn the load into
+/// `movl $x, %r`. Slots are keyed by name in `global_symbols`,
+/// where an STB_LOCAL symbol may find another object's entry (locals are
+/// fallback definitions, see `symbols.rs`): a local owns the slot only when
+/// the slot's link-time value is its own address.
 pub(super) fn resolve_got_reloc(
+    obj: &InputObject,
     sym: &InputSymbol,
     sym_addr: u32,
     addend: i32,
     rel_type: u32,
+    conversion: Option<Got32xConversion>,
+    baseless: bool,
+    patch_addr: u32,
     ctx: &RelocContext,
-    relax_got32x: &mut bool,
-) -> u32 {
-    if let Some(gs) = ctx.global_symbols.get(sym.name.as_str()) {
-        if gs.needs_got {
+) -> Result<(u32, Option<Got32xConversion>), String> {
+    let gs = (!sym.name.is_empty())
+        .then(|| ctx.global_symbols.get(sym.name.as_str()))
+        .flatten();
+    if let Some(conv) = conversion.filter(|_| rel_type == R_386_GOT32X) {
+        if got_target_relaxable(sym, gs) {
+            // The caller rewrites the instruction (see `Got32xConversion`):
+            // an immediate takes the absolute value, a direct branch the
+            // displacement from its own end -- the field stays at the
+            // relocation offset for `addr32 call`, moves one byte back for
+            // `jmp`.
+            let s_a = sym_addr.wrapping_add(addend as u32);
+            let value = match conv {
+                Got32xConversion::Call => s_a.wrapping_sub(patch_addr.wrapping_add(4)),
+                Got32xConversion::Jmp => s_a.wrapping_sub(patch_addr.wrapping_add(3)),
+                _ => s_a,
+            };
+            return Ok((value, Some(conv)));
+        }
+    }
+    if let Some(gs) = gs.filter(|gs| gs.needs_got) {
+        let owned = sym.binding != STB_LOCAL || (!gs.is_dynamic && gs.address == sym_addr);
+        if owned {
             // Every GOT-relative reference to a named symbol gave it a slot
             // of its own (`mark_plt_got_needs`); for a shared-library symbol
             // that slot is filled by GLOB_DAT -- never the lazy `.got.plt`
@@ -422,22 +571,89 @@ pub(super) fn resolve_got_reloc(
             // call, so an address loaded from it would change over time.
             let got_entry_addr =
                 ctx.got_vaddr + (ctx.got_reserved as u32 + (gs.got_index - ctx.num_plt) as u32) * 4;
-            (got_entry_addr as i32 + addend - ctx.got_base as i32) as u32
-        } else if gs.is_dynamic {
-            // Unreachable while the invariant above holds; the PLT's slot is
-            // the only one such a symbol could have.
-            let got_entry_addr = ctx.gotplt_vaddr + (ctx.gotplt_reserved + gs.plt_index as u32) * 4;
-            (got_entry_addr as i32 + addend - ctx.got_base as i32) as u32
-        } else if rel_type == R_386_GOT32X {
-            *relax_got32x = true;
-            (sym_addr as i32 + addend - ctx.got_base as i32) as u32
-        } else {
-            (sym_addr as i32 + addend - ctx.got_base as i32) as u32
+            let base = if baseless { 0 } else { ctx.got_base as i32 };
+            return Ok(((got_entry_addr as i32 + addend - base) as u32, None));
         }
-    } else if rel_type == R_386_GOT32X {
-        *relax_got32x = true;
-        (sym_addr as i32 + addend - ctx.got_base as i32) as u32
-    } else {
-        (sym_addr as i32 + addend - ctx.got_base as i32) as u32
+    }
+    // Resolving to the symbol's GOT-relative offset without converting the
+    // instruction would load from the symbol instead of its slot.
+    Err(format!(
+        "{}: {} against local symbol `{}' needs a GOT slot of its own, but \
+         lccc-ld keys GOT slots by name and that name is bound to another \
+         definition (address the local symbol with @GOTOFF)",
+        obj.filename,
+        if rel_type == R_386_GOT32X {
+            "R_386_GOT32X"
+        } else {
+            "R_386_GOT32"
+        },
+        if sym.name.is_empty() {
+            "<section>"
+        } else {
+            sym.name.as_str()
+        }
+    ))
+}
+
+#[cfg(test)]
+mod got32x_tests {
+    use super::{Got32xConversion as C, got_field_baseless, got32x_conversion};
+
+    /// `bytes` followed by a zero disp32; the field starts after `bytes`.
+    fn site(bytes: &[u8]) -> (Vec<u8>, usize) {
+        let mut v = bytes.to_vec();
+        let off = v.len();
+        v.extend_from_slice(&[0; 4]);
+        (v, off)
+    }
+
+    #[test]
+    fn converts_exactly_ld_2_47_forms() {
+        let cases: &[(&[u8], Option<C>)] = &[
+            (&[0x8b, 0x83], Some(C::MovImm)),    // movl x@GOT(%ebx),%eax
+            (&[0x8b, 0x05], Some(C::MovImm)),    // movl x@GOT,%eax
+            (&[0x8b, 0x0d], Some(C::MovImm)),    // movl x@GOT,%ecx
+            (&[0x85, 0x83], Some(C::TestImm)),   // testl %eax,x@GOT(%ebx)
+            (&[0x03, 0x83], Some(C::AluImm(0))), // addl
+            (&[0x0b, 0x93], Some(C::AluImm(1))), // orl ...,%edx
+            (&[0x13, 0x83], Some(C::AluImm(2))), // adcl
+            (&[0x3b, 0x83], Some(C::AluImm(7))), // cmpl
+            (&[0xff, 0x93], Some(C::Call)),      // call *x@GOT(%ebx)
+            (&[0xff, 0x15], Some(C::Call)),      // call *x@GOT
+            (&[0xff, 0xa3], Some(C::Jmp)),       // jmp *x@GOT(%ebx)
+            (&[0xff, 0x25], Some(C::Jmp)),       // jmp *x@GOT
+            (&[0xff, 0xb3], Some(C::Push)),      // pushl x@GOT(%ebx)
+            (&[0xff, 0x35], Some(C::Push)),      // pushl x@GOT
+            (&[0x89, 0x83], None),               // store
+            (&[0x01, 0x83], None),               // addl %eax,x@GOT(%ebx)
+            (&[0x8d, 0x83], None),               // lea
+            (&[0xff, 0x83], None),               // incl (FF /0)
+            (&[0xff, 0x8b], None),               // decl (FF /1)
+            (&[0x8b, 0xc3], None),               // register form
+            (&[0x8b, 0x43], None),               // disp8 cannot hold it
+            (&[0x8b, 0x84, 0xb3], None),         // SIB: off-2 is ModR/M
+            (&[0x0f, 0xb6, 0x83], None),         // movzbl (0F map)
+        ];
+        for (bytes, want) in cases {
+            let (v, off) = site(bytes);
+            assert_eq!(got32x_conversion(&v, off), *want, "{bytes:02x?}");
+        }
+    }
+
+    #[test]
+    fn nonzero_addend_and_truncated_sites_are_not_converted() {
+        // The GOT32X addend offsets the slot, not the symbol.
+        let v = [0x8b, 0x83, 4, 0, 0, 0];
+        assert_eq!(got32x_conversion(&v, 2), None);
+        assert_eq!(got32x_conversion(&[0x8b, 0x83, 0, 0], 2), None);
+        assert_eq!(got32x_conversion(&[0x83, 0, 0, 0, 0], 1), None);
+    }
+
+    #[test]
+    fn baseless_is_modrm_mod00_rm101() {
+        assert!(got_field_baseless(&[0xff, 0x15, 0, 0, 0, 0], 2));
+        assert!(got_field_baseless(&[0x8b, 0x0d, 0, 0, 0, 0], 2));
+        assert!(!got_field_baseless(&[0x8b, 0x83, 0, 0, 0, 0], 2));
+        assert!(!got_field_baseless(&[0, 0, 0, 0], 0));
     }
 }

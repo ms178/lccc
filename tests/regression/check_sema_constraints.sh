@@ -6,7 +6,7 @@ struct A{int x;}; struct B{int x;}; int one(int x){return x;}
 void v(void){return 1;} int n(void){return;}
 int main(void){struct A a;struct B b;a=b;int *p;double*q;p=q;int(*fp)(int)=one;return one()+one(1,2)+fp();}
 C
-! "$CCC" -fsyntax-only "$t/bad.c" 2>"$t/e"
+! "$CCC" -fsyntax-only "$t/bad.c" 2>"$t/e" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 for x in "'return' with a value" "return with no value" "incompatible types" "incompatible pointer types" "too few arguments to function 'one'" "too many arguments to function 'one'" "too few arguments to function 'fp'"; do grep -q "$x" "$t/e"; done
 cat >"$t/good.c" <<'C'
 struct A{int x;}; static int add(int a,int b){return a+b;} static int sum(int n,...){return n;}
@@ -37,7 +37,7 @@ int *d1(void){ return &sf().m; }
 int *d2(void){ return &(x + 1); }
 int *d3(void){ return &(int)x; }
 C
-! "$CCC" -fsyntax-only "$t/lv_bad.c" 2>"$t/lv_e"
+! "$CCC" -fsyntax-only "$t/lv_bad.c" 2>"$t/lv_e" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 [ "$(grep -c "error: expression is not assignable" "$t/lv_e")" = 11 ]
 [ "$(grep -c "error: assignment to cast is illegal, lvalue casts are not supported" "$t/lv_e")" = 2 ]
 [ "$(grep -c "error: cannot take the address of an rvalue of type 'int'" "$t/lv_e")" = 3 ]
@@ -83,7 +83,7 @@ int b13(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; retu
 int b14(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr(__builtin_strlen(s), 1, 2); }
 int b15(int x){ const int k = 1; int E_shadow = 0; (void)k; (void)E_shadow; return __builtin_choose_expr(E_shadow, 1, 2); }
 C
-! "$CCC" -std=gnu17 -fsyntax-only "$t/ch_bad.c" 2>"$t/ch_e"
+! "$CCC" -std=gnu17 -fsyntax-only "$t/ch_bad.c" 2>"$t/ch_e" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 [ "$(grep -c "first argument to '__builtin_choose_expr' not a constant" "$t/ch_e")" = 15 ]
 # The accepted forms select GCC's arm. `__builtin_constant_p` of a parameter
 # is 0 there (the kernel idiom; lccc took the constant arm once inlined),
@@ -107,14 +107,14 @@ C
 for o in -O0 -O2; do "$CCC" $o "$t/ch_good.c" -o "$t/ch_g"; "$t/ch_g"; done
 printf 'int f(void) { return __builtin_choose_expr(1 << 31, 1, 2); }\n' >"$t/ch89.c"
 "$CCC" -std=gnu89 -fsyntax-only "$t/ch89.c"
-! "$CCC" -std=gnu17 -fsyntax-only "$t/ch89.c" 2>/dev/null
+! "$CCC" -std=gnu17 -fsyntax-only "$t/ch89.c" 2>/dev/null || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 printf 'struct P { int a, b; };\nint f(void) { return __builtin_choose_expr((long)&((struct P *)0)->b, 1, 2); }\n' >"$t/ch_off.c"
-! "$CCC" -fsyntax-only "$t/ch_off.c" 2>/dev/null
+! "$CCC" -fsyntax-only "$t/ch_off.c" 2>/dev/null || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 # Enumerator scope in `_Static_assert` conditions: an object hides an
 # enumerator, a block-scope enumerator ends with its block (GCC 16.2 wording).
 printf 'enum { A = 1 };\nint h(void) { int A = 5; _Static_assert(A, "x"); return A; }\n' >"$t/en_shadow.c"
 printf 'void f(void) { enum { X = 1 }; }\n_Static_assert(X, "leak");\n' >"$t/en_leak.c"
 for f in en_shadow en_leak; do
-  ! "$CCC" -fsyntax-only "$t/$f.c" 2>"$t/$f.e"
+  ! "$CCC" -fsyntax-only "$t/$f.c" 2>"$t/$f.e" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
   grep -q "expression in static assertion is not constant" "$t/$f.e"
 done

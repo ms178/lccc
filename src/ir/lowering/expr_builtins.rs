@@ -15,7 +15,7 @@ use crate::frontend::parser::ast::{Expr, TypeSpecifier, UnaryOp};
 use crate::frontend::sema::builtins::{self, BuiltinIntrinsic, BuiltinKind};
 use crate::ir::reexports::{
     BasicBlock, CallInfo, Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrConst, IrUnaryOp, Operand,
-    Terminator, Value,
+    PrefetchHint, Terminator, Value,
 };
 
 /// How `__builtin_cpu_supports("f")` is answered (AUD-CPU-1).
@@ -304,12 +304,13 @@ impl Lowerer {
         // __builtin_prefetch(addr, [rw], [locality]) - architectural
         // prefetch hint.
         //
-        // GCC semantics: `rw` must be the constant 0 (read) or 1 (write) and
-        // `locality` the constant 0..=3 (0 = no reuse, streaming). Both
-        // default to 0 and 3 respectively. The frontend already diagnoses
-        // out-of-range or non-constant arguments, so anything else reaching
-        // lowering is evaluated for its side effects and the hint falls back
-        // to the default flavors.
+        // GCC 16 semantics (`expand_builtin_prefetch`): `rw` and `locality`
+        // must be integer constant expressions (an error otherwise), `rw` in
+        // 0..=2 (read, write, instruction fetch) and `locality` in 0..=3; an
+        // out-of-range value is a warning and is replaced by ZERO. They
+        // default to 0 and 3. This lowering is the only place that sees the
+        // builtin's arguments (sema registers it as a plain intrinsic), so
+        // it owns those diagnostics — see `prefetch_hint`.
         //
         // The hint is only a hint: dropping it (non-constant arguments, or a
         // backend without prefetch support) can never change program
@@ -317,7 +318,17 @@ impl Lowerer {
         // architecturally legal for a prefetch.
         if name == "__builtin_prefetch" {
             let addr = args.first().map(|arg| self.lower_expr(arg));
-            let hint = prefetch_flavor(args.get(1), args.get(2));
+            let rw = args.get(1).map(|e| self.prefetch_hint_arg(e));
+            let locality = args.get(2).map(|e| self.prefetch_hint_arg(e));
+            let (hint, diags) = prefetch_hint(rw, locality);
+            for (diag, idx) in diags {
+                let span = args[idx].span();
+                match diag {
+                    PrefetchDiag::NotConstant(msg) => self.emit_error(msg, span),
+                    PrefetchDiag::OutOfRange(msg) => self.emit_warning(msg, span),
+                }
+            }
+            let hint = hint.encode();
             // Evaluate any arguments beyond the first for their side effects
             // (GCC's frontend rejects >3 arguments, but lowering must stay
             // total).
@@ -526,6 +537,7 @@ impl Lowerer {
                         assume_library: true,
                         ret_eightbyte_classes: Vec::new(),
                         ret_is_f128_sse: false,
+                        cold: false,
                     },
                 });
                 Some(Operand::Value(dest))
@@ -1420,6 +1432,7 @@ impl Lowerer {
                         assume_library: false,
                         ret_eightbyte_classes: Vec::new(),
                         ret_is_f128_sse: false,
+                        cold: false,
                     },
                 });
                 Some(Operand::Value(dest))
@@ -1693,6 +1706,7 @@ impl Lowerer {
                 assume_library: true,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
+                cold: false,
             },
         });
         Some(Operand::Value(dest))
@@ -2959,44 +2973,97 @@ fn builtin_variadic_fixed_arity(libc_name: &str) -> Option<usize> {
     })
 }
 
-/// Map GCC's `__builtin_prefetch` hint arguments onto the target-independent
-/// `IntrinsicOp::Prefetch` payload (see that variant's table).
-///
-/// `rw` and `locality` must be integer constants in GCC; the frontend rejects
-/// anything else, and `int_const` returns `None` for them here, in which case
-/// the GCC default (read, locality 3) is used. A `rw = 1` (write) hint
-/// outranks the locality: x86 encodes write intent in a different opcode
-/// (`prefetchw`), not in the locality field.
-fn prefetch_flavor(rw: Option<&Expr>, locality: Option<&Expr>) -> u8 {
-    // Only GCC's documented domains select a hint: {0, 1} for `rw` and
-    // 0..=3 for `locality`. Anything else is a program the frontend has
-    // already diagnosed; mapping it onto the *default* is the one choice
-    // that cannot change the meaning of a valid program.
-    let rw = match rw.and_then(integer_literal) {
-        Some(1) => 1,
-        _ => 0,
-    };
-    let locality = match locality.and_then(integer_literal) {
-        Some(v @ 0..=3) => v as u8,
-        _ => 3,
-    };
-    if rw == 1 {
-        return 4;
-    }
-    locality
+/// One `__builtin_prefetch` hint argument after constant evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefetchArg {
+    /// An integer constant expression with this value (wide enough that no
+    /// out-of-range value can wrap into the valid domain).
+    Value(i128),
+    /// Not an integer constant expression (a variable, a float, ...).
+    NotConstant,
 }
 
-/// The value of an integer *literal* expression, without running the constant
-/// evaluator: hint arguments that are not literals fall back to the GCC
-/// defaults instead of triggering a second diagnostic (the frontend owns the
-/// "must be a constant integer" diagnostic).
-fn integer_literal(expr: &Expr) -> Option<i64> {
-    match expr {
-        Expr::IntLiteral(n, _) | Expr::LongLiteral(n, _) | Expr::LongLongLiteral(n, _) => Some(*n),
-        Expr::UIntLiteral(n, _) | Expr::ULongLiteral(n, _) | Expr::ULongLongLiteral(n, _) => {
-            Some(*n as i64)
+/// A diagnostic produced while decoding the hint arguments, worded exactly
+/// like GCC 16 so build logs and `-Werror` behave identically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrefetchDiag {
+    NotConstant(&'static str),
+    OutOfRange(&'static str),
+}
+
+/// GCC 16 `expand_builtin_prefetch`: map the optional `rw` and `locality`
+/// arguments onto the [`PrefetchHint`] payload, plus the diagnostics to emit
+/// (paired with the index of the offending call argument).
+///
+/// * absent: `rw = 0`, `locality = 3`;
+/// * not an integer constant: an error, and the argument is treated as 0;
+/// * `rw` outside 0..=2 or `locality` outside 0..=3: a warning, and the
+///   argument is treated as 0 (GCC's "using zero" — NOT the default 3);
+/// * `rw == 2` (instruction-fetch intent, GCC 15+) is a read hint.
+fn prefetch_hint(
+    rw: Option<PrefetchArg>,
+    locality: Option<PrefetchArg>,
+) -> (PrefetchHint, Vec<(PrefetchDiag, usize)>) {
+    let mut diags = Vec::new();
+    let rw = match rw {
+        None => 0,
+        Some(PrefetchArg::NotConstant) => {
+            diags.push((
+                PrefetchDiag::NotConstant(
+                    "second argument to '__builtin_prefetch' must be a constant",
+                ),
+                1,
+            ));
+            0
         }
-        _ => None,
+        Some(PrefetchArg::Value(v @ 0..=2)) => v,
+        Some(PrefetchArg::Value(_)) => {
+            diags.push((
+                PrefetchDiag::OutOfRange(
+                    "invalid second argument to '__builtin_prefetch'; using zero",
+                ),
+                1,
+            ));
+            0
+        }
+    };
+    let locality = match locality {
+        None => 3,
+        Some(PrefetchArg::NotConstant) => {
+            diags.push((
+                PrefetchDiag::NotConstant(
+                    "third argument to '__builtin_prefetch' must be a constant",
+                ),
+                2,
+            ));
+            0
+        }
+        Some(PrefetchArg::Value(v @ 0..=3)) => v as u8,
+        Some(PrefetchArg::Value(_)) => {
+            diags.push((
+                PrefetchDiag::OutOfRange(
+                    "invalid third argument to '__builtin_prefetch'; using zero",
+                ),
+                2,
+            ));
+            0
+        }
+    };
+    (PrefetchHint::new(rw == 1, locality), diags)
+}
+
+impl Lowerer {
+    /// Constant-evaluate one hint argument. Any integer constant expression
+    /// counts (`enum` constants, `sizeof`, parenthesised arithmetic), exactly
+    /// like GCC; a float or a runtime value is `NotConstant`.
+    fn prefetch_hint_arg(&self, expr: &Expr) -> PrefetchArg {
+        match self.eval_const_expr(expr) {
+            Some(IrConst::I128(v)) => PrefetchArg::Value(v),
+            Some(c) => c
+                .to_i64()
+                .map_or(PrefetchArg::NotConstant, |v| PrefetchArg::Value(v as i128)),
+            None => PrefetchArg::NotConstant,
+        }
     }
 }
 
@@ -3621,48 +3688,113 @@ fn nan_library_function(name: &str) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-mod prefetch_flavor_tests {
-    //! `prefetch_flavor` is the whole of `__builtin_prefetch`'s hint
-    //! translation: the payload it returns is what each backend's mnemonic
-    //! table is indexed by, so the GCC (rw, locality) semantics have to be
-    //! pinned here or a future "simplification" can silently turn every
-    //! streaming hint into an L1 hint.
-    use super::prefetch_flavor;
-    use crate::common::source::Span;
-    use crate::frontend::parser::ast::Expr;
+mod prefetch_hint_tests {
+    //! `prefetch_hint` is the whole of `__builtin_prefetch`'s argument
+    //! semantics: the payload it returns is what every backend's mnemonic
+    //! table is indexed by. Every expectation below is GCC 16.2's measured
+    //! behaviour (`gcc-16 -O2 -S`, x86-64 and `-m32 -msse`; AArch64 via the
+    //! `pftype[rw & 1][locality]` table), including the diagnostics' text.
+    use super::{PrefetchArg, PrefetchDiag, prefetch_hint};
+    use crate::ir::reexports::PrefetchHint;
 
-    fn lit(v: i64) -> Expr {
-        Expr::IntLiteral(v, Span::dummy())
+    fn v(x: i128) -> Option<PrefetchArg> {
+        Some(PrefetchArg::Value(x))
     }
 
     #[test]
     fn defaults_are_read_with_high_locality() {
-        // __builtin_prefetch(p): read, locality 3 (GCC's defaults).
-        assert_eq!(prefetch_flavor(None, None), 3);
+        assert_eq!(
+            prefetch_hint(None, None),
+            (PrefetchHint::new(false, 3), vec![])
+        );
+        assert_eq!(
+            prefetch_hint(v(1), None),
+            (PrefetchHint::new(true, 3), vec![])
+        );
     }
 
     #[test]
-    fn locality_maps_onto_the_payload_verbatim() {
-        for loc in 0..=3i64 {
-            assert_eq!(prefetch_flavor(Some(&lit(0)), Some(&lit(loc))), loc as u8);
+    fn write_intent_keeps_its_locality() {
+        // Defect 15: `rw = 1` used to collapse every locality onto one
+        // payload, so `(p, 1, 0)` became an L1 hint instead of a streaming
+        // one (GCC: `prefetchnta` / `PSTL1STRM`).
+        for rw in 0..=1i128 {
+            for loc in 0..=3i128 {
+                let (hint, diags) = prefetch_hint(v(rw), v(loc));
+                assert!(diags.is_empty());
+                assert_eq!(hint, PrefetchHint::new(rw == 1, loc as u8));
+                assert_eq!(PrefetchHint::decode(hint.encode()), hint);
+            }
         }
     }
 
     #[test]
-    fn write_intent_wins_over_locality() {
-        // GCC's `rw = 1`: the payload is the write flavor regardless of the
-        // locality argument.
-        assert_eq!(prefetch_flavor(Some(&lit(1)), Some(&lit(3))), 4);
-        assert_eq!(prefetch_flavor(Some(&lit(1)), None), 4);
+    fn instruction_fetch_intent_is_a_read_hint() {
+        // GCC 15+ accepts `rw = 2` without a diagnostic and lowers it with the
+        // read table on every target.
+        for loc in 0..=3i128 {
+            assert_eq!(
+                prefetch_hint(v(2), v(loc)),
+                (PrefetchHint::new(false, loc as u8), vec![])
+            );
+        }
     }
 
     #[test]
-    fn out_of_range_and_non_literal_arguments_fall_back_to_the_default() {
-        // The frontend diagnoses these; lowering must stay total and must not
-        // invent a different hint than GCC's default.
-        assert_eq!(prefetch_flavor(Some(&lit(7)), Some(&lit(9))), 3);
-        assert_eq!(prefetch_flavor(Some(&lit(-1)), Some(&lit(-1))), 3);
-        let non_literal = Expr::Identifier("x".to_string(), Span::dummy());
-        assert_eq!(prefetch_flavor(Some(&non_literal), Some(&non_literal)), 3);
+    fn out_of_range_values_warn_and_use_zero() {
+        let rw_msg =
+            PrefetchDiag::OutOfRange("invalid second argument to '__builtin_prefetch'; using zero");
+        let loc_msg =
+            PrefetchDiag::OutOfRange("invalid third argument to '__builtin_prefetch'; using zero");
+        // (p, -1, 3): GCC warns once and emits `prefetcht0`.
+        assert_eq!(
+            prefetch_hint(v(-1), v(3)),
+            (PrefetchHint::new(false, 3), vec![(rw_msg.clone(), 1)])
+        );
+        // (p, 1, 9): locality becomes ZERO, not the default 3 (`prefetchnta`).
+        assert_eq!(
+            prefetch_hint(v(1), v(9)),
+            (PrefetchHint::new(true, 0), vec![(loc_msg.clone(), 2)])
+        );
+        // A value that would wrap into range at 64 bits stays out of range.
+        assert_eq!(
+            prefetch_hint(v((1i128 << 64) + 1), v(-1)),
+            (PrefetchHint::new(false, 0), vec![(rw_msg, 1), (loc_msg, 2)])
+        );
+    }
+
+    #[test]
+    fn non_constant_arguments_are_errors() {
+        let (hint, diags) = prefetch_hint(
+            Some(PrefetchArg::NotConstant),
+            Some(PrefetchArg::NotConstant),
+        );
+        assert_eq!(hint, PrefetchHint::new(false, 0));
+        assert_eq!(
+            diags,
+            vec![
+                (
+                    PrefetchDiag::NotConstant(
+                        "second argument to '__builtin_prefetch' must be a constant"
+                    ),
+                    1
+                ),
+                (
+                    PrefetchDiag::NotConstant(
+                        "third argument to '__builtin_prefetch' must be a constant"
+                    ),
+                    2
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_payload_decodes_to_a_valid_hint() {
+        for p in 0u8..=255 {
+            let h = PrefetchHint::decode(p);
+            assert!(h.locality <= 3);
+            assert_eq!(h.encode(), p & 7);
+        }
     }
 }

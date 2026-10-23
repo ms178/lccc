@@ -231,13 +231,7 @@ pub(crate) fn encode_load(operands: &[Operand], funct3: u32) -> Result<EncodeRes
         Some(Operand::MemSymbol { base, symbol, .. }) => {
             let rs1 = reg_num(base).ok_or("invalid base register")?;
             let (reloc_type, sym) = parse_reloc_modifier(symbol);
-            // Use Lo12I for load-type relocations
-            let reloc_type = match reloc_type {
-                RelocType::PcrelHi20 => RelocType::PcrelLo12I,
-                RelocType::Hi20 => RelocType::Lo12I,
-                RelocType::TprelHi20 => RelocType::TprelLo12I,
-                other => other,
-            };
+            let reloc_type = lo12_itype(reloc_type);
             Ok(EncodeResult::WordWithReloc {
                 word: encode_i(OP_LOAD, rd, funct3, rs1, 0),
                 reloc: Relocation {
@@ -290,12 +284,7 @@ pub(crate) fn encode_store(operands: &[Operand], funct3: u32) -> Result<EncodeRe
         Some(Operand::MemSymbol { base, symbol, .. }) => {
             let rs1 = reg_num(base).ok_or("invalid base register")?;
             let (reloc_type, sym) = parse_reloc_modifier(symbol);
-            let reloc_type = match reloc_type {
-                RelocType::PcrelHi20 => RelocType::PcrelLo12S,
-                RelocType::Hi20 => RelocType::Lo12S,
-                RelocType::TprelHi20 => RelocType::TprelLo12S,
-                other => other,
-            };
+            let reloc_type = lo12_stype(reloc_type);
             Ok(EncodeResult::WordWithReloc {
                 word: encode_s(OP_STORE, funct3, rs1, rs2, 0),
                 reloc: Relocation {
@@ -322,12 +311,7 @@ pub(crate) fn encode_alu_imm(operands: &[Operand], funct3: u32) -> Result<Encode
         ))),
         Some(Operand::Symbol(s)) => {
             let (reloc_type, sym) = parse_reloc_modifier(s);
-            let reloc_type = match reloc_type {
-                RelocType::PcrelHi20 => RelocType::PcrelLo12I,
-                RelocType::Hi20 => RelocType::Lo12I,
-                RelocType::TprelHi20 => RelocType::TprelLo12I,
-                other => other,
-            };
+            let reloc_type = lo12_itype(reloc_type);
             Ok(EncodeResult::WordWithReloc {
                 word: encode_i(OP_OP_IMM, rd, funct3, rs1, 0),
                 reloc: Relocation {

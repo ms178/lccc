@@ -1308,14 +1308,13 @@ pub(super) fn emit_shared_library(
     let has_fini_array = output_sections
         .iter()
         .any(|s| s.name == ".fini_array" && s.mem_size > 0);
-    // `.init`/`.fini` (crti/crtn): addresses are not final yet (layout runs
-    // below), so only the predicates live here; emission looks them up.
-    let has_init = output_sections
-        .iter()
-        .any(|s| s.name == ".init" && s.mem_size > 0);
-    let has_fini = output_sections
-        .iter()
-        .any(|s| s.name == ".fini" && s.mem_size > 0);
+    // GNU ld's rule: DT_INIT/DT_FINI exist iff the image defines `_init`/`_fini`
+    // (crti.o's frame around the `.init`/`.fini` fragments) and record that
+    // symbol.  A `.init` with no `_init` (a `-nostartfiles` fragment with no
+    // prologue and no `ret`) gets no tag: ld.so would run off its end.  The
+    // presence is decided here, before layout; the values are read at
+    // emission once symbol addresses are final.
+    let (has_init, has_fini) = linker_common::image_init_fini(globals);
     // 8 fixed entries + DT_NULL.  DT_GNU_HASH is no longer unconditional (see
     // --hash-style), so both hash tags are counted below instead.
     let mut dyn_count = needed_sonames.len() as u64 + 9;
@@ -1917,6 +1916,8 @@ pub(super) fn emit_shared_library(
         }
     }
 
+    super::link::tls_module_base_value(globals, tls_addr, tls_mem_size, false);
+
     // Auto-generate __start_<section> / __stop_<section> symbols (GNU ld feature)
     for (name, addr) in linker_common::resolve_start_stop_symbols(output_sections) {
         if let Some(entry) = globals.get_mut(&name) {
@@ -2234,18 +2235,11 @@ pub(super) fn emit_shared_library(
     // to 0 on a library lacking it; conversely `__cxa_finalize`, referenced
     // only weakly by crtbeginS.o, must stay weak although libc defines it
     // GLOBAL.  The type is STT_TLS iff some reference says so.
-    let mut import_has_strong_ref: FxHashMap<&str, bool> = FxHashMap::default();
+    let import_has_strong_ref = linker_common::import_strong_refs(objects);
     let mut import_ref_type: FxHashMap<&str, u8> = FxHashMap::default();
-    for obj in objects.iter() {
-        for sym in &obj.symbols {
-            if sym.is_undefined() && !sym.is_local() && !sym.name.is_empty() {
-                *import_has_strong_ref
-                    .entry(sym.name.as_str())
-                    .or_insert(false) |= !sym.is_weak();
-                if sym.sym_type() == STT_TLS {
-                    import_ref_type.insert(sym.name.as_str(), STT_TLS);
-                }
-            }
+    for sym in objects.iter().flat_map(|o| o.symbols.iter()) {
+        if sym.is_undefined() && !sym.is_local() && sym.sym_type() == STT_TLS {
+            import_ref_type.insert(sym.name.as_str(), STT_TLS);
         }
     }
 
@@ -3170,13 +3164,15 @@ pub(super) fn emit_shared_library(
         let ef_start = ef.file_offset as usize;
         let ef_end = ef_start + ef.mem_size as usize;
         if ef_end <= out.len() {
-            let hdr = linker_common::build_eh_frame_hdr(
+            let mut hdr = vec![0u8; eh_frame_hdr_size as usize];
+            linker_common::write_eh_frame_hdr(
+                &mut hdr,
                 &out[ef_start..ef_end],
                 ef.addr,
                 eh_frame_hdr_vaddr,
                 true,
             );
-            if !hdr.is_empty() && eh_frame_hdr_offset as usize + hdr.len() <= out.len() {
+            if eh_frame_hdr_offset as usize + hdr.len() <= out.len() {
                 write_bytes(&mut out, eh_frame_hdr_offset as usize, &hdr);
             }
         }
@@ -3320,28 +3316,13 @@ pub(super) fn emit_shared_library(
         w64(&mut out, dd + 8, so as u64);
         dd += 16;
     }
-    // DT_INIT/DT_FINI: the .init/.fini section addresses, right after SONAME
-    // as in bfd.  The lookups cannot miss (`has_init`/`has_fini` above test
-    // the same predicate on the same section list).
-    if has_init {
-        let init_addr = output_sections
-            .iter()
-            .find(|s| s.name == ".init")
-            .map(|s| s.addr)
-            .unwrap_or(0);
-        w64(&mut out, dd, DT_INIT as u64);
-        w64(&mut out, dd + 8, init_addr);
-        dd += 16;
-    }
-    if has_fini {
-        let fini_addr = output_sections
-            .iter()
-            .find(|s| s.name == ".fini")
-            .map(|s| s.addr)
-            .unwrap_or(0);
-        w64(&mut out, dd, DT_FINI as u64);
-        w64(&mut out, dd + 8, fini_addr);
-        dd += 16;
+    // DT_INIT/DT_FINI (presence fixed above), right after SONAME as in bfd.
+    for (present, name, tag) in [(has_init, "_init", DT_INIT), (has_fini, "_fini", DT_FINI)] {
+        if present {
+            w64(&mut out, dd, tag as u64);
+            w64(&mut out, dd + 8, globals.get(name).map_or(0, |g| g.value));
+            dd += 16;
+        }
     }
     for &(tag, val) in &[
         (DT_STRTAB, dynstr_addr),

@@ -15,9 +15,9 @@ C
 "$tmp/t"
 body=$(sed -n '/^f:/,/^\.size f/p' "$tmp/bmi.s")
 grep -q 'andnq' <<<"$body"
-! grep -q 'notq' <<<"$body"
-"$CCC" -O2 -S "$tmp/t.c" -o "$tmp/base.s"
-! grep -q 'andnq' "$tmp/base.s"  # baseline x86-64 must remain SIGILL-safe
+! grep -q 'notq' <<<"$body" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
+"$CCC" -O2 -march=x86-64 -S "$tmp/t.c" -o "$tmp/base.s"  # explicit baseline: independent of the default -march
+! grep -q 'andnq' "$tmp/base.s" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }  # baseline x86-64 must remain SIGILL-safe
 
 # ── Red-team: the non-negated operand's home read is freshness-gated ──────
 # emit_and_not_impl historically read `other`'s home register

@@ -95,7 +95,7 @@ pub(crate) struct DemorganRec {
 /// Env-gated trace for the De Morgan branch split: prints scan matches,
 /// prune decisions, and emission fires to stderr. Zero cost when off.
 pub(crate) fn demorgan_debug_enabled() -> bool {
-    std::env::var_os("LCCC_DEBUG_DEMORGAN").is_some()
+    demorgan_debug_env()
         // Exploratory (metric-only) emissions of the dual-layout selection
         // do not describe shipped code: their traces would double the
         // count-based assertions in check_demorgan_branch_split.
@@ -119,7 +119,7 @@ pub(crate) fn compute_cmp_replay_scan(
         crate::common::fx_hash::FxHashMap::default();
     let mut replay_gaps: crate::common::fx_hash::FxHashMap<u32, (usize, usize, usize)> =
         crate::common::fx_hash::FxHashMap::default();
-    let demorgan_enabled = std::env::var("CCC_NO_DEMORGAN").is_err();
+    let demorgan_enabled = !demorgan_disabled();
     for (bi, block) in func.blocks.iter().enumerate() {
         let insts = &block.instructions;
         for (ii, inst) in insts.iter().enumerate() {
@@ -488,14 +488,14 @@ fn check_demorgan_pattern(
                 found[slot] = Some((*op, lhs.clone(), rhs.clone(), *ty, arm_v, ci));
             }
         }
-        if found[slot].is_none() {
-            return None;
-        }
     }
     let [
-        (aop, alhs, arhs, aty, adest, aidx),
-        (bop, blhs, brhs, bty, bdest, bidx),
-    ] = found.map(|f| f.expect("checked above"));
+        Some((aop, alhs, arhs, aty, adest, aidx)),
+        Some((bop, blhs, brhs, bty, bdest, bidx)),
+    ] = found
+    else {
+        return None;
+    };
     // Redefinition guard: each Cmp's value operands must not be redefined
     // between the Cmp and the terminator (the And/Or itself emits nothing,
     // so only real defs in between can disturb the replayed reads).
@@ -519,6 +519,58 @@ fn check_demorgan_pattern(
         binop_id: andor_src_id,
     })
 }
+
+// The compare/select A/B and trace knobs, read once per process. The hot
+// ones were asked per instruction (every Cmp, every Select, every FP-select
+// blend), each ask a `getenv` scan under the environment lock. The driver
+// never changes its environment mid-process, so caching is exact; same
+// convention as `emit.rs`'s `trace_notes_enabled`.
+macro_rules! cached_knob {
+    ($(#[$doc:meta])* $fn:ident, $name:literal) => {
+        $(#[$doc])*
+        fn $fn() -> bool {
+            static ON: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| std::env::var_os($name).is_some());
+            *ON
+        }
+    };
+}
+
+cached_knob!(
+    /// `CCC_NO_FLAG_FUSION`: always materialise a compare's boolean.
+    no_flag_fusion,
+    "CCC_NO_FLAG_FUSION"
+);
+cached_knob!(
+    /// `CCC_V9_SELECT`: the legacy v9 select emission.
+    v9_select,
+    "CCC_V9_SELECT"
+);
+cached_knob!(
+    /// `CCC_NO_INPLACE_SELECT`: no in-place test of a materialised condition.
+    no_inplace_select,
+    "CCC_NO_INPLACE_SELECT"
+);
+cached_knob!(
+    /// `CCC_NO_FP_SELECT`: no VEX blend / cmov lowering of FP-compare selects.
+    fp_select_disabled,
+    "CCC_NO_FP_SELECT"
+);
+cached_knob!(
+    /// `CCC_DEBUG_FP_SELECT`: trace the FP-select lowering to stderr.
+    fp_select_debug,
+    "CCC_DEBUG_FP_SELECT"
+);
+cached_knob!(
+    /// `CCC_NO_DEMORGAN`: no De Morgan branch split.
+    demorgan_disabled,
+    "CCC_NO_DEMORGAN"
+);
+cached_knob!(
+    /// `LCCC_DEBUG_DEMORGAN`, the environment half of `demorgan_debug_enabled`.
+    demorgan_debug_env,
+    "LCCC_DEBUG_DEMORGAN"
+);
 
 impl X86Codegen {
     /// Materialize the FP boolean (`setcc` chain) — used by
@@ -563,13 +615,17 @@ impl X86Codegen {
     /// so the ordinary select path below is sound.
     ///
     /// RELATIONAL ops need no boolean at all: the flags just set are the
-    /// condition, so `pending_fp_cmp` is handed to the select (which maps
-    /// the FP jcc ja/jae directly onto its cmov) — the select then runs its
-    /// register-direct or accumulator cmov path with the in-place flags and
-    /// no setcc/movzbl/test. Eq/Ne cannot fold (parity-based chains), so
-    /// they materialize the boolean via the setcc chain and the select
-    /// tests the materialized value (the %cl clobber in that chain is
-    /// handled inside emit_fp_cmp_setcc).
+    /// condition, returned as the cmov condition code (`a`/`ae`: unordered
+    /// clears CF=0&&ZF=0 / CF=0, so NaN selects the false arm, C99) — the
+    /// select then runs its register-direct or accumulator cmov path with
+    /// the in-place flags and no setcc/movzbl/test. Eq/Ne need two flags
+    /// (ZF and PF), which no single cmov reads, so they materialize the
+    /// boolean via the setcc chain, return `None`, and the select tests the
+    /// materialized value (the %cl clobber in that chain is handled inside
+    /// emit_fp_cmp_setcc). Returning the code, rather than parking it in
+    /// `pending_fp_cmp`, keeps the select's mapping total: the CondBranch
+    /// fusion's two-flag pair sentinels cannot reach a cmov.
+    #[must_use]
     pub(super) fn emit_fp_cmp_boolean(
         &mut self,
         dest: &Value,
@@ -577,7 +633,7 @@ impl X86Codegen {
         lhs: &Operand,
         rhs: &Operand,
         ty: IrType,
-    ) {
+    ) -> Option<&'static str> {
         let swap_operands = matches!(
             op,
             IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sle | IrCmpOp::Ule
@@ -599,14 +655,11 @@ impl X86Codegen {
             }
         }
         match op {
-            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sgt | IrCmpOp::Ugt => {
-                self.pending_fp_cmp = Some((dest.0, "ja"));
-            }
-            IrCmpOp::Sle | IrCmpOp::Ule | IrCmpOp::Sge | IrCmpOp::Uge => {
-                self.pending_fp_cmp = Some((dest.0, "jae"));
-            }
+            IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sgt | IrCmpOp::Ugt => Some("a"),
+            IrCmpOp::Sle | IrCmpOp::Ule | IrCmpOp::Sge | IrCmpOp::Uge => Some("ae"),
             IrCmpOp::Eq | IrCmpOp::Ne => {
                 self.emit_fp_cmp_setcc(dest, op);
+                None
             }
         }
     }
@@ -734,10 +787,8 @@ impl X86Codegen {
         // (vcmpsd/vcmpss, see try_emit_fp_select_blend) from the recorded
         // operands and blends the FP arms. The scan excluded `fused` dests,
         // so no pending-flag handshake state is skipped with it.
-        if std::env::var_os("CCC_NO_FP_SELECT").is_none()
-            && self.fp_select_cmps.contains_key(&dest.0)
-        {
-            if std::env::var_os("CCC_DEBUG_FP_SELECT").is_some() {
+        if !fp_select_disabled() && self.fp_select_cmps.contains_key(&dest.0) {
+            if fp_select_debug() {
                 eprintln!(
                     "[FP-SELECT] cmp %{} emits nothing (blend at select)",
                     dest.0
@@ -791,21 +842,24 @@ impl X86Codegen {
         // fused_cmp_dests), skip the boolean materialization. The ucomisd
         // above set EFLAGS; the relational ordered comparisons map cleanly
         // to `ja`/`jae` (NaN → unordered → not-taken = false, which is the
-        // C99 result for NaN in any relational). Eq/Ne are never fused
-        // (the prologue gate excludes them), so the parity bit is irrelevant
-        // here. The consumer reads `pending_fp_cmp` for the pre-computed
-        // jcc — distinct from the integer `pending_cmp` because the FP
+        // C99 result for NaN in any relational). Eq/Ne need the parity bit
+        // too: a self-compare is PF alone (`jnp`/`jp`), anything else is a
+        // two-flag pair the CondBranch consumer expands
+        // (`emit_fp_eq_ne_pair_branch`). The consumer reads `pending_fp_cmp`
+        // for the pre-computed jcc — distinct from the integer `pending_cmp` because the FP
         // flag→jcc mapping differs (ja vs jg).
-        let fusion_disabled = std::env::var("CCC_NO_FLAG_FUSION").is_ok();
+        let fusion_disabled = no_flag_fusion();
         if !fusion_disabled {
             if let Some(&chain_end) = self.fused_cmp_dests.get(&dest.0) {
                 let jcc: Option<&'static str> = match op {
                     IrCmpOp::Slt | IrCmpOp::Ult | IrCmpOp::Sgt | IrCmpOp::Ugt => Some("ja"),
                     IrCmpOp::Sle | IrCmpOp::Ule | IrCmpOp::Sge | IrCmpOp::Uge => Some("jae"),
-                    // Eq/Ne are excluded from FP fusion by the prologue gate;
-                    // reaching here is unreachable, but materialize anyway
-                    // for safety rather than risk a skipped boolean.
-                    IrCmpOp::Eq | IrCmpOp::Ne => None,
+                    // Self-compare: PF alone is the answer. Otherwise the
+                    // CondBranch consumer expands the two-flag pair.
+                    IrCmpOp::Eq if is_self_compare(lhs, rhs) => Some("jnp"),
+                    IrCmpOp::Ne if is_self_compare(lhs, rhs) => Some("jp"),
+                    IrCmpOp::Eq => Some(FP_EQ_PAIR),
+                    IrCmpOp::Ne => Some(FP_NE_PAIR),
                 };
                 if let Some(jcc) = jcc {
                     self.pending_fp_cmp = Some((chain_end, jcc));
@@ -927,9 +981,7 @@ impl X86Codegen {
         // register (it was never written because the Cmp skipped the
         // materialization). Without this gate, setting either flag produced
         // wrong select results (differential test: got 660 vs expected 1320).
-        let fusion_disabled = std::env::var("CCC_NO_FLAG_FUSION").is_ok()
-            || std::env::var("CCC_V9_SELECT").is_ok()
-            || std::env::var("CCC_NO_INPLACE_SELECT").is_ok();
+        let fusion_disabled = no_flag_fusion() || v9_select() || no_inplace_select();
         if !fusion_disabled {
             if let Some(&chain_end) = self.fused_cmp_dests.get(&dest.0) {
                 // The consumer is the next instruction(s) (possibly after a
@@ -1237,6 +1289,36 @@ impl X86Codegen {
         None
     }
 
+    /// FP `==`/`!=` on live `ucomis` flags (PF = unordered, ZF = equal or
+    /// unordered): `!=` holds when PF or !ZF, `==` when !PF and ZF. The PF
+    /// test always comes first; a jcc to the next block is kept where it
+    /// shields the ZF test from the unordered case.
+    fn emit_fp_eq_ne_pair_branch(&mut self, eq: bool, t: BlockId, f: BlockId) {
+        let next = self.state.next_block_label;
+        let out = &mut self.state.out;
+        if eq {
+            out.emit_jcc_block("jp", f.0);
+            if next == Some(t) {
+                out.emit_jcc_block("jne", f.0);
+            } else {
+                out.emit_jcc_block("je", t.0);
+                if next != Some(f) {
+                    out.emit_jmp_block(f.0);
+                }
+            }
+        } else {
+            out.emit_jcc_block("jp", t.0);
+            if next == Some(t) {
+                out.emit_jcc_block("je", f.0);
+            } else {
+                out.emit_jcc_block("jne", t.0);
+                if next != Some(f) {
+                    out.emit_jmp_block(f.0);
+                }
+            }
+        }
+    }
+
     #[inline]
     fn invert_jcc(cc: &str) -> &'static str {
         match cc {
@@ -1250,7 +1332,10 @@ impl X86Codegen {
             "jae" => "jb",
             "jbe" => "ja",
             "ja" => "jbe",
-            _ => "jne",
+            "jp" => "jnp",
+            "jnp" => "jp",
+            // A silent fallback here would branch on the wrong condition.
+            other => unreachable!("invert_jcc: unexpected condition {other}"),
         }
     }
 
@@ -1332,6 +1417,11 @@ impl X86Codegen {
         // `if (zr*zr + zi*zi > 4.0) break` drops from 6 instructions
         // (ucomisd; seta; movzbl; movq; test; jne) to 2 (ucomisd; ja).
         if let Some(jcc) = self.take_pending_fp_cmp(cond) {
+            if jcc == FP_EQ_PAIR || jcc == FP_NE_PAIR {
+                self.emit_fp_eq_ne_pair_branch(jcc == FP_EQ_PAIR, true_block, false_block);
+                self.state.reg_cache.invalidate_all();
+                return;
+            }
             let jcc_hot = if pref_true {
                 jcc
             } else {
@@ -1867,7 +1957,7 @@ impl X86Codegen {
         // Case A: XMM-homed destination — blend straight into the home.
         if let Some(d) = self.dest_reg(dest).filter(|r| is_xmm_reg(*r)) {
             let d_name = phys_reg_name(d);
-            if std::env::var_os("CCC_DEBUG_FP_SELECT").is_some() {
+            if fp_select_debug() {
                 eprintln!("[FP-SELECT] blend into {}", d_name);
             }
             // 1. mask: the vcmpsd source position takes the RHS directly
@@ -1933,7 +2023,7 @@ impl X86Codegen {
             return false;
         };
         let f_name = phys_reg_name(f_reg);
-        if std::env::var_os("CCC_DEBUG_FP_SELECT").is_some() {
+        if fp_select_debug() {
             eprintln!("[FP-SELECT] blend into xmm0 (false in {})", f_name);
         }
         // 1. mask → xmm1: register-direct when the LHS has a fresh home
@@ -2035,7 +2125,7 @@ impl X86Codegen {
         ty: IrType,
     ) {
         // legacy-compat path (debugging): the legacy emission order.
-        if std::env::var("CCC_V9_SELECT").is_ok() {
+        if v9_select() {
             if let Some(d_reg) = self.dest_reg(dest).filter(|r| !super::emit::is_xmm_reg(*r)) {
                 if !is_xmm_reg(d_reg) {
                     let d_name = phys_reg_name(d_reg);
@@ -2109,7 +2199,9 @@ impl X86Codegen {
         // (I32 values in XMM homes occupy only the low 32 bits — writing a
         // GPR→XMM lane leaves the upper bits stale — so an F64-width blend
         // over an I32 arm would mix stale lanes; the width must match.)
-        if std::env::var_os("CCC_NO_FP_SELECT").is_none() {
+        // The cmov condition the FP-SELECT fallback's `ucomis` left live.
+        let mut fp_flags_cc: Option<&'static str> = None;
+        if !fp_select_disabled() {
             if let Operand::Value(cv) = cond {
                 if let Some((cop, clhs, crhs, cty)) = self.fp_select_cmps.get(&cv.0).cloned() {
                     let arm_ok = |op: &Operand| -> bool {
@@ -2129,24 +2221,24 @@ impl X86Codegen {
                         if !self.try_emit_fp_select_blend(
                             dest, cop, &clhs, &crhs, true_val, false_val, cty,
                         ) {
-                            if std::env::var_os("CCC_DEBUG_FP_SELECT").is_some() {
+                            if fp_select_debug() {
                                 eprintln!(
                                     "[FP-SELECT] cmp %{}: blend refused, materialize boolean",
                                     cv.0
                                 );
                             }
-                            self.emit_fp_cmp_boolean(cv, cop, &clhs, &crhs, cty);
+                            fp_flags_cc = self.emit_fp_cmp_boolean(cv, cop, &clhs, &crhs, cty);
                         } else {
                             return;
                         }
                     } else {
-                        if std::env::var_os("CCC_DEBUG_FP_SELECT").is_some() {
+                        if fp_select_debug() {
                             eprintln!(
                                 "[FP-SELECT] cmp %{}: arm types not blendable, materialize",
                                 cv.0
                             );
                         }
-                        self.emit_fp_cmp_boolean(cv, cop, &clhs, &crhs, cty);
+                        fp_flags_cc = self.emit_fp_cmp_boolean(cv, cop, &clhs, &crhs, cty);
                     }
                 }
             }
@@ -2157,10 +2249,10 @@ impl X86Codegen {
         // code directly for the cmov, no test needed.
         let fused_op = self.take_pending_cmp(cond);
         // FP-SELECT fallback flags: emit_fp_cmp_boolean (above) just ran the
-        // ucomisd and left its FP relational flags live. The FP flag → cmov
-        // mapping is ja/jae (unordered → not-taken → false arm, C99 NaN), the
-        // SAME contract as the CondBranch fusion.
-        let fused_fp = self.take_pending_fp_cmp(cond);
+        // ucomisd and left its FP relational flags live as `a`/`ae`
+        // (unordered → false arm, C99 NaN), the SAME contract as the
+        // CondBranch fusion. An FP Cmp never fuses into a Select (prologue
+        // gate), so `pending_fp_cmp` is the CondBranch's alone.
         // COMPARE-REPLAY: the condition is a Cmp result consumed only by this
         // select but not adjacent to the Cmp (flags clobbered in between).
         // Re-emit the comparison from the recorded operands right before the
@@ -2174,21 +2266,22 @@ impl X86Codegen {
         }
         // Test the condition in place (no pushfq). Only when the condition is
         // not directly testable (rare) do we fall back to the legacy
-        // materialize + pushfq/popfq path. With live FP flags the in-place
-        // path is MANDATORY (the condition's boolean was never materialized,
-        // so any load/test would read a stale home).
-        let tested_in_place = if std::env::var("CCC_NO_INPLACE_SELECT").is_ok() {
-            false
-        } else if fused_op.is_some() || fused_fp.is_some() || replay_op.is_some() {
+        // materialize + pushfq/popfq path. With live flags (fused integer or
+        // FP Cmp, or a replayed compare) the in-place path is MANDATORY: the
+        // condition's boolean was never materialized, so any load/test would
+        // read a stale home. `CCC_NO_INPLACE_SELECT` therefore only turns off
+        // the optional in-place test of a materialized condition.
+        let tested_in_place = if fused_op.is_some() || fp_flags_cc.is_some() || replay_op.is_some()
+        {
             true
+        } else if no_inplace_select() {
+            false
         } else {
             self.test_select_cond_in_place(cond)
         };
-        let cmov_cc = match (fused_op, fused_fp, replay_op.as_ref()) {
+        let cmov_cc = match (fused_op, fp_flags_cc, replay_op.as_ref()) {
             (Some(op), _, _) => Self::cmp_cmov(op),
-            (None, Some("ja"), _) => "a",
-            (None, Some("jae"), _) => "ae",
-            (None, Some(_), _) => "ne",
+            (None, Some(cc), _) => cc,
             (None, None, Some((op, _, _, _))) => Self::cmp_cmov(*op),
             (None, None, None) => "ne",
         };
@@ -2310,6 +2403,18 @@ impl X86Codegen {
         self.state.reg_cache.invalidate_acc();
         self.store_rax_to(dest);
     }
+}
+
+/// Pending-FP-compare pseudo-codes for a two-flag `==`/`!=`: only the
+/// CondBranch consumer accepts them (`emit_fp_eq_ne_pair_branch`); FP
+/// Selects never fuse (prologue gate), so no cmov ever sees one.
+const FP_EQ_PAIR: &str = "fp-eq-pair";
+const FP_NE_PAIR: &str = "fp-ne-pair";
+
+/// Both operands are the same SSA value: `ucomis r,r` then sets PF exactly
+/// when `r` is NaN (ZF is always set), so FP `Eq`/`Ne` reduce to `jnp`/`jp`.
+fn is_self_compare(lhs: &Operand, rhs: &Operand) -> bool {
+    matches!(lhs, Operand::Value(_)) && lhs == rhs
 }
 
 #[cfg(test)]

@@ -283,6 +283,7 @@ impl DeadWriteRefresh {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct FileLiveness {
     /// Registers live immediately AFTER each line, when its function could be
     /// analysed.
@@ -315,6 +316,7 @@ pub(super) struct FileLiveness {
 #[cfg(test)]
 thread_local! {
     static MEMO_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static EFFECT_MEMO_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// `CCC_VERIFY_LIVENESS_SPAN` (see `FileLiveness::assert_matches_full_analysis`).
@@ -1288,9 +1290,14 @@ impl FileLiveness {
         let resolve = |name: &str| -> Option<usize> { label_index.get(name).copied() };
 
         // ── instruction effects + successor edges ────────────────────────────
-        let mut effects: Vec<Option<Effect>> = vec![None; end.saturating_sub(start)];
-        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); end.saturating_sub(start)];
-        let mut lines: Vec<usize> = Vec::new();
+        // Successor edges live in ONE flat buffer, line `rel` owning
+        // `succ_flat[succ_range[rel].0..succ_range[rel].1]`.  A `Vec` per line
+        // cost a heap allocation and free for nearly every line of every
+        // solve (almost all have one or two successors); the flat buffer
+        // grows to its high-water mark once per solve.
+        let mut effects: Vec<Option<Effect>> = vec![None; fn_len];
+        let mut succ_range: Vec<(usize, usize)> = vec![(0, 0); fn_len];
+        let mut lines: Vec<usize> = Vec::with_capacity(fn_len);
         for n in start..end {
             if super::helpers::steps_over_line(&infos[n], infos[n].trimmed(store.get(n))) {
                 continue;
@@ -1318,11 +1325,13 @@ impl FileLiveness {
         // refuses analysis.
         let jump_table_succs: Vec<Option<Vec<usize>>> =
             Self::resolve_jump_tables(store, infos, &lines, &label_index, start, end);
+        let mut succ_flat: Vec<usize> = Vec::with_capacity(lines.len() + lines.len() / 4);
         for (pos, &n) in lines.iter().enumerate() {
             let t = infos[n].trimmed(store.get(n));
             let next = lines.get(pos + 1).copied();
             let rel = n - start;
-            let (eff, edges) = match self.classify(
+            let first_edge = succ_flat.len();
+            let eff = match self.classify(
                 store,
                 infos,
                 n,
@@ -1332,6 +1341,7 @@ impl FileLiveness {
                 ret_live,
                 &jump_table_succs,
                 start,
+                &mut succ_flat,
             ) {
                 Some(v) => v,
                 None => return, // unanalysable control flow: leave `known` false
@@ -1353,12 +1363,12 @@ impl FileLiveness {
                 _ => eff,
             };
             effects[rel] = Some(eff);
-            succs[rel] = edges;
+            succ_range[rel] = (first_edge, succ_flat.len());
         }
 
         // ── backward dataflow ────────────────────────────────────────────────
-        let mut live_in: Vec<u16> = vec![0; end.saturating_sub(start)];
-        let mut live_out: Vec<u16> = vec![0; end.saturating_sub(start)];
+        let mut live_in: Vec<u16> = vec![0; fn_len];
+        let mut live_out: Vec<u16> = vec![0; fn_len];
         let mut changed = true;
         let mut rounds = 0;
         while changed && rounds < 64 {
@@ -1367,11 +1377,12 @@ impl FileLiveness {
             for &n in lines.iter().rev() {
                 let rel = n - start;
                 let Some(eff) = effects[rel] else { continue };
+                let (first, past) = succ_range[rel];
                 let mut out = 0u16;
-                for &s in &succs[rel] {
+                for &s in &succ_flat[first..past] {
                     out |= live_in[s - start];
                 }
-                if succs[rel].is_empty() {
+                if first == past {
                     out |= ret_live; // fell off the end: be conservative
                 }
                 let inn = eff.reads | (out & !eff.writes);
@@ -1563,8 +1574,10 @@ impl FileLiveness {
         out
     }
 
-    /// Effects and successors of one instruction, or `None` when the control
-    /// transfer cannot be resolved.
+    /// The effect of line `n`, with its successor lines appended to `edges`
+    /// (none for `ret`, which the solver then treats as reading `ret_live`),
+    /// or `None` when the control transfer cannot be resolved -- `edges` is
+    /// then garbage, and the caller abandons the function.
     fn classify(
         &self,
         store: &LineStore,
@@ -1576,37 +1589,32 @@ impl FileLiveness {
         ret_live: u16,
         jump_table_succs: &[Option<Vec<usize>>],
         jump_table_base: usize,
-    ) -> Option<(Effect, Vec<usize>)> {
+        edges: &mut Vec<usize>,
+    ) -> Option<Effect> {
         let mentioned = infos[n].reg_refs;
-        let fall: Vec<usize> = next.into_iter().collect();
 
         if infos[n].kind == LineKind::InlineAsm
             || infos[n].pinned && infos[n].kind == LineKind::InlineAsm
         {
-            return Some((
-                Effect {
-                    reads: ALL,
-                    writes: 0,
-                },
-                fall,
-            ));
+            edges.extend(next);
+            return Some(Effect {
+                reads: ALL,
+                writes: 0,
+            });
         }
 
         match infos[n].kind {
-            LineKind::Label => Some((
-                Effect {
+            LineKind::Label => {
+                edges.extend(next);
+                Some(Effect {
                     reads: 0,
                     writes: 0,
-                },
-                fall,
-            )),
-            LineKind::Ret => Some((
-                Effect {
-                    reads: ret_live | mentioned,
-                    writes: 0,
-                },
-                Vec::new(),
-            )),
+                })
+            }
+            LineKind::Ret => Some(Effect {
+                reads: ret_live | mentioned,
+                writes: 0,
+            }),
             LineKind::Call => {
                 // Call-site reads: see `call_site_reads` (the shared
                 // authority for the LCCC_CALL_ARGS / LCCC_VA_CALL /
@@ -1632,21 +1640,18 @@ impl FileLiveness {
                 // live across the call (sound — dead is never concluded),
                 // while a real external callee keeps the ABI model.
                 let local_target = t.split_whitespace().nth(1).and_then(resolve);
+                edges.extend(next);
                 match local_target {
                     Some(target) => {
-                        let mut edges = fall;
-                        if !edges.contains(&target) {
+                        if next != Some(target) {
                             edges.push(target);
                         }
-                        Some((Effect { reads, writes: 0 }, edges))
+                        Some(Effect { reads, writes: 0 })
                     }
-                    None => Some((
-                        Effect {
-                            reads,
-                            writes: CALLER_SAVED,
-                        },
-                        fall,
-                    )),
+                    None => Some(Effect {
+                        reads,
+                        writes: CALLER_SAVED,
+                    }),
                 }
             }
             LineKind::JmpIndirect => {
@@ -1654,16 +1659,14 @@ impl FileLiveness {
                 // target labels (see `resolve_jump_tables`). The dispatch
                 // registers are ordinary instructions classified on their
                 // own lines; this line only reads the target register.
-                if let Some(Some(targets)) = jump_table_succs.get(n - jump_table_base) {
-                    return Some((
-                        Effect {
-                            reads: mentioned,
-                            writes: 0,
-                        },
-                        targets.clone(),
-                    ));
-                }
-                None
+                let Some(Some(targets)) = jump_table_succs.get(n - jump_table_base) else {
+                    return None;
+                };
+                edges.extend_from_slice(targets);
+                Some(Effect {
+                    reads: mentioned,
+                    writes: 0,
+                })
             }
             LineKind::Jmp => {
                 let target = t.split_whitespace().nth(1)?;
@@ -1671,37 +1674,79 @@ impl FileLiveness {
                     return None;
                 }
                 let idx = resolve(target)?; // tail call / foreign label
-                Some((
-                    Effect {
-                        reads: mentioned,
-                        writes: 0,
-                    },
-                    vec![idx],
-                ))
+                edges.push(idx);
+                Some(Effect {
+                    reads: mentioned,
+                    writes: 0,
+                })
             }
             LineKind::CondJmp => {
                 let target = t.split_whitespace().nth(1)?;
                 let idx = resolve(target)?;
-                let mut edges = fall;
+                edges.extend(next);
                 edges.push(idx);
-                Some((
-                    Effect {
-                        reads: mentioned,
-                        writes: 0,
-                    },
-                    edges,
-                ))
+                Some(Effect {
+                    reads: mentioned,
+                    writes: 0,
+                })
             }
-            _ => Some((Self::straight_effect(infos, n, t), fall)),
+            _ => {
+                edges.extend(next);
+                Some(Self::straight_effect(infos, n, t))
+            }
         }
     }
 
     /// Register effect of a line that is not a control transfer, label,
     /// call, `ret` or inline asm: a function of the line's own text alone,
     /// which is what lets `refresh_span` re-derive it in isolation.
+    ///
+    /// Memoised per thread.  The solver re-derives every line's effect on
+    /// every solve, and the memo of whole functions rarely hits while a pass
+    /// is editing them; re-parsing the text (prefix scans, family substring
+    /// searches, the implicit-operand oracle) was a quarter of all compile
+    /// instructions on large inlined functions.  The key is EVERYTHING the
+    /// derivation reads -- the trimmed text, `kind` (which carries the
+    /// destination `get_dest_reg` reports) and `reg_refs` -- compared for
+    /// equality on a hit, so a hit is the uncached answer by construction (no
+    /// hash-collision argument needed).  One entry per text: a text seen
+    /// with a different `kind`/`reg_refs` (a pass re-typed the line without
+    /// editing it) recomputes and replaces the entry.
     fn straight_effect(infos: &[LineInfo], n: usize, t: &str) -> Effect {
-        let mentioned = infos[n].reg_refs;
-        match infos[n].kind {
+        /// Bounded memory: a full table is cleared, not frozen, so it keeps
+        /// tracking the texts the current passes are producing.
+        const EFFECT_MEMO_CAP: usize = 1 << 15;
+        type Memo = FxHashMap<Box<str>, (LineKind, u16, Effect)>;
+        thread_local! {
+            static EFFECT_MEMO: std::cell::RefCell<Memo> =
+                std::cell::RefCell::new(FxHashMap::default());
+        }
+        let info = &infos[n];
+        EFFECT_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if let Some(entry) = memo.get_mut(t) {
+                if entry.0 == info.kind && entry.1 == info.reg_refs {
+                    #[cfg(test)]
+                    EFFECT_MEMO_HITS.with(|c| c.set(c.get() + 1));
+                    return entry.2;
+                }
+                let eff = Self::straight_effect_uncached(info, t);
+                *entry = (info.kind, info.reg_refs, eff);
+                return eff;
+            }
+            let eff = Self::straight_effect_uncached(info, t);
+            if memo.len() >= EFFECT_MEMO_CAP {
+                memo.clear();
+            }
+            memo.insert(t.into(), (info.kind, info.reg_refs, eff));
+            eff
+        })
+    }
+
+    /// [`FileLiveness::straight_effect`] without the memo.
+    fn straight_effect_uncached(info: &LineInfo, t: &str) -> Effect {
+        let mentioned = info.reg_refs;
+        match info.kind {
             LineKind::Push { .. } => Effect {
                 reads: mentioned | RSP,
                 writes: RSP,
@@ -1737,7 +1782,7 @@ impl FileLiveness {
                 }
                 let mut reads = mentioned;
                 let mut writes = 0u16;
-                let dest = get_dest_reg(&infos[n]);
+                let dest = get_dest_reg(info);
                 if dest != REG_NONE && dest <= REG_GP_MAX {
                     let bit = 1u16 << dest;
                     writes |= bit;
@@ -1951,6 +1996,19 @@ mod tests {
             "blsrl %ebx, %eax",
             "blsil %ebx, %eax",
             "blsmskl %ebx, %eax",
+            // Vector/FP -> GPR transfers (whole GPR written, r32 forms
+            // zero-extend).
+            "vmovq %xmm0, %rax",
+            "vmovd %xmm0, %eax",
+            "movd %xmm1, %ecx",
+            "vpextrd $1, %xmm0, %eax",
+            "pextrw $3, %xmm2, %edx",
+            "vpmovmskb %ymm0, %eax",
+            "vmovmskpd %xmm0, %eax",
+            "movmskps %xmm3, %r8d",
+            "cvttsd2si %xmm0, %rax",
+            "vcvttss2si %xmm1, %eax",
+            "vcvtsd2si %xmm2, %rcx",
         ];
         for line in dest_only {
             assert!(
@@ -2007,6 +2065,33 @@ mod tests {
         }
     }
 
+    /// zlib_ng_adler32: a vector-lane extract into %rax after a loop must
+    /// KILL %rax, not read it. As a phantom read it kept the fill loop's
+    /// dead `movq %rdx, %rax` (and the in-place `movzbl` feeding it) alive
+    /// for 2M iterations: liveness flowed from the extract back over the
+    /// loop's exit edge into the loop body.
+    #[test]
+    fn vector_extract_into_gpr_kills_it_across_a_loop_exit() {
+        let (store, _infos, lv) = build(concat!(
+            ".text\nf:\n.cfi_startproc\n",
+            ".L1:\n",
+            "    movq %rdx, %rax\n",
+            "    movb %dl, (%rcx, %rsi)\n",
+            "    addq $1, %rsi\n",
+            "    cmpq $8, %rsi\n",
+            "jb .L1\n",
+            "    vmovq %xmm0, %rax\n",
+            "    movq %rax, 8(%rsp)\n",
+            "    xorl %eax, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        let copy = (0..store.len())
+            .find(|&n| store.get(n).trim() == "movq %rdx, %rax")
+            .expect("fixture has the copy");
+        assert_eq!(lv.live_after(copy, 0), Some(false));
+    }
+
     fn build(asm: &str) -> (LineStore, Vec<LineInfo>, FileLiveness) {
         let store = LineStore::new(asm.to_string());
         let infos: Vec<LineInfo> = (0..store.len())
@@ -2038,6 +2123,45 @@ mod tests {
     }
 
     /// Straight-line fold (the copy-propagation shape): spliced, exact.
+    /// A frameless function that allocates `%rbp` as a GPR: its `%rsp`-slot
+    /// spills and reloads must not read `%rbp`. The slot classification used
+    /// to hard-code the rbp bit for both slot bases, so the spill below kept
+    /// the byte value live past its only consumer (and, in
+    /// `zlib_ng_adler32_combine`, across two whole loops).
+    #[test]
+    fn rsp_slot_traffic_is_not_a_read_of_an_allocated_rbp() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    pushq %rbp\n",
+            "    subq $16, %rsp\n",
+            "    movl %edi, %ebp\n",
+            "    movb %bpl, (%rsi)\n",
+            "    movq %rax, 8(%rsp)\n",
+            "    movl $1, %ebp\n",
+            "    movq 8(%rsp), %rax\n",
+            "    addq %rbp, %rax\n",
+            "    addq $16, %rsp\n",
+            "    popq %rbp\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, _infos, lv) = build(asm);
+        let consumer = line_of(&store, "movb %bpl, (%rsi)");
+        assert_eq!(
+            lv.live_after(consumer, 5),
+            Some(false),
+            "the spill does not read %rbp"
+        );
+        // The second value really is read across the reload: still live.
+        let reload = line_of(&store, "movq 8(%rsp), %rax");
+        assert_eq!(
+            lv.live_after(reload, 5),
+            Some(true),
+            "addq still reads %rbp"
+        );
+    }
+
     #[test]
     fn refresh_span_splices_a_straight_line_fold() {
         let asm = concat!(
@@ -2751,5 +2875,96 @@ mod tests {
             lv.textual_ret.contains(&starts[0]),
             lv.textual_ret.contains(&starts[1])
         );
+    }
+
+    /// The `straight_effect` memo answers exactly what the uncached
+    /// derivation answers, on a line set that walks every branch of it
+    /// (pure write at full and partial width, load, self-xor zeroing and a
+    /// non-self xor, RMW, xchg, string op, unknown mnemonic, push/pop, the
+    /// implicit-operand kills `cltd`/`syscall`, the partial implicit write
+    /// `lahf`, cmov).  The second round must be served from the memo, line
+    /// for line: the hit counter proves it rather than inferring it.
+    #[test]
+    fn straight_effect_memo_answers_like_the_uncached_derivation() {
+        let asm = concat!(
+            "    movq %rdi, %rax\n",
+            "    movl %esi, %eax\n",
+            "    movb %sil, %al\n",
+            "    movq (%rax), %rax\n",
+            "    xorl %eax, %eax\n",
+            "    xorl %ecx, %eax\n",
+            "    addq %rdx, %rcx\n",
+            "    xchgq %rax, %rbx\n",
+            "    rep movsb\n",
+            "    frobnicate %r8, %r9\n",
+            "    pushq %rbx\n",
+            "    popq %r12\n",
+            "    cltd\n",
+            "    syscall\n",
+            "    lahf\n",
+            "    cmovneq %rsi, %rdi\n",
+        );
+        let store = LineStore::new(asm.to_string());
+        let infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let real: Vec<usize> = (0..store.len()).filter(|&n| !infos[n].is_nop()).collect();
+        assert!(real.len() >= 16, "every fixture line must be classified");
+        // Distinct texts: the first round can only miss (or hit an entry a
+        // previous test on this thread left, which is equally exact).
+        for round in 0..2 {
+            let hits_before = EFFECT_MEMO_HITS.with(|c| c.get());
+            for &n in &real {
+                let t = infos[n].trimmed(store.get(n));
+                let memo = FileLiveness::straight_effect(&infos, n, t);
+                let raw = FileLiveness::straight_effect_uncached(&infos[n], t);
+                assert_eq!(
+                    (memo.reads, memo.writes),
+                    (raw.reads, raw.writes),
+                    "round {round}: `{t}`"
+                );
+            }
+            if round == 1 {
+                assert_eq!(
+                    EFFECT_MEMO_HITS.with(|c| c.get()) - hits_before,
+                    real.len() as u64,
+                    "the second round must be served from the memo"
+                );
+            }
+        }
+    }
+
+    /// The memo key covers the classification, not just the text: a pass
+    /// that re-types a line without editing it (as `passes/mod.rs` does to
+    /// `kind`) or widens its `reg_refs` must get the derivation for the NEW
+    /// classification.  A text-only key would hand back the stale write of
+    /// `%rax` here and keep a dead value's producer alive -- or, the other
+    /// way round, drop a live one.
+    #[test]
+    fn straight_effect_memo_key_covers_kind_and_reg_refs() {
+        let store = LineStore::new("    movq %rdi, %rax\n".to_string());
+        let mut infos = vec![classify_line(store.get(0))];
+        let t = infos[0].trimmed(store.get(0)).to_string();
+        assert!(matches!(infos[0].kind, LineKind::Other { dest_reg: 0 }));
+        let typed = FileLiveness::straight_effect(&infos, 0, &t);
+        assert_eq!(typed.writes, RAX, "`movq %rdi, %rax` kills %rax");
+
+        infos[0].kind = LineKind::Other { dest_reg: REG_NONE };
+        let retyped = FileLiveness::straight_effect(&infos, 0, &t);
+        let raw = FileLiveness::straight_effect_uncached(&infos[0], &t);
+        assert_eq!((retyped.reads, retyped.writes), (raw.reads, raw.writes));
+        assert_eq!(retyped.writes, 0, "no destination, no kill");
+
+        infos[0].reg_refs |= 1 << 9;
+        let widened = FileLiveness::straight_effect(&infos, 0, &t);
+        let raw = FileLiveness::straight_effect_uncached(&infos[0], &t);
+        assert_eq!((widened.reads, widened.writes), (raw.reads, raw.writes));
+        assert_ne!(widened.reads & (1 << 9), 0, "a mentioned family is read");
+
+        // And back: the entry was replaced, not shadowed, so the original
+        // classification is still answered exactly.
+        infos[0] = classify_line(store.get(0));
+        let again = FileLiveness::straight_effect(&infos, 0, &t);
+        assert_eq!((again.reads, again.writes), (typed.reads, typed.writes));
     }
 }

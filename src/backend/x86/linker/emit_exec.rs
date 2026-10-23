@@ -303,81 +303,25 @@ pub(super) fn emit_executable(
 
     // ── Build .gnu.version (versym) and .gnu.version_r (verneed) data ──
     //
-    // Collect version requirements from dynamic symbols, grouped by library.
-    let mut lib_versions: FxHashMap<String, BTreeSet<String>> = FxHashMap::default();
-    for name in &dyn_sym_names {
-        if let Some(gs) = globals.get(name) {
-            if gs.is_dynamic {
-                if let Some(ref ver) = gs.version {
-                    if let Some(ref lib) = gs.from_lib {
-                        lib_versions
-                            .entry(lib.clone())
-                            .or_default()
-                            .insert(ver.clone());
-                    }
-                }
-            }
+    // Version requirements of the imports, one `Verneed` per NEEDED provider
+    // (`linker_common::symver`, shared by every lccc-ld dynamic output).
+    let import_version = |name: &String| {
+        let gs = globals.get(name)?;
+        if !gs.is_dynamic {
+            return None;
         }
+        Some((gs.from_lib.as_deref()?, gs.version.as_deref()?))
+    };
+    let verneed_plan = linker_common::symver::VerneedPlan::new(
+        dyn_sym_names.iter().filter_map(import_version),
+        needed_sonames,
+        2,
+    )?;
+    for s in verneed_plan.strings() {
+        dynstr.add(s);
     }
-
-    // Build version index mapping: (library, version_string) -> version index (starting at 2)
-    let mut ver_index_map: FxHashMap<(String, String), u16> = FxHashMap::default();
-    let mut ver_idx: u16 = 2;
-    let mut lib_ver_list: Vec<(String, Vec<String>)> = Vec::new();
-    let mut sorted_libs: Vec<String> = lib_versions.keys().cloned().collect();
-    sorted_libs.sort();
-    for lib in &sorted_libs {
-        let vers: Vec<String> = lib_versions[lib].iter().cloned().collect();
-        for v in &vers {
-            ver_index_map.insert((lib.clone(), v.clone()), ver_idx);
-            ver_idx += 1;
-            // Add version string to dynstr
-            dynstr.add(v);
-        }
-        lib_ver_list.push((lib.clone(), vers));
-    }
-
-    // Build .gnu.version_r (verneed) section
-    let mut verneed_data: Vec<u8> = Vec::new();
-    let mut verneed_count: u32 = 0;
-    // Only include libraries that are in our needed list
-    let lib_ver_needed: Vec<(String, Vec<String>)> = lib_ver_list
-        .iter()
-        .filter(|(lib, _)| needed_sonames.contains(lib))
-        .cloned()
-        .collect();
-    for (lib_i, (lib, vers)) in lib_ver_needed.iter().enumerate() {
-        let lib_name_off = dynstr.get_offset(lib);
-        let is_last_lib = lib_i == lib_ver_needed.len() - 1;
-
-        // Verneed entry header (16 bytes)
-        verneed_data.extend_from_slice(&1u16.to_le_bytes()); // vn_version = 1
-        verneed_data.extend_from_slice(&(vers.len() as u16).to_le_bytes()); // vn_cnt
-        verneed_data.extend_from_slice(&(lib_name_off as u32).to_le_bytes()); // vn_file
-        verneed_data.extend_from_slice(&16u32.to_le_bytes()); // vn_aux (right after header)
-        let next_off = if is_last_lib {
-            0u32
-        } else {
-            16 + vers.len() as u32 * 16
-        };
-        verneed_data.extend_from_slice(&next_off.to_le_bytes()); // vn_next
-        verneed_count += 1;
-
-        // Vernaux entries for each version (16 bytes each)
-        for (v_i, ver) in vers.iter().enumerate() {
-            let ver_name_off = dynstr.get_offset(ver);
-            let vidx = ver_index_map[&(lib.clone(), ver.clone())];
-            let is_last_ver = v_i == vers.len() - 1;
-
-            let vna_hash = linker_common::sysv_hash(ver.as_bytes());
-            verneed_data.extend_from_slice(&vna_hash.to_le_bytes()); // vna_hash
-            verneed_data.extend_from_slice(&0u16.to_le_bytes()); // vna_flags
-            verneed_data.extend_from_slice(&vidx.to_le_bytes()); // vna_other
-            verneed_data.extend_from_slice(&(ver_name_off as u32).to_le_bytes()); // vna_name
-            let vna_next: u32 = if is_last_ver { 0 } else { 16 };
-            verneed_data.extend_from_slice(&vna_next.to_le_bytes()); // vna_next
-        }
-    }
+    let verneed_data = verneed_plan.encode(|s| dynstr.get_offset(s) as u32);
+    let verneed_count = verneed_plan.file_count() as u32;
 
     let verneed_size = verneed_data.len() as u64;
 
@@ -593,19 +537,11 @@ pub(super) fn emit_executable(
     for name in &dyn_sym_names {
         if let Some(gs) = globals.get(name) {
             if gs.is_dynamic {
-                if let Some(ref ver) = gs.version {
-                    if let Some(ref lib) = gs.from_lib {
-                        let idx = ver_index_map
-                            .get(&(lib.clone(), ver.clone()))
-                            .copied()
-                            .unwrap_or(1);
-                        versym_data.extend_from_slice(&idx.to_le_bytes());
-                    } else {
-                        versym_data.extend_from_slice(&1u16.to_le_bytes()); // VER_NDX_GLOBAL
-                    }
-                } else {
-                    versym_data.extend_from_slice(&1u16.to_le_bytes()); // VER_NDX_GLOBAL
-                }
+                let idx = match gs.from_lib.as_deref() {
+                    Some(lib) => verneed_plan.index_of(lib, gs.version.as_deref()),
+                    None => linker_common::symver::VER_NDX_GLOBAL,
+                };
+                versym_data.extend_from_slice(&idx.to_le_bytes());
             } else if gs.section_idx != SHN_UNDEF && gs.value != 0 {
                 // Defined/exported symbol: VER_NDX_GLOBAL
                 versym_data.extend_from_slice(&1u16.to_le_bytes());
@@ -716,15 +652,13 @@ pub(super) fn emit_executable(
     let has_fini_array = output_sections
         .iter()
         .any(|s| s.name == ".fini_array" && s.mem_size > 0);
-    // `.init`/`.fini` (from crti/crtn): present with content on every normal
-    // dynamic link.  The addresses are NOT final yet (layout runs below), so
-    // only the predicates live here; emission looks the addresses up by name.
-    let has_init = output_sections
-        .iter()
-        .any(|s| s.name == ".init" && s.mem_size > 0);
-    let has_fini = output_sections
-        .iter()
-        .any(|s| s.name == ".fini" && s.mem_size > 0);
+    // GNU ld's rule: DT_INIT/DT_FINI exist iff the image defines `_init`/`_fini`
+    // (crti.o's frame around the `.init`/`.fini` fragments) and record that
+    // symbol.  A `.init` with no `_init` (a `-nostartfiles` fragment with no
+    // prologue and no `ret`) gets no tag: ld.so would run off its end.  The
+    // presence is decided here, before layout; the values are read at
+    // emission once symbol addresses are final.
+    let (has_init, has_fini) = linker_common::image_init_fini(globals);
     // DT_RELACOUNT: the count of leading R_X86_64_RELATIVE entries in
     // .rela.dyn, which ld.so uses to bound the slide pass.  The writer
     // below emits all RELATIVE entries first (pie_relative, then the GOT
@@ -1401,6 +1335,8 @@ pub(super) fn emit_executable(
             entry.section_idx = SHN_ABS;
         }
     }
+
+    super::link::tls_module_base_value(globals, tls_addr, tls_mem_size, true);
 
     // Auto-generate __start_<section> / __stop_<section> symbols (GNU ld feature).
     // These are created for output sections whose names are valid C identifiers,
@@ -2520,30 +2456,13 @@ pub(super) fn emit_executable(
             w64(&mut out, dd + 8, so as u64);
             dd += 16;
         }
-        // DT_INIT/DT_FINI: the .init/.fini section addresses (crti/crtn put
-        // _init/_fini at the section starts, so this equals the symbol
-        // values on every normal link — verified against bfd).  Placed
-        // right after NEEDED as in bfd.  The lookups cannot miss: `has_init`
-        // / `has_fini` above test the same predicate.
-        if has_init {
-            let init_addr = output_sections
-                .iter()
-                .find(|s| s.name == ".init")
-                .map(|s| s.addr)
-                .unwrap_or(0);
-            w64(&mut out, dd, DT_INIT as u64);
-            w64(&mut out, dd + 8, init_addr);
-            dd += 16;
-        }
-        if has_fini {
-            let fini_addr = output_sections
-                .iter()
-                .find(|s| s.name == ".fini")
-                .map(|s| s.addr)
-                .unwrap_or(0);
-            w64(&mut out, dd, DT_FINI as u64);
-            w64(&mut out, dd + 8, fini_addr);
-            dd += 16;
+        // DT_INIT/DT_FINI (presence fixed above), right after NEEDED as in bfd.
+        for (present, name, tag) in [(has_init, "_init", DT_INIT), (has_fini, "_fini", DT_FINI)] {
+            if present {
+                w64(&mut out, dd, tag as u64);
+                w64(&mut out, dd + 8, globals.get(name).map_or(0, |g| g.value));
+                dd += 16;
+            }
         }
         for &(tag, val) in &[
             (DT_STRTAB, dynstr_addr),
@@ -3348,6 +3267,23 @@ pub(super) fn emit_executable(
                         w64(&mut out, fp, v as u64);
                     }
                     R_X86_64_TPOFF32 => {
+                        // A Local-Exec offset exists only for the
+                        // executable's own TLS block: a variable a shared
+                        // library defines lives in that library's module
+                        // (GNU ld: "unresolvable R_X86_64_TPOFF32
+                        // relocation"). Writing (0 - block) would read
+                        // another thread-pointer-relative word silently.
+                        let global = (!sym.name.is_empty() && !sym.is_local())
+                            .then(|| globals_snap.get(sym.name.as_str()))
+                            .flatten();
+                        if global.is_some_and(|g| g.is_dynamic) {
+                            return Err(format!(
+                                "{obj_name}: unresolvable R_X86_64_TPOFF32 relocation against \
+                                 shared-library TLS symbol '{}': a Local-Exec access needs a \
+                                 definition in the executable (drop -ftls-model=local-exec)",
+                                sym.name
+                            ));
+                        }
                         // Initial Exec TLS: value = (sym_addr - tls_addr) - tls_mem_size
                         // %fs:0 points past end of TLS block on x86-64
                         let tpoff = (s as i64 - tls_addr as i64) - tls_mem_size as i64;
@@ -3542,13 +3478,15 @@ pub(super) fn emit_executable(
                 // 20 000-function link -- so that copy was pure waste. The
                 // immutable borrow ends when `hdr` is produced, which is
                 // before `out` is borrowed mutably, so NLL accepts this.
-                let hdr = linker_common::build_eh_frame_hdr(
+                let mut hdr = vec![0u8; eh_frame_hdr_size as usize];
+                linker_common::write_eh_frame_hdr(
+                    &mut hdr,
                     &out[ef_start..ef_end],
                     ef.addr,
                     eh_frame_hdr_vaddr,
                     true,
                 );
-                if !hdr.is_empty() && eh_frame_hdr_offset as usize + hdr.len() <= out.len() {
+                if eh_frame_hdr_offset as usize + hdr.len() <= out.len() {
                     write_bytes(&mut out, eh_frame_hdr_offset as usize, &hdr);
                 }
             }
