@@ -316,6 +316,38 @@ impl DataFixup {
     }
 }
 
+/// Append `padding` bytes of code fill (GAS's fill law, see
+/// [`ElfWriterBase::align_to_capped_ex`]): NOPs on their natural grid,
+/// the bytes that cannot host one filled from the front with the largest
+/// encoding that fits.
+fn push_code_fill(
+    data: &mut Vec<u8>,
+    padding: usize,
+    nop: &[u8; 4],
+    small_nop: Option<([u8; 2], u64)>,
+) {
+    let start = data.len() as u64;
+    let end = start + padding as u64;
+    let mut pos = start;
+    while pos < end {
+        let room = end - pos;
+        if pos % 4 == 0 && room >= 4 {
+            data.extend_from_slice(nop);
+            pos += 4;
+        } else if let Some((sb, ss)) = small_nop
+            && pos % ss == 0
+            && room >= ss
+        {
+            data.extend_from_slice(&sb);
+            pos += ss;
+        } else {
+            data.push(0);
+            pos += 1;
+        }
+    }
+    debug_assert_eq!(pos, end, "fill law must cover the pad exactly");
+}
+
 /// A data value that could not be assembled where it stands.
 #[derive(Clone, Debug)]
 pub struct PendingData {
@@ -363,6 +395,27 @@ pub struct ElfWriterBase {
     pub sets: FxHashMap<String, SetValue>,
     /// Data values deferred to [`Self::resolve_pending_data`].
     pub pending_data: Vec<PendingData>,
+    /// Data values name labels of executable sections symbolically: a
+    /// difference of two such labels is an ADD/SUB pair and a lone one is
+    /// relocated against by name, never folded to a constant or rewritten to
+    /// section+offset.  RISC-V with linker relaxation (GNU as: no local
+    /// subtraction across relaxable code, `tc_fix_adjustable` 0 for code),
+    /// where the linker deletes bytes between labels after assembly.  Read
+    /// when data values are captured and again when they are resolved, so a
+    /// target may change it before [`Self::resolve_pending_data`] (GNU as
+    /// decides by the relax state at the end of the input).  Off for every
+    /// other target.
+    pub keep_code_labels: bool,
+    /// Evaluation mode: [`Self::keep_code_labels`] is in force for the data
+    /// value being captured or resolved right now.  Set only around those two
+    /// entry points, so `.set`, `.org`, `.fill` and the rest keep folding
+    /// code-label differences to constants exactly as GNU as does.
+    code_labels_symbolic: std::cell::Cell<bool>,
+    /// The synthetic label standing for `.` in the data value being captured
+    /// (GNU as's `.L0 `), when `.` is a code location that must stay symbolic.
+    dot_label: Option<String>,
+    /// Counter for [`Self::dot_label`] names.
+    dot_labels: u32,
     /// Section stack for .pushsection/.popsection (saves both current and previous section)
     section_stack: Vec<(String, String)>,
     /// Previous section for .section/.previous swapping
@@ -387,14 +440,17 @@ pub struct ElfWriterBase {
     /// pad at offset 1 on rv64gc is `00 01 00 13 00 00 00` — zero, `c.nop`,
     /// `nop` — and a table with one entry cannot spell that.
     small_nop: Option<([u8; 2], u64)>,
-    /// Smallest alignment ever recorded for an executable section, or 0 for no
-    /// floor. RISC-V sets 4: GNU as 2.47 raises `.p2align 0' and `.p2align 1'
-    /// in `.text' to a 4-byte boundary and records `sh_addralign` 4 (measured:
-    /// payload 1 + `.p2align 1` -> size 4, addralign 2**2), because the padding
-    /// run is written on the NOP grid and that grid starts at the uncompressed
-    /// instruction size. `.data` keeps what was asked for (same cell: size 2,
-    /// addralign 2**1), and AArch64 has no floor at all — `.p2align 1` there
-    /// aligns to 2 exactly.
+    /// Smallest alignment an alignment directive records for an executable
+    /// section, or 0 for no floor.  It raises `sh_addralign` only: the
+    /// directive pads to what it asked for.  RISC-V sets its instruction
+    /// alignment, 2 with RVC and 4 without (GNU as 2.47, measured with the
+    /// march spelled out: `.byte 1; .p2align 0,,3; .byte 2` is `01 02` at
+    /// addralign 2 for rv64gc and `01 02` -- plus a 2-byte tail -- at
+    /// addralign 4 for rv64imafd; `.p2align 1` puts the next byte at offset
+    /// 2 in both).  An earlier reading took the tail GNU as pads a code
+    /// section with for padding of the directive, and was measured under a
+    /// default march without C, so it raised the directive itself to 4.
+    /// `.data` keeps what was asked for, and AArch64 has no floor at all.
     code_align_floor: u64,
     /// The alignment an *instruction* raises the current section to, not the
     /// alignment `.text` is created with: 4 for ARM/AArch64, 2 for RISC-V (the
@@ -414,6 +470,18 @@ impl ElfWriterBase {
     pub fn with_small_nop(mut self, bytes: [u8; 2]) -> Self {
         self.small_nop = Some((bytes, 2));
         self
+    }
+
+    /// See [`Self::code_align_floor`]; for a target whose instruction
+    /// alignment changes mid-input (RISC-V `.option rvc`/`norvc`).
+    pub fn set_code_align_floor(&mut self, floor: u64) {
+        self.code_align_floor = floor;
+    }
+
+    /// The alignment an instruction records for its section (the `new`
+    /// argument), for a target whose instruction size changes mid-input.
+    pub fn set_text_align(&mut self, align: u64) {
+        self.text_align = align;
     }
 
     /// See [`Self::code_align_floor`].
@@ -440,6 +508,10 @@ impl ElfWriterBase {
             aliases: FxHashMap::default(),
             sets: FxHashMap::default(),
             pending_data: Vec::new(),
+            keep_code_labels: false,
+            code_labels_symbolic: std::cell::Cell::new(false),
+            dot_label: None,
+            dot_labels: 0,
             section_stack: Vec::new(),
             previous_section: String::new(),
             nop_bytes,
@@ -847,22 +919,38 @@ impl ElfWriterBase {
         max_pad: Option<u64>,
         fill: Option<u8>,
     ) -> Result<(), String> {
+        self.align_impl(align, max_pad, fill, true)
+    }
+
+    /// Pad the current section to `align` with code fill, ignoring
+    /// [`Self::code_align_floor`]: RISC-V's step to the instruction alignment
+    /// in front of an `R_RISCV_ALIGN` run (GNU as 2.44, measured: at offset 5
+    /// the run starts at 6, after one zero byte), which is not a directive's
+    /// alignment and so is not subject to the directive floor.
+    pub fn align_code_step(&mut self, align: u64) -> Result<(), String> {
+        self.align_impl(align, None, None, false)
+    }
+
+    fn align_impl(
+        &mut self,
+        align: u64,
+        max_pad: Option<u64>,
+        fill: Option<u8>,
+        floor: bool,
+    ) -> Result<(), String> {
         self.ensure_default_section();
-        // The floor is decided before the `align <= 1` no-op test, because on
-        // a section that needs one the raising *is* the work the directive asks
-        // for (see [`Self::code_align_floor`]).
-        let align = if self.code_align_floor > 0
-            && align < self.code_align_floor
-            && self
-                .sections
-                .get(&self.current_section)
-                .is_some_and(|s| s.sh_flags & SHF_EXECINSTR != 0)
-        {
+        // The floor is recorded before the `align <= 1` no-op test: a
+        // `.p2align 0` in code pads nothing but still raises the section's
+        // alignment (see [`Self::code_align_floor`]).
+        let floor_align = if floor && self.is_exec_section(&self.current_section.clone()) {
             self.code_align_floor
         } else {
-            align
+            0
         };
         if align <= 1 {
+            if let Some(section) = self.sections.get_mut(&self.current_section) {
+                section.sh_addralign = section.sh_addralign.max(floor_align);
+            }
             return Ok(());
         }
         let nop = self.nop_bytes.clone();
@@ -935,36 +1023,37 @@ impl ElfWriterBase {
                     // but a byte-for-byte divergence from the oracle, and on
                     // aarch64 a NOP straddling the requested boundary is what an
                     // instruction-aligned fetch of the *pad* would trip over.
-                    let start = section.data.len() as u64;
-                    let end = start + padding as u64;
-                    let mut pos = start;
-                    while pos < end {
-                        let room = end - pos;
-                        if pos % 4 == 0 && room >= 4 {
-                            section.data.extend_from_slice(&nop);
-                            pos += 4;
-                        } else if let Some((sb, ss)) = small_nop {
-                            if pos % ss == 0 && room >= ss {
-                                section.data.extend_from_slice(&sb);
-                                pos += ss;
-                            } else {
-                                section.data.push(0);
-                                pos += 1;
-                            }
-                        } else {
-                            section.data.push(0);
-                            pos += 1;
-                        }
-                    }
-                    debug_assert_eq!(pos, end, "fill law must cover the pad exactly");
+                    push_code_fill(&mut section.data, padding, &nop, small_nop);
                 } else {
                     section.data.extend(std::iter::repeat_n(0u8, padding));
                 }
             }
             // GAS records the alignment even when the pad was skipped.
-            if align > section.sh_addralign {
-                section.sh_addralign = align;
-            }
+            section.sh_addralign = section.sh_addralign.max(align).max(floor_align);
+        }
+        Ok(())
+    }
+
+    /// Append exactly `n` bytes of code fill (the [`Self::align_to_capped_ex`]
+    /// vocabulary) to the current section and raise its `sh_addralign` to
+    /// `align`: RISC-V's worst-case `R_RISCV_ALIGN` run, whose length is
+    /// decided by the directive, not by the current offset.
+    pub fn emit_code_nops(&mut self, n: u64, align: u64) -> Result<(), String> {
+        self.ensure_default_section();
+        let n = usize::try_from(n)
+            .ok()
+            .filter(|&n| n <= MAX_DIRECTIVE_FILL)
+            .ok_or_else(|| {
+                format!(
+                    "alignment padding of {n} bytes exceeds the {MAX_DIRECTIVE_FILL}-byte limit"
+                )
+            })?;
+        self.charge_fill(n)?;
+        let nop = self.nop_bytes;
+        let small_nop = self.small_nop;
+        if let Some(section) = self.sections.get_mut(&self.current_section) {
+            push_code_fill(&mut section.data, n, &nop, small_nop);
+            section.sh_addralign = section.sh_addralign.max(align);
         }
         Ok(())
     }
@@ -1424,6 +1513,9 @@ impl ElfWriterBase {
 
     fn capture_symbol_at(&self, name: &str, section: &str, offset: u64, depth: u32) -> SymValue {
         if name == "." {
+            if let Some(dot) = &self.dot_label {
+                return SectionExpr::term(ExprBase::Sym(dot.clone()), 1);
+            }
             return SectionExpr::at(ExprBase::Sec(section.to_string()), offset as i64);
         }
         if self.labels.contains_key(name) && self.is_global_or_weak(name) {
@@ -1438,7 +1530,7 @@ impl ElfWriterBase {
             None => {}
         }
         if let Some((sec, off)) = self.labels.get(name) {
-            return SectionExpr::at(ExprBase::Sec(sec.clone()), *off as i64);
+            return self.label_term(name, sec, *off);
         }
         if self.is_section_name(name) {
             return SectionExpr::at(ExprBase::Sec(name.to_string()), 0);
@@ -1461,6 +1553,12 @@ impl ElfWriterBase {
                 eval_section_expr::<ExprBase>(expr, |_| Ok(SectionExpr::absolute(0)))
                     .map_err(|_| e)?;
                 let mut captured: Vec<(String, SymValue)> = Vec::new();
+                if let Some(dot) = &self.dot_label {
+                    captured.push((
+                        ".".to_string(),
+                        SectionExpr::term(ExprBase::Sym(dot.clone()), 1),
+                    ));
+                }
                 for name in crate::backend::asm_expr::expr_symbols(expr)? {
                     if self.sets.contains_key(&name) && !captured.iter().any(|(n, _)| *n == name) {
                         let v = self.capture_symbol(&name, &section, offset);
@@ -1532,7 +1630,23 @@ impl ElfWriterBase {
         }
     }
 
-    fn remap_place(remap: &SubsectionRemap, section: &str, offset: u64) -> (String, u64) {
+    /// The value of label `name`, defined at `sec + off`: section-relative,
+    /// unless it is a code label and [`Self::code_labels_symbolic`] holds.
+    fn label_term(&self, name: &str, sec: &str, off: u64) -> SymValue {
+        if self.code_labels_symbolic.get() && self.is_exec_section(sec) {
+            SectionExpr::term(ExprBase::Sym(name.to_string()), 1)
+        } else {
+            SectionExpr::at(ExprBase::Sec(sec.to_string()), off as i64)
+        }
+    }
+
+    fn is_exec_section(&self, sec: &str) -> bool {
+        self.sections
+            .get(sec)
+            .is_some_and(|s| s.sh_flags & SHF_EXECINSTR != 0)
+    }
+
+    pub fn remap_place(remap: &SubsectionRemap, section: &str, offset: u64) -> (String, u64) {
         match remap.get(section) {
             Some((parent, adj)) => (parent.clone(), offset + adj),
             None => (section.to_string(), offset),
@@ -1585,7 +1699,7 @@ impl ElfWriterBase {
             None => {}
         }
         if let Some((sec, off)) = self.labels.get(name) {
-            return Ok(SectionExpr::at(ExprBase::Sec(sec.clone()), *off as i64));
+            return Ok(self.label_term(name, sec, *off));
         }
         if self.is_section_name(name) {
             return Ok(SectionExpr::at(ExprBase::Sec(name.to_string()), 0));
@@ -1608,7 +1722,7 @@ impl ElfWriterBase {
     ) -> Result<SymValue, String> {
         let (sec, off) = Self::remap_place(remap, section, offset);
         eval_section_expr(expr, |n| {
-            if n == "." {
+            if n == "." && !captured.iter().any(|(c, _)| c == ".") {
                 return Ok(SectionExpr::at(ExprBase::Sec(sec.clone()), off as i64));
             }
             let v = match captured.iter().find(|(c, _)| c == n) {
@@ -1632,13 +1746,14 @@ impl ElfWriterBase {
         }
     }
 
-    /// Replace every defined label still held by name with `section + offset`.
+    /// Replace every defined label still held by name with `section + offset`
+    /// (code labels excepted while [`Self::code_labels_symbolic`]).
     fn fold_defined(&self, v: &SymValue) -> SymValue {
         let mut out = SectionExpr::absolute(v.constant);
         for (base, coeff) in v.terms() {
             let t = match base {
                 ExprBase::Sym(n) => match self.labels.get(n) {
-                    Some((sec, off)) => SectionExpr::at(ExprBase::Sec(sec.clone()), *off as i64),
+                    Some((sec, off)) => self.label_term(n, sec, *off),
                     None => SectionExpr::term(base.clone(), 1),
                 },
                 ExprBase::Sec(_) => SectionExpr::term(base.clone(), 1),
@@ -1730,6 +1845,31 @@ impl ElfWriterBase {
     /// operand substitution) at the current position, for a data directive.
     pub fn capture_data_symbol(&mut self, name: &str) -> Result<SetValue, String> {
         self.ensure_default_section();
+        if !self.keep_code_labels {
+            return self.capture_data_symbol_inner(name);
+        }
+        // `.` at a code location moves with the code around it: give it a
+        // label of its own (GNU as's `.L0 `), defined only when named.
+        if self.is_exec_section(&self.current_section.clone())
+            && (name == "."
+                || crate::backend::asm_expr::expr_symbols(name)?
+                    .iter()
+                    .any(|n| n == "."))
+        {
+            let dot = format!(".L0\u{1}{}", self.dot_labels);
+            self.dot_labels += 1;
+            let at = (self.current_section.clone(), self.current_offset());
+            self.labels.insert(dot.clone(), at);
+            self.dot_label = Some(dot);
+        }
+        self.code_labels_symbolic.set(true);
+        let captured = self.capture_data_symbol_inner(name);
+        self.code_labels_symbolic.set(false);
+        self.dot_label = None;
+        captured
+    }
+
+    fn capture_data_symbol_inner(&mut self, name: &str) -> Result<SetValue, String> {
         if is_bare_symbol(name) || name == "." {
             let (section, offset) = (self.current_section.clone(), self.current_offset());
             return Ok(SetValue::Value(self.capture_symbol(name, &section, offset)));
@@ -1764,6 +1904,16 @@ impl ElfWriterBase {
         remap: &SubsectionRemap,
     ) -> Result<Vec<(String, u64, usize, DataFixup)>, String> {
         self.finalize_sets(remap)?;
+        self.code_labels_symbolic.set(self.keep_code_labels);
+        let resolved = self.resolve_pending_data_inner(remap);
+        self.code_labels_symbolic.set(false);
+        resolved
+    }
+
+    fn resolve_pending_data_inner(
+        &mut self,
+        remap: &SubsectionRemap,
+    ) -> Result<Vec<(String, u64, usize, DataFixup)>, String> {
         let mut out = Vec::new();
         for p in std::mem::take(&mut self.pending_data) {
             let (section, offset) = Self::remap_place(remap, &p.section, p.offset);
@@ -1803,6 +1953,31 @@ impl ElfWriterBase {
             }
         }
         Ok(out)
+    }
+
+    /// A deferred value resolved twice, after [`Self::resolve_pending_data`]:
+    /// as relocations would name it (under [`Self::keep_code_labels`]) and as
+    /// the constant it has at assembly time, if any.  RISC-V `.uleb128`, whose
+    /// bytes hold the assembly-time value even when relocations follow
+    /// (the linker rewrites them in place, keeping their length).
+    pub fn resolve_value(
+        &self,
+        value: &SetValue,
+        remap: &SubsectionRemap,
+    ) -> Result<(DataFixup, Option<i64>), String> {
+        self.code_labels_symbolic.set(self.keep_code_labels);
+        let symbolic = self
+            .final_set_value(value, remap)
+            .and_then(|v| self.classify(&v));
+        self.code_labels_symbolic.set(false);
+        let folded = self
+            .final_set_value(value, remap)
+            .and_then(|v| self.classify(&v))?;
+        let constant = match folded {
+            DataFixup::Constant(c) => Some(c),
+            _ => None,
+        };
+        Ok((symbolic?, constant))
     }
 
     /// Record a relocation at an explicit place (deferred data values).
@@ -1881,6 +2056,13 @@ impl ElfWriterBase {
     }
 
     /// Emit placeholder bytes for a deferred value (symbol diff, etc.).
+    /// `n` zero bytes for a value written later (see [`Self::emit_placeholder`]
+    /// for the NOBITS rule).
+    pub fn emit_placeholder_bytes(&mut self, n: usize) -> Result<(), String> {
+        self.nobits_guard(true)?;
+        self.emit_bytes(&vec![0u8; n])
+    }
+
     pub fn emit_placeholder(&mut self, size: usize) -> Result<(), String> {
         // The deferred value is unknown here; treat it as non-zero until
         // proven otherwise — a NOBITS section must not receive content
@@ -1983,6 +2165,16 @@ impl ElfWriterBase {
             }
         }
         symbols.append(&mut self.extra_symbols);
+
+        // Relocations in offset order, as GNU as writes them: consumers walk
+        // them with a cursor (bfd's `.eh_frame` parser rejects the section
+        // -- "no .eh_frame_hdr table will be created" -- when the FDE fields
+        // resolved after the data fixups come out of order). The sort is
+        // stable, so entries at one offset (ADD/SUB, SET/SUB, HI20 + RELAX)
+        // keep their emission order, which is significant.
+        for sec in self.sections.values_mut() {
+            sec.relocs.sort_by_key(|r| r.offset);
+        }
 
         let elf_bytes =
             write_relocatable_object(config, &self.section_order, &self.sections, &symbols)?;

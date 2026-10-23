@@ -1353,6 +1353,14 @@ fn has_unmodelled_effects(line: &str) -> bool {
 ///     afterwards*, and no unmodelled instruction.  A far `jump` uses t6 as its
 ///     scratch, so t6 is never renamed across one.
 ///  4. s0 (frame pointer), ra and sp are never renamed.
+/// `sb`/`sh`/`sw`/`sd` and the FP stores: they read every register they name.
+fn is_gp_store(line: &str) -> bool {
+    matches!(
+        line.trim().split_whitespace().next().unwrap_or(""),
+        "sb" | "sh" | "sw" | "sd" | "fsh" | "fsw" | "fsd" | "fsq"
+    )
+}
+
 fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize) -> bool {
     fn mentions(line: &str, reg: u8) -> bool {
         let name = reg_name(reg);
@@ -1408,6 +1416,24 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
             };
             let i = i - 1;
             if dst == src || !renamable(dst) || !renamable(src) {
+                continue;
+            }
+            // The rename rewrites every later mention of `dst` -- including
+            // the epilogue restore of a callee-saved `dst` -- so `dst` is never
+            // written again and the caller gets back whatever it held just
+            // before the copy. That is the caller's own value only when nothing
+            // in the (straight-line) entry run touched it first; the prologue
+            // save is a store, and RISC-V stores never write a GP register.
+            // `mv s1, a0; mv s2, s1; mv s1, a1` would return a0 in s1.
+            if (REG_S1..=REG_S11).contains(&dst)
+                && (fstart + 1..i).any(|k| {
+                    !matches!(
+                        kinds[k],
+                        LineKind::Nop | LineKind::Directive | LineKind::Label
+                    ) && (implicitly_writes_rv(&lines[k], dst)
+                        || (mentions(&lines[k], dst) && !is_gp_store(&lines[k])))
+                })
+            {
                 continue;
             }
             let mut ok = true;
@@ -1467,7 +1493,8 @@ fn coalesce_entry_copies(lines: &mut [String], kinds: &mut [LineKind], n: usize)
                 if kinds[k] == LineKind::Nop {
                     continue;
                 }
-                let new = crate::backend::peephole_common::replace_whole_word(&lines[k], &d, &s);
+                let new =
+                    crate::backend::peephole_common::rename_register_operand(&lines[k], &d, &s);
                 if new != lines[k] {
                     lines[k] = new;
                     kinds[k] = classify_line(&lines[k]);
@@ -2352,6 +2379,51 @@ fn extract_s0_offset_from_line(line: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A parameter copied into a callee-saved home that the entry run already
+    /// used as a temporary: renaming the copy also renamed the epilogue
+    /// restore of s1, and s1 returned holding the first parameter.
+    #[test]
+    fn entry_coalescing_keeps_the_restore_of_a_rewritten_callee_saved_dst() {
+        let asm = "f:\n    addi sp, sp, -32\n    sd ra, 24(sp)\n    sd s1, 16(sp)\n    sd s2, 8(sp)\n    mv s1, a0\n    mv s2, s1\n    mv s1, a1\n    add a0, s1, s2\n    ld s1, 16(sp)\n    ld s2, 8(sp)\n    ld ra, 24(sp)\n    addi sp, sp, 32\n    ret\n";
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        assert!(
+            matches!(
+                kinds[7],
+                LineKind::Move {
+                    dst: REG_S1,
+                    src: REG_A1
+                }
+            ),
+            "fixture premise: the copy is a coalescing candidate"
+        );
+        while coalesce_entry_copies(&mut lines, &mut kinds, n) {}
+        let live: Vec<&str> = lines
+            .iter()
+            .zip(&kinds)
+            .filter(|(_, k)| **k != LineKind::Nop)
+            .map(|(l, _)| l.trim())
+            .collect();
+        assert!(live.contains(&"ld s1, 16(sp)"), "{live:#?}");
+        assert!(!live.iter().any(|l| l.starts_with("ld a1")), "{live:#?}");
+    }
+
+    /// A global named like a register keeps its name through the rename.
+    #[test]
+    fn entry_coalescing_does_not_rename_register_named_symbols() {
+        let asm = "f:\n    mv t3, a1\n    lga t0, t3\n    ld t0, 0(t0)\n    add a0, t3, t0\n    call t3\n    ret\n";
+        let mut lines: Vec<String> = asm.lines().map(str::to_owned).collect();
+        let mut kinds: Vec<LineKind> = lines.iter().map(|l| classify_line(l)).collect();
+        let n = lines.len();
+        while coalesce_entry_copies(&mut lines, &mut kinds, n) {}
+        for (l, k) in lines.iter().zip(&kinds) {
+            if *k != LineKind::Nop && (l.contains("lga") || l.contains("call")) {
+                assert!(l.trim().ends_with("t3"), "symbol renamed: {l}");
+            }
+        }
+    }
 
     #[test]
     fn identical_blocks_with_different_fallthroughs_do_not_merge() {

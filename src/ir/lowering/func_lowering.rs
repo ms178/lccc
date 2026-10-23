@@ -1258,6 +1258,12 @@ impl Lowerer {
             is_inline: func.attrs.is_inline(),
             is_always_inline: func.attrs.is_always_inline(),
             is_noinline: func.attrs.is_noinline(),
+            target_features: func
+                .attrs
+                .target
+                .as_deref()
+                .map(crate::ir::module::normalize_target_features)
+                .unwrap_or_default(),
             next_value_id: next_val,
             fp_expr_tags: std::mem::take(&mut self.fp_expr_tags),
             next_label,

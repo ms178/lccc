@@ -242,7 +242,9 @@ if not d_i < g_i:
 # lags compose, the escape-off census is 53/3 (default arm 53/2) — the two
 # relay moves are folded into their phi homes by the sink's copy coalescing
 # while the reassoc latency model keeps the folded `add (mem), reg`.
-# Pinned as <=53 insns / <=3 stack refs, the exact measured shape: the
+# Measured on d8668ee24 and on 455c834f0 plus the 2026-10-20 homing series:
+# 51/3 (default arm 51/2).
+# Pinned as <=51 insns / <=3 stack refs, the exact measured shape: the
 # output is deterministic, so any shift is a real codegen change and must
 # ratchet this pin explicitly.
 # Re-measured 2026-10-22 after the two-wave Phase-1 allocation landed on
@@ -250,9 +252,19 @@ if not d_i < g_i:
 # 60/6). One instruction fewer; the two extra stack refs are the
 # slot-operand-only loop bound doing exactly what the paragraph below
 # describes -- it lives in its slot and both compares fold to
-# `cmpq 24(%rsp), %r10` -- plus its def store. Pin updated to the measured
-# shape (<=52 / <=5); the margin requirements below are unchanged.
-if not (k_i <= 52 and k_s <= 5 and k_i < l_i - 10):
+# `cmpq 24(%rsp), %r10` -- plus its def store.
+# Re-measured 2026-10-23 on the homing series rebased onto 26d79dd6e:
+# escape-off 50/3 (default 50/3, legacy 57/9, gcc 71/0). The three stack
+# refs left are exactly the slot-resident bound above (its def store and both
+# `cmpq 16(%rsp), %r10`); the two other refs of the 2026-10-22 shape are gone.
+# Pinned at the exact shape.
+# Against legacy only strict dominance on both axes is required: the legacy
+# arm is a kill switch that shares the allocator, so allocator work shrinks
+# it too (the 2026-10-20 phi-blocker re-homing took it from 63/27 to 59/12
+# with both resolver arms unchanged) -- a fixed margin over it would fail
+# exactly when the allocator improves. The absolute pin is what holds the
+# resolver's contribution.
+if not (k_i <= 50 and k_s <= 3 and k_i < l_i and k_s < l_s):
     bad.append(f"escape-off resolver shape regressed ({k_i} insns/{k_s} stkref; "
                f"legacy {l_i}/{l_s}): resolver contribution changed")
 # The escape must never make THIS shape worse than no-escape-at-all: the

@@ -13,6 +13,7 @@
 //!
 //! ## Module structure
 //!
+//! - `align`: `R_RISCV_ALIGN` trimming of relaxable objects (right after parsing)
 //! - `elf_read`: ELF64 constants, type aliases, parsing (delegates to shared linker_common)
 //! - `relocations`: RISC-V relocation constants, instruction patching, shared types
 //! - `input`: Phase 1 - input file loading, archive resolution, shared lib discovery
@@ -23,6 +24,7 @@
 //! - `emit_exec`: Executable emission (static and dynamic)
 //! - `emit_shared`: Shared library (.so) emission
 
+mod align;
 mod displacement;
 mod elf_read;
 mod emit_exec;

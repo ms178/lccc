@@ -128,6 +128,17 @@ pub(super) fn rbp_is_gpr_in_function(
             continue;
         }
         let t = infos[n].trimmed(store.get(n));
+        // Every rule below needs an rbp spelling (each contains `bp`), a
+        // `leave`/`enter` mnemonic, or a numeric `.cfi_def_cfa_register`.
+        // One substring search settles the other lines -- nearly all of a
+        // large function -- instead of fifteen.
+        if !t.contains("bp")
+            && !t.starts_with("leave")
+            && !t.starts_with("enter")
+            && !t.starts_with(".cfi_def_cfa_register")
+        {
+            continue;
+        }
         // Opaque lines: any rbp spelling inside them is unknowable.
         if infos[n].pinned || infos[n].kind == LineKind::InlineAsm {
             if t.contains("%rbp")
@@ -178,6 +189,74 @@ pub(super) fn rbp_is_gpr_in_function(
         }
     }
     true
+}
+
+/// Per-pass memo of [`rbp_is_gpr_in_function`], exact by construction.
+///
+/// The producer-retarget and move-relay passes ask the question once per
+/// rbp-naming candidate, and each answer was a function-range scan plus a
+/// linear text scan of the whole function: quadratic on the 2,000-line
+/// functions FORCE_INLINE code produces (zstd `huf_compress.c`: 875 queries,
+/// 2.5 G instructions).  The verdict reads only lines inside its function,
+/// so it stays valid until the pass edits that function; [`Self::edited`]
+/// drops exactly that function's entry and the next query re-scans the
+/// current text.  A hit is therefore the predicate evaluated on the current
+/// text -- the memo cannot change a decision, only skip a repeated scan.
+///
+/// The range comes from the caller's [`FileLiveness`] (O(1)), falling back
+/// to [`function_range`] when its recorded delimiters are not intact; both
+/// name the same `(start, end)` for any line inside a function.
+#[derive(Default)]
+pub(super) struct RbpRoles {
+    verdicts: crate::common::fx_hash::FxHashMap<(usize, usize), bool>,
+}
+
+impl RbpRoles {
+    fn range(
+        lv: &FileLiveness,
+        store: &LineStore,
+        infos: &[LineInfo],
+        idx: usize,
+    ) -> Option<(usize, usize)> {
+        lv.recorded_function(store, infos, idx)
+            .or_else(|| function_range(store, infos, idx))
+    }
+
+    /// [`rbp_is_gpr_in_function`] for the function containing `idx`;
+    /// `false` outside a function, as at every former call site.
+    pub(super) fn is_gpr(
+        &mut self,
+        lv: &FileLiveness,
+        store: &LineStore,
+        infos: &[LineInfo],
+        idx: usize,
+    ) -> bool {
+        let Some((fs, fe)) = Self::range(lv, store, infos, idx) else {
+            return false;
+        };
+        *self
+            .verdicts
+            .entry((fs, fe))
+            .or_insert_with(|| rbp_is_gpr_in_function(store, infos, fs, fe))
+    }
+
+    /// The pass changed line `idx` (and possibly others in the same
+    /// function): forget that function's verdict.  Outside a recognisable
+    /// function every verdict is dropped.
+    pub(super) fn edited(
+        &mut self,
+        lv: &FileLiveness,
+        store: &LineStore,
+        infos: &[LineInfo],
+        idx: usize,
+    ) {
+        match Self::range(lv, store, infos, idx) {
+            Some(key) => {
+                self.verdicts.remove(&key);
+            }
+            None => self.verdicts.clear(),
+        }
+    }
 }
 
 /// Does `line` name any width of GP family `fam`? Boundary-checked so `%r1`
@@ -433,30 +512,54 @@ fn is_caller_saved_family(fam: RegId) -> bool {
     matches!(fam, 0 | 1 | 2 | 6 | 7 | 8 | 9 | 10 | 11)
 }
 
+/// Name -> line of the FIRST live label of that name in `[start, end)`: the
+/// resolution [`copy_in_loop`] and [`self_base_reexec_unsafe`] use (label text
+/// carries the trailing colon, jump targets do not, mirroring
+/// `FileLiveness::analyse_function`).  One pass, then O(1) per jump; the
+/// linear search per jump it replaces made each query O(jumps x labels).
+fn first_label_lines<'s>(
+    store: &'s LineStore,
+    infos: &[LineInfo],
+    start: usize,
+    end: usize,
+) -> crate::common::fx_hash::FxHashMap<&'s str, usize> {
+    let mut lines = crate::common::fx_hash::FxHashMap::default();
+    for n in start..end {
+        if infos[n].is_nop() || infos[n].kind != LineKind::Label {
+            continue;
+        }
+        if let Some(name) = infos[n].trimmed(store.get(n)).strip_suffix(':') {
+            lines.entry(name).or_insert(n);
+        }
+    }
+    lines
+}
+
+/// The enclosing function of `idx`: `lv`'s record when it analysed the
+/// function (O(1), the same `[start, end)` as [`function_range`]), else the
+/// delimiter scan.
+fn enclosing_function(
+    lv: &FileLiveness,
+    store: &LineStore,
+    infos: &[LineInfo],
+    idx: usize,
+) -> Option<(usize, usize)> {
+    lv.recorded_function(store, infos, idx)
+        .or_else(|| function_range(store, infos, idx))
+}
+
 /// `true` when line `idx` may sit inside a loop: some control edge from
 /// after `idx` targets `idx` or an earlier line, so the copy re-executes.
 /// Textual and deliberately conservative: an unresolvable function shape or
 /// any indirect jump (`jmp *...`, e.g. a jump table or tail call) answers
 /// `true`, direct jumps to labels outside the function are ignored (a tail
 /// call never re-executes `idx`).
-fn copy_in_loop(store: &LineStore, infos: &[LineInfo], idx: usize) -> bool {
-    let Some((start, end)) = function_range(store, infos, idx) else {
+fn copy_in_loop(lv: &FileLiveness, store: &LineStore, infos: &[LineInfo], idx: usize) -> bool {
+    let Some((start, end)) = enclosing_function(lv, store, infos, idx) else {
         return true;
     };
-    // Label map mirrors FileLiveness::analyse_function: label text carries
-    // the trailing colon, jump targets do not.
-    let mut labels: Vec<(&str, usize)> = Vec::new();
-    for n in start..end {
-        if infos[n].is_nop() || infos[n].kind != LineKind::Label {
-            continue;
-        }
-        if let Some(name) = infos[n].trimmed(store.get(n)).strip_suffix(':') {
-            labels.push((name, n));
-        }
-    }
-    let resolve = |name: &str| -> Option<usize> {
-        labels.iter().find(|(l, _)| *l == name).map(|&(_, pos)| pos)
-    };
+    let labels = first_label_lines(store, infos, start, end);
+    let resolve = |name: &str| labels.get(name).copied();
     for q in idx + 1..end {
         match infos[q].kind {
             LineKind::Jmp | LineKind::CondJmp => {
@@ -529,6 +632,26 @@ fn family_private_in(
     owned: &[usize],
 ) -> bool {
     let mask = 1u16 << fam;
+    // The proof is a conjunction over the function's lines, so any line
+    // that fails it decides `false` whatever the visiting order.  Settle
+    // the common failure first, on the cached bitmask alone: callers ask
+    // about families the dataflow already calls live, which another
+    // instruction nearly always names close to the candidate.  Walking
+    // outward from the first owned line finds that mention in a few steps,
+    // where the text checks below cost several string searches per line
+    // over the whole function (62k queries on zstd `huf_compress.c`,
+    // 1.85 G instructions).  Only a family that passes this test pays for
+    // the full scan, which is unchanged.
+    let names_fam =
+        |n: usize| !infos[n].is_nop() && infos[n].reg_refs & mask != 0 && !owned.contains(&n);
+    let pivot = owned
+        .iter()
+        .copied()
+        .find(|&p| (start..end).contains(&p))
+        .unwrap_or(start);
+    if (pivot..end).any(names_fam) || (start..pivot).rev().any(names_fam) {
+        return false;
+    }
     let mut n = start;
     while n < end {
         if infos[n].is_nop() {
@@ -692,13 +815,62 @@ impl LazyDeadness {
     /// extends the live ranges of the registers it substitutes in, so cached
     /// answers for that function are stale until the next query refreshes it.
     pub(super) fn invalidate(&mut self, store: &LineStore, infos: &[LineInfo], idx: usize) {
-        if self.lv.is_none() {
+        let Some(lv) = self.lv.as_ref() else {
             return;
-        }
-        let start = function_range(store, infos, idx).map_or(idx, |(s, _)| s);
+        };
+        let start = Self::function_start(lv, store, infos, idx);
         if !self.dirty.contains(&start) {
             self.dirty.push(start);
         }
+    }
+
+    /// Record that the caller edited ONLY lines in `lo..=hi` (one function;
+    /// the lines between its edits unchanged), and bring the cached solution
+    /// up to date now with the exact local splice
+    /// ([`FileLiveness::refresh_span`]) instead of deferring a whole-function
+    /// re-analysis to the next query.
+    ///
+    /// The splice must run before any further edit: it reads the
+    /// pre-edit solution for everything outside the span, so it cannot be
+    /// deferred and batched like [`Self::invalidate`].  A function already
+    /// queued by `invalidate` is left to that full re-analysis, which covers
+    /// this edit as well.
+    ///
+    /// `fold_lea_into_memory_op` re-solved the whole function after each of
+    /// its ~1,000 folds on zstd `huf_compress.c` (2.84 G instructions, 8% of
+    /// the compile); each fold rewrites two or three adjacent lines.
+    pub(super) fn invalidate_span(
+        &mut self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        lo: usize,
+        hi: usize,
+    ) {
+        let Some(lv) = self.lv.as_mut() else {
+            return;
+        };
+        if !self.dirty.is_empty()
+            && self
+                .dirty
+                .contains(&Self::function_start(lv, store, infos, lo))
+        {
+            return;
+        }
+        lv.refresh_span(store, infos, lo, hi);
+    }
+
+    /// The `.cfi_startproc` line of `idx`'s function (`idx` itself outside
+    /// one): the solution's recorded bounds in O(1), else the text scan --
+    /// both name the same line.
+    fn function_start(
+        lv: &FileLiveness,
+        store: &LineStore,
+        infos: &[LineInfo],
+        idx: usize,
+    ) -> usize {
+        lv.recorded_function(store, infos, idx)
+            .or_else(|| function_range(store, infos, idx))
+            .map_or(idx, |(s, _)| s)
     }
 }
 
@@ -799,8 +971,10 @@ fn relay_source_for(
 /// ```
 ///
 /// Conditions (all checked):
-/// * `%S` and `%D` are distinct general-purpose registers (not `%rsp`/`%rbp`),
-///   and the copy is a plain register-to-register `movl`/`movq`.
+/// * `%S` and `%D` are distinct general-purpose registers (never `%rsp`;
+///   `%rbp` only where [`rbp_is_gpr_in_function`] proves it allocator-owned,
+///   and never renamed into a memory operand), and the copy is a plain
+///   register-to-register `movl`/`movq`.
 /// * Between the copy and the use there is no barrier, no implicit register
 ///   traffic, no write to `%S`, and no other mention of `%D`.
 /// * The use names `%D` EXACTLY as the copy's destination text, so the rewrite
@@ -814,6 +988,7 @@ fn relay_source_for(
 pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
+    let mut rbp_roles = RbpRoles::default();
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -839,7 +1014,19 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
             i += 1;
             continue;
         };
-        if src_fam == dst_fam || !is_relayable_family(src_fam) || !is_relayable_family(dst_fam) {
+        // `%rbp` relays only where whole-function evidence proves it is an
+        // allocator-owned GPR (`rbp_is_gpr_in_function`, the same gate the
+        // producer-retarget and flag passes use). Refusing it outright left
+        // the relay alive whenever the allocator happened to home the source
+        // in rbp: zstd_count's `movl %ebp, %r14d; leaq buffer(%rip), %r10;
+        // addq %r14, %r10` kept a zero-extension copy per iteration that the
+        // identical `%r12` shape folds. The range scan runs lazily, so copies
+        // that do not name rbp never pay for it.
+        let rbp_gpr = (src_fam == 5 || dst_fam == 5) && rbp_roles.is_gpr(&lv, store, infos, i);
+        if src_fam == dst_fam
+            || !is_writable_family_gpr(src_fam, rbp_gpr)
+            || !is_writable_family_gpr(dst_fam, rbp_gpr)
+        {
             i += 1;
             continue;
         }
@@ -886,7 +1073,9 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
                                 {
                                     mark_nop(&mut infos[i]);
                                     replace_line(store, &mut infos[j], j, new_line);
-                                    lv.refresh_at(store, infos, j);
+                                    // Only `i` (now a nop) and `j` changed.
+                                    lv.refresh_span(store, infos, i, j);
+                                    rbp_roles.edited(&lv, store, infos, i);
                                     changed = true;
                                     folded = true;
                                 }
@@ -914,7 +1103,9 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
                                 {
                                     mark_nop(&mut infos[i]);
                                     replace_line(store, &mut infos[j], j, new_line);
-                                    lv.refresh_at(store, infos, j);
+                                    // Only `i` (now a nop) and `j` changed.
+                                    lv.refresh_span(store, infos, i, j);
+                                    rbp_roles.edited(&lv, store, infos, i);
                                     changed = true;
                                     folded = true;
                                 }
@@ -953,7 +1144,14 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
                     // destination's registers are reads, never the write.
                     let writes_dst_as_reg = consumer_writes_dst_as_reg(t, dst_fam);
                     let write_only_dst = writes_dst_as_reg && fam_written_only_as_dest(t, dst_fam);
-                    if t.contains('(') && (!writes_dst_as_reg || write_only_dst) {
+                    //
+                    // Never rename INTO a memory operand as `%rbp`: every
+                    // `N(%rbp)` spelling is parsed as frame-slot traffic
+                    // (`LineInfo::rbp_offset`, store forwarding, dead-store
+                    // elimination) and is itself the frame-pointer evidence
+                    // `rbp_is_gpr_in_function` keys on — the rewrite would
+                    // invalidate the very proof that admitted it.
+                    if src_fam != 5 && t.contains('(') && (!writes_dst_as_reg || write_only_dst) {
                         // The high-byte trap (pinned by
                         // `test_rcx_address_copy_high_byte_use_is_not_a_kill`):
                         // `%ch` reads bits 8..15 of the copied value at a
@@ -976,10 +1174,19 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
                                 }
                             })
                         };
-                        let reads_64 = true; // a memory operand reads its registers at 64 bits
+                        // A memory operand reads its registers at 64 bits —
+                        // except under a 32-bit LEA: `leal` keeps only the
+                        // low 32 bits of base + index*scale + disp, and those
+                        // depend only on the low 32 bits of base and index
+                        // (addition and scaling by 1/2/4/8 carry upward
+                        // only). So a `movl` copy relays into `leal` with no
+                        // upper-half proof: `movl %eax,%r11d; leal (%r11,
+                        // %r11,2),%eax` ≡ `leal (%rax,%rax,2),%eax`.
+                        let reads_64 = !t.starts_with("leal ");
                         if high_byte_ok
-                            && reads_64
-                            && (copy_w == 64 || upper32_zero_at(store, infos, i, src_fam))
+                            && (!reads_64
+                                || copy_w == 64
+                                || upper32_zero_at(store, infos, i, src_fam))
                         {
                             let new_line = if write_only_dst {
                                 replace_reg_family_in_source(t, dst_fam, src_fam)
@@ -1000,7 +1207,9 @@ pub(super) fn eliminate_move_relays(store: &mut LineStore, infos: &mut [LineInfo
                                 if ok {
                                     mark_nop(&mut infos[i]);
                                     replace_line(store, &mut infos[j], j, new_line);
-                                    lv.refresh_at(store, infos, j);
+                                    // Only `i` (now a nop) and `j` changed.
+                                    lv.refresh_span(store, infos, i, j);
+                                    rbp_roles.edited(&lv, store, infos, i);
                                     changed = true;
                                     folded = true;
                                 }
@@ -1058,7 +1267,15 @@ fn consumer_writes_dst_as_reg(t: &str, fam: RegId) -> bool {
 /// (`%r11`/`%r11d`; a 32-bit write zero-extends into the full family), so
 /// the write kills the copy's value here and no later read can want it.
 pub(super) fn fam_written_only_as_dest(t: &str, fam: RegId) -> bool {
-    if !consumer_writes_dst_as_reg(t, fam) || is_read_modify_write(t.trim_start()) {
+    // A LEA never reads its destination as a register: its only source is
+    // the address, whose register mentions are exactly what the relay
+    // rename retargets (and what the memory-stripping check below ignores).
+    // `is_read_modify_write`'s LEA clause is an exact-SPELLING self-address
+    // test (`leaq (%r11,%r11,2), %r11` → RMW, the 32-bit twin `leal (%r11,
+    // %r11,2), %r11d` → not), so consulting it here refused the 64-bit form
+    // of a fold it admitted at 32 bits (`usel(a) * 3` kept its relay copy).
+    let is_lea = t.trim_start().starts_with("lea");
+    if !consumer_writes_dst_as_reg(t, fam) || (!is_lea && is_read_modify_write(t.trim_start())) {
         return false;
     }
     let trimmed = t.trim_start();
@@ -1222,26 +1439,15 @@ fn self_base_reexec_unsafe(
     fam: RegId,
     lv: &FileLiveness,
 ) -> bool {
-    let Some((start, end)) = function_range(store, infos, idx) else {
+    let Some((start, end)) = enclosing_function(lv, store, infos, idx) else {
         return true;
     };
-    // Label map mirrors copy_in_loop: label text carries the trailing colon,
-    // jump targets do not.
-    let mut labels: Vec<(&str, usize)> = Vec::new();
-    for n in start..end {
-        if infos[n].is_nop() || infos[n].kind != LineKind::Label {
-            continue;
-        }
-        if let Some(name) = infos[n].trimmed(store.get(n)).strip_suffix(':') {
-            labels.push((name, n));
-        }
-    }
+    // Label resolution mirrors copy_in_loop (first live label of the name).
+    let labels = first_label_lines(store, infos, start, end);
     if labels.is_empty() {
         return false;
     }
-    let resolve = |name: &str| -> Option<usize> {
-        labels.iter().find(|(l, _)| *l == name).map(|&(_, pos)| pos)
-    };
+    let resolve = |name: &str| labels.get(name).copied();
     for q in idx + 1..end {
         match infos[q].kind {
             LineKind::Jmp | LineKind::CondJmp => {
@@ -1916,17 +2122,34 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
                 break;
             }
             // A write to any register the address reads makes the LEA
-            // irreproducible at the use site.
+            // irreproducible at the use site — on an INTERVENING line. The
+            // consumer itself (the first line touching %T) may write one:
+            // a ModRM effective address is computed from the registers'
+            // values before the instruction writes its destination, so
+            // `leaq (%rax,%rax,2), %r11; leaq 1(%r11), %rax` composes to
+            // `leaq 1(%rax,%rax,2), %rax`. Excluded: %rsp writes and the
+            // stack instructions (push/pop/call/ret adjust %rsp around the
+            // access — `popq 8(%rsp)` addresses with the incremented %rsp),
+            // and the self-base producer, whose re-execution proof assumes
+            // the old rule.
             if infos[j].reg_refs & addr_mask != 0 {
                 let w = get_dest_reg(&infos[j]);
                 if w != REG_NONE && addr_fams.contains(&w) {
-                    break;
+                    let is_consumer = infos[j].reg_refs & (1u16 << dst_fam) != 0;
+                    let stack_op = ["push", "pop", "call", "ret", "leave", "enter"]
+                        .iter()
+                        .any(|m| t.starts_with(m));
+                    if !is_consumer || self_base || w == 4 || stack_op {
+                        break;
+                    }
                 }
             }
             if infos[j].reg_refs & dst_mask != 0 {
-                // Only a BARE `(%T)` operand or a base/offset operand
-                // `(%T, …)` can absorb the LEA. `8(%T)` must not match:
-                // splicing would produce `8DISP(%base)`.
+                // A BARE `(%T)` operand or a base/offset operand `(%T, …)`
+                // absorbs the LEA verbatim. A displaced `d2(%T)` must never be
+                // SPLICED (that would produce `d2DISP(%base)`); it is COMPOSED
+                // instead by `compose_displaced_relay` (d1 + d2 on a numeric
+                // producer displacement), below.
                 let mut matched: Option<(usize, usize, String)> = None;
                 // Plain relay: `%gs:(%T)` takes the folded address verbatim.
                 // An indexed address under a segment override is a segment
@@ -1963,6 +2186,9 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
                         matched = Some((pos, cl, new_operand));
                     }
                 }
+                if matched.is_none() && !self_base {
+                    matched = compose_displaced_relay(t, &addr_pat, &folded_addr);
+                }
                 if let Some((op, cl, new_operand)) = matched {
                     let replacement = format!("{}{}{}", &t[..op], new_operand, &t[cl + 1..]);
                     // Normal form: the consumer must not mention dst at all
@@ -1995,6 +2221,61 @@ pub(super) fn fold_lea_into_load(store: &mut LineStore, infos: &mut [LineInfo]) 
         i += 1;
     }
     changed
+}
+
+/// Compose a LEA into a DISPLACED use of its result: with the producer
+/// `leaq d1(B,I,s), %T`, the consumer operand `d2(%T)` addresses
+/// `T + d2 = B + I*s + (d1 + d2)`, i.e. `d1+d2(B,I,s)` — one operand, the same
+/// address (both are 64-bit address computations; a 32-bit consumer such as
+/// `leal 1(%T), %eax` keeps the low 32 bits of the same sum). Returns the
+/// `(operand start, closing paren, new operand)` splice for the first match.
+///
+/// Fail-closed scope: decimal displacements on both sides (no `sym(%rip)`
+/// producer — its displacement is a relocation expression), a plain operand
+/// boundary before `d2` (no segment-prefixed consumer, so the segment-SIB
+/// kill switch is never involved), and `d1 + d2` within the signed 32-bit
+/// displacement field. The caller keeps every other proof (no write to the
+/// address registers in the window, `%T` absent from the rewritten line,
+/// `%T` provably dead).
+fn compose_displaced_relay(
+    t: &str,
+    addr_pat: &str,
+    producer: &str,
+) -> Option<(usize, usize, String)> {
+    let open = producer.find('(')?;
+    let (d1_text, sib) = producer.split_at(open);
+    if sib.contains("%rip") {
+        return None;
+    }
+    let d1: i64 = if d1_text.trim().is_empty() {
+        0
+    } else {
+        d1_text.trim().parse().ok()?
+    };
+    let b = t.as_bytes();
+    for (pos, _) in t.match_indices(addr_pat) {
+        let mut start = pos;
+        while start > 0 && (b[start - 1].is_ascii_digit() || b[start - 1] == b'-') {
+            start -= 1;
+        }
+        if start == pos || !(start == 0 || matches!(b[start - 1], b' ' | b',' | b'\t')) {
+            continue;
+        }
+        let Ok(d2) = t[start..pos].parse::<i64>() else {
+            continue;
+        };
+        let sum = d1.checked_add(d2)?;
+        if sum < i64::from(i32::MIN) || sum > i64::from(i32::MAX) {
+            return None;
+        }
+        let disp = if sum == 0 {
+            String::new()
+        } else {
+            sum.to_string()
+        };
+        return Some((start, pos + addr_pat.len() - 1, format!("{disp}{sib}")));
+    }
+    None
 }
 
 // ── Pass 2b: same-block redundant rip-LEA elimination ────────────────────────
@@ -2172,6 +2453,7 @@ fn retarget_producer_into_copy_impl(
 ) -> bool {
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
+    let mut rbp_roles = RbpRoles::default();
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -2197,10 +2479,7 @@ fn retarget_producer_into_copy_impl(
         // conservative `is_relayable_family` refusal. The function-range scan
         // runs lazily: candidates without an rbp operand never pay for it.
         let rbp_gpr = if a_fam == 5 {
-            match function_range(store, infos, i) {
-                Some((fs, fe)) => rbp_is_gpr_in_function(store, infos, fs, fe),
-                None => false,
-            }
+            rbp_roles.is_gpr(&lv, store, infos, i)
         } else {
             false
         };
@@ -2277,13 +2556,7 @@ fn retarget_producer_into_copy_impl(
             i += 1;
             continue;
         }
-        let rbp_gpr = rbp_gpr
-            || (d_fam == 5 && {
-                match function_range(store, infos, i) {
-                    Some((fs, fe)) => rbp_is_gpr_in_function(store, infos, fs, fe),
-                    None => false,
-                }
-            });
+        let rbp_gpr = rbp_gpr || (d_fam == 5 && rbp_roles.is_gpr(&lv, store, infos, i));
         if !is_writable_family_gpr(d_fam, rbp_gpr) {
             i += 1;
             continue;
@@ -2332,6 +2605,7 @@ fn retarget_producer_into_copy_impl(
             mark_nop(&mut infos[i]);
             mark_nop(&mut infos[j]);
             lv.refresh_span(store, infos, i, j);
+            rbp_roles.edited(&lv, store, infos, i);
             changed = true;
             i = j + 1;
             continue;
@@ -2349,6 +2623,195 @@ fn retarget_producer_into_copy_impl(
                 ri,
                 format!("    {}{}, {}", rmw_op, r_src, r_dst),
             );
+        }
+        mark_nop(&mut infos[j]);
+        lv.refresh_span(store, infos, i, j);
+        rbp_roles.edited(&lv, store, infos, i);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+/// Upper bound on the lines between a chain's producer and its final copy
+/// (keeps [`rename_chain_into_copy`] linear).
+const CHAIN_WINDOW: usize = 8;
+
+/// Does `line` name family `fam` at 16 or 8 bits (high byte included)? Those
+/// spellings are partial writes / partial reads that a family rename would
+/// either break (`shll %cl, …` -> `%al`) or change the meaning of.
+fn names_family_narrow(line: &str, fam: RegId) -> bool {
+    let f = fam as usize;
+    if f >= REG_NAMES[0].len() {
+        return true;
+    }
+    line.contains(REG_NAMES[2][f])
+        || line.contains(REG_NAMES[3][f])
+        || (f < 4 && line.contains(super::helpers::HIGH_BYTE_NAMES[f]))
+}
+
+/// Rename a short straight-line value chain into the register its final copy
+/// targets, deleting the copy (the late, windowed generalisation of
+/// [`retarget_producer_into_copy`], whose producer must be adjacent):
+///
+/// ```text
+///     leal (%rax, %rax, 2), %r11d      leal (%rax, %rax, 2), %eax
+///     addl %ebx, %r11d            ->   addl %ebx, %eax
+///     movl %r11d, %eax
+/// ```
+///
+/// Soundness, for the window `[i, j]` from the producer `i` to the copy `j`:
+/// 1. The producer is a pure full-width write of `T` that does not read `T`,
+///    so no line in the window observes `T`'s pre-window value.
+/// 2. No line after the producer names `D` (any width), no window line has
+///    implicit register effects (`implicit_reg_refs`,
+///    `has_implicit_reg_usage`), and none is a barrier, label or pinned line:
+///    `D`'s old value is unobserved after the producer and overwritten by the
+///    copy anyway, so writing it from the producer on is unobservable. The
+///    producer's SOURCES may name `D`: every `PURE_PRODUCERS` form reads all
+///    operands before writing (the aliasing argument of
+///    [`retarget_producer_into_copy_aliasing`]).
+/// 3. Every `T` mention is a 32/64-bit name, so renaming every mention
+///    `T -> D` (`replace_reg_family`) keeps each value bit-identical: `D`
+///    holds exactly what `T` would have held at every point.
+/// 4. Width: the copy zero-extends (`movl`) or copies (`movq`); if the last
+///    write of `T` was 64-bit, a `movl` copy discarded bits 32..63 that the
+///    renamed chain would keep, so that case is refused. A 32-bit last write
+///    already left the upper half zero.
+/// 5. `T` is provably dead after the copy (`provably_dead_lv`; the window
+///    lines are the owned set).
+///
+/// Flags are unaffected (a register rename changes no computed value).
+/// Phase: late, beside [`retarget_producer_into_copy_aliasing`] — inside the
+/// local fixpoints it would merge chains before the RMW coalescers and LEA
+/// folds see them.
+pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut lv = FileLiveness::new(store, infos);
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if debug_transparent(store, infos[i], i) || infos[i].pinned {
+            i += 1;
+            continue;
+        }
+        let prod = infos[i].trimmed(store.get(i));
+        let Some(op) = PURE_PRODUCERS.iter().find(|p| prod.starts_with(**p)) else {
+            i += 1;
+            continue;
+        };
+        let Some((prod_src, prod_dst)) = split_two_operands(&prod[op.len()..]) else {
+            i += 1;
+            continue;
+        };
+        let (Some(t), Some(prod_w)) = (plain_gp_operand(prod_dst), dest_width(prod_dst)) else {
+            i += 1;
+            continue;
+        };
+        if matches!(t, 4 | 5) || t > REG_GP_MAX || line_refs_family(prod_src, t) {
+            i += 1;
+            continue;
+        }
+        // Walk forward to the copy `mov{l,q} %T, %D`.
+        let mut window: Vec<usize> = vec![i];
+        // The budget counts instructions only: debug directives (`.loc`)
+        // ride in `window` but must not shorten the reach, or `-g` would
+        // change the generated code.
+        let mut real = 1usize;
+        let mut last_w = prod_w;
+        let mut copy_at = None;
+        let mut k = i + 1;
+        while k < len && real <= CHAIN_WINDOW {
+            if infos[k].is_nop() {
+                k += 1;
+                continue;
+            }
+            let t_k = infos[k].trimmed(store.get(k));
+            if debug_transparent(store, infos[k], k) {
+                if line_refs_family(t_k, t) {
+                    break;
+                }
+                window.push(k);
+                k += 1;
+                continue;
+            }
+            if infos[k].pinned || infos[k].is_barrier() || infos[k].kind == LineKind::InlineAsm {
+                break;
+            }
+            // Implicit operands are invisible to the rename and to the D
+            // check (`cltq` reads %eax): every window line must have none.
+            if has_implicit_reg_usage(t_k) || implicit_reg_refs(t_k.as_bytes()) != 0 {
+                break;
+            }
+            let copy_w = if t_k.starts_with("movq ") {
+                Some(64u8)
+            } else if t_k.starts_with("movl ") {
+                Some(32u8)
+            } else {
+                None
+            };
+            if let Some(cw) = copy_w {
+                if let Some((cs, cd)) = split_two_operands(&t_k[5..]) {
+                    if plain_gp_operand(cs) == Some(t)
+                        && plain_gp_operand(cd).is_some_and(|d| d != t)
+                    {
+                        copy_at = Some((k, cw, plain_gp_operand(cd).unwrap_or(t)));
+                        break;
+                    }
+                }
+            }
+            if !line_refs_family(t_k, t) {
+                // Unrelated lines may sit in the window as long as they leave
+                // D alone (checked once D is known).
+                window.push(k);
+                real += 1;
+                k += 1;
+                continue;
+            }
+            if names_family_narrow(t_k, t) {
+                break;
+            }
+            if writes_family(&infos[k], t_k, t) {
+                let last = t_k.rsplit_once(',').map_or_else(
+                    || t_k.split_whitespace().last().unwrap_or(""),
+                    |(_, d)| d.trim(),
+                );
+                match dest_width(last) {
+                    Some(w) if register_family_fast(last) == t => last_w = w,
+                    _ => break,
+                }
+            }
+            window.push(k);
+            real += 1;
+            k += 1;
+        }
+        let Some((j, copy_w, d)) = copy_at else {
+            i += 1;
+            continue;
+        };
+        if real < 2
+            || matches!(d, 4 | 5)
+            || !is_writable_family_gpr(d, false)
+            || (last_w == 64 && copy_w == 32)
+            || window[1..]
+                .iter()
+                .any(|&w| line_refs_family(infos[w].trimmed(store.get(w)), d))
+        {
+            i += 1;
+            continue;
+        }
+        let mut owned = window.clone();
+        owned.push(j);
+        if !provably_dead_lv(&lv, store, infos, j, t, &owned) {
+            i += 1;
+            continue;
+        }
+        for &w in &window {
+            let text = infos[w].trimmed(store.get(w));
+            if line_refs_family(text, t) {
+                let renamed = format!("    {}", replace_reg_family(text, t, d));
+                replace_line(store, &mut infos[w], w, renamed);
+            }
         }
         mark_nop(&mut infos[j]);
         lv.refresh_span(store, infos, i, j);
@@ -3745,7 +4208,7 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
         if !(matches!(lv.live_after(li, s_fam), Some(false))
             || dead_in_block_after(store, infos, li + 1, s_fam)
             || (is_caller_saved_family(s_fam)
-                && !copy_in_loop(store, infos, li)
+                && !copy_in_loop(&lv, store, infos, li)
                 && family_private_lv(&lv, store, infos, li, s_fam, &[li])))
         {
             continue;
@@ -3756,6 +4219,11 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
         let d_mask = 1u16 << d_fam;
         let mut rewrites: Vec<(usize, String, String)> = vec![(j, orig_cons, new_cons)];
         let mut abort = false;
+        // Whether the coalesced value's most recent write was a dword write
+        // (upper half zero): a dword copy back into %S is then the identity.
+        let mut upper_zero = cons_w == 32;
+        // A copy back into the source that the rewrite deletes.
+        let mut dropped_copy_back: Option<usize> = None;
         let mut k = j + 1;
         while k < len {
             if infos[k].is_nop() {
@@ -3770,6 +4238,26 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
                 break; // downstream paths are the deadness proof's job
             }
             let t = infos[k].trimmed(store.get(k)).to_string();
+            // The copy BACK into the source (`movl %D, %S` / `movq %D, %S`;
+            // the call-result relay `movl %eax,%r11d; addl M,%r11d; movl
+            // %r11d,%eax`): %S already holds %D's full value, so the qword
+            // copy is the identity, and so is the zero-extending dword copy
+            // when the last write of the value was a dword write; otherwise
+            // it stays as `movl %S, %S`. The window ends here; a later %D read
+            // fails the deadness proof below and rolls everything back.
+            if let Some(qword) = copy_back_width(&t, d_fam, s_fam) {
+                if qword || upper_zero {
+                    dropped_copy_back = Some(k);
+                } else {
+                    let s32 = REG_NAMES[1][s_fam as usize];
+                    rewrites.push((
+                        k,
+                        store.get(k).to_string(),
+                        format!("    movl {s32}, {s32}"),
+                    ));
+                }
+                break;
+            }
             if line_refs_family(&t, s_fam) {
                 abort = true;
                 break;
@@ -3801,6 +4289,7 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
                     abort = true;
                     break;
                 };
+                upper_zero = dest_width(dest_operand_text(&t)) == Some(32);
                 rewrites.push((k, store.get(k).to_string(), new_t));
                 k += 1;
                 continue;
@@ -3825,7 +4314,25 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
         for &(idx, _, ref new_t) in &rewrites {
             replace_line(store, &mut infos[idx], idx, new_t.clone());
         }
-        let lv2 = FileLiveness::new(store, infos);
+        let orig_copy_back = dropped_copy_back.map(|idx| {
+            let orig = store.get(idx).to_string();
+            mark_nop(&mut infos[idx]);
+            (idx, orig)
+        });
+        // The proof needs the solution of the REWRITTEN text.  Every edit
+        // lies in `li..=last` (the copy, the consumer at `j > li`, and the
+        // renamed reads / dropped copy-back after it), so a splice of a copy
+        // of `lv` over that span is that solution (`refresh_span` falls back
+        // to re-solving the one function when the span is not straight-line).
+        // Re-solving the whole file per candidate made this pass 3% of
+        // compiling zstd's huf_compress.c.
+        let last = rewrites
+            .iter()
+            .map(|r| r.0)
+            .chain(orig_copy_back.as_ref().map(|c| c.0))
+            .fold(j, usize::max);
+        let mut lv2 = lv.clone();
+        lv2.refresh_span(store, infos, li, last);
         // The deadness query is anchored at the consumer line, NOT at the
         // copy: the copy is NOP-marked at this point and `FileLiveness` only
         // marks real instructions as known, so a query at its index would
@@ -3842,10 +4349,26 @@ pub(super) fn coalesce_copy_into_rmw(store: &mut LineStore, infos: &mut [LineInf
             for (idx, orig, _) in rewrites {
                 replace_line(store, &mut infos[idx], idx, orig);
             }
+            if let Some((idx, orig)) = orig_copy_back {
+                replace_line(store, &mut infos[idx], idx, orig);
+            }
             // `lv` still describes the restored text.
         }
     }
     changed
+}
+
+/// `Some(is_qword)` when `t` is exactly the full-width copy `mov{l,q} %D, %S`
+/// from family `d` into family `s` (lowercase allocator spelling).
+fn copy_back_width(t: &str, d: RegId, s: RegId) -> Option<bool> {
+    let rest = t
+        .strip_prefix("movq ")
+        .map(|r| (true, r))
+        .or_else(|| t.strip_prefix("movl ").map(|r| (false, r)));
+    let (qword, rest) = rest?;
+    let w = if qword { 0 } else { 1 };
+    let (src, dst) = split_two_operands(rest)?;
+    (src == REG_NAMES[w][d as usize] && dst == REG_NAMES[w][s as usize]).then_some(qword)
 }
 
 /// Rename every PLAIN-REGISTER mention of family `from` to the same-width
@@ -3935,8 +4458,309 @@ fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String> 
     Some(format!("    {} {}, {}", mnemonic, n0, n1))
 }
 
+// ── Scaled-index temporary into a memory operand ────────────────────────────
+//
+// Address operands that never reach the codegen-time GEP folds (the
+// `__builtin_prefetch` pointer, explicit-SIMD intrinsic pointers) arrive with
+// their scaled index materialised in a temporary. The measured shapes, from
+// the canonical software-prefetch loop `__builtin_prefetch(&a[i + K])`:
+//
+//     leaq 0(,%r9,8), %r11              leaq 8(%r8), %r9
+//     prefetcht0 128(%rdi,%r11,1)       shlq $3, %r9
+//                                       prefetcht0 (%rdi,%r9)
+//
+// `fold_lea_into_memory_op` splices only a temporary in BASE position and
+// skips index-only producers, and `fold_shift_into_sib` needs an `addq`
+// consumer, so both survive to the final assembly: one or two extra
+// instructions per loop iteration against GCC's single
+// `prefetcht0 128(%rdi,%r9,8)` / `prefetcht0 64(%rdi,%r8,8)`.
+//
+// The fold composes the producer into the consumer's operand where the
+// temporary is the UNSCALED index (beside a base) or the sole base, through
+// the same `compose_sib` every LEA fold uses (term merging, scale legality,
+// disp32 range — all fail closed).
+//
+// Sound when:
+//   * the producer is `leaq ADDR, %T` with an index-only ADDR, or a base-only
+//     `leaq K(%I), %T` immediately followed by `shlq/salq $s, %T` (s = 1..3,
+//     64-bit only: `shll` zero-extends, which `lea` scaling does not model),
+//     whose deleted flag write must be dead (`flags_dead_after`);
+//   * the consumer immediately follows, mentions `%T`'s family exactly once —
+//     inside one memory operand, as `D(%B,%T[,1])` or `D(%T)` — has no
+//     implicit use of it, and `%T` is dead after it. The producer's inputs
+//     cannot change in between (adjacency), and with the producer deleted
+//     `%T` keeps its pre-producer value, so `%I == %T` composes correctly;
+//   * the consumer is not a `lea` (a base+index+disp LEA is the 3-cycle "slow
+//     LEA" on Skylake-family cores, so turning two 1-cycle LEAs into one is
+//     not a clear win; a memory access gets the third component free in the
+//     AGU), has no `*` (indirect branch) and no segment override.
+pub(super) fn fold_scaled_index_temp_into_mem(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut dead = LazyDeadness::new();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if debug_transparent(store, infos[i], i) || infos[i].pinned || infos[i].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let Some((producer, dst, shl)) = scaled_temp_producer(store, infos, i, len) else {
+            i += 1;
+            continue;
+        };
+        let j = next_non_debug(store, infos, shl.unwrap_or(i) + 1, len);
+        if j >= len || infos[j].is_barrier() || infos[j].pinned {
+            i += 1;
+            continue;
+        }
+        let dst_fam = register_family_fast(&dst);
+        let consumer = infos[j].trimmed(store.get(j));
+        if implicit_reg_refs(consumer.as_bytes()) & (1u16 << dst_fam) != 0 {
+            i += 1;
+            continue;
+        }
+        let Some(replacement) = splice_temp_into_mem_operand(consumer, &dst, dst_fam, &producer)
+        else {
+            i += 1;
+            continue;
+        };
+        let owned = [i, shl.unwrap_or(i), j];
+        if !dead.dead_after(store, infos, j, dst_fam, &owned) {
+            i += 1;
+            continue;
+        }
+        mark_nop(&mut infos[i]);
+        if let Some(k) = shl {
+            mark_nop(&mut infos[k]);
+        }
+        replace_line(store, &mut infos[j], j, format!("    {replacement}"));
+        dead.invalidate(store, infos, j);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+/// The producer of a scaled-index temporary at line `i`: its address, the
+/// 64-bit temporary, and the `shl` line for the two-instruction shape (see
+/// [`fold_scaled_index_temp_into_mem`]).
+fn scaled_temp_producer(
+    store: &LineStore,
+    infos: &[LineInfo],
+    i: usize,
+    len: usize,
+) -> Option<(SibAddr, String, Option<usize>)> {
+    let t = infos[i].trimmed(store.get(i));
+    let (addr_text, dst) = t.strip_prefix("leaq ")?.rsplit_once(',')?;
+    let (addr_text, dst) = (addr_text.trim(), dst.trim());
+    let fam = register_family_fast(dst);
+    if fam == REG_NONE || fam > REG_GP_MAX || REG_NAMES[0][fam as usize] != dst {
+        return None;
+    }
+    if addr_text.contains(':') {
+        return None;
+    }
+    let addr = SibAddr::parse(addr_text)?;
+    if addr.base.is_none() && addr.index.is_some() {
+        return Some((addr, dst.to_string(), None));
+    }
+    let base = match (&addr.base, &addr.index, &addr.sym) {
+        (Some(b), None, None) => b.clone(),
+        _ => return None,
+    };
+    let k = next_non_debug(store, infos, i + 1, len);
+    if k >= len || infos[k].pinned || infos[k].is_barrier() {
+        return None;
+    }
+    let shl = infos[k].trimmed(store.get(k));
+    let (mnemonic, rest) = shl.split_once(' ')?;
+    if !matches!(mnemonic, "shlq" | "salq") {
+        return None;
+    }
+    let (imm, reg) = split_two_operands(rest.trim_start())?;
+    let s: u32 = imm.strip_prefix('$')?.parse().ok()?;
+    if reg != dst || !(1..=3).contains(&s) {
+        return None;
+    }
+    if !super::flag_peepholes::flags_dead_after(store, infos, k + 1) {
+        return None;
+    }
+    let disp = addr.disp.checked_mul(1i64 << s)?;
+    i32::try_from(disp).ok()?;
+    Some((
+        SibAddr {
+            sym: None,
+            disp,
+            base: None,
+            index: Some((base, 1u8 << s)),
+        },
+        dst.to_string(),
+        Some(k),
+    ))
+}
+
+/// Mentions of GP family `fam` in `line`, at every width (high byte too).
+fn gp_family_mentions(line: &str, fam: RegId) -> usize {
+    let fam_u = fam as usize;
+    if fam_u >= REG_NAMES[0].len() {
+        return usize::MAX;
+    }
+    let high = (fam_u < 4).then(|| super::helpers::HIGH_BYTE_NAMES[fam_u]);
+    REG_NAMES
+        .iter()
+        .map(|row| row[fam_u])
+        .chain(high)
+        .map(|name| {
+            line.match_indices(name)
+                .filter(|(pos, _)| {
+                    line.as_bytes()
+                        .get(pos + name.len())
+                        .is_none_or(|ch| !ch.is_ascii_alphanumeric())
+                })
+                .count()
+        })
+        .sum()
+}
+
+/// Rewrite the single memory operand of `line` that holds `%T` (`dst`) as
+/// its unscaled index or sole base, composing `producer` into it. `None`
+/// when the shape is anything else (see [`fold_scaled_index_temp_into_mem`]).
+fn splice_temp_into_mem_operand(
+    line: &str,
+    dst: &str,
+    dst_fam: RegId,
+    producer: &SibAddr,
+) -> Option<String> {
+    if line.starts_with("lea")
+        || line.contains('*')
+        || segment_prefix_len_anywhere(line)
+        || gp_family_mentions(line, dst_fam) != 1
+    {
+        return None;
+    }
+    let pos = line
+        .match_indices(dst)
+        .find(|(p, _)| {
+            line.as_bytes()
+                .get(p + dst.len())
+                .is_none_or(|ch| !ch.is_ascii_alphanumeric())
+        })?
+        .0;
+    let open = line[..pos].rfind('(')?;
+    if line[open..pos].contains(')') {
+        return None;
+    }
+    let close = pos + line[pos..].find(')')?;
+    let op_start = operand_start(line, open);
+    let disp_text = line[op_start..open].trim();
+    if disp_text.contains(['%', ':', '*', '(', ')', '$', ' ', '\t']) {
+        return None;
+    }
+    let cons = SibAddr::parse(&format!("{}{}", disp_text, &line[open..=close]))?;
+    let rest = match (&cons.base, &cons.index) {
+        (Some(b), None) if b == dst => SibAddr {
+            sym: cons.sym.clone(),
+            disp: cons.disp,
+            base: None,
+            index: None,
+        },
+        (Some(b), Some((x, 1))) if x == dst && b != dst => SibAddr {
+            sym: cons.sym.clone(),
+            disp: cons.disp,
+            base: Some(b.clone()),
+            index: None,
+        },
+        _ => return None,
+    };
+    let composed = compose_sib(producer, &rest)?;
+    let lead = line[op_start..open].len() - line[op_start..open].trim_start().len();
+    let start = op_start + lead;
+    Some(format!(
+        "{}{}{}",
+        &line[..start],
+        composed,
+        &line[close + 1..]
+    ))
+}
+
+/// Any `%fs:`/`%gs:` (or other segment) override in `line`.
+fn segment_prefix_len_anywhere(line: &str) -> bool {
+    ["%fs:", "%gs:", "%es:", "%cs:", "%ss:", "%ds:"]
+        .iter()
+        .any(|seg| line.contains(seg))
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Whole-pipeline driver for the `%rbp` relay tests: a rewrite that is
+    /// sound alone but misread by a neighbouring pass is still a bug.
+    fn rbp_relay(body: &str) -> String {
+        use super::super::super::peephole_optimize;
+        peephole_optimize(format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n"))
+    }
+
+    /// zstd_count's per-iteration zero-extension relay: `%rbp` is an ordinary
+    /// allocator-owned register in an `%rsp`-relative frame (only the
+    /// callee-save push/pop names it), the 32-bit `andl` proves its upper
+    /// half zero, so the 64-bit read relays and the copy disappears. Before
+    /// the `rbp_is_gpr_in_function` gate the identical `%r12` shape folded
+    /// and this one did not.
+    #[test]
+    fn move_relay_reads_rbp_when_it_is_a_plain_gpr() {
+        let out = rbp_relay(concat!(
+            "    pushq %rbp\n",
+            "    andl $1048319, %ebp\n",
+            "    movl %ebp, %r11d\n",
+            "    addq %r11, %rax\n",
+            "    movl $0, %r11d\n",
+            "    popq %rbp\n",
+            "    ret",
+        ));
+        assert!(out.contains("addq %rbp, %rax"), "{out}");
+        assert!(!out.contains("movl %ebp, %r11d"), "{out}");
+    }
+
+    /// Any parenthesised rbp operand proves the frame-pointer build: rbp is
+    /// then part of the frame contract and the relay must stay.
+    #[test]
+    fn move_relay_leaves_rbp_alone_in_a_frame_pointer_function() {
+        let out = rbp_relay(concat!(
+            "    pushq %rbp\n",
+            "    movq %rsp, %rbp\n",
+            "    movl -4(%rbp), %ecx\n",
+            "    andl $1048319, %ebp\n",
+            "    movl %ebp, %r11d\n",
+            "    addq %r11, %rax\n",
+            "    movl $0, %r11d\n",
+            "    addl %ecx, %eax\n",
+            "    popq %rbp\n",
+            "    ret",
+        ));
+        assert!(out.contains("movl %ebp, %r11d"), "{out}");
+        assert!(!out.contains("addq %rbp, %rax"), "{out}");
+    }
+
+    /// Even with rbp proven a GPR, the relay must not rename INTO an address:
+    /// `(%rdi,%rbp)` would read as frame-slot traffic to every later pass and
+    /// would itself be frame-pointer evidence, invalidating the proof.
+    #[test]
+    fn move_relay_never_creates_an_rbp_memory_operand() {
+        let out = rbp_relay(concat!(
+            "    pushq %rbp\n",
+            "    andl $1048319, %ebp\n",
+            "    movl %ebp, %r11d\n",
+            "    movzbl (%rdi, %r11), %eax\n",
+            "    movl $0, %r11d\n",
+            "    popq %rbp\n",
+            "    ret",
+        ));
+        assert!(!out.contains("%rbp)"), "{out}");
+        assert!(!out.contains("(%rdi, %rbp"), "{out}");
+    }
 
     /// `CfiIndex` answers exactly what the `function_range` scan answers, for
     /// every line: before the first function, inside one, on a marker,
@@ -4521,6 +5345,247 @@ mod tests {
     }
 
     #[test]
+    fn rmw_coalesce_folds_the_call_result_relay_into_the_return_register() {
+        // `return use(a) + g;`: GCC 16.2 `call use; addl g(%rip), %eax`.
+        // The dword consumer zero-extends, so the copy back is the identity.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    call bar\n",
+            "    movl %eax, %r11d\n",
+            "    addl g(%rip), %r11d\n",
+            "    movl %r11d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("addl g(%rip), %eax"), "{out}");
+        assert!(!out.contains("%r11"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_keeps_the_zero_extension_after_a_qword_write() {
+        // The last write of the coalesced value is a qword shift: its upper
+        // half may be nonzero, so the dword copy back still truncates and
+        // must survive as `movl %eax, %eax`.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    call bar\n",
+            "    movl %eax, %r11d\n",
+            "    subl %edi, %r11d\n",
+            "    shlq $3, %r11\n",
+            "    movl %r11d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        // (`subl`: no `lea` form, so an earlier pass cannot pre-empt this one.)
+        assert!(out.contains("subl %edi, %eax"), "{out}");
+        assert!(out.contains("shlq $3, %rax"), "{out}");
+        assert!(out.contains("movl %eax, %eax"), "{out}");
+        assert!(!out.contains("%r11"), "{out}");
+    }
+
+    #[test]
+    fn rmw_coalesce_copy_back_rolls_back_when_the_copy_stays_live() {
+        // %r11 is read after the copy back: the deadness proof fails and
+        // the whole rewrite (copy, consumer, dropped copy back) is undone.
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    call bar\n",
+            "    movl %eax, %r11d\n",
+            "    subl %edi, %r11d\n",
+            "    movl %r11d, %eax\n",
+            "    imull %r11d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        // Whatever else runs, the difference must still be squared: it is
+        // read twice, from one register or from two holding it.
+        assert!(
+            out.contains("subl %edi, %r11d") || out.contains("subl %edi, %eax"),
+            "{out}"
+        );
+        assert!(
+            out.contains("imull %r11d, %eax") || out.contains("imull %eax, %eax"),
+            "{out}"
+        );
+    }
+
+    /// `movl %S, %D` relays into a 32-bit LEA with no upper-half proof: the
+    /// `leal` result depends only on the low 32 bits of its address
+    /// registers. This is `use(a) * 3` (GCC: `leal (%rax,%rax,2), %eax`).
+    #[test]
+    fn move_relay_into_leal_needs_no_upper_proof() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    call bar\n",
+            "    movl %eax, %r11d\n",
+            "    leal (%r11, %r11, 2), %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leal (%rax, %rax, 2), %eax"), "{out}");
+        assert!(!out.contains("%r11"), "{out}");
+    }
+
+    /// Control: a 64-bit `leaq` reads the upper half the `movl` copy zeroed
+    /// and `%rax` (a call result) does not provably have zero there, so the
+    /// copy must stay.
+    #[test]
+    fn move_relay_into_leaq_keeps_the_zero_extending_copy() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    call bar\n",
+            "    movl %eax, %r11d\n",
+            "    leaq (%r11, %r11, 2), %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("(%rax, %rax, 2)"), "{out}");
+    }
+
+    /// The 64-bit twin: a `movq` copy relays into a self-addressed `leaq`
+    /// whose destination is the copy (`leaq (%r11,%r11,2), %r11`): the LEA
+    /// reads the copy only through its address, which the rename retargets.
+    #[test]
+    fn move_relay_into_self_addressed_leaq() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    call bar\n",
+            "    movq %rax, %r11\n",
+            "    leaq (%r11, %r11, 2), %r11\n",
+            "    leaq 1(%r11), %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!out.contains("movq %rax, %r11"), "{out}");
+        assert!(out.contains("(%rax, %rax, 2)"), "{out}");
+    }
+
+    /// `usel(a) * 3 + 1` at 64 bits: the multiply LEA composes into the
+    /// displaced `leaq 1(%T)` (GCC: `leaq 1(%rax,%rax,2), %rax`).
+    #[test]
+    fn lea_composes_into_displaced_lea_use() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    call bar\n",
+            "    leaq (%rax, %rax, 2), %r11\n",
+            "    leaq 1(%r11), %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leaq 1(%rax, %rax, 2), %rax"), "{out}");
+        assert!(!out.contains("%r11"), "{out}");
+    }
+
+    /// Displacements add (including to zero), for loads too.
+    #[test]
+    fn lea_composes_into_displaced_load_summing_displacements() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    leaq -8(%rdi, %rsi, 4), %r11\n",
+            "    movl 12(%r11), %eax\n",
+            "    movl 8(%rdi), %ecx\n",
+            "    leaq 8(%rcx, %rdx, 8), %r10\n",
+            "    addl -8(%r10), %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("movl 4(%rdi, %rsi, 4), %eax"), "{out}");
+        assert!(out.contains("(%rcx, %rdx, 8), %eax"), "{out}");
+        assert!(!out.contains("%r11") && !out.contains("%r10"), "{out}");
+    }
+
+    /// The consumer may overwrite an address register (the address is
+    /// read first) — but never through %rsp-adjusting stack instructions.
+    #[test]
+    fn lea_relay_consumer_may_write_an_address_register_except_stack_ops() {
+        let ok = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    leaq (%rax, %rbx, 1), %r11\n",
+            "    movq (%r11), %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(
+            ok.contains("movq (%rax, %rbx, 1), %rax") || ok.contains("movq (%rax,%rbx), %rax"),
+            "{ok}"
+        );
+        let pop = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    leaq 8(%rsp), %r11\n",
+            "    popq (%r11)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(pop.contains("popq (%r11)"), "{pop}");
+    }
+
+    /// Fail closed: a RIP-relative producer (relocation displacement), a
+    /// live `%T`, and an out-of-range sum all keep the LEA.
+    #[test]
+    fn displaced_relay_composition_refusals() {
+        let rip = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    leaq tbl(%rip), %r11\n",
+            "    movl 8(%r11), %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!rip.contains("8tbl") && !rip.contains("tbl8"), "{rip}");
+        let live = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    leaq (%rdi, %rsi, 4), %r11\n",
+            "    movl 8(%r11), %eax\n",
+            "    addl (%r11), %eax\n",
+            "    movq %r11, (%rdx)\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(live.contains("movq %r11, (%rdx)"), "{live}");
+        let big = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    leaq 2147483647(%rdi, %rsi, 1), %r11\n",
+            "    movl 1(%r11), %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(!big.contains("2147483648("), "{big}");
+    }
+
+    /// End to end, the `use(a) * 3 + 1` shape: the relay folds into the
+    /// `leal`, the `addl $1` folds into its displacement, and the copy back
+    /// retargets — GCC's single `leal 1(%rax,%rax,2), %eax`.
+    #[test]
+    fn mul3_plus1_relay_collapses_to_one_leal() {
+        let out = run(concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    call bar\n",
+            "    movl %eax, %r11d\n",
+            "    leal (%r11, %r11, 2), %r11d\n",
+            "    addl $1, %r11d\n",
+            "    movl %r11d, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        ));
+        assert!(out.contains("leal 1(%rax, %rax, 2), %eax"), "{out}");
+        assert!(!out.contains("%r11"), "{out}");
+        assert!(!out.contains("addl"), "{out}");
+    }
+
+    #[test]
     fn rmw_coalesce_folds_64bit_copy() {
         // `subq` (non-commutative) defeats `load_alu_fuse`'s copy+commute,
         // and the later full redefinition of %r12 defeats whole-function
@@ -4848,6 +5913,9 @@ mod tests {
 
     #[test]
     fn rmw_coalesce_refuses_movl_shlq32_before_setl_signed_compare() {
+        // Pins `coalesce_copy_into_rmw`'s refusal; the late chain rename
+        // (own tests: `chain_rename_tests`) would rename the shape.
+        let _skip = super::super::test_skips::skip_passes(&["chain_retarget"]);
         // `setl` is the OF reader lccc emits for every signed compare
         // (backend/x86/codegen/comparison.rs, i128_ops.rs). It is not a CFG
         // barrier, and the CF audit's `set` prefix skip stepped over it: with
@@ -4893,6 +5961,9 @@ mod tests {
 
     #[test]
     fn rmw_coalesce_refuses_movl_shlq32_before_adoxq_of_consumer() {
+        // Pins `coalesce_copy_into_rmw`'s refusal; the late chain rename
+        // (own tests: `chain_rename_tests`) would rename the shape.
+        let _skip = super::super::test_skips::skip_passes(&["chain_retarget"]);
         // ADOX consumes OF as its carry-in, so the divergence reaches a VALUE,
         // not just a flag: measured natively, `shlq $32` unfolded vs folded
         // with src `0x8000_0000_8000_0000` gives OF 0 vs 1 and a following
@@ -4918,6 +5989,9 @@ mod tests {
 
     #[test]
     fn rmw_coalesce_refuses_movl_shlq32_when_clc_kills_cf_but_not_of() {
+        // Pins `coalesce_copy_into_rmw`'s refusal; the late chain rename
+        // (own tests: `chain_rename_tests`) would rename the shape.
+        let _skip = super::super::test_skips::skip_passes(&["chain_retarget"]);
         // Partial credit must not end the audit. CLC writes CF — settling the
         // CF question — and preserves OF (silicon-verified, as do `stc`,
         // `sahf` and the `bt` family), so the divergent OF is still live at
@@ -5013,6 +6087,9 @@ mod tests {
 
     #[test]
     fn rmw_coalesce_refuses_callee_saved_source_without_spill() {
+        // Pins `coalesce_copy_into_rmw`'s refusal; the late chain rename
+        // (own tests: `chain_rename_tests`) would rename the shape.
+        let _skip = super::super::test_skips::skip_passes(&["chain_retarget"]);
         // %ebx is owed its entry value at `ret` (RET_LIVE must-restore), an
         // obligation no text scan can see: whole-function uniqueness must not
         // justify the new write even though %ebx is mentioned only at the
@@ -6240,6 +7317,9 @@ mod tests {
 
     #[test]
     fn lea_is_kept_when_the_temporary_survives_the_use() {
+        // Pins `the refusal under test; the late chain rename
+        // (own tests: `chain_rename_tests`) would rename the shape.
+        let _skip = super::super::test_skips::skip_passes(&["chain_retarget"]);
         let out = run(concat!(
             "foo:\n",
             ".cfi_startproc\n",
@@ -6553,6 +7633,9 @@ mod tests {
 
     #[test]
     fn rmw_coalesce_refuses_source_read_by_consumer() {
+        // Pins `coalesce_copy_into_rmw`'s refusal; the late chain rename
+        // (own tests: `chain_rename_tests`) would rename the shape.
+        let _skip = super::super::test_skips::skip_passes(&["chain_retarget"]);
         // The consumer reads the source (`andl %r8d, %r10d`): the source's
         // old value is live into the consumer, so the clobber cannot be
         // proven dead and the candidate must be refused. (The rename
@@ -6645,6 +7728,9 @@ mod tests {
 
     #[test]
     fn rmw_coalesce_refuses_zext_when_rdx_return_marker_set() {
+        // Pins `coalesce_copy_into_rmw`'s refusal; the late chain rename
+        // (own tests: `chain_rename_tests`) would rename the shape.
+        let _skip = super::super::test_skips::skip_passes(&["chain_retarget"]);
         // The sound direction of the return-type fact: `# LCCC_RET_RDX 1`
         // (an i128 return) keeps `%rdx` live at `ret`, so the source's old
         // value cannot be proven dead and the pair must stay.
@@ -6664,6 +7750,9 @@ mod tests {
 
     #[test]
     fn rmw_coalesce_refuses_zext_copy_under_wide_mask() {
+        // Pins `coalesce_copy_into_rmw`'s refusal; the late chain rename
+        // (own tests: `chain_rename_tests`) would rename the shape.
+        let _skip = super::super::test_skips::skip_passes(&["chain_retarget"]);
         // `$511` keeps bit 8, where the zero-extension (0) and the raw
         // source (garbage) disagree: folding would compute the wrong value.
         let out = run(concat!(
@@ -6681,6 +7770,9 @@ mod tests {
 
     #[test]
     fn rmw_coalesce_refuses_zext_copy_under_non_mask_consumer() {
+        // Pins `coalesce_copy_into_rmw`'s refusal; the late chain rename
+        // (own tests: `chain_rename_tests`) would rename the shape.
+        let _skip = super::super::test_skips::skip_passes(&["chain_retarget"]);
         // `orl` does not kill the extension garbage (it ORs it in): only an
         // `andl` with a subsuming mask admits an extension copy.
         let out = run(concat!(
@@ -7478,5 +8570,451 @@ mod rmw_window_tests {
             splice_lea_into_mem_operand(ok_line, "%r8", "(%rsi)").as_deref(),
             Some("movq 8(%rsi, %rcx, 8), %rax"),
         );
+    }
+}
+
+#[cfg(test)]
+mod chain_rename_tests {
+    use super::super::super::peephole_optimize;
+
+    fn run(body: &str) -> String {
+        peephole_optimize(format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n"))
+    }
+
+    /// `m3x`: `use(a) * 3 + b` — GCC 16.2 computes straight into %eax.
+    #[test]
+    fn producer_rmw_copy_chain_is_computed_in_the_copy_target() {
+        let out = run(
+            "    leal (%rax, %rax, 2), %r11d\n    addl %ebx, %r11d\n    movl %r11d, %eax\n    ret",
+        );
+        assert!(out.contains("leal (%rax, %rax, 2), %eax"), "{out}");
+        assert!(out.contains("addl %ebx, %eax"), "{out}");
+        assert!(!out.contains("%r11"), "{out}");
+    }
+
+    #[test]
+    fn chain_rename_declines_unsound_windows() {
+        // A later window line reads D's OLD value.
+        let out = run(
+            "    leal (%rcx, %rcx, 2), %r11d\n    addl %eax, %r11d\n    movl %r11d, %eax\n    ret",
+        );
+        assert!(out.contains("addl %eax, %r11d"), "{out}");
+        // 64-bit last write under a movl copy (bits 32..63 must be dropped).
+        let out = run(
+            "    leaq (%rcx, %rcx, 2), %r11\n    addq %rbx, %r11\n    movl %r11d, %eax\n    ret",
+        );
+        assert!(!out.contains("addq %rbx, %rax"), "{out}");
+        // T still read after the copy.
+        let out = run(
+            "    leal (%rcx, %rcx, 2), %r11d\n    addl %ebx, %r11d\n    movl %r11d, %eax\n    addl %r11d, %eax\n    ret",
+        );
+        assert!(out.contains("addl %ebx, %r11d"), "{out}");
+        // Implicit operand in the window: `cltd` reads D's OLD %eax and
+        // its %edx result is stored, so it cannot be deleted first.
+        let out = run(
+            "    leal (%rcx, %rcx, 2), %r11d\n    cltd\n    addl %ebx, %r11d\n    movl %r11d, %eax\n    movl %edx, (%rdi)\n    ret",
+        );
+        assert!(out.contains("cltd"), "{out}");
+        assert!(out.contains("addl %ebx, %r11d"), "{out}");
+        // Narrow T mention (a partial read the rename must not touch).
+        let out = run(
+            "    leal (%rcx, %rcx, 2), %r11d\n    movb %r11b, (%rdi)\n    movl %r11d, %eax\n    ret",
+        );
+        assert!(out.contains("%r11b"), "{out}");
+    }
+
+    /// The shapes whose `coalesce_copy_into_rmw` refusals other tests pin
+    /// (with this pass skipped): the rename must leave the hazards they guard
+    /// untouched — the source register is never written, flags consumers see
+    /// the same flag-setting value, a live `%rdx` return half is untouched.
+    #[test]
+    fn chain_rename_on_coalesce_refusal_shapes_is_value_preserving() {
+        let body = |out: &str| -> Vec<String> {
+            out.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('.') && !l.ends_with(':'))
+                .map(str::to_string)
+                .collect()
+        };
+        let out = run("    movl %r8d, %r10d\n    andl %r8d, %r10d\n    movl %r10d, %eax\n    ret");
+        assert_eq!(
+            body(&out),
+            ["movl %r8d, %eax", "andl %r8d, %eax", "ret"],
+            "{out}"
+        );
+        let out = run(
+            "    movl %ebx, %r11d\n    shlq $32, %r11\n    movq %r11, %rdi\n    call bar\n    ret",
+        );
+        assert_eq!(
+            body(&out),
+            ["movl %ebx, %edi", "shlq $32, %rdi", "call bar", "ret"],
+            "{out}"
+        );
+        let out = run(
+            "    movl %r8d, %r10d\n    shlq $32, %r10\n    setl %cl\n    movq %r10, %rax\n    ret",
+        );
+        assert_eq!(
+            body(&out),
+            ["movl %r8d, %eax", "shlq $32, %rax", "setl %cl", "ret"],
+            "{out}"
+        );
+        let out = run(
+            "    # LCCC_RET_RDX 1\n    movzbl %dl, %r11d\n    andl $127, %r11d\n    movl %r11d, %eax\n    ret",
+        );
+        assert_eq!(
+            body(&out),
+            [
+                "# LCCC_RET_RDX 1",
+                "movzbl %dl, %eax",
+                "andl $127, %eax",
+                "ret"
+            ],
+            "{out}"
+        );
+    }
+
+    /// A 32-bit chain under a movq copy: the upper half is already zero.
+    #[test]
+    fn chain_rename_accepts_movq_copy_of_a_32bit_chain() {
+        let out = run(
+            "    leal (%rcx, %rcx, 4), %r10d\n    subl %esi, %r10d\n    movq %r10, %rax\n    ret",
+        );
+        assert!(out.contains("subl %esi, %eax"), "{out}");
+        assert!(!out.contains("%r10"), "{out}");
+    }
+
+    /// `-g` must not change code: the `.loc` lines between the chain and its
+    /// copy (zstd_count's `shrl`/`andl` chain had two) do not count against
+    /// the window. Five per gap exhaust the old line-counting budget.
+    #[test]
+    fn chain_rename_window_ignores_debug_locations() {
+        let plain =
+            "    leal (%rax, %rax, 2), %r11d\n    addl %ebx, %r11d\n    movl %r11d, %eax\n    ret";
+        let locs = ".loc 1 7 3\n".repeat(5);
+        let debug = format!(
+            "    leal (%rax, %rax, 2), %r11d\n{locs}    addl %ebx, %r11d\n{locs}    movl %r11d, %eax\n    ret"
+        );
+        let strip = |s: String| -> String {
+            s.lines()
+                .filter(|l| !l.trim_start().starts_with(".loc"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let (a, b) = (strip(run(plain)), strip(run(&debug)));
+        assert!(a.contains("addl %ebx, %eax"), "{a}");
+        assert_eq!(a, b, "debug locations changed the generated code");
+    }
+}
+
+#[cfg(test)]
+mod scaled_index_temp_tests {
+    use super::super::super::peephole_optimize;
+    use super::super::super::types::{LineInfo, LineStore, classify_line};
+    use super::fold_scaled_index_temp_into_mem;
+
+    fn func(body: &[&str]) -> String {
+        format!(
+            ".text\nf:\n.cfi_startproc\n{}\n    ret\n.cfi_endproc\n",
+            body.join("\n")
+        )
+    }
+
+    /// Run ONLY this pass; returns (changed, resulting instruction lines).
+    fn fold(body: &[&str]) -> (bool, Vec<String>) {
+        let mut store = LineStore::new(func(body));
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = fold_scaled_index_temp_into_mem(&mut store, &mut infos);
+        let lines = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .filter(|l| l.starts_with(|c: char| c.is_ascii_lowercase()) && !l.ends_with(':'))
+            .collect();
+        (changed, lines)
+    }
+
+    #[test]
+    fn index_only_lea_folds_into_the_unscaled_index() {
+        // `__builtin_prefetch(&p[i] + 16)` loop body (measured).
+        let (c, out) = fold(&[
+            "    leaq 0(,%r9,8), %r11",
+            "    prefetcht0 128(%rdi, %r11, 1)",
+        ]);
+        assert!(c);
+        assert_eq!(out, ["prefetcht0 128(%rdi, %r9, 8)", "ret"]);
+    }
+
+    #[test]
+    fn lea_shift_pair_folds_into_a_scaled_index() {
+        // `__builtin_prefetch(&d[i + 8], 1, 0)` loop body (measured).
+        let (c, out) = fold(&[
+            "    leaq 8(%r8), %r9",
+            "    shlq $3, %r9",
+            "    prefetchnta (%rdi, %r9)",
+        ]);
+        assert!(c);
+        assert_eq!(out, ["prefetchnta 64(%rdi, %r8, 8)", "ret"]);
+    }
+
+    #[test]
+    fn sole_base_temp_becomes_an_index_only_operand() {
+        let (c, out) = fold(&[
+            "    leaq 16(%r8), %r9",
+            "    shlq $2, %r9",
+            "    movl (%r9), %eax",
+        ]);
+        assert!(c);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(
+            out[0].starts_with("movl 64(") && out[0].contains("%r8, 4)"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn producer_index_may_be_the_temporary_itself() {
+        // With the producer deleted, %r9 keeps its pre-producer value.
+        let (c, out) = fold(&["    leaq 0(,%r9,8), %r9", "    prefetcht0 (%rdi, %r9)"]);
+        assert!(c);
+        assert_eq!(out, ["prefetcht0 (%rdi, %r9, 8)", "ret"]);
+    }
+
+    #[test]
+    fn declines_unsound_or_unprofitable_windows() {
+        for body in [
+            // %T read after the consumer.
+            &[
+                "    leaq 0(,%r9,8), %r11",
+                "    prefetcht0 (%rdi, %r11)",
+                "    movq %r11, %rax",
+            ][..],
+            // The deleted shl's flags are read.
+            &[
+                "    leaq 8(%r8), %r9",
+                "    shlq $3, %r9",
+                "    prefetcht0 (%rdi, %r9)",
+                "    setc %al",
+            ],
+            // 32-bit shift: zero-extension is not lea scaling.
+            &[
+                "    leaq 8(%r8), %r9",
+                "    shll $3, %r9d",
+                "    prefetcht0 (%rdi, %r9)",
+            ],
+            // Scale 4 is not encodable after shifting by 4.
+            &[
+                "    leaq 8(%r8), %r9",
+                "    shlq $4, %r9",
+                "    prefetcht0 (%rdi, %r9)",
+            ],
+            // %T is the SCALED index: composing would need a scale product.
+            &["    leaq 0(,%r9,8), %r11", "    prefetcht0 (%rdi, %r11, 2)"],
+            // Two mentions of %T in the consumer.
+            &["    leaq 0(,%r9,8), %r11", "    movq %r11, (%rdi, %r11)"],
+            // lea consumer: base+index+disp is a slow LEA on Skylake-family.
+            &["    leaq 0(,%r9,8), %r11", "    leaq 128(%rdi, %r11), %rax"],
+            // Not adjacent: an intervening write to the producer's input.
+            &[
+                "    leaq 0(,%r9,8), %r11",
+                "    addq $1, %r9",
+                "    prefetcht0 (%rdi, %r11)",
+            ],
+            // Base equals the producer index: (%rdi)+(%rdi*8) is scale 9.
+            &["    leaq 0(,%rdi,8), %r11", "    prefetcht0 (%rdi, %r11)"],
+            // Segment-relative consumer.
+            &[
+                "    leaq 0(,%r9,8), %r11",
+                "    movq %gs:(%rdi, %r11), %rax",
+            ],
+            // Base-and-index producer with an index consumer: three registers.
+            &["    leaq (%rsi,%r9,8), %r11", "    prefetcht0 (%rdi, %r11)"],
+        ] {
+            let (c, _) = fold(body);
+            assert!(!c, "{body:?}");
+        }
+    }
+
+    /// The whole pipeline reaches GCC's shape from the measured codegen.
+    #[test]
+    fn pipeline_matches_gcc_for_the_software_prefetch_idiom() {
+        let out = peephole_optimize(func(&[
+            "    leaq 8(%r8), %r9",
+            "    shlq $3, %r9",
+            "    prefetchnta (%rdi, %r9)",
+            "    movq (%rsi, %r8, 8), %rax",
+        ]));
+        assert!(out.contains("prefetchnta 64(%rdi, %r8, 8)"), "{out}");
+        assert!(!out.contains("%r9"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod rbp_role_and_span_tests {
+    use super::super::super::types::{
+        LineInfo, LineStore, REG_GP_MAX, classify_line, mark_nop, replace_line,
+    };
+    use super::super::liveness::FileLiveness;
+    use super::{LazyDeadness, RbpRoles, rbp_is_gpr_in_function};
+
+    fn parse(asm: &str) -> (LineStore, Vec<LineInfo>) {
+        let store = LineStore::new(asm.to_string());
+        let infos = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        (store, infos)
+    }
+
+    fn line_of(store: &LineStore, text: &str) -> usize {
+        (0..store.len())
+            .find(|&i| store.get(i).trim() == text)
+            .unwrap_or_else(|| panic!("fixture lacks `{text}`"))
+    }
+
+    /// The verdict over a one-function program whose body is `body`.
+    fn verdict(body: &str) -> bool {
+        let (store, infos) = parse(&format!("f:\n.cfi_startproc\n{body}\n.cfi_endproc\n"));
+        rbp_is_gpr_in_function(&store, &infos, 0, store.len() - 1)
+    }
+
+    /// One fixture per frame-pointer rule.  The `bp`-free spellings
+    /// (`.cfi_def_cfa_register 6`, `leave`, `enter`) are the ones the
+    /// one-substring prefilter must still let through.
+    #[test]
+    fn rbp_verdict_sees_every_frame_pointer_rule() {
+        let gpr =
+            "    pushq %rbp\n    movq %rdi, %rbp\n    addq %rbp, %rax\n    popq %rbp\n    ret";
+        assert!(verdict(gpr), "a callee-saved rbp used as data is a GPR");
+        for evidence in [
+            "    movq %rsp, %rbp",
+            "    movq %rbp, %rsp",
+            "    movl %esp, %ebp",
+            "    mov %ebp, %esp",
+            "    leave",
+            "    leaveq",
+            "    enter $16, $0",
+            ".cfi_def_cfa_register 6",
+            ".cfi_def_cfa_register 5",
+            ".cfi_def_cfa_register %rbp",
+            ".cfi_def_cfa %rbp, 16",
+            "    movq -8(%rbp), %rax",
+            "    movl %eax, (%ebp)",
+            "    leaq 16(%rbp), %rdi",
+            "    movw %ax, (%bp)",
+        ] {
+            let body =
+                format!("    pushq %rbp\n{evidence}\n    addq %rbp, %rax\n    popq %rbp\n    ret");
+            assert!(
+                !verdict(&body),
+                "`{evidence}` marks a frame-pointer function"
+            );
+        }
+    }
+
+    /// A memo hit is the predicate on the current text: verdicts are kept
+    /// across queries, an edit forgets exactly its function's verdict, and a
+    /// line outside every function answers `false`.
+    #[test]
+    fn rbp_roles_memo_forgets_only_the_edited_function() {
+        let (mut store, mut infos) = parse(concat!(
+            "    .text\n",
+            "f:\n.cfi_startproc\n",
+            "    pushq %rbp\n    movq %rdi, %rbp\n    addq %rbp, %rax\n    popq %rbp\n    ret\n",
+            ".cfi_endproc\n",
+            "g:\n.cfi_startproc\n",
+            "    pushq %rbp\n    movq %rsi, %rbp\n    addq %rbp, %rdx\n    popq %rbp\n    ret\n",
+            ".cfi_endproc\n",
+        ));
+        let lv = FileLiveness::new(&store, &infos);
+        let mut roles = RbpRoles::default();
+        let in_f = line_of(&store, "addq %rbp, %rax");
+        let in_g = line_of(&store, "addq %rbp, %rdx");
+        assert!(
+            !roles.is_gpr(&lv, &store, &infos, 0),
+            "`.text` lies outside every function"
+        );
+        assert!(roles.is_gpr(&lv, &store, &infos, in_f));
+        assert!(roles.is_gpr(&lv, &store, &infos, in_g));
+        assert_eq!(roles.verdicts.len(), 2);
+
+        // Turn f into a frame-pointer function, as a fold creating an
+        // `(%rbp)` operand would.
+        replace_line(
+            &mut store,
+            &mut infos[in_f],
+            in_f,
+            "    movq 8(%rbp), %rax".to_string(),
+        );
+        roles.edited(&lv, &store, &infos, in_f);
+        assert_eq!(roles.verdicts.len(), 1, "only f's verdict is dropped");
+        assert!(
+            !roles.is_gpr(&lv, &store, &infos, in_f),
+            "the re-scan sees the new text"
+        );
+        assert!(roles.is_gpr(&lv, &store, &infos, in_g));
+    }
+
+    /// Every `(line, family)` answer of `dead`'s solution equals a fresh
+    /// analysis of the current text.
+    fn assert_matches_fresh(dead: &LazyDeadness, store: &LineStore, infos: &[LineInfo]) {
+        let lv = dead.lv.as_ref().expect("solution built");
+        let fresh = FileLiveness::new(store, infos);
+        for n in 0..store.len() {
+            for fam in 0..=REG_GP_MAX {
+                assert_eq!(
+                    lv.live_after(n, fam),
+                    fresh.live_after(n, fam),
+                    "line {n} `{}`, family {fam}",
+                    store.get(n).trim()
+                );
+            }
+        }
+    }
+
+    const LOOP: &str = concat!(
+        "f:\n.cfi_startproc\n",
+        "    movq %rdi, %rax\n",
+        "    xorl %esi, %esi\n",
+        ".L1:\n",
+        "    leaq 8(%rax), %rdx\n",
+        "    movq (%rdx), %rcx\n",
+        "    addq %rcx, %rsi\n",
+        "    decq %r8\n",
+        "    jne .L1\n",
+        "    movq %rsi, %rax\n",
+        "    ret\n",
+        ".cfi_endproc\n",
+    );
+
+    /// `fold_lea_into_memory_op`'s edit (LEA deleted, consumer rewritten)
+    /// reported as a span keeps the cached solution exact, both on the
+    /// direct path and when the function is already queued for a full
+    /// re-analysis by `invalidate`.
+    #[test]
+    fn lazy_deadness_span_refresh_equals_a_fresh_analysis() {
+        for queued in [false, true] {
+            let (mut store, mut infos) = parse(LOOP);
+            let mut dead = LazyDeadness::new();
+            let i = line_of(&store, "leaq 8(%rax), %rdx");
+            let j = line_of(&store, "movq (%rdx), %rcx");
+            assert!(
+                dead.dead_after(&store, &infos, j, 2, &[i, j]),
+                "%rdx dies at its use"
+            );
+            mark_nop(&mut infos[i]);
+            replace_line(
+                &mut store,
+                &mut infos[j],
+                j,
+                "    movq 8(%rax), %rcx".to_string(),
+            );
+            if queued {
+                dead.invalidate(&store, &infos, j);
+            }
+            dead.invalidate_span(&store, &infos, i, j);
+            // Drain any queued re-analysis the way a query does.
+            dead.dead_after(&store, &infos, j, 1, &[j]);
+            assert_matches_fresh(&dead, &store, &infos);
+        }
     }
 }

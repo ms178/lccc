@@ -18,7 +18,7 @@ C
 body=$(sed -n '/^copy64:/,/^\.size copy64/p' "$tmp/v3.s")
 [[ $(grep -c 'vmovdqu.*%ymm' <<<"$body") -eq 4 ]]
 grep -q 'vzeroupper' <<<"$body"
-! grep -Eq '(subq|addq).*%rsp|movq[[:space:]]+%rsi,[[:space:]]*%rax' <<<"$body"
+! grep -Eq '(subq|addq).*%rsp|movq[[:space:]]+%rsi,[[:space:]]*%rax' <<<"$body" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 [[ $(grep -Ec '^[[:space:]]+(v?mov|vzeroupper|ret)' <<<"$body") -eq 6 ]]
-"$CCC" -O2 -S "$tmp/t.c" -o "$tmp/base.s"
-! grep -q '%ymm' "$tmp/base.s"
+"$CCC" -O2 -march=x86-64 -S "$tmp/t.c" -o "$tmp/base.s"  # explicit baseline: independent of the default -march
+! grep -q '%ymm' "$tmp/base.s" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }

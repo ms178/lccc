@@ -22,7 +22,11 @@ impl I686Codegen {
     /// Exactly the constructs that expand to a `@GOT`/`@GOTOFF` reference:
     ///   * `GlobalAddr`  -> `movl sym@GOT(%ebx)` / `leal sym@GOTOFF(%ebx)`
     ///   * `LabelAddr`   -> `leal L@GOTOFF(%ebx)`   (computed goto, `&&label`)
-    ///   * TLS addresses -> `movl sym@GOTNTPOFF(%ebx)`
+    ///   * TLS addresses whose model reads the GOT: initial-exec
+    ///     (`sym@GOTNTPOFF(%ebx)`) and the dynamic descriptor
+    ///     (`sym@TLSDESC(%ebx)`). Local-exec (`%gs:0 + sym@NTPOFF`) is a
+    ///     link-time constant, so a PIE function whose only PIC construct
+    ///     is a local-exec access needs no thunk (GCC: none either).
     ///   * a `Switch` lowered to a jump table -> `leal jt@GOTOFF(%ebx)`
     ///   * inline asm, which may name any symbol in text we do not parse
     ///
@@ -43,7 +47,7 @@ impl I686Codegen {
                     };
                     self.state.tls_symbols.contains(name)
                         && matches!(
-                            self.state.tls_model_for_symbol(name),
+                            self.state.tls_model(name),
                             crate::ir::reexports::TlsModel::LocalDynamic
                                 | crate::ir::reexports::TlsModel::GlobalDynamic
                         )
@@ -62,6 +66,10 @@ impl I686Codegen {
             }
             for inst in &block.instructions {
                 match inst {
+                    Instruction::GlobalAddr { name, .. }
+                        if self.state.tls_symbols.contains(name)
+                            && self.state.tls_model(name)
+                                == crate::common::tls::TlsModel::LocalExec => {}
                     Instruction::GlobalAddr { .. }
                     | Instruction::LabelAddr { .. }
                     | Instruction::InlineAsm { .. }
@@ -355,6 +363,17 @@ impl I686Codegen {
         } else {
             None
         };
+        // Omitted TLS roots (PIC too: the IE offset comes via %ebx) are never
+        // written either; a register home would only cost a callee-save push.
+        if !self.state.omitted_tls_roots.is_empty() {
+            let roots: Vec<u32> = self.state.omitted_tls_roots.keys().copied().collect();
+            self.state
+                .never_materialized_values
+                .extend(roots.iter().copied());
+            never_materialized
+                .get_or_insert_with(Default::default)
+                .extend(roots);
+        }
 
         // Return-consumed accumulator flow: a value whose SOLE use is the
         // Return terminator and whose producer preserves the accumulator
@@ -465,6 +484,13 @@ impl I686Codegen {
             // folds to their consumers, so the address registers survive
             // intervening calls and accumulator staging.
             crate::backend::generation::collect_folded_gep_links_all(func, false),
+            // Register-base constant-offset folds (%ebx/%esi/%edi/%ebp homes;
+            // const_offset_fold_reg_base_ok): defer their address producers.
+            [0u8, 1, 2, 3]
+                .into_iter()
+                .map(crate::backend::regalloc::PhysReg)
+                .filter(|&r| super::emit::i686_const_fold_base_reg(r))
+                .collect(),
             &self.state.ra_config,
             // Not alias-aware yet: ignored scratch map keeps the pre-alias freshness behavior.
             &mut crate::common::fx_hash::FxHashMap::default(),

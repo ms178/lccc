@@ -12,6 +12,6 @@ CCC_NO_LEAF_PARAM_GPR=1 CCC_NO_EMPTY_LOCAL_FRAME_ELISION=1 "$CCC" -O2 -S "$t/t.c
 on=$(sed -n '/^leaf:/,/^\.size leaf/p' "$t/on.s")
 off=$(sed -n '/^leaf:/,/^\.size leaf/p' "$t/off.s")
 grep -q 'pushq' <<<"$on"
-! grep -Eq '(subq|addq).*%rsp' <<<"$on"
+! grep -Eq '(subq|addq).*%rsp' <<<"$on" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 grep -Eq 'subq.*%rsp' <<<"$off"
 grep -q '\.cfi_def_cfa_offset 24' <<<"$on"

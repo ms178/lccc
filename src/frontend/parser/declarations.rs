@@ -31,6 +31,11 @@ struct DeclContext {
     alignment_sizeof_type: Option<TypeSpecifier>,
     /// `__attribute__((common))` - emit as common symbol
     is_common: bool,
+    /// Visibility / TLS model written in the declaration SPECIFIERS: they
+    /// apply to every declarator of the declaration, unlike the ones written
+    /// after a declarator (see `parse_external_decl`).
+    spec_visibility: Option<String>,
+    spec_tls_model: Option<crate::common::tls::TlsModel>,
 }
 
 /// Parser-side mirror of `common::type_builder::apply_declaration_address_space`
@@ -156,6 +161,13 @@ impl Parser {
         // Capture constructor/destructor from type-level attributes
         let type_level_ctor = self.attrs.parsing_constructor();
         let type_level_dtor = self.attrs.parsing_destructor();
+        // Attributes in the declaration specifiers apply to EVERY declarator:
+        // `__attribute__((visibility("hidden"))) int a, b;` hides both, while
+        // `int c __attribute__((visibility("hidden"))), d;` hides only `c`
+        // (GCC 16.2, measured). Snapshot the specifier-level values before the
+        // first declarator's own attributes are merged in and taken.
+        let spec_visibility = self.attrs.parsing_visibility.clone();
+        let spec_tls_model = self.attrs.parsing_tls_model;
 
         // Bare type with no declarator (e.g., struct definition)
         if self.at_eof() || matches!(self.peek(), TokenKind::Semicolon) {
@@ -232,6 +244,7 @@ impl Parser {
         let is_noreturn = self.attrs.parsing_noreturn();
         let cleanup_fn = self.attrs.parsing_cleanup_fn.take();
         let symver = self.attrs.parsing_symver.take();
+        let target = self.attrs.parsing_target.take();
         let diagnose_as = self.attrs.parsing_diagnose_as.take();
         let is_used = self.attrs.parsing_used();
         let is_fastcall = self.attrs.parsing_fastcall();
@@ -264,11 +277,13 @@ impl Parser {
         decl_attrs.set_nested_fn(self.attrs.parsing_nested_fn());
         decl_attrs.alias_target = alias_target;
         decl_attrs.visibility = visibility;
+        decl_attrs.tls_model = tls_model;
         decl_attrs.section = section;
         decl_attrs.tls_model = tls_model;
         decl_attrs.asm_register = first_asm_reg;
         decl_attrs.cleanup_fn = cleanup_fn;
         decl_attrs.symver = symver;
+        decl_attrs.target = target;
         decl_attrs.diagnose_as = diagnose_as;
 
         // Apply __attribute__((mode(...))): transform type to specified bit-width
@@ -310,6 +325,8 @@ impl Parser {
                 alignas_type,
                 alignment_sizeof_type,
                 is_common,
+                spec_visibility,
+                spec_tls_model,
             };
             self.parse_declaration_rest(type_spec, name, derived, start, ctx)
         }
@@ -719,6 +736,9 @@ impl Parser {
         if let Some(ref vis) = self.attrs.parsing_visibility {
             last_decl.attrs.visibility = Some(vis.clone());
         }
+        if let Some(model) = self.attrs.parsing_tls_model.take() {
+            last_decl.attrs.tls_model = Some(model);
+        }
         if let Some(ref sect) = self.attrs.parsing_section {
             last_decl.attrs.section = Some(sect.clone());
         }
@@ -772,6 +792,7 @@ impl Parser {
         self.attrs.set_weak(false);
         self.attrs.parsing_alias_target = None;
         self.attrs.parsing_visibility = None;
+        self.attrs.parsing_tls_model = None;
         self.attrs.parsing_section = None;
         self.attrs.set_error_attr(false);
         self.attrs.set_noreturn(false);
@@ -808,7 +829,9 @@ impl Parser {
                 .attrs
                 .parsing_visibility
                 .take()
+                .or_else(|| ctx.spec_visibility.clone())
                 .or_else(|| self.pragma_default_visibility.clone());
+            let d_tls_model = self.attrs.parsing_tls_model.take().or(ctx.spec_tls_model);
             // Per-declarator section attribute overrides, otherwise inherit from
             // the declaration-level attribute (e.g. __attribute__((section(".x"))) int a, b;)
             let d_section = self
@@ -857,6 +880,7 @@ impl Parser {
                     da.regparm = d_regparm;
                     da.alias_target = d_alias;
                     da.visibility = d_vis;
+                    da.tls_model = d_tls_model;
                     da.section = d_section;
                     da.object_space = d_object_space;
                     da.object_volatile = d_object_volatile;
@@ -949,6 +973,14 @@ impl Parser {
         let type_spec = self.parse_type_specifier()?;
 
         self.consume_post_type_qualifiers();
+        // Specifier-level visibility / TLS model apply to every declarator;
+        // a declarator's own attribute applies to it alone (same rule as the
+        // file-scope path). Both are TAKEN so neither can leak into a later
+        // declaration of the block: a stale `tls_model("local-exec")` landing
+        // on a later `extern __thread` would read another module's TLS
+        // through a link-time offset that does not belong to it.
+        let spec_visibility = self.attrs.parsing_visibility.take();
+        let spec_tls_model = self.attrs.parsing_tls_model.take();
 
         // Snapshot the declaration's address space NOW: initializer parsing
         // can contain casts to segment-qualified pointers, and the abstract-
@@ -1012,7 +1044,12 @@ impl Parser {
             let (skip_mode, skip_aligned, skip_asm_reg) = self.skip_asm_and_attributes();
             let local_cleanup_fn = self.attrs.parsing_cleanup_fn.take();
             let local_section = self.attrs.parsing_section.take();
-            let local_tls_model = self.attrs.parsing_tls_model.take();
+            let local_visibility = self
+                .attrs
+                .parsing_visibility
+                .take()
+                .or_else(|| spec_visibility.clone());
+            let local_tls_model = self.attrs.parsing_tls_model.take().or(spec_tls_model);
             mode_kind = mode_kind.or(decl_mode).or(skip_mode);
             // Merge alignment from declarator and post-declarator attributes
             for a in [decl_aligned, skip_aligned].iter().copied().flatten() {
@@ -1053,9 +1090,8 @@ impl Parser {
                     if let Some(ref target) = self.attrs.parsing_alias_target {
                         da.alias_target = Some(target.clone());
                     }
-                    if let Some(ref vis) = self.attrs.parsing_visibility {
-                        da.visibility = Some(vis.clone());
-                    }
+                    da.visibility = local_visibility;
+                    da.tls_model = local_tls_model;
                     da
                 },
                 span: start,
@@ -1143,6 +1179,10 @@ impl Parser {
         d.set_pointer_const(self.attrs.parsing_pointer_const());
         d.set_thread_local(self.attrs.parsing_thread_local());
         d.set_transparent_union(is_transparent_union);
+        // An attribute written after an initializer must not outlive this
+        // declaration either (see the specifier snapshot above).
+        self.attrs.parsing_visibility = None;
+        self.attrs.parsing_tls_model = None;
         Some(d)
     }
 

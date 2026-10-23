@@ -108,7 +108,7 @@ pub(crate) fn run(module: &mut IrModule) -> usize {
             fn_changes += n;
             total += n;
         }
-        if std::env::var("CCC_DEBUG_SROA").is_ok() && fn_changes > 0 {
+        if fn_changes > 0 && split::sroa_trace() {
             eprintln!("[SROA] fn {} changes={}", f.name, fn_changes);
         }
     }
@@ -300,10 +300,62 @@ struct Plan {
 }
 
 struct Scan {
-    gep: FxHashMap<u32, (u32, i64)>,
+    /// Pointer derivations: value -> (base, offset). The offset is `None` for
+    /// a `GetElementPtr` with a runtime offset: the value still points INTO
+    /// `base`'s object, which every identity question (escape, "may this
+    /// write reach the source?", "is every read of the object accounted
+    /// for?") must see, even though no field can be named. See `resolve`.
+    gep: FxHashMap<u32, (u32, Option<i64>)>,
     alloca_size: FxHashMap<u32, i64>,
     escapes: FxHashSet<u32>,
     memcpy: Vec<(usize, usize, u32, u32, i64)>,
+    /// Library `memset` calls of a constant byte and length (see
+    /// [`const_memset`]): `(block, index, ptr, byte, len, result)`. Their
+    /// pointer argument is still in `escapes` -- forms 1-3 do not model a
+    /// memset and must keep treating it as an opaque write -- and is left out
+    /// of `split_escapes` only, because form 4 models exactly this call.
+    memset: Vec<(usize, usize, u32, u8, i64, Option<Value>)>,
+    /// `escapes` minus the pointer arguments of `memset` calls, or `None`
+    /// when there are none (then it equals `escapes`). Read through
+    /// [`Scan::split_escapes`].
+    split_escapes: Option<FxHashSet<u32>>,
+}
+
+impl Scan {
+    /// The escape set form 4 (`split`) uses: identical to `escapes` except
+    /// that a constant library memset's pointer argument does not escape,
+    /// because form 4 either rewrites that call as per-field constant stores
+    /// (a whole-object memset) or refuses the object.
+    fn split_escapes(&self) -> &FxHashSet<u32> {
+        self.split_escapes.as_ref().unwrap_or(&self.escapes)
+    }
+}
+
+/// `memset(p, c, n)` with a constant byte and a positive constant length that
+/// may be treated as the library function: `(p, (unsigned char)c, n)`.
+///
+/// Shape and permission are the backend's own predicate
+/// ([`inline_memset_const_len`](crate::backend::generation::inline_memset_const_len):
+/// `CallInfo::assume_library`, so `-fno-builtin`, `-ffreestanding` and a TU
+/// definition or redirect of `memset` all refuse; a constant `n`; and the
+/// fortify `destlen` rule for `__memset_chk`), so the IR passes and the
+/// emitter never disagree about which calls are library memsets. The SROA
+/// unlock analysis in the inliner uses the same predicate, so it never
+/// promises a split this module refuses.
+pub(crate) fn const_memset(
+    func: &str,
+    info: &crate::ir::instruction::CallInfo,
+) -> Option<(Value, u8, i64)> {
+    let n = crate::backend::generation::inline_memset_const_len(func, info)?;
+    let Some(Operand::Value(p)) = info.args.first() else {
+        return None;
+    };
+    let Some(Operand::Const(c)) = info.args.get(1) else {
+        return None;
+    };
+    // C11 7.24.6.1: the value is converted to `unsigned char`.
+    let byte = c.to_i64()? as u8;
+    (n > 0).then_some((*p, byte, n as i64))
 }
 
 fn scan(func: &IrFunction) -> Scan {
@@ -312,19 +364,27 @@ fn scan(func: &IrFunction) -> Scan {
         alloca_size: FxHashMap::default(),
         escapes: FxHashSet::default(),
         memcpy: Vec::new(),
+        memset: Vec::new(),
+        split_escapes: None,
     };
+    // Pointer arguments of constant memsets; merged into `escapes` at the end
+    // (see `Scan::memset`).
+    let mut memset_ptrs: Vec<u32> = Vec::new();
     for (bi, block) in func.blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             match inst {
                 Instruction::Alloca { dest, size, .. } => {
                     s.alloca_size.insert(dest.0, *size as i64);
                 }
+                // Runtime-offset GEPs are recorded too (offset `None`).
+                // Skipping them made `&s.v[k]` look like an unrelated object:
+                // a store through it did not dirty a forwarded copy's source,
+                // a load through it was not counted as a read of the object,
+                // and passing it to a call did not make the object escape.
                 Instruction::GetElementPtr {
                     dest, base, offset, ..
                 } => {
-                    if let Some(off) = const_i64(offset) {
-                        s.gep.insert(dest.0, (base.0, off));
-                    }
+                    s.gep.insert(dest.0, (base.0, const_i64(offset)));
                 }
                 // A `Copy` of a pointer is a zero-offset alias. Following it
                 // keeps aggregate copies visible when the frontend routes the
@@ -335,7 +395,7 @@ fn scan(func: &IrFunction) -> Scan {
                     dest,
                     src: Operand::Value(v),
                 } => {
-                    s.gep.insert(dest.0, (v.0, 0));
+                    s.gep.insert(dest.0, (v.0, Some(0)));
                 }
                 Instruction::Memcpy { dest, src, size } => {
                     s.memcpy.push((bi, ii, dest.0, src.0, *size as i64));
@@ -368,8 +428,8 @@ fn scan(func: &IrFunction) -> Scan {
     //
     // Anything not explicitly understood below conservatively escapes; a new
     // IR instruction can therefore never silently defeat the analysis.
-    for block in &func.blocks {
-        for inst in &block.instructions {
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
             match inst {
                 // Understood and handled by the transforms themselves.
                 Instruction::Alloca { .. }
@@ -380,6 +440,15 @@ fn scan(func: &IrFunction) -> Scan {
                 | Instruction::Store { .. }
                 | Instruction::PgoCounterInc { .. } => {}
 
+                // A constant library memset: recorded for form 4. Its other
+                // two arguments are constants, so the pointer is its only
+                // value operand.
+                Instruction::Call { func: name, info } if const_memset(name, info).is_some() => {
+                    if let Some((p, byte, len)) = const_memset(name, info) {
+                        s.memset.push((bi, ii, p.0, byte, len, info.dest));
+                        memset_ptrs.push(p.0);
+                    }
+                }
                 // Arguments to a call leave the function.
                 Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
                     for a in &info.args {
@@ -419,6 +488,10 @@ fn scan(func: &IrFunction) -> Scan {
             }
         }
     }
+    if !memset_ptrs.is_empty() {
+        s.split_escapes = Some(s.escapes.clone());
+        s.escapes.extend(memset_ptrs);
+    }
     s
 }
 
@@ -444,10 +517,19 @@ fn block_targets(b: &crate::ir::reexports::BasicBlock) -> Vec<usize> {
     }
 }
 
-fn resolve(gep: &FxHashMap<u32, (u32, i64)>, mut v: u32) -> (u32, i64) {
-    let mut off = 0i64;
+/// Walk a pointer value to the object it is derived from.
+///
+/// Returns `(root, offset)`. The offset is `None` when any step of the chain
+/// has a runtime offset: the pointer is derived from `root`, so identity
+/// questions must treat it as `root`, but it names no particular field and
+/// nothing may be forwarded or split through it.
+fn resolve(gep: &FxHashMap<u32, (u32, Option<i64>)>, mut v: u32) -> (u32, Option<i64>) {
+    let mut off = Some(0i64);
     while let Some(&(b, o)) = gep.get(&v) {
-        off = off.saturating_add(o);
+        off = match (off, o) {
+            (Some(acc), Some(step)) => Some(acc.saturating_add(step)),
+            _ => None,
+        };
         v = b;
     }
     (v, off)
@@ -456,7 +538,11 @@ fn resolve(gep: &FxHashMap<u32, (u32, i64)>, mut v: u32) -> (u32, i64) {
 /// True if the alloca `target` (or any GEP/copy-alias chain rooted at it)
 /// escapes — its address leaves the function via a store, a call, a return,
 /// or a Phi. Any such path makes every scalar-replacement transform unsound.
-fn any_escape(escapes: &FxHashSet<u32>, gep: &FxHashMap<u32, (u32, i64)>, target: u32) -> bool {
+fn any_escape(
+    escapes: &FxHashSet<u32>,
+    gep: &FxHashMap<u32, (u32, Option<i64>)>,
+    target: u32,
+) -> bool {
     if escapes.contains(&target) {
         return true;
     }
@@ -475,7 +561,7 @@ enum PtrUse {
 
 fn pointer_uses(
     func: &IrFunction,
-    gep: &FxHashMap<u32, (u32, i64)>,
+    gep: &FxHashMap<u32, (u32, Option<i64>)>,
 ) -> FxHashMap<u32, Vec<PtrUse>> {
     let mut m: FxHashMap<u32, Vec<PtrUse>> = FxHashMap::default();
     for block in &func.blocks {
@@ -550,8 +636,16 @@ fn run_function(func: &mut IrFunction) -> usize {
     let mut store_fields: FxHashMap<u32, Vec<(i64, IrType)>> = FxHashMap::default();
     for &(bi, ii, d, src, size) in &s.memcpy {
         let (r, off) = resolve(&s.gep, d);
-        if off == 0 && s.alloca_size.contains_key(&r) {
-            *memcpy_writer_count.entry(r).or_insert(0) += 1;
+        if !s.alloca_size.contains_key(&r) {
+            continue;
+        }
+        // EVERY copy into the root counts as a writer, at any offset: a
+        // member assignment `d.in = n` lowers to `Memcpy GEP(d, 8) <- n`.
+        // Counting only offset-0 copies made `d = s; d.in = n; d.in.x`
+        // look singly written, and Transform 1 forwarded the member read
+        // to `s.in.x`, past the copy that replaced it.
+        *memcpy_writer_count.entry(r).or_insert(0) += 1;
+        if off == Some(0) {
             memcpy_writer.insert(r, (bi, ii, src, size));
         }
     }
@@ -560,7 +654,10 @@ fn run_function(func: &mut IrFunction) -> usize {
             if let Instruction::Store { ptr, ty, .. } = inst {
                 let (r, off) = resolve(&s.gep, ptr.0);
                 store_target.insert(r);
-                if off >= 0 && s.alloca_size.contains_key(&r) {
+                if let Some(off) = off
+                    && off >= 0
+                    && s.alloca_size.contains_key(&r)
+                {
                     store_fields.entry(r).or_default().push((off, *ty));
                 }
             }
@@ -573,7 +670,9 @@ fn run_function(func: &mut IrFunction) -> usize {
         for inst in &block.instructions {
             if let Instruction::Load { ptr, ty, .. } = inst {
                 let (r, off) = resolve(&s.gep, ptr.0);
-                load_reads.entry(r).or_default().push((off, *ty));
+                if let Some(off) = off {
+                    load_reads.entry(r).or_default().push((off, *ty));
+                }
             }
         }
     }
@@ -588,14 +687,16 @@ fn run_function(func: &mut IrFunction) -> usize {
     // dead and is removed explicitly (a generic "dest unused" sweep is
     // unsound: dynamic GEPs into a shared alloca look unused while the same
     // bytes are still read through a different GEP value).
+    // EVERY load of the object counts, whatever its offset: the dead-writer
+    // removal below deletes the copy once `forwarded == loads`, so a read that
+    // is not counted here (a runtime index, an offset outside the copy) would
+    // be left reading an object whose initializing copy is gone.
     let mut loads_from: FxHashMap<u32, u32> = FxHashMap::default();
     for block in &func.blocks {
         for inst in &block.instructions {
             if let Instruction::Load { ptr, .. } = inst {
-                let (r, off) = resolve(&s.gep, ptr.0);
-                if off >= 0 {
-                    *loads_from.entry(r).or_insert(0) += 1;
-                }
+                let (r, _) = resolve(&s.gep, ptr.0);
+                *loads_from.entry(r).or_insert(0) += 1;
             }
         }
     }
@@ -618,6 +719,10 @@ fn run_function(func: &mut IrFunction) -> usize {
                 if let Instruction::Load { ptr, ty, .. } = inst {
                     let (r, off) = resolve(&s.gep, ptr.0);
                     if let Some(&(mb, mi, src, size)) = memcpy_writer.get(&r) {
+                        // A runtime-offset read names no field of the source.
+                        let Some(off) = off else {
+                            continue;
+                        };
                         if memcpy_writer_count.get(&r).copied().unwrap_or(0) != 1
                             || store_target.contains(&r)
                             || s.escapes.contains(&r)
@@ -801,7 +906,7 @@ fn run_function(func: &mut IrFunction) -> usize {
                 for (ii, inst) in block.instructions.iter().enumerate() {
                     if let Instruction::Memcpy { src, .. } = inst {
                         let (sr, soff) = resolve(&s.gep, src.0);
-                        if sr != r || soff != 0 {
+                        if sr != r || soff != Some(0) {
                             continue;
                         }
                         if bi != mb || ii <= mi {
@@ -884,7 +989,20 @@ fn run_function(func: &mut IrFunction) -> usize {
     // that only appears to work. Transforms 1 and 2 already deliver the
     // struct-copy win and are on by default.
     if std::env::var("CCC_SROA_COPYOUT").is_ok() {
+        // Objects reached through a runtime offset anywhere: their accesses
+        // cannot be mapped onto fields, so the form refuses them outright.
+        let unknown_offset_roots: FxHashSet<u32> = s
+            .gep
+            .keys()
+            .filter_map(|&v| match resolve(&s.gep, v) {
+                (root, None) => Some(root),
+                _ => None,
+            })
+            .collect();
         for (&r, fields) in &store_fields {
+            if unknown_offset_roots.contains(&r) {
+                continue;
+            }
             if memcpy_writer_count.get(&r).copied().unwrap_or(0) > 0 {
                 continue; // also written by a memcpy — not a pure store-only source
             }
@@ -904,7 +1022,7 @@ fn run_function(func: &mut IrFunction) -> usize {
                 for (ii, inst) in block.instructions.iter().enumerate() {
                     if let Instruction::Memcpy { dest, src, .. } = inst {
                         let (sr, soff) = resolve(&s.gep, src.0);
-                        if sr == r && soff == 0 {
+                        if sr == r && soff == Some(0) {
                             readers.push((bi, ii, dest.0));
                         }
                     }
@@ -996,7 +1114,10 @@ fn run_function(func: &mut IrFunction) -> usize {
             let mut expandable = !readers.is_empty();
             for &(_, _, d) in &readers {
                 let (dr, _) = resolve(&s.gep, d);
-                if s.escapes.contains(&d) || s.escapes.contains(&dr) {
+                if s.escapes.contains(&d)
+                    || s.escapes.contains(&dr)
+                    || unknown_offset_roots.contains(&dr)
+                {
                     expandable = false;
                     break;
                 }
@@ -1040,7 +1161,7 @@ fn run_function(func: &mut IrFunction) -> usize {
                         let (sr, soff) = resolve(&s.gep, ptr.0);
                         if sr == r {
                             if let Some(&(_, _, a)) =
-                                field_allocas.iter().find(|&&(o, _, _)| o == soff)
+                                field_allocas.iter().find(|&&(o, _, _)| Some(o) == soff)
                             {
                                 plan.store_ptr.push((bi, ii, a));
                             }
@@ -1457,5 +1578,132 @@ mod scalar_memcpy_tests {
             func.blocks[0].instructions[2],
             Instruction::Memcpy { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod member_copy_writer_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+
+    fn alloca(v: u32, size: usize) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(v),
+            ty: IrType::Ptr,
+            size,
+            align: 8,
+            volatile: false,
+            semantic_volatile: false,
+        }
+    }
+
+    fn load(dest: u32, ptr: u32) -> Instruction {
+        Instruction::Load {
+            volatile: false,
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty: IrType::I64,
+            seg_override: AddressSpace::Default,
+        }
+    }
+
+    fn gep(dest: u32, base: u32, off: i64) -> Instruction {
+        Instruction::GetElementPtr {
+            dest: Value(dest),
+            base: Value(base),
+            offset: Operand::Const(IrConst::I64(off)),
+            ty: IrType::Ptr,
+        }
+    }
+
+    fn func(instructions: Vec<Instruction>) -> IrFunction {
+        let mut f = IrFunction::new("t".into(), IrType::I64, vec![], false);
+        f.next_value_id = 100;
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(Some(Operand::Value(Value(6)))),
+            source_spans: vec![],
+        });
+        f
+    }
+
+    /// `d = s; d.in = n; return d.in.x;` — the member copy into `d + 8` is a
+    /// second writer of `d`, so the read must keep reading `d` (it used to be
+    /// forwarded to `s + 8`, past the copy that replaced those bytes).
+    #[test]
+    fn member_copy_is_a_second_writer() {
+        let mut f = func(vec![
+            alloca(0, 24),
+            alloca(1, 24),
+            alloca(2, 16),
+            Instruction::Memcpy {
+                dest: Value(1),
+                src: Value(0),
+                size: 24,
+            },
+            gep(4, 1, 8),
+            Instruction::Memcpy {
+                dest: Value(4),
+                src: Value(2),
+                size: 16,
+            },
+            gep(5, 1, 8),
+            load(6, 5),
+        ]);
+        run_function(&mut f);
+        let insts = &f.blocks[0].instructions;
+        let Some(Instruction::Load { ptr, .. }) =
+            insts.iter().find(|i| matches!(i, Instruction::Load { .. }))
+        else {
+            panic!("the load must survive: {insts:?}");
+        };
+        let mut root = ptr.0;
+        while let Some(Instruction::GetElementPtr { base, .. }) = insts
+            .iter()
+            .find(|i| matches!(i, Instruction::GetElementPtr { dest, .. } if dest.0 == root))
+        {
+            root = base.0;
+        }
+        assert_eq!(root, 1, "d.in.x must be read from d: {insts:?}");
+        assert_eq!(
+            insts
+                .iter()
+                .filter(|i| matches!(i, Instruction::Memcpy { .. }))
+                .count(),
+            2,
+            "both writers of d stay: {insts:?}"
+        );
+    }
+
+    /// Positive control: without the member copy the read IS forwarded to
+    /// `s`, so the test above fails only because of the second writer.
+    #[test]
+    fn single_whole_copy_still_forwards() {
+        let mut f = func(vec![
+            alloca(0, 24),
+            alloca(1, 24),
+            Instruction::Memcpy {
+                dest: Value(1),
+                src: Value(0),
+                size: 24,
+            },
+            gep(5, 1, 8),
+            load(6, 5),
+        ]);
+        assert!(run_function(&mut f) > 0);
+        let insts = &f.blocks[0].instructions;
+        let Some(Instruction::Load { ptr, .. }) =
+            insts.iter().find(|i| matches!(i, Instruction::Load { .. }))
+        else {
+            panic!("the load must survive: {insts:?}");
+        };
+        let Some(Instruction::GetElementPtr { base, .. }) = insts
+            .iter()
+            .find(|i| matches!(i, Instruction::GetElementPtr { dest, .. } if dest.0 == ptr.0))
+        else {
+            panic!("forwarded load reads through a new GEP: {insts:?}");
+        };
+        assert_eq!(base.0, 0, "forwarded to s: {insts:?}");
     }
 }

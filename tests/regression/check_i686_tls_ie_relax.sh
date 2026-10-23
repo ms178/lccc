@@ -41,11 +41,19 @@ if ! printf '#include <stdio.h>\n' | "$ccc" -m32 -x c - -fsyntax-only >/dev/null
     exit 0
 fi
 
+# The variables are defined in a second translation unit of the SAME
+# executable: the using TU cannot know where they end up, so it must use
+# initial-exec (`@GOTNTPOFF(%ebx)` in the default PIE, as GCC 16 does), and
+# the linker, which sees the definitions, relaxes the pair to local-exec.
+# (Variables defined in the using TU are local-exec from the start.)
+cat >"$td/tls_def.c" <<'CEOF'
+__thread int le_var = 5;   /* offset 0 in the block */
+__thread int mid_var = 6;  /* offset 4 */
+__thread int g_var = 9;    /* offset 8 */
+CEOF
 cat >"$td/tls.c" <<'CEOF'
 #include <stdio.h>
-static __thread int le_var = 5;   /* local, offset 0 in the block */
-static __thread int mid_var = 6;  /* local, offset 4 */
-__thread int g_var = 9;           /* global, offset 8 */
+extern __thread int le_var, mid_var, g_var;
 int main(void){
     le_var += 1; mid_var += 1; g_var += 1;
     printf("le=%d mid=%d g=%d\n", le_var, mid_var, g_var);
@@ -56,27 +64,34 @@ CEOF
 "$ccc" -m32 -O1 -c "$td/tls.c" -o "$td/tls.o"
 
 # ── 1. object structure: GOTIE relocs must reference STT_TLS symbols ──
-relocs=$(readelf -rW "$td/tls.o")
-if ! grep -q "R_386_TLS_GOTIE" <<<"$relocs"; then
-    echo "SKIP: no GOTIE relocations emitted (codegen changed?)"
-    exit 0
-fi
-for sym in $(readelf -rW "$td/tls.o" | awk '/R_386_TLS_GOTIE/{print $NF}'); do
-    case "$sym" in
-        .*)
-            echo "FAIL: GOTIE reloc references section symbol '$sym' (local-label folding leaked into a TLS reloc)"
-            exit 1
-            ;;
-    esac
-    kind=$(readelf -sW "$td/tls.o" | awk -v s="$sym" '$8==s {print $4; exit}')
-    if [ "$kind" != "TLS" ]; then
-        echo "FAIL: GOTIE reloc references '$sym' of type '$kind' (expected TLS)"
+# check_gotie_symbols <object>: every R_386_TLS_GOTIE names an STT_TLS
+# symbol, never a section symbol (local-label folding is value-identical for
+# plain relocs but WRONG for TLS GOT relocs). Run on the C object (global
+# symbols) and on the hand-written probe below (LOCAL TLS symbols, the shape
+# the folding bug hit).
+check_gotie_symbols() {
+    if ! readelf -rW "$1" | grep -c "R_386_TLS_GOTIE" >/dev/null; then
+        echo "FAIL: $(basename "$1") has no R_386_TLS_GOTIE relocation"
         exit 1
     fi
-done
+    for sym in $(readelf -rW "$1" | awk '/R_386_TLS_GOTIE/{print $NF}'); do
+        case "$sym" in
+            .*)
+                echo "FAIL: GOTIE reloc references section symbol '$sym' (local-label folding leaked into a TLS reloc)"
+                exit 1
+                ;;
+        esac
+        kind=$(readelf -sW "$1" | awk -v s="$sym" '$8==s {print $4; exit}')
+        if [ "$kind" != "TLS" ]; then
+            echo "FAIL: GOTIE reloc references '$sym' of type '$kind' (expected TLS)"
+            exit 1
+        fi
+    done
+}
+check_gotie_symbols "$td/tls.o"
 
 # ── 2. full link + runtime ──
-"$ccc" -m32 -O1 "$td/tls.c" -o "$td/tls_exe"
+"$ccc" -m32 -O1 "$td/tls.c" "$td/tls_def.c" -o "$td/tls_exe"
 
 # Resolve the ELF32 execution path ONCE, validated against the gate's own
 # binary: the candidate must produce the exact expected stdout.  A native
@@ -228,7 +243,9 @@ main:
     ret
 SEOF
 
-"$ccc" -m32 -O1 "$td/tls_regs.s" -o "$td/tls_regs"
+"$ccc" -m32 -O1 -c "$td/tls_regs.s" -o "$td/tls_regs.o"
+check_gotie_symbols "$td/tls_regs.o"
+"$ccc" -m32 -O1 "$td/tls_regs.o" -o "$td/tls_regs"
 # Expected after the increments: 2 + 3*10 + 4*100 + 5*1000 + 6*10000 + 7*100000
 want=$(( 2 + 3*10 + 4*100 + 5*1000 + 6*10000 + 7*100000 ))
 got=$(run32 "$td/tls_regs"; echo $?)

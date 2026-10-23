@@ -207,10 +207,16 @@ impl X86Codegen {
         }
     }
 
-    /// 32-bit leading-zero count of %eax without LZCNT: 31 - BSR(x).
-    /// BSR leaves its destination undefined for x == 0, so the zero case is
-    /// fixed up explicitly — this preserves the IR's defined
-    /// Clz(0) == width semantics, which constant folding guarantees.
+    /// 32-bit leading-zero count of %eax without LZCNT: 31 - BSR(x), with
+    /// the IR's Clz(0) == 32 (a defined result; constant folding agrees).
+    /// This is the accumulator-only fallback. Register-allocated operands
+    /// take `emit_zero_defined_scan_direct`, which preloads 63 into a
+    /// distinct destination so the zero source passes it through, branch
+    /// free. Here the operand and the result share %eax and no scratch is
+    /// free, so the zero case is a branch. The branch-free scratch-less form
+    /// (`movl; lea 1(%rax,%rax); bsrq; neg; add $32`) puts five dependent
+    /// instructions on every input's critical path; the nonzero path here is
+    /// `test; jnz; bsr; xor` with the jump well predicted, so it is kept.
     fn emit_clz32_rax_baseline(&mut self) {
         let nz = self.state.fresh_label("clz_nz");
         let done = self.state.fresh_label("clz_done");
@@ -224,19 +230,16 @@ impl X86Codegen {
         self.state.out.emit_named_label(&done);
     }
 
-    /// 32-bit trailing-zero count of %eax without TZCNT: BSF(x).
-    /// BSF's destination is undefined for x == 0; the fixup keeps the
-    /// defined Ctz(0) == 32 semantics.
+    /// 32-bit trailing-zero count of %eax without TZCNT, defined at zero.
+    /// The narrow forms' stop bit, one lane up: with bit 32 set the 64-bit
+    /// scan never sees zero, a zero operand yields 32, and whatever sits in
+    /// bits 33..63 can never be the lowest set bit, so no zero-extension is
+    /// needed. Two instructions, no branch and no scratch register (GCC:
+    /// `xor; mov $32; rep bsf; test; cmove`, which needs a second register
+    /// the accumulator path does not have free).
     fn emit_ctz32_rax_baseline(&mut self) {
-        let nz = self.state.fresh_label("ctz_nz");
-        let done = self.state.fresh_label("ctz_done");
-        self.state.emit("    testl %eax, %eax");
-        self.state.out.emit_jcc_label("    jnz", &nz);
-        self.state.emit("    movl $32, %eax");
-        self.state.out.emit_jmp_label(&done);
-        self.state.out.emit_named_label(&nz);
-        self.state.emit("    bsfl %eax, %eax");
-        self.state.out.emit_named_label(&done);
+        self.state.emit("    btsq $32, %rax");
+        self.state.emit("    bsfq %rax, %rax");
     }
 
     pub(super) fn emit_int_clz_impl(&mut self, ty: IrType) {
@@ -321,36 +324,33 @@ impl X86Codegen {
         }
     }
 
+    /// Ctz with the IR's defined-zero semantics: `Ctz(0)` is the operand
+    /// width (`src/ir/ops.rs`). TZCNT is a BMI1 instruction (GCC gates it
+    /// on `-mbmi`, not `-mlzcnt`): on LZCNT-only CPUs (AMD K10, Bobcat,
+    /// Jaguar) F3 0F BC decodes as BSF and leaves Ctz(0) undefined.
+    ///
+    /// Narrow widths OR a stop bit just above the operand (bit 8 or 16):
+    /// the scanned value is then never zero, so a zero operand yields the
+    /// width, the baseline needs no zero branch, and no zero-extension is
+    /// needed -- garbage above the stop bit can never be the lowest set bit.
     pub(super) fn emit_int_ctz_impl(&mut self, ty: IrType) {
-        if self.lzcnt_enabled {
-            match ty {
-                IrType::I8 | IrType::U8 => {
-                    // Zero-extend so only the real low byte's trailing zeros count.
-                    self.state.emit("    movzbl %al, %eax");
-                    self.state.emit("    tzcntl %eax, %eax");
-                }
-                IrType::I16 | IrType::U16 => {
-                    self.state.emit("    movzwl %ax, %eax");
-                    self.state.emit("    tzcntl %eax, %eax");
-                }
-                IrType::I32 | IrType::U32 => self.state.emit("    tzcntl %eax, %eax"),
-                _ => self.state.emit("    tzcntq %rax, %rax"),
-            }
-            return;
-        }
-        // TZCNT (F3 0F BC) decodes as plain BSF without the feature; the two
-        // agree for every nonzero input, but BSF's result is undefined for
-        // zero, so the zero case is fixed up to preserve Ctz(0) == width.
+        let tz32 = if self.bmi1_enabled {
+            "    tzcntl %eax, %eax"
+        } else {
+            "    bsfl %eax, %eax"
+        };
         match ty {
             IrType::I8 | IrType::U8 => {
-                self.state.emit("    movzbl %al, %eax");
-                self.emit_ctz32_rax_baseline();
+                self.state.emit("    orl $256, %eax");
+                self.state.emit(tz32);
             }
             IrType::I16 | IrType::U16 => {
-                self.state.emit("    movzwl %ax, %eax");
-                self.emit_ctz32_rax_baseline();
+                self.state.emit("    orl $65536, %eax");
+                self.state.emit(tz32);
             }
+            IrType::I32 | IrType::U32 if self.bmi1_enabled => self.state.emit(tz32),
             IrType::I32 | IrType::U32 => self.emit_ctz32_rax_baseline(),
+            _ if self.bmi1_enabled => self.state.emit("    tzcntq %rax, %rax"),
             _ => {
                 let nz = self.state.fresh_label("ctz_nz");
                 let done = self.state.fresh_label("ctz_done");
@@ -367,23 +367,21 @@ impl X86Codegen {
 
     /// CTZ for a value proven nonzero by the frontend or CVP. BSF has exactly
     /// the desired semantics on that domain and needs no test/branch/fallback.
+    /// A narrow operand's lowest set bit lies in its low lane, so bits above
+    /// it never matter and no zero-extension is emitted. TZCNT (BMI1) is
+    /// preferred where available: AMD Zen 1-3 run BSF as 6 macro-ops with
+    /// latency 3, TZCNT as 2 with latency 2; Intel runs both as 1 uop.
     pub(super) fn emit_int_ctz_nonzero_impl(&mut self, ty: IrType) {
-        if self.lzcnt_enabled {
-            self.emit_int_ctz_impl(ty);
-            return;
-        }
-        match ty {
-            IrType::I8 | IrType::U8 => {
-                self.state.emit("    movzbl %al, %eax");
-                self.state.emit("    bsfl %eax, %eax");
-            }
-            IrType::I16 | IrType::U16 => {
-                self.state.emit("    movzwl %ax, %eax");
-                self.state.emit("    bsfl %eax, %eax");
-            }
-            IrType::I32 | IrType::U32 => self.state.emit("    bsfl %eax, %eax"),
-            _ => self.state.emit("    bsfq %rax, %rax"),
-        }
+        let narrow_or_32 = matches!(
+            ty,
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+        );
+        self.state.emit(match (narrow_or_32, self.bmi1_enabled) {
+            (true, true) => "    tzcntl %eax, %eax",
+            (true, false) => "    bsfl %eax, %eax",
+            (false, true) => "    tzcntq %rax, %rax",
+            (false, false) => "    bsfq %rax, %rax",
+        });
     }
 
     pub(super) fn emit_int_bswap_impl(&mut self, ty: IrType) {
@@ -433,6 +431,8 @@ impl X86Codegen {
         // them (e.g. a 64-bit multiply constant reused by a later `imulq`).
         // Preserve them with push/pop pairs; the sequence contains no call,
         // so the transient 16-byte stack excursion is safe at any alignment.
+        // The peephole `dead_scratch_saves` deletes a pair whose register is
+        // provably dead afterwards, so the cost is paid only when it is live.
         if narrow || matches!(ty, IrType::I32 | IrType::U32) {
             self.state.emit("    pushq %rcx");
             self.state.emit("    movl %eax, %ecx"); // c = x
@@ -527,6 +527,24 @@ impl X86Codegen {
         // In-place compute accounting (see note_inplace_compute): the result
         // was written into dest_phys.
         self.note_inplace_compute(dest_phys, dest_value_id);
+    }
+
+    /// `UMulHigh`/`SMulHigh` on the accumulator pair: one-operand
+    /// `mul`/`imul` leaves %rdx:%rax = %rax * %rcx and the high half is the
+    /// result.  %rdx is this point's fixed scratch
+    /// (`regalloc::x86_inst_fixed_scratch`), so the position-aware %rdx
+    /// wave keeps every value live across it out of %rdx.  The operation is
+    /// only ever created at 64 bits (`div_by_const`).
+    fn emit_mul_high_acc(&mut self, op: IrBinOp, use_32bit: bool) {
+        if use_32bit {
+            crate::ir::ops::mul_high_unsupported_here();
+        }
+        self.state.emit(if op == IrBinOp::UMulHigh {
+            "    mulq %rcx"
+        } else {
+            "    imulq %rcx"
+        });
+        self.state.emit("    movq %rdx, %rax");
     }
 
     /// Accumulator `Bzhi`: source in %rax/%eax, index in %rcx.  With BMI2
@@ -1885,6 +1903,7 @@ impl X86Codegen {
             }
             IrBinOp::BitTest => unreachable!("BitTest handled by native BT fallback"),
             IrBinOp::Bzhi => self.emit_bzhi_acc(use_32bit),
+            IrBinOp::UMulHigh | IrBinOp::SMulHigh => self.emit_mul_high_acc(op, use_32bit),
             // Rotates of every integer width are emitted above
             // (register-direct or accumulator, both width-aware); this arm
             // is structurally dead for well-typed IR.

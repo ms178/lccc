@@ -856,29 +856,44 @@ pub fn emit_machinst_with_tune(
             index,
             offset,
             dst,
+            size,
         } => {
+            // Address registers are always 64-bit; only the destination
+            // (and the mnemonic) carry the operation width. `leal` computes
+            // the full sum and writes its low 32 bits zero-extended.
+            let w32 = *size != OpSize::S64;
+            let (lea, mov, dsz) = if w32 {
+                ("leal", "movl", OpSize::S32)
+            } else {
+                ("leaq", "movq", OpSize::S64)
+            };
             let base_str = fmt_reg(base, OpSize::S64);
-            let dst_str = fmt_reg(dst, OpSize::S64);
+            let dst_str = fmt_reg(dst, dsz);
             if let Some((idx, scale)) = index {
                 let idx_str = fmt_reg(idx, OpSize::S64);
                 if *offset == 0 {
                     out.emit_fmt(format_args!(
-                        "    leaq ({}, {}, {}), {}",
-                        base_str, idx_str, scale, dst_str
+                        "    {} ({}, {}, {}), {}",
+                        lea, base_str, idx_str, scale, dst_str
                     ));
                 } else {
                     out.emit_fmt(format_args!(
-                        "    leaq {}({}, {}, {}), {}",
-                        offset, base_str, idx_str, scale, dst_str
+                        "    {} {}({}, {}, {}), {}",
+                        lea, offset, base_str, idx_str, scale, dst_str
                     ));
                 }
             } else if *offset == 0 {
-                // lea (%base), %dst — just a mov
-                out.emit_fmt(format_args!("    movq {}, {}", base_str, dst_str));
+                // lea (%base), %dst — just a (zero-extending, for S32) mov
+                out.emit_fmt(format_args!(
+                    "    {} {}, {}",
+                    mov,
+                    fmt_reg(base, dsz),
+                    dst_str
+                ));
             } else {
                 out.emit_fmt(format_args!(
-                    "    leaq {}({}), {}",
-                    offset, base_str, dst_str
+                    "    {} {}({}), {}",
+                    lea, offset, base_str, dst_str
                 ));
             }
         }

@@ -673,11 +673,17 @@ pub(super) fn coalesce_vector_brackets(store: &mut LineStore, infos: &mut [LineI
             continue;
         }
         // Rule 5: no read of the source after the bracket wider than the
-        // copy-out, whose upper-bit behaviour the rewrite changes.
-        let upper_safe = (kout + 1..fend).all(|n| {
-            infos[n].is_nop()
-                || vec_mention_width(infos[n].trimmed(store.get(n)), copy_in.src) <= out_copy.width
-        });
+        // copy-out, whose upper-bit behaviour the rewrite changes -- `ret`
+        // included (a `__m128d` return reads all of `%xmm0`); any `ret` of
+        // the function counts, since a back edge can reach an earlier one.
+        let upper_safe =
+            super::fp_liveness::ret_xmm_read_bits(store, infos, fstart, fend, copy_in.src)
+                <= out_copy.width
+                && (kout + 1..fend).all(|n| {
+                    infos[n].is_nop()
+                        || vec_mention_width(infos[n].trimmed(store.get(n)), copy_in.src)
+                            <= out_copy.width
+                });
         if !upper_safe {
             i += 1;
             continue;
@@ -1131,8 +1137,11 @@ fn copy_spelled_width(t: &str) -> Option<u16> {
 ///   a later preserving one leaves its own bits, which the last copy alone
 ///   would hide — the rewrite may change those bits, so it is allowed only
 ///   when no line of the function outside the rewritten bracket reads that
-///   register wider than the element.  The copy-out itself must be a legacy
-///   element-width copy for the same reason, seen from the other side.
+///   register wider than the element.  The copy-out is held to the same
+///   rule from the other side: a legacy element-width copy-out merges, as
+///   writing the FMA into the result register does; a replacing one
+///   (`movapd`, a VEX copy) gave that register the FMA destination's upper
+///   bits, so it too is allowed only without a wide reader.
 /// * **Memory operands travel with their role.**  The encoder puts a memory
 ///   role at operand 0 in whichever form allows it and reports that no form
 ///   can when the role that must be memory is the destination, or when two
@@ -1173,17 +1182,20 @@ pub(super) fn reassociate_fma_accumulator(store: &mut LineStore, infos: &mut [Li
         let elem_bits = fma.width.bits();
         let t = fma.dst();
 
-        // The copy-out, if any: a legacy element-width move of the result,
-        // adjacent, register to register in `%xmm` spelling.
+        // The copy-out, if any: an adjacent register-to-register move of the
+        // result in `%xmm` spelling, at least element-wide. A legacy
+        // element-width copy-out merges, which is exactly what writing the
+        // FMA into `d` does; a replacing one (`movapd`, a VEX copy) gave `d`
+        // the upper bits of `t` instead, so it joins the upper-bits rule below.
         let copy_out = next_real(store, infos, j + 1, fend).and_then(|k| {
             if infos[k].pinned {
                 return None;
             }
             let text = infos[k].trimmed(store.get(k));
             let c = parse_vec_copy(text)?;
-            (c.src == t && c.width == elem_bits && !c.zeroes_above && copy_spelled_xmm(text))
-                .then_some((k, c))
+            (c.src == t && c.width >= elem_bits && copy_spelled_xmm(text)).then_some((k, c))
         });
+        let out_merges = copy_out.is_none_or(|(_, c)| c.width == elem_bits && !c.zeroes_above);
         let (d, last) = match copy_out {
             Some((k, c)) => (c.dst, k),
             None => (t, j),
@@ -1272,15 +1284,28 @@ pub(super) fn reassociate_fma_accumulator(store: &mut LineStore, infos: &mut [Li
         // the earlier copy left, and deleting the whole run would restore the
         // pre-bracket bits instead.  `None` in the run means no copy wrote it,
         // which is the `is_none_or` fast path.
-        let upper_preserved = run
-            .iter()
-            .all(|(_, c)| c.dst != d || (!c.zeroes_above && c.width == elem_bits));
+        let upper_preserved = out_merges
+            && run
+                .iter()
+                .all(|(_, c)| c.dst != d || (!c.zeroes_above && c.width == elem_bits));
         if !upper_preserved {
-            let wide_reader = (fstart..fend).any(|n| {
-                !owned.contains(&n)
-                    && !infos[n].is_nop()
-                    && vec_mention_width(infos[n].trimmed(store.get(n)), d) > elem_bits
-            });
+            // Only a line that can execute AFTER the bracket observes the
+            // rewritten upper bits.  With no label between the function's
+            // start and the FMA, the prefix is straight-line code entered
+            // once, so nothing in it runs after `last` (no branch can reach
+            // it); a label there may be a loop head, and the whole function
+            // stays in scope.  `chain`'s `vaddsd .., %xmm0, %xmm2` reads the
+            // INCOMING %xmm0's upper lane before the bracket redefines it.
+            let prefix_straight =
+                (fstart..j).all(|n| infos[n].is_nop() || infos[n].kind != LineKind::Label);
+            let scan_from = if prefix_straight { last + 1 } else { fstart };
+            let wide_reader = super::fp_liveness::ret_xmm_read_bits(store, infos, fstart, fend, d)
+                > elem_bits
+                || (scan_from..fend).any(|n| {
+                    !owned.contains(&n)
+                        && !infos[n].is_nop()
+                        && vec_mention_width(infos[n].trimmed(store.get(n)), d) > elem_bits
+                });
             if wide_reader {
                 j += 1;
                 continue;
@@ -3711,6 +3736,89 @@ mod tests {
             got,
             vec!["vfmadd213sd %xmm2, %xmm0, %xmm1", "ret"],
             "xmm1 = xmm0*xmm1 + xmm2, the same three values in the same roles"
+        );
+    }
+
+    #[test]
+    fn a_replacing_copy_out_rewrites_only_without_a_wide_reader() {
+        // The scalar emitters copy with `movapd` (dependency-free); the same
+        // `__builtin_fma` return shape must still reach ICX's one instruction.
+        let ret_shape = |bits: &str| {
+            format!(
+                "    # LCCC_RET_XMM 1\n{bits}    movapd %xmm2, %xmm5\n    vfmadd231sd %xmm1, %xmm0, %xmm5\n    movapd %xmm5, %xmm0\n    ret\n"
+            )
+        };
+        let code = |text: &str| -> Vec<String> {
+            fma_only(text)
+                .into_iter()
+                .filter(|l| !l.starts_with('#'))
+                .collect()
+        };
+        let got = code(&ret_shape("    # LCCC_RET_XMM_BITS 64\n"));
+        assert_eq!(
+            got,
+            vec!["vfmadd213sd %xmm2, %xmm1, %xmm0", "ret"],
+            "{got:?}"
+        );
+        // `ret` is a reader too: a `__m128d` return (`_mm_fmadd_sd`) reads
+        // bits 127:64 of %xmm0, and so does a function whose return width is
+        // not published (hand-written code; no marker means 512).
+        for bits in ["    # LCCC_RET_XMM_BITS 128\n", ""] {
+            let got = code(&ret_shape(bits));
+            assert_eq!(got.len(), 4, "{bits:?} must keep the bracket: {got:?}");
+        }
+        // The `movapd` copy-out gave %xmm0 bits 127:64 of %xmm5 (the
+        // addend's); the fused form leaves %xmm0's own. A 128-bit reader
+        // would see the difference, so the bracket must stay.
+        let text = "    movapd %xmm2, %xmm5\n    vfmadd231sd %xmm1, %xmm0, %xmm5\n    movapd %xmm5, %xmm0\n    vaddpd %xmm0, %xmm10, %xmm11\n    ret\n";
+        let got = fma_only(text);
+        assert_eq!(
+            got,
+            vec![
+                "movapd %xmm2, %xmm5",
+                "vfmadd231sd %xmm1, %xmm0, %xmm5",
+                "movapd %xmm5, %xmm0",
+                "vaddpd %xmm0, %xmm10, %xmm11",
+                "ret",
+            ],
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn a_wide_read_of_the_incoming_register_before_a_straight_prefix_bracket_is_dead() {
+        // `chain`: the VEX scalar add reads ALL of the incoming %xmm0 (its upper
+        // lane flows to %xmm2) before the load redefines %xmm0.  Straight-line
+        // code before the FMA cannot run again after it, so that read cannot
+        // observe the rewritten bits and the copy-out folds (GCC's 3 lines).
+        let shape = |prefix_label: &str| {
+            format!(
+                "    # LCCC_RET_XMM 1\n    # LCCC_RET_XMM_BITS 64\n{prefix_label}    vaddsd .LC0(%rip), %xmm0, %xmm2\n    movsd .LC2(%rip), %xmm0\n    vfmsub132sd .LC1(%rip), %xmm0, %xmm2\n    vmovapd %xmm2, %xmm0\n    ret\n"
+            )
+        };
+        let code = |text: &str| -> Vec<String> {
+            fma_only(text)
+                .into_iter()
+                .filter(|l| !l.starts_with('#'))
+                .collect()
+        };
+        let got = code(&shape(""));
+        assert_eq!(
+            got,
+            vec![
+                "vaddsd .LC0(%rip), %xmm0, %xmm2",
+                "movsd .LC2(%rip), %xmm0",
+                "vfmsub231sd .LC1(%rip), %xmm2, %xmm0",
+                "ret",
+            ],
+            "{got:?}"
+        );
+        // A label in the prefix may be a loop head reached after the bracket:
+        // the wide read is then live and the bracket must stay.
+        let got = code(&shape(".LBB1:\n"));
+        assert!(
+            got.iter().any(|l| l == "vmovapd %xmm2, %xmm0"),
+            "a labelled prefix keeps the copy-out: {got:?}"
         );
     }
 

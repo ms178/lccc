@@ -57,6 +57,38 @@ def counters(text):
     return result
 
 
+def directory_mode(args, root, base_env, checks):
+    """-fprofile-generate=DIR: reproducible output, one appended profile file."""
+    src = root / "dirmode.c"
+    src.write_text(source(1))
+    pgd = root / "pgd"
+    outs = []
+    for n in (1, 2):
+        asm = root / f"dirmode-{n}.s"
+        obj = root / f"dirmode-{n}.o"
+        run([args.lccc, "-O2", "-fprofile-generate=" + str(pgd), "-S", str(src), "-o", str(asm)])
+        run([args.lccc, "-O2", "-fprofile-generate=" + str(pgd), "-c", str(src), "-o", str(obj)])
+        outs.append((asm.read_bytes(), obj.read_bytes()))
+    assert outs[0][0] == outs[1][0], "instrumented assembly differs between identical compiles"
+    assert outs[0][1] == outs[1][1], "instrumented object differs between identical compiles"
+    checks.append("dir: reproducible instrumented assembly and object")
+    exe = root / "dirmode.exe"
+    run([args.lccc, "-O2", "-fprofile-generate=" + str(pgd), str(src), "-o", str(exe)])
+    expected = run([str(exe)], env=base_env, expected=23)
+    first = sorted(pgd.glob("lccc-*.profraw"))
+    assert len(first) == 1, first
+    once = counters(first[0].read_text())
+    run([str(exe)], env=base_env, expected=23)
+    assert sorted(pgd.glob("lccc-*.profraw")) == first, "second run created another profile file"
+    assert counters(first[0].read_text()) == {k: v * 2 for k, v in once.items()}
+    checks.append("dir: one deterministic profile file, appended by every run")
+    use = root / "dirmode-use.exe"
+    p = run([args.lccc, "-O2", "-fprofile-use=" + str(pgd), str(src), "-o", str(use)])
+    assert "loaded 2 functions" in p.stderr, p.stderr
+    assert run([str(use)], env=base_env, expected=23).stdout == expected.stdout
+    checks.append("dir: profile-use ingests the directory")
+
+
 def run_checks(args, checks):
     with tempfile.TemporaryDirectory(prefix="lccc-pgo-io-") as tmp:
         root = Path(tmp)
@@ -65,6 +97,7 @@ def run_checks(args, checks):
              str(ROOT / "tests/regression/fixtures/pgo_io_interpose.c"), "-ldl", "-o", str(so)])
         base_env = {k: v for k, v in os.environ.items() if not k.startswith(("LCCC_PGO_", "PGO_IO_"))
                     and k not in ("LCCC_PROFILE_FILE", "LLVM_PROFILE_FILE", "LD_PRELOAD")}
+        directory_mode(args, root, base_env, checks)
         for opt in ("-O0", "-O2", "-O3"):
             for count in (1, 96):
                 src = root / f"unit-{opt}-{count}.c"

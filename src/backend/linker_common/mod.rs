@@ -79,6 +79,7 @@ mod section_map;
 pub mod strmerge;
 mod symbols;
 mod symstr;
+pub mod symver;
 mod types;
 mod version_script;
 mod write;
@@ -120,10 +121,10 @@ pub use mapfile::{LinkMap, MapArchiveMember, MapSectionContribution, build_link_
 
 // symbols.rs
 pub use symbols::{
-    GlobalSymbolOps, InputSection, OutputSection, is_dynamic_visibility,
-    is_exported_dynamic_symbol, is_layout_anchor_symbol, is_linker_defined_symbol,
-    is_valid_c_identifier_for_section, merge_object_visibility, most_constraining_visibility,
-    resolve_start_stop_symbols,
+    GlobalSymbolOps, InputSection, OutputSection, image_init_fini, import_strong_refs,
+    is_dynamic_visibility, is_exported_dynamic_symbol, is_layout_anchor_symbol,
+    is_linker_defined_symbol, is_valid_c_identifier_for_section, merge_object_visibility,
+    most_constraining_visibility, resolve_start_stop_symbols,
 };
 
 // merge.rs
@@ -146,8 +147,8 @@ pub use archive::{
 
 // resolve_lib.rs
 pub use resolve_lib::{
-    expand_file_mode_libs, resolve_lib, resolve_lib_positional, resolve_script_path,
-    script_input_spelling,
+    cannot_find_lib, expand_file_mode_libs, require_libs, resolve_lib, resolve_lib_positional,
+    resolve_script_path, script_input_spelling,
 };
 
 // write.rs
@@ -156,7 +157,7 @@ pub use write::{align_up_64, pad_to, write_elf64_phdr, write_elf64_phdr_at, writ
 // args.rs
 pub use args::{
     HashStyle, InputItem, LinkerArgs, Symbolic, TextrelPolicy, dyn_flags, exclude_libs_matches,
-    parse_linker_args,
+    parse_linker_args, rpath_dyn_entry,
 };
 
 // check.rs
@@ -165,7 +166,7 @@ pub use check::{check_undefined_symbols_elf64, check_undefined_symbols_elf64_ver
 // eh_frame.rs
 pub use eh_frame::{
     EhFramePacking, apply_cie_redirects, build_eh_frame_hdr, compact_eh_frame, count_eh_frame_fdes,
-    pack_eh_frame_sections, prune_dead_fdes, scan_eh_frame_records,
+    pack_eh_frame_sections, prune_dead_fdes, scan_eh_frame_records, write_eh_frame_hdr,
 };
 
 // gc_sections.rs

@@ -54,7 +54,7 @@ unsigned long __fortify_strlen(const char *s) { return 0; } /* must be unreferen
 C
 
 "$CCC" -O2 -S "$tmp/t.c" -o "$tmp/t.s"
-! grep -qE 'call.*__fortify_strlen' "$tmp/t.s"
+! grep -qE 'call.*__fortify_strlen' "$tmp/t.s" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 
 # Inlining must have happened for the defined always_inline helper: with the
 # budget bypass the calls disappear; the strlen contract result is checked at
@@ -90,7 +90,7 @@ unsigned long use(const char *s) {
 int main(void) { return (int)(use("kernel-shape") & 1); }
 C
 "$CCC" -O2 -S "$tmp/k.c" -o "$tmp/k.s"
-! grep -qE 'call.*__fortify_strlen' "$tmp/k.s"
+! grep -qE 'call.*__fortify_strlen' "$tmp/k.s" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }
 "$CCC" -O2 "$tmp/k.c" -o "$tmp/k"
 "$tmp/k"; st=$?
 [ "$st" -eq 0 ] # strlen=12, even

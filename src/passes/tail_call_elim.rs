@@ -868,6 +868,7 @@ mod tests {
                         assume_library: false,
                         ret_eightbyte_classes: vec![],
                         ret_is_f128_sse: false,
+                        cold: false,
                     },
                 },
             ],
@@ -1157,6 +1158,7 @@ mod tests {
                         assume_library: false,
                         ret_eightbyte_classes: vec![],
                         ret_is_f128_sse: false,
+                        cold: false,
                     },
                 },
                 // %2 = %1 + 1   (uses call result — NOT a tail call)

@@ -11,16 +11,21 @@
 // ELF writer helpers; some section/relocation utilities defined for completeness.
 #![allow(dead_code)]
 
+use super::cfi;
 use super::compress;
-use super::encoder::{EncodeResult, RelocType, encode_insn_directive, encode_instruction};
+use super::encoder::{
+    EncodeResult, RelocType, encode_got_pseudo, encode_insn_directive, encode_instruction,
+};
 use super::parser::{
     AsmStatement, DataValue, Directive, Operand, SizeExpr, SymbolType, Visibility,
 };
+use crate::backend::cfi_lower;
 use crate::backend::elf::{
-    self, DataFixup, ELFCLASS64, EM_RISCV, ElfWriterBase, ObjReloc, SHF_ALLOC, SHF_EXECINSTR,
-    SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, STT_FUNC, STT_NOTYPE, STT_OBJECT, STT_TLS, STV_HIDDEN,
-    STV_INTERNAL, STV_PROTECTED,
+    self, DataFixup, ELFCLASS32, ELFCLASS64, EM_RISCV, ElfWriterBase, ObjReloc, SHF_ALLOC,
+    SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, STT_FUNC, STT_NOTYPE, STT_OBJECT, STT_TLS,
+    STV_HIDDEN, STV_INTERNAL, STV_PROTECTED, SetValue,
 };
+use crate::backend::elf_writer_common::{uleb128_fixed, uleb128_len};
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 
 // ELF flags for RISC-V
@@ -53,7 +58,6 @@ pub struct ElfWriter {
     /// Counter for generating synthetic pcrel_hi labels
     pcrel_hi_counter: u32,
     /// GNU numeric labels: e.g., "1" -> [(section, offset), ...] in definition order.
-    numeric_labels: FxHashMap<String, Vec<(String, u64)>>,
     /// Deferred data expressions that reference forward labels (resolved after all statements).
     /// ELF e_flags to use (default: RVC + double-float ABI)
     elf_flags: u32,
@@ -61,8 +65,48 @@ pub struct ElfWriter {
     elf_class: u8,
     /// When true, don't emit R_RISCV_RELAX relocations (set by `.option norelax`).
     no_relax: bool,
-    /// Stack for `.option push`/`.option pop` to save/restore the `no_relax` state.
-    option_stack: Vec<bool>,
+    /// `.option pic` state: `la` loads the address from the GOT (as `lga`).
+    pic: bool,
+    /// `.option rvc` / `norvc` (default on: the objects declare
+    /// `EF_RISCV_RVC`, so a relaxing linker may shrink code in 2-byte steps).
+    /// GNU as's `insn_alignment` for `R_RISCV_ALIGN` runs (2 with RVC, else 4).
+    rvc: bool,
+    /// Stack for `.option push`/`.option pop`: saved `(no_relax, pic, rvc)`.
+    option_stack: Vec<(bool, bool, bool)>,
+    /// `.uleb128` values resolved after layout, in source order.
+    pending_lebs: Vec<PendingLeb>,
+    /// Bytes reserved for the n-th pending `.uleb128` (1 when absent).
+    leb_widths: Vec<usize>,
+    /// Set when a pending `.uleb128` outgrew its reservation: the widths to
+    /// assemble again with (see [`Self::process_statements`]).
+    leb_retry: Option<Vec<usize>>,
+    /// CFI location advances and PC-relative words resolved after layout.
+    pending_cfi: Vec<PendingCfi>,
+}
+
+/// A `.eh_frame` field produced by the CFI lowering, written after layout.
+enum PendingCfi {
+    /// `DW_CFA_advance_loc*` by `value` (= `to - from`), `width` bytes.
+    Advance {
+        section: String,
+        offset: u64,
+        width: usize,
+        value: SetValue,
+    },
+    /// `R_RISCV_32_PCREL` to `value`.
+    Pcrel32 {
+        section: String,
+        offset: u64,
+        value: SetValue,
+    },
+}
+
+/// A `.uleb128` whose value was not known where it stands.
+struct PendingLeb {
+    section: String,
+    offset: u64,
+    width: usize,
+    value: SetValue,
 }
 
 struct PendingReloc {
@@ -74,6 +118,17 @@ struct PendingReloc {
     /// For pcrel_lo12 relocations resolved locally: the offset of the
     /// corresponding auipc (pcrel_hi) instruction.
     pcrel_hi_offset: Option<u64>,
+    /// Pair an R_RISCV_RELAX when the relocation is emitted (decided at the
+    /// instruction, where `.option norelax` state is known).
+    relax: bool,
+}
+
+/// Relocations GAS 2.47 pairs with R_RISCV_RELAX when they come from a
+/// single explicit instruction (relaxation enabled): PCREL_HI20/LO12_I/LO12_S,
+/// HI20/LO12_I/LO12_S and the four TPREL forms. Explicit GOT/TLS-GOT/TLS-GD
+/// hi20 are not paired (measured); CALL_PLT is handled separately.
+fn relax_paired(elf_type: u32) -> bool {
+    matches!(elf_type, 23..=32)
 }
 
 /// Check if a label name is a GNU numeric label (e.g., "1", "42").
@@ -103,7 +158,7 @@ fn parse_numeric_label_ref(symbol: &str) -> Option<(&str, bool)> {
 /// Pre-process assembly statements to resolve GNU numeric label references.
 /// Numeric labels like `1:` can be defined multiple times. References like `1b`
 /// (backward) and `1f` (forward) must resolve to the nearest matching definition.
-fn resolve_numeric_label_refs(statements: &[AsmStatement]) -> Vec<AsmStatement> {
+fn resolve_numeric_label_refs(statements: &[AsmStatement]) -> Result<Vec<AsmStatement>, String> {
     // First pass: collect all numeric label definition positions
     let mut label_defs: FxHashMap<String, Vec<(usize, usize)>> = FxHashMap::default();
     let mut instance_counter: FxHashMap<String, usize> = FxHashMap::default();
@@ -122,7 +177,8 @@ fn resolve_numeric_label_refs(statements: &[AsmStatement]) -> Vec<AsmStatement> 
     }
 
     if label_defs.is_empty() {
-        return statements.to_vec();
+        reject_unresolved_numeric_refs(statements)?;
+        return Ok(statements.to_vec());
     }
 
     // Second pass: rewrite labels and references
@@ -169,7 +225,42 @@ fn resolve_numeric_label_refs(statements: &[AsmStatement]) -> Vec<AsmStatement> 
         }
     }
 
-    result
+    reject_unresolved_numeric_refs(&result)?;
+    Ok(result)
+}
+
+/// A numeric reference still present after the rewrite names no definition
+/// (`j 3f` with no later `3:`). Left alone it becomes an undefined symbol
+/// literally called "3f" that only fails at link time, if at all; GAS 2.47
+/// rejects it: "local label `"3" (instance number 1 of a fb label)' is not
+/// defined".
+fn reject_unresolved_numeric_refs(statements: &[AsmStatement]) -> Result<(), String> {
+    fn numeric_ref(s: &str) -> Option<&str> {
+        let inner = match (s.find('('), s.starts_with('%') && s.ends_with(')')) {
+            (Some(open), true) => s[open + 1..s.len() - 1].trim(),
+            _ => s,
+        };
+        parse_numeric_label_ref(inner).map(|_| inner)
+    }
+    for stmt in statements {
+        let AsmStatement::Instruction { operands, .. } = stmt else {
+            continue;
+        };
+        for op in operands {
+            let name = match op {
+                Operand::Symbol(s) | Operand::Label(s) | Operand::SymbolOffset(s, _) => s,
+                Operand::MemSymbol { symbol, .. } => symbol,
+                _ => continue,
+            };
+            if let Some(r) = numeric_ref(name) {
+                let (label, _) = parse_numeric_label_ref(r).unwrap_or((r, false));
+                return Err(format!(
+                    "local label `\"{label}\" (instance number 1 of a fb label)' is not defined (`{r}`)"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Rewrite a numeric label reference in an operand to a synthetic label name.
@@ -182,8 +273,26 @@ fn rewrite_numeric_ref_in_operand(
         Operand::Symbol(s) => {
             if let Some(new_name) = resolve_numeric_ref_name(s, stmt_idx, label_defs) {
                 Operand::Symbol(new_name)
+            } else if let Some(new_name) = rewrite_modifier_numeric_ref(s, stmt_idx, label_defs) {
+                Operand::Symbol(new_name)
             } else {
                 op.clone()
+            }
+        }
+        Operand::MemSymbol {
+            base,
+            symbol,
+            modifier,
+        } => {
+            let new_symbol = resolve_numeric_ref_name(symbol, stmt_idx, label_defs)
+                .or_else(|| rewrite_modifier_numeric_ref(symbol, stmt_idx, label_defs));
+            match new_symbol {
+                Some(symbol) => Operand::MemSymbol {
+                    base: base.clone(),
+                    symbol,
+                    modifier: modifier.clone(),
+                },
+                None => op.clone(),
             }
         }
         Operand::Label(s) => {
@@ -202,6 +311,24 @@ fn rewrite_numeric_ref_in_operand(
         }
         _ => op.clone(),
     }
+}
+
+/// `%pcrel_lo(1b)`: the GNU idiom that names an `auipc` by a numeric label
+/// (`1: auipc a0, %pcrel_hi(sym)` then `addi a0, a0, %pcrel_lo(1b)`). The
+/// reference sits inside the modifier, so the bare-operand rewrite above does
+/// not see it; left alone it becomes an undefined symbol called "1b".
+fn rewrite_modifier_numeric_ref(
+    s: &str,
+    stmt_idx: usize,
+    label_defs: &FxHashMap<String, Vec<(usize, usize)>>,
+) -> Option<String> {
+    let open = s.find('(')?;
+    if !s.starts_with('%') || !s.ends_with(')') {
+        return None;
+    }
+    let inner = s[open + 1..s.len() - 1].trim();
+    let new_inner = resolve_numeric_ref_name(inner, stmt_idx, label_defs)?;
+    Some(format!("{}({})", &s[..open], new_inner))
 }
 
 /// Resolve a numeric label reference like "1b" or "2f" to a synthetic label name.
@@ -258,6 +385,10 @@ fn rewrite_numeric_refs_in_directive(
         Directive::Short(v) => Directive::Short(vals(v)),
         Directive::Long(v) => Directive::Long(vals(v)),
         Directive::Quad(v) => Directive::Quad(vals(v)),
+        Directive::Leb128 { signed, values } => Directive::Leb128 {
+            signed: *signed,
+            values: vals(values),
+        },
         Directive::Org { expr: e, fill } => Directive::Org {
             expr: expr(e),
             fill: *fill,
@@ -269,7 +400,7 @@ fn rewrite_numeric_refs_in_directive(
 
 impl ElfWriter {
     pub fn new() -> Self {
-        Self {
+        let mut w = Self {
             // The padding vocabulary follows the target, not the march: measured
             // on GNU as 2.47, `-march=rv64im` pads `.p2align` exactly like
             // `rv64gc` — including the 2-byte `c.nop` — because the fill lands
@@ -278,21 +409,44 @@ impl ElfWriter {
             // the oracle disproves.
             base: ElfWriterBase::new(RISCV_NOP, 2)
                 .with_small_nop(RISCV_C_NOP)
-                .with_code_align_floor(4),
+                .with_code_align_floor(2),
             pending_branch_relocs: Vec::new(),
             pcrel_hi_counter: 0,
-            numeric_labels: FxHashMap::default(),
             elf_flags: EF_RISCV_FLOAT_ABI_DOUBLE | EF_RISCV_RVC,
             elf_class: ELFCLASS64,
             no_relax: false,
+            pic: false,
+            rvc: true,
             option_stack: Vec::new(),
-        }
+            pending_lebs: Vec::new(),
+            leb_widths: Vec::new(),
+            leb_retry: None,
+            pending_cfi: Vec::new(),
+        };
+        // Data values capture code labels symbolically; whether they end up
+        // folded or relocated is decided by the relax state at the end
+        // (`process_statements`), as in GNU as.
+        w.base.keep_code_labels = true;
+        w
     }
 
     /// Set the ELF e_flags (e.g., to change float ABI from the default double-float).
     ///
     pub fn set_elf_flags(&mut self, flags: u32) {
         self.elf_flags = flags;
+        // GNU as derives both from one `riscv_opts.rvc`.
+        self.set_rvc(flags & EF_RISCV_RVC != 0);
+    }
+
+    /// `riscv_opts.rvc`: the step a relaxing linker may shrink code in, and
+    /// with it the alignment directives record for code (`insn_alignment`).
+    fn set_rvc(&mut self, rvc: bool) {
+        self.rvc = rvc;
+        // GNU as 2.47, measured: `.text; nop` records addralign 2 for rv64gc
+        // and 4 for rv64imafd, and so does any alignment directive in code.
+        let insn_alignment = if rvc { 2 } else { 4 };
+        self.base.set_code_align_floor(insn_alignment);
+        self.base.set_text_align(insn_alignment);
     }
 
     /// Set the ELF class (ELFCLASS32 or ELFCLASS64).
@@ -311,11 +465,15 @@ impl ElfWriter {
     /// R_RISCV_ALIGN ELF relocation type - marks alignment padding that the
     /// linker may need to adjust during relaxation.
     const R_RISCV_ALIGN: u32 = 43;
+    /// `.uleb128 A - B` across relaxable code: the linker sets the LEB128 at
+    /// the place to S+A of the first, then subtracts S+A of the second.
+    const R_RISCV_32_PCREL: u32 = 57;
+    const R_RISCV_SET_ULEB128: u32 = 60;
+    const R_RISCV_SUB_ULEB128: u32 = 61;
 
-    /// Emit alignment padding with an R_RISCV_ALIGN relocation in executable
-    /// sections (when relaxation is enabled). The linker needs these to know
-    /// where alignment padding exists so it can re-align after relaxation
-    /// changes code sizes.
+    /// Code alignment as GNU as does it: in a relaxable code section a
+    /// worst-case NOP run under an `R_RISCV_ALIGN` the linker trims, else
+    /// plain (capped) padding.
     fn emit_align_with_reloc(
         &mut self,
         align_bytes: u64,
@@ -327,7 +485,6 @@ impl ElfWriter {
         // has nothing to do, and that decision needs the section's flags, which
         // only the shared writer has. Short-cutting made `.byte 1;
         // .p2align 0,,3` emit no padding where GNU as 2.47 pads to 4.
-        let offset_before = self.base.current_offset();
         // Which cap applies is a property of the SECTION, not of the mnemonic.
         //
         // GAS's `s_align` calls `md_do_align`, and the RISC-V hook fires only for
@@ -343,31 +500,36 @@ impl ElfWriter {
         //   2. `bytes <= insn_alignment`, where `insn_alignment = rvc ? 2 : 4`
         //   3. `!riscv_opts.relax`            (`.option push; .option norelax`)
         //
-        // Conjunction 2 is the one this backend had wrong, and it is not
-        // theoretical: measured on the local as 2.44 with only the ISA string
-        // changed, `.text; .byte 1; .p2align 2,,1; .byte 2` pads 0 bytes at
-        // `-march=rv64im` and 3 bytes at `-march=rv64gc`.  lccc cannot emit
-        // compressed instructions (`.option rvc`/`norvc` are accepted and ignored
-        // in `apply_option` above), so its `insn_alignment` is 4 and the cap must
-        // survive at `.p2align 2` / `.balign 4`.  Taking the *toolchain's* default
-        // instead of *this backend's* capability is the same mistake as reading a
-        // `.text`-only rule and applying it to `.data`: the law has an input, and
-        // the input is the emitter, not the assembler next door.  If compression is
-        // ever supported, this constant and the `.p2align 2` rows of
-        // `riscv_align_cap_matrix_matches_the_hook` move together.
+        // Conjunction 2 has an input that is easy to misread: measured on the
+        // local as 2.44 with only the ISA string changed, `.text; .byte 1;
+        // .p2align 2,,1; .byte 2` pads 0 bytes at `-march=rv64im` and 3 bytes
+        // at `-march=rv64gc`.  `insn_alignment` is not "the narrowest
+        // instruction this assembler emits" but the step in which the LINKER
+        // may shrink code -- GNU ld relaxes to compressed forms (`c.j`,
+        // `c.lui`, ...) exactly when the object's `EF_RISCV_RVC` is set, and
+        // GNU as derives both that flag and `insn_alignment` from the same
+        // `riscv_opts.rvc`.  These objects declare `EF_RISCV_RVC` (as GCC's
+        // do), so the default is the rv64gc row; `.option norvc` selects the
+        // rv64im one.  (This backend once fixed it at 4 because it emits no
+        // compressed encodings itself -- which left a `.p2align 2` with no
+        // relocation for a linker that then shrank code before it in 2-byte
+        // steps.)
         //
         // Measured rows (as 2.44 here, and as 2.47.20260726 -- the oracle
         // `scripts/ensure_gas_247.sh` provisions -- for the rows marked 47; pad
-        // bytes after `.byte 1`, with the anchor `.byte 2` after the directive):
-        //   .text  .p2align 4,,2      -> 15   cap dropped by the hook
-        //   .text  .p2align 3,,1      -> 7    cap dropped by the hook
-        //   .text  .p2align 2,,1      -> 0    bytes 4 <= 4: cap honoured
+        // bytes after `.byte 1`, with the anchor `.byte 2` after the directive;
+        // under the hook the count is the fixed 1-byte step to the instruction
+        // alignment plus the worst-case run):
+        //   .text  .p2align 4,,2      -> 15   cap dropped by the hook (1 + 14)
+        //   .text  .p2align 3,,1      -> 7    cap dropped by the hook (1 + 6)
+        //   .text  .p2align 2,,1      -> 3    rv64gc: hook (1 + 2)
+        //   .text  norvc .p2align 2,,1 -> 0   rv64im: bytes 4 <= 4, cap honoured
         //   .text  .p2align 2,,3      -> 3    pad fits the cap
         //   .text  .p2align 1,,1      -> 1    (and 1 for any cap: unobservable,
         //                                     see the note in the matrix test)
         //   .text  norelax .p2align 3,,1  -> 0    relax off: cap honoured
         //   .text  norelax .p2align 3,,15 -> 7
-        //   .text  .balign 8,,4       -> 7  (47)     .text .balign 4,,1 -> 0
+        //   .text  .balign 8,,4       -> 7  (47)     .text .balign 4,,1 -> 3 (gc)
         //   .text  .p2align 4,0x13,2  -> 0  (47)    fill routes around the hook
         //   .text  .p2align 4,0x13,99 -> 15x0x13 (47)
         //   .data  .p2align 4,,2      -> 0  (47)     .data .balign 8,,4 -> 0 (47)
@@ -377,39 +539,80 @@ impl ElfWriter {
             .sections
             .get(&self.base.current_section)
             .map_or(true, |s| s.sh_flags & SHF_EXECINSTR != 0);
-        // 4 = the width of every instruction this backend can emit.
-        const INSN_ALIGNMENT: u64 = 4;
-        let hook_drops_cap =
-            fill.is_none() && section_flags_exec && align_bytes > INSN_ALIGNMENT && !self.no_relax;
-        // `align_bytes > INSN_ALIGNMENT` already excludes `n == 0` and `n == 1`
-        // (1 and 2 are both <= 4), so the `n != 0` conjunct is deliberately not
-        // spelled out: a condition that cannot change the answer is decoration,
-        // and decoration in a security-relevant predicate invites the next reader
-        // to trust it.
-        let max_pad = if hook_drops_cap { None } else { max_pad };
-        self.base.align_to_capped_ex(align_bytes, max_pad, fill)?;
-        let offset_after = self.base.current_offset();
-        let padding = offset_after - offset_before;
-        if padding > 0 && !self.no_relax {
-            // Only emit R_RISCV_ALIGN in executable sections where linker
-            // relaxation may change code sizes and require re-alignment.
+        // GNU as's `insn_alignment`: the step in which a relaxing linker may
+        // shrink code, 2 with RVC (`.option rvc`, the default: the objects
+        // declare `EF_RISCV_RVC`) and 4 without.
+        let insn_alignment: u64 = if self.rvc { 2 } else { 4 };
+        let hook =
+            fill.is_none() && section_flags_exec && align_bytes > insn_alignment && !self.no_relax;
+        // `align_bytes > insn_alignment` already excludes `n == 0` and `n == 1`
+        // (1 and 2 are both <= 2), so the `n != 0` conjunct is deliberately not
+        // spelled out.
+        if hook {
+            // `riscv_frag_align_code`: the address after this directive is not
+            // known until link time (relaxing an earlier `call` shrinks it), so
+            // GNU as first brings the offset to the instruction alignment
+            // (fixed padding), then writes the WORST case, `align -
+            // insn_alignment` bytes of NOPs, under an `R_RISCV_ALIGN` whose
+            // addend is that length.  Every linker derives the alignment from
+            // the addend (the smallest power of two above it) and keeps only
+            // the NOPs the final address needs; lccc-ld does the same
+            // (`riscv/linker/align.rs`).  Padding only to the boundary -- what
+            // this backend did -- names too small an alignment whenever the
+            // pad is short (2 bytes of a `.p2align 4` read as "align 4") and
+            // too few bytes whenever earlier code shrinks: GNU ld then refuses
+            // the object ("12 bytes required for alignment to 16-byte
+            // boundary, but only 8 present"), and an aligned site got no
+            // relocation at all.
+            self.base.align_code_step(insn_alignment)?;
+            let at = self.base.current_offset();
+            let worst = align_bytes - insn_alignment;
+            self.base.emit_code_nops(worst, align_bytes)?;
             if let Some(s) = self.base.sections.get_mut(&self.base.current_section) {
-                if (s.sh_flags & SHF_EXECINSTR) != 0 {
-                    s.relocs.push(ObjReloc {
-                        offset: offset_before,
-                        reloc_type: Self::R_RISCV_ALIGN,
-                        symbol_name: String::new(),
-                        addend: padding as i64,
-                    });
-                }
+                s.relocs.push(ObjReloc {
+                    offset: at,
+                    reloc_type: Self::R_RISCV_ALIGN,
+                    symbol_name: String::new(),
+                    addend: worst as i64,
+                });
             }
+            return Ok(());
         }
+        // Everything else is GAS's generic `frag_align (n, *fill, max)`: the
+        // padding is final (nothing before it can move, or the alignment is
+        // within one instruction step), the cap is honoured, and no
+        // relocation is needed.
+        self.base.align_to_capped_ex(align_bytes, max_pad, fill)?;
         Ok(())
     }
 
     /// Process all parsed assembly statements.
+    ///
+    /// A forward-referencing `.uleb128` takes its width before its value is
+    /// known.  GNU as relaxes such fragments to the canonical length; here the
+    /// whole input is assembled again with the widths the previous pass
+    /// measured, which reaches the same layout.  Widths only grow (capped at
+    /// 10, a u64's LEB128), so this terminates; inputs without such a value
+    /// assemble once.
     pub fn process_statements(&mut self, statements: &[AsmStatement]) -> Result<(), String> {
-        let statements = resolve_numeric_label_refs(statements);
+        let (flags, class) = (self.elf_flags, self.elf_class);
+        let ptr_size = if class == ELFCLASS32 { 4 } else { 8 };
+        let statements = cfi_lower::lower_cfi(statements.to_vec(), &cfi::target(ptr_size))?;
+        loop {
+            self.process_statements_once(&statements)?;
+            let Some(widths) = self.leb_retry.take() else {
+                return Ok(());
+            };
+            let mut fresh = ElfWriter::new();
+            fresh.set_elf_flags(flags);
+            fresh.set_elf_class(class);
+            fresh.leb_widths = widths;
+            *self = fresh;
+        }
+    }
+
+    fn process_statements_once(&mut self, statements: &[AsmStatement]) -> Result<(), String> {
+        let statements = resolve_numeric_label_refs(statements)?;
         for stmt in &statements {
             self.process_statement(stmt)?;
         }
@@ -430,8 +633,18 @@ impl ElfWriter {
                 }
             }
         }
+        // GNU as (2.44, measured) relocates every data difference involving a
+        // code label -- even one between labels of an `.option norelax`
+        // stretch -- unless relaxation is off at the END of the input, and
+        // folds them all otherwise: the decision is per object, made here.
+        self.base.keep_code_labels = !self.no_relax;
         for (section, offset, size, fixup) in self.base.resolve_pending_data(&remap)? {
             self.emit_data_fixup(&section, offset, size, &fixup)?;
+        }
+        self.resolve_pending_lebs(&remap)?;
+        self.resolve_pending_cfi(&remap)?;
+        if self.leb_retry.is_some() {
+            return Ok(());
         }
         // Compression is disabled: the linker handles relaxation via
         // R_RISCV_RELAX. Running our own compression would change code
@@ -446,13 +659,7 @@ impl ElfWriter {
             AsmStatement::Empty => Ok(()),
 
             AsmStatement::Label(name) => {
-                let (section, offset) = self.base.define_label(name)?;
-                if is_numeric_label(name) {
-                    self.numeric_labels
-                        .entry(name.clone())
-                        .or_default()
-                        .push((section, offset));
-                }
+                self.base.define_label(name)?;
                 Ok(())
             }
 
@@ -596,6 +803,13 @@ impl ElfWriter {
                 Ok(())
             }
 
+            Directive::Leb128 { signed, values } => {
+                for dv in values {
+                    self.emit_leb128(dv, *signed)?;
+                }
+                Ok(())
+            }
+
             Directive::Quad(values) => {
                 for dv in values {
                     self.emit_data_value(dv, 8)?;
@@ -645,21 +859,55 @@ impl ElfWriter {
                     self.no_relax = true;
                 } else if opt == "relax" {
                     self.no_relax = false;
+                } else if opt == "pic" {
+                    self.pic = true;
+                } else if opt == "nopic" {
+                    self.pic = false;
+                } else if opt == "rvc" {
+                    self.set_rvc(true);
+                } else if opt == "norvc" {
+                    self.set_rvc(false);
                 } else if opt == "push" {
-                    self.option_stack.push(self.no_relax);
+                    self.option_stack.push((self.no_relax, self.pic, self.rvc));
                 } else if opt == "pop" {
-                    if let Some(saved) = self.option_stack.pop() {
-                        self.no_relax = saved;
+                    if let Some((no_relax, pic, rvc)) = self.option_stack.pop() {
+                        self.no_relax = no_relax;
+                        self.pic = pic;
+                        self.set_rvc(rvc);
                     }
                 }
-                // rvc/norvc are silently accepted (compression not yet supported)
+                // `rvc` selects no encodings here (this backend emits none);
+                // it is GNU as's `insn_alignment` input for code alignment,
+                // and, as in GNU as (`riscv_set_rvc`), it marks the object.
+                if self.rvc {
+                    self.elf_flags |= EF_RISCV_RVC;
+                }
                 Ok(())
             }
 
             Directive::Attribute(_) => Ok(()),
 
             Directive::Org { expr, fill } => self.base.emit_org(expr, *fill),
-            Directive::Cfi | Directive::Ignored => Ok(()),
+            Directive::Ignored => Ok(()),
+            Directive::Cfi(name, _) => Err(format!(
+                "internal: {name} reached the ELF writer without CFI lowering"
+            )),
+            Directive::CfaAdvance { from, to } => self.emit_cfa_advance(from, to),
+            Directive::Pcrel32(sym) => {
+                let value = self.base.capture_data_symbol(sym)?;
+                self.base.ensure_default_section();
+                let (section, offset) = (
+                    self.base.current_section.clone(),
+                    self.base.current_offset(),
+                );
+                self.base.emit_placeholder_bytes(4)?;
+                self.pending_cfi.push(PendingCfi::Pcrel32 {
+                    section,
+                    offset,
+                    value,
+                });
+                Ok(())
+            }
 
             Directive::Insn(args) => {
                 self.base.ensure_text_section();
@@ -726,6 +974,221 @@ impl ElfWriter {
         self.base.emit_data_value(value, size)
     }
 
+    /// `.uleb128` / `.sleb128` (GNU as `s_riscv_leb128`): a value constant
+    /// where it stands is encoded at once; otherwise only an unsigned one is
+    /// accepted, and it is resolved after layout.
+    fn emit_leb128(&mut self, dv: &DataValue, signed: bool) -> Result<(), String> {
+        let value = match dv {
+            DataValue::Integer(v) => return self.emit_leb128_constant(*v, signed),
+            DataValue::Expression(expr) => self.base.capture_data_symbol(expr)?,
+        };
+        if let SetValue::Value(v) = &value
+            && v.is_absolute()
+        {
+            return self.emit_leb128_constant(v.constant, signed);
+        }
+        if signed {
+            return Err("non-constant .sleb128 is not supported".to_string());
+        }
+        let width = self
+            .leb_widths
+            .get(self.pending_lebs.len())
+            .copied()
+            .unwrap_or(1);
+        self.base.ensure_default_section();
+        let (section, offset) = (
+            self.base.current_section.clone(),
+            self.base.current_offset(),
+        );
+        self.base.emit_placeholder_bytes(width)?;
+        self.pending_lebs.push(PendingLeb {
+            section,
+            offset,
+            width,
+            value,
+        });
+        Ok(())
+    }
+
+    /// A CFA advance from label `from` to `to`. The lowering appends
+    /// `.eh_frame` after all code and no code changes size once emitted, so
+    /// two labels of one (sub)section are already at their final distance:
+    /// that fixes the form now. Labels of different subsections move apart
+    /// when those merge; such an advance takes the 5-byte
+    /// `DW_CFA_advance_loc4`, which holds any distance. The value (and its
+    /// relocations) is written after layout ([`Self::resolve_pending_cfi`]).
+    fn emit_cfa_advance(&mut self, from: &str, to: &str) -> Result<(), String> {
+        let value = self.base.capture_data_symbol(&format!("{to} - {from}"))?;
+        let width = match (self.base.labels.get(from), self.base.labels.get(to)) {
+            (Some((sf, of)), Some((st, ot))) if sf == st && ot >= of => cfi::advance_width(ot - of),
+            _ => 5,
+        };
+        self.base.ensure_default_section();
+        let (section, offset) = (
+            self.base.current_section.clone(),
+            self.base.current_offset(),
+        );
+        self.base.emit_placeholder_bytes(width)?;
+        self.pending_cfi.push(PendingCfi::Advance {
+            section,
+            offset,
+            width,
+            value,
+        });
+        Ok(())
+    }
+
+    /// Write the CFI fields recorded during the pass. An advance over code
+    /// under relaxation keeps its SET/SUB pair (see [`cfi`]); otherwise it
+    /// is a constant.
+    fn resolve_pending_cfi(&mut self, remap: &elf::SubsectionRemap) -> Result<(), String> {
+        for p in std::mem::take(&mut self.pending_cfi) {
+            match p {
+                PendingCfi::Advance {
+                    section,
+                    offset,
+                    width,
+                    value,
+                } => {
+                    let (section, offset) = ElfWriterBase::remap_place(remap, &section, offset);
+                    let (fixup, constant) = self
+                        .base
+                        .resolve_value(&value, remap)
+                        .map_err(|e| format!("CFA advance at {section}+{offset:#x}: {e}"))?;
+                    let (delta, pair) = match (fixup, constant) {
+                        (DataFixup::Constant(c), _) => (c, None),
+                        (DataFixup::Diff { add, sub, addend }, Some(c)) => {
+                            (c, Some((add, sub, addend)))
+                        }
+                        _ => {
+                            return Err(format!(
+                                "CFA advance at {section}+{offset:#x}: CFI locations in different sections"
+                            ));
+                        }
+                    };
+                    let delta = u64::try_from(delta).map_err(|_| {
+                        format!("CFA advance at {section}+{offset:#x}: negative distance {delta}")
+                    })?;
+                    if cfi::advance_width(delta) > width {
+                        return Err(format!(
+                            "internal: CFA advance at {section}+{offset:#x} outgrew its {width}-byte form"
+                        ));
+                    }
+                    let (bytes, field, set, sub_t) = cfi::encode_advance(delta, width)?;
+                    let sec = self
+                        .base
+                        .sections
+                        .get_mut(&section)
+                        .ok_or_else(|| format!("CFA advance: unknown section {section}"))?;
+                    let at = usize::try_from(offset).map_err(|e| e.to_string())?;
+                    sec.data[at..at + width].copy_from_slice(&bytes);
+                    if let Some((add, sub, addend)) = pair {
+                        self.base
+                            .add_reloc_at(&section, offset + field, set, &add, addend);
+                        self.base
+                            .add_reloc_at(&section, offset + field, sub_t, &sub, 0);
+                    }
+                }
+                PendingCfi::Pcrel32 {
+                    section,
+                    offset,
+                    value,
+                } => {
+                    let (section, offset) = ElfWriterBase::remap_place(remap, &section, offset);
+                    let (fixup, _) = self
+                        .base
+                        .resolve_value(&value, remap)
+                        .map_err(|e| format!("`.eh_frame' at {section}+{offset:#x}: {e}"))?;
+                    let DataFixup::Abs { sym, addend } = fixup else {
+                        return Err(format!(
+                            "`.eh_frame' at {section}+{offset:#x}: a PC-relative CFI pointer must name a symbol"
+                        ));
+                    };
+                    self.base
+                        .add_reloc_at(&section, offset, Self::R_RISCV_32_PCREL, &sym, addend);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_leb128_constant(&mut self, v: i64, signed: bool) -> Result<(), String> {
+        let mut enc = Vec::with_capacity(10);
+        if signed {
+            crate::backend::elf_writer_common::encode_sleb128(&mut enc, v);
+        } else {
+            crate::backend::elf_writer_common::encode_uleb128(&mut enc, v as u64);
+        }
+        self.base.emit_bytes(&enc)
+    }
+
+    /// Write every pending `.uleb128`, or note the widths a further pass
+    /// needs.  A difference involving code labels under relaxation keeps an
+    /// `R_RISCV_SET_ULEB128`/`R_RISCV_SUB_ULEB128` pair (GNU as
+    /// `riscv_insert_uleb128_fixes`) over its assembly-time value; GNU as
+    /// drops the expression's constant from the pair (it zeroes
+    /// `X_add_number`), which the linker then loses -- here it rides on the
+    /// SET relocation, where the linker adds it.  GNU as also pairs
+    /// differences of data labels; those are exact at assembly time, so they
+    /// are written as constants.
+    fn resolve_pending_lebs(&mut self, remap: &elf::SubsectionRemap) -> Result<(), String> {
+        let mut needed: Option<Vec<usize>> = None;
+        for (i, p) in std::mem::take(&mut self.pending_lebs)
+            .into_iter()
+            .enumerate()
+        {
+            let (section, offset) = ElfWriterBase::remap_place(remap, &p.section, p.offset);
+            let where_ = format!("`.uleb128' at {section}+{offset:#x}");
+            let (fixup, constant) = self
+                .base
+                .resolve_value(&p.value, remap)
+                .map_err(|e| format!("{where_}: {e}"))?;
+            let value = match (&fixup, constant) {
+                (DataFixup::Constant(c), _) => *c,
+                (DataFixup::Diff { add, sub, addend }, Some(c)) => {
+                    self.base.add_reloc_at(
+                        &section,
+                        offset,
+                        Self::R_RISCV_SET_ULEB128,
+                        add,
+                        *addend,
+                    );
+                    self.base
+                        .add_reloc_at(&section, offset, Self::R_RISCV_SUB_ULEB128, sub, 0);
+                    c
+                }
+                (DataFixup::Diff { .. }, None) => {
+                    return Err(format!(
+                        "{where_}: a difference of symbols in different sections has no LEB128 relocation"
+                    ));
+                }
+                (DataFixup::Abs { .. }, _) => {
+                    return Err(format!("{where_}: non-constant .uleb128 is not supported"));
+                }
+            };
+            match uleb128_fixed(value as u64, p.width) {
+                Some(bytes) => {
+                    let sec = self
+                        .base
+                        .sections
+                        .get_mut(&section)
+                        .ok_or_else(|| format!("{where_}: unknown section"))?;
+                    let at = usize::try_from(offset).map_err(|e| e.to_string())?;
+                    sec.data[at..at + p.width].copy_from_slice(&bytes);
+                }
+                None => {
+                    let w = needed.get_or_insert_with(|| self.leb_widths.clone());
+                    if w.len() <= i {
+                        w.resize(i + 1, 1);
+                    }
+                    w[i] = w[i].max(uleb128_len(value as u64));
+                }
+            }
+        }
+        self.leb_retry = needed;
+        Ok(())
+    }
+
     /// The relocation(s) for one deferred data value.  GAS 2.44 (riscv64,
     /// -mno-relax): `sym + k` is R_RISCV_32/64 (there is none for 1 or 2
     /// bytes: refused), and EVERY difference not folded to a constant --
@@ -780,7 +1243,14 @@ impl ElfWriter {
         // sh_addralign (data-only `.text` stays 1 — measured).
         self.base.note_instruction();
 
-        match encode_instruction(mnemonic, operands, raw_operands) {
+        let encoded = match mnemonic {
+            "lga" | "la.tls.ie" | "la.tls.gd" => {
+                encode_got_pseudo(mnemonic, operands, self.elf_class == ELFCLASS64)
+            }
+            "la" if self.pic => encode_got_pseudo(mnemonic, operands, self.elf_class == ELFCLASS64),
+            _ => encode_instruction(mnemonic, operands, raw_operands),
+        };
+        match encoded {
             Ok(EncodeResult::Word(word)) => {
                 self.base.emit_u32_le(word)?;
                 Ok(())
@@ -820,9 +1290,7 @@ impl ElfWriter {
                         .add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
                     self.base.emit_u32_le(word)?;
                 } else {
-                    let is_local = reloc.symbol.starts_with(".L")
-                        || reloc.symbol.starts_with(".l")
-                        || parse_numeric_label_ref(&reloc.symbol).is_some();
+                    let is_local = reloc.symbol.starts_with(".L") || reloc.symbol.starts_with(".l");
 
                     if is_local {
                         let offset = self.base.current_offset();
@@ -833,11 +1301,15 @@ impl ElfWriter {
                             symbol: reloc.symbol.clone(),
                             addend: reloc.addend,
                             pcrel_hi_offset: None,
+                            relax: !self.no_relax && relax_paired(elf_type),
                         });
                         self.base.emit_u32_le(word)?;
                     } else {
                         self.base
                             .add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
+                        if !self.no_relax && relax_paired(elf_type) {
+                            self.base.add_reloc(Self::R_RISCV_RELAX, String::new(), 0);
+                        }
                         self.base.emit_u32_le(word)?;
                     }
                 }
@@ -870,7 +1342,9 @@ impl ElfWriter {
 
                             self.base
                                 .add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
-                            if !self.no_relax {
+                            // GAS 2.47 pairs R_RISCV_RELAX with the hi part of
+                            // `lla`/`la`/`lga`, never with a TLS GOT/GD hi20.
+                            if !self.no_relax && !is_tls_gd_hi && !is_tls_got_hi {
                                 self.base.add_reloc(Self::R_RISCV_RELAX, String::new(), 0);
                             }
                             self.base.emit_u32_le(*word)?;
@@ -907,9 +1381,8 @@ impl ElfWriter {
                             self.base
                                 .add_reloc(elf_type, reloc.symbol.clone(), reloc.addend);
                         } else {
-                            let is_local = reloc.symbol.starts_with(".L")
-                                || reloc.symbol.starts_with(".l")
-                                || parse_numeric_label_ref(&reloc.symbol).is_some();
+                            let is_local =
+                                reloc.symbol.starts_with(".L") || reloc.symbol.starts_with(".l");
                             if is_local {
                                 let offset = self.base.current_offset();
                                 self.pending_branch_relocs.push(PendingReloc {
@@ -919,6 +1392,7 @@ impl ElfWriter {
                                     symbol: reloc.symbol.clone(),
                                     addend: reloc.addend,
                                     pcrel_hi_offset: None,
+                                    relax: !self.no_relax && relax_paired(elf_type),
                                 });
                             } else {
                                 self.base
@@ -997,14 +1471,6 @@ impl ElfWriter {
                 }
             }
 
-            for (_, defs) in self.numeric_labels.iter_mut() {
-                for (def_sec, def_offset) in defs.iter_mut() {
-                    if def_sec == sec_name {
-                        *def_offset = compress::remap_offset(*def_offset, &offset_map);
-                    }
-                }
-            }
-
             for sym in &mut self.base.extra_symbols {
                 if sym.section_name == *sec_name {
                     sym.value = compress::remap_offset(sym.value, &offset_map);
@@ -1013,62 +1479,35 @@ impl ElfWriter {
         }
     }
 
-    /// Resolve a numeric label reference like "1b" or "1f" to a (section, offset).
-    fn resolve_numeric_label_ref(
-        &self,
-        label_name: &str,
-        is_backward: bool,
-        ref_section: &str,
-        ref_offset: u64,
-    ) -> Option<(String, u64)> {
-        let defs = self.numeric_labels.get(label_name)?;
-        if is_backward {
-            let mut best: Option<&(String, u64)> = None;
-            for def in defs {
-                if def.0 == ref_section && def.1 <= ref_offset {
-                    best = Some(def);
-                }
-            }
-            best.cloned()
-        } else {
-            for def in defs {
-                if def.0 == ref_section && def.1 > ref_offset {
-                    return Some(def.clone());
-                }
-            }
-            None
-        }
-    }
-
     /// Resolve local branch labels to PC-relative offsets using RISC-V relocation types.
     fn resolve_local_branches(&mut self) -> Result<(), String> {
-        for reloc in &self.pending_branch_relocs {
+        let pending = std::mem::take(&mut self.pending_branch_relocs);
+        for reloc in &pending {
             // pcrel_lo12 relocations must always be emitted as external relocations
             // so the linker can pair them with their corresponding pcrel_hi20.
             let is_pcrel_lo = reloc.reloc_type == 24 || reloc.reloc_type == 25;
             if is_pcrel_lo {
+                let symbol_name = reloc.symbol.clone();
                 if let Some(section) = self.base.sections.get_mut(&reloc.section) {
                     section.relocs.push(ObjReloc {
                         offset: reloc.offset,
                         reloc_type: reloc.reloc_type,
-                        symbol_name: reloc.symbol.clone(),
+                        symbol_name,
                         addend: reloc.addend,
                     });
+                    if reloc.relax {
+                        section.relocs.push(ObjReloc {
+                            offset: reloc.offset,
+                            reloc_type: Self::R_RISCV_RELAX,
+                            symbol_name: String::new(),
+                            addend: 0,
+                        });
+                    }
                 }
                 continue;
             }
 
-            let resolved =
-                if let Some((label_name, is_backward)) = parse_numeric_label_ref(&reloc.symbol) {
-                    self.resolve_numeric_label_ref(
-                        label_name,
-                        is_backward,
-                        &reloc.section,
-                        reloc.offset,
-                    )
-                } else {
-                    self.base.labels.get(&reloc.symbol).cloned()
-                };
+            let resolved = self.base.labels.get(&reloc.symbol).cloned();
 
             let (target_section, target_offset) = match resolved {
                 Some(v) => v,
@@ -1080,6 +1519,14 @@ impl ElfWriter {
                             symbol_name: reloc.symbol.clone(),
                             addend: reloc.addend,
                         });
+                        if reloc.relax {
+                            section.relocs.push(ObjReloc {
+                                offset: reloc.offset,
+                                reloc_type: Self::R_RISCV_RELAX,
+                                symbol_name: String::new(),
+                                addend: 0,
+                            });
+                        }
                     }
                     continue;
                 }
@@ -1093,6 +1540,14 @@ impl ElfWriter {
                         symbol_name: reloc.symbol.clone(),
                         addend: reloc.addend,
                     });
+                    if reloc.relax {
+                        section.relocs.push(ObjReloc {
+                            offset: reloc.offset,
+                            reloc_type: Self::R_RISCV_RELAX,
+                            symbol_name: String::new(),
+                            addend: 0,
+                        });
+                    }
                 }
                 continue;
             }
@@ -1690,53 +2145,100 @@ mod padding_law_tests {
     const DATA: [u8; 5] = [0xa5; 5];
 
     /// The pad content is GNU as 2.47's `riscv_make_nops` (tc-riscv.c:5410),
-    /// measured on the oracle: a run of `p` bytes takes one zero byte when `p`
-    /// is odd, then one `c.nop` when what remains is 2 mod 4, and 4-byte NOPs
-    /// for the rest — so every NOP sits where a hart could fetch it and the
-    /// run ends flush with the boundary. Before this law was shared with
-    /// aarch64 the writer emitted NOPs first and zeros last, putting a 4-byte
-    /// NOP at an odd offset.
+    /// measured on the oracle (`-march=rv64gc`): one zero byte at an odd
+    /// offset, then one `c.nop` where the position is 2 mod 4, and 4-byte NOPs
+    /// for the rest -- every NOP sits where a hart could fetch it.  Before this
+    /// law was shared with aarch64 the writer emitted NOPs first and zeros
+    /// last, putting a 4-byte NOP at an odd offset.  (In a relaxable code
+    /// section the run is the worst case `align - 2` after the step to the
+    /// instruction alignment, see `relaxable_pad_is_the_worst_case_run`.)
     #[test]
     fn pad_is_zero_prefix_then_compressed_nop_then_nops() {
-        // Offset 5, `.p2align 3`: 3 bytes of pad = 00 | c.nop.
+        // Offset 5, `.p2align 3`: 00 | c.nop | nop  (as 2.47: 00 01 00 13 00 00 00).
         assert_eq!(
             text(".byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.p2align 3\n"),
-            [DATA.as_slice(), &[0x00], &C_NOP].concat()
+            [DATA.as_slice(), &[0x00], &C_NOP, &NOP].concat()
         );
-        // Offset 5, `.p2align 4`: 11 bytes = 00 | c.nop | nop | nop.
+        // Offset 5, `.p2align 4`: 00 | c.nop | nop | nop | nop.
         assert_eq!(
             text(".byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.p2align 4\n"),
+            [DATA.as_slice(), &[0x00], &C_NOP, &NOP, &NOP, &NOP].concat()
+        );
+        // Without relaxation the pad is final and stops at the boundary.
+        assert_eq!(
+            text(
+                ".option norelax\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.p2align 4\n"
+            ),
             [DATA.as_slice(), &[0x00], &C_NOP, &NOP, &NOP].concat()
         );
     }
 
-    /// The pad stops at the boundary. GAS does not stop there on RISC-V:
-    /// `riscv_frag_align_code` writes a worst-case `align - insn_alignment`
-    /// NOP run plus a `BFD_RELOC_RISCV_ALIGN` fixup and lets the linker relax
-    /// it (measured at offset 16: `.p2align 5` pads 48 bytes, two quanta more
-    /// than the 16 that reach the boundary). LCCC's linker takes
-    /// `R_RISCV_ALIGN` as a hint it skips, so the inflation would survive into
-    /// the image; padding to the boundary is what a relaxed link leaves. This
-    /// test is the pinned record of that deliberate difference.
+    /// The `.text` relocations of `asm`, as `(offset, type, addend)`.
+    fn text_relocs(asm: &str) -> Vec<(u64, u32, i64)> {
+        let statements = parse_asm(asm).expect("must parse");
+        let mut w = ElfWriter::new();
+        w.process_statements(&statements).expect("must assemble");
+        w.base.sections[".text"]
+            .relocs
+            .iter()
+            .map(|r| (r.offset, r.reloc_type, r.addend))
+            .collect()
+    }
+
+    /// In a relaxable code section the pad is GNU as's `riscv_frag_align_code`:
+    /// a fixed step to the instruction alignment, then the WORST case `align -
+    /// insn_alignment` bytes of NOPs under an `R_RISCV_ALIGN` naming that
+    /// length, which the linker trims to what the final address needs (GNU ld,
+    /// lld, and lccc-ld's `riscv/linker/align.rs`).  Every row is GNU as
+    /// 2.47.20260726 `-march=rv64gc` (lccc's objects declare `EF_RISCV_RVC`).
+    /// This backend used to pad only to the boundary with the pad length as the
+    /// addend: a short pad then named too small an alignment (2 bytes of a
+    /// `.p2align 4` read as "align to 4"), and code shrinking before it left too
+    /// few bytes -- GNU ld refused such objects outright ("12 bytes required for
+    /// alignment to 16-byte boundary, but only 8 present").
     #[test]
-    fn pad_reaches_the_boundary_and_stops_there() {
-        let got = text(".byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.p2align 5\n");
-        assert_eq!(got.len(), 5 + 27, "27 bytes of pad to the 32-byte boundary");
+    fn relaxable_pad_is_the_worst_case_run() {
+        const ALIGN: u32 = 43;
+        let five = ".byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n";
+        // Offset 5, `.p2align 5`: 00 (step to 6), then 30 bytes = c.nop + 7 NOPs.
+        let got = text(&format!("{five}.p2align 5\n"));
+        assert_eq!(got.len(), 5 + 1 + 30);
+        assert_eq!(&got[5..8], &[0x00, 0x01, 0x00][..]);
+        assert!(got[8..].chunks_exact(4).all(|c| c == NOP));
         assert_eq!(
-            &got[5..6],
-            &[0x00][..],
-            "odd prefix first, exactly as riscv_make_nops"
+            text_relocs(&format!("{five}.p2align 5\n")),
+            [(6, ALIGN, 30)]
         );
-        assert_eq!(&got[6..8], &C_NOP[..], "then the one allowed c.nop");
-        assert!(
-            got[8..].chunks_exact(4).all(|c| c == NOP),
-            "the remaining 24 bytes are four full NOPs, ending flush at 32"
-        );
+        // `.p2align 2` is above the 2-byte RVC step, so it is relaxable too.
+        assert_eq!(text(&format!("{five}.p2align 2\n")).len(), 8);
+        assert_eq!(text_relocs(&format!("{five}.p2align 2\n")), [(6, ALIGN, 2)]);
+        // `.option norvc`: the step is 4 (00 c.nop), the run 4 bytes.
+        let norvc = format!(".option norvc\n{five}.p2align 3\n");
         assert_eq!(
-            text(".byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.byte 0xa5\n.p2align 2\n").len(),
-            8,
-            "`.p2align 2` is at or below the instruction size: plain 3-byte pad"
+            text(&norvc),
+            [DATA.as_slice(), &[0x00], &C_NOP, &NOP].concat()
         );
+        assert_eq!(text_relocs(&norvc), [(8, ALIGN, 4)]);
+        // ... and `.p2align 2` is no longer above the step: final pad, no reloc.
+        let norvc2 = format!(".option norvc\n{five}.p2align 2\n");
+        assert_eq!(text(&norvc2).len(), 8);
+        assert_eq!(text_relocs(&norvc2), []);
+        // `.option norelax`: final pad to the boundary, no relocation.
+        let norelax = format!(".option norelax\n{five}.p2align 5\n");
+        assert_eq!(text(&norelax).len(), 32);
+        assert_eq!(text_relocs(&norelax), []);
+        // An object assembled for a march without C (no `EF_RISCV_RVC`) steps
+        // to 4 from the start, like `.option norvc`.
+        let statements = parse_asm(&format!("{five}.p2align 3\n")).expect("must parse");
+        let mut w = ElfWriter::new();
+        w.set_elf_flags(EF_RISCV_FLOAT_ABI_DOUBLE);
+        w.process_statements(&statements).expect("must assemble");
+        let relocs: Vec<_> = w.base.sections[".text"]
+            .relocs
+            .iter()
+            .map(|r| (r.offset, r.reloc_type, r.addend))
+            .collect();
+        assert_eq!(relocs, [(8, ALIGN, 4)]);
     }
 
     /// The `fill` operand was parsed and thrown away by this backend, so
@@ -1757,17 +2259,13 @@ mod padding_law_tests {
             got[5..].iter().all(|&b| b == 0xff),
             "11 bytes of 0xff, no NOPs: {got:02x?}"
         );
-        // The corner LCCC does *not* chase: an explicit fill below the code
-        // alignment floor. `.byte 1; .p2align 1, 0xff` pads GAS `ff 01 00` —
-        // its mapping-state pre-align (`frag_align_code (rvc ? 1 : 2, 0)`,
-        // tc-riscv.c:5463) runs first, so the fill reaches only the byte that
-        // pre-align could not express as a NOP. LCCC fills all three with the
-        // asked-for byte at the same size, which is what the operand means to a
-        // reader of the source. Sizes agree, so no address after the directive
-        // moves; `scripts/gas_fill_census.py` counts these cells separately.
+        // `.byte 1; .p2align 1, 0xff` is `01 ff` on GNU as 2.47 -march=rv64gc:
+        // the directive pads to what it asks for, and the code floor only
+        // raises the section's alignment.  (`ff 01 00`, read once as the law,
+        // is a march without C, where the tail GNU as pads a code section with
+        // follows the 4-byte alignment.)
         let got = text(".byte 0xa5\n.p2align 1, 0xff\n");
-        assert_eq!(got.len(), 4, "raised to the 4-byte code floor like GAS");
-        assert_eq!(&got[1..], &[0xff, 0xff, 0xff], "fill byte throughout");
+        assert_eq!(got, [0xa5, 0xff], "one fill byte to the 2-byte boundary");
         // `.balign` shares the grammar, including the cap slot -- which is live
         // outside a code section (see `cap_applies_outside_a_code_section`; in
         // `.text` the hook ignores it, so `.balign 8,,2` still pads).
@@ -1894,12 +2392,43 @@ mod padding_law_tests {
             (".text", "", ".p2align 3,,1", 7, None),
             (".text", "", ".p2align 3,,7", 7, None),
             (".text", "", ".balign 8,,1", 7, None),
-            // `bytes <= insn_alignment`: the hook declines, so the cap is honoured.
-            // `.p2align 2,,1` is the row a cap-ignoring backend gets backwards.
-            (".text", "", ".p2align 2,,1", 0, None),
+            // With RVC (the default: these objects declare `EF_RISCV_RVC`) 4
+            // bytes are above `insn_alignment`, so the hook drops the cap here
+            // too: the 1-byte step plus a 2-byte run (as 2.47 -march=rv64gc).
+            (".text", "", ".p2align 2,,1", 3, None),
             (".text", "", ".p2align 2,,3", 3, None),
-            (".text", "", ".balign 4,,1", 0, None),
+            (".text", "", ".balign 4,,1", 3, None),
             (".text", "", ".balign 4,,3", 3, None),
+            // `bytes <= insn_alignment` without RVC: the hook declines, so the
+            // cap is honoured -- the row a cap-ignoring backend gets backwards.
+            (
+                ".text",
+                ".option push\n.option norvc\n",
+                ".p2align 2,,1",
+                0,
+                None,
+            ),
+            (
+                ".text",
+                ".option push\n.option norvc\n",
+                ".balign 4,,1",
+                0,
+                None,
+            ),
+            (
+                ".text",
+                ".option push\n.option norvc\n",
+                ".p2align 2,,3",
+                3,
+                None,
+            ),
+            (
+                ".text",
+                ".option push\n.option norvc\n",
+                ".p2align 3,,1",
+                7,
+                None,
+            ),
             // `!relax`: same section, same exponent, cap honoured again.
             (
                 ".text",
@@ -2073,5 +2602,372 @@ mod padding_law_tests {
             assemble(".data\n.zero 0x10000001\n").is_err(),
             "PROGBITS ceiling"
         );
+    }
+}
+
+/// Relocation kinds and R_RISCV_RELAX pairing of the TLS / GOT / low-12
+/// forms, row for row against GNU as 2.47 (`riscv64-linux-gnu-as`, read back
+/// with `objdump -dr`, 2026-10-19).
+#[cfg(test)]
+mod reloc_kind_tests {
+    use super::super::parser::parse_asm;
+    use super::*;
+
+    /// (offset, type, symbol) of every `.text` relocation, RELAX as type 51.
+    fn relocs(asm: &str) -> Vec<(u64, u32, String)> {
+        let statements = parse_asm(asm).expect("must parse");
+        let mut w = ElfWriter::new();
+        w.process_statements(&statements).expect("must assemble");
+        let mut r: Vec<_> = w.base.sections[".text"]
+            .relocs
+            .iter()
+            .map(|r| (r.offset, r.reloc_type, r.symbol_name.clone()))
+            .collect();
+        r.sort_by_key(|x| (x.0, x.1 == 51));
+        r
+    }
+    fn types(asm: &str) -> Vec<(u64, u32)> {
+        relocs(asm).into_iter().map(|(o, t, _)| (o, t)).collect()
+    }
+
+    /// Stores take the S-type low-12 relocations. An I-type one patches
+    /// bits 31:20, which in a store hold `rs2`: the linker would rewrite the
+    /// stored register field with address bits.
+    #[test]
+    fn stores_take_s_type_low12() {
+        assert_eq!(
+            types("sw a1, %lo(g)(a0)\nfsd fa0, %lo(g)(a0)\nsw a1, %tprel_lo(v)(t0)\n"),
+            vec![(0, 28), (0, 51), (4, 28), (4, 51), (8, 31), (8, 51)]
+        );
+        assert_eq!(
+            types("lw a1, %lo(g)(a0)\nfld fa0, %tprel_lo(v)(a0)\n"),
+            vec![(0, 27), (0, 51), (4, 30), (4, 51)]
+        );
+    }
+
+    /// The Local-Exec sequence: HI20, TPREL_ADD on the `add`, LO12, each with
+    /// RELAX, so the linker can shrink it to `addi rd, tp, off`.
+    #[test]
+    fn local_exec_sequence_is_relaxable() {
+        assert_eq!(
+            types(
+                "lui t0, %tprel_hi(v)\nadd t0, t0, tp, %tprel_add(v)\naddi t0, t0, %tprel_lo(v)\n"
+            ),
+            vec![(0, 29), (0, 51), (4, 32), (4, 51), (8, 30), (8, 51)]
+        );
+        assert!(
+            parse_asm("add t0, t0, tp, t1\n")
+                .ok()
+                .and_then(|s| {
+                    let mut w = ElfWriter::new();
+                    w.process_statements(&s).ok()
+                })
+                .is_none()
+        );
+        // `.option norelax` drops every pairing.
+        assert_eq!(
+            types(".option norelax\nlui t0, %tprel_hi(v)\nadd t0, t0, tp, %tprel_add(v)\n"),
+            vec![(0, 29), (4, 32)]
+        );
+    }
+
+    /// GOT-slot pseudos: TLS hi20 never pairs RELAX, the GOT `lga` does, and
+    /// `ld` (RV64) reads the slot. `la` is GOT-indirect only under
+    /// `.option pic` (and `.option push/pop` restore the state).
+    #[test]
+    fn got_pseudos_match_gas() {
+        assert_eq!(
+            types("la.tls.ie a5, v\nla.tls.gd a0, v\nlga t0, g\n"),
+            vec![
+                (0, 21),
+                (4, 24),
+                (4, 51),
+                (8, 22),
+                (12, 24),
+                (12, 51),
+                (16, 20),
+                (16, 51),
+                (20, 24),
+                (20, 51)
+            ]
+        );
+        assert_eq!(
+            types(".option pic\nla a0, g\n.option push\n.option nopic\nla a1, g\n.option pop\nla a2, g\n")
+                .into_iter()
+                .filter(|&(_, t)| t == 20 || t == 23)
+                .collect::<Vec<_>>(),
+            vec![(0, 20), (8, 23), (16, 20)]
+        );
+        let statements = parse_asm("la.tls.ie a5, v\n").unwrap();
+        let mut w = ElfWriter::new();
+        w.process_statements(&statements).unwrap();
+        let text = &w.base.sections[".text"].data;
+        // auipc a5,0 ; ld a5,0(a5) -- GAS bytes 00000797 0007b783.
+        assert_eq!(text[..8], [0x97, 0x07, 0x00, 0x00, 0x83, 0xb7, 0x07, 0x00]);
+    }
+
+    /// `call foo@plt` is GAS's legacy spelling of `call foo`; the canonical
+    /// `mv` is `addi rd, rs, 0` (GAS 2.47 words, norvc).
+    #[test]
+    fn call_plt_suffix_and_mv_match_gas() {
+        assert_eq!(
+            relocs("call foo@plt\ntail bar@plt\n"),
+            vec![
+                (0, 19, "foo".to_string()),
+                (0, 51, String::new()),
+                (8, 19, "bar".to_string()),
+                (8, 51, String::new())
+            ]
+        );
+        assert!(parse_asm("call foo@plt+4\n").ok().is_none_or(|s| {
+            let mut w = ElfWriter::new();
+            w.process_statements(&s).is_err()
+        }));
+        let statements = parse_asm("mv a0, t0\n").unwrap();
+        let mut w = ElfWriter::new();
+        w.process_statements(&statements).unwrap();
+        assert_eq!(w.base.sections[".text"].data, [0x13, 0x85, 0x02, 0x00]);
+    }
+
+    /// A numeric reference with no definition is an error (GAS 2.47), not
+    /// an undefined symbol called "3f".
+    #[test]
+    fn undefined_numeric_label_is_an_error() {
+        for asm in [
+            "j 3f\n",
+            "1:\tauipc a0, %pcrel_hi(g)\n\taddi a0, a0, %pcrel_lo(3b)\n",
+            "2:\tnop\n\tlw a0, %pcrel_lo(2f)(a0)\n",
+        ] {
+            let statements = parse_asm(asm).unwrap();
+            let mut w = ElfWriter::new();
+            assert!(w.process_statements(&statements).is_err(), "{asm:?}");
+        }
+    }
+
+    /// `%pcrel_lo(1b)` names its auipc through a GNU numeric label: the
+    /// relocation must point at a local label on that auipc, never at an
+    /// undefined symbol called "1b" (the Linux/glibc `1: auipc` idiom).
+    #[test]
+    fn numeric_label_pcrel_lo_targets_the_auipc() {
+        let statements =
+            parse_asm("nop\n1:\tauipc a0, %pcrel_hi(g)\n\taddi a3, a0, %pcrel_lo(1b)\n").unwrap();
+        let mut w = ElfWriter::new();
+        w.process_statements(&statements).unwrap();
+        let lo = w.base.sections[".text"]
+            .relocs
+            .iter()
+            .find(|r| r.reloc_type == 24)
+            .expect("PCREL_LO12_I");
+        assert!(lo.symbol_name.starts_with(".L"), "{}", lo.symbol_name);
+        assert_eq!(w.base.labels[&lo.symbol_name], (".text".to_string(), 4));
+    }
+}
+
+/// Data values naming code that linker relaxation may move.  Rows are GNU as
+/// 2.44 (local) and 2.47.20260726, which agree on every one of them.
+#[cfg(test)]
+mod relax_value_tests {
+    use super::super::parser::parse_asm;
+    use super::*;
+
+    const ADD32: u32 = 35;
+    const SUB32: u32 = 39;
+    const R64: u32 = 2;
+    const SET_ULEB128: u32 = 60;
+    const SUB_ULEB128: u32 = 61;
+
+    fn assemble(asm: &str) -> ElfWriter {
+        let statements = parse_asm(asm).expect("must parse");
+        let mut w = ElfWriter::new();
+        w.process_statements(&statements).expect("must assemble");
+        w
+    }
+
+    fn relocs(w: &ElfWriter, sec: &str) -> Vec<(u64, u32, String, i64)> {
+        w.base.sections[sec]
+            .relocs
+            .iter()
+            .map(|r| (r.offset, r.reloc_type, r.symbol_name.clone(), r.addend))
+            .collect()
+    }
+
+    fn r(off: u64, ty: u32, sym: &str, addend: i64) -> (u64, u32, String, i64) {
+        (off, ty, sym.to_string(), addend)
+    }
+
+    /// GNU as: `.word b - a` over code is an ADD32/SUB32 pair against the
+    /// labels in any section, even between labels with nothing relaxable in
+    /// between, and even when the difference was written after both labels.
+    /// Folding it (what this backend did) froze the pre-relaxation distance:
+    /// a jump table or a length past a relaxed `call` read 4 bytes too far.
+    #[test]
+    fn code_label_differences_stay_relocations() {
+        let w = assemble(
+            ".text\na: call foo\n.p2align 4\nb: ret\n.word b-a\n\
+             .section .rodata\n.word b-a\n.text\nc: addi a0,a0,1\nd: ret\n\
+             .section .rodata\n.word d-c\n",
+        );
+        assert_eq!(
+            relocs(&w, ".rodata"),
+            [
+                r(0, ADD32, "b", 0),
+                r(0, SUB32, "a", 0),
+                r(4, ADD32, "d", 0),
+                r(4, SUB32, "c", 0),
+            ]
+        );
+        assert_eq!(w.base.sections[".rodata"].data, [0u8; 8]);
+        let text: Vec<_> = relocs(&w, ".text")
+            .into_iter()
+            .filter(|(_, t, _, _)| *t == ADD32 || *t == SUB32)
+            .collect();
+        assert_eq!(text, [r(26, ADD32, "b", 0), r(26, SUB32, "a", 0)]);
+        // A data label on the other side keeps its constant on the ADD.
+        let w =
+            assemble(".text\n.LBB1: ret\n.section .rodata\n.byte 0\n.Ljt: .word .LBB1 - .Ljt\n");
+        let rel = relocs(&w, ".rodata");
+        assert_eq!(rel[0].1, ADD32);
+        assert_eq!(rel[0].2, ".LBB1");
+        assert_eq!(rel[1].1, SUB32);
+        assert_eq!(rel[0].3 - rel[1].3, -1, "the ADD carries -(.Ljt - .rodata)");
+    }
+
+    /// GNU as folds them all when relaxation is off at the end of the input,
+    /// and folds `.set` (and `.org`) eagerly whatever the relax state.
+    #[test]
+    fn folding_follows_gnu_as() {
+        let w = assemble(
+            ".text\na: call foo\nb: ret\n.section .rodata\n.word b-a\n.text\n.option norelax\n",
+        );
+        assert!(relocs(&w, ".rodata").is_empty());
+        assert_eq!(w.base.sections[".rodata"].data, 8u32.to_le_bytes());
+        let w = assemble(".text\na: call foo\nb:\n.set L, b-a\n.section .rodata\n.word L\n");
+        assert!(relocs(&w, ".rodata").is_empty());
+        assert_eq!(w.base.sections[".rodata"].data, 8u32.to_le_bytes());
+    }
+
+    /// A lone local code label is relocated against by name
+    /// (`tc_fix_adjustable` is 0 for code on RISC-V): `.text + 8` would not
+    /// follow the label when the linker deletes bytes before it.
+    #[test]
+    fn a_code_label_is_not_rewritten_to_its_section() {
+        let w = assemble(".text\ncall foo\n.L1: ret\n.data\n.quad .L1\n");
+        assert_eq!(relocs(&w, ".data"), [r(0, R64, ".L1", 0)]);
+        // Data labels still go through their section, as before.
+        let w = assemble(".section .rodata\n.byte 1\n.L2: .byte 2\n.data\n.quad .L2\n");
+        assert_eq!(relocs(&w, ".data"), [r(0, R64, ".rodata", 1)]);
+    }
+
+    /// `.` at a code location is a label of its own (GNU as's `.L0 `).
+    #[test]
+    fn dot_in_code_is_a_label() {
+        let w = assemble(".text\n1: call foo\n.word 1b - .\n");
+        let rel: Vec<_> = relocs(&w, ".text")
+            .into_iter()
+            .filter(|(_, t, _, _)| *t == ADD32 || *t == SUB32)
+            .collect();
+        assert_eq!(rel.len(), 2);
+        assert_eq!((rel[0].0, rel[0].1), (8, ADD32));
+        assert_eq!((rel[1].0, rel[1].1), (8, SUB32));
+        assert!(rel[1].2.starts_with(".L0\u{1}"), "{:?}", rel[1].2);
+        assert_eq!(w.base.labels[&rel[1].2], (".text".to_string(), 8));
+        // In a data section `.` does not move: section-relative, as before.
+        let w = assemble(".text\n1: call foo\n.section .rodata\n.word 0\n.word 1b - .\n");
+        let rel = relocs(&w, ".rodata");
+        assert_eq!(
+            (rel[1].1, rel[1].2.as_str(), rel[0].3),
+            (SUB32, ".rodata", -4)
+        );
+    }
+
+    #[test]
+    fn uleb128_constants_and_sleb128() {
+        let w = assemble(
+            ".data\n.uleb128 300\n.sleb128 -2\n.uleb128 0\n.L1: .byte 1\n.L2: .sleb128 .L1 - .L2\n",
+        );
+        assert_eq!(
+            w.base.sections[".data"].data,
+            [0xac, 0x02, 0x7e, 0x00, 0x01, 0x7f]
+        );
+        // GNU as: "non-constant .sleb128 is not supported" (`s_riscv_leb128`).
+        for asm in [
+            ".data\n.sleb128 .L1 - .L2\n.L2: .byte 1\n.L1:\n",
+            ".text\na: call foo\nb: ret\n.data\n.sleb128 b - a\n",
+        ] {
+            let statements = parse_asm(asm).expect("must parse");
+            let err = ElfWriter::new()
+                .process_statements(&statements)
+                .unwrap_err();
+            assert!(
+                err.contains("non-constant .sleb128 is not supported"),
+                "{asm}: {err}"
+            );
+        }
+    }
+
+    /// `.uleb128 b - a` over code: R_RISCV_SET_ULEB128 + R_RISCV_SUB_ULEB128
+    /// over the assembly-time value (GNU as: `16` with b 0x16 past a).
+    #[test]
+    fn uleb128_over_code_is_a_set_sub_pair() {
+        let w =
+            assemble(".text\na: call foo\n.p2align 4\nb: ret\n.section .rodata\n.uleb128 b-a\n");
+        assert_eq!(w.base.sections[".rodata"].data, [0x16]);
+        assert_eq!(
+            relocs(&w, ".rodata"),
+            [r(0, SET_ULEB128, "b", 0), r(0, SUB_ULEB128, "a", 0)]
+        );
+        // A forward reference to a code label: GNU as writes the assembly-time
+        // value, -4 here, in its 10-byte LEB128 (`fcffffff ffffffff ff01`).
+        let w = assemble(".text\nb: ret\n.section .rodata\n.uleb128 b - a\n.text\na: call foo\n");
+        assert_eq!(
+            w.base.sections[".rodata"].data,
+            [0xfc, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]
+        );
+        assert_eq!(
+            relocs(&w, ".rodata"),
+            [r(0, SET_ULEB128, "b", 0), r(0, SUB_ULEB128, "a", 0)]
+        );
+        // The constant rides on the SET (GNU as drops it from the pair).
+        let w = assemble(".text\na: call foo\nb: ret\n.section .rodata\n.uleb128 b-a+3\n");
+        assert_eq!(w.base.sections[".rodata"].data, [11]);
+        assert_eq!(
+            relocs(&w, ".rodata"),
+            [r(0, SET_ULEB128, "b", 3), r(0, SUB_ULEB128, "a", 0)]
+        );
+    }
+
+    /// Forward references take their canonical length, as GNU as relaxes them
+    /// to (`.uleb128 .Lfw - .Lc2` over 200 bytes is `c8 01`); data labels are
+    /// exact at assembly time, so no relocation is needed for them.
+    #[test]
+    fn forward_uleb128_takes_the_canonical_length() {
+        let w = assemble(".data\n.uleb128 .Lfw - .Lc2\n.Lc2: .fill 200,1,0\n.Lfw:\n.byte 7\n");
+        let d = &w.base.sections[".data"].data;
+        assert_eq!(&d[..2], &[0xc8, 0x01]);
+        assert_eq!(d.len(), 2 + 200 + 1);
+        assert_eq!(d[202], 7, "everything after moved with the grown field");
+        assert!(relocs(&w, ".data").is_empty());
+        // Two growing fields, the second spanning the first's growth.
+        let w = assemble(
+            ".data\n.uleb128 .L2-.L1\n.uleb128 .L3-.L1\n.L1: .fill 130,1,0\n.L2: .fill 20000,1,0\n.L3:\n",
+        );
+        let d = &w.base.sections[".data"].data;
+        assert_eq!(&d[..2], &[0x82, 0x01]);
+        assert_eq!(&d[2..5], &[0xa2, 0x9d, 0x01]);
+        assert_eq!(d.len(), 5 + 20130);
+    }
+
+    #[test]
+    fn fixed_width_uleb128_encoding() {
+        assert_eq!(uleb128_fixed(0x16, 1), Some(vec![0x16]));
+        assert_eq!(uleb128_fixed(0x16, 3), Some(vec![0x96, 0x80, 0x00]));
+        assert_eq!(uleb128_fixed(128, 1), None);
+        assert_eq!(uleb128_fixed(u64::MAX, 10).map(|v| v.len()), Some(10));
+        for v in [0u64, 1, 127, 128, 16383, 16384, u64::MAX] {
+            let mut canon = Vec::new();
+            crate::backend::elf_writer_common::encode_uleb128(&mut canon, v);
+            assert_eq!(uleb128_len(v), canon.len(), "{v}");
+            assert_eq!(uleb128_fixed(v, canon.len()), Some(canon));
+        }
     }
 }

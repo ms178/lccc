@@ -4,7 +4,6 @@
 set -euo pipefail
 root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 ccc=${CCC:-$root/target/fastbuild/lccc}
-clang_bin=${CLANG:-clang-19}
 gcc_bin=${GCC:-gcc}
 readelf_bin=${READELF:-readelf}
 source "$root/tests/regression/i386_exec.sh"
@@ -17,15 +16,14 @@ command -v "$readelf_bin" >/dev/null 2>&1 || {
     echo "FAIL: readelf not available for emitted-object layout checks" >&2
     exit 1
 }
-clang_available=1
-if ! command -v "$clang_bin" >/dev/null 2>&1; then
-    clang_available=0
-    if [[ ${LCCC_REQUIRE_CLANG:-0} == 1 ]]; then
-        echo "FAIL: required Clang oracle not found: $clang_bin" >&2
-        exit 1
-    fi
-    echo "SKIP: Clang layout oracle not found: $clang_bin"
-fi
+# The layout oracle is the pinned Clang release (lib/clang_oracle.sh), the
+# same one check_ext_vector_abi.sh and the ABI grid use; "whatever clang is
+# on PATH" is not a reference. A missing oracle FAILS rather than silently
+# skipping the cross-compiler legs.
+# shellcheck source=tests/regression/lib/clang_oracle.sh
+. "$root/tests/regression/lib/clang_oracle.sh"
+require_clang_oracle check_ext_vector_layout || exit 1
+clang_bin=$CLANG_ORACLE_BIN
 
 # The emitted object must have the C object's size, not the IR pointer carrier
 # size. Alignment is checked from the ELF symbol value as well as by the
@@ -174,70 +172,68 @@ for bits in 64 32; do
         echo "PASS: ext-vector temporary initialization (lanes + padding) -m$bits $opt"
     done
 
-    if [[ $clang_available == 1 ]]; then
-        # Clang is the semantic/layout oracle; use O0 to avoid known Clang-19
-        # i386 optimizer failures. Non-PIE is needed only for sandboxed i386
-        # execution, not for compilation to an object file.
-        clang_exe=$tmp/clang-layout-$bits
-        clang_flags=()
-        if [[ $bits == 32 ]]; then clang_flags+=(-no-pie); fi
-        if ! "$clang_bin" -m"$bits" -O0 "${clang_flags[@]}" "$src" -o "$clang_exe" \
-            >"$tmp/clang-$bits.log" 2>&1; then
-            echo "FAIL: Clang ext-vector layout oracle compile -m$bits -O0" >&2
-            cat "$tmp/clang-$bits.log" >&2
-            exit 1
-        fi
-        rc=0
-        "$clang_exe" || rc=$?
-        if [[ $rc -ne 0 ]]; then
-            echo "FAIL: Clang ext-vector layout oracle -m$bits -O0 (exit $rc)" >&2
-            exit 1
-        fi
-        echo "PASS: Clang ext-vector layout/runtime oracle -m$bits -O0"
-
-        # Portable half of the temporary-init test: logical lanes only, because
-        # Clang leaves the padding of an automatic ext-vector indeterminate
-        # (measured on i386 -O0: 0xf6/0xf7). Build LCCC and Clang the same way
-        # and require byte-identical results at every LCCC optimization level.
-        clang_init_exe=$tmp/clang-temp-init-$bits
-        if ! "$clang_bin" -m"$bits" -O0 "${clang_flags[@]}" "$init_src" -o "$clang_init_exe" \
-            >"$tmp/clang-init-$bits.log" 2>&1; then
-            echo "FAIL: Clang ext-vector temporary init oracle compile -m$bits -O0" >&2
-            cat "$tmp/clang-init-$bits.log" >&2
-            exit 1
-        fi
-        rc=0
-        "$clang_init_exe" >"$tmp/clang-init-$bits.out" || rc=$?
-        if [[ $rc -ne 0 ]]; then
-            echo "FAIL: Clang ext-vector temporary init oracle -m$bits -O0 (exit $rc)" >&2
-            cat "$tmp/clang-init-$bits.out" >&2
-            exit 1
-        fi
-        for opt in -O0 -O1 -O2; do
-            lccc_init_exe=$tmp/lccc-temp-init-portable-$bits$opt
-            if ! "$ccc" -m"$bits" $opt "$init_src" -o "$lccc_init_exe" \
-                >"$tmp/init-p-$bits$opt.log" 2>&1; then
-                echo "FAIL: ext-vector temporary init compile -m$bits $opt" >&2
-                cat "$tmp/init-p-$bits$opt.log" >&2
-                exit 1
-            fi
-            rc=0
-            "$lccc_init_exe" >"$tmp/init-p-$bits$opt.out" || rc=$?
-            if [[ $rc -ne 0 ]]; then
-                echo "FAIL: ext-vector temporary initialization -m$bits $opt (exit $rc)" >&2
-                cat "$tmp/init-p-$bits$opt.out" >&2
-                exit 1
-            fi
-            if ! diff -u "$tmp/clang-init-$bits.out" "$tmp/init-p-$bits$opt.out" >"$tmp/init-p-$bits$opt.diff"; then
-                echo "FAIL: ext-vector temporary initialization -m$bits $opt differs from the Clang oracle" >&2
-                cat "$tmp/init-p-$bits$opt.diff" >&2
-                exit 1
-            fi
-            echo "PASS: ext-vector temporary initialization matches Clang -m$bits $opt"
-        done
-
-        clang_obj=$tmp/clang-layout-$bits.o
-        "$clang_bin" -m"$bits" -O0 -c "$src" -o "$clang_obj"
-        check_objects Clang "$clang_obj"
+    # Clang is the semantic/layout oracle; -O0 keeps its optimizer out of
+    # the reference. Non-PIE is needed only for sandboxed i386 execution,
+    # not for compilation to an object file.
+    clang_exe=$tmp/clang-layout-$bits
+    clang_flags=()
+    if [[ $bits == 32 ]]; then clang_flags+=(-no-pie); fi
+    if ! "$clang_bin" -m"$bits" -O0 "${clang_flags[@]}" "$src" -o "$clang_exe" \
+        >"$tmp/clang-$bits.log" 2>&1; then
+        echo "FAIL: Clang ext-vector layout oracle compile -m$bits -O0" >&2
+        cat "$tmp/clang-$bits.log" >&2
+        exit 1
     fi
+    rc=0
+    "$clang_exe" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo "FAIL: Clang ext-vector layout oracle -m$bits -O0 (exit $rc)" >&2
+        exit 1
+    fi
+    echo "PASS: Clang ext-vector layout/runtime oracle -m$bits -O0"
+
+    # Portable half of the temporary-init test: logical lanes only, because
+    # Clang leaves the padding of an automatic ext-vector indeterminate
+    # (measured on i386 -O0: 0xf6/0xf7). Build LCCC and Clang the same way
+    # and require byte-identical results at every LCCC optimization level.
+    clang_init_exe=$tmp/clang-temp-init-$bits
+    if ! "$clang_bin" -m"$bits" -O0 "${clang_flags[@]}" "$init_src" -o "$clang_init_exe" \
+        >"$tmp/clang-init-$bits.log" 2>&1; then
+        echo "FAIL: Clang ext-vector temporary init oracle compile -m$bits -O0" >&2
+        cat "$tmp/clang-init-$bits.log" >&2
+        exit 1
+    fi
+    rc=0
+    "$clang_init_exe" >"$tmp/clang-init-$bits.out" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo "FAIL: Clang ext-vector temporary init oracle -m$bits -O0 (exit $rc)" >&2
+        cat "$tmp/clang-init-$bits.out" >&2
+        exit 1
+    fi
+    for opt in -O0 -O1 -O2; do
+        lccc_init_exe=$tmp/lccc-temp-init-portable-$bits$opt
+        if ! "$ccc" -m"$bits" $opt "$init_src" -o "$lccc_init_exe" \
+            >"$tmp/init-p-$bits$opt.log" 2>&1; then
+            echo "FAIL: ext-vector temporary init compile -m$bits $opt" >&2
+            cat "$tmp/init-p-$bits$opt.log" >&2
+            exit 1
+        fi
+        rc=0
+        "$lccc_init_exe" >"$tmp/init-p-$bits$opt.out" || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            echo "FAIL: ext-vector temporary initialization -m$bits $opt (exit $rc)" >&2
+            cat "$tmp/init-p-$bits$opt.out" >&2
+            exit 1
+        fi
+        if ! diff -u "$tmp/clang-init-$bits.out" "$tmp/init-p-$bits$opt.out" >"$tmp/init-p-$bits$opt.diff"; then
+            echo "FAIL: ext-vector temporary initialization -m$bits $opt differs from the Clang oracle" >&2
+            cat "$tmp/init-p-$bits$opt.diff" >&2
+            exit 1
+        fi
+        echo "PASS: ext-vector temporary initialization matches Clang -m$bits $opt"
+    done
+
+    clang_obj=$tmp/clang-layout-$bits.o
+    "$clang_bin" -m"$bits" -O0 -c "$src" -o "$clang_obj"
+    check_objects Clang "$clang_obj"
 done

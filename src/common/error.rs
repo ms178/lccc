@@ -103,6 +103,9 @@ pub enum WarningKind {
     /// GCC flag: -Wreturn-type
     ReturnType,
     IncompatiblePointerTypes,
+    /// An attribute that does not apply to its declaration is ignored
+    /// (enabled by default, as in GCC). GCC flag: -Wattributes
+    Attributes,
     // Future categories (add as warnings are implemented):
     // UnusedVariable,         // -Wunused-variable
     // UnusedFunction,         // -Wunused-function
@@ -123,6 +126,7 @@ impl WarningKind {
             WarningKind::Cpp => "cpp",
             WarningKind::ReturnType => "return-type",
             WarningKind::IncompatiblePointerTypes => "incompatible-pointer-types",
+            WarningKind::Attributes => "attributes",
         }
     }
 
@@ -136,6 +140,7 @@ impl WarningKind {
             "cpp" => Some(WarningKind::Cpp),
             "return-type" => Some(WarningKind::ReturnType),
             "incompatible-pointer-types" => Some(WarningKind::IncompatiblePointerTypes),
+            "attributes" => Some(WarningKind::Attributes),
             _ => None,
         }
     }
@@ -165,6 +170,7 @@ impl WarningKind {
             WarningKind::Cpp,
             WarningKind::ReturnType,
             WarningKind::IncompatiblePointerTypes,
+            WarningKind::Attributes,
         ]
     }
 }
@@ -179,6 +185,10 @@ pub struct WarningConfig {
     enabled: crate::common::fx_hash::FxHashSet<WarningKind>,
     /// Per-warning error promotion. Warnings in this set are emitted as errors.
     errors: crate::common::fx_hash::FxHashSet<WarningKind>,
+    /// Per-warning error DEMOTION (`-Wno-error=<name>`): never an error, even
+    /// under a global `-Werror` given before or after it (GCC 16.2, measured).
+    /// The last of `-Werror=<name>` / `-Wno-error=<name>` decides.
+    not_errors: crate::common::fx_hash::FxHashSet<WarningKind>,
     /// Global -Werror flag: promote ALL warnings to errors.
     pub werror_all: bool,
     /// Global `-w` flag: inhibit ALL warning messages.  Measured against
@@ -198,6 +208,7 @@ impl WarningConfig {
         Self {
             enabled,
             errors: crate::common::fx_hash::FxHashSet::default(),
+            not_errors: crate::common::fx_hash::FxHashSet::default(),
             werror_all: false,
             inhibit_all: false,
         }
@@ -238,6 +249,7 @@ impl WarningConfig {
     /// Promote a specific warning to error (-Werror=<name>).
     pub fn set_werror(&mut self, kind: WarningKind) {
         self.errors.insert(kind);
+        self.not_errors.remove(&kind);
         // -Werror=<name> also implicitly enables the warning
         self.enabled.insert(kind);
     }
@@ -245,6 +257,7 @@ impl WarningConfig {
     /// Demote a specific warning from error (-Wno-error=<name>).
     pub fn clear_werror(&mut self, kind: WarningKind) {
         self.errors.remove(&kind);
+        self.not_errors.insert(kind);
     }
 
     /// Check if a warning of the given kind should be emitted at all.
@@ -254,7 +267,7 @@ impl WarningConfig {
 
     /// Check if a warning of the given kind should be promoted to an error.
     pub fn is_error(&self, kind: WarningKind) -> bool {
-        self.werror_all || self.errors.contains(&kind)
+        self.errors.contains(&kind) || (self.werror_all && !self.not_errors.contains(&kind))
     }
 
     /// Process a single -W flag argument (the part after -W).

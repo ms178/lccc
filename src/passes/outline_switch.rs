@@ -899,6 +899,8 @@ fn build_outlined_function(
         is_inline: false,
         is_always_inline: false,
         is_noinline: true, // Do NOT inline back — that defeats the purpose
+        // The outlined cases ran under the parent's ISA; keep it.
+        target_features: func.target_features.clone(),
         next_value_id,
         fp_expr_tags: Default::default(),
         next_label: outlined_next_label,
@@ -1346,6 +1348,7 @@ fn remap_call_info(info: &CallInfo, remap_op: &dyn Fn(&Operand) -> Operand) -> C
         assume_library: info.assume_library,
         ret_eightbyte_classes: info.ret_eightbyte_classes.clone(),
         ret_is_f128_sse: info.ret_is_f128_sse,
+        cold: info.cold,
     }
 }
 
@@ -1491,6 +1494,7 @@ fn replace_case_with_call(
                 assume_library: false,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
+                cold: false,
             },
         };
 
@@ -1536,6 +1540,7 @@ fn replace_case_with_call(
                 assume_library: false,
                 ret_eightbyte_classes: Vec::new(),
                 ret_is_f128_sse: false,
+                cold: false,
             },
         };
 

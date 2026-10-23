@@ -16,10 +16,10 @@
 # `call/jmp/push`) and the plain `R_X86_64_GOTPCREL` for stores, `lea` and
 # immediate forms.  LCCC matches that exactly, form by form; when the pinned
 # GAS 2.47 oracle is present the gate compares the full (type, symbol) lists
-# instead of trusting the table in this comment.  i686 still emits
-# `R_386_GOT32` where GAS emits the relaxable `R_386_GOT32X`: that is a
-# relaxation/size opportunity, not a correctness difference, and the gate
-# reports it explicitly rather than hiding it (follow-up ledger item).
+# instead of trusting the table in this comment.  i686 emits the relaxable
+# `R_386_GOT32X` for these `movl x@GOT(%reg)` loads exactly as GAS 2.47
+# does (I686-GOT32X; the spelling gap this gate used to report is closed),
+# and with the oracle present the i686 lists must agree exactly as well.
 set -uo pipefail
 
 CCC=$(realpath "${CCC:-./target/fastbuild/lccc}")
@@ -226,20 +226,26 @@ R_X86_64_GOTPCREL q7'
     fi
 fi
 
-# i686: values are checked above; the spelling difference is reported, not
-# hidden.  The known, analysed gap is exactly "relaxable instruction form ->
-# GAS writes GOT32X, LCCC writes GOT32".
+# i686: values are checked above; the relaxable `mov` loads must carry
+# GAS's spelling, R_386_GOT32X, with the local symbol kept.
 if try_build "i686 object" "$CCC" -m32 -c "$i686_src" -o "$td/i686.o"; then
-    if [ "$(reloc_pairs "$td/i686.o" q1 q2)" = "$(printf 'R_386_GOT32 q1\nR_386_GOT32 q2\n')" ]; then
-        ok "i686: GOT32 keeps the symbol (values verified above)"
+    if [ "$(reloc_pairs "$td/i686.o" q1 q2)" = "$(printf 'R_386_GOT32X q1\nR_386_GOT32X q2\n')" ]; then
+        ok "i686: GOT32X keeps the symbol (values verified above)"
     else
         bad "i686 GOT reloc spelling"; reloc_pairs "$td/i686.o" q1 q2 | sed 's/^/      /'
     fi
     if [ -x "$GAS" ]; then
         if "$GAS" --32 "$i686_src" -o "$td/i686_g.o" 2>/dev/null; then
-            gap=$(diff <(reloc_pairs "$td/i686_g.o" q1 q2) <(reloc_pairs "$td/i686.o" q1 q2) |
-                grep -c '^[<>]' || true)
-            ok "i686: documented spelling gap vs GAS 2.47 (${gap} reloc lines: GOT32X vs GOT32, follow-up ledger)"
+            oracle=$(reloc_pairs "$td/i686_g.o" q1 q2)
+            if [ -n "$oracle" ] && [ "$oracle" = "$(reloc_pairs "$td/i686.o" q1 q2)" ]; then
+                ok "i686: exact agreement with the pinned GAS 2.47 oracle"
+            else
+                bad "i686: oracle disagreement (GAS 2.47 vs LCCC)"
+                diff <(printf '%s\n' "$oracle") <(reloc_pairs "$td/i686.o" q1 q2) |
+                    sed 's/^/      /' | sed -n '1,10p'
+            fi
+        else
+            bad "oracle present but could not assemble the i686 probe"
         fi
     fi
 fi

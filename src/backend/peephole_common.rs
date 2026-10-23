@@ -86,6 +86,104 @@ pub(crate) fn replace_whole_word(text: &str, old: &str, new: &str) -> String {
     unsafe { String::from_utf8_unchecked(out) }
 }
 
+/// Is the whole-word match at `at` a symbol reference rather than a register?
+///
+/// A C identifier may spell a register name (`long x20;`, `int a1;`, `void
+/// w2(void)` are all legal), and relocation syntax is what tells them apart:
+/// `:got_lo12:x20` and `=x1` (AArch64), `%pcrel_lo(a1)` (RISC-V) -- but not
+/// the base register of `8(a1)`.
+fn is_symbol_position(bytes: &[u8], at: usize) -> bool {
+    let Some(prev) = at.checked_sub(1).map(|p| bytes[p]) else {
+        return false;
+    };
+    match prev {
+        b':' | b'=' => true,
+        b'(' => {
+            let mut p = at - 1;
+            while p > 0 && is_ident_char(bytes[p - 1]) {
+                p -= 1;
+            }
+            p > 0 && bytes[p - 1] == b'%' && p < at - 1
+        }
+        _ => false,
+    }
+}
+
+/// The byte span of `trimmed` (one AArch64 or RISC-V instruction) whose
+/// register names may be renamed, or `None` when no operand is a register.
+///
+/// Direct branch and call targets are symbols (`bl w2`, `call a1`), and so is
+/// every operand after the destination of an address-forming pseudo-op or a
+/// PC-relative literal load (`adrp x0, x20`, `lga t0, a1`, `ldr x0, sym`).
+/// Directives and labels are left alone: after a coalescing rename
+/// `.cfi_restore x20` still describes x20, which the renamed code no longer
+/// touches.
+fn register_operand_span(trimmed: &str) -> Option<(usize, usize)> {
+    if trimmed.starts_with('.') || trimmed.ends_with(':') {
+        return None;
+    }
+    let op_at = operands_start(trimmed)?;
+    let mnemonic = &trimmed[..trimmed.find(|c: char| c.is_ascii_whitespace())?];
+    if matches!(mnemonic, "b" | "bl" | "call" | "tail" | "j" | "jal") {
+        return None;
+    }
+    let first_end = trimmed[op_at..].find(',').map(|c| op_at + c);
+    let literal_load =
+        mnemonic.starts_with("ldr") && first_end.is_some_and(|c| !trimmed[c..].contains('['));
+    if matches!(mnemonic, "adr" | "adrp" | "la" | "lla" | "lga") || literal_load {
+        return Some((op_at, first_end.unwrap_or(trimmed.len())));
+    }
+    Some((op_at, trimmed.len()))
+}
+
+/// Rename `old` to `new` in `trimmed[lo..hi]`, skipping symbol references.
+fn rename_in_span(trimmed: &str, lo: usize, hi: usize, old: &str, new: &str) -> Option<String> {
+    let bytes = trimmed.as_bytes();
+    let mut out = String::with_capacity(trimmed.len() + 4);
+    let mut copied = 0usize;
+    let mut from = lo;
+    while let Some(i) = find_whole_word(bytes, old.as_bytes(), from) {
+        if i + old.len() > hi {
+            break;
+        }
+        from = i + old.len();
+        if is_symbol_position(bytes, i) {
+            continue;
+        }
+        out.push_str(&trimmed[copied..i]);
+        out.push_str(new);
+        copied = i + old.len();
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&trimmed[copied..]);
+    Some(out)
+}
+
+/// Rename every REGISTER occurrence of `old` in one AArch64 or RISC-V line.
+///
+/// The register-renaming passes used [`replace_whole_word`], which cannot
+/// tell `x20` the register from `x20` the symbol and so redirected
+/// `ldr x0, [x0, :got_lo12:x20]`, `lga t0, a1` or `bl w2` to another object
+/// whenever the renamed register shared a name with a global.
+pub(crate) fn rename_register_operand(line: &str, old: &str, new: &str) -> String {
+    if old.is_empty() || old == new {
+        return line.to_owned();
+    }
+    let trimmed = line.trim();
+    let Some((lo, hi)) = register_operand_span(trimmed) else {
+        return line.to_owned();
+    };
+    match rename_in_span(trimmed, lo, hi, old, new) {
+        Some(renamed) => {
+            let leading = line.len() - line.trim_start().len();
+            format!("{}{renamed}", &line[..leading])
+        }
+        None => line.to_owned(),
+    }
+}
+
 /// `true` if `text` contains `word` at a word boundary. Empty `word` is never
 /// a match (vacuous empty matches at punctuation / EOF are not useful).
 pub(crate) fn has_whole_word(text: &str, word: &str) -> bool {
@@ -227,7 +325,14 @@ pub(crate) fn replace_source_reg_in_instruction(
     let op_at = operands_start(trimmed)?;
     let comma = trimmed[op_at..].find(',')?;
     let src_lo = op_at + comma;
-    splice_source_rewrite(line, trimmed, src_lo, trimmed.len(), old_reg, new_reg)
+    // Symbol operands (`lga t0, a1`, `:got_lo12:x20`) are not sources.
+    let (_, hi) = register_operand_span(trimmed)?;
+    if src_lo >= hi {
+        return None;
+    }
+    let renamed = rename_in_span(trimmed, src_lo, hi, old_reg, new_reg)?;
+    let leading = line.len() - line.trim_start().len();
+    Some(format!("{}{renamed}", &line[..leading]))
 }
 
 /// Replace `old_reg` in source operands of an **AT&T** instruction.
@@ -1084,6 +1189,54 @@ mod directive_law_enforcement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_rename_leaves_register_named_symbols_alone() {
+        let r = rename_register_operand;
+        assert_eq!(
+            r("    ldr x0, [x0, :got_lo12:x20]", "x20", "x1"),
+            "    ldr x0, [x0, :got_lo12:x20]"
+        );
+        assert_eq!(
+            r("    ldr x0, [x0, :got_lo12:x20]", "x0", "x9"),
+            "    ldr x9, [x9, :got_lo12:x20]"
+        );
+        assert_eq!(
+            r("    adrp x20, :got:x20", "x20", "x1"),
+            "    adrp x1, :got:x20"
+        );
+        assert_eq!(r("    adrp x0, x20", "x20", "x1"), "    adrp x0, x20");
+        assert_eq!(r("    ldr x0, x20", "x20", "x1"), "    ldr x0, x20");
+        assert_eq!(r("    ldr x0, =x1", "x1", "x2"), "    ldr x0, =x1");
+        assert_eq!(r("    bl w2", "w2", "w9"), "    bl w2");
+        assert_eq!(r("    blr x8", "x8", "x9"), "    blr x9");
+        assert_eq!(r("    lga t0, a1", "a1", "t1"), "    lga t0, a1");
+        assert_eq!(r("    lga t0, a1", "t0", "t1"), "    lga t1, a1");
+        assert_eq!(
+            r("    ld a0, %pcrel_lo(a1)(a1)", "a1", "t1"),
+            "    ld a0, %pcrel_lo(a1)(t1)"
+        );
+        assert_eq!(r("    ld a0, 8(a1)", "a1", "t1"), "    ld a0, 8(t1)");
+        assert_eq!(r("    call a1", "a1", "t1"), "    call a1");
+        assert_eq!(
+            r("    .cfi_restore x20", "x20", "x1"),
+            "    .cfi_restore x20"
+        );
+        assert_eq!(r("\tadd\tx0, x1, x1", "x1", "x5"), "\tadd\tx0, x5, x5");
+        assert_eq!(r("    add x11, x1", "x1", "x5"), "    add x11, x5");
+    }
+
+    #[test]
+    fn source_rename_leaves_register_named_symbols_alone() {
+        let r = replace_source_reg_in_instruction;
+        assert_eq!(r("    ldr x0, [x0, :lo12:x20]", "x20", "x1"), None);
+        assert_eq!(
+            r("    ldr x0, [x0, :lo12:x20]", "x0", "x9").as_deref(),
+            Some("    ldr x0, [x9, :lo12:x20]")
+        );
+        assert_eq!(r("    lga t0, a1", "a1", "t1"), None);
+        assert_eq!(r("    adrp x0, x1", "x1", "x2"), None);
+    }
 
     /// The store is the single place where the peephole's whitespace invariance
     /// is enforced: passes read line text both through `LineInfo::trimmed` and

@@ -30,11 +30,12 @@ impl RiscvCodegen {
                 self.state.emit("    fence iorw, iorw");
             }
             IntrinsicOp::Prefetch(_) => {
-                // Zicbop's `prefetch.r` is an optional extension: emitting it
-                // unconditionally would fault on a core without it, so the
-                // hint is dropped here. Dropping a prefetch is always
-                // semantics-preserving — it only costs the latency the hint
-                // would have hidden.
+                // Zicbop's `prefetch.r/.w` live in the `ori x0, rs1, imm`
+                // HINT space, so they would execute as no-ops (not fault) on
+                // a core without Zicbop — but the mnemonics require the
+                // extension at assembly time and GCC emits nothing for
+                // `rv64gc` (measured), so the hint is dropped. Dropping a
+                // prefetch is always semantics-preserving.
             }
             IntrinsicOp::Movnti => {
                 // Non-temporal 32-bit store: dest_ptr = target address, args[0] = value

@@ -155,5 +155,6 @@ fn hook_call(vfn: Value, vsite: Value) -> CallInfo {
         is_const: false,
         assume_library: false,
         ret_eightbyte_classes: vec![],
+        cold: false,
     }
 }

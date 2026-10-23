@@ -1037,9 +1037,13 @@ fn match_rotate(
         (None, None) => {
             // Both amounts dynamic: accept either complement direction, but
             // only one of them needs to hold.
-            if is_width_minus(lshr_amt, shl_amt, width, defs) {
+            if is_width_minus(lshr_amt, shl_amt, width, defs)
+                || is_masked_complement(lshr_amt, shl_amt, width, defs)
+            {
                 (shl_amt, true)
-            } else if is_width_minus(shl_amt, lshr_amt, width, defs) {
+            } else if is_width_minus(shl_amt, lshr_amt, width, defs)
+                || is_masked_complement(shl_amt, lshr_amt, width, defs)
+            {
                 (lshr_amt, false)
             } else {
                 return None;
@@ -1047,7 +1051,94 @@ fn match_rotate(
         }
     };
 
-    Some((value, amount, is_left))
+    Some((value, strip_rotate_count_mask(amount, width, defs), is_left))
+}
+
+/// The operand under `& (W-1)` when `opnd` is exactly that mask (either
+/// `And` order).
+fn width_masked(opnd: Operand, width: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
+    let (lhs, rhs, _) = binop(opnd, IrBinOp::And, defs)?;
+    if const_u64(peel(rhs, defs)) == Some(width - 1) {
+        Some(lhs)
+    } else if const_u64(peel(lhs, defs)) == Some(width - 1) {
+        Some(rhs)
+    } else {
+        None
+    }
+}
+
+/// `m` when `opnd` negates it modulo `W`: `Neg(m)` or `c - m` with
+/// `c ≡ 0 (mod W)` (`0 - m`, `W - m`).
+fn negated_mod_width(opnd: Operand, width: u64, defs: &[Option<Instruction>]) -> Option<Operand> {
+    if let Operand::Value(v) = peel(opnd, defs)
+        && let Some(Instruction::UnaryOp {
+            op: IrUnaryOp::Neg,
+            src,
+            ..
+        }) = defs.get(v.0 as usize).and_then(Option::as_ref)
+    {
+        return Some(*src);
+    }
+    let (lhs, rhs, _) = binop(opnd, IrBinOp::Sub, defs)?;
+    (const_u64(peel(lhs, defs))? % width == 0).then_some(rhs)
+}
+
+/// Is `neg_amt` the UB-free complement `(-n) & (W-1)` of `pos_amt`, which is
+/// `n` or `n & (W-1)`?  This is the spelling portable code uses precisely
+/// because `x >> (W - n)` is undefined for `n == 0` (Linux `rol32`, Regehr's
+/// rotate, hash and cipher kernels).  With `k = n mod W` the halves are
+/// `x << k` and `x >> ((W - k) mod W)`: `x | x == x` for `k == 0`, and the
+/// exact rotate otherwise.  Amounts are compared through integer casts
+/// (`same`), which is sound because every carrier is at least 8 bits wide
+/// and a cast changes a count only by a multiple of `2^8`, a multiple of
+/// `W`.  The complement's mask must be exactly `W-1`: a wider one could
+/// leave an oversize *shift*, whose result the IR does not define modularly.
+/// An unmasked `n` on the positive side matches every backend's native
+/// count masking (x86 `shl %cl`, AArch64 `lslv`, RISC-V `sll`) and C's
+/// undefined oversize shift alike, and `RotateLeft` reduces its count
+/// modulo `W`, so the rewrite is exact for all `n`.
+fn is_masked_complement(
+    neg_amt: Operand,
+    pos_amt: Operand,
+    width: u64,
+    defs: &[Option<Instruction>],
+) -> bool {
+    let Some(m) = width_masked(neg_amt, width, defs)
+        .and_then(|negated| negated_mod_width(negated, width, defs))
+    else {
+        return false;
+    };
+    let core = |op: Operand| width_masked(op, width, defs).unwrap_or(op);
+    same(core(m), core(pos_amt), defs)
+}
+
+/// `RotateLeft`/`RotateRight` reduce their count modulo `W`, so a direct
+/// `n & c` whose low `log2(W)` bits are all ones is the rotate by `n`; the
+/// mask then dies with its last use instead of surviving as an `and`
+/// before `rol %cl`.  Only a mask defined directly (through `Copy` chains,
+/// never a cast) is stripped, so the replacement keeps the amount's type.
+fn strip_rotate_count_mask(amount: Operand, width: u64, defs: &[Option<Instruction>]) -> Operand {
+    let Operand::Value(v) = peel_copies(amount, defs) else {
+        return amount;
+    };
+    let Some(Instruction::BinOp {
+        op: IrBinOp::And,
+        lhs,
+        rhs,
+        ..
+    }) = defs.get(v.0 as usize).and_then(Option::as_ref)
+    else {
+        return amount;
+    };
+    let low = width - 1;
+    let full = |c: Operand| const_u64(c).is_some_and(|c| c & low == low);
+    if full(*rhs) && !matches!(lhs, Operand::Const(_)) {
+        *lhs
+    } else if full(*lhs) && !matches!(rhs, Operand::Const(_)) {
+        *rhs
+    } else {
+        amount
+    }
 }
 
 /// Width in bits of the sub-word integer types, or `None` for wider ones.
@@ -3820,6 +3911,176 @@ mod tests {
         assert_eq!(value, v(0));
         assert_eq!(amount, v(4));
         assert!(is_left);
+    }
+
+    /// `Or(Shl(x, shl_amt), LShr(x, lshr_amt))` at `ty` over extra defs;
+    /// the OR is value 9, `x` is value 0 and `n` is value 1.
+    fn masked_rotate_defs(
+        ty: IrType,
+        extra: &[(u32, Instruction)],
+        shl_amt: Operand,
+        lshr_amt: Operand,
+    ) -> Vec<Option<Instruction>> {
+        let v = |id| Operand::Value(Value(id));
+        let mut defs = vec![None; 10];
+        for (id, inst) in extra {
+            defs[*id as usize] = Some(inst.clone());
+        }
+        defs[7] = Some(Instruction::BinOp {
+            dest: Value(7),
+            op: IrBinOp::Shl,
+            lhs: v(0),
+            rhs: shl_amt,
+            ty,
+        });
+        defs[8] = Some(Instruction::BinOp {
+            dest: Value(8),
+            op: IrBinOp::LShr,
+            lhs: v(0),
+            rhs: lshr_amt,
+            ty,
+        });
+        defs[9] = Some(Instruction::BinOp {
+            dest: Value(9),
+            op: IrBinOp::Or,
+            lhs: v(7),
+            rhs: v(8),
+            ty,
+        });
+        defs
+    }
+
+    fn bin(id: u32, op: IrBinOp, lhs: Operand, rhs: Operand) -> (u32, Instruction) {
+        let ty = IrType::I32;
+        (
+            id,
+            Instruction::BinOp {
+                dest: Value(id),
+                op,
+                lhs,
+                rhs,
+                ty,
+            },
+        )
+    }
+
+    /// The UB-free spellings `(x << (n & (W-1))) | (x >> (-n & (W-1)))`,
+    /// with the negation as `Neg`, `0 - m` or `W - m`, the negated operand
+    /// masked or not, in both directions and at both widths; the rotate
+    /// count drops the redundant mask.
+    #[test]
+    fn recognizes_masked_complement_rotate() {
+        let v = |id| Operand::Value(Value(id));
+        let k = |n| Operand::Const(IrConst::I64(n));
+        for (ty, w) in [(IrType::U32, 32i64), (IrType::U64, 64)] {
+            let masked_n = bin(2, IrBinOp::And, v(1), k(w - 1));
+            let negs = [
+                (
+                    3,
+                    Instruction::UnaryOp {
+                        dest: Value(3),
+                        op: IrUnaryOp::Neg,
+                        src: v(1),
+                        ty: IrType::I32,
+                    },
+                ),
+                bin(3, IrBinOp::Sub, k(0), v(1)),
+                bin(3, IrBinOp::Sub, k(w), v(1)),
+                bin(3, IrBinOp::Sub, k(0), v(2)),
+            ];
+            for neg in negs {
+                let comp = bin(4, IrBinOp::And, v(3), k(w - 1));
+                let extra = [masked_n.clone(), neg.clone(), comp.clone()];
+                // Left: shl by n & (W-1), lshr by the complement.
+                let defs = masked_rotate_defs(ty, &extra, v(2), v(4));
+                let (value, amount, left) = match_rotate(v(9), 64, &defs).expect("left");
+                assert_eq!((value, amount, left), (v(0), v(1), true), "{ty:?} {neg:?}");
+                // Unmasked positive count.
+                let defs = masked_rotate_defs(ty, &extra, v(1), v(4));
+                assert_eq!(match_rotate(v(9), 64, &defs).map(|r| r.1), Some(v(1)));
+                // Right: the complement on the shl side.
+                let defs = masked_rotate_defs(ty, &extra, v(4), v(2));
+                let (_, amount, left) = match_rotate(v(9), 64, &defs).expect("right");
+                assert_eq!((amount, left), (v(1), false), "{ty:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_inexact_masked_complements() {
+        let v = |id| Operand::Value(Value(id));
+        let k = |n| Operand::Const(IrConst::I64(n));
+        let masked_n = bin(2, IrBinOp::And, v(1), k(31));
+        let neg = bin(3, IrBinOp::Sub, k(0), v(1));
+        // Complement mask wider than W-1: (-n) & 63 can be an oversize shift.
+        let extra = [
+            masked_n.clone(),
+            neg.clone(),
+            bin(4, IrBinOp::And, v(3), k(63)),
+        ];
+        assert!(
+            match_rotate(
+                v(9),
+                64,
+                &masked_rotate_defs(IrType::U32, &extra, v(2), v(4))
+            )
+            .is_none()
+        );
+        // Negation of a different count.
+        let other = bin(3, IrBinOp::Sub, k(0), v(5));
+        let extra = [masked_n.clone(), other, bin(4, IrBinOp::And, v(3), k(31))];
+        assert!(
+            match_rotate(
+                v(9),
+                64,
+                &masked_rotate_defs(IrType::U32, &extra, v(2), v(4))
+            )
+            .is_none()
+        );
+        // `16 - n` is not a negation modulo 32.
+        let off = bin(3, IrBinOp::Sub, k(16), v(1));
+        let extra = [masked_n, off, bin(4, IrBinOp::And, v(3), k(31))];
+        assert!(
+            match_rotate(
+                v(9),
+                64,
+                &masked_rotate_defs(IrType::U32, &extra, v(2), v(4))
+            )
+            .is_none()
+        );
+    }
+
+    /// `ROTL(x, n & 31)` in the `W - m` spelling: the mask is stripped only
+    /// when the amount is the `And` itself, never across a cast.
+    #[test]
+    fn rotate_count_mask_is_stripped_only_without_a_cast() {
+        let v = |id| Operand::Value(Value(id));
+        let k = |n| Operand::Const(IrConst::I64(n));
+        let masked = bin(2, IrBinOp::And, v(1), k(31));
+        let comp = bin(4, IrBinOp::Sub, k(32), v(2));
+        let defs = masked_rotate_defs(IrType::U32, &[masked.clone(), comp.clone()], v(2), v(4));
+        assert_eq!(match_rotate(v(9), 64, &defs).map(|r| r.1), Some(v(1)));
+        // 0xFF keeps the low five bits: still the rotate by n.
+        let wide = bin(2, IrBinOp::And, k(0xFF), v(1));
+        let defs = masked_rotate_defs(IrType::U32, &[wide, comp.clone()], v(2), v(4));
+        assert_eq!(match_rotate(v(9), 64, &defs).map(|r| r.1), Some(v(1)));
+        // A mask that clears a count bit is not redundant.
+        let narrow = bin(2, IrBinOp::And, v(1), k(15));
+        let defs = masked_rotate_defs(IrType::U32, &[narrow, comp.clone()], v(2), v(4));
+        assert_eq!(match_rotate(v(9), 64, &defs).map(|r| r.1), Some(v(2)));
+        // Reached through a widening cast: keep the cast operand.
+        let cast = (
+            3,
+            Instruction::Cast {
+                dest: Value(3),
+                src: v(2),
+                from_ty: IrType::I32,
+                to_ty: IrType::I64,
+            },
+        );
+        let comp64 = bin(4, IrBinOp::Sub, k(32), v(3));
+        let defs = masked_rotate_defs(IrType::U32, &[masked, cast, comp64], v(3), v(4));
+        assert_eq!(match_rotate(v(9), 64, &defs).map(|r| r.1), Some(v(3)));
     }
 
     #[test]

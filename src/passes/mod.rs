@@ -1014,9 +1014,10 @@ fn run_inline_phase(
     }
     iphase_dump!("cleanup-copyprop1");
     // Sret copy elision: point a structure-returning call straight at the
-    // aggregate it is copied to, deleting the hidden-slot copy. It must run
-    // before the aggregate forwarders, which decline any copy whose
-    // destination escapes to a call — exactly the shape removed here.
+    // aggregate it is copied to (when nothing can observe that aggregate
+    // before the copy), deleting the hidden-slot copy, then forward
+    // whole-object copies into the reads they own. It runs before the
+    // aggregate forwarders, which require a single writer of the copy.
     if std::env::var_os("CCC_NO_SRET_COPY_ELISION").is_none() {
         module.for_each_function(sret_copy_elision::run);
     }
@@ -1379,6 +1380,8 @@ pub(crate) fn run_passes(
     fp_environment_observable: bool,
     fp_reassoc: bool,
     fp_contract: crate::common::fp_contract::FpContract,
+    // `-fmath-errno` (the C default; cleared by -fno-math-errno/-ffast-math).
+    math_errno: bool,
     x86_isa: X86Isa,
     x86_avx: bool,
     x86_fma: bool,
@@ -1390,7 +1393,9 @@ pub(crate) fn run_passes(
     // in this unit are interposable, so the inliner keeps calls to them
     // (GCC's default `-fsemantic-interposition` at -fPIC).
     pic: bool,
-    tls_model: Option<crate::ir::reexports::TlsModel>,
+    // `-ftls-model=` (the floor of `common::tls::TlsPolicy`); with `pic` it is
+    // the policy every TLS model decision in the pipeline is made under.
+    tls_floor: Option<crate::ir::reexports::TlsModel>,
 ) {
     let policy = crate::common::pass_policy::PassPolicy::new(
         wrap_signed_overflow,
@@ -1485,6 +1490,7 @@ pub(crate) fn run_passes(
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(aggregate_sroa::split::SPLIT_ENV_DEFAULT_MAX_FIELDS),
+        sroa_trace: std::env::var_os("CCC_DEBUG_SROA").is_some(),
     });
     backedge_pre::set_backedge_pre_env(backedge_pre::EnvConfig::from_env());
     loop_align::set_tight_loop_mode(loop_align::TightLoopMode::from_env());
@@ -1514,6 +1520,7 @@ pub(crate) fn run_passes(
     // it) and `-mno-fma` clears it; `-mno-sse` clears the whole
     // SIMD register file (vfmadd is a VEX-encoded SSE instruction, so a
     // kernel TU built with `-mno-sse` would #UD on the folded form).
+    simplify::set_math_errno(math_errno);
     simplify::set_has_fma3(match target {
         crate::backend::Target::X86_64 => x86_isa.fma,
         crate::backend::Target::I686 => x86_fma,
@@ -1683,6 +1690,10 @@ pub(crate) fn run_passes(
         constant_fold::run(module);
         copy_prop::run(module);
         o1_checkpoint!("constfold+copyprop");
+        if !pass_disabled(&disabled, "libmemcpy") {
+            builtin_policy::canonicalize_library_memcpy(module, target);
+        }
+        o1_checkpoint!("libmemcpy");
         // Local simplifier at -O1: shift identity folds (x>>0 -> x, 0<<x -> 0,
         // all-ones arithmetic shr), `fabs(x) < 0.0` -> false and related
         // per-instruction canonicalizations. gcc.c-torture shiftopt-1 and
@@ -1715,6 +1726,15 @@ pub(crate) fn run_passes(
         // chain below, exactly like the -O2 tier's post-inline mem2reg.
         crate::ir::mem2reg::promote_allocas_with_params(module);
         o1_checkpoint!("post-inline mem2reg");
+        // GlobalAddr CSE: -O1 runs no GVN, so every source-level access kept
+        // its own address materialization -- for dynamic TLS one descriptor
+        // or __tls_get_addr call per access (GCC's -O1 CSE pass merges
+        // them). Same class-aware pass and kill switch as the -O2 tier.
+        if !pass_disabled(&disabled, "gaddrcse") {
+            global_addr_cse::run_module(module);
+            module.for_each_function(dce::eliminate_dead_code);
+        }
+        o1_checkpoint!("gaddrcse");
         // Range-check folding at -O1 (same transform as the -O2 loop's
         // "range_fold" pass): (x >= lo && x <= hi) ->
         // (unsigned)(x - lo) <= (hi - lo) plus the complement form.
@@ -1842,6 +1862,7 @@ pub(crate) fn run_passes(
     // dedicated fold knows which sign-bit-only operations remain legal under
     // a strict FP environment and is also the lowering authority for compiler
     // runtime helpers such as __fabstf2 that LCCC deliberately does not link.
+    simplify::guard_errno_sqrt_calls(module);
     simplify::fold_math_intrinsic_calls(module);
     preloop_dump!("math_intrinsic_fold");
     if !pass_disabled(&disabled, "fortifyfold") {
@@ -1853,6 +1874,13 @@ pub(crate) fn run_passes(
     // disappears.
     constant_fold::fold_string_library_calls(module);
     constant_fold::resolve_remaining_is_constant(module);
+    // A library `memcpy` of small constant length gets the native Memcpy
+    // the `__builtin_` spelling already lowers to (see the pass doc); again
+    // after the post-inline fold below, which makes more lengths literal.
+    if !pass_disabled(&disabled, "libmemcpy") {
+        builtin_policy::canonicalize_library_memcpy(module, target);
+        preloop_dump!("libmemcpy");
+    }
 
     // Switch case outlining: extract case bodies from large switch statements
     // (like SQLite's VdbeExec with 170+ cases) into separate functions.
@@ -1936,6 +1964,9 @@ pub(crate) fn run_passes(
         crate::ir::mem2reg::promote_allocas_with_params(module);
         constant_fold::run(module);
         copy_prop::run(module);
+        if !pass_disabled(&disabled, "libmemcpy") {
+            builtin_policy::canonicalize_library_memcpy(module, target);
+        }
         simplify::run(module);
         module.for_each_function(cfg_simplify::run_function);
         module.for_each_function(dce::eliminate_dead_code);
@@ -2187,7 +2218,7 @@ pub(crate) fn run_passes(
             && matches!(target, crate::backend::Target::X86_64)
             && !pass_disabled(&disabled, "vectorize")
         {
-            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module);
+            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
             let n = timed_pass!(
                 "vectorize_const_trip_maps",
                 run_on_visited(
@@ -2261,16 +2292,11 @@ pub(crate) fn run_passes(
             // Shared module facts keep aliases, assembler labels, weak
             // definitions, and opaque top-level assembly out of disjointness
             // proofs. Other memory transforms use this same contract.
-            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module);
+            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
             let n = timed_pass!(
                 "loop_idiom",
                 run_on_visited(module, &dirty, &mut changed, |func| {
-                    loop_idiom::run_function(
-                        func,
-                        &symbol_facts.aliased_names,
-                        &symbol_facts.local_globals,
-                        loop_idiom_capabilities,
-                    )
+                    loop_idiom::run_function(func, &symbol_facts, loop_idiom_capabilities)
                 })
             );
             total_changes += n;
@@ -2299,7 +2325,7 @@ pub(crate) fn run_passes(
             && !pass_disabled(&disabled, "vectorize")
         {
             let vectorize_mode = vectorize_entry(target, fp_reassoc, fp_contract, x86_avx);
-            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module);
+            let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
             let n = timed_pass!(
                 "vectorize",
                 run_on_visited(module, &dirty, &mut changed, |func| {
@@ -2455,7 +2481,13 @@ pub(crate) fn run_passes(
             && !pass_disabled(&disabled, "volatile_reduce")
             && volatile_reduction_enabled()
         {
-            let costly_tls = volatile_reduce::costly_tls_symbols(module, pic, tls_model);
+            let costly_tls = volatile_reduce::costly_tls_symbols(
+                module,
+                crate::common::tls::TlsPolicy {
+                    shlib: pic,
+                    floor: tls_floor,
+                },
+            );
             let enforce_block_budget =
                 std::env::var("CCC_VOLATILE_REDUCE_BUDGET").as_deref() != Ok("0");
             let n = timed_pass!(
@@ -3204,7 +3236,7 @@ pub(crate) fn run_passes(
         // pre-conversion and to the admission fixes, NOT to "opening" a
         // rerun that was already open.
         let late_mode = late_vectorize_entry(target, fp_reassoc, fp_contract, x86_avx);
-        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module);
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
         // SCOPE: min/max reductions only. The unrestricted rerun also
         // transforms the guarded-sum reduction in `zlib_ng_adler32`, which
         // measured +1.05 % retired instructions (callgrind, whole program)
@@ -3326,7 +3358,7 @@ pub(crate) fn run_passes(
         && !pass_disabled(&disabled, "latevec")
         && !pass_disabled(&disabled, "vectorize")
     {
-        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module);
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
         let n = {
             let _scope = vectorize::LateMinMaxOnlyScope::enter();
             module.for_each_function(|func| {
@@ -3631,7 +3663,7 @@ pub(crate) fn run_passes(
     // and memory-operand folding see the copy at all; see
     // engineering/SSE2-CODEGEN-MATRIX.md.
     if !pass_disabled(&disabled, "aggcopy16") {
-        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module);
+        let symbol_facts = module_symbol_facts::ModuleSymbolFacts::from_module(module, pic);
         module.for_each_function(|func| {
             aggregate_pair_roundtrip::run_with_symbol_facts(func, &symbol_facts)
         });
@@ -4229,6 +4261,7 @@ mod signed_wrap_policy_tests {
             fenv,
             false,
             FpContract::Off,
+            true,
             X86Isa::default(),
             false,
             false,

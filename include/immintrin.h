@@ -7,10 +7,13 @@
 #error "x86 SIMD intrinsics (immintrin.h) require an x86 target"
 #endif
 
+#include <ia32intrin.h>
 #include <wmmintrin.h>
 #include <smmintrin.h>
 #include <shaintrin.h>
+#include <bmiintrin.h>
 #include <bmi2intrin.h>
+#include <lzcntintrin.h>
 #include <avxintrin.h>
 #include <avx2intrin.h>
 #include <fmaintrin.h>

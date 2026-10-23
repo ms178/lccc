@@ -19,14 +19,30 @@ for spec in \
     set -- $spec
     body "$TD/v3.s" "$1" | grep -Ec "$2" >/dev/null || fail "$1 lacks its packed rounding mode"
 done
+# Square root is only a pure map without errno. Under C's default -fmath-errno
+# `sqrt(x)` for x < 0 must set errno = EDOM, which a packed vsqrtp[sd] cannot
+# do; GCC 16.2 and Clang 23.1.3 at `-O3 -march=x86-64-v3` therefore keep the
+# scalar sqrtsd with its `call sqrt` slow path and vectorize only under
+# -fno-math-errno (ICX vectorizes because its default FP model is fast-math).
+# The packed legs are checked where the transform is legal, and the default
+# leg must keep the errno path: a packed sqrt there would be a miscompile.
+"$CCC" -O3 -march=x86-64-v3 -fno-math-errno -S "$SRC" -o "$TD/v3ne.s"
 for spec in 'sqrt_f64 vsqrtpd' 'sqrt_f32 vsqrtps'; do
     set -- $spec
-    body "$TD/v3.s" "$1" | grep -Ec "$2" >/dev/null || fail "$1 lacks packed square root"
+    body "$TD/v3ne.s" "$1" | grep -Ec "$2" >/dev/null || fail "$1 lacks packed square root (-fno-math-errno)"
+done
+for spec in 'sqrt_f64 sqrt' 'sqrt_f32 sqrtf' 'sqrt_add_f64 sqrt' 'sqrt_add_f32 sqrtf'; do
+    set -- $spec
+    if body "$TD/v3.s" "$1" | grep -Ec 'v?sqrtp[sd]' >/dev/null; then
+        fail "$1 vectorized sqrt under -fmath-errno (errno = EDOM would be lost)"
+    fi
+    body "$TD/v3.s" "$1" | grep -Ec "call[[:space:]]+$2(@PLT)?\$" >/dev/null \
+        || fail "$1 lost the errno slow path ($2) under -fmath-errno"
 done
 body "$TD/v3.s" floor_f64 | grep -Ec 'vroundpd.*\(' >/dev/null || fail 'round failed to fold its source load'
 body "$TD/v3.s" ceil_f32 | grep -Ec 'vroundps.*\(' >/dev/null || fail 'roundf failed to fold its source load'
-body "$TD/v3.s" sqrt_f64 | grep -Ec 'vsqrtpd.*\(' >/dev/null || fail 'sqrt failed to fold its source load'
-body "$TD/v3.s" sqrt_f32 | grep -Ec 'vsqrtps.*\(' >/dev/null || fail 'sqrtf failed to fold its source load'
+body "$TD/v3ne.s" sqrt_f64 | grep -Ec 'vsqrtpd.*\(' >/dev/null || fail 'sqrt failed to fold its source load'
+body "$TD/v3ne.s" sqrt_f32 | grep -Ec 'vsqrtps.*\(' >/dev/null || fail 'sqrtf failed to fold its source load'
 # Dynamic signed-long bounds need a guarded byte limit, not a second hot-loop
 # induction variable. Between the packed op and its backedge there must be only
 # the byte-IV increment; an element-counter `addq $1` costs every vector trip.
@@ -43,13 +59,17 @@ for spec in \
     'sqrt_add_f64 vaddpd' 'sqrt_add_f64 vsqrtpd.*%ymm' \
     'sqrt_add_f32 vaddps' 'sqrt_add_f32 vsqrtps.*%ymm'; do
     set -- $spec
-    body "$TD/v3.s" "$1" | grep -Ec "$2" >/dev/null || fail "$1 lacks register-source packed chain: $2"
+    asm="$TD/v3.s"
+    case $1 in sqrt_*) asm="$TD/v3ne.s" ;; esac
+    body "$asm" "$1" | grep -Ec "$2" >/dev/null || fail "$1 lacks register-source packed chain: $2"
 done
 # Register-to-register unary chains must remain in the SIMD scratch register:
 # a dead stack home between load, round/sqrt and store erased most of the win.
 for fn in floor_f64 floor_f32 sqrt_f64 sqrt_f32 \
           floor_add_f64 floor_add_f32 sqrt_add_f64 sqrt_add_f32; do
-    if body "$TD/v3.s" "$fn" | grep -Ec 'vmovdqu.*%rsp|vmovdqu.*\(%rsp\)' >/dev/null; then
+    asm="$TD/v3.s"
+    case $fn in sqrt_*) asm="$TD/v3ne.s" ;; esac
+    if body "$asm" "$fn" | grep -Ec 'vmovdqu.*%rsp|vmovdqu.*\(%rsp\)' >/dev/null; then
         fail "$fn regressed to dead vector stack traffic"
     fi
 done

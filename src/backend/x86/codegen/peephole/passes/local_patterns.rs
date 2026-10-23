@@ -18,10 +18,10 @@ use super::dead_writes::{frame_slot_stable_in_range, parse_frame_slot};
 use super::flag_peepholes::{FlagsEffect, flags_dead_after, flags_effect};
 use super::fp_liveness::FpLiveness;
 use super::helpers::{
-    get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family, is_callee_saved_reg,
-    is_read_modify_write, is_valid_gp_reg, parse_reg_to_reg_movq, replace_reg_family,
-    replace_reg_name_exact, self_zeroing_full_write, src_mentions_family, writes_family,
-    writes_family_full,
+    HIGH_BYTE_NAMES, get_dest_reg, has_implicit_reg_usage, implicit_read_reg_family,
+    is_callee_saved_reg, is_read_modify_write, is_valid_gp_reg, parse_reg_to_reg_movq,
+    replace_reg_family, replace_reg_name_exact, self_zeroing_full_write, src_mentions_family,
+    writes_family, writes_family_full,
 };
 use super::liveness::FileLiveness;
 use super::relay_and_lea::{
@@ -349,6 +349,926 @@ pub(super) fn forward_adjacent_gp_stack_loads(
     changed
 }
 
+/// Highest set bit: `bsr S, D; xor $W-1, D; xor $W-1, D` -> `bsr S, D`.
+///
+/// ClzNonZero lowers to `bsr; xor $W-1`, and simplify turns the
+/// `(W-1) - clz(x)` highbit idiom (ZSTD_highbit32, BIT_highbit32, __fls)
+/// into `^ (W-1)`, so a coalesced destination XORs the same constant twice.
+/// The pair cancels exactly only right after `bsr`: D then holds a value in
+/// [0, W-1] with every upper bit zero, and an XOR with the same small
+/// positive immediate keeps them zero, so the second XOR may run at either
+/// width on D's family (a later pass widens the consumer to 64 bits when it
+/// proves the value small) and neither one's zero-extension changes
+/// anything. Both XORs define the flags: they go only when the flags are
+/// dead afterwards.
+///
+/// Runs inside [`combined_local_pass`] and, through
+/// [`cancel_highbit_double_xors`], after the late renames (phases 3c/3d):
+/// the emitter writes `xor $K, %a; mov %a, %b; xor $K, %b`, and only
+/// renaming the chain into `%b` makes the two XORs adjacent.
+fn cancel_highbit_double_xor_at(store: &LineStore, infos: &mut [LineInfo], i: usize) -> bool {
+    let len = store.len();
+    let cur = infos[i].trimmed(store.get(i));
+    let Some((ops, width, mask)) = cur
+        .strip_prefix("bsrl ")
+        .map(|o| (o, 'l', 31))
+        .or_else(|| cur.strip_prefix("bsrq ").map(|o| (o, 'q', 63)))
+    else {
+        return false;
+    };
+    // The destination is the last operand: a memory source contains ", ".
+    let Some((_, dst)) = ops.rsplit_once(", ") else {
+        return false;
+    };
+    let Some(family) = register_family(dst) else {
+        return false;
+    };
+    let xor = format!("xor{width} ${mask}, {dst}");
+    let imm = format!("${mask}");
+    let next = |mut j: usize| {
+        while j < len && debug_transparent(store, infos[j], j) {
+            j += 1;
+        }
+        j
+    };
+    let undoes = |line: &str| {
+        line.strip_prefix("xorl ")
+            .or_else(|| line.strip_prefix("xorq "))
+            .and_then(|o| o.split_once(", "))
+            .is_some_and(|(k, reg)| k == imm && register_family(reg) == Some(family))
+    };
+    let first = next(i + 1);
+    if first >= len || infos[first].trimmed(store.get(first)) != xor {
+        return false;
+    }
+    let second = next(first + 1);
+    if second < len
+        && undoes(infos[second].trimmed(store.get(second)))
+        && flags_dead_after(store, infos, second + 1)
+    {
+        mark_nop(&mut infos[first]);
+        mark_nop(&mut infos[second]);
+        return true;
+    }
+    false
+}
+
+/// Sweep form of [`cancel_highbit_double_xor_at`] for the late phases.
+pub(super) fn cancel_highbit_double_xors(store: &LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    for i in 0..store.len() {
+        if !infos[i].is_nop() && cancel_highbit_double_xor_at(store, infos, i) {
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Zero-defined highest set bit through BSR's zero-source passthrough:
+///
+/// ```text
+///     movl $2W-1, %D        movl/movq $-1, %R
+///     bsr  %S, %D       ->  bsr  %S, %R
+///     xor  $W-1, %D         [add $(K-(W-1)), %R]   (only when K != W-1)
+///     mov  $K, %R
+///     sub  %D, %R
+/// ```
+///
+/// For a general minuend K (`x ? 32 - clz(x) : 0`, the kernel's `fls`, is
+/// K = W) the identity is `K - (b ^ (W-1)) = b + (K - (W-1))`, and for
+/// x == 0 `K - W = -1 + (K - (W-1))`: the same addend after the same -1
+/// preload, so five instructions become three.
+///
+/// The emitter lowers a zero-defined `Clz` without LZCNT as the first three
+/// lines (`emit_zero_defined_scan_direct`), and `(W-1) - clz(x)` — zstd's
+/// `ZSTD_highbit32`, `BIT_highBit32` — appends the subtraction. For x != 0
+/// the scan writes the MSB index b in [0, W-1] and (W-1) - (b ^ (W-1)) = b;
+/// for x == 0 the scan keeps the preload and the result is (W-1) - W = -1,
+/// which is exactly what the new preload holds. Five instructions become
+/// two, with the defined zero result intact.
+///
+/// Widths: a 64-bit scan preserves the whole destination on a zero source,
+/// so `bsrq` pairs with either subtraction width (`movl $-1` reproduces the
+/// zero-extended `subl` result, `movq $-1` the `subq` one). A 32-bit scan
+/// may clear bits 63:32 on older processors (SDM footnote), so `bsrl` is
+/// only paired with `subl`, whose result has those bits zero anyway.
+///
+/// `D` must be dead after the `sub` and the flags too (`bsr` defines only
+/// ZF); `S` must be a register distinct from both `D` and `R`, since the new
+/// preload writes `R` before the scan reads `S`.
+pub(super) fn fold_highbit_subs(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut dead = LazyDeadness::new();
+    let mut changed = false;
+    for i in 0..len {
+        if infos[i].is_nop() {
+            continue;
+        }
+        let mut lines = [i; 5];
+        for k in 1..5 {
+            lines[k] = next_non_debug(store, infos, lines[k - 1] + 1, len);
+            if lines[k] >= len {
+                break;
+            }
+        }
+        if lines[4] >= len || lines[4] == i {
+            continue;
+        }
+        let text = |k: usize| infos[lines[k]].trimmed(store.get(lines[k])).to_string();
+        let Some(rewrite) = match_highbit_sub(&[text(0), text(1), text(2), text(3), text(4)])
+        else {
+            continue;
+        };
+        if !all_editable(infos, &lines)
+            || !flags_dead_after(store, infos, lines[4] + 1)
+            || !dead.dead_after(store, infos, lines[4], rewrite.d_fam, &lines)
+        {
+            continue;
+        }
+        replace_line(store, &mut infos[lines[0]], lines[0], rewrite.preload);
+        replace_line(store, &mut infos[lines[1]], lines[1], rewrite.scan);
+        let mut first_nop = 2;
+        if let Some(add) = rewrite.add {
+            replace_line(store, &mut infos[lines[2]], lines[2], add);
+            first_nop = 3;
+        }
+        for &k in &lines[first_nop..] {
+            mark_nop(&mut infos[k]);
+        }
+        dead.invalidate(store, infos, lines[0]);
+        changed = true;
+    }
+    changed
+}
+
+/// A zero guard around a bit scan is a scan with a different preload:
+///
+/// ```text
+///     [mov  $K, %D]                     mov  $C, %R   (width: see below)
+///     bs{f,r} %S, %D                ->  bs{f,r} %S, %R
+///     test %S, %S      } either
+///     mov  $C, %R      } order
+///     cmovne %D, %R
+/// ```
+///
+/// `S ? scan(S) : C` (`x ? __builtin_ctz(x) : -1`, a lowest-set-bit index
+/// with -1 for zero) is selected by `cmovne` on the test of S, and BSF/BSR
+/// leave their destination unchanged exactly when S is zero (AMD; Intel SDM
+/// since the LLVM #123623 documentation fix; see
+/// `emit_zero_defined_scan_direct`). Scanning straight into R preloaded with
+/// C is therefore the whole select. D's own preload `K` (the zero-defined
+/// count's) or the lack of one (a NonZero scan the guard protected) is
+/// irrelevant: the cmov never reads D for a zero S, and D is dead after it.
+///
+/// Widths: the scan, test and cmov share one width. A 32-bit cmov writes
+/// `%R32` on both paths, zero-extending, so the preload is the dword
+/// `movl $C32, %R32` (whose zero-extension a zero-source 32-bit scan keeps
+/// or clears to the same zero — SDM footnote). A 64-bit cmov keeps the
+/// original `mov $C, %R` text, whose 64-bit value it would have kept.
+/// Requires D, S, R pairwise distinct, D dead after the cmov and the flags
+/// dead (the scan defines only ZF, and that from the same S).
+pub(super) fn fold_guarded_scan_selects(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut dead = LazyDeadness::new();
+    let mut changed = false;
+    for i in 0..len {
+        if infos[i].is_nop() {
+            continue;
+        }
+        let mut lines = [i; 4];
+        for k in 1..4 {
+            lines[k] = next_non_debug(store, infos, lines[k - 1] + 1, len);
+            if lines[k] >= len {
+                break;
+            }
+        }
+        if lines[3] >= len || lines[3] == i {
+            continue;
+        }
+        let text = |k: usize| infos[lines[k]].trimmed(store.get(lines[k])).to_string();
+        let Some(m) = match_guarded_scan_select(&[text(0), text(1), text(2), text(3)]) else {
+            continue;
+        };
+        if !all_editable(infos, &lines)
+            || !flags_dead_after(store, infos, lines[3] + 1)
+            || !dead.dead_after(store, infos, lines[3], m.d_fam, &lines)
+        {
+            continue;
+        }
+        // D's preload, if it is the line right before the scan, dies too.
+        let prev = prev_non_debug(store, infos, i);
+        let drop_prev = prev.is_some_and(|p| {
+            !infos[p].is_nop()
+                && all_editable(infos, &[p])
+                && is_imm_move_to(infos[p].trimmed(store.get(p)), m.d_fam)
+        });
+        replace_line(store, &mut infos[lines[0]], lines[0], m.preload);
+        replace_line(store, &mut infos[lines[1]], lines[1], m.scan);
+        mark_nop(&mut infos[lines[2]]);
+        mark_nop(&mut infos[lines[3]]);
+        if drop_prev {
+            if let Some(p) = prev {
+                mark_nop(&mut infos[p]);
+            }
+        }
+        dead.invalidate(store, infos, lines[0]);
+        changed = true;
+    }
+    changed
+}
+
+/// The closest earlier line that is not debug-transparent (the mirror of
+/// `next_non_debug`), or None at the start of the file.
+fn prev_non_debug(store: &LineStore, infos: &[LineInfo], i: usize) -> Option<usize> {
+    (0..i)
+        .rev()
+        .find(|&j| !debug_transparent(store, infos[j], j))
+}
+
+/// A preloaded scan whose result is only copied elsewhere scans there:
+///
+/// ```text
+///     mov  $K, %D               mov  $K', %X
+///     bs{f,r} %S, %D       ->   bs{f,r} %S, %X
+///     mov  %D, %X
+/// ```
+///
+/// The copy-retarget passes keep BSF/BSR out of `PURE_PRODUCERS` because the
+/// scan reads its destination; moving the preload WITH the scan is what makes
+/// the retarget sound. The highbit fold produces this when the subtraction
+/// was computed in a scratch register (`subl %esi, %edx; movl %edx, %eax`).
+///
+/// A 64-bit copy reproduces D exactly, so the preload keeps its own text
+/// (whatever a zero-source 32-bit scan does to bits 63:32 of it happens to X
+/// instead). A 32-bit copy zero-extends D's low half, so the preload becomes
+/// the dword `movl $K32, %X32`: a nonzero source writes a small count, and a
+/// zero source keeps the zero-extended K32 (a 32-bit scan may clear bits 63:32,
+/// which are already zero). The flags are untouched. Requires D, S, X
+/// pairwise distinct and D dead after the copy.
+pub(super) fn retarget_preloaded_scan_copies(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut dead = LazyDeadness::new();
+    let mut changed = false;
+    for i in 0..len {
+        if infos[i].is_nop() {
+            continue;
+        }
+        let l1 = next_non_debug(store, infos, i + 1, len);
+        if l1 >= len {
+            continue;
+        }
+        let l2 = next_non_debug(store, infos, l1 + 1, len);
+        if l2 >= len {
+            continue;
+        }
+        let lines = [i, l1, l2];
+        let text = |k: usize| infos[k].trimmed(store.get(k)).to_string();
+        let Some(m) = match_preloaded_scan_copy(&[text(i), text(l1), text(l2)]) else {
+            continue;
+        };
+        if !all_editable(infos, &lines) || !dead.dead_after(store, infos, l2, m.d_fam, &lines) {
+            continue;
+        }
+        replace_line(store, &mut infos[i], i, m.preload);
+        replace_line(store, &mut infos[l1], l1, m.scan);
+        mark_nop(&mut infos[l2]);
+        dead.invalidate(store, infos, i);
+        changed = true;
+    }
+    changed
+}
+
+/// Pure matcher for [`retarget_preloaded_scan_copies`].
+fn match_preloaded_scan_copy(t: &[String; 3]) -> Option<GuardedScanRewrite> {
+    let (mn, q, scan_ops) = [("bsf", false), ("bsf", true), ("bsr", false), ("bsr", true)]
+        .into_iter()
+        .find_map(|(mn, q)| {
+            let prefix = format!("{mn}{} ", if q { 'q' } else { 'l' });
+            t[1].strip_prefix(prefix.as_str()).map(|o| (mn, q, o))
+        })?;
+    let size = usize::from(!q);
+    let (s, d) = scan_ops.split_once(", ")?;
+    let s_fam = register_family(s)?;
+    let d_fam = register_family(d)?;
+    if s_fam > REG_GP_MAX
+        || d_fam > REG_GP_MAX
+        || s_fam == d_fam
+        || REG_NAMES[size][s_fam as usize] != s
+        || REG_NAMES[size][d_fam as usize] != d
+    {
+        return None;
+    }
+    // The preload: an immediate move into D at either width.
+    let (pre_q, pre_imm) = if let Some(o) = t[0].strip_prefix("movl $") {
+        (
+            false,
+            o.strip_suffix(&format!(", {}", REG_NAMES[1][d_fam as usize]))?,
+        )
+    } else {
+        let o = t[0].strip_prefix("movq $")?;
+        (
+            true,
+            o.strip_suffix(&format!(", {}", REG_NAMES[0][d_fam as usize]))?,
+        )
+    };
+    let k = parse_imm_i64(pre_imm)?;
+    // The copy out of D.
+    let (copy_q, copy_ops) = if let Some(o) = t[2].strip_prefix("movq ") {
+        (true, o)
+    } else {
+        (false, t[2].strip_prefix("movl ")?)
+    };
+    let copy_size = usize::from(!copy_q);
+    let (src, x) = copy_ops.split_once(", ")?;
+    let x_fam = register_family(x)?;
+    if src != REG_NAMES[copy_size][d_fam as usize]
+        || x_fam > REG_GP_MAX
+        || x_fam == d_fam
+        || x_fam == s_fam
+        || REG_NAMES[copy_size][x_fam as usize] != x
+    {
+        return None;
+    }
+    let preload = if copy_q {
+        let w = if pre_q { 'q' } else { 'l' };
+        format!(
+            "    mov{w} ${k}, {}",
+            REG_NAMES[usize::from(!pre_q)][x_fam as usize]
+        )
+    } else {
+        format!(
+            "    movl ${}, {}",
+            k as u32 as i32, REG_NAMES[1][x_fam as usize]
+        )
+    };
+    let scan = format!(
+        "    {mn}{} {s}, {}",
+        if q { 'q' } else { 'l' },
+        REG_NAMES[size][x_fam as usize]
+    );
+    Some(GuardedScanRewrite {
+        d_fam,
+        preload,
+        scan,
+    })
+}
+
+struct GuardedScanRewrite {
+    d_fam: RegId,
+    preload: String,
+    scan: String,
+}
+
+/// `mov{l,q} $imm, <reg of family fam>` (a pure immediate write of D).
+fn is_imm_move_to(t: &str, fam: RegId) -> bool {
+    let Some(rest) = t
+        .strip_prefix("movl $")
+        .or_else(|| t.strip_prefix("movq $"))
+    else {
+        return false;
+    };
+    let Some((imm, dst)) = rest.split_once(", ") else {
+        return false;
+    };
+    parse_imm_i64(imm).is_some() && register_family(dst) == Some(fam)
+}
+
+/// Pure matcher for [`fold_guarded_scan_selects`]: `t` is the scan, then the
+/// test and the constant move in either order, then the cmov.
+fn match_guarded_scan_select(t: &[String; 4]) -> Option<GuardedScanRewrite> {
+    let (mn, q, scan_ops) = [("bsf", false), ("bsf", true), ("bsr", false), ("bsr", true)]
+        .into_iter()
+        .find_map(|(mn, q)| {
+            let prefix = format!("{mn}{} ", if q { 'q' } else { 'l' });
+            t[0].strip_prefix(prefix.as_str()).map(|o| (mn, q, o))
+        })?;
+    let size = usize::from(!q); // REG_NAMES row: 0 = 64-bit, 1 = 32-bit.
+    let w = if q { 'q' } else { 'l' };
+    let (s, d) = scan_ops.split_once(", ")?;
+    let s_fam = register_family(s)?;
+    let d_fam = register_family(d)?;
+    if s_fam > REG_GP_MAX
+        || d_fam > REG_GP_MAX
+        || s_fam == d_fam
+        || REG_NAMES[size][s_fam as usize] != s
+        || REG_NAMES[size][d_fam as usize] != d
+    {
+        return None;
+    }
+    let test = format!("test{w} {s}, {s}");
+    let mov = if t[1] == test {
+        &t[2]
+    } else if t[2] == test {
+        &t[1]
+    } else {
+        return None;
+    };
+    let cmov_ops = t[3]
+        .strip_prefix(&format!("cmovne{w} "))
+        .or_else(|| t[3].strip_prefix(&format!("cmovnz{w} ")))?;
+    let (cm_src, r) = cmov_ops.split_once(", ")?;
+    let r_fam = register_family(r)?;
+    if cm_src != d
+        || r_fam > REG_GP_MAX
+        || r_fam == s_fam
+        || r_fam == d_fam
+        || REG_NAMES[size][r_fam as usize] != r
+    {
+        return None;
+    }
+    let r32 = REG_NAMES[1][r_fam as usize];
+    let r64 = REG_NAMES[0][r_fam as usize];
+    // The constant as R holds it before the cmov.
+    let c: i64 = if let Some(imm) = mov
+        .strip_prefix("movl $")
+        .and_then(|o| o.strip_suffix(&format!(", {r32}")))
+    {
+        i64::from((parse_imm_i64(imm)? & 0xFFFF_FFFF) as u32)
+    } else {
+        let imm = mov
+            .strip_prefix("movq $")
+            .and_then(|o| o.strip_suffix(&format!(", {r64}")))?;
+        let v = parse_imm_i64(imm)?;
+        i32::try_from(v).ok()?;
+        v
+    };
+    let preload = if q {
+        format!("    {mov}")
+    } else {
+        format!("    movl ${}, {r32}", c as u32 as i32)
+    };
+    let scan = format!("    {mn}{w} {s}, {}", REG_NAMES[size][r_fam as usize]);
+    Some(GuardedScanRewrite {
+        d_fam,
+        preload,
+        scan,
+    })
+}
+
+struct HighbitSubRewrite {
+    d_fam: RegId,
+    preload: String,
+    scan: String,
+    /// `add $(K - mask), R` when the minuend is not the mask itself.
+    add: Option<String>,
+}
+
+/// Pure matcher for [`fold_highbit_subs`]; see there for the contract.
+fn match_highbit_sub(t: &[String; 5]) -> Option<HighbitSubRewrite> {
+    let (scan_q, mask, preload_imm) = if t[1].starts_with("bsrq ") {
+        (true, 63u32, 127u32)
+    } else if t[1].starts_with("bsrl ") {
+        (false, 31, 63)
+    } else {
+        return None;
+    };
+    let (s, d) = t[1][5..].split_once(", ")?;
+    let size = usize::from(!scan_q); // REG_NAMES row: 0 = 64-bit, 1 = 32-bit.
+    let d_fam = register_family(d)?;
+    let s_fam = register_family(s)?;
+    if d_fam > REG_GP_MAX || s_fam > REG_GP_MAX || d_fam == s_fam {
+        return None;
+    }
+    if REG_NAMES[size][d_fam as usize] != d || REG_NAMES[size][s_fam as usize] != s {
+        return None;
+    }
+    let d32 = REG_NAMES[1][d_fam as usize];
+    if t[0] != format!("movl ${preload_imm}, {d32}")
+        || t[2] != format!("xor{} ${mask}, {d}", if scan_q { 'q' } else { 'l' })
+    {
+        return None;
+    }
+    let (sub_q, sub_ops) = if let Some(o) = t[4].strip_prefix("subq ") {
+        (true, o)
+    } else {
+        (false, t[4].strip_prefix("subl ")?)
+    };
+    if sub_q && !scan_q {
+        return None;
+    }
+    let (sub_src, r) = sub_ops.split_once(", ")?;
+    let sub_size = usize::from(!sub_q);
+    let r_fam = register_family(r)?;
+    if r_fam > REG_GP_MAX
+        || r_fam == d_fam
+        || r_fam == s_fam
+        || REG_NAMES[sub_size][r_fam as usize] != r
+        || sub_src != REG_NAMES[sub_size][d_fam as usize]
+    {
+        return None;
+    }
+    let r32 = REG_NAMES[1][r_fam as usize];
+    let r64 = REG_NAMES[0][r_fam as usize];
+    // The minuend K, as the value R holds before the `sub` at its width.
+    let k: i64 = if let Some(imm) = t[3]
+        .strip_prefix("movl $")
+        .and_then(|o| o.strip_suffix(&format!(", {r32}")))
+    {
+        let v = parse_imm_i64(imm)?;
+        // A dword move zero-extends; at `subl` width only the low half counts.
+        i64::from(u32::try_from(v & 0xFFFF_FFFF).ok()?)
+    } else if sub_q {
+        let imm = t[3]
+            .strip_prefix("movq $")
+            .and_then(|o| o.strip_suffix(&format!(", {r64}")))?;
+        let v = parse_imm_i64(imm)?;
+        i32::try_from(v).ok()?; // GAS sign-extends a movq imm32
+        v
+    } else {
+        return None;
+    };
+    // The count in D is `bsr ^ mask == mask - bsr` (bsr in 0..=mask), so
+    // `K - D == bsr + (K - mask)`; for a zero source D == mask + 1 and the
+    // result is `K - mask - 1`, which is exactly the -1 preload plus the
+    // same addend. K == mask is the plain highest-set-bit index.
+    let addend = if sub_q {
+        k.checked_sub(i64::from(mask))?
+    } else {
+        // 32-bit arithmetic: wrap the addend into a signed imm32.
+        i64::from((k as u32).wrapping_sub(mask) as i32)
+    };
+    if sub_q && i32::try_from(addend).is_err() {
+        return None;
+    }
+    let preload = if sub_q {
+        format!("    movq $-1, {r64}")
+    } else {
+        format!("    movl $-1, {r32}")
+    };
+    let scan = format!(
+        "    bsr{} {s}, {}",
+        if scan_q { 'q' } else { 'l' },
+        REG_NAMES[size][r_fam as usize]
+    );
+    let add = (addend != 0).then(|| {
+        if sub_q {
+            format!("    addq ${addend}, {r64}")
+        } else {
+            format!("    addl ${addend}, {r32}")
+        }
+    });
+    Some(HighbitSubRewrite {
+        d_fam,
+        preload,
+        scan,
+        add,
+    })
+}
+
+/// A decimal or `0x` hexadecimal immediate, optionally negative.
+fn parse_imm_i64(imm: &str) -> Option<i64> {
+    let (neg, mag) = match imm.strip_prefix('-') {
+        Some(m) => (true, m),
+        None => (false, imm),
+    };
+    let mag = match mag.strip_prefix("0x").or_else(|| mag.strip_prefix("0X")) {
+        Some(h) => i64::from_str_radix(h, 16).ok()?,
+        None => mag.parse::<i64>().ok()?,
+    };
+    Some(if neg { mag.checked_neg()? } else { mag })
+}
+
+#[cfg(test)]
+mod highbit_sub_tests {
+    use super::*;
+
+    fn run(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        fold_highbit_subs(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    fn body(lines: &[&str]) -> String {
+        let mut s = String::from("f:\n    .cfi_startproc\n");
+        for l in lines {
+            s.push_str("    ");
+            s.push_str(l);
+            s.push('\n');
+        }
+        s.push_str("    ret\n    .cfi_endproc\n");
+        s
+    }
+
+    const HB32: [&str; 5] = [
+        "movl $63, %esi",
+        "bsrl %edi, %esi",
+        "xorl $31, %esi",
+        "movl $31, %eax",
+        "subl %esi, %eax",
+    ];
+
+    #[test]
+    fn folds_the_32_bit_highbit_to_a_preloaded_scan() {
+        let out = run(&body(&HB32));
+        assert!(
+            out.windows(2)
+                .any(|w| w == ["movl $-1, %eax", "bsrl %edi, %eax"]),
+            "{out:?}"
+        );
+        assert!(
+            !out.iter()
+                .any(|l| l.starts_with("subl") || l.starts_with("xorl"))
+        );
+    }
+
+    #[test]
+    fn folds_64_bit_scans_at_both_subtraction_widths() {
+        let out = run(&body(&[
+            "movl $127, %esi",
+            "bsrq %rdi, %rsi",
+            "xorq $63, %rsi",
+            "movl $63, %eax",
+            "subl %esi, %eax",
+        ]));
+        assert!(
+            out.windows(2)
+                .any(|w| w == ["movl $-1, %eax", "bsrq %rdi, %rax"]),
+            "{out:?}"
+        );
+        let out = run(&body(&[
+            "movl $127, %esi",
+            "bsrq %rdi, %rsi",
+            "xorq $63, %rsi",
+            "movq $63, %rax",
+            "subq %rsi, %rax",
+        ]));
+        assert!(
+            out.windows(2)
+                .any(|w| w == ["movq $-1, %rax", "bsrq %rdi, %rax"]),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_32_bit_scan_feeding_a_64_bit_subtraction() {
+        // A zero-source 32-bit scan may clear bits 63:32 of a -1 preload.
+        let out = run(&body(&[
+            "movl $63, %esi",
+            "bsrl %edi, %esi",
+            "xorl $31, %esi",
+            "movq $31, %rax",
+            "subq %rsi, %rax",
+        ]));
+        assert!(out.iter().any(|l| l == "subq %rsi, %rax"), "{out:?}");
+    }
+
+    #[test]
+    fn refuses_live_count_live_flags_aliasing_and_wrong_preloads() {
+        // The count register is read after the subtraction.
+        let mut live_d = HB32.to_vec();
+        live_d.push("addl %esi, %eax");
+        assert!(run(&body(&live_d)).iter().any(|l| l == "subl %esi, %eax"));
+        // The subtraction's flags are consumed.
+        let mut live_flags = HB32.to_vec();
+        live_flags.push("sete %al");
+        assert!(
+            run(&body(&live_flags))
+                .iter()
+                .any(|l| l == "subl %esi, %eax")
+        );
+        // The scan source is the result register.
+        let alias = [
+            "movl $63, %esi",
+            "bsrl %eax, %esi",
+            "xorl $31, %esi",
+            "movl $31, %eax",
+            "subl %esi, %eax",
+        ];
+        assert!(run(&body(&alias)).iter().any(|l| l == "subl %esi, %eax"));
+        // A preload other than 2W-1 is not the zero-defined count.
+        let mut wrong = HB32;
+        wrong[0] = "movl $32, %esi";
+        assert!(run(&body(&wrong)).iter().any(|l| l == "subl %esi, %eax"));
+        // A guarded or unpreloaded scan is not this idiom.
+        assert!(
+            run(&body(&HB32[1..]))
+                .iter()
+                .any(|l| l == "subl %esi, %eax")
+        );
+    }
+
+    #[test]
+    fn folds_a_general_minuend_with_one_add() {
+        // x ? 32 - clz(x) : 0 (fls): K = W, addend 1.
+        let mut fls = HB32;
+        fls[3] = "movl $32, %eax";
+        let out = run(&body(&fls));
+        assert!(
+            out.windows(3)
+                .any(|w| w == ["movl $-1, %eax", "bsrl %edi, %eax", "addl $1, %eax"]),
+            "{out:?}"
+        );
+        // K = 0: 0 - (b ^ 31) == b - 31 (and -32 for zero).
+        let mut neg = HB32;
+        neg[3] = "movl $0, %eax";
+        let out = run(&body(&neg));
+        assert!(out.iter().any(|l| l == "addl $-31, %eax"), "{out:?}");
+        // 64-bit subtraction, K = 64.
+        let out = run(&body(&[
+            "movl $127, %esi",
+            "bsrq %rdi, %rsi",
+            "xorq $63, %rsi",
+            "movq $64, %rax",
+            "subq %rsi, %rax",
+        ]));
+        assert!(
+            out.windows(3)
+                .any(|w| w == ["movq $-1, %rax", "bsrq %rdi, %rax", "addq $1, %rax"]),
+            "{out:?}"
+        );
+    }
+
+    fn run_guarded(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        fold_guarded_scan_selects(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    const LOWBIT32: [&str; 5] = [
+        "movl $32, %esi",
+        "bsfl %edi, %esi",
+        "testl %edi, %edi",
+        "movq $-1, %rax",
+        "cmovnel %esi, %eax",
+    ];
+
+    #[test]
+    fn fuses_a_zero_guarded_scan_into_a_preloaded_scan() {
+        // x ? ctz(x) : -1 at 32 bits: the dword cmov zero-extends, so the
+        // preload is the dword -1.
+        let out = run_guarded(&body(&LOWBIT32));
+        assert_eq!(
+            out[2..out.len() - 2],
+            ["movl $-1, %eax", "bsfl %edi, %eax"],
+            "{out:?}"
+        );
+        // Constant move before the test; no preload on D (NonZero scan).
+        let out = run_guarded(&body(&[
+            "bsrl %edi, %esi",
+            "movl $99, %eax",
+            "testl %edi, %edi",
+            "cmovnel %esi, %eax",
+        ]));
+        assert_eq!(
+            out[2..out.len() - 2],
+            ["movl $99, %eax", "bsrl %edi, %eax"],
+            "{out:?}"
+        );
+        // 64-bit forms keep the original constant move.
+        let out = run_guarded(&body(&[
+            "movl $64, %esi",
+            "bsfq %rdi, %rsi",
+            "testq %rdi, %rdi",
+            "movq $-1, %rax",
+            "cmovneq %rsi, %rax",
+        ]));
+        assert_eq!(
+            out[2..out.len() - 2],
+            ["movq $-1, %rax", "bsfq %rdi, %rax"],
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_mismatched_or_live_guarded_scans() {
+        let kept = |lines: &[&str]| {
+            let out = run_guarded(&body(lines));
+            out.iter().any(|l| l.starts_with("cmov"))
+        };
+        // Width mismatch between the scan and the cmov.
+        let mut m = LOWBIT32;
+        m[4] = "cmovneq %rsi, %rax";
+        assert!(kept(&m));
+        // Inverted condition, or the test of another register.
+        let mut m = LOWBIT32;
+        m[4] = "cmovel %esi, %eax";
+        assert!(kept(&m));
+        let mut m = LOWBIT32;
+        m[2] = "testl %ecx, %ecx";
+        assert!(kept(&m));
+        // The scan result is read after the select.
+        let mut m = LOWBIT32.to_vec();
+        m.push("addl %esi, %eax");
+        assert!(kept(&m));
+        // The test's flags are read after the select.
+        let mut m = LOWBIT32.to_vec();
+        m.push("sete %cl");
+        assert!(kept(&m));
+        // The result register is the scan source.
+        assert!(kept(&[
+            "bsfl %eax, %esi",
+            "testl %eax, %eax",
+            "movq $-1, %rax",
+            "cmovnel %esi, %eax",
+        ]));
+    }
+
+    fn run_scan_copy(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        retarget_preloaded_scan_copies(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn retargets_a_preloaded_scan_into_its_copy() {
+        // The highbit fold's scratch-register form (int hb64(unsigned long)).
+        let out = run_scan_copy(&body(&[
+            "movl $-1, %esi",
+            "bsrq %rdi, %rsi",
+            "movl %esi, %eax",
+        ]));
+        assert_eq!(
+            out[2..out.len() - 2],
+            ["movl $-1, %eax", "bsrq %rdi, %rax"],
+            "{out:?}"
+        );
+        // A 32-bit copy of a qword preload takes the dword low half.
+        let out = run_scan_copy(&body(&[
+            "movq $-1, %rsi",
+            "bsfq %rdi, %rsi",
+            "movl %esi, %eax",
+        ]));
+        assert_eq!(
+            out[2..out.len() - 2],
+            ["movl $-1, %eax", "bsfq %rdi, %rax"],
+            "{out:?}"
+        );
+        // A 64-bit copy keeps the preload's own width.
+        let out = run_scan_copy(&body(&[
+            "movq $-1, %rsi",
+            "bsrl %edi, %esi",
+            "movq %rsi, %rcx",
+        ]));
+        assert_eq!(
+            out[2..out.len() - 2],
+            ["movq $-1, %rcx", "bsrl %edi, %ecx"],
+            "{out:?}"
+        );
+        // %rdx as the scratch is dead at `ret` only under the return-register
+        // annotation the emitter writes for an int-returning function.
+        let out = run_scan_copy(&body(&[
+            "# LCCC_RET_RDX 0",
+            "movl $-1, %edx",
+            "bsrq %rdi, %rdx",
+            "movl %edx, %eax",
+        ]));
+        assert_eq!(
+            out[3..out.len() - 2],
+            ["movl $-1, %eax", "bsrq %rdi, %rax"],
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn refuses_live_or_aliased_scan_copies() {
+        let kept = |lines: &[&str]| {
+            run_scan_copy(&body(lines))
+                .iter()
+                .any(|l| l.starts_with("movl %e") || l.starts_with("movq %r"))
+        };
+        // D read after the copy.
+        assert!(kept(&[
+            "movl $-1, %esi",
+            "bsrq %rdi, %rsi",
+            "movl %esi, %eax",
+            "addl %esi, %eax",
+        ]));
+        // The copy target is the scan source.
+        assert!(kept(&[
+            "movl $-1, %esi",
+            "bsrl %edi, %esi",
+            "movl %esi, %edi"
+        ]));
+        // No preload: the scan's zero-source value is D's unknown content.
+        assert!(kept(&[
+            "xorl %ecx, %ecx",
+            "bsrl %edi, %esi",
+            "movl %esi, %eax"
+        ]));
+    }
+}
+
 pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let len = store.len();
@@ -435,6 +1355,12 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                     }
                 }
             }
+        }
+
+        if cancel_highbit_double_xor_at(store, infos, i) {
+            changed = true;
+            i += 1;
+            continue;
         }
 
         // --- Pattern: dead xorl %eax before overwriting load ---
@@ -1528,6 +2454,96 @@ pub(super) fn eliminate_dead_sign_extensions(
     changed
 }
 
+/// Compose `leaq d(%B), %T` into an adjacent self-scaled consumer
+/// `lea{q,l} d2(%T, %T, s), %D`: `(B + d) * (1 + s) + d2` is
+/// `B + B*s + (d*(1+s) + d2)`, i.e. `lea{q,l} d'(%B, %B, s), %D` — exact modulo
+/// 2^64 for `leaq` and modulo 2^32 for `leal` (which reads only the low bits
+/// of the sum). A `leal` producer zero-extends `B + d` before the multiply,
+/// which the identity survives only modulo 2^32 — so it composes into a
+/// `leal` consumer only. `%B` must be a 64-bit, index-capable register
+/// (not `%rsp`), both consumer slots must name `%T` at 64 bits (no addr32),
+/// and `d'` must fit a signed 32-bit displacement. The caller proves the
+/// producer's value dead after the consumer.
+fn compose_self_scaled_lea(
+    next: &str,
+    producer_is_leal: bool,
+    t_fam: RegId,
+    base: &str,
+    base_fam: RegId,
+    disp_text: &str,
+) -> Option<String> {
+    let (b_u, t_u) = (base_fam as usize, t_fam as usize);
+    if b_u >= REG_NAMES[0].len() || t_u >= REG_NAMES[0].len() || base_fam == 4 {
+        return None;
+    }
+    if REG_NAMES[0][b_u] != base {
+        return None;
+    }
+    let op = next
+        .get(..5)
+        .filter(|o| *o == "leal " || (*o == "leaq " && !producer_is_leal))?;
+    let (addr, dest) = next[5..].rsplit_once(',')?;
+    let (addr, dest) = (addr.trim(), dest.trim());
+    let d_fam = register_family_fast(dest);
+    if d_fam == REG_NONE || d_fam > REG_GP_MAX {
+        return None;
+    }
+    let open = addr.find('(')?;
+    let inner = addr.strip_suffix(')')?.get(open + 1..)?;
+    let f: Vec<&str> = inner.split(',').map(str::trim).collect();
+    let t64 = REG_NAMES[0][t_u];
+    if f.len() != 3 || f[0] != t64 || f[1] != t64 {
+        return None;
+    }
+    let s: i64 = match f[2] {
+        "1" => 1,
+        "2" => 2,
+        "4" => 4,
+        "8" => 8,
+        _ => return None,
+    };
+    let d = parse_lea_disp(disp_text)?;
+    let d2 = parse_lea_disp(&addr[..open])?;
+    let nd = d.checked_mul(1 + s)?.checked_add(d2)?;
+    i32::try_from(nd).ok()?;
+    let nd = if nd == 0 {
+        String::new()
+    } else {
+        nd.to_string()
+    };
+    Some(format!("{op}{nd}({base}, {base}, {s}), {dest}"))
+}
+
+/// Register-name mentions of `fam` (every width, the high byte included) in
+/// the SOURCE operands of `t` — everything before the last top-level comma.
+/// The LEA-into-memory fold splices exactly one `%T` slot, so its redefining
+/// path requires exactly one such mention.
+fn source_family_mentions(t: &str, fam: RegId) -> usize {
+    let fam_u = fam as usize;
+    if fam_u >= REG_NAMES[0].len() {
+        return usize::MAX; // fail closed
+    }
+    let Some(c) = last_top_level_comma(t.as_bytes()) else {
+        return 0;
+    };
+    let src = &t[..c];
+    let high = (fam_u < 4).then(|| HIGH_BYTE_NAMES[fam_u]);
+    REG_NAMES
+        .iter()
+        .map(|row| row[fam_u])
+        .chain(high)
+        .map(|name| {
+            src.match_indices(name)
+                .filter(|(pos, _)| {
+                    src.as_bytes()
+                        .get(pos + name.len())
+                        .is_none_or(|ch| !ch.is_ascii_alphanumeric())
+                })
+                .count()
+        })
+        .sum()
+}
+
 // ── LEA-to-memory SIB folding ───────────────────────────────────────────────
 //
 // Fold the already-emitted form:
@@ -1552,7 +2568,11 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
             continue;
         }
         let lea = infos[i].trimmed(store.get(i));
-        if !lea.starts_with("leaq ") {
+        // `leal` producers feed only the self-scaled compose below (a
+        // `leal` consumer reads just the low 32 bits); every memory-operand
+        // fold needs the full 64-bit address and stays `leaq`-only.
+        let producer_is_leal = lea.starts_with("leal ");
+        if !lea.starts_with("leaq ") && !producer_is_leal {
             i += 1;
             continue;
         }
@@ -1613,6 +2633,34 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
                 continue;
             }
             let next = infos[j].trimmed(store.get(j));
+            // `leaq d(%B), %T; lea{q,l} d2(%T, %T, s), %D` is
+            // `lea{q,l} d*(1+s)+d2(%B, %B, s), %D` (see
+            // `compose_self_scaled_lea`); the double mention rules the
+            // one-slot splice below out, so compose it here.
+            if let Some(composed) = compose_self_scaled_lea(
+                next,
+                producer_is_leal,
+                dst_family,
+                base,
+                base_family,
+                &addr_text[..open],
+            ) {
+                let redefines = composed
+                    .rsplit_once(',')
+                    .is_some_and(|(_, d)| register_family_fast(d.trim()) == dst_family);
+                if redefines || dead.dead_after(store, infos, j, dst_family, &[i, j]) {
+                    mark_nop(&mut infos[i]);
+                    replace_line(store, &mut infos[j], j, format!("    {composed}"));
+                    dead.invalidate_span(store, infos, i, j);
+                    changed = true;
+                    i = j + 1;
+                    continue;
+                }
+            }
+            if producer_is_leal {
+                i += 1;
+                continue;
+            }
             // A consumer that full-width-redefines the LEA destination kills
             // its value here (`movq (%rdx), %rdx`): the LEA result has no
             // other reader, the composed address reads the PRE-LEA base, and
@@ -1622,7 +2670,12 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
             // the pre-LEA value by construction. Without the redefinition the
             // old discipline stands: dst must differ from base and die after
             // the consumer.
-            let consumer_redefines_dst = fam_written_only_as_dest(next, dst_family);
+            // The redefining path splices ONE `%T` slot; a second source
+            // mention (`leaq (%T,%T,4), %T`) would keep reading the stale
+            // pre-LEA register: `leaq -3(%rdi), %r10; leaq (%r10,%r10,4),
+            // %r10` became `leaq -3(%rdi, %r10, 4), %r10`.
+            let consumer_redefines_dst = fam_written_only_as_dest(next, dst_family)
+                && source_family_mentions(next, dst_family) == 1;
             if dst_family == base_family && !consumer_redefines_dst {
                 i += 1;
                 continue;
@@ -1663,12 +2716,15 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
             }
             mark_nop(&mut infos[i]);
             replace_line(store, &mut infos[j], j, format!("    {}", replacement));
-            dead.invalidate(store, infos, j);
+            dead.invalidate_span(store, infos, i, j);
             changed = true;
             i = j + 1;
             continue;
         }
-        if fields.len() > 3 || fields.iter().any(|field| !field.starts_with('%')) {
+        if producer_is_leal
+            || fields.len() > 3
+            || fields.iter().any(|field| !field.starts_with('%'))
+        {
             i += 1;
             continue;
         }
@@ -1701,7 +2757,9 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
         // Same consumer-redefines-dst admission as the single-base arm (the
         // LEA value dies at the consumer's fresh destination write; the
         // composed address keeps reading the pre-LEA base/index).
-        let consumer_redefines_dst = fam_written_only_as_dest(next, dst_family);
+        // One spliced slot only — see the single-base arm.
+        let consumer_redefines_dst = fam_written_only_as_dest(next, dst_family)
+            && source_family_mentions(next, dst_family) == 1;
         if !consumer_redefines_dst && (dst_family == base_family || dst_family == index_family) {
             i += 1;
             continue;
@@ -1756,7 +2814,7 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
                             mark_nop(&mut infos[i]);
                             mark_nop(&mut infos[j]);
                             replace_line(store, &mut infos[k], k, format!("    {}", replacement));
-                            dead.invalidate(store, infos, k);
+                            dead.invalidate_span(store, infos, i, k);
                             changed = true;
                             i = k + 1;
                             continue;
@@ -1791,7 +2849,7 @@ pub(super) fn fold_lea_into_memory_op(store: &mut LineStore, infos: &mut [LineIn
         }
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, format!("    {}", replacement));
-        dead.invalidate(store, infos, j);
+        dead.invalidate_span(store, infos, i, j);
         changed = true;
         i = j + 1;
     }
@@ -4400,6 +5458,395 @@ pub(super) fn fuse_signext_and_move(store: &mut LineStore, infos: &mut [LineInfo
         i = j + 1;
     }
     changed
+}
+
+// ── Extension chains ─────────────────────────────────────────────────────────
+//
+// An extension FROM width W reads only the low W bits of its source, and any
+// extension of S preserves S's low W bits. So when a W-bit extension consumes
+// a register that was itself just produced by extending S from width W,
+//   ext1 S, %X              (movs/movz from W bits, or movl/movslq for W=32)
+//   ext2 %X_W, %Y           (movs/movz from W bits, into a 32/64-bit register)
+// the pair is `ext2 S, %Y`. The first write is gone, so %X must be dead after
+// ext2 -- unless Y is X's family, which ext2 overwrites in full anyway.
+// Immediates are refused (`movslq $5` does not exist) and so are high-byte
+// sources (`movsbq %ah` cannot be encoded).
+fn ext_source_width(mnemonic: &str) -> Option<u8> {
+    match mnemonic {
+        "movsbl" | "movsbq" | "movzbl" | "movzbq" => Some(8),
+        "movswl" | "movswq" | "movzwl" | "movzwq" => Some(16),
+        "movslq" | "movl" => Some(32),
+        _ => None,
+    }
+}
+
+pub(super) fn collapse_extension_chains(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let len = store.len();
+    let mut dead = LazyDeadness::new();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let ti = infos[i].trimmed(store.get(i));
+        let Some((m1, rest1)) = ti.split_once(' ') else {
+            i += 1;
+            continue;
+        };
+        let (Some(w), Some((src, xdst))) = (ext_source_width(m1), split_two_operands(rest1)) else {
+            i += 1;
+            continue;
+        };
+        let Some(x) = plain_gp_operand(xdst) else {
+            i += 1;
+            continue;
+        };
+        // ext1 must write X's full family (a 32- or 64-bit destination) and
+        // read a real register or memory operand of at least W bits.
+        if x > REG_GP_MAX
+            || (xdst != REG_NAMES[0][x as usize] && xdst != REG_NAMES[1][x as usize])
+            || (m1 == "movl" && xdst != REG_NAMES[1][x as usize])
+            || src.starts_with('$')
+            || HIGH_BYTE_NAMES.contains(&src)
+        {
+            i += 1;
+            continue;
+        }
+        let k = next_non_nop(infos, i + 1, len);
+        if k >= len || infos[k].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let tk = infos[k].trimmed(store.get(k));
+        let Some((m2, rest2)) = tk.split_once(' ') else {
+            i += 1;
+            continue;
+        };
+        let Some((xsub, ydst)) = split_two_operands(rest2) else {
+            i += 1;
+            continue;
+        };
+        let narrow_name = match w {
+            8 => REG_NAMES[3][x as usize],
+            16 => REG_NAMES[2][x as usize],
+            _ => REG_NAMES[1][x as usize],
+        };
+        let Some(y) = plain_gp_operand(ydst) else {
+            i += 1;
+            continue;
+        };
+        if m2 == "movl"
+            || ext_source_width(m2) != Some(w)
+            || xsub != narrow_name
+            || y > REG_GP_MAX
+            || (ydst != REG_NAMES[0][y as usize] && ydst != REG_NAMES[1][y as usize])
+        {
+            i += 1;
+            continue;
+        }
+        if y != x && !dead.dead_after(store, infos, k, x, &[i, k]) {
+            i += 1;
+            continue;
+        }
+        let fused = format!("    {m2} {src}, {ydst}");
+        replace_line(store, &mut infos[k], k, fused);
+        mark_nop(&mut infos[i]);
+        dead.invalidate(store, infos, k);
+        changed = true;
+        i = k + 1;
+    }
+    changed
+}
+
+#[cfg(test)]
+mod extension_chain_tests {
+    use super::*;
+
+    fn run(body: &str) -> Vec<String> {
+        let asm = format!(".type f, @function\nf:\n.cfi_startproc\n{body}    ret\n.cfi_endproc\n");
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        collapse_extension_chains(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .filter(|l| l.starts_with("mov"))
+            .collect()
+    }
+
+    #[test]
+    fn same_width_chains_collapse_onto_the_original_source() {
+        for (body, want) in [
+            // the corpus shapes (float128_usual_conversions, casts_roundtrip)
+            (
+                "    movsbl %al, %r12d\n    movsbq %r12b, %rdx\n",
+                "movsbq %al, %rdx",
+            ),
+            (
+                "    movswl %ax, %ebx\n    movswq %bx, %rdx\n",
+                "movswq %ax, %rdx",
+            ),
+            // signedness of ext1 is irrelevant: only the low W bits flow on
+            (
+                "    movzbl (%rsi), %ecx\n    movsbq %cl, %rdx\n",
+                "movsbq (%rsi), %rdx",
+            ),
+            (
+                "    movl (%rsi), %ecx\n    movslq %ecx, %rdx\n",
+                "movslq (%rsi), %rdx",
+            ),
+            // Y == X: ext2 overwrites the family, no liveness fact needed
+            (
+                "    movswl %dx, %r8d\n    movswq %r8w, %r8\n",
+                "movswq %dx, %r8",
+            ),
+            // SRC naming X reads it before either write
+            (
+                "    movsbl (%r12), %r12d\n    movsbq %r12b, %rdx\n",
+                "movsbq (%r12), %rdx",
+            ),
+        ] {
+            assert_eq!(run(body), vec![want.to_string()], "{body}");
+        }
+    }
+
+    #[test]
+    fn refused_shapes_are_untouched() {
+        let cases = [
+            // X read afterwards
+            "    movsbl %al, %r12d\n    movsbq %r12b, %rdx\n    addl %r12d, %edx\n",
+            // ext2 reads MORE bits than ext1 preserved from S
+            "    movsbl %al, %r12d\n    movswq %r12w, %rdx\n",
+            // X is still read (16 bits of the zero-extension) afterwards
+            "    movzbl %al, %r12d\n    movsbq %r12b, %rdx\n    movswq %r12w, %rcx\n",
+            // immediate source
+            "    movl $5, %ecx\n    movslq %ecx, %rdx\n",
+            // high-byte source
+            "    movsbl %ah, %ecx\n    movsbq %cl, %rdx\n",
+            // ext2 reads a different register
+            "    movsbl %al, %r12d\n    movsbq %r13b, %rdx\n",
+        ];
+        // Report every collapsed case at once, not just the first.
+        let collapsed: Vec<_> = cases
+            .iter()
+            .map(|body| (body, run(body)))
+            .filter(|(_, out)| out.len() < 2)
+            .collect();
+        assert!(
+            collapsed.is_empty(),
+            "collapsed refused shapes: {collapsed:#?}"
+        );
+    }
+}
+
+// ── Sign-extension narrowed into its 32-bit copy ─────────────────────────────
+//
+// Narrow signed values live sign-extended to 64 bits in registers, so a
+// narrow load (or re-extension) whose consumer is a 32-bit copy is emitted as
+//   movs{b,w}q SRC, %rA        movslq SRC, %rA
+//   movl %eA, %eB              movl %eA, %eB
+// The copy keeps bits 0..31 and zero-extends, which is exactly what the
+// 32-bit form of the extension computes on its own:
+//   movs{b,w}l SRC, %eB        movl SRC, %eB
+// (`char` and `int` loads returned or passed as `int`: GCC's `movsbl`.)
+//
+// * B == A (`movsbq %al, %rax; movl %eax, %eax`): the final register value is
+//   bit-identical, so no liveness fact is needed.
+// * B != A: the full 64-bit value of %rA is no longer produced, so %rA must be
+//   dead after the copy ([`LazyDeadness`]: CFG liveness, `ret` keeps %rax and
+//   the callee-saved registers live).
+// SRC is read before %eB is written, so SRC may mention %rB. Neither form
+// touches the flags. High-byte sources (`%ah`) are refused: `movsbl %ah` and
+// a REX-requiring %eB cannot be encoded together.
+pub(super) fn narrow_signext_into_32bit_copy(
+    store: &mut LineStore,
+    infos: &mut [LineInfo],
+) -> bool {
+    let len = store.len();
+    let mut dead = LazyDeadness::new();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() || infos[i].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let ti = infos[i].trimmed(store.get(i));
+        let Some((op32, rest)) = ["movsbq ", "movswq ", "movslq "]
+            .iter()
+            .find_map(|m| ti.strip_prefix(m).map(|r| (*m, r)))
+            .map(|(m, r)| {
+                let op32 = match m {
+                    "movsbq " => "movsbl",
+                    "movswq " => "movswl",
+                    _ => "movl",
+                };
+                (op32, r)
+            })
+        else {
+            i += 1;
+            continue;
+        };
+        let Some((src, dst)) = split_two_operands(rest) else {
+            i += 1;
+            continue;
+        };
+        let Some(a) = plain_gp_operand(dst) else {
+            i += 1;
+            continue;
+        };
+        if a > REG_GP_MAX || dst != REG_NAMES[0][a as usize] || HIGH_BYTE_NAMES.contains(&src) {
+            i += 1;
+            continue;
+        }
+        let j = next_non_nop(infos, i + 1, len);
+        if j >= len || infos[j].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let tj = infos[j].trimmed(store.get(j));
+        let Some((csrc, cdst)) = tj.strip_prefix("movl ").and_then(split_two_operands) else {
+            i += 1;
+            continue;
+        };
+        let Some(b) = plain_gp_operand(cdst) else {
+            i += 1;
+            continue;
+        };
+        // %esp/%rsp as a copy target is never a value move; leave it alone.
+        if b > REG_GP_MAX
+            || b == 4
+            || csrc != REG_NAMES[1][a as usize]
+            || cdst != REG_NAMES[1][b as usize]
+        {
+            i += 1;
+            continue;
+        }
+        if b != a && !dead.dead_after(store, infos, j, a, &[i, j]) {
+            i += 1;
+            continue;
+        }
+        let fused = format!("    {op32} {src}, {cdst}");
+        replace_line(store, &mut infos[i], i, fused);
+        mark_nop(&mut infos[j]);
+        dead.invalidate(store, infos, i);
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
+#[cfg(test)]
+mod narrow_signext_copy_tests {
+    use super::*;
+
+    fn run(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        narrow_signext_into_32bit_copy(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    fn func(body: &str) -> String {
+        // Real output brackets every function with CFI; the liveness oracle
+        // keys on it and refuses (fail-closed) to prove deadness without it.
+        format!(".type f, @function\nf:\n.cfi_startproc\n{body}    ret\n.cfi_endproc\n")
+    }
+
+    #[test]
+    fn char_and_int_loads_returned_as_int_use_the_32bit_form() {
+        // `int f(void) { return b[0]; }` with `char b[]` / `int b[]`.
+        for (ext, want) in [
+            ("movsbq b(%rip), %rdi", "movsbl b(%rip), %eax"),
+            ("movswq b(%rip), %rdi", "movswl b(%rip), %eax"),
+            ("movslq b(%rip), %rdi", "movl b(%rip), %eax"),
+        ] {
+            let out = run(&func(&format!("    {ext}\n    movl %edi, %eax\n")));
+            assert!(out.iter().any(|l| l == want), "{ext}: {out:?}");
+            assert!(!out.iter().any(|l| l.starts_with("movl %edi")), "{out:?}");
+        }
+    }
+
+    #[test]
+    fn self_copy_needs_no_liveness() {
+        // %rax stays live into `ret`, yet the value is bit-identical.
+        let out = run(&func("    movsbq %al, %rax\n    movl %eax, %eax\n"));
+        assert!(out.iter().any(|l| l == "movsbl %al, %eax"), "{out:?}");
+        assert_eq!(out.iter().filter(|l| l.starts_with("mov")).count(), 1);
+    }
+
+    #[test]
+    fn live_wide_source_is_kept() {
+        // %rdi's 64-bit sign-extended value is read after the copy.
+        let asm = func("    movsbq (%rsi), %rdi\n    movl %edi, %eax\n    addq %rdi, %rdx\n");
+        let out = run(&asm);
+        assert!(out.iter().any(|l| l == "movsbq (%rsi), %rdi"), "{out:?}");
+        assert!(out.iter().any(|l| l == "movl %edi, %eax"), "{out:?}");
+    }
+
+    #[test]
+    fn restored_callee_saved_source_folds() {
+        // Codegen saves every callee-saved register it writes; the restore
+        // kills the family, so the wide value is dead after the copy.
+        let out = run(&func(
+            "    pushq %rbx\n    movslq (%rsi), %rbx\n    movl %ebx, %eax\n    popq %rbx\n",
+        ));
+        assert!(out.iter().any(|l| l == "movl (%rsi), %eax"), "{out:?}");
+        assert!(!out.iter().any(|l| l.contains("%ebx, %eax")), "{out:?}");
+    }
+
+    #[test]
+    fn value_read_around_a_back_edge_is_kept() {
+        // %rdi is read at the loop head -- EARLIER in the text, LATER in
+        // execution. A forward text scan would call it dead; CFG liveness
+        // must not.
+        let out = run(&func(concat!(
+            ".L1:\n",
+            "    addq %rdi, %rdx\n",
+            "    movsbq (%rsi), %rdi\n",
+            "    movl %edi, %eax\n",
+            "    decq %rcx\n",
+            "    jne .L1\n",
+        )));
+        assert!(out.iter().any(|l| l == "movsbq (%rsi), %rdi"), "{out:?}");
+        assert!(out.iter().any(|l| l == "movl %edi, %eax"), "{out:?}");
+    }
+
+    #[test]
+    fn mismatched_or_unencodable_shapes_are_refused() {
+        for body in [
+            // the copy reads a different register
+            "    movsbq (%rsi), %rdi\n    movl %ecx, %eax\n",
+            // high-byte source
+            "    movsbq %ah, %rdi\n    movl %edi, %eax\n",
+            // 32-bit destination on the extension (not the 64-bit form)
+            "    movsbl (%rsi), %edi\n    movl %edi, %eax\n",
+        ] {
+            let out = run(&func(body));
+            assert_eq!(
+                out.iter().filter(|l| l.starts_with("mov")).count(),
+                2,
+                "{body}: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_may_name_the_copy_target() {
+        // SRC is read before %eB is written.
+        let out = run(&func("    movslq (%rax), %rdi\n    movl %edi, %eax\n"));
+        assert!(out.iter().any(|l| l == "movl (%rax), %eax"), "{out:?}");
+    }
 }
 
 // ── Phi-copy register coalescing ─────────────────────────────────────────────
@@ -7681,7 +9128,7 @@ fn lea_op_name(w: u8) -> &'static str {
 /// Parse a LEA displacement text (the part before `(`) into its value.
 /// Empty means zero. Accepts the spellings this backend emits — signed
 /// decimal and `0x` hex — with checked negation for `-i64::MIN`.
-fn parse_lea_disp(text: &str) -> Option<i64> {
+pub(super) fn parse_lea_disp(text: &str) -> Option<i64> {
     let t = text.trim();
     if t.is_empty() {
         return Some(0);
@@ -7740,6 +9187,11 @@ fn parse_lea_disp(text: &str) -> Option<i64> {
 pub(super) fn fuse_load_lea_into_base(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut changed = false;
+    // One solution per call, built at the first candidate that reaches the
+    // liveness proof and kept exact across folds by `refresh_span`.  Building
+    // it per candidate re-solved the whole file hundreds of times per call on
+    // large functions (503 builds, 8.7% of compiling zstd's huf_compress.c).
+    let mut liveness: Option<FileLiveness> = None;
     let mut i = 0;
     while i < len {
         if infos[i].is_nop() || infos[i].pinned {
@@ -7897,10 +9349,10 @@ pub(super) fn fuse_load_lea_into_base(store: &mut LineStore, infos: &mut [LineIn
         // keep-set, matching the rewritten program's reads), and D is dead
         // after the renamed use (any later read would still reference the
         // deleted LEA's definition).
-        let mut lv = FileLiveness::new(store, infos);
-        if !provably_dead_lv(&lv, store, infos, j, x_fam, &[i, j])
-            || !provably_dead_lv(&lv, store, infos, j, b_fam, &[i, j])
-            || !provably_dead_lv(&lv, store, infos, k, d_fam, &[j, k])
+        let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
+        if !provably_dead_lv(lv, store, infos, j, x_fam, &[i, j])
+            || !provably_dead_lv(lv, store, infos, j, b_fam, &[i, j])
+            || !provably_dead_lv(lv, store, infos, k, d_fam, &[j, k])
         {
             i += 1;
             continue;
@@ -7917,7 +9369,12 @@ pub(super) fn fuse_load_lea_into_base(store: &mut LineStore, infos: &mut [LineIn
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, add_new);
         replace_line(store, &mut infos[k], k, use_new);
-        lv.refresh_at(store, infos, j);
+        // The fold edited exactly i, j and k; every line between them is a
+        // nop (j and k are the next real lines), so the edit is confined to
+        // `i..=k` as `refresh_span` requires.
+        if let Some(lv) = liveness.as_mut() {
+            lv.refresh_span(store, infos, i, k);
+        }
         changed = true;
         i = k + 1;
     }
@@ -8276,7 +9733,8 @@ mod lea_scan_debug {
     }
 }
 
-/// Fuse `movsd %A, %D` + `vOP %S, %D, %D` into `vOP %S, %A, %D`.
+/// Fuse `movsd %A, %D` (or a packed `(v)movapd`/`(v)movaps` register copy)
+/// + `vOP %S, %D, %D` into `vOP %S, %A, %D`.
 ///
 /// The scalar-FP emitters stage the first operand into the destination with
 /// a `movsd` and then apply the (already 3-operand VEX) operation — a pure
@@ -8305,13 +9763,23 @@ pub(super) fn fuse_mov_scalar_fp_into_vex_op(
             i += 1;
             continue;
         }
-        // Match: `movsd %xmmA, %xmmD` / `movss %xmmA, %xmmD` (A != D).
+        // Match a register copy `%xmmA -> %xmmD` (A != D): the scalar
+        // `movsd`/`movss`, or the full-register `(v)movapd`/`(v)movaps` the
+        // scalar emitters now use for dependency-free copies. A packed copy
+        // fixes no width (its bits 127:0 equal A's whatever the consumer's
+        // lane width), so either scalar width may consume it.
         let line_i = infos[i].trimmed(store.get(i));
-        let (width, rest) = if let Some(r) = line_i.strip_prefix("movsd %") {
-            ("sd", r)
-        } else if let Some(r) = line_i.strip_prefix("movss %") {
-            ("ss", r)
-        } else {
+        let copy = [
+            ("movsd %", Some("sd")),
+            ("movss %", Some("ss")),
+            ("movapd %", None),
+            ("movaps %", None),
+            ("vmovapd %", None),
+            ("vmovaps %", None),
+        ]
+        .into_iter()
+        .find_map(|(prefix, width)| line_i.strip_prefix(prefix).map(|r| (width, r)));
+        let Some((width, rest)) = copy else {
             i += 1;
             continue;
         };
@@ -8352,7 +9820,12 @@ pub(super) fn fuse_mov_scalar_fp_into_vex_op(
 
         // Match: `vOP<width> %S, %xmmD, %xmmD`.
         let line_j = infos[j].trimmed(store.get(j));
-        let (vop, body) = match binary_vex_scalar_mnemonic(line_j, width) {
+        let consumer = match width {
+            Some(w) => binary_vex_scalar_mnemonic(line_j, w),
+            None => binary_vex_scalar_mnemonic(line_j, "sd")
+                .or_else(|| binary_vex_scalar_mnemonic(line_j, "ss")),
+        };
+        let (vop, body) = match consumer {
             Some((m, rest)) => (m, rest.trim_start()),
             None => {
                 i += 1;
@@ -8400,6 +9873,65 @@ pub(super) fn fuse_mov_scalar_fp_into_vex_op(
         i = j;
     }
     changed
+}
+
+#[cfg(test)]
+mod vex_copy_fusion_tests {
+    use super::super::super::types::classify_line;
+    use crate::backend::peephole_common::LineStore;
+
+    fn run(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        super::fuse_mov_scalar_fp_into_vex_op(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
+    /// The full-register copies the scalar emitters use fuse like `movsd`,
+    /// for either consumer width (bits 127:0 of D equal A's after them).
+    #[test]
+    fn packed_register_copies_fuse_into_the_vex_op() {
+        for (copy, op) in [
+            ("movsd %xmm3, %xmm0", "vaddsd"),
+            ("movss %xmm3, %xmm0", "vaddss"),
+            ("movapd %xmm3, %xmm0", "vaddsd"),
+            ("movapd %xmm3, %xmm0", "vmulss"),
+            ("movaps %xmm3, %xmm0", "vdivss"),
+            ("vmovapd %xmm3, %xmm0", "vsubsd"),
+            ("vmovaps %xmm3, %xmm0", "vmaxss"),
+        ] {
+            let out = run(&format!("    {copy}\n    {op} %xmm4, %xmm0, %xmm0\n"));
+            assert_eq!(out, [format!("{op} %xmm4, %xmm3, %xmm0")], "{copy} + {op}");
+        }
+    }
+
+    /// `movss` defines only D's low 32 bits: an `sd` consumer reads
+    /// `A[31:0] | D_old[63:32]`, which the fused form would replace by
+    /// `A[63:0]`. The pair must survive.
+    #[test]
+    fn scalar_copy_width_binds_the_consumer_width() {
+        let asm = "    movss %xmm3, %xmm0\n    vmulsd %xmm4, %xmm0, %xmm0\n";
+        assert_eq!(
+            run(asm),
+            ["movss %xmm3, %xmm0", "vmulsd %xmm4, %xmm0, %xmm0"]
+        );
+    }
+
+    /// The deleted copy's register may not feed the op's other source.
+    #[test]
+    fn refuses_when_the_other_source_reads_the_copy() {
+        let asm = "    movapd %xmm3, %xmm0\n    vmulsd %xmm0, %xmm0, %xmm0\n";
+        assert_eq!(
+            run(asm),
+            ["movapd %xmm3, %xmm0", "vmulsd %xmm0, %xmm0, %xmm0"]
+        );
+    }
 }
 
 /// Fold `movsd MEM, %D` + `vCOMM %S, %D, %D` into `vCOMM MEM, %S, %D`.
@@ -8705,15 +10237,17 @@ fn dst_d_full(dst: &str) -> String {
 
 /// The role-preserving binary scalar VEX mnemonics for `width` (sd or ss).
 /// Returns the mnemonic plus the rest of the line.
+///
+/// The width binds: after `movss %A, %D` only D's low 32 bits are A's, so an
+/// `sd` consumer would read `A[31:0] | D_old[63:32]` -- fusing it into
+/// `vOPsd %S, %A, %D` (which reads `A[63:0]`) would change the result.
 fn binary_vex_scalar_mnemonic<'a>(line: &'a str, width: &str) -> Option<(&'static str, &'a str)> {
-    let _ = width;
     const MNEMONICS: [&str; 12] = [
         "vmulsd", "vaddsd", "vsubsd", "vdivsd", "vminsd", "vmaxsd", "vmulss", "vaddss", "vsubss",
         "vdivss", "vminss", "vmaxss",
     ];
     for m in MNEMONICS {
-        if line.starts_with(m) && line[m.len()..].starts_with(' ') {
-            let _ = width;
+        if m.ends_with(width) && line.starts_with(m) && line[m.len()..].starts_with(' ') {
             return Some((m, &line[m.len()..]));
         }
     }
@@ -12692,5 +14226,305 @@ mod extension_fact_barrier_tests {
             let out = run(&input);
             assert_eq!(!out.contains("cltq"), redundant, "{input} => {out}");
         }
+    }
+}
+
+#[cfg(test)]
+mod lea_mem_redefining_consumer_tests {
+    //! `fold_lea_into_memory_op`'s redefining-consumer path splices ONE `%T`
+    //! slot; a consumer naming `%T` twice must not be composed (it would keep
+    //! reading the stale pre-LEA register in the slot left behind).
+    use super::super::super::peephole_optimize;
+    use super::source_family_mentions;
+
+    fn run(body: &str) -> String {
+        peephole_optimize(format!(".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n"))
+    }
+
+    /// The miscompile `vectorize_map_i32_scale_add` caught: `(i - 3) * 5`
+    /// became `leaq -3(%rdi, %r10, 4), %r10` (index still the stale %r10).
+    /// Now composed exactly: `(rdi - 3) * 5 = rdi + 4*rdi - 15`.
+    #[test]
+    fn self_scaled_leaq_consumer_is_composed_not_half_spliced() {
+        let out = run(
+            "    leaq -3(%rdi), %r10\n    leaq (%r10, %r10, 4), %r10\n    movq %r10, %rax\n    ret",
+        );
+        assert!(!out.contains("(%rdi, %r10"), "{out}");
+        assert!(out.contains("-15(%rdi, %rdi, 4)"), "{out}");
+        assert!(!out.contains("-3(%rdi)"), "{out}");
+    }
+
+    /// The 32-bit twin (`leal (%T,%T,s), %Td` — the i32 multiply shape):
+    /// exact modulo 2^32: `(rdi - 3) * 9 = rdi + 8*rdi - 27`.
+    #[test]
+    fn self_scaled_leal_consumer_is_composed_not_half_spliced() {
+        let out = run(
+            "    leaq -3(%rdi), %r10\n    leal (%r10, %r10, 8), %r10d\n    movl %r10d, %eax\n    ret",
+        );
+        assert!(!out.contains("(%rdi, %r10"), "{out}");
+        assert!(out.contains("leal -27(%rdi, %rdi, 8)"), "{out}");
+    }
+
+    /// `leal` producer into a `leal` consumer (the i32 `(i - 3) * 5` loop):
+    /// both read only the low 32 bits.
+    #[test]
+    fn leal_producer_composes_into_leal_consumer() {
+        let out = run(
+            "    leal -3(%r8), %ebx\n    leal (%rbx, %rbx, 4), %ebx\n    movl %ebx, %eax\n    ret",
+        );
+        assert!(out.contains("leal -15(%r8, %r8, 4)"), "{out}");
+        assert!(!out.contains("-3(%r8)"), "{out}");
+    }
+
+    /// Consumer displacement and a different destination (T dead after).
+    #[test]
+    fn self_scaled_consumer_displacement_adds_and_dest_may_differ() {
+        let out = run("    leaq 5(%rsi), %r11\n    leaq 2(%r11, %r11, 2), %rax\n    ret");
+        assert!(out.contains("leaq 17(%rsi, %rsi, 2), %rax"), "{out}");
+    }
+
+    #[test]
+    fn self_scaled_compose_declines_live_t_rsp_overflow_and_leal_producer() {
+        // T still read after a consumer writing another register.
+        let out = run(
+            "    leaq 5(%rsi), %r11\n    leaq (%r11, %r11, 2), %rax\n    addq %r11, %rax\n    ret",
+        );
+        assert!(!out.contains("(%rsi, %rsi, 2)"), "{out}");
+        // %rsp cannot be an index.
+        let out = run(
+            "    leaq 8(%rsp), %r11\n    leaq (%r11, %r11, 2), %r11\n    movq %r11, %rax\n    ret",
+        );
+        assert!(!out.contains("(%rsp, %rsp"), "{out}");
+        // 1e9 * 5 does not fit a disp32.
+        let out = run(
+            "    leaq 1000000000(%rdi), %r10\n    leaq (%r10, %r10, 4), %r10\n    movq %r10, %rax\n    ret",
+        );
+        assert!(!out.contains("(%rdi, %rdi, 4)"), "{out}");
+        // A leal producer zero-extends between the add and the multiply.
+        let out = run(
+            "    leal -3(%rdi), %r10d\n    leaq (%r10, %r10, 4), %r10\n    movq %r10, %rax\n    ret",
+        );
+        assert!(!out.contains("(%rdi, %rdi"), "{out}");
+    }
+
+    /// Control: a single-mention redefining consumer still composes.
+    #[test]
+    fn single_mention_redefining_consumer_still_composes() {
+        let out =
+            run("    leaq 8(%rdx), %rdx\n    movq (%rdx), %rdx\n    movq %rdx, %rax\n    ret");
+        assert!(out.contains("8(%rdx)"), "{out}");
+        assert!(!out.contains("leaq 8(%rdx), %rdx"), "{out}");
+    }
+
+    #[test]
+    fn source_mentions_count_every_width_and_skip_the_destination() {
+        assert_eq!(source_family_mentions("leaq (%r10, %r10, 4), %r10", 10), 2);
+        assert_eq!(source_family_mentions("leal (%r10, %r10, 4), %r10d", 10), 2);
+        assert_eq!(source_family_mentions("movq (%rdx), %rdx", 2), 1);
+        assert_eq!(source_family_mentions("movzbl %dh, %edx", 2), 1);
+        assert_eq!(source_family_mentions("movl %r10d, %eax", 10), 1);
+        assert_eq!(source_family_mentions("movl %r11d, %eax", 10), 0);
+    }
+
+    #[test]
+    fn compose_self_scaled_lea_identity() {
+        use super::compose_self_scaled_lea;
+        let c = |n: &str, t, b: &str, bf, d: &str| compose_self_scaled_lea(n, false, t, b, bf, d);
+        // leal producer: only into a leal consumer.
+        assert_eq!(
+            compose_self_scaled_lea("leal (%rbx, %rbx, 4), %ebx", true, 3, "%r8", 8, "-3")
+                .as_deref(),
+            Some("leal -15(%r8, %r8, 4), %ebx")
+        );
+        assert_eq!(
+            compose_self_scaled_lea("leaq (%rbx, %rbx, 4), %rbx", true, 3, "%r8", 8, "-3"),
+            None
+        );
+        assert_eq!(
+            c("leaq (%r10, %r10, 4), %r10", 10, "%rdi", 7, "-3").as_deref(),
+            Some("leaq -15(%rdi, %rdi, 4), %r10")
+        );
+        assert_eq!(
+            c("leaq (%r10, %r10, 1), %r10", 10, "%rdi", 7, "3").as_deref(),
+            Some("leaq 6(%rdi, %rdi, 1), %r10")
+        );
+        assert_eq!(
+            c("leaq 15(%r10, %r10, 4), %r10", 10, "%rdi", 7, "-3").as_deref(),
+            Some("leaq (%rdi, %rdi, 4), %r10")
+        );
+        assert_eq!(
+            c("leal (%r10d, %r10d, 4), %r10d", 10, "%rdi", 7, "-3"),
+            None
+        );
+        assert_eq!(c("leaq (%r10, %r9, 4), %r10", 10, "%rdi", 7, "-3"), None);
+        assert_eq!(c("leaq (%r10, %r10, 3), %r10", 10, "%rdi", 7, "-3"), None);
+        assert_eq!(c("leaq (%r10, %r10, 4), %r10", 10, "%edi", 7, "-3"), None);
+        assert_eq!(c("leaq (%r10, %r10, 4), %r10", 10, "%rsp", 4, "8"), None);
+        assert_eq!(
+            c("leaq (%r10, %r10, 8), %r10", 10, "%rdi", 7, "300000000"),
+            None
+        );
+        assert_eq!(c("movq (%r10, %r10, 4), %r10", 10, "%rdi", 7, "-3"), None);
+    }
+}
+
+#[cfg(test)]
+mod highbit_bsr_tests {
+    use super::*;
+
+    fn run(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        combined_local_pass(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn double_xor_after_bsr_cancels_at_both_widths() {
+        let out = run(concat!(
+            "    bsrl %edi, %esi\n",
+            "    xorl $31, %esi\n",
+            "    xorl $31, %esi\n",
+            "    movl %esi, %eax\n",
+            "    bsrq 8(%rsp), %rcx\n",
+            "    xorq $63, %rcx\n",
+            "    xorq $63, %rcx\n",
+            "    addq %rcx, %rax\n",
+            "    ret\n",
+        ));
+        assert_eq!(
+            out,
+            vec![
+                "bsrl %edi, %esi",
+                "movl %esi, %eax",
+                "bsrq 8(%rsp), %rcx",
+                "addq %rcx, %rax",
+                "ret"
+            ]
+        );
+    }
+
+    /// After `bsr` the upper bits are zero, so a consumer XOR widened to 64
+    /// bits (or narrowed to 32) still undoes the count's XOR exactly.
+    #[test]
+    fn mixed_width_double_xor_after_bsr_cancels() {
+        let out = run(concat!(
+            "    bsrl %edi, %esi\n",
+            "    xorl $31, %esi\n",
+            "    xorq $31, %rsi\n",
+            "    movl %esi, %eax\n",
+            "    bsrq %rdi, %rdx\n",
+            "    xorq $63, %rdx\n",
+            "    xorl $63, %edx\n",
+            "    addl %edx, %eax\n",
+            "    ret\n",
+        ));
+        assert_eq!(
+            out,
+            vec![
+                "bsrl %edi, %esi",
+                "movl %esi, %eax",
+                "bsrq %rdi, %rdx",
+                "addl %edx, %eax",
+                "ret"
+            ]
+        );
+    }
+
+    /// The emitter's real text (CCC_NO_PEEPHOLE) for `hb = 31 - clz(x | 1)`
+    /// with `hb` used later: `xor $31,%eax; mov %eax,%esi; xor $31,%esi`. Only the late
+    /// chain rename (phase 3d, after the local fixpoint) makes the XORs
+    /// adjacent, so the whole pipeline must still cancel them.
+    #[test]
+    fn pair_exposed_by_the_late_chain_rename_cancels() {
+        let asm = concat!(
+            ".text\n",
+            ".globl bucket\n",
+            ".p2align 4\n",
+            ".type bucket, @function\n",
+            "bucket:\n",
+            // FileLiveness delimits functions at the CFI directives; without
+            // them no register is provably dead and the rename refuses.
+            ".cfi_startproc\n",
+            "    # LCCC_RET_XMM 0\n",
+            "    # LCCC_RET_XMM_BITS 512\n",
+            "    # LCCC_RET_RDX 0\n",
+            "    # LCCC_RET_RAX 1\n",
+            "    movq %rdi, %rax\n",
+            "    orq $1, %rax\n",
+            "    bsrl %eax, %eax\n",
+            "    xorl $31, %eax\n",
+            "    movl %eax, %esi\n",
+            "    xorl $31, %esi\n",
+            "    movl %esi, %edx\n",
+            "    cmpl $20, %edx\n",
+            "jbe .LBB2\n",
+            ".LBB1:\n",
+            "    movl %edx, %r8d\n",
+            "    leal (%r8, %r8, 2), %r8d\n",
+            "    movl %r8d, %eax\n",
+            "    ret\n",
+            ".LBB2:\n",
+            "    testl %edx, %edx\n",
+            "jne .LBB4\n",
+            ".LBB3:\n",
+            "    movl $7, %eax\n",
+            "    ret\n",
+            ".LBB4:\n",
+            "    shll $8, %edi\n",
+            "    movl %esi, %ecx\n",
+            "    shrl %cl, %edi\n",
+            "    addl %edi, %edx\n",
+            "    movl %edx, %eax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+            ".size bucket, .-bucket\n",
+        );
+        let out = super::super::peephole_optimize(asm.to_string());
+        assert!(!out.contains("xorl $31"), "{out}");
+        assert!(out.contains("bsrl"), "{out}");
+    }
+
+    #[test]
+    fn double_xor_is_kept_when_it_is_not_the_exact_bsr_idiom() {
+        // Flags read after the pair: the XOR result's ZF/SF are observable.
+        let live = concat!(
+            "    bsrl %edi, %esi\n",
+            "    xorl $31, %esi\n",
+            "    xorl $31, %esi\n",
+            "    je .L1\n",
+            ".L1:\n",
+            "    ret\n",
+        );
+        assert_eq!(run(live).len(), 6);
+        // A different constant in the second XOR.
+        let other_k = concat!(
+            "    bsrl %edi, %esi\n",
+            "    xorl $31, %esi\n",
+            "    xorq $15, %rsi\n",
+            "    ret\n",
+        );
+        assert_eq!(run(other_k).len(), 4);
+        // Not preceded by bsr: a lone XOR pair may also be clearing bits 32..63.
+        let bare = concat!(
+            "    movq %rdi, %rsi\n",
+            "    xorl $31, %esi\n",
+            "    xorl $31, %esi\n",
+            "    ret\n",
+        );
+        assert_eq!(run(bare).len(), 4);
+        // A different register or constant in the second XOR.
+        let other = concat!(
+            "    bsrl %edi, %esi\n",
+            "    xorl $31, %esi\n",
+            "    xorl $31, %ecx\n",
+            "    ret\n",
+        );
+        assert_eq!(run(other).len(), 4);
     }
 }

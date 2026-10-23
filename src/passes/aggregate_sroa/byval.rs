@@ -218,6 +218,12 @@ fn classify(
                 if root != d_root {
                     continue;
                 }
+                // A pointer into D at a runtime offset names no field. The
+                // GEP that made it is refused above, but blocks are visited
+                // in layout order, so its uses can be seen first.
+                let Some(off) = off else {
+                    return Err("variable-offset GEP");
+                };
                 match inst {
                     Instruction::GetElementPtr { .. } => {}
                     Instruction::Load {
@@ -509,7 +515,7 @@ pub(super) fn run_function(
         }
         let (d_root, d_off) = resolve(&scan.gep, dest);
         let (s_root, s_off) = resolve(&scan.gep, src);
-        if d_off != 0 || s_off != 0 || d_root == s_root {
+        if d_off != Some(0) || s_off != Some(0) || d_root == s_root {
             continue;
         }
         if claimed.contains(&d_root) || claimed.contains(&s_root) {

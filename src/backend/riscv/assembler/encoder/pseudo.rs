@@ -226,11 +226,10 @@ pub(crate) fn encode_li_immediate(rd: u32, imm: i64) -> Vec<u32> {
 pub(crate) fn encode_mv(operands: &[Operand]) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
     let rs = get_reg(operands, 1)?;
-    // Use `add rd, x0, rs` instead of `addi rd, rs, 0` so the instruction
-    // is eligible for RV64C compression to C.MV (which requires the ADD form).
-    Ok(EncodeResult::Word(encode_r(
-        OP_OP, rd, 0b000, 0, rs, 0b0000000,
-    ))) // add rd, x0, rs
+    // The ISA's definition of MV and GAS 2.47's encoding: `addi rd, rs, 0`
+    // (00028513 for `mv a0, t0`). Compression is unaffected: GAS (and
+    // `compress.rs`) turn this form into C.MV exactly like `add rd, x0, rs`.
+    Ok(EncodeResult::Word(encode_i(OP_OP_IMM, rd, 0b000, rs, 0))) // addi rd, rs, 0
 }
 
 pub(crate) fn encode_not(operands: &[Operand]) -> Result<EncodeResult, String> {
@@ -479,9 +478,22 @@ pub(crate) fn encode_jr(operands: &[Operand]) -> Result<EncodeResult, String> {
     Ok(EncodeResult::Word(encode_i(OP_JALR, 0, 0, rs1, 0)))
 }
 
+/// `call foo@plt` / `tail foo@plt`: the legacy spelling GAS 2.47 still
+/// accepts (lowercase, no addend) and drops -- the relocation is
+/// R_RISCV_CALL_PLT against `foo` either way. Kept in the name, `@plt` would
+/// read as symbol `foo` with a symbol version called "plt".
+fn call_target(operands: &[Operand]) -> Result<(String, i64), String> {
+    let (symbol, addend) = get_symbol(operands, 0)?;
+    match symbol.strip_suffix("@plt") {
+        Some(base) if addend == 0 && !base.is_empty() => Ok((base.to_string(), 0)),
+        Some(_) => Err(format!("illegal operands `{symbol}`")),
+        None => Ok((symbol, addend)),
+    }
+}
+
 pub(crate) fn encode_call(operands: &[Operand]) -> Result<EncodeResult, String> {
     // call symbol -> auipc ra, %pcrel_hi(symbol) ; jalr ra, %pcrel_lo(symbol)(ra)
-    let (symbol, addend) = get_symbol(operands, 0)?;
+    let (symbol, addend) = call_target(operands)?;
     Ok(EncodeResult::WordsWithRelocs(vec![
         (
             encode_u(OP_AUIPC, 1, 0),
@@ -497,7 +509,7 @@ pub(crate) fn encode_call(operands: &[Operand]) -> Result<EncodeResult, String> 
 
 pub(crate) fn encode_tail(operands: &[Operand]) -> Result<EncodeResult, String> {
     // tail symbol -> auipc t1, %pcrel_hi(symbol) ; jalr x0, %pcrel_lo(symbol)(t1)
-    let (symbol, addend) = get_symbol(operands, 0)?;
+    let (symbol, addend) = call_target(operands)?;
     Ok(EncodeResult::WordsWithRelocs(vec![
         (
             encode_u(OP_AUIPC, 6, 0),
@@ -536,9 +548,60 @@ pub(crate) fn encode_jump(operands: &[Operand]) -> Result<EncodeResult, String> 
 }
 
 pub(crate) fn encode_la(operands: &[Operand]) -> Result<EncodeResult, String> {
-    // la rd, symbol -> auipc rd, %pcrel_hi(symbol) ; addi rd, rd, %pcrel_lo(symbol)
-    // TODO: For PIC, this should use GOT
-    encode_lla(operands) // for now, same as lla
+    // `la` outside `.option pic` is `lla` (GAS 2.47); under `.option pic` the
+    // ELF writer expands it as `lga` (see `encode_got_pseudo`).
+    encode_lla(operands)
+}
+
+/// The GOT-slot address pseudos, which need XLEN (`ld` vs `lw`) and so are
+/// expanded by the ELF writer rather than `encode_instruction`:
+///
+/// * `lga rd, sym` (and `la` under `.option pic`): `auipc rd, %got_pcrel_hi`
+///   + `l[dw] rd, %pcrel_lo(rd)` — the symbol's address from its GOT slot.
+/// * `la.tls.ie rd, sym`: the same with R_RISCV_TLS_GOT_HI20 — the TP offset.
+/// * `la.tls.gd rd, sym`: `auipc` R_RISCV_TLS_GD_HI20 + `addi` — the address
+///   of the GD GOT pair, `__tls_get_addr`'s argument.
+///
+/// The `%pcrel_lo` relocation is re-targeted at the `auipc`'s synthetic
+/// label by the writer, exactly as for `lla`. Byte-identical to GAS 2.47.
+pub(crate) fn encode_got_pseudo(
+    mnemonic: &str,
+    operands: &[Operand],
+    xlen64: bool,
+) -> Result<EncodeResult, String> {
+    let rd = get_reg(operands, 0)?;
+    let (symbol, addend) = get_symbol(operands, 1)?;
+    let (hi, second) = match mnemonic {
+        "lga" | "la" | "la.tls.ie" => {
+            let hi = if mnemonic == "la.tls.ie" {
+                RelocType::TlsGotHi20
+            } else {
+                RelocType::GotHi20
+            };
+            let funct3 = if xlen64 { 0b011 } else { 0b010 }; // ld / lw
+            (hi, encode_i(OP_LOAD, rd, funct3, rd, 0))
+        }
+        "la.tls.gd" => (RelocType::TlsGdHi20, encode_i(OP_OP_IMM, rd, 0, rd, 0)),
+        _ => return Err(format!("not a GOT pseudo: {mnemonic}")),
+    };
+    Ok(EncodeResult::WordsWithRelocs(vec![
+        (
+            encode_u(OP_AUIPC, rd, 0),
+            Some(Relocation {
+                reloc_type: hi,
+                symbol: symbol.clone(),
+                addend,
+            }),
+        ),
+        (
+            second,
+            Some(Relocation {
+                reloc_type: RelocType::PcrelLo12I,
+                symbol,
+                addend,
+            }),
+        ),
+    ]))
 }
 
 pub(crate) fn encode_lla(operands: &[Operand]) -> Result<EncodeResult, String> {
@@ -689,6 +752,34 @@ pub(crate) fn extract_modifier_symbol(s: &str) -> String {
         }
     }
     s.to_string()
+}
+
+/// The low-12 relocation an I-type instruction (load, `addi`, `jalr`) carries
+/// for a parsed modifier (`%lo`, `%pcrel_lo`, `%tprel_lo`, or a hi form).
+pub(crate) fn lo12_itype(r: RelocType) -> RelocType {
+    match r {
+        RelocType::PcrelHi20 => RelocType::PcrelLo12I,
+        RelocType::Hi20 => RelocType::Lo12I,
+        RelocType::TprelHi20 => RelocType::TprelLo12I,
+        other => other,
+    }
+}
+
+/// The S-type twin of [`lo12_itype`], for stores. A store splits its
+/// immediate (imm[11:5] in bits 31:25, imm[4:0] in bits 11:7); an I-type
+/// fixup writes bits 31:20 instead, i.e. it overwrites the store's `rs2`
+/// field with address bits once the symbol's low 12 bits are non-zero.
+/// `parse_reloc_modifier` yields the I-type kinds for the `_lo` modifiers,
+/// so they must be remapped here (GAS 2.47: `sw a1, %lo(g)(a0)` is
+/// R_RISCV_LO12_S, `%tprel_lo` R_RISCV_TPREL_LO12_S, `%pcrel_lo`
+/// R_RISCV_PCREL_LO12_S).
+pub(crate) fn lo12_stype(r: RelocType) -> RelocType {
+    match r {
+        RelocType::PcrelHi20 | RelocType::PcrelLo12I => RelocType::PcrelLo12S,
+        RelocType::Hi20 | RelocType::Lo12I => RelocType::Lo12S,
+        RelocType::TprelHi20 | RelocType::TprelLo12I => RelocType::TprelLo12S,
+        other => other,
+    }
 }
 
 /// Parse a relocation modifier like %pcrel_hi(symbol) and return (RelocType, symbol)

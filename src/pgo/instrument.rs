@@ -624,7 +624,6 @@ pub fn instrument_module(
             is_const: false,
             is_used: true,
             is_thread_local: false,
-            tls_model: None,
         });
 
         // ── Insert increments ────────────────────────────────────────────
@@ -788,7 +787,6 @@ pub fn instrument_module(
                             is_const: false,
                             is_used: true,
                             is_thread_local: false,
-                            tls_model: None,
                         };
                         if !m.globals.iter().any(|x| x.name == g.name) {
                             m.globals.push(g);
@@ -855,7 +853,9 @@ pub fn instrument_module(
         return 0;
     }
     let path = resolve_output_path(dir, unit);
-    let helper = format!("__lccc_pgo_dump_{:016x}_{}", uid, std::process::id());
+    // Internal linkage (registered in this unit's `.fini_array`), so the
+    // unit hash alone names it; no per-compile suffix (reproducible output).
+    let helper = format!("__lccc_pgo_dump_{:016x}", uid);
     if std::env::var("LCCC_PGO_NO_DUMP").is_err() {
         emit_value_prof_helpers(m, uid, &vp_recorder);
         let lookup_name = format!("__lccc_pgo_lookup_{:016x}", uid);
@@ -1623,6 +1623,7 @@ fn dump_helper(
         is_inline: false,
         is_always_inline: false,
         is_noinline: true,
+        target_features: Vec::new(),
         next_value_id: next,
         fp_expr_tags: Default::default(),
         next_label: 910100,
@@ -1669,6 +1670,7 @@ fn dump_helper(
                 is_inline: false,
                 is_always_inline: false,
                 is_noinline: false,
+                target_features: Vec::new(),
                 next_value_id: 0,
                 fp_expr_tags: Default::default(),
                 next_label: 0,
@@ -1714,6 +1716,7 @@ fn ci(d: Option<Value>, a: Vec<Operand>, t: Vec<IrType>, r: IrType, var: bool) -
         assume_library: false,
         ret_eightbyte_classes: vec![],
         ret_is_f128_sse: false,
+        cold: false,
     }
 }
 fn sanitize(s: &str) -> String {
@@ -1956,6 +1959,7 @@ fn push_helper_fn(
         is_inline: false,
         is_always_inline: false,
         is_noinline: true,
+        target_features: Vec::new(),
         // `push_helper_fn` appends alloca/load parameter plumbing after the
         // caller-built body.  Those ids are real definitions too; publishing
         // the pre-plumbing cursor as the cache lets a later allocator collide
@@ -2123,7 +2127,6 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             is_const: true,
             is_used: true,
             is_thread_local: false,
-            tls_model: None,
         });
     }
 
@@ -2154,7 +2157,6 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             is_const: false,
             is_used: true,
             is_thread_local: false,
-            tls_model: None,
         });
     }
     // Pool node.
@@ -2174,7 +2176,6 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
         is_const: false,
         is_used: true,
         is_thread_local: false,
-        tls_model: None,
     });
     // addr2name table: {addr, name} pairs for every defined function.
     let mut elems: Vec<GlobalInit> = Vec::new();
@@ -2211,7 +2212,6 @@ fn emit_value_prof_helpers(m: &mut IrModule, uid: u64, vp_recorder: &str) {
             is_const: true,
             is_used: true,
             is_thread_local: false,
-            tls_model: None,
         });
     }
 

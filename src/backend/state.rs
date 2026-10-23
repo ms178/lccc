@@ -330,20 +330,21 @@ pub struct CodegenState {
     /// data directives into the peephole/assembler stream and corrupted
     /// instruction/label mapping at -O1 (see 20000822-1).
     pub trampoline_data_blocks: Vec<String>,
-    /// Counter for generating unique labels (e.g., memcpy loops).
     /// Whether any position-independent code generation is enabled. Backends
     /// that do not distinguish PIE from full PIC retain this conservative bit.
     pub pic_mode: bool,
     /// Position-independent executable mode. x86-64 may address ordinary
     /// executable data directly; full PIC and weak extern data still use GOT.
     pub pie_mode: bool,
-    /// Shared-object output (`-shared`). Gates the Local-Exec TLS direct
-    /// form: legal in executables (PIE included), rejected by the linker for
-    /// `ET_DYN` shared objects.
+    /// Shared-object output (`-shared`).
     pub shared_lib: bool,
-    /// Explicit compilation-wide ELF TLS policy. `None` selects LE/IE for an
-    /// executable and LD/GD for full PIC according to symbol preemptibility.
-    pub tls_model: Option<crate::ir::reexports::TlsModel>,
+    /// Compilation-wide TLS model inputs: shared-library code (`-fPIC`/
+    /// `-fpic`/`-shared`) and the `-ftls-model=` floor.
+    pub tls_policy: crate::common::tls::TlsPolicy,
+    /// Final access model of every TLS symbol of the module
+    /// (`common::tls::model_table`, filled by `collect_symbol_sets`). Its key
+    /// set equals `tls_symbols`. Query through [`CodegenState::tls_model`].
+    pub tls_models: FxHashMap<String, crate::common::tls::TlsModel>,
     /// Set of symbol names that are locally defined (not extern) and have internal
     /// linkage (static) — these can use direct addressing even in PIC mode.
     pub local_symbols: FxHashSet<String>,
@@ -365,13 +366,6 @@ pub struct CodegenState {
     /// Set of symbol names that are thread-local (_Thread_local / __thread).
     /// These require TLS-specific access patterns (e.g., %fs:x@TPOFF on x86-64).
     pub tls_symbols: FxHashSet<String>,
-    /// TLS objects defined by this translation unit. In an executable these
-    /// are non-preemptible and qualify for Local-Exec even when their source
-    /// linkage is external; a shared object still consults `local_symbols`.
-    pub tls_definitions: FxHashSet<String>,
-    /// Per-symbol source `tls_model` attributes. These take precedence over
-    /// the compilation-wide driver policy.
-    pub tls_models: FxHashMap<String, crate::ir::reexports::TlsModel>,
     /// Whether the current function contains DynAlloca instructions.
     /// When true, the epilogue must restore SP from the frame pointer instead of
     /// adding back the compile-time frame size.
@@ -409,6 +403,11 @@ pub struct CodegenState {
     /// must NOT skip these: they carry a register home that
     /// `emit_global_addr` materializes once and the SIB consumers read.
     pub promoted_global_addr_homes: FxHashSet<u32>,
+    /// TLS `GlobalAddr` roots the generic emitter OMITTED for the current
+    /// function (value id -> symbol): every use is a load the backend's
+    /// direct-load hook must fold, since nothing materializes the address.
+    /// Backends whose hook only pays off for omitted roots consult this.
+    pub omitted_tls_roots: FxHashMap<u32, String>,
     /// Name of the function currently being code-generated (diagnostics).
     pub current_func_name: String,
     /// Total use count for each value ID across the entire function.
@@ -673,35 +672,6 @@ pub struct CodegenState {
 }
 
 impl CodegenState {
-    /// Resolve the effective ELF TLS model for one symbol.
-    ///
-    /// Declaration attributes outrank the command-line policy. Without either,
-    /// executable code takes the zero-resolver LE/IE paths while full PIC uses
-    /// LD/GD according to whether the symbol is non-preemptible. Keeping this
-    /// policy here prevents prologue analysis and individual backends from
-    /// disagreeing about whether an access contains a descriptor call.
-    pub(crate) fn tls_model_for_symbol(&self, name: &str) -> crate::ir::reexports::TlsModel {
-        use crate::ir::reexports::TlsModel;
-
-        self.tls_models
-            .get(name)
-            .copied()
-            .or(self.tls_model)
-            .unwrap_or_else(|| {
-                if (self.pic_mode && !self.pie_mode) || self.shared_lib {
-                    if self.local_symbols.contains(name) {
-                        TlsModel::LocalDynamic
-                    } else {
-                        TlsModel::GlobalDynamic
-                    }
-                } else if self.local_symbols.contains(name) || self.tls_definitions.contains(name) {
-                    TlsModel::LocalExec
-                } else {
-                    TlsModel::InitialExec
-                }
-            })
-    }
-
     /// Record what the callee of the call just emitted pops on return; see
     /// `callee_pops_direct`. `direct` is the callee symbol, `None` for an
     /// indirect call. Every call is recorded, pop or not: a direct callee's
@@ -775,15 +745,14 @@ impl CodegenState {
             trampoline_data_blocks: Vec::new(),
             pic_mode: false,
             shared_lib: false,
-            tls_model: None,
+            tls_policy: crate::common::tls::TlsPolicy::default(),
+            tls_models: FxHashMap::default(),
             pie_mode: false,
             local_symbols: FxHashSet::default(),
             extern_function_symbols: FxHashSet::default(),
             cmp_replay: FxHashMap::default(),
             absolute_symbols: FxHashSet::default(),
             tls_symbols: FxHashSet::default(),
-            tls_definitions: FxHashSet::default(),
-            tls_models: FxHashMap::default(),
             has_dyn_alloca: false,
             omit_frame_pointer: false,
             fpo_requested: true, // -fomit-frame-pointer is the default at -O1+
@@ -793,6 +762,7 @@ impl CodegenState {
             folded_gep_values: FxHashSet::default(),
             never_materialized_values: FxHashSet::default(),
             promoted_global_addr_homes: FxHashSet::default(),
+            omitted_tls_roots: FxHashMap::default(),
             current_func_name: String::new(),
             value_use_counts: Vec::new(),
             switch_unsigned_bounds: FxHashMap::default(),
@@ -1066,6 +1036,7 @@ impl CodegenState {
         self.wide_values.clear();
         self.never_materialized_values.clear();
         self.promoted_global_addr_homes.clear();
+        self.omitted_tls_roots.clear();
         self.switch_unsigned_bounds.clear();
         self.has_dyn_alloca = false;
         self.omit_frame_pointer = false;
@@ -1310,6 +1281,30 @@ impl CodegenState {
         if let Some(entry) = self.f128_load_sources.get(&src_id).copied() {
             self.f128_load_sources.insert(dest_id, entry);
         }
+    }
+
+    /// The access model of the TLS symbol `name`. The table covers every TLS
+    /// symbol of the module, so a miss is a codegen bug; release builds then
+    /// fall back to Global-Dynamic, the one model that is correct for any TLS
+    /// symbol in any kind of output.
+    pub fn tls_model(&self, name: &str) -> crate::common::tls::TlsModel {
+        match self.tls_models.get(name) {
+            Some(model) => *model,
+            None => {
+                debug_assert!(false, "TLS symbol `{name}` has no model");
+                crate::common::tls::TlsModel::GlobalDynamic
+            }
+        }
+    }
+
+    /// Set the compilation-wide TLS inputs from the codegen options (shared by
+    /// every backend's `apply_options`).
+    pub fn apply_tls_options(&mut self, opts: &crate::backend::CodegenOptions) {
+        self.shared_lib = opts.shared_lib;
+        self.tls_policy = crate::common::tls::TlsPolicy {
+            shlib: opts.pic,
+            floor: opts.tls_model_floor,
+        };
     }
 
     /// Returns true if the given symbol needs GOT indirection in PIC mode.

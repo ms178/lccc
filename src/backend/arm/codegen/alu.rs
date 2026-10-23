@@ -821,24 +821,10 @@ impl ArmCodegen {
                     }
                 }
                 IrBinOp::Bzhi => crate::ir::ops::bzhi_outside_x86_64(),
-                IrBinOp::BitTest => {
-                    // AArch64 has no BT. UBFX extracts a 1-bit field when the
-                    // index is an in-range immediate; variable and 64-bit cases
-                    // use the canonical shift/AND form. The IR recognizer only
-                    // creates I32 BitTest, so this path remains in w registers.
-                    if let Some(imm) = Self::const_as_imm12(rhs) {
-                        if (0..31).contains(&imm) {
-                            self.state
-                                .emit_fmt(format_args!("    ubfx w0, w1, #{imm}, #1"));
-                        } else {
-                            self.state.emit_fmt(format_args!("    lsr w0, w1, #{imm}"));
-                            self.state.emit("    and w0, w0, #1");
-                        }
-                    } else {
-                        self.state.emit("    lsr w0, w1, w2");
-                        self.state.emit("    and w0, w0, #1");
-                    }
+                IrBinOp::UMulHigh | IrBinOp::SMulHigh => {
+                    crate::ir::ops::mul_high_unsupported_here()
                 }
+                IrBinOp::BitTest => self.emit_bit_test(rhs, false),
             }
         } else {
             match op {
@@ -887,24 +873,32 @@ impl ArmCodegen {
                     }
                 }
                 IrBinOp::Bzhi => crate::ir::ops::bzhi_outside_x86_64(),
-                IrBinOp::BitTest => {
-                    if let Some(imm) = Self::const_as_imm12(rhs) {
-                        if (0..63).contains(&imm) {
-                            self.state
-                                .emit_fmt(format_args!("    ubfx x0, x1, #{imm}, #1"));
-                        } else {
-                            self.state.emit_fmt(format_args!("    lsr x0, x1, #{imm}"));
-                            self.state.emit("    and x0, x0, #1");
-                        }
-                    } else {
-                        self.state.emit("    lsr x0, x1, x2");
-                        self.state.emit("    and x0, x0, #1");
-                    }
-                }
+                IrBinOp::UMulHigh => self.state.emit("    umulh x0, x1, x2"),
+                IrBinOp::SMulHigh => self.state.emit("    smulh x0, x1, x2"),
+                IrBinOp::BitTest => self.emit_bit_test(rhs, true),
             }
         }
 
         self.store_x0_to(dest);
+    }
+
+    /// `BitTest(x1, rhs)` into x0/w0: bit `rhs mod W` of the base (the IR
+    /// semantics, `IrBinOp::BitTest`). AArch64 has no BT. An immediate index
+    /// is one `ubfx` for every value -- reduced modulo W first, because an
+    /// index of W or more (an undefined C shift that may sit in dead code)
+    /// must still assemble, and the reduction is exactly what the register
+    /// form does (LSRV takes its amount modulo the register size).
+    fn emit_bit_test(&mut self, rhs: &Operand, is_64: bool) {
+        let (r, width) = if is_64 { ('x', 64) } else { ('w', 32) };
+        if let Some(imm) = Self::const_as_imm12(rhs) {
+            let bit = imm & (width - 1);
+            self.state
+                .emit_fmt(format_args!("    ubfx {r}0, {r}1, #{bit}, #1"));
+        } else {
+            self.state
+                .emit_fmt(format_args!("    lsr {r}0, {r}1, {r}2"));
+            self.state.emit_fmt(format_args!("    and {r}0, {r}0, #1"));
+        }
     }
 
     /// Store x3 (the fused pair's second result) to a value's location.

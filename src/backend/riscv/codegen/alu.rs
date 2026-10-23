@@ -171,6 +171,11 @@ impl RiscvCodegen {
             (IrBinOp::LShr, true) => "srlw",
             (IrBinOp::BitTest, _) => unreachable!("BitTest handled above"),
             (IrBinOp::Bzhi, _) => crate::ir::ops::bzhi_outside_x86_64(),
+            (IrBinOp::UMulHigh, false) => "mulhu",
+            (IrBinOp::SMulHigh, false) => "mulh",
+            (IrBinOp::UMulHigh | IrBinOp::SMulHigh, true) => {
+                crate::ir::ops::mul_high_unsupported_here()
+            }
             (IrBinOp::RotateLeft, _) | (IrBinOp::RotateRight, _) => {
                 unreachable!("rotate handled above")
             }

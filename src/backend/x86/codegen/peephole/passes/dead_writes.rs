@@ -2568,17 +2568,40 @@ mod tests {
         assert!(out.contains("movl %eax, (%rsi,%rbx,4)"), "{out}");
     }
 
+    /// A register read only inside an address is a use: the dead-write pass
+    /// must keep the LEA that defines it. The pass is run on its own because
+    /// the full pipeline now folds this scaled-index temporary into the
+    /// load (`fold_scaled_index_temp_into_mem`), which removes the LEA for a
+    /// different, correct reason; that end-to-end result is pinned too.
     #[test]
     fn live_lea_is_kept() {
-        let out = run(concat!(
+        let asm = concat!(
             "foo:\n",
             ".cfi_startproc\n",
             "    leaq 0(,%rbx,4), %rdi\n",
             "    movl (%rsi,%rdi), %eax\n",
             "    ret\n",
             ".cfi_endproc\n",
-        ));
-        assert!(out.contains("leaq 0(,%rbx,4), %rdi"), "{out}");
+        );
+        let store = crate::backend::peephole_common::LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let lea = (0..store.len())
+            .find(|&i| store.get(i).contains("leaq 0(,%rbx,4), %rdi"))
+            .expect("fixture LEA");
+        eliminate_dead_pure_writes(&store, &mut infos);
+        assert!(
+            !infos[lea].is_nop(),
+            "the address-only read must keep its LEA"
+        );
+
+        let out = run(asm);
+        assert!(out.contains("movl (%rsi, %rbx, 4), %eax"), "{out}");
+        assert!(
+            !out.contains("%rdi"),
+            "no read of the folded temporary may remain: {out}"
+        );
     }
 
     #[test]

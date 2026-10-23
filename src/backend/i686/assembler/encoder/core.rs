@@ -45,10 +45,9 @@
 //! - `@PLT` stripping and `PC32 -> PLT32` promotion in `add_relocation`
 //!   are preserved; symbol-difference relocations keep the original symbol
 //!   spelling for the existing resolver.
-//! - TLS/GOT modifier *mapping* lives in
-//!   `InstructionEncoder::tls_reloc_type` (x87.rs); this file only
-//!   rejects modifier names the mapper does not know (GNU as rejects
-//!   unknown modifiers, the mapper silently degraded them to `R_386_32`).
+//! - TLS/GOT modifier *mapping* lives in `i686_modifier_reloc` below, the
+//!   one case-insensitive table every operand path consults; an unknown
+//!   modifier is an error (GNU as rejects it), never a silent `R_386_32`.
 //! - `emit_segment_prefix` keeps its diagnostic-less `()` signature (every
 //!   caller in this backend uses it as a statement). The parser only
 //!   accepts the six segment names, so an unknown segment here is a
@@ -268,28 +267,34 @@ pub(super) fn i686_default_segment(base: Option<&str>, index: Option<&str>) -> u
     if default_ss { 0x36 } else { 0x3E }
 }
 
-/// Modifier names understood by `InstructionEncoder::tls_reloc_type`.
+/// The relocation an i386 `sym@MOD` operand field asks for, or `None` when
+/// GNU as would reject the modifier there. The single source of truth for
+/// the address, ALU-immediate and `mov`-immediate paths.
 ///
-/// Keep in sync with the match in `x87.rs`. The mapper silently degrades
-/// unknown modifiers to `R_386_32`; GNU as rejects them, so this file
-/// checks membership before consulting the mapper.
-fn i686_known_tls_modifier(modifier: &str) -> bool {
-    matches!(
-        modifier,
-        "NTPOFF"
-            | "TPOFF"
-            | "TLSGD"
-            | "TLSLDM"
-            | "TLSDESC"
-            | "TLSCALL"
-            | "DTPOFF"
-            | "GOT"
-            | "GOTOFF"
-            | "PLT"
-            | "GOTPC"
-            | "GOTNTPOFF"
-            | "INDNTPOFF"
-    )
+/// Case-insensitive like GAS: GCC spells every operator in lower case
+/// (`x@gotntpoff(%ebx)`, `$x@ntpoff`, `x@tlsdesc(%ebx)`), lccc in upper
+/// case. Byte-probed against GAS 2.47 `--32`:
+/// `@indntpoff` is R_386_TLS_IE (the absolute GOT-slot address of the
+/// non-PIC initial-exec form), `@gotntpoff` R_386_TLS_GOTIE (the
+/// %ebx-relative slot), `@tlsdesc` R_386_TLS_GOTDESC. `@tlscall` owns no
+/// field and is legal only as `call *sym@tlscall(%reg)`, so it is not here
+/// (see `encode_call`).
+pub(super) fn i686_modifier_reloc(modifier: &str) -> Option<u32> {
+    Some(match modifier.to_ascii_uppercase().as_str() {
+        "NTPOFF" => R_386_TLS_LE,
+        "TPOFF" => R_386_TLS_LE_32,
+        "TLSGD" => R_386_TLS_GD,
+        "TLSLDM" => R_386_TLS_LDM,
+        "DTPOFF" => R_386_TLS_LDO_32,
+        "GOT" => R_386_GOT32,
+        "GOTOFF" => R_386_GOTOFF,
+        "PLT" => R_386_PLT32,
+        "GOTPC" => R_386_GOTPC,
+        "GOTNTPOFF" => R_386_TLS_GOTIE,
+        "INDNTPOFF" => R_386_TLS_IE,
+        "TLSDESC" => R_386_TLS_GOTDESC,
+        _ => return None,
+    })
 }
 
 // ===========================================================================
@@ -862,23 +867,40 @@ impl super::InstructionEncoder {
 
         let literal = i686_parse_address_literal(label)?;
 
-        let (displacement, mut relocation) = match literal {
-            Some(value) => (I686AddressValue::Constant(value), None),
-            None => {
-                let (symbol, addend) = split_label_offset(label.trim());
+        let (displacement, relocation) =
+            match literal {
+                Some(value) => (I686AddressValue::Constant(value), None),
+                None => {
+                    let (symbol, addend) = split_label_offset(label.trim());
+                    // A base-less `sym@MOD` reaches here as a bare label: the
+                    // non-PIC initial-exec load `movl x@indntpoff, %ecx` (GCC
+                    // and lccc both emit it; GAS: `8b 0d` / `a1` + R_386_TLS_IE).
+                    // Split a KNOWN trailing modifier so it selects the
+                    // relocation; it used to stay in the symbol name, an
+                    // R_386_32 against the undefined `x@indntpoff`. A symbol
+                    // version (`sym@VER`) is not a modifier and stays intact.
+                    let (symbol, modifier) = match symbol.rsplit_once('@') {
+                    Some((base, m))
+                        if !base.is_empty()
+                            && crate::backend::x86::assembler::parser::is_known_reloc_modifier(m) =>
+                    {
+                        (base, Some(m))
+                    }
+                    _ => (symbol, None),
+                };
 
-                (
-                    I686AddressValue::Relocatable,
-                    Some(I686PendingRelocation {
-                        symbol,
-                        reloc_type: R_386_32,
-                        addend,
-                        diff_symbol: None,
-                        modifier: None,
-                    }),
-                )
-            }
-        };
+                    (
+                        I686AddressValue::Relocatable,
+                        Some(I686PendingRelocation {
+                            symbol,
+                            reloc_type: R_386_32,
+                            addend,
+                            diff_symbol: None,
+                            modifier,
+                        }),
+                    )
+                }
+            };
 
         let plan = i686_plan_memory_address(
             self.code16,
@@ -889,12 +911,7 @@ impl super::InstructionEncoder {
             displacement,
         )?;
 
-        if let Some(relocation) = &mut relocation {
-            i686_validate_pending_relocation(relocation, plan.address16)?;
-        }
-
-        self.emit_i686_address_plan(&plan, relocation, reg_field.is_some());
-        Ok(())
+        self.i686_resolve_and_emit(&plan, relocation, reg_field.is_some())
     }
 
     /// Emit the address field for the accumulator moffs forms A0/A1/A2/A3.
@@ -1035,12 +1052,25 @@ impl super::InstructionEncoder {
             i686_validate_pending_relocation(relocation, plan.address16)?;
 
             if let Some(modifier) = relocation.modifier.take() {
-                // GNU as rejects unknown modifiers; the mapper in
-                // tls_reloc_type would silently degrade them to R_386_32.
-                if !i686_known_tls_modifier(modifier) {
-                    return Err(format!("unknown i686 relocation modifier: @{}", modifier));
+                // GNU as rejects unknown modifiers (tls_reloc_type errors).
+                relocation.reloc_type = self.tls_reloc_type(modifier)?;
+                // GAS (tc-i386.c md_apply_fix: "Fully resolved at runtime.
+                // No addend.") zeroes the addend of every relocation that
+                // names a per-symbol GOT entry or descriptor: an addend
+                // there would select the NEIGHBOURING slot, not an offset
+                // into the variable. Measured: `x@gotntpoff+4(%ebx)` and
+                // `x@indntpoff+4` assemble with a zero field, while the
+                // local-exec `%gs:x@ntpoff+4` keeps its 4.
+                if matches!(
+                    relocation.reloc_type,
+                    R_386_TLS_GD
+                        | R_386_TLS_LDM
+                        | R_386_TLS_IE
+                        | R_386_TLS_GOTIE
+                        | R_386_TLS_GOTDESC
+                ) {
+                    relocation.addend = 0;
                 }
-                relocation.reloc_type = self.tls_reloc_type(modifier);
             }
         }
 
@@ -1929,22 +1959,28 @@ mod i686_encoding_helper_tests {
 
     #[test]
     fn known_tls_modifiers_reach_the_existing_mapper() {
+        // `@tlscall` owns no field (only `call *x@tlscall(%reg)`, see
+        // `encode_call`), so the field mapper rejects it like GNU as does.
+        assert_eq!(i686_modifier_reloc("TLSCALL"), None);
         for (modifier, expected) in [
             ("NTPOFF", R_386_TLS_LE),
             ("TPOFF", R_386_TLS_LE_32),
             ("TLSGD", R_386_TLS_GD),
             ("TLSLDM", R_386_TLS_LDM),
-            ("TLSDESC", R_386_TLS_GOTDESC),
-            ("TLSCALL", R_386_TLS_DESC_CALL),
             ("DTPOFF", R_386_TLS_LDO_32),
             ("GOT", R_386_GOT32),
             ("GOTOFF", R_386_GOTOFF),
             ("PLT", R_386_PLT32),
             ("GOTPC", R_386_GOTPC),
             ("GOTNTPOFF", R_386_TLS_GOTIE),
-            ("INDNTPOFF", R_386_TLS_GOTIE),
+            ("gotntpoff", R_386_TLS_GOTIE),
+            ("INDNTPOFF", R_386_TLS_IE),
+            ("indntpoff", R_386_TLS_IE),
+            ("ntpoff", R_386_TLS_LE),
+            ("TLSDESC", R_386_TLS_GOTDESC),
+            ("tlsdesc", R_386_TLS_GOTDESC),
         ] {
-            assert!(i686_known_tls_modifier(modifier));
+            assert_eq!(i686_modifier_reloc(modifier), Some(expected));
 
             let mut encoder = InstructionEncoder::new();
             encoder.bytes.push(0x8B);

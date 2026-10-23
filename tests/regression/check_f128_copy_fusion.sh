@@ -7,4 +7,4 @@ src=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/f128_param_home_order.c
 "$CCC" -O2 -S "$src" -o "$t/t.s"
 body=$(sed -n '/^wr:/,/^\.size wr/p' "$t/t.s")
 grep -q 'movdqu' <<<"$body"
-! grep -q 'fstpl' <<<"$body"
+! grep -q 'fstpl' <<<"$body" || { echo "FAIL: negative assertion at ${BASH_SOURCE[0]##*/}:$LINENO" >&2; exit 1; }

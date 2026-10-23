@@ -166,7 +166,13 @@ impl I686Codegen {
             self.state.reg_cache.invalidate_sec();
             return;
         }
+        self.emit_scalar_store_to_mem(val, sym, ty);
+    }
 
+    /// Store a non-pair scalar to the memory operand text `sym` (an absolute
+    /// symbol, or a `%gs:` TLS operand): an immediate, the value's own
+    /// register, or `%eax` staging when the value has no encodable register.
+    fn emit_scalar_store_to_mem(&mut self, val: &Operand, sym: &str, ty: IrType) {
         // Integer constants can be stored without a scratch register.
         // Truncate to the actual store width and print a signed immediate;
         // this preserves the low bits without relying on assembler
@@ -231,22 +237,107 @@ impl I686Codegen {
         }
     }
 
-    /// Emit the existing ELF i386 TLS addressing sequences:
-    /// initial-exec in PIC mode, local-exec otherwise.
+    /// Emit the ELF i386 TLS address of `name` for its selected model
+    /// (`common::tls`, the same table every backend uses):
     ///
-    /// Selecting these models is an upstream responsibility. PIC alone
-    /// does not prove that initial-exec is suitable for every shared
-    /// object. `%ebx` cannot be the destination in a GOT-live function
-    /// (the allocator reserves it), so writing the destination register
-    /// directly is safe in every mode.
+    /// * local-exec: `%gs:0 + x@ntpoff`, a link-time constant (also in PIE);
+    /// * initial-exec: the GOT slot holding the TP offset, `x@gotntpoff(%ebx)`
+    ///   when the code is position-independent, absolute `x@indntpoff`
+    ///   (`R_386_TLS_IE`) otherwise, exactly like GCC;
+    /// * global-/local-dynamic: the GNU2 descriptor sequence
+    ///   `leal x@tlsdesc(%ebx),%eax; call *x@tlscall(%eax)`, which returns
+    ///   the TP offset in %eax and preserves every other register, so the
+    ///   allocator's %ecx/%edx homes survive it. The linker relaxes it to IE
+    ///   or LE when the symbol ends up static. Dynamic models are only chosen
+    ///   for shared-object code, where `pic_mode` holds and `function_needs_got`
+    ///   keeps the GOT base in %ebx.
+    ///
+    /// `%ebx` cannot be the destination in a GOT-live function (the allocator
+    /// reserves it), so writing the destination register directly is safe.
+    /// Direct `%gs:` store to an omitted Local-Exec TLS root:
+    /// `movX $imm|%r, %gs:x@NTPOFF` (GCC 16.2 `-m32`). Always succeeds for an
+    /// omitted LE root of a `tls_direct_store_type_ok` type: the shared
+    /// omission analysis admits exactly those stores.
+    pub(super) fn try_emit_tls_direct_store_impl(
+        &mut self,
+        val: &Operand,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+    ) -> bool {
+        if offset != 0 || !self.tls_direct_store_type_ok(ty) {
+            return false;
+        }
+        let Some(name) = self.state.omitted_tls_roots.get(&base.0).cloned() else {
+            return false;
+        };
+        if self.state.tls_model(&name) != TlsModel::LocalExec {
+            return false;
+        }
+        self.emit_scalar_store_to_mem(val, &format!("%gs:{}@NTPOFF", name), ty);
+        true
+    }
+
+    /// Direct `%gs:` load of an omitted TLS root (GCC 16.2 `-m32` forms):
+    ///   LE:          `movl %gs:x@NTPOFF, %r`
+    ///   IE non-PIC:  `movl x@INDNTPOFF, %r;      movl %gs:(%r), %r`
+    ///   IE PIC:      `movl x@GOTNTPOFF(%ebx), %r; movl %gs:(%r), %r`
+    /// with `%r` the destination's register (or `%eax` + spill). Only roots
+    /// the generic emitter omitted qualify: for a materialized root the
+    /// plain `movl (%root), %r` is already one instruction, and the IE form
+    /// would re-load the GOT slot. Dynamic models keep the descriptor root.
+    pub(super) fn try_emit_tls_direct_load_impl(
+        &mut self,
+        dest: &Value,
+        base: &Value,
+        offset: i64,
+        ty: IrType,
+    ) -> bool {
+        if offset != 0 || !self.tls_direct_load_type_ok(ty) {
+            return false;
+        }
+        let Some(name) = self.state.omitted_tls_roots.get(&base.0).cloned() else {
+            return false;
+        };
+        let model = self.state.tls_model(&name);
+        if !matches!(model, TlsModel::LocalExec | TlsModel::InitialExec) {
+            return false;
+        }
+        let load = self.mov_load_for_type(ty);
+        let (reg, needs_store) = match self.dest_reg(dest) {
+            Some(phys) => (super::emit::phys_reg_name(phys), false),
+            None => ("eax", true),
+        };
+        if model == TlsModel::LocalExec {
+            emit!(self.state, "    {} %gs:{}@NTPOFF, %{}", load, name, reg);
+        } else {
+            if self.state.pic_mode {
+                emit!(self.state, "    movl {}@GOTNTPOFF(%ebx), %{}", name, reg);
+            } else {
+                emit!(self.state, "    movl {}@INDNTPOFF, %{}", name, reg);
+            }
+            emit!(self.state, "    {} %gs:(%{}), %{}", load, reg, reg);
+        }
+        if needs_store {
+            self.state.reg_cache.invalidate_acc();
+            self.store_eax_to(dest);
+        } else {
+            match reg {
+                "eax" => self.state.park_acc(dest.0, false),
+                "edx" => self.state.reg_cache.set_sec(dest.0, false),
+                _ => {}
+            }
+        }
+        true
+    }
+
     pub(super) fn emit_tls_global_addr_impl(&mut self, dest: &Value, name: &str) {
         let (reg, needs_store) = match self.dest_reg(dest) {
             Some(phys) => (super::emit::phys_reg_name(phys), false),
             None => ("eax", true),
         };
 
-        let model = self.state.tls_model_for_symbol(name);
-        match model {
+        match self.state.tls_model(name) {
             TlsModel::LocalExec => {
                 emit!(self.state, "    movl %gs:0, %{}", reg);
                 emit!(self.state, "    addl ${}@NTPOFF, %{}", name, reg);

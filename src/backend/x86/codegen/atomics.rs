@@ -4,7 +4,7 @@
 //! register operands only overwrite AL/AX/EAX, so results must be canonicalized
 //! before they are stored as the backend's 64-bit SSA representation.
 
-use super::emit::X86Codegen;
+use super::emit::{X86Codegen, is_gpr_reg, phys_reg_name};
 use crate::common::types::IrType;
 use crate::ir::reexports::{AtomicOrdering, AtomicRmwOp, Operand, Value};
 
@@ -70,11 +70,11 @@ impl X86Codegen {
         ty: IrType,
         _ordering: AtomicOrdering,
     ) {
-        self.operand_to_rax(ptr);
+        let addr = self.atomic_address_reg(ptr, "rax");
         self.prepare_atomic_side_effect();
         let suffix = Self::type_suffix(ty);
         self.state
-            .emit_fmt(format_args!("    lock inc{} {}(%rax)", suffix, offset));
+            .emit_fmt(format_args!("    lock inc{suffix} {offset}(%{addr})"));
     }
 
     pub(super) fn emit_atomic_rmw_impl(
@@ -98,18 +98,64 @@ impl X86Codegen {
             self.store_rax_rdx_to(dest);
             return;
         }
-        self.operand_to_rax(ptr);
-        self.state.emit("    movq %rax, %rcx");
+        let addr = self.atomic_address_reg(ptr, "rcx");
 
         // TestAndSet carries a dummy IR operand. Avoid materializing a value
         // that is unconditionally replaced by one.
         if matches!(op, AtomicRmwOp::TestAndSet) {
             self.prepare_atomic_side_effect();
             self.state.emit("    movb $1, %al");
-            self.state.emit("    xchgb %al, (%rcx)");
+            self.state
+                .emit_fmt(format_args!("    xchgb %al, (%{addr})"));
             // The builtin tests the old byte for zero, irrespective of whether
             // plain `char` is signed on the source target.
             self.state.emit("    movzbl %al, %eax");
+            self.store_rax_to(dest);
+            return;
+        }
+
+        let bitwise = match op {
+            AtomicRmwOp::And => Some("and"),
+            AtomicRmwOp::Or => Some("or"),
+            AtomicRmwOp::Xor => Some("xor"),
+            AtomicRmwOp::Nand => Some("nand"),
+            _ => None,
+        };
+        if let Some(bop) = bitwise {
+            // The CMPXCHG loop owns %rax (old value), %rcx (address) and %rdx
+            // (candidate).  The operand is read IN the loop from where it
+            // already lives -- an immediate or its register home -- so the
+            // instruction clobbers nothing beyond the %rdx the fixed-scratch
+            // model declares (`regalloc::x86_inst_fixed_scratch`); parking it
+            // in %rdi used to evict every parameter of the function from its
+            // ABI register (`and8(p, v)`: push %rbx, frame, three relays).
+            // Anything else (a spilled value, a 64-bit constant beyond imm32,
+            // a home among the loop's own registers) is staged on the stack.
+            let (src, staged) = match self.atomic_loop_operand(val, ty) {
+                Some(src) => {
+                    self.prepare_atomic_side_effect();
+                    (src, false)
+                }
+                None => {
+                    self.operand_to_rax(val);
+                    self.prepare_atomic_side_effect();
+                    self.state.emit("    pushq %rax");
+                    if self.state.out.use_rsp_addressing {
+                        self.state.out.rsp_frame_size += 8;
+                    }
+                    ("(%rsp)".to_string(), true)
+                }
+            };
+            self.emit_x86_atomic_op_loop(ty, bop, &src, addr);
+            if staged {
+                // %rdx is the loop's own scratch: popping into it frees the
+                // slot without touching a register the allocator owns.
+                self.state.emit("    popq %rdx");
+                if self.state.out.use_rsp_addressing {
+                    self.state.out.rsp_frame_size -= 8;
+                }
+            }
+            self.canonicalize_atomic_rax_result(ty);
             self.store_rax_to(dest);
             return;
         }
@@ -127,27 +173,60 @@ impl X86Codegen {
                     self.state.emit("    negq %rax");
                 }
                 self.state
-                    .emit_fmt(format_args!("    lock xadd{} %{}, (%rcx)", suffix, val_reg));
+                    .emit_fmt(format_args!("    lock xadd{suffix} %{val_reg}, (%{addr})"));
                 self.canonicalize_atomic_rax_result(ty);
             }
             AtomicRmwOp::Xchg => {
                 self.state
-                    .emit_fmt(format_args!("    xchg{} %{}, (%rcx)", suffix, val_reg));
+                    .emit_fmt(format_args!("    xchg{suffix} %{val_reg}, (%{addr})"));
                 self.canonicalize_atomic_rax_result(ty);
             }
-            AtomicRmwOp::And => self.emit_x86_atomic_op_loop(ty, "and"),
-            AtomicRmwOp::Or => self.emit_x86_atomic_op_loop(ty, "or"),
-            AtomicRmwOp::Xor => self.emit_x86_atomic_op_loop(ty, "xor"),
-            AtomicRmwOp::Nand => self.emit_x86_atomic_op_loop(ty, "nand"),
-            AtomicRmwOp::TestAndSet => unreachable!(),
-        }
-        if matches!(
-            op,
-            AtomicRmwOp::And | AtomicRmwOp::Or | AtomicRmwOp::Xor | AtomicRmwOp::Nand
-        ) {
-            self.canonicalize_atomic_rax_result(ty);
+            AtomicRmwOp::And
+            | AtomicRmwOp::Or
+            | AtomicRmwOp::Xor
+            | AtomicRmwOp::Nand
+            | AtomicRmwOp::TestAndSet => unreachable!("handled above"),
         }
         self.store_rax_to(dest);
+    }
+
+    /// The register that addresses an atomic's memory operand: the pointer's
+    /// fresh GPR home when no atomic sequence writes it (every home except
+    /// %rdx -- %rax and %rcx are never homes), else `staging` after loading
+    /// it there.  Saves the `movq %home, %rax; movq %rax, %rcx` relay.
+    fn atomic_address_reg(&mut self, ptr: &Operand, staging: &'static str) -> &'static str {
+        if let Some(reg) = self.operand_reg(ptr).filter(|&r| is_gpr_reg(r)) {
+            let name = phys_reg_name(reg);
+            if !matches!(name, "rax" | "rcx" | "rdx") {
+                return name;
+            }
+        }
+        self.operand_to_rax(ptr);
+        if staging != "rax" {
+            self.state
+                .emit_fmt(format_args!("    movq %rax, %{staging}"));
+        }
+        staging
+    }
+
+    /// The CMPXCHG-loop operand as an ALU source that the loop's own
+    /// registers (%rax, %rcx, %rdx) cannot disturb: an imm32 (the loop
+    /// computes in 64-bit registers and only the low `ty` bits reach memory,
+    /// so a constant's low 32 bits suffice at widths up to 32), or the
+    /// value's fresh GPR home outside those three.  `None` means stage it.
+    fn atomic_loop_operand(&self, val: &Operand, ty: IrType) -> Option<String> {
+        let narrow = matches!(
+            ty,
+            IrType::I8 | IrType::U8 | IrType::I16 | IrType::U16 | IrType::I32 | IrType::U32
+        );
+        if let Some(imm) = Self::const_as_imm32_typed(val, narrow) {
+            // `andq $imm32` sign-extends; at <= 32 bits only the low 32 bits
+            // matter, so re-spell [2^31, 2^32) as its negative twin.
+            return Some(format!("${}", imm as u32 as i32));
+        }
+        let reg = self.operand_reg(val).filter(|&r| is_gpr_reg(r))?;
+        let name = phys_reg_name(reg);
+        (!matches!(name, "rax" | "rcx" | "rdx")).then(|| format!("%{name}"))
     }
 
     pub(super) fn emit_atomic_cmpxchg_impl(
@@ -178,18 +257,15 @@ impl X86Codegen {
             );
             return;
         }
-        self.operand_to_rax(ptr);
-        self.state.emit("    movq %rax, %rcx");
-        self.operand_to_rax(desired);
-        self.state.emit("    movq %rax, %rdx");
+        let addr = self.atomic_address_reg(ptr, "rcx");
+        self.operand_to_reg(desired, "rdx");
         self.operand_to_rax(expected);
         self.prepare_atomic_side_effect();
 
         let suffix = Self::type_suffix(ty);
         let desired_reg = Self::reg_for_type("rdx", ty);
         self.state.emit_fmt(format_args!(
-            "    lock cmpxchg{} %{}, (%rcx)",
-            suffix, desired_reg
+            "    lock cmpxchg{suffix} %{desired_reg}, (%{addr})"
         ));
         if returns_bool {
             // Consume CMPXCHG's ZF before any flag-changing instruction.
@@ -418,12 +494,12 @@ impl X86Codegen {
             self.emit_libatomic_16_load(dest, ptr, ordering);
             return;
         }
-        self.operand_to_rax(ptr);
+        let addr = self.atomic_address_reg(ptr, "rax");
         self.prepare_atomic_side_effect();
         let load = Self::mov_load_for_type(ty);
         let dest_reg = Self::load_dest_reg(ty);
         self.state
-            .emit_fmt(format_args!("    {} (%rax), {}", load, dest_reg));
+            .emit_fmt(format_args!("    {load} (%{addr}), {dest_reg}"));
         self.store_rax_to(dest);
     }
 
@@ -442,9 +518,11 @@ impl X86Codegen {
             self.emit_libatomic_16_binary("__atomic_store_16", ptr, val, ordering);
             return;
         }
-        self.operand_to_rax(val);
-        self.state.emit("    movq %rax, %rdx");
-        self.operand_to_rax(ptr);
+        // The value goes to %rdx (XCHG swaps, so a home could not be used in
+        // place without proving the value dead), straight from its home,
+        // slot or immediate; the address needs no copy when it has a home.
+        self.operand_to_reg(val, "rdx");
+        let addr = self.atomic_address_reg(ptr, "rax");
         self.prepare_atomic_side_effect();
 
         let reg = Self::reg_for_type("rdx", ty);
@@ -454,11 +532,11 @@ impl X86Codegen {
             // current Intel and AMD cores.
             let suffix = Self::type_suffix(ty);
             self.state
-                .emit_fmt(format_args!("    xchg{} %{}, (%rax)", suffix, reg));
+                .emit_fmt(format_args!("    xchg{suffix} %{reg}, (%{addr})"));
         } else {
             let store = Self::mov_store_for_type(ty);
             self.state
-                .emit_fmt(format_args!("    {} %{}, (%rax)", store, reg));
+                .emit_fmt(format_args!("    {store} %{reg}, (%{addr})"));
         }
     }
 

@@ -121,6 +121,8 @@ pub enum AsmDirective {
     Section(SectionDirective),
     /// Global symbol: `.globl name`
     Global(String),
+    /// `.tlsdesccall sym`: R_AARCH64_TLSDESC_CALL on the next instruction.
+    TlsDescCall(String),
     /// Weak symbol: `.weak name`
     Weak(String),
     /// Hidden visibility: `.hidden name`
@@ -190,11 +192,17 @@ pub enum AsmDirective {
     Previous,
     /// `.subsection N` — switch to numbered subsection within the current section
     Subsection(u64),
-    /// AArch64 TLSDESC call-site marker. Emits R_AARCH64_TLSDESC_CALL at
-    /// the current location (the following `blr`).
-    TlsDescCall(String),
-    /// CFI directive (ignored for code generation)
-    Cfi,
+    /// A `.cfi_*` directive: name and operand text. `cfi_lower::lower_cfi`
+    /// replaces it by a location label and the `.eh_frame` data it implies.
+    Cfi(String, String),
+    /// DWARF location advance between two code labels, produced by the CFI
+    /// lowering only.
+    CfaAdvance { from: String, to: String },
+    /// `.uleb128` / `.sleb128`.
+    Leb128 {
+        signed: bool,
+        values: Vec<DataValue>,
+    },
     /// `.incbin "file"[, skip[, count]]` — include binary file contents
     Incbin {
         path: String,
@@ -1245,6 +1253,13 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
 
     let dir = match name {
         ".section" => parse_section_directive(args)?,
+        ".tlsdesccall" => {
+            let sym = args.trim();
+            if sym.is_empty() || sym.contains([' ', '\t', ',']) {
+                return Err(format!(".tlsdesccall needs one symbol, got `{args}`"));
+            }
+            AsmDirective::TlsDescCall(sym.to_string())
+        }
         ".text" => AsmDirective::Section(SectionDirective {
             name: ".text".to_string(),
             flags: None,
@@ -1376,6 +1391,10 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
                 fill,
             }
         }
+        ".uleb128" | ".sleb128" => AsmDirective::Leb128 {
+            signed: name == ".sleb128",
+            values: parse_data_values(args)?,
+        },
         ".byte" => {
             let vals = parse_data_values(args)?;
             AsmDirective::Byte(vals)
@@ -1512,33 +1531,10 @@ fn parse_directive(line: &str) -> Result<AsmStatement, String> {
                 AsmDirective::Ignored
             }
         }
-        ".tlsdesccall" => {
-            let symbol = args.trim();
-            if symbol.is_empty() {
-                return Err(".tlsdesccall requires a symbol".to_string());
-            }
-            AsmDirective::TlsDescCall(symbol.to_string())
-        }
         // CFI directives
-        ".cfi_startproc"
-        | ".cfi_endproc"
-        | ".cfi_def_cfa_offset"
-        | ".cfi_offset"
-        | ".cfi_def_cfa_register"
-        | ".cfi_restore"
-        | ".cfi_remember_state"
-        | ".cfi_restore_state"
-        | ".cfi_adjust_cfa_offset"
-        | ".cfi_def_cfa"
-        | ".cfi_sections"
-        | ".cfi_personality"
-        | ".cfi_lsda"
-        | ".cfi_rel_offset"
-        | ".cfi_register"
-        | ".cfi_return_column"
-        | ".cfi_undefined"
-        | ".cfi_same_value"
-        | ".cfi_escape" => AsmDirective::Cfi,
+        name if name.starts_with(".cfi_") => {
+            AsmDirective::Cfi(name.to_string(), args.trim().to_string())
+        }
         ".pushsection" => {
             // .pushsection name,"flags",@type - same syntax as .section
             match parse_section_directive(args)? {
@@ -2094,6 +2090,14 @@ fn parse_memory_operand(s: &str) -> Result<Operand, String> {
     }
 
     let second = parts[1].trim();
+    // `#:lo12:sym` (and `# :lo12:sym`) is the same operand as `:lo12:sym`
+    // (GAS 2.47: identical word and relocation); route it to the modifier
+    // form below instead of the deferred-expression path, which no
+    // load/store encoder accepts.
+    let second = match second.strip_prefix('#') {
+        Some(rest) if rest.trim_start().starts_with(':') => rest.trim_start(),
+        _ => second,
+    };
 
     // [base, #imm] or [base, imm] (bare immediate without # prefix)
     if let Some(imm_str) = second.strip_prefix('#') {
@@ -2131,6 +2135,14 @@ fn parse_memory_operand(s: &str) -> Result<Operand, String> {
 
     // [base, :lo12:symbol]
     if second.starts_with(':') {
+        // No pre-index form carries a relocated offset (its imm9 field has
+        // no low-12 relocation); dropping the `!` would assemble a load whose
+        // base register is never updated. GAS rejects it too.
+        if has_writeback {
+            return Err(format!(
+                "`[{base}, {second}]!`: a relocated offset has no writeback form"
+            ));
+        }
         // Parse the modifier embedded in memory operand
         // The ] is already stripped, so just parse the modifier
         let mod_op = parse_modifier(second)?;

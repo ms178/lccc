@@ -150,20 +150,14 @@ fn same_root(a: &ObjectRoot, b: &ObjectRoot) -> bool {
 /// Object/restrict rules for this copy proof: distinct current-frame stack
 /// homes cannot alias; a current-frame alloca cannot alias an incoming
 /// parameter; a global may alias an ordinary parameter; and two parameters
-/// need a restrict/noalias contract. Distinct global names are disjoint only
-/// when module facts prove both are strong private definitions and neither
-/// participates in an alias/asm-label redirect. Unknown roots never reach this
+/// need a restrict/noalias contract. Distinct global names are disjoint when
+/// `ModuleSymbolFacts::globals_distinct` proves it (one strong, locally binding
+/// definition and no alias/asm-label redirect). Unknown roots never reach this
 /// function because `root_and_offset` returns `None` for them.
 fn roots_proven_distinct(a: &ObjectRoot, b: &ObjectRoot, facts: &ModuleSymbolFacts) -> bool {
     match (a, b) {
         (ObjectRoot::Alloca(a), ObjectRoot::Alloca(b)) => a != b,
-        (ObjectRoot::Global(a), ObjectRoot::Global(b)) => {
-            a != b
-                && facts.local_globals.contains(a)
-                && facts.local_globals.contains(b)
-                && !facts.aliased_names.contains(a)
-                && !facts.aliased_names.contains(b)
-        }
+        (ObjectRoot::Global(a), ObjectRoot::Global(b)) => facts.globals_distinct(a, b),
         (ObjectRoot::Alloca(_), ObjectRoot::Global(_))
         | (ObjectRoot::Global(_), ObjectRoot::Alloca(_))
         | (ObjectRoot::Alloca(_), ObjectRoot::Param { .. })
@@ -1030,7 +1024,7 @@ mod tests {
     fn strong_private_globals_can_prove_a_nonoverlapping_copy() {
         let facts = ModuleSymbolFacts {
             aliased_names: FxHashSet::default(),
-            local_globals: ["source", "destination"]
+            identity_witnesses: ["source", "destination"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),
@@ -1052,7 +1046,7 @@ mod tests {
                 .collect(),
             // Deliberately include both names: the alias marker, not just the
             // linkage class, must defeat the disjointness proof.
-            local_globals: ["source", "alias_source", "destination"]
+            identity_witnesses: ["source", "alias_source", "destination"]
                 .into_iter()
                 .map(str::to_owned)
                 .collect(),

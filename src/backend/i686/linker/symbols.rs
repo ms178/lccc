@@ -354,9 +354,20 @@ pub(super) fn mark_plt_got_needs(
                             }
                         }
                     }
+                    // A convertible GOT32X access to a symbol defined here
+                    // is rewritten to an immediate or a direct branch
+                    // (reloc.rs, `Got32xConversion`) and needs no slot;
+                    // every other GOT reference loads from one.
                     R_386_GOT32 | R_386_GOT32X => {
+                        let relaxed = rel_type == R_386_GOT32X
+                            && super::reloc::got32x_conversion(&sec.data, rel_offset as usize)
+                                .is_some()
+                            && super::reloc::got_target_relaxable(
+                                sym,
+                                global_symbols.get(sym.name.as_str()),
+                            );
                         if let Some(gs) = global_symbols.get_mut(sym.name.as_str()) {
-                            gs.needs_got = true;
+                            gs.needs_got |= !relaxed;
                         }
                     }
                     // Main-image TLS transitions to local exec; a DSO TLS

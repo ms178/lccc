@@ -715,33 +715,70 @@ fn inner_loop_in_noneligible_outer_loop() {
     assert_eq!(run(&mut f), 0);
 }
 
+/// The cost gate asks the backend's own model table (GCC 16.2 semantics:
+/// binding default, `-ftls-model=` floor and attribute only RAISE the model).
+/// Executable code is never dynamic, whatever the request; under `-fPIC` only
+/// symbols left at Local/Global-Dynamic are costly. A predicate letting the
+/// attribute or option override the default (`declaration.or(command)`) marks
+/// `tls_model("global-dynamic")` and `-ftls-model=global-dynamic` costly in a
+/// PIE although both lower to Local-Exec there.
 #[test]
-fn dynamic_tls_policy_honors_all_overrides() {
+fn costly_tls_follows_the_backend_model_table() {
+    use crate::common::tls::TlsPolicy;
+    use crate::ir::module::{GlobalInit, IrGlobal, IrModule};
     use crate::ir::reexports::TlsModel::*;
-    for pic in [false, true] {
-        for command in [
-            None,
-            Some(LocalExec),
-            Some(InitialExec),
-            Some(LocalDynamic),
-            Some(GlobalDynamic),
-        ] {
-            for declaration in [
-                None,
-                Some(LocalExec),
-                Some(InitialExec),
-                Some(LocalDynamic),
-                Some(GlobalDynamic),
-            ] {
-                let expected = match declaration.or(command) {
-                    Some(LocalDynamic | GlobalDynamic) => true,
-                    Some(LocalExec | InitialExec) => false,
-                    None => pic,
-                };
-                assert_eq!(dynamic_tls(declaration, command, pic), expected);
-            }
-        }
+    let tls = |name: &str, is_static: bool, is_extern: bool, vis: Option<&str>| IrGlobal {
+        name: name.to_string(),
+        ty: IrType::I32,
+        size: 4,
+        align: 4,
+        init: GlobalInit::Zero,
+        is_static,
+        is_extern,
+        is_common: false,
+        section: None,
+        is_weak: false,
+        visibility: vis.map(str::to_string),
+        has_explicit_align: false,
+        is_const: false,
+        is_used: false,
+        is_thread_local: true,
+    };
+    let mut module = IrModule::default();
+    module.globals = vec![
+        tls("local", true, false, None),
+        tls("defined", false, false, None),
+        tls("ext", false, true, None),
+        tls("hidden_ext", false, true, Some("hidden")),
+        tls("gd_attr", true, false, None),
+        tls("ie_attr", false, true, None),
+    ];
+    module
+        .tls_model_attrs
+        .insert("gd_attr".to_string(), GlobalDynamic);
+    module
+        .tls_model_attrs
+        .insert("ie_attr".to_string(), InitialExec);
+    let costly = |shlib, floor| {
+        let mut v: Vec<String> = costly_tls_symbols(&module, TlsPolicy { shlib, floor })
+            .into_iter()
+            .collect();
+        v.sort();
+        v
+    };
+    let none: Vec<String> = Vec::new();
+    for floor in [None, Some(GlobalDynamic), Some(LocalDynamic)] {
+        assert_eq!(costly(false, floor), none, "PIE floor {floor:?}");
     }
+    assert_eq!(
+        costly(true, None),
+        ["defined", "ext", "gd_attr", "hidden_ext", "local"]
+    );
+    assert_eq!(costly(true, Some(InitialExec)), none);
+    assert_eq!(
+        costly(true, Some(LocalDynamic)),
+        ["defined", "ext", "gd_attr", "hidden_ext", "local"]
+    );
 }
 
 #[test]

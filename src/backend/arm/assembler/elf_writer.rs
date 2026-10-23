@@ -11,8 +11,10 @@
 // ELF writer helpers; some section/relocation utilities defined for completeness.
 #![allow(dead_code)]
 
+use super::cfi;
 use super::encoder::{EncodeResult, RelocType, encode_instruction};
 use super::parser::{AsmDirective, AsmStatement, DataValue, Operand, SizeExpr, SymbolKind};
+use crate::backend::cfi_lower;
 use crate::backend::elf::SetValue;
 use crate::backend::elf::{
     self, DataFixup, ELFCLASS64, EM_AARCH64, ElfWriterBase, ObjReloc, STT_FUNC, STT_NOTYPE,
@@ -38,6 +40,33 @@ pub struct ElfWriter {
     /// Pending raw expressions to resolve after all labels are known
     /// Pending instructions with symbolic offset expressions (resolved after labels are known)
     pending_instructions: Vec<PendingInstruction>,
+    /// CFA advances (`.eh_frame`), written once every label is final.
+    pending_advances: Vec<PendingAdvance>,
+    /// `.uleb128`/`.sleb128` whose value was not known where they stand.
+    pending_lebs: Vec<PendingLeb>,
+    /// Width each deferred LEB128 reserves, by occurrence (from the
+    /// previous pass; 1 when unmeasured).
+    leb_widths: Vec<usize>,
+    /// Set when a deferred LEB128 outgrew its width: assemble again.
+    leb_retry: Option<Vec<usize>>,
+}
+
+/// A `.uleb128`/`.sleb128` reserved at `section+offset`, `width` bytes.
+struct PendingLeb {
+    section: String,
+    offset: u64,
+    width: usize,
+    signed: bool,
+    value: SetValue,
+}
+
+/// A `DW_CFA_advance_loc*` reserved at `section+offset`, `width` bytes.
+struct PendingAdvance {
+    section: String,
+    offset: u64,
+    width: usize,
+    from: String,
+    to: String,
 }
 
 struct PendingReloc {
@@ -78,6 +107,10 @@ impl ElfWriter {
             base: ElfWriterBase::new(AARCH64_NOP, 4),
             pending_branch_relocs: Vec::new(),
             pending_instructions: Vec::new(),
+            pending_advances: Vec::new(),
+            pending_lebs: Vec::new(),
+            leb_widths: Vec::new(),
+            leb_retry: None,
         }
     }
 
@@ -213,7 +246,30 @@ impl ElfWriter {
     }
 
     /// Process all parsed assembly statements.
+    ///
+    /// A `.uleb128`/`.sleb128` of a later-resolved difference (GCC's
+    /// `.gcc_except_table` and DWARF lengths: `.uleb128 .LEnd-.LStart`)
+    /// takes its width before its value is known. GNU as relaxes such
+    /// fragments to the canonical length; here the input is assembled again
+    /// with the widths the previous pass measured. Each value is a label
+    /// distance, which only grows in magnitude as widths grow, so widths
+    /// only grow (at most 10 bytes each), the loop terminates, and the final
+    /// width is the canonical length of the final value: GAS's layout.
+    /// Inputs without such a value assemble once.
     pub fn process_statements(&mut self, statements: &[AsmStatement]) -> Result<(), String> {
+        let statements = cfi_lower::lower_cfi(statements.to_vec(), &cfi::target())?;
+        loop {
+            self.process_statements_once(&statements)?;
+            let Some(widths) = self.leb_retry.take() else {
+                return Ok(());
+            };
+            let mut fresh = ElfWriter::new();
+            fresh.leb_widths = widths;
+            *self = fresh;
+        }
+    }
+
+    fn process_statements_once(&mut self, statements: &[AsmStatement]) -> Result<(), String> {
         for stmt in statements {
             self.process_statement(stmt)?;
         }
@@ -239,8 +295,223 @@ impl ElfWriter {
         for (section, offset, size, fixup) in self.base.resolve_pending_data(&remap)? {
             self.emit_data_fixup(&section, offset, size, &fixup)?;
         }
+        self.resolve_pending_lebs(&remap)?;
+        if self.leb_retry.is_some() {
+            return Ok(());
+        }
         self.resolve_pending_instructions()?;
         self.resolve_local_branches()?;
+        self.resolve_pending_advances()?;
+        Ok(())
+    }
+
+    /// A CFA advance from label `from` to `to`. The lowering appends
+    /// `.eh_frame` after all code and no code changes size once emitted, so
+    /// two labels of one (sub)section are already at their final distance,
+    /// which fixes the form now; labels of different subsections move apart
+    /// when those merge, and take the 5-byte `DW_CFA_advance_loc4`.
+    fn emit_cfa_advance(&mut self, from: &str, to: &str) -> Result<(), String> {
+        let width = match (self.base.labels.get(from), self.base.labels.get(to)) {
+            (Some((sf, of)), Some((st, ot))) if sf == st && ot >= of => {
+                Self::advance_width((ot - of) / 4)
+            }
+            _ => 5,
+        };
+        self.base.ensure_default_section();
+        let (section, offset) = (
+            self.base.current_section.clone(),
+            self.base.current_offset(),
+        );
+        self.base.emit_placeholder_bytes(width)?;
+        self.pending_advances.push(PendingAdvance {
+            section,
+            offset,
+            width,
+            from: from.to_string(),
+            to: to.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Bytes of the smallest `DW_CFA_advance_loc*` form for `units`.
+    fn advance_width(units: u64) -> usize {
+        match units {
+            0..=0x3f => 1,
+            0x40..=0xff => 2,
+            0x100..=0xffff => 3,
+            _ => 5,
+        }
+    }
+
+    /// Write every CFA advance in its reserved form (code alignment factor
+    /// 4: the distance is in instructions).
+    fn resolve_pending_advances(&mut self) -> Result<(), String> {
+        for p in std::mem::take(&mut self.pending_advances) {
+            let at = |l: &str| {
+                self.base
+                    .labels
+                    .get(l)
+                    .cloned()
+                    .ok_or_else(|| format!("internal: CFI label {l} undefined"))
+            };
+            let ((sf, of), (st, ot)) = (at(&p.from)?, at(&p.to)?);
+            if sf != st || ot < of {
+                return Err(format!(
+                    "CFA advance from {} to {}: CFI locations out of order or in different sections",
+                    p.from, p.to
+                ));
+            }
+            let delta = ot - of;
+            if delta % 4 != 0 {
+                return Err(format!(
+                    "CFA advance of {delta} bytes is not a multiple of the code alignment factor 4"
+                ));
+            }
+            let units = delta / 4;
+            if Self::advance_width(units) > p.width {
+                return Err(format!(
+                    "internal: CFA advance at {}+{:#x} outgrew its {}-byte form",
+                    p.section, p.offset, p.width
+                ));
+            }
+            let units32 = u32::try_from(units).map_err(|_| {
+                format!("CFA advance of {delta:#x} bytes exceeds DW_CFA_advance_loc4")
+            })?;
+            let bytes = match p.width {
+                1 => vec![0x40 | units as u8],
+                2 => vec![0x02, units as u8],
+                3 => {
+                    let mut v = vec![0x03];
+                    v.extend_from_slice(&(units as u16).to_le_bytes());
+                    v
+                }
+                _ => {
+                    let mut v = vec![0x04];
+                    v.extend_from_slice(&units32.to_le_bytes());
+                    v
+                }
+            };
+            let sec = self
+                .base
+                .sections
+                .get_mut(&p.section)
+                .ok_or_else(|| format!("CFA advance: unknown section {}", p.section))?;
+            let at = usize::try_from(p.offset).map_err(|e| e.to_string())?;
+            sec.data[at..at + p.width].copy_from_slice(&bytes);
+        }
+        Ok(())
+    }
+
+    /// `.uleb128` / `.sleb128`: a value constant where it stands is encoded
+    /// at once; any other is reserved and resolved after layout
+    /// ([`Self::resolve_pending_lebs`]).
+    fn emit_leb128(&mut self, vals: &[DataValue], signed: bool) -> Result<(), String> {
+        for val in vals {
+            let v = match val {
+                DataValue::Integer(v) => *v,
+                DataValue::Expr(expr) => match self.base.capture_data_symbol(expr)? {
+                    SetValue::Value(v) if v.is_absolute() => v.constant,
+                    value => {
+                        self.defer_leb128(value, signed)?;
+                        continue;
+                    }
+                },
+            };
+            let mut enc = Vec::with_capacity(10);
+            if signed {
+                crate::backend::elf_writer_common::encode_sleb128(&mut enc, v);
+            } else {
+                crate::backend::elf_writer_common::encode_uleb128(&mut enc, v as u64);
+            }
+            self.base.emit_bytes(&enc)?;
+        }
+        Ok(())
+    }
+
+    fn defer_leb128(&mut self, value: SetValue, signed: bool) -> Result<(), String> {
+        let width = self
+            .leb_widths
+            .get(self.pending_lebs.len())
+            .copied()
+            .unwrap_or(1);
+        self.base.ensure_default_section();
+        let (section, offset) = (
+            self.base.current_section.clone(),
+            self.base.current_offset(),
+        );
+        // Refused in NOBITS like any value the guard cannot verify.
+        self.base.emit_placeholder_bytes(width)?;
+        self.pending_lebs.push(PendingLeb {
+            section,
+            offset,
+            width,
+            signed,
+            value,
+        });
+        Ok(())
+    }
+
+    /// Encode every deferred LEB128 now that all labels are final. AArch64
+    /// has no LEB128 relocation, so the value must fold to an assembly-time
+    /// constant (a difference within one section), as GNU as requires. A
+    /// value that does not fit its reserved width records the width it
+    /// needs in `leb_retry`.
+    fn resolve_pending_lebs(&mut self, remap: &elf::SubsectionRemap) -> Result<(), String> {
+        let mut needed: Option<Vec<usize>> = None;
+        for (i, p) in std::mem::take(&mut self.pending_lebs)
+            .into_iter()
+            .enumerate()
+        {
+            let (section, offset) = ElfWriterBase::remap_place(remap, &p.section, p.offset);
+            let dir = if p.signed { ".sleb128" } else { ".uleb128" };
+            let where_ = format!("`{dir}' at {section}+{offset:#x}");
+            // The folded value, not the symbolic fixup: a same-section label
+            // difference stays a `Diff` symbolically but is exact here, since
+            // AArch64 has no linker relaxation to move either label.
+            let (_, constant) = self
+                .base
+                .resolve_value(&p.value, remap)
+                .map_err(|e| format!("{where_}: {e}"))?;
+            let Some(value) = constant else {
+                return Err(format!(
+                    "{where_}: value is not an assembly-time constant (AArch64 has no LEB128 relocation)"
+                ));
+            };
+            let (bytes, len) = if p.signed {
+                (
+                    crate::backend::elf_writer_common::sleb128_fixed(value, p.width),
+                    crate::backend::elf_writer_common::sleb128_len(value),
+                )
+            } else {
+                (
+                    crate::backend::elf_writer_common::uleb128_fixed(value as u64, p.width),
+                    crate::backend::elf_writer_common::uleb128_len(value as u64),
+                )
+            };
+            match bytes {
+                Some(bytes) => {
+                    let sec = self
+                        .base
+                        .sections
+                        .get_mut(&section)
+                        .ok_or_else(|| format!("{where_}: unknown section"))?;
+                    let at = usize::try_from(offset).map_err(|e| e.to_string())?;
+                    let slot = sec
+                        .data
+                        .get_mut(at..at + p.width)
+                        .ok_or_else(|| format!("{where_}: outside its section"))?;
+                    slot.copy_from_slice(&bytes);
+                }
+                None => {
+                    let w = needed.get_or_insert_with(|| self.leb_widths.clone());
+                    if w.len() <= i {
+                        w.resize(i + 1, 1);
+                    }
+                    w[i] = w[i].max(len);
+                }
+            }
+        }
+        self.leb_retry = needed;
         Ok(())
     }
 
@@ -426,16 +697,23 @@ impl ElfWriter {
 
             AsmDirective::Org { expr, fill } => self.base.emit_org(expr, *fill),
 
-            AsmDirective::TlsDescCall(symbol) => {
+            // GAS attaches the marker to the instruction that follows
+            // (`.tlsdesccall v; blr x1` = R_AARCH64_TLSDESC_CALL at the blr).
+            AsmDirective::TlsDescCall(sym) => {
                 self.base.add_reloc(
                     super::encoder::RelocType::TlsDescCall.elf_type(),
-                    symbol.clone(),
+                    sym.clone(),
                     0,
                 );
                 Ok(())
             }
 
-            AsmDirective::Cfi | AsmDirective::Ignored | AsmDirective::Ltorg => Ok(()),
+            AsmDirective::Ignored | AsmDirective::Ltorg => Ok(()),
+            AsmDirective::Cfi(name, _) => Err(format!(
+                "internal: {name} reached the ELF writer without CFI lowering"
+            )),
+            AsmDirective::CfaAdvance { from, to } => self.emit_cfa_advance(from, to),
+            AsmDirective::Leb128 { signed, values } => self.emit_leb128(values, *signed),
         }
     }
 
@@ -2684,5 +2962,153 @@ mod aarch64_encoder_tests {
         let bss = &w.base.sections[".bss"];
         assert!(bss.data.is_empty(), "NOBITS holds no bytes");
         assert_eq!(bss.size(), 0x8000_0004);
+    }
+}
+
+/// TLS Initial-Exec and descriptor forms, word for word against GNU as 2.47
+/// (`aarch64-linux-gnu-as`, `objdump -dr`, 2026-10-19).
+#[cfg(test)]
+mod tls_reloc_tests {
+    use super::super::parser::parse_asm;
+    use super::*;
+
+    #[test]
+    fn tls_ie_and_descriptor_words_and_relocs() {
+        let statements = parse_asm(
+            "adrp x0, :gottprel:v\n\
+             ldr x0, [x0, :gottprel_lo12:v]\n\
+             adrp x0, :tlsdesc:v\n\
+             ldr x1, [x0, :tlsdesc_lo12:v]\n\
+             add x0, x0, :tlsdesc_lo12:v\n\
+             .tlsdesccall v\n\
+             blr x1\n\
+             adrp x9, :gottprel:v\n\
+             ldr x9, [x9, #:gottprel_lo12:v]\n\
+             ldr x2, [x3, # :lo12:v]\n",
+        )
+        .expect("parses");
+        let mut w = ElfWriter::new();
+        w.process_statements(&statements).expect("assembles");
+        let text = &w.base.sections[".text"];
+        let words: Vec<u32> = text
+            .data
+            .chunks(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(
+            words,
+            [
+                0x9000_0000,
+                0xf940_0000,
+                0x9000_0000,
+                0xf940_0001,
+                0x9100_0000,
+                0xd63f_0020,
+                0x9000_0009,
+                0xf940_0129,
+                0xf940_0062
+            ]
+        );
+        let relocs: Vec<(u64, u32)> = text
+            .relocs
+            .iter()
+            .map(|r| (r.offset, r.reloc_type))
+            .collect();
+        assert_eq!(
+            relocs,
+            [
+                (0, 541),
+                (4, 542),
+                (8, 562),
+                (12, 563),
+                (16, 564),
+                (20, 569),
+                (24, 541),
+                (28, 542),
+                (32, 286)
+            ]
+        );
+        assert!(text.relocs.iter().all(|r| r.symbol_name == "v"));
+    }
+
+    /// The GOT-slot forms name an 8-byte entry: only `ldr xN` may carry them.
+    /// GAS 2.47 accepts the first six rows without a diagnostic and emits the
+    /// 64-bit-slot relocation (or, for an operand-less `.tlsdesccall`,
+    /// nothing): each would link into a wrong access, so LCCC refuses them.
+    #[test]
+    fn got_slot_modifiers_need_a_64bit_ldr() {
+        for bad in [
+            "ldr w0, [x0, :gottprel_lo12:v]\n",
+            "ldr w1, [x0, :tlsdesc_lo12:v]\n",
+            "str x0, [x0, :gottprel_lo12:v]\n",
+            "ldr w0, [x0, :got_lo12:v]\n",
+            "add w0, w0, :tlsdesc_lo12:v\n",
+            ".tlsdesccall\n",
+            // GAS rejects these two as well: no writeback form relocates.
+            "ldr x0, [x1, :lo12:v]!\n",
+            "ldr x0, [x1, #:lo12:v]!\n",
+        ] {
+            let ok = parse_asm(bad).ok().is_some_and(|s| {
+                let mut w = ElfWriter::new();
+                w.process_statements(&s).is_ok()
+            });
+            assert!(!ok, "{bad:?} must be rejected");
+        }
+    }
+}
+
+// ── Tests: LEB128 of later-resolved differences (GAS relaxation parity) ──
+#[cfg(test)]
+mod leb128_tests {
+    use super::*;
+
+    fn data_of(asm: &str) -> Result<Vec<u8>, String> {
+        let statements = super::super::prepare_statements(asm)?;
+        let mut writer = ElfWriter::new();
+        writer.process_statements(&statements)?;
+        Ok(writer.base.sections[".data"].data.clone())
+    }
+
+    #[test]
+    fn forward_differences_take_their_canonical_width() {
+        // `.gcc_except_table`'s call-site length shape: the value (200) is
+        // known only after the bytes it measures, and needs two bytes.
+        let data = data_of(
+            ".data\n.uleb128 2f-1f\n1:\n.zero 200\n2:\n.byte 0xee\n\
+             .sleb128 3f-4f\n4:\n.zero 100\n3:\n.sleb128 4b-3b\n",
+        )
+        .expect("assembles");
+        assert_eq!(&data[..2], &[0xc8, 0x01], "uleb128 200");
+        assert_eq!(
+            data[202], 0xee,
+            "data after the LEB lands after its 2 bytes"
+        );
+        assert_eq!(
+            &data[203..205],
+            &[0xe4, 0x00],
+            "sleb128 +100 needs a sign byte"
+        );
+        assert_eq!(&data[305..307], &[0x9c, 0x7f], "sleb128 -100 (backward)");
+        assert_eq!(data.len(), 307);
+    }
+
+    #[test]
+    fn mutually_dependent_widths_converge_to_the_gas_layout() {
+        // A = 126 + width(B); B = width(A) + 126 + width(B). Pass 1 (1,1):
+        // B = 128 outgrows. Pass 2 (1,2): A = 128 outgrows. Pass 3 (2,2):
+        // A = 128, B = 130 both fit -- GNU as 2.47 emits the same bytes.
+        let data = data_of(".data\n0:\n.uleb128 2f-1f\n1:\n.zero 126\n.uleb128 2f-0b\n2:\n")
+            .expect("assembles");
+        assert_eq!(data.len(), 130);
+        assert_eq!(&data[..2], &[0x80, 0x01]);
+        assert_eq!(&data[128..], &[0x82, 0x01]);
+    }
+
+    #[test]
+    fn a_cross_section_difference_is_refused_not_misencoded() {
+        // AArch64 has no LEB128 relocation, so GNU as refuses this too.
+        let err = data_of(".data\n.uleb128 2f-1f\n1:\n.text\nnop\n2:\n")
+            .expect_err("no assembly-time constant");
+        assert!(err.contains("LEB128"), "{err}");
     }
 }
