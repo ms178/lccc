@@ -22,10 +22,12 @@ pub(super) const LARGE_ARG_COPY_THRESHOLD: usize = 2048;
 
 /// Bit image of a scalar 16-byte SSE-carrier constant (`_Float128` or
 /// `_Decimal128`). The I128 variant is already the converted object image,
-/// not an integer to be converted again. Integer zero is also accepted: the
-/// lowering uses it as the canonical zero after some implicit conversions.
-/// Other scalar constants are rejected rather than reinterpreted as carrier
-/// bits; they indicate a missing conversion in lowering.
+/// not an integer to be converted again. Integer zero is also accepted for
+/// binary128, whose lowering uses it as the canonical zero after some implicit
+/// conversions. Decimal128 constants must already carry their I128 BID image:
+/// integer and literal zeros can have different quantum encodings. Other
+/// scalar constants are rejected rather than reinterpreted as carrier bits;
+/// they indicate a missing conversion in lowering.
 pub(crate) fn f128_sse_const_bits(c: IrConst) -> Option<u128> {
     match c {
         IrConst::Zero

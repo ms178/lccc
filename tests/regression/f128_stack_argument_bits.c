@@ -31,11 +31,15 @@ int main(void)
     if (PROBE(-0.0F128, 0, 0x8000000000000000ULL)) return 3;
 
     /* A volatile, value-dependent object forces the SSA-slot path and checks
-       arbitrary nonzero bits in both limbs, not merely numeric conversion. */
+       every bit of a quiet-NaN payload, not merely numeric conversion. */
     volatile union f128_bits variable = {
-        .word = { 0x0123456789abcdefULL, 0x4002200000000000ULL }
+        .word = { 0x0123456789abcdefULL, 0x7fff800000000000ULL }
     };
-    if (PROBE(variable.value, 0x0123456789abcdefULL, 0x4002200000000000ULL))
+    if (PROBE(variable.value, 0x0123456789abcdefULL, 0x7fff800000000000ULL))
         return 4;
+
+    /* A nonzero integer must be converted by lowering, not reinterpreted as
+       an I128 object image or rejected by the backend's constant decoder. */
+    if (PROBE(9, 0, 0x4002200000000000ULL)) return 5;
     return 0;
 }
