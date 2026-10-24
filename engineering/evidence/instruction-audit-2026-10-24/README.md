@@ -288,3 +288,50 @@ lccc-ld -o /tmp/rip-static /tmp/rip-start.o /tmp/rip-memory.o
 
 This adds a fourteenth **partial** section review, not completion of the
 manual, the assembler, or any backend as a whole.
+
+## Continued review: i686 vector relocation ABI
+
+The shared vector encoder's ModR/M/SIB bytes can be correct for i686 while its
+relocation types are not. With a 32-bit base register, delegated `@GOT` and
+`@GOTOFF` operands became absolute `R_386_32` references; local TLS offsets
+could acquire the wrong class or fail translation. The i686 delegation boundary
+now reconstructs only the memory relocation from the original displacement,
+using the existing i686 symbol, modifier and addend rules. Address bytes and
+instruction lengths are preserved, including VEX/EVEX **VSIB gather** fields
+and XOP's trailing register byte. Re-encoding these ordinary shared addresses
+would unnecessarily risk rejecting vector indices or changing address layouts.
+Absolute and 16-bit addressing retain the existing local address planner.
+
+TLSGD/TLSLDM, GOTNTPOFF/INDNTPOFF and TLSDESC protocol relocations cannot be
+consumed by these vector instructions; both delegated and local SSE/MMX paths
+now reject them rather than lending a TLS relaxation contract to an unrelated
+opcode. Valid bare-symbol legacy immediate sources are normalized as absolute
+memory without cloning the whole instruction or the operand vector.
+
+This ELF ABI and GNU-syntax review is independent of the SDM's CPU semantics.
+Its **430 additional i686 cases** include 360 accepted forms and 70 rejection
+controls across six basic modifier classes, positive/negative addends, SIB,
+absolute addresses, legacy SSE, VEX, EVEX, XOP, and both gather encodings. Every
+case was explicitly checked with GNU binutils 2.47.20260726; no failing oracle
+input was trimmed away. The preceding binary fails **292 cases**: 180 wrong
+relocation tables, 58 false acceptances and 54 false rejections. The fixed
+binary passes all 430. The complete corpora now pass **1,692 x86-64 + 1,163
+i686 cases**. All **6,205 library tests** (10 pre-existing ignored tests), the
+linker binary test, strict all-target Clippy and the unchanged census pass.
+The independent packed-shift matrix still passes 1,808 decisions and 390 exact
+accepted-byte comparisons.
+
+`i686-vector-got.s` is a libc-free native 32-bit PIC witness for GOT and GOTOFF
+vector accesses. On the recorded Linux host with IA32 execution and AVX512F/VL,
+objects produced by the fixed assembler, GNU assembler, GCC 16.2 and Clang 23.1
+all execute successfully after GNU `ld -m elf_i386`. The preceding LCCC object
+faults with SIGSEGV because it uses absolute addresses where GOT-relative
+addresses were requested. This witness does **not** claim i686 linking support
+in lccc-ld or general native coverage of TLS models.
+
+```sh
+D=engineering/evidence/instruction-audit-2026-10-24
+lccc -m32 -c "$D/i686-vector-got.s" -o /tmp/i686-got.o
+ld -m elf_i386 /tmp/i686-got.o -o /tmp/i686-got
+/tmp/i686-got  # requires Linux IA32 execution and AVX512F/VL
+```
