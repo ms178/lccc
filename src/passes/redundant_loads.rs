@@ -53,6 +53,14 @@ fn same_memory_value_type(
 }
 
 pub(crate) fn run(func: &mut IrFunction) -> usize {
+    run_impl(func, None)
+}
+
+pub(crate) fn run_with_ipa_pta(func: &mut IrFunction, analysis: &super::ipa_pta::IpaPta) -> usize {
+    run_impl(func, Some(analysis))
+}
+
+fn run_impl(func: &mut IrFunction, ipa: Option<&super::ipa_pta::IpaPta>) -> usize {
     if std::env::var("CCC_NO_REDUNDANT_LOADS").is_ok() {
         return 0;
     }
@@ -80,8 +88,10 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 
         for bi in 0..func.blocks.len() {
             let frame = frames.block_frame[bi];
-            // (form, type, canonical dest)
-            let mut available: Vec<(alias::LinForm, crate::common::types::IrType, Value)> =
+            // (form, type, canonical dest, address value).  Retaining the
+            // original address is what lets IPA-PTA answer a call query per
+            // available load rather than conservatively clearing the list.
+            let mut available: Vec<(alias::LinForm, crate::common::types::IrType, Value, Value)> =
                 Vec::new();
             let mut removed: Vec<usize> = Vec::new();
 
@@ -95,7 +105,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                 // redefined, so the guard costs nothing there.
                 if let Some(dest) = inst.dest() {
                     if !available.is_empty() {
-                        available.retain(|(f, _, _)| !f.syms.iter().any(|s| s.0 == dest.0));
+                        available.retain(|(f, _, _, _)| !f.syms.iter().any(|s| s.0 == dest.0));
                     }
                 }
                 match inst {
@@ -120,9 +130,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                         else {
                             continue;
                         };
-                        if let Some((_, _, canon)) = available
+                        if let Some((_, _, canon, _)) = available
                             .iter()
-                            .find(|(f, t, _)| *f == form && same_memory_value_type(*t, *ty))
+                            .find(|(f, t, _, _)| *f == form && same_memory_value_type(*t, *ty))
                         {
                             // MULTI-DEF GUARD: see the module doc. A multi-def
                             // canonical's content is not position-stable, and a
@@ -134,7 +144,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                                 continue;
                             }
                         }
-                        available.push((form, *ty, *dest));
+                        available.push((form, *ty, *dest, *ptr));
                     }
                     Instruction::Store {
                         ptr,
@@ -153,6 +163,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                                 let keep = |entry: &(
                                     alias::LinForm,
                                     crate::common::types::IrType,
+                                    Value,
                                     Value,
                                 )| {
                                     match (
@@ -187,7 +198,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                                             same_memory_value_type(source_ty, *ty)
                                         })
                                 {
-                                    available.push((sform, *ty, *value));
+                                    available.push((sform, *ty, *value, *ptr));
                                 }
                             }
                             None => available.clear(),
@@ -217,6 +228,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                                         alias::LinForm,
                                         crate::common::types::IrType,
                                         Value,
+                                        Value,
                                     )| {
                                         match (
                                             crate::passes::loop_memory_promote::byte_size(entry.1),
@@ -240,9 +252,16 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                     // Calls, atomics, inline asm, variadics: unknown memory
                     // effects, kill everything.  Intrinsics with a write
                     // pointer kill everything (read-only intrinsics are fine).
-                    Instruction::Call { .. }
-                    | Instruction::CallIndirect { .. }
-                    | Instruction::Memcpy { .. }
+                    Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
+                        if let Some(analysis) = ipa {
+                            available.retain(|(_, _, _, pointer)| {
+                                !analysis.may_call_modify(func, bi, ii, *pointer)
+                            });
+                        } else {
+                            available.clear();
+                        }
+                    }
+                    Instruction::Memcpy { .. }
                     | Instruction::AtomicRmw { .. }
                     | Instruction::AtomicCmpxchg { .. }
                     | Instruction::AtomicStore { .. }

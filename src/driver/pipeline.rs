@@ -2336,6 +2336,17 @@ impl Driver {
             }
         }
 
+        // IPA-PTA is a whole-unit, fail-closed analysis.  It runs after
+        // inlining/PGO promotion so direct and indirect call targets are as
+        // precise as the final IR permits, and before post-SSA splitters
+        // create position-dependent copy webs.
+        if self.ipa_pta && self.opt_level >= 1 && std::env::var_os("CCC_NO_IPA_PTA").is_none() {
+            let changed = crate::passes::ipa_pta::run(&mut module, self.pic || self.shared_lib);
+            if changed != 0 {
+                crate::passes::verify::verify_after_pass(&module, "ipa_pta");
+            }
+        }
+
         // x86-64 hardware shifts mask their counts; drop the C-level masks
         // that only feed such counts. This must follow every semantic IR
         // pass (see backend::x86::shift_count for the contract).
