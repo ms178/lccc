@@ -7,7 +7,11 @@
 #define NOINLINE
 #endif
 
-/* The result is compared with zero after subtraction. The `ge`/`l` condition
+/* Contract: compile this fixture with -fwrapv; its boundary matrix deliberately
+ * overflows signed subtraction. Without that flag the oracle comparison would
+ * exercise undefined source behavior rather than wrapped-result semantics.
+ *
+ * The result is compared with zero after subtraction. The `ge`/`l` condition
  * produced by TEST uses only the result's sign bit; the x86 peephole can read
  * the same sign directly from SUB's flags. */
 NOINLINE int nonnegative_difference(int a, int b) {

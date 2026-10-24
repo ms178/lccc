@@ -134,3 +134,16 @@ A fresh inspection found two additional proof defects, now corrected:
   instructions. Shifts now fail closed, and stack-neutral matching is exact.
   A regression matrix covers immediate-zero, masked-zero and variable shifts,
   plus both flag-snapshot spellings followed by a carry reader.
+
+The fresh restored-host fastbuild completed warning-free; the library suite
+passed 6157 tests (10 ignored), and the linker binary's additional test passed.
+The first hosted follow-up exposed a failing authenticated Intel lane while
+other completed compiler, linker and differential lanes passed. Inspecting its
+new invocation revealed a source-contract defect: the wrapping-edge fixture
+was compiled without `-fwrapv`, permitting signed-overflow UB in the oracle.
+All runtime and assembly invocations now explicitly use `-fwrapv`, including
+both compilers in the Intel fixture loop. The fixture documents that contract;
+its manifest digest changes for the comment only. This corrects the earlier
+claim that the original invocation supplied wrapping semantics. The hosted
+Intel rerun, rather than the incidental earlier GCC/Clang agreement, determines
+whether this fully resolves the lane failure.

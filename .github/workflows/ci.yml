@@ -2721,8 +2721,8 @@ jobs:
       run: |
         python3 scripts/test_local_oracles.py
         for fixture in popcount_loop_idiom crc32_index_narrowing_variants affine_scaled_index_matrix sign_test_cmov; do
-          "$LCCC_ICX_BIN" -O2 -Wall -Wextra -Werror "tests/regression/$fixture.c" -o "intel-evidence/$fixture-icx"
-          target/fastbuild/lccc -O2 -Wall -Wextra -Werror "tests/regression/$fixture.c" -o "intel-evidence/$fixture-lccc"
+          "$LCCC_ICX_BIN" -O2 -fwrapv -Wall -Wextra -Werror "tests/regression/$fixture.c" -o "intel-evidence/$fixture-icx"
+          target/fastbuild/lccc -O2 -fwrapv -Wall -Wextra -Werror "tests/regression/$fixture.c" -o "intel-evidence/$fixture-lccc"
           "intel-evidence/$fixture-icx" > "intel-evidence/$fixture-icx.txt"
           "intel-evidence/$fixture-lccc" > "intel-evidence/$fixture-lccc.txt"
           diff -u "intel-evidence/$fixture-icx.txt" "intel-evidence/$fixture-lccc.txt"

@@ -72,7 +72,7 @@ fail() {
 compile_with() {
     local label=$1 compiler=$2 binary=$3
     shift 3
-    if ! timeout 120 "$compiler" "$@" "$FIXTURE" -o "$binary" \
+    if ! timeout 120 "$compiler" -fwrapv "$@" "$FIXTURE" -o "$binary" \
         >"$harness/$label.compile.log" 2>&1; then
         cat "$harness/$label.compile.log" >&2
         fail "$label compilation failed"
@@ -142,12 +142,12 @@ echo "PASS: wrapping-edge runtime output agrees at O0/O1/O2/O3/Os (${oracle_desc
 
 # Codegen: the self-TEST disappears and the CMOV condition matches GCC's sign
 # test; strict `> 0` is the negative control because it also needs ZF.
-if ! timeout 120 "$lccc" -O2 -Wall -Wextra -Werror -S "$FIXTURE" \
+if ! timeout 120 "$lccc" -O2 -fwrapv -Wall -Wextra -Werror -S "$FIXTURE" \
     -o "$harness/lccc-x86-O2.s" >"$harness/lccc-x86-O2.compile.log" 2>&1; then
     cat "$harness/lccc-x86-O2.compile.log" >&2
     fail "LCCC -O2 -S failed"
 fi
-if ! timeout 120 "$gcc16" -O2 -S "$FIXTURE" -o "$harness/gcc-x86-O2.s" \
+if ! timeout 120 "$gcc16" -O2 -fwrapv -S "$FIXTURE" -o "$harness/gcc-x86-O2.s" \
     >"$harness/gcc-x86-O2.compile.log" 2>&1; then
     cat "$harness/gcc-x86-O2.compile.log" >&2
     fail "GCC -O2 -S failed"
@@ -157,7 +157,7 @@ fi
 # must restore the original TEST/CMOV shape.  This is the gate's own negative
 # control: without it, a dead pass could still pass via the strict-positive
 # TEST elsewhere in the same translation unit.
-if ! timeout 120 env CCC_PEEPHOLE_SKIP=sign_test_cmov "$lccc" -O2 -S "$FIXTURE" \
+if ! timeout 120 env CCC_PEEPHOLE_SKIP=sign_test_cmov "$lccc" -O2 -fwrapv -S "$FIXTURE" \
     -o "$harness/lccc-x86-skip.s" >"$harness/lccc-x86-skip.compile.log" 2>&1; then
     cat "$harness/lccc-x86-skip.compile.log" >&2
     fail "LCCC skip-group compile failed"
@@ -193,9 +193,9 @@ fi
 # The 32-bit backend lowers the same source to branches rather than CMOVs.
 # The identical algebraic law applies to `jl`/`jge`, with a CFG proof that no
 # later path reads the producer's divergent CF/OF/AF before a complete writer.
-if timeout 120 "$lccc" -O2 -m32 -S "$FIXTURE" -o "$harness/lccc-i686-O2.s" \
+if timeout 120 "$lccc" -O2 -fwrapv -m32 -S "$FIXTURE" -o "$harness/lccc-i686-O2.s" \
     >"$harness/lccc-i686-O2.compile.log" 2>&1; then
-    if timeout 120 env CCC_NO_I686_SIGN_JCC=1 "$lccc" -O2 -m32 -S "$FIXTURE" \
+    if timeout 120 env CCC_NO_I686_SIGN_JCC=1 "$lccc" -O2 -fwrapv -m32 -S "$FIXTURE" \
         -o "$harness/lccc-i686-off.s" >"$harness/lccc-i686-off.compile.log" 2>&1; then
         function_has "$harness/lccc-i686-off.s" nonnegative_difference 'testl' \
             || fail "i686 kill switch did not restore nonnegative_difference's TEST"
@@ -217,9 +217,9 @@ if timeout 120 "$lccc" -O2 -m32 -S "$FIXTURE" -o "$harness/lccc-i686-O2.s" \
 
     # Runtime parity is opportunistic: some runners lack the 32-bit libc or a
     # qemu-i386 user binary.  Codegen parity above is still mandatory.
-    if timeout 120 "$gcc16" -O2 -m32 -Wall -Wextra -Werror "$FIXTURE" \
+    if timeout 120 "$gcc16" -O2 -fwrapv -m32 -Wall -Wextra -Werror "$FIXTURE" \
         -o "$harness/gcc-i686" >"$harness/gcc-i686.compile.log" 2>&1; then
-        if timeout 120 env -u CCC_NO_I686_SIGN_JCC "$lccc" -O2 -m32 -Wall -Wextra -Werror \
+        if timeout 120 env -u CCC_NO_I686_SIGN_JCC "$lccc" -O2 -fwrapv -m32 -Wall -Wextra -Werror \
             "$FIXTURE" -o "$harness/lccc-i686" >"$harness/lccc-i686.compile.log" 2>&1; then
             runner=()
             runnable=1
