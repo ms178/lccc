@@ -125,7 +125,7 @@ measured `lccc:clang`-never-fails pattern):
   to ABI-EXTVEC-LD-1 (`ldx1` is 16 bytes and cannot have been this defect)
   and are retired with it below.
 
-**ABI-GNUVEC-I386-1 — implementation complete; hosted acceptance pending.**
+**ABI-GNUVEC-I386-1 — FIXED; hosted matrix accepted.**
 The 16-byte GNU vector case uses `%xmm0-2` for fixed arguments and `%xmm0` for
 returns, with direct/indirect and variadic calls covered by the freestanding
 GCC 16.2 / Clang 23.1.3 matrix. The 32/64-byte MEMORY cases now carry an
@@ -139,7 +139,12 @@ latch remains. Run 40120508272 passed the first 56 rows, then exposed a
 second reduced-ISA Clang self-oracle incompatibility (SSE-only Clang→Clang
 exit 4 in `iddouble`, after the earlier exit 8 in `pick_variadic`). The matrix
 therefore excludes reduced-ISA Clang self-oracle rows explicitly and retains
-all probes in every LCCC/GCC row; a fresh full run remains required.
+all probes in every LCCC/GCC row. Run 40124172080 at 28f179894 completed all
+88 rows and 3,244,032 checks, including every no-SSE LCCC/GCC row and explicit
+no-SSE object-level XMM ceilings. The no-SSE GCC typed oracle now separates
+arbitrary NaN-bit carriage from finite floating-lane shuffles because GCC's
+own x87 `flds`/`fstps` sequence can quiet a signaling NaN; this added a probe
+rather than removing the failing assertion.
 
 ### ABI-EXTVEC-LD-1 — `long double` ext vectors by value, x86-64 (29 deterministic + 12 flaky) — **FIXED**
 

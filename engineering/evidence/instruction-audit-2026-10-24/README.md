@@ -386,10 +386,11 @@ fix alone. This is an instruction-count result, not a universal timing claim.
 
 Regressions include all 65,536 immediate-pair compositions, barrier and
 skip-control checks, a native original/optimized/independent-integer-model
-comparison including observable YMM upper lanes, and an 18,432-check typed C
+comparison including observable YMM upper lanes, and a 20,480-check typed C
 fixture. The latter supports separate compiler/driver translation units and
 covers nesting, function arguments/returns, conditional struct members,
-floating bit patterns, sizeof, _Generic and operand side effects. Differential
+floating bit patterns, finite floating lanes, sizeof, _Generic and operand
+side effects. Differential
 runs use only the cached GCC 16.2, Clang 23.1.3 and binutils 2.47 tools.
 
 ### i686 GNU vector ABI follow-up
@@ -414,16 +415,16 @@ Ordinary over-aligned records retain their measured four-byte layout;
 memory-passed GNU vectors use natural alignment, including no-SSE v16.
 The alignment-ABI gate now requires every i386 v16/v32/v64 LCCC/GCC pairing to
 exit zero, including both stack residues and O0/O2; the former divergence
-latch is removed. Hosted acceptance is pending the next run. This is an ABI
-finding from current compiler differential evidence, not a calling-convention
-claim derived from the SDM.
+latch is removed. Hosted run 40124172080 accepted the complete matrix at
+28f179894. This is an ABI finding from current compiler differential evidence,
+not a calling-convention claim derived from the SDM.
 
 `check_i686_gnu_vector_abi.sh` requires GCC 16.2.0, Clang 23.1.3 and GNU as
 2.47. It links freestanding ELF32 programs with lccc-ld, requiring no 32-bit
 libc headers/runtime. Across default, explicit SSE2, SSE-only, SSE2-denied,
 profile-denied, SSE-restored and no-SSE modes, it exercises **88 complete
 cross-TU configurations** at O0/O2/O3/Os, each retaining all 16,384 vector-ABI
-and 18,432 typed-shuffle checks. Default and SSE2 run all 24 mixed-compiler
+and 20,480 typed-shuffle checks. Default and SSE2 run all 24 mixed-compiler
 rows. The other five modes run eight GCC/LCCC-family rows; reduced-ISA Clang
 self-oracle rows are explicitly excluded because Clang 23.1.3 failed its own
 SSE-only `pick_variadic` probe with exit 8 and, after that probe was removed,
@@ -442,7 +443,14 @@ Compile-time `__SSE__`/`__SSE2__`/`__SSE3__` checks and non-vacuous PSHUFD/XMM
 assembly ceilings cover states that a host runtime cannot observe.
 Integer element widths 8/16/32/64, double bit patterns, indirect calls,
 register exhaustion, 16-byte stack alignment and variadic named/unnamed
-vectors are covered. The shared typed fixture keeps its original checks;
-only its libc includes are replaced by freestanding declarations. The
-unsharded differential workflow runs this gate after a swap-enabled fastbuild
-with the pinned compiler and assembler oracles.
+vectors are covered. GCC 16.2's no-SSE O0 direct `v4f` shuffle uses x87
+`flds`/`fstps` and lost a random NaN payload (typed exit 2). The fixture now
+keeps that direct floating shuffle as an exactly representable finite-lane
+probe and adds a separate integer-union bit-carrier shuffle for arbitrary NaN
+payloads; no probe or compiler row was deleted. The original fixture fails
+locally with exit 2 and the split fixture passes all 28 GCC mode/optimization
+combinations plus native O0/O2/O3/Os. The hosted matrix completed 88/88 rows,
+3,244,032 total checks, with no-SSE object-level XMM ceilings in run
+40124172080. Only libc includes are replaced by freestanding declarations.
+The unsharded differential workflow runs this gate after a swap-enabled
+fastbuild with the pinned compiler and assembler oracles.
