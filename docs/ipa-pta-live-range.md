@@ -119,7 +119,8 @@ their passes:
 `tests/regression/check_ipa_pta_live_range.py` compiles and runs direct,
 indirect, escaping, variadic, recursive, volatile-boundary, and high-pressure
 cases. It compares baseline/feature output and strict available GCC 16.2,
-Clang 23.1.3, and ICX 2026.2 oracles, checks a positive IPA forwarding witness,
+Clang 23.1.3, and authenticated ICX 2026.2 oracles (the dedicated lane installs
+GCC from the repository's exact-version cache), checks a positive IPA forwarding witness,
 and records an interleaved median timing report. Both a positive IPA forwarding
 witness and a positive changed-region LRS witness are required, so a silent
 no-op cannot produce a green correctness run. Performance executables have
