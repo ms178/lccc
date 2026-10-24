@@ -1216,20 +1216,32 @@ pub(super) fn fold_uniform_vector_shift(store: &mut LineStore, infos: &mut [Line
             continue;
         }
         let (bmn, bargs) = split_mn(broadcast);
-        if bmn
-            != if row == 1 {
-                "vpbroadcastd"
-            } else {
-                "vpbroadcastq"
-            }
-        {
-            continue;
-        }
         let bops = operand_list(bargs);
-        if bops.len() != 2 || vec_operand(bops[0]) != Some((count, W128)) {
-            continue;
-        }
-        let Some((splat, width @ (W128 | W256))) = vec_operand(bops[1]) else {
+        let count_xmm = Some((count, W128));
+        let splat = match (row, bmn, bops.as_slice()) {
+            (1, "vpbroadcastd", [src, dst]) | (0, "vpbroadcastq", [src, dst])
+                if vec_operand(src) == count_xmm =>
+            {
+                vec_operand(dst)
+            }
+            (1, "pshufd" | "vpshufd", ["$0" | "$0x0" | "$0x00", src, dst])
+                if vec_operand(src) == count_xmm =>
+            {
+                vec_operand(dst).filter(|&(_, width)| width == W128)
+            }
+            (0, "unpcklpd" | "punpcklqdq", [src, dst])
+                if vec_operand(src) == count_xmm && vec_operand(dst) == count_xmm =>
+            {
+                count_xmm
+            }
+            (0, "vunpcklpd" | "vpunpcklqdq", [a, b, dst])
+                if vec_operand(a) == count_xmm && vec_operand(b) == count_xmm =>
+            {
+                vec_operand(dst).filter(|&(_, width)| width == W128)
+            }
+            _ => None,
+        };
+        let Some((splat, width @ (W128 | W256))) = splat else {
             continue;
         };
         let (mn, args) = split_mn(shift);
@@ -3404,6 +3416,44 @@ mod tests {
     }
 
     #[test]
+    fn uniform_shift_shuffle_splats_require_exact_lane_provenance() {
+        for (mov, gp, splat, shift, valid) in [
+            ("movd", "edi", "pshufd $0x00, %xmm0, %xmm0", "vpsllvd", true),
+            ("vmovd", "edi", "vpshufd $0, %xmm0, %xmm0", "vpsravd", true),
+            ("movq", "rdi", "unpcklpd %xmm0, %xmm0", "vpsllvq", true),
+            ("movq", "rdi", "punpcklqdq %xmm0, %xmm0", "vpsrlvq", true),
+            (
+                "vmovq",
+                "rdi",
+                "vpunpcklqdq %xmm0, %xmm0, %xmm0",
+                "vpsrlvq",
+                true,
+            ),
+            (
+                "movd",
+                "edi",
+                "pshufd $0x55, %xmm0, %xmm0",
+                "vpsllvd",
+                false,
+            ),
+            ("movq", "rdi", "unpcklpd %xmm3, %xmm0", "vpsllvq", false),
+            (
+                "vmovq",
+                "rdi",
+                "vunpcklpd %xmm0, %xmm3, %xmm0",
+                "vpsllvq",
+                false,
+            ),
+            ("vmovq", "rdi", "vpshufd $0, %xmm0, %xmm0", "vpsllvd", false),
+        ] {
+            let text = format!(
+                "    {mov} %{gp}, %xmm0\n    {splat}\n    {shift} %xmm0, %xmm2, %xmm0\n    ret\n"
+            );
+            assert_eq!(uniform_shift_only(&text).0, valid, "{text}");
+        }
+    }
+
+    #[test]
     fn uniform_shift_full_pipeline_disable_control() {
         use super::super::test_skips::skip_passes;
         let asm = body(
@@ -3448,6 +3498,18 @@ mod tests {
                 let text = format!(
                     "    # LCCC_RET_XMM 1\n    # LCCC_RET_XMM_BITS {bits}\n    vmovaps %{bank}0, %{bank}2\n    {mov} %{gp}, %xmm0\n    vpbroadcast{lane} %xmm0, %{bank}15\n    {shift}{lane} %{bank}15, %{bank}2, %{bank}0\n    ret\n"
                 );
+                let text = if bank == "xmm" {
+                    text.replace(
+                        &format!("vpbroadcast{lane} %xmm0, %xmm15"),
+                        if lane == "d" {
+                            "vpshufd $0x00, %xmm0, %xmm15"
+                        } else {
+                            "vunpcklpd %xmm0, %xmm0, %xmm15"
+                        },
+                    )
+                } else {
+                    text
+                };
                 let original = body(&text);
                 let (changed, optimized) = uniform_shift_only(&text);
                 assert!(changed, "{optimized}");
