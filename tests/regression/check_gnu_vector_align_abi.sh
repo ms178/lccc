@@ -27,10 +27,10 @@
 #         and as the first stack argument, at -O0 and -O2, in all four
 #         compiler pairings, on both stack residues mod 32.
 # Part 3  i386 (-m32): the layout probes agree (Part 1), lccc agrees with
-#         itself, and the cross-compiler legs are LATCHED as divergent under
-#         ABI-GNUVEC-I386-1 (GCC -m32 passes 16-byte vectors in %xmm0-2 and
-#         keeps 32/64-byte vectors at their full alignment with a realigned
-#         %esp; lccc's i686 call sequence packs them 4-granular). A leg that
+#         itself. The 16-byte XMM-vector cross-compiler legs must agree too.
+#         The 32/64-byte cross legs remain LATCHED under ABI-GNUVEC-I386-1:
+#         GCC keeps these vectors at full alignment with a realigned %esp;
+#         lccc's i686 call sequence still packs them 4-granular. A leg that
 #         changes -- fixed or newly broken -- fails this gate, so the debt is
 #         re-measured on every run instead of hiding.
 set -euo pipefail
@@ -193,7 +193,8 @@ for lanes in 8 16; do
     done
 done
 
-# Part 3: i386. Latched: lccc/lccc agrees; both cross legs diverge.
+# Part 3: i386. The fixed 16-byte XMM ABI agrees in every direction;
+# the separate wider-vector alignment issue retains its measured latch.
 if [ "$i386_ok" = yes ]; then
     for lanes in 4 8 16; do
         for opt in -O0 -O2; do
@@ -204,7 +205,13 @@ if [ "$i386_ok" = yes ]; then
             if [ "$rc" = 0 ]; then ok "i386 v$((lanes * 4)) $opt gcc/gcc (oracle sanity)"; else bad "i386 v$((lanes * 4)) $opt gcc/gcc exit $rc"; fi
             for pair in cl/eg cg/el; do
                 rc=0; leg 32 "${pair%/*}" "${pair#*/}" || rc=$?
-                if [ "$rc" != 0 ] && [ "$rc" != 97 ]; then
+                if [ "$lanes" = 4 ]; then
+                    if [ "$rc" = 0 ]; then
+                        ok "i386 v16 $opt $pair (XMM ABI agrees)"
+                    else
+                        bad "i386 v16 $opt $pair exit $rc: fixed XMM vector ABI regressed"
+                    fi
+                elif [ "$rc" != 0 ] && [ "$rc" != 97 ]; then
                     ok "i386 v$((lanes * 4)) $opt $pair diverges (exit $rc) -- latched ABI-GNUVEC-I386-1"
                 else
                     bad "i386 v$((lanes * 4)) $opt $pair exit $rc: the latched ABI-GNUVEC-I386-1 verdict changed; re-measure and update this gate with the fix"
