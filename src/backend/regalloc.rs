@@ -2067,6 +2067,32 @@ fn ipa_disjoint(tenants: &[(u32, (u32, u32))], (s, e): (u32, u32)) -> bool {
     tenants.iter().all(|&(_, (s2, e2))| e < s2 || e2 < s)
 }
 
+/// Per-point covering counts of the inclusive `(start, end)` ranges, built
+/// with a difference array: O(ranges + points) instead of O(sum of range
+/// lengths), so whole-function intervals on a 50k-program-point function
+/// stay linear (a per-range point sweep would cost ranges × length).
+/// `points` is the program-point axis length; every range must end below
+/// it (they are value intervals on that axis).
+fn interval_covering_counts(ranges: &[(u32, u32)], points: usize) -> Vec<i32> {
+    let mut out = vec![0i32; points];
+    if ranges.is_empty() || points == 0 {
+        return out;
+    }
+    let mut diff = vec![0i32; points + 1];
+    for &(s, e) in ranges {
+        diff[s as usize] += 1;
+        if e as usize + 1 < diff.len() {
+            diff[e as usize + 1] -= 1;
+        }
+    }
+    let mut c = 0i32;
+    for (o, &d) in out.iter_mut().zip(&diff) {
+        c += d;
+        *o = c;
+    }
+    out
+}
+
 /// Make IPA register `p` free over every interval of `ivs`, displacing the
 /// conflicting tenants as ONE group into a single relocation register they
 /// are all allowed in and all disjoint from (the group already shared `p`,
@@ -2172,19 +2198,18 @@ fn ipa_fill_preserved_regs(
         let Some(Some(tenants)) = occ.get(&r.0) else {
             continue;
         };
-        let mut busy = vec![false; horizon];
-        for &(_, (s, e)) in tenants {
-            for b in busy.iter_mut().take(e as usize + 1).skip(s as usize) {
-                *b = true;
-            }
-        }
-        for (f, b) in free_at.iter_mut().zip(&busy) {
-            *f += u32::from(!*b);
+        let busy = interval_covering_counts(
+            &tenants.iter().map(|&(_, iv)| iv).collect::<Vec<_>>(),
+            horizon,
+        );
+        for (f, &n) in free_at.iter_mut().zip(&busy) {
+            *f += u32::from(n == 0);
         }
     }
-    for &(s, e) in fill.scratch_demand {
-        for f in free_at.iter_mut().take(e as usize + 1).skip(s as usize) {
-            *f = f.saturating_sub(1);
+    let scratch = interval_covering_counts(fill.scratch_demand, horizon);
+    for (f, &n) in free_at.iter_mut().zip(&scratch) {
+        if n > 0 {
+            *f = f.saturating_sub(n as u32);
         }
     }
     let mut used: Vec<PhysReg> = Vec::new();
@@ -2200,16 +2225,11 @@ fn ipa_fill_preserved_regs(
                      tenants: &[(u32, (u32, u32))]|
      -> Option<PhysReg> {
         let ivs: Vec<(u32, u32)> = tenants.iter().map(|&(_, iv)| iv).collect();
-        let mut covered = vec![false; free_at.len()];
-        for &(s, e) in &ivs {
-            for c in covered.iter_mut().take(e as usize + 1).skip(s as usize) {
-                *c = true;
-            }
-        }
+        let covered = interval_covering_counts(&ivs, free_at.len());
         if covered
             .iter()
             .zip(free_at.iter())
-            .any(|(&c, &f)| c && f <= IPA_MIN_FREE_SCRATCH)
+            .any(|(&n, &f)| n > 0 && f <= IPA_MIN_FREE_SCRATCH)
         {
             return None;
         }
@@ -2236,8 +2256,10 @@ fn ipa_fill_preserved_regs(
         if fill.trace {
             eprintln!("[RA-IPA] home {:?} in r{}", tenants, p.0);
         }
-        for (f, &c) in free_at.iter_mut().zip(&covered) {
-            *f -= u32::from(c);
+        for (f, &n) in free_at.iter_mut().zip(&covered) {
+            if n > 0 {
+                *f -= 1;
+            }
         }
         for &(v, _) in tenants {
             assignments.insert(v, p);
@@ -19349,6 +19371,78 @@ mod ipa_fill_tests {
         let used = c.run(&[], &[R8], &[RBX], POOL, &tenant_ok, &|_| false, &[]);
         assert!(used.is_empty());
         assert_eq!(c.assignments.get(&200), Some(&RBX), "rename stays put");
+    }
+
+    /// The difference-array fill must match the naive per-range point sweep
+    /// exactly at scale: 50k program points with two hundred whole-function
+    /// ranges (the old sweep cost ranges x length here; the difference
+    /// array costs ranges + points). The reference below IS the old
+    /// algorithm, run once to pin the semantics.
+    #[test]
+    fn interval_covering_counts_matches_naive_at_scale() {
+        const POINTS: u32 = 50_000;
+        let mut ranges: Vec<(u32, u32)> = vec![(0, POINTS - 1); 200];
+        ranges.push((5, 5));
+        ranges.push((7, 9));
+        ranges.push((POINTS - 2, POINTS - 1));
+        let got = interval_covering_counts(&ranges, POINTS as usize);
+        let mut want = vec![0i32; POINTS as usize];
+        for &(s, e) in &ranges {
+            for w in want.iter_mut().take(e as usize + 1).skip(s as usize) {
+                *w += 1;
+            }
+        }
+        assert_eq!(got, want);
+        assert_eq!(got[0], 200);
+        assert_eq!(got[5], 201);
+        assert_eq!(got[6], 200);
+        assert_eq!(got[7], 201);
+        assert_eq!(got[10], 200);
+        assert_eq!(got[(POINTS - 1) as usize], 201);
+        // Degenerate axes.
+        assert_eq!(
+            interval_covering_counts(&[], POINTS as usize),
+            vec![0i32; POINTS as usize]
+        );
+        assert_eq!(interval_covering_counts(&ranges, 0), Vec::<i32>::new());
+    }
+
+    /// End-to-end at 50k program points: a relocation register holding
+    /// two thousand whole-function tenants used to cost 2000 x 50k point
+    /// writes to build the occupancy axis; the difference array keeps the
+    /// fill linear. The placement decision itself is unchanged: the tenant
+    /// register is busy everywhere, so the single candidate homes in the
+    /// free IPA register.
+    #[test]
+    fn fifty_k_program_points_stay_linear_for_whole_function_tenants() {
+        const POINTS: u32 = 50_000;
+        let make = || {
+            let mut vals: Vec<(u32, (u32, u32), u64, Option<PhysReg>)> = Vec::with_capacity(2002);
+            vals.push((1, (0, POINTS - 1), 10, None));
+            for i in 0..2000u32 {
+                vals.push((100_000 + i, (0, POINTS - 1), 1, Some(R11)));
+            }
+            Case::new(&vals)
+        };
+        let mut c = make();
+        let used = c.run(&[1], &[R8], &[], POOL, &tenant_ok, &|_| false, &[]);
+        assert_eq!(used, vec![R8]);
+        assert_eq!(c.assignments.get(&1), Some(&R8));
+        // A whole-axis scratch demand must not change that the single free
+        // IPA register still wins (free axis 3 -> 2 after the demand, above
+        // IPA_MIN_FREE_SCRATCH).
+        let mut c = make();
+        let used = c.run(
+            &[1],
+            &[R8],
+            &[],
+            POOL,
+            &tenant_ok,
+            &|_| false,
+            &[(0, POINTS - 1)],
+        );
+        assert_eq!(used, vec![R8]);
+        assert_eq!(c.assignments.get(&1), Some(&R8));
     }
 
     #[test]
