@@ -101,3 +101,14 @@ available cache contains no ICX payload; fresh ICX2026.2 comparison is missing.
 is not solved by a compiler-latency optimization. No universal optimality,
 all-architecture certification or superiority over other C compilers follows
 from this evidence.
+
+## Hosted lane-plan follow-up
+
+The first hosted run caught an integration omission: the new compiler-free
+experiment-contract gate was in `frontend-b` but absent from
+`.github/ci-lane-plan.json`. The structural audit correctly rejected that
+unplanned gate. Register its existing assignment and its measured 0.24 s local
+cost, updating the lane's predicted total without moving or disabling any gate.
+The lane-plan audit, its 18-rule/25-fixture self-test, the shard-partition audit,
+and all three experiment-contract tests pass after that correction. This fixes
+the review record rather than relaxing the checker; hosted checks must rerun.
