@@ -2562,6 +2562,15 @@ pub(crate) fn split_relocation_symbol_addend(s: &str) -> Option<(&str, i64)> {
     }
 }
 
+/// Separate a source constant from a relocation symbol without allocating.
+/// Keep an overflowing expression intact for the normal undefined-symbol
+/// diagnostic rather than silently wrapping it to a different address.
+pub(crate) fn normalize_relocation_symbol_addend(symbol: &str, addend: i64) -> (&str, i64) {
+    split_relocation_symbol_addend(symbol)
+        .and_then(|(base, extra)| addend.checked_add(extra).map(|sum| (base, sum)))
+        .unwrap_or((symbol, addend))
+}
+
 /// Try to parse a `symbol+offset` or `symbol-offset` expression.
 /// Returns None if the string doesn't match this pattern.
 fn try_parse_symbol_plus_offset(s: &str) -> Option<Displacement> {
@@ -5891,5 +5900,34 @@ mod integer_grammar_equivalence_tests {
                 "{text:?}: got {err:?}, want it to mention {want:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod relocation_symbol_normalization_tests {
+    use super::normalize_relocation_symbol_addend;
+
+    #[test]
+    fn source_addends_are_checked_and_symbol_differences_are_not_split() {
+        assert_eq!(
+            normalize_relocation_symbol_addend("anchor+17", -4),
+            ("anchor", 13)
+        );
+        assert_eq!(
+            normalize_relocation_symbol_addend("anchor-17", -4),
+            ("anchor", -21)
+        );
+        assert_eq!(
+            normalize_relocation_symbol_addend("anchor-other", -4),
+            ("anchor-other", -4)
+        );
+        assert_eq!(
+            normalize_relocation_symbol_addend("anchor+1", i64::MAX),
+            ("anchor+1", i64::MAX)
+        );
+        assert_eq!(
+            normalize_relocation_symbol_addend("anchor-1", i64::MIN),
+            ("anchor-1", i64::MIN)
+        );
     }
 }

@@ -12,7 +12,7 @@ The combined PDF's SHA-256 is
 All 5,364 pages were extracted; all 4,106 bookmarks were indexed. The large
 source files and full bookmark review ledger are workspace artifacts under
 `/home/user/artifacts/instruction-audit/`, not vendored source files.
-Extraction and indexing are not semantic review. Thirteen instruction sections
+Extraction and indexing are not semantic review. Fourteen sections
 have partial, explicitly scoped reviews; other bookmark entries are unreviewed.
 
 The shift review concerns only register-only, unmasked 128/256-bit forms:
@@ -221,3 +221,65 @@ The completed production-source snapshot passes **6,201 library tests**
 and the unchanged audit ratchet. The latest main merge reconciles independent
 knob additions at 533 literals. No ignored-test, panic, unsafe, large-function
 or undocumented-knob budget was increased for this audit tranche.
+
+## Continued review: immediate-memory relocation origins
+
+SDM volume 2A section **2.2.1.6, RIP-Relative Addressing** (combined PDF page
+627) defines the origin as the RIP of the **next instruction**. An immediate
+following disp32 is therefore part of the distance subtracted in an ELF
+PC-relative addend: with imm8 the assembler must use user-addend **minus 5**,
+not minus 4. The SDM supplies the address semantics; ELF addend spelling and
+symbol arithmetic are independently checked against GNU binutils 2.47.20260726.
+
+Ten EVEX immediate-memory encoder families omitted that adjustment: ordinary
+and SAE-capable two-operand immediates, packed shifts, three-source immediates,
+compare-to-mask, extraction, rotation, AVX10.2 VMPSADBW, VFPCLASS and VCVTPS2PH.
+The common legacy SSE/MMX immediate encoder had the same error, affecting all
+27 mnemonics currently dispatched through it. Memory destinations are affected
+as well as loads. The new memory-plus-imm8 emission helpers keep the adjustment
+and immediate together; they touch only relocations emitted by that operand,
+not earlier instructions or absolute-address relocations. The emitted opcodes
+and instruction lengths are unchanged.
+
+The i686 address planner also bypassed source-addend normalization for a
+broadcast-decorated absolute symbol. `anchor+17{1to16}` could become an undefined
+symbol literally named `anchor+17`. It now normalizes pending memory symbols
+before GOT/TLS addend policy and before replacing shared EVEX address bytes.
+One allocation-free, checked normalization helper is shared with both existing
+architecture-specific relocation insertion paths. Overflow retains the source
+spelling for the existing diagnostic path; symbol differences retain their
+separate resolver contract.
+
+The new ELF differential fixtures cover **258 x86-64 cases** and **45 i686
+cases**, including positive/negative user addends, GOTPCREL, absolute controls,
+broadcasts and memory destinations. The old binary fails **215 of the 258**
+x86-64 cases and **2 of the 45** i686 cases; the fixed binary passes all of them.
+The complete corpora now pass **1,692 x86-64 + 733 i686 cases**. The Rust tests
+also check prior-relocation isolation, each legacy mnemonic, 16-bit-address
+and 32-bit-address i686 broadcast addends, and checked normalization boundaries.
+All **6,204 library tests** pass (10 pre-existing ignored tests), as do the
+linker binary test, strict all-target Clippy and the unchanged 533-knob census.
+
+`rip-immediate.s` plus `rip-immediate-driver.c` independently exercise a legacy
+PSHUFD load, an EVEX packed-shift load and an EVEX extraction store. On this
+AVX512F/VL-capable host, GCC 16.2 and Clang 23.1 drivers both pass with the fixed
+assembler and GNU assembler objects. With the old object, both detect the wrong
+EVEX load/store before the misaligned legacy load faults with SIGSEGV.
+`rip-immediate-start.s` provides a libc-free entry point: executables linked
+with **lccc-ld** also pass for both fixed and GNU objects and fault for the old
+object. These are semantic witnesses, not throughput benchmarks.
+
+Reproduce the positive native witnesses after a fastbuild:
+
+```sh
+D=engineering/evidence/instruction-audit-2026-10-24
+lccc -c "$D/rip-immediate.s" -o /tmp/rip-memory.o
+gcc "$D/rip-immediate-driver.c" /tmp/rip-memory.o -o /tmp/rip-driver
+/tmp/rip-driver  # requires AVX512F and AVX512VL; returns 77 otherwise
+lccc -c "$D/rip-immediate-start.s" -o /tmp/rip-start.o
+lccc-ld -o /tmp/rip-static /tmp/rip-start.o /tmp/rip-memory.o
+/tmp/rip-static  # execute only on an AVX512F/VL-capable host
+```
+
+This adds a fourteenth **partial** section review, not completion of the
+manual, the assembler, or any backend as a whole.
