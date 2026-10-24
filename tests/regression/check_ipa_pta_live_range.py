@@ -212,6 +212,33 @@ int main(void) {
         performance=True,
     ),
     Case(
+        "lrs-low-latency-pressure",
+        r'''
+#include <stdio.h>
+#include <stdint.h>
+static __attribute__((noinline)) uint32_t low_latency(uint32_t x) {
+    uint32_t a0 = x + 1, a1 = x ^ 0x13579bdfu, a2 = x + 7;
+    uint32_t a3 = x + 11, a4 = x ^ 0x2468ace0u, a5 = x + 13;
+    uint32_t a6 = x + 17, a7 = x ^ 0x55aa33ccu, a8 = x + 19;
+    uint32_t a9 = x + 23, a10 = x ^ 0x10203040u, a11 = x + 29;
+    uint32_t a12 = x + 31, a13 = x ^ 0x31415926u, a14 = x + 37;
+    uint32_t a15 = x + 41, a16 = x ^ 0x27182818u, a17 = x + 43;
+    uint32_t a18 = x + 47, a19 = x ^ 0xdeadbeefu;
+    uint32_t b0 = a0 + a1, b1 = a2 + a3, b2 = a4 + a5, b3 = a6 + a7;
+    uint32_t b4 = a8 + a9, b5 = a10 + a11, b6 = a12 + a13;
+    uint32_t b7 = a14 + a15, b8 = a16 + a17, b9 = a18 + a19;
+    return b0 + b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8 + b9
+         + a1 + a5 + a9 + a13 + a17;
+}
+int main(void) {
+    uint32_t sum = 0;
+    for (uint32_t i = 0; i < 1000; ++i) sum += low_latency(i);
+    printf("%08x\n", sum);
+    return 0;
+}
+''',
+    ),
+    Case(
         "lrs-memory-and-volatile-boundaries",
         r'''
 #include <stdio.h>

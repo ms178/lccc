@@ -9,9 +9,10 @@
 //!   memory operations, calls, atomics, asm, stack manipulation, PHIs and
 //!   target-ABI pseudo operations are hard region boundaries;
 //! * a candidate schedule is committed only when the measured pressure model
-//!   improves excess pressure without increasing total live area or peak in
-//!   either register class.  A heuristic that merely looks profitable locally
-//!   therefore cannot make the function's modelled allocation problem worse.
+//!   improves excess pressure without increasing total live area, peak in
+//!   either register class, or dependency-aware issue latency. A heuristic
+//!   that merely looks profitable locally therefore cannot make the function's
+//!   modelled allocation problem worse or serialize a longer-latency DAG.
 //!
 //! This is deliberately not a general latency scheduler.  Moving work below
 //! the register-file pressure threshold only perturbs debug locations and can
@@ -77,6 +78,8 @@ pub(crate) struct ShrinkStats {
     pub changed_regions: usize,
     pub excess_area_before: u64,
     pub excess_area_after: u64,
+    pub latency_before: u64,
+    pub latency_after: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -90,6 +93,7 @@ struct Node {
     original: usize,
     uses: Vec<u32>,
     dest: Option<u32>,
+    predecessors: Vec<usize>,
     successors: Vec<usize>,
     remaining_predecessors: usize,
 }
@@ -380,6 +384,7 @@ fn build_nodes(
                 original: start + offset,
                 uses,
                 dest: inst.dest().map(|d| d.0),
+                predecessors: Vec::new(),
                 successors: Vec::new(),
                 remaining_predecessors: 0,
             }
@@ -395,6 +400,7 @@ fn build_nodes(
                 }
                 if edges.insert((producer, node)) {
                     nodes[producer].successors.push(node);
+                    nodes[node].predecessors.push(producer);
                     nodes[node].remaining_predecessors += 1;
                 }
             }
@@ -425,37 +431,138 @@ fn simulate_original(
     sim.metrics
 }
 
+fn instruction_latency(inst: &Instruction, target: Target) -> u64 {
+    use crate::ir::reexports::IrBinOp;
+    match inst {
+        Instruction::BinOp { op, ty, .. } => match op {
+            IrBinOp::SDiv | IrBinOp::UDiv | IrBinOp::SRem | IrBinOp::URem => {
+                if ty.is_float() {
+                    12
+                } else {
+                    match target {
+                        Target::X86_64 | Target::I686 => {
+                            if ty.size() > 4 {
+                                24
+                            } else {
+                                16
+                            }
+                        }
+                        Target::Aarch64 => 8,
+                        Target::Riscv64 => 16,
+                    }
+                }
+            }
+            IrBinOp::Mul | IrBinOp::UMulHigh | IrBinOp::SMulHigh => {
+                if ty.is_float() {
+                    4
+                } else {
+                    3
+                }
+            }
+            _ if ty.is_float() => 4,
+            _ => 1,
+        },
+        Instruction::UnaryOp { ty, .. } if ty.is_float() => 4,
+        _ => 1,
+    }
+}
+
+/// Dependency-aware in-order issue cost. This is not a replacement for the
+/// pressure objective or a claim about out-of-order hardware; it is a guard
+/// against serializing long-latency dependency chains merely to die values
+/// earlier. Every candidate is compared with the original order using the
+/// same model.
+fn schedule_latency(
+    nodes: &[Node],
+    instructions: &[Instruction],
+    target: Target,
+    order: &[usize],
+) -> u64 {
+    let mut completion = vec![0u64; nodes.len()];
+    let mut issue = 0u64;
+    let mut makespan = 0u64;
+    for &node_index in order {
+        let node = &nodes[node_index];
+        let ready = node
+            .predecessors
+            .iter()
+            .map(|&predecessor| completion[predecessor])
+            .max()
+            .unwrap_or(0);
+        let start = issue.max(ready);
+        let finish =
+            start.saturating_add(instruction_latency(&instructions[node.original], target));
+        completion[node_index] = finish;
+        issue = start.saturating_add(1);
+        makespan = makespan.max(finish);
+    }
+    makespan
+}
+
 fn candidate_order(
     nodes: &mut [Node],
+    instructions: &[Instruction],
+    target: Target,
     remaining: &[u32],
     relevant: &[u32],
     locally_defined: &FxHashSet<u32>,
     info: &[ValueInfo],
     budget: PressureBudget,
-) -> Option<(Vec<usize>, Metrics)> {
+) -> Option<(Vec<usize>, Metrics, u64)> {
     let mut sim = Simulation::new(remaining.to_vec(), relevant, locally_defined, info);
+    let mut completion = vec![0u64; nodes.len()];
+    let mut issue = 0u64;
+    let mut makespan = 0u64;
     let mut ready: Vec<usize> = (0..nodes.len())
         .filter(|&i| nodes[i].remaining_predecessors == 0)
         .collect();
     let mut order = Vec::with_capacity(nodes.len());
     while !ready.is_empty() {
-        let mut best: Option<(usize, (u32, u32, std::cmp::Reverse<u32>, usize))> = None;
+        let mut best: Option<(usize, (u32, u32, u64, std::cmp::Reverse<u32>, usize))> = None;
         for (position, &node_index) in ready.iter().enumerate() {
             let node = &nodes[node_index];
             let (excess, worst) = sim.excess_after(node, info, budget);
             let (_, deaths, _) = sim.pressure_delta(node, info);
+            let ready_at = node
+                .predecessors
+                .iter()
+                .map(|&predecessor| completion[predecessor])
+                .max()
+                .unwrap_or(0);
+            let start = issue.max(ready_at);
+            let finish =
+                start.saturating_add(instruction_latency(&instructions[node.original], target));
             // Absolute post-instruction excess is the primary key (the current
-            // pressure is common to every candidate).  Prefer deaths on a tie,
-            // then source order.  This retains GCC's stable behaviour below
-            // the pressure threshold while avoiding its one-step-only choice
-            // between equal total and equal worst-class excess.
-            let key = (excess, worst, std::cmp::Reverse(deaths), node.original);
+            // pressure is common to every candidate). Dependency-aware issue
+            // cost breaks pressure ties before deaths and source order; the
+            // final acceptance check also rejects a net latency regression.
+            let key = (
+                excess,
+                worst,
+                makespan.max(finish),
+                std::cmp::Reverse(deaths),
+                node.original,
+            );
             if best.is_none_or(|(_, best_key)| key < best_key) {
                 best = Some((position, key));
             }
         }
         let (position, _) = best.expect("non-empty ready list");
         let node_index = ready.swap_remove(position);
+        let ready_at = nodes[node_index]
+            .predecessors
+            .iter()
+            .map(|&predecessor| completion[predecessor])
+            .max()
+            .unwrap_or(0);
+        let start = issue.max(ready_at);
+        let finish = start.saturating_add(instruction_latency(
+            &instructions[nodes[node_index].original],
+            target,
+        ));
+        completion[node_index] = finish;
+        issue = start.saturating_add(1);
+        makespan = makespan.max(finish);
         sim.apply(&nodes[node_index], info, budget);
         order.push(node_index);
         for &succ in &nodes[node_index].successors {
@@ -468,15 +575,21 @@ fn candidate_order(
     if order.len() != nodes.len() {
         return None;
     }
-    Some((order, sim.metrics))
+    Some((order, sim.metrics, makespan))
 }
 
-fn strictly_better(before: Metrics, after: Metrics) -> bool {
+fn strictly_better(
+    before: Metrics,
+    after: Metrics,
+    before_latency: u64,
+    after_latency: u64,
+) -> bool {
     let improves = (0..CLASSES).any(|class| {
         after.0[class].excess_area < before.0[class].excess_area
             || after.0[class].excess_peak < before.0[class].excess_peak
     });
     improves
+        && after_latency <= before_latency
         && (0..CLASSES).all(|class| {
             let a = after.0[class];
             let b = before.0[class];
@@ -559,15 +672,21 @@ fn schedule_function(
                         stats.high_pressure_regions += 1;
                         stats.excess_area_before =
                             stats.excess_area_before.saturating_add(before_excess);
-                        if let Some((order, after)) = candidate_order(
+                        let original_order: Vec<usize> = (0..nodes.len()).collect();
+                        let before_latency =
+                            schedule_latency(&nodes, &block.instructions, target, &original_order);
+                        stats.latency_before = stats.latency_before.saturating_add(before_latency);
+                        if let Some((order, after, after_latency)) = candidate_order(
                             &mut nodes,
+                            &block.instructions,
+                            target,
                             &remaining_original,
                             &relevant,
                             &locally_defined,
                             &info,
                             budget,
                         ) {
-                            if strictly_better(before, after) {
+                            if strictly_better(before, after, before_latency, after_latency) {
                                 for (offset, node_index) in order.into_iter().enumerate() {
                                     final_order[start + offset] = start + node_index;
                                 }
@@ -578,14 +697,20 @@ fn schedule_function(
                                     .fold(0u64, u64::saturating_add);
                                 stats.excess_area_after =
                                     stats.excess_area_after.saturating_add(after_excess);
+                                stats.latency_after =
+                                    stats.latency_after.saturating_add(after_latency);
                                 stats.changed_regions += 1;
                             } else {
                                 stats.excess_area_after =
                                     stats.excess_area_after.saturating_add(before_excess);
+                                stats.latency_after =
+                                    stats.latency_after.saturating_add(before_latency);
                             }
                         } else {
                             stats.excess_area_after =
                                 stats.excess_area_after.saturating_add(before_excess);
+                            stats.latency_after =
+                                stats.latency_after.saturating_add(before_latency);
                         }
                     }
                 }
@@ -659,12 +784,14 @@ pub(crate) fn run_with_budget(
     }
     if std::env::var_os("CCC_LR_SHRINK_STATS").is_some() {
         eprintln!(
-            "[LR-SHRINK] regions={} high-pressure={} changed={} excess-area={}->{}",
+            "[LR-SHRINK] regions={} high-pressure={} changed={} excess-area={}->{} latency={}->{}",
             stats.regions,
             stats.high_pressure_regions,
             stats.changed_regions,
             stats.excess_area_before,
-            stats.excess_area_after
+            stats.excess_area_after,
+            stats.latency_before,
+            stats.latency_after
         );
     }
     stats
@@ -866,6 +993,16 @@ mod tests {
         let stats = run_with_budget(&mut m, Target::X86_64, PressureBudget { gp: 1, vector: 1 });
         assert_eq!(stats.changed_regions, 0);
         assert_eq!(dests(&m.functions[0]), before);
+    }
+
+    #[test]
+    fn latency_regression_rejects_an_otherwise_better_schedule() {
+        let mut before = Metrics::default();
+        before.0[GP].excess_area = 4;
+        before.0[GP].excess_peak = 2;
+        let after = Metrics::default();
+        assert!(!strictly_better(before, after, 20, 21));
+        assert!(strictly_better(before, after, 20, 20));
     }
 
     #[test]

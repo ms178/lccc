@@ -73,10 +73,13 @@ operation or speculate an instruction across control flow.
 
 The objective separately tracks GP and FP/vector pressure, including two-GP
 64-bit values on i686. A ready-list candidate minimizes post-instruction excess
-pressure, then worst-class excess, then prefers deaths and stable source order.
-A candidate is committed only if it strictly improves excess area or peak
-without increasing live area or peak in either class. Below-threshold regions
-retain source order; rejected simulations have no IR effect.
+pressure, then worst-class excess and dependency-aware issue cost, then prefers
+deaths and stable source order. A candidate is committed only if it strictly
+improves excess area or peak without increasing live area or peak in either
+class and without increasing the same DAG latency model evaluated for the
+original order. This guard is deliberately a profitability check, not a claim
+to model every out-of-order core. Below-threshold regions retain source order;
+rejected simulations have no IR effect.
 
 The budgets are architectural starting points (x86-64 14 GP/16 vector, i686
 6/8, AArch64 28/32, RISC-V 27/32), not claims about a particular host CPU.
@@ -84,7 +87,8 @@ APX's additional GPRs are not assumed by this IR pass: backend eligibility and
 calling-convention reservations must be proven before raising that budget.
 The existing backend's APX-aware allocation remains independent.
 
-`CCC_LR_SHRINK_STATS=1` reports region counts and excess-area before/after.
+`CCC_LR_SHRINK_STATS=1` reports region counts and excess-area/issue-latency
+before/after.
 
 ## Reference review
 
