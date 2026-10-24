@@ -57,7 +57,7 @@ CASES = [
 static int cell = 7;
 static __attribute__((noinline)) void read_only(int *p) {
     /* Keep a real memory reference in the callee without writing it. */
-    if (*p == -12345) __builtin_trap();
+    if (*(volatile int *)p == -12345) __builtin_trap();
 }
 int main(void) {
     /* A global keeps this witness after early scalar replacement: the
