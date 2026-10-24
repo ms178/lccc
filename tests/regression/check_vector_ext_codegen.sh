@@ -228,8 +228,12 @@ ceiling loop_v32i 16
 # Shapes still on the per-lane scalar path, ratcheted at their measured
 # counts so the memory-object cost model cannot regress unnoticed
 # (GCC: 2 / 11 / 11 / 15; see FOLLOWUP "vector-ext scalar residue").
+# MEMORY-class incoming homes avoid capture copies and per-use alignment.
+ceiling cf_wrap_phi 10  # was 32; GCC: 6
+ceiling nine 12         # ninth vector is stack-passed; was 20; GCC: 9
+ceiling nine4 11        # was 17; GCC: 9
 ceiling sadd 2         # single-member vector record: returned like the bare vector (GCC: 2)
-ceiling s4i_add 26     # struct-wrapped 128-bit add
+ceiling s4i_add 16     # struct-wrapped 128-bit add
 ceiling tern_se 53     # ternary whose arms are calls (two sret temporaries)
 ceiling viacall 30     # by-value call into a GCC-built callee + return
 ceiling shr_v32l 6     # signed 64-bit lanes: vpsrlvq + sign fix-up (xor/sub), GCC: 6

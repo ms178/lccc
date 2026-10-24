@@ -564,7 +564,7 @@ fn classify_alloca(
     max_block_local_space: &mut i64,
 ) {
     // `Alloca.align` is authoritative, for parameter allocas too: the
-    // lowering homes a parameter alloca at `struct_align.or(param_align)`
+    // lowering homes a parameter alloca at `max(struct_align, param_align)`
     // (func_lowering.rs, `allocate_function_params`), and the only pass that
     // lowers it afterwards is `downgrade_nonescaping_vector_align`, which
     // does so exactly when it has proven every use alignment-insensitive
@@ -589,6 +589,13 @@ fn classify_alloca(
 
     state.alloca_values.insert(dest.0);
     state.alloca_types.insert(dest.0, ty);
+    // The caller already created this callee-owned by-value object. Its
+    // checked ABI alignment satisfies Alloca.align, including >16 alignment;
+    // do not register a runtime align-up or reserve a second local object.
+    if let Some(&slot) = state.incoming_byval_slots.get(&dest.0) {
+        state.value_locations.insert(dest.0, slot);
+        return;
+    }
     if effective_align > 16 {
         state.alloca_alignments.insert(dest.0, effective_align);
     }

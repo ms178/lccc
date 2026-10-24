@@ -1023,6 +1023,11 @@ jobs:
       run: |
         [ -s "$RUNNER_TEMP/vector-ext-codegen.log" ] || exit 0
         python3 scripts/ci_annotate_log.py --title "vector-ext codegen" "$RUNNER_TEMP/vector-ext-codegen.log"
+    - name: Incoming MEMORY parameter homes and cross-compiler ABI
+      run: |
+        set -euo pipefail
+        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_incoming_byval_homes.sh
+        env CCC=target/fastbuild/lccc ORACLE_CC="${CLANG:-clang-23}" bash tests/regression/check_incoming_byval_homes.sh
     needs:
     - build
   codegen-a:
@@ -2742,6 +2747,8 @@ jobs:
           GCC_SIGN_CMOV="${GCC16:-gcc}" CLANG_SIGN_CMOV="${CLANG:-clang}" \
           ICX_SIGN_CMOV="$LCCC_ICX_BIN" LCCC_FASTBUILD_BIN=target/fastbuild/lccc \
           bash tests/regression/check_sign_test_cmov.sh
+    - name: Incoming MEMORY parameter ABI against ICX
+      run: env CCC=target/fastbuild/lccc ORACLE_CC="$LCCC_ICX_BIN" bash tests/regression/check_incoming_byval_homes.sh
     - name: FP select min/max matrix against ICX
       run: |
         set -euo pipefail
