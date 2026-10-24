@@ -85,38 +85,52 @@ for mode in default sse2 sse-only sse2-denied arch-denied sse-restored no-sse; d
         default)
             isa_flags=()
             expect_sse=1 expect_sse2=1 expect_sse3=0 expect_pshufd=1 expect_xmm=1
+            mixed_abi=1
             ;;
         sse2)
             isa_flags=(-msse2)
             expect_sse=1 expect_sse2=1 expect_sse3=0 expect_pshufd=1 expect_xmm=1
+            mixed_abi=1
             ;;
         sse-only)
             isa_flags=(-msse -mno-sse2)
             expect_sse=1 expect_sse2=0 expect_sse3=0 expect_pshufd=0 expect_xmm=1
+            mixed_abi=0
             ;;
         sse2-denied)
             isa_flags=(-mno-sse2)
             expect_sse=1 expect_sse2=0 expect_sse3=0 expect_pshufd=0 expect_xmm=1
+            mixed_abi=0
             ;;
         arch-denied)
             isa_flags=(-mno-sse2 -march=nehalem)
             expect_sse=1 expect_sse2=0 expect_sse3=0 expect_pshufd=0 expect_xmm=1
+            mixed_abi=0
             ;;
         sse-restored)
             isa_flags=(-mno-sse -msse)
             expect_sse=1 expect_sse2=1 expect_sse3=0 expect_pshufd=1 expect_xmm=1
+            mixed_abi=0
             ;;
         no-sse)
             isa_flags=(-mno-sse)
             expect_sse=0 expect_sse2=0 expect_sse3=0 expect_pshufd=0 expect_xmm=0
+            mixed_abi=0
             ;;
     esac
     flags=("${base_flags[@]}" "${isa_flags[@]}")
     for compiler in "$ccc" "$GCC_ORACLE_BIN" "$CLANG_ORACLE_BIN"; do
+        compiler_expect_sse2=$expect_sse2
+        if [[ $mode == sse-restored && $compiler == "$CLANG_ORACLE_BIN" ]]; then
+            # LLVM's -sse disables dependent SSE2, while a later +sse has no
+            # reverse implication. GCC/LCCC instead restore their SSE2
+            # baseline because there was no independent -mno-sse2 request.
+            compiler_expect_sse2=0
+        fi
         extra=()
         [[ $compiler == "$ccc" ]] || extra=(-B"$as_dir/")
         "$compiler" "${flags[@]}" "${extra[@]}" \
-            -DEXPECT_SSE="$expect_sse" -DEXPECT_SSE2="$expect_sse2" \
+            -DEXPECT_SSE="$expect_sse" -DEXPECT_SSE2="$compiler_expect_sse2" \
             -DEXPECT_SSE3="$expect_sse3" \
             -c "$tmp/feature-macros.c" -o "$tmp/feature-macros.o"
     done
@@ -143,9 +157,23 @@ for mode in default sse2 sse-only sse2-denied arch-denied sse-restored no-sse; d
     echo "ok: $mode macros + ISA ceiling (pshufd=$pshufd_count xmm=$xmm_count)"
 
     for driver in "$GCC_ORACLE_BIN" "$CLANG_ORACLE_BIN"; do
+        driver_family=gcc
+        [[ $driver != "$CLANG_ORACLE_BIN" ]] || driver_family=clang
         "$driver" "${flags[@]}" -B"$as_dir/" -O2 -c "$fixture/driver.c" -o "$tmp/abi-driver.o"
         "$driver" "${flags[@]}" -B"$as_dir/" -O2 -DSHUFFLE_DRIVER_ONLY -c "$tmp/typed.c" -o "$tmp/typed-driver.o"
         for compiler in "$ccc" "$GCC_ORACLE_BIN" "$CLANG_ORACLE_BIN"; do
+            compiler_family=gcc
+            [[ $compiler != "$CLANG_ORACLE_BIN" ]] || compiler_family=clang
+            # LLVM 23.1.3 X86CallingConv.td passes only v4f32 in XMM
+            # registers with SSE1 but no SSE2; GCC and LCCC also use XMM for
+            # these integer/double vectors. Clang's no-SSE vector return rule
+            # likewise differs from GCC's stack/sret convention. Those are
+            # incompatible ABI families, not valid differential rows. Keep
+            # every mixed row where the conventions agree and all same-family
+            # rows where they do not; LCCC remains in the GCC family.
+            if (( ! mixed_abi )) && [[ $compiler_family != "$driver_family" ]]; then
+                continue
+            fi
             extra=()
             [[ $compiler == "$ccc" ]] || extra=(-B"$as_dir/")
             for opt in O0 O2 O3 Os; do
@@ -161,8 +189,10 @@ for mode in default sse2 sse-only sse2-denied arch-denied sse-restored no-sse; d
         done
     done
 done
-[[ $configurations == 168 ]] || {
-    echo "FAIL: executed $configurations configurations, expected 168" >&2
+# Two mixed-ABI modes run 2*3*4 rows; five same-family modes run
+# (2 GCC-family + 1 Clang-family)*4 rows.
+[[ $configurations == 108 ]] || {
+    echo "FAIL: executed $configurations configurations, expected 108" >&2
     exit 1
 }
-echo 'PASS: 168 i686 GNU vector configurations; default/SSE-only/SSE2/no-SSE ABI, flag-order macro ceilings, PSHUFD ceilings, indirect calls, stack overflow, variadics and typed shuffles'
+echo 'PASS: 108 i686 GNU vector configurations; default/SSE-only/SSE2/no-SSE ABI, flag-order macro ceilings, PSHUFD ceilings, indirect calls, stack overflow, variadics and typed shuffles'

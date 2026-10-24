@@ -407,17 +407,30 @@ and `-mno-sse -msse` restores baseline SSE2 unless a direct SSE2 denial is
 also present. The effective-feature mirror now publishes those baseline and
 denial states to this classifier. Prefetch retains its narrower positive-
 grant predicate instead of inheriting the backend's baseline. Other GNU
-vector widths are not changed. This is an ABI finding from current compiler
-differential evidence, not a calling-convention claim derived from the SDM.
+vector widths are not changed. The existing alignment-ABI gate now requires
+all four i386 v16 mixed LCCC/GCC legs at O0/O2 to exit zero; the hosted
+`be7156898` run observed exactly those four repaired results while its stale
+expected-divergence ratchet failed. The v32/v64 legs remain explicitly latched
+as ABI-GNUVEC-I386-1 debt (observed exit 27), not declared fixed. This is an
+ABI finding from current compiler differential evidence, not a
+calling-convention claim derived from the SDM.
 
 `check_i686_gnu_vector_abi.sh` requires GCC 16.2.0, Clang 23.1.3 and GNU as
 2.47. It links freestanding ELF32 programs with lccc-ld, requiring no 32-bit
 libc headers/runtime. Across default, explicit SSE2, SSE-only, SSE2-denied,
-profile-denied, SSE-restored and no-SSE modes, both driver compilers, and all
-three function compilers at O0/O2/O3/Os, it exercises 168 cross-TU
-configurations, each with 16,384 vector-ABI checks and 18,432 typed-shuffle
-checks. Compile-time `__SSE__`/`__SSE2__`/`__SSE3__` checks and non-vacuous
-PSHUFD/XMM assembly ceilings cover states that a host runtime cannot observe.
+profile-denied, SSE-restored and no-SSE modes, it exercises 108 cross-TU
+configurations at O0/O2/O3/Os, each with 16,384 vector-ABI checks and 18,432
+typed-shuffle checks. Default and SSE2 run all 24 mixed-compiler rows. The
+other five modes run 12 same-ABI-family rows: LLVM 23.1.3's
+`X86CallingConv.td` passes only `v4f32` in XMM with SSE1 but no SSE2, whereas
+GCC/LCCC also use XMM for the tested integer/double vectors, and Clang's no-SSE
+vector return rule differs from GCC stack/sret. LLVM's `-sse` also disables
+dependent SSE2 without a reverse implication from a later `+sse`, so its
+SSE-restored row is SSE-only while GCC/LCCC restore SSE2. Linking incompatible
+families is not a valid differential test; all compatible mixed rows and all
+same-family rows remain mandatory. Compile-time
+`__SSE__`/`__SSE2__`/`__SSE3__` checks and non-vacuous PSHUFD/XMM assembly
+ceilings cover states that a host runtime cannot observe.
 Integer element widths 8/16/32/64, double bit patterns, indirect calls,
 register exhaustion, 16-byte stack alignment and variadic named/unnamed
 vectors are covered. The shared typed fixture keeps its original checks;

@@ -215,9 +215,9 @@ impl Driver {
     /// replayed after the profile lands (see
     /// [`Driver::replay_x86_explicit_isa_flags`]).
     fn reset_x86_arch_implied_isa(&mut self) {
-        // `enable_sse` is only ever set by the explicit `-msse`/`-msse2`
-        // flags, which are replayed after the profile like every other
-        // explicit decision; `enable_prfchw` is arch-implied or explicit.
+        // `enable_sse` is set only by explicit SSE/SSE2-granting flags,
+        // which are replayed after the profile like every other explicit
+        // decision; `enable_prfchw` is arch-implied or explicit.
         self.enable_sse = false;
         self.enable_prfchw = false;
         self.enable_sse3 = false;
@@ -327,40 +327,18 @@ impl Driver {
     /// loop) then records it for [`Driver::replay_x86_explicit_isa_flags`].
     /// This is the SINGLE implementation of every ISA flag's effect — the
     /// immediate application and the post-`-march=` replay run the same
-    /// code, so they cannot drift.  Non-ISA `-m` flags (`-mcmodel=`,
-    /// `-mtune=`, `-mno-red-zone`, `-mno-80387`, `-mgeneral-regs-only`,
+    /// code, so they cannot drift. General-regs-only participates because
+    /// later explicit SIMD grants may lift it. Non-ISA `-m` flags
+    /// (`-mcmodel=`, `-mtune=`, `-mno-red-zone`, `-mno-80387`,
     /// `-malign-data=`, `-mharden-sls=`, the AVX10 not-implemented errors,
     /// ...) return `false` and stay with the main match: they have no
     /// arch-set interaction.
     fn apply_x86_isa_mflag(&mut self, arg: &str) -> bool {
-        if self.grant_avx512_family(arg) {
+        if self.grant_avx512_family(arg) || self.apply_x86_sse_level_mflag(arg) {
             return true;
         }
         match arg {
-            "-mno-sse" | "-mno-sse2" => {
-                // SSE2 denial also removes every higher vector class. Only
-                // `-mno-sse` removes an independent SSE grant: i386 can keep
-                // its SSE XMM ABI under `-msse -mno-sse2`. Final target
-                // resolution below preserves x86-64's existing no-SSE2 path.
-                let all_sse = arg == "-mno-sse";
-                self.no_sse = true;
-                self.no_sse2 = true;
-                if all_sse {
-                    self.sse_explicitly_disabled = true;
-                    self.enable_sse = false;
-                } else {
-                    self.sse2_explicitly_disabled = true;
-                }
-                self.avx_explicitly_disabled = true;
-                self.fma_explicitly_disabled = true;
-                self.sse41_explicitly_disabled = true;
-                self.enable_sse3 = false;
-                self.enable_ssse3 = false;
-                self.enable_sse4_1 = false;
-                self.enable_sse4_2 = false;
-                self.enable_avx = false;
-                self.enable_avx2 = false;
-            }
+            "-mgeneral-regs-only" => self.deny_general_registers(),
             "-mno-avx2" => {
                 self.enable_avx2 = false;
                 // AVX2 is the 256-bit integer class — a strict subset
@@ -416,10 +394,12 @@ impl Driver {
             "-maes" => {
                 self.enable_aes = true;
                 self.grant_sse2_class();
+                self.enable_sse = true;
             }
             "-mpclmul" => {
                 self.enable_pclmul = true;
                 self.grant_sse2_class();
+                self.enable_sse = true;
             }
             // F16C, VAES and VPCLMULQDQ are VEX-encoded: GCC 16.2 implies
             // `__AVX__` and `__SSE4_2__` for each (measured), so each grants
@@ -626,22 +606,6 @@ impl Driver {
                 self.grant_sse2_class();
                 self.enable_sse3 = true;
             }
-            // Baseline x86-64 ISA flags. SSE2/MMX are the x86-64 default,
-            // but `-msse`/`-msse2` after `-mno-sse` must re-enable SSE
-            // (GCC last-explicit-ISA-flag wins; `-march=native` does not).
-            "-msse2" => {
-                self.grant_sse2_class();
-                self.enable_sse = true;
-            }
-            "-msse" => {
-                self.no_sse = false;
-                self.sse_explicitly_disabled = false;
-                self.general_regs_only = false;
-                if !self.sse2_explicitly_disabled {
-                    self.no_sse2 = false;
-                }
-                self.enable_sse = true;
-            }
             "-mprfchw" => {
                 // Last explicit decision wins (GCC): lifts an earlier
                 // `-mno-prfchw`.
@@ -658,6 +622,75 @@ impl Driver {
             _ => return false,
         }
         true
+    }
+
+    /// Apply the scalar SSE/SSE2 level flags in command-line order. Keeping
+    /// the two denial bits independent is what lets i386 retain an SSE XMM
+    /// ABI under `-msse -mno-sse2` and restore SSE2 only after an SSE2-class
+    /// grant. Returns `false` for flags outside this family.
+    fn apply_x86_sse_level_mflag(&mut self, arg: &str) -> bool {
+        match arg {
+            "-mno-sse" | "-mno-sse2" => {
+                // SSE2 denial also removes every higher vector class. Only
+                // `-mno-sse` removes an independent SSE grant. Final target
+                // resolution preserves x86-64's existing no-SSE2 path.
+                let all_sse = arg == "-mno-sse";
+                self.no_sse = true;
+                self.no_sse2 = true;
+                if all_sse {
+                    self.sse_explicitly_disabled = true;
+                    self.enable_sse = false;
+                } else {
+                    self.sse2_explicitly_disabled = true;
+                }
+                self.avx_explicitly_disabled = true;
+                self.fma_explicitly_disabled = true;
+                self.sse41_explicitly_disabled = true;
+                self.enable_sse3 = false;
+                self.enable_ssse3 = false;
+                self.enable_sse4_1 = false;
+                self.enable_sse4_2 = false;
+                self.enable_avx = false;
+                self.enable_avx2 = false;
+            }
+            // Baseline x86-64 ISA flags. SSE2/MMX are the x86-64 default,
+            // but `-msse`/`-msse2` after `-mno-sse` must re-enable SSE
+            // (GCC last-explicit-ISA-flag wins; `-march=native` does not).
+            "-msse2" => {
+                self.grant_sse2_class();
+                self.enable_sse = true;
+            }
+            "-msse" => {
+                self.no_sse = false;
+                self.sse_explicitly_disabled = false;
+                self.general_regs_only = false;
+                if !self.sse2_explicitly_disabled {
+                    self.no_sse2 = false;
+                }
+                self.enable_sse = true;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Enter the ordered general-register-only state. This is shared by the
+    /// immediate parse and post-profile replay so flag order cannot drift.
+    fn deny_general_registers(&mut self) {
+        self.general_regs_only = true;
+        self.no_sse = true;
+        self.no_sse2 = true;
+        self.sse_explicitly_disabled = true;
+        self.sse2_explicitly_disabled = true;
+        self.avx_explicitly_disabled = true;
+        self.fma_explicitly_disabled = true;
+        self.sse41_explicitly_disabled = true;
+        self.enable_sse3 = false;
+        self.enable_ssse3 = false;
+        self.enable_sse4_1 = false;
+        self.enable_sse4_2 = false;
+        self.enable_avx = false;
+        self.enable_avx2 = false;
     }
 
     /// Explicit SSE2-or-higher grant: lift every SIMD denial, including a
@@ -1883,23 +1916,6 @@ impl Driver {
                 | "-mno-xsavec" => {}
                 "-mmmx" => {}
                 "-m3dnow" => return Err("3DNow! is unsupported".to_string()),
-                "-mgeneral-regs-only" => {
-                    self.general_regs_only = true;
-                    self.no_sse = true;
-                    self.no_sse2 = true;
-                    self.sse_explicitly_disabled = true;
-                    self.sse2_explicitly_disabled = true;
-                    // No xmm state at all, so every VEX form is forbidden too.
-                    self.avx_explicitly_disabled = true;
-                    self.fma_explicitly_disabled = true;
-                    self.sse41_explicitly_disabled = true;
-                    self.enable_sse3 = false;
-                    self.enable_ssse3 = false;
-                    self.enable_sse4_1 = false;
-                    self.enable_sse4_2 = false;
-                    self.enable_avx = false;
-                    self.enable_avx2 = false;
-                }
                 "-mcmodel=kernel" => self.code_model_kernel = true,
                 "-mcmodel=small" | "-mcmodel=medlow" | "-mcmodel=medium" | "-mcmodel=medany"
                 | "-mcmodel=large" => {
@@ -5484,6 +5500,8 @@ mod prefetch_isa_tests {
             &["-m32", "-msse", "-march=i686"],
             &["-m32", "-march=i686", "-msse"],
             &["-m32", "-msse4.1"],
+            &["-m32", "-maes"],
+            &["-m32", "-mpclmul"],
             &["-m32", "-march=nehalem"],
             &["-m32", "-march=raptorlake"],
             &["-m32", "-mprfchw"],
@@ -5516,6 +5534,26 @@ mod prefetch_isa_tests {
             (&["-m32", "-mgeneral-regs-only", "-msse"][..], true, false),
             (&["-m32", "-mgeneral-regs-only", "-msse2"][..], true, true),
             (&["-m32", "-msse", "-mgeneral-regs-only"][..], false, false),
+            (
+                &["-m32", "-mgeneral-regs-only", "-msse", "-march=nehalem"][..],
+                true,
+                false,
+            ),
+            (
+                &["-m32", "-msse", "-mgeneral-regs-only", "-march=nehalem"][..],
+                false,
+                false,
+            ),
+            (
+                &["-m32", "-mgeneral-regs-only", "-msse2", "-march=nehalem"][..],
+                true,
+                true,
+            ),
+            (
+                &["-m32", "-msse2", "-mgeneral-regs-only", "-march=nehalem"][..],
+                false,
+                false,
+            ),
             (&["-m32", "-msse2", "-mno-sse2"][..], true, false),
             (&["-m32", "-msse2", "-msse"][..], true, true),
             (&["-m32", "-msse", "-msse2"][..], true, true),

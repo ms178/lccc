@@ -245,7 +245,7 @@ pub struct Driver {
     pub(super) enable_prfchw: bool,
     /// Sticky `-mno-prfchw` (GCC: wins over a later PRFCHW `-march=`).
     pub(super) prfchw_explicitly_disabled: bool,
-    /// Explicit `-msse`/`-msse2`, used as a positive i686 prefetch grant.
+    /// Explicit SSE/SSE2 grant, used as a positive i686 prefetch grant.
     /// This is deliberately narrower than the backend's SSE2 ABI baseline:
     /// default i686 code generation does not by itself promise prefetch-
     /// capable silicon. Every higher SSE/AVX grant is visible through its
