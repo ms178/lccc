@@ -34,7 +34,11 @@ icx=${ICX:-icx}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-fail() { echo "check_fp_select_minmax: FAIL: $*" >&2; exit 1; }
+fail() {
+    echo "check_fp_select_minmax: FAIL: $*" >&2
+    echo "::error title=FP select min/max::$*" >&2
+    exit 1
+}
 [ -x "$ccc" ] || { echo "SKIP: $ccc not built" >&2; exit 0; }
 icx_only=${FP_MINMAX_ICX_ONLY:-0}
 if [ "$icx_only" = 1 ]; then
