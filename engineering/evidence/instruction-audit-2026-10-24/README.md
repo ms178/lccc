@@ -408,3 +408,16 @@ widths 8/16/32/64, double bit patterns, indirect calls, register exhaustion,
 shared typed fixture keeps its original checks; only its libc includes are
 replaced by freestanding declarations. Backend contract CI runs this gate
 with the pinned compiler and assembler oracles.
+
+### Parallel-check isolation and main integration
+
+The hosted parallel unit lane exposed a pre-existing tri-state test-window
+nesting leak: Drop restored the override value but not the thread's nesting
+depth, so later outer windows on that thread bypassed the shared mutex.
+Restoring the depth makes each outer window reacquire the lock. A deterministic
+regression covers repeated windows, nested restoration and panic unwinding;
+it fails without the depth restoration and passes with it. This changes test
+isolation, not the production liveness policy. Integrating the concurrent main
+changes also requires counting the union of its IPA switch and this branch's
+incoming-home switch in the audit baseline, rather than keeping the equal
+pre-merge scalar count from either branch.

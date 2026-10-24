@@ -23,7 +23,7 @@
     "gcc_clang_oracle_combinations": 4,
     "mask_pair_model_cases": 65536,
     "native_upper_lane_word_checks": 393216,
-    "library_tests_passed": 6209,
+    "library_tests_passed": 6263,
     "library_tests_ignored": 10
   },
   "i686_gnu_vector_abi": {
@@ -39,5 +39,13 @@
     "lccc_configurations": 8,
     "abi_checks_per_run": 16384,
     "typed_shuffle_checks_per_run": 18432
+  },
+  "parallel_test_isolation": {
+    "baseline_regression_exit": 101,
+    "fixed_standalone_helper_tests_passed": 6,
+    "integrated_all_target_library_tests_passed": 6263,
+    "integrated_32_thread_library_tests_passed": 6263,
+    "ignored_preexisting_library_tests": 10,
+    "census_knob_names_after_main_union": 534
   }
 }
