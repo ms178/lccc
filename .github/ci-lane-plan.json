@@ -1161,7 +1161,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 344.58,
+      "predicted_gate_seconds": 344.82,
       "shards": 2,
       "steps": [
         {
@@ -1199,6 +1199,10 @@
         {
           "measured_s": 0.25,
           "name": "Verify benchmark harness oracle and timing contracts"
+        },
+        {
+          "measured_s": 0.24,
+          "name": "Verify label-reference cost experiment contracts"
         },
         {
           "measured_s": 0.25,

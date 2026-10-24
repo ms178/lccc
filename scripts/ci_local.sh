@@ -429,6 +429,9 @@ gate "binary-equivalence-contracts" fast \
 gate "benchmark-harness-contracts" fast \
     python3 tests/benchmark/test_benchmark_harness.py
 
+gate "label-reference-cost-contracts" fast \
+    python3 scripts/test_measure_label_ref_cost.py
+
 gate "benchmark-ranking-contracts" fast \
     python3 -m unittest discover -s scripts -p test_bench_rank.py
 

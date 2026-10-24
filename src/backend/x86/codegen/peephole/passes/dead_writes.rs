@@ -253,6 +253,7 @@ fn is_symbol_char(c: char) -> bool {
 ///
 /// One-shot form (a whole-file scan per call); a pass that asks for many
 /// labels builds a [`LabelRefs`] once instead.
+#[cfg(test)]
 pub(super) fn label_is_fallthrough_only(
     store: &LineStore,
     infos: &[LineInfo],
@@ -284,12 +285,19 @@ pub(super) fn label_is_fallthrough_only(
 pub(super) struct LabelRefs {
     /// Defined label name -> number of non-nop lines whose token stream
     /// contains it (the definition line included).
-    lines_naming: FxHashMap<String, u32>,
+    lines_naming: FxHashMap<String, usize>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static LABEL_REF_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl LabelRefs {
     pub(super) fn build(store: &LineStore, infos: &[LineInfo]) -> Self {
-        let mut lines_naming: FxHashMap<String, u32> = FxHashMap::default();
+        #[cfg(test)]
+        LABEL_REF_BUILDS.with(|count| count.set(count.get() + 1));
+        let mut lines_naming: FxHashMap<String, usize> = FxHashMap::default();
         for n in 0..store.len() {
             if infos[n].is_nop() || infos[n].kind != LineKind::Label {
                 continue;
@@ -298,29 +306,49 @@ impl LabelRefs {
                 lines_naming.insert(name.trim().to_string(), 0);
             }
         }
-        let mut seen: Vec<&str> = Vec::new();
+        let mut refs = Self { lines_naming };
+        let mut seen = Vec::new();
         for n in 0..store.len() {
-            if infos[n].is_nop() {
-                continue;
-            }
-            seen.clear();
-            for tok in infos[n]
-                .trimmed(store.get(n))
-                .split(|c: char| !is_symbol_char(c))
-            {
-                if tok.is_empty() || seen.contains(&tok) {
-                    continue;
-                }
-                if let Some(count) = lines_naming.get_mut(tok) {
-                    *count += 1;
-                    seen.push(tok);
-                }
+            if !infos[n].is_nop() {
+                Self::adjust_counts(
+                    &mut refs.lines_naming,
+                    infos[n].trimmed(store.get(n)),
+                    true,
+                    &mut seen,
+                );
             }
         }
-        Self { lines_naming }
+        refs
     }
 
-    /// See [`label_is_fallthrough_only`].
+    /// Count a symbol at most once per line, exactly as in the full scan.
+    fn adjust_line(&mut self, text: &str, add: bool) {
+        Self::adjust_counts(&mut self.lines_naming, text, add, &mut Vec::new());
+    }
+
+    fn adjust_counts<'a>(
+        counts: &mut FxHashMap<String, usize>,
+        text: &'a str,
+        add: bool,
+        seen: &mut Vec<&'a str>,
+    ) {
+        seen.clear();
+        for token in text.split(|c: char| !is_symbol_char(c)) {
+            if token.is_empty() || seen.contains(&token) {
+                continue;
+            }
+            if let Some(count) = counts.get_mut(token) {
+                if add {
+                    *count += 1;
+                } else {
+                    *count -= 1;
+                }
+                seen.push(token);
+            }
+        }
+    }
+
+    /// True only for a defined, unreferenced symbol.
     pub(super) fn is_fallthrough_only(
         &self,
         store: &LineStore,
@@ -337,10 +365,60 @@ impl LabelRefs {
             return false;
         }
         // The definition line itself names the label exactly once.
-        let own = u32::from(!infos[label_idx].is_nop());
+        let own = usize::from(!infos[label_idx].is_nop());
         self.lines_naming
             .get(name)
             .is_some_and(|&count| count <= own)
+    }
+}
+
+/// Exact, lazily built reference counts for a pass that edits existing lines.
+/// Unlike a conservative snapshot, this observes a removed last reference in
+/// the same invocation. Retargeting a branch transfers its reference without
+/// rescanning the file. Label definitions must not be added, renamed or moved.
+#[derive(Default)]
+pub(super) struct LazyLabelRefs {
+    refs: Option<LabelRefs>,
+}
+
+impl LazyLabelRefs {
+    pub(super) fn is_fallthrough_only(
+        &mut self,
+        store: &LineStore,
+        infos: &[LineInfo],
+        idx: usize,
+    ) -> bool {
+        self.refs
+            .get_or_insert_with(|| LabelRefs::build(store, infos))
+            .is_fallthrough_only(store, infos, idx)
+    }
+
+    pub(super) fn mark_nop(&mut self, store: &LineStore, info: &mut LineInfo, idx: usize) {
+        if !info.pinned
+            && !info.is_nop()
+            && let Some(refs) = &mut self.refs
+        {
+            refs.adjust_line(info.trimmed(store.get(idx)), false);
+        }
+        mark_nop(info);
+    }
+
+    pub(super) fn replace_line(
+        &mut self,
+        store: &mut LineStore,
+        info: &mut LineInfo,
+        idx: usize,
+        text: String,
+    ) {
+        if !info.is_nop()
+            && let Some(refs) = &mut self.refs
+        {
+            refs.adjust_line(info.trimmed(store.get(idx)), false);
+        }
+        replace_line(store, info, idx, text);
+        if let Some(refs) = &mut self.refs {
+            refs.adjust_line(info.trimmed(store.get(idx)), true);
+        }
     }
 }
 
@@ -3411,5 +3489,78 @@ mod tests {
                 "movslq must not be retargeted across a 16-bit read: {out}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod lazy_label_ref_tests {
+    use super::*;
+
+    fn check(cache: &mut LazyLabelRefs, store: &LineStore, infos: &[LineInfo]) {
+        let fresh = LabelRefs::build(store, infos);
+        for (i, info) in infos.iter().enumerate() {
+            if info.kind == LineKind::Label {
+                assert_eq!(
+                    cache.is_fallthrough_only(store, infos, i),
+                    fresh.is_fallthrough_only(store, infos, i),
+                    "{}",
+                    store.get(i)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_references_match_fresh_scans_after_edits() {
+        let mut store = LineStore::new(
+            concat!(
+                "f:\n",
+                ".L1:\n",
+                ".L10:\n",
+                ".Ldata:\n",
+                "je .L1\n",
+                "jmp .L10\n",
+                ".long .L1-.L1\n",
+                "leaq .L10(%rip), %rax\n",
+                "ret\n",
+            )
+            .to_string(),
+        );
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let mut cache = LazyLabelRefs::default();
+        check(&mut cache, &store, &infos);
+        cache.replace_line(&mut store, &mut infos[4], 4, "jne .L10".into());
+        check(&mut cache, &store, &infos);
+        cache.mark_nop(&store, &mut infos[6], 6);
+        check(&mut cache, &store, &infos);
+        assert!(cache.is_fallthrough_only(&store, &infos, 1));
+        infos[7].pinned = true;
+        cache.mark_nop(&store, &mut infos[7], 7);
+        check(&mut cache, &store, &infos);
+        assert!(!infos[7].is_nop());
+        infos[7].pinned = false;
+        for i in [4, 5, 7] {
+            cache.mark_nop(&store, &mut infos[i], i);
+        }
+        check(&mut cache, &store, &infos);
+        assert!(cache.is_fallthrough_only(&store, &infos, 2));
+        // Replacing an already deleted line must not decrement it twice.
+        cache.replace_line(&mut store, &mut infos[5], 5, "jmp .L1".into());
+        check(&mut cache, &store, &infos);
+        assert!(!cache.is_fallthrough_only(&store, &infos, 1));
+    }
+
+    #[test]
+    fn no_index_allocation_without_a_query() {
+        let mut store = LineStore::new("f:\nmovq %rax, %rax\nret\n".into());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let mut cache = LazyLabelRefs::default();
+        cache.mark_nop(&store, &mut infos[1], 1);
+        cache.replace_line(&mut store, &mut infos[1], 1, "xorl %eax, %eax".into());
+        assert!(cache.refs.is_none());
     }
 }

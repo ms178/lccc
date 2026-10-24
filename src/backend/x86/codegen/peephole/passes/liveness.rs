@@ -360,6 +360,7 @@ pub(super) struct FileLiveness {
 // inferring it from matching answers. Compiled out of release builds.
 #[cfg(test)]
 thread_local! {
+    pub(super) static LIVENESS_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static MEMO_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static EFFECT_MEMO_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -649,6 +650,8 @@ impl FileLiveness {
     /// Compute liveness for every function in the file.
     #[expect(clippy::needless_range_loop)]
     pub(super) fn new(store: &LineStore, infos: &[LineInfo]) -> Self {
+        #[cfg(test)]
+        LIVENESS_BUILDS.with(|count| count.set(count.get() + 1));
         let len = store.len();
         let mut lv = FileLiveness {
             live_out: vec![ALL; len],

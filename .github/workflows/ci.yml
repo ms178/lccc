@@ -852,6 +852,8 @@ jobs:
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_seg_conversion_parity.sh
     - name: Verify benchmark harness oracle and timing contracts
       run: python3 tests/benchmark/test_benchmark_harness.py
+    - name: Verify label-reference cost experiment contracts
+      run: python3 scripts/test_measure_label_ref_cost.py
     - name: Check GOT-slot references to local symbols
       run: env CCC=target/fastbuild/lccc bash tests/regression/check_got_slot_local_addend.sh
     - name: Check default ISA policy (x86-64 default emits no post-baseline instruction)

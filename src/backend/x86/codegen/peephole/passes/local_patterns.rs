@@ -46,6 +46,53 @@ mod branch_inversion_tests {
             .collect()
     }
 
+    #[test]
+    fn branch_rewrites_preserve_every_pinned_participant() {
+        for (asm, participants) in [
+            (
+                "f:\nje .Lyes\njmp .Lno\n.Lyes:\nret\n.Lno:\nret\n",
+                vec![1, 2],
+            ),
+            (
+                "f:\nje .Lalt\nmovq $1, %rax\njmp .Lend\n.Lalt:\nmovq $2, %rax\n.Lend:\nret\n",
+                vec![1, 2, 3],
+            ),
+        ] {
+            for pin in participants {
+                let mut store = LineStore::new(asm.into());
+                let mut infos: Vec<_> = (0..store.len())
+                    .map(|i| classify_line(store.get(i)))
+                    .collect();
+                infos[pin].pinned = true;
+                combined_local_pass(&mut store, &mut infos);
+                let out: Vec<_> = (0..store.len())
+                    .filter(|&i| !infos[i].is_nop())
+                    .map(|i| store.get(i).trim())
+                    .collect();
+                assert_eq!(out, asm.lines().collect::<Vec<_>>(), "pin={pin}");
+                assert!(infos[pin].pinned);
+            }
+        }
+    }
+
+    #[test]
+    fn branch_chain_builds_one_exact_reference_index() {
+        use super::super::dead_writes::LABEL_REF_BUILDS;
+        let mut asm = "f:\n".to_string();
+        for i in 0..256 {
+            asm.push_str(&format!("testq %rax, %rax\nje .Lt{i}\n.Lempty{i}:\njmp .Lf{i}\n.Lt{i}:\naddq $1, %rax\n.Lf{i}:\n"));
+        }
+        asm.push_str("ret\n");
+        let before = LABEL_REF_BUILDS.with(std::cell::Cell::get);
+        let out = run(&asm);
+        let after = LABEL_REF_BUILDS.with(std::cell::Cell::get);
+        assert_eq!(after - before, 1);
+        assert_eq!(
+            out.iter().filter(|line| line.starts_with("jne ")).count(),
+            256
+        );
+    }
+
     /// hot_web_loop after phi coalescing emptied the common arm: the
     /// fallthrough-only `.LBB4` no longer blocks the inversion.
     #[test]
@@ -1354,6 +1401,7 @@ mod highbit_sub_tests {
 pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let mut changed = false;
     let len = store.len();
+    let mut label_refs = super::dead_writes::LazyLabelRefs::default();
 
     // Track whether %rax is known to be zero for redundant xorl elimination.
     // This is set to true after `xorl %eax, %eax` and stays true across
@@ -1388,7 +1436,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             if let LineKind::Other { dest_reg: 0 } = infos[i].kind {
                 let trimmed = infos[i].trimmed(store.get(i));
                 if trimmed == "xorl %eax, %eax" {
-                    mark_nop(&mut infos[i]);
+                    label_refs.mark_nop(store, &mut infos[i], i);
                     changed = true;
                     i += 1;
                     continue;
@@ -1430,7 +1478,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                             .or_else(|| next.strip_prefix("bsrl ")),
                     };
                     if bit_ops == Some(ops) {
-                        mark_nop(&mut infos[i]);
+                        label_refs.mark_nop(store, &mut infos[i], i);
                         changed = true;
                         i += 1;
                         continue;
@@ -1534,7 +1582,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                         _ => false,
                     };
                     if overwrites_rax {
-                        mark_nop(&mut infos[i]);
+                        label_refs.mark_nop(store, &mut infos[i], i);
                         changed = true;
                         i += 1;
                         continue;
@@ -1628,7 +1676,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
         // --- Pattern: self-move elimination (movq %reg, %reg) ---
         // Pre-classified as SelfMove during classify_line, avoiding string parsing.
         if infos[i].kind == LineKind::SelfMove {
-            mark_nop(&mut infos[i]);
+            label_refs.mark_nop(store, &mut infos[i], i);
             changed = true;
             i += 1;
             continue;
@@ -1689,7 +1737,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                                 let src_j_fam = register_family_fast(src_j);
                                                 let dst_j_fam = register_family_fast(dst_j);
                                                 if src_j_fam == dst_fam && dst_j_fam == src_fam {
-                                                    mark_nop(&mut infos[j]);
+                                                    label_refs.mark_nop(store, &mut infos[j], j);
                                                     changed = true;
                                                     i += 1;
                                                     continue;
@@ -1720,7 +1768,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                         let next = infos[j].trimmed(store.get(j));
                         if let Some(label) = next.strip_suffix(':') {
                             if label == target {
-                                mark_nop(&mut infos[i]);
+                                label_refs.mark_nop(store, &mut infos[i], i);
                                 changed = true;
                                 found_redundant = true;
                             }
@@ -1751,7 +1799,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
         // block a later pass emptied — an if/else arm whose phi copies were
         // coalesced away leaves `je .Lrare; .Lcommon: jmp .Ljoin; .Lrare:`.
         // The label stays (unreferenced, harmless); only the jmp goes.  The
-        // per-label scan is fresh because this pass itself retargets jumps.
+        // exact lazy index follows each deletion and branch retargeting.
         if infos[i].kind == LineKind::CondJmp {
             let cond_line = infos[i].trimmed(store.get(i));
             // Parse: "jCC target" -> extract CC and target
@@ -1768,7 +1816,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                 .trimmed(store.get(j))
                                 .strip_suffix(':')
                                 .is_some_and(|l| l.trim() != cond_target)
-                            && super::dead_writes::label_is_fallthrough_only(store, infos, j)))
+                            && label_refs.is_fallthrough_only(store, infos, j)))
                 {
                     j += 1;
                 }
@@ -1786,10 +1834,10 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                             if let Some(label_name) = label_line.strip_suffix(':') {
                                 if label_name == cond_target {
                                     let inv_cc = invert_cc(cc);
-                                    if inv_cc != cc {
+                                    if inv_cc != cc && all_editable(infos, &[i, j]) {
                                         let new_line = format!("    j{} {}", inv_cc, jmp_target);
-                                        replace_line(store, &mut infos[i], i, new_line);
-                                        mark_nop(&mut infos[j]); // Remove the jmp
+                                        label_refs.replace_line(store, &mut infos[i], i, new_line);
+                                        label_refs.mark_nop(store, &mut infos[j], j); // Remove the jmp
                                         changed = true;
                                         i += 1;
                                         continue;
@@ -1851,7 +1899,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                     // jump-table entry (`.long .LBBn - .Ljt`) is an edge
                     // too, and `extract_jump_target` does not see it.
                     && fallthrough_label.is_none_or(|fl| {
-                        super::dead_writes::label_is_fallthrough_only(store, infos, fl)
+                        label_refs.is_fallthrough_only(store, infos, fl)
                     })
                 {
                     let init = infos[j].trimmed(store.get(j));
@@ -1878,18 +1926,23 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                             && jump_merge == Some(merge)
                         {
                             let inv = invert_cc(cc);
-                            if inv != cc {
+                            if inv != cc && all_editable(infos, &[i, j, k]) {
                                 let init_owned = init.to_string();
                                 let inv_owned = inv.to_string();
                                 let merge_owned = merge.to_string();
-                                replace_line(store, &mut infos[i], i, format!("    {init_owned}"));
-                                replace_line(
+                                label_refs.replace_line(
+                                    store,
+                                    &mut infos[i],
+                                    i,
+                                    format!("    {init_owned}"),
+                                );
+                                label_refs.replace_line(
                                     store,
                                     &mut infos[j],
                                     j,
                                     format!("    j{inv_owned} {merge_owned}"),
                                 );
-                                mark_nop(&mut infos[k]);
+                                label_refs.mark_nop(store, &mut infos[k], k);
                                 changed = true;
                                 i += 1;
                                 continue;
@@ -1982,8 +2035,13 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                                     // line i stays (store), line m becomes the copy,
                                     // line l becomes the modifier's text.
                                     let mid_text_owned = store.get(m).to_string();
-                                    replace_line(store, &mut infos[m], m, copy);
-                                    replace_line(store, &mut infos[l], l, mid_text_owned);
+                                    label_refs.replace_line(store, &mut infos[m], m, copy);
+                                    label_refs.replace_line(
+                                        store,
+                                        &mut infos[l],
+                                        l,
+                                        mid_text_owned,
+                                    );
                                     changed = true;
                                     i += 1;
                                     continue;
@@ -2054,7 +2112,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
             };
 
             if is_redundant_ext {
-                mark_nop(&mut infos[ext_idx]);
+                label_refs.mark_nop(store, &mut infos[ext_idx], ext_idx);
                 changed = true;
                 i += 1;
                 continue;
@@ -2128,7 +2186,7 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                         k -= 1;
                     }
                     if found_producer {
-                        mark_nop(&mut infos[ext_idx]);
+                        label_refs.mark_nop(store, &mut infos[ext_idx], ext_idx);
                         changed = true;
                         i += 1;
                         continue;
