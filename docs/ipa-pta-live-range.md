@@ -146,6 +146,31 @@ respectively; CI takes nine rotated samples per compiler so sub-millisecond
 process startup does not dominate the measurement. ICX is explicitly run with
 `-fp-model=strict`.
 
+### Measured hosted result
+
+Dedicated run
+[40093920459](https://github.com/ms178/lccc/actions/runs/40093920459) validated
+commit `dc6dd25` with a swap-enabled fastbuild, all nine differential fixtures,
+and nine rotated timing repetitions on x86-64 AMD EPYC 7763. The exact oracles
+were GCC 16.2.0, Clang 23.1.3, and ICX 2026.2.0. Mandatory witnesses were
+positive (`IPA forwarded max=1`, `LRS changed max=1`). Median process times were:
+
+| Workload | LCCC baseline (ms) | LCCC features (ms) | Feature / baseline | GCC 16.2 (ms) | Clang 23.1.3 (ms) | ICX 2026.2 (ms) |
+|---|---:|---:|---:|---:|---:|---:|
+| IPA forwarding | 38.4809 | 38.3917 | 0.997681 | 38.3944 | 38.4547 | 32.3054 |
+| Multi-cycle pressure | 37.2955 | 37.1891 | 0.997148 | 28.5152 | 32.1643 | 32.2422 |
+| Unit-latency LRS | 23.2320 | 16.9840 | **0.731057** | 9.4633 | 8.2250 | 8.2757 |
+
+Baseline/feature MADs were respectively 0.0840/0.0320 ms, 0.1735/0.4586 ms,
+and 0.0289/0.0555 ms. The active unit-latency schedule reduced median process
+time by 26.9% (1.367x speedup), while the IPA and preserved multi-cycle cases
+were effectively neutral. Feature/GCC, feature/Clang, and feature/ICX ratios
+for the improved unit-latency case were still 1.794714, 2.064912, and 2.052278;
+the optimization narrowed a large gap but did not beat those oracles on this
+workload. The multi-cycle ratios were 1.304187, 1.156223, and 1.153430. IPA was
+at parity with GCC/Clang but its feature/ICX ratio was 1.188400. These are
+specific hosted measurements, not a universal performance claim.
+
 The Rust unit tests additionally pin fail-before/pass-after behavior for the
 block-local consumer, recursive and variadic summaries, semantic interposition,
 escape through globals, source-span preservation, and budget failure. The
