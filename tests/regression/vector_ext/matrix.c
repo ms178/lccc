@@ -1,3 +1,8 @@
+/* Constant extraction indexes are part of the oracle contract. Check the
+   exact same index at compile time, including the two-lane vector shapes. */
+#define EXTRACT_LANE(T,R,name,index) \
+    R name(T a){ _Static_assert((index)>=0 && (index)<sizeof(a)/sizeof(a[0]), \
+        "vector lane index out of bounds"); return a[index]; }
 typedef char v16c __attribute__((vector_size(16)));
 v16c add_v16c(v16c a,v16c b){return a+b;}
 v16c sub_v16c(v16c a,v16c b){return a-b;}
@@ -13,7 +18,7 @@ v16c eq_v16c(v16c a,v16c b){return a==b;}
 v16c lt_v16c(v16c a,v16c b){return a<b;}
 void loop_v16c(v16c*r,const v16c*a,const v16c*b,int n){for(int i=0;i<n;i++)r[i]=a[i]*b[i]+r[i];}
 v16c splat_v16c(char x){return (v16c){}+x;}
-char lane2_v16c(v16c a){return a[2];}
+EXTRACT_LANE(v16c,char,lane2_v16c,2)
 v16c setlane_v16c(v16c a,char x){a[1]=x;return a;}
 v16c ld_v16c(const char*p){v16c v; __builtin_memcpy(&v,p,sizeof v); return v;}
 void st_v16c(char*p,v16c v){__builtin_memcpy(p,&v,sizeof v);}
@@ -34,7 +39,7 @@ v32c eq_v32c(v32c a,v32c b){return a==b;}
 v32c lt_v32c(v32c a,v32c b){return a<b;}
 void loop_v32c(v32c*r,const v32c*a,const v32c*b,int n){for(int i=0;i<n;i++)r[i]=a[i]*b[i]+r[i];}
 v32c splat_v32c(char x){return (v32c){}+x;}
-char lane2_v32c(v32c a){return a[2];}
+EXTRACT_LANE(v32c,char,lane2_v32c,2)
 v32c setlane_v32c(v32c a,char x){a[1]=x;return a;}
 v32c ld_v32c(const char*p){v32c v; __builtin_memcpy(&v,p,sizeof v); return v;}
 void st_v32c(char*p,v32c v){__builtin_memcpy(p,&v,sizeof v);}
@@ -55,7 +60,7 @@ v16s eq_v16s(v16s a,v16s b){return a==b;}
 v16s lt_v16s(v16s a,v16s b){return a<b;}
 void loop_v16s(v16s*r,const v16s*a,const v16s*b,int n){for(int i=0;i<n;i++)r[i]=a[i]*b[i]+r[i];}
 v16s splat_v16s(short x){return (v16s){}+x;}
-short lane2_v16s(v16s a){return a[2];}
+EXTRACT_LANE(v16s,short,lane2_v16s,2)
 v16s setlane_v16s(v16s a,short x){a[1]=x;return a;}
 v16s ld_v16s(const short*p){v16s v; __builtin_memcpy(&v,p,sizeof v); return v;}
 void st_v16s(short*p,v16s v){__builtin_memcpy(p,&v,sizeof v);}
@@ -76,7 +81,7 @@ v32s eq_v32s(v32s a,v32s b){return a==b;}
 v32s lt_v32s(v32s a,v32s b){return a<b;}
 void loop_v32s(v32s*r,const v32s*a,const v32s*b,int n){for(int i=0;i<n;i++)r[i]=a[i]*b[i]+r[i];}
 v32s splat_v32s(short x){return (v32s){}+x;}
-short lane2_v32s(v32s a){return a[2];}
+EXTRACT_LANE(v32s,short,lane2_v32s,2)
 v32s setlane_v32s(v32s a,short x){a[1]=x;return a;}
 v32s ld_v32s(const short*p){v32s v; __builtin_memcpy(&v,p,sizeof v); return v;}
 void st_v32s(short*p,v32s v){__builtin_memcpy(p,&v,sizeof v);}
@@ -97,7 +102,7 @@ v16i eq_v16i(v16i a,v16i b){return a==b;}
 v16i lt_v16i(v16i a,v16i b){return a<b;}
 void loop_v16i(v16i*r,const v16i*a,const v16i*b,int n){for(int i=0;i<n;i++)r[i]=a[i]*b[i]+r[i];}
 v16i splat_v16i(int x){return (v16i){}+x;}
-int lane2_v16i(v16i a){return a[2];}
+EXTRACT_LANE(v16i,int,lane2_v16i,2)
 v16i setlane_v16i(v16i a,int x){a[1]=x;return a;}
 v16i ld_v16i(const int*p){v16i v; __builtin_memcpy(&v,p,sizeof v); return v;}
 void st_v16i(int*p,v16i v){__builtin_memcpy(p,&v,sizeof v);}
@@ -118,7 +123,7 @@ v32i eq_v32i(v32i a,v32i b){return a==b;}
 v32i lt_v32i(v32i a,v32i b){return a<b;}
 void loop_v32i(v32i*r,const v32i*a,const v32i*b,int n){for(int i=0;i<n;i++)r[i]=a[i]*b[i]+r[i];}
 v32i splat_v32i(int x){return (v32i){}+x;}
-int lane2_v32i(v32i a){return a[2];}
+EXTRACT_LANE(v32i,int,lane2_v32i,2)
 v32i setlane_v32i(v32i a,int x){a[1]=x;return a;}
 v32i ld_v32i(const int*p){v32i v; __builtin_memcpy(&v,p,sizeof v); return v;}
 void st_v32i(int*p,v32i v){__builtin_memcpy(p,&v,sizeof v);}
@@ -139,7 +144,7 @@ v16l eq_v16l(v16l a,v16l b){return a==b;}
 v16l lt_v16l(v16l a,v16l b){return a<b;}
 void loop_v16l(v16l*r,const v16l*a,const v16l*b,int n){for(int i=0;i<n;i++)r[i]=a[i]*b[i]+r[i];}
 v16l splat_v16l(long x){return (v16l){}+x;}
-long lane2_v16l(v16l a){return a[2];}
+EXTRACT_LANE(v16l,long,lane1_v16l,1)
 v16l setlane_v16l(v16l a,long x){a[1]=x;return a;}
 v16l ld_v16l(const long*p){v16l v; __builtin_memcpy(&v,p,sizeof v); return v;}
 void st_v16l(long*p,v16l v){__builtin_memcpy(p,&v,sizeof v);}
@@ -160,7 +165,7 @@ v32l eq_v32l(v32l a,v32l b){return a==b;}
 v32l lt_v32l(v32l a,v32l b){return a<b;}
 void loop_v32l(v32l*r,const v32l*a,const v32l*b,int n){for(int i=0;i<n;i++)r[i]=a[i]*b[i]+r[i];}
 v32l splat_v32l(long x){return (v32l){}+x;}
-long lane2_v32l(v32l a){return a[2];}
+EXTRACT_LANE(v32l,long,lane2_v32l,2)
 v32l setlane_v32l(v32l a,long x){a[1]=x;return a;}
 v32l ld_v32l(const long*p){v32l v; __builtin_memcpy(&v,p,sizeof v); return v;}
 void st_v32l(long*p,v32l v){__builtin_memcpy(p,&v,sizeof v);}
@@ -176,7 +181,7 @@ v16i lt_v16f(v16f a,v16f b){return a<b;}
 v16f div_v16f(v16f a,v16f b){return a/b;}
 void loop_v16f(v16f*r,const v16f*a,const v16f*b,int n){for(int i=0;i<n;i++)r[i]=a[i]*b[i]+r[i];}
 v16f splat_v16f(float x){return (v16f){}+x;}
-float lane2_v16f(v16f a){return a[2];}
+EXTRACT_LANE(v16f,float,lane2_v16f,2)
 v16f setlane_v16f(v16f a,float x){a[1]=x;return a;}
 v16f ld_v16f(const float*p){v16f v; __builtin_memcpy(&v,p,sizeof v); return v;}
 void st_v16f(float*p,v16f v){__builtin_memcpy(p,&v,sizeof v);}
@@ -192,7 +197,7 @@ v32i lt_v32f(v32f a,v32f b){return a<b;}
 v32f div_v32f(v32f a,v32f b){return a/b;}
 void loop_v32f(v32f*r,const v32f*a,const v32f*b,int n){for(int i=0;i<n;i++)r[i]=a[i]*b[i]+r[i];}
 v32f splat_v32f(float x){return (v32f){}+x;}
-float lane2_v32f(v32f a){return a[2];}
+EXTRACT_LANE(v32f,float,lane2_v32f,2)
 v32f setlane_v32f(v32f a,float x){a[1]=x;return a;}
 v32f ld_v32f(const float*p){v32f v; __builtin_memcpy(&v,p,sizeof v); return v;}
 void st_v32f(float*p,v32f v){__builtin_memcpy(p,&v,sizeof v);}
@@ -208,7 +213,7 @@ v16l lt_v16d(v16d a,v16d b){return a<b;}
 v16d div_v16d(v16d a,v16d b){return a/b;}
 void loop_v16d(v16d*r,const v16d*a,const v16d*b,int n){for(int i=0;i<n;i++)r[i]=a[i]*b[i]+r[i];}
 v16d splat_v16d(double x){return (v16d){}+x;}
-double lane2_v16d(v16d a){return a[2];}
+EXTRACT_LANE(v16d,double,lane1_v16d,1)
 v16d setlane_v16d(v16d a,double x){a[1]=x;return a;}
 v16d ld_v16d(const double*p){v16d v; __builtin_memcpy(&v,p,sizeof v); return v;}
 void st_v16d(double*p,v16d v){__builtin_memcpy(p,&v,sizeof v);}
@@ -224,7 +229,7 @@ v32l lt_v32d(v32d a,v32d b){return a<b;}
 v32d div_v32d(v32d a,v32d b){return a/b;}
 void loop_v32d(v32d*r,const v32d*a,const v32d*b,int n){for(int i=0;i<n;i++)r[i]=a[i]*b[i]+r[i];}
 v32d splat_v32d(double x){return (v32d){}+x;}
-double lane2_v32d(v32d a){return a[2];}
+EXTRACT_LANE(v32d,double,lane2_v32d,2)
 v32d setlane_v32d(v32d a,double x){a[1]=x;return a;}
 v32d ld_v32d(const double*p){v32d v; __builtin_memcpy(&v,p,sizeof v); return v;}
 void st_v32d(double*p,v32d v){__builtin_memcpy(p,&v,sizeof v);}
