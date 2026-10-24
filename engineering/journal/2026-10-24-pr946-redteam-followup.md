@@ -77,8 +77,19 @@ Native original-vs-folded assembly testing on the local Intel Xeon VM passed:
 Each operation used all boundary counts and 16,384 deterministic samples,
 including counts above the lane width and with nonzero upper count bits. GNU
 assembler/objdump 2.40 accepted and decoded every original and folded ZMM
-encoding. These are semantic model results, not LCCC pass-after or performance
-results.
+encoding. These are semantic model results, not LCCC pass-after results.
+
+A local four-independent-chain microkernel compared the original and folded
+ZMM sequences at a fixed count of three. Each sample executed one million
+loops, with nine alternating-order samples and three repeated median sets after
+warm-up; twelve boundary counts also required identical 512-byte outputs. The
+post-warm-up per-operation median original/optimized ratios were approximately
+1.003 (dword left), 0.996 (dword logical right), 0.997 (dword arithmetic right),
+1.001 (qword left), and 1.001 (qword logical right). An initial colder set had
+mixed -2.3% to +2.4% outliers. This virtual-Xeon result is therefore
+**performance-neutral within this screen**, not evidence of a ZMM speedup or
+of cross-microarchitecture profitability. The fold removes one broadcast per
+site, but no universal runtime claim is made.
 
 A proposed AVX-512BW word extension was **rejected**, not shipped. Per-lane
 `VPSRAVW` consumes 16 count bits while uniform `VPSRAW` consumes 64. Native
@@ -92,8 +103,7 @@ broadcast-count argument, is required for each lane width.
 
 The integrated tree still requires warning-free swap-enabled fastbuild,
 rustfmt/clippy, LCCC execution of both fixtures, GCC 16.2 / Clang 23.1.3 / ICX
-2026.2 comparisons, and the differential lanes. No representative ZMM timing
-has yet been measured, so no runtime-speedup claim is made for the new ZMM
-matcher coverage. Hosted CPU identity and any future timing must be reported
-with the measurement; these local semantics do not establish whole-program or
-cross-microarchitecture superiority.
+2026.2 comparisons, and the differential lanes. The local ZMM microkernel is
+only a narrow host screen and does not establish whole-program or
+cross-microarchitecture superiority. Hosted CPU identity and any future timing
+must be reported with the measurement.
