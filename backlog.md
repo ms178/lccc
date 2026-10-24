@@ -685,7 +685,10 @@ mask or `qemu -cpu`; `readelf -sW` shows `IFUNC`; static-binary variant works.
 are implemented; pinned branch-rewrite commits are guarded. Evidence and
 mutation results: [label-reference journal](engineering/journal/2026-10-24-label-reference-cost.md).
 The new 40-function profile puts `LabelRefs::build` at 1.77%, but the peephole
-still costs 73.46%; allocation/decode/fixpoint work remains open. The historical
+still costs 73.46%; allocation/decode/fixpoint work remains open. Deferring
+copy-mask liveness construction preserves all 94 assembly outputs but saves
+only 0.247% of simulated instructions on the same input, not a major latency
+win (see the journal follow-up). The historical
 reproducer and staged plan below are retained as the acceptance specification,
 not a claim that all five steps are complete.
 

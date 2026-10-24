@@ -112,3 +112,30 @@ cost, updating the lane's predicted total without moving or disabling any gate.
 The lane-plan audit, its 18-rule/25-fixture self-test, the shard-partition audit,
 and all three experiment-contract tests pass after that correction. This fixes
 the review record rather than relaxing the checker; hosted checks must rerun.
+
+## Deferred copy-mask liveness follow-up
+
+The next bounded MB-20 change defers `FileLiveness::new` in
+`fold_copy_and_mask_into_test` until the first actual liveness query, after the
+existing syntactic eligibility checks. Both immediate and register masks share
+that analysis; all original refresh points and exact `Some(false)` decisions
+remain intact. No fallback deadness rule or optimization eligibility changes.
+
+Two targeted fastbuild regressions pass: three ineligible input shapes construct
+no analysis, and a mixed immediate/register example folds both candidates using
+one refreshed analysis. Reintroducing eager construction fails the zero-build
+regression (1 versus 0); the restored tests pass. Fastbuild `lccc` and `lccc-ld`
+build successfully. Hosted CI remains responsible for the broad suite.
+
+Against the preceding indexed-label binary, all 94 assembly outputs remain
+byte-identical, including gzip `longest_match`, with no compile failures.
+The same 40-function paired experiment (15 randomized CPU-pinned pairs after
+two warmups) measured medians of 0.312385 s before and 0.309903 s after.
+Callgrind instructions were 3,231,513,850 before and 3,223,536,541 after, a
+0.247% reduction. The timing difference is small relative to sample scatter:
+**this is not evidence of a meaningful wall-clock speedup**, nor does it satisfy
+the remaining MB-20 acceptance criteria. Existing liveness memoization already
+avoids much of the expensive construction; the inclusive profile percentage
+must not be mistaken for time recoverable by this deferral alone. Further
+allocation/decode/scheduling work is still needed. Reproducible compact records
+are in `engineering/evidence/lazy-copy-mask-liveness-2026-10-24/`.

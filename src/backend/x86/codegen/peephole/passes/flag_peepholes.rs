@@ -1805,7 +1805,9 @@ fn copy_mask_partner(
 /// never take the byte form.
 pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
-    let mut lv = FileLiveness::new(store, infos);
+    // Most files contain no eligible copy/AND pair. Keep the exact
+    // analysis and refresh contract, but pay for it only at a real query.
+    let mut liveness = None;
     let mut changed = false;
     let mut i = 0;
     while i < len {
@@ -1878,10 +1880,12 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
             // exclusion: the destination arm already refuses `%rsp`/`%rbp`, so
             // no stack adjustment can disappear. Excluding it (as this did)
             // lost every `mov %rsp, %S; and %M, %S` / `and %rsp, %S` fold.
-            if mask_fam == dst_fam
-                || !names_family_at_width(imm_text, mask_fam, and_wide)
-                || !matches!(lv.live_after(j, dst_fam), Some(false))
-            {
+            if mask_fam == dst_fam || !names_family_at_width(imm_text, mask_fam, and_wide) {
+                i += 1;
+                continue;
+            }
+            let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
+            if !matches!(lv.live_after(j, dst_fam), Some(false)) {
                 i += 1;
                 continue;
             }
@@ -1918,6 +1922,7 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
             continue;
         }
         // The masked value itself must be dead: only the flags survive.
+        let lv = liveness.get_or_insert_with(|| FileLiveness::new(store, infos));
         if !matches!(lv.live_after(j, dst_fam), Some(false)) {
             i += 1;
             continue;
@@ -5781,5 +5786,50 @@ mod arithmetic_test_sign_cmov_tests {
             !unrelated_skip.contains("testl %edi, %edi"),
             "{unrelated_skip}"
         );
+    }
+}
+
+#[cfg(test)]
+mod copy_mask_lazy_liveness_tests {
+    use super::super::liveness::LIVENESS_BUILDS;
+    use super::*;
+
+    #[test]
+    fn no_liveness_build_without_an_eligible_copy_mask_pair() {
+        for body in [
+            "movq %rdi, %r8\naddq $1, %r8\nret\n",
+            "movq %rdi, %r8\nandq $1, %r9\nret\n",
+            "movl %edi, %r8d\nandq $1, %r8\nret\n",
+        ] {
+            let mut store = LineStore::new(format!("f:\n.cfi_startproc\n{body}.cfi_endproc\n"));
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            let before = LIVENESS_BUILDS.with(std::cell::Cell::get);
+            assert!(!fold_copy_and_mask_into_test(&mut store, &mut infos));
+            assert_eq!(LIVENESS_BUILDS.with(std::cell::Cell::get) - before, 0);
+        }
+    }
+
+    #[test]
+    fn immediate_and_register_candidates_share_one_refreshed_analysis() {
+        let mut store = LineStore::new(
+            concat!(
+                "f:\n.cfi_startproc\n",
+                "movq %rdi, %r8\nandq $1, %r8\nje .Lnext\n",
+                "movq %rsi, %r9\nandq %rcx, %r9\nje .Lnext\n",
+                ".Lnext:\nxorl %eax, %eax\nret\n.cfi_endproc\n",
+            )
+            .into(),
+        );
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let before = LIVENESS_BUILDS.with(std::cell::Cell::get);
+        assert!(fold_copy_and_mask_into_test(&mut store, &mut infos));
+        assert_eq!(LIVENESS_BUILDS.with(std::cell::Cell::get) - before, 1);
+        let output = store.build_result(|i| infos[i].is_nop());
+        assert!(output.contains("testb $1, %dil"), "{output}");
+        assert!(output.contains("testq %rcx, %rsi"), "{output}");
     }
 }
