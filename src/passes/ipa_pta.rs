@@ -640,7 +640,15 @@ fn pointer_effects(solver: &Solver, node: Node) -> ModRef {
 /// Analyze a module and eliminate redundant loads using the resulting call
 /// mod/ref summaries.  `semantic_interposition` is true for -fPIC/-shared.
 pub(crate) fn run(module: &mut IrModule, semantic_interposition: bool) -> usize {
-    let mut solver = build_solver(module, semantic_interposition, AnalysisBudget::default());
+    run_with_budget(module, semantic_interposition, AnalysisBudget::default())
+}
+
+fn run_with_budget(
+    module: &mut IrModule,
+    semantic_interposition: bool,
+    budget: AnalysisBudget,
+) -> usize {
+    let mut solver = build_solver(module, semantic_interposition, budget);
     solver.finish();
     if !solver.complete {
         if std::env::var_os("CCC_IPA_PTA_STATS").is_some() {
@@ -1283,4 +1291,263 @@ fn build_solver(module: &IrModule, semantic_interposition: bool, budget: Analysi
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::common::types::{AddressSpace, IrType};
+    use crate::ir::module::IrParam;
+    use crate::ir::reexports::{BasicBlock, BlockId};
+
+    fn function(name: &str, return_type: IrType) -> IrFunction {
+        let mut function = IrFunction::new(name.into(), return_type, Vec::new(), false);
+        function.is_static = true;
+        function.next_value_id = 128;
+        function.next_label = 1;
+        function
+    }
+
+    fn finish(function: &mut IrFunction, instructions: Vec<Instruction>, result: Option<Value>) {
+        function.blocks.push(BasicBlock {
+            label: BlockId(0),
+            instructions,
+            terminator: Terminator::Return(result.map(Operand::Value)),
+            source_spans: Vec::new(),
+        });
+    }
+
+    fn alloca(value: u32) -> Instruction {
+        Instruction::Alloca {
+            dest: Value(value),
+            ty: IrType::I32,
+            size: 4,
+            align: 4,
+            volatile: false,
+            semantic_volatile: false,
+        }
+    }
+
+    fn load(dest: u32, ptr: u32) -> Instruction {
+        Instruction::Load {
+            dest: Value(dest),
+            ptr: Value(ptr),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    fn store(value: u32, ptr: u32) -> Instruction {
+        Instruction::Store {
+            val: Operand::Value(Value(value)),
+            ptr: Value(ptr),
+            ty: IrType::I32,
+            seg_override: AddressSpace::Default,
+            volatile: false,
+        }
+    }
+
+    fn copy_const(dest: u32, value: i32) -> Instruction {
+        Instruction::Copy {
+            dest: Value(dest),
+            src: Operand::Const(crate::ir::constants::IrConst::I32(value)),
+        }
+    }
+
+    fn global_addr(dest: u32, name: &str) -> Instruction {
+        Instruction::GlobalAddr {
+            dest: Value(dest),
+            name: name.into(),
+        }
+    }
+
+    fn call(name: &str, args: Vec<Operand>) -> Instruction {
+        let count = args.len();
+        Instruction::Call {
+            func: name.into(),
+            info: CallInfo {
+                args,
+                arg_types: vec![IrType::Ptr; count],
+                return_type: IrType::Void,
+                num_fixed_args: count,
+                ..CallInfo::default()
+            },
+        }
+    }
+
+    fn indirect(pointer: u32) -> Instruction {
+        Instruction::CallIndirect {
+            func_ptr: Operand::Value(Value(pointer)),
+            info: CallInfo {
+                return_type: IrType::Void,
+                ..CallInfo::default()
+            },
+        }
+    }
+
+    fn pointer_param() -> IrParam {
+        IrParam {
+            ty: IrType::Ptr,
+            noalias: false,
+            struct_size: None,
+            struct_align: None,
+            param_align: None,
+            struct_eightbyte_classes: Vec::new(),
+            is_f128_sse: false,
+            riscv_float_class: None,
+        }
+    }
+
+    fn module(functions: Vec<IrFunction>) -> IrModule {
+        let mut module = IrModule::new();
+        module.functions = functions;
+        module
+    }
+
+    fn load_count(function: &IrFunction) -> usize {
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|inst| matches!(inst, Instruction::Load { .. }))
+            .count()
+    }
+
+    #[test]
+    fn direct_read_only_call_preserves_unescaped_load() {
+        let mut reader = function("reader", IrType::I32);
+        finish(
+            &mut reader,
+            vec![global_addr(0, "external_global"), load(1, 0)],
+            Some(Value(1)),
+        );
+        let mut caller = function("caller", IrType::I32);
+        finish(
+            &mut caller,
+            vec![alloca(0), load(1, 0), call("reader", vec![]), load(2, 0)],
+            Some(Value(2)),
+        );
+        let mut module = module(vec![reader, caller]);
+        assert_eq!(run(&mut module, false), 1);
+        assert_eq!(load_count(&module.functions[1]), 1);
+    }
+
+    #[test]
+    fn direct_store_summary_reaches_pointer_argument() {
+        let mut writer = function("writer", IrType::Void);
+        writer.params.push(pointer_param());
+        finish(
+            &mut writer,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                copy_const(1, 9),
+                store(1, 0),
+            ],
+            None,
+        );
+        let mut caller = function("caller", IrType::I32);
+        finish(
+            &mut caller,
+            vec![
+                alloca(0),
+                load(1, 0),
+                call("writer", vec![Operand::Value(Value(0))]),
+                load(2, 0),
+            ],
+            Some(Value(2)),
+        );
+        let mut module = module(vec![writer, caller]);
+        assert_eq!(run(&mut module, false), 0);
+        assert_eq!(load_count(&module.functions[1]), 2);
+    }
+
+    #[test]
+    fn unknown_call_escapes_argument_and_keeps_load() {
+        let mut caller = function("caller", IrType::I32);
+        finish(
+            &mut caller,
+            vec![
+                alloca(0),
+                load(1, 0),
+                call("unknown_external", vec![Operand::Value(Value(0))]),
+                load(2, 0),
+            ],
+            Some(Value(2)),
+        );
+        let mut module = module(vec![caller]);
+        assert_eq!(run(&mut module, false), 0);
+        assert_eq!(load_count(&module.functions[0]), 2);
+    }
+
+    #[test]
+    fn direct_read_through_parameter_does_not_invent_a_write() {
+        let mut reader = function("reader", IrType::Void);
+        reader.params.push(pointer_param());
+        finish(
+            &mut reader,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                load(1, 0),
+            ],
+            None,
+        );
+        let mut caller = function("caller", IrType::I32);
+        finish(
+            &mut caller,
+            vec![
+                alloca(0),
+                load(1, 0),
+                call("reader", vec![Operand::Value(Value(0))]),
+                load(2, 0),
+            ],
+            Some(Value(2)),
+        );
+        let mut module = module(vec![reader, caller]);
+        assert_eq!(run(&mut module, false), 1);
+        assert_eq!(load_count(&module.functions[1]), 1);
+    }
+
+    #[test]
+    fn indirect_function_address_gets_direct_summary() {
+        let mut reader = function("reader", IrType::Void);
+        finish(&mut reader, vec![], None);
+        let mut caller = function("caller", IrType::I32);
+        finish(
+            &mut caller,
+            vec![
+                alloca(0),
+                global_addr(3, "reader"),
+                load(1, 0),
+                indirect(3),
+                load(2, 0),
+            ],
+            Some(Value(2)),
+        );
+        let mut module = module(vec![reader, caller]);
+        assert_eq!(run(&mut module, false), 1);
+        assert_eq!(load_count(&module.functions[1]), 1);
+    }
+
+    #[test]
+    fn exhausted_budget_disables_all_forwarding() {
+        let mut caller = function("caller", IrType::I32);
+        finish(
+            &mut caller,
+            vec![alloca(0), load(1, 0), call("reader", vec![]), load(2, 0)],
+            Some(Value(2)),
+        );
+        let mut module = module(vec![caller]);
+        let budget = AnalysisBudget {
+            max_work: 1,
+            max_edges: 1,
+        };
+        assert_eq!(run_with_budget(&mut module, false, budget), 0);
+        assert_eq!(load_count(&module.functions[0]), 2);
+    }
+}
