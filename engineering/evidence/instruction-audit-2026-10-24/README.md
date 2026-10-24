@@ -400,23 +400,27 @@ struct stack/sret objects instead of XMM vectors when SSE was enabled. The
 baseline native witness terminates with SIGSEGV. These GNU vector shapes now
 reuse the already modeled single-XMM carrier, including signature CType
 retention, direct/indirect calls, argument decomposition and return packing.
-Pre-SSE i686 and explicit `-mno-sse` instead retain the generic stack/sret
-convention: GCC 16.2 assembly distinguishes that ABI, and the initial
-SSE-unconditional predicate did not. The driver now publishes its resolved
-i686 SSE grant through the effective-feature mirror used by this classifier;
-the same resolved predicate remains shared with SSE prefetch selection. Other
-GNU vector widths are not changed. This is an ABI finding from current
-compiler differential evidence, not a calling-convention claim derived from
-the SDM.
+Explicit `-mno-sse` instead retains the generic stack/sret convention. LCCC's
+existing i686 backend and macro contract have an SSE2 baseline, so the default
+ABI remains XMM; an independent `-mno-sse2` denial produces SSE-only carriers,
+and `-mno-sse -msse` restores baseline SSE2 unless a direct SSE2 denial is
+also present. The effective-feature mirror now publishes those baseline and
+denial states to this classifier. Prefetch retains its narrower positive-
+grant predicate instead of inheriting the backend's baseline. Other GNU
+vector widths are not changed. This is an ABI finding from current compiler
+differential evidence, not a calling-convention claim derived from the SDM.
 
 `check_i686_gnu_vector_abi.sh` requires GCC 16.2.0, Clang 23.1.3 and GNU as
 2.47. It links freestanding ELF32 programs with lccc-ld, requiring no 32-bit
-libc headers/runtime. Across explicit SSE2, `-march=i686`, and `-mno-sse`
-modes, both driver compilers, and all three function compilers at
-O0/O2/O3/Os, it exercises 72 cross-TU configurations, each with 16,384
-vector-ABI checks and 18,432 typed-shuffle checks. Integer element widths
-8/16/32/64, double bit patterns, indirect calls, register exhaustion, 16-byte
-stack alignment and variadic named/unnamed vectors are covered. The shared
-typed fixture keeps its original checks; only its libc includes are replaced
-by freestanding declarations. Backend contract CI runs this gate with the
-pinned compiler and assembler oracles.
+libc headers/runtime. Across default, explicit SSE2, SSE-only, SSE2-denied,
+profile-denied, SSE-restored and no-SSE modes, both driver compilers, and all
+three function compilers at O0/O2/O3/Os, it exercises 168 cross-TU
+configurations, each with 16,384 vector-ABI checks and 18,432 typed-shuffle
+checks. Compile-time `__SSE__`/`__SSE2__`/`__SSE3__` checks and non-vacuous
+PSHUFD/XMM assembly ceilings cover states that a host runtime cannot observe.
+Integer element widths 8/16/32/64, double bit patterns, indirect calls,
+register exhaustion, 16-byte stack alignment and variadic named/unnamed
+vectors are covered. The shared typed fixture keeps its original checks;
+only its libc includes are replaced by freestanding declarations. The
+unsharded differential workflow runs this gate after a swap-enabled fastbuild
+with the pinned compiler and assembler oracles.

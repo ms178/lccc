@@ -2734,9 +2734,10 @@ impl CType {
     }
 
     /// GNU 16-byte vectors share the single-XMM i386 ext-vector carrier only
-    /// when this invocation has SSE. Pre-SSE i386 and explicit `-mno-sse`
-    /// retain the ordinary aggregate stack/sret convention. Keep the other
-    /// vector_size widths and non-x86 targets separate.
+    /// when this invocation has SSE. Explicit `-mno-sse` (or an equivalent
+    /// general-register restriction) retains the ordinary aggregate
+    /// stack/sret convention; SSE-only `-mno-sse2` keeps the XMM ABI. Keep
+    /// the other vector_size widths and non-x86 targets separate.
     fn i386_gnu_xmm_vector(&self) -> bool {
         target_elf_machine() == 3
             && crate::common::x86_features::effective()

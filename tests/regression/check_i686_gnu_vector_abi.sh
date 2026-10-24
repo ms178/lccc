@@ -43,13 +43,105 @@ ASM
     printf 'extern void *memcpy(void *,const void *,unsigned);\nextern int puts(const char *);\n'
     sed '/^#include/d' tests/regression/shufflevector_value_convention.c
 } > "$tmp/typed.c"
-for mode in sse2 i686 no-sse; do
+cat > "$tmp/feature-macros.c" <<'EOF'
+#if EXPECT_SSE
+#ifndef __SSE__
+#error "SSE macro missing"
+#endif
+#else
+#ifdef __SSE__
+#error "SSE macro escaped its target ceiling"
+#endif
+#endif
+#if EXPECT_SSE2
+#ifndef __SSE2__
+#error "SSE2 macro missing"
+#endif
+#else
+#ifdef __SSE2__
+#error "SSE2 macro escaped its target ceiling"
+#endif
+#endif
+#if EXPECT_SSE3
+#ifndef __SSE3__
+#error "SSE3 macro missing"
+#endif
+#else
+#ifdef __SSE3__
+#error "SSE3 macro escaped its target ceiling"
+#endif
+#endif
+int feature_macro_contract(void) { return 0; }
+EOF
+cat > "$tmp/isa-ceiling.c" <<'EOF'
+typedef unsigned V4SI __attribute__((vector_size(16)));
+V4SI reverse(V4SI value) {
+    return __builtin_shufflevector(value, value, 3, 2, 1, 0);
+}
+EOF
+configurations=0
+for mode in default sse2 sse-only sse2-denied arch-denied sse-restored no-sse; do
     case $mode in
-        sse2) isa_flags=(-msse2) ;;
-        i686) isa_flags=(-march=i686) ;;
-        no-sse) isa_flags=(-mno-sse) ;;
+        default)
+            isa_flags=()
+            expect_sse=1 expect_sse2=1 expect_sse3=0 expect_pshufd=1 expect_xmm=1
+            ;;
+        sse2)
+            isa_flags=(-msse2)
+            expect_sse=1 expect_sse2=1 expect_sse3=0 expect_pshufd=1 expect_xmm=1
+            ;;
+        sse-only)
+            isa_flags=(-msse -mno-sse2)
+            expect_sse=1 expect_sse2=0 expect_sse3=0 expect_pshufd=0 expect_xmm=1
+            ;;
+        sse2-denied)
+            isa_flags=(-mno-sse2)
+            expect_sse=1 expect_sse2=0 expect_sse3=0 expect_pshufd=0 expect_xmm=1
+            ;;
+        arch-denied)
+            isa_flags=(-mno-sse2 -march=nehalem)
+            expect_sse=1 expect_sse2=0 expect_sse3=0 expect_pshufd=0 expect_xmm=1
+            ;;
+        sse-restored)
+            isa_flags=(-mno-sse -msse)
+            expect_sse=1 expect_sse2=1 expect_sse3=0 expect_pshufd=1 expect_xmm=1
+            ;;
+        no-sse)
+            isa_flags=(-mno-sse)
+            expect_sse=0 expect_sse2=0 expect_sse3=0 expect_pshufd=0 expect_xmm=0
+            ;;
     esac
     flags=("${base_flags[@]}" "${isa_flags[@]}")
+    for compiler in "$ccc" "$GCC_ORACLE_BIN" "$CLANG_ORACLE_BIN"; do
+        extra=()
+        [[ $compiler == "$ccc" ]] || extra=(-B"$as_dir/")
+        "$compiler" "${flags[@]}" "${extra[@]}" \
+            -DEXPECT_SSE="$expect_sse" -DEXPECT_SSE2="$expect_sse2" \
+            -DEXPECT_SSE3="$expect_sse3" \
+            -c "$tmp/feature-macros.c" -o "$tmp/feature-macros.o"
+    done
+
+    # A host executing an SSE2-capable CPU cannot detect an ISA-ceiling
+    # escape. Compile a one-source shuffle and require the PSHUFD fast path
+    # exactly when SSE2 is effective; the portable gather must remain correct
+    # in the runtime matrix below. XMM presence independently proves which
+    # argument/return convention this function used.
+    assembly="$tmp/isa-$mode.s"
+    "$ccc" "${flags[@]}" -O2 -S "$tmp/isa-ceiling.c" -o "$assembly"
+    pshufd_count=$(awk '/[[:space:]]v?pshufd[[:space:]]/{n++} END{print n+0}' "$assembly")
+    xmm_count=$(awk '/%xmm/{n++} END{print n+0}' "$assembly")
+    if (( expect_pshufd ? pshufd_count == 0 : pshufd_count != 0 )); then
+        echo "FAIL: $mode PSHUFD ceiling (count=$pshufd_count expected=$expect_pshufd)" >&2
+        cat "$assembly" >&2
+        exit 1
+    fi
+    if (( expect_xmm ? xmm_count == 0 : xmm_count != 0 )); then
+        echo "FAIL: $mode XMM carrier convention (count=$xmm_count expected=$expect_xmm)" >&2
+        cat "$assembly" >&2
+        exit 1
+    fi
+    echo "ok: $mode macros + ISA ceiling (pshufd=$pshufd_count xmm=$xmm_count)"
+
     for driver in "$GCC_ORACLE_BIN" "$CLANG_ORACLE_BIN"; do
         "$driver" "${flags[@]}" -B"$as_dir/" -O2 -c "$fixture/driver.c" -o "$tmp/abi-driver.o"
         "$driver" "${flags[@]}" -B"$as_dir/" -O2 -DSHUFFLE_DRIVER_ONLY -c "$tmp/typed.c" -o "$tmp/typed-driver.o"
@@ -63,9 +155,14 @@ for mode in sse2 i686 no-sse; do
                 "$compiler" "${flags[@]}" "${extra[@]}" -"$opt" -DSHUFFLE_FUNCTIONS_ONLY -c "$tmp/typed.c" -o "$tmp/functions.o"
                 "$linker" -m elf_i386 -static -e _start "$tmp/start.o" "$tmp/typed-driver.o" "$tmp/functions.o" -o "$tmp/typed"
                 "$tmp/typed"
+                configurations=$((configurations + 1))
                 echo "ok: $mode $compiler -$opt / $driver driver: 16384 ABI + 18432 typed shuffle checks"
             done
         done
     done
 done
-echo 'PASS: i686 GNU vector SSE XMM and pre-SSE/no-SSE stack/sret ABI, indirect calls, stack overflow, variadics and typed shuffles'
+[[ $configurations == 168 ]] || {
+    echo "FAIL: executed $configurations configurations, expected 168" >&2
+    exit 1
+}
+echo 'PASS: 168 i686 GNU vector configurations; default/SSE-only/SSE2/no-SSE ABI, flag-order macro ceilings, PSHUFD ceilings, indirect calls, stack overflow, variadics and typed shuffles'

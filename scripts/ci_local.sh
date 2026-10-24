@@ -708,6 +708,13 @@ gate "vector-abi-wide" fast \
 gate "gnu-vector-align-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_gnu_vector_align_abi.sh
 
+# GCC-compatible 16-byte vector_size i686 carriers, including the SSE-only
+# and no-SSE boundaries, with typed shuffles across every compiler pairing.
+# The hosted leg runs after a swap-enabled fastbuild with GNU as 2.47 and the
+# exact GCC 16.2 / Clang 23.1.3 oracles in the unsharded differential lane.
+gate "i686-gnu-vector-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_i686_gnu_vector_abi.sh
+
 # AUD-TMP-1: temp files must be symlink-proof. Drives the pre-placed-symlink
 # reproducer (and its pre-placed-directory variant) against the built compiler
 # and asserts the victim file is untouched, the compile still succeeds and

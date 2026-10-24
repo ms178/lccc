@@ -77,7 +77,7 @@ downstream lexer uses these markers to maintain accurate source locations.
 | `set_pic(enabled)` | Define or undefine `__PIC__`/`__pic__`. |
 | `set_optimize(opt, size)` | Define `__OPTIMIZE__` and `__OPTIMIZE_SIZE__`. |
 | `set_gnu89_inline(gnu89)` | Toggle between GNU89 and C99 inline semantics macros. |
-| `set_sse_macros(no_sse)` | Control `__SSE__`/`__SSE2__`/`__MMX__` definitions. |
+| `set_sse_macros(no_sse, no_sse2)` | Control `__SSE__`/`__SSE2__`/`__MMX__` definitions, including SSE-only i686. |
 | `set_extended_simd_macros(...)` | Define `__SSE3__`, `__SSSE3__`, `__SSE4_1__`, `__SSE4_2__`, `__AVX__`, `__AVX2__` based on flags. |
 | `set_asm_mode(asm_mode)` | Enable assembly preprocessing mode: `$` is not treated as an identifier character (for AT&T assembly `$MACRO_NAME` expansion), and `#pragma pack` / `#pragma GCC visibility` synthetic tokens are suppressed (since these are C parser-specific and would cause assembler errors). |
 | `set_riscv_abi(abi)` | Override RISC-V float ABI macros (`lp64` = soft-float, `lp64f` = single, `lp64d` = double). |
