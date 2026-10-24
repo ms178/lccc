@@ -57,7 +57,10 @@ impl PressureBudget {
         match class {
             GP => self.gp,
             VECTOR => self.vector,
-            _ => unreachable!(),
+            _ => {
+                debug_assert!(false, "invalid register-pressure class");
+                0 // Fail closed in release builds if an internal caller is wrong.
+            }
         }
     }
 }
@@ -487,7 +490,9 @@ fn candidate_order(
                 best = Some((position, key));
             }
         }
-        let (position, _) = best.expect("non-empty ready list");
+        let Some((position, _)) = best else {
+            return None; // Fail closed rather than committing a partial schedule.
+        };
         let node_index = ready.swap_remove(position);
         sim.apply(&nodes[node_index], info, budget);
         order.push(node_index);
@@ -659,22 +664,19 @@ fn schedule_function(
             });
         }
         let spans_valid = block.source_spans.len() == n;
-        let mut old_instructions: Vec<Option<Instruction>> =
-            std::mem::take(&mut block.instructions)
-                .into_iter()
-                .map(Some)
-                .collect();
-        block.instructions = final_order
-            .iter()
-            .map(|&old| {
-                old_instructions[old]
-                    .take()
-                    .expect("each source instruction moved once")
-            })
-            .collect();
-        if spans_valid {
-            let old_spans = std::mem::take(&mut block.source_spans);
-            block.source_spans = final_order.iter().map(|&old| old_spans[old]).collect();
+        // Apply new->old as an in-place permutation. Swapping the parallel
+        // span array at every step preserves debug locations, and using the
+        // permutation itself as the position map avoids Option/unwrap
+        // reconstruction or a second instruction allocation.
+        for new in 0..n {
+            while final_order[new] != new {
+                let old = final_order[new];
+                block.instructions.swap(new, old);
+                final_order.swap(new, old);
+                if spans_valid {
+                    block.source_spans.swap(new, old);
+                }
+            }
         }
     }
 }

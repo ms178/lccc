@@ -52,6 +52,30 @@ fn same_memory_value_type(
     a == b || matches!((a, b), (I64, U64) | (U64, I64))
 }
 
+type AvailableLoad = (alias::LinForm, crate::common::types::IrType, Value, Value);
+
+fn retain_available_across_call(
+    func: &IrFunction,
+    block: usize,
+    instruction: usize,
+    available: &mut Vec<AvailableLoad>,
+    analysis: &super::ipa_pta::IpaPta,
+) {
+    let before = available.len();
+    available
+        .retain(|(_, _, _, pointer)| !analysis.may_call_modify(func, block, instruction, *pointer));
+    if std::env::var_os("CCC_IPA_PTA_STATS").is_some() {
+        eprintln!(
+            "[IPA-PTA] consumer function={} block={} instruction={} available={}->{}",
+            func.name,
+            block,
+            instruction,
+            before,
+            available.len()
+        );
+    }
+}
+
 pub(crate) fn run(func: &mut IrFunction) -> usize {
     run_impl(func, None)
 }
@@ -91,8 +115,7 @@ fn run_impl(func: &mut IrFunction, ipa: Option<&super::ipa_pta::IpaPta>) -> usiz
             // (form, type, canonical dest, address value).  Retaining the
             // original address is what lets IPA-PTA answer a call query per
             // available load rather than conservatively clearing the list.
-            let mut available: Vec<(alias::LinForm, crate::common::types::IrType, Value, Value)> =
-                Vec::new();
+            let mut available: Vec<AvailableLoad> = Vec::new();
             let mut removed: Vec<usize> = Vec::new();
 
             for (ii, inst) in func.blocks[bi].instructions.iter().enumerate() {
@@ -160,12 +183,7 @@ fn run_impl(func: &mut IrFunction, ipa: Option<&super::ipa_pta::IpaPta>) -> usiz
                         match alias::resolve_in_frame(func, &defs, &frames, frame, *ptr) {
                             Some(sform) => {
                                 let ssz = crate::passes::loop_memory_promote::byte_size(*ty);
-                                let keep = |entry: &(
-                                    alias::LinForm,
-                                    crate::common::types::IrType,
-                                    Value,
-                                    Value,
-                                )| {
+                                let keep = |entry: &AvailableLoad| {
                                     match (
                                         crate::passes::loop_memory_promote::byte_size(entry.1),
                                         ssz,
@@ -224,21 +242,14 @@ fn run_impl(func: &mut IrFunction, ipa: Option<&super::ipa_pta::IpaPta>) -> usiz
                                 func, &defs, &frames, frame, base, index, disp,
                             ) {
                                 Some(sform) => {
-                                    let keep = |entry: &(
-                                        alias::LinForm,
-                                        crate::common::types::IrType,
-                                        Value,
-                                        Value,
-                                    )| {
-                                        match (
-                                            crate::passes::loop_memory_promote::byte_size(entry.1),
-                                            Some(ssz),
-                                        ) {
-                                            (Some(lsz), Some(_)) => alias::forms_disjoint(
-                                                &entry.0, lsz, &sform, ssz, true,
-                                            ),
-                                            _ => false,
+                                    let keep = |entry: &AvailableLoad| match (
+                                        crate::passes::loop_memory_promote::byte_size(entry.1),
+                                        Some(ssz),
+                                    ) {
+                                        (Some(lsz), Some(_)) => {
+                                            alias::forms_disjoint(&entry.0, lsz, &sform, ssz, true)
                                         }
+                                        _ => false,
                                     };
                                     available.retain(keep);
                                 }
@@ -254,20 +265,7 @@ fn run_impl(func: &mut IrFunction, ipa: Option<&super::ipa_pta::IpaPta>) -> usiz
                     // pointer kill everything (read-only intrinsics are fine).
                     Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
                         if let Some(analysis) = ipa {
-                            let before = available.len();
-                            available.retain(|(_, _, _, pointer)| {
-                                !analysis.may_call_modify(func, bi, ii, *pointer)
-                            });
-                            if std::env::var_os("CCC_IPA_PTA_STATS").is_some() {
-                                eprintln!(
-                                    "[IPA-PTA] consumer function={} block={} instruction={} available={}->{}",
-                                    func.name,
-                                    bi,
-                                    ii,
-                                    before,
-                                    available.len()
-                                );
-                            }
+                            retain_available_across_call(func, bi, ii, &mut available, analysis);
                         } else {
                             available.clear();
                         }

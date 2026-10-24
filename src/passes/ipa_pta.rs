@@ -1229,8 +1229,7 @@ fn build_instruction(
             let allocation = destination.is_some()
                 && is_allocation_name(name)
                 && target.is_none_or(|target| !solver.functions[target].safe_body);
-            if allocation {
-                let destination = destination.expect("allocation destination");
+            if allocation && let Some(destination) = destination {
                 let object = solver.add_object(ObjectKind::Heap);
                 solver.insert(destination, object);
                 if name == "realloc"
