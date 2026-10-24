@@ -147,3 +147,24 @@ its manifest digest changes for the comment only. This corrects the earlier
 claim that the original invocation supplied wrapping semantics. The hosted
 Intel rerun, rather than the incidental earlier GCC/Clang agreement, determines
 whether this fully resolves the lane failure.
+
+The Intel lane still failed after the wrapping correction. A local reproduction
+on the restored host exposed a second integration defect: the unconditional
+`-m32 -S` leg pulled multilib libc headers even though assembly coverage needs
+no libc. The fixture now uses compiler integer limits and an explicit standard
+printf declaration, leaving the arithmetic and checksum unchanged. Before
+installing multilib, the same gate then passed assembly and explicitly skipped
+only the unavailable runtime. After restoring the cached multilib files, the
+gate passed with GCC 16.2.0 and Clang 23.1.3 at all five optimization levels,
+including i686 runtime parity. ICX remained unavailable locally. Override
+reporting now prints the actual GCC version without labelling an arbitrary
+caller-supplied compiler as version 16.2. Hosted failures also expose their log
+tail as check annotations, avoiding reliance on blocked signed log redirects.
+
+Hosted annotations confirmed the diagnosis: ICX 2026.2 runtime comparisons
+passed at O0/O1/O2/O3/Os, then assembly-only i686 failed on missing
+`bits/libc-header-start.h`/`bits/types.h`. Thus removing the fixture's libc
+header dependency addresses the observed failure rather than merely a local
+hypothesis. The Intel lane's runner-default GCC/Clang versions were 13.3.0 and
+18.1.3; exact GCC 16.2/Clang 23.1.3 coverage is owned by the contract lane and
+was also reproduced locally as recorded above.

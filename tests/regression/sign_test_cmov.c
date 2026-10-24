@@ -1,5 +1,9 @@
-#include <limits.h>
-#include <stdio.h>
+#define INT_MAX __INT_MAX__
+#define INT_MIN (-INT_MAX - 1)
+
+/* Keep assembly-only -m32 coverage independent of multilib libc headers.
+ * The runtime leg still requires a working libc and reports its own probe. */
+extern int printf(const char *format, ...);
 
 #if defined(__GNUC__) || defined(__clang__)
 #define NOINLINE __attribute__((noinline))

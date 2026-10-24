@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "source": "tests/regression/sign_test_cmov.c",
-  "source_sha256": "990afa9ee430e5d816f154358c3de3836fbc814da9454b5b7010ce9b0c721199",
+  "source_sha256": "13f1347968a64c75e7147e84b7b0ed9b55526475c9e8500f6fa20234d70a42fa",
   "function": "nonnegative_difference",
   "remote_flags": "-O2 -fwrapv",
   "local_flags": "-O2 -fwrapv",
@@ -102,6 +102,7 @@
   "notes": [
     "The 2026-10-24 red-team pass wired the helper directly into both CI mirrors.",
     "ICX coverage is hosted; the absolute local binary path was removed from this manifest.",
-    "Fixture comment now documents the required wrapping contract; see engineering/journal/2026-10-24-sign-test-cmov-redteam.md."
+    "Fixture comment now documents the required wrapping contract; see engineering/journal/2026-10-24-sign-test-cmov-redteam.md.",
+    "The fixture declares printf directly and uses compiler integer limits so assembly-only i686 coverage does not require multilib libc headers."
   ]
 }

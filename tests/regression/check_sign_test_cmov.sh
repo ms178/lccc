@@ -108,7 +108,7 @@ function_has() {
 gcc_version=$($gcc16 -dumpfullversion -dumpversion 2>/dev/null || echo unknown)
 clang_version=$($clang --version 2>/dev/null || echo unknown)
 clang_version=${clang_version%%$'\n'*}
-oracle_desc=("GCC 16.2 ($gcc_version)" "Clang ($clang_version)")
+oracle_desc=("GCC ($gcc_version)" "Clang ($clang_version)")
 if [ -n "$icx" ]; then
     icx_version=$($icx --version 2>/dev/null || echo unknown)
     icx_version=${icx_version%%$'\n'*}
@@ -236,7 +236,7 @@ if timeout 120 "$lccc" -O2 -fwrapv -m32 -S "$FIXTURE" -o "$harness/lccc-i686-O2.
                     "${runner[@]}"
                 diff -u "$harness/lccc-i686.txt" "$harness/gcc-i686.txt" >/dev/null \
                     || fail "i686 LCCC/GCC runtime mismatch"
-                echo "PASS: i686 runtime and branch-condition parity (GCC 16.2 $gcc_version)"
+                echo "PASS: i686 runtime and branch-condition parity (GCC $gcc_version)"
             else
                 echo "SKIP [i686 runtime: host cannot execute -m32 binaries and qemu-i386 is absent]"
             fi
