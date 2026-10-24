@@ -4459,6 +4459,36 @@ pub(super) fn eliminate_fp_spill_around_load(
 //   - xmm2 is not used inside the loop body
 //   - The preheader (block before loop header) stores to -O(%rbp)
 //
+// This pass only rewrites the preheader store and body load, never labels.
+// Retain the first occurrence, just like the old prefix scan (even for
+// malformed duplicate labels); a forward target is not a loop back-edge.
+struct FpLoopHeaders(crate::common::fx_hash::FxHashMap<String, usize>);
+
+#[cfg(test)]
+thread_local! {
+    static FP_LOOP_HEADER_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl FpLoopHeaders {
+    fn build(store: &LineStore, infos: &[LineInfo]) -> Self {
+        #[cfg(test)]
+        FP_LOOP_HEADER_BUILDS.with(|count| count.set(count.get() + 1));
+        let mut labels = crate::common::fx_hash::FxHashMap::default();
+        for (i, info) in infos.iter().enumerate() {
+            if info.kind == LineKind::Label {
+                if let Some(name) = info.trimmed(store.get(i)).strip_suffix(':') {
+                    labels.entry(name.to_owned()).or_insert(i);
+                }
+            }
+        }
+        Self(labels)
+    }
+
+    fn backward_target(&self, target: &str, jump: usize) -> Option<usize> {
+        self.0.get(target).copied().filter(|&label| label < jump)
+    }
+}
+
 pub(super) fn promote_loop_invariant_fp_load(
     store: &mut LineStore,
     infos: &mut [LineInfo],
@@ -4466,6 +4496,7 @@ pub(super) fn promote_loop_invariant_fp_load(
     let len = store.len();
     let mut changed = false;
     let mut lv: Option<FpLiveness> = None;
+    let mut headers: Option<FpLoopHeaders> = None;
 
     // Find loop back-edges: jmp to a label that appears before the jmp.
     let mut i = 0;
@@ -4484,18 +4515,9 @@ pub(super) fn promote_loop_invariant_fp_load(
             continue;
         }
         let target = &jmp_text[4..];
-        let target_label = format!("{}:", target);
-
-        // Find the target label (must be before the jmp = back-edge).
-        let mut header_pos = None;
-        for lbl in 0..i {
-            if infos[lbl].kind == LineKind::Label {
-                if infos[lbl].trimmed(store.get(lbl)) == target_label {
-                    header_pos = Some(lbl);
-                    break;
-                }
-            }
-        }
+        let header_pos = headers
+            .get_or_insert_with(|| FpLoopHeaders::build(store, infos))
+            .backward_target(target, i);
         let header = match header_pos {
             Some(h) => h,
             None => {
@@ -4623,7 +4645,9 @@ pub(super) fn promote_loop_invariant_fp_load(
                 // Labels are OK to cross — we're looking for ANY store to this offset
                 // that dominates the loop header.
                 if let LineKind::StoreRbp {
-                    reg: 0, offset: o, ..
+                    reg: 0,
+                    offset: o,
+                    size: MoveSize::Q,
                 } = infos[ph].kind
                 {
                     if o == numeric_offset {
@@ -4639,6 +4663,12 @@ pub(super) fn promote_loop_invariant_fp_load(
             }
 
             if let Some(ph_pos) = preheader_store {
+                // Both writes are replaced as one transaction. A partial GP
+                // store does not define all eight bytes read by MOVSD; the
+                // MoveSize::Q match above is essential, not a profitability gate.
+                if infos[ph_pos].pinned || infos[pos].pinned {
+                    continue;
+                }
                 // Soundness (CFG-aware oracle; the old pass rewrote
                 // unconditionally and miscompiled fp_param_wide / hoistH):
                 //
@@ -13211,6 +13241,92 @@ mod loop_hoist_tests {
         );
     }
 
+    fn promotion_fixture(store: &str) -> String {
+        format!(
+            "foo:\n.cfi_startproc\n pushq %rbp\n movq %rsp, %rbp\n {store}\n.Lhead:\n subl $1, %ebx\n jle .Lexit\n.Lbody:\n movsd -24(%rbp), %xmm0\n addsd %xmm0, %xmm1\n jmp .Lhead\n.Lexit:\n movapd %xmm1, %xmm0\n popq %rbp\n ret\n.cfi_endproc\n"
+        )
+    }
+
+    #[test]
+    fn promote_refuses_partial_preheader_store() {
+        for instruction in [
+            "movb %al, -24(%rbp)",
+            "movb %ah, -24(%rbp)",
+            "movw %ax, -24(%rbp)",
+            "movl %eax, -24(%rbp)",
+        ] {
+            let out = run_promote(&promotion_fixture(instruction));
+            assert!(
+                out.iter().any(|line| line == instruction),
+                "{instruction}: {out:?}"
+            );
+            assert!(
+                out.iter().any(|line| line == "movsd -24(%rbp), %xmm0"),
+                "{out:?}"
+            );
+            assert!(
+                !out.iter().any(|line| line == "movq %rax, %xmm2"),
+                "{out:?}"
+            );
+        }
+    }
+
+    /// SSE2 MOVSD m64 reads the complete slot, not the width of its
+    /// preceding GP store. Execute the reviewed instruction contract too.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn partial_preheader_store_native_preserves_other_bytes() {
+        let old = 0x3ff8_0000_0010_0000u64;
+        let value = 0x8877_6655_4433_2211u64;
+        macro_rules! check {
+            ($store:literal, $mask:expr, $stored:expr) => {{
+                let mut slot = old;
+                let result: u64;
+                // SAFETY: address points to a live writable eight-byte slot;
+                // SSE2 is baseline on x86-64 and every clobber is declared.
+                unsafe {
+                    std::arch::asm!(
+                        $store,
+                        "movsd xmm0, qword ptr [rdi]",
+                        "movq {result}, xmm0",
+                        in("rdi") &mut slot,
+                        in("rax") value,
+                        result = lateout(reg) result,
+                        out("xmm0") _,
+                        options(nostack),
+                    );
+                }
+                assert_eq!(result, (old & !$mask) | ($stored & $mask));
+                assert_ne!(result, value, "a full MOVQ is not equivalent");
+            }};
+        }
+        check!("mov byte ptr [rdi], al", 0xffu64, value);
+        check!("mov byte ptr [rdi], ah", 0xffu64, value >> 8);
+        check!("mov word ptr [rdi], ax", 0xffffu64, value);
+        check!("mov dword ptr [rdi], eax", 0xffff_ffffu64, value);
+    }
+
+    #[test]
+    fn promote_preserves_each_pinned_participant() {
+        for pinned in ["movq %rax, -24(%rbp)", "movsd -24(%rbp), %xmm0"] {
+            let mut store = LineStore::new(promotion_fixture("movq %rax, -24(%rbp)"));
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            let at = (0..store.len())
+                .find(|&i| store.get(i).trim() == pinned)
+                .unwrap();
+            infos[at].pinned = true;
+            let original = store.build_result(|_| false);
+            assert!(
+                !promote_loop_invariant_fp_load(&mut store, &mut infos),
+                "{pinned}"
+            );
+            assert_eq!(store.build_result(|_| false), original);
+            assert!(infos[at].pinned);
+        }
+    }
+
     /// Textbook promotion shape (with a real frame-pointer prologue, which
     /// the slot-liveness oracle requires): the preheader store becomes the
     /// %xmm2 definition and the body load becomes a register copy.
@@ -14950,5 +15066,78 @@ mod highbit_bsr_tests {
             "    ret\n",
         );
         assert_eq!(run(other).len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod fp_loop_header_index_tests {
+    use super::*;
+
+    #[test]
+    fn index_matches_first_preceding_label_scan() {
+        let mut store = LineStore::new(
+            "f:\n.cfi_startproc\n.Lsame:\njmp .Lforward\n.Lsame:\njmp .Lsame\n.Lforward:\njmp missing\n.Lremoved:\nret\n.cfi_endproc\n".into(),
+        );
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        mark_nop(&mut infos[8]);
+        let index = FpLoopHeaders::build(&store, &infos);
+        for jump in 0..store.len() {
+            for target in [
+                "f",
+                ".Lsame",
+                ".Lforward",
+                ".Lremoved",
+                "missing",
+                "",
+                ".Lsame #comment",
+            ] {
+                let expected = (0..jump).find(|&label| {
+                    infos[label].kind == LineKind::Label
+                        && infos[label].trimmed(store.get(label)) == format!("{target}:")
+                });
+                assert_eq!(
+                    index.backward_target(target, jump),
+                    expected,
+                    "{target} at {jump}"
+                );
+            }
+        }
+        // The actual pass edits instruction text, not label identities.
+        replace_line(
+            &mut store,
+            &mut infos[9],
+            9,
+            "    movapd %xmm2, %xmm0".into(),
+        );
+        assert_eq!(index.backward_target(".Lsame", 5), Some(2));
+    }
+
+    #[test]
+    fn many_forward_jumps_build_one_index() {
+        let mut asm = String::from("f:\n.cfi_startproc\n");
+        for i in 0..256 {
+            asm.push_str(&format!("jmp .Lnext{i}\n.Lnext{i}:\n"));
+        }
+        asm.push_str("ret\n.cfi_endproc\n");
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let before = FP_LOOP_HEADER_BUILDS.with(std::cell::Cell::get);
+        assert!(!promote_loop_invariant_fp_load(&mut store, &mut infos));
+        assert_eq!(FP_LOOP_HEADER_BUILDS.with(std::cell::Cell::get) - before, 1);
+    }
+
+    #[test]
+    fn no_jump_needs_no_header_index() {
+        let mut store = LineStore::new("f:\nret\n".into());
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let before = FP_LOOP_HEADER_BUILDS.with(std::cell::Cell::get);
+        assert!(!promote_loop_invariant_fp_load(&mut store, &mut infos));
+        assert_eq!(FP_LOOP_HEADER_BUILDS.with(std::cell::Cell::get) - before, 0);
     }
 }
