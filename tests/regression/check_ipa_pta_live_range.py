@@ -542,9 +542,17 @@ def main(argv: Iterable[str] | None = None) -> int:
             if any(ipa) or any(lrs):
                 detail = f"{entry['name']}: IPA forwarded max={max(ipa or [0])}; LRS changed max={max(lrs or [0])}"
                 print(f"::notice title=IPA/LRS optimization witness::{escape_annotation(detail)}")
+        context = {
+            "repetitions": args.reps,
+            "host": {k: v for k, v in report["host"].items()
+                     if k in {"platform", "machine", "model name", "Hardware"}},
+            "compilers": report["compilers"],
+        }
+        print(f"::notice title=IPA/LRS measurement context::{escape_annotation(json.dumps(context, sort_keys=True))}")
         for item in report["performance"]:
             detail = json.dumps({
                 "case": item["case"],
+                "repetitions": item["repetitions"],
                 "feature_over_baseline": item.get("feature_over_baseline"),
                 "feature_over_oracle": item.get("feature_over_oracle", {}),
                 "median_seconds": item["median_seconds"],

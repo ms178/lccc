@@ -119,7 +119,7 @@ impl Simulation {
             let vi = info[v as usize];
             if sim.remaining[v as usize] != 0 && !locally_defined.contains(&v) {
                 sim.live[v as usize] = vi.weight;
-                sim.current[vi.class] += u32::from(vi.weight);
+                sim.current[vi.class] = sim.current[vi.class].saturating_add(u32::from(vi.weight));
             }
         }
         sim
@@ -134,21 +134,21 @@ impl Simulation {
             let i = v as usize;
             if self.remaining[i] == 1 && self.live[i] != 0 {
                 let vi = info[i];
-                deaths[vi.class] -= i32::from(vi.weight);
-                death_weight += u32::from(vi.weight);
+                deaths[vi.class] = deaths[vi.class].saturating_sub(i32::from(vi.weight));
+                death_weight = death_weight.saturating_add(u32::from(vi.weight));
             }
         }
         if let Some(v) = node.dest {
             let i = v as usize;
             if self.remaining[i] != 0 && self.live[i] == 0 {
                 let vi = info[i];
-                births[vi.class] += i32::from(vi.weight);
-                birth_weight += u32::from(vi.weight);
+                births[vi.class] = births[vi.class].saturating_add(i32::from(vi.weight));
+                birth_weight = birth_weight.saturating_add(u32::from(vi.weight));
             }
         }
         let mut delta = [0i32; CLASSES];
         for class in 0..CLASSES {
-            delta[class] = deaths[class] + births[class];
+            delta[class] = deaths[class].saturating_add(births[class]);
         }
         (delta, death_weight, birth_weight)
     }
@@ -158,7 +158,8 @@ impl Simulation {
         let mut total = 0u32;
         let mut worst = 0u32;
         for class in 0..CLASSES {
-            let next = (self.current[class] as i32 + delta[class]).max(0) as u32;
+            let next = (i64::from(self.current[class]) + i64::from(delta[class]))
+                .clamp(0, i64::from(u32::MAX)) as u32;
             let excess = next.saturating_sub(budget.get(class));
             total = total.saturating_add(excess);
             worst = worst.max(excess);
@@ -185,7 +186,8 @@ impl Simulation {
             if self.remaining[i] != 0 && self.live[i] == 0 {
                 let vi = info[i];
                 self.live[i] = vi.weight;
-                self.current[vi.class] += u32::from(vi.weight);
+                self.current[vi.class] =
+                    self.current[vi.class].saturating_add(u32::from(vi.weight));
             }
         }
         for class in 0..CLASSES {

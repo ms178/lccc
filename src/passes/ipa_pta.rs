@@ -52,7 +52,21 @@ impl ObjectSet {
     }
 
     fn union_with(&mut self, other: &Self) -> bool {
-        if other.0.iter().all(|&object| self.contains(object)) {
+        // First do a linear subset check.  Using binary_search for every
+        // element here would reintroduce O(n log m) work into the summary
+        // fixpoint even though both inputs are already sorted.
+        let mut existing = 0usize;
+        let mut changed = false;
+        for &object in &other.0 {
+            while existing < self.0.len() && self.0[existing] < object {
+                existing += 1;
+            }
+            if existing == self.0.len() || self.0[existing] != object {
+                changed = true;
+                break;
+            }
+        }
+        if !changed {
             return false;
         }
         // Both sets are sorted.  Merge in linear time instead of repeatedly
@@ -1288,8 +1302,12 @@ fn build_instruction(
                 },
             );
         }
-        Instruction::PgoCounterInc { .. }
-        | Instruction::GetReturnF64Second { .. }
+        Instruction::PgoCounterInc { .. } => {
+            // Instrumentation normally runs after IPA, but keep the analysis
+            // sound for handcrafted IR or a future pipeline reordering too.
+            mark_unmodeled(solver, function, block, instruction, inst);
+        }
+        Instruction::GetReturnF64Second { .. }
         | Instruction::GetReturnF32Second { .. }
         | Instruction::GetReturnF128Second { .. }
         | Instruction::SetReturnF64Second { .. }
@@ -1855,6 +1873,43 @@ mod tests {
         let mut module = test_module(vec![sync, caller]);
         assert_eq!(run(&mut module, false), 0);
         assert_eq!(load_count(&module.functions[1]), 2);
+    }
+
+    #[test]
+    fn profile_counter_is_a_summary_barrier() {
+        let mut profiled = function("profiled", IrType::Void);
+        finish(
+            &mut profiled,
+            vec![Instruction::PgoCounterInc {
+                name: "profile_counter".into(),
+                offset: 0,
+                atomic: false,
+            }],
+            None,
+        );
+        let mut caller = function("caller", IrType::I32);
+        finish(
+            &mut caller,
+            vec![
+                global_addr(0, "cell"),
+                load(1, 0),
+                call("profiled", vec![]),
+                load(2, 0),
+            ],
+            Some(Value(2)),
+        );
+        let mut module = test_module(vec![profiled, caller]);
+        assert_eq!(run(&mut module, false), 0);
+        assert_eq!(load_count(&module.functions[1]), 2);
+    }
+
+    #[test]
+    fn sorted_union_merges_without_duplicates() {
+        let mut left = ObjectSet(vec![1, 3, 7]);
+        let right = ObjectSet(vec![2, 3, 4, 8]);
+        assert!(left.union_with(&right));
+        assert_eq!(left.0, vec![1, 2, 3, 4, 7, 8]);
+        assert!(!left.union_with(&right));
     }
 
     #[test]
