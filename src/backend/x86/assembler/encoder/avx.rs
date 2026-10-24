@@ -316,6 +316,65 @@ fn vec_width(name: &str) -> Option<u8> {
     }
 }
 
+/// Packed shift operand roles from SDM Vol. 2: uniform register counts
+/// are always XMM, even for YMM/ZMM data. Per-element shifts instead read
+/// a full-width count vector. Neither family permits widening the data
+/// register names by merely choosing the widest operand's encoding.
+/// Returns whether the valid shape requires EVEX (immediate + memory data).
+pub(crate) fn check_packed_shift_shape(mnemonic: &str, ops: &[Operand]) -> Result<bool, String> {
+    // PSLLDQ/PSRLDQ have no MMX or GP form. Their ModRM register
+    // number alone cannot distinguish those illegal names from XMM.
+    if matches!(mnemonic, "pslldq" | "psrldq") {
+        return match ops {
+            [
+                Operand::Immediate(ImmediateValue::Integer(_)),
+                Operand::Register(dst),
+            ] if is_xmm(&dst.name) => Ok(false),
+            _ => Err(format!("operand type mismatch for `{mnemonic}'")),
+        };
+    }
+    let (variable, byte_shift) = match mnemonic {
+        "vpsllw" | "vpslld" | "vpsllq" | "vpsrlw" | "vpsrld" | "vpsrlq" | "vpsraw" | "vpsrad"
+        | "vpsraq" => (false, false),
+        "vpsllvw" | "vpsllvd" | "vpsllvq" | "vpsrlvw" | "vpsrlvd" | "vpsrlvq" | "vpsravw"
+        | "vpsravd" | "vpsravq" => (true, false),
+        "vpslldq" | "vpsrldq" => (false, true),
+        _ => return Ok(false),
+    };
+    let type_error = || format!("operand type mismatch for `{mnemonic}'");
+    if ops.len() != 3 {
+        return Err(format!("number of operands mismatch for `{mnemonic}'"));
+    }
+    let width = match &ops[2] {
+        Operand::Register(dst) => vec_width(&dst.name).ok_or_else(type_error)?,
+        _ => return Err(type_error()),
+    };
+    let immediate = matches!(&ops[0], Operand::Immediate(ImmediateValue::Integer(_)));
+    match &ops[1] {
+        Operand::Register(src) => {
+            if vec_width(&src.name) != Some(width) {
+                return Err(format!("register type mismatch for `{mnemonic}'"));
+            }
+        }
+        // Memory data is available only for immediate counts. Variable
+        // per-element shifts put memory in the COUNT operand, not the data.
+        Operand::Memory(_) if immediate && !variable => {}
+        _ => return Err(type_error()),
+    }
+    let count_ok = match &ops[0] {
+        Operand::Immediate(ImmediateValue::Integer(_)) => !variable,
+        Operand::Register(count) if !byte_shift => {
+            vec_width(&count.name) == Some(if variable { width } else { 0 })
+        }
+        Operand::Memory(_) => !byte_shift,
+        _ => false,
+    };
+    if !count_ok {
+        return Err(type_error());
+    }
+    Ok(matches!(&ops[1], Operand::Memory(_)))
+}
+
 /// Packed-convert shape validation, shared by the VEX and EVEX paths
 /// (GAS reports the same texts either way). Rejects cross-width
 /// registers (`register type mismatch' for same-width, `operand size

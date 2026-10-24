@@ -5,6 +5,7 @@
 
 mod apx;
 mod avx;
+pub(crate) use avx::check_packed_shift_shape;
 mod core;
 
 pub(crate) use self::core::{fold_index_into_base, folded_base, mem_vex_xb_bits};
@@ -3420,6 +3421,10 @@ impl InstructionEncoder {
         let mnemonic = suffixed.as_str();
         let ops = &instr.operands;
 
+        // Validate role-specific widths before either forced or automatic
+        // EVEX dispatch can reinterpret malformed register names.
+        let evex_shift_memory = check_packed_shift_shape(mnemonic, ops)?;
+
         // `{evex}` forces the EVEX encoding (GAS 2.47 semantics, byte-probed
         // over the whole promoted set): AVX/EVEX-native instructions take
         // their EVEX arm via try_encode_evex; `cmp`/`test` promote to
@@ -3490,7 +3495,8 @@ impl InstructionEncoder {
         let prefer_evex = matches!(
             mnemonic,
             "vpdpbusd" | "vpdpwssd" | "vpmadd52luq" | "vpmadd52huq"
-        ) || avx::vcvt_params(mnemonic).is_some_and(|params| params.prefer_evex);
+        ) || avx::vcvt_params(mnemonic).is_some_and(|params| params.prefer_evex)
+            || evex_shift_memory;
         // {vex}/{vex2}/{vex3} (GAS 2.47): the EVEX encoding is forbidden.
         // Anything only EVEX can express is rejected, in GAS's order:
         //   zmm / EGPR memory / xmm-ymm 16-31  -> `unsupported instruction'
@@ -8393,5 +8399,95 @@ mod index_fold_tests {
             hex("vgatherdpd %ymm5, 0x298(,%xmm4,1), %ymm6"),
             "c4 e2 d5 92 34 25 98 02 00 00"
         );
+    }
+}
+
+#[cfg(test)]
+mod packed_shift_audit_tests {
+    use super::*;
+
+    fn check_both_modes(line: &str, accepted: bool) {
+        let items = parse_asm(line).unwrap();
+        let mut x64 = InstructionEncoder::new();
+        let mut x32 = crate::backend::i686::assembler::encoder::InstructionEncoder::new();
+        for item in items {
+            if let AsmItem::Instruction(instr) = item {
+                assert_eq!(x64.encode(&instr).is_ok(), accepted, "x86-64: {line}");
+                assert_eq!(x32.encode(&instr).is_ok(), accepted, "i686: {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn packed_shift_audit_register_role_matrix() {
+        let banks = ["xmm", "ymm", "zmm"];
+        for (mnemonic, variable) in [
+            ("vpsllw", false),
+            ("vpslld", false),
+            ("vpsllq", false),
+            ("vpsrlw", false),
+            ("vpsrld", false),
+            ("vpsrlq", false),
+            ("vpsraw", false),
+            ("vpsrad", false),
+            ("vpsraq", false),
+            ("vpsllvw", true),
+            ("vpsllvd", true),
+            ("vpsllvq", true),
+            ("vpsrlvw", true),
+            ("vpsrlvd", true),
+            ("vpsrlvq", true),
+            ("vpsravw", true),
+            ("vpsravd", true),
+            ("vpsravq", true),
+        ] {
+            for count in banks {
+                for src in banks {
+                    for dst in banks {
+                        let valid = src == dst && count == if variable { dst } else { "xmm" };
+                        check_both_modes(&format!("{mnemonic} %{count}1, %{src}2, %{dst}3"), valid);
+                    }
+                }
+            }
+            for bank in banks {
+                check_both_modes(&format!("{mnemonic} $3, %{bank}2, %{bank}3"), !variable);
+                check_both_modes(&format!("{mnemonic} %eax, %{bank}2, %{bank}3"), false);
+                check_both_modes(&format!("{mnemonic} %xmm1, %eax, %{bank}3"), false);
+            }
+        }
+        for mnemonic in ["vpslldq", "vpsrldq"] {
+            for src in banks {
+                for dst in banks {
+                    check_both_modes(&format!("{mnemonic} $3, %{src}2, %{dst}3"), src == dst);
+                    check_both_modes(&format!("{mnemonic} %xmm1, %{src}2, %{dst}3"), false);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_shift_audit_legacy_bytes_require_xmm() {
+        for mnemonic in ["pslldq", "psrldq"] {
+            for reg in ["xmm0", "xmm7", "mm0", "eax", "ax", "al", "ymm0", "zmm0"] {
+                check_both_modes(&format!("{mnemonic} $3, %{reg}"), reg.starts_with("xmm"));
+            }
+        }
+    }
+
+    #[test]
+    fn packed_shift_audit_memory_roles_and_forced_evex() {
+        for prefix in ["", "{evex} "] {
+            for bank in ["xmm", "ymm", "zmm"] {
+                check_both_modes(&format!("{prefix}vpslld (%eax), %{bank}2, %{bank}3"), true);
+                check_both_modes(&format!("{prefix}vpslld $3, (%eax), %{bank}3"), true);
+                check_both_modes(&format!("{prefix}vpsllvd (%eax), %{bank}2, %{bank}3"), true);
+                check_both_modes(&format!("{prefix}vpsllvd %xmm1, (%eax), %{bank}3"), false);
+                check_both_modes(&format!("{prefix}vpslld %ymm1, %{bank}2, %{bank}3"), false);
+                check_both_modes(
+                    &format!("{prefix}vpslld %xmm1, %xmm2, %{bank}3"),
+                    bank == "xmm",
+                );
+            }
+        }
     }
 }

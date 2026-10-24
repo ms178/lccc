@@ -12,7 +12,7 @@ The combined PDF's SHA-256 is
 All 5,364 pages were extracted; all 4,106 bookmarks were indexed. The large
 source files and full bookmark review ledger are workspace artifacts under
 `/home/user/artifacts/instruction-audit/`, not vendored source files.
-Extraction and indexing are not semantic review. Eight instruction sections
+Extraction and indexing are not semantic review. Thirteen instruction sections
 have partial, explicitly scoped reviews; other bookmark entries are unreviewed.
 
 The shift review concerns only register-only, unmasked 128/256-bit forms:
@@ -47,8 +47,9 @@ zeroing. The existing vector-copy disable control also disables this rule.
 For the real C expression `return a << n` with a 256-bit unsigned vector,
 the current compiler emits `vmovd; vpslld; ret`, replacing the previous
 five-instruction sequence. This is instruction-count evidence, not a universal
-runtime-speedup claim. Real 128-bit C lowering uses other splat shapes and is
-not claimed to benefit from this particular three-instruction matcher.
+runtime-speedup claim. The continued review recognizes the 128-bit low-dword shuffle and
+low-qword self-unpack splats as well; the measurements below supersede the
+initial absence of a 128-bit C improvement.
 
 The native integer-model fixture compares original and rewritten assembly
 on boundary counts, high-bit counts, and randomized valid/excessive counts,
@@ -84,7 +85,7 @@ full ABI/layout review, the remaining SDM sections, and current AMD full-text
 cross-checks are not certified here. The current delta also has no new local
 ICX comparison or general runtime benchmark claim.
 
-## Recorded local outcomes
+## Initial recorded local outcomes
 
 The fastbuild compiler build, strict all-target Clippy (`-D warnings`),
 6,173 library tests (10 existing ignored tests), and the lccc-ld binary test
@@ -95,3 +96,128 @@ and the new exhaustive test failed with exit 101 after removing only the new
 M0 guard, and passed with exit 0 with the guard present. This establishes
 that the guard's regression test distinguishes the old decision from the fix;
 it does not claim native APX execution on this host.
+
+## Continued review: register roles, byte shifts, and 128-bit splats
+
+Additional scoped manual references (PDF page numbers, not printed pagination):
+
+- PSHUFD: 1715–1716, immediate zero replicates the low dword within a 128-bit lane.
+- PUNPCKLQDQ: 1801–1807, self-unpack replicates the low qword.
+- UNPCKLPD: 2041–2044, the corresponding bitwise self-unpack has no SIMD FP
+  exceptions. It is safe for arbitrary integer bit patterns, including ones
+  whose floating-point interpretation is a signaling NaN.
+- PSLLDQ: 1730–1731; PSRLDQ: 1754–1755. Legacy forms require XMM registers;
+  neither MMX nor GP forms exist. VEX data is register-only; EVEX admits
+  memory data. Counts are immediate bytes, not count registers.
+- The previously reviewed packed-shift opcode/operand tables were revisited
+  for all three data widths, uniform versus per-element count roles, and the
+  EVEX-only immediate-plus-memory forms.
+
+### Findings and implementation
+
+1. Mixed-width exemptions let invalid packed-shift data/count registers encode
+   as different operands. For example, the old assembler accepts
+   `vpslld %ymm1,%ymm2,%ymm3`, but the resulting bytes disassemble as
+   `vpslld %xmm1,%ymm2,%ymm3`. Uniform counts must be XMM regardless of data
+   width; per-element counts must match the data vector width. The data source
+   and destination must also agree. Validate those roles before forced or
+   automatic EVEX dispatch, not after the encoder has discarded register names.
+2. i686 normally delegates vector-only instructions, but malformed GP data
+   prevents delegation and reaches its local VEX encoder. Apply the same role
+   validator there, rather than relying on delegation or duplicating the rules.
+3. Immediate shifts with memory data require EVEX even for unmasked XMM/YMM
+   destinations. Select EVEX from the validated operand shape while preserving
+   explicit VEX rejection and the shorter VEX form for legal register data.
+4. Legacy PSLLDQ/PSRLDQ used only the destination's register number: `%mm1`
+   silently became `%xmm1`. The shared role validator rejects non-XMM names
+   in both machine modes, without changing any valid MMX packed-element shift.
+5. The compiler's 128-bit scalar-count lowering uses PSHUFD or a qword
+   self-unpack rather than VPBROADCAST. Recognize those exact register splats,
+   retaining GP move count provenance, mask/barrier/alias restrictions, and
+   deleted-write region liveness. A nonzero shuffle selector or distinct
+   unpack input is not a uniform scalar splat and is rejected.
+
+The native integer-model test now uses 128-bit shuffle/unpack splats and
+256-bit broadcasts. Separate structural tests cover legacy unpack spelling,
+wrong shuffle selectors, wrong input banks, and mismatched count provenance.
+The same existing pass-disable control applies; no new tuning knob is added.
+
+### Reproduction
+
+`check_packed_shift_roles.py /path/to/lccc --report /path/to/report.json`
+compares acceptance with the SDM-derived operand-role model and GNU as in both
+32-bit and 64-bit modes, then compares every accepted instruction's raw
+`.text` bytes with GNU as. The matrix includes immediate, uniform-register,
+per-element, memory-count, memory-data, forced-EVEX, forbidden-VEX-memory,
+broadcast, mixed-width, GP-substitution and legacy-byte-shift cases. It uses
+host binutils (2.40 here), independently of the pinned C compiler oracles.
+
+The retained ten-function C corpus drops from **41 to 36 instructions**:
+the three 128-bit dword shifts each fall from 4 to 3; the two 128-bit qword
+shifts each fall from 6 to 5. The five 256-bit functions do not change in this
+tranche. Counts include returns. Sources, per-function counts, and both
+assembly listings are retained here. These are static measurements, not a
+claim of a universal runtime improvement or completed vectorizer audit.
+
+The expanded matrix initially used GNU binutils 2.40: **1,808 decisions**, all
+**390 accepted cases byte-identical**, and **zero remaining discrepancies**.
+The baseline had 372 false acceptances and 44 false rejections. Summary counts
+and example inputs are retained in `packed-shift-oracle-summary.json`; full
+per-input logs remain workspace artifacts. The script accepts `--gas` and
+`--objcopy` to reproduce the same checks with a newer pinned binutils oracle.
+
+Current GNU binutils **2.47.20260726** was restored from the verified source
+payload and built locally. The **complete** existing assembler differential
+corpora pass: **1,434 x86-64 cases** and **688 i686 cases**, with zero failures.
+The expanded 1,808-decision packed-shift matrix also passes against 2.47,
+including all 390 exact accepted instruction byte comparisons.
+
+### Vector-oracle fixture corrections and scope
+
+The broader cross-compiler run exposed two fixture defects, not new instruction
+semantics to imitate:
+
+- `lane2_v16l` and `lane2_v16d` read index 2 from two-lane vectors. They now
+  extract valid index 1, with correspondingly honest function names. All twelve
+  constant-extraction functions use a macro that statically checks the *same*
+  index it extracts. A deliberate index-2 mutation of the two-lane long case
+  fails with `vector lane index out of bounds` in LCCC, GCC 16.2 and Clang 23.1.
+- Twenty-four float/double input generators multiplied random floating bit
+  patterns by zero, then converted the result to int. A random NaN survives
+  multiplication by zero; the conversion is undefined. Construct bounded
+  finite values directly from the integer PRNG instead, preserving its draws.
+
+The reference flags now pin FMA enablement and contraction policy explicitly.
+The normal GCC gate retains all **11 host-supported runtime levels**, codegen
+ceilings and contraction checks, and passes. The gate also accepts repeatable
+`--runtime-level 'flags'` arguments for explicit supplemental comparisons; its
+assembly-quality and contraction checks still always run.
+
+Clang is not an interchangeable oracle for every GCC ABI/policy configuration:
+without AVX, a minimal 32-byte vector identity returns via hidden sret in GCC
+and LCCC, but via XMM0/XMM1 in Clang 23.1. With permissive FP contraction,
+Clang and GCC/LCCC also choose different allowed fusions for shared products
+and loop-carried reductions. Do not treat those ABI/policy differences as
+instruction bugs, and do not change the GNU ABI or weaken its default gate to
+hide them. The additional Clang run passes **eight common-ABI runtime levels**
+with explicit `-ffp-contract=off`, including O0/O1/O2 AVX, O2/Os AVX2,
+O3 AVX2+FMA, O2 AVX2 without FMA, and O2 AVX512F. The gate's separate
+positive-contraction assembly checks remain enabled. The independent native
+integer-shift and original/optimized FP tests are not replaced by this run.
+
+Example supplemental invocation (repeat `--runtime-level` for other levels):
+
+```sh
+GCC=/path/to/clang-23 tests/regression/check_vector_ext_codegen.sh \
+  --runtime-level '-O2 -mavx2 -ffp-contract=off'
+```
+
+The earlier 377-function measurements describe their original pinned corpus,
+not a remeasurement of this corrected fixture. Do not mix aggregate counts
+across those source identities.
+
+The completed production-source snapshot passes **6,201 library tests**
+(10 existing ignored), the linker binary test, strict all-target Clippy,
+and the unchanged audit ratchet. The latest main merge reconciles independent
+knob additions at 533 literals. No ignored-test, panic, unsafe, large-function
+or undocumented-knob budget was increased for this audit tranche.
