@@ -1343,6 +1343,11 @@ impl InstructionEncoder {
         };
         let ops = &instr.operands;
 
+        // Malformed GP data operands do not delegate to the shared vector
+        // encoder. Apply the same role check before the local VEX path can
+        // reinterpret eax..edi as vector register numbers.
+        crate::backend::x86::assembler::encoder::check_packed_shift_shape(mnemonic, ops)?;
+
         match mnemonic {
             // Data movement
             "movl" => self.encode_mov(ops, 4),
