@@ -2465,6 +2465,12 @@ pub trait ArchCodegen {
         text
     }
 
+    /// The shipped (non-exploratory) emission of `func` is complete and is
+    /// the output buffer from byte `mark` on. Interprocedural register
+    /// allocation (x86-64 `ipa_ra`) summarizes it and records the keep set
+    /// the emission relied on; other backends ignore it.
+    fn note_function_emitted(&mut self, _func: &IrFunction, _mark: usize) {}
+
     /// Optimize both dual-layout candidates for the instruction-count metric.
     ///
     /// Every shipped backend (x86-64, i686, AArch64, RISC-V) overrides this to

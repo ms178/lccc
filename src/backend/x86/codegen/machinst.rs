@@ -497,6 +497,10 @@ pub enum MachInst {
         /// oracles then assume all six GP and eight SSE argument registers
         /// are read (fail-closed).
         gp_arg_count: Option<u8>,
+        /// Caller-saved GP families (peephole bits) the caller keeps live
+        /// across this call (`x86::codegen::ipa_ra`), published as
+        /// `# LCCC_IPA_KEEP` after the other markers; 0 publishes nothing.
+        ipa_keep: u16,
     },
 
     /// Return: `ret`.

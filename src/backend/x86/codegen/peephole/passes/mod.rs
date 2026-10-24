@@ -1839,6 +1839,14 @@ fn peephole_optimize_inner(
             if !sk("scaled_index_temp") {
                 changed2 |= relay_and_lea::fold_scaled_index_temp_into_mem(&mut store, &mut infos);
             }
+            // Phase 2's copy propagation retires the other readers of a
+            // copied value (`movq %rax, %r10; addq %r10, %r12` becomes
+            // `addq %rax, %r12`), leaving the mask as the copy's only reader
+            // only now: hot_web_loop's `(h & 255) == 0` reaches `testb %al,
+            // %al` here, never in phase 1.  Idempotent and liveness-checked.
+            if !sk("copy_mask_test") {
+                changed2 |= flag_peepholes::fold_copy_and_mask_into_test(&mut store, &mut infos);
+            }
             changed2 |= local_patterns::fuse_movq_ext_truncation(&mut store, &mut infos);
             changed2 |= local_patterns::eliminate_fp_xmm_roundtrips(&mut store, &mut infos);
             changed2 |= memory_fold::fold_fp_memory_operands(&mut store, &mut infos);

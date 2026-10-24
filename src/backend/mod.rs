@@ -560,30 +560,68 @@ impl Target {
     ) -> String {
         match self {
             Target::X86_64 => {
-                let mut cg = x86::X86Codegen::new_with_ra_config(opts.ra_config.clone());
-                cg.apply_options(opts);
-                cg.state.fpo_requested = opts.omit_frame_pointer;
-                cg.state.function_sections = opts.function_sections;
-                cg.state.data_sections = opts.data_sections;
-                let raw = generation::generate_module_with_debug(
-                    &mut cg,
-                    module,
-                    opts.debug_info,
-                    source_mgr,
-                );
-                // Escape hatch for bisecting a suspected peephole miscompile:
-                // LCCC_NO_PEEPHOLE=1 emits the pre-peephole assembly verbatim.
-                let asm = if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
-                    x86::codegen::peephole::strip_volatile_markers(raw)
-                } else {
-                    x86::codegen::peephole::peephole_optimize_with_config(
-                        raw,
-                        opts.ra_config.as_ref(),
-                        opts.optimize_for_size,
-                    )
-                };
-                let asm = x86::codegen::peephole::lower_tls_call_markers(asm);
-                finish_fn_boundaries(&asm, &cg.state, opts.emit_cfi, cfi_synth::CfiArch::X86_64)
+                // Interprocedural register allocation (`x86::codegen::ipa_ra`)
+                // predicts each callee's clobbers from its pre-peephole text;
+                // the final text is the ground truth. Generate, optimize,
+                // verify; on a violated assumption regenerate with the
+                // offending callees/callers excluded, and after
+                // IPA_RA_MAX_ROUNDS failed rounds with IPA-RA off (which
+                // verifies trivially), so no unverified assumption ships.
+                // Off for runtime-patched code (mcount, patchable entries).
+                const IPA_RA_MAX_ROUNDS: usize = 2;
+                let ipa_wanted = !opts.ra_config.no_ipa_ra
+                    && !opts.disable_regalloc
+                    && opts.mcount.is_none()
+                    && opts.patchable_function_entry.is_none();
+                let mut poisoned_callees = crate::common::fx_hash::FxHashSet::default();
+                let mut poisoned_callers = crate::common::fx_hash::FxHashSet::default();
+                let mut round = 0usize;
+                loop {
+                    let mut cg = x86::X86Codegen::new_with_ra_config(opts.ra_config.clone());
+                    cg.apply_options(opts);
+                    cg.state.fpo_requested = opts.omit_frame_pointer;
+                    cg.state.function_sections = opts.function_sections;
+                    cg.state.data_sections = opts.data_sections;
+                    cg.ipa = x86::codegen::ipa_ra::IpaRaState::new(
+                        ipa_wanted && round < IPA_RA_MAX_ROUNDS,
+                        poisoned_callees.clone(),
+                        poisoned_callers.clone(),
+                        opts.ra_config.debug_ra,
+                    );
+                    let raw = generation::generate_module_with_debug(
+                        &mut cg,
+                        module,
+                        opts.debug_info,
+                        source_mgr,
+                    );
+                    // Escape hatch for bisecting a suspected peephole miscompile:
+                    // LCCC_NO_PEEPHOLE=1 emits the pre-peephole assembly verbatim.
+                    let asm = if std::env::var_os("LCCC_NO_PEEPHOLE").is_some() {
+                        x86::codegen::peephole::strip_volatile_markers(raw)
+                    } else {
+                        x86::codegen::peephole::peephole_optimize_with_config(
+                            raw,
+                            opts.ra_config.as_ref(),
+                            opts.optimize_for_size,
+                        )
+                    };
+                    let asm = x86::codegen::peephole::lower_tls_call_markers(asm);
+                    let violations = x86::codegen::ipa_ra::verify(&asm, &cg.ipa);
+                    if violations.is_empty() {
+                        break finish_fn_boundaries(
+                            &asm,
+                            &cg.state,
+                            opts.emit_cfi,
+                            cfi_synth::CfiArch::X86_64,
+                        );
+                    }
+                    if opts.ra_config.debug_ra {
+                        eprintln!("[IPA-RA] round {round}: {violations:?}");
+                    }
+                    poisoned_callees.extend(violations.callees);
+                    poisoned_callers.extend(violations.callers);
+                    round += 1;
+                }
             }
             Target::I686 => {
                 let mut cg = i686::I686Codegen::new_with_ra_config(opts.ra_config.clone());

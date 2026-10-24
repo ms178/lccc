@@ -5005,8 +5005,14 @@ fn generate_function(
     file_table: &FxHashMap<String, u32>,
 ) {
     cg.set_function_target_features(&func.target_features);
+    let mark = cg.state_ref().out.buf.len();
     generate_function_body(cg, attr_align, func, source_mgr, file_table);
     cg.set_function_target_features(&[]);
+    // Exploratory (dual-layout measurement) emissions are truncated away;
+    // only the shipped emission may define a summary or a keep record.
+    if !crate::backend::state::EXPLORATORY_EMISSION.load(std::sync::atomic::Ordering::Relaxed) {
+        cg.note_function_emitted(func, mark);
+    }
 }
 
 fn generate_function_body(

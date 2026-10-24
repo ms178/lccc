@@ -13,6 +13,7 @@ mod i128_ops;
 mod inline_asm;
 mod intrinsics;
 mod intrinsics_simd;
+pub(crate) mod ipa_ra;
 pub(crate) mod isel;
 pub(crate) mod machinst;
 pub(crate) mod machinst_alloc;
