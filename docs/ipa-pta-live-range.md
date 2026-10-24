@@ -73,13 +73,20 @@ operation or speculate an instruction across control flow.
 
 The objective separately tracks GP and FP/vector pressure, including two-GP
 64-bit values on i686. A ready-list candidate minimizes post-instruction excess
-pressure, then worst-class excess and dependency-aware issue cost, then prefers
-deaths and stable source order. A candidate is committed only if it strictly
-improves excess area or peak without increasing live area or peak in either
-class and without increasing the same DAG latency model evaluated for the
-original order. This guard is deliberately a profitability check, not a claim
-to model every out-of-order core. Below-threshold regions retain source order;
-rejected simulations have no IR effect.
+pressure, then worst-class excess, then prefers deaths and stable source order.
+A candidate is committed only if it strictly improves excess area or peak
+without increasing live area or peak in either class. Below-threshold regions
+retain source order; rejected simulations have no IR effect.
+
+Multi-cycle integer and floating-point arithmetic is also a hard region
+boundary. The first sustained comparison showed a 16.12% regression from a
+pressure-improving multiply DAG, and an experimental in-order latency proxy
+still left a 17.62% regression on a later host sample. Rather than disguise
+that result or treat an idealized issue score as a hardware model, the pass now
+restricts reordering to unit-latency integer DAGs. Both the preserved
+multi-cycle case and an independently scheduled unit-latency case have
+sustained timing workloads; this is a measured eligibility boundary, not a
+claim that all unit-latency schedules are universally profitable.
 
 The budgets are architectural starting points (x86-64 14 GP/16 vector, i686
 6/8, AArch64 28/32, RISC-V 27/32), not claims about a particular host CPU.
@@ -87,8 +94,9 @@ APX's additional GPRs are not assumed by this IR pass: backend eligibility and
 calling-convention reservations must be proven before raising that budget.
 The existing backend's APX-aware allocation remains independent.
 
-`CCC_LR_SHRINK_STATS=1` reports region counts and excess-area/issue-latency
-before/after.
+`CCC_LR_SHRINK_STATS=1` reports eligible-region counts and excess-area
+before/after. Multi-cycle boundaries are intentionally not counted as eligible
+regions.
 
 ## Reference review
 
@@ -131,8 +139,9 @@ no-op cannot produce a green correctness run. Performance executables have
 compiler-specific names and all available compilers are rotated through the
 same interleaved timing loop; the report includes feature/baseline and
 feature/oracle medians, min/max and median absolute deviation without treating
-process-time noise as a universal win. The two performance fixtures execute
-20 million call/load iterations and four million pressure-function iterations,
+process-time noise as a universal win. The three performance fixtures execute
+20 million call/load iterations, four million multi-cycle pressure-function
+iterations, and four million unit-latency pressure-function iterations,
 respectively; CI takes nine rotated samples per compiler so sub-millisecond
 process startup does not dominate the measurement. ICX is explicitly run with
 `-fp-model=strict`.

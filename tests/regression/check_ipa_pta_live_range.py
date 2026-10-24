@@ -232,11 +232,12 @@ static __attribute__((noinline)) uint32_t low_latency(uint32_t x) {
 }
 int main(void) {
     uint32_t sum = 0;
-    for (uint32_t i = 0; i < 1000; ++i) sum += low_latency(i);
+    for (uint32_t i = 0; i < 4000000; ++i) sum += low_latency(i);
     printf("%08x\n", sum);
     return 0;
 }
 ''',
+        performance=True,
     ),
     Case(
         "lrs-memory-and-volatile-boundaries",
