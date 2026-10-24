@@ -1,478 +1,919 @@
-# LCCC engineering backlog
+# LCCC Engineering Backlog — "Maybach" edition
 
-**Live, evidence-qualified open work only.** This roadmap is reconciled against
-`main` at `4ba567022b7d358837aa13be4eb999621871c9f9` (PR #941 merge),
-2026-10-23. The audit reviewed the 100 most recent upstream commits and
-inventoried 60 distinct engineering/docs Markdown paths they touched; statuses
-below are revalidated only where the referenced gate or evidence was rerun,
-not inferred from commit presence. This is not a compiler-quality certificate
-or a record of every historical experiment. The previous 3,302-line queue is
-preserved verbatim at
-[`engineering/archive/ROOT-BACKLOG-2026-10-17.md`](engineering/archive/ROOT-BACKLOG-2026-10-17.md);
-its dated status text must not be read as current without revalidation.
+Rewritten 2026-10-24 against upstream `2070d23f` (`main`). It **supersedes** the
+478-line live queue that preceded it, which is preserved unchanged at
+[`engineering/archive/BACKLOG-2026-10-24-live-queue.md`](engineering/archive/BACKLOG-2026-10-24-live-queue.md);
+the older 3,302-line queue stays at
+[`engineering/archive/ROOT-BACKLOG-2026-10-17.md`](engineering/archive/ROOT-BACKLOG-2026-10-17.md).
+Every open item of the superseded live queue is carried into §10 with its
+acceptance criteria; nothing was dropped, only demoted. Closed entries, session
+narratives and measurement journals live in the archives and in
+[`engineering/journal/`](engineering/journal/README.md).
+Method doctrine: [`engineering/agent/RULES.md`](engineering/agent/RULES.md).
+Do-not-retry grounds: [`engineering/DECISIONS.md`](engineering/DECISIONS.md).
+Per-area knobs: [`engineering/subsystems/`](engineering/subsystems/README.md).
 
-## Sign-test fold red-team closure (2026-10-24)
+**This file holds open work only, written so an implementation agent can start
+without asking questions.** An item with no reproducer or no stated acceptance
+test does not belong here.
 
-The previously listed sign-CMOV follow-up is closed on the current PR branch by
-[`engineering/journal/2026-10-24-sign-test-cmov-redteam.md`](engineering/journal/2026-10-24-sign-test-cmov-redteam.md):
-dedicated skip group, exact-flag producer refinement, directly mirrored
-differential gate, i686 branch twin, orphan-gate mutation tests, refreshed lane
-costs and sanitised evidence. Remaining open work is PMU-level runtime
-confirmation and broader scalar min/max/abs lowering; those are not claimed by
-this peephole receipt. Local ICX 2026.2 provisioning is blocked by the sandbox
-egress allowlist, so the hosted authenticated ICX job is the authoritative ICX
-oracle and is wired to this exact fixture.
+---
 
-## Decision rules
+## 1. The target: what "Maybach" means for lccc / lccc-ld (x86-64 and i686)
 
-- **Correctness and evidence integrity outrank performance.** Every semantic
-  or code-generation change needs a minimal failing witness, a positive control,
-  and a negative control. Compare exit status and output, not stdout alone.
-- **No performance claim from static instruction count or Callgrind Ir alone.**
-  Callgrind events are simulated counts under a model, not PMU cycles. Runtime
-  claims require the canonical output-checked paired runner, immutable compiler
-  and workload identities, matched flags, complete raw rounds, and meaningful
-  durations. Report initial screens and follow-ups separately.
-- **Do not tune by workload name.** Use general legality/profitability rules;
-  retain all regressions and rejected controls. Never remove `-fwrapv`, weaken
-  an alias/volatile/FP barrier, or widen an optimization's scope to recover a
-  benchmark result without a proof and its named correctness oracles.
-- Re-oracle every code-generation change, including the gzip
-  `longest_match` stack-memory veto. Keep rustfmt, strict Clippy and
-  `scripts/ci_local.sh --fast` green before publication. Full/slow CI is a
-  hosted-runner responsibility for this task.
-- Evidence limits are part of each result. A skipped/unavailable oracle is
-  missing evidence, not a pass. A moving Compiler Explorer channel is not a
-  binary pin; record its resolved metadata.
+A Maybach is not the fastest car; it is the one where nothing you touch feels
+unfinished. For a C toolchain that means six properties, in this order:
 
-## Current evidence boundary (2026-10-23)
+| # | Pillar | Operational definition (testable) |
+|---|--------|------------------------------------|
+| 1 | **Trust** | Every accepted option either changes the artifact in the documented way or is refused with a diagnostic. No silent no-ops on semantics-, ABI-, or security-affecting flags. |
+| 2 | **Completeness** | The flag set of a stock distribution build (Arch `makepkg.conf`, Debian `dpkg-buildflags`) compiles, links and *produces the hardening it asks for* (verifiable with `readelf`). |
+| 3 | **Debuggability** | `-g` output is usable in gdb (frames, arguments, locals, types) and in `addr2line`/`perf annotate`; unwinding is correct through every generated function. |
+| 4 | **Craft** | GCC-class diagnostics (precise, low false-positive), reproducible output, standard coverage up to the current default dialect (C23). |
+| 5 | **Speed of the tool** | The compiler's own latency is never the reason a developer or CI job picks GCC. The linker is at least as fast as GNU ld and within 2× of lld/mold on the same inputs. |
+| 6 | **Speed of the output** | Generated code beats GCC/Clang/ICX on the representative corpus; cost models are calibrated on the target microarchitecture. |
 
-- Current upstream identity: `4ba567022b7d358837aa13be4eb999621871c9f9`
-  (PR #941 merge). The prior 2026-10-17 base and hosted receipts remain useful
-  history only; they are not current-main test or performance claims.
-- The last 100 main commits touched 60 distinct Markdown paths under `docs/`
-  and `engineering/`. The highest-impact current findings are recorded in
-  [`docs/FOLLOWUP-2026-10-23-open-pr-audit.md`](docs/FOLLOWUP-2026-10-23-open-pr-audit.md),
-  [`docs/FOLLOWUP-2026-10-23-remaining-codegen-gap.md`](docs/FOLLOWUP-2026-10-23-remaining-codegen-gap.md),
-  [`docs/FOLLOWUP-2026-10-22-ipa-ra-callee-clobbers.md`](docs/FOLLOWUP-2026-10-22-ipa-ra-callee-clobbers.md),
-  [`engineering/journal/2026-10-22-inline-memmove-and-zstd-decode-gap.md`](engineering/journal/2026-10-22-inline-memmove-and-zstd-decode-gap.md),
-  and [`engineering/FINDINGS-2026-10-21-s93.md`](engineering/FINDINGS-2026-10-21-s93.md).
-  These reports invalidate several rows in the older 2026-10-22 codegen TODO
-  table; current-tree rechecks below take precedence over those earlier statuses.
-- Revalidated on the current main compiler before this follow-up: the phi
-  acyclic-order gate passes (`rot()` default 50 instructions / 3 stack refs;
-  GCC 16.2 60 / 6; both policy arms match on 65 trip counts); the LLVM scalar
-  facts gate passes with GCC 16.2 and Clang; the 16-byte atomic runtime
-  checks pass at `-O1`, `-O2`, and `-O3`. The first standalone atomic run
-  lacked GCC 16 on `PATH`, so its oracle-parity leg was skipped there; the
-  final fast-CI rerun below is the oracle receipt. Thus the old TODO-7 and
-  TODO-10 claims are stale on current main. TODO-11's old witness is also superseded:
-  the current scalar-facts gate uses a different mechanism witness and passes;
-  do not revive the old guard diagnosis without a new failing control.
-- The open-PR audit did **not** adopt the 10k-line SIMD stack: the current
-  49-program corpus has no matching 16-byte XMM stack operands, so those PRs
-  remain unvalidated, not accepted. The layout-tie result is tree-specific and
-  already landed; the original #932 benchmark number is not portable across a
-  rebase. Keep the `CCC_LAYOUT_TIE_ORIG=1` rollback and the strict stack rule.
-- The remaining broad codegen/runtime gaps are not closed by those green gates:
-  `hot_web_loop` still has an IPA-RA/callee-clobber hypothesis; Zstandard's
-  recent memmove/byval fixes improved specific workloads, while
-  `ZSTD_decompressSequencesLong_default` (2517 instructions / 871 frame
-  references vs GCC's 1786 / 401) and `ZSTD_safecopy` (211 / 58 vs 152 / 0)
-  remain separate allocator gaps. These are evidence for follow-up, not runtime
-  wins attributed to the present peephole.
-- Local tool provisioning for this task: Rust stable 1.99.1, GCC 16.2.0,
-  Clang 23.1.3, ICX 2026.2.0, Valgrind 3.24, AArch64 and RISC-V cross GCCs,
-  QEMU user, and an active 8 GiB swapfile. `gcc-16 -m32` links. The Debian
-  `gcc-14-multilib` component and i386 development libraries remain installed;
-  Debian's `gcc-multilib` meta-package was removed when the cross compiler
-  packages were installed because of their package conflict. The pinned GAS
-  2.47 x86-64 and AArch64 toolchains are present. The final fast-CI result for
-  the final fast-CI run after refresh/rebase is the publication gate; prior
-  incomplete attempts are not promoted to a pass. The delivery receipt reports
-  its exact result with rustfmt and strict Clippy. Full/slow CI is not run.
-- Compiler Explorer metadata is not silently equated with local pins: its
-  `clang` channel resolved to 23.1.0 in this run. Exact Clang 23.1.3 comparison
-  for the current change is local and recorded in the regression receipt. The
-  offline oracle-tool self-tests remain separate from vendor comparison data.
-  The historical 2026-10-21 authorization to run slow CI was scoped to that
-  prior PR; this follow-up runs `--fast` only, as directed.
+Pillars 1–3 are where lccc is furthest from the bar *today* and where the
+effort/benefit ratio is best: they are mostly plumbing and policy, not research.
+Pillar 6 already has a large, mature queue (see §6); this rewrite does not
+re-litigate it.
 
-## P0 — semantic correctness and capability honesty
+### Evidence legend
+- **R** reproduced on the baseline binary with the quoted command (fastbuild of
+  `2070d23f`, rustc 1.91.1 + `-Zcrate-attr=feature(if_let_guard)` shim, 1 vCPU
+  sandbox, GCC 13.3 / GNU ld 2.42 / mold / lld as comparison tools).
+- **S** read from source; runtime consequence not demonstrated.
+- **H** hypothesis; step 1 is the experiment.
+- The i7-14700KF has **not** been measured by anything in this file. Absolute
+  compile times below come from an `opt-level = 1` build of the compiler and are
+  only used for *ratios and instruction-share profiles* (Callgrind), never as
+  speed claims.
 
-### P0.1 — Revalidate and complete `ext_vector_type` layout semantics
+### Item format
+`ID · class · evidence` — **Why** (impact), **Where** (files), **Plan**
+(ordered, each step independently landable), **Gates** (tests to add; every new
+gate must be mutation-verified: revert the fix, watch it fail), **Accept**
+(measurable), **Risks**, **Effort/ROI**. Effort: S ≤ 1 day, M ≤ 1 week, L > 1 week
+of agent time. ROI = impact × confidence ÷ effort, 1–5 scale in the table below.
 
-**Evidence/source:** archived A14-13 follow-up in
-[`BACKLOG-2026-10-16.md`](engineering/archive/ROOT-BACKLOG-2026-10-17.md),
-section A14-13; `tests/regression/check_ext_vector_size.sh`.
-The prior audit reported two unresolved semantic mismatches: `_Bool`
-`ext_vector_type(4)` storage size and padded three-lane `unsigned long` vectors
-on i686, plus agreement between parser-time static assertions and runtime
-`sizeof`. The typedef/type-name width repair is not proof of logical lane-count,
-layout, ABI or execution semantics.
+### Standing constraints for every item
+Build with the `fastbuild` profile, `-j2`, never concurrently with another heavy
+job; run `scripts/ci_local.sh --fast` before declaring done; any change touching
+code generation must also pass the identity/encoding gates named in
+[`engineering/agent/RULES.md`](engineering/agent/RULES.md). Do not remove a
+reproducer to close an item. The decision rules of the previous live queue still
+bind every item here: correctness and evidence integrity outrank performance;
+no runtime-speed claim from static instruction counts or Callgrind `Ir` alone
+(they are simulated counts — in this file `Ir` is used **only** as a
+deterministic proxy for the compiler's *own* cost, MB-20/MB-21, and every such
+result must also be confirmed with paired wall time); never tune by workload
+name; never weaken `-fwrapv`, alias, volatile or FP barriers to recover a
+benchmark; a skipped oracle is missing evidence, not a pass.
 
-**Next:** reproduce each case on the current tree against current Clang and
-GCC where applicable; inspect declaration and type-name paths separately.
-Represent logical lane count and storage size explicitly if the mismatch
-persists. Add runtime, `_Static_assert`, operation, and ABI controls for m32/m64.
+---
 
-**Accept:** same observed `sizeof`, alignment, lane count, and observable
-operations as the supported compiler contract for every accepted case; invalid
-forms diagnose; the full regression/differential battery passes. Do not round
-byte counts or alter `vector_size` semantics as a substitute for a representation
-model.
+## 2. Baseline snapshot (R, 2026-10-24, `2070d23f`)
 
-**Progress 2026-10-21 (layout matrix receipts):** both historical layout
-mismatches are re-measured and closed on the current tree, and the i686 half
-now has a receipt that does not depend on multilib glibc headers.
-`_Bool ext_vector_type(4)` is 1/1 (`sizeof`/`_Alignof`) and the padded
-three-lane `unsigned long` vector is 32/32 on LP64 and 16/16 on i686 -- the
-same numbers Clang 23.1.3 produces, which is the contract compiler for this
-extension. The evidence is a new gate
-(`tests/regression/check_ext_vector_layout_matrix.sh`) over a freestanding
-fixture (`tests/regression/ext_vector_layout/layout_matrix.c`): 12 element
-types x 10 lane counts (1-8, 11, 16) printed as `sizeof`/`_Alignof` and
-compared byte-for-byte with Clang 23.1.3 for `-m64` and `-m32` at `-O0` and
-`-O2`, plus a hash over lane stores and lane loads of the 72 odd/prime-lane
-shapes, plus 240 compile-time layout laws (`_Static_assert`). Two controls
-keep it from passing vacuously: a perturbed size row must break the
-comparison, and a `_Static_assert` naming the LP64 answer for three `unsigned
-long` lanes must be accepted by `-m64` and rejected by `-m32` (a target that
-answered with the host's width model would accept it). The fixture includes
-no header, so the i686 leg runs wherever a 32-bit crt links; the older gates
-in this area (`check_ext_vector_layout.sh`, `check_ext_vector_abi_grid.sh`)
-still need the target's glibc development headers and therefore skip i686 in
-a minimal sandbox -- that limitation, not a compiler defect, is why the i686
-receipts were hosted-runner-only. Observed on this tree: 4 oracle legs +
-2 optimisation-invariance legs + 2 controls pass; the ext-vector size gate
-also passes on both targets.
+Static census (`python3 scripts/audit_census.py`, as of `e8ae10a`; re-run for
+the current numbers): ~530 source files; 888 panic-class sites (109 in
+user-input-reachable code); 193/75/23 functions over 300/500/1000 lines.
 
-**Progress 2026-10-17 (PR #852 update):** sema now evaluates `_Static_assert`
-conditions with the full type context, which exposed an internally
-inconsistent `bool33` assertion in `ext_vector_layout.c` (sizeof 5 beside
-alignof 8 is not a representable C layout); the fixture now asserts the
-single coherent power-of-two rule its own `bool17` case follows (8/8).
-Parser/sema/lowering enum layout follows the GCC compatible-type rule
-(widening, packed minimum, struct inheritance) and is byte-identical to the
-system GCC oracle; one-lane FP vectors ride `%xmm0` with integer one-lanes
-in GPRs (AUD-VABI-4), covered by `check_enum_layout_semantics.sh` and
-`check_ext_vector_one_lane_fp.sh`. Remaining: cross-compiler receipts for
-the bit-packed bool rule need a Clang/ICX oracle (unavailable in this
-sandbox; hosted CI lanes are the vehicle).
+**What the previous revision of this file reported and upstream has since fixed**
+(re-measured on `2070d23f`; keep as regression rows): unknown or unimplemented
+`-f`/`-m`/`-W` options now follow a measured, tiered policy documented at the top
+of `src/driver/cli.rs` (hard error for contract flags — `-fstack-protector*`,
+`-ftrapv`, `-fsanitize=`, and in practice `-fstack-clash-protection`,
+`-fvisibility=`, `-flto`, `-fopenmp`; tolerated **with a warning** otherwise;
+`LCCC_STRICT_OPTIONS=1` makes everything strict); `__builtin_cpu_supports` is now
+a real runtime CPUID/XGETBV test with a cached result (`__lccc_cpu_ready`,
+`__lccc_cpu_w7ebx`), no longer a Raptor Lake constant; C23 `constexpr`,
+`nullptr`, keyword `bool`, digit separators, fixed-type enums and `typeof` under
+`-std=c23` are accepted (40-snippet census: 39/40).
 
-### P0.2 — Close unsupported-option acceptance; revalidate wrapped byte-address semantics
+Dynamic probes on the current build (commands are runnable verbatim; `lccc` =
+the built driver):
 
-**Evidence/source:** archived A14-16 and the accepted-`-fwrapv` byte-address
-witness. PR #844 adds `LCCC_STRICT_OPTIONS` plus tests for strict unknown-option
-handling, and the current fast gate includes `check_pr824_boundaries.py`, which
-executes `wrapv_byte_address.c` across optimization modes and supported targets.
-The #844 hosted checks are green. This closes the historical unknown-option
-acceptance defect and gives a permanent executable wrap-domain oracle, but the
-local compiler run is still unavailable in this session; do not claim a fresh
-local replay.
+| Probe | Result | GCC reference |
+|---|---|---|
+| `-fstack-clash-protection`, `-fvisibility=hidden`, `-fsanitize=undefined`, `-flto`, `-fopenmp`, `-ftrapv`, `-fstack-protector` | hard error with a clear message (honest, but **not implemented**) | implemented |
+| `-fno-plt` | accepted **silently**: no warning, no effect (inconsistent with the tolerated-with-warning tier) | indirect call via GOT |
+| `-static-pie`, `-Wformat`, `-Werror=format-security` | accepted with a "tolerated but not implemented" warning | implemented |
+| `__attribute__((target_clones("avx2","default")))` | accepted, no IFUNC symbol, no variants | IFUNC + resolver |
+| `__attribute__((target("avx2")))` loop, `-O2` | **no `ymm`** (17 `xmm` refs); with `-mavx2` 13 `ymm` — the `e8ae10a` build emitted `ymm` for the same file: regression candidate, bisect first | GCC 13 `-O2` also emits no `ymm` (no vectoriser at `-O2`) |
+| `-g -O0 -c` | **0** `.debug_*` sections | line + info |
+| gdb on a linked `-g` binary | `bt` works; "No symbol table info available" for args/locals | full |
+| `-Wall -Wextra` | still missing `-Wformat`, `-Wsign-compare`, `-Wunused-variable` | present |
+| `_Float16` | rejected | accepted |
+| default executable type | `ET_EXEC` (no ASLR), no build-id | `ET_DYN` (PIE), build-id |
+| `-static-pie` (x86-64 and `-m32`) | warning, then silently `ET_EXEC` | `ET_DYN` static-pie |
+| `-Wl,-z,pack-relative-relocs`, `--pack-dyn-relocs=relr`, `--image-base=0x10000000`, `-z max-page-size=65536`, `--oformat=binary` | accepted **silently**, no effect (no `DT_RELR`; entry stays `0x401450`; `LOAD` align stays `0x1000`; still ELF) | honoured (bfd) |
+| `-m32` link | clear errors: `-pie`, `-Map`, `--version-script`, `--emit-relocs`, `--exclude-libs`, `--build-id=uuid`, `-r` | all work |
+| 14 `-m32` run-and-compare programs (`-O0`, `-O2`) | all identical to `gcc -m32` (measured on `e8ae10a`; re-run as the first step of MB-32) | — |
+| 800 objects (6.3 MB) link, 1 vCPU (`e8ae10a`) | lccc 0.08–0.09 s; bfd 0.15; mold 0.14; lld 0.045–0.09; outputs run, sizes within 1 % | — |
+| Callgrind, 40-function TU, `-O1` (`2070d23f`) | 961 M instructions (was 1,232 M); **68 %** in `peephole_optimize_inner`; **32.5 % in `LabelRefs::build` called from `label_is_fallthrough_only` inside `combined_local_pass`**; `FileLiveness::new` fell from 41 % to 4.8 % and `fold_copy_into_lea_base` from 20 % to 2.3 % (upstream's liveness cache); `str::starts_with` ≈ 10 % | — |
+| 300-function TU, `-O1`, `CCC_TIME_PEEPHOLE=1` | peephole 2.08 s of 2.81 s total (74 %); GCC `-O1` 0.77 s (ratio only: fastbuild compiler) | — |
+| `-O0` vs `-O1`/`-O2` compile latency (`e8ae10a`, 80 TUs, twice) | `-O0` slower: 7.4 s vs 5.8–6.5 s; `.text` 4049 vs 2705 B — **re-measure** before acting (MB-21) | — |
 
-**Remaining:** inspect classification of `-flto` and sanitizers; once Rust/Cargo
-are available, run the exact `-O1`/`-O2` witnesses and the boundary gate locally.
+What is **good** and must not regress: i686 code generation and ABI behaviour
+on the 14-program differential set; link speed; object determinism across build
+directories (R: identical objects from two directories with `-g`); the
+diagnostic format (`file:line:col`, caret); `-Werror=` plumbing;
+`--version-script`, `-Map`, `--wrap`, `--defsym`, `-rpath`, `--hash-style`,
+`--dependency-file` in `lccc-ld`; `-ffile-prefix-map`.
 
-**Accept:** unsupported capability requests diagnose unless explicitly
-classified as benign compatibility no-ops; `-fwrapv` preserves the modular
-result across optimization levels and targets. Keep wrapping and non-wrapping
-controls and avoid blanket rejection of build-system `-f*` probes.
+## 3. Roadmap and ranking
 
-### P0.3 — AArch64 shared-symbol visibility repair landed; maintain regression evidence
+ROI = (impact × confidence) ÷ effort, each 1–5; higher is better.
 
-PR #844 replaces the former narrow ADR repair with a shared visibility merge
-across all object references and definitions after dynamic resolution. The
-shared emitter uses that merged visibility consistently for export filtering,
-`dynsym` visibility and ADR admission. Hidden/internal definitions are excluded;
-protected symbols remain exported with their binding semantics. Existing
-AArch64 address-contract tests cover hidden shared output. Static source review
-and green hosted assembler/linker checks support closing the historical
-implementation defect; this session did not execute the local cross-target
-matrix or independent-linker comparison. Keep those as regression-evidence
-limitations, not as a claim that the specific old defect remains open.
+| Rank | ID | Title | Pillar | Effort | ROI |
+|---:|---|---|---|---|---:|
+| 1 | MB-01 | Finish the option contract: silent `-fno-plt`, OPTIONS.md, probe rows | 1 | S | 4.6 |
+| 2 | MB-02 | Linker option contract + the five dead flags | 1 | M | 4.5 |
+| 3 | MB-20 | Peephole compile time: hoist `LabelRefs`, decode once | 5 | S–M | 4.8 |
+| 4 | MB-04 | PIE by default, real `-static-pie`, default build-id | 2 | M | 4.2 |
+| 5 | MB-05 | `-fstack-clash-protection` (x86-64 + i686) | 2 | S–M | 4.0 |
+| 6 | MB-03 | ~~`__builtin_cpu_supports`~~ fixed upstream; keep regression gate only | 1 | S | — |
+| 7 | MB-10 | DWARF: line tables in the native assemblers, then DIEs | 3 | L | 3.8 |
+| 8 | MB-13 | i686 linker parity (reuse `linker_common`) | 2 | M | 3.6 |
+| 9 | MB-06 | Stack protector canaries (incl. kernel guard options) | 2 | M | 3.5 |
+| 10 | MB-12 | Warnings: `-Wformat*`, unused, sign-compare | 4 | M–L | 3.4 |
+| 11 | MB-11 | C23 tail: `_Float16`, default `-std`, `target("avx2")` regression | 4 | S–M | 3.3 |
+| 12 | MB-07 | `-fvisibility`, `-fno-plt`, `-ftrapv`, trap-mode UBSan | 2 | M | 3.2 |
+| 13 | MB-14 | x86-64 linker: DT_RELR, page-size, image-base | 2 | M | 3.2 |
+| 14 | MB-16 | `target_clones` / IFUNC multiversioning | 6 | M | 3.0 |
+| 15 | MB-32 | i686 differential gate (expand the 14 programs) | 3 | S | 3.0 |
+| 16 | MB-15 | Whole-program mode (`-fwhole-program` / honest `-flto`) | 6 | L | 3.0 |
+| 17 | MB-21 | `-O0` slower than `-O1` | 5 | S | 2.8 |
+| 18 | MB-33 | Linker differential oracle (bfd/lld/mold/lccc-ld) | 1 | M | 2.8 |
+| 19 | MB-30 | Raptor Lake cost-model calibration from published tables | 6 | L | 2.5 |
+| 20 | MB-41 | Backlog format gate + archive discipline | — | S | 2.5 |
 
-### P0.4 — Revalidate RISC-V relocation error and preservation contracts
+Suggested start for a single agent with one session: MB-20 (hoist `LabelRefs`:
+a one-function change worth ~30 % of compile instructions) → MB-01 → MB-05; for two agents in parallel: [MB-01, MB-04, MB-13] on the driver/linker
+side and [MB-20, MB-21, MB-05] on the backend side (disjoint files).
 
-**Evidence/source:** archived A14-15/A14-17. Unknown-relocation and AUIPC fixes
-are recorded as landed, with bounded tests, but the old wide audit also called
-out expression-classification, extent/index, ET_EXEC/ET_DYN, and relocation
-preservation coverage. Do not treat the original zero-emission reproducer as a
-current defect without replaying it.
+---
 
-**Next:** replay the archived malformed-expression and mutated-relocation
-fixtures on current main; enumerate applied, dynamically retained, relaxed,
-and rejected relocation classes across executable and shared outputs.
+## 4. Tier M0 — Trust: promises must match artifacts
 
-**Accept:** no unsupported expression silently becomes zero or loses a symbol;
-malformed relocation metadata is rejected in both output modes; valid supported
-relocations and addends are preserved/applied exactly. Keep valid symbolic
-subtraction as a positive control. Add no blanket rejection for documented GAS
-expression semantics.
+### MB-01 · P0 · R — finish the option contract (the policy exists; its edges do not)
 
-## Integration audit — PR #844 atop PR #846
+**Why.** Upstream landed a measured, tiered policy (header of `src/driver/cli.rs`):
+contract flags are hard errors, everything else unimplemented is tolerated with a
+warning, `LCCC_STRICT_OPTIONS=1` makes it strict, and `scripts/lccc_capability_probe.py`
+establishes capabilities by running the compiler. **Do not reopen the "unknown flag
+must fail" question** — the policy's argument (16 of 93 flags that kernel, glibc,
+zlib-ng, gzip and expat pass unconditionally had no arm) is recorded and measured.
+The remaining defects are at the edges of that policy:
 
-- The direct source overlap is limited to pass scheduling/configuration and
-  regression gates; #844 does not replace the generator-map transform or its
-  legality predicates. In the composed pipeline, `late_vectorize_entry` keeps
-  the established AArch64 two-wide entry, while generator-map is invoked only
-  from the main x86 vectorization mode, is disabled in late-minmax-only mode,
-  and retains its dedicated kill switch/trace. Loop rotation remains explicitly
-  opt-in. Static review found no contradictory pass ownership or evidence that
-  the default pipeline silently broadens these changes. This is not a substitute
-  for compiler execution.
-- One actual harness-contract defect was found: generator trace validation
-  compared only the set of kernel names, allowing duplicate events when all
-  expected positives were present. It now requires exactly one trace event per
-  positive fixture (and none when disabled), with a compiler-free mutation test
-  for the fully-present-plus-duplicate case. Its focused 7-test suite passes.
-- The `-fwrapv` byte-address case is not discarded as stale: it remains inside
-  the permanent PR824 boundary gate. PR #844's codegen/runtime and integration
-  checks are green, but the individual hosted substep was not separately
-  inspected in this audit; local replay remains blocked by missing Rust/Cargo. A14-35 is no longer treated as an open defect:
-  the merged visibility decision is shared by AArch64 export, dynamic-symbol
-  visibility, and ADR resolution. Existing audit obligations for ext-vector
-  layout and RISC-V relocation edges remain distinct and open until executed.
+1. `-fno-plt` is accepted with **no warning and no effect** (R), unlike its
+   neighbours in the tolerated tier.
+2. The linker-side equivalent is wider: `-Wl,` options such as
+   `-z pack-relative-relocs`, `--image-base`, `-z max-page-size`, `--oformat=binary`
+   are swallowed silently (MB-02).
+3. Nothing tells a user *which* options are implemented; the answer exists only
+   inside the capability probe's manifest.
+4. The "tolerated" tier mixes presentation namespaces (`-fdiagnostics-*`) with
+   options that change the artifact (`-fno-plt`, `-fvisibility-*` family,
+   `-ftls-model`, `-fzero-call-used-regs`, `-ftrivial-auto-var-init`); only the
+   first kind is harmless to ignore.
 
-## P1 — measured performance work, correctness-preserving only
+**Where.** `src/driver/cli.rs` (tier arms), `scripts/lccc_capability_probe.py`,
+[`engineering/SCRIPT-MEASUREMENT-MAP.md`](engineering/SCRIPT-MEASUREMENT-MAP.md).
 
-### P1.1 — Fannkuch runtime regression: explain before changing code
+**Reproducer.**
+```bash
+echo 'int f(int x){return x+1;}' > x.c
+lccc -fno-plt -c x.c -o x.o; echo $?          # 0, nothing printed (siblings print a warning)
+lccc -fPIC -fno-plt -S x.c -o - | grep -c GOTPCREL
+```
 
-**Evidence:** S101/S102's approximately **25% slower than main** result and
-full-default Callgrind Ir totals (17,131,993,449 vs 16,054,326,746) are
-historical, not a current Fannkuch receipt; Ir is not cycles. The latest
-49-program paired report records corpus geomean `lccc/GCC16.2` 0.7897 on the
-synthesized main, but does not establish Fannkuch's current per-program ratio.
-Remeasure the exact program before carrying forward the old slowdown. A
-`-fno-wrapv` ablation is diagnostic only and is explicitly not permission to
-remove `-fwrapv`.
+**Plan.**
+1. Give `-fno-plt` (and every other artifact-changing option found in step 2) the
+   same tolerated-with-warning treatment, or implement it (MB-07b).
+2. Enumerate the tolerated tier mechanically: `gcc -Q --help=common,target` option
+   names × the capability probe; classify each as `presentation | artifact-changing`.
+   Artifact-changing options must warn at least once per invocation and be listed in
+   the document of step 3.
+3. Generate an options document (to be created, e.g. docs/OPTIONS.md) from the
+   probe manifest + the tier table: option, class, since-version, note. Add a gate
+   that fails when the document is stale.
+4. Add the probe's rows from §2 (flag → observable effect) to the capability probe
+   as `effect:` capabilities, so "accepted" and "has the documented effect" are
+   separate columns.
 
-**Next:** freeze the exact current source, flags, executable and input; attribute
-hot-loop instruction/value-flow changes using Godbolt assembly, the existing
-IVSR/stack census tools, and matched Callgrind. Test any proposed dominating,
-width-aware range/no-wrap certificate against executed backedges, zero-trip
-loops, negative/variable steps, `INT_MIN`/`INT_MAX`, narrow consumers and all
-pointer widths. Keep unsupported cases on the original arithmetic path.
+**Gates.** The probe runs in strict mode in `ci_local.sh --fast`'s existing probe
+slot; new rows must be mutation-verified (turn the option into a silent no-op and
+watch the `effect:` row fail). **Accept.** No artifact-changing option is accepted
+silently; the options document is generated and current. **Effort** S · **ROI** 4.6.
 
-**Accept:** semantics on x86-64, i686, AArch64 and RISC-V; verifier/dominance
-and wrap-domain controls; no increase in gzip `longest_match` stack memory;
-output-checked native A/B with complete paired rounds and useful duration. A
-reduction in Ir or assembly size alone does not close the runtime regression.
+### MB-02 · P0 · R — linker option contract and the dead flags
 
-### P1.2 — Zstandard code quality and application-level runtime: no victory claim
+**Why.** `lccc-ld` and `-Wl,…` accepted 92/93 probed options without a word on
+`e8ae10a`; on `2070d23f` the five dead ones (`-z pack-relative-relocs`,
+`--pack-dyn-relocs=relr`, `--image-base`, `-z max-page-size`, `--oformat=binary`)
+are still silent no-ops (R, §2). The compiler driver now warns for tolerated options; the linker side has no equivalent. `src/bin/lccc_ld.rs::is_benign_ignorable`
+silently swallows `--fatal-warnings`, `--no-relax`, `--warn-common`,
+`--eh-frame-hdr`… and `warn_unimplemented` warns only for flags that reach the
+fallthrough. Two of the dead flags matter for real distributions: Arch's default
+LDFLAGS include `-Wl,-z,pack-relative-relocs` (no `DT_RELR` emitted today) and
+`-Wl,-O1 --sort-common`.
 
-**Evidence:** S101/S105/S106 show no reliable application-level zstd speedup.
-The broad GCC deficit remains; an apparent random/long-input gain reversed
-across controls. The header-inline-assembly BZHI candidate was rejected after
-its pilot (compression GM 1.017476, with an entirely slower JSON level-3
-interval and increased instruction/cache counts). The portable implementation
-is the baseline.
+**Where.** `src/bin/lccc_ld.rs` (`is_benign_ignorable`, `warn_unimplemented`),
+`src/backend/linker_common/args.rs`, `parse_linker_args` users in the driver.
 
-**Progress 2026-10-21 (causal stack census; no runtime claim):** the
-question "why is lccc slower than GCC 16.2 on this library" was narrowed with
-the repository's own causal tools rather than with another knob sweep.
-`scripts/stack_census.py` over the three hottest compression/decompression
-translation units (`zstd_fast.c`, `zstd_lazy.c`,
-`zstd_decompress_block.c`, `-O2 -march=x86-64-v3`) attributes **60.8 % of all
-stack references to register spills** (13,578 of 22,331; coverage 99.89 %),
-against **7.0 % structurally required memory** (`alloca`/`address`/`wide`/
-`nongpr`). The busiest slots are not short-lived temporaries: in
-`ZSTD_compressBlock_lazy_generic`, offset `-64` is written **once** and read
-**204** times, and offset `-584` is written once and read 194 times -- a
-long-range value the global allocator spilled at its definition and reloads
-per region, where GCC keeps it in a callee-saved register. A per-translation-
-unit ablation (each hot unit rebuilt with GCC 16.2 inside an otherwise lccc
-library, interleaved min-of-N process-CPU runs on one pinned core) shows the
-deficit is **spread across units, not concentrated in one defect**:
-substituting `zstd_fast.c` recovers 5.1 % at level 1, substituting
-`zstd_double_fast.c` recovers 5.6 % at level 3, and substituting `zstd_lazy.c`
-recovers nothing measurable -- while the whole-library gap is much larger than
-any single unit. Two negative results are recorded so they are not retried:
-the global location allocator is a **no-op** on this library (its archive is
-byte-identical with `CCC_RA_GLOBAL_LOCATION=0`), and its per-function edit
-budget is not the limiter (`CCC_RA_GLOBAL_LOCATION_MAX=1024` produces a
-byte-identical archive too). Therefore no runtime claim is made here and no
-knob is shipped: the remaining gap is the base colourer's global decision to
-spill long-range hot values, which needs a residency/live-range-splitting
-change with its own A/B and corpus review, not a threshold tweak.
+**Reproducer.**
+```bash
+cat > a.c <<'E'
+#include <stdio.h>
+int main(void){puts("hi");return 0;}
+E
+lccc -Wl,-z,pack-relative-relocs a.c -o a  && readelf -d a | grep -c RELR   # 0 (bfd: 3)
+lccc -Wl,--image-base=0x10000000 a.c -o b  && readelf -h b | grep Entry      # unchanged
+lccc -Wl,-z,max-page-size=65536 a.c -o c   && readelf -lW c | grep LOAD | head -1   # Align 0x1000
+lccc -Wl,--oformat=binary a.c -o d && file d                                  # still ELF
+```
 
-**Progress 2026-10-23 (current gap attribution):** the latest 49-program
-paired report shows `zstd_count` at +21.2% Callgrind Ir vs GCC 16.2, with
-`mov*` accounting for 76% of the Ir delta. This is static instruction-count
-attribution, not an application runtime result. The broader move census points
-toward allocator-side zero-extension copies, symbol-plus-register address
-composition, a loop-carried spill, and fixed-register shift chains; the report
-explicitly rejects another peephole-only campaign. The exact current remaining
-workloads are recorded above (`ZSTD_decompressSequencesLong_default` and
-`ZSTD_safecopy`), and no global win or regression is inferred from the single
-kernel.
+**Plan.**
+1. Same discipline as MB-01 for the linker: one table, classes
+   `Implemented | BenignNoop(justification) | Refused | WarnUnimplemented`.
+2. Harvest the option universe mechanically: `ld.bfd --help`, `ld.lld --help`,
+   `mold --help` (all installable in the sandbox) → union list checked into a
+   data file; the gate fails on any option that is in the union but absent from
+   the table (no un-triaged options).
+3. Classify the 93 probed flags: implement MB-14 items; `--fatal-warnings`
+   must **make warnings fatal** (it currently does nothing) — this matters for
+   `-Wl,--fatal-warnings` in kernel and CI builds; `--oformat=binary` and
+   `-N/-n/--omagic/--nmagic` either implemented or refused; `--print-memory-usage`
+   and `--trace/-t` implemented (trivial, from the layout tables) or refused.
+4. Make every `WarnUnimplemented` print once per option with the standard
+   prefix, and exit non-zero under `--fatal-warnings`.
 
-**Next:** only continue with a causal, source-independent hypothesis. Profile
-bounded Callgrind regions and inspect exact hot instructions/register-stack
-traffic before considering general narrow-load forwarding, address recurrences,
-or explicit parameter-save provenance. Rebuild the patched source from a frozen
-identity and verify assembly and output before timing. Preserve RLE and
-random/long20 as separate workloads; do not pool them to hide opposite outcomes.
+**Gates.** Option-surface test (to be created, e.g.
+scripts/ld_option_surface.py (to be created)): for each option with an `Implemented` class, run
+a mini-link and assert the effect via `readelf` (examples in the reproducer);
+for `Refused`, assert rc≠0 and message.
+**Accept.** 0 silent no-ops among options present in bfd/lld/mold; the four
+reproducer lines show their effect or an error. **Effort** M · **ROI** 4.5.
 
-**Accept:** semantic/memcheck controls, unchanged valid workload and flags,
-matched compiler/ELF identities, independent paired runtime confirmation whose
-interval supports the claimed direction, and full corpus regression review.
-Otherwise retain as investigation only. Do not reintroduce BZHI inline asm,
-relax alias/liveness checks, or claim GCC superiority from Ir.
+### MB-03 · closed upstream — keep a regression gate for `__builtin_cpu_supports`
 
-### P1.3 — Validate performance on actual target hardware
+The previous revision of this file reported a Raptor Lake constant fold. On
+`2070d23f` the builtin lowers to a real runtime test (CPUID leaves 1, 7, 0xd +
+XGETBV, cached in `__lccc_cpu_ready`/`__lccc_cpu_w7ebx`). Residual work, all small:
+(a) a gate asserting that `-march=x86-64` **and** `-mno-avx2` builds contain the
+runtime path while `-march=raptorlake` may fold (`readelf`/asm shape), (b) check
+`OSXSAVE`/XCR0 gating for the AVX/AVX-512 bits explicitly, (c) AArch64/RISC-V:
+`__builtin_cpu_supports("avx2")` must be a diagnostic, not a value (re-run
+`lccc-arm`, which earlier folded `avx2 + 10*bmi2` to `11`). **Effort** S.
 
-The supplied Xeon VM is screening evidence, not the requested Raptor Lake
-14700KF PMU environment or EPYC7763 host. No native target-hardware/PMU claim is
-closed by VM percentages or Callgrind.
+### MB-04 · P0 · R — PIE by default, a real `-static-pie`, default build-id
 
-**Next:** acquire same-window, same-baseline, output-checked runs on the named
-physical host; record CPU/microcode, affinity, frequency policy, compiler and
-workload hashes, raw pairs and PMU availability. If hardware is unavailable,
-keep the item explicitly blocked and report VM evidence as screening only.
+**Why.** `lccc a.c -o a` yields `ET_EXEC` (R) where every mainstream GCC
+configuration yields `ET_DYN`: no ASLR for any binary built by lccc. `-static-pie`
+now warns "tolerated but not implemented" and still produces a non-PIE executable
+on x86-64 **and** i686 (R): that tier is wrong for a hardening flag — it belongs in
+the contract tier (hard error) until implemented. No `.note.gnu.build-id` by default (GCC distributions pass `--build-id`);
+without it, debuginfod, `perf`, coredumps and `eu-unstrip` cannot match binaries.
+`-pie` itself works on x86-64 (`ET_DYN`); i686 refuses it (see MB-13).
 
-**Accept:** reproducible paired runtime and available hardware counters for a
-bounded, named claim; preserve unavailable counters and every failed/unsupported
-case. No universal “best compiler” conclusion.
+**Where.** `src/driver/cli.rs` (the `-pie`/`-no-pie`/`-static`/`-static-pie`
+arms and `parse_linker_args` handoff), `src/driver/external_tools.rs`
+(start-file selection), `src/backend/x86/linker/emit_exec.rs` (PIE emission),
+`src/backend/linker_common/build_id.rs`.
 
-## P1 — baseline freshness and integration
+**Plan.**
+1. Policy switch `default_pie` (compile-time constant, overridable by env
+   `LCCC_DEFAULT_PIE=0/1` for bootstrap scripts): when linking an executable and
+   none of `-no-pie`, `-static`, `-shared`, `-r`, `-nostdlib`+`-T` is given, add
+   `-pie` and use `Scrt1.o` instead of `crt1.o`.
+2. `-static-pie`: start files `rcrt1.o`, flags `-static -pie --no-dynamic-linker
+   -z text`; the linker must emit `R_X86_64_RELATIVE` (and, with MB-14,
+   `DT_RELR`) for every absolute pointer in data, apply `IRELATIVE` entries in
+   `.rela.iplt` through `__rela_iplt_start/end` as glibc's `_dl_relocate_static_pie`
+   expects, and define `_DYNAMIC`/`_GLOBAL_OFFSET_TABLE_`. If this is not done in
+   the first change, `-static-pie` must be **Refused** (MB-01 class), never
+   silently non-PIE.
+3. Default `--build-id=sha1` when the driver links (the linker already
+   implements `sha1`/`tree`; add `uuid`/hex-string forms for parity, shared code
+   with i686).
+4. Make the object code PIE-clean: audit that `-fPIE` codegen of lccc never
+   emits absolute 32-bit relocations in `.text` (`R_X86_64_32S`) — GCC's PIE
+   mode guarantees this; verify with `readelf -r` over the benchmark corpus
+   linked with `-pie -Wl,-z,text`.
 
-### P1.4 — Fresh current-tree comparison and required local gates
+**Gates.** `check_default_pie` (to be created): `readelf -h` type DYN, `PT_INTERP`
+present, `FLAGS_1 PIE`; static-pie: `file` says "static-pie linked", runs, and
+`setarch -R` vs default produce different `&main` printed addresses; build-id
+note present and stable across two builds in different directories.
+**Accept.** Corpus (zlib-ng, gzip, expat, sqlite harness) builds, runs and
+passes with default PIE; kernel builds keep using `-no-pie`/`-T`.
+**Risks.** Code with absolute addresses in asm; start-file availability
+(`Scrt1.o`/`rcrt1.o` on the host). **Effort** M · **ROI** 4.2.
 
-PR #844 CI is valuable integration evidence, but it does not establish all
-candidate-specific semantic/performance obligations, and the named candidate
-audit job was skipped. Once toolchain prerequisites are present, freeze current
-`main` and candidate independently, recompile the relevant benchmark corpus,
-confirm output identities, rerun worst regressions, and keep the receipts
-separate from older S101–S106 evidence.
+### MB-05 · P1 · R — `-fstack-clash-protection` (x86-64 and i686)
 
-**Required before publication:** `scripts/ci_local.sh --fast`, rustfmt, strict
-Clippy; for code-generation edits, the `engineering/agent/RULES.md` test and
-oracle requirements. Full/slow CI is not authorized locally; rely on hosted CI.
-Never publish or open a PR as locally validated unless these gates actually pass.
+**Why.** Now a hard error ("Stack probing is not implemented", R) — honest, but
+Arch's default CFLAGS and Debian hardening include it, so those builds fail
+outright. Implementation is mechanical and well-specified.
 
-**Progress 2026-10-21 (local CI on the pinned caches):** the hosted runs for
-this PR never reached a compiler (two jobs died provisioning GCC 16 on a
-Launchpad window), so the whole gate set was run locally from the tag caches
-instead: all thirteen pinned assets verified against their `MANIFEST.sha256`,
-Rust 1.97.0 (the declared floor), the bookworm i686 sysroot, and the pinned
-`as`/`ld.bfd` 2.47, relocs, valgrind and A64 ISA XML oracles. `ci_local.sh
---fast` first reported 51 failures; on the pre-rebase tree it then ran 366
-passed / 1 failed, and the linker suite went from 295 pass / 9 fail to 304
-pass / 0 fail / 0 warn / 0 skip once the pinned oracles were in place. Four of
-the 51 were repository defects fixed here: stale benchmark-registry counts in
-three corpus modules; the `not_mask` bit idiom, now implemented with an
-exhaustive-model unit test; the missing local mirror of the new layout-matrix
-gate; and the audit-census drift, which a pristine base export reproduced and
-which upstream's own rename pass has since brought back to the recorded
-baseline (no baseline edit ships in this branch). The remaining 47 were
-sandbox-toolchain gaps: the tag-cache GCC defaults to `-fno-pie` where distro
-compilers default to `-fPIE`, the tarball ships no sanitizer archives, and the
-32-bit glibc headers live under Debian's host-triplet directory — each
-reproduced explicitly so a gate measures the compiler, never the host. With
-`LCCC_I686_SYSROOT` pointing at the extracted sysroot the pre-rebase tree ran
-the differential suite to PASS=1026 FAIL=0 SKIP=3 (AB-diff 0), i.e. no `-m32`
-build failures remain. The maintainer directed that these local, pinned-cache runs are the
-evidence of record for this PR while GitHub's hosted runs are degraded, so
-`--fast` **and** `--slow` are both run here; the older "full/slow CI is not
-authorized locally" line above is superseded for this PR by that direction,
-not by a relaxation of any gate.
+**Where.** `src/backend/x86/codegen/prologue.rs` (frame allocation and
+`calculate_stack_space_impl`), the dynamic `alloca`/VLA lowering in the x86 and
+i686 codegen, CFI emission (`src/backend/cfi_synth.rs`).
 
-**Progress 2026-10-21 (oracle-contract defect inherited from main):** the
-rebased tree failed one corpus test, and it fails identically on a pristine
-`git archive` of `origin/main` — `run_regression.py` (added in `8a4d424`)
-downgraded *any* oracle binary that exits non-zero to `SKIP-COMPARE`, while
-`test_wrapping_regression_contract` pins the same case as `FAIL`. A blanket
-waiver silently disables the differential comparison for every row an
-out-of-date oracle touches, so the waiver is now declared per fixture
-(`LCCC_ORACLE_SELFCHECK=skip` in the `.env` sidecar, with the reason) and a
-failed oracle self-check is otherwise a hard failure naming the declaration.
-The only fixture that needs it is `gnu_constant_builtins` (vector
-`__builtin_classify_type` is 19 on GCC 14+, -1 on GCC 12). Two tests cover the
-declared and undeclared paths plus the fail-closed key parse.
+**Plan.**
+1. Static frames: if `frame ≤ 1 KiB` (no probe needed beyond the callee-pushed
+   return address) leave as is. Else probe every 4 KiB: unrolled up to 4
+   steps (`subq $4096,%rsp; orq $0,(%rsp)`), loop beyond
+   (`mov %rsp,%r11; sub $N,%r11; L: sub $4096,%rsp; orq $0,(%rsp); cmp %r11,%rsp; jne L`), then allocate the residue and
+   probe it if it is > 1 KiB. i686: same with `orl $0,(%esp)`.
+2. Each `sub` adjusts the CFA: emit `.cfi_adjust_cfa_offset 4096` per step (loop:
+   describe once with `DW_CFA_def_cfa_expression` or save-restore state), so
+   unwinding is exact mid-prologue.
+3. Dynamic allocation (`alloca`, VLA): allocate in 4 KiB steps with a probe each
+   iteration, final partial block probed; never use a single `sub %reg,%rsp`.
+4. Leaf functions using the red zone: keep the red zone only when the frame is
+   ≤ 128 bytes (already true); no probes needed.
+5. Interaction: `-mno-red-zone` (kernel) unchanged; `-fcf-protection` `endbr64`
+   remains first; make sure peephole passes cannot delete or reorder the
+   `orq $0,(%rsp)` probes (treat as a memory write with side effect, pinned).
 
-### P1.5 — Continue scalar min/max/abs lowering from the sign-only witness
+**Gates.** (a) asm-shape test for 512 B / 8 KiB / 1 MiB / VLA frames on both
+targets; (b) runtime test: run a 64 KiB-frame function on an `mmap`ed stack
+(`makecontext`) whose lowest page is `PROT_NONE` with a writable victim region
+below it — with probes `SIGSEGV` must occur; without them the victim region is
+corrupted (this proves the probes work, which asm shape alone cannot); (c)
+`gdb` backtrace taken *inside* the probe loop is correct (CFI).
+**Accept.** Both tests green on x86-64 and i686; `-fstack-clash-protection`
+moves from Refused (MB-01) to Implemented. **Effort** S–M · **ROI** 4.0.
 
-**Evidence:** the recent codegen-round reports identify scalar min/max/abs as a
-remaining family. This follow-up implements one exact x86 case:
-`max(0, a - b)` represented as arithmetic → same-width TEST → sign-only CMOV.
-The witness changes 6 to 5 actual instructions in LCCC; GCC 16.2 uses 4, while
-local Clang 23.1.3 and ICX 2026.2 use 5. Runtime output matches GCC/Clang/ICX
-for `-O0`, `-O1`, `-O2`, `-O3`, and `-Os`, including wrapping edges. The
-comparison is static code shape only; no runtime-speed claim follows.
-See [`engineering/journal/2026-10-23-sign-test-cmov.md`](engineering/journal/2026-10-23-sign-test-cmov.md)
-and the artifact directory
-[`engineering/evidence/sign-test-cmov-2026-10-23/`](engineering/evidence/sign-test-cmov-2026-10-23/).
+### MB-06 · P1 · S — stack-protector canaries, including the kernel's guard options
 
-**Next:** enumerate the remaining min/max/abs shapes and determine which are
-legally reducible from their exact flag semantics; retain strict-positive and
-other ZF-dependent controls. Add a minimal witness and negative control for each
-accepted generalization. Keep same-width and all intervening-flag-use barriers;
-never rewrite from source-level algebra alone.
+**Why.** Refused today (correct, honest; `-mstack-protector-guard*` too), which means Debian/Ubuntu/Arch default
+flags fail outright (`-fstack-protector-strong`) and the kernel's
+`CONFIG_STACKPROTECTOR` is unavailable. A complete toolchain implements it; the
+design below keeps it small.
 
-**Accept:** exact compiler differential over the supported arithmetic domain,
-optimization modes, and existing overflow flags; mutation-sensitive runtime and
-codegen gates; final fast CI, rustfmt, strict Clippy, and exact-version oracle
-receipts. Any runtime claim requires the matched output-checked paired runner
-on a workload with useful duration; instruction count is not a substitute.
+**Where.** `src/backend/stack_layout/` (slot ordering), `src/backend/x86/codegen/prologue.rs`
+and `returns.rs`, `src/backend/i686/codegen/`, `src/driver/cli.rs`.
 
-### P1.6 — IPA-RA: known-callee clobber sets for `hot_web_loop`
+**Plan.**
+1. Eligibility per function: `-fstack-protector` = char arrays ≥ 8 bytes (or
+   `alloca`); `-strong` = any local array, any local whose address is taken,
+   VLA/`alloca`, local register variables; `-all` = every function;
+   `-explicit` = `__attribute__((stack_protect))`; `__attribute__((no_stack_protector))`
+   opts out.
+2. Layout: place the canary directly below the saved frame pointer/return
+   address; sort protected arrays *above* scalar locals so an overflow hits the
+   canary before other variables (GCC's layout rule); spilled arguments copied
+   below the arrays.
+3. Prologue: `movq %fs:0x28,%rax; movq %rax,-8(%rbp-or-rsp);  xorl %eax,%eax`
+   (i686: `%gs:0x14`). Epilogue: reload, `subq %fs:0x28,%rdx` (or `xor`), `jne` to
+   one shared cold block per function calling `__stack_chk_fail` (noreturn).
+   No tail call out of a protected function; no check before a `noreturn` call.
+4. Options: `-mstack-protector-guard=tls|global`, `-mstack-protector-guard-reg=`,
+   `-mstack-protector-guard-offset=`, `-mstack-protector-guard-symbol=` (the
+   kernel passes `tls`, `gs`, `offset` and, on newer trees, a symbol).
+5. Remove the refusal arms in `cli.rs` and flip MB-01 rows.
 
-**Evidence:** `docs/FOLLOWUP-2026-10-22-ipa-ra-callee-clobbers.md` measures
-`hot_web_loop` at 1.549× GCC 16.2 runtime on a 99.8 ms median and finds 18
-stack references in LCCC versus none in GCC. The specific mechanism is that
-four hot loop-carried values are copied into callee-saved homes around a
-`static noinline` helper because the allocator assumes every call clobbers all
-caller-saved registers. This is a measured, bounded workload result, not a
-universal compiler ranking.
+**Gates.** Smash test (`char b[8]; strcpy(b, argv[1])`) aborts with
+`*** stack smashing detected ***` under both lccc and GCC for `-strong`,
+`-all`; not for a function with only scalars under `-strong`; asm test that the
+check is not removable by the peephole passes (mutation: add a pass that drops
+the epilogue compare and watch the gate fail); kernel-style options accepted
+and emitted. **Accept.** Debian and Arch flag sets compile; `scripts/` corpus
+overhead measured (expect < 2 % on the benchmark set; report it).
+**Effort** M · **ROI** 3.5.
 
-**Next:** prototype post-allocation per-callee written-register summaries in
-reverse topological order. Preserve conservative caller-saved clobbers for
-recursive cycles, indirect/unknown calls, escaped functions, and external ABI
-calls; inspect the full report's fallback design before coding. A per-callee
-summary that is not proven safe must not affect allocation.
+### MB-07 · P1 · R — `-fvisibility`, `-fno-plt`, `-ftrapv`, trap-mode UBSan, `-fwrapv`
 
-**Accept:** exact helper/call-graph, recursion, indirect-call, escaped-function,
-and external-ABI controls; no allocator miscompile; reproducible assembly and
-runtime evidence on `hot_web_loop`, the complete 49-program corpus, and callback
-kernels. Use a matched paired runner and retain all regressions. Do not adopt
-from static counts alone.
+Split into independently landable parts; each ends by flipping its row in MB-01.
 
-## Rejected/stale queue claims
+**MB-07a `-fvisibility=hidden|protected|internal|default` + `#pragma GCC visibility`
++ `__attribute__((visibility))` precedence.** Apply to definitions *and* to
+`extern` declarations (hidden externs get direct calls/PC-relative accesses with
+no PLT/GOT, a measurable size and speed win for shared libraries). Where: symbol
+emission in `src/backend/x86/codegen/globals.rs` and the i686 equivalent; the
+attribute parser in the frontend. Test: `readelf -sW` visibility column over a
+matrix of flag × attribute × pragma; link a shared lib and verify `--dynsym`
+exports shrink; `-fvisibility-inlines-hidden` is C++ only (Refused).
 
-- The root backlog's dated A14/PR834/PR837 status is historical; its baseline
-  hashes are not this tree. Reproduce before calling any original failure
-  current. Completed entries stay in the archive, not the live queue.
-- The earlier claims that `oracle_asm.py` returns success on compile/extraction
-  failure and that `tune_oracle.py` returns success with a partial vendor table
-  are rejected as stale: current code returns nonzero and the 40 focused offline
-  tests exercise local, remote, missing-function, empty-output, stale-report,
-  and execution-result failures.
-- The BZHI header-asm optimization is rejected on measured negative evidence;
-  no production adoption or relaxed safety gate is authorized.
-- Callgrind Ir, static instruction counts and single-run VM timings are not
-  runtime wins. Historical compiler comparisons remain attached to their
-  original source/base and cannot be promoted to current-main claims.
+**MB-07b `-fno-plt`.** With `-fPIC`: calls to external functions become
+`call *foo@GOTPCREL(%rip)` (i686: `call *foo@GOT(%ebx)`); the linker must keep
+the `GOTPCRELX` relaxation (`call *foo@GOTPCREL(%rip)` → `addr32 call foo` when
+`foo` binds locally; already supported in `src/backend/x86/linker/plt_got.rs`
+if relaxation is implemented — verify first). Test: asm shape + runtime with
+`LD_BIND_NOW` unset to prove lazy PLT is bypassed (`LD_DEBUG=bindings`).
 
-## Measurement and implementation workflow
+**MB-07c `-ftrapv` and `-fsanitize=undefined` (trap mode first).** Stage 1 needs
+no runtime library: `-ftrapv` lowers signed `+ - *` to the existing
+`__builtin_*_overflow` machinery followed by `jo`/`ud2`; `-fsanitize-trap=undefined`
+adds: signed overflow, shift out of range, unreachable, array-bounds (known-size
+only), null-pointer deref where statically known. Stage 2: emit calls to
+`__ubsan_handle_*` (link `libubsan` when present) with source-location records.
+`-fsanitize=address|thread|memory|leak`: Refused (MB-01) — they need runtime
+libraries and shadow memory; do not fake them. Test: seeded-bug programs per
+check, rc/trap observed, no false trap on the corpus (all 39 benchmark workloads
+must pass with `-fsanitize-trap=undefined`).
 
-1. Check [`engineering/agent/RULES.md`](engineering/agent/RULES.md),
-   [`engineering/DECISIONS.md`](engineering/DECISIONS.md), and the matching
-   source/evidence receipt before each item. Use the canonical tool map at
-   [`engineering/SCRIPT-MEASUREMENT-MAP.md`](engineering/SCRIPT-MEASUREMENT-MAP.md).
-2. Use `scripts/godbolt.py`, `scripts/codegen_oracle.py`, `scripts/oracle_asm.py`
-   and the relevant script-specific gates. Live Compiler Explorer was not
-   reachable/used in this audit; offline oracle self-tests are not vendor
-   comparison data.
-3. For dynamic instruction/caching investigation, use the repository Callgrind
-   tools only when Valgrind is installed; preserve exact geometry, full counters,
-   source/binary identities, native/instrumented output equivalence and complete
-   status. Callgrind is not a substitute for PMU/runtime measurement.
-4. Runtime: `tests/benchmark/run_benchmarks.py` with immutable compiler/input
-   identities, matched options, canonical output checks, paired/interleaved
-   rounds and raw receipts. Rerun at least the baseline control when an
-   apparent effect changes across ASLR/layout/order.
-5. Add permanent tests for a real defect, mutation-check the targeted failure,
-   re-oracle, remeasure, and only then update an item's status. Record the dated
-   session digest under `engineering/journal/`; retain durable negative
-   decisions in `engineering/DECISIONS.md` and raw data in `engineering/evidence/`.
+**MB-07d `-fwrapv`/`-fno-strict-overflow` soundness** (A14-16 tail in
+[`engineering/archive/BACKLOG-2026-10-16.md`](engineering/archive/BACKLOG-2026-10-16.md)):
+the archived reproducer (`p[i*4]` with `i` starting at 2^30 faulting at -O1/-O2)
+must be re-run first; it is the only known case of an accepted flag whose
+semantics the optimiser violates.
+
+**MB-07e `-ftls-model=`, `-fzero-call-used-regs=`, `-ftrivial-auto-var-init=zero|pattern`.**
+`-ftls-model` is cheap (select GD/LD/IE/LE per variable; the i686 linker already
+has TLS relaxations in `src/backend/i686/linker/tls.rs`). The other two are
+security options: either implement (zeroing used caller-saved registers before
+`ret`; zero/pattern-fill of uninitialised automatic storage at declaration) or
+refuse — never ignore. **Effort** M (a–e together L) · **ROI** 3.2.
+
+---
+
+## 5. Tier M1 — Completeness and debuggability
+
+### MB-10 · P1 · R — DWARF: from "no debug sections" to usable gdb
+
+**Why.** `-g -O0 -c` produces **no** `.debug_*` sections (R); the native x86
+assembler parses `.file`/`.loc` and drops them (`AsmItem::{File,Loc}` in
+`src/backend/x86/assembler/parser.rs` are "parsed but skipped"). Consequence:
+no `addr2line`, no `perf annotate` source lines, no gdb locals, no kernel BTF.
+`-gsplit-dwarf` is accepted and ignored with a warning. This is the largest
+"does not feel finished" gap for daily use.
+
+**Where.** x86 and i686 assemblers (`src/backend/x86/assembler/`, i686 equivalent),
+`src/backend/x86/assembler/elf_writer.rs` (section + relocation emission),
+`src/driver/pipeline.rs` (`asm_contains_debug_records` honesty check),
+`src/backend/cfi_synth.rs`; DIE generation in a new backend-independent module
+fed by `CType`.
+
+**Plan (each stage is shippable alone).**
+1. **Line table (S–M).** Teach both assemblers to turn `.file N "name"`/`.loc`
+   (with `is_stmt`, `prologue_end`, `discriminator`, `view`) into a DWARF 5
+   line program in `.debug_line` (+ `.debug_line_str`), with
+   `DW_LNE_set_address` relocated against the section symbol
+   (`R_X86_64_64` / `R_386_32`, written into `.rela.debug_line`/`.rel.debug_line`).
+   Support `-gdwarf-4` as the alternate format (directory/file tables differ).
+   Update the honesty check to validate the **object**, not the `.s` text.
+2. **Minimal DIE tree at -O0 (M).** `.debug_info`/`.debug_abbrev`/`.debug_str`:
+   compile unit (producer, language `DW_LANG_C11`, name, comp_dir, `low_pc`/`high_pc`
+   or `DW_AT_ranges`, `stmt_list`); base, pointer, const/volatile, typedef,
+   struct/union/enum, array (subrange), subroutine types; `DW_TAG_subprogram`
+   (name, external, decl line, type, pc range, `frame_base = DW_OP_call_frame_cfa`);
+   formal parameters and locals with `DW_OP_fbreg <slot offset>`; lexical blocks.
+   Emit them as assembler directives (`.uleb128`, `.long label`, `.quad`) so
+   stage 1's assembler consumes them.
+3. **Optimised code (L).** Location lists from register-allocator live ranges
+   (`DW_AT_location` → `.debug_loclists`), `DW_OP_piece` for split values,
+   `DW_TAG_inlined_subroutine` with `call_file/call_line`, honest
+   `<optimized out>` where no range exists.
+4. **Extras.** `.debug_aranges`, `.debug_rnglists`, `-gz` section compression,
+   `-fdebug-prefix-map`/`-ffile-prefix-map` applied to `DW_AT_name/comp_dir/decl_file`
+   (must keep objects reproducible across directories — the current
+   cross-directory determinism is a property to protect), `-gsplit-dwarf`
+   either implemented or Refused, BTF generation for the kernel
+   (`pahole`-compatible) as a follow-up.
+
+**Gates.** (a) `readelf --debug-dump=decodedline` rows map `.loc` lines
+exactly; (b) `addr2line -e a.out <pc>` for every function entry of a 3-file
+program; (c) gdb batch (`gdb` installs from apt): `break g`, `run`, `bt`,
+`info args`, `info locals`, `print *ptr`, `ptype struct S`, `finish` all
+return the expected text at `-O0`; (d) the same on i686 via `gdb` + `-m32`;
+(e) mutation: corrupt one relocation and see (a) fail. (f) `llvm-dwarfdump
+--verify` where available.
+**Accept.** Stages 1+2 land together with a stable gdb test; stage 3 has its
+own acceptance on the benchmark corpus (≥ 90 % of parameters inspectable at
+`-O1`). **Effort** L · **ROI** 3.8.
+
+### MB-11 · P2 · R — C23 tail and a `target("avx2")` regression candidate
+
+**Status.** C23 coverage jumped upstream: 39 of 40 census snippets are accepted
+(`nullptr`, `constexpr`, keyword `bool`, `0b…'…`, `enum E : T`, `typeof` in
+`-std=c23` all pass now). Remaining:
+
+1. **`_Float16` / `__bf16`** — rejected (R). Plan: type, literals (`f16`/`F16`
+   suffix), conversions (F16C `vcvtph2ps`/`vcvtps2ph` when `-mf16c`/`-march`
+   has it, else a software helper), SysV x86-64 ABI (low 16 bits of an XMM
+   register), i686 software path, `<float.h>` `FLT16_*` macros, `_Generic`
+   distinctness. Gate: round-trip and ULP tests against GCC 16 for 2^16 bit
+   patterns × each rounding mode used by the conversion helpers.
+2. **Default dialect.** GCC 15+ defaults to `-std=gnu23`. Decide and record in
+   [`engineering/DECISIONS.md`](engineering/DECISIONS.md) whether lccc's default
+   follows; if yes, flip it only after the kernel (`-std=gnu11` pinned) and the
+   corpus pass, and keep an escape hatch environment variable for one release.
+3. **Regression candidate.** `__attribute__((target("avx2")))` on a reduction
+   loop emitted `ymm` on `e8ae10a` and emits only `xmm` at `-O2` on `2070d23f`
+   (R; `-mavx2` file-wide still gives `ymm`). Bisect the 546 commits (the
+   per-function ISA gating or a vectoriser cost-model change); add a gate that a
+   per-function `target("avx2")` is honoured by the vectoriser at `-O2`. If the
+   change was a deliberate cost-model decision, record it in DECISIONS.md and
+   change the probe row instead.
+
+**Gates.** The per-feature accept/reject table against GCC 16 for the C23 snippets
+(write them fresh); the bisect result recorded in the journal. **Effort** S–M ·
+**ROI** 3.3.
+
+### MB-12 · P1 · R — warnings that real builds rely on
+
+**Why.** Missing vs GCC 13 `-Wall -Wextra` (R): `-Wformat`, `-Wsign-compare`,
+`-Wunused-variable`. Arch's default flags contain `-Wformat -Werror=format-security`;
+a compiler that cannot raise that diagnostic cannot enforce the policy.
+`-Wall -Werror` itself works for the warnings that exist (R: implicit
+declaration becomes `error [-Werror=implicit-function-declaration]`).
+
+**Where.** `src/frontend/sema/` (diagnostics), a new format-string checker
+module, warning-registry in `src/driver/cli.rs`/diagnostic sink.
+
+**Plan.**
+1. Warning registry: one table `(name, default-on, in -Wall, in -Wextra, description)`
+   driving `-W<name>`, `-Wno-<name>`, `-Werror=<name>`, `-Wno-error=<name>`,
+   the `[-Wname]` suffix, and `-Wall/-Wextra/-pedantic` group expansion; unknown
+   `-W` names follow MB-01.
+2. `-Wunused-variable`, `-Wunused-but-set-variable`, `-Wunused-function` (static,
+   not referenced), `-Wunused-parameter` (`-Wextra`): need a `used`/`set` bit on
+   declarations, respecting `(void)x`, `__attribute__((unused))`,
+   `[[maybe_unused]]`, and variables used only in `sizeof`/unevaluated contexts.
+3. `-Wsign-compare` (C: `-Wextra`): signed/unsigned relational comparison after
+   usual arithmetic conversions, with GCC's constant-value exemptions.
+4. `-Wformat` family for `printf`/`scanf`/`strftime`/`strfmon` families:
+   built-in knowledge of libc names plus `__attribute__((format(printf,m,n)))`;
+   checks: conversion/argument type mismatch, missing/extra arguments, `%n`, width
+   `*` types; `-Wformat-security` (non-literal format string, no arguments) so
+   `-Werror=format-security` works; `-Wformat-nonliteral` and
+   `-Wformat-overflow` later.
+5. Later: `-Wmaybe-uninitialized` (needs flow analysis before `mem2reg`),
+   `-Wshadow`, `-Wmissing-prototypes`, `-Wstrict-prototypes`, `-Wimplicit-fallthrough`,
+   `-Wcast-qual`, `-Wdeprecated-declarations`.
+
+**Gates.** Per-warning positive/negative tests; **precision gate**: zero new
+warnings over `tests/benchmark/programs`, the zlib-ng/gzip/expat sources and
+the kernel corpus for each warning that is enabled by `-Wall` (compare counts
+with GCC on the same files and list every lccc-only warning as a bug).
+`-Werror=format-security` on `printf(argv[0])` fails (R reference: GCC does).
+**Effort** M–L · **ROI** 3.4.
+
+### MB-13 · P1 · R — i686 linker parity (reuse `linker_common`)
+
+**Why.** The i386 userspace linker rejects `--version-script`, `-Map`, `-pie`,
+`--emit-relocs`, `--exclude-libs`, `--build-id=<other than sha1/tree>` and `-r`
+(`src/backend/i686/linker/options.rs`, `unsupported(...)` arms;
+`src/bin/lccc_ld.rs` rejects ELF32 `-r` and `-pie`/`-static-pie` outright;
+the driver's `-r` for `-m32` demands the `gcc_linker` feature). All errors are
+clear, which is why this is "parity" not "trust". `linker_common` already
+contains the shared building blocks: `version_script.rs`, `mapfile.rs`,
+`build_id.rs`, `defsym.rs`, `archive.rs`, `eh_frame.rs`, `cet.rs`.
+
+**Where.** `src/backend/i686/linker/{options,emit,shared,link}.rs`,
+`src/backend/linker_common/*`, `src/bin/lccc_ld.rs`.
+
+**Plan (one PR each, in this order).**
+1. `--version-script`/`--exclude-libs`: parse via `linker_common::version_script`,
+   apply when building `.dynsym` and `.gnu.version*` in `emit_shared`/`shared.rs`.
+2. `-Map`/`--print-map`/`--cref`: feed `linker_common::mapfile` from the i686 layout.
+3. `--build-id=uuid|0xHEX|md5` shared implementation (also used by MB-04).
+4. `-r` for ELF32: implement relocatable output (merge sections, keep relocations,
+   COMDAT handling); mirrors `src/backend/x86/linker/emit_rel.rs`.
+5. `--emit-relocs` for the regular (non-script) path.
+6. `-pie`/`-static-pie` for ELF32: `R_386_RELATIVE`, `.rel.dyn` (and `DT_RELR`
+   via MB-14), `__x86.get_pc_thunk` based PIC code is already generated.
+   Without this, MB-04 cannot make i686 default-PIE; until then the driver must
+   say "default PIE is x86-64 only".
+
+**Gates.** The same option-surface script as MB-02 run with `-m32`, plus the
+MB-32 corpus linked with each feature; `readelf --dyn-syms`, `--version-info`
+comparisons against `ld -m elf_i386`. **Accept.** The seven rows in §2's
+"`-m32` link" line turn into passes. **Effort** M · **ROI** 3.6.
+
+### MB-14 · P1 · R — x86-64 linker: DT_RELR, page size, image base, small flags
+
+**Why.** Five flags are dead (MB-02 R list). Of those, `DT_RELR` is the one with
+real-world weight: Arch ships with it, it shrinks PIE/shared-object relocation
+tables 60–90 % and speeds startup.
+
+**Where.** `src/backend/x86/linker/emit_exec.rs`, `emit_shared.rs`,
+`plt_got.rs`, layout constants in `layout_plan.rs`; `src/backend/linker_common/`.
+
+**Plan.**
+1. **RELR.** After layout, collect all `R_X86_64_RELATIVE`-class entries whose
+   place is 8-byte aligned and whose value is `base + addend` with the addend
+   *stored in the place* (RELR has no explicit addend): write the addend into
+   the section data, then encode sorted offsets as RELR words — an even word is
+   an address entry, an odd word is a 63-bit bitmap for the following 63
+   words. Entries that cannot be encoded (unaligned, or needing an explicit
+   addend elsewhere) stay in `.rela.dyn`. Emit `.relr.dyn`, `DT_RELR`,
+   `DT_RELRSZ`, `DT_RELRENT=8`, and **add the version dependency on
+   `GLIBC_ABI_DT_RELR`** (a `DT_VERNEED` entry against `libc.so.6`), otherwise
+   older glibc loads the binary and mis-relocates it. Enable on
+   `-z pack-relative-relocs` / `--pack-dyn-relocs=relr`; keep off by default.
+2. `-z max-page-size=N` / `-z common-page-size=N`: parametrise the layout's
+   page constant (currently 0x1000); needed for aarch64-style 64 KiB hosts and
+   for `-z separate-code` alignments. i686: keep 4096 and refuse other values
+   (already refused, MB-13).
+3. `--image-base=ADDR`: base of the first PT_LOAD for `ET_EXEC` (and the
+   preferred base recorded for `ET_DYN`). Validate alignment.
+4. Small ones: `--print-memory-usage`, `--trace/-t`, `--oformat=binary` (or
+   Refused), `-N/-n/--omagic/--nmagic` (Refused unless implemented),
+   `--fatal-warnings` (MB-02), `-z keep-text-section-prefix`.
+5. Verify (not assume) `--icf=all|safe` correctness: the flag is accepted by
+   lccc-ld; bfd 2.42 rejects it, lld/mold implement it. Add a run-and-compare
+   test that function pointers to merged functions still compare unequal under
+   `--icf=safe` and that `-Wl,--icf=all` does not break address-significant
+   data (`.llvm_addrsig` equivalent: lccc has none, so `safe` must be
+   conservative — document the rule).
+
+**Gates.** `readelf -d`/`-r --use-dynamic`, a test binary run with
+`LD_DEBUG=reloc` on the host loader, comparison of `-z pack-relative-relocs`
+output size with bfd 2.47 (`ld.bfd --pack-dyn-relocs=relr` once available);
+exercise glibc 2.36+. **Accept.** Reproducer lines in MB-02 flip; size of
+`libc`-linked PIE with N relocations within 5 % of bfd's. **Effort** M · **ROI** 3.2.
+
+### MB-15 · P2 · S — whole-program mode instead of a no-op `-flto`
+
+**Why.** `-flto` is accepted and does nothing (R: accepted; no IR is retained —
+treat as S until the archive is inspected). Cross-TU inlining and constant
+propagation are among the largest wins GCC/Clang/ICX have on multi-file programs
+(gzip, expat, zlib-ng are all multi-file), and the benchmark corpus is the stated
+yardstick. Honest staging:
+
+1. **Stage 0 (S, do now).** `-flto` Refused or `BenignNoop` *with a warning that
+   no LTO is performed* (MB-01).
+2. **Stage 1 (M).** `lccc -fwhole-program -O2 a.c b.c c.c -o app`: the driver
+   parses all TUs, lowers each to IR, **merges the modules in memory** (statics
+   renamed `TU#name`, extern declarations resolved to definitions, duplicate
+   `inline`/COMDAT handling, tentative definitions merged) and runs the normal
+   pipeline once. Only accepted when the whole program is on one command line
+   (no `-c`). Expected effect: cross-TU inlining of small functions, global
+   constant propagation, dead-function elimination with `-fwhole-program`
+   semantics (non-`main` globals become internal unless exported by
+   `-Wl,--export-dynamic` or attribute).
+3. **Stage 2 (L).** `-flto` with `-c`: serialise IR into a `.lccc.ir` section
+   (versioned, deterministic), and make `lccc-ld`/the driver perform the merge
+   at link time (Stage 1 machinery). Needs a stable IR serialisation format
+   and a symbol-resolution handshake (which symbols are preserved).
+
+**Gates.** Differential run-and-compare on gzip/expat/zlib-ng corpus: outputs
+identical to non-LTO; counted instructions on hot paths drop (Callgrind, the
+repo's paired harness); build with an *unrelated* TU defining a same-named
+static to prove renaming. **Effort** M (stage 1) / L (stage 2) · **ROI** 3.0.
+
+### MB-16 · P2 · R — function multiversioning and IFUNC
+
+**Why.** `target("avx2")` works (R: `ymm` emitted) but `target_clones` produces
+no IFUNC and no variants (R). zlib-ng, zstd, xz, FFmpeg style dispatch is the
+standard way to ship fast portable binaries; with MB-03 fixed, `target_clones`
+is the other half.
+
+**Plan.** (1) Parse `target_clones("avx2","bmi2","default")`; (2) emit one
+clone per target string through the existing per-function ISA machinery;
+(3) emit an IFUNC symbol plus a resolver that tests the same runtime feature
+bits as MB-03 in priority order (most capable first), `STT_GNU_IFUNC`,
+`R_X86_64_IRELATIVE` handled by the linker for static binaries (MB-04 step 2);
+(4) i686: IFUNC needs `-fPIC` and a GOT-relative resolver; (5) `__attribute__((ifunc("resolver")))`
+explicit form; (6) `target_version` is Refused.
+**Gates.** Dispatch test runs both clones depending on a forced `GLIBC_TUNABLES`
+mask or `qemu -cpu`; `readelf -sW` shows `IFUNC`; static-binary variant works.
+**Effort** M · **ROI** 3.0.
+
+---
+
+## 6. Tier M2 — speed of the tool
+
+### MB-20 · P1 · R — peephole compile time: one quadratic lookup, then decode once
+
+**Why (measured on `2070d23f`).** Callgrind, 40-function TU, `-O1`: 961 M
+instructions total, **68 % in `peephole_optimize_inner`**. Inside it:
+
+- **32.5 % of all compiler instructions are `LabelRefs::build`**, reached via
+  `label_is_fallthrough_only` → `combined_local_pass` (`local_patterns.rs`, two call sites near
+  lines 1771 and 1854). `label_is_fallthrough_only` is the *one-shot* form
+  (`dead_writes.rs`, "a whole-file scan per call"); calling it per candidate label
+  is quadratic in file size. Its own doc comment names the cure: build a
+  `LabelRefs` once per pass invocation (`memory_fold.rs` already does, with
+  `get_or_insert_with`), and states the staleness contract that makes it safe for
+  passes that only delete or rewrite lines.
+- `FileLiveness::new` fell from 41 % to 4.8 % and `fold_copy_into_lea_base` from
+  20 % to 2.3 % since `e8ae10a` (upstream's liveness cache) — those earlier
+  hypotheses are closed.
+- `str::starts_with`/`slice::starts_with` ≈ 10 %; 80 `trimmed(..).to_string()` sites
+  remain in `peephole/passes/` (was 71): opcode tests on text, allocation before
+  the filter.
+
+On a 300-function TU the peephole is 2.08 s of 2.81 s (74 %) in the fastbuild
+compiler; GCC `-O1` takes 0.77 s on the same file (ratio only).
+
+**Where.** `src/backend/x86/codegen/peephole/passes/{local_patterns,dead_writes,memory_fold,relay_and_lea,load_op_fuse}.rs`.
+
+**Reproducer.**
+```bash
+CCC_TIME_PEEPHOLE=1 lccc -O1 -c big.c -o /dev/null
+valgrind --tool=callgrind --callgrind-out-file=cg.out lccc -O1 -c big40.c -o /dev/null
+callgrind_annotate --inclusive=yes cg.out | grep -E 'LabelRefs::build|combined_local_pass|peephole_optimize_inner'
+```
+
+**Plan (measure after every step; output must stay byte-identical).**
+1. **Hoist `LabelRefs` (S).** In `combined_local_pass` create the index lazily once
+   (`Option<LabelRefs>`), pass it to both call sites, and keep the one-shot function
+   only for tests. Confirm the staleness contract holds for every transformation in
+   the pass (deletes/rewrites only; if one *adds* a label reference, rebuild after
+   that edit). Expected: the 32.5 % collapses to a single scan per invocation.
+2. **Search for siblings (S).** `grep -rn 'label_is_fallthrough_only(' passes/` and
+   any other "one-shot" helper whose doc says "whole-file scan per call" — apply the
+   same fix; add a debug-assertion counter (tests only) that fails when
+   `LabelRefs::build` runs more than once per pass invocation.
+3. **Allocation before filter (S).** For each of the 80 `trimmed(..).to_string()`
+   sites test the opcode on `&str` first; prioritise by Callgrind inclusive cost.
+4. **Decode once (M).** Extend `LineInfo` with an interned opcode id and operand
+   kinds computed on creation/edit so the `starts_with` ladders become table lookups.
+5. **Per-function dirty bits (M).** Re-run only functions changed in the previous
+   iteration of the fixpoint loop; skip a pass when its trigger opcode never occurs.
+
+**Gates.** Byte-identical `.s` over the benchmark programs, the kernel corpus and the
+asm-diff corpus before/after each step (existing identity scripts); a compile-cost
+ratchet on two fixed inputs using Callgrind instruction counts with a 3 %
+tolerance (deterministic proxy, per the decision rules above) **plus** a paired
+wall-time check reported separately. **Accept.** `LabelRefs::build` below 2 % of
+instructions; peephole ≤ 35 % of the total; output byte-identical. **Risks.** Stale
+index after a pass that adds a label reference — hence step 1's explicit audit and
+the identity gates. **Effort** S for steps 1–3, M for 4–5 · **ROI** 4.8.
+
+### MB-21 · P2 · R — `-O0` compiles slower than `-O1`
+
+**Why.** Reproduced twice on `e8ae10a` (**re-measure on current `main` first**: MB-20 step 1 may erase the difference): 80 small TUs take 7.4 s at `-O0` vs 5.8–6.5 s at
+`-O1`/`-O2`; `-O0` text is 50 % larger (4049 vs 2705 bytes) and `CCC_TIME_PHASES=1`
+shows 72 ms vs 66 ms in `codegen` for the same file, i.e. the same peephole
+cost on more lines. The edit-compile-debug loop is exactly where `-O0` is used.
+**Plan.** (1) Measure which peephole phases run at `-O0` (`CCC_TIME_PEEPHOLE`);
+(2) run only the cheap local passes and skip the liveness-driven ones at
+`-O0` — but **only if** debugging behaviour and `-g` line tables are unaffected;
+(3) re-measure after MB-20. **Gate.** `-O0` compile instructions ≤ `-O1`'s on
+the ratchet inputs; run-and-compare corpus identical at `-O0`.
+**Effort** S · **ROI** 2.8.
+
+### MB-22 · P2 — measure the tool honestly
+
+`fastbuild` (`opt-level = 1`) is for REACT cycles and is **not** a basis for any
+speed claim about the compiler. Add a documented recipe and script (to be
+created) that builds a measurement binary (`--release` equivalent without thin
+LTO if memory-bound), records its hash, and reports both Callgrind instruction
+counts (deterministic, for gates) and paired wall times (for humans). Keep
+instruction counts as the only CI-gated number.
+
+---
+
+## 7. Tier M3 — i686 and linker verification
+
+### MB-32 · P1 · R — i686 differential gate (promote the 14 programs, then widen)
+
+**Why.** The 14-program run-and-compare set (64-bit integer ops, FP, struct
+return, varargs, `setjmp`, `qsort` callbacks, 64-bit atomics, TLS,
+`regparm`/`fastcall`/`stdcall`, bit-fields, switch lowering, PIC data, float↔int
+conversion, `alloca`/VLA) is currently clean against `gcc -m32` at `-O0` and
+`-O2` and runs natively as 32-bit code even on an x86-64 host. That is the
+best i686 asset we have and it is not a repo gate yet.
+**Plan.** (1) Commit the 14 programs under `tests/` with a runner comparing
+stdout and exit code to `gcc -m32` and to expected-output files (so the gate
+works where GCC multilib is absent); (2) widen: x87 `long double` (arithmetic,
+`printf("%Lf")`, `-mfpmath=387|sse`), `-malign-double`, `-mstackrealign`,
+`-mpreferred-stack-boundary=2..4`, `-mregparm=3`, `-mrtd`, struct passing
+and return (≤8 B in `eax:edx`, `sret` otherwise, `-freg-struct-return`),
+`va_arg` of structs and `long long`, `signal`/`sigaltstack` frames, unwinding
+through generated functions (`_Unwind_Backtrace`, `__attribute__((cleanup))`
+with `pthread_cancel`), all four TLS models, `-fPIC` shared library + `dlopen`,
+`-static`, `-O1/-O2/-Os`, `-fcf-protection`; (3) add each defect found to this
+file as its own item.
+**Gates.** Runs in `ci_local.sh --fast` only for the small subset; full set in
+the slow job. **Effort** S · **ROI** 3.0.
+
+### MB-33 · P2 · S — linker differential oracle
+
+Link the same object sets with `ld.bfd`, `ld.lld`, `mold` and `lccc-ld`; assert
+(1) identical runtime behaviour, (2) a normalised set of structural properties
+is equal: `PT_*` flags and alignment, `PT_GNU_RELRO` page-exactness,
+`PT_GNU_STACK`, `.eh_frame_hdr` table sorted and complete (`_Unwind_Find_FDE`
+works for every function), `DT_NEEDED` order, `DT_RUNPATH`, symbol versions,
+`IFUNC`/`IRELATIVE`, TLS template sizes (`PT_TLS`), init/fini array order and
+constructor priorities, weak-undefined resolution to 0, COMDAT dedup,
+copy-relocation placement, `--gc-sections` keep rules. Differences allowed only
+via an explicit allowlist with a reason. This subsumes A14-07 and A14-06's
+linker-oracle part (archive). The 800-object synthetic link (§2) is the
+performance input; keep its generator in `scripts/` and record
+`lccc-ld` vs the three linkers' wall time **and** `LCCC_LD_TIME` phase output.
+**Effort** M · **ROI** 2.8.
+
+---
+
+## 8. Tier M4 — code quality of generated code (carry-forward, re-ranked)
+
+This tier is deliberately thin: the performance queue is large and was
+produced under a measurement discipline this file does not repeat (paired,
+order-balanced, Callgrind-backed; see the archive). Priorities below are by the
+archive's own evidence, **not re-measured here**.
+
+- **MB-30 · L · H — calibrate the cost model from published Raptor Lake data.**
+  Replace hand-tuned latencies/ports in the scheduler/regalloc cost functions with a
+  generated table (instruction → µops, latency, throughput, ports) built from a
+  checked-in snapshot of the uops.info measurement data for Alder/Raptor Lake P
+  cores, keyed by the mnemonic classes the backend already enumerates; the
+  generator script lives in `scripts/`, the output in a generated Rust file with a
+  version header. Gate: table lookup equals the old constants for the
+  instructions where they were already right (regression), and the benchmark
+  corpus A/B shows no >1 % regression per workload. This is archive item
+  A14-25 made concrete.
+- **Carry-forward performance items** (unchanged scope, see archive):
+  RA-GLA-04, RA-CSAVE-1, RA-PRESSURE-3/4, PF-SN-1, PF-LZ4-1, PF-MB-1, PF-FB-1,
+  PF-CHACHA-1, PF-SCHEDULER-1, PF-CLS-1, PERF-1 (byte-width reductions), PERF-2
+  (loop interchange; matmul 1.399×, worst kernel), PERF-4 (descending-loop
+  IV strength reduction), PERF-5 (redundant-extension elimination), PERF-6,
+  SETMEM-SHAPE-1, RANGEFOLD-OR-1, CONSTLOOP-FOLD-1, WR-COND-RETEST,
+  MI-CLOBBER-1/MI-XMM-1/MI-PARAM-1/MI-ROTATE-1/MI-ENCODE-1, IVOPTS-1,
+  LOOP-PREHEADER-3. Use MB-15 (whole-program) as the next *measurable*
+  cross-cutting performance lever for the multi-file corpus members.
+- **Metric traps still in force:** METRIC-TRAP-1 and METRIC-SPLIT-1 in the archive
+  (`Ir` vs wall clock disagreement of up to 74 points) — never accept an
+  optimisation on static instruction counts alone.
+
+---
+
+## 9. Tier M5 — engineering system
+
+### MB-40 · P1 · S — keep the census ratchet honest
+`scripts/audit_census.py` exists upstream with a baseline; its remaining
+weaknesses are recorded as A14-01 in the archive (suffix-blanking after the
+first `#[cfg(test)]`, malformed-function reporting). Close those, then add the
+two metrics this rewrite found useful: "functions over 1,000 lines" is already
+tracked (23); add **`.to_string()` calls on a `trimmed(...)` result inside
+peephole passes** (MB-20 step 1, currently 71) and **catch-all option arms**
+(`=> {}` after `starts_with("-f")`, MB-01) so the specific regressions cannot
+return.
+
+### MB-41 · P2 · S — backlog format gate
+This file follows the item format of §1. Add a gate (to be created, e.g.
+scripts/check_backlog_format.py (to be created)): every `### ID · class · evidence` heading
+has Why/Where/Plan/Gates/Accept fields; every `R` item contains a fenced
+reproducer or a command in backticks; every referenced repo path resolves
+(the existing doc-link gate already covers paths); closed items must be moved to
+the archive directory rather than left in place. New closed entries go to
+[`engineering/journal/`](engineering/journal/README.md), not here.
+
+### MB-42 · P1 · S — promote the probe set to a standing gate
+The probes behind §2 (flag effects, linker option effects, debug-info presence,
+C23 census, 14 i686 programs, link-speed corpus, compile-instruction ratchet) were
+ad-hoc scripts. Extend `scripts/lccc_capability_probe.py` (it already runs the
+compiler and records command + exit status per capability) with `effect:` rows
+rather than adding a parallel tool; keep a machine-readable result file and a
+checked-in expectation table; each MB item above flips its rows from GAP to OK as it
+lands. This makes "Maybach progress" a number instead of an opinion.
+
+---
+
+## 10. Carried over from the superseded live queue (full text in the archives)
+
+Everything open in the 478-line queue that this file replaces is listed here with
+its acceptance criterion. Statuses are the previous queue's own (revalidated there
+only where its gates were rerun); re-verify a reproducer before starting. Full
+narrative and evidence links:
+[`engineering/archive/BACKLOG-2026-10-24-live-queue.md`](engineering/archive/BACKLOG-2026-10-24-live-queue.md).
+
+| ID | Item | Accept |
+|---|---|---|
+| UP-1 (was P0.1) | `ext_vector_type` layout: both historical mismatches re-measured **closed** (receipts: layout-matrix gate, 12 types × 10 lane counts vs Clang 23.1.3, `-m64`/`-m32`, `-O0`/`-O2`). Remaining: cross-compiler receipt for the bit-packed `bool` rule from a Clang/ICX hosted lane | Hosted-lane receipt; invalid forms diagnose |
+| UP-2 (was P0.2) | Option acceptance: policy landed (see MB-01). Remaining: classification review of `-flto`/sanitizers (now hard errors — verify intent), and a local replay of the `-fwrapv` byte-address boundary witnesses at `-O1`/`-O2` on every supported target | Modular result preserved across levels and targets; wrapping and non-wrapping controls kept |
+| UP-3 (was P0.4) | RISC-V relocation error/preservation contracts: replay archived malformed-expression and mutated-relocation fixtures; enumerate applied/retained/relaxed/rejected classes for exec and shared outputs | No unsupported expression becomes zero; malformed metadata rejected in both output modes; valid symbolic subtraction stays a positive control |
+| UP-4 (was P1.1) | Fannkuch runtime regression: explain before changing code | Matched paired runner; mechanism identified before any edit |
+| UP-5 (was P1.2) | Zstandard code quality: `ZSTD_decompressSequencesLong_default` 2517 instructions / 871 frame refs vs GCC 1786 / 401; `ZSTD_safecopy` 211 / 58 vs 152 / 0; no victory claim from instruction counts | Output-checked paired runtime on useful durations; all regressions retained |
+| UP-6 (was P1.3) | Validate on real target hardware (Raptor Lake 14700KF PMU, EPYC 7763): VM numbers are screening only | Raw pairs, CPU/microcode, affinity, frequency policy, hashes, PMU availability; no universal "best compiler" claim |
+| UP-7 (was P1.4) | Fresh current-tree comparison and required local gates after any rebase | Frozen main vs candidate, recompiled corpus, immutable identities |
+| UP-8 (was P1.5) | Scalar min/max/abs lowering beyond the landed `max(0, a-b)` sign-test CMOV case (6→5 instructions; GCC 4, Clang/ICX 5): enumerate remaining shapes legal from exact flag semantics | Exact differential over the arithmetic domain incl. wrapping edges; mutation-sensitive gates; same-width and intervening-flag barriers kept |
+| UP-9 (was P1.6) | IPA-RA known-callee clobber sets: `hot_web_loop` 1.549× GCC 16.2 (99.8 ms median), 18 stack refs vs 0, caused by assuming every call clobbers all caller-saved registers around a `static noinline` helper | Per-callee written-register summaries in reverse topological order; conservative for recursion, indirect, escaped and external-ABI calls; no allocator miscompile; paired runtime on the 49-program corpus |
+
+**Rejected/stale claims carried forward** (do not revive without a new failing
+control): the old A14/PR834/PR837 dated statuses are historical; `oracle_asm.py`
+and `tune_oracle.py` returning success on failure is stale (nonzero now, 40 offline
+tests); the BZHI header-asm optimisation is rejected on measured negative evidence;
+Callgrind `Ir`, static counts and single-run VM timings are not runtime wins; the
+10k-line SIMD-stack PRs are **unvalidated, not accepted** (no matching 16-byte XMM
+stack operands in the 49-program corpus); keep the `CCC_LAYOUT_TIE_ORIG=1` rollback
+and the strict stack rule; the layout-tie benchmark number is not portable across a
+rebase.
+
+**Older item families** (IDs live in the archives; re-verify before use):
+evidence/benchmark integrity A14-02/03/04/06/07/22/23/26/27/28/32/33; structure
+A14-01/08/09 (typed AST identity — includes the pointer-address `ExprId` hazard)
+/10/11/12 (giant functions)/18/24/25; correctness A14-15/17 (RISC-V), A14-31
+(lossy ELF string decoding), ANON-KEY-1, PARSER-ALIGN-1, CONST-QUAL-1, INTPTR-1,
+REDEF-1, IVSR-OFFSET-1; performance PF-*, RA-*, PERF-1..6, SETMEM-SHAPE-1,
+RANGEFOLD-OR-1, CONSTLOOP-FOLD-1, WR-COND-RETEST, MI-*, IVOPTS-1,
+LOOP-PREHEADER-3; infrastructure INF-HARNESS-1, INF-BENCHGATE-1, INF-FRESHCLONE-1,
+INF-GAS-1, INF-LINK-1, INF-PGOPID-1, INF-M32HDRS-1, EDG-TRANSPLANT.
+
+## 11. Definition of done for the whole programme
+
+Maybach is reached for x86/i686 when the MB-42 harness shows: **zero GAP** rows
+in pillars 1–3 for the Arch and Debian default flag sets; C23 census 40/40; gdb
+and `addr2line` gates green on x86-64 and i686; the linker differential oracle
+(MB-33) green against bfd/lld/mold for the curated structural set; compile
+instructions at `-O1`/`-O2` within 2× of GCC's on the 300-function input
+(measured with a release build, MB-22); and the performance corpus gates of §8
+unchanged or better. Until then, report progress per row of §2, never as a
+single adjective.
