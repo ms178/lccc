@@ -171,6 +171,24 @@ workload. The multi-cycle ratios were 1.304187, 1.156223, and 1.153430. IPA was
 at parity with GCC/Clang but its feature/ICX ratio was 1.188400. These are
 specific hosted measurements, not a universal performance claim.
 
+Final run
+[40096188063](https://github.com/ms178/lccc/actions/runs/40096188063) repeated
+the complete matrix on a different host, AMD EPYC 9V45, with the same exact
+oracles and witnesses. It confirms that the magnitude is host-dependent:
+
+| Workload | LCCC baseline (ms) | LCCC features (ms) | Feature / baseline | Baseline/feature MAD (ms) |
+|---|---:|---:|---:|---:|
+| IPA forwarding | 27.1626 | 26.8456 | 0.988331 | 0.8979 / 0.4927 |
+| Multi-cycle pressure | 22.6077 | 22.5414 | 0.997067 | 0.1405 / 0.2392 |
+| Unit-latency LRS | 13.3774 | 12.9873 | **0.970839** | 0.0752 / 0.0611 |
+
+The 2.9% unit-latency reduction is smaller than on EPYC 7763 but remains
+well above its spread; the other two differences are not decisive against
+their MADs. Feature/GCC, feature/Clang, and feature/ICX ratios for the
+unit-latency workload were 2.050056, 2.388318, and 2.369033 on this host.
+This second run is evidence of a workload- and host-specific gain, not a
+26.9% cross-machine expectation or general superiority over other compilers.
+
 The Rust unit tests additionally pin fail-before/pass-after behavior for the
 block-local consumer, recursive and variadic summaries, semantic interposition,
 escape through globals, source-span preservation, and budget failure. The
