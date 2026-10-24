@@ -30111,9 +30111,7 @@ fn transform_map_vector(
             (IrType::I32 | IrType::U32, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI32x8),
             // The backend selects direct SSE4.1 pmulld or the exact SSE2
             // even/odd pmuludq reconstruction; both implement modular I32.
-            (IrType::I32 | IrType::U32, false, IrBinOp::Mul) => {
-                Some(IntrinsicOp::VecMulI32x4)
-            }
+            (IrType::I32 | IrType::U32, false, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI32x4),
             (IrType::I32 | IrType::U32, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI32x8),
             (IrType::I32 | IrType::U32, false, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI32x4),
             (IrType::I32 | IrType::U32, true, IrBinOp::And) => Some(IntrinsicOp::VecAndI32x8),
