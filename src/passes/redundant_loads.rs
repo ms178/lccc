@@ -52,7 +52,39 @@ fn same_memory_value_type(
     a == b || matches!((a, b), (I64, U64) | (U64, I64))
 }
 
+type AvailableLoad = (alias::LinForm, crate::common::types::IrType, Value, Value);
+
+fn retain_available_across_call(
+    func: &IrFunction,
+    block: usize,
+    instruction: usize,
+    available: &mut Vec<AvailableLoad>,
+    analysis: &super::ipa_pta::IpaPta,
+) {
+    let before = available.len();
+    available
+        .retain(|(_, _, _, pointer)| !analysis.may_call_modify(func, block, instruction, *pointer));
+    if std::env::var_os("CCC_IPA_PTA_STATS").is_some() {
+        eprintln!(
+            "[IPA-PTA] consumer function={} block={} instruction={} available={}->{}",
+            func.name,
+            block,
+            instruction,
+            before,
+            available.len()
+        );
+    }
+}
+
 pub(crate) fn run(func: &mut IrFunction) -> usize {
+    run_impl(func, None)
+}
+
+pub(crate) fn run_with_ipa_pta(func: &mut IrFunction, analysis: &super::ipa_pta::IpaPta) -> usize {
+    run_impl(func, Some(analysis))
+}
+
+fn run_impl(func: &mut IrFunction, ipa: Option<&super::ipa_pta::IpaPta>) -> usize {
     if std::env::var("CCC_NO_REDUNDANT_LOADS").is_ok() {
         return 0;
     }
@@ -80,9 +112,10 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
 
         for bi in 0..func.blocks.len() {
             let frame = frames.block_frame[bi];
-            // (form, type, canonical dest)
-            let mut available: Vec<(alias::LinForm, crate::common::types::IrType, Value)> =
-                Vec::new();
+            // (form, type, canonical dest, address value).  Retaining the
+            // original address is what lets IPA-PTA answer a call query per
+            // available load rather than conservatively clearing the list.
+            let mut available: Vec<AvailableLoad> = Vec::new();
             let mut removed: Vec<usize> = Vec::new();
 
             for (ii, inst) in func.blocks[bi].instructions.iter().enumerate() {
@@ -95,7 +128,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                 // redefined, so the guard costs nothing there.
                 if let Some(dest) = inst.dest() {
                     if !available.is_empty() {
-                        available.retain(|(f, _, _)| !f.syms.iter().any(|s| s.0 == dest.0));
+                        available.retain(|(f, _, _, _)| !f.syms.iter().any(|s| s.0 == dest.0));
                     }
                 }
                 match inst {
@@ -120,9 +153,9 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                         else {
                             continue;
                         };
-                        if let Some((_, _, canon)) = available
+                        if let Some((_, _, canon, _)) = available
                             .iter()
-                            .find(|(f, t, _)| *f == form && same_memory_value_type(*t, *ty))
+                            .find(|(f, t, _, _)| *f == form && same_memory_value_type(*t, *ty))
                         {
                             // MULTI-DEF GUARD: see the module doc. A multi-def
                             // canonical's content is not position-stable, and a
@@ -134,7 +167,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                                 continue;
                             }
                         }
-                        available.push((form, *ty, *dest));
+                        available.push((form, *ty, *dest, *ptr));
                     }
                     Instruction::Store {
                         ptr,
@@ -150,11 +183,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                         match alias::resolve_in_frame(func, &defs, &frames, frame, *ptr) {
                             Some(sform) => {
                                 let ssz = crate::passes::loop_memory_promote::byte_size(*ty);
-                                let keep = |entry: &(
-                                    alias::LinForm,
-                                    crate::common::types::IrType,
-                                    Value,
-                                )| {
+                                let keep = |entry: &AvailableLoad| {
                                     match (
                                         crate::passes::loop_memory_promote::byte_size(entry.1),
                                         ssz,
@@ -187,7 +216,7 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                                             same_memory_value_type(source_ty, *ty)
                                         })
                                 {
-                                    available.push((sform, *ty, *value));
+                                    available.push((sform, *ty, *value, *ptr));
                                 }
                             }
                             None => available.clear(),
@@ -213,20 +242,14 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                                 func, &defs, &frames, frame, base, index, disp,
                             ) {
                                 Some(sform) => {
-                                    let keep = |entry: &(
-                                        alias::LinForm,
-                                        crate::common::types::IrType,
-                                        Value,
-                                    )| {
-                                        match (
-                                            crate::passes::loop_memory_promote::byte_size(entry.1),
-                                            Some(ssz),
-                                        ) {
-                                            (Some(lsz), Some(_)) => alias::forms_disjoint(
-                                                &entry.0, lsz, &sform, ssz, true,
-                                            ),
-                                            _ => false,
+                                    let keep = |entry: &AvailableLoad| match (
+                                        crate::passes::loop_memory_promote::byte_size(entry.1),
+                                        Some(ssz),
+                                    ) {
+                                        (Some(lsz), Some(_)) => {
+                                            alias::forms_disjoint(&entry.0, lsz, &sform, ssz, true)
                                         }
+                                        _ => false,
                                     };
                                     available.retain(keep);
                                 }
@@ -240,9 +263,14 @@ pub(crate) fn run(func: &mut IrFunction) -> usize {
                     // Calls, atomics, inline asm, variadics: unknown memory
                     // effects, kill everything.  Intrinsics with a write
                     // pointer kill everything (read-only intrinsics are fine).
-                    Instruction::Call { .. }
-                    | Instruction::CallIndirect { .. }
-                    | Instruction::Memcpy { .. }
+                    Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
+                        if let Some(analysis) = ipa {
+                            retain_available_across_call(func, bi, ii, &mut available, analysis);
+                        } else {
+                            available.clear();
+                        }
+                    }
+                    Instruction::Memcpy { .. }
                     | Instruction::AtomicRmw { .. }
                     | Instruction::AtomicCmpxchg { .. }
                     | Instruction::AtomicStore { .. }

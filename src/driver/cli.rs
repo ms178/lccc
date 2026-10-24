@@ -2368,6 +2368,10 @@ impl Driver {
                 // withdrawals are supported there with GCC's stickiness.)
                 "-fno-tree-vectorize" => self.disable_tree_vectorize = true,
                 "-ftree-vectorize" => self.disable_tree_vectorize = false,
+                "-fipa-pta" => self.ipa_pta = true,
+                "-fno-ipa-pta" => self.ipa_pta = false,
+                "-flive-range-shrinkage" => self.live_range_shrinkage = true,
+                "-fno-live-range-shrinkage" => self.live_range_shrinkage = false,
                 arg if matches!(
                     arg,
                     "-fno-tree-loop-vectorize"
@@ -3234,6 +3238,38 @@ mod cli_tests {
         // args[0] is argv[0] (used for target detection from the binary name).
         let args = vec!["ccc".to_string(), flag.to_string(), "x.c".to_string()];
         d.parse_cli_args(&args).map(|_| ())
+    }
+
+    #[test]
+    fn ipa_pta_and_live_range_shrinkage_are_real_last_wins_options() {
+        for flag in [
+            "-fipa-pta",
+            "-fno-ipa-pta",
+            "-flive-range-shrinkage",
+            "-fno-live-range-shrinkage",
+        ] {
+            try_flag(flag).unwrap_or_else(|e| panic!("{flag} must be implemented: {e}"));
+        }
+        let mut d = Driver::new();
+        let args = [
+            "ccc",
+            "-fipa-pta",
+            "-flive-range-shrinkage",
+            "-fno-ipa-pta",
+            "-fno-live-range-shrinkage",
+            "-fipa-pta",
+            "-flive-range-shrinkage",
+            "x.c",
+        ]
+        .map(str::to_string);
+        d.parse_cli_args(&args)
+            .expect("implemented optimization options");
+        assert!(d.ipa_pta);
+        assert!(d.live_range_shrinkage);
+        let off = ["ccc", "-fno-ipa-pta", "-fno-live-range-shrinkage", "x.c"].map(str::to_string);
+        d.parse_cli_args(&off).expect("disabling forms");
+        assert!(!d.ipa_pta);
+        assert!(!d.live_range_shrinkage);
     }
 
     /// `-w` inhibits every warning and is dominant regardless of position —

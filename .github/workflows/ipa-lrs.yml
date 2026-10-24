@@ -1,0 +1,114 @@
+name: IPA-PTA and live-range shrinkage
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ipa-lrs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    name: Differential correctness and measured IPA/LRS witnesses
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      RUSTFLAGS: -D warnings -C link-arg=-Wl,--no-keep-memory
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Enable swap
+        run: bash scripts/ci_enable_swap.sh
+      - name: Compute weekly apt cache key
+        id: apt-epoch
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+      - name: Cache GCC package downloads
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lccc-apt
+          key: lccc-apt-debs-v1-${{ runner.os }}-${{ steps.apt-epoch.outputs.week }}
+          restore-keys: |
+            lccc-apt-debs-v1-${{ runner.os }}-
+      - name: Cache provisioned GCC toolchain
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lccc-toolchain
+          key: lccc-toolchain-v1-${{ runner.os }}-${{ hashFiles('scripts/ci_install_gcc16.sh', 'scripts/ci_toolchain_bundle.sh', 'scripts/ci_provision_toolchain.sh') }}
+      - name: Provision GCC 16.2 and runtime tools
+        env:
+          LCCC_CI_APT_ARCHIVE_DIR: /home/runner/.cache/lccc-apt
+        run: bash scripts/ci_provision_toolchain.sh --multilib
+      - name: Cache Clang 23.1.3 oracle
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lccc/clang-oracle
+          key: lccc-clang-oracle-${{ runner.os }}-${{ hashFiles('scripts/ci_install_clang_oracle.sh') }}
+      - name: Provision Clang 23.1.3 oracle
+        run: bash scripts/ci_install_clang_oracle.sh
+      - name: Cache GCC 16.2 oracle
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/lccc/gcc-oracle
+          key: lccc-gcc-oracle-${{ runner.os }}-16.2-${{ hashFiles('scripts/ci_install_gcc_oracle.sh') }}
+      - name: Provision GCC 16.2 oracle
+        run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
+      - name: Verify exact GCC and Clang oracle versions
+        run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.3
+      - name: Provision authenticated Intel ICX 2026.2 oracle
+        run: |
+          set -euo pipefail
+          binary=$(bash scripts/ensure_icx_2026.sh "$RUNNER_TEMP/intel-icx-2026.2")
+          test -x "$binary"
+          echo "LCCC_ICX_BIN=$binary" >> "$GITHUB_ENV"
+          "$binary" --version
+      - name: Build fastbuild compiler and linker
+        run: ./scripts/build_lccc_fast.sh
+      - name: Run IPA/LRS correctness and performance harness
+        env:
+          CCC: target/fastbuild/lccc
+          GCC: gcc-16
+        run: |
+          python3 tests/regression/check_ipa_pta_live_range.py \
+            --lccc target/fastbuild/lccc \
+            --gcc gcc-16 \
+            --clang "${CLANG:-clang-23}" \
+            --icx "$LCCC_ICX_BIN" \
+            --reps 9 \
+            --output target/ipa-lrs-report.json
+      - name: Publish measurement summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path('target/ipa-lrs-report.json')
+          if not path.exists():
+              raise SystemExit(0)
+          report = json.loads(path.read_text())
+          print('## IPA-PTA / live-range shrinkage')
+          print(f"Cases: {len(report.get('cases', []))}; failures: {len(report.get('failures', []))}")
+          for result in report.get('performance', []):
+              print(f"- {result['case']}: feature/baseline median = {result.get('feature_over_baseline', 'n/a')}")
+          for compiler, identity in report.get('compilers', {}).items():
+              print(f"- `{compiler}`: {identity}")
+          PY
+      - name: Upload correctness and timing report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ipa-lrs-report-${{ github.sha }}
+          path: target/ipa-lrs-report.json
+          if-no-files-found: warn
