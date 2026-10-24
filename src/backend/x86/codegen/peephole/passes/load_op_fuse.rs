@@ -2129,6 +2129,13 @@ fn rename_product_range(
 /// families, the reader is a plain instruction with no high-byte alias, and
 /// widths agree (`l` copy with `l` op, `q` with `q`).  The op writes the
 /// same flags in both forms and the copy was flag-neutral.
+///
+/// The reader may also name `C` as its full-width destination
+/// (`leaq (%rbp,%r11), %rdx` -> `leaq (%rbp,%rdx), %rdx`): `C` is dead after
+/// the op, so the reader cannot read it, and an `l`/`q` register destination
+/// kills it outright, after the renamed read. Any other mention of `C` (a
+/// source, an address, a partial-width destination that merges old bits) is
+/// refused.
 pub(super) fn fold_copy_into_dying_operand(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
@@ -2178,7 +2185,10 @@ pub(super) fn fold_copy_into_dying_operand(store: &mut LineStore, infos: &mut [L
         }
         let b_bit = 1u16 << b_fam;
         let c_bit = 1u16 << c_fam;
-        if infos[k].reg_refs & b_bit == 0 || infos[k].reg_refs & c_bit != 0 {
+        let reader = infos[k].trimmed(store.get(k)).to_string();
+        if infos[k].reg_refs & b_bit == 0
+            || (infos[k].reg_refs & c_bit != 0 && !kills_family_only(&reader, c_fam))
+        {
             i += 1;
             continue;
         }
@@ -2186,7 +2196,6 @@ pub(super) fn fold_copy_into_dying_operand(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         }
-        let reader = infos[k].trimmed(store.get(k)).to_string();
         // Opaque readers (implicit operands, string ops, x87) are refused by
         // the MAY model; a memory-destination reader is fine (it reads B in
         // the address or as the stored value, both renamed consistently).
@@ -2212,6 +2221,32 @@ pub(super) fn fold_copy_into_dying_operand(store: &mut LineStore, infos: &mut [L
         i = k + 1;
     }
     changed
+}
+
+/// `true` when the only mention of family `fam` in `insn` is its full-width
+/// (`l`/`q`) register destination: `OP SRC..., %fam` with no `fam` in the
+/// sources. Single-operand forms (implicit destinations such as `mulq`)
+/// never qualify. Whether `OP` also READS its destination (two-address ALU,
+/// `cmov`) is the caller's liveness obligation.
+///
+/// Extension readers (`movz*`/`movs*`) are refused although the rename is
+/// exact: it turns `movzbl %Bb, %Cd` into the self-extension `movzbl %Cb,
+/// %Cd`, which no pass may delete (it clears bits 8..63), while the
+/// cross-register form is what the relay folds retire entirely
+/// (affine_countdown: `movzbl %r12b, %esi; movq %rsi, %rax; movb %al, (m)`
+/// reaches `movb %r12b, (m)`; renamed, a `movzbl %sil, %esi` survived).
+fn kills_family_only(insn: &str, fam: RegId) -> bool {
+    if insn.starts_with("movz") || insn.starts_with("movs") {
+        return false;
+    }
+    let Some((_, rest)) = insn.split_once(char::is_whitespace) else {
+        return false;
+    };
+    let Some((src, dst)) = split_two_operands(rest.trim()) else {
+        return false;
+    };
+    (dst == REG_NAMES[0][fam as usize] || dst == REG_NAMES[1][fam as usize])
+        && !mentions_family(src.as_bytes(), fam)
 }
 
 // ── symbol-LEA CSE ───────────────────────────────────────────────────────────
@@ -3355,6 +3390,65 @@ mod tests {
         );
         let out = body(&run(&asm, fold_copy_into_dying_operand));
         assert!(has(&out, "movl %ebp, %eax"), "{out:?}");
+    }
+
+    /// hot_web_loop with an IPA-RA home in %r9: the reader that last reads the
+    /// copy destination also redefines the dying operand's register.
+    #[test]
+    fn copy_into_dying_operand_reader_kills_c() {
+        let asm = format!(
+            "{PRO}    movq %rsi, %r11\n    xorq %rdx, %r11\n    leaq (%rbp, %r11, 1), %rdx\n    movq %rdx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "xorq %rsi, %rdx"), "{out:?}");
+        assert!(has(&out, "leaq (%rbp, %rdx, 1), %rdx"), "{out:?}");
+        assert!(!has(&out, "movq %rsi, %r11"), "{out:?}");
+        // A 32-bit destination zero-extends: a full kill too.
+        let asm = format!(
+            "{PRO}    movl %esi, %r11d\n    xorl %edx, %r11d\n    leal 1(%r11), %edx\n    movl %edx, %eax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "xorl %esi, %edx"), "{out:?}");
+        assert!(has(&out, "leal 1(%rdx), %edx"), "{out:?}");
+    }
+
+    #[test]
+    fn copy_into_dying_operand_reader_mentions_c_otherwise() {
+        // Partial-width destination merges C's old upper bits: refuse.
+        let asm = format!(
+            "{PRO}    movq %rsi, %r11\n    xorq %rdx, %r11\n    movb %r11b, %dl\n    movq %rdx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movq %rsi, %r11"), "{out:?}");
+        // C read in the reader's address: C is live after the op.
+        let asm = format!(
+            "{PRO}    movq %rsi, %r11\n    xorq %rdx, %r11\n    leaq (%rdx, %r11, 1), %rdx\n    movq %rdx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movq %rsi, %r11"), "{out:?}");
+        // Implicit %rdx writer (single operand): never a plain kill.
+        let asm = format!(
+            "{PRO}    movq %rsi, %rax\n    xorq %rdx, %rax\n    mulq %rax\n    movq %rdx, %rax\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movq %rsi, %rax"), "{out:?}");
+        // Extension reader: renaming would leave a self-extension.
+        let asm = format!(
+            "{PRO}    movl %eax, %r12d\n    xorl %esi, %r12d\n    movzbl %r12b, %esi\n    movb %sil, (%rdi)\n{EPI}"
+        );
+        let out = body(&run(&asm, fold_copy_into_dying_operand));
+        assert!(has(&out, "movl %eax, %r12d"), "{out:?}");
+    }
+
+    /// affine_countdown end to end: the byte store takes the xor result
+    /// directly, with no extension left behind.
+    #[test]
+    fn copy_into_dying_operand_extension_reader_pipeline() {
+        let out = super::super::super::peephole_optimize(format!(
+            "{PRO}    movzbl (%r10, %rdx), %eax\n    movl %eax, %r12d\n    xorl %esi, %r12d\n    movzbl %r12b, %esi\n    movq %rsi, %rax\n    movb %al, (%r10, %rdx)\n    xorl %eax, %eax\n{EPI}"
+        ));
+        assert!(!out.contains("movzbl %sil, %esi"), "{out}");
+        assert!(!out.contains("movzbl %r12b"), "{out}");
     }
 
     #[test]

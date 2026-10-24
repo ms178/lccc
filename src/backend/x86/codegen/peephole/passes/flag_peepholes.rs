@@ -1738,6 +1738,48 @@ pub(super) fn fold_copy_and_mask_into_movz(store: &mut LineStore, infos: &mut [L
 
 // ── 4b. copy + mask + flag consumer → test ─────────────────────────────────
 
+/// Longest run of real lines [`copy_mask_partner`] crosses between the copy
+/// and its mask.
+const COPY_MASK_WINDOW: usize = 12;
+
+/// The first real line after the copy `i` (`mov %A, %D`) that names `%D`, when
+/// every line between them leaves the pair alone: no line names `%D` (any
+/// width, implicit operands included), writes `%A`, has implicit register
+/// effects, or is a barrier, label, pinned line or inline asm.  Testing `%A`
+/// at the partner's position then sees exactly the value the copy took, and
+/// deleting the copy is unobservable because nothing in the window reads
+/// `%D`.  The adjacent pair is the zero-length window.
+///
+/// hot_web_loop keeps `h = helper(i)` for both `a += h` and `(h & 255) == 0`:
+/// `movq %rax, %r10` sits right after the call, the mask ten lines later.
+fn copy_mask_partner(
+    store: &LineStore,
+    infos: &[LineInfo],
+    i: usize,
+    len: usize,
+    src_fam: RegId,
+    dst_fam: RegId,
+) -> Option<usize> {
+    let mut k = i;
+    for _ in 0..=COPY_MASK_WINDOW {
+        k = next_real(infos, k, len)?;
+        let t = infos[k].trimmed(store.get(k));
+        if infos[k].pinned || infos[k].is_barrier() || infos[k].kind == LineKind::InlineAsm {
+            return None;
+        }
+        if line_refs_family(t, dst_fam) {
+            return Some(k);
+        }
+        if implicit_reg_refs(t.as_bytes()) & (1u16 << dst_fam) != 0
+            || super::helpers::has_implicit_reg_usage(t)
+            || writes_family(&infos[k], t, src_fam)
+        {
+            return None;
+        }
+    }
+    None
+}
+
 /// `movl %A,%D; andl $imm,%D; j{e,ne}/setcc/cmov…` with `%D` dead afterwards
 /// → `testl $imm,%A` (`testb $imm,%Ab` when the mask fits a byte and every
 /// consumer is ZF-only).
@@ -1754,9 +1796,10 @@ pub(super) fn fold_copy_and_mask_into_movz(store: &mut LineStore, infos: &mut [L
 /// iteration of the shift loop).
 ///
 /// Soundness: `%D` must be dead after the `and` (whole-function dataflow via
-/// [`FileLiveness`]); `%A` is only read; nothing between the `mov` and the
-/// `and` exists (adjacent real lines). Families 4/5 (`%rsp`/`%rbp`) never take
-/// the byte form.
+/// [`FileLiveness`]); `%A` is only read; the lines between the `mov` and the
+/// `and` neither name `%D` nor write `%A` ([`copy_mask_partner`]), so `%A`
+/// still holds the copied value at the `and`. Families 4/5 (`%rsp`/`%rbp`)
+/// never take the byte form.
 pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
@@ -1790,7 +1833,7 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         }
-        let Some(j) = next_real(infos, i, len) else {
+        let Some(j) = copy_mask_partner(store, infos, i, len, src_fam, dst_fam) else {
             i += 1;
             continue;
         };
@@ -1897,12 +1940,24 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
             && src_fam != REG_RSP
             && src_fam != REG_RBP
             && (imm & 0x80 == 0 || !flags_reach_an_sf_consumer(store, infos, j + 1));
-        let new_line = if byte_form {
-            format!("    testb ${}, {}", imm, REG_NAMES[3][src_fam as usize])
+        // An all-ones mask at the test width tests the register against
+        // itself: `x & 0xff == x & x` at byte width, so ZF/SF/PF agree and
+        // CF/OF are cleared either way; the register form drops the imm8
+        // (GCC/Clang emit `testb %dl, %dl` for `(h & 255) == 0`).
+        let (name_b, name_l) = (
+            REG_NAMES[3][src_fam as usize],
+            REG_NAMES[1][src_fam as usize],
+        );
+        let new_line = if byte_form && imm == 0xff {
+            format!("    testb {name_b}, {name_b}")
+        } else if byte_form {
+            format!("    testb ${imm}, {name_b}")
+        } else if !and_wide && imm == 0xffff_ffff {
+            format!("    testl {name_l}, {name_l}")
         } else if and_wide {
             format!("    testq ${}, {}", imm, REG_NAMES[0][src_fam as usize])
         } else {
-            format!("    testl ${}, {}", imm, REG_NAMES[1][src_fam as usize])
+            format!("    testl ${imm}, {name_l}")
         };
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, new_line);
@@ -4034,6 +4089,83 @@ mod tests {
         ));
         assert!(out.contains("andl $255, %r9d"), "{out}");
     }
+    /// hot_web_loop: `h` is copied right after the call and masked ten lines
+    /// later; the copy's only reader is the mask, so both go and the branch
+    /// tests the call result directly (GCC: `testb %dl, %dl`).
+    #[test]
+    fn distant_copy_and_mask_becomes_register_testb() {
+        let body = concat!(
+            "    call helper\n",
+            "    movq %rax, %r10\n",
+            "    addq %rax, %r12\n",
+            "    leaq 0(,%r14,8), %r11\n",
+            "    xorq %r11, %r14\n",
+            "    andq $255, %r10\n",
+            "    je .LBB5\n",
+            "    movq %r12, %rax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    movq %r14, %rax\n",
+            "    ret\n",
+        );
+        let out = peephole_optimize(format!(".cfi_startproc\n{body}.cfi_endproc\n"));
+        assert!(out.contains("testb %al, %al"), "{out}");
+        assert!(!out.contains("%r10"), "{out}");
+    }
+
+    /// Every window veto keeps the copy and the `and`.  The pass runs alone:
+    /// in the full pipeline a relay may first retire the copy's other reader
+    /// (`movq %r10, %r9` -> `movq %rax, %r9`), after which folding is right.
+    #[test]
+    fn distant_copy_and_mask_window_vetoes() {
+        let peephole_optimize = |asm: String| {
+            let mut store = LineStore::new(asm);
+            let mut infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(!super::fold_copy_and_mask_into_test(&mut store, &mut infos));
+            (0..store.len())
+                .filter(|&i| !infos[i].is_nop())
+                .map(|i| store.get(i).trim().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for (mid, why) in [
+            ("    addq $1, %rax\n", "source rewritten"),
+            ("    movq %r10, %r9\n", "copy read in the window"),
+            ("    movb $1, %r10b\n", "copy partially written"),
+            ("    cqto\n", "implicit register effects"),
+            ("    call g\n", "barrier"),
+            (".Lmid:\n", "label"),
+        ] {
+            let asm = format!(
+                ".cfi_startproc\n    movq %rax, %r10\n{mid}    andq $255, %r10\n    je .LBB5\n    movq %r9, %rax\n    ret\n.LBB5:\n    ret\n.cfi_endproc\n"
+            );
+            let out = peephole_optimize(asm);
+            assert!(
+                out.contains("andq $255, %r10") || out.contains("andl $255, %r10d"),
+                "{why}: {out}"
+            );
+        }
+    }
+
+    /// The all-ones dword mask tests the register against itself.
+    #[test]
+    fn all_ones_dword_mask_becomes_register_testl() {
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $4294967295, %esi\n",
+            "    js .LBB5\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testl %ebx, %ebx"), "{out}");
+    }
+
     #[test]
     fn copy_and_mask_branch_becomes_testb() {
         // ffs1 kernel shape: `while (!(x & 1))`, mask temp dead after the branch.

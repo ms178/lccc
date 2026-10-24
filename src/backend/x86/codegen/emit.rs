@@ -956,6 +956,19 @@ pub struct X86Codegen {
     /// pad so %rsp is 16-byte aligned at each call (entry %rsp ≡ 8 mod 16).
     /// Set by calculate_stack_space_impl, read by aligned_frame_size_impl.
     pub(super) func_has_calls: bool,
+    /// Module-scoped interprocedural register allocation state (summaries,
+    /// caller records); see `ipa_ra`.
+    pub(crate) ipa: super::ipa_ra::IpaRaState,
+    /// Caller-saved GP families (peephole bits) the current function keeps
+    /// live across some of its calls; 0 when IPA-RA does not apply. The
+    /// function-wide union, recorded for the module verifier.
+    pub(super) ipa_keep: u16,
+    /// Per IPA-homed value: (family bit, FAT interval). A call at point `c`
+    /// publishes, as `# LCCC_IPA_KEEP`, exactly the families of the values
+    /// live ACROSS it (`start < c < end`); see [`Self::ipa_keep_at`].
+    pub(super) ipa_keep_spans: Vec<(u16, u32, u32)>,
+    /// The callees the current function's keep set was computed against.
+    pub(super) ipa_keep_callees: Vec<String>,
     /// FP contraction contract (-ffp-contract=fast / -ffast-math): gates the
     /// scalar mul+add -> vfmadd231 fusion.
     pub(super) fp_contract: crate::common::fp_contract::FpContract,
@@ -1339,6 +1352,19 @@ fn alias_refuse_dbg() -> bool {
 }
 
 impl X86Codegen {
+    /// IPA-RA keep mask for a call at program point `pp`: the families
+    /// holding a value that is live across the call. Exact rather than the
+    /// function-wide union, so at a call no IPA value survives the peephole
+    /// keeps its ordinary clobber model (an argument staged through a dead
+    /// kept register still forwards; sf_inverse lost `movl %r12d,%edi` to a
+    /// union marker).
+    pub(super) fn ipa_keep_at(&self, pp: u32) -> u16 {
+        self.ipa_keep_spans
+            .iter()
+            .filter(|&&(_, start, end)| start < pp && pp < end)
+            .fold(0, |mask, &(fam, _, _)| mask | fam)
+    }
+
     /// Compare the low 64-bit half of a 128-bit switch value (already in
     /// %rax) against `case_val` and branch to `label` on equality.  The sign
     /// class of the case has already been verified against the high half.
@@ -1543,6 +1569,10 @@ impl X86Codegen {
             function_alignment: 0,
             skip_rax_setup: false,
             func_has_calls: false,
+            ipa: super::ipa_ra::IpaRaState::default(),
+            ipa_keep: 0,
+            ipa_keep_spans: Vec::new(),
+            ipa_keep_callees: Vec::new(),
             fp_contract: crate::common::fp_contract::FpContract::default(),
             fma_enabled: false,
             no_sse: false,
@@ -7225,6 +7255,7 @@ impl X86Codegen {
             target,
             ret: plan.ret,
             gp_arg_count: Some(plan.gp_arg_count),
+            ipa_keep: self.ipa_keep_at(self.state.current_program_point),
         });
         self.machinst_buf_ir.push(inst.clone());
         self.flush_machinst();
@@ -9007,6 +9038,33 @@ impl ArchCodegen for X86Codegen {
     }
     fn trap_instruction(&self) -> &'static str {
         "ud2"
+    }
+
+    fn note_function_emitted(&mut self, func: &IrFunction, mark: usize) {
+        if !self.ipa.enabled() {
+            return;
+        }
+        // A non-interposable definition: what a direct call reaches is
+        // exactly this text. PIE executables bind their definitions
+        // locally; full PIC (possibly a DSO) only hidden/internal/protected
+        // and static ones.
+        let binds_locally = func.is_static
+            || matches!(
+                func.visibility.as_deref(),
+                Some("hidden" | "internal" | "protected")
+            )
+            || !self.state.pic_mode
+            || (self.state.pie_mode && !self.state.shared_lib);
+        let text = &self.state.out.buf[mark..];
+        let label = format!("{}:", func.name);
+        // The summary is keyed by the IR name; it must be the emitted label
+        // (an asm-label rename would otherwise key the wrong symbol).
+        let labelled = text.lines().any(|l| l == label);
+        self.ipa
+            .note_function_emitted(func, binds_locally && labelled, text);
+        let callees = std::mem::take(&mut self.ipa_keep_callees);
+        self.ipa.record(&func.name, self.ipa_keep, callees);
+        self.ipa_keep = 0;
     }
 
     fn peephole_for_metric(&self, text: String) -> String {
@@ -10815,6 +10873,7 @@ mod machinst_window_tests {
                 target: CallTarget::Direct("f".into()),
                 ret: None,
                 gp_arg_count: None,
+                ipa_keep: 0,
             },
             MachInst::Ret,
             MachInst::Raw("lock cmpxchg16b (%rdi)".into()),

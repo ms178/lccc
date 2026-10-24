@@ -459,6 +459,10 @@ impl X86Codegen {
         }
         // Store function pointer for indexed addressing detection
         self.current_func = Some(func as *const IrFunction);
+        // The IPA-RA keep set answers for one function (set below, after
+        // the caller-saved pool is final).
+        self.ipa_keep = 0;
+        self.ipa_keep_callees.clear();
         // The def index answers for one function; the next question builds
         // this one's (see `get_defining_instruction`).
         self.def_index = std::cell::OnceCell::new();
@@ -862,6 +866,31 @@ impl X86Codegen {
         if !fixed.rdx && !has_i128_ops && !has_switch {
             caller_saved_regs.push(PhysReg(16)); // rdx
         }
+
+        // Interprocedural register allocation (`ipa_ra`): caller-saved
+        // registers that survive EVERY call this function makes (each call
+        // point is a direct call of the restricted shape to a local callee
+        // whose emitted text never writes them) are call-preserved here at
+        // no save/restore cost. They stay in both pools exactly as before --
+        // every phase decides as it always did -- and the allocator's final
+        // IPA fill gives the ones no phase used to slotted call-spanning
+        // values or to a callee-saved register's holders (one push/pop pair
+        // less each). Computed from the final caller-saved pool, so every
+        // whole-function exclusion above (i128 pairs, rdtscp/libatomic rdi)
+        // already applies.
+        let (ipa_keep, ipa_callees) =
+            if has_calls && !has_nonlocal_goto && !has_longjmp && !self.state.disable_regalloc {
+                self.ipa
+                    .keep_set(func, super::ipa_ra::pool_families(&caller_saved_regs))
+            } else {
+                (0, Vec::new())
+            };
+        let ipa_keep_regs: Vec<PhysReg> = super::ipa_ra::KEEP_PHYS
+            .iter()
+            .filter(|(fam, _)| ipa_keep & fam != 0)
+            .map(|&(_, id)| PhysReg(id))
+            .collect();
+        self.ipa_keep_callees = ipa_callees;
 
         // For a leaf, ParamRefs are eligible for caller-saved homes. Prefer
         // their incoming ABI registers in argument order so the common case
@@ -1600,6 +1629,9 @@ impl X86Codegen {
         // named "r11" and PhysReg(11) is named "r10". The indirect target is
         // the literal "%r10", i.e. PhysReg(11).
         let indirect_target_regs = vec![crate::backend::regalloc::PhysReg(11)];
+        // Out-parameter of the allocator: the IPA-RA kept registers it homed
+        // values in (see `RegAllocConfig::ipa_regs`).
+        let mut ipa_used: Vec<PhysReg> = Vec::new();
         let seg_indexed_fold = crate::backend::traits::ArchCodegen::supports_seg_indexed_fold(self);
         let fold_base_regs: Vec<crate::backend::regalloc::PhysReg> = available_regs
             .iter()
@@ -1613,7 +1645,7 @@ impl X86Codegen {
             caller_save_spans,
             accumulator_assignments,
             ra_eligible,
-        ) = crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ex(
+        ) = crate::backend::stack_layout::run_regalloc_and_merge_clobbers_ipa(
             func,
             available_regs,
             caller_saved_regs,
@@ -1667,7 +1699,38 @@ impl X86Codegen {
             fold_base_regs,
             &self.state.ra_config,
             &mut self.phi_chain,
+            ipa_keep_regs,
+            &mut ipa_used,
         );
+
+        // IPA-RA: publish exactly the kept registers the fill homed values
+        // in. A register no IPA home uses is an ordinary caller-saved
+        // register here (any Phase-2 tenant never spans a call), so marking
+        // it would only make the peephole treat it as read at every call and
+        // add a verification obligation for nothing.
+        self.ipa_keep = super::ipa_ra::KEEP_PHYS
+            .iter()
+            .filter(|(_, id)| ipa_used.iter().any(|r| r.0 == *id))
+            .fold(0, |m, (fam, _)| m | fam);
+        if self.ipa_keep == 0 {
+            self.ipa_keep_callees.clear();
+        }
+        self.ipa_keep_spans.clear();
+        if self.ipa_keep != 0 {
+            if let Some(liv) = &cached_liveness {
+                for iv in &liv.intervals {
+                    let Some(reg) = self.reg_assignments.get(&iv.value_id) else {
+                        continue;
+                    };
+                    if let Some(&(fam, _)) = super::ipa_ra::KEEP_PHYS
+                        .iter()
+                        .find(|&&(fam, id)| id == reg.0 && self.ipa_keep & fam != 0)
+                    {
+                        self.ipa_keep_spans.push((fam, iv.start, iv.end));
+                    }
+                }
+            }
+        }
 
         // Home-freshness bookkeeping (SOUNDNESS): reg_assignments is now THIS
         // function's final map. Build its inverse so note_dest_defined can

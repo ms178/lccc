@@ -355,6 +355,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 config: RegAllocConfig {
+                    ipa_regs: Vec::new(),
                     available_regs: vec![PhysReg(1), PhysReg(2)],
                     caller_saved_regs: vec![PhysReg(10)],
                     call_arg_regs: vec![],

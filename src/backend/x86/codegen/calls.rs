@@ -1673,6 +1673,17 @@ impl X86Codegen {
             self.state
                 .emit_fmt(format_args!("    # LCCC_CALL_FP {}", fp.min(8)));
         }
+        // IPA-RA keep set (`ipa_ra`): the kept registers holding a value live
+        // across THIS call (nonzero only when every call point of the
+        // function is a qualifying direct call to a summarized callee). After
+        // CALL_FP: the earlier markers' windows are unchanged and
+        // `call_markers` reads the whole contiguous block (at most five
+        // lines, inside its window).
+        let keep = self.ipa_keep_at(self.state.current_program_point);
+        if keep != 0 {
+            self.state
+                .emit_fmt(format_args!("    # LCCC_IPA_KEEP {:#06x}", keep));
+        }
         self.state.reg_cache.invalidate_all();
         self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();

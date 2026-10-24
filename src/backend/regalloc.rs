@@ -69,6 +69,11 @@ pub(crate) struct RaConfig {
     pub(crate) leaf_strict_call_free: bool,
     /// `CCC_NO_LEAF_CALLER_HOME`: disable volatile homes for eligible leaves (default: false).
     pub(crate) no_leaf_caller_home: bool,
+    /// `CCC_DISABLE_PASSES=ipa_ra` (or `all`): disable interprocedural
+    /// register allocation, i.e.
+    /// caller-saved homes kept across calls of local callees that provably
+    /// never write them (`x86::codegen::ipa_ra`; default: false).
+    pub(crate) no_ipa_ra: bool,
     /// `CCC_NO_SPAN_VALVE`: disable the span-pressure valve globally, in
     /// every scan (default: false — the valve is on). Diagnostic/A/B
     /// switch only: the valve is load-bearing (chacha20_core goes from
@@ -375,6 +380,8 @@ impl RaConfig {
             no_hot_loop: present("CCC_NO_HOT_LOOP"),
             leaf_strict_call_free: present("CCC_LEAF_STRICT_CALL_FREE"),
             no_leaf_caller_home: present("CCC_NO_LEAF_CALLER_HOME"),
+            no_ipa_ra: text("CCC_DISABLE_PASSES")
+                .is_some_and(|list| crate::passes::pass_disabled(list, "ipa_ra")),
             no_span_valve: present("CCC_NO_SPAN_VALVE"),
             no_web_inloop_use: present("CCC_NO_WEB_INLOOP_USE"),
             no_recurrence_floor: present("CCC_RA_NO_RECURRENCE_FLOOR"),
@@ -674,6 +681,8 @@ fn verify_accumulator_assignments(func: &IrFunction, assignments: &[AccumulatorA
 
 pub struct RegAllocResult {
     pub assignments: FxHashMap<u32, PhysReg>,
+    /// The `RegAllocConfig::ipa_regs` the IPA-RA fill homed values in.
+    pub ipa_used: Vec<PhysReg>,
     pub accumulator_assignments: Vec<AccumulatorAssignment>,
     pub used_regs: Vec<PhysReg>,
     pub caller_save_spans: FxHashMap<u8, Vec<(u32, u32)>>,
@@ -1483,6 +1492,11 @@ pub(crate) fn x86_param_caller_homes_safe_with_config(
 
 pub struct RegAllocConfig {
     pub available_regs: Vec<PhysReg>,
+    /// x86-64 IPA-RA: caller-saved registers (also in `caller_saved_regs`)
+    /// that survive every call of this function; registers no phase used
+    /// receive slotted call-spanning values or a callee-saved register's
+    /// holders after allocation (`ipa_fill_preserved_regs`). Empty elsewhere.
+    pub ipa_regs: Vec<PhysReg>,
     pub accumulator_policy: AccumulatorPolicy,
     pub caller_saved_regs: Vec<PhysReg>,
     /// Subset of `caller_saved_regs` that a call's argument staging writes
@@ -1998,6 +2012,254 @@ fn segment_spanned_calls<'a>(
         .iter()
         .copied()
         .take_while(move |&cp| cp < end && cp >= start)
+}
+
+/// Inputs of [`ipa_fill_preserved_regs`] beyond the assignment map.
+struct IpaFill<'a> {
+    /// Caller-saved registers every call of the function preserves (x86-64
+    /// `ipa_ra`): a home there spans calls with no save/restore anywhere.
+    ipa_regs: &'a [PhysReg],
+    /// Callee-saved registers whose holders may move wholesale to an IPA
+    /// register (renaming), scanned last-first.
+    callee_pool: &'a [PhysReg],
+    /// Caller-saved registers a displaced tenant of an IPA register may move to.
+    reloc_pool: &'a [PhysReg],
+    iv_map: &'a FxHashMap<u32, (u32, u32)>,
+    /// Loop-weighted use count: the spill traffic a home saves.
+    cost: &'a dyn Fn(u32) -> u64,
+    /// May tenant `v` be displaced into register `r`? Encodes every
+    /// per-register rule Phase 2 applied to it; `false` for any value whose
+    /// home must not change (class members, call-spanning values, params).
+    reloc_ok: &'a dyn Fn(u32, PhysReg) -> bool,
+    /// Holders that pin their callee-saved register (no rename).
+    rename_blocked: &'a dyn Fn(u32) -> bool,
+    /// FAT intervals of the values that will draw an emitter scratch
+    /// register where they live: eligible, homeless, not call-spanning GPR
+    /// values (MachInst window vregs).
+    scratch_demand: &'a [(u32, u32)],
+    /// `CCC_DEBUG_RA`: report every displacement and placement.
+    trace: bool,
+}
+
+/// One register's tenants (`value`, FAT interval), or `None` when a tenant
+/// has no interval (occupancy unknown: the register is never touched).
+type IpaOcc = FxHashMap<u8, Option<Vec<(u32, (u32, u32))>>>;
+
+/// Caller-saved registers that must stay free at every program point an
+/// IPA-RA placement covers. The emitter's MachInst window allocator and call
+/// staging draw scratch from exactly that pool, so the fill must never take
+/// its last free register: hot_web_loop's loop had one free caller-saved
+/// register (%r11) at its hot point, and a fill that took it cost one copy
+/// per iteration (+3.3% Ir) to save two cold-path memory operands.
+const IPA_MIN_FREE_SCRATCH: u32 = 1;
+
+fn ipa_disjoint(tenants: &[(u32, (u32, u32))], (s, e): (u32, u32)) -> bool {
+    tenants.iter().all(|&(_, (s2, e2))| e < s2 || e2 < s)
+}
+
+/// Make IPA register `p` free over every interval of `ivs`, displacing the
+/// conflicting tenants as ONE group into a single relocation register they
+/// are all allowed in and all disjoint from (the group already shared `p`,
+/// so its members stay mutually compatible). Returns `false`, changing
+/// nothing, when no such register exists.
+fn ipa_make_room(
+    assignments: &mut FxHashMap<u32, PhysReg>,
+    occ: &mut IpaOcc,
+    fill: &IpaFill<'_>,
+    p: PhysReg,
+    ivs: &[(u32, u32)],
+) -> bool {
+    let Some(Some(tenants)) = occ.get(&p.0) else {
+        return false;
+    };
+    let (group, rest): (Vec<_>, Vec<_>) = tenants
+        .iter()
+        .copied()
+        .partition(|&(_, iv)| !ivs.iter().all(|&own| ipa_disjoint(&[(0, iv)], own)));
+    if group.is_empty() {
+        return true;
+    }
+    let target = fill.reloc_pool.iter().copied().find(|&q| {
+        q.0 != p.0
+            && occ.get(&q.0).is_some_and(|o| {
+                o.as_deref().is_some_and(|qt| {
+                    group
+                        .iter()
+                        .all(|&(v, iv)| (fill.reloc_ok)(v, q) && ipa_disjoint(qt, iv))
+                })
+            })
+    });
+    let Some(q) = target else {
+        return false;
+    };
+    if fill.trace {
+        eprintln!("[RA-IPA] displace {:?} from r{} to r{}", group, p.0, q.0);
+    }
+    for &(v, _) in &group {
+        assignments.insert(v, q);
+    }
+    if let Some(Some(qt)) = occ.get_mut(&q.0) {
+        qt.extend_from_slice(&group);
+    }
+    occ.insert(p.0, Some(rest));
+    true
+}
+
+/// IPA-RA fill (x86-64 `ipa_ra`), run once after every allocation phase and
+/// the overlap repair, so it never competes with them for registers.
+///
+/// 1. Homing: each slotted call-spanning `candidate` (loop-weighted `cost`
+///    descending, ties by id) takes the first IPA register that is free over
+///    its FAT interval, else the first one that can be freed by displacing
+///    its overlapping tenants to another caller-saved register
+///    ([`ipa_make_room`]). Every displaced tenant keeps a register, so no
+///    value loses its home. Overlap is INCLUSIVE, as in the overlap verifier.
+///    A placement is refused where it would leave fewer than
+///    [`IPA_MIN_FREE_SCRATCH`] caller-saved registers free at any point it
+///    covers (the emitter's scratch supply).
+/// 2. Renaming: each callee-saved register R (last-first) moves ALL its
+///    holders to the first IPA register that is, or can be made, free over
+///    all of them. A whole-register rename keeps every same-register relation
+///    (coalesce webs, phi classes) by construction and drops R's push/pop
+///    pair. R stays put if a holder is `rename_blocked` or has no interval.
+///
+/// Returns the IPA registers that received a call-spanning tenant.
+fn ipa_fill_preserved_regs(
+    assignments: &mut FxHashMap<u32, PhysReg>,
+    candidates: &[u32],
+    fill: &IpaFill<'_>,
+) -> Vec<PhysReg> {
+    if fill.ipa_regs.is_empty() {
+        return Vec::new();
+    }
+    let mut occ: IpaOcc = FxHashMap::default();
+    for r in fill.ipa_regs.iter().chain(fill.reloc_pool) {
+        occ.insert(r.0, Some(Vec::new()));
+    }
+    let mut sorted: Vec<(u32, PhysReg)> = assignments.iter().map(|(&v, &r)| (v, r)).collect();
+    sorted.sort_unstable_by_key(|&(v, _)| v);
+    for (v, reg) in sorted {
+        if let Some(slot) = occ.get_mut(&reg.0) {
+            match (fill.iv_map.get(&v), slot.as_mut()) {
+                (Some(&iv), Some(list)) => list.push((v, iv)),
+                _ => *slot = None,
+            }
+        }
+    }
+    // Free caller-saved registers per program point (inclusive intervals; a
+    // register whose occupancy is unknown counts as busy everywhere). A
+    // placement of tenants T lowers this by exactly one on T's points and
+    // nowhere else: a fresh home turns a free point busy, and a displaced
+    // group trades `p` for an equally free `q` except where T now holds `p`.
+    let horizon = fill
+        .iv_map
+        .values()
+        .map(|&(_, e)| e as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut free_at: Vec<u32> = vec![0; horizon];
+    for r in fill.reloc_pool {
+        let Some(Some(tenants)) = occ.get(&r.0) else {
+            continue;
+        };
+        let mut busy = vec![false; horizon];
+        for &(_, (s, e)) in tenants {
+            for b in busy.iter_mut().take(e as usize + 1).skip(s as usize) {
+                *b = true;
+            }
+        }
+        for (f, b) in free_at.iter_mut().zip(&busy) {
+            *f += u32::from(!*b);
+        }
+    }
+    for &(s, e) in fill.scratch_demand {
+        for f in free_at.iter_mut().take(e as usize + 1).skip(s as usize) {
+            *f = f.saturating_sub(1);
+        }
+    }
+    let mut used: Vec<PhysReg> = Vec::new();
+    let mut ranked: Vec<(u64, u32, (u32, u32))> = candidates
+        .iter()
+        .filter(|v| !assignments.contains_key(v))
+        .filter_map(|&v| fill.iv_map.get(&v).map(|&iv| ((fill.cost)(v), v, iv)))
+        .filter(|&(c, _, _)| c > 0)
+        .collect();
+    ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut place = |assignments: &mut FxHashMap<u32, PhysReg>,
+                     occ: &mut IpaOcc,
+                     tenants: &[(u32, (u32, u32))]|
+     -> Option<PhysReg> {
+        let ivs: Vec<(u32, u32)> = tenants.iter().map(|&(_, iv)| iv).collect();
+        let mut covered = vec![false; free_at.len()];
+        for &(s, e) in &ivs {
+            for c in covered.iter_mut().take(e as usize + 1).skip(s as usize) {
+                *c = true;
+            }
+        }
+        if covered
+            .iter()
+            .zip(free_at.iter())
+            .any(|(&c, &f)| c && f <= IPA_MIN_FREE_SCRATCH)
+        {
+            return None;
+        }
+        let free_now = fill.ipa_regs.iter().copied().find(|p| {
+            occ.get(&p.0).is_some_and(|o| {
+                o.as_deref()
+                    .is_some_and(|t| ivs.iter().all(|&iv| ipa_disjoint(t, iv)))
+            })
+        });
+        let p = match free_now {
+            Some(p) => p,
+            None => fill
+                .ipa_regs
+                .iter()
+                .copied()
+                .find(|&p| ipa_make_room(assignments, occ, fill, p, &ivs))?,
+        };
+        if fill.trace {
+            eprintln!("[RA-IPA] home {:?} in r{}", tenants, p.0);
+        }
+        for (f, &c) in free_at.iter_mut().zip(&covered) {
+            *f -= u32::from(c);
+        }
+        for &(v, _) in tenants {
+            assignments.insert(v, p);
+        }
+        if let Some(Some(list)) = occ.get_mut(&p.0) {
+            list.extend_from_slice(tenants);
+        }
+        if !used.contains(&p) {
+            used.push(p);
+        }
+        Some(p)
+    };
+    for (_, v, iv) in ranked {
+        place(assignments, &mut occ, &[(v, iv)]);
+    }
+    for &r in fill.callee_pool.iter().rev() {
+        if fill.ipa_regs.iter().any(|x| x.0 == r.0) {
+            continue;
+        }
+        let mut holders: Vec<u32> = assignments
+            .iter()
+            .filter(|&(_, reg)| reg.0 == r.0)
+            .map(|(&v, _)| v)
+            .collect();
+        if holders.is_empty() || holders.iter().any(|&v| (fill.rename_blocked)(v)) {
+            continue;
+        }
+        holders.sort_unstable();
+        let Some(tenants) = holders
+            .iter()
+            .map(|&v| fill.iv_map.get(&v).map(|&iv| (v, iv)))
+            .collect::<Option<Vec<(u32, (u32, u32))>>>()
+        else {
+            continue;
+        };
+        place(assignments, &mut occ, &tenants);
+    }
+    used
 }
 
 /// Derive the COLD-CALL XMM SPLIT save set from the FINAL assignments: an
@@ -4101,6 +4363,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         || (config.available_regs.is_empty() && config.caller_saved_regs.is_empty())
     {
         return RegAllocResult {
+            ipa_used: Vec::new(),
             eligible: FxHashSet::default(),
             fold_deferred: FxHashMap::default(),
             assignments: FxHashMap::default(),
@@ -6217,11 +6480,36 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         }
     }
 
+    // Secondary latch copies of an already-represented phi dest (the if/else
+    // latch `x = f(old); if (rare) x' = g(x); old = x | x'`: one copy per
+    // arm).  Only the primary source was made home-less above, so the
+    // sieve-class hazard (every source competing for one register, losers
+    // spilling) cannot recur: a secondary keeps the home Phase 2 gave it and
+    // the apply phase moves it onto the dest's register only when no foreign
+    // holder conflicts, deleting that arm's copy.  Primaries go first so the
+    // home-less sources always get their register.  Proofs are per pair and
+    // web-aware (`source_home_survives_dest_redefs_in` dirties the home at a
+    // sibling source's definition), so the arms' sources may share it.
+    let phi_apply: Vec<PhiCoalesceCandidate> = if config.ra_config.no_phi_coalesce {
+        Vec::new()
+    } else {
+        // Set membership keeps this linear in the pair count (a
+        // `Vec::contains` filter was quadratic on large functions).
+        let primary: FxHashSet<PhiCoalesceCandidate> = phi_coalesce.iter().copied().collect();
+        let mut list = phi_coalesce.clone();
+        list.extend(
+            all_phi_pairs
+                .iter()
+                .filter(|c| !primary.contains(c))
+                .copied(),
+        );
+        list
+    };
     let mut applied_phi_coalesce = apply_phi_coalesce_assignments_with_config(
         func,
         &liveness,
         &iv_map,
-        &phi_coalesce,
+        &phi_apply,
         &mut assignments,
         &config.available_regs,
         Some((&coalesce_member_of, &config.caller_saved_regs)),
@@ -6821,6 +7109,99 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         );
     }
 
+    // IPA-RA fill (x86-64 `ipa_ra`): after every phase and the repair (homes
+    // are final), before the overlap verifier, which therefore audits it too.
+    // Running last means it never competes with Phase 2: a first version ran
+    // before Phase 2 and seeded its waves, and on hot_web_loop the cold
+    // values it homed over [5,60] took %r8/%r9 from the loop temporaries,
+    // costing a hot-path copy (+3.3% Ir) to save cold-path loads. Here a
+    // tenant is only ever displaced into another free caller-saved register
+    // it is allowed in (Phase 2's per-wave pool rules, fold-base registers
+    // for deferred-fold bases), never to memory.
+    let mut ipa_used: Vec<PhysReg> = Vec::new();
+    if !config.ipa_regs.is_empty() {
+        let restricted = |v: u32| !ordered_param_homes && param_restricted.contains(&v);
+        let mut fixed: FxHashSet<u32> = FxHashSet::default();
+        for (&m, &l) in coalesce_member_of.iter().chain(fp_web_member_of.iter()) {
+            fixed.insert(m);
+            fixed.insert(l);
+        }
+        for (&leader, members) in &coalesce_groups {
+            fixed.insert(leader);
+            fixed.extend(members.iter().copied());
+        }
+        for pair in &applied_phi_coalesce {
+            fixed.insert(pair.phi_dest);
+            fixed.insert(pair.backedge_src);
+        }
+        for inst in func.blocks.iter().flat_map(|b| b.instructions.iter()) {
+            if let Instruction::Phi { dest, incoming, .. } = inst {
+                fixed.insert(dest.0);
+                for (op, _) in incoming {
+                    if let Operand::Value(v) = op {
+                        fixed.insert(v.0);
+                    }
+                }
+            }
+        }
+        let candidates: Vec<u32> = {
+            let mut c: Vec<u32> = call_spanning
+                .iter()
+                .copied()
+                .filter(|v| {
+                    eligible.contains(v)
+                        && !non_gpr_values.contains(v)
+                        && !fixed.contains(v)
+                        && !restricted(*v)
+                        && !assignments.contains_key(v)
+                })
+                .collect();
+            c.sort_unstable();
+            c
+        };
+        let scratch_demand: Vec<(u32, u32)> = {
+            let mut d: Vec<(u32, u32)> = iv_map
+                .iter()
+                .filter(|(v, _)| {
+                    eligible.contains(v)
+                        && !assignments.contains_key(v)
+                        && !call_spanning.contains(v)
+                        && !non_gpr_values.contains(v)
+                })
+                .map(|(_, &iv)| iv)
+                .collect();
+            d.sort_unstable();
+            d
+        };
+        let reloc_ok = |v: u32, r: PhysReg| {
+            !fixed.contains(&v)
+                && !call_spanning.contains(&v)
+                && !restricted(v)
+                && !non_gpr_values.contains(&v)
+                && !(later_arg_values.contains(&v) && config.call_arg_regs.contains(&r))
+                && !(indirect_arg_values.contains(&v) && config.indirect_target_regs.contains(&r))
+                && (!fold_use_transfer.contains_key(&v) || config.fold_base_regs.contains(&r))
+        };
+        ipa_used = ipa_fill_preserved_regs(
+            &mut assignments,
+            &candidates,
+            &IpaFill {
+                ipa_regs: &config.ipa_regs,
+                callee_pool: &config.available_regs,
+                reloc_pool: &config.caller_saved_regs,
+                iv_map: &iv_map,
+                cost: &|v| use_count.get(&v).copied().unwrap_or(0),
+                reloc_ok: &reloc_ok,
+                rename_blocked: &restricted,
+                scratch_demand: &scratch_demand,
+                trace: config.ra_config.debug_ra,
+            },
+        );
+        if config.ra_config.debug_ra && !ipa_used.is_empty() {
+            eprintln!("[RA-IPA] fn={} used {:?}", func.name, ipa_used);
+        }
+    }
+
     if config.ra_config.verify_regalloc {
         verify_no_overlap(
             &liveness,
@@ -7070,6 +7451,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
         eprintln!("[RA-HOMES] fn={} {}", func.name, homes.join(" "));
     }
     RegAllocResult {
+        ipa_used,
         eligible,
         assignments,
         accumulator_assignments,
@@ -11149,7 +11531,7 @@ fn exclude_every_third_mul_temp(func: &IrFunction, eligible: &mut FxHashSet<u32>
 /// predecessor of `block_idx`, the window is `(source_def_idx..end_of_pred) +
 /// (start_of_block..copy_idx)`.  This covers branch-separated latch copies from
 /// Backedge PRE without allowing arbitrary cross-block destructive updates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct PhiCoalesceCandidate {
     pub(crate) phi_dest: u32,
     pub(crate) backedge_src: u32,
@@ -11214,6 +11596,17 @@ fn uses_excluding(func: &IrFunction, value: u32, excl_block: usize, excl_idx: us
     n
 }
 
+/// True iff `term` reads `value` as an operand.
+fn terminator_reads_value(term: &Terminator, value: u32) -> bool {
+    let mut used = false;
+    for_each_operand_in_terminator(term, |op| {
+        if matches!(op, Operand::Value(v) if v.0 == value) {
+            used = true;
+        }
+    });
+    used
+}
+
 /// True iff every path from `source_block` (which defines `src` right before
 /// the phi copy of `dest` in `copy_block`) to `use_block` passes through no
 /// block that re-defines `dest`.  The eliminated copy's own block is exempt:
@@ -11236,6 +11629,7 @@ fn src_use_path_clear_of_dest_redefs(
     source_block: usize,
     copy_block: usize,
     dest: u32,
+    src: u32,
 ) -> bool {
     let mut redef_blocks: FxHashSet<usize> = FxHashSet::default();
     for (i, b) in func.blocks.iter().enumerate() {
@@ -11252,11 +11646,29 @@ fn src_use_path_clear_of_dest_redefs(
     if redef_blocks.is_empty() {
         return true;
     }
-    // If the use itself sits in a block that re-defines `dest`, the redef
-    // may precede the use; without instruction-order inspection that is a
-    // hazard.
+    // A use block that itself re-defines `dest` is safe only when every
+    // read of `src` there (instructions and terminator) precedes the block's
+    // first re-definition: a path entering it clean then reads the intact
+    // home, and the DFS below treats the block as dirtying on exit.  This
+    // is the if/else latch shape `x = f(old); if (rare) x' = g(x); old = x`
+    // where the rare arm reads the fresh value before its own phi copy.
+    // Hidden folded reads are proven by `source_home_survives_dest_redefs_in`.
     if redef_blocks.contains(&use_block) {
-        return false;
+        let block = &func.blocks[use_block];
+        let Some(first_redef) = block
+            .instructions
+            .iter()
+            .position(|inst| inst.dest().is_some_and(|d| d.0 == dest))
+        else {
+            return false;
+        };
+        if block.instructions[first_redef..]
+            .iter()
+            .any(|inst| uses_value(inst, src))
+            || terminator_reads_value(&block.terminator, src)
+        {
+            return false;
+        }
     }
     // Two-state reachability from the source definition.  `dirty` means the
     // path crossed a re-definition of the phi since the last execution of
@@ -11399,6 +11811,22 @@ fn const_address_link_bases(func: &IrFunction) -> FxHashMap<u32, u32> {
 ///
 /// Roots compare with [`web_find`].
 fn coalesce_web_parent(func: &IrFunction) -> FxHashMap<u32, u32> {
+    web_parent_with(func, true)
+}
+
+/// The components of [`coalesce_web_parent`] without its int-`Cast` edges:
+/// exactly the values the phi apply phase may place in one home WITHOUT its
+/// segment home-conflict test (applied pairs and their chains form its
+/// same-home class).  A cast-coalesced co-resident is an ordinary holder in
+/// `assignments`, which that test rejects whenever its segment starts while
+/// the source is still live — so only pair-linked values need the dirty
+/// tracking of [`source_home_survives_dest_redefs_in`], and vetoing on a
+/// cast (`v19 = trunc v17; v40 = v17` in gzip_crc32) cost a coalescing.
+fn phi_pair_web_parent(func: &IrFunction) -> FxHashMap<u32, u32> {
+    web_parent_with(func, false)
+}
+
+fn web_parent_with(func: &IrFunction, casts: bool) -> FxHashMap<u32, u32> {
     let mut def_count: FxHashMap<u32, u32> = FxHashMap::default();
     let mut copy_dests: FxHashSet<u32> = FxHashSet::default();
     let mut phi_dests: FxHashSet<u32> = FxHashSet::default();
@@ -11512,7 +11940,7 @@ fn coalesce_web_parent(func: &IrFunction) -> FxHashMap<u32, u32> {
                     from_ty,
                     to_ty,
                 } => {
-                    if int_class(from_ty) && int_class(to_ty) {
+                    if casts && int_class(from_ty) && int_class(to_ty) {
                         union_sets(&mut parent, dest.0, s.0);
                     }
                 }
@@ -11715,6 +12143,8 @@ fn homeless_merge_profitable(segments: &[LiveInterval], dest: u32, src: u32) -> 
 struct SourceHomeFacts<'f> {
     fold_base_of: FxHashMap<u32, u32>,
     web_parent: FxHashMap<u32, u32>,
+    /// [`phi_pair_web_parent`]: the dirty-tracking components.
+    pair_parent: FxHashMap<u32, u32>,
     def_of: FxHashMap<u32, &'f Instruction>,
     def_count: FxHashMap<u32, u32>,
 }
@@ -11734,6 +12164,7 @@ impl<'f> SourceHomeFacts<'f> {
         Self {
             fold_base_of: const_address_link_bases(func),
             web_parent: coalesce_web_parent(func),
+            pair_parent: phi_pair_web_parent(func),
             def_of,
             def_count,
         }
@@ -11816,6 +12247,7 @@ fn source_home_survives_dest_redefs_in(
     // Potential-sharing components + def maps for the disjoint-web hidden-read
     // exemption below come from the caller's shared `SourceHomeFacts`.
     let src_web = web_find(&mut facts.web_parent, src);
+    let dest_pair_web = web_find(&mut facts.pair_parent, dest);
     let mut work = vec![(
         candidate.source_block_idx,
         candidate.source_def_idx.saturating_add(1),
@@ -11878,6 +12310,13 @@ fn source_home_survives_dest_redefs_in(
                 if !selected {
                     dirty = true;
                 }
+            } else if web_find(&mut facts.pair_parent, defined.0) == dest_pair_web {
+                // Another pair-linked value (a sibling latch source coalesced
+                // into the same home: `x' = g(x)` before its own copy
+                // `old = x'`) writes the home at ITS definition, not at the
+                // eliminated copy, and the apply phase exempts it from the
+                // home-conflict test; every potential sibling dirties.
+                dirty = true;
             }
         }
         let Ok(terminator_offset) = u32::try_from(block.instructions.len()) else {
@@ -13110,6 +13549,7 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
                             source_block,
                             block_idx,
                             dest.0,
+                            src.0,
                         )
                 })
             });
@@ -13199,7 +13639,7 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
             {
                 if debug {
                     eprintln!(
-                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}) block={} source_block={} used_in_window={} derived_in_window={} live_in_window={} cross_block={} src_before_copy={}",
+                        "[PHI_COALESCE] BLOCKED phi_dest=Value({}) src=Value({}) block={} source_block={} used_in_window={} derived_in_window={} live_in_window={} src_used_elsewhere={} src_home_killed={} src_before_copy={}",
                         dest.0,
                         src.0,
                         block_idx,
@@ -13208,6 +13648,7 @@ pub(crate) fn detect_phi_coalesce_groups_with_config(
                         phi_derived_used_in_window,
                         phi_live_in_window,
                         source_used_elsewhere,
+                        source_home_killed,
                         source_used_before_copy
                     );
                 }
@@ -13372,6 +13813,12 @@ mod ra_config_tests {
         switch!(no_hot_loop, "CCC_NO_HOT_LOOP");
         switch!(leaf_strict_call_free, "CCC_LEAF_STRICT_CALL_FREE");
         switch!(no_leaf_caller_home, "CCC_NO_LEAF_CALLER_HOME");
+        // IPA-RA rides the shared exact-token pass list, not its own knob.
+        assert!(!from(&[]).no_ipa_ra);
+        assert!(from(&[("CCC_DISABLE_PASSES", "ipa_ra")]).no_ipa_ra);
+        assert!(from(&[("CCC_DISABLE_PASSES", "gvn, ipa_ra")]).no_ipa_ra);
+        assert!(from(&[("CCC_DISABLE_PASSES", "all")]).no_ipa_ra);
+        assert!(!from(&[("CCC_DISABLE_PASSES", "ipa_ra_x,gvn")]).no_ipa_ra);
         switch!(no_span_valve, "CCC_NO_SPAN_VALVE");
         switch!(no_web_inloop_use, "CCC_NO_WEB_INLOOP_USE");
         switch!(no_recurrence_floor, "CCC_RA_NO_RECURRENCE_FLOOR");
@@ -15340,6 +15787,7 @@ mod phi_coalesce_tests {
         let mut folded = FxHashMap::default();
         folded.insert(1u32, vec![4u32]);
         let config = RegAllocConfig {
+            ipa_regs: Vec::new(),
             available_regs: vec![PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5)],
             accumulator_policy: AccumulatorPolicy {
                 operand_order: AccumulatorOperandOrder::LhsFirst,
@@ -16149,6 +16597,7 @@ mod allocation_kernel_tests {
         ];
         func.next_value_id = 12;
         let config = RegAllocConfig {
+            ipa_regs: Vec::new(),
             available_regs: vec![PhysReg(1), PhysReg(2), PhysReg(3), PhysReg(4), PhysReg(5)],
             accumulator_policy: AccumulatorPolicy {
                 operand_order: AccumulatorOperandOrder::LhsFirst,
@@ -16692,6 +17141,210 @@ mod allocation_kernel_tests {
             copy_idx: 0,
         };
         assert!(!source_home_survives_dest_redefs(
+            &func, &liveness, &succs, &cand
+        ));
+    }
+
+    fn add(dest: u32, lhs: u32, k: i64) -> Instruction {
+        Instruction::BinOp {
+            dest: Value(dest),
+            op: IrBinOp::Add,
+            lhs: Operand::Value(Value(lhs)),
+            rhs: Operand::Const(IrConst::I64(k)),
+            ty: IrType::I64,
+        }
+    }
+
+    fn copy(dest: u32, src: u32) -> Instruction {
+        Instruction::Copy {
+            dest: Value(dest),
+            src: Operand::Value(Value(src)),
+        }
+    }
+
+    fn store(val: u32, ptr: u32, ty: IrType) -> Instruction {
+        Instruction::Store {
+            val: Operand::Value(Value(val)),
+            ptr: Value(ptr),
+            ty,
+            seg_override: Default::default(),
+            volatile: false,
+        }
+    }
+
+    /// The if/else latch of hot_web_loop: `x = old + 1; if (c) { x' = x + 5;
+    /// use(x + 7); old = x' } else old = x`.  `rare_tail` is the rare arm
+    /// (block 3) after its sibling definition `v3 = v2 + 5`.
+    fn if_else_latch(rare_tail: Vec<Instruction>) -> IrFunction {
+        let mut func = IrFunction::new("latch".to_string(), IrType::I64, vec![], false);
+        let mut rare = vec![add(3, 2, 5)];
+        rare.extend(rare_tail);
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Const(IrConst::I64(0)),
+                    },
+                    Instruction::GlobalAddr {
+                        dest: Value(9),
+                        name: "g".to_string(),
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![add(2, 1, 1)],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(2)),
+                    true_label: BlockId(2),
+                    false_label: BlockId(3),
+                },
+            ),
+            block(2, vec![copy(1, 2)], Terminator::Branch(BlockId(4))),
+            block(3, rare, Terminator::Branch(BlockId(4))),
+            block(
+                4,
+                Vec::new(),
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(5),
+                },
+            ),
+            block(
+                5,
+                Vec::new(),
+                Terminator::Return(Some(Operand::Value(Value(1)))),
+            ),
+        ];
+        func.next_value_id = 10;
+        func
+    }
+
+    const COMMON_ARM: PhiCoalesceCandidate = PhiCoalesceCandidate {
+        phi_dest: 1,
+        backedge_src: 2,
+        block_idx: 2,
+        source_block_idx: 1,
+        source_def_idx: 0,
+        copy_idx: 0,
+    };
+
+    /// A sibling source coalesced into the same home writes it at its OWN
+    /// definition: a read of the common-arm source after that point (but
+    /// before the rare arm's copy) would see `x + 5`, not `x`.  Only
+    /// dest redefinitions used to dirty the walk, so this was accepted.
+    #[test]
+    fn source_home_rejects_a_read_after_a_sibling_source_definition() {
+        let func = if_else_latch(vec![add(4, 2, 7), store(4, 9, IrType::I64), copy(1, 3)]);
+        let liveness = compute_live_intervals(&func);
+        let (_preds, succs) = analysis::build_cfg(&func, &analysis::build_label_map(&func));
+        assert!(!source_home_survives_dest_redefs(
+            &func,
+            &liveness,
+            &succs,
+            &COMMON_ARM
+        ));
+        // Reading the source BEFORE the sibling definition is clean.
+        let mut ok = if_else_latch(vec![copy(1, 3)]);
+        ok.blocks[3].instructions.insert(0, add(4, 2, 7));
+        ok.blocks[3]
+            .instructions
+            .insert(1, store(4, 9, IrType::I64));
+        let liveness = compute_live_intervals(&ok);
+        let (_preds, succs) = analysis::build_cfg(&ok, &analysis::build_label_map(&ok));
+        assert!(source_home_survives_dest_redefs(
+            &ok,
+            &liveness,
+            &succs,
+            &COMMON_ARM
+        ));
+    }
+
+    /// The block-level use-path test reads instruction order inside a use
+    /// block that redefines the dest: reads before its first redefinition
+    /// are clean, reads after it (or in its terminator) are not.
+    #[test]
+    fn use_path_respects_instruction_order_in_a_redefining_use_block() {
+        let func = if_else_latch(vec![copy(1, 3)]); // rare arm reads v2 first
+        let (_preds, succs) = analysis::build_cfg(&func, &analysis::build_label_map(&func));
+        assert!(src_use_path_clear_of_dest_redefs(
+            &func, &succs, 3, 1, 2, 1, 2
+        ));
+        let late = if_else_latch(vec![copy(1, 3), add(4, 2, 7), store(4, 9, IrType::I64)]);
+        let (_preds, succs) = analysis::build_cfg(&late, &analysis::build_label_map(&late));
+        assert!(!src_use_path_clear_of_dest_redefs(
+            &late, &succs, 3, 1, 2, 1, 2
+        ));
+        let mut term = if_else_latch(vec![copy(1, 3)]);
+        term.blocks[3].terminator = Terminator::Return(Some(Operand::Value(Value(2))));
+        let (_preds, succs) = analysis::build_cfg(&term, &analysis::build_label_map(&term));
+        assert!(!src_use_path_clear_of_dest_redefs(
+            &term, &succs, 3, 1, 2, 1, 2
+        ));
+    }
+
+    /// gzip_crc32: a cast of the source (`v3 = trunc v2`) is an ordinary
+    /// holder for the apply phase's home-conflict test, not a pair sibling:
+    /// its definition must not dirty the walk and veto the coalescing.
+    #[test]
+    fn source_home_ignores_a_cast_of_the_source() {
+        let mut func = IrFunction::new("cast".to_string(), IrType::I64, vec![], false);
+        func.blocks = vec![
+            block(
+                0,
+                vec![
+                    Instruction::Copy {
+                        dest: Value(1),
+                        src: Operand::Const(IrConst::I64(0)),
+                    },
+                    Instruction::GlobalAddr {
+                        dest: Value(9),
+                        name: "g".to_string(),
+                    },
+                ],
+                Terminator::Branch(BlockId(1)),
+            ),
+            block(
+                1,
+                vec![
+                    add(2, 1, 1),
+                    Instruction::Cast {
+                        dest: Value(3),
+                        src: Operand::Value(Value(2)),
+                        from_ty: IrType::I64,
+                        to_ty: IrType::U8,
+                    },
+                    store(3, 9, IrType::U8),
+                    copy(1, 2),
+                ],
+                Terminator::CondBranch {
+                    cond: Operand::Value(Value(1)),
+                    true_label: BlockId(1),
+                    false_label: BlockId(2),
+                },
+            ),
+            block(
+                2,
+                Vec::new(),
+                Terminator::Return(Some(Operand::Value(Value(1)))),
+            ),
+        ];
+        func.next_value_id = 10;
+        let liveness = compute_live_intervals(&func);
+        let (_preds, succs) = analysis::build_cfg(&func, &analysis::build_label_map(&func));
+        let cand = PhiCoalesceCandidate {
+            phi_dest: 1,
+            backedge_src: 2,
+            block_idx: 1,
+            source_block_idx: 1,
+            source_def_idx: 0,
+            copy_idx: 3,
+        };
+        assert!(source_home_survives_dest_redefs(
             &func, &liveness, &succs, &cand
         ));
     }
@@ -18167,6 +18820,7 @@ mod call_sequence_policy_tests {
 
     fn config(caller_saved_regs: Vec<PhysReg>) -> RegAllocConfig {
         RegAllocConfig {
+            ipa_regs: Vec::new(),
             available_regs: vec![PhysReg(1), PhysReg(2), PhysReg(3)],
             accumulator_policy: AccumulatorPolicy {
                 operand_order: AccumulatorOperandOrder::LhsFirst,
@@ -18344,6 +18998,7 @@ mod fold_defer_tests {
 
     fn config(fold_base_regs: Vec<PhysReg>) -> RegAllocConfig {
         RegAllocConfig {
+            ipa_regs: Vec::new(),
             available_regs: vec![PhysReg(1), PhysReg(2), PhysReg(3)],
             accumulator_policy: AccumulatorPolicy {
                 operand_order: AccumulatorOperandOrder::LhsFirst,
@@ -18538,5 +19193,220 @@ mod wide_hazard_tests {
             "integer casts 3 and 6 stage through rax:rdx only; the F64 cast \
              is a libcall; the I128 cmp's fusion window runs to the terminator"
         );
+    }
+}
+
+#[cfg(test)]
+mod ipa_fill_tests {
+    use super::*;
+
+    const R8: PhysReg = PhysReg(12);
+    const R9: PhysReg = PhysReg(13);
+    const R11: PhysReg = PhysReg(10);
+    const R10: PhysReg = PhysReg(11);
+    const RBX: PhysReg = PhysReg(1);
+    const R12: PhysReg = PhysReg(2);
+
+    /// Values >= 100 are displaceable Phase-2 tenants; below are call-spanning.
+    fn tenant_ok(v: u32, _: PhysReg) -> bool {
+        v >= 100
+    }
+
+    struct Case {
+        assignments: FxHashMap<u32, PhysReg>,
+        iv: FxHashMap<u32, (u32, u32)>,
+        cost: FxHashMap<u32, u64>,
+    }
+
+    impl Case {
+        fn new(vals: &[(u32, (u32, u32), u64, Option<PhysReg>)]) -> Self {
+            let mut c = Case {
+                assignments: FxHashMap::default(),
+                iv: FxHashMap::default(),
+                cost: FxHashMap::default(),
+            };
+            for &(v, iv, cost, home) in vals {
+                c.iv.insert(v, iv);
+                c.cost.insert(v, cost);
+                if let Some(r) = home {
+                    c.assignments.insert(v, r);
+                }
+            }
+            c
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn run(
+            &mut self,
+            candidates: &[u32],
+            ipa: &[PhysReg],
+            callee: &[PhysReg],
+            reloc: &[PhysReg],
+            reloc_ok: &dyn Fn(u32, PhysReg) -> bool,
+            blocked: &dyn Fn(u32) -> bool,
+            demand: &[(u32, u32)],
+        ) -> Vec<PhysReg> {
+            let cost = self.cost.clone();
+            let iv = self.iv.clone();
+            ipa_fill_preserved_regs(
+                &mut self.assignments,
+                candidates,
+                &IpaFill {
+                    ipa_regs: ipa,
+                    callee_pool: callee,
+                    reloc_pool: reloc,
+                    iv_map: &iv,
+                    cost: &|v| cost.get(&v).copied().unwrap_or(0),
+                    reloc_ok,
+                    rename_blocked: blocked,
+                    scratch_demand: demand,
+                    trace: false,
+                },
+            )
+        }
+    }
+
+    const POOL: &[PhysReg] = &[R11, R10, R8, R9];
+
+    #[test]
+    fn homes_the_costliest_candidate_first() {
+        // v1 and v2 overlap; one IPA register: the costlier v2 wins it.
+        let mut c = Case::new(&[(1, (0, 10), 5, None), (2, (5, 15), 9, None)]);
+        let used = c.run(&[1, 2], &[R8], &[], POOL, &tenant_ok, &|_| false, &[]);
+        assert_eq!(used, vec![R8]);
+        assert_eq!(c.assignments.get(&2), Some(&R8));
+        assert_eq!(c.assignments.get(&1), None, "a home is never shared");
+    }
+
+    #[test]
+    fn zero_cost_and_intervalless_candidates_stay_slotted() {
+        let mut c = Case::new(&[(1, (0, 10), 0, None)]);
+        assert!(
+            c.run(&[1, 7], &[R8], &[], POOL, &tenant_ok, &|_| false, &[])
+                .is_empty()
+        );
+        assert!(c.assignments.is_empty());
+    }
+
+    #[test]
+    fn shared_endpoint_conflicts_and_displaces_the_tenant() {
+        // Tenant v100 [10,20] in r8; candidate v1 [20,30] touches it at 20:
+        // inclusive overlap, so v100 must move (to the first free, allowed
+        // relocation register) before v1 takes r8.
+        let mut c = Case::new(&[(100, (10, 20), 1, Some(R8)), (1, (20, 30), 4, None)]);
+        let used = c.run(&[1], &[R8], &[], POOL, &tenant_ok, &|_| false, &[]);
+        assert_eq!(used, vec![R8]);
+        assert_eq!(c.assignments.get(&1), Some(&R8));
+        assert_eq!(c.assignments.get(&100), Some(&R11));
+    }
+
+    #[test]
+    fn displacement_respects_the_tenant_register_rules() {
+        // v100 may not live in r11 (e.g. a fold base); r10 is the next one.
+        let ok = |v: u32, r: PhysReg| v >= 100 && r != R11;
+        let mut c = Case::new(&[(100, (10, 20), 1, Some(R8)), (1, (0, 30), 4, None)]);
+        c.run(&[1], &[R8], &[], POOL, &ok, &|_| false, &[]);
+        assert_eq!(c.assignments.get(&100), Some(&R10));
+        // A tenant that may not move at all pins its register.
+        let mut c = Case::new(&[(100, (10, 20), 1, Some(R8)), (1, (0, 30), 4, None)]);
+        let used = c.run(&[1], &[R8], &[], POOL, &|_, _| false, &|_| false, &[]);
+        assert!(used.is_empty());
+        assert_eq!(c.assignments.get(&100), Some(&R8));
+        assert_eq!(c.assignments.get(&1), None);
+    }
+
+    #[test]
+    fn displaced_group_moves_together_and_never_into_a_busy_register() {
+        // Tenants v100 [0,5] and v101 [5,9] share r8 (touching, as Phase 2's
+        // half-open spans allow); r11 is busy over [3,4], r10 is free.
+        let mut c = Case::new(&[
+            (100, (0, 5), 1, Some(R8)),
+            (101, (5, 9), 1, Some(R8)),
+            (102, (3, 4), 1, Some(R11)),
+            (1, (0, 9), 4, None),
+        ]);
+        c.run(&[1], &[R8], &[], POOL, &tenant_ok, &|_| false, &[]);
+        assert_eq!(c.assignments.get(&100), Some(&R10));
+        assert_eq!(c.assignments.get(&101), Some(&R10));
+        assert_eq!(c.assignments.get(&102), Some(&R11));
+        assert_eq!(c.assignments.get(&1), Some(&R8));
+    }
+
+    #[test]
+    fn renames_a_whole_callee_saved_register_unless_blocked() {
+        // rbx holds a two-value web; r12 holds a parameter (blocked).
+        let mut c = Case::new(&[
+            (10, (0, 4), 3, Some(RBX)),
+            (11, (6, 9), 3, Some(RBX)),
+            (12, (0, 9), 3, Some(R12)),
+        ]);
+        let used = c.run(
+            &[],
+            &[R8, R9],
+            &[RBX, R12],
+            POOL,
+            &tenant_ok,
+            &|v| v == 12,
+            &[],
+        );
+        assert_eq!(used, vec![R8]);
+        assert_eq!(c.assignments.get(&10), Some(&R8));
+        assert_eq!(c.assignments.get(&11), Some(&R8));
+        assert_eq!(c.assignments.get(&12), Some(&R12));
+    }
+
+    #[test]
+    fn keeps_one_caller_saved_register_free_for_emitter_scratch() {
+        // Pool r11/r8 only; r11 busy over the candidate's whole range: taking
+        // r8 would leave no free caller-saved register there.
+        let pool = &[R11, R8];
+        let mut c = Case::new(&[(100, (0, 30), 1, Some(R11)), (1, (0, 30), 9, None)]);
+        assert!(
+            c.run(&[1], &[R8], &[], pool, &tenant_ok, &|_| false, &[])
+                .is_empty()
+        );
+        // One more free register in the pool: admitted.
+        let mut c = Case::new(&[(100, (0, 30), 1, Some(R11)), (1, (0, 30), 9, None)]);
+        assert_eq!(
+            c.run(
+                &[1],
+                &[R8],
+                &[],
+                &[R11, R10, R8],
+                &tenant_ok,
+                &|_| false,
+                &[]
+            ),
+            vec![R8]
+        );
+        // ... unless a homeless window value already claims it over [12,14].
+        let mut c = Case::new(&[(100, (0, 30), 1, Some(R11)), (1, (0, 30), 9, None)]);
+        let pool = &[R11, R10, R8];
+        assert!(
+            c.run(&[1], &[R8], &[], pool, &tenant_ok, &|_| false, &[(12, 14)])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_unknown_tenant_interval_freezes_its_register() {
+        let mut c = Case::new(&[(1, (0, 9), 9, None)]);
+        c.assignments.insert(100, R8); // no interval: occupancy unknown
+        assert!(
+            c.run(&[1], &[R8], &[], POOL, &tenant_ok, &|_| false, &[])
+                .is_empty()
+        );
+        assert_eq!(c.assignments.get(&100), Some(&R8));
+    }
+
+    #[test]
+    fn untouched_without_ipa_registers() {
+        let mut c = Case::new(&[(1, (0, 9), 9, None), (10, (0, 4), 3, Some(RBX))]);
+        assert!(
+            c.run(&[1], &[], &[RBX], POOL, &tenant_ok, &|_| false, &[])
+                .is_empty()
+        );
+        assert_eq!(c.assignments.len(), 1);
+        assert_eq!(c.assignments.get(&10), Some(&RBX));
     }
 }

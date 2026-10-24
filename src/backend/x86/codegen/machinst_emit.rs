@@ -1200,6 +1200,7 @@ pub fn emit_machinst_with_tune(
             target,
             ret,
             gp_arg_count,
+            ipa_keep,
         } => {
             // Phase 1: caller-save spills (Phase 2b of the mature path,
             // typed). Same slot addressing as every other MachOperand —
@@ -1257,6 +1258,9 @@ pub fn emit_machinst_with_tune(
             if let Some(n) = gp_arg_count {
                 out.emit_fmt(format_args!("    # LCCC_CALL_ARGS {}", (*n).min(6)));
                 out.emit("    # LCCC_CALL_FP 0");
+            }
+            if *ipa_keep != 0 {
+                out.emit_fmt(format_args!("    # LCCC_IPA_KEEP {:#06x}", ipa_keep));
             }
             // Phase 4: return home.
             if let Some(r) = ret {

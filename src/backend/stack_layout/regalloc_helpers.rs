@@ -147,6 +147,17 @@ fn collect_abi_reg_hints(
     hints
 }
 
+/// Result tuple of [`run_regalloc_and_merge_clobbers_ex`]: final homes, the
+/// liveness the allocator computed, caller-save spans, accumulator
+/// assignments and the allocation-eligible value set.
+pub type RegallocMergeResult = (
+    FxHashMap<u32, PhysReg>,
+    Option<super::super::liveness::LivenessResult>,
+    FxHashMap<u8, Vec<(u32, u32)>>,
+    Vec<super::super::regalloc::AccumulatorAssignment>,
+    FxHashSet<u32>,
+);
+
 #[expect(clippy::too_many_arguments)]
 pub fn run_regalloc_and_merge_clobbers_ex(
     func: &IrFunction,
@@ -163,13 +174,50 @@ pub fn run_regalloc_and_merge_clobbers_ex(
     fold_base_regs: Vec<PhysReg>,
     ra_config: &Arc<RaConfig>,
     phi_chain_out: &mut FxHashMap<u32, u32>,
-) -> (
-    FxHashMap<u32, PhysReg>,
-    Option<super::super::liveness::LivenessResult>,
-    FxHashMap<u8, Vec<(u32, u32)>>,
-    Vec<super::super::regalloc::AccumulatorAssignment>,
-    FxHashSet<u32>,
-) {
+) -> RegallocMergeResult {
+    run_regalloc_and_merge_clobbers_ipa(
+        func,
+        available_regs,
+        caller_saved_regs,
+        asm_clobbered_regs,
+        reg_assignments,
+        used_callee_saved,
+        allow_inline_asm_regalloc,
+        never_materialized,
+        call_arg_regs,
+        indirect_target_regs,
+        folded_index_uses,
+        fold_base_regs,
+        ra_config,
+        phi_chain_out,
+        Vec::new(),
+        &mut Vec::new(),
+    )
+}
+
+/// [`run_regalloc_and_merge_clobbers_ex`] plus the x86-64 IPA-RA inputs:
+/// `ipa_regs` (caller-saved registers every call of `func` preserves, see
+/// `RegAllocConfig::ipa_regs`) and, on return, `ipa_used` (those the
+/// allocator homed values in).
+#[expect(clippy::too_many_arguments)]
+pub fn run_regalloc_and_merge_clobbers_ipa(
+    func: &IrFunction,
+    available_regs: Vec<PhysReg>,
+    caller_saved_regs: Vec<PhysReg>,
+    asm_clobbered_regs: &[PhysReg],
+    reg_assignments: &mut FxHashMap<u32, PhysReg>,
+    used_callee_saved: &mut Vec<PhysReg>,
+    allow_inline_asm_regalloc: bool,
+    never_materialized: Option<crate::common::fx_hash::FxHashSet<u32>>,
+    call_arg_regs: Vec<PhysReg>,
+    indirect_target_regs: Vec<PhysReg>,
+    folded_index_uses: crate::common::fx_hash::FxHashMap<u32, Vec<u32>>,
+    fold_base_regs: Vec<PhysReg>,
+    ra_config: &Arc<RaConfig>,
+    phi_chain_out: &mut FxHashMap<u32, u32>,
+    ipa_regs: Vec<PhysReg>,
+    ipa_used: &mut Vec<PhysReg>,
+) -> RegallocMergeResult {
     // `phi_chain_out` receives the allocator's blessed same-value classes
     // (see RegAllocResult::phi_chain); targets whose emitters are not
     // alias-aware pass an ignored scratch map and keep the pre-alias
@@ -448,6 +496,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         && indirect_target_regs.iter().any(|r| r.0 == 11)
         && caller_saved_regs.len() >= 4;
     let mut config = super::super::regalloc::RegAllocConfig {
+        ipa_regs,
         available_regs,
         accumulator_policy,
         caller_saved_regs,
@@ -476,6 +525,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
             .unwrap_or(false);
     let alloc_result = if no_regalloc {
         super::super::regalloc::RegAllocResult {
+            ipa_used: Vec::new(),
             assignments: Default::default(),
             accumulator_assignments:
                 super::super::regalloc::analyze_accumulator_assignments_with_config(
@@ -494,6 +544,7 @@ pub fn run_regalloc_and_merge_clobbers_ex(
         super::super::regalloc::allocate_registers_with_fold_rounds(func, &mut config)
     };
     *reg_assignments = alloc_result.assignments;
+    *ipa_used = alloc_result.ipa_used;
     *used_callee_saved = alloc_result.used_regs;
     let accumulator_assignments = alloc_result.accumulator_assignments;
     let caller_save_spans = alloc_result.caller_save_spans;

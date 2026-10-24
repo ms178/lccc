@@ -1,5 +1,11 @@
 # FOLLOWUP 2026-10-22 — IPA-RA callee-clobber refinement is the largest remaining runtime gap
 
+> **Status 2026-10-24 (correction):** IPA-RA is implemented. The premise below, that callee clobbers were the
+> largest remaining `hot_web_loop` gap, was wrong. With IPA-RA disabled (`CCC_DISABLE_PASSES=ipa_ra`),
+> `hot_web_loop` reaches 841.2M Ir (-30%, tying GCC 16.2, Clang 23.1.3 and ICX 2026.2) through secondary
+> latch-copy phi coalescing. IPA-RA itself changes two functions statically and is runtime-neutral on the
+> corpus. See `FOLLOWUP-2026-10-24-latch-coalescing-and-ipa-ra.md`.
+
 ## Summary
 
 `hot_web_loop` is the worst benchmark in the corpus at **1.549× slower than GCC

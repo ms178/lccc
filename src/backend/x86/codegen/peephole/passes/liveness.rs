@@ -62,7 +62,7 @@ const RBP: u16 = 1 << 5;
 #[expect(dead_code)]
 const CALL_READS: u16 = RAX | RCX | RDX | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9);
 /// Registers a call may destroy.
-const CALLER_SAVED: u16 =
+pub(super) const CALLER_SAVED: u16 =
     RAX | RCX | RDX | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
 /// Live at `ret`: integer return value plus everything the callee must restore.
 const RET_LIVE: u16 = RAX | RDX | RBX | RBP | RSP | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
@@ -73,10 +73,76 @@ const RET_LIVE: u16 = RAX | RDX | RBX | RBP | RSP | (1 << 12) | (1 << 13) | (1 <
 const RET_LIVE_RAX_ONLY: u16 = RET_LIVE & !RDX;
 
 /// How many lines after a `call` its marker protocol may occupy: every
-/// marker [`call_site_reads`] consults sits on lines `n+1..=n+CALL_MARKER_WINDOW`
+/// marker [`call_markers`] consults sits on lines `n+1..=n+CALL_MARKER_WINDOW`
 /// of the call on line `n`, so an edit further down cannot change that
-/// call's read set.
-const CALL_MARKER_WINDOW: usize = 4;
+/// call's read set. The codegen publishes at most five markers per call
+/// (`VA_CALL`, `CALL_ARGS`, `CHAIN_CALL`, `CALL_FP`, `IPA_KEEP`) directly
+/// after the call text; one line of slack.
+const CALL_MARKER_WINDOW: usize = 6;
+
+/// The marker protocol of the `call` on line `n`, parsed from the contiguous
+/// block of comment/directive lines that directly follows the call text (the
+/// block ends at the first real instruction, so a later call's markers can
+/// never be attributed to this one).
+///
+/// One parser for every consumer. The variadic and static-chain markers used
+/// to be searched only on lines `n+1..=n+2`, which a variadic static-chain
+/// call (`[call][VA_CALL][CALL_ARGS][CHAIN_CALL]`) violates: the chain read
+/// of %r10 was invisible and its staging write deletable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CallMarkers {
+    /// `# LCCC_VA_CALL`: the callee reads %al (SSE register count).
+    pub(crate) variadic: bool,
+    /// `# LCCC_CHAIN_CALL`: the callee reads the static chain in %r10.
+    pub(crate) chain: bool,
+    /// `# LCCC_CALL_ARGS <n>`: leading SysV GP argument registers read
+    /// (6, the fail-closed default, when absent or illegible).
+    pub(crate) gp_args: usize,
+    /// `# LCCC_IPA_KEEP <mask>`: caller-saved GP families the caller keeps
+    /// live ACROSS this call because the callee provably never writes them
+    /// (interprocedural register allocation, `x86::codegen::ipa_ra`). The
+    /// oracles model the call as reading them (and, through the ABI clobber
+    /// set, writing them): the strongest conservative reading of "preserved"
+    /// that every pass already handles, since it is exactly how they treat
+    /// argument registers.
+    pub(crate) ipa_keep: u16,
+}
+
+pub(crate) fn call_markers(store: &LineStore, infos: &[LineInfo], n: usize) -> CallMarkers {
+    let mut m = CallMarkers {
+        variadic: false,
+        chain: false,
+        gp_args: 6,
+        ipa_keep: 0,
+    };
+    for k in n + 1..(n + 1 + CALL_MARKER_WINDOW).min(infos.len()) {
+        if infos[k].is_nop() {
+            continue;
+        }
+        let mk = infos[k].trimmed(store.get(k));
+        if !(mk.starts_with('#') || mk.starts_with('.')) {
+            break; // a real instruction ends the marker block
+        }
+        if mk.starts_with("# LCCC_VA_CALL") {
+            m.variadic = true;
+        } else if mk.starts_with("# LCCC_CHAIN_CALL") {
+            m.chain = true;
+        } else if let Some(rest) = mk.strip_prefix("# LCCC_CALL_ARGS ") {
+            if let Ok(v) = rest.trim().parse::<usize>() {
+                m.gp_args = v.min(6);
+            }
+        } else if let Some(rest) = mk.strip_prefix("# LCCC_IPA_KEEP ") {
+            // Fail-closed parse: an illegible mask keeps every caller-saved
+            // family live (read) at the call.
+            m.ipa_keep = rest
+                .trim()
+                .strip_prefix("0x")
+                .and_then(|h| u16::from_str_radix(h, 16).ok())
+                .map_or(CALLER_SAVED, |v| v & CALLER_SAVED);
+        }
+    }
+    m
+}
 
 /// Registers the `call` on line `n` reads: the leading SysV GP argument
 /// registers its `# LCCC_CALL_ARGS <n>` marker publishes (all six when the
@@ -98,21 +164,15 @@ pub(super) fn call_site_reads(store: &LineStore, infos: &[LineInfo], n: usize) -
     // unlocks copy/extension folding up to the call in every
     // non-variadic caller (the gzip_crc32 harness kept
     // `movzbl+movq+movb` chains live solely on it).
-    let variadic = (n + 1..(n + 3).min(infos.len())).any(|k| {
-        !infos[k].is_nop() && infos[k].trimmed(store.get(k)).starts_with("# LCCC_VA_CALL")
-    });
+    let markers = call_markers(store, infos, n);
+    let variadic = markers.variadic;
     // A static-chain callee reads the chain staged in %r10 by
     // the SetStaticChain emission directly before this call;
     // `# LCCC_CHAIN_CALL` marks exactly those sites. The
     // staging write's own liveness DEPENDS on this read: without
     // it, dead-write elimination would retire the staging and
     // silently drop the chain.
-    let chain = (n + 1..(n + 3).min(infos.len())).any(|k| {
-        !infos[k].is_nop()
-            && infos[k]
-                .trimmed(store.get(k))
-                .starts_with("# LCCC_CHAIN_CALL")
-    });
+    let chain = markers.chain;
     // External-retpoline indirect call: the target register is read by
     // the THUNK symbol, not by this instruction's %-tokens. The register
     // named by the symbol suffix (`__x86_indirect_thunk_rax` reads %rax)
@@ -145,23 +205,7 @@ pub(super) fn call_site_reads(store: &LineStore, infos: &[LineInfo], n: usize) -
     // Absent/illegible marker (hand-written fragments, raw
     // `call` emissions like the i128 helpers) keeps all six:
     // fail-closed.
-    let mut gp_args: usize = 6;
-    for k in n + 1..(n + 1 + CALL_MARKER_WINDOW).min(infos.len()) {
-        if infos[k].is_nop() {
-            continue;
-        }
-        let mk = infos[k].trimmed(store.get(k));
-        if let Some(rest) = mk.strip_prefix("# LCCC_CALL_ARGS ") {
-            if let Ok(v) = rest.trim().parse::<usize>() {
-                gp_args = v.min(6);
-            }
-            break;
-        }
-        if mk.starts_with('#') || mk.starts_with('.') {
-            continue; // a sibling marker or directive
-        }
-        break; // a real instruction ends the marker window
-    }
+    let gp_args = markers.gp_args;
     // The first n GP argument registers, in SysV order.
     let arg_reads: u16 = match gp_args {
         0 => 0,
@@ -180,7 +224,7 @@ pub(super) fn call_site_reads(store: &LineStore, infos: &[LineInfo], n: usize) -
     if chain {
         reads |= 1 << 10;
     }
-    reads | retpoline_thunk_bits
+    reads | retpoline_thunk_bits | markers.ipa_keep
 }
 
 /// Verdict of a forward windowed scan for GP family `reg` that reaches the
@@ -2639,6 +2683,80 @@ mod tests {
         let idx = line_of(&store, "movl $7, %eax");
         assert_eq!(lv.live_after(idx, 0), None);
     }
+    /// The marker block is parsed as a whole: on a variadic static-chain
+    /// call the chain marker sits third (`[call][VA][ARGS][CHAIN]`), past the
+    /// two-line window the oracle used to search, and the %r10 staging write
+    /// then looked dead.
+    #[test]
+    fn chain_marker_after_va_and_args_markers_keeps_r10_live() {
+        let asm = concat!(
+            "foo:\n",
+            ".cfi_startproc\n",
+            "    movq %rbx, %r10\n",
+            "    movb $0, %al\n",
+            "    call bar\n",
+            "    # LCCC_VA_CALL\n",
+            "    # LCCC_CALL_ARGS 0\n",
+            "    # LCCC_CHAIN_CALL\n",
+            "    # LCCC_CALL_FP 0\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (store, infos, lv) = build(asm);
+        let idx = line_of(&store, "movq %rbx, %r10");
+        assert_eq!(
+            lv.live_after(idx, 10),
+            Some(true),
+            "the chain call reads %r10"
+        );
+        let call = line_of(&store, "call bar");
+        let m = call_markers(&store, &infos, call);
+        assert!(
+            m.variadic && m.chain && m.gp_args == 0 && m.ipa_keep == 0,
+            "{m:?}"
+        );
+    }
+
+    /// `# LCCC_IPA_KEEP`: a caller-saved family the caller keeps live across
+    /// the call (the callee provably never writes it) is READ by the call in
+    /// the oracle's model, so its definition before the call stays live.
+    /// Without the marker the ABI clobber kills it, and an illegible mask
+    /// fails closed to every caller-saved family.
+    #[test]
+    fn ipa_keep_marker_carries_a_caller_saved_value_across_the_call() {
+        let with = |keep: &str| {
+            format!(
+                "foo:\n.cfi_startproc\n    movq %rbx, %r8\n    call bar\n\
+                 {keep}    # LCCC_CALL_ARGS 0\n    movq %r8, %rax\n    ret\n.cfi_endproc\n"
+            )
+        };
+        let r8 = 8;
+        let asm = with("    # LCCC_IPA_KEEP 0x0100\n");
+        let (store, infos, lv) = build(&asm);
+        let idx = line_of(&store, "movq %rbx, %r8");
+        assert_eq!(lv.live_after(idx, r8), Some(true));
+        let call = line_of(&store, "call bar");
+        assert_eq!(call_markers(&store, &infos, call).ipa_keep, 1 << r8);
+        assert_eq!(call_window_verdict(&store, &infos, call, r8), Some(false));
+        let asm = with("");
+        let (store, _infos, lv) = build(&asm);
+        let idx = line_of(&store, "movq %rbx, %r8");
+        assert_eq!(
+            lv.live_after(idx, r8),
+            Some(false),
+            "ABI clobber without the marker"
+        );
+        let asm = with("    # LCCC_IPA_KEEP r8\n");
+        let (store, infos, _lv) = build(&asm);
+        let call = line_of(&store, "call bar");
+        assert_eq!(call_markers(&store, &infos, call).ipa_keep, CALLER_SAVED);
+        // Callee-saved bits in a mask are meaningless and dropped.
+        let asm = with("    # LCCC_IPA_KEEP 0xf108\n");
+        let (store, infos, _lv) = build(&asm);
+        let call = line_of(&store, "call bar");
+        assert_eq!(call_markers(&store, &infos, call).ipa_keep, 1 << r8);
+    }
+
     #[test]
     fn syscall_kill_from_the_oracle_ends_a_loop_carried_def() {
         // `syscall` destroys %r11 — knowledge only the central oracle has

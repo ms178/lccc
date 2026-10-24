@@ -672,8 +672,8 @@ fn family_private_in(
         // transforms in this module want to delete: `owned` may cover
         // every textual %r10 mention (the staging itself plus the
         // rewritten consumer) and still leave an invisible live reader.
-        // Mirror FileLiveness's protocol EXACTLY -- the marker within the
-        // next two non-nop lines after a call, and every
+        // Mirror FileLiveness's protocol EXACTLY -- the shared marker-block
+        // parser (`liveness::call_markers`), and every
         // `call __x86_indirect_thunk_*` reading the r10-staged target --
         // so the two liveness oracles can never disagree about a chain
         // call (a divergent pair is itself a miscompile-in-waiting).
@@ -682,12 +682,7 @@ fn family_private_in(
                 return false;
             }
             if matches!(infos[n].kind, LineKind::Call)
-                && (n + 1..(n + 3).min(infos.len())).any(|k| {
-                    !infos[k].is_nop()
-                        && infos[k]
-                            .trimmed(store.get(k))
-                            .starts_with("# LCCC_CHAIN_CALL")
-                })
+                && super::liveness::call_markers(store, infos, n).chain
             {
                 return false;
             }
@@ -697,6 +692,14 @@ fn family_private_in(
         // (Static-chain and external-retpoline %r10 reads are handled by
         // the fam-10 case above -- the marker/thunk evidence, not textual
         // traffic. See implicit_at_transfer's doc.)
+        // A family the caller keeps live across this call under the
+        // interprocedural allocation contract (`# LCCC_IPA_KEEP`) carries a
+        // value through the call: never private to the owned lines.
+        if matches!(infos[n].kind, LineKind::Call)
+            && super::liveness::call_markers(store, infos, n).ipa_keep & mask != 0
+        {
+            return false;
+        }
         match infos[n].kind {
             LineKind::Call | LineKind::JmpIndirect if implicit_at_transfer(fam) => return false,
             // A jump to a non-local target is a tail call and reads the
@@ -2813,8 +2816,17 @@ pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInf
         for &w in &window {
             let text = infos[w].trimmed(store.get(w));
             if line_refs_family(text, t) {
-                let renamed = format!("    {}", replace_reg_family(text, t, d));
-                replace_line(store, &mut infos[w], w, renamed);
+                let renamed = replace_reg_family(text, t, d);
+                // A producer that copies `D` itself (`movq %r13, %rdi; rolq
+                // $7, %rdi; movq %rdi, %r13`) renames to `movq %r13, %r13`:
+                // a 64-bit self-move writes nothing and touches no flags, so
+                // it goes.  `movl %r13d, %r13d` stays — it zero-extends,
+                // exactly as the original `movl %r13d, %edi` did.
+                if w == i && is_q_self_move(&renamed) {
+                    mark_nop(&mut infos[w]);
+                } else {
+                    replace_line(store, &mut infos[w], w, format!("    {renamed}"));
+                }
             }
         }
         mark_nop(&mut infos[j]);
@@ -2823,6 +2835,13 @@ pub(super) fn rename_chain_into_copy(store: &mut LineStore, infos: &mut [LineInf
         i = j + 1;
     }
     changed
+}
+
+/// True iff `insn` is `movq %R, %R` for one 64-bit general register.
+fn is_q_self_move(insn: &str) -> bool {
+    insn.strip_prefix("movq ")
+        .and_then(split_two_operands)
+        .is_some_and(|(a, b)| a == b && a.starts_with('%') && dest_width(a) == Some(64))
 }
 
 /// Fold the loop-latch increment / pointer-bump shape that neither relay
@@ -4494,10 +4513,12 @@ fn rename_plain_family_reads(t: &str, from: RegId, to: RegId) -> Option<String> 
 //     implicit use of it, and `%T` is dead after it. The producer's inputs
 //     cannot change in between (adjacency), and with the producer deleted
 //     `%T` keeps its pre-producer value, so `%I == %T` composes correctly;
-//   * the consumer is not a `lea` (a base+index+disp LEA is the 3-cycle "slow
+//   * a `lea` consumer composes to a two-component `(%B,%I,s)` address with
+//     no displacement or symbol (a base+index+disp LEA is the 3-cycle "slow
 //     LEA" on Skylake-family cores, so turning two 1-cycle LEAs into one is
-//     not a clear win; a memory access gets the third component free in the
-//     AGU), has no `*` (indirect branch) and no segment override.
+//     not a clear win there; a memory access gets the third component free in
+//     the AGU); the consumer has no `*` (indirect branch) and no segment
+//     override.
 pub(super) fn fold_scaled_index_temp_into_mem(
     store: &mut LineStore,
     infos: &mut [LineInfo],
@@ -4638,8 +4659,8 @@ fn splice_temp_into_mem_operand(
     dst_fam: RegId,
     producer: &SibAddr,
 ) -> Option<String> {
-    if line.starts_with("lea")
-        || line.contains('*')
+    let is_lea = line.starts_with("lea");
+    if line.contains('*')
         || segment_prefix_len_anywhere(line)
         || gp_family_mentions(line, dst_fam) != 1
     {
@@ -4677,8 +4698,29 @@ fn splice_temp_into_mem_operand(
             base: Some(b.clone()),
             index: None,
         },
+        // `(%T, %B, 1)`: at scale 1 base and index are interchangeable, and
+        // `%B` moves to the base slot, where even `%rsp` is encodable.
+        (Some(b), Some((x, 1))) if b == dst && x != dst => SibAddr {
+            sym: cons.sym.clone(),
+            disp: cons.disp,
+            base: Some(x.clone()),
+            index: None,
+        },
         _ => return None,
     };
+    // A `lea` consumer only when the composition is a two-component address
+    // (`(%B, %I, s)`, no displacement, no symbol, no RIP base): that is one
+    // 1-cycle LEA on Intel P-cores replacing two dependent ones (GCC emits
+    // exactly `leaq (%r9, %r8, 8)` for `a + (b << 3)`); a displacement would
+    // make it the 3-component slow LEA, which stays two instructions.
+    if is_lea
+        && (producer.sym.is_some()
+            || rest.sym.is_some()
+            || producer.disp.checked_add(rest.disp) != Some(0)
+            || rest.base.as_deref() == Some("%rip"))
+    {
+        return None;
+    }
     let composed = compose_sib(producer, &rest)?;
     let lead = line[op_start..open].len() - line[op_start..open].trim_start().len();
     let start = op_start + lead;
@@ -5113,6 +5155,73 @@ mod tests {
 
     fn run(asm: &str) -> String {
         peephole_optimize(asm.to_string())
+    }
+
+    fn run_chain_rename(body: &str) -> (Vec<String>, bool) {
+        let asm = format!(".text\nf:\n.cfi_startproc\n{body}.cfi_endproc\n");
+        let mut store = super::LineStore::new(asm);
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| super::classify_line(store.get(i)))
+            .collect();
+        let changed = super::rename_chain_into_copy(&mut store, &mut infos);
+        let out = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .filter(|l| !l.starts_with('.') && !l.ends_with(':'))
+            .collect();
+        (out, changed)
+    }
+
+    /// The chain's producer copies the copy's own destination: renaming the
+    /// scratch into `%r13` must not leave the no-op `movq %r13, %r13`
+    /// (hot_web_loop's `d = rotl(d, 7) ^ c` emitted it in every iteration).
+    #[test]
+    fn chain_rename_drops_the_64_bit_self_move_it_creates() {
+        let (out, changed) = run_chain_rename(concat!(
+            "    movq %r13, %rdi\n",
+            "    rolq $7, %rdi\n",
+            "    xorq %rbp, %rdi\n",
+            "    movq %rdi, %r13\n",
+            "    movq %r13, %rax\n",
+            "    ret\n",
+        ));
+        assert!(changed);
+        assert_eq!(
+            out,
+            ["rolq $7, %r13", "xorq %rbp, %r13", "movq %r13, %rax", "ret"]
+        );
+    }
+
+    /// The 32-bit form is not a no-op: `movl %r13d, %r13d` clears bits 32..63
+    /// exactly as the original `movl %r13d, %edi` did, so it must survive.
+    #[test]
+    fn chain_rename_keeps_the_zero_extending_32_bit_self_move() {
+        let (out, changed) = run_chain_rename(concat!(
+            "    movl %r13d, %edi\n",
+            "    roll $7, %edi\n",
+            "    movl %edi, %r13d\n",
+            "    movq %r13, %rax\n",
+            "    ret\n",
+        ));
+        assert!(changed);
+        assert_eq!(
+            out,
+            [
+                "movl %r13d, %r13d",
+                "roll $7, %r13d",
+                "movq %r13, %rax",
+                "ret"
+            ]
+        );
+    }
+
+    #[test]
+    fn q_self_move_predicate() {
+        assert!(super::is_q_self_move("movq %r13, %r13"));
+        assert!(!super::is_q_self_move("movq %r13, %r12"));
+        assert!(!super::is_q_self_move("movl %r13d, %r13d"));
+        assert!(!super::is_q_self_move("movq (%r13), %r13"));
+        assert!(!super::is_q_self_move("movq $1, $1"));
     }
 
     fn run_lea_base_fold(asm: &str) -> (String, bool) {
@@ -8833,6 +8942,48 @@ mod scaled_index_temp_tests {
             ],
             // Base-and-index producer with an index consumer: three registers.
             &["    leaq (%rsi,%r9,8), %r11", "    prefetcht0 (%rdi, %r11)"],
+        ] {
+            let (c, _) = fold(body);
+            assert!(!c, "{body:?}");
+        }
+    }
+
+    /// hot_web_loop's `b ^= a + (b << 3)`: two dependent LEAs become GCC's
+    /// single two-component `leaq (%r12, %r14, 8)`.
+    #[test]
+    fn lea_consumer_composes_to_a_two_component_address() {
+        let (c, out) = fold(&[
+            "    leaq 0(,%r14,8), %r11",
+            "    leaq (%r12, %r11, 1), %rdi",
+        ]);
+        assert!(c);
+        assert_eq!(out, ["leaq (%r12, %r14, 8), %rdi", "ret"]);
+        // `leal`: the low 32 bits of base + index*8 are the same either way.
+        let (c, out) = fold(&["    leaq 0(,%r14,8), %r11", "    leal (%r12, %r11), %edi"]);
+        assert!(c);
+        assert_eq!(out, ["leal (%r12, %r14, 8), %edi", "ret"]);
+    }
+
+    /// `(%T, %B, 1)`: the scale-1 temporary in base position swaps slots.
+    #[test]
+    fn temp_in_base_position_beside_an_unscaled_index_swaps_slots() {
+        let (c, out) = fold(&["    leaq 0(,%r14,8), %r11", "    leaq (%r11, %r12), %rdi"]);
+        assert!(c);
+        assert_eq!(out, ["leaq (%r12, %r14, 8), %rdi", "ret"]);
+        let (c, out) = fold(&["    leaq 0(,%r9,8), %r11", "    prefetcht0 16(%r11, %rsp)"]);
+        assert!(c);
+        assert_eq!(out, ["prefetcht0 16(%rsp, %r9, 8)", "ret"]);
+    }
+
+    /// Three-component (slow) or symbolic LEA compositions stay split.
+    #[test]
+    fn lea_consumer_declines_three_component_results() {
+        for body in [
+            &["    leaq 8(,%r9,8), %r11", "    leaq (%rdi, %r11), %rax"][..],
+            &["    leaq 0(,%r9,8), %r11", "    leaq tab(%rdi, %r11), %rax"],
+            &["    leaq 0(,%r9,8), %r11", "    leaq -8(%r11, %rdi), %rax"],
+            &["    leaq 0(,%r9,8), %r11", "    leaq (%rdi, %r11), %r11"],
+            &["    leaq 0(,%r9,8), %r11", "    leaq (%r11, %r11), %rax"],
         ] {
             let (c, _) = fold(body);
             assert!(!c, "{body:?}");
