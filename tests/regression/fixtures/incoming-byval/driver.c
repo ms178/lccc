@@ -7,6 +7,9 @@ long adjust(struct Big *s, const struct Big *original) {
     s->b += 11;
     return 5;
 }
+__attribute__((noinline)) long read_big(struct Big *s) {
+    return s->a+s->b+s->c;
+}
 long consume_wide(struct Wide s) {
     if ((uintptr_t)&s & 63) return -4000;
     return s.a[0] + s.a[7];
@@ -19,10 +22,12 @@ int main(void) {
         struct Wide w = {{k,0,0,0,0,0,0,k+2}};
         long sum = 6*k;
         if (sum_big(s) != sum) return 1;
+        if (tail_big(s) != sum) return 13;
         if (mutate_big(s, &s) != sum+16) return 2;
         if (s.a != k || s.b != 2*k+1 || s.c != 3*k-1) return 3;
         if (dynamic_big(s, (unsigned)(k+20)) != sum+7) return 4;
         if (realign_big(s, w) != sum+2*k+2) return 5;
+        if (aligned_f128(1,2,3,4,5,6,7,1,2,3,4,5,6,7,8,9,10) != 83) return 12;
         if (aligned_object(1,2,3,4,5,6,7,s,8) != 36+sum) return 6;
         if (variadic_big(s, 13L, s) != 2*sum+13) return 7;
         if (exhausted_small(1,2,3,4,5,6,t) != 2*k+24) return 8;

@@ -5796,9 +5796,14 @@ fn generate_function_body(
     let sibcall_fn_ok = sibcall_enabled()
         && !func.blocks.iter().any(|b| {
             b.instructions.iter().any(|inst| match inst {
-                // A live alloca's address could reach the tail callee.
+                // A live LOCAL alloca's address could reach the tail callee.
+                // Checked incoming MEMORY parameter homes are different:
+                // their storage belongs to the caller's argument area and
+                // remains above the tail callee's frame after our epilogue.
+                // Keep refusing every ordinary or dynamic local object.
                 Instruction::Alloca { dest, .. } => {
-                    sibcall_use_counts.get(&dest.0).copied().unwrap_or(0) > 0
+                    !cg.state().incoming_byval_slots.contains_key(&dest.0)
+                        && sibcall_use_counts.get(&dest.0).copied().unwrap_or(0) > 0
                 }
                 // Dynamic stack allocation: memory below %rsp, and the
                 // epilogue would hand the tail callee unowned stack.

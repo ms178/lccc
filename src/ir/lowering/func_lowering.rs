@@ -377,7 +377,7 @@ impl Lowerer {
                 // DECLARED alignment may exceed that (typedef override or a
                 // direct parameter-list spelling): `&x` of an
                 // `aligned(32)` _Float128 parameter must be 32-aligned.
-                // Fold it in exactly like the scalar arm.
+                // Keep it in param_align, not in the ABI carrier alignment.
                 let natural_align = self.ctype_align(&param_ctype);
                 let declared_align = self.alignof_type(&param.type_spec);
                 let direct_align = self.param_explicit_alignment(param);
@@ -387,7 +387,7 @@ impl Lowerer {
                     ty: IrType::U128,
                     noalias: false,
                     struct_size: Some(16),
-                    struct_align: Some(16.max(declared)),
+                    struct_align: Some(natural_align),
                     param_align,
                     struct_eightbyte_classes: vec![
                         crate::common::types::EightbyteClass::Sse,

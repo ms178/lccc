@@ -5,6 +5,10 @@ typedef uint32_t D4 __attribute__((vector_size(16)));
 typedef uint32_t D8 __attribute__((vector_size(32)));
 typedef uint64_t Q2 __attribute__((vector_size(16)));
 typedef uint64_t Q4 __attribute__((vector_size(32)));
+#ifdef AVX512_MODEL
+typedef uint32_t D16 __attribute__((vector_size(64)));
+typedef uint64_t Q8 __attribute__((vector_size(64)));
+#endif
 static uint64_t random_bits = UINT64_C(0xc65ae19d983b172f);
 static uint64_t next(void) {
     random_bits ^= random_bits << 13;
@@ -33,6 +37,10 @@ static const uint64_t counts[] = {
 DECL(d4sl,D4); DECL(d4sr,D4); DECL(d4sa,D4);
 DECL(d8sl,D8); DECL(d8sr,D8); DECL(d8sa,D8);
 DECL(q2sl,Q2); DECL(q2sr,Q2); DECL(q4sl,Q4); DECL(q4sr,Q4);
+#ifdef AVX512_MODEL
+DECL(d16sl,D16); DECL(d16sr,D16); DECL(d16sa,D16);
+DECL(q8sl,Q8); DECL(q8sr,Q8);
+#endif
 #define RUN(name,type,lanes,bits,op) do { \
     for(unsigned k=0;k<16384;k++) { \
         uint64_t c = k < sizeof(counts)/sizeof(counts[0]) ? counts[k] : ((k&1) ? next() : next() % (bits+2)); \
@@ -53,6 +61,12 @@ int main(void) {
     RUN(d8sl,D8,8,32,0); RUN(d8sr,D8,8,32,1); RUN(d8sa,D8,8,32,2);
     RUN(q2sl,Q2,2,64,0); RUN(q2sr,Q2,2,64,1);
     RUN(q4sl,Q4,4,64,0); RUN(q4sr,Q4,4,64,1);
+#ifdef AVX512_MODEL
+    RUN(d16sl,D16,16,32,0); RUN(d16sr,D16,16,32,1); RUN(d16sa,D16,16,32,2);
+    RUN(q8sl,Q8,8,64,0); RUN(q8sr,Q8,8,64,1);
+    puts("245760 exact uniform-shift comparisons");
+#else
     puts("163840 exact uniform-shift comparisons");
+#endif
     return 0;
 }
