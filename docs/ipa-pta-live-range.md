@@ -43,7 +43,10 @@ Escape handling is part of the solver, not a post-hoc approximation:
 * integer-to-pointer casts add unknown provenance instead of fabricating a
   concrete object;
 * unmodelled memory-affecting IR has an `all` effect and therefore cannot be
-  used to prove that a call preserves a load.
+  used to prove that a call preserves a load. Acquire/release/seq-cst atomic
+  operations and target fence intrinsics are also summary barriers; relaxed
+  atomics retain object precision. TLS address materialization is conservatively
+  treated as a possible helper call unless a target-specific proof says otherwise.
 
 The mod/ref fixpoint propagates both modification and reference summaries over
 recursive call graphs. The first consumer is late redundant-load forwarding:

@@ -452,9 +452,26 @@ def main(argv: Iterable[str] | None = None) -> int:
                     detail = record.get("stderr", "")[-4000:]
                     print(f"RUNTIME DIAGNOSTIC {entry['name']} {record['compiler']}:\n{detail}", file=sys.stderr)
         if os.environ.get("GITHUB_ACTIONS"):
+            def escape_annotation(text):
+                return (text.replace("%", "%25").replace("\r", "%0D")
+                        .replace("\n", "%0A"))
             for failure in failures:
-                escaped = failure.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-                print(f"::error title=IPA/LRS harness::{escaped}")
+                print(f"::error title=IPA/LRS harness::{escape_annotation(failure)}")
+            if not forwarding_witness:
+                # Hosted log/artifact downloads are not available in every
+                # CI environment. Keep the decisive counter evidence in the
+                # check-run annotations as well as the JSON report.
+                for entry in report["cases"]:
+                    records = [entry["lccc_feature"]]
+                    records.extend(v["feature"] for v in entry.get("variants", []))
+                    stats = []
+                    for record in records:
+                        for line in record.get("compile_stderr", "").splitlines():
+                            if "[IPA-PTA]" in line or "[LR-SHRINK]" in line:
+                                stats.append(line)
+                    if stats:
+                        detail = f"{entry['name']}: " + " | ".join(stats[-24:])
+                        print(f"::error title=IPA/LRS statistics::{escape_annotation(detail)}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(f"IPA/LRS cases: {len(CASES)}; failures: {len(failures)}")

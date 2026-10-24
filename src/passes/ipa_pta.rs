@@ -176,6 +176,7 @@ struct Solver {
     value_nodes: Vec<FxHashMap<u32, Node>>,
     function_indices: FxHashMap<String, usize>,
     named_objects: FxHashMap<String, Object>,
+    tls_globals: FxHashSet<String>,
     call_sites: Vec<CallSite>,
     site_for_instruction: FxHashMap<(usize, usize, usize), usize>,
     unmodeled_instructions: FxHashSet<(usize, usize, usize)>,
@@ -200,6 +201,7 @@ impl Solver {
             value_nodes: vec![FxHashMap::default(); function_count],
             function_indices: FxHashMap::default(),
             named_objects: FxHashMap::default(),
+            tls_globals: FxHashSet::default(),
             call_sites: Vec::new(),
             site_for_instruction: FxHashMap::default(),
             unmodeled_instructions: FxHashSet::default(),
@@ -738,6 +740,29 @@ fn run_with_budget(
     eliminated
 }
 
+fn has_synchronization_barrier(inst: &Instruction) -> bool {
+    use crate::ir::reexports::AtomicOrdering;
+    let ordered = |ordering: AtomicOrdering| ordering != AtomicOrdering::Relaxed;
+    match inst {
+        Instruction::AtomicLoad { ordering, .. }
+        | Instruction::AtomicStore { ordering, .. }
+        | Instruction::AtomicRmw { ordering, .. }
+        | Instruction::AtomicInc { ordering, .. } => ordered(*ordering),
+        Instruction::AtomicCmpxchg {
+            success_ordering,
+            failure_ordering,
+            ..
+        } => ordered(*success_ordering) || ordered(*failure_ordering),
+        Instruction::Intrinsic { op, .. } => matches!(
+            op,
+            crate::ir::reexports::IntrinsicOp::Lfence
+                | crate::ir::reexports::IntrinsicOp::Mfence
+                | crate::ir::reexports::IntrinsicOp::Sfence
+        ),
+        _ => false,
+    }
+}
+
 fn compute_effects(solver: &Solver, module: &IrModule) -> Vec<ModRef> {
     let function_count = solver.functions.len();
     let mut local_mods = vec![ModRef::default(); function_count];
@@ -847,7 +872,8 @@ fn compute_effects(solver: &Solver, module: &IrModule) -> Vec<ModRef> {
                     }
                     _ => {}
                 }
-                if solver.unmodeled_instructions.contains(&key) {
+                if solver.unmodeled_instructions.contains(&key) || has_synchronization_barrier(inst)
+                {
                     local_mods[fi].all = true;
                     local_refs[fi].all = true;
                 }
@@ -1009,9 +1035,17 @@ fn build_instruction(
             solver.insert(node, object);
         }
         Instruction::GlobalAddr { dest, name } => {
-            let object = solver.object_for_name(canonical_name(aliases, name));
+            let name = canonical_name(aliases, name);
+            let object = solver.object_for_name(name);
             let node = solver.value_node(function, dest.0);
             solver.insert(node, object);
+            if solver.tls_globals.contains(name) {
+                // Some TLS models materialize an address through a helper
+                // call.  Without target-specific model information here,
+                // retain that hidden call's possible memory effects rather
+                // than pretending GlobalAddr is always a pure constant.
+                mark_unmodeled(solver, function, block, instruction, inst);
+            }
         }
         Instruction::Copy { dest, src } => {
             let destination = solver.value_node(function, dest.0);
@@ -1281,6 +1315,12 @@ fn build_solver(module: &IrModule, semantic_interposition: bool, budget: Analysi
         .aliases
         .iter()
         .map(|(alias, target, _)| (alias.clone(), target.clone()))
+        .collect();
+    solver.tls_globals = module
+        .globals
+        .iter()
+        .filter(|global| global.is_thread_local)
+        .map(|global| global.name.clone())
         .collect();
 
     for (index, function) in module.functions.iter().enumerate() {
@@ -1769,6 +1809,38 @@ mod tests {
         assert_eq!(load_count(&module.functions[1]), 2);
         let mut native = test_module(vec![reader, caller]);
         assert_eq!(run(&mut native, false), 1);
+    }
+
+    #[test]
+    fn synchronized_callee_is_a_memory_barrier() {
+        let mut sync = function("sync", IrType::Void);
+        finish(
+            &mut sync,
+            vec![
+                global_addr(0, "flag"),
+                Instruction::AtomicLoad {
+                    dest: Value(1),
+                    ptr: Operand::Value(Value(0)),
+                    ty: IrType::I32,
+                    ordering: crate::ir::reexports::AtomicOrdering::Acquire,
+                },
+            ],
+            None,
+        );
+        let mut caller = function("caller", IrType::I32);
+        finish(
+            &mut caller,
+            vec![
+                global_addr(0, "cell"),
+                load(1, 0),
+                call("sync", vec![]),
+                load(2, 0),
+            ],
+            Some(Value(2)),
+        );
+        let mut module = test_module(vec![sync, caller]);
+        assert_eq!(run(&mut module, false), 0);
+        assert_eq!(load_count(&module.functions[1]), 2);
     }
 
     #[test]
