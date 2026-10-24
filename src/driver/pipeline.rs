@@ -3236,6 +3236,23 @@ impl Driver {
             && !self.prfchw_explicitly_disabled
     }
 
+    /// Whether this i686 invocation enables the SSE register file. The
+    /// separate `general_regs_only` permission veto is applied by consumers
+    /// such as `effective_x86_features`; prefetch has its own established
+    /// `-mno-sse` policy below.
+    pub(crate) fn resolved_i686_sse(&self) -> bool {
+        self.target == Target::I686
+            && !self.no_sse
+            && (self.enable_sse
+                || self.enable_sse3
+                || self.enable_ssse3
+                || self.enable_sse4_1
+                || self.enable_sse4_2
+                || self.enable_avx
+                || self.enable_avx2
+                || self.enable_avx512f)
+    }
+
     /// Whether the SSE prefetch family (`prefetchnta/t0/t1/t2`, `0F 18
     /// /0-3`) may be emitted — GCC's `ix86_prefetch_sse`:
     ///
@@ -3250,18 +3267,7 @@ impl Driver {
     pub(crate) fn resolved_prefetch_sse(&self) -> bool {
         match self.target {
             Target::X86_64 => true,
-            Target::I686 => {
-                let sse = !self.no_sse
-                    && (self.enable_sse
-                        || self.enable_sse3
-                        || self.enable_ssse3
-                        || self.enable_sse4_1
-                        || self.enable_sse4_2
-                        || self.enable_avx
-                        || self.enable_avx2
-                        || self.enable_avx512f);
-                sse || self.resolved_prfchw()
-            }
+            Target::I686 => self.resolved_i686_sse() || self.resolved_prfchw(),
             _ => false,
         }
     }
@@ -3340,8 +3346,10 @@ impl Driver {
         set.insert_if(x86_64, F::Fxsr);
         set.insert_if(x86_64 && simd, F::Mmx);
         // SSE/SSE2 are part of the x86-64 architectural baseline (v1 already
-        // has them); i686 has neither by default.
-        set.insert_if(x86_64 && simd, F::Sse);
+        // has them). i686 has neither by default; publish its resolved SSE
+        // grant as well so ABI classification can distinguish register
+        // carriers from the pre-SSE stack/sret convention.
+        set.insert_if(simd && (x86_64 || self.resolved_i686_sse()), F::Sse);
         set.insert_if(x86_64 && simd, F::Sse2);
 
         // The SSE3..SSE4.2 ladder.  `x86_isa()` carries only the 128-bit

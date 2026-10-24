@@ -5437,6 +5437,32 @@ mod prefetch_isa_tests {
     }
 
     #[test]
+    fn i686_sse_feature_mirror_tracks_abi_permission() {
+        for (flags, expected) in [
+            (&["-m32"][..], false),
+            (&["-m32", "-march=i686"][..], false),
+            (&["-m32", "-msse", "-mno-sse"][..], false),
+            (&["-m32", "-mno-sse2"][..], false),
+            (&["-m32", "-mgeneral-regs-only"][..], false),
+            (&["-m32", "-msse"][..], true),
+            (&["-m32", "-msse2"][..], true),
+            (&["-m32", "-msse4.1"][..], true),
+            (&["-m32", "-march=nehalem"][..], true),
+            (&["-m32", "-mno-sse", "-msse"][..], true),
+        ] {
+            let driver = parse(flags);
+            assert_eq!(driver.resolved_i686_sse(), expected, "{flags:?}");
+            assert_eq!(
+                driver
+                    .effective_x86_features()
+                    .contains(crate::common::x86_features::X86Feature::Sse),
+                expected,
+                "effective SSE mirror disagrees for {flags:?}"
+            );
+        }
+    }
+
+    #[test]
     fn x86_64_sse_prefetch_is_baseline() {
         // GCC 16 emits prefetcht* even without xmm state on x86-64.
         for flags in [

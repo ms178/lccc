@@ -2733,10 +2733,14 @@ impl CType {
         }
     }
 
-    /// GNU 16-byte vectors share the single-XMM i386 ext-vector carrier.
-    /// Keep the other vector_size widths and non-x86 targets separate.
+    /// GNU 16-byte vectors share the single-XMM i386 ext-vector carrier only
+    /// when this invocation has SSE. Pre-SSE i386 and explicit `-mno-sse`
+    /// retain the ordinary aggregate stack/sret convention. Keep the other
+    /// vector_size widths and non-x86 targets separate.
     fn i386_gnu_xmm_vector(&self) -> bool {
         target_elf_machine() == 3
+            && crate::common::x86_features::effective()
+                .contains(crate::common::x86_features::X86Feature::Sse)
             && matches!(self, CType::Vector(elem, 16)
                 if elem.is_integer() || matches!(**elem, CType::Float | CType::Double))
     }
