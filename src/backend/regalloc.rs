@@ -19482,6 +19482,42 @@ mod ipa_fill_tests {
         assert_eq!(c.assignments.get(&1), None);
     }
 
+    /// Displacement is a GROUP operation: the candidate's overlapping
+    /// tenants all leave together, into the single relocation register the
+    /// whole group fits, and the non-overlapping rest keeps the register.
+    /// When no one register fits the whole group, nothing moves and the
+    /// placement fails clean.
+    #[test]
+    fn displacement_moves_the_conflicting_group_as_one() {
+        // v100 [0,5] and v101 [7,12] both conflict with candidate v1
+        // [2,10]; v102 [20,30] does not.
+        let case = || {
+            Case::new(&[
+                (100, (0, 5), 1, Some(R8)),
+                (101, (7, 12), 1, Some(R8)),
+                (102, (20, 30), 1, Some(R8)),
+                (1, (2, 10), 10, None),
+            ])
+        };
+        let mut c = case();
+        let used = c.run(&[1], &[R8], &[], POOL, &tenant_ok, &|_| false, &[]);
+        assert_eq!(used, vec![R8]);
+        assert_eq!(c.assignments.get(&1), Some(&R8));
+        assert_eq!(c.assignments.get(&100), Some(&R11), "group member moves");
+        assert_eq!(c.assignments.get(&101), Some(&R11), "group member moves");
+        assert_eq!(c.assignments.get(&102), Some(&R8), "the rest stays");
+        // One unmovable member sinks the whole group: r8 cannot be freed,
+        // and the failure must leave every assignment untouched.
+        let no_v101 = |v: u32, r: PhysReg| tenant_ok(v, r) && v != 101;
+        let mut c = case();
+        let used = c.run(&[1], &[R8], &[], POOL, &no_v101, &|_| false, &[]);
+        assert!(used.is_empty());
+        assert_eq!(c.assignments.get(&1), None);
+        assert_eq!(c.assignments.get(&100), Some(&R8));
+        assert_eq!(c.assignments.get(&101), Some(&R8));
+        assert_eq!(c.assignments.get(&102), Some(&R8));
+    }
+
     #[test]
     fn displaced_group_moves_together_and_never_into_a_busy_register() {
         // Tenants v100 [0,5] and v101 [5,9] share r8 (touching, as Phase 2's

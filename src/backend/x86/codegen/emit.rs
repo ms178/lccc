@@ -9045,16 +9045,15 @@ impl ArchCodegen for X86Codegen {
             return;
         }
         // A non-interposable definition: what a direct call reaches is
-        // exactly this text. PIE executables bind their definitions
-        // locally; full PIC (possibly a DSO) only hidden/internal/protected
-        // and static ones.
-        let binds_locally = func.is_static
-            || matches!(
-                func.visibility.as_deref(),
-                Some("hidden" | "internal" | "protected")
-            )
-            || !self.state.pic_mode
-            || (self.state.pie_mode && !self.state.shared_lib);
+        // exactly this text (the matrix and the safe-side argument live on
+        // the predicate itself).
+        let binds_locally = super::ipa_ra::call_binds_locally(
+            func.is_static,
+            func.visibility.as_deref(),
+            self.state.pic_mode,
+            self.state.pie_mode,
+            self.state.shared_lib,
+        );
         let text = &self.state.out.buf[mark..];
         let label = format!("{}:", func.name);
         // The summary is keyed by the IR name; it must be the emitted label

@@ -115,6 +115,39 @@ pub(crate) struct IpaRaState {
     records: FxHashMap<String, (u16, Vec<String>)>,
 }
 
+/// Whether a direct call made BY the module being emitted is guaranteed
+/// to execute the callee's emitted text in that module — the soundness
+/// precondition for summarizing the callee and keeping caller-saved
+/// registers across the call:
+///
+/// - internal linkage (`is_static`) and the non-interposable visibilities
+///   (`hidden`, `internal`, `protected`) always bind locally;
+/// - default-visibility global definitions do in non-PIC output (static
+///   link resolution) and in PIE executables: the executable is the first
+///   object in its own dynamic scope, ahead of LD_PRELOAD and of its
+///   dependencies, so its own definitions are never preempted;
+/// - a DSO's default-visibility definitions never do: an executable or
+///   earlier DSO can interpose them at load time;
+/// - PIC output that is neither a PIE executable nor a DSO (a `-fPIC`
+///   relocatable whose final link is unknown) is refused: the text will
+///   live in a scope the caller also sees, so it cannot be assumed local.
+///
+/// A wrong `true` here is a correctness hole (a summary for text the call
+/// never executes); a wrong `false` only forfeits the optimization, so the
+/// predicate errs on the safe side.
+pub(crate) fn call_binds_locally(
+    is_static: bool,
+    visibility: Option<&str>,
+    pic_mode: bool,
+    pie_mode: bool,
+    shared_lib: bool,
+) -> bool {
+    is_static
+        || matches!(visibility, Some("hidden" | "internal" | "protected"))
+        || !pic_mode
+        || (pie_mode && !shared_lib)
+}
+
 /// The call targets of `text` whose summary `text_clobbers` needs: external
 /// (not a local label or `@PLT`-less callee of its own), not
 /// `__stack_chk_fail`, not `*`-indirect, and not summarized yet. Mirrors
@@ -1177,6 +1210,53 @@ mod tests {
         let mut got = missing_callee_summaries(text, &summaries);
         got.sort();
         assert_eq!(got, vec!["missing".to_string(), "other".to_string()]);
+    }
+
+    /// The full binds-locally matrix. A wrong `true` is a correctness hole
+    /// (the summary would describe text the call never executes), so every
+    /// row is pinned: internal linkage and the non-interposable
+    /// visibilities bind locally everywhere; default-visibility globals do
+    /// in non-PIC output and in PIE executables (the executable heads its
+    /// own dynamic scope, ahead of LD_PRELOAD), never in a DSO, and a
+    /// PIC-nor-PIE-nor-DSO relocatable is refused.
+    #[test]
+    fn binds_locally_matrix() {
+        // (is_static, visibility, pic, pie, shared_lib) -> expected
+        let cases: &[(bool, Option<&str>, bool, bool, bool, bool)] = &[
+            // internal linkage: always local, in every context.
+            (true, None, false, false, false, true),
+            (true, Some("default"), true, true, true, true),
+            (true, Some("hidden"), true, false, true, true),
+            // non-interposable visibility: always local.
+            (false, Some("hidden"), true, false, true, true),
+            (false, Some("internal"), true, false, true, true),
+            (false, Some("protected"), true, false, true, true),
+            (false, Some("hidden"), false, false, false, true),
+            (false, Some("protected"), true, true, true, true),
+            (false, Some("internal"), true, true, false, true),
+            // default visibility, non-PIC: static link resolution.
+            (false, None, false, false, false, true),
+            (false, Some("default"), false, false, true, true),
+            // default visibility, PIE executable: the executable's own
+            // definitions head its dynamic scope and are never preempted.
+            (false, None, true, true, false, true),
+            (false, Some("default"), true, true, false, true),
+            // default visibility, DSO: interposable at load time.
+            (false, None, true, false, true, false),
+            (false, None, true, true, true, false),
+            (false, Some("default"), true, false, true, false),
+            // default visibility, PIC but neither PIE nor DSO: the final
+            // link is unknown, so assume interposable.
+            (false, None, true, false, false, false),
+            (false, Some("default"), true, false, false, false),
+        ];
+        for &(s, v, pic, pie, shared, want) in cases {
+            assert_eq!(
+                call_binds_locally(s, v, pic, pie, shared),
+                want,
+                "static={s} vis={v:?} pic={pic} pie={pie} shared={shared}"
+            );
+        }
     }
 
     /// A twice-defined name is ambiguous, not first-wins: whichever body
