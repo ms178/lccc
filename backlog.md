@@ -681,6 +681,14 @@ mask or `qemu -cpu`; `readelf -sW` shows `IFUNC`; static-binary variant works.
 
 ### MB-20 · P1 · R — peephole compile time: one quadratic lookup, then decode once
 
+**Progress:** exact lazy reference tracking and the per-invocation scan ratchet
+are implemented; pinned branch-rewrite commits are guarded. Evidence and
+mutation results: [label-reference journal](engineering/journal/2026-10-24-label-reference-cost.md).
+The new 40-function profile puts `LabelRefs::build` at 1.77%, but the peephole
+still costs 73.46%; allocation/decode/fixpoint work remains open. The historical
+reproducer and staged plan below are retained as the acceptance specification,
+not a claim that all five steps are complete.
+
 **Why (measured on `2070d23f`).** Callgrind, 40-function TU, `-O1`: 961 M
 instructions total, **68 % in `peephole_optimize_inner`**. Inside it:
 

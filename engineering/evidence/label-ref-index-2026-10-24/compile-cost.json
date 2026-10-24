@@ -1,0 +1,124 @@
+{
+  "cpu": 0,
+  "seed": 20261024,
+  "repetitions": 15,
+  "flags": [
+    "-O1",
+    "-S"
+  ],
+  "rows": {
+    "40": {
+      "samples_s": {
+        "before": [
+          1.5618489460000546,
+          1.5740609209999548,
+          1.452380931999869,
+          1.625933970999995,
+          1.4671819860000141,
+          1.2173468420000972,
+          1.5588029129999086,
+          1.569807474000072,
+          1.5487691620000987,
+          1.4426650060001975,
+          1.2149478920000547,
+          1.3339979190000122,
+          1.5007374299998446,
+          1.3383832640001856,
+          1.2669403360000615
+        ],
+        "after": [
+          0.3081011309998303,
+          0.30694018400004097,
+          0.25741790000006404,
+          0.3103297919999477,
+          0.29433611200011,
+          0.3166636230000677,
+          0.30539199899999403,
+          0.29378007900004377,
+          0.3004722820001007,
+          0.2682932320001328,
+          0.24959771299995737,
+          0.2668614060000891,
+          0.2758851890000642,
+          0.2630067439999948,
+          0.28635242899986224
+        ]
+      },
+      "source_sha256": "225ec5ce7bd4f1ec7a755dea2d5270c6394c69fde20b202d2cfbe57be44c2ffd",
+      "assembly_sha256": {
+        "after": "3972342351145861c46458bfc9ec39be451f84b4742f67c8c8f061ef82eded4c",
+        "before": "3972342351145861c46458bfc9ec39be451f84b4742f67c8c8f061ef82eded4c"
+      },
+      "median_s": {
+        "before": 1.4671819860000141,
+        "after": 0.29378007900004377
+      },
+      "before_over_after": 4.994150695969401
+    },
+    "120": {
+      "samples_s": {
+        "before": [
+          15.410848187000056,
+          14.781912616,
+          14.035599972,
+          14.120478437999964,
+          13.577267751000136,
+          15.588707569000007,
+          15.26766048400009,
+          15.506268736000038,
+          15.91093567400003,
+          15.077270766999845,
+          15.451336933999983,
+          15.583352469000147,
+          16.00578617400015,
+          16.050329431000137,
+          15.589542685999959
+        ],
+        "after": [
+          1.0106927309998355,
+          0.9372921639999277,
+          1.0772776520000207,
+          0.9294831649999651,
+          0.9716682450000462,
+          0.9703425170000628,
+          0.9458517730001859,
+          1.0816872330001388,
+          1.1227133110000977,
+          1.074927185999968,
+          0.9533077220000905,
+          0.955027285999904,
+          1.087889394000058,
+          1.1788185320001503,
+          1.054316082000014
+        ]
+      },
+      "source_sha256": "9832d207260090736675153f6408f9f99d89f312fd5b443424fd3562938410dd",
+      "assembly_sha256": {
+        "after": "135a630b7c624825ce5cd3a9ac4797dcd8da280f4b89026cae6804b8254fb4a7",
+        "before": "135a630b7c624825ce5cd3a9ac4797dcd8da280f4b89026cae6804b8254fb4a7"
+      },
+      "median_s": {
+        "before": 15.451336933999983,
+        "after": 1.0106927309998355
+      },
+      "before_over_after": 15.287867875248919
+    }
+  },
+  "scope": "compiler cost, not generated-code runtime",
+  "large_input_budget_note": "300-function trial stopped before completion; use a bounded 120-function input, retaining 15 paired measured rounds for both sizes",
+  "callgrind_Ir": {
+    "before": 19845265946,
+    "after": 3232109164
+  },
+  "baseline_commit": "9fa15cb4cf90301f0d809cd9dc0777f5d993dfb8",
+  "rust": "1.97.0",
+  "compiler_profile": "fastbuild, opt-level=1, line-tables-only, -j2",
+  "wall_measurement": "15 randomized paired CPU-pinned samples per input, two excluded warmups; each source has separately seeded ordering",
+  "binary_sha256": {
+    "before": "bb07f72cfb5a448619db9fa3aeca72c3aaec2b28ad74c73fd5ef4bbbc08b4fef",
+    "after": "0ab0d789b381c94b19340f1af3cad829b1079410db214a9c81e768f06ac7714c"
+  },
+  "callgrind_note": "Ir is simulated instruction count, not CPU cycles or generated-program speed",
+  "after_labelrefs_build_inclusive_Ir": 57104225,
+  "after_peephole_inclusive_Ir": 2374193098
+}
