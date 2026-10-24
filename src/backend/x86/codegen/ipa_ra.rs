@@ -474,9 +474,90 @@ fn no_implicit_gp_write(m: &str) -> bool {
         "rdfsbase",
         "rdgsbase",
     ];
-    // AVX (`v...`), SSE integer (`p...`) and x87 (`f...`) families name every
-    // GP register they write, except the VMX/SEV/TDX system instructions
-    // that share the prefixes (and the `pcmp*stri` forms tabled above).
+    // AVX/SSE `v...` and `p...` families that write only operands they name
+    // (xmm/ymm, or an explicit GPR destination such as `vpmovmskb`'s). The
+    // list is the census of every such mnemonic the x86 backend can emit
+    // (verified across the benchmark corpus); it is fail-closed, so a `v`/
+    // `p` mnemonic outside it is unclassified and refuses the summary, the
+    // same as any other unknown mnemonic - never assumed clean.
+    const SIMD_FAMILIES: &[&str] = &[
+        "vadd",
+        "vsub",
+        "vmul",
+        "vdiv",
+        "vsqrt",
+        "vround",
+        "vmin",
+        "vmax",
+        "vfmadd",
+        "vfmsub",
+        "vfnmadd",
+        "vfnmsub",
+        "vcmp",
+        "vcvt",
+        "vtest",
+        "vmov",
+        "vextract",
+        "vinsert",
+        "vbroadcast",
+        "vpbroadcast",
+        "vpshuf",
+        "vperm",
+        "vpalignr",
+        "vblend",
+        "vshuf",
+        "vzeroall",
+        "vzeroupper",
+        "vpxor",
+        "vpor",
+        "vpand",
+        "vand",
+        "vor",
+        "vxor",
+        "vpadd",
+        "vpsub",
+        "vpmul",
+        "vpmadd",
+        "vpsad",
+        "vpavg",
+        "vpmax",
+        "vpmin",
+        "vpcmpeq",
+        "vpcmpgt",
+        "vpcmp",
+        "vpsl",
+        "vpsr",
+        "vpsra",
+        "vpacks",
+        "vpackus",
+        "vpunpck",
+        "vunpck",
+        "vpmovsx",
+        "vpmovzx",
+        "vpmovmskb",
+        "pxor",
+        "pand",
+        "pshuf",
+        "padd",
+        "psub",
+        "pmul",
+        "pmax",
+        "pmin",
+        "pavg",
+        "pcmpeq",
+        "pcmpgt",
+        "packs",
+        "packus",
+        "punpck",
+        "pmovsx",
+        "pmovzx",
+        "psll",
+        "psrl",
+        "psrad",
+        "popcnt",
+    ];
+    // VMX/SEV/TDX system instructions share the `v`/`p` prefixes and do
+    // write unnamed state; tabled deny-list.
     const DENY: &[&str] = &[
         "vmcall",
         "vmclear",
@@ -503,7 +584,15 @@ fn no_implicit_gp_write(m: &str) -> bool {
     if DENY.contains(&m) {
         return false;
     }
-    matches!(m.as_bytes().first(), Some(b'v' | b'p' | b'f'))
+    // x87 (`f...`): the x87 ALU encodes only st(i), memory and constants, so
+    // no x87 form can write a GP register it does not name; the no-operand
+    // `fnstsw`/`fstsw` (AX) is tabled explicitly in `implicit_writes` and is
+    // consulted before this fallback.
+    if matches!(m.as_bytes().first(), Some(b'f')) {
+        return true;
+    }
+    (matches!(m.as_bytes().first(), Some(b'v' | b'p'))
+        && SIMD_FAMILIES.iter().any(|p| m.starts_with(p)))
         || PREFIXES.iter().any(|p| m.starts_with(p))
 }
 
@@ -733,6 +822,43 @@ mod tests {
                       \x20   movabsq $-2960836687051489901, %rax\n    imulq %rax, %rdi\n\
                       \x20   movq %rdi, %rax\n    ret\n.cfi_endproc\n";
         assert_eq!(text_clobbers(helper, &none), Some(RAX | RDI));
+    }
+
+    /// The `v`/`p` clean table is fail-closed: a mnemonic outside it (a
+    /// future SIMD extension, a renamed system instruction) refuses the
+    /// summary instead of being assumed clean; tabled families and the
+    /// x87 exception stay classified.
+    #[test]
+    fn simd_table_is_fail_closed() {
+        // Tabled families: known-clean.
+        for m in [
+            "vpmovmskb",
+            "vpmaxsd",
+            "vunpckhpd",
+            "vfmadd231pd",
+            "vblendvpd",
+            "vzeroupper",
+            "pshufd",
+            "popcnt",
+            "pxor",
+            "faddp",
+            "fstps",
+        ] {
+            assert_eq!(implicit_writes(m, " %r10, %xmm0"), Some(0), "{m}");
+        }
+        // No-operand fnstsw still hits the explicit AX arm.
+        assert_eq!(implicit_writes("fnstsw", ""), Some(RAX));
+        // Outside the table: unclassified, summary refused.
+        for m in [
+            "vfoo",
+            "vmyfutureext",
+            "pvxyz",
+            "vmcall",
+            "pconfig",
+            "vmlaunch",
+        ] {
+            assert_eq!(implicit_writes(m, " %r10, %xmm0"), None, "{m}");
+        }
     }
 
     #[test]
