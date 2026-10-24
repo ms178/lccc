@@ -499,10 +499,21 @@ fn schedule_function(
     };
     for (bi, block) in func.blocks.iter_mut().enumerate() {
         let n = block.instructions.len();
-        if n < 3 {
+        if n < 3 || (!block.source_spans.is_empty() && block.source_spans.len() != n) {
             continue;
         }
         let mut remaining_original = total_uses.clone();
+        // Phi operands are consumed on incoming edges.  They must not stay
+        // live through every pure region in the successor block merely
+        // because the lexical phi instruction is a scheduling barrier.
+        for inst in &block.instructions {
+            if matches!(inst, Instruction::Phi { .. }) {
+                for v in unique_instruction_uses(inst) {
+                    remaining_original[v as usize] =
+                        remaining_original[v as usize].saturating_sub(1);
+                }
+            }
+        }
         let mut final_order: Vec<usize> = (0..n).collect();
         let mut start = 0usize;
         while start < n {

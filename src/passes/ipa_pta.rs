@@ -71,6 +71,7 @@ enum ObjectKind {
     ExternalData,
     ConstantData,
     Alloca,
+    Heap,
     Function(usize),
     ExternalFunction,
 }
@@ -319,6 +320,15 @@ impl Solver {
     }
 
     fn mark_external(&mut self, site: usize, unknown_target: bool) {
+        self.mark_external_with_return(site, unknown_target, true);
+    }
+
+    fn mark_external_with_return(
+        &mut self,
+        site: usize,
+        unknown_target: bool,
+        unknown_return: bool,
+    ) {
         self.call_sites[site].external = true;
         if unknown_target {
             self.call_sites[site].is_pure = false;
@@ -335,7 +345,7 @@ impl Solver {
                 self.activate_escape(argument);
             }
         }
-        if let Some(destination) = self.call_sites[site].destination {
+        if unknown_return && let Some(destination) = self.call_sites[site].destination {
             self.insert(destination, UNKNOWN);
         }
     }
@@ -563,13 +573,11 @@ impl IpaPta {
         }
         for &object in points {
             if object == UNKNOWN {
-                if effects.unknown
-                    || effects
-                        .objects
-                        .0
-                        .iter()
-                        .any(|&modified| self.objects[modified as usize].escaped)
-                {
+                // Unknown provenance is not a proof that an unescaped object
+                // is unreachable: it can arise from an integer-to-pointer
+                // cast or an external entry point.  Any concrete write is
+                // therefore a may-alias with this address as well.
+                if effects.unknown || !effects.objects.0.is_empty() {
                     return true;
                 }
                 continue;
@@ -697,6 +705,9 @@ fn run_with_budget(
     if eliminated != 0 {
         module.for_each_function(super::dce::eliminate_dead_code);
     }
+    if std::env::var_os("CCC_IPA_PTA_STATS").is_some() {
+        eprintln!("[IPA-PTA] redundant-loads-forwarded={eliminated}");
+    }
     eliminated
 }
 
@@ -762,10 +773,12 @@ fn compute_effects(solver: &Solver, module: &IrModule) -> Vec<ModRef> {
                     }
                     Instruction::VaArg { va_list_ptr, .. } => {
                         if let Some(node) = node(solver, *va_list_ptr) {
-                            local_refs[fi].union_with(&pointer_effects(solver, node));
+                            let effects = pointer_effects(solver, node);
+                            local_mods[fi].union_with(&effects);
+                            local_refs[fi].union_with(&effects);
                         }
                     }
-                    Instruction::VaStart { va_list_ptr } => {
+                    Instruction::VaStart { va_list_ptr } | Instruction::VaEnd { va_list_ptr } => {
                         if let Some(node) = node(solver, *va_list_ptr) {
                             local_mods[fi].union_with(&pointer_effects(solver, node));
                         }
@@ -792,7 +805,9 @@ fn compute_effects(solver: &Solver, module: &IrModule) -> Vec<ModRef> {
                             local_mods[fi].union_with(&pointer_effects(solver, node));
                         }
                         if let Some(node) = node(solver, *va_list_ptr) {
-                            local_refs[fi].union_with(&pointer_effects(solver, node));
+                            let effects = pointer_effects(solver, node);
+                            local_mods[fi].union_with(&effects);
+                            local_refs[fi].union_with(&effects);
                         }
                     }
                     Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
@@ -928,6 +943,20 @@ fn operand_memory_pointer(solver: &mut Solver, function: usize, operand: &Operan
         Operand::Value(value) => Some(solver.memory_pointer(function, *value)),
         Operand::Const(_) => None,
     }
+}
+
+fn is_allocation_name(name: &str) -> bool {
+    matches!(
+        name,
+        "malloc"
+            | "calloc"
+            | "realloc"
+            | "strdup"
+            | "strndup"
+            | "aligned_alloc"
+            | "valloc"
+            | "pvalloc"
+    )
 }
 
 fn build_instruction(
@@ -1099,7 +1128,22 @@ fn build_instruction(
             let destination = info.dest.map(|dest| solver.value_node(function, dest.0));
             let site = solver.new_call_site(function, block, instruction, info, destination);
             let name = canonical_name(aliases, func);
-            if let Some(&target) = solver.function_indices.get(name) {
+            let target = solver.function_indices.get(name).copied();
+            let allocation = destination.is_some()
+                && is_allocation_name(name)
+                && target.is_none_or(|target| !solver.functions[target].safe_body);
+            if allocation {
+                let destination = destination.expect("allocation destination");
+                let object = solver.add_object(ObjectKind::Heap);
+                solver.insert(destination, object);
+                if name == "realloc"
+                    && let Some(Operand::Value(source)) = info.args.first()
+                {
+                    let source = solver.value_node(function, source.0);
+                    solver.add_edge(source, destination);
+                }
+                solver.mark_external_with_return(site, false, false);
+            } else if let Some(target) = target {
                 solver.bind_target(site, target);
             } else {
                 solver.mark_external(site, false);
@@ -1132,7 +1176,7 @@ fn build_instruction(
                 solver.insert(destination, UNKNOWN);
             }
         }
-        Instruction::VaStart { va_list_ptr } => {
+        Instruction::VaStart { va_list_ptr } | Instruction::VaEnd { va_list_ptr } => {
             solver.memory_pointer(function, *va_list_ptr);
         }
         Instruction::VaCopy { dest_ptr, src_ptr } => {
@@ -1152,8 +1196,7 @@ fn build_instruction(
             solver.memory_pointer(function, *dest_ptr);
             solver.memory_pointer(function, *va_list_ptr);
         }
-        Instruction::VaEnd { .. }
-        | Instruction::PgoCounterInc { .. }
+        Instruction::PgoCounterInc { .. }
         | Instruction::GetReturnF64Second { .. }
         | Instruction::GetReturnF32Second { .. }
         | Instruction::GetReturnF128Second { .. }
@@ -1172,6 +1215,16 @@ fn build_instruction(
         Instruction::SetStaticChain { src } => {
             if let Some(node) = solver.operand_node(function, src) {
                 solver.activate_escape(node);
+            }
+        }
+        Instruction::Intrinsic { dest, .. } if !inst.may_write_memory() => {
+            // Pure/readonly target intrinsics still need a conservative
+            // pointer result, but they do not make arbitrary caller memory
+            // modifiable.  This is important for vectorized call-heavy code:
+            // an unrelated SIMD operation must not become an IPA barrier.
+            if let Some(dest) = dest {
+                let node = solver.value_node(function, dest.0);
+                solver.insert(node, UNKNOWN);
             }
         }
         _ => mark_unmodeled(solver, function, block, instruction, inst),
@@ -1425,6 +1478,11 @@ mod tests {
             vec![alloca(0), load(1, 0), call("reader", vec![]), load(2, 0)],
             Some(Value(2)),
         );
+        let mut baseline = module(vec![reader.clone(), caller.clone()]);
+        assert_eq!(
+            super::super::redundant_loads::run(&mut baseline.functions[1]),
+            0
+        );
         let mut module = module(vec![reader, caller]);
         assert_eq!(run(&mut module, false), 1);
         assert_eq!(load_count(&module.functions[1]), 1);
@@ -1532,6 +1590,141 @@ mod tests {
         let mut module = module(vec![reader, caller]);
         assert_eq!(run(&mut module, false), 1);
         assert_eq!(load_count(&module.functions[1]), 1);
+    }
+
+    #[test]
+    fn recursive_summary_propagates_through_an_intermediate_caller() {
+        let mut recursive = function("recursive", IrType::Void);
+        recursive.params.push(pointer_param());
+        finish(
+            &mut recursive,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                copy_const(1, 4),
+                store(1, 0),
+                call("recursive", vec![Operand::Value(Value(0))]),
+            ],
+            None,
+        );
+        let mut outer = function("outer", IrType::Void);
+        outer.params.push(pointer_param());
+        finish(
+            &mut outer,
+            vec![
+                Instruction::ParamRef {
+                    dest: Value(0),
+                    param_idx: 0,
+                    ty: IrType::Ptr,
+                },
+                call("recursive", vec![Operand::Value(Value(0))]),
+            ],
+            None,
+        );
+        let mut caller = function("caller", IrType::I32);
+        finish(
+            &mut caller,
+            vec![
+                alloca(0),
+                load(1, 0),
+                call("outer", vec![Operand::Value(Value(0))]),
+                load(2, 0),
+            ],
+            Some(Value(2)),
+        );
+        let mut module = module(vec![recursive, outer, caller]);
+        assert_eq!(run(&mut module, false), 0);
+        assert_eq!(load_count(&module.functions[2]), 2);
+    }
+
+    #[test]
+    fn pointer_stored_in_global_escapes_before_an_unknown_call() {
+        let mut caller = function("caller", IrType::I32);
+        finish(
+            &mut caller,
+            vec![
+                alloca(0),
+                load(1, 0),
+                global_addr(3, "pointer_slot"),
+                Instruction::Store {
+                    val: Operand::Value(Value(0)),
+                    ptr: Value(3),
+                    ty: IrType::Ptr,
+                    seg_override: AddressSpace::Default,
+                    volatile: false,
+                },
+                call("unknown_external", vec![]),
+                load(2, 0),
+            ],
+            Some(Value(2)),
+        );
+        let mut module = module(vec![caller]);
+        assert_eq!(run(&mut module, false), 0);
+        assert_eq!(load_count(&module.functions[0]), 2);
+    }
+
+    #[test]
+    fn variadic_argument_edges_feed_va_arg_memory_effects() {
+        let mut variadic = function("variadic", IrType::Void);
+        variadic.is_variadic = true;
+        variadic.params.push(pointer_param());
+        finish(
+            &mut variadic,
+            vec![
+                alloca(1),
+                Instruction::VaArg {
+                    dest: Value(0),
+                    va_list_ptr: Value(1),
+                    result_ty: IrType::Ptr,
+                },
+                copy_const(2, 8),
+                store(2, 0),
+            ],
+            None,
+        );
+        let mut caller = function("caller", IrType::I32);
+        let mut invoke = call(
+            "variadic",
+            vec![Operand::Value(Value(4)), Operand::Value(Value(0))],
+        );
+        if let Instruction::Call { info, .. } = &mut invoke {
+            info.is_variadic = true;
+            info.num_fixed_args = 1;
+        }
+        finish(
+            &mut caller,
+            vec![alloca(0), alloca(4), load(1, 0), invoke, load(2, 0)],
+            Some(Value(2)),
+        );
+        let mut module = module(vec![variadic, caller]);
+        assert_eq!(run(&mut module, false), 0);
+        assert_eq!(load_count(&module.functions[1]), 2);
+    }
+
+    #[test]
+    fn semantic_interposition_disables_body_based_precision() {
+        let mut reader = function("reader", IrType::Void);
+        reader.is_static = false;
+        finish(&mut reader, vec![], None);
+        let mut caller = function("caller", IrType::I32);
+        finish(
+            &mut caller,
+            vec![
+                global_addr(0, "local_global"),
+                load(1, 0),
+                call("reader", vec![]),
+                load(2, 0),
+            ],
+            Some(Value(2)),
+        );
+        let mut module = module(vec![reader.clone(), caller.clone()]);
+        assert_eq!(run(&mut module, true), 0);
+        assert_eq!(load_count(&module.functions[1]), 2);
+        let mut native = module(vec![reader, caller]);
+        assert_eq!(run(&mut native, false), 1);
     }
 
     #[test]
