@@ -27,6 +27,10 @@ set -euo pipefail
 
 CCC=${CCC:-./target/release/lccc}
 GCC=${GCC:-gcc}
+if [[ $# -gt 0 ]]; then
+    echo "usage: $0" >&2
+    exit 2
+fi
 command -v "$GCC" >/dev/null 2>&1 || { echo "SKIP: no $GCC on PATH"; exit 0; }
 
 td=$(mktemp -d)
@@ -213,3 +217,6 @@ for opt in -O0 -O1 -O2 -O3; do
     fi
 done
 echo "PASS runtime: lccc -O0/-O1/-O2/-O3 agree with gcc -O2 ($ref)"
+
+# The sign-only CMOV regression is a separate, directly wired gate
+# (`check_sign_test_cmov.sh`); this gate owns the ZF-only counter-loop fold.

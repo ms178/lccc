@@ -4003,6 +4003,26 @@ are not obvious from the diff:
   at `ret`, and the text liveness no longer keeps the broadcast
   emitters' staging `movq %rdi, %rax` alive.
 
+- *A sign-test fold must name its own skip group.* The x86-64
+  `fold_arithmetic_test_sign_cmov` rewrite is bisected with
+  `CCC_PEEPHOLE_SKIP=sign_test_cmov`, not with the general `self_test` group it
+  used to share. `sk()` matches exact names; a kill switch that names the
+  function instead of the group is a no-op and lets a dead-pass A/B look green.
+  The same rule applies to the i686 twin's `CCC_NO_I686_SIGN_JCC`.
+- *Flag-exact producers earn the strict predicates.* `and`/`or`/`xor`
+  clear CF and OF exactly as a following `test` does, so `cmovg`/`cmovle`
+  (and i686 `jg`/`jle`) may keep their spelling when the self-TEST is deleted.
+  An `add`/`sub`/`inc`/`dec`/`neg` producer agrees only on ZF/SF/PF: its
+  `cmovge`/`cmovl` become `cmovns`/`cmovs` (or `jns`/`js`), its strict
+  predicates are refused, and any later CF/OF/AF reader vetoes the fold. This
+  is the overflow-safe law, including under `-fwrapv`. ANDN is excluded
+  because its PF is undefined, unlike TEST.
+- *A CI gate is wired directly or it is debt.* A new regression helper must
+  appear in both `ci_local.sh` and a hosted `run:` step. Routing it through a
+  wrapper option and recording it in `ci_gate_allowlist.txt` hides it from the
+  parity checker's path layer; the allowlist is a shrinking record, never a
+  parking place.
+
 The remaining debt is listed, measured, with its fix in
 `FOLLOWUP-2026-10-17-ext-vector-grid.md` (MEMORY-class parameter capture
 is the largest single item).

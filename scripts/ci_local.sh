@@ -1492,6 +1492,18 @@ gate "redundant-flags-compare" fast \
 gate "self-test-after-arith" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_self_test_after_arith.sh
 
+# A sign-only conditional after arithmetic can consume SUB's sign flag directly:
+# TEST clears OF, making TEST's `ge`/`l` exactly SUB's `ns`/`s`. The gate is
+# wired DIRECTLY in both mirrors (not through a wrapper's option), checks
+# signed-wrap edge outputs against GCC/Clang/ICX, exercises the dedicated
+# `sign_test_cmov` skip group, and pins strict `> 0` as a negative control.
+# The i686 leg uses the same fixture under -m32 with its own CFG proof.
+gate "arithmetic-test-sign-cmov" fast \
+    env CCC=target/fastbuild/lccc \
+    GCC_SIGN_CMOV="${GCC16:-gcc-16}" CLANG_SIGN_CMOV="${CLANG:-clang}" \
+    ICX_SIGN_CMOV="${ICX:-}" LCCC_FASTBUILD_BIN=target/fastbuild/lccc \
+    bash tests/regression/check_sign_test_cmov.sh
+
 # A gate must not report a FAILURE that did not happen.  Under `set -o
 # pipefail` a consumer that stops reading early (`head`, `grep -q`) kills its
 # producer with SIGPIPE and the pipeline then reports 141, so `if ... | grep -q`

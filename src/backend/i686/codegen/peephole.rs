@@ -7720,6 +7720,285 @@ fn eliminate_redundant_test_i686(store: &mut LineStore, infos: &mut [LineInfo]) 
     changed
 }
 
+// ── Pass: fold an arithmetic self-TEST into a sign-only branch ──────────────
+
+/// `subl %esi, %edx; testl %edx, %edx; jl .L` tests whether the *wrapped*
+/// result is negative.  TEST clears OF, so `jl` here is exactly `js`; the
+/// arithmetic producer has the same SF as the test at the same width.  The
+/// mirrored `jge` -> `jns` case is the non-negative predicate.  A logical
+/// AND/OR/XOR producer is flag-for-flag exact, so the strict `jg`/`jle`
+/// predicates are also admitted unchanged (their OF input is already the zero
+/// TEST would install).  All other conditions, width mismatches, redefinitions,
+/// barriers and unknown flag readers refuse conservatively.
+///
+/// The i686 backend lowers ternary selections to branches, not CMOVs, so this
+/// is the 32-bit twin of the x86-64 `fold_arithmetic_test_sign_cmov` pass.  It
+/// runs after the exact logical self-test eliminator (which already removes the
+/// TEST for `and`/`or`/`xor`) and before the sext/test fusion, with its own
+/// kill switch so an A/B can attribute the rewrite on its own.
+///
+/// Proof obligation after the branch: deleting TEST exposes the arithmetic
+/// producer's CF/OF/AF.  A bounded CFG walk from BOTH successors must reach a
+/// complete flag writer or a return without meeting another flag reader or an
+/// unresolvable edge.  This is stricter than the x86-64 ZF/SF/PF consumer
+/// licence and is cheap because i686 branches stay inside small generated
+/// blocks; it keeps the default-deny model of this module intact.
+fn fold_arithmetic_test_sign_jcc_i686(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    if std::env::var_os("CCC_NO_I686_SIGN_JCC").is_some() {
+        return false;
+    }
+
+    /// Parse `testl %R, %R` -> the tested GP family.  A byte/word form is
+    /// refused: the sign bit would live at a different position.
+    fn self_test_l(s: &str) -> Option<RegId> {
+        let rest = s.strip_prefix("testl ")?;
+        let comma = crate::backend::peephole_common::last_top_level_comma(rest.as_bytes())?;
+        let a = rest[..comma].trim();
+        let b = rest[comma + 1..].trim();
+        if a != b || !a.starts_with('%') || a.contains('(') {
+            return None;
+        }
+        let fam = register_family(a);
+        (fam <= REG_GP_MAX && fam != REG_ESP).then_some(fam)
+    }
+
+    /// Parse a result-producing ALU op -> (destination family, exact-flags).
+    /// `exact` is true for `and`/`or`/`xor`, whose CF and OF are cleared
+    /// exactly as TEST clears them; false for `add`/`sub`/`inc`/`dec`/`neg`,
+    /// which agree with TEST only on ZF/SF/PF.
+    fn arithmetic_result_writer(s: &str) -> Option<(RegId, bool)> {
+        let (mnem, rest) = s.split_once(' ')?;
+        let exact = match mnem {
+            "subl" | "addl" | "incl" | "decl" | "negl" => false,
+            "andl" | "orl" | "xorl" => true,
+            _ => return None,
+        };
+        let dest = if matches!(mnem, "incl" | "decl" | "negl") {
+            rest.trim()
+        } else {
+            let comma = crate::backend::peephole_common::last_top_level_comma(rest.as_bytes())?;
+            rest[comma + 1..].trim()
+        };
+        if !dest.starts_with('%') || dest.contains('(') {
+            return None;
+        }
+        let fam = register_family(dest);
+        (fam <= REG_GP_MAX && fam != REG_ESP).then_some((fam, exact))
+    }
+
+    /// A writer that redefines EVERY arithmetic flag, so the CF/OF/AF
+    /// divergence introduced by deleting TEST can no longer be observed.
+    fn complete_flag_writer(s: &str) -> bool {
+        matches!(
+            s.split_whitespace().next().unwrap_or(""),
+            "addl"
+                | "subl"
+                | "cmpl"
+                | "testl"
+                | "andl"
+                | "orl"
+                | "xorl"
+                | "imull"
+                | "mull"
+                | "divl"
+                | "idivl"
+                | "popfl"
+        )
+    }
+
+    /// Flag-neutral mnemonics a CFG walk may step over.  Anything else is
+    /// unknown and fails closed rather than being assumed harmless.
+    fn flag_neutral(s: &str) -> bool {
+        let m = s.split_whitespace().next().unwrap_or("");
+        m.starts_with("mov")
+            || m.starts_with("lea")
+            || matches!(m, "pushl" | "popl" | "push" | "pop")
+            || m.starts_with("nop")
+            || m.starts_with("prefetch")
+            || matches!(m, "cltd" | "cwtl" | "cbtw" | "cld" | "std")
+    }
+
+    /// From a conditional jump, prove neither successor reads the producer's
+    /// flags before a complete writer or a return.  The walk follows direct
+    /// unconditional jumps, resolves labels inside the enclosing function and
+    /// refuses indirect/unknown edges.  A later conditional jump, SETCC or
+    /// CMOV is a reader and vetoes; a partial writer (INC/DEC/NEG) does not end
+    /// the walk because it leaves CF alive.
+    fn no_later_flag_reader(store: &LineStore, infos: &[LineInfo], jcc: usize) -> bool {
+        let Some(&(fs, fe)) = function_ranges_i686(store, infos)
+            .iter()
+            .find(|&&(s, e)| s <= jcc && jcc < e)
+        else {
+            return false;
+        };
+        let mut labels: Vec<(&str, usize)> = Vec::new();
+        for n in fs..fe {
+            if infos[n].kind == LineKind::Label {
+                let t = trimmed(store, &infos[n], n);
+                if let Some(name) = t.strip_suffix(':').map(str::trim) {
+                    labels.push((name, n));
+                }
+            }
+        }
+        let resolve = |target: &str| -> Option<usize> {
+            labels
+                .iter()
+                .find(|(name, _)| *name == target)
+                .map(|(_, i)| *i)
+        };
+        let jtext = trimmed(store, &infos[jcc], jcc);
+        let Some((_, taken)) = parse_condjmp(jtext) else {
+            return false;
+        };
+        let Some(taken_idx) = resolve(taken) else {
+            return false;
+        };
+        let mut seen = vec![false; fe - fs];
+        let mut work = vec![jcc + 1, taken_idx];
+        while let Some(mut n) = work.pop() {
+            while n < fe {
+                if seen[n - fs] {
+                    break;
+                }
+                seen[n - fs] = true;
+                let t = trimmed(store, &infos[n], n);
+                if infos[n].is_nop()
+                    || t.is_empty()
+                    || infos[n].kind == LineKind::Label
+                    || (infos[n].kind == LineKind::Directive && infos[n].inert_dir)
+                {
+                    n += 1;
+                    continue;
+                }
+                if infos[n].kind == LineKind::InlineAsm
+                    || (infos[n].kind == LineKind::Directive && !infos[n].inert_dir)
+                {
+                    return false;
+                }
+                if matches!(
+                    infos[n].kind,
+                    LineKind::Ret | LineKind::RetN | LineKind::Call
+                ) {
+                    break;
+                }
+                if infos[n].kind == LineKind::JmpIndirect {
+                    return false;
+                }
+                if let Some((cc, target)) = parse_condjmp(t) {
+                    if cc == "mp" {
+                        match resolve(target) {
+                            Some(idx) => work.push(idx),
+                            None => return false,
+                        }
+                        break;
+                    }
+                    return false; // a later flag reader
+                }
+                if is_cond_jcc(t)
+                    || t.starts_with("set")
+                    || t.starts_with("cmov")
+                    || matches!(infos[n].kind, LineKind::SetCC { .. } | LineKind::CondJmp)
+                {
+                    return false;
+                }
+                if complete_flag_writer(t) {
+                    break;
+                }
+                if flag_neutral(t) {
+                    n += 1;
+                    continue;
+                }
+                return false; // unknown effect
+            }
+        }
+        true
+    }
+
+    let len = infos.len();
+    let mut changed = false;
+    let mut i = 0;
+    while i < len {
+        if infos[i].is_nop() {
+            i += 1;
+            continue;
+        }
+        let Some(fam) = self_test_l(trimmed(store, &infos[i], i)) else {
+            i += 1;
+            continue;
+        };
+        // The producer must be the immediately preceding real instruction; a
+        // barrier, label or any other writer between the two ends the proof.
+        let mut p = i;
+        while p > 0 {
+            p -= 1;
+            if steps_over_line(store, infos, p) {
+                continue;
+            }
+            break;
+        }
+        if p >= i || infos[p].is_barrier() {
+            i += 1;
+            continue;
+        }
+        let pt = trimmed(store, &infos[p], p);
+        let Some((pfam, exact)) = arithmetic_result_writer(pt) else {
+            i += 1;
+            continue;
+        };
+        if pfam != fam {
+            i += 1;
+            continue;
+        }
+        // The first real instruction after TEST must be the conditional branch.
+        let mut j = i + 1;
+        while j < len && steps_over_line(store, infos, j) {
+            j += 1;
+        }
+        if j >= len {
+            break;
+        }
+        let jt = trimmed(store, &infos[j], j);
+        let Some((cc, target)) = parse_condjmp(jt) else {
+            i += 1;
+            continue;
+        };
+        let canonical = match cc {
+            "nge" => "l",
+            "nl" => "ge",
+            "nle" => "g",
+            "ng" => "le",
+            other => other,
+        };
+        let replacement = match (exact, canonical) {
+            (_, "l") => "s",
+            (_, "ge") => "ns",
+            (true, "g") => "g",
+            (true, "le") => "le",
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        if !no_later_flag_reader(store, infos, j) {
+            i += 1;
+            continue;
+        }
+        let target = target.to_string();
+        infos[i].kind = LineKind::Nop;
+        store.replace(j, format!("    j{replacement} {target}"));
+        infos[j] = LineInfo {
+            kind: LineKind::CondJmp,
+            trim_start: 4,
+            has_indirect_mem: false,
+            ebp_offset: EBP_OFFSET_NONE,
+            inert_dir: false,
+        };
+        changed = true;
+        i = j + 1;
+    }
+    changed
+}
+
 // ── Pass: sign-extend + test fusion ──────────────────────────────────────────
 
 /// Fuse `movs{b,w}l %L, %eR` + `testl %eR, %eR` into `test{b,w} %L, %L`.
@@ -13880,6 +14159,11 @@ pub fn peephole_optimize(asm: String) -> String {
     let global_changed = global_changed | narrow_dead_and_to_testb(&mut store, &mut infos);
 
     let global_changed = global_changed | eliminate_redundant_test_i686(&mut store, &mut infos);
+    // The 32-bit sign-only twin runs after the exact logical self-test fold:
+    // logical producers are already gone, arithmetic producers still carry a
+    // redundant TEST that the branch below can consume directly.
+    let global_changed =
+        global_changed | fold_arithmetic_test_sign_jcc_i686(&mut store, &mut infos);
     let global_changed = global_changed | fuse_sext_testb(&mut store, &mut infos);
     let global_changed = global_changed | collapse_slot_rmw_i686(&mut store, &mut infos);
 
@@ -13904,6 +14188,7 @@ pub fn peephole_optimize(asm: String) -> String {
             changed2 |= narrow_dead_and_to_testb(&mut store, &mut infos);
 
             changed2 |= eliminate_redundant_test_i686(&mut store, &mut infos);
+            changed2 |= fold_arithmetic_test_sign_jcc_i686(&mut store, &mut infos);
             changed2 |= fuse_sext_testb(&mut store, &mut infos);
             pass_count2 += 1;
         }
@@ -24041,5 +24326,146 @@ mod dispatch_and_pin_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sign_test_jcc_tests {
+    use super::*;
+
+    fn run_pass(asm: &str) -> (bool, String) {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        pin_inline_asm_regions(&store, &mut infos);
+        let changed = fold_arithmetic_test_sign_jcc_i686(&mut store, &mut infos);
+        let out = (0..infos.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (changed, out)
+    }
+
+    fn run_full(body: &str) -> String {
+        peephole_optimize(format!(
+            ".text\nnonnegative_difference:\n.cfi_startproc\n{body}\n.cfi_endproc\n.size nonnegative_difference, .-nonnegative_difference\n"
+        ))
+    }
+
+    fn base_body(cc: &str) -> String {
+        format!(
+            "    subl %esi, %edx\n    testl %edx, %edx\n    j{cc} .Ltrue\n    movl %edx, %eax\n    jmp .Lend\n.Ltrue:\n    xorl %eax, %eax\n.Lend:\n    ret\n"
+        )
+    }
+
+    #[test]
+    fn arithmetic_negative_branch_consumes_the_sign_flag() {
+        let out = run_full(&base_body("l"));
+        assert!(!out.contains("testl %edx, %edx"), "{out}");
+        assert!(out.contains("js .Ltrue"), "{out}");
+        assert!(!out.contains("jl .Ltrue"), "{out}");
+    }
+
+    #[test]
+    fn arithmetic_nonnegative_branch_consumes_the_inverted_sign_flag() {
+        let out = run_full(&base_body("ge"));
+        assert!(!out.contains("testl %edx, %edx"), "{out}");
+        assert!(out.contains("jns .Ltrue"), "{out}");
+    }
+
+    #[test]
+    fn strict_positive_branch_is_refused() {
+        let (changed, out) = run_pass(&format!(
+            ".text\nf:\n.cfi_startproc\n{}\n.cfi_endproc\n.size f, .-f\n",
+            base_body("g")
+        ));
+        assert!(!changed, "{out}");
+        assert!(out.contains("testl %edx, %edx"), "{out}");
+        assert!(out.contains("jg .Ltrue"), "{out}");
+    }
+
+    #[test]
+    fn condition_synonyms_are_canonicalised() {
+        let (changed, out) = run_pass(&format!(
+            ".text\nf:\n.cfi_startproc\n{}\n.cfi_endproc\n.size f, .-f\n",
+            base_body("nge")
+        ));
+        assert!(changed, "{out}");
+        assert!(out.contains("js .Ltrue"), "{out}");
+    }
+
+    #[test]
+    fn a_later_flag_reader_vetoes_the_fold() {
+        let body = "    subl %esi, %edx\n    testl %edx, %edx\n    jl .Ltrue\n    movl %edx, %eax\n    je .Lother\n    jmp .Lend\n.Ltrue:\n    xorl %eax, %eax\n.Lend:\n    ret\n";
+        let (changed, out) = run_pass(&format!(
+            ".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n.size f, .-f\n"
+        ));
+        assert!(!changed, "{out}");
+        assert!(out.contains("testl %edx, %edx"), "{out}");
+    }
+
+    #[test]
+    fn an_unresolvable_jump_vetoes_the_fold() {
+        let body = "    subl %esi, %edx\n    testl %edx, %edx\n    jl .Ltrue\n    movl %edx, %eax\n    jmp *%ecx\n.Ltrue:\n    xorl %eax, %eax\n    ret\n";
+        let (changed, out) = run_pass(&format!(
+            ".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n.size f, .-f\n"
+        ));
+        assert!(!changed, "{out}");
+    }
+
+    #[test]
+    fn an_exact_logical_producer_admits_strict_positive() {
+        let body = "    andl $7, %edx\n    testl %edx, %edx\n    jg .Ltrue\n    movl %edx, %eax\n    jmp .Lend\n.Ltrue:\n    xorl %eax, %eax\n.Lend:\n    ret\n";
+        let (changed, out) = run_pass(&format!(
+            ".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n.size f, .-f\n"
+        ));
+        assert!(changed, "{out}");
+        assert!(!out.contains("testl %edx, %edx"), "{out}");
+        assert!(out.contains("jg .Ltrue"), "{out}");
+    }
+
+    #[test]
+    fn a_flag_neutral_redefinition_between_producer_and_test_is_refused() {
+        // An ALU write is itself a valid producer; a value change that does
+        // NOT set flags must leave the pair alone.
+        let body = "    subl %esi, %edx\n    movl %ecx, %edx\n    testl %edx, %edx\n    jl .Ltrue\n    movl %edx, %eax\n    jmp .Lend\n.Ltrue:\n    xorl %eax, %eax\n.Lend:\n    ret\n";
+        let (changed, out) = run_pass(&format!(
+            ".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n.size f, .-f\n"
+        ));
+        assert!(!changed, "{out}");
+        assert!(out.contains("testl %edx, %edx"), "{out}");
+    }
+
+    #[test]
+    fn zero_count_shifts_and_flag_snapshots_cannot_hide_a_reader() {
+        for op in [
+            "shll $0, %eax",
+            "shrl %cl, %eax",
+            "sarl $32, %eax",
+            "pushfl",
+            "pushf",
+        ] {
+            let body = base_body("l").replace(
+                "    movl %edx, %eax",
+                &format!("    {op}\n    adcl $0, %eax"),
+            );
+            let (changed, out) = run_pass(&format!(
+                ".text\nf:\n.cfi_startproc\n{body}\n.cfi_endproc\n.size f, .-f\n"
+            ));
+            assert!(!changed, "{op}: {out}");
+        }
+    }
+
+    #[test]
+    fn dedicated_kill_switch_disables_the_pass() {
+        let _guard = crate::test_support::EnvGuard::set("CCC_NO_I686_SIGN_JCC", "1");
+        let (changed, out) = run_pass(&format!(
+            ".text\nf:\n.cfi_startproc\n{}\n.cfi_endproc\n.size f, .-f\n",
+            base_body("l")
+        ));
+        assert!(!changed, "{out}");
+        assert!(out.contains("testl %edx, %edx"), "{out}");
     }
 }

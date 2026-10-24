@@ -1399,6 +1399,23 @@ fn peephole_optimize_inner(
                 changed |= c;
             }
         }
+        // Dedicated switch: the sign-CMOV fold has its own flag-lifetime
+        // proof and must be bisectable without also disabling the general
+        // self-test elimination below (whose licence is a ZF-only consumer
+        // walk, not the sign/SF proof this one performs).
+        if !sk("sign_test_cmov") {
+            {
+                let c = flag_peepholes::fold_arithmetic_test_sign_cmov(&mut store, &mut infos);
+                trace(
+                    "fold_arithmetic_test_sign_cmov",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+            }
+        }
         if !sk("self_test") {
             {
                 let c = flag_peepholes::eliminate_redundant_self_test(&mut store, &mut infos);

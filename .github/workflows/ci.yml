@@ -2449,6 +2449,12 @@ jobs:
         # consumers, kept for `while ((n -= 3) > 0)`) plus a matcher
         # self-test, so it cannot pass vacuously.
         bash tests/regression/check_self_test_after_arith.sh
+        # Sign-only SUB/TEST/CMOV: a dedicated gate, directly wired here and in
+        # ci_local.sh.  The same script also carries the i686 branch-fold leg.
+        env CCC=target/fastbuild/lccc \
+          GCC_SIGN_CMOV="${GCC16:-gcc-16}" CLANG_SIGN_CMOV="${CLANG:-clang}" \
+          ICX_SIGN_CMOV="${ICX:-}" LCCC_FASTBUILD_BIN=target/fastbuild/lccc \
+          bash tests/regression/check_sign_test_cmov.sh
         python3 -m unittest discover -s tests/corpus -p 'test_*.py'
         # ZERO-REM-2 + chained exit phis: the hoisted FMA transform's A
         # factor lives in a fixed register (%ymm1) with no SSA edge to its
@@ -2713,14 +2719,29 @@ jobs:
         LCCC_TEST_REAL_ICX: '1'
         CCC: target/fastbuild/lccc
       run: |
+        set -euo pipefail
+        # Surface the tail as check annotations as well as retaining the full
+        # log: restricted clients may be unable to follow signed log redirects.
+        exec > >(tee intel-evidence/dispatch.log) 2>&1
+        trap 'status=$?; if [ "$status" -ne 0 ]; then while IFS= read -r line; do printf "::error::%s\n" "$line"; done < <(tail -n 30 intel-evidence/dispatch.log); fi' EXIT
         python3 scripts/test_local_oracles.py
-        for fixture in popcount_loop_idiom crc32_index_narrowing_variants affine_scaled_index_matrix; do
-          "$LCCC_ICX_BIN" -O2 -Wall -Wextra -Werror "tests/regression/$fixture.c" -o "intel-evidence/$fixture-icx"
-          target/fastbuild/lccc -O2 -Wall -Wextra -Werror "tests/regression/$fixture.c" -o "intel-evidence/$fixture-lccc"
+        for fixture in popcount_loop_idiom crc32_index_narrowing_variants affine_scaled_index_matrix sign_test_cmov; do
+          "$LCCC_ICX_BIN" -O2 -fwrapv -Wall -Wextra -Werror "tests/regression/$fixture.c" -o "intel-evidence/$fixture-icx"
+          target/fastbuild/lccc -O2 -fwrapv -Wall -Wextra -Werror "tests/regression/$fixture.c" -o "intel-evidence/$fixture-lccc"
           "intel-evidence/$fixture-icx" > "intel-evidence/$fixture-icx.txt"
           "intel-evidence/$fixture-lccc" > "intel-evidence/$fixture-lccc.txt"
           diff -u "intel-evidence/$fixture-icx.txt" "intel-evidence/$fixture-lccc.txt"
         done
+        # The full differential gate runs here too, where a real authenticated
+        # ICX 2026.2 binary exists; its local mirror skips ICX only when the
+        # vendor snapshot is unavailable on the host.
+        # This lane's primary oracle is ICX; its GCC leg uses the runner
+        # default.  The pinned GCC 16.2 differential runs in
+        # backend-contracts-b, which provisions that exact oracle.
+        env CCC=target/fastbuild/lccc \
+          GCC_SIGN_CMOV="${GCC16:-gcc}" CLANG_SIGN_CMOV="${CLANG:-clang}" \
+          ICX_SIGN_CMOV="$LCCC_ICX_BIN" LCCC_FASTBUILD_BIN=target/fastbuild/lccc \
+          bash tests/regression/check_sign_test_cmov.sh
     - name: FP select min/max matrix against ICX
       run: |
         set -euo pipefail
