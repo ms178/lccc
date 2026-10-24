@@ -431,10 +431,12 @@ incompatibilities, not LCCC passes or LCCC failures; no LCCC/GCC probe is
 omitted. LLVM 23.1.3's `X86CallingConv.td` passes only `v4f32` in XMM with
 SSE1 but no SSE2, whereas GCC/LCCC also use XMM for the tested integer/double
 vectors, and Clang's no-SSE vector return rule differs from GCC stack/sret.
-LLVM's `-sse` also disables dependent SSE2 without a reverse implication from
-a later `+sse`, so its SSE-restored row is SSE-only while GCC/LCCC restore
-SSE2. Linking incompatible families is not a valid differential test; all
-compatible mixed rows and all GCC/LCCC reduced-ISA rows remain mandatory.
+The earlier source-only inference that Clang's `-mno-sse -msse` remains
+SSE-only was disproved by the hosted 23.1.3 executable probe: it defines
+`__SSE2__` after that ordered sequence, so the gate now expects SSE2 for all
+three compiler families in `sse-restored`. Linking incompatible families is
+not a valid differential test; all compatible mixed rows and all GCC/LCCC
+reduced-ISA rows remain mandatory.
 Compile-time `__SSE__`/`__SSE2__`/`__SSE3__` checks and non-vacuous PSHUFD/XMM
 assembly ceilings cover states that a host runtime cannot observe.
 Integer element widths 8/16/32/64, double bit patterns, indirect calls,

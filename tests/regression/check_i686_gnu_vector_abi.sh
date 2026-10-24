@@ -120,13 +120,10 @@ for mode in default sse2 sse-only sse2-denied arch-denied sse-restored no-sse; d
     esac
     flags=("${base_flags[@]}" "${isa_flags[@]}")
     for compiler in "$ccc" "$GCC_ORACLE_BIN" "$CLANG_ORACLE_BIN"; do
+        # The hosted Clang 23.1.3 probe, like GCC/LCCC, reports SSE2 after
+        # this ordered -mno-sse -msse sequence. Do not substitute a
+        # source-only feature-implication inference for the executable probe.
         compiler_expect_sse2=$expect_sse2
-        if [[ $mode == sse-restored && $compiler == "$CLANG_ORACLE_BIN" ]]; then
-            # LLVM's -sse disables dependent SSE2, while a later +sse has no
-            # reverse implication. GCC/LCCC instead restore their SSE2
-            # baseline because there was no independent -mno-sse2 request.
-            compiler_expect_sse2=0
-        fi
         extra=()
         [[ $compiler == "$ccc" ]] || extra=(-B"$as_dir/")
         "$compiler" "${flags[@]}" "${extra[@]}" \
