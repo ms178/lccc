@@ -185,7 +185,7 @@ for mode in default sse2 sse-only sse2-denied arch-denied sse-restored no-sse; d
                 echo "run: $mode $compiler -$opt / $driver driver"
                 "$compiler" "${flags[@]}" "${extra[@]}" -"$opt" -c "$fixture/functions.c" -o "$tmp/functions.o"
                 if [[ $compiler == "$ccc" && $mode == no-sse ]] \
-                    && objdump -d "$tmp/functions.o" | grep -q '%xmm'; then
+                    && objdump -d "$tmp/functions.o" | grep -c '%xmm' >/dev/null; then
                     echo "FAIL: no-sse $opt emitted an XMM instruction in ABI functions" >&2
                     exit 1
                 fi
@@ -199,7 +199,7 @@ for mode in default sse2 sse-only sse2-denied arch-denied sse-restored no-sse; d
                 fi
                 "$compiler" "${flags[@]}" "${extra[@]}" -"$opt" -DSHUFFLE_FUNCTIONS_ONLY -c "$tmp/typed.c" -o "$tmp/functions.o"
                 if [[ $compiler == "$ccc" && $mode == no-sse ]] \
-                    && objdump -d "$tmp/functions.o" | grep -q '%xmm'; then
+                    && objdump -d "$tmp/functions.o" | grep -c '%xmm' >/dev/null; then
                     echo "FAIL: no-sse $opt emitted an XMM instruction in typed functions" >&2
                     exit 1
                 fi
