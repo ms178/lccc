@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Bounded host measurement for the i686 stack-copy/alignment optimizations.
-# This is deliberately a manual audit, not a timing gate: the two binaries use
+# This is deliberately a bounded audit, not a timing gate: the two binaries use
 # different target ISA ceilings and the result is reported with the host name.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -132,7 +132,7 @@ except OSError:
     pass
 report = {
     "schema": 1,
-    "scope": "manual bounded i686 SSE versus no-SSE target comparison; not a universal performance claim",
+    "scope": "bounded i686 SSE versus no-SSE target comparison; not a universal performance claim",
     "compiler": subprocess.check_output([ccc, "--version"], text=True).splitlines()[0],
     "host": host,
     "iterations_per_run": 5000000,

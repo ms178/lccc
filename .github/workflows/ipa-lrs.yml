@@ -87,9 +87,7 @@ jobs:
         run: |
           PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
             CCC=target/fastbuild/lccc bash tests/regression/check_i686_gnu_vector_abi.sh
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            CCC=target/fastbuild/lccc bash tests/regression/measure_i686_vector_copy.sh
-          fi
+          CCC=target/fastbuild/lccc bash tests/regression/measure_i686_vector_copy.sh
       - name: Run IPA/LRS correctness and performance harness
         env:
           CCC: target/fastbuild/lccc
