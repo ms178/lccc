@@ -295,7 +295,7 @@ impl X86Codegen {
         &mut self,
         args: &[Operand],
         arg_classes: &[CallArgClass],
-        _arg_types: &[IrType],
+        arg_types: &[IrType],
         stack_arg_space: usize,
         _fptr_spill: usize,
         _f128_temp_space: usize,
@@ -541,7 +541,11 @@ impl X86Codegen {
                     }
                 }
                 CallArgClass::StructByValStack { size: 16 }
-                    if struct_arg_is_f128_sse.get(si).copied().unwrap_or(false) =>
+                    if crate::backend::call_abi::is_scalar_f128_sse_arg(
+                        arg_types,
+                        struct_arg_is_f128_sse,
+                        si,
+                    ) =>
                 {
                     // Scalar _Float128/_Decimal128 overflow keeps the same
                     // 16-byte stack slot as a one-XMM aggregate, but its
@@ -1753,9 +1757,7 @@ impl X86Codegen {
                 self.state.emit("    movdqu %xmm0, (%rsp)");
             }
             Operand::Const(c) => {
-                let bits = crate::backend::call_abi::f128_sse_const_bits(*c).unwrap_or_else(|| {
-                    panic!("internal error: {c:?} is not a 16-byte SSE scalar constant")
-                });
+                let bits = crate::backend::call_abi::f128_sse_const_image(*c);
                 for (offset, half) in [(0usize, bits as u64), (8, (bits >> 64) as u64)] {
                     if half == 0 {
                         self.state
@@ -1787,19 +1789,15 @@ impl X86Codegen {
     pub(super) fn emit_f128_sse_operand_to_xmm(&mut self, op: &Operand, xmm: &str) {
         let bits: u128 = match op {
             Operand::Value(v) => {
-                let Some(slot) = self.state.get_slot(v.0) else {
-                    panic!(
-                        "internal error: 16-byte SSE scalar v{} has no stack slot",
-                        v.0
-                    );
-                };
+                let slot = crate::backend::call_abi::require_f128_sse_value_slot(
+                    self.state.get_slot(v.0),
+                    v.0,
+                );
                 self.state.out.emit_instr_rbp_reg("    movdqu", slot.0, xmm);
                 return;
             }
             Operand::Const(c) => {
-                let bits = crate::backend::call_abi::f128_sse_const_bits(*c).unwrap_or_else(|| {
-                    panic!("internal error: {c:?} is not a 16-byte SSE scalar constant")
-                });
+                let bits = crate::backend::call_abi::f128_sse_const_image(*c);
                 if bits == 0 {
                     // Do not use IrConst::is_zero here: -0.0 must retain its
                     // sign bit. Only the all-zero 16-byte image takes this arm.

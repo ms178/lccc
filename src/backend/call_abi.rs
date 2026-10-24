@@ -39,6 +39,36 @@ pub(crate) fn f128_sse_const_bits(c: IrConst) -> Option<u128> {
     }
 }
 
+/// Return the object image after the lowering invariant has been checked in
+/// one place. Keeping this internal-error path shared avoids architecture-
+/// specific copies of both the conversion policy and its diagnostic.
+pub(crate) fn f128_sse_const_image(c: IrConst) -> u128 {
+    f128_sse_const_bits(c)
+        .unwrap_or_else(|| panic!("internal error: {c:?} is not a 16-byte SSE scalar constant"))
+}
+
+/// Distinguish a scalar 16-byte VALUE from an ext-vector/aggregate ADDRESS.
+/// i686 deliberately reuses the f128 alignment marker for decomposed XMM
+/// vector pieces, so the marker alone is not sufficient for marshalling.
+/// Both scalar `_Float128` and `_Decimal128` have the U128 IR carrier; an
+/// `__int128` argument cannot be misselected because the CType-derived marker
+/// is false for it.
+pub(crate) fn is_scalar_f128_sse_arg(
+    arg_types: &[IrType],
+    struct_arg_is_f128_sse: &[bool],
+    index: usize,
+) -> bool {
+    arg_types.get(index).copied() == Some(IrType::U128)
+        && struct_arg_is_f128_sse.get(index).copied().unwrap_or(false)
+}
+
+/// Scalar SSE-carrier values are always homed in a 16-byte slot. Share the
+/// explicit invariant failure between x86-64 and i686 rather than silently
+/// manufacturing a partial/zero-filled object when malformed IR violates it.
+pub(crate) fn require_f128_sse_value_slot<T>(slot: Option<T>, value: u32) -> T {
+    slot.unwrap_or_else(|| panic!("internal error: 16-byte SSE scalar v{value} has no stack slot"))
+}
+
 // ---------------------------------------------------------------------------
 // CallArgClass — caller-side classification (used by emit_call_*)
 // ---------------------------------------------------------------------------
@@ -1897,6 +1927,21 @@ mod tests {
             core.classes[0],
             CoreArgClass::StructByValStack { size: 16 }
         ));
+    }
+
+    #[test]
+    fn scalar_f128_marshalling_rejects_vector_address_markers() {
+        // i686 ext-vector XMM pieces reuse the alignment marker but carry
+        // Ptr operands. Only the genuine U128 scalar with the marker may use
+        // the value-copy path; missing metadata and other carriers fail closed
+        // to the aggregate/ordinary-I128 paths respectively.
+        let types = [IrType::Ptr, IrType::U128, IrType::U128, IrType::I128];
+        let markers = [true, true, false, true];
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 0));
+        assert!(is_scalar_f128_sse_arg(&types, &markers, 1));
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 2));
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 3));
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 4));
     }
 
     #[test]
