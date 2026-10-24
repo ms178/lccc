@@ -120,7 +120,9 @@ their passes:
 indirect, escaping, variadic, recursive, volatile-boundary, and high-pressure
 cases. It compares baseline/feature output and strict available GCC 16.2,
 Clang 23.1.3, and ICX 2026.2 oracles, checks a positive IPA forwarding witness,
-and records an interleaved median timing report. ICX is explicitly run with
+and records an interleaved median timing report. Both a positive IPA forwarding
+witness and a positive changed-region LRS witness are required, so a silent
+no-op cannot produce a green correctness run. ICX is explicitly run with
 `-fp-model=strict`.
 
 The Rust unit tests additionally pin fail-before/pass-after behavior for the

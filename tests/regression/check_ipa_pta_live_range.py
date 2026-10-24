@@ -54,7 +54,7 @@ CASES = [
         "ipa-readonly-forwarding",
         r'''
 #include <stdio.h>
-static int cell = 7;
+int cell = 7;
 static __attribute__((noinline)) void read_only(int *p) {
     /* Keep a real memory reference in the callee without writing it. */
     if (*(volatile int *)p == -12345) __builtin_trap();
@@ -171,16 +171,27 @@ int main(void) {
 #include <stdio.h>
 #include <stdint.h>
 static __attribute__((noinline)) uint32_t pressure(uint32_t x) {
+    /* Enough independent definitions to exceed the x86-64 GP budget.  Most
+       inputs die at the paired operations, giving the scheduler a real
+       pressure-reducing alternative rather than a cosmetic permutation. */
     uint32_t a0 = x + 1, a1 = x ^ 0x13579bdfu, a2 = x * 3 + 7;
     uint32_t a3 = x + 11, a4 = x ^ 0x2468ace0u, a5 = x * 5 + 13;
     uint32_t a6 = x + 17, a7 = x ^ 0x55aa33ccu, a8 = x * 7 + 19;
-    uint32_t a9 = x + 23, aa = x ^ 0x10203040u, ab = x * 9 + 29;
+    uint32_t a9 = x + 23, a10 = x ^ 0x10203040u, a11 = x * 9 + 29;
+    uint32_t a12 = x + 31, a13 = x ^ 0x31415926u, a14 = x * 11 + 37;
+    uint32_t a15 = x + 41, a16 = x ^ 0x27182818u, a17 = x * 13 + 43;
+    uint32_t a18 = x + 47, a19 = x ^ 0xdeadbeefu;
     uint32_t b0 = a0 * 31 + a1, b1 = a2 * 37 + a3;
     uint32_t b2 = a4 * 41 + a5, b3 = a6 * 43 + a7;
-    uint32_t b4 = a8 * 47 + a9, b5 = aa * 53 + ab;
+    uint32_t b4 = a8 * 47 + a9, b5 = a10 * 53 + a11;
+    uint32_t b6 = a12 * 59 + a13, b7 = a14 * 61 + a15;
+    uint32_t b8 = a16 * 67 + a17, b9 = a18 * 71 + a19;
     uint32_t c0 = b0 + b1 * 3, c1 = b2 + b3 * 5, c2 = b4 + b5 * 7;
+    uint32_t c3 = b6 + b7 * 11, c4 = b8 + b9 * 13;
     uint32_t d0 = c0 ^ (c1 + 0x9e3779b9u), d1 = c2 ^ (c0 + 0x7f4a7c15u);
-    return d0 + d1 * 3 + b0 + b2 + b4 + a1 + a5 + a9;
+    uint32_t d2 = c3 ^ (c4 + 0x6a09e667u);
+    return d0 + d1 * 3 + d2 * 5 + b0 + b2 + b4 + b6 + b8
+         + a1 + a5 + a9 + a13 + a17;
 }
 int main(void) {
     uint32_t sum = 0;
@@ -234,6 +245,10 @@ def host_cpu() -> dict[str, str]:
 
 def forwarding_counts(text: str) -> list[int]:
     return [int(value) for value in re.findall(r"redundant-loads-forwarded=(\d+)", text)]
+
+
+def shrinkage_counts(text: str) -> list[int]:
+    return [int(value) for value in re.findall(r"\[LR-SHRINK\][^\n]*?changed=(\d+)", text)]
 
 
 def version(compiler: str) -> str:
@@ -343,6 +358,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     }
     failures = []
     forwarding_witness = False
+    shrinkage_witness = False
     with tempfile.TemporaryDirectory(prefix="lccc-ipa-lrs-") as temporary:
         directory = Path(temporary)
         for case in CASES:
@@ -352,6 +368,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                      "oracles": [], "variants": []}
             if any(count > 0 for count in forwarding_counts(feature.get("compile_stderr", ""))):
                 forwarding_witness = True
+            if any(count > 0 for count in shrinkage_counts(feature.get("compile_stderr", ""))):
+                shrinkage_witness = True
             if not args.skip_matrix:
                 for label, flags in (("O0", ("-O0",)), ("O1", ("-O1",)),
                                      ("O3", ("-O3",)), ("PIC", ("-fPIC",))):
@@ -362,6 +380,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                         extra_flags=flags)
                     if any(count > 0 for count in forwarding_counts(variant_feature.get("compile_stderr", ""))):
                         forwarding_witness = True
+                    if any(count > 0 for count in shrinkage_counts(variant_feature.get("compile_stderr", ""))):
+                        shrinkage_witness = True
                     variant = {"name": label, "flags": flags,
                                "baseline": variant_baseline, "feature": variant_feature}
                     entry["variants"].append(variant)
@@ -397,6 +417,8 @@ def main(argv: Iterable[str] | None = None) -> int:
 
         if not forwarding_witness:
             failures.append("no IPA forwarding opportunity was exercised in the correctness matrix")
+        if not shrinkage_witness:
+            failures.append("no live-range shrinkage opportunity was exercised in the correctness matrix")
 
         if not args.skip_performance:
             for case in CASES:
@@ -434,9 +456,9 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     report["failures"] = failures
     if failures:
-        if not forwarding_witness:
+        if not forwarding_witness or not shrinkage_witness:
             for entry in report["cases"]:
-                print(f"IPA STATS {entry['name']}:\n{entry['lccc_feature'].get('compile_stderr', '')[-8000:]}", file=sys.stderr)
+                print(f"IPA/LRS STATS {entry['name']}:\n{entry['lccc_feature'].get('compile_stderr', '')[-8000:]}", file=sys.stderr)
         def diagnostic_records(entry):
             yield entry["lccc_baseline"]
             yield entry["lccc_feature"]
@@ -458,7 +480,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                         .replace("\n", "%0A"))
             for failure in failures:
                 print(f"::error title=IPA/LRS harness::{escape_annotation(failure)}")
-            if not forwarding_witness:
+            if not forwarding_witness or not shrinkage_witness:
                 # Hosted log/artifact downloads are not available in every
                 # CI environment. Keep the decisive counter evidence in the
                 # check-run annotations as well as the JSON report.
