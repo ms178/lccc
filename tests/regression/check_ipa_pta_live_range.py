@@ -55,9 +55,12 @@ CASES = [
         r'''
 #include <stdio.h>
 int cell = 7;
+static volatile int observed;
 static __attribute__((noinline)) void read_only(int *p) {
-    /* Keep a real memory reference in the callee without writing it. */
-    if (*(volatile int *)p == -12345) __builtin_trap();
+    /* The volatile access prevents the earlier purity pass from deleting
+       this call.  Its only write is to a distinct object, so IPA must retain
+       the caller's load of cell while still modelling the side effect. */
+    observed = *(volatile int *)p;
 }
 int main(void) {
     /* A global keeps this witness after early scalar replacement: the
@@ -66,7 +69,7 @@ int main(void) {
     read_only(&cell);
     int after = cell;
     printf("%d %d\n", before, after);
-    return before != 7 || after != 7;
+    return before != 7 || after != 7 || observed != 7;
 }
 ''',
         performance=True,
