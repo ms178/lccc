@@ -667,6 +667,30 @@ fn i686_memory_displacement(
     )
 }
 
+/// Retain the shared vector encoder's address bytes (including VSIB), but
+/// reconstruct its relocation using the i686 symbol/modifier/addend rules.
+/// The caller has excluded TLS protocol relocations for vector consumers.
+pub(super) fn i686_vector_memory_relocation(
+    displacement: &Displacement,
+    offset: usize,
+) -> Result<Relocation, String> {
+    let (_, pending) = i686_memory_displacement(displacement);
+    let mut pending = pending.ok_or("missing delegated memory relocation")?;
+    i686_validate_pending_relocation(&mut pending, false)?;
+    let modifier = pending
+        .modifier
+        .ok_or("missing delegated relocation modifier")?;
+    let reloc_type = i686_modifier_reloc(modifier)
+        .ok_or_else(|| format!("unsupported relocation modifier: @{modifier}"))?;
+    Ok(i686_make_relocation(
+        offset,
+        pending.symbol,
+        reloc_type,
+        pending.addend,
+        pending.diff_symbol,
+    ))
+}
+
 /// Validate the relocation-width contract before emitting any bytes.
 ///
 /// The addend itself need not fit the final relocation field: it is

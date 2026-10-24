@@ -358,6 +358,21 @@ impl InstructionEncoder {
         for op in &instr.operands {
             validate_i686_operand_registers(op)?;
         }
+        // TLS descriptor/IE protocols constrain the consuming opcode. A
+        // vector instruction cannot stand in for their LEA/MOV/ADD sequence,
+        // whether encoded locally (legacy SSE/MMX) or by the shared core.
+        if instr.operands.iter().any(|op| {
+            matches!(op, Operand::Memory(m) if matches!(m.displacement,
+                Displacement::SymbolMod(..) | Displacement::SymbolModAddend(..)))
+        }) && instr.operands.iter().any(|op| {
+            matches!(op, Operand::Register(r) if vec_reg_id(&r.name).is_some()
+                || matches!(r.name.as_str(), "mm0" | "mm1" | "mm2" | "mm3" | "mm4" | "mm5" | "mm6" | "mm7"
+                    | "k0" | "k1" | "k2" | "k3" | "k4" | "k5" | "k6" | "k7"))
+        }) {
+            for op in &instr.operands {
+                validate_i686_vector_memory_modifier(op)?;
+            }
+        }
         // APX modifiers are not supported in 32-bit mode even if the
         // instruction would otherwise have a legal VEX/EVEX row. GAS 2.47
         // rejects them before testing the selected vector encoding.
@@ -3300,6 +3315,9 @@ impl InstructionEncoder {
         } else {
             instr
         };
+        for op in &instr.operands {
+            validate_i686_vector_memory_modifier(op)?;
+        }
         x64.configure_encoding_hints(instr)?;
         // Record the actual address span and EVEX tuple scale in the shared
         // *emitter*. Parsing opcode bytes here would be fragile across VEX2,
@@ -3377,6 +3395,26 @@ impl InstructionEncoder {
                 Some((_, end, delta)) if r.offset >= end => (r.offset as i64 + delta) as u64,
                 _ => r.offset,
             };
+            // Base/index and VSIB address bytes already match this mode,
+            // but GOT/TLS modifiers do not share the x86-64 relocation ABI.
+            // Rebuild only the relocation, preserving the shared emitter's
+            // actual address field and any trailing immediate/register byte.
+            if let Some(emission) = x64.memory_emission {
+                if r.offset >= emission.start as u64 && r.offset < emission.end as u64 {
+                    if let Some(memory) = memories.first() {
+                        if matches!(
+                            memory.displacement,
+                            Displacement::SymbolMod(..) | Displacement::SymbolModAddend(..)
+                        ) {
+                            self.relocations.push(core::i686_vector_memory_relocation(
+                                &memory.displacement,
+                                (append_start + offset) as usize,
+                            )?);
+                            continue;
+                        }
+                    }
+                }
+            }
             let reloc_type = translate_x64_reloc(r.reloc_type)?;
             self.relocations.push(Relocation {
                 offset: append_start + offset,
@@ -3423,6 +3461,31 @@ fn i686_unavailable_register(name: &str) -> bool {
         || matches!(name, "spl" | "bpl" | "sil" | "dil" | "dr8")
         || gp_id(name).is_some_and(|id| id >= 8)
         || vec_reg_id(name).is_some_and(|id| id >= 8)
+}
+
+/// Plain GOT offsets and local TLS offsets are ordinary memory values.
+/// TLS protocol relocations require specific non-vector instruction shapes;
+/// they must not be accepted just because the address field has four bytes.
+fn validate_i686_vector_memory_modifier(op: &Operand) -> Result<(), String> {
+    match op {
+        Operand::Memory(m) => {
+            if let Displacement::SymbolMod(_, modifier)
+            | Displacement::SymbolModAddend(_, modifier, _) = &m.displacement
+            {
+                if !["GOT", "GOTOFF", "PLT", "NTPOFF", "TPOFF", "DTPOFF"]
+                    .iter()
+                    .any(|allowed| modifier.eq_ignore_ascii_case(allowed))
+                {
+                    return Err(format!(
+                        "@{modifier} operator cannot be used with a vector instruction"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Operand::Indirect(inner) => validate_i686_vector_memory_modifier(inner),
+        _ => Ok(()),
+    }
 }
 
 fn validate_i686_operand_registers(op: &Operand) -> Result<(), String> {
@@ -3953,5 +4016,74 @@ mod gotpc_expression_tests {
         assert_eq!(gotpc_dot_difference("-[.Ldotpos_0_7-.Lx]"), None);
         assert_eq!(gotpc_dot_difference("+[.Ldotpos_0_7-.Lx"), None);
         assert_eq!(gotpc_dot_difference("+4"), None);
+    }
+}
+
+#[cfg(test)]
+mod vector_modifier_relocation_tests {
+    use super::*;
+
+    #[test]
+    fn vector_addresses_keep_i686_relocation_semantics() {
+        for template in [
+            "vpbroadcastd MEM, %zmm1",
+            "vpslld $3, MEM, %xmm1",
+            "vpshufd $3, MEM, %ymm1",
+            "vextracti32x4 $1, %zmm1, MEM",
+            "vpcmov MEM, %xmm1, %xmm2, %xmm3",
+            "pshufd $3, MEM, %xmm1",
+            "vgatherdps %xmm1, MEM, %xmm3",
+            "vgatherdps MEM, %zmm3{%k1}",
+        ] {
+            let base = if template.starts_with("vgather") {
+                if template.contains("%zmm3") {
+                    "(%eax,%zmm2,4)"
+                } else {
+                    "(%eax,%xmm2,4)"
+                }
+            } else {
+                "(%eax)"
+            };
+            for base in [base, ""] {
+                if template.starts_with("vgather") && base.is_empty() {
+                    continue;
+                }
+                for (modifier, expected_type) in [
+                    ("GOT", R_386_GOT32),
+                    ("GOTOFF", R_386_GOTOFF),
+                    ("PLT", R_386_PLT32),
+                    ("NTPOFF", R_386_TLS_LE),
+                    ("TPOFF", R_386_TLS_LE_32),
+                    ("DTPOFF", R_386_TLS_LDO_32),
+                ] {
+                    for addend in [0, 17, -17] {
+                        let line =
+                            template.replace("MEM", &format!("anchor@{modifier}{addend:+}{base}"));
+                        let mut encoder = InstructionEncoder::new();
+                        for item in parse_asm(&line).unwrap() {
+                            if let AsmItem::Instruction(instr) = item {
+                                encoder
+                                    .encode(&instr)
+                                    .unwrap_or_else(|e| panic!("{line}: {e}"));
+                            }
+                        }
+                        assert_eq!(encoder.relocations.len(), 1, "{line}");
+                        let reloc = &encoder.relocations[0];
+                        assert_eq!(reloc.symbol, "anchor", "{line}");
+                        assert_eq!(reloc.reloc_type, expected_type, "{line}");
+                        assert_eq!(reloc.addend, addend, "{line}");
+                    }
+                }
+                for modifier in ["TLSGD", "TLSLDM", "GOTNTPOFF", "INDNTPOFF", "TLSDESC"] {
+                    let line = template.replace("MEM", &format!("anchor@{modifier}{base}"));
+                    let mut encoder = InstructionEncoder::new();
+                    for item in parse_asm(&line).unwrap() {
+                        if let AsmItem::Instruction(instr) = item {
+                            assert!(encoder.encode(&instr).is_err(), "{line}");
+                        }
+                    }
+                }
+            }
+        }
     }
 }
