@@ -10,11 +10,101 @@ use crate::backend::liveness::{
     LiveInterval, for_each_operand_in_instruction, for_each_operand_in_terminator,
 };
 use crate::backend::regalloc::PhysReg;
+use crate::backend::state::StackSlot;
 use crate::common::fx_hash::{FxHashMap, FxHashSet};
 use crate::common::types::{AddressSpace, EightbyteClass, IrType};
 use crate::ir::reexports::{
     Instruction, IntrinsicOp, IrBinOp, IrCmpOp, IrFunction, Operand, Terminator, Value,
 };
+
+/// Bind only complete x86-64 stack-by-value objects, never pointers to caller
+/// objects (the by-reference classes on other ABIs). The incoming copy already
+/// has parameter-object identity: stores and escaped addresses must address it,
+/// not an additional private copy. Outgoing call areas grow below this frame;
+/// dynamic stack realignment leaves the frame base stable. FPO offsets use the
+/// same entry-RSP virtual base as every other stack-parameter access.
+fn incoming_byval_homes(
+    func: &IrFunction,
+    classes: &[ParamClass],
+    omit_fp: bool,
+) -> FxHashMap<u32, StackSlot> {
+    if !classes.iter().any(|class| {
+        matches!(
+            class,
+            ParamClass::StructStack { .. } | ParamClass::LargeStructStack { .. }
+        )
+    }) {
+        return FxHashMap::default();
+    }
+    let allocas: FxHashMap<_, _> = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::Alloca {
+                dest, size, align, ..
+            } => Some((dest.0, (*size, *align))),
+            _ => None,
+        })
+        .collect();
+    // Aggregate parameters have no scalar ParamRef/homing store. Refuse
+    // synthetic scalar-carrier shapes rather than aliasing their data homes
+    // with an address-valued alloca.
+    let scalar_refs: FxHashSet<_> = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instructions)
+        .filter_map(|inst| match inst {
+            Instruction::ParamRef { param_idx, .. } => Some(*param_idx),
+            _ => None,
+        })
+        .collect();
+    let mut homes = FxHashMap::default();
+    for (i, class) in classes.iter().enumerate() {
+        let (ParamClass::StructStack { offset, size }
+        | ParamClass::LargeStructStack { offset, size }) = *class
+        else {
+            continue;
+        };
+        let Some(param) = func.params.get(i) else {
+            continue;
+        };
+        let Some(alloca) = func.param_alloca_values.get(i) else {
+            continue;
+        };
+        let Some(&(alloc_size, align)) = allocas.get(&alloca.0) else {
+            continue;
+        };
+        let abi_align = param.struct_align.unwrap_or(8).max(8);
+        let (Ok(abi_align_i64), Ok(size_i64)) = (i64::try_from(abi_align), i64::try_from(size))
+        else {
+            continue;
+        };
+        if size == 0
+            || param.struct_size != Some(size)
+            || scalar_refs.contains(&i)
+            || alloc_size > size.max(8)
+            || alloc_size < size
+            || !abi_align.is_power_of_two()
+            || !align.max(1).is_power_of_two()
+            || align > abi_align
+            || offset < 0
+            || offset % abi_align_i64 != 0
+        {
+            continue;
+        }
+        let Some(slot) = offset.checked_add(if omit_fp { 8 } else { 16 }) else {
+            continue;
+        };
+        let Some(end) = slot.checked_add(size_i64) else {
+            continue;
+        };
+        if i32::try_from(slot).is_ok() && i32::try_from(end).is_ok() {
+            homes.insert(alloca.0, StackSlot(slot));
+        }
+    }
+    homes
+}
 
 /// Find raw-wide home demand and semantic signed-I32 definitions before RA.
 /// Consumer-promoted storage types must not replace the producer's signed type.
@@ -711,6 +801,13 @@ impl X86Codegen {
             for class in &classification.classes {
                 named_gp += class.gp_reg_count();
                 named_fp += class.fp_reg_count();
+            }
+            if !self.state.ra_config.no_incoming_byval_home {
+                self.state.incoming_byval_slots = incoming_byval_homes(
+                    func,
+                    &classification.classes,
+                    self.state.omit_frame_pointer,
+                );
             }
             self.num_named_int_params = named_gp;
             self.num_named_fp_params = named_fp;
@@ -3388,6 +3485,18 @@ impl X86Codegen {
 
         for (i, _param) in func.params.iter().enumerate() {
             let class = param_classes[i];
+            if self
+                .state
+                .param_alloca_slots
+                .get(i)
+                .copied()
+                .flatten()
+                .is_some_and(|(_, _, id)| self.state.incoming_byval_slots.contains_key(&id))
+            {
+                // Storage is already initialized by the caller's by-value
+                // copy. Do not read/store it again in the capture prologue.
+                continue;
+            }
 
             if let ParamClass::VectorReturnBuffer { .. } = class {
                 // The hidden return pointer of a `%ymm0`/`%zmm0`-returned
@@ -4706,5 +4815,142 @@ mod fpo_frame_size_tests {
         assert_eq!(fpo_frame_size(8, true), 8);
         assert_eq!(fpo_frame_size(9, true), 24);
         assert_eq!(fpo_frame_size(24, true), 24);
+    }
+}
+
+#[cfg(test)]
+mod incoming_byval_tests {
+    use super::*;
+    use crate::ir::reexports::{BasicBlock, BlockId, IrParam};
+
+    fn fixture(abi_align: usize, object_align: usize) -> IrFunction {
+        let mut f = IrFunction::new(
+            "byval".into(),
+            IrType::I64,
+            vec![IrParam {
+                ty: IrType::Ptr,
+                noalias: false,
+                struct_size: Some(24),
+                struct_align: Some(abi_align),
+                param_align: (object_align > abi_align).then_some(object_align),
+                struct_eightbyte_classes: vec![EightbyteClass::Memory],
+                riscv_float_class: None,
+                is_f128_sse: false,
+            }],
+            false,
+        );
+        // The parameter need not be the first alloca (or value zero).
+        f.param_alloca_values = vec![Value(9)];
+        f.blocks.push(BasicBlock {
+            label: BlockId(0),
+            source_spans: vec![],
+            instructions: vec![
+                Instruction::Alloca {
+                    dest: Value(1),
+                    ty: IrType::I64,
+                    size: 8,
+                    align: 8,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+                Instruction::Alloca {
+                    dest: Value(9),
+                    ty: IrType::Ptr,
+                    size: 24,
+                    align: object_align,
+                    volatile: false,
+                    semantic_volatile: false,
+                },
+            ],
+            terminator: Terminator::Return(None),
+        });
+        f
+    }
+
+    #[test]
+    fn complete_byval_objects_use_the_correct_frame_base() {
+        for class in [
+            ParamClass::StructStack {
+                offset: 64,
+                size: 24,
+            },
+            ParamClass::LargeStructStack {
+                offset: 64,
+                size: 24,
+            },
+        ] {
+            for align in [1, 8, 16, 32, 64] {
+                for fpo in [false, true] {
+                    let f = fixture(align, align);
+                    assert_eq!(
+                        incoming_byval_homes(&f, &[class], fpo)
+                            .into_iter()
+                            .map(|(id, slot)| (id, slot.0))
+                            .collect::<FxHashMap<_, _>>(),
+                        [(9, if fpo { 72 } else { 80 })].into_iter().collect()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stronger_object_alignment_keeps_a_private_home() {
+        let class = ParamClass::LargeStructStack {
+            offset: 8,
+            size: 24,
+        };
+        assert!(incoming_byval_homes(&fixture(8, 64), &[class], false).is_empty());
+        assert!(incoming_byval_homes(&fixture(16, 16), &[class], false).is_empty());
+    }
+
+    #[test]
+    fn references_partial_objects_and_missing_allocas_are_not_byval_homes() {
+        let f = fixture(8, 8);
+        for class in [
+            ParamClass::LargeStructByRefReg {
+                reg_idx: 0,
+                size: 24,
+            },
+            ParamClass::StructStack {
+                offset: 0,
+                size: 16,
+            },
+            ParamClass::LargeStructStack {
+                offset: -8,
+                size: 24,
+            },
+            ParamClass::LargeStructStack {
+                offset: i64::MAX - 8,
+                size: 24,
+            },
+        ] {
+            assert!(
+                incoming_byval_homes(&f, &[class], false).is_empty(),
+                "{class:?}"
+            );
+        }
+        let class = ParamClass::LargeStructStack {
+            offset: 0,
+            size: 24,
+        };
+        let mut missing = f.clone();
+        missing.param_alloca_values = vec![Value(99)];
+        assert!(incoming_byval_homes(&missing, &[class], false).is_empty());
+        let mut scalar = f;
+        scalar.blocks[0].instructions.push(Instruction::ParamRef {
+            dest: Value(20),
+            param_idx: 0,
+            ty: IrType::Ptr,
+        });
+        assert!(incoming_byval_homes(&scalar, &[class], false).is_empty());
+    }
+
+    #[test]
+    fn invocation_reset_does_not_leak_incoming_objects() {
+        let mut state = crate::backend::state::CodegenState::new();
+        state.incoming_byval_slots.insert(9, StackSlot(16));
+        state.reset_for_function();
+        assert!(state.incoming_byval_slots.is_empty());
     }
 }

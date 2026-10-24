@@ -1302,6 +1302,9 @@ fn peephole_optimize_inner(
         }
         if !sk("vector_copy_retarget") {
             {
+                let c = vector_copy::fold_uniform_vector_shift(&mut store, &mut infos);
+                trace("fold_uniform_vector_shift", pass_count, c, &store, &infos);
+                changed |= c;
                 let c = vector_copy::retarget_vex_result(&mut store, &mut infos);
                 trace("retarget_vex_result", pass_count, c, &store, &infos);
                 changed |= c;

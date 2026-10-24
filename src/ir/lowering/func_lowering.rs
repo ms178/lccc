@@ -339,30 +339,24 @@ impl Lowerer {
                     } else {
                         (None, Vec::new(), None)
                     };
-                // Struct params carry alignment through `struct_align`.
-                // The struct LAYOUT's natural alignment (layout.align) is not
-                // enough: a typedef override (`typedef S7 AS32
-                // __attribute__((aligned(32)))`) or a direct parameter-list
-                // spelling (`struct S {...} s __attribute__((aligned(32)))`)
-                // raises the alignment of the PARAMETER OBJECT itself above
-                // the layout's — and `&s` must observe it (GCC homes the
-                // param at the declared alignment). Fold the declared
-                // alignment in so the alloca is padded and the capture
-                // targets the effective aligned address.
+                // ABI alignment belongs to the underlying aggregate/vector
+                // type. A typedef or parameter-declaration alignment can raise
+                // the LOCAL parameter object's alignment without changing its
+                // incoming stack position (GCC copies such objects to an aligned
+                // home). Do not fold that request into the ABI classifier.
+                let struct_align =
+                    struct_align.or_else(|| struct_size.map(|_| self.ctype_align(&param_ctype)));
                 let declared_align = self.alignof_type(&param.type_spec);
                 let direct_align = self.param_explicit_alignment(param);
-                let extra = declared_align.max(direct_align.unwrap_or(0));
-                let struct_align = match struct_align {
-                    Some(a) => Some(a.max(extra)),
-                    None if extra > 0 => Some(extra),
-                    None => None,
-                };
+                let object_align = declared_align.max(direct_align.unwrap_or(0));
+                let param_align =
+                    (object_align > struct_align.unwrap_or(0)).then_some(object_align);
                 params.push(IrParam {
                     ty: IrType::Ptr,
                     noalias: false,
                     struct_size,
                     struct_align,
-                    param_align: None,
+                    param_align,
                     struct_eightbyte_classes,
                     riscv_float_class,
                     // "ONE 16-byte %xmm" -- the same carrier _Float128 uses.
@@ -567,7 +561,12 @@ impl Lowerer {
             // extends the same guarantee to typedef-aligned scalar parameters
             // (`typedef int A32 __attribute__((aligned(32)))`), whose alignment
             // the frontend would otherwise drop entirely.
-            let align = param.struct_align.or(param.param_align).unwrap_or(0);
+            let align = param
+                .struct_align
+                .into_iter()
+                .chain(param.param_align)
+                .max()
+                .unwrap_or(0);
             self.emit(Instruction::Alloca {
                 dest: alloca,
                 ty: param.ty,
