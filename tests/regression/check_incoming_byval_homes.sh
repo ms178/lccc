@@ -25,6 +25,15 @@ cleanup() {
             sed -n '/^tail_big:/,/\.size tail_big/p;/^aligned_f128:/,/\.size aligned_f128/p' \
                 "$tmp/failure.s" >&2
         fi
+        if [[ -x $tmp/run ]] && command -v gdb >/dev/null; then
+            gdb -q -batch -ex run -ex 'bt 12' --args "$tmp/run" >&2 || true
+        fi
+        if [[ -x $tmp/run ]] && command -v objdump >/dev/null; then
+            objdump -d --no-show-raw-insn "$tmp/run" >"$tmp/failure.dis"
+            sed -n '/<read_big>:/,/^$/p' "$tmp/failure.dis" >&2
+            grep -B45 -A8 -E 'call[[:space:]].*<(sum_big|tail_big|aligned_f128)>' \
+                "$tmp/failure.dis" >&2 || true
+        fi
     fi
     rm -rf "$tmp"
     exit "$status"
