@@ -1445,7 +1445,7 @@ mod tests {
         }
     }
 
-    fn module(functions: Vec<IrFunction>) -> IrModule {
+    fn test_module(functions: Vec<IrFunction>) -> IrModule {
         let mut module = IrModule::new();
         module.functions = functions;
         module
@@ -1474,12 +1474,12 @@ mod tests {
             vec![alloca(0), load(1, 0), call("reader", vec![]), load(2, 0)],
             Some(Value(2)),
         );
-        let mut baseline = module(vec![reader.clone(), caller.clone()]);
+        let mut baseline = test_module(vec![reader.clone(), caller.clone()]);
         assert_eq!(
             super::super::redundant_loads::run(&mut baseline.functions[1]),
             0
         );
-        let mut module = module(vec![reader, caller]);
+        let mut module = test_module(vec![reader, caller]);
         assert_eq!(run(&mut module, false), 1);
         assert_eq!(load_count(&module.functions[1]), 1);
     }
@@ -1512,7 +1512,7 @@ mod tests {
             ],
             Some(Value(2)),
         );
-        let mut module = module(vec![writer, caller]);
+        let mut module = test_module(vec![writer, caller]);
         assert_eq!(run(&mut module, false), 0);
         assert_eq!(load_count(&module.functions[1]), 2);
     }
@@ -1530,7 +1530,7 @@ mod tests {
             ],
             Some(Value(2)),
         );
-        let mut module = module(vec![caller]);
+        let mut module = test_module(vec![caller]);
         assert_eq!(run(&mut module, false), 0);
         assert_eq!(load_count(&module.functions[0]), 2);
     }
@@ -1562,7 +1562,7 @@ mod tests {
             ],
             Some(Value(2)),
         );
-        let mut module = module(vec![reader, caller]);
+        let mut module = test_module(vec![reader, caller]);
         assert_eq!(run(&mut module, false), 1);
         assert_eq!(load_count(&module.functions[1]), 1);
     }
@@ -1583,7 +1583,7 @@ mod tests {
             ],
             Some(Value(2)),
         );
-        let mut module = module(vec![reader, caller]);
+        let mut module = test_module(vec![reader, caller]);
         assert_eq!(run(&mut module, false), 1);
         assert_eq!(load_count(&module.functions[1]), 1);
     }
@@ -1631,7 +1631,7 @@ mod tests {
             ],
             Some(Value(2)),
         );
-        let mut module = module(vec![recursive, outer, caller]);
+        let mut module = test_module(vec![recursive, outer, caller]);
         assert_eq!(run(&mut module, false), 0);
         assert_eq!(load_count(&module.functions[2]), 2);
     }
@@ -1657,7 +1657,7 @@ mod tests {
             ],
             Some(Value(2)),
         );
-        let mut module = module(vec![caller]);
+        let mut module = test_module(vec![caller]);
         assert_eq!(run(&mut module, false), 0);
         assert_eq!(load_count(&module.functions[0]), 2);
     }
@@ -1695,7 +1695,7 @@ mod tests {
             vec![alloca(0), alloca(4), load(1, 0), invoke, load(2, 0)],
             Some(Value(2)),
         );
-        let mut module = module(vec![variadic, caller]);
+        let mut module = test_module(vec![variadic, caller]);
         assert_eq!(run(&mut module, false), 0);
         assert_eq!(load_count(&module.functions[1]), 2);
     }
@@ -1716,10 +1716,10 @@ mod tests {
             ],
             Some(Value(2)),
         );
-        let mut module = module(vec![reader.clone(), caller.clone()]);
+        let mut module = test_module(vec![reader.clone(), caller.clone()]);
         assert_eq!(run(&mut module, true), 0);
         assert_eq!(load_count(&module.functions[1]), 2);
-        let mut native = module(vec![reader, caller]);
+        let mut native = test_module(vec![reader, caller]);
         assert_eq!(run(&mut native, false), 1);
     }
 
@@ -1738,7 +1738,7 @@ mod tests {
             }],
             None,
         );
-        let module = module(vec![caller]);
+        let module = test_module(vec![caller]);
         let mut solver = build_solver(&module, false, AnalysisBudget::default());
         solver.finish();
         assert!(solver.complete);
@@ -1760,7 +1760,7 @@ mod tests {
             vec![alloca(0), load(1, 0), call("reader", vec![]), load(2, 0)],
             Some(Value(2)),
         );
-        let mut module = module(vec![caller]);
+        let mut module = test_module(vec![caller]);
         let budget = AnalysisBudget {
             max_work: 1,
             max_edges: 1,
