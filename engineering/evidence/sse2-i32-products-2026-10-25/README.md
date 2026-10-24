@@ -54,7 +54,7 @@ this result to all products or all memory sizes.
 
 GCC 16.2 and Clang 23.1.3 were restored from manifest-verified repository
 cache tags. GNU as/ld 2.47.20260726 were built from the verified 2.47 source
-archive before the retained comparisons; `effective-tools.log` records the
+archive before the retained comparisons; `effective-tools.txt` records the
 actual oracle driver/link commands. The Clang wrapper explicitly selects the GCC 16.2 runtime/toolchain rather
 than the host GCC 12 installation; its complete contents are retained as
 `clang23-gcc16.sh`. The earlier default-runtime screen was superseded by

@@ -1,0 +1,12 @@
+   Compiling lccc v0.1.0 (/home/user/lccc)
+    Finished `fastbuild` profile [optimized + debuginfo] target(s) in 4m 39s
+     Running unittests src/lib.rs (target/fastbuild/deps/lccc-244ecc21c018cae1)
+
+running 4 tests
+test driver::cli::cli_tests::mfma_at_sse2_baseline_pulls_chain ... ok
+test frontend::preprocessor::predefined_macros::tests::sse2_denial_does_not_erase_independent_x86_64_sse_macros ... ok
+test frontend::preprocessor::predefined_macros::tests::sse_only_i686_preserves_sse_but_not_sse2_macros ... ok
+test passes::vec_arx::tests::pshufd_immediates_are_the_classic_sse2_rotations ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 6294 filtered out; finished in 0.00s
+
