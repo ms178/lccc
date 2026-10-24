@@ -126,8 +126,12 @@ witness and a positive changed-region LRS witness are required, so a silent
 no-op cannot produce a green correctness run. Performance executables have
 compiler-specific names and all available compilers are rotated through the
 same interleaved timing loop; the report includes feature/baseline and
-feature/oracle medians without treating process-time noise as a universal win.
-ICX is explicitly run with `-fp-model=strict`.
+feature/oracle medians, min/max and median absolute deviation without treating
+process-time noise as a universal win. The two performance fixtures execute
+20 million call/load iterations and four million pressure-function iterations,
+respectively; CI takes nine rotated samples per compiler so sub-millisecond
+process startup does not dominate the measurement. ICX is explicitly run with
+`-fp-model=strict`.
 
 The Rust unit tests additionally pin fail-before/pass-after behavior for the
 block-local consumer, recursive and variadic summaries, semantic interposition,

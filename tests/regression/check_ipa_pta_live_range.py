@@ -64,11 +64,17 @@ static __attribute__((noinline)) void read_only(int *p) {
 }
 int main(void) {
     /* A global keeps this witness after early scalar replacement: the
-       call must be proven read-only before the second load can forward. */
-    int before = cell;
-    read_only(&cell);
-    int after = cell;
-    printf("%d %d\n", before, after);
+       call must be proven read-only before the second load can forward.
+       Enough iterations make process startup negligible in the timing row. */
+    int before = 0, after = 0;
+    unsigned sum = 0;
+    for (unsigned i = 0; i < 20000000; ++i) {
+        before = cell;
+        read_only(&cell);
+        after = cell;
+        sum = sum * 1664525u + (unsigned)before + (unsigned)after + 1013904223u;
+    }
+    printf("%d %d %08x\n", before, after, sum);
     return before != 7 || after != 7 || observed != 7;
 }
 ''',
@@ -198,7 +204,7 @@ static __attribute__((noinline)) uint32_t pressure(uint32_t x) {
 }
 int main(void) {
     uint32_t sum = 0;
-    for (uint32_t i = 0; i < 20000; ++i) sum = sum * 1664525u + pressure(i) + 1013904223u;
+    for (uint32_t i = 0; i < 4000000; ++i) sum = sum * 1664525u + pressure(i) + 1013904223u;
     printf("%08x\n", sum);
     return 0;
 }
@@ -478,6 +484,12 @@ def main(argv: Iterable[str] | None = None) -> int:
                     "repetitions": args.reps,
                     "seconds": timings,
                     "median_seconds": medians,
+                    "min_seconds": {k: min(v) if v else None for k, v in timings.items()},
+                    "max_seconds": {k: max(v) if v else None for k, v in timings.items()},
+                    "median_absolute_deviation": {
+                        k: statistics.median([abs(x - medians[k]) for x in v]) if v else None
+                        for k, v in timings.items()
+                    },
                 }
                 if timings["baseline"] and timings["feature"]:
                     performance["feature_over_baseline"] = (
@@ -556,6 +568,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 "feature_over_baseline": item.get("feature_over_baseline"),
                 "feature_over_oracle": item.get("feature_over_oracle", {}),
                 "median_seconds": item["median_seconds"],
+                "median_absolute_deviation": item["median_absolute_deviation"],
             }, sort_keys=True)
             print(f"::notice title=IPA/LRS measured performance::{escape_annotation(detail)}")
     print(f"IPA/LRS cases: {len(CASES)}; failures: {len(failures)}")

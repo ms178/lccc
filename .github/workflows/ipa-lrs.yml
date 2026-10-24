@@ -86,7 +86,7 @@ jobs:
             --gcc gcc-16 \
             --clang "${CLANG:-clang-23}" \
             --icx "$LCCC_ICX_BIN" \
-            --reps 5 \
+            --reps 9 \
             --output target/ipa-lrs-report.json
       - name: Publish measurement summary
         if: always()
