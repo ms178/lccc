@@ -54,9 +54,10 @@ impl I686Codegen {
     ///     int, double)`: c at offset 12), 12-byte x87 long double (`f3`),
     ///     8-byte-aligned structs (`f7(int, struct{double,double}, int)`: a at
     ///     offset 4) and even `aligned(16)` structs (`f8`: a at offset 4);
-    ///   * GNU vectors wider than 16 bytes are the other exception: their
-    ///     MEMORY slots use natural 32/64-byte alignment, with dynamic ESP
-    ///     realignment when the caller's incoming boundary is insufficient.
+    ///   * Memory-passed GNU vectors are the other exception: their slots
+    ///     use natural 16/32/64-byte alignment (including no-SSE v16), with
+    ///     dynamic ESP realignment when the caller's incoming boundary is
+    ///     insufficient.
     ///   * EXCEPT TFmode 16-byte carriers (__float128/_Decimal128), which are
     ///     16-byte aligned within the outgoing area (`f2(__float128, int,
     ///     __float128)`: b at offset 16; `f6(int, __float128, int)`: q at

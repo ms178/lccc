@@ -1942,10 +1942,13 @@ impl Lowerer {
     ) -> Vec<crate::common::types::EightbyteClass> {
         if let Some(ctype) = self.get_expr_ctype(expr) {
             if self.target == crate::backend::Target::I686 && matches!(&ctype, CType::Vector(..)) {
-                // Distinguish naturally aligned wide GNU vectors from
-                // over-aligned records without adding a parallel CallInfo
-                // array. This marker is consumed only by the i386 backend.
-                return vec![crate::common::types::EightbyteClass::Memory];
+                // Distinguish naturally aligned GNU vectors from ordinary
+                // MEMORY records without adding a parallel CallInfo array.
+                // This marker is consumed only by the i386 backend.
+                return vec![
+                    crate::common::types::EightbyteClass::Memory,
+                    crate::common::types::EightbyteClass::NoClass,
+                ];
             }
             // x86-64 structs, unions AND vectors (a vector has no layout).
             if let Some((classes, _)) = self.sysv_arg_abi(&ctype) {

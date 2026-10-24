@@ -336,13 +336,16 @@ impl Lowerer {
                         } else if self.target == crate::backend::Target::I686
                             && matches!(&param_ctype, CType::Vector(..))
                         {
-                            // i386 GNU vectors wider than 16 bytes use their
-                            // natural stack alignment, unlike over-aligned
-                            // records. `[Memory]` is an internal target-local
+                            // Memory-passed i386 GNU vectors use their natural
+                            // stack alignment, unlike over-aligned records.
+                            // `[Memory, NoClass]` is an internal target-local
                             // marker (the AMD64 classifier is not involved).
                             (
                                 Some(self.ctype_align(&param_ctype)),
-                                vec![crate::common::types::EightbyteClass::Memory],
+                                vec![
+                                    crate::common::types::EightbyteClass::Memory,
+                                    crate::common::types::EightbyteClass::NoClass,
+                                ],
                                 None,
                             )
                         } else {

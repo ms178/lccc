@@ -475,7 +475,7 @@ pub struct CallAbiConfig {
     ///   so the callee layout (and the va_start overflow offset derived from
     ///   it) must agree — an 8-byte cap here misreads every over-aligned
     ///   struct arg whose natural offset is 4 (mod 8). TFmode carriers and
-    ///   GNU vectors wider than 16 bytes are explicit exceptions handled by
+    ///   memory-passed GNU vectors are explicit exceptions handled by
     ///   `i386_gnu_vector_stack_align` and the TFmode branch below.
     pub stack_arg_align_cap: usize,
     /// XMM registers for 16-byte vector pieces on i386 (Clang's
@@ -499,20 +499,26 @@ pub struct CallAbiConfig {
 
 /// Natural stack alignment for an i386 GNU vector MEMORY argument.
 ///
-/// The lowering uses a singleton `[Memory]` class as a target-local marker
-/// for GNU `vector_size` aggregates. It is deliberately gated by the i386
-/// configuration: on x86-64 `[Memory]` is an ordinary SysV record/vector
-/// classification and must follow that target's own rules. Sixteen-byte
-/// vectors retain the measured i386 four-byte stack convention; only wider
-/// vectors (32/64 bytes and future wider forms) get natural alignment.
+/// The lowering uses `[Memory, NoClass]` as a target-local marker for GNU
+/// `vector_size` aggregates. The second tag distinguishes the marker from an
+/// ordinary SysV `[Memory]` record. It is deliberately gated by the i386
+/// configuration: on x86-64 these bytes are not a vector marker and must
+/// follow that target's own rules. Every memory-passed vector with natural
+/// alignment of at least 16 bytes uses that alignment, including no-SSE v16;
+/// XMM-register pieces never call this helper for stack placement.
 pub(crate) fn i386_gnu_vector_stack_align(
     config: &CallAbiConfig,
     classes: &[crate::common::types::EightbyteClass],
     align: usize,
 ) -> Option<usize> {
     (config.i386_ext_vector_lanes
-        && align > 16
-        && classes == [crate::common::types::EightbyteClass::Memory])
+        && align >= 16
+        && align.is_power_of_two()
+        && classes
+            == [
+                crate::common::types::EightbyteClass::Memory,
+                crate::common::types::EightbyteClass::NoClass,
+            ])
     .then_some(align)
 }
 
@@ -1551,8 +1557,8 @@ fn classify_param_slice(
                 //    granularity — doubles, 12-byte x87 long double, 8-byte-
                 //    aligned structs, even `aligned(16)` structs (GCC 14.2
                 //    -m32 oracles f1/f3/f7/f8) — with separate exceptions for
-                //    wide GNU vectors (natural 32/64-byte alignment) and
-                //    TFmode 16-byte carriers (__float128/_Decimal128, the
+                //    memory-passed GNU vectors (natural 16/32/64-byte alignment)
+                //    and TFmode 16-byte carriers (__float128/_Decimal128, the
                 //    is_f128_sse params) are 16-byte aligned (oracles f2/f6:
                 //    (int,__float128,int) puts q at offset 16; libgcc's
                 //    __addtf3 reads its by-value TF args at entry+20/+36).
@@ -1930,18 +1936,65 @@ mod tests {
     }
 
     #[test]
-    fn i386_wide_vector_alignment_requires_the_explicit_vector_marker() {
+    fn i386_vector_alignment_requires_the_explicit_vector_marker() {
         let config = i686_regparm3();
-        let memory = [EightbyteClass::Memory];
-        assert_eq!(i386_gnu_vector_stack_align(&config, &memory, 32), Some(32));
-        assert_eq!(i386_gnu_vector_stack_align(&config, &memory, 64), Some(64));
-        assert_eq!(i386_gnu_vector_stack_align(&config, &memory, 16), None);
+        let vector = [EightbyteClass::Memory, EightbyteClass::NoClass];
+        let ordinary_memory = [EightbyteClass::Memory];
+        assert_eq!(i386_gnu_vector_stack_align(&config, &vector, 16), Some(16));
+        assert_eq!(i386_gnu_vector_stack_align(&config, &vector, 32), Some(32));
+        assert_eq!(i386_gnu_vector_stack_align(&config, &vector, 64), Some(64));
+        assert_eq!(i386_gnu_vector_stack_align(&config, &vector, 8), None);
         assert_eq!(i386_gnu_vector_stack_align(&config, &[], 32), None);
-        assert_eq!(i386_gnu_vector_stack_align(&config, &memory, 8), None);
+        for align in [16, 32, 64] {
+            assert_eq!(
+                i386_gnu_vector_stack_align(&config, &ordinary_memory, align),
+                None
+            );
+        }
         assert_eq!(
-            i386_gnu_vector_stack_align(&sysv_x86_64(), &memory, 64),
+            i386_gnu_vector_stack_align(&sysv_x86_64(), &vector, 64),
             None
         );
+    }
+
+    #[test]
+    fn i386_no_sse_vector_stack_offsets_include_v16_alignment() {
+        let vector = vec![EightbyteClass::Memory, EightbyteClass::NoClass];
+        let param = |size, align, classes: Vec<EightbyteClass>| crate::ir::module::IrParam {
+            ty: IrType::Ptr,
+            noalias: false,
+            struct_size: size,
+            struct_align: align,
+            param_align: None,
+            struct_eightbyte_classes: classes,
+            is_f128_sse: false,
+            riscv_float_class: None,
+        };
+        let params = vec![
+            param(None, None, Vec::new()),
+            param(Some(16), Some(16), vector.clone()),
+            param(Some(32), Some(32), vector),
+        ];
+        let mut config = i686_regparm3();
+        config.max_int_regs = 0; // cdecl no-SSE hidden-sret convention
+        let classified = classify_param_slice("no_sse_vectors", &params, true, false, &config);
+        assert!(matches!(
+            classified.classes[1],
+            ParamClass::StructStack {
+                offset: 16,
+                size: 16
+            }
+        ));
+        assert!(matches!(
+            classified.classes[2],
+            ParamClass::StructStack {
+                offset: 32,
+                size: 32
+            } | ParamClass::LargeStructStack {
+                offset: 32,
+                size: 32
+            }
+        ));
     }
 
     #[test]

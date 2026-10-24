@@ -4403,7 +4403,10 @@ mod tests {
         let cg = I686Codegen::new();
         let classes = vec![
             Vec::new(),
-            vec![crate::common::types::EightbyteClass::Memory],
+            vec![
+                crate::common::types::EightbyteClass::Memory,
+                crate::common::types::EightbyteClass::NoClass,
+            ],
             Vec::new(),
         ];
         let (slots, bytes) = cg.fastcall_layout_with_abi(

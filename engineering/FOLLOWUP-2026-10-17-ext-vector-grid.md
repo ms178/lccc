@@ -131,8 +131,9 @@ returns, with direct/indirect and variadic calls covered by the freestanding
 GCC 16.2 / Clang 23.1.3 matrix. The 32/64-byte MEMORY cases now carry an
 explicit i386 GNU-vector marker through caller/callee classification, align
 their stack slots naturally, dynamically realign the caller's `%esp`, and use
-one aligned `va_arg` cursor/copy. Ordinary over-aligned records and 16-byte
-vectors keep their measured four-byte layout. `check_gnu_vector_align_abi.sh`
+one aligned `va_arg` cursor/copy. Ordinary over-aligned records keep their
+measured four-byte layout; memory-passed GNU vectors use natural alignment,
+including no-SSE v16. `check_gnu_vector_align_abi.sh`
 now requires all v16/v32/v64 LCCC/GCC pairings to exit zero; no divergence
 latch remains. Run 40120508272 passed the first 56 rows, then exposed a
 second reduced-ISA Clang self-oracle incompatibility (SSE-only Clang→Clang

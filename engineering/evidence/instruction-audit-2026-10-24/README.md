@@ -410,7 +410,8 @@ grant predicate instead of inheriting the backend's baseline. The separate
 32/64-byte GNU-vector MEMORY defect is now addressed in the i686 backend:
 explicit target-local vector metadata drives natural caller/callee offsets,
 call-site dynamic stack realignment, and a single aligned variadic cursor/copy.
-Ordinary over-aligned records and v16 retain their measured four-byte layout.
+Ordinary over-aligned records retain their measured four-byte layout;
+memory-passed GNU vectors use natural alignment, including no-SSE v16.
 The alignment-ABI gate now requires every i386 v16/v32/v64 LCCC/GCC pairing to
 exit zero, including both stack residues and O0/O2; the former divergence
 latch is removed. Hosted acceptance is pending the next run. This is an ABI

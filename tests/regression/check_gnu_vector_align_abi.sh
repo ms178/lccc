@@ -27,8 +27,8 @@
 #         and as the first stack argument, at -O0 and -O2, in all four
 #         compiler pairings, on both stack residues mod 32.
 # Part 3  i386 (-m32): the layout probes agree (Part 1), and every v16/v32/v64
-#         caller/callee pairing must agree with GCC. Wider vectors use their
-#         natural stack alignment and a dynamically realigned %esp; no
+#         caller/callee pairing must agree with GCC. Memory-passed vectors use
+#         their natural stack alignment and a dynamically realigned %esp; no
 #         divergence latch is accepted.
 set -euo pipefail
 

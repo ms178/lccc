@@ -182,12 +182,25 @@ for mode in default sse2 sse-only sse2-denied arch-denied sse-restored no-sse; d
             extra=()
             [[ $compiler == "$ccc" ]] || extra=(-B"$as_dir/")
             for opt in O0 O2 O3 Os; do
+                echo "run: $mode $compiler -$opt / $driver driver"
                 "$compiler" "${flags[@]}" "${extra[@]}" -"$opt" -c "$fixture/functions.c" -o "$tmp/functions.o"
                 "$linker" -m elf_i386 -static -e _start "$tmp/start.o" "$tmp/abi-driver.o" "$tmp/functions.o" -o "$tmp/abi"
-                "$tmp/abi"
+                if "$tmp/abi"; then
+                    :
+                else
+                    rc=$?
+                    echo "FAIL: $mode $compiler -$opt / $driver ABI exit $rc" >&2
+                    exit "$rc"
+                fi
                 "$compiler" "${flags[@]}" "${extra[@]}" -"$opt" -DSHUFFLE_FUNCTIONS_ONLY -c "$tmp/typed.c" -o "$tmp/functions.o"
                 "$linker" -m elf_i386 -static -e _start "$tmp/start.o" "$tmp/typed-driver.o" "$tmp/functions.o" -o "$tmp/typed"
-                "$tmp/typed"
+                if "$tmp/typed"; then
+                    :
+                else
+                    rc=$?
+                    echo "FAIL: $mode $compiler -$opt / $driver typed exit $rc" >&2
+                    exit "$rc"
+                fi
                 configurations=$((configurations + 1))
                 echo "ok: $mode $compiler -$opt / $driver driver: 16384 ABI + 18432 typed shuffle checks"
             done
