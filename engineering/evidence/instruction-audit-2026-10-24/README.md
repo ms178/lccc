@@ -12,7 +12,7 @@ The combined PDF's SHA-256 is
 All 5,364 pages were extracted; all 4,106 bookmarks were indexed. The large
 source files and full bookmark review ledger are workspace artifacts under
 `/home/user/artifacts/instruction-audit/`, not vendored source files.
-Extraction and indexing are not semantic review. Fourteen sections
+Extraction and indexing are not semantic review. Twenty-two sections
 have partial, explicitly scoped reviews; other bookmark entries are unreviewed.
 
 The shift review concerns register-only, unmasked 128/256/512-bit forms. The
@@ -335,3 +335,59 @@ lccc -m32 -c "$D/i686-vector-got.s" -o /tmp/i686-got.o
 ld -m elf_i386 /tmp/i686-got.o -o /tmp/i686-got
 /tmp/i686-got  # requires Linux IA32 execution and AVX512F/VL
 ```
+
+## Continued review: legacy SIMD operand shapes and typed shuffles
+
+The continued instruction-table review covers PSHUFW (PDF page 1725),
+PALIGNR (1505), ROUNDPS (1875), SHA1RNDS4 (1923), MPSADBW (1421),
+GF2P8AFFINEQB (1133), and GF2P8AFFINEINVQB (1130). PSHUFD pages
+1715–1717 and MOVDQA pages 1348–1351 additionally establish the register-only
+shuffle composition and identity-copy rules. These are scoped reviews, not
+certification of those sections' entire arithmetic/exception/EVEX behavior.
+
+A shared legacy-immediate operand checker now enforces register banks and
+encodable immediate ranges for 27 mnemonics on both x86 targets. PSHUFW is
+MMX-only; PALIGNR accepts matching MMX or XMM operands, and its MMX encoding
+must omit the XMM mandatory prefix. Other covered rows require XMM operands.
+The i686 dispatcher now reaches SHA1RNDS4, MPSADBW and both GFNI affine rows.
+
+PSHUFW's opcode table and description specify MMX registers, but its REX.R
+paragraph refers to extra XMM registers. The table, MMX operation and cached
+GNU assembler agree; that contradictory paragraph must not authorize XMM
+PSHUFW. Immediate width is also distinct from assembler source spelling:
+GNU 2.47 accepts negative aliases for some imm8 rows but not others. The
+checker and generated corpus preserve that row-specific policy rather than
+assuming every signed spelling is valid or truncating arbitrary integers.
+`generate_legacy_immediate_shapes.py` generates 4,590 cases per mode, covering
+register classes, mixed banks, unavailable registers, memory destinations,
+memory sources, and immediate boundaries. Signed-source acceptance comes from
+GNU differential evidence, not from an SDM claim about assembly syntax.
+
+`__builtin_shufflevector` previously returned packed data while nested vector
+consumers and returns could treat it as an address. The minimal two-shuffle
+native witness terminates with SIGSEGV before the fix. The implementation now
+uses one 16-byte pointer-backed vector value consistently through semantic
+typing, aggregate sizing, argument lowering, member/conditional expressions,
+and returns. It evaluates both operands once, validates known four-by-32-bit
+vector geometry and matching element types, and diagnoses nonconstant or
+out-of-range selectors. Single-source permutations use PSHUFD where the x86
+SSE2 contract permits it; mixed-source and other-target paths retain scalar
+lane gathering. This does not add other vector geometries to the builtin.
+
+Adjacent same-destination register PSHUFD/VPSHUFD instructions compose their
+two-bit selectors independently within each 128-bit lane. Mixed legacy/VEX,
+memory, masks, changed destination, width changes and intervening effects are
+excluded. A legacy identity may disappear only for a self-copy; VEX identity
+replacement remains VMOVDQA so upper-zeroing is not silently lost. The rule
+also runs after stack forwarding, which is when real frontend chains become
+adjacent. Reverse-twice becomes `ret`; reverse-then-rotate becomes one
+`pshufd $198` plus `ret`, versus two PSHUFD instructions after the correctness
+fix alone. This is an instruction-count result, not a universal timing claim.
+
+Regressions include all 65,536 immediate-pair compositions, barrier and
+skip-control checks, a native original/optimized/independent-integer-model
+comparison including observable YMM upper lanes, and an 18,432-check typed C
+fixture. The latter supports separate compiler/driver translation units and
+covers nesting, function arguments/returns, conditional struct members,
+floating bit patterns, sizeof, _Generic and operand side effects. Differential
+runs use only the cached GCC 16.2, Clang 23.1.3 and binutils 2.47 tools.

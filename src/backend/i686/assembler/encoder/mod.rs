@@ -2344,6 +2344,10 @@ impl InstructionEncoder {
             "cvtpd2dq" => self.encode_sse_op(ops, &[0xF2, 0x0F, 0xE6]),
 
             // SSE packed integer
+            "sha1rnds4" => self.encode_sse_op_imm8(ops, &[0x0F, 0x3A, 0xCC]),
+            "mpsadbw" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0x42]),
+            "gf2p8affineqb" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0xCE]),
+            "gf2p8affineinvqb" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x3A, 0xCF]),
             "pshufw" => self.encode_sse_op_imm8(ops, &[0x0F, 0x70]),
             "pshufd" => self.encode_sse_op_imm8(ops, &[0x66, 0x0F, 0x70]),
             "pshuflw" => self.encode_sse_op_imm8(ops, &[0xF2, 0x0F, 0x70]),

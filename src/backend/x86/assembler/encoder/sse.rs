@@ -185,6 +185,8 @@ impl super::InstructionEncoder {
             return Err("SSE op+imm8 requires 3 operands".to_string());
         }
 
+        let use_mmx = crate::backend::x86::assembler::encoder::check_legacy_simd_imm8(ops, opcode)?;
+
         let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
 
         match (&ops[0], &ops[1], &ops[2]) {
@@ -195,7 +197,6 @@ impl super::InstructionEncoder {
             ) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let use_mmx = is_mmx(&src.name) || is_mmx(&dst.name);
                 if !use_mmx {
                     for &b in &opcode[..prefix_len] {
                         self.bytes.push(b);
@@ -213,7 +214,6 @@ impl super::InstructionEncoder {
                 Operand::Register(dst),
             ) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let use_mmx = is_mmx(&dst.name);
                 if !use_mmx {
                     for &b in &opcode[..prefix_len] {
                         self.bytes.push(b);
