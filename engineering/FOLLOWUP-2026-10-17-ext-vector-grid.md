@@ -593,3 +593,67 @@ Fix the defect, run the grid locally (`scripts/ci_local.sh` gate
 `scripts/ci_install_clang_oracle.sh`), and delete the lines the gate reports
 as "expected failure(s) did not occur" in the same commit. Never add a line
 for a new failure without a tracking id and a reproduction here.
+
+## i686 by-value argument copies: measured policy, one policy function, two defects
+
+**Status: fixed on the current tree.** The SSE copy of a by-value argument
+into the outgoing argument area was correct but shaped by guesswork: 16-byte
+`movups` chunks followed by 4/2/1-byte scalar tails, duplicated verbatim at
+three staging sites (slot-to-area, over-aligned alloca, pointer source) and a
+fourth time in the `va_arg` struct copier. Three defects came out of the
+red-team pass.
+
+**1. The 8-mod-16 tail stalled the callee.** `scripts/measure_i686_stack_copy.py`
+is a standalone harness (needs only `as --32`, `ld -m elf_i386`; it does not
+build lccc) that times the candidate instruction mixes with the destination in
+the outgoing area and the first/last dword read straight back — the regime the
+call sequence produces. Min of 101 rounds, Intel Xeon @ 2.60 GHz, cycles per
+copy:
+
+| size | scalar | chunks + 4/2/1 tail | chunks + `movlps` tail | chunks + overlapping tail |
+|---:|---:|---:|---:|---:|
+| 16 | 3.07 | 1.93 | 1.93 | 1.93 |
+| 20 | 3.08 | 2.31 | 2.31 | 2.31 |
+| 21 | 15.31 | 14.55 | 14.55 | **2.31** |
+| 24 | 3.85 | 14.55 | 2.31 | **2.31** |
+| 28 | 3.85 | 3.07 | 2.69 | **2.31** |
+| 31 | 16.84 | 3.07 | 15.31 | **2.31** |
+| 33 | 16.84 | 16.07 | 16.07 | **2.69** |
+| 40 | 5.38 | 15.31 | 2.69 | 2.70 |
+| 48 | 6.14 | 2.69 | 2.69 | 2.69 |
+| 64 | 7.66 | 3.08 | 3.07 | 3.07 |
+
+The 8-mod-16 sizes (24, 40) cost ~12 extra cycles because the callee's dword
+read has to be recombined from two 4-byte stores. The shipped policy ends the
+copy with the **overlapping 16-byte chunk at `size - 16`** (the classic memcpy
+tail): equal to a `movlps` tail where that wins, strictly fewer instructions
+for remainders of 9..15 bytes, no new mnemonic, and 21..31-byte arguments go
+from 14.6-16.1 to 2.3 cycles. `rep movsl` costs 25+ cycles to 256 bytes and is
+rejected for argument-sized copies; alternating `%xmm0`/`%xmm1` is inside the
+±10 % noise floor and is rejected as unmeasurable.
+
+**2. One policy, four call sites.** `emit_copy_bytes(CopySrc, CopyDst,
+CopyScratch, n_bytes)` is now the only copy sequence in the backend; the
+`va_arg` path passes `CopyDst::Register("%eax", 0)` and `CopyScratch::Edx`
+because it may not touch `%eax`/`%ecx`. The in-bounds property — every access
+strictly inside `[0, size)`, so no padding is read and no neighbouring
+argument is written — is enforced by
+`copy_policy_never_touches_a_byte_outside_the_object` over sizes 0..=512 in
+both SSE modes. `sse_copy_is_chunks_plus_one_overlapping_tail` pins the exact
+instruction stream, and `scalar_copy_tail_is_four_two_one` pins the 4/2/1
+scalar tail.
+
+**3. `esp_store_operand` modelled 16-byte stores as 8.** `movups`, `movaps`,
+`movapd` and `movupd` were listed in the 8-byte arm while `frame_mem_width`
+already said 16, so a full-width vector store covering a tracked pair was
+modelled as covering its low half only; `movntdq`, `movhps`, `movhpd` and
+`movlpd` were missing from the slot table entirely. Fixed, and both tables are
+now pinned against the ISA widths by
+`both_width_tables_agree_on_every_shared_mnemonic`.
+
+**4. `movlps`/`movhps`/`movlpd`/`movhpd` stores did not assemble.**
+`encode_sse_op` implements only the load row, so a valid GAS store such as
+`movlps %xmm0, (%eax)` was rejected with "unsupported SSE op operands". The
+half-width moves now route through the two-row `encode_sse_rr_rm` helper
+(0F 12/13, 0F 16/17, and the 66-prefixed pair), locked byte-for-byte against
+GNU as 2.40 by `half_width_sse_store_encodings_match_gas_golden_bytes`.
