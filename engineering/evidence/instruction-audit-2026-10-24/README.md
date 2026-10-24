@@ -391,3 +391,25 @@ fixture. The latter supports separate compiler/driver translation units and
 covers nesting, function arguments/returns, conditional struct members,
 floating bit patterns, sizeof, _Generic and operand side effects. Differential
 runs use only the cached GCC 16.2, Clang 23.1.3 and binutils 2.47 tools.
+
+### i686 GNU vector ABI follow-up
+
+A freestanding GCC 16.2 driver exposed a separate i686 calling-convention
+failure: 16-byte GNU `vector_size` arguments/returns were classified like
+struct stack/sret objects instead of XMM vectors. The baseline native witness
+terminates with SIGSEGV. These GNU vector shapes now reuse the already modeled
+single-XMM carrier, including signature CType retention, direct/indirect calls,
+argument decomposition and return packing. Other GNU vector widths are not
+changed. This is an ABI finding from current compiler differential evidence,
+not a calling-convention claim derived from the SDM.
+
+`check_i686_gnu_vector_abi.sh` requires GCC 16.2.0, Clang 23.1.3 and GNU as
+2.47. It links freestanding ELF32 programs with lccc-ld, requiring no 32-bit
+libc headers/runtime. Across both driver compilers and all three function
+compilers at O0/O2/O3/Os, it exercises 24 cross-TU configurations, each with
+16,384 vector-ABI checks and 18,432 typed-shuffle checks. Integer element
+widths 8/16/32/64, double bit patterns, indirect calls, register exhaustion,
+16-byte stack alignment and variadic named/unnamed vectors are covered. The
+shared typed fixture keeps its original checks; only its libc includes are
+replaced by freestanding declarations. Backend contract CI runs this gate
+with the pinned compiler and assembler oracles.

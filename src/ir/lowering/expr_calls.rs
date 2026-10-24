@@ -1230,7 +1230,7 @@ impl Lowerer {
             let arg = args.get(cursor);
             let vector_ct = arg
                 .and_then(|arg| self.call_arg_ctype(param_ctypes, cursor, arg))
-                .filter(|ct| matches!(ct, CType::ExtVector(..)));
+                .filter(|ct| ct.i386_ext_vector_arg().is_some());
             let carrier = vector_ct.as_ref().and_then(CType::i386_ext_vector_arg);
             let (Some(arg), Some(vector_ct), Some(carrier)) = (arg, vector_ct, carrier) else {
                 new_vals.push(value);
