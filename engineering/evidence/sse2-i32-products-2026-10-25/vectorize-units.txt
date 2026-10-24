@@ -2,8 +2,8 @@
      Running unittests src/lib.rs (target/fastbuild/deps/lccc-244ecc21c018cae1)
 
 running 164 tests
-test passes::vectorize::byte_count_exit_shape_tests::byte_count_bound_division_preserves_signed_negative_limits ... ok
 test passes::vectorize::byte_count_exit_shape_tests::byte_count_requires_true_to_continue_false_to_exit_and_exact_iv ... ok
+test passes::vectorize::byte_count_exit_shape_tests::byte_count_bound_division_preserves_signed_negative_limits ... ok
 test passes::vectorize::byte_count_normalize::tests::interpreted_32bit_address_casts_keep_the_original_byte_stream ... ok
 test passes::vectorize::byte_count_normalize::tests::rejected_adapter_and_failed_packed_plan_do_not_mutate_ir_or_metadata ... ok
 test passes::vectorize::byte_count_normalize::tests::u32_inclusive_endpoint_must_include_the_failing_header_domain ... ok
@@ -124,7 +124,7 @@ test passes::vectorize::range_mask_fusion_tests::different_subjects_do_not_fuse 
 test passes::vectorize::range_mask_fusion_tests::empty_window_is_refused ... ok
 test passes::vectorize::range_mask_fusion_tests::fp_lanes_have_no_lane_width ... ok
 test passes::vectorize::range_mask_fusion_tests::full_domain_window_is_refused ... ok
-test passes::vectorize::range_mask_fusion_tests::fused_mask_matches_unsigned_range_exhaustively_at_8_bits ... ok
+test passes::vectorize::range_fusion_tests::fused_mask_matches_unsigned_range_exhaustively_at_8_bits ... ok
 test passes::vectorize::range_mask_fusion_tests::mixed_unsigned_lower_signed_upper_is_refused ... ok
 test passes::vectorize::range_mask_fusion_tests::negative_constant_signed_bounds_fail_closed ... ok
 test passes::vectorize::range_mask_fusion_tests::signed_bounds_fuse_only_through_the_sound_window ... ok
@@ -163,8 +163,8 @@ test passes::vectorize::strict_recip::strict_packed_dag_tests::packed_shift_boun
 test passes::vectorize::strict_recip::strict_packed_dag_tests::rejected_packed_plan_discards_partially_allocated_ids ... ok
 test passes::vectorize::window_union_tests::ascii_alpha_class_collapses_to_one_window ... ok
 test passes::vectorize::window_union_tests::bitwise_mask_ops_canonicalise_to_mask_conjunctions ... ok
-test passes::vectorize::range_fusion_tests::fused_mask_matches_unsigned_range_exhaustively_at_8_bits ... ok
+test passes::vectorize::range_mask_fusion_tests::fused_mask_matches_unsigned_range_exhaustively_at_8_bits ... ok
 test passes::vectorize::window_union_tests::union_fold_refuses_when_the_precondition_fails ... ok
 test passes::vectorize::window_union_tests::single_bit_union_matches_the_union_exhaustively_at_8_bits ... ok
 
-test result: ok. 164 passed; 0 failed; 0 ignored; 0 measured; 6134 filtered out; finished in 0.22s
+test result: ok. 164 passed; 0 failed; 0 ignored; 0 measured; 6135 filtered out; finished in 0.24s

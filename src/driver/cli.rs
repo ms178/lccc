@@ -3856,6 +3856,30 @@ mod cli_tests {
         );
     }
 
+    #[test]
+    fn sse2_denial_survives_independent_sse1_codegen_grant() {
+        for flags in [
+            &["-mno-sse2", "-msse"][..],
+            &["-msse", "-mno-sse2", "-msse"],
+            &["-march=x86-64-v3", "-mno-sse2", "-msse"],
+        ] {
+            let mut d = Driver::new();
+            let args: Vec<String> = std::iter::once("ccc")
+                .chain(flags.iter().copied())
+                .chain(std::iter::once("x.c"))
+                .map(str::to_string)
+                .collect();
+            assert!(d.parse_cli_args(&args).is_ok(), "{flags:?}");
+            assert!(!d.no_sse && d.no_sse2, "{flags:?}");
+            let isa = d.x86_isa();
+            assert!(!isa.simd && !isa.sse41 && !isa.avx && !isa.ymm && !isa.fma);
+        }
+        let mut d = Driver::new();
+        let args = ["ccc", "-mno-sse2", "-msse", "-msse2", "x.c"].map(str::to_string);
+        assert!(d.parse_cli_args(&args).is_ok());
+        assert!(d.x86_isa().simd);
+    }
+
     /// `-mfma` at the plain SSE2 baseline pulls the whole chain too (GCC
     /// emits FMA there; the march ceiling is not a hard ceiling for
     /// explicit -m feature flags).

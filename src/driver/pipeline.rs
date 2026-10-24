@@ -3483,7 +3483,10 @@ impl Driver {
     /// handling through `no_sse` and never reaches the x86-64 emitters.
     pub(crate) fn x86_isa(&self) -> crate::backend::x86::isa::X86Isa {
         use crate::backend::x86::isa::X86Isa;
-        if self.target != Target::X86_64 || self.no_sse || self.general_regs_only {
+        // The packed x86-64 classes require SSE2, not merely SSE1. A later
+        // -msse may re-enable scalar SSE1 after -mno-sse2, but must not reopen
+        // vector lowering or allocation while that SSE2 denial is sticky.
+        if self.target != Target::X86_64 || self.no_sse || self.no_sse2 || self.general_regs_only {
             return X86Isa {
                 cx16: self.resolved_cx16(),
                 ..X86Isa::NONE

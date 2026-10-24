@@ -25,6 +25,15 @@ four-lane I32/U32 multiply solely because SSE4.1 is absent. SSE4.1 retains
 `pmulld`; AVX2 retains its direct packed multiply. No FP transformation,
 reassociation permission, ISA default, or benchmark-specific dispatch changed.
 
+A follow-up flag-order probe found that `-mno-sse2 -msse` could reopen the
+packed-codegen ceiling: the driver checked `no_sse` but not the independent
+sticky `no_sse2`. The ceiling now requires SSE2. Scalar SSE1 permission and
+predefines are kept independent: memory-to-memory F32 additions still work,
+while the integer maps/reductions remain scalar until an explicit `-msse2`
+regrant. The pre-fix compiler fails the expanded gate with `movdqu`,
+`pmuludq`, `pshufd` and `punpckldq` under the SSE2-denied profile.
+
+
 ## Paired runtime evidence
 
 `map-runtime.json` is the canonical benchmark runner's raw report: 15 paired
@@ -73,6 +82,10 @@ swap. Rust 1.97 is the cached toolchain, not a claim of latest stable Rust.
   explicit SSE4.1 denial, scalar-XMM homes disabled, vector homes disabled,
   both home classes disabled, and final VEX promotion disabled. Exact stdout
   and successful exits match independent GCC and Clang executables.
+- Additional SSE2-denial fixture: GCC and Clang plus four LCCC profiles,
+  44 cases each. Three SSE1-only flag orderings must contain only permitted
+  SSE1 operations; scalar F32 additions must remain. A later explicit SSE2
+  regrant must restore packed products. A driver unit pins both directions.
 - SSE2 SIMD opcode allowlist plus mandatory packed products: disabling
   vectorization cannot make the gate pass. SSE4.1/AVX2 must retain direct
   multiplication. The gate is in hosted codegen CI and local targeted CI.
@@ -87,8 +100,8 @@ swap. Rust 1.97 is the cached toolchain, not a claim of latest stable Rust.
 - Complete gzip longest_match assembly is identical before/after under SSE2
   and AVX2: stack references cannot have increased. SSE4.1 and AVX2 map
   assembly is likewise byte-identical. See `unchanged-code.json`.
-- Warning-clean fastbuild units: 4 SSE2-filtered, 164 vectorizer and 146
-  register-allocator tests pass (314 total); both compiler/linker binaries
+- Warning-clean fastbuild units: 5 SSE2-filtered, 164 vectorizer and 146
+  register-allocator tests pass (315 total); both compiler/linker binaries
   also build with `RUSTFLAGS="-D warnings"`.
 - Benchmark harness unit tests and the unchanged strict shard-plan contract
   pass. The new benchmark belongs to hosted shard b and has a bounded
@@ -108,6 +121,12 @@ python3 tests/benchmark/run_benchmarks.py --only i32_product_map \
   --artifact-dir /absolute/path/to/artifacts --json /absolute/path/to/report.json \
   --strict
 ```
+
+The permission-boundary follow-up regenerated the measured SSE2 map ELF
+byte-for-byte, and regenerated the unchanged gzip/SSE4.1/AVX2 assembly.
+`permission-fix-provenance.json` links the final compiler fingerprint to the
+unchanged measured executable: the earlier raw runtime report is retained
+without rewriting its original compiler metadata.
 
 The full per-arm assembly is reproducible from the gate; its fingerprints
 and commands are retained in `feature-matrix.json`. Raw runtime samples,

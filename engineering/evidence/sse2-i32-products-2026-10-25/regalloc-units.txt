@@ -7,37 +7,37 @@ test backend::regalloc::allocation_kernel_tests::call_spanning_respects_segment_
 test backend::regalloc::allocation_kernel_tests::collect_gpr_requires_eligibility_and_sorts ... ok
 test backend::regalloc::allocation_kernel_tests::cold_call_xmm_saves_skip_the_result_register ... ok
 test backend::regalloc::allocation_kernel_tests::coverage_overlap_is_linear_and_half_open ... ok
-test backend::regalloc::allocation_kernel_tests::divrem_pairs_matching_operands_and_width ... ok
 test backend::regalloc::allocation_kernel_tests::divrem_rejects_exceptional_barrier ... ok
+test backend::regalloc::allocation_kernel_tests::divrem_pairs_matching_operands_and_width ... ok
 test backend::regalloc::allocation_kernel_tests::divrem_rejects_redefined_operand_stamp ... ok
 test backend::regalloc::allocation_kernel_tests::divrem_rejects_width_mismatch ... ok
 test backend::regalloc::allocation_kernel_tests::flatten_resolves_indirect_class_parents ... ok
 test backend::regalloc::allocation_kernel_tests::hidden_read_through_deep_address_chain_does_not_veto ... ok
 test backend::regalloc::allocation_kernel_tests::folded_consumer_rooted_in_dest_does_not_veto ... ok
-test backend::regalloc::allocation_kernel_tests::interval_map_keeps_complete_envelope ... ok
 test backend::regalloc::allocation_kernel_tests::homeless_merge_profitability_gate ... ok
+test backend::regalloc::allocation_kernel_tests::interval_map_keeps_complete_envelope ... ok
 test backend::regalloc::allocation_kernel_tests::overlap_kernel_keeps_zero_length_and_half_open_boundaries ... ok
 test backend::regalloc::allocation_kernel_tests::overlap_kernel_matches_quadratic_oracle ... ok
 test backend::regalloc::allocation_kernel_tests::overlap_kernel_reports_all_pairwise_class_conflicts ... ok
-test backend::regalloc::allocation_kernel_tests::owned_segments_keep_unsegmented_web_members ... ok
 test backend::regalloc::allocation_kernel_tests::overlap_kernel_rejects_reversed_range - should panic ... ok
+test backend::regalloc::allocation_kernel_tests::owned_segments_keep_unsegmented_web_members ... ok
 test backend::regalloc::allocation_kernel_tests::phi_web_rejects_overlapping_segments ... ok
 test backend::regalloc::allocation_kernel_tests::propagate_restrictions_to_web_owners ... ok
 test backend::regalloc::allocation_kernel_tests::rdx_clobber_classes_admitted_for_param_homes ... ok
 test backend::regalloc::allocation_kernel_tests::saved_callee_fill_breaks_ties_by_envelope_then_id_and_tries_each_register ... ok
 test backend::regalloc::allocation_kernel_tests::saved_callee_fill_judges_the_fat_envelope ... ok
+test backend::regalloc::allocation_kernel_tests::phi_chain_published_for_applied_coalesce ... ok
 test backend::regalloc::allocation_kernel_tests::saved_callee_fill_places_the_hottest_web_first ... ok
 test backend::regalloc::allocation_kernel_tests::skip_birth_consumes_every_duplicate_birth_hazard ... ok
 test backend::regalloc::allocation_kernel_tests::source_home_accepts_clean_same_block_window ... ok
 test backend::regalloc::allocation_kernel_tests::source_home_allows_pointer_increment_latch ... ok
-test backend::regalloc::allocation_kernel_tests::phi_chain_published_for_applied_coalesce ... ok
 test backend::regalloc::allocation_kernel_tests::source_home_ignores_a_cast_of_the_source ... ok
-test backend::regalloc::allocation_kernel_tests::source_home_rejects_copy_block_redef ... ok
 test backend::regalloc::allocation_kernel_tests::source_home_rejects_a_read_after_a_sibling_source_definition ... ok
-test backend::regalloc::allocation_kernel_tests::summed_use_weight_saturates_instead_of_wrapping ... ok
+test backend::regalloc::allocation_kernel_tests::source_home_rejects_copy_block_redef ... ok
 test backend::regalloc::allocation_kernel_tests::source_home_rejects_folded_read_in_dirty_window ... ok
-test backend::regalloc::allocation_kernel_tests::vecreg_rejects_non_16_byte_alloca ... ok
+test backend::regalloc::allocation_kernel_tests::summed_use_weight_saturates_instead_of_wrapping ... ok
 test backend::regalloc::allocation_kernel_tests::use_path_respects_instruction_order_in_a_redefining_use_block ... ok
+test backend::regalloc::allocation_kernel_tests::vecreg_rejects_non_16_byte_alloca ... ok
 test backend::regalloc::allocation_kernel_tests::vecreg_rejects_unknown_dest_ptr_writer ... ok
 test backend::regalloc::allocation_kernel_tests::wide_ops_see_i128_constants_without_typed_def ... ok
 test backend::regalloc::call_sequence_policy_tests::i686_phases_key_on_the_target_not_the_register_numbers ... ok
@@ -46,8 +46,8 @@ test backend::regalloc::call_sequence_policy_tests::no_caller_saved_home_spans_a
 test backend::regalloc::fold_defer_tests::deferral_skips_readmitted_addresses_and_ineligible_bases ... ok
 test backend::regalloc::call_sequence_policy_tests::sequences_do_not_reorder_callee_saved_priority ... ok
 test backend::regalloc::fold_defer_tests::empty_fold_pool_disables_deferral ... ok
-test backend::regalloc::fold_defer_tests::failed_base_readmits_its_addresses_and_reaches_a_fixpoint ... ok
 test backend::regalloc::fold_defer_tests::homed_base_keeps_its_addresses_deferred_in_one_round ... ok
+test backend::regalloc::fold_defer_tests::failed_base_readmits_its_addresses_and_reaches_a_fixpoint ... ok
 test backend::regalloc::fp_phi_move_tests::fat_fallback_for_unsegmented_values ... ok
 test backend::regalloc::fp_phi_move_tests::ignores_other_regs_and_the_pair_itself ... ok
 test backend::regalloc::fp_phi_move_tests::no_coverage_fails_closed ... ok
@@ -149,4 +149,4 @@ test backend::regalloc::wide_hazard_tests::integer_casts_across_the_wide_boundar
 test backend::regalloc::wide_hazard_tests::integer_truncation_out_of_i128_has_a_gpr_result ... ok
 test backend::regalloc::ipa_fill_tests::interval_covering_counts_matches_naive_at_scale ... ok
 
-test result: ok. 146 passed; 0 failed; 0 ignored; 0 measured; 6152 filtered out; finished in 0.02s
+test result: ok. 146 passed; 0 failed; 0 ignored; 0 measured; 6153 filtered out; finished in 0.03s

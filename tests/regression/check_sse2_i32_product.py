@@ -138,6 +138,55 @@ def main():
                             print(f'{label}: KILLED ({sites} sites, native exit zero)')
                 report['arms'].append(row)
                 print(f'{name}: PASS {row["cases"]} exact-output cases + {isa} legality')
+            denial_source = ROOT / 'tests/regression/sse2_denial_sse1_grant.c'
+            report['denial_source_sha256'] = hashlib.sha256(denial_source.read_bytes()).hexdigest()
+            report['denial_arms'] = []
+            denial_modes = [('gcc-denial', args.gcc, ['-mno-sse2', '-msse'], 'oracle')]
+            if args.clang:
+                denial_modes.append(('clang-denial', args.clang, ['-mno-sse2', '-msse'], 'oracle'))
+            denial_modes.extend([
+                ('deny-then-sse1', args.lccc, ['-mno-sse2', '-msse'], 'sse1'),
+                ('sse1-deny-sse1', args.lccc, ['-msse', '-mno-sse2', '-msse'], 'sse1'),
+                ('v3-deny-sse1', args.lccc, ['-march=x86-64-v3', '-mno-sse2', '-msse'], 'sse1'),
+                ('sse2-regrant', args.lccc, ['-mno-sse2', '-msse', '-msse2'], 'sse2'),
+            ])
+            expected_denial = None
+            for name, compiler, flags, isa in denial_modes:
+                binary = Path(td) / name
+                command = [compiler, *COMMON, *flags, str(denial_source), '-o', str(binary)]
+                run(command, env)
+                output = run([str(binary)], env)
+                if expected_denial is None:
+                    expected_denial = output
+                if output != expected_denial:
+                    raise RuntimeError(f'{name}: SSE1-only fixture differs from GCC')
+                row = {'name': name, 'command': command, 'cases': len(output.splitlines()),
+                       'sha256': hashlib.sha256(output).hexdigest()}
+                if isa != 'oracle':
+                    assembly = binary.with_suffix('.s')
+                    run([compiler, *COMMON, *flags, '-S', str(denial_source), '-o', str(assembly)], env)
+                    text = assembly.read_text()
+                    row['assembly_sha256'] = hashlib.sha256(text.encode()).hexdigest()
+                    if isa == 'sse1':
+                        # The SSE1 scalar grant survives; SSE2 packed integer
+                        # code must not. Check the entire translation unit.
+                        allowed = {'movss', 'movaps', 'movups', 'addss', 'addps',
+                                   'subss', 'subps', 'mulss', 'mulps', 'divss', 'divps',
+                                   'xorps', 'andps', 'andnps', 'orps', 'ucomiss', 'comiss',
+                                   'cvtsi2ssl', 'cvtsi2ssq', 'cvttss2sil', 'cvttss2siq',
+                                   'shufps', 'unpcklps', 'unpckhps', 'movhlps', 'movlhps',
+                                   'movlps', 'movhps'}
+                        simd_ops = {re.match(r'\s*([a-z0-9]+)', line)[1]
+                                    for line in text.splitlines()
+                                    if '%xmm' in line and re.match(r'\s*[a-z][a-z0-9]*\s', line)}
+                        if simd_ops - allowed or re.search(r'\b[vyz]mm\d+\b|^\s+v[a-z0-9]+\s', text, re.M):
+                            raise RuntimeError(f'{name}: SSE2 denial escaped: {simd_ops - allowed}')
+                        if not {'addss', 'addps'} & simd_ops:
+                            raise RuntimeError(f'{name}: independent SSE1 arithmetic disappeared')
+                    elif not re.search(r'\bpmuludq\b', text):
+                        raise RuntimeError('explicit SSE2 regrant did not restore packed products')
+                report['denial_arms'].append(row)
+                print(f'{name}: PASS {row["cases"]} exact-output cases + {isa} legality')
             report['complete'] = True
     finally:
         if args.json:

@@ -15,3 +15,9 @@ no-xmm: PASS 808 exact-output cases + sse2 legality
 no-vecreg: PASS 808 exact-output cases + sse2 legality
 no-homes: PASS 808 exact-output cases + sse2 legality
 no-promote: PASS 808 exact-output cases + sse2 legality
+gcc-denial: PASS 44 exact-output cases + oracle legality
+clang-denial: PASS 44 exact-output cases + oracle legality
+deny-then-sse1: PASS 44 exact-output cases + sse1 legality
+sse1-deny-sse1: PASS 44 exact-output cases + sse1 legality
+v3-deny-sse1: PASS 44 exact-output cases + sse1 legality
+sse2-regrant: PASS 44 exact-output cases + sse2 legality
