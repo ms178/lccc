@@ -525,6 +525,27 @@ fn strictly_better(before: Metrics, after: Metrics) -> bool {
         })
 }
 
+/// Apply a new->old permutation as disjoint cycle rotations. `swap` is called
+/// for both instruction and source-span arrays so they cannot diverge.
+fn for_each_permutation_swap(order: &[usize], mut swap: impl FnMut(usize, usize)) {
+    let mut visited = vec![false; order.len()];
+    for start in 0..order.len() {
+        if visited[start] {
+            continue;
+        }
+        let mut current = start;
+        loop {
+            visited[current] = true;
+            let next = order[current];
+            if next == start {
+                break;
+            }
+            swap(current, next);
+            current = next;
+        }
+    }
+}
+
 fn schedule_function(
     func: &mut IrFunction,
     target: Target,
@@ -664,20 +685,14 @@ fn schedule_function(
             });
         }
         let spans_valid = block.source_spans.len() == n;
-        // Apply new->old as an in-place permutation. Swapping the parallel
-        // span array at every step preserves debug locations, and using the
-        // permutation itself as the position map avoids Option/unwrap
-        // reconstruction or a second instruction allocation.
-        for new in 0..n {
-            while final_order[new] != new {
-                let old = final_order[new];
-                block.instructions.swap(new, old);
-                final_order.swap(new, old);
-                if spans_valid {
-                    block.source_spans.swap(new, old);
-                }
+        // Rotate every cycle of the new->old permutation. The closure applies
+        // identical swaps to instructions and their parallel source spans.
+        for_each_permutation_swap(&final_order, |from, to| {
+            block.instructions.swap(from, to);
+            if spans_valid {
+                block.source_spans.swap(from, to);
             }
-        }
+        });
     }
 }
 
@@ -769,6 +784,25 @@ mod tests {
             .iter()
             .filter_map(|i| i.dest().map(|d| d.0))
             .collect()
+    }
+
+    #[test]
+    fn permutation_application_covers_every_four_element_cycle() {
+        for a in 0..4 {
+            for b in 0..4 {
+                for c in 0..4 {
+                    for d in 0..4 {
+                        let order = [a, b, c, d];
+                        if (1 << a) | (1 << b) | (1 << c) | (1 << d) != 0b1111 {
+                            continue;
+                        }
+                        let mut values = [0, 1, 2, 3];
+                        for_each_permutation_swap(&order, |from, to| values.swap(from, to));
+                        assert_eq!(values, order, "permutation {order:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
