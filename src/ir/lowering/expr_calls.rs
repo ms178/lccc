@@ -340,6 +340,7 @@ impl Lowerer {
             &mut struct_arg_riscv_float_classes,
             &param_ctypes_for_decompose,
             args,
+            call_is_variadic,
         );
 
         let dest = self.fresh_value();
@@ -1203,6 +1204,7 @@ impl Lowerer {
         struct_arg_riscv_float_classes: &mut Vec<Option<crate::common::types::RiscvFloatClass>>,
         param_ctypes: &Option<Vec<CType>>,
         args: &[Expr],
+        call_is_variadic: bool,
     ) -> Vec<Option<(usize, bool)>> {
         use crate::common::types::{EightbyteClass, I386ExtVectorCarrier};
         let mut expansions = vec![None; args.len()];
@@ -1228,17 +1230,52 @@ impl Lowerer {
 
         for (cursor, &value) in old_vals.iter().enumerate() {
             let arg = args.get(cursor);
-            let vector_ct = arg
-                .and_then(|arg| self.call_arg_ctype(param_ctypes, cursor, arg))
-                .filter(|ct| ct.i386_ext_vector_arg().is_some());
+            let vector_ct = arg.and_then(|arg| self.call_arg_ctype(param_ctypes, cursor, arg));
             let carrier = vector_ct.as_ref().and_then(CType::i386_ext_vector_arg);
+            // Captured before the let-else moves `vector_ct` (the else arm
+            // decides the pre-SSE variadic 16-byte-class promotion).
+            let variadic_16b_simd = call_is_variadic
+                && vector_ct
+                    .as_ref()
+                    .is_some_and(|ct| ct.is_i386_16b_simd_vector());
             let (Some(arg), Some(vector_ct), Some(carrier)) = (arg, vector_ct, carrier) else {
-                new_vals.push(value);
-                new_types.push(old_types.get(cursor).copied().unwrap_or(IrType::Ptr));
-                new_sizes.push(old_sizes.get(cursor).copied().flatten());
-                new_aligns.push(old_aligns.get(cursor).copied().flatten());
-                new_classes.push(old_classes.get(cursor).cloned().unwrap_or_default());
-                new_riscv_classes.push(old_riscv_classes.get(cursor).copied().flatten());
+                // A 16-byte SIMD vector with no XMM carrier (pre-SSE
+                // baseline / -mno-sse) is ordinarily the plain 4-granular
+                // by-value aggregate: the Clang-side fork of the measured
+                // pre-SSE callee conventions (GCC 16.2 8-aligns the 16B
+                // vector slot in fixed arguments — documented fork; lccc
+                // follows Clang's 4-granular placement).
+                //
+                // Exception: in a VARIADIC call the GCC 4.6 va rule
+                // 16-byte-aligns the 16-byte class inside the variadic area
+                // on ANY baseline (measured: GCC 16.2 and Clang 23.1.3
+                // callers both pad the vector to a 16-byte boundary, and
+                // both callees realign the va_arg cursor). Emit the same
+                // 16-byte `[Sse, SseUp]` piece the XMM carrier uses: the
+                // variadic classify arm never assigns an XMM register to
+                // it (always `StructByValStack { 16 }`), and the
+                // `(pieces = 1, true)` expansion gives it the 16-byte
+                // stack alignment the `__float128` carrier shares
+                // (struct_arg_is_f128_sse).
+                if variadic_16b_simd {
+                    // The aggregate operand of a by-value vector already is
+                    // the 16-byte object address (no XMM image needed).
+                    let base = self.operand_to_value(value);
+                    new_vals.push(Operand::Value(base));
+                    new_types.push(IrType::Ptr);
+                    new_sizes.push(Some(16));
+                    new_aligns.push(Some(16));
+                    new_classes.push(vec![EightbyteClass::Sse, EightbyteClass::SseUp]);
+                    new_riscv_classes.push(None);
+                    expansions[cursor] = Some((1, true));
+                } else {
+                    new_vals.push(value);
+                    new_types.push(old_types.get(cursor).copied().unwrap_or(IrType::Ptr));
+                    new_sizes.push(old_sizes.get(cursor).copied().flatten());
+                    new_aligns.push(old_aligns.get(cursor).copied().flatten());
+                    new_classes.push(old_classes.get(cursor).cloned().unwrap_or_default());
+                    new_riscv_classes.push(old_riscv_classes.get(cursor).copied().flatten());
+                }
                 continue;
             };
             let base = self.operand_to_value(value);

@@ -325,11 +325,20 @@ pub(crate) fn check_packed_shift_shape(mnemonic: &str, ops: &[Operand]) -> Resul
     // PSLLDQ/PSRLDQ have no MMX or GP form. Their ModRM register
     // number alone cannot distinguish those illegal names from XMM.
     if matches!(mnemonic, "pslldq" | "psrldq") {
+        // GAS 2.47 (byte-probed, both modes): a same-family vector of the
+        // wrong size is an *operand size* mismatch; MMX/GP/anything else is
+        // an operand type mismatch.
         return match ops {
             [
                 Operand::Immediate(ImmediateValue::Integer(_)),
                 Operand::Register(dst),
             ] if is_xmm(&dst.name) => Ok(false),
+            [
+                Operand::Immediate(ImmediateValue::Integer(_)),
+                Operand::Register(dst),
+            ] if is_ymm(&dst.name) || is_zmm(&dst.name) => {
+                Err(format!("operand size mismatch for `{mnemonic}'"))
+            }
             _ => Err(format!("operand type mismatch for `{mnemonic}'")),
         };
     }
@@ -350,10 +359,16 @@ pub(crate) fn check_packed_shift_shape(mnemonic: &str, ops: &[Operand]) -> Resul
         _ => return Err(type_error()),
     };
     let immediate = matches!(&ops[0], Operand::Immediate(ImmediateValue::Integer(_)));
+    let reg_error = || format!("register type mismatch for `{mnemonic}'");
     match &ops[1] {
         Operand::Register(src) => {
-            if vec_width(&src.name) != Some(width) {
-                return Err(format!("register type mismatch for `{mnemonic}'"));
+            // A vector of the wrong width is a register type mismatch (GAS
+            // text); a GP/MM register in the data slot is an operand type
+            // mismatch.
+            match vec_width(&src.name) {
+                Some(src_width) if src_width == width => {}
+                Some(_) => return Err(reg_error()),
+                None => return Err(type_error()),
             }
         }
         // Memory data is available only for immediate counts. Variable
@@ -363,9 +378,18 @@ pub(crate) fn check_packed_shift_shape(mnemonic: &str, ops: &[Operand]) -> Resul
     }
     let count_ok = match &ops[0] {
         Operand::Immediate(ImmediateValue::Integer(_)) => !variable,
-        Operand::Register(count) if !byte_shift => {
-            vec_width(&count.name) == Some(if variable { width } else { 0 })
-        }
+        Operand::Register(count) if !byte_shift => match vec_width(&count.name) {
+            // The data slots accept any vector width, so a wrong-width
+            // vector there is a register type mismatch; the uniform count
+            // slot is XMM-only, so GAS reports operand type mismatch for
+            // YMM/ZMM counts. A GP count is an operand type mismatch
+            // either way.
+            Some(count_width) if count_width != if variable { width } else { 0 } => {
+                return Err(if variable { reg_error() } else { type_error() });
+            }
+            Some(_) => true,
+            None => false,
+        },
         Operand::Memory(_) => !byte_shift,
         _ => false,
     };

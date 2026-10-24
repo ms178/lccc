@@ -215,10 +215,16 @@ impl Driver {
     /// replayed after the profile lands (see
     /// [`Driver::replay_x86_explicit_isa_flags`]).
     fn reset_x86_arch_implied_isa(&mut self) {
-        // `enable_sse` is only ever set by the explicit `-msse`/`-msse2`
-        // flags, which are replayed after the profile like every other
-        // explicit decision; `enable_prfchw` is arch-implied or explicit.
+        // `enable_sse`/`enable_sse2` are only ever set by the explicit
+        // `-msse`/`-msse2` flags, which are replayed after the profile like
+        // every other explicit decision; `enable_prfchw` is arch-implied or
+        // explicit. The sticky denials (`no_sse`, `sse_explicitly_disabled`,
+        // `sse2_explicitly_disabled`) and `march_pre_sse` are NOT reset
+        // here: the denials survive every `-march=` (GCC keeps them in
+        // either flag order), and `march_pre_sse` is re-set by the `-march=`
+        // handler that this reset serves.
         self.enable_sse = false;
+        self.enable_sse2 = false;
         self.enable_prfchw = false;
         self.enable_sse3 = false;
         self.enable_ssse3 = false;
@@ -337,13 +343,14 @@ impl Driver {
             return true;
         }
         match arg {
-            "-mno-sse" | "-mno-sse2" => {
+            "-mno-sse" => {
                 // Sticky disable: later `-march=native` / CPU profiles must
                 // not revive SSE. GCC keeps `-mno-sse` in either flag order
                 // (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
                 self.no_sse = true;
                 self.sse_explicitly_disabled = true;
                 self.enable_sse = false;
+                self.enable_sse2 = false;
                 // No xmm state at all, so every VEX form is forbidden too.
                 self.avx_explicitly_disabled = true;
                 self.fma_explicitly_disabled = true;
@@ -354,6 +361,19 @@ impl Driver {
                 self.enable_sse4_2 = false;
                 self.enable_avx = false;
                 self.enable_avx2 = false;
+            }
+            "-mno-sse2" => {
+                // The SSE2 level only, sticky. GCC 16.2 measures:
+                // `-m32 -mno-sse2` keeps `-msse` [enabled] (16-byte vectors
+                // still take their XMM carrier, through SSE1-only encodings —
+                // lccc's i386 vector marshalling emits `movdqu`, never a
+                // SSE2-only instruction), while x86-64 `-mno-sse2` is a
+                // genuine codegen mode change lccc does not emulate (its
+                // x86-64 backend requires SSE2), so the end-of-parse
+                // normalization below folds it into the full `-mno-sse`
+                // state there.
+                self.sse2_explicitly_disabled = true;
+                self.enable_sse2 = false;
             }
             "-mno-avx2" => {
                 self.enable_avx2 = false;
@@ -599,10 +619,18 @@ impl Driver {
             // Baseline x86-64 ISA flags. SSE2/MMX are the x86-64 default,
             // but `-msse`/`-msse2` after `-mno-sse` must re-enable SSE
             // (GCC last-explicit-ISA-flag wins; `-march=native` does not).
+            // `-msse2` grants the SSE2 level too (and lifts a `-mno-sse2`
+            // denial, the same last-explicit-wins contract); `-msse` alone
+            // does NOT re-grant a denied SSE2 (GCC: `-mno-sse2 -msse` keeps
+            // `-msse2` [disabled] — measured).
             "-msse2" | "-msse" => {
                 self.no_sse = false;
                 self.sse_explicitly_disabled = false;
                 self.enable_sse = true;
+                if arg == "-msse2" {
+                    self.enable_sse2 = true;
+                    self.sse2_explicitly_disabled = false;
+                }
             }
             "-mprfchw" => {
                 // Last explicit decision wins (GCC): lifts an earlier
@@ -1866,7 +1894,13 @@ impl Driver {
                     }
                     match self.target {
                         Target::Riscv64 => self.riscv_march = Some(march.to_string()),
-                        Target::X86_64 | Target::I686 => match march {
+                        Target::X86_64 | Target::I686 => {
+                            // The baseline SSE/SSE2/MMX grant follows the
+                            // FINAL `-march=` (last wins, like the profile):
+                            // every accepted spelling resets the pre-SSE veto,
+                            // and the legacy 32-bit baselines re-set it.
+                            self.march_pre_sse = false;
+                            match march {
                             "x86-64" | "x86-64-v1" | "generic" => {}
                             // Legacy 32-bit baselines (kernel REALMODE_CFLAGS
                             // pass `-march=i386 -m16`). The i686 backend's
@@ -1884,6 +1918,15 @@ impl Driver {
                                         march
                                     ));
                                 }
+                                // Pre-SSE baseline: vetoes the default
+                                // x86-64-baseline SSE/SSE2/MMX grant on i686
+                                // (GCC 16.2 `-m32 -march=i686` measures
+                                // `-msse`/`-msse2` [disabled], no `__MMX__`);
+                                // explicit `-msse`/`-msse2` still override at
+                                // resolve time, and MMX follows the arch (the
+                                // kernel's `-march=i386 -m16` real-mode code
+                                // gets neither, as measured).
+                                self.march_pre_sse = true;
                             }
                             "nehalem" => self.enable_x86_nehalem_profile(),
                             "westmere" => self.enable_x86_westmere_profile(),
@@ -2031,6 +2074,7 @@ impl Driver {
                                 }
                             }
                             _ => return Err(format!("unsupported x86 -march={}", march)),
+                            }
                         },
                         _ => {
                             return Err(format!(
@@ -2813,6 +2857,33 @@ impl Driver {
         }
         if let Some(dialect) = self.tls_dialect.as_deref() {
             check_tls_dialect(&self.target, dialect)?;
+        }
+
+        // Target-dependent normalization of the SSE flag state, run once the
+        // target is final (flag order within the ISA set is already settled
+        // by the sticky-denial + explicit-replay machinery above):
+        //  * x86-64: SSE2 is an inescapable codegen baseline there, so a
+        //    surviving `-mno-sse2` denial folds into the full `-mno-sse`
+        //    state (the exact prior behavior of the combined
+        //    `-mno-sse`/`-mno-sse2` arm — lccc's x86-64 backend cannot
+        //    emit x87 fallback code for `-mno-sse2` the way GCC does);
+        //  * i686: the denial stays SSE2-only, so `-m32 -mno-sse2` keeps
+        //    the SSE level (and the XMM 16-byte-vector carrier) live,
+        //    matching GCC 16.2's measured `-msse` [enabled] / `-msse2`
+        //    [disabled] state.
+        if self.target == Target::X86_64 && self.sse2_explicitly_disabled && !self.no_sse {
+            self.no_sse = true;
+            self.sse_explicitly_disabled = true;
+            self.enable_sse = false;
+            self.avx_explicitly_disabled = true;
+            self.fma_explicitly_disabled = true;
+            self.sse41_explicitly_disabled = true;
+            self.enable_sse3 = false;
+            self.enable_ssse3 = false;
+            self.enable_sse4_1 = false;
+            self.enable_sse4_2 = false;
+            self.enable_avx = false;
+            self.enable_avx2 = false;
         }
 
         Ok(())
@@ -5410,19 +5481,31 @@ mod prefetch_isa_tests {
 
     #[test]
     fn i686_sse_prefetch_needs_sse_or_prfchw() {
-        // GCC emits nothing for these (pre-SSE i686 baseline).
+        // The i386 default baseline is the x86-64 ISA level, so the
+        // prefetcht*/nta family is baseline for plain `-m32` (GCC 16.2 and
+        // Clang 23.1.3 both emit it there, measured). An explicit pre-SSE
+        // `-march=` still suppresses it (both oracles: 0 instructions for
+        // `-m32 -march=i686`), as does `-mno-sse`.
+        //
+        // The `-mno-sse` corner is a measured oracle fork: GCC 16.2 EMITS
+        // `prefetcht0` under `-m32 -mno-sse` (0F 18, an SSE encoding), while
+        // Clang 23.1.3 suppresses it. lccc follows Clang: the `-mno-sse`
+        // contract is that NO SSE instruction of any encoding is emitted
+        // (the kernel's -mno-sse use is precisely to avoid FPU/SSE state),
+        // and a lone prefetch hint does not justify breaking that invariant.
         for flags in [
-            &["-m32"][..],
-            &["-m32", "-march=i686"],
+            &["-m32", "-march=i686"][..],
             &["-m32", "-march=pentiumpro"],
             &["-m32", "-msse", "-mno-sse"],
+            &["-m32", "-mno-sse"],
             &["-m32", "-march=raptorlake", "-mno-sse", "-mno-prfchw"],
         ] {
             assert!(!parse(flags).resolved_prefetch_sse(), "{flags:?}");
         }
-        // GCC emits the prefetcht*/nta family for these.
+        // The prefetcht*/nta family is granted for these.
         for flags in [
-            &["-m32", "-msse"][..],
+            &["-m32"][..],
+            &["-m32", "-msse"],
             &["-m32", "-msse2"],
             &["-m32", "-msse", "-march=i686"],
             &["-m32", "-march=i686", "-msse"],
@@ -5438,28 +5521,65 @@ mod prefetch_isa_tests {
 
     #[test]
     fn i686_sse_feature_mirror_tracks_abi_permission() {
-        for (flags, expected) in [
-            (&["-m32"][..], false),
-            (&["-m32", "-march=i686"][..], false),
-            (&["-m32", "-msse", "-mno-sse"][..], false),
-            (&["-m32", "-mno-sse2"][..], false),
-            (&["-m32", "-mgeneral-regs-only"][..], false),
-            (&["-m32", "-msse"][..], true),
-            (&["-m32", "-msse2"][..], true),
-            (&["-m32", "-msse4.1"][..], true),
-            (&["-m32", "-march=nehalem"][..], true),
-            (&["-m32", "-mno-sse", "-msse"][..], true),
+        // The i386 default baseline is the x86-64 ISA level: `-m32` alone
+        // resolves SSE AND SSE2 on (GCC 16.2 default `-m32` = `-march=x86-64`
+        // with both [enabled], Clang 23.1.3 agrees). Only an explicit
+        // pre-SSE `-march=`, the sticky `-mno-sse`, or (SSE2 only) the
+        // sticky `-mno-sse2` drop the level; explicit grants override the
+        // `-march=` veto and lift the `-mno-sse2` denial (last-explicit
+        // wins, in either order).
+        for (flags, sse, sse2) in [
+            // (flags, resolved SSE level, resolved SSE2 level)
+            (&["-m32"][..], true, true),
+            (&["-m32", "-march=i686"][..], false, false),
+            (&["-m32", "-march=i386"][..], false, false),
+            (&["-m32", "-march=i686", "-msse"][..], true, false),
+            (&["-m32", "-march=i686", "-msse2"][..], true, true),
+            (&["-m32", "-msse", "-march=i686"][..], true, false),
+            (&["-m32", "-msse", "-mno-sse"][..], false, false),
+            (&["-m32", "-mno-sse", "-msse"][..], true, true),
+            (&["-m32", "-mno-sse"][..], false, false),
+            (&["-m32", "-mno-sse2"][..], true, false),
+            (&["-m32", "-mno-sse2", "-msse"][..], true, false),
+            (&["-m32", "-mno-sse2", "-msse2"][..], true, true),
+            (&["-m32", "-msse"][..], true, true),
+            (&["-m32", "-msse2"][..], true, true),
+            (&["-m32", "-msse4.1"][..], true, true),
+            (&["-m32", "-march=nehalem"][..], true, true),
+            (&["-m32", "-march=i686", "-march=nehalem"][..], true, true),
+            (&["-m32", "-march=nehalem", "-march=i686"][..], false, false),
         ] {
             let driver = parse(flags);
-            assert_eq!(driver.resolved_i686_sse(), expected, "{flags:?}");
+            assert_eq!(driver.resolved_i686_sse(), sse, "{flags:?}");
+            assert_eq!(driver.resolved_i686_sse2(), sse2, "{flags:?}");
             assert_eq!(
                 driver
                     .effective_x86_features()
                     .contains(crate::common::x86_features::X86Feature::Sse),
-                expected,
+                sse,
                 "effective SSE mirror disagrees for {flags:?}"
             );
+            assert_eq!(
+                driver
+                    .effective_x86_features()
+                    .contains(crate::common::x86_features::X86Feature::Sse2),
+                sse2,
+                "effective SSE2 mirror disagrees for {flags:?}"
+            );
         }
+        // `-mgeneral-regs-only` is a full SSE denial (it sets `no_sse`, so
+        // the resolved levels drop too): no XMM state of any kind, which
+        // also vetoes the published features and the prefetch grant.
+        let driver = parse(&["-m32", "-mgeneral-regs-only"]);
+        assert!(!driver.resolved_i686_sse());
+        assert!(!driver.resolved_i686_sse2());
+        assert!(!driver.effective_x86_features().contains(
+            crate::common::x86_features::X86Feature::Sse
+        ));
+        assert!(!driver.effective_x86_features().contains(
+            crate::common::x86_features::X86Feature::Sse2
+        ));
+        assert!(!driver.resolved_prefetch_sse());
     }
 
     #[test]

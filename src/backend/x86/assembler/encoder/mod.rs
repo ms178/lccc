@@ -8474,6 +8474,111 @@ mod packed_shift_audit_tests {
         }
     }
 
+    /// Exact GAS diagnostic texts, byte-probed on binutils 2.40 (both
+    /// modes; identical on 2.47 for these rows): a wrong-width VECTOR
+    /// register in a data slot is a `register type mismatch`, a GP
+    /// register in a vector slot is an `operand type mismatch`, a uniform
+    /// (XMM-only) count given YMM/ZMM is an `operand type mismatch`
+    /// (unlike the data slots, which accept any vector width), and the
+    /// legacy 2-operand forms distinguish a same-family wrong size
+    /// (`operand size mismatch`) from a wrong family.
+    #[test]
+    fn packed_shift_audit_gas_diagnostic_texts() {
+        let x64_err = |line: &str| -> String {
+            for item in parse_asm(line).unwrap() {
+                if let AsmItem::Instruction(instr) = item {
+                    return InstructionEncoder::new().encode(&instr).unwrap_err();
+                }
+            }
+            panic!("no instruction: {line}");
+        };
+        let cases = [
+            (
+                "vpslld $3, %xmm1, %ymm2",
+                "register type mismatch for `vpslld'",
+            ),
+            (
+                "vpslld $3, %zmm1, %ymm3",
+                "register type mismatch for `vpslld'",
+            ),
+            (
+                "vpslld $3, %rax, %xmm2",
+                "operand type mismatch for `vpslld'",
+            ),
+            (
+                "vpslld $3, %xmm1, %rax",
+                "operand type mismatch for `vpslld'",
+            ),
+            (
+                "vpsllvd %xmm2, %ymm1, %ymm3",
+                "register type mismatch for `vpsllvd'",
+            ),
+            (
+                "vpsllvd %zmm1, %xmm2, %zmm3",
+                "register type mismatch for `vpsllvd'",
+            ),
+            (
+                "vpsllvd %rax, %xmm1, %xmm2",
+                "operand type mismatch for `vpsllvd'",
+            ),
+            (
+                "vpsllvd %xmm1, %rax, %xmm2",
+                "operand type mismatch for `vpsllvd'",
+            ),
+            (
+                "vpslld %ymm1, %xmm2, %xmm3",
+                "operand type mismatch for `vpslld'",
+            ),
+            (
+                "vpsllq %ymm1, %xmm2, %xmm3",
+                "operand type mismatch for `vpsllq'",
+            ),
+            (
+                "vpslldq $3, %ymm1, %xmm2",
+                "register type mismatch for `vpslldq'",
+            ),
+            (
+                "vpslldq $3, %rax, %xmm3",
+                "operand type mismatch for `vpslldq'",
+            ),
+            (
+                "vpslldq %xmm1, %ymm2, %ymm3",
+                "operand type mismatch for `vpslldq'",
+            ),
+            ("pslldq $3, %ymm0", "operand size mismatch for `pslldq'"),
+            ("psrldq $3, %zmm0", "operand size mismatch for `psrldq'"),
+            ("pslldq $3, %mm0", "operand type mismatch for `pslldq'"),
+            ("pslldq $3, %rax", "operand type mismatch for `pslldq'"),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(x64_err(line), expected, "{line}");
+        }
+        // The i686 encoder reaches the same shared gate; the
+        // vector-register-only texts are mode-invariant in GAS (probed
+        // with --32). GP-name diagnostics are mode-specific there and are
+        // covered by the i686 register-availability tests.
+        let i686_cases = [
+            (
+                "vpslld $3, %xmm1, %ymm2",
+                "register type mismatch for `vpslld'",
+            ),
+            (
+                "vpsllvd %xmm2, %ymm1, %ymm3",
+                "register type mismatch for `vpsllvd'",
+            ),
+            ("pslldq $3, %ymm0", "operand size mismatch for `pslldq'"),
+        ];
+        for (line, expected) in i686_cases {
+            for item in parse_asm(line).unwrap() {
+                if let AsmItem::Instruction(instr) = item {
+                    let mut enc =
+                        crate::backend::i686::assembler::encoder::InstructionEncoder::new();
+                    assert_eq!(enc.encode(&instr).unwrap_err(), expected, "i686: {line}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn packed_shift_audit_memory_roles_and_forced_evex() {
         for prefix in ["", "{evex} "] {

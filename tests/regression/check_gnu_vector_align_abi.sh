@@ -96,7 +96,10 @@ constants() {  # constants <compiler> <flags...>: the `.long` data of `r` in pro
                in_r { exit }' \
         | tr '\n' ' '
 }
-for flags in "-m64" "-m64 -mavx" "-m64 -mavx2" "-m64 -mavx512f" "-m32" "-m32 -mavx"; do
+# The pre-SSE i386 legs (-march=i686, -mno-sse) guard the 2026-10-24
+# baseline work: type layout/alignment is baseline-independent, so these
+# must agree with the plain -m32 constants.
+for flags in "-m64" "-m64 -mavx" "-m64 -mavx2" "-m64 -mavx512f" "-m32" "-m32 -mavx" "-m32 -march=i686" "-m32 -mno-sse"; do
     # shellcheck disable=SC2086  # flags are a word list on purpose
     want=$(constants "$gcc_bin" $flags)
     # shellcheck disable=SC2086
@@ -145,13 +148,21 @@ __attribute__((noinline)) int shift(int depth) { volatile char pad[16]; pad[0] =
 int main(void) { return run(0) | (shift(1) << 3); }
 EOF
 
-# build <bits> <opt> <lanes>: objects cl/el (lccc caller/callee), cg/eg (gcc).
+# build <bits> <opt> <lanes> [extra-flags...]: objects cl/el (lccc
+# caller/callee), cg/eg (gcc).
 build() {
     local bits=$1 opt=$2 lanes=$3 d="-DLANES=$3"
-    "$ccc" "-m$bits" "$opt" "$d" -c "$tmp/caller.c" -o "$tmp/cl.o" &&
-    "$ccc" "-m$bits" "$opt" "$d" -c "$tmp/callee.c" -o "$tmp/el.o" &&
-    "$gcc_bin" "-m$bits" "$opt" -w "$d" -c "$tmp/caller.c" -o "$tmp/cg.o" &&
-    "$gcc_bin" "-m$bits" "$opt" -w "$d" -c "$tmp/callee.c" -o "$tmp/eg.o"
+    shift 3
+    # shellcheck disable=SC2086  # extra flags are a word list on purpose
+    local extra=$*
+    # shellcheck disable=SC2086
+    "$ccc" "-m$bits" $extra "$opt" "$d" -c "$tmp/caller.c" -o "$tmp/cl.o" &&
+    # shellcheck disable=SC2086
+    "$ccc" "-m$bits" $extra "$opt" "$d" -c "$tmp/callee.c" -o "$tmp/el.o" &&
+    # shellcheck disable=SC2086
+    "$gcc_bin" "-m$bits" $extra "$opt" -w "$d" -c "$tmp/caller.c" -o "$tmp/cg.o" &&
+    # shellcheck disable=SC2086
+    "$gcc_bin" "-m$bits" $extra "$opt" -w "$d" -c "$tmp/callee.c" -o "$tmp/eg.o"
 }
 # leg <bits> <caller-obj> <callee-obj> -> exit code of the linked program
 leg() {
@@ -221,6 +232,36 @@ if [ "$i386_ok" = yes ]; then
     done
 else
     echo "note: no i386 execution capability (gcc -m32 link or qemu-i386); Part 3 not measured" >&2
+fi
+
+# Part 3b: i386 pre-SSE baseline (-m32 -march=i686): the fixed 16-byte
+# vector has no XMM carrier and is a by-value aggregate (measured
+# 2026-10-24, GCC 16.2 / Clang 23.1.3):
+#   h (first arg): both oracles 4-granular at offset 8 (agree);
+#   g (mid args):  MEASURED FORK — Clang 4-granular (offset 36), GCC
+#                  8-aligned slot (offset 40); lccc follows Clang, so the
+#                  cross verdict is exactly bit 2 (g) — bits 1 (f, the
+#                  16-byte-aligned va_arg, which both oracles share) and
+#                  4 (h) must be clear;
+#   f (va_arg):    the GCC 4.6 va rule 16-byte-aligns the 16-byte class
+#                  on ANY baseline; both oracles agree, lccc matches.
+if [ "$i386_ok" = yes ]; then
+    for opt in -O0 -O2; do
+        if ! build 32 "$opt" 4 -march=i686; then bad "i386 pre-SSE build v16 $opt"; continue; fi
+        rc=0; leg 32 cl el || rc=$?
+        if [ "$rc" = 0 ]; then ok "i386 pre-SSE v16 $opt lccc/lccc"; else bad "i386 pre-SSE v16 $opt lccc/lccc exit $rc"; fi
+        rc=0; leg 32 cg eg || rc=$?
+        if [ "$rc" = 0 ]; then ok "i386 pre-SSE v16 $opt gcc/gcc (oracle sanity)"; else bad "i386 pre-SSE v16 $opt gcc/gcc exit $rc"; fi
+        for pair in cl/eg cg/el; do
+            rc=0; leg 32 "${pair%/*}" "${pair#*/}" || rc=$?
+            # 2 (g) in BOTH the plain and the <<3-shifted run = 2 | (2<<3).
+            if [ "$rc" = 18 ]; then
+                ok "i386 pre-SSE v16 $opt $pair (measured fork: only g 8-align/4-granular)"
+            else
+                bad "i386 pre-SSE v16 $opt $pair exit $rc: the measured pre-SSE verdict changed (bad bits: 1 va_arg, 2 named-fork, 4 first-arg, each |<<3 from the shifted run); re-measure and update this gate"
+            fi
+        done
+    done
 fi
 
 # ---------------------------------------------------------------- Part 4 --
