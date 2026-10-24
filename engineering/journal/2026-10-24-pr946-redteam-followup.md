@@ -122,6 +122,36 @@ though its generic CPU-model string is the same. Reports are retained outside
 Git under `/home/user/artifacts/pr946-followup/`; they are host-specific A/B
 measurements, not whole-program or cross-host superiority claims.
 
+## 5. Updated 128-bit shift folds and measured profitability
+
+PR #946's updated `db18a5506` snapshot was merged and re-reviewed. Exact
+`pshufd $0` and low-qword self-unpack splats feed the same scalar-count shift
+proof as the broadcasts; the merge retains the ZMM cases and the executed
+word-fold rejection above. The assembler validator distinguishes scalar XMM
+counts, full-width per-element counts, immediate-data memory, and EVEX-only
+forms in both x86 modes. GNU-as spot checks also confirm its decorator rules.
+
+The five new 128-bit before/after kernels were wrapped in aligned in-assembly
+dependency loops with identical decrement/branch overhead. GCC 16.2 linked the
+harness; every variant agreed for counts 0–80 and after every timed leg. Three
+sequential runs each used 15 samples and 10,000,000 iterations per leg. Medians
+of the three before/after ratio medians were:
+
+| kernel | ratio | local interpretation |
+| --- | ---: | --- |
+| `d4sl` | 0.999315 | neutral |
+| `d4sr` | 0.996676 | neutral |
+| `d4sa` | 0.994001 | neutral |
+| `q2sl` | 1.582398 | faster after folding |
+| `q2sr` | 1.576423 | faster after folding |
+
+Per-run ratio MADs were at most 0.026264. This supports the qword transform on
+this Xeon 2.60 GHz host and does not expose a dword regression once indirect
+call overhead is removed from the loop. It remains a bounded dependency-latency
+screen, not proof of whole-program or cross-microarchitecture profitability.
+Raw reports, exact source hashes, and the reproduction scripts are outside Git
+under `/home/user/artifacts/pr946-followup/shift128-loops/`.
+
 ## Remaining validation and performance boundary
 
 The integrated tree still requires warning-free swap-enabled fastbuild,
