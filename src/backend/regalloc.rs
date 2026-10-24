@@ -2027,10 +2027,20 @@ struct IpaFill<'a> {
     iv_map: &'a FxHashMap<u32, (u32, u32)>,
     /// Loop-weighted use count: the spill traffic a home saves.
     cost: &'a dyn Fn(u32) -> u64,
-    /// May tenant `v` be displaced into register `r`? Encodes every
-    /// per-register rule Phase 2 applied to it; `false` for any value whose
-    /// home must not change (class members, call-spanning values, params).
+    /// May tenant `v` be displaced into caller-saved register `r`? Encodes
+    /// every per-register rule Phase 2 applied to it; `false` for any value
+    /// whose home must not change (class members, call-spanning values,
+    /// params).
     reloc_ok: &'a dyn Fn(u32, PhysReg) -> bool,
+    /// May tenant `v` be homed or renamed into IPA register `r`? The
+    /// per-register hazards only: a value consumed as a call argument is
+    /// staged OUT of its home in argument order, so an earlier stage's write
+    /// clobbers the home before the value is read; the indirect-call target
+    /// home is overwritten by the same staging; a deferred-fold consumer must
+    /// stay in a fold-base register. The value-level clauses of `reloc_ok`
+    /// deliberately do not apply here: IPA placement is exactly where
+    /// call-spanning values are meant to be homed.
+    ipa_register_ok: &'a dyn Fn(u32, PhysReg) -> bool,
     /// Holders that pin their callee-saved register (no rename).
     rename_blocked: &'a dyn Fn(u32) -> bool,
     /// FAT intervals of the values that will draw an emitter scratch
@@ -2203,20 +2213,26 @@ fn ipa_fill_preserved_regs(
         {
             return None;
         }
-        let free_now = fill.ipa_regs.iter().copied().find(|p| {
-            occ.get(&p.0).is_some_and(|o| {
-                o.as_deref()
-                    .is_some_and(|t| ivs.iter().all(|&iv| ipa_disjoint(t, iv)))
-            })
+        // Every tenant must be allowed in the chosen register: Phase 2
+        // excluded the staging registers from a call argument's pool, but
+        // the IPA pool overlaps them, so an unguarded placement (homing or
+        // rename) could re-home an argument into the register the next
+        // staging write clobbers before it is read.
+        let tenants_ok_in = |p: PhysReg| tenants.iter().all(|&(v, _)| (fill.ipa_register_ok)(v, p));
+        let free_now = fill.ipa_regs.iter().copied().find(|&p| {
+            tenants_ok_in(p)
+                && occ.get(&p.0).is_some_and(|o| {
+                    o.as_deref()
+                        .is_some_and(|t| ivs.iter().all(|&iv| ipa_disjoint(t, iv)))
+                })
         });
-        let p = match free_now {
-            Some(p) => p,
-            None => fill
-                .ipa_regs
-                .iter()
-                .copied()
-                .find(|&p| ipa_make_room(assignments, occ, fill, p, &ivs))?,
-        };
+        let p =
+            match free_now {
+                Some(p) => p,
+                None => fill.ipa_regs.iter().copied().find(|&p| {
+                    tenants_ok_in(p) && ipa_make_room(assignments, occ, fill, p, &ivs)
+                })?,
+            };
         if fill.trace {
             eprintln!("[RA-IPA] home {:?} in r{}", tenants, p.0);
         }
@@ -7182,6 +7198,14 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 && !(indirect_arg_values.contains(&v) && config.indirect_target_regs.contains(&r))
                 && (!fold_use_transfer.contains_key(&v) || config.fold_base_regs.contains(&r))
         };
+        // Per-register hazards for homing/renaming into an IPA register,
+        // without `reloc_ok`'s value-level clauses (call-spanning values are
+        // precisely what IPA homing exists to place).
+        let ipa_register_ok = |v: u32, r: PhysReg| {
+            !(later_arg_values.contains(&v) && config.call_arg_regs.contains(&r))
+                && !(indirect_arg_values.contains(&v) && config.indirect_target_regs.contains(&r))
+                && (!fold_use_transfer.contains_key(&v) || config.fold_base_regs.contains(&r))
+        };
         ipa_used = ipa_fill_preserved_regs(
             &mut assignments,
             &candidates,
@@ -7192,6 +7216,7 @@ pub fn allocate_registers(func: &IrFunction, config: &RegAllocConfig) -> RegAllo
                 iv_map: &iv_map,
                 cost: &|v| use_count.get(&v).copied().unwrap_or(0),
                 reloc_ok: &reloc_ok,
+                ipa_register_ok: &ipa_register_ok,
                 rename_blocked: &restricted,
                 scratch_demand: &scratch_demand,
                 trace: config.ra_config.debug_ra,
@@ -19216,6 +19241,7 @@ mod ipa_fill_tests {
         assignments: FxHashMap<u32, PhysReg>,
         iv: FxHashMap<u32, (u32, u32)>,
         cost: FxHashMap<u32, u64>,
+        ipa_ok: Box<dyn Fn(u32, PhysReg) -> bool>,
     }
 
     impl Case {
@@ -19224,6 +19250,9 @@ mod ipa_fill_tests {
                 assignments: FxHashMap::default(),
                 iv: FxHashMap::default(),
                 cost: FxHashMap::default(),
+                // Permissive by default: the pre-F2 behaviour. Tests that
+                // exercise the per-register hazard set a restrictive one.
+                ipa_ok: Box::new(|_, _| true),
             };
             for &(v, iv, cost, home) in vals {
                 c.iv.insert(v, iv);
@@ -19233,6 +19262,11 @@ mod ipa_fill_tests {
                 }
             }
             c
+        }
+
+        fn with_ipa_ok(mut self, f: impl Fn(u32, PhysReg) -> bool + 'static) -> Self {
+            self.ipa_ok = Box::new(f);
+            self
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -19258,6 +19292,7 @@ mod ipa_fill_tests {
                     iv_map: &iv,
                     cost: &|v| cost.get(&v).copied().unwrap_or(0),
                     reloc_ok,
+                    ipa_register_ok: &self.ipa_ok,
                     rename_blocked: blocked,
                     scratch_demand: demand,
                     trace: false,
@@ -19276,6 +19311,41 @@ mod ipa_fill_tests {
         assert_eq!(used, vec![R8]);
         assert_eq!(c.assignments.get(&2), Some(&R8));
         assert_eq!(c.assignments.get(&1), None, "a home is never shared");
+    }
+
+    /// The IPA pool overlaps the staging registers (r8/r9/rdi/rsi): a value
+    /// consumed as a call argument is staged OUT of its home in argument
+    /// order, so homing it into one of those registers lets the next
+    /// staging write clobber the home before the value is read (the printf
+    /// class). Phase 2 excluded the staging registers from such values'
+    /// pool; the fill must not undo that. Pre-F2, `place` never consulted
+    /// the per-register hazards, so the homing below went through.
+    #[test]
+    fn homing_refuses_arg_register_for_arg_value() {
+        let mut c = Case::new(&[(1, (0, 10), 5, None)]);
+        c = c.with_ipa_ok(|v, r| !(v == 1 && r == R8));
+        let used = c.run(&[1], &[R8], &[], POOL, &tenant_ok, &|_| false, &[]);
+        assert!(used.is_empty(), "no staging register may take an arg value");
+        assert_eq!(c.assignments.get(&1), None);
+        // Control: the same placement with a non-arg register is fine.
+        let mut c = Case::new(&[(1, (0, 10), 5, None)]);
+        c = c.with_ipa_ok(|_, _| true);
+        let used = c.run(&[1], &[R8], &[], POOL, &tenant_ok, &|_| false, &[]);
+        assert_eq!(used, vec![R8]);
+        assert_eq!(c.assignments.get(&1), Some(&R8));
+    }
+
+    /// A whole-register rename moves every holder into one IPA register; a
+    /// holder consumed as a call argument must not be among them when the
+    /// only IPA register is a staging register (same hazard as the homing
+    /// test, reached through the rename path).
+    #[test]
+    fn rename_refuses_arg_register_for_arg_value() {
+        let mut c = Case::new(&[(200, (0, 10), 1, Some(RBX))]);
+        c = c.with_ipa_ok(|v, r| !(v == 200 && r == R8));
+        let used = c.run(&[], &[R8], &[RBX], POOL, &tenant_ok, &|_| false, &[]);
+        assert!(used.is_empty());
+        assert_eq!(c.assignments.get(&200), Some(&RBX), "rename stays put");
     }
 
     #[test]
