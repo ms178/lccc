@@ -1335,12 +1335,12 @@ pub(super) fn fold_uniform_vector_shift(store: &mut LineStore, infos: &mut [Line
             continue;
         };
         let (mn, args) = split_mn(shift);
-        let uniform = match (row, bmn, mn) {
-            (1, "vpbroadcastd", "vpsllvd") => "vpslld",
-            (1, "vpbroadcastd", "vpsrlvd") => "vpsrld",
-            (1, "vpbroadcastd", "vpsravd") => "vpsrad",
-            (0, "vpbroadcastq", "vpsllvq") => "vpsllq",
-            (0, "vpbroadcastq", "vpsrlvq") => "vpsrlq",
+        let uniform = match (row, mn) {
+            (1, "vpsllvd") => "vpslld",
+            (1, "vpsrlvd") => "vpsrld",
+            (1, "vpsravd") => "vpsrad",
+            (0, "vpsllvq") => "vpsllq",
+            (0, "vpsrlvq") => "vpsrlq",
             _ => continue,
         };
         let shifts = operand_list(args);
