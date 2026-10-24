@@ -1160,6 +1160,118 @@ pub(super) fn coalesce_packed_fma_prefix(store: &mut LineStore, infos: &mut [Lin
     changed
 }
 
+/// Replace a proven uniform per-lane shift with the scalar-count encoding.
+/// (V)MOVD zeroes bits 32..127, so its low 64 bits equal the dword count;
+/// (V)MOVQ supplies the complete qword count. Legacy upper preservation
+/// and VEX upper zeroing are included in the deleted-write liveness proof.
+/// Without that proof a dword
+/// broadcast cannot become a uniform shift: the latter reads SIXTY-FOUR
+/// count bits, not just the low dword. No C undefined-behavior assumption.
+/// Both shifts saturate at the lane width and leave flags unchanged.
+/// Retarget the count move to the dead broadcast bank, also freeing the
+/// original data bank for the ordinary copy-propagation pass.
+pub(super) fn fold_uniform_vector_shift(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let cfi = super::relay_and_lea::CfiIndex::build(store, infos);
+    let mut fp = None;
+    let mut changed = false;
+    for i in 0..infos.len() {
+        if infos[i].is_nop() || infos[i].pinned {
+            continue;
+        }
+        let text = infos[i].trimmed(store.get(i));
+        let (mov, args) = split_mn(text);
+        let row = match mov {
+            "vmovd" | "movd" => 1,
+            "vmovq" | "movq" => 0,
+            _ => continue,
+        };
+        let ops = operand_list(args);
+        if ops.len() != 2 || text.contains(['{', '}']) {
+            continue;
+        }
+        let Some(gp) = super::relay_and_lea::plain_gp_operand(ops[0]) else {
+            continue;
+        };
+        if ops[0] != REG_NAMES[row][gp as usize] {
+            continue;
+        }
+        let Some((count, W128)) = vec_operand(ops[1]) else {
+            continue;
+        };
+        let Some((_, end)) = cfi.function_range(i, store.len()) else {
+            continue;
+        };
+        let Some(j) = next_real(store, infos, i + 1, end) else {
+            continue;
+        };
+        let Some(k) = next_real(store, infos, j + 1, end) else {
+            continue;
+        };
+        if infos[j].pinned || infos[k].pinned {
+            continue;
+        }
+        let broadcast = infos[j].trimmed(store.get(j));
+        let shift = infos[k].trimmed(store.get(k));
+        if broadcast.contains(['{', '}']) || shift.contains(['{', '}']) {
+            continue;
+        }
+        let (bmn, bargs) = split_mn(broadcast);
+        if bmn
+            != if row == 1 {
+                "vpbroadcastd"
+            } else {
+                "vpbroadcastq"
+            }
+        {
+            continue;
+        }
+        let bops = operand_list(bargs);
+        if bops.len() != 2 || vec_operand(bops[0]) != Some((count, W128)) {
+            continue;
+        }
+        let Some((splat, width @ (W128 | W256))) = vec_operand(bops[1]) else {
+            continue;
+        };
+        let (mn, args) = split_mn(shift);
+        let uniform = match (row, mn) {
+            (1, "vpsllvd") => "vpslld",
+            (1, "vpsrlvd") => "vpsrld",
+            (1, "vpsravd") => "vpsrad",
+            (0, "vpsllvq") => "vpsllq",
+            (0, "vpsrlvq") => "vpsrlq",
+            _ => continue,
+        };
+        let shifts = operand_list(args);
+        if shifts.len() != 3 || vec_operand(shifts[0]) != Some((splat, width)) {
+            continue;
+        }
+        let Some((src, sw)) = vec_operand(shifts[1]) else {
+            continue;
+        };
+        let Some((dst, dw)) = vec_operand(shifts[2]) else {
+            continue;
+        };
+        if sw != width || dw != width || src == count || src == splat {
+            continue;
+        }
+        let live = fp.get_or_insert_with(|| FpLiveness::new(store, infos));
+        if [count, splat].iter().any(|&bank| {
+            bank != dst
+                && !live.deleted_write_regions_dead_after(store, infos, k, u32::from(bank), &[i, j])
+        }) {
+            continue;
+        }
+        let moved = format!("    {mov} {}, %xmm{splat}", ops[0]);
+        let shifted = format!("    {uniform} %xmm{splat}, {}, {}", shifts[1], shifts[2]);
+        replace_line(store, &mut infos[i], i, moved);
+        replace_line(store, &mut infos[k], k, shifted);
+        mark_nop(&mut infos[j]);
+        fp = None;
+        changed = true;
+    }
+    changed
+}
+
 /// Re-home a scalar FMA so that the copies around it disappear.
 ///
 /// The codegen stages a scalar FMA's operands through copies whenever the
@@ -3206,6 +3318,177 @@ mod tests {
 
     fn body(text: &str) -> String {
         format!("{PRO}{text}{EPI}")
+    }
+
+    fn uniform_shift_only(text: &str) -> (bool, String) {
+        let mut store = LineStore::new(body(&format!("    # LCCC_RET_XMM 1\n{text}")));
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = fold_uniform_vector_shift(&mut store, &mut infos);
+        let result = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (changed, result)
+    }
+
+    #[test]
+    fn uniform_shift_encodings_and_aliases() {
+        for bank in ["xmm", "ymm"] {
+            for (mov, gp, broadcast, shift, expected) in [
+                ("vmovd", "edi", "vpbroadcastd", "vpsllvd", "vpslld"),
+                ("vmovd", "edi", "vpbroadcastd", "vpsrlvd", "vpsrld"),
+                ("vmovd", "edi", "vpbroadcastd", "vpsravd", "vpsrad"),
+                ("vmovq", "rdi", "vpbroadcastq", "vpsllvq", "vpsllq"),
+                ("vmovq", "rdi", "vpbroadcastq", "vpsrlvq", "vpsrlq"),
+                ("movd", "edi", "vpbroadcastd", "vpsllvd", "vpslld"),
+                ("movq", "rdi", "vpbroadcastq", "vpsrlvq", "vpsrlq"),
+            ] {
+                for (count, splat, dst) in
+                    [(0, 15, 0), (3, 15, 0), (3, 0, 0), (15, 15, 0), (0, 0, 0)]
+                {
+                    let text = format!(
+                        "    {mov} %{gp}, %xmm{count}\n    {broadcast} %xmm{count}, %{bank}{splat}\n    {shift} %{bank}{splat}, %{bank}2, %{bank}{dst}\n    ret\n"
+                    );
+                    let (changed, out) = uniform_shift_only(&text);
+                    assert!(changed, "{text}\n{out}");
+                    assert!(
+                        out.contains(&format!("{expected} %xmm{splat}, %{bank}2, %{bank}{dst}")),
+                        "{out}"
+                    );
+                    assert!(!out.contains(broadcast), "{out}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_shift_rejects_unproven_counts_and_live_banks() {
+        for prefix in [
+            "vmovq %rdi, %xmm0",
+            "vmovd %edi, %xmm0{%k1}",
+            "vmovd (%rdi), %xmm0",
+            "vmovd %xmm3, %xmm0",
+            "vmovd %di, %xmm0",
+        ] {
+            assert!(!uniform_shift_only(&format!("    {prefix}\n    vpbroadcastd %xmm0, %ymm15\n    vpsllvd %ymm15, %ymm2, %ymm0\n    ret\n")).0);
+        }
+        for middle in ["label:", "    call opaque", "    vzeroupper", "    .rept 2"] {
+            assert!(!uniform_shift_only(&format!("    vmovd %edi, %xmm0\n{middle}\n    vpbroadcastd %xmm0, %ymm15\n    vpsllvd %ymm15, %ymm2, %ymm0\n    ret\n")).0);
+        }
+        for shift in [
+            "vpsllvd %ymm15, %ymm0, %ymm0",
+            "vpsllvd %ymm15, %ymm15, %ymm0",
+            "vpsllvd %ymm15, %ymm2, %ymm0{%k1}",
+            "vpsllvd %xmm15, %xmm2, %xmm0",
+            "vpsllvd (%rdi), %ymm2, %ymm0",
+            "vpsllvd %zmm15, %zmm2, %zmm0",
+        ] {
+            assert!(
+                !uniform_shift_only(&format!(
+                    "    vmovd %edi, %xmm0\n    vpbroadcastd %xmm0, %ymm15\n    {shift}\n    ret\n"
+                ))
+                .0
+            );
+        }
+        for tail in [
+            "vmovdqa %ymm15, (%rdi)",
+            "vextractf128 $1, %ymm15, %xmm5",
+            "fxsave (%rdi)",
+        ] {
+            assert!(!uniform_shift_only(&format!("    vmovd %edi, %xmm0\n    vpbroadcastd %xmm0, %ymm15\n    vpsllvd %ymm15, %ymm2, %ymm0\n    {tail}\n    ret\n")).0);
+        }
+        assert!(!uniform_shift_only("    vmovd %edi, %xmm3\n    vpbroadcastd %xmm3, %ymm15\n    vpsllvd %ymm15, %ymm2, %ymm0\n    vmovdqa %ymm3, (%rdi)\n    ret\n").0);
+    }
+
+    #[test]
+    fn uniform_shift_full_pipeline_disable_control() {
+        use super::super::test_skips::skip_passes;
+        let asm = body(
+            "    # LCCC_RET_XMM 1\n    # LCCC_RET_XMM_BITS 256\n    vmovaps %ymm0, %ymm2\n    vmovd %edi, %xmm0\n    vpbroadcastd %xmm0, %ymm15\n    vpsllvd %ymm15, %ymm2, %ymm0\n    ret\n",
+        );
+        let out = run(&asm);
+        assert!(out.contains("vpslld"), "{out}");
+        assert!(!out.contains("vpbroadcast"), "{out}");
+        let disabled = {
+            let _guard = skip_passes(&["vector_copy_retarget"]);
+            run(&asm)
+        };
+        assert!(disabled.contains("vpbroadcast"), "{disabled}");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn uniform_shift_native_integer_model() {
+        use crate::common::temp_files::TempFile;
+        use std::process::Command;
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            eprintln!("SKIP uniform shift native execution: AVX2 required");
+            return;
+        }
+        let mut assembly = String::from(".text\n");
+        for (bank, lane, suffix) in [
+            ("xmm", "d", "4"),
+            ("ymm", "d", "8"),
+            ("xmm", "q", "2"),
+            ("ymm", "q", "4"),
+        ] {
+            for (operation, shift) in [("sl", "vpsllv"), ("sr", "vpsrlv"), ("sa", "vpsrav")] {
+                if lane == "q" && operation == "sa" {
+                    continue;
+                }
+                let (mov, gp) = if lane == "d" {
+                    (if bank == "xmm" { "movd" } else { "vmovd" }, "edi")
+                } else {
+                    (if bank == "xmm" { "movq" } else { "vmovq" }, "rdi")
+                };
+                let bits = if bank == "ymm" { 256 } else { 128 };
+                let text = format!(
+                    "    # LCCC_RET_XMM 1\n    # LCCC_RET_XMM_BITS {bits}\n    vmovaps %{bank}0, %{bank}2\n    {mov} %{gp}, %xmm0\n    vpbroadcast{lane} %xmm0, %{bank}15\n    {shift}{lane} %{bank}15, %{bank}2, %{bank}0\n    ret\n"
+                );
+                let original = body(&text);
+                let (changed, optimized) = uniform_shift_only(&text);
+                assert!(changed, "{optimized}");
+                for (prefix, asm) in [("original", original), ("optimized", optimized)] {
+                    let name = format!("{prefix}_{lane}{suffix}{operation}");
+                    assembly.push_str(&format!(".globl {name}\n"));
+                    assembly.push_str(
+                        &asm.replace("f:", &format!("{name}:"))
+                            .replace(".size f, .-f", &format!(".size {name}, .-{name}")),
+                    );
+                    assembly.push('\n');
+                }
+            }
+        }
+        assembly.push_str(".section .note.GNU-stack,\"\",@progbits\n");
+        let asm = TempFile::try_new("uniform-shift", "contract", "s").unwrap();
+        let exe = TempFile::try_new("uniform-shift", "contract", "exe").unwrap();
+        std::fs::write(asm.path(), assembly).unwrap();
+        let output = Command::new("gcc")
+            .args(["-O2", "-mavx2", "-Wall", "-Wextra", "-Werror"])
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/regression/fixtures/peephole-uniform-shift/driver.c"),
+            )
+            .arg(asm.path())
+            .arg("-o")
+            .arg(exe.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(exe.path()).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("163840 exact"));
     }
 
     fn packed_prefix_only(text: &str) -> (bool, String) {
