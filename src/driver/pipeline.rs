@@ -464,6 +464,11 @@ pub struct Driver {
     /// `-fno-tree-vectorize` disables automatic vectorizer passes while
     /// retaining explicit vector types and intrinsics.
     pub(super) disable_tree_vectorize: bool,
+    /// Opt in to the module-wide Andersen-style points-to and mod/ref pass.
+    /// Like GCC, this is deliberately independent of the -O level.
+    pub(super) ipa_pta: bool,
+    /// Opt in to the pressure-guided, dependence-preserving IR scheduler.
+    pub(super) live_range_shrinkage: bool,
     /// Whether -fexceptions is in effect (defines __EXCEPTIONS like GCC).
     pub(super) exceptions: bool,
     /// Whether to dump preprocessor defines instead of preprocessed output (-dM).
@@ -677,6 +682,8 @@ impl Driver {
             gnu89_inline_explicit: None,
             stdc_version: None,
             disable_tree_vectorize: false,
+            ipa_pta: false,
+            live_range_shrinkage: false,
             exceptions: false,
             dump_defines: false,
             color_mode: ColorMode::Auto,
@@ -2311,6 +2318,21 @@ impl Driver {
             let nprom = crate::pgo::promote::promote_indirect_calls(&mut module, &pgo_unit);
             if nprom > 0 {
                 let _ = crate::passes::inline::run(&mut module);
+            }
+        }
+
+        // Pressure-guided live-range shrinkage runs after PGO promotion and
+        // every ordinary SSA transform, but before call/global splitters and
+        // phi elimination create non-SSA copy webs.  The pass itself is the
+        // profitability gate: below-threshold and non-improving regions keep
+        // their original order.
+        if self.live_range_shrinkage
+            && self.opt_level >= 1
+            && std::env::var_os("CCC_NO_LIVE_RANGE_SHRINKAGE").is_none()
+        {
+            let changed = crate::passes::live_range_shrinkage::run(&mut module, self.target);
+            if changed != 0 {
+                crate::passes::verify::verify_after_pass(&module, "live_range_shrinkage");
             }
         }
 

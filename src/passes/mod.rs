@@ -53,6 +53,7 @@ pub(crate) mod ipcp;
 pub(crate) mod iv_strength_reduce;
 pub(crate) mod iv_widen;
 pub(crate) mod licm;
+pub(crate) mod live_range_shrinkage;
 pub(crate) mod load_forward;
 pub(crate) mod loop_align;
 pub(crate) mod loop_analysis;
