@@ -575,6 +575,12 @@ gate "vector-static-init" fast \
 gate "vector-ext-codegen" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_vector_ext_codegen.sh
 
+# Incoming x86-64 by-value objects, both frame modes and kill-switch control.
+gate "incoming-byval-homes" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_incoming_byval_homes.sh
+gate "incoming-byval-homes-clang" fast \
+    env CCC="$LCCC" ORACLE_CC="${CLANG:-clang-23}" bash tests/regression/check_incoming_byval_homes.sh
+
 # `void` objects, members, parameters and initializers (C11 6.7.6.3p10,
 # 6.7.9p3): every row's verdict and message against GCC 16.2.
 gate "void-declarators" fast \

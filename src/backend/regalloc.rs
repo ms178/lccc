@@ -46,6 +46,9 @@ pub(crate) struct RaConfig {
     // Core allocation / fusion policy.
     /// `CCC_NO_LEAF_PARAM_GPR`: disable leaf ABI parameter homes (default: false).
     pub(crate) no_leaf_param_gpr: bool,
+    /// `CCC_NO_INCOMING_BYVAL_HOME`: retain x86-64 MEMORY parameter copies
+    /// for differential testing and bisection (default: false).
+    pub(crate) no_incoming_byval_home: bool,
     /// `CCC_NO_IR_DIVREM`: disable same-block div/rem pairing (default: false).
     pub(crate) no_ir_divrem: bool,
     /// `CCC_NO_MULACC`: disable i686 mul-accumulate pairing (default: false).
@@ -364,6 +367,7 @@ impl RaConfig {
         };
         Self {
             no_leaf_param_gpr: present("CCC_NO_LEAF_PARAM_GPR"),
+            no_incoming_byval_home: present("CCC_NO_INCOMING_BYVAL_HOME"),
             no_ir_divrem: present("CCC_NO_IR_DIVREM"),
             no_mulacc: present("CCC_NO_MULACC"),
             no_index_home: present("CCC_NO_INDEX_HOME"),
@@ -13361,6 +13365,7 @@ mod ra_config_tests {
         }
 
         switch!(no_leaf_param_gpr, "CCC_NO_LEAF_PARAM_GPR");
+        switch!(no_incoming_byval_home, "CCC_NO_INCOMING_BYVAL_HOME");
         switch!(no_ir_divrem, "CCC_NO_IR_DIVREM");
         switch!(no_mulacc, "CCC_NO_MULACC");
         switch!(no_index_home, "CCC_NO_INDEX_HOME");

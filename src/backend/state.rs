@@ -216,6 +216,10 @@ pub struct CodegenState {
     pub ra_config: Arc<crate::backend::regalloc::RaConfig>,
     pub stack_offset: i64,
     pub value_locations: FxHashMap<u32, StackSlot>,
+    /// x86-64 by-value parameter allocas whose object IS the incoming stack
+    /// argument. Positive virtual-frame offsets; never allocated or coalesced
+    /// into the local frame. Populated only after ABI/alignment/extent checks.
+    pub incoming_byval_slots: FxHashMap<u32, StackSlot>,
     /// Emergency spill slot offset, allocated downward from the bottom of the frame.
     /// Used when store_rax_to encounters a value with no register or stack slot.
     /// Values that are allocas (their stack slot IS the data, not a pointer to data).
@@ -766,6 +770,7 @@ impl CodegenState {
             ra_config,
             stack_offset: 0,
             value_locations: FxHashMap::default(),
+            incoming_byval_slots: FxHashMap::default(),
             alloca_values: FxHashSet::default(),
             volatile_alloca_values: FxHashSet::default(),
             alloca_types: FxHashMap::default(),
@@ -1083,6 +1088,7 @@ impl CodegenState {
         self.call_gp_arg_count = 6;
         self.call_fp_arg_count = None;
         self.value_locations.clear();
+        self.incoming_byval_slots.clear();
         self.alloca_values.clear();
         self.volatile_alloca_values.clear();
         self.alloca_types.clear();
