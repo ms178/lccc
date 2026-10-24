@@ -81,3 +81,11 @@ are VM screening results, not PMU or application-geomean claims.
   `i32-identity.json` records hashes. Evidence transcripts normalize trailing
   whitespace. Hosted native gates are wired into codegen CI; broad coverage
   is delegated to hosted CI rather than an expansive local run.
+
+### Focused-ablation census entry
+
+Hosted CI caught the missing audit-census registration for the new I32
+unroll ablation. Register exactly that one documented name (+1 knob); no
+panic, unsafe, long-function or undocumented-knob allowance is increased.
+The independent switch is justified by the retained paired measurements and
+required native structural ablation, not a new optimizer mode or default.
