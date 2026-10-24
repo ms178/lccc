@@ -40,6 +40,6 @@ int main(void)
 
     /* A nonzero integer must be converted by lowering, not reinterpreted as
        an I128 object image or rejected by the backend's constant decoder. */
-    if (PROBE(9, 0, 0x4002200000000000ULL)) return 5;
+    if (PROBE(10, 0, 0x4002400000000000ULL)) return 5;
     return 0;
 }
