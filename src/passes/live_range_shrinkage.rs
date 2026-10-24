@@ -827,6 +827,46 @@ mod tests {
     }
 
     #[test]
+    fn malformed_span_metadata_fails_closed() {
+        let mut f = function(
+            vec![
+                copy(0, 1),
+                copy(1, 2),
+                add(2, 0, 0),
+                copy(3, 3),
+                add(4, 1, 3),
+                add(5, 2, 4),
+            ],
+            5,
+        );
+        f.blocks[0].source_spans.truncate(1);
+        let before = dests(&f);
+        let mut m = module(f);
+        let stats = run_with_budget(&mut m, Target::X86_64, PressureBudget { gp: 1, vector: 1 });
+        assert_eq!(stats.changed_regions, 0);
+        assert_eq!(dests(&m.functions[0]), before);
+    }
+
+    #[test]
+    fn duplicate_definition_webs_fail_closed() {
+        let f = function(
+            vec![
+                copy(0, 1),
+                copy(0, 2),
+                add(1, 0, 0),
+                copy(2, 3),
+                add(3, 1, 2),
+            ],
+            3,
+        );
+        let before = dests(&f);
+        let mut m = module(f);
+        let stats = run_with_budget(&mut m, Target::X86_64, PressureBudget { gp: 1, vector: 1 });
+        assert_eq!(stats.changed_regions, 0);
+        assert_eq!(dests(&m.functions[0]), before);
+    }
+
+    #[test]
     fn register_weights_are_target_and_class_aware() {
         assert_eq!(value_weight(IrType::I64, Target::I686).weight, 2);
         assert_eq!(value_weight(IrType::I64, Target::X86_64).weight, 1);

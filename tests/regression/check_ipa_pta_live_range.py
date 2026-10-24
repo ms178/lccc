@@ -218,6 +218,18 @@ def run(cmd: list[str], *, timeout: int = 30, env: dict[str, str] | None = None,
                           timeout=timeout, check=False)
 
 
+def host_cpu() -> dict[str, str]:
+    result = {"machine": platform.machine()}
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith(("model name", "Hardware", "flags", "Features")):
+                key, value = line.split(":", 1)
+                result.setdefault(key.strip(), value.strip())
+    except OSError:
+        pass
+    return result
+
+
 def version(compiler: str) -> str:
     try:
         result = run([compiler, "--version"], timeout=10)
@@ -228,7 +240,19 @@ def version(compiler: str) -> str:
 
 def compile_and_run(compiler: str, case: Case, directory: Path, features: bool,
                     gcc_include: str, stats: bool = False) -> dict:
+    return compile_and_run_flags(compiler, case, directory, features, gcc_include,
+                                 stats=stats, extra_flags=())
+
+
+def compile_and_run_flags(compiler: str, case: Case, directory: Path, features: bool,
+                          gcc_include: str, stats: bool = False,
+                          extra_flags: Iterable[str] = ()) -> dict:
+    extra_flags = tuple(extra_flags)
     tag = "feature" if features else "baseline"
+    suffix = "-".join(extra_flags)
+    if suffix:
+        safe_suffix = "".join(c if c.isalnum() else "-" for c in suffix)
+        tag = f"{tag}-{safe_suffix}"
     source = directory / f"{case.name}-{tag}.c"
     source.write_text(case.source)
     files = [str(source)]
@@ -240,7 +264,7 @@ def compile_and_run(compiler: str, case: Case, directory: Path, features: bool,
     cmd = [compiler, *STRICT]
     if Path(compiler).name in {"icx", "icpx"}:
         cmd.append("-fp-model=strict")
-    cmd.extend([*(FEATURES if features else []),
+    cmd.extend([*(FEATURES if features else []), *extra_flags,
                 f"-I{gcc_include}", *files, "-o", str(executable)])
     env = os.environ.copy()
     if stats:
@@ -286,6 +310,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--icx", default=os.environ.get("ICX", "icx"))
     parser.add_argument("--skip-oracles", action="store_true")
     parser.add_argument("--skip-performance", action="store_true")
+    parser.add_argument("--skip-matrix", action="store_true",
+                        help="only run the default -O2 correctness configuration")
     parser.add_argument("--reps", type=int, default=5)
     parser.add_argument("--output", type=Path, default=Path("target/ipa-lrs-report.json"))
     args = parser.parse_args(argv)
@@ -304,7 +330,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     report = {
         "schema": 1,
         "features": FEATURES,
-        "host": {"platform": platform.platform(), "machine": platform.machine()},
+        "host": {"platform": platform.platform(), **host_cpu()},
         "compilers": {c: version(c) for c in [args.lccc, *oracle_compilers(args)]},
         "cases": [],
         "performance": [],
@@ -316,7 +342,26 @@ def main(argv: Iterable[str] | None = None) -> int:
             baseline = compile_and_run(args.lccc, case, directory, False, gcc_include, stats=True)
             feature = compile_and_run(args.lccc, case, directory, True, gcc_include, stats=True)
             entry = {"name": case.name, "lccc_baseline": baseline, "lccc_feature": feature,
-                     "oracles": []}
+                     "oracles": [], "variants": []}
+            if not args.skip_matrix:
+                for label, flags in (("O0", ("-O0",)), ("O1", ("-O1",)),
+                                     ("O3", ("-O3",)), ("PIC", ("-fPIC",))):
+                    variant_baseline = compile_and_run_flags(
+                        args.lccc, case, directory, False, gcc_include, extra_flags=flags)
+                    variant_feature = compile_and_run_flags(
+                        args.lccc, case, directory, True, gcc_include, stats=True,
+                        extra_flags=flags)
+                    variant = {"name": label, "flags": flags,
+                               "baseline": variant_baseline, "feature": variant_feature}
+                    entry["variants"].append(variant)
+                    for record in (variant_baseline, variant_feature):
+                        if record.get("compile_returncode") != 0:
+                            failures.append(f"{case.name}/{label}: LCCC compilation failed")
+                        elif record.get("runtime_returncode") != 0:
+                            failures.append(f"{case.name}/{label}: LCCC runtime failed")
+                    if (variant_baseline.get("stdout") != variant_feature.get("stdout")
+                            or variant_baseline.get("runtime_returncode") != variant_feature.get("runtime_returncode")):
+                        failures.append(f"{case.name}/{label}: baseline/feature output divergence")
             for record in (baseline, feature):
                 if record.get("compile_returncode") != 0:
                     failures.append(f"{case.name}: LCCC compilation failed")
@@ -380,6 +425,26 @@ def main(argv: Iterable[str] | None = None) -> int:
                 report["performance"].append(performance)
 
     report["failures"] = failures
+    if failures:
+        def diagnostic_records(entry):
+            yield entry["lccc_baseline"]
+            yield entry["lccc_feature"]
+            for variant in entry.get("variants", []):
+                yield variant["baseline"]
+                yield variant["feature"]
+            yield from entry.get("oracles", [])
+        for entry in report["cases"]:
+            for record in diagnostic_records(entry):
+                if record.get("compile_returncode"):
+                    detail = record.get("compile_stderr", "")[-4000:]
+                    print(f"DIAGNOSTIC {entry['name']} {record['compiler']}:\n{detail}", file=sys.stderr)
+                elif record.get("runtime_returncode"):
+                    detail = record.get("stderr", "")[-4000:]
+                    print(f"RUNTIME DIAGNOSTIC {entry['name']} {record['compiler']}:\n{detail}", file=sys.stderr)
+        if os.environ.get("GITHUB_ACTIONS"):
+            for failure in failures:
+                escaped = failure.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                print(f"::error title=IPA/LRS harness::{escaped}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(f"IPA/LRS cases: {len(CASES)}; failures: {len(failures)}")

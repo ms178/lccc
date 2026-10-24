@@ -594,19 +594,6 @@ impl IpaPta {
         }
         false
     }
-
-    #[cfg(test)]
-    fn points_to(&self, function: &str, value: u32) -> Option<Vec<usize>> {
-        let &fi = self.functions.get(function)?;
-        let &node = self.value_nodes[fi].get(&value)?;
-        Some(
-            self.points[node as usize]
-                .0
-                .iter()
-                .map(|&o| o as usize)
-                .collect(),
-        )
-    }
 }
 
 fn is_global(object: &AbstractObject) -> bool {
@@ -1176,25 +1163,34 @@ fn build_instruction(
                 solver.insert(destination, UNKNOWN);
             }
         }
-        Instruction::VaStart { va_list_ptr } | Instruction::VaEnd { va_list_ptr } => {
+        Instruction::VaStart { va_list_ptr } => {
+            let pointer = solver.memory_pointer(function, *va_list_ptr);
+            let unknown_content = solver.objects[UNKNOWN as usize].content;
+            solver.add_watch(
+                pointer,
+                Watch::Store {
+                    value: unknown_content,
+                },
+            );
+        }
+        Instruction::VaEnd { va_list_ptr } => {
             solver.memory_pointer(function, *va_list_ptr);
         }
         Instruction::VaCopy { dest_ptr, src_ptr } => {
-            solver.memory_pointer(function, *dest_ptr);
-            solver.memory_pointer(function, *src_ptr);
-        }
-        Instruction::VaArgStruct {
-            dest_ptr,
-            va_list_ptr,
-            ..
-        }
-        | Instruction::VaArgVector {
-            dest_ptr,
-            va_list_ptr,
-            ..
-        } => {
-            solver.memory_pointer(function, *dest_ptr);
-            solver.memory_pointer(function, *va_list_ptr);
+            let destination = solver.memory_pointer(function, *dest_ptr);
+            let source = solver.memory_pointer(function, *src_ptr);
+            solver.add_watch(
+                destination,
+                Watch::MemcpyDestination {
+                    source_pointer: source,
+                },
+            );
+            solver.add_watch(
+                source,
+                Watch::MemcpySource {
+                    destination_pointer: destination,
+                },
+            );
         }
         Instruction::PgoCounterInc { .. }
         | Instruction::GetReturnF64Second { .. }
@@ -1725,6 +1721,35 @@ mod tests {
         assert_eq!(load_count(&module.functions[1]), 2);
         let mut native = module(vec![reader, caller]);
         assert_eq!(run(&mut native, false), 1);
+    }
+
+    #[test]
+    fn allocation_results_have_a_distinct_heap_object() {
+        let mut caller = function("caller", IrType::Void);
+        finish(
+            &mut caller,
+            vec![Instruction::Call {
+                func: "malloc".into(),
+                info: CallInfo {
+                    dest: Some(Value(0)),
+                    return_type: IrType::Ptr,
+                    ..CallInfo::default()
+                },
+            }],
+            None,
+        );
+        let module = module(vec![caller]);
+        let mut solver = build_solver(&module, false, AnalysisBudget::default());
+        solver.finish();
+        assert!(solver.complete);
+        let node = solver.value_nodes[0][&0];
+        let points = &solver.points[node as usize].0;
+        assert_eq!(points.len(), 1);
+        assert!(matches!(
+            solver.objects[points[0] as usize].kind,
+            ObjectKind::Heap
+        ));
+        assert!(!solver.objects[points[0] as usize].escaped);
     }
 
     #[test]
