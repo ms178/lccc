@@ -652,10 +652,17 @@ pub(crate) fn verify(asm: &str, state: &IpaRaState) -> IpaViolations {
     }
     let lines: Vec<&str> = asm.lines().collect();
     let mut index: FxHashMap<&str, usize> = FxHashMap::default();
+    // A name defined twice makes `function_body` ambiguous: a summary could
+    // be derived from the wrong definition and the keep-set proof built on
+    // it would be unverifiable. Such names fail closed (every record naming
+    // them is a violation) instead of picking a definition.
+    let mut duplicated: FxHashSet<&str> = FxHashSet::default();
     for (i, l) in lines.iter().enumerate() {
         if let Some(label) = l.strip_suffix(':') {
             if !label.contains(char::is_whitespace) && !label.starts_with('.') {
-                index.entry(label).or_insert(i);
+                if index.insert(label, i).is_some() {
+                    duplicated.insert(label);
+                }
             }
         }
     }
@@ -664,8 +671,12 @@ pub(crate) fn verify(asm: &str, state: &IpaRaState) -> IpaViolations {
     let mut actual: FxHashMap<&str, u16> = FxHashMap::default();
     for name in &state.order {
         let predicted = state.summaries[name];
-        let final_mask = function_body(&lines, &index, name)
-            .and_then(|body| text_clobbers(&body.join("\n"), &|s| actual.get(s).copied()));
+        let final_mask = (if duplicated.contains(name.as_str()) {
+            None
+        } else {
+            function_body(&lines, &index, name)
+        })
+        .and_then(|body| text_clobbers(&body.join("\n"), &|s| actual.get(s).copied()));
         match final_mask {
             Some(m) if m & !predicted == 0 => {
                 actual.insert(name.as_str(), m);
@@ -695,7 +706,10 @@ pub(crate) fn verify(asm: &str, state: &IpaRaState) -> IpaViolations {
                     return ops.contains("@TLSCALL(%rax)");
                 }
                 let sym = ops.strip_suffix("@PLT").unwrap_or(ops);
-                callees.iter().any(|c| c == sym) && actual.get(sym).is_some_and(|m| m & keep == 0)
+                // A twice-defined target has no trustworthy summary.
+                !duplicated.contains(sym)
+                    && callees.iter().any(|c| c == sym)
+                    && actual.get(sym).is_some_and(|m| m & keep == 0)
             })
         });
         if !calls_ok {
@@ -889,5 +903,31 @@ mod tests {
             verify("main:\n    ret\n.size main, .-main\n", &st).callees,
             vec!["helper".to_string()]
         );
+    }
+
+    /// A twice-defined name is ambiguous, not first-wins: whichever body
+    /// `function_body` would pick, the summary cannot be trusted, so both
+    /// the callee summary and every caller record naming it fail closed.
+    #[test]
+    fn verify_fails_closed_on_duplicated_label() {
+        let mut st = IpaRaState::new(true, FxHashSet::default(), FxHashSet::default());
+        // `movq %rdi, %rax` names both families, so the predicted summary
+        // carries both.
+        st.summaries.insert("helper".into(), RAX | RDI);
+        st.order.push("helper".into());
+        st.record("main", R8 | R9, vec!["helper".into()]);
+        // Both definitions are individually clean against the predicted
+        // summary: a first-wins index would hide the second one and let the
+        // verification pass.
+        let dup = "helper:\n    movq %rdi, %rax\n    ret\n.size helper, .-helper\n\
+                   helper:\n    xorq %r9, %r9\n    ret\n.size helper, .-helper\n\
+                   main:\n    call helper\n    ret\n.size main, .-main\n";
+        let v = verify(dup, &st);
+        assert_eq!(v.callees, vec!["helper".to_string()]);
+        assert_eq!(v.callers, vec!["main".to_string()]);
+        // One definition: clean.
+        let single = "helper:\n    movq %rdi, %rax\n    ret\n.size helper, .-helper\n\
+              main:\n    call helper\n    ret\n.size main, .-main\n";
+        assert!(verify(single, &st).is_empty());
     }
 }

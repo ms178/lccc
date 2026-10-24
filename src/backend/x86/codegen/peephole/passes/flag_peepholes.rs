@@ -1947,9 +1947,10 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
         // itself: `x & 0xff == x & x` at byte width, so ZF/SF/PF agree and
         // CF/OF are cleared either way; the register form drops the imm8
         // (GCC/Clang emit `testb %dl, %dl` for `(h & 255) == 0`).
-        let (name_b, name_l) = (
+        let (name_b, name_l, name_q) = (
             REG_NAMES[3][src_fam as usize],
             REG_NAMES[1][src_fam as usize],
+            REG_NAMES[0][src_fam as usize],
         );
         let new_line = if byte_form && imm == 0xff {
             format!("    testb {name_b}, {name_b}")
@@ -1957,8 +1958,12 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
             format!("    testb ${imm}, {name_b}")
         } else if !and_wide && imm == 0xffff_ffff {
             format!("    testl {name_l}, {name_l}")
+        } else if and_wide && imm == -1 {
+            // `x & -1 == x` at qword width: the register form is flag-identical
+            // and is what GCC/Clang emit (`testq %rax, %rax`).
+            format!("    testq {name_q}, {name_q}")
         } else if and_wide {
-            format!("    testq ${}, {}", imm, REG_NAMES[0][src_fam as usize])
+            format!("    testq ${imm}, {name_q}")
         } else {
             format!("    testl ${imm}, {name_l}")
         };
@@ -4196,6 +4201,25 @@ mod tests {
         );
         let out = peephole_optimize(asm.to_string());
         assert!(out.contains("testl %ebx, %ebx"), "{out}");
+    }
+
+    /// The qword all-ones mask tests the register against itself (GCC shape
+    /// `testq %rax, %rax`), not `testq $-1, %rax`.
+    #[test]
+    fn all_ones_qword_mask_becomes_register_testq() {
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movq %rax, %r10\n",
+            "    andq $-1, %r10\n",
+            "    js .LBB5\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testq %rax, %rax"), "{out}");
+        assert!(!out.contains("$-1"), "{out}");
     }
 
     #[test]
