@@ -246,6 +246,11 @@ def host_cpu() -> dict[str, str]:
     return result
 
 
+def escape_annotation(text: str) -> str:
+    return (text.replace("%", "%25").replace("\r", "%0D")
+            .replace("\n", "%0A"))
+
+
 def forwarding_counts(text: str) -> list[int]:
     return [int(value) for value in re.findall(r"redundant-loads-forwarded=(\d+)", text)]
 
@@ -506,9 +511,6 @@ def main(argv: Iterable[str] | None = None) -> int:
                     detail = record.get("stderr", "")[-4000:]
                     print(f"RUNTIME DIAGNOSTIC {entry['name']} {record['compiler']}:\n{detail}", file=sys.stderr)
         if os.environ.get("GITHUB_ACTIONS"):
-            def escape_annotation(text):
-                return (text.replace("%", "%25").replace("\r", "%0D")
-                        .replace("\n", "%0A"))
             for failure in failures:
                 print(f"::error title=IPA/LRS harness::{escape_annotation(failure)}")
             if not forwarding_witness or not shrinkage_witness:
@@ -528,6 +530,26 @@ def main(argv: Iterable[str] | None = None) -> int:
                         print(f"::error title=IPA/LRS statistics::{escape_annotation(detail)}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    if os.environ.get("GITHUB_ACTIONS"):
+        # Keep measurements discoverable even when the hosted artifact
+        # download endpoint is unavailable. These are notices, not assertions
+        # of superiority; the JSON retains every repetition for analysis.
+        for entry in report["cases"]:
+            records = [entry["lccc_feature"]]
+            records.extend(v["feature"] for v in entry.get("variants", []))
+            ipa = [count for record in records for count in forwarding_counts(record.get("compile_stderr", ""))]
+            lrs = [count for record in records for count in shrinkage_counts(record.get("compile_stderr", ""))]
+            if any(ipa) or any(lrs):
+                detail = f"{entry['name']}: IPA forwarded max={max(ipa or [0])}; LRS changed max={max(lrs or [0])}"
+                print(f"::notice title=IPA/LRS optimization witness::{escape_annotation(detail)}")
+        for item in report["performance"]:
+            detail = json.dumps({
+                "case": item["case"],
+                "feature_over_baseline": item.get("feature_over_baseline"),
+                "feature_over_oracle": item.get("feature_over_oracle", {}),
+                "median_seconds": item["median_seconds"],
+            }, sort_keys=True)
+            print(f"::notice title=IPA/LRS measured performance::{escape_annotation(detail)}")
     print(f"IPA/LRS cases: {len(CASES)}; failures: {len(failures)}")
     for item in report["performance"]:
         print(item["case"], item.get("feature_over_baseline"), item["median_seconds"])
