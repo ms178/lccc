@@ -20,6 +20,25 @@ use crate::ir::reexports::{IrConst, IrFunction, Operand};
 /// scalar stores (GCC torture 20050622-1 passes a 72-MiB object by value).
 pub(super) const LARGE_ARG_COPY_THRESHOLD: usize = 2048;
 
+/// Bit image of a scalar 16-byte SSE-carrier constant (`_Float128` or
+/// `_Decimal128`). The I128 variant is already the converted object image,
+/// not an integer to be converted again. Integer zero is also accepted: the
+/// lowering uses it as the canonical zero after some implicit conversions.
+/// Other scalar constants are rejected rather than reinterpreted as carrier
+/// bits; they indicate a missing conversion in lowering.
+pub(crate) fn f128_sse_const_bits(c: IrConst) -> Option<u128> {
+    match c {
+        IrConst::Zero
+        | IrConst::I8(0)
+        | IrConst::I16(0)
+        | IrConst::I32(0)
+        | IrConst::I64(0)
+        | IrConst::I128(0) => Some(0),
+        IrConst::I128(bits) => Some(bits as u128),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CallArgClass — caller-side classification (used by emit_call_*)
 // ---------------------------------------------------------------------------
@@ -1848,5 +1867,49 @@ mod tests {
             core.classes[2],
             CoreArgClass::IntReg { reg_idx: 0 }
         ));
+    }
+
+    #[test]
+    fn scalar_f128_overflow_uses_the_value_stack_class_on_x86() {
+        let f128 = || ArgInfo {
+            struct_size: Some(16),
+            struct_align: Some(16),
+            is_f128_sse: true,
+            ..scalar(&[])
+        };
+        let mut args: Vec<ArgInfo<'_>> = (0..8)
+            .map(|_| ArgInfo {
+                is_float: true,
+                ..scalar(&[])
+            })
+            .collect();
+        args.push(f128());
+        let core = classify_args_core(&args, false, false, &sysv_x86_64());
+        assert!(matches!(
+            core.classes[8],
+            CoreArgClass::StructByValStack { size: 16 }
+        ));
+
+        // i686 has no XMM argument registers and scalar binary128 carries no
+        // aggregate eightbyte classes, so it reaches the same flagged arm.
+        let core = classify_args_core(&[f128()], false, false, &i686_regparm3());
+        assert!(matches!(
+            core.classes[0],
+            CoreArgClass::StructByValStack { size: 16 }
+        ));
+    }
+
+    #[test]
+    fn f128_sse_constants_are_object_images_not_aggregate_addresses() {
+        let nine = 0x4002_0000_0000_0000_0000_0000_0000_0000u128;
+        assert_eq!(f128_sse_const_bits(IrConst::I128(nine as i128)), Some(nine));
+        let negative_zero = 1u128 << 127;
+        assert_eq!(
+            f128_sse_const_bits(IrConst::I128(negative_zero as i128)),
+            Some(negative_zero)
+        );
+        assert_eq!(f128_sse_const_bits(IrConst::I64(0)), Some(0));
+        assert_eq!(f128_sse_const_bits(IrConst::I64(9)), None);
+        assert_eq!(f128_sse_const_bits(IrConst::F64(9.0)), None);
     }
 }

@@ -20,6 +20,9 @@ int main(void) {
         struct Small t = {k, k+3};
         struct Packed p = {3, k};
         struct Wide w = {{k,0,0,0,0,0,0,k+2}};
+        /* Volatile forces the stack-overflow binary128 argument through its
+           16-byte SSA slot; the constant call below covers immediate images. */
+        volatile __float128 xf = -2*k+1;
         long sum = 6*k;
         if (sum_big(s) != sum) return 1;
         if (tail_big(s) != sum) return 13;
@@ -28,6 +31,7 @@ int main(void) {
         if (dynamic_big(s, (unsigned)(k+20)) != sum+7) return 4;
         if (realign_big(s, w) != sum+2*k+2) return 5;
         if (aligned_f128(1,2,3,4,5,6,7,1,2,3,4,5,6,7,8,9,10) != 83) return 12;
+        if (aligned_f128(1,2,3,4,5,6,7,1,2,3,4,5,6,7,8,xf,10) != 75-2*k) return 14;
         if (aligned_object(1,2,3,4,5,6,7,s,8) != 36+sum) return 6;
         if (variadic_big(s, 13L, s) != 2*sum+13) return 7;
         if (exhausted_small(1,2,3,4,5,6,t) != 2*k+24) return 8;
