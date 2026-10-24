@@ -42,6 +42,11 @@ class BenchmarkHarnessTests(unittest.TestCase):
         self.assertIn('-DMATCH_RICH=1', flags)
         self.assertIn('-DPASSES=2', flags)
         self.assertNotIn('-DPASSES=2048', flags)
+        for name in ['fp32_product_map', 'fp64_product_map']:
+            flags = corpus.workload_flags(by_name[name], sizes[name])
+            self.assertIn('-ffp-contract=off', flags)
+            self.assertEqual(flags.count('-DFP_MAP_PASSES=128'), 1)
+            self.assertEqual('-DFP_MAP_DOUBLE' in flags, name == 'fp64_product_map')
 
     def test_paired_timing_never_times_crashes_or_changed_output(self):
         sys.path.insert(0, str(ROOT / 'scripts'))

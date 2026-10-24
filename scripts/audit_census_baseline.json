@@ -3,7 +3,7 @@
   "fns_over_300": 228,
   "fns_over_500": 94,
   "ignored_tests": 10,
-  "knob_literals": 535,
+  "knob_literals": 536,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -275,6 +275,7 @@
     "CCC_NO_LOOP_ROTATE",
     "CCC_NO_LOOP_VEC_MAX",
     "CCC_NO_MACHINST",
+    "CCC_NO_MAP_FP_UNROLL",
     "CCC_NO_MAP_I32_UNROLL",
     "CCC_NO_MAP_I64_UNROLL",
     "CCC_NO_MAP_VEC",

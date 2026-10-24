@@ -1,0 +1,50 @@
+{
+  "sse2/i32_product_map": {
+    "regenerated_measured_elf_identical": true,
+    "sha256": "06bebe87a4c963be79fe25d46c0c77a385158cf70468fc4da81c5faabfa165ed"
+  },
+  "sse2/fp32_product_map": {
+    "regenerated_measured_elf_identical": true,
+    "sha256": "8e9f7573a6a3a96707e8853cf0cdd3a943716abed45552ac842c92498e217301"
+  },
+  "sse2/fp64_product_map": {
+    "regenerated_measured_elf_identical": true,
+    "sha256": "1229bc97f83741f8528ac6a50670fd117d5be89f5d6e80773b15635de95ff143"
+  },
+  "sse2/gzip": {
+    "entire_assembly_identical": true,
+    "sha256": "283e9999efd803078238927b54fb7eec22f1da0e2b6224c8afc84f45367640ce"
+  },
+  "sse41/i32_product_map": {
+    "regenerated_measured_elf_identical": true,
+    "sha256": "86d6625de9228c8b0b39bb6f419bab4d9c212ca799b64e94d5713944d23496cc"
+  },
+  "sse41/fp32_product_map": {
+    "regenerated_measured_elf_identical": true,
+    "sha256": "8e9f7573a6a3a96707e8853cf0cdd3a943716abed45552ac842c92498e217301"
+  },
+  "sse41/fp64_product_map": {
+    "regenerated_measured_elf_identical": true,
+    "sha256": "1229bc97f83741f8528ac6a50670fd117d5be89f5d6e80773b15635de95ff143"
+  },
+  "sse41/gzip": {
+    "entire_assembly_identical": true,
+    "sha256": "283e9999efd803078238927b54fb7eec22f1da0e2b6224c8afc84f45367640ce"
+  },
+  "avx2/i32_product_map": {
+    "regenerated_measured_elf_identical": true,
+    "sha256": "148d8a0c5e299353327cedc9cc6d580232111139f6aadb0a099a9e047d55223c"
+  },
+  "avx2/fp32_product_map": {
+    "regenerated_measured_elf_identical": true,
+    "sha256": "ee2dec4c5ab0085e24d4ffdcd414d0438469070b78ec99d2e1d44b2c25941e7d"
+  },
+  "avx2/fp64_product_map": {
+    "regenerated_measured_elf_identical": true,
+    "sha256": "0562fd7441834080eb5dfda76c5ee9021210c240c0233feeefcdb239bdfb45ce"
+  },
+  "avx2/gzip": {
+    "entire_assembly_identical": true,
+    "sha256": "2b3a27a17fa472de98586650db21be263ffe24f4224e6fad9e0cb3e99c3b2340"
+  }
+}

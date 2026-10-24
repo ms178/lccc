@@ -1,0 +1,15 @@
+......
+  CORRECTNESS FAILURE: the two arms disagree, so no timing comparison is meaningful.
+    A: rc=17 stdout=''
+    B: rc=17 stdout=''
+...
+----------------------------------------------------------------------
+Ran 9 tests in 0.097s
+
+OK
+A/B
+  arm A: /tmp/tmpbstg15f9/program
+    sha256 2550f5203adee30a033c1bd30d567c30f72b24018675b385535db0e9d4acad52   env=<default>
+  arm B: /tmp/tmpbstg15f9/program
+    sha256 2550f5203adee30a033c1bd30d567c30f72b24018675b385535db0e9d4acad52   env=<default>
+  raw samples -> /tmp/tmpbstg15f9/report.json

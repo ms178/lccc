@@ -1,0 +1,722 @@
+{
+  "complete": true,
+  "source_sha256": "db9a91843900b01d1ddcff5ca7d60d3fcc033f8ec0686b475131bf9745b572b2",
+  "arms": [
+    {
+      "name": "f32/gcc",
+      "command": [
+        "/home/user/.cache/oracle-bin/gcc-16",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-gcc"
+      ],
+      "env": {},
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702"
+    },
+    {
+      "name": "f32/clang",
+      "command": [
+        "/home/user/artifacts/sse/clang23-gcc16",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-clang"
+      ],
+      "env": {},
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702"
+    },
+    {
+      "name": "f32/sse2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-sse2"
+      ],
+      "env": {},
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "packed_multiply_count": 2,
+      "assembly_sha256": "93756cb67847eb0f0e461b88d1a450146874be75d751bcfdb315d1130393e08e"
+    },
+    {
+      "name": "f32/sse2-rolled",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-sse2-rolled"
+      ],
+      "env": {
+        "CCC_NO_MAP_FP_UNROLL": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "packed_multiply_count": 1,
+      "assembly_sha256": "52496a456c56b6445b32a16570b00938efd6f69eae5d39b51379668152a844ef"
+    },
+    {
+      "name": "f32/sse41",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-sse41"
+      ],
+      "env": {},
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "packed_multiply_count": 2,
+      "assembly_sha256": "93756cb67847eb0f0e461b88d1a450146874be75d751bcfdb315d1130393e08e"
+    },
+    {
+      "name": "f32/sse41-rolled",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-sse41-rolled"
+      ],
+      "env": {
+        "CCC_NO_MAP_FP_UNROLL": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "packed_multiply_count": 1,
+      "assembly_sha256": "52496a456c56b6445b32a16570b00938efd6f69eae5d39b51379668152a844ef"
+    },
+    {
+      "name": "f32/avx2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64-v3",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-avx2"
+      ],
+      "env": {},
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "packed_multiply_count": 2,
+      "assembly_sha256": "eecaef3fe2dd5fdfcaf2da05148f77b9676edbc4f8d7fd21dcefdb4b61b56578"
+    },
+    {
+      "name": "f32/avx2-rolled",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64-v3",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-avx2-rolled"
+      ],
+      "env": {
+        "CCC_NO_MAP_FP_UNROLL": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702",
+      "packed_multiply_count": 1,
+      "assembly_sha256": "2cd35b39fabedc6ab5f81a2b05fa9701bc4252f733459c771b3dfefebf49f164"
+    },
+    {
+      "name": "f32/-O0/x86-64",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O0",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-O0-x86-64"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702"
+    },
+    {
+      "name": "f32/-O0/x86-64-v2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O0",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-O0-x86-64-v2"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702"
+    },
+    {
+      "name": "f32/-O0/x86-64-v3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O0",
+        "-ffp-contract=off",
+        "-march=x86-64-v3",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-O0-x86-64-v3"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702"
+    },
+    {
+      "name": "f32/-O1/x86-64",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O1",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-O1-x86-64"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702"
+    },
+    {
+      "name": "f32/-O1/x86-64-v2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O1",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-O1-x86-64-v2"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702"
+    },
+    {
+      "name": "f32/-O1/x86-64-v3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O1",
+        "-ffp-contract=off",
+        "-march=x86-64-v3",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-O1-x86-64-v3"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702"
+    },
+    {
+      "name": "f32/-O3/x86-64",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O3",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-O3-x86-64"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702"
+    },
+    {
+      "name": "f32/-O3/x86-64-v2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O3",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-O3-x86-64-v2"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702"
+    },
+    {
+      "name": "f32/-O3/x86-64-v3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O3",
+        "-ffp-contract=off",
+        "-march=x86-64-v3",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-O3-x86-64-v3"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702"
+    },
+    {
+      "name": "f32/-Os/x86-64",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-Os",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-Os-x86-64"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702"
+    },
+    {
+      "name": "f32/-Os/x86-64-v2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-Os",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-Os-x86-64-v2"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702"
+    },
+    {
+      "name": "f32/-Os/x86-64-v3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-Os",
+        "-ffp-contract=off",
+        "-march=x86-64-v3",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f32-Os-x86-64-v3"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "f37987657476eb7ef0e49a6ba63beeb67561d0f83f2a0afe38bb57e8272f0702"
+    },
+    {
+      "name": "f64/gcc",
+      "command": [
+        "/home/user/.cache/oracle-bin/gcc-16",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-gcc"
+      ],
+      "env": {},
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9"
+    },
+    {
+      "name": "f64/clang",
+      "command": [
+        "/home/user/artifacts/sse/clang23-gcc16",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-clang"
+      ],
+      "env": {},
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9"
+    },
+    {
+      "name": "f64/sse2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-sse2"
+      ],
+      "env": {},
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9",
+      "packed_multiply_count": 2,
+      "assembly_sha256": "8d68d81c83d03b3f91378e06b93a9a40626502f752e5ceb99390955a36a3e397"
+    },
+    {
+      "name": "f64/sse2-rolled",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-sse2-rolled"
+      ],
+      "env": {
+        "CCC_NO_MAP_FP_UNROLL": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9",
+      "packed_multiply_count": 1,
+      "assembly_sha256": "c4e2eb03405ab48f32407b3d26ce67e877028f3b126188bc5d3ff95d31380475"
+    },
+    {
+      "name": "f64/sse41",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-sse41"
+      ],
+      "env": {},
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9",
+      "packed_multiply_count": 2,
+      "assembly_sha256": "8d68d81c83d03b3f91378e06b93a9a40626502f752e5ceb99390955a36a3e397"
+    },
+    {
+      "name": "f64/sse41-rolled",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-sse41-rolled"
+      ],
+      "env": {
+        "CCC_NO_MAP_FP_UNROLL": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9",
+      "packed_multiply_count": 1,
+      "assembly_sha256": "c4e2eb03405ab48f32407b3d26ce67e877028f3b126188bc5d3ff95d31380475"
+    },
+    {
+      "name": "f64/avx2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64-v3",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-avx2"
+      ],
+      "env": {},
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9",
+      "packed_multiply_count": 2,
+      "assembly_sha256": "7ce5b2c3cd271b0965fda3b254d06be52fedc8440d98ba82db0e042d79fba00d"
+    },
+    {
+      "name": "f64/avx2-rolled",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O2",
+        "-ffp-contract=off",
+        "-march=x86-64-v3",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-avx2-rolled"
+      ],
+      "env": {
+        "CCC_NO_MAP_FP_UNROLL": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9",
+      "packed_multiply_count": 1,
+      "assembly_sha256": "068b3efafb610465c668cfce1d8852ca8f832ff17acf477b13e1d0f20c3cfa8a"
+    },
+    {
+      "name": "f64/-O0/x86-64",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O0",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-O0-x86-64"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9"
+    },
+    {
+      "name": "f64/-O0/x86-64-v2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O0",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-O0-x86-64-v2"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9"
+    },
+    {
+      "name": "f64/-O0/x86-64-v3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O0",
+        "-ffp-contract=off",
+        "-march=x86-64-v3",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-O0-x86-64-v3"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9"
+    },
+    {
+      "name": "f64/-O1/x86-64",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O1",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-O1-x86-64"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9"
+    },
+    {
+      "name": "f64/-O1/x86-64-v2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O1",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-O1-x86-64-v2"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9"
+    },
+    {
+      "name": "f64/-O1/x86-64-v3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O1",
+        "-ffp-contract=off",
+        "-march=x86-64-v3",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-O1-x86-64-v3"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9"
+    },
+    {
+      "name": "f64/-O3/x86-64",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O3",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-O3-x86-64"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9"
+    },
+    {
+      "name": "f64/-O3/x86-64-v2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O3",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-O3-x86-64-v2"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9"
+    },
+    {
+      "name": "f64/-O3/x86-64-v3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-O3",
+        "-ffp-contract=off",
+        "-march=x86-64-v3",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-O3-x86-64-v3"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9"
+    },
+    {
+      "name": "f64/-Os/x86-64",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-Os",
+        "-ffp-contract=off",
+        "-march=x86-64",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-Os-x86-64"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9"
+    },
+    {
+      "name": "f64/-Os/x86-64-v2",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-Os",
+        "-ffp-contract=off",
+        "-march=x86-64-v2",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-Os-x86-64-v2"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9"
+    },
+    {
+      "name": "f64/-Os/x86-64-v3",
+      "command": [
+        "/home/user/lccc/target/fastbuild/lccc",
+        "-Os",
+        "-ffp-contract=off",
+        "-march=x86-64-v3",
+        "-DFP_MAP_DOUBLE",
+        "/home/user/lccc/tests/regression/fp_map_unroll_bits.c",
+        "-o",
+        "/tmp/fp-map-unroll-hkapb6ti/f64-Os-x86-64-v3"
+      ],
+      "env": {
+        "CCC_VALIDATE_SSA": "1"
+      },
+      "cases": 606,
+      "sha256": "be51da2e9d15dd05c18bbca3df80e10f9876fc9b45698ee89cb8603780c528d9"
+    }
+  ],
+  "mutants": [
+    {
+      "name": "f32/fma",
+      "killed": true,
+      "sha256": "85ddb9b98d0916fc8f5c27d87e3c4796a48b607bbdaa2568dc3ce083f5eae917"
+    },
+    {
+      "name": "f64/fma",
+      "killed": true,
+      "sha256": "91610284e56dbca669cab2a69d4193eba18c4eb959ddc2c54ca0a03fb0b96d92"
+    }
+  ]
+}

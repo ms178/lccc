@@ -201,6 +201,7 @@ thread_local! {
     // lookup in every candidate loop and makes the early/main entries agree.
     static NO_MAP_I64_UNROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static NO_MAP_I32_UNROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NO_MAP_FP_UNROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // Generator-map vectorizer policy: `(enabled, trace)`. Resolved once per
     // pipeline run, like the map switches above.
     static GENERATOR_MAP: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((true, false)) };
@@ -238,6 +239,10 @@ pub(crate) fn set_no_map_i64_unroll(disabled: bool) {
 
 pub(crate) fn set_no_map_i32_unroll(disabled: bool) {
     NO_MAP_I32_UNROLL.with(|cell| cell.set(disabled));
+}
+
+pub(crate) fn set_no_map_fp_unroll(disabled: bool) {
+    NO_MAP_FP_UNROLL.with(|cell| cell.set(disabled));
 }
 
 /// Generator-map policy for this translation unit: `enabled` is false under the
@@ -6484,6 +6489,22 @@ enum MapExpr {
 }
 
 impl MapExpr {
+    /// Only short unfused arithmetic trees get the FP two-copy policy.
+    /// Exclude selects, comparisons, rounding, sqrt, division and explicit
+    /// FMA: their lowering/pressure is not described by this small budget.
+    fn small_fp_arithmetic(&self) -> bool {
+        fn arithmetic(e: &MapExpr) -> bool {
+            match e {
+                MapExpr::Load(_) | MapExpr::Invariant(_) => true,
+                MapExpr::BinOp(IrBinOp::Add | IrBinOp::Sub | IrBinOp::Mul, l, r) => {
+                    arithmetic(l) && arithmetic(r)
+                }
+                _ => false,
+            }
+        }
+        matches!(self, MapExpr::BinOp(_, _, _)) && self.unroll_cost() <= 5 && arithmetic(self)
+    }
+
     fn node_count(&self) -> usize {
         match self {
             MapExpr::Load(_) | MapExpr::Invariant(_) => 1,
@@ -6503,7 +6524,7 @@ impl MapExpr {
     /// `MapEmitCtx::broadcast_cache`; charging them here made an expression
     /// such as `(x[i] + y[i]) + k` look more expensive than the work that is
     /// actually copied.  Keep `node_count` as the syntax/compile-time budget
-    /// metric and use this separate metric only for the I64/U64 unroll choice.
+    /// metric and use this separate metric for bounded map unroll choices.
     fn unroll_cost(&self) -> usize {
         match self {
             MapExpr::Load(_) => 1,
@@ -29722,7 +29743,7 @@ mod map_unroll_policy_tests {
 
     #[test]
     fn two_copy_maps_keep_packed_work_at_both_widths() {
-        for width in [4, 8] {
+        for width in [2, 4, 8] {
             for count in 0..=259 {
                 let unroll = map_constant_unroll(width, 2, count);
                 assert!(matches!(unroll, 1 | 2));
@@ -29745,6 +29766,29 @@ mod map_unroll_policy_tests {
     }
 
     #[test]
+    fn fp_unroll_budget_excludes_complex_and_nonarithmetic_trees() {
+        let product = MapExpr::BinOp(
+            IrBinOp::Mul,
+            Box::new(MapExpr::Load(0)),
+            Box::new(MapExpr::Load(1)),
+        );
+        let sum = MapExpr::BinOp(IrBinOp::Add, Box::new(product), Box::new(MapExpr::Load(2)));
+        assert!(sum.small_fp_arithmetic());
+        let larger = MapExpr::BinOp(IrBinOp::Add, Box::new(sum), Box::new(MapExpr::Load(3)));
+        assert!(!larger.small_fp_arithmetic());
+        assert!(!MapExpr::Load(0).small_fp_arithmetic());
+        let sqrt = MapExpr::Sqrt(Box::new(MapExpr::Load(0)));
+        let nested_sqrt = MapExpr::BinOp(IrBinOp::Mul, Box::new(sqrt), Box::new(MapExpr::Load(1)));
+        assert!(!nested_sqrt.small_fp_arithmetic());
+        let divide = MapExpr::BinOp(
+            IrBinOp::SDiv,
+            Box::new(MapExpr::Load(0)),
+            Box::new(MapExpr::Load(1)),
+        );
+        assert!(!divide.small_fp_arithmetic());
+    }
+
+    #[test]
     fn unroll_policy_refreshes_on_the_same_worker() {
         let previous = no_map_i64_unroll();
         set_no_map_i64_unroll(true);
@@ -29758,6 +29802,12 @@ mod map_unroll_policy_tests {
         set_no_map_i32_unroll(false);
         assert!(!NO_MAP_I32_UNROLL.with(std::cell::Cell::get));
         set_no_map_i32_unroll(previous_i32);
+        let previous_fp = NO_MAP_FP_UNROLL.with(std::cell::Cell::get);
+        set_no_map_fp_unroll(true);
+        assert!(NO_MAP_FP_UNROLL.with(std::cell::Cell::get));
+        set_no_map_fp_unroll(false);
+        assert!(!NO_MAP_FP_UNROLL.with(std::cell::Cell::get));
+        set_no_map_fp_unroll(previous_fp);
     }
 }
 
@@ -29893,6 +29943,15 @@ fn transform_map_vector(
         // Two independent products halve loop-control overhead at both
         // widths. Bound the tree so extra copies cannot amplify a large DAG.
         // The shared packed_width machinery owns alias guards and tails.
+        2
+    } else if !neon
+        && matches!(pattern.elem_ty, IrType::F32 | IrType::F64)
+        && pattern.expr.small_fp_arithmetic()
+        && !NO_MAP_FP_UNROLL.with(std::cell::Cell::get)
+    {
+        // Independent copies preserve every lane's expression and rounding
+        // order; only loop control is shared. Keep the tree/register budget
+        // small and leave more elaborate FP lowerings at one packed copy.
         2
     } else {
         1
