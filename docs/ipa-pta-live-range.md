@@ -54,8 +54,9 @@ existing consumer remain unchanged. Unknown or exhausted analysis disables
 forwarding everywhere; partial points-to information is never treated as a
 non-alias proof.
 
-The default budget is four million solver work units and one million unique
-edges. It bounds pathological compile-time behavior and fails closed. Statistics
+The default budget is four million solver work units, one million unique
+edges, and 8192 objects per points-to set. It bounds pathological compile-time
+behavior and fails closed. Statistics
 under `CCC_IPA_PTA_STATS=1` report graph size, escape count, work, and the
 number of forwarded loads.
 

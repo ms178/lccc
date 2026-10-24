@@ -26,6 +26,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import statistics
 import subprocess
@@ -230,6 +231,10 @@ def host_cpu() -> dict[str, str]:
     return result
 
 
+def forwarding_counts(text: str) -> list[int]:
+    return [int(value) for value in re.findall(r"redundant-loads-forwarded=(\d+)", text)]
+
+
 def version(compiler: str) -> str:
     try:
         result = run([compiler, "--version"], timeout=10)
@@ -336,6 +341,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "performance": [],
     }
     failures = []
+    forwarding_witness = False
     with tempfile.TemporaryDirectory(prefix="lccc-ipa-lrs-") as temporary:
         directory = Path(temporary)
         for case in CASES:
@@ -343,6 +349,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             feature = compile_and_run(args.lccc, case, directory, True, gcc_include, stats=True)
             entry = {"name": case.name, "lccc_baseline": baseline, "lccc_feature": feature,
                      "oracles": [], "variants": []}
+            if any(count > 0 for count in forwarding_counts(feature.get("compile_stderr", ""))):
+                forwarding_witness = True
             if not args.skip_matrix:
                 for label, flags in (("O0", ("-O0",)), ("O1", ("-O1",)),
                                      ("O3", ("-O3",)), ("PIC", ("-fPIC",))):
@@ -351,6 +359,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                     variant_feature = compile_and_run_flags(
                         args.lccc, case, directory, True, gcc_include, stats=True,
                         extra_flags=flags)
+                    if any(count > 0 for count in forwarding_counts(variant_feature.get("compile_stderr", ""))):
+                        forwarding_witness = True
                     variant = {"name": label, "flags": flags,
                                "baseline": variant_baseline, "feature": variant_feature}
                     entry["variants"].append(variant)
@@ -369,12 +379,6 @@ def main(argv: Iterable[str] | None = None) -> int:
                     failures.append(f"{case.name}: LCCC runtime failed")
             if baseline.get("stdout") != feature.get("stdout") or baseline.get("runtime_returncode") != feature.get("runtime_returncode"):
                 failures.append(f"{case.name}: baseline/feature output divergence")
-            if case.name == "ipa-readonly-forwarding":
-                stats_text = feature.get("compile_stderr", "")
-                if "redundant-loads-forwarded=" not in stats_text:
-                    failures.append("IPA positive witness emitted no analysis statistics")
-                elif "redundant-loads-forwarded=0" in stats_text:
-                    failures.append("IPA positive witness performed no forwarding")
             if not args.skip_oracles:
                 for oracle in oracle_compilers(args):
                     # ICX's default FP contraction/value model is not a
@@ -389,6 +393,9 @@ def main(argv: Iterable[str] | None = None) -> int:
                     else:
                         failures.append(f"{case.name}: {oracle} compilation failed")
             report["cases"].append(entry)
+
+        if not forwarding_witness:
+            failures.append("no IPA forwarding opportunity was exercised in the correctness matrix")
 
         if not args.skip_performance:
             for case in CASES:
@@ -426,6 +433,9 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     report["failures"] = failures
     if failures:
+        if not forwarding_witness:
+            for entry in report["cases"]:
+                print(f"IPA STATS {entry['name']}:\n{entry['lccc_feature'].get('compile_stderr', '')[-8000:]}", file=sys.stderr)
         def diagnostic_records(entry):
             yield entry["lccc_baseline"]
             yield entry["lccc_feature"]

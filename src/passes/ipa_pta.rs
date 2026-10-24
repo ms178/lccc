@@ -52,11 +52,42 @@ impl ObjectSet {
     }
 
     fn union_with(&mut self, other: &Self) -> bool {
-        let mut changed = false;
-        for &object in &other.0 {
-            changed |= self.insert(object);
+        if other.0.iter().all(|&object| self.contains(object)) {
+            return false;
         }
-        changed
+        // Both sets are sorted.  Merge in linear time instead of repeatedly
+        // inserting into the middle of a Vec during call-summary propagation.
+        let mut merged = Vec::with_capacity(self.0.len() + other.0.len());
+        let (mut left, mut right) = (0usize, 0usize);
+        while left < self.0.len() || right < other.0.len() {
+            let next = match (self.0.get(left), other.0.get(right)) {
+                (Some(&a), Some(&b)) if a < b => {
+                    left += 1;
+                    a
+                }
+                (Some(&a), Some(&b)) if b < a => {
+                    right += 1;
+                    b
+                }
+                (Some(&a), Some(_)) => {
+                    left += 1;
+                    right += 1;
+                    a
+                }
+                (Some(&a), None) => {
+                    left += 1;
+                    a
+                }
+                (None, Some(&b)) => {
+                    right += 1;
+                    b
+                }
+                (None, None) => break,
+            };
+            merged.push(next);
+        }
+        self.0 = merged;
+        true
     }
 
     fn contains(&self, object: Object) -> bool {
@@ -118,6 +149,7 @@ struct CallSite {
 pub(crate) struct AnalysisBudget {
     pub max_work: usize,
     pub max_edges: usize,
+    pub max_points_per_node: usize,
 }
 
 impl Default for AnalysisBudget {
@@ -125,6 +157,7 @@ impl Default for AnalysisBudget {
         Self {
             max_work: 4_000_000,
             max_edges: 1_000_000,
+            max_points_per_node: 8192,
         }
     }
 }
@@ -214,6 +247,13 @@ impl Solver {
 
     fn insert(&mut self, node: Node, object: Object) {
         if !self.complete {
+            return;
+        }
+        if self.points[node as usize].0.len() >= self.budget.max_points_per_node
+            && !self.points[node as usize].contains(object)
+        {
+            self.complete = false;
+            self.queue.clear();
             return;
         }
         self.charge(1);
@@ -821,14 +861,22 @@ fn compute_effects(solver: &Solver, module: &IrModule) -> Vec<ModRef> {
         local_refs[site.caller].union_with(&external_references(site));
     }
 
-    let mut callers = vec![Vec::<usize>::new(); function_count];
+    let mut caller_sets = vec![FxHashSet::default(); function_count];
     for site in &solver.call_sites {
         for &callee in &site.targets {
-            if solver.functions[callee].safe_body && !callers[callee].contains(&site.caller) {
-                callers[callee].push(site.caller);
+            if solver.functions[callee].safe_body {
+                caller_sets[callee].insert(site.caller);
             }
         }
     }
+    let callers: Vec<Vec<usize>> = caller_sets
+        .into_iter()
+        .map(|set| {
+            let mut callers: Vec<usize> = set.into_iter().collect();
+            callers.sort_unstable();
+            callers
+        })
+        .collect();
 
     // Propagate both components over recursive call graphs.  Cloning the
     // predecessor summary avoids aliasing a mutable caller with an immutable
@@ -1764,6 +1812,7 @@ mod tests {
         let budget = AnalysisBudget {
             max_work: 1,
             max_edges: 1,
+            max_points_per_node: 16,
         };
         assert_eq!(run_with_budget(&mut module, false, budget), 0);
         assert_eq!(load_count(&module.functions[0]), 2);
