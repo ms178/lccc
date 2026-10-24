@@ -134,6 +134,10 @@ pub struct I686Codegen {
     /// subl $4,%esp for f32 conversion). Incremented on subl, decremented on addl.
     /// Added to frame_base_offset in slot_ref() to get the correct ESP offset.
     pub(super) esp_adjust: i64,
+    /// The active call used runtime ESP realignment for a >16-byte-aligned
+    /// GNU-vector argument. Cleanup restores the saved pre-alignment ESP
+    /// instead of adding the statically known argument area.
+    pub(super) dyn_align_cleanup: bool,
     /// -Os/-Oz: prefer the shorter sequence (idiv/imul) over the faster one
     /// (magic-number division, multi-instruction LEA multiply chains).
     pub(super) optimize_for_size: bool,
@@ -538,6 +542,7 @@ impl I686Codegen {
             omit_frame_pointer: false,
             frame_base_offset: 0,
             esp_adjust: 0,
+            dyn_align_cleanup: false,
             optimize_for_size: false,
             lzcnt_enabled: false,
             bmi1_enabled: false,
@@ -1085,12 +1090,28 @@ impl I686Codegen {
     /// the return instruction; the previous implementation re-derived
     /// register assignment, offsets and cleanup sizes in three places with
     /// incompatible rules.
+    #[cfg(test)]
     pub(super) fn fastcall_layout(
         &self,
         param_tys: &[IrType],
         struct_sizes: &[Option<usize>],
         force_stack: &[bool],
         is_variadic: bool,
+    ) -> (Vec<I686FastcallSlot>, usize) {
+        self.fastcall_layout_with_abi(param_tys, struct_sizes, force_stack, is_variadic, &[], &[])
+    }
+
+    /// Fastcall layout with aggregate ABI metadata. The legacy wrapper above
+    /// keeps older unit tests source-compatible; production caller/callee
+    /// paths use this version so wide GNU vectors share the cdecl rule.
+    pub(super) fn fastcall_layout_with_abi(
+        &self,
+        param_tys: &[IrType],
+        struct_sizes: &[Option<usize>],
+        force_stack: &[bool],
+        is_variadic: bool,
+        struct_aligns: &[Option<usize>],
+        struct_classes: &[Vec<crate::common::types::EightbyteClass>],
     ) -> (Vec<I686FastcallSlot>, usize) {
         // Every (scalarized) parameter slot needs a parallel force_stack entry
         // so i686 ExtVector lanes cannot silently fall back to the register
@@ -1113,6 +1134,15 @@ impl I686Codegen {
         let mut regs_free = [true, true];
         let mut chain_broken = is_variadic;
         let mut cursor: i64 = 0;
+        let vector_align = |i: usize| {
+            let align = struct_aligns.get(i).copied().flatten().unwrap_or(4);
+            let classes = struct_classes.get(i).map(Vec::as_slice).unwrap_or(&[]);
+            crate::backend::call_abi::i386_gnu_vector_stack_align(
+                &self.call_abi_config_impl(),
+                classes,
+                align,
+            )
+        };
 
         for (i, ty) in param_tys.iter().enumerate() {
             let aggregate = struct_sizes
@@ -1132,6 +1162,10 @@ impl I686Codegen {
             // slots, but unlike aggregates they do not break fastcall's
             // ECX/EDX eligibility chain for subsequent ordinary parameters.
             if force_stack.get(i).copied().unwrap_or(false) {
+                if let Some(align) = vector_align(i) {
+                    let a = align as i64;
+                    cursor = (cursor + a - 1) & !(a - 1);
+                }
                 slots.push(I686FastcallSlot::Stack {
                     offset: cursor,
                     size,
@@ -1156,6 +1190,10 @@ impl I686Codegen {
                 chain_broken = true;
             }
 
+            if let Some(align) = vector_align(i) {
+                let a = align as i64;
+                cursor = (cursor + a - 1) & !(a - 1);
+            }
             slots.push(I686FastcallSlot::Stack {
                 offset: cursor,
                 size,
@@ -1682,6 +1720,7 @@ impl I686Codegen {
         args: &[Operand],
         arg_types: &[IrType],
         struct_arg_sizes: &[Option<usize>],
+        struct_arg_aligns: &[Option<usize>],
         struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
         direct_name: Option<&str>,
         func_ptr: Option<&Operand>,
@@ -1698,12 +1737,35 @@ impl I686Codegen {
                 classes.len() == 1 && classes[0] == crate::common::types::EightbyteClass::NoClass
             })
             .collect();
-        let (slots, stack_bytes) =
-            self.fastcall_layout(arg_types, struct_arg_sizes, &force_stack, is_variadic);
+        let (slots, stack_bytes) = self.fastcall_layout_with_abi(
+            arg_types,
+            struct_arg_sizes,
+            &force_stack,
+            is_variadic,
+            struct_arg_aligns,
+            struct_arg_classes,
+        );
 
-        // Align the outgoing argument area to 16 bytes. The callee pops
-        // exactly `stack_bytes`; the alignment padding is caller-owned.
-        let stack_arg_space = (stack_bytes + 15) & !15;
+        let dyn_align_a =
+            struct_arg_aligns
+                .iter()
+                .enumerate()
+                .fold(16usize, |max_align, (i, align)| {
+                    let classes = struct_arg_classes.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                    crate::backend::call_abi::i386_gnu_vector_stack_align(
+                        &self.call_abi_config_impl(),
+                        classes,
+                        align.unwrap_or(4),
+                    )
+                    .map_or(max_align, |a| max_align.max(a))
+                });
+        let dyn_align = dyn_align_a > 16;
+        debug_assert!(!dyn_align || !self.omit_frame_pointer);
+        // The callee pops exactly `stack_bytes`; alignment padding is
+        // caller-owned. Wide vectors additionally require an absolute ESP
+        // boundary, just like the cdecl path.
+        let stack_arg_space = (stack_bytes + dyn_align_a - 1) & !(dyn_align_a - 1);
+        self.dyn_align_cleanup = false;
 
         // Spill indirect function pointer before stack manipulation.
         if indirect {
@@ -1712,7 +1774,19 @@ impl I686Codegen {
 
         // Phase 1: Allocate stack space and write stack args at their
         // layout offsets.
-        if stack_arg_space > 0 {
+        if dyn_align {
+            let total = stack_arg_space + 4;
+            self.state.emit("    movl %esp, %ecx");
+            self.state.emit("    movl %ecx, %eax");
+            emit!(self.state, "    subl ${}, %eax", total);
+            emit!(self.state, "    andl ${}, %eax", dyn_align_a - 1);
+            self.state.emit("    subl %eax, %esp");
+            self.state.emit("    subl $4, %esp");
+            self.state.emit("    movl %ecx, (%esp)");
+            emit!(self.state, "    subl ${}, %esp", stack_arg_space);
+            self.esp_adjust += total as i64;
+            self.state.reg_cache.invalidate_all();
+        } else if stack_arg_space > 0 {
             emit!(self.state, "    subl ${}, %esp", stack_arg_space);
             self.esp_adjust += stack_arg_space as i64;
         }
@@ -1773,9 +1847,16 @@ impl I686Codegen {
 
         // Phase 3: Emit the call.
         if indirect {
-            // Reload function pointer from spill slot
-            let fptr_offset = stack_arg_space as i64;
-            emit!(self.state, "    movl {}(%esp), %eax", fptr_offset);
+            // Reload the function pointer from the spill slot. With dynamic
+            // realignment the save word holds the pre-realignment ESP, which
+            // is also the address of that spill slot.
+            if dyn_align {
+                emit!(self.state, "    movl {}(%esp), %eax", stack_arg_space);
+                self.state.emit("    movl (%eax), %eax");
+            } else {
+                let fptr_offset = stack_arg_space as i64;
+                emit!(self.state, "    movl {}(%esp), %eax", fptr_offset);
+            }
             self.state.emit("    call *%eax");
         } else if let Some(name) = direct_name {
             // PIC: external fastcall callees must go through the PLT
@@ -1798,24 +1879,36 @@ impl I686Codegen {
 
         // Phase 4: Stack cleanup. Non-variadic fastcall callees pop the
         // stack args themselves (`ret $N`); variadic callees pop nothing.
-        if is_variadic {
-            if stack_bytes != 0 {
-                emit!(self.state, "    addl ${}, %esp", stack_bytes);
+        if dyn_align {
+            // Skip the remaining area to the save word, then restore the
+            // exact pre-realignment ESP. Do not also remove `pops` or the
+            // alignment padding: the restore already accounts for both.
+            let remaining = stack_arg_space - pops as usize;
+            if remaining > 0 {
+                emit!(self.state, "    addl ${}, %esp", remaining);
+            }
+            self.state.emit("    movl (%esp), %esp");
+            self.esp_adjust -= (stack_arg_space + 4) as i64;
+        } else {
+            if is_variadic {
+                if stack_bytes != 0 {
+                    emit!(self.state, "    addl ${}, %esp", stack_bytes);
+                    self.esp_adjust -= stack_bytes as i64;
+                }
+            } else {
+                // Callee popped stack_bytes, so esp_adjust drops by that amount.
                 self.esp_adjust -= stack_bytes as i64;
             }
-        } else {
-            // Callee popped stack_bytes, so esp_adjust drops by that amount.
-            self.esp_adjust -= stack_bytes as i64;
+            // Clean up alignment padding (the difference between actual stack bytes and aligned)
+            let padding = stack_arg_space - stack_bytes;
+            if padding > 0 {
+                emit!(self.state, "    addl ${}, %esp", padding);
+                self.esp_adjust -= padding as i64;
+            }
         }
         if indirect {
             self.state.emit("    addl $4, %esp"); // pop fptr spill
             self.esp_adjust -= 4;
-        }
-        // Clean up alignment padding (the difference between actual stack bytes and aligned)
-        let padding = stack_arg_space - stack_bytes;
-        if padding > 0 {
-            emit!(self.state, "    addl ${}, %esp", padding);
-            self.esp_adjust -= padding as i64;
         }
 
         // Phase 5: Store return value.
@@ -2779,6 +2872,7 @@ impl ArchCodegen for I686Codegen {
                 args,
                 arg_types,
                 struct_arg_sizes,
+                struct_arg_aligns,
                 struct_arg_classes,
                 direct_name,
                 func_ptr,
@@ -2824,6 +2918,7 @@ impl ArchCodegen for I686Codegen {
             &arg_classes_vec,
             arg_types,
             struct_arg_aligns,
+            struct_arg_classes,
             struct_arg_is_f128_sse,
         );
         let f128_temp_space =
@@ -2841,6 +2936,7 @@ impl ArchCodegen for I686Codegen {
             },
             f128_temp_space,
             struct_arg_aligns,
+            struct_arg_classes,
             struct_arg_is_f128_sse,
         );
         self.state().reg_cache.invalidate_acc();
@@ -3639,8 +3735,8 @@ impl ArchCodegen for I686Codegen {
         // calls
         fn call_abi_config(&self) -> call_abi::CallAbiConfig => call_abi_config_impl;
         fn emit_call_f128_pre_convert(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], stack_arg_space: usize) -> usize => emit_call_f128_pre_convert_impl;
-        fn emit_call_compute_stack_space(&self, arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], _struct_arg_aligns: &[Option<usize>], _struct_arg_is_f128_sse: &[bool]) -> usize => emit_call_compute_stack_space_impl;
-        fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize, _struct_arg_aligns: &[Option<usize>], _struct_arg_is_f128_sse: &[bool]) -> i64 => emit_call_stack_args_impl;
+        fn emit_call_compute_stack_space(&self, arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], struct_arg_aligns: &[Option<usize>], struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], struct_arg_is_f128_sse: &[bool]) -> usize => emit_call_compute_stack_space_impl;
+        fn emit_call_stack_args(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], stack_arg_space: usize, fptr_spill: usize, f128_temp_space: usize, struct_arg_aligns: &[Option<usize>], struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>], struct_arg_is_f128_sse: &[bool]) -> i64 => emit_call_stack_args_impl;
         fn emit_call_reg_args(&mut self, args: &[Operand], arg_classes: &[call_abi::CallArgClass], arg_types: &[IrType], total_sp_adjust: i64, f128_temp_space: usize, stack_arg_space: usize, struct_arg_riscv_float_classes: &[Option<crate::common::types::RiscvFloatClass>]) => emit_call_reg_args_impl;
         fn emit_call_instruction(&mut self, direct_name: Option<&str>, func_ptr: Option<&Operand>, indirect: bool, stack_arg_space: usize) => emit_call_instruction_impl;
         fn emit_call_cleanup(&mut self, stack_arg_space: usize, f128_temp_space: usize, indirect: bool) => emit_call_cleanup_impl;
@@ -4299,6 +4395,66 @@ mod tests {
             ]
         );
         assert_eq!(bytes, 12);
+    }
+
+    #[test]
+    fn fastcall_wide_gnu_vector_uses_natural_stack_padding() {
+        use I686FastcallSlot::Stack;
+        let cg = I686Codegen::new();
+        let classes = vec![
+            Vec::new(),
+            vec![crate::common::types::EightbyteClass::Memory],
+            Vec::new(),
+        ];
+        let (slots, bytes) = cg.fastcall_layout_with_abi(
+            &[IrType::I32, IrType::Ptr, IrType::I32],
+            &[None, Some(32), None],
+            &[],
+            true,
+            &[None, Some(32), None],
+            &classes,
+        );
+        assert_eq!(
+            slots,
+            vec![
+                Stack { offset: 0, size: 4 },
+                Stack {
+                    offset: 32,
+                    size: 32
+                },
+                Stack {
+                    offset: 64,
+                    size: 4
+                },
+            ]
+        );
+        assert_eq!(bytes, 68);
+
+        // The same size/alignment on an ordinary record is not a vector
+        // marker and must retain the four-byte fastcall layout.
+        let (record_slots, record_bytes) = cg.fastcall_layout_with_abi(
+            &[IrType::I32, IrType::Ptr, IrType::I32],
+            &[None, Some(32), None],
+            &[],
+            true,
+            &[None, Some(32), None],
+            &[],
+        );
+        assert_eq!(
+            record_slots,
+            vec![
+                Stack { offset: 0, size: 4 },
+                Stack {
+                    offset: 4,
+                    size: 32
+                },
+                Stack {
+                    offset: 36,
+                    size: 4
+                },
+            ]
+        );
+        assert_eq!(record_bytes, 40);
     }
 
     #[test]

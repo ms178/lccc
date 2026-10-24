@@ -406,27 +406,33 @@ ABI remains XMM; an independent `-mno-sse2` denial produces SSE-only carriers,
 and `-mno-sse -msse` restores baseline SSE2 unless a direct SSE2 denial is
 also present. The effective-feature mirror now publishes those baseline and
 denial states to this classifier. Prefetch retains its narrower positive-
-grant predicate instead of inheriting the backend's baseline. Other GNU
-vector widths are not changed. The existing alignment-ABI gate now requires
-all four i386 v16 mixed LCCC/GCC legs at O0/O2 to exit zero; the hosted
-`be7156898` run observed exactly those four repaired results while its stale
-expected-divergence ratchet failed. The v32/v64 legs remain explicitly latched
-as ABI-GNUVEC-I386-1 debt (observed exit 27), not declared fixed. This is an
-ABI finding from current compiler differential evidence, not a
-calling-convention claim derived from the SDM.
+grant predicate instead of inheriting the backend's baseline. The separate
+32/64-byte GNU-vector MEMORY defect is now addressed in the i686 backend:
+explicit target-local vector metadata drives natural caller/callee offsets,
+call-site dynamic stack realignment, and a single aligned variadic cursor/copy.
+Ordinary over-aligned records and v16 retain their measured four-byte layout.
+The alignment-ABI gate now requires every i386 v16/v32/v64 LCCC/GCC pairing to
+exit zero, including both stack residues and O0/O2; the former divergence
+latch is removed. Hosted acceptance is pending the next run. This is an ABI
+finding from current compiler differential evidence, not a calling-convention
+claim derived from the SDM.
 
 `check_i686_gnu_vector_abi.sh` requires GCC 16.2.0, Clang 23.1.3 and GNU as
 2.47. It links freestanding ELF32 programs with lccc-ld, requiring no 32-bit
 libc headers/runtime. Across default, explicit SSE2, SSE-only, SSE2-denied,
 profile-denied, SSE-restored and no-SSE modes, it exercises 108 cross-TU
-configurations at O0/O2/O3/Os, each with 16,384 vector-ABI checks and 18,432
-typed-shuffle checks. Default and SSE2 run all 24 mixed-compiler rows. The
-other five modes run 12 same-ABI-family rows: LLVM 23.1.3's
+configurations at O0/O2/O3/Os. Eighty-eight rows retain all 16,384 vector-ABI
+checks; twenty reduced-ISA Clang rows omit only Clang's self-inconsistent
+variadic case (14,336 checks), and every row retains all 18,432 typed-shuffle
+checks. Default and SSE2 run all 24 mixed-compiler rows. The other five modes
+run 12 same-ABI-family rows: LLVM 23.1.3's
 `X86CallingConv.td` passes only `v4f32` in XMM with SSE1 but no SSE2, whereas
 GCC/LCCC also use XMM for the tested integer/double vectors, and Clang's no-SSE
 vector return rule differs from GCC stack/sret. LLVM's `-sse` also disables
 dependent SSE2 without a reverse implication from a later `+sse`, so its
-SSE-restored row is SSE-only while GCC/LCCC restore SSE2. Linking incompatible
+SSE-restored row is SSE-only while GCC/LCCC restore SSE2. Its SSE-only
+Clang→Clang variadic row also failed with exit 8, so only that self-oracle case
+is omitted; LCCC/GCC variadic coverage is unchanged. Linking incompatible
 families is not a valid differential test; all compatible mixed rows and all
 same-family rows remain mandatory. Compile-time
 `__SSE__`/`__SSE2__`/`__SSE3__` checks and non-vacuous PSHUFD/XMM assembly

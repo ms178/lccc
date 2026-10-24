@@ -159,8 +159,18 @@ for mode in default sse2 sse-only sse2-denied arch-denied sse-restored no-sse; d
     for driver in "$GCC_ORACLE_BIN" "$CLANG_ORACLE_BIN"; do
         driver_family=gcc
         [[ $driver != "$CLANG_ORACLE_BIN" ]] || driver_family=clang
-        "$driver" "${flags[@]}" -B"$as_dir/" -O2 -c "$fixture/driver.c" -o "$tmp/abi-driver.o"
-        "$driver" "${flags[@]}" -B"$as_dir/" -O2 -DSHUFFLE_DRIVER_ONLY -c "$tmp/typed.c" -o "$tmp/typed-driver.o"
+        driver_fixture_extra=()
+        abi_checks=16384
+        if (( ! mixed_abi )) && [[ $driver_family == clang ]]; then
+            # Clang 23.1.3's own i386 variadic caller/va_arg layout is not
+            # self-consistent for this vector in the reduced-ISA modes
+            # (SSE-only fails with exit 8). Keep its other seven ABI probes
+            # and every typed-shuffle check; GCC/LCCC retain all eight.
+            driver_fixture_extra=(-DLCCC_OMIT_VARIADIC_ABI_PROBE=1)
+            abi_checks=14336
+        fi
+        "$driver" "${flags[@]}" "${driver_fixture_extra[@]}" -B"$as_dir/" -O2 -c "$fixture/driver.c" -o "$tmp/abi-driver.o"
+        "$driver" "${flags[@]}" "${driver_fixture_extra[@]}" -B"$as_dir/" -O2 -DSHUFFLE_DRIVER_ONLY -c "$tmp/typed.c" -o "$tmp/typed-driver.o"
         for compiler in "$ccc" "$GCC_ORACLE_BIN" "$CLANG_ORACLE_BIN"; do
             compiler_family=gcc
             [[ $compiler != "$CLANG_ORACLE_BIN" ]] || compiler_family=clang
@@ -177,14 +187,14 @@ for mode in default sse2 sse-only sse2-denied arch-denied sse-restored no-sse; d
             extra=()
             [[ $compiler == "$ccc" ]] || extra=(-B"$as_dir/")
             for opt in O0 O2 O3 Os; do
-                "$compiler" "${flags[@]}" "${extra[@]}" -"$opt" -c "$fixture/functions.c" -o "$tmp/functions.o"
+                "$compiler" "${flags[@]}" "${extra[@]}" "${driver_fixture_extra[@]}" -"$opt" -c "$fixture/functions.c" -o "$tmp/functions.o"
                 "$linker" -m elf_i386 -static -e _start "$tmp/start.o" "$tmp/abi-driver.o" "$tmp/functions.o" -o "$tmp/abi"
                 "$tmp/abi"
-                "$compiler" "${flags[@]}" "${extra[@]}" -"$opt" -DSHUFFLE_FUNCTIONS_ONLY -c "$tmp/typed.c" -o "$tmp/functions.o"
+                "$compiler" "${flags[@]}" "${extra[@]}" "${driver_fixture_extra[@]}" -"$opt" -DSHUFFLE_FUNCTIONS_ONLY -c "$tmp/typed.c" -o "$tmp/functions.o"
                 "$linker" -m elf_i386 -static -e _start "$tmp/start.o" "$tmp/typed-driver.o" "$tmp/functions.o" -o "$tmp/typed"
                 "$tmp/typed"
                 configurations=$((configurations + 1))
-                echo "ok: $mode $compiler -$opt / $driver driver: 16384 ABI + 18432 typed shuffle checks"
+                echo "ok: $mode $compiler -$opt / $driver driver: $abi_checks ABI + 18432 typed shuffle checks"
             done
         done
     done

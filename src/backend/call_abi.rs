@@ -464,8 +464,9 @@ pub struct CallAbiConfig {
     ///   the >16 case, see emit_call_stack_args_impl).
     /// * AArch64/RISC-V: 16 — the psABIs cap stack-argument alignment at
     ///   2*XLEN (the va_arg / prologue readers cap identically).
-    /// * i686: 4 — GCC's i386 cdecl NEVER aligns stack arguments beyond the
-    ///   4-byte slot granularity (PARM_BOUNDARY): not `long long` (align 8),
+    /// * i686: 4 for ordinary scalars/records — GCC's i386 cdecl does not
+    ///   align those stack arguments beyond the 4-byte slot granularity
+    ///   (PARM_BOUNDARY): not `long long` (align 8),
     ///   not over-aligned aggregates. GCC 14.2 -m32 oracle: a 3-int prefix
     ///   places an aligned(32)/24-byte struct at arg offset 12, and the
     ///   callee reads it via %ebp at that same 4-granular offset — the
@@ -473,7 +474,9 @@ pub struct CallAbiConfig {
     ///   i686 caller packs 4-granular and its va_arg readers walk 4-granular,
     ///   so the callee layout (and the va_start overflow offset derived from
     ///   it) must agree — an 8-byte cap here misreads every over-aligned
-    ///   struct arg whose natural offset is 4 (mod 8).
+    ///   struct arg whose natural offset is 4 (mod 8). TFmode carriers and
+    ///   GNU vectors wider than 16 bytes are explicit exceptions handled by
+    ///   `i386_gnu_vector_stack_align` and the TFmode branch below.
     pub stack_arg_align_cap: usize,
     /// XMM registers for 16-byte vector pieces on i386 (Clang's
     /// convention, LLVM `CC_X86_32_Vector_Common`): the first three pieces of
@@ -492,6 +495,25 @@ pub struct CallAbiConfig {
     /// honoring the tag there pushed the pointer to the stack while the
     /// callee's `va_arg` read `%rsi` (gcc.c-torture 20020412-1.c aborts).
     pub i386_ext_vector_lanes: bool,
+}
+
+/// Natural stack alignment for an i386 GNU vector MEMORY argument.
+///
+/// The lowering uses a singleton `[Memory]` class as a target-local marker
+/// for GNU `vector_size` aggregates. It is deliberately gated by the i386
+/// configuration: on x86-64 `[Memory]` is an ordinary SysV record/vector
+/// classification and must follow that target's own rules. Sixteen-byte
+/// vectors retain the measured i386 four-byte stack convention; only wider
+/// vectors (32/64 bytes and future wider forms) get natural alignment.
+pub(crate) fn i386_gnu_vector_stack_align(
+    config: &CallAbiConfig,
+    classes: &[crate::common::types::EightbyteClass],
+    align: usize,
+) -> Option<usize> {
+    (config.i386_ext_vector_lanes
+        && align > 16
+        && classes == [crate::common::types::EightbyteClass::Memory])
+    .then_some(align)
 }
 
 impl CallAbiConfig {
@@ -1525,10 +1547,11 @@ fn classify_param_slice(
                 //  * x86-64 (GCC >= 4.6) honors the FULL natural alignment
                 //    of MEMORY-class stack arguments (uncapped; callers
                 //    realign %rsp for the >16 case).
-                //  * i686 cdecl packs EVERYTHING at the 4-byte slot
+                //  * i686 cdecl packs ordinary arguments at the 4-byte slot
                 //    granularity — doubles, 12-byte x87 long double, 8-byte-
                 //    aligned structs, even `aligned(16)` structs (GCC 14.2
-                //    -m32 oracles f1/f3/f7/f8) — with EXACTLY ONE exception:
+                //    -m32 oracles f1/f3/f7/f8) — with separate exceptions for
+                //    wide GNU vectors (natural 32/64-byte alignment) and
                 //    TFmode 16-byte carriers (__float128/_Decimal128, the
                 //    is_f128_sse params) are 16-byte aligned (oracles f2/f6:
                 //    (int,__float128,int) puts q at offset 16; libgcc's
@@ -1555,6 +1578,11 @@ fn classify_param_slice(
                     slot_size == 4 && param.is_some_and(|p| p.is_f128_sse) && struct_align >= 16;
                 if tf_carrier_ia32 {
                     stack_offset = (stack_offset + 15) & !15;
+                } else if let Some(vector_align) = param.and_then(|p| {
+                    i386_gnu_vector_stack_align(config, &p.struct_eightbyte_classes, struct_align)
+                }) {
+                    let a = vector_align as i64;
+                    stack_offset = (stack_offset + a - 1) & !(a - 1);
                 } else if struct_align > slot_size as usize {
                     // NOTE: the cap is `usize::MAX` when uncapped (x86-64);
                     // the min/max MUST run in usize — casting the cap to i64
@@ -1899,6 +1927,21 @@ mod tests {
             core.classes[2],
             CoreArgClass::IntReg { reg_idx: 0 }
         ));
+    }
+
+    #[test]
+    fn i386_wide_vector_alignment_requires_the_explicit_vector_marker() {
+        let config = i686_regparm3();
+        let memory = [EightbyteClass::Memory];
+        assert_eq!(i386_gnu_vector_stack_align(&config, &memory, 32), Some(32));
+        assert_eq!(i386_gnu_vector_stack_align(&config, &memory, 64), Some(64));
+        assert_eq!(i386_gnu_vector_stack_align(&config, &memory, 16), None);
+        assert_eq!(i386_gnu_vector_stack_align(&config, &[], 32), None);
+        assert_eq!(i386_gnu_vector_stack_align(&config, &memory, 8), None);
+        assert_eq!(
+            i386_gnu_vector_stack_align(&sysv_x86_64(), &memory, 64),
+            None
+        );
     }
 
     #[test]

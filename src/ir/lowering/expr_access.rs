@@ -1756,6 +1756,20 @@ impl Lowerer {
         let ap_val = self.lower_va_list_pointer(ap_expr);
         let va_list_ptr = self.operand_to_value(ap_val);
 
+        // Wide i386 GNU vectors have naturally aligned MEMORY slots. Use
+        // one backend operation so the cursor is aligned once and the copy
+        // does not repeatedly load/store the va_list for every four bytes.
+        if self.target == Target::I686 && matches!(ctype, CType::Vector(..)) && struct_align > 16 {
+            self.emit(Instruction::VaArgStruct {
+                dest_ptr: alloca,
+                va_list_ptr,
+                size: struct_size,
+                align: struct_align,
+                eightbyte_classes: Vec::new(),
+            });
+            return Operand::Value(alloca);
+        }
+
         // On RISC-V, structs containing long double (f128) require 16-byte alignment
         // in the variadic argument area. The RISC-V LP64D ABI specifies that 2*XLEN-bit
         // scalars (and structs containing them) are aligned to 2*XLEN (16 bytes) on the

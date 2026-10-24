@@ -16,6 +16,17 @@ use crate::common::types::IrType;
 use crate::emit;
 use crate::ir::reexports::{Instruction, IntrinsicOp, IrFunction, Value};
 
+fn has_overaligned_call_args(func: &IrFunction) -> bool {
+    func.blocks.iter().any(|block| {
+        block.instructions.iter().any(|inst| match inst {
+            Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => {
+                info.struct_arg_aligns.iter().any(|a| a.unwrap_or(0) > 16)
+            }
+            _ => false,
+        })
+    })
+}
+
 impl I686Codegen {
     /// Does this function need the PIC GOT base in %ebx?
     ///
@@ -150,6 +161,13 @@ impl I686Codegen {
             let param_tys: Vec<IrType> = func.params.iter().map(|p| p.ty).collect();
             let struct_sizes: Vec<Option<usize>> =
                 func.params.iter().map(|p| p.struct_size).collect();
+            let struct_aligns: Vec<Option<usize>> =
+                func.params.iter().map(|p| p.struct_align).collect();
+            let struct_classes: Vec<Vec<crate::common::types::EightbyteClass>> = func
+                .params
+                .iter()
+                .map(|p| p.struct_eightbyte_classes.clone())
+                .collect();
             let force_stack: Vec<bool> = func
                 .params
                 .iter()
@@ -159,8 +177,14 @@ impl I686Codegen {
                             == crate::common::types::EightbyteClass::NoClass
                 })
                 .collect();
-            let (slots, stack_bytes) =
-                self.fastcall_layout(&param_tys, &struct_sizes, &force_stack, func.is_variadic);
+            let (slots, stack_bytes) = self.fastcall_layout_with_abi(
+                &param_tys,
+                &struct_sizes,
+                &force_stack,
+                func.is_variadic,
+                &struct_aligns,
+                &struct_classes,
+            );
             self.fastcall_slots = slots;
             self.fastcall_stack_cleanup = stack_bytes;
         } else {
@@ -217,6 +241,12 @@ impl I686Codegen {
         // Dynamic alloca (VLAs) requires the frame pointer to track the stack,
         // since ESP changes by runtime-computed amounts.
         if self.state.has_dyn_alloca {
+            self.omit_frame_pointer = false;
+        }
+
+        // Runtime ESP realignment requires EBP-relative local/param
+        // addressing for the duration of the call.
+        if has_overaligned_call_args(func) {
             self.omit_frame_pointer = false;
         }
 

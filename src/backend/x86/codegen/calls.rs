@@ -282,6 +282,7 @@ impl X86Codegen {
         arg_classes: &[CallArgClass],
         _arg_types: &[IrType],
         struct_arg_aligns: &[Option<usize>],
+        _struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
         _struct_arg_is_f128_sse: &[bool],
     ) -> usize {
         // x86-64: uncapped per-arg alignment padding (GCC ≥ 4.6 honors the
@@ -300,6 +301,7 @@ impl X86Codegen {
         _fptr_spill: usize,
         _f128_temp_space: usize,
         struct_arg_aligns: &[Option<usize>],
+        _struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
         struct_arg_is_f128_sse: &[bool],
     ) -> i64 {
         // Per-call-site transient state (defensive reset: the pipeline

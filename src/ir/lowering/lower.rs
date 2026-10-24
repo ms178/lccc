@@ -1562,6 +1562,11 @@ impl Lowerer {
                         // x86-64: the psABI classes of the struct, union or
                         // vector (`[Memory]`, `[Sse, SseUp]`, ...).
                         classes
+                    } else if self.target == crate::backend::Target::I686
+                        && matches!(self.type_spec_to_ctype(&p.type_spec), CType::Vector(..))
+                    {
+                        // Target-local GNU-vector marker; see func_lowering.
+                        vec![crate::common::types::EightbyteClass::Memory]
                     } else if let Some(layout) = self.get_struct_layout_for_type(&p.type_spec) {
                         layout.classify_sysv_eightbytes(&*self.types.borrow_struct_layouts())
                     } else {

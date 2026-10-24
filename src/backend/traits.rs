@@ -1316,6 +1316,7 @@ pub trait ArchCodegen {
             &arg_classes,
             arg_types,
             struct_arg_aligns,
+            struct_arg_classes,
             struct_arg_is_f128_sse,
         );
 
@@ -1340,6 +1341,7 @@ pub trait ArchCodegen {
             },
             f128_temp_space,
             struct_arg_aligns,
+            struct_arg_classes,
             struct_arg_is_f128_sse,
         );
 
@@ -1424,11 +1426,14 @@ pub trait ArchCodegen {
     /// x86 returns raw push bytes; ARM/RISC-V return pre-allocated SP space.
     /// `arg_types` is provided so that i686 can account for F64 taking 8 bytes on the stack.
     /// `struct_arg_aligns` lets the x86 backend 16-align over-aligned stack struct args.
+    /// `struct_arg_classes` carries target-local aggregate markers (i386 GNU
+    /// vectors) as well as the x86-64 SysV classes.
     fn emit_call_compute_stack_space(
         &self,
         arg_classes: &[super::call_abi::CallArgClass],
         arg_types: &[IrType],
         struct_arg_aligns: &[Option<usize>],
+        struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
         struct_arg_is_f128_sse: &[bool],
     ) -> usize;
 
@@ -1465,6 +1470,7 @@ pub trait ArchCodegen {
         fptr_spill: usize,
         f128_temp_space: usize,
         struct_arg_aligns: &[Option<usize>],
+        struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
         struct_arg_is_f128_sse: &[bool],
     ) -> i64;
 
