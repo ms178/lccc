@@ -3,7 +3,7 @@
   "fns_over_300": 228,
   "fns_over_500": 94,
   "ignored_tests": 10,
-  "knob_literals": 527,
+  "knob_literals": 528,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -230,6 +230,7 @@
     "CCC_NO_I686_EPILOGUE_MERGE",
     "CCC_NO_I686_PEEPHOLE",
     "CCC_NO_I686_SIB",
+    "CCC_NO_I686_SIGN_JCC",
     "CCC_NO_IDENTICAL_BLOCK_MERGE",
     "CCC_NO_IFCOMBINE",
     "CCC_NO_IMM_MATERIALIZED",

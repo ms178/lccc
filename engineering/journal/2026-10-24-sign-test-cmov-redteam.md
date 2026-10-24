@@ -168,3 +168,13 @@ header dependency addresses the observed failure rather than merely a local
 hypothesis. The Intel lane's runner-default GCC/Clang versions were 13.3.0 and
 18.1.3; exact GCC 16.2/Clang 23.1.3 coverage is owned by the contract lane and
 was also reproduced locally as recorded above.
+
+After rebasing onto `86948dd`, the new upstream census ratchet correctly caught
+one additional production environment control: `CCC_NO_I686_SIGN_JCC`. Retain
+this documented and regression-tested control because independent enabled /
+disabled compiles are the non-vacuity proof for the new i686 transformation.
+The baseline increases only the distinct-knob count by one and adds that exact
+name; panic, unsafe, ignored-test and function-size ceilings are unchanged.
+The rebased local fastbuild and suite passed (6159 library tests plus the
+linker test), and the five-level differential gate again passed with GCC
+16.2.0 / Clang 23.1.3, including i686 execution.
