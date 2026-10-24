@@ -31,6 +31,10 @@ ccc=${CCC:-$repo/target/fastbuild/lccc}
 gcc=${GCC:-gcc-16}
 clang=${CLANG:-clang-23}
 icx=${ICX:-icx}
+# ICX enables value-unsafe FP optimization at -O1 and above by default. The
+# matrix is specifically about NaN and signed-zero value semantics, so its ICX
+# oracle must use the strict model rather than comparing against fast-math.
+icx_strict=(-fno-fast-math -fp-model=strict)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -148,7 +152,7 @@ fi
 for opt in -O0 -O1 -O2 -O3 -Os; do
     for isa in -mno-avx -mavx; do
         if [ "$icx_only" = 1 ]; then
-            "$icx" "$opt" "$isa" "$work/matrix.c" -o "$work/icx" \
+            "$icx" "${icx_strict[@]}" "$opt" "$isa" "$work/matrix.c" -o "$work/icx" \
                 || fail "ICX $opt $isa build"
             expected=$("$work/icx")
             oracle=ICX
@@ -163,7 +167,7 @@ for opt in -O0 -O1 -O2 -O3 -Os; do
                 || fail "Clang $opt $isa: '$clang_out' != GCC '$expected'"
             oracle=GCC/Clang
             if [ "$have_icx" = 1 ]; then
-                "$icx" "$opt" "$isa" "$work/matrix.c" -o "$work/icx" \
+                "$icx" "${icx_strict[@]}" "$opt" "$isa" "$work/matrix.c" -o "$work/icx" \
                     || fail "ICX $opt $isa build"
                 icx_out=$("$work/icx")
                 [ "$icx_out" = "$expected" ] \
