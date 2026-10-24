@@ -254,9 +254,20 @@ fn run_impl(func: &mut IrFunction, ipa: Option<&super::ipa_pta::IpaPta>) -> usiz
                     // pointer kill everything (read-only intrinsics are fine).
                     Instruction::Call { .. } | Instruction::CallIndirect { .. } => {
                         if let Some(analysis) = ipa {
+                            let before = available.len();
                             available.retain(|(_, _, _, pointer)| {
                                 !analysis.may_call_modify(func, bi, ii, *pointer)
                             });
+                            if std::env::var_os("CCC_IPA_PTA_STATS").is_some() {
+                                eprintln!(
+                                    "[IPA-PTA] consumer function={} block={} instruction={} available={}->{}",
+                                    func.name,
+                                    bi,
+                                    ii,
+                                    before,
+                                    available.len()
+                                );
+                            }
                         } else {
                             available.clear();
                         }

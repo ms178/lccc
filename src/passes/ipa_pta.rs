@@ -694,6 +694,20 @@ fn run_with_budget(
         return 0;
     }
     let site_effects = compute_effects(&solver, module);
+    if std::env::var_os("CCC_IPA_PTA_STATS").is_some() {
+        for (site_id, effects) in site_effects.iter().enumerate() {
+            let site = &solver.call_sites[site_id];
+            let targets: Vec<&str> = site
+                .targets
+                .iter()
+                .map(|&target| module.functions[target].name.as_str())
+                .collect();
+            eprintln!(
+                "[IPA-PTA] site id={} caller={} targets={:?} external={} effects={:?}",
+                site_id, module.functions[site.caller].name, targets, site.external, effects
+            );
+        }
+    }
     let functions: FxHashMap<String, usize> = module
         .functions
         .iter()

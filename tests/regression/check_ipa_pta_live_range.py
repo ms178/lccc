@@ -270,6 +270,8 @@ def compile_and_run_flags(compiler: str, case: Case, directory: Path, features: 
                           extra_flags: Iterable[str] = ()) -> dict:
     extra_flags = tuple(extra_flags)
     tag = "feature" if features else "baseline"
+    compiler_tag = re.sub(r"[^A-Za-z0-9_.-]+", "-", Path(compiler).name)
+    tag = f"{compiler_tag}-{tag}"
     suffix = "-".join(extra_flags)
     if suffix:
         safe_suffix = "".join(c if c.isalnum() else "-" for c in suffix)
@@ -297,6 +299,7 @@ def compile_and_run_flags(compiler: str, case: Case, directory: Path, features: 
         "case": case.name,
         "features": features,
         "compile_command": cmd,
+        "executable": str(executable),
         "compile_returncode": compiled.returncode,
         "compile_stderr": compiled.stderr[-12000:],
     }
@@ -409,7 +412,10 @@ def main(argv: Iterable[str] | None = None) -> int:
                     oracle_result = compile_and_run(oracle, case, directory, False, gcc_include)
                     entry["oracles"].append(oracle_result)
                     if oracle_result.get("compile_returncode") == 0:
-                        if oracle_result.get("stdout") != baseline.get("stdout"):
+                        if oracle_result.get("runtime_returncode") != 0:
+                            failures.append(f"{case.name}: {oracle} runtime failed")
+                        if (oracle_result.get("stdout") != baseline.get("stdout")
+                                or oracle_result.get("runtime_returncode") != baseline.get("runtime_returncode")):
                             failures.append(f"{case.name}: {oracle} output differs from LCCC baseline")
                     else:
                         failures.append(f"{case.name}: {oracle} compilation failed")
@@ -421,37 +427,59 @@ def main(argv: Iterable[str] | None = None) -> int:
             failures.append("no live-range shrinkage opportunity was exercised in the correctness matrix")
 
         if not args.skip_performance:
+            entries = {entry["name"]: entry for entry in report["cases"]}
             for case in CASES:
                 if not case.performance:
                     continue
-                timings = {"baseline": [], "feature": []}
-                executables = {}
-                for features in (False, True):
-                    tag = "feature" if features else "baseline"
-                    # Reuse the already checked executable by rebuilding in a
-                    # dedicated path only when the temporary naming scheme
-                    # changes; keeping this explicit makes timing independent
-                    # of the correctness subprocesses.
-                    executables[tag] = directory / f"{case.name}-{tag}.exe"
-                if not all(path.exists() for path in executables.values()):
+                entry = entries[case.name]
+                records = {
+                    "baseline": entry["lccc_baseline"],
+                    "feature": entry["lccc_feature"],
+                }
+                for oracle in entry.get("oracles", []):
+                    records[f"oracle:{oracle['compiler']}"] = oracle
+                executables = {
+                    label: Path(record["executable"])
+                    for label, record in records.items()
+                    if record.get("compile_returncode") == 0
+                    and record.get("executable")
+                    and Path(record["executable"]).exists()
+                }
+                if "baseline" not in executables or "feature" not in executables:
                     continue
+                timings = {label: [] for label in executables}
+                labels = list(executables)
+                # Rotate the complete set, rather than timing one compiler
+                # in a separate thermal/scheduling phase. Compiler-specific
+                # executable names also prevent an oracle from overwriting
+                # the LCCC baseline before this loop.
                 for rep in range(args.reps):
-                    for tag in (("baseline", "feature") if rep % 2 == 0 else ("feature", "baseline")):
+                    order = labels[rep % len(labels):] + labels[:rep % len(labels)]
+                    for label in order:
                         started = time.perf_counter()
-                        result = run([str(executables[tag])], timeout=60)
+                        result = run([str(executables[label])], timeout=60)
                         elapsed = time.perf_counter() - started
                         if result.returncode == 0:
-                            timings[tag].append(elapsed)
+                            timings[label].append(elapsed)
+                medians = {
+                    label: statistics.median(values) if values else None
+                    for label, values in timings.items()
+                }
                 performance = {
                     "case": case.name,
                     "repetitions": args.reps,
                     "seconds": timings,
-                    "median_seconds": {k: statistics.median(v) if v else None for k, v in timings.items()},
+                    "median_seconds": medians,
                 }
                 if timings["baseline"] and timings["feature"]:
                     performance["feature_over_baseline"] = (
-                        statistics.median(timings["feature"]) / statistics.median(timings["baseline"])
+                        medians["feature"] / medians["baseline"]
                     )
+                    performance["feature_over_oracle"] = {
+                        label: medians["feature"] / medians[label]
+                        for label in labels
+                        if label.startswith("oracle:") and medians[label]
+                    }
                 report["performance"].append(performance)
 
     report["failures"] = failures
