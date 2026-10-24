@@ -37,28 +37,37 @@ fn sibcall_enabled() -> bool {
     !*SIBCALL_DISABLED.get_or_init(|| std::env::var_os("CCC_NO_SIBCALL").is_some())
 }
 
-/// Per-block sibling-call shape (TODO-3 / §5b): the block's LAST
+/// Per-site sibling-call shape (TODO-3 / §5b): the block's LAST
 /// instruction is a call whose dest is returned verbatim by the block's
 /// `Return` terminator with no other use anywhere in the function
 /// (`use_counts[v] == 1`: the Return itself), or a void call under
 /// `Return(None)`. Anything else — a non-call tail, a result used
 /// elsewhere, a different value returned, a constant returned — is a
-/// miss, never a guess.
+/// miss, never a guess. The returned hint carries the instruction index;
+/// a result id is not a call-site identity (void calls all have `None`).
 fn sibcall_block_hint(
     block: &BasicBlock,
     use_counts: &FxHashMap<u32, u8>,
 ) -> Option<crate::backend::state::SibcallHint> {
     use crate::backend::state::SibcallHint;
-    let last = block.instructions.last()?;
+    let instruction_index = block.instructions.len().checked_sub(1)?;
+    let last = &block.instructions[instruction_index];
+    // A returns-twice callee needs this function's frame on every return.
+    // Handing its second return directly to our caller bypasses that
+    // contract, so even an otherwise exact tail shape stays a normal call.
+    if crate::backend::liveness::is_returns_twice_call(last) {
+        return None;
+    }
     let dest = match last {
         Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info.dest,
         _ => return None,
     };
+    let hint = || Some(SibcallHint { instruction_index });
     match (dest, &block.terminator) {
         (Some(v), Terminator::Return(Some(Operand::Value(w)))) if *w == v => {
             // Single-use: the value's one use anywhere is this Return.
             if use_counts.get(&v.0).copied() == Some(1) {
-                Some(SibcallHint { dest: Some(v.0) })
+                hint()
             } else {
                 None
             }
@@ -69,10 +78,10 @@ fn sibcall_block_hint(
         // and its %eax is ignored by our void contract. A result with any
         // other use, or a different value returned, stays refused.
         (Some(v), Terminator::Return(None)) if use_counts.get(&v.0).copied().unwrap_or(0) == 0 => {
-            Some(SibcallHint { dest: Some(v.0) })
+            hint()
         }
         // Void forwarder: nothing to materialise, nothing to protect.
-        (None, Terminator::Return(None)) => Some(SibcallHint { dest: None }),
+        (None, Terminator::Return(None)) => hint(),
         _ => None,
     }
 }
@@ -5809,7 +5818,8 @@ fn generate_function_body(
         // its LAST instruction is the call, the terminator returns exactly
         // its result (or `Return(None)` for a void call), and the result
         // has no other use anywhere (count == 1: the Return itself).
-        cg.state().sibcall_hint = if sibcall_fn_ok {
+        cg.state().sibcall_hint = None;
+        let sibcall_hint = if sibcall_fn_ok {
             sibcall_block_hint(block, &sibcall_use_counts)
         } else {
             None
@@ -6003,6 +6013,10 @@ fn generate_function_body(
         }
 
         for (idx, inst) in block.instructions.iter().enumerate() {
+            // Publish the block's candidate only for its exact instruction.
+            // In particular, earlier void calls must not observe the final
+            // void call's hint and have their emission suppressed.
+            cg.state().sibcall_hint = sibcall_hint.filter(|hint| hint.instruction_index == idx);
             if Some(idx) == fuse_idx.map(|f| f.0) {
                 cg.state().current_program_point += 1;
                 continue;
@@ -7194,11 +7208,7 @@ fn generate_instruction_body(
             // Sibling call (TODO-3 / §5b): arm when the driver's block-tail
             // hint matches this site; the backend applies its own ABI
             // refusals (zero stack arguments, non-variadic, not sret).
-            if cg
-                .state()
-                .sibcall_hint
-                .is_some_and(|h| h.dest == info.dest.map(|d| d.0))
-            {
+            if cg.state().sibcall_hint.is_some() {
                 cg.arm_sibcall_candidate(info);
             }
             cg.emit_call(
@@ -7227,11 +7237,7 @@ fn generate_instruction_body(
             // Sibling call (TODO-3 / §5b): arm when the driver's block-tail
             // hint matches this site; the backend applies its own ABI
             // refusals (zero stack arguments, non-variadic, not sret).
-            if cg
-                .state()
-                .sibcall_hint
-                .is_some_and(|h| h.dest == info.dest.map(|d| d.0))
-            {
+            if cg.state().sibcall_hint.is_some() {
                 cg.arm_sibcall_candidate(info);
             }
             cg.emit_call(

@@ -1,5 +1,8 @@
 //! Globally priced, whole-web callee-saved eviction for x86 loop state.
-//! Run before segment fill; never evict another loop web or an ABI hint.
+//! Run before segment fill. Overlapping loop webs compete by strict profit;
+//! ABI hints and protected disjoint members are never evicted, and hottest-
+//! first admission prevents a colder later candidate from stealing back a
+//! home won by a hotter one.
 use super::*;
 
 pub(super) struct HotWebSteal<'a> {
@@ -686,18 +689,31 @@ mod tests {
     }
 
     #[test]
-    fn hot_web_never_displaces_loop_pair_or_abi_hint() {
-        for protected in [1, 101, 2] {
+    fn hot_web_prices_overlapping_loop_pair_members() {
+        // Phi destinations and their back-edge sources are not permanent
+        // vetoes when they directly compete with a hotter incoming web.
+        // Strict whole-web cost is the anti-thrashing arbiter.
+        for protected in [1, 101] {
             let mut f = Fixture::new();
             f.candidate(1, (0, 100), 10);
             f.candidate(10, (20, 80), 1000);
             f.holder(protected, 1, (0, 100), 1);
-            if protected == 2 {
-                f.config.reg_hints.insert(2, PhysReg(1));
-            }
-            assert_eq!(f.run(), 0);
-            assert!(!f.assignments.contains_key(&10));
+            assert_eq!(f.run(), 1);
+            assert_eq!(f.assignments.get(&10), Some(&PhysReg(1)));
+            assert!(!f.assignments.contains_key(&protected));
         }
+    }
+
+    #[test]
+    fn hot_web_never_displaces_an_abi_hint() {
+        let mut f = Fixture::new();
+        f.candidate(1, (0, 100), 10);
+        f.candidate(10, (20, 80), 1000);
+        f.holder(2, 1, (0, 100), 1);
+        f.config.reg_hints.insert(2, PhysReg(1));
+        assert_eq!(f.run(), 0);
+        assert!(!f.assignments.contains_key(&10));
+        assert_eq!(f.assignments.get(&2), Some(&PhysReg(1)));
     }
 
     #[test]

@@ -1,125 +1,208 @@
 #!/usr/bin/env bash
 # ============================================================================
-# check_fp_select_minmax.sh — pin the one-instruction min/max lowering of FP
-# selects over relational compares (`a > b ? a : b` and its seven siblings).
+# check_fp_select_minmax.sh — exact FP-select min/max semantics and shape.
 #
-# THE OPTIMIZATION THIS PINS
-# --------------------------
-# A Select whose condition is a relational FP compare and whose arms are the
-# compare's operands verbatim lowers to a single `maxsd`/`minsd` (or
-# `maxss`/`minss`), replacing the whole ucomisd + cmov (SSE2) or vcmp +
-# vblend (AVX) sequence. The hardware's SECOND-OPERAND-WINS rule on NaN and
-# ties is exactly the C semantics of the ordered selects, with one subtlety
-# that this gate exists to keep honest: the instruction follows the arms'
-# ORIENTATION relative to the predicate —
+# A Select over a strict relational FP compare, whose arms are the compare's
+# operands verbatim, is one MIN/MAX instruction. The true arm is the first
+# source and the false arm is the second: SECOND OPERAND WINS on NaN and ties
+# is exactly the ordered C select. The instruction follows arm orientation:
 #
-#     ogt(a,b) ? a : b  ==  maxsd dst=a, src=b   (NaN → b, tie → b)
-#     olt(a,b) ? a : b  ==  minsd dst=a, src=b
-#     ogt(a,b) ? b : a  ==  minsd dst=b, src=a   (NaN → a, tie → a)
-#     olt(a,b) ? b : a  ==  maxsd dst=b, src=a
+#   a > b ? a : b -> max(dst=a, src=b)    a > b ? b : a -> min(dst=b, src=a)
+#   a < b ? a : b -> min(dst=a, src=b)    a < b ? b : a -> max(dst=b, src=a)
 #
-# An earlier draft of the fold mapped BOTH `>`-forms to maxsd; the swapped
-# shapes came back transposed in the differential hash below and the mapping
-# was corrected. `ge`/`le` are deliberately NOT folded (their tie arm is the
-# opposite of the hardware's tie arm) and must keep the compare path.
+# Non-strict ge/le forms are not folded: their tie arm is opposite MIN/MAX's
+# second-source rule. This gate covers the COMPLETE 16-case matrix:
+#   {gt,lt,ge,le} x {natural,swapped arms} x {f32,f64}.
 #
-# THE GATE
-# --------
-#   1. BIT-EXACT DIFFERENTIAL — all eight shapes over a corner-value grid
-#      (negatives, ±0.0, QNaN, SNaN; every ordered pair, both widths), hashed
-#      by raw bit pattern, must equal the gcc-16 oracle's hash at
-#      -O0/-O1/-O2/-O3/-Os. -O0/-O1 use the unfolded path, so the gate also
-#      proves folded and unfolded agree — the strongest available statement
-#      that the fold changed no bit.
-#   2. SHAPE — the canonical scalar wrappers compile to exactly one
-#      `maxsd`/`minsd`/`maxss` each at -O2 (the instruction the fold exists
-#      to produce), and the deliberately-unfolded `ge`/`le` shapes contain
-#      none (they must keep the compare path; folding them would flip ties).
+# Validation has two independent halves:
+#   1. bit-exact runtime differential against GCC 16.2 and Clang 23.1.3 at
+#      -O0/-O1/-O2/-O3/-Os, in SSE and AVX modes, over infinities, ordinary
+#      values, +/-0, QNaN and SNaN in both operand positions. Constant selects
+#      and register-pressure/alias shapes are included alongside the matrix.
+#      ICX 2026.2 is added as a third oracle when provisioned.
+#   2. assembly shape for all 16 forms in both ISA modes. The eight strict
+#      forms have exactly one MIN/MAX; the eight non-strict forms have none.
+#      AVX must use VEX mnemonics directly, avoiding legacy-SSE transitions.
 # ============================================================================
 set -euo pipefail
 
 repo=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 ccc=${CCC:-$repo/target/fastbuild/lccc}
 gcc=${GCC:-gcc-16}
+clang=${CLANG:-clang-23}
+icx=${ICX:-icx}
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 fail() { echo "check_fp_select_minmax: FAIL: $*" >&2; exit 1; }
 [ -x "$ccc" ] || { echo "SKIP: $ccc not built" >&2; exit 0; }
-"$gcc" --version 2>/dev/null | grep -q "16\.2" || { echo "SKIP: gcc-16.2 oracle not on PATH" >&2; exit 0; }
+icx_only=${FP_MINMAX_ICX_ONLY:-0}
+if [ "$icx_only" = 1 ]; then
+    "$icx" --version 2>/dev/null | grep -c '2026\.2' >/dev/null \
+        || fail "FP_MINMAX_ICX_ONLY requires an ICX 2026.2 oracle"
+else
+    "$gcc" --version 2>/dev/null | grep -c '16\.2' >/dev/null \
+        || { echo "SKIP: gcc-16.2 oracle not on PATH" >&2; exit 0; }
+    "$clang" --version 2>/dev/null | grep -c '23\.1\.3' >/dev/null \
+        || { echo "SKIP: clang-23.1.3 oracle not on PATH" >&2; exit 0; }
+fi
 
-# --- 1. bit-exact differential over the corner grid -------------------------
-cat >"$work/hash.c" <<'EOF'
+cat >"$work/matrix.c" <<'EOF'
 #include <stdio.h>
 #include <string.h>
 typedef unsigned long long u64;
-static u64 H; static void mix(u64 x){ H^=x; H*=1099511628211ULL; }
-double s_gt(double a, double b)  { return a > b ? a : b; }
-double s_lt(double a, double b)  { return a < b ? a : b; }
-double s_gt_sw(double a, double b) { return a > b ? b : a; }
-double s_lt_sw(double a, double b) { return a < b ? b : a; }
-double s_ge(double a, double b)  { return a >= b ? a : b; }
-double s_le(double a, double b)  { return a <= b ? a : b; }
-float  f_gt(float a, float b)    { return a > b ? a : b; }
-float  f_lt_sw(float a, float b) { return a < b ? b : a; }
-#define DFN(name, fn) static void name(double a, double b){ u64 x; double r=fn(a,b); memcpy(&x,&r,8); mix(x); }
-#define FFN(name, fn) static void name(float a, float b){ u64 x; unsigned y; float r=fn(a,b); memcpy(&y,&r,4); x=y; mix(x); }
-DFN(h_gt, s_gt) DFN(h_lt, s_lt) DFN(h_gt_sw, s_gt_sw) DFN(h_lt_sw, s_lt_sw) DFN(h_ge, s_ge) DFN(h_le, s_le)
-FFN(hf_gt, f_gt) FFN(hf_lt_sw, f_lt_sw)
-int main(void){
-    double dv[]={1.5,-2.25,0.0,-0.0,3.0,-3.0};
-    double q,s; u64 qn=0x7ff8000000000000ULL,sn=0x7ff0000000000001ULL;
-    memcpy(&q,&qn,8); memcpy(&s,&sn,8);
-    double vals[8]; int n=0; for(int i=0;i<6;i++)vals[n++]=dv[i]; vals[n++]=q; vals[n++]=s;
-    H=1469598103934665603ULL;
-    for(int i=0;i<n;i++)for(int j=0;j<n;j++){
-        h_gt(vals[i],vals[j]); h_lt(vals[i],vals[j]);
-        h_gt_sw(vals[i],vals[j]); h_lt_sw(vals[i],vals[j]);
-        h_ge(vals[i],vals[j]); h_le(vals[i],vals[j]);
-    }
-    printf("d=%016llx ",H);
-    float fv[]={1.5f,-2.25f,0.0f,-0.0f}; float fq; unsigned fb=0x7fc00000u; memcpy(&fq,&fb,4);
-    float fvals[5]; n=0; for(int i=0;i<4;i++)fvals[n++]=fv[i]; fvals[n++]=fq;
-    H=1469598103934665603ULL;
-    for(int i=0;i<n;i++)for(int j=0;j<n;j++){ hf_gt(fvals[i],fvals[j]); hf_lt_sw(fvals[i],fvals[j]); }
-    printf("f=%016llx\n",H); return 0;
+#define DEF(name, type, op, t, f) \
+    __attribute__((noinline)) type name(type a, type b) { return a op b ? t : f; }
+DEF(d_gt,    double, >, a, b)
+DEF(d_gt_sw, double, >, b, a)
+DEF(d_lt,    double, <, a, b)
+DEF(d_lt_sw, double, <, b, a)
+DEF(d_ge,    double, >=, a, b)
+DEF(d_ge_sw, double, >=, b, a)
+DEF(d_le,    double, <=, a, b)
+DEF(d_le_sw, double, <=, b, a)
+DEF(f_gt,    float, >, a, b)
+DEF(f_gt_sw, float, >, b, a)
+DEF(f_lt,    float, <, a, b)
+DEF(f_lt_sw, float, <, b, a)
+DEF(f_ge,    float, >=, a, b)
+DEF(f_ge_sw, float, >=, b, a)
+DEF(f_le,    float, <=, a, b)
+DEF(f_le_sw, float, <=, b, a)
+
+/* Extra register-home/alias pressure: the select result must not overwrite
+   the false arm before that arm has been secured. */
+__attribute__((noinline)) double d_alias(double a, double b, double c, double d) {
+    double r = a > b ? a : b;
+    return c == d ? c : r;
+}
+__attribute__((noinline)) float f_alias(float a, float b, float c, float d) {
+    float r = a < b ? b : a;
+    return c == d ? c : r;
+}
+
+/* Compile-time constants, including both signed-zero arm orientations. */
+__attribute__((noinline)) double cd_zero(void) { return 0.0 > -0.0 ? 0.0 : -0.0; }
+__attribute__((noinline)) double cd_zero_sw(void) { return 0.0 > -0.0 ? -0.0 : 0.0; }
+__attribute__((noinline)) float cf_zero(void) { return 0.0f > -0.0f ? 0.0f : -0.0f; }
+__attribute__((noinline)) float cf_zero_sw(void) { return 0.0f > -0.0f ? -0.0f : 0.0f; }
+
+static u64 H;
+static void mix(u64 x) { H ^= x; H *= 1099511628211ULL; }
+static void mixd(double x) { u64 u; memcpy(&u, &x, 8); mix(u); }
+static void mixf(float x) { unsigned u; memcpy(&u, &x, 4); mix((u64)u); }
+#define DALL(a,b) do { \
+    mixd(d_gt(a,b)); mixd(d_gt_sw(a,b)); mixd(d_lt(a,b)); mixd(d_lt_sw(a,b)); \
+    mixd(d_ge(a,b)); mixd(d_ge_sw(a,b)); mixd(d_le(a,b)); mixd(d_le_sw(a,b)); \
+    mixd(d_alias(a,b,0.75,-1.25)); \
+} while (0)
+#define FALL(a,b) do { \
+    mixf(f_gt(a,b)); mixf(f_gt_sw(a,b)); mixf(f_lt(a,b)); mixf(f_lt_sw(a,b)); \
+    mixf(f_ge(a,b)); mixf(f_ge_sw(a,b)); mixf(f_le(a,b)); mixf(f_le_sw(a,b)); \
+    mixf(f_alias(a,b,0.75f,-1.25f)); \
+} while (0)
+static double frombits(u64 u) { double x; memcpy(&x, &u, 8); return x; }
+static float frombitsf(unsigned u) { float x; memcpy(&x, &u, 4); return x; }
+int main(void) {
+    const u64 dbits[] = {
+        0x3ff8000000000000ULL, 0xc002000000000000ULL,
+        0x0000000000000000ULL, 0x8000000000000000ULL,
+        0x4008000000000000ULL, 0xc008000000000000ULL,
+        0x7ff0000000000000ULL, 0xfff0000000000000ULL,
+        0x7ff8000000000000ULL, 0x7ff0000000000001ULL,
+        0xfff8000000000001ULL, 0x0000000000000001ULL
+    };
+    const unsigned fbits[] = {
+        0x3fc00000u, 0xc0100000u, 0x00000000u, 0x80000000u,
+        0x40400000u, 0xc0400000u, 0x7f800000u, 0xff800000u,
+        0x7fc00000u, 0x7f800001u, 0xffc00001u, 0x00000001u
+    };
+    H = 1469598103934665603ULL;
+    for (unsigned i = 0; i < sizeof(dbits)/sizeof(dbits[0]); ++i)
+        for (unsigned j = 0; j < sizeof(dbits)/sizeof(dbits[0]); ++j)
+            DALL(frombits(dbits[i]), frombits(dbits[j]));
+    mixd(cd_zero()); mixd(cd_zero_sw());
+    printf("d=%016llx ", H);
+    H = 1469598103934665603ULL;
+    for (unsigned i = 0; i < sizeof(fbits)/sizeof(fbits[0]); ++i)
+        for (unsigned j = 0; j < sizeof(fbits)/sizeof(fbits[0]); ++j)
+            FALL(frombitsf(fbits[i]), frombitsf(fbits[j]));
+    mixf(cf_zero()); mixf(cf_zero_sw());
+    printf("f=%016llx\n", H);
+    return 0;
 }
 EOF
+have_icx=0
+if [ "$icx_only" = 1 ]; then
+    have_icx=1
+elif "$icx" --version 2>/dev/null | grep -c '2026\.2' >/dev/null; then
+    have_icx=1
+else
+    echo "note: ICX 2026.2 not provisioned; GCC and Clang differential legs remain mandatory"
+fi
+
 for opt in -O0 -O1 -O2 -O3 -Os; do
-    "$gcc" "$opt" "$work/hash.c" -o "$work/g" || fail "gcc $opt build"
-    g_out=$("$work/g")
-    "$ccc" "$opt" "$work/hash.c" -o "$work/l" || fail "lccc $opt build"
-    l_out=$("$work/l")
-    [ "$g_out" = "$l_out" ] \
-        || fail "$opt differential: lccc '$l_out' != gcc '$g_out' (NaN/tie/SNaN corners diverge)"
-    echo "PASS: $opt bit-exact vs gcc-16 ($l_out)"
+    for isa in -mno-avx -mavx; do
+        if [ "$icx_only" = 1 ]; then
+            "$icx" "$opt" "$isa" "$work/matrix.c" -o "$work/icx" \
+                || fail "ICX $opt $isa build"
+            expected=$("$work/icx")
+            oracle=ICX
+        else
+            "$gcc" "$opt" "$isa" "$work/matrix.c" -o "$work/gcc" \
+                || fail "GCC $opt $isa build"
+            "$clang" "$opt" "$isa" "$work/matrix.c" -o "$work/clang" \
+                || fail "Clang $opt $isa build"
+            expected=$("$work/gcc")
+            clang_out=$("$work/clang")
+            [ "$clang_out" = "$expected" ] \
+                || fail "Clang $opt $isa: '$clang_out' != GCC '$expected'"
+            oracle=GCC/Clang
+            if [ "$have_icx" = 1 ]; then
+                "$icx" "$opt" "$isa" "$work/matrix.c" -o "$work/icx" \
+                    || fail "ICX $opt $isa build"
+                icx_out=$("$work/icx")
+                [ "$icx_out" = "$expected" ] \
+                    || fail "ICX $opt $isa: '$icx_out' != GCC '$expected'"
+                oracle=GCC/Clang/ICX
+            fi
+        fi
+        "$ccc" "$opt" "$isa" "$work/matrix.c" -o "$work/lccc" \
+            || fail "lccc $opt $isa build"
+        actual=$("$work/lccc")
+        [ "$actual" = "$expected" ] \
+            || fail "lccc $opt $isa: '$actual' != $oracle '$expected'"
+        echo "PASS: $opt $isa full matrix vs $oracle ($actual)"
+    done
 done
 
-# --- 2. shape: one instruction for the foldable forms, none for ge/le -------
-cat >"$work/shape.c" <<'EOF'
-double dmax(double a, double b){ return a > b ? a : b; }
-double dmin(double a, double b){ return a < b ? a : b; }
-double dmax_sw(double a, double b){ return a > b ? b : a; }
-float  fmax_(float a, float b){ return a > b ? a : b; }
-double ge(double a, double b){ return a >= b ? a : b; }
-double le(double a, double b){ return a <= b ? a : b; }
-EOF
-"$ccc" -O2 -S "$work/shape.c" -o "$work/shape.s" || fail "shape build"
-for fn_insn in "dmax maxsd" "dmin minsd" "dmax_sw minsd" "fmax_ maxss"; do
-    set -- $fn_insn
-    fn=$1; insn=$2
-    count=$(sed -n "/^${fn}:/,/^\.size\|^\.globl\|^ret/p" "$work/shape.s" \
-        | grep -cE "^\s+${insn}\s")
-    [ "$count" -eq 1 ] \
-        || fail "$fn: expected exactly one $insn, found $count"
-    echo "PASS: $fn -> single $insn"
-done
-for fn in ge le; do
-    sed -n "/^${fn}:/,/^\.size\|^\.globl\|^ret/p" "$work/shape.s" \
-        | grep -qE "^\s+maxsd\s|^\s+minsd\s" \
-        && fail "$fn: ge/le must NOT fold to maxsd/minsd (tie semantics differ)" \
-        || true
-    echo "PASS: $fn correctly unfolded"
+# Assembly shape: eight strict folds and eight deliberate non-folds, at both
+# ISA levels. Checking the complete matrix prevents a width/arm-specific
+# mapper from being hidden by a single canonical example.
+folds='d_gt:maxsd d_gt_sw:minsd d_lt:minsd d_lt_sw:maxsd f_gt:maxss f_gt_sw:minss f_lt:minss f_lt_sw:maxss'
+nonfolds='d_ge d_ge_sw d_le d_le_sw f_ge f_ge_sw f_le f_le_sw'
+for isa in -mno-avx -mavx; do
+    "$ccc" -O2 "$isa" -S "$work/matrix.c" -o "$work/$isa.s" \
+        || fail "shape build $isa"
+    prefix=
+    [ "$isa" = -mavx ] && prefix=v
+    for item in $folds; do
+        fn=${item%%:*}
+        insn=$prefix${item##*:}
+        body=$(sed -n "/^${fn}:/,/^\\.size/p" "$work/$isa.s")
+        count=$(grep -cE "^[[:space:]]+${insn}[[:space:]]" <<<"$body" || true)
+        [ "$count" -eq 1 ] || fail "$isa $fn: expected one $insn, found $count"
+        if [ "$isa" = -mavx ] && grep -qE '^[[:space:]]+(max|min)(sd|ss)[[:space:]]' <<<"$body"; then
+            fail "$isa $fn: legacy SSE MIN/MAX survived in AVX mode"
+        fi
+    done
+    for fn in $nonfolds; do
+        body=$(sed -n "/^${fn}:/,/^\\.size/p" "$work/$isa.s")
+        if grep -qE '^[[:space:]]+v?(max|min)(sd|ss)[[:space:]]' <<<"$body"; then
+            fail "$isa $fn: non-strict select folded with different tie semantics"
+        fi
+    done
+    echo "PASS: $isa all 16 predicate/arm/width assembly forms"
 done
 
 echo "check_fp_select_minmax: ok"

@@ -16,7 +16,7 @@ gcc=${GCC16:-${GCC:-gcc-16}}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-if ! "$gcc" --version 2>/dev/null | grep -q "16\.2"; then
+if ! "$gcc" --version 2>/dev/null | grep -c "16\.2" >/dev/null; then
     echo "SKIP: gcc-16.2 oracle not on PATH"
     exit 0
 fi

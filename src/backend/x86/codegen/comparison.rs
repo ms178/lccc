@@ -1935,6 +1935,21 @@ impl X86Codegen {
     ///
     /// Returns true when the min/max was emitted; false when the shape is
     /// not the canonical one (the caller proceeds to the blend/fallback).
+    /// Emit the scalar MIN/MAX with the ABI-active encoding. AVX requires
+    /// the three-operand VEX form (src2, src1, dest in AT&T order); repeating
+    /// the true-arm destination as src1 preserves the legacy two-operand
+    /// semantics while avoiding an AVX-to-legacy-SSE transition.
+    fn emit_fp_select_minmax_instruction(&mut self, minmax: &str, false_src: &str, true_dst: &str) {
+        if self.isa.avx {
+            self.state.emit_fmt(format_args!(
+                "    v{minmax} {false_src}, %{true_dst}, %{true_dst}"
+            ));
+        } else {
+            self.state
+                .emit_fmt(format_args!("    {minmax} {false_src}, %{true_dst}"));
+        }
+    }
+
     fn try_emit_fp_select_minmax(
         &mut self,
         dest: &Value,
@@ -2021,8 +2036,7 @@ impl X86Codegen {
                 }
             };
             self.emit_fp_operand_to_xmm(true_val, ty, &d_name);
-            self.state
-                .emit_fmt(format_args!("    {} {}, %{}", minmax, false_src, d_name));
+            self.emit_fp_select_minmax_instruction(minmax, &false_src, &d_name);
             self.state.reg_cache.invalidate_acc();
             return true;
         }
@@ -2031,13 +2045,11 @@ impl X86Codegen {
         self.emit_fp_operand_to_xmm(true_val, ty, "xmm0");
         match self.fp_src_mem_operand(false_val, ty) {
             Some(src) => {
-                self.state
-                    .emit_fmt(format_args!("    {} {}, %xmm0", minmax, src));
+                self.emit_fp_select_minmax_instruction(minmax, &src, "xmm0");
             }
             None => {
                 self.emit_fp_operand_to_xmm(false_val, ty, "xmm1");
-                self.state
-                    .emit_fmt(format_args!("    {} %xmm1, %xmm0", minmax));
+                self.emit_fp_select_minmax_instruction(minmax, "%xmm1", "xmm0");
             }
         }
         self.store_xmm0_fp_dest(dest, ty);

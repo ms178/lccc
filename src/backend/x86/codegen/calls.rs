@@ -1499,8 +1499,13 @@ impl X86Codegen {
         // passes model this site from the markers, and without them the
         // dead-write eliminations around it (the `movb $N, %al` census,
         // param-homing moves) silently stop firing.
-        let sibcall_armed = matches!(self.state.pending_sibcall, Some(SibcallPending::Armed));
-        if sibcall_armed {
+        let preserve_upper_vector_lanes = match &self.state.pending_sibcall {
+            Some(SibcallPending::Armed {
+                preserve_upper_vector_lanes,
+            }) => Some(*preserve_upper_vector_lanes),
+            _ => None,
+        };
+        if let Some(preserve_upper_vector_lanes) = preserve_upper_vector_lanes {
             let target = if let Some(name) = direct_name {
                 if self.state.needs_plt(name) {
                     let n = name.split('@').next().unwrap_or(name);
@@ -1543,7 +1548,10 @@ impl X86Codegen {
                 self.state.pending_sibcall = None;
                 return;
             };
-            self.state.pending_sibcall = Some(SibcallPending::Ready(target));
+            self.state.pending_sibcall = Some(SibcallPending::Ready {
+                target,
+                preserve_upper_vector_lanes,
+            });
         } else if let Some(name) = direct_name {
             if self.state.needs_plt(name) {
                 // Versioned symbols (`printf@GLIBC_2.2.5`, bound by .symver)
@@ -1850,19 +1858,22 @@ impl X86Codegen {
             info.is_variadic,
             &config,
         );
-        let stack_class = |c: &crate::backend::call_abi::CallArgClass| {
-            matches!(
-                c,
-                crate::backend::call_abi::CallArgClass::Stack
-                    | crate::backend::call_abi::CallArgClass::StructByValStack { .. }
-                    | crate::backend::call_abi::CallArgClass::LargeStructStack { .. }
-                    | crate::backend::call_abi::CallArgClass::StructSplitRegStack { .. }
-            )
-        };
-        if classes.iter().any(stack_class) {
+        if classes
+            .iter()
+            .any(crate::backend::call_abi::CallArgClass::is_stack)
+        {
             return;
         }
-        self.state.pending_sibcall = Some(SibcallPending::Armed);
+        let preserve_upper_vector_lanes = classes.iter().any(|class| {
+            matches!(
+                class,
+                crate::backend::call_abi::CallArgClass::StructXmmReg { size, .. }
+                    if *size > 16
+            )
+        });
+        self.state.pending_sibcall = Some(SibcallPending::Armed {
+            preserve_upper_vector_lanes,
+        });
     }
 
     pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {

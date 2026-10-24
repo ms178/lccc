@@ -136,7 +136,10 @@ EOF
 "$CCC" -O2 -S "$td/strlen-vla.c" -o "$td/hosted.s"
 "$CCC" -O2 -fno-builtin -S "$td/strlen-vla.c" -o "$td/no-builtin.s"
 
-CALL_RE='call[q]?[[:space:]]+strlen(@PLT)?'
+# A sibling tail jump is still an out-of-line call site: folding policy is
+# about whether the library invocation survives, not which branch mnemonic
+# transfers to it.
+CALL_RE='(call|jmp)[q]?[[:space:]]+strlen(@PLT)?'
 if grep -Eq "$CALL_RE" "$td/hosted.s"; then
     echo "FAIL: hosted -O2 unexpectedly retained strlen call" >&2
     grep -nE "$CALL_RE" "$td/hosted.s" >&2
@@ -190,7 +193,7 @@ int observable(void) { strlen("abc"); return 0; }
 EOF
 "$CCC" -O2 -fno-builtin -S "$td/math-purity.c" -o "$td/math-purity.s"
 for name in sqrt strlen; do
-    grep -Eq "call[q]?[[:space:]]+$name(@PLT)?" "$td/math-purity.s" || {
+    grep -Eq "(call|jmp)[q]?[[:space:]]+$name(@PLT)?" "$td/math-purity.s" || {
         echo "FAIL: -fno-builtin lost ordinary $name call to math/purity optimization" >&2
         exit 1
     }
@@ -199,7 +202,7 @@ done
 # Verify that it receives the same per-TU policy as the main simplifier.
 for opt in -O0 -O1; do
     "$CCC" "$opt" -fno-builtin -S "$td/math-purity.c" -o "$td/math-purity-$opt.s"
-    grep -Eq 'call[q]?[[:space:]]+sqrt(@PLT)?' "$td/math-purity-$opt.s" || {
+    grep -Eq '(call|jmp)[q]?[[:space:]]+sqrt(@PLT)?' "$td/math-purity-$opt.s" || {
         echo "FAIL: $opt -fno-builtin folded ordinary sqrt through the low-tier intrinsic pass" >&2
         exit 1
     }
@@ -226,12 +229,12 @@ CEOF
 withdrawn_fn=$(awk '/per_name_withdrawn:/,/\.size.*per_name_withdrawn/' "$td/pername.s")
 # herestring, not `echo | grep -q`: under `set -o pipefail` an early-exit grep
 # can SIGPIPE the producer and turn a match into a false failure.
-grep -Eq 'call[q]?[[:space:]]+strlen(@PLT)?' <<<"$withdrawn_fn" || {
+grep -Eq '(call|jmp)[q]?[[:space:]]+strlen(@PLT)?' <<<"$withdrawn_fn" || {
     echo "FAIL: per-name -fno-builtin-strlen did not keep the ordinary strlen call" >&2
     exit 1
 }
 explicit_fn=$(awk '/per_name_explicit_still_folds:/,/\.size.*per_name_explicit_still_folds/' "$td/pername.s")
-if grep -Eq 'call[q]?[[:space:]]+strlen(@PLT)?' <<<"$explicit_fn"; then
+if grep -Eq '(call|jmp)[q]?[[:space:]]+strlen(@PLT)?' <<<"$explicit_fn"; then
     echo "FAIL: explicit __builtin_strlen must still fold under per-name withdrawal" >&2
     exit 1
 fi

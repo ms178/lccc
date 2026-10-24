@@ -28,8 +28,15 @@ pub struct StackSlot(pub i64);
 /// at Phase 4, recording the resolved tail target as `Ready`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SibcallPending {
-    Armed,
-    Ready(SibcallTarget),
+    Armed {
+        /// A YMM/ZMM argument must reach the tail callee with every lane
+        /// intact. The return path therefore must not clean upper lanes.
+        preserve_upper_vector_lanes: bool,
+    },
+    Ready {
+        target: SibcallTarget,
+        preserve_upper_vector_lanes: bool,
+    },
 }
 
 /// The resolved tail target's emission form. `Direct` holds the symbol
@@ -43,12 +50,13 @@ pub enum SibcallTarget {
     Reg(&'static str),
 }
 
-/// Per-block sibling-call shape hint, computed by the generation driver:
-/// `dest` is the trailing call's result value id (`None` for a void call)
-/// when the block's tail is a sibling-call shape.
+/// Per-instruction sibling-call shape hint, computed by the generation
+/// driver. `instruction_index` is the exact call's index in its block. The
+/// driver publishes the hint only while emitting that instruction: result
+/// ids (and especially `None` for void calls) are not site identities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SibcallHint {
-    pub dest: Option<u32>,
+    pub instruction_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

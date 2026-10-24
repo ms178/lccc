@@ -2721,6 +2721,11 @@ jobs:
           "intel-evidence/$fixture-lccc" > "intel-evidence/$fixture-lccc.txt"
           diff -u "intel-evidence/$fixture-icx.txt" "intel-evidence/$fixture-lccc.txt"
         done
+    - name: FP select min/max matrix against ICX
+      run: |
+        set -euo pipefail
+        CCC=target/fastbuild/lccc ICX="$LCCC_ICX_BIN" FP_MINMAX_ICX_ONLY=1 \
+          bash tests/regression/check_fp_select_minmax.sh
     - name: Volatile reduction O3 contracts and ICX matrix
       run: |
         set -euo pipefail

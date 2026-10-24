@@ -8006,21 +8006,13 @@ impl ArchCodegen for X86Codegen {
             // conversion lives in `emit_call_instruction_impl`/`emit_return_impl`
             // (call suppression + `<epilogue>; jmp`), which the MachInst
             // buffering bypasses entirely.
-            if self
-                .state
-                .sibcall_hint
-                .is_some_and(|h| h.dest == info.dest.map(|d| d.0))
-            {
+            if self.state.sibcall_hint.is_some() {
                 return false;
             }
             return self.try_lower_call_typed(inst, Some(func), None, info, folded_global_addrs);
         }
         if let crate::ir::reexports::Instruction::CallIndirect { func_ptr, info } = inst {
-            if self
-                .state
-                .sibcall_hint
-                .is_some_and(|h| h.dest == info.dest.map(|d| d.0))
-            {
+            if self.state.sibcall_hint.is_some() {
                 return false;
             }
             return self.try_lower_call_typed(
@@ -8959,6 +8951,15 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_post_call_restore_caller_regs(&mut self) {
+        // The matching pre-call save was skipped for a sibling call. In
+        // particular, the initial `caller_regs_restored == false` must not
+        // make this site reload stale caller-save slots over the outgoing
+        // argument registers before the tail jump.
+        if self.state.pending_sibcall.is_some() {
+            self.caller_regs_restored = true;
+            self.call_fresh_snapshot.clear();
+            return;
+        }
         // Idempotent per call site: the vector-register aggregate return
         // (`emit_call_store_vector_return_impl`) restores early so it can
         // read the buffer operand, and the generic Phase 2b call that

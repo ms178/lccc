@@ -1,9 +1,9 @@
 {
   "fns_over_1000": 27,
-  "fns_over_300": 227,
+  "fns_over_300": 228,
   "fns_over_500": 94,
   "ignored_tests": 10,
-  "knob_literals": 525,
+  "knob_literals": 527,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -201,6 +201,7 @@
     "CCC_NO_EXPR_CHAIN_SINK",
     "CCC_NO_EXPR_SINK",
     "CCC_NO_EXT16",
+    "CCC_NO_FIXED_SLP",
     "CCC_NO_FLAG_FUSION",
     "CCC_NO_FMA_NEG_PEEL",
     "CCC_NO_FMSUB",
@@ -328,6 +329,7 @@
     "CCC_NO_SEXT_ELIM",
     "CCC_NO_SEXT_TEST",
     "CCC_NO_SHIFT_COUNT_DEMAND",
+    "CCC_NO_SIBCALL",
     "CCC_NO_SLOT_COALESCE",
     "CCC_NO_SLOT_FWD_PRECISION",
     "CCC_NO_SLOT_LOAD_DEDUP",

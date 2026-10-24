@@ -14,8 +14,9 @@
 #
 # Assertions (x86-64 -O2 -march=x86-64-v3 -fwrapv):
 #   1. constant trips 2, 4 (inside a loop) and 8: the helper call is gone
-#   2. trips 0, 1, 9, and a non-constant trip: the call remains
-#   3. at -Os the tier is disabled, so a constant-trip call remains
+#   2. trips 0, 1, 9, and a non-constant trip: an out-of-line call or tail
+#      jump remains (sibling-call conversion does not constitute inlining)
+#   3. at -Os the tier is disabled, so a constant-trip call/tail jump remains
 #   4. an always_inline twin is NOT restricted to constants: at a
 #      non-constant site its call is still inlined
 # ============================================================================
@@ -84,20 +85,21 @@ extract() { # extract <asm> <fn>
     on { print }' "$1"
 }
 
-# Count direct calls to <callee> in one function's body.
-calls_to() { # calls_to <asm> <fn> <callee>
-  extract "$1" "$2" | grep -c "^[[:space:]]*call[[:space:]]\+$3[[:space:]]*$" || true
+# Count out-of-line transfers to <callee> in one function's body. A direct
+# sibling jump is just as strong evidence against cloning as an ordinary call.
+transfers_to() { # transfers_to <asm> <fn> <callee>
+  extract "$1" "$2" | grep -Ec "^[[:space:]]*(call|jmp)[[:space:]]+$3[[:space:]]*$" || true
 }
 
 fail=0
 expect_calls() { # expect_calls <asm> <fn> <callee> <count> <label>
   local got
-  got=$(calls_to "$1" "$2" "$3")
+  got=$(transfers_to "$1" "$2" "$3")
   if [[ $got != "$4" ]]; then
-    echo "FAIL $5: $2 has $got call(s) to $3, expected $4" >&2
+    echo "FAIL $5: $2 has $got out-of-line transfer(s) to $3, expected $4" >&2
     fail=1
   else
-    echo "ok   $5: $2 has $got call(s) to $3"
+    echo "ok   $5: $2 has $got out-of-line transfer(s) to $3"
   fi
 }
 

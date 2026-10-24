@@ -91,7 +91,7 @@ for fn in dmin2 dmax2 iw vfwd icall; do
         dmax2) want='jmp fmax@PLT' ;;
         iw)    want='jmp g6@PLT' ;;
         vfwd)  want='jmp puts@PLT' ;;
-        icall) want='jmp \*%r10' ;;
+        icall) want='jmpq \*%r10' ;;
     esac
     has "$b" "$want" || { echo "$fn: missing '$want':"; echo "$b" >&2; exit 1; }
     lacks "$b" '^[[:space:]]*call ' || { echo "$fn: tail still calls"; exit 1; }
@@ -155,7 +155,7 @@ esac
 
 # --- §5.3 oracle: GCC 16.2 compiles dmin2 to `jmp fmin`; match it ---
 gcc=${GCC:-gcc-16}
-if "$gcc" --version 2>/dev/null | grep -q "16\.2"; then
+if "$gcc" --version 2>/dev/null | grep -c "16\.2" >/dev/null; then
     printf 'double dmin2(double x, double y) { return __builtin_fmin(x, y); }\n' > "$tmp/o.c"
     o=$("$gcc" -O2 -S "$tmp/o.c" -o - | sed -n "/^dmin2:/,/^\.size/p" | sed '/^\.size/q')
     if ! grep -q 'jmp.*fmin' <<<"$o"; then
@@ -167,5 +167,260 @@ if "$gcc" --version 2>/dev/null | grep -q "16\.2"; then
 else
     echo "SKIP: gcc-16.2 oracle not on PATH (shape parity leg)"
 fi
+
+# --- Adversarial per-site and ABI contracts ---------------------------------
+# The positive cases above are deliberately simple.  These cases exercise the
+# states that a block-wide hint or a partial ABI classifier misses: two void
+# IR calls at different instruction indices, constants in the two aligned
+# stack-argument classes, returns-twice callees, both retpoline modes, and
+# outgoing YMM/ZMM arguments with dirty upper lanes.
+cat > "$tmp/instrumented.c" <<'C'
+void __cyg_profile_func_enter(void *this_fn, void *call_site);
+void __cyg_profile_func_exit(void *this_fn, void *call_site);
+void observed(void) {}
+C
+"$CCC" -O2 -finstrument-functions -S "$tmp/instrumented.c" -o "$tmp/instrumented.s"
+b=$(body "$tmp/instrumented.s" observed)
+has "$b" 'call __cyg_profile_func_enter@PLT' || {
+    echo "instrumented per-site identity: entry hook was suppressed or moved" >&2
+    echo "$b" >&2
+    exit 1
+}
+has "$b" 'jmp __cyg_profile_func_exit@PLT' || {
+    echo "instrumented per-site identity: final exit hook was not the tail site" >&2
+    echo "$b" >&2
+    exit 1
+}
+lacks "$b" 'jmp __cyg_profile_func_enter@PLT' || {
+    echo "instrumented per-site identity: entry hook aliases the final void site" >&2
+    exit 1
+}
+lacks "$b" 'call __cyg_profile_func_exit@PLT' || {
+    echo "instrumented per-site identity: exit hook emitted twice" >&2
+    exit 1
+}
+
+cat > "$tmp/abi.c" <<'C'
+typedef __int128 i128;
+typedef float V32 __attribute__((vector_size(32)));
+typedef float V64 __attribute__((vector_size(64)));
+
+long double ld_target(long double x);
+long double ld_const_fwd(void) { return ld_target(1.25L); }
+i128 i128_target(long a, long b, long c, long d, long e, i128 x);
+i128 i128_const_fwd(void) { return i128_target(1, 2, 3, 4, 5, 6); }
+int _setjmp(void *env);
+int returns_twice_fwd(void *env) { return _setjmp(env); }
+
+typedef int (*fp6)(int, int, int, int, int, int);
+int indirect(fp6 f, int a, int b, int c, int d, int e, int f6) {
+    return f(a, b, c, d, e, f6);
+}
+
+V32 global32, global32_out;
+V64 global64, global64_out;
+long avx32_target(V32 x);
+long avx64_target(V64 x);
+long avx32_dirty_global_fwd(void) {
+    global32_out = global32 + global32;
+    return avx32_target(global32);
+}
+long avx64_dirty_global_fwd(void) {
+    global64_out = global64 + global64;
+    return avx64_target(global64);
+}
+C
+"$CCC" -O2 -S "$tmp/abi.c" -o "$tmp/abi.s"
+for fn_target in 'ld_const_fwd ld_target' 'i128_const_fwd i128_target' \
+                 'returns_twice_fwd _setjmp'; do
+    set -- $fn_target
+    fn=$1
+    target=$2
+    b=$(body "$tmp/abi.s" "$fn")
+    has "$b" "call $target@PLT" || {
+        echo "$fn: $target must remain an ordinary call" >&2
+        echo "$b" >&2
+        exit 1
+    }
+    has "$b" '^[[:space:]]*ret$' || {
+        echo "$fn: ordinary-call refusal lost its return" >&2
+        exit 1
+    }
+    lacks "$b" "jmp $target@PLT" || {
+        echo "$fn: unsafe sibling conversion" >&2
+        exit 1
+    }
+done
+
+for mode in thunk-extern thunk-inline; do
+    "$CCC" -O2 "-mindirect-branch=$mode" -S "$tmp/abi.c" -o "$tmp/$mode.s"
+    b=$(body "$tmp/$mode.s" indirect)
+    lacks "$b" 'jmp \*%r10' || {
+        echo "$mode: sibling call bypassed the indirect-branch thunk" >&2
+        exit 1
+    }
+    if [ "$mode" = thunk-extern ]; then
+        has "$b" 'jmp __x86_indirect_thunk_r10' || {
+            echo "$mode: missing external tail thunk" >&2
+            echo "$b" >&2
+            exit 1
+        }
+    else
+        has "$b" 'call \.Lrpl_set_' || {
+            echo "$mode: missing inline tail-retpoline sequence" >&2
+            echo "$b" >&2
+            exit 1
+        }
+        has "$b" 'movq %r10, (%rsp)' || {
+            echo "$mode: inline sequence does not dispatch through r10" >&2
+            exit 1
+        }
+    fi
+done
+
+for width in 32 64; do
+    isa=-mavx2
+    [ "$width" = 64 ] && isa=-mavx512f
+    "$CCC" -O2 "$isa" -S "$tmp/abi.c" -o "$tmp/abi$width.s"
+    b=$(body "$tmp/abi$width.s" "avx${width}_dirty_global_fwd")
+    has "$b" "jmp avx${width}_target@PLT" || {
+        echo "avx$width: expected a safe register-only sibling call" >&2
+        echo "$b" >&2
+        exit 1
+    }
+    lacks "$b" 'vzeroupper' || {
+        echo "avx$width: epilogue zeroes live outgoing upper vector lanes" >&2
+        exit 1
+    }
+done
+
+# --- Runtime witnesses for every repaired ABI class -------------------------
+cat > "$tmp/abi_runtime.c" <<'C'
+#include <stdio.h>
+typedef __int128 i128;
+typedef float V32 __attribute__((vector_size(32)));
+typedef float V64 __attribute__((vector_size(64)));
+
+__attribute__((noinline)) long double ld_target(long double x) { return x + 2.5L; }
+long double ld_const_fwd(void) { return ld_target(1.25L); }
+__attribute__((noinline)) i128 i128_target(long a, long b, long c, long d, long e, i128 x) {
+    return a + b + c + d + e + x;
+}
+i128 i128_const_fwd(void) { return i128_target(1, 2, 3, 4, 5, 6); }
+
+V32 global32, global32_out;
+__attribute__((noinline)) long avx32_target(V32 x) {
+    long mask = 0;
+    for (int i = 0; i < 8; ++i) if (x[i] == global32[i]) mask |= 1L << i;
+    return mask;
+}
+long avx32_dirty_global_fwd(void) {
+    global32_out = global32 + global32;
+    return avx32_target(global32);
+}
+#ifdef RUN64
+V64 global64, global64_out;
+__attribute__((noinline)) long avx64_target(V64 x) {
+    long mask = 0;
+    for (int i = 0; i < 16; ++i) if (x[i] == global64[i]) mask |= 1L << i;
+    return mask;
+}
+long avx64_dirty_global_fwd(void) {
+    global64_out = global64 + global64;
+    return avx64_target(global64);
+}
+#endif
+
+int main(void) {
+    unsigned long long ld_ok = ld_const_fwd() == 3.75L;
+    unsigned long long i128_bits = (unsigned long long)i128_const_fwd();
+    for (int i = 0; i < 8; ++i) global32[i] = (float)(i + 1);
+    long mask32 = avx32_dirty_global_fwd();
+#ifdef RUN64
+    for (int i = 0; i < 16; ++i) global64[i] = (float)(i + 1);
+    long mask64 = avx64_dirty_global_fwd();
+#else
+    long mask64 = 0xffff;
+#endif
+    printf("%llu %llu %lx %lx\n", ld_ok, i128_bits, mask32, mask64);
+    return !(ld_ok == 1 && i128_bits == 21 && mask32 == 0xff && mask64 == 0xffff);
+}
+C
+for width in 32 64; do
+    isa=-mavx2
+    extra=()
+    if [ "$width" = 64 ]; then
+        isa=-mavx512f
+        extra=(-DRUN64)
+        grep -qw avx512f /proc/cpuinfo 2>/dev/null || {
+            echo "note: avx512f runtime leg skipped (host CPU lacks AVX-512F)"
+            continue
+        }
+    fi
+    "$CCC" -O2 "$isa" "${extra[@]}" "$tmp/abi_runtime.c" -o "$tmp/abi${width}_on"
+    CCC_NO_SIBCALL=1 "$CCC" -O2 "$isa" "${extra[@]}" "$tmp/abi_runtime.c" -o "$tmp/abi${width}_off"
+    on=$(timeout 10 "$tmp/abi${width}_on") || {
+        echo "avx$width runtime failed with sibling calls enabled" >&2
+        exit 1
+    }
+    off=$(timeout 10 "$tmp/abi${width}_off") || {
+        echo "avx$width runtime failed with sibling calls disabled" >&2
+        exit 1
+    }
+    [ "$on" = "$off" ] && [ "$on" = '1 21 ff ffff' ] || {
+        echo "avx$width runtime mismatch: on='$on' off='$off' (want '1 21 ff ffff')" >&2
+        exit 1
+    }
+    echo "PASS: avx$width sibling-call runtime and aligned stack arguments"
+done
+
+cat > "$tmp/instrumented_runtime.c" <<'C'
+#include <stdio.h>
+static int events[2];
+static int count;
+__attribute__((no_instrument_function)) void __cyg_profile_func_enter(void *a, void *b) {
+    (void)a; (void)b; events[count++] = 1;
+}
+__attribute__((no_instrument_function)) void __cyg_profile_func_exit(void *a, void *b) {
+    (void)a; (void)b; events[count++] = 2;
+}
+void observed(void) {}
+__attribute__((no_instrument_function)) int main(void) {
+    observed();
+    printf("%d%d\n", events[0], events[1]);
+    return !(count == 2 && events[0] == 1 && events[1] == 2);
+}
+C
+"$CCC" -O2 -finstrument-functions "$tmp/instrumented_runtime.c" -o "$tmp/instrumented_on"
+CCC_NO_SIBCALL=1 "$CCC" -O2 -finstrument-functions "$tmp/instrumented_runtime.c" -o "$tmp/instrumented_off"
+on=$("$tmp/instrumented_on")
+off=$("$tmp/instrumented_off")
+[ "$on" = "$off" ] && [ "$on" = 12 ] || {
+    echo "instrumented runtime order mismatch: on='$on' off='$off' (want '12')" >&2
+    exit 1
+}
+echo "PASS: per-instruction void-call identity and runtime hook order"
+
+# The shared driver computes hints on every target, but only x86-64 implements
+# conversion. Other backends must not grow a silent partial tail-call path.
+cat > "$tmp/cross.c" <<'C'
+extern int target(int);
+int forward(int x) { return target(x); }
+C
+bindir=$(dirname "$CCC")
+for target_cc in lccc-i686 lccc-arm lccc-riscv; do
+    [ -x "$bindir/$target_cc" ] || {
+        echo "missing cross-target compiler: $bindir/$target_cc" >&2
+        exit 1
+    }
+    "$bindir/$target_cc" -O2 -S "$tmp/cross.c" -o "$tmp/$target_cc.on.s"
+    CCC_NO_SIBCALL=1 "$bindir/$target_cc" -O2 -S "$tmp/cross.c" -o "$tmp/$target_cc.off.s"
+    cmp -s "$tmp/$target_cc.on.s" "$tmp/$target_cc.off.s" || {
+        echo "$target_cc: unsupported sibling-call path changed target assembly" >&2
+        diff -u "$tmp/$target_cc.off.s" "$tmp/$target_cc.on.s" >&2
+        exit 1
+    }
+    echo "PASS: $target_cc leaves sibling-call lowering disabled"
+done
 
 echo "sibcall-shapes gate OK"

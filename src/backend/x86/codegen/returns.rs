@@ -19,12 +19,17 @@ impl X86Codegen {
         // entry line is handed over byte-for-byte identical (zero stack
         // arguments, no dynamic alloca, no address-taken local: the §5b
         // guards the arming proved).
-        if let Some(SibcallPending::Ready(target)) = self.state.pending_sibcall.take() {
-            // IS-20 discipline, same as `emit_epilogue_and_ret_impl`: a
-            // function that dirtied upper YMM halves must clean them before
-            // leaving the frame, or every legacy-SSE instruction in the
-            // caller pays the AVX-SSE transition penalty.
-            if self.state.dirty_upper_ymm {
+        if let Some(SibcallPending::Ready {
+            target,
+            preserve_upper_vector_lanes,
+        }) = self.state.pending_sibcall.take()
+        {
+            // IS-20 discipline, same as `emit_epilogue_and_ret_impl`: clean
+            // dirty upper lanes before an ordinary tail callee. A YMM/ZMM
+            // argument is the exception: vzeroupper would destroy the value
+            // being handed over. Such a callee uses the AVX ABI and owns the
+            // eventual cleanup before it returns to our caller.
+            if self.state.dirty_upper_ymm && !preserve_upper_vector_lanes {
                 self.state.emit("    vzeroupper");
             }
             self.emit_epilogue_impl(frame_size);
@@ -37,10 +42,19 @@ impl X86Codegen {
                     self.state.out.emit_jmp_label(&name);
                 }
                 SibcallTarget::RipSlot(cell) => {
-                    self.state.emit_fmt(format_args!("    jmp *{}(%rip)", cell));
+                    if self.state.indirect_branch_thunk || self.state.indirect_branch_thunk_inline {
+                        // A memory-indirect target needs the same Spectre-v2
+                        // protection as a register-indirect one. Load after
+                        // the epilogue so no frame addressing is involved.
+                        self.state
+                            .emit_fmt(format_args!("    movq {}(%rip), %r10", cell));
+                        self.emit_retpoline_jump("r10");
+                    } else {
+                        self.state.emit_fmt(format_args!("    jmp *{}(%rip)", cell));
+                    }
                 }
                 SibcallTarget::Reg(reg) => {
-                    self.state.emit_fmt(format_args!("    jmp *%{}", reg));
+                    self.emit_retpoline_jump(reg);
                 }
             }
             return;
