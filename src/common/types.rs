@@ -2750,7 +2750,12 @@ impl CType {
                 elem.is_integer() || matches!(**elem, CType::Float | CType::Double)
             }
             CType::ExtVector(elem, layout) => {
-                !layout.bitpacked_bool
+                // One XMM can *hold* an 8-byte vector too, so
+                // `ext_vector_xmm_pieces() == Some(1)` alone is not the
+                // 16-byte class: require the type to actually occupy 16
+                // bytes (u8x8/u16x4/u32x2 stay the ordinary aggregate path).
+                self.size() == 16
+                    && !layout.bitpacked_bool
                     && (elem.is_integer() || matches!(**elem, CType::Float | CType::Double))
                     && self.ext_vector_xmm_pieces() == Some(1)
             }

@@ -705,14 +705,8 @@ impl Preprocessor {
     /// i386).
     pub fn set_sse_macros(&mut self, sse_on: bool, sse2_on: bool, mmx_on: bool) {
         let is_x86_64 = self.macros.is_defined("__x86_64__");
-        apply_sse_macro_levels(
-            &mut self.macros,
-            is_x86_64,
-            sse_on,
-            sse2_on,
-            mmx_on,
-        );
 
+        apply_sse_macro_levels(&mut self.macros, is_x86_64, sse_on, sse2_on, mmx_on);
     }
 
     /// Define extended SIMD feature macros (__SSE3__, __AVX__, __AVX2__, etc.)
@@ -1460,12 +1454,12 @@ mod sse_macro_tests {
     #[test]
     fn sse_macros_follow_granular_levels() {
         for (sse, sse2, mmx) in [
-            (true, true, true),   // -m32 baseline (-march=x86-64 default)
-            (true, false, true),  // -m32 -mno-sse2
-            (false, false, true), // -m32 -mno-sse
-            (false, false, false),// -m32 -march=i686 (and -mgeneral-regs-only)
-            (true, false, true),  // -m32 -march=i686 -msse: SSE revives, MMX with it
-            (true, true, false),  // -m32 -march=i686 -msse2: SSE+MMX revive with SSE2
+            (true, true, true),    // -m32 baseline (-march=x86-64 default)
+            (true, false, true),   // -m32 -mno-sse2
+            (false, false, true),  // -m32 -mno-sse
+            (false, false, false), // -m32 -march=i686 (and -mgeneral-regs-only)
+            (true, false, true),   // -m32 -march=i686 -msse: SSE revives, MMX with it
+            (true, true, false),   // -m32 -march=i686 -msse2: SSE+MMX revive with SSE2
         ] {
             let mut macros = i386_table();
             apply_sse_macro_levels(&mut macros, false, sse, sse2, mmx);

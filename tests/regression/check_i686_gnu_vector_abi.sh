@@ -46,16 +46,16 @@ linker=${LCCC_LD:-$(dirname "$ccc")/lccc-ld}
 # the oracle binutils 2.47 tree if present.
 if [[ -n ${LCCC_TEST_ASSEMBLER:-} ]]; then
     assembler=$LCCC_TEST_ASSEMBLER
-elif [[ $(as --version 2>/dev/null | head -n1) == *'2.47'* ]]; then
+elif [[ $(as --version 2>/dev/null | sed -n 1p) == *'2.47'* ]]; then
     assembler=as
 elif [[ -x /home/user/oracle/binutils-2.47/bin/as ]]; then
     assembler=/home/user/oracle/binutils-2.47/bin/as
 else
     assembler=as
 fi
-[[ "$("$assembler" --version)" == *'2.47'* ]] || {
-    echo "FAIL: this gate requires GNU as 2.47 (got: $("$assembler" --version 2>&1 | head -n1)); set LCCC_TEST_ASSEMBLER" >&2; exit 1;
 
+[[ "$("$assembler" --version | sed -n 1p)" == *'2.47'* ]] || {
+    echo "FAIL: this gate requires GNU as 2.47 (got: $("$assembler" --version 2>&1 | sed -n 1p)); set LCCC_TEST_ASSEMBLER" >&2; exit 1;
 }
 as_dir=$(dirname "$(command -v "$assembler")")
 tmp=$(mktemp -d)
