@@ -2049,18 +2049,14 @@ impl I686Codegen {
     pub(super) fn emit_call_f128_sse_stack_arg(&mut self, arg: &Operand, stack_offset: usize) {
         match arg {
             Operand::Value(v) => {
-                let Some(slot) = self.state.get_slot(v.0) else {
-                    panic!(
-                        "internal error: 16-byte SSE scalar v{} has no stack slot",
-                        v.0
-                    );
-                };
+                let slot = crate::backend::call_abi::require_f128_sse_value_slot(
+                    self.state.get_slot(v.0),
+                    v.0,
+                );
                 self.emit_copy_slot_to_stack(slot, stack_offset, 16);
             }
             Operand::Const(c) => {
-                let bits = crate::backend::call_abi::f128_sse_const_bits(*c).unwrap_or_else(|| {
-                    panic!("internal error: {c:?} is not a 16-byte SSE scalar constant")
-                });
+                let bits = crate::backend::call_abi::f128_sse_const_image(*c);
                 for word in 0usize..4 {
                     let dword = (bits >> (word * 32)) as u32 as i32;
                     emit!(
