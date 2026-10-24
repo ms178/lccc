@@ -15,7 +15,11 @@ source files and full bookmark review ledger are workspace artifacts under
 Extraction and indexing are not semantic review. Thirteen instruction sections
 have partial, explicitly scoped reviews; other bookmark entries are unreviewed.
 
-The shift review concerns only register-only, unmasked 128/256-bit forms:
+The shift review concerns register-only, unmasked 128/256/512-bit forms. The
+128-bit matcher additionally recognizes the exact shuffle/unpack splats below;
+256/512-bit coverage is limited to the reviewed broadcast shapes. Word shifts
+remain excluded by the executed count-semantics counterexample recorded in the
+follow-up journal.
 
 | PDF page, one-based | Section | Relevant invariant |
 | --- | --- | --- |
@@ -47,13 +51,14 @@ zeroing. The existing vector-copy disable control also disables this rule.
 For the real C expression `return a << n` with a 256-bit unsigned vector,
 the current compiler emits `vmovd; vpslld; ret`, replacing the previous
 five-instruction sequence. This is instruction-count evidence, not a universal
-runtime-speedup claim. The continued review recognizes the 128-bit low-dword shuffle and
-low-qword self-unpack splats as well; the measurements below supersede the
-initial absence of a 128-bit C improvement.
+runtime-speedup claim. The continued review recognizes 128-bit low-dword
+shuffle and low-qword self-unpack splats as well; the measurements below
+supersede the initial absence of a 128-bit C improvement.
 
 The native integer-model fixture compares original and rewritten assembly
 on boundary counts, high-bit counts, and randomized valid/excessive counts,
-without C out-of-range or signed-shift assumptions (163,840 vector cases).
+without C out-of-range or signed-shift assumptions (163,840 AVX2 cases;
+245,760 cases when the host also executes the ZMM extension).
 The checked-in differential sources compare actual compiler output against
 GCC 16.2.0 and Clang 23.1.3 for every valid count and randomized data across
 ten operations (448,000 calls). Compile `differential.c` three times with
@@ -138,7 +143,7 @@ Additional scoped manual references (PDF page numbers, not printed pagination):
    unpack input is not a uniform scalar splat and is rejected.
 
 The native integer-model test now uses 128-bit shuffle/unpack splats and
-256-bit broadcasts. Separate structural tests cover legacy unpack spelling,
+256/512-bit broadcasts. Separate structural tests cover legacy unpack spelling,
 wrong shuffle selectors, wrong input banks, and mismatched count provenance.
 The same existing pass-disable control applies; no new tuning knob is added.
 
