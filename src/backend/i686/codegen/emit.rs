@@ -4843,7 +4843,10 @@ mod tests {
         cg.apply_options(&opts);
         assert!(cg.sse_enabled);
         let default_lines = copy_lines_with(&opts, 32);
-        assert!(default_lines[0].contains("xmm"), "default TU must copy via SSE");
+        assert!(
+            default_lines[0].contains("xmm"),
+            "default TU must copy via SSE"
+        );
         opts.no_sse = true;
         cg.apply_options(&opts);
         assert!(!cg.sse_enabled);
@@ -4863,7 +4866,12 @@ mod tests {
     fn copy_lines_with(opts: &crate::backend::CodegenOptions, size: usize) -> Vec<String> {
         let mut cg = I686Codegen::new();
         cg.apply_options(opts);
-        cg.emit_copy_bytes(CopySrc::Ecx, CopyDst::OutgoingArea(8), CopyScratch::Eax, size);
+        cg.emit_copy_bytes(
+            CopySrc::Ecx,
+            CopyDst::OutgoingArea(8),
+            CopyScratch::Eax,
+            size,
+        );
         cg.state
             .out
             .buf
@@ -4886,7 +4894,10 @@ mod tests {
     /// and never a chunk that would cross `size`).
     #[test]
     fn sse_copy_is_chunks_plus_one_overlapping_tail() {
-        assert_eq!(copy_lines(16, true), vec!["movups 0(%ecx), %xmm0", "movups %xmm0, 8(%esp)"]);
+        assert_eq!(
+            copy_lines(16, true),
+            vec!["movups 0(%ecx), %xmm0", "movups %xmm0, 8(%esp)"]
+        );
         assert_eq!(
             copy_lines(17, true),
             vec![
@@ -5011,7 +5022,12 @@ mod tests {
         let mut opts = crate::backend::CodegenOptions::default();
         opts.no_sse = true;
         cg.apply_options(&opts);
-        cg.emit_copy_bytes(CopySrc::Ecx, CopyDst::Register("%eax", 4), CopyScratch::Edx, 7);
+        cg.emit_copy_bytes(
+            CopySrc::Ecx,
+            CopyDst::Register("%eax", 4),
+            CopyScratch::Edx,
+            7,
+        );
         let lines: Vec<&str> = cg
             .state
             .out

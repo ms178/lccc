@@ -98,7 +98,12 @@ impl I686Codegen {
         // One copy policy for every by-value path: the source is the aligned
         // cursor in %ecx, the destination is the caller's buffer in %eax, and
         // %edx is the scalar scratch (this path may not touch %eax or %ecx).
-        self.emit_copy_bytes(CopySrc::Ecx, CopyDst::Register("%eax", 0), CopyScratch::Edx, size);
+        self.emit_copy_bytes(
+            CopySrc::Ecx,
+            CopyDst::Register("%eax", 0),
+            CopyScratch::Edx,
+            size,
+        );
 
         let advance = size.div_ceil(4) * 4;
         emit!(self.state, "    addl ${}, %ecx", advance);

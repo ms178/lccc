@@ -657,3 +657,16 @@ now pinned against the ISA widths by
 half-width moves now route through the two-row `encode_sse_rr_rm` helper
 (0F 12/13, 0F 16/17, and the 66-prefixed pair), locked byte-for-byte against
 GNU as 2.40 by `half_width_sse_store_encodings_match_gas_golden_bytes`.
+
+**Measurement note for the next contributor.** The four new tests are written
+to the *formatter's* shape as well as the compiler's, because a formatting diff
+is a merge blocker. rustfmt's default `fn_call_width = 60` — not `max_width =
+100` — decides whether a call wraps: `assert!(matches!(f(..), E::V))` stays on
+one line only while the argument text between the outermost parentheses is at
+most 60 columns, so a 96-column line whose *arguments* span 88 columns is
+still wrapped one-argument-per-line. The initial revision of these tests
+followed the 100-column rule and was rejected; the rule above is what the gate
+applies. `scripts/measure_i686_stack_copy.py` needs no Rust toolchain, so it
+runs in environments where the compiler cannot be built — the tests are the
+only place the emitted instruction stream is checked, and they are checked in
+CI, not locally.
