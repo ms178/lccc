@@ -13,7 +13,6 @@ v4u pick5(v4u a, v4u b, v4u c, v4u d, v4u e) {
     (void)a; (void)c; (void)d;
     return __builtin_shufflevector(b,e,0,5,2,7);
 }
-#ifndef LCCC_OMIT_VARIADIC_ABI_PROBE
 v4u pick_variadic(v4u a, ...) {
     __builtin_va_list ap;
     __builtin_va_start(ap,a);
@@ -21,4 +20,3 @@ v4u pick_variadic(v4u a, ...) {
     __builtin_va_end(ap);
     return __builtin_shufflevector(a,b,0,5,2,7);
 }
-#endif

@@ -420,23 +420,23 @@ claim derived from the SDM.
 `check_i686_gnu_vector_abi.sh` requires GCC 16.2.0, Clang 23.1.3 and GNU as
 2.47. It links freestanding ELF32 programs with lccc-ld, requiring no 32-bit
 libc headers/runtime. Across default, explicit SSE2, SSE-only, SSE2-denied,
-profile-denied, SSE-restored and no-SSE modes, it exercises 108 cross-TU
-configurations at O0/O2/O3/Os. Eighty-eight rows retain all 16,384 vector-ABI
-checks; twenty reduced-ISA Clang rows omit only Clang's self-inconsistent
-variadic case (14,336 checks), and every row retains all 18,432 typed-shuffle
-checks. Default and SSE2 run all 24 mixed-compiler rows. The other five modes
-run 12 same-ABI-family rows: LLVM 23.1.3's
-`X86CallingConv.td` passes only `v4f32` in XMM with SSE1 but no SSE2, whereas
-GCC/LCCC also use XMM for the tested integer/double vectors, and Clang's no-SSE
-vector return rule differs from GCC stack/sret. LLVM's `-sse` also disables
-dependent SSE2 without a reverse implication from a later `+sse`, so its
-SSE-restored row is SSE-only while GCC/LCCC restore SSE2. Its SSE-only
-Clang→Clang variadic row also failed with exit 8, so only that self-oracle case
-is omitted; LCCC/GCC variadic coverage is unchanged. Linking incompatible
-families is not a valid differential test; all compatible mixed rows and all
-same-family rows remain mandatory. Compile-time
-`__SSE__`/`__SSE2__`/`__SSE3__` checks and non-vacuous PSHUFD/XMM assembly
-ceilings cover states that a host runtime cannot observe.
+profile-denied, SSE-restored and no-SSE modes, it exercises **88 complete
+cross-TU configurations** at O0/O2/O3/Os, each retaining all 16,384 vector-ABI
+and 18,432 typed-shuffle checks. Default and SSE2 run all 24 mixed-compiler
+rows. The other five modes run eight GCC/LCCC-family rows; reduced-ISA Clang
+self-oracle rows are explicitly excluded because Clang 23.1.3 failed its own
+SSE-only `pick_variadic` probe with exit 8 and, after that probe was removed,
+its own `iddouble` probe with exit 4. These are recorded upstream-oracle
+incompatibilities, not LCCC passes or LCCC failures; no LCCC/GCC probe is
+omitted. LLVM 23.1.3's `X86CallingConv.td` passes only `v4f32` in XMM with
+SSE1 but no SSE2, whereas GCC/LCCC also use XMM for the tested integer/double
+vectors, and Clang's no-SSE vector return rule differs from GCC stack/sret.
+LLVM's `-sse` also disables dependent SSE2 without a reverse implication from
+a later `+sse`, so its SSE-restored row is SSE-only while GCC/LCCC restore
+SSE2. Linking incompatible families is not a valid differential test; all
+compatible mixed rows and all GCC/LCCC reduced-ISA rows remain mandatory.
+Compile-time `__SSE__`/`__SSE2__`/`__SSE3__` checks and non-vacuous PSHUFD/XMM
+assembly ceilings cover states that a host runtime cannot observe.
 Integer element widths 8/16/32/64, double bit patterns, indirect calls,
 register exhaustion, 16-byte stack alignment and variadic named/unnamed
 vectors are covered. The shared typed fixture keeps its original checks;

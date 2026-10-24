@@ -125,16 +125,20 @@ measured `lccc:clang`-never-fails pattern):
   to ABI-EXTVEC-LD-1 (`ldx1` is 16 bytes and cannot have been this defect)
   and are retired with it below.
 
-**ABI-GNUVEC-I386-1 — FIXED; hosted revalidation pending.** The 16-byte GNU
-vector case uses `%xmm0-2` for fixed arguments and `%xmm0` for returns, with
-direct/indirect and variadic calls covered by the freestanding GCC 16.2 /
-Clang 23.1.3 matrix. The 32/64-byte MEMORY cases now carry an explicit i386
-GNU-vector marker through caller/callee classification, align their stack
-slots naturally, dynamically realign the caller's `%esp`, and use one aligned
-`va_arg` cursor/copy. Ordinary over-aligned records and 16-byte vectors keep
-their measured four-byte layout. `check_gnu_vector_align_abi.sh` now requires
-all v16/v32/v64 LCCC/GCC pairings to exit zero; no divergence latch remains.
-The next hosted run is the executable acceptance check for this fix.
+**ABI-GNUVEC-I386-1 — implementation complete; hosted acceptance pending.**
+The 16-byte GNU vector case uses `%xmm0-2` for fixed arguments and `%xmm0` for
+returns, with direct/indirect and variadic calls covered by the freestanding
+GCC 16.2 / Clang 23.1.3 matrix. The 32/64-byte MEMORY cases now carry an
+explicit i386 GNU-vector marker through caller/callee classification, align
+their stack slots naturally, dynamically realign the caller's `%esp`, and use
+one aligned `va_arg` cursor/copy. Ordinary over-aligned records and 16-byte
+vectors keep their measured four-byte layout. `check_gnu_vector_align_abi.sh`
+now requires all v16/v32/v64 LCCC/GCC pairings to exit zero; no divergence
+latch remains. Run 40120508272 passed the first 56 rows, then exposed a
+second reduced-ISA Clang self-oracle incompatibility (SSE-only Clang→Clang
+exit 4 in `iddouble`, after the earlier exit 8 in `pick_variadic`). The matrix
+therefore excludes reduced-ISA Clang self-oracle rows explicitly and retains
+all probes in every LCCC/GCC row; a fresh full run remains required.
 
 ### ABI-EXTVEC-LD-1 — `long double` ext vectors by value, x86-64 (29 deterministic + 12 flaky) — **FIXED**
 
