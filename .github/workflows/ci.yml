@@ -2220,10 +2220,6 @@ jobs:
         key: ${{ runner.os }}-gas-2.47-${{ hashFiles('scripts/ensure_gas_247.sh') }}
     - name: Install GNU as 2.47 for x86-64 differential
       run: bash scripts/ensure_gas_247.sh x86_64-linux-gnu
-    - name: i686 GNU vector ABI and typed shuffles against GCC and Clang
-      run: |
-        PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
-          CCC=target/fastbuild/lccc bash tests/regression/check_i686_gnu_vector_abi.sh
     # The cross packages are unpacked with `dpkg -x`, so they are invisible
     # to the oracle bundle's package delta and every lane re-downloaded
     # them: run 39752334266 paid 331 s (assembler/linker), 165 s (contract
@@ -2281,6 +2277,7 @@ jobs:
         fast_contracts() {
         trap 'rc=$?; printf "::error title=Fast contract failed::%s (exit %s)\n" "$BASH_COMMAND" "$rc"; exit "$rc"' ERR
         bash tests/regression/check_i686_atomics.sh
+        env LCCC_TEST_ASSEMBLER="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin/as" bash tests/regression/check_i686_gnu_vector_abi.sh
         bash tests/regression/check_gvn_cross_block_mul_dot.sh
         bash tests/regression/check_volatile_access_semantics.sh
         python3 scripts/test_godbolt_cache.py

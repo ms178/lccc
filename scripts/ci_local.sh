@@ -738,6 +738,10 @@ gate "ivsr-reproducers" fast \
 gate "shuffle-diagnostics" fast \
     env CCC="$LCCC" bash tests/regression/check_shuffle_diagnostics.sh
 
+# GNU vector_size(16) XMM carriers, cross-TU with the pinned modern oracles.
+gate "i686-gnu-vector-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_i686_gnu_vector_abi.sh
+
 # Clang ext_vector_type component access against the Clang 23.1.3 oracle:
 # LCCC's diagnostics for ext_vector_select/errors.c equal Clang's (line,
 # column, message), LCCC accepts exactly the forms Clang accepts and puts the
