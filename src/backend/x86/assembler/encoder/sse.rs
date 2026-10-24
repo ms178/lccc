@@ -185,6 +185,8 @@ impl super::InstructionEncoder {
             return Err("SSE op+imm8 requires 3 operands".to_string());
         }
 
+        let use_mmx = crate::backend::x86::assembler::encoder::check_legacy_simd_imm8(ops, opcode)?;
+
         let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
 
         match (&ops[0], &ops[1], &ops[2]) {
@@ -195,7 +197,6 @@ impl super::InstructionEncoder {
             ) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let use_mmx = is_mmx(&src.name) || is_mmx(&dst.name);
                 if !use_mmx {
                     for &b in &opcode[..prefix_len] {
                         self.bytes.push(b);
@@ -213,7 +214,6 @@ impl super::InstructionEncoder {
                 Operand::Register(dst),
             ) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let use_mmx = is_mmx(&dst.name);
                 if !use_mmx {
                     for &b in &opcode[..prefix_len] {
                         self.bytes.push(b);
@@ -221,9 +221,7 @@ impl super::InstructionEncoder {
                 }
                 self.emit_rex_rm(0, if use_mmx { "" } else { dst.name.as_str() }, mem);
                 self.bytes.extend_from_slice(&opcode[prefix_len..]);
-                self.encode_modrm_mem(dst_num, mem)?;
-                self.bytes.push(*imm as u8);
-                Ok(())
+                self.encode_modrm_mem_imm8(dst_num, mem, *imm as u8)
             }
             _ => Err(format!("unsupported SSE op+imm8 operands: {:?}", ops)),
         }
@@ -1089,6 +1087,24 @@ impl super::InstructionEncoder {
             });
         }
         result
+    }
+
+    /// Emit an EVEX memory operand followed by imm8. RIP-relative displacement
+    /// relocations are based on the end of the whole instruction, not the end
+    /// of disp32. Keep the immediate and its relocation adjustment together so
+    /// new immediate-memory instruction families cannot omit the trailing byte.
+    pub(crate) fn encode_evex_mem_imm8(
+        &mut self,
+        reg_field: u8,
+        mem: &MemoryOperand,
+        scale_n: u32,
+        imm: u8,
+    ) -> Result<(), String> {
+        let reloc_start = self.relocations.len();
+        self.encode_evex_mem(reg_field, mem, scale_n)?;
+        self.adjust_rip_reloc_addend(reloc_start, 1);
+        self.bytes.push(imm);
+        Ok(())
     }
 
     fn encode_evex_mem_body(

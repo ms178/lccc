@@ -645,6 +645,16 @@ fn i686_memory_displacement(
         }
     };
 
+    // Decorated absolute operands can retain `symbol+constant` as a Symbol
+    // displacement. Normalize before GOT/TLS policy can discard an addend,
+    // and before the local address planner replaces a shared EVEX address.
+    // Difference expressions retain their separate resolver contract.
+    let (symbol, addend) = if diff_symbol.is_none() {
+        crate::backend::x86::assembler::parser::normalize_relocation_symbol_addend(symbol, addend)
+    } else {
+        (symbol, addend)
+    };
+
     (
         I686AddressValue::Relocatable,
         Some(I686PendingRelocation {
@@ -655,6 +665,30 @@ fn i686_memory_displacement(
             modifier,
         }),
     )
+}
+
+/// Retain the shared vector encoder's address bytes (including VSIB), but
+/// reconstruct its relocation using the i686 symbol/modifier/addend rules.
+/// The caller has excluded TLS protocol relocations for vector consumers.
+pub(super) fn i686_vector_memory_relocation(
+    displacement: &Displacement,
+    offset: usize,
+) -> Result<Relocation, String> {
+    let (_, pending) = i686_memory_displacement(displacement);
+    let mut pending = pending.ok_or("missing delegated memory relocation")?;
+    i686_validate_pending_relocation(&mut pending, false)?;
+    let modifier = pending
+        .modifier
+        .ok_or("missing delegated relocation modifier")?;
+    let reloc_type = i686_modifier_reloc(modifier)
+        .ok_or_else(|| format!("unsupported relocation modifier: @{modifier}"))?;
+    Ok(i686_make_relocation(
+        offset,
+        pending.symbol,
+        reloc_type,
+        pending.addend,
+        pending.diff_symbol,
+    ))
 }
 
 /// Validate the relocation-width contract before emitting any bytes.
@@ -1086,20 +1120,10 @@ impl super::InstructionEncoder {
         // undefined at link time and silently wrong at the byte level
         // (GAS resolves the constant at assembly time). Split the source
         // constant into the addend here so every encoding arm benefits.
-        let (symbol, addend) = if let Some((base, extra)) =
-            crate::backend::x86::assembler::parser::split_relocation_symbol_addend(symbol)
-        {
-            // Parsed source constants and architecture-supplied addends are
-            // both i64. Overflow is not a legal ELF addend; retaining the
-            // unsplit spelling lets the normal undefined-symbol path
-            // diagnose it rather than wrapping to a different address.
-            match addend.checked_add(extra) {
-                Some(sum) => (base, sum),
-                None => (symbol, addend),
-            }
-        } else {
-            (symbol, addend)
-        };
+        let (symbol, addend) =
+            crate::backend::x86::assembler::parser::normalize_relocation_symbol_addend(
+                symbol, addend,
+            );
         let relocation = i686_make_relocation(self.bytes.len(), symbol, reloc_type, addend, None);
         self.relocations.push(relocation);
     }

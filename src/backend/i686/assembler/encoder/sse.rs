@@ -98,9 +98,24 @@ impl super::InstructionEncoder {
             return Err("SSE op+imm8 requires 3 operands".to_string());
         }
 
+        // A bare symbol in this source position is absolute memory, not
+        // a branch target. Normalize only this operand, avoiding a cloned
+        // instruction/operand vector on the ordinary register-memory path.
+        let mut source;
+        let source = if matches!(ops[1], Operand::Label(_)) {
+            source = ops[1].clone();
+            normalize_bare_label(&mut source);
+            validate_i686_vector_memory_modifier(&source)?;
+            &source
+        } else {
+            &ops[1]
+        };
+
+        let use_mmx = crate::backend::x86::assembler::encoder::check_legacy_simd_imm8(ops, opcode)?;
+
         let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
 
-        match (&ops[0], &ops[1], &ops[2]) {
+        match (&ops[0], source, &ops[2]) {
             (
                 Operand::Immediate(ImmediateValue::Integer(imm)),
                 Operand::Register(src),
@@ -108,7 +123,6 @@ impl super::InstructionEncoder {
             ) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let use_mmx = is_mm(&src.name) || is_mm(&dst.name);
                 if !use_mmx {
                     self.bytes.extend_from_slice(&opcode[..prefix_len]);
                 }
@@ -123,7 +137,6 @@ impl super::InstructionEncoder {
                 Operand::Register(dst),
             ) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let use_mmx = is_mm(&dst.name);
                 if !use_mmx {
                     self.bytes.extend_from_slice(&opcode[..prefix_len]);
                 }

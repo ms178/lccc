@@ -8491,3 +8491,195 @@ mod packed_shift_audit_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod immediate_memory_relocation_tests {
+    use super::*;
+
+    // Every legacy immediate-memory mnemonic and representatives of all EVEX
+    // immediate-memory encoding families, including
+    // memory destinations, scalar tuples, broadcast tuples and AVX10.2.
+    const FAMILIES: &[&str] = &[
+        "vpshufd $3, MEM, %zmm1",
+        "vrndscaleps $3, MEM, %zmm1",
+        "vpslld $3, MEM, %xmm1",
+        "vpslld $3, MEM, %ymm1",
+        "vpslld $3, MEM, %zmm1",
+        "vshufps $3, MEM, %zmm1, %zmm2",
+        "vcmpps $3, MEM, %zmm1, %k2",
+        "vextracti32x4 $3, %zmm1, MEM",
+        "vprold $3, MEM, %zmm1",
+        "vmpsadbw $3, MEM, %zmm1, %zmm2",
+        "vfpclassps $3, MEM{1to16}, %k2",
+        "vfpclassss $3, MEM, %k2",
+        "vcvtps2ph $3, %zmm1, MEM",
+        "vpternlogd $3, MEM, %zmm1, %zmm2",
+        "vinsertf32x4 $3, MEM, %zmm1, %zmm2",
+        "palignr $3, MEM, %xmm1",
+        "pshufw $3, MEM, %mm1",
+        "pshufd $3, MEM, %xmm1",
+        "pshuflw $3, MEM, %xmm1",
+        "pshufhw $3, MEM, %xmm1",
+        "sha1rnds4 $3, MEM, %xmm1",
+        "aeskeygenassist $3, MEM, %xmm1",
+        "pclmulqdq $3, MEM, %xmm1",
+        "shufps $3, MEM, %xmm1",
+        "shufpd $3, MEM, %xmm1",
+        "roundsd $3, MEM, %xmm1",
+        "roundss $3, MEM, %xmm1",
+        "roundpd $3, MEM, %xmm1",
+        "roundps $3, MEM, %xmm1",
+        "pblendw $3, MEM, %xmm1",
+        "blendpd $3, MEM, %xmm1",
+        "blendps $3, MEM, %xmm1",
+        "dpps $3, MEM, %xmm1",
+        "dppd $3, MEM, %xmm1",
+        "insertps $3, MEM, %xmm1",
+        "mpsadbw $3, MEM, %xmm1",
+        "gf2p8affineqb $3, MEM, %xmm1",
+        "gf2p8affineinvqb $3, MEM, %xmm1",
+        "cmpsd $3, MEM, %xmm1",
+        "cmpss $3, MEM, %xmm1",
+        "cmppd $3, MEM, %xmm1",
+        "cmpps $3, MEM, %xmm1",
+        "palignr $3, MEM, %mm1",
+    ];
+
+    #[test]
+    fn immediate_memory_relocations_include_trailing_byte() {
+        let mut encoder = InstructionEncoder::new();
+        for family in FAMILIES {
+            for (memory, reloc_type, addend) in [
+                ("anchor(%rip)", R_X86_64_PC32, -5),
+                ("anchor+17(%rip)", R_X86_64_PC32, 12),
+                ("anchor-17(%rip)", R_X86_64_PC32, -22),
+                ("anchor@GOTPCREL(%rip)", R_X86_64_GOTPCREL, -5),
+                ("anchor@GOTPCREL+17(%rip)", R_X86_64_GOTPCREL, 12),
+                ("anchor+17", R_X86_64_32S, 17),
+            ] {
+                let line = family.replace("MEM", memory);
+                let before = encoder.relocations.len();
+                let previous: Vec<_> = encoder.relocations.iter().map(|r| r.addend).collect();
+                let mut instructions = 0;
+                for item in parse_asm(&line).unwrap() {
+                    if let AsmItem::Instruction(instr) = item {
+                        encoder
+                            .encode(&instr)
+                            .unwrap_or_else(|e| panic!("{line}: {e}"));
+                        instructions += 1;
+                    }
+                }
+                assert_eq!(instructions, 1, "{line}");
+                assert_eq!(encoder.relocations.len(), before + 1, "{line}");
+                let reloc = &encoder.relocations[before];
+                assert_eq!(reloc.symbol, "anchor", "{line}");
+                assert_eq!(reloc.reloc_type, reloc_type, "{line}");
+                assert_eq!(reloc.addend, addend, "{line}");
+                assert_eq!(encoder.bytes.last(), Some(&3), "{line}");
+                for (reloc, original) in encoder.relocations[..before].iter().zip(previous) {
+                    assert_eq!(
+                        reloc.addend, original,
+                        "previous relocation changed: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn i686_decorated_absolute_symbol_addends() {
+        for offset in [0, 17, -17] {
+            for (base, reloc_type) in [("", 1), ("(%eax)", 1), ("(%bx)", 20)] {
+                let line = format!("vfpclassps $3, anchor{offset:+}{base}{{1to16}}, %k2");
+                let mut encoder =
+                    crate::backend::i686::assembler::encoder::InstructionEncoder::new();
+                for item in parse_asm(&line).unwrap() {
+                    if let AsmItem::Instruction(instr) = item {
+                        encoder
+                            .encode(&instr)
+                            .unwrap_or_else(|e| panic!("{line}: {e}"));
+                    }
+                }
+                assert_eq!(encoder.relocations.len(), 1, "{line}");
+                let reloc = &encoder.relocations[0];
+                assert_eq!(reloc.symbol, "anchor", "{line}");
+                assert_eq!(reloc.reloc_type, reloc_type, "{line}");
+                assert_eq!(reloc.addend, offset, "{line}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod legacy_simd_immediate_shape_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_simd_immediate_register_files_and_field_boundaries() {
+        let source = include_str!(
+            "../../../../../engineering/evidence/instruction-audit-2026-10-24/legacy-immediate-mnemonics.txt"
+        );
+        assert_eq!(source.lines().count(), 27);
+        for mnemonic in source.lines() {
+            let min_imm = if matches!(
+                mnemonic,
+                "palignr"
+                    | "aeskeygenassist"
+                    | "roundsd"
+                    | "roundss"
+                    | "roundpd"
+                    | "roundps"
+                    | "insertps"
+                    | "gf2p8affineqb"
+                    | "gf2p8affineinvqb"
+                    | "cmpsd"
+                    | "cmpss"
+                    | "cmppd"
+                    | "cmpps"
+            ) {
+                0
+            } else {
+                -128
+            };
+            for src in [
+                "mm1", "xmm1", "ymm1", "zmm1", "eax", "ax", "al", "k1", "st(0)", "xmm16",
+            ] {
+                for dst in [
+                    "mm1", "xmm1", "ymm1", "zmm1", "eax", "ax", "al", "k1", "st(0)", "xmm16",
+                ] {
+                    let valid = match mnemonic {
+                        "pshufw" => src == "mm1" && dst == "mm1",
+                        "palignr" => (src == "mm1" || src == "xmm1") && src == dst,
+                        _ => src == "xmm1" && dst == "xmm1",
+                    };
+                    check_modes(&format!("{mnemonic} $3, %{src}, %{dst}"), valid);
+                }
+            }
+            let reg = if mnemonic == "pshufw" { "mm1" } else { "xmm1" };
+            for imm in [-129, -128, -1, 0, 1, 127, 128, 255, 256, i64::MAX, i64::MIN] {
+                check_modes(
+                    &format!("{mnemonic} ${imm}, %{reg}, %{reg}"),
+                    (min_imm..=255).contains(&imm),
+                );
+                check_modes(
+                    &format!("{mnemonic} ${imm}, (%eax), %{reg}"),
+                    (min_imm..=255).contains(&imm),
+                );
+            }
+        }
+    }
+
+    fn check_modes(line: &str, valid: bool) {
+        let mut x64 = InstructionEncoder::new();
+        let mut x32 = crate::backend::i686::assembler::encoder::InstructionEncoder::new();
+        let mut count = 0;
+        for item in parse_asm(line).unwrap() {
+            if let AsmItem::Instruction(instr) = item {
+                assert_eq!(x64.encode(&instr).is_ok(), valid, "x86-64: {line}");
+                assert_eq!(x32.encode(&instr).is_ok(), valid, "i686: {line}");
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1, "{line}");
+    }
+}

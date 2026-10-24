@@ -163,7 +163,7 @@ impl Lowerer {
                         // bundle type (I32/I64/I128) computed in the first pass.
                         // Do not collapse the three-register case back to I64.
                         if crate::common::types::target_is_32bit()
-                            && matches!(rc, CType::ExtVector(..))
+                            && rc.i686_ext_vector_ret_carrier().is_some()
                         {
                             return sig.return_type;
                         }

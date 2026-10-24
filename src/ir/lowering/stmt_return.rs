@@ -137,8 +137,9 @@ impl Lowerer {
     /// `struct_value_size` answers for the raw vector builtins
     /// authoritatively, and its two answers mean opposite things — `None` for
     /// a value that IS already the packed register pair (the
-    /// `__builtin_ia32_*` 128-bit family, `__builtin_shufflevector`), `Some(n)`
-    /// for a pointer to n bytes of data (`__builtin_shuffle` >8 bytes). Letting
+    /// `__builtin_ia32_*` 128-bit family), `Some(n)`
+    /// for a pointer to n bytes of data (`__builtin_shuffle` >8 bytes and
+    /// `__builtin_shufflevector`). Letting
     /// the signature override the `None` answer made the return path load the
     /// packed value as an aggregate, i.e. dereference the vector data as a
     /// pointer.

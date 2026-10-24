@@ -1,0 +1,1719 @@
+;;; i686-vector-mod-0
+.text
+vpbroadcastd anchor@GOT+0(%eax), %zmm1
+
+;;; i686-vector-mod-1
+.text
+vpbroadcastd anchor@GOT+0(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-2
+.text
+vpbroadcastd anchor@GOT+0, %zmm1
+
+;;; i686-vector-mod-3
+.text
+vpbroadcastd anchor@GOT+17(%eax), %zmm1
+
+;;; i686-vector-mod-4
+.text
+vpbroadcastd anchor@GOT+17(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-5
+.text
+vpbroadcastd anchor@GOT+17, %zmm1
+
+;;; i686-vector-mod-6
+.text
+vpbroadcastd anchor@GOT-17(%eax), %zmm1
+
+;;; i686-vector-mod-7
+.text
+vpbroadcastd anchor@GOT-17(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-8
+.text
+vpbroadcastd anchor@GOT-17, %zmm1
+
+;;; i686-vector-mod-9
+.text
+vpbroadcastd anchor@GOTOFF+0(%eax), %zmm1
+
+;;; i686-vector-mod-10
+.text
+vpbroadcastd anchor@GOTOFF+0(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-11
+.text
+vpbroadcastd anchor@GOTOFF+0, %zmm1
+
+;;; i686-vector-mod-12
+.text
+vpbroadcastd anchor@GOTOFF+17(%eax), %zmm1
+
+;;; i686-vector-mod-13
+.text
+vpbroadcastd anchor@GOTOFF+17(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-14
+.text
+vpbroadcastd anchor@GOTOFF+17, %zmm1
+
+;;; i686-vector-mod-15
+.text
+vpbroadcastd anchor@GOTOFF-17(%eax), %zmm1
+
+;;; i686-vector-mod-16
+.text
+vpbroadcastd anchor@GOTOFF-17(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-17
+.text
+vpbroadcastd anchor@GOTOFF-17, %zmm1
+
+;;; i686-vector-mod-18
+.text
+vpbroadcastd anchor@PLT+0(%eax), %zmm1
+
+;;; i686-vector-mod-19
+.text
+vpbroadcastd anchor@PLT+0(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-20
+.text
+vpbroadcastd anchor@PLT+0, %zmm1
+
+;;; i686-vector-mod-21
+.text
+vpbroadcastd anchor@PLT+17(%eax), %zmm1
+
+;;; i686-vector-mod-22
+.text
+vpbroadcastd anchor@PLT+17(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-23
+.text
+vpbroadcastd anchor@PLT+17, %zmm1
+
+;;; i686-vector-mod-24
+.text
+vpbroadcastd anchor@PLT-17(%eax), %zmm1
+
+;;; i686-vector-mod-25
+.text
+vpbroadcastd anchor@PLT-17(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-26
+.text
+vpbroadcastd anchor@PLT-17, %zmm1
+
+;;; i686-vector-mod-27
+.text
+vpbroadcastd anchor@NTPOFF+0(%eax), %zmm1
+
+;;; i686-vector-mod-28
+.text
+vpbroadcastd anchor@NTPOFF+0(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-29
+.text
+vpbroadcastd anchor@NTPOFF+0, %zmm1
+
+;;; i686-vector-mod-30
+.text
+vpbroadcastd anchor@NTPOFF+17(%eax), %zmm1
+
+;;; i686-vector-mod-31
+.text
+vpbroadcastd anchor@NTPOFF+17(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-32
+.text
+vpbroadcastd anchor@NTPOFF+17, %zmm1
+
+;;; i686-vector-mod-33
+.text
+vpbroadcastd anchor@NTPOFF-17(%eax), %zmm1
+
+;;; i686-vector-mod-34
+.text
+vpbroadcastd anchor@NTPOFF-17(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-35
+.text
+vpbroadcastd anchor@NTPOFF-17, %zmm1
+
+;;; i686-vector-mod-36
+.text
+vpbroadcastd anchor@TPOFF+0(%eax), %zmm1
+
+;;; i686-vector-mod-37
+.text
+vpbroadcastd anchor@TPOFF+0(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-38
+.text
+vpbroadcastd anchor@TPOFF+0, %zmm1
+
+;;; i686-vector-mod-39
+.text
+vpbroadcastd anchor@TPOFF+17(%eax), %zmm1
+
+;;; i686-vector-mod-40
+.text
+vpbroadcastd anchor@TPOFF+17(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-41
+.text
+vpbroadcastd anchor@TPOFF+17, %zmm1
+
+;;; i686-vector-mod-42
+.text
+vpbroadcastd anchor@TPOFF-17(%eax), %zmm1
+
+;;; i686-vector-mod-43
+.text
+vpbroadcastd anchor@TPOFF-17(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-44
+.text
+vpbroadcastd anchor@TPOFF-17, %zmm1
+
+;;; i686-vector-mod-45
+.text
+vpbroadcastd anchor@DTPOFF+0(%eax), %zmm1
+
+;;; i686-vector-mod-46
+.text
+vpbroadcastd anchor@DTPOFF+0(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-47
+.text
+vpbroadcastd anchor@DTPOFF+0, %zmm1
+
+;;; i686-vector-mod-48
+.text
+vpbroadcastd anchor@DTPOFF+17(%eax), %zmm1
+
+;;; i686-vector-mod-49
+.text
+vpbroadcastd anchor@DTPOFF+17(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-50
+.text
+vpbroadcastd anchor@DTPOFF+17, %zmm1
+
+;;; i686-vector-mod-51
+.text
+vpbroadcastd anchor@DTPOFF-17(%eax), %zmm1
+
+;;; i686-vector-mod-52
+.text
+vpbroadcastd anchor@DTPOFF-17(%eax,%ecx,4), %zmm1
+
+;;; i686-vector-mod-53
+.text
+vpbroadcastd anchor@DTPOFF-17, %zmm1
+
+;;; i686-vector-protocol-54 reject
+.text
+vpbroadcastd anchor@TLSGD(%eax), %zmm1
+
+;;; i686-vector-protocol-55 reject
+.text
+vpbroadcastd anchor@TLSGD, %zmm1
+
+;;; i686-vector-protocol-56 reject
+.text
+vpbroadcastd anchor@TLSLDM(%eax), %zmm1
+
+;;; i686-vector-protocol-57 reject
+.text
+vpbroadcastd anchor@TLSLDM, %zmm1
+
+;;; i686-vector-protocol-58 reject
+.text
+vpbroadcastd anchor@GOTNTPOFF(%eax), %zmm1
+
+;;; i686-vector-protocol-59 reject
+.text
+vpbroadcastd anchor@GOTNTPOFF, %zmm1
+
+;;; i686-vector-protocol-60 reject
+.text
+vpbroadcastd anchor@INDNTPOFF(%eax), %zmm1
+
+;;; i686-vector-protocol-61 reject
+.text
+vpbroadcastd anchor@INDNTPOFF, %zmm1
+
+;;; i686-vector-protocol-62 reject
+.text
+vpbroadcastd anchor@TLSDESC(%eax), %zmm1
+
+;;; i686-vector-protocol-63 reject
+.text
+vpbroadcastd anchor@TLSDESC, %zmm1
+
+;;; i686-vector-mod-64
+.text
+vpslld $3, anchor@GOT+0(%eax), %xmm1
+
+;;; i686-vector-mod-65
+.text
+vpslld $3, anchor@GOT+0(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-66
+.text
+vpslld $3, anchor@GOT+0, %xmm1
+
+;;; i686-vector-mod-67
+.text
+vpslld $3, anchor@GOT+17(%eax), %xmm1
+
+;;; i686-vector-mod-68
+.text
+vpslld $3, anchor@GOT+17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-69
+.text
+vpslld $3, anchor@GOT+17, %xmm1
+
+;;; i686-vector-mod-70
+.text
+vpslld $3, anchor@GOT-17(%eax), %xmm1
+
+;;; i686-vector-mod-71
+.text
+vpslld $3, anchor@GOT-17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-72
+.text
+vpslld $3, anchor@GOT-17, %xmm1
+
+;;; i686-vector-mod-73
+.text
+vpslld $3, anchor@GOTOFF+0(%eax), %xmm1
+
+;;; i686-vector-mod-74
+.text
+vpslld $3, anchor@GOTOFF+0(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-75
+.text
+vpslld $3, anchor@GOTOFF+0, %xmm1
+
+;;; i686-vector-mod-76
+.text
+vpslld $3, anchor@GOTOFF+17(%eax), %xmm1
+
+;;; i686-vector-mod-77
+.text
+vpslld $3, anchor@GOTOFF+17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-78
+.text
+vpslld $3, anchor@GOTOFF+17, %xmm1
+
+;;; i686-vector-mod-79
+.text
+vpslld $3, anchor@GOTOFF-17(%eax), %xmm1
+
+;;; i686-vector-mod-80
+.text
+vpslld $3, anchor@GOTOFF-17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-81
+.text
+vpslld $3, anchor@GOTOFF-17, %xmm1
+
+;;; i686-vector-mod-82
+.text
+vpslld $3, anchor@PLT+0(%eax), %xmm1
+
+;;; i686-vector-mod-83
+.text
+vpslld $3, anchor@PLT+0(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-84
+.text
+vpslld $3, anchor@PLT+0, %xmm1
+
+;;; i686-vector-mod-85
+.text
+vpslld $3, anchor@PLT+17(%eax), %xmm1
+
+;;; i686-vector-mod-86
+.text
+vpslld $3, anchor@PLT+17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-87
+.text
+vpslld $3, anchor@PLT+17, %xmm1
+
+;;; i686-vector-mod-88
+.text
+vpslld $3, anchor@PLT-17(%eax), %xmm1
+
+;;; i686-vector-mod-89
+.text
+vpslld $3, anchor@PLT-17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-90
+.text
+vpslld $3, anchor@PLT-17, %xmm1
+
+;;; i686-vector-mod-91
+.text
+vpslld $3, anchor@NTPOFF+0(%eax), %xmm1
+
+;;; i686-vector-mod-92
+.text
+vpslld $3, anchor@NTPOFF+0(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-93
+.text
+vpslld $3, anchor@NTPOFF+0, %xmm1
+
+;;; i686-vector-mod-94
+.text
+vpslld $3, anchor@NTPOFF+17(%eax), %xmm1
+
+;;; i686-vector-mod-95
+.text
+vpslld $3, anchor@NTPOFF+17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-96
+.text
+vpslld $3, anchor@NTPOFF+17, %xmm1
+
+;;; i686-vector-mod-97
+.text
+vpslld $3, anchor@NTPOFF-17(%eax), %xmm1
+
+;;; i686-vector-mod-98
+.text
+vpslld $3, anchor@NTPOFF-17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-99
+.text
+vpslld $3, anchor@NTPOFF-17, %xmm1
+
+;;; i686-vector-mod-100
+.text
+vpslld $3, anchor@TPOFF+0(%eax), %xmm1
+
+;;; i686-vector-mod-101
+.text
+vpslld $3, anchor@TPOFF+0(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-102
+.text
+vpslld $3, anchor@TPOFF+0, %xmm1
+
+;;; i686-vector-mod-103
+.text
+vpslld $3, anchor@TPOFF+17(%eax), %xmm1
+
+;;; i686-vector-mod-104
+.text
+vpslld $3, anchor@TPOFF+17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-105
+.text
+vpslld $3, anchor@TPOFF+17, %xmm1
+
+;;; i686-vector-mod-106
+.text
+vpslld $3, anchor@TPOFF-17(%eax), %xmm1
+
+;;; i686-vector-mod-107
+.text
+vpslld $3, anchor@TPOFF-17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-108
+.text
+vpslld $3, anchor@TPOFF-17, %xmm1
+
+;;; i686-vector-mod-109
+.text
+vpslld $3, anchor@DTPOFF+0(%eax), %xmm1
+
+;;; i686-vector-mod-110
+.text
+vpslld $3, anchor@DTPOFF+0(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-111
+.text
+vpslld $3, anchor@DTPOFF+0, %xmm1
+
+;;; i686-vector-mod-112
+.text
+vpslld $3, anchor@DTPOFF+17(%eax), %xmm1
+
+;;; i686-vector-mod-113
+.text
+vpslld $3, anchor@DTPOFF+17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-114
+.text
+vpslld $3, anchor@DTPOFF+17, %xmm1
+
+;;; i686-vector-mod-115
+.text
+vpslld $3, anchor@DTPOFF-17(%eax), %xmm1
+
+;;; i686-vector-mod-116
+.text
+vpslld $3, anchor@DTPOFF-17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-117
+.text
+vpslld $3, anchor@DTPOFF-17, %xmm1
+
+;;; i686-vector-protocol-118 reject
+.text
+vpslld $3, anchor@TLSGD(%eax), %xmm1
+
+;;; i686-vector-protocol-119 reject
+.text
+vpslld $3, anchor@TLSGD, %xmm1
+
+;;; i686-vector-protocol-120 reject
+.text
+vpslld $3, anchor@TLSLDM(%eax), %xmm1
+
+;;; i686-vector-protocol-121 reject
+.text
+vpslld $3, anchor@TLSLDM, %xmm1
+
+;;; i686-vector-protocol-122 reject
+.text
+vpslld $3, anchor@GOTNTPOFF(%eax), %xmm1
+
+;;; i686-vector-protocol-123 reject
+.text
+vpslld $3, anchor@GOTNTPOFF, %xmm1
+
+;;; i686-vector-protocol-124 reject
+.text
+vpslld $3, anchor@INDNTPOFF(%eax), %xmm1
+
+;;; i686-vector-protocol-125 reject
+.text
+vpslld $3, anchor@INDNTPOFF, %xmm1
+
+;;; i686-vector-protocol-126 reject
+.text
+vpslld $3, anchor@TLSDESC(%eax), %xmm1
+
+;;; i686-vector-protocol-127 reject
+.text
+vpslld $3, anchor@TLSDESC, %xmm1
+
+;;; i686-vector-mod-128
+.text
+vpshufd $3, anchor@GOT+0(%eax), %ymm1
+
+;;; i686-vector-mod-129
+.text
+vpshufd $3, anchor@GOT+0(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-130
+.text
+vpshufd $3, anchor@GOT+0, %ymm1
+
+;;; i686-vector-mod-131
+.text
+vpshufd $3, anchor@GOT+17(%eax), %ymm1
+
+;;; i686-vector-mod-132
+.text
+vpshufd $3, anchor@GOT+17(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-133
+.text
+vpshufd $3, anchor@GOT+17, %ymm1
+
+;;; i686-vector-mod-134
+.text
+vpshufd $3, anchor@GOT-17(%eax), %ymm1
+
+;;; i686-vector-mod-135
+.text
+vpshufd $3, anchor@GOT-17(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-136
+.text
+vpshufd $3, anchor@GOT-17, %ymm1
+
+;;; i686-vector-mod-137
+.text
+vpshufd $3, anchor@GOTOFF+0(%eax), %ymm1
+
+;;; i686-vector-mod-138
+.text
+vpshufd $3, anchor@GOTOFF+0(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-139
+.text
+vpshufd $3, anchor@GOTOFF+0, %ymm1
+
+;;; i686-vector-mod-140
+.text
+vpshufd $3, anchor@GOTOFF+17(%eax), %ymm1
+
+;;; i686-vector-mod-141
+.text
+vpshufd $3, anchor@GOTOFF+17(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-142
+.text
+vpshufd $3, anchor@GOTOFF+17, %ymm1
+
+;;; i686-vector-mod-143
+.text
+vpshufd $3, anchor@GOTOFF-17(%eax), %ymm1
+
+;;; i686-vector-mod-144
+.text
+vpshufd $3, anchor@GOTOFF-17(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-145
+.text
+vpshufd $3, anchor@GOTOFF-17, %ymm1
+
+;;; i686-vector-mod-146
+.text
+vpshufd $3, anchor@PLT+0(%eax), %ymm1
+
+;;; i686-vector-mod-147
+.text
+vpshufd $3, anchor@PLT+0(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-148
+.text
+vpshufd $3, anchor@PLT+0, %ymm1
+
+;;; i686-vector-mod-149
+.text
+vpshufd $3, anchor@PLT+17(%eax), %ymm1
+
+;;; i686-vector-mod-150
+.text
+vpshufd $3, anchor@PLT+17(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-151
+.text
+vpshufd $3, anchor@PLT+17, %ymm1
+
+;;; i686-vector-mod-152
+.text
+vpshufd $3, anchor@PLT-17(%eax), %ymm1
+
+;;; i686-vector-mod-153
+.text
+vpshufd $3, anchor@PLT-17(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-154
+.text
+vpshufd $3, anchor@PLT-17, %ymm1
+
+;;; i686-vector-mod-155
+.text
+vpshufd $3, anchor@NTPOFF+0(%eax), %ymm1
+
+;;; i686-vector-mod-156
+.text
+vpshufd $3, anchor@NTPOFF+0(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-157
+.text
+vpshufd $3, anchor@NTPOFF+0, %ymm1
+
+;;; i686-vector-mod-158
+.text
+vpshufd $3, anchor@NTPOFF+17(%eax), %ymm1
+
+;;; i686-vector-mod-159
+.text
+vpshufd $3, anchor@NTPOFF+17(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-160
+.text
+vpshufd $3, anchor@NTPOFF+17, %ymm1
+
+;;; i686-vector-mod-161
+.text
+vpshufd $3, anchor@NTPOFF-17(%eax), %ymm1
+
+;;; i686-vector-mod-162
+.text
+vpshufd $3, anchor@NTPOFF-17(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-163
+.text
+vpshufd $3, anchor@NTPOFF-17, %ymm1
+
+;;; i686-vector-mod-164
+.text
+vpshufd $3, anchor@TPOFF+0(%eax), %ymm1
+
+;;; i686-vector-mod-165
+.text
+vpshufd $3, anchor@TPOFF+0(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-166
+.text
+vpshufd $3, anchor@TPOFF+0, %ymm1
+
+;;; i686-vector-mod-167
+.text
+vpshufd $3, anchor@TPOFF+17(%eax), %ymm1
+
+;;; i686-vector-mod-168
+.text
+vpshufd $3, anchor@TPOFF+17(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-169
+.text
+vpshufd $3, anchor@TPOFF+17, %ymm1
+
+;;; i686-vector-mod-170
+.text
+vpshufd $3, anchor@TPOFF-17(%eax), %ymm1
+
+;;; i686-vector-mod-171
+.text
+vpshufd $3, anchor@TPOFF-17(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-172
+.text
+vpshufd $3, anchor@TPOFF-17, %ymm1
+
+;;; i686-vector-mod-173
+.text
+vpshufd $3, anchor@DTPOFF+0(%eax), %ymm1
+
+;;; i686-vector-mod-174
+.text
+vpshufd $3, anchor@DTPOFF+0(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-175
+.text
+vpshufd $3, anchor@DTPOFF+0, %ymm1
+
+;;; i686-vector-mod-176
+.text
+vpshufd $3, anchor@DTPOFF+17(%eax), %ymm1
+
+;;; i686-vector-mod-177
+.text
+vpshufd $3, anchor@DTPOFF+17(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-178
+.text
+vpshufd $3, anchor@DTPOFF+17, %ymm1
+
+;;; i686-vector-mod-179
+.text
+vpshufd $3, anchor@DTPOFF-17(%eax), %ymm1
+
+;;; i686-vector-mod-180
+.text
+vpshufd $3, anchor@DTPOFF-17(%eax,%ecx,4), %ymm1
+
+;;; i686-vector-mod-181
+.text
+vpshufd $3, anchor@DTPOFF-17, %ymm1
+
+;;; i686-vector-protocol-182 reject
+.text
+vpshufd $3, anchor@TLSGD(%eax), %ymm1
+
+;;; i686-vector-protocol-183 reject
+.text
+vpshufd $3, anchor@TLSGD, %ymm1
+
+;;; i686-vector-protocol-184 reject
+.text
+vpshufd $3, anchor@TLSLDM(%eax), %ymm1
+
+;;; i686-vector-protocol-185 reject
+.text
+vpshufd $3, anchor@TLSLDM, %ymm1
+
+;;; i686-vector-protocol-186 reject
+.text
+vpshufd $3, anchor@GOTNTPOFF(%eax), %ymm1
+
+;;; i686-vector-protocol-187 reject
+.text
+vpshufd $3, anchor@GOTNTPOFF, %ymm1
+
+;;; i686-vector-protocol-188 reject
+.text
+vpshufd $3, anchor@INDNTPOFF(%eax), %ymm1
+
+;;; i686-vector-protocol-189 reject
+.text
+vpshufd $3, anchor@INDNTPOFF, %ymm1
+
+;;; i686-vector-protocol-190 reject
+.text
+vpshufd $3, anchor@TLSDESC(%eax), %ymm1
+
+;;; i686-vector-protocol-191 reject
+.text
+vpshufd $3, anchor@TLSDESC, %ymm1
+
+;;; i686-vector-mod-192
+.text
+vextracti32x4 $1, %zmm1, anchor@GOT+0(%eax)
+
+;;; i686-vector-mod-193
+.text
+vextracti32x4 $1, %zmm1, anchor@GOT+0(%eax,%ecx,4)
+
+;;; i686-vector-mod-194
+.text
+vextracti32x4 $1, %zmm1, anchor@GOT+0
+
+;;; i686-vector-mod-195
+.text
+vextracti32x4 $1, %zmm1, anchor@GOT+17(%eax)
+
+;;; i686-vector-mod-196
+.text
+vextracti32x4 $1, %zmm1, anchor@GOT+17(%eax,%ecx,4)
+
+;;; i686-vector-mod-197
+.text
+vextracti32x4 $1, %zmm1, anchor@GOT+17
+
+;;; i686-vector-mod-198
+.text
+vextracti32x4 $1, %zmm1, anchor@GOT-17(%eax)
+
+;;; i686-vector-mod-199
+.text
+vextracti32x4 $1, %zmm1, anchor@GOT-17(%eax,%ecx,4)
+
+;;; i686-vector-mod-200
+.text
+vextracti32x4 $1, %zmm1, anchor@GOT-17
+
+;;; i686-vector-mod-201
+.text
+vextracti32x4 $1, %zmm1, anchor@GOTOFF+0(%eax)
+
+;;; i686-vector-mod-202
+.text
+vextracti32x4 $1, %zmm1, anchor@GOTOFF+0(%eax,%ecx,4)
+
+;;; i686-vector-mod-203
+.text
+vextracti32x4 $1, %zmm1, anchor@GOTOFF+0
+
+;;; i686-vector-mod-204
+.text
+vextracti32x4 $1, %zmm1, anchor@GOTOFF+17(%eax)
+
+;;; i686-vector-mod-205
+.text
+vextracti32x4 $1, %zmm1, anchor@GOTOFF+17(%eax,%ecx,4)
+
+;;; i686-vector-mod-206
+.text
+vextracti32x4 $1, %zmm1, anchor@GOTOFF+17
+
+;;; i686-vector-mod-207
+.text
+vextracti32x4 $1, %zmm1, anchor@GOTOFF-17(%eax)
+
+;;; i686-vector-mod-208
+.text
+vextracti32x4 $1, %zmm1, anchor@GOTOFF-17(%eax,%ecx,4)
+
+;;; i686-vector-mod-209
+.text
+vextracti32x4 $1, %zmm1, anchor@GOTOFF-17
+
+;;; i686-vector-mod-210
+.text
+vextracti32x4 $1, %zmm1, anchor@PLT+0(%eax)
+
+;;; i686-vector-mod-211
+.text
+vextracti32x4 $1, %zmm1, anchor@PLT+0(%eax,%ecx,4)
+
+;;; i686-vector-mod-212
+.text
+vextracti32x4 $1, %zmm1, anchor@PLT+0
+
+;;; i686-vector-mod-213
+.text
+vextracti32x4 $1, %zmm1, anchor@PLT+17(%eax)
+
+;;; i686-vector-mod-214
+.text
+vextracti32x4 $1, %zmm1, anchor@PLT+17(%eax,%ecx,4)
+
+;;; i686-vector-mod-215
+.text
+vextracti32x4 $1, %zmm1, anchor@PLT+17
+
+;;; i686-vector-mod-216
+.text
+vextracti32x4 $1, %zmm1, anchor@PLT-17(%eax)
+
+;;; i686-vector-mod-217
+.text
+vextracti32x4 $1, %zmm1, anchor@PLT-17(%eax,%ecx,4)
+
+;;; i686-vector-mod-218
+.text
+vextracti32x4 $1, %zmm1, anchor@PLT-17
+
+;;; i686-vector-mod-219
+.text
+vextracti32x4 $1, %zmm1, anchor@NTPOFF+0(%eax)
+
+;;; i686-vector-mod-220
+.text
+vextracti32x4 $1, %zmm1, anchor@NTPOFF+0(%eax,%ecx,4)
+
+;;; i686-vector-mod-221
+.text
+vextracti32x4 $1, %zmm1, anchor@NTPOFF+0
+
+;;; i686-vector-mod-222
+.text
+vextracti32x4 $1, %zmm1, anchor@NTPOFF+17(%eax)
+
+;;; i686-vector-mod-223
+.text
+vextracti32x4 $1, %zmm1, anchor@NTPOFF+17(%eax,%ecx,4)
+
+;;; i686-vector-mod-224
+.text
+vextracti32x4 $1, %zmm1, anchor@NTPOFF+17
+
+;;; i686-vector-mod-225
+.text
+vextracti32x4 $1, %zmm1, anchor@NTPOFF-17(%eax)
+
+;;; i686-vector-mod-226
+.text
+vextracti32x4 $1, %zmm1, anchor@NTPOFF-17(%eax,%ecx,4)
+
+;;; i686-vector-mod-227
+.text
+vextracti32x4 $1, %zmm1, anchor@NTPOFF-17
+
+;;; i686-vector-mod-228
+.text
+vextracti32x4 $1, %zmm1, anchor@TPOFF+0(%eax)
+
+;;; i686-vector-mod-229
+.text
+vextracti32x4 $1, %zmm1, anchor@TPOFF+0(%eax,%ecx,4)
+
+;;; i686-vector-mod-230
+.text
+vextracti32x4 $1, %zmm1, anchor@TPOFF+0
+
+;;; i686-vector-mod-231
+.text
+vextracti32x4 $1, %zmm1, anchor@TPOFF+17(%eax)
+
+;;; i686-vector-mod-232
+.text
+vextracti32x4 $1, %zmm1, anchor@TPOFF+17(%eax,%ecx,4)
+
+;;; i686-vector-mod-233
+.text
+vextracti32x4 $1, %zmm1, anchor@TPOFF+17
+
+;;; i686-vector-mod-234
+.text
+vextracti32x4 $1, %zmm1, anchor@TPOFF-17(%eax)
+
+;;; i686-vector-mod-235
+.text
+vextracti32x4 $1, %zmm1, anchor@TPOFF-17(%eax,%ecx,4)
+
+;;; i686-vector-mod-236
+.text
+vextracti32x4 $1, %zmm1, anchor@TPOFF-17
+
+;;; i686-vector-mod-237
+.text
+vextracti32x4 $1, %zmm1, anchor@DTPOFF+0(%eax)
+
+;;; i686-vector-mod-238
+.text
+vextracti32x4 $1, %zmm1, anchor@DTPOFF+0(%eax,%ecx,4)
+
+;;; i686-vector-mod-239
+.text
+vextracti32x4 $1, %zmm1, anchor@DTPOFF+0
+
+;;; i686-vector-mod-240
+.text
+vextracti32x4 $1, %zmm1, anchor@DTPOFF+17(%eax)
+
+;;; i686-vector-mod-241
+.text
+vextracti32x4 $1, %zmm1, anchor@DTPOFF+17(%eax,%ecx,4)
+
+;;; i686-vector-mod-242
+.text
+vextracti32x4 $1, %zmm1, anchor@DTPOFF+17
+
+;;; i686-vector-mod-243
+.text
+vextracti32x4 $1, %zmm1, anchor@DTPOFF-17(%eax)
+
+;;; i686-vector-mod-244
+.text
+vextracti32x4 $1, %zmm1, anchor@DTPOFF-17(%eax,%ecx,4)
+
+;;; i686-vector-mod-245
+.text
+vextracti32x4 $1, %zmm1, anchor@DTPOFF-17
+
+;;; i686-vector-protocol-246 reject
+.text
+vextracti32x4 $1, %zmm1, anchor@TLSGD(%eax)
+
+;;; i686-vector-protocol-247 reject
+.text
+vextracti32x4 $1, %zmm1, anchor@TLSGD
+
+;;; i686-vector-protocol-248 reject
+.text
+vextracti32x4 $1, %zmm1, anchor@TLSLDM(%eax)
+
+;;; i686-vector-protocol-249 reject
+.text
+vextracti32x4 $1, %zmm1, anchor@TLSLDM
+
+;;; i686-vector-protocol-250 reject
+.text
+vextracti32x4 $1, %zmm1, anchor@GOTNTPOFF(%eax)
+
+;;; i686-vector-protocol-251 reject
+.text
+vextracti32x4 $1, %zmm1, anchor@GOTNTPOFF
+
+;;; i686-vector-protocol-252 reject
+.text
+vextracti32x4 $1, %zmm1, anchor@INDNTPOFF(%eax)
+
+;;; i686-vector-protocol-253 reject
+.text
+vextracti32x4 $1, %zmm1, anchor@INDNTPOFF
+
+;;; i686-vector-protocol-254 reject
+.text
+vextracti32x4 $1, %zmm1, anchor@TLSDESC(%eax)
+
+;;; i686-vector-protocol-255 reject
+.text
+vextracti32x4 $1, %zmm1, anchor@TLSDESC
+
+;;; i686-vector-mod-256
+.text
+vpcmov anchor@GOT+0(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-257
+.text
+vpcmov anchor@GOT+0(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-258
+.text
+vpcmov anchor@GOT+0, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-259
+.text
+vpcmov anchor@GOT+17(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-260
+.text
+vpcmov anchor@GOT+17(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-261
+.text
+vpcmov anchor@GOT+17, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-262
+.text
+vpcmov anchor@GOT-17(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-263
+.text
+vpcmov anchor@GOT-17(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-264
+.text
+vpcmov anchor@GOT-17, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-265
+.text
+vpcmov anchor@GOTOFF+0(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-266
+.text
+vpcmov anchor@GOTOFF+0(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-267
+.text
+vpcmov anchor@GOTOFF+0, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-268
+.text
+vpcmov anchor@GOTOFF+17(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-269
+.text
+vpcmov anchor@GOTOFF+17(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-270
+.text
+vpcmov anchor@GOTOFF+17, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-271
+.text
+vpcmov anchor@GOTOFF-17(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-272
+.text
+vpcmov anchor@GOTOFF-17(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-273
+.text
+vpcmov anchor@GOTOFF-17, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-274
+.text
+vpcmov anchor@PLT+0(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-275
+.text
+vpcmov anchor@PLT+0(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-276
+.text
+vpcmov anchor@PLT+0, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-277
+.text
+vpcmov anchor@PLT+17(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-278
+.text
+vpcmov anchor@PLT+17(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-279
+.text
+vpcmov anchor@PLT+17, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-280
+.text
+vpcmov anchor@PLT-17(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-281
+.text
+vpcmov anchor@PLT-17(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-282
+.text
+vpcmov anchor@PLT-17, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-283
+.text
+vpcmov anchor@NTPOFF+0(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-284
+.text
+vpcmov anchor@NTPOFF+0(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-285
+.text
+vpcmov anchor@NTPOFF+0, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-286
+.text
+vpcmov anchor@NTPOFF+17(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-287
+.text
+vpcmov anchor@NTPOFF+17(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-288
+.text
+vpcmov anchor@NTPOFF+17, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-289
+.text
+vpcmov anchor@NTPOFF-17(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-290
+.text
+vpcmov anchor@NTPOFF-17(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-291
+.text
+vpcmov anchor@NTPOFF-17, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-292
+.text
+vpcmov anchor@TPOFF+0(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-293
+.text
+vpcmov anchor@TPOFF+0(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-294
+.text
+vpcmov anchor@TPOFF+0, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-295
+.text
+vpcmov anchor@TPOFF+17(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-296
+.text
+vpcmov anchor@TPOFF+17(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-297
+.text
+vpcmov anchor@TPOFF+17, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-298
+.text
+vpcmov anchor@TPOFF-17(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-299
+.text
+vpcmov anchor@TPOFF-17(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-300
+.text
+vpcmov anchor@TPOFF-17, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-301
+.text
+vpcmov anchor@DTPOFF+0(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-302
+.text
+vpcmov anchor@DTPOFF+0(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-303
+.text
+vpcmov anchor@DTPOFF+0, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-304
+.text
+vpcmov anchor@DTPOFF+17(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-305
+.text
+vpcmov anchor@DTPOFF+17(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-306
+.text
+vpcmov anchor@DTPOFF+17, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-307
+.text
+vpcmov anchor@DTPOFF-17(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-308
+.text
+vpcmov anchor@DTPOFF-17(%eax,%ecx,4), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-309
+.text
+vpcmov anchor@DTPOFF-17, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-protocol-310 reject
+.text
+vpcmov anchor@TLSGD(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-protocol-311 reject
+.text
+vpcmov anchor@TLSGD, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-protocol-312 reject
+.text
+vpcmov anchor@TLSLDM(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-protocol-313 reject
+.text
+vpcmov anchor@TLSLDM, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-protocol-314 reject
+.text
+vpcmov anchor@GOTNTPOFF(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-protocol-315 reject
+.text
+vpcmov anchor@GOTNTPOFF, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-protocol-316 reject
+.text
+vpcmov anchor@INDNTPOFF(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-protocol-317 reject
+.text
+vpcmov anchor@INDNTPOFF, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-protocol-318 reject
+.text
+vpcmov anchor@TLSDESC(%eax), %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-protocol-319 reject
+.text
+vpcmov anchor@TLSDESC, %xmm1, %xmm2, %xmm3
+
+;;; i686-vector-mod-320
+.text
+pshufd $3, anchor@GOT+0(%eax), %xmm1
+
+;;; i686-vector-mod-321
+.text
+pshufd $3, anchor@GOT+0(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-322
+.text
+pshufd $3, anchor@GOT+0, %xmm1
+
+;;; i686-vector-mod-323
+.text
+pshufd $3, anchor@GOT+17(%eax), %xmm1
+
+;;; i686-vector-mod-324
+.text
+pshufd $3, anchor@GOT+17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-325
+.text
+pshufd $3, anchor@GOT+17, %xmm1
+
+;;; i686-vector-mod-326
+.text
+pshufd $3, anchor@GOT-17(%eax), %xmm1
+
+;;; i686-vector-mod-327
+.text
+pshufd $3, anchor@GOT-17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-328
+.text
+pshufd $3, anchor@GOT-17, %xmm1
+
+;;; i686-vector-mod-329
+.text
+pshufd $3, anchor@GOTOFF+0(%eax), %xmm1
+
+;;; i686-vector-mod-330
+.text
+pshufd $3, anchor@GOTOFF+0(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-331
+.text
+pshufd $3, anchor@GOTOFF+0, %xmm1
+
+;;; i686-vector-mod-332
+.text
+pshufd $3, anchor@GOTOFF+17(%eax), %xmm1
+
+;;; i686-vector-mod-333
+.text
+pshufd $3, anchor@GOTOFF+17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-334
+.text
+pshufd $3, anchor@GOTOFF+17, %xmm1
+
+;;; i686-vector-mod-335
+.text
+pshufd $3, anchor@GOTOFF-17(%eax), %xmm1
+
+;;; i686-vector-mod-336
+.text
+pshufd $3, anchor@GOTOFF-17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-337
+.text
+pshufd $3, anchor@GOTOFF-17, %xmm1
+
+;;; i686-vector-mod-338
+.text
+pshufd $3, anchor@PLT+0(%eax), %xmm1
+
+;;; i686-vector-mod-339
+.text
+pshufd $3, anchor@PLT+0(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-340
+.text
+pshufd $3, anchor@PLT+0, %xmm1
+
+;;; i686-vector-mod-341
+.text
+pshufd $3, anchor@PLT+17(%eax), %xmm1
+
+;;; i686-vector-mod-342
+.text
+pshufd $3, anchor@PLT+17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-343
+.text
+pshufd $3, anchor@PLT+17, %xmm1
+
+;;; i686-vector-mod-344
+.text
+pshufd $3, anchor@PLT-17(%eax), %xmm1
+
+;;; i686-vector-mod-345
+.text
+pshufd $3, anchor@PLT-17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-346
+.text
+pshufd $3, anchor@PLT-17, %xmm1
+
+;;; i686-vector-mod-347
+.text
+pshufd $3, anchor@NTPOFF+0(%eax), %xmm1
+
+;;; i686-vector-mod-348
+.text
+pshufd $3, anchor@NTPOFF+0(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-349
+.text
+pshufd $3, anchor@NTPOFF+0, %xmm1
+
+;;; i686-vector-mod-350
+.text
+pshufd $3, anchor@NTPOFF+17(%eax), %xmm1
+
+;;; i686-vector-mod-351
+.text
+pshufd $3, anchor@NTPOFF+17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-352
+.text
+pshufd $3, anchor@NTPOFF+17, %xmm1
+
+;;; i686-vector-mod-353
+.text
+pshufd $3, anchor@NTPOFF-17(%eax), %xmm1
+
+;;; i686-vector-mod-354
+.text
+pshufd $3, anchor@NTPOFF-17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-355
+.text
+pshufd $3, anchor@NTPOFF-17, %xmm1
+
+;;; i686-vector-mod-356
+.text
+pshufd $3, anchor@TPOFF+0(%eax), %xmm1
+
+;;; i686-vector-mod-357
+.text
+pshufd $3, anchor@TPOFF+0(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-358
+.text
+pshufd $3, anchor@TPOFF+0, %xmm1
+
+;;; i686-vector-mod-359
+.text
+pshufd $3, anchor@TPOFF+17(%eax), %xmm1
+
+;;; i686-vector-mod-360
+.text
+pshufd $3, anchor@TPOFF+17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-361
+.text
+pshufd $3, anchor@TPOFF+17, %xmm1
+
+;;; i686-vector-mod-362
+.text
+pshufd $3, anchor@TPOFF-17(%eax), %xmm1
+
+;;; i686-vector-mod-363
+.text
+pshufd $3, anchor@TPOFF-17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-364
+.text
+pshufd $3, anchor@TPOFF-17, %xmm1
+
+;;; i686-vector-mod-365
+.text
+pshufd $3, anchor@DTPOFF+0(%eax), %xmm1
+
+;;; i686-vector-mod-366
+.text
+pshufd $3, anchor@DTPOFF+0(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-367
+.text
+pshufd $3, anchor@DTPOFF+0, %xmm1
+
+;;; i686-vector-mod-368
+.text
+pshufd $3, anchor@DTPOFF+17(%eax), %xmm1
+
+;;; i686-vector-mod-369
+.text
+pshufd $3, anchor@DTPOFF+17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-370
+.text
+pshufd $3, anchor@DTPOFF+17, %xmm1
+
+;;; i686-vector-mod-371
+.text
+pshufd $3, anchor@DTPOFF-17(%eax), %xmm1
+
+;;; i686-vector-mod-372
+.text
+pshufd $3, anchor@DTPOFF-17(%eax,%ecx,4), %xmm1
+
+;;; i686-vector-mod-373
+.text
+pshufd $3, anchor@DTPOFF-17, %xmm1
+
+;;; i686-vector-protocol-374 reject
+.text
+pshufd $3, anchor@TLSGD(%eax), %xmm1
+
+;;; i686-vector-protocol-375 reject
+.text
+pshufd $3, anchor@TLSGD, %xmm1
+
+;;; i686-vector-protocol-376 reject
+.text
+pshufd $3, anchor@TLSLDM(%eax), %xmm1
+
+;;; i686-vector-protocol-377 reject
+.text
+pshufd $3, anchor@TLSLDM, %xmm1
+
+;;; i686-vector-protocol-378 reject
+.text
+pshufd $3, anchor@GOTNTPOFF(%eax), %xmm1
+
+;;; i686-vector-protocol-379 reject
+.text
+pshufd $3, anchor@GOTNTPOFF, %xmm1
+
+;;; i686-vector-protocol-380 reject
+.text
+pshufd $3, anchor@INDNTPOFF(%eax), %xmm1
+
+;;; i686-vector-protocol-381 reject
+.text
+pshufd $3, anchor@INDNTPOFF, %xmm1
+
+;;; i686-vector-protocol-382 reject
+.text
+pshufd $3, anchor@TLSDESC(%eax), %xmm1
+
+;;; i686-vector-protocol-383 reject
+.text
+pshufd $3, anchor@TLSDESC, %xmm1
+
+;;; i686-vector-mod-384
+.text
+vgatherdps %xmm1, anchor@GOT+0(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-385
+.text
+vgatherdps %xmm1, anchor@GOT+17(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-386
+.text
+vgatherdps %xmm1, anchor@GOT-17(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-387
+.text
+vgatherdps %xmm1, anchor@GOTOFF+0(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-388
+.text
+vgatherdps %xmm1, anchor@GOTOFF+17(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-389
+.text
+vgatherdps %xmm1, anchor@GOTOFF-17(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-390
+.text
+vgatherdps %xmm1, anchor@PLT+0(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-391
+.text
+vgatherdps %xmm1, anchor@PLT+17(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-392
+.text
+vgatherdps %xmm1, anchor@PLT-17(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-393
+.text
+vgatherdps %xmm1, anchor@NTPOFF+0(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-394
+.text
+vgatherdps %xmm1, anchor@NTPOFF+17(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-395
+.text
+vgatherdps %xmm1, anchor@NTPOFF-17(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-396
+.text
+vgatherdps %xmm1, anchor@TPOFF+0(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-397
+.text
+vgatherdps %xmm1, anchor@TPOFF+17(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-398
+.text
+vgatherdps %xmm1, anchor@TPOFF-17(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-399
+.text
+vgatherdps %xmm1, anchor@DTPOFF+0(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-400
+.text
+vgatherdps %xmm1, anchor@DTPOFF+17(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-401
+.text
+vgatherdps %xmm1, anchor@DTPOFF-17(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-protocol-402 reject
+.text
+vgatherdps %xmm1, anchor@TLSGD(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-protocol-403 reject
+.text
+vgatherdps %xmm1, anchor@TLSLDM(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-protocol-404 reject
+.text
+vgatherdps %xmm1, anchor@GOTNTPOFF(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-protocol-405 reject
+.text
+vgatherdps %xmm1, anchor@INDNTPOFF(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-protocol-406 reject
+.text
+vgatherdps %xmm1, anchor@TLSDESC(%eax,%xmm2,4), %xmm3
+
+;;; i686-vector-mod-407
+.text
+vgatherdps anchor@GOT+0(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-408
+.text
+vgatherdps anchor@GOT+17(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-409
+.text
+vgatherdps anchor@GOT-17(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-410
+.text
+vgatherdps anchor@GOTOFF+0(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-411
+.text
+vgatherdps anchor@GOTOFF+17(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-412
+.text
+vgatherdps anchor@GOTOFF-17(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-413
+.text
+vgatherdps anchor@PLT+0(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-414
+.text
+vgatherdps anchor@PLT+17(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-415
+.text
+vgatherdps anchor@PLT-17(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-416
+.text
+vgatherdps anchor@NTPOFF+0(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-417
+.text
+vgatherdps anchor@NTPOFF+17(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-418
+.text
+vgatherdps anchor@NTPOFF-17(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-419
+.text
+vgatherdps anchor@TPOFF+0(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-420
+.text
+vgatherdps anchor@TPOFF+17(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-421
+.text
+vgatherdps anchor@TPOFF-17(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-422
+.text
+vgatherdps anchor@DTPOFF+0(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-423
+.text
+vgatherdps anchor@DTPOFF+17(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-mod-424
+.text
+vgatherdps anchor@DTPOFF-17(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-protocol-425 reject
+.text
+vgatherdps anchor@TLSGD(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-protocol-426 reject
+.text
+vgatherdps anchor@TLSLDM(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-protocol-427 reject
+.text
+vgatherdps anchor@GOTNTPOFF(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-protocol-428 reject
+.text
+vgatherdps anchor@INDNTPOFF(%eax,%zmm2,4), %zmm3{%k1}
+
+;;; i686-vector-protocol-429 reject
+.text
+vgatherdps anchor@TLSDESC(%eax,%zmm2,4), %zmm3{%k1}

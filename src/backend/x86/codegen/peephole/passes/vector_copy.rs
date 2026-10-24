@@ -1160,6 +1160,94 @@ pub(super) fn coalesce_packed_fma_prefix(store: &mut LineStore, infos: &mut [Lin
     changed
 }
 
+/// SDM PSHUFD: each two-bit selector acts independently within a 128-bit lane.
+fn compose_dword_shuffle(first: u8, second: u8) -> u8 {
+    (0..4).fold(0, |imm, lane| {
+        let intermediate = (second >> (lane * 2)) & 3;
+        imm | (((first >> (intermediate * 2)) & 3) << (lane * 2))
+    })
+}
+
+/// Compose adjacent unmasked register shuffles that both write the same bank.
+/// No deleted temporary needs a liveness proof: the second instruction fully
+/// overwrites precisely the first destination. Never mix legacy preservation
+/// with VEX zeroing, and retain a VEX identity's upper-zeroing effect as a move.
+pub(super) fn fold_composed_dword_shuffles(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    for i in 0..infos.len() {
+        if infos[i].is_nop() || infos[i].pinned {
+            continue;
+        }
+        let first = infos[i].trimmed(store.get(i));
+        let (mnemonic, args) = split_mn(first);
+        if !matches!(mnemonic, "pshufd" | "vpshufd") || first.contains(['{', '}']) {
+            continue;
+        }
+        let ops = operand_list(args);
+        let [imm1, src, dst] = ops.as_slice() else {
+            continue;
+        };
+        let Some((_, width @ (W128 | W256))) = vec_operand(src) else {
+            continue;
+        };
+        if vec_operand(dst).map(|(_, w)| w) != Some(width)
+            || (mnemonic == "pshufd" && width != W128)
+        {
+            continue;
+        }
+        let Some(j) = next_real(store, infos, i + 1, infos.len()) else {
+            continue;
+        };
+        let second = infos[j].trimmed(store.get(j));
+        let (mnemonic2, args2) = split_mn(second);
+        if mnemonic2 != mnemonic || second.contains(['{', '}']) {
+            continue;
+        }
+        let ops2 = operand_list(args2);
+        let [imm2, src2, dst2] = ops2.as_slice() else {
+            continue;
+        };
+        if dst != src2 || dst != dst2 {
+            continue;
+        }
+        let immediate = |text: &str| {
+            text.strip_prefix('$')?
+                .parse::<i64>()
+                .ok()
+                .filter(|v| (-128..=255).contains(v))
+                .map(|v| v as u8)
+        };
+        let (Some(a), Some(b)) = (immediate(imm1), immediate(imm2)) else {
+            continue;
+        };
+        let combined = compose_dword_shuffle(a, b);
+        let replacement = if combined == 0xE4 {
+            if mnemonic == "pshufd" && src == dst {
+                None
+            } else {
+                Some(format!(
+                    "    {} {src}, {dst}",
+                    if mnemonic == "pshufd" {
+                        "movdqa"
+                    } else {
+                        "vmovdqa"
+                    }
+                ))
+            }
+        } else {
+            Some(format!("    {mnemonic} ${combined}, {src}, {dst}"))
+        };
+        if let Some(text) = replacement {
+            replace_line(store, &mut infos[j], j, text);
+        } else {
+            mark_nop(&mut infos[j]);
+        }
+        mark_nop(&mut infos[i]);
+        changed = true;
+    }
+    changed
+}
+
 /// Replace a proven uniform per-lane shift with the scalar-count encoding.
 /// (V)MOVD zeroes bits 32..127, so its low 64 bits equal the dword count;
 /// (V)MOVQ supplies the complete qword count. Legacy upper preservation and
@@ -3346,6 +3434,150 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         (changed, result)
+    }
+
+    #[test]
+    fn composed_dword_shuffle_exhaustive_lane_model() {
+        for first in 0..=255u8 {
+            for second in 0..=255u8 {
+                let input = [0x80000000u32, 0xFFFFFFFF, 0x7FC12345, 0x12345678];
+                let apply = |imm: u8, x: [u32; 4]| {
+                    std::array::from_fn(|lane| x[((imm >> (2 * lane)) & 3) as usize])
+                };
+                assert_eq!(
+                    apply(compose_dword_shuffle(first, second), input),
+                    apply(second, apply(first, input))
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn composed_dword_shuffle_native_upper_lanes() {
+        use crate::common::temp_files::TempFile;
+        use std::process::Command;
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            eprintln!("SKIP composed shuffle native witness: AVX2 required");
+            return;
+        }
+        let mut assembly = String::from(".text\n");
+        let mut driver = String::from("#include <stdint.h>\n");
+        let mut checks = String::new();
+        let mut index = 0;
+        for (mnemonic, bank, lanes, zero_upper) in [
+            ("pshufd", "xmm", 4, false),
+            ("vpshufd", "xmm", 4, true),
+            ("vpshufd", "ymm", 8, false),
+        ] {
+            for destination in [0, 2] {
+                for second in [27, 57] {
+                    let original = body(&format!(
+                        "    vmovdqu (%rdi), %ymm0\n    vmovdqu 32(%rdi), %ymm2\n    {mnemonic} $27, %{bank}0, %{bank}{destination}\n    {mnemonic} ${second}, %{bank}{destination}, %{bank}{destination}\n    vmovdqu %ymm{destination}, (%rsi)\n    vzeroupper\n    ret\n"
+                    ));
+                    let optimized = run(&original);
+                    assert!(optimized.matches(mnemonic).count() < 2, "{optimized}");
+                    let mask = compose_dword_shuffle(27, second);
+                    for (prefix, asm) in [("before", original), ("after", optimized)] {
+                        let name = format!("{prefix}_{index}");
+                        assembly.push_str(&format!(".globl {name}\n"));
+                        assembly.push_str(
+                            &asm.replace("f:", &format!("{name}:"))
+                                .replace(".size f, .-f", &format!(".size {name}, .-{name}")),
+                        );
+                        assembly.push('\n');
+                        driver
+                            .push_str(&format!("extern void {name}(const uint32_t*,uint32_t*);\n"));
+                        checks.push_str(&format!(
+                            "{name}(a,b); for(unsigned k=0;k<8;++k){{uint32_t e; if(k<{lanes}) e=a[(k/4)*4+(({mask}u>>((k%4)*2))&3)]; else e={upper}; if(b[k]!=e)return 1;}}\n",
+                            upper = if zero_upper { "0" } else if destination == 0 { "a[k]" } else { "a[k+8]" }
+                        ));
+                    }
+                    index += 1;
+                }
+            }
+        }
+        assembly.push_str(".section .note.GNU-stack,\"\",@progbits\n");
+        driver.push_str(&format!("int main(void){{uint32_t a[16],b[8],state=17; for(unsigned n=0;n<2048;++n){{for(unsigned k=0;k<16;++k){{state=state*1664525u+1013904223u;a[k]=state;}}{checks}}}return 0;}}\n"));
+        let asm = TempFile::try_new("composed-shuffle", "native", "s").unwrap();
+        let c = TempFile::try_new("composed-shuffle", "native", "c").unwrap();
+        let exe = TempFile::try_new("composed-shuffle", "native", "exe").unwrap();
+        std::fs::write(asm.path(), assembly).unwrap();
+        std::fs::write(c.path(), driver).unwrap();
+        let output = Command::new("gcc")
+            .args(["-O2", "-mavx2", "-Wall", "-Wextra", "-Werror"])
+            .arg(c.path())
+            .arg(asm.path())
+            .arg("-o")
+            .arg(exe.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(Command::new(exe.path()).status().unwrap().success());
+    }
+
+    #[test]
+    fn composed_dword_shuffle_effects_and_barriers() {
+        use super::super::test_skips::skip_passes;
+        let run_rule = |text: &str| {
+            let mut store = LineStore::new(body(text));
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            let changed = fold_composed_dword_shuffles(&mut store, &mut infos);
+            let text = (0..store.len())
+                .filter(|&i| !infos[i].is_nop())
+                .map(|i| store.get(i))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (changed, text)
+        };
+        let (_, identity) =
+            run_rule("    pshufd $27, %xmm0, %xmm0\n    pshufd $27, %xmm0, %xmm0\n    ret\n");
+        assert!(!identity.contains("pshufd"), "{identity}");
+        for bank in ["xmm", "ymm"] {
+            let (changed, zeroing) = run_rule(&format!(
+                "    vpshufd $27, %{bank}1, %{bank}2\n    vpshufd $27, %{bank}2, %{bank}2\n    ret\n"
+            ));
+            assert!(changed);
+            assert!(
+                zeroing.contains(&format!("vmovdqa %{bank}1, %{bank}2")),
+                "{zeroing}"
+            );
+        }
+        for second in [
+            "vpshufd $27, %xmm0, %xmm0",
+            "pshufd $27, %xmm0, %xmm1",
+            "pshufd $27, (%rax), %xmm0",
+            "pshufd $27, %xmm0, %xmm0{%k1}",
+        ] {
+            assert!(
+                !run_rule(&format!(
+                    "    pshufd $27, %xmm0, %xmm0\n    {second}\n    ret\n"
+                ))
+                .0
+            );
+        }
+        for middle in [
+            "label:",
+            "    call opaque",
+            "    vzeroupper",
+            "    .rept 2",
+            "    paddd %xmm0, %xmm1",
+        ] {
+            assert!(!run_rule(&format!("    pshufd $27, %xmm0, %xmm0\n{middle}\n    pshufd $27, %xmm0, %xmm0\n    ret\n")).0);
+        }
+        let input = body("    pshufd $27, %xmm0, %xmm0\n    pshufd $27, %xmm0, %xmm0\n    ret\n");
+        assert!(!run(&input).contains("pshufd"));
+        let disabled = {
+            let _guard = skip_passes(&["vector_copy_retarget"]);
+            run(&input)
+        };
+        assert!(disabled.matches("pshufd").count() >= 2, "{disabled}");
     }
 
     #[test]

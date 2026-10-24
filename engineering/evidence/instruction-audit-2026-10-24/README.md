@@ -12,7 +12,7 @@ The combined PDF's SHA-256 is
 All 5,364 pages were extracted; all 4,106 bookmarks were indexed. The large
 source files and full bookmark review ledger are workspace artifacts under
 `/home/user/artifacts/instruction-audit/`, not vendored source files.
-Extraction and indexing are not semantic review. Thirteen instruction sections
+Extraction and indexing are not semantic review. Twenty-two sections
 have partial, explicitly scoped reviews; other bookmark entries are unreviewed.
 
 The shift review concerns register-only, unmasked 128/256/512-bit forms. The
@@ -226,3 +226,190 @@ The completed production-source snapshot passes **6,201 library tests**
 and the unchanged audit ratchet. The latest main merge reconciles independent
 knob additions at 533 literals. No ignored-test, panic, unsafe, large-function
 or undocumented-knob budget was increased for this audit tranche.
+
+## Continued review: immediate-memory relocation origins
+
+SDM volume 2A section **2.2.1.6, RIP-Relative Addressing** (combined PDF page
+627) defines the origin as the RIP of the **next instruction**. An immediate
+following disp32 is therefore part of the distance subtracted in an ELF
+PC-relative addend: with imm8 the assembler must use user-addend **minus 5**,
+not minus 4. The SDM supplies the address semantics; ELF addend spelling and
+symbol arithmetic are independently checked against GNU binutils 2.47.20260726.
+
+Ten EVEX immediate-memory encoder families omitted that adjustment: ordinary
+and SAE-capable two-operand immediates, packed shifts, three-source immediates,
+compare-to-mask, extraction, rotation, AVX10.2 VMPSADBW, VFPCLASS and VCVTPS2PH.
+The common legacy SSE/MMX immediate encoder had the same error, affecting all
+27 mnemonics currently dispatched through it. Memory destinations are affected
+as well as loads. The new memory-plus-imm8 emission helpers keep the adjustment
+and immediate together; they touch only relocations emitted by that operand,
+not earlier instructions or absolute-address relocations. The emitted opcodes
+and instruction lengths are unchanged.
+
+The i686 address planner also bypassed source-addend normalization for a
+broadcast-decorated absolute symbol. `anchor+17{1to16}` could become an undefined
+symbol literally named `anchor+17`. It now normalizes pending memory symbols
+before GOT/TLS addend policy and before replacing shared EVEX address bytes.
+One allocation-free, checked normalization helper is shared with both existing
+architecture-specific relocation insertion paths. Overflow retains the source
+spelling for the existing diagnostic path; symbol differences retain their
+separate resolver contract.
+
+The new ELF differential fixtures cover **258 x86-64 cases** and **45 i686
+cases**, including positive/negative user addends, GOTPCREL, absolute controls,
+broadcasts and memory destinations. The old binary fails **215 of the 258**
+x86-64 cases and **2 of the 45** i686 cases; the fixed binary passes all of them.
+The complete corpora now pass **1,692 x86-64 + 733 i686 cases**. The Rust tests
+also check prior-relocation isolation, each legacy mnemonic, 16-bit-address
+and 32-bit-address i686 broadcast addends, and checked normalization boundaries.
+All **6,204 library tests** pass (10 pre-existing ignored tests), as do the
+linker binary test, strict all-target Clippy and the unchanged 533-knob census.
+
+`rip-immediate.s` plus `rip-immediate-driver.c` independently exercise a legacy
+PSHUFD load, an EVEX packed-shift load and an EVEX extraction store. On this
+AVX512F/VL-capable host, GCC 16.2 and Clang 23.1 drivers both pass with the fixed
+assembler and GNU assembler objects. With the old object, both detect the wrong
+EVEX load/store before the misaligned legacy load faults with SIGSEGV.
+`rip-immediate-start.s` provides a libc-free entry point: executables linked
+with **lccc-ld** also pass for both fixed and GNU objects and fault for the old
+object. These are semantic witnesses, not throughput benchmarks.
+
+Reproduce the positive native witnesses after a fastbuild:
+
+```sh
+D=engineering/evidence/instruction-audit-2026-10-24
+lccc -c "$D/rip-immediate.s" -o /tmp/rip-memory.o
+gcc "$D/rip-immediate-driver.c" /tmp/rip-memory.o -o /tmp/rip-driver
+/tmp/rip-driver  # requires AVX512F and AVX512VL; returns 77 otherwise
+lccc -c "$D/rip-immediate-start.s" -o /tmp/rip-start.o
+lccc-ld -o /tmp/rip-static /tmp/rip-start.o /tmp/rip-memory.o
+/tmp/rip-static  # execute only on an AVX512F/VL-capable host
+```
+
+This adds a fourteenth **partial** section review, not completion of the
+manual, the assembler, or any backend as a whole.
+
+## Continued review: i686 vector relocation ABI
+
+The shared vector encoder's ModR/M/SIB bytes can be correct for i686 while its
+relocation types are not. With a 32-bit base register, delegated `@GOT` and
+`@GOTOFF` operands became absolute `R_386_32` references; local TLS offsets
+could acquire the wrong class or fail translation. The i686 delegation boundary
+now reconstructs only the memory relocation from the original displacement,
+using the existing i686 symbol, modifier and addend rules. Address bytes and
+instruction lengths are preserved, including VEX/EVEX **VSIB gather** fields
+and XOP's trailing register byte. Re-encoding these ordinary shared addresses
+would unnecessarily risk rejecting vector indices or changing address layouts.
+Absolute and 16-bit addressing retain the existing local address planner.
+
+TLSGD/TLSLDM, GOTNTPOFF/INDNTPOFF and TLSDESC protocol relocations cannot be
+consumed by these vector instructions; both delegated and local SSE/MMX paths
+now reject them rather than lending a TLS relaxation contract to an unrelated
+opcode. Valid bare-symbol legacy immediate sources are normalized as absolute
+memory without cloning the whole instruction or the operand vector.
+
+This ELF ABI and GNU-syntax review is independent of the SDM's CPU semantics.
+Its **430 additional i686 cases** include 360 accepted forms and 70 rejection
+controls across six basic modifier classes, positive/negative addends, SIB,
+absolute addresses, legacy SSE, VEX, EVEX, XOP, and both gather encodings. Every
+case was explicitly checked with GNU binutils 2.47.20260726; no failing oracle
+input was trimmed away. The preceding binary fails **292 cases**: 180 wrong
+relocation tables, 58 false acceptances and 54 false rejections. The fixed
+binary passes all 430. The complete corpora now pass **1,692 x86-64 + 1,163
+i686 cases**. All **6,205 library tests** (10 pre-existing ignored tests), the
+linker binary test, strict all-target Clippy and the unchanged census pass.
+The independent packed-shift matrix still passes 1,808 decisions and 390 exact
+accepted-byte comparisons.
+
+`i686-vector-got.s` is a libc-free native 32-bit PIC witness for GOT and GOTOFF
+vector accesses. On the recorded Linux host with IA32 execution and AVX512F/VL,
+objects produced by the fixed assembler, GNU assembler, GCC 16.2 and Clang 23.1
+all execute successfully after GNU `ld -m elf_i386`. The preceding LCCC object
+faults with SIGSEGV because it uses absolute addresses where GOT-relative
+addresses were requested. This witness does **not** claim i686 linking support
+in lccc-ld or general native coverage of TLS models.
+
+```sh
+D=engineering/evidence/instruction-audit-2026-10-24
+lccc -m32 -c "$D/i686-vector-got.s" -o /tmp/i686-got.o
+ld -m elf_i386 /tmp/i686-got.o -o /tmp/i686-got
+/tmp/i686-got  # requires Linux IA32 execution and AVX512F/VL
+```
+
+## Continued review: legacy SIMD operand shapes and typed shuffles
+
+The continued instruction-table review covers PSHUFW (PDF page 1725),
+PALIGNR (1505), ROUNDPS (1875), SHA1RNDS4 (1923), MPSADBW (1421),
+GF2P8AFFINEQB (1133), and GF2P8AFFINEINVQB (1130). PSHUFD pages
+1715–1717 and MOVDQA pages 1348–1351 additionally establish the register-only
+shuffle composition and identity-copy rules. These are scoped reviews, not
+certification of those sections' entire arithmetic/exception/EVEX behavior.
+
+A shared legacy-immediate operand checker now enforces register banks and
+encodable immediate ranges for 27 mnemonics on both x86 targets. PSHUFW is
+MMX-only; PALIGNR accepts matching MMX or XMM operands, and its MMX encoding
+must omit the XMM mandatory prefix. Other covered rows require XMM operands.
+The i686 dispatcher now reaches SHA1RNDS4, MPSADBW and both GFNI affine rows.
+
+PSHUFW's opcode table and description specify MMX registers, but its REX.R
+paragraph refers to extra XMM registers. The table, MMX operation and cached
+GNU assembler agree; that contradictory paragraph must not authorize XMM
+PSHUFW. Immediate width is also distinct from assembler source spelling:
+GNU 2.47 accepts negative aliases for some imm8 rows but not others. The
+checker and generated corpus preserve that row-specific policy rather than
+assuming every signed spelling is valid or truncating arbitrary integers.
+`generate_legacy_immediate_shapes.py` generates 4,590 cases per mode, covering
+register classes, mixed banks, unavailable registers, memory destinations,
+memory sources, and immediate boundaries. Signed-source acceptance comes from
+GNU differential evidence, not from an SDM claim about assembly syntax.
+
+`__builtin_shufflevector` previously returned packed data while nested vector
+consumers and returns could treat it as an address. The minimal two-shuffle
+native witness terminates with SIGSEGV before the fix. The implementation now
+uses one 16-byte pointer-backed vector value consistently through semantic
+typing, aggregate sizing, argument lowering, member/conditional expressions,
+and returns. It evaluates both operands once, validates known four-by-32-bit
+vector geometry and matching element types, and diagnoses nonconstant or
+out-of-range selectors. Single-source permutations use PSHUFD where the x86
+SSE2 contract permits it; mixed-source and other-target paths retain scalar
+lane gathering. This does not add other vector geometries to the builtin.
+
+Adjacent same-destination register PSHUFD/VPSHUFD instructions compose their
+two-bit selectors independently within each 128-bit lane. Mixed legacy/VEX,
+memory, masks, changed destination, width changes and intervening effects are
+excluded. A legacy identity may disappear only for a self-copy; VEX identity
+replacement remains VMOVDQA so upper-zeroing is not silently lost. The rule
+also runs after stack forwarding, which is when real frontend chains become
+adjacent. Reverse-twice becomes `ret`; reverse-then-rotate becomes one
+`pshufd $198` plus `ret`, versus two PSHUFD instructions after the correctness
+fix alone. This is an instruction-count result, not a universal timing claim.
+
+Regressions include all 65,536 immediate-pair compositions, barrier and
+skip-control checks, a native original/optimized/independent-integer-model
+comparison including observable YMM upper lanes, and an 18,432-check typed C
+fixture. The latter supports separate compiler/driver translation units and
+covers nesting, function arguments/returns, conditional struct members,
+floating bit patterns, sizeof, _Generic and operand side effects. Differential
+runs use only the cached GCC 16.2, Clang 23.1.3 and binutils 2.47 tools.
+
+### i686 GNU vector ABI follow-up
+
+A freestanding GCC 16.2 driver exposed a separate i686 calling-convention
+failure: 16-byte GNU `vector_size` arguments/returns were classified like
+struct stack/sret objects instead of XMM vectors. The baseline native witness
+terminates with SIGSEGV. These GNU vector shapes now reuse the already modeled
+single-XMM carrier, including signature CType retention, direct/indirect calls,
+argument decomposition and return packing. Other GNU vector widths are not
+changed. This is an ABI finding from current compiler differential evidence,
+not a calling-convention claim derived from the SDM.
+
+`check_i686_gnu_vector_abi.sh` requires GCC 16.2.0, Clang 23.1.3 and GNU as
+2.47. It links freestanding ELF32 programs with lccc-ld, requiring no 32-bit
+libc headers/runtime. Across both driver compilers and all three function
+compilers at O0/O2/O3/Os, it exercises 24 cross-TU configurations, each with
+16,384 vector-ABI checks and 18,432 typed-shuffle checks. Integer element
+widths 8/16/32/64, double bit patterns, indirect calls, register exhaustion,
+16-byte stack alignment and variadic named/unnamed vectors are covered. The
+shared typed fixture keeps its original checks; only its libc includes are
+replaced by freestanding declarations. Backend contract CI runs this gate
+with the pinned compiler and assembler oracles.
