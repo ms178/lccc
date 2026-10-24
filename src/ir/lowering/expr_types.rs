@@ -154,6 +154,7 @@ impl Lowerer {
         if let Expr::FunctionCall(callee, _, _) = expr {
             if let Expr::Identifier(name, _) = &**callee {
                 match name.as_str() {
+                    "__builtin_shufflevector" => return Some(16),
                     // ONLY the 256-bit builtins: v8sf results live behind a
                     // pointer (sret convention). The 128-bit raw builtins
                     // return packed I128 BY VALUE — reporting a size here
@@ -172,7 +173,6 @@ impl Lowerer {
                     "__builtin_ia32_maxps"
                     | "__builtin_ia32_minps"
                     | "__builtin_ia32_shufps"
-                    | "__builtin_shufflevector"
                     | "__builtin_shuffle"
                     | "__builtin_ia32_vextractf128_ps256"
                         if self.target == crate::backend::Target::I686 =>
@@ -182,7 +182,6 @@ impl Lowerer {
                     "__builtin_ia32_maxps"
                     | "__builtin_ia32_minps"
                     | "__builtin_ia32_shufps"
-                    | "__builtin_shufflevector"
                     | "__builtin_ia32_vextractf128_ps256" => return None,
                     // __builtin_shuffle is the one raw vector builtin whose
                     // value is NOT packed by value: its lowering hands back
@@ -432,6 +431,7 @@ impl Lowerer {
     /// Returns None for builtins without special return type handling.
     pub(super) fn builtin_return_type(&self, name: &str) -> Option<IrType> {
         match name {
+            "__builtin_shufflevector" => Some(IrType::Ptr),
             // x86 vector scalar extractions with 64-bit results (long long /
             // unsigned long long). Without these the call was typed with the
             // target int (I32 on i686): every consumer sign-extended the low
@@ -638,7 +638,6 @@ impl Lowerer {
             "__builtin_ia32_maxps"
             | "__builtin_ia32_minps"
             | "__builtin_ia32_shufps"
-            | "__builtin_shufflevector"
             | "__builtin_ia32_vextractf128_ps256"
                 if self.target == crate::backend::Target::I686 =>
             {
@@ -647,7 +646,6 @@ impl Lowerer {
             "__builtin_ia32_maxps"
             | "__builtin_ia32_minps"
             | "__builtin_ia32_shufps"
-            | "__builtin_shufflevector"
             | "__builtin_ia32_vextractf128_ps256" => Some(IrType::I128),
             // 256-bit raw builtins return v8sf, which lccc represents as a
             // POINTER to the 32-byte result slot everywhere (sret convention).

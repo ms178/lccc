@@ -77,11 +77,53 @@ impl I686Codegen {
 
     pub(super) fn emit_va_arg_struct_impl(
         &mut self,
-        _dest_ptr: &Value,
-        _va_list_ptr: &Value,
-        _size: usize,
-        _align: usize,
+        dest_ptr: &Value,
+        va_list_ptr: &Value,
+        size: usize,
+        align: usize,
     ) {
-        panic!("VaArgStruct should not be emitted for i686 target");
+        // Keep the destination in EAX while EDX is the va_list address;
+        // after the cursor is loaded EDX becomes the copy scratch. This is
+        // one aligned cursor walk, rather than one va_list round trip per
+        // four-byte word (important for 32/64-byte vector varargs).
+        self.operand_to_eax(&crate::ir::reexports::Operand::Value(*dest_ptr));
+        self.load_va_list_addr_to_edx(va_list_ptr);
+        self.state.emit("    movl (%edx), %ecx");
+        if align > 4 {
+            debug_assert!(align.is_power_of_two());
+            emit!(self.state, "    addl ${}, %ecx", align - 1);
+            emit!(self.state, "    andl ${}, %ecx", -(align as i64));
+        }
+
+        let mut offset = 0usize;
+        // SSE1 movups copies exact bits and handles unaligned struct slots;
+        // the scalar path remains mandatory for -mno-sse.
+        while self.sse_enabled && offset + 16 <= size {
+            emit!(self.state, "    movups {}(%ecx), %xmm0", offset);
+            emit!(self.state, "    movups %xmm0, {}(%eax)", offset);
+            offset += 16;
+        }
+        while offset < size {
+            let remaining = size - offset;
+            if remaining >= 4 {
+                emit!(self.state, "    movl {}(%ecx), %edx", offset);
+                emit!(self.state, "    movl %edx, {}(%eax)", offset);
+                offset += 4;
+            } else if remaining >= 2 {
+                emit!(self.state, "    movzwl {}(%ecx), %edx", offset);
+                emit!(self.state, "    movw %dx, {}(%eax)", offset);
+                offset += 2;
+            } else {
+                emit!(self.state, "    movzbl {}(%ecx), %edx", offset);
+                emit!(self.state, "    movb %dl, {}(%eax)", offset);
+                offset += 1;
+            }
+        }
+
+        let advance = size.div_ceil(4) * 4;
+        emit!(self.state, "    addl ${}, %ecx", advance);
+        self.load_va_list_addr_to_edx(va_list_ptr);
+        self.state.emit("    movl %ecx, (%edx)");
+        self.state.reg_cache.invalidate_all();
     }
 }

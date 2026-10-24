@@ -1,6 +1,6 @@
 # Follow-up: ext_vector_type ABI grid — first measured run against Clang 23.1.3
 
-**Status: every lccc-class entry fixed (ABI-EXTVEC-VA-1, ABI-EXTVEC-I386-O2-1, ABI-EXTVEC-LD-1, ABI-EXTVEC-LD-I386-1); open: the Clang oracle class (ORACLE-CLANG-2313-1/-2) and ABI-GNUVEC-I386-1 (GNU `vector_size` on i386, latched by its own gate).** Measured on 2026-10-17 by the hosted "Frontend and ABI
+**Status: every lccc-class entry fixed (ABI-EXTVEC-VA-1, ABI-EXTVEC-I386-O2-1, ABI-EXTVEC-LD-1, ABI-EXTVEC-LD-I386-1, ABI-GNUVEC-I386-1); open: the Clang oracle class (ORACLE-CLANG-2313-1/-2).** Measured on 2026-10-17 by the hosted "Frontend and ABI
 contracts" job (ubuntu-24.04, lccc fastbuild, Clang 23.1.3 from
 `scripts/ci_install_clang_oracle.sh`, GCC 16 as the linker driver).
 `tests/regression/check_ext_vector_abi_grid.sh` ran 848 legs over 53 shapes
@@ -125,12 +125,26 @@ measured `lccc:clang`-never-fails pattern):
   to ABI-EXTVEC-LD-1 (`ldx1` is 16 bytes and cannot have been this defect)
   and are retired with it below.
 
-**Residual, tracked separately: ABI-GNUVEC-I386-1** — on i386 GCC passes
-16-byte GNU vectors in `%xmm0-2` for fixed arguments and keeps 32/64-byte
-vectors in memory at their full alignment with a realigned `%esp` (DRAP via
-`%ecx`); lccc's i686 call sequence packs them 4-byte granular. lccc agrees
-with itself; both cross legs diverge, and `check_gnu_vector_align_abi.sh`
-latches exactly that verdict so it is re-measured on every run.
+**ABI-GNUVEC-I386-1 — FIXED; hosted matrix accepted.**
+The 16-byte GNU vector case uses `%xmm0-2` for fixed arguments and `%xmm0` for
+returns, with direct/indirect and variadic calls covered by the freestanding
+GCC 16.2 / Clang 23.1.3 matrix. The 32/64-byte MEMORY cases now carry an
+explicit i386 GNU-vector marker through caller/callee classification, align
+their stack slots naturally, dynamically realign the caller's `%esp`, and use
+one aligned `va_arg` cursor/copy. Ordinary over-aligned records keep their
+measured four-byte layout; memory-passed GNU vectors use natural alignment,
+including no-SSE v16. `check_gnu_vector_align_abi.sh`
+now requires all v16/v32/v64 LCCC/GCC pairings to exit zero; no divergence
+latch remains. Run 40120508272 passed the first 56 rows, then exposed a
+second reduced-ISA Clang self-oracle incompatibility (SSE-only Clang→Clang
+exit 4 in `iddouble`, after the earlier exit 8 in `pick_variadic`). The matrix
+therefore excludes reduced-ISA Clang self-oracle rows explicitly and retains
+all probes in every LCCC/GCC row. Run 40124172080 at 28f179894 completed all
+88 rows and 3,244,032 checks, including every no-SSE LCCC/GCC row and explicit
+no-SSE object-level XMM ceilings. The no-SSE GCC typed oracle now separates
+arbitrary NaN-bit carriage from finite floating-lane shuffles because GCC's
+own x87 `flds`/`fstps` sequence can quiet a signaling NaN; this added a probe
+rather than removing the failing assertion.
 
 ### ABI-EXTVEC-LD-1 — `long double` ext vectors by value, x86-64 (29 deterministic + 12 flaky) — **FIXED**
 

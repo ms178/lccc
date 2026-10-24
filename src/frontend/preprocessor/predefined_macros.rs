@@ -682,10 +682,11 @@ impl Preprocessor {
     /// i686 backend always uses SSE2 instructions, we define them unconditionally.
     ///
     /// When `no_sse` is true (from -mno-sse or similar flags), these macros are
-    /// not defined (matching GCC behavior for kernel builds).
+    /// not defined (matching GCC behavior for kernel builds). `no_sse2` can
+    /// independently suppress only the SSE2 macros in an SSE-only i686 TU.
     ///
     /// Must be called after set_target() since it checks which arch is active.
-    pub fn set_sse_macros(&mut self, no_sse: bool) {
+    pub fn set_sse_macros(&mut self, no_sse: bool, no_sse2: bool) {
         if no_sse {
             // The baseline macros are pre-defined in PREDEFINED_OBJECT_MACROS
             // (most translation units never pass -mno-sse and the fast path
@@ -712,15 +713,23 @@ impl Preprocessor {
             return;
         }
 
-        // SSE and SSE2 are baseline for x86_64; our i686 backend also uses SSE2.
+        // SSE and SSE2 are baseline for x86_64; retain the existing i686
+        // default while honoring an independent SSE2 denial.
         self.define_simple_macro("__SSE__", "1");
-        self.define_simple_macro("__SSE2__", "1");
         self.define_simple_macro("__MMX__", "1");
+        if no_sse2 {
+            self.macros.undefine("__SSE2__");
+            self.macros.undefine("__SSE2_MATH__");
+        } else {
+            self.define_simple_macro("__SSE2__", "1");
+        }
 
         if is_x86_64 {
             // x86_64 uses SSE for floating-point math by default
             self.define_simple_macro("__SSE_MATH__", "1");
-            self.define_simple_macro("__SSE2_MATH__", "1");
+            if !no_sse2 {
+                self.define_simple_macro("__SSE2_MATH__", "1");
+            }
             // GCC also defines this for x86_64
             self.define_simple_macro("__MMX_WITH_SSE__", "1");
         }
@@ -1383,5 +1392,40 @@ impl Preprocessor {
         if !has_f && !has_d {
             self.macros.undefine("__riscv_flen");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_only_i686_preserves_sse_but_not_sse2_macros() {
+        let mut pp = Preprocessor::new();
+        pp.set_target("i686");
+        pp.set_sse_macros(false, true);
+        assert!(pp.macros.is_defined("__SSE__"));
+        assert!(!pp.macros.is_defined("__SSE2__"));
+        assert!(!pp.macros.is_defined("__SSE2_MATH__"));
+
+        pp.set_sse_macros(false, false);
+        assert!(pp.macros.is_defined("__SSE__"));
+        assert!(pp.macros.is_defined("__SSE2__"));
+
+        pp.set_sse_macros(true, true);
+        assert!(!pp.macros.is_defined("__SSE__"));
+        assert!(!pp.macros.is_defined("__SSE2__"));
+    }
+
+    #[test]
+    fn sse2_denial_does_not_erase_independent_x86_64_sse_macros() {
+        let mut pp = Preprocessor::new();
+        pp.set_target("x86_64");
+        pp.set_sse_macros(false, true);
+        assert!(pp.macros.is_defined("__SSE__"));
+        assert!(pp.macros.is_defined("__SSE_MATH__"));
+        assert!(pp.macros.is_defined("__MMX_WITH_SSE__"));
+        assert!(!pp.macros.is_defined("__SSE2__"));
+        assert!(!pp.macros.is_defined("__SSE2_MATH__"));
     }
 }

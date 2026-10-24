@@ -1,0 +1,42 @@
+{
+  "lccc_d4sl": {
+    "before": 4,
+    "after": 3
+  },
+  "lccc_d4sr": {
+    "before": 4,
+    "after": 3
+  },
+  "lccc_d4sa": {
+    "before": 4,
+    "after": 3
+  },
+  "lccc_d8sl": {
+    "before": 3,
+    "after": 3
+  },
+  "lccc_d8sr": {
+    "before": 3,
+    "after": 3
+  },
+  "lccc_d8sa": {
+    "before": 3,
+    "after": 3
+  },
+  "lccc_q2sl": {
+    "before": 6,
+    "after": 5
+  },
+  "lccc_q2sr": {
+    "before": 6,
+    "after": 5
+  },
+  "lccc_q4sl": {
+    "before": 4,
+    "after": 4
+  },
+  "lccc_q4sr": {
+    "before": 4,
+    "after": 4
+  }
+}

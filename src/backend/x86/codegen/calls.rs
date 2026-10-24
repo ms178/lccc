@@ -282,6 +282,7 @@ impl X86Codegen {
         arg_classes: &[CallArgClass],
         _arg_types: &[IrType],
         struct_arg_aligns: &[Option<usize>],
+        _struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
         _struct_arg_is_f128_sse: &[bool],
     ) -> usize {
         // x86-64: uncapped per-arg alignment padding (GCC ≥ 4.6 honors the
@@ -295,12 +296,13 @@ impl X86Codegen {
         &mut self,
         args: &[Operand],
         arg_classes: &[CallArgClass],
-        _arg_types: &[IrType],
+        arg_types: &[IrType],
         stack_arg_space: usize,
         _fptr_spill: usize,
         _f128_temp_space: usize,
         struct_arg_aligns: &[Option<usize>],
-        _struct_arg_is_f128_sse: &[bool],
+        _struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
+        struct_arg_is_f128_sse: &[bool],
     ) -> i64 {
         // Per-call-site transient state (defensive reset: the pipeline
         // always consumes the flag, but a stale value from an aborted
@@ -539,6 +541,25 @@ impl X86Codegen {
                     if self.state.out.use_rsp_addressing {
                         self.state.out.rsp_frame_size += 16;
                     }
+                }
+                CallArgClass::StructByValStack { size: 16 }
+                    if crate::backend::call_abi::is_scalar_f128_sse_arg(
+                        arg_types,
+                        struct_arg_is_f128_sse,
+                        si,
+                    ) =>
+                {
+                    // Scalar _Float128/_Decimal128 overflow keeps the same
+                    // 16-byte stack slot as a one-XMM aggregate, but its
+                    // operand is the VALUE, not an aggregate address. Using
+                    // operand_to_rax here truncated the I128 image to its low
+                    // limb and dereferenced it (binary128 9.0 -> NULL).
+                    self.state.emit("    subq $16, %rsp");
+                    sp_adjust += 16;
+                    if self.state.out.use_rsp_addressing {
+                        self.state.out.rsp_frame_size += 16;
+                    }
+                    self.emit_f128_sse_stack_arg(&args[si]);
                 }
                 CallArgClass::StructByValStack { size }
                 | CallArgClass::LargeStructStack { size } => {
@@ -1723,6 +1744,43 @@ impl X86Codegen {
         }
     }
 
+    /// Write a scalar 16-byte SSE-carrier argument into its ALREADY RESERVED
+    /// outgoing stack slot. The slot reservation and RSP-frame accounting are
+    /// owned by the stack-argument walk so value slots remain addressable.
+    fn emit_f128_sse_stack_arg(&mut self, op: &Operand) {
+        // A deferred vector result may still live in xmm0 (or need %rax for
+        // its destination). Materialize that store before either scratch is
+        // reused for this argument. RSP/frame accounting already includes the
+        // reserved outgoing slot, so a slot-relative flush remains correct.
+        self.flush_pending_vec_store_impl();
+        match op {
+            Operand::Value(_) => {
+                self.emit_f128_sse_operand_to_xmm(op, "xmm0");
+                self.state.emit("    movdqu %xmm0, (%rsp)");
+            }
+            Operand::Const(c) => {
+                let bits = crate::backend::call_abi::f128_sse_const_image(*c);
+                for (offset, half) in [(0usize, bits as u64), (8, (bits >> 64) as u64)] {
+                    if half == 0 {
+                        self.state
+                            .emit_fmt(format_args!("    movq $0, {offset}(%rsp)"));
+                    } else {
+                        self.state
+                            .out
+                            .emit_instr_imm_reg("    movabsq", half as i64, "rax");
+                        self.state
+                            .emit_fmt(format_args!("    movq %rax, {offset}(%rsp)"));
+                    }
+                }
+                // A nonzero immediate used %rax; invalidating unconditionally
+                // is conservative for the all-zero form and keeps the cache
+                // contract local to this emission helper.
+                self.state.reg_cache.invalidate_acc();
+            }
+        }
+        self.state.invalidate_vec_peephole();
+    }
+
     /// Load a 16-byte SSE + SSEUP value (it travels in ONE XMM register) into
     /// `xmm`: a scalar `_Float128` / `_Decimal128` argument or return, or the
     /// returned bytes of a one-XMM aggregate. Such a value is always homed in
@@ -1733,34 +1791,22 @@ impl X86Codegen {
     pub(super) fn emit_f128_sse_operand_to_xmm(&mut self, op: &Operand, xmm: &str) {
         let bits: u128 = match op {
             Operand::Value(v) => {
-                let Some(slot) = self.state.get_slot(v.0) else {
-                    panic!(
-                        "internal error: 16-byte SSE scalar v{} has no stack slot",
-                        v.0
-                    );
-                };
+                let slot = crate::backend::call_abi::require_f128_sse_value_slot(
+                    self.state.get_slot(v.0),
+                    v.0,
+                );
                 self.state.out.emit_instr_rbp_reg("    movdqu", slot.0, xmm);
                 return;
             }
-            Operand::Const(
-                IrConst::Zero
-                | IrConst::I8(0)
-                | IrConst::I16(0)
-                | IrConst::I32(0)
-                | IrConst::I64(0)
-                | IrConst::I128(0),
-            ) => {
-                // Integer zero is the canonical IR representation produced by
-                // implicit conversion in calls such as hypotf128(real, 0).
-                // Its binary128 representation is all-zero bits just like the
-                // dedicated Zero variant.  Do not use IrConst::is_zero here:
-                // -0.0 must retain its sign bit.
-                self.state.emit_fmt(format_args!("    pxor %{xmm}, %{xmm}"));
-                return;
-            }
-            Operand::Const(IrConst::I128(c)) => *c as u128,
             Operand::Const(c) => {
-                panic!("internal error: {c:?} is not a 16-byte SSE scalar constant")
+                let bits = crate::backend::call_abi::f128_sse_const_image(*c);
+                if bits == 0 {
+                    // Do not use IrConst::is_zero here: -0.0 must retain its
+                    // sign bit. Only the all-zero 16-byte image takes this arm.
+                    self.state.emit_fmt(format_args!("    pxor %{xmm}, %{xmm}"));
+                    return;
+                }
+                bits
             }
         };
         let lo = bits as u64;

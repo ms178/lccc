@@ -48,11 +48,16 @@ impl I686Codegen {
     }
 
     /// Stack-argument alignment per the GCC i386 psABI (all offsets verified
-    /// against the GCC 14.2 -m32 oracle):
-    ///   * everything packs at 4-byte slot granularity — doubles (`f1(double,
+    /// against the GCC 14.2/16.2 -m32 oracles):
+    ///   * ordinary scalars and records pack at 4-byte slot granularity —
+    ///     doubles (`f1(double,
     ///     int, double)`: c at offset 12), 12-byte x87 long double (`f3`),
     ///     8-byte-aligned structs (`f7(int, struct{double,double}, int)`: a at
     ///     offset 4) and even `aligned(16)` structs (`f8`: a at offset 4);
+    ///   * Memory-passed GNU vectors are the other exception: their slots
+    ///     use natural 16/32/64-byte alignment (including no-SSE v16), with
+    ///     dynamic ESP realignment when the caller's incoming boundary is
+    ///     insufficient.
     ///   * EXCEPT TFmode 16-byte carriers (__float128/_Decimal128), which are
     ///     16-byte aligned within the outgoing area (`f2(__float128, int,
     ///     __float128)`: b at offset 16; `f6(int, __float128, int)`: q at
@@ -64,6 +69,7 @@ impl I686Codegen {
         i: usize,
         ac: &call_abi::CallArgClass,
         struct_arg_aligns: &[Option<usize>],
+        struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
         struct_arg_is_f128_sse: &[bool],
     ) -> usize {
         // A vector piece in an XMM register occupies no outgoing stack.
@@ -71,7 +77,12 @@ impl I686Codegen {
             return 4;
         }
         let align = struct_arg_aligns.get(i).copied().flatten().unwrap_or(4);
-        if struct_arg_is_f128_sse.get(i).copied().unwrap_or(false) && align >= 16 {
+        let classes = struct_arg_classes.get(i).map(Vec::as_slice).unwrap_or(&[]);
+        if let Some(vector_align) =
+            call_abi::i386_gnu_vector_stack_align(&self.call_abi_config_impl(), classes, align)
+        {
+            vector_align
+        } else if struct_arg_is_f128_sse.get(i).copied().unwrap_or(false) && align >= 16 {
             16
         } else {
             4
@@ -83,6 +94,7 @@ impl I686Codegen {
         arg_classes: &[call_abi::CallArgClass],
         arg_types: &[IrType],
         struct_arg_aligns: &[Option<usize>],
+        struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
         struct_arg_is_f128_sse: &[bool],
     ) -> usize {
         let mut total = 0usize;
@@ -93,7 +105,13 @@ impl I686Codegen {
             } else {
                 IrType::I32
             };
-            let align = self.stack_arg_align(i, ac, struct_arg_aligns, struct_arg_is_f128_sse);
+            let align = self.stack_arg_align(
+                i,
+                ac,
+                struct_arg_aligns,
+                struct_arg_classes,
+                struct_arg_is_f128_sse,
+            );
             max_arg_align = max_arg_align.max(align);
             total = (total + align - 1) & !(align - 1);
             match ac {
@@ -178,9 +196,47 @@ impl I686Codegen {
         _fptr_spill: usize,
         _f128_temp_space: usize,
         struct_arg_aligns: &[Option<usize>],
+        struct_arg_classes: &[Vec<crate::common::types::EightbyteClass>],
         struct_arg_is_f128_sse: &[bool],
     ) -> i64 {
-        if stack_arg_space > 0 {
+        self.dyn_align_cleanup = false;
+        let dyn_align_a = arg_classes
+            .iter()
+            .enumerate()
+            .fold(4usize, |max_align, (i, ac)| {
+                max_align.max(self.stack_arg_align(
+                    i,
+                    ac,
+                    struct_arg_aligns,
+                    struct_arg_classes,
+                    struct_arg_is_f128_sse,
+                ))
+            });
+        let dyn_align = dyn_align_a > 16;
+        // generation/prologue pins these functions to an EBP frame: the
+        // runtime delta cannot be represented by ESP-relative slot offsets.
+        debug_assert!(!dyn_align || !self.omit_frame_pointer);
+        if dyn_align {
+            // GCC's >16-byte MEMORY argument rule needs an absolute stack
+            // boundary, not merely padding relative to an arbitrary ESP.
+            // Choose D so (R0 - D - 4 - AREA) == 0 mod A, save R0 in the
+            // word above the argument area, then restore it after the call.
+            // The outgoing area is already A-rounded by the sizing pass.
+            let save_bytes = 4usize;
+            let total = stack_arg_space + save_bytes;
+            self.state.emit("    movl %esp, %ecx");
+            // LEA computes the same padding with one fewer instruction than
+            // copying ECX to EAX and subtracting; flags are not needed here.
+            emit!(self.state, "    leal -{}(%esp), %eax", total);
+            emit!(self.state, "    andl ${}, %eax", dyn_align_a - 1);
+            self.state.emit("    subl %eax, %esp");
+            self.state.emit("    subl $4, %esp");
+            self.state.emit("    movl %ecx, (%esp)");
+            emit!(self.state, "    subl ${}, %esp", stack_arg_space);
+            self.esp_adjust += total as i64;
+            self.dyn_align_cleanup = true;
+            self.state.reg_cache.invalidate_all();
+        } else if stack_arg_space > 0 {
             // GCC-style push staging: when every stack argument is a 4-byte
             // scalar and the outgoing area is exactly the pushed bytes (no
             // alignment pad, boundary <= 4), push the arguments right-to-left
@@ -199,8 +255,13 @@ impl I686Codegen {
                 let mut stack_offset: usize = 0;
                 for (i, ac) in arg_classes.iter().enumerate() {
                     let ty = arg_types.get(i).copied().unwrap_or(IrType::I32);
-                    let align =
-                        self.stack_arg_align(i, ac, struct_arg_aligns, struct_arg_is_f128_sse);
+                    let align = self.stack_arg_align(
+                        i,
+                        ac,
+                        struct_arg_aligns,
+                        struct_arg_classes,
+                        struct_arg_is_f128_sse,
+                    );
                     stack_offset = (stack_offset + align - 1) & !(align - 1);
                     if Self::push_staging_class_ok(ac, ty) {
                         v.push((stack_offset, i));
@@ -253,7 +314,13 @@ impl I686Codegen {
         for (i, ac) in arg_classes.iter().enumerate() {
             // GCC i386: TFmode 16-byte carriers are 16-byte aligned in the
             // outgoing area; everything else packs at slot granularity.
-            let align = self.stack_arg_align(i, ac, struct_arg_aligns, struct_arg_is_f128_sse);
+            let align = self.stack_arg_align(
+                i,
+                ac,
+                struct_arg_aligns,
+                struct_arg_classes,
+                struct_arg_is_f128_sse,
+            );
             stack_offset = (stack_offset + align - 1) & !(align - 1);
             match ac {
                 call_abi::CallArgClass::I128Stack => {
@@ -263,6 +330,12 @@ impl I686Codegen {
                 call_abi::CallArgClass::F128Stack => {
                     self.emit_call_f128_stack_arg(&args[i], stack_offset);
                     stack_offset += 12;
+                }
+                call_abi::CallArgClass::StructByValStack { size: 16 }
+                    if call_abi::is_scalar_f128_sse_arg(arg_types, struct_arg_is_f128_sse, i) =>
+                {
+                    self.emit_call_f128_sse_stack_arg(&args[i], stack_offset);
+                    stack_offset += 16;
                 }
                 call_abi::CallArgClass::StructByValStack { size }
                 | call_abi::CallArgClass::LargeStructStack { size } => {
@@ -564,6 +637,19 @@ impl I686Codegen {
         _f128_temp_space: usize,
         _indirect: bool,
     ) {
+        if self.dyn_align_cleanup {
+            self.dyn_align_cleanup = false;
+            // The callee may have popped an sret word; the caller passes the
+            // remaining effective area here, so this lands on the save word.
+            if stack_arg_space > 0 {
+                emit!(self.state, "    addl ${}, %esp", stack_arg_space);
+            }
+            // MOV computes the memory address before writing ESP, preserving
+            // every possible return register (including ECX for GP3 vectors).
+            self.state.emit("    movl (%esp), %esp");
+            self.esp_adjust -= (stack_arg_space + 4) as i64;
+            return;
+        }
         if stack_arg_space > 0 {
             emit!(self.state, "    addl ${}, %esp", stack_arg_space);
             self.esp_adjust -= stack_arg_space as i64;

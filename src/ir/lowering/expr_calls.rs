@@ -1230,7 +1230,7 @@ impl Lowerer {
             let arg = args.get(cursor);
             let vector_ct = arg
                 .and_then(|arg| self.call_arg_ctype(param_ctypes, cursor, arg))
-                .filter(|ct| matches!(ct, CType::ExtVector(..)));
+                .filter(|ct| ct.i386_ext_vector_arg().is_some());
             let carrier = vector_ct.as_ref().and_then(CType::i386_ext_vector_arg);
             let (Some(arg), Some(vector_ct), Some(carrier)) = (arg, vector_ct, carrier) else {
                 new_vals.push(value);
@@ -1451,7 +1451,7 @@ impl Lowerer {
                 }
 
                 // A raw GCC 128-bit vector builtin (__builtin_ia32_shufps,
-                // __builtin_shufflevector, ...) yields its vector BY VALUE as a
+                // __builtin_ia32_maxps, ...) yields its vector BY VALUE as a
                 // packed I128; the struct/vector argument-passing path below
                 // expects a POINTER to the 16 data bytes (like any vector lvalue
                 // argument). Spill to a slot and continue as a pointer arg —
@@ -1465,7 +1465,6 @@ impl Lowerer {
                                 "__builtin_ia32_maxps"
                                     | "__builtin_ia32_minps"
                                     | "__builtin_ia32_shufps"
-                                    | "__builtin_shufflevector"
                                     | "__builtin_ia32_vextractf128_ps256"
                             ) {
                                 let slot = self.fresh_value();
@@ -1829,8 +1828,9 @@ impl Lowerer {
                     // bytes of garbage on half of all stack residues
                     // (ABI-EXTVEC-VA-1). The parameter side already records
                     // `ctype_align` for vector params (func_lowering), so the
-                    // caller and callee layouts agree. i686 (cap 4) and ARM
-                    // (cap 16) clamp this through `stack_arg_align_cap`.
+                    // caller and callee layouts agree. ARM (cap 16) clamps
+                    // this through `stack_arg_align_cap`; i686 applies its
+                    // explicit wide-GNU-vector natural-alignment exception.
                     Some(ct) if ct.is_vector() => Some(self.ctype_align(ct)),
                     // _Float128/_Decimal128 args are 16-byte TFmode carriers:
                     // the i686 stack layout aligns them to 16 in the outgoing
@@ -1941,6 +1941,15 @@ impl Lowerer {
         expr: &Expr,
     ) -> Vec<crate::common::types::EightbyteClass> {
         if let Some(ctype) = self.get_expr_ctype(expr) {
+            if self.target == crate::backend::Target::I686 && matches!(&ctype, CType::Vector(..)) {
+                // Distinguish naturally aligned GNU vectors from ordinary
+                // MEMORY records without adding a parallel CallInfo array.
+                // This marker is consumed only by the i386 backend.
+                return vec![
+                    crate::common::types::EightbyteClass::Memory,
+                    crate::common::types::EightbyteClass::NoClass,
+                ];
+            }
             // x86-64 structs, unions AND vectors (a vector has no layout).
             if let Some((classes, _)) = self.sysv_arg_abi(&ctype) {
                 return classes;

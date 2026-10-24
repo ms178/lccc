@@ -584,6 +584,12 @@ gate "vector-static-init" fast \
 gate "vector-ext-codegen" fast \
     env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_vector_ext_codegen.sh
 
+# Incoming x86-64 by-value objects, both frame modes and kill-switch control.
+gate "incoming-byval-homes" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" bash tests/regression/check_incoming_byval_homes.sh
+gate "incoming-byval-homes-clang" fast \
+    env CCC="$LCCC" ORACLE_CC="${CLANG:-clang-23}" bash tests/regression/check_incoming_byval_homes.sh
+
 # `void` objects, members, parameters and initializers (C11 6.7.6.3p10,
 # 6.7.9p3): every row's verdict and message against GCC 16.2.
 gate "void-declarators" fast \
@@ -701,6 +707,13 @@ gate "vector-abi-wide" fast \
 # ABI-GNUVEC-I386-1.
 gate "gnu-vector-align-abi" fast \
     env CCC="$LCCC" bash tests/regression/check_gnu_vector_align_abi.sh
+
+# GCC-compatible 16-byte vector_size i686 carriers, including the SSE-only
+# and no-SSE boundaries, with typed shuffles across every compiler pairing.
+# The hosted leg runs after a swap-enabled fastbuild with GNU as 2.47 and the
+# exact GCC 16.2 / Clang 23.1.3 oracles in the unsharded differential lane.
+gate "i686-gnu-vector-abi" fast \
+    env CCC="$LCCC" bash tests/regression/check_i686_gnu_vector_abi.sh
 
 # AUD-TMP-1: temp files must be symlink-proof. Drives the pre-placed-symlink
 # reproducer (and its pre-placed-directory variant) against the built compiler

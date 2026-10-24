@@ -2733,9 +2733,26 @@ impl CType {
         }
     }
 
+    /// GNU 16-byte vectors share the single-XMM i386 ext-vector carrier only
+    /// when this invocation has SSE. Explicit `-mno-sse` (or an equivalent
+    /// general-register restriction) retains the ordinary aggregate
+    /// stack/sret convention; SSE-only `-mno-sse2` keeps the XMM ABI. Keep
+    /// the other vector_size widths and non-x86 targets separate.
+    fn i386_gnu_xmm_vector(&self) -> bool {
+        target_elf_machine() == 3
+            && crate::common::x86_features::effective()
+                .contains(crate::common::x86_features::X86Feature::Sse)
+            && matches!(self, CType::Vector(elem, 16)
+                if elem.is_integer() || matches!(**elem, CType::Float | CType::Double))
+    }
+
     /// Clang 23.1.3's i386 convention for this ext vector as an argument
-    /// (`None` for other types). See `I386ExtVectorCarrier`.
+    /// or a GNU 16-byte vector (`None` for other types).
+    /// See `I386ExtVectorCarrier`.
     pub fn i386_ext_vector_arg(&self) -> Option<I386ExtVectorCarrier> {
+        if self.i386_gnu_xmm_vector() {
+            return Some(I386ExtVectorCarrier::Xmm { pieces: 1 });
+        }
         let CType::ExtVector(elem, layout) = self else {
             return None;
         };
@@ -2767,8 +2784,12 @@ impl CType {
     }
 
     /// Clang 23.1.3's i386 convention for this ext vector as a return value
-    /// (`None` for other types). See `I386ExtVectorCarrier`.
+    /// or a GNU 16-byte vector (`None` for other types).
+    /// See `I386ExtVectorCarrier`.
     pub fn i386_ext_vector_ret(&self) -> Option<I386ExtVectorCarrier> {
+        if self.i386_gnu_xmm_vector() {
+            return Some(I386ExtVectorCarrier::Xmm { pieces: 1 });
+        }
         let CType::ExtVector(elem, layout) = self else {
             return None;
         };
@@ -2799,7 +2820,7 @@ impl CType {
     /// lane words in EAX/EDX/ECX (I32, I64, or the I128 bundle tagged with
     /// three INTEGER classes), a one-lane floating vector as its x87 scalar,
     /// or one XMM piece (I128 tagged `[Sse, SseUp]`). `None` for sret and
-    /// unsupported returns and for anything but an ext vector.
+    /// unsupported returns and types without a supported vector carrier.
     pub fn i686_ext_vector_ret_carrier(&self) -> Option<(IrType, Vec<EightbyteClass>)> {
         match self.i386_ext_vector_ret()? {
             I386ExtVectorCarrier::Xmm { .. } => Some((

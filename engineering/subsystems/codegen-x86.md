@@ -13,3 +13,24 @@ Boot/`-m16` pipeline: GAS-faithful `.code16gcc` encodings, mcount/`-pg` family e
 Peephole call-site liveness has ONE authority, `passes/liveness.rs::call_site_reads` (the `LCCC_CALL_ARGS` / `LCCC_VA_CALL` / `LCCC_CHAIN_CALL` marker protocol plus retpoline `%r10` and textual operands). `FileLiveness` and the windowed dead-register scans (`call_window_verdict`, used by `memory_fold::is_reg_dead_after` and `scratch_dead_after_relaxed`) both consult it: a call is transparent to callee-saved families, kills only caller-saved families it does not read, and keeps its argument registers live. The windowed scans used to answer "dead" for every register at any call, so `movslq %eax,%rbx; movq %rbx,%rdi; call malloc; … movq %rbx,%rdx` lost its only `%rbx` write (regression `movslq_relay_callee_saved_across_call.c`).
 
 Return liveness reaches the text peephole the same way, as prologue marker comments that are authoritative when present (tail-block inference otherwise): `# LCCC_RET_XMM <mask>` (bit 0 `%xmm0`, bit 1 `%xmm1` read by `ret`), `# LCCC_RET_XMM_BITS <n>` (the widest read, in bits from bit 0, of those registers: 32/64 for scalar `float`/`double`, 128/256/512 for vectors, 512 when the width cannot be bounded; `fp_liveness.rs::ret_xmm_read_bits` lets a rewrite change bits above an element only where no `ret` reads them), `# LCCC_RET_RDX 0|1` and `# LCCC_RET_RAX 0|1` (`prologue.rs::emit_gp_return_liveness_markers`). They are compiler-internal protocol, not environment knobs.
+
+## Incoming MEMORY parameter homes
+
+x86-64 complete `StructStack` / `LargeStructStack` arguments can directly
+home their parameter alloca in the incoming argument area. This is the callee's
+by-value object, not a reference to the caller's source object. Mutation and
+address escape therefore do not require another copy. Positive virtual-frame
+slots remain stable across outgoing calls and dynamic stack realignment;
+FPO uses entry RSP + 8, frame-pointer mode uses RBP + 16.
+
+`IrParam.struct_align` describes ABI placement, whereas `param_align` can
+request stronger local-object alignment. The alloca takes their maximum.
+A typedef raising only a parameter object's alignment must not move the incoming
+argument: GCC copies it to an aligned local home. Such a home is retained when
+its alignment exceeds the incoming guarantee. Clang 23 ignores this stronger
+typedef alignment on aggregate parameter objects; the ABI positions still agree.
+
+`CCC_NO_INCOMING_BYVAL_HOME` retains the incoming-to-local capture copies for
+bisection and A/B measurement. It is invocation-owned in `RaConfig`, not read
+per function or per instruction. The runtime gate checks both switch states,
+both frame modes, both optimization levels and all four compiler pairings.

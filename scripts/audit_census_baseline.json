@@ -3,7 +3,7 @@
   "fns_over_300": 228,
   "fns_over_500": 94,
   "ignored_tests": 10,
-  "knob_literals": 533,
+  "knob_literals": 534,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -236,6 +236,7 @@
     "CCC_NO_IDENTICAL_BLOCK_MERGE",
     "CCC_NO_IFCOMBINE",
     "CCC_NO_IMM_MATERIALIZED",
+    "CCC_NO_INCOMING_BYVAL_HOME",
     "CCC_NO_INDEX_HOME",
     "CCC_NO_INLINE_CALLER_CLEANUP",
     "CCC_NO_INLINE_DEVIRT",

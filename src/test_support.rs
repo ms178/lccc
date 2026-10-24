@@ -104,6 +104,7 @@ impl Drop for TriStateFlagWindow {
     fn drop(&mut self) {
         self.flag
             .store(self.previous, std::sync::atomic::Ordering::Relaxed);
+        FLAG_WINDOW_DEPTH.with(|depth| depth.set(depth.get() - 1));
     }
 }
 
@@ -326,6 +327,41 @@ mod tests {
             None,
             "Drop did not run, so the variable leaked out of the panicking body"
         );
+    }
+
+    #[test]
+    fn tri_state_windows_restore_nesting_and_reacquire_the_lock() {
+        use super::{FLAG_WINDOW_DEPTH, TriStateFlagWindow};
+        use std::sync::atomic::{AtomicI8, Ordering};
+        static FLAG: AtomicI8 = AtomicI8::new(-1);
+        for _ in 0..3 {
+            assert_eq!(FLAG_WINDOW_DEPTH.with(std::cell::Cell::get), 0);
+            let outer = TriStateFlagWindow::new(&FLAG, 0);
+            assert!(
+                outer._guard.is_some(),
+                "each outer window must reacquire the lock"
+            );
+            assert_eq!(FLAG_WINDOW_DEPTH.with(std::cell::Cell::get), 1);
+            {
+                let inner = TriStateFlagWindow::new(&FLAG, 1);
+                assert!(inner._guard.is_none(), "nested window must not deadlock");
+                assert_eq!(FLAG.load(Ordering::Relaxed), 1);
+                assert_eq!(FLAG_WINDOW_DEPTH.with(std::cell::Cell::get), 2);
+            }
+            assert_eq!(FLAG.load(Ordering::Relaxed), 0);
+            assert_eq!(FLAG_WINDOW_DEPTH.with(std::cell::Cell::get), 1);
+            drop(outer);
+            assert_eq!(FLAG.load(Ordering::Relaxed), -1);
+            assert_eq!(FLAG_WINDOW_DEPTH.with(std::cell::Cell::get), 0);
+        }
+        let panicked = std::panic::catch_unwind(|| {
+            let _window = TriStateFlagWindow::new(&FLAG, 1);
+            panic!("exercise Drop while unwinding");
+        });
+        assert!(panicked.is_err());
+        assert_eq!(FLAG.load(Ordering::Relaxed), -1);
+        assert_eq!(FLAG_WINDOW_DEPTH.with(std::cell::Cell::get), 0);
+        assert!(TriStateFlagWindow::new(&FLAG, 0)._guard.is_some());
     }
 
     #[test]

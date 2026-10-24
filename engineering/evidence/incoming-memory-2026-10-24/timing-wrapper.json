@@ -1,0 +1,110 @@
+{
+  "metric": "call-inclusive dependent cf_wrap_phi",
+  "cpu": 0,
+  "driver_flags": [
+    "-O2",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-mavx2",
+    "-mfma"
+  ],
+  "iterations_per_sample": 30000000,
+  "samples_ns": [
+    {
+      "new": 154056324,
+      "original": 324867411
+    },
+    {
+      "original": 319331074,
+      "new": 160971120
+    },
+    {
+      "new": 161214300,
+      "original": 335869793
+    },
+    {
+      "original": 342833581,
+      "new": 154442419
+    },
+    {
+      "new": 155992928,
+      "original": 322073221
+    },
+    {
+      "original": 317963334,
+      "new": 155013952
+    },
+    {
+      "new": 153538554,
+      "original": 319632030
+    },
+    {
+      "original": 321456081,
+      "new": 152870123
+    },
+    {
+      "new": 154103753,
+      "original": 318890484
+    },
+    {
+      "original": 320715139,
+      "new": 154467649
+    },
+    {
+      "new": 155581030,
+      "original": 319826496
+    },
+    {
+      "original": 327176882,
+      "new": 156102940
+    },
+    {
+      "new": 153450987,
+      "original": 320026957
+    },
+    {
+      "original": 339420236,
+      "new": 159014482
+    },
+    {
+      "new": 158658723,
+      "original": 321564088
+    },
+    {
+      "original": 318439433,
+      "new": 156747571
+    },
+    {
+      "new": 154423858,
+      "original": 320168548
+    },
+    {
+      "original": 319637810,
+      "new": 154407576
+    },
+    {
+      "new": 152989655,
+      "original": 321541739
+    },
+    {
+      "original": 328343273,
+      "new": 153982492
+    },
+    {
+      "new": 153758611,
+      "original": 322703062
+    }
+  ],
+  "median_before_over_after": 2.08177048482559,
+  "ratio_median_absolute_deviation": 0.019951615273269496,
+  "before_kernel": ".globl original\n.type original,@function\noriginal:\n.cfi_startproc\n    subq $152, %rsp\n    .cfi_def_cfa_offset 160\n    # LCCC_RET_XMM 1\n    # LCCC_RET_XMM_BITS 256\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 0\n    leaq 79(%rsp), %r11\n    andq $-32, %r11\n    movq 160(%rsp), %rax\n    movq %rax, 0(%r11)\n    movq 168(%rsp), %rax\n    movq %rax, 8(%r11)\n    movq 176(%rsp), %rax\n    movq %rax, 16(%r11)\n    movq 184(%rsp), %rax\n    movq %rax, 24(%r11)\n    movq 192(%rsp), %rax\n    movq %rax, 32(%r11)\n    movq 200(%rsp), %rax\n    movq %rax, 40(%r11)\n    movq 208(%rsp), %rax\n    movq %rax, 48(%r11)\n    movq 216(%rsp), %rax\n    movq %rax, 56(%r11)\n    vmovaps %ymm0, %ymm2\n    testl %edi, %edi\njne .LBB497_original\n.LBB496_original:\n    jmp .LBB498_original\n.LBB497_original:\n    leaq 79(%rsp), %rax\n    andq $-32, %rax\n    vmovups (%rax), %ymm2\n.LBB498_original:\n    leaq 79(%rsp), %rax\n    andq $-32, %rax\n    vmovups (%rax), %ymm4\n    vsubps %ymm4, %ymm2, %ymm0\n    addq $152, %rsp\n    .cfi_def_cfa_offset 8\n    ret\n.cfi_endproc\n.size original, .-original\n",
+  "after_kernel": ".globl optimized\n.type optimized,@function\noptimized:\n.cfi_startproc\n    subq $40, %rsp\n    .cfi_def_cfa_offset 48\n    # LCCC_RET_XMM 1\n    # LCCC_RET_XMM_BITS 256\n    # LCCC_RET_RDX 0\n    # LCCC_RET_RAX 0\n    vmovaps %ymm0, %ymm2\n    testl %edi, %edi\njne .LBB497_optimized\n.LBB496_optimized:\n    jmp .LBB498_optimized\n.LBB497_optimized:\n    vmovups 48(%rsp), %ymm2\n.LBB498_optimized:\n    vmovups 48(%rsp), %ymm4\n    vsubps %ymm4, %ymm2, %ymm0\n    addq $40, %rsp\n    .cfi_def_cfa_offset 8\n    ret\n.cfi_endproc\n.size optimized, .-optimized\n",
+  "driver_sha256": "1c44d50ac0bc316e2582180b8d1e33316b613c4b2f0a7adf1aa85a9460702022",
+  "harness_sha256": "d642aa150b08964ed2861bebb1fed5ac04ab9ff7bdedb2e6e0861982b4e264ec",
+  "before_sha256": "1f53f00a0c04f02bb7cefaf8f59998d67d365519f9b10ad42bfdbdb6659b59d1",
+  "after_sha256": "c04c38df5199dd22f441166a86cf7025e04d2e67b5c34a0823f578d0da6f2356",
+  "compiler": "gcc-16 (GCC) 16.2.0",
+  "cpu_model": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+  "caveat": "Virtualized single host; no PMU or general workload speed claim."
+}

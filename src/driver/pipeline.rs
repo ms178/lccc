@@ -190,9 +190,16 @@ pub struct Driver {
     /// any SSE/SSE2/AVX instructions (movdqu, movss, movsd, etc.).
     /// The Linux kernel uses -mno-sse to avoid FPU state in kernel code.
     pub(super) no_sse: bool,
-    /// Set by an explicit `-mno-sse`/`-mno-sse2`. `-march=native` and CPU
-    /// profiles must not re-enable SSE after that: GCC keeps the disable
-    /// (kernel decompressor: `-mno-sse` then Cachy `-march=native`).
+    /// SSE2 is denied directly or as part of `-mno-sse`. Unlike `no_sse`,
+    /// this can coexist with SSE-only i686 code after explicit `-msse`.
+    pub(super) no_sse2: bool,
+    /// A direct `-mno-sse2` / general-register denial. This survives a later
+    /// SSE-only grant, whereas `-mno-sse -msse` restores the baseline SSE2
+    /// state when no direct SSE2 denial was present (GCC 16.2 flag matrix).
+    pub(super) sse2_explicitly_disabled: bool,
+    /// Set by an explicit `-mno-sse`. `-march=native` and CPU profiles must
+    /// not re-enable SSE after that: GCC keeps the disable (kernel
+    /// decompressor: `-mno-sse` then Cachy `-march=native`).
     pub(super) sse_explicitly_disabled: bool,
     /// Set by `-mno-avx`/`-mno-sse4.x`/`-mno-sse`: the TU explicitly forbade
     /// the VEX encoding itself (every VEX form, 128-bit included).
@@ -238,11 +245,11 @@ pub struct Driver {
     pub(super) enable_prfchw: bool,
     /// Sticky `-mno-prfchw` (GCC: wins over a later PRFCHW `-march=`).
     pub(super) prfchw_explicitly_disabled: bool,
-    /// Explicit `-msse`/`-msse2`. On x86-64 SSE is baseline and only `no_sse`
-    /// matters; on i686 SSE is NOT baseline (the default target is pre-SSE
-    /// silicon), so a positive grant is needed to know that SSE-only
-    /// instructions such as the `prefetcht*` family are legal. Every higher
-    /// SSE/AVX grant is visible through its own `enable_*` bit.
+    /// Explicit SSE/SSE2 grant, used as a positive i686 prefetch grant.
+    /// This is deliberately narrower than the backend's SSE2 ABI baseline:
+    /// default i686 code generation does not by itself promise prefetch-
+    /// capable silicon. Every higher SSE/AVX grant is visible through its
+    /// own `enable_*` bit.
     pub(super) enable_sse: bool,
     /// Set by `-mno-movbe`: MOVBE forbidden.
     pub(super) movbe_explicitly_disabled: bool,
@@ -581,6 +588,8 @@ impl Driver {
             cf_protection_branch: false,
             cf_protection_value: None,
             no_sse: false,
+            no_sse2: false,
+            sse2_explicitly_disabled: false,
             sse_explicitly_disabled: false,
             avx_explicitly_disabled: false,
             avx2_explicitly_disabled: false,
@@ -1650,12 +1659,12 @@ impl Driver {
         // GCC/Clang always define __SSE__, __SSE2__, __MMX__ for x86_64 (baseline ISA).
         // Our i686 backend also uses SSE2, so we define them for i686 as well.
         // Projects like stb_image, minimp3, dr_libs use #ifdef __SSE2__ to enable SIMD paths.
-        preprocessor.set_sse_macros(self.no_sse);
+        preprocessor.set_sse_macros(self.no_sse, self.no_sse2);
         // Define extended feature macros (__SSE3__, __AVX__, __BMI__, ...).
-        // The SIMD half is gated on the xmm file being open (`x86_isa()`
-        // returns NONE under -mno-sse, and macros must mirror codegen —
-        // every SIMD arg is ANDed with `!no_sse` so a stray enable flag can
-        // never over-report).  The INTEGER half (__BMI__, __BMI2__,
+        // The SIMD half is gated on the xmm file being open and its SSE2
+        // prerequisite not being denied. A later `-march=` cannot make a
+        // sticky denial over-report SSE3+ macros. The INTEGER half
+        // (__BMI__, __BMI2__,
         // __LZCNT__, __POPCNT__, __MOVBE__, __RDRND__) follows the RESOLVED
         // integer state with NO -mno-sse gate: integer ISA is legal without
         // xmm state — lccc's codegen emits `andn` for `-mno-sse -O2`
@@ -1664,17 +1673,21 @@ impl Driver {
         // made the preprocessor lie about the codegen contract (an
         // #ifdef __BMI__ fallback path would disagree with the emitted
         // `andnq`).
+        // GFNI/MOVRS/AMX/CMPCCXADD retain their measured SSE-only forms;
+        // SSE3+ and the AVX-dependent families require the second predicate.
+        let xmm_macros_enabled = !self.no_sse;
+        let simd_macros_enabled = xmm_macros_enabled && !self.no_sse2;
         preprocessor.set_extended_simd_macros(
-            !self.no_sse && self.enable_sse3,
-            !self.no_sse && self.enable_ssse3,
-            !self.no_sse && self.enable_sse4_1,
-            !self.no_sse && self.enable_sse4_2,
-            !self.no_sse && self.enable_avx,
-            !self.no_sse && self.enable_avx2,
-            !self.no_sse && self.enable_aes,
-            !self.no_sse && self.enable_pclmul,
-            !self.no_sse && self.enable_f16c,
-            !self.no_sse && self.enable_fma,
+            simd_macros_enabled && self.enable_sse3,
+            simd_macros_enabled && self.enable_ssse3,
+            simd_macros_enabled && self.enable_sse4_1,
+            simd_macros_enabled && self.enable_sse4_2,
+            simd_macros_enabled && self.enable_avx,
+            simd_macros_enabled && self.enable_avx2,
+            simd_macros_enabled && self.enable_aes,
+            simd_macros_enabled && self.enable_pclmul,
+            simd_macros_enabled && self.enable_f16c,
+            simd_macros_enabled && self.enable_fma,
             // INTEGER-ISA macros follow the RESOLVED codegen permission
             // (explicit -march grant or ceiling, default x86-64 baseline,
             // -mno-* denial), not the raw request flags: __BMI__ and
@@ -1687,40 +1700,40 @@ impl Driver {
             self.resolved_popcnt(),
             self.resolved_movbe(),
             self.enable_rdrnd,
-            !self.no_sse && self.enable_avx512f,
-            !self.no_sse && self.enable_avx512cd,
-            !self.no_sse && self.enable_avx512dq,
-            !self.no_sse && self.enable_avx512bw,
-            !self.no_sse && self.enable_avx512vl,
-            !self.no_sse && self.enable_avx512ifma,
-            !self.no_sse && self.enable_avx512vbmi,
-            !self.no_sse && self.enable_avx512vbmi2,
-            !self.no_sse && self.enable_avx512vnni,
-            !self.no_sse && self.enable_avx512bitalg,
-            !self.no_sse && self.enable_avx512vpopcntdq,
-            !self.no_sse && self.enable_avx512bf16,
-            !self.no_sse && self.enable_avx512fp16,
-            !self.no_sse && self.enable_avx512er,
-            !self.no_sse && self.enable_avx512pf,
-            !self.no_sse && self.enable_avx512vp2intersect,
-            !self.no_sse && self.enable_avxvnni,
-            !self.no_sse && self.enable_avxifma,
-            !self.no_sse && self.enable_avxneconvert,
-            !self.no_sse && self.enable_avx10_1,
-            !self.no_sse && self.enable_avx10_2,
-            !self.no_sse && self.enable_gfni,
-            !self.no_sse && self.enable_vaes,
-            !self.no_sse && self.enable_vpclmulqdq,
-            !self.no_sse && self.enable_avxvnniint8,
-            !self.no_sse && self.enable_avxvnniint16,
-            !self.no_sse && self.enable_sha512,
-            !self.no_sse && self.enable_sm3,
-            !self.no_sse && self.enable_sm4,
-            !self.no_sse && self.enable_movrs,
-            !self.no_sse && self.enable_amx_tile,
-            !self.no_sse && self.enable_amx_int8,
-            !self.no_sse && self.enable_amx_bf16,
-            !self.no_sse && self.enable_cmpccxadd,
+            simd_macros_enabled && self.enable_avx512f,
+            simd_macros_enabled && self.enable_avx512cd,
+            simd_macros_enabled && self.enable_avx512dq,
+            simd_macros_enabled && self.enable_avx512bw,
+            simd_macros_enabled && self.enable_avx512vl,
+            simd_macros_enabled && self.enable_avx512ifma,
+            simd_macros_enabled && self.enable_avx512vbmi,
+            simd_macros_enabled && self.enable_avx512vbmi2,
+            simd_macros_enabled && self.enable_avx512vnni,
+            simd_macros_enabled && self.enable_avx512bitalg,
+            simd_macros_enabled && self.enable_avx512vpopcntdq,
+            simd_macros_enabled && self.enable_avx512bf16,
+            simd_macros_enabled && self.enable_avx512fp16,
+            simd_macros_enabled && self.enable_avx512er,
+            simd_macros_enabled && self.enable_avx512pf,
+            simd_macros_enabled && self.enable_avx512vp2intersect,
+            simd_macros_enabled && self.enable_avxvnni,
+            simd_macros_enabled && self.enable_avxifma,
+            simd_macros_enabled && self.enable_avxneconvert,
+            simd_macros_enabled && self.enable_avx10_1,
+            simd_macros_enabled && self.enable_avx10_2,
+            xmm_macros_enabled && self.enable_gfni,
+            simd_macros_enabled && self.enable_vaes,
+            simd_macros_enabled && self.enable_vpclmulqdq,
+            simd_macros_enabled && self.enable_avxvnniint8,
+            simd_macros_enabled && self.enable_avxvnniint16,
+            simd_macros_enabled && self.enable_sha512,
+            simd_macros_enabled && self.enable_sm3,
+            simd_macros_enabled && self.enable_sm4,
+            xmm_macros_enabled && self.enable_movrs,
+            xmm_macros_enabled && self.enable_amx_tile,
+            xmm_macros_enabled && self.enable_amx_int8,
+            xmm_macros_enabled && self.enable_amx_bf16,
+            xmm_macros_enabled && self.enable_cmpccxadd,
             self.enable_apxf,
         );
         // `__PRFCHW__` mirrors the codegen permission exactly (GCC defines
@@ -3339,10 +3352,11 @@ impl Driver {
         set.insert_if(x86_64, F::Cmov);
         set.insert_if(x86_64, F::Fxsr);
         set.insert_if(x86_64 && simd, F::Mmx);
-        // SSE/SSE2 are part of the x86-64 architectural baseline (v1 already
-        // has them); i686 has neither by default.
-        set.insert_if(x86_64 && simd, F::Sse);
-        set.insert_if(x86_64 && simd, F::Sse2);
+        // SSE/SSE2 are the x86-64 architectural baseline and the existing
+        // i686 backend baseline. Publish both for ABI classification and
+        // intrinsic gating; an independent SSE2 denial retains SSE-only i686.
+        set.insert_if(simd, F::Sse);
+        set.insert_if(simd && !self.no_sse2, F::Sse2);
 
         // The SSE3..SSE4.2 ladder.  `x86_isa()` carries only the 128-bit
         // SSE4.1 class, so SSE3/SSSE3/SSE4.2 have no codegen bit of their

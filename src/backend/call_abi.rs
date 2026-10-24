@@ -20,6 +20,57 @@ use crate::ir::reexports::{IrConst, IrFunction, Operand};
 /// scalar stores (GCC torture 20050622-1 passes a 72-MiB object by value).
 pub(super) const LARGE_ARG_COPY_THRESHOLD: usize = 2048;
 
+/// Bit image of a scalar 16-byte SSE-carrier constant (`_Float128` or
+/// `_Decimal128`). The I128 variant is already the converted object image,
+/// not an integer to be converted again. Integer zero is also accepted for
+/// binary128, whose lowering uses it as the canonical zero after some implicit
+/// conversions. Decimal128 constants must already carry their I128 BID image:
+/// integer and literal zeros can have different quantum encodings. Other
+/// scalar constants are rejected rather than reinterpreted as carrier bits;
+/// they indicate a missing conversion in lowering.
+pub(crate) fn f128_sse_const_bits(c: IrConst) -> Option<u128> {
+    match c {
+        IrConst::Zero
+        | IrConst::I8(0)
+        | IrConst::I16(0)
+        | IrConst::I32(0)
+        | IrConst::I64(0)
+        | IrConst::I128(0) => Some(0),
+        IrConst::I128(bits) => Some(bits as u128),
+        _ => None,
+    }
+}
+
+/// Return the object image after the lowering invariant has been checked in
+/// one place. Keeping this internal-error path shared avoids architecture-
+/// specific copies of both the conversion policy and its diagnostic.
+pub(crate) fn f128_sse_const_image(c: IrConst) -> u128 {
+    f128_sse_const_bits(c)
+        .unwrap_or_else(|| panic!("internal error: {c:?} is not a 16-byte SSE scalar constant"))
+}
+
+/// Distinguish a scalar 16-byte VALUE from an ext-vector/aggregate ADDRESS.
+/// i686 deliberately reuses the f128 alignment marker for decomposed XMM
+/// vector pieces, so the marker alone is not sufficient for marshalling.
+/// Both scalar `_Float128` and `_Decimal128` have the U128 IR carrier; an
+/// `__int128` argument cannot be misselected because the CType-derived marker
+/// is false for it.
+pub(crate) fn is_scalar_f128_sse_arg(
+    arg_types: &[IrType],
+    struct_arg_is_f128_sse: &[bool],
+    index: usize,
+) -> bool {
+    arg_types.get(index).copied() == Some(IrType::U128)
+        && struct_arg_is_f128_sse.get(index).copied().unwrap_or(false)
+}
+
+/// Scalar SSE-carrier values are always homed in a 16-byte slot. Share the
+/// explicit invariant failure between x86-64 and i686 rather than silently
+/// manufacturing a partial/zero-filled object when malformed IR violates it.
+pub(crate) fn require_f128_sse_value_slot<T>(slot: Option<T>, value: u32) -> T {
+    slot.unwrap_or_else(|| panic!("internal error: 16-byte SSE scalar v{value} has no stack slot"))
+}
+
 // ---------------------------------------------------------------------------
 // CallArgClass — caller-side classification (used by emit_call_*)
 // ---------------------------------------------------------------------------
@@ -413,8 +464,9 @@ pub struct CallAbiConfig {
     ///   the >16 case, see emit_call_stack_args_impl).
     /// * AArch64/RISC-V: 16 — the psABIs cap stack-argument alignment at
     ///   2*XLEN (the va_arg / prologue readers cap identically).
-    /// * i686: 4 — GCC's i386 cdecl NEVER aligns stack arguments beyond the
-    ///   4-byte slot granularity (PARM_BOUNDARY): not `long long` (align 8),
+    /// * i686: 4 for ordinary scalars/records — GCC's i386 cdecl does not
+    ///   align those stack arguments beyond the 4-byte slot granularity
+    ///   (PARM_BOUNDARY): not `long long` (align 8),
     ///   not over-aligned aggregates. GCC 14.2 -m32 oracle: a 3-int prefix
     ///   places an aligned(32)/24-byte struct at arg offset 12, and the
     ///   callee reads it via %ebp at that same 4-granular offset — the
@@ -422,7 +474,9 @@ pub struct CallAbiConfig {
     ///   i686 caller packs 4-granular and its va_arg readers walk 4-granular,
     ///   so the callee layout (and the va_start overflow offset derived from
     ///   it) must agree — an 8-byte cap here misreads every over-aligned
-    ///   struct arg whose natural offset is 4 (mod 8).
+    ///   struct arg whose natural offset is 4 (mod 8). TFmode carriers and
+    ///   memory-passed GNU vectors are explicit exceptions handled by
+    ///   `i386_gnu_vector_stack_align` and the TFmode branch below.
     pub stack_arg_align_cap: usize,
     /// XMM registers for 16-byte vector pieces on i386 (Clang's
     /// convention, LLVM `CC_X86_32_Vector_Common`): the first three pieces of
@@ -441,6 +495,31 @@ pub struct CallAbiConfig {
     /// honoring the tag there pushed the pointer to the stack while the
     /// callee's `va_arg` read `%rsi` (gcc.c-torture 20020412-1.c aborts).
     pub i386_ext_vector_lanes: bool,
+}
+
+/// Natural stack alignment for an i386 GNU vector MEMORY argument.
+///
+/// The lowering uses `[Memory, NoClass]` as a target-local marker for GNU
+/// `vector_size` aggregates. The second tag distinguishes the marker from an
+/// ordinary SysV `[Memory]` record. It is deliberately gated by the i386
+/// configuration: on x86-64 these bytes are not a vector marker and must
+/// follow that target's own rules. Every memory-passed vector with natural
+/// alignment of at least 16 bytes uses that alignment, including no-SSE v16;
+/// XMM-register pieces never call this helper for stack placement.
+pub(crate) fn i386_gnu_vector_stack_align(
+    config: &CallAbiConfig,
+    classes: &[crate::common::types::EightbyteClass],
+    align: usize,
+) -> Option<usize> {
+    (config.i386_ext_vector_lanes
+        && align >= 16
+        && align.is_power_of_two()
+        && classes
+            == [
+                crate::common::types::EightbyteClass::Memory,
+                crate::common::types::EightbyteClass::NoClass,
+            ])
+    .then_some(align)
 }
 
 impl CallAbiConfig {
@@ -1474,11 +1553,12 @@ fn classify_param_slice(
                 //  * x86-64 (GCC >= 4.6) honors the FULL natural alignment
                 //    of MEMORY-class stack arguments (uncapped; callers
                 //    realign %rsp for the >16 case).
-                //  * i686 cdecl packs EVERYTHING at the 4-byte slot
+                //  * i686 cdecl packs ordinary arguments at the 4-byte slot
                 //    granularity — doubles, 12-byte x87 long double, 8-byte-
                 //    aligned structs, even `aligned(16)` structs (GCC 14.2
-                //    -m32 oracles f1/f3/f7/f8) — with EXACTLY ONE exception:
-                //    TFmode 16-byte carriers (__float128/_Decimal128, the
+                //    -m32 oracles f1/f3/f7/f8) — with separate exceptions for
+                //    memory-passed GNU vectors (natural 16/32/64-byte alignment)
+                //    and TFmode 16-byte carriers (__float128/_Decimal128, the
                 //    is_f128_sse params) are 16-byte aligned (oracles f2/f6:
                 //    (int,__float128,int) puts q at offset 16; libgcc's
                 //    __addtf3 reads its by-value TF args at entry+20/+36).
@@ -1504,6 +1584,11 @@ fn classify_param_slice(
                     slot_size == 4 && param.is_some_and(|p| p.is_f128_sse) && struct_align >= 16;
                 if tf_carrier_ia32 {
                     stack_offset = (stack_offset + 15) & !15;
+                } else if let Some(vector_align) = param.and_then(|p| {
+                    i386_gnu_vector_stack_align(config, &p.struct_eightbyte_classes, struct_align)
+                }) {
+                    let a = vector_align as i64;
+                    stack_offset = (stack_offset + a - 1) & !(a - 1);
                 } else if struct_align > slot_size as usize {
                     // NOTE: the cap is `usize::MAX` when uncapped (x86-64);
                     // the min/max MUST run in usize — casting the cap to i64
@@ -1848,5 +1933,126 @@ mod tests {
             core.classes[2],
             CoreArgClass::IntReg { reg_idx: 0 }
         ));
+    }
+
+    #[test]
+    fn i386_vector_alignment_requires_the_explicit_vector_marker() {
+        let config = i686_regparm3();
+        let vector = [EightbyteClass::Memory, EightbyteClass::NoClass];
+        let ordinary_memory = [EightbyteClass::Memory];
+        assert_eq!(i386_gnu_vector_stack_align(&config, &vector, 16), Some(16));
+        assert_eq!(i386_gnu_vector_stack_align(&config, &vector, 32), Some(32));
+        assert_eq!(i386_gnu_vector_stack_align(&config, &vector, 64), Some(64));
+        assert_eq!(i386_gnu_vector_stack_align(&config, &vector, 8), None);
+        assert_eq!(i386_gnu_vector_stack_align(&config, &[], 32), None);
+        for align in [16, 32, 64] {
+            assert_eq!(
+                i386_gnu_vector_stack_align(&config, &ordinary_memory, align),
+                None
+            );
+        }
+        assert_eq!(
+            i386_gnu_vector_stack_align(&sysv_x86_64(), &vector, 64),
+            None
+        );
+    }
+
+    #[test]
+    fn i386_no_sse_vector_stack_offsets_include_v16_alignment() {
+        let vector = vec![EightbyteClass::Memory, EightbyteClass::NoClass];
+        let param = |size, align, classes: Vec<EightbyteClass>| crate::ir::module::IrParam {
+            ty: IrType::Ptr,
+            noalias: false,
+            struct_size: size,
+            struct_align: align,
+            param_align: None,
+            struct_eightbyte_classes: classes,
+            is_f128_sse: false,
+            riscv_float_class: None,
+        };
+        let params = vec![
+            param(None, None, Vec::new()),
+            param(Some(16), Some(16), vector.clone()),
+            param(Some(32), Some(32), vector),
+        ];
+        let mut config = i686_regparm3();
+        config.max_int_regs = 0; // cdecl no-SSE hidden-sret convention
+        let classified = classify_param_slice("no_sse_vectors", &params, true, false, &config);
+        assert!(matches!(
+            classified.classes[1],
+            ParamClass::StructStack {
+                offset: 16,
+                size: 16
+            }
+        ));
+        assert!(matches!(
+            classified.classes[2],
+            ParamClass::StructStack {
+                offset: 32,
+                size: 32
+            } | ParamClass::LargeStructStack {
+                offset: 32,
+                size: 32
+            }
+        ));
+    }
+
+    #[test]
+    fn scalar_f128_overflow_uses_the_value_stack_class_on_x86() {
+        let f128 = || ArgInfo {
+            struct_size: Some(16),
+            struct_align: Some(16),
+            is_f128_sse: true,
+            ..scalar(&[])
+        };
+        let mut args: Vec<ArgInfo<'_>> = (0..8)
+            .map(|_| ArgInfo {
+                is_float: true,
+                ..scalar(&[])
+            })
+            .collect();
+        args.push(f128());
+        let core = classify_args_core(&args, false, false, &sysv_x86_64());
+        assert!(matches!(
+            core.classes[8],
+            CoreArgClass::StructByValStack { size: 16 }
+        ));
+
+        // i686 has no XMM argument registers and scalar binary128 carries no
+        // aggregate eightbyte classes, so it reaches the same flagged arm.
+        let core = classify_args_core(&[f128()], false, false, &i686_regparm3());
+        assert!(matches!(
+            core.classes[0],
+            CoreArgClass::StructByValStack { size: 16 }
+        ));
+    }
+
+    #[test]
+    fn scalar_f128_marshalling_rejects_vector_address_markers() {
+        // i686 ext-vector XMM pieces reuse the alignment marker but carry
+        // Ptr operands. Only the genuine U128 scalar with the marker may use
+        // the value-copy path; missing metadata and other carriers fail closed
+        // to the aggregate/ordinary-I128 paths respectively.
+        let types = [IrType::Ptr, IrType::U128, IrType::U128, IrType::I128];
+        let markers = [true, true, false, true];
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 0));
+        assert!(is_scalar_f128_sse_arg(&types, &markers, 1));
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 2));
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 3));
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 4));
+    }
+
+    #[test]
+    fn f128_sse_constants_are_object_images_not_aggregate_addresses() {
+        let nine = 0x4002_2000_0000_0000_0000_0000_0000_0000u128;
+        assert_eq!(f128_sse_const_bits(IrConst::I128(nine as i128)), Some(nine));
+        let negative_zero = 1u128 << 127;
+        assert_eq!(
+            f128_sse_const_bits(IrConst::I128(negative_zero as i128)),
+            Some(negative_zero)
+        );
+        assert_eq!(f128_sse_const_bits(IrConst::I64(0)), Some(0));
+        assert_eq!(f128_sse_const_bits(IrConst::I64(9)), None);
+        assert_eq!(f128_sse_const_bits(IrConst::F64(9.0)), None);
     }
 }

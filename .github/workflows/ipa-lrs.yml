@@ -67,6 +67,13 @@ jobs:
         run: bash scripts/ci_install_gcc_oracle.sh --version 16.2
       - name: Verify exact GCC and Clang oracle versions
         run: bash scripts/ci_verify_oracles.sh --gcc-version 16.2 --clang-version 23.1.3
+      - name: Cache GNU as 2.47 for i686 differential
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/gas-2.47-x86_64-linux-gnu
+          key: ${{ runner.os }}-gas-2.47-${{ hashFiles('scripts/ensure_gas_247.sh') }}
+      - name: Provision GNU as 2.47 for i686 differential
+        run: bash scripts/ensure_gas_247.sh x86_64-linux-gnu
       - name: Provision authenticated Intel ICX 2026.2 oracle
         run: |
           set -euo pipefail
@@ -76,6 +83,11 @@ jobs:
           "$binary" --version
       - name: Build fastbuild compiler and linker
         run: ./scripts/build_lccc_fast.sh
+      - name: i686 GNU vector ABI and typed shuffles against GCC and Clang
+        run: |
+          PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
+            CCC=target/fastbuild/lccc bash tests/regression/check_i686_gnu_vector_abi.sh
+          CCC=target/fastbuild/lccc bash tests/regression/measure_i686_vector_copy.sh
       - name: Run IPA/LRS correctness and performance harness
         env:
           CCC: target/fastbuild/lccc
@@ -110,5 +122,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: ipa-lrs-report-${{ github.sha }}
-          path: target/ipa-lrs-report.json
+          path: |
+            target/ipa-lrs-report.json
+            target/i686-vector-copy-benchmark.json
           if-no-files-found: warn

@@ -70,6 +70,20 @@ if cpu_has avx2 && cpu_has fma; then
              "-O2 -mavx2 -mfma -ffp-contract=off")
 fi
 cpu_has avx512f && levels+=("-O2 -mavx512f")
+# Optional, explicit supplemental oracle configurations. Defaults retain the
+# complete host-supported matrix; code-quality/contraction checks always run.
+# Example: GCC=clang-23 "$0" --runtime-level "-O2 -mavx2 -ffp-contract=off"
+if (( $# )); then
+    levels=()
+    while (( $# )); do
+        if [[ $1 != --runtime-level || $# -lt 2 || -z $2 ]]; then
+            echo "usage: $0 [--runtime-level 'compiler flags']..." >&2
+            exit 2
+        fi
+        levels+=("$2")
+        shift 2
+    done
+fi
 # GCC's ISA must match the one lccc ASSUMES, not merely the flags: lccc's
 # documented default-flag baseline is x86-64-v3 for CODEGEN
 # (`src/backend/x86/isa.rs`), so FMA3 contraction is on unless a level
@@ -81,9 +95,20 @@ cpu_has avx512f && levels+=("-O2 -mavx512f")
 # all; there lccc runs with `-ffp-contract=off` so the differential compares
 # equal roundings (lccc's fusion at those levels is covered by Part 3).
 gcc_isa_flags() {
-    # Identity: GCC does not imply -mfma from any -mavx* flag (measured,
-    # gcc 14/16), so the reference build contracts exactly where lccc does.
-    echo "$1"
+    # Pin reference ISA/contraction defaults. Clang implies FMA from
+    # -mavx512f and defaults to in-expression contraction, unlike GCC.
+    # This does not make incompatible vector ABIs or permissible FP
+    # contraction decisions interchangeable across compiler families.
+    local flags=$1
+    case " $flags " in
+        *" -mfma "*) ;;
+        *) flags+=" -mno-fma" ;;
+    esac
+    case " $flags " in
+        *" -ffp-contract="*) ;;
+        *) flags+=" -ffp-contract=fast" ;;
+    esac
+    echo "$flags"
 }
 lccc_isa_flags() {
     case " $1 " in
@@ -228,8 +253,12 @@ ceiling loop_v32i 16
 # Shapes still on the per-lane scalar path, ratcheted at their measured
 # counts so the memory-object cost model cannot regress unnoticed
 # (GCC: 2 / 11 / 11 / 15; see FOLLOWUP "vector-ext scalar residue").
+# MEMORY-class incoming homes avoid capture copies and per-use alignment.
+ceiling cf_wrap_phi 10  # was 32; GCC: 6
+ceiling nine 12         # ninth vector is stack-passed; was 20; GCC: 9
+ceiling nine4 11        # was 17; GCC: 9
 ceiling sadd 2         # single-member vector record: returned like the bare vector (GCC: 2)
-ceiling s4i_add 26     # struct-wrapped 128-bit add
+ceiling s4i_add 16     # struct-wrapped 128-bit add
 ceiling tern_se 53     # ternary whose arms are calls (two sret temporaries)
 ceiling viacall 30     # by-value call into a GCC-built callee + return
 ceiling shr_v32l 6     # signed 64-bit lanes: vpsrlvq + sign fix-up (xor/sub), GCC: 6

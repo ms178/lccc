@@ -1,0 +1,71 @@
+{
+  "gas_version": "GNU assembler (GNU Binutils for Debian) 2.40",
+  "modes": [
+    32,
+    64
+  ],
+  "decisions": 1808,
+  "before": {
+    "mismatches": 416,
+    "false_acceptance": 372,
+    "false_rejection": 44,
+    "correct_accepted_bytes": 346
+  },
+  "after": {
+    "mismatches": 0,
+    "correct_accepted_bytes": 390
+  },
+  "examples": [
+    {
+      "mode": 32,
+      "assembly": "vpsllw %xmm1, %xmm2, %ymm3",
+      "expected": false,
+      "gas_exit": 1,
+      "compiler_exit": 0
+    },
+    {
+      "mode": 32,
+      "assembly": "vpsllw %xmm1, %xmm2, %zmm3",
+      "expected": false,
+      "gas_exit": 1,
+      "compiler_exit": 0
+    },
+    {
+      "mode": 32,
+      "assembly": "vpsllw %xmm1, %ymm2, %xmm3",
+      "expected": false,
+      "gas_exit": 1,
+      "compiler_exit": 0
+    },
+    {
+      "mode": 32,
+      "assembly": "vpsllw %xmm1, %ymm2, %zmm3",
+      "expected": false,
+      "gas_exit": 1,
+      "compiler_exit": 0
+    },
+    {
+      "mode": 32,
+      "assembly": "vpsllw %xmm1, %zmm2, %xmm3",
+      "expected": false,
+      "gas_exit": 1,
+      "compiler_exit": 0
+    }
+  ],
+  "current_binutils": {
+    "version": "GNU Binutils 2.47.20260726",
+    "x86_64_corpus": {
+      "passed": 1434,
+      "failed": 0
+    },
+    "i686_corpus": {
+      "passed": 688,
+      "failed": 0
+    },
+    "packed_shift_matrix": {
+      "decisions": 1808,
+      "accepted_byte_matches": 390,
+      "mismatches": 0
+    }
+  }
+}

@@ -163,7 +163,7 @@ impl Lowerer {
                         // bundle type (I32/I64/I128) computed in the first pass.
                         // Do not collapse the three-register case back to I64.
                         if crate::common::types::target_is_32bit()
-                            && matches!(rc, CType::ExtVector(..))
+                            && rc.i686_ext_vector_ret_carrier().is_some()
                         {
                             return sig.return_type;
                         }
@@ -333,36 +333,45 @@ impl Lowerer {
                         } else if let Some((classes, _)) = sysv_abi.clone() {
                             // A vector: no record layout.
                             (Some(self.ctype_align(&param_ctype)), classes, None)
+                        } else if self.target == crate::backend::Target::I686
+                            && matches!(&param_ctype, CType::Vector(..))
+                        {
+                            // Memory-passed i386 GNU vectors use their natural
+                            // stack alignment, unlike over-aligned records.
+                            // `[Memory, NoClass]` is an internal target-local
+                            // marker (the AMD64 classifier is not involved).
+                            (
+                                Some(self.ctype_align(&param_ctype)),
+                                vec![
+                                    crate::common::types::EightbyteClass::Memory,
+                                    crate::common::types::EightbyteClass::NoClass,
+                                ],
+                                None,
+                            )
                         } else {
                             (None, Vec::new(), None)
                         }
                     } else {
                         (None, Vec::new(), None)
                     };
-                // Struct params carry alignment through `struct_align`.
-                // The struct LAYOUT's natural alignment (layout.align) is not
-                // enough: a typedef override (`typedef S7 AS32
-                // __attribute__((aligned(32)))`) or a direct parameter-list
-                // spelling (`struct S {...} s __attribute__((aligned(32)))`)
-                // raises the alignment of the PARAMETER OBJECT itself above
-                // the layout's — and `&s` must observe it (GCC homes the
-                // param at the declared alignment). Fold the declared
-                // alignment in so the alloca is padded and the capture
-                // targets the effective aligned address.
+                // ABI alignment belongs to the underlying aggregate/vector
+                // type. A typedef or parameter-declaration alignment can raise
+                // the LOCAL parameter object's alignment without changing its
+                // incoming stack position (GCC copies such objects to an aligned
+                // home). Do not fold that request into the ABI classifier.
+                let struct_align =
+                    struct_align.or_else(|| struct_size.map(|_| self.ctype_align(&param_ctype)));
                 let declared_align = self.alignof_type(&param.type_spec);
                 let direct_align = self.param_explicit_alignment(param);
-                let extra = declared_align.max(direct_align.unwrap_or(0));
-                let struct_align = match struct_align {
-                    Some(a) => Some(a.max(extra)),
-                    None if extra > 0 => Some(extra),
-                    None => None,
-                };
+                let object_align = declared_align.max(direct_align.unwrap_or(0));
+                let param_align =
+                    (object_align > struct_align.unwrap_or(0)).then_some(object_align);
                 params.push(IrParam {
                     ty: IrType::Ptr,
                     noalias: false,
                     struct_size,
                     struct_align,
-                    param_align: None,
+                    param_align,
                     struct_eightbyte_classes,
                     riscv_float_class,
                     // "ONE 16-byte %xmm" -- the same carrier _Float128 uses.
@@ -383,7 +392,7 @@ impl Lowerer {
                 // DECLARED alignment may exceed that (typedef override or a
                 // direct parameter-list spelling): `&x` of an
                 // `aligned(32)` _Float128 parameter must be 32-aligned.
-                // Fold it in exactly like the scalar arm.
+                // Keep it in param_align, not in the ABI carrier alignment.
                 let natural_align = self.ctype_align(&param_ctype);
                 let declared_align = self.alignof_type(&param.type_spec);
                 let direct_align = self.param_explicit_alignment(param);
@@ -393,7 +402,7 @@ impl Lowerer {
                     ty: IrType::U128,
                     noalias: false,
                     struct_size: Some(16),
-                    struct_align: Some(16.max(declared)),
+                    struct_align: Some(natural_align),
                     param_align,
                     struct_eightbyte_classes: vec![
                         crate::common::types::EightbyteClass::Sse,
@@ -567,7 +576,12 @@ impl Lowerer {
             // extends the same guarantee to typedef-aligned scalar parameters
             // (`typedef int A32 __attribute__((aligned(32)))`), whose alignment
             // the frontend would otherwise drop entirely.
-            let align = param.struct_align.or(param.param_align).unwrap_or(0);
+            let align = param
+                .struct_align
+                .into_iter()
+                .chain(param.param_align)
+                .max()
+                .unwrap_or(0);
             self.emit(Instruction::Alloca {
                 dest: alloca,
                 ty: param.ty,
