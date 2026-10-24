@@ -111,6 +111,8 @@ impl super::InstructionEncoder {
             &ops[1]
         };
 
+        let use_mmx = crate::backend::x86::assembler::encoder::check_legacy_simd_imm8(ops, opcode)?;
+
         let prefix_len = opcode.iter().position(|&b| b == 0x0F).unwrap_or(0);
 
         match (&ops[0], source, &ops[2]) {
@@ -121,7 +123,6 @@ impl super::InstructionEncoder {
             ) => {
                 let src_num = reg_num(&src.name).ok_or("bad register")?;
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let use_mmx = is_mm(&src.name) || is_mm(&dst.name);
                 if !use_mmx {
                     self.bytes.extend_from_slice(&opcode[..prefix_len]);
                 }
@@ -136,7 +137,6 @@ impl super::InstructionEncoder {
                 Operand::Register(dst),
             ) => {
                 let dst_num = reg_num(&dst.name).ok_or("bad register")?;
-                let use_mmx = is_mm(&dst.name);
                 if !use_mmx {
                     self.bytes.extend_from_slice(&opcode[..prefix_len]);
                 }

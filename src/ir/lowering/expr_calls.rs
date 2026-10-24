@@ -1451,7 +1451,7 @@ impl Lowerer {
                 }
 
                 // A raw GCC 128-bit vector builtin (__builtin_ia32_shufps,
-                // __builtin_shufflevector, ...) yields its vector BY VALUE as a
+                // __builtin_ia32_maxps, ...) yields its vector BY VALUE as a
                 // packed I128; the struct/vector argument-passing path below
                 // expects a POINTER to the 16 data bytes (like any vector lvalue
                 // argument). Spill to a slot and continue as a pointer arg —
@@ -1465,7 +1465,6 @@ impl Lowerer {
                                 "__builtin_ia32_maxps"
                                     | "__builtin_ia32_minps"
                                     | "__builtin_ia32_shufps"
-                                    | "__builtin_shufflevector"
                                     | "__builtin_ia32_vextractf128_ps256"
                             ) {
                                 let slot = self.fresh_value();

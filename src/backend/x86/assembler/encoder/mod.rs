@@ -8609,3 +8609,77 @@ mod immediate_memory_relocation_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod legacy_simd_immediate_shape_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_simd_immediate_register_files_and_field_boundaries() {
+        let source = include_str!(
+            "../../../../../engineering/evidence/instruction-audit-2026-10-24/legacy-immediate-mnemonics.txt"
+        );
+        assert_eq!(source.lines().count(), 27);
+        for mnemonic in source.lines() {
+            let min_imm = if matches!(
+                mnemonic,
+                "palignr"
+                    | "aeskeygenassist"
+                    | "roundsd"
+                    | "roundss"
+                    | "roundpd"
+                    | "roundps"
+                    | "insertps"
+                    | "gf2p8affineqb"
+                    | "gf2p8affineinvqb"
+                    | "cmpsd"
+                    | "cmpss"
+                    | "cmppd"
+                    | "cmpps"
+            ) {
+                0
+            } else {
+                -128
+            };
+            for src in [
+                "mm1", "xmm1", "ymm1", "zmm1", "eax", "ax", "al", "k1", "st(0)", "xmm16",
+            ] {
+                for dst in [
+                    "mm1", "xmm1", "ymm1", "zmm1", "eax", "ax", "al", "k1", "st(0)", "xmm16",
+                ] {
+                    let valid = match mnemonic {
+                        "pshufw" => src == "mm1" && dst == "mm1",
+                        "palignr" => (src == "mm1" || src == "xmm1") && src == dst,
+                        _ => src == "xmm1" && dst == "xmm1",
+                    };
+                    check_modes(&format!("{mnemonic} $3, %{src}, %{dst}"), valid);
+                }
+            }
+            let reg = if mnemonic == "pshufw" { "mm1" } else { "xmm1" };
+            for imm in [-129, -128, -1, 0, 1, 127, 128, 255, 256, i64::MAX, i64::MIN] {
+                check_modes(
+                    &format!("{mnemonic} ${imm}, %{reg}, %{reg}"),
+                    (min_imm..=255).contains(&imm),
+                );
+                check_modes(
+                    &format!("{mnemonic} ${imm}, (%eax), %{reg}"),
+                    (min_imm..=255).contains(&imm),
+                );
+            }
+        }
+    }
+
+    fn check_modes(line: &str, valid: bool) {
+        let mut x64 = InstructionEncoder::new();
+        let mut x32 = crate::backend::i686::assembler::encoder::InstructionEncoder::new();
+        let mut count = 0;
+        for item in parse_asm(line).unwrap() {
+            if let AsmItem::Instruction(instr) = item {
+                assert_eq!(x64.encode(&instr).is_ok(), valid, "x86-64: {line}");
+                assert_eq!(x32.encode(&instr).is_ok(), valid, "i686: {line}");
+                count += 1;
+            }
+        }
+        assert_eq!(count, 1, "{line}");
+    }
+}

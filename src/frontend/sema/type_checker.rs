@@ -356,19 +356,14 @@ impl<'a> ExprTypeChecker<'a> {
                     // back the shuffle alloca's ADDRESS where the caller
                     // expected the 16 bytes of data.
                     //
-                    // `__builtin_shufflevector` is deliberately NOT annotated
-                    // here.  It shares this builtin's semantics but not its
-                    // value convention: its lowering returns the result as a
-                    // PACKED I128 by value (struct_value_size reports None for
-                    // it, and the four name-keyed conventions in expr_types /
-                    // expr_calls / vec128_arg_ptr are written against that),
-                    // while the CType is likewise what makes
-                    // vector_temp_promotion treat the result alloca as a
-                    // promotable vector temporary.  Annotating it made
-                    // `return __builtin_shufflevector(a, b, 3, 2, 1, 0)` read
-                    // a stale slot at -O2 (lanes 2-3 duplicated lanes 0-1).
-                    // Typing it correctly needs that convention rework first.
-                    if name == "__builtin_shuffle" && !args.is_empty() {
+                    // Both shuffle builtins use the ordinary pointer-backed
+                    // vector value convention. Their result type follows the
+                    // first vector rather than a name-only builtin signature.
+                    if matches!(
+                        name.as_str(),
+                        "__builtin_shuffle" | "__builtin_shufflevector"
+                    ) && !args.is_empty()
+                    {
                         if let Some(ct @ (CType::Vector(_, _) | CType::ExtVector(_, _))) =
                             self.infer_expr_ctype(&args[0])
                         {

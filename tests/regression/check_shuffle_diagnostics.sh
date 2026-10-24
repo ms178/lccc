@@ -80,6 +80,17 @@ cat >svnonconst.c <<'C'
 typedef int v4si __attribute__((vector_size(16)));
 v4si s(v4si a, v4si b, int i) { return __builtin_shufflevector(a, b, 0, 1, 2, i); }
 C
+cat > svtypes.c <<'C'
+typedef int v4i __attribute__((vector_size(16)));
+typedef float v4f __attribute__((vector_size(16)));
+v4i f(v4i a, v4f b) { return __builtin_shufflevector(a,b,0,1,2,3); }
+C
+cat > svscalar.c <<'C'
+typedef int v4i __attribute__((vector_size(16)));
+v4i f(v4i a, int b) { return __builtin_shufflevector(a,b,0,1,2,3); }
+C
+expect_rejected svtypes.c "matching vector element types"
+expect_rejected svscalar.c "four-lane 32-bit vector operands"
 expect_rejected svrange.c "invalid element index"
 expect_rejected svnonconst.c "must be an integer constant expression"
 
@@ -93,7 +104,14 @@ if command -v gcc >/dev/null 2>&1; then
             "gcc-$file.err" \
             || { cat "gcc-$file.err" >&2; fail "gcc rejects $file for another reason"; }
     done
-    echo "ok: gcc rejects the same three programs (verdict is oracle-checked)"
+    for file in svtypes.c svscalar.c svrange.c svnonconst.c; do
+        if gcc -O0 -S "$file" -o /dev/null 2>"gcc-$file.err"; then
+            fail "oracle disagreement: gcc accepted $file"
+        fi
+        grep -q '__builtin_shufflevector' "gcc-$file.err" \
+            || { cat "gcc-$file.err" >&2; fail "gcc rejects $file for another reason"; }
+    done
+    echo "ok: gcc rejects all seven malformed shuffle programs"
     # ...and the positive control is NOT oracle-comparable as a whole: the
     # narrow_mask case is the documented acceptance superset above, so the
     # runtime comparison against gcc is done on a form gcc also compiles.

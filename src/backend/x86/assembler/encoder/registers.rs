@@ -958,6 +958,65 @@ fn check_pextr_shape(mnemonic: &str, ops: &[Operand]) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate the legacy SIMD immediate row before register numbers can alias
+/// MMX, XMM, GP or wider vectors. Only PSHUFW is MMX-only; PALIGNR has
+/// separate MMX/XMM rows. All other callers use an XMM-only legacy row.
+/// Return whether the emitter must select the MMX (no mandatory prefix) row.
+pub(crate) fn check_legacy_simd_imm8(ops: &[Operand], opcode: &[u8]) -> Result<bool, String> {
+    let [
+        Operand::Immediate(ImmediateValue::Integer(imm)),
+        src,
+        Operand::Register(dst),
+    ] = ops
+    else {
+        return Err(
+            "legacy SIMD immediate instruction requires imm8, source, destination".to_string(),
+        );
+    };
+    // GNU's signed spelling is row-specific: several control operands are
+    // explicitly unsigned (ROUND*, compares, PALIGNR, INSERTPS, AES and GFNI).
+    // Both spellings still encode exactly one byte; do not silently truncate.
+    let signed_alias = matches!(opcode,
+        [0x0F, 0x70 | 0xC6] | [0x66 | 0xF2 | 0xF3, 0x0F, 0x70]
+        | [0x66, 0x0F, 0xC6] | [0x0F, 0x3A, 0xCC]
+        | [0x66, 0x0F, 0x3A, 0x0C..=0x0E | 0x40..=0x44]);
+    let min_imm = if signed_alias { -128 } else { 0 };
+    if !(min_imm..=255).contains(imm) {
+        return Err("immediate does not fit this instruction's 8-bit field".to_string());
+    }
+    let mmx = |name: &str| {
+        name.strip_prefix("mm")
+            .and_then(|n| n.parse::<u8>().ok())
+            .is_some_and(|n| n < 8)
+    };
+    let xmm = |name: &str| is_xmm(name) && vec_reg_id(name).is_some_and(|n| n < 16);
+    let use_mmx = mmx(&dst.name);
+    let valid_destination = match opcode {
+        [0x0F, 0x70] => use_mmx, // PSHUFW, not PSHUFD/PSHUFLW/PSHUFHW.
+        [0x66, 0x0F, 0x3A, 0x0F] => use_mmx || xmm(&dst.name), // PALIGNR.
+        _ => xmm(&dst.name),
+    };
+    let valid_source = match src {
+        Operand::Register(r) => {
+            if use_mmx {
+                mmx(&r.name)
+            } else {
+                xmm(&r.name)
+            }
+        }
+        Operand::Memory(_) => true,
+        Operand::Label(s) => !s.starts_with('{'), // normalized absolute memory
+        _ => false,
+    };
+    if !valid_destination || !valid_source {
+        return Err(
+            "operand type or register width mismatch for legacy SIMD immediate instruction"
+                .to_string(),
+        );
+    }
+    Ok(use_mmx)
+}
+
 /// Validate that an instruction's operands are mutually consistent.
 ///
 /// This catches the class of malformed input that would otherwise be encoded

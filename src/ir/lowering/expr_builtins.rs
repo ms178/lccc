@@ -2010,7 +2010,7 @@ impl Lowerer {
                 if matches!(&**callee, Expr::Identifier(n, _)
                     if matches!(n.as_str(),
                         "__builtin_ia32_maxps" | "__builtin_ia32_minps"
-                        | "__builtin_ia32_shufps" | "__builtin_shufflevector"
+                        | "__builtin_ia32_shufps"
                         | "__builtin_ia32_vextractf128_ps256")));
         let op = self.lower_expr(arg);
         if !is_by_value {
@@ -2425,13 +2425,65 @@ impl Lowerer {
     fn lower_shufflevector(&mut self, args: &[Expr]) -> Option<Operand> {
         if args.len() != 6 {
             return self.reject_builtin_call(
-                "wrong number of arguments to '__builtin_shufflevector' (this                  implementation supports the 4-lane 32-bit form: 2 vectors + 4 indices)"
-                    .to_string(),
-                args,
-                16,
+                "wrong number of arguments to '__builtin_shufflevector' (this implementation supports two vectors and four indices)".to_string(), args, 16,
             );
-            return None;
         }
+        for arg in &args[..2] {
+            if let Some(ct) = self.get_expr_ctype(arg) {
+                if !ct
+                    .vector_info()
+                    .is_some_and(|(element, lanes)| element.size() == 4 && lanes == 4)
+                {
+                    return self.reject_builtin_call(
+                        "'__builtin_shufflevector' requires four-lane 32-bit vector operands"
+                            .to_string(),
+                        args,
+                        16,
+                    );
+                }
+            }
+        }
+        if let (Some(first), Some(second)) =
+            (self.get_expr_ctype(&args[0]), self.get_expr_ctype(&args[1]))
+        {
+            if let (Some((a, _)), Some((b, _))) = (first.vector_info(), second.vector_info()) {
+                if a != b {
+                    return self.reject_builtin_call(
+                        "'__builtin_shufflevector' requires matching vector element types"
+                            .to_string(),
+                        args,
+                        16,
+                    );
+                }
+            }
+        }
+        let mut indices = [0i64; 4];
+        for (lane, index) in indices.iter_mut().enumerate() {
+            *index = match self.eval_const_expr(&args[2 + lane]) {
+                Some(IrConst::I64(v)) => v,
+                Some(IrConst::I32(v)) => v as i64,
+                Some(IrConst::I8(v)) => v as i64,
+                Some(IrConst::I16(v)) => v as i64,
+                _ => return self.reject_builtin_call(
+                    format!("argument {} of '__builtin_shufflevector' must be an integer constant expression", 3 + lane), args, 16,
+                ),
+            };
+            if !(-1..8).contains(index) {
+                return self.reject_builtin_call(
+                    format!(
+                        "invalid element index '{}' to '__builtin_shufflevector'",
+                        index
+                    ),
+                    args,
+                    16,
+                );
+            }
+            // -1 is an unspecified lane. Choose lane zero of the first input.
+            if *index == -1 {
+                *index = 0;
+            }
+        }
+        // Evaluate both operands once even if only one supplies output lanes.
         let v1 = self.vec128_arg_ptr(&args[0]);
         let v2 = self.vec128_arg_ptr(&args[1]);
         let v1p = self.operand_to_value(v1);
@@ -2445,45 +2497,45 @@ impl Lowerer {
             volatile: false,
             semantic_volatile: false,
         });
-        for lane in 0..4usize {
-            let idx = match self.eval_const_expr(&args[2 + lane]) {
-                Some(IrConst::I64(v)) => v,
-                Some(IrConst::I32(v)) => v as i64,
-                Some(IrConst::I8(v)) => v as i64,
-                Some(IrConst::I16(v)) => v as i64,
-                _other => {
-                    return self.reject_builtin_call(
-                        format!(
-                            "argument {} of '__builtin_shufflevector' must be an integer constant expression",
-                            3 + lane
-                        ),
-                        args,
-                        16,
-                    );
-                }
-            };
-            let (src, off) = if idx < 0 {
-                (v1p, 0i64)
-            } else if idx < 4 {
-                (v1p, idx * 4)
-            } else if idx < 8 {
-                (v2p, (idx - 4) * 4)
+        let first_only = indices.iter().all(|&i| i < 4);
+        let second_only = indices.iter().all(|&i| i >= 4);
+        if (first_only || second_only)
+            && matches!(
+                self.target,
+                crate::backend::Target::X86_64 | crate::backend::Target::I686
+            )
+            && crate::common::x86_features::effective()
+                .contains(crate::common::x86_features::X86Feature::Sse2)
+        {
+            // PSHUFD copies arbitrary 32-bit bit patterns, including floats;
+            // it is not a floating-point operation and raises no FP exception.
+            let immediate = indices
+                .iter()
+                .enumerate()
+                .fold(0i32, |imm, (lane, &i)| imm | ((i as i32 & 3) << (lane * 2)));
+            self.emit(Instruction::Intrinsic {
+                dest: None,
+                op: IntrinsicOp::Pshufd128,
+                dest_ptr: Some(result),
+                args: vec![
+                    Operand::Value(if first_only { v1p } else { v2p }),
+                    Operand::Const(IrConst::I32(immediate)),
+                ],
+            });
+            return Some(Operand::Value(result));
+        }
+        // Mixed sources and non-SSE2 targets retain the portable scalar gather.
+        for (lane, &index) in indices.iter().enumerate() {
+            let (src, offset) = if index < 4 {
+                (v1p, index * 4)
             } else {
-                return self.reject_builtin_call(
-                    format!(
-                        "invalid element index '{}' to '__builtin_shufflevector'",
-                        idx
-                    ),
-                    args,
-                    16,
-                );
-                return None;
+                (v2p, (index - 4) * 4)
             };
             let src_ptr = self.fresh_value();
             self.emit(Instruction::GetElementPtr {
                 dest: src_ptr,
                 base: src,
-                offset: Operand::Const(IrConst::I64(off)),
+                offset: Operand::Const(IrConst::I64(offset)),
                 ty: IrType::I8,
             });
             let lane_val = self.fresh_value();
@@ -2509,8 +2561,9 @@ impl Lowerer {
                 seg_override: AddressSpace::Default,
             });
         }
-        // Raw builtin: return the vector BY VALUE (packed I128).
-        Some(self.pack_vec128_from_slot(result))
+        // Typed vector expressions always carry the address of their data,
+        // just like vector lvalues and __builtin_shuffle results >8 bytes.
+        Some(Operand::Value(result))
     }
 
     /// Lower an X86 SSE/AES/CRC intrinsic to IR.
