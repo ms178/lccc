@@ -168,4 +168,3 @@ test passes::vectorize::window_union_tests::union_fold_refuses_when_the_precondi
 test passes::vectorize::window_union_tests::single_bit_union_matches_the_union_exhaustively_at_8_bits ... ok
 
 test result: ok. 164 passed; 0 failed; 0 ignored; 0 measured; 6134 filtered out; finished in 0.22s
-

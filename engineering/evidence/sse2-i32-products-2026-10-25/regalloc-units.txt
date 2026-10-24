@@ -150,4 +150,3 @@ test backend::regalloc::wide_hazard_tests::integer_truncation_out_of_i128_has_a_
 test backend::regalloc::ipa_fill_tests::interval_covering_counts_matches_naive_at_scale ... ok
 
 test result: ok. 146 passed; 0 failed; 0 ignored; 0 measured; 6152 filtered out; finished in 0.02s
-

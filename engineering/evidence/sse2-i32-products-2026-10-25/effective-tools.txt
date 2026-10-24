@@ -11,7 +11,7 @@ Target: x86_64-pc-linux-gnu
 Configured with: ../gcc-16.2.0/configure --prefix=/opt/gcc-16 --program-suffix=-16 --enable-languages=c,c++ --disable-bootstrap --disable-nls --disable-libsanitizer --disable-werror --with-system-zlib
 Thread model: posix
 Supported LTO compression algorithms: zlib zstd
-gcc version 16.2.0 (GCC) 
+gcc version 16.2.0 (GCC)
 COLLECT_GCC_OPTIONS='-o' '/home/user/artifacts/sse/probe-gcc' '-mtune=generic' '-march=x86-64' '-dumpdir' '/home/user/artifacts/sse/probe-gcc-'
  /home/user/.cache/oracles/gcc-16.2.0/bin/../libexec/gcc/x86_64-pc-linux-gnu/16.2.0/cc1 -quiet -imultiarch x86_64-linux-gnu -iprefix /home/user/.cache/oracles/gcc-16.2.0/bin/../lib/gcc/x86_64-pc-linux-gnu/16.2.0/ /home/user/artifacts/sse/mul-probe.c -quiet -dumpdir /home/user/artifacts/sse/probe-gcc- -dumpbase mul-probe.c -dumpbase-ext .c "-mtune=generic" "-march=x86-64" -o /tmp/ccA1rnRB.s
 COLLECT_GCC_OPTIONS='-o' '/home/user/artifacts/sse/probe-gcc' '-mtune=generic' '-march=x86-64' '-dumpdir' '/home/user/artifacts/sse/probe-gcc-'

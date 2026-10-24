@@ -112,7 +112,8 @@ python3 tests/benchmark/run_benchmarks.py --only i32_product_map \
 The full per-arm assembly is reproducible from the gate; its fingerprints
 and commands are retained in `feature-matrix.json`. Raw runtime samples,
 compiler/binary fingerprints and output checks are retained in the runtime
-report. Compiler Explorer access failed because that host is unavailable in
+report. Text transcripts normalize trailing whitespace only;
+the structured runtime data and compiler output hashes are unchanged. Compiler Explorer access failed because that host is unavailable in
 this environment; the local verified GCC/Clang comparisons are the evidence.
 No new local ICX measurement or complete architectural audit is claimed.
 
