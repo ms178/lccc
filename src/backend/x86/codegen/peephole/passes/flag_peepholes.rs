@@ -543,16 +543,19 @@ pub(super) fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usiz
     false
 }
 
-/// Index of the next non-NOP line after `i`, or `None`.
-fn next_real(infos: &[LineInfo], i: usize, len: usize) -> Option<usize> {
-    let mut k = i + 1;
-    while k < len {
-        if !infos[k].is_nop() {
-            return Some(k);
-        }
-        k += 1;
-    }
-    None
+/// Index of the next line after `i` that is neither a NOP nor a
+/// debug-attribution directive (`.loc`/`.file`), or `None`.
+///
+/// Attribution lines are free of the window's step budget, exactly as
+/// `next_memfold_instruction` in `memory_fold.rs` treats them (its proof
+/// budgets carry the same invariant): if they counted, whether a pair fits
+/// the window would depend on whether `-g` was passed, and the same source
+/// would emit different `.text` with and without debug information
+/// (check_debug_code_parity.py).  Without `-g` no attribution lines exist
+/// in a function, so this changes nothing for plain builds.
+fn next_real(store: &LineStore, infos: &[LineInfo], i: usize, len: usize) -> Option<usize> {
+    let k = next_non_debug(store, infos, i + 1, len);
+    (k < len).then_some(k)
 }
 
 /// Parse `$<int>` (decimal, optionally negative) into its value.
@@ -639,7 +642,7 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-        let Some(j) = next_real(infos, i, len) else {
+        let Some(j) = next_real(store, infos, i, len) else {
             i += 1;
             continue;
         };
@@ -820,7 +823,7 @@ pub(super) fn fold_lea_add_into_lea(store: &mut LineStore, infos: &mut [LineInfo
             i += 1;
             continue;
         };
-        let Some(j) = next_real(infos, i, len) else {
+        let Some(j) = next_real(store, infos, i, len) else {
             i += 1;
             continue;
         };
@@ -963,7 +966,7 @@ pub(super) fn fold_inplace_add_copy_into_lea(
         // register. The copy may be WIDER than the arithmetic (movq after
         // addl), never narrower (a movl copy would truncate the 64-bit
         // result the LEA must produce).
-        let Some(j) = next_real(infos, i, len) else {
+        let Some(j) = next_real(store, infos, i, len) else {
             i += 1;
             continue;
         };
@@ -1078,7 +1081,7 @@ pub(super) fn fold_copy_shift_into_lea(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         }
-        let Some(j) = next_real(infos, i, len) else {
+        let Some(j) = next_real(store, infos, i, len) else {
             i += 1;
             continue;
         };
@@ -1348,7 +1351,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
         // %r11d, %r11d; cmovnel` (the allocator reusing the dead setcc
         // register) kept setbe+movzbl+test in the ASCII case-fold loop.
         let mut retired_mask: u16 = 0;
-        while let Some(n) = next_real(infos, k, len) {
+        while let Some(n) = next_real(store, infos, k, len) {
             k = n;
             if infos[n].pinned || infos[n].is_barrier() {
                 break;
@@ -1679,7 +1682,7 @@ pub(super) fn fold_copy_and_mask_into_movz(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         }
-        let Some(j) = next_real(infos, i, len) else {
+        let Some(j) = next_real(store, infos, i, len) else {
             i += 1;
             continue;
         };
@@ -1762,7 +1765,7 @@ fn copy_mask_partner(
 ) -> Option<usize> {
     let mut k = i;
     for _ in 0..=COPY_MASK_WINDOW {
-        k = next_real(infos, k, len)?;
+        k = next_real(store, infos, k, len)?;
         let t = infos[k].trimmed(store.get(k));
         if infos[k].pinned || infos[k].is_barrier() || infos[k].kind == LineKind::InlineAsm {
             return None;
@@ -1882,7 +1885,7 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
                 i += 1;
                 continue;
             }
-            let Some(k) = next_real(infos, j, len) else {
+            let Some(k) = next_real(store, infos, j, len) else {
                 i += 1;
                 continue;
             };
@@ -1921,7 +1924,7 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
         }
         // Someone must actually consume the flags in this block, otherwise the
         // pair is dead-code territory, not ours.
-        let Some(k) = next_real(infos, j, len) else {
+        let Some(k) = next_real(store, infos, j, len) else {
             i += 1;
             continue;
         };
@@ -4149,6 +4152,35 @@ mod tests {
         }
     }
 
+    /// Debug attribution must not consume the window's step budget.  With
+    /// `-g` every instruction carries a `.loc` line, so if attribution
+    /// counted, the same source would fold the pair in the plain build but
+    /// not in the `-g` build and the two `.text` sections would differ
+    /// (check_debug_code_parity.py).  This case sits one attribution line
+    /// past the 12-real-line budget: the old budgeting (attribution counted)
+    /// rejected the fold, the transparent walk accepts it, and the plain
+    /// build (no attribution lines at all) is bit-identical before and after.
+    #[test]
+    fn debug_attribution_does_not_break_copy_mask_window() {
+        let mid = "    addq %r12, %r13\n".repeat(12) + ".loc 1 42 0\n";
+        let asm = format!(
+            ".cfi_startproc\n    movq %rax, %r10\n{mid}    andq $255, %r10\n    je .LBB5\n    movq %r12, %rax\n    ret\n.LBB5:\n    ret\n.cfi_endproc\n"
+        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(super::fold_copy_and_mask_into_test(&mut store, &mut infos));
+        let out = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(out.contains("testb %al, %al"), "{out}");
+        assert!(!out.contains("movq %rax, %r10"), "{out}");
+        assert!(!out.contains("andq $255, %r10"), "{out}");
+    }
+
     /// The all-ones dword mask tests the register against itself.
     #[test]
     fn all_ones_dword_mask_becomes_register_testl() {
@@ -5084,10 +5116,10 @@ pub(super) fn fold_conditional_increment(store: &mut LineStore, infos: &mut [Lin
         if infos[i].is_nop() || infos[i].pinned {
             continue;
         }
-        let Some(j) = next_real(infos, i, store.len()) else {
+        let Some(j) = next_real(store, infos, i, store.len()) else {
             continue;
         };
-        let Some(k) = next_real(infos, j, store.len()) else {
+        let Some(k) = next_real(store, infos, j, store.len()) else {
             continue;
         };
         if infos[j].pinned || infos[k].pinned {
