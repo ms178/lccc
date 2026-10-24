@@ -96,6 +96,13 @@ impl I686Codegen {
         }
 
         let mut offset = 0usize;
+        // SSE1 movups copies exact bits and handles unaligned struct slots;
+        // the scalar path remains mandatory for -mno-sse.
+        while self.sse_enabled && offset + 16 <= size {
+            emit!(self.state, "    movups {}(%ecx), %xmm0", offset);
+            emit!(self.state, "    movups %xmm0, {}(%eax)", offset);
+            offset += 16;
+        }
         while offset < size {
             let remaining = size - offset;
             if remaining >= 4 {

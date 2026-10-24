@@ -225,8 +225,9 @@ impl I686Codegen {
             let save_bytes = 4usize;
             let total = stack_arg_space + save_bytes;
             self.state.emit("    movl %esp, %ecx");
-            self.state.emit("    movl %ecx, %eax");
-            emit!(self.state, "    subl ${}, %eax", total);
+            // LEA computes the same padding with one fewer instruction than
+            // copying ECX to EAX and subtracting; flags are not needed here.
+            emit!(self.state, "    leal -{}(%esp), %eax", total);
             emit!(self.state, "    andl ${}, %eax", dyn_align_a - 1);
             self.state.emit("    subl %eax, %esp");
             self.state.emit("    subl $4, %esp");

@@ -158,6 +158,9 @@ pub struct I686Codegen {
     /// `IntrinsicOp::Prefetch` lowering permissions; `None` under
     /// `CCC_NO_PREFETCH` (see `CodegenOptions::no_prefetch`).
     pub(super) prefetch_isa: Option<crate::backend::x86_common::X86PrefetchIsa>,
+    /// Final TU permission for SSE1 `movups` copies. This is independent of
+    /// SSE2/AVX: no-SSE targets retain the scalar bit-exact copy loops.
+    pub(super) sse_enabled: bool,
     /// Same-block div/rem pair analysis (see backend::regalloc::
     /// compute_i686_divrem_pairs). Recomputed per function; the emitter uses
     /// tail_dests/head_partners to fuse URem+UDiv couples into one divl.
@@ -548,6 +551,7 @@ impl I686Codegen {
             bmi1_enabled: false,
             popcnt_enabled: false,
             prefetch_isa: None,
+            sse_enabled: false,
         }
     }
 
@@ -586,6 +590,7 @@ impl I686Codegen {
         self.popcnt_enabled = opts.popcnt;
         // i686 is NOT SSE-baseline: the driver decides (SSE or PRFCHW).
         self.prefetch_isa = (!opts.no_prefetch).then_some(opts.x86_prefetch);
+        self.sse_enabled = !opts.no_sse && !opts.general_regs_only;
     }
 
     // --- i686 helper methods ---
@@ -1777,8 +1782,7 @@ impl I686Codegen {
         if dyn_align {
             let total = stack_arg_space + 4;
             self.state.emit("    movl %esp, %ecx");
-            self.state.emit("    movl %ecx, %eax");
-            emit!(self.state, "    subl ${}, %eax", total);
+            emit!(self.state, "    leal -{}(%esp), %eax", total);
             emit!(self.state, "    andl ${}, %eax", dyn_align_a - 1);
             self.state.emit("    subl %eax, %esp");
             self.state.emit("    subl $4, %esp");
@@ -2106,6 +2110,19 @@ impl I686Codegen {
         n_bytes: usize,
     ) {
         let mut copied = 0usize;
+        // SSE1 movups is a bit copy, not an FP conversion. It is valid for
+        // unaligned slots and avoids eight dword instructions per 16 bytes;
+        // no-SSE targets keep the exact scalar loop below.
+        while self.sse_enabled && copied + 16 <= n_bytes {
+            let sr = self.slot_ref_offset(slot, copied as i64);
+            emit!(self.state, "    movups {}, %xmm0", sr);
+            emit!(
+                self.state,
+                "    movups %xmm0, {}(%esp)",
+                stack_offset + copied
+            );
+            copied += 16;
+        }
         while copied + 4 <= n_bytes {
             let sr = self.slot_ref_offset(slot, copied as i64);
             emit!(self.state, "    movl {}, %eax", sr);
@@ -2329,6 +2346,15 @@ impl I686Codegen {
                         emit!(self.state, "    addl ${}, %ecx", a - 1);
                         emit!(self.state, "    andl ${}, %ecx", -(a as i32));
                         let mut copied = 0usize;
+                        while self.sse_enabled && copied + 16 <= size {
+                            emit!(self.state, "    movups {}(%ecx), %xmm0", copied);
+                            emit!(
+                                self.state,
+                                "    movups %xmm0, {}(%esp)",
+                                stack_offset + copied
+                            );
+                            copied += 16;
+                        }
                         while copied + 4 <= size {
                             emit!(self.state, "    movl {}(%ecx), %eax", copied);
                             emit!(self.state, "    movl %eax, {}(%esp)", stack_offset + copied);
@@ -2350,20 +2376,22 @@ impl I686Codegen {
                 // pointer-deref path below would read the first dword as an
                 // address (state.rs resolve_slot_addr SEGV case).
                 if let Some(slot) = self.state.get_slot(v.0) {
-                    let mut copied = 0usize;
-                    while copied + 4 <= size {
-                        let sr = self.slot_ref_offset(slot, copied as i64);
-                        emit!(self.state, "    movl {}, %eax", sr);
-                        emit!(self.state, "    movl %eax, {}(%esp)", stack_offset + copied);
-                        copied += 4;
-                    }
-                    self.state.reg_cache.invalidate_acc();
+                    self.emit_copy_slot_to_stack(slot, stack_offset, size);
                 }
             } else {
                 // Non-alloca: value is a pointer to struct data.
                 self.operand_to_eax(arg);
                 self.state.emit("    movl %eax, %ecx");
                 let mut copied = 0usize;
+                while self.sse_enabled && copied + 16 <= size {
+                    emit!(self.state, "    movups {}(%ecx), %xmm0", copied);
+                    emit!(
+                        self.state,
+                        "    movups %xmm0, {}(%esp)",
+                        stack_offset + copied
+                    );
+                    copied += 16;
+                }
                 while copied + 4 <= size {
                     emit!(self.state, "    movl {}(%ecx), %eax", copied);
                     emit!(self.state, "    movl %eax, {}(%esp)", stack_offset + copied);
@@ -4686,5 +4714,20 @@ mod tests {
                 assert!(const_stack_arg_fold_wins(imm), "{name}");
             }
         }
+    }
+
+    #[test]
+    fn sse_copy_permission_follows_final_target_gates() {
+        let mut cg = I686Codegen::new();
+        let mut opts = crate::backend::CodegenOptions::default();
+        cg.apply_options(&opts);
+        assert!(cg.sse_enabled);
+        opts.no_sse = true;
+        cg.apply_options(&opts);
+        assert!(!cg.sse_enabled);
+        opts.no_sse = false;
+        opts.general_regs_only = true;
+        cg.apply_options(&opts);
+        assert!(!cg.sse_enabled);
     }
 }
