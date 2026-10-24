@@ -1,6 +1,6 @@
 {
   "after": "/home/user/lccc/target/fastbuild/lccc",
-  "before": "/home/user/artifacts/audit/lccc-baseline",
+  "before": "/home/user/artifacts/audit/lccc-baseline-modern",
   "compile_fail": 0,
   "corpora": [
     "/home/user/lccc/tests/benchmark/kernel_corpus",
@@ -8,7 +8,7 @@
   ],
   "default_flags": "-O2",
   "different": 0,
-  "elapsed_seconds": 2.87,
+  "elapsed_seconds": 3.031,
   "explicit_environment": {},
   "extra": [],
   "identical": 94,

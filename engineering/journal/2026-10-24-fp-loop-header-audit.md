@@ -18,33 +18,35 @@ back-edges. Cache a label index lazily once per invocation, retaining the first
 occurrence and requiring its position to precede the jump. This pass changes
 only instruction text, not label identities, positions or classifications.
 
-The initial 15-pair CPU-pinned experiment (two excluded warmups) measured:
+The accepted 15-pair CPU-pinned experiment (two excluded warmups), using
+matched GCC 16.2 host-driver builds, measured:
 
 | Functions | Before median, seconds | After median, seconds | Before/after |
 | --- | ---: | ---: | ---: |
-| 40 | 0.243943 | 0.234882 | 1.039 |
-| 120 | 0.841302 | 0.744582 | 1.130 |
+| 40 | 0.248453 | 0.236989 | 1.048 |
+| 120 | 0.851961 | 0.751183 | 1.134 |
 
 Callgrind on the same fixed inputs, with identical output assembly:
 
 | Functions | Before Ir | After Ir | Reduction |
 | --- | ---: | ---: | ---: |
-| 40 | 3,224,400,549 | 3,101,676,030 | 3.81% |
-| 120 | 10,781,171,046 | 9,608,985,532 | 10.87% |
+| 40 | 3,229,288,392 | 3,099,972,894 | 4.00% |
+| 120 | 10,794,101,306 | 9,607,176,948 | 11.00% |
 
 The indexed pass's inclusive 40-function cost is now about 0.12%, compared
 with the preceding profile's approximately 4%. The peephole still consumes
-72.33% in this new profile, so the ≤35% MB-20 criterion remains **open**.
+72.32% in this new profile, so the ≤35% MB-20 criterion remains **open**.
 These are compiler-cost numbers, not generated-program speedups. Both inputs
-satisfy the bounded 3% Ir non-regression check. The measured x86-phase compiler
-and final compiler are recorded separately by hash; adding the independent
-RV64 range helper does not turn the earlier binary into the final binary.
-
-A separate 15-pair confirmation using the final compiler (including the RV64
-helper) measured 0.242943 → 0.229257 s for 40 functions (1.060×) and
-0.842614 → 0.744973 s for 120 (1.131×). Its raw samples and final binary hash
-are in `final-compile-cost.json`; the earlier phase and its profiles are kept
-rather than silently relabelled as the final executable.
+satisfy the bounded 3% Ir non-regression check. A final provenance review found
+that the initial bootstrap Rust builds used the system GCC 12 driver, although
+the C oracles correctly used GCC 16.2. Those preliminary compiler-cost numbers
+are superseded, not acceptance evidence. Both compiler arms were rebuilt with
+GCC 16.2 and all paired times, both Callgrind profiles, identity checks and the
+RV64 oracle were rerun; the tables above and `compile-cost.json` are those new
+results. `rustc --print link-args` confirms the effective Rust host linker is
+its bundled LLD 22.1.6, not the generic `ld` on PATH. GNU 2.47 remains the
+assembler/linker/inspection oracle for the target C comparisons. The build
+wrapper policy must not be mistaken for the observed linker invocation.
 
 All 94 assembly outputs are byte-identical on the final compiler, with zero
 compile failures. This includes gzip `longest_match`; the sampled gzip runtime
@@ -114,11 +116,18 @@ agree. Sizes are explicitly recorded, not hidden compiler special cases.
 | spectral_norm | N=3072 | 1.275 | 1.008 |
 | gzip_longest_match | PASSES=131072 | 1.080 | 1.140 |
 
+All six sampled candidate/baseline ELFs were subsequently recompiled with the
+matched GCC-16-host-driver compiler pair and reproduced byte-for-byte;
+`modern-host-provenance.json` retains the commands and hashes. Thus the retained
+runtime samples describe exactly those executable bytes, without relabelling
+the original run's compiler metadata.
+
 Candidate and baseline ELFs are identical for all three inputs. Their paired
 ratios' confidence intervals include 1; this is not a program-runtime win.
 The GCC spectral-norm inner loop uses packed `cvtdq2pd/divpd/mulpd` followed by
 ordered scalar additions, while LCCC retains scalar `cvtsi2sd/divsd/mulsd`.
-That is a concrete next vectorizer hypothesis: pack independent terms while
+The vectorizer trace explicitly reports that floating reductions require
+associative-math permission. That is a concrete next vectorizer hypothesis: pack independent terms while
 preserving reduction order. It is not permission to reassociate FP sums or
 to infer causality from instruction count alone. No ICX runtime comparison,
 all-workload superiority or hardware-counter conclusion is claimed.
