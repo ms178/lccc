@@ -18,7 +18,7 @@
   },
   "typed_shuffle": {
     "baseline_probe": "SIGSEGV",
-    "native_fixture_checks_per_run": 18432,
+    "native_fixture_checks_per_run": 20480,
     "cross_translation_unit_lccc_profiles": 30,
     "gcc_clang_oracle_combinations": 4,
     "mask_pair_model_cases": 65536,
@@ -38,6 +38,6 @@
     "cross_tu_configurations": 24,
     "lccc_configurations": 8,
     "abi_checks_per_run": 16384,
-    "typed_shuffle_checks_per_run": 18432
+    "typed_shuffle_checks_per_run": 20480
   }
 }

@@ -12,6 +12,7 @@ v4u shuffle_second(v4u, v4u);
 v4u shuffle_field(v4u, v4u, int);
 v4u shuffle_argument(v4u, v4u);
 v4f shuffle_float(v4f);
+v4f shuffle_float_bits(v4f);
 unsigned shuffle_effects(v4u, v4u);
 
 #ifndef SHUFFLE_DRIVER_ONLY
@@ -37,6 +38,16 @@ __attribute__((noinline)) v4u shuffle_field(v4u a, v4u b, int condition) {
 __attribute__((noinline)) static v4u consume(v4u x) { return x; }
 __attribute__((noinline)) v4u shuffle_argument(v4u a, v4u b) {
     return consume(__builtin_shufflevector(a,b,0,5,2,7));
+}
+/* Keep the bit-carrier contract separate from floating-point lowering.  GCC's
+ * no-SSE i686 backend uses x87 loads/stores for a direct v4f shuffle, which can
+ * quiet a signaling NaN; the integer union path tests the required bit copy
+ * without deleting the independent finite-lane float probe below. */
+__attribute__((noinline)) v4f shuffle_float_bits(v4f a) {
+    union float_bits { v4f f; v4u u; } value;
+    value.f = a;
+    value.u = __builtin_shufflevector(value.u, value.u, 3, 2, 1, 0);
+    return value.f;
 }
 __attribute__((noinline)) v4f shuffle_float(v4f a) {
     return __builtin_shufflevector(a,a,3,2,1,0);
@@ -76,11 +87,17 @@ int main(void) {
             || !same(shuffle_argument(a,b),mixed) || !shuffle_effects(a,b)) return 1;
         /* Preserve every bit, including NaN payloads, without FP arithmetic. */
         v4f floats; memcpy(&floats,&a,16);
-        floats=shuffle_float(floats);
+        floats=shuffle_float_bits(floats);
         v4u bits; memcpy(&bits,&floats,16);
         if (!same(bits,reverse)) return 2;
+        /* Exercise the actual floating shuffle independently on finite,
+         * exactly representable lanes (including no-SSE x87 oracles). */
+        v4f finite = {1.0f, 2.0f, 4.0f, 8.0f};
+        v4f finite_reverse = shuffle_float(finite);
+        if (finite_reverse[0] != 8.0f || finite_reverse[1] != 4.0f
+            || finite_reverse[2] != 2.0f || finite_reverse[3] != 1.0f) return 3;
     }
-    puts("18432 typed shuffle checks");
+    puts("20480 typed shuffle checks");
     return 0;
 }
 #endif
