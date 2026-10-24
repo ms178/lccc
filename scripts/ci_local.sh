@@ -202,6 +202,15 @@ fi
 
 gate "driver-option-contract" fast \
     env CCC="$LCCC" bash tests/regression/check_driver_option_contract.sh
+
+# Opt-in IPA-PTA/LRS must have a local mirror as well as the dedicated hosted
+# lane. Available pinned oracles are used; the dedicated lane additionally
+# provisions authenticated ICX and records the sustained timing matrix.
+gate "ipa-pta-live-range" fast \
+    python3 tests/regression/check_ipa_pta_live_range.py \
+    --lccc "$LCCC" --gcc "${GCC16:-gcc-16}" --clang "${CLANG:-clang-23}" \
+    --icx "${ICX:-icx}" --reps 9 --output target/ipa-lrs-report.json
+
 gate "default-isa-policy" fast \
     env CCC="$LCCC" bash tests/regression/check_default_isa_policy.sh
 gate "cas16-lowering" fast \
