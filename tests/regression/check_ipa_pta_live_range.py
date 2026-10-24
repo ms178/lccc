@@ -54,16 +54,17 @@ CASES = [
         "ipa-readonly-forwarding",
         r'''
 #include <stdio.h>
+static int cell = 7;
 static __attribute__((noinline)) void read_only(int *p) {
     /* Keep a real memory reference in the callee without writing it. */
     if (*p == -12345) __builtin_trap();
 }
 int main(void) {
-    int x = 7;
-    int *p = &x;
-    int before = *p;
-    read_only(p);
-    int after = *p;
+    /* A global keeps this witness after early scalar replacement: the
+       call must be proven read-only before the second load can forward. */
+    int before = cell;
+    read_only(&cell);
+    int after = cell;
     printf("%d %d\n", before, after);
     return before != 7 || after != 7;
 }

@@ -742,7 +742,7 @@ fn run_with_budget(
 
 fn has_synchronization_barrier(inst: &Instruction) -> bool {
     use crate::ir::reexports::AtomicOrdering;
-    let ordered = |ordering: AtomicOrdering| ordering != AtomicOrdering::Relaxed;
+    let ordered = |ordering: AtomicOrdering| !matches!(ordering, AtomicOrdering::Relaxed);
     match inst {
         Instruction::AtomicLoad { ordering, .. }
         | Instruction::AtomicStore { ordering, .. }
