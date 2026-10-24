@@ -1162,12 +1162,14 @@ pub(super) fn coalesce_packed_fma_prefix(store: &mut LineStore, infos: &mut [Lin
 
 /// Replace a proven uniform per-lane shift with the scalar-count encoding.
 /// (V)MOVD zeroes bits 32..127, so its low 64 bits equal the dword count;
-/// (V)MOVQ supplies the complete qword count. Legacy upper preservation
-/// and VEX upper zeroing are included in the deleted-write liveness proof.
-/// Without that proof a dword
-/// broadcast cannot become a uniform shift: the latter reads SIXTY-FOUR
-/// count bits, not just the low dword. No C undefined-behavior assumption.
-/// Both shifts saturate at the lane width and leave flags unchanged.
+/// (V)MOVQ supplies the complete qword count. Legacy upper preservation and
+/// VEX/EVEX upper zeroing are included in the deleted-write liveness proof.
+/// Without that proof a broadcast cannot become a uniform shift: the latter
+/// reads SIXTY-FOUR count bits, not just the low dword. Word forms are not
+/// eligible: their per-lane operations consume only 16 count bits, so an
+/// arbitrary nonzero bit 16..63 would change the result. Dword/qword and
+/// 128/256/512-bit shifts saturate at the lane width and leave flags unchanged.
+/// No C undefined-behavior assumption.
 /// Retarget the count move to the dead broadcast bank, also freeing the
 /// original data bank for the ordinary copy-propagation pass.
 pub(super) fn fold_uniform_vector_shift(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
@@ -1216,29 +1218,20 @@ pub(super) fn fold_uniform_vector_shift(store: &mut LineStore, infos: &mut [Line
             continue;
         }
         let (bmn, bargs) = split_mn(broadcast);
-        if bmn
-            != if row == 1 {
-                "vpbroadcastd"
-            } else {
-                "vpbroadcastq"
-            }
-        {
-            continue;
-        }
         let bops = operand_list(bargs);
         if bops.len() != 2 || vec_operand(bops[0]) != Some((count, W128)) {
             continue;
         }
-        let Some((splat, width @ (W128 | W256))) = vec_operand(bops[1]) else {
+        let Some((splat, width @ (W128 | W256 | W512))) = vec_operand(bops[1]) else {
             continue;
         };
         let (mn, args) = split_mn(shift);
-        let uniform = match (row, mn) {
-            (1, "vpsllvd") => "vpslld",
-            (1, "vpsrlvd") => "vpsrld",
-            (1, "vpsravd") => "vpsrad",
-            (0, "vpsllvq") => "vpsllq",
-            (0, "vpsrlvq") => "vpsrlq",
+        let uniform = match (row, bmn, mn) {
+            (1, "vpbroadcastd", "vpsllvd") => "vpslld",
+            (1, "vpbroadcastd", "vpsrlvd") => "vpsrld",
+            (1, "vpbroadcastd", "vpsravd") => "vpsrad",
+            (0, "vpbroadcastq", "vpsllvq") => "vpsllq",
+            (0, "vpbroadcastq", "vpsrlvq") => "vpsrlq",
             _ => continue,
         };
         let shifts = operand_list(args);
@@ -3336,7 +3329,7 @@ mod tests {
 
     #[test]
     fn uniform_shift_encodings_and_aliases() {
-        for bank in ["xmm", "ymm"] {
+        for bank in ["xmm", "ymm", "zmm"] {
             for (mov, gp, broadcast, shift, expected) in [
                 ("vmovd", "edi", "vpbroadcastd", "vpsllvd", "vpslld"),
                 ("vmovd", "edi", "vpbroadcastd", "vpsrlvd", "vpsrld"),
@@ -3375,6 +3368,13 @@ mod tests {
         ] {
             assert!(!uniform_shift_only(&format!("    {prefix}\n    vpbroadcastd %xmm0, %ymm15\n    vpsllvd %ymm15, %ymm2, %ymm0\n    ret\n")).0);
         }
+        // VPSRAVW consumes a 16-bit count per lane; VPSRAW consumes 64 bits.
+        // Count 0x85012179f8de0000 therefore means zero to the former but
+        // arithmetic saturation to the latter. Native execution caught this
+        // exact mismatch; do not generalize the dword/qword proof to words.
+        assert!(!uniform_shift_only(
+            "    vmovd %edi, %xmm0\n    vpbroadcastw %xmm0, %zmm15\n    vpsravw %zmm15, %zmm2, %zmm0\n    ret\n"
+        ).0);
         for middle in ["label:", "    call opaque", "    vzeroupper", "    .rept 2"] {
             assert!(!uniform_shift_only(&format!("    vmovd %edi, %xmm0\n{middle}\n    vpbroadcastd %xmm0, %ymm15\n    vpsllvd %ymm15, %ymm2, %ymm0\n    ret\n")).0);
         }
@@ -3428,67 +3428,94 @@ mod tests {
             eprintln!("SKIP uniform shift native execution: AVX2 required");
             return;
         }
-        let mut assembly = String::from(".text\n");
-        for (bank, lane, suffix) in [
-            ("xmm", "d", "4"),
-            ("ymm", "d", "8"),
-            ("xmm", "q", "2"),
-            ("ymm", "q", "4"),
-        ] {
-            for (operation, shift) in [("sl", "vpsllv"), ("sr", "vpsrlv"), ("sa", "vpsrav")] {
-                if lane == "q" && operation == "sa" {
-                    continue;
-                }
-                let (mov, gp) = if lane == "d" {
-                    (if bank == "xmm" { "movd" } else { "vmovd" }, "edi")
-                } else {
-                    (if bank == "xmm" { "movq" } else { "vmovq" }, "rdi")
-                };
-                let bits = if bank == "ymm" { 256 } else { 128 };
-                let text = format!(
-                    "    # LCCC_RET_XMM 1\n    # LCCC_RET_XMM_BITS {bits}\n    vmovaps %{bank}0, %{bank}2\n    {mov} %{gp}, %xmm0\n    vpbroadcast{lane} %xmm0, %{bank}15\n    {shift}{lane} %{bank}15, %{bank}2, %{bank}0\n    ret\n"
-                );
-                let original = body(&text);
-                let (changed, optimized) = uniform_shift_only(&text);
-                assert!(changed, "{optimized}");
-                for (prefix, asm) in [("original", original), ("optimized", optimized)] {
-                    let name = format!("{prefix}_{lane}{suffix}{operation}");
-                    assembly.push_str(&format!(".globl {name}\n"));
-                    assembly.push_str(
-                        &asm.replace("f:", &format!("{name}:"))
-                            .replace(".size f, .-f", &format!(".size {name}, .-{name}")),
+        let make_assembly = |avx512: bool| {
+            let mut cases = vec![
+                ("xmm", "d", "4"),
+                ("ymm", "d", "8"),
+                ("xmm", "q", "2"),
+                ("ymm", "q", "4"),
+            ];
+            if avx512 {
+                cases.extend([("zmm", "d", "16"), ("zmm", "q", "8")]);
+            }
+            let mut assembly = String::from(".text\n");
+            for (bank, lane, suffix) in cases {
+                for (operation, shift) in
+                    [("sl", "vpsllv"), ("sr", "vpsrlv"), ("sa", "vpsrav")]
+                {
+                    if lane == "q" && operation == "sa" {
+                        continue;
+                    }
+                    let (mov, gp) = match lane {
+                        "d" => (if bank == "xmm" { "movd" } else { "vmovd" }, "edi"),
+                        _ => (if bank == "xmm" { "movq" } else { "vmovq" }, "rdi"),
+                    };
+                    let bits = match bank {
+                        "zmm" => 512,
+                        "ymm" => 256,
+                        _ => 128,
+                    };
+                    let text = format!(
+                        "    # LCCC_RET_XMM 1\n    # LCCC_RET_XMM_BITS {bits}\n    vmovaps %{bank}0, %{bank}2\n    {mov} %{gp}, %xmm0\n    vpbroadcast{lane} %xmm0, %{bank}15\n    {shift}{lane} %{bank}15, %{bank}2, %{bank}0\n    ret\n"
                     );
-                    assembly.push('\n');
+                    let original = body(&text);
+                    let (changed, optimized) = uniform_shift_only(&text);
+                    assert!(changed, "{optimized}");
+                    for (prefix, asm) in [("original", original), ("optimized", optimized)] {
+                        let name = format!("{prefix}_{lane}{suffix}{operation}");
+                        assembly.push_str(&format!(".globl {name}\n"));
+                        assembly.push_str(
+                            &asm.replace("f:", &format!("{name}:"))
+                                .replace(".size f, .-f", &format!(".size {name}, .-{name}")),
+                        );
+                        assembly.push('\n');
+                    }
                 }
             }
+            assembly.push_str(".section .note.GNU-stack,\"\",@progbits\n");
+            assembly
+        };
+        let compile_and_run = |assembly: String, avx512: bool| {
+            let asm = TempFile::try_new("uniform-shift", "contract", "s").unwrap();
+            let exe = TempFile::try_new("uniform-shift", "contract", "exe").unwrap();
+            std::fs::write(asm.path(), assembly).unwrap();
+            let mut command = Command::new("gcc");
+            command.args(["-O2", "-Wall", "-Wextra", "-Werror"]);
+            if avx512 {
+                command.args(["-mavx512f", "-DAVX512_MODEL"]);
+            } else {
+                command.arg("-mavx2");
+            }
+            let output = command
+                .arg(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/regression/fixtures/peephole-uniform-shift/driver.c"),
+                )
+                .arg(asm.path())
+                .arg("-o")
+                .arg(exe.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = Command::new(exe.path()).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expected = if avx512 { "245760" } else { "163840" };
+            assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
+        };
+        compile_and_run(make_assembly(false), false);
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            compile_and_run(make_assembly(true), true);
+        } else {
+            eprintln!("SKIP AVX-512 uniform shifts: AVX512F required");
         }
-        assembly.push_str(".section .note.GNU-stack,\"\",@progbits\n");
-        let asm = TempFile::try_new("uniform-shift", "contract", "s").unwrap();
-        let exe = TempFile::try_new("uniform-shift", "contract", "exe").unwrap();
-        std::fs::write(asm.path(), assembly).unwrap();
-        let output = Command::new("gcc")
-            .args(["-O2", "-mavx2", "-Wall", "-Wextra", "-Werror"])
-            .arg(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/regression/fixtures/peephole-uniform-shift/driver.c"),
-            )
-            .arg(asm.path())
-            .arg("-o")
-            .arg(exe.path())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let output = Command::new(exe.path()).output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("163840 exact"));
     }
 
     fn packed_prefix_only(text: &str) -> (bool, String) {

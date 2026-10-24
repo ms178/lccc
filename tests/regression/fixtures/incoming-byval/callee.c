@@ -4,6 +4,11 @@
 __attribute__((noinline)) long sum_big(struct Big s) {
     return s.a + s.b + s.c;
 }
+/* The pointer names caller-owned incoming storage, not a local frame object.
+   It remains valid for the duration of a register-only sibling call. */
+__attribute__((noinline)) long tail_big(struct Big s) {
+    return read_big(&s);
+}
 __attribute__((noinline)) long mutate_big(struct Big s, const struct Big *original) {
     struct Big *p = &s;
     long r = adjust(p, original);
@@ -19,6 +24,19 @@ __attribute__((noinline)) long dynamic_big(struct Big s, unsigned n) {
 __attribute__((noinline)) long realign_big(struct Big s, struct Wide w) {
     return consume_wide(w) + s.a + s.b + s.c;
 }
+/* Exhaust both register files and place one integer on the stack first. The
+   incoming _Float128 carrier is 16-aligned at offset 16 and h is at offset 32;
+   the stronger LOCAL typedef alignment must not change either ABI position. */
+__attribute__((noinline)) long aligned_f128(
+    long a,long b,long c,long d,long e,long f,long g,
+    double d0,double d1,double d2,double d3,double d4,double d5,double d6,double d7,
+    AlignedFloat128 x,long h) {
+    /* Do not assert a compiler-specific local realignment here: GCC 12 at
+       -O0 can address the carrier in place, while its -O2 path realigns. */
+    return a+b+c+d+e+f+g+h+(long)x+
+        (long)(d0+d1+d2+d3+d4+d5+d6+d7);
+}
+
 /* A declaration-only alignment changes the LOCAL object's alignment, NOT
    stack-argument placement. The seventh integer makes that distinction visible. */
 __attribute__((noinline)) long aligned_object(long a,long b,long c,long d,long e,long f,long g,

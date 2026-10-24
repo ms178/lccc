@@ -56,4 +56,18 @@ on, off = map(count, sys.argv[1:])
 if not on < off:
     raise SystemExit(f'FAIL: incoming capture not eliminated: on={on}, off={off}')
 print(f'ok incoming-byval: sum_big instructions {off} -> {on}')
+
+on_text = Path(sys.argv[1]).read_text()
+off_text = Path(sys.argv[2]).read_text()
+def transfer(text, mnemonic):
+    return re.search(r'^\s+' + mnemonic + r'\s+read_big(?:@PLT)?\s*$', text, re.M)
+
+# Caller-owned incoming storage remains valid after the wrapper's epilogue.
+# The enabled path can therefore tail-call the register-only pointer consumer;
+# the private-home control must retain its ordinary call and local frame proof.
+if transfer(on_text, 'call') or not transfer(on_text, 'jmp'):
+    raise SystemExit('FAIL: incoming pointer forwarder was not sibling-called')
+if not transfer(off_text, 'call'):
+    raise SystemExit('FAIL: private-home sibling-call control did not retain its call')
+print('ok incoming-byval: caller-owned pointer forwarder uses a sibling jump')
 PY
