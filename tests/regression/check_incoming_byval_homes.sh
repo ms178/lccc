@@ -16,7 +16,20 @@ fi
 command -v "$oracle" >/dev/null
 fixture=$root/tests/regression/fixtures/incoming-byval
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+cleanup() {
+    status=$?
+    trap - EXIT
+    if ((status != 0)); then
+        echo 'incoming-byval failure: relevant LCCC -O0 assembly:' >&2
+        if "$ccc" -O0 -fomit-frame-pointer -S "$fixture/callee.c" -o "$tmp/failure.s"; then
+            sed -n '/^tail_big:/,/\.size tail_big/p;/^aligned_f128:/,/\.size aligned_f128/p' \
+                "$tmp/failure.s" >&2
+        fi
+    fi
+    rm -rf "$tmp"
+    exit "$status"
+}
+trap cleanup EXIT
 for opt in -O0 -O2; do
     for frame in -fomit-frame-pointer -fno-omit-frame-pointer; do
         for disabled in 0 1; do

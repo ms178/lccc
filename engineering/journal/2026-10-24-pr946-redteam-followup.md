@@ -99,6 +99,29 @@ the integer reference required `48128`. A negative matcher test now records
 this family boundary. This is why native execution, rather than a superficial
 broadcast-count argument, is required for each lane width.
 
+## 4. Exact-oracle replay and ICX source compatibility
+
+The repository-cache GCC **16.2.0** binary passed an x86-64 compile/link/run
+probe and the complete incoming fixture at `-O0` and `-O2`, plus all eight
+optimization/frame/control matrix configurations. Its optional 32-bit install
+probe was not used because this sandbox lacks 32-bit libc. ICX 2026.2 initially
+rejected the fixture before any LCCC execution: its diagnostic was
+`common.h:5:9: error: unknown type name '_Float128'`. The fixture therefore
+uses the GNU `__float128` spelling so ICX need not be skipped; LCCC's lexer
+maps both spellings to the same `CType::Float128`, preserving the carrier test.
+
+The checked-in PR #946 before/after kernels were re-executed sequentially with
+that exact GCC 16.2 driver, 15 samples and 30,000,000 iterations per sample.
+The measured median original/optimized ratios were **2.2296441162** for
+`cf_wrap_phi` (ratio MAD 0.0122435011) and **1.1940657137** for `sum_big`
+(ratio MAD 0.0058010156). Before/after kernel text, driver hash, and harness
+hash are byte-identical to the original reports. The original `sum_big` ratio
+was 0.9904893824, so the new result must not be described as reproducing that
+timing: absolute times and relative memory-copy costs differ on this VM even
+though its generic CPU-model string is the same. Reports are retained outside
+Git under `/home/user/artifacts/pr946-followup/`; they are host-specific A/B
+measurements, not whole-program or cross-host superiority claims.
+
 ## Remaining validation and performance boundary
 
 The integrated tree still requires warning-free swap-enabled fastbuild,
