@@ -3440,9 +3440,7 @@ mod tests {
             }
             let mut assembly = String::from(".text\n");
             for (bank, lane, suffix) in cases {
-                for (operation, shift) in
-                    [("sl", "vpsllv"), ("sr", "vpsrlv"), ("sa", "vpsrav")]
-                {
+                for (operation, shift) in [("sl", "vpsllv"), ("sr", "vpsrlv"), ("sa", "vpsrav")] {
                     if lane == "q" && operation == "sa" {
                         continue;
                     }
