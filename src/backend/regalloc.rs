@@ -2854,7 +2854,10 @@ pub(crate) struct I686MulAccChains {
 ///
 /// - Head: an `I64/U64 Mul` whose result `t` has exactly ONE use in the
 ///   whole function: the tail Add. (Otherwise the product must exist
-///   independently and cannot be folded into the fused store.)
+///   independently and cannot be folded into the fused store.) The count
+///   is over the IR, where a loop body appears once, so a hot loop's
+///   per-iteration use is one IR use; no loop-weighting is involved in the
+///   shape test.
 /// - Tail: an `I64/U64 Add(t, v)` in the same block, after the head.
 /// - The rhs (base) and the addend (val) must each be either an i64 constant
 ///   with a provably zero high half (< 2^32), or the dest of a

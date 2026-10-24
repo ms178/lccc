@@ -586,6 +586,7 @@ impl Target {
                         ipa_wanted && round < IPA_RA_MAX_ROUNDS,
                         poisoned_callees.clone(),
                         poisoned_callers.clone(),
+                        opts.ra_config.debug_ra,
                     );
                     let raw = generation::generate_module_with_debug(
                         &mut cg,

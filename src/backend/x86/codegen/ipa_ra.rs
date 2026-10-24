@@ -95,14 +95,57 @@ pub(crate) struct IpaRaState {
     enabled: bool,
     /// Emitted symbol -> predicted caller-saved clobber families.
     summaries: FxHashMap<String, u16>,
-    /// Summarized symbols in emission order (callees precede their callers).
+    /// Summarized symbols in emission order. One pass, no fixpoint: a
+    /// function is summarized only from the summaries already known when it
+    /// is emitted, so a function whose callee is emitted LATER is silently
+    /// not summarized (its keep set is likewise denied, `keep_set` being
+    /// fail-closed on a missing callee summary), and neither is any caller
+    /// of it that relies on its summary. The ordering therefore changes
+    /// which optimizations are realized, never correctness: a missing
+    /// summary degrades to the un-optimized allocation, and `verify` is
+    /// fail-closed over every record it is given.
     order: Vec<String>,
     /// Functions whose summaries a previous verification rejected.
     poisoned_callees: FxHashSet<String>,
     /// Functions whose keep sets a previous verification rejected.
     poisoned_callers: FxHashSet<String>,
+    /// `CCC_DEBUG_RA`: report summarization decisions.
+    trace: bool,
     /// Caller -> (keep families, callee symbols its calls name).
     records: FxHashMap<String, (u16, Vec<String>)>,
+}
+
+/// The call targets of `text` whose summary `text_clobbers` needs: external
+/// (not a local label or `@PLT`-less callee of its own), not
+/// `__stack_chk_fail`, not `*`-indirect, and not summarized yet. Mirrors
+/// `target_clobbers`'s treatment so the trace names exactly the symbols a
+/// missing summary blocked on.
+fn missing_callee_summaries(text: &str, summaries: &FxHashMap<String, u16>) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        for insn in line.split(';') {
+            let insn = insn.trim();
+            let Some(ops) = insn
+                .strip_prefix("call ")
+                .or_else(|| insn.strip_prefix("callq "))
+            else {
+                continue;
+            };
+            let ops = ops.trim();
+            if ops.is_empty() || ops.starts_with('.') || ops.starts_with('*') {
+                continue;
+            }
+            let sym = ops.strip_suffix("@PLT").unwrap_or(ops);
+            if sym == "__stack_chk_fail" {
+                continue;
+            }
+            if !summaries.contains_key(sym) && !out.iter().any(|s| s == sym) {
+                out.push(sym.to_string());
+            }
+        }
+    }
+    out
 }
 
 impl IpaRaState {
@@ -110,11 +153,13 @@ impl IpaRaState {
         enabled: bool,
         poisoned_callees: FxHashSet<String>,
         poisoned_callers: FxHashSet<String>,
+        trace: bool,
     ) -> Self {
         Self {
             enabled,
             poisoned_callees,
             poisoned_callers,
+            trace,
             ..Self::default()
         }
     }
@@ -137,10 +182,25 @@ impl IpaRaState {
             return;
         }
         let summaries = &self.summaries;
-        if let Some(mask) = text_clobbers(text, &|s| summaries.get(s).copied()) {
-            if self.summaries.insert(func.name.clone(), mask).is_none() {
-                self.order.push(func.name.clone());
+        let Some(mask) = text_clobbers(text, &|s| summaries.get(s).copied()) else {
+            if self.trace {
+                // Usually a callee emitted later than its caller (one pass,
+                // no fixpoint); otherwise an unclassified body instruction.
+                let missing = missing_callee_summaries(text, summaries);
+                eprintln!(
+                    "[IPA-RA] {} not summarized: {}",
+                    func.name,
+                    if missing.is_empty() {
+                        "unclassified body instruction".to_string()
+                    } else {
+                        format!("missing callee summaries {}", missing.join(", "))
+                    }
+                );
             }
+            return;
+        };
+        if self.summaries.insert(func.name.clone(), mask).is_none() {
+            self.order.push(func.name.clone());
         }
     }
 
@@ -1002,7 +1062,7 @@ mod tests {
 
     #[test]
     fn verify_accepts_exact_and_rejects_grown_or_uncovered() {
-        let mut st = IpaRaState::new(true, FxHashSet::default(), FxHashSet::default());
+        let mut st = IpaRaState::new(true, FxHashSet::default(), FxHashSet::default(), false);
         st.summaries.insert("helper".into(), RAX | RDI);
         st.order.push("helper".into());
         st.record("main", R8 | R9 | RSI, vec!["helper".into()]);
@@ -1031,12 +1091,100 @@ mod tests {
         );
     }
 
+    /// A function that calls `callee` (restricted shape) and returns.
+    fn call_func(name: &str) -> IrFunction {
+        use crate::ir::reexports::{BasicBlock, BlockId, Terminator};
+        let mut f = IrFunction::new(name.into(), IrType::I64, vec![], false);
+        f.blocks = vec![BasicBlock {
+            label: BlockId(0),
+            instructions: vec![Instruction::Call {
+                func: "callee".into(),
+                info: info(&[], IrType::I64),
+            }],
+            terminator: Terminator::Return(None),
+            source_spans: vec![],
+        }];
+        f.next_value_id = 1;
+        f
+    }
+
+    /// One pass, no fixpoint: summarization is emission-order dependent, and
+    /// the degradation is silent by design. Callee-first, both functions are
+    /// summarized. Caller-first, the caller is self-limiting (no summary and
+    /// no keep set, `keep_set` being fail-closed on a missing callee
+    /// summary) while the callee still is. Because no IPA-RA assumption was
+    /// ever recorded for the self-limiting caller, `verify` reports nothing
+    /// in either order: ordering changes which optimizations are realized,
+    /// never correctness.
+    #[test]
+    fn one_pass_summary_order_self_limits() {
+        let callee = call_func("callee");
+        let caller = call_func("caller");
+        let callee_text = "callee:\n    ret\n.size callee, .-callee\n";
+        let caller_text = "caller:\n    call callee\n    ret\n.size caller, .-caller\n";
+        let full = format!("{callee_text}{caller_text}");
+
+        // Callee emitted first: both summarized, in order.
+        let mut st = IpaRaState::new(true, FxHashSet::default(), FxHashSet::default(), false);
+        st.note_function_emitted(&callee, true, callee_text);
+        st.note_function_emitted(&caller, true, caller_text);
+        assert_eq!(st.order, vec!["callee".to_string(), "caller".to_string()]);
+        assert!(verify(&full, &st).is_empty());
+
+        // Caller emitted first: the caller stays un-summarized even after
+        // the callee appears; its keep set is denied; verify stays clean.
+        let mut st = IpaRaState::new(true, FxHashSet::default(), FxHashSet::default(), false);
+        st.note_function_emitted(&caller, true, caller_text);
+        assert!(!st.summaries.contains_key("caller"));
+        assert_eq!(st.keep_set(&caller, KEEP_CANDIDATES).0, 0);
+        st.note_function_emitted(&callee, true, callee_text);
+        assert!(st.summaries.contains_key("callee"));
+        assert_eq!(st.order, vec!["callee".to_string()]);
+        assert!(verify(&full, &st).is_empty());
+    }
+
+    /// The driver's poison->regenerate contract: a callee whose summary a
+    /// previous `verify` rejected is never re-summarized, a caller whose
+    /// keep set was rejected never gets one, and the disabled state (round
+    /// budget exhausted) carries no records, so the final regeneration
+    /// always converges with `verify` clean.
+    #[test]
+    fn poison_contract_drives_regeneration() {
+        let callees: FxHashSet<String> = ["callee".into()].into_iter().collect();
+        let callers: FxHashSet<String> = ["main".into()].into_iter().collect();
+        let mut st = IpaRaState::new(true, callees, callers, false);
+        let f = call_func("callee");
+        st.note_function_emitted(&f, true, "callee:\n    ret\n.size callee, .-callee\n");
+        assert!(
+            st.summaries.is_empty(),
+            "poisoned callee must not be summarized"
+        );
+        let m = call_func("main");
+        assert_eq!(st.keep_set(&m, KEEP_CANDIDATES), (0, Vec::new()));
+        let off = IpaRaState::new(false, FxHashSet::default(), FxHashSet::default(), false);
+        assert!(verify("main:\n    ret\n.size main, .-main\n", &off).is_empty());
+    }
+
+    /// The trace's missing-callee scan must name exactly the symbols a
+    /// skipped summarization blocked on: external, non-`__stack_chk_fail`,
+    /// not local labels or `*`-indirect, and not yet summarized.
+    #[test]
+    fn missing_callee_scan_names_only_unsummarized_external() {
+        let mut summaries: FxHashMap<String, u16> = FxHashMap::default();
+        summaries.insert("known".into(), 0);
+        let text = "f:\n    call known\n    call missing@PLT\n    call .LBB2\n    call *%rax\n    \
+                    call __stack_chk_fail\n    call other\n";
+        let mut got = missing_callee_summaries(text, &summaries);
+        got.sort();
+        assert_eq!(got, vec!["missing".to_string(), "other".to_string()]);
+    }
+
     /// A twice-defined name is ambiguous, not first-wins: whichever body
     /// `function_body` would pick, the summary cannot be trusted, so both
     /// the callee summary and every caller record naming it fail closed.
     #[test]
     fn verify_fails_closed_on_duplicated_label() {
-        let mut st = IpaRaState::new(true, FxHashSet::default(), FxHashSet::default());
+        let mut st = IpaRaState::new(true, FxHashSet::default(), FxHashSet::default(), false);
         // `movq %rdi, %rax` names both families, so the predicted summary
         // carries both.
         st.summaries.insert("helper".into(), RAX | RDI);
