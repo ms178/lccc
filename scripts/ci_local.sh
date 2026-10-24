@@ -252,6 +252,8 @@ gate "fp-contract-parity" fast \
 # the reference kernel) without any test going red.
 gate "sse2-matmul-vectorization" fast \
     env CCC="$LCCC" bash tests/regression/check_sse2_matmul_vectorization.sh
+gate "sse2-i32-product" fast \
+    env CCC="$LCCC" python3 tests/regression/check_sse2_i32_product.py
 # Fixed-distance SLP: complete 256-bit F32x8/F64x4 distance expressions pack
 # under fast FP semantics; strict FP, partial widths, an intervening call,
 # and the no-AVX baseline all keep scalar code. The CCC_NO_FIXED_SLP leg is

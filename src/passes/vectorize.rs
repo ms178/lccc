@@ -300,8 +300,8 @@ pub(crate) fn x86_avx512vl_available_pub() -> bool {
 }
 
 /// SSE4.1 availability on the 128-bit path, for every consumer: `pmulld`
-/// (VecMulI32x4) has no SSE2 encoding, so an I32 multiply map/dot under
-/// `-mno-sse4.1` / `-march=x86-64` must not be vectorised; and since
+/// uses the direct `pmulld` encoding only with this permission; the SSE2
+/// backend instead reconstructs low products from two `pmuludq`s. Since
 /// SSE4.1 implies SSSE3, this is also the gate for `pshufb`-based rotate
 /// masks in the ARX vectorizers.
 pub(crate) fn x86_sse41_available_pub() -> bool {
@@ -28347,18 +28347,10 @@ fn transform_reduction_sse2(
                 IntrinsicOp::VecHorizontalAddI64x2,
             ),
             IrType::I32 => {
-                // `VecMulI32x4` is `pmulld` where SSE4.1 exists and a
-                // `pmuludq` pair (two shifts, two `pshufd`, one
-                // `punpckldq`) on the SSE2 baseline -- see
-                // `x86::codegen::intrinsics::emit_int_mul_i32x4`. That
-                // sequence is exact, not an approximation: a C int32 product
-                // keeps the low 32 bits, which are the same bits whether
-                // `pmuludq` reads the operands as signed or unsigned. Eight
-                // instructions therefore produce four products instead of
-                // four `imul`s on the port the loop's dependency chain
-                // already saturates, which is what the correlation loop in
-                // tests/benchmark/programs/double_reduction.c measures
-                // (268 ms -> 121 ms against gcc's 210 ms on this box).
+                // The backend selects direct SSE4.1 pmulld or seven SSE2
+                // instructions reconstructing the even/odd pmuludq low
+                // products. Signed and unsigned products have the same low
+                // 32 bits, so both implement modular I32 multiplication.
                 (
                     4u64,
                     IntrinsicOp::LoadI32x4,
@@ -30117,8 +30109,9 @@ fn transform_map_vector(
             (IrType::I32 | IrType::U32, true, IrBinOp::Add) => Some(IntrinsicOp::VecAddI32x8),
             (IrType::I32 | IrType::U32, false, IrBinOp::Add) => Some(IntrinsicOp::VecAddI32x4),
             (IrType::I32 | IrType::U32, true, IrBinOp::Mul) => Some(IntrinsicOp::VecMulI32x8),
-            // `pmulld` is SSE4.1: no SSE2 spelling of a 4-lane I32 multiply.
-            (IrType::I32 | IrType::U32, false, IrBinOp::Mul) if x86_sse41_available() => {
+            // The backend selects direct SSE4.1 pmulld or the exact SSE2
+            // even/odd pmuludq reconstruction; both implement modular I32.
+            (IrType::I32 | IrType::U32, false, IrBinOp::Mul) => {
                 Some(IntrinsicOp::VecMulI32x4)
             }
             (IrType::I32 | IrType::U32, true, IrBinOp::Sub) => Some(IntrinsicOp::VecSubI32x8),

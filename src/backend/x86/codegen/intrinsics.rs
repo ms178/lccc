@@ -351,8 +351,8 @@ impl X86Codegen {
     ///
     /// ```text
     /// lo = pmuludq(x, y)         ; dwords [x0*y0, hi, x2*y2, hi]
-    /// xh = psrlq(x, 32)          ; x1, x3 in the low dwords
-    /// yh = psrlq(y, 32)
+    /// xh = pshufd(x, 0xf5)       ; [x1, x1, x3, x3]
+    /// yh = pshufd(y, 0xf5)       ; [y1, y1, y3, y3]
     /// hi = pmuludq(xh, yh)       ; dwords [x1*y1, hi, x3*y3, hi]
     /// lo = pshufd(lo, 0x08)      ; [x0*y0, x2*y2, x0*y0, x2*y2]
     /// hi = pshufd(hi, 0x08)      ; [x1*y1, x3*y3, x1*y1, x3*y3]
@@ -370,11 +370,10 @@ impl X86Codegen {
     /// lane's sign bit) rejected the checksum immediately.
     /// `punpckldq` overwrites the odd dwords instead of OR-ing into them.
     ///
-    /// Eight instructions against the scalar loop's two `imul` per element,
-    /// and they work on four lanes at once on the port that has nothing else
-    /// to do. Measured on tests/benchmark/programs/double_reduction.c (the
-    /// `s += a[i]*b[i]` correlation loop) this is what GCC emits and what the
-    /// benchmark was losing to.
+    /// The reconstruction costs seven SIMD instructions for four products
+    /// without requiring SSE4.1. This instruction
+    /// count excludes operand loads and the result store; it is not a claim
+    /// about runtime speedup over scalar multiplication.
     ///
     /// The third register is `%xmm2`, following the contract the other
     /// multi-step 128-bit emitters use: `stack_layout::regalloc_helpers`
@@ -398,10 +397,12 @@ impl X86Codegen {
         self.sse_load_arg(&args[1], "xmm1");
         self.sse_load_arg(&args[0], "xmm0");
         // xmm0 = lo, xmm2 = scratch; xmm1 is dead after its last use below.
-        self.state.emit("    movdqa %xmm0, %xmm2");
+        // A non-destructive shuffle selects the odd lanes while making the
+        // scratch copy: one instruction instead of movdqa + psrlq. Only the
+        // even dwords feed pmuludq; the duplicated odd dwords are irrelevant.
+        self.state.emit("    pshufd $0xf5, %xmm0, %xmm2");
         self.state.emit("    pmuludq %xmm1, %xmm0");
-        self.state.emit("    psrlq $32, %xmm2");
-        self.state.emit("    psrlq $32, %xmm1");
+        self.state.emit("    pshufd $0xf5, %xmm1, %xmm1");
         self.state.emit("    pmuludq %xmm1, %xmm2");
         self.state.emit("    pshufd $0x08, %xmm0, %xmm0");
         self.state.emit("    pshufd $0x08, %xmm2, %xmm2");
@@ -7044,7 +7045,7 @@ impl X86Codegen {
             }
             IntrinsicOp::VecMulI32x4 => {
                 if let Some(d) = dest {
-                    self.emit_sse_binary_128(d, args, "pmulld");
+                    self.emit_int_mul_i32x4(d, args);
                 }
             }
             // Integer map lane ops. Sub is `src1 - src2` and NON-commutative:

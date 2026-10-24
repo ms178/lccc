@@ -1,4 +1,5 @@
 {
+  "i32_product_map": "-DPRODUCT_MAP_PASSES=128",
   "arith_loop": "-DARITH_ITERS=20000",
   "fib": "-DFIB_N=25",
   "matmul": "-DN=48",

@@ -72,6 +72,8 @@ class Benchmark:
 # Keep historical synthetic tests, then add workload-derived kernels.  Sources
 # may live in the legacy numbered directory until they are migrated.
 BENCHMARKS: tuple[Benchmark, ...] = (
+    Benchmark("i32_product_map", "cache-resident pointwise modular I32 products",
+              ("i32_product_map.c",), ("synthetic", "simd", "integer", "map")),
     Benchmark("volatile_reduce", "volatile TLS sum and product / scalar ILP",
               ("volatile_reduce.c",), ("integer", "loop", "tls")),
     # Required source semantics, not optional tuning: these signed recurrences
