@@ -1,0 +1,95 @@
+{
+  "engine": "synthetic",
+  "arch": "x86_64",
+  "total": 12,
+  "pass": 12,
+  "fail": 0,
+  "skip": 0,
+  "elapsed_sec": 2.8006532192230225,
+  "results": [
+    {
+      "test_id": "synth_20261025",
+      "status": "PASS",
+      "message": "All optimization levels matched every reference",
+      "opt_level": "-O2",
+      "source_path": null
+    },
+    {
+      "test_id": "synth_20261026",
+      "status": "PASS",
+      "message": "All optimization levels matched every reference",
+      "opt_level": "-O2",
+      "source_path": null
+    },
+    {
+      "test_id": "synth_20261027",
+      "status": "PASS",
+      "message": "All optimization levels matched every reference",
+      "opt_level": "-O2",
+      "source_path": null
+    },
+    {
+      "test_id": "synth_20261028",
+      "status": "PASS",
+      "message": "All optimization levels matched every reference",
+      "opt_level": "-O2",
+      "source_path": null
+    },
+    {
+      "test_id": "synth_20261029",
+      "status": "PASS",
+      "message": "All optimization levels matched every reference",
+      "opt_level": "-O2",
+      "source_path": null
+    },
+    {
+      "test_id": "synth_20261030",
+      "status": "PASS",
+      "message": "All optimization levels matched every reference",
+      "opt_level": "-O2",
+      "source_path": null
+    },
+    {
+      "test_id": "synth_20261031",
+      "status": "PASS",
+      "message": "All optimization levels matched every reference",
+      "opt_level": "-O2",
+      "source_path": null
+    },
+    {
+      "test_id": "synth_20261032",
+      "status": "PASS",
+      "message": "All optimization levels matched every reference",
+      "opt_level": "-O2",
+      "source_path": null
+    },
+    {
+      "test_id": "synth_20261033",
+      "status": "PASS",
+      "message": "All optimization levels matched every reference",
+      "opt_level": "-O2",
+      "source_path": null
+    },
+    {
+      "test_id": "synth_20261034",
+      "status": "PASS",
+      "message": "All optimization levels matched every reference",
+      "opt_level": "-O2",
+      "source_path": null
+    },
+    {
+      "test_id": "synth_20261035",
+      "status": "PASS",
+      "message": "All optimization levels matched every reference",
+      "opt_level": "-O2",
+      "source_path": null
+    },
+    {
+      "test_id": "synth_20261036",
+      "status": "PASS",
+      "message": "All optimization levels matched every reference",
+      "opt_level": "-O2",
+      "source_path": null
+    }
+  ]
+}
