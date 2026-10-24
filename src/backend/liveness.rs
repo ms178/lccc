@@ -937,7 +937,7 @@ fn assign_program_points(
 }
 
 /// Instructions that clobber the caller-saved set at the assembly level.
-fn instruction_is_call_point(inst: &Instruction) -> bool {
+pub(crate) fn instruction_is_call_point(inst: &Instruction) -> bool {
     let is_32bit = crate::common::types::target_is_32bit();
     match inst {
         Instruction::Call { .. } | Instruction::CallIndirect { .. } => true,

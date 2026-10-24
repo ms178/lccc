@@ -2904,7 +2904,6 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
         let cdest = copy_parts[1];
         // Prove the loaded register is dead after the copy within a bounded
         // window: no read before the next write; calls kill caller-saved regs.
-        let load_is_callee_saved = matches!(load_fam, 3 | 5 | 12 | 13 | 14 | 15);
         let mut dead = false;
         let mut k = j + 1;
         let limit = (len).min(j + 16);
@@ -2925,12 +2924,15 @@ pub(super) fn fold_load_copy_relay(store: &mut LineStore, infos: &mut [LineInfo]
             if infos[k].is_barrier() {
                 // A call CONSUMES the loaded register if it is passed as an
                 // argument — the fuse would retarget the load and the call
-                // would read the un-loaded register. Only when the call does
-                // not reference the register may the caller-saved clobber
-                // count as deadness.
+                // would read the un-loaded register. The call-site authority
+                // (`call_window_verdict`: argument count, variadic %al,
+                // static chain, retpoline target, IPA keep set, the call's
+                // own text) decides; only a caller-saved family the call
+                // provably does not read is killed by it. Checking the call
+                // TEXT alone missed every implicit argument read
+                // (`movq 8(%rbx), %rdi; movq %rdi, %r12; call g`).
                 if matches!(infos[k].kind, LineKind::Call)
-                    && !load_is_callee_saved
-                    && infos[k].reg_refs & (1u16 << load_fam) == 0
+                    && call_window_verdict(store, infos, k, load_fam) == Some(true)
                 {
                     dead = true;
                 }
@@ -3087,6 +3089,36 @@ mod fold_load_copy_relay_tests {
 ";
         let (changed, _) = run(asm);
         assert!(!changed, "fuse must be refused: cltq reads %eax implicitly");
+    }
+
+    /// A call reads its argument registers without naming them: the window
+    /// must ask the call-site authority (`call_window_verdict`), not the
+    /// call's text. Loading the first argument and copying it to a
+    /// callee-saved home is the ordinary "keep x across f(x)" shape; the fuse
+    /// used to retarget the load to %r12 and call `g` with a stale %rdi.
+    #[test]
+    fn refuses_fuse_when_a_call_reads_the_loaded_argument_register() {
+        let asm = concat!(
+            "    movq 8(%rbx), %rdi\n",
+            "    movq %rdi, %r12\n",
+            "    call g\n",
+            "    movq %r12, %rax\n",
+        );
+        let (changed, _) = run(asm);
+        assert!(!changed, "g reads %rdi: the load must keep its register");
+        // With the codegen's marker saying the call reads no GP argument the
+        // caller-saved clobber is a genuine kill, and the fuse is legal.
+        let no_args = asm.replace("    call g\n", "    call g\n    # LCCC_CALL_ARGS 0\n");
+        assert_ne!(no_args, asm, "fixture must carry the marker");
+        let (changed, out) = run(&no_args);
+        assert!(
+            changed,
+            "a zero-argument call clobbers %rdi unread: {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l.trim() == "movq 8(%rbx), %r12"),
+            "{out:?}"
+        );
     }
 
     /// A plain dead copy with no implicit reader MAY be fused.

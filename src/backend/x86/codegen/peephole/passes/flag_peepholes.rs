@@ -543,16 +543,19 @@ pub(super) fn flags_dead_after(store: &LineStore, infos: &[LineInfo], from: usiz
     false
 }
 
-/// Index of the next non-NOP line after `i`, or `None`.
-fn next_real(infos: &[LineInfo], i: usize, len: usize) -> Option<usize> {
-    let mut k = i + 1;
-    while k < len {
-        if !infos[k].is_nop() {
-            return Some(k);
-        }
-        k += 1;
-    }
-    None
+/// Index of the next line after `i` that is neither a NOP nor a
+/// debug-attribution directive (`.loc`/`.file`), or `None`.
+///
+/// Attribution lines are free of the window's step budget, exactly as
+/// `next_memfold_instruction` in `memory_fold.rs` treats them (its proof
+/// budgets carry the same invariant): if they counted, whether a pair fits
+/// the window would depend on whether `-g` was passed, and the same source
+/// would emit different `.text` with and without debug information
+/// (check_debug_code_parity.py).  Without `-g` no attribution lines exist
+/// in a function, so this changes nothing for plain builds.
+fn next_real(store: &LineStore, infos: &[LineInfo], i: usize, len: usize) -> Option<usize> {
+    let k = next_non_debug(store, infos, i + 1, len);
+    (k < len).then_some(k)
 }
 
 /// Parse `$<int>` (decimal, optionally negative) into its value.
@@ -639,7 +642,7 @@ pub(super) fn fold_copy_add_into_lea(store: &mut LineStore, infos: &mut [LineInf
             i += 1;
             continue;
         }
-        let Some(j) = next_real(infos, i, len) else {
+        let Some(j) = next_real(store, infos, i, len) else {
             i += 1;
             continue;
         };
@@ -820,7 +823,7 @@ pub(super) fn fold_lea_add_into_lea(store: &mut LineStore, infos: &mut [LineInfo
             i += 1;
             continue;
         };
-        let Some(j) = next_real(infos, i, len) else {
+        let Some(j) = next_real(store, infos, i, len) else {
             i += 1;
             continue;
         };
@@ -963,7 +966,7 @@ pub(super) fn fold_inplace_add_copy_into_lea(
         // register. The copy may be WIDER than the arithmetic (movq after
         // addl), never narrower (a movl copy would truncate the 64-bit
         // result the LEA must produce).
-        let Some(j) = next_real(infos, i, len) else {
+        let Some(j) = next_real(store, infos, i, len) else {
             i += 1;
             continue;
         };
@@ -1078,7 +1081,7 @@ pub(super) fn fold_copy_shift_into_lea(store: &mut LineStore, infos: &mut [LineI
             i += 1;
             continue;
         }
-        let Some(j) = next_real(infos, i, len) else {
+        let Some(j) = next_real(store, infos, i, len) else {
             i += 1;
             continue;
         };
@@ -1348,7 +1351,7 @@ pub(super) fn fold_setcc_test_cmov(store: &mut LineStore, infos: &mut [LineInfo]
         // %r11d, %r11d; cmovnel` (the allocator reusing the dead setcc
         // register) kept setbe+movzbl+test in the ASCII case-fold loop.
         let mut retired_mask: u16 = 0;
-        while let Some(n) = next_real(infos, k, len) {
+        while let Some(n) = next_real(store, infos, k, len) {
             k = n;
             if infos[n].pinned || infos[n].is_barrier() {
                 break;
@@ -1679,7 +1682,7 @@ pub(super) fn fold_copy_and_mask_into_movz(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         }
-        let Some(j) = next_real(infos, i, len) else {
+        let Some(j) = next_real(store, infos, i, len) else {
             i += 1;
             continue;
         };
@@ -1738,6 +1741,48 @@ pub(super) fn fold_copy_and_mask_into_movz(store: &mut LineStore, infos: &mut [L
 
 // ── 4b. copy + mask + flag consumer → test ─────────────────────────────────
 
+/// Longest run of real lines [`copy_mask_partner`] crosses between the copy
+/// and its mask.
+const COPY_MASK_WINDOW: usize = 12;
+
+/// The first real line after the copy `i` (`mov %A, %D`) that names `%D`, when
+/// every line between them leaves the pair alone: no line names `%D` (any
+/// width, implicit operands included), writes `%A`, has implicit register
+/// effects, or is a barrier, label, pinned line or inline asm.  Testing `%A`
+/// at the partner's position then sees exactly the value the copy took, and
+/// deleting the copy is unobservable because nothing in the window reads
+/// `%D`.  The adjacent pair is the zero-length window.
+///
+/// hot_web_loop keeps `h = helper(i)` for both `a += h` and `(h & 255) == 0`:
+/// `movq %rax, %r10` sits right after the call, the mask ten lines later.
+fn copy_mask_partner(
+    store: &LineStore,
+    infos: &[LineInfo],
+    i: usize,
+    len: usize,
+    src_fam: RegId,
+    dst_fam: RegId,
+) -> Option<usize> {
+    let mut k = i;
+    for _ in 0..=COPY_MASK_WINDOW {
+        k = next_real(store, infos, k, len)?;
+        let t = infos[k].trimmed(store.get(k));
+        if infos[k].pinned || infos[k].is_barrier() || infos[k].kind == LineKind::InlineAsm {
+            return None;
+        }
+        if line_refs_family(t, dst_fam) {
+            return Some(k);
+        }
+        if implicit_reg_refs(t.as_bytes()) & (1u16 << dst_fam) != 0
+            || super::helpers::has_implicit_reg_usage(t)
+            || writes_family(&infos[k], t, src_fam)
+        {
+            return None;
+        }
+    }
+    None
+}
+
 /// `movl %A,%D; andl $imm,%D; j{e,ne}/setcc/cmov…` with `%D` dead afterwards
 /// → `testl $imm,%A` (`testb $imm,%Ab` when the mask fits a byte and every
 /// consumer is ZF-only).
@@ -1754,9 +1799,10 @@ pub(super) fn fold_copy_and_mask_into_movz(store: &mut LineStore, infos: &mut [L
 /// iteration of the shift loop).
 ///
 /// Soundness: `%D` must be dead after the `and` (whole-function dataflow via
-/// [`FileLiveness`]); `%A` is only read; nothing between the `mov` and the
-/// `and` exists (adjacent real lines). Families 4/5 (`%rsp`/`%rbp`) never take
-/// the byte form.
+/// [`FileLiveness`]); `%A` is only read; the lines between the `mov` and the
+/// `and` neither name `%D` nor write `%A` ([`copy_mask_partner`]), so `%A`
+/// still holds the copied value at the `and`. Families 4/5 (`%rsp`/`%rbp`)
+/// never take the byte form.
 pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
     let len = store.len();
     let mut lv = FileLiveness::new(store, infos);
@@ -1790,7 +1836,7 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
             i += 1;
             continue;
         }
-        let Some(j) = next_real(infos, i, len) else {
+        let Some(j) = copy_mask_partner(store, infos, i, len, src_fam, dst_fam) else {
             i += 1;
             continue;
         };
@@ -1839,7 +1885,7 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
                 i += 1;
                 continue;
             }
-            let Some(k) = next_real(infos, j, len) else {
+            let Some(k) = next_real(store, infos, j, len) else {
                 i += 1;
                 continue;
             };
@@ -1878,7 +1924,7 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
         }
         // Someone must actually consume the flags in this block, otherwise the
         // pair is dead-code territory, not ours.
-        let Some(k) = next_real(infos, j, len) else {
+        let Some(k) = next_real(store, infos, j, len) else {
             i += 1;
             continue;
         };
@@ -1897,12 +1943,29 @@ pub(super) fn fold_copy_and_mask_into_test(store: &mut LineStore, infos: &mut [L
             && src_fam != REG_RSP
             && src_fam != REG_RBP
             && (imm & 0x80 == 0 || !flags_reach_an_sf_consumer(store, infos, j + 1));
-        let new_line = if byte_form {
-            format!("    testb ${}, {}", imm, REG_NAMES[3][src_fam as usize])
+        // An all-ones mask at the test width tests the register against
+        // itself: `x & 0xff == x & x` at byte width, so ZF/SF/PF agree and
+        // CF/OF are cleared either way; the register form drops the imm8
+        // (GCC/Clang emit `testb %dl, %dl` for `(h & 255) == 0`).
+        let (name_b, name_l, name_q) = (
+            REG_NAMES[3][src_fam as usize],
+            REG_NAMES[1][src_fam as usize],
+            REG_NAMES[0][src_fam as usize],
+        );
+        let new_line = if byte_form && imm == 0xff {
+            format!("    testb {name_b}, {name_b}")
+        } else if byte_form {
+            format!("    testb ${imm}, {name_b}")
+        } else if !and_wide && imm == 0xffff_ffff {
+            format!("    testl {name_l}, {name_l}")
+        } else if and_wide && imm == -1 {
+            // `x & -1 == x` at qword width: the register form is flag-identical
+            // and is what GCC/Clang emit (`testq %rax, %rax`).
+            format!("    testq {name_q}, {name_q}")
         } else if and_wide {
-            format!("    testq ${}, {}", imm, REG_NAMES[0][src_fam as usize])
+            format!("    testq ${imm}, {name_q}")
         } else {
-            format!("    testl ${}, {}", imm, REG_NAMES[1][src_fam as usize])
+            format!("    testl ${imm}, {name_l}")
         };
         mark_nop(&mut infos[i]);
         replace_line(store, &mut infos[j], j, new_line);
@@ -4034,6 +4097,131 @@ mod tests {
         ));
         assert!(out.contains("andl $255, %r9d"), "{out}");
     }
+    /// hot_web_loop: `h` is copied right after the call and masked ten lines
+    /// later; the copy's only reader is the mask, so both go and the branch
+    /// tests the call result directly (GCC: `testb %dl, %dl`).
+    #[test]
+    fn distant_copy_and_mask_becomes_register_testb() {
+        let body = concat!(
+            "    call helper\n",
+            "    movq %rax, %r10\n",
+            "    addq %rax, %r12\n",
+            "    leaq 0(,%r14,8), %r11\n",
+            "    xorq %r11, %r14\n",
+            "    andq $255, %r10\n",
+            "    je .LBB5\n",
+            "    movq %r12, %rax\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    movq %r14, %rax\n",
+            "    ret\n",
+        );
+        let out = peephole_optimize(format!(".cfi_startproc\n{body}.cfi_endproc\n"));
+        assert!(out.contains("testb %al, %al"), "{out}");
+        assert!(!out.contains("%r10"), "{out}");
+    }
+
+    /// Every window veto keeps the copy and the `and`.  The pass runs alone:
+    /// in the full pipeline a relay may first retire the copy's other reader
+    /// (`movq %r10, %r9` -> `movq %rax, %r9`), after which folding is right.
+    #[test]
+    fn distant_copy_and_mask_window_vetoes() {
+        let peephole_optimize = |asm: String| {
+            let mut store = LineStore::new(asm);
+            let mut infos: Vec<LineInfo> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            assert!(!super::fold_copy_and_mask_into_test(&mut store, &mut infos));
+            (0..store.len())
+                .filter(|&i| !infos[i].is_nop())
+                .map(|i| store.get(i).trim().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for (mid, why) in [
+            ("    addq $1, %rax\n", "source rewritten"),
+            ("    movq %r10, %r9\n", "copy read in the window"),
+            ("    movb $1, %r10b\n", "copy partially written"),
+            ("    cqto\n", "implicit register effects"),
+            ("    call g\n", "barrier"),
+            (".Lmid:\n", "label"),
+        ] {
+            let asm = format!(
+                ".cfi_startproc\n    movq %rax, %r10\n{mid}    andq $255, %r10\n    je .LBB5\n    movq %r9, %rax\n    ret\n.LBB5:\n    ret\n.cfi_endproc\n"
+            );
+            let out = peephole_optimize(asm);
+            assert!(
+                out.contains("andq $255, %r10") || out.contains("andl $255, %r10d"),
+                "{why}: {out}"
+            );
+        }
+    }
+
+    /// Debug attribution must not consume the window's step budget.  With
+    /// `-g` every instruction carries a `.loc` line, so if attribution
+    /// counted, the same source would fold the pair in the plain build but
+    /// not in the `-g` build and the two `.text` sections would differ
+    /// (check_debug_code_parity.py).  This case sits one attribution line
+    /// past the 12-real-line budget: the old budgeting (attribution counted)
+    /// rejected the fold, the transparent walk accepts it, and the plain
+    /// build (no attribution lines at all) is bit-identical before and after.
+    #[test]
+    fn debug_attribution_does_not_break_copy_mask_window() {
+        let mid = "    addq %r12, %r13\n".repeat(12) + ".loc 1 42 0\n";
+        let asm = format!(
+            ".cfi_startproc\n    movq %rax, %r10\n{mid}    andq $255, %r10\n    je .LBB5\n    movq %r12, %rax\n    ret\n.LBB5:\n    ret\n.cfi_endproc\n"
+        );
+        let mut store = LineStore::new(asm);
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        assert!(super::fold_copy_and_mask_into_test(&mut store, &mut infos));
+        let out = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(out.contains("testb %al, %al"), "{out}");
+        assert!(!out.contains("movq %rax, %r10"), "{out}");
+        assert!(!out.contains("andq $255, %r10"), "{out}");
+    }
+
+    /// The all-ones dword mask tests the register against itself.
+    #[test]
+    fn all_ones_dword_mask_becomes_register_testl() {
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movl %ebx, %esi\n",
+            "    andl $4294967295, %esi\n",
+            "    js .LBB5\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testl %ebx, %ebx"), "{out}");
+    }
+
+    /// The qword all-ones mask tests the register against itself (GCC shape
+    /// `testq %rax, %rax`), not `testq $-1, %rax`.
+    #[test]
+    fn all_ones_qword_mask_becomes_register_testq() {
+        let asm = concat!(
+            ".cfi_startproc\n",
+            "    movq %rax, %r10\n",
+            "    andq $-1, %r10\n",
+            "    js .LBB5\n",
+            "    ret\n",
+            ".LBB5:\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let out = peephole_optimize(asm.to_string());
+        assert!(out.contains("testq %rax, %rax"), "{out}");
+        assert!(!out.contains("$-1"), "{out}");
+    }
+
     #[test]
     fn copy_and_mask_branch_becomes_testb() {
         // ffs1 kernel shape: `while (!(x & 1))`, mask temp dead after the branch.
@@ -4952,10 +5140,10 @@ pub(super) fn fold_conditional_increment(store: &mut LineStore, infos: &mut [Lin
         if infos[i].is_nop() || infos[i].pinned {
             continue;
         }
-        let Some(j) = next_real(infos, i, store.len()) else {
+        let Some(j) = next_real(store, infos, i, store.len()) else {
             continue;
         };
-        let Some(k) = next_real(infos, j, store.len()) else {
+        let Some(k) = next_real(store, infos, j, store.len()) else {
             continue;
         };
         if infos[j].pinned || infos[k].pinned {

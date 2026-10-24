@@ -728,6 +728,7 @@ fn instruction_corpus() -> Vec<MachInst> {
                     size: if i % 2 == 0 { OpSize::S32 } else { OpSize::S64 },
                 }),
                 gp_arg_count: None,
+                ipa_keep: 0,
             });
         }
         // Void call, no saves, no ret.
@@ -741,6 +742,7 @@ fn instruction_corpus() -> Vec<MachInst> {
             target: CallTarget::Direct("machinst_probe_void".into()),
             ret: None,
             gp_arg_count: None,
+            ipa_keep: 0,
         });
         // Indirect target: the staging move and the `call *%reg` form —
         // r10 and r11, with and without an accompanying caller-save pair.
@@ -765,6 +767,7 @@ fn instruction_corpus() -> Vec<MachInst> {
                     size: OpSize::S64,
                 }),
                 gp_arg_count: None,
+                ipa_keep: 0,
             });
             v.push(MachInst::CallTyped {
                 caller_saves: vec![],
@@ -776,6 +779,7 @@ fn instruction_corpus() -> Vec<MachInst> {
                 target: CallTarget::Indirect(target_reg),
                 ret: None,
                 gp_arg_count: None,
+                ipa_keep: 0,
             });
         }
         // Wide-immediate arguments: outside the sign-extended imm32 window
@@ -805,6 +809,7 @@ fn instruction_corpus() -> Vec<MachInst> {
                 target: CallTarget::Direct("machinst_probe_wide".into()),
                 ret: None,
                 gp_arg_count: None,
+                ipa_keep: 0,
             });
         }
         // The xmm0/xmm1 pre-colored scratch pair participates in FMov shapes.
@@ -3631,6 +3636,7 @@ fn calltyped_emits_saves_args_call_ret_restores_in_order() {
             size: OpSize::S64,
         }),
         gp_arg_count: None,
+        ipa_keep: 0,
     };
     let lines = emit(&inst);
     assert_eq!(
@@ -3668,6 +3674,7 @@ fn calltyped_publishes_call_site_markers_before_the_return_move() {
             size: OpSize::S64,
         }),
         gp_arg_count: Some(3),
+        ipa_keep: 0,
     };
     let lines = emit(&inst);
     let call = lines.iter().position(|l| l == "call f").expect("call");
@@ -3679,6 +3686,51 @@ fn calltyped_publishes_call_site_markers_before_the_return_move() {
             "movq %rax, -8(%rbp)"
         ],
         "{lines:?}"
+    );
+}
+
+/// `# LCCC_IPA_KEEP` is the LAST marker of the block and still precedes the
+/// return move, so `peephole::passes::liveness::call_markers` (which reads
+/// only the contiguous comment block after the call) sees it; without
+/// `CALL_ARGS` it directly follows the call. A zero mask publishes nothing.
+#[test]
+fn calltyped_publishes_ipa_keep_last_inside_the_marker_block() {
+    let mk = |gp: Option<u8>, keep: u16| MachInst::CallTyped {
+        caller_saves: vec![],
+        args: vec![],
+        target: CallTarget::Direct("f".into()),
+        ret: Some(CallRetMove {
+            dst: MachOperand::StackSlot(-8),
+            size: OpSize::S64,
+        }),
+        gp_arg_count: gp,
+        ipa_keep: keep,
+    };
+    let tail = |inst: &MachInst| {
+        let lines = emit(inst);
+        let call = lines.iter().position(|l| l == "call f").expect("call");
+        lines[call + 1..].to_vec()
+    };
+    assert_eq!(
+        tail(&mk(Some(1), 0x0340)),
+        [
+            "# LCCC_CALL_ARGS 1",
+            "# LCCC_CALL_FP 0",
+            "# LCCC_IPA_KEEP 0x0340",
+            "movq %rax, -8(%rbp)"
+        ]
+    );
+    assert_eq!(
+        tail(&mk(None, 0x0100)),
+        ["# LCCC_IPA_KEEP 0x0100", "movq %rax, -8(%rbp)"]
+    );
+    assert_eq!(
+        tail(&mk(Some(1), 0)),
+        [
+            "# LCCC_CALL_ARGS 1",
+            "# LCCC_CALL_FP 0",
+            "movq %rax, -8(%rbp)"
+        ]
     );
 }
 
@@ -3695,6 +3747,7 @@ fn calltyped_return_home_names_the_sized_rax() {
             size: OpSize::S32,
         }),
         gp_arg_count: None,
+        ipa_keep: 0,
     };
     let lines = emit(&inst);
     assert_eq!(lines, vec!["call f", "movl %eax, -8(%rbp)"], "{lines:?}");
@@ -4597,6 +4650,7 @@ mod typed_indirect_calls {
                 size: OpSize::S64,
             }),
             gp_arg_count: None,
+            ipa_keep: 0,
         };
         let lines = emit(&inst);
         assert_eq!(

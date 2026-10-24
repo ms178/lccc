@@ -31,6 +31,88 @@ use super::relay_and_lea::{
 };
 
 #[cfg(test)]
+mod branch_inversion_tests {
+    use super::*;
+
+    fn run(asm: &str) -> Vec<String> {
+        let mut store = LineStore::new(asm.to_string());
+        let mut infos: Vec<LineInfo> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        combined_local_pass(&mut store, &mut infos);
+        (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim().to_string())
+            .collect()
+    }
+
+    /// hot_web_loop after phi coalescing emptied the common arm: the
+    /// fallthrough-only `.LBB4` no longer blocks the inversion.
+    #[test]
+    fn inverts_across_an_emptied_fallthrough_only_block() {
+        let out = run(concat!(
+            "f:\n",
+            "    testq %rax, %rax\n",
+            "je .LBB5\n",
+            ".LBB4:\n",
+            "    jmp .LBB6\n",
+            ".LBB5:\n",
+            "    addq $1, %rbx\n",
+            ".LBB6:\n",
+            "    ret\n",
+        ));
+        assert_eq!(
+            out,
+            [
+                "f:",
+                "testq %rax, %rax",
+                "jne .LBB6",
+                ".LBB4:",
+                ".LBB5:",
+                "addq $1, %rbx",
+                ".LBB6:",
+                "ret"
+            ]
+        );
+    }
+
+    /// A label some other jump (or a jump table) enters keeps its `jmp`:
+    /// deleting it would let that predecessor fall into the wrong arm.
+    #[test]
+    fn keeps_the_jump_when_the_middle_label_is_a_branch_target() {
+        for other in [
+            "    jmp .LBB4\n",
+            "    .long .LBB4-.Ljt\n",
+            "    leaq .LBB4(%rip), %rcx\n",
+        ] {
+            let asm = format!(
+                "f:\n    testq %rax, %rax\nje .LBB5\n.LBB4:\n    jmp .LBB6\n.LBB5:\n    addq $1, %rbx\n.LBB6:\n    ret\n{other}"
+            );
+            let out = run(&asm);
+            assert!(out.iter().any(|l| l == "je .LBB5"), "{other}: {out:?}");
+            assert!(out.iter().any(|l| l == "jmp .LBB6"), "{other}: {out:?}");
+        }
+    }
+
+    /// The jcc target itself between the jumps is not a skippable label.
+    #[test]
+    fn does_not_cross_the_conditional_target() {
+        let out = run(concat!(
+            "f:\n",
+            "    testq %rax, %rax\n",
+            "je .LBB5\n",
+            ".LBB5:\n",
+            "    jmp .LBB6\n",
+            ".LBB7:\n",
+            "    ret\n",
+            ".LBB6:\n",
+            "    ret\n",
+        ));
+        assert!(out.iter().any(|l| l == "jmp .LBB6"), "{out:?}");
+    }
+}
+
+#[cfg(test)]
 mod nonzero_bitcount_staging_tests {
     use super::*;
 
@@ -1662,6 +1744,14 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
         // Transforms to:
         //   j!CC .Lfalse      (inverted condition, jump to false target)
         //   .Ltrue:           (fall through naturally)
+        //
+        // Labels between the two jumps are crossed only when nothing but the
+        // fallthrough enters them (`label_is_fallthrough_only`: no branch,
+        // jump-table entry or address-of-label names them).  That is the
+        // block a later pass emptied — an if/else arm whose phi copies were
+        // coalesced away leaves `je .Lrare; .Lcommon: jmp .Ljoin; .Lrare:`.
+        // The label stays (unreferenced, harmless); only the jmp goes.  The
+        // per-label scan is fresh because this pass itself retargets jumps.
         if infos[i].kind == LineKind::CondJmp {
             let cond_line = infos[i].trimmed(store.get(i));
             // Parse: "jCC target" -> extract CC and target
@@ -1670,7 +1760,16 @@ pub(super) fn combined_local_pass(store: &mut LineStore, infos: &mut [LineInfo])
                 let cond_target = cond_line[space_pos + 1..].trim();
                 // Find the next non-NOP line (should be jmp)
                 let mut j = i + 1;
-                while j < len && infos[j].is_nop() {
+                while j < len
+                    && (infos[j].is_nop()
+                        || infos[j].kind == LineKind::Empty
+                        || (infos[j].kind == LineKind::Label
+                            && infos[j]
+                                .trimmed(store.get(j))
+                                .strip_suffix(':')
+                                .is_some_and(|l| l.trim() != cond_target)
+                            && super::dead_writes::label_is_fallthrough_only(store, infos, j)))
+                {
                     j += 1;
                 }
                 if j < len && infos[j].kind == LineKind::Jmp {
@@ -7659,12 +7758,6 @@ fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
     }
     let mut uses = vec![0u16; n];
     let mut defs = vec![0u16; n];
-    let caller_saved: u16 = [0u8, 1, 2, 4, 5, 8, 9, 10, 11]
-        .iter()
-        .fold(0, |m, r| m | (1u16 << r));
-    let call_args: u16 = [0u8, 1, 2, 4, 5, 8, 9]
-        .iter()
-        .fold(0, |m, r| m | (1u16 << r));
     for i in 0..n {
         let refs = infos[i].reg_refs;
         // PARTIAL-WIDTH DEF GUARD.  A destination spelled in a 16-bit or
@@ -7700,9 +7793,16 @@ fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
                 uses[i] = 1u16 << reg;
                 defs[i] = 1u16 << reg;
             }
+            // The call-site authority shared with `FileLiveness` (argument
+            // count, variadic %al, static chain, retpoline target, IPA keep
+            // set, plus every register the call text names) and the SysV
+            // clobber set, in the canonical family numbering. A private copy
+            // here used to read {rax,rcx,rdx,RSP,RBP,r8,r9} and clobber RBP:
+            // %rdi/%rsi argument staging looked dead and the callee-saved
+            // frame register died at every call.
             LineKind::Call => {
-                uses[i] = call_args | refs;
-                defs[i] = caller_saved;
+                uses[i] = super::liveness::call_site_reads(store, infos, i);
+                defs[i] = super::liveness::CALLER_SAVED;
             }
             LineKind::Ret => uses[i] = (1u16 << 0) | (1u16 << 2),
             LineKind::Cmp | LineKind::JmpIndirect => uses[i] = refs,
@@ -7724,9 +7824,15 @@ fn compute_gpr_live_out(store: &LineStore, infos: &[LineInfo]) -> Vec<u16> {
                 // value survives in the upper bits — keep it live (see the
                 // PARTIAL-WIDTH DEF GUARD above).
                 partial_def(t, dest_reg as u16, &mut uses[i]);
+                // Implicit operands can be any family (`cpuid` writes %rbx,
+                // string ops read %rsi/%rdi): every family is read here, so
+                // nothing live before the line is ever judged dead
+                // (live_in = uses | (live_out & !defs) is then total
+                // whatever the defs are), and the ABI scratch set is
+                // modelled as written.
                 if has_implicit_reg_usage(t) {
-                    uses[i] |= caller_saved;
-                    defs[i] |= caller_saved;
+                    uses[i] = u16::MAX;
+                    defs[i] |= super::liveness::CALLER_SAVED;
                 }
             }
             LineKind::Other { .. } => uses[i] = refs,
@@ -10568,6 +10674,85 @@ mod windowed_liveness_tests {
             .find(|i| store.get(*i).contains("shlq $17, %r11"))
             .expect("producer line must still be addressable");
         assert!(infos[nop_idx].is_nop(), "old producer must be nop'd");
+    }
+
+    /// The call model of `compute_gpr_live_out` uses the canonical family
+    /// numbering (`REG_NAMES`: rsp=4, rbp=5, rsi=6, rdi=7). It used to read
+    /// {rax,rcx,rdx,RSP,RBP,r8,r9} and clobber {..,RSP,RBP,..}: the first two
+    /// argument registers were invisible to the call, and the callee-saved
+    /// frame register died at every call.
+    #[test]
+    fn call_reads_rdi_rsi_and_preserves_rbp() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    movq %rbx, %rdi\n",
+            "    movq %r12, %rsi\n",
+            "    movq $5, %rbp\n",
+            "    call g\n",
+            "    movq %rbp, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        // Lines: 0 label, 1 cfi, 2 rdi staging, 3 rsi staging, 4 rbp def,
+        // 5 call, 6 rbp read, 7 ret.
+        let (store, infos) = build(asm);
+        let live_out = compute_gpr_live_out(&store, &infos);
+        assert!(
+            live_out[2] & (1u16 << 7) != 0,
+            "call reads its %rdi argument"
+        );
+        assert!(
+            live_out[3] & (1u16 << 6) != 0,
+            "call reads its %rsi argument"
+        );
+        assert!(
+            live_out[4] & (1u16 << 5) != 0,
+            "%rbp is callee-saved: the value written before the call is read after it"
+        );
+        // An `# LCCC_CALL_ARGS 1` site reads %rdi only: %rsi is then dead.
+        let one_arg = asm.replace("    call g\n", "    call g\n    # LCCC_CALL_ARGS 1\n");
+        assert_ne!(one_arg, asm, "fixture must carry the marker");
+        let (store, infos) = build(&one_arg);
+        let live_out = compute_gpr_live_out(&store, &infos);
+        assert!(
+            live_out[2] & (1u16 << 7) != 0,
+            "LCCC_CALL_ARGS 1 still reads %rdi"
+        );
+        assert!(
+            live_out[3] & (1u16 << 6) == 0,
+            "LCCC_CALL_ARGS 1 does not read %rsi"
+        );
+    }
+
+    /// End-to-end witness for the call model above: the increment-chain
+    /// collapse retires `TMP1` and `TMP2` when the oracle calls them dead.
+    /// `TMP2` (%r10) really is dead at the call (clobbered, unread); `TMP1`
+    /// (%rdi) is the argument the call reads, which only the corrected call
+    /// model sees.
+    #[test]
+    fn increment_chain_keeps_a_call_argument_temporary() {
+        let asm = concat!(
+            "f:\n",
+            ".cfi_startproc\n",
+            "    leaq 1(%rbx), %rdi\n",
+            "    movslq %edi, %r10\n",
+            "    movq %r10, %rbx\n",
+            "    call g\n",
+            "    movq %rbx, %rax\n",
+            "    ret\n",
+            ".cfi_endproc\n",
+        );
+        let (mut store, mut infos) = build(asm);
+        let changed = collapse_increment_chain(&mut store, &mut infos);
+        let live: Vec<&str> = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i).trim())
+            .collect();
+        assert!(
+            !changed && live.contains(&"leaq 1(%rbx), %rdi"),
+            "the call reads %rdi: its staging must survive: {live:?}"
+        );
     }
 
     /// compute_gpr_live_out must treat a 16-bit dest spelling as a PARTIAL

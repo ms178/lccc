@@ -3,7 +3,7 @@
   "fns_over_300": 228,
   "fns_over_500": 94,
   "ignored_tests": 10,
-  "knob_literals": 532,
+  "knob_literals": 533,
   "knob_names": [
     "CCC_AGGREGATE_SPLIT",
     "CCC_AGG_BYVAL_DEBUG",
@@ -483,6 +483,7 @@
     "LCCC_FORCE_SSE2",
     "LCCC_GAS",
     "LCCC_IFCONV_ARM_BUDGET",
+    "LCCC_IPA_KEEP",
     "LCCC_LD_ICF",
     "LCCC_LD_MAP",
     "LCCC_LD_PANIC_TRACE",
@@ -538,7 +539,7 @@
     "LCCC_VOLATILE_SLOT",
     "LCCC_WHY_NOT_VECTORIZE"
   ],
-  "knobs_undocumented": 270,
+  "knobs_undocumented": 269,
   "panic_sites": 834,
   "panic_sites_hot": 105,
   "unsafe_sites": 25
