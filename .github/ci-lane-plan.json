@@ -1161,7 +1161,7 @@
     "frontend-b": {
       "group": "frontend",
       "mode": "steps",
-      "predicted_gate_seconds": 341.86,
+      "predicted_gate_seconds": 344.58,
       "shards": 2,
       "steps": [
         {
@@ -1387,6 +1387,10 @@
         {
           "measured_s": 0.25,
           "name": "Surface vector-extension codegen failures in annotations"
+        },
+        {
+          "measured_s": 2.72,
+          "name": "Incoming MEMORY parameter homes and cross-compiler ABI"
         }
       ]
     }
@@ -1404,8 +1408,8 @@
     },
     "frontend": {
       "costs": "/home/user/.cache/tmp/frontend.tsv",
-      "measured_seconds_total": 680.73,
-      "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); target-attribute-isa 1 s and x86-scalar-intrinsics 3 s by scripts/ci_local.sh --fast, rounded up"
+      "measured_seconds_total": 683.45,
+      "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); target-attribute-isa 1 s and x86-scalar-intrinsics 3 s by scripts/ci_local.sh --fast, rounded up; incoming MEMORY ABI GCC/Clang gate 2.72 s measured on the quiet research host (both pinned oracles, both frame modes and switch states)"
     }
   }
 }

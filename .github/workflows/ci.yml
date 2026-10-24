@@ -1023,6 +1023,11 @@ jobs:
       run: |
         [ -s "$RUNNER_TEMP/vector-ext-codegen.log" ] || exit 0
         python3 scripts/ci_annotate_log.py --title "vector-ext codegen" "$RUNNER_TEMP/vector-ext-codegen.log"
+    - name: Incoming MEMORY parameter homes and cross-compiler ABI
+      run: |
+        set -euo pipefail
+        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_incoming_byval_homes.sh
+        env CCC=target/fastbuild/lccc ORACLE_CC="${CLANG:-clang-23}" bash tests/regression/check_incoming_byval_homes.sh
     needs:
     - build
   codegen-a:
@@ -2215,6 +2220,10 @@ jobs:
         key: ${{ runner.os }}-gas-2.47-${{ hashFiles('scripts/ensure_gas_247.sh') }}
     - name: Install GNU as 2.47 for x86-64 differential
       run: bash scripts/ensure_gas_247.sh x86_64-linux-gnu
+    - name: i686 GNU vector ABI and typed shuffles against GCC and Clang
+      run: |
+        PATH="$HOME/.cache/gas-2.47-x86_64-linux-gnu/bin:$PATH" \
+          CCC=target/fastbuild/lccc bash tests/regression/check_i686_gnu_vector_abi.sh
     # The cross packages are unpacked with `dpkg -x`, so they are invisible
     # to the oracle bundle's package delta and every lane re-downloaded
     # them: run 39752334266 paid 331 s (assembler/linker), 165 s (contract
@@ -2725,7 +2734,7 @@ jobs:
         exec > >(tee intel-evidence/dispatch.log) 2>&1
         trap 'status=$?; if [ "$status" -ne 0 ]; then while IFS= read -r line; do printf "::error::%s\n" "$line"; done < <(tail -n 30 intel-evidence/dispatch.log); fi' EXIT
         python3 scripts/test_local_oracles.py
-        for fixture in popcount_loop_idiom crc32_index_narrowing_variants affine_scaled_index_matrix sign_test_cmov; do
+        for fixture in popcount_loop_idiom crc32_index_narrowing_variants affine_scaled_index_matrix sign_test_cmov shufflevector_value_convention; do
           "$LCCC_ICX_BIN" -O2 -fwrapv -Wall -Wextra -Werror "tests/regression/$fixture.c" -o "intel-evidence/$fixture-icx"
           target/fastbuild/lccc -O2 -fwrapv -Wall -Wextra -Werror "tests/regression/$fixture.c" -o "intel-evidence/$fixture-lccc"
           "intel-evidence/$fixture-icx" > "intel-evidence/$fixture-icx.txt"
@@ -2742,6 +2751,8 @@ jobs:
           GCC_SIGN_CMOV="${GCC16:-gcc}" CLANG_SIGN_CMOV="${CLANG:-clang}" \
           ICX_SIGN_CMOV="$LCCC_ICX_BIN" LCCC_FASTBUILD_BIN=target/fastbuild/lccc \
           bash tests/regression/check_sign_test_cmov.sh
+    - name: Incoming MEMORY parameter ABI against ICX
+      run: env CCC=target/fastbuild/lccc ORACLE_CC="$LCCC_ICX_BIN" bash tests/regression/check_incoming_byval_homes.sh
     - name: FP select min/max matrix against ICX
       run: |
         set -euo pipefail

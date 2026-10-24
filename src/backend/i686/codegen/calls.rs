@@ -264,6 +264,12 @@ impl I686Codegen {
                     self.emit_call_f128_stack_arg(&args[i], stack_offset);
                     stack_offset += 12;
                 }
+                call_abi::CallArgClass::StructByValStack { size: 16 }
+                    if call_abi::is_scalar_f128_sse_arg(arg_types, struct_arg_is_f128_sse, i) =>
+                {
+                    self.emit_call_f128_sse_stack_arg(&args[i], stack_offset);
+                    stack_offset += 16;
+                }
                 call_abi::CallArgClass::StructByValStack { size }
                 | call_abi::CallArgClass::LargeStructStack { size } => {
                     let sz = *size;

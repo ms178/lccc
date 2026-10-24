@@ -1069,20 +1069,10 @@ impl super::InstructionEncoder {
     /// `loop .Ltarget+1` emitted undefined symbols literally named `ext+9`
     /// and `.Ltarget+1`; the internal PC8 type could then escape into ELF.
     pub(crate) fn add_relocation(&mut self, symbol: &str, reloc_type: u32, addend: i64) {
-        let (symbol, addend) = if let Some((base, extra)) =
-            super::super::parser::split_relocation_symbol_addend(symbol)
-        {
-            // Parsed source constants and architecture-supplied addends
-            // are both i64. Overflow is not a legal ELF addend; retaining
-            // the unsplit spelling lets the normal undefined-symbol path
-            // diagnose it rather than wrapping to a different address.
-            match addend.checked_add(extra) {
-                Some(sum) => (base, sum),
-                None => (symbol, addend),
-            }
-        } else {
-            (symbol, addend)
-        };
+        let (symbol, addend) =
+            crate::backend::x86::assembler::parser::normalize_relocation_symbol_addend(
+                symbol, addend,
+            );
 
         // Strip @PLT suffix from symbol names - the suffix only affects relocation type,
         // not the symbol name in the ELF symbol table. Use PLT32 reloc when @PLT is present.
@@ -1128,6 +1118,22 @@ impl super::InstructionEncoder {
             addend,
             diff_symbol: Some(diff.to_string()),
         });
+    }
+
+    /// Emit a legacy/VEX memory operand and its trailing immediate together.
+    /// Only this operand's RIP-relative relocation receives the extra byte;
+    /// absolute addresses and earlier instructions' relocations are unchanged.
+    pub(crate) fn encode_modrm_mem_imm8(
+        &mut self,
+        reg_field: u8,
+        mem: &MemoryOperand,
+        imm: u8,
+    ) -> Result<(), String> {
+        let reloc_start = self.relocations.len();
+        self.encode_modrm_mem(reg_field, mem)?;
+        self.adjust_rip_reloc_addend(reloc_start, 1);
+        self.bytes.push(imm);
+        Ok(())
     }
 
     /// Adjust a RIP-relative relocation's addend to account for immediate bytes

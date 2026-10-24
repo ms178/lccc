@@ -316,6 +316,65 @@ fn vec_width(name: &str) -> Option<u8> {
     }
 }
 
+/// Packed shift operand roles from SDM Vol. 2: uniform register counts
+/// are always XMM, even for YMM/ZMM data. Per-element shifts instead read
+/// a full-width count vector. Neither family permits widening the data
+/// register names by merely choosing the widest operand's encoding.
+/// Returns whether the valid shape requires EVEX (immediate + memory data).
+pub(crate) fn check_packed_shift_shape(mnemonic: &str, ops: &[Operand]) -> Result<bool, String> {
+    // PSLLDQ/PSRLDQ have no MMX or GP form. Their ModRM register
+    // number alone cannot distinguish those illegal names from XMM.
+    if matches!(mnemonic, "pslldq" | "psrldq") {
+        return match ops {
+            [
+                Operand::Immediate(ImmediateValue::Integer(_)),
+                Operand::Register(dst),
+            ] if is_xmm(&dst.name) => Ok(false),
+            _ => Err(format!("operand type mismatch for `{mnemonic}'")),
+        };
+    }
+    let (variable, byte_shift) = match mnemonic {
+        "vpsllw" | "vpslld" | "vpsllq" | "vpsrlw" | "vpsrld" | "vpsrlq" | "vpsraw" | "vpsrad"
+        | "vpsraq" => (false, false),
+        "vpsllvw" | "vpsllvd" | "vpsllvq" | "vpsrlvw" | "vpsrlvd" | "vpsrlvq" | "vpsravw"
+        | "vpsravd" | "vpsravq" => (true, false),
+        "vpslldq" | "vpsrldq" => (false, true),
+        _ => return Ok(false),
+    };
+    let type_error = || format!("operand type mismatch for `{mnemonic}'");
+    if ops.len() != 3 {
+        return Err(format!("number of operands mismatch for `{mnemonic}'"));
+    }
+    let width = match &ops[2] {
+        Operand::Register(dst) => vec_width(&dst.name).ok_or_else(type_error)?,
+        _ => return Err(type_error()),
+    };
+    let immediate = matches!(&ops[0], Operand::Immediate(ImmediateValue::Integer(_)));
+    match &ops[1] {
+        Operand::Register(src) => {
+            if vec_width(&src.name) != Some(width) {
+                return Err(format!("register type mismatch for `{mnemonic}'"));
+            }
+        }
+        // Memory data is available only for immediate counts. Variable
+        // per-element shifts put memory in the COUNT operand, not the data.
+        Operand::Memory(_) if immediate && !variable => {}
+        _ => return Err(type_error()),
+    }
+    let count_ok = match &ops[0] {
+        Operand::Immediate(ImmediateValue::Integer(_)) => !variable,
+        Operand::Register(count) if !byte_shift => {
+            vec_width(&count.name) == Some(if variable { width } else { 0 })
+        }
+        Operand::Memory(_) => !byte_shift,
+        _ => false,
+    };
+    if !count_ok {
+        return Err(type_error());
+    }
+    Ok(matches!(&ops[1], Operand::Memory(_)))
+}
+
 /// Packed-convert shape validation, shared by the VEX and EVEX paths
 /// (GAS reports the same texts either way). Rejects cross-width
 /// registers (`register type mismatch' for same-width, `operand size
@@ -1649,9 +1708,7 @@ impl super::InstructionEncoder {
                 let dst_num =
                     self.emit_evex_memop(&dst.name, mem, None, map, w, pp, ll, z, aaa, mem_bcst)?;
                 self.bytes.push(opcode);
-                self.encode_evex_mem(dst_num, mem, scale_n)?;
-                self.bytes.push(*imm as u8);
-                Ok(())
+                self.encode_evex_mem_imm8(dst_num, mem, scale_n, *imm as u8)
             }
             _ => Err("unsupported EVEX imm2 operands".to_string()),
         }
@@ -1718,9 +1775,7 @@ impl super::InstructionEncoder {
                 let dst_num =
                     self.emit_evex_memop(&dst.name, mem, None, map, w, pp, ll, z, aaa, mem_bcst)?;
                 self.bytes.push(opcode);
-                self.encode_evex_mem(dst_num, mem, scale_n)?;
-                self.bytes.push(*imm as u8);
-                Ok(())
+                self.encode_evex_mem_imm8(dst_num, mem, scale_n, *imm as u8)
             }
             _ => Err("unsupported EVEX imm2 operands".to_string()),
         }
@@ -1891,9 +1946,7 @@ impl super::InstructionEncoder {
                     x4,
                 );
                 self.bytes.push(opcode);
-                self.encode_evex_mem(ext, mem, scale_n)?;
-                self.bytes.push(*imm as u8);
-                Ok(())
+                self.encode_evex_mem_imm8(ext, mem, scale_n, *imm as u8)
             }
             _ => Err("unsupported EVEX shift operands".to_string()),
         }
@@ -2140,9 +2193,7 @@ impl super::InstructionEncoder {
                     mem_bcst,
                 )?;
                 self.bytes.push(opcode);
-                self.encode_evex_mem(dst_num, mem, scale_n)?;
-                self.bytes.push(*imm as u8);
-                Ok(())
+                self.encode_evex_mem_imm8(dst_num, mem, scale_n, *imm as u8)
             }
             _ => Err("unsupported EVEX 3src-imm operands".to_string()),
         }
@@ -2305,9 +2356,7 @@ impl super::InstructionEncoder {
                     bcst,
                 )?;
                 self.bytes.push(opcode);
-                self.encode_evex_mem(k_num, mem, scale_n)?;
-                self.bytes.push(*imm as u8);
-                Ok(())
+                self.encode_evex_mem_imm8(k_num, mem, scale_n, *imm as u8)
             }
             _ => Err(CMP_ARITY_MISMATCH.to_string()),
         }
@@ -2420,9 +2469,7 @@ impl super::InstructionEncoder {
                 let src_num =
                     self.emit_evex_memop(&src.name, mem, None, map, w, pp, ll, z, aaa, false)?;
                 self.bytes.push(opcode);
-                self.encode_evex_mem(src_num, mem, tuple_n)?;
-                self.bytes.push(*imm as u8);
-                Ok(())
+                self.encode_evex_mem_imm8(src_num, mem, tuple_n, *imm as u8)
             }
             _ => Err("unsupported EVEX extract operands".to_string()),
         }
@@ -2651,9 +2698,7 @@ impl super::InstructionEncoder {
                     x4,
                 );
                 self.bytes.push(opcode);
-                self.encode_evex_mem(ext, mem, scale_n)?;
-                self.bytes.push(*imm as u8);
-                Ok(())
+                self.encode_evex_mem_imm8(ext, mem, scale_n, *imm as u8)
             }
             _ => Err("unsupported EVEX rotate operands".to_string()),
         }
@@ -3488,9 +3533,7 @@ impl super::InstructionEncoder {
                 self.bytes.push(0x42);
                 // Full-vector tuple: N = VL bytes (GAS 2.47:
                 // `vmpsadbw $1,4096(%rax),%zmm1,%zmm3` = disp8 0x40).
-                self.encode_evex_mem(dst_num, mem, 16u32 << ll)?;
-                self.bytes.push(imm);
-                Ok(())
+                self.encode_evex_mem_imm8(dst_num, mem, 16u32 << ll, imm)
             }
             _ => Err("operand type mismatch for `vmpsadbw'".to_string()),
         }
@@ -4760,7 +4803,7 @@ impl super::InstructionEncoder {
                     &dst.name, mem, None, params.map, params.w, params.pp, ll, false, aaa, bcst,
                 )?;
                 self.bytes.push(params.opcode);
-                self.encode_evex_mem(dst_num, mem, tuple_n)?;
+                return self.encode_evex_mem_imm8(dst_num, mem, tuple_n, imm);
             }
             _ => unreachable!("VFPCLASS source kind was validated above"),
         }
@@ -4963,9 +5006,7 @@ impl super::InstructionEncoder {
                     self.emit_evex_memop(&src.name, mem, None, 3, 0, 1, src_ll, z, aaa, false)?;
                 self.bytes.push(0x1D);
                 let (_, scale_n) = Self::evex_mem_scale(mem, src_ll, 2);
-                self.encode_evex_mem(src_num, mem, scale_n)?;
-                self.bytes.push(imm);
-                Ok(())
+                self.encode_evex_mem_imm8(src_num, mem, scale_n, imm)
             }
             _ => Err("operand type mismatch for `vcvtps2ph'".to_string()),
         }

@@ -20,6 +20,57 @@ use crate::ir::reexports::{IrConst, IrFunction, Operand};
 /// scalar stores (GCC torture 20050622-1 passes a 72-MiB object by value).
 pub(super) const LARGE_ARG_COPY_THRESHOLD: usize = 2048;
 
+/// Bit image of a scalar 16-byte SSE-carrier constant (`_Float128` or
+/// `_Decimal128`). The I128 variant is already the converted object image,
+/// not an integer to be converted again. Integer zero is also accepted for
+/// binary128, whose lowering uses it as the canonical zero after some implicit
+/// conversions. Decimal128 constants must already carry their I128 BID image:
+/// integer and literal zeros can have different quantum encodings. Other
+/// scalar constants are rejected rather than reinterpreted as carrier bits;
+/// they indicate a missing conversion in lowering.
+pub(crate) fn f128_sse_const_bits(c: IrConst) -> Option<u128> {
+    match c {
+        IrConst::Zero
+        | IrConst::I8(0)
+        | IrConst::I16(0)
+        | IrConst::I32(0)
+        | IrConst::I64(0)
+        | IrConst::I128(0) => Some(0),
+        IrConst::I128(bits) => Some(bits as u128),
+        _ => None,
+    }
+}
+
+/// Return the object image after the lowering invariant has been checked in
+/// one place. Keeping this internal-error path shared avoids architecture-
+/// specific copies of both the conversion policy and its diagnostic.
+pub(crate) fn f128_sse_const_image(c: IrConst) -> u128 {
+    f128_sse_const_bits(c)
+        .unwrap_or_else(|| panic!("internal error: {c:?} is not a 16-byte SSE scalar constant"))
+}
+
+/// Distinguish a scalar 16-byte VALUE from an ext-vector/aggregate ADDRESS.
+/// i686 deliberately reuses the f128 alignment marker for decomposed XMM
+/// vector pieces, so the marker alone is not sufficient for marshalling.
+/// Both scalar `_Float128` and `_Decimal128` have the U128 IR carrier; an
+/// `__int128` argument cannot be misselected because the CType-derived marker
+/// is false for it.
+pub(crate) fn is_scalar_f128_sse_arg(
+    arg_types: &[IrType],
+    struct_arg_is_f128_sse: &[bool],
+    index: usize,
+) -> bool {
+    arg_types.get(index).copied() == Some(IrType::U128)
+        && struct_arg_is_f128_sse.get(index).copied().unwrap_or(false)
+}
+
+/// Scalar SSE-carrier values are always homed in a 16-byte slot. Share the
+/// explicit invariant failure between x86-64 and i686 rather than silently
+/// manufacturing a partial/zero-filled object when malformed IR violates it.
+pub(crate) fn require_f128_sse_value_slot<T>(slot: Option<T>, value: u32) -> T {
+    slot.unwrap_or_else(|| panic!("internal error: 16-byte SSE scalar v{value} has no stack slot"))
+}
+
 // ---------------------------------------------------------------------------
 // CallArgClass — caller-side classification (used by emit_call_*)
 // ---------------------------------------------------------------------------
@@ -1848,5 +1899,64 @@ mod tests {
             core.classes[2],
             CoreArgClass::IntReg { reg_idx: 0 }
         ));
+    }
+
+    #[test]
+    fn scalar_f128_overflow_uses_the_value_stack_class_on_x86() {
+        let f128 = || ArgInfo {
+            struct_size: Some(16),
+            struct_align: Some(16),
+            is_f128_sse: true,
+            ..scalar(&[])
+        };
+        let mut args: Vec<ArgInfo<'_>> = (0..8)
+            .map(|_| ArgInfo {
+                is_float: true,
+                ..scalar(&[])
+            })
+            .collect();
+        args.push(f128());
+        let core = classify_args_core(&args, false, false, &sysv_x86_64());
+        assert!(matches!(
+            core.classes[8],
+            CoreArgClass::StructByValStack { size: 16 }
+        ));
+
+        // i686 has no XMM argument registers and scalar binary128 carries no
+        // aggregate eightbyte classes, so it reaches the same flagged arm.
+        let core = classify_args_core(&[f128()], false, false, &i686_regparm3());
+        assert!(matches!(
+            core.classes[0],
+            CoreArgClass::StructByValStack { size: 16 }
+        ));
+    }
+
+    #[test]
+    fn scalar_f128_marshalling_rejects_vector_address_markers() {
+        // i686 ext-vector XMM pieces reuse the alignment marker but carry
+        // Ptr operands. Only the genuine U128 scalar with the marker may use
+        // the value-copy path; missing metadata and other carriers fail closed
+        // to the aggregate/ordinary-I128 paths respectively.
+        let types = [IrType::Ptr, IrType::U128, IrType::U128, IrType::I128];
+        let markers = [true, true, false, true];
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 0));
+        assert!(is_scalar_f128_sse_arg(&types, &markers, 1));
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 2));
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 3));
+        assert!(!is_scalar_f128_sse_arg(&types, &markers, 4));
+    }
+
+    #[test]
+    fn f128_sse_constants_are_object_images_not_aggregate_addresses() {
+        let nine = 0x4002_2000_0000_0000_0000_0000_0000_0000u128;
+        assert_eq!(f128_sse_const_bits(IrConst::I128(nine as i128)), Some(nine));
+        let negative_zero = 1u128 << 127;
+        assert_eq!(
+            f128_sse_const_bits(IrConst::I128(negative_zero as i128)),
+            Some(negative_zero)
+        );
+        assert_eq!(f128_sse_const_bits(IrConst::I64(0)), Some(0));
+        assert_eq!(f128_sse_const_bits(IrConst::I64(9)), None);
+        assert_eq!(f128_sse_const_bits(IrConst::F64(9.0)), None);
     }
 }

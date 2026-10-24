@@ -1230,7 +1230,7 @@ impl Lowerer {
             let arg = args.get(cursor);
             let vector_ct = arg
                 .and_then(|arg| self.call_arg_ctype(param_ctypes, cursor, arg))
-                .filter(|ct| matches!(ct, CType::ExtVector(..)));
+                .filter(|ct| ct.i386_ext_vector_arg().is_some());
             let carrier = vector_ct.as_ref().and_then(CType::i386_ext_vector_arg);
             let (Some(arg), Some(vector_ct), Some(carrier)) = (arg, vector_ct, carrier) else {
                 new_vals.push(value);
@@ -1451,7 +1451,7 @@ impl Lowerer {
                 }
 
                 // A raw GCC 128-bit vector builtin (__builtin_ia32_shufps,
-                // __builtin_shufflevector, ...) yields its vector BY VALUE as a
+                // __builtin_ia32_maxps, ...) yields its vector BY VALUE as a
                 // packed I128; the struct/vector argument-passing path below
                 // expects a POINTER to the 16 data bytes (like any vector lvalue
                 // argument). Spill to a slot and continue as a pointer arg —
@@ -1465,7 +1465,6 @@ impl Lowerer {
                                 "__builtin_ia32_maxps"
                                     | "__builtin_ia32_minps"
                                     | "__builtin_ia32_shufps"
-                                    | "__builtin_shufflevector"
                                     | "__builtin_ia32_vextractf128_ps256"
                             ) {
                                 let slot = self.fresh_value();

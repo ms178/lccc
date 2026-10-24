@@ -1160,6 +1160,220 @@ pub(super) fn coalesce_packed_fma_prefix(store: &mut LineStore, infos: &mut [Lin
     changed
 }
 
+/// SDM PSHUFD: each two-bit selector acts independently within a 128-bit lane.
+fn compose_dword_shuffle(first: u8, second: u8) -> u8 {
+    (0..4).fold(0, |imm, lane| {
+        let intermediate = (second >> (lane * 2)) & 3;
+        imm | (((first >> (intermediate * 2)) & 3) << (lane * 2))
+    })
+}
+
+/// Compose adjacent unmasked register shuffles that both write the same bank.
+/// No deleted temporary needs a liveness proof: the second instruction fully
+/// overwrites precisely the first destination. Never mix legacy preservation
+/// with VEX zeroing, and retain a VEX identity's upper-zeroing effect as a move.
+pub(super) fn fold_composed_dword_shuffles(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let mut changed = false;
+    for i in 0..infos.len() {
+        if infos[i].is_nop() || infos[i].pinned {
+            continue;
+        }
+        let first = infos[i].trimmed(store.get(i));
+        let (mnemonic, args) = split_mn(first);
+        if !matches!(mnemonic, "pshufd" | "vpshufd") || first.contains(['{', '}']) {
+            continue;
+        }
+        let ops = operand_list(args);
+        let [imm1, src, dst] = ops.as_slice() else {
+            continue;
+        };
+        let Some((_, width @ (W128 | W256))) = vec_operand(src) else {
+            continue;
+        };
+        if vec_operand(dst).map(|(_, w)| w) != Some(width)
+            || (mnemonic == "pshufd" && width != W128)
+        {
+            continue;
+        }
+        let Some(j) = next_real(store, infos, i + 1, infos.len()) else {
+            continue;
+        };
+        let second = infos[j].trimmed(store.get(j));
+        let (mnemonic2, args2) = split_mn(second);
+        if mnemonic2 != mnemonic || second.contains(['{', '}']) {
+            continue;
+        }
+        let ops2 = operand_list(args2);
+        let [imm2, src2, dst2] = ops2.as_slice() else {
+            continue;
+        };
+        if dst != src2 || dst != dst2 {
+            continue;
+        }
+        let immediate = |text: &str| {
+            text.strip_prefix('$')?
+                .parse::<i64>()
+                .ok()
+                .filter(|v| (-128..=255).contains(v))
+                .map(|v| v as u8)
+        };
+        let (Some(a), Some(b)) = (immediate(imm1), immediate(imm2)) else {
+            continue;
+        };
+        let combined = compose_dword_shuffle(a, b);
+        let replacement = if combined == 0xE4 {
+            if mnemonic == "pshufd" && src == dst {
+                None
+            } else {
+                Some(format!(
+                    "    {} {src}, {dst}",
+                    if mnemonic == "pshufd" {
+                        "movdqa"
+                    } else {
+                        "vmovdqa"
+                    }
+                ))
+            }
+        } else {
+            Some(format!("    {mnemonic} ${combined}, {src}, {dst}"))
+        };
+        if let Some(text) = replacement {
+            replace_line(store, &mut infos[j], j, text);
+        } else {
+            mark_nop(&mut infos[j]);
+        }
+        mark_nop(&mut infos[i]);
+        changed = true;
+    }
+    changed
+}
+
+/// Replace a proven uniform per-lane shift with the scalar-count encoding.
+/// (V)MOVD zeroes bits 32..127, so its low 64 bits equal the dword count;
+/// (V)MOVQ supplies the complete qword count. Legacy upper preservation and
+/// VEX/EVEX upper zeroing are included in the deleted-write liveness proof.
+/// Without that proof a broadcast cannot become a uniform shift: the latter
+/// reads SIXTY-FOUR count bits, not just the low dword. Word forms are not
+/// eligible: their per-lane operations consume only 16 count bits, so an
+/// arbitrary nonzero bit 16..63 would change the result. Dword/qword and
+/// 128/256/512-bit shifts saturate at the lane width and leave flags unchanged.
+/// No C undefined-behavior assumption.
+/// Retarget the count move to the dead broadcast bank, also freeing the
+/// original data bank for the ordinary copy-propagation pass.
+pub(super) fn fold_uniform_vector_shift(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    let cfi = super::relay_and_lea::CfiIndex::build(store, infos);
+    let mut fp = None;
+    let mut changed = false;
+    for i in 0..infos.len() {
+        if infos[i].is_nop() || infos[i].pinned {
+            continue;
+        }
+        let text = infos[i].trimmed(store.get(i));
+        let (mov, args) = split_mn(text);
+        let row = match mov {
+            "vmovd" | "movd" => 1,
+            "vmovq" | "movq" => 0,
+            _ => continue,
+        };
+        let ops = operand_list(args);
+        if ops.len() != 2 || text.contains(['{', '}']) {
+            continue;
+        }
+        let Some(gp) = super::relay_and_lea::plain_gp_operand(ops[0]) else {
+            continue;
+        };
+        if ops[0] != REG_NAMES[row][gp as usize] {
+            continue;
+        }
+        let Some((count, W128)) = vec_operand(ops[1]) else {
+            continue;
+        };
+        let Some((_, end)) = cfi.function_range(i, store.len()) else {
+            continue;
+        };
+        let Some(j) = next_real(store, infos, i + 1, end) else {
+            continue;
+        };
+        let Some(k) = next_real(store, infos, j + 1, end) else {
+            continue;
+        };
+        if infos[j].pinned || infos[k].pinned {
+            continue;
+        }
+        let broadcast = infos[j].trimmed(store.get(j));
+        let shift = infos[k].trimmed(store.get(k));
+        if broadcast.contains(['{', '}']) || shift.contains(['{', '}']) {
+            continue;
+        }
+        let (bmn, bargs) = split_mn(broadcast);
+        let bops = operand_list(bargs);
+        let count_xmm = Some((count, W128));
+        let splat = match (row, bmn, bops.as_slice()) {
+            (1, "vpbroadcastd", [src, dst]) | (0, "vpbroadcastq", [src, dst])
+                if vec_operand(src) == count_xmm =>
+            {
+                vec_operand(dst)
+            }
+            (1, "pshufd" | "vpshufd", ["$0" | "$0x0" | "$0x00", src, dst])
+                if vec_operand(src) == count_xmm =>
+            {
+                vec_operand(dst).filter(|&(_, width)| width == W128)
+            }
+            (0, "unpcklpd" | "punpcklqdq", [src, dst])
+                if vec_operand(src) == count_xmm && vec_operand(dst) == count_xmm =>
+            {
+                count_xmm
+            }
+            (0, "vunpcklpd" | "vpunpcklqdq", [a, b, dst])
+                if vec_operand(a) == count_xmm && vec_operand(b) == count_xmm =>
+            {
+                vec_operand(dst).filter(|&(_, width)| width == W128)
+            }
+            _ => None,
+        };
+        let Some((splat, width @ (W128 | W256 | W512))) = splat else {
+            continue;
+        };
+        let (mn, args) = split_mn(shift);
+        let uniform = match (row, mn) {
+            (1, "vpsllvd") => "vpslld",
+            (1, "vpsrlvd") => "vpsrld",
+            (1, "vpsravd") => "vpsrad",
+            (0, "vpsllvq") => "vpsllq",
+            (0, "vpsrlvq") => "vpsrlq",
+            _ => continue,
+        };
+        let shifts = operand_list(args);
+        if shifts.len() != 3 || vec_operand(shifts[0]) != Some((splat, width)) {
+            continue;
+        }
+        let Some((src, sw)) = vec_operand(shifts[1]) else {
+            continue;
+        };
+        let Some((dst, dw)) = vec_operand(shifts[2]) else {
+            continue;
+        };
+        if sw != width || dw != width || src == count || src == splat {
+            continue;
+        }
+        let live = fp.get_or_insert_with(|| FpLiveness::new(store, infos));
+        if [count, splat].iter().any(|&bank| {
+            bank != dst
+                && !live.deleted_write_regions_dead_after(store, infos, k, u32::from(bank), &[i, j])
+        }) {
+            continue;
+        }
+        let moved = format!("    {mov} {}, %xmm{splat}", ops[0]);
+        let shifted = format!("    {uniform} %xmm{splat}, {}, {}", shifts[1], shifts[2]);
+        replace_line(store, &mut infos[i], i, moved);
+        replace_line(store, &mut infos[k], k, shifted);
+        mark_nop(&mut infos[j]);
+        fp = None;
+        changed = true;
+    }
+    changed
+}
+
 /// Re-home a scalar FMA so that the copies around it disappear.
 ///
 /// The codegen stages a scalar FMA's operands through copies whenever the
@@ -3206,6 +3420,403 @@ mod tests {
 
     fn body(text: &str) -> String {
         format!("{PRO}{text}{EPI}")
+    }
+
+    fn uniform_shift_only(text: &str) -> (bool, String) {
+        let mut store = LineStore::new(body(&format!("    # LCCC_RET_XMM 1\n{text}")));
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = fold_uniform_vector_shift(&mut store, &mut infos);
+        let result = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (changed, result)
+    }
+
+    #[test]
+    fn composed_dword_shuffle_exhaustive_lane_model() {
+        for first in 0..=255u8 {
+            for second in 0..=255u8 {
+                let input = [0x80000000u32, 0xFFFFFFFF, 0x7FC12345, 0x12345678];
+                let apply = |imm: u8, x: [u32; 4]| {
+                    std::array::from_fn(|lane| x[((imm >> (2 * lane)) & 3) as usize])
+                };
+                assert_eq!(
+                    apply(compose_dword_shuffle(first, second), input),
+                    apply(second, apply(first, input))
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn composed_dword_shuffle_native_upper_lanes() {
+        use crate::common::temp_files::TempFile;
+        use std::process::Command;
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            eprintln!("SKIP composed shuffle native witness: AVX2 required");
+            return;
+        }
+        let mut assembly = String::from(".text\n");
+        let mut driver = String::from("#include <stdint.h>\n");
+        let mut checks = String::new();
+        let mut index = 0;
+        for (mnemonic, bank, lanes, zero_upper) in [
+            ("pshufd", "xmm", 4, false),
+            ("vpshufd", "xmm", 4, true),
+            ("vpshufd", "ymm", 8, false),
+        ] {
+            for destination in [0, 2] {
+                for second in [27, 57] {
+                    let original = body(&format!(
+                        "    vmovdqu (%rdi), %ymm0\n    vmovdqu 32(%rdi), %ymm2\n    {mnemonic} $27, %{bank}0, %{bank}{destination}\n    {mnemonic} ${second}, %{bank}{destination}, %{bank}{destination}\n    vmovdqu %ymm{destination}, (%rsi)\n    vzeroupper\n    ret\n"
+                    ));
+                    let optimized = run(&original);
+                    assert!(optimized.matches(mnemonic).count() < 2, "{optimized}");
+                    let mask = compose_dword_shuffle(27, second);
+                    for (prefix, asm) in [("before", original), ("after", optimized)] {
+                        let name = format!("{prefix}_{index}");
+                        assembly.push_str(&format!(".globl {name}\n"));
+                        assembly.push_str(
+                            &asm.replace("f:", &format!("{name}:"))
+                                .replace(".size f, .-f", &format!(".size {name}, .-{name}")),
+                        );
+                        assembly.push('\n');
+                        driver
+                            .push_str(&format!("extern void {name}(const uint32_t*,uint32_t*);\n"));
+                        checks.push_str(&format!(
+                            "{name}(a,b); for(unsigned k=0;k<8;++k){{uint32_t e; if(k<{lanes}) e=a[(k/4)*4+(({mask}u>>((k%4)*2))&3)]; else e={upper}; if(b[k]!=e)return 1;}}\n",
+                            upper = if zero_upper { "0" } else if destination == 0 { "a[k]" } else { "a[k+8]" }
+                        ));
+                    }
+                    index += 1;
+                }
+            }
+        }
+        assembly.push_str(".section .note.GNU-stack,\"\",@progbits\n");
+        driver.push_str(&format!("int main(void){{uint32_t a[16],b[8],state=17; for(unsigned n=0;n<2048;++n){{for(unsigned k=0;k<16;++k){{state=state*1664525u+1013904223u;a[k]=state;}}{checks}}}return 0;}}\n"));
+        let asm = TempFile::try_new("composed-shuffle", "native", "s").unwrap();
+        let c = TempFile::try_new("composed-shuffle", "native", "c").unwrap();
+        let exe = TempFile::try_new("composed-shuffle", "native", "exe").unwrap();
+        std::fs::write(asm.path(), assembly).unwrap();
+        std::fs::write(c.path(), driver).unwrap();
+        let output = Command::new("gcc")
+            .args(["-O2", "-mavx2", "-Wall", "-Wextra", "-Werror"])
+            .arg(c.path())
+            .arg(asm.path())
+            .arg("-o")
+            .arg(exe.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(Command::new(exe.path()).status().unwrap().success());
+    }
+
+    #[test]
+    fn composed_dword_shuffle_effects_and_barriers() {
+        use super::super::test_skips::skip_passes;
+        let run_rule = |text: &str| {
+            let mut store = LineStore::new(body(text));
+            let mut infos: Vec<_> = (0..store.len())
+                .map(|i| classify_line(store.get(i)))
+                .collect();
+            let changed = fold_composed_dword_shuffles(&mut store, &mut infos);
+            let text = (0..store.len())
+                .filter(|&i| !infos[i].is_nop())
+                .map(|i| store.get(i))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (changed, text)
+        };
+        let (_, identity) =
+            run_rule("    pshufd $27, %xmm0, %xmm0\n    pshufd $27, %xmm0, %xmm0\n    ret\n");
+        assert!(!identity.contains("pshufd"), "{identity}");
+        for bank in ["xmm", "ymm"] {
+            let (changed, zeroing) = run_rule(&format!(
+                "    vpshufd $27, %{bank}1, %{bank}2\n    vpshufd $27, %{bank}2, %{bank}2\n    ret\n"
+            ));
+            assert!(changed);
+            assert!(
+                zeroing.contains(&format!("vmovdqa %{bank}1, %{bank}2")),
+                "{zeroing}"
+            );
+        }
+        for second in [
+            "vpshufd $27, %xmm0, %xmm0",
+            "pshufd $27, %xmm0, %xmm1",
+            "pshufd $27, (%rax), %xmm0",
+            "pshufd $27, %xmm0, %xmm0{%k1}",
+        ] {
+            assert!(
+                !run_rule(&format!(
+                    "    pshufd $27, %xmm0, %xmm0\n    {second}\n    ret\n"
+                ))
+                .0
+            );
+        }
+        for middle in [
+            "label:",
+            "    call opaque",
+            "    vzeroupper",
+            "    .rept 2",
+            "    paddd %xmm0, %xmm1",
+        ] {
+            assert!(!run_rule(&format!("    pshufd $27, %xmm0, %xmm0\n{middle}\n    pshufd $27, %xmm0, %xmm0\n    ret\n")).0);
+        }
+        let input = body("    pshufd $27, %xmm0, %xmm0\n    pshufd $27, %xmm0, %xmm0\n    ret\n");
+        assert!(!run(&input).contains("pshufd"));
+        let disabled = {
+            let _guard = skip_passes(&["vector_copy_retarget"]);
+            run(&input)
+        };
+        assert!(disabled.matches("pshufd").count() >= 2, "{disabled}");
+    }
+
+    #[test]
+    fn uniform_shift_encodings_and_aliases() {
+        for bank in ["xmm", "ymm", "zmm"] {
+            for (mov, gp, broadcast, shift, expected) in [
+                ("vmovd", "edi", "vpbroadcastd", "vpsllvd", "vpslld"),
+                ("vmovd", "edi", "vpbroadcastd", "vpsrlvd", "vpsrld"),
+                ("vmovd", "edi", "vpbroadcastd", "vpsravd", "vpsrad"),
+                ("vmovq", "rdi", "vpbroadcastq", "vpsllvq", "vpsllq"),
+                ("vmovq", "rdi", "vpbroadcastq", "vpsrlvq", "vpsrlq"),
+                ("movd", "edi", "vpbroadcastd", "vpsllvd", "vpslld"),
+                ("movq", "rdi", "vpbroadcastq", "vpsrlvq", "vpsrlq"),
+            ] {
+                for (count, splat, dst) in
+                    [(0, 15, 0), (3, 15, 0), (3, 0, 0), (15, 15, 0), (0, 0, 0)]
+                {
+                    let text = format!(
+                        "    {mov} %{gp}, %xmm{count}\n    {broadcast} %xmm{count}, %{bank}{splat}\n    {shift} %{bank}{splat}, %{bank}2, %{bank}{dst}\n    ret\n"
+                    );
+                    let (changed, out) = uniform_shift_only(&text);
+                    assert!(changed, "{text}\n{out}");
+                    assert!(
+                        out.contains(&format!("{expected} %xmm{splat}, %{bank}2, %{bank}{dst}")),
+                        "{out}"
+                    );
+                    assert!(!out.contains(broadcast), "{out}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_shift_rejects_unproven_counts_and_live_banks() {
+        for prefix in [
+            "vmovq %rdi, %xmm0",
+            "vmovd %edi, %xmm0{%k1}",
+            "vmovd (%rdi), %xmm0",
+            "vmovd %xmm3, %xmm0",
+            "vmovd %di, %xmm0",
+        ] {
+            assert!(!uniform_shift_only(&format!("    {prefix}\n    vpbroadcastd %xmm0, %ymm15\n    vpsllvd %ymm15, %ymm2, %ymm0\n    ret\n")).0);
+        }
+        // VPSRAVW consumes a 16-bit count per lane; VPSRAW consumes 64 bits.
+        // Count 0x85012179f8de0000 therefore means zero to the former but
+        // arithmetic saturation to the latter. Native execution caught this
+        // exact mismatch; do not generalize the dword/qword proof to words.
+        assert!(!uniform_shift_only(
+            "    vmovd %edi, %xmm0\n    vpbroadcastw %xmm0, %zmm15\n    vpsravw %zmm15, %zmm2, %zmm0\n    ret\n"
+        ).0);
+        for middle in ["label:", "    call opaque", "    vzeroupper", "    .rept 2"] {
+            assert!(!uniform_shift_only(&format!("    vmovd %edi, %xmm0\n{middle}\n    vpbroadcastd %xmm0, %ymm15\n    vpsllvd %ymm15, %ymm2, %ymm0\n    ret\n")).0);
+        }
+        for shift in [
+            "vpsllvd %ymm15, %ymm0, %ymm0",
+            "vpsllvd %ymm15, %ymm15, %ymm0",
+            "vpsllvd %ymm15, %ymm2, %ymm0{%k1}",
+            "vpsllvd %xmm15, %xmm2, %xmm0",
+            "vpsllvd (%rdi), %ymm2, %ymm0",
+            "vpsllvd %zmm15, %zmm2, %zmm0",
+        ] {
+            assert!(
+                !uniform_shift_only(&format!(
+                    "    vmovd %edi, %xmm0\n    vpbroadcastd %xmm0, %ymm15\n    {shift}\n    ret\n"
+                ))
+                .0
+            );
+        }
+        for tail in [
+            "vmovdqa %ymm15, (%rdi)",
+            "vextractf128 $1, %ymm15, %xmm5",
+            "fxsave (%rdi)",
+        ] {
+            assert!(!uniform_shift_only(&format!("    vmovd %edi, %xmm0\n    vpbroadcastd %xmm0, %ymm15\n    vpsllvd %ymm15, %ymm2, %ymm0\n    {tail}\n    ret\n")).0);
+        }
+        assert!(!uniform_shift_only("    vmovd %edi, %xmm3\n    vpbroadcastd %xmm3, %ymm15\n    vpsllvd %ymm15, %ymm2, %ymm0\n    vmovdqa %ymm3, (%rdi)\n    ret\n").0);
+    }
+
+    #[test]
+    fn uniform_shift_shuffle_splats_require_exact_lane_provenance() {
+        for (mov, gp, splat, shift, valid) in [
+            ("movd", "edi", "pshufd $0x00, %xmm0, %xmm0", "vpsllvd", true),
+            ("vmovd", "edi", "vpshufd $0, %xmm0, %xmm0", "vpsravd", true),
+            ("movq", "rdi", "unpcklpd %xmm0, %xmm0", "vpsllvq", true),
+            ("movq", "rdi", "punpcklqdq %xmm0, %xmm0", "vpsrlvq", true),
+            (
+                "vmovq",
+                "rdi",
+                "vpunpcklqdq %xmm0, %xmm0, %xmm0",
+                "vpsrlvq",
+                true,
+            ),
+            (
+                "movd",
+                "edi",
+                "pshufd $0x55, %xmm0, %xmm0",
+                "vpsllvd",
+                false,
+            ),
+            ("movq", "rdi", "unpcklpd %xmm3, %xmm0", "vpsllvq", false),
+            (
+                "vmovq",
+                "rdi",
+                "vunpcklpd %xmm0, %xmm3, %xmm0",
+                "vpsllvq",
+                false,
+            ),
+            ("vmovq", "rdi", "vpshufd $0, %xmm0, %xmm0", "vpsllvd", false),
+        ] {
+            let text = format!(
+                "    {mov} %{gp}, %xmm0\n    {splat}\n    {shift} %xmm0, %xmm2, %xmm0\n    ret\n"
+            );
+            assert_eq!(uniform_shift_only(&text).0, valid, "{text}");
+        }
+    }
+
+    #[test]
+    fn uniform_shift_full_pipeline_disable_control() {
+        use super::super::test_skips::skip_passes;
+        let asm = body(
+            "    # LCCC_RET_XMM 1\n    # LCCC_RET_XMM_BITS 256\n    vmovaps %ymm0, %ymm2\n    vmovd %edi, %xmm0\n    vpbroadcastd %xmm0, %ymm15\n    vpsllvd %ymm15, %ymm2, %ymm0\n    ret\n",
+        );
+        let out = run(&asm);
+        assert!(out.contains("vpslld"), "{out}");
+        assert!(!out.contains("vpbroadcast"), "{out}");
+        let disabled = {
+            let _guard = skip_passes(&["vector_copy_retarget"]);
+            run(&asm)
+        };
+        assert!(disabled.contains("vpbroadcast"), "{disabled}");
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn uniform_shift_native_integer_model() {
+        use crate::common::temp_files::TempFile;
+        use std::process::Command;
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            eprintln!("SKIP uniform shift native execution: AVX2 required");
+            return;
+        }
+        let make_assembly = |avx512: bool| {
+            let mut cases = vec![
+                ("xmm", "d", "4"),
+                ("ymm", "d", "8"),
+                ("xmm", "q", "2"),
+                ("ymm", "q", "4"),
+            ];
+            if avx512 {
+                cases.extend([("zmm", "d", "16"), ("zmm", "q", "8")]);
+            }
+            let mut assembly = String::from(".text\n");
+            for (bank, lane, suffix) in cases {
+                for (operation, shift) in [("sl", "vpsllv"), ("sr", "vpsrlv"), ("sa", "vpsrav")] {
+                    if lane == "q" && operation == "sa" {
+                        continue;
+                    }
+                    let (mov, gp) = match lane {
+                        "d" => (if bank == "xmm" { "movd" } else { "vmovd" }, "edi"),
+                        _ => (if bank == "xmm" { "movq" } else { "vmovq" }, "rdi"),
+                    };
+                    let bits = match bank {
+                        "zmm" => 512,
+                        "ymm" => 256,
+                        _ => 128,
+                    };
+                    let text = format!(
+                        "    # LCCC_RET_XMM 1\n    # LCCC_RET_XMM_BITS {bits}\n    vmovaps %{bank}0, %{bank}2\n    {mov} %{gp}, %xmm0\n    vpbroadcast{lane} %xmm0, %{bank}15\n    {shift}{lane} %{bank}15, %{bank}2, %{bank}0\n    ret\n"
+                    );
+                    let text = if bank == "xmm" {
+                        text.replace(
+                            &format!("vpbroadcast{lane} %xmm0, %xmm15"),
+                            if lane == "d" {
+                                "vpshufd $0x00, %xmm0, %xmm15"
+                            } else {
+                                "vunpcklpd %xmm0, %xmm0, %xmm15"
+                            },
+                        )
+                    } else {
+                        text
+                    };
+                    let original = body(&text);
+                    let (changed, optimized) = uniform_shift_only(&text);
+                    assert!(changed, "{optimized}");
+                    for (prefix, asm) in [("original", original), ("optimized", optimized)] {
+                        let name = format!("{prefix}_{lane}{suffix}{operation}");
+                        assembly.push_str(&format!(".globl {name}\n"));
+                        assembly.push_str(
+                            &asm.replace("f:", &format!("{name}:"))
+                                .replace(".size f, .-f", &format!(".size {name}, .-{name}")),
+                        );
+                        assembly.push('\n');
+                    }
+                }
+            }
+            assembly.push_str(".section .note.GNU-stack,\"\",@progbits\n");
+            assembly
+        };
+        let compile_and_run = |assembly: String, avx512: bool| {
+            let asm = TempFile::try_new("uniform-shift", "contract", "s").unwrap();
+            let exe = TempFile::try_new("uniform-shift", "contract", "exe").unwrap();
+            std::fs::write(asm.path(), assembly).unwrap();
+            let mut command = Command::new("gcc");
+            command.args(["-O2", "-Wall", "-Wextra", "-Werror"]);
+            if avx512 {
+                command.args(["-mavx512f", "-DAVX512_MODEL"]);
+            } else {
+                command.arg("-mavx2");
+            }
+            let output = command
+                .arg(
+                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/regression/fixtures/peephole-uniform-shift/driver.c"),
+                )
+                .arg(asm.path())
+                .arg("-o")
+                .arg(exe.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = Command::new(exe.path()).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let expected = if avx512 { "245760" } else { "163840" };
+            assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
+        };
+        compile_and_run(make_assembly(false), false);
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            compile_and_run(make_assembly(true), true);
+        } else {
+            eprintln!("SKIP AVX-512 uniform shifts: AVX512F required");
+        }
     }
 
     fn packed_prefix_only(text: &str) -> (bool, String) {

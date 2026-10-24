@@ -149,7 +149,7 @@ v16l G_eq_v16l(v16l a,v16l b);
 v16l G_lt_v16l(v16l a,v16l b);
 void G_loop_v16l(v16l*r,const v16l*a,const v16l*b,int n);
 v16l G_splat_v16l(long x);
-long G_lane2_v16l(v16l a);
+long G_lane1_v16l(v16l a);
 v16l G_setlane_v16l(v16l a,long x);
 v16l G_ld_v16l(const long*p);
 void G_st_v16l(long*p,v16l v);
@@ -214,7 +214,7 @@ v16l G_lt_v16d(v16d a,v16d b);
 v16d G_div_v16d(v16d a,v16d b);
 void G_loop_v16d(v16d*r,const v16d*a,const v16d*b,int n);
 v16d G_splat_v16d(double x);
-double G_lane2_v16d(v16d a);
+double G_lane1_v16d(v16d a);
 v16d G_setlane_v16d(v16d a,double x);
 v16d G_ld_v16d(const double*p);
 void G_st_v16d(double*p,v16d v);
@@ -373,7 +373,7 @@ v16l L_eq_v16l(v16l a,v16l b);
 v16l L_lt_v16l(v16l a,v16l b);
 void L_loop_v16l(v16l*r,const v16l*a,const v16l*b,int n);
 v16l L_splat_v16l(long x);
-long L_lane2_v16l(v16l a);
+long L_lane1_v16l(v16l a);
 v16l L_setlane_v16l(v16l a,long x);
 v16l L_ld_v16l(const long*p);
 void L_st_v16l(long*p,v16l v);
@@ -438,7 +438,7 @@ v16l L_lt_v16d(v16d a,v16d b);
 v16d L_div_v16d(v16d a,v16d b);
 void L_loop_v16d(v16d*r,const v16d*a,const v16d*b,int n);
 v16d L_splat_v16d(double x);
-double L_lane2_v16d(v16d a);
+double L_lane1_v16d(v16d a);
 v16d L_setlane_v16d(v16d a,double x);
 v16d L_ld_v16d(const double*p);
 void L_st_v16d(double*p,v16d v);
@@ -467,6 +467,25 @@ static int L_sink_count; void L_sink(void){ L_sink_count++; }
 static uint64_t seed=0x9E3779B97F4A7C15ull;
 static uint64_t rnd(void){ seed^=seed<<13; seed^=seed>>7; seed^=seed<<17; return seed; }
 static void fill(void*p,int n,int kind){ unsigned char*b=p; for(int i=0;i<n;i++) b[i]=(unsigned char)rnd(); (void)kind; }
+/* Signed vector arithmetic has the scalar C overflow/left-shift rules. Keep
+   raw bits for bitwise/compare/right-shift tests, but prove these arithmetic
+   inputs defined: [-3,3] cannot overflow the loop/nine-argument sums, and
+   0..3 shifted by 0..lane_bits-3 stays representable and nonnegative. */
+#define SIGNED_INPUT(V) do { \
+  for(unsigned i=0;i<sizeof(V)/sizeof((V)[0]);i++) \
+    (V)[i]=(__typeof__((V)[0]))((int)(rnd()%7)-3); \
+} while(0)
+#define SIGNED_LEFT_INPUT(A,B) do { \
+  for(unsigned i=0;i<sizeof(A)/sizeof((A)[0]);i++) { \
+    (A)[i]=(__typeof__((A)[0]))(rnd()%4); \
+    (B)[i]=(__typeof__((B)[0]))(rnd()%(sizeof((A)[0])*8-2)); \
+  } \
+} while(0)
+#define SIGNED_LEFT_SCALAR_INPUT(A,N) do { \
+  for(unsigned i=0;i<sizeof(A)/sizeof((A)[0]);i++) \
+    (A)[i]=(__typeof__((A)[0]))(rnd()%4); \
+  (N)=(__typeof__(N))(rnd()%(sizeof((A)[0])*8-2)); \
+} while(0)
 static int fails=0, total=0;
 static void check(const char*n,const void*a,const void*b,int sz){ total++; if(memcmp(a,b,sz)){ fails++; printf("MISMATCH %s\n",n);} }
 
@@ -584,22 +603,25 @@ static void cf_checks(void){
 #define SHVV(T,N,W) { T a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(unsigned i=0;i<sizeof a/sizeof a[0];i++) b[i]=(b[i]&(W-1)); \
   T r1=G_##N(a,b), r2=L_##N(a,b); check(#N,&r1,&r2,sizeof r1); }
 #define SHVS(T,N,CT,W) { T a; fill(&a,sizeof a,0); CT n=(CT)(rnd()%W); T r1=G_##N(a,n), r2=L_##N(a,n); check(#N,&r1,&r2,sizeof r1); }
+#define SHLV(T,N) { T a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); SIGNED_LEFT_INPUT(a,b); \
+  T r1=G_##N(a,b), r2=L_##N(a,b); check(#N,&r1,&r2,sizeof r1); }
+#define SHLS(T,N,CT) { T a; fill(&a,sizeof a,0); CT n; SIGNED_LEFT_SCALAR_INPUT(a,n); T r1=G_##N(a,n), r2=L_##N(a,n); check(#N,&r1,&r2,sizeof r1); }
 static void shift_checks(void){
   for(int rep=0;rep<4;rep++){
-    SHVV(v32u,sh_vv_u,32) SHVV(v32ul,sh_vv_ul,64) SHVV(v16u,sh_vv_u4,32) SHVV(v32i,sh_then_add,32)
-    SHVS(v32i,sh_vs_shl,int,32) SHVS(v32i,sh_vs_sar,int,32) SHVS(v32u,sh_vs_shr,unsigned,32)
-    SHVS(v32l,sh_vs_shl_l,long,64) SHVS(v32ul,sh_vs_shr_ul,int,64)
-    SHVS(v16i,sh4_vs_sar,int,32) SHVV(v16l,sh4_vv_shl_l,64)
-    { v16i a,b,c; fill(&a,sizeof a,0); fill(&b,sizeof b,0); fill(&c,sizeof c,0); for(int i=0;i<4;i++){ b[i]&=31; c[i]&=31; } v16i r1=G_sh4_chain(a,b,c), r2=L_sh4_chain(a,b,c); check("sh4_chain",&r1,&r2,sizeof r1); }
-    { v32i a; v32u b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<8;i++) b[i]&=31; v32i r1=G_sh_mixsign(a,b), r2=L_sh_mixsign(a,b); check("sh_mixsign",&r1,&r2,sizeof r1); }
+    SHVV(v32u,sh_vv_u,32) SHVV(v32ul,sh_vv_ul,64) SHVV(v16u,sh_vv_u4,32) SHLV(v32i,sh_then_add)
+    SHLS(v32i,sh_vs_shl,int) SHVS(v32i,sh_vs_sar,int,32) SHVS(v32u,sh_vs_shr,unsigned,32)
+    SHLS(v32l,sh_vs_shl_l,long) SHVS(v32ul,sh_vs_shr_ul,int,64)
+    SHVS(v16i,sh4_vs_sar,int,32) SHLV(v16l,sh4_vv_shl_l)
+    { v16i a,b,c; fill(&a,sizeof a,0); fill(&b,sizeof b,0); fill(&c,sizeof c,0); SIGNED_LEFT_INPUT(a,b); for(int i=0;i<4;i++) c[i]&=31; v16i r1=G_sh4_chain(a,b,c), r2=L_sh4_chain(a,b,c); check("sh4_chain",&r1,&r2,sizeof r1); }
+    { v32i a; v32u b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); SIGNED_LEFT_INPUT(a,b); v32i r1=G_sh_mixsign(a,b), r2=L_sh_mixsign(a,b); check("sh_mixsign",&r1,&r2,sizeof r1); }
     { v32u a; v32i b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<8;i++) b[i]&=31; v32u r1=G_sh_mixsign2(a,b), r2=L_sh_mixsign2(a,b); check("sh_mixsign2",&r1,&r2,sizeof r1); }
-    { v32i a,b,c; fill(&a,sizeof a,0); fill(&b,sizeof b,0); fill(&c,sizeof c,0); for(int i=0;i<8;i++){ b[i]&=31; c[i]&=31; } v32i r1=G_sh_chain(a,b,c), r2=L_sh_chain(a,b,c); check("sh_chain",&r1,&r2,sizeof r1); }
+    { v32i a,b,c; fill(&a,sizeof a,0); fill(&b,sizeof b,0); fill(&c,sizeof c,0); SIGNED_LEFT_INPUT(a,b); for(int i=0;i<8;i++) c[i]&=31; v32i r1=G_sh_chain(a,b,c), r2=L_sh_chain(a,b,c); check("sh_chain",&r1,&r2,sizeof r1); }
   }
 }
 /* compare operands: random lanes, with some lanes forced equal and some to
    the sign-bit boundary so eq/le/unsigned-order paths are all exercised */
 #define CMPV(T,N,AT) { AT a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); \
-  for(unsigned i=0;i<sizeof a/sizeof a[0];i++){ if(i%3==0) b[i]=a[i]; if(i%4==1) a[i]=(__typeof__(a[0]))((__typeof__(a[0]))1<<(sizeof a[0]*8-1)); } \
+  for(unsigned i=0;i<sizeof a/sizeof a[0];i++){ if(i%3==0) b[i]=a[i]; if(i%4==1) a[i]=(__typeof__(a[0]))((uint64_t)1<<(sizeof a[0]*8-1)); } \
   T r1=G_##N(a,b), r2=L_##N(a,b); check(#N,&r1,&r2,sizeof r1); }
 static void cmp64_checks(void){
   for(int rep=0;rep<4;rep++){
@@ -623,10 +645,10 @@ static void filld2(v16d*v){ for(int i=0;i<2;i++) (*v)[i]=(double)((int)(rnd()%20
 static void extra_checks(void){
   { v32f a,b; fillf8(&a); fillf8(&b); float s=(float)(rnd()%50)/4.0f; v32f r1=G_mix_sab(s,a,b), r2=L_mix_sab(s,a,b); check("mix_sab",&r1,&r2,sizeof r1); }
   { v16f a,b; fillf4(&a); fillf4(&b); float s=(float)(rnd()%50)/4.0f; v16f r1=G_mix_sab4(s,a,b), r2=L_mix_sab4(s,a,b); check("mix_sab4",&r1,&r2,sizeof r1); }
-  { v32i a; fill(&a,sizeof a,0); v32i r1=G_splat_r(a), r2=L_splat_r(a); check("splat_r",&r1,&r2,sizeof r1); }
+  { v32i a; fill(&a,sizeof a,0); SIGNED_INPUT(a); v32i r1=G_splat_r(a), r2=L_splat_r(a); check("splat_r",&r1,&r2,sizeof r1); }
   { v32f a; fillf8(&a); v32f r1=G_splat_l(a), r2=L_splat_l(a); check("splat_l",&r1,&r2,sizeof r1); }
   { v32f v[9]; for(int k=0;k<9;k++) fillf8(&v[k]); v32f r1=G_nine(v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]), r2=L_nine(v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]); check("nine",&r1,&r2,sizeof r1); }
-  { v16i v[9]; fill(v,sizeof v,0); v16i r1=G_nine4(v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]), r2=L_nine4(v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]); check("nine4",&r1,&r2,sizeof r1); }
+  { v16i v[9]; fill(v,sizeof v,0); for(int k=0;k<9;k++) SIGNED_INPUT(v[k]); v16i r1=G_nine4(v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]), r2=L_nine4(v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8]); check("nine4",&r1,&r2,sizeof r1); }
   { v32f a; fillf8(&a); v32f r1=G_ident(a), r2=L_ident(a); check("ident",&r1,&r2,sizeof r1); }
   { v16d a; filld2(&a); v16d r1=G_ident2(a), r2=L_ident2(a); check("ident2",&r1,&r2,sizeof r1); }
   { v32f a,r1,r2; fillf8(&a); fillf8(&r1); r2=r1; G_asg(&r1,&a); L_asg(&r2,&a); check("asg",&r1,&r2,sizeof r1); G_asg_self(&r1); L_asg_self(&r2); check("asg_self",&r1,&r2,sizeof r1); }
@@ -638,7 +660,7 @@ static void extra_checks(void){
       G_tern_count=L_tern_count=0; r1=G_tern_se(a,b,c); r2=L_tern_se(a,b,c); check("tern_se",&r1,&r2,sizeof r1); check("tern_se_count",&G_tern_count,&L_tern_count,sizeof(int)); } }
   { v32f a={0.0f,-0.0f,1.0f,-1.0f,0.0f,-0.0f,2.5f,-2.5f}; v32f r1=G_negz(a), r2=L_negz(a); check("negz",&r1,&r2,sizeof r1); }
   { v16d a={0.0,-0.0}; v16d r1=G_negz2(a), r2=L_negz2(a); check("negz2",&r1,&r2,sizeof r1); }
-  { struct S4i a; v16i b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); struct S4i r1=G_s4i_add(a,b), r2=L_s4i_add(a,b); check("s4i_add.v",&r1.v,&r2.v,sizeof r1.v); check("s4i_add.tag",&r1.tag,&r2.tag,sizeof r1.tag); }
+  { struct S4i a; v16i b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); SIGNED_INPUT(a.v); SIGNED_INPUT(b); a.tag=(int)(rnd()%200)-100; struct S4i r1=G_s4i_add(a,b), r2=L_s4i_add(a,b); check("s4i_add.v",&r1.v,&r2.v,sizeof r1.v); check("s4i_add.tag",&r1.tag,&r2.tag,sizeof r1.tag); }
   { v32f p1,p2,b; fillf8(&p1); p2=p1; fillf8(&b); G_cas_ptr(&p1,b); L_cas_ptr(&p2,b); check("cas_ptr",&p1,&p2,sizeof p1); }
   { v16i p1[3],p2[3],b; fill(p1,sizeof p1,0); memcpy(p2,p1,sizeof p1); fill(&b,sizeof b,0); G_cas_arr(p1,b,2); L_cas_arr(p2,b,2); check("cas_arr",p1,p2,sizeof p1); }
   { v32f a,b; v32i x,y; fillf8(&a); fillf8(&b); fill(&x,sizeof x,0); fill(&y,sizeof y,0); v32i r1=G_sel_mask(a,b,x,y), r2=L_sel_mask(a,b,x,y); check("sel_mask",&r1,&r2,sizeof r1); }
@@ -646,10 +668,13 @@ static void extra_checks(void){
 
 int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shift_checks(); cmp64_checks();
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16c r1=G_add_v16c(a,b), r2=L_add_v16c(a,b); check("add_v16c",&r1,&r2,sizeof r1); }
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16c r1=G_sub_v16c(a,b), r2=L_sub_v16c(a,b); check("sub_v16c",&r1,&r2,sizeof r1); }
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16c r1=G_mul_v16c(a,b), r2=L_mul_v16c(a,b); check("mul_v16c",&r1,&r2,sizeof r1); }
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16c r1=G_and_v16c(a,b), r2=L_and_v16c(a,b); check("and_v16c",&r1,&r2,sizeof r1); }
@@ -658,12 +683,13 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16c r1=G_xor_v16c(a,b), r2=L_xor_v16c(a,b); check("xor_v16c",&r1,&r2,sizeof r1); }
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<16;i++) b[i]=(char)(((unsigned)b[i])%8);
+  SIGNED_LEFT_INPUT(a,b);
   v16c r1=G_shl_v16c(a,b), r2=L_shl_v16c(a,b); check("shl_v16c",&r1,&r2,sizeof r1); }
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<16;i++) b[i]=(char)(((unsigned)b[i])%8);
   v16c r1=G_shr_v16c(a,b), r2=L_shr_v16c(a,b); check("shr_v16c",&r1,&r2,sizeof r1); }
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16c r1=G_neg_v16c(a,b), r2=L_neg_v16c(a,b); check("neg_v16c",&r1,&r2,sizeof r1); }
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16c r1=G_not_v16c(a,b), r2=L_not_v16c(a,b); check("not_v16c",&r1,&r2,sizeof r1); }
@@ -671,20 +697,25 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
   v16c r1=G_eq_v16c(a,b), r2=L_eq_v16c(a,b); check("eq_v16c",&r1,&r2,sizeof r1); }
 { v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16c r1=G_lt_v16c(a,b), r2=L_lt_v16c(a,b); check("lt_v16c",&r1,&r2,sizeof r1); }
-{ v16c r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0); memcpy(r2,r1,sizeof r1);
+{ v16c r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0);
+  for(int k=0;k<9;k++) { SIGNED_INPUT(a[k]); SIGNED_INPUT(b[k]); SIGNED_INPUT(r1[k]); }
+  memcpy(r2,r1,sizeof r1);
   G_loop_v16c(r1,a,b,9); L_loop_v16c(r2,a,b,9); check("loop_v16c",r1,r2,sizeof r1); }
 { char x=(char)(rnd()%200); v16c r1=G_splat_v16c(x), r2=L_splat_v16c(x); check("splat_v16c",&r1,&r2,sizeof r1); }
 { v16c a; fill(&a,sizeof a,0); for(int i=0;i<16;i++) a[i]=(char)(int)(rnd()%200); char r1=G_lane2_v16c(a), r2=L_lane2_v16c(a); check("lane2_v16c",&r1,&r2,sizeof r1); }
 { v16c a; fill(&a,sizeof a,0); for(int i=0;i<16;i++) a[i]=(char)(int)(rnd()%200); char x=(char)(rnd()%200); v16c r1=G_setlane_v16c(a,x), r2=L_setlane_v16c(a,x); check("setlane_v16c",&r1,&r2,sizeof r1); }
 { char p[16]; fill(p,sizeof p,0); v16c r1=G_ld_v16c(p), r2=L_ld_v16c(p); check("ld_v16c",&r1,&r2,sizeof r1); }
 { v16c v; fill(&v,sizeof v,0); char p1[16],p2[16]; G_st_v16c(p1,v); L_st_v16c(p2,v); check("st_v16c",p1,p2,sizeof p1); }
-{ v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<16;i++) { a[i]=(char)(int)(rnd()%200); b[i]=(char)(int)(rnd()%200); } for(int c=0;c<2;c++) { v16c r1=G_cond_v16c(a,b,c), r2=L_cond_v16c(a,b,c); check("cond_v16c",&r1,&r2,sizeof r1); } }
-{ v16c p[6]; for(int k=0;k<6;k++) for(int i=0;i<16;i++) p[k][i]=(char)(int)(rnd()%100); for(int n=0;n<=6;n+=3) { v16c r1=G_acc_v16c(p,n), r2=L_acc_v16c(p,n); check("acc_v16c",&r1,&r2,sizeof r1); } }
+{ v16c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); SIGNED_INPUT(a); SIGNED_INPUT(b); for(int c=0;c<2;c++) { v16c r1=G_cond_v16c(a,b,c), r2=L_cond_v16c(a,b,c); check("cond_v16c",&r1,&r2,sizeof r1); } }
+{ v16c p[6]; for(int k=0;k<6;k++) for(int i=0;i<16;i++) p[k][i]=(char)(int)(rnd()%10); for(int n=0;n<=6;n+=3) { v16c r1=G_acc_v16c(p,n), r2=L_acc_v16c(p,n); check("acc_v16c",&r1,&r2,sizeof r1); } }
 { v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32c r1=G_add_v32c(a,b), r2=L_add_v32c(a,b); check("add_v32c",&r1,&r2,sizeof r1); }
 { v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32c r1=G_sub_v32c(a,b), r2=L_sub_v32c(a,b); check("sub_v32c",&r1,&r2,sizeof r1); }
 { v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32c r1=G_mul_v32c(a,b), r2=L_mul_v32c(a,b); check("mul_v32c",&r1,&r2,sizeof r1); }
 { v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32c r1=G_and_v32c(a,b), r2=L_and_v32c(a,b); check("and_v32c",&r1,&r2,sizeof r1); }
@@ -693,12 +724,13 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32c r1=G_xor_v32c(a,b), r2=L_xor_v32c(a,b); check("xor_v32c",&r1,&r2,sizeof r1); }
 { v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<32;i++) b[i]=(char)(((unsigned)b[i])%8);
+  SIGNED_LEFT_INPUT(a,b);
   v32c r1=G_shl_v32c(a,b), r2=L_shl_v32c(a,b); check("shl_v32c",&r1,&r2,sizeof r1); }
 { v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<32;i++) b[i]=(char)(((unsigned)b[i])%8);
   v32c r1=G_shr_v32c(a,b), r2=L_shr_v32c(a,b); check("shr_v32c",&r1,&r2,sizeof r1); }
 { v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32c r1=G_neg_v32c(a,b), r2=L_neg_v32c(a,b); check("neg_v32c",&r1,&r2,sizeof r1); }
 { v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32c r1=G_not_v32c(a,b), r2=L_not_v32c(a,b); check("not_v32c",&r1,&r2,sizeof r1); }
@@ -706,20 +738,25 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
   v32c r1=G_eq_v32c(a,b), r2=L_eq_v32c(a,b); check("eq_v32c",&r1,&r2,sizeof r1); }
 { v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32c r1=G_lt_v32c(a,b), r2=L_lt_v32c(a,b); check("lt_v32c",&r1,&r2,sizeof r1); }
-{ v32c r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0); memcpy(r2,r1,sizeof r1);
+{ v32c r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0);
+  for(int k=0;k<9;k++) { SIGNED_INPUT(a[k]); SIGNED_INPUT(b[k]); SIGNED_INPUT(r1[k]); }
+  memcpy(r2,r1,sizeof r1);
   G_loop_v32c(r1,a,b,9); L_loop_v32c(r2,a,b,9); check("loop_v32c",r1,r2,sizeof r1); }
 { char x=(char)(rnd()%200); v32c r1=G_splat_v32c(x), r2=L_splat_v32c(x); check("splat_v32c",&r1,&r2,sizeof r1); }
 { v32c a; fill(&a,sizeof a,0); for(int i=0;i<32;i++) a[i]=(char)(int)(rnd()%200); char r1=G_lane2_v32c(a), r2=L_lane2_v32c(a); check("lane2_v32c",&r1,&r2,sizeof r1); }
 { v32c a; fill(&a,sizeof a,0); for(int i=0;i<32;i++) a[i]=(char)(int)(rnd()%200); char x=(char)(rnd()%200); v32c r1=G_setlane_v32c(a,x), r2=L_setlane_v32c(a,x); check("setlane_v32c",&r1,&r2,sizeof r1); }
 { char p[32]; fill(p,sizeof p,0); v32c r1=G_ld_v32c(p), r2=L_ld_v32c(p); check("ld_v32c",&r1,&r2,sizeof r1); }
 { v32c v; fill(&v,sizeof v,0); char p1[32],p2[32]; G_st_v32c(p1,v); L_st_v32c(p2,v); check("st_v32c",p1,p2,sizeof p1); }
-{ v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<32;i++) { a[i]=(char)(int)(rnd()%200); b[i]=(char)(int)(rnd()%200); } for(int c=0;c<2;c++) { v32c r1=G_cond_v32c(a,b,c), r2=L_cond_v32c(a,b,c); check("cond_v32c",&r1,&r2,sizeof r1); } }
-{ v32c p[6]; for(int k=0;k<6;k++) for(int i=0;i<32;i++) p[k][i]=(char)(int)(rnd()%100); for(int n=0;n<=6;n+=3) { v32c r1=G_acc_v32c(p,n), r2=L_acc_v32c(p,n); check("acc_v32c",&r1,&r2,sizeof r1); } }
+{ v32c a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); SIGNED_INPUT(a); SIGNED_INPUT(b); for(int c=0;c<2;c++) { v32c r1=G_cond_v32c(a,b,c), r2=L_cond_v32c(a,b,c); check("cond_v32c",&r1,&r2,sizeof r1); } }
+{ v32c p[6]; for(int k=0;k<6;k++) for(int i=0;i<32;i++) p[k][i]=(char)(int)(rnd()%10); for(int n=0;n<=6;n+=3) { v32c r1=G_acc_v32c(p,n), r2=L_acc_v32c(p,n); check("acc_v32c",&r1,&r2,sizeof r1); } }
 { v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16s r1=G_add_v16s(a,b), r2=L_add_v16s(a,b); check("add_v16s",&r1,&r2,sizeof r1); }
 { v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16s r1=G_sub_v16s(a,b), r2=L_sub_v16s(a,b); check("sub_v16s",&r1,&r2,sizeof r1); }
 { v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16s r1=G_mul_v16s(a,b), r2=L_mul_v16s(a,b); check("mul_v16s",&r1,&r2,sizeof r1); }
 { v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16s r1=G_and_v16s(a,b), r2=L_and_v16s(a,b); check("and_v16s",&r1,&r2,sizeof r1); }
@@ -728,12 +765,13 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16s r1=G_xor_v16s(a,b), r2=L_xor_v16s(a,b); check("xor_v16s",&r1,&r2,sizeof r1); }
 { v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<8;i++) b[i]=(short)(((unsigned)b[i])%16);
+  SIGNED_LEFT_INPUT(a,b);
   v16s r1=G_shl_v16s(a,b), r2=L_shl_v16s(a,b); check("shl_v16s",&r1,&r2,sizeof r1); }
 { v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<8;i++) b[i]=(short)(((unsigned)b[i])%16);
   v16s r1=G_shr_v16s(a,b), r2=L_shr_v16s(a,b); check("shr_v16s",&r1,&r2,sizeof r1); }
 { v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16s r1=G_neg_v16s(a,b), r2=L_neg_v16s(a,b); check("neg_v16s",&r1,&r2,sizeof r1); }
 { v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16s r1=G_not_v16s(a,b), r2=L_not_v16s(a,b); check("not_v16s",&r1,&r2,sizeof r1); }
@@ -741,7 +779,9 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
   v16s r1=G_eq_v16s(a,b), r2=L_eq_v16s(a,b); check("eq_v16s",&r1,&r2,sizeof r1); }
 { v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16s r1=G_lt_v16s(a,b), r2=L_lt_v16s(a,b); check("lt_v16s",&r1,&r2,sizeof r1); }
-{ v16s r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0); memcpy(r2,r1,sizeof r1);
+{ v16s r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0);
+  for(int k=0;k<9;k++) { SIGNED_INPUT(a[k]); SIGNED_INPUT(b[k]); SIGNED_INPUT(r1[k]); }
+  memcpy(r2,r1,sizeof r1);
   G_loop_v16s(r1,a,b,9); L_loop_v16s(r2,a,b,9); check("loop_v16s",r1,r2,sizeof r1); }
 { short x=(short)(rnd()%200); v16s r1=G_splat_v16s(x), r2=L_splat_v16s(x); check("splat_v16s",&r1,&r2,sizeof r1); }
 { v16s a; fill(&a,sizeof a,0); for(int i=0;i<8;i++) a[i]=(short)(int)(rnd()%200); short r1=G_lane2_v16s(a), r2=L_lane2_v16s(a); check("lane2_v16s",&r1,&r2,sizeof r1); }
@@ -751,10 +791,13 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v16s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<8;i++) { a[i]=(short)(int)(rnd()%200); b[i]=(short)(int)(rnd()%200); } for(int c=0;c<2;c++) { v16s r1=G_cond_v16s(a,b,c), r2=L_cond_v16s(a,b,c); check("cond_v16s",&r1,&r2,sizeof r1); } }
 { v16s p[6]; for(int k=0;k<6;k++) for(int i=0;i<8;i++) p[k][i]=(short)(int)(rnd()%100); for(int n=0;n<=6;n+=3) { v16s r1=G_acc_v16s(p,n), r2=L_acc_v16s(p,n); check("acc_v16s",&r1,&r2,sizeof r1); } }
 { v32s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32s r1=G_add_v32s(a,b), r2=L_add_v32s(a,b); check("add_v32s",&r1,&r2,sizeof r1); }
 { v32s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32s r1=G_sub_v32s(a,b), r2=L_sub_v32s(a,b); check("sub_v32s",&r1,&r2,sizeof r1); }
 { v32s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32s r1=G_mul_v32s(a,b), r2=L_mul_v32s(a,b); check("mul_v32s",&r1,&r2,sizeof r1); }
 { v32s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32s r1=G_and_v32s(a,b), r2=L_and_v32s(a,b); check("and_v32s",&r1,&r2,sizeof r1); }
@@ -763,12 +806,13 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v32s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32s r1=G_xor_v32s(a,b), r2=L_xor_v32s(a,b); check("xor_v32s",&r1,&r2,sizeof r1); }
 { v32s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<16;i++) b[i]=(short)(((unsigned)b[i])%16);
+  SIGNED_LEFT_INPUT(a,b);
   v32s r1=G_shl_v32s(a,b), r2=L_shl_v32s(a,b); check("shl_v32s",&r1,&r2,sizeof r1); }
 { v32s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<16;i++) b[i]=(short)(((unsigned)b[i])%16);
   v32s r1=G_shr_v32s(a,b), r2=L_shr_v32s(a,b); check("shr_v32s",&r1,&r2,sizeof r1); }
 { v32s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32s r1=G_neg_v32s(a,b), r2=L_neg_v32s(a,b); check("neg_v32s",&r1,&r2,sizeof r1); }
 { v32s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32s r1=G_not_v32s(a,b), r2=L_not_v32s(a,b); check("not_v32s",&r1,&r2,sizeof r1); }
@@ -776,7 +820,9 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
   v32s r1=G_eq_v32s(a,b), r2=L_eq_v32s(a,b); check("eq_v32s",&r1,&r2,sizeof r1); }
 { v32s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32s r1=G_lt_v32s(a,b), r2=L_lt_v32s(a,b); check("lt_v32s",&r1,&r2,sizeof r1); }
-{ v32s r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0); memcpy(r2,r1,sizeof r1);
+{ v32s r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0);
+  for(int k=0;k<9;k++) { SIGNED_INPUT(a[k]); SIGNED_INPUT(b[k]); SIGNED_INPUT(r1[k]); }
+  memcpy(r2,r1,sizeof r1);
   G_loop_v32s(r1,a,b,9); L_loop_v32s(r2,a,b,9); check("loop_v32s",r1,r2,sizeof r1); }
 { short x=(short)(rnd()%200); v32s r1=G_splat_v32s(x), r2=L_splat_v32s(x); check("splat_v32s",&r1,&r2,sizeof r1); }
 { v32s a; fill(&a,sizeof a,0); for(int i=0;i<16;i++) a[i]=(short)(int)(rnd()%200); short r1=G_lane2_v32s(a), r2=L_lane2_v32s(a); check("lane2_v32s",&r1,&r2,sizeof r1); }
@@ -786,10 +832,13 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v32s a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<16;i++) { a[i]=(short)(int)(rnd()%200); b[i]=(short)(int)(rnd()%200); } for(int c=0;c<2;c++) { v32s r1=G_cond_v32s(a,b,c), r2=L_cond_v32s(a,b,c); check("cond_v32s",&r1,&r2,sizeof r1); } }
 { v32s p[6]; for(int k=0;k<6;k++) for(int i=0;i<16;i++) p[k][i]=(short)(int)(rnd()%100); for(int n=0;n<=6;n+=3) { v32s r1=G_acc_v32s(p,n), r2=L_acc_v32s(p,n); check("acc_v32s",&r1,&r2,sizeof r1); } }
 { v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16i r1=G_add_v16i(a,b), r2=L_add_v16i(a,b); check("add_v16i",&r1,&r2,sizeof r1); }
 { v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16i r1=G_sub_v16i(a,b), r2=L_sub_v16i(a,b); check("sub_v16i",&r1,&r2,sizeof r1); }
 { v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16i r1=G_mul_v16i(a,b), r2=L_mul_v16i(a,b); check("mul_v16i",&r1,&r2,sizeof r1); }
 { v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16i r1=G_and_v16i(a,b), r2=L_and_v16i(a,b); check("and_v16i",&r1,&r2,sizeof r1); }
@@ -798,12 +847,13 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16i r1=G_xor_v16i(a,b), r2=L_xor_v16i(a,b); check("xor_v16i",&r1,&r2,sizeof r1); }
 { v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<4;i++) b[i]=(int)(((unsigned)b[i])%32);
+  SIGNED_LEFT_INPUT(a,b);
   v16i r1=G_shl_v16i(a,b), r2=L_shl_v16i(a,b); check("shl_v16i",&r1,&r2,sizeof r1); }
 { v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<4;i++) b[i]=(int)(((unsigned)b[i])%32);
   v16i r1=G_shr_v16i(a,b), r2=L_shr_v16i(a,b); check("shr_v16i",&r1,&r2,sizeof r1); }
 { v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16i r1=G_neg_v16i(a,b), r2=L_neg_v16i(a,b); check("neg_v16i",&r1,&r2,sizeof r1); }
 { v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16i r1=G_not_v16i(a,b), r2=L_not_v16i(a,b); check("not_v16i",&r1,&r2,sizeof r1); }
@@ -811,7 +861,9 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
   v16i r1=G_eq_v16i(a,b), r2=L_eq_v16i(a,b); check("eq_v16i",&r1,&r2,sizeof r1); }
 { v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16i r1=G_lt_v16i(a,b), r2=L_lt_v16i(a,b); check("lt_v16i",&r1,&r2,sizeof r1); }
-{ v16i r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0); memcpy(r2,r1,sizeof r1);
+{ v16i r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0);
+  for(int k=0;k<9;k++) { SIGNED_INPUT(a[k]); SIGNED_INPUT(b[k]); SIGNED_INPUT(r1[k]); }
+  memcpy(r2,r1,sizeof r1);
   G_loop_v16i(r1,a,b,9); L_loop_v16i(r2,a,b,9); check("loop_v16i",r1,r2,sizeof r1); }
 { int x=(int)(rnd()%200); v16i r1=G_splat_v16i(x), r2=L_splat_v16i(x); check("splat_v16i",&r1,&r2,sizeof r1); }
 { v16i a; fill(&a,sizeof a,0); for(int i=0;i<4;i++) a[i]=(int)(int)(rnd()%200); int r1=G_lane2_v16i(a), r2=L_lane2_v16i(a); check("lane2_v16i",&r1,&r2,sizeof r1); }
@@ -821,10 +873,13 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v16i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<4;i++) { a[i]=(int)(int)(rnd()%200); b[i]=(int)(int)(rnd()%200); } for(int c=0;c<2;c++) { v16i r1=G_cond_v16i(a,b,c), r2=L_cond_v16i(a,b,c); check("cond_v16i",&r1,&r2,sizeof r1); } }
 { v16i p[6]; for(int k=0;k<6;k++) for(int i=0;i<4;i++) p[k][i]=(int)(int)(rnd()%100); for(int n=0;n<=6;n+=3) { v16i r1=G_acc_v16i(p,n), r2=L_acc_v16i(p,n); check("acc_v16i",&r1,&r2,sizeof r1); } }
 { v32i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32i r1=G_add_v32i(a,b), r2=L_add_v32i(a,b); check("add_v32i",&r1,&r2,sizeof r1); }
 { v32i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32i r1=G_sub_v32i(a,b), r2=L_sub_v32i(a,b); check("sub_v32i",&r1,&r2,sizeof r1); }
 { v32i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32i r1=G_mul_v32i(a,b), r2=L_mul_v32i(a,b); check("mul_v32i",&r1,&r2,sizeof r1); }
 { v32i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32i r1=G_and_v32i(a,b), r2=L_and_v32i(a,b); check("and_v32i",&r1,&r2,sizeof r1); }
@@ -833,12 +888,13 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v32i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32i r1=G_xor_v32i(a,b), r2=L_xor_v32i(a,b); check("xor_v32i",&r1,&r2,sizeof r1); }
 { v32i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<8;i++) b[i]=(int)(((unsigned)b[i])%32);
+  SIGNED_LEFT_INPUT(a,b);
   v32i r1=G_shl_v32i(a,b), r2=L_shl_v32i(a,b); check("shl_v32i",&r1,&r2,sizeof r1); }
 { v32i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<8;i++) b[i]=(int)(((unsigned)b[i])%32);
   v32i r1=G_shr_v32i(a,b), r2=L_shr_v32i(a,b); check("shr_v32i",&r1,&r2,sizeof r1); }
 { v32i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32i r1=G_neg_v32i(a,b), r2=L_neg_v32i(a,b); check("neg_v32i",&r1,&r2,sizeof r1); }
 { v32i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32i r1=G_not_v32i(a,b), r2=L_not_v32i(a,b); check("not_v32i",&r1,&r2,sizeof r1); }
@@ -846,7 +902,9 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
   v32i r1=G_eq_v32i(a,b), r2=L_eq_v32i(a,b); check("eq_v32i",&r1,&r2,sizeof r1); }
 { v32i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32i r1=G_lt_v32i(a,b), r2=L_lt_v32i(a,b); check("lt_v32i",&r1,&r2,sizeof r1); }
-{ v32i r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0); memcpy(r2,r1,sizeof r1);
+{ v32i r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0);
+  for(int k=0;k<9;k++) { SIGNED_INPUT(a[k]); SIGNED_INPUT(b[k]); SIGNED_INPUT(r1[k]); }
+  memcpy(r2,r1,sizeof r1);
   G_loop_v32i(r1,a,b,9); L_loop_v32i(r2,a,b,9); check("loop_v32i",r1,r2,sizeof r1); }
 { int x=(int)(rnd()%200); v32i r1=G_splat_v32i(x), r2=L_splat_v32i(x); check("splat_v32i",&r1,&r2,sizeof r1); }
 { v32i a; fill(&a,sizeof a,0); for(int i=0;i<8;i++) a[i]=(int)(int)(rnd()%200); int r1=G_lane2_v32i(a), r2=L_lane2_v32i(a); check("lane2_v32i",&r1,&r2,sizeof r1); }
@@ -856,10 +914,13 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v32i a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<8;i++) { a[i]=(int)(int)(rnd()%200); b[i]=(int)(int)(rnd()%200); } for(int c=0;c<2;c++) { v32i r1=G_cond_v32i(a,b,c), r2=L_cond_v32i(a,b,c); check("cond_v32i",&r1,&r2,sizeof r1); } }
 { v32i p[6]; for(int k=0;k<6;k++) for(int i=0;i<8;i++) p[k][i]=(int)(int)(rnd()%100); for(int n=0;n<=6;n+=3) { v32i r1=G_acc_v32i(p,n), r2=L_acc_v32i(p,n); check("acc_v32i",&r1,&r2,sizeof r1); } }
 { v16l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16l r1=G_add_v16l(a,b), r2=L_add_v16l(a,b); check("add_v16l",&r1,&r2,sizeof r1); }
 { v16l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16l r1=G_sub_v16l(a,b), r2=L_sub_v16l(a,b); check("sub_v16l",&r1,&r2,sizeof r1); }
 { v16l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16l r1=G_mul_v16l(a,b), r2=L_mul_v16l(a,b); check("mul_v16l",&r1,&r2,sizeof r1); }
 { v16l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16l r1=G_and_v16l(a,b), r2=L_and_v16l(a,b); check("and_v16l",&r1,&r2,sizeof r1); }
@@ -868,12 +929,13 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v16l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16l r1=G_xor_v16l(a,b), r2=L_xor_v16l(a,b); check("xor_v16l",&r1,&r2,sizeof r1); }
 { v16l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<2;i++) b[i]=(long)(((unsigned)b[i])%64);
+  SIGNED_LEFT_INPUT(a,b);
   v16l r1=G_shl_v16l(a,b), r2=L_shl_v16l(a,b); check("shl_v16l",&r1,&r2,sizeof r1); }
 { v16l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<2;i++) b[i]=(long)(((unsigned)b[i])%64);
   v16l r1=G_shr_v16l(a,b), r2=L_shr_v16l(a,b); check("shr_v16l",&r1,&r2,sizeof r1); }
 { v16l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v16l r1=G_neg_v16l(a,b), r2=L_neg_v16l(a,b); check("neg_v16l",&r1,&r2,sizeof r1); }
 { v16l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16l r1=G_not_v16l(a,b), r2=L_not_v16l(a,b); check("not_v16l",&r1,&r2,sizeof r1); }
@@ -881,20 +943,25 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
   v16l r1=G_eq_v16l(a,b), r2=L_eq_v16l(a,b); check("eq_v16l",&r1,&r2,sizeof r1); }
 { v16l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v16l r1=G_lt_v16l(a,b), r2=L_lt_v16l(a,b); check("lt_v16l",&r1,&r2,sizeof r1); }
-{ v16l r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0); memcpy(r2,r1,sizeof r1);
+{ v16l r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0);
+  for(int k=0;k<9;k++) { SIGNED_INPUT(a[k]); SIGNED_INPUT(b[k]); SIGNED_INPUT(r1[k]); }
+  memcpy(r2,r1,sizeof r1);
   G_loop_v16l(r1,a,b,9); L_loop_v16l(r2,a,b,9); check("loop_v16l",r1,r2,sizeof r1); }
 { long x=(long)(rnd()%200); v16l r1=G_splat_v16l(x), r2=L_splat_v16l(x); check("splat_v16l",&r1,&r2,sizeof r1); }
-{ v16l a; fill(&a,sizeof a,0); for(int i=0;i<2;i++) a[i]=(long)(int)(rnd()%200); long r1=G_lane2_v16l(a), r2=L_lane2_v16l(a); check("lane2_v16l",&r1,&r2,sizeof r1); }
+{ v16l a; fill(&a,sizeof a,0); for(int i=0;i<2;i++) a[i]=(long)(int)(rnd()%200); long r1=G_lane1_v16l(a), r2=L_lane1_v16l(a); check("lane1_v16l",&r1,&r2,sizeof r1); }
 { v16l a; fill(&a,sizeof a,0); for(int i=0;i<2;i++) a[i]=(long)(int)(rnd()%200); long x=(long)(rnd()%200); v16l r1=G_setlane_v16l(a,x), r2=L_setlane_v16l(a,x); check("setlane_v16l",&r1,&r2,sizeof r1); }
 { long p[2]; fill(p,sizeof p,0); v16l r1=G_ld_v16l(p), r2=L_ld_v16l(p); check("ld_v16l",&r1,&r2,sizeof r1); }
 { v16l v; fill(&v,sizeof v,0); long p1[2],p2[2]; G_st_v16l(p1,v); L_st_v16l(p2,v); check("st_v16l",p1,p2,sizeof p1); }
 { v16l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<2;i++) { a[i]=(long)(int)(rnd()%200); b[i]=(long)(int)(rnd()%200); } for(int c=0;c<2;c++) { v16l r1=G_cond_v16l(a,b,c), r2=L_cond_v16l(a,b,c); check("cond_v16l",&r1,&r2,sizeof r1); } }
 { v16l p[6]; for(int k=0;k<6;k++) for(int i=0;i<2;i++) p[k][i]=(long)(int)(rnd()%100); for(int n=0;n<=6;n+=3) { v16l r1=G_acc_v16l(p,n), r2=L_acc_v16l(p,n); check("acc_v16l",&r1,&r2,sizeof r1); } }
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32l r1=G_add_v32l(a,b), r2=L_add_v32l(a,b); check("add_v32l",&r1,&r2,sizeof r1); }
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32l r1=G_sub_v32l(a,b), r2=L_sub_v32l(a,b); check("sub_v32l",&r1,&r2,sizeof r1); }
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32l r1=G_mul_v32l(a,b), r2=L_mul_v32l(a,b); check("mul_v32l",&r1,&r2,sizeof r1); }
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32l r1=G_and_v32l(a,b), r2=L_and_v32l(a,b); check("and_v32l",&r1,&r2,sizeof r1); }
@@ -903,12 +970,13 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32l r1=G_xor_v32l(a,b), r2=L_xor_v32l(a,b); check("xor_v32l",&r1,&r2,sizeof r1); }
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<4;i++) b[i]=(long)(((unsigned)b[i])%64);
+  SIGNED_LEFT_INPUT(a,b);
   v32l r1=G_shl_v32l(a,b), r2=L_shl_v32l(a,b); check("shl_v32l",&r1,&r2,sizeof r1); }
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<4;i++) b[i]=(long)(((unsigned)b[i])%64);
   v32l r1=G_shr_v32l(a,b), r2=L_shr_v32l(a,b); check("shr_v32l",&r1,&r2,sizeof r1); }
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
+  SIGNED_INPUT(a); SIGNED_INPUT(b);
   v32l r1=G_neg_v32l(a,b), r2=L_neg_v32l(a,b); check("neg_v32l",&r1,&r2,sizeof r1); }
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32l r1=G_not_v32l(a,b), r2=L_not_v32l(a,b); check("not_v32l",&r1,&r2,sizeof r1); }
@@ -916,7 +984,9 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
   v32l r1=G_eq_v32l(a,b), r2=L_eq_v32l(a,b); check("eq_v32l",&r1,&r2,sizeof r1); }
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   v32l r1=G_lt_v32l(a,b), r2=L_lt_v32l(a,b); check("lt_v32l",&r1,&r2,sizeof r1); }
-{ v32l r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0); memcpy(r2,r1,sizeof r1);
+{ v32l r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0);
+  for(int k=0;k<9;k++) { SIGNED_INPUT(a[k]); SIGNED_INPUT(b[k]); SIGNED_INPUT(r1[k]); }
+  memcpy(r2,r1,sizeof r1);
   G_loop_v32l(r1,a,b,9); L_loop_v32l(r2,a,b,9); check("loop_v32l",r1,r2,sizeof r1); }
 { long x=(long)(rnd()%200); v32l r1=G_splat_v32l(x), r2=L_splat_v32l(x); check("splat_v32l",&r1,&r2,sizeof r1); }
 { v32l a; fill(&a,sizeof a,0); for(int i=0;i<4;i++) a[i]=(long)(int)(rnd()%200); long r1=G_lane2_v32l(a), r2=L_lane2_v32l(a); check("lane2_v32l",&r1,&r2,sizeof r1); }
@@ -926,26 +996,26 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v32l a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<4;i++) { a[i]=(long)(int)(rnd()%200); b[i]=(long)(int)(rnd()%200); } for(int c=0;c<2;c++) { v32l r1=G_cond_v32l(a,b,c), r2=L_cond_v32l(a,b,c); check("cond_v32l",&r1,&r2,sizeof r1); } }
 { v32l p[6]; for(int k=0;k<6;k++) for(int i=0;i<4;i++) p[k][i]=(long)(int)(rnd()%100); for(int n=0;n<=6;n+=3) { v32l r1=G_acc_v32l(p,n), r2=L_acc_v32l(p,n); check("acc_v32l",&r1,&r2,sizeof r1); } }
 { v16f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<4;i++) { a[i]=(float)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<4;i++) { a[i]=(float)((int)rnd()%1000)/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v16f r1=G_add_v16f(a,b), r2=L_add_v16f(a,b); check("add_v16f",&r1,&r2,sizeof r1); }
 { v16f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<4;i++) { a[i]=(float)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<4;i++) { a[i]=(float)((int)rnd()%1000)/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v16f r1=G_sub_v16f(a,b), r2=L_sub_v16f(a,b); check("sub_v16f",&r1,&r2,sizeof r1); }
 { v16f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<4;i++) { a[i]=(float)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<4;i++) { a[i]=(float)((int)rnd()%1000)/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v16f r1=G_mul_v16f(a,b), r2=L_mul_v16f(a,b); check("mul_v16f",&r1,&r2,sizeof r1); }
 { v16f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<4;i++) a[i]=(float)((int)rnd()%1000)/7.0;
   v16f r1=G_neg_v16f(a,b), r2=L_neg_v16f(a,b); check("neg_v16f",&r1,&r2,sizeof r1); }
 { v16f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<4;i++) { a[i]=(float)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<4;i++) { a[i]=(float)((int)rnd()%1000)/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v16i r1=G_eq_v16f(a,b), r2=L_eq_v16f(a,b); check("eq_v16f",&r1,&r2,sizeof r1); }
 { v16f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<4;i++) { a[i]=(float)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<4;i++) { a[i]=(float)((int)rnd()%1000)/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v16i r1=G_lt_v16f(a,b), r2=L_lt_v16f(a,b); check("lt_v16f",&r1,&r2,sizeof r1); }
 { v16f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<4;i++) { if(b[i]==0) b[i]=3; if(a[i]==(float)(1ull<<31) && b[i]==(float)-1) b[i]=2; }
-  for(int i=0;i<4;i++) { a[i]=(float)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<4;i++) { a[i]=(float)((int)rnd()%1000)/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v16f r1=G_div_v16f(a,b), r2=L_div_v16f(a,b); check("div_v16f",&r1,&r2,sizeof r1); }
 { v16f r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0); memcpy(r2,r1,sizeof r1);
   for(int k=0;k<9;k++) for(int i=0;i<4;i++) { a[k][i]=(float)((int)rnd()%100); b[k][i]=(float)((int)rnd()%100); r1[k][i]=r2[k][i]=(float)((int)rnd()%100); }
@@ -958,26 +1028,26 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v16f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<4;i++) { a[i]=(float)(int)(rnd()%200); b[i]=(float)(int)(rnd()%200); } for(int c=0;c<2;c++) { v16f r1=G_cond_v16f(a,b,c), r2=L_cond_v16f(a,b,c); check("cond_v16f",&r1,&r2,sizeof r1); } }
 { v16f p[6]; for(int k=0;k<6;k++) for(int i=0;i<4;i++) p[k][i]=(float)(int)(rnd()%100); for(int n=0;n<=6;n+=3) { v16f r1=G_acc_v16f(p,n), r2=L_acc_v16f(p,n); check("acc_v16f",&r1,&r2,sizeof r1); } }
 { v32f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<8;i++) { a[i]=(float)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<8;i++) { a[i]=(float)((int)rnd()%1000)/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v32f r1=G_add_v32f(a,b), r2=L_add_v32f(a,b); check("add_v32f",&r1,&r2,sizeof r1); }
 { v32f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<8;i++) { a[i]=(float)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<8;i++) { a[i]=(float)((int)rnd()%1000)/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v32f r1=G_sub_v32f(a,b), r2=L_sub_v32f(a,b); check("sub_v32f",&r1,&r2,sizeof r1); }
 { v32f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<8;i++) { a[i]=(float)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<8;i++) { a[i]=(float)((int)rnd()%1000)/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v32f r1=G_mul_v32f(a,b), r2=L_mul_v32f(a,b); check("mul_v32f",&r1,&r2,sizeof r1); }
 { v32f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<8;i++) a[i]=(float)((int)rnd()%1000)/7.0;
   v32f r1=G_neg_v32f(a,b), r2=L_neg_v32f(a,b); check("neg_v32f",&r1,&r2,sizeof r1); }
 { v32f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<8;i++) { a[i]=(float)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<8;i++) { a[i]=(float)((int)rnd()%1000)/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v32i r1=G_eq_v32f(a,b), r2=L_eq_v32f(a,b); check("eq_v32f",&r1,&r2,sizeof r1); }
 { v32f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<8;i++) { a[i]=(float)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<8;i++) { a[i]=(float)((int)rnd()%1000)/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v32i r1=G_lt_v32f(a,b), r2=L_lt_v32f(a,b); check("lt_v32f",&r1,&r2,sizeof r1); }
 { v32f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<8;i++) { if(b[i]==0) b[i]=3; if(a[i]==(float)(1ull<<31) && b[i]==(float)-1) b[i]=2; }
-  for(int i=0;i<8;i++) { a[i]=(float)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<8;i++) { a[i]=(float)((int)rnd()%1000)/7.0; b[i]=(float)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v32f r1=G_div_v32f(a,b), r2=L_div_v32f(a,b); check("div_v32f",&r1,&r2,sizeof r1); }
 { v32f r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0); memcpy(r2,r1,sizeof r1);
   for(int k=0;k<9;k++) for(int i=0;i<8;i++) { a[k][i]=(float)((int)rnd()%100); b[k][i]=(float)((int)rnd()%100); r1[k][i]=r2[k][i]=(float)((int)rnd()%100); }
@@ -990,58 +1060,58 @@ int main(void){ extra_checks(); fma_checks(); handoff_checks(); cf_checks(); shi
 { v32f a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<8;i++) { a[i]=(float)(int)(rnd()%200); b[i]=(float)(int)(rnd()%200); } for(int c=0;c<2;c++) { v32f r1=G_cond_v32f(a,b,c), r2=L_cond_v32f(a,b,c); check("cond_v32f",&r1,&r2,sizeof r1); } }
 { v32f p[6]; for(int k=0;k<6;k++) for(int i=0;i<8;i++) p[k][i]=(float)(int)(rnd()%100); for(int n=0;n<=6;n+=3) { v32f r1=G_acc_v32f(p,n), r2=L_acc_v32f(p,n); check("acc_v32f",&r1,&r2,sizeof r1); } }
 { v16d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<2;i++) { a[i]=(double)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<2;i++) { a[i]=(double)((int)rnd()%1000)/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v16d r1=G_add_v16d(a,b), r2=L_add_v16d(a,b); check("add_v16d",&r1,&r2,sizeof r1); }
 { v16d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<2;i++) { a[i]=(double)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<2;i++) { a[i]=(double)((int)rnd()%1000)/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v16d r1=G_sub_v16d(a,b), r2=L_sub_v16d(a,b); check("sub_v16d",&r1,&r2,sizeof r1); }
 { v16d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<2;i++) { a[i]=(double)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<2;i++) { a[i]=(double)((int)rnd()%1000)/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v16d r1=G_mul_v16d(a,b), r2=L_mul_v16d(a,b); check("mul_v16d",&r1,&r2,sizeof r1); }
 { v16d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<2;i++) a[i]=(double)((int)rnd()%1000)/7.0;
   v16d r1=G_neg_v16d(a,b), r2=L_neg_v16d(a,b); check("neg_v16d",&r1,&r2,sizeof r1); }
 { v16d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<2;i++) { a[i]=(double)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<2;i++) { a[i]=(double)((int)rnd()%1000)/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v16l r1=G_eq_v16d(a,b), r2=L_eq_v16d(a,b); check("eq_v16d",&r1,&r2,sizeof r1); }
 { v16d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<2;i++) { a[i]=(double)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<2;i++) { a[i]=(double)((int)rnd()%1000)/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v16l r1=G_lt_v16d(a,b), r2=L_lt_v16d(a,b); check("lt_v16d",&r1,&r2,sizeof r1); }
 { v16d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<2;i++) { if(b[i]==0) b[i]=3; if(a[i]==(double)(1ull<<63) && b[i]==(double)-1) b[i]=2; }
-  for(int i=0;i<2;i++) { a[i]=(double)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<2;i++) { a[i]=(double)((int)rnd()%1000)/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v16d r1=G_div_v16d(a,b), r2=L_div_v16d(a,b); check("div_v16d",&r1,&r2,sizeof r1); }
 { v16d r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0); memcpy(r2,r1,sizeof r1);
   for(int k=0;k<9;k++) for(int i=0;i<2;i++) { a[k][i]=(double)((int)rnd()%100); b[k][i]=(double)((int)rnd()%100); r1[k][i]=r2[k][i]=(double)((int)rnd()%100); }
   G_loop_v16d(r1,a,b,9); L_loop_v16d(r2,a,b,9); check("loop_v16d",r1,r2,sizeof r1); }
 { double x=(double)(rnd()%200); v16d r1=G_splat_v16d(x), r2=L_splat_v16d(x); check("splat_v16d",&r1,&r2,sizeof r1); }
-{ v16d a; fill(&a,sizeof a,0); for(int i=0;i<2;i++) a[i]=(double)(int)(rnd()%200); double r1=G_lane2_v16d(a), r2=L_lane2_v16d(a); check("lane2_v16d",&r1,&r2,sizeof r1); }
+{ v16d a; fill(&a,sizeof a,0); for(int i=0;i<2;i++) a[i]=(double)(int)(rnd()%200); double r1=G_lane1_v16d(a), r2=L_lane1_v16d(a); check("lane1_v16d",&r1,&r2,sizeof r1); }
 { v16d a; fill(&a,sizeof a,0); for(int i=0;i<2;i++) a[i]=(double)(int)(rnd()%200); double x=(double)(rnd()%200); v16d r1=G_setlane_v16d(a,x), r2=L_setlane_v16d(a,x); check("setlane_v16d",&r1,&r2,sizeof r1); }
 { double p[2]; fill(p,sizeof p,0); v16d r1=G_ld_v16d(p), r2=L_ld_v16d(p); check("ld_v16d",&r1,&r2,sizeof r1); }
 { v16d v; fill(&v,sizeof v,0); double p1[2],p2[2]; G_st_v16d(p1,v); L_st_v16d(p2,v); check("st_v16d",p1,p2,sizeof p1); }
 { v16d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0); for(int i=0;i<2;i++) { a[i]=(double)(int)(rnd()%200); b[i]=(double)(int)(rnd()%200); } for(int c=0;c<2;c++) { v16d r1=G_cond_v16d(a,b,c), r2=L_cond_v16d(a,b,c); check("cond_v16d",&r1,&r2,sizeof r1); } }
 { v16d p[6]; for(int k=0;k<6;k++) for(int i=0;i<2;i++) p[k][i]=(double)(int)(rnd()%100); for(int n=0;n<=6;n+=3) { v16d r1=G_acc_v16d(p,n), r2=L_acc_v16d(p,n); check("acc_v16d",&r1,&r2,sizeof r1); } }
 { v32d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<4;i++) { a[i]=(double)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<4;i++) { a[i]=(double)((int)rnd()%1000)/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v32d r1=G_add_v32d(a,b), r2=L_add_v32d(a,b); check("add_v32d",&r1,&r2,sizeof r1); }
 { v32d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<4;i++) { a[i]=(double)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<4;i++) { a[i]=(double)((int)rnd()%1000)/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v32d r1=G_sub_v32d(a,b), r2=L_sub_v32d(a,b); check("sub_v32d",&r1,&r2,sizeof r1); }
 { v32d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<4;i++) { a[i]=(double)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<4;i++) { a[i]=(double)((int)rnd()%1000)/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v32d r1=G_mul_v32d(a,b), r2=L_mul_v32d(a,b); check("mul_v32d",&r1,&r2,sizeof r1); }
 { v32d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<4;i++) a[i]=(double)((int)rnd()%1000)/7.0;
   v32d r1=G_neg_v32d(a,b), r2=L_neg_v32d(a,b); check("neg_v32d",&r1,&r2,sizeof r1); }
 { v32d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<4;i++) { a[i]=(double)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<4;i++) { a[i]=(double)((int)rnd()%1000)/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v32l r1=G_eq_v32d(a,b), r2=L_eq_v32d(a,b); check("eq_v32d",&r1,&r2,sizeof r1); }
 { v32d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
-  for(int i=0;i<4;i++) { a[i]=(double)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<4;i++) { a[i]=(double)((int)rnd()%1000)/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v32l r1=G_lt_v32d(a,b), r2=L_lt_v32d(a,b); check("lt_v32d",&r1,&r2,sizeof r1); }
 { v32d a,b; fill(&a,sizeof a,0); fill(&b,sizeof b,0);
   for(int i=0;i<4;i++) { if(b[i]==0) b[i]=3; if(a[i]==(double)(1ull<<63) && b[i]==(double)-1) b[i]=2; }
-  for(int i=0;i<4;i++) { a[i]=(double)(int)(a[i]*0+((int)rnd()%1000))/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
+  for(int i=0;i<4;i++) { a[i]=(double)((int)rnd()%1000)/7.0; b[i]=(double)((int)rnd()%1000)/3.0; if(b[i]==0)b[i]=1; }
   v32d r1=G_div_v32d(a,b), r2=L_div_v32d(a,b); check("div_v32d",&r1,&r2,sizeof r1); }
 { v32d r1[9],r2[9],a[9],b[9]; fill(a,sizeof a,0); fill(b,sizeof b,0); fill(r1,sizeof r1,0); memcpy(r2,r1,sizeof r1);
   for(int k=0;k<9;k++) for(int i=0;i<4;i++) { a[k][i]=(double)((int)rnd()%100); b[k][i]=(double)((int)rnd()%100); r1[k][i]=r2[k][i]=(double)((int)rnd()%100); }

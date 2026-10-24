@@ -1302,6 +1302,18 @@ fn peephole_optimize_inner(
         }
         if !sk("vector_copy_retarget") {
             {
+                let c = vector_copy::fold_composed_dword_shuffles(&mut store, &mut infos);
+                trace(
+                    "fold_composed_dword_shuffles",
+                    pass_count,
+                    c,
+                    &store,
+                    &infos,
+                );
+                changed |= c;
+                let c = vector_copy::fold_uniform_vector_shift(&mut store, &mut infos);
+                trace("fold_uniform_vector_shift", pass_count, c, &store, &infos);
+                changed |= c;
                 let c = vector_copy::retarget_vex_result(&mut store, &mut infos);
                 trace("retarget_vex_result", pass_count, c, &store, &infos);
                 changed |= c;
@@ -2097,6 +2109,13 @@ fn peephole_optimize_inner(
     // leave unnecessary callee-save traffic behind.
     if !sk("bmi2_mask") {
         bmi2_mask::fuse_masks(&mut store, &mut infos);
+    }
+
+    // Stack forwarding can expose adjacent shuffles only after Phase 1.
+    // Revisit them before frame cleanup so frontend-generated chains benefit,
+    // not just already-adjacent assembly fragments.
+    if !sk("vector_copy_retarget") {
+        vector_copy::fold_composed_dword_shuffles(&mut store, &mut infos);
     }
 
     // Phase 6: Eliminate unused callee-saved register saves/restores.

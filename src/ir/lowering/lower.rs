@@ -1327,12 +1327,11 @@ impl Lowerer {
         // Track CTypes used to resolve aggregate and ext-vector call results.
         // Ext vectors can use scalar GP return registers on i686, so their
         // CType must remain available even when the IR return is I32/I64/I128.
-        let return_ctype =
-            if ret_ty == IrType::Ptr || matches!(full_ret_ctype, CType::ExtVector(..)) {
-                Some(full_ret_ctype.clone())
-            } else {
-                None
-            };
+        let return_ctype = if ret_ty == IrType::Ptr || full_ret_ctype.is_vector() {
+            Some(full_ret_ctype.clone())
+        } else {
+            None
+        };
 
         // Record complex return types for expr_ctype resolution
         if ptr_count == 0 && full_ret_ctype.is_complex() {
@@ -1351,7 +1350,7 @@ impl Lowerer {
                 // psABI classifier; elsewhere by size).
                 let size = self.sizeof_type(ret_type_spec);
                 if crate::common::types::target_is_32bit()
-                    && matches!(full_ret_ctype, CType::ExtVector(..))
+                    && full_ret_ctype.i386_ext_vector_ret().is_some()
                 {
                     // Clang 23.1.3's i386 ext-vector return convention, not a
                     // SysV aggregate: lane words in EAX:EDX:ECX, one floating
