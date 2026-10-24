@@ -46,6 +46,21 @@ def main():
     args = parser.parse_args()
     env = dict(os.environ)
     report = {'complete': False, 'source_sha256': hashlib.sha256(SOURCE.read_bytes()).hexdigest(), 'arms': [], 'mutations': []}
+    # Last-option precedence is per ISA feature, not one global SIMD switch.
+    # Compare the actual macros against GCC rather than inferring its policy.
+    report['feature_order'] = []
+    for compiler in [args.gcc, args.lccc] + ([args.clang] if args.clang else []):
+        for flags, sse2 in [
+            (['-mno-sse2', '-msse'], False),
+            (['-msse', '-mno-sse2'], False),
+            (['-mno-sse', '-msse'], True),
+            (['-mno-sse2', '-msse2'], True),
+        ]:
+            macros = run([compiler, *flags, '-dM', '-E', '-x', 'c', '/dev/null'], env).decode()
+            present = set(re.findall(r'^#define (__SSE2?__) ', macros, re.M))
+            if '__SSE__' not in present or ('__SSE2__' in present) != sse2:
+                raise RuntimeError(f'{compiler} {flags}: unexpected SSE macro set {present}')
+            report['feature_order'].append({'compiler': compiler, 'flags': flags, 'macros': sorted(present)})
     expected = None
     modes = [('gcc', args.gcc, ['-march=x86-64'], {}, 'oracle')]
     if args.clang:
@@ -146,9 +161,11 @@ def main():
                 denial_modes.append(('clang-denial', args.clang, ['-mno-sse2', '-msse'], 'oracle'))
             denial_modes.extend([
                 ('deny-then-sse1', args.lccc, ['-mno-sse2', '-msse'], 'sse1'),
+                ('plain-sse2-denial', args.lccc, ['-mno-sse2'], 'sse1'),
+                ('sse1-then-denial', args.lccc, ['-msse', '-mno-sse2'], 'sse1'),
                 ('sse1-deny-sse1', args.lccc, ['-msse', '-mno-sse2', '-msse'], 'sse1'),
                 ('v3-deny-sse1', args.lccc, ['-march=x86-64-v3', '-mno-sse2', '-msse'], 'sse1'),
-                ('sse2-regrant', args.lccc, ['-mno-sse2', '-msse', '-msse2'], 'sse2'),
+                ('sse2-regrant', args.lccc, ['-mno-sse2', '-msse', '-msse2', '-DREQUIRE_SSE2'], 'sse2'),
             ])
             expected_denial = None
             for name, compiler, flags, isa in denial_modes:
@@ -187,6 +204,21 @@ def main():
                         raise RuntimeError('explicit SSE2 regrant did not restore packed products')
                 report['denial_arms'].append(row)
                 print(f'{name}: PASS {row["cases"]} exact-output cases + {isa} legality')
+            # An SSE2 denial must retain the scalar bulk-copy fallback;
+            # reopening SSE1 must not reopen movdqu-based memory helpers.
+            copy_src = Path(td) / 'copy-without-sse2.c'
+            copy_src.write_text('struct S {char b[256];}; void f(struct S*d,const struct S*s){*d=*s;}\n')
+            for flags in [['-mno-sse2'], ['-msse', '-mno-sse2'], ['-mno-sse2', '-msse']]:
+                run([args.lccc, '-O2', *flags, '-S', str(copy_src), '-o',
+                     str(copy_src.with_suffix('.s'))], env)
+            unsupported = Path(td) / 'needs-sse2.c'
+            unsupported.write_text('double needs_sse2(double a, double b) { return a + b; }\n')
+            for flags in [['-mno-sse2'], ['-msse', '-mno-sse2'], ['-mno-sse2', '-msse']]:
+                rejected = subprocess.run([args.lccc, '-O2', *flags, '-S', str(unsupported),
+                                           '-o', str(unsupported.with_suffix('.s'))], env=env,
+                                          capture_output=True, timeout=90)
+                if rejected.returncode == 0 or b'requires SSE2' not in rejected.stderr:
+                    raise RuntimeError(f'{flags}: unsupported SSE2 lowering was not diagnosed')
             report['complete'] = True
     finally:
         if args.json:

@@ -1,5 +1,17 @@
 /* An independent SSE1 grant cannot cancel an explicit SSE2 denial. Keep
    scalar memory-to-memory F32 arithmetic usable without packed I32 code. */
+#ifndef __SSE__
+#error The independent SSE1 grant must be preserved
+#endif
+#ifdef REQUIRE_SSE2
+#ifndef __SSE2__
+#error The explicit SSE2 regrant must be preserved
+#endif
+#else
+#ifdef __SSE2__
+#error An SSE1 grant must not cancel an explicit SSE2 denial
+#endif
+#endif
 #include <stdint.h>
 #include <stdio.h>
 #define N 40

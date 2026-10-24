@@ -961,6 +961,7 @@ jobs:
       run: |
         env CCC=target/fastbuild/lccc bash tests/regression/check_sse2_matmul_vectorization.sh
         env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_sse2_i32_product.py
+        env CCC=target/fastbuild/lccc GCC=gcc-16 python3 tests/regression/check_i32_map_unroll.py
     # The two-wide matmul arm and its guards arrived with the synthesized
     # SIMD work; each gate below pins one property that a scalar fallback
     # would otherwise hide (see the gate headers for the measured costs).

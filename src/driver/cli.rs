@@ -635,9 +635,9 @@ impl Driver {
                 // `-mno-sse` removes an independent SSE grant. Final target
                 // resolution preserves x86-64's existing no-SSE2 path.
                 let all_sse = arg == "-mno-sse";
-                self.no_sse = true;
                 self.no_sse2 = true;
                 if all_sse {
+                    self.no_sse = true;
                     self.sse_explicitly_disabled = true;
                     self.enable_sse = false;
                 } else {
@@ -3860,6 +3860,8 @@ mod cli_tests {
     fn sse2_denial_survives_independent_sse1_codegen_grant() {
         for flags in [
             &["-mno-sse2", "-msse"][..],
+            &["-mno-sse2"],
+            &["-msse", "-mno-sse2"],
             &["-msse", "-mno-sse2", "-msse"],
             &["-march=x86-64-v3", "-mno-sse2", "-msse"],
         ] {

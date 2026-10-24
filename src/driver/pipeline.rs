@@ -2990,7 +2990,10 @@ impl Driver {
                 }
             },
             skip_rax_setup: self.skip_rax_setup,
-            no_sse: self.no_sse,
+            // Legacy bulk-memory/vararg helpers use SSE2 integer moves.
+            // Keep those paths off after an SSE2 denial, independently of
+            // the SSE1 scalar operations permitted by the driver flags.
+            no_sse: self.no_sse || self.no_sse2,
             general_regs_only: self.general_regs_only,
             code_model_kernel: self.code_model_kernel,
             no_jump_tables: self.no_jump_tables,
@@ -3050,6 +3053,19 @@ impl Driver {
                      x86-64 lccc has no x87 lowering for it (offending instruction: `{}`)",
                     input_file,
                     func,
+                    line.trim()
+                ));
+            }
+        }
+        // SSE1 and SSE2 permissions are independent. Keep legal scalar SSE1
+        // available after an SSE2 denial, but fail closed on emitters that
+        // still require SSE2 (notably F64: there is no x87 fallback here).
+        if self.target == Target::X86_64 && self.no_sse2 && !self.no_sse {
+            if let Some((func, line)) = first_sse2_reference(&asm) {
+                return Err(format!(
+                    "{input_file}: in function '{func}': operation requires SSE2, \
+                     but SSE2 is disabled (-mno-sse2); x86-64 lccc has no \
+                     SSE1/x87 lowering for it (offending instruction: `{}`)",
                     line.trim()
                 ));
             }
@@ -3657,6 +3673,87 @@ mod arm_simd_reference_tests {
 }
 
 fn first_sse_reference(asm: &str) -> Option<(String, String)> {
+    first_xmm_reference_if(asm, |_| true)
+}
+
+/// SSE1's XMM vocabulary, including AT&T size-suffixed scalar conversions.
+/// User inline assembly remains an explicit escape hatch, as in the no-SSE
+/// fence. MMX-only instructions without an XMM operand are not SSE2 leaks.
+fn first_sse2_reference(asm: &str) -> Option<(String, String)> {
+    first_xmm_reference_if(asm, |op| {
+        !matches!(
+            op,
+            "movss"
+                | "movaps"
+                | "movups"
+                | "movhps"
+                | "movlps"
+                | "movhlps"
+                | "movlhps"
+                | "unpcklps"
+                | "unpckhps"
+                | "shufps"
+                | "movmskps"
+                | "movntps"
+                | "addss"
+                | "addps"
+                | "subss"
+                | "subps"
+                | "mulss"
+                | "mulps"
+                | "divss"
+                | "divps"
+                | "sqrtss"
+                | "sqrtps"
+                | "rcpss"
+                | "rcpps"
+                | "rsqrtss"
+                | "rsqrtps"
+                | "minss"
+                | "minps"
+                | "maxss"
+                | "maxps"
+                | "andps"
+                | "andnps"
+                | "orps"
+                | "xorps"
+                | "comiss"
+                | "ucomiss"
+                | "cmpps"
+                | "cmpss"
+                | "cmpeqps"
+                | "cmpeqss"
+                | "cmpltps"
+                | "cmpltss"
+                | "cmpleps"
+                | "cmpless"
+                | "cmpunordps"
+                | "cmpunordss"
+                | "cmpneqps"
+                | "cmpneqss"
+                | "cmpnltps"
+                | "cmpnltss"
+                | "cmpnleps"
+                | "cmpnless"
+                | "cmpordps"
+                | "cmpordss"
+                | "cvtpi2ps"
+                | "cvtps2pi"
+                | "cvttps2pi"
+                | "cvtsi2ss"
+                | "cvtsi2ssl"
+                | "cvtsi2ssq"
+                | "cvtss2si"
+                | "cvtss2sil"
+                | "cvtss2siq"
+                | "cvttss2si"
+                | "cvttss2sil"
+                | "cvttss2siq"
+        )
+    })
+}
+
+fn first_xmm_reference_if(asm: &str, forbidden: impl Fn(&str) -> bool) -> Option<(String, String)> {
     let mut func = String::from("<toplevel>");
     let mut in_app = false;
     for line in asm.lines() {
@@ -3685,7 +3782,11 @@ fn first_sse_reference(asm: &str) -> Option<(String, String)> {
         if t.ends_with(':') {
             continue;
         }
-        if t.contains("%xmm") || t.contains("%ymm") || t.contains("%zmm") {
+        let code = t.split('#').next().unwrap_or("");
+        let op = code.split_ascii_whitespace().next().unwrap_or("");
+        if (code.contains("%xmm") || code.contains("%ymm") || code.contains("%zmm"))
+            && forbidden(op)
+        {
             return Some((func, line.to_string()));
         }
     }
@@ -3694,7 +3795,41 @@ fn first_sse_reference(asm: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod sse_reference_tests {
-    use super::first_sse_reference;
+    use super::{first_sse_reference, first_sse2_reference};
+
+    #[test]
+    fn sse1_fence_keeps_legal_memory_arithmetic_and_rejects_sse2() {
+        let prefix = ".type f, @function\nf:\n";
+        for op in [
+            "movss (%rdi), %xmm0",
+            "addps %xmm1, %xmm0",
+            "xorps %xmm0, %xmm0",
+            "cvtsi2ssq %rax, %xmm0",
+            "ucomiss %xmm1, %xmm0",
+            "movq %mm0, %mm1",
+        ] {
+            assert!(
+                first_sse2_reference(&format!("{prefix}{op}\n")).is_none(),
+                "{op}"
+            );
+        }
+        for op in [
+            "movdqu (%rdi), %xmm0",
+            "pmuludq %xmm1, %xmm0",
+            "addsd %xmm1, %xmm0",
+            "movd %eax, %xmm0",
+            "vaddps %xmm1, %xmm0, %xmm0",
+        ] {
+            let (name, _) = first_sse2_reference(&format!("{prefix}{op}\n")).unwrap();
+            assert_eq!(name, "f", "{op}");
+        }
+        assert!(
+            first_sse2_reference(&format!(
+                "{prefix}#APP\naddsd %xmm1,%xmm0\n#NO_APP\nret # %xmm0\n"
+            ))
+            .is_none()
+        );
+    }
 
     #[test]
     fn finds_first_sse_line_with_function_name() {

@@ -1,0 +1,64 @@
+[
+  {
+    "flags": [
+      "-mno-sse2",
+      "-msse"
+    ],
+    "target_options": [
+      "  -mavx                       \t\t[disabled]",
+      "  -msse                       \t\t[enabled]",
+      "  -msse2                      \t\t[disabled]",
+      "  -msse3                      \t\t[disabled]"
+    ],
+    "macros": [
+      "#define __SSE__ 1"
+    ]
+  },
+  {
+    "flags": [
+      "-msse",
+      "-mno-sse2"
+    ],
+    "target_options": [
+      "  -mavx                       \t\t[disabled]",
+      "  -msse                       \t\t[enabled]",
+      "  -msse2                      \t\t[disabled]",
+      "  -msse3                      \t\t[disabled]"
+    ],
+    "macros": [
+      "#define __SSE__ 1"
+    ]
+  },
+  {
+    "flags": [
+      "-mno-sse",
+      "-msse"
+    ],
+    "target_options": [
+      "  -mavx                       \t\t[disabled]",
+      "  -msse                       \t\t[enabled]",
+      "  -msse2                      \t\t[enabled]",
+      "  -msse3                      \t\t[disabled]"
+    ],
+    "macros": [
+      "#define __SSE__ 1",
+      "#define __SSE2__ 1"
+    ]
+  },
+  {
+    "flags": [
+      "-mno-sse2",
+      "-msse2"
+    ],
+    "target_options": [
+      "  -mavx                       \t\t[disabled]",
+      "  -msse                       \t\t[enabled]",
+      "  -msse2                      \t\t[enabled]",
+      "  -msse3                      \t\t[disabled]"
+    ],
+    "macros": [
+      "#define __SSE__ 1",
+      "#define __SSE2__ 1"
+    ]
+  }
+]

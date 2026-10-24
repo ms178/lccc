@@ -200,6 +200,7 @@ thread_local! {
     // policy bit.  Keeping it beside the map switch avoids an environment
     // lookup in every candidate loop and makes the early/main entries agree.
     static NO_MAP_I64_UNROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static NO_MAP_I32_UNROLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     // Generator-map vectorizer policy: `(enabled, trace)`. Resolved once per
     // pipeline run, like the map switches above.
     static GENERATOR_MAP: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((true, false)) };
@@ -233,6 +234,10 @@ pub(crate) fn set_no_map_vec(disabled: bool) {
 
 pub(crate) fn set_no_map_i64_unroll(disabled: bool) {
     NO_MAP_I64_UNROLL.with(|cell| cell.set(disabled));
+}
+
+pub(crate) fn set_no_map_i32_unroll(disabled: bool) {
+    NO_MAP_I32_UNROLL.with(|cell| cell.set(disabled));
 }
 
 /// Generator-map policy for this translation unit: `enabled` is false under the
@@ -29716,6 +29721,22 @@ mod map_unroll_policy_tests {
     }
 
     #[test]
+    fn two_copy_maps_keep_packed_work_at_both_widths() {
+        for width in [4, 8] {
+            for count in 0..=259 {
+                let unroll = map_constant_unroll(width, 2, count);
+                assert!(matches!(unroll, 1 | 2));
+                if count > width {
+                    assert!(width * unroll < count);
+                }
+                if count <= 16 {
+                    assert!(count % (width * unroll) < width);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn invariant_cost_is_separate_from_tree_budget() {
         let k = MapExpr::Invariant(Operand::Value(Value(42)));
         let expr = MapExpr::BinOp(IrBinOp::Sub, Box::new(MapExpr::Load(0)), Box::new(k));
@@ -29731,6 +29752,12 @@ mod map_unroll_policy_tests {
         set_no_map_i64_unroll(false);
         assert!(!no_map_i64_unroll());
         set_no_map_i64_unroll(previous);
+        let previous_i32 = NO_MAP_I32_UNROLL.with(std::cell::Cell::get);
+        set_no_map_i32_unroll(true);
+        assert!(NO_MAP_I32_UNROLL.with(std::cell::Cell::get));
+        set_no_map_i32_unroll(false);
+        assert!(!NO_MAP_I32_UNROLL.with(std::cell::Cell::get));
+        set_no_map_i32_unroll(previous_i32);
     }
 }
 
@@ -29857,6 +29884,16 @@ fn transform_map_vector(
                 _ => 1,
             }
         }
+    } else if !neon
+        && matches!(pattern.elem_ty, IrType::I32 | IrType::U32)
+        && matches!(pattern.expr, MapExpr::BinOp(IrBinOp::Mul, _, _))
+        && pattern.expr.unroll_cost() <= 3
+        && !NO_MAP_I32_UNROLL.with(std::cell::Cell::get)
+    {
+        // Two independent products halve loop-control overhead at both
+        // widths. Bound the tree so extra copies cannot amplify a large DAG.
+        // The shared packed_width machinery owns alias guards and tails.
+        2
     } else {
         1
     };

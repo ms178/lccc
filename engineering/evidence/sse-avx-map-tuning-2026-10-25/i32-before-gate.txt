@@ -1,0 +1,14 @@
+gcc: PASS 10605 overlap/length cases
+clang: PASS 10605 overlap/length cases
+sse2: PASS 10605 overlap/length cases
+sse2-rolled: PASS 10605 overlap/length cases
+sse41: PASS 10605 overlap/length cases
+sse41-rolled: PASS 10605 overlap/length cases
+avx2: PASS 10605 overlap/length cases
+avx2-rolled: PASS 10605 overlap/length cases
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/regression/check_i32_map_unroll.py", line 85, in <module>
+    main()
+  File "/home/user/lccc/tests/regression/check_i32_map_unroll.py", line 76, in main
+    raise RuntimeError(f'{profile}: unroll ablation not observable: {counts}')
+RuntimeError: sse2: unroll ablation not observable: {'sse2': 2, 'sse2-rolled': 2, 'sse41': 1, 'sse41-rolled': 1, 'avx2': 1, 'avx2-rolled': 1}
