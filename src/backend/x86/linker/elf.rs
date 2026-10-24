@@ -253,7 +253,12 @@ pub fn gotpcrelx_relaxation(
             }
         }
         R_X86_64_CODE_4_GOTPCRELX => {
-            if off < 4 || code[off - 4] != 0xd5 || op != 0x8b || !rip_ok {
+            if off < 4
+                || code[off - 4] != 0xd5
+                || code[off - 3] & 0x80 != 0
+                || op != 0x8b
+                || !rip_ok
+            {
                 return None;
             }
             Some(GotRelax::Load { imm: false })
@@ -940,6 +945,46 @@ mod tests {
             0x10,
         );
         assert_eq!(got.unwrap(), with_imm(&[0x48, 0xc7, 0xc0], 0x10));
+    }
+
+    /// REX2.M0 selects the opcode map, not a register extension. Only map
+    /// zero's 8b is MOV; changing 8b to 8d in map one corrupts an unrelated
+    /// instruction. A relocation's spelling cannot override its actual bytes.
+    #[test]
+    fn rex2_gotpcrelx_requires_map_zero_for_every_payload() {
+        for payload in 0u8..=255 {
+            for reg in 0..8 {
+                let code = [0xd5, payload, 0x8b, 0x05 | (reg << 3), 0, 0, 0, 0];
+                for pic in [false, true] {
+                    let expected = (payload & 0x80 == 0).then_some(GotRelax::Load { imm: false });
+                    assert_eq!(
+                        gotpcrelx_relaxation(
+                            R_X86_64_CODE_4_GOTPCRELX,
+                            -4,
+                            &code,
+                            4,
+                            pic,
+                            GotTarget::Image,
+                        ),
+                        expected,
+                        "payload={payload:#04x}, reg={reg}, pic={pic}",
+                    );
+                    if let Some(kind) = expected {
+                        let mut out = code;
+                        let field = rewrite_got_relax(
+                            &mut out,
+                            4,
+                            kind,
+                            R_X86_64_CODE_4_GOTPCRELX,
+                            0x2000,
+                            0x1000,
+                        );
+                        assert_eq!(field, (4, 0xffc));
+                        assert_eq!(out, [0xd5, payload, 0x8d, code[3], 0, 0, 0, 0]);
+                    }
+                }
+            }
+        }
     }
 
     /// The prefix a relocation type promises is checked inside the section:
