@@ -2042,6 +2042,38 @@ impl I686Codegen {
         }
     }
 
+    /// Emit a scalar _Float128/_Decimal128 argument to its 16-byte stack
+    /// slot. Unlike a true aggregate, the operand is the value itself rather
+    /// than an address. Keep the full object image: the low limb of many
+    /// binary128 values is zero and is not a null aggregate pointer.
+    pub(super) fn emit_call_f128_sse_stack_arg(&mut self, arg: &Operand, stack_offset: usize) {
+        match arg {
+            Operand::Value(v) => {
+                let Some(slot) = self.state.get_slot(v.0) else {
+                    panic!(
+                        "internal error: 16-byte SSE scalar v{} has no stack slot",
+                        v.0
+                    );
+                };
+                self.emit_copy_slot_to_stack(slot, stack_offset, 16);
+            }
+            Operand::Const(c) => {
+                let bits = crate::backend::call_abi::f128_sse_const_bits(*c).unwrap_or_else(|| {
+                    panic!("internal error: {c:?} is not a 16-byte SSE scalar constant")
+                });
+                for word in 0usize..4 {
+                    let dword = (bits >> (word * 32)) as u32 as i32;
+                    emit!(
+                        self.state,
+                        "    movl ${}, {}(%esp)",
+                        dword,
+                        stack_offset + word * 4
+                    );
+                }
+            }
+        }
+    }
+
     /// Emit I128 argument to call stack (16 bytes).
     pub(super) fn emit_call_i128_stack_arg(&mut self, arg: &Operand, stack_offset: usize) {
         if let Operand::Value(v) = arg {
