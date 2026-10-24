@@ -220,7 +220,7 @@ fn value_weight(ty: IrType, target: Target) -> ValueInfo {
     if ty == IrType::Void {
         return ValueInfo::default();
     }
-    if ty.is_float() || ty.is_vector() {
+    if ty.is_float() {
         return ValueInfo {
             class: VECTOR,
             weight: 1,

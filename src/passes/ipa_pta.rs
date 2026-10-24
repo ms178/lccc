@@ -235,7 +235,7 @@ impl Solver {
             return;
         }
         self.edges[source as usize].push(destination);
-        for &object in self.points[source as usize].0.clone() {
+        for object in self.points[source as usize].0.clone() {
             self.insert(destination, object);
         }
     }
@@ -271,7 +271,7 @@ impl Solver {
 
     fn activate_escape(&mut self, node: Node) {
         if self.escape_sources.insert(node) {
-            for &object in self.points[node as usize].0.clone() {
+            for object in self.points[node as usize].0.clone() {
                 self.mark_escaped(object);
             }
         }
@@ -424,7 +424,7 @@ impl Solver {
             }
             Watch::MemcpyDestination { source_pointer } => {
                 let destination_content = self.objects[object as usize].content;
-                for &source in self.points[source_pointer as usize].0.clone() {
+                for source in self.points[source_pointer as usize].0.clone() {
                     let source_content = self.objects[source as usize].content;
                     self.add_edge(source_content, destination_content);
                 }
@@ -433,7 +433,7 @@ impl Solver {
                 destination_pointer,
             } => {
                 let source_content = self.objects[object as usize].content;
-                for &destination in self.points[destination_pointer as usize].0.clone() {
+                for destination in self.points[destination_pointer as usize].0.clone() {
                     let destination_content = self.objects[destination as usize].content;
                     self.add_edge(source_content, destination_content);
                 }
@@ -744,8 +744,8 @@ fn compute_effects(solver: &Solver, module: &IrModule) -> Vec<ModRef> {
                             local_refs[fi].union_with(&effects);
                         }
                     }
-                    Instruction::Memcpy { dst, src, .. } => {
-                        if let Some(node) = node(solver, *dst) {
+                    Instruction::Memcpy { dest, src, .. } => {
+                        if let Some(node) = node(solver, *dest) {
                             local_mods[fi].union_with(&pointer_effects(solver, node));
                         }
                         if let Some(node) = node(solver, *src) {
@@ -833,7 +833,7 @@ fn compute_effects(solver: &Solver, module: &IrModule) -> Vec<ModRef> {
             let changed = summaries[caller].union_with(&callee_mods);
             let ref_changed = references[caller].union_with(&callee_refs);
             if changed || ref_changed {
-                queue.push(caller);
+                queue.push_back(caller);
             }
         }
     }
@@ -910,7 +910,7 @@ fn mark_unmodeled(
     let mut values = Vec::new();
     inst.for_each_used_value(|value| values.push(value));
     for value in values {
-        let node = solver.value_node(function, value.0);
+        let node = solver.value_node(function, value);
         solver.activate_escape(node);
     }
 }
@@ -1207,7 +1207,7 @@ fn build_solver(module: &IrModule, semantic_interposition: bool, budget: Analysi
         let object = solver.add_object(ObjectKind::Function(index));
         solver.named_objects.insert(function.name.clone(), object);
     }
-    for (index, global) in module.globals.iter().enumerate() {
+    for global in &module.globals {
         let object = solver.add_object(ObjectKind::Global);
         solver.named_objects.insert(global.name.clone(), object);
     }
