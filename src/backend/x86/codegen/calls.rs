@@ -1731,6 +1731,11 @@ impl X86Codegen {
     /// outgoing stack slot. The slot reservation and RSP-frame accounting are
     /// owned by the stack-argument walk so value slots remain addressable.
     fn emit_f128_sse_stack_arg(&mut self, op: &Operand) {
+        // A deferred vector result may still live in xmm0 (or need %rax for
+        // its destination). Materialize that store before either scratch is
+        // reused for this argument. RSP/frame accounting already includes the
+        // reserved outgoing slot, so a slot-relative flush remains correct.
+        self.flush_pending_vec_store_impl();
         match op {
             Operand::Value(_) => {
                 self.emit_f128_sse_operand_to_xmm(op, "xmm0");
@@ -1758,7 +1763,6 @@ impl X86Codegen {
                 self.state.reg_cache.invalidate_acc();
             }
         }
-        self.flush_pending_vec_store_impl();
         self.state.invalidate_vec_peephole();
     }
 

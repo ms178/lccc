@@ -1901,7 +1901,7 @@ mod tests {
 
     #[test]
     fn f128_sse_constants_are_object_images_not_aggregate_addresses() {
-        let nine = 0x4002_0000_0000_0000_0000_0000_0000_0000u128;
+        let nine = 0x4002_2000_0000_0000_0000_0000_0000_0000u128;
         assert_eq!(f128_sse_const_bits(IrConst::I128(nine as i128)), Some(nine));
         let negative_zero = 1u128 << 127;
         assert_eq!(
