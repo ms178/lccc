@@ -1946,6 +1946,19 @@ jobs:
         # at every opt level times every kill switch, plus the asm pins that
         # say the fold actually fired (and stayed off when refused).
         bash tests/regression/check_rmw_sib_folds.sh
+        # Sibling calls (TODO-3 / §5b): converted tail-forwarder shapes,
+        # the four design refusals asserted as refusals, the kill-switch
+        # control, runtime parity on-vs-off, and the §5.3 gcc-16.2 shape pin.
+        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_sibcall_shapes.sh
+        # The i128-atomic consumer reproducer from
+        # FOLLOWUP-2026-10-21-i128-atomic-o2.md (fixed; pinned so the class
+        # cannot silently return), at -O0..-O3 under default and -mcx16.
+        env CCC=target/fastbuild/lccc GCC16=gcc-16 bash tests/regression/check_i128_atomic_reproducer.sh
+        # The hot-web steal diagnostics knob (opt-in purity, firing-with-cost,
+        # named cost-refusal) and the one-instruction FP min/max select fold
+        # (bit-exact vs gcc-16 over the NaN/±0/SNaN corner grid, both widths).
+        env CCC=target/fastbuild/lccc bash tests/regression/check_hot_web_steal_diagnostics.sh
+        env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_fp_select_minmax.sh
         python3 tests/regression/check_llvm_scalar_facts.py
         python3 tests/regression/check_llvm_integer_observations.py
         bash tests/regression/check_asm_case_insensitive.sh
@@ -2708,6 +2721,11 @@ jobs:
           "intel-evidence/$fixture-lccc" > "intel-evidence/$fixture-lccc.txt"
           diff -u "intel-evidence/$fixture-icx.txt" "intel-evidence/$fixture-lccc.txt"
         done
+    - name: FP select min/max matrix against ICX
+      run: |
+        set -euo pipefail
+        CCC=target/fastbuild/lccc ICX="$LCCC_ICX_BIN" FP_MINMAX_ICX_ONLY=1 \
+          bash tests/regression/check_fp_select_minmax.sh
     - name: Volatile reduction O3 contracts and ICX matrix
       run: |
         set -euo pipefail

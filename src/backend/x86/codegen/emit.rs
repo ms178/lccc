@@ -8001,9 +8001,20 @@ impl ArchCodegen for X86Codegen {
         // mature path, which owns the general contract. See
         // try_lower_call_typed for the full admission contract.
         if let crate::ir::reexports::Instruction::Call { func, info } = inst {
+            // Sibling call (TODO-3 / §5b): a site the driver matched to the
+            // block-tail shape stays on the MATURE call path — the sibcall
+            // conversion lives in `emit_call_instruction_impl`/`emit_return_impl`
+            // (call suppression + `<epilogue>; jmp`), which the MachInst
+            // buffering bypasses entirely.
+            if self.state.sibcall_hint.is_some() {
+                return false;
+            }
             return self.try_lower_call_typed(inst, Some(func), None, info, folded_global_addrs);
         }
         if let crate::ir::reexports::Instruction::CallIndirect { func_ptr, info } = inst {
+            if self.state.sibcall_hint.is_some() {
+                return false;
+            }
             return self.try_lower_call_typed(
                 inst,
                 None,
@@ -8901,6 +8912,13 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_pre_call_save_caller_regs(&mut self) {
+        // Sibling call (TODO-3): with the `call` suppressed there is no
+        // clobber to protect values across — the save/restore pair would
+        // be dead stores around the epilogue. The argument-setup phases
+        // still run unchanged and read the same homes they always did.
+        if self.state.pending_sibcall.is_some() {
+            return;
+        }
         self.caller_regs_restored = false;
         let point = self.state.current_program_point;
         // Home-freshness snapshot for the registers this call actually saves:
@@ -8933,6 +8951,15 @@ impl ArchCodegen for X86Codegen {
     }
 
     fn emit_post_call_restore_caller_regs(&mut self) {
+        // The matching pre-call save was skipped for a sibling call. In
+        // particular, the initial `caller_regs_restored == false` must not
+        // make this site reload stale caller-save slots over the outgoing
+        // argument registers before the tail jump.
+        if self.state.pending_sibcall.is_some() {
+            self.caller_regs_restored = true;
+            self.call_fresh_snapshot.clear();
+            return;
+        }
         // Idempotent per call site: the vector-register aggregate return
         // (`emit_call_store_vector_return_impl`) restores early so it can
         // read the buffer operand, and the generic Phase 2b call that
@@ -9955,6 +9982,7 @@ impl ArchCodegen for X86Codegen {
         fn emit_va_copy(&mut self, dest_ptr: &Value, src_ptr: &Value) => emit_va_copy_impl;
         // returns
         fn emit_return(&mut self, val: Option<&Operand>, frame_size: i64) => emit_return_impl;
+        fn arm_sibcall_candidate(&mut self, info: &CallInfo) => arm_sibcall_candidate_impl;
         fn current_return_type(&self) -> IrType => current_return_type_impl;
         fn emit_return_f32_to_reg(&mut self) => emit_return_f32_to_reg_impl;
         fn emit_return_f64_to_reg(&mut self) => emit_return_f64_to_reg_impl;

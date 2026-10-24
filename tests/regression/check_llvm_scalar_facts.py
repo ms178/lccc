@@ -5,6 +5,7 @@ import argparse
 import os
 from pathlib import Path
 import re
+import subprocess
 import tempfile
 from check_llvm_missed_zero_choice import body, run
 
@@ -167,26 +168,80 @@ def main():
         )
         narrow = p / "i686.c"
         narrow.write_text(freestanding)
-        for compiler, settings in [
-            (args.gcc, env),
-            (args.compiler, env),
-            (args.compiler, env | {"CCC_DISABLE_PASSES": "bit_idioms"}),
-        ] + ([(args.baseline, env)] if args.baseline else []):
-            run(
-                [
-                    compiler,
-                    "-m32",
-                    "-O2",
-                    "-nostdlib",
-                    "-static",
-                    "-Wl,-e,_start",
-                    str(narrow),
-                    "-o",
-                    str(p / "i686"),
-                ],
-                env=settings,
+        # The i686 leg executes real 32-bit code through `int $0x80`.  A host
+        # whose kernel or seccomp policy refuses ia32 syscalls kills every
+        # probe binary with SIGSYS (-31) before the first cohort
+        # instruction, and a host without 32-bit headers cannot build it at
+        # all; both are named environmental prerequisites (CI's runner has
+        # them), so the leg skips loudly instead of dying in a traceback
+        # that names neither the reason nor the fix.  The probe is compiled
+        # with the reference GCC so it measures the environment, not this
+        # build: a probe that fails under gcc-16 says nothing about lccc.
+        probe = p / "probe32.c"
+        probe.write_text(
+            "void _start(void) {\n"
+            '    __asm__ volatile("movl $0, %ebx; movl $1, %eax; int $0x80");\n'
+            "    __builtin_unreachable();\n"
+            "}\n"
+        )
+        # Probe with the reference GCC and report the refusal mode by name:
+        # a compile failure means the host lacks 32-bit headers/toolchain; a
+        # killed probe (SIGSYS, rc -31) means the kernel/seccomp policy
+        # refuses ia32 syscalls.  Different prerequisites, different fixes,
+        # and neither says anything about the compiler under test.
+        probe_rc = subprocess.run(
+            [
+                args.gcc,
+                "-m32",
+                "-O2",
+                "-nostdlib",
+                "-static",
+                "-Wl,-e,_start",
+                str(probe),
+                "-o",
+                str(p / "probe32"),
+            ],
+            capture_output=True,
+            timeout=60,
+        ).returncode
+        if probe_rc == 0:
+            probe_rc = subprocess.run(
+                [str(p / "probe32")], capture_output=True, timeout=60
+            ).returncode
+        if probe_rc != 0:
+            if probe_rc < 0:
+                reason = f"the probe binary was killed by signal {-probe_rc} (ia32 syscalls refused)"
+            else:
+                reason = (
+                    "the reference GCC cannot build 32-bit code here "
+                    f"(rc={probe_rc}: no 32-bit headers or toolchain)"
+                )
+            print(
+                f"SKIP: i686 leg -- this host cannot run 32-bit freestanding "
+                f"code: {reason}. CI's runner executes ia32 syscalls and runs "
+                "the leg."
             )
-            run([str(p / "i686")])
+        else:
+            for compiler, settings in [
+                (args.gcc, env),
+                (args.compiler, env),
+                (args.compiler, env | {"CCC_DISABLE_PASSES": "bit_idioms"}),
+            ] + ([(args.baseline, env)] if args.baseline else []):
+                run(
+                    [
+                        compiler,
+                        "-m32",
+                        "-O2",
+                        "-nostdlib",
+                        "-static",
+                        "-Wl,-e,_start",
+                        str(narrow),
+                        "-o",
+                        str(p / "i686"),
+                    ],
+                    env=settings,
+                )
+                run([str(p / "i686")])
         hot = ROOT / "tests/regression/hot_web_callee_saved.c"
         for compiler in [args.gcc] + ([args.clang] if args.clang else []):
             run(

@@ -97,6 +97,19 @@ const SYNTHESIZED: [Libcall; 8] = [
     Libcall::Fwrite,
 ];
 
+/// Does a TU-level definition (with a body) of `name` withdraw some
+/// synthesized call?  Public so the FRONTEND's unreferenced-static skip can
+/// keep exactly these functions alive: [`apply`] runs on the lowered module
+/// and must see the body, and `dead_statics` — which runs after it, at
+/// every opt level — removes the unreferenced one afterwards.  The frontend
+/// skipping such a function first is how a TU with a dead
+/// `static memcpy` re-enabled `call memcpy@PLT` synthesis for the whole TU
+/// (A13: the definition must withdraw the builtin whether or not it is
+/// reachable; GCC 16.2 refuses the rewrite in both shapes, measured).
+pub(crate) fn defining_affects_synthesis(name: &str) -> bool {
+    SYNTHESIZED.iter().any(|l| reach(l.name()).contains(&name))
+}
+
 /// What the translation unit does with symbol names (see the module docs).
 #[derive(Debug, Default)]
 pub(crate) struct SymbolInventory {

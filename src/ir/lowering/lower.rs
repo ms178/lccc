@@ -21,7 +21,7 @@ use crate::common::source::Span;
 use crate::common::types::{AddressSpace, CType, IrType, SsoMode};
 use crate::frontend::parser::ast::{
     self, BlockItem, CompoundStmt, Declaration, DerivedDeclarator, EnumVariant, Expr, ExprId,
-    ExternalDecl, ParamDecl, Stmt, TranslationUnit, TypeSpecifier,
+    ExternalDecl, FunctionDef, ParamDecl, Stmt, TranslationUnit, TypeSpecifier,
 };
 use crate::frontend::sema::type_context::TypeContext;
 use crate::frontend::sema::{ConstMap, ExprTypeMap, FunctionInfo};
@@ -664,6 +664,65 @@ impl Lowerer {
 
     // --- Top-level orchestration ---
 
+    /// May the third pass skip this function definition as an unreferenced
+    /// internal body?  Skippable shapes (static / static-inline, GNU89 or
+    /// gnu_inline extern-inline bodies, C99 inline-only definitions) carry
+    /// no external definition and nothing references them, so lowering them
+    /// would only produce a body `dead_statics` removes later.
+    ///
+    /// One exception, and it is a correctness boundary rather than a
+    /// preference: a body the builtin policy COUNTS must reach the IR even
+    /// when unreferenced.  `builtin_policy::apply` publishes its
+    /// synthesized-call permissions from the lowered module before any pass
+    /// runs, and a TU definition of a synthesized-libcall name — dead or
+    /// not — withdraws that synthesis (GCC 16.2 semantics, A13; the
+    /// frontend skipping such a body first is how a dead
+    /// `static memcpy` once re-enabled `call memcpy@PLT` for the whole TU).
+    /// `dead_statics` then removes the unreachable body at every opt level,
+    /// AFTER the policy ran, so the skip's benefit is deferred, never lost.
+    /// gnu-inline bodies stay skippable: the policy deliberately ignores
+    /// them (glibc's _FORTIFY_SOURCE headers define memcpy/memset/printf
+    /// that way), so keeping them would be pure cost.
+    fn may_skip_unreferenced_internal(
+        &self,
+        func: &FunctionDef,
+        referenced_statics: &FxHashSet<String>,
+    ) -> bool {
+        let is_gnu_inline_no_extern_def = self.is_gnu_inline_no_extern_def(&func.attrs);
+        // C99 6.7.4p7: A plain `inline` definition (without `extern`) does
+        // not provide an external definition. We lower these as static
+        // functions so their bodies are available for inlining; if all call
+        // sites are inlined, dead code elimination removes them, and if
+        // not, they are emitted as local symbols (safe fallback).  In GNU89
+        // mode, `inline` without `extern` provides the external definition,
+        // so this rule does not apply.
+        let is_c99_inline_only = !self.gnu89_inline
+            && func.attrs.is_inline()
+            && !func.attrs.is_extern()
+            && !func.attrs.is_static()
+            && !func.attrs.is_gnu_inline()
+            && !self.has_non_inline_decl.contains(&func.name);
+        let can_skip = is_c99_inline_only || func.attrs.is_static() || is_gnu_inline_no_extern_def;
+        if !can_skip {
+            return false;
+        }
+        // A static or C99-inline-only body of a synthesized-libcall name is
+        // a definition the builtin policy counts — keep it (see the doc
+        // comment).  gnu-inline bodies are not counted and stay skippable.
+        if (func.attrs.is_static() || is_c99_inline_only)
+            && crate::passes::builtin_policy::defining_affects_synthesis(&func.name)
+        {
+            return false;
+        }
+        // Used, referenced, or lifecycle-annotated bodies are kept.
+        !(func.attrs.is_used()
+            || func.attrs.is_constructor()
+            || self.module.constructors.contains(&func.name)
+            || func.attrs.is_destructor()
+            || self.module.destructors.contains(&func.name)
+            || referenced_statics.contains(&func.name))
+    }
+
     pub fn lower(mut self, tu: &TranslationUnit) -> (IrModule, DiagnosticEngine) {
         // Sema has already populated TypeContext with typedefs, enum constants,
         // struct/union layouts, function typedefs, and function pointer typedefs.
@@ -1087,43 +1146,11 @@ impl Lowerer {
                     // C99 semantics (default for -std=c99 and later):
                     //   extern inline = provides external definition (must emit, global)
                     //   inline (alone) = inline definition only (no external def)
-                    let is_gnu_inline_no_extern_def = self.is_gnu_inline_no_extern_def(&func.attrs);
-                    // C99 6.7.4p7: A plain `inline` definition (without `extern`)
-                    // does not provide an external definition. We lower these as
-                    // static functions so their bodies are available for inlining.
-                    // If unreferenced, they are skipped. If referenced but all calls
-                    // are inlined, dead code elimination removes them.
-                    // Note: this only applies in C99 mode; in GNU89 mode, `inline`
-                    // without `extern` provides the external definition.
-                    let is_c99_inline_only = !self.gnu89_inline
-                        && func.attrs.is_inline()
-                        && !func.attrs.is_extern()
-                        && !func.attrs.is_static()
-                        && !func.attrs.is_gnu_inline()
-                        && !self.has_non_inline_decl.contains(&func.name);
-                    let can_skip = if is_c99_inline_only {
-                        // C99 inline-only functions don't provide an external definition.
-                        // Lower them as static so their bodies are available for inlining.
-                        // If all call sites are inlined, dead code elimination removes them.
-                        // If not inlined, they're emitted as local symbols (safe fallback).
-                        true
-                    } else if func.attrs.is_static() {
-                        // static or static inline: internal linkage, safe to skip if unreferenced
-                        true
-                    } else if is_gnu_inline_no_extern_def {
-                        // extern inline (gnu89 or gnu_inline attr): no external def, skip if unreferenced
-                        true
-                    } else {
-                        false
-                    };
-                    if can_skip
-                        && !func.attrs.is_used()
-                        && !func.attrs.is_constructor()
-                        && !self.module.constructors.contains(&func.name)
-                        && !func.attrs.is_destructor()
-                        && !self.module.destructors.contains(&func.name)
-                        && !referenced_statics.contains(&func.name)
-                    {
+                    // The third pass lowers a function definition unless it is
+                    // an unreferenced internal body the optimizer would drop
+                    // anyway; `may_skip_unreferenced_internal` owns that
+                    // decision, including the builtin-policy exception.
+                    if self.may_skip_unreferenced_internal(func, &referenced_statics) {
                         continue;
                     }
                     self.lower_function(func);

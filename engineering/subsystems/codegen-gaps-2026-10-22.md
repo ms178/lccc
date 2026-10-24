@@ -407,4 +407,81 @@ reproduced or refuted, not trusted.
   gate, full SSE matrix re-run. Do not half-land this: it is the kind
   of change whose failure mode is silent corruption at someone
   else's link step.
+* **TODO-3 (sibling calls) — LANDED, measured.** IR-fact-driven conversion
+  of tail-forwarder calls to `<epilogue>; jmp target`: the §5b guards verbatim
+  (zero stack-passed arguments via the emission's own classifier, non-variadic,
+  not sret/fastcall/regparm, no used alloca, no dynamic alloca, no inline asm,
+  i686 refused wholesale, MachInst typed-call lowering vetoed for matched
+  sites), the marker contract still discharging so the late passes keep
+  modeling the site, `CCC_NO_SIBCALL` kill switch (OnceLock). Gate
+  `check_sibcall_shapes.sh`: 5 positive shapes (fp, integer, void forwarder,
+  indirect `jmp *%r10`, gcc-16.2 §5.3 parity on dmin2) and the 4 design
+  refusals asserted AS refusals (7-stack-arg forwarder/pr23324, variadic,
+  address-taken local, dynamic alloca), kill-switch control, runtime parity
+  on-vs-off. Corpus 1089/0/1134 with execution + gcc-16.2 reference.
+  Callgrind on/off over the fast corpus: never slower, geomean 0.9999985,
+  glibc_memcmp 0.99995. Known residual: the classic emission's param-homing
+  and hazard staging stay as 1-2 dead instructions at converted sites (the
+  late passes cannot model a tail site without call text); documented,
+  correctness-neutral, still ahead of call+ret by the RA-traffic saving.
+* **TODO-9 — recorded.** `PERFORMANCE-BACKLOG.md` now carries the post-fix
+  re-baseline: the sibcall A/B (on/off) and the lccc-vs-gcc-16.2 standing
+  (parity on gzip_crc32/qsort; ahead on chacha20/sha256/struct_copy; the
+  remaining behind rows are regalloc-quality owned).
+* **TODO-8 (binutils 2.47 oracle) — BUILT, WIRED, VERIFIED.** The verified
+  tag payload builds cleanly (`oracle_toolchains_from_tags.sh
+  --with-binutils`); `as` reports 2.47.20260726 and the conventional
+  `~/.cache/ld-2.47/bin/ld.bfd` path plus `LCCC_BFD_LD` are honoured by
+  run_linker_tests.py as designed. The full linker differential on this
+  tree: 282 pass / 9 fail / 15 skip (oracles: bfd mold). The 9 fails are
+  all `-m32` fixture builds — this host has no 32-bit multilib dev headers
+  and no root to install them; the host's own GCC fails the same builds.
+  Follow-up (parked): the affected fixtures should SKIP loudly on hosts
+  without an -m32 capability (probe once, like the corpus runner's
+  host-skip) instead of FAILing on the fixture build.
 * TODO-3, TODO-6..TODO-11 remain as written in §6.
+
+## Appendix: status after the 2026-10-23 open-PR perfection round
+
+* **5c.1 (rot() stack refs) — RESOLVED UPSTREAM, verified.** The S81
+  regalloc series seats the rotation's values again: `rot()` measures
+  **50 insns / 3 stkref** on current main (pin: `<=53`/`<=3`), so
+  `check_phi_acyclic_order.sh` is green and TODO-10's 702-commit bisect is
+  moot. Verified by running the gate against a fresh fastbuild of `main`
+  at `864cb635f`.
+* **5c.2 / TODO-11 (hot-web steal) — resolved with a measured twist.** The
+  filed no-op diagnosis is *stale* on current main: the same S81 allocator
+  rework seats the fixture's hot loop values (uses 3100/310) without the
+  steal, and the only remaining candidate (21 uses) is **correctly refused
+  by cost** — evicting a 310-use web for it would be a pessimization.
+  `CCC_DEBUG_HOT_WEB_STEAL` (new) proves this in one run, naming each
+  refusing guard. The over-broad `phi_pair` veto was still wrong on the
+  merits and is now scoped to protected **disjoint** web members (the
+  collateral-displacement case `evict_group` cannot avoid); a protected
+  holder that itself overlaps the incoming web competes on loop-weighted
+  cost, which is the pass's designed shape. Anti-thrash holds by
+  construction (hottest-first visit order + cost = the victim's own
+  loop-weighted count). Pinned three ways: two unit tests (displacement and
+  preservation at the function level), the scalar-facts WITNESS/PROTECTED
+  contracts (both re-verified green), and the new
+  `check_hot_web_steal_diagnostics.sh` (opt-in purity, firing-with-cost,
+  named cost-refusal). The i686 leg of `check_llvm_scalar_facts.py` now
+  skips loudly on hosts whose kernel refuses ia32 syscalls (SIGSYS on this
+  box, probed with the reference GCC) instead of dying in a traceback.
+* **TODO-4 (`_mm_max_sd`/`_mm_min_sd`) — landed via PR #941, verified
+  here**: `check_sse2_scalar_minmax.sh` green against gcc-16 (bit-exact
+  tie/NaN semantics, high lane preserved).
+* **TODO-4's C-level sibling — landed this round.** The *hand-written*
+  select path (`a > b ? a : b`, distinct from the intrinsic) also lowered
+  through compare+cmov; it now folds to a single `maxsd`/`minsd`
+  (`maxss`/`minss`), on SSE2 exactly as on AVX. The instruction follows
+  the arms' orientation (dst = true arm, src = false arm; the swapped
+  arms flip max/min — `a > b ? b : a` is *min*sd), and an earlier draft
+  of the mapping was caught transposed by the bit-exact differential
+  before it shipped. `ge`/`le` stay unfolded by design (tie arm is the
+  opposite of the hardware's). Gate: `check_fp_select_minmax.sh`
+  (bit-exact vs gcc-16 at -O0..-Os over the NaN/±0/SNaN corner grid, all
+  eight shapes, both widths, plus the one-instruction shape pins).
+  Measured: `dmax` is exactly gcc's `maxsd %xmm1, %xmm0; ret`; the §5.2
+  `__m128d vmax` kernel drops 23 → 16 instructions (the remaining delta
+  is the §5.2 struct-ABI surface of TODO-5, deliberately not half-landed).

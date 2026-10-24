@@ -1,5 +1,8 @@
 //! Globally priced, whole-web callee-saved eviction for x86 loop state.
-//! Run before segment fill; never evict another loop web or an ABI hint.
+//! Run before segment fill. Overlapping loop webs compete by strict profit;
+//! ABI hints and protected disjoint members are never evicted, and hottest-
+//! first admission prevents a colder later candidate from stealing back a
+//! home won by a hotter one.
 use super::*;
 
 pub(super) struct HotWebSteal<'a> {
@@ -164,6 +167,20 @@ pub(super) fn steal_hot_loop_webs(
         .collect();
     candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     candidates.dedup_by_key(|&mut (v, _)| v);
+    // Why-didn't-it-fire diagnostics, opt-in via `CCC_DEBUG_HOT_WEB_STEAL`:
+    // two sessions have had to hand-instrument this pass to learn which
+    // guard refused (the cost comparison had no diagnostic at all).  The
+    // printout is one line per refusal, keyed by candidate, so a single
+    // compile answers "what would it take for the steal to fire here".
+    let debug = std::env::var_os("CCC_DEBUG_HOT_WEB_STEAL").is_some();
+    if debug {
+        eprintln!(
+            "hot-web-steal: phi_pairs={} loop_carried={} candidates={}",
+            phi_pairs.len(),
+            loop_carried.len(),
+            candidates.len()
+        );
+    }
 
     let overlaps_vid = |a: u32, b: u32| -> bool {
         match (
@@ -182,9 +199,24 @@ pub(super) fn steal_hot_loop_webs(
     let mut steals = 0;
     for &(vid, hot_count) in &candidates {
         if steals >= k || assignments.contains_key(&vid) {
+            if debug {
+                eprintln!(
+                    "hot-web-steal: cand v{vid} uses={hot_count} skipped ({})",
+                    if steals >= k {
+                        "steal budget exhausted"
+                    } else {
+                        "already assigned"
+                    }
+                );
+            }
             continue;
         }
         let mut best: Option<(u8, Vec<u32>, u64)> = None;
+        // Per-candidate refusal record for the diagnostics: one entry per
+        // available register that was considered and refused, with the
+        // guard that refused it.  Collected only when debugging so the
+        // production path allocates nothing.
+        let mut refusals: Vec<(u8, &'static str)> = Vec::new();
         for (&reg_id, holders) in &holders_by_reg {
             if !config.available_regs.iter().any(|r| r.0 == reg_id) {
                 continue;
@@ -193,6 +225,9 @@ pub(super) fn steal_hot_loop_webs(
                 .iter()
                 .any(|h| allocation_owner_bounds(*h, merged_of, iv_map).is_none())
             {
+                if debug {
+                    refusals.push((reg_id, "holder without owner bounds"));
+                }
                 continue;
             }
             let evict: Vec<u32> = holders
@@ -201,12 +236,30 @@ pub(super) fn steal_hot_loop_webs(
                 .filter(|&h| overlaps_vid(h, vid))
                 .collect();
             if evict.is_empty() {
+                if debug {
+                    refusals.push((reg_id, "no overlapping holder"));
+                }
                 continue;
             }
             // Protect the exact mutation, not every past/future occupant of
             // this register. A disjoint loop/ABI holder stays assigned. But
             // evict_group removes whole copy webs, so a protected disjoint
             // member of an overlapping victim must still veto the eviction.
+            //
+            // A protected member that ITSELF overlaps the incoming web does
+            // not veto: it is the competing loop value the cost model below
+            // exists to price. The steal's designed shape is a register file
+            // whose every callee-saved home is a loop web while a hotter
+            // loop value has none -- there, displacing the *cheaper* loop
+            // web is the whole point, and `use_count` is already
+            // loop-depth-weighted, so the cost comparison is the honest
+            // arbiter. Refusing overlapping protected holders wholesale made
+            // the knob provably inert on that shape (5c.2: every register
+            // was vetoed by phi_pair before cost was even computed).
+            // Candidates are visited hottest-first and a prior steal's cost
+            // is its own loop-weighted use count, so a later (colder)
+            // candidate can never profitably evict an earlier steal: the
+            // cost model encodes the anti-thrash property by construction.
             if evict.iter().any(|v| {
                 let owner = coalesce_member_of.get(v).copied().unwrap_or(*v);
                 let solo = [*v];
@@ -214,8 +267,14 @@ pub(super) fn steal_hot_loop_webs(
                     .get(&owner)
                     .map_or(solo.as_slice(), Vec::as_slice)
                     .iter()
-                    .any(|h| phi_pair_values.contains(h) || config.reg_hints.contains_key(h))
+                    .any(|h| {
+                        config.reg_hints.contains_key(h)
+                            || (phi_pair_values.contains(h) && !overlaps_vid(*h, vid))
+                    })
             }) {
+                if debug {
+                    refusals.push((reg_id, "protected disjoint web member"));
+                }
                 continue;
             }
             // evict_group removes WHOLE copy webs, including members
@@ -225,6 +284,9 @@ pub(super) fn steal_hot_loop_webs(
             let cost =
                 hot_web_eviction_cost(&evict, coalesce_member_of, coalesce_groups, use_count);
             if cost >= hot_count {
+                if debug {
+                    refusals.push((reg_id, "eviction cost >= hot count"));
+                }
                 continue;
             }
             if best
@@ -232,6 +294,25 @@ pub(super) fn steal_hot_loop_webs(
                 .is_none_or(|&(best_reg, _, c)| (cost, reg_id) < (c, best_reg))
             {
                 best = Some((reg_id, evict, cost));
+            }
+        }
+        if debug {
+            match best {
+                Some((reg_id, _, cost)) => eprintln!(
+                    "hot-web-steal: cand v{vid} uses={hot_count} -> reg {reg_id} (evict cost {cost})"
+                ),
+                None => {
+                    for (reg_id, reason) in &refusals {
+                        eprintln!(
+                            "hot-web-steal: cand v{vid} uses={hot_count} reg {reg_id} refused: {reason}"
+                        );
+                    }
+                    if refusals.is_empty() {
+                        eprintln!(
+                            "hot-web-steal: cand v{vid} uses={hot_count} refused: no available register had holders"
+                        );
+                    }
+                }
             }
         }
         if let Some((reg_id, evict, _)) = best {
@@ -401,13 +482,32 @@ mod tests {
     }
 
     #[test]
-    fn hot_web_preserves_noncoalescible_loop_state_holders() {
+    fn hot_web_displaces_a_cheaper_overlapping_loop_state_holder() {
+        // The designed shape of the pass: every callee-saved home is a loop
+        // web and the incoming candidate is hotter than the cheapest one.
+        // The loop-weighted cost model is the arbiter -- an overlapping
+        // protected holder no longer vetoes (5c.2), it competes on price.
         let mut f = Fixture::new();
         f.holder(1, 1, (0, 100), 1);
         f.loop_carried.insert(1);
         f.candidate(10, (20, 80), 40);
+        assert_eq!(f.run(), 1);
+        assert_eq!(f.assignments.get(&10), Some(&PhysReg(1)));
+        assert!(!f.assignments.contains_key(&1));
+    }
+
+    #[test]
+    fn hot_web_preserves_a_costlier_overlapping_loop_state_holder() {
+        // The same shape with the prices reversed: evicting the holder's web
+        // would cost more loop traffic than the candidate is worth, so the
+        // holder keeps its home even though it overlaps the candidate.
+        let mut f = Fixture::new();
+        f.holder(1, 1, (0, 100), 80);
+        f.loop_carried.insert(1);
+        f.candidate(10, (20, 80), 40);
         assert_eq!(f.run(), 0);
         assert_eq!(f.assignments.get(&1), Some(&PhysReg(1)));
+        assert!(!f.assignments.contains_key(&10));
     }
 
     #[test]
@@ -589,18 +689,31 @@ mod tests {
     }
 
     #[test]
-    fn hot_web_never_displaces_loop_pair_or_abi_hint() {
-        for protected in [1, 101, 2] {
+    fn hot_web_prices_overlapping_loop_pair_members() {
+        // Phi destinations and their back-edge sources are not permanent
+        // vetoes when they directly compete with a hotter incoming web.
+        // Strict whole-web cost is the anti-thrashing arbiter.
+        for protected in [1, 101] {
             let mut f = Fixture::new();
             f.candidate(1, (0, 100), 10);
             f.candidate(10, (20, 80), 1000);
             f.holder(protected, 1, (0, 100), 1);
-            if protected == 2 {
-                f.config.reg_hints.insert(2, PhysReg(1));
-            }
-            assert_eq!(f.run(), 0);
-            assert!(!f.assignments.contains_key(&10));
+            assert_eq!(f.run(), 1);
+            assert_eq!(f.assignments.get(&10), Some(&PhysReg(1)));
+            assert!(!f.assignments.contains_key(&protected));
         }
+    }
+
+    #[test]
+    fn hot_web_never_displaces_an_abi_hint() {
+        let mut f = Fixture::new();
+        f.candidate(1, (0, 100), 10);
+        f.candidate(10, (20, 80), 1000);
+        f.holder(2, 1, (0, 100), 1);
+        f.config.reg_hints.insert(2, PhysReg(1));
+        assert_eq!(f.run(), 0);
+        assert!(!f.assignments.contains_key(&10));
+        assert_eq!(f.assignments.get(&2), Some(&PhysReg(1)));
     }
 
     #[test]

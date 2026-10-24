@@ -22,6 +22,43 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy)]
 pub struct StackSlot(pub i64);
 
+/// Sibling-call conversion bookkeeping (TODO-3 / §5b of the codegen-gaps
+/// ledger). `Armed` is set at a qualifying call site before emission; the
+/// argument setup phases run unchanged and the `call` text is suppressed
+/// at Phase 4, recording the resolved tail target as `Ready`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SibcallPending {
+    Armed {
+        /// A YMM/ZMM argument must reach the tail callee with every lane
+        /// intact. The return path therefore must not clean upper lanes.
+        preserve_upper_vector_lanes: bool,
+    },
+    Ready {
+        target: SibcallTarget,
+        preserve_upper_vector_lanes: bool,
+    },
+}
+
+/// The resolved tail target's emission form. `Direct` holds the symbol
+/// reference text (with `@PLT` where the ABI wants it); `RipSlot` a
+/// memory-indirect `sym+off(%rip)` cell; `Reg` a register already holding
+/// the target (the Phase 0 `%r10` spill).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SibcallTarget {
+    Direct(String),
+    RipSlot(String),
+    Reg(&'static str),
+}
+
+/// Per-instruction sibling-call shape hint, computed by the generation
+/// driver. `instruction_index` is the exact call's index in its block. The
+/// driver publishes the hint only while emitting that instruction: result
+/// ids (and especially `None` for void calls) are not site identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SibcallHint {
+    pub instruction_index: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExplicitLocation {
     Reg(crate::backend::regalloc::PhysReg),
@@ -311,6 +348,22 @@ pub struct CodegenState {
     /// Scalar FP value already resident in the SysV return register xmm0.
     /// Set only by exact direct-result intrinsics immediately before Return.
     pub direct_fp_result: Option<u32>,
+    /// Sibling-call conversion state (TODO-3 / §5b of the codegen-gaps
+    /// ledger). `Armed` is set at a qualifying call site before its
+    /// emission starts (argument setup runs unchanged); `Ready(target)`
+    /// once the call text itself has been suppressed and the tail target
+    /// resolved. `emit_return_impl` consumes `Ready` to emit
+    /// `<epilogue>; jmp target` instead of `<materialise>; epilogue; ret`.
+    /// Only the x86-64 backend arms it; other backends leave it `None`.
+    pub pending_sibcall: Option<SibcallPending>,
+    /// Driver-side per-block hint: the trailing call's dest value id (or
+    /// `None` for a void call) when this block's tail is a sibling-call
+    /// shape -- last instruction is the call, the terminator returns
+    /// exactly its result (or `Return(None)` for a void call), and the
+    /// result has no other use anywhere in the function. Set once per
+    /// block by the generation driver; consulted by the Call arms to arm
+    /// the backend. `None` in every other block.
+    pub sibcall_hint: Option<SibcallHint>,
     /// CCC_ENABLE_VECREG: value id -> physical XMM register name that currently
     /// provably holds the vector data (128-bit vector register allocation).
     pub vec_live_regs: FxHashMap<u32, &'static str>,
@@ -739,6 +792,8 @@ impl CodegenState {
             x87_defer_values: FxHashSet::default(),
             x87_suppress: false,
             direct_fp_result: None,
+            pending_sibcall: None,
+            sibcall_hint: None,
             vec_live_regs: FxHashMap::default(),
             dirty_upper_ymm: false,
             requires_executable_stack: false,
@@ -1079,6 +1134,8 @@ impl CodegenState {
         self.x87_defer_values.clear();
         self.x87_suppress = false;
         self.direct_fp_result = None;
+        self.pending_sibcall = None;
+        self.sibcall_hint = None;
         self.vec_live_regs.clear();
         self.dirty_upper_ymm = false;
         self.uses_sret = false;

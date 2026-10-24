@@ -215,6 +215,12 @@ gate "atomic16-runtime" fast \
 gate "i128-atomic-call-clobber" fast \
     env CCC="$LCCC" GCC16="${GCC16:-gcc-16}" \
     bash tests/regression/check_i128_atomic_call_clobber.sh
+gate "i128-atomic-reproducer" fast \
+    env CCC="$LCCC" GCC16="${GCC16:-gcc-16}" \
+    bash tests/regression/check_i128_atomic_reproducer.sh
+gate "sibcall-shapes" fast \
+    env CCC="$LCCC" GCC="${GCC:-gcc-16}" \
+    bash tests/regression/check_sibcall_shapes.sh
 gate "fno-builtin-fold-contract" fast \
     env CCC="$LCCC" bash tests/regression/check_fno_builtin_folds.sh
 
@@ -1804,6 +1810,20 @@ gate "differential-corpus-paths" fast \
 
 gate "ra-web-inloop-use" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_ra_web_inloop_use.sh
+
+# Hot-web steal: opt-in diagnostics purity (no env, no output), a firing
+# steal with its eviction cost on the scalar-facts witness, and a named
+# cost-refusal on the all-hot fixture — the 5c.2 guard decisions made
+# observable instead of re-derived by hand instrumentation.
+gate "hot-web-steal-diagnostics" fast \
+    env CCC=target/fastbuild/lccc bash tests/regression/check_hot_web_steal_diagnostics.sh
+
+# FP selects over relational compares whose arms are the compared operands
+# lower to ONE maxsd/minsd/maxss/minss (second-operand-wins ties/NaNs, the
+# C semantics exactly); ge/le stay unfolded. Bit-exact vs gcc-16 across
+# -O0..-Os over the NaN/±0/SNaN corner grid.
+gate "fp-select-minmax" fast \
+    env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_fp_select_minmax.sh
 
 gate "store-alu-cross-join" fast \
     env CCC=target/fastbuild/lccc bash tests/regression/check_store_alu_cross_join.sh

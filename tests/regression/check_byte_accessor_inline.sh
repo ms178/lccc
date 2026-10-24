@@ -6,7 +6,20 @@ CCC=${CCC:-$root/target/fastbuild/lccc}
 GCC=${GCC:-gcc-16}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+# The m32 legs need the host's 32-bit headers (the fixture includes
+# <stdint.h> and both compilers link against the 32-bit crt).  A host
+# without gcc-multilib cannot run them; probe once with the reference GCC
+# so the skip names the missing prerequisite instead of failing as a
+# missing-header mystery.  CI's runner installs gcc-multilib and runs
+# every leg.
+printf 'int main(void) { return 0; }\n' >"$tmp/m32probe.c"
+m32_ok=1
+"$GCC" -m32 "$tmp/m32probe.c" -o "$tmp/m32probe" >/dev/null 2>&1 && "$tmp/m32probe" >/dev/null 2>&1 || m32_ok=0
 for mode in -m64 -m32; do
+    if [ "$mode" = "-m32" ] && [ "$m32_ok" = 0 ]; then
+        echo "SKIP: m32 legs (host lacks 32-bit headers/crt; CI installs gcc-multilib)"
+        continue
+    fi
     for opt in -O0 -O1 -O2 -O3 -Os; do
         "$GCC" "$mode" "$opt" -Wall -Wextra -Werror "$root/tests/regression/byte_accessor_inline.c" -o "$tmp/ref"
         "$CCC" "$mode" "$opt" "$root/tests/regression/byte_accessor_inline.c" -o "$tmp/mine"
@@ -22,13 +35,15 @@ for opt in -O2 -O3; do
     fi
 done
 # The x86-64 early placement must not erase the established i686 placement.
-for opt in -O2 -O3; do
-    "$CCC" -m32 "$opt" -march=i686 -S "$root/tests/benchmark/programs/byte_load_reassembly.c" -o "$tmp/byte32.s"
-    if grep -Eq '^[[:space:]]*call[q]?[[:space:]]+body_le64' "$tmp/byte32.s"; then
-        echo 'FAIL: i686 compact byte accessor scheduling was lost' >&2
-        exit 1
-    fi
-done
+if [ "$m32_ok" = 1 ]; then
+    for opt in -O2 -O3; do
+        "$CCC" -m32 "$opt" -march=i686 -S "$root/tests/benchmark/programs/byte_load_reassembly.c" -o "$tmp/byte32.s"
+        if grep -Eq '^[[:space:]]*call[q]?[[:space:]]+body_le64' "$tmp/byte32.s"; then
+            echo 'FAIL: i686 compact byte accessor scheduling was lost' >&2
+            exit 1
+        fi
+    done
+fi
 # Both diagnostic switches must suppress the extra scheduling opportunity.
 # These are controls for ONE variable: whether byte scheduling is what makes
 # body_le64 compact enough to inline. The inliner's capped-caller cleanup
@@ -37,6 +52,9 @@ done
 # O2/O3 assertions above run with every inliner feature enabled.
 control=(env CCC_NO_INLINE_CALLER_CLEANUP=1)
 for mode in -m64 -m32; do
+    if [ "$mode" = "-m32" ] && [ "$m32_ok" = 0 ]; then
+        continue
+    fi
     for disabled in byte_load postinline; do
         "${control[@]}" CCC_DISABLE_PASSES="$disabled" "$CCC" "$mode" -O2 -S "$root/tests/benchmark/programs/byte_load_reassembly.c" -o "$tmp/disabled.s"
         if ! grep -Eq '^[[:space:]]*call[q]?[[:space:]]+body_le64' "$tmp/disabled.s"; then
@@ -51,10 +69,12 @@ if ! grep -Eq '^[[:space:]]*call[q]?[[:space:]]+body_le64' "$tmp/early64.s"; the
     echo 'FAIL: x86-64 early byte scheduling ignored its own switch' >&2
     exit 1
 fi
-"${control[@]}" CCC_DISABLE_PASSES=byte_load_early "$CCC" -m32 -O2 -S "$root/tests/benchmark/programs/byte_load_reassembly.c" -o "$tmp/early32.s"
-if grep -Eq '^[[:space:]]*call[q]?[[:space:]]+body_le64' "$tmp/early32.s"; then
-    echo 'FAIL: early-only switch suppressed the separate i686 placement' >&2
-    exit 1
+if [ "$m32_ok" = 1 ]; then
+    "${control[@]}" CCC_DISABLE_PASSES=byte_load_early "$CCC" -m32 -O2 -S "$root/tests/benchmark/programs/byte_load_reassembly.c" -o "$tmp/early32.s"
+    if grep -Eq '^[[:space:]]*call[q]?[[:space:]]+body_le64' "$tmp/early32.s"; then
+        echo 'FAIL: early-only switch suppressed the separate i686 placement' >&2
+        exit 1
+    fi
 fi
 "$CCC" -O2 -S "$root/tests/regression/byte_accessor_inline.c" -o "$tmp/noinline.s"
 if ! grep -Eq '^[[:space:]]*call[q]?[[:space:]]+read_noinline' "$tmp/noinline.s"; then

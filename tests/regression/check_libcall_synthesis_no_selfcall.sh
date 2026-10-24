@@ -197,9 +197,16 @@ asm_of() { # <cfile> <flags...>  -> stdout asm (fails the gate on compiler error
     fi
     cat "$tmp/out.s"
 }
-# Number of `call` instructions inside the body of function $2 of asm on stdin.
-calls_in() {
-    awk -v fn="$2" '
+# Number of `call` instructions inside the body of function $1 of asm on
+# stdin.  The asm arrives on stdin (the `<<<"$asm"` herestring, exactly like
+# every other awk in this gate): an earlier version took it as a positional
+# argument that the function then ignored, so awk read the SCRIPT's stdin
+# instead -- on CI (stdin /dev/null) every count came back 0 and every
+# refusal row passed vacuously, while on a host with an open stdin the gate
+# hung.  The count is real now, so the refusal rows genuinely bind.
+calls_in() { # <fn> ; asm on stdin
+    local fn=$1
+    awk -v fn="$fn" '
         index($0, fn ":") == 1 { in_fn = 1; next }
         in_fn && /^\.size/ { in_fn = 0 }
         in_fn && /call/ { n++ }
@@ -211,7 +218,7 @@ expect_refused() { # <cfile> <fn> <flags...>
     local src=$1 fn=$2; shift 2
     local asm; asm=$(asm_of "$src" "$@")
     if ! has_fn "$asm" "$fn"; then bad "$(basename "$src") $*: $fn not emitted"; return; fi
-    local n; n=$(calls_in "$asm" "$fn")
+    local n; n=$(calls_in "$fn" <<<"$asm")
     if [ "$n" != "0" ]; then
         bad "$(basename "$src") $*: $fn still calls a libcall ($n) -- self-call/aliasing risk"
     else

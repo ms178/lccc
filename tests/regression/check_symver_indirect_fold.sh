@@ -10,13 +10,13 @@
 #   - stripping to the base name re-binds the call to the DEFAULT version —
 #     a silent .symver semantic change;
 #   - the GOT/TLS/absolute guards key on full symbol names.
-# The resolver must REJECT the fold: the call goes through the loaded
-# pointer value (GOTPCREL load + call *%r10), which is correct for every
-# binding.
+# The resolver must REJECT the fold: the call or sibling tail jump goes
+# through the loaded pointer value (GOTPCREL load + branch *%r10), which is
+# correct for every binding.
 #
 # Positive control: an unversioned local-pointer call DOES fold — to a
-# direct call, or (current behaviour) all the way to an inlined body with
-# no call left. Either way it must not remain a value-based indirect call:
+# direct call/jump, or (current behaviour) all the way to an inlined body
+# with no transfer left. Either way it must not remain value-based indirect:
 # that proves the resolver still folds the ordinary shapes.
 set -euo pipefail
 
@@ -45,19 +45,19 @@ ver_body=$(sed -n '/^versioned_local_ptr:/,/^\t\.size.*versioned_local_ptr/p' "$
 plain_body=$(sed -n '/^plain_local_ptr:/,/^\t\.size.*plain_local_ptr/p' "$tmp/t.s")
 
 fail=0
-if grep -qE 'call +\*?target_fn(@VER|@PLT)?\(' <<<"$ver_body" \
-   || grep -qE 'call +target_fn(@PLT|@VER)' <<<"$ver_body"; then
+if grep -qE '(call|jmp)q? +\*?target_fn(@VER|@PLT)?\(' <<<"$ver_body" \
+   || grep -qE '(call|jmp)q? +target_fn(@PLT|@VER)' <<<"$ver_body"; then
     echo "FAIL  versioned indirect call was folded (direct/memory-indirect target_fn form)"
     fail=$((fail+1))
 fi
-if ! grep -q 'call \*%r10' <<<"$ver_body"; then
+if ! grep -qE '(call|jmp)q? +\*%r10' <<<"$ver_body"; then
     echo "FAIL  versioned indirect call does not go through the loaded pointer (r10)"
     fail=$((fail+1))
 fi
 # Folded means: not value-based any more. Accept a direct `call plain_fn`
-# or a fully inlined body (no call instruction at all); reject any
-# surviving indirect call or GOT load of the callee.
-if grep -qE 'call +\*%' <<<"$plain_body" \
+# or a fully inlined body (no branch to the callee at all); reject any
+# surviving indirect transfer or GOT load of the callee.
+if grep -qE '(call|jmp)q? +\*%' <<<"$plain_body" \
    || grep -q 'plain_fn@GOTPCREL' <<<"$plain_body"; then
     echo "FAIL  positive control: unversioned local-pointer call did not fold"
     fail=$((fail+1))

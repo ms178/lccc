@@ -1134,6 +1134,17 @@ pub trait ArchCodegen {
     /// Called by the default emit_cmp for non-float, non-i128 types.
     fn emit_int_cmp(&mut self, dest: &Value, op: IrCmpOp, lhs: &Operand, rhs: &Operand, ty: IrType);
 
+    /// Arm a sibling-call conversion at a call site the generation driver
+    /// has already matched to the tail shape (last instruction of its
+    /// block, its result returned by the block's `Return`, no other use).
+    /// The backend performs its own ABI-level refusal here (zero stack
+    /// arguments, non-variadic, not sret, target-appropriate); when it
+    /// arms, the call's argument setup is emitted as usual but the `call`
+    /// itself is suppressed and the block's `Return` emits
+    /// `<epilogue>; jmp target` instead. Default: no-op (the conversion
+    /// is x86-64 only; every other backend leaves the state unset).
+    fn arm_sibcall_candidate(&mut self, _info: &CallInfo) {}
+
     /// Emit a function call (direct or indirect).
     ///
     /// The default implementation provides the shared algorithmic skeleton that all four

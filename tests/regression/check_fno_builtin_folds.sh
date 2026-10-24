@@ -70,7 +70,7 @@ for opt in -O0 -O2; do
     fn=$(awk '/call_site:/,/\.size.*call_site/' "$td/runtime.s")
     # herestring, not `echo | grep -q`: under `set -o pipefail` an early-exit
     # grep can SIGPIPE the producer and turn a match into a false failure.
-    grep -Eq 'call[q]?[[:space:]]+fabs(@PLT)?' <<<"$fn" || {
+    grep -Eq '(call|jmp)[q]?[[:space:]]+fabs(@PLT)?' <<<"$fn" || {
         echo "FAIL: -fno-builtin $opt did not retain the fabs call" >&2
         exit 1
     }
