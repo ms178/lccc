@@ -30,7 +30,22 @@ _start:
 .section .note.GNU-stack,"",@progbits
 ASM
 "$ccc" -m32 -c "$work/start.s" -o "$work/start.o"
+# ia32 execution probe: a host whose kernel or seccomp policy refuses ia32
+# syscalls kills every int $0x80 binary with SIGSYS (status 159) before its
+# first instruction. Probe once with a trivial freestanding main so the m32
+# legs skip loudly with the reason instead of failing as mystery 159s; CI's
+# runner executes ia32 and runs every leg.
+ia32_exec_ok() {
+    printf 'int main(void) { return 0; }\n' >"$work/probe32.c"
+    "$ccc" -m32 -O0 -nostdlib -c "$work/probe32.c" -o "$work/probe32.o" &&
+        "$ccc" -m32 -nostdlib -static "$work/start.o" "$work/probe32.o" -o "$work/probe32" &&
+        "$work/probe32"
+}
 for bits in 64 32; do
+    if [[ $bits == 32 ]] && ! ia32_exec_ok; then
+        echo "SKIP: m32 legs (host cannot execute ia32 int \$0x80 binaries; CI's runner executes them)"
+        continue
+    fi
     link_flags=(-m"$bits")
     if [[ $bits == 32 ]]; then
         link_flags+=(-nostdlib -static "$work/start.o")

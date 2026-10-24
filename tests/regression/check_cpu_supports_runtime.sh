@@ -242,7 +242,17 @@ if [ -x "$CCC_I686" ]; then
     else
         # Host has no 32-bit multilib libc/libgcc: verify 32-bit PIC CPUID
         # probe execution via a freestanding _start binary against the 64-bit
-        # GCC oracle answers from out_g.
+        # GCC oracle answers from out_g.  A host whose kernel or seccomp
+        # policy refuses ia32 syscalls kills every int $0x80 binary with
+        # SIGSYS before the program's first instruction; probe that with the
+        # REFERENCE GCC first so the skip measures the environment, not the
+        # compiler under test, and the leg skips loudly instead of failing
+        # as a mystery exit 159.
+        printf 'void _start(void){ __asm__ volatile("movl $0, %%ebx; movl $1, %%eax; int $0x80"); }\n' >"$td/ia32probe.c"
+        if ! { "$GCC" -m32 -nostdlib "$td/ia32probe.c" -o "$td/ia32probe" >/dev/null 2>&1 &&
+               "$td/ia32probe" >/dev/null 2>&1; }; then
+            echo "SKIP i686 freestanding row (host cannot execute ia32 int \$0x80 binaries; CI's runner executes them)"
+        else
         sse2_exp=$(awk -F= '$1=="sse2"{print $2}' "$td/out_g")
         avx2_exp=$(awk -F= '$1=="avx2"{print $2}' "$td/out_g")
         avx512f_exp=$(awk -F= '$1=="avx512f"{print $2}' "$td/out_g")
@@ -259,6 +269,7 @@ EOF
             ok "i686: freestanding PIC runtime probe agrees with host CPUID (${sse2_exp:-1} ${avx2_exp:-1} ${avx512f_exp:-0})"
         else
             bad "i686: freestanding runtime probe failed"; head -3 "$td/i686.err" | sed 's/^/      /'
+        fi
         fi
     fi
 else

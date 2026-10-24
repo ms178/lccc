@@ -142,3 +142,28 @@ Two items stay closed, so they are not re-litigated: `sdiv` by a constant
 already emits a 64-bit magic multiply (`sdr7` 4.39 vs 4.43 ns in
 `i686_alu_chains`), and `byte_load_reassembly`'s hot loop *does* fold its byte
 loads — the residual 20 % is gcc's SSE2 vectorisation of the 32-byte block.
+
+## Layout-metric ties go to the trace-built order
+
+The forwarding-phi fold shrank both layout candidates of
+`expat_utf8_name_length` onto exactly 68 ins + 60 br, and the tie fell back to
+the append order — which needs a `jmp` to reach the shared loop latch where the
+chain order falls into it, i.e. three taken branches per character instead of
+two. Ties now go to the chain layout: on a tie the cost model has nothing left
+to say, and the trace-built order is the better-founded default because its
+fall-throughs were chosen by a greedy walk over the same structural weights the
+metric prices.
+
+`CCC_LAYOUT_TIE_ORIG=1` restores the historical append-order fallback for A/B
+bisection. Measured on the canonical output-checked paired runner:
+`expat_xml_scan` 1.106x faster, 1.226 against GCC 16.2 (was 1.172). Of the 1205
+benchmark and regression programs that compile cleanly at `-O2`, exactly two
+emit different assembly, and both produce output byte-identical to GCC.
+
+One refinement landed with the factored rule (`adopt_chain_layout`): on a tie
+the stack-traffic comparison is **strict** (`chain_stack <= orig_stack`) rather
+than the usual 10 % admission band. The band exists because "a wrongly rejected
+layout costs the whole placement win"; on a tie there is no placement win left
+to protect — the metric has already declined to separate the orders — so the
+only evidence that remains is the stack term, and there the honest comparison
+admits no unproven memory traffic: no measured win means no extra spills.

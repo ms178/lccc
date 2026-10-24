@@ -3,7 +3,7 @@
     "backend-contracts-a": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 409.28,
+      "predicted_gate_seconds": 411.43,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard a of 2)",
       "steps": [
@@ -14,6 +14,22 @@
         {
           "measured_s": 3.34,
           "name": "bash tests/regression/check_rmw_sib_folds.sh"
+        },
+        {
+          "measured_s": 0.32,
+          "name": "env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_sibcall_shapes.sh"
+        },
+        {
+          "measured_s": 0.66,
+          "name": "env CCC=target/fastbuild/lccc GCC16=gcc-16 bash tests/regression/check_i128_atomic_reproducer.sh"
+        },
+        {
+          "measured_s": 0.32,
+          "name": "env CCC=target/fastbuild/lccc bash tests/regression/check_hot_web_steal_diagnostics.sh"
+        },
+        {
+          "measured_s": 0.85,
+          "name": "env CCC=target/fastbuild/lccc GCC=gcc-16 bash tests/regression/check_fp_select_minmax.sh"
         },
         {
           "measured_s": 4.4,

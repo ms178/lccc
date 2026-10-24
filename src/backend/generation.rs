@@ -25,6 +25,57 @@ use crate::ir::reexports::{
     Terminator, Value,
 };
 use std::collections::hash_map::Entry;
+use std::sync::OnceLock;
+
+/// Sibling-call kill switch (`CCC_NO_SIBCALL=1`), resolved once per
+/// process like the other `CCC_NO_*` switches: the generation driver reads
+/// it once per function through `sibcall_enabled`, never per site, keeping
+/// the environment-hygiene contract (one read per translation unit).
+static SIBCALL_DISABLED: OnceLock<bool> = OnceLock::new();
+
+fn sibcall_enabled() -> bool {
+    !*SIBCALL_DISABLED.get_or_init(|| std::env::var_os("CCC_NO_SIBCALL").is_some())
+}
+
+/// Per-block sibling-call shape (TODO-3 / §5b): the block's LAST
+/// instruction is a call whose dest is returned verbatim by the block's
+/// `Return` terminator with no other use anywhere in the function
+/// (`use_counts[v] == 1`: the Return itself), or a void call under
+/// `Return(None)`. Anything else — a non-call tail, a result used
+/// elsewhere, a different value returned, a constant returned — is a
+/// miss, never a guess.
+fn sibcall_block_hint(
+    block: &BasicBlock,
+    use_counts: &FxHashMap<u32, u8>,
+) -> Option<crate::backend::state::SibcallHint> {
+    use crate::backend::state::SibcallHint;
+    let last = block.instructions.last()?;
+    let dest = match last {
+        Instruction::Call { info, .. } | Instruction::CallIndirect { info, .. } => info.dest,
+        _ => return None,
+    };
+    match (dest, &block.terminator) {
+        (Some(v), Terminator::Return(Some(Operand::Value(w)))) if *w == v => {
+            // Single-use: the value's one use anywhere is this Return.
+            if use_counts.get(&v.0).copied() == Some(1) {
+                Some(SibcallHint { dest: Some(v.0) })
+            } else {
+                None
+            }
+        }
+        // Void forwarder with a discarded result: `int f(void) { puts(s); }`
+        // lowers to `Call puts (dest Some(v))` + `Return(None)` — the
+        // result is dead (count == 0), so the tail callee's exit is ours
+        // and its %eax is ignored by our void contract. A result with any
+        // other use, or a different value returned, stays refused.
+        (Some(v), Terminator::Return(None)) if use_counts.get(&v.0).copied().unwrap_or(0) == 0 => {
+            Some(SibcallHint { dest: Some(v.0) })
+        }
+        // Void forwarder: nothing to materialise, nothing to protect.
+        (None, Terminator::Return(None)) => Some(SibcallHint { dest: None }),
+        _ => None,
+    }
+}
 
 /// GEP/`Add`/`Sub` with a constant offset foldable into a Load/Store.
 #[derive(Debug, Clone, Copy)]
@@ -5705,8 +5756,64 @@ fn generate_function_body(
         }
     }
 
+    // Sibling-call site analysis (TODO-3 / §5b of the codegen-gaps ledger),
+    // part 1: the function-level guards and the whole-function use counts,
+    // computed once. The conversion is sound only when no Alloca whose
+    // ADDRESS IS USED survives (a used alloca's pointer could reach the
+    // tail callee, and the epilogue hands it unowned stack — the design's
+    // "no Alloca whose address escapes", with "used anywhere" as the
+    // conservative proxy: a Load/Store through it before the epilogue is
+    // harmless, but distinguishing that from an address that reaches the
+    // callee costs coverage, never correctness, to refuse). A DEAD alloca
+    // (zero uses — the lowering's artifacts, e.g. an unused parameter temp)
+    // is just frame space the epilogue discards: allowed. DynAlloca is
+    // refused on sight (its memory lives below %rsp); inline asm anywhere
+    // is refused on sight (the design's "no live inline-asm barrier", made
+    // function-wide: an IR-level analysis cannot bound the asm's stack
+    // expectations).
+    let mut sibcall_use_counts: FxHashMap<u32, u8> = FxHashMap::default();
+    for b in &func.blocks {
+        for inst in &b.instructions {
+            for id in inst.used_values() {
+                let entry = sibcall_use_counts.entry(id).or_insert(0);
+                *entry = entry.saturating_add(1);
+            }
+        }
+        for id in b.terminator.used_values() {
+            let entry = sibcall_use_counts.entry(id).or_insert(0);
+            *entry = entry.saturating_add(1);
+        }
+    }
+    let sibcall_fn_ok = sibcall_enabled()
+        && !func.blocks.iter().any(|b| {
+            b.instructions.iter().any(|inst| match inst {
+                // A live alloca's address could reach the tail callee.
+                Instruction::Alloca { dest, .. } => {
+                    sibcall_use_counts.get(&dest.0).copied().unwrap_or(0) > 0
+                }
+                // Dynamic stack allocation: memory below %rsp, and the
+                // epilogue would hand the tail callee unowned stack.
+                Instruction::DynAlloca { .. } => true,
+                // Inline asm: unbounded stack expectations.
+                Instruction::InlineAsm { .. } => true,
+                _ => false,
+            })
+        });
+
     for (block_idx, block) in func.blocks.iter().enumerate() {
         cg.begin_home_write_block(block.label);
+        // Sibling-call site analysis (TODO-3 / §5b of the codegen-gaps
+        // ledger), part 2: per-block shape. The function-level guard and
+        // the whole-function use counts were computed once above
+        // (`sibcall_fn_ok` / `sibcall_use_counts`); a block qualifies when
+        // its LAST instruction is the call, the terminator returns exactly
+        // its result (or `Return(None)` for a void call), and the result
+        // has no other use anywhere (count == 1: the Return itself).
+        cg.state().sibcall_hint = if sibcall_fn_ok {
+            sibcall_block_hint(block, &sibcall_use_counts)
+        } else {
+            None
+        };
         if Some(block.label) != entry_label {
             cg.state().reg_cache.invalidate_all();
             cg.flush_pending_vec_store();
@@ -7084,6 +7191,16 @@ fn generate_instruction_body(
                 }
                 return;
             }
+            // Sibling call (TODO-3 / §5b): arm when the driver's block-tail
+            // hint matches this site; the backend applies its own ABI
+            // refusals (zero stack arguments, non-variadic, not sret).
+            if cg
+                .state()
+                .sibcall_hint
+                .is_some_and(|h| h.dest == info.dest.map(|d| d.0))
+            {
+                cg.arm_sibcall_candidate(info);
+            }
             cg.emit_call(
                 &info.args,
                 &info.arg_types,
@@ -7107,6 +7224,16 @@ fn generate_instruction_body(
             clobber_after_call_like(cg);
         }
         Instruction::CallIndirect { func_ptr, info } => {
+            // Sibling call (TODO-3 / §5b): arm when the driver's block-tail
+            // hint matches this site; the backend applies its own ABI
+            // refusals (zero stack arguments, non-variadic, not sret).
+            if cg
+                .state()
+                .sibcall_hint
+                .is_some_and(|h| h.dest == info.dest.map(|d| d.0))
+            {
+                cg.arm_sibcall_candidate(info);
+            }
             cg.emit_call(
                 &info.args,
                 &info.arg_types,

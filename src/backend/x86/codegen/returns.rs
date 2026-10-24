@@ -7,6 +7,44 @@ use crate::ir::reexports::{IrConst, Operand, Value};
 
 impl X86Codegen {
     pub(super) fn emit_return_impl(&mut self, val: Option<&Operand>, frame_size: i64) {
+        use crate::backend::state::SibcallPending;
+        use crate::backend::state::SibcallTarget;
+        // Sibling call (TODO-3 / §5b): a qualifying trailing call had its
+        // `call` suppressed at Phase 4; this `Return` is its tail. Emit
+        // the epilogue and JUMP to the target instead of materialising a
+        // result and returning: the tail callee's exit IS this function's
+        // exit, its return registers already hold the value, and the
+        // existing return address (at the post-epilogue `%rsp`, which the
+        // callee's `ret` pops) is our caller's — the 16-byte window at the
+        // entry line is handed over byte-for-byte identical (zero stack
+        // arguments, no dynamic alloca, no address-taken local: the §5b
+        // guards the arming proved).
+        if let Some(SibcallPending::Ready(target)) = self.state.pending_sibcall.take() {
+            // IS-20 discipline, same as `emit_epilogue_and_ret_impl`: a
+            // function that dirtied upper YMM halves must clean them before
+            // leaving the frame, or every legacy-SSE instruction in the
+            // caller pays the AVX-SSE transition penalty.
+            if self.state.dirty_upper_ymm {
+                self.state.emit("    vzeroupper");
+            }
+            self.emit_epilogue_impl(frame_size);
+            match target {
+                SibcallTarget::Direct(name) => {
+                    // Same formatting path as `emit_call` uses for call
+                    // targets (`    call {sym}`): a symbol reference is a
+                    // valid named jump target, so the PLT-decorated name
+                    // round-trips unchanged.
+                    self.state.out.emit_jmp_label(&name);
+                }
+                SibcallTarget::RipSlot(cell) => {
+                    self.state.emit_fmt(format_args!("    jmp *{}(%rip)", cell));
+                }
+                SibcallTarget::Reg(reg) => {
+                    self.state.emit_fmt(format_args!("    jmp *%{}", reg));
+                }
+            }
+            return;
+        }
         use crate::backend::state::SlotAddr;
         if let Some(val) = val {
             // A register-valued vector return (`try_lower_vector_return_simd`):

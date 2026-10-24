@@ -1897,6 +1897,153 @@ impl X86Codegen {
         }
     }
 
+    /// The min/max canonical shape: a Select whose condition is a relational
+    /// FP compare and whose arms are the compare's operands verbatim —
+    /// `a > b ? a : b` and its three siblings. One `maxsd`/`minsd` (SECOND
+    /// OPERAND WINS on NaN and on ties, Intel SDM MAXSD/MINSD) replaces the
+    /// whole vcmp+blend (AVX) or ucomisd+cmov (SSE2) sequence, and the
+    /// hardware semantics match the C select exactly. The dst is always the
+    /// TRUE arm and the src the FALSE arm (the false arm is exactly where
+    /// NaN and ties land, because the condition is false there); the
+    /// INSTRUCTION follows the arms' orientation relative to the predicate:
+    ///
+    ///   ogt(a,b) ? a : b  ==  maxsd dst=a, src=b   (NaN → b, tie → b)
+    ///   olt(a,b) ? a : b  ==  minsd dst=a, src=b
+    ///   ogt(a,b) ? b : a  ==  minsd dst=b, src=a   (NaN → a, tie → a)
+    ///   olt(a,b) ? b : a  ==  maxsd dst=b, src=a
+    ///
+    /// (`a > b ? b : a` selects b when b is the SMALLER side's opposite —
+    /// the true arm is the predicate's RHS, so the T-vs-F relation that
+    /// selects the true arm is `T < F`, which is minsd.) The swapped-arm
+    /// mapping was first derived backwards (max for both gt shapes); the
+    /// bit-exact differential against gcc-16 over NaN/±0/SNaN corners
+    /// caught the transposition, and the table above is the corrected,
+    /// re-verified algebra.
+    ///
+    /// `ge`/`le` are deliberately NOT folded: their tie arm (`a`, picked
+    /// when `a == b`) is the opposite of the hardware's tie arm (src), and
+    /// `eq`/`ne` are not min/max at all — GCC leaves those un-folded too,
+    /// for the same reason. Exception parity: `ucomisd`/`ucomiss` raise #IA
+    /// on SNaN and so do `maxsd`/`minsd`/`maxss`/`minss`, so the fold
+    /// cannot change the select's exception behavior.
+    ///
+    /// Arm identity is VALUE identity (same SSA id) or bit-identical FP
+    /// constants — the strongest possible precondition. Bitcast arms (the
+    /// frontend's integer-spelled FP selects) keep their distinct SSA ids,
+    /// fail the identity test, and stay on the blend path below rather
+    /// than being guessed at.
+    ///
+    /// Returns true when the min/max was emitted; false when the shape is
+    /// not the canonical one (the caller proceeds to the blend/fallback).
+    fn try_emit_fp_select_minmax(
+        &mut self,
+        dest: &Value,
+        op: IrCmpOp,
+        lhs: &Operand,
+        rhs: &Operand,
+        true_val: &Operand,
+        false_val: &Operand,
+        ty: IrType,
+    ) -> bool {
+        let Some(gt_form) = (match op {
+            IrCmpOp::Sgt | IrCmpOp::Ugt => Some(true),
+            IrCmpOp::Slt | IrCmpOp::Ult => Some(false),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let same_operand = |a: &Operand, b: &Operand| -> bool {
+            match (a, b) {
+                (Operand::Value(x), Operand::Value(y)) => x.0 == y.0,
+                (Operand::Const(x), Operand::Const(y)) => match (x, y) {
+                    (IrConst::F64(p), IrConst::F64(q)) => p.to_bits() == q.to_bits(),
+                    (IrConst::F32(p), IrConst::F32(q)) => p.to_bits() == q.to_bits(),
+                    _ => false,
+                },
+                _ => false,
+            }
+        };
+        // dst is always the TRUE arm, src the FALSE arm (second operand wins
+        // on NaN and ties, which is exactly where the C select's condition
+        // is false). The INSTRUCTION depends on the arms' orientation:
+        //   * true arm is the predicate's LHS: cond == (T > F) resp. (T < F)
+        //     -> maxsd/minsd(dst=T, src=F);
+        //   * true arm is the predicate's RHS: cond == (F > T) resp. (F < T),
+        //     i.e. the SELECTED-on-true relation between T and F is the
+        //     opposite one -> minsd/maxsd(dst=T, src=F).
+        // (The swapped case was derived the hard way: an earlier draft
+        // mapped `a > b ? b : a` to maxsd and the differential hash caught
+        // it — gt_sw and lt_sw came back transposed.)
+        let (true_is_lhs, true_is_rhs) = (
+            same_operand(true_val, lhs) && same_operand(false_val, rhs),
+            same_operand(true_val, rhs) && same_operand(false_val, lhs),
+        );
+        if !true_is_lhs && !true_is_rhs {
+            return false;
+        }
+        let is_max = if true_is_lhs { gt_form } else { !gt_form };
+        let is_f64 = ty == IrType::F64;
+        let minmax = if is_max {
+            if is_f64 { "maxsd" } else { "maxss" }
+        } else if is_f64 {
+            "minsd"
+        } else {
+            "minss"
+        };
+        if fp_select_debug() {
+            eprintln!("[FP-SELECT] min/max canonical shape -> {minmax}");
+        }
+        // Case A: XMM-homed destination — dst arm into the home, then the
+        // min/max straight into it. Homes are xmm2..xmm15, so the staged
+        // scratch below can never alias the destination. ORDER MATTERS: the
+        // false arm's source must be secured BEFORE the true arm's copy can
+        // clobber a shared home — when the destination inherits the FALSE
+        // arm's home (`x = a > b ? a : b` with x reusing b's register), the
+        // direct home spelling would read the register AFTER the true-arm
+        // copy overwrote it. Stage to %xmm1 in that case, exactly like the
+        // blend's step-2-before-step-3 discipline.
+        if let Some(d) = self.dest_reg(dest).filter(|r| is_xmm_reg(*r)) {
+            let d_name = phys_reg_name(d);
+            let false_home_is_dest = match false_val {
+                Operand::Value(v) => self.fresh_home_of(v.0) == Some(d),
+                _ => false,
+            };
+            let false_src = if false_home_is_dest {
+                self.emit_fp_operand_to_xmm(false_val, ty, "xmm1");
+                "%xmm1".to_string()
+            } else {
+                match self.fp_src_mem_operand(false_val, ty) {
+                    Some(s) => s,
+                    None => {
+                        self.emit_fp_operand_to_xmm(false_val, ty, "xmm1");
+                        "%xmm1".to_string()
+                    }
+                }
+            };
+            self.emit_fp_operand_to_xmm(true_val, ty, &d_name);
+            self.state
+                .emit_fmt(format_args!("    {} {}, %{}", minmax, false_src, d_name));
+            self.state.reg_cache.invalidate_acc();
+            return true;
+        }
+        // Case B: no XMM home — dst arm into the FP accumulator scratch,
+        // min/max into it, store through the shared xmm0 dest path.
+        self.emit_fp_operand_to_xmm(true_val, ty, "xmm0");
+        match self.fp_src_mem_operand(false_val, ty) {
+            Some(src) => {
+                self.state
+                    .emit_fmt(format_args!("    {} {}, %xmm0", minmax, src));
+            }
+            None => {
+                self.emit_fp_operand_to_xmm(false_val, ty, "xmm1");
+                self.state
+                    .emit_fmt(format_args!("    {} %xmm1, %xmm0", minmax));
+            }
+        }
+        self.store_xmm0_fp_dest(dest, ty);
+        true
+    }
+
     /// S05 FP-SELECT: blend the FP arms of a Select whose condition is a
     /// float Cmp that elided its boolean (see emit_float_cmp_impl). The mask
     /// is re-derived as vcmpsd/vcmpss from the recorded operands, then
@@ -2218,6 +2365,15 @@ impl X86Codegen {
                         }
                     };
                     if arm_ok(true_val) && arm_ok(false_val) {
+                        // The one-instruction min/max shape first: when the
+                        // arms ARE the compared operands, no mask and no
+                        // cmov are needed at all (`a > b ? a : b` → maxsd),
+                        // on SSE2 exactly as on AVX.
+                        if self.try_emit_fp_select_minmax(
+                            dest, cop, &clhs, &crhs, true_val, false_val, cty,
+                        ) {
+                            return;
+                        }
                         if !self.try_emit_fp_select_blend(
                             dest, cop, &clhs, &crhs, true_val, false_val, cty,
                         ) {

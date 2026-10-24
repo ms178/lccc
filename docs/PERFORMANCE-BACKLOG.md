@@ -71,3 +71,29 @@ New items, each with a witness, on top of the list above:
 4. **`andl $255, %r10` self-mask** where gcc emits `testb %al,%al`
    (`fold_copy_and_mask_into_movz` handles the `movl`+`andl` pair, not the
    in-place mask).
+
+## Callgrind re-baseline after the sibling-call conversion (TODO-9 + TODO-3)
+
+`scripts/callgrind_ab.py`, simulated Ir (not wall-clock), correctness-gated on
+identical stdout, 2026-10-23, fastbuild binaries on this host. Both arms of
+the sibling-call A/B used the SAME compiler binary, differing only by
+`CCC_NO_SIBCALL` (the conversion on vs off):
+
+* **Sibling-call conversion (on/off): neutral-to-positive, never slower.**
+  Geomean 0.9999985 over the fast corpus; every arm at or below 1.00000;
+  `glibc_memcmp` 0.99995. Output byte-identical on every program. The
+  conversion's benefit class (wrapper/forwarder code) is thin in the fast
+  corpus; the §5.3 shape evidence (dmin2: call/ret pair + return-address
+  traffic removed, gcc-16.2 parity on the emitted shape) carries the claim.
+* **lccc vs gcc-16.2 standing (same run, second A/B):** instruction parity on
+  `gzip_crc32` (1.00000) and `qsort` (1.00032); ahead on `sha256_transform`
+  (0.95), `tce_sum` (1.00), `struct_copy`/`bitops`/`double_reduction`
+  (0.73–0.75), `chacha20_block` (0.62); behind on `ring_fifo` (2.49),
+  `binary_search` (1.40), `switch_dispatch` (1.28), `linux_rbtree` (1.27),
+  `loop_patterns` (1.32), `zstd_count` (1.17), `linux_find_bit` (1.18).
+  The two 0.00013 rows (`ackermann`, `constant_recursion`) are the IPA
+  devirt/constprop machinery eliminating recursion GCC keeps: 1.0e9 vs
+  1.3e5 Ir. Those are real effects of the invariant-callback pass, not
+  measurement artifacts — the same binaries' stdout gates the comparison.
+  Remaining-gap ownership: regalloc/callocation quality (the §5.1
+  post-TODO-2 residuals), not call shape.

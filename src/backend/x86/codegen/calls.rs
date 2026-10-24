@@ -4,9 +4,10 @@ use super::emit::{X86_ARG_REGS, X86Codegen};
 use crate::backend::call_abi::{CallAbiConfig, CallArgClass, compute_stack_push_bytes};
 use crate::backend::generation::is_i128_type;
 use crate::backend::narrow_copy::{NarrowCopy, eax_ferry, narrow_copy_plan, narrow_move_mnemonic};
+use crate::backend::state::{SibcallPending, SibcallTarget};
 use crate::backend::traits::ArchCodegen;
 use crate::common::types::IrType;
-use crate::ir::reexports::{Instruction, IrBinOp, IrConst, Operand, Value};
+use crate::ir::reexports::{CallInfo, Instruction, IrBinOp, IrConst, Operand, Value};
 
 /// How a resolved global call target must be emitted.
 pub(super) enum ResolvedIndirectCall {
@@ -1420,7 +1421,14 @@ impl X86Codegen {
                 _ => {}
             }
         }
-        if float_count > 0 {
+        if float_count > 0 && self.state.pending_sibcall.is_none() {
+            // The census is ABI payload only for VARIADIC callees, and the
+            // GP dead-write pass deletes it for non-variadic ones — except
+            // at a sibling call, where the late passes have no call text to
+            // model the site from and keep it. A sibcall is non-variadic by
+            // construction (the arm refuses variadic callees), so skip the
+            // write outright there: the `# LCCC_CALL_FP` marker below still
+            // publishes the count for the FP liveness oracle.
             self.state
                 .out
                 .emit_instr_imm_reg("    movb", float_count as i64, "al");
@@ -1480,7 +1488,63 @@ impl X86Codegen {
         // Lazy flush: the call clobbers all XMM registers — a pending
         // deferred vector-result store must hit its slot first.
         self.flush_pending_vec_store_impl();
-        if let Some(name) = direct_name {
+        // Sibling call (TODO-3 / §5b): argument setup ran unchanged; the
+        // `call` is replaced by the block's `Return` emitting
+        // `<epilogue>; jmp target`. Resolve the target exactly as the
+        // non-sibcall path below would have spelled it (PLT policy,
+        // paravirt memory-slot folding, `%r10` for value-based indirects)
+        // so the emitted `jmp` keeps byte-for-byte the binding semantics
+        // of the `call` it replaces. The call TEXT is suppressed but the
+        // liveness-marker contract below still discharges — the late text
+        // passes model this site from the markers, and without them the
+        // dead-write eliminations around it (the `movb $N, %al` census,
+        // param-homing moves) silently stop firing.
+        let sibcall_armed = matches!(self.state.pending_sibcall, Some(SibcallPending::Armed));
+        if sibcall_armed {
+            let target = if let Some(name) = direct_name {
+                if self.state.needs_plt(name) {
+                    let n = name.split('@').next().unwrap_or(name);
+                    SibcallTarget::Direct(format!("{}@PLT", n))
+                } else {
+                    SibcallTarget::Direct(name.to_string())
+                }
+            } else if let Some(fp) = func_ptr {
+                match self.try_resolve_indirect_call_global(fp) {
+                    Some(ResolvedIndirectCall::MemorySlot(sym, off)) => {
+                        let sym_str = if off == 0 {
+                            sym.clone()
+                        } else if off > 0 {
+                            format!("{}+{}", sym, off)
+                        } else {
+                            format!("{}{}", sym, off)
+                        };
+                        SibcallTarget::RipSlot(sym_str)
+                    }
+                    Some(ResolvedIndirectCall::Direct(sym, off)) => {
+                        if off == 0 && self.state.needs_plt(&sym) {
+                            SibcallTarget::Direct(format!("{}@PLT", sym))
+                        } else if off == 0 {
+                            SibcallTarget::Direct(sym.clone())
+                        } else if off > 0 {
+                            SibcallTarget::Direct(format!("{}+{}", sym, off))
+                        } else {
+                            SibcallTarget::Direct(format!("{}{}", sym, off))
+                        }
+                    }
+                    // Value-based indirect: Phase 0 already loaded the
+                    // target into %r10 (emit_call_spill_fptr_impl); the
+                    // epilogue does not touch caller-saved registers.
+                    None => SibcallTarget::Reg("r10"),
+                }
+            } else {
+                // Unreachable: the driver only arms sites whose emission
+                // reaches the generic `emit_call` with a direct name or a
+                // function pointer. Fail closed rather than emit nothing.
+                self.state.pending_sibcall = None;
+                return;
+            };
+            self.state.pending_sibcall = Some(SibcallPending::Ready(target));
+        } else if let Some(name) = direct_name {
             if self.state.needs_plt(name) {
                 // Versioned symbols (`printf@GLIBC_2.2.5`, bound by .symver)
                 // must use the base name in @PLT references — GAS 2.47 rejects
@@ -1741,7 +1805,73 @@ impl X86Codegen {
         }
     }
 
+    pub(super) fn arm_sibcall_candidate_impl(&mut self, info: &CallInfo) {
+        // One conversion in flight at a time; the driver arms at most one
+        // site per block and `emit_return_impl` consumes it before the
+        // next block begins. A stale `Armed` here means an aborted emission
+        // path — refuse to stack a second one on top of it.
+        if self.state.pending_sibcall.is_some() {
+            return;
+        }
+        // i686: cdecl stages every argument through the outgoing stack area
+        // (see the `%esp`-relative staging in the probe for PR #255), so the
+        // zero-stack-argument premise of §5b never holds there. Refused
+        // wholesale until an i686-specific proof exists; the guard below
+        // (which classifies through the x86-64 SysV config) must not be
+        // allowed to green-light a 32-bit target.
+        if crate::common::types::target_is_32bit() {
+            return;
+        }
+        // The remaining ABI refusals from the §5b design: variadic callees
+        // read `%al`, sret/fastcall take unaudited argument paths, and the
+        // kernel return-thunk build replaces `ret` with a thunk the
+        // conversion would bypass.
+        if info.is_variadic || info.is_sret || info.is_fastcall || info.regparm.is_some() {
+            return;
+        }
+        if self.state.function_return_thunk {
+            return;
+        }
+        // Zero-stack-argument guard: classify exactly as the emission will
+        // (same `CallAbiConfig`, same arrays) and refuse unless every
+        // argument lands in a register. This is the soundness core: with
+        // no stack-passed arguments, the callee reads nothing below `%rsp`,
+        // so the 16-byte window shift between `call` and `jmp` cannot
+        // change any byte the callee observes (pr23324 stays impossible).
+        let config = self.call_abi_config_impl();
+        let classes = crate::backend::call_abi::classify_call_args(
+            &info.args,
+            &info.arg_types,
+            &info.struct_arg_sizes,
+            &info.struct_arg_aligns,
+            &info.struct_arg_classes,
+            &info.struct_arg_riscv_float_classes,
+            &info.struct_arg_is_f128_sse,
+            info.is_variadic,
+            &config,
+        );
+        let stack_class = |c: &crate::backend::call_abi::CallArgClass| {
+            matches!(
+                c,
+                crate::backend::call_abi::CallArgClass::Stack
+                    | crate::backend::call_abi::CallArgClass::StructByValStack { .. }
+                    | crate::backend::call_abi::CallArgClass::LargeStructStack { .. }
+                    | crate::backend::call_abi::CallArgClass::StructSplitRegStack { .. }
+            )
+        };
+        if classes.iter().any(stack_class) {
+            return;
+        }
+        self.state.pending_sibcall = Some(SibcallPending::Armed);
+    }
+
     pub(super) fn emit_call_store_result_impl(&mut self, dest: &Value, return_type: IrType) {
+        // Sibling call (TODO-3): the result is never materialised here —
+        // the tail callee's exit IS this function's exit, so its return
+        // registers already hold the value our `Return` hands over.
+        if self.state.pending_sibcall.is_some() {
+            return;
+        }
         // Void functions have no meaningful return value — skip the store.
         // Without this, store_rax_to writes garbage %rax to a stack slot that
         // may overlap with callee-saved register save area, corrupting them.

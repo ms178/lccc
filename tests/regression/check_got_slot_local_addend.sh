@@ -34,6 +34,18 @@ ok()   { printf 'ok   %s\n' "$*"; }
 bad()  { printf 'FAIL %s\n' "$*"; fail=1; }
 skip() { printf 'SKIP %s\n' "$*"; }
 
+# The freestanding i686 legs return through the shim's `int $0x80`; a host
+# whose kernel or seccomp policy refuses ia32 syscalls kills those binaries
+# with SIGSYS (exit 159) before the program's first instruction.  Probe once
+# with the reference GCC so the skip measures the environment, not the
+# compiler under test, and the legs skip loudly instead of failing as a
+# mystery exit 159.  CI's runner executes ia32 syscalls and runs every leg.
+ia32_freestanding_exec_works() {
+    printf 'void _start(void){ __asm__ volatile("movl $0, %%ebx; movl $1, %%eax; int $0x80"); }\n' >"$td/ia32probe.c"
+    "$GCC" -m32 -nostdlib "$td/ia32probe.c" -o "$td/ia32probe" >/dev/null 2>&1 &&
+        "$td/ia32probe" >/dev/null 2>&1
+}
+
 [ -x "$CCC" ] || { echo "FAIL: no compiler at $CCC"; exit 1; }
 
 x64_src=tests/data/got_slot_local_addend_x86_64.s
@@ -67,18 +79,18 @@ if "$GCC" -m32 -no-pie "$td/m32.c" -o "$td/m32probe" >/dev/null 2>&1; then
 else
     has_m32_libc=0
     cat >"$td/shim32.s" <<'EOF'
-	.text
-	.globl	_start
+        .text
+        .globl  _start
 _start:
-	call	main
-	movl	%eax, %ebx
-	movl	$1, %eax
-	int	$0x80
-	.weak	__x86.get_pc_thunk.bx
-	.type	__x86.get_pc_thunk.bx, @function
+        call    main
+        movl    %eax, %ebx
+        movl    $1, %eax
+        int     $0x80
+        .weak   __x86.get_pc_thunk.bx
+        .type   __x86.get_pc_thunk.bx, @function
 __x86.get_pc_thunk.bx:
-	movl	(%esp), %ebx
-	ret
+        movl    (%esp), %ebx
+        ret
 EOF
 fi
 
@@ -87,10 +99,12 @@ if [ "$has_m32_libc" = 1 ]; then
     if try_build "i686 default" "$CCC" -m32 "$i686_src" -o "$td/prog"; then run_25 "i686 default (LCCC driver)"; fi
     rm -f "$td/prog"
     if try_build "i686 -no-pie" "$CCC" -m32 -no-pie "$i686_src" -o "$td/prog"; then run_25 "i686 -no-pie (LCCC driver)"; fi
-else
+elif ia32_freestanding_exec_works; then
     if try_build "i686 default" "$CCC" -m32 -nostdlib "$i686_src" "$td/shim32.s" -o "$td/prog"; then run_25 "i686 default (LCCC driver, freestanding)"; fi
     rm -f "$td/prog"
     if try_build "i686 -no-pie" "$CCC" -m32 -no-pie -nostdlib "$i686_src" "$td/shim32.s" -o "$td/prog"; then run_25 "i686 -no-pie (LCCC driver, freestanding)"; fi
+else
+    skip "i686 runtime legs (host cannot execute ia32 int \$0x80 binaries; CI's runner executes them)"
 fi
 
 # Cross pipeline: the LCCC object, linked by GNU ld.  A fold defect shows up
@@ -107,7 +121,7 @@ if [ "$has_m32_libc" = 1 ]; then
        try_build "i686 cross link" "$GCC" -m32 -no-pie "$td/i686.o" -o "$td/prog"; then
         run_25 "i686 LCCC object + GNU ld"
     fi
-elif command -v ld >/dev/null 2>&1; then
+elif command -v ld >/dev/null 2>&1 && ia32_freestanding_exec_works; then
     rm -f "$td/prog"
     if try_build "i686 cross link" "$CCC" -m32 -c "$i686_src" -o "$td/i686.o" &&
        try_build "i686 cross link" "$CCC" -m32 -c "$td/shim32.s" -o "$td/shim32.o" &&
@@ -115,7 +129,7 @@ elif command -v ld >/dev/null 2>&1; then
         run_25 "i686 LCCC object + GNU ld (freestanding)"
     fi
 else
-    skip "i686 cross link (no gcc multilib or ld)"
+    skip "i686 cross link (no gcc multilib, no ld, or host cannot execute ia32 int \$0x80 binaries)"
 fi
 
 # ------------------------------------------------------ 2. relocation spelling
@@ -149,43 +163,43 @@ fi
 
 # The instruction-form contract, form by form, against the pinned oracle.
 cat >"$td/forms.s" <<'EOF'
-	.text
-	.globl f1
-f1:	movq q1@GOTPCREL(%rip), %rax
-	ret
-	.globl f2
-f2:	movl q2@GOTPCREL(%rip), %eax
-	ret
-	.globl f3
-f3:	addq q3@GOTPCREL(%rip), %rax
-	ret
-	.globl f4
-f4:	movl %eax, q4@GOTPCREL(%rip)
-	ret
-	.globl f5
-f5:	pushq q5@GOTPCREL(%rip)
-	ret
-	.globl f6
-f6:	cmpl $1, q6@GOTPCREL(%rip)
-	ret
-	.globl f7
-f7:	leaq q7@GOTPCREL(%rip), %rax
-	ret
-	.data
-	.globl q1
-q1:	.quad 1
-	.globl q2
-q2:	.long 1
-	.globl q3
-q3:	.quad 1
-	.globl q4
-q4:	.long 1
-	.globl q5
-q5:	.quad 1
-	.globl q6
-q6:	.long 1
-	.globl q7
-q7:	.quad 1
+        .text
+        .globl f1
+f1:     movq q1@GOTPCREL(%rip), %rax
+        ret
+        .globl f2
+f2:     movl q2@GOTPCREL(%rip), %eax
+        ret
+        .globl f3
+f3:     addq q3@GOTPCREL(%rip), %rax
+        ret
+        .globl f4
+f4:     movl %eax, q4@GOTPCREL(%rip)
+        ret
+        .globl f5
+f5:     pushq q5@GOTPCREL(%rip)
+        ret
+        .globl f6
+f6:     cmpl $1, q6@GOTPCREL(%rip)
+        ret
+        .globl f7
+f7:     leaq q7@GOTPCREL(%rip), %rax
+        ret
+        .data
+        .globl q1
+q1:     .quad 1
+        .globl q2
+q2:     .long 1
+        .globl q3
+q3:     .quad 1
+        .globl q4
+q4:     .long 1
+        .globl q5
+q5:     .quad 1
+        .globl q6
+q6:     .long 1
+        .globl q7
+q7:     .quad 1
 EOF
 if try_build "x86-64 form probe" "$CCC" -c "$td/forms.s" -o "$td/forms_l.o"; then
     want_forms='R_X86_64_REX_GOTPCRELX q1
