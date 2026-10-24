@@ -1,0 +1,11 @@
+{
+  "scope": "RV64I immediate shift fields only; other families not certified",
+  "repository": "https://github.com/riscv/riscv-isa-manual",
+  "commit": "7a90b34e1a04e57a65bfd9de9a3b4e8dc2c5ddc8",
+  "path": "src/unpriv/rv64.adoc",
+  "sha256": "75457817585331baa49af3ec0b6a1662431294e695dd734a0b3ecfc7f38e1f4d",
+  "sections": [
+    "rv64i-slli",
+    "rv64i-slliw"
+  ]
+}

@@ -9,8 +9,10 @@ per-session document (those live in [`../journal/`](../journal/README.md)).
 
 | File | Scope |
 |------|-------|
+| [`instruction-audit.md`](instruction-audit.md) | Cross-architecture manual-review boundary, sources and proof procedure |
 | [`cpu-model.md`](cpu-model.md) | x86 tuning rows, decision functions and their consumers, verified policy (mispredict penalty, movbe movsb ERMS, movbe, march resolution), stop-conditions |
 | [`x86-apx-evex.md`](x86-apx-evex.md) | APX/EVEX encoder contract (`-mapx`/`-mapxf` gate, GAS 2.47 oracle, reloc pairing, reject list) |
+| [`riscv.md`](riscv.md) | RV64 assembler shift/rotate immediate fields and range diagnostics |
 | [`i686.md`](i686.md) | 32-bit backend: landed infra (red-teamer, `synth_mul`, div/divrem helpers), fixed defect classes, measured perf-gap ordering (x87↔GP pairs, leaf prologue) |
 | [`optimizer.md`](optimizer.md) | Optimizer tier/cost-model surface, vectorizer/vec-interleave discipline, FP-minmax interpreter rule |
 | [`codegen-x86.md`](codegen-x86.md) | x86-64 codegen pipeline contract |

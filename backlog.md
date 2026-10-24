@@ -692,6 +692,13 @@ win (see the journal follow-up). The historical
 reproducer and staged plan below are retained as the acceptance specification,
 not a claim that all five steps are complete.
 
+The FP promoter now also indexes loop headers instead of rescanning every
+jump prefix. A 40-function measurement saves 4.00% of simulated instructions;
+40/120-function final paired compiler-time medians improve by 1.048×/1.134×. This
+removes another quadratic lookup but does not establish the ≤35% peephole
+criterion. The accompanying audit fixes partial-store and pinned-participant
+rewrites; its evidence is in `engineering/evidence/fp-loop-headers-2026-10-24/`.
+
 **Why (measured on `2070d23f`).** Callgrind, 40-function TU, `-O1`: 961 M
 instructions total, **68 % in `peephole_optimize_inner`**. Inside it:
 

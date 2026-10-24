@@ -1,0 +1,5972 @@
+{
+  "scope": "RV64 assembler acceptance and exact bytes, not runtime",
+  "tools": {
+    "candidate": "/home/user/lccc/target/fastbuild/lccc-riscv",
+    "clang": "/home/user/.cache/oracles/bin/clang-23",
+    "before": "/home/user/artifacts/audit/lccc-riscv-modern-before"
+  },
+  "clang_version": "clang version 23.1.3 (https://github.com/llvm/llvm-project 0d261d1ca552c95a8f007e061c787ac7132fbcbc)",
+  "binary_sha256": {
+    "candidate": "673c03ef502b3521d6d9e7cd156476936c2f709a3ba794b96ad966a4847cd36a",
+    "clang": "913453afb492abab17025139852413ba7fd7a52b4fb75fcce58ff3fe399d0a9e",
+    "before": "0ca1f0bb4baec617fbd248b994ff088fb8105dd48dafba4c6c789879de9f7261"
+  },
+  "valid_byte_matches": 384,
+  "invalid_rejections": 64,
+  "before_invalid_acceptances": 64,
+  "failures": [],
+  "cases": [
+    {
+      "assembly": "slli a0,a1,0",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13950500",
+        "clang": "13950500",
+        "before": "13950500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,1",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13951500",
+        "clang": "13951500",
+        "before": "13951500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,2",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13952500",
+        "clang": "13952500",
+        "before": "13952500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,3",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13953500",
+        "clang": "13953500",
+        "before": "13953500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,4",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13954500",
+        "clang": "13954500",
+        "before": "13954500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,5",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13955500",
+        "clang": "13955500",
+        "before": "13955500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,6",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13956500",
+        "clang": "13956500",
+        "before": "13956500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,7",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13957500",
+        "clang": "13957500",
+        "before": "13957500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,8",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13958500",
+        "clang": "13958500",
+        "before": "13958500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,9",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13959500",
+        "clang": "13959500",
+        "before": "13959500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,10",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395a500",
+        "clang": "1395a500",
+        "before": "1395a500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,11",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395b500",
+        "clang": "1395b500",
+        "before": "1395b500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,12",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395c500",
+        "clang": "1395c500",
+        "before": "1395c500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,13",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395d500",
+        "clang": "1395d500",
+        "before": "1395d500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,14",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395e500",
+        "clang": "1395e500",
+        "before": "1395e500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,15",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395f500",
+        "clang": "1395f500",
+        "before": "1395f500"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,16",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13950501",
+        "clang": "13950501",
+        "before": "13950501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,17",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13951501",
+        "clang": "13951501",
+        "before": "13951501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,18",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13952501",
+        "clang": "13952501",
+        "before": "13952501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,19",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13953501",
+        "clang": "13953501",
+        "before": "13953501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,20",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13954501",
+        "clang": "13954501",
+        "before": "13954501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,21",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13955501",
+        "clang": "13955501",
+        "before": "13955501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,22",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13956501",
+        "clang": "13956501",
+        "before": "13956501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,23",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13957501",
+        "clang": "13957501",
+        "before": "13957501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,24",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13958501",
+        "clang": "13958501",
+        "before": "13958501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,25",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13959501",
+        "clang": "13959501",
+        "before": "13959501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,26",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395a501",
+        "clang": "1395a501",
+        "before": "1395a501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,27",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395b501",
+        "clang": "1395b501",
+        "before": "1395b501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,28",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395c501",
+        "clang": "1395c501",
+        "before": "1395c501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,29",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395d501",
+        "clang": "1395d501",
+        "before": "1395d501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,30",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395e501",
+        "clang": "1395e501",
+        "before": "1395e501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,31",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395f501",
+        "clang": "1395f501",
+        "before": "1395f501"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,32",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13950502",
+        "clang": "13950502",
+        "before": "13950502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,33",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13951502",
+        "clang": "13951502",
+        "before": "13951502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,34",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13952502",
+        "clang": "13952502",
+        "before": "13952502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,35",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13953502",
+        "clang": "13953502",
+        "before": "13953502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,36",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13954502",
+        "clang": "13954502",
+        "before": "13954502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,37",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13955502",
+        "clang": "13955502",
+        "before": "13955502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,38",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13956502",
+        "clang": "13956502",
+        "before": "13956502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,39",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13957502",
+        "clang": "13957502",
+        "before": "13957502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,40",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13958502",
+        "clang": "13958502",
+        "before": "13958502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,41",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13959502",
+        "clang": "13959502",
+        "before": "13959502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,42",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395a502",
+        "clang": "1395a502",
+        "before": "1395a502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,43",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395b502",
+        "clang": "1395b502",
+        "before": "1395b502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,44",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395c502",
+        "clang": "1395c502",
+        "before": "1395c502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,45",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395d502",
+        "clang": "1395d502",
+        "before": "1395d502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,46",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395e502",
+        "clang": "1395e502",
+        "before": "1395e502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,47",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395f502",
+        "clang": "1395f502",
+        "before": "1395f502"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,48",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13950503",
+        "clang": "13950503",
+        "before": "13950503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,49",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13951503",
+        "clang": "13951503",
+        "before": "13951503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,50",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13952503",
+        "clang": "13952503",
+        "before": "13952503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,51",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13953503",
+        "clang": "13953503",
+        "before": "13953503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,52",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13954503",
+        "clang": "13954503",
+        "before": "13954503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,53",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13955503",
+        "clang": "13955503",
+        "before": "13955503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,54",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13956503",
+        "clang": "13956503",
+        "before": "13956503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,55",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13957503",
+        "clang": "13957503",
+        "before": "13957503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,56",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13958503",
+        "clang": "13958503",
+        "before": "13958503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,57",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13959503",
+        "clang": "13959503",
+        "before": "13959503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,58",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395a503",
+        "clang": "1395a503",
+        "before": "1395a503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,59",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395b503",
+        "clang": "1395b503",
+        "before": "1395b503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,60",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395c503",
+        "clang": "1395c503",
+        "before": "1395c503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,61",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395d503",
+        "clang": "1395d503",
+        "before": "1395d503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,62",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395e503",
+        "clang": "1395e503",
+        "before": "1395e503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,63",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1395f503",
+        "clang": "1395f503",
+        "before": "1395f503"
+      }
+    },
+    {
+      "assembly": "slli a0,a1,-9223372036854775808",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slli a0,a1,-4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slli a0,a1,-65",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slli a0,a1,-1",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slli a0,a1,64",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slli a0,a1,65",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slli a0,a1,4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slli a0,a1,9223372036854775807",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srli a0,a1,0",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d50500",
+        "clang": "13d50500",
+        "before": "13d50500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,1",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d51500",
+        "clang": "13d51500",
+        "before": "13d51500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,2",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d52500",
+        "clang": "13d52500",
+        "before": "13d52500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,3",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d53500",
+        "clang": "13d53500",
+        "before": "13d53500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,4",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d54500",
+        "clang": "13d54500",
+        "before": "13d54500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,5",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d55500",
+        "clang": "13d55500",
+        "before": "13d55500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,6",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d56500",
+        "clang": "13d56500",
+        "before": "13d56500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,7",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d57500",
+        "clang": "13d57500",
+        "before": "13d57500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,8",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d58500",
+        "clang": "13d58500",
+        "before": "13d58500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,9",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d59500",
+        "clang": "13d59500",
+        "before": "13d59500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,10",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5a500",
+        "clang": "13d5a500",
+        "before": "13d5a500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,11",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5b500",
+        "clang": "13d5b500",
+        "before": "13d5b500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,12",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5c500",
+        "clang": "13d5c500",
+        "before": "13d5c500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,13",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5d500",
+        "clang": "13d5d500",
+        "before": "13d5d500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,14",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5e500",
+        "clang": "13d5e500",
+        "before": "13d5e500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,15",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5f500",
+        "clang": "13d5f500",
+        "before": "13d5f500"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,16",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d50501",
+        "clang": "13d50501",
+        "before": "13d50501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,17",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d51501",
+        "clang": "13d51501",
+        "before": "13d51501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,18",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d52501",
+        "clang": "13d52501",
+        "before": "13d52501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,19",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d53501",
+        "clang": "13d53501",
+        "before": "13d53501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,20",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d54501",
+        "clang": "13d54501",
+        "before": "13d54501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,21",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d55501",
+        "clang": "13d55501",
+        "before": "13d55501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,22",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d56501",
+        "clang": "13d56501",
+        "before": "13d56501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,23",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d57501",
+        "clang": "13d57501",
+        "before": "13d57501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,24",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d58501",
+        "clang": "13d58501",
+        "before": "13d58501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,25",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d59501",
+        "clang": "13d59501",
+        "before": "13d59501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,26",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5a501",
+        "clang": "13d5a501",
+        "before": "13d5a501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,27",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5b501",
+        "clang": "13d5b501",
+        "before": "13d5b501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,28",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5c501",
+        "clang": "13d5c501",
+        "before": "13d5c501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,29",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5d501",
+        "clang": "13d5d501",
+        "before": "13d5d501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,30",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5e501",
+        "clang": "13d5e501",
+        "before": "13d5e501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,31",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5f501",
+        "clang": "13d5f501",
+        "before": "13d5f501"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,32",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d50502",
+        "clang": "13d50502",
+        "before": "13d50502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,33",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d51502",
+        "clang": "13d51502",
+        "before": "13d51502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,34",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d52502",
+        "clang": "13d52502",
+        "before": "13d52502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,35",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d53502",
+        "clang": "13d53502",
+        "before": "13d53502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,36",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d54502",
+        "clang": "13d54502",
+        "before": "13d54502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,37",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d55502",
+        "clang": "13d55502",
+        "before": "13d55502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,38",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d56502",
+        "clang": "13d56502",
+        "before": "13d56502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,39",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d57502",
+        "clang": "13d57502",
+        "before": "13d57502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,40",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d58502",
+        "clang": "13d58502",
+        "before": "13d58502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,41",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d59502",
+        "clang": "13d59502",
+        "before": "13d59502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,42",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5a502",
+        "clang": "13d5a502",
+        "before": "13d5a502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,43",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5b502",
+        "clang": "13d5b502",
+        "before": "13d5b502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,44",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5c502",
+        "clang": "13d5c502",
+        "before": "13d5c502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,45",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5d502",
+        "clang": "13d5d502",
+        "before": "13d5d502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,46",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5e502",
+        "clang": "13d5e502",
+        "before": "13d5e502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,47",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5f502",
+        "clang": "13d5f502",
+        "before": "13d5f502"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,48",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d50503",
+        "clang": "13d50503",
+        "before": "13d50503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,49",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d51503",
+        "clang": "13d51503",
+        "before": "13d51503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,50",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d52503",
+        "clang": "13d52503",
+        "before": "13d52503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,51",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d53503",
+        "clang": "13d53503",
+        "before": "13d53503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,52",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d54503",
+        "clang": "13d54503",
+        "before": "13d54503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,53",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d55503",
+        "clang": "13d55503",
+        "before": "13d55503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,54",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d56503",
+        "clang": "13d56503",
+        "before": "13d56503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,55",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d57503",
+        "clang": "13d57503",
+        "before": "13d57503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,56",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d58503",
+        "clang": "13d58503",
+        "before": "13d58503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,57",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d59503",
+        "clang": "13d59503",
+        "before": "13d59503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,58",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5a503",
+        "clang": "13d5a503",
+        "before": "13d5a503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,59",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5b503",
+        "clang": "13d5b503",
+        "before": "13d5b503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,60",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5c503",
+        "clang": "13d5c503",
+        "before": "13d5c503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,61",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5d503",
+        "clang": "13d5d503",
+        "before": "13d5d503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,62",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5e503",
+        "clang": "13d5e503",
+        "before": "13d5e503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,63",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5f503",
+        "clang": "13d5f503",
+        "before": "13d5f503"
+      }
+    },
+    {
+      "assembly": "srli a0,a1,-9223372036854775808",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srli a0,a1,-4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srli a0,a1,-65",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srli a0,a1,-1",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srli a0,a1,64",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srli a0,a1,65",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srli a0,a1,4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srli a0,a1,9223372036854775807",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srai a0,a1,0",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d50540",
+        "clang": "13d50540",
+        "before": "13d50540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,1",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d51540",
+        "clang": "13d51540",
+        "before": "13d51540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,2",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d52540",
+        "clang": "13d52540",
+        "before": "13d52540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,3",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d53540",
+        "clang": "13d53540",
+        "before": "13d53540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,4",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d54540",
+        "clang": "13d54540",
+        "before": "13d54540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,5",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d55540",
+        "clang": "13d55540",
+        "before": "13d55540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,6",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d56540",
+        "clang": "13d56540",
+        "before": "13d56540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,7",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d57540",
+        "clang": "13d57540",
+        "before": "13d57540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,8",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d58540",
+        "clang": "13d58540",
+        "before": "13d58540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,9",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d59540",
+        "clang": "13d59540",
+        "before": "13d59540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,10",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5a540",
+        "clang": "13d5a540",
+        "before": "13d5a540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,11",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5b540",
+        "clang": "13d5b540",
+        "before": "13d5b540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,12",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5c540",
+        "clang": "13d5c540",
+        "before": "13d5c540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,13",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5d540",
+        "clang": "13d5d540",
+        "before": "13d5d540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,14",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5e540",
+        "clang": "13d5e540",
+        "before": "13d5e540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,15",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5f540",
+        "clang": "13d5f540",
+        "before": "13d5f540"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,16",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d50541",
+        "clang": "13d50541",
+        "before": "13d50541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,17",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d51541",
+        "clang": "13d51541",
+        "before": "13d51541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,18",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d52541",
+        "clang": "13d52541",
+        "before": "13d52541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,19",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d53541",
+        "clang": "13d53541",
+        "before": "13d53541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,20",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d54541",
+        "clang": "13d54541",
+        "before": "13d54541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,21",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d55541",
+        "clang": "13d55541",
+        "before": "13d55541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,22",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d56541",
+        "clang": "13d56541",
+        "before": "13d56541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,23",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d57541",
+        "clang": "13d57541",
+        "before": "13d57541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,24",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d58541",
+        "clang": "13d58541",
+        "before": "13d58541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,25",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d59541",
+        "clang": "13d59541",
+        "before": "13d59541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,26",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5a541",
+        "clang": "13d5a541",
+        "before": "13d5a541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,27",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5b541",
+        "clang": "13d5b541",
+        "before": "13d5b541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,28",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5c541",
+        "clang": "13d5c541",
+        "before": "13d5c541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,29",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5d541",
+        "clang": "13d5d541",
+        "before": "13d5d541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,30",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5e541",
+        "clang": "13d5e541",
+        "before": "13d5e541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,31",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5f541",
+        "clang": "13d5f541",
+        "before": "13d5f541"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,32",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d50542",
+        "clang": "13d50542",
+        "before": "13d50542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,33",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d51542",
+        "clang": "13d51542",
+        "before": "13d51542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,34",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d52542",
+        "clang": "13d52542",
+        "before": "13d52542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,35",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d53542",
+        "clang": "13d53542",
+        "before": "13d53542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,36",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d54542",
+        "clang": "13d54542",
+        "before": "13d54542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,37",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d55542",
+        "clang": "13d55542",
+        "before": "13d55542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,38",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d56542",
+        "clang": "13d56542",
+        "before": "13d56542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,39",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d57542",
+        "clang": "13d57542",
+        "before": "13d57542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,40",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d58542",
+        "clang": "13d58542",
+        "before": "13d58542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,41",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d59542",
+        "clang": "13d59542",
+        "before": "13d59542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,42",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5a542",
+        "clang": "13d5a542",
+        "before": "13d5a542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,43",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5b542",
+        "clang": "13d5b542",
+        "before": "13d5b542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,44",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5c542",
+        "clang": "13d5c542",
+        "before": "13d5c542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,45",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5d542",
+        "clang": "13d5d542",
+        "before": "13d5d542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,46",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5e542",
+        "clang": "13d5e542",
+        "before": "13d5e542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,47",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5f542",
+        "clang": "13d5f542",
+        "before": "13d5f542"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,48",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d50543",
+        "clang": "13d50543",
+        "before": "13d50543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,49",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d51543",
+        "clang": "13d51543",
+        "before": "13d51543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,50",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d52543",
+        "clang": "13d52543",
+        "before": "13d52543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,51",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d53543",
+        "clang": "13d53543",
+        "before": "13d53543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,52",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d54543",
+        "clang": "13d54543",
+        "before": "13d54543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,53",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d55543",
+        "clang": "13d55543",
+        "before": "13d55543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,54",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d56543",
+        "clang": "13d56543",
+        "before": "13d56543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,55",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d57543",
+        "clang": "13d57543",
+        "before": "13d57543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,56",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d58543",
+        "clang": "13d58543",
+        "before": "13d58543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,57",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d59543",
+        "clang": "13d59543",
+        "before": "13d59543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,58",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5a543",
+        "clang": "13d5a543",
+        "before": "13d5a543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,59",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5b543",
+        "clang": "13d5b543",
+        "before": "13d5b543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,60",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5c543",
+        "clang": "13d5c543",
+        "before": "13d5c543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,61",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5d543",
+        "clang": "13d5d543",
+        "before": "13d5d543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,62",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5e543",
+        "clang": "13d5e543",
+        "before": "13d5e543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,63",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5f543",
+        "clang": "13d5f543",
+        "before": "13d5f543"
+      }
+    },
+    {
+      "assembly": "srai a0,a1,-9223372036854775808",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srai a0,a1,-4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srai a0,a1,-65",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srai a0,a1,-1",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srai a0,a1,64",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srai a0,a1,65",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srai a0,a1,4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srai a0,a1,9223372036854775807",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "rori a0,a1,0",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d50560",
+        "clang": "13d50560",
+        "before": "13d50560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,1",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d51560",
+        "clang": "13d51560",
+        "before": "13d51560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,2",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d52560",
+        "clang": "13d52560",
+        "before": "13d52560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,3",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d53560",
+        "clang": "13d53560",
+        "before": "13d53560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,4",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d54560",
+        "clang": "13d54560",
+        "before": "13d54560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,5",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d55560",
+        "clang": "13d55560",
+        "before": "13d55560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,6",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d56560",
+        "clang": "13d56560",
+        "before": "13d56560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,7",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d57560",
+        "clang": "13d57560",
+        "before": "13d57560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,8",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d58560",
+        "clang": "13d58560",
+        "before": "13d58560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,9",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d59560",
+        "clang": "13d59560",
+        "before": "13d59560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,10",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5a560",
+        "clang": "13d5a560",
+        "before": "13d5a560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,11",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5b560",
+        "clang": "13d5b560",
+        "before": "13d5b560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,12",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5c560",
+        "clang": "13d5c560",
+        "before": "13d5c560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,13",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5d560",
+        "clang": "13d5d560",
+        "before": "13d5d560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,14",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5e560",
+        "clang": "13d5e560",
+        "before": "13d5e560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,15",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5f560",
+        "clang": "13d5f560",
+        "before": "13d5f560"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,16",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d50561",
+        "clang": "13d50561",
+        "before": "13d50561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,17",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d51561",
+        "clang": "13d51561",
+        "before": "13d51561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,18",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d52561",
+        "clang": "13d52561",
+        "before": "13d52561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,19",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d53561",
+        "clang": "13d53561",
+        "before": "13d53561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,20",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d54561",
+        "clang": "13d54561",
+        "before": "13d54561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,21",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d55561",
+        "clang": "13d55561",
+        "before": "13d55561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,22",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d56561",
+        "clang": "13d56561",
+        "before": "13d56561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,23",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d57561",
+        "clang": "13d57561",
+        "before": "13d57561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,24",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d58561",
+        "clang": "13d58561",
+        "before": "13d58561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,25",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d59561",
+        "clang": "13d59561",
+        "before": "13d59561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,26",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5a561",
+        "clang": "13d5a561",
+        "before": "13d5a561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,27",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5b561",
+        "clang": "13d5b561",
+        "before": "13d5b561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,28",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5c561",
+        "clang": "13d5c561",
+        "before": "13d5c561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,29",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5d561",
+        "clang": "13d5d561",
+        "before": "13d5d561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,30",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5e561",
+        "clang": "13d5e561",
+        "before": "13d5e561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,31",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5f561",
+        "clang": "13d5f561",
+        "before": "13d5f561"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,32",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d50562",
+        "clang": "13d50562",
+        "before": "13d50562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,33",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d51562",
+        "clang": "13d51562",
+        "before": "13d51562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,34",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d52562",
+        "clang": "13d52562",
+        "before": "13d52562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,35",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d53562",
+        "clang": "13d53562",
+        "before": "13d53562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,36",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d54562",
+        "clang": "13d54562",
+        "before": "13d54562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,37",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d55562",
+        "clang": "13d55562",
+        "before": "13d55562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,38",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d56562",
+        "clang": "13d56562",
+        "before": "13d56562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,39",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d57562",
+        "clang": "13d57562",
+        "before": "13d57562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,40",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d58562",
+        "clang": "13d58562",
+        "before": "13d58562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,41",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d59562",
+        "clang": "13d59562",
+        "before": "13d59562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,42",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5a562",
+        "clang": "13d5a562",
+        "before": "13d5a562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,43",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5b562",
+        "clang": "13d5b562",
+        "before": "13d5b562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,44",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5c562",
+        "clang": "13d5c562",
+        "before": "13d5c562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,45",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5d562",
+        "clang": "13d5d562",
+        "before": "13d5d562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,46",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5e562",
+        "clang": "13d5e562",
+        "before": "13d5e562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,47",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5f562",
+        "clang": "13d5f562",
+        "before": "13d5f562"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,48",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d50563",
+        "clang": "13d50563",
+        "before": "13d50563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,49",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d51563",
+        "clang": "13d51563",
+        "before": "13d51563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,50",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d52563",
+        "clang": "13d52563",
+        "before": "13d52563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,51",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d53563",
+        "clang": "13d53563",
+        "before": "13d53563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,52",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d54563",
+        "clang": "13d54563",
+        "before": "13d54563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,53",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d55563",
+        "clang": "13d55563",
+        "before": "13d55563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,54",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d56563",
+        "clang": "13d56563",
+        "before": "13d56563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,55",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d57563",
+        "clang": "13d57563",
+        "before": "13d57563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,56",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d58563",
+        "clang": "13d58563",
+        "before": "13d58563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,57",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d59563",
+        "clang": "13d59563",
+        "before": "13d59563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,58",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5a563",
+        "clang": "13d5a563",
+        "before": "13d5a563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,59",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5b563",
+        "clang": "13d5b563",
+        "before": "13d5b563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,60",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5c563",
+        "clang": "13d5c563",
+        "before": "13d5c563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,61",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5d563",
+        "clang": "13d5d563",
+        "before": "13d5d563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,62",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5e563",
+        "clang": "13d5e563",
+        "before": "13d5e563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,63",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "13d5f563",
+        "clang": "13d5f563",
+        "before": "13d5f563"
+      }
+    },
+    {
+      "assembly": "rori a0,a1,-9223372036854775808",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "rori a0,a1,-4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "rori a0,a1,-65",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "rori a0,a1,-1",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "rori a0,a1,64",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "rori a0,a1,65",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "rori a0,a1,4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "rori a0,a1,9223372036854775807",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,0",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b950500",
+        "clang": "1b950500",
+        "before": "1b950500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,1",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b951500",
+        "clang": "1b951500",
+        "before": "1b951500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,2",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b952500",
+        "clang": "1b952500",
+        "before": "1b952500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,3",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b953500",
+        "clang": "1b953500",
+        "before": "1b953500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,4",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b954500",
+        "clang": "1b954500",
+        "before": "1b954500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,5",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b955500",
+        "clang": "1b955500",
+        "before": "1b955500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,6",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b956500",
+        "clang": "1b956500",
+        "before": "1b956500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,7",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b957500",
+        "clang": "1b957500",
+        "before": "1b957500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,8",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b958500",
+        "clang": "1b958500",
+        "before": "1b958500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,9",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b959500",
+        "clang": "1b959500",
+        "before": "1b959500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,10",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b95a500",
+        "clang": "1b95a500",
+        "before": "1b95a500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,11",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b95b500",
+        "clang": "1b95b500",
+        "before": "1b95b500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,12",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b95c500",
+        "clang": "1b95c500",
+        "before": "1b95c500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,13",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b95d500",
+        "clang": "1b95d500",
+        "before": "1b95d500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,14",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b95e500",
+        "clang": "1b95e500",
+        "before": "1b95e500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,15",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b95f500",
+        "clang": "1b95f500",
+        "before": "1b95f500"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,16",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b950501",
+        "clang": "1b950501",
+        "before": "1b950501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,17",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b951501",
+        "clang": "1b951501",
+        "before": "1b951501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,18",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b952501",
+        "clang": "1b952501",
+        "before": "1b952501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,19",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b953501",
+        "clang": "1b953501",
+        "before": "1b953501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,20",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b954501",
+        "clang": "1b954501",
+        "before": "1b954501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,21",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b955501",
+        "clang": "1b955501",
+        "before": "1b955501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,22",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b956501",
+        "clang": "1b956501",
+        "before": "1b956501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,23",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b957501",
+        "clang": "1b957501",
+        "before": "1b957501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,24",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b958501",
+        "clang": "1b958501",
+        "before": "1b958501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,25",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b959501",
+        "clang": "1b959501",
+        "before": "1b959501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,26",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b95a501",
+        "clang": "1b95a501",
+        "before": "1b95a501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,27",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b95b501",
+        "clang": "1b95b501",
+        "before": "1b95b501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,28",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b95c501",
+        "clang": "1b95c501",
+        "before": "1b95c501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,29",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b95d501",
+        "clang": "1b95d501",
+        "before": "1b95d501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,30",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b95e501",
+        "clang": "1b95e501",
+        "before": "1b95e501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,31",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1b95f501",
+        "clang": "1b95f501",
+        "before": "1b95f501"
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,-9223372036854775808",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,-4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,-65",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,-1",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,32",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,33",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "slliw a0,a1,9223372036854775807",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,0",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd50500",
+        "clang": "1bd50500",
+        "before": "1bd50500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,1",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd51500",
+        "clang": "1bd51500",
+        "before": "1bd51500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,2",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd52500",
+        "clang": "1bd52500",
+        "before": "1bd52500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,3",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd53500",
+        "clang": "1bd53500",
+        "before": "1bd53500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,4",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd54500",
+        "clang": "1bd54500",
+        "before": "1bd54500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,5",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd55500",
+        "clang": "1bd55500",
+        "before": "1bd55500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,6",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd56500",
+        "clang": "1bd56500",
+        "before": "1bd56500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,7",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd57500",
+        "clang": "1bd57500",
+        "before": "1bd57500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,8",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd58500",
+        "clang": "1bd58500",
+        "before": "1bd58500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,9",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd59500",
+        "clang": "1bd59500",
+        "before": "1bd59500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,10",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5a500",
+        "clang": "1bd5a500",
+        "before": "1bd5a500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,11",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5b500",
+        "clang": "1bd5b500",
+        "before": "1bd5b500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,12",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5c500",
+        "clang": "1bd5c500",
+        "before": "1bd5c500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,13",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5d500",
+        "clang": "1bd5d500",
+        "before": "1bd5d500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,14",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5e500",
+        "clang": "1bd5e500",
+        "before": "1bd5e500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,15",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5f500",
+        "clang": "1bd5f500",
+        "before": "1bd5f500"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,16",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd50501",
+        "clang": "1bd50501",
+        "before": "1bd50501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,17",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd51501",
+        "clang": "1bd51501",
+        "before": "1bd51501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,18",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd52501",
+        "clang": "1bd52501",
+        "before": "1bd52501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,19",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd53501",
+        "clang": "1bd53501",
+        "before": "1bd53501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,20",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd54501",
+        "clang": "1bd54501",
+        "before": "1bd54501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,21",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd55501",
+        "clang": "1bd55501",
+        "before": "1bd55501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,22",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd56501",
+        "clang": "1bd56501",
+        "before": "1bd56501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,23",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd57501",
+        "clang": "1bd57501",
+        "before": "1bd57501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,24",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd58501",
+        "clang": "1bd58501",
+        "before": "1bd58501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,25",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd59501",
+        "clang": "1bd59501",
+        "before": "1bd59501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,26",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5a501",
+        "clang": "1bd5a501",
+        "before": "1bd5a501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,27",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5b501",
+        "clang": "1bd5b501",
+        "before": "1bd5b501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,28",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5c501",
+        "clang": "1bd5c501",
+        "before": "1bd5c501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,29",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5d501",
+        "clang": "1bd5d501",
+        "before": "1bd5d501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,30",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5e501",
+        "clang": "1bd5e501",
+        "before": "1bd5e501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,31",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5f501",
+        "clang": "1bd5f501",
+        "before": "1bd5f501"
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,-9223372036854775808",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,-4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,-65",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,-1",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,32",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,33",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "srliw a0,a1,9223372036854775807",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,0",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd50540",
+        "clang": "1bd50540",
+        "before": "1bd50540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,1",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd51540",
+        "clang": "1bd51540",
+        "before": "1bd51540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,2",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd52540",
+        "clang": "1bd52540",
+        "before": "1bd52540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,3",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd53540",
+        "clang": "1bd53540",
+        "before": "1bd53540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,4",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd54540",
+        "clang": "1bd54540",
+        "before": "1bd54540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,5",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd55540",
+        "clang": "1bd55540",
+        "before": "1bd55540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,6",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd56540",
+        "clang": "1bd56540",
+        "before": "1bd56540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,7",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd57540",
+        "clang": "1bd57540",
+        "before": "1bd57540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,8",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd58540",
+        "clang": "1bd58540",
+        "before": "1bd58540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,9",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd59540",
+        "clang": "1bd59540",
+        "before": "1bd59540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,10",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5a540",
+        "clang": "1bd5a540",
+        "before": "1bd5a540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,11",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5b540",
+        "clang": "1bd5b540",
+        "before": "1bd5b540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,12",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5c540",
+        "clang": "1bd5c540",
+        "before": "1bd5c540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,13",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5d540",
+        "clang": "1bd5d540",
+        "before": "1bd5d540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,14",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5e540",
+        "clang": "1bd5e540",
+        "before": "1bd5e540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,15",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5f540",
+        "clang": "1bd5f540",
+        "before": "1bd5f540"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,16",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd50541",
+        "clang": "1bd50541",
+        "before": "1bd50541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,17",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd51541",
+        "clang": "1bd51541",
+        "before": "1bd51541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,18",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd52541",
+        "clang": "1bd52541",
+        "before": "1bd52541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,19",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd53541",
+        "clang": "1bd53541",
+        "before": "1bd53541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,20",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd54541",
+        "clang": "1bd54541",
+        "before": "1bd54541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,21",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd55541",
+        "clang": "1bd55541",
+        "before": "1bd55541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,22",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd56541",
+        "clang": "1bd56541",
+        "before": "1bd56541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,23",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd57541",
+        "clang": "1bd57541",
+        "before": "1bd57541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,24",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd58541",
+        "clang": "1bd58541",
+        "before": "1bd58541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,25",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd59541",
+        "clang": "1bd59541",
+        "before": "1bd59541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,26",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5a541",
+        "clang": "1bd5a541",
+        "before": "1bd5a541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,27",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5b541",
+        "clang": "1bd5b541",
+        "before": "1bd5b541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,28",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5c541",
+        "clang": "1bd5c541",
+        "before": "1bd5c541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,29",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5d541",
+        "clang": "1bd5d541",
+        "before": "1bd5d541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,30",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5e541",
+        "clang": "1bd5e541",
+        "before": "1bd5e541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,31",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5f541",
+        "clang": "1bd5f541",
+        "before": "1bd5f541"
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,-9223372036854775808",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,-4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,-65",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,-1",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,32",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,33",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "sraiw a0,a1,9223372036854775807",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,0",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd50560",
+        "clang": "1bd50560",
+        "before": "1bd50560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,1",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd51560",
+        "clang": "1bd51560",
+        "before": "1bd51560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,2",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd52560",
+        "clang": "1bd52560",
+        "before": "1bd52560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,3",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd53560",
+        "clang": "1bd53560",
+        "before": "1bd53560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,4",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd54560",
+        "clang": "1bd54560",
+        "before": "1bd54560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,5",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd55560",
+        "clang": "1bd55560",
+        "before": "1bd55560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,6",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd56560",
+        "clang": "1bd56560",
+        "before": "1bd56560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,7",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd57560",
+        "clang": "1bd57560",
+        "before": "1bd57560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,8",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd58560",
+        "clang": "1bd58560",
+        "before": "1bd58560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,9",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd59560",
+        "clang": "1bd59560",
+        "before": "1bd59560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,10",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5a560",
+        "clang": "1bd5a560",
+        "before": "1bd5a560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,11",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5b560",
+        "clang": "1bd5b560",
+        "before": "1bd5b560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,12",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5c560",
+        "clang": "1bd5c560",
+        "before": "1bd5c560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,13",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5d560",
+        "clang": "1bd5d560",
+        "before": "1bd5d560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,14",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5e560",
+        "clang": "1bd5e560",
+        "before": "1bd5e560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,15",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5f560",
+        "clang": "1bd5f560",
+        "before": "1bd5f560"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,16",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd50561",
+        "clang": "1bd50561",
+        "before": "1bd50561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,17",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd51561",
+        "clang": "1bd51561",
+        "before": "1bd51561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,18",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd52561",
+        "clang": "1bd52561",
+        "before": "1bd52561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,19",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd53561",
+        "clang": "1bd53561",
+        "before": "1bd53561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,20",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd54561",
+        "clang": "1bd54561",
+        "before": "1bd54561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,21",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd55561",
+        "clang": "1bd55561",
+        "before": "1bd55561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,22",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd56561",
+        "clang": "1bd56561",
+        "before": "1bd56561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,23",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd57561",
+        "clang": "1bd57561",
+        "before": "1bd57561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,24",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd58561",
+        "clang": "1bd58561",
+        "before": "1bd58561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,25",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd59561",
+        "clang": "1bd59561",
+        "before": "1bd59561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,26",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5a561",
+        "clang": "1bd5a561",
+        "before": "1bd5a561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,27",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5b561",
+        "clang": "1bd5b561",
+        "before": "1bd5b561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,28",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5c561",
+        "clang": "1bd5c561",
+        "before": "1bd5c561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,29",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5d561",
+        "clang": "1bd5d561",
+        "before": "1bd5d561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,30",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5e561",
+        "clang": "1bd5e561",
+        "before": "1bd5e561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,31",
+      "valid": true,
+      "exit_codes": {
+        "candidate": 0,
+        "clang": 0,
+        "before": 0
+      },
+      "text_hex": {
+        "candidate": "1bd5f561",
+        "clang": "1bd5f561",
+        "before": "1bd5f561"
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,-9223372036854775808",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,-4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,-65",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,-1",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,32",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,33",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,4294967296",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    },
+    {
+      "assembly": "roriw a0,a1,9223372036854775807",
+      "valid": false,
+      "exit_codes": {
+        "candidate": 1,
+        "clang": 1,
+        "before": 0
+      }
+    }
+  ]
+}

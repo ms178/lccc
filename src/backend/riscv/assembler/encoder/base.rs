@@ -325,6 +325,20 @@ pub(crate) fn encode_alu_imm(operands: &[Operand], funct3: u32) -> Result<Encode
     }
 }
 
+// Register shifts mask the count, but an assembly immediate must fit the
+// instruction's shamt field. Check the signed value before any narrowing;
+// casting first would accept negative and large counts after truncation.
+fn checked_shift_amount(operands: &[Operand], bits: u32) -> Result<u32, String> {
+    let shamt = get_imm(operands, 2)?;
+    let maximum = (1i64 << bits) - 1;
+    if !(0..=maximum).contains(&shamt) {
+        return Err(format!(
+            "shift amount {shamt} out of range (expected 0..{maximum})"
+        ));
+    }
+    Ok(shamt as u32)
+}
+
 pub(crate) fn encode_shift_imm(
     operands: &[Operand],
     funct3: u32,
@@ -332,7 +346,7 @@ pub(crate) fn encode_shift_imm(
 ) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
     let rs1 = get_reg(operands, 1)?;
-    let shamt = get_imm(operands, 2)? as u32;
+    let shamt = checked_shift_amount(operands, 6)?;
     // For RV64, shift amount is 6 bits
     let imm = (funct6 << 6) | (shamt & 0x3F);
     Ok(EncodeResult::Word(encode_i(
@@ -373,7 +387,7 @@ pub(crate) fn encode_shift_imm_w(
 ) -> Result<EncodeResult, String> {
     let rd = get_reg(operands, 0)?;
     let rs1 = get_reg(operands, 1)?;
-    let shamt = get_imm(operands, 2)? as u32;
+    let shamt = checked_shift_amount(operands, 5)?;
     // For RV32/W operations, shift amount is 5 bits
     let imm = (funct7 << 5) | (shamt & 0x1F);
     Ok(EncodeResult::Word(encode_i(
@@ -451,4 +465,95 @@ pub(crate) fn encode_zbb_zexth(operands: &[Operand]) -> Result<EncodeResult, Str
     Ok(EncodeResult::Word(encode_r(
         OP_OP_32, rd, 0b100, rs1, 0, 0b0000100,
     )))
+}
+
+#[cfg(test)]
+mod shift_immediate_range_tests {
+    use super::*;
+
+    fn operands(count: i64) -> [Operand; 3] {
+        [
+            Operand::Reg("a0".into()),
+            Operand::Reg("a1".into()),
+            Operand::Imm(count),
+        ]
+    }
+
+    #[test]
+    fn all_valid_shift_and_rotate_immediates_keep_exact_bits() {
+        for (mnemonic, f3, upper, bits, opcode) in [
+            ("slli", 1, 0, 6, 0x13),
+            ("srli", 5, 0, 6, 0x13),
+            ("srai", 5, 0b010000, 6, 0x13),
+            ("rori", 5, 0b011000, 6, 0x13),
+            ("slliw", 1, 0, 5, 0x1b),
+            ("srliw", 5, 0, 5, 0x1b),
+            ("sraiw", 5, 0b0100000, 5, 0x1b),
+            ("roriw", 5, 0b0110000, 5, 0x1b),
+        ] {
+            for count in 0..(1 << bits) {
+                let encoded = encode_instruction(mnemonic, &operands(count), "").unwrap();
+                let EncodeResult::Word(word) = encoded else {
+                    panic!("{encoded:?}")
+                };
+                let imm = ((upper as u32) << bits) | count as u32;
+                let expected = (imm << 20) | (11 << 15) | (f3 << 12) | (10 << 7) | opcode;
+                assert_eq!(word, expected, "{mnemonic} {count}");
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_range_counts_are_not_masked_or_truncated() {
+        for (mnemonic, max) in [
+            ("slli", 63),
+            ("srli", 63),
+            ("srai", 63),
+            ("rori", 63),
+            ("sll", 63),
+            ("srl", 63),
+            ("sra", 63),
+            ("ror", 63),
+            ("slliw", 31),
+            ("srliw", 31),
+            ("sraiw", 31),
+            ("roriw", 31),
+            ("sllw", 31),
+            ("srlw", 31),
+            ("sraw", 31),
+            ("rorw", 31),
+        ] {
+            for count in [
+                i64::MIN,
+                -(1i64 << 32),
+                -65,
+                -1,
+                max + 1,
+                max + 2,
+                1i64 << 32,
+                i64::MAX,
+            ] {
+                let error = encode_instruction(mnemonic, &operands(count), "").expect_err(mnemonic);
+                assert!(
+                    error.contains("shift amount"),
+                    "{mnemonic} {count}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn register_count_shifts_are_not_immediate_range_checked() {
+        let operands = [
+            Operand::Reg("a0".into()),
+            Operand::Reg("a1".into()),
+            Operand::Reg("t0".into()),
+        ];
+        for mnemonic in ["sll", "srl", "sra", "ror", "sllw", "srlw", "sraw", "rorw"] {
+            assert!(matches!(
+                encode_instruction(mnemonic, &operands, "").unwrap(),
+                EncodeResult::Word(_)
+            ));
+        }
+    }
 }
