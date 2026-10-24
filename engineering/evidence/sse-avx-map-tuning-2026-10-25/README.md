@@ -161,3 +161,11 @@ All six measured FP executables and all three measured integer executables
 regenerate byte-identically with the final compiler; gzip assembly is also
 unchanged on all three profiles. The full audit census holds with exactly
 the two documented new ablation names and no other increased ceiling.
+
+The final shared-admission cleanup combines the two identical two-copy
+branches without changing either type's guard or short-circuit ablation
+behavior. Both binaries rebuilt warning-clean, all focused units and native
+gates passed again, and all nine timed ELF images plus gzip assembly remain
+byte-identical. The final compiler's separate fingerprint is recorded beside
+the original measured-compiler/source identities, not substituted into the
+original timing reports.

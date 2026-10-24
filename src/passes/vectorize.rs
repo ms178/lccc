@@ -29935,23 +29935,18 @@ fn transform_map_vector(
             }
         }
     } else if !neon
-        && matches!(pattern.elem_ty, IrType::I32 | IrType::U32)
-        && matches!(pattern.expr, MapExpr::BinOp(IrBinOp::Mul, _, _))
-        && pattern.expr.unroll_cost() <= 3
-        && !NO_MAP_I32_UNROLL.with(std::cell::Cell::get)
+        && ((matches!(pattern.elem_ty, IrType::I32 | IrType::U32)
+            && matches!(pattern.expr, MapExpr::BinOp(IrBinOp::Mul, _, _))
+            && pattern.expr.unroll_cost() <= 3
+            && !NO_MAP_I32_UNROLL.with(std::cell::Cell::get))
+            || (matches!(pattern.elem_ty, IrType::F32 | IrType::F64)
+                && pattern.expr.small_fp_arithmetic()
+                && !NO_MAP_FP_UNROLL.with(std::cell::Cell::get)))
     {
-        // Two independent products halve loop-control overhead at both
-        // widths. Bound the tree so extra copies cannot amplify a large DAG.
-        // The shared packed_width machinery owns alias guards and tails.
-        2
-    } else if !neon
-        && matches!(pattern.elem_ty, IrType::F32 | IrType::F64)
-        && pattern.expr.small_fp_arithmetic()
-        && !NO_MAP_FP_UNROLL.with(std::cell::Cell::get)
-    {
-        // Independent copies preserve every lane's expression and rounding
-        // order; only loop control is shared. Keep the tree/register budget
-        // small and leave more elaborate FP lowerings at one packed copy.
+        // Two independent copies amortize loop control at both widths. The
+        // type-specific budgets prevent amplification of larger DAGs. Every
+        // FP lane retains its expression/rounding order, and packed_width
+        // continues to own alias guards, byte displacements and scalar tails.
         2
     } else {
         1
