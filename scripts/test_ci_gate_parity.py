@@ -48,6 +48,7 @@ from pathlib import Path
 import importlib
 import tempfile
 import unittest
+from unittest import mock
 
 import check_ci_gate_parity as parity
 
@@ -1360,6 +1361,56 @@ class ReusableInputSemanticsTest(unittest.TestCase):
             " --lccc target/fastbuild/lccc-x86\n")
         self.assertNotIn("scripts/asmdiff.py",
                          parity.run_script_bodies(self.caller()))
+
+
+class OrphanGateDiscoveryTest(unittest.TestCase):
+    """Mutation coverage for the allowlist that cannot grow.
+
+    A brand-new `tests/regression/check_*.sh` that neither mirror executes
+    must fail the audit; allowlisting it is the intended temporary escape, and
+    wiring it into either mirror must then make that entry stale.  Before this
+    test the only coverage was the real tree passing, which a deleted guard
+    would not necessarily break.
+    """
+
+    def setUp(self) -> None:
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.root = Path(self._dir.name)
+        self.reg = self.root / "tests" / "regression"
+        self.reg.mkdir(parents=True)
+        (self.reg / "check_new_gate.sh").write_text("#!/bin/sh\nexit 0\n")
+        self.allow = self.root / "scripts" / "ci_gate_allowlist.txt"
+        self.allow.parent.mkdir(parents=True)
+        self.allow.write_text("")
+
+    def check(self, local: str, hosted: str) -> int:
+        with unittest.mock.patch.object(parity, "ROOT", self.root), \
+             unittest.mock.patch.object(parity, "REGRESSION_DIR", self.reg), \
+             unittest.mock.patch.object(parity, "ALLOWLIST", self.allow), \
+             redirect_stderr(StringIO()):
+            return parity.check_orphaned_gates(local, hosted)
+
+    def test_an_unwired_unallowlisted_gate_fails(self) -> None:
+        self.assertEqual(self.check("bash other.sh", "bash other.sh"), 1)
+
+    def test_an_allowlisted_gate_passes_until_it_is_wired(self) -> None:
+        self.allow.write_text("tests/regression/check_new_gate.sh  # pending wiring\n")
+        self.assertEqual(self.check("bash other.sh", "bash other.sh"), 0)
+        # Wiring it locally makes the entry stale; the allowlist must shrink.
+        self.assertEqual(self.check("bash tests/regression/check_new_gate.sh", ""), 1)
+        self.allow.write_text("")
+        self.assertEqual(self.check("bash tests/regression/check_new_gate.sh", ""), 0)
+
+    def test_hosted_wiring_is_sufficient_coverage(self) -> None:
+        self.assertEqual(self.check("", "bash tests/regression/check_new_gate.sh"), 0)
+
+    def test_the_real_tree_passes(self) -> None:
+        with redirect_stderr(StringIO()):
+            rc = parity.check_orphaned_gates(
+                parity.LOCAL.read_text(), hosted_bodies()
+            )
+        self.assertEqual(rc, 0)
 
 
 if __name__ == "__main__":

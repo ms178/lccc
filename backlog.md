@@ -11,6 +11,18 @@ preserved verbatim at
 [`engineering/archive/ROOT-BACKLOG-2026-10-17.md`](engineering/archive/ROOT-BACKLOG-2026-10-17.md);
 its dated status text must not be read as current without revalidation.
 
+## Sign-test fold red-team closure (2026-10-24)
+
+The previously listed sign-CMOV follow-up is closed on the current PR branch by
+[`engineering/journal/2026-10-24-sign-test-cmov-redteam.md`](engineering/journal/2026-10-24-sign-test-cmov-redteam.md):
+dedicated skip group, exact-flag producer refinement, directly mirrored
+differential gate, i686 branch twin, orphan-gate mutation tests, refreshed lane
+costs and sanitised evidence. Remaining open work is PMU-level runtime
+confirmation and broader scalar min/max/abs lowering; those are not claimed by
+this peephole receipt. Local ICX 2026.2 provisioning is blocked by the sandbox
+egress allowlist, so the hosted authenticated ICX job is the authoritative ICX
+oracle and is wired to this exact fixture.
+
 ## Decision rules
 
 - **Correctness and evidence integrity outrank performance.** Every semantic

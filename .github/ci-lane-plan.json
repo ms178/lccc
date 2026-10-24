@@ -312,7 +312,7 @@
     "backend-contracts-b": {
       "group": "backend-contracts",
       "mode": "shell",
-      "predicted_gate_seconds": 409.03,
+      "predicted_gate_seconds": 411.03,
       "shards": 2,
       "step": "Verify remaining fast local contracts (shard b of 2)",
       "steps": [
@@ -591,6 +591,10 @@
         {
           "measured_s": 47.99,
           "name": "bash tests/regression/check_self_test_after_arith.sh"
+        },
+        {
+          "measured_s": 2.0,
+          "name": "env CCC=target/fastbuild/lccc \\ GCC_SIGN_CMOV=\"${GCC16:-gcc-16}\" CLANG_SIGN_CMOV=\"${CLANG:-clang}\" \\ ICX_SIGN_CMOV=\"${ICX:-}\" LCCC_FASTBUILD_BIN=target/fastbuild/lccc \\ bash tests/regression/check_sign_test_cmov.sh"
         },
         {
           "measured_s": 111.25,
@@ -1390,8 +1394,8 @@
   "provenance": {
     "backend-contracts": {
       "costs": "/tmp/audit/backend_contracts_costs.tsv",
-      "measured_seconds_total": 818.31,
-      "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); iabs-cmp-fold 0.40 s measured fresh by scripts/ci_gate_costs.py --only iabs_cmp"
+      "measured_seconds_total": 820.31,
+      "source": "measured: scripts/ci_gate_costs.py (previous plan measured_s); iabs-cmp-fold 0.40 s measured fresh by scripts/ci_gate_costs.py --only iabs_cmp; arithmetic-test-sign-cmov 2 s measured fresh by scripts/ci_local.sh --only arithmetic-test-sign-cmov (2026-10-24)"
     },
     "codegen": {
       "costs": "/home/user/.cache/tmp/codegen.tsv",

@@ -27,17 +27,8 @@ set -euo pipefail
 
 CCC=${CCC:-./target/release/lccc}
 GCC=${GCC:-gcc}
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-run_sign_cmov() {
-    CCC="$CCC" GCC="${GCC_SIGN_CMOV:-gcc-16}" CLANG="${CLANG:-clang}" ICX="${ICX:-}" \
-        bash "$SCRIPT_DIR/check_sign_test_cmov.sh"
-}
-if [[ "${1:-}" == "--sign-cmov-only" ]]; then
-    run_sign_cmov
-    exit $?
-fi
 if [[ $# -gt 0 ]]; then
-    echo "usage: $0 [--sign-cmov-only]" >&2
+    echo "usage: $0" >&2
     exit 2
 fi
 command -v "$GCC" >/dev/null 2>&1 || { echo "SKIP: no $GCC on PATH"; exit 0; }
@@ -227,6 +218,5 @@ for opt in -O0 -O1 -O2 -O3; do
 done
 echo "PASS runtime: lccc -O0/-O1/-O2/-O3 agree with gcc -O2 ($ref)"
 
-# This existing hosted gate also carries the sign-only CMOV regression, so the
-# local gate remains covered by the unchanged workflow contract.
-run_sign_cmov
+# The sign-only CMOV regression is a separate, directly wired gate
+# (`check_sign_test_cmov.sh`); this gate owns the ZF-only counter-loop fold.

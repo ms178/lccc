@@ -10,17 +10,19 @@ zero-initializer copy.
 
 ## Oracle results
 
-- The sign-CMOV section of `tests/regression/check_self_test_after_arith.sh`
-  passed with the local, exact compilers: GCC 16.2.0, Clang 23.1.3, and ICX
-  2026.2.0. The standalone helper is
-  `tests/regression/check_sign_test_cmov.sh`; the existing hosted entry point
-  invokes it by default, while the local `arithmetic-test-sign-cmov` gate
-  selects it with `--sign-cmov-only`. At each of `-O0`,
-  `-O1`, `-O2`, `-O3`, and `-Os`, the runtime fixture includes
-  `INT_MIN`/`INT_MAX` combinations under `-fwrapv`; all outputs and statuses
-  matched. The strict-positive `> 0` control retains `test` and its
-  original condition. `CCC_PEEPHOLE_SKIP=self_test` is the mutation/sensitivity
-  control and restores the `test` in the candidate assembly.
+- The standalone gate `tests/regression/check_sign_test_cmov.sh` is wired
+  **directly** into `scripts/ci_local.sh` and the hosted `backend-contracts-b`
+  job; it is no longer reached through a wrapper option or parked in the orphan
+  allowlist. It passed with the local exact compilers GCC 16.2.0 and Clang
+  23.1.3, and with the hosted authenticated ICX 2026.2 snapshot in the dedicated
+  `icx-oracle` job. At each of `-O0`, `-O1`, `-O2`, `-O3`, and `-Os`, the
+  runtime fixture includes `INT_MIN`/`INT_MAX` combinations under `-fwrapv`;
+  all outputs and statuses matched. The strict-positive `> 0` control retains
+  `test` and its original condition. `CCC_PEEPHOLE_SKIP=sign_test_cmov` is the
+  dedicated mutation control; the old `self_test` spelling did **not** disable
+  this pass and was corrected during the 2026-10-24 red-team audit. The gate
+  also exercises the i686 branch-fold twin under `-m32` with its own
+  `CCC_NO_I686_SIGN_JCC` kill switch.
 - `scripts/godbolt.py compare` ran for `nonnegative_difference`, `-O2 -fwrapv`,
   with GCC 16.2, the Clang channel, and local ICX 2026.2. The recorded channel
   resolved Clang to **23.1.0**, not the requested 23.1.3; treat that row only as

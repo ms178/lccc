@@ -25,8 +25,8 @@
     {
       "key": "clang",
       "id": "cclang2310",
-      "name": "x86-64 clang 23.1.0",
-      "semver": "23.1.0",
+      "name": "x86-64 clang 23.1.3 (local differential; CE channel row was 23.1.0)",
+      "semver": "23.1.3",
       "compilerType": "clang",
       "flags": "-O2 -fwrapv",
       "instructions": 5
@@ -34,10 +34,9 @@
     {
       "key": "icx2026.2",
       "id": "icx2026.2",
-      "name": "Intel oneAPI DPC++/C++ 2026.2.x (local)",
+      "name": "Intel oneAPI DPC++/C++ 2026.2.x (hosted authenticated snapshot)",
       "semver": "2026.2.0",
       "compilerType": "local-icx",
-      "binary": "/home/user/.cache/intel-icx-2026.2/opt/intel/oneapi/compiler/2026.2/bin/icx",
       "binary_sha256": "59eaaf55744c7290fb870cd12049ec11877b5224e333cba33270b433bdb73213",
       "probe": "__INTEL_LLVM_COMPILER=20260200",
       "target": "x86_64",
@@ -94,7 +93,15 @@
         "binary_sha256": "59eaaf55744c7290fb870cd12049ec11877b5224e333cba33270b433bdb73213"
       },
       "flags": "-O2 -fwrapv",
-      "instructions": 5
+      "instructions": 5,
+      "binary_basename": "opt/intel/oneapi/compiler/2026.2/bin/icx",
+      "artifact": "intel-icx-provenance-<github.sha> (hosted icx-oracle job)",
+      "note": "Local sandbox provisioning is blocked by egress policy; the hosted job runs this exact fixture and the full differential gate."
     }
+  ],
+  "notes": [
+    "The 2026-10-24 red-team pass wired the helper directly into both CI mirrors.",
+    "ICX coverage is hosted; the absolute local binary path was removed from this manifest.",
+    "Source digest is unchanged; see engineering/journal/2026-10-24-sign-test-cmov-redteam.md."
   ]
 }
