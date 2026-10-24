@@ -251,7 +251,7 @@ done
 ceiling fma_sq 2
 ceiling fma_sq4 4      # DEBT (VEX-128-INT-1 sibling): legacy movdqa staging
 ceiling fma_self 2
-ceiling fma_chain 4
+ceiling fma_chain 3   # packed FMA prefix coalesces a dying multiplier; GCC: 3
 ceiling fma_two 6      # m = a*b reused by + and -: both contract (GCC: 4)
 ceiling fma_nouse 4
 # Streaming FMA loop `r[i] = a[i]*b[i] + c[i]` (GCC: 14).

@@ -1292,6 +1292,9 @@ fn peephole_optimize_inner(
         // widening so the copy spellings it matches are already normalised.
         if !sk("vector_copy_fma") {
             {
+                let c = vector_copy::coalesce_packed_fma_prefix(&mut store, &mut infos);
+                trace("coalesce_packed_fma_prefix", pass_count, c, &store, &infos);
+                changed |= c;
                 let c = vector_copy::reassociate_fma_accumulator(&mut store, &mut infos);
                 trace("reassociate_fma_accumulator", pass_count, c, &store, &infos);
                 changed |= c;

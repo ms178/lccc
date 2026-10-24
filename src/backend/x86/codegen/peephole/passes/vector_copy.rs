@@ -1058,6 +1058,108 @@ fn copy_spelled_width(t: &str) -> Option<u16> {
     width
 }
 
+/// Coalesce a full-width VEX copy into a packed FMA and its adjacent FMA
+/// consumer. The instruction forms and operand positions do not change: this
+/// is register renaming, not reassociation (including for NaN payloads).
+///
+/// The copied source must be dead in ALL architectural regions after the
+/// producer; the temporary must be dead after the consumer. Both operations
+/// must be unmasked, register-only, equal-width packed FMAs. Keeping this
+/// window small avoids turning the peephole into a second register allocator.
+pub(super) fn coalesce_packed_fma_prefix(store: &mut LineStore, infos: &mut [LineInfo]) -> bool {
+    fn packed_fma(t: &str, width: u16) -> bool {
+        let (mn, operands) = split_mn(t);
+        let Some(rest) = ["vfmadd", "vfmsub", "vfnmadd", "vfnmsub"]
+            .iter()
+            .find_map(|stem| mn.strip_prefix(stem))
+        else {
+            return false;
+        };
+        let Some(suffix) = ["132", "213", "231"]
+            .iter()
+            .find_map(|form| rest.strip_prefix(form))
+        else {
+            return false;
+        };
+        if !matches!(suffix, "ps" | "pd") || !matches!(width, W128 | W256) {
+            return false;
+        }
+        let ops = operand_list(operands);
+        ops.len() == 3
+            && ops
+                .iter()
+                .all(|op| vec_operand(op).is_some_and(|(_, w)| w == width))
+    }
+
+    // No line insertion or CFI mutation: the index remains valid throughout.
+    let cfi = super::relay_and_lea::CfiIndex::build(store, infos);
+    let mut changed = false;
+    let mut fp = None;
+    for i in 0..infos.len() {
+        if infos[i].is_nop() || infos[i].pinned {
+            continue;
+        }
+        let text = infos[i].trimmed(store.get(i));
+        let Some(copy) = parse_vec_copy(text) else {
+            continue;
+        };
+        if !copy.zeroes_above
+            || copy.src == copy.dst
+            || copy_spelled_width(text) != Some(copy.width)
+        {
+            continue;
+        }
+        let Some((_, end)) = cfi.function_range(i, store.len()) else {
+            continue;
+        };
+        let Some(j) = next_real(store, infos, i + 1, end) else {
+            continue;
+        };
+        let Some(k) = next_real(store, infos, j + 1, end) else {
+            continue;
+        };
+        let producer = infos[j].trimmed(store.get(j));
+        let consumer = infos[k].trimmed(store.get(k));
+        if infos[j].pinned
+            || infos[k].pinned
+            || !packed_fma(producer, copy.width)
+            || !packed_fma(consumer, copy.width)
+            || operand_list(split_mn(producer).1)
+                .last()
+                .and_then(|op| vec_operand(op))
+                .map(|(n, _)| n)
+                != Some(copy.dst)
+            || vec_mention_width(consumer, copy.dst) != copy.width
+            || names_vec_reg(consumer, copy.src)
+        {
+            continue;
+        }
+        let oracle = fp.get_or_insert_with(|| FpLiveness::new(store, infos));
+        if oracle.xmm_live_after(j, u32::from(copy.src)) != Some(false)
+            || !oracle.upper_regions_dead_after(j, u32::from(copy.src))
+            || !oracle.deleted_write_regions_dead_after(
+                store,
+                infos,
+                k,
+                u32::from(copy.dst),
+                &[i, j],
+            )
+        {
+            continue;
+        }
+        let producer = replace_vec_reg(producer, copy.dst, copy.src);
+        let consumer = replace_vec_reg(consumer, copy.dst, copy.src);
+        replace_line(store, &mut infos[j], j, format!("    {producer}"));
+        replace_line(store, &mut infos[k], k, format!("    {consumer}"));
+        mark_nop(&mut infos[i]);
+        // Register identities changed. Never reuse a pre-rewrite liveness
+        // result to license another transformation in the same iteration.
+        fp = None;
+        changed = true;
+    }
+    changed
+}
+
 /// Re-home a scalar FMA so that the copies around it disappear.
 ///
 /// The codegen stages a scalar FMA's operands through copies whenever the
@@ -3104,6 +3206,176 @@ mod tests {
 
     fn body(text: &str) -> String {
         format!("{PRO}{text}{EPI}")
+    }
+
+    fn packed_prefix_only(text: &str) -> (bool, String) {
+        let mut store = LineStore::new(body(&format!("    # LCCC_RET_XMM 1\n{text}")));
+        let mut infos: Vec<_> = (0..store.len())
+            .map(|i| classify_line(store.get(i)))
+            .collect();
+        let changed = coalesce_packed_fma_prefix(&mut store, &mut infos);
+        let result = (0..store.len())
+            .filter(|&i| !infos[i].is_nop())
+            .map(|i| store.get(i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (changed, result)
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn packed_fma_prefix_native_bits_rounding_and_exceptions() {
+        use crate::common::temp_files::TempFile;
+        use std::process::Command;
+        // Structural proof tests above/below are unconditional. Native
+        // execution is meaningful only on a host implementing these opcodes.
+        if !std::arch::is_x86_feature_detected!("avx2")
+            || !std::arch::is_x86_feature_detected!("fma")
+        {
+            eprintln!("SKIP packed FMA native execution: AVX2 and FMA required");
+            return;
+        }
+        let mut assembly = String::from(".text\n");
+        for (ty, bank, suffix, bits) in [
+            ("f4", "xmm", "ps", 128),
+            ("f8", "ymm", "ps", 256),
+            ("d2", "xmm", "pd", 128),
+            ("d4", "ymm", "pd", 256),
+        ] {
+            let text = format!(
+                "    # LCCC_RET_XMM 1\n    # LCCC_RET_XMM_BITS {bits}\n    vmovaps %{bank}1, %{bank}14\n    vfmadd132{suffix} %{bank}0, %{bank}2, %{bank}14\n    vfmadd231{suffix} %{bank}3, %{bank}14, %{bank}0\n    ret\n"
+            );
+            let original = body(&text);
+            let (changed, optimized) = packed_prefix_only(&text);
+            assert!(changed, "{optimized}");
+            for (prefix, asm) in [("original", original), ("optimized", optimized)] {
+                let name = format!("{prefix}_{ty}");
+                assembly.push_str(&format!(".globl {name}\n"));
+                assembly.push_str(
+                    &asm.replace("f:", &format!("{name}:"))
+                        .replace(".size f, .-f", &format!(".size {name}, .-{name}")),
+                );
+                assembly.push('\n');
+            }
+        }
+        assembly.push_str(".section .note.GNU-stack,\"\",@progbits\n");
+        let asm = TempFile::try_new("packed-fma", "contract", "s").unwrap();
+        let exe = TempFile::try_new("packed-fma", "contract", "exe").unwrap();
+        std::fs::write(asm.path(), assembly).unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let output = Command::new("gcc")
+            .args([
+                "-O2",
+                "-mavx2",
+                "-mfma",
+                "-frounding-math",
+                "-fno-fast-math",
+                "-ffp-contract=off",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+            ])
+            .arg(root.join("tests/regression/fixtures/peephole-packed-fma/driver.c"))
+            .arg(asm.path())
+            .args(["-lm", "-o"])
+            .arg(exe.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(exe.path()).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("65536 exact"));
+    }
+
+    #[test]
+    fn packed_fma_prefix_preserves_forms_and_operand_order() {
+        for bank in ["xmm", "ymm"] {
+            for family in ["vfmadd", "vfmsub", "vfnmadd", "vfnmsub"] {
+                for form in ["132", "213", "231"] {
+                    for suffix in ["ps", "pd"] {
+                        let mnemonic = format!("{family}{form}{suffix}");
+                        let text = format!(
+                            "    vmovaps %{bank}1, %{bank}14\n    {mnemonic} %{bank}0, %{bank}2, %{bank}14\n    vfmadd231{suffix} %{bank}3, %{bank}14, %{bank}0\n    ret\n"
+                        );
+                        let (changed, out) = packed_prefix_only(&text);
+                        assert!(changed, "{out}");
+                        assert!(!out.contains("vmovaps"), "{out}");
+                        assert!(
+                            out.contains(&format!("{mnemonic} %{bank}0, %{bank}2, %{bank}1")),
+                            "{out}"
+                        );
+                        assert!(
+                            out.contains(&format!(
+                                "vfmadd231{suffix} %{bank}3, %{bank}1, %{bank}0"
+                            )),
+                            "{out}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_fma_prefix_full_pipeline_disable_control() {
+        use super::super::test_skips::skip_passes;
+        let asm = body(
+            "    # LCCC_RET_XMM 1\n    # LCCC_RET_XMM_BITS 256\n    vmovaps %ymm1, %ymm14\n    vfmadd132ps %ymm0, %ymm2, %ymm14\n    vfmadd231ps %ymm3, %ymm14, %ymm0\n    ret\n",
+        );
+        let optimized = run(&asm);
+        assert!(!optimized.contains("vmovaps"), "{optimized}");
+        let disabled = {
+            let _guard = skip_passes(&["vector_copy_fma"]);
+            run(&asm)
+        };
+        assert!(disabled.contains("vmovaps"), "{disabled}");
+    }
+
+    #[test]
+    fn packed_fma_prefix_refuses_live_original_source_or_temporary() {
+        for tail in [
+            "    vaddps %ymm1, %ymm0, %ymm0\n",
+            "    vmovups %zmm1, (%rdi)\n",
+            "    vmovups %ymm14, (%rdi)\n",
+            "    vmovups %zmm14, (%rdi)\n",
+            "    jne .Lread\n    ret\n.Lread:\n    vmovups %ymm1, (%rdi)\n",
+        ] {
+            let text = format!(
+                "    vmovaps %ymm1, %ymm14\n    vfmadd132ps %ymm0, %ymm2, %ymm14\n    vfmadd231ps %ymm3, %ymm14, %ymm0\n{tail}    ret\n"
+            );
+            let (changed, out) = packed_prefix_only(&text);
+            assert!(!changed, "{out}");
+        }
+    }
+
+    #[test]
+    fn packed_fma_prefix_refuses_masks_memory_width_mismatch_and_barriers() {
+        for producer in [
+            "vfmadd132ps (%rdi), %ymm2, %ymm14",
+            "vfmadd132ps %ymm0, %ymm2, %ymm14{%k1}",
+            "vfmadd132ps %xmm0, %xmm2, %xmm14",
+            "vfmadd132ss %xmm0, %xmm2, %xmm14",
+            ".Lentry:\n    vfmadd132ps %ymm0, %ymm2, %ymm14",
+            "call other\n    vfmadd132ps %ymm0, %ymm2, %ymm14",
+        ] {
+            let text = format!(
+                "    vmovaps %ymm1, %ymm14\n    {producer}\n    vfmadd231ps %ymm3, %ymm14, %ymm0\n    ret\n"
+            );
+            let (changed, out) = packed_prefix_only(&text);
+            assert!(!changed, "{out}");
+        }
+        let (changed, out) = packed_prefix_only(
+            "    vmovaps %ymm1, %ymm14\n    vfmadd132ps %ymm0, %ymm2, %ymm14\n    vfmadd231ps %ymm1, %ymm14, %ymm0\n    ret\n",
+        );
+        assert!(!changed, "{out}");
     }
 
     // ── the parsers ─────────────────────────────────────────────────────────
