@@ -70,6 +70,20 @@ if cpu_has avx2 && cpu_has fma; then
              "-O2 -mavx2 -mfma -ffp-contract=off")
 fi
 cpu_has avx512f && levels+=("-O2 -mavx512f")
+# Optional, explicit supplemental oracle configurations. Defaults retain the
+# complete host-supported matrix; code-quality/contraction checks always run.
+# Example: GCC=clang-23 "$0" --runtime-level "-O2 -mavx2 -ffp-contract=off"
+if (( $# )); then
+    levels=()
+    while (( $# )); do
+        if [[ $1 != --runtime-level || $# -lt 2 || -z $2 ]]; then
+            echo "usage: $0 [--runtime-level 'compiler flags']..." >&2
+            exit 2
+        fi
+        levels+=("$2")
+        shift 2
+    done
+fi
 # GCC's ISA must match the one lccc ASSUMES, not merely the flags: lccc's
 # documented default-flag baseline is x86-64-v3 for CODEGEN
 # (`src/backend/x86/isa.rs`), so FMA3 contraction is on unless a level
@@ -81,9 +95,20 @@ cpu_has avx512f && levels+=("-O2 -mavx512f")
 # all; there lccc runs with `-ffp-contract=off` so the differential compares
 # equal roundings (lccc's fusion at those levels is covered by Part 3).
 gcc_isa_flags() {
-    # Identity: GCC does not imply -mfma from any -mavx* flag (measured,
-    # gcc 14/16), so the reference build contracts exactly where lccc does.
-    echo "$1"
+    # Pin reference ISA/contraction defaults. Clang implies FMA from
+    # -mavx512f and defaults to in-expression contraction, unlike GCC.
+    # This does not make incompatible vector ABIs or permissible FP
+    # contraction decisions interchangeable across compiler families.
+    local flags=$1
+    case " $flags " in
+        *" -mfma "*) ;;
+        *) flags+=" -mno-fma" ;;
+    esac
+    case " $flags " in
+        *" -ffp-contract="*) ;;
+        *) flags+=" -ffp-contract=fast" ;;
+    esac
+    echo "$flags"
 }
 lccc_isa_flags() {
     case " $1 " in
