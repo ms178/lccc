@@ -164,7 +164,8 @@ def function_body_metrics(asm: str) -> dict:
     return m
 
 
-def compile_metrics(lccc: str, gcc_inc: str, src: Path) -> dict | None:
+def compile_asm(lccc: str, gcc_inc: str, src: Path) -> str | None:
+    """The `-O2 -S` translation unit for one workload, or None on failure."""
     with tempfile.NamedTemporaryFile(suffix=".s", delete=False) as f:
         out = Path(f.name)
     try:
@@ -174,9 +175,122 @@ def compile_metrics(lccc: str, gcc_inc: str, src: Path) -> dict | None:
         )
         if r.returncode != 0:
             return None
-        return function_body_metrics(out.read_text())
+        return out.read_text()
     finally:
         out.unlink(missing_ok=True)
+
+
+def compile_metrics(lccc: str, gcc_inc: str, src: Path) -> dict | None:
+    asm = compile_asm(lccc, gcc_inc, src)
+    return None if asm is None else function_body_metrics(asm)
+
+
+def gha_escape(text: str) -> str:
+    """Escape a workflow-command payload (property values are `%`/`,`/`:`)."""
+    return (text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+            .replace(",", "%2C").replace(":", "%3A"))
+
+
+# GitHub truncates one annotation body well below the 65535-byte API limit;
+# 56 KiB keeps every chunk safely inside it while bounding the number of
+# annotations a run publishes.
+ANNOTATION_CHUNK = 56 * 1024
+
+
+def emit_metrics_annotation(results: list) -> None:
+    """Publish the per-workload numbers as ONE annotation.
+
+    The gate's numbers otherwise exist only in the job log, and a log is not
+    queryable from the API: a reviewer (or an agent) cannot read the codegen
+    metrics of a run at all. One compact annotation makes the evidence
+    API-visible without adding a step, a lane or an artifact — the same
+    contract `.github/workflows/pr826-redteam.yml` uses for its fmt payload.
+    """
+    rows = ["workload insns stackmem pushes moves ymm fma verdict"]
+    for r in results:
+        if "skip" in r or "error" in r:
+            rows.append(f"{r['label']} - - - - - - {r.get('error', 'SKIPPED')}")
+            continue
+        m = r["metrics"]
+        verdict = "REGRESSION" if r.get("regressions") else "pass"
+        rows.append(
+            f"{r['label']} {m['insns']} {m['stackmem']} {m['pushes']} "
+            f"{m['moves']} {m['ymm']} {m['fma']} {verdict}"
+        )
+        for reg in r.get("regressions") or []:
+            rows.append(f"  ^ {reg}")
+    # LEVEL: `warning`, deliberately. The checks API
+    # (/repos/{o}/{r}/check-runs/{id}/annotations) returns only the error and
+    # warning levels — a `::notice` is rendered in the UI but is NOT
+    # retrievable, and the step-summary channel does not surface through
+    # `output.summary` for a reusable-workflow job either. Publishing at
+    # warning level is what makes the evidence machine-readable; it does not
+    # affect this step's exit status, which is what actually gates the lane.
+    print(f"::warning title=codegen-gate-metrics::"
+          f"{gha_escape(chr(10).join(rows))}")
+
+
+def emit_step_summary(results: list, asm_by_label: dict) -> None:
+    """Append the same evidence to $GITHUB_STEP_SUMMARY.
+
+    Annotations are rendered in the UI but a `::notice` is NOT retrievable
+    through the checks API (`/check-runs/{id}/annotations` returns only
+    error/warning levels), so a notice alone is still "visible to a human,
+    invisible to a program" — the exact defect this instrument exists to fix.
+    The step summary lands in the check run's `output.summary`, which anything
+    holding a token can read: `gh api repos/O/R/check-runs/<job-id>
+    --jq .output.summary`.
+    """
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    out = ["", "## Codegen quality gate — golden workloads", "",
+           "| workload | insns | stackmem | pushes | moves | ymm | fma | verdict |",
+           "|---|---:|---:|---:|---:|---:|---:|---|"]
+    for r in results:
+        if "skip" in r or "error" in r:
+            out.append(f"| {r['label']} | — | — | — | — | — | — | "
+                       f"{r.get('error', 'SKIPPED')} |")
+            continue
+        m = r["metrics"]
+        verdict = "REGRESSION" if r.get("regressions") else "pass"
+        out.append(f"| {r['label']} | {m['insns']} | {m['stackmem']} | "
+                   f"{m['pushes']} | {m['moves']} | {m['ymm']} | {m['fma']} | "
+                   f"{verdict} |")
+    for r in results:
+        for reg in r.get("regressions") or []:
+            out.append(f"- **{r['label']}**: {reg}")
+    if asm_by_label:
+        out.append("")
+        out.append("<details><summary>emitted assembly (-O2 -S)</summary>")
+        out.append("")
+        out.append("```asm")
+        for label, asm in asm_by_label.items():
+            out.append(f"# ===== {label} =====")
+            out.extend(asm.splitlines())
+        out.append("```")
+        out.append("</details>")
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n")
+
+
+def emit_asm_annotations(asm_by_label: dict) -> None:
+    """Publish the emitted assembly, chunked. Opt-in (`--annotate-asm`)."""
+    buf: list = []
+    size = 0
+    chunk_no = 0
+    for label, asm in asm_by_label.items():
+        block = f"===== {label} =====\n{asm}"
+        if size + len(block) > ANNOTATION_CHUNK and buf:
+            chunk_no += 1
+            print(f"::warning title=codegen-asm-{chunk_no}::"
+                  f"{gha_escape(''.join(buf))}")
+            buf, size = [], 0
+        buf.append(block)
+        size += len(block)
+    if buf:
+        chunk_no += 1
+        print(f"::warning title=codegen-asm-{chunk_no}::{gha_escape(''.join(buf))}")
 
 
 def detect_gcc_inc() -> str:
@@ -206,6 +320,11 @@ def main():
                    help="Write the measured metrics as the new baseline")
     p.add_argument("--json", metavar="FILE", help="Dump results JSON")
     p.add_argument("--summary", action="store_true", help="GitHub markdown")
+    p.add_argument("--annotate", action="store_true",
+                   help="publish the per-workload metrics as a workflow annotation "
+                        "(API-visible; the numbers are otherwise log-only)")
+    p.add_argument("--annotate-asm", action="store_true",
+                   help="also publish each workload's -O2 -S output, chunked")
     args = p.parse_args()
 
     gcc_inc = args.gcc_inc or detect_gcc_inc()
@@ -219,13 +338,19 @@ def main():
 
     results = []
     failures = []
+    annotate_asm = args.annotate_asm
+    asm_by_label: dict = {}
     for src_name, label in WORKLOADS:
         src = PROGRAMS / src_name
         if not src.exists():
             failures.append(f"{label}: required source missing")
             results.append({"label": label, "skip": str(src)})
             continue
-        got = compile_metrics(args.lccc, gcc_inc, src)
+        asm = compile_asm(args.lccc, gcc_inc, src) if annotate_asm else None
+        got = (function_body_metrics(asm) if asm is not None
+               else compile_metrics(args.lccc, gcc_inc, src))
+        if annotate_asm and asm is not None:
+            asm_by_label[label] = asm
         if got is None:
             failures.append(f"{label}: compile failed")
             results.append({"label": label, "error": "compile failed"})
@@ -284,6 +409,12 @@ def main():
                 f"| {r['label']} | {m['insns']} | {m['stackmem']} | "
                 f"{m['pushes']} | {m['ymm']} | {m['fma']} | {verdict} |"
             )
+
+    if args.annotate or annotate_asm:
+        emit_metrics_annotation(results)
+        emit_step_summary(results, asm_by_label if annotate_asm else {})
+    if annotate_asm and asm_by_label:
+        emit_asm_annotations(asm_by_label)
 
     print(file=sys.stderr)
     if failures:

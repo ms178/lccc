@@ -655,8 +655,12 @@ now pinned against the ISA widths by
 `encode_sse_op` implements only the load row, so a valid GAS store such as
 `movlps %xmm0, (%eax)` was rejected with "unsupported SSE op operands". The
 half-width moves now route through the two-row `encode_sse_rr_rm` helper
-(0F 12/13, 0F 16/17, and the 66-prefixed pair), locked byte-for-byte against
-GNU as 2.40 by `half_width_sse_store_encodings_match_gas_golden_bytes`.
+(0F 12/13, 0F 16/17, and the 66-prefixed pair). The oracle for those bytes is
+`tests/asm-diff/i686/sse-half-width.casefile`, compared byte-for-byte against
+the GNU as the tree provisions for its differential lanes
+(`scripts/ensure_gas_247.sh`, 2.47 in CI) — never a locally installed
+assembler, and never a pinned older one. `half_width_sse_store_encodings_match_gas_golden_bytes`
+is only the fast in-tree check.
 
 **Measurement note for the next contributor.** The four new tests are written
 to the *formatter's* shape as well as the compiler's, because a formatting diff

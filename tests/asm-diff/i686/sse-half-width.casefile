@@ -1,0 +1,23 @@
+;;; sse_half_width_moves
+# 0F 12/13 (movlps), 0F 16/17 (movhps) and their 66-prefixed movlpd/movhpd
+# twins are two-row instructions: the same opcode means LOAD when the memory
+# operand is the source and STORE when it is the destination. The encoder used
+# to implement the load row only, so every store spelling was rejected. These
+# rows exist so the 32-bit differential lane validates BOTH rows against the
+# provisioned GNU as (2.47 in CI, scripts/ensure_gas_247.sh) instead of against
+# a locally measured byte table.
+.text
+movlps %xmm0, 8(%esp)
+movhps %xmm1, 12(%ebp)
+movlpd %xmm2, 4(%esp)
+movhpd %xmm3, 8(%esp)
+movlps 8(%esp), %xmm0
+movhps 12(%ebp), %xmm1
+movlpd 4(%esp), %xmm2
+movhpd 8(%esp), %xmm3
+movlps %xmm0, (%ecx)
+movhps %xmm1, (%edx)
+movlpd %xmm2, (%eax)
+movhpd %xmm3, (%ebx)
+movlps %xmm5, 24(%eax,%ecx,4)
+movhpd %xmm6, -8(%ebp,%edx,2)

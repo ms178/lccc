@@ -1629,8 +1629,14 @@ mod tests {
     /// produce — failed to assemble. The half-width moves have their own
     /// store rows; the register stays in ModRM.reg.
     ///
-    /// Bytes captured from GNU as 2.40 (`as --32`): these are ISA-fixed
-    /// legacy encodings, identical across binutils versions.
+    /// These are TWO-ROW instructions: `0f 12/13` and `0f 16/17` (plus the
+    /// `66`-prefixed `movlpd`/`movhpd` twins) mean LOAD with the memory
+    /// operand as source and STORE with it as destination. The bytes below are
+    /// fixed by the ISA encoding, not by an assembler build; their AUTHORITY is
+    /// the differential lane, where `tests/asm-diff/i686/sse-half-width.casefile`
+    /// is compared byte-for-byte against the GNU as the tree provisions
+    /// (`scripts/ensure_gas_247.sh`, 2.47 in CI). This test is only the fast
+    /// in-tree check that the encoder still emits them.
     #[test]
     fn half_width_sse_store_encodings_match_gas_golden_bytes() {
         let asm = concat!(
