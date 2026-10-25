@@ -19,14 +19,23 @@ class GccRuntimeExport(unittest.TestCase):
         for arch in (directory, directory / '32'):
             for name in ('crtbegin.o', 'libgcc.a'):
                 (arch / name).write_bytes(f'{arch.name}/{name}'.encode())
+        for name in ('lib64', 'lib32'):
+            shared = root / 'private compiler' / name
+            shared.mkdir()
+            for filename in ('libgcc_s.so', 'libgcc_s.so.1'):
+                (shared / filename).write_bytes(f'{name}/{filename}'.encode())
         driver = root / 'mock compiler'
         driver.write_text('''#!/bin/sh
 if [ "$1" = -dumpfullversion ]; then echo "${MOCK_VERSION:-16.2.0}"; exit 0; fi
 root=''' + shlex.quote(str(directory)) + '''
-if [ "$1" = -m32 ]; then root="$root/32"; shift; fi
+arch=lib64
+if [ "$1" = -m32 ]; then root="$root/32"; arch=lib32; shift; fi
+shared=''' + shlex.quote(str(root / 'private compiler')) + '''/$arch
 case "$1" in
     -print-file-name=crtbegin.o) echo "$root/crtbegin.o" ;;
     -print-libgcc-file-name) echo "$root/libgcc.a" ;;
+    -print-file-name=libgcc_s.so) echo "$shared/libgcc_s.so" ;;
+    -print-file-name=libgcc_s.so.1) echo "$shared/libgcc_s.so.1" ;;
     *) exit 99 ;;
 esac
 ''')
@@ -47,12 +56,14 @@ esac
             self.assertEqual(result.returncode, 0, result.stderr)
             sysroot = root / 'current-gcc-runtime'
             self.assertEqual(result.stdout.strip(), str(sysroot))
-            self.assertEqual((root / 'env').read_text(), f'LCCC_SYSROOT={sysroot}\n')
+            self.assertIn(f'LCCC_SYSROOT={sysroot}\n', (root / 'env').read_text())
+            self.assertIn(f'LD_LIBRARY_PATH={root}/private compiler/lib64:{root}/private compiler/lib32',
+                          (root / 'env').read_text())
             link = sysroot / 'usr/lib/gcc/x86_64-linux-gnu/16.2.0'
             self.assertEqual(link.resolve(), directory)
             receipt = json.loads((sysroot / 'runtime.json').read_text())
             self.assertEqual(receipt['gcc_version'], '16.2.0')
-            self.assertEqual(len(receipt['files']), 4)
+            self.assertEqual(len(receipt['files']), 8)
             for item in receipt['files']:
                 self.assertEqual(item['sha256'], hashlib.sha256(Path(item['path']).read_bytes()).hexdigest())
 
@@ -61,6 +72,17 @@ esac
             root = Path(tmp)
             directory, driver = self.setup(root)
             (directory / '32/libgcc.a').unlink()
+            result = self.run_helper(root, driver)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('missing exact GCC runtime file', result.stderr)
+            self.assertFalse((root / 'env').exists())
+            self.assertFalse((root / 'current-gcc-runtime').exists())
+
+    def test_missing_shared_i386_unwinder_cannot_be_exported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, driver = self.setup(root)
+            (root / 'private compiler/lib32/libgcc_s.so.1').unlink()
             result = self.run_helper(root, driver)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('missing exact GCC runtime file', result.stderr)

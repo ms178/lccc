@@ -139,3 +139,13 @@ writes or old compiler packages; a hash receipt travels with research outputs.
 Four isolated tests cover coherent export (including paths with spaces),
 missing i386 runtime, wrong GCC version and refusal to overwrite a sysroot.
 Real candidate dual-mode linking still needs the next hosted acceptance run.
+
+The runtime export also exposes the same installation's shared unwind linker
+scripts and SONAME objects for each ELF class through separate multiarch
+search paths and the dynamic loader path. i686 dynamic links must retain the
+shared unwinder, not substitute `libgcc_eh.a` (pthread forced unwinding requires
+the shared instance). Hash all eight native/i386 files and reject a missing
+shared i386 unwinder before creating or publishing the sysroot. Five isolated
+controls pass, and the helper successfully exported a real GCC 16.2.0 cache
+into a private local test directory with eight hashed runtime files; this is
+not a candidate compile or runtime acceptance claim.
