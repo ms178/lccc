@@ -29,6 +29,9 @@ mode is taken from the row's own path (`sdm.model_any`).
 from __future__ import annotations
 
 import importlib.util
+import contextlib
+import io
+from unittest import mock
 import json
 import sys
 import unittest
@@ -167,7 +170,7 @@ class GasEncodingCrossrefTests(unittest.TestCase):
         self.assertIn(("vex", "0f38", "none", 0xF3, 1), encs("blsr"))
         self.assertIn(("vex", "0f38", "none", 0xF3, 2), encs("blsmsk"))
         # Same shape, EVEX-only encoding: EVEX.66.0F3A.W0 66 /r ib.
-        self.assertIn(("vex", "0f3a", "66", 0x66, None), encs("vfpclassps"))
+        self.assertIn(("evex", "0f3a", "66", 0x66, None), encs("vfpclassps"))
 
     def test_prefix_and_opcode_in_one_field_still_split(self):
         """`shrx` is `0xf2f7`: mandatory prefix F2, opcode F7."""
@@ -220,6 +223,87 @@ class GasEncodingCrossrefTests(unittest.TestCase):
             [row], self.table, lambda r, name=None: [dict(setc)])
         self.assertEqual((findings, unmodeLLed, uncovered), ([], [], []))
         self.assertEqual(checked, 1)
+
+    def test_expression_evaluator_uses_c_precedence(self):
+        for expression, expected in [
+            ("1 + 2 << 3", 24), ("1 << 2 + 1", 8),
+            ("2 + 3 * 4 << 1", 28), ("1 | 2 + 3 << 1", 11),
+            ("1 << 1 << 2", 8), ("1 + (2 << 3)", 17),
+            ("(1 + 2) * 3 << 1", 18),
+        ]:
+            with self.subTest(expression=expression):
+                self.assertEqual(self.gas.eval_expr(expression), expected)
+
+    def test_prefix_family_is_not_a_substring_guess(self):
+        for attrs, expected in [
+            ("EVex128|Space0F|VexW0", ["evex"]),
+            ("EVexLIG|Space0F|VexW1", ["evex"]),
+            ("Masking|Space0F|VexW=2", ["evex"]),
+            ("Vex128|Space0F|VexW0", ["vex"]),
+            ("Vex128|EVex128|Space0F|VexW0", ["vex", "evex"]),
+            ("Space0F|VexW0", ["legacy"]),
+        ]:
+            with self.subTest(attrs=attrs):
+                self.assertEqual(self.gas._canonical(0x90, None, attrs)[1], expected)
+        # The real snapshot must not admit an invented VEX FPCLASS form.
+        self.assertEqual({e["family"] for e in self.table["vfpclassps"]}, {"evex"})
+
+    def test_family_and_both_modrm_w_constraints_must_match(self):
+        enc = {"family": "vex", "map": "0f38", "pp": "none",
+               "opcode": 0xF3, "reg": 3, "w": 0}
+        self.assertTrue(self.gas._same(enc, dict(enc)))
+        for key, bad in [("family", "evex"), ("family", "legacy"),
+                         ("reg", 2), ("w", 1), ("opcode", 0xF2),
+                         ("pp", "f2"), ("map", "0f")]:
+            with self.subTest(key=key, bad=bad):
+                self.assertFalse(self.gas._same(enc, dict(enc, **{key: bad})))
+        # Unknown W is deliberately unconstrained, not silently interpreted as0.
+        self.assertTrue(self.gas._same(enc, dict(enc, w=None)))
+        # Exercise the public verifier: a wrong W cannot pass just because /3
+        # matches. The only candidate encoding is intentionally malformed.
+        row = {"file": "synthetic", "line": 1, "names": ["blsi"], "body": "mutant"}
+        findings, _, checked, _ = self.gas.verify(
+            [row], {"blsi": [enc]}, lambda row, name=None: [dict(enc, w=1)])
+        self.assertEqual(checked, 1)
+        self.assertEqual([f["kind"] for f in findings], ["LCCC-EXTRA"])
+
+    def test_numeric_w_attributes_are_not_unknown(self):
+        for value, expected in [("1", 0), ("2", 1), ("3", None),
+                                ("VEXW0", 0), ("VEXW1", 1), ("VEXWIG", None)]:
+            with self.subTest(value=value):
+                enc, _ = self.gas._canonical(0x666f, None, "Masking|Space0F|VexW=" + value)
+                self.assertEqual(enc["w"], expected)
+        self.assertTrue(all(e["w"] == 0 for e in self.table["vmovdqa32"]))
+        self.assertTrue(all(e["w"] == 1 for e in self.table["vmovdqa64"]))
+
+    def test_v_spelling_requires_the_gas_template_attribute(self):
+        for fake in ("vandn", "vblsi", "vblsr", "vblsmsk", "vshrx"):
+            with self.subTest(fake=fake):
+                self.assertNotIn(fake, self.table)
+                row = {"file": "synthetic", "line": 1, "names": [fake], "body": "mutant"}
+                base = self.table[fake[1:]][0]
+                findings, _, checked, uncovered = self.gas.verify(
+                    [row], self.table, lambda row, name=None: [dict(base)])
+                self.assertEqual(findings, [])
+                self.assertEqual(checked, 0)
+                self.assertEqual([u["name"] for u in uncovered], [fake])
+        # Legacy sqrtps and its SSE2AVX spelling have distinct families.
+        self.assertEqual({e["family"] for e in self.table["sqrtps"]}, {"legacy"})
+        self.assertEqual({e["family"] for e in self.table["vsqrtps"]}, {"vex", "evex"})
+        parsed = self.gas._parse_row(
+            "sqrtps, 0x0f51, AVX, Modrm|Vex128|SSE2AVX, { RegXMM, RegXMM }")
+        self.assertEqual({e["mnemonic"] for e in parsed}, {"vsqrtps"})
+
+    def test_strict_cli_fails_for_an_uncovered_mnemonic(self):
+        uncovered = [{"name": "invented", "file": "synthetic", "line": 1}]
+        for strict, expected in [(True, 1), (False, 0)]:
+            argv = ["gas_encoding_crossref.py", "--verify", "--backend", "all"]
+            if strict:
+                argv.append("--strict")
+            with self.subTest(strict=strict), mock.patch.object(sys, "argv", argv), \
+                 mock.patch.object(self.gas, "verify", return_value=([], [], 0, uncovered)), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(self.gas.main(), expected)
 
     def test_core_isa_encodings_are_pinned(self):
         """A spot check so a snapshot regenerated from the wrong branch fails."""

@@ -1,6 +1,6 @@
 {
-  "encodings": 6113,
-  "mnemonics": 2518,
+  "encodings": 3975,
+  "mnemonics": 2195,
   "note": "Encodings declared by GNU as's own instruction table, expanded from its template blocks.  Factual encoding data used as a test oracle; regenerate with scripts/gas_encoding_crossref.py --build <path to opcodes/i386-opc.tbl>.  Do not hand-edit.",
   "stats": {
     "declarations": 73,

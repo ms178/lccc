@@ -72,8 +72,7 @@ mnemonics, and the same pattern extends to the remaining families
 
 `--backend {all,i686,x86}` selects the encoder sources.  The 64-bit backend is
 not a superset of the 32-bit one — x87 integer memory arithmetic, `fcmov*` and
-`fucom*` live only in `i686` — so `--backend all` is the default question worth
-asking before a release.
+`fucom*` live only in `i686` — so use `--backend all` before a release (the CLI default remains `i686`).
 
 Provenance
 ----------
@@ -141,7 +140,7 @@ def _tokens(text: str) -> list[str]:
 
 
 def eval_expr(text: str) -> int:
-    """Evaluate an opcode expression with C precedence: `|` < `+` < `*` < `<<`."""
+    """Evaluate an opcode expression with C precedence: `|` < `<<` < `+` < `*`."""
     toks = _tokens(text)
     if not toks:
         raise ExprError("empty expression")
@@ -170,18 +169,18 @@ def eval_expr(text: str) -> int:
 
     def shift() -> int:
         nonlocal pos
-        val = primary()
+        val = add()
         while peek() == "<<":
             pos += 1
-            val <<= primary()
+            val <<= add()
         return val
 
     def mul() -> int:
         nonlocal pos
-        val = shift()
+        val = primary()
         while peek() == "*":
             pos += 1
-            val *= shift()
+            val *= primary()
         return val
 
     def add() -> int:
@@ -194,10 +193,10 @@ def eval_expr(text: str) -> int:
 
     def bitor() -> int:
         nonlocal pos
-        val = add()
+        val = shift()
         while peek() == "|":
             pos += 1
-            val |= add()
+            val |= shift()
         return val
 
     val = bitor()
@@ -348,7 +347,7 @@ def _substitute(text: str, expansion: dict[str, dict]) -> str:
     return re.sub(r"<([A-Za-z_][A-Za-z0-9_]*)(?::([A-Za-z_][A-Za-z0-9_]*))?>", repl, text)
 
 
-def _parse_row(line: str) -> dict | None:
+def _parse_row(line: str) -> list[dict] | None:
     parts = _split_top(line)
     if len(parts) < 4:
         return None
@@ -357,6 +356,10 @@ def _parse_row(line: str) -> dict | None:
         return None
     opcode_field = parts[1].strip()
     attrs = parts[3].strip()
+    # i386-gen prefixes only SSE2AVX template names; VEX itself does not
+    # invent a v spelling (vandn/vblsi/vshrx are not GAS mnemonics).
+    if "SSE2AVX" in {t.strip() for t in attrs.split("|")}:
+        mnemonic = "v" + mnemonic
     # Pseudo rows and anything still carrying an unexpanded template hole.
     # `<` alone is not a hole: `<<` is the shift operator of the opcode language.
     if TEMPLATE_HOLE.search(opcode_field) or TEMPLATE_HOLE.search(attrs):
@@ -395,18 +398,24 @@ def _canonical(value: int, ext: int | None, attrs: str) -> dict | None:
     # A row carrying both `Vex` and `EVex` is dual-encoded: `as` emits the VEX
     # form for 128/256-bit operands and the EVEX form where a mask or zmm
     # register requires it.  Both have to be admitted here.
-    if "EVex" in attrs and "Vex" in attrs:
-        family = "vexevex"
-    elif "EVex" in attrs:
-        family = "evex"
-    elif "Vex" in attrs:
-        family = "vex"
-    else:
-        family = "legacy"
+    tokens = {t.strip() for t in attrs.split("|")}
+    # VexW0/VexW1 describe W for either prefix family; they do not enable
+    # VEX. Likewise "Vex" is a substring of "EVex", not a second family.
+    vex = bool(tokens & {"Vex", "Vex128", "Vex256", "VexLIG"})
+    evex = bool(tokens & {"EVex", "EVex128", "EVex256", "EVex512",
+                          "EVexLIG", "EVexDYN", "EVexMap4", "EVexMap5",
+                          "EVexMap6", "EVexMap7"})
+    vex = vex or any(t.startswith("Vex=") for t in tokens)
+    evex = evex or any(t.startswith("EVex=") for t in tokens)
+    # GAS also uses implicit EVEX for masked AVX512 rows without an EVexLIG
+    # attribute (e.g. vprold). Masking is an exact attribute, not a substring.
+    evex = evex or "Masking" in tokens
+    family = "vexevex" if vex and evex else "evex" if evex else "vex" if vex else "legacy"
     w = None
-    if "VexW1" in attrs:
+    # i386-opc.h defines VEXW0=1, VEXW1=2, VEXWIG=3.
+    if tokens & {"VexW1", "VexW=2", "VexW=VEXW1"}:
         w = 1
-    elif "VexW0" in attrs:
+    elif tokens & {"VexW0", "VexW=1", "VexW=VEXW0"}:
         w = 0
     map_ = None
     if "Space0F38" in attrs:
@@ -435,7 +444,7 @@ def _canonical(value: int, ext: int | None, attrs: str) -> dict | None:
         # A single byte therefore has no mandatory prefix at all — the BMI rows
         # are exactly this shape, not a prefix with a missing opcode: `andn
         # 0xf2` is VEX.NDS.LZ.0F38.W0 F2, `blsi 0xf3/3` is VEX.NDS.LZ.0F38.W0
-        # F3 /3, `vfpclassph 0x66` is EVEX.66.0F3A.W0 66.  The old loop treated
+        # F3 /3, `vfpclassph 0x66` is EVEX.NONE.0F3A.W0 66.  The old loop treated
         # that lone byte as a prefix, left no opcode behind, and `len(arr) != 1`
         # below then dropped the row, which is why GNU as "had no entry" for
         # `andn`/`blsi`/`blsr`/`blsmsk` and the gate reported them as uncovered
@@ -495,7 +504,7 @@ def _directions(enc: dict, attrs: str) -> list[dict]:
     makes a cross-reference tool untrustworthy.
     """
     base = {k: v for k, v in enc.items() if k != "directions"}
-    tokens = set(attrs.split("|"))
+    tokens = {t.strip() for t in attrs.split("|")}
     opcode, map_ = base["opcode"], base["map"]
     deltas: list[int] = []
     if "D" in tokens:
@@ -528,12 +537,6 @@ def build_snapshot(tbl: Path) -> int:
     for row in rows:
         entry = {k: v for k, v in row.items() if k != "mnemonic"}
         by_mnemonic.setdefault(row["mnemonic"], []).append(entry)
-        # GAS's front end prepends `v` to the vector-encoded rows, and the table
-        # does not spell the letter out; BMI2 (`shrx`, `bzhi`, ...) and SM4 rows
-        # are VEX-encoded but keep their plain name.  Registering both spellings
-        # is what keeps this exact for either convention.
-        if row["family"] != "legacy" and not row["mnemonic"].startswith("v"):
-            by_mnemonic.setdefault("v" + row["mnemonic"], []).append(entry)
     for name, encodings in by_mnemonic.items():
         seen, unique = set(), []
         for enc in encodings:
@@ -607,11 +610,6 @@ def gas_name(mnemonic: str) -> str:
 SNAPSHOT_ALIASES = {"setcc": "setc"}
 
 
-# `i386-opc.tbl` spells a VEX and an EVEX instruction with the same template
-# fields; which prefix family a row uses is not visible in the snapshot, so the
-# three families compare as one when map, prefix and opcode agree.
-VEX_PAIR = {frozenset(("vex", "legacy")), frozenset(("evex", "legacy")),
-            frozenset(("vex", "evex"))}
 # Mnemonics whose `i386-opc.tbl` entry cannot be compared with the encoder's row,
 # with the reason.  Every one of them is pinned byte-for-byte by the as-2.47
 # differential instead (`tests/asm-diff/prefix.casefile`), which compares
@@ -636,13 +634,7 @@ HELPER_OF = re.compile(r"(?:self\.)?([a-z_][a-z0-9_]*)\(")
 
 def _same(want: dict, have: dict) -> bool:
     if want.get("family") != have.get("family"):
-        # A VEX/EVEX row and its legacy spelling share map, prefix and opcode;
-        # which of the two families a row belongs to is a property of the
-        # template attribute the row references, and `i386-opc.tbl` does not
-        # always reference it (the `sqrt*` and `*dup` rows do not).  Comparing
-        # them as one form is exact for the encoding and avoids a false report.
-        if frozenset((want.get("family"), have.get("family"))) not in VEX_PAIR:
-            return False
+        return False
     # `i386-opc.tbl` has no notation for EVEX/VEX maps 4..7 (APX, USER_MSR), so
     # the snapshot records those forms with map "none".  The map bits are not
     # part of the comparison then; the SDM gate checks them exactly.
@@ -654,10 +646,10 @@ def _same(want: dict, have: dict) -> bool:
                         ("opcode", want.get("opcode"), have.get("opcode"))):
         if wv != hv:
             return False
-    if want.get("reg") is not None and have.get("reg") is not None:
-        return want["reg"] == have["reg"]
-    if want.get("w") is not None and have.get("w") is not None:
-        return want["w"] == have["w"]
+    for key in ("reg", "w"):
+        if want.get(key) is not None and have.get(key) is not None:
+            if want[key] != have[key]:
+                return False
     return True
 
 
@@ -692,10 +684,6 @@ def verify(rows: list[dict], table: dict[str, list[dict]],
             base = SNAPSHOT_ALIASES.get(name, gas_name(name))
             if base != name:
                 prefixes.append(base)
-            if name.startswith("v"):
-                # Symmetric to the `v` synthesis: an AVX mnemonic whose row is
-                # spelled without the letter is still that row.
-                prefixes.append(name[1:])
             known = next((table[p] for p in prefixes if p in table), None)
             if known is None:
                 # No entry under any spelling of the name.  This list is a
@@ -888,7 +876,7 @@ def main() -> int:
     ap.add_argument("--coverage", metavar="OUT",
                     help="write a JSON worklist of mnemonics with no encoder row")
     ap.add_argument("--summary", action="store_true")
-    ap.add_argument("--strict", action="store_true", help="non-zero exit on findings")
+    ap.add_argument("--strict", action="store_true", help="non-zero exit on findings, unmodelled rows or uncovered mnemonics")
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
 
@@ -966,7 +954,7 @@ def main() -> int:
             names = sorted({u["name"] for u in uncovered})
             print(f"  UNCOVERED     {len(names)} mnemonic(s) with no entry in the "
                   f"as 2.47 snapshot: {' '.join(names)}")
-        if args.strict and (findings or unmodeLLed):
+        if args.strict and (findings or unmodeLLed or uncovered):
             return 1
 
     if args.missing:

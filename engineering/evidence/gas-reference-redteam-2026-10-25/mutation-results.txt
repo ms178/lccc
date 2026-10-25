@@ -1,0 +1,237 @@
+.....FFFFFFFF.FFFF.FFFF....FFFFFFF
+======================================================================
+FAIL: test_expression_evaluator_uses_c_precedence (__main__.GasEncodingCrossrefTests.test_expression_evaluator_uses_c_precedence) (expression='1 + 2 << 3')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 216, in test_expression_evaluator_uses_c_precedence
+    self.assertEqual(self.gas.eval_expr(expression), expected)
+AssertionError: 17 != 24
+
+======================================================================
+FAIL: test_expression_evaluator_uses_c_precedence (__main__.GasEncodingCrossrefTests.test_expression_evaluator_uses_c_precedence) (expression='1 << 2 + 1')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 216, in test_expression_evaluator_uses_c_precedence
+    self.assertEqual(self.gas.eval_expr(expression), expected)
+AssertionError: 5 != 8
+
+======================================================================
+FAIL: test_expression_evaluator_uses_c_precedence (__main__.GasEncodingCrossrefTests.test_expression_evaluator_uses_c_precedence) (expression='2 + 3 * 4 << 1')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 216, in test_expression_evaluator_uses_c_precedence
+    self.assertEqual(self.gas.eval_expr(expression), expected)
+AssertionError: 26 != 28
+
+======================================================================
+FAIL: test_expression_evaluator_uses_c_precedence (__main__.GasEncodingCrossrefTests.test_expression_evaluator_uses_c_precedence) (expression='1 | 2 + 3 << 1')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 216, in test_expression_evaluator_uses_c_precedence
+    self.assertEqual(self.gas.eval_expr(expression), expected)
+AssertionError: 9 != 11
+
+======================================================================
+FAIL: test_family_and_both_modrm_w_constraints_must_match (__main__.GasEncodingCrossrefTests.test_family_and_both_modrm_w_constraints_must_match) (key='family', bad='evex')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 240, in test_family_and_both_modrm_w_constraints_must_match
+    self.assertFalse(self.gas._same(enc, dict(enc, **{key: bad})))
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_family_and_both_modrm_w_constraints_must_match (__main__.GasEncodingCrossrefTests.test_family_and_both_modrm_w_constraints_must_match) (key='family', bad='legacy')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 240, in test_family_and_both_modrm_w_constraints_must_match
+    self.assertFalse(self.gas._same(enc, dict(enc, **{key: bad})))
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_family_and_both_modrm_w_constraints_must_match (__main__.GasEncodingCrossrefTests.test_family_and_both_modrm_w_constraints_must_match) (key='w', bad=1)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 240, in test_family_and_both_modrm_w_constraints_must_match
+    self.assertFalse(self.gas._same(enc, dict(enc, **{key: bad})))
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_family_and_both_modrm_w_constraints_must_match (__main__.GasEncodingCrossrefTests.test_family_and_both_modrm_w_constraints_must_match)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 249, in test_family_and_both_modrm_w_constraints_must_match
+    self.assertEqual([f["kind"] for f in findings], ["LCCC-EXTRA"])
+AssertionError: Lists differ: [] != ['LCCC-EXTRA']
+
+Second list contains 1 additional elements.
+First extra element 0:
+'LCCC-EXTRA'
+
+- []
++ ['LCCC-EXTRA']
+
+======================================================================
+FAIL: test_numeric_w_attributes_are_not_unknown (__main__.GasEncodingCrossrefTests.test_numeric_w_attributes_are_not_unknown) (value='1')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 256, in test_numeric_w_attributes_are_not_unknown
+    self.assertEqual(enc["w"], expected)
+AssertionError: None != 0
+
+======================================================================
+FAIL: test_numeric_w_attributes_are_not_unknown (__main__.GasEncodingCrossrefTests.test_numeric_w_attributes_are_not_unknown) (value='2')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 256, in test_numeric_w_attributes_are_not_unknown
+    self.assertEqual(enc["w"], expected)
+AssertionError: None != 1
+
+======================================================================
+FAIL: test_numeric_w_attributes_are_not_unknown (__main__.GasEncodingCrossrefTests.test_numeric_w_attributes_are_not_unknown) (value='VEXW0')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 256, in test_numeric_w_attributes_are_not_unknown
+    self.assertEqual(enc["w"], expected)
+AssertionError: None != 0
+
+======================================================================
+FAIL: test_numeric_w_attributes_are_not_unknown (__main__.GasEncodingCrossrefTests.test_numeric_w_attributes_are_not_unknown) (value='VEXW1')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 256, in test_numeric_w_attributes_are_not_unknown
+    self.assertEqual(enc["w"], expected)
+AssertionError: None != 1
+
+======================================================================
+FAIL: test_prefix_family_is_not_a_substring_guess (__main__.GasEncodingCrossrefTests.test_prefix_family_is_not_a_substring_guess) (attrs='EVex128|Space0F|VexW0')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 228, in test_prefix_family_is_not_a_substring_guess
+    self.assertEqual(self.gas._canonical(0x90, None, attrs)[1], expected)
+AssertionError: Lists differ: ['vex', 'evex'] != ['evex']
+
+First differing element 0:
+'vex'
+'evex'
+
+First list contains 1 additional elements.
+First extra element 1:
+'evex'
+
+- ['vex', 'evex']
++ ['evex']
+
+======================================================================
+FAIL: test_prefix_family_is_not_a_substring_guess (__main__.GasEncodingCrossrefTests.test_prefix_family_is_not_a_substring_guess) (attrs='EVexLIG|Space0F|VexW1')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 228, in test_prefix_family_is_not_a_substring_guess
+    self.assertEqual(self.gas._canonical(0x90, None, attrs)[1], expected)
+AssertionError: Lists differ: ['vex', 'evex'] != ['evex']
+
+First differing element 0:
+'vex'
+'evex'
+
+First list contains 1 additional elements.
+First extra element 1:
+'evex'
+
+- ['vex', 'evex']
++ ['evex']
+
+======================================================================
+FAIL: test_prefix_family_is_not_a_substring_guess (__main__.GasEncodingCrossrefTests.test_prefix_family_is_not_a_substring_guess) (attrs='Masking|Space0F|VexW=2')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 228, in test_prefix_family_is_not_a_substring_guess
+    self.assertEqual(self.gas._canonical(0x90, None, attrs)[1], expected)
+AssertionError: Lists differ: ['vex'] != ['evex']
+
+First differing element 0:
+'vex'
+'evex'
+
+- ['vex']
++ ['evex']
+?   +
+
+
+======================================================================
+FAIL: test_prefix_family_is_not_a_substring_guess (__main__.GasEncodingCrossrefTests.test_prefix_family_is_not_a_substring_guess) (attrs='Space0F|VexW0')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 228, in test_prefix_family_is_not_a_substring_guess
+    self.assertEqual(self.gas._canonical(0x90, None, attrs)[1], expected)
+AssertionError: Lists differ: ['vex'] != ['legacy']
+
+First differing element 0:
+'vex'
+'legacy'
+
+- ['vex']
++ ['legacy']
+
+======================================================================
+FAIL: test_strict_cli_fails_for_an_uncovered_mnemonic (__main__.GasEncodingCrossrefTests.test_strict_cli_fails_for_an_uncovered_mnemonic) (strict=True)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 287, in test_strict_cli_fails_for_an_uncovered_mnemonic
+    self.assertEqual(self.gas.main(), expected)
+AssertionError: 0 != 1
+
+======================================================================
+FAIL: test_v_spelling_requires_the_gas_template_attribute (__main__.GasEncodingCrossrefTests.test_v_spelling_requires_the_gas_template_attribute) (fake='vandn')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 269, in test_v_spelling_requires_the_gas_template_attribute
+    self.assertEqual(checked, 0)
+AssertionError: 1 != 0
+
+======================================================================
+FAIL: test_v_spelling_requires_the_gas_template_attribute (__main__.GasEncodingCrossrefTests.test_v_spelling_requires_the_gas_template_attribute) (fake='vblsi')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 269, in test_v_spelling_requires_the_gas_template_attribute
+    self.assertEqual(checked, 0)
+AssertionError: 1 != 0
+
+======================================================================
+FAIL: test_v_spelling_requires_the_gas_template_attribute (__main__.GasEncodingCrossrefTests.test_v_spelling_requires_the_gas_template_attribute) (fake='vblsr')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 269, in test_v_spelling_requires_the_gas_template_attribute
+    self.assertEqual(checked, 0)
+AssertionError: 1 != 0
+
+======================================================================
+FAIL: test_v_spelling_requires_the_gas_template_attribute (__main__.GasEncodingCrossrefTests.test_v_spelling_requires_the_gas_template_attribute) (fake='vblsmsk')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 269, in test_v_spelling_requires_the_gas_template_attribute
+    self.assertEqual(checked, 0)
+AssertionError: 1 != 0
+
+======================================================================
+FAIL: test_v_spelling_requires_the_gas_template_attribute (__main__.GasEncodingCrossrefTests.test_v_spelling_requires_the_gas_template_attribute) (fake='vshrx')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 269, in test_v_spelling_requires_the_gas_template_attribute
+    self.assertEqual(checked, 0)
+AssertionError: 1 != 0
+
+======================================================================
+FAIL: test_v_spelling_requires_the_gas_template_attribute (__main__.GasEncodingCrossrefTests.test_v_spelling_requires_the_gas_template_attribute)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/lccc/tests/corpus/test_gas_encoding_crossref.py", line 276, in test_v_spelling_requires_the_gas_template_attribute
+    self.assertEqual({e["mnemonic"] for e in parsed}, {"vsqrtps"})
+AssertionError: Items in the first set but not the second:
+'sqrtps'
+Items in the second set but not the first:
+'vsqrtps'
+
+----------------------------------------------------------------------
+Ran 17 tests in 0.367s
+
+FAILED (failures=23)

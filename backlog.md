@@ -895,7 +895,7 @@ rather than adding a parallel tool; keep a machine-readable result file and a
 checked-in expectation table; each MB item above flips its rows from GAP to OK as it
 lands. This makes "Maybach progress" a number instead of an opinion.
 
-### MB-43 · P1 · S — keep the SDM cross-reference exhaustive (it now is)
+### MB-43 · P1 · S — keep ISA cross-references strict; audit model boundaries
 `scripts/sdm_isa_crossref.py --backend all --strict` verifies every declarative
 row of both encoders against Intel's ISA descriptions: 2595 rows, 1436 classes,
 4992 encodings from 39 XED datafiles, **zero findings and zero unmodelled rows**
@@ -908,22 +908,31 @@ noise (`--strict` fails on UNMODELLED), and a class XED does not model goes into
 `SDM_ONLY_CLASSES` with a provenance comment **and** a byte-level assertion in
 `tests/asm-diff/` — `PREFETCHW` (`0F 0D /1`) is the only entry today. The
 as-2.47 reference gap is closed: the distiller used to read a lone `f2`/`f3`
-opcode byte as a mandatory prefix and drop the whole row (which is why `andn`,
-`blsi`, `blsr` and `blsmsk` were UNCOVERED), and it dropped the
-`0F 01 <ModRM>` rows whose field mixes escape, opcode and digit (`wrmsrns
-0x0f01c6`, `sgdt 0x0f010/0`). The opcode is now the *last* byte of the field, a
-three-byte-opcode row keeps its ModRM `/digit`, and the parameterised `setcc`
-resolves through `SNAPSHOT_ALIASES` to the `setc` row it encodes. The snapshot
-therefore grows from 2431 to 2518 mnemonics (5999 -> 6113 encodings) and
-`gas_encoding_crossref.py --verify --strict --backend all` checks 1638 rows
-with 0 findings, 0 unmodelled rows and an **empty** UNCOVERED list — a ratchet
-that `tests/corpus/test_gas_encoding_crossref.py` pins by asserting both lists
-are empty, that the four BMI rows carry `VEX.NDS.LZ.0F38 F2/F3 /digit`, and
-that the `0F 01` group keeps its ModRM digits (`swapgs` /7, `monitor` /1,
-`xgetbv` /2, `rdpkru` /5, `wrmsrns` /0). Only the four `movs*` string moves
-remain in `SNAPSHOT_LIMITATIONS`, and those are pinned by the as-2.47
-differential instead. Accept: both gates exit 0 on a clean tree, and adding a row with a
-wrong opcode, prefix, map or `/digit` makes exactly that row fail.
+opcode byte as a mandatory prefix and drop the whole row, which is why `andn`,
+`blsi`, `blsr` and `blsmsk` were reported as UNCOVERED; the opcode is now taken
+as the *last* byte of the field. The upstream `0F 01 <ModRM>` repair is
+retained: the fixed ModR/M byte contributes its `/digit` instead of being
+dropped as an extra opcode. Only the four `movs*` overloads remain documented
+snapshot limitations. The parameterised `setcc` resolves through
+`SNAPSHOT_ALIASES` to the `setc` row it encodes. `gas_encoding_crossref.py
+--verify --strict --backend all` therefore checks 1638 rows with 0 findings, 0
+unmodelled rows and an **empty** UNCOVERED list — a ratchet that
+`tests/corpus/test_gas_encoding_crossref.py` pins by asserting both lists are
+empty and that the four BMI rows carry `VEX.NDS.LZ.0F38 F2/F3 /digit` in the
+snapshot. A subsequent red-team audit found the empty list insufficient:
+substring family inference, unconditional v aliases and an early ModR/M return
+could accept invalid families/W bits, and strict mode did not fail for an
+uncovered-only result. The repair derives family/naming from exact GAS
+attributes, checks both known constraints, and fails closed on uncovered names.
+The same-source snapshot is now2,195 names/3,975 forms, with the same1,638
+encoder rows checked. Eighteen GAS tests,22 SDM tests,11 native GAS
+positive/refusal cases and a1,024-expression three-compiler oracle cover the
+new boundaries. C precedence is repaired as well:116 synthetic disagreements,
+but **zero** precedence-dependent changes in5,223 accepted evaluations from the pinned
+current table. Details and remaining row-existence/operand-model limitations:
+[`red-team audit`](engineering/evidence/gas-reference-redteam-2026-10-25/README.md).
+Accept: clean-tree gates pass; wrong-family, W, digit and uncovered mutations
+fail. Full operand/feature and architecture audits remain separate obligations.
 
 ### MB-44 · P0 · R — close the runtime gaps the ranker can now report
 The corpus ranking tool could not read five of the six checked-in evidence
@@ -952,17 +961,22 @@ classic "GCC widens the compare, we go one byte at a time" shape) and `nbody`
 (FP-heavy, no vectorisation win) first, then `expat_xml_scan` (`sqlite_varint`
 overlap) and `hash_table` (probe loop).
 
-**Blocker, stated once so it stops costing a session each time:** `lccc` needs a
-Rust toolchain, and this sandbox has none and no route to one — `static.rust-lang.org`
-is unreachable and rust-lang/rust publishes no binary release assets; the
-tag-cache ref (`harness-cache-1`) carries `gcc-16-bookworm-x86_64`,
-`binutils-2.47`, `debs-bookworm` and `mold-2.42.1`, and no Rust. Both are now
-provisioned and verified from that ref here (GNU as/objdump 2.47.20260726, GCC
-16.2.0, SHA-256 checked against `MANIFEST.sha256`), so every oracle-shaped gate
-in this file can be run locally; only `cargo`-shaped work cannot. Runtime
-numbers therefore still come from hosted CI — `python3 scripts/bench_rank.py
-<shard report>` is the reader, and `--compare` is the A/B that decides whether a
-change stays.
+**Fresh revalidation (2026-10-25):** the earlier Rust blocker is obsolete.
+`rust-cache-1.97.0` supplies rustc/cargo/rustfmt/Clippy, verified against its
+manifest; current main builds warning-clean with `fastbuild -j2`,8GiB swap.
+Checking only `harness-cache-1` was not an inventory of all available caches.
+
+A fresh15-round CPU-pinned, output-checked VM screening of the two priority
+workloads gives `lz4_match_extend` **1.0007x GCC [0.9647,1.0164]** (parity, not
+an established regression) and `nbody` **1.4361x GCC [1.4268,1.4521]** /
+**1.4948x Clang [1.4835,1.5229]**. Ratios are LCCC/reference; all measured arms
+exceed237ms. These are current-main measurements, **not wins from the oracle
+repair**. Investigate nbody first rather than uncritically tuning the historical
+1.937x LZ4 number. Reduced-size Callgrind at a separately stated v3 profile
+retains1.1841x/1.1579x whole-program simulated Ir ratios for nbody/LZ4 versus
+GCC; do not equate them with native cycles or the default-size native ratios.
+Full receipts, toolchain limits and review rationale:
+[`gas reference red-team audit`](engineering/evidence/gas-reference-redteam-2026-10-25/README.md).
 
 **The table above is the 2026-09-27 ranking and is kept only as the schema
 witness; it is not the live list.** Two of its rows are repaired and must not be
