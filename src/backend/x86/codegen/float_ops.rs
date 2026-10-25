@@ -578,11 +578,11 @@ impl X86Codegen {
     ) {
         // `inst` is the VEX spelling (`vsqrtsd`). Legacy scalar sqrt merges
         // the destination's old upper lanes, even when its low-lane source
-        // is a different register. Seed the destination with a full-register
-        // copy first: this removes the false dependency on its previous
-        // iteration's result. load_fp_to_reg uses MOVAPS/MOVAPD (not the
-        // merging register-register MOVSS/MOVSD); an aliased source needs no
-        // copy. Scalar IR observes only the low lane. Keep the VEX path below
+        // is a different register. For distinct XMM homes, zero the unused
+        // upper lanes independently before consuming the scalar source.
+        // Other sources retain the full-register copy fallback; an aliased
+        // source must not be zeroed. Scalar IR observes only the low lane.
+        // Keep the VEX path below
         // source-direct: its explicit upper-lane source already avoids this.
         if !self.isa.avx {
             let legacy = inst.strip_prefix('v').unwrap_or(inst);
@@ -590,6 +590,30 @@ impl X86Codegen {
                 if let Some(&reg) = self.reg_assignments.get(&d.0) {
                     if is_xmm_reg(reg) {
                         let dname = phys_reg_name(reg);
+                        // A zero idiom makes the unused upper lanes independent
+                        // of both the old destination and the source's upper
+                        // lanes. Never zero an aliased scalar input. XORPS is
+                        // SSE1; using PXOR here would incorrectly require SSE2
+                        // for F32 on an SSE1-only target.
+                        if let Operand::Value(source) = arg {
+                            if let Some(&sreg) = self.reg_assignments.get(&source.0) {
+                                if is_xmm_reg(sreg) && sreg != reg {
+                                    let zero = if ty == IrType::F32 { "xorps" } else { "xorpd" };
+                                    self.state.emit_fmt(format_args!(
+                                        "    {} %{}, %{}",
+                                        zero, dname, dname
+                                    ));
+                                    self.state.emit_fmt(format_args!(
+                                        "    {} %{}, %{}",
+                                        legacy,
+                                        phys_reg_name(sreg),
+                                        dname
+                                    ));
+                                    self.state.reg_cache.invalidate_acc();
+                                    return;
+                                }
+                            }
+                        }
                         self.load_fp_to_reg(arg, ty, dname);
                         self.state
                             .emit_fmt(format_args!("    {} %{}, %{}", legacy, dname, dname));
@@ -2220,10 +2244,10 @@ mod scalar_sqrt_dependency_tests {
     use crate::backend::regalloc::PhysReg;
 
     #[test]
-    fn legacy_sqrt_seeds_the_entire_destination_without_a_merging_move() {
-        for (ty, sqrt, copy) in [
-            (IrType::F32, "sqrtss", "movaps"),
-            (IrType::F64, "sqrtsd", "movapd"),
+    fn legacy_sqrt_zero_seed_preserves_input_and_sse1_permission() {
+        for (ty, sqrt, zero) in [
+            (IrType::F32, "sqrtss", "xorps"),
+            (IrType::F64, "sqrtsd", "xorpd"),
         ] {
             for (source, destination) in [(20, 21), (33, 20), (20, 20)] {
                 let mut cg = X86Codegen::new();
@@ -2238,16 +2262,16 @@ mod scalar_sqrt_dependency_tests {
                 );
                 let text = &cg.state.out.buf;
                 let dst = phys_reg_name(PhysReg(destination));
-                assert!(text.contains(&format!("{sqrt} %{dst}, %{dst}")), "{text}");
+                let src = phys_reg_name(PhysReg(source));
+                assert!(text.contains(&format!("{sqrt} %{src}, %{dst}")), "{text}");
                 if source != destination {
-                    let src = phys_reg_name(PhysReg(source));
-                    let seed = format!("{copy} %{src}, %{dst}");
+                    let seed = format!("{zero} %{dst}, %{dst}");
                     assert!(
                         text.find(&seed).unwrap() < text.find(sqrt).unwrap(),
                         "{text}"
                     );
                 } else {
-                    assert!(!text.contains(copy), "{text}");
+                    assert!(!text.contains(zero), "{text}");
                 }
                 assert!(
                     !text.contains("    movsd %") && !text.contains("    movss %"),
